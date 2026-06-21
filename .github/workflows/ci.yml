@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*'] # a pushed version tag (e.g. v1.2.0) cuts a release
   pull_request:
 
 permissions:
@@ -40,39 +41,30 @@ jobs:
   release:
     name: Release
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Only on a pushed version tag (v*). The tag name is the release version,
+    # so cut a release with e.g. `git tag v1.2.0 && git push origin v1.2.0`.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ github.ref_name }} # the tag, e.g. v1.2.0
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # full history so the commit count is correct
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      # Version scheme: v<MAJOR_MINOR>.<commit-count-on-main>. Monotonic and
-      # SemVer-ordered (so `lv host upgrade`'s version comparison works). Bump
-      # MAJOR_MINOR here to cut a new minor/major line.
-      - name: Compute version
-        id: ver
-        run: |
-          MAJOR_MINOR="1.0"
-          VERSION="v${MAJOR_MINOR}.$(git rev-list --count HEAD)"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Release version: ${VERSION}"
-
       - name: Vendor UI assets
         run: make vendor-js
 
       - name: Build release binaries
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
           COMMIT: ${{ github.sha }}
         run: |
+          echo "Release version: ${VERSION}"
           mkdir -p dist
           for arch in amd64 arm64; do
             echo "building linux/${arch}..."
@@ -90,8 +82,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.ver.outputs.version }}" \
-            --title "${{ steps.ver.outputs.version }}" \
+          gh release create "${VERSION}" \
+            --title "${VERSION}" \
             --generate-notes \
-            --target "${{ github.sha }}" \
             dist/*.tar.gz dist/*checksums.txt

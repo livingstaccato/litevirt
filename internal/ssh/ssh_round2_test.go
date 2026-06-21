@@ -419,8 +419,8 @@ func TestAuthMethods_InvalidAgentSocket(t *testing.T) {
 }
 
 func TestDefaultHostKeyCallback_ReturnsCallbackOrError(t *testing.T) {
-	// defaultHostKeyCallback uses user.Current().HomeDir, so we can't easily
-	// redirect it. Just verify it returns either a valid callback or an error.
+	// Just verify it returns either a valid callback or an error, regardless
+	// of whether the current user has a ~/.ssh/known_hosts.
 	cb, err := defaultHostKeyCallback()
 	if err != nil {
 		// No known_hosts file -- this is expected in many test environments

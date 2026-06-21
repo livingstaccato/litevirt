@@ -7,7 +7,6 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"syscall"
 
@@ -257,11 +256,11 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 }
 
 func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
-	u, err := user.Current()
+	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
 	}
-	knownHostsFile := filepath.Join(u.HomeDir, ".ssh", "known_hosts")
+	knownHostsFile := filepath.Join(home, ".ssh", "known_hosts")
 	cb, err := knownhosts.New(knownHostsFile)
 	if err != nil {
 		return nil, err

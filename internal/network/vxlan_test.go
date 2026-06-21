@@ -20,11 +20,16 @@ func TestEnsureVXLAN_NewInterface(t *testing.T) {
 	if bridge != "br-vni100" {
 		t.Errorf("expected bridge br-vni100, got %s", bridge)
 	}
-	if len(calls) != 5 {
-		t.Fatalf("expected 5 commands, got %d: %v", len(calls), calls)
+	// EnsureVXLAN emits 5 core `ip` commands, plus 2 best-effort `mtu`
+	// commands when the underlay interface exists on the host
+	// (net.InterfaceByName succeeds). Tolerate the optional pair so the test
+	// is deterministic regardless of whether the runner happens to have an
+	// interface named "eth0".
+	if len(calls) != 5 && len(calls) != 7 {
+		t.Fatalf("expected 5 or 7 commands, got %d: %v", len(calls), calls)
 	}
 
-	// Verify commands in order
+	// Verify the 5 core commands in order
 	expected := [][]string{
 		{"ip", "link", "add", "vxlan100", "type", "vxlan", "id", "100", "dstport", "4789", "local", "10.0.0.1", "dev", "eth0", "nolearning"},
 		{"ip", "link", "add", "br-vni100", "type", "bridge"},
@@ -40,6 +45,17 @@ func TestEnsureVXLAN_NewInterface(t *testing.T) {
 		for j, arg := range exp {
 			if calls[i][j] != arg {
 				t.Errorf("call %d arg %d: expected %q, got %q", i, j, arg, calls[i][j])
+			}
+		}
+	}
+
+	// If the optional MTU commands were emitted, verify their shape (the MTU
+	// value itself depends on the host interface, so it isn't pinned).
+	if len(calls) == 7 {
+		for i, dev := range []string{"vxlan100", "br-vni100"} {
+			c := calls[5+i]
+			if len(c) != 6 || c[0] != "ip" || c[1] != "link" || c[2] != "set" || c[3] != dev || c[4] != "mtu" {
+				t.Errorf("call %d: expected `ip link set %s mtu <n>`, got %v", 5+i, dev, c)
 			}
 		}
 	}

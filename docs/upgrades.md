@@ -382,6 +382,30 @@ The daemon refuses to start when its `CurrentSchemaVersion` is OLDER
 than the cluster DB's version (downgrade guard), and aborts replication
 batches that reference missing tables / columns (forward-skew guard).
 
+**Schema changes are additive-only.** CRDT-replicated tables (everything in
+`internal/corrosion/schema.go`) may only **grow**: a new `CREATE TABLE`, or an
+`ALTER TABLE … ADD COLUMN` **with a `DEFAULT`** so a row written by an older
+peer stays valid. **Never rename a column, drop a column, change a column's
+type, or change a primary key** on a replicated table. Crescent's
+last-writer-wins apply path addresses columns *by name*, so in a mixed-version
+cluster a renamed or dropped column is simply *missing* on the not-yet-upgraded
+peers, and mutations that reference it are silently dropped or mis-applied
+there. A rename is also invisible to the safety nets — it can leave the column
+*count* unchanged, so it slips past both the forward-skew check and the
+version-bump guard, which catch *growth* without a `CurrentSchemaVersion` bump,
+not in-place edits.
+
+To rename or retype a replicated column, do it as a multi-release dual-write
+migration — never a single change:
+
+1. `ADD COLUMN` the new column (with a default); bump `CurrentSchemaVersion` and
+   add a `History:` line.
+2. Dual-write old + new, and read new-with-fallback-to-old. Roll that out to
+   **every** node.
+3. In a *later* release — after every supported version is past step 2 —
+   backfill and stop writing the old column. Leave the dead column in place;
+   dropping it is itself a non-additive change and rarely worth the risk.
+
 **`lv host upgrade` handles this for you.** Before swapping any binary it
 runs a **pre-stage pass**: it streams the new binary to every target and
 runs that binary's `schema-migrate` against the live `state.db` (idempotent,

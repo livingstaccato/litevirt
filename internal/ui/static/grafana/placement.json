@@ -28,6 +28,17 @@
       "targets": [
         {"expr": "rate(litevirt_rebalance_proposals_total[5m])", "legendFormat": "{{status}}"}
       ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Host pressure (per host / dimension)",
+      "description": "litevirt_host_pressure: per-host (used)/capacity per dimension. 0 = idle, 1 = full.",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 12},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}},
+      "targets": [
+        {"expr": "litevirt_host_pressure", "legendFormat": "{{host}} / {{dim}}"}
+      ]
     }
   ],
   "refresh": "1m",
@@ -37,5 +48,5 @@
   "time": { "from": "now-6h", "to": "now" },
   "title": "litevirt — Placement & Rebalancer",
   "uid": "litevirt-placement",
-  "version": 1
+  "version": 2
 }

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The UI embeds uPlot, which is fetched from a CDN (gitignored). Vendor it
+      # so the embedded asset set matches a real build.
+      - name: Vendor UI assets
+        run: make vendor-js
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Unit tests + the in-process fleet integration suite. The tests/e2e and
+      # tests/cluster suites are intentionally excluded: they require a live
+      # multi-host cluster with PKI under /etc/litevirt and root privileges.
+      - name: Test
+        run: go test ./internal/... ./cmd/... ./tests/fleet/
+
+  release:
+    name: Release
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so the commit count is correct
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Version scheme: v<MAJOR_MINOR>.<commit-count-on-main>. Monotonic and
+      # SemVer-ordered (so `lv host upgrade`'s version comparison works). Bump
+      # MAJOR_MINOR here to cut a new minor/major line.
+      - name: Compute version
+        id: ver
+        run: |
+          MAJOR_MINOR="1.0"
+          VERSION="v${MAJOR_MINOR}.$(git rev-list --count HEAD)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}"
+
+      - name: Vendor UI assets
+        run: make vendor-js
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            echo "building linux/${arch}..."
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
+              -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+              -o dist/litevirt ./cmd/litevirt
+            ( cd dist && ln -sf litevirt lv \
+              && tar -czf "litevirt-${VERSION}-linux-${arch}.tar.gz" litevirt lv \
+              && rm -f litevirt lv )
+          done
+          ( cd dist && sha256sum *.tar.gz > "litevirt-${VERSION}-checksums.txt" )
+          ls -l dist
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.version }}" \
+            --title "${{ steps.ver.outputs.version }}" \
+            --generate-notes \
+            --target "${{ github.sha }}" \
+            dist/*.tar.gz dist/*checksums.txt

@@ -758,6 +758,28 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		}
 	}
 
+	// Delete the stack's containers (tagged with the reserved stack label; the
+	// containers table has no stack_name column, so the label is the
+	// association). DeleteContainer forwards to each container's owning host.
+	containers, ctErr := corrosion.ListContainersByStack(ctx, s.db, req.Name)
+	if ctErr != nil {
+		hadFailures = true
+		slog.Warn("stack delete: list containers failed", "stack", req.Name, "error", ctErr)
+	}
+	for _, ct := range containers {
+		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); delErr != nil {
+			hadFailures = true
+			slog.Warn("stack delete container failed", "container", ct.Name, "host", ct.HostName, "error", delErr)
+			if sendErr := stream.Send(&pb.DeleteProgress{VmName: ct.Name, Status: "error", Error: delErr.Error()}); sendErr != nil {
+				return sendErr
+			}
+			continue
+		}
+		if err := stream.Send(&pb.DeleteProgress{VmName: ct.Name, Status: "deleted"}); err != nil {
+			return err
+		}
+	}
+
 	// Deprovision networks associated with this stack (skip external networks).
 	externalNets := s.externalNetworkNames(ctx, req.Name)
 	nets, _ := corrosion.ListNetworks(ctx, s.db)

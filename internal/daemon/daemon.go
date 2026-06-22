@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -385,6 +386,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// is more useful than a blanket "container runtime not wired".
 	lxcRunner := lxc.NewLxcRunner()
 	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
+
+	// Advertise LXC capability as a host label so the compose planner places
+	// container (kind=lxc/oci) workloads only on hosts that can actually run
+	// them. The runtime is always wired, but the lxc-* binaries may be absent —
+	// probe for lxc-create. SetHostLabel is a no-op when unchanged, so this is
+	// cheap to re-assert every start.
+	lxcCapable := "false"
+	if _, lerr := exec.LookPath("lxc-create"); lerr == nil {
+		lxcCapable = "true"
+	}
+	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelLXCCapable, lxcCapable); err != nil {
+		slog.Warn("set LXC capability host label failed", "capable", lxcCapable, "error", err)
+	}
 
 	// Container reconciler + restart engine: every cycle, sync each locally-owned
 	// container's cluster row to the LXC runtime's reality and auto-restart one

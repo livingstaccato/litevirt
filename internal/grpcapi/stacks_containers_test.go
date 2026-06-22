@@ -60,6 +60,54 @@ func TestBuildContainerRequest(t *testing.T) {
 	if _, err := s.buildContainerRequest(ctx, "c", &compose.VMDef{Kind: compose.WorkloadKindOCI, Image: "nginx:latest"}, f, "h"); err == nil {
 		t.Error("oci registry ref should error (no auto-pull yet)")
 	}
+
+	// The reserved stack label is set so the planner/down can find the container.
+	req2, err := s.buildContainerRequest(ctx, "c", &compose.VMDef{Kind: compose.WorkloadKindLXC, Image: "alpine:3.21"}, f, "h")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if req2.Labels[corrosion.LabelStack] != "ct-stack" {
+		t.Errorf("stack label = %q, want ct-stack", req2.Labels[corrosion.LabelStack])
+	}
+}
+
+// compose down (DeleteStack) deletes the stack's containers (found via the
+// reserved stack label), not just its VMs — the live-test teardown gap.
+func TestDeleteStack_RemovesContainers(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminContext(context.Background())
+	rt := &fakeCTRuntime{}
+	s.SetContainerRuntime(rt)
+
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "test-host", Name: "web", State: "running",
+		Image: "alpine:3.21", CPULimit: 1, MemMiB: 256,
+		Labels: map[string]string{corrosion.LabelStack: "ct-stack"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	stream := &mockDeleteStreamR2{ctx: ctx}
+	if err := s.DeleteStack(&pb.DeleteStackRequest{Name: "ct-stack"}, stream); err != nil {
+		t.Fatalf("DeleteStack: %v", err)
+	}
+
+	found := false
+	for _, n := range rt.deleteCalls {
+		if n == "web" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("DeleteContainer not called for web; deleteCalls=%v", rt.deleteCalls)
+	}
+	cts, err := corrosion.ListContainersByStack(ctx, s.db, "ct-stack")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cts) != 0 {
+		t.Errorf("container still present after down: %d", len(cts))
+	}
 }
 
 // DeployStack routes a kind=lxc workload through CreateContainer + StartContainer
@@ -68,6 +116,10 @@ func TestDeployStack_RoutesLXCContainer(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
 	insertTestHostR2(t, ctx, s.db, "test-host", "active")
+	// Containers are placed only on LXC-capable hosts (daemon-advertised label).
+	if err := corrosion.SetHostLabel(ctx, s.db, "test-host", corrosion.LabelLXCCapable, "true"); err != nil {
+		t.Fatal(err)
+	}
 	rt := &fakeCTRuntime{}
 	s.SetContainerRuntime(rt)
 

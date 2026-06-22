@@ -7,7 +7,21 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/compose/planner"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// deleteWorkload removes a planned workload, routing containers to
+// DeleteContainer (on their resolved/current host) and VMs to DeleteVM. Used by
+// the deploy executor for OpDelete and the delete half of an OpUpdate recreate.
+func (s *Server) deleteWorkload(ctx context.Context, a planner.VMAction) error {
+	if a.IsContainer {
+		_, err := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: a.TargetHost, Name: a.VMName})
+		return err
+	}
+	_, err := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: a.VMName})
+	return err
+}
 
 // buildContainerRequest converts a compose container workload (kind: lxc | oci)
 // into a CreateContainerRequest for the planner-resolved host. The deploy path
@@ -27,12 +41,22 @@ import (
 // for container veths is a separate follow-up; a container sharing a stack
 // network with a VM finds the bridge already provisioned by the VM path.
 func (s *Server) buildContainerRequest(ctx context.Context, instanceName string, d *compose.VMDef, f *compose.File, targetHost string) (*pb.CreateContainerRequest, error) {
+	// Tag the container with its compose stack (reserved label) so the deploy
+	// planner's current-state diff and `compose down` can find it — the
+	// containers table has no stack_name column. Compose's value wins over any
+	// user-set label of the same key.
+	labels := map[string]string{}
+	for k, v := range d.Labels {
+		labels[k] = v
+	}
+	labels[corrosion.LabelStack] = f.Name
+
 	req := &pb.CreateContainerRequest{
 		HostName:  targetHost,
 		Name:      instanceName,
 		Cpu:       int32(d.CPU),
 		MemoryMib: int32(d.Memory),
-		Labels:    d.Labels,
+		Labels:    labels,
 		Image:     d.Image,
 		Arch:      "amd64",
 	}

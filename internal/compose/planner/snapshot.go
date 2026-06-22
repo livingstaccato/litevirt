@@ -16,6 +16,7 @@ import (
 type ClusterState struct {
 	Hosts      []corrosion.HostRecord
 	VMs        []corrosion.VMRecord
+	Containers []corrosion.ContainerRecord // cluster-wide; diffed per-stack via LabelStack
 	Networks   []corrosion.NetworkRecord
 	LBs        []corrosion.LBConfigRecord
 	Devices    map[string][]corrosion.PCIDeviceRecord // host → available devices
@@ -30,6 +31,11 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client) (*ClusterState,
 	}
 
 	vms, err := corrosion.ListVMs(ctx, db, "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	containers, err := corrosion.ListContainers(ctx, db, "")
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +84,7 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client) (*ClusterState,
 	return &ClusterState{
 		Hosts:      hosts,
 		VMs:        vms,
+		Containers: containers,
 		Networks:   networks,
 		LBs:        lbs,
 		Devices:    devices,

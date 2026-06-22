@@ -155,12 +155,29 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			r.startPendingVM(ctx, vm)
 
 		case "running":
+			if r.virt == nil {
+				break
+			}
 			// After daemon restart or libvirt reconnect, verify VMs that
 			// corrosion says are "running" are actually alive in libvirt (#43/#53).
-			if r.virt != nil && !r.virt.DomainExists(vm.Name) {
+			if !r.virt.DomainExists(vm.Name) {
 				slog.Warn("reconciler: VM marked running but not in libvirt — attempting restart",
 					"vm", vm.Name)
 				r.startPendingVM(ctx, vm)
+				break
+			}
+			// The domain is defined but may have been stopped out-of-band (a
+			// crash, an external `virsh destroy`, or a fence that powered it
+			// off). Reconcile the cluster state to libvirt reality so it doesn't
+			// linger as "running" everywhere: the list/host UI reads the
+			// replicated cluster state, while the VM-detail view reads the live
+			// state from the owning host — if we don't sync here they disagree
+			// (host view "running" vs detail "stopped"). This mirrors the
+			// on-demand sync ListVMs already does for local VMs.
+			if live, err := r.virt.DomainState(vm.Name); err == nil && live == "stopped" {
+				slog.Warn("reconciler: VM marked running but stopped in libvirt — syncing cluster state",
+					"vm", vm.Name)
+				corrosion.UpdateVMState(ctx, r.db, vm.Name, "stopped", "reconciler: stopped out-of-band")
 			}
 
 		case "error":

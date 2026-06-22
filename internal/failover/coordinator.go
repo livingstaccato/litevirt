@@ -68,6 +68,13 @@ type Coordinator struct {
 	// fencing tracks hosts that have already been fenced in this session
 	// to avoid double-fencing on repeated poll cycles.
 	fenced map[string]bool
+	// fenceRelocated records, for hosts THIS coordinator fenced, whether the
+	// fence actually relocated any VMs. Presence of a key means "fenced by me
+	// this session"; the value is "did VMs move". A spuriously-fenced host that
+	// relocated nothing (value=false) can auto-recover to active once healthy;
+	// one that moved VMs (value=true) must wait for a manual `undrain` to avoid
+	// split-brain. Absent key ⇒ we can't prove it's safe ⇒ stays manual.
+	fenceRelocated map[string]bool
 	// Now is the time source for lease TTL / fencing-log timestamps.
 	// Defaults to time.Now; the fleet harness overrides it with a
 	// virtual clock so scenarios can advance time deterministically
@@ -81,11 +88,12 @@ type Coordinator struct {
 // NewCoordinator creates a new failover coordinator with the real fencer.
 func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 	return &Coordinator{
-		hostName: hostName,
-		db:       db,
-		fencer:   fence.Execute,
-		fenced:   make(map[string]bool),
-		Now:      func() time.Time { return time.Now() },
+		hostName:       hostName,
+		db:             db,
+		fencer:         fence.Execute,
+		fenced:         make(map[string]bool),
+		fenceRelocated: make(map[string]bool),
+		Now:            func() time.Time { return time.Now() },
 	}
 }
 
@@ -228,29 +236,28 @@ func (c *Coordinator) run(ctx context.Context) {
 		c.failover(ctx, h)
 	}
 
-	// Recovery pass: bring hosts that were marked 'offline' back to 'active'
-	// once a fresh quorum agrees they're healthy again. A transient drop (a
-	// daemon restart, a brief network blip) must self-heal — otherwise health
-	// reconverges in seconds but the authoritative hosts.state stays stuck.
-	c.recoverOfflineHosts(ctx, quorum)
+	// Recovery pass: bring a host the coordinator marked down (offline, or a
+	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
+	// it's healthy again. A transient drop (a daemon restart, a brief blip) must
+	// self-heal — otherwise health reconverges in seconds but hosts.state sticks.
+	c.recoverHosts(ctx, quorum)
 }
 
-// recoverOfflineHosts promotes hosts stuck in 'offline' back to 'active' once a
-// fresh quorum of observers reports them healthy (consecutive_failures = 0).
+// recoverHosts promotes a host the coordinator marked down back to 'active'
+// once a fresh quorum of observers reports it healthy (consecutive_failures = 0).
+// Without this, a host that briefly dropped (a daemon restart, a transient blip,
+// or a spurious fence) never returns to active on its own — health reconverges
+// in seconds but the authoritative hosts.state stays stuck.
 //
-// Why this is needed: the coordinator only ever writes "down" states, and a
-// host's own startup self-active write (daemon.go) can lose a last-writer-wins
-// race with a slightly-later offline write from this coordinator. With no
-// recovery path, a briefly-dropped-then-healthy host stays 'offline' forever
-// until an operator runs `lv host undrain`.
-//
-// Only 'offline' is auto-recovered. 'fenced' is left manual on purpose: a
-// SUCCESSFUL fence may have rescheduled the host's VMs, so resurrecting it
-// without operator confirmation risks split-brain. 'maintenance'/'draining'
-// reflect operator intent and must not be cleared automatically either. As a
-// belt-and-suspenders guard we also skip any host with a recent successful
-// fence in the fencing_log.
-func (c *Coordinator) recoverOfflineHosts(ctx context.Context, quorum int) {
+//   - 'offline' (a best-effort / unconfirmed fence — no successful fence, so no
+//     VMs were rescheduled): recovered whenever healthy.
+//   - 'fenced' (a SUCCESSFUL fence): recovered ONLY if THIS coordinator did the
+//     fence AND it relocated no VMs (fenceRelocated == false). A fence that moved
+//     VMs — or one this coordinator has no record of (e.g. a prior leader) —
+//     stays manual (`lv host undrain`), so we never resurrect a host into a
+//     split-brain where a moved VM runs in two places.
+//   - 'maintenance'/'draining': operator intent, never auto-cleared.
+func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
 		slog.Error("failover: list hosts for recovery", "error", err)
@@ -258,12 +265,20 @@ func (c *Coordinator) recoverOfflineHosts(ctx context.Context, quorum int) {
 	}
 	freshCutoff := c.now().Add(-healthFreshness).UTC().Format(time.RFC3339)
 	for _, h := range hosts {
-		if h.State != "offline" {
+		switch h.State {
+		case "offline":
+			if c.recentlyFenced(ctx, h.Name) {
+				continue // a real fence happened — treat like 'fenced'
+			}
+		case "fenced":
+			reloc, fencedByMe := c.fenceRelocated[h.Name]
+			if !fencedByMe || reloc {
+				continue // not ours to clear, or VMs moved → manual undrain only
+			}
+		default:
 			continue
 		}
-		if c.recentlyFenced(ctx, h.Name) {
-			continue
-		}
+
 		rows, err := c.db.Query(ctx,
 			`SELECT COUNT(DISTINCT observer) AS n
 			 FROM host_health
@@ -271,19 +286,17 @@ func (c *Coordinator) recoverOfflineHosts(ctx context.Context, quorum int) {
 			   AND consecutive_failures = 0
 			   AND updated_at > ?`,
 			h.Name, freshCutoff)
-		if err != nil || len(rows) == 0 {
-			continue
-		}
-		if rows[0].Int("n") < quorum {
+		if err != nil || len(rows) == 0 || rows[0].Int("n") < quorum {
 			continue
 		}
 		if err := corrosion.UpdateHostState(ctx, c.db, h.Name, "active"); err != nil {
-			slog.Error("failover: recover offline host", "host", h.Name, "error", err)
+			slog.Error("failover: recover host", "host", h.Name, "state", h.State, "error", err)
 			continue
 		}
-		slog.Info("failover: offline host healthy again, marking active",
-			"host", h.Name, "healthy_observers", rows[0].Int("n"), "quorum", quorum)
+		slog.Info("failover: host healthy again, marking active",
+			"host", h.Name, "from", h.State, "healthy_observers", rows[0].Int("n"), "quorum", quorum)
 		delete(c.fenced, h.Name)
+		delete(c.fenceRelocated, h.Name)
 	}
 }
 
@@ -298,6 +311,7 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 	for host := range c.fenced {
 		if h, err := corrosion.GetHost(ctx, c.db, host); err == nil && h != nil && h.State == "active" {
 			delete(c.fenced, host)
+			delete(c.fenceRelocated, host)
 		}
 	}
 }
@@ -470,6 +484,11 @@ func (c *Coordinator) countLiveHosts(ctx context.Context) (int, error) {
 // failover fences the host and reschedules its VMs.
 func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	c.fenced[h.Name] = true
+	// Track whether this fence actually relocates any VM. A fence that moves
+	// nothing (e.g. a spurious fence of a host whose VMs all stayed put) is safe
+	// to auto-recover later; one that relocated VMs must stay manual to avoid
+	// split-brain. See recoverHosts.
+	c.fenceRelocated[h.Name] = false
 
 	// Re-validate lease immediately before the destructive fence call. Fence
 	// runs (especially IPMI verify) can take ~15 s; a second coordinator must
@@ -583,6 +602,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 					"vm", vm.Name, "error", err)
 			} else {
 				slog.Info("failover: VM recovered via replica promotion", "vm", vm.Name)
+				c.fenceRelocated[h.Name] = true
 				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 					ID: newID(), Username: "failover-coordinator", Action: "failover.promote",
 					Target: vm.Name, Detail: "promoted replica after fencing " + h.Name, Result: "ok",
@@ -663,6 +683,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 			slog.Error("failover: update VM host", "vm", vm.Name, "error", err)
 			continue
 		}
+		c.fenceRelocated[h.Name] = true
 
 		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 			ID:       newID(),

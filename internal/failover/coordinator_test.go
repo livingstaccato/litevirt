@@ -2,12 +2,26 @@ package failover
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
 )
+
+// ensureObserverHost inserts an observer host, tolerating "already exists" so a
+// test can re-declare the same observers across phases.
+func ensureObserverHost(t *testing.T, db *corrosion.Client, name string) {
+	t.Helper()
+	err := corrosion.InsertHost(context.Background(), db, corrosion.HostRecord{
+		Name: name, Address: "10.0.9." + name[len(name)-1:], SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+	})
+	if err != nil && !strings.Contains(err.Error(), "UNIQUE") {
+		t.Fatalf("InsertHost %s: %v", name, err)
+	}
+}
 
 func newTestDB(t *testing.T) *corrosion.Client {
 	t.Helper()
@@ -108,12 +122,7 @@ func healthyObservers(t *testing.T, db *corrosion.Client, target string, observe
 	t.Helper()
 	ctx := context.Background()
 	for _, o := range observers {
-		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
-			Name: o, Address: "10.0.1." + o[len(o)-1:], SSHUser: "root", SSHPort: 22,
-			GRPCPort: 7443, State: "active", FenceStrategy: "manual",
-		}); err != nil {
-			t.Fatalf("InsertHost %s: %v", o, err)
-		}
+		ensureObserverHost(t, db, o)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -227,12 +236,7 @@ func downObservers(t *testing.T, db *corrosion.Client, target string, observers 
 	t.Helper()
 	ctx := context.Background()
 	for _, o := range observers {
-		if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
-			Name: o, Address: "10.0.4." + o[len(o)-1:], SSHUser: "root", SSHPort: 22,
-			GRPCPort: 7443, State: "active", FenceStrategy: "manual",
-		}); err != nil {
-			t.Fatalf("InsertHost %s: %v", o, err)
-		}
+		ensureObserverHost(t, db, o)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -241,6 +245,63 @@ func downObservers(t *testing.T, db *corrosion.Client, target string, observers 
 		); err != nil {
 			t.Fatalf("insert health: %v", err)
 		}
+	}
+}
+
+// A host this coordinator spuriously fenced (best-effort) that relocated NO VMs
+// must auto-recover to active once a fresh quorum sees it healthy again — no
+// operator undrain needed.
+func TestCoordinator_FencedHostAutoRecoversWhenNoVMsMoved(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "spur", Address: "10.0.0.60", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	c := newTestCoordinator("coordinator", db) // stub fencer succeeds → 'fenced'
+
+	// Phase 1: quorum sees it down; it owns no VMs → fenced, nothing relocated.
+	downObservers(t, db, "spur", "h1", "h2", "h3")
+	c.run(ctx)
+	if h, _ := corrosion.GetHost(ctx, db, "spur"); h == nil || h.State != "fenced" {
+		t.Fatalf("phase 1: expected fenced, got %+v", h)
+	}
+	if c.fenceRelocated["spur"] {
+		t.Fatal("no VMs existed — fenceRelocated must be false")
+	}
+
+	// Phase 2: quorum now sees it healthy → auto-recover (safe: nothing moved).
+	healthyObservers(t, db, "spur", "h1", "h2", "h3")
+	c.run(ctx)
+	if h, _ := corrosion.GetHost(ctx, db, "spur"); h == nil || h.State != "active" {
+		t.Errorf("phase 2: fenced-but-healthy host with no moved VMs should recover, got %+v", h)
+	}
+}
+
+// A fenced host whose fence DID relocate VMs must stay manual (split-brain
+// safety) even when healthy again.
+func TestCoordinator_FencedHostWithRelocatedVMsStaysManual(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "rel", Address: "10.0.0.61", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "fenced", FenceStrategy: "best-effort",
+	}); err != nil {
+		t.Fatalf("InsertHost: %v", err)
+	}
+	healthyObservers(t, db, "rel", "h1", "h2", "h3")
+
+	c := newTestCoordinator("coordinator", db)
+	c.fenceRelocated["rel"] = true // this coordinator fenced it AND moved VMs
+
+	c.run(ctx)
+
+	if h, _ := corrosion.GetHost(ctx, db, "rel"); h == nil || h.State != "fenced" {
+		t.Errorf("fenced host that relocated VMs must stay manual, got %+v", h)
 	}
 }
 

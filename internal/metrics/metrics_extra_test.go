@@ -37,18 +37,41 @@ func peerGaugeValues(t *testing.T, ch <-chan prometheus.Metric, name string) map
 	return out
 }
 
+// gaugeValue drains ch, returning the value of the first metric whose
+// descriptor mentions name (and whether one was found).
+func gaugeValue(t *testing.T, ch <-chan prometheus.Metric, name string) (float64, bool) {
+	t.Helper()
+	for m := range ch {
+		if !containsStr(m.Desc().String(), name) {
+			continue
+		}
+		var dm dto.Metric
+		if err := m.Write(&dm); err != nil {
+			t.Fatalf("write metric %s: %v", name, err)
+		}
+		return dm.GetGauge().GetValue(), true
+	}
+	return 0, false
+}
+
+func insertLogRows(t *testing.T, db *corrosion.Client, n int) {
+	t.Helper()
+	ctx := context.Background()
+	for i := 0; i < n; i++ {
+		if err := db.Execute(ctx,
+			`INSERT INTO mutation_log (hlc, origin, stmts, created_at) VALUES ('0','n','x', datetime('now'))`); err != nil {
+			t.Fatalf("insert mutation_log: %v", err)
+		}
+	}
+}
+
 // Per-peer replication backlog: one series per LIVE peer, value MAX(seq) -
 // last_seq; a stale watermark (outside LiveWatermarkWindow) is excluded.
 func TestCollect_ReplicationPeerLag(t *testing.T) {
 	db := initTestDB(t)
 	ctx := context.Background()
 
-	for i := 0; i < 10; i++ {
-		if err := db.Execute(ctx,
-			`INSERT INTO mutation_log (hlc, origin, stmts, created_at) VALUES ('0','n','x', datetime('now'))`); err != nil {
-			t.Fatalf("insert log: %v", err)
-		}
-	}
+	insertLogRows(t, db, 10)
 	now := time.Now().UTC().Format(time.RFC3339)
 	rows, _ := db.Query(ctx, `SELECT COALESCE(MAX(seq),0) AS m FROM mutation_log`)
 	maxSeq := rows[0].Int("m")
@@ -95,6 +118,77 @@ func TestCollect_ReplicationPeerLag(t *testing.T) {
 	}
 	if got["slow"] <= got["fast"] {
 		t.Errorf("slow peer (%v) should lag more than fast (%v)", got["slow"], got["fast"])
+	}
+}
+
+// litevirt_replication_pending_entries = MAX(seq) - MIN(live last_seq).
+func TestCollect_ReplicationPending(t *testing.T) {
+	db := initTestDB(t)
+	ctx := context.Background()
+
+	insertLogRows(t, db, 10)
+	// seq is AUTOINCREMENT (InitSchema advances it) and db.Execute itself logs a
+	// mutation row, so don't hardcode an absolute value: place a live peer a few
+	// entries behind MAX(seq), then compare the gauge against the same MAX(seq) -
+	// MIN(live last_seq) the collector computes (no writes happen after this, so
+	// the two reads agree).
+	rows, err := db.Query(ctx, `SELECT COALESCE(MAX(seq),0) AS m FROM mutation_log`)
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("max seq: %v", err)
+	}
+	if err := db.Execute(ctx,
+		`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)`,
+		"peer-a", rows[0].Int("m")-3, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("insert watermark: %v", err)
+	}
+
+	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
+	wm, _ := db.Query(ctx, `SELECT COALESCE(MIN(last_seq),0) AS m FROM replication_watermarks WHERE updated_at > ?`, liveCutoff)
+	mx, _ := db.Query(ctx, `SELECT COALESCE(MAX(seq),0) AS m FROM mutation_log`)
+	want := float64(mx[0].Int("m") - wm[0].Int("m"))
+	if want <= 0 {
+		t.Fatalf("test setup: expected a positive backlog, got %v", want)
+	}
+
+	c := newCollector(db, nil, "host-a")
+	ch := make(chan prometheus.Metric, 100)
+	c.Collect(ch)
+	close(ch)
+
+	got, found := gaugeValue(t, ch, "litevirt_replication_pending_entries")
+	if !found {
+		t.Fatal("missing litevirt_replication_pending_entries metric")
+	}
+	if got != want {
+		t.Fatalf("pending = %v, want %v (MAX(seq) - MIN(live last_seq))", got, want)
+	}
+}
+
+// With no LIVE peers the backlog is reported as 0, not the whole log — a single
+// or fully-partitioned node has nothing to replicate to.
+func TestCollect_ReplicationPending_NoLivePeers(t *testing.T) {
+	db := initTestDB(t)
+	ctx := context.Background()
+
+	insertLogRows(t, db, 5)
+	// A watermark exists but is stale (outside LiveWatermarkWindow) → excluded.
+	if err := db.Execute(ctx,
+		`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)`,
+		"stale", 1, time.Now().Add(-2*corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("insert watermark: %v", err)
+	}
+
+	c := newCollector(db, nil, "host-a")
+	ch := make(chan prometheus.Metric, 100)
+	c.Collect(ch)
+	close(ch)
+
+	got, found := gaugeValue(t, ch, "litevirt_replication_pending_entries")
+	if !found {
+		t.Fatal("missing litevirt_replication_pending_entries metric")
+	}
+	if got != 0 {
+		t.Fatalf("pending = %v, want 0 (no live peers)", got)
 	}
 }
 

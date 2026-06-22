@@ -102,6 +102,7 @@ type collector struct {
 	hlcRejected        *prometheus.Desc // remote HLC timestamps rejected for skew
 	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
 	replicationMinSeq  *prometheus.Desc // MIN(last_seq) across replication_watermarks
+	replicationPending *prometheus.Desc // entries ahead of the slowest LIVE peer
 	replicationPeerLag *prometheus.Desc // per-peer backlog: MAX(seq) - peer last_seq
 
 	// placement / rebalancer metrics.
@@ -219,6 +220,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, hostName string) *
 			"MIN(last_seq) across replication_watermarks; gates mutation_log compaction",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		replicationPending: prometheus.NewDesc(
+			"litevirt_replication_pending_entries",
+			"mutation_log entries written but not yet acked by the slowest LIVE peer (MAX(seq) - MIN(live last_seq)); 0 when there are no live peers",
+			nil, prometheus.Labels{"host": hostName},
+		),
 		replicationPeerLag: prometheus.NewDesc(
 			"litevirt_replication_peer_pending_entries",
 			"Per-peer replication backlog: local mutation_log tail (MAX(seq)) minus the peer's acknowledged last_seq. One series per live peer; a single climbing series identifies the lagging peer",
@@ -269,6 +275,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hlcRejected
 	ch <- c.mutationLogSize
 	ch <- c.replicationMinSeq
+	ch <- c.replicationPending
 	ch <- c.replicationPeerLag
 	ch <- c.placementDecisions
 	ch <- c.hostPressure
@@ -405,6 +412,28 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.replicationMinSeq,
 			prometheus.GaugeValue, float64(rows[0].Int("m")))
 	}
+
+	// Replication backlog ahead of the slowest LIVE peer: entries written but
+	// not yet acked by the peer that's furthest behind. Complements
+	// mutation_log_rows (total, incl. already-replicated-but-unpruned) and
+	// replication_min_watermark_seq. Reported as 0 when there are no live peers
+	// so a single node (or a fully-partitioned one) doesn't report its whole
+	// log as "pending". The live cutoff matches the replicator's prune logic.
+	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
+	pending := 0.0
+	if wm, werr := c.db.Query(ctx,
+		`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
+		 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff); werr == nil && len(wm) > 0 {
+		if wm[0].Int("live") > 0 {
+			if mx, merr := c.db.Query(ctx,
+				`SELECT COALESCE(MAX(seq), 0) AS m FROM mutation_log`); merr == nil && len(mx) > 0 {
+				if lag := mx[0].Int("m") - wm[0].Int("minseq"); lag > 0 {
+					pending = float64(lag)
+				}
+			}
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(c.replicationPending, prometheus.GaugeValue, pending)
 
 	// Per-peer replication backlog: how far each LIVE peer is behind the local
 	// mutation_log tail. Restricted to watermarks updated within

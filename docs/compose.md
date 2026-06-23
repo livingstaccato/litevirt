@@ -439,7 +439,10 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
 ```
 
 All VMs in the stack automatically become backends. Backend IPs are discovered via
-ARP/DHCP after boot and persisted in the cluster database.
+ARP/DHCP after boot and persisted in the cluster database. **Containers in the stack
+are backends too** — a single LB can front a mix of VMs and containers; give a
+container NIC a static `ip:` (resolved cluster-wide) or, when the container runs on
+the LB's own host, a DHCP address is resolved locally.
 
 **Drain vs disable**: `lv lb drain` puts a backend in drain mode — it stops accepting
 new connections but finishes existing ones. `lv lb disable` immediately removes the

@@ -186,11 +186,15 @@ func killHAProxyByConfig(cfgPath string) {
 
 // Remove stops and removes LB instances for the given name.
 func (m *Manager) Remove(ctx context.Context, name string) error {
-	for _, pidFile := range []string{
+	keepalivedPid := filepath.Join(m.runDir, name+"-keepalived.pid")
+	pidFiles := []string{
 		filepath.Join(m.runDir, name+"-haproxy.pid"),
-		filepath.Join(m.runDir, name+"-keepalived.pid"),
+		keepalivedPid,
 		filepath.Join(m.runDir, name+"-conntrackd.pid"),
-	} {
+	}
+	// keepalived's vrrp/checkers children have their own per-LB pidfiles now.
+	pidFiles = append(pidFiles, keepalivedChildPidFiles(keepalivedPid)...)
+	for _, pidFile := range pidFiles {
 		killByPidFile(pidFile)
 	}
 
@@ -503,6 +507,30 @@ func (m *Manager) killOrphanedHAProxy(cfgPath string) {
 	}
 }
 
+// keepalivedArgs builds the keepalived command line for one LB instance.
+//
+// Each LB gets its own vrrp (-r) and checkers (-c) child pidfiles, derived from
+// the parent pidfile. keepalived's child processes otherwise default to shared
+// paths (/var/run/keepalived_vrrp.pid, /var/run/keepalived_checkers.pid), so a
+// second stack LB on the same host hits "daemon is already running" and never
+// assigns its VIP.
+func keepalivedArgs(cfgPath, pidFile string) []string {
+	base := strings.TrimSuffix(pidFile, ".pid")
+	return []string{
+		"-f", cfgPath,
+		"-p", pidFile,
+		"-r", base + "_vrrp.pid",
+		"-c", base + "_checkers.pid",
+	}
+}
+
+// keepalivedChildPidFiles returns the vrrp + checkers child pidfiles for a
+// parent keepalived pidfile (see keepalivedArgs), so teardown can reap them.
+func keepalivedChildPidFiles(pidFile string) []string {
+	base := strings.TrimSuffix(pidFile, ".pid")
+	return []string{base + "_vrrp.pid", base + "_checkers.pid"}
+}
+
 // startOrReloadKeepalived starts or restarts keepalived.
 func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	// Kill existing and wait for it to fully exit (release PID file lock).
@@ -526,10 +554,7 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	// Let keepalived daemonize (default behavior). It double-forks internally,
 	// writes its own PID file, and the initial process exits. cmd.Run() waits
 	// for that initial exit, then the actual daemon is reparented to init.
-	cmd := exec.Command("keepalived",
-		"-f", cfgPath,
-		"-p", pidFile,
-	)
+	cmd := exec.Command("keepalived", keepalivedArgs(cfgPath, pidFile)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("keepalived start: %w: %s", err, out)

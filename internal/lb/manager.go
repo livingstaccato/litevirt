@@ -162,7 +162,7 @@ func (m *Manager) Apply(ctx context.Context, cfg Config) error {
 	keepalivedPid := filepath.Join(m.runDir, cfg.Name+"-keepalived.pid")
 	if keepalivedChanged || !pidAlive(keepalivedPid) {
 		if err := m.startOrReloadKeepalived(keepalivedPath, keepalivedPid); err != nil {
-			slog.Warn("keepalived start failed (VIP may not be assigned)", "lb", cfg.Name, "error", err)
+			slog.Error("keepalived start failed — VIP NOT assigned, LB unreachable", "lb", cfg.Name, "error", err)
 		}
 	}
 
@@ -632,9 +632,16 @@ func (m *Manager) startOrReloadKeepalived(cfgPath, pidFile string) error {
 	if pid > 0 && processAlive(pid) {
 		slog.Info("keepalived started", "config", cfgPath, "pid", pid)
 	} else {
-		slog.Warn("keepalived may have failed to start", "config", cfgPath, "pid", pid, "output", string(out))
+		slog.Error("keepalived did not start — VIP will NOT be assigned", "config", cfgPath, "pid", pid, "output", string(out))
 	}
 	return nil
+}
+
+// KeepalivedRunning reports whether this LB's keepalived process is alive — the
+// real signal that its VIP is assigned. HAProxy binds the VIP non-locally even
+// when keepalived is down, so "haproxy is up" is NOT evidence the VIP works.
+func (m *Manager) KeepalivedRunning(name string) bool {
+	return pidAlive(filepath.Join(m.runDir, name+"-keepalived.pid"))
 }
 
 // startConntrackd starts conntrackd for SNAT conntrack replication.

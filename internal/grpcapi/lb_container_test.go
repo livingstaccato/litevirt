@@ -70,6 +70,39 @@ func TestInspectLB_HealthOverlay(t *testing.T) {
 	}
 }
 
+// An enabled LB whose keepalived isn't running on the host that should run it is
+// reported "degraded" — its VIP isn't actually assigned even though HAProxy
+// binds it non-locally and would otherwise look "active".
+func TestInspectLB_DegradedWhenKeepalivedDown(t *testing.T) {
+	s := testServer(t) // hostName = "test-host"
+	ctx := adminCtx()
+	if err := corrosion.UpsertLBConfig(ctx, s.db, corrosion.LBConfigRecord{
+		Name: "app-lb", StackName: "app", VIP: "10.0.0.9/24", Algorithm: "roundrobin",
+		Hosts: `["test-host"]`, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Health reachable (so degraded comes only from the VIP/keepalived check).
+	s.lbHealthOverride = func(context.Context, string) (map[string]string, error) {
+		return map[string]string{}, nil
+	}
+
+	s.lbKeepalivedOverride = func(string) bool { return false } // VIP not assigned
+	lbResp, err := s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "app-lb"})
+	if err != nil {
+		t.Fatalf("InspectLoadBalancer: %v", err)
+	}
+	if lbResp.State != "degraded" {
+		t.Errorf("state = %q, want degraded (keepalived down → VIP unassigned)", lbResp.State)
+	}
+
+	s.lbKeepalivedOverride = func(string) bool { return true } // VIP assigned
+	lbResp, _ = s.InspectLoadBalancer(ctx, &pb.InspectLBRequest{Name: "app-lb"})
+	if lbResp.State != "active" {
+		t.Errorf("state = %q, want active when keepalived is up", lbResp.State)
+	}
+}
+
 var errStatsUnavailableForTest = &lbTestErr{"haproxy not running"}
 
 type lbTestErr struct{ s string }

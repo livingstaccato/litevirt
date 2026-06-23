@@ -302,7 +302,8 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 	// inspect reflects whether a backend is actually serving (not just whether
 	// its workload is running). Inspect-only: listing every LB would fan out a
 	// stats query per LB. On failure, keep run-state status + flag it.
-	if health, herr := s.lbHealthByServer(ctx, result.Name); herr == nil {
+	health, herr := s.lbHealthByServer(ctx, result.Name)
+	if herr == nil {
 		for _, b := range result.Backends {
 			if hs, ok := health[b.VmName]; ok {
 				b.Status = mapHAProxyStatus(hs, b.Status)
@@ -313,7 +314,35 @@ func (s *Server) InspectLoadBalancer(ctx context.Context, req *pb.InspectLBReque
 			b.LastError = "haproxy health unavailable"
 		}
 	}
+
+	// VIP health: an enabled LB is "degraded" when its VIP isn't actually
+	// assigned. The reliable signal is keepalived NOT running on a host that is
+	// supposed to run this LB — HAProxy binds the VIP non-locally, so without
+	// this check a down-VIP LB would still look "active". We only assert this
+	// when inspecting ON an LB host (runsHere); a precise remote keepalived
+	// check would need an additive RPC and is a documented follow-up. (Stats
+	// being unreachable is NOT treated as degraded — that conflates "can't ask"
+	// with "VIP down".)
+	if state == "active" {
+		for _, h := range lbHosts {
+			if h == s.hostName {
+				if !s.lbKeepalivedRunning(result.Name) {
+					result.State = "degraded"
+				}
+				break
+			}
+		}
+	}
 	return result, nil
+}
+
+// lbKeepalivedRunning reports whether this host's keepalived for an LB is alive
+// (VIP assigned). Test seam: lbKeepalivedOverride replaces the real check.
+func (s *Server) lbKeepalivedRunning(name string) bool {
+	if s.lbKeepalivedOverride != nil {
+		return s.lbKeepalivedOverride(name)
+	}
+	return lb.NewManager().KeepalivedRunning(name)
 }
 
 func (s *Server) DisableBackend(ctx context.Context, req *pb.DisableBackendRequest) (*pb.LoadBalancer, error) {
@@ -581,10 +610,24 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 // lbApplyDisabled test seam lets unit tests exercise CreateLoadBalancer's
 // persistence + rollback logic without root privileges or a haproxy binary.
 func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
+	var err error
 	if s.lbApplyOverride != nil {
-		return s.lbApplyOverride(ctx, cfg)
+		err = s.lbApplyOverride(ctx, cfg)
+	} else {
+		err = lb.NewManager().Apply(ctx, cfg)
 	}
-	return lb.NewManager().Apply(ctx, cfg)
+	if err == nil {
+		s.recordLBKeepalived(cfg.Name) // publish whether the VIP came up
+	}
+	return err
+}
+
+// removeLBLocal stops this host's haproxy/keepalived for an LB and clears its
+// health gauge. Single chokepoint so teardown always drops the metric.
+func (s *Server) removeLBLocal(ctx context.Context, name string) error {
+	err := lb.NewManager().Remove(ctx, name)
+	s.clearLBKeepalived(name)
+	return err
 }
 
 func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest) (*pb.LoadBalancer, error) {
@@ -742,8 +785,7 @@ func (s *Server) UpdateLoadBalancer(ctx context.Context, req *pb.UpdateLBRequest
 				Interface: lb.DetectInterfaceForIP(vipIP), VRID: s.allocVRID(ctx, req.Name),
 				Priority: priority, Backends: lbBackends, Ports: ports, Algorithm: algorithm,
 			}
-			mgr := lb.NewManager()
-			if err := mgr.Apply(ctx, cfg); err != nil {
+			if err := s.applyLBLocal(ctx, cfg); err != nil {
 				slog.Warn("UpdateLoadBalancer: local apply failed", "error", err)
 			}
 			break
@@ -807,8 +849,7 @@ func (s *Server) DeleteLoadBalancer(ctx context.Context, req *pb.DeleteLBRequest
 	}
 
 	// Stop locally.
-	mgr := lb.NewManager()
-	if err := mgr.Remove(ctx, req.Name); err != nil {
+	if err := s.removeLBLocal(ctx, req.Name); err != nil {
 		slog.Warn("DeleteLoadBalancer: local remove failed", "error", err)
 	}
 
@@ -1081,8 +1122,7 @@ func (s *Server) removeLBFromStaleHosts(ctx context.Context, lbName string, oldH
 		}
 		if h == s.hostName {
 			// Remove locally.
-			mgr := lb.NewManager()
-			if err := mgr.Remove(ctx, lbName); err != nil {
+			if err := s.removeLBLocal(ctx, lbName); err != nil {
 				slog.Warn("removeLBFromStaleHosts: local remove failed", "lb", lbName, "error", err)
 			} else {
 				slog.Info("removeLBFromStaleHosts: removed locally", "lb", lbName)
@@ -1218,8 +1258,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 		Algorithm: algorithm,
 	}
 
-	mgr := lb.NewManager()
-	if err := mgr.Apply(ctx, cfg); err != nil {
+	if err := s.applyLBLocal(ctx, cfg); err != nil {
 		return nil, status.Errorf(codes.Internal, "apply LB: %v", err)
 	}
 
@@ -1246,8 +1285,7 @@ func (s *Server) RemoveLB(ctx context.Context, req *pb.RemoveLBRequest) (*emptyp
 		lbVIP = rows[0].String("vip")
 	}
 
-	mgr := lb.NewManager()
-	if err := mgr.Remove(ctx, req.LbName); err != nil {
+	if err := s.removeLBLocal(ctx, req.LbName); err != nil {
 		return nil, status.Errorf(codes.Internal, "remove LB: %v", err)
 	}
 
@@ -1486,8 +1524,7 @@ func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []c
 
 	// Stop haproxy + keepalived locally.
 	slog.Info("removeLBForStack: removing LB", "stack", stackName, "lb", lbName)
-	mgr := lb.NewManager()
-	if err := mgr.Remove(ctx, lbName); err != nil {
+	if err := s.removeLBLocal(ctx, lbName); err != nil {
 		slog.Warn("removeLBForStack: local remove failed", "lb", lbName, "error", err)
 	} else {
 		slog.Info("removeLBForStack: local processes stopped", "lb", lbName)
@@ -1604,8 +1641,7 @@ func (s *Server) applyLBForStack(ctx context.Context, lbName, vip, algorithm str
 		Health:    health,
 	}
 
-	mgr := lb.NewManager()
-	if err := mgr.Apply(ctx, cfg); err != nil {
+	if err := s.applyLBLocal(ctx, cfg); err != nil {
 		return err
 	}
 

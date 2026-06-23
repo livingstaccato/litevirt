@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,26 @@ func testManager(t *testing.T) *Manager {
 	return &Manager{
 		configDir: filepath.Join(dir, "config"),
 		runDir:    filepath.Join(dir, "run"),
+	}
+}
+
+// KeepalivedRunning is the VIP-assigned signal: true only when the pidfile
+// names a live process. A missing pidfile → false (VIP not assigned).
+func TestKeepalivedRunning(t *testing.T) {
+	m := testManager(t)
+	if err := os.MkdirAll(m.runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if m.KeepalivedRunning("nope-lb") {
+		t.Error("no pidfile → should be false")
+	}
+	// A pidfile pointing at this test process (definitely alive) → true.
+	pidPath := filepath.Join(m.runDir, "live-lb-keepalived.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !m.KeepalivedRunning("live-lb") {
+		t.Error("pidfile of a live process → should be true")
 	}
 }
 

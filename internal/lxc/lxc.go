@@ -87,6 +87,10 @@ type Runtime interface {
 	Exec(ctx context.Context, name string, argv []string) (ExecResult, error)
 	// State queries lxc-info for the current state.
 	State(ctx context.Context, name string) (State, error)
+	// IP returns the container's primary IPv4 address (lxc-info -iH), or ""
+	// if it has none yet. Used to discover a running container's address for
+	// load balancer backends.
+	IP(ctx context.Context, name string) (string, error)
 	// List enumerates every container known to LXC on this host.
 	List(ctx context.Context) ([]string, error)
 }
@@ -318,6 +322,29 @@ func (r *LxcRunner) State(ctx context.Context, name string) (State, error) {
 		return StateUnknown, err
 	}
 	return parseLxcInfoState(string(out)), nil
+}
+
+// IP returns the container's primary IPv4 (lxc-info -iH), or "" if it has
+// none assigned yet. `-iH` prints one IP per line (IPv4 and IPv6); we pick the
+// first IPv4 that isn't loopback so the result is usable as an LB backend.
+func (r *LxcRunner) IP(ctx context.Context, name string) (string, error) {
+	out, _, err := r.run(ctx, "lxc-info", "-n", name, "-iH")
+	if err != nil {
+		return "", err
+	}
+	return parseLxcInfoIP(string(out)), nil
+}
+
+// parseLxcInfoIP returns the first non-loopback IPv4 from lxc-info -iH output.
+func parseLxcInfoIP(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		ip := net.ParseIP(strings.TrimSpace(line))
+		if ip == nil || ip.To4() == nil || ip.IsLoopback() {
+			continue
+		}
+		return ip.String()
+	}
+	return ""
 }
 
 // List enumerates lxc-ls --running --stopped output.

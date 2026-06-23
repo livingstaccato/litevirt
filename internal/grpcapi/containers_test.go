@@ -32,6 +32,10 @@ type fakeCTRuntime struct {
 
 	createErr error
 	createOut *ContainerInfo
+
+	// ipByName lets a test simulate a locally-discovered (e.g. DHCP) container
+	// IP — what IPContainer (lxc-info -iH) would return on the LB host.
+	ipByName map[string]string
 }
 
 func (f *fakeCTRuntime) CreateContainer(_ context.Context, opts CreateContainerOpts) (*ContainerInfo, error) {
@@ -77,7 +81,12 @@ func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []str
 	return ContainerExecResult{Stdout: []byte("ok"), ExitCode: 0}, nil
 }
 func (f *fakeCTRuntime) StateContainer(_ context.Context, _ string) (string, error) { return "running", nil }
-func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error)         { return nil, nil }
+func (f *fakeCTRuntime) IPContainer(_ context.Context, name string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.ipByName[name], nil
+}
+func (f *fakeCTRuntime) ListContainers(_ context.Context) ([]string, error) { return nil, nil }
 func (f *fakeCTRuntime) PullOCIImage(_ context.Context, image, dest, tag, username, password string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

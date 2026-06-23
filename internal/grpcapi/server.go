@@ -151,6 +151,7 @@ type ContainerRuntime interface {
 	DeleteContainer(ctx context.Context, name string) error
 	ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error)
 	StateContainer(ctx context.Context, name string) (string, error)
+	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
 	PullOCIImage(ctx context.Context, image, dest, tag, username, password string) error
 }

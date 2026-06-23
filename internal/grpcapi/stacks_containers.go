@@ -92,6 +92,12 @@ func (s *Server) buildContainerRequest(ctx context.Context, instanceName string,
 			Ip:     n.IP,
 			Mac:    n.MAC,
 		})
+		// Record the first static address so the container can be discovered as
+		// an LB backend cluster-wide (see corrosion.LabelIP). DHCP NICs (no IP)
+		// are resolved locally on the LB host at apply time instead.
+		if n.IP != "" && labels[corrosion.LabelIP] == "" {
+			labels[corrosion.LabelIP] = n.IP
+		}
 	}
 	return req, nil
 }

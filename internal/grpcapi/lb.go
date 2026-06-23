@@ -67,6 +67,24 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 
 // lbBackends returns the live backend list for an LB by looking up running VMs
 // in the corresponding stack, or explicit backends from lb_backends table.
+// containerBackendIP resolves a stack container's address for LB backend use.
+// Containers have no vm_interfaces row, so the address comes from the recorded
+// static IP (corrosion.LabelIP, replicated cluster-wide) first, then a local
+// lxc-info lookup when the container runs on this host (covers DHCP NICs).
+// A DHCP container on a *remote* host with no recorded IP is not yet resolved
+// (a peer GetContainerIPRemote, mirroring VMs, is the follow-up).
+func (s *Server) containerBackendIP(ctx context.Context, ct corrosion.ContainerRecord) string {
+	if ip := ct.Labels[corrosion.LabelIP]; ip != "" {
+		return ip
+	}
+	if ct.HostName == s.hostName && s.containerRuntime != nil {
+		if ip, err := s.containerRuntime.IPContainer(ctx, ct.Name); err == nil {
+			return ip
+		}
+	}
+	return ""
+}
+
 func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend {
 	// Try explicit backends first (standalone LBs).
 	explicitBackends, _ := corrosion.ListLBBackends(ctx, s.db, lbName)
@@ -123,6 +141,20 @@ func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend 
 		backends = append(backends, &pb.LBBackend{
 			VmName:  vm.Name,
 			Address: ip,
+			Status:  st,
+		})
+	}
+
+	// Container backends in the same stack (found via the reserved stack label).
+	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
+	for _, ct := range cts {
+		st := "active"
+		if ct.State != "running" {
+			st = "down"
+		}
+		backends = append(backends, &pb.LBBackend{
+			VmName:  ct.Name,
+			Address: s.containerBackendIP(ctx, ct),
 			Status:  st,
 		})
 	}
@@ -1226,6 +1258,25 @@ func (s *Server) collectLBBackends(ctx context.Context, stackName string, lbSpec
 				break
 			}
 		}
+	}
+
+	// Container backends in the same stack (found via the reserved stack label).
+	// Containers have no vm_interfaces row; their address is the recorded static
+	// IP or a local lxc-info lookup (see containerBackendIP).
+	targetPort := 80
+	if len(lbSpec.Ports) > 0 {
+		targetPort = int(lbSpec.Ports[0].Target)
+	}
+	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
+	for _, ct := range cts {
+		if ct.State != "running" {
+			continue
+		}
+		ip := s.containerBackendIP(ctx, ct)
+		if ip == "" {
+			continue
+		}
+		backends = append(backends, lb.Backend{Name: ct.Name, IP: ip, Port: targetPort})
 	}
 	return backends
 }

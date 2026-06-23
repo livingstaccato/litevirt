@@ -41,6 +41,11 @@ func TestBuildContainerRequest(t *testing.T) {
 	if len(req.Networks) != 1 || req.Networks[0].Name != "lan" || req.Networks[0].Ip != "10.0.1.5" {
 		t.Errorf("network mapping wrong: %+v", req.Networks)
 	}
+	// A static NIC address is recorded as the reserved IP label so the container
+	// can be discovered as an LB backend cluster-wide.
+	if req.Labels[corrosion.LabelIP] != "10.0.1.5" {
+		t.Errorf("LabelIP = %q, want 10.0.1.5 (from static NIC)", req.Labels[corrosion.LabelIP])
+	}
 
 	// "alpine" (no release).
 	req, err = s.buildContainerRequest(ctx, "c", &compose.VMDef{Kind: compose.WorkloadKindLXC, Image: "alpine"}, f, "h")

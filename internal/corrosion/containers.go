@@ -18,6 +18,11 @@ const (
 	// container (LXC) runtime is available. Compose requires it when placing
 	// container workloads so they never land on a non-LXC host.
 	LabelLXCCapable = "litevirt.lxc"
+	// LabelIP records a container's primary IPv4 so it can serve as a load
+	// balancer backend cluster-wide (containers have no vm_interfaces table).
+	// Set from a static compose NIC address at create; the LB host re-discovers
+	// a DHCP address locally via lxc-info when this is empty.
+	LabelIP = "litevirt.ip"
 )
 
 // ContainerRecord is one LXC/OCI container's cluster-state row.

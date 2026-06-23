@@ -85,78 +85,106 @@ func (s *Server) containerBackendIP(ctx context.Context, ct corrosion.ContainerR
 	return ""
 }
 
-func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend {
-	// Try explicit backends first (standalone LBs).
-	explicitBackends, _ := corrosion.ListLBBackends(ctx, s.db, lbName)
-	if len(explicitBackends) > 0 {
-		var backends []*pb.LBBackend
-		for _, b := range explicitBackends {
-			st := "active"
-			if !b.Enabled {
-				st = "disabled"
-			}
-			backends = append(backends, &pb.LBBackend{
-				VmName:  b.VMName,
-				Address: b.Address,
-				Status:  st,
-			})
-		}
-		return backends
-	}
+// resolvedBackend is one LB backend (VM or container) with its discovered
+// address and run-state, independent of the caller's output shape.
+type resolvedBackend struct {
+	Name    string
+	IP      string
+	Running bool
+}
 
-	// Derive stack name from LB name (strip "-lb" suffix).
-	stackName := strings.TrimSuffix(lbName, "-lb")
-	if stackName == lbName {
-		return nil
+// remoteVMIP asks a peer for a VM interface's live IP (best-effort, "" on any error).
+func (s *Server) remoteVMIP(ctx context.Context, host, mac, networkName string) string {
+	client, conn, err := s.peerClient(ctx, host)
+	if err != nil {
+		return ""
 	}
+	defer conn.Close()
+	resp, err := client.GetVMIPRemote(ctx, &pb.GetVMIPRequest{Mac: mac, NetworkName: networkName})
+	if err != nil {
+		return ""
+	}
+	return resp.Ip
+}
 
+// resolveStackBackends resolves the LB backends for a stack — its VMs (address
+// from the vm_interfaces row, then local ARP/DHCP for running VMs on this host,
+// then a peer GetVMIPRemote lookup when allowRemote) and its containers
+// (containerBackendIP). When persist is set, a freshly-discovered VM IP is
+// written back to vm_interfaces. The status path uses allowRemote=false /
+// persist=false (fast, read-only — keeps `lv lb ls` cheap); the render path
+// uses allowRemote=true / persist=true (full discovery). This is the single
+// source of truth for "which backends does this stack's LB have."
+func (s *Server) resolveStackBackends(ctx context.Context, stackName string, allowRemote, persist bool) []resolvedBackend {
 	vms, err := corrosion.ListVMs(ctx, s.db, stackName, "")
 	if err != nil {
+		slog.Warn("resolveStackBackends: list VMs", "stack", stackName, "error", err)
 		return nil
 	}
-
-	var backends []*pb.LBBackend
+	var out []resolvedBackend
 	for _, vm := range vms {
+		running := vm.State == "running"
 		ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
 		ip := ""
 		for _, iface := range ifaces {
 			ip = iface.IP
-			if ip == "" && vm.HostName == s.hostName {
+			// Live discovery only makes sense for a running VM.
+			if ip == "" && running && vm.HostName == s.hostName {
 				ip = lv.GetIPFromARP(iface.MAC)
 			}
-			if ip == "" && vm.HostName == s.hostName {
+			if ip == "" && running && vm.HostName == s.hostName {
 				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
 			}
-			if ip != "" && ip != iface.IP {
+			if ip == "" && running && allowRemote && vm.HostName != s.hostName {
+				ip = s.remoteVMIP(ctx, vm.HostName, iface.MAC, iface.NetworkName)
+			}
+			if persist && running && ip != "" && ip != iface.IP {
 				corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
 			}
 			if ip != "" {
 				break
 			}
 		}
-		st := "active"
-		if vm.State != "running" {
-			st = "down"
-		}
-		backends = append(backends, &pb.LBBackend{
-			VmName:  vm.Name,
-			Address: ip,
-			Status:  st,
-		})
+		out = append(out, resolvedBackend{Name: vm.Name, IP: ip, Running: running})
 	}
-
-	// Container backends in the same stack (found via the reserved stack label).
+	// Containers in the stack (found via the reserved stack label).
 	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
 	for _, ct := range cts {
+		out = append(out, resolvedBackend{Name: ct.Name, IP: s.containerBackendIP(ctx, ct), Running: ct.State == "running"})
+	}
+	return out
+}
+
+// lbBackends returns the backend list for the LB status views. Run-state derived
+// (a backend is "active" when its workload is running); InspectLoadBalancer
+// overlays real HAProxy health on top. Read-only and no peer RPCs so `lv lb ls`
+// stays fast.
+func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend {
+	// Explicit backends first (standalone LBs).
+	if explicit, _ := corrosion.ListLBBackends(ctx, s.db, lbName); len(explicit) > 0 {
+		var backends []*pb.LBBackend
+		for _, b := range explicit {
+			st := "active"
+			if !b.Enabled {
+				st = "disabled"
+			}
+			backends = append(backends, &pb.LBBackend{VmName: b.VMName, Address: b.Address, Status: st})
+		}
+		return backends
+	}
+
+	stackName := strings.TrimSuffix(lbName, "-lb")
+	if stackName == lbName {
+		return nil
+	}
+
+	var backends []*pb.LBBackend
+	for _, rb := range s.resolveStackBackends(ctx, stackName, false, false) {
 		st := "active"
-		if ct.State != "running" {
+		if !rb.Running {
 			st = "down"
 		}
-		backends = append(backends, &pb.LBBackend{
-			VmName:  ct.Name,
-			Address: s.containerBackendIP(ctx, ct),
-			Status:  st,
-		})
+		backends = append(backends, &pb.LBBackend{VmName: rb.Name, Address: rb.IP, Status: st})
 	}
 	return backends
 }
@@ -1205,78 +1233,20 @@ func (s *Server) applyLBFromSpecWithRetry(ctx context.Context, spec *pb.VMSpec) 
 
 // collectLBBackends gathers IPs for all running VMs in a stack, using ARP/DHCP
 // fallback for IPs not yet stored in corrosion.
+// collectLBBackends builds the HAProxy server list for the render/apply path:
+// running backends with a resolved IP, at the LB's target port. Uses full
+// discovery (peer lookups + IP persistence) so a freshly-migrated VM resolves.
 func (s *Server) collectLBBackends(ctx context.Context, stackName string, lbSpec *pb.LBSpec) []lb.Backend {
-	vms, err := corrosion.ListVMs(ctx, s.db, stackName, "")
-	if err != nil {
-		slog.Warn("collectLBBackends: list VMs", "stack", stackName, "error", err)
-		return nil
-	}
-
-	var backends []lb.Backend
-	for _, vm := range vms {
-		if vm.State != "running" {
-			continue
-		}
-		ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-		for _, iface := range ifaces {
-			ip := iface.IP
-			// ARP/DHCP fallback for freshly booted VMs on this host.
-			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromARP(iface.MAC)
-			}
-			if ip == "" && vm.HostName == s.hostName {
-				ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", iface.MAC)
-			}
-			// Remote host IP discovery fallback.
-			if ip == "" && vm.HostName != s.hostName {
-				client, conn, err := s.peerClient(ctx, vm.HostName)
-				if err == nil {
-					resp, err := client.GetVMIPRemote(ctx, &pb.GetVMIPRequest{
-						Mac:         iface.MAC,
-						NetworkName: iface.NetworkName,
-					})
-					conn.Close()
-					if err == nil && resp.Ip != "" {
-						ip = resp.Ip
-					}
-				}
-			}
-			// Persist discovered IP for future lookups.
-			if ip != "" && ip != iface.IP {
-				corrosion.UpdateVMInterfaceIP(ctx, s.db, vm.Name, iface.NetworkName, ip)
-			}
-			if ip != "" {
-				targetPort := 80
-				if len(lbSpec.Ports) > 0 {
-					targetPort = int(lbSpec.Ports[0].Target)
-				}
-				backends = append(backends, lb.Backend{
-					Name: vm.Name,
-					IP:   ip,
-					Port: targetPort,
-				})
-				break
-			}
-		}
-	}
-
-	// Container backends in the same stack (found via the reserved stack label).
-	// Containers have no vm_interfaces row; their address is the recorded static
-	// IP or a local lxc-info lookup (see containerBackendIP).
 	targetPort := 80
 	if len(lbSpec.Ports) > 0 {
 		targetPort = int(lbSpec.Ports[0].Target)
 	}
-	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
-	for _, ct := range cts {
-		if ct.State != "running" {
+	var backends []lb.Backend
+	for _, rb := range s.resolveStackBackends(ctx, stackName, true, true) {
+		if !rb.Running || rb.IP == "" {
 			continue
 		}
-		ip := s.containerBackendIP(ctx, ct)
-		if ip == "" {
-			continue
-		}
-		backends = append(backends, lb.Backend{Name: ct.Name, IP: ip, Port: targetPort})
+		backends = append(backends, lb.Backend{Name: rb.Name, IP: rb.IP, Port: targetPort})
 	}
 	return backends
 }

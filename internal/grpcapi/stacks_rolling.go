@@ -142,11 +142,14 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 			}
 
 		case planner.OpUpdate:
-			if _, delErr := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: action.VMName}); delErr != nil {
-				slog.Warn("deploy update delete failed", "vm", action.VMName, "error", delErr)
+			// Recreate: delete then re-create. For containers (no in-place
+			// reconfigure yet) this is the update strategy; deleteWorkload +
+			// deployCreatePlanned route by workload kind.
+			if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+				slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
 			}
 			if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
-				slog.Warn("deploy update recreate failed", "vm", action.VMName, "host", action.TargetHost, "error", vmErr)
+				slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)
 				if sendErr := stream.Send(&pb.DeployProgress{
 					Phase:  "error",
 					VmName: action.VMName,
@@ -158,8 +161,8 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 			}
 
 		case planner.OpDelete:
-			if _, delErr := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: action.VMName}); delErr != nil {
-				slog.Warn("deploy delete failed", "vm", action.VMName, "error", delErr)
+			if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+				slog.Warn("deploy delete failed", "workload", action.VMName, "error", delErr)
 			}
 		}
 
@@ -178,13 +181,20 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 // deletes. Creates execute first (scale-up), then updates are delegated to
 // the rolling update engine, then deletes execute (scale-down).
 func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File, resolved *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
-	var creates, updates, deletes []planner.VMAction
+	var creates, updates, ctUpdates, deletes []planner.VMAction
 	for _, a := range resolved.VMs {
 		switch a.Kind {
 		case planner.OpCreate:
 			creates = append(creates, a)
 		case planner.OpUpdate:
-			updates = append(updates, a)
+			// The rolling engine is VM-only (it operates on the vms table), so
+			// container updates are recreated inline below; only VM updates go
+			// through it.
+			if a.IsContainer {
+				ctUpdates = append(ctUpdates, a)
+			} else {
+				updates = append(updates, a)
+			}
 		case planner.OpDelete:
 			deletes = append(deletes, a)
 		}
@@ -208,7 +218,22 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 		_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: action.VMName, ProgressPct: 100})
 	}
 
-	// Rolling updates.
+	// Container updates: inline recreate (the rolling engine doesn't handle
+	// containers). delete-then-create on the resolved host.
+	for _, action := range ctUpdates {
+		_ = stream.Send(&pb.DeployProgress{Phase: "applying", VmName: action.VMName, Detail: action.Detail})
+		if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+			slog.Warn("rolling update: container delete failed", "workload", action.VMName, "error", delErr)
+		}
+		if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
+			slog.Warn("rolling update: container recreate failed", "workload", action.VMName, "error", vmErr)
+			_ = stream.Send(&pb.DeployProgress{Phase: "error", VmName: action.VMName, Error: vmErr.Error()})
+			continue
+		}
+		_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: action.VMName, ProgressPct: 100})
+	}
+
+	// Rolling updates (VMs only).
 	if len(updates) > 0 {
 		strategy := useRollingUpdate(f)
 		_ = stream.Send(&pb.DeployProgress{
@@ -239,8 +264,8 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 	// Execute deletes (scale-down).
 	for _, action := range deletes {
 		_ = stream.Send(&pb.DeployProgress{Phase: "applying", VmName: action.VMName, Detail: action.Detail})
-		if _, delErr := s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: action.VMName}); delErr != nil {
-			slog.Warn("deploy delete failed", "vm", action.VMName, "error", delErr)
+		if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+			slog.Warn("deploy delete failed", "workload", action.VMName, "error", delErr)
 		}
 		_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: action.VMName, ProgressPct: 100})
 	}

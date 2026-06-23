@@ -150,8 +150,18 @@ workloads:
 ```
 
 `kind: lxc` and `kind: oci` route to the container runtime (see
-[`docs/containers.md`](containers.md)); `kind: oci` pulls the named OCI image
-(via skopeo + umoci) and runs it as an LXC container.
+[`docs/containers.md`](containers.md)) and are full compose citizens: `lv compose
+up` creates **and starts** them, re-apply is idempotent (unchanged containers are
+left alone), a changed spec recreates the container, and `lv compose down`
+removes them. Placement is **LXC-aware** — containers are only scheduled onto
+hosts that advertise the container runtime, so they never land on a node that
+can't run them. Image forms: `kind: lxc` takes a download template (`image:
+"alpine:3.21"`) or a rootfs path; an OCI **registry ref** must be pre-pulled
+today (`lv ct pull <ref> --dest <rootfs-dir>`, then set `image:` to that rootfs
+path). Remaining follow-ups: OCI registry-ref auto-pull; in-place reconfigure
+(cpu/mem changes recreate the container rather than live-tuning); and full
+network/IPAM/security-group provisioning for container NICs (a container sharing
+a stack network with a VM uses the bridge the VM path provisions).
 
 ## Service inheritance
 
@@ -429,7 +439,10 @@ Standalone load balancers (not tied to a stack) can also be created with `lv lb 
 ```
 
 All VMs in the stack automatically become backends. Backend IPs are discovered via
-ARP/DHCP after boot and persisted in the cluster database.
+ARP/DHCP after boot and persisted in the cluster database. **Containers in the stack
+are backends too** — a single LB can front a mix of VMs and containers; give a
+container NIC a static `ip:` (resolved cluster-wide) or, when the container runs on
+the LB's own host, a DHCP address is resolved locally.
 
 **Drain vs disable**: `lv lb drain` puts a backend in drain mode — it stops accepting
 new connections but finishes existing ones. `lv lb disable` immediately removes the

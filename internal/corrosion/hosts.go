@@ -137,6 +137,35 @@ func roleOrDefault(s string) string {
 	return s
 }
 
+// SetHostLabel merges a single key=value into a host's labels (the hosts.labels
+// JSON column that placement reads). A no-op when the value is unchanged, so a
+// caller that re-asserts the same label every daemon start (e.g. LXC capability)
+// doesn't churn replication. Use the empty host row gracefully — if the host
+// isn't registered yet the UPDATE simply matches nothing.
+func SetHostLabel(ctx context.Context, c *Client, host, key, value string) error {
+	h, err := GetHost(ctx, c, host)
+	if err != nil {
+		return err
+	}
+	labels := map[string]string{}
+	if h != nil {
+		for k, v := range h.Labels {
+			labels[k] = v
+		}
+	}
+	if labels[key] == value {
+		return nil // unchanged — avoid replication churn
+	}
+	labels[key] = value
+	b, err := json.Marshal(labels)
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx,
+		`UPDATE hosts SET labels = ?, updated_at = ? WHERE name = ?`,
+		string(b), time.Now().UTC().Format(time.RFC3339), host)
+}
+
 func decodeLabels(raw string) map[string]string {
 	m := map[string]string{}
 	if raw != "" {

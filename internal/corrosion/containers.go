@@ -6,6 +6,25 @@ import (
 	"time"
 )
 
+// Reserved labels litevirt uses to manage compose-deployed containers. They
+// live here (the lowest layer) so corrosion, compose, grpcapi, and the daemon
+// can all reference them without an import cycle.
+const (
+	// LabelStack tags a container with the compose stack that created it. The
+	// containers table has no stack_name column, so this label is the stack
+	// association the deploy planner (current-state diff) and teardown use.
+	LabelStack = "litevirt.stack"
+	// LabelLXCCapable is the HOST label the daemon sets to advertise that the
+	// container (LXC) runtime is available. Compose requires it when placing
+	// container workloads so they never land on a non-LXC host.
+	LabelLXCCapable = "litevirt.lxc"
+	// LabelIP records a container's primary IPv4 so it can serve as a load
+	// balancer backend cluster-wide (containers have no vm_interfaces table).
+	// Set from a static compose NIC address at create; the LB host re-discovers
+	// a DHCP address locally via lxc-info when this is empty.
+	LabelIP = "litevirt.ip"
+)
+
 // ContainerRecord is one LXC/OCI container's cluster-state row.
 // populated by the daemon owning the container; the
 // `lv ct ls` query reads across the whole cluster.
@@ -152,6 +171,24 @@ func ListContainers(ctx context.Context, c *Client, hostName string) ([]Containe
 			Labels:        decodeContainerLabels(r.String("labels")),
 			RestartPolicy: r.String("restart_policy"), StateDetail: r.String("state_detail"),
 			CreatedAt: r.String("created_at"), UpdatedAt: r.String("updated_at"),
+		}
+	}
+	return out, nil
+}
+
+// ListContainersByStack returns active containers tagged with the given compose
+// stack (via the LabelStack label set at deploy time). Compose uses this for
+// idempotent re-apply (current state) and teardown — the containers table has
+// no stack_name column, so the label is the association.
+func ListContainersByStack(ctx context.Context, c *Client, stack string) ([]ContainerRecord, error) {
+	all, err := ListContainers(ctx, c, "")
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ContainerRecord, 0)
+	for _, ct := range all {
+		if ct.Labels[LabelStack] == stack {
+			out = append(out, ct)
 		}
 	}
 	return out, nil

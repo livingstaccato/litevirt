@@ -124,15 +124,38 @@ workloads:
     network: [{ name: prod, ip: 10.0.0.5 }]
 
   web-ct:
-    kind: oci
-    image: docker.io/library/nginx:1.27
+    kind: lxc
+    image: alpine:3.21          # download template (distro:release) or a rootfs path
     cpu: 2
     memory: 512
     network: [{ name: prod, ip: 10.0.0.6 }]
 ```
 
-The legacy `vms:` map still parses — every entry there gets `kind: vm`
-applied implicitly so existing stacks need no changes.
+Containers are full compose citizens: `lv compose up` creates **and starts** each
+container on an LXC-capable host (placement is capability-aware, so a container
+never lands on a node without the runtime); re-apply is idempotent (unchanged
+containers are left alone, a changed spec recreates); and `lv compose down`
+removes them and every trace they created (rootfs, the stack's network bridge +
+dnsmasq, and any load balancer processes). The legacy `vms:` map still parses —
+every entry there gets `kind: vm` applied implicitly so existing stacks need no
+changes.
+
+Containers attach to a stack's networks the same way VMs do — give the NIC a
+static `ip:` (litevirt assigns it and writes the guest's `/etc/network/interfaces`),
+or omit it for DHCP off the network's dnsmasq.
+
+**Load balancer backends.** A stack `loadbalancer:` discovers containers as
+backends alongside VMs, so a single LB can front a mix of both. Use a static NIC
+`ip:` for the container (recorded cluster-wide); a DHCP-assigned address is also
+resolved when the container runs on the LB's own host. (A DHCP container on a
+*different* host than the LB isn't auto-discovered yet — a follow-up.)
+
+Current limits: an OCI **registry ref** (`kind: oci`, `image:
+docker.io/library/nginx:1.27`) isn't auto-pulled by compose yet — pre-pull it
+(`lv ct pull <ref> --dest <dir>`) and set `image:` to that rootfs path. A cpu/mem
+change recreates the container (no in-place reconfigure). `lv compose ps` lists
+VMs only. Containers cannot be **migrated** (no CRIU); use re-create. Per-NIC
+security-group provisioning for containers is a follow-up.
 
 ## Networking
 
@@ -227,9 +250,9 @@ A `FROZEN` (paused) container maps to running and is never restarted.
 - OCI image cache reuse — each `lv ct pull` re-fetches from the
   registry; the backup chunk store will eventually absorb image
   layers.
-- Full compose `workloads:` → Containers RPC dispatch. The parser
-  reads the `workloads:` map and `kind:` discriminator today
-  (`compose.File.Workloads`); deploy/redeploy currently rejects
-  `kind: lxc` and `kind: oci` with a pointer to `lv ct create`. The
-  follow-up wires the dispatcher to call into the `Containers`
-  service so a single compose stack can mix VMs and containers.
+- Compose `workloads:` → Containers RPC dispatch **(shipped)**: `lv compose up`
+  now routes `kind: lxc` (download template or rootfs path) workloads through
+  CreateContainer + StartContainer on the planner-resolved host, so a stack can
+  mix VMs and containers. Remaining: auto-pull of OCI **registry** refs (pre-pull
+  required today), and full network/IPAM/security-group provisioning for
+  container NICs.

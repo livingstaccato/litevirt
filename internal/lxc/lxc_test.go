@@ -126,6 +126,22 @@ func TestParseLxcInfoState(t *testing.T) {
 	}
 }
 
+func TestParseLxcInfoIP(t *testing.T) {
+	cases := map[string]string{
+		"10.0.0.20\n":            "10.0.0.20",    // single IPv4
+		"127.0.0.1\n10.0.0.20\n": "10.0.0.20",    // skip loopback, take the real one
+		"fe80::1\n10.0.0.21\n":   "10.0.0.21",    // skip IPv6, take IPv4
+		"  10.0.0.22 \n":         "10.0.0.22",    // trims whitespace
+		"":                       "",             // none assigned yet
+		"not-an-ip\n":            "",             // garbage
+	}
+	for in, want := range cases {
+		if got := parseLxcInfoIP(in); got != want {
+			t.Errorf("parseLxcInfoIP(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestFakeRuntime_LifecycleRoundTrip exercises the test double itself
 // to lock its semantics — gRPC handler tests rely on it.
 func TestFakeRuntime_LifecycleRoundTrip(t *testing.T) {

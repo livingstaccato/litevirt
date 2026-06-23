@@ -67,6 +67,24 @@ func (s *Server) ListLoadBalancers(ctx context.Context, _ *emptypb.Empty) (*pb.L
 
 // lbBackends returns the live backend list for an LB by looking up running VMs
 // in the corresponding stack, or explicit backends from lb_backends table.
+// containerBackendIP resolves a stack container's address for LB backend use.
+// Containers have no vm_interfaces row, so the address comes from the recorded
+// static IP (corrosion.LabelIP, replicated cluster-wide) first, then a local
+// lxc-info lookup when the container runs on this host (covers DHCP NICs).
+// A DHCP container on a *remote* host with no recorded IP is not yet resolved
+// (a peer GetContainerIPRemote, mirroring VMs, is the follow-up).
+func (s *Server) containerBackendIP(ctx context.Context, ct corrosion.ContainerRecord) string {
+	if ip := ct.Labels[corrosion.LabelIP]; ip != "" {
+		return ip
+	}
+	if ct.HostName == s.hostName && s.containerRuntime != nil {
+		if ip, err := s.containerRuntime.IPContainer(ctx, ct.Name); err == nil {
+			return ip
+		}
+	}
+	return ""
+}
+
 func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend {
 	// Try explicit backends first (standalone LBs).
 	explicitBackends, _ := corrosion.ListLBBackends(ctx, s.db, lbName)
@@ -123,6 +141,20 @@ func (s *Server) lbBackends(ctx context.Context, lbName string) []*pb.LBBackend 
 		backends = append(backends, &pb.LBBackend{
 			VmName:  vm.Name,
 			Address: ip,
+			Status:  st,
+		})
+	}
+
+	// Container backends in the same stack (found via the reserved stack label).
+	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
+	for _, ct := range cts {
+		st := "active"
+		if ct.State != "running" {
+			st = "down"
+		}
+		backends = append(backends, &pb.LBBackend{
+			VmName:  ct.Name,
+			Address: s.containerBackendIP(ctx, ct),
 			Status:  st,
 		})
 	}
@@ -1227,6 +1259,25 @@ func (s *Server) collectLBBackends(ctx context.Context, stackName string, lbSpec
 			}
 		}
 	}
+
+	// Container backends in the same stack (found via the reserved stack label).
+	// Containers have no vm_interfaces row; their address is the recorded static
+	// IP or a local lxc-info lookup (see containerBackendIP).
+	targetPort := 80
+	if len(lbSpec.Ports) > 0 {
+		targetPort = int(lbSpec.Ports[0].Target)
+	}
+	cts, _ := corrosion.ListContainersByStack(ctx, s.db, stackName)
+	for _, ct := range cts {
+		if ct.State != "running" {
+			continue
+		}
+		ip := s.containerBackendIP(ctx, ct)
+		if ip == "" {
+			continue
+		}
+		backends = append(backends, lb.Backend{Name: ct.Name, IP: ip, Port: targetPort})
+	}
 	return backends
 }
 
@@ -1350,6 +1401,15 @@ func (s *Server) ReconcileLBs(ctx context.Context) {
 
 // removeLBForStack removes all LB instances associated with a stack on all hosts.
 // It checks VM specs for LB configuration and tears down haproxy + keepalived.
+// stackHasLBConfig reports whether an lb_config row exists for the LB, including
+// soft-deleted rows. DeleteStack soft-deletes the row before tearing the LB
+// down, so a `deleted_at IS NULL` filter would miss it and the haproxy /
+// keepalived processes would be orphaned.
+func (s *Server) stackHasLBConfig(ctx context.Context, lbName string) bool {
+	rows, _ := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = ?`, lbName)
+	return len(rows) > 0
+}
+
 func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []corrosion.VMRecord) {
 	if stackName == "" {
 		return
@@ -1357,9 +1417,11 @@ func (s *Server) removeLBForStack(ctx context.Context, stackName string, vms []c
 
 	lbName := stackName + "-lb"
 
-	// Check if an LB record exists in corrosion for this stack.
-	rows, _ := s.db.Query(ctx, `SELECT name FROM lb_configs WHERE name = ? AND deleted_at IS NULL`, lbName)
-	hasLB := len(rows) > 0
+	// Whether an LB record EVER existed for this stack — including soft-deleted
+	// rows. The VM-spec fallback below is unreliable after a migration, which may
+	// re-store the spec without the LB block, so the row is the authoritative
+	// teardown signal.
+	hasLB := s.stackHasLBConfig(ctx, lbName)
 
 	// Determine which hosts ran the LB so we can remove from all of them.
 	var lbHosts []string

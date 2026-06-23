@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/placement"
 )
@@ -34,7 +35,7 @@ type ResolvedPlan struct {
 	Summary   string
 }
 
-// VMAction is a fully-resolved VM operation.
+// VMAction is a fully-resolved workload operation (VM or container).
 type VMAction struct {
 	Kind       OpKind
 	VMName     string
@@ -47,6 +48,11 @@ type VMAction struct {
 	DependsOn  compose.DependsOn
 	WaitFor    string // condition dependents wait for
 	Warning    string
+	// IsContainer marks a kind=lxc/oci workload so the executor routes it to the
+	// Containers RPCs (Create/Start/Delete) instead of the VM ones. Set for
+	// delete/no-change ops too — where the workload may be gone from the compose
+	// file, so FindVMDef can't classify it.
+	IsContainer bool
 }
 
 // DeviceAssignment is a pre-resolved PCI device allocation.
@@ -96,11 +102,18 @@ type DNSAction struct {
 func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*ResolvedPlan, error) {
 	plan := &ResolvedPlan{StackName: f.Name}
 
-	// Step 1: Build VM diff (reuse existing compose.Build logic).
+	// Step 1: Build the workload diff (reuse compose.Build). Containers diff
+	// alongside VMs: current containers for this stack are fed in as
+	// CurrentVM-shaped entries (a container has image/cpu/mem like a VM and no
+	// cloud-init), so Build emits no-op / update / delete for them instead of
+	// always "create". ctHost maps a current container name → its host so we can
+	// target delete/recreate at the right node.
 	current := buildCurrentVMs(state, f.Name)
+	ctCurrent, ctHost := buildCurrentContainers(state, f.Name)
+	current = append(current, ctCurrent...)
 	vmPlan, err := compose.Build(f, current)
 	if err != nil {
-		return nil, fmt.Errorf("build VM plan: %w", err)
+		return nil, fmt.Errorf("build workload plan: %w", err)
 	}
 	// Topological sort create ops by dependency graph.
 	vmPlan.Ops = compose.TopologicalSortOps(vmPlan.Ops)
@@ -134,6 +147,22 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		req := buildPlacementRequest(spec)
 		// Resolve anti-affinity names: expand compose definition keys to instance names.
 		req.AntiAffinity = expandAntiAffinity(req.AntiAffinity, req.VMName, composeInstances)
+		// Container workloads can only run where the LXC runtime exists, so
+		// require the daemon-advertised capability label (copy-on-write so we
+		// don't mutate the compose def's Require map). On update, pin to the
+		// current host so the recreate happens in place.
+		if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
+			rl := map[string]string{corrosion.LabelLXCCapable: "true"}
+			for k, v := range req.RequireLabels {
+				rl[k] = v
+			}
+			req.RequireLabels = rl
+			if op.Kind == OpUpdate {
+				if h := ctHost[op.VMName]; h != "" {
+					req.PinHost = h
+				}
+			}
+		}
 		placementReqs = append(placementReqs, req)
 		placementVMNames = append(placementVMNames, op.VMName)
 	}
@@ -147,11 +176,12 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	vmHostMap := map[string]string{} // vmName → host (for network/LB resolution)
 	for _, op := range vmPlan.Ops {
 		action := VMAction{
-			Kind:      op.Kind,
-			VMName:    op.VMName,
-			Detail:    op.Detail,
-			DependsOn: op.DependsOn,
-			Warning:   op.Warning,
+			Kind:        op.Kind,
+			VMName:      op.VMName,
+			Detail:      op.Detail,
+			DependsOn:   op.DependsOn,
+			Warning:     op.Warning,
+			IsContainer: isContainerWorkload(f, op.VMName, ctHost),
 		}
 
 		if op.Kind == OpCreate || op.Kind == OpUpdate {
@@ -195,6 +225,15 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			}
 		}
 
+		// Container delete / no-change ops carry no placement; pin them to the
+		// container's current host so the executor's DeleteContainer targets the
+		// right node.
+		if action.IsContainer && action.TargetHost == "" {
+			if h := ctHost[op.VMName]; h != "" {
+				action.TargetHost = h
+			}
+		}
+
 		plan.VMs = append(plan.VMs, action)
 	}
 
@@ -234,6 +273,46 @@ func buildCurrentVMs(state *ClusterState, stackName string) []compose.CurrentVM 
 		})
 	}
 	return current
+}
+
+// buildCurrentContainers converts this stack's current containers (tagged with
+// LabelStack) into CurrentVM-shaped diff entries plus a name→host map. A
+// container has image/cpu/mem like a VM and no cloud-init, so compose.Build
+// diffs them the same way — yielding no-op / update / delete correctly. Without
+// this, a container is never found in current state and re-apply always says
+// "create" (→ "container already exists").
+func buildCurrentContainers(state *ClusterState, stackName string) ([]compose.CurrentVM, map[string]string) {
+	var current []compose.CurrentVM
+	host := map[string]string{}
+	for _, ct := range state.Containers {
+		if ct.Labels[corrosion.LabelStack] != stackName {
+			continue
+		}
+		current = append(current, compose.CurrentVM{
+			Name:     ct.Name,
+			Image:    ct.Image,
+			CPU:      ct.CPULimit,
+			MemMiB:   ct.MemMiB,
+			State:    ct.State,
+			HostName: ct.HostName,
+		})
+		host[ct.Name] = ct.HostName
+	}
+	return current, host
+}
+
+// isContainerWorkload reports whether a workload instance is a container — by
+// the compose def's kind (create/update, where the def still exists) or by
+// presence in the current-container host map (delete/no-change, where the def
+// may be gone from the file).
+func isContainerWorkload(f *compose.File, name string, currentContainerHost map[string]string) bool {
+	if _, ok := currentContainerHost[name]; ok {
+		return true
+	}
+	if d, _ := compose.FindVMDef(f, name); d != nil {
+		return d.Kind == compose.WorkloadKindLXC || d.Kind == compose.WorkloadKindOCI
+	}
+	return false
 }
 
 // specField extracts a field from the JSON spec. Lightweight — avoids full unmarshal.

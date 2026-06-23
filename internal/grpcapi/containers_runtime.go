@@ -60,6 +60,10 @@ func (a *LXCRuntimeAdapter) StateContainer(ctx context.Context, name string) (st
 	return string(st), err
 }
 
+func (a *LXCRuntimeAdapter) IPContainer(ctx context.Context, name string) (string, error) {
+	return a.Inner.IP(ctx, name)
+}
+
 func (a *LXCRuntimeAdapter) ListContainers(ctx context.Context) ([]string, error) {
 	return a.Inner.List(ctx)
 }

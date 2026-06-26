@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"google.golang.org/grpc"
@@ -53,7 +55,11 @@ func (s *Server) BackupSnapshot(req *pb.BackupSnapshotRequest, stream grpc.Serve
 		return err
 	}
 
-	repo, err := pbsstore.Open(req.RepoPath)
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	repo, err := pbsstore.Open(repoPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
 	}
@@ -453,16 +459,18 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 		return status.Error(codes.InvalidArgument,
 			"repo_path, vm_name, disk_name, timestamp, target_path all required")
 	}
-	// Restore may target a VM that no longer exists (disaster recovery),
-	// so fall back to the default-project path when the record is gone.
-	rbacPath := vmRBACPathFor("", req.VmName)
-	if vm, gerr := corrosion.GetVM(ctx, s.db, req.VmName); gerr == nil && vm != nil {
-		rbacPath = vmRBACPath(vm)
-	}
-	if err := s.RequirePerm(ctx, rbacPath, "backup.restore", "operator"); err != nil {
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
 		return err
 	}
-	repo, err := pbsstore.Open(req.RepoPath)
+	// target_path: a bare filename is contained under the disks dir; a custom
+	// absolute path is admin-only. Restore to a temp file + rename so we never
+	// write through a symlink planted at the final path.
+	target, err := s.resolveRestoreTarget(ctx, req.TargetPath, filepath.Join(s.dataDir, "disks"))
+	if err != nil {
+		return err
+	}
+	repo, err := pbsstore.Open(repoPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "open repo: %v", err)
 	}
@@ -470,17 +478,27 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	if err != nil {
 		return status.Errorf(codes.NotFound, "manifest: %v", err)
 	}
+	// Authorize against the backup's actual project (manifest spec authoritative;
+	// name-reuse mismatch or undeterminable → admin) — not a _default fallback.
+	if _, err := s.authorizeVMRestore(ctx, req.VmName, manifest); err != nil {
+		return err
+	}
 
 	send := func(p *pb.RestoreFromBackupProgress) error { return stream.Send(p) }
 	if err := send(&pb.RestoreFromBackupProgress{
 		Phase:       pb.RestoreFromBackupProgress_RESTORE,
 		ChunksTotal: int32(len(manifest.Chunks)),
-		Status:      fmt.Sprintf("restoring %s@%s → %s", req.VmName, req.Timestamp, req.TargetPath),
+		Status:      fmt.Sprintf("restoring %s@%s → %s", req.VmName, req.Timestamp, target),
 	}); err != nil {
 		return err
 	}
 
-	if err := pbsstore.RestoreToFile(ctx, repo, manifest, req.TargetPath, pbsstore.RestoreOptions{
+	if err := refuseSymlinkTarget(target); err != nil {
+		return err
+	}
+	tmpTarget := target + ".restore.tmp"
+	_ = os.Remove(tmpTarget)
+	if err := pbsstore.RestoreToFile(ctx, repo, manifest, tmpTarget, pbsstore.RestoreOptions{
 		Progress: func(p pbsstore.RestoreProgress) {
 			_ = send(&pb.RestoreFromBackupProgress{
 				Phase:        pb.RestoreFromBackupProgress_RESTORE,
@@ -490,10 +508,15 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 			})
 		},
 	}); err != nil {
+		_ = os.Remove(tmpTarget)
 		return status.Errorf(codes.Internal, "restore: %v", err)
 	}
+	if err := os.Rename(tmpTarget, target); err != nil {
+		_ = os.Remove(tmpTarget)
+		return status.Errorf(codes.Internal, "finalize restore: %v", err)
+	}
 	s.recordVMEvent(ctx, req.VmName, "backup.restored", "ok",
-		fmt.Sprintf("%s @ %s → %s", req.DiskName, req.Timestamp, req.TargetPath))
+		fmt.Sprintf("%s @ %s → %s", req.DiskName, req.Timestamp, target))
 	return send(&pb.RestoreFromBackupProgress{
 		Phase:        pb.RestoreFromBackupProgress_DONE,
 		BytesWritten: manifest.TotalSize,

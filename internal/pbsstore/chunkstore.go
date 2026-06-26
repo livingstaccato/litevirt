@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -46,6 +47,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/safename"
 	"lukechampine.com/blake3"
 )
 
@@ -214,6 +216,9 @@ func (r *Repo) PutChunk(data []byte) (id string, created bool, err error) {
 
 // HasChunk reports whether a chunk with the given id exists in the repo.
 func (r *Repo) HasChunk(id string) bool {
+	if safename.ValidateChunkID(id) != nil {
+		return false
+	}
 	_, err := os.Stat(r.chunkPath(id))
 	return err == nil
 }
@@ -223,6 +228,9 @@ func (r *Repo) HasChunk(id string) bool {
 // ErrChunkMismatch on plaintext corruption and wraps ErrKeyMismatch
 // when AES-GCM authentication fails.
 func (r *Repo) GetChunk(id string) ([]byte, error) {
+	if err := safename.ValidateChunkID(id); err != nil {
+		return nil, err
+	}
 	storage, err := os.ReadFile(r.chunkPath(id))
 	if err != nil {
 		return nil, fmt.Errorf("read chunk %s: %w", id, err)
@@ -241,6 +249,9 @@ func (r *Repo) GetChunk(id string) ([]byte, error) {
 // directly because manifest-aware reference tracking is the only safe
 // way to drop chunks.
 func (r *Repo) DeleteChunk(id string) error {
+	if err := safename.ValidateChunkID(id); err != nil {
+		return err
+	}
 	if err := os.Remove(r.chunkPath(id)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -256,6 +267,9 @@ func (r *Repo) PutManifest(m *Manifest) error {
 	if m.Timestamp == "" {
 		m.Timestamp = time.Now().UTC().Format(time.RFC3339)
 	}
+	if err := ValidateManifest(m); err != nil {
+		return fmt.Errorf("refusing to write invalid manifest: %w", err)
+	}
 	dir := filepath.Join(r.root, "snapshots", m.VMName)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("mkdir snapshots dir: %w", err)
@@ -264,8 +278,20 @@ func (r *Repo) PutManifest(m *Manifest) error {
 	return writeJSONAtomic(filepath.Join(dir, name), m)
 }
 
-// GetManifest loads a single manifest by VM name + timestamp + disk name.
+// GetManifest loads a single manifest by VM name + timestamp + disk name. The
+// caller-supplied components are validated BEFORE they compose the on-disk path
+// (filenameSafeTS only strips ':', so a '/'-bearing timestamp would otherwise
+// escape), and the loaded manifest is validated before it's returned.
 func (r *Repo) GetManifest(vm, ts, disk string) (*Manifest, error) {
+	if err := safename.ValidateVMName(vm); err != nil {
+		return nil, err
+	}
+	if err := safename.ValidateTimestamp(ts); err != nil {
+		return nil, err
+	}
+	if err := safename.ValidateDiskName(disk); err != nil {
+		return nil, err
+	}
 	path := filepath.Join(r.root, "snapshots", vm,
 		fmt.Sprintf("%s-%s.manifest.json", filenameSafeTS(ts), disk))
 	data, err := os.ReadFile(path)
@@ -275,6 +301,9 @@ func (r *Repo) GetManifest(vm, ts, disk string) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parse manifest: %w", err)
+	}
+	if err := ValidateManifest(&m); err != nil {
+		return nil, fmt.Errorf("invalid manifest %s@%s/%s: %w", vm, ts, disk, err)
 	}
 	return &m, nil
 }
@@ -327,6 +356,13 @@ func (r *Repo) ListManifests() ([]Manifest, error) {
 		if err := json.Unmarshal(data, &m); err != nil {
 			return fmt.Errorf("parse %s: %w", path, err)
 		}
+		// A structurally-invalid manifest is skipped (not fatal) so one bad file
+		// can't deny listing every other backup, and it's never offered for a
+		// restore/prune.
+		if verr := ValidateManifest(&m); verr != nil {
+			slog.Warn("pbsstore: skipping invalid manifest", "path", path, "error", verr)
+			return nil
+		}
 		out = append(out, m)
 		return nil
 	})
@@ -335,6 +371,20 @@ func (r *Repo) ListManifests() ([]Manifest, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp < out[j].Timestamp })
 	return out, nil
+}
+
+// AllChunks returns every chunk a manifest references — the disk chunks plus
+// the firmware-state bundle (nvram+swtpm). Repo maintenance (GC reachability,
+// Verify, Sync) MUST iterate this, not just Chunks, or it would treat a valid
+// backup's firmware bundle as garbage / miss it on verify / drop it on sync.
+func (m *Manifest) AllChunks() []ChunkRef {
+	if len(m.FirmwareChunks) == 0 {
+		return m.Chunks
+	}
+	out := make([]ChunkRef, 0, len(m.Chunks)+len(m.FirmwareChunks))
+	out = append(out, m.Chunks...)
+	out = append(out, m.FirmwareChunks...)
+	return out
 }
 
 // chunkPath returns the on-disk path for a chunk id. Splits into

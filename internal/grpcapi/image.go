@@ -12,11 +12,39 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
+// SetImageLimits records the daemon's image pull/import bounds (disk-fill +
+// SSRF guards). Zero values fall back to the image package defaults.
+func (s *Server) SetImageLimits(maxBytes int64, timeout time.Duration) {
+	s.imageMaxBytes = maxBytes
+	s.imagePullTimeout = timeout
+}
+
+// imagePullOptions builds the configured PullOptions (defaults applied inside
+// image.Pull when a field is zero).
+func (s *Server) imagePullOptions() image.PullOptions {
+	return image.PullOptions{Timeout: s.imagePullTimeout, MaxBytes: s.imageMaxBytes}
+}
+
+// maxImageBytes returns the effective image byte ceiling for streamed
+// import/upload (source-side + target-side guards).
+func (s *Server) maxImageBytes() int64 {
+	if s.imageMaxBytes > 0 {
+		return s.imageMaxBytes
+	}
+	return image.DefaultMaxImageBytes
+}
+
 func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImageServer) error {
-	if err := RequireRole(stream.Context(), "operator"); err != nil {
+	// Images are a cluster-global library (matching PullOCIImage), so the check
+	// is rooted; a project-scoped token can't pull into the shared store.
+	if err := s.RequirePerm(stream.Context(), "/", "image.pull", "operator"); err != nil {
 		return err
+	}
+	if err := safename.ValidateImageName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	slog.Info("pulling image", "name", req.Name, "url", req.SourceUrl)
 
@@ -44,7 +72,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// pull completes even if the client disconnects (#17).
 	errCh := make(chan error, 1)
 	go func() {
-		pullErr := image.Pull(s.images, req.Name, req.SourceUrl, req.Checksum, progressCh)
+		pullErr := image.Pull(s.images, req.Name, req.SourceUrl, req.Checksum, s.imagePullOptions(), progressCh)
 		errCh <- pullErr
 		if pullErr != nil {
 			slog.Error("image pull failed", "name", req.Name, "error", pullErr)

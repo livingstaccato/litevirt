@@ -38,6 +38,18 @@ type Server struct {
 	version   string // build version, reported via Ping and ListHosts
 	dnsDomain string // DNS domain for VM record names (e.g. "litevirt.local")
 
+	// backupRepos maps a logical repo name to its on-disk path (daemon config
+	// `backup_repos:`), set via SetBackupRepos. Used to resolve a request's
+	// repo_path: a registered name is allowed for any operator; an absolute or
+	// unregistered path is admin-only (resolveBackupRepoPath).
+	backupRepos map[string]string
+
+	// imageMaxBytes / imagePullTimeout bound image pull+import (disk-fill /
+	// SSRF guards), set from daemon config via SetImageLimits. Zero → the image
+	// package defaults apply.
+	imageMaxBytes    int64
+	imagePullTimeout time.Duration
+
 	// Session lifetimes. Zero means "use the package default" (see
 	// idleTimeout/hardExpiry); set from daemon config via SetSessionTimeouts.
 	// Per-node — sessions store an absolute ExpiresAt at login, so a mixed

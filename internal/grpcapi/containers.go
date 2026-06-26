@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/lxc"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -49,12 +51,23 @@ func (s *Server) containerProject(ctx context.Context, host, name string) string
 }
 
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*pb.Container, error) {
+	if req.Name == "" {
+		return nil, status.Error(codes.InvalidArgument, "name required")
+	}
+	// Validate the name + project BEFORE the permission check (so a path-like
+	// name never participates in the auth path) and before they reach the LXC
+	// runtime (which builds <lxcpath>/<name>) or the stored row used for RBAC.
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if req.Project != "" {
+		if _, err := safename.CanonicalProjectName(req.Project); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+	}
 	if err := s.RequirePerm(ctx, ctRBACPathFor(req.Project, req.Name), "ct.create", "operator"); err != nil {
 		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
 		return nil, err
-	}
-	if req.Name == "" {
-		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
 	if forwarded, err := s.forwardCreateContainer(ctx, req); err != nil || forwarded != nil {
 		return forwarded, err
@@ -110,6 +123,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 }
 
 func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerRequest) (*emptypb.Empty, error) {
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.start", "operator"); err != nil {
 		return nil, err
@@ -138,6 +154,9 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 }
 
 func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest) (*emptypb.Empty, error) {
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.stop", "operator"); err != nil {
 		return nil, err
@@ -162,6 +181,9 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 }
 
 func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.delete", "operator"); err != nil {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
@@ -187,6 +209,9 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 }
 
 func (s *Server) ExecContainer(ctx context.Context, req *pb.ExecContainerRequest) (*pb.ExecContainerResponse, error) {
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.exec", "operator"); err != nil {
 		s.audit(ctx, "ct.exec", req.Name, "permission denied: "+strings.Join(req.Argv, " "), "denied")
@@ -236,6 +261,32 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	if err := s.RequirePerm(ctx, "/", "image.pull", "operator"); err != nil {
 		return nil, err
 	}
+	// Dest is where umoci unpacks the (untrusted) image rootfs as root, and a
+	// local oci: source is read as root — both are host-path primitives. A bare
+	// Dest name is contained under the daemon OCI staging dir; an absolute Dest
+	// or a local oci: source requires admin (remote docker:// registry pulls
+	// stay operator). The check binds the real caller on the entry node; a
+	// forwarded peer call runs as admin (daemon mTLS) so it isn't re-denied.
+	if lxc.RegistryHost(req.Image) == "" {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return nil, status.Error(codes.PermissionDenied,
+				"pulling from a local OCI source path requires the admin role")
+		}
+	}
+	if filepath.IsAbs(req.Dest) {
+		if err := RequireRole(ctx, "admin"); err != nil {
+			return nil, status.Error(codes.PermissionDenied,
+				"an absolute --dest requires the admin role; use a bare name to stage under the daemon OCI directory")
+		}
+	} else if req.Dest != "" {
+		// A bare Dest must be a single safe name (no nested path); it is resolved
+		// to a staging path on the host that actually unpacks it (below, after the
+		// forward), so the raw name — not the entry host's dataDir path — crosses
+		// the wire.
+		if err := safename.ValidateName(req.Dest); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid --dest (use a bare name): %v", err)
+		}
+	}
 	// Resolve registry credentials on the ENTRY node — only here is
 	// callerUsername(ctx) meaningful (a forwarded peer runs under the daemon's
 	// mTLS identity). Skip if the request already carries inline creds (ad-hoc
@@ -260,6 +311,16 @@ func (s *Server) PullOCIImage(ctx context.Context, req *pb.PullOCIImageRequest) 
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
+	}
+	// Resolve a bare Dest name to a staging path on THIS (the unpacking) host,
+	// so it lands under this host's OCI dir regardless of where the request
+	// entered the cluster.
+	if req.Dest != "" && !filepath.IsAbs(req.Dest) {
+		resolved, err := safename.SafeJoin(filepath.Join(s.dataDir, "oci"), req.Dest)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid --dest: %v", err)
+		}
+		req.Dest = resolved
 	}
 	if err := s.containerRuntime.PullOCIImage(ctx, req.Image, req.Dest, req.Tag, req.Username, req.Password); err != nil {
 		return nil, status.Errorf(codes.Internal, "pull oci: %v", err)

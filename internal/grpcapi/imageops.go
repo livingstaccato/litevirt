@@ -17,12 +17,13 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/safename"
 )
 
 // ImportImage receives a client-streamed image file and writes it to the local store.
 func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	ctx := stream.Context()
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "image.import", "operator"); err != nil {
 		return err
 	}
 
@@ -52,6 +53,9 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			if name == "" {
 				return status.Error(codes.InvalidArgument, "image name required")
 			}
+			if err := safename.ValidateImageName(name); err != nil {
+				return status.Errorf(codes.InvalidArgument, "%v", err)
+			}
 			if format == "" {
 				format = "qcow2"
 			}
@@ -74,6 +78,10 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			}
 			hasher.Write(req.Chunk)
 			total += int64(n)
+			if total > s.maxImageBytes() {
+				return status.Errorf(codes.InvalidArgument,
+					"image import exceeds the %d-byte ceiling", s.maxImageBytes())
+			}
 		}
 	}
 
@@ -129,12 +137,15 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 // This uses the existing mTLS peer connection — no SSH/rsync required.
 func (s *Server) PushImage(req *pb.PushImageRequest, stream pb.LiteVirt_PushImageServer) error {
 	ctx := stream.Context()
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "image.push", "operator"); err != nil {
 		return err
 	}
 
 	if req.Name == "" || req.TargetHost == "" {
 		return status.Error(codes.InvalidArgument, "name and target_host required")
+	}
+	if err := safename.ValidateImageName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	// Verify image exists locally.
@@ -142,6 +153,12 @@ func (s *Server) PushImage(req *pb.PushImageRequest, stream pb.LiteVirt_PushImag
 	info, err := os.Stat(srcPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "image %q not found locally", req.Name)
+	}
+	// Fail source-side before streaming if the local file already exceeds the
+	// ceiling (the target enforces it again as defense-in-depth).
+	if info.Size() > s.maxImageBytes() {
+		return status.Errorf(codes.InvalidArgument,
+			"image %q is %d bytes, over the %d-byte ceiling", req.Name, info.Size(), s.maxImageBytes())
 	}
 
 	// Look up image metadata for checksum.
@@ -286,16 +303,25 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 
 // BuildImage snapshots a running VM's root disk to create a golden image.
 func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb.BuildImageResponse, error) {
-	if err := RequireRole(ctx, "operator"); err != nil {
+	if err := s.RequirePerm(ctx, "/", "image.build", "operator"); err != nil {
 		return nil, err
 	}
 	if req.VmName == "" || req.ImageName == "" {
 		return nil, status.Error(codes.InvalidArgument, "vm_name and image_name required")
 	}
+	if err := safename.ValidateImageName(req.ImageName); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.VmName)
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
+	}
+	// Building an image reads the source VM's root disk into a (global) image —
+	// a cross-project data-exposure surface — so also require backup-level
+	// access to the SOURCE VM, not just the global image.build perm.
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "backup.create", "operator"); err != nil {
+		return nil, err
 	}
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)

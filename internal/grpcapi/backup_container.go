@@ -17,6 +17,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -51,6 +52,9 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	if req.Name == "" || req.RepoPath == "" {
 		return status.Error(codes.InvalidArgument, "name and repo_path required")
 	}
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
 	project := s.containerProject(ctx, req.HostName, req.Name)
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "backup.create", "operator"); err != nil {
 		s.audit(ctx, "ct.backup", req.Name, "project="+project, "denied")
@@ -74,7 +78,11 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
-	repo, err := pbsstore.Open(req.RepoPath)
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	repo, err := pbsstore.Open(repoPath)
 	if err != nil {
 		return status.Errorf(codes.NotFound, "open repo %q: %v", req.RepoPath, err)
 	}
@@ -175,12 +183,10 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if req.RepoPath == "" || req.Name == "" || req.Timestamp == "" {
 		return status.Error(codes.InvalidArgument, "repo_path, name and timestamp required")
 	}
-	// Restore may target a name that no longer exists (disaster recovery); the
-	// project comes from the existing row if present, else from the manifest.
-	project := s.containerProject(ctx, "", req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "backup.restore", "operator"); err != nil {
-		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
-		return err
+	// Validate the name before it composes the permission path, the staging
+	// tar path (dataDir/ct-restore), or the container dir.
+	if err := safename.ValidateContainerName(req.Name); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
 	target := req.HostName
@@ -195,6 +201,28 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
+	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
+	if err != nil {
+		return err
+	}
+	repo, err := pbsstore.Open(repoPath)
+	if err != nil {
+		return status.Errorf(codes.NotFound, "open repo: %v", err)
+	}
+	manifest, err := repo.GetManifest(req.Name, req.Timestamp, containerBackupDisk)
+	if err != nil {
+		return status.Errorf(codes.NotFound, "manifest: %v", err)
+	}
+	// Authorize against the backup's actual project (live row, else the manifest
+	// spec; admin when undeterminable) and use that project for the restored row
+	// — never a _default fallback (cross-project read) nor the unauthenticated
+	// manifest-claimed project.
+	project, err := s.authorizeContainerRestore(ctx, req.Name, manifest)
+	if err != nil {
+		s.audit(ctx, "ct.restore", req.Name, "denied", "denied")
+		return err
+	}
+
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
@@ -203,15 +231,6 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on host %q; delete it first or restore under a different name",
 			req.Name, s.hostName)
-	}
-
-	repo, err := pbsstore.Open(req.RepoPath)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "open repo: %v", err)
-	}
-	manifest, err := repo.GetManifest(req.Name, req.Timestamp, containerBackupDisk)
-	if err != nil {
-		return status.Errorf(codes.NotFound, "manifest: %v", err)
 	}
 
 	send := func(p *pb.RestoreContainerProgress) error { return stream.Send(p) }
@@ -256,7 +275,12 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Errorf(codes.Internal, "import container: %v", importErr)
 	}
 
-	// Recreate the cluster row from the embedded spec.
+	// Recreate the cluster row from the embedded spec. The spec is UNTRUSTED
+	// manifest data, so it supplies only descriptive fields (image/cpu/mem/
+	// labels/restart) — never the project: a tampered manifest must not move the
+	// restored container into a project the caller wasn't authorized for. The
+	// row uses the project the permission check was made against; a cross-project
+	// restore is a separate, explicitly-authorized operation.
 	spec := containerBackupSpec{Name: req.Name, Project: project}
 	if manifest.ContainerSpecJSON != "" {
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
@@ -265,7 +289,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		HostName: s.hostName, Name: req.Name, State: "stopped",
 		Image: spec.Image, CPULimit: spec.CPULimit, MemMiB: spec.MemMiB,
 		Labels: spec.Labels, RestartPolicy: spec.RestartPolicy,
-		Project: tenancy.NormalizeProject(spec.Project),
+		Project: tenancy.NormalizeProject(project),
 	}
 	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
 		slog.Warn("container restore: cluster row write failed", "name", req.Name, "error", err)
@@ -279,7 +303,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "running", "")
 	}
 
-	s.audit(ctx, "ct.restore", req.Name, fmt.Sprintf("project=%s from %s @ %s", spec.Project, req.RepoPath, req.Timestamp), "ok")
+	s.audit(ctx, "ct.restore", req.Name, fmt.Sprintf("project=%s from %s @ %s", project, req.RepoPath, req.Timestamp), "ok")
 	return send(&pb.RestoreContainerProgress{
 		Phase:        pb.RestoreContainerProgress_DONE,
 		BytesWritten: manifest.TotalSize,

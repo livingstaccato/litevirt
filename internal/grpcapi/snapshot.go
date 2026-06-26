@@ -103,7 +103,10 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		if !hasFW {
 			return nil
 		}
-		bundle := lv.SnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.Name)
+		bundle, err := lv.SafeSnapshotFirmwareBundlePath(s.dataDir, req.VmName, req.Name)
+		if err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(bundle), 0o755); err != nil {
 			return err
 		}
@@ -127,7 +130,10 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 	var vmstatePath string
 	snapCreated := false
 	if withMemory {
-		vmstatePath = lv.VMStatePath(s.dataDir, req.VmName, req.Name)
+		vmstatePath, err = lv.SafeVMStatePath(s.dataDir, req.VmName, req.Name)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
 		if mkErr := os.MkdirAll(filepath.Dir(vmstatePath), 0o755); mkErr != nil {
 			return nil, status.Errorf(codes.Internal, "prepare vmstate dir: %v", mkErr)
 		}

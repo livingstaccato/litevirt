@@ -2,21 +2,16 @@ package corrosion
 
 import (
 	"context"
-	"database/sql"
-	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/hlc"
 	"github.com/litevirt/litevirt/internal/pki"
 )
 
@@ -164,51 +159,17 @@ func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, erro
 }
 
 func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
-	var addr string
-	var port int
-
-	host, err := GetHost(ctx, ae.client, peerName)
+	target, err := resolvePeerTarget(ctx, ae.client, peerName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up host %q: %w", peerName, err)
+		return nil, nil, err
 	}
-	if host != nil {
-		addr = host.Address
-		port = host.GRPCPort
-	} else {
-		for _, m := range ae.client.Members() {
-			if m.Name == peerName {
-				host, _, _ := net.SplitHostPort(m.Addr)
-				if host != "" {
-					addr = host
-				} else {
-					addr = m.Addr
-				}
-				break
-			}
-		}
-		if addr == "" {
-			return nil, nil, fmt.Errorf("look up host %q: not found in cluster state or gossip", peerName)
-		}
-		slog.Debug("antientropy: using gossip address for peer", "peer", peerName, "addr", addr)
-	}
-	if port == 0 {
-		port = 7443
-	}
-
-	tlsCfg, err := pki.PeerTLSConfig(ae.pkiDir)
+	// Raise the receive limit so the legacy unary GetStateDump fallback can
+	// pull a large full-state dump from an old peer. StreamStateDump chunks
+	// stay well under the 4 MiB default and don't need this.
+	conn, err := pki.PeerDial(ae.pkiDir, target,
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(antiEntropyMaxMsgSize)))
 	if err != nil {
-		return nil, nil, fmt.Errorf("peer TLS config: %w", err)
-	}
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", addr, port),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-		// Raise the receive limit so the legacy unary GetStateDump fallback can
-		// pull a large full-state dump from an old peer. StreamStateDump chunks
-		// stay well under the 4 MiB default and don't need this.
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(antiEntropyMaxMsgSize)),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dial: %w", err)
+		return nil, nil, err
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
@@ -217,137 +178,5 @@ func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.Lite
 // size; matches the server's grpcMaxMsgSize backstop.
 const antiEntropyMaxMsgSize = 64 << 20 // 64 MiB
 
-// MergeStateBytesLWW merges a full state dump with HLC-aware LWW conflict resolution.
-func (c *Client) MergeStateBytesLWW(buf []byte) {
-	c.mergeStateLWW(buf)
-}
-
-// mergeStateLWW is like mergeState but checks HLC timestamps before replacing rows.
-func (c *Client) mergeStateLWW(buf []byte) {
-	if len(buf) == 0 {
-		return
-	}
-
-	payload, err := decompressPayload(buf)
-	if err != nil {
-		slog.Error("sync: decompress", "error", err)
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	tx, err := c.db.Begin()
-	if err != nil {
-		slog.Error("sync: begin tx", "error", err)
-		return
-	}
-
-	merged := 0
-	skipped := 0
-	for _, table := range payload.Tables {
-		updatedAtIdx := -1
-		for i, col := range table.Columns {
-			if col == "updated_at" {
-				updatedAtIdx = i
-				break
-			}
-		}
-
-		// Find PK columns for this table.
-		pkCols := tablePrimaryKeys[table.Name]
-
-		for _, row := range table.Rows {
-			// If table has updated_at and PK, do LWW check.
-			if updatedAtIdx >= 0 && len(pkCols) > 0 {
-				incomingUpdatedAt := ""
-				if updatedAtIdx < len(row) {
-					if s, ok := row[updatedAtIdx].(string); ok {
-						incomingUpdatedAt = s
-					}
-				}
-
-				if incomingUpdatedAt != "" && shouldSkipMergeLWW(tx, table.Name, table.Columns, pkCols, row, incomingUpdatedAt) {
-					skipped++
-					continue
-				}
-			}
-
-			placeholders := make([]string, len(table.Columns))
-			for i := range placeholders {
-				placeholders[i] = "?"
-			}
-
-			sql := "INSERT OR REPLACE INTO " + table.Name +
-				" (" + joinStrings(table.Columns, ", ") + ") VALUES (" +
-				joinStrings(placeholders, ", ") + ")"
-
-			if _, err := tx.Exec(sql, row...); err != nil {
-				slog.Warn("sync: merge row", "table", table.Name, "error", err)
-			} else {
-				merged++
-			}
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		slog.Error("sync: commit", "error", err)
-	}
-
-	slog.Info("sync: merged remote state (LWW)", "tables", len(payload.Tables), "merged", merged, "skipped", skipped)
-}
-
-// shouldSkipMergeLWW checks if the local row's updated_at is newer than the incoming one.
-func shouldSkipMergeLWW(tx *sql.Tx, tableName string, columns, pkCols []string, row []interface{}, incomingUpdatedAt string) bool {
-	// Build PK lookup.
-	pkValues := make([]interface{}, 0, len(pkCols))
-	for _, pk := range pkCols {
-		for i, col := range columns {
-			if col == pk && i < len(row) {
-				pkValues = append(pkValues, row[i])
-				break
-			}
-		}
-	}
-	if len(pkValues) != len(pkCols) {
-		return false
-	}
-
-	where := ""
-	for i, col := range pkCols {
-		if i > 0 {
-			where += " AND "
-		}
-		where += col + " = ?"
-	}
-
-	var localUpdatedAt string
-	err := tx.QueryRow(
-		fmt.Sprintf("SELECT updated_at FROM %s WHERE %s", tableName, where),
-		pkValues...,
-	).Scan(&localUpdatedAt)
-	if err != nil {
-		return false
-	}
-
-	// Compare HLC timestamps if both parse; otherwise fall back to
-	// lexicographic string comparison (works for RFC3339 timestamps).
-	localTS, localOK := hlc.Parse(localUpdatedAt)
-	incomingTS, incomingOK := hlc.Parse(incomingUpdatedAt)
-	if localOK && incomingOK {
-		return localTS.After(incomingTS)
-	}
-
-	return localUpdatedAt >= incomingUpdatedAt
-}
-
-func joinStrings(ss []string, sep string) string {
-	result := ""
-	for i, s := range ss {
-		if i > 0 {
-			result += sep
-		}
-		result += s
-	}
-	return result
-}
+// The full-state merge (MergeStateBytesLWW) lives in sync.go — it is the single
+// merge engine shared by all callers.

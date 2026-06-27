@@ -4,16 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
-	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/hlc"
@@ -29,11 +28,12 @@ type Replicator struct {
 	pkiDir   string
 	relayCfg RelayConfig
 
-	mu       sync.Mutex
-	peers    map[string]context.CancelFunc // peer name → cancel for its goroutine
-	relaySet *RelaySet                     // current relay election result
-	isRelay  bool                          // cached: is this node a relay?
-	wg       sync.WaitGroup
+	mu             sync.Mutex
+	peers          map[string]context.CancelFunc // peer name → cancel for its goroutine
+	relaySet       *RelaySet                     // current relay election result
+	isRelay        bool                          // cached: is this node a relay?
+	cleanupPending map[string]bool               // departed peers with a watermark-cleanup timer in flight
+	wg             sync.WaitGroup
 
 	// Fallback tracking for leaves: when was the last successful push to any relay?
 	lastRelayPush  atomic.Int64 // unix millis
@@ -47,11 +47,12 @@ type Replicator struct {
 func NewReplicator(client *Client, pkiDir string, cfg RelayConfig) *Replicator {
 	cfg = cfg.withDefaults()
 	r := &Replicator{
-		client:   client,
-		pkiDir:   pkiDir,
-		relayCfg: cfg,
-		peers:    make(map[string]context.CancelFunc),
-		stopCh:   make(chan struct{}),
+		client:         client,
+		pkiDir:         pkiDir,
+		relayCfg:       cfg,
+		peers:          make(map[string]context.CancelFunc),
+		cleanupPending: make(map[string]bool),
+		stopCh:         make(chan struct{}),
 	}
 	r.lastRelayPush.Store(time.Now().UnixMilli())
 	return r
@@ -100,57 +101,9 @@ func (r *Replicator) Stop() {
 	})
 }
 
-// PeerJoined starts a replicator goroutine for the named peer.
-func (r *Replicator) PeerJoined(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if _, exists := r.peers[name]; exists {
-		return
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	r.peers[name] = cancel
-
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
-		r.replicateToPeer(ctx, name)
-	}()
-
-	slog.Info("replicator: started peer goroutine", "peer", name)
-}
-
-// PeerLeft stops the replicator goroutine for the named peer and schedules
-// watermark cleanup after a grace period to prevent blocking log compaction.
-func (r *Replicator) PeerLeft(name string) {
-	r.mu.Lock()
-	cancel, exists := r.peers[name]
-	if exists {
-		cancel()
-		delete(r.peers, name)
-	}
-	r.mu.Unlock()
-
-	if exists {
-		slog.Info("replicator: stopped peer goroutine", "peer", name)
-		// Schedule watermark cleanup after a grace period. The cleanup
-		// re-checks membership before deleting, so a peer that rejoins within
-		// the window (PeerJoined re-adds it) keeps its watermark instead of
-		// being forced into a full re-sync by a stale timer.
-		go func() {
-			select {
-			case <-r.stopCh:
-				return
-			case <-time.After(watermarkCleanupGrace):
-			}
-			r.cleanupDepartedWatermark(name)
-		}()
-	}
-}
-
-// watermarkCleanupGrace is how long PeerLeft waits before reclaiming a departed
-// peer's replication watermark. A var so tests can drive the cleanup directly.
+// watermarkCleanupGrace is how long the discovery loop waits before reclaiming
+// a departed peer's replication watermark. A var so tests can drive the cleanup
+// directly.
 //
 // pruneMutationLog already excludes watermarks not advanced within
 // LiveWatermarkWindow (30m), so a departed peer stops pinning the log well
@@ -161,31 +114,26 @@ func (r *Replicator) PeerLeft(name string) {
 // old 1h so a genuinely departed peer's row is reclaimed promptly.
 var watermarkCleanupGrace = 10 * time.Minute
 
-// cleanupDepartedWatermark deletes a peer's replication watermark — but only if
-// the peer is still absent. If it rejoined (back in r.peers) the watermark is
-// kept; deleting an active peer's watermark would trigger a needless full re-sync.
-func (r *Replicator) cleanupDepartedWatermark(name string) {
-	r.mu.Lock()
-	_, live := r.peers[name]
-	r.mu.Unlock()
-	if live {
-		slog.Info("replicator: peer rejoined before cleanup, keeping watermark", "peer", name)
-		return
-	}
-	r.client.mu.Lock()
-	r.client.db.ExecContext(context.Background(),
-		`DELETE FROM replication_watermarks WHERE peer_name = ?`, name)
-	r.client.mu.Unlock()
-	slog.Info("replicator: cleaned watermark for departed peer", "peer", name)
-}
-
-// peerDiscoveryLoop periodically checks memberlist for new/departed peers.
+// peerDiscoveryLoop keeps the per-peer replication goroutines and the
+// replication-watermark table in sync with cluster membership. It reconverges
+// on every gossip membership change (event-driven, via MembershipChanged) and
+// on a slow backstop ticker that guarantees convergence even if an event is
+// ever missed.
 func (r *Replicator) peerDiscoveryLoop(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	// Backstop poll — a safety net behind the membership events, not the
+	// primary trigger; far slower than the old 5s busy-poll.
+	const backstopInterval = 30 * time.Second
+	ticker := time.NewTicker(backstopInterval)
 	defer ticker.Stop()
 
-	// Initial discovery.
-	r.syncPeers()
+	membership := r.client.MembershipChanged()
+
+	reconverge := func() {
+		r.syncPeers()
+		r.reconcileDepartedWatermarks(ctx)
+	}
+
+	reconverge() // initial discovery
 
 	for {
 		select {
@@ -193,10 +141,106 @@ func (r *Replicator) peerDiscoveryLoop(ctx context.Context) {
 			return
 		case <-r.stopCh:
 			return
+		case <-membership:
+			reconverge()
 		case <-ticker.C:
-			r.syncPeers()
+			reconverge()
 		}
 	}
+}
+
+// reconcileDepartedWatermarks schedules cleanup of replication_watermarks rows
+// whose peer is no longer in cluster membership. This catches peers that leave
+// after a relay reshuffle already dropped them from this node's target set (so
+// they were never in r.peers to trigger a stop-time cleanup). The cleanup is
+// delayed by watermarkCleanupGrace and re-checks membership, so a brief flap or
+// a quick rejoin keeps the watermark.
+func (r *Replicator) reconcileDepartedWatermarks(ctx context.Context) {
+	members := map[string]bool{}
+	for _, m := range r.client.Members() {
+		members[m.Name] = true
+	}
+	// If we can't see any peers, don't reap — this is more likely a local
+	// gossip outage than the whole cluster departing, and reaping would force
+	// needless full re-syncs when peers reappear.
+	if len(members) == 0 {
+		return
+	}
+	r.reconcileDepartedWatermarksAgainst(ctx, members)
+}
+
+// reconcileDepartedWatermarksAgainst schedules cleanup for watermark rows whose
+// peer is absent from the given live-member set. Split from the Members()-driven
+// caller so tests can supply membership without a running gossip layer.
+func (r *Replicator) reconcileDepartedWatermarksAgainst(ctx context.Context, members map[string]bool) {
+	rows, err := r.client.Query(ctx, `SELECT DISTINCT peer_name FROM replication_watermarks`)
+	if err != nil {
+		slog.Warn("replicator: list watermarks for reconcile", "error", err)
+		return
+	}
+	for _, row := range rows {
+		name := row.String("peer_name")
+		if name != "" && name != r.client.HostName() && !members[name] {
+			r.scheduleWatermarkCleanup(name)
+		}
+	}
+}
+
+// scheduleWatermarkCleanup reclaims a departed peer's watermark after a grace
+// period, deduping so at most one timer per peer is in flight (the discovery
+// loop may observe the same departed peer many times during the grace window).
+func (r *Replicator) scheduleWatermarkCleanup(name string) {
+	r.mu.Lock()
+	if r.cleanupPending[name] {
+		r.mu.Unlock()
+		return
+	}
+	r.cleanupPending[name] = true
+	r.mu.Unlock()
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer func() {
+			r.mu.Lock()
+			delete(r.cleanupPending, name)
+			r.mu.Unlock()
+		}()
+		select {
+		case <-r.stopCh:
+			return
+		case <-time.After(watermarkCleanupGrace):
+		}
+		r.cleanupDepartedWatermark(name)
+	}()
+}
+
+// cleanupDepartedWatermark deletes a peer's replication watermark — but only if
+// the peer is gone for good. It is kept when the peer is still in cluster
+// membership (rejoined during the grace) or is still one of our replication
+// targets; deleting an active peer's watermark would trigger a needless full
+// re-sync. Membership is authoritative for liveness (a live peer always shows
+// in gossip); the target-set check is extra belt-and-suspenders.
+func (r *Replicator) cleanupDepartedWatermark(name string) {
+	for _, m := range r.client.Members() {
+		if m.Name == name {
+			slog.Info("replicator: peer back in membership before cleanup, keeping watermark", "peer", name)
+			return
+		}
+	}
+	r.mu.Lock()
+	_, targeted := r.peers[name]
+	r.mu.Unlock()
+	if targeted {
+		slog.Info("replicator: peer still a replication target, keeping watermark", "peer", name)
+		return
+	}
+
+	r.client.mu.Lock()
+	r.client.db.ExecContext(context.Background(),
+		`DELETE FROM replication_watermarks WHERE peer_name = ?`, name)
+	r.client.mu.Unlock()
+	slog.Info("replicator: cleaned watermark for departed peer", "peer", name)
 }
 
 func (r *Replicator) syncPeers() {
@@ -525,50 +569,13 @@ func (r *Replicator) setWatermark(ctx context.Context, peerName string, seq int6
 }
 
 func (r *Replicator) peerGRPCClient(ctx context.Context, peerName string) (pb.LiteVirtClient, *grpc.ClientConn, error) {
-	var addr string
-	var port int
-
-	host, err := GetHost(ctx, r.client, peerName)
+	target, err := resolvePeerTarget(ctx, r.client, peerName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("look up host %q: %w", peerName, err)
+		return nil, nil, err
 	}
-	if host != nil {
-		addr = host.Address
-		port = host.GRPCPort
-	} else {
-		// Host not yet in DB — fall back to gossip memberlist address.
-		// This handles bootstrap when a new node joins and hasn't
-		// received the hosts table via replication yet.
-		for _, m := range r.client.Members() {
-			if m.Name == peerName {
-				host, _, _ := net.SplitHostPort(m.Addr)
-				if host != "" {
-					addr = host
-				} else {
-					addr = m.Addr
-				}
-				break
-			}
-		}
-		if addr == "" {
-			return nil, nil, fmt.Errorf("look up host %q: not found in cluster state or gossip", peerName)
-		}
-		slog.Debug("replicator: using gossip address for peer", "peer", peerName, "addr", addr)
-	}
-	if port == 0 {
-		port = 7443
-	}
-
-	tlsCfg, err := pki.PeerTLSConfig(r.pkiDir)
+	conn, err := pki.PeerDial(r.pkiDir, target)
 	if err != nil {
-		return nil, nil, fmt.Errorf("peer TLS config: %w", err)
-	}
-	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", addr, port),
-		grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dial host %s: %w", peerName, err)
+		return nil, nil, err
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
@@ -675,17 +682,36 @@ func (r *Replicator) pruneMutationLog(ctx context.Context) {
 	}
 }
 
-// pruneMutationSeen deletes old entries from the dedup table.
-// Uses HLC lexicographic ordering: entries with physical time older than 15 minutes are pruned.
-func (r *Replicator) pruneMutationSeen(ctx context.Context) {
-	cutoffMS := time.Now().Add(-15 * time.Minute).UnixMilli()
-	cutoffHLC := fmt.Sprintf("%013d-0000-", cutoffMS)
+// mutationSeenRetention bounds how far behind the newest dedup entry a row may
+// be before it is pruned. Measured against the data (the newest stored HLC),
+// not the wall clock, so an NTP step can't skew the cutoff. A var so tests can
+// drive the prune directly.
+var mutationSeenRetention = 15 * time.Minute
 
+// validHLCPredicate is a SQL fragment that matches only rows whose hlc has the
+// exact canonical layout "<13 digits>-<4 digits>-<node>" (hlc.Timestamp.String).
+// Position/length are enforced with fixed-count GLOB digit classes — not a loose
+// '[0-9]*' which would also match e.g. "12abc-…" — so a malformed/legacy row
+// neither defines the max nor gets pruned by a misleading CAST(...)→0.
+const validHLCPredicate = "length(hlc) >= 19 " +
+	"AND substr(hlc,1,13) GLOB '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' " +
+	"AND substr(hlc,14,1) = '-' " +
+	"AND substr(hlc,15,4) GLOB '[0-9][0-9][0-9][0-9]' " +
+	"AND substr(hlc,19,1) = '-'"
+
+// pruneMutationSeen deletes dedup entries whose physical time is more than
+// mutationSeenRetention behind the newest valid HLC row. The cutoff is derived
+// from the stored data (MAX over valid rows), so it is immune to wall-clock /
+// NTP steps; an empty or all-malformed table yields a NULL max → no-op.
+func (r *Replicator) pruneMutationSeen(ctx context.Context) {
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
 
 	result, err := r.client.db.ExecContext(ctx,
-		`DELETE FROM mutation_seen WHERE hlc < ?`, cutoffHLC)
+		`DELETE FROM mutation_seen WHERE `+validHLCPredicate+
+			` AND CAST(substr(hlc,1,13) AS INTEGER) <`+
+			` (SELECT MAX(CAST(substr(hlc,1,13) AS INTEGER)) FROM mutation_seen WHERE `+validHLCPredicate+`) - ?`,
+		mutationSeenRetention.Milliseconds())
 	if err != nil {
 		slog.Warn("replicator: prune mutation_seen error", "error", err)
 		return
@@ -770,9 +796,12 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 	}
 
 	// Filter out entries we've already processed (dedup).
-	unseen := r.filterUnseen(ctx, tx, entries)
+	unseen, err := r.filterUnseen(ctx, tx, entries)
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, err
+	}
 
-	var lastSeq int64
 	for _, entry := range unseen {
 		// Advance local HLC.
 		if remoteTS, ok := hlc.Parse(entry.Hlc); ok {
@@ -808,7 +837,6 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 			}
 		}
 
-		lastSeq = entry.Seq
 	}
 
 	// Record all unseen entries in mutation_seen for future dedup. On failure,
@@ -843,29 +871,30 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 	}
 
 	// Use the last seq from the original entries (not just unseen) so the
-	// sender's watermark advances past duplicates too.
-	if lastSeq == 0 && len(entries) > 0 {
-		lastSeq = entries[len(entries)-1].Seq
-	}
-
-	return lastSeq, nil
+	// sender's watermark advances past duplicates too. Otherwise a batch with
+	// new entries followed by already-seen entries would replay the trailing
+	// duplicates forever.
+	return entries[len(entries)-1].Seq, nil
 }
 
 // filterUnseen returns entries not yet in the mutation_seen dedup table.
-func (r *Replicator) filterUnseen(ctx context.Context, tx *sql.Tx, entries []*pb.MutationEntry) []*pb.MutationEntry {
+func (r *Replicator) filterUnseen(ctx context.Context, tx *sql.Tx, entries []*pb.MutationEntry) ([]*pb.MutationEntry, error) {
 	var unseen []*pb.MutationEntry
 	for _, e := range entries {
 		var exists int
 		err := tx.QueryRowContext(ctx,
 			`SELECT 1 FROM mutation_seen WHERE origin = ? AND hlc = ?`,
 			e.Origin, e.Hlc).Scan(&exists)
-		if err != nil {
-			// sql.ErrNoRows means not seen yet — include it.
+		if errors.Is(err, sql.ErrNoRows) {
 			unseen = append(unseen, e)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("query mutation_seen (origin=%s hlc=%s): %w", e.Origin, e.Hlc, err)
 		}
 		// If exists == 1, skip (already applied).
 	}
-	return unseen
+	return unseen, nil
 }
 
 // recordSeen inserts entries into mutation_seen for future dedup. Returns an
@@ -970,15 +999,17 @@ func shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName string, pkCols []s
 		return false
 	}
 
-	// Compare HLC timestamps. If local is an old RFC3339, incoming HLC always wins.
-	localTS, localOK := hlc.Parse(localUpdatedAt.String)
-	incomingTS, incomingOK := hlc.Parse(incomingHLC)
-	if !localOK || !incomingOK {
-		return false // can't compare, don't skip
+	// Prefer the row's own updated_at when the statement carries it. Most real
+	// tables still store RFC3339 in updated_at; comparing that local RFC3339
+	// against the mutation-log HLC would make every remote mutation win by
+	// format rather than by row timestamp. Fall back to the entry HLC only for
+	// statements whose timestamp cannot be extracted.
+	incomingTS, ok := extractUpdatedAtValue(s)
+	if !ok || incomingTS == "" {
+		incomingTS = incomingHLC
 	}
 
-	// Skip if local is strictly newer.
-	return localTS.After(incomingTS)
+	return localWinsLWW(localUpdatedAt.String, incomingTS)
 }
 
 // extractPKValues attempts to extract primary key values from a Statement.

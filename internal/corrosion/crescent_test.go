@@ -70,11 +70,11 @@ func TestComputeRelays_Scaling(t *testing.T) {
 		nodes     int
 		wantRelay int
 	}{
-		{10, 4},   // 3 + ceil(10/50) = 4
-		{50, 4},   // 3 + ceil(50/50) = 4
-		{51, 5},   // 3 + ceil(51/50) = 5
-		{100, 5},  // 3 + ceil(100/50) = 5
-		{200, 7},  // 3 + ceil(200/50) = 7
+		{10, 4},  // 3 + ceil(10/50) = 4
+		{50, 4},  // 3 + ceil(50/50) = 4
+		{51, 5},  // 3 + ceil(51/50) = 5
+		{100, 5}, // 3 + ceil(100/50) = 5
+		{200, 7}, // 3 + ceil(200/50) = 7
 	}
 
 	for _, tt := range tests {
@@ -236,6 +236,47 @@ func TestDedup_MutationSeen(t *testing.T) {
 	c.mu.RUnlock()
 	if count != 1 {
 		t.Errorf("mutation_seen count = %d, want 1", count)
+	}
+}
+
+func TestApplyRemoteMutations_AdvancesPastTrailingDuplicates(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+	clock := hlc.NewClock("origin-node")
+	tsNew := clock.Now().String()
+	tsSeen := clock.Now().String()
+
+	entries := []*pb.MutationEntry{
+		{
+			Seq:    1,
+			Hlc:    tsNew,
+			Origin: "origin-node",
+			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["dedup-new","10.0.0.1","root","serial1","active","2025-01-01T00:00:00Z","` + tsNew + `"]}]`,
+		},
+		{
+			Seq:    2,
+			Hlc:    tsSeen,
+			Origin: "origin-node",
+			Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["dedup-seen","10.0.0.2","root","serial2","active","2025-01-01T00:00:00Z","` + tsSeen + `"]}]`,
+		},
+	}
+
+	c.mu.Lock()
+	if _, err := c.db.ExecContext(ctx,
+		`INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)`,
+		"origin-node", tsSeen); err != nil {
+		c.mu.Unlock()
+		t.Fatalf("seed mutation_seen: %v", err)
+	}
+	c.mu.Unlock()
+
+	got, err := r.ApplyRemoteMutations(ctx, entries)
+	if err != nil {
+		t.Fatalf("ApplyRemoteMutations: %v", err)
+	}
+	if got != 2 {
+		t.Fatalf("acked seq = %d, want 2 (must advance past trailing duplicates)", got)
 	}
 }
 
@@ -443,6 +484,41 @@ func TestLWW_ConcurrentWrites(t *testing.T) {
 	}
 }
 
+func TestLWW_PrimaryReplicationUsesStatementUpdatedAt(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+
+	localTS := "2026-01-02T00:00:00Z"
+	incomingRowTS := "2026-01-01T00:00:00Z"
+	incomingMutationHLC := "9999999999999-0000-remote"
+
+	if err := c.Execute(ctx,
+		`INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		"rfc-conflict", "10.0.0.1", "root", "serial-local", "active", localTS, localTS); err != nil {
+		t.Fatalf("seed local host: %v", err)
+	}
+
+	entries := []*pb.MutationEntry{{
+		Seq:    1,
+		Hlc:    incomingMutationHLC,
+		Origin: "remote-node",
+		Stmts:  `[{"SQL":"INSERT INTO hosts (name, address, ssh_user, cert_serial, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)","Params":["rfc-conflict","10.0.0.2","root","serial-remote","active","` + incomingRowTS + `","` + incomingRowTS + `"]}]`,
+	}}
+	if _, err := r.ApplyRemoteMutations(ctx, entries); err != nil {
+		t.Fatalf("apply older row with newer mutation HLC: %v", err)
+	}
+
+	rows, err := c.Query(ctx, "SELECT address FROM hosts WHERE name = 'rfc-conflict'")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("lookup rfc-conflict: err=%v rows=%d", err, len(rows))
+	}
+	if addr := rows[0].String("address"); addr != "10.0.0.1" {
+		t.Errorf("address = %s, want 10.0.0.1 (row updated_at, not mutation HLC, should decide)", addr)
+	}
+}
+
 // ─── Prune Tests ────────────────────────────────────────────────────────────
 
 func TestPruneMutationSeen(t *testing.T) {
@@ -469,6 +545,73 @@ func TestPruneMutationSeen(t *testing.T) {
 
 	if count != 1 {
 		t.Errorf("after prune: mutation_seen count = %d, want 1 (only recent)", count)
+	}
+}
+
+func seenCount(t *testing.T, c *Client) int {
+	t.Helper()
+	var n int
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	c.db.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM mutation_seen").Scan(&n)
+	return n
+}
+
+// TestPruneMutationSeen_DataRelative proves the cutoff is derived from the
+// newest stored HLC, not the wall clock. All rows sit in the year 2000 — far
+// behind "now" — so the old wall-clock cutoff would have deleted every row;
+// the data-relative cutoff deletes only the one >15m behind the table's max.
+func TestPruneMutationSeen_DataRelative(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+
+	baseMS := int64(946684800000) // 2000-01-01, far behind any plausible now
+	mk := func(ms int64, node string) string { return fmt.Sprintf("%013d-%04d-%s", ms, 0, node) }
+
+	c.mu.Lock()
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "max", mk(baseMS, "max"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "keep", mk(baseMS-5*60*1000, "keep"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "drop", mk(baseMS-20*60*1000, "drop"))
+	c.mu.Unlock()
+
+	r.pruneMutationSeen(ctx)
+
+	if got := seenCount(t, c); got != 2 {
+		t.Errorf("data-relative prune: count = %d, want 2 (max + keep; only the 20m-old row dropped)", got)
+	}
+}
+
+// TestPruneMutationSeen_MalformedSurvives ensures a row that is not a canonical
+// HLC neither defines the max nor is deleted. "12abc12345678-0000-x" is the
+// case a loose '[0-9][0-9]*-*' GLOB would have wrongly matched.
+func TestPruneMutationSeen_MalformedSurvives(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+	ctx := context.Background()
+
+	nowMS := time.Now().UnixMilli()
+	mk := func(ms int64, node string) string { return fmt.Sprintf("%013d-%04d-%s", ms, 0, node) }
+
+	c.mu.Lock()
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "max", mk(nowMS, "max"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "old", mk(nowMS-20*60*1000, "old"))
+	c.db.ExecContext(ctx, "INSERT INTO mutation_seen (origin, hlc) VALUES (?, ?)", "bad", "12abc12345678-0000-x")
+	c.mu.Unlock()
+
+	r.pruneMutationSeen(ctx)
+
+	// max + malformed survive; the valid 20m-old row is pruned.
+	if got := seenCount(t, c); got != 2 {
+		t.Errorf("malformed prune: count = %d, want 2 (max + malformed kept; valid old row dropped)", got)
+	}
+	var badCount int
+	c.mu.RLock()
+	c.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM mutation_seen WHERE origin = 'bad'").Scan(&badCount)
+	c.mu.RUnlock()
+	if badCount != 1 {
+		t.Errorf("malformed row was pruned (count=%d), want kept", badCount)
 	}
 }
 

@@ -9,9 +9,11 @@
 
 Every host runs `litevirt`. There is **no master node**. State (hosts, VMs,
 networks, etc.) is replicated as a CRDT via the embedded Corrosion store using
-the Crescent relay-quorum protocol over mTLS gRPC. Each host generates its
-own Hybrid Logical Clock timestamps; conflicts resolve via last-writer-wins
-with HLC ordering. Health is observed peer-to-peer (TLS probes every 2 s).
+the Crescent relay-quorum protocol over mTLS gRPC. Each host's Hybrid Logical
+Clock orders the replication log and de-duplicates mutations; row **conflict
+resolution is last-writer-wins by the row's wall-clock `updated_at` (RFC3339)**,
+so all hosts must run NTP (HLC does not arbitrate conflicts). Health is observed
+peer-to-peer (TLS probes every 2 s).
 Failover is decided by quorum among observers, gated by a CRDT-stored leader
 lease. Fencing has multiple strategies; safety guards refuse to reschedule
 VMs after a fence failure so that the same VM never runs on two hosts at once.
@@ -27,7 +29,9 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **No data loss for committed local writes** as long as one healthy peer
   remains reachable before the host dies.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
-  and is the safety net for any divergence the WAL replicator missed. When it
+  and is the safety net for divergence the WAL replicator missed in the
+  full-state-replicated tables (a few push-only tables are deliberately
+  excluded — see "Push-only tables are not self-healed" below). When it
   detects drift it pulls the peer's full state over a **chunked** streaming RPC
   (`StreamStateDump`), so convergence works regardless of total state size; the
   older unary `GetStateDump` is retained as a fallback for mixed-version
@@ -67,9 +71,11 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   - Fencing primitives are designed to be idempotent (IPMI on an already-off
     host is a no-op; SSH poweroff likewise). Ensure your fence method has
     this property.
-- VM placement and other state writes use HLC-LWW. **The most recent writer
-  wins**; there is no two-phase commit. If two operators concurrently modify
-  the same VM, one set of changes is silently lost.
+- VM placement and other state writes use last-writer-wins on the row's
+  wall-clock `updated_at`. **The most recent writer (by wall clock) wins**; there
+  is no two-phase commit. If two operators concurrently modify the same VM, one
+  set of changes is silently lost — and under clock skew the host with the faster
+  clock wins, so NTP is required.
 
 ### Even-N clusters cannot fence in a 2/2 partition
 - A 4-node cluster split exactly 2/2 has no majority. Both sides compute
@@ -97,6 +103,20 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   a healthy LAN cluster, longer over WAN. Code that needs "this write is
   visible everywhere before I act" should use a confirmation read on the
   target peer, not assume convergence.
+
+### Push-only tables are not self-healed by anti-entropy
+- A few replicated tables are **excluded from the full-state anti-entropy
+  dump**: the secret-bearing ones — `registry_credentials` and the
+  notification config (`notification_targets`, `notification_routes`, whose
+  config can carry webhook tokens/URLs) — and the 2FA tables (`user_2fa`
+  enrollment secrets, single-use `recovery_codes`). They are kept out of the
+  operator-readable bulk dump on purpose.
+- These propagate by **mutation push only**. If a host misses the push (a
+  partition or restart at the wrong moment), anti-entropy will **not** repair
+  it — unlike every other replicated table. To re-replicate, re-apply the
+  change on a healthy host (re-save the credential / notification target,
+  re-enroll 2FA). Recovery codes are single-use and per-host divergence there
+  is self-correcting on next enrollment.
 
 ### Disk-full is not auto-recovered
 - The Corrosion store is a SQLite file. If the disk fills, the daemon stops

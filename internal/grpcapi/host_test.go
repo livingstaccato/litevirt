@@ -12,6 +12,31 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// TestHostStateToPB_NeverMasqueradesAsActive guards the host-state display
+// mapping: "fenced", "upgrading", and unknown future states must not report
+// as HOST_ACTIVE, which would show a dead or transitioning host as healthy in
+// `lv host ls` / UI / REST.
+func TestHostStateToPB_NeverMasqueradesAsActive(t *testing.T) {
+	cases := []struct {
+		in   string
+		want pb.HostState
+	}{
+		{"active", pb.HostState_HOST_ACTIVE},
+		{"draining", pb.HostState_HOST_DRAINING},
+		{"maintenance", pb.HostState_HOST_MAINTENANCE},
+		{"suspect", pb.HostState_HOST_SUSPECT},
+		{"offline", pb.HostState_HOST_OFFLINE},
+		{"fenced", pb.HostState_HOST_OFFLINE},            // fenced ⇒ down, not active
+		{"upgrading", pb.HostState_HOST_DRAINING},        // transient, not steady-active
+		{"some-future-state", pb.HostState_HOST_OFFLINE}, // fail safe: unknown ≠ active
+	}
+	for _, c := range cases {
+		if got := hostStateToPB(c.in); got != c.want {
+			t.Errorf("hostStateToPB(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}
+
 func insertTestHost(t *testing.T, ctx context.Context, db *corrosion.Client, name, state string) {
 	t.Helper()
 	err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{

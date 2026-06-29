@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // StoragePoolRecord represents a storage pool on a host.
@@ -111,6 +112,80 @@ func HostsWithPool(ctx context.Context, c *Client, poolName, excludeHost string)
 		out = append(out, r.String("host_name"))
 	}
 	return out, nil
+}
+
+// CountDisksUsingPool counts live VM disks placed on (host, poolName). Pools are
+// HOST-scoped, so the guard must scope by host too — a cluster-wide
+// `storage_volume = ?` count would be both too broad (a same-named pool's disks on
+// another host) and wrong. The pool delete refuses (without --force) when this is
+// non-zero.
+func CountDisksUsingPool(ctx context.Context, c *Client, host, poolName string) (int, error) {
+	rows, err := c.Query(ctx,
+		`SELECT COUNT(*) AS n FROM vm_disks
+		 WHERE storage_volume = ? AND host_name = ? AND deleted_at IS NULL`,
+		poolName, host)
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Int("n"), nil
+}
+
+// CountPoolsSharingResource counts OTHER live pool rows on rec's host that would
+// share the SAME host-level resource rec's teardown releases — the refcount that
+// stops us tearing down a mount/session another pool still needs. The shared
+// resource is DRIVER-SPECIFIC, not just "same source":
+//
+//   - nfs: the litevirt-DERIVED mountpoint, keyed by source. Only OTHER
+//     litevirt-owned NFS pools (target='') with the same source mount it at the
+//     same path; an operator-managed (targetOverride) pool mounts elsewhere and
+//     is excluded — counting it would falsely block a derived-mount unmount.
+//   - iscsi: the (target IQN, portal) session. Same source (IQN) AND same portal
+//     (empty/absent normalizes to 127.0.0.1, matching the driver default) — two
+//     pools on the same IQN via DIFFERENT portals are distinct sessions and must
+//     not block each other.
+//   - every other driver: no host-level resource to refcount → 0 (teardown is a
+//     no-op for them anyway).
+func CountPoolsSharingResource(ctx context.Context, c *Client, rec StoragePoolRecord) (int, error) {
+	if rec.Source == "" {
+		return 0, nil
+	}
+	switch strings.ToLower(rec.Driver) {
+	case "nfs", "netfs":
+		rows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM storage_pools
+			 WHERE host_name = ? AND name != ? AND driver = ? AND source = ?
+			   AND COALESCE(target, '') = '' AND deleted_at IS NULL`,
+			rec.HostName, rec.Name, rec.Driver, rec.Source)
+		return countN(rows, err)
+	case "iscsi":
+		portal := rec.Options["portal"]
+		if portal == "" {
+			portal = "127.0.0.1"
+		}
+		rows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM storage_pools
+			 WHERE host_name = ? AND name != ? AND driver = 'iscsi' AND source = ? AND deleted_at IS NULL
+			   AND CASE WHEN COALESCE(json_extract(options, '$.portal'), '') = ''
+			            THEN '127.0.0.1' ELSE json_extract(options, '$.portal') END = ?`,
+			rec.HostName, rec.Name, rec.Source, portal)
+		return countN(rows, err)
+	default:
+		return 0, nil
+	}
+}
+
+// countN reads a single COUNT(*) AS n result.
+func countN(rows []Row, err error) (int, error) {
+	if err != nil {
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Int("n"), nil
 }
 
 // MarkStoragePoolDeleted soft-deletes a pool row by stamping deleted_at.

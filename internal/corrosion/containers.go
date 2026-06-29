@@ -93,13 +93,22 @@ type ContainerCreateSpec struct {
 	Networks []ContainerNetwork `json:"networks,omitempty"`
 }
 
-// ContainerNetwork is one NIC of a ContainerCreateSpec (mirrors lxc.NetworkAttach
-// without importing the lxc package into corrosion).
+// ContainerNetwork is one NIC of a ContainerCreateSpec. It carries the create-
+// time intent so relocate/restore/clone can faithfully rebuild the NIC:
+// NetworkName (the managed logical network, "" = legacy raw bridge),
+// SecurityGroups (SG names), MAC (the stable generated/assigned MAC), and IP —
+// the EFFECTIVE address, static OR auto-allocated (stored back at create time),
+// so a relocate/restore/migrate re-reserves the SAME address instead of losing an
+// auto-allocated one. (A clone is the exception: it builds the spec with IP empty
+// so the copy gets a fresh address.) The derived veth is NOT stored; it's
+// recomputed deterministically from (host, ct, ordinal).
 type ContainerNetwork struct {
-	Name   string `json:"name,omitempty"`
-	Bridge string `json:"bridge,omitempty"`
-	IP     string `json:"ip,omitempty"`
-	MAC    string `json:"mac,omitempty"`
+	Name           string   `json:"name,omitempty"`
+	Bridge         string   `json:"bridge,omitempty"`
+	IP             string   `json:"ip,omitempty"`
+	MAC            string   `json:"mac,omitempty"`
+	NetworkName    string   `json:"network_name,omitempty"`
+	SecurityGroups []string `json:"security_groups,omitempty"`
 }
 
 // EncodeCreateSpec marshals a create spec for storage. Returns "" for a
@@ -129,6 +138,17 @@ func DecodeCreateSpec(raw string) ContainerCreateSpec {
 // Atomic: the (host_name, name) primary key plus a soft-delete-aware
 // UPDATE keeps us from racing with concurrent List queries.
 func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
+	stmt, err := upsertContainerStmt(c, r)
+	if err != nil {
+		return err
+	}
+	return c.ExecuteBatch(ctx, []Statement{stmt})
+}
+
+// upsertContainerStmt builds the container UPSERT as a Statement so it can be
+// written in the SAME ExecuteBatch as the interface rows + IPAM leases (atomic
+// create — a crash can't leave a tracked container with missing NIC/IPAM state).
+func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	now := c.NowTS()
 	if r.CreatedAt == "" {
 		r.CreatedAt = now
@@ -140,14 +160,14 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 	if len(r.Labels) > 0 {
 		b, err := json.Marshal(r.Labels)
 		if err != nil {
-			return err
+			return Statement{}, err
 		}
 		labelsJSON = string(b)
 	}
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
-	return c.Execute(ctx,
-		`INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
+	return Statement{
+		SQL: `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(host_name, name) DO UPDATE SET
 		   state = excluded.state,
@@ -167,9 +187,33 @@ func UpsertContainer(ctx context.Context, c *Client, r ContainerRecord) error {
 		   relocate_token = excluded.relocate_token,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
-		labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken, r.CreatedAt, now,
-	)
+		Params: []interface{}{
+			r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
+			labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken, r.CreatedAt, now,
+		},
+	}, nil
+}
+
+// CreateContainerAtomic writes the container row and its managed interface rows
+// in ONE transaction, so a crash/kill never leaves a live tracked container with
+// missing interface rows. IPAM leases are allocated separately (they need a
+// conditional, tombstone/race-safe write that a plain batch can't express; the
+// caller reserves them before this and rolls them back on failure).
+func CreateContainerAtomic(ctx context.Context, c *Client, rec ContainerRecord, ifaces []ContainerInterfaceRecord) error {
+	stmts := make([]Statement, 0, 1+len(ifaces))
+	cs, err := upsertContainerStmt(c, rec)
+	if err != nil {
+		return err
+	}
+	stmts = append(stmts, cs)
+	for _, ifc := range ifaces {
+		s, err := containerInterfaceStmt(c, ifc)
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, s)
+	}
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // SetContainerTemplate flips a container's is_template flag (ConvertContainer-

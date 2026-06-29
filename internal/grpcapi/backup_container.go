@@ -17,6 +17,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -42,6 +43,13 @@ type containerBackupSpec struct {
 	CreateSpec    string `json:"create_spec,omitempty"`
 	OnHostFailure string `json:"on_host_failure,omitempty"`
 	IsTemplate    bool   `json:"is_template,omitempty"`
+	// StateDetail carries the source's stop intent so a restore that does NOT start
+	// the container (req.Start == false, e.g. cold-migrating an already-stopped CT)
+	// preserves it. Only "operator-stop" is load-bearing — without it the target
+	// reconciler treats the stopped row as an out-of-band stop and restarts it,
+	// resurrecting a container the operator had deliberately stopped. (Other details
+	// are transient — the reconciler overwrites them on its next sweep.)
+	StateDetail string `json:"state_detail,omitempty"`
 }
 
 // containerBackupDisk is the manifest "disk" name for a container — a container
@@ -58,6 +66,54 @@ const restoreRowRecordedStatus = "cluster-row-recorded"
 // row's relocate_token so the coordinator can prove the (target,name) row is ITS
 // restore. Passed via metadata (not a proto field) so no contract change.
 const relocateTokenMDKey = "x-litevirt-relocate-token"
+
+// migrateFromMDKey marks a restore as the target side of a cross-host MIGRATE,
+// carrying the source host. When honored, RestoreContainer keeps the imported NIC
+// IPs (does NOT re-reserve/blank them) because the source has explicitly handed
+// its IPAM leases to this host — a move ReserveContainerIP won't infer from a name.
+const migrateFromMDKey = "x-litevirt-migrate-from-host"
+
+// migrateFromMD reads the raw (UNVERIFIED) migrate-source claim from incoming gRPC
+// metadata ("" if absent). Callers must NOT trust this directly — see
+// migrateSourceFromPeer, which is the only path allowed to honor it.
+func migrateFromMD(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if v := md.Get(migrateFromMDKey); len(v) > 0 {
+			return v[0]
+		}
+	}
+	return ""
+}
+
+// migrateSourceFromPeer returns the migrate source host ONLY when the marker is
+// backed by peer mTLS whose certificate CN matches the claimed source (a known
+// cluster host). RestoreContainer is operator-facing, so an operator/bearer caller
+// — or a peer impersonating a different source — must NOT be able to set this
+// header to skip IP re-reservation and import an address this host doesn't own.
+// An unverified marker is IGNORED (returns ""), degrading safely to the normal
+// reserve-or-blank path rather than rejecting the restore.
+func (s *Server) migrateSourceFromPeer(ctx context.Context) string {
+	claimed := migrateFromMD(ctx)
+	if claimed == "" {
+		return ""
+	}
+	if callerAuthMethod(ctx) != authMethodMTLS {
+		slog.Warn("restore: ignoring migrate-from marker — caller is not a peer mTLS connection",
+			"claimed_source", claimed)
+		return ""
+	}
+	if cn := callerMTLSCommonName(ctx); cn != claimed {
+		slog.Warn("restore: ignoring migrate-from marker — peer cert CN does not match the claimed source",
+			"peer_cn", cn, "claimed_source", claimed)
+		return ""
+	}
+	if h, _ := corrosion.GetHost(ctx, s.db, claimed); h == nil {
+		slog.Warn("restore: ignoring migrate-from marker — claimed source is not a known cluster host",
+			"claimed_source", claimed)
+		return ""
+	}
+	return claimed
+}
 
 // BackupContainer freezes a container, streams its rootfs+config as a full,
 // content-addressed manifest into a host-local repo, and indexes the size for
@@ -205,12 +261,9 @@ func relocateTokenFromMD(ctx context.Context) string {
 // than destructively falling back.
 func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name, timestamp, token string) (corrosion.RestoreOutcome, error) {
 	if s.migrateRestoreOverride != nil {
-		// Test seam (shared with MigrateContainer): a nil error ⇒ landed; an error
-		// is indeterminate (the override doesn't model where it failed).
-		if e := s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true); e != nil {
-			return corrosion.RestoreUnknown, e
-		}
-		return corrosion.RestoreLanded, nil
+		// Test seam (shared with MigrateContainer): the override returns the
+		// classified outcome directly.
+		return s.migrateRestoreOverride(ctx, target, repoPath, name, timestamp, true)
 	}
 	// Carry the attempt token to the target so it stamps the restored row.
 	if token != "" {
@@ -227,6 +280,18 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 	if rerr != nil {
 		return corrosion.RestoreNotAttempted, rerr // RPC never established
 	}
+	return drainRestoreStream(rs)
+}
+
+// drainRestoreStream classifies a remote RestoreContainer progress stream. The
+// authoritative "row recorded" signal is the target's restoreRowRecordedStatus
+// frame (or a clean DONE/EOF) ⇒ RestoreLanded — once seen, a later error is the
+// target's own recoverable post-land state (e.g. a start failure), NOT a reason to
+// undo the restore. A definite pre-row status code means nothing was written;
+// anything else after the row may have landed is indeterminate (RestoreUnknown).
+// Shared by driveRemoteRestore (failover) and migrateRestore (cold migrate) so
+// both make the same land/rollback decision.
+func drainRestoreStream(rs grpc.ServerStreamingClient[pb.RestoreContainerProgress]) (corrosion.RestoreOutcome, error) {
 	landed := false
 	for {
 		p, e := rs.Recv()
@@ -315,6 +380,7 @@ func (s *Server) archiveContainer(ctx context.Context, repo *pbsstore.Repo, rec 
 		Name: rec.Name, Image: rec.Image, CPULimit: rec.CPULimit, MemMiB: rec.MemMiB,
 		Labels: rec.Labels, RestartPolicy: rec.RestartPolicy, Project: rec.Project,
 		CreateSpec: rec.CreateSpec, OnHostFailure: rec.OnHostFailure, IsTemplate: rec.IsTemplate,
+		StateDetail: rec.StateDetail,
 	})
 	// Pipe the export tar straight into the chunk store so we never buffer the
 	// whole rootfs. If PushDisk returns early (error), CloseWithError unblocks
@@ -386,8 +452,14 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	unlock := s.lockVM("ct/" + req.Name)
 	defer unlock()
 
-	// Refuse to clobber a live container of the same name on this host.
-	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name); existing != nil {
+	// Refuse to clobber a live container of the same name on this host. Fail CLOSED
+	// on a read error — proceeding could land a restore over an existing container
+	// (and a later cleanup keyed on (host, name) could release its NIC state).
+	existing, gerr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if gerr != nil {
+		return status.Errorf(codes.Internal, "check existing container: %v", gerr)
+	}
+	if existing != nil {
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on host %q; delete it first or restore under a different name",
 			req.Name, s.hostName)
@@ -445,8 +517,18 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	if manifest.ContainerSpecJSON != "" {
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
+	// Preserve the source's stop intent ONLY when we are NOT going to start the
+	// container (req.Start == false — e.g. cold-migrating an already-stopped CT).
+	// Otherwise the row lands as stopped with an empty detail and the reconciler
+	// treats it as an out-of-band stop, restarting a CT the operator had stopped.
+	// When we DO start it, leave the detail empty (a successful start clears it; a
+	// failed start must not inherit a stale stop intent).
+	stateDetail := ""
+	if !req.Start {
+		stateDetail = spec.StateDetail
+	}
 	rec := corrosion.ContainerRecord{
-		HostName: s.hostName, Name: req.Name, State: "stopped",
+		HostName: s.hostName, Name: req.Name, State: "stopped", StateDetail: stateDetail,
 		Image: spec.Image, CPULimit: spec.CPULimit, MemMiB: spec.MemMiB,
 		Labels: spec.Labels, RestartPolicy: spec.RestartPolicy,
 		Project: tenancy.NormalizeProject(project),
@@ -460,20 +542,41 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		// restore-relocation) so it can prove this row is its restore.
 		RelocateToken: relocateTokenFromMD(ctx),
 	}
-	// The cluster-row write is MANDATORY. A restore that imported the runtime
-	// container but failed to record the row would strand an untracked container —
-	// and at failover the coordinator could tombstone the source believing the
-	// move completed (point: relocate-restore relies on "row exists ⇒ restore
-	// landed"). On failure, best-effort delete the just-imported container so
-	// nothing untracked is left, then error out.
-	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
+	// The cluster-state write is MANDATORY and atomic: the container row AND its
+	// managed interface rows go in ONE batch, so a restore can't land a tracked
+	// container with missing NIC state (failover relies on "row exists ⇒ restore
+	// landed"). On failure, delete the just-imported runtime container so nothing
+	// untracked is left, then error out (before signalling "landed").
+	ifs := corrosion.BuildContainerInterfacesFromSpec(s.hostName, req.Name, corrosion.DecodeCreateSpec(rec.CreateSpec))
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifs); err != nil {
 		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
-			slog.Warn("container restore: failed to clean up imported container after row-write failure",
+			slog.Warn("container restore: failed to clean up imported container after cluster-state-write failure",
 				"name", req.Name, "error", delErr)
 		}
 		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
-		return status.Errorf(codes.Internal, "restore: record cluster row: %v", err)
+		return status.Errorf(codes.Internal, "restore: record cluster state: %v", err)
 	}
+	// Re-reserve the managed IPs on this host (conditional — never steals; blanks a
+	// NIC whose IP a different workload now holds). Runs after the rows are written.
+	// unreserved NICs gate the start below: the IMPORTED on-disk config still names
+	// those IPs, so booting would cause the very conflict the blank avoids.
+	//
+	// EXCEPTION — a VERIFIED cross-host MIGRATE (peer-authenticated migrate-from):
+	// keep the imported IPs as is; the source daemon has handed its IPAM leases to
+	// this host explicitly (a move ReserveContainerIP won't infer from a name), so
+	// re-reserving here would wrongly blank a still-valid address. The marker is
+	// honored only over peer mTLS with a CN matching the source (migrateSourceFromPeer)
+	// — an operator-supplied header falls through to the safe re-reserve path.
+	unreserved := 0
+	if s.migrateSourceFromPeer(ctx) == "" {
+		u, rerr := network.ReserveContainerNICs(ctx, s.db, s.hostName, req.Name, ifs)
+		if rerr != nil {
+			slog.Warn("container restore: IP re-reservation incomplete (NIC may be re-discovered)",
+				"name", req.Name, "error", rerr)
+		}
+		unreserved = u
+	}
+
 	// Signal that the cluster row has been recorded — the restore has LANDED. A
 	// remote driver (failover RestoreContainerFromBackup) keys off this frame to
 	// distinguish a landed restore whose later start failed from a genuine restore
@@ -482,6 +585,23 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	_ = send(&pb.RestoreContainerProgress{Phase: pb.RestoreContainerProgress_IMPORT, Status: restoreRowRecordedStatus})
 
 	if req.Start {
+		if unreserved > 0 {
+			// The imported on-disk config still names IP(s) we couldn't reserve (held
+			// by another workload). Starting would create a real network conflict, so
+			// leave it stopped + tracked (recoverable) and surface the reason. The row
+			// was created with an EMPTY detail (we intended to start it) and keeps its
+			// restart policy — which the reconciler would read as an out-of-band stop
+			// and restart into that very conflict. Stamp the sticky operator-stop marker
+			// so it stays down until an operator frees the IP and starts it explicitly.
+			if derr := corrosion.SetContainerStateDetail(ctx, s.db, s.hostName, req.Name, "stopped", "operator-stop"); derr != nil {
+				s.audit(ctx, "ct.restore", req.Name, "project="+project+" (ip unavailable; failed to mark no-restart)", "error")
+				return status.Errorf(codes.Internal,
+					"restored %q but %d NIC(s) had unavailable IPs and marking it no-restart failed: %v", req.Name, unreserved, derr)
+			}
+			s.audit(ctx, "ct.restore", req.Name, "project="+project+" (ip unavailable; left stopped)", "error")
+			return status.Errorf(codes.FailedPrecondition,
+				"restored %q but %d NIC(s) had unavailable IPs — left stopped (operator-stop) to avoid a network conflict", req.Name, unreserved)
+		}
 		if err := s.containerRuntime.StartContainer(ctx, req.Name); err != nil {
 			// Partial success: the container is restored AND tracked (row stays
 			// 'stopped'), so the reconciler / restart policy can start it later. We

@@ -76,6 +76,25 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
+	// Serialize same-name creates on this host, and reject a duplicate BEFORE
+	// allocating any IPAM lease. Without this, a duplicate / concurrent create that
+	// later fails would run the lease-cleanup path (keyed on host+name) and tombstone
+	// the EXISTING container's leases + interface rows. The lock + preflight make the
+	// failure cleanup safe (this is the only live container of this name on the host).
+	unlock := s.lockVM("ct/" + req.Name)
+	defer unlock()
+	// Fail CLOSED on a read error: if we can't prove the name is free, a later
+	// cleanup keyed on (host, name) could release an existing container's managed
+	// NIC state — so never proceed to allocate leases / touch the runtime on a
+	// read we couldn't complete.
+	existing, gerr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Name)
+	if gerr != nil {
+		return nil, status.Errorf(codes.Internal, "check existing container: %v", gerr)
+	}
+	if existing != nil {
+		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Name, s.hostName)
+	}
+
 	// Tenancy admission — containers draw down the SAME project vCPU/Mem budget
 	// as VMs (mirrors CreateVM). Runs on the owning host (post-forward) so the
 	// check happens once against the cluster-wide usage view.
@@ -86,17 +105,24 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}
 	}
 
-	nics := make([]ContainerNICOpt, 0, len(req.Networks))
-	for _, n := range req.Networks {
-		nics = append(nics, ContainerNICOpt{Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac})
+	// Resolve the requested NICs into runtime attachments + managed-interface rows
+	// + create-spec intent, ALLOCATING each managed NIC's IPAM lease as it goes
+	// (managed network vs legacy raw bridge). On any later failure we release this
+	// container's leases (s.releaseContainerNICs) to undo partial allocation.
+	plan, err := s.resolveContainerNICs(ctx, req.Name, req.Networks)
+	if err != nil {
+		_ = s.releaseContainerNICs(ctx, req.Name) // undo any leases taken before the error
+		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
+		return nil, err
 	}
 	info, err := s.containerRuntime.CreateContainer(ctx, CreateContainerOpts{
 		Name: req.Name, Template: req.Template,
 		Distro: req.Distro, Release: req.Release, Arch: req.Arch,
 		CPULimit: int(req.Cpu), MemoryMiB: int(req.MemoryMib),
-		Networks: nics, Labels: req.Labels,
+		Networks: plan.lxcNics, Labels: req.Labels,
 	})
 	if err != nil {
+		_ = s.releaseContainerNICs(ctx, req.Name)
 		s.audit(ctx, "ct.create", req.Name, "image="+req.Image, "error")
 		return nil, status.Errorf(codes.Internal, "create: %v", err)
 	}
@@ -105,11 +131,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// restore can rebuild this container faithfully, not as a bare image recreate.
 	createSpec := corrosion.ContainerCreateSpec{
 		Template: req.Template, Distro: req.Distro, Release: req.Release, Arch: req.Arch,
-	}
-	for _, n := range req.Networks {
-		createSpec.Networks = append(createSpec.Networks, corrosion.ContainerNetwork{
-			Name: n.Name, Bridge: n.Bridge, IP: n.Ip, MAC: n.Mac,
-		})
+		Networks: plan.specNets,
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -123,17 +145,18 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
 		CreatedAt:     now,
 	}
-	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
-		// Fail closed: the runtime container was created but the cluster row write
-		// failed. A "success" here would strand an untracked container (wrong
-		// quota/accounting, invisible to failover). Best-effort delete the
-		// just-created container, then return an error. (Mirrors RestoreContainer.)
+	// Write the container row + managed interface rows in ONE atomic batch. Fail
+	// closed: the runtime container exists but the DB write failed → delete the
+	// just-created container and release its leases, so no partial tracked state
+	// and no leaked lease.
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, plan.ifaces); err != nil {
+		_ = s.releaseContainerNICs(ctx, info.Name)
 		if delErr := s.containerRuntime.DeleteContainer(ctx, info.Name); delErr != nil {
-			slog.Warn("container create: cleanup after cluster-row-write failure also failed",
+			slog.Warn("container create: cleanup after cluster-state-write failure also failed",
 				"name", info.Name, "error", delErr)
 		}
 		s.audit(ctx, "ct.create", info.Name, "image="+rec.Image, "error")
-		return nil, status.Errorf(codes.Internal, "create: record cluster row: %v", err)
+		return nil, status.Errorf(codes.Internal, "create: record cluster state: %v", err)
 	}
 	s.audit(ctx, "ct.create", info.Name, "project="+tenancy.NormalizeProject(req.Project)+" image="+rec.Image, "ok")
 	slog.Info("container created", "name", info.Name, "host", s.hostName)
@@ -261,12 +284,23 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "delete: remove cluster row: %v", derr)
 	}
-	// Best-effort restart-state cleanup on BOTH the normal and already-absent
-	// paths: a prior delete may have tombstoned the row but failed here, so a
-	// retry (now zero-row) must still clear it — otherwise a later same-host/name
-	// recreate could inherit stale restart state.
+	// Cascade the managed network state (IPAM leases + container_interfaces rows)
+	// and clear restart state, on BOTH the normal and already-absent paths — a
+	// prior delete may have tombstoned the container row but failed these, so a
+	// retry (now zero-row) must still clean them up, else a later same-host/name
+	// recreate inherits stale leases/rows.
+	nicErr := s.releaseContainerNICs(ctx, req.Name)
 	if err := corrosion.DeleteContainerRestartState(ctx, s.db, s.hostName, req.Name); err != nil {
 		slog.Warn("container delete: failed to clear restart state (harmless, GC'able)", "name", req.Name, "error", err)
+	}
+	// The managed-NIC cascade is part of the CT network invariant: a stale lease or
+	// interface row would be inherited by a later same-host/same-name recreate —
+	// which makes the name live again and so hides the orphan from the lease GC.
+	// Surface a cascade failure so the caller retries; the whole delete is
+	// idempotent (runtime not-found OK, row tombstone zero-row OK, cascade re-runs).
+	if nicErr != nil {
+		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")
+		return nil, status.Errorf(codes.Internal, "delete: release managed NICs: %v", nicErr)
 	}
 	if errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		// Idempotent: the row was already gone. Audited distinctly, not a silent "ok".

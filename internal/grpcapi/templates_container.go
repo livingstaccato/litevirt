@@ -115,7 +115,11 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"source %q must be a template or stopped to clone (current: %s)", req.Source, src.State)
 	}
-	if existing, _ := corrosion.GetContainer(ctx, s.db, s.hostName, req.Target); existing != nil {
+	// Fail CLOSED on a read error — never clone onto a name we couldn't prove free
+	// (a later cleanup keyed on (host, name) could release an existing CT's NICs).
+	if existing, gerr := corrosion.GetContainer(ctx, s.db, s.hostName, req.Target); gerr != nil {
+		return nil, status.Errorf(codes.Internal, "check existing container: %v", gerr)
+	} else if existing != nil {
 		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Target, s.hostName)
 	}
 
@@ -135,17 +139,31 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
+	// Rebuild the clone's MANAGED NIC identity (fresh deterministic MAC+veth, a
+	// dynamic IP — a clone must not reuse the source's address) from the source's
+	// create spec, and rewrite the spec to match. The runtime clone
+	// (cloneFreshIdentity) stamps the SAME deterministic MAC/veth on-disk and drops
+	// the source's static IP, so the clone's DB state and on-disk config agree.
+	cloneSpec := corrosion.DecodeCreateSpec(src.CreateSpec)
+	ifaces, specNets := s.cloneContainerNICs(req.Target, cloneSpec)
+	cloneSpec.Networks = specNets
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Target, State: "stopped",
 		Image: src.Image, CPULimit: src.CPULimit, MemMiB: src.MemMiB,
 		Labels: src.Labels, RestartPolicy: src.RestartPolicy,
 		Project: project, OnHostFailure: src.OnHostFailure,
-		// Carry the source's create-time intent (template/distro/release/arch/
-		// networks) so the clone is relocation/restore-faithful too.
-		CreateSpec: src.CreateSpec, CreatedAt: now,
+		CreateSpec: corrosion.EncodeCreateSpec(cloneSpec), CreatedAt: now,
 		// A clone is a normal container, never a template.
 	}
-	if err := corrosion.UpsertContainer(ctx, s.db, rec); err != nil {
+	// Atomic: the container row + the clone's interface rows in one batch (no IPAM
+	// lease — clone NICs are dynamic). Fail closed: if persistence fails, delete the
+	// just-cloned runtime container so we don't strand an untracked clone (same rule
+	// as CreateContainer).
+	if err := corrosion.CreateContainerAtomic(ctx, s.db, rec, ifaces); err != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Target); delErr != nil {
+			slog.Warn("container clone: cleanup after persist failure also failed", "name", req.Target, "error", delErr)
+		}
+		s.audit(ctx, "ct.clone", req.Target, "project="+project+" source="+req.Source, "error")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}
 

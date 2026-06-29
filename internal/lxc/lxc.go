@@ -39,6 +39,12 @@ import (
 // metrics collector) skip the usage sample via errors.Is rather than logging.
 var ErrStatsUnavailable = errors.New("container cgroup stats unavailable")
 
+// ErrContainerNotFound is returned (wrapped) by Delete when lxc-destroy reports
+// the container does not exist. The fail-closed DeleteContainer handler tests it
+// with errors.Is to treat deletion as idempotent (a runtime that's already gone
+// is success) — without string-matching command output up in the gRPC layer.
+var ErrContainerNotFound = errors.New("container not found")
+
 // ContainerStats is a point-in-time cgroup-v2 usage sample for a container.
 type ContainerStats struct {
 	CPUUsageUsec uint64 // cumulative CPU time (cpu.stat usage_usec)
@@ -343,6 +349,15 @@ func (r *LxcRunner) Stop(ctx context.Context, name string, timeoutSec int) error
 // running"), so `lv ct rm` and `compose down` of a running container would fail.
 func (r *LxcRunner) Delete(ctx context.Context, name string) error {
 	if _, stderr, err := r.run(ctx, "lxc-destroy", "-f", "-n", name); err != nil {
+		// Only classify as not-found when the container is ACTUALLY gone on disk
+		// (its config is absent). A broad stderr match would mask a real failure —
+		// a corrupt config, a busy mount, a permission/read error — that leaves
+		// runtime state behind while the gRPC layer tombstones the row and reports
+		// success. Verifying the path keeps that across lxc-* versions/wording.
+		cfg := filepath.Join(r.lxcpath(), name, "config")
+		if _, statErr := os.Stat(cfg); os.IsNotExist(statErr) {
+			return fmt.Errorf("%w: lxc-destroy %s: %s", ErrContainerNotFound, name, strings.TrimSpace(string(stderr)))
+		}
 		return cmdErr("lxc-destroy", name, stderr, err)
 	}
 	return nil

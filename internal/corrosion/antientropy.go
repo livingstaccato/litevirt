@@ -96,38 +96,37 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		return
 	}
 
-	// Compare digests.
-	mismatch := false
-	for _, remote := range resp.Tables {
-		local, exists := localMap[remote.Name]
-		if !exists {
-			mismatch = true
-			break
-		}
-		if local.Count != int(remote.Count) || local.Hash != remote.Hash {
-			slog.Info("anti-entropy: drift detected",
-				"peer", peerName, "table", remote.Name,
-				"local_count", local.Count, "remote_count", remote.Count,
-				"local_hash", local.Hash, "remote_hash", remote.Hash)
-			mismatch = true
-			break
-		}
-	}
-
-	if mismatch {
-		// Fetch full state dump and merge with LWW.
-		slog.Info("anti-entropy: syncing from peer", "peer", peerName)
+	if mismatched := digestMismatches(peerName, resp.Tables, localMap); len(mismatched) > 0 {
+		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", mismatched)
 		data, err := fetchStateDump(ctx, client)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
-			return
+		} else {
+			ae.client.MergeStateBytesLWW(data)
+			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
 		}
-
-		ae.client.MergeStateBytesLWW(data)
-		slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
 	}
 
 	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap)
+}
+
+// digestMismatches returns the tables whose digest differs from the peer.
+func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string]TableDigest) []string {
+	var out []string
+	for _, r := range remote {
+		local, exists := localMap[r.Name]
+		if exists && local.Count == int(r.Count) && local.Hash == r.Hash {
+			continue // in sync
+		}
+		lh := ""
+		if exists {
+			lh = local.Hash
+		}
+		slog.Info("anti-entropy: drift detected",
+			"peer", peer, "table", r.Name, "local_hash", lh, "remote_hash", r.Hash)
+		out = append(out, r.Name)
+	}
+	return out
 }
 
 func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest) {
@@ -145,27 +144,12 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		return
 	}
 
-	mismatch := false
-	for _, remote := range resp.Tables {
-		local, exists := localMap[remote.Name]
-		if !exists {
-			mismatch = true
-			break
-		}
-		if local.Count != int(remote.Count) || local.Hash != remote.Hash {
-			slog.Info("anti-entropy: sensitive drift detected",
-				"peer", peerName, "table", remote.Name,
-				"local_count", local.Count, "remote_count", remote.Count,
-				"local_hash", local.Hash, "remote_hash", remote.Hash)
-			mismatch = true
-			break
-		}
-	}
-	if !mismatch {
+	mismatched := digestMismatches(peerName, resp.Tables, localMap)
+	if len(mismatched) == 0 {
 		return
 	}
 
-	slog.Info("anti-entropy: syncing sensitive state from peer", "peer", peerName)
+	slog.Info("anti-entropy: syncing sensitive state from peer", "peer", peerName, "tables", mismatched)
 	data, err := fetchSensitiveStateDump(ctx, client, req)
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {

@@ -941,7 +941,10 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 
 	// For DELETE statements, always apply (soft-deletes use UPDATE anyway).
 	if isDeleteStatement(s.SQL) {
-		_, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		if err == nil && rowsChanged(res) {
+			r.client.clearUnresolvedFromStmt(s)
+		}
 		return err
 	}
 
@@ -950,7 +953,7 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	if len(pkCols) > 0 && tableName != "" {
 		// Try to extract PK values and check local updated_at.
 		// If local row exists and has a newer HLC, skip this mutation.
-		if shouldSkipLWW(ctx, tx, tableName, pkCols, s, incomingHLC) {
+		if r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, incomingHLC) {
 			slog.Debug("replicator: LWW skip (local is newer)", "table", tableName, "hlc", incomingHLC)
 			return nil
 		}
@@ -961,12 +964,37 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	if isInsertStatement(applied) {
 		applied = replaceInsertStrategy(applied, "INSERT OR REPLACE")
 	}
-	_, err := tx.ExecContext(ctx, applied, s.Params...)
+	res, err := tx.ExecContext(ctx, applied, s.Params...)
+	if err == nil && rowsChanged(res) {
+		// A strictly-newer / resolver-chosen incoming write that actually CHANGED
+		// the row clears any stale unresolved-tie tracking (the remediation path).
+		// A guarded zero-row UPDATE is excluded. Lock-free when nothing is tracked.
+		r.client.clearUnresolvedFromStmt(s)
+	}
 	return err
 }
 
-// shouldSkipLWW checks if the local row has a newer HLC than the incoming one.
-func shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName string, pkCols []string, s Statement, incomingHLC string) bool {
+// rowsChanged reports whether a SQL result provably affected at least one row.
+// Used to gate the unresolved-tie clear so a guarded zero-row statement
+// (WHERE … matched nothing) doesn't drop a still-valid tie. SQLite always
+// reports RowsAffected; an unavailable count is treated as "no change" (don't
+// clear) so the clear is never based on a guess.
+func rowsChanged(res sql.Result) bool {
+	n, err := res.RowsAffected()
+	return err == nil && n > 0
+}
+
+// shouldSkipLWW reports whether to skip applying the incoming mutation under
+// last-writer-wins. A strict timestamp order is decided by lwwOrder. On an EXACT
+// tie it defers to the table-aware resolver — but only for repaired tables and
+// only when the statement is a full-image INSERT (the dominant upsert shape),
+// resolving over the full row with the SAME engine anti-entropy uses, so the two
+// paths can never disagree. A tied partial UPDATE, or any AE-excluded table,
+// keeps local: the divergence is left for anti-entropy to converge (or, for
+// excluded lease tables, for the existing self-correcting write to overwrite),
+// never resolved from a partial local⊕SET image (which could differ from the
+// source's full row and make AE and WAL diverge).
+func (r *Replicator) shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName string, pkCols []string, s Statement, incomingHLC string) bool {
 	// Extract PK values from the statement params based on the table schema.
 	// This is a best-effort approach — for UPDATE statements we can try to
 	// extract the WHERE clause PK values; for INSERT we use the column order.
@@ -1009,7 +1037,29 @@ func shouldSkipLWW(ctx context.Context, tx *sql.Tx, tableName string, pkCols []s
 		incomingTS = incomingHLC
 	}
 
-	return localWinsLWW(localUpdatedAt.String, incomingTS)
+	switch ord := lwwOrder(localUpdatedAt.String, incomingTS); {
+	case ord > 0:
+		return true // local strictly newer → skip incoming
+	case ord < 0:
+		return false // incoming strictly newer → apply
+	}
+	// Exact tie. AE-excluded tables keep local (existing lease/self-correcting
+	// semantics — they never reach the resolver, matching anti-entropy).
+	if _, repaired := capabilityMap[tableName]; !repaired {
+		return true
+	}
+	// A full-image INSERT can be resolved over the full row, exactly as AE does.
+	if cols, vals, isFull := extractInsertRow(s); isFull {
+		pkIdx := columnIndexes(cols, pkCols)
+		localRow, found := fetchLocalRowCells(tx, tableName, cols, pkCols, pkIdx, vals)
+		if !found {
+			return false // no local row → apply incoming
+		}
+		keepLocal, _ := r.client.resolveTie(tableName, cols, localRow, vals, pkIdx, pathWAL)
+		return keepLocal
+	}
+	// A tied partial UPDATE: keep local; anti-entropy converges it over the full row.
+	return true
 }
 
 // extractPKValues attempts to extract primary key values from a Statement.

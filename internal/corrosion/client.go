@@ -27,6 +27,14 @@ type SyncMetrics interface {
 	ObserveDump(d time.Duration, bytes int)
 	ObserveDigest(d time.Duration)
 	ObserveMerge(d time.Duration, merged, skipped int)
+	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
+	// resolver ∈ {tombstone, content_max, numeric_max, timestamp_max,
+	// non_null_wins, lb_generation}; winner ∈ {local, incoming}.
+	ObserveTieBreak(table, resolver, winner string)
+	// ObserveTieUnresolved records a DISTINCT unresolved tie (counted once per
+	// (table,PK,content-pair), not per cycle): path ∈ {ae, wal}; category ∈
+	// {runtime_owned, tenancy, policy, auth_factor, auth_pointer, lb_token}.
+	ObserveTieUnresolved(table, path, category string)
 }
 
 // Config holds configuration for the embedded state store.
@@ -77,6 +85,20 @@ type Client struct {
 	// contends with or re-enters the main lock.
 	tsMu   sync.Mutex
 	lastTS time.Time
+
+	// tieMu guards the equal-timestamp-tie tracking state below. Separate from mu
+	// so the resolver (called while mu is held during a merge) records without
+	// re-entrancy.
+	tieMu sync.Mutex
+	// unresolvedTies records, per (table,PK), the sorted content-hash pair of the
+	// last classified-unresolved tie. It makes lww_tie_unresolved count DISTINCT
+	// rows (re-observing the same divergence is a no-op) and drives the alert.
+	// Cleared when the row converges or is repaired (a newer write to the PK).
+	unresolvedTies map[string]string
+	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
+	// clear-on-write hooks (which run on every applied/local row) skip the lock
+	// entirely when nothing is tracked — the overwhelmingly common case.
+	unresolvedLen atomic.Int64
 }
 
 // SetSyncMetrics installs the anti-entropy timing sink. Nil-safe; call once at
@@ -100,6 +122,18 @@ func (c *Client) observeDigest(d time.Duration) {
 func (c *Client) observeMerge(d time.Duration, merged, skipped int) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveMerge(d, merged, skipped)
+	}
+}
+
+func (c *Client) observeTieBreak(table, resolver, winner string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveTieBreak(table, resolver, winner)
+	}
+}
+
+func (c *Client) observeTieUnresolved(table, path, category string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveTieUnresolved(table, path, category)
 	}
 }
 
@@ -355,6 +389,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	}
 
 	var affected int64
+	var mutated []Statement // statements that changed ≥1 row (for unresolved-clear)
 	for _, s := range stmts {
 		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
 		if err != nil {
@@ -364,6 +399,9 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		}
 		if n, e := res.RowsAffected(); e == nil {
 			affected += n
+			if n > 0 {
+				mutated = append(mutated, s)
+			}
 		}
 	}
 
@@ -392,6 +430,17 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		return 0, fmt.Errorf("commit: %w", err)
 	}
 	c.mu.Unlock()
+
+	// A local write that actually CHANGED a row clears any stale unresolved-tie
+	// tracking for that PK — the remediation path (e.g. repair-owner's
+	// UpdateVMHost). A guarded zero-row statement (WHERE … matched nothing) is
+	// excluded: it changed no content, so the tie must stay tracked. Lock-free
+	// when nothing is tracked.
+	if c.anyUnresolved() {
+		for _, s := range mutated {
+			c.clearUnresolvedFromStmt(s)
+		}
+	}
 
 	if notify {
 		c.notifyReplicator()

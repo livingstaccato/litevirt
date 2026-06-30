@@ -28,14 +28,26 @@ type SyncMetrics interface {
 	ObserveDigest(d time.Duration)
 	ObserveMerge(d time.Duration, merged, skipped int)
 	// ObserveTieBreak records an exact-timestamp tie that a resolver converged:
-	// resolver ∈ {tombstone, content_max, numeric_max, timestamp_max,
-	// non_null_wins, lb_generation}; winner ∈ {local, incoming}.
+	// resolver ∈ {content_max, numeric_max, timestamp_max, non_null_wins,
+	// lb_generation}; winner ∈ {local, incoming}. (Tombstone ties go to
+	// ObserveTombstoneTie instead.)
 	ObserveTieBreak(table, resolver, winner string)
 	// ObserveTieUnresolved records a DISTINCT unresolved tie (counted once per
 	// (table,PK,content-pair), not per cycle): path ∈ {ae, wal}; category ∈
 	// {runtime_owned, opaque, tenancy, policy, control_plane, auth_factor,
 	// auth_pointer, lb_token}.
 	ObserveTieUnresolved(table, path, category string)
+	// ObserveTombstoneTie records a tie a one-sided soft-delete settled. Tracked
+	// separately because it is a benign, expected outcome (a delete racing a
+	// write) — counting it in the tie-break series would muddy the "steady ties ⇒
+	// colliding timestamps" signal.
+	ObserveTombstoneTie(table string)
+	// ObserveUnresolvedTieCurrent reports the CURRENT count of distinct
+	// unresolved ties this node is tracking — a gauge, not the monotonic
+	// lww_tie_unresolved_total counter. It drops back to 0 when the rows are
+	// repaired (clearUnresolved), so it's the right signal for a "something is
+	// divergent right now" alert (the counter would page forever after one tie).
+	ObserveUnresolvedTieCurrent(n int)
 }
 
 // Config holds configuration for the embedded state store.
@@ -135,6 +147,18 @@ func (c *Client) observeTieBreak(table, resolver, winner string) {
 func (c *Client) observeTieUnresolved(table, path, category string) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveTieUnresolved(table, path, category)
+	}
+}
+
+func (c *Client) observeTombstoneTie(table string) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveTombstoneTie(table)
+	}
+}
+
+func (c *Client) observeUnresolvedTieCurrent(n int) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveUnresolvedTieCurrent(n)
 	}
 }
 

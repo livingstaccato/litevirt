@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -136,12 +138,19 @@ func TestResolver_TenancyUnresolved(t *testing.T) {
 
 func TestResolver_TombstoneWins(t *testing.T) {
 	cols := []string{"name", "value", "updated_at", "deleted_at"}
-	// Incoming deleted, local live → take incoming (the tombstone).
+	// Incoming deleted, local live → take incoming (the tombstone). A tombstone tie
+	// is recorded in its own benign counter, NOT the tie-break series.
 	_, sm, keepLocal, unresolved := resolve(t, "dns_records", cols,
 		[]interface{}{"a", "1.1.1.1", "T", nil},
 		[]interface{}{"a", "1.1.1.1", "T", "2026-06-03T00:00:00Z"})
-	if keepLocal || unresolved || len(sm.tieBreaks) != 1 || sm.tieBreaks[0] != "dns_records/tombstone/incoming" {
-		t.Fatalf("one-sided tombstone must win (take incoming), got keepLocal=%v breaks=%v", keepLocal, sm.tieBreaks)
+	if keepLocal || unresolved {
+		t.Fatalf("one-sided tombstone must win (take incoming), got keepLocal=%v unresolved=%v", keepLocal, unresolved)
+	}
+	if len(sm.tieBreaks) != 0 {
+		t.Fatalf("a tombstone tie must not hit the tie-break series, got %v", sm.tieBreaks)
+	}
+	if len(sm.tombstoneTies) != 1 || sm.tombstoneTies[0] != "dns_records" {
+		t.Fatalf("a tombstone tie must be counted in the tombstone series, got %v", sm.tombstoneTies)
 	}
 }
 
@@ -244,18 +253,64 @@ func TestUnresolvedTracker_DistinctOnce(t *testing.T) {
 	if c.UnresolvedTieCount() != 1 || len(sm.tieUnresolved) != 1 {
 		t.Fatalf("re-observing the same divergence must count once, got count=%d metric=%d", c.UnresolvedTieCount(), len(sm.tieUnresolved))
 	}
+	if sm.unresolvedCurrent != 1 {
+		t.Fatalf("current-unresolved gauge = %d, want 1", sm.unresolvedCurrent)
+	}
 
-	// The content changes (a real new write) → re-evaluated, counted again.
+	// The content changes (a real new write) → re-evaluated, counted again (the
+	// monotonic counter), but it's the SAME row so the current gauge stays 1.
 	b2 := []interface{}{"db1", "docker004", "T"}
 	c.resolveTie("vms", cols, a, b2, []int{0}, pathAE)
 	if len(sm.tieUnresolved) != 2 {
 		t.Fatalf("a changed divergence must re-count, got metric=%d", len(sm.tieUnresolved))
 	}
+	if sm.unresolvedCurrent != 1 {
+		t.Fatalf("a same-row content change must not bump the current gauge, got %d", sm.unresolvedCurrent)
+	}
 
-	// Convergence clears the entry.
+	// Convergence clears the entry → the gauge drops to 0 (the counter stays at 2).
 	c.clearUnresolved("vms", pkKeyAt(b2, []int{0}))
 	if c.UnresolvedTieCount() != 0 {
 		t.Fatalf("clearUnresolved must drop the entry, count=%d", c.UnresolvedTieCount())
+	}
+	if sm.unresolvedCurrent != 0 {
+		t.Fatalf("current-unresolved gauge must drop to 0 after repair, got %d", sm.unresolvedCurrent)
+	}
+}
+
+// TestUnresolvedGauge_ConcurrentTrackClear: under concurrent track/clear the
+// exported current-unresolved gauge must always settle on the true map length —
+// never a stale (backwards) value from callback reordering. Run with -race.
+func TestUnresolvedGauge_ConcurrentTrackClear(t *testing.T) {
+	c := testClient(t)
+	sm := &fakeSyncMetrics{}
+	c.SetSyncMetrics(sm)
+	const n = 50
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c.trackUnresolved("vms", fmt.Sprintf("vm%d", i),
+				[]interface{}{"a"}, []interface{}{"b"}, pathAE, "runtime_owned")
+		}(i)
+	}
+	wg.Wait()
+	if c.UnresolvedTieCount() != n || sm.unresolvedCurrent != n {
+		t.Fatalf("after %d concurrent tracks: count=%d gauge=%d, want %d", n, c.UnresolvedTieCount(), sm.unresolvedCurrent, n)
+	}
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c.clearUnresolved("vms", fmt.Sprintf("vm%d", i))
+		}(i)
+	}
+	wg.Wait()
+	if c.UnresolvedTieCount() != 0 || sm.unresolvedCurrent != 0 {
+		t.Fatalf("after clearing all: count=%d gauge=%d, want 0 (gauge must not be left stale)", c.UnresolvedTieCount(), sm.unresolvedCurrent)
 	}
 }
 

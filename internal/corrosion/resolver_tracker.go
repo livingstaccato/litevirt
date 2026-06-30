@@ -57,6 +57,11 @@ func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}
 	}
 	if !existed {
 		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+		// Export the gauge WHILE holding tieMu so concurrent track/clear exports
+		// serialize in mutation order — the gauge can never settle on a stale
+		// (backwards) value due to callback reordering. The prometheus Set is a
+		// cheap atomic store and never re-enters our locks.
+		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
 	}
 	c.tieMu.Unlock()
 
@@ -74,6 +79,8 @@ func (c *Client) clearUnresolved(table, pk string) {
 	if _, ok := c.unresolvedTies[unresolvedKey(table, pk)]; ok {
 		delete(c.unresolvedTies, unresolvedKey(table, pk))
 		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
+		// Export under the lock (see trackUnresolved) so the gauge can't regress.
+		c.observeUnresolvedTieCurrent(len(c.unresolvedTies))
 	}
 	c.tieMu.Unlock()
 }

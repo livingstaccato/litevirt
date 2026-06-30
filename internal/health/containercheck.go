@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -34,6 +35,23 @@ type ContainerChecker struct {
 	db       *corrosion.Client
 	runtime  lxc.Runtime
 	bus      *events.Bus
+
+	// checkPeerRuntime asks a peer for its local LXC view of a container
+	// (absent/defined_stopped/running/unknown) — injected by the daemon. nil
+	// disables runtime re-key. See SetPeerContainerRuntimeChecker.
+	checkPeerRuntime func(ctx context.Context, host, name string) (string, error)
+	// onRekey observes each runtime re-key decision (result ∈ rekeyed /
+	// split_brain / inconclusive / error) — nil-safe; tests assert on it.
+	onRekey func(name, result string)
+
+	// Now is the clock for the re-key debounce (defaults to time.Now); tests
+	// override it to advance deterministically.
+	Now func() time.Time
+
+	// ownerMu guards ownershipFirstSeen, the debounce map recording when each
+	// container was first seen running-locally-but-owned-elsewhere.
+	ownerMu            sync.Mutex
+	ownershipFirstSeen map[string]time.Time
 }
 
 // NewContainerChecker creates a container reconciler/restart engine for the
@@ -86,9 +104,25 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 		live[ct.Name] = true
 		c.checkContainer(ctx, ct, now)
 	}
+
+	// Runtime owner re-key (Phase 4): reclaim a container running locally whose
+	// only live DB row points at another host. Runs BEFORE the orphan-lease GC so
+	// a re-key (which transfers the container's leases to us) isn't racing a GC of
+	// those same leases.
+	c.assertContainerOwnership(ctx)
+
 	// GC IPAM leases stranded by a crash between allocating a lease and persisting
 	// the container row (an orphan lease — owner with no live container row). The
-	// age guard keeps this from racing an in-flight create.
+	// age guard keeps this from racing an in-flight create. The live set also
+	// includes every container present in the LOCAL RUNTIME, not just those with a
+	// local DB row: in the exact ownership-divergence case the runtime container
+	// exists but its DB row points elsewhere, and its lease must NOT be reclaimed
+	// out from under the pending re-key.
+	if names, lerr := c.runtime.List(ctx); lerr == nil {
+		for _, n := range names {
+			live[n] = true
+		}
+	}
 	if _, err := network.ReleaseOrphanContainerLeases(ctx, c.db, c.hostName, live, orphanLeaseMinAge); err != nil {
 		slog.Warn("containercheck: orphan-lease GC failed", "error", err)
 	}

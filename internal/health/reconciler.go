@@ -284,17 +284,64 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 
 		// If corrosion says this VM belongs to a different host, we no longer own it.
 		if vm.HostName != r.hostName {
-			slog.Warn("reconciler: split-brain detected — destroying local domain that moved to another host",
-				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName)
+			// Non-destruction guard (LWW-repair Phase 1): NEVER destroy a domain
+			// that holds live or resumable state locally, whatever the DB host_name
+			// says. A converged-wrong host_name — the equal-`updated_at` LWW tie this
+			// repair targets — must not be able to drive selfFence into destroying a
+			// live VM. Destroying is permitted ONLY on positive proof the domain is a
+			// clearly-dead leftover (see cleanableDomainReason); everything else —
+			// running, PAUSED, PM-SUSPENDED, SAVED (managed-save memory image),
+			// shutting-down, crashed, migrated, from-snapshot, and any unknown or
+			// unreadable state — is skipped and deferred to the Phase-3 runtime/
+			// fencing ownership reconciliation. We use DomainStateReason, not the
+			// coarse DomainState, because the latter collapses paused/pm-suspended/
+			// saved/shutoff all into "stopped" and would destroy resumable workloads.
+			st, serr := r.virt.DomainStateReason(domName)
+			if serr != nil || !cleanableLeftover(st) {
+				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",
+					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", st.State, "reason", st.Reason, "state_err", serr)
+				continue
+			}
+			slog.Warn("reconciler: removing clearly-dead local leftover whose DB row moved to another host",
+				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "reason", st.Reason)
 			if err := r.virt.DestroyDomain(domName); err != nil {
 				slog.Warn("reconciler: destroy stale domain failed", "vm", domName, "error", err)
 			}
-			// wipe by design: the VM now lives on another host; this is a dead
-			// local copy (the authoritative firmware state travels with it).
+			// wipe by design: a stopped/defined leftover whose VM now lives on
+			// another host (the authoritative firmware state travels with it).
 			if err := r.virt.UndefineDomain(domName, false); err != nil {
 				slog.Warn("reconciler: undefine stale domain failed", "vm", domName, "error", err)
 			}
 		}
+	}
+}
+
+// cleanableLeftover reports whether a local domain is a CLEARLY-DEAD leftover —
+// no live or resumable state — so it is safe to destroy+undefine when its DB row
+// has moved to another host. Both conditions must hold (positive proof, fail
+// closed):
+//
+//   - coarse State == "stopped" — defensive belt-and-suspenders. Today the
+//     cleanable reasons below all originate from DomainShutoff (which coarse-maps
+//     to "stopped"), so this is redundant against the current mapping; it guards
+//     against a future reason/state decoupling silently re-admitting a non-stopped
+//     (possibly live) domain to destruction.
+//   - Reason in the allowlist below. An allowlist (default: do NOT clean) so any
+//     state holding recoverable memory (paused, pmsuspended, saved), in transition
+//     (shutting-down, migrated, from-snapshot), needing investigation (crashed), or
+//     unknown/unreadable is skipped and deferred to Phase-3 runtime ownership repair.
+func cleanableLeftover(st lv.DomainStatus) bool {
+	if st.State != "stopped" {
+		return false
+	}
+	switch st.Reason {
+	case "guest-shutdown", // guest cleanly powered itself off
+		"destroyed", // forcibly destroyed — no state retained
+		"daemon",    // shut off by the daemon
+		"failed":    // failed to start — never held live state
+		return true
+	default:
+		return false
 	}
 }
 

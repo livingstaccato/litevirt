@@ -91,36 +91,126 @@ func TestReconciler_StartPendingVM_RefusesWhenLockHeld(t *testing.T) {
 	}
 }
 
-// TestReconciler_SelfFenceDestroysMovedDomain proves the split-brain GC: a domain
-// running locally that corrosion says now belongs to ANOTHER host is destroyed +
-// undefined locally (the loser of a partition+heal reassignment), leaving exactly
-// one owner cluster-wide.
-func TestReconciler_SelfFenceDestroysMovedDomain(t *testing.T) {
+// Phase-1 selfFence guard tests. selfFence cleans up a moved-away local domain
+// ONLY when it's a clearly-dead leftover (DomainStateReason in the cleanable
+// allowlist); it NEVER destroys a domain that is running or holds resumable state
+// (paused/pmsuspended/saved), nor on an unreadable state — that defers to the
+// Phase-3 runtime/fencing ownership reconciliation.
+func wasDestroyed(fake *libvirtfake.Fake, name string) bool {
+	for _, e := range fake.EventLog() {
+		if e.Domain == name && e.Op == "destroy" {
+			return true
+		}
+	}
+	return false
+}
+
+// Phase 1 guard: a domain RUNNING locally whose DB row points to another host is
+// NOT destroyed — a converged-wrong host_name (the equal-timestamp LWW tie) must
+// not drive selfFence into killing a live VM. Ownership is reconciled later
+// against runtime/fencing (Phase 3), not by trusting the DB field.
+func TestReconciler_SelfFence_RunningLocalNotDestroyed(t *testing.T) {
 	db := testReconcilerDB(t)
 	ctx := context.Background()
-
-	// Corrosion: vm1 now owned by node-b, running there.
 	if err := corrosion.InsertVM(ctx, db,
 		corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	// But it's still running locally on node-a (a stale copy from before the move).
 	fake := libvirtfake.New()
-	fake.SetState("vm1", libvirtfake.StateRunning)
+	fake.SetState("vm1", libvirtfake.StateRunning) // still running locally on node-a
 
-	r := NewReconciler("node-a", t.TempDir(), db, fake)
-	r.selfFence(ctx)
+	NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
 
-	if fake.DomainExists("vm1") {
-		t.Fatal("selfFence must destroy+undefine the local domain that moved to another host")
+	if !fake.DomainExists("vm1") || wasDestroyed(fake, "vm1") {
+		t.Fatal("selfFence must NOT destroy a locally-running domain whose DB row moved away")
 	}
-	var destroyed bool
-	for _, e := range fake.EventLog() {
-		if e.Domain == "vm1" && e.Op == "destroy" {
-			destroyed = true
-		}
+}
+
+// Resumable / live state (paused, pm-suspended, saved-memory) whose DB row moved
+// away must NOT be destroyed — coarse DomainState collapses these to "stopped", so
+// the guard keys on DomainStateReason. These hold recoverable workload state.
+func TestReconciler_SelfFence_ResumableStateNotDestroyed(t *testing.T) {
+	for _, reason := range []string{"paused", "pmsuspended", "saved", "from-snapshot", "shutting-down", "crashed", "migrated", "unknown"} {
+		t.Run(reason, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			ctx := context.Background()
+			if err := corrosion.InsertVM(ctx, db,
+				corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+				t.Fatalf("InsertVM: %v", err)
+			}
+			fake := libvirtfake.New()
+			fake.SetState("vm1", libvirtfake.StateDefined) // coarse "stopped"
+			fake.SetStateReason("vm1", reason)
+
+			NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
+
+			if wasDestroyed(fake, "vm1") {
+				t.Fatalf("selfFence must NOT destroy a domain with reason %q whose DB row moved away", reason)
+			}
+		})
 	}
-	if !destroyed {
-		t.Fatal("expected a destroy event for the moved-away vm1")
+}
+
+// Defensive: a cleanable REASON under a non-"stopped" coarse state is still NOT
+// cleaned (both conditions must hold). Can't happen under the current real mapping
+// — guards a future reason/state decoupling.
+func TestReconciler_SelfFence_CleanableReasonButNotStopped(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning) // coarse state "running"
+	fake.SetStateReason("vm1", "destroyed")        // a cleanable reason, but state isn't "stopped"
+
+	NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
+
+	if wasDestroyed(fake, "vm1") {
+		t.Fatal("selfFence must require BOTH a stopped state AND a clearly-dead reason")
+	}
+}
+
+// An unreadable state fails closed — it could be a running domain mid-query.
+func TestReconciler_SelfFence_UnreadableNotDestroyed(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, db,
+		corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateDefined)
+	fake.FailDomainStateReason = func(string) error { return context.DeadlineExceeded }
+
+	NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
+
+	if wasDestroyed(fake, "vm1") {
+		t.Fatal("selfFence must fail closed (not destroy) when the local state is unreadable")
+	}
+}
+
+// A clearly-dead leftover (guest-shutdown / destroyed / daemon / failed) whose DB
+// row moved to another host is still cleaned up (destroy + undefine).
+func TestReconciler_SelfFence_DeadLeftoverDestroyed(t *testing.T) {
+	for _, reason := range []string{"guest-shutdown", "destroyed", "daemon", "failed"} {
+		t.Run(reason, func(t *testing.T) {
+			db := testReconcilerDB(t)
+			ctx := context.Background()
+			if err := corrosion.InsertVM(ctx, db,
+				corrosion.VMRecord{Name: "vm1", HostName: "node-b", Spec: "{}", State: "running"}, nil, nil); err != nil {
+				t.Fatalf("InsertVM: %v", err)
+			}
+			fake := libvirtfake.New()
+			fake.SetState("vm1", libvirtfake.StateDefined)
+			fake.SetStateReason("vm1", reason)
+
+			NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
+
+			if fake.DomainExists("vm1") || !wasDestroyed(fake, "vm1") {
+				t.Fatalf("selfFence must clean up a clearly-dead leftover (reason %q) whose VM moved away", reason)
+			}
+		})
 	}
 }

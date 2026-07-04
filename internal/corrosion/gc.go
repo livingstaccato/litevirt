@@ -99,9 +99,53 @@ func GCSupersededRows(ctx context.Context, c *Client, coreRetention, orphanReten
 		return counts, err
 	}
 
+	// NOTE: runtime_action_proofs must NEVER be added to THIS local-only sweep. Unlike the
+	// inert rows above, a plain local delete of a proof is union-unsafe: a direct-RPC
+	// executor re-seeds a carried proof via WriteActionProof (INSERT OR IGNORE) and then
+	// claims it, and a lagging prepared/in_progress copy on a partitioned peer re-merges
+	// after a local delete — either can revive a spent proof to prepared/in_progress and let
+	// its action run again (a delete is not a lattice state). Proof-table GC is instead
+	// handled by ReapSpentProofs (below): a REPLICATED monotone tombstone plus a
+	// convergence-gated local reclaim of long-tombstoned rows. The daemon GC loop calls it
+	// alongside this sweep.
+
 	// Bounded, best-effort space reclaim (no-op without incremental auto_vacuum).
 	// A PRAGMA argument can't be a bound parameter, so format it (gcVacuumPages is
 	// a trusted int constant) — mirrors the mutation_log prune.
 	_ = c.execLocal(ctx, fmt.Sprintf("PRAGMA incremental_vacuum(%d)", gcVacuumPages))
 	return counts, nil
+}
+
+// ReapSpentProofs bounds the CONSUMABLE runtime_action_proofs set once the split-brain gate
+// is flipped (pre-flip the table is empty, so this is a no-op). It REPLICATED-tombstones a
+// terminal (completed/failed) proof older than tombstoneAfter — sets deleted_at via a guarded
+// monotone UPDATE. This is a lattice state, NOT a delete: it can't un-terminal a row, it
+// no-ops on any peer whose copy is still non-terminal (WHERE status IN terminal), and every
+// proof consume path already filters `deleted_at IS NULL`, so the tombstone renders the proof
+// inert cluster-wide while KEEPING its terminal rank — a tombstone still beats any lagging
+// non-terminal copy on merge, so it can never resurrect a spent proof.
+//
+// It deliberately does NOT hard-delete (reclaim rows). A local hard delete of a proof is
+// union-unsafe — a lagging prepared/in_progress copy on a partitioned peer, or a direct-RPC
+// carrier's re-seed, can revive a spent proof AFTER the delete — and there is no CHEAP local
+// signal that proves every enforcement-relevant member has observed the terminal/tombstone:
+// the replicated hosts.state can read `active` for a peer this node hasn't actually reached
+// since a partition, so it is NOT convergence evidence. Reclaiming tombstoned rows must wait
+// on REAL local convergence evidence (per-peer replication watermarks past the tombstone's
+// mutation_log seq) and is left as a separate follow-up; tombstones are tiny and inert until
+// then, and the consumable set — all that gates a runtime action — is already bounded here.
+func ReapSpentProofs(ctx context.Context, c *Client, tombstoneAfter time.Duration) (tombstoned int, err error) {
+	tombstoneCutoff := time.Now().UTC().Add(-tombstoneAfter).Format(tsSecLayout)
+	ts := c.NowTS()
+	n, err := c.ExecuteRows(ctx,
+		`UPDATE runtime_action_proofs
+		    SET deleted_at = ?, updated_at = ?
+		  WHERE deleted_at IS NULL
+		    AND status IN ('completed','failed')
+		    AND substr(updated_at, 1, 19) < ?`,
+		ts, ts, tombstoneCutoff)
+	if err != nil {
+		return 0, fmt.Errorf("tombstone spent proofs: %w", err)
+	}
+	return int(n), nil
 }

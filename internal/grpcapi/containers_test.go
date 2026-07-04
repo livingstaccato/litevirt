@@ -46,6 +46,9 @@ type fakeCTRuntime struct {
 	// (unset → "running" for back-compat with the lifecycle tests).
 	listNames   []string
 	stateByName map[string]string
+	// stateErrByName injects a StateContainer read error per name (unset → no error) so a
+	// test can exercise the fail-closed path when the runtime can't report container state.
+	stateErrByName map[string]error
 
 	// B0 day-2 primitives: rootfs path a test wants returned, plus freeze/unfreeze
 	// call tracking so backup/snapshot tests can assert quiesce + unfreeze.
@@ -61,6 +64,10 @@ type fakeCTRuntime struct {
 	imported      map[string][]byte
 	exportErr     error
 	importErr     error
+	// existsByName overrides ContainerExists per name (for the restore-resume tests to
+	// simulate an untracked leftover artifact); unset → falls back to `imported` presence.
+	existsByName map[string]bool
+	existsErr    error
 
 	// B2 snapshot revert: captures bytes handed to RevertContainer keyed by name;
 	// revertErr injects a failure.
@@ -118,7 +125,25 @@ func (f *fakeCTRuntime) DeleteContainer(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleteCalls = append(f.deleteCalls, name)
+	if f.deleteErr == nil {
+		delete(f.imported, name)
+		delete(f.existsByName, name)
+	}
 	return f.deleteErr
+}
+func (f *fakeCTRuntime) ContainerExists(_ context.Context, name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.existsErr != nil {
+		return false, f.existsErr
+	}
+	if f.existsByName != nil {
+		if v, ok := f.existsByName[name]; ok {
+			return v, nil
+		}
+	}
+	_, ok := f.imported[name]
+	return ok, nil
 }
 func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []string) (ContainerExecResult, error) {
 	f.mu.Lock()
@@ -130,6 +155,11 @@ func (f *fakeCTRuntime) ExecContainer(_ context.Context, name string, argv []str
 	return ContainerExecResult{Stdout: []byte("ok"), ExitCode: 0}, nil
 }
 func (f *fakeCTRuntime) StateContainer(_ context.Context, name string) (string, error) {
+	if f.stateErrByName != nil {
+		if err, ok := f.stateErrByName[name]; ok {
+			return "", err
+		}
+	}
 	if f.stateByName != nil {
 		if s, ok := f.stateByName[name]; ok {
 			return s, nil

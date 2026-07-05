@@ -220,7 +220,13 @@ import (
 //	     NON-LWW merge, kept off replication until split_brain_gate_v1 is cluster-wide)
 //	     + vms.pending_action_id (TEXT NOT NULL DEFAULT '') linking a pending start to
 //	     its proof. One CREATE TABLE + one ADD COLUMN; gap-1 from v37.
-const CurrentSchemaVersion = 38
+//	v39: request idempotency — new table idempotency_keys(key PK, claim_id, method,
+//	     request_hash, response, status, expires_at, …) recording a mutating RPC so a
+//	     lost-response retry to the SAME entry node replays the original result
+//	     instead of executing twice. LOCAL-only (execLocal, never replicated) and
+//	     TTL-reaped (ephemeral); cross-node retries fall back to resource-name
+//	     uniqueness. One CREATE TABLE; gap-1 from v38.
+const CurrentSchemaVersion = 39
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1226,6 +1232,31 @@ var schemaDDL = []string{
 		deleted_at  TEXT
 	)`,
 
+	// idempotency_keys (v39): records a mutating RPC keyed by a client-supplied
+	// idempotency key. It is claimed in_progress (with an opaque claim_id owner
+	// token) BEFORE side effects, then completed with the response, so a
+	// lost-response retry to the SAME entry node replays the stored response instead
+	// of executing twice. claim_id gates complete/release/extend so a stale owner
+	// whose claim was stolen after its lease lapsed can't mutate the newer claim.
+	// request_hash detects key reuse with a different payload (→ 409). This table is
+	// LOCAL-only (written via execLocal, never replicated): the create RPCs own the
+	// claim on the entry node and strip the key before forwarding, so a mutable
+	// in_progress row never replicates to lose an LWW race against a completed row.
+	// Cross-node dedup falls back to the create name-uniqueness constraint. Records
+	// are ephemeral and TTL-reaped via expires_at.
+	`CREATE TABLE IF NOT EXISTS idempotency_keys (
+		key          TEXT PRIMARY KEY,
+		claim_id     TEXT NOT NULL DEFAULT '',
+		method       TEXT NOT NULL,
+		request_hash TEXT NOT NULL,
+		response     TEXT NOT NULL DEFAULT '',
+		status       TEXT NOT NULL DEFAULT 'completed',
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		expires_at   TEXT NOT NULL,
+		deleted_at   TEXT
+	)`,
+
 	// containers cluster state. One row per LXC/OCI
 	// container; aggregated by `lv ct ls` cluster-wide. Lifecycle
 	// transitions are written by the daemon owning the container.
@@ -1571,6 +1602,7 @@ var tablePrimaryKeys = map[string][]string{
 	"leader_election":        {"key"},
 	"vm_locks":               {"vm_name"},
 	"runtime_action_proofs":  {"id"},
+	"idempotency_keys":       {"key"},
 	"rebalance_proposals":    {"id"},
 	"host_pci_devices":       {"host_name", "address"},
 	"images":                 {"name"},
@@ -1895,6 +1927,7 @@ var createTableUnits = []struct {
 	{33, "host_runtime_usage"},
 	{35, "container_interfaces"},
 	{38, "runtime_action_proofs"},
+	{39, "idempotency_keys"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

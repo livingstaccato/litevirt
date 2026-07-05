@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -62,7 +63,7 @@ func validateSpecNames(spec *pb.VMSpec) error {
 	return nil
 }
 
-func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM, error) {
+func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (resp *pb.VM, retErr error) {
 	spec := req.Spec
 	if spec == nil {
 		return nil, status.Error(codes.InvalidArgument, "spec required")
@@ -75,6 +76,38 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(spec.Project, spec.Name), "vm.create", "operator"); err != nil {
 		return nil, err
+	}
+
+	// Idempotency: a lost-response retry carrying the same key replays the original
+	// result instead of creating a second VM. The check runs before the forward
+	// decision below, so a retry replays without re-forwarding; the record is
+	// written on success (deferred, all return paths). A forwarded (peer) leg also
+	// carries the key, but during the original op nothing is recorded yet, so it
+	// executes; on a retry the entry node — or the owning host on a re-forward —
+	// finds the record and replays. Recording is idempotent (first writer wins).
+	if req.IdempotencyKey != "" {
+		reqHash := idempotencyRequestHash(req)
+		replay, claimID, ierr := s.idempotencyBegin(ctx, req.IdempotencyKey, "CreateVM", reqHash)
+		if ierr != nil {
+			return nil, ierr
+		}
+		if replay != nil {
+			out := &pb.VM{}
+			if proto.Unmarshal(replay, out) != nil {
+				return nil, status.Error(codes.Internal, "corrupt idempotency record")
+			}
+			return out, nil
+		}
+		stopHB := s.startIdempotencyHeartbeat(ctx, req.IdempotencyKey, claimID)
+		defer func() {
+			stopHB()
+			// Fail closed: if a successful create's result couldn't be durably
+			// recorded, surface that as the RPC error rather than a success we
+			// can't replay.
+			if ferr := s.idempotencyFinish(ctx, req.IdempotencyKey, claimID, resp, retErr); ferr != nil && retErr == nil {
+				resp, retErr = nil, ferr
+			}
+		}()
 	}
 	// F3: defining a lifecycle hook = the ability to run an arbitrary root
 	// shell command on whatever host the VM lands on (hooks.Run shells out to
@@ -197,13 +230,23 @@ func (s *Server) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (*pb.VM,
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", targetHost, err)
 		}
 		defer conn.Close()
-		resp, err := client.CreateVM(ctx, req)
+		// The entry node owns the idempotency claim. Strip the key from the
+		// forwarded copy so the executor does NOT re-enter the idempotency path and
+		// self-conflict on the same key — otherwise the entry's claim either aborts
+		// the forward (if it replicated first) or the executor races a duplicate
+		// claim on the same row.
+		fwd := req
+		if req.IdempotencyKey != "" {
+			fwd = proto.Clone(req).(*pb.CreateVMRequest)
+			fwd.IdempotencyKey = ""
+		}
+		out, err := client.CreateVM(ctx, fwd)
 		if err != nil {
 			return nil, err
 		}
 		// The remote host's mutation_log entry will be replicated to us
 		// via the WAL-based replicator. No need to manually sync.
-		return resp, nil
+		return out, nil
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)

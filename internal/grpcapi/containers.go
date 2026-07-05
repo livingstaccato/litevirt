@@ -11,6 +11,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -50,7 +51,7 @@ func (s *Server) containerProject(ctx context.Context, host, name string) string
 	return "_default"
 }
 
-func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (*pb.Container, error) {
+func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
@@ -68,6 +69,33 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if err := s.RequirePerm(ctx, ctRBACPathFor(req.Project, req.Name), "ct.create", "operator"); err != nil {
 		s.audit(ctx, "ct.create", req.Name, "project="+tenancy.NormalizeProject(req.Project), "denied")
 		return nil, err
+	}
+	// Idempotency: replay a completed create on a lost-response retry (see CreateVM).
+	// Placed before the forward so a retry replays without re-forwarding; recorded
+	// on success across all return paths.
+	if req.IdempotencyKey != "" {
+		reqHash := idempotencyRequestHash(req)
+		replay, claimID, ierr := s.idempotencyBegin(ctx, req.IdempotencyKey, "CreateContainer", reqHash)
+		if ierr != nil {
+			return nil, ierr
+		}
+		if replay != nil {
+			out := &pb.Container{}
+			if proto.Unmarshal(replay, out) != nil {
+				return nil, status.Error(codes.Internal, "corrupt idempotency record")
+			}
+			return out, nil
+		}
+		stopHB := s.startIdempotencyHeartbeat(ctx, req.IdempotencyKey, claimID)
+		defer func() {
+			stopHB()
+			// Fail closed: if a successful create's result couldn't be durably
+			// recorded, surface that as the RPC error rather than a success we
+			// can't replay.
+			if ferr := s.idempotencyFinish(ctx, req.IdempotencyKey, claimID, resp, retErr); ferr != nil && retErr == nil {
+				resp, retErr = nil, ferr
+			}
+		}()
 	}
 	if forwarded, err := s.forwardCreateContainer(ctx, req); err != nil || forwarded != nil {
 		return forwarded, err
@@ -481,7 +509,15 @@ func (s *Server) forwardCreateContainer(ctx context.Context, req *pb.CreateConta
 		return nil, status.Errorf(codes.Unavailable, "forward create: %v", err)
 	}
 	defer conn.Close()
-	return c.CreateContainer(ctx, req)
+	// The entry node owns the idempotency claim; strip the key from the forwarded
+	// copy so the executor doesn't re-run the idempotency path and self-conflict on
+	// the same key (abort the forward, or race a duplicate claim on the same row).
+	fwd := req
+	if req.IdempotencyKey != "" {
+		fwd = proto.Clone(req).(*pb.CreateContainerRequest)
+		fwd.IdempotencyKey = ""
+	}
+	return c.CreateContainer(ctx, fwd)
 }
 
 // forwardSimpleCT is the empty-result version: returns (resp, err)

@@ -84,24 +84,14 @@ jobs:
       - name: Vendor UI assets
         run: make vendor-js
 
+      # Cross-compile the linux + darwin (client-only) binaries, tar them, and
+      # write a checksums file. Logic lives in the script (workflow-script policy).
       - name: Build release binaries
         env:
           COMMIT: ${{ github.sha }}
-        run: |
-          echo "Release version: ${VERSION}"
-          mkdir -p dist
-          for arch in amd64 arm64; do
-            echo "building linux/${arch}..."
-            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build \
-              -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-              -o dist/litevirt ./cmd/litevirt
-            ( cd dist && ln -sf litevirt lv \
-              && tar -czf "litevirt-${VERSION}-linux-${arch}.tar.gz" litevirt lv \
-              && rm -f litevirt lv )
-          done
-          ( cd dist && sha256sum *.tar.gz > "litevirt-${VERSION}-checksums.txt" )
-          ls -l dist
+        run: ./scripts/ci/build-release.sh
 
+      # Publish the tarballs + checksums as a GitHub release.
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -110,3 +100,13 @@ jobs:
             --title "${VERSION}" \
             --generate-notes \
             dist/*.tar.gz dist/*checksums.txt
+
+      # Regenerate the Homebrew formula and push it to the tap. No-ops until the
+      # HOMEBREW_TAP_REPO variable + HOMEBREW_TAP_TOKEN secret are configured.
+      - name: Publish Homebrew formula
+        if: ${{ vars.HOMEBREW_TAP_REPO != '' }}
+        env:
+          REPO: ${{ github.repository }}
+          TAP_REPO: ${{ vars.HOMEBREW_TAP_REPO }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: ./scripts/ci/brew-formula.sh

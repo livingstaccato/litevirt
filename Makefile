@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: all build proto lint test test-fleet test-fleet-race test-fuzz update-golden ci-guards clean
+.PHONY: all build dist brew-formula proto lint test test-fleet test-fleet-race test-fuzz update-golden ci-guards clean
 
 UPLOT_VERSION := 1.6.31
 UPLOT_DIR := internal/ui/static/vendor/uplot
@@ -44,6 +44,16 @@ $(FONTS_DIR)/source-sans-3.woff2:
 	@mkdir -p $(FONTS_DIR)
 	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-sans-3/files/source-sans-3-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-sans-3.woff2
 	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-code-pro/files/source-code-pro-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-code-pro.woff2
+
+# dist cross-compiles the shipped release artifacts (linux + darwin client)
+# into dist/, the same way CI does. Override VERSION for a local build.
+dist: vendor-js
+	VERSION=$(VERSION) COMMIT=$(COMMIT) ./scripts/ci/build-release.sh
+
+# brew-formula regenerates dist/litevirt.rb from an existing dist/ (run `make
+# dist` first). Set TAP_REPO + TAP_TOKEN to also push to the tap.
+brew-formula:
+	VERSION=$(VERSION) ./scripts/ci/brew-formula.sh
 
 proto:
 	buf generate

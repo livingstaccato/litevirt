@@ -104,7 +104,7 @@ class Litevirt < Formula
       On macOS only the client works — hosting VMs needs Linux + KVM/QEMU.
       Point it at a remote cluster (creds in ~/.config/litevirt/pki):
         export LV_HOST=<host>   # gRPC/mTLS on :7443
-        lv host list
+        lv host ls
     CAVEAT
   end
 

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -93,9 +94,21 @@ type Daemon struct {
 	// overridable in tests.
 	exitFunc func(int)
 
-	// flushTelemetry flushes OTLP telemetry with a bounded timeout. Set in Run;
-	// called by exit() so an os.Exit path doesn't drop the last spans/logs.
+	// flushTelemetry flushes OTLP telemetry with a bounded timeout. Assigned
+	// once in Run, BEFORE the upgrade watchdog is armed — the watchdog
+	// goroutine can call exit() before obs.Setup completes, and this field
+	// itself must never be nil/racing when it does. It reads the real
+	// shutdown func from telemetryShutdown rather than closing over it
+	// directly, so it's safe to call at any time. Called by exit() so an
+	// os.Exit path doesn't drop the last spans/logs.
 	flushTelemetry func()
+
+	// telemetryShutdown holds obs.Setup's shutdown func once Setup completes;
+	// nil until then. Written once from Run, read concurrently by
+	// flushTelemetry — which the watchdog goroutine (armed before Setup runs)
+	// can invoke via exit() at any time — so this needs atomic access, not a
+	// plain field. Finding 7.
+	telemetryShutdown atomic.Pointer[func(context.Context) error]
 }
 
 // New creates a new daemon instance.
@@ -152,37 +165,82 @@ func (d *Daemon) markRestarting() {
 	time.Sleep(2 * time.Second)
 }
 
+// telemetryShutdownTimeout bounds every telemetry flush so a wedged collector
+// can't stall daemon shutdown / a rolling upgrade past systemd's TimeoutStopSec.
+const telemetryShutdownTimeout = 2 * time.Second
+
+// armWatchdogThenSetupTelemetry enforces the load-bearing boot order: arm the
+// post-upgrade watchdog FIRST, then run (possibly-blocking) telemetry setup, so a
+// setup that hangs is still caught by the already-armed watchdog. Returns
+// telemetry's shutdown func and setup error. Split out so the ordering invariant
+// is testable without standing up a live daemon.
+func armWatchdogThenSetupTelemetry(
+	armWatchdog func(),
+	setupTelemetry func() (func(context.Context) error, error),
+) (func(context.Context) error, error) {
+	armWatchdog()
+	return setupTelemetry()
+}
+
+// boundedTelemetryShutdown flushes telemetry under a hard timeout. The returned
+// shutdown honors context cancellation, so a slow/unreachable collector can't
+// stall the flush past timeout. Safe with a nil shutdown (no-op).
+func boundedTelemetryShutdown(shutdown func(context.Context) error, timeout time.Duration) error {
+	if shutdown == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return shutdown(ctx)
+}
+
 func (d *Daemon) Run(ctx context.Context) error {
-	// Initialize observability first so every subsequent slog.* call in this
-	// process is structured/enriched and — when an OTLP endpoint is configured —
-	// exported alongside traces and metrics. Fail-open: a telemetry setup error
-	// degrades to local logging and never blocks boot.
-	shutdownTelemetry, terr := obs.Setup(ctx, obs.Config{
-		ServiceName:  "litevirt",
-		Version:      d.cfg.Version,
-		Environment:  d.cfg.Telemetry.Environment,
-		HostName:     d.cfg.HostName,
-		OTLPEndpoint: d.cfg.Telemetry.OTLPEndpoint,
-		SampleRate:   d.cfg.Telemetry.SampleRate,
-		LogLevel:     d.cfg.Telemetry.LogLevel,
-		LogFormat:    d.cfg.Telemetry.LogFormat,
-	})
+	// Boot order is load-bearing: arm the post-upgrade watchdog FIRST, then run
+	// telemetry setup (which can block on a slow/unreachable collector — production
+	// sets none of the PROVIDE_*_TIMEOUT caps). If setup ran first and hung, a
+	// boot-hang would never roll back. Extracted to a helper so the ordering is
+	// unit-tested without a live daemon (see daemon_telemetry_test.go). Fail-open:
+	// a setup error degrades to local logging and never blocks boot.
+	// Assigned BEFORE the watchdog is armed: startUpgradeWatchdog (below) can
+	// spawn a goroutine that calls exit() while Setup is still running (or
+	// hung), so this field must never be nil/racing at that point. It reads
+	// telemetryShutdown — set at the bottom of this block, once Setup
+	// returns — via atomic.Pointer, so the closure itself is safe to assign
+	// once and call at any time; a call before Setup completes is a safe
+	// no-op instead of a lost-rollback-telemetry bug. Finding 7.
+	d.flushTelemetry = func() {
+		if fn := d.telemetryShutdown.Load(); fn != nil {
+			_ = boundedTelemetryShutdown(*fn, telemetryShutdownTimeout)
+		}
+	}
+	shutdownTelemetry, terr := armWatchdogThenSetupTelemetry(
+		func() { d.startUpgradeWatchdog(ctx) },
+		func() (func(context.Context) error, error) {
+			return obs.Setup(ctx, obs.Config{
+				ServiceName:  "litevirt",
+				Version:      d.cfg.Version,
+				Environment:  d.cfg.Telemetry.Environment,
+				HostName:     d.cfg.HostName,
+				OTLPEndpoint: d.cfg.Telemetry.OTLPEndpoint,
+				SampleRate:   d.cfg.Telemetry.SampleRate,
+				LogLevel:     d.cfg.Telemetry.LogLevel,
+				LogFormat:    d.cfg.Telemetry.LogFormat,
+			})
+		},
+	)
 	if terr != nil {
 		slog.Warn("telemetry setup degraded to local logging", "error", terr)
 	}
-	// Bounded flush for abnormal (os.Exit) paths; see (*Daemon).exit. Set before
-	// the watchdog goroutine starts so a rollback can flush.
-	d.flushTelemetry = func() {
-		fctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = shutdownTelemetry(fctx)
-	}
-	defer func() { _ = shutdownTelemetry(context.Background()) }()
-
-	// Arm the post-upgrade health watchdog FIRST (before any potentially-hanging
-	// init step), and independently, so a boot that hangs before the gRPC server
-	// can serve is still caught. No-op on a normal boot (no sentinel).
-	d.startUpgradeWatchdog(ctx)
+	d.telemetryShutdown.Store(&shutdownTelemetry)
+	// Every telemetry flush is bounded (abnormal os.Exit path and normal defer
+	// alike) so a wedged collector can't stall graceful stop / a rolling upgrade
+	// past systemd's TimeoutStopSec into SIGKILL.
+	defer func() { _ = boundedTelemetryShutdown(shutdownTelemetry, telemetryShutdownTimeout) }()
+	// Wire tracing dial options into every pki.PeerDial caller (including the
+	// corrosion replicator/anti-entropy dials, which pass none of their own —
+	// finding 8), now that obs.Setup has resolved whether tracing is active.
+	// Safe here: replication/anti-entropy start later in this method.
+	pki.SetTraceDialOptions(obs.ClientDialOptions)
 
 	// Pre-flight: refuse to start under a systemd unit that would kill
 	// child QEMU processes on stop. See preflight.go for the rationale.
@@ -314,7 +372,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// WAL entries defer rather than leak — never a schema-version guess.)
 	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
 	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, "split_brain_activated"))
-	gateMetrics := metrics.NewRuntimeGateMetrics() // shared by all gate observers
+	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
+	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
 	// Start WAL-based replicator with Crescent relay protocol.
 	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, corrosion.RelayConfig{
@@ -330,11 +389,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 	// LWW future-skew quarantine (partial): enabled only once LWWSkewGuardV1 has
 	// latched on this node (cheap marker read, no ping/I/O), so a future-skewed peer's
-	// rows can't win a conflict. Dark until the token is flipped + latched cluster-wide.
+	// rows can't win a conflict. The token is advertised, so enforcement is gated on the
+	// enforcement.lww_skew_guard config flag AND the latch — behavior-neutral until an
+	// operator enables it (and the flag is the reversible kill switch).
 	// NOTE: does not address the backward-clock case (NowTS still emits wall-clock) —
 	// that's deferred to a separate conflict-key migration.
 	d.db.SetHLCSkewGuard(func() bool {
-		return d.checker.Latched(capabilities.LWWSkewGuardV1)
+		// Config kill-switch AND the latched capability (the HA monitor drives the
+		// latch while healthy). Latched (not Enforced) keeps this merge-hot-path read
+		// off any peer dial.
+		return d.cfg.Enforcement.LWWSkewGuard && d.checker.Latched(capabilities.LWWSkewGuardV1)
 	})
 	repl.Start(ctx)
 
@@ -377,6 +441,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	vmChecker := health.NewVMChecker(d.cfg.HostName, d.db, d.virt)
 	vmChecker.SetGate(d.checker)
 	vmChecker.SetGateRefusedObserver(gateMetrics.Refused)
+	vmChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 
 	// Start libvirt reconnect loop — auto-reconnects if libvirtd restarts (#42).
 	go d.virt.StartReconnectLoop(ctx)
@@ -393,8 +458,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return // don't act on intentional stops
 			}
 			slog.Warn("domain event: VM stopped/crashed", "vm", domName, "event", event, "detail", detail)
-			corrosion.UpdateVMState(ctx, d.db, domName, "error",
-				fmt.Sprintf("domain event: stopped (detail=%d). Check host dmesg for OOM.", detail))
+			if err := corrosion.UpdateVMState(ctx, d.db, domName, "error",
+				fmt.Sprintf("domain event: stopped (detail=%d). Check host dmesg for OOM.", detail)); err != nil {
+				slog.Error("domain event: failed to record crash state — reconciler will re-detect", "vm", domName, "error", err)
+				stateWriteMetrics.Failed(corrosion.OpVMState, corrosion.ClassifyWriteErr(err))
+			}
 		}
 	})
 
@@ -407,6 +475,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	reconciler.SetGate(d.checker)
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
+	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 
 	// Daily prune of this host's vm_events rows so the operational event store
 	// stays bounded (see config vm_event_*).
@@ -465,6 +534,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
+	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// Target the upgrade swap at the binary we're actually running (re-exec uses
 	// os.Executable()), so a non-/usr/local/bin install upgrades correctly.
 	if exe, err := os.Executable(); err == nil {
@@ -480,6 +550,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSessionTimeouts(parseDurationOr(d.cfg.Auth.SessionIdleTimeout, 0), parseDurationOr(d.cfg.Auth.SessionHardExpiry, 0))
 	svc.SetStrictMTLSIdentity(d.cfg.Auth.StrictMTLSIdentity)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
+	// Split-brain-family enforcement kill-switches — so the HA monitor drives the
+	// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
+	// config intent. The actual enforcement predicates live on the consumers
+	// (Coordinator, the lww/vip closures above), wired from the same config below.
+	svc.SetEnforcementConfig(
+		d.cfg.Enforcement.SafeFenceDefault,
+		d.cfg.Enforcement.LWWSkewGuard,
+		d.cfg.Enforcement.VIPSelfDemote,
+		d.cfg.Enforcement.VIPProofReclaim,
+	)
 	svc.SetMigrationMetrics(metrics.NewMigrationMetrics())
 	svc.SetLBMetrics(metrics.NewLBMetrics())
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
@@ -569,7 +649,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// flip doesn't activate a lone rolled node before the whole cluster can participate,
 	// but a watchdog-less node still self-demotes (only its failure-handling differs).
 	vipDemoter.SetEnabled(func(ctx context.Context) bool {
-		return d.checker.Enforced(ctx, capabilities.VIPDemoteV1)
+		// Config kill-switch AND the cluster-wide latch (HA monitor drives it while
+		// healthy). Flag false ⇒ never self-demote (legacy: keepalived VRRP handles it).
+		return d.cfg.Enforcement.VIPSelfDemote && d.checker.Enforced(ctx, capabilities.VIPDemoteV1)
 	})
 	vipDemoter.SetRefusedObserver(gateMetrics.Refused)
 	// Surface an unfenced demotion failure (demote failed + no verified self-fence) as a
@@ -675,6 +757,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// enforced — wired before the container reconcile loop starts.
 	ctChecker.SetGate(d.checker)
 	ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
+	ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume
@@ -727,8 +810,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.Promoter = svc // *grpcapi.Server implements failover.ReplicaPromoter
 	fc.Restorer = svc // implements failover.ContainerRestorer (tier-2 relocate-from-backup)
 	fc.RelocateRestoreTimeout = time.Duration(d.cfg.ContainerRestoreTimeoutSec) * time.Second
-	fc.OnFence = svc.NotifyHostFenced         // operator notification on fence (#5)
-	fc.Metrics = metrics.NewFailoverMetrics() // structured failover counters (U9)
+	fc.OnFence = svc.NotifyHostFenced                        // operator notification on fence (#5)
+	fc.Metrics = metrics.NewFailoverMetrics()                // structured failover counters (U9)
+	fc.SafeFenceEnforce = d.cfg.Enforcement.SafeFenceDefault // safe-fence kill-switch (config AND SafeFenceDefaultV1)
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

@@ -187,10 +187,10 @@ github.com/prometheus/procfs v0.0.2/go.mod h1:TjEm7ze935MbeOT/UhFTIMYKhuLP4wbCsT
 github.com/prometheus/procfs v0.0.8/go.mod h1:7Qr8sr6344vo1JqZ6HhLceV9o3AJ1Ff+GxbHq6oeK9A=
 github.com/prometheus/procfs v0.21.1 h1:GljZCt+zSTS+NZq88cyQ1LjZ+RCHp3uVuabBWA5+OJI=
 github.com/prometheus/procfs v0.21.1/go.mod h1:aB55Cww9pdSJVHk0hUf0inxWyyjPogFIjmHKYgMKmtY=
-github.com/provide-io/provide-telemetry/go v0.5.0 h1:zL+/ez0jCQQD6/541DnK3KoNH90YrsnYbcs8uR9bCsw=
-github.com/provide-io/provide-telemetry/go v0.5.0/go.mod h1:ENavx/MAXDRy6ianaZKnTUh4h5NYZPbgO9C7VjnkHRY=
-github.com/provide-io/provide-telemetry/go/otel v0.5.0 h1:eIMosasvEabAzyh6FMoiYpzaously9CCNjPK9bDwTTw=
-github.com/provide-io/provide-telemetry/go/otel v0.5.0/go.mod h1:U5qqQ7pUhZSeTXNjody6ndbEXsGpH/ump/E4xbQfKRo=
+github.com/provide-io/provide-telemetry/go v0.5.1 h1:fUCL5xEkp14Ohj5LYD7QqL3jdwTONSg/QNItf9Mcr+4=
+github.com/provide-io/provide-telemetry/go v0.5.1/go.mod h1:ENavx/MAXDRy6ianaZKnTUh4h5NYZPbgO9C7VjnkHRY=
+github.com/provide-io/provide-telemetry/go/otel v0.5.1 h1:rE71JIW0h0r3jB9Wlo+SXlR6gL1MUodmvBHdZa3F8W0=
+github.com/provide-io/provide-telemetry/go/otel v0.5.1/go.mod h1:UvOrmwsjdPgWNE7PSahhIOqOekag5oqmzKG3gHQTqYw=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
 github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=

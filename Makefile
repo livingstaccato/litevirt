@@ -2,7 +2,7 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
 LDFLAGS := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 
-.PHONY: all build dist brew-formula proto lint test test-fleet test-fleet-race test-fuzz update-golden ci-guards clean
+.PHONY: all build proto lint test test-fleet test-fleet-race test-fuzz test-fuzz-telemetry test-telemetry-mutation update-golden ci-guards clean
 
 UPLOT_VERSION := 1.6.31
 UPLOT_DIR := internal/ui/static/vendor/uplot
@@ -45,16 +45,6 @@ $(FONTS_DIR)/source-sans-3.woff2:
 	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-sans-3/files/source-sans-3-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-sans-3.woff2
 	curl -sL "https://cdn.jsdelivr.net/npm/@fontsource-variable/source-code-pro/files/source-code-pro-latin-wght-normal.woff2" -o $(FONTS_DIR)/source-code-pro.woff2
 
-# dist cross-compiles the shipped release artifacts (linux + darwin client)
-# into dist/, the same way CI does. Override VERSION for a local build.
-dist: vendor-js
-	VERSION=$(VERSION) COMMIT=$(COMMIT) ./scripts/ci/build-release.sh
-
-# brew-formula regenerates dist/litevirt.rb from an existing dist/ (run `make
-# dist` first). Set TAP_REPO + TAP_TOKEN to also push to the tap.
-brew-formula:
-	VERSION=$(VERSION) ./scripts/ci/brew-formula.sh
-
 proto:
 	buf generate
 
@@ -73,6 +63,12 @@ test-fleet:
 test-fleet-race:
 	go test ./tests/fleet/ -count=1 -race
 
+# Mutation-prove telemetry pass-2 guards (clean tree required). Each case
+# breaks one fix, asserts the pinning test goes red, restores. See
+# scripts/ci/telemetry-mutation.sh.
+test-telemetry-mutation:
+	./scripts/ci/telemetry-mutation.sh
+
 # Refresh golden files in place after an intentional rendering change.
 # Inspect the diff before committing.
 update-golden:
@@ -90,6 +86,14 @@ test-fuzz:
 	go test ./internal/firewall/ -run='^$$' -fuzz='^FuzzFromCorrosionRule$$' -fuzztime=$(FUZZTIME)
 	go test ./internal/firewall/ -run='^$$' -fuzz='^FuzzRender$$'            -fuzztime=$(FUZZTIME)
 	go test ./internal/lb/       -run='^$$' -fuzz='^FuzzParseVIP$$'          -fuzztime=$(FUZZTIME)
+	$(MAKE) test-fuzz-telemetry
+
+# Coverage-guided fuzz of telemetry validation (endpoint / sample rate / log redaction).
+# Same family of testing as OSS-Fuzz native Go targets; safe to run on a Mac.
+test-fuzz-telemetry:
+	go test ./internal/obs/ -run='^$$' -fuzz='^FuzzValidEndpoint$$'      -fuzztime=$(FUZZTIME)
+	go test ./internal/obs/ -run='^$$' -fuzz='^FuzzValidSampleRate$$'    -fuzztime=$(FUZZTIME)
+	go test ./internal/obs/ -run='^$$' -fuzz='^FuzzSafeEndpointForLog$$' -fuzztime=$(FUZZTIME)
 
 # CI guardrails (see docs/upgrades.md → CI guardrails):
 #   - schema growth must come with a CurrentSchemaVersion bump (diff-based)
@@ -98,6 +102,8 @@ test-fuzz:
 # BASE_REF overrides what the schema-growth check diffs against (default origin/main).
 ci-guards:
 	./scripts/ci/check-schema-bump.sh
+	go run ./scripts/ci/writecheck -root .
+	go test ./scripts/ci/writecheck/
 	go test ./internal/corrosion/ -run TestSchemaHistoryDocumentsCurrentVersion
 	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestValidateInvocation|TestCheckIdentifier|TestExtractInvocations'
 

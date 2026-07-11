@@ -78,7 +78,7 @@ gRPC/mTLS. macOS builds ship in every release, and via the Homebrew tap:
 ```bash
 brew install colonelpanik/litevirt/litevirt
 export LV_HOST=<host>          # remote node; gRPC/mTLS on :7443 (creds in ~/.config/litevirt/pki)
-lv host list
+lv host ls
 ```
 
 ## Features
@@ -134,7 +134,7 @@ detection) — scaling to hundreds of nodes with no master to lose.
 ## Build & test
 
 ```bash
-make build   # single binary bin/litevirt (~35 MB, static, no CGO) + bin/lv symlink — Go 1.25+
+make build   # single binary bin/litevirt (~35 MB, static, no CGO) + bin/lv symlink — Go 1.26+
 make test
 ```
 

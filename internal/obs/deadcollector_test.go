@@ -74,7 +74,7 @@ func TestDeadCollector_DoesNotDegradeControlPlane(t *testing.T) {
 			ServiceName:  "deadcollector-test",
 			HostName:     "node-dead",
 			OTLPEndpoint: bh.endpoint(),
-			SampleRate:   1.0,
+			SampleRate:   f64p(1.0),
 		})
 		if err != nil {
 			t.Logf("Setup returned (fail-open, non-fatal): %v", err)
@@ -145,7 +145,7 @@ func TestDeadCollector_ConnectionRefused(t *testing.T) {
 	t.Setenv("PROVIDE_EXPORTER_LOGS_TIMEOUT_SECONDS", "1")
 
 	ctx := context.Background()
-	shutdown, err := Setup(ctx, Config{ServiceName: "refused-test", OTLPEndpoint: endpoint, SampleRate: 1.0})
+	shutdown, err := Setup(ctx, Config{ServiceName: "refused-test", OTLPEndpoint: endpoint, SampleRate: f64p(1.0)})
 	if err != nil {
 		t.Logf("Setup (fail-open): %v", err)
 	}

@@ -43,9 +43,9 @@ Two sources, `LITEVIRT_*` env wins. Precedence, highest first:
 telemetry:
   otlp_endpoint: "http://otel-collector:5080/api/default"  # empty = export off
   environment: "prod"          # service.env label
-  sample_rate: 1.0             # trace sampling 0.0–1.0
+  sample_rate: 1.0             # trace sampling 0.0–1.0; omit = default (100%), 0 = disabled
   log_level: "INFO"            # TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL
-  log_format: "json"           # json|console|pretty
+  log_format: "console"        # json|console|pretty (default console; json = structured)
 ```
 
 ### Operator env (`LITEVIRT_*`)
@@ -66,6 +66,49 @@ internally.
 
 The standard `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_HEADERS` are also
 honored directly if you prefer them.
+
+### Turning export off
+
+The endpoint **is** the switch: with no endpoint resolved, nothing exports, no
+otel handler attaches to any gRPC path, and local logging stays on the stock
+handler. But env wins over config — clearing `telemetry.otlp_endpoint` in
+`config.yaml` does **not** disable export while `LITEVIRT_OTEL_ENDPOINT` (or
+`OTEL_EXPORTER_OTLP_ENDPOINT`) is still set in the daemon's environment, e.g. in
+the systemd unit. To turn export off, clear the config field **and** any
+endpoint env vars, then restart the daemon.
+
+### Exporter resilience (`LITEVIRT_OTEL_*`)
+
+These bound the OTLP export calls themselves so a **slow or unreachable
+collector** can't stall the daemon. Set them if your collector can be slow or
+flap. Each knob fans out to both active signals (logs **and** traces) — one
+value tunes the whole export path, no per-signal `PROVIDE_EXPORTER_*` fiddling.
+
+When unset, the two signals default **differently**: logs ride the vendor's
+exporter, which sets no caps of its own (unbounded until you set these knobs);
+traces ride an obs-owned exporter (that's what makes `sample_rate` real — see
+below), which falls back to the OTel SDK defaults — ~10s per-export timeout and
+retries capped at about a minute. So an uncapped collector stall can hold a
+**log** export open indefinitely, while a **trace** export self-bounds. Setting
+`LITEVIRT_OTEL_TIMEOUT`/`RETRIES`/`BACKOFF` overrides both signals to the same
+explicit values.
+
+| litevirt env | Purpose | Example |
+|---|---|---|
+| `LITEVIRT_OTEL_TIMEOUT` | per-export deadline, seconds | `5` |
+| `LITEVIRT_OTEL_RETRIES` | retry attempts on export failure | `2` |
+| `LITEVIRT_OTEL_BACKOFF` | backoff between retries, seconds | `1` |
+| `LITEVIRT_OTEL_FAIL_OPEN` | drop on failure instead of blocking | `true` |
+| `LITEVIRT_OTEL_SHUTDOWN_TIMEOUT` | drain cap on daemon stop, seconds | `2` |
+
+Boot and shutdown are already bounded structurally (the upgrade watchdog is armed
+*before* telemetry init, and telemetry shutdown runs under a 2s cap), so these are
+a **hardening layer**, not a requirement — reach for them when you see export
+latency or a flapping collector.
+
+`LITEVIRT_OTEL_SHUTDOWN_TIMEOUT` maps to the logs signal only (the vendor exposes
+a shutdown-drain cap for logs alone; traces flush on the batch processor's own
+timeout). Metrics have no knobs here — `obs` doesn't export OTLP metrics.
 
 ## What gets traced
 
@@ -103,18 +146,39 @@ prefer leaving it at `1.0` unless span volume is a proven problem.
   `telemetry: OTLP export enabled endpoint=… traces_sample_rate=…`, or
   `… export disabled — local structured logging only`. Check it first if traces
   aren't arriving.
-- **Export-error metric** — `litevirt_telemetry_export_errors_total` (Prometheus,
-  on `:7444/metrics`) counts dropped exports. **Nonzero and growing = the
-  collector is unreachable or rejecting** (e.g. missing auth header). Because it
-  lives on Prometheus, not OTLP, it's visible even when trace export is dead.
-  Alert on `rate(litevirt_telemetry_export_errors_total[5m]) > 0`.
+- **Export-health metrics** — on Prometheus (`:7444/metrics`). Logs stay on
+  provide-telemetry's own exporter, so their health is sourced from the
+  vendor's resilience snapshot (NOT an otel error handler: the fail-open
+  wrapper swallows export failures before they reach otel's global handler, so
+  a handler-based counter would silently read 0 against a dead collector for
+  that signal). Traces run through an obs-owned `TracerProvider` (so the real
+  `sample_rate` sampler applies — see above), which bypasses that vendor
+  wrapper entirely; trace export failures are instead counted via an
+  obs-installed otel error handler. Because these metrics live on Prometheus,
+  not OTLP, they stay visible even when OTLP export is dead:
+
+  | Metric | Meaning |
+  |---|---|
+  | `litevirt_telemetry_export_errors_total` | Failed OTLP export attempts (logs, vendor snapshot, + traces, obs error handler). **Nonzero and growing = collector unreachable/rejecting.** |
+  | `litevirt_telemetry_export_retries_total` | Export retry attempts (logs+traces, vendor snapshot). |
+  | `litevirt_telemetry_dropped_total` | Records shed because the async export queue was full (backpressure). **Logs only** — an obs-owned traces provider makes traces backpressure drops unobservable; reporting a stale vendor value would misrepresent it. |
+  | `litevirt_telemetry_circuit_state{signal}` | Per-signal circuit breaker: `0`=closed, `1`=half-open, `2`=open, `-1`=unknown. `signal="traces"` is always `-1` (unknown) — the obs-owned provider has no vendor circuit to observe. |
+
+  Alert on `rate(litevirt_telemetry_export_errors_total[5m]) > 0` (collector
+  trouble) and `litevirt_telemetry_circuit_state{signal="logs"} > 0` (exporter
+  tripped/probing).
 - **Fail-open, non-blocking** — a down/slow collector never blocks the control
   plane: emission is async-batched and shutdown is bounded (data is dropped, the
   daemon is not stalled). Last spans/logs are flushed even on an abnormal
   (upgrade-rollback) exit.
-- **Invalid config fails fast** — a bad `telemetry` block (e.g. `log_level: WARN`,
-  `sample_rate: 2`, non-http endpoint) fails daemon start with a clear message
-  rather than silently degrading to local logging.
+- **Invalid config degrades, never bricks** — a bad `telemetry` value (e.g.
+  `log_level: WARN` — it's `WARNING`; `sample_rate: 2`; a non-`http://` endpoint)
+  is **logged as a warning and reset to its safe default** (the endpoint is
+  cleared, disabling export), not treated as a fatal error. Telemetry is fail-open
+  end to end: a typo in an optional block must never stop the daemon booting —
+  critically, an in-place upgrade re-execs the daemon, so a config the running
+  node tolerated must still boot the new binary. Watch the boot log for
+  `config telemetry: …` warnings if a setting isn't taking effect.
 
 ## Quick start with OpenObserve
 

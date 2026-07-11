@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -288,39 +289,77 @@ pci:
 	}
 }
 
-func TestValidateTelemetry(t *testing.T) {
+// normalizeTelemetry never errors — it is fail-open. Valid values are
+// canonicalized; invalid values are degraded to their safe default (empty
+// level/format, 0 sample rate, cleared endpoint) so a typo can never block boot.
+func TestNormalizeTelemetry(t *testing.T) {
 	cases := []struct {
-		name    string
-		in      TelemetryConfig
-		wantErr bool
-		wantLvl string // normalized level, when no error
-		wantFmt string
+		name string
+		in   TelemetryConfig
+		want TelemetryConfig // expected state after normalize
 	}{
-		{name: "empty ok", in: TelemetryConfig{}, wantErr: false},
-		{name: "valid full", in: TelemetryConfig{OTLPEndpoint: "http://c:4317", SampleRate: 0.5, LogLevel: "info", LogFormat: "JSON"}, wantErr: false, wantLvl: "INFO", wantFmt: "json"},
-		{name: "warn rejected (must be WARNING)", in: TelemetryConfig{LogLevel: "WARN"}, wantErr: true},
-		{name: "warning accepted", in: TelemetryConfig{LogLevel: "warning"}, wantErr: false, wantLvl: "WARNING"},
-		{name: "bad format", in: TelemetryConfig{LogFormat: "yaml"}, wantErr: true},
-		{name: "pretty ok", in: TelemetryConfig{LogFormat: "pretty"}, wantErr: false, wantFmt: "pretty"},
-		{name: "sample too high", in: TelemetryConfig{SampleRate: 1.5}, wantErr: true},
-		{name: "sample negative", in: TelemetryConfig{SampleRate: -0.1}, wantErr: true},
-		{name: "endpoint bad scheme", in: TelemetryConfig{OTLPEndpoint: "grpc://c:4317"}, wantErr: true},
-		{name: "endpoint no host", in: TelemetryConfig{OTLPEndpoint: "http://"}, wantErr: true},
+		{name: "empty ok", in: TelemetryConfig{}, want: TelemetryConfig{}},
+		{
+			name: "valid full canonicalized",
+			in:   TelemetryConfig{OTLPEndpoint: "http://c:4318", LogLevel: "info", LogFormat: "JSON"},
+			want: TelemetryConfig{OTLPEndpoint: "http://c:4318", LogLevel: "INFO", LogFormat: "json"},
+		},
+		{name: "WARN degraded (must be WARNING)", in: TelemetryConfig{LogLevel: "WARN"}, want: TelemetryConfig{LogLevel: ""}},
+		{name: "warning canonicalized", in: TelemetryConfig{LogLevel: "warning"}, want: TelemetryConfig{LogLevel: "WARNING"}},
+		{name: "bad format degraded", in: TelemetryConfig{LogFormat: "yaml"}, want: TelemetryConfig{LogFormat: ""}},
+		{name: "pretty canonicalized", in: TelemetryConfig{LogFormat: "pretty"}, want: TelemetryConfig{LogFormat: "pretty"}},
+		{name: "gRPC scheme endpoint disabled", in: TelemetryConfig{OTLPEndpoint: "grpc://c:4317"}, want: TelemetryConfig{OTLPEndpoint: ""}},
+		{name: "no-scheme endpoint disabled", in: TelemetryConfig{OTLPEndpoint: "otel-collector:4317"}, want: TelemetryConfig{OTLPEndpoint: ""}},
+		{name: "no-host endpoint disabled", in: TelemetryConfig{OTLPEndpoint: "http://"}, want: TelemetryConfig{OTLPEndpoint: ""}},
+		{name: "userinfo endpoint disabled", in: TelemetryConfig{OTLPEndpoint: "http://u:p@c:4318"}, want: TelemetryConfig{OTLPEndpoint: ""}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			tc := c.in
-			err := validateTelemetry(&tc)
-			if (err != nil) != c.wantErr {
-				t.Fatalf("validateTelemetry(%+v) err=%v, wantErr=%v", c.in, err, c.wantErr)
+			got := c.in
+			normalizeTelemetry(&got)
+			if got != c.want {
+				t.Errorf("normalizeTelemetry(%+v) = %+v; want %+v", c.in, got, c.want)
 			}
-			if !c.wantErr {
-				if c.wantLvl != "" && tc.LogLevel != c.wantLvl {
-					t.Errorf("normalized level = %q; want %q", tc.LogLevel, c.wantLvl)
+		})
+	}
+}
+
+func f64(v float64) *float64 { return &v }
+
+// sample_rate is a tristate: nil (unset) = library default (100%); a valid value
+// INCLUDING 0 (disable sampling) is honored; an out-of-range/NaN value degrades to
+// nil (library default), never to 0 — 0 is a legitimate "off" request.
+func TestNormalizeTelemetry_SampleRate(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      *float64
+		wantNil bool
+		wantVal float64
+	}{
+		{"nil = library default", nil, true, 0},
+		{"valid 0.5 kept", f64(0.5), false, 0.5},
+		{"zero kept (disabled, not treated as unset)", f64(0), false, 0},
+		{"one kept", f64(1), false, 1},
+		{"too high -> default", f64(1.5), true, 0},
+		{"negative -> default", f64(-0.1), true, 0},
+		{"NaN -> default", f64(math.NaN()), true, 0},
+		{"+Inf -> default", f64(math.Inf(1)), true, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := TelemetryConfig{SampleRate: c.in}
+			normalizeTelemetry(&tc)
+			if c.wantNil {
+				if tc.SampleRate != nil {
+					t.Errorf("SampleRate = %v; want nil (degraded to library default)", *tc.SampleRate)
 				}
-				if c.wantFmt != "" && tc.LogFormat != c.wantFmt {
-					t.Errorf("normalized format = %q; want %q", tc.LogFormat, c.wantFmt)
-				}
+				return
+			}
+			if tc.SampleRate == nil {
+				t.Fatalf("SampleRate = nil; want %v", c.wantVal)
+			}
+			if *tc.SampleRate != c.wantVal {
+				t.Errorf("SampleRate = %v; want %v", *tc.SampleRate, c.wantVal)
 			}
 		})
 	}

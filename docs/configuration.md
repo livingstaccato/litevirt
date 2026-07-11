@@ -117,6 +117,20 @@ storage_pools:
       id: admin
       conf: /etc/ceph/ceph.conf
 
+# Split-brain-family enforcement kill-switches. Each is a per-node on/off for a
+# hardening feature whose capability token the build advertises but does NOT enforce
+# until you opt in. Enforcement = this flag AND the token's cluster-wide latch, so the
+# flag is BOTH the enable and the kill switch: set it false + restart to disable,
+# regardless of any durable latch (never delete marker files). All default false; a
+# fresh deploy changes no behavior. Enable fleet-uniformly for lww_skew_guard (it
+# changes merge behavior) and for vip_* enable the pair together.
+enforcement:
+  safe_fence_default: false   # a best-effort (unconfirmable) fence must carry an operator
+                              # proof (`lv host fence-confirm`) before reschedule/promote
+  lww_skew_guard: false       # quarantine an incoming LWW row >5 min future-skewed (future-skew only)
+  vip_self_demote: false      # a minority node releases its VIPs on sustained quorum loss
+  vip_proof_reclaim: false    # majority refuses a VIP takeover without a release/fence proof
+
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and
 # LDAP realms are loaded into a Registry at startup; `Login` dispatches
@@ -229,13 +243,15 @@ notifications:
 # touch them. Export is OFF until otlp_endpoint is set; with no endpoint the
 # daemon logs locally and attaches no otel handler to any gRPC path (zero cost).
 # The auth secret for the collector belongs in LITEVIRT_OTEL_HEADERS (env), not
-# here. LITEVIRT_* env overrides win over these fields.
+# here. LITEVIRT_* env overrides win over these fields — including for DISABLING:
+# clearing otlp_endpoint here does not turn export off while LITEVIRT_OTEL_ENDPOINT
+# (or OTEL_EXPORTER_OTLP_ENDPOINT) is still set in the daemon's environment.
 telemetry:
-  otlp_endpoint: ""                 # OTLP endpoint, e.g. http://otel-collector:4317 (empty = export disabled)
+  otlp_endpoint: ""                 # OTLP HTTP endpoint URL, e.g. http://otel-collector:4318 (http://|https:// required; empty = export disabled)
   environment: ""                   # service.env label, e.g. "prod"/"homelab"
-  sample_rate: 0                    # trace sampling 0.0–1.0; 0 → library default
+  # sample_rate: 1.0                # trace sampling 0.0–1.0; unset = library default (100%), 0 = disabled
   log_level: "INFO"                 # TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL
-  log_format: "json"                # json|console|pretty
+  log_format: "console"             # json|console|pretty (default console; set json for structured export)
 
 # Peer self-upgrade (auto-catch-up). A lagging daemon pulls a newer *released*
 # binary from a healthy peer and re-execs, so a host that was down during a
@@ -344,5 +360,8 @@ live cluster.
 | `LITEVIRT_LOG_FORMAT` | Telemetry: log format `json`\|`console`\|`pretty`. |
 | `LITEVIRT_TELEMETRY_ENV` / `LITEVIRT_TELEMETRY_SERVICE` / `LITEVIRT_TELEMETRY_VERSION` | Telemetry: `service.env` / `service.name` / `service.version` labels. |
 | `LITEVIRT_TRACES_SAMPLE_RATE` | Telemetry: trace sample rate `0.0`–`1.0`. |
+| `LITEVIRT_OTEL_TIMEOUT` / `LITEVIRT_OTEL_RETRIES` / `LITEVIRT_OTEL_BACKOFF` | Telemetry exporter resilience (seconds / count / seconds): bound the OTLP export calls so a slow collector can't stall the daemon. Fan out to logs + traces. Off by default. |
+| `LITEVIRT_OTEL_FAIL_OPEN` | Telemetry: drop on export failure instead of blocking (`true`/`false`). Fans out to logs + traces. |
+| `LITEVIRT_OTEL_SHUTDOWN_TIMEOUT` | Telemetry: drain cap (seconds) on daemon stop; logs signal only. |
 
 See [telemetry.md](telemetry.md) for the full telemetry setup and an OpenObserve quick start.

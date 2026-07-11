@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"fmt"
+	"log/slog"
+	"math"
 	"net/netip"
 	"net/url"
 	"os"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/obs"
 )
 
 const defaultConfigPath = "/etc/litevirt/config.yaml"
@@ -51,6 +54,16 @@ type Config struct {
 	// providers the daemon should accept Login requests against. The
 	// "local" realm is always present and need not be listed.
 	Auth AuthConfig `yaml:"auth"`
+
+	// Enforcement holds the per-node kill-switches for split-brain-family
+	// capability tokens. Each is the enforcement AND kill switch: enforcement is
+	// this flag AND the token's cluster-wide capability latch, so false disables
+	// the behavior regardless of any durable latch marker (flag=false + restart is
+	// the only stand-down — never delete marker files). All default false; the
+	// build still ADVERTISES the tokens (capabilities.supported) so the cluster can
+	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
+	// forwarded-identity switches live under Auth for historical reasons.)
+	Enforcement EnforcementConfig `yaml:"enforcement"`
 
 	// BackupRepos maps a logical repo name (referenced from compose
 	// `vms.<name>.backup.repo:`) to an on-disk path the snapshot
@@ -164,9 +177,10 @@ type Config struct {
 	// DefaultWebhook seeds a catch-all webhook target without UI/CLI.
 	Notifications NotificationsConfig `yaml:"notifications,omitempty"`
 
-	// Telemetry configures structured logging + distributed tracing/metrics via
+	// Telemetry configures structured logging + distributed tracing via
 	// provide-telemetry. With no otlp_endpoint the daemon logs locally and traces
-	// are no-ops; set otlp_endpoint to export traces/metrics/logs to a collector.
+	// are no-ops; set otlp_endpoint to export logs + traces to a collector.
+	// Metrics stay on Prometheus (/metrics) — obs never exports OTLP metrics.
 	// PROVIDE_*/OTEL_* env vars override these fields.
 	Telemetry TelemetryConfig `yaml:"telemetry,omitempty"`
 
@@ -178,11 +192,11 @@ type Config struct {
 // environment contract (see internal/obs). Every field is optional; an empty
 // OTLPEndpoint leaves OTLP export off (local structured logging only).
 type TelemetryConfig struct {
-	OTLPEndpoint string  `yaml:"otlp_endpoint,omitempty"` // OTLP gRPC endpoint, e.g. "otel-collector:4317"; empty = export disabled
+	OTLPEndpoint string  `yaml:"otlp_endpoint,omitempty"` // OTLP HTTP endpoint URL, e.g. "http://otel-collector:4318"; http://|https://, no URL userinfo (use LITEVIRT_OTEL_HEADERS for auth); empty = export disabled
 	Environment  string  `yaml:"environment,omitempty"`   // deployment env label, e.g. "prod"/"homelab"
-	SampleRate   float64 `yaml:"sample_rate,omitempty"`   // trace sample rate 0.0–1.0; 0 = library default
-	LogLevel     string  `yaml:"log_level,omitempty"`     // DEBUG|INFO|WARN|ERROR (default INFO)
-	LogFormat    string  `yaml:"log_format,omitempty"`    // json|console (default json)
+	SampleRate   *float64 `yaml:"sample_rate,omitempty"`  // trace sample rate 0.0–1.0; unset = library default (100%), 0 = disabled (0%)
+	LogLevel     string  `yaml:"log_level,omitempty"`     // TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (default INFO; note WARNING, not WARN)
+	LogFormat    string  `yaml:"log_format,omitempty"`    // json|console|pretty (default console — human text; set json for structured export)
 }
 
 // ACMEConfig configures autocert for the web UI (#13). directory_url points at
@@ -251,6 +265,33 @@ type AuthConfig struct {
 	// ForwardedIdentityV1 capability active cluster-wide gate the owner-side
 	// promotion. Default false; the flag is the enforcement + kill switch.
 	ForwardedIdentity bool `yaml:"forwarded_identity,omitempty"`
+}
+
+// EnforcementConfig holds the per-node kill-switches for the split-brain-family
+// capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
+// flag is authoritative for enforcement AND recovery, so false disables the
+// behavior regardless of the durable latch. All default false.
+type EnforcementConfig struct {
+	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
+	// proof-of-power-off before the coordinator reschedules/promotes off the host
+	// (capabilities.SafeFenceDefaultV1). Best-effort-fenced hosts then need
+	// `lv host fence-confirm` (or the per-host unsafe-auto-failover opt-out label)
+	// to auto-recover.
+	SafeFenceDefault bool `yaml:"safe_fence_default,omitempty"`
+	// LWWSkewGuard: quarantine an incoming LWW row whose updated_at is >5 min into
+	// the future when the local copy is not (capabilities.LWWSkewGuardV1). Future-
+	// skew only — the backward-clock case is a separate, deferred token. Changes
+	// merge behavior, so enable fleet-uniformly.
+	LWWSkewGuard bool `yaml:"lww_skew_guard,omitempty"`
+	// VIPSelfDemote: on sustained local quorum loss, a minority node stops
+	// keepalived + releases its VIPs so it can't serve a VIP the majority may bring
+	// up (capabilities.VIPDemoteV1).
+	VIPSelfDemote bool `yaml:"vip_self_demote,omitempty"`
+	// VIPProofReclaim: the majority refuses a VIP move/claim until the prior holder
+	// is proven released (break-before-make), gating majority-side reclaim on a
+	// release/fence proof (capabilities.VIPReleaseProbeV1). Named for the behavior
+	// it gates, not the release-probe RPC (which still serves when this is off).
+	VIPProofReclaim bool `yaml:"vip_proof_reclaim,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.
@@ -357,21 +398,33 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("config image_pull_blocked_cidrs: %w", err)
 	}
 
-	// Validate telemetry now so a typo (e.g. log_level: WARN, which the exporter
-	// rejects) fails load with a clear message instead of silently degrading to
-	// local logging at daemon start. Normalizes level/format to canonical case.
-	if err := validateTelemetry(&cfg.Telemetry); err != nil {
-		return nil, fmt.Errorf("config telemetry: %w", err)
-	}
+	// Normalize the telemetry block. A bad value (typo'd log_level, wrong endpoint
+	// scheme) must NOT block boot: telemetry is fail-open by contract (see
+	// internal/obs), and a live node re-execing an in-place upgrade must not be
+	// bricked by an unrelated telemetry typo. So warn loudly and degrade the
+	// offending field to its safe default instead of failing load.
+	normalizeTelemetry(&cfg.Telemetry)
 
 	return cfg, nil
 }
 
-// validateTelemetry checks and normalizes the telemetry block. Accepted sets
-// mirror provide-telemetry's own validators (log level is WARNING, not WARN).
-func validateTelemetry(t *TelemetryConfig) error {
-	if t.SampleRate < 0 || t.SampleRate > 1 {
-		return fmt.Errorf("sample_rate %.3f out of range — must be between 0.0 and 1.0", t.SampleRate)
+// normalizeTelemetry canonicalizes the telemetry block and neutralizes invalid
+// values so a typo never blocks daemon boot (telemetry is fail-open; see
+// internal/obs). Accepted sets mirror provide-telemetry's own validators: the
+// log level is WARNING (not WARN), and the OTLP endpoint is HTTP and needs an
+// http://|https:// scheme. Each rejected value is logged and reset to the
+// library default — or, for the endpoint, cleared to disable OTLP export.
+func normalizeTelemetry(t *TelemetryConfig) {
+	// nil = unset = library default (100%); a set value including 0 (disabled) is
+	// honored. NaN must be caught explicitly: NaN<0 and NaN>1 are BOTH false, so a
+	// bare range check would let a NaN slip through unwarned. Degrade a bad value to
+	// nil (library default), not 0 — 0 is a valid "disable sampling" request.
+	if t.SampleRate != nil {
+		if r := *t.SampleRate; math.IsNaN(r) || r < 0 || r > 1 {
+			slog.Warn("config telemetry: sample_rate out of range — ignoring, using library default",
+				"sample_rate", r, "valid_range", "0.0-1.0")
+			t.SampleRate = nil
+		}
 	}
 	if t.LogLevel != "" {
 		lvl := strings.ToUpper(t.LogLevel)
@@ -379,7 +432,9 @@ func validateTelemetry(t *TelemetryConfig) error {
 		case "TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL":
 			t.LogLevel = lvl
 		default:
-			return fmt.Errorf("log_level %q invalid — use TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (note WARNING, not WARN)", t.LogLevel)
+			slog.Warn("config telemetry: invalid log_level — ignoring, using default INFO",
+				"log_level", t.LogLevel, "valid", "TRACE|DEBUG|INFO|WARNING|ERROR|CRITICAL (note WARNING, not WARN)")
+			t.LogLevel = ""
 		}
 	}
 	if t.LogFormat != "" {
@@ -388,22 +443,34 @@ func validateTelemetry(t *TelemetryConfig) error {
 		case "json", "console", "pretty":
 			t.LogFormat = f
 		default:
-			return fmt.Errorf("log_format %q invalid — use json|console|pretty", t.LogFormat)
+			slog.Warn("config telemetry: invalid log_format — ignoring, using default",
+				"log_format", t.LogFormat, "valid", "json|console|pretty")
+			t.LogFormat = ""
 		}
 	}
 	if t.OTLPEndpoint != "" {
-		u, err := url.Parse(t.OTLPEndpoint)
-		if err != nil {
-			return fmt.Errorf("otlp_endpoint %q is not a valid URL: %w", t.OTLPEndpoint, err)
-		}
-		if u.Scheme != "http" && u.Scheme != "https" {
-			return fmt.Errorf("otlp_endpoint %q must use http:// or https:// (got scheme %q)", t.OTLPEndpoint, u.Scheme)
-		}
-		if u.Host == "" {
-			return fmt.Errorf("otlp_endpoint %q must include a host:port", t.OTLPEndpoint)
+		// Redact userinfo in warn logs even when rejecting — a password in the
+		// URL must never hit journald. Auth belongs in LITEVIRT_OTEL_HEADERS.
+		logEP := obs.SafeEndpointForLog(t.OTLPEndpoint)
+		switch u, err := url.Parse(t.OTLPEndpoint); {
+		case err != nil:
+			slog.Warn("config telemetry: otlp_endpoint is not a valid URL — disabling OTLP export",
+				"otlp_endpoint", logEP, "error", err)
+			t.OTLPEndpoint = ""
+		case u.Scheme != "http" && u.Scheme != "https":
+			slog.Warn("config telemetry: otlp_endpoint must use http:// or https:// (OTLP is HTTP, not gRPC) — disabling OTLP export",
+				"otlp_endpoint", logEP, "scheme", u.Scheme)
+			t.OTLPEndpoint = ""
+		case u.Host == "":
+			slog.Warn("config telemetry: otlp_endpoint must include a host:port — disabling OTLP export",
+				"otlp_endpoint", logEP)
+			t.OTLPEndpoint = ""
+		case u.User != nil:
+			slog.Warn("config telemetry: otlp_endpoint must not embed credentials (userinfo) — use LITEVIRT_OTEL_HEADERS; disabling OTLP export",
+				"otlp_endpoint", logEP)
+			t.OTLPEndpoint = ""
 		}
 	}
-	return nil
 }
 
 // ImagePullBlockedPrefixes resolves the image-pull deny config (explicit CIDRs +

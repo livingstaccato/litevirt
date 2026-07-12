@@ -74,3 +74,6 @@ tmp/
 # Claude Code local config / agents / skills / settings — never published
 .claude/
 CLAUDE.local.md
+
+# Isolated local feature worktrees.
+.worktrees/

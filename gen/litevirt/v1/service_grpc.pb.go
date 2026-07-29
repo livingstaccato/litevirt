@@ -243,6 +243,7 @@ const (
 	LiteVirt_GetProjectQuota_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectQuota"
 	LiteVirt_GetProjectUsage_FullMethodName            = "/litevirt.v1.LiteVirt/GetProjectUsage"
 	LiteVirt_ExecuteCreateVM_FullMethodName            = "/litevirt.v1.LiteVirt/ExecuteCreateVM"
+	LiteVirt_ClaimProjectReservation_FullMethodName    = "/litevirt.v1.LiteVirt/ClaimProjectReservation"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -576,6 +577,7 @@ type LiteVirtClient interface {
 	GetProjectUsage(ctx context.Context, in *GetProjectUsageRequest, opts ...grpc.CallOption) (*ProjectUsage, error)
 	// Internal owner-side endpoint appended for wire-order stability.
 	ExecuteCreateVM(ctx context.Context, in *ExecuteCreateVMRequest, opts ...grpc.CallOption) (*VM, error)
+	ClaimProjectReservation(ctx context.Context, in *ClaimProjectReservationRequest, opts ...grpc.CallOption) (*Operation, error)
 }
 
 type liteVirtClient struct {
@@ -3062,6 +3064,16 @@ func (c *liteVirtClient) ExecuteCreateVM(ctx context.Context, in *ExecuteCreateV
 	return out, nil
 }
 
+func (c *liteVirtClient) ClaimProjectReservation(ctx context.Context, in *ClaimProjectReservationRequest, opts ...grpc.CallOption) (*Operation, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Operation)
+	err := c.cc.Invoke(ctx, LiteVirt_ClaimProjectReservation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -3393,6 +3405,7 @@ type LiteVirtServer interface {
 	GetProjectUsage(context.Context, *GetProjectUsageRequest) (*ProjectUsage, error)
 	// Internal owner-side endpoint appended for wire-order stability.
 	ExecuteCreateVM(context.Context, *ExecuteCreateVMRequest) (*VM, error)
+	ClaimProjectReservation(context.Context, *ClaimProjectReservationRequest) (*Operation, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -4071,6 +4084,9 @@ func (UnimplementedLiteVirtServer) GetProjectUsage(context.Context, *GetProjectU
 }
 func (UnimplementedLiteVirtServer) ExecuteCreateVM(context.Context, *ExecuteCreateVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExecuteCreateVM not implemented")
+}
+func (UnimplementedLiteVirtServer) ClaimProjectReservation(context.Context, *ClaimProjectReservationRequest) (*Operation, error) {
+	return nil, status.Error(codes.Unimplemented, "method ClaimProjectReservation not implemented")
 }
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
@@ -7829,6 +7845,24 @@ func _LiteVirt_ExecuteCreateVM_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ClaimProjectReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ClaimProjectReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ClaimProjectReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ClaimProjectReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ClaimProjectReservation(ctx, req.(*ClaimProjectReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -8591,6 +8625,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExecuteCreateVM",
 			Handler:    _LiteVirt_ExecuteCreateVM_Handler,
+		},
+		{
+			MethodName: "ClaimProjectReservation",
+			Handler:    _LiteVirt_ClaimProjectReservation_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

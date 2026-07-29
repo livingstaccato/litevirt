@@ -294,6 +294,11 @@ type Server struct {
 	// reserves). Zero value normalizes to the built-in defaults.
 	capacity corrosion.CapacityPolicy
 
+	// admission serializes positive host and project capacity claims. It is
+	// initialized lazily because many unit-test servers use struct literals.
+	admissionMu sync.Mutex
+	admission   *admissionCoordinator
+
 	// containerRuntime executes LXC ops on this host.
 	// nil = container RPCs return Unavailable. Tests inject a fake.
 	containerRuntime ContainerRuntime

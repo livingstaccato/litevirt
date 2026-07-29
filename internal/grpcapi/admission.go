@@ -2,11 +2,13 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // requireOvercommit gates the --allow-overcommit capacity bypass. Skipping the
@@ -41,10 +43,10 @@ func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, m
 
 // checkResourceAdmission verifies a proposed CPU/memory GROW (positive deltas, MiB)
 // fits BOTH the target host's free capacity AND the project's quota, counting
-// in-flight reservations from nonterminal operations — not just committed usage — so
-// two concurrent grows can't both pass and over-commit (F2). Host capacity is
-// serialized by the target-host owner (the caller holds the VM lock on the owning
-// host); project quota is checked against committed usage + reserved deltas.
+// in-flight reservations from nonterminal operations — not just committed usage.
+// It is a read-side predicate; callers that create positive claims must hold the
+// admission coordinator's host/project critical section so a passing check and
+// its durable reservation cannot race another claim.
 //
 // It returns codes.ResourceExhausted when a dimension would be exceeded, and nil for
 // a shrink/no-op (deltas ≤ 0 never need capacity). An unbounded project (no quota
@@ -112,12 +114,13 @@ func quotaWouldExceed(limit, used, reserved, delta int) bool {
 	return false
 }
 
-// ensureProjectAuthority makes sure the project has a D1 admission-authority epoch,
-// claiming the initial one (this node) if none exists. Best-effort establishment;
-// the returned authority is the current one (for recording in an operation's reserved
-// step). A concurrent claim on another node is fine — exactly one wins the guarded
-// initial claim, and this node reads the winner back.
+// ensureProjectAuthority resolves the current sticky D1 authority. When none
+// exists, every node deterministically selects the same active non-witness
+// holder; only that holder may mint epoch 1. Other nodes return the selected
+// holder so the coordinator can forward once rather than creating competing
+// local authorities.
 func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (corrosion.ProjectAuthority, error) {
+	project = tenancy.NormalizeProject(strings.TrimSpace(project))
 	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	if err != nil {
 		return corrosion.ProjectAuthority{}, err
@@ -125,7 +128,18 @@ func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (co
 	if ok {
 		return cur, nil
 	}
-	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, s.hostName); err != nil {
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return corrosion.ProjectAuthority{}, err
+	}
+	selected, err := deterministicProjectAuthority(project, hosts)
+	if err != nil {
+		return corrosion.ProjectAuthority{}, err
+	}
+	if selected != s.hostName {
+		return corrosion.ProjectAuthority{Project: project, Holder: selected}, nil
+	}
+	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, selected); err != nil {
 		return corrosion.ProjectAuthority{}, err
 	}
 	cur, _, err = corrosion.CurrentProjectAuthority(ctx, s.db, project)

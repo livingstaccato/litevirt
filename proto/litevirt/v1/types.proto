@@ -655,3 +655,24 @@ message StoragePool {
     int64  used_bytes  = 10;
     string project     = 11; // owning tenant; empty = global/shared
 }
+
+// Operation is the immutable peer-to-peer capacity-reservation header. It is
+// intentionally not exposed by REST or CLI; ClaimProjectReservation returns it
+// so an executor can verify and import exactly what the project authority
+// persisted before releasing its host admission lock.
+message Operation {
+    string id               = 1;
+    string method           = 2;
+    string project          = 3;
+    string resource_kind    = 4;
+    string resource_id      = 5;
+    string operation_kind   = 6;
+    string request_hash     = 7;
+    string idempotency_key  = 8;
+    string reservation_json = 9;
+    string desired_ref      = 10;
+    int64  owner_epoch      = 11;
+    int64  authority_epoch  = 12;
+    string authority_host   = 13;
+    string principal        = 14;
+}

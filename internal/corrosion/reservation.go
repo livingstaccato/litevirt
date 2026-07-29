@@ -188,10 +188,24 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 				return nil, err
 			}
 			if !current {
-				// The immutable header remains journal-visible, but a superseded
-				// v44 workload owner must not make it an authoritative capacity
-				// claim. Epoch-zero legacy journals retain their old behavior.
-				continue
+				key := fmt.Sprintf("%s\x00%d", id, r.Int64("vm_owner_epoch"))
+				state, _ := ReduceOperationState(kind, stepsByOpEpoch[key])
+				_, authorityExists, authorityErr := CurrentProjectAuthority(ctx, c, r.String("project"))
+				if authorityErr != nil {
+					return nil, authorityErr
+				}
+				// A current project authority mints planned+reserved BEFORE the
+				// executor imports the immutable header and creates the
+				// provisional workload row. Count that narrow pre-import state
+				// so the next authority claim sees it. Once desired_persisted is
+				// present, an absent/non-current workload means a superseded
+				// owner and must not retain capacity.
+				preImportAuthorityClaim := authorityExists &&
+					state == OpStepReserved &&
+					reservationFactsByOpEpoch[key] != ""
+				if !preImportAuthorityClaim {
+					continue
+				}
 			}
 		}
 		key := fmt.Sprintf("%s\x00%d", id, r.Int64("vm_owner_epoch"))

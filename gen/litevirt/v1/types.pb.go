@@ -5483,6 +5483,158 @@ func (x *StoragePool) GetProject() string {
 	return ""
 }
 
+// Operation is the immutable peer-to-peer capacity-reservation header. It is
+// intentionally not exposed by REST or CLI; ClaimProjectReservation returns it
+// so an executor can verify and import exactly what the project authority
+// persisted before releasing its host admission lock.
+type Operation struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Id              string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	Method          string                 `protobuf:"bytes,2,opt,name=method,proto3" json:"method,omitempty"`
+	Project         string                 `protobuf:"bytes,3,opt,name=project,proto3" json:"project,omitempty"`
+	ResourceKind    string                 `protobuf:"bytes,4,opt,name=resource_kind,json=resourceKind,proto3" json:"resource_kind,omitempty"`
+	ResourceId      string                 `protobuf:"bytes,5,opt,name=resource_id,json=resourceId,proto3" json:"resource_id,omitempty"`
+	OperationKind   string                 `protobuf:"bytes,6,opt,name=operation_kind,json=operationKind,proto3" json:"operation_kind,omitempty"`
+	RequestHash     string                 `protobuf:"bytes,7,opt,name=request_hash,json=requestHash,proto3" json:"request_hash,omitempty"`
+	IdempotencyKey  string                 `protobuf:"bytes,8,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	ReservationJson string                 `protobuf:"bytes,9,opt,name=reservation_json,json=reservationJson,proto3" json:"reservation_json,omitempty"`
+	DesiredRef      string                 `protobuf:"bytes,10,opt,name=desired_ref,json=desiredRef,proto3" json:"desired_ref,omitempty"`
+	OwnerEpoch      int64                  `protobuf:"varint,11,opt,name=owner_epoch,json=ownerEpoch,proto3" json:"owner_epoch,omitempty"`
+	AuthorityEpoch  int64                  `protobuf:"varint,12,opt,name=authority_epoch,json=authorityEpoch,proto3" json:"authority_epoch,omitempty"`
+	AuthorityHost   string                 `protobuf:"bytes,13,opt,name=authority_host,json=authorityHost,proto3" json:"authority_host,omitempty"`
+	Principal       string                 `protobuf:"bytes,14,opt,name=principal,proto3" json:"principal,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *Operation) Reset() {
+	*x = Operation{}
+	mi := &file_litevirt_v1_types_proto_msgTypes[55]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Operation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Operation) ProtoMessage() {}
+
+func (x *Operation) ProtoReflect() protoreflect.Message {
+	mi := &file_litevirt_v1_types_proto_msgTypes[55]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Operation.ProtoReflect.Descriptor instead.
+func (*Operation) Descriptor() ([]byte, []int) {
+	return file_litevirt_v1_types_proto_rawDescGZIP(), []int{55}
+}
+
+func (x *Operation) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Operation) GetMethod() string {
+	if x != nil {
+		return x.Method
+	}
+	return ""
+}
+
+func (x *Operation) GetProject() string {
+	if x != nil {
+		return x.Project
+	}
+	return ""
+}
+
+func (x *Operation) GetResourceKind() string {
+	if x != nil {
+		return x.ResourceKind
+	}
+	return ""
+}
+
+func (x *Operation) GetResourceId() string {
+	if x != nil {
+		return x.ResourceId
+	}
+	return ""
+}
+
+func (x *Operation) GetOperationKind() string {
+	if x != nil {
+		return x.OperationKind
+	}
+	return ""
+}
+
+func (x *Operation) GetRequestHash() string {
+	if x != nil {
+		return x.RequestHash
+	}
+	return ""
+}
+
+func (x *Operation) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+func (x *Operation) GetReservationJson() string {
+	if x != nil {
+		return x.ReservationJson
+	}
+	return ""
+}
+
+func (x *Operation) GetDesiredRef() string {
+	if x != nil {
+		return x.DesiredRef
+	}
+	return ""
+}
+
+func (x *Operation) GetOwnerEpoch() int64 {
+	if x != nil {
+		return x.OwnerEpoch
+	}
+	return 0
+}
+
+func (x *Operation) GetAuthorityEpoch() int64 {
+	if x != nil {
+		return x.AuthorityEpoch
+	}
+	return 0
+}
+
+func (x *Operation) GetAuthorityHost() string {
+	if x != nil {
+		return x.AuthorityHost
+	}
+	return ""
+}
+
+func (x *Operation) GetPrincipal() string {
+	if x != nil {
+		return x.Principal
+	}
+	return ""
+}
+
 var File_litevirt_v1_types_proto protoreflect.FileDescriptor
 
 const file_litevirt_v1_types_proto_rawDesc = "" +
@@ -6018,7 +6170,26 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
 	"used_bytes\x18\n" +
 	" \x01(\x03R\tusedBytes\x12\x18\n" +
-	"\aproject\x18\v \x01(\tR\aproject*\x8c\x01\n" +
+	"\aproject\x18\v \x01(\tR\aproject\"\xe1\x03\n" +
+	"\tOperation\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
+	"\x06method\x18\x02 \x01(\tR\x06method\x12\x18\n" +
+	"\aproject\x18\x03 \x01(\tR\aproject\x12#\n" +
+	"\rresource_kind\x18\x04 \x01(\tR\fresourceKind\x12\x1f\n" +
+	"\vresource_id\x18\x05 \x01(\tR\n" +
+	"resourceId\x12%\n" +
+	"\x0eoperation_kind\x18\x06 \x01(\tR\roperationKind\x12!\n" +
+	"\frequest_hash\x18\a \x01(\tR\vrequestHash\x12'\n" +
+	"\x0fidempotency_key\x18\b \x01(\tR\x0eidempotencyKey\x12)\n" +
+	"\x10reservation_json\x18\t \x01(\tR\x0freservationJson\x12\x1f\n" +
+	"\vdesired_ref\x18\n" +
+	" \x01(\tR\n" +
+	"desiredRef\x12\x1f\n" +
+	"\vowner_epoch\x18\v \x01(\x03R\n" +
+	"ownerEpoch\x12'\n" +
+	"\x0fauthority_epoch\x18\f \x01(\x03R\x0eauthorityEpoch\x12%\n" +
+	"\x0eauthority_host\x18\r \x01(\tR\rauthorityHost\x12\x1c\n" +
+	"\tprincipal\x18\x0e \x01(\tR\tprincipal*\x8c\x01\n" +
 	"\aVMState\x12\x0f\n" +
 	"\vVM_CREATING\x10\x00\x12\x0f\n" +
 	"\vVM_STARTING\x10\x01\x12\x0e\n" +
@@ -6073,7 +6244,7 @@ func file_litevirt_v1_types_proto_rawDescGZIP() []byte {
 }
 
 var file_litevirt_v1_types_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 59)
+var file_litevirt_v1_types_proto_msgTypes = make([]protoimpl.MessageInfo, 60)
 var file_litevirt_v1_types_proto_goTypes = []any{
 	(VMState)(0),                  // 0: litevirt.v1.VMState
 	(HostState)(0),                // 1: litevirt.v1.HostState
@@ -6136,11 +6307,12 @@ var file_litevirt_v1_types_proto_goTypes = []any{
 	(*Alert)(nil),                 // 58: litevirt.v1.Alert
 	(*ClusterEvent)(nil),          // 59: litevirt.v1.ClusterEvent
 	(*StoragePool)(nil),           // 60: litevirt.v1.StoragePool
-	nil,                           // 61: litevirt.v1.VMSpec.LabelsEntry
-	nil,                           // 62: litevirt.v1.PlacementSpec.RequireEntry
-	nil,                           // 63: litevirt.v1.PlacementSpec.PreferEntry
-	nil,                           // 64: litevirt.v1.Host.LabelsEntry
-	(*timestamppb.Timestamp)(nil), // 65: google.protobuf.Timestamp
+	(*Operation)(nil),             // 61: litevirt.v1.Operation
+	nil,                           // 62: litevirt.v1.VMSpec.LabelsEntry
+	nil,                           // 63: litevirt.v1.PlacementSpec.RequireEntry
+	nil,                           // 64: litevirt.v1.PlacementSpec.PreferEntry
+	nil,                           // 65: litevirt.v1.Host.LabelsEntry
+	(*timestamppb.Timestamp)(nil), // 66: google.protobuf.Timestamp
 }
 var file_litevirt_v1_types_proto_depIdxs = []int32{
 	7,  // 0: litevirt.v1.VMSpec.disks:type_name -> litevirt.v1.DiskSpec
@@ -6153,11 +6325,11 @@ var file_litevirt_v1_types_proto_depIdxs = []int32{
 	17, // 7: litevirt.v1.VMSpec.healthcheck:type_name -> litevirt.v1.HealthCheckSpec
 	18, // 8: litevirt.v1.VMSpec.hooks:type_name -> litevirt.v1.HooksSpec
 	19, // 9: litevirt.v1.VMSpec.loadbalancer:type_name -> litevirt.v1.LBSpec
-	61, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
+	62, // 10: litevirt.v1.VMSpec.labels:type_name -> litevirt.v1.VMSpec.LabelsEntry
 	24, // 11: litevirt.v1.VMSpec.devices:type_name -> litevirt.v1.DeviceSpec
 	23, // 12: litevirt.v1.VMSpec.restart:type_name -> litevirt.v1.RestartPolicy
-	62, // 13: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
-	63, // 14: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
+	63, // 13: litevirt.v1.PlacementSpec.require:type_name -> litevirt.v1.PlacementSpec.RequireEntry
+	64, // 14: litevirt.v1.PlacementSpec.prefer:type_name -> litevirt.v1.PlacementSpec.PreferEntry
 	11, // 15: litevirt.v1.PlacementSpec.rebalance:type_name -> litevirt.v1.RebalanceSpec
 	12, // 16: litevirt.v1.RebalanceSpec.budget:type_name -> litevirt.v1.RebalanceBudget
 	2,  // 17: litevirt.v1.MigrationPolicy.strategy:type_name -> litevirt.v1.MigrateStrategy
@@ -6174,31 +6346,31 @@ var file_litevirt_v1_types_proto_depIdxs = []int32{
 	0,  // 28: litevirt.v1.VM.state:type_name -> litevirt.v1.VMState
 	36, // 29: litevirt.v1.VM.interfaces:type_name -> litevirt.v1.VMInterface
 	37, // 30: litevirt.v1.VM.disks:type_name -> litevirt.v1.VMDisk
-	65, // 31: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
-	65, // 32: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
+	66, // 31: litevirt.v1.VM.created_at:type_name -> google.protobuf.Timestamp
+	66, // 32: litevirt.v1.VM.updated_at:type_name -> google.protobuf.Timestamp
 	39, // 33: litevirt.v1.HardwareDevice.disk:type_name -> litevirt.v1.HardwareDisk
 	40, // 34: litevirt.v1.HardwareDevice.nic:type_name -> litevirt.v1.HardwareNIC
 	42, // 35: litevirt.v1.HardwareDevice.pci:type_name -> litevirt.v1.HardwarePCI
 	24, // 36: litevirt.v1.HardwarePCI.desired:type_name -> litevirt.v1.DeviceSpec
 	41, // 37: litevirt.v1.HardwarePCI.members:type_name -> litevirt.v1.HardwarePCIMember
 	1,  // 38: litevirt.v1.Host.state:type_name -> litevirt.v1.HostState
-	64, // 39: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
-	65, // 40: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
-	65, // 41: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
+	65, // 39: litevirt.v1.Host.labels:type_name -> litevirt.v1.Host.LabelsEntry
+	66, // 40: litevirt.v1.Host.created_at:type_name -> google.protobuf.Timestamp
+	66, // 41: litevirt.v1.Host.updated_at:type_name -> google.protobuf.Timestamp
 	32, // 42: litevirt.v1.Host.pci_devices:type_name -> litevirt.v1.PCIDevice
 	60, // 43: litevirt.v1.Host.storage_pools:type_name -> litevirt.v1.StoragePool
-	65, // 44: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
-	65, // 45: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
-	65, // 46: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
-	65, // 47: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
-	65, // 48: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
+	66, // 44: litevirt.v1.Image.created_at:type_name -> google.protobuf.Timestamp
+	66, // 45: litevirt.v1.Snapshot.created_at:type_name -> google.protobuf.Timestamp
+	66, // 46: litevirt.v1.User.created_at:type_name -> google.protobuf.Timestamp
+	66, // 47: litevirt.v1.Token.expires_at:type_name -> google.protobuf.Timestamp
+	66, // 48: litevirt.v1.Token.created_at:type_name -> google.protobuf.Timestamp
 	49, // 49: litevirt.v1.LoadBalancer.backends:type_name -> litevirt.v1.LBBackend
 	20, // 50: litevirt.v1.LoadBalancer.ports:type_name -> litevirt.v1.LBPort
 	52, // 51: litevirt.v1.LBStatsResponse.frontends:type_name -> litevirt.v1.LBFrontendStats
 	51, // 52: litevirt.v1.LBStatsResponse.backends:type_name -> litevirt.v1.LBBackendStats
 	56, // 53: litevirt.v1.HostResourceStats.vm_stats:type_name -> litevirt.v1.VMStats
-	65, // 54: litevirt.v1.Alert.timestamp:type_name -> google.protobuf.Timestamp
-	65, // 55: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
+	66, // 54: litevirt.v1.Alert.timestamp:type_name -> google.protobuf.Timestamp
+	66, // 55: litevirt.v1.ClusterEvent.timestamp:type_name -> google.protobuf.Timestamp
 	56, // [56:56] is the sub-list for method output_type
 	56, // [56:56] is the sub-list for method input_type
 	56, // [56:56] is the sub-list for extension type_name
@@ -6222,7 +6394,7 @@ func file_litevirt_v1_types_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_litevirt_v1_types_proto_rawDesc), len(file_litevirt_v1_types_proto_rawDesc)),
 			NumEnums:      6,
-			NumMessages:   59,
+			NumMessages:   60,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

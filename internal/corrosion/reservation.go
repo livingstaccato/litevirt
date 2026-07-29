@@ -146,7 +146,8 @@ func reservationStepFacts(facts *ReservationFacts, project string) (string, erro
 // count on top of committed running-VM actuals.
 func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVector, error) {
 	orows, err := c.Query(ctx,
-		`SELECT id, project, resource_kind, resource_id, operation_kind,
+		`SELECT id, method, project, resource_kind, resource_id,
+		        operation_kind, request_hash,
 		        reservation_json, desired_ref, vm_owner_epoch
 		 FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
 	if err != nil {
@@ -177,6 +178,10 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 	}
 
 	var out []ReservationVector
+	var (
+		initialAuthorityHosts       []HostRecord
+		initialAuthorityHostsLoaded bool
+	)
 	for _, r := range orows {
 		id := r.String("id")
 		kind := OperationKind(r.String("operation_kind"))
@@ -203,6 +208,21 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 				preImportAuthorityClaim := authorityExists &&
 					state == OpStepReserved &&
 					reservationFactsByOpEpoch[key] != ""
+				if !authorityExists {
+					if !initialAuthorityHostsLoaded {
+						initialAuthorityHosts, authorityErr = ListHosts(ctx, c)
+						if authorityErr != nil {
+							return nil, authorityErr
+						}
+						initialAuthorityHostsLoaded = true
+					}
+					preImportAuthorityClaim, authorityErr = validInitialForwardedReservation(
+						r, state, reservationFactsByOpEpoch[key], initialAuthorityHosts,
+					)
+					if authorityErr != nil {
+						return nil, authorityErr
+					}
+				}
 				if !preImportAuthorityClaim {
 					continue
 				}
@@ -257,6 +277,77 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 		out = append(out, rv)
 	}
 	return out, nil
+}
+
+// validInitialForwardedReservation recognizes the narrow window where an
+// executor has imported an epoch-1 authority response but the authority row has
+// not replicated yet. It must not turn arbitrary reserved facts into capacity:
+// the complete workload header, requested project/host vectors, active executor,
+// deterministic epoch-1 holder, and reserved-only state all have to agree.
+func validInitialForwardedReservation(
+	op Row,
+	state, rawFacts string,
+	hosts []HostRecord,
+) (bool, error) {
+	if state != OpStepReserved || rawFacts == "" ||
+		op.String("id") == "" || op.String("method") == "" ||
+		op.String("request_hash") == "" || op.String("resource_id") == "" ||
+		op.String("desired_ref") == "" || op.Int64("vm_owner_epoch") <= 0 {
+		return false, nil
+	}
+	kind := OperationKind(op.String("operation_kind"))
+	if kind != OpWorkloadCreate && kind != OpWorkloadStart {
+		return false, nil
+	}
+	switch op.String("resource_kind") {
+	case "vm", "container":
+	default:
+		return false, nil
+	}
+
+	var facts ReservationFacts
+	if err := json.Unmarshal([]byte(rawFacts), &facts); err != nil {
+		return false, fmt.Errorf("reservation %s has malformed authority facts: %w",
+			op.String("id"), err)
+	}
+	project := projectOrDefault(op.String("project"))
+	if projectOrDefault(facts.Project) != project ||
+		facts.AuthorityEpoch != 1 || facts.AuthorityHost == "" {
+		return false, fmt.Errorf("reservation %s has invalid initial-authority facts",
+			op.String("id"))
+	}
+	rv, err := DecodeReservation(op.String("reservation_json"))
+	if err != nil {
+		return false, fmt.Errorf("reservation %s is malformed: %w", op.String("id"), err)
+	}
+	if rv.Project != project || rv.TargetHost == "" || rv.SourceHost != "" ||
+		(rv.TargetCPU <= 0 && rv.TargetMemMiB <= 0) ||
+		rv.ProjectCPU != rv.TargetCPU || rv.ProjectMemMiB != rv.TargetMemMiB {
+		return false, fmt.Errorf("reservation %s has invalid initial-forward binding",
+			op.String("id"))
+	}
+
+	executorActive := false
+	for _, host := range hosts {
+		if host.Name == rv.TargetHost && host.State == "active" && !host.IsWitness() {
+			executorActive = true
+			break
+		}
+	}
+	if !executorActive {
+		return false, fmt.Errorf("reservation %s executor %q is not an active worker",
+			op.String("id"), rv.TargetHost)
+	}
+	selected, err := DeterministicInitialProjectAuthority(project, hosts)
+	if err != nil {
+		return false, err
+	}
+	if facts.AuthorityHost != selected {
+		return false, fmt.Errorf(
+			"reservation %s initial authority %q does not match deterministic holder %q",
+			op.String("id"), facts.AuthorityHost, selected)
+	}
+	return true, nil
 }
 
 func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, resourceKind, resourceID, desiredRef string, ownerEpoch int64) (bool, error) {

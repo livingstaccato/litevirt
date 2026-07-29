@@ -2,9 +2,12 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 )
 
 // D1 — project-admission authority. Project quota is a HARD admission guarantee, so
@@ -27,6 +30,35 @@ type ProjectAuthority struct {
 	Holder        string
 	TransferKind  string // initial | planned | fenced
 	FenceProofRef string
+}
+
+// DeterministicInitialProjectAuthority selects the sole host allowed to mint a
+// project's epoch 1 authority. Membership is canonicalized so every node with
+// the same active worker set reaches the same answer regardless of row order.
+func DeterministicInitialProjectAuthority(project string, hosts []HostRecord) (string, error) {
+	project = projectOrDefault(strings.TrimSpace(project))
+	eligible := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		if host.State == "active" && !host.IsWitness() && host.Name != "" {
+			eligible = append(eligible, host.Name)
+		}
+	}
+	sort.Strings(eligible)
+	unique := eligible[:0]
+	for _, name := range eligible {
+		if len(unique) == 0 || unique[len(unique)-1] != name {
+			unique = append(unique, name)
+		}
+	}
+	if len(unique) == 0 {
+		return "", fmt.Errorf("no active non-witness host can hold project authority")
+	}
+	sum := sha256.Sum256([]byte(project))
+	var n uint64
+	for _, b := range sum[:8] {
+		n = n<<8 | uint64(b)
+	}
+	return unique[n%uint64(len(unique))], nil
 }
 
 // CurrentProjectAuthority returns the highest live authority epoch for a project,

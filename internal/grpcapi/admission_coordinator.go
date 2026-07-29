@@ -2,12 +2,10 @@ package grpcapi
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -636,28 +634,5 @@ func authorityStatusError(err error) error {
 }
 
 func deterministicProjectAuthority(project string, hosts []corrosion.HostRecord) (string, error) {
-	project = tenancy.NormalizeProject(strings.TrimSpace(project))
-	eligible := make([]string, 0, len(hosts))
-	for _, host := range hosts {
-		if host.State == "active" && !host.IsWitness() && host.Name != "" {
-			eligible = append(eligible, host.Name)
-		}
-	}
-	sort.Strings(eligible)
-	unique := eligible[:0]
-	for _, name := range eligible {
-		if len(unique) == 0 || unique[len(unique)-1] != name {
-			unique = append(unique, name)
-		}
-	}
-	eligible = unique
-	if len(eligible) == 0 {
-		return "", fmt.Errorf("no active non-witness host can hold project authority")
-	}
-	sum := sha256.Sum256([]byte(project))
-	var n uint64
-	for _, b := range sum[:8] {
-		n = n<<8 | uint64(b)
-	}
-	return eligible[n%uint64(len(eligible))], nil
+	return corrosion.DeterministicInitialProjectAuthority(project, hosts)
 }

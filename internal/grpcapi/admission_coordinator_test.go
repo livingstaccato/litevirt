@@ -426,6 +426,82 @@ func TestAdmissionCoordinatorInitialAuthorityForwardAndReplay(t *testing.T) {
 	}
 }
 
+func TestAdmissionCoordinatorInitialForwardReservationCountsBeforeAuthorityReplication(t *testing.T) {
+	nodeA := separateAdmissionServer(t, "node-a")
+	nodeB := separateAdmissionServer(t, "node-b")
+	for _, pair := range []struct {
+		s    *Server
+		host string
+	}{
+		{nodeA, "node-b"},
+		{nodeB, "node-a"},
+	} {
+		if err := corrosion.InsertHost(context.Background(), pair.s.db, corrosion.HostRecord{
+			Name: pair.host, Address: "10.0.0.2", State: "active", CPUTotal: 8, MemTotal: 8192,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	selected, err := deterministicProjectAuthority("fresh-capacity", []corrosion.HostRecord{
+		{Name: "node-a", State: "active"}, {Name: "node-b", State: "active"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor, authority := nodeA, nodeB
+	if selected == "node-a" {
+		executor, authority = nodeB, nodeA
+	}
+	executor.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &admissionPeerClient{target: authority, caller: executor.hostName}, func() {}, nil
+	}
+
+	claim := func(id, vm string) error {
+		_, err := executor.admission.Claim(context.Background(), ReservationRequest{
+			OperationID: id, RequestHash: "hash-" + id, Host: executor.hostName,
+			Project: "fresh-capacity", CPU: 4, MemMiB: 7168, ExecutorHost: executor.hostName,
+			Header: &corrosion.OperationRecord{
+				ID: id, Method: "CreateVM", Project: "fresh-capacity",
+				ResourceKind: "vm", ResourceID: vm,
+				OperationKind: string(corrosion.OpWorkloadCreate),
+				RequestHash:   "hash-" + id, IdempotencyKey: id,
+				DesiredRef: vm, VMOwnerEpoch: 1,
+			},
+		})
+		return err
+	}
+	if err := claim("first", "vm1"); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if current, ok, err := corrosion.CurrentProjectAuthority(
+		context.Background(), executor.db, "fresh-capacity",
+	); err != nil || ok {
+		t.Fatalf("executor unexpectedly has replicated authority: current=%+v ok=%t err=%v", current, ok, err)
+	}
+	cpu, mem, err := corrosion.HostReserved(context.Background(), executor.db, executor.hostName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cpu != 4 || mem != 7168 {
+		t.Fatalf("pre-authority host reservation = %d/%d, want 4/7168", cpu, mem)
+	}
+	if err := claim("second", "vm2"); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("second claim error = %v, want ResourceExhausted", err)
+	}
+	if _, err := corrosion.ClaimInitialProjectAuthority(
+		context.Background(), executor.db, "fresh-capacity", selected,
+	); err != nil {
+		t.Fatal(err)
+	}
+	cpu, mem, err = corrosion.HostReserved(context.Background(), executor.db, executor.hostName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cpu != 4 || mem != 7168 {
+		t.Fatalf("post-authority host reservation = %d/%d, want 4/7168 without double count", cpu, mem)
+	}
+}
+
 func TestAdmissionCoordinatorRejectsAuthorityRolloverBeforePersist(t *testing.T) {
 	s := admissionCoordinatorServer(t, 8, 8192)
 	s.admission.beforeProjectPersist = func() {

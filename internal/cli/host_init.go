@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"net"
@@ -10,6 +11,7 @@ import (
 	osuser "os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -574,6 +576,66 @@ func resolveHost(host string) (string, error) {
 		host, addrs)
 }
 
+// setupScriptEnv is the environment the setup script reads to write the daemon
+// config. One place, so the local and remote paths cannot disagree about it —
+// they already had, which is how the local path shipped with no advertise_address.
+func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
+	return []string{
+		"HOST_NAME=" + hostName,
+		// The address that just went into the certificate SAN. Without it the daemon
+		// auto-detects, registers with its default-route source IP — the wrong
+		// interface on a multi-homed host — and the operator has to notice and
+		// correct it, which needed a genuine RESTART, because init leaves the daemon
+		// running and `systemctl start` is then a no-op.
+		"ADVERTISE_ADDRESS=" + advertiseAddr,
+		"JOIN_PEERS=" + joinPeers,
+		"PCI_RESCAN_INTERVAL=0",
+		"PCI_UDEV_HOOK=false",
+		"SRIOV_MANAGED=false",
+		"SRIOV_MAX_VFS=8",
+		// The capability-latch model requires config uniformity: a token is
+		// advertised only while a host's enforcement.* flag is on, so a host
+		// added with a config missing the block silently weakens the cluster.
+		// A re-admitted signer with no enforcement.audit_signature wrote
+		// unsigned audit rows reported as tampering cluster-wide (2026-08-01).
+		// Base64: the remote path joins this env into one shell command line,
+		// so a multi-line YAML block must travel as a single token.
+		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcementYAMLFrom(daemonConfigPath))),
+	}
+}
+
+// enforcementYAMLFrom extracts the `enforcement:` mapping from a daemon config
+// verbatim — the key line plus every following line indented deeper. Empty on a
+// missing file or absent block: adding a host must never fail on this, and an
+// empty value makes the setup script append nothing.
+func enforcementYAMLFrom(path string) string {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	lines := strings.Split(string(raw), "\n")
+	var b strings.Builder
+	in := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "enforcement:") {
+			in = true
+			b.WriteString("enforcement:\n")
+			continue
+		}
+		if in {
+			if line == "" || (!strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t")) {
+				break
+			}
+			b.WriteString(line)
+			b.WriteString("\n")
+		}
+	}
+	if !in {
+		return ""
+	}
+	return b.String()
+}
+
 func getSetupScript() (string, error) {
 	// Try to read from embedded or local path
 	// For now, return the script inline
@@ -653,6 +715,15 @@ pci:
     managed: ${SRIOV_MANAGED:-false}
     max_vfs_per_pf: ${SRIOV_MAX_VFS:-8}
 CONF
+
+# Propagate the adding node's enforcement block: capability latches require
+# config uniformity, and a host that boots without the flags silently weakens
+# the cluster (a re-admitted signer without enforcement.audit_signature writes
+# unsigned audit rows that every node reports as tampering).
+if [ -n "${ENFORCEMENT_B64:-}" ]; then
+    echo "${ENFORCEMENT_B64}" | base64 -d >> /etc/litevirt/config.yaml
+    echo "enforcement config propagated from the adding node"
+fi
 
 # pci.udev_hook is deprecated: real-time PCI events are covered by
 # pci.rescan_interval, and the old curl-to-REST udev rule was unreliable. This

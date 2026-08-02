@@ -405,6 +405,11 @@ var capabilityMap = map[string]tableResolver{
 	}},
 	"host_labels":   {category: "content", chain: contentDefaultChain()},
 	"host_health":   {category: "content", chain: contentDefaultChain()},
+	// v48 host network intent: single-writer per row (the owning host), so an
+	// exact-instant tie already means something is wrong; the default chain
+	// settles it deterministically rather than leaving the cluster divergent,
+	// and the owning host's next render works from whatever won.
+	"host_networks": {category: "content", chain: contentDefaultChain()},
 	"images":        {category: "content", chain: contentDefaultChain()},
 	"image_hosts":   {category: "content", chain: contentDefaultChain()},
 	"stacks":        {category: "content", chain: contentOpaqueChain("spec", "compose_yaml")},

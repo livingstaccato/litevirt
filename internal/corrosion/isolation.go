@@ -205,6 +205,21 @@ func (c *Client) retireOutboundBacklog(ctx context.Context) error {
 		head, nowRFC3339(), head); err != nil {
 		return fmt.Errorf("retire outbound backlog: %w", err)
 	}
+	// Advancing the CURRENT peers' watermarks is not sufficient on its own: a
+	// peer that joins later gets a fresh watermark at 0 and would be served the
+	// pre-reseed entries that are still in the log (the pruner only removes
+	// them once its retention window has also passed). A new node is precisely
+	// the node that was not around to refuse them.
+	//
+	// So drop them outright. seq is AUTOINCREMENT, so deletion never reuses a
+	// number and peers tracking our sequence are unaffected; this is the same
+	// removal pruneMutationLog performs on its own schedule, taken immediately
+	// because a reseed has already superseded every one of these entries with
+	// state pulled from a healthy peer.
+	if err := c.execLocal(ctx,
+		`DELETE FROM mutation_log WHERE seq <= ?`, head); err != nil { // full-state-delete-ok
+		return fmt.Errorf("drop pre-reseed mutation log: %w", err)
+	}
 	return nil
 }
 

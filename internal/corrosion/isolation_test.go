@@ -152,6 +152,19 @@ func TestReseedRetiresTheOutboundBacklog(t *testing.T) {
 			"backlog would replay the moment the epoch cleared", wm, head)
 	}
 
+	// A peer that joins AFTER the reseed starts at watermark 0 — it was not
+	// around to refuse anything — so the pre-reseed entries must be gone from
+	// the log entirely, not merely watermarked past.
+	var remaining int64
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM mutation_log WHERE seq <= ?`, head).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("%d pre-reseed entries still in the log — a peer joining later would be "+
+			"served the out-of-regime backlog from watermark 0", remaining)
+	}
+
 	// And the node is not muted forever: a write made AFTER the reseed is past
 	// the retired watermark, so it still replicates.
 	if err := UpsertContainer(ctx, c, ContainerRecord{

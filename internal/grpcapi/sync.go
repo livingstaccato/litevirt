@@ -423,7 +423,11 @@ func (s *Server) requireNotIsolated(ctx context.Context, sender string) error {
 	if !s.tokenEnabled(capabilities.IsolationEpochV1) || s.gate == nil {
 		return nil
 	}
-	if active, _ := s.gate.CapabilityActiveForHealth(ctx, capabilities.IsolationEpochV1); !active {
+	// Enforced (not CapabilityActiveForHealth): this is an enforcement
+	// decision, so it takes the same latch-backed path every other gate uses.
+	// The ForHealth variant is positive-cached for the HA monitor and must not
+	// decide whether to refuse a peer.
+	if !s.gate.Enforced(ctx, capabilities.IsolationEpochV1) {
 		return nil
 	}
 	epoch, reason, err := corrosion.HostIsolation(ctx, s.db, sender)

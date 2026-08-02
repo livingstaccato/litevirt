@@ -1829,6 +1829,31 @@ message ApplyHostNetworkRequest {
 }
 message DeleteHostNetworkRequest { string host_name = 1; string name = 2; }
 
+// ── Isolation epoch / reseed (§A, schema v49) ──
+message IsolateHostRequest {
+    string name = 1;    // the host to isolate
+    string reason = 2;  // rolled_back_latch | manual | schema_forward
+}
+message HostIsolationStatus {
+    string host_name = 1;
+    int64 isolation_epoch = 2;  // 0 = not isolated
+    string isolation_reason = 3;
+}
+message ReseedHostRequest {
+    string name = 1;    // the isolated host to reseed
+    string source = 2;  // healthy peer to reseed FROM ('' = pick any healthy peer)
+    // driven_by_peer is set by the healthy peer when it forwards the request to
+    // the isolated host. Empty means an operator aimed reseed directly at the
+    // isolated node, which is refused: the epoch clear must be peer-written.
+    string driven_by_peer = 3;
+}
+message ReseedHostResponse {
+    string host_name = 1;
+    string source = 2;         // the peer the state came from
+    int64 cleared_epoch = 3;   // the isolation epoch this reseed reconciled
+    int32 tables_converged = 4;
+}
+
 service LiteVirt {
     // ── Hosts ──
     rpc ListHosts(ListHostsRequest)           returns (ListHostsResponse);
@@ -1849,6 +1874,11 @@ service LiteVirt {
     rpc PlanHostNetwork(PlanHostNetworkRequest)     returns (PlanHostNetworkResponse);
     rpc ApplyHostNetwork(ApplyHostNetworkRequest)   returns (google.protobuf.Empty);
     rpc DeleteHostNetwork(DeleteHostNetworkRequest) returns (google.protobuf.Empty);
+    // Isolation epoch (v49): isolate is written by a HEALTHY PEER about another
+    // host; reseed is forwarded to the isolated host, which pulls a full state
+    // dump from a healthy peer and clears its epoch only on verified convergence.
+    rpc IsolateHost(IsolateHostRequest)   returns (HostIsolationStatus);
+    rpc ReseedHost(ReseedHostRequest)     returns (ReseedHostResponse);
     // PublishCRL hands the cluster a CA-signed certificate revocation list, which
     // replication then carries to every node. `lv host rm` calls it after revoking
     // the removed host's certificate — revocation needs the CA private key, which

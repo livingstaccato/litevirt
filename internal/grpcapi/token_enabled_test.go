@@ -36,6 +36,7 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.enfProjectAuthority = true
 	s.enfAuditSignature = true
 	s.enfOwnerEpoch = true
+	s.enfIsolationEpoch = true
 	s.hwV2Ready.Store(true)
 
 	for _, tok := range capabilities.Supported() {

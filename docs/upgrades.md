@@ -547,3 +547,45 @@ to keep the invariants above from rotting. Run them locally with
   packaging
 - [operating-model.md](operating-model.md) — what the cluster guarantees;
   recovery playbook
+
+## Isolating and reseeding a node
+
+A node whose local state was produced **outside the cluster's current
+compatibility regime** — rolled back below a capability token the cluster had
+already latched, or isolated by an operator — must not inject that state back.
+Such a node already self-quarantines (it WAL-quarantines and stops advertising
+its capabilities), but a self-muting node is exactly the one whose
+self-assessment you cannot rely on. The isolation epoch is the other half: the
+*cluster* records the fact, so every peer refuses that node independently.
+
+```bash
+# From a HEALTHY peer — the observation must not come from the suspect.
+lv host isolate node-3 --reason rolled_back_latch
+
+lv host ls          # peers now refuse node-3's replication
+```
+
+While a host is isolated, every peer refuses its mutation pushes and will not
+merge from it via anti-entropy. State dumps and digests stay readable *by* the
+isolated node on purpose — that is how it reseeds.
+
+```bash
+lv host drain node-3        # reseed discards replicated state; never under a live VM
+lv host reseed node-3       # run from a HEALTHY peer; --source pins which one
+```
+
+Reseed discards the node's replicated state, pulls a full dump from a healthy
+peer, and **verifies convergence** before anything is cleared. Only a verified
+reseed ends the quarantine: a partial pull leaves the host isolated, because
+half a reseed is worse than none. The epoch clear is written by the healthy peer
+that drove the reseed — the isolated node's own writes are refused, so a
+self-written clear could never reach the cluster.
+
+Per-node evidence (`audit_log`, `host_health`, `clock_skew`) is exempt from the
+convergence comparison: those legitimately differ between any two healthy nodes,
+and requiring them to match would make every reseed fail.
+
+The whole regime is gated on `isolation_epoch_v1`
+(`enforcement.isolation_epoch`, default off). A pre-latch cluster behaves exactly
+as it did before this shipped, so it can be rolled out incrementally — enable the
+flag fleet-uniformly, since the token latches only under config uniformity.

@@ -41,6 +41,8 @@ func newHostCmd() *cobra.Command {
 		newHostRetireAuditKeyCmd(),
 		newHostPublishCRLCmd(),
 		newHostNetworkCmd(),
+		newHostIsolateCmd(),
+		newHostReseedCmd(),
 	)
 
 	return cmd

@@ -782,6 +782,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
 	// the fleet can never latch across a node whose generations do not exist yet.
 	svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
+	svc.SetIsolationEpochEnforce(d.cfg.Enforcement.IsolationEpoch)
 	svc.SetOwnerEpochReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

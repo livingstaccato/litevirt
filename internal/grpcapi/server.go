@@ -460,6 +460,13 @@ func (s *Server) advertisedCapabilities() []string {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
 		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
 	}
+	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
+	// a peer outright, and a node that isn't enforcing would keep accepting the
+	// isolated node's state and re-inject it — so the latch requires CONFIG
+	// uniformity, not just a uniform build.
+	if !s.enfIsolationEpoch {
+		caps = withoutCapability(caps, capabilities.IsolationEpochV1)
+	}
 	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
 	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
@@ -639,6 +646,11 @@ func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
 
 // SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
 func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
+
+// SetIsolationEpochEnforce toggles isolation_epoch_v1 advertisement (§A): with
+// it on and the token latched, this node refuses replication from a host the
+// cluster recorded as isolated.
+func (s *Server) SetIsolationEpochEnforce(on bool) { s.enfIsolationEpoch = on }
 
 // SetOwnerEpochReady wires the readiness probe consulted before advertising
 // owner_epoch_v1 (nil = never ready).

@@ -37,6 +37,22 @@ func TestReseedDigestsConverged(t *testing.T) {
 		t.Fatalf("mismatch should name the table: %q", mismatch)
 	}
 
+	// The invariant that failed on the lab: every table a reseed KEEPS must
+	// also be skipped by the verifier. A kept table was never replaced, so it
+	// cannot be expected to match the source — comparing one makes every
+	// reseed fail verification and leaves the node permanently quarantined.
+	for _, kept := range []string{"audit_log", "audit_signing_keys", "audit_chain_heads", "audit_key_lifecycle", "hosts"} {
+		if !corrosion.ReseedKeepsTable(kept) {
+			t.Fatalf("%s is expected to be kept by a reseed", kept)
+		}
+		if _, mismatch := reseedDigestsConverged(
+			[]corrosion.TableDigest{{Name: kept, Hash: "local"}},
+			map[string]string{kept: "source-differs"},
+		); mismatch != "" {
+			t.Fatalf("a KEPT table must never block a reseed, but %s did: %q", kept, mismatch)
+		}
+	}
+
 	// A table the source doesn't report at all (older build) is skipped, not
 	// treated as a mismatch — a benign version difference must not block a
 	// reseed the node genuinely needs.

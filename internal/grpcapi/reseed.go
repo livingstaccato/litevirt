@@ -279,7 +279,6 @@ func (s *Server) pickReseedSource(ctx context.Context, want string) (string, err
 // Everything else — the tables where an out-of-regime node could inject
 // AUTHORITY (vms, containers, hosts, networks, operations, …) — must match.
 var reseedConvergenceExempt = map[string]bool{
-	"audit_log":   true,
 	"host_health": true,
 	"clock_skew":  true,
 	// hosts: every node self-reports its OWN row (version, capacity,
@@ -319,7 +318,9 @@ func (s *Server) verifyReseedConvergence(ctx context.Context, peer pb.LiteVirtCl
 func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]string) (int, string) {
 	verified := 0
 	for _, t := range local {
-		if reseedConvergenceExempt[t.Name] {
+		// Skip what the reseed deliberately KEPT (derived from corrosion's keep
+		// set, so the two can never drift apart) plus the per-observer tables.
+		if corrosion.ReseedKeepsTable(t.Name) || reseedConvergenceExempt[t.Name] {
 			continue
 		}
 		r, ok := remote[t.Name]

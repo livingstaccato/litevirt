@@ -134,6 +134,14 @@ var reseedKeepTables = map[string]bool{
 	"hosts":               true,
 }
 
+// ReseedKeepsTable reports whether a reseed KEEPS this table's local rows. It
+// is exported because the convergence verifier must skip exactly these: a table
+// we deliberately did not replace cannot be expected to match the source, and
+// comparing it would fail every reseed. Keeping the two derived from one set is
+// the point — they drifted once (audit_signing_keys was kept but still
+// compared, and the lab caught it as a reseed that could never verify).
+func ReseedKeepsTable(name string) bool { return reseedKeepTables[name] }
+
 // DiscardReplicatedStateForReseed drops this node's replicated rows so a state
 // dump pulled from a healthy peer becomes AUTHORITATIVE rather than merely
 // merged. Without it a reseed cannot do its job: an LWW merge is additive, so

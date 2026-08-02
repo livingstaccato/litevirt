@@ -264,7 +264,13 @@ func TestRecoverRestoresACrashedApply(t *testing.T) {
 	ctx := context.Background()
 	r.upsert(t, corrosion.HostNetworkRecord{Name: "vmbr0", Kind: "bridge"})
 
-	// Simulate the crash window: journal written, new file written, no outcome.
+	// Simulate the crash window faithfully: rows had been marked applying and
+	// the journal written before the file changed — the daemon died after
+	// that, before any outcome. (Recovery deliberately rolls back only rows
+	// stuck 'applying'; rows in other states did not belong to the attempt.)
+	if err := corrosion.SetHostNetworkState(ctx, r.db, "h1", "vmbr0", corrosion.HostNetworkApplying, ""); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.ap.Journal.Write(opjournal.Entry{
 		OperationID: r.ap.journalID(), Kind: journalKind, ResourceID: "h1", Stage: "applying",
 		Artifacts: map[string]string{artPrevFile: "# previous\n", artPrevExists: "true"},
@@ -291,5 +297,38 @@ func TestRecoverRestoresACrashedApply(t *testing.T) {
 	r.sys.events = nil
 	if err := r.ap.Recover(ctx); err != nil || len(r.sys.events) != 0 {
 		t.Fatalf("idle recover must do nothing: err=%v events=%v", err, r.sys.events)
+	}
+}
+
+// A failed apply must not smear rolled_back onto rows it wasn't changing: an
+// applied neighbor's config is IN the restored file, so its row stays
+// truthfully applied. Found on the lab — a refused new bridge stamped
+// rolled_back onto an untouched, still-live one.
+func TestFailedApplyLeavesAppliedNeighborsAlone(t *testing.T) {
+	r := newRig(t)
+	ctx := context.Background()
+
+	// vmbr0 applied and live.
+	r.upsert(t, corrosion.HostNetworkRecord{Name: "vmbr0", Kind: "bridge"})
+	if err := r.ap.Apply(ctx, ""); err != nil {
+		t.Fatalf("first apply: %v", err)
+	}
+
+	// A NEW intent fails its confirm.
+	r.upsert(t, corrosion.HostNetworkRecord{Name: "vmbr1", Kind: "bridge"})
+	r.sys.confirmErr = errors.New("gateway unreachable")
+	if err := r.ap.Apply(ctx, ""); err == nil {
+		t.Fatal("expected rollback error")
+	}
+
+	if rec := r.row(t, "vmbr1"); rec.State != corrosion.HostNetworkRolledBack {
+		t.Fatalf("the changing row must be rolled_back: %q", rec.State)
+	}
+	rec := r.row(t, "vmbr0")
+	if rec.State != corrosion.HostNetworkApplied || rec.Generation != 1 {
+		t.Fatalf("the untouched applied neighbor must STAY applied: state=%q gen=%d", rec.State, rec.Generation)
+	}
+	if !strings.Contains(r.sys.file, "vmbr0:") || strings.Contains(r.sys.file, "vmbr1:") {
+		t.Fatalf("restored file must carry vmbr0 only: %q", r.sys.file)
 	}
 }

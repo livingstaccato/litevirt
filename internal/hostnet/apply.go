@@ -130,7 +130,7 @@ func (a *Applier) Plan(ctx context.Context) (*Plan, error) {
 }
 
 // Apply drives one plan to a terminal outcome. force must name the cluster
-// interface ('' = no force): a cutoff-risk plan applies only when the caller
+// interface (” = no force): a cutoff-risk plan applies only when the caller
 // explicitly wrote down which interface they are about to touch — a
 // confirmation, not a flag.
 //
@@ -174,7 +174,21 @@ func (a *Applier) Apply(ctx context.Context, force string) error {
 		return fmt.Errorf("another host network apply is in flight (or crashed and awaits recovery) — retry after it settles")
 	}
 
+	// Only the rows this apply is actually CHANGING transition through
+	// applying → applied/rolled_back: an edit resets its row to desired, so
+	// state==applied means "the previous file already carries this intent" —
+	// and the restore-on-failure brings exactly that file back, leaving those
+	// interfaces live and their rows truthfully 'applied'. (Found on the lab:
+	// a refused apply of a new bridge stamped rolled_back onto an untouched,
+	// still-live neighbor.)
+	var pending []corrosion.HostNetworkRecord
 	for _, r := range plan.Rows {
+		if r.State == corrosion.HostNetworkApplied {
+			continue
+		}
+		pending = append(pending, r)
+	}
+	for _, r := range pending {
 		if err := corrosion.SetHostNetworkState(ctx, a.DB, a.HostName, r.Name, corrosion.HostNetworkApplying, ""); err != nil {
 			return fmt.Errorf("mark %q applying: %w", r.Name, err)
 		}
@@ -191,13 +205,13 @@ func (a *Applier) Apply(ctx context.Context, force string) error {
 		},
 	}
 	if err := a.Journal.Write(entry); err != nil {
-		a.recordRollback(ctx, plan.Rows, "journal write failed: "+err.Error())
+		a.recordRollback(ctx, pending, "journal write failed: "+err.Error())
 		return fmt.Errorf("journal the apply (nothing was changed): %w", err)
 	}
 
 	if err := a.Sys.WriteManagedFile(plan.Rendered); err != nil {
 		a.restoreFile(entry)
-		a.recordRollback(ctx, plan.Rows, "write managed file: "+err.Error())
+		a.recordRollback(ctx, pending, "write managed file: "+err.Error())
 		_ = a.Journal.Remove(a.journalID())
 		return fmt.Errorf("write %s: %w", ManagedFile, err)
 	}
@@ -213,7 +227,7 @@ func (a *Applier) Apply(ctx context.Context, force string) error {
 			reason = "apply failed: " + err.Error()
 		}
 		a.restoreFile(entry)
-		a.recordRollback(ctx, plan.Rows, reason)
+		a.recordRollback(ctx, pending, reason)
 		_ = a.Journal.Remove(a.journalID())
 		if err != nil {
 			return err
@@ -255,7 +269,13 @@ func (a *Applier) Recover(ctx context.Context) error {
 	}
 	rows, err := corrosion.ListHostNetworks(ctx, a.DB, a.HostName)
 	if err == nil {
-		a.recordRollback(ctx, rows, "daemon crashed mid-apply; previous configuration restored")
+		var pending []corrosion.HostNetworkRecord
+		for _, r := range rows {
+			if r.State == corrosion.HostNetworkApplying {
+				pending = append(pending, r)
+			}
+		}
+		a.recordRollback(ctx, pending, "daemon crashed mid-apply; previous configuration restored")
 	}
 	return a.Journal.Remove(a.journalID())
 }
@@ -286,7 +306,7 @@ func (a *Applier) restoreFile(entry opjournal.Entry) {
 	_ = a.Sys.RemoveManagedFile()
 }
 
-// fileExisted reports whether ManagedFile existed at plan time: Current is ''
+// fileExisted reports whether ManagedFile existed at plan time: Current is ”
 // both for an empty file and a missing one, and the restore path must know
 // which (restore-empty vs remove).
 func fileExisted(p *Plan) bool { return p.currentExists }

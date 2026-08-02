@@ -171,7 +171,41 @@ func (c *Client) DiscardReplicatedStateForReseed(ctx context.Context) (int, erro
 		}
 		cleared++
 	}
+	if err := c.retireOutboundBacklog(ctx); err != nil {
+		return cleared, err
+	}
 	return cleared, nil
+}
+
+// retireOutboundBacklog stops this node's PRE-RESEED writes from ever reaching
+// a peer.
+//
+// This is the half that made the quarantine only a delay. A refused push does
+// not advance the per-peer watermark (by design — a transient refusal must not
+// lose entries), so while a node is isolated its out-of-regime writes pile up
+// in mutation_log. Discarding the local rows does not touch that queue, so the
+// instant a reseed cleared the epoch the whole backlog replayed onto every
+// peer — carrying its ORIGINAL timestamps, which is how the lab caught it: a
+// container the peers had refused for half an hour appeared on all of them
+// seconds after the reseed, created_at intact.
+//
+// After a reseed this node's entire state came from a healthy peer, so it has
+// nothing legitimate left to push from before that point. We advance every
+// peer watermark to the current head instead of deleting rows: the log stays
+// intact as local history (and seq numbering keeps its meaning for peers that
+// track it), while nothing before the reseed is ever selected for push again.
+func (c *Client) retireOutboundBacklog(ctx context.Context) error {
+	var head int64
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT COALESCE(MAX(seq), 0) FROM mutation_log`).Scan(&head); err != nil {
+		return fmt.Errorf("read mutation log head: %w", err)
+	}
+	if err := c.execLocal(ctx,
+		`UPDATE replication_watermarks SET last_seq = ?, updated_at = ? WHERE last_seq < ?`,
+		head, nowRFC3339(), head); err != nil {
+		return fmt.Errorf("retire outbound backlog: %w", err)
+	}
+	return nil
 }
 
 // HostIsolation reports a host's recorded isolation. A host row that is absent

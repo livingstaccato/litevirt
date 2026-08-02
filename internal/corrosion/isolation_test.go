@@ -101,3 +101,69 @@ func TestClearHostIsolationPinsTheEpoch(t *testing.T) {
 		t.Fatalf("unknown host reported isolated: %d", e)
 	}
 }
+
+// A refused push does not advance the sender's watermark (by design — a
+// transient refusal must not lose entries), so an isolated node QUEUES its
+// out-of-regime writes. If a reseed does not retire that queue, the quarantine
+// is only a DELAY: the backlog replays onto every peer the instant the epoch
+// clears. The lab caught exactly that — a container the peers had refused for
+// half an hour landed on all of them seconds after the reseed, carrying its
+// original created_at.
+func TestReseedRetiresTheOutboundBacklog(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	seedHost(t, c, "n1")
+
+	// Writes made while isolated, with a peer watermark left behind them —
+	// exactly the state a refused push leaves.
+	for i := 0; i < 3; i++ {
+		if err := UpsertContainer(ctx, c, ContainerRecord{
+			HostName: "n1", Name: "queued", State: "stopped", Image: "alpine",
+		}); err != nil {
+			t.Fatalf("queued write: %v", err)
+		}
+	}
+	var head int64
+	if err := c.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM mutation_log`).Scan(&head); err != nil {
+		t.Fatal(err)
+	}
+	if head == 0 {
+		t.Fatal("precondition: the writes must have produced a mutation-log backlog")
+	}
+	if err := c.execLocal(ctx,
+		`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)`,
+		"n2", 0, nowRFC3339()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.DiscardReplicatedStateForReseed(ctx); err != nil {
+		t.Fatalf("discard: %v", err)
+	}
+
+	// Every peer watermark now sits at the head, so nothing written before the
+	// reseed is ever selected for push again.
+	var wm int64
+	if err := c.db.QueryRowContext(ctx,
+		`SELECT last_seq FROM replication_watermarks WHERE peer_name = 'n2'`).Scan(&wm); err != nil {
+		t.Fatal(err)
+	}
+	if wm < head {
+		t.Fatalf("watermark %d is still behind the pre-reseed head %d — the out-of-regime "+
+			"backlog would replay the moment the epoch cleared", wm, head)
+	}
+
+	// And the node is not muted forever: a write made AFTER the reseed is past
+	// the retired watermark, so it still replicates.
+	if err := UpsertContainer(ctx, c, ContainerRecord{
+		HostName: "n1", Name: "after-reseed", State: "stopped", Image: "alpine",
+	}); err != nil {
+		t.Fatalf("post-reseed write: %v", err)
+	}
+	var newHead int64
+	if err := c.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq),0) FROM mutation_log`).Scan(&newHead); err != nil {
+		t.Fatal(err)
+	}
+	if newHead <= wm {
+		t.Fatalf("a post-reseed write (seq %d) must be ahead of the retired watermark %d", newHead, wm)
+	}
+}

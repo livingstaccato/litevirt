@@ -168,9 +168,15 @@ network:
 		t.Fatalf("unparseable foreign file must conflict everything, got %v", got)
 	}
 
-	// set-name definitions count: a stanza keyed by an arbitrary id whose
-	// match+set-name claims the interface (how the lab's cluster NIC is
-	// defined) conflicts just the same as a name-keyed one.
+	// Regression, lab 2026-08-02: a stanza may be keyed by an ARBITRARY id and
+	// claim the real interface via match+set-name — here the key is
+	// "clusternet" and the device is net1 — so the original key-only scan
+	// never saw "net1" and let a plan for it through, producing two netplan
+	// definitions racing on one device. The fixture is the offending lab file
+	// VERBATIM (it is only test input to a pure function — nothing reads
+	// /etc/netplan here): sanitizing the input that defeated a guard is how a
+	// regression test quietly stops reproducing the trigger. The MAC and
+	// address play no role in the property; only key ≠ set-name does.
 	got = ForeignConflicts(
 		[]corrosion.HostNetworkRecord{{Name: "net1", Kind: "ethernet"}},
 		map[string]string{"/etc/netplan/60-cluster.yaml": `

@@ -136,8 +136,11 @@ type Server struct {
 	// is the operator opt-in, readiness is "no owned workload left at epoch 0"
 	// (the health backfill reports it). Both required — the fleet must never
 	// latch across a node whose workloads are ungraduated.
-	enfOwnerEpoch   bool
-	ownerEpochReady func() bool
+	enfOwnerEpoch bool
+	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
+	// and the token latched, this node refuses replication from an isolated host.
+	enfIsolationEpoch bool
+	ownerEpochReady   func() bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -704,6 +707,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
+	case capabilities.IsolationEpochV1:
+		return s.enfIsolationEpoch
 	default:
 		return false
 	}

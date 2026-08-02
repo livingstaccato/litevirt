@@ -299,7 +299,16 @@ import (
 //	     from peers. Deliberately NOT part of the Phase 4 workload-ownership
 //	     regime — host_name in the PK is the ownership, and only that host
 //	     writes state transitions. One new table.
-const CurrentSchemaVersion = 48
+//	v49: hosts.isolation_epoch / isolation_reason — the §A isolation epoch. A
+//	     node whose local state was produced outside the cluster's current
+//	     compatibility regime (rolled back below a latched token, or isolated
+//	     by an operator) is recorded as isolated BY A HEALTHY PEER, and every
+//	     peer then refuses its replication until a verified reseed clears it.
+//	     Deliberately cluster state rather than a host-local marker: peers
+//	     cannot refuse what they cannot see, and a node that cannot be trusted
+//	     to replicate cannot be trusted to record its own quarantine. Monotone
+//	     and peer-written; 0 = not isolated. Two additive columns.
+const CurrentSchemaVersion = 49
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -702,6 +711,8 @@ var schemaDDL = []string{
 		mem_overcommit  REAL NOT NULL DEFAULT 0,
 		cpu_reserve     INTEGER NOT NULL DEFAULT -1,
 		mem_reserve_mib INTEGER NOT NULL DEFAULT -1,
+		isolation_epoch INTEGER NOT NULL DEFAULT 0,
+		isolation_reason TEXT NOT NULL DEFAULT '',
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
@@ -2317,6 +2328,13 @@ var schemaMigrations = []string{
 	`ALTER TABLE audit_log ADD COLUMN key_id TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN signature TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
+	// v49: isolation epoch (§A). CLUSTER state about a host, not host-local
+	// state — replicated so every peer independently refuses a quarantined
+	// node's replication, and so a node cannot clear its own quarantine.
+	// Monotone: only ever increases, only through the peer-written guarded
+	// writer. 0 = not isolated (the legacy-compatible default).
+	`ALTER TABLE hosts ADD COLUMN isolation_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN isolation_reason TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2403,6 +2421,7 @@ var alterVersions = []int{
 	44,     // hosts.capacity_policy_hash
 	44, 44, // notification_routes.subject_pattern/project
 	45, 45, 45, // audit_log.key_id/signature/seq
+	49, 49, // hosts.isolation_epoch/isolation_reason
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

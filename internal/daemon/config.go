@@ -398,6 +398,15 @@ type EnforcementConfig struct {
 	// ENFORCEMENT (refusing stale-row self-heal restarts) activates only after
 	// the fleet-wide latch. Enable fleet-uniformly; reversible kill switch.
 	OwnerEpoch bool `yaml:"owner_epoch,omitempty"`
+	// IsolationEpoch: activate the §A isolation regime on this host
+	// (capabilities.IsolationEpochV1). With the flag on and the token latched
+	// cluster-wide, this node REFUSES replication from any host recorded with a
+	// nonzero hosts.isolation_epoch — a node whose state was produced outside
+	// the cluster's compatibility regime (rolled back below a latched token, or
+	// isolated by an operator) can no longer inject that state back, and stays
+	// refused until `lv host reseed` verifies convergence. Pre-latch clusters
+	// behave exactly as today. Enable fleet-uniformly; reversible kill switch.
+	IsolationEpoch bool `yaml:"isolation_epoch,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

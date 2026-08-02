@@ -46,6 +46,14 @@ const (
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
 	OwnerEpochV1 = "owner_epoch_v1"
+	// IsolationEpochV1 gates the §A isolation regime: a host recorded with a
+	// nonzero hosts.isolation_epoch has its replication REFUSED by every peer
+	// until a verified reseed clears it. Gated because it can refuse a peer
+	// outright — a pre-latch cluster behaves exactly as before, so the regime
+	// rolls out incrementally, and a partition fails closed (no latch, no new
+	// refusals). Deliberately NOT a version-skew check: mixed-version rolling
+	// upgrades must keep working, so it gates on the recorded isolation fact.
+	IsolationEpochV1 = "isolation_epoch_v1"
 	// SafeFenceDefaultV1 gates the safe-fencing-default policy: once enforced
 	// cluster-wide, an UNCONFIRMED best-effort fence is no longer treated as proof
 	// of power-off — the coordinator requires an operator fence-confirm before

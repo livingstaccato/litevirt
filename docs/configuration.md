@@ -281,6 +281,20 @@ enforcement:
                               # self-heal restarts on a marker/epoch mismatch) activates only
                               # after the fleet-wide latch. Enable fleet-uniformly; the flag
                               # is the reversible kill switch.
+  isolation_epoch: false      # activate the isolation regime on this host
+                              # (isolation_epoch_v1). A node whose local state was produced
+                              # OUTSIDE the cluster's current compatibility regime — rolled
+                              # back below a capability token it had already latched, or
+                              # isolated by an operator — is recorded as isolated BY A
+                              # HEALTHY PEER in cluster state (hosts.isolation_epoch), not
+                              # by itself: a node that cannot be trusted to replicate cannot
+                              # be trusted to record its own quarantine. With the flag on and
+                              # the token latched, this node REFUSES that host's mutation
+                              # pushes and will not merge from it via anti-entropy, until
+                              # `lv host reseed` replaces its state and verifies convergence.
+                              # Deliberately not a version check — mixed-version rolling
+                              # upgrades keep working. Pre-latch clusters behave exactly as
+                              # before. Enable fleet-uniformly; reversible kill switch.
 
 # Authentication realms. The "local" realm is always present (bcrypt
 # passwords in the cluster DB) and need not be listed here. OIDC and

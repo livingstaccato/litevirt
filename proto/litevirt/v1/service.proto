@@ -1494,6 +1494,14 @@ message PingResponse {
   // drift, which corrupts LWW conflict resolution. Empty from a peer that
   // predates this field; a caller must read that as "unknown", never as skew.
   string wall_clock = 5;
+  // wal_quarantined: this node detected that its own binary is a rollback below
+  // a capability token it had ALREADY latched, so it is WAL-quarantined —
+  // emitting no replicated writes and advertising nothing. It is a SELF-REPORT
+  // of degradation, which is the one direction worth trusting: a node lying
+  // about its state claims health, not quarantine. A healthy peer acts on it by
+  // recording the isolation (§A), because the quarantined node may not record
+  // its own.
+  bool wal_quarantined = 6;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.

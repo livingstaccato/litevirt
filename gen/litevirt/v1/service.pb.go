@@ -17278,9 +17278,17 @@ type PingResponse struct {
 	// answered — never the HLC. The caller compares it with its own to detect NTP
 	// drift, which corrupts LWW conflict resolution. Empty from a peer that
 	// predates this field; a caller must read that as "unknown", never as skew.
-	WallClock     string `protobuf:"bytes,5,opt,name=wall_clock,json=wallClock,proto3" json:"wall_clock,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	WallClock string `protobuf:"bytes,5,opt,name=wall_clock,json=wallClock,proto3" json:"wall_clock,omitempty"`
+	// wal_quarantined: this node detected that its own binary is a rollback below
+	// a capability token it had ALREADY latched, so it is WAL-quarantined —
+	// emitting no replicated writes and advertising nothing. It is a SELF-REPORT
+	// of degradation, which is the one direction worth trusting: a node lying
+	// about its state claims health, not quarantine. A healthy peer acts on it by
+	// recording the isolation (§A), because the quarantined node may not record
+	// its own.
+	WalQuarantined bool `protobuf:"varint,6,opt,name=wal_quarantined,json=walQuarantined,proto3" json:"wal_quarantined,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *PingResponse) Reset() {
@@ -17346,6 +17354,13 @@ func (x *PingResponse) GetWallClock() string {
 		return x.WallClock
 	}
 	return ""
+}
+
+func (x *PingResponse) GetWalQuarantined() bool {
+	if x != nil {
+		return x.WalQuarantined
+	}
+	return false
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -25493,14 +25508,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"LOCALIZING\x10\x04\x12\b\n" +
 	"\x04DONE\x10\x05\"\r\n" +
-	"\vPingRequest\"\xaf\x01\n" +
+	"\vPingRequest\"\xd8\x01\n" +
 	"\fPingResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x18\n" +
 	"\aversion\x18\x02 \x01(\tR\aversion\x12%\n" +
 	"\x0eschema_version\x18\x03 \x01(\x05R\rschemaVersion\x12\"\n" +
 	"\fcapabilities\x18\x04 \x03(\tR\fcapabilities\x12\x1d\n" +
 	"\n" +
-	"wall_clock\x18\x05 \x01(\tR\twallClock\"\x14\n" +
+	"wall_clock\x18\x05 \x01(\tR\twallClock\x12'\n" +
+	"\x0fwal_quarantined\x18\x06 \x01(\bR\x0ewalQuarantined\"\x14\n" +
 	"\x12FetchBinaryRequest\"\x85\x01\n" +
 	"\x10FetchBinaryChunk\x12\x14\n" +
 	"\x05chunk\x18\x01 \x01(\fR\x05chunk\x12\x1a\n" +

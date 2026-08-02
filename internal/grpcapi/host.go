@@ -147,6 +147,10 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// WALL clock, not the HLC: the caller uses it to detect NTP drift, and an
 		// HLC value would compare against its own wall clock as nonsense skew.
 		WallClock: time.Now().UTC().Format(time.RFC3339Nano),
+		// Self-report of degradation: see PingResponse.wal_quarantined. A peer
+		// records our isolation on the strength of this, because we cannot
+		// record it ourselves.
+		WalQuarantined: s.walQuarantinedNow(),
 	}, nil
 }
 

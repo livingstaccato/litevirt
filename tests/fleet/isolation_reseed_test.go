@@ -167,6 +167,51 @@ func ctCount(t *testing.T, n *Node, name string) int {
 	return int(rows[0].Int64("c"))
 }
 
+// The §A loop closes only if something ACTS on the shipped rollback detector: a
+// WAL-quarantined node self-mutes, but nothing else refused it, and it cannot
+// record its own quarantine. A healthy peer pings, sees the self-report, and
+// records the isolation — after which the regime takes over.
+func TestFleet_SelfReportedQuarantineBecomesAnIsolation(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	a, bad := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	isolationRegimeOn(t, c, true)
+
+	// Nothing to act on yet: a healthy peer must NOT be isolated (the control
+	// that keeps this from being "isolate everything on a timer").
+	a.Server.RecordSelfReportedIsolationForTest(ctx)
+	if epoch, _ := isolationOf(t, a, bad.Name); epoch != 0 {
+		t.Fatalf("a healthy peer must never be isolated, got epoch %d", epoch)
+	}
+
+	// Latch the token while the cluster is HEALTHY — which is the real order of
+	// events: a cluster latches, and only later does a node roll back beneath
+	// it. (A quarantined node advertises nothing, so a cluster that had not
+	// already latched could never latch afterwards.)
+	if _, err := c.PeerClient(bad, a).PushMutations(ctx, &pb.ReplicateRequest{
+		Sender: bad.Name, Entries: nil,
+	}); err != nil {
+		t.Fatalf("healthy push (to latch the token): %v", err)
+	}
+
+	// The peer now reports itself WAL-quarantined (what the shipped rollback
+	// detector does when the binary is below a token it already latched).
+	bad.Server.SetWALQuarantinedForTest(true)
+	a.Server.RecordSelfReportedIsolationForTest(ctx)
+
+	epoch, reason := isolationOf(t, a, bad.Name)
+	if epoch == 0 || reason != corrosion.IsolationRolledBackLatch {
+		t.Fatalf("the self-report must become an isolation: epoch=%d reason=%q", epoch, reason)
+	}
+
+	// And the regime takes it from there: the quarantined node's pushes are refused.
+	if _, err := c.PeerClient(bad, a).PushMutations(ctx, &pb.ReplicateRequest{
+		Sender: bad.Name, Entries: nil,
+	}); err == nil {
+		t.Fatal("the newly isolated node's pushes must be refused")
+	}
+}
+
 // A node cannot record — or clear — its own quarantine, and reseed is not a
 // general repair tool. These are the refusals that keep the regime meaningful.
 func TestFleet_IsolationRefusals(t *testing.T) {

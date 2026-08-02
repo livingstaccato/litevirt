@@ -162,6 +162,9 @@ type Server struct {
 	capHealthMu     sync.Mutex
 	capHealthLast   map[string]bool
 	capHealthCursor int
+	// isolationCursor round-robins the §A self-reported-quarantine check
+	// (one peer per HA cycle). Guarded by capHealthMu.
+	isolationCursor int
 
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability

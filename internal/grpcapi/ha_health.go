@@ -372,7 +372,14 @@ func (s *Server) observeOneSelfReportedQuarantine(ctx context.Context) {
 	}
 	var peers []string
 	for _, h := range hosts {
-		if h.Name != s.hostName && (h.State == "" || h.State == "active") {
+		// Deliberately NOT filtered to active hosts. Draining/maintenance is
+		// exactly the state an operator puts a node into BEFORE downgrading it,
+		// so an active-only filter would miss the most common way a rollback
+		// actually happens (the lab caught precisely that: a rolled-back node
+		// sat HOST_DRAINING and was never observed). Isolation is about whether
+		// a node's STATE is valid, not whether it is eligible for workloads.
+		// An unreachable or decommissioned host simply fails the ping below.
+		if h.Name != s.hostName && h.State != "decommissioned" {
 			peers = append(peers, h.Name)
 		}
 	}

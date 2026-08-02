@@ -116,6 +116,56 @@ func ClearHostIsolation(ctx context.Context, c *Client, host string, expectedEpo
 	return nil
 }
 
+// reseedKeepTables are NOT discarded by a reseed. Everything else in the
+// replicated set is, because replacing it is the entire point.
+//
+//   - the audit tables: this host's OWN signed evidence, including the record
+//     of the reseed itself. Discarding it would destroy the chain that proves
+//     what this node did while it was incompatible — the opposite of what an
+//     operator investigating an isolation needs.
+//   - hosts: carries the isolation record being reconciled and the peer
+//     addressing this node needs to keep talking to the cluster. The dump
+//     merged immediately afterwards re-establishes it from the source anyway.
+var reseedKeepTables = map[string]bool{
+	"audit_log":           true,
+	"audit_chain_heads":   true,
+	"audit_signing_keys":  true,
+	"audit_key_lifecycle": true,
+	"hosts":               true,
+}
+
+// DiscardReplicatedStateForReseed drops this node's replicated rows so a state
+// dump pulled from a healthy peer becomes AUTHORITATIVE rather than merely
+// merged. Without it a reseed cannot do its job: an LWW merge is additive, so
+// rows the isolated node produced outside the compatibility regime — the exact
+// rows the quarantine exists to contain — would survive it and be re-injected
+// the moment the epoch cleared. (Found on the lab: a reseed that only merged
+// failed its own convergence check, correctly, because the stale rows were
+// still there.)
+//
+// LOCAL ONLY (execLocal, no mutation_log rows): this must never replicate. It
+// is one node rebuilding its own view, not a cluster-wide removal — broadcasting
+// it would erase the cluster from every peer.
+//
+// Callers MUST already hold the dump they intend to merge (fetch → discard →
+// merge): the gap between discard and merge is the one moment this node has no
+// cluster state, and a fetch failure there would strand it.
+func (c *Client) DiscardReplicatedStateForReseed(ctx context.Context) (int, error) {
+	cleared := 0
+	for _, table := range tableNames {
+		if reseedKeepTables[table] {
+			continue
+		}
+		// full-state-delete-ok: a reseed replaces this node's whole view from
+		// an authoritative peer; the merge that follows repopulates it.
+		if err := c.execLocal(ctx, `DELETE FROM `+table); err != nil {
+			return cleared, fmt.Errorf("discard %s: %w", table, err)
+		}
+		cleared++
+	}
+	return cleared, nil
+}
+
 // HostIsolation reports a host's recorded isolation. A host row that is absent
 // reports NOT isolated: absence is an unknown host (a fresh peer, a removed
 // one), which the mTLS/admission layers judge on their own terms — inventing

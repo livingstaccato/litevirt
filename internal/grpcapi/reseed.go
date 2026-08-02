@@ -151,6 +151,18 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Unavailable, "pull state from %s: %v", source, err)
 	}
+	// DISCARD, then merge — with the dump already in hand. A merge alone is
+	// additive, so the rows this node produced outside the regime (precisely
+	// what the quarantine contains) would survive and be re-injected once the
+	// epoch cleared. The lab proved it: a merge-only reseed failed its own
+	// convergence check because the stale rows were still there.
+	cleared, err := s.db.DiscardReplicatedStateForReseed(ctx)
+	if err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Internal,
+			"discard local state (%d tables cleared before the failure; this node now needs a "+
+				"repeat reseed to be usable): %v", cleared, err)
+	}
 	if err := s.db.MergeStateBytesLWW(dump); err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal, "merge state from %s: %v", source, err)
@@ -270,6 +282,14 @@ var reseedConvergenceExempt = map[string]bool{
 	"audit_log":   true,
 	"host_health": true,
 	"clock_skew":  true,
+	// hosts: every node self-reports its OWN row (version, capacity,
+	// heartbeat), and an isolated node's self-updates cannot replicate to the
+	// source by construction — its pushes are refused. So the two copies can
+	// never match while it is isolated, and requiring it would make reseed
+	// impossible. The one field that carries authority here, isolation_epoch,
+	// is checked by the guarded clear itself (which pins the exact epoch), not
+	// by digest equality.
+	"hosts": true,
 }
 
 // verifyReseedConvergence compares this node against the source on the three

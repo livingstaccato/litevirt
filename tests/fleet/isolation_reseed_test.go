@@ -119,6 +119,54 @@ func TestFleet_IsolatedNodeIsRefusedByItsPeers(t *testing.T) {
 	}
 }
 
+// A reseed must DISCARD the state the isolated node produced outside the
+// regime, not merely merge the source over it. An LWW merge is additive, so a
+// merge-only reseed leaves those rows in place — they would be re-injected the
+// moment the epoch cleared, defeating the entire quarantine. (The lab caught
+// this: a merge-only reseed failed its own convergence check.)
+func TestFleet_ReseedDiscardsOutOfRegimeState(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	a, bad := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	isolationRegimeOn(t, c, true)
+
+	if _, err := c.SelfClient(a).IsolateHost(ctx, &pb.IsolateHostRequest{Name: bad.Name}); err != nil {
+		t.Fatalf("isolate: %v", err)
+	}
+	pumpMutations(t, c, a, bad)
+
+	// The isolated node writes a row the cluster never accepted — exactly the
+	// out-of-regime state a reseed exists to remove.
+	if err := corrosion.UpsertContainer(ctx, bad.DB, corrosion.ContainerRecord{
+		HostName: bad.Name, Name: "out-of-regime", State: "stopped", Image: "alpine:3.19",
+	}); err != nil {
+		t.Fatalf("stale write: %v", err)
+	}
+	if n := ctCount(t, bad, "out-of-regime"); n != 1 {
+		t.Fatalf("precondition: the stale row must exist locally, got %d", n)
+	}
+
+	if _, err := c.SelfClient(a).ReseedHost(ctx, &pb.ReseedHostRequest{
+		Name: bad.Name, Source: a.Name,
+	}); err != nil {
+		t.Fatalf("reseed: %v", err)
+	}
+	if n := ctCount(t, bad, "out-of-regime"); n != 0 {
+		t.Fatalf("the reseed left %d out-of-regime row(s) behind — they would be re-injected "+
+			"as soon as the epoch cleared", n)
+	}
+}
+
+func ctCount(t *testing.T, n *Node, name string) int {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(),
+		`SELECT COUNT(*) c FROM containers WHERE name = ?`, name)
+	if err != nil {
+		t.Fatalf("count %s on %s: %v", name, n.Name, err)
+	}
+	return int(rows[0].Int64("c"))
+}
+
 // A node cannot record — or clear — its own quarantine, and reseed is not a
 // general repair tool. These are the refusals that keep the regime meaningful.
 func TestFleet_IsolationRefusals(t *testing.T) {

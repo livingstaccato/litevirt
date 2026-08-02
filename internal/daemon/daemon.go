@@ -34,6 +34,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -847,6 +848,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else {
 		d.opJournal = j
 		svc.SetOpJournal(j) // so the device-lease path can durably record allocations
+		// Host network apply protocol (v48): the real netplan-touching System,
+		// plus crash recovery INSIDE this barrier — a half-applied netplan
+		// change is restored before any RPC or runtime loop can observe it.
+		svc.SetHostNetworkEnv(&hostnet.RealSystem{
+			AdvertiseIP: d.hostAddress(),
+			GRPCPort:    d.cfg.GRPCPort,
+		}, d.hostAddress())
+		svc.RecoverHostNetworks(ctx)
 		d.runOperationRecovery(ctx)
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}

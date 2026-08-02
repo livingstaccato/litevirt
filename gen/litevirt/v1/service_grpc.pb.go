@@ -30,6 +30,11 @@ const (
 	LiteVirt_GetHostHealth_FullMethodName              = "/litevirt.v1.LiteVirt/GetHostHealth"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
 	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
+	LiteVirt_ListHostNetworks_FullMethodName           = "/litevirt.v1.LiteVirt/ListHostNetworks"
+	LiteVirt_UpsertHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/UpsertHostNetwork"
+	LiteVirt_PlanHostNetwork_FullMethodName            = "/litevirt.v1.LiteVirt/PlanHostNetwork"
+	LiteVirt_ApplyHostNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ApplyHostNetwork"
+	LiteVirt_DeleteHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteHostNetwork"
 	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
 	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
 	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
@@ -265,6 +270,14 @@ type LiteVirtClient interface {
 	GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Host network configuration (v48): intent CRUD runs anywhere (replicated
+	// rows); Plan and Apply are forwarded to the OWNING host — they read and
+	// mutate its local netplan state.
+	ListHostNetworks(ctx context.Context, in *ListHostNetworksRequest, opts ...grpc.CallOption) (*ListHostNetworksResponse, error)
+	UpsertHostNetwork(ctx context.Context, in *UpsertHostNetworkRequest, opts ...grpc.CallOption) (*HostNetwork, error)
+	PlanHostNetwork(ctx context.Context, in *PlanHostNetworkRequest, opts ...grpc.CallOption) (*PlanHostNetworkResponse, error)
+	ApplyHostNetwork(ctx context.Context, in *ApplyHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	DeleteHostNetwork(ctx context.Context, in *DeleteHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
 	// replication then carries to every node. `lv host rm` calls it after revoking
 	// the removed host's certificate — revocation needs the CA private key, which
@@ -742,6 +755,56 @@ func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_AdmitHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListHostNetworks(ctx context.Context, in *ListHostNetworksRequest, opts ...grpc.CallOption) (*ListHostNetworksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHostNetworksResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListHostNetworks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) UpsertHostNetwork(ctx context.Context, in *UpsertHostNetworkRequest, opts ...grpc.CallOption) (*HostNetwork, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HostNetwork)
+	err := c.cc.Invoke(ctx, LiteVirt_UpsertHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PlanHostNetwork(ctx context.Context, in *PlanHostNetworkRequest, opts ...grpc.CallOption) (*PlanHostNetworkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PlanHostNetworkResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PlanHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ApplyHostNetwork(ctx context.Context, in *ApplyHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ApplyHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) DeleteHostNetwork(ctx context.Context, in *DeleteHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_DeleteHostNetwork_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3171,6 +3234,14 @@ type LiteVirtServer interface {
 	GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
 	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
+	// Host network configuration (v48): intent CRUD runs anywhere (replicated
+	// rows); Plan and Apply are forwarded to the OWNING host — they read and
+	// mutate its local netplan state.
+	ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error)
+	UpsertHostNetwork(context.Context, *UpsertHostNetworkRequest) (*HostNetwork, error)
+	PlanHostNetwork(context.Context, *PlanHostNetworkRequest) (*PlanHostNetworkResponse, error)
+	ApplyHostNetwork(context.Context, *ApplyHostNetworkRequest) (*emptypb.Empty, error)
+	DeleteHostNetwork(context.Context, *DeleteHostNetworkRequest) (*emptypb.Empty, error)
 	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
 	// replication then carries to every node. `lv host rm` calls it after revoking
 	// the removed host's certificate — revocation needs the CA private key, which
@@ -3565,6 +3636,21 @@ func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostReques
 }
 func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdmitHost not implemented")
+}
+func (UnimplementedLiteVirtServer) ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHostNetworks not implemented")
+}
+func (UnimplementedLiteVirtServer) UpsertHostNetwork(context.Context, *UpsertHostNetworkRequest) (*HostNetwork, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpsertHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) PlanHostNetwork(context.Context, *PlanHostNetworkRequest) (*PlanHostNetworkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PlanHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) ApplyHostNetwork(context.Context, *ApplyHostNetworkRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) DeleteHostNetwork(context.Context, *DeleteHostNetworkRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteHostNetwork not implemented")
 }
 func (UnimplementedLiteVirtServer) PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishCRL not implemented")
@@ -4403,6 +4489,96 @@ func _LiteVirt_AdmitHost_Handler(srv interface{}, ctx context.Context, dec func(
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).AdmitHost(ctx, req.(*AdmitHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListHostNetworks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHostNetworksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListHostNetworks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListHostNetworks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListHostNetworks(ctx, req.(*ListHostNetworksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_UpsertHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpsertHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).UpsertHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_UpsertHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).UpsertHostNetwork(ctx, req.(*UpsertHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PlanHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PlanHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PlanHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PlanHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PlanHostNetwork(ctx, req.(*PlanHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ApplyHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ApplyHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ApplyHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ApplyHostNetwork(ctx, req.(*ApplyHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_DeleteHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DeleteHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DeleteHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DeleteHostNetwork(ctx, req.(*DeleteHostNetworkRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8105,6 +8281,26 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AdmitHost",
 			Handler:    _LiteVirt_AdmitHost_Handler,
+		},
+		{
+			MethodName: "ListHostNetworks",
+			Handler:    _LiteVirt_ListHostNetworks_Handler,
+		},
+		{
+			MethodName: "UpsertHostNetwork",
+			Handler:    _LiteVirt_UpsertHostNetwork_Handler,
+		},
+		{
+			MethodName: "PlanHostNetwork",
+			Handler:    _LiteVirt_PlanHostNetwork_Handler,
+		},
+		{
+			MethodName: "ApplyHostNetwork",
+			Handler:    _LiteVirt_ApplyHostNetwork_Handler,
+		},
+		{
+			MethodName: "DeleteHostNetwork",
+			Handler:    _LiteVirt_DeleteHostNetwork_Handler,
 		},
 		{
 			MethodName: "PublishCRL",

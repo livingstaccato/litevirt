@@ -21,6 +21,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -288,6 +289,13 @@ type Server struct {
 	// in tests / when unwired (durable recovery disabled, in-memory rollback still
 	// applies).
 	opJournal *opjournal.Journal
+
+	// hostNetSys + hostNetAdvertiseIP wire the host network apply protocol
+	// (SetHostNetworkEnv): the netplan-touching System (real on a daemon, fake
+	// in fleet tests) and the address whose loss the connectivity confirm and
+	// self-cutoff guard protect. nil/'' = feature unwired, RPCs refuse.
+	hostNetSys         hostnet.System
+	hostNetAdvertiseIP string
 
 	// realmRegistry is consulted by Login to dispatch authentication
 	// to the right realm by name. Always contains "local"; OIDC/LDAP

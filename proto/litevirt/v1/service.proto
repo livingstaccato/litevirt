@@ -1788,6 +1788,47 @@ message AdmitHostRequest {
     string cert_serial = 3;
 }
 
+// ── Host network configuration (schema v48, §O Tier 1) ──
+// Declarative per-host interface intent, rendered by the OWNING host into the
+// single litevirt-managed netplan file behind a journaled apply-with-rollback.
+message HostNetwork {
+    string host_name = 1;
+    string name = 2;              // interface name (Linux rules, <=15 chars)
+    string kind = 3;              // bridge | bond | vlan | ethernet
+    repeated string members = 4;  // bond/bridge member interfaces
+    int32 vlan_id = 5;            // vlan only, 1..4094
+    string vlan_link = 6;         // vlan only
+    string addressing = 7;        // JSON: {dhcp4,dhcp6,addresses,gateway,gateway6,nameservers}
+    int32 mtu = 8;
+    string bond_mode = 9;         // bond only (default active-backup)
+    string lacp_rate = 10;        // bond only
+    string hash_policy = 11;      // bond only
+    string state = 12;            // desired | applying | applied | rolled_back
+    int64 generation = 13;        // count of CONFIRMED applies
+    string last_error = 14;
+    string created_at = 15;
+    string updated_at = 16;
+}
+message ListHostNetworksRequest { string host_name = 1; } // '' = cluster-wide
+message ListHostNetworksResponse { repeated HostNetwork networks = 1; }
+message UpsertHostNetworkRequest { HostNetwork network = 1; }
+message PlanHostNetworkRequest { string host_name = 1; }
+message PlanHostNetworkResponse {
+    string rendered = 1;          // the full desired netplan file
+    string current = 2;           // the managed file as it is on disk
+    bool no_op = 3;               // rendered == current: apply would change nothing
+    string cutoff_reason = 4;     // non-empty: apply will refuse without force_interface
+    string cluster_interface = 5; // the interface carrying the advertise address
+    map<string, string> conflicts = 6; // planned interface -> foreign netplan file defining it
+}
+message ApplyHostNetworkRequest {
+    string host_name = 1;
+    // force_interface must NAME the cluster interface to override a
+    // self-cutoff refusal — a written confirmation, not a boolean.
+    string force_interface = 2;
+}
+message DeleteHostNetworkRequest { string host_name = 1; string name = 2; }
+
 service LiteVirt {
     // ── Hosts ──
     rpc ListHosts(ListHostsRequest)           returns (ListHostsResponse);
@@ -1800,6 +1841,14 @@ service LiteVirt {
     rpc GetHostHealth(google.protobuf.Empty)   returns (HostHealthMatrix);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
     rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
+    // Host network configuration (v48): intent CRUD runs anywhere (replicated
+    // rows); Plan and Apply are forwarded to the OWNING host — they read and
+    // mutate its local netplan state.
+    rpc ListHostNetworks(ListHostNetworksRequest)   returns (ListHostNetworksResponse);
+    rpc UpsertHostNetwork(UpsertHostNetworkRequest) returns (HostNetwork);
+    rpc PlanHostNetwork(PlanHostNetworkRequest)     returns (PlanHostNetworkResponse);
+    rpc ApplyHostNetwork(ApplyHostNetworkRequest)   returns (google.protobuf.Empty);
+    rpc DeleteHostNetwork(DeleteHostNetworkRequest) returns (google.protobuf.Empty);
     // PublishCRL hands the cluster a CA-signed certificate revocation list, which
     // replication then carries to every node. `lv host rm` calls it after revoking
     // the removed host's certificate — revocation needs the CA private key, which

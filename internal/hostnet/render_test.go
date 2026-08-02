@@ -167,4 +167,23 @@ network:
 	if len(got) != 2 {
 		t.Fatalf("unparseable foreign file must conflict everything, got %v", got)
 	}
+
+	// set-name definitions count: a stanza keyed by an arbitrary id whose
+	// match+set-name claims the interface (how the lab's cluster NIC is
+	// defined) conflicts just the same as a name-keyed one.
+	got = ForeignConflicts(
+		[]corrosion.HostNetworkRecord{{Name: "net1", Kind: "ethernet"}},
+		map[string]string{"/etc/netplan/60-cluster.yaml": `
+network:
+  version: 2
+  ethernets:
+    clusternet:
+      match:
+        macaddress: "52:54:00:77:01:03"
+      set-name: net1
+      addresses: [10.77.0.13/24]
+`})
+	if got["net1"] != "/etc/netplan/60-cluster.yaml" {
+		t.Fatalf("a set-name definition must conflict: %v", got)
+	}
 }

@@ -332,5 +332,8 @@ address — is refused unless you name that interface with
 `--force-interface <iface>` (the name is shown by `plan`). Naming it is the
 confirmation that you understand you may be disconnecting the node.
 
-Removal is two-step as well: `rm` tombstones the intent, and the interface is
-actually removed by the next `apply`, which renders the file without it.
+Removal is two-step as well: `rm` tombstones the intent, and the next `apply`
+renders the file without it. Note netplan does not delete an existing virtual
+device when its definition disappears: the interface stays up (unconfigured)
+until the next reboot, or until the operator removes it with `ip link del`.
+The persistent config is gone either way — it will not return after a reboot.

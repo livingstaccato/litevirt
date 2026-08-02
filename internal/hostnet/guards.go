@@ -125,6 +125,12 @@ func ForeignConflicts(plan []corrosion.HostNetworkRecord, foreign map[string]str
 // defines, across all section types (ethernets, bonds, bridges, vlans, and
 // anything else keyed the same way — wifis, tunnels — since a definition there
 // conflicts just the same).
+//
+// BOTH the stanza key and any `set-name` value count: netplan lets a stanza be
+// keyed by an arbitrary id with match+set-name choosing the real device
+// (`clusternet: {match: …, set-name: net1}` — exactly how the lab's cluster
+// NIC is defined, which is how this gap was found: a plan for net1 slipped
+// past the key-only check and produced two definitions racing on one device).
 func netplanInterfaceNames(content string) (map[string]bool, error) {
 	var doc struct {
 		Network map[string]yaml.Node `yaml:"network"`
@@ -139,8 +145,18 @@ func netplanInterfaceNames(content string) (map[string]bool, error) {
 		}
 		// A mapping node's content alternates key, value.
 		for i := 0; i+1 < len(node.Content); i += 2 {
-			if k := node.Content[i]; k != nil && k.Value != "" {
+			k, v := node.Content[i], node.Content[i+1]
+			if k != nil && k.Value != "" {
 				names[k.Value] = true
+			}
+			if v == nil || v.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j+1 < len(v.Content); j += 2 {
+				if v.Content[j] != nil && v.Content[j].Value == "set-name" &&
+					v.Content[j+1] != nil && v.Content[j+1].Value != "" {
+					names[v.Content[j+1].Value] = true
+				}
 			}
 		}
 	}

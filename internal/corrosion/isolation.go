@@ -61,6 +61,24 @@ func IsolateHost(ctx context.Context, c *Client, observer, host, reason string) 
 		return err
 	}
 	now := c.NowTS()
+	// On the local-guard question raised by the project-authority review (#126,
+	// finding 1): the guard below is a LOCAL transaction, so two healthy peers
+	// observing the same quarantined node concurrently can both pass it and
+	// both write. That is fatal for project_authority_epochs — an immutable
+	// merge table whose PK includes the epoch, where two writers leave a
+	// permanent immutable_conflict and two holders. It is SAFE here for a
+	// reason worth stating rather than assuming: `hosts` is a plain LWW table
+	// (no customMergeTables entry), and both writers produce the same
+	// semantic fact — a nonzero epoch with the same reason — so LWW converges
+	// on a valid isolation instead of a conflict. The admission gate reads
+	// "nonzero", never a specific value.
+	//
+	// The one visible consequence is that two peers computing different epochs
+	// (different replicated views of the cluster max) converge on whichever
+	// wrote later, so a reseed that pinned the other value clears nothing and
+	// reports "a newer isolation may have been recorded — re-run it". That is
+	// the fail-safe direction and is already handled at the clear site.
+	//
 	// Guarded on NOT-ALREADY-ISOLATED. The detector runs every sweep, so an
 	// already-isolated host must keep its ORIGINAL epoch: re-stamping a fresh
 	// one on each pass would make the number meaningless (it is supposed to

@@ -204,6 +204,20 @@ func TestFleet_SelfReportedQuarantineBecomesAnIsolation(t *testing.T) {
 		t.Fatalf("the self-report must become an isolation: epoch=%d reason=%q", epoch, reason)
 	}
 
+	pumpMutations(t, c, a, bad) // the target must know its own isolation first
+
+	// A reseed must REFUSE while the node is still quarantined: replacing its
+	// state does not fix a binary that is still below the latched token, and
+	// clearing the epoch would leave only its self-assessment protecting the
+	// cluster.
+	if _, err := c.SelfClient(a).ReseedHost(ctx, &pb.ReseedHostRequest{
+		Name: bad.Name, Source: a.Name,
+	}); err == nil {
+		t.Fatal("reseed must refuse while the target is still WAL-quarantined")
+	} else if !strings.Contains(err.Error(), "Upgrade the binary first") {
+		t.Fatalf("the refusal must name the fix: %v", err)
+	}
+
 	// And the regime takes it from there: the quarantined node's pushes are refused.
 	if _, err := c.PeerClient(bad, a).PushMutations(ctx, &pb.ReplicateRequest{
 		Sender: bad.Name, Entries: nil,

@@ -117,6 +117,21 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 				"and is not a general repair tool (see `lv cluster converge`)", s.hostName)
 	}
 
+	// Refuse while THIS node is still WAL-quarantined: the binary is still below
+	// a token the cluster latched, so replacing its state changes nothing about
+	// why it was isolated — it would re-detect and re-quarantine on the next
+	// restart, and meanwhile the cleared epoch means peers stop refusing it,
+	// leaving only its own self-assessment as protection. That is precisely the
+	// judgement §A says cannot be relied on. Upgrade the binary first, then
+	// reseed. (Found on the lab: a reseed cleared the epoch on a node still
+	// running the rolled-back build.)
+	if s.walQuarantinedNow() {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%s is still WAL-quarantined: its binary remains below a capability token this "+
+				"cluster latched, so a reseed would clear the isolation without fixing its cause. "+
+				"Upgrade the binary first, then reseed", s.hostName)
+	}
+
 	// Refuse while this node owns RUNNING workloads. Discarding replicated
 	// state under a live VM is the one way this primitive could destroy
 	// something: the row that says "this VM is mine and running" would vanish

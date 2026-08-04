@@ -745,8 +745,8 @@ func TestRecreatedVMCommitRevivesTombstonedHardwareKeysLocallyAndOnReceiver(t *t
 	); err != nil || !applied {
 		t.Fatalf("old commit: applied=%v err=%v", applied, err)
 	}
-	if applied, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || !applied {
-		t.Fatalf("guarded old delete: applied=%v err=%v", applied, err)
+	if outcome, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || outcome != deleteApplied {
+		t.Fatalf("guarded old delete: outcome=%v err=%v", outcome, err)
 	}
 	newOp := createOp("op-hw-new", "vm", "vm1", "new", "", 2)
 	newVM := VMRecord{
@@ -825,8 +825,8 @@ func TestRecreatedWorkloadRejectsHigherClockOldDeleteWALAndAntiEntropy(t *testin
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if applied, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || !applied {
-			t.Fatalf("guarded old delete: applied=%v err=%v", applied, err)
+		if outcome, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || outcome != deleteApplied {
+			t.Fatalf("guarded old delete: outcome=%v err=%v", outcome, err)
 		}
 		deleteEntry := latestMutationEntry(t, source, "delayed-old-vm-delete", 1)
 		var deleteStatements []Statement
@@ -960,8 +960,8 @@ func TestRecreatedWorkloadRejectsHigherClockOldDeleteWALAndAntiEntropy(t *testin
 			t.Fatalf("old commit: applied=%v err=%v", applied, err)
 		}
 		commitEntry := latestMutationEntry(t, source, "old-ct-source", 2)
-		if applied, err := deleteContainerGuarded(ctx, source, "h1", "ct1"); err != nil || !applied {
-			t.Fatalf("guarded old delete: applied=%v err=%v", applied, err)
+		if outcome, err := deleteContainerGuarded(ctx, source, "h1", "ct1"); err != nil || outcome != deleteApplied {
+			t.Fatalf("guarded old delete: outcome=%v err=%v", outcome, err)
 		}
 		deleteEntry := latestMutationEntry(t, source, "delayed-old-ct-delete", 1)
 		var deleteStatements []Statement
@@ -1825,8 +1825,8 @@ func TestReplicatedGuardedEntryRejectsReorderedBarrierAndMisbinding(t *testing.T
 		assertNoCreateTerminalSteps(t, receiver, rollbackOp.ID, 1)
 	})
 	t.Run("delete cleanup sequence is required", func(t *testing.T) {
-		if applied, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || !applied {
-			t.Fatalf("guarded delete: applied=%v err=%v", applied, err)
+		if outcome, err := deleteVMGuarded(ctx, source, "vm1"); err != nil || outcome != deleteApplied {
+			t.Fatalf("guarded delete: outcome=%v err=%v", outcome, err)
 		}
 		deleteEntry := latestMutationEntry(t, source, "entry-delete-source", 3)
 		var stmts []Statement
@@ -3135,7 +3135,11 @@ func TestAntiEntropyEqualAuthorityTombstoneRequiresExactIdentity(t *testing.T) {
 	})
 }
 
-func TestOrdinaryWorkloadWritersRetainV43WireShapes(t *testing.T) {
+// TestOrdinaryWorkloadWriterWireShapes pins which shapes the ordinary (non-
+// operation) workload writers put on the wire: INSERT stays on the v43
+// pre-authority shape for rolling upgrades, DELETE carries authority because a
+// terminal fact must not ship on a shape a receiver can silently ignore.
+func TestOrdinaryWorkloadWriterWireShapes(t *testing.T) {
 	ctx := context.Background()
 	decodeLatest := func(t *testing.T, c *Client) []Statement {
 		t.Helper()
@@ -3183,17 +3187,26 @@ func TestOrdinaryWorkloadWritersRetainV43WireShapes(t *testing.T) {
 		if !found {
 			t.Fatal("ordinary VM insert entry has no VM parent")
 		}
+		// DELETE is the deliberate exception (2026-08-02): it emits the
+		// AUTHORITY-BEARING tombstone. The pre-authority shape is admitted by a
+		// receiver only while its own row has zero authority, so once epochs
+		// exist it is silently dropped and the workload survives on every peer.
+		// A terminal fact cannot ship on a shape that can be silently ignored.
+		// Insert stays on the v43 shape — only deletion changed.
 		if err := DeleteVM(ctx, c, "vm1"); err != nil {
 			t.Fatal(err)
 		}
 		deleted := decodeLatest(t, c)
-		assertUnguarded(t, deleted)
-		parent, _, err := parseResolved(deleted[0].SQL)
+		parent, _, err := parseResolved(deleted[len(deleted)-1].SQL)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if stmtFingerprint(parent) != mustStatementFingerprint(legacyVMDeleteSQL) {
-			t.Fatalf("ordinary VM delete emitted non-v43 parent: %s", deleted[0].SQL)
+		if stmtFingerprint(parent) != mustStatementFingerprint(vmDeleteSQL) {
+			t.Fatalf("ordinary VM delete must emit the authority-bearing parent, got: %s",
+				deleted[len(deleted)-1].SQL)
+		}
+		if deleted[len(deleted)-1].Guard == nil {
+			t.Fatal("the authority-bearing VM delete must travel with its guard")
 		}
 	})
 
@@ -3216,17 +3229,22 @@ func TestOrdinaryWorkloadWritersRetainV43WireShapes(t *testing.T) {
 				t.Errorf("ordinary container insert emitted v44 column %s", forbidden)
 			}
 		}
+		// See the VM case: deletion deliberately moved to the authority-bearing
+		// shape; insert did not.
 		if err := DeleteContainer(ctx, c, "h1", "ct1"); err != nil {
 			t.Fatal(err)
 		}
 		deleted := decodeLatest(t, c)
-		assertUnguarded(t, deleted)
-		parent, _, err := parseResolved(deleted[0].SQL)
+		parent, _, err := parseResolved(deleted[len(deleted)-1].SQL)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if stmtFingerprint(parent) != mustStatementFingerprint(legacyContainerDeleteSQL) {
-			t.Fatalf("ordinary container delete emitted non-v43 parent: %s", deleted[0].SQL)
+		if stmtFingerprint(parent) != mustStatementFingerprint(containerDeleteSQL) {
+			t.Fatalf("ordinary container delete must emit the authority-bearing parent, got: %s",
+				deleted[len(deleted)-1].SQL)
+		}
+		if deleted[len(deleted)-1].Guard == nil {
+			t.Fatal("the authority-bearing container delete must travel with its guard")
 		}
 	})
 }
@@ -3277,8 +3295,8 @@ func TestGuardedSemanticWorkloadClockNeverRegresses(t *testing.T) {
 							t.Fatalf("rollback: applied=%v err=%v", applied, err)
 						}
 					case "delete":
-						if applied, err := deleteVMGuarded(ctx, source, vm.Name); err != nil || !applied {
-							t.Fatalf("delete: applied=%v err=%v", applied, err)
+						if outcome, err := deleteVMGuarded(ctx, source, vm.Name); err != nil || outcome != deleteApplied {
+							t.Fatalf("delete: outcome=%v err=%v", outcome, err)
 						}
 					}
 					terminal = latestMutationEntry(t, source, "clock-terminal", 3)
@@ -3319,8 +3337,8 @@ func TestGuardedSemanticWorkloadClockNeverRegresses(t *testing.T) {
 							t.Fatalf("rollback: applied=%v err=%v", applied, err)
 						}
 					case "delete":
-						if applied, err := deleteContainerGuarded(ctx, source, "h1", ct.Name); err != nil || !applied {
-							t.Fatalf("delete: applied=%v err=%v", applied, err)
+						if outcome, err := deleteContainerGuarded(ctx, source, "h1", ct.Name); err != nil || outcome != deleteApplied {
+							t.Fatalf("delete: outcome=%v err=%v", outcome, err)
 						}
 					}
 					terminal = latestMutationEntry(t, source, "clock-terminal", 3)

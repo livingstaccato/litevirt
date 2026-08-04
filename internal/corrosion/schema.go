@@ -289,7 +289,26 @@ import (
 //	     replicate in the clear because a CRL is signed by the cluster CA — a peer
 //	     can write the row but cannot forge one that verifies, and every reader
 //	     checks the signature before installing it. One new table.
-const CurrentSchemaVersion = 47
+//	v48: host_networks — declarative host network intent (§O Tier 1: bridges,
+//	     bonds, VLAN interfaces, physical-NIC addressing). One row per named
+//	     interface per host; ONLY the owning host renders its rows into
+//	     /etc/netplan/90-litevirt.yaml behind the journaled apply-with-rollback
+//	     protocol. Replicated (unlike host_fw_intent) because the intent is the
+//	     operator-facing object: the UI/CLI list every host's interfaces from
+//	     any node, and a host that lost its DB re-learns its own wiring intent
+//	     from peers. Deliberately NOT part of the Phase 4 workload-ownership
+//	     regime — host_name in the PK is the ownership, and only that host
+//	     writes state transitions. One new table.
+//	v49: hosts.isolation_epoch / isolation_reason — the §A isolation epoch. A
+//	     node whose local state was produced outside the cluster's current
+//	     compatibility regime (rolled back below a latched token, or isolated
+//	     by an operator) is recorded as isolated BY A HEALTHY PEER, and every
+//	     peer then refuses its replication until a verified reseed clears it.
+//	     Deliberately cluster state rather than a host-local marker: peers
+//	     cannot refuse what they cannot see, and a node that cannot be trusted
+//	     to replicate cannot be trusted to record its own quarantine. Monotone
+//	     and peer-written; 0 = not isolated. Two additive columns.
+const CurrentSchemaVersion = 49
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -692,6 +711,8 @@ var schemaDDL = []string{
 		mem_overcommit  REAL NOT NULL DEFAULT 0,
 		cpu_reserve     INTEGER NOT NULL DEFAULT -1,
 		mem_reserve_mib INTEGER NOT NULL DEFAULT -1,
+		isolation_epoch INTEGER NOT NULL DEFAULT 0,
+		isolation_reason TEXT NOT NULL DEFAULT '',
 		created_at   TEXT NOT NULL,
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
@@ -1655,6 +1676,33 @@ var schemaDDL = []string{
 		PRIMARY KEY (host_name, scope_key)
 	)`,
 
+	// host_networks (v48): declarative host network intent — bridges, bonds,
+	// VLAN interfaces, physical-NIC addressing (§O Tier 1). The owning host is
+	// the ONLY renderer/applier of its rows (state: desired → applying →
+	// applied | rolled_back, generation bumped per confirmed apply); other
+	// nodes read them for the UI/CLI and carry them for repair. members and
+	// addressing are JSON blobs owned by the netplan renderer.
+	`CREATE TABLE IF NOT EXISTS host_networks (
+		host_name    TEXT NOT NULL,
+		name         TEXT NOT NULL,
+		kind         TEXT NOT NULL,
+		members      TEXT NOT NULL DEFAULT '',
+		vlan_id      INTEGER NOT NULL DEFAULT 0,
+		vlan_link    TEXT NOT NULL DEFAULT '',
+		addressing   TEXT NOT NULL DEFAULT '',
+		mtu          INTEGER NOT NULL DEFAULT 0,
+		bond_mode    TEXT NOT NULL DEFAULT '',
+		lacp_rate    TEXT NOT NULL DEFAULT '',
+		hash_policy  TEXT NOT NULL DEFAULT '',
+		state        TEXT NOT NULL DEFAULT 'desired',
+		generation   INTEGER NOT NULL DEFAULT 0,
+		last_error   TEXT NOT NULL DEFAULT '',
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT,
+		PRIMARY KEY (host_name, name)
+	)`,
+
 	// containers cluster state. One row per LXC/OCI
 	// container; aggregated by `lv ct ls` cluster-wide. Lifecycle
 	// transitions are written by the daemon owning the container.
@@ -2001,6 +2049,7 @@ var tablePrimaryKeys = map[string][]string{
 	"clock_skew":               {"observer", "target"},
 	"crl_versions":             {"host"},
 	"cluster_crl":              {"id", "crl_pem"},
+	"host_networks":            {"host_name", "name"},
 	"leader_election":          {"key"},
 	"vm_locks":                 {"vm_name"},
 	"runtime_action_proofs":    {"id"},
@@ -2279,6 +2328,13 @@ var schemaMigrations = []string{
 	`ALTER TABLE audit_log ADD COLUMN key_id TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN signature TEXT`,
 	`ALTER TABLE audit_log ADD COLUMN seq INTEGER NOT NULL DEFAULT 0`,
+	// v49: isolation epoch (§A). CLUSTER state about a host, not host-local
+	// state — replicated so every peer independently refuses a quarantined
+	// node's replication, and so a node cannot clear its own quarantine.
+	// Monotone: only ever increases, only through the peer-written guarded
+	// writer. 0 = not isolated (the legacy-compatible default).
+	`ALTER TABLE hosts ADD COLUMN isolation_epoch INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE hosts ADD COLUMN isolation_reason TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -2365,6 +2421,7 @@ var alterVersions = []int{
 	44,     // hosts.capacity_policy_hash
 	44, 44, // notification_routes.subject_pattern/project
 	45, 45, 45, // audit_log.key_id/signature/seq
+	49, 49, // hosts.isolation_epoch/isolation_reason
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -2390,6 +2447,7 @@ var createTableUnits = []struct {
 	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
 	{46, "audit_key_lifecycle"},
 	{47, "cluster_crl"},
+	{48, "host_networks"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

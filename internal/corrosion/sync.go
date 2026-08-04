@@ -259,6 +259,10 @@ var tableNames = []string{
 	// v47 cluster CRL — a revocation list is published to be read, and a node that
 	// missed the replicated write is exactly the node that must repair from a peer.
 	"cluster_crl",
+	// v48 host network intent — operator-facing wiring config, read cluster-wide
+	// by the UI/CLI and repaired from peers if a host loses its DB. LWW-safe
+	// (PK + updated_at); the owning host is the only writer of its rows.
+	"host_networks",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

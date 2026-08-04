@@ -46,6 +46,14 @@ const (
 	FenceEpochV1 = "fence_epoch_v1"
 	// OwnerEpochV1 gates Phase-5 enforcement, advertised only after Phase-4 backfill.
 	OwnerEpochV1 = "owner_epoch_v1"
+	// IsolationEpochV1 gates the §A isolation regime: a host recorded with a
+	// nonzero hosts.isolation_epoch has its replication REFUSED by every peer
+	// until a verified reseed clears it. Gated because it can refuse a peer
+	// outright — a pre-latch cluster behaves exactly as before, so the regime
+	// rolls out incrementally, and a partition fails closed (no latch, no new
+	// refusals). Deliberately NOT a version-skew check: mixed-version rolling
+	// upgrades must keep working, so it gates on the recorded isolation fact.
+	IsolationEpochV1 = "isolation_epoch_v1"
 	// SafeFenceDefaultV1 gates the safe-fencing-default policy: once enforced
 	// cluster-wide, an UNCONFIRMED best-effort fence is no longer treated as proof
 	// of power-off — the coordinator requires an operator fence-confirm before
@@ -325,12 +333,23 @@ var supported = []string{
 	HardwareV2,
 	ProjectAuthorityV1,
 	AuditSignatureV1,
+	// OwnerEpochV1 is advertised CONDITIONALLY: enforcement.owner_epoch on AND
+	// the node.s backfill readiness (no owned workload at epoch 0) — see the
+	// grpcapi advertisement filter.
+	OwnerEpochV1,
+	// IsolationEpochV1 is advertised CONDITIONALLY on enforcement.isolation_epoch,
+	// like OperationProtocolV1: the regime REFUSES a peer's replication, so the
+	// fleet-wide latch must require CONFIG uniformity — a node that isn't
+	// enforcing would keep accepting the isolated node's state and re-inject it,
+	// defeating the quarantine. Withholding advertisement while the flag is off
+	// keeps the cluster from latching until every node has opted in.
+	IsolationEpochV1,
 }
 
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -129,6 +130,15 @@ type Server struct {
 	// which are exactly what a forgery looks like, so the latch must require config
 	// uniformity.
 	enfAuditSignature bool
+	// enfOwnerEpoch + ownerEpochReady gate owner_epoch_v1 advertisement: the flag
+	// is the operator opt-in, readiness is "no owned workload left at epoch 0"
+	// (the health backfill reports it). Both required — the fleet must never
+	// latch across a node whose workloads are ungraduated.
+	enfOwnerEpoch bool
+	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
+	// and the token latched, this node refuses replication from an isolated host.
+	enfIsolationEpoch bool
+	ownerEpochReady   func() bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -150,6 +160,9 @@ type Server struct {
 	capHealthMu     sync.Mutex
 	capHealthLast   map[string]bool
 	capHealthCursor int
+	// isolationCursor round-robins the §A self-reported-quarantine check
+	// (one peer per HA cycle). Guarded by capHealthMu.
+	isolationCursor int
 
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability
@@ -280,6 +293,13 @@ type Server struct {
 	// in tests / when unwired (durable recovery disabled, in-memory rollback still
 	// applies).
 	opJournal *opjournal.Journal
+
+	// hostNetSys + hostNetAdvertiseIP wire the host network apply protocol
+	// (SetHostNetworkEnv): the netplan-touching System (real on a daemon, fake
+	// in fleet tests) and the address whose loss the connectivity confirm and
+	// self-cutoff guard protect. nil/'' = feature unwired, RPCs refuse.
+	hostNetSys         hostnet.System
+	hostNetAdvertiseIP string
 
 	// realmRegistry is consulted by Login to dispatch authentication
 	// to the right realm by name. Always contains "local"; OIDC/LDAP
@@ -441,6 +461,13 @@ func (s *Server) advertisedCapabilities() []string {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
 		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
 	}
+	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
+	// a peer outright, and a node that isn't enforcing would keep accepting the
+	// isolated node's state and re-inject it — so the latch requires CONFIG
+	// uniformity, not just a uniform build.
+	if !s.enfIsolationEpoch {
+		caps = withoutCapability(caps, capabilities.IsolationEpochV1)
+	}
 	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
 	// require CONFIG uniformity, not just a uniform build. Withholding advertisement while the
@@ -475,6 +502,14 @@ func (s *Server) advertisedCapabilities() []string {
 	// data. "Advertise = this node reads correctly across the transition."
 	if !s.hardwareV2Ready() {
 		caps = withoutCapability(caps, capabilities.HardwareV2)
+	}
+	// owner_epoch_v1 (Phase 4) follows the hardware_v2 model: advertised only
+	// when the operator opted in (config uniformity, like every enforcement
+	// token) AND this node is READY — its owned workloads have all graduated
+	// out of the pre-epoch 0. Advertising earlier could latch the fleet across
+	// a node whose runtime markers and generations don.t exist yet.
+	if !s.enfOwnerEpoch || s.ownerEpochReady == nil || !s.ownerEpochReady() {
+		caps = withoutCapability(caps, capabilities.OwnerEpochV1)
 	}
 	return caps
 }
@@ -610,6 +645,18 @@ func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = o
 // advertisement is withheld while the flag is off.
 func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
 
+// SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
+func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
+
+// SetIsolationEpochEnforce toggles isolation_epoch_v1 advertisement (§A): with
+// it on and the token latched, this node refuses replication from a host the
+// cluster recorded as isolated.
+func (s *Server) SetIsolationEpochEnforce(on bool) { s.enfIsolationEpoch = on }
+
+// SetOwnerEpochReady wires the readiness probe consulted before advertising
+// owner_epoch_v1 (nil = never ready).
+func (s *Server) SetOwnerEpochReady(fn func() bool) { s.ownerEpochReady = fn }
+
 // projectAuthorityActive reports whether this node routes project-quota admissions
 // through the project's authority holder: the config flag AND the cluster-wide latch.
 // Same `flag && Enforced` model as the rest of the family.
@@ -671,6 +718,10 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfProjectAuthority
 	case capabilities.AuditSignatureV1:
 		return s.enfAuditSignature
+	case capabilities.OwnerEpochV1:
+		return s.enfOwnerEpoch
+	case capabilities.IsolationEpochV1:
+		return s.enfIsolationEpoch
 	default:
 		return false
 	}

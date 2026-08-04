@@ -966,6 +966,21 @@ func (r *Replicator) ApplyRemoteMutations(ctx context.Context, entries []*pb.Mut
 			// The retained pre-authority wire shape cannot identify a v44
 			// recreate. Skip its entire historical batch—including child
 			// tombstones—while still acknowledging the entry below.
+			//
+			// This is the site that actually fires for a complete pre-authority
+			// delete batch (the per-statement DispLegacyWorkloadDelete branch is
+			// bypassed by this continue). It was silent, which is how a dropped
+			// tombstone stayed invisible: the entry is ACKNOWLEDGED, so nothing
+			// back-pressures and the sender believes it replicated. Naming the
+			// sender is the point — the fix is to upgrade it.
+			// stmts[0] is the parent tombstone (the entry decision enforces
+			// legacyIndex == 0), so the metric can carry the real table — an
+			// operator filtering on table="containers" must see these.
+			r.client.observeMergeRejected(structuralTableLabel(stmts[0].SQL), "wal", "pre_authority_delete")
+			slog.Warn("replicator: skipped a pre-authority workload delete batch (rows kept live here)",
+				"sender", entry.Origin, "seq", entry.Seq,
+				"reason", "the pre-authority shape cannot prove the local row is the same workload it deleted",
+				"fix", "upgrade "+entry.Origin+" so it emits the authority-bearing tombstone")
 			continue
 		}
 
@@ -1233,8 +1248,22 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 
 	case DispLegacyWorkloadDelete:
 		safe, err := legacyWorkloadDeleteMatchesPreAuthority(ctx, tx, s, sh)
-		if err != nil || !safe {
+		if err != nil {
 			return err
+		}
+		if !safe {
+			// A pre-authority tombstone from a peer whose row we hold at nonzero
+			// authority. Refusing is correct — the shape carries no authority to
+			// compare — but it must never again be SILENT: this returned a bare
+			// nil for a week while a relocation's source row stayed live on every
+			// peer (lab, 2026-08-02). Nothing back-pressures and the deleter still
+			// hides the row, so this counter is the only local evidence.
+			r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", "pre_authority_delete")
+			slog.Warn("replicator: refused a pre-authority workload delete (row kept live here)",
+				"table", tableName,
+				"reason", "local row carries an ownership generation; the sender must emit the authority-bearing tombstone",
+				"sender_upgrade_required", true)
+			return nil
 		}
 		return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 

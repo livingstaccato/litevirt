@@ -34,6 +34,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -620,6 +621,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// confirm capability.
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	reconciler.SetGate(d.checker)
+	reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
@@ -666,6 +668,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Start hardware watchdog heartbeat (optional). The controller lets Phase-2 VIP
 	// self-demotion trip a self-fence when a demotion can't be confirmed.
 	watchdogCtrl := watchdog.NewController()
+	// Clean-shutdown disarm hole (§B Phase 5): only a host that owns nothing may
+	// disarm on SIGTERM. A restart re-pets inside the timeout; a stop that
+	// abandons running workloads lets the watchdog reboot the host into a safely
+	// fenced state. Probe errors count as NOT owned — the probe runs through the
+	// same clients the daemon manages workloads with, so a host that cannot
+	// answer is overwhelmingly one with no runtime at all (containers-only or
+	// fresh hosts must not reboot on every daemon stop). VIP ownership is not
+	// yet probed here — Phase 5 adds it with the quorum-gated handoff.
+	watchdogCtrl.SetOwnershipCheck(func() bool {
+		if names, err := d.virt.ListRunningDomains(); err == nil && len(names) > 0 {
+			slog.Warn("watchdog: refusing shutdown disarm — running VMs owned", "count", len(names))
+			return true
+		}
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer probeCancel()
+		if names, err := lxcRunner.ListRunning(probeCtx); err == nil && len(names) > 0 {
+			slog.Warn("watchdog: refusing shutdown disarm — running containers owned", "count", len(names))
+			return true
+		}
+		return false
+	})
 	go watchdog.Heartbeat(ctx, d.cfg.WatchdogDev, 0, watchdogCtrl)
 	// Central self-fence hard gate: once this node self-fences, the checker's Execution/
 	// DecisionGate fail closed regardless of quorum, so every gate consumer (reconciler,
@@ -755,6 +778,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetProjectAuthorityEnforce(d.cfg.Enforcement.ProjectAuthority)   // F2: delegate project-quota admission to the authority holder
 	svc.SetAuditSignatureEnforce(d.cfg.Enforcement.AuditSignature)       // drives the latch + conditional advertisement
+	// Phase 4: owner_epoch_v1 is advertised only when the operator opted in AND
+	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
+	// the fleet can never latch across a node whose generations do not exist yet.
+	svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
+	svc.SetIsolationEpochEnforce(d.cfg.Enforcement.IsolationEpoch)
+	svc.SetOwnerEpochReady(func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ok, err := corrosion.OwnerEpochBackfillComplete(ctx, d.db, d.cfg.HostName)
+		return err == nil && ok
+	})
 	// Once the whole cluster has latched audit_signature_v1, a write this node
 	// cannot sign is an error-level event rather than a normal one.
 	//
@@ -815,6 +849,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else {
 		d.opJournal = j
 		svc.SetOpJournal(j) // so the device-lease path can durably record allocations
+		// Host network apply protocol (v48): the real netplan-touching System,
+		// plus crash recovery INSIDE this barrier — a half-applied netplan
+		// change is restored before any RPC or runtime loop can observe it.
+		svc.SetHostNetworkEnv(&hostnet.RealSystem{
+			AdvertiseIP: d.hostAddress(),
+			GRPCPort:    d.cfg.GRPCPort,
+		}, d.hostAddress())
+		svc.RecoverHostNetworks(ctx)
 		d.runOperationRecovery(ctx)
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
@@ -1022,6 +1064,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// that stopped unexpectedly per its restart policy. Shares the runtime wired
 	// above; operator-stopped containers are left alone (state_detail).
 	ctChecker := health.NewContainerChecker(d.cfg.HostName, d.db, lxcRunner)
+	ctChecker.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 	ctChecker.SetEventBus(svc.EventBus())
 	// Runtime container re-key (Phase 4): corroborate a locally-running container
 	// whose only live DB row points elsewhere against every workload-capable peer

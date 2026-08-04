@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -107,6 +108,7 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 		req.Proof = &pb.RuntimeActionProof{
 			Id: newID(), Action: corrosion.ActionPromote, TargetKind: "vm",
 			TargetName: vmName, Coordinator: s.hostName, LeaseHolder: s.hostName,
+			OwnerEpoch: strconv.FormatInt(vm.OwnerEpoch, 10),
 			FenceEpoch: fenceEpoch,
 		}
 	}
@@ -777,6 +779,10 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 
 	// Persist. Takeover (same name) re-homes the existing record; a renamed
 	// promotion writes a fresh VM alongside the original.
+	// Same as create/import: the define above resolved any alias on THIS host,
+	// so persist the concrete type rather than letting the promoted VM carry an
+	// alias that a later move would re-resolve elsewhere.
+	s.pinMachineFromDomain(&spec)
 	specJSON, _ := json.Marshal(&spec)
 	if renamed {
 		rec := corrosion.VMRecord{
@@ -793,7 +799,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
 	} else {
-		if err := corrosion.UpdateVMHost(ctx, s.db, targetName, s.hostName, "running"); err != nil {
+		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
+		if err := corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running"); err != nil {
 			return status.Errorf(codes.Internal, "re-home vm record: %v", err)
 		}
 		if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, targetName, src.DiskName, s.hostName, livePath); err != nil {

@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -179,7 +178,12 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Networks: plan.specNets,
 	}
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	// CreatedAt is left empty ON PURPOSE: the corrosion writer stamps it with
+	// nanosecond precision, and that stamp is the row's INCARNATION identity —
+	// anti-entropy uses it to tell a genuine recreate from a stale pre-delete
+	// copy. Pre-filling a bare-second stamp here (as this site used to) would
+	// make a same-second delete+recreate indistinguishable from the incarnation
+	// the delete killed.
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: info.Name,
 		State: info.State, Image: chooseImage(req.Image, info.Image),
@@ -188,7 +192,6 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
 		OnHostFailure: req.OnHostFailure,
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
-		CreatedAt:     now,
 	}
 	// Write the container row + managed interface rows in ONE atomic batch. Fail
 	// closed: the runtime container exists but the DB write failed → delete the
@@ -341,7 +344,10 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	// governs start/stop): retry-safety matters for the failover/relocation paths
 	// that re-issue deletes. So an already-gone row (ErrNoRowsAffected) is a
 	// success — but audited distinctly (not a silent "ok") so an operator typo
-	// isn't invisible; only a REAL DB error surfaces as Internal.
+	// isn't invisible. A REAL DB error — or ErrDeleteContended, a row still LIVE
+	// after the guarded CAS retried (its authority kept moving) — surfaces as
+	// Internal: the runtime container is gone by this point, and OK-with-a-live-
+	// row would be exactly the ghost this tombstone is mandatory to prevent.
 	derr := corrosion.DeleteContainerStrict(ctx, s.db, s.hostName, req.Name)
 	if derr != nil && !errors.Is(derr, corrosion.ErrNoRowsAffected) {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "error")

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1753,7 +1754,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	if vm.HostName == s.hostName && state == "running" && s.virt != nil {
 		if port, err := s.virt.GetVMVNCPort(name); err == nil && port >= 0 {
 			if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
-				pbVM.VncAddress = fmt.Sprintf("vnc://%s:%d", host.Address, port)
+				pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
 			}
 		}
 	}

@@ -308,7 +308,13 @@ import (
 //	     cannot refuse what they cannot see, and a node that cannot be trusted
 //	     to replicate cannot be trusted to record its own quarantine. Monotone
 //	     and peer-written; 0 = not isolated. Two additive columns.
-const CurrentSchemaVersion = 49
+//	v50: quota_reservations — preserve the durable reservation table introduced
+//	     by upstream schema v44 after that version number had already been used by
+//	     this integration line. The table remains replicated and understood during
+//	     mixed-version operation; this branch keeps its existing authority-ledger
+//	     admission implementation, so upstream's emitted statement shapes are
+//	     retained as historical receiver contracts. One new table.
+const CurrentSchemaVersion = 50
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -944,6 +950,28 @@ var schemaDDL = []string{
 		updated_at      TEXT NOT NULL,
 		deleted_at      TEXT,
 		PRIMARY KEY (project, authority_epoch)
+	)`,
+
+	// quota_reservations (v50 on this integration line; upstream v44): durable
+	// project-quota reservations emitted by upstream #126 peers. This branch's
+	// admission path uses its existing authority ledger, but the replicated table
+	// must remain present and mergeable throughout a rolling upgrade.
+	`CREATE TABLE IF NOT EXISTS quota_reservations (
+		id          TEXT PRIMARY KEY,
+		project     TEXT NOT NULL,
+		holder      TEXT NOT NULL,
+		cpu         INTEGER NOT NULL DEFAULT 0,
+		mem_mib     INTEGER NOT NULL DEFAULT 0,
+		state       TEXT NOT NULL DEFAULT 'pending',
+		workload    TEXT NOT NULL DEFAULT '',
+		kind        TEXT NOT NULL DEFAULT '',
+		host        TEXT NOT NULL DEFAULT '',
+		want_cpu    INTEGER NOT NULL DEFAULT 0,
+		want_mem    INTEGER NOT NULL DEFAULT 0,
+		expires_at  TEXT NOT NULL,
+		created_at  TEXT NOT NULL,
+		updated_at  TEXT NOT NULL,
+		deleted_at  TEXT
 	)`,
 
 	// Rebalancer proposals. One row per (vm, generation). Pending
@@ -2056,6 +2084,7 @@ var tablePrimaryKeys = map[string][]string{
 	"operations":               {"id"},
 	"operation_steps":          {"operation_id", "owner_epoch", "step_name"},
 	"project_authority_epochs": {"project", "authority_epoch"},
+	"quota_reservations":       {"id"},
 	"idempotency_keys":         {"key"},
 	"rebalance_proposals":      {"id"},
 	"host_pci_devices":         {"host_name", "address"},
@@ -2448,6 +2477,7 @@ var createTableUnits = []struct {
 	{46, "audit_key_lifecycle"},
 	{47, "cluster_crl"},
 	{48, "host_networks"},
+	{50, "quota_reservations"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

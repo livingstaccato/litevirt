@@ -6,9 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/netip"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -263,6 +261,23 @@ type Server struct {
 	// run concurrently (e.g. snapshot + migration, backup + delete).
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+
+	// hostAdmit serializes host-capacity ADMISSION on this node and records the
+	// grows this node has admitted but not yet committed. See admitHostCapacity
+	// for why the ledger — not the lock — is what makes admission safe.
+	//
+	// A SEPARATE map from vmLocks, not a namespaced key in it: vmLocks is keyed by
+	// bare VM name, so a host and a VM sharing a name would collide on one
+	// non-reentrant mutex and StartVM would self-deadlock. It also carries the
+	// counters, which vmLocks' signature cannot.
+	hostAdmitMu sync.Mutex
+	hostAdmit   map[string]*hostAdmitState
+
+	// projectAdmit does the same for project-quota admission, keyed by normalized
+	// project name. Only meaningful on the project's authority holder — see
+	// admitProjectQuota.
+	projectAdmitMu sync.Mutex
+	projectAdmit   map[string]*hostAdmitState
 
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
@@ -996,6 +1011,8 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		images:         images,
 		events:         events.NewBus(),
 		vmLocks:        make(map[string]*sync.Mutex),
+		hostAdmit:      make(map[string]*hostAdmitState),
+		projectAdmit:   make(map[string]*hostAdmitState),
 		loginThrottle:  newLoginThrottle(),
 		ReExecCh:       make(chan struct{}, 1),
 		ShutdownCh:     make(chan struct{}, 1),
@@ -1288,12 +1305,11 @@ func (s *Server) vmLogDir() string {
 }
 
 // peerTarget builds a dialable "host:port" target, defaulting the port to 7443
-// and bracketing IPv6 addresses via net.JoinHostPort.
+// and bracketing IPv6 addresses. One implementation, in corrosion, next to the
+// hosts table the address comes from — a second copy is a second chance to
+// regress back to Sprintf("%s:%d").
 func peerTarget(addr string, port int) string {
-	if port == 0 {
-		port = 7443
-	}
-	return net.JoinHostPort(addr, strconv.Itoa(port))
+	return corrosion.PeerTarget(addr, port)
 }
 
 // dialPeerAddr opens an mTLS gRPC connection to a peer daemon at an already-known

@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -145,6 +146,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
 	}
 
+	// Resource defaults BEFORE admission. Everything below — quota, placement,
+	// host capacity — reads spec.Cpu/spec.MemoryMib, and every one of those checks
+	// is a no-op at zero: the admission helpers early-return on non-positive
+	// deltas, placement skips its fit filter behind `if req.CPUNeeded > 0`, and a
+	// quota check can't be violated by adding 0. So a client sending 0 (documented
+	// as "use defaults") was admitted as a zero-sized VM and then persisted at
+	// 2 vCPU / 4096 MiB — repeatable, and it bypassed BOTH project quota and host
+	// capacity. Normalize first so every check sees what the VM will actually cost.
+	//
+	// Both copies. spec is a CLONE of req.Spec (normalizeCreateVMSpec clones so the
+	// server-owned UUID mint can't be steered by the caller), so normalizing only
+	// spec would leave the request forwarded to the owning host still carrying
+	// zeros. It re-runs admission from that copy, so the defaults have to be on it.
+	compose.NormalizeVMSpecResources(spec)
+	compose.NormalizeVMSpecResources(req.Spec)
+
 	// admission: prefer the tenancy engine (live billing +
 	// public-IP/backup-GiB checks); fall back to the corrosion-direct
 	// path for harnesses that haven't wired an Engine.
@@ -200,9 +217,20 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Before pinned filtering was fixed, three 1 GiB VMs could be pinned to a
 	// ~3 GiB host and accepted until the node thrashed.
 	//
-	// This is the same check the resize path has used all along (resize.go:116), so
+	// This is the same check the resize path has used all along (resize.go), so
 	// growing a VM into a host was refused while creating one there was not. The
-	// This runs on the entry node to fail fast and again on the owning host.
+	// spec (and therefore the pin) travels with a forwarded request, so this runs
+	// on the entry node as an UNSERIALIZED fail-fast that reserves nothing (it will
+	// not commit the VM) and again on the owning host, where it is authoritative:
+	// the owner admits and RESERVES, so two concurrent creates onto one host cannot
+	// both pass. The reservation is held until this RPC returns, which is what
+	// covers the long gap to InsertVMWithHardware below (image pull, disk creation,
+	// DefineDomain) — see admitWithReservation.
+	//
+	// The reservation is REPLICATED rather than a per-process lock because the race
+	// that bit us was cross-node: two same-project creates entering on different
+	// hosts both passed against a view containing neither, which no amount of
+	// in-process serialization can see.
 	if req.AllowOvercommit {
 		// Deliberate density on a host the operator judges can take it. Project
 		// quota still applies (that is a tenancy limit, not a physical one); only
@@ -215,6 +243,19 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
+		// that reserved nothing would be invisible to the very next admission, so a
+		// normal create could be admitted against memory this one is already using.
+		// Reserved on the OWNING node only, for the same double-count reason the
+		// checked path reserves there.
+		if targetHost == s.hostName {
+			lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
+				"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
+		}
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
 		// rejects the hopeless case before we forward. The authoritative
@@ -262,7 +303,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
 	if !req.AllowOvercommit {
-		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib), true)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -278,6 +319,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// supplied value, so a client can't bind a new VM to existing swtpm state.
 	// Restore/migrate set the preserved UUID via their own record-building paths.
 	spec.Uuid = uuid.NewString()
+	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
 
 	// Prepare disks — track created paths for cleanup on failure.
 	var diskConfigs []lv.DiskConfig
@@ -1006,6 +1048,12 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// Skipped when the VM is already running: `lv start` on a running VM is a
 	// no-op that adds nothing, and must not be refused for capacity it already
 	// occupies.
+	//
+	// The reservation must outlive startVMLocked's state write, so release is
+	// declared out here and deferred through a closure — `defer release()` would
+	// capture the no-op value instead of whatever the admission assigns below.
+	release := noopRelease
+	defer func() { release() }()
 	if vm.State != "running" {
 		spec := &pb.VMSpec{}
 		if vm.Spec != "" {
@@ -1020,11 +1068,20 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+			lease, aerr := s.reserveWithoutCheck(ctx, "StartVM", vm.HostName, vm.Project, "", int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
 		} else {
 			// Reserve-then-verify (F2): publish this start's demand before deciding,
 			// so a concurrent start on another node sees it instead of both reading a
 			// view containing neither.
-			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib))
+			//
+			// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
+			// per-VM overhead subtraction, so starting it adds both its guest memory
+			// and a new qemu overhead.
+			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib), true)
 			if aerr != nil {
 				return nil, aerr
 			}
@@ -1781,7 +1838,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	if vm.HostName == s.hostName && state == "running" && s.virt != nil {
 		if port, err := s.virt.GetVMVNCPort(name); err == nil && port >= 0 {
 			if host, err := corrosion.GetHost(ctx, s.db, s.hostName); err == nil && host != nil {
-				pbVM.VncAddress = fmt.Sprintf("vnc://%s:%d", host.Address, port)
+				pbVM.VncAddress = fmt.Sprintf("vnc://%s", net.JoinHostPort(host.Address, strconv.Itoa(port)))
 			}
 		}
 	}
@@ -2862,11 +2919,16 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
 				}
 			} else {
+				// Reserved across the stop → redefine → start below, so a concurrent
+				// grow on this host can't claim the same headroom.
+				//
 				// No resource id: a GROW's row is already visible everywhere, so a
-				// visibility signal would free the delegated lease immediately while the
-				// holder's usage still reflects the OLD size — under-counting exactly the
-				// amount being added. A grow leans on the settle grace instead.
-				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow)
+				// visibility signal would free the delegated lease immediately while
+				// the holder's usage still reflects the OLD size — under-counting
+				// exactly the amount being added. A grow leans on the settle grace.
+				// newVMOnHost=false: the VM is running and already counted, overhead
+				// included, so the delta must not be charged another one.
+				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow, false)
 				if aerr != nil {
 					return nil, aerr
 				}

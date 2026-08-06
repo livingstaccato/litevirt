@@ -188,7 +188,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// setup (PCI preflight, network provisioning, cloud-init, disk stubs) so a
 	// refusal wastes no work. The figures are the VM's ACTUAL allocation, which is
 	// what the target's usage will report once the VM lands there.
-	migLease, err := s.admitHostWithReservation(ctx, "MigrateVM", targetHost.Name, vm.Project, vm.CPUActual, vm.MemActual)
+	migLease, err := s.admitHostWithReservation(ctx, "MigrateVM", targetHost.Name, vm.Project, vm.CPUActual, vm.MemActual, true)
 	if err != nil {
 		return err
 	}
@@ -449,7 +449,9 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// Build destination URI: use TLS transport with our existing PKI certs.
 	// Combined with MigrateTunnelled, all data flows over the single libvirt
 	// TLS port (16514) — no SSH or extra ports required.
-	dconnuri := fmt.Sprintf("qemu+tls://%s/system", targetHost.Address)
+	// URIHost brackets an IPv6 literal — an unbracketed one makes this an
+	// unparseable authority and libvirt connects nowhere useful.
+	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(targetHost.Address))
 
 	// Split-brain gate, LATE re-check: the early gate (after target validation) is a
 	// fail-fast, but preflight/provisioning ran since then. Re-check quorum on the
@@ -504,7 +506,9 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			BandwidthMiB:  bandwidthMiB,
 			AutoConverge:  autoConverge,
 			MaxDowntimeMS: maxDowntimeMS,
-			TargetAddress: targetHost.Address,
+			// Bracketed here, not in internal/libvirt: that package renders it
+			// into a tcp:// migrate_uri authority but must not import corrosion.
+			TargetAddress: corrosion.URIHost(targetHost.Address),
 			DiskTargets:   diskTargets,
 		})}
 	}()

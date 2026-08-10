@@ -430,6 +430,7 @@ func (s *Server) driveRemoteRestore(ctx context.Context, target, repoPath, name,
 			proof = &pb.RuntimeActionProof{
 				Id: pr.ID, Action: pr.Action, TargetKind: pr.TargetKind, TargetName: pr.TargetName,
 				DestHost: pr.DestHost, Coordinator: pr.Coordinator, RelocationToken: pr.RelocationToken,
+				OwnerEpoch: pr.OwnerEpoch,
 			}
 		} else if s.gateActive(ctx) {
 			// Under enforcement the coordinator minted a proof for this token; a miss
@@ -732,9 +733,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 			aerr  error
 		)
 		if req.Proof != nil || relocateTokenFromMD(ctx) != "" {
-			lease, aerr = s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, 0, mem)
+			lease, aerr = s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, 0, mem, false)
 		} else {
-			lease, aerr = s.admitWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, mem)
+			lease, aerr = s.admitWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, mem, false)
 		}
 		if aerr != nil {
 			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")

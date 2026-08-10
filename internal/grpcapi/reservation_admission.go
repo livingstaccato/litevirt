@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -10,6 +11,33 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
+
+// quotaSubject is the workload a project-quota admission is FOR: its identity
+// (kind, host, name) and the ABSOLUTE size the admission grows it to. The settle
+// rule retires a released lease only when this workload contributes at least the
+// want — see corrosion.WorkloadQuotaContribution for why identity and size, not
+// presence or aggregate growth, are the sound retire signals. A zero subject means
+// the admission carries no retire-by-observation hint and settles on presence of
+// its resource_id (correct for host-only reservations).
+type quotaSubject struct {
+	Kind, Host, Name    string
+	WantCPU, WantMemMiB int
+}
+
+// subjectForCreate derives the subject from a create's "vm:<name>" / "ct:<name>"
+// resource id. A create's absolute size IS its delta: the workload does not exist
+// yet, so what it will contribute equals what is being admitted.
+func subjectForCreate(resourceID, host string, cpuDelta, memDelta int) quotaSubject {
+	kindTag, name, ok := strings.Cut(resourceID, ":")
+	if !ok || name == "" {
+		return quotaSubject{}
+	}
+	kind := corrosion.WorkloadVM
+	if kindTag == "ct" {
+		kind = corrosion.WorkloadContainer
+	}
+	return quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: cpuDelta, WantMemMiB: memDelta}
+}
 
 // Reserve-then-verify admission (F2).
 //
@@ -47,6 +75,10 @@ import (
 // which is the remaining half of F2. This is the primitive that half builds on, not
 // a substitute for it.
 
+// releaseTimeout bounds the best-effort release of a lease whose caller context
+// has already been cancelled.
+const releaseTimeout = 10 * time.Second
+
 // reservationLease is a provisional capacity reservation held while an admission
 // decides. The caller MUST release it exactly once, whatever the outcome: a leaked
 // lease permanently consumes capacity no workload is using.
@@ -59,25 +91,47 @@ type reservationLease struct {
 	quotaHolder  string
 	quotaProject string
 	quotaLease   string
+	// quotaEpoch is the authority epoch the quota grant was made under; 0 means no
+	// epoch-bearing authority was involved (no quota reserved, or the pre-epoch
+	// fallback), in which case the fence allows. See allowCommit.
+	quotaEpoch int64
 }
 
-// releaseTimeout bounds the detached release below. Long enough to absorb a brief
-// DB or peer stall, short enough that a shutdown is not held up by a lease whose
-// capacity the stale-lease sweep would collect anyway.
-const releaseTimeout = 10 * time.Second
+// allowCommit reports whether this admission may still be COMMITTED, and must be
+// called immediately before the durable write — the narrower the gap, the smaller
+// the window in which authority can move between the check and the write.
+//
+// The fence exists because an authority handoff cannot be made safe by bookkeeping
+// alone. The grant lives in the OLD holder's replica; a takeover mints a new epoch
+// on evidence that does not include un-replicated leases, so the successor can
+// admit the same quota while this request is still in flight — and this request
+// then completes and puts the project over. Keeping the old lease counted does not
+// help: the successor never learns of it in time. The only sound options are
+// durable transferred reservations or ABORTING the outstanding operation, and this
+// is the abort. Refusing here costs a retry and writes nothing.
+//
+// A zero epoch allows: an admission that reserved no quota (unbounded project,
+// delegation inactive, host-only) has no authority to lose, and blocking it would
+// fail every create on a quota-less project.
+func (l *reservationLease) allowCommit(ctx context.Context) error {
+	if l == nil || l.s == nil || l.quotaEpoch == 0 {
+		return nil
+	}
+	ok, err := corrosion.ValidateProjectAuthority(ctx, l.s.db, l.quotaProject, l.quotaEpoch, l.quotaHolder)
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"cannot confirm project-quota authority for %q before committing: %v", l.quotaProject, err)
+	}
+	if !ok {
+		return status.Errorf(codes.Aborted,
+			"project-quota authority for %q moved past epoch %d while this request was in flight; "+
+				"nothing was committed — retry", l.quotaProject, l.quotaEpoch)
+	}
+	return nil
+}
 
 // release marks the reservation's operation terminal, freeing the capacity.
 // Idempotent, and safe on the empty lease returned for a no-op admission.
-//
-// It runs on a bounded DETACHED context, NOT the caller's. A release is cleanup,
-// and cleanup that only happens while the caller is still listening is not
-// cleanup. The case that proves it is a streaming migrate: it holds the lease
-// across the whole transfer and releases it with defer, and by then the stream
-// context is routinely already cancelled — the client has its result and has hung
-// up. On the lab, a perfectly successful migration left its reservation open, so
-// the target held 1536 MiB against nothing until the stale-lease sweep collected
-// it up to an hour later. finalizeMigrationOwnership detaches its own commit for
-// exactly this reason and says so; this sat beside it with the same exposure.
 func (l *reservationLease) release(ctx context.Context) {
 	if l == nil || l.s == nil {
 		return
@@ -117,10 +171,44 @@ func (l *reservationLease) release(ctx context.Context) {
 //
 // A zero/negative delta consumes nothing and takes the cheap path — no operation
 // row, no lease — so a shrink never queues behind anything.
+// newVMOnHost says a qemu domain is APPEARING on host (a create, or a start that
+// makes a stopped VM resident), so host capacity must also carry that VM's
+// per-domain memory overhead. It is charged against the HOST only, never against
+// project quota: the overhead is the hypervisor's cost of running the guest, not
+// memory the tenant asked for, and billing it to the quota would shrink every
+// project's usable allocation by an accounting artifact.
 func (s *Server) admitWithReservation(
-	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int,
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, method, host, project, resourceID, cpuDelta, memDelta, true)
+	return s.admitReserved(ctx, "", method, host, project, resourceID,
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, newVMOnHost)
+}
+
+// admitGrowWithReservation is admitWithReservation for a GROW of an existing
+// workload, which must carry the absolute target size: the workload's row is
+// already visible at its old size, so without the want the released lease would
+// settle instantly while usage still counted the smaller spec.
+func (s *Server) admitGrowWithReservation(
+	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int,
+) (*reservationLease, error) {
+	tag := "vm"
+	if kind == corrosion.WorkloadContainer {
+		tag = "ct"
+	}
+	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
+	return s.admitReserved(ctx, "", method, host, project, tag+":"+name, subject, cpuDelta, memDelta, true, false)
+}
+
+// admitWithReservationID is admitWithReservation with an explicit operation ID.
+//
+// This exists for paths where the operation identity is already known (for
+// example, ResizeVMLive derives a deterministic ID from an idempotency key and
+// then needs admission/verification to participate in the same winner election).
+func (s *Server) admitWithReservationID(
+	ctx context.Context, opID, method, host, project, resourceID string, cpuDelta, memDelta int, newVMOnHost bool,
+) (*reservationLease, error) {
+	return s.admitReserved(ctx, opID, method, host, project, resourceID,
+		subjectForCreate(resourceID, host, cpuDelta, memDelta), cpuDelta, memDelta, true, newVMOnHost)
 }
 
 // admitHostWithReservation is admitWithReservation for paths that must NOT charge
@@ -128,16 +216,73 @@ func (s *Server) admitWithReservation(
 // project usage whether the workload is running or stopped, so charging it again
 // would refuse a plain stop/start of any workload over half its quota.
 func (s *Server) admitHostWithReservation(
-	ctx context.Context, method, host, project string, cpuDelta, memDelta int,
+	ctx context.Context, method, host, project string, cpuDelta, memDelta int, newVMOnHost bool,
 ) (*reservationLease, error) {
-	return s.admitReserved(ctx, method, host, project, "", cpuDelta, memDelta, false)
+	return s.admitReserved(ctx, "", method, host, project, "", quotaSubject{}, cpuDelta, memDelta, false, newVMOnHost)
 }
 
-func (s *Server) admitReserved(
-	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int, withQuota bool,
+// reserveWithoutCheck publishes a HOST reservation without verifying it fits —
+// the --allow-overcommit path, which deliberately bypasses the capacity CHECK but
+// must not also bypass the DRAW.
+//
+// Skipping the check and the reservation together is what made overcommit unsafe
+// beyond its own request: the VM's memory stayed invisible to every concurrent
+// admission until the workload row committed, so a NORMAL create racing it could
+// be admitted against memory already spoken for — and that create never asked to
+// overcommit anything. Reserving keeps the operator's decision scoped to the
+// request that made it.
+//
+// Host figures only. Project quota is admitted separately on this path (an
+// operator bypassing a physical limit is not bypassing a tenancy one), so
+// charging it here would double-count it.
+func (s *Server) reserveWithoutCheck(
+	ctx context.Context, method, host, project, resourceID string, cpuDelta, memDelta int,
 ) (*reservationLease, error) {
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
+	}
+	rv := corrosion.ReservationVector{
+		Project:    project,
+		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: s.capacity.MemChargeFor(memDelta),
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+	op := corrosion.OperationRecord{
+		ID:              newID(),
+		Method:          method,
+		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
+		Project:         project,
+		ResourceKind:    corrosion.CapacityResourceKind,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		ReservationJSON: resJSON,
+	}
+	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+		return nil, status.Errorf(codes.Internal, "reserve capacity: %v", err)
+	}
+	lease := &reservationLease{s: s, id: op.ID}
+	// Same reason admitReserved stamps: an unattributed reservation is not counted
+	// by capacity aggregation once the project has an authority epoch, so the lease
+	// would hold nothing and the draw would stay invisible after all.
+	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+	return lease, nil
+}
+
+func (s *Server) admitReserved(
+	ctx context.Context, opID, method, host, project, resourceID string, subject quotaSubject, cpuDelta, memDelta int, withQuota, newVMOnHost bool,
+) (*reservationLease, error) {
+	if cpuDelta <= 0 && memDelta <= 0 {
+		return &reservationLease{}, nil
+	}
+
+	// Host figures carry the per-domain overhead; quota figures never do.
+	hostMemDelta := memDelta
+	if newVMOnHost {
+		hostMemDelta = s.capacity.MemChargeFor(memDelta)
 	}
 
 	// When the project-quota decision is DELEGATED, its reservation is published by
@@ -150,7 +295,7 @@ func (s *Server) admitReserved(
 	// FIGURES at zero, so it is bound to the project without charging its quota.
 	rv := corrosion.ReservationVector{
 		Project:    project,
-		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
+		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: hostMemDelta,
 	}
 	if withQuota && !delegated {
 		// Only a quota-charging admission reserves against the PROJECT. A start
@@ -158,14 +303,19 @@ func (s *Server) admitReserved(
 		// so publishing a project reservation too would make concurrent starts
 		// appear to double-consume a quota neither of them is growing.
 		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
+		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
+		rv.WantCPU, rv.WantMemMiB = subject.WantCPU, subject.WantMemMiB
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
 	}
 
+	if opID == "" {
+		opID = newID()
+	}
 	op := corrosion.OperationRecord{
-		ID:              newID(),
+		ID:              opID,
 		Method:          method,
 		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
 		Project:         project,
@@ -189,7 +339,7 @@ func (s *Server) admitReserved(
 	// Verify against headroom that counts ONLY earlier claimants: not our own
 	// provisional reservation (comparing our request against headroom that already
 	// subtracted it double-counts) and not later racers (they yield to us).
-	if err := s.checkHostCapacityBefore(ctx, host, cpuDelta, memDelta, op.ID); err != nil {
+	if err := s.checkHostCapacityBefore(ctx, host, cpuDelta, hostMemDelta, op.ID); err != nil {
 		lease.release(ctx)
 		return nil, err
 	}
@@ -203,12 +353,13 @@ func (s *Server) admitReserved(
 		}
 		// Host capacity is settled first because it is the cheap, local half: an
 		// admission that cannot fit the host never needs to bother the holder.
-		holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, project, resourceID, cpuDelta, memDelta)
+		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
 		if qerr != nil {
 			lease.release(ctx)
 			return nil, qerr
 		}
 		lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, project, quotaLease
+		lease.quotaEpoch = epoch
 	}
 	return lease, nil
 }
@@ -257,4 +408,79 @@ func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, cp
 			project, u.MemMiBUsed, rMem, memDelta, q.MemMiBLimit)
 	}
 	return nil
+}
+
+// admitQuotaWithReservation admits a grow against PROJECT QUOTA ONLY — no host
+// figures. Three callers need exactly this shape:
+//
+//   - container creates: host capacity charges memory only (cpu_limit is cgroup
+//     shares, not a vCPU reservation), but quota charges BOTH — SumProjectUsage
+//     counts a container's cpu_limit against the project vCPU budget, so admission
+//     must too or the limit is unenforceable;
+//   - --allow-overcommit: the operator is bypassing a PHYSICAL judgment, not a
+//     tenancy limit, so quota still goes through serialized admission — the
+//     unserialized fail-fast cannot see in-flight reservations, and concurrent
+//     overcommit requests all observed the same headroom;
+//   - a grow of an already-STOPPED VM: its spec counts toward SumProjectUsage but
+//     it contributes nothing to host usage until StartVM admits the full size.
+//
+// The returned lease carries the commit fence like any other quota grant.
+func (s *Server) admitQuotaWithReservation(
+	ctx context.Context, method, host, project, kind, name string, cpuDelta, memDelta, wantCPU, wantMem int,
+) (*reservationLease, error) {
+	if cpuDelta <= 0 && memDelta <= 0 {
+		return &reservationLease{}, nil
+	}
+	subject := quotaSubject{Kind: kind, Host: host, Name: name, WantCPU: wantCPU, WantMemMiB: wantMem}
+	tag := "vm"
+	if kind == corrosion.WorkloadContainer {
+		tag = "ct"
+	}
+	resourceID := tag + ":" + name
+
+	if s.projectAuthorityActive(ctx) {
+		lease := &reservationLease{s: s}
+		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, cpuDelta, memDelta)
+		if qerr != nil {
+			return nil, qerr
+		}
+		lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, project, quotaLease
+		lease.quotaEpoch = epoch
+		return lease, nil
+	}
+
+	// Pre-delegation: a local reservation carrying quota figures only, verified
+	// reserve-then-verify like every other admission.
+	rv := corrosion.ReservationVector{
+		Project: project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
+		Workload: name, WorkloadKind: kind, WorkloadHost: host,
+		WantCPU: wantCPU, WantMemMiB: wantMem,
+	}
+	resJSON, err := rv.Encode()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "encode reservation: %v", err)
+	}
+	op := corrosion.OperationRecord{
+		ID:              newID(),
+		Method:          method,
+		Principal:       callerUsername(ctx) + "@" + callerRealm(ctx),
+		Project:         project,
+		ResourceID:      resourceID,
+		ResourceKind:    corrosion.CapacityResourceKind,
+		OperationKind:   string(corrosion.OpResourceUpdateRunning),
+		ReservationJSON: resJSON,
+	}
+	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+		return nil, status.Errorf(codes.Internal, "reserve project quota: %v", err)
+	}
+	lease := &reservationLease{s: s, id: op.ID}
+	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+	if err := s.checkProjectQuotaBefore(ctx, project, cpuDelta, memDelta, op.ID); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+	return lease, nil
 }

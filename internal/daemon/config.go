@@ -273,6 +273,19 @@ type AuthConfig struct {
 	// requires the StrictMTLSIdentityV1 capability active cluster-wide. This flag
 	// is the enforcement + kill switch — set false to disable regardless of latch.
 	StrictMTLSIdentity bool `yaml:"strict_mtls_identity,omitempty"`
+	// TrustRotatedPeerCerts is the RECOVERY switch for the peer certificate-serial
+	// pin. Peer trust binds a live host row to the serial recorded in it; when
+	// those recorded serials go stale (host certificates reissued), every daemon
+	// refuses every peer and the cluster stops replicating — and the correction
+	// cannot be replicated, because replication is what is being refused.
+	//
+	// Set true on EVERY node to break that deadlock: a mismatch is then logged and
+	// admitted for CA-issued host certificates rather than refused. Leave it on
+	// only until the fleet has replicated the serials each node re-records for
+	// itself at startup, then set it back to false. It never relaxes the removal
+	// tombstone, and never lets a distributable client certificate act as a peer.
+	// Default false; an ordinary rotation on a healthy cluster does not need it.
+	TrustRotatedPeerCerts bool `yaml:"trust_rotated_peer_certs,omitempty"`
 	// ForwardedIdentity, when true, makes this node (as the owner of a resource)
 	// re-authenticate the forwarded user's session bearer relayed by the entry
 	// node and run RBAC + audit as the real user, instead of the peer=admin
@@ -388,6 +401,25 @@ type EnforcementConfig struct {
 	// keeps emitting unsigned rows, so the token is advertised only while it is on).
 	// Default false; reversible kill switch.
 	AuditSignature bool `yaml:"audit_signature,omitempty"`
+	// OwnerEpoch: activate the Phase 4 ownership-generation regime on this host
+	// (capabilities.OwnerEpochV1). With the flag on, the health sweeps backfill
+	// every workload this host owns from the pre-epoch 0 to a real generation
+	// (stamping its runtime marker in the same pass), and the token is advertised
+	// only once this node is READY — flag on AND no owned workload left at epoch
+	// 0 — so the fleet can never latch across a node whose workloads are still
+	// ungraduated ("never bless an already-diverged cluster"). Marker/epoch
+	// ENFORCEMENT (refusing stale-row self-heal restarts) activates only after
+	// the fleet-wide latch. Enable fleet-uniformly; reversible kill switch.
+	OwnerEpoch bool `yaml:"owner_epoch,omitempty"`
+	// IsolationEpoch: activate the §A isolation regime on this host
+	// (capabilities.IsolationEpochV1). With the flag on and the token latched
+	// cluster-wide, this node REFUSES replication from any host recorded with a
+	// nonzero hosts.isolation_epoch — a node whose state was produced outside
+	// the cluster's compatibility regime (rolled back below a latched token, or
+	// isolated by an operator) can no longer inject that state back, and stays
+	// refused until `lv host reseed` verifies convergence. Pre-latch clusters
+	// behave exactly as today. Enable fleet-uniformly; reversible kill switch.
+	IsolationEpoch bool `yaml:"isolation_epoch,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

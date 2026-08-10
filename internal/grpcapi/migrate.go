@@ -188,7 +188,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// setup (PCI preflight, network provisioning, cloud-init, disk stubs) so a
 	// refusal wastes no work. The figures are the VM's ACTUAL allocation, which is
 	// what the target's usage will report once the VM lands there.
-	migLease, err := s.admitHostWithReservation(ctx, "MigrateVM", targetHost.Name, vm.Project, vm.CPUActual, vm.MemActual)
+	migLease, err := s.admitHostWithReservation(ctx, "MigrateVM", targetHost.Name, vm.Project, vm.CPUActual, vm.MemActual, true)
 	if err != nil {
 		return err
 	}
@@ -1048,7 +1048,8 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 
 	// Hand the VM to the target, PRESERVING its (stopped) state. On failure, roll
 	// the disks AND target back and abort (source still owns it + is intact).
-	if err := corrosion.UpdateVMHost(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
+	// Phase 4: migration commit is an ownership transition (fresh-read CAS + increment).
+	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
 		rollbackDisks()
 		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
 		return status.Errorf(codes.Internal, "reassign VM %q to %s: %v", vm.Name, targetHost.Name, err)

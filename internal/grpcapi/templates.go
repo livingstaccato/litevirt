@@ -100,7 +100,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// report as its usage — admitting a different number than the row we go on to
 	// write would leave the accounting permanently off by the difference.
 	lease, aerr := s.admitWithReservation(
-		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target, int(srcSpec.Cpu), int(srcSpec.MemoryMib))
+		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target, int(srcSpec.Cpu), int(srcSpec.MemoryMib), true)
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -278,6 +278,17 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)
+	}
+	// specJSON above was marshalled BEFORE the define, so it carries whatever
+	// the source spec had — an alias if the source was never pinned. The define
+	// just resolved it against this host's qemu; persist that concrete value
+	// instead, or the clone starts life with the ABI hazard its source had.
+	// Re-marshal, since the pre-pin JSON is what would otherwise be stored.
+	if before := srcSpec.Machine; true {
+		s.pinMachineFromDomain(&srcSpec)
+		if srcSpec.Machine != before {
+			specJSON, _ = json.Marshal(&srcSpec)
+		}
 	}
 
 	// Roll back everything the clone built until the DB row lands — including the

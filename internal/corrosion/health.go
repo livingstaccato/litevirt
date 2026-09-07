@@ -24,7 +24,9 @@ import (
 const (
 	ConditionObserved  = "observed"
 	ConditionConfirmed = "confirmed"
-	ConditionResolved  = "resolved"
+	// ConditionResolved is also hardcoded as a SQL literal in
+	// TombstoneResolvedHealthConditions — keep them in sync.
+	ConditionResolved = "resolved"
 )
 
 // Condition severities.

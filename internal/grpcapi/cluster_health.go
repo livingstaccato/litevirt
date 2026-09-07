@@ -21,6 +21,14 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 		return nil, err
 	}
 
+	// These three queries are deliberately unsynchronized — no shared snapshot
+	// or transaction ties them together. A detector pass landing between them
+	// can produce a response that mixes pre- and post-transition state (e.g. a
+	// condition already resolved but an evaluator row not yet updated to match).
+	// That's an acceptable tradeoff here: this is a read-only advisory endpoint,
+	// not a consistency-sensitive decision point, the window is one detector
+	// cycle wide, and the response self-heals within ~60s on the next scan —
+	// nothing this handler does relies on the three views agreeing exactly.
 	conditions, err := corrosion.ListHealthConditions(ctx, s.db, req.GetIncludeResolved())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "list health conditions: %v", err)

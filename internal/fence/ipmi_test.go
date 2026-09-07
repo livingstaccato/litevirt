@@ -33,6 +33,15 @@ func testIPMIHost() HostConfig {
 // function seam would assert none of them.
 func fakeIpmitool(t *testing.T, stdout string, delay time.Duration, exitCode int) (logPath string) {
 	t.Helper()
+	return fakeIpmitoolStreams(t, stdout, "", delay, exitCode)
+}
+
+// fakeIpmitoolStreams is fakeIpmitool with control over stderr as well.
+// ipmitool reports failures on stderr, and cmd.Output() captures ONLY stderr
+// into ExitError.Stderr — a fake that writes its message to stdout cannot
+// exercise the error-reporting path at all.
+func fakeIpmitoolStreams(t *testing.T, stdout, stderr string, delay time.Duration, exitCode int) (logPath string) {
+	t.Helper()
 	dir := t.TempDir()
 	logPath = filepath.Join(dir, "invocations.log")
 
@@ -44,8 +53,9 @@ func fakeIpmitool(t *testing.T, stdout string, delay time.Duration, exitCode int
 } >> %q
 sleep %v
 printf '%%s\n' %q
+printf '%%s\n' %q >&2
 exit %d
-`, logPath, delay.Seconds(), stdout, exitCode)
+`, logPath, delay.Seconds(), stdout, stderr, exitCode)
 
 	path := filepath.Join(dir, "ipmitool")
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
@@ -207,9 +217,15 @@ func TestVerifyIPMIPowerOff_PacesPollsFromCallStart(t *testing.T) {
 
 // TestVerifyIPMIPowerOff_ReportsWhyItFailed pins that an auth-style failure is
 // distinguishable from a chassis that is simply still on. Both refuse the fence,
-// but only the latter makes refusing to reschedule the correct outcome.
+// but only the latter makes refusing to reschedule the correct outcome, and the
+// reason is what an operator reads out of fencing_log during an incident.
+//
+// "exit status 1" alone is NOT enough to assert here: exec's own ExitError
+// already says that much, so a check for it passes whether or not the stderr
+// text is folded in. The BMC's own message is the part that has to survive.
 func TestVerifyIPMIPowerOff_ReportsWhyItFailed(t *testing.T) {
-	fakeIpmitool(t, "Error: Unable to establish IPMI v2 / RMCP+ session", 0, 1)
+	const bmcError = "Error: Unable to establish IPMI v2 / RMCP+ session"
+	fakeIpmitoolStreams(t, "", bmcError, 0, 1)
 	shrinkVerifyKnobs(t, 2*time.Second, 50*time.Millisecond)
 
 	verified, err := verifyIPMIPowerOff(context.Background(), testIPMIHost())
@@ -222,6 +238,9 @@ func TestVerifyIPMIPowerOff_ReportsWhyItFailed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exit status 1") {
 		t.Errorf("error does not carry the invocation failure: %v", err)
+	}
+	if !strings.Contains(err.Error(), bmcError) {
+		t.Errorf("error drops the BMC's own stderr, so the fence detail cannot say WHY: %v", err)
 	}
 }
 

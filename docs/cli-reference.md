@@ -46,7 +46,8 @@ lv version                         # Print version
 lv cluster digest                  # Per-table state digest for every host (fanned out server-side)
 lv cluster converge [--all]        # Kick an immediate anti-entropy pass + report cross-host convergence
                                    #   (`lv cluster sync` is a deprecated alias)
-lv health                          # Cluster health matrix
+lv cluster health [--include-resolved]  # Durable conditions + evaluator coverage + connectivity, one overall state
+lv health                          # Per-host connectivity matrix
 ```
 
 ## Hosts
@@ -699,7 +700,8 @@ See `docs/audit-log.md` for the chain semantics.
 ## Monitoring
 
 ```bash
-lv health                                    # Cluster health matrix
+lv health                                    # Per-host connectivity matrix
+lv cluster health [--include-resolved]       # Durable conditions + evaluator coverage + connectivity, one overall state
 lv audit ls [--limit N] [--target T] [--action A] [--user U] [--since TS]   # Audit log (default 50 entries)
 lv host stats <host>                         # Host resource statistics
 lv stats <vm>                                # VM resource statistics

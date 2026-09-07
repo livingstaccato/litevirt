@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -22,8 +23,80 @@ func newClusterCmd() *cobra.Command {
 	cmd.AddCommand(
 		newClusterDigestCmd(),
 		newClusterConvergeCmd(),
+		newClusterHealthCmd(),
 	)
 	return cmd
+}
+
+// lv cluster health — THE health read: durable dual-run conditions, evaluator
+// coverage, and peer connectivity, rolled up into one overall state.
+func newClusterHealthCmd() *cobra.Command {
+	var includeResolved bool
+	cmd := &cobra.Command{
+		Use:   "health",
+		Short: "Show cluster health: conditions, evaluator coverage, connectivity",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{IncludeResolved: includeResolved})
+				if err != nil {
+					return fmt.Errorf("get cluster health: %w", err)
+				}
+				fmt.Printf("Overall: %s\n", resp.GetOverall())
+
+				fmt.Println("\nCONDITIONS")
+				w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "EVALUATOR\tCODE\tSUBJECT\tLIFECYCLE\tSEVERITY\tOBSERVED\tCLEAN\tLAST SEEN")
+				for _, cnd := range resp.GetConditions() {
+					fmt.Fprintf(w, "%s\t%s\t%s/%s\t%s\t%s\t%d\t%d\t%s\n",
+						cnd.GetEvaluator(), cnd.GetCode(), cnd.GetSubjectKind(), cnd.GetSubjectId(),
+						cnd.GetLifecycle(), cnd.GetSeverity(),
+						cnd.GetObserveCount(), cnd.GetCleanCount(), agoOrDash(cnd.GetLastSeen()))
+				}
+				w.Flush()
+				if len(resp.GetConditions()) == 0 {
+					fmt.Println("(none)")
+				}
+
+				fmt.Println("\nEVALUATORS")
+				w = tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "EVALUATOR\tCOVERAGE\tLAST SCAN\tREPORTER")
+				for _, e := range resp.GetEvaluators() {
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+						e.GetEvaluator(), e.GetCoverage(), agoOrDash(e.GetLastScan()), e.GetReporter())
+				}
+				w.Flush()
+
+				fmt.Println("\nCONNECTIVITY")
+				w = tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(w, "OBSERVER\tTARGET\tSTATUS\tFAILURES\tLAST SEEN")
+				for _, e := range resp.GetConnectivity() {
+					lastSeen := "-"
+					if e.GetLastSeen() != nil {
+						lastSeen = time.Since(e.GetLastSeen().AsTime()).Truncate(time.Second).String() + " ago"
+					}
+					fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n",
+						e.GetObserver(), e.GetTarget(), e.GetStatus(), e.GetConsecutiveFailures(), lastSeen)
+				}
+				return w.Flush()
+			})
+		},
+	}
+	cmd.Flags().BoolVar(&includeResolved, "include-resolved", false, "also show conditions resolved within the last 30 days")
+	return cmd
+}
+
+// agoOrDash renders an RFC3339 timestamp string as a relative duration, or
+// "-" for the zero value (a field that hasn't happened yet, e.g. an
+// unconfirmed condition's confirmed_at).
+func agoOrDash(rfc3339 string) string {
+	if rfc3339 == "" {
+		return "-"
+	}
+	t, err := time.Parse(time.RFC3339, rfc3339)
+	if err != nil {
+		return rfc3339
+	}
+	return time.Since(t).Truncate(time.Second).String() + " ago"
 }
 
 // lv cluster digest — per-table state digest for EVERY host, aggregated server-side (the
@@ -127,8 +200,8 @@ type digestVersion struct {
 }
 
 func digestVersions(dig *pb.ClusterStateDigestResponse) digestVersion {
-	seen := map[string]bool{}    // table -> reported by at least one host
-	allV2 := map[string]bool{}   // table -> every reporting host supplied hash_v2 (so far)
+	seen := map[string]bool{}  // table -> reported by at least one host
+	allV2 := map[string]bool{} // table -> every reporting host supplied hash_v2 (so far)
 	for _, h := range dig.GetHosts() {
 		for _, t := range h.GetTables() {
 			name := t.GetName()

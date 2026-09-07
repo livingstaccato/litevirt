@@ -75,32 +75,33 @@ type mockGRPC struct {
 	createNetworkResp  *pb.NetworkInfo
 
 	// Track calls
-	lastListVMsReq        *pb.ListVMsRequest
-	lastListContainersReq *pb.ListContainersRequest
-	lastInspectVMName    string
-	lastInspectHostName  string
-	lastStartVMName      string
-	lastStopVMName       string
-	lastStopVMReq        *pb.StopVMRequest
-	lastRemoveHostReq    *pb.RemoveHostRequest
-	lastRestartVMName    string
-	lastDeleteVMName     string
-	lastDeleteVMReq      *pb.DeleteVMRequest
-	deleteVMCalled       bool
-	lastInspectLBName    string
-	lastUpdateLBReq      *pb.UpdateLBRequest
-	lastDeleteLBName     string
-	deleteLBCalled       bool
-	lastLBStatsName      string
-	lastDrainReq         *pb.DrainBackendRequest
-	lastDisableReq       *pb.DisableBackendRequest
-	lastEnableReq        *pb.EnableBackendRequest
-	lastGetNetworkName   string
-	lastDeleteNetworkReq *pb.DeleteNetworkRequest
-	deleteNetworkCalled  bool
-	lastCreateNetworkReq *pb.CreateNetworkRequest
-	lastCreateLBReq      *pb.CreateLBRequest
-	lastMigrateStackReq  *pb.MigrateStackVolumesRequest
+	lastListVMsReq          *pb.ListVMsRequest
+	lastListContainersReq   *pb.ListContainersRequest
+	lastGetClusterHealthReq *pb.GetClusterHealthRequest
+	lastInspectVMName       string
+	lastInspectHostName     string
+	lastStartVMName         string
+	lastStopVMName          string
+	lastStopVMReq           *pb.StopVMRequest
+	lastRemoveHostReq       *pb.RemoveHostRequest
+	lastRestartVMName       string
+	lastDeleteVMName        string
+	lastDeleteVMReq         *pb.DeleteVMRequest
+	deleteVMCalled          bool
+	lastInspectLBName       string
+	lastUpdateLBReq         *pb.UpdateLBRequest
+	lastDeleteLBName        string
+	deleteLBCalled          bool
+	lastLBStatsName         string
+	lastDrainReq            *pb.DrainBackendRequest
+	lastDisableReq          *pb.DisableBackendRequest
+	lastEnableReq           *pb.EnableBackendRequest
+	lastGetNetworkName      string
+	lastDeleteNetworkReq    *pb.DeleteNetworkRequest
+	deleteNetworkCalled     bool
+	lastCreateNetworkReq    *pb.CreateNetworkRequest
+	lastCreateLBReq         *pb.CreateLBRequest
+	lastMigrateStackReq     *pb.MigrateStackVolumesRequest
 
 	// Host action tracking
 	lastDrainHostName    string
@@ -501,6 +502,10 @@ func (m *mockGRPC) ListContainers(_ context.Context, in *pb.ListContainersReques
 	m.lastListContainersReq = in
 	return &pb.ListContainersResponse{NextPageToken: "ct-next"}, nil
 }
+func (m *mockGRPC) GetClusterHealth(_ context.Context, in *pb.GetClusterHealthRequest, _ ...grpc.CallOption) (*pb.ClusterHealth, error) {
+	m.lastGetClusterHealthReq = in
+	return &pb.ClusterHealth{Overall: "HEALTHY", GeneratedAt: "2026-01-01T00:00:00Z"}, nil
+}
 func (m *mockGRPC) PullOCIImage(context.Context, *pb.PullOCIImageRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
@@ -881,6 +886,39 @@ func TestListContainers_Pagination(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "ct-next") {
 		t.Errorf("response body should echo next_page_token; got %s", rec.Body.String())
+	}
+}
+
+// TestGetClusterHealth_ForwardsIncludeResolved confirms the include_resolved
+// query flag reaches the RPC request, and the response round-trips as JSON.
+func TestGetClusterHealth_ForwardsIncludeResolved(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster/health?include_resolved=true", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if mock.lastGetClusterHealthReq == nil || !mock.lastGetClusterHealthReq.IncludeResolved {
+		t.Errorf("expected IncludeResolved=true forwarded, got %+v", mock.lastGetClusterHealthReq)
+	}
+	if !strings.Contains(rec.Body.String(), "HEALTHY") {
+		t.Errorf("response body should echo overall state; got %s", rec.Body.String())
+	}
+}
+
+// TestGetClusterHealth_BadIncludeResolved rejects a non-boolean include_resolved with 400.
+func TestGetClusterHealth_BadIncludeResolved(t *testing.T) {
+	s, _ := newMockServer("test-token")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cluster/health?include_resolved=maybe", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d (%s)", rec.Code, rec.Body.String())
 	}
 }
 

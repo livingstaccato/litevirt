@@ -71,22 +71,39 @@ type HealthCondition struct {
 
 // UpsertHealthCondition writes a condition's full current state. The caller (the
 // evaluator) has already decided the lifecycle transition; this persists it.
+//
+// It is the single-write form: one statement, one transaction, immediate
+// replicator wake. An evaluator pass that touches several conditions at once
+// should build statements with HealthConditionStatement instead and issue them
+// as one deferred batch.
 func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) error {
+	stmt, err := HealthConditionStatement(c, h)
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, stmt.SQL, stmt.Params...)
+}
+
+// HealthConditionStatement builds the upsert for one condition WITHOUT
+// executing it, so a caller writing several rows in one pass can collect them
+// into a single atomic batch. The SQL and parameters are identical to what
+// UpsertHealthCondition issues.
+func HealthConditionStatement(c *Client, h HealthCondition) (Statement, error) {
 	if h.Evaluator == "" || h.Code == "" || h.SubjectKind == "" {
-		return fmt.Errorf("corrosion: health condition requires evaluator, code and subject_kind (got %q/%q/%q)",
+		return Statement{}, fmt.Errorf("corrosion: health condition requires evaluator, code and subject_kind (got %q/%q/%q)",
 			h.Evaluator, h.Code, h.SubjectKind)
 	}
 	hosts := ""
 	if len(h.Hosts) > 0 {
 		b, err := json.Marshal(h.Hosts)
 		if err != nil {
-			return err
+			return Statement{}, err
 		}
 		hosts = string(b)
 	}
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO health_conditions (evaluator, code, subject_kind, subject_id,
+	return Statement{
+		SQL: `INSERT INTO health_conditions (evaluator, code, subject_kind, subject_id,
 		   lifecycle, severity, hosts, evidence, observe_count, clean_count,
 		   first_seen, last_seen, confirmed_at, resolved_at, reporter,
 		   created_at, updated_at)
@@ -105,10 +122,13 @@ func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) er
 		   reporter = excluded.reporter,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		h.Evaluator, h.Code, h.SubjectKind, h.SubjectID,
-		h.Lifecycle, h.Severity, hosts, h.Evidence, h.ObserveCount, h.CleanCount,
-		h.FirstSeen, h.LastSeen, nullIfEmpty(h.ConfirmedAt), nullIfEmpty(h.ResolvedAt), h.Reporter,
-		nowRFC3339(), now)
+		Params: []interface{}{
+			h.Evaluator, h.Code, h.SubjectKind, h.SubjectID,
+			h.Lifecycle, h.Severity, hosts, h.Evidence, h.ObserveCount, h.CleanCount,
+			h.FirstSeen, h.LastSeen, nullIfEmpty(h.ConfirmedAt), nullIfEmpty(h.ResolvedAt), h.Reporter,
+			nowRFC3339(), now,
+		},
+	}, nil
 }
 
 // GetHealthCondition reads one condition by identity; ok=false when absent.
@@ -203,14 +223,26 @@ type HealthEvaluatorStatus struct {
 	Detail    string
 }
 
-// UpsertHealthEvaluatorStatus records an evaluator's completed scan.
+// UpsertHealthEvaluatorStatus records an evaluator's completed scan. Like
+// UpsertHealthCondition this is the single-write form; a pass batching several
+// health writes together should use HealthEvaluatorStatusStatement.
 func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvaluatorStatus) error {
+	stmt, err := HealthEvaluatorStatusStatement(c, st)
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, stmt.SQL, stmt.Params...)
+}
+
+// HealthEvaluatorStatusStatement builds the evaluator-status upsert WITHOUT
+// executing it, for callers collecting a pass's writes into one batch.
+func HealthEvaluatorStatusStatement(c *Client, st HealthEvaluatorStatus) (Statement, error) {
 	if st.Evaluator == "" {
-		return fmt.Errorf("corrosion: evaluator status requires an evaluator name")
+		return Statement{}, fmt.Errorf("corrosion: evaluator status requires an evaluator name")
 	}
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`INSERT INTO health_evaluator_status (evaluator, last_scan, coverage, reporter, detail,
+	return Statement{
+		SQL: `INSERT INTO health_evaluator_status (evaluator, last_scan, coverage, reporter, detail,
 		   created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(evaluator) DO UPDATE SET
@@ -220,8 +252,11 @@ func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvalua
 		   detail = excluded.detail,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		st.Evaluator, st.LastScan, st.Coverage, st.Reporter, st.Detail,
-		nowRFC3339(), now)
+		Params: []interface{}{
+			st.Evaluator, st.LastScan, st.Coverage, st.Reporter, st.Detail,
+			nowRFC3339(), now,
+		},
+	}, nil
 }
 
 // ListHealthEvaluatorStatus returns every evaluator's latest scan record.

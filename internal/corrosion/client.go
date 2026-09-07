@@ -825,6 +825,18 @@ func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
 	return err
 }
 
+// ExecuteBatchDeferred is ExecuteBatch without the immediate replicator wake:
+// the statements still land atomically in one transaction and one mutation_log
+// write, but are pushed on the next periodic replication tick (~10s). It stands
+// to ExecuteBatch exactly as ExecuteDeferred stands to Execute. Use it for the
+// same class of write ExecuteDeferred serves — high-frequency, low-priority
+// periodic probe results like health checks — when a pass produces several rows
+// at once and one exclusive-lock transaction beats N of them.
+func (c *Client) ExecuteBatchDeferred(ctx context.Context, stmts []Statement) error {
+	_, err := c.executeBatchInternal(ctx, stmts, false)
+	return err
+}
+
 // ExecuteBatchGuarded runs stmts in ONE transaction ONLY IF guard — evaluated
 // INSIDE that transaction against a consistent snapshot — returns true. It is the
 // compare-and-swap primitive for a repair that must not race its own

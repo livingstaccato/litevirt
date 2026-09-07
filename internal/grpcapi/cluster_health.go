@@ -44,8 +44,20 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 		return nil, status.Errorf(codes.Internal, "query connectivity: %v", err)
 	}
 
+	// Parse the mesh once: the same edges feed both the response body and the
+	// roll-up (which counts failing/suspect links as coverage gaps).
+	mesh := make([]connectivityEdge, 0, len(edges))
+	for _, r := range edges {
+		mesh = append(mesh, connectivityEdge{
+			Observer: r.String("observer"), Target: r.String("target"),
+			Status:              r.String("status"),
+			ConsecutiveFailures: r.Int("consecutive_failures"),
+			LastSeen:            r.String("last_seen"),
+		})
+	}
+
 	resp := &pb.ClusterHealth{
-		Overall:     overallHealth(conditions, evaluators, time.Now().UTC()),
+		Overall:     overallHealth(conditions, evaluators, mesh, time.Now().UTC()),
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 	for _, h := range conditions {
@@ -66,15 +78,35 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			Coverage: e.Coverage, Reporter: e.Reporter, Detail: e.Detail,
 		})
 	}
-	for _, r := range edges {
+	for _, e := range mesh {
 		resp.Connectivity = append(resp.Connectivity, &pb.ConnectivityEdge{
-			Observer: r.String("observer"), Target: r.String("target"),
-			Status:              r.String("status"),
-			ConsecutiveFailures: int32(r.Int("consecutive_failures")),
-			LastSeen:            parseTimestamp(r.String("last_seen")),
+			Observer: e.Observer, Target: e.Target,
+			Status:              e.Status,
+			ConsecutiveFailures: int32(e.ConsecutiveFailures),
+			LastSeen:            parseTimestamp(e.LastSeen),
 		})
 	}
 	return resp, nil
+}
+
+// connectivityEdge is one observer→target peer-probe result from host_health,
+// as both the response body and the roll-up read it. It is the typed shape of
+// the row, not a new storage concept: internal/health's checker owns the column.
+type connectivityEdge struct {
+	Observer            string
+	Target              string
+	Status              string // healthy | suspect | failing
+	ConsecutiveFailures int
+	LastSeen            string
+}
+
+// Connectivity statuses that mean a peer link is not proven good. The checker
+// (internal/health) writes "healthy" and "suspect" today; "failing" is accepted
+// as the same class so a future terminal state degrades rather than reading as
+// silently fine — an unrecognized status is NOT treated as a problem, since
+// guessing would turn any new value into a cluster-wide DEGRADED.
+func connectivityDegrades(status string) bool {
+	return status == "failing" || status == "suspect"
 }
 
 // Overall cluster-health states.
@@ -98,7 +130,11 @@ const evaluatorScanTTL = 5 * time.Minute
 //	CRITICAL — any ACTIVE critical condition (an observed one included: the
 //	           operator should be looking before the confirm lands);
 //	DEGRADED — active warning conditions, an evaluator without complete
-//	           coverage, or a STALE evaluator (last scan past evaluatorScanTTL);
+//	           coverage, a STALE evaluator (last scan past evaluatorScanTTL),
+//	           or a connectivity edge that is not proven good (failing or
+//	           suspect). A broken peer link is the same kind of gap as missing
+//	           coverage — the mesh is part of what "the cluster is healthy"
+//	           claims, so a fully partitioned mesh can no longer read HEALTHY;
 //	UNKNOWN  — no evaluator has ever completed a scan, or every evaluator's
 //	           last scan is stale;
 //	HEALTHY  — none of the above.
@@ -106,7 +142,12 @@ const evaluatorScanTTL = 5 * time.Minute
 // Deliberately, staleness does NOT gate admission — this roll-up is a read,
 // not an enforcement point. Coupling admission to a single detector's
 // liveness would make that detector a cluster-wide availability SPOF.
-func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosion.HealthEvaluatorStatus, now time.Time) string {
+func overallHealth(
+	conditions []corrosion.HealthCondition,
+	evaluators []corrosion.HealthEvaluatorStatus,
+	mesh []connectivityEdge,
+	now time.Time,
+) string {
 	if len(evaluators) == 0 {
 		return HealthUnknown
 	}
@@ -137,6 +178,15 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		}
 		if stale || e.Coverage != corrosion.CoverageComplete {
 			degraded = true
+		}
+	}
+	// A failing or suspect peer link degrades, and does not escalate past it:
+	// a broken edge is a coverage/observability gap, not proof of corruption,
+	// so it belongs in the same tier as an incomplete scan.
+	for _, e := range mesh {
+		if connectivityDegrades(e.Status) {
+			degraded = true
+			break
 		}
 	}
 	if allStale {

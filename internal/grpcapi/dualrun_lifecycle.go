@@ -51,12 +51,19 @@ import (
 // to other same-version nodes. So during the single rollout that ships this
 // change, a dual-run already CONFIRMED and paging under an old binary has no
 // health_conditions row for a new-binary leader to inherit; that leader's first
-// pass necessarily writes it as a fresh OBSERVED row and Overall/paging go
-// quiet for one detector interval (~60s) even though the split-brain never
-// stopped. There is no code-level remedy: the prior state does not exist
-// anywhere to migrate from. It is bounded to that one rollout and self-heals on
-// the next pass, when the still-present finding re-observes and re-confirms.
-// Every subsequent handover is covered, which is the point of the port.
+// pass necessarily writes it as a fresh OBSERVED row, so PAGING is delayed by
+// one detector interval (~60s) even though the split-brain never stopped —
+// paging gates on the confirm transition, which the next pass reaches.
+//
+// Overall does NOT go quiet: the fresh row is stored at the finding's inherent
+// severity from its very first observation, so GetClusterHealth's roll-up reads
+// CRITICAL for a corruption-class finding immediately. Only the page waits.
+//
+// There is no code-level remedy for that one-interval paging delay: the prior
+// state does not exist anywhere to migrate from. It is bounded to that one
+// rollout and self-heals on the next pass, when the still-present finding
+// re-observes and confirms. Every subsequent handover is covered, which is the
+// point of the port.
 
 // dualRunEvaluator is this detector's evaluator name in health_conditions /
 // health_evaluator_status.

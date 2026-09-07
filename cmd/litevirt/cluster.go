@@ -72,7 +72,7 @@ func newClusterHealthCmd() *cobra.Command {
 				for _, e := range resp.GetConnectivity() {
 					lastSeen := "-"
 					if e.GetLastSeen() != nil {
-						lastSeen = time.Since(e.GetLastSeen().AsTime()).Truncate(time.Second).String() + " ago"
+						lastSeen = ago(e.GetLastSeen().AsTime())
 					}
 					fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n",
 						e.GetObserver(), e.GetTarget(), e.GetStatus(), e.GetConsecutiveFailures(), lastSeen)
@@ -83,6 +83,13 @@ func newClusterHealthCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&includeResolved, "include-resolved", false, "also show conditions resolved within the last 30 days")
 	return cmd
+}
+
+// ago renders a timestamp as a relative duration. The health messages carry
+// timestamps both ways — RFC3339 strings on conditions/evaluators, a
+// google.protobuf.Timestamp on connectivity edges — so both render through here.
+func ago(t time.Time) string {
+	return time.Since(t).Truncate(time.Second).String() + " ago"
 }
 
 // agoOrDash renders an RFC3339 timestamp string as a relative duration, or
@@ -96,7 +103,7 @@ func agoOrDash(rfc3339 string) string {
 	if err != nil {
 		return rfc3339
 	}
-	return time.Since(t).Truncate(time.Second).String() + " ago"
+	return ago(t)
 }
 
 // lv cluster digest — per-table state digest for EVERY host, aggregated server-side (the

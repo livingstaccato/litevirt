@@ -311,6 +311,19 @@ func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration)
 // acquireDualRunLease takes/renews the dual_run_detector leader lease (mirrors the
 // rebalancer's lease: RFC3339 expiry compared bound-now-vs-stored so a dead leader's
 // lease looks expired without waiting for datetime('now')). TTL = 2x interval.
+//
+// This is the codebase's established lease shape — the same leader_election
+// table and the same guarded upsert the failover coordinator and the rebalancer
+// use — and it inherits that model's properties, including the absence of
+// FENCING. The lease is time-based and evaluated against the local replica, so
+// it guarantees neither true mutual exclusion under a replication partition
+// (two nodes can each read their own row as valid) nor that the winner's
+// replica is caught up. Adding fencing tokens or epochs would have to change
+// leader_election for every consumer; it is not done here. What the detector
+// does instead is keep its state in replicated ROWS whose merge is LWW, so a
+// split or lagging leader can perturb a condition's confirmation TIMING but
+// cannot lose positive evidence — see the note on applyConditionLifecycle's
+// !exists branch in dualrun_lifecycle.go.
 func (s *Server) acquireDualRunLease(ctx context.Context, interval time.Duration) bool {
 	now := time.Now().UTC().Format(time.RFC3339)
 	expires := time.Now().Add(2 * interval).UTC().Format(time.RFC3339)

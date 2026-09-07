@@ -22,19 +22,41 @@ import (
 //
 // Lifecycle:
 //
-//   - the FIRST positive observation writes an OBSERVED row at warning severity;
-//   - the second CONSECUTIVE positive scan CONFIRMS it — critical for the
-//     corruption-class codes (vm/ct/vip dual-run, runtime-owner mismatch),
-//     warning for coverage gaps and unresolved ties;
+//   - the FIRST positive observation writes an OBSERVED row at the finding's
+//     INHERENT severity — critical for the corruption-class codes (vm/ct/vip
+//     dual-run, runtime-owner mismatch), warning otherwise. Lifecycle=OBSERVED
+//     already tells every reader "not yet confirmed", so the severity column
+//     carries the finding's real stakes rather than an artificially softened
+//     one: a suspected VM dual-run is a critical-class problem the moment it is
+//     first seen, and GetClusterHealth's roll-up promises to surface it as such;
+//   - the second CONSECUTIVE positive scan CONFIRMS it. Confirmation, not
+//     severity, is what gates PAGING: notify() fires an unconfirmed observation
+//     only as a warning-level "observed (unconfirmed)" notice and pages on the
+//     confirm transition, unchanged by the severity the row stores;
 //   - positive evidence is recorded WITHOUT quorum: refusing to write down
 //     corruption because the cluster is degraded would hide exactly the state
 //     an operator needs most;
 //   - RESOLUTION is stricter than observation: it requires two consecutive
 //     clean scans with COMPLETE coverage (no unreachable or partial peer)
 //     while the leader's decision gate is valid. An incomplete scan can
-//     neither resolve nor reset the observation streak;
+//     neither resolve nor reset the observation streak — but it DOES reset the
+//     CLEAN streak, because "two consecutive complete clean scans" has to mean
+//     consecutive: a blind pass between two clean ones proved nothing and must
+//     not be allowed to bridge them;
 //   - there is no operator force-clear: operators remove the cause, the
 //     evaluator proves the resolution.
+//
+// One-time rollout caveat (upgrade discontinuity): the debounce this replaced
+// was a per-process in-memory map — never durable, never replicated, not even
+// to other same-version nodes. So during the single rollout that ships this
+// change, a dual-run already CONFIRMED and paging under an old binary has no
+// health_conditions row for a new-binary leader to inherit; that leader's first
+// pass necessarily writes it as a fresh OBSERVED row and Overall/paging go
+// quiet for one detector interval (~60s) even though the split-brain never
+// stopped. There is no code-level remedy: the prior state does not exist
+// anywhere to migrate from. It is bounded to that one rollout and self-heals on
+// the next pass, when the still-present finding re-observes and re-confirms.
+// Every subsequent handover is covered, which is the point of the port.
 
 // dualRunEvaluator is this detector's evaluator name in health_conditions /
 // health_evaluator_status.
@@ -154,16 +176,52 @@ func (s *Server) applyConditionLifecycle(
 		byIdentity[finding{kind: notifyKindForCondition(h.Code), target: h.SubjectID}] = h
 	}
 
+	// Every row this pass touches is collected here and issued as ONE deferred
+	// batch at the end, rather than one Execute per row. Two reasons: each
+	// Execute takes the client's EXCLUSIVE lock for its own transaction, so a
+	// pass with many findings — the incident storm this detector exists to
+	// catch — would otherwise block concurrent readers (GetClusterHealth) N
+	// times in a row; and these are periodic-probe writes, the same class as
+	// host_health/clock_skew, which use the deferred (no immediate replicator
+	// wake) path by convention. The batch is also atomic, so a pass now lands
+	// completely or not at all instead of leaving a half-applied lifecycle.
+	var stmts []corrosion.Statement
+	appendCondition := func(f finding, row corrosion.HealthCondition) {
+		stmt, err := corrosion.HealthConditionStatement(s.db, row)
+		if err != nil {
+			slog.Error("dual-run detector: build condition statement",
+				"kind", f.kind, "target", f.target, "error", err)
+			return
+		}
+		stmts = append(stmts, stmt)
+	}
+
 	// Positive findings first: observe or confirm. Recorded without quorum.
 	for f := range current {
 		code, subjectKind := conditionIdentity(f.kind)
 		row, exists := byIdentity[f]
 		evidence := encodeEvidence(details[f], evidenceHosts[f])
 		switch {
+		// KNOWN LIMITATION (pre-existing leader-election model, shared with the
+		// failover coordinator and the rebalancer): "no local row" is treated as
+		// "genuinely new", which a lagging replica cannot distinguish from "the
+		// previous leader's confirm has not replicated here yet". A leader that
+		// takes the lease with a stale replica can therefore momentarily rewrite
+		// an already-CONFIRMED finding as freshly OBSERVED, restarting the
+		// debounce. Fixing it properly needs fencing tokens or epochs in
+		// leader_election itself, which every lease consumer would have to adopt
+		// — out of scope here. The blast radius is bounded: the finding is still
+		// present, so the very next pass re-confirms, and positive evidence is
+		// never lost, only its confirmation timing.
 		case !exists:
 			row = corrosion.HealthCondition{
 				Evaluator: dualRunEvaluator, Code: code, SubjectKind: subjectKind, SubjectID: f.target,
-				Lifecycle: corrosion.ConditionObserved, Severity: corrosion.SeverityWarning,
+				// The stored severity is the finding's inherent severity from the
+				// first observation — Lifecycle=OBSERVED is what says "unconfirmed",
+				// so there is no reason to under-report a corruption-class finding
+				// as a warning. Paging is unchanged: it is gated on the confirm
+				// transition below, not on this column.
+				Lifecycle: corrosion.ConditionObserved, Severity: confirmedSeverity(f.kind),
 				Hosts: evidenceHosts[f], Evidence: evidence,
 				ObserveCount: 1, CleanCount: 0,
 				FirstSeen: now, LastSeen: now, Reporter: s.hostName,
@@ -197,9 +255,7 @@ func (s *Server) applyConditionLifecycle(
 			row.LastSeen = now
 			row.Hosts, row.Evidence, row.Reporter = evidenceHosts[f], evidence, s.hostName
 		}
-		if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
-			slog.Error("dual-run detector: persist condition", "kind", f.kind, "target", f.target, "error", err)
-		}
+		appendCondition(f, row)
 		byIdentity[f] = row
 	}
 
@@ -211,6 +267,19 @@ func (s *Server) applyConditionLifecycle(
 			continue
 		}
 		if !canResolve {
+			// This pass could not prove absence, so it BREAKS the clean streak
+			// rather than being skipped over: leaving CleanCount intact would let
+			// clean → blind → clean resolve a condition on "two consecutive
+			// complete clean scans" when the two clean scans were not
+			// consecutive. Only write when there is a streak to break — a 0 → 0
+			// reset is a no-op, and this loop runs over every tracked condition
+			// on every blind pass.
+			if row.CleanCount != 0 {
+				row.CleanCount = 0
+				row.Reporter = s.hostName
+				appendCondition(f, row)
+				byIdentity[f] = row
+			}
 			continue
 		}
 		row.CleanCount++
@@ -226,9 +295,7 @@ func (s *Server) applyConditionLifecycle(
 			})
 			slog.Info("dual-run detector: condition resolved", "kind", f.kind, "target", f.target)
 		}
-		if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
-			slog.Error("dual-run detector: persist condition", "kind", f.kind, "target", f.target, "error", err)
-		}
+		appendCondition(f, row)
 		byIdentity[f] = row
 	}
 
@@ -237,11 +304,24 @@ func (s *Server) applyConditionLifecycle(
 	if !coverageComplete {
 		coverage = corrosion.CoveragePartial
 	}
-	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
+	if stmt, err := corrosion.HealthEvaluatorStatusStatement(s.db, corrosion.HealthEvaluatorStatus{
 		Evaluator: dualRunEvaluator, LastScan: now, Coverage: coverage,
 		Reporter: s.hostName, Detail: coverageDetail,
 	}); err != nil {
-		slog.Warn("dual-run detector: persist evaluator status", "error", err)
+		slog.Warn("dual-run detector: build evaluator status statement", "error", err)
+	} else {
+		stmts = append(stmts, stmt)
+	}
+
+	// One transaction for the whole pass. The batch is atomic, so there is no
+	// per-row error to report — a failure means nothing landed, and the next
+	// pass (60s) recomputes and rewrites the same rows from scratch.
+	if len(stmts) > 0 {
+		if err := s.db.ExecuteBatchDeferred(ctx, stmts); err != nil {
+			slog.Error("dual-run detector: persist condition pass",
+				"evaluator", dualRunEvaluator, "scan", now, "statements", len(stmts),
+				"coverage", coverage, "error", err)
+		}
 	}
 
 	// Gauges rebuild from the CONFIRMED conditions (the durable state), so a

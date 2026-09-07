@@ -128,8 +128,17 @@ func captureDualRun(t *testing.T, s *Server) (sets func(target string) int, clea
 	return sets, clears, unsub
 }
 
-func confirmed(st *dualRunState, kind, target string) bool {
-	return st.confirmed[finding{kind: kind, target: target}]
+// confirmedCondition reports whether the durable health_conditions row for
+// (kind, target) is currently in the CONFIRMED lifecycle state — the durable
+// replacement for the old in-memory st.confirmed map.
+func confirmedCondition(t *testing.T, s *Server, kind, target string) bool {
+	t.Helper()
+	code, subjectKind := conditionIdentity(kind)
+	cond, ok, err := corrosion.GetHealthCondition(context.Background(), s.db, dualRunEvaluator, code, subjectKind, target)
+	if err != nil {
+		t.Fatalf("GetHealthCondition(%s, %s): %v", kind, target, err)
+	}
+	return ok && cond.Lifecycle == corrosion.ConditionConfirmed
 }
 
 // TestDualRun_VMOnTwoHosts_PagesAfterDebounce: a VM that is an active disk-holder on two
@@ -144,25 +153,24 @@ func TestDualRun_VMOnTwoHosts_PagesAfterDebounce(t *testing.T) {
 	sets, _, stop := captureDualRun(t, s)
 	defer stop()
 	ctx := context.Background()
-	st := newDualRunState()
 
-	s.detectDualRunPass(ctx, st) // pass 1 — below threshold
-	if confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // pass 1 — below threshold
+	if confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("confirmed on pass 1 — debounce not applied")
 	}
 	if got := sets("ha.dualrun.vm:vmA"); got != 0 {
 		t.Fatalf("paged %d times on pass 1, want 0", got)
 	}
 
-	s.detectDualRunPass(ctx, st) // pass 2 — confirm
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // pass 2 — confirm
+	if !confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("not confirmed on pass 2")
 	}
 	if got := sets("ha.dualrun.vm:vmA"); got != 1 {
 		t.Fatalf("paged %d times through pass 2, want 1", got)
 	}
 
-	s.detectDualRunPass(ctx, st) // pass 3 — still present, no re-page (set-transition only)
+	s.detectDualRunPass(ctx) // pass 3 — still present, no re-page (set-transition only)
 	if got := sets("ha.dualrun.vm:vmA"); got != 1 {
 		t.Fatalf("paged %d times through pass 3, want 1 (set-transition only)", got)
 	}
@@ -182,10 +190,9 @@ func TestDualRun_StuckMigrationTwoDiskHolders_Pages(t *testing.T) {
 			"h2": {diskHolderVMs: []string{"vmA"}},
 		})
 		ctx := context.Background()
-		st := newDualRunState()
-		s.detectDualRunPass(ctx, st)
-		s.detectDualRunPass(ctx, st)
-		if !confirmed(st, kindDualRunVM, "vmA") {
+		s.detectDualRunPass(ctx)
+		s.detectDualRunPass(ctx)
+		if !confirmedCondition(t, s, kindDualRunVM, "vmA") {
 			t.Fatalf("state %q: two active disk-holders must page regardless of DB migration state", state)
 		}
 	}
@@ -203,13 +210,12 @@ func TestDualRun_OwnerMismatch_MigrationExempt(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindOwnerMismatch, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCondition(t, s, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must stay exempt for a migrating VM (cutover lag)")
 	}
-	if confirmed(st, kindDualRunVM, "vmA") {
+	if confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("single holder is not a dual-run")
 	}
 }
@@ -225,10 +231,9 @@ func TestDualRun_VIPOnTwoHosts(t *testing.T) {
 		"h1": {kernelVIPs: []string{"10.0.0.9"}},
 		"h2": {},
 	})
-	st1 := newDualRunState()
-	s1.detectDualRunPass(ctx, st1)
-	s1.detectDualRunPass(ctx, st1)
-	if confirmed(st1, kindDualRunVIP, "10.0.0.9") {
+	s1.detectDualRunPass(ctx)
+	s1.detectDualRunPass(ctx)
+	if confirmedCondition(t, s1, kindDualRunVIP, "10.0.0.9") {
 		t.Fatal("single VIP holder should not page")
 	}
 
@@ -238,10 +243,9 @@ func TestDualRun_VIPOnTwoHosts(t *testing.T) {
 		"h1": {kernelVIPs: []string{"10.0.0.9"}},
 		"h2": {kernelVIPs: []string{"10.0.0.9"}},
 	})
-	st2 := newDualRunState()
-	s2.detectDualRunPass(ctx, st2)
-	s2.detectDualRunPass(ctx, st2)
-	if !confirmed(st2, kindDualRunVIP, "10.0.0.9") {
+	s2.detectDualRunPass(ctx)
+	s2.detectDualRunPass(ctx)
+	if !confirmedCondition(t, s2, kindDualRunVIP, "10.0.0.9") {
 		t.Fatal("dual VIP holder should page")
 	}
 }
@@ -260,13 +264,12 @@ func TestDualRun_OwnerMismatch_CoverageGated(t *testing.T) {
 		"h1": {},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	}, "h3")
-	stP := newDualRunState()
-	sPartial.detectDualRunPass(ctx, stP)
-	sPartial.detectDualRunPass(ctx, stP)
-	if confirmed(stP, kindOwnerMismatch, "vmA") {
+	sPartial.detectDualRunPass(ctx)
+	sPartial.detectDualRunPass(ctx)
+	if confirmedCondition(t, sPartial, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must be suppressed when the DB owner was not probed (partial coverage)")
 	}
-	if !confirmed(stP, kindDualRunCoverage, "h3") {
+	if !confirmedCondition(t, sPartial, kindDualRunCoverage, "h3") {
 		t.Fatal("expected a coverage finding for the unprobed owner h3")
 	}
 
@@ -278,10 +281,9 @@ func TestDualRun_OwnerMismatch_CoverageGated(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}},
 		"h3": {},
 	})
-	stF := newDualRunState()
-	sFull.detectDualRunPass(ctx, stF)
-	sFull.detectDualRunPass(ctx, stF)
-	if !confirmed(stF, kindOwnerMismatch, "vmA") {
+	sFull.detectDualRunPass(ctx)
+	sFull.detectDualRunPass(ctx)
+	if !confirmedCondition(t, sFull, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch should page under full coverage with owner probed-and-absent")
 	}
 }
@@ -295,10 +297,9 @@ func TestDualRun_CrossNodeTies(t *testing.T) {
 		"h2": {unresolvedTies: 3},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindLWWUnresolved, "h2") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCondition(t, s, kindLWWUnresolved, "h2") {
 		t.Fatal("expected an unresolved-ties finding for the peer h2")
 	}
 }
@@ -313,13 +314,12 @@ func TestDualRun_ProbeFailure_SurfacedNotSilent(t *testing.T) {
 	sets, _, stop := captureDualRun(t, s)
 	defer stop()
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindDualRunCoverage, "h2") {
+	s.detectDualRunPass(ctx)
+	if confirmedCondition(t, s, kindDualRunCoverage, "h2") {
 		t.Fatal("coverage finding confirmed on pass 1 — debounce not applied")
 	}
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunCoverage, "h2") {
+	s.detectDualRunPass(ctx)
+	if !confirmedCondition(t, s, kindDualRunCoverage, "h2") {
 		t.Fatal("unprobed host must surface as a coverage finding")
 	}
 	if got := sets("ha.dualrun.coverage:h2"); got != 1 {
@@ -327,7 +327,8 @@ func TestDualRun_ProbeFailure_SurfacedNotSilent(t *testing.T) {
 	}
 }
 
-// TestDualRun_HealClearsConfirmed: when a dual-run heals, the confirmed set drops it and a
+// TestDualRun_HealClearsConfirmed: when a dual-run heals, the confirmed condition resolves
+// (after two consecutive complete clean scans — the durable resolution threshold) and a
 // cleared event fires.
 func TestDualRun_HealClearsConfirmed(t *testing.T) {
 	s := dualRunTestServer(t, 2)
@@ -335,15 +336,14 @@ func TestDualRun_HealClearsConfirmed(t *testing.T) {
 	_, clears, stop := captureDualRun(t, s)
 	defer stop()
 	ctx := context.Background()
-	st := newDualRunState()
 
 	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
 		"h1": {diskHolderVMs: []string{"vmA"}},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("precondition: should be confirmed")
 	}
 
@@ -352,9 +352,13 @@ func TestDualRun_HealClearsConfirmed(t *testing.T) {
 		"h1": {diskHolderVMs: []string{"vmA"}},
 		"h2": {},
 	})
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindDualRunVM, "vmA") {
-		t.Fatal("healed dual-run must clear from confirmed")
+	s.detectDualRunPass(ctx) // 1st clean pass: still confirmed, resolution needs a 2nd
+	if !confirmedCondition(t, s, kindDualRunVM, "vmA") {
+		t.Fatal("condition must remain confirmed after only one clean pass (resolution requires two)")
+	}
+	s.detectDualRunPass(ctx) // 2nd consecutive complete clean pass: resolves
+	if confirmedCondition(t, s, kindDualRunVM, "vmA") {
+		t.Fatal("healed dual-run must clear from confirmed after two consecutive complete clean scans")
 	}
 	if got := clears("ha.dualrun.vm:vmA"); got != 1 {
 		t.Fatalf("cleared event fired %d times, want 1", got)
@@ -375,9 +379,8 @@ func TestDualRun_NeverDestroys(t *testing.T) {
 	s.virt = rv
 	seedVM(t, s, "vmA", "h1", "running")
 
-	st := newDualRunState()
 	for i := 0; i < 3; i++ {
-		s.detectDualRunPass(ctx, st) // real gather → localRuntimeSnapshot(self)
+		s.detectDualRunPass(ctx) // real gather → localRuntimeSnapshot(self)
 	}
 	if rv.destroys != 0 || rv.undefines != 0 {
 		t.Fatalf("detector performed destructive ops: destroys=%d undefines=%d", rv.destroys, rv.undefines)
@@ -452,10 +455,9 @@ func TestDualRun_FencedHostStillRunning_Detected(t *testing.T) {
 		"h1": {diskHolderVMs: []string{"vmA"}},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("a fenced host still running the VM must be detected as a dual-run")
 	}
 }
@@ -470,10 +472,9 @@ func TestDualRun_ContainerOnTwoHosts(t *testing.T) {
 		"h1": {runningCTs: []string{"ctA"}},
 		"h2": {runningCTs: []string{"ctA"}},
 	})
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunCT, "ctA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCondition(t, s, kindDualRunCT, "ctA") {
 		t.Fatal("a container running on two hosts should page")
 	}
 
@@ -486,10 +487,9 @@ func TestDualRun_ContainerOnTwoHosts(t *testing.T) {
 		"h1": {runningCTs: []string{"ctB"}},
 		"h2": {runningCTs: []string{"ctB"}},
 	})
-	stMig := newDualRunState()
-	sMig.detectDualRunPass(ctx, stMig)
-	sMig.detectDualRunPass(ctx, stMig)
-	if !confirmed(stMig, kindDualRunCT, "ctB") {
+	sMig.detectDualRunPass(ctx)
+	sMig.detectDualRunPass(ctx)
+	if !confirmedCondition(t, sMig, kindDualRunCT, "ctB") {
 		t.Fatal("two running containers must page regardless of DB migration state")
 	}
 }
@@ -501,10 +501,9 @@ func TestDualRun_UnsupportedPeer_NotPagedAsCoverage(t *testing.T) {
 	s := dualRunTestServer(t, 2)
 	s.gatherRuntimeOverride = gatherWith(map[string]runtimeSnapshot{"h1": {}}, nil, []string{"h2"})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindDualRunCoverage, "h2") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCondition(t, s, kindDualRunCoverage, "h2") {
 		t.Fatal("an older-binary peer must not page as a coverage gap")
 	}
 }
@@ -520,10 +519,9 @@ func TestDualRun_OwnerMismatch_UnprobedOwnerDeferred(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	}, "h3")
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindOwnerMismatch, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCondition(t, s, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must be deferred when the DB owner was not positively probed")
 	}
 }
@@ -534,7 +532,6 @@ func TestDualRun_DebounceReArmsOnFlap(t *testing.T) {
 	s := dualRunTestServer(t, 2)
 	seedVM(t, s, "vmA", "h1", "running")
 	ctx := context.Background()
-	st := newDualRunState()
 
 	present := fixedGather(map[string]runtimeSnapshot{
 		"h1": {diskHolderVMs: []string{"vmA"}},
@@ -546,16 +543,16 @@ func TestDualRun_DebounceReArmsOnFlap(t *testing.T) {
 	})
 
 	s.gatherRuntimeOverride = present
-	s.detectDualRunPass(ctx, st) // seen=1
+	s.detectDualRunPass(ctx) // seen=1
 	s.gatherRuntimeOverride = absent
-	s.detectDualRunPass(ctx, st) // gone -> reset
+	s.detectDualRunPass(ctx) // gone -> reset
 	s.gatherRuntimeOverride = present
-	s.detectDualRunPass(ctx, st) // seen=1 again (must NOT confirm)
-	if confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // seen=1 again (must NOT confirm)
+	if confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("a flapping finding must not confirm on its first pass back (counter must reset)")
 	}
-	s.detectDualRunPass(ctx, st) // seen=2 -> confirm
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx) // seen=2 -> confirm
+	if !confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("should confirm after two consecutive passes back")
 	}
 }
@@ -666,13 +663,12 @@ func TestDualRun_PartialOwner_NoFalseOwnerMismatch(t *testing.T) {
 		"h3": {partial: true},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if confirmed(st, kindOwnerMismatch, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if confirmedCondition(t, s, kindOwnerMismatch, "vmA") {
 		t.Fatal("owner-mismatch must be deferred when the owner's snapshot is partial")
 	}
-	if !confirmed(st, kindDualRunCoverage, "h3") {
+	if !confirmedCondition(t, s, kindDualRunCoverage, "h3") {
 		t.Fatal("a partial host must raise a coverage finding")
 	}
 }
@@ -686,10 +682,9 @@ func TestDualRun_PartialHost_PositiveHoldersStillCounted(t *testing.T) {
 		"h2": {diskHolderVMs: []string{"vmA"}, partial: true},
 	})
 	ctx := context.Background()
-	st := newDualRunState()
-	s.detectDualRunPass(ctx, st)
-	s.detectDualRunPass(ctx, st)
-	if !confirmed(st, kindDualRunVM, "vmA") {
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+	if !confirmedCondition(t, s, kindDualRunVM, "vmA") {
 		t.Fatal("a partial host's positive holder must still count toward a dual-run")
 	}
 }

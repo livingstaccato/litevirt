@@ -259,6 +259,9 @@ var tableNames = []string{
 	// v47 cluster CRL — a revocation list is published to be read, and a node that
 	// missed the replicated write is exactly the node that must repair from a peer.
 	"cluster_crl",
+	// v48 durable cluster-health model — health is cluster state, so every node must
+	// converge on the same observed/confirmed/resolved conditions and evaluator status.
+	"health_conditions", "health_evaluator_status",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

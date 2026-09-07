@@ -289,7 +289,13 @@ import (
 //	     replicate in the clear because a CRL is signed by the cluster CA — a peer
 //	     can write the row but cannot forge one that verifies, and every reader
 //	     checks the signature before installing it. One new table.
-const CurrentSchemaVersion = 47
+//	v48: durable cluster-health model — health_conditions (one row per
+//	    detected condition, with its observed→confirmed→resolved lifecycle
+//	    and canonical evidence) and health_evaluator_status (each evaluator's
+//	    latest scan: when, with what coverage). Replaces the dual-run
+//	    detector's in-memory debounce state, which a leadership handover or
+//	    daemon restart silently forgot.
+const CurrentSchemaVersion = 48
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -718,6 +724,61 @@ var schemaDDL = []string{
 		updated_at   TEXT NOT NULL,
 		deleted_at   TEXT,
 		PRIMARY KEY (observer, target)
+	)`,
+
+	// health_conditions — the durable cluster-health model (v48). One row per
+	// (evaluator, code, subject): the CURRENT state of a detected condition,
+	// with its full lifecycle (observed → confirmed → resolved) and canonical
+	// evidence. This replaces in-memory dual-run debounce state: health is
+	// cluster STATE, so it must survive detector leadership changes and
+	// daemon restarts, and every node must converge on the same view of it.
+	//
+	// Written by the detecting evaluator (normally the detector lease holder;
+	// positive evidence may be recorded without quorum — refusing to record
+	// CORRUPTION because the cluster is degraded would hide exactly the state
+	// an operator needs). Resolution is stricter than observation: only the
+	// lease holder with a valid decision gate and two consecutive COMPLETE
+	// clean scans may resolve. Default LWW merge: rows are keyed per
+	// evaluator, and one evaluator instance writes at a time, so last-writer-
+	// wins converges to the newest scan.
+	`CREATE TABLE IF NOT EXISTS health_conditions (
+		evaluator     TEXT NOT NULL,               -- producing evaluator: dual_run | …
+		code          TEXT NOT NULL,               -- condition code, e.g. vm_dual_run
+		subject_kind  TEXT NOT NULL,               -- vm | container | vip | host | cluster
+		subject_id    TEXT NOT NULL,
+		lifecycle     TEXT NOT NULL DEFAULT 'observed',  -- observed | confirmed | resolved
+		severity      TEXT NOT NULL DEFAULT 'warning',   -- info | warning | critical
+		hosts         TEXT NOT NULL DEFAULT '',    -- JSON array of involved host names
+		evidence      TEXT NOT NULL DEFAULT '',    -- canonical structured evidence (JSON)
+		observe_count INTEGER NOT NULL DEFAULT 0,  -- consecutive positive scans
+		clean_count   INTEGER NOT NULL DEFAULT 0,  -- consecutive complete clean scans
+		first_seen    TEXT NOT NULL DEFAULT '',
+		last_seen     TEXT NOT NULL DEFAULT '',
+		confirmed_at  TEXT,
+		resolved_at   TEXT,
+		reporter      TEXT NOT NULL DEFAULT '',    -- host that wrote the latest transition
+		created_at    TEXT NOT NULL,
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT,
+		PRIMARY KEY (evaluator, code, subject_kind, subject_id)
+	)`,
+
+	// health_evaluator_status — each evaluator's latest scan: when it ran, what
+	// it could see, and who ran it (v48). Coverage is a first-class fact
+	// because ABSENCE of a condition is only meaningful under COMPLETE
+	// coverage: a scan that could not reach every peer cannot prove a dual-run
+	// is gone, and consumers (GetClusterHealth) must be able to tell "clean"
+	// from "blind". One row per evaluator; LWW.
+	`CREATE TABLE IF NOT EXISTS health_evaluator_status (
+		evaluator     TEXT NOT NULL,
+		last_scan     TEXT NOT NULL DEFAULT '',    -- RFC3339 of the latest completed scan
+		coverage      TEXT NOT NULL DEFAULT '',    -- complete | partial | unreachable | unsupported
+		reporter      TEXT NOT NULL DEFAULT '',    -- host that ran the scan
+		detail        TEXT NOT NULL DEFAULT '',    -- human-readable coverage detail
+		created_at    TEXT NOT NULL,
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT,
+		PRIMARY KEY (evaluator)
 	)`,
 
 	`CREATE TABLE IF NOT EXISTS clock_skew (
@@ -1954,6 +2015,11 @@ var schemaIndexes = []string{
 	// Host health: queried by target for failover quorum and by observer for sweeps.
 	`CREATE INDEX IF NOT EXISTS idx_health_target ON host_health(target)`,
 
+	// Cluster health conditions (v48): filtered by lifecycle state for active-conditions lists.
+	`CREATE INDEX IF NOT EXISTS idx_health_conditions_lifecycle ON health_conditions(lifecycle) WHERE deleted_at IS NULL`,
+	// Cluster health conditions: resolved conditions indexed for retention GC.
+	`CREATE INDEX IF NOT EXISTS idx_health_conditions_resolved ON health_conditions(resolved_at) WHERE resolved_at IS NOT NULL AND deleted_at IS NULL`,
+
 	// PCI devices: filtered by host_name for placement and inspection.
 	`CREATE INDEX IF NOT EXISTS idx_pci_host ON host_pci_devices(host_name) WHERE deleted_at IS NULL`,
 	// PCI devices: filtered by vm_name for passthrough tracking.
@@ -1997,6 +2063,8 @@ var tablePrimaryKeys = map[string][]string{
 	"hosts":                    {"name"},
 	"host_labels":              {"host_name", "key"},
 	"host_health":              {"observer", "target"},
+	"health_conditions":        {"evaluator", "code", "subject_kind", "subject_id"},
+	"health_evaluator_status":  {"evaluator"},
 	"host_runtime_usage":       {"host_name"},
 	"clock_skew":               {"observer", "target"},
 	"crl_versions":             {"host"},
@@ -2390,6 +2458,7 @@ var createTableUnits = []struct {
 	{45, "audit_signing_keys"}, {45, "audit_chain_heads"},
 	{46, "audit_key_lifecycle"},
 	{47, "cluster_crl"},
+	{48, "health_conditions"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

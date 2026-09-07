@@ -27,10 +27,16 @@ const (
 	LiteVirt_UndrainHost_FullMethodName                = "/litevirt.v1.LiteVirt/UndrainHost"
 	LiteVirt_SetHostLabels_FullMethodName              = "/litevirt.v1.LiteVirt/SetHostLabels"
 	LiteVirt_FenceHost_FullMethodName                  = "/litevirt.v1.LiteVirt/FenceHost"
-	LiteVirt_GetHostHealth_FullMethodName              = "/litevirt.v1.LiteVirt/GetHostHealth"
 	LiteVirt_GetClusterHealth_FullMethodName           = "/litevirt.v1.LiteVirt/GetClusterHealth"
 	LiteVirt_RemoveHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RemoveHost"
 	LiteVirt_AdmitHost_FullMethodName                  = "/litevirt.v1.LiteVirt/AdmitHost"
+	LiteVirt_ListHostNetworks_FullMethodName           = "/litevirt.v1.LiteVirt/ListHostNetworks"
+	LiteVirt_UpsertHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/UpsertHostNetwork"
+	LiteVirt_PlanHostNetwork_FullMethodName            = "/litevirt.v1.LiteVirt/PlanHostNetwork"
+	LiteVirt_ApplyHostNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ApplyHostNetwork"
+	LiteVirt_DeleteHostNetwork_FullMethodName          = "/litevirt.v1.LiteVirt/DeleteHostNetwork"
+	LiteVirt_IsolateHost_FullMethodName                = "/litevirt.v1.LiteVirt/IsolateHost"
+	LiteVirt_ReseedHost_FullMethodName                 = "/litevirt.v1.LiteVirt/ReseedHost"
 	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
 	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
 	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
@@ -48,9 +54,7 @@ const (
 	LiteVirt_RestartVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestartVM"
 	LiteVirt_DeleteVM_FullMethodName                   = "/litevirt.v1.LiteVirt/DeleteVM"
 	LiteVirt_RepairVMOwner_FullMethodName              = "/litevirt.v1.LiteVirt/RepairVMOwner"
-	LiteVirt_CheckVMRuntime_FullMethodName             = "/litevirt.v1.LiteVirt/CheckVMRuntime"
-	LiteVirt_CheckContainerRuntime_FullMethodName      = "/litevirt.v1.LiteVirt/CheckContainerRuntime"
-	LiteVirt_ReportRuntime_FullMethodName              = "/litevirt.v1.LiteVirt/ReportRuntime"
+	LiteVirt_GetRuntimeInventory_FullMethodName        = "/litevirt.v1.LiteVirt/GetRuntimeInventory"
 	LiteVirt_CheckVIPParticipant_FullMethodName        = "/litevirt.v1.LiteVirt/CheckVIPParticipant"
 	LiteVirt_RelayCheckVIPParticipant_FullMethodName   = "/litevirt.v1.LiteVirt/RelayCheckVIPParticipant"
 	LiteVirt_CheckLBPresent_FullMethodName             = "/litevirt.v1.LiteVirt/CheckLBPresent"
@@ -249,6 +253,8 @@ const (
 	LiteVirt_ExecuteCreateVM_FullMethodName            = "/litevirt.v1.LiteVirt/ExecuteCreateVM"
 	LiteVirt_ReserveProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReserveProjectCapacity"
 	LiteVirt_ReleaseProjectCapacity_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseProjectCapacity"
+	LiteVirt_ReserveHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReserveHostCapacity"
+	LiteVirt_ReleaseHostCapacity_FullMethodName        = "/litevirt.v1.LiteVirt/ReleaseHostCapacity"
 )
 
 // LiteVirtClient is the client API for LiteVirt service.
@@ -263,10 +269,22 @@ type LiteVirtClient interface {
 	UndrainHost(ctx context.Context, in *UndrainHostRequest, opts ...grpc.CallOption) (*Host, error)
 	SetHostLabels(ctx context.Context, in *SetHostLabelsRequest, opts ...grpc.CallOption) (*Host, error)
 	FenceHost(ctx context.Context, in *FenceHostRequest, opts ...grpc.CallOption) (*FenceResult, error)
-	GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error)
 	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Host network configuration (v48): intent CRUD runs anywhere (replicated
+	// rows); Plan and Apply are forwarded to the OWNING host — they read and
+	// mutate its local netplan state.
+	ListHostNetworks(ctx context.Context, in *ListHostNetworksRequest, opts ...grpc.CallOption) (*ListHostNetworksResponse, error)
+	UpsertHostNetwork(ctx context.Context, in *UpsertHostNetworkRequest, opts ...grpc.CallOption) (*HostNetwork, error)
+	PlanHostNetwork(ctx context.Context, in *PlanHostNetworkRequest, opts ...grpc.CallOption) (*PlanHostNetworkResponse, error)
+	ApplyHostNetwork(ctx context.Context, in *ApplyHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	DeleteHostNetwork(ctx context.Context, in *DeleteHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// Isolation epoch (v49): isolate is written by a HEALTHY PEER about another
+	// host; reseed is forwarded to the isolated host, which pulls a full state
+	// dump from a healthy peer and clears its epoch only on verified convergence.
+	IsolateHost(ctx context.Context, in *IsolateHostRequest, opts ...grpc.CallOption) (*HostIsolationStatus, error)
+	ReseedHost(ctx context.Context, in *ReseedHostRequest, opts ...grpc.CallOption) (*ReseedHostResponse, error)
 	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
 	// replication then carries to every node. `lv host rm` calls it after revoking
 	// the removed host's certificate — revocation needs the CA private key, which
@@ -302,9 +320,7 @@ type LiteVirtClient interface {
 	RestartVM(ctx context.Context, in *RestartVMRequest, opts ...grpc.CallOption) (*VM, error)
 	DeleteVM(ctx context.Context, in *DeleteVMRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	RepairVMOwner(ctx context.Context, in *RepairVMOwnerRequest, opts ...grpc.CallOption) (*RepairVMOwnerResponse, error)
-	CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error)
-	CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error)
-	ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error)
+	GetRuntimeInventory(ctx context.Context, in *GetRuntimeInventoryRequest, opts ...grpc.CallOption) (*RuntimeInventory, error)
 	CheckVIPParticipant(ctx context.Context, in *CheckVIPParticipantRequest, opts ...grpc.CallOption) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(ctx context.Context, in *RelayCheckVIPParticipantRequest, opts ...grpc.CallOption) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(ctx context.Context, in *CheckLBPresentRequest, opts ...grpc.CallOption) (*CheckLBPresentResponse, error)
@@ -622,6 +638,20 @@ type LiteVirtClient interface {
 	// owner, which is the only node that reserves against it.
 	ReserveProjectCapacity(ctx context.Context, in *ReserveProjectCapacityRequest, opts ...grpc.CallOption) (*ReserveProjectCapacityResponse, error)
 	ReleaseProjectCapacity(ctx context.Context, in *ReleaseProjectCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ── destination-owned migration host admission ──
+	// PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+	// only it can probe its own runtime inventory, and replicated capacity
+	// observations degrade to DB-only arithmetic exactly when they are missing,
+	// stale, or unreadable — so a source-side decision silently loses the final
+	// target-local safety gate. The source obtains this lease before stopping a
+	// container or beginning a VM transfer, holds it across the whole move, and
+	// releases it on every return path. The destination refuses a request naming
+	// any host but itself, runs full local host admission (fresh inventory,
+	// ownership conditions, runtime-only load), persists a durable reservation
+	// operation, and returns its id as the lease. Release is idempotent and only
+	// ever terminates a capacity operation targeting the local host.
+	ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error)
+	ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 }
 
 type liteVirtClient struct {
@@ -720,16 +750,6 @@ func (c *liteVirtClient) FenceHost(ctx context.Context, in *FenceHostRequest, op
 	return out, nil
 }
 
-func (c *liteVirtClient) GetHostHealth(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*HostHealthMatrix, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(HostHealthMatrix)
-	err := c.cc.Invoke(ctx, LiteVirt_GetHostHealth_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *liteVirtClient) GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClusterHealth)
@@ -754,6 +774,76 @@ func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_AdmitHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListHostNetworks(ctx context.Context, in *ListHostNetworksRequest, opts ...grpc.CallOption) (*ListHostNetworksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListHostNetworksResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListHostNetworks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) UpsertHostNetwork(ctx context.Context, in *UpsertHostNetworkRequest, opts ...grpc.CallOption) (*HostNetwork, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HostNetwork)
+	err := c.cc.Invoke(ctx, LiteVirt_UpsertHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PlanHostNetwork(ctx context.Context, in *PlanHostNetworkRequest, opts ...grpc.CallOption) (*PlanHostNetworkResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PlanHostNetworkResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PlanHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ApplyHostNetwork(ctx context.Context, in *ApplyHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ApplyHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) DeleteHostNetwork(ctx context.Context, in *DeleteHostNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_DeleteHostNetwork_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) IsolateHost(ctx context.Context, in *IsolateHostRequest, opts ...grpc.CallOption) (*HostIsolationStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HostIsolationStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_IsolateHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReseedHost(ctx context.Context, in *ReseedHostRequest, opts ...grpc.CallOption) (*ReseedHostResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReseedHostResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReseedHost_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -945,30 +1035,10 @@ func (c *liteVirtClient) RepairVMOwner(ctx context.Context, in *RepairVMOwnerReq
 	return out, nil
 }
 
-func (c *liteVirtClient) CheckVMRuntime(ctx context.Context, in *CheckVMRuntimeRequest, opts ...grpc.CallOption) (*CheckVMRuntimeResponse, error) {
+func (c *liteVirtClient) GetRuntimeInventory(ctx context.Context, in *GetRuntimeInventoryRequest, opts ...grpc.CallOption) (*RuntimeInventory, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CheckVMRuntimeResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_CheckVMRuntime_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *liteVirtClient) CheckContainerRuntime(ctx context.Context, in *CheckContainerRuntimeRequest, opts ...grpc.CallOption) (*CheckContainerRuntimeResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(CheckContainerRuntimeResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_CheckContainerRuntime_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *liteVirtClient) ReportRuntime(ctx context.Context, in *ReportRuntimeRequest, opts ...grpc.CallOption) (*ReportRuntimeResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReportRuntimeResponse)
-	err := c.cc.Invoke(ctx, LiteVirt_ReportRuntime_FullMethodName, in, out, cOpts...)
+	out := new(RuntimeInventory)
+	err := c.cc.Invoke(ctx, LiteVirt_GetRuntimeInventory_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3168,6 +3238,26 @@ func (c *liteVirtClient) ReleaseProjectCapacity(ctx context.Context, in *Release
 	return out, nil
 }
 
+func (c *liteVirtClient) ReserveHostCapacity(ctx context.Context, in *ReserveHostCapacityRequest, opts ...grpc.CallOption) (*ReserveHostCapacityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReserveHostCapacityResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReserveHostCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ReleaseHostCapacity(ctx context.Context, in *ReleaseHostCapacityRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseHostCapacity_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // LiteVirtServer is the server API for LiteVirt service.
 // All implementations must embed UnimplementedLiteVirtServer
 // for forward compatibility.
@@ -3180,10 +3270,22 @@ type LiteVirtServer interface {
 	UndrainHost(context.Context, *UndrainHostRequest) (*Host, error)
 	SetHostLabels(context.Context, *SetHostLabelsRequest) (*Host, error)
 	FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error)
-	GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error)
 	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
 	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
+	// Host network configuration (v48): intent CRUD runs anywhere (replicated
+	// rows); Plan and Apply are forwarded to the OWNING host — they read and
+	// mutate its local netplan state.
+	ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error)
+	UpsertHostNetwork(context.Context, *UpsertHostNetworkRequest) (*HostNetwork, error)
+	PlanHostNetwork(context.Context, *PlanHostNetworkRequest) (*PlanHostNetworkResponse, error)
+	ApplyHostNetwork(context.Context, *ApplyHostNetworkRequest) (*emptypb.Empty, error)
+	DeleteHostNetwork(context.Context, *DeleteHostNetworkRequest) (*emptypb.Empty, error)
+	// Isolation epoch (v49): isolate is written by a HEALTHY PEER about another
+	// host; reseed is forwarded to the isolated host, which pulls a full state
+	// dump from a healthy peer and clears its epoch only on verified convergence.
+	IsolateHost(context.Context, *IsolateHostRequest) (*HostIsolationStatus, error)
+	ReseedHost(context.Context, *ReseedHostRequest) (*ReseedHostResponse, error)
 	// PublishCRL hands the cluster a CA-signed certificate revocation list, which
 	// replication then carries to every node. `lv host rm` calls it after revoking
 	// the removed host's certificate — revocation needs the CA private key, which
@@ -3219,9 +3321,7 @@ type LiteVirtServer interface {
 	RestartVM(context.Context, *RestartVMRequest) (*VM, error)
 	DeleteVM(context.Context, *DeleteVMRequest) (*emptypb.Empty, error)
 	RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error)
-	CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error)
-	CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error)
-	ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error)
+	GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error)
 	CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error)
 	RelayCheckVIPParticipant(context.Context, *RelayCheckVIPParticipantRequest) (*RelayCheckVIPParticipantResponse, error)
 	CheckLBPresent(context.Context, *CheckLBPresentRequest) (*CheckLBPresentResponse, error)
@@ -3539,6 +3639,20 @@ type LiteVirtServer interface {
 	// owner, which is the only node that reserves against it.
 	ReserveProjectCapacity(context.Context, *ReserveProjectCapacityRequest) (*ReserveProjectCapacityResponse, error)
 	ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error)
+	// ── destination-owned migration host admission ──
+	// PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+	// only it can probe its own runtime inventory, and replicated capacity
+	// observations degrade to DB-only arithmetic exactly when they are missing,
+	// stale, or unreadable — so a source-side decision silently loses the final
+	// target-local safety gate. The source obtains this lease before stopping a
+	// container or beginning a VM transfer, holds it across the whole move, and
+	// releases it on every return path. The destination refuses a request naming
+	// any host but itself, runs full local host admission (fresh inventory,
+	// ownership conditions, runtime-only load), persists a durable reservation
+	// operation, and returns its id as the lease. Release is idempotent and only
+	// ever terminates a capacity operation targeting the local host.
+	ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error)
+	ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error)
 	mustEmbedUnimplementedLiteVirtServer()
 }
 
@@ -3570,9 +3684,6 @@ func (UnimplementedLiteVirtServer) SetHostLabels(context.Context, *SetHostLabels
 func (UnimplementedLiteVirtServer) FenceHost(context.Context, *FenceHostRequest) (*FenceResult, error) {
 	return nil, status.Error(codes.Unimplemented, "method FenceHost not implemented")
 }
-func (UnimplementedLiteVirtServer) GetHostHealth(context.Context, *emptypb.Empty) (*HostHealthMatrix, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetHostHealth not implemented")
-}
 func (UnimplementedLiteVirtServer) GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetClusterHealth not implemented")
 }
@@ -3581,6 +3692,27 @@ func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostReques
 }
 func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdmitHost not implemented")
+}
+func (UnimplementedLiteVirtServer) ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListHostNetworks not implemented")
+}
+func (UnimplementedLiteVirtServer) UpsertHostNetwork(context.Context, *UpsertHostNetworkRequest) (*HostNetwork, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpsertHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) PlanHostNetwork(context.Context, *PlanHostNetworkRequest) (*PlanHostNetworkResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PlanHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) ApplyHostNetwork(context.Context, *ApplyHostNetworkRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) DeleteHostNetwork(context.Context, *DeleteHostNetworkRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteHostNetwork not implemented")
+}
+func (UnimplementedLiteVirtServer) IsolateHost(context.Context, *IsolateHostRequest) (*HostIsolationStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method IsolateHost not implemented")
+}
+func (UnimplementedLiteVirtServer) ReseedHost(context.Context, *ReseedHostRequest) (*ReseedHostResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReseedHost not implemented")
 }
 func (UnimplementedLiteVirtServer) PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishCRL not implemented")
@@ -3633,14 +3765,8 @@ func (UnimplementedLiteVirtServer) DeleteVM(context.Context, *DeleteVMRequest) (
 func (UnimplementedLiteVirtServer) RepairVMOwner(context.Context, *RepairVMOwnerRequest) (*RepairVMOwnerResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RepairVMOwner not implemented")
 }
-func (UnimplementedLiteVirtServer) CheckVMRuntime(context.Context, *CheckVMRuntimeRequest) (*CheckVMRuntimeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CheckVMRuntime not implemented")
-}
-func (UnimplementedLiteVirtServer) CheckContainerRuntime(context.Context, *CheckContainerRuntimeRequest) (*CheckContainerRuntimeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method CheckContainerRuntime not implemented")
-}
-func (UnimplementedLiteVirtServer) ReportRuntime(context.Context, *ReportRuntimeRequest) (*ReportRuntimeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ReportRuntime not implemented")
+func (UnimplementedLiteVirtServer) GetRuntimeInventory(context.Context, *GetRuntimeInventoryRequest) (*RuntimeInventory, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRuntimeInventory not implemented")
 }
 func (UnimplementedLiteVirtServer) CheckVIPParticipant(context.Context, *CheckVIPParticipantRequest) (*CheckVIPParticipantResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckVIPParticipant not implemented")
@@ -4236,6 +4362,12 @@ func (UnimplementedLiteVirtServer) ReserveProjectCapacity(context.Context, *Rese
 func (UnimplementedLiteVirtServer) ReleaseProjectCapacity(context.Context, *ReleaseProjectCapacityRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReleaseProjectCapacity not implemented")
 }
+func (UnimplementedLiteVirtServer) ReserveHostCapacity(context.Context, *ReserveHostCapacityRequest) (*ReserveHostCapacityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReserveHostCapacity not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseHostCapacity(context.Context, *ReleaseHostCapacityRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseHostCapacity not implemented")
+}
 func (UnimplementedLiteVirtServer) mustEmbedUnimplementedLiteVirtServer() {}
 func (UnimplementedLiteVirtServer) testEmbeddedByValue()                  {}
 
@@ -4369,24 +4501,6 @@ func _LiteVirt_FenceHost_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
-func _LiteVirt_GetHostHealth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(emptypb.Empty)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).GetHostHealth(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_GetHostHealth_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).GetHostHealth(ctx, req.(*emptypb.Empty))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _LiteVirt_GetClusterHealth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetClusterHealthRequest)
 	if err := dec(in); err != nil {
@@ -4437,6 +4551,132 @@ func _LiteVirt_AdmitHost_Handler(srv interface{}, ctx context.Context, dec func(
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).AdmitHost(ctx, req.(*AdmitHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListHostNetworks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListHostNetworksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListHostNetworks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListHostNetworks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListHostNetworks(ctx, req.(*ListHostNetworksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_UpsertHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpsertHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).UpsertHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_UpsertHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).UpsertHostNetwork(ctx, req.(*UpsertHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PlanHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PlanHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PlanHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PlanHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PlanHostNetwork(ctx, req.(*PlanHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ApplyHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ApplyHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ApplyHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ApplyHostNetwork(ctx, req.(*ApplyHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_DeleteHostNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteHostNetworkRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).DeleteHostNetwork(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_DeleteHostNetwork_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).DeleteHostNetwork(ctx, req.(*DeleteHostNetworkRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_IsolateHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(IsolateHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).IsolateHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_IsolateHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).IsolateHost(ctx, req.(*IsolateHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReseedHost_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReseedHostRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReseedHost(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReseedHost_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReseedHost(ctx, req.(*ReseedHostRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -4718,56 +4958,20 @@ func _LiteVirt_RepairVMOwner_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
-func _LiteVirt_CheckVMRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CheckVMRuntimeRequest)
+func _LiteVirt_GetRuntimeInventory_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRuntimeInventoryRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(LiteVirtServer).CheckVMRuntime(ctx, in)
+		return srv.(LiteVirtServer).GetRuntimeInventory(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: LiteVirt_CheckVMRuntime_FullMethodName,
+		FullMethod: LiteVirt_GetRuntimeInventory_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).CheckVMRuntime(ctx, req.(*CheckVMRuntimeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _LiteVirt_CheckContainerRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CheckContainerRuntimeRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_CheckContainerRuntime_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).CheckContainerRuntime(ctx, req.(*CheckContainerRuntimeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _LiteVirt_ReportRuntime_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReportRuntimeRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(LiteVirtServer).ReportRuntime(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: LiteVirt_ReportRuntime_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(LiteVirtServer).ReportRuntime(ctx, req.(*ReportRuntimeRequest))
+		return srv.(LiteVirtServer).GetRuntimeInventory(ctx, req.(*GetRuntimeInventoryRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -8101,6 +8305,42 @@ func _LiteVirt_ReleaseProjectCapacity_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ReserveHostCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReserveHostCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReserveHostCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReserveHostCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReserveHostCapacity(ctx, req.(*ReserveHostCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ReleaseHostCapacity_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseHostCapacityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseHostCapacity(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseHostCapacity_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseHostCapacity(ctx, req.(*ReleaseHostCapacityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // LiteVirt_ServiceDesc is the grpc.ServiceDesc for LiteVirt service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -8129,10 +8369,6 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_FenceHost_Handler,
 		},
 		{
-			MethodName: "GetHostHealth",
-			Handler:    _LiteVirt_GetHostHealth_Handler,
-		},
-		{
 			MethodName: "GetClusterHealth",
 			Handler:    _LiteVirt_GetClusterHealth_Handler,
 		},
@@ -8143,6 +8379,34 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AdmitHost",
 			Handler:    _LiteVirt_AdmitHost_Handler,
+		},
+		{
+			MethodName: "ListHostNetworks",
+			Handler:    _LiteVirt_ListHostNetworks_Handler,
+		},
+		{
+			MethodName: "UpsertHostNetwork",
+			Handler:    _LiteVirt_UpsertHostNetwork_Handler,
+		},
+		{
+			MethodName: "PlanHostNetwork",
+			Handler:    _LiteVirt_PlanHostNetwork_Handler,
+		},
+		{
+			MethodName: "ApplyHostNetwork",
+			Handler:    _LiteVirt_ApplyHostNetwork_Handler,
+		},
+		{
+			MethodName: "DeleteHostNetwork",
+			Handler:    _LiteVirt_DeleteHostNetwork_Handler,
+		},
+		{
+			MethodName: "IsolateHost",
+			Handler:    _LiteVirt_IsolateHost_Handler,
+		},
+		{
+			MethodName: "ReseedHost",
+			Handler:    _LiteVirt_ReseedHost_Handler,
 		},
 		{
 			MethodName: "PublishCRL",
@@ -8201,16 +8465,8 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_RepairVMOwner_Handler,
 		},
 		{
-			MethodName: "CheckVMRuntime",
-			Handler:    _LiteVirt_CheckVMRuntime_Handler,
-		},
-		{
-			MethodName: "CheckContainerRuntime",
-			Handler:    _LiteVirt_CheckContainerRuntime_Handler,
-		},
-		{
-			MethodName: "ReportRuntime",
-			Handler:    _LiteVirt_ReportRuntime_Handler,
+			MethodName: "GetRuntimeInventory",
+			Handler:    _LiteVirt_GetRuntimeInventory_Handler,
 		},
 		{
 			MethodName: "CheckVIPParticipant",
@@ -8887,6 +9143,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReleaseProjectCapacity",
 			Handler:    _LiteVirt_ReleaseProjectCapacity_Handler,
+		},
+		{
+			MethodName: "ReserveHostCapacity",
+			Handler:    _LiteVirt_ReserveHostCapacity_Handler,
+		},
+		{
+			MethodName: "ReleaseHostCapacity",
+			Handler:    _LiteVirt_ReleaseHostCapacity_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

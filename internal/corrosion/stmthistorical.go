@@ -87,6 +87,26 @@ func HistoricalShapes() []HistoricalShape {
 		`updated_at = ? `+
 		`WHERE name = ?`, "configure_host_fixed_v130")
 
+	// Upstream #126 (schema v44) emitted durable quota-reservation statements.
+	// This integration line already used v44-v49 for different additive schema,
+	// so it retains those SQL shapes as receive-only compatibility contracts while
+	// preserving the table at local schema v50.
+	add(`INSERT OR IGNORE INTO quota_reservations
+		      (id, project, holder, cpu, mem_mib, state, workload, kind, host,
+		       want_cpu, want_mem, expires_at, created_at, updated_at, deleted_at)
+		      VALUES (?, ?, ?, ?, ?, 'pending', '', '', '', 0, 0, ?, ?, ?, NULL)`, "quota_reservations_upstream_v44")
+	add(`UPDATE quota_reservations
+		    SET state = ?, workload = ?, kind = ?, host = ?, want_cpu = ?, want_mem = ?,
+		        expires_at = ?, updated_at = ?
+		  WHERE id = ? AND deleted_at IS NULL`, "quota_reservations_upstream_v44")
+	add(`UPDATE quota_reservations SET deleted_at = ?, updated_at = ?
+		  WHERE id = ? AND state = ? AND deleted_at IS NULL`, "quota_reservations_upstream_v44")
+	add(`UPDATE quota_reservations SET deleted_at = ?, updated_at = ? WHERE id = ?`, "quota_reservations_upstream_v44")
+	add(`INSERT OR IGNORE INTO quota_reservations
+		 (id, project, holder, cpu, mem_mib, state, workload, kind, host,
+		  want_cpu, want_mem, expires_at, created_at, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "quota_reservations_upstream_v44")
+
 	// Schema v44 widened these three builders with receiver-visible lifecycle
 	// and routing columns. Keep the v1.3.0 shapes accepted for the supported
 	// rolling-upgrade/WAL-retention horizon; receiver-only v44 columns retain
@@ -96,6 +116,12 @@ func HistoricalShapes() []HistoricalShape {
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "insert_vm_pre_authority")
 	// Workload deletes became owner/generation guarded. Older retained WAL
 	// entries remain valid ordinary LWW tombstones during the support horizon.
+	// These three became RECEIVE-ONLY on 2026-08-02: the ordinary delete writers
+	// now emit the authority-bearing tombstone, because a receiver admits a
+	// pre-authority delete only while its OWN row has zero authority — after the
+	// owner-epoch backfill that is never true, so the tombstone was silently
+	// discarded on every peer. A supported peer still EMITS these, so they must
+	// stay recognised here.
 	add(legacyVMDeleteSQL, "delete_vm_pre_authority")
 	add(legacyContainerDeleteSQL, "delete_container_pre_authority")
 	add(legacyContainerStrictDeleteSQL, "delete_container_strict_pre_authority")

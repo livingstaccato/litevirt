@@ -47,7 +47,7 @@ type Reconciler struct {
 
 	// checkPeerRuntime asks a peer for its LOCAL libvirt view of a VM
 	// (absent/defined_stopped/running/unknown) — injected by the daemon (it wires
-	// the gRPC CheckVMRuntime client). nil disables runtime owner-assert (e.g. in
+	// the gRPC runtime-inventory client). nil disables runtime owner-assert (e.g. in
 	// tests that don't exercise it). See SetPeerRuntimeChecker.
 	checkPeerRuntime func(ctx context.Context, host, name string) (string, error)
 	// onOwnerAssert observes each owner-assert decision (result ∈ asserted /
@@ -430,6 +430,19 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 					r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleEpoch)
 					break
 				}
+				// Automated recovery must never act on a workload whose OWNERSHIP
+				// is in dispute: restarting one side of a dual-run is exactly how
+				// a transient condition becomes a corrupted disk. The condition is
+				// durable state, so this refusal holds across restarts and leader
+				// changes; recovery resumes when the evaluator proves resolution.
+				if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", vm.Name); cerr != nil {
+					slog.Warn("reconciler: cannot read health conditions; deferring self-heal restart", "vm", vm.Name, "error", cerr)
+					break
+				} else if disputed {
+					slog.Warn("reconciler: refusing self-heal restart — active ownership condition",
+						"vm", vm.Name, "condition", code)
+					break
+				}
 				slog.Warn("reconciler: VM marked running but not in libvirt — attempting restart",
 					"vm", vm.Name)
 				r.startPendingVM(ctx, vm)
@@ -753,6 +766,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			r.noteGateRefused(corrosion.ActionReschedule, g.Reason)
 			return // lock released by defer; retry next tick if quorum returns
 		}
+	}
+
+	// Ownership-dispute gate, EXECUTE side. The coordinator refuses to plan
+	// recovery for a disputed workload, but this reconciler is the node that
+	// actually starts things — and it also serves pending rows minted before
+	// the condition was raised, and local starts (onboot autostart, domain-died
+	// recovery) that never passed through the coordinator at all. Starting any
+	// of them while ownership is contested adds a holder. Fail closed on a read
+	// error; the row stays pending and the next tick retries.
+	if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", vm.Name); cerr != nil {
+		slog.Warn("reconciler: cannot read health conditions; deferring start (fail closed)",
+			"vm", vm.Name, "error", cerr)
+		return
+	} else if disputed {
+		slog.Warn("reconciler: refusing automated start — active ownership condition",
+			"vm", vm.Name, "condition", code)
+		r.noteGateRefused(corrosion.ActionReschedule, ReasonOwnershipDispute)
+		return
 	}
 
 	// Post-activation, a coordinator OWNERSHIP TRANSFER writes state=pending AND a

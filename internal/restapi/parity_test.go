@@ -39,7 +39,6 @@ func TestParity_RoutesRegistered(t *testing.T) {
 		{"/api/v1/pools/foo", http.MethodPut},       // GET or DELETE
 		{"/api/v1/regions/list", http.MethodPost},   // GET only
 		{"/api/v1/regions/migrate", http.MethodGet}, // POST only
-		{"/api/v1/cluster/health", http.MethodPost}, // GET only
 	}
 	for _, tc := range cases {
 		req := httptest.NewRequest(tc.method, tc.path, nil)

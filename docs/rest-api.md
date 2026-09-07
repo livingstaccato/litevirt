@@ -64,7 +64,7 @@ POST   /api/v1/hosts/{name}/fence          # Manually fence a host
 DELETE /api/v1/hosts/{name}                # Remove host from cluster (?force=true)
 GET    /api/v1/hosts/{name}/devices        # List PCI devices (?type=gpu)
 POST   /api/v1/hosts/{name}/rescan         # Rescan PCI devices
-GET    /api/v1/hosts/{name}/health         # Host health matrix
+GET    /api/v1/hosts/{name}/health         # Cluster health (conditions, coverage, connectivity, capacity); ?resolved=1 adds 30-day history
 GET    /api/v1/hosts/{name}/stats          # Host resource statistics
 PUT    /api/v1/hosts/{name}/config         # Configure host settings
 ```
@@ -319,8 +319,8 @@ streams that don't map cleanly onto SSE / chunked HTTP. These will
 move to WebSocket in a later iteration:
 
 - `StreamEvents`, `GetVMLogs`, `ConsoleVM`, `ProxyVNC` — bidirectional or
-  WebSocket-shaped. (`ExecContainer` IS wired in REST — `POST
-  /api/v1/containers/{name}/exec`.)
+  WebSocket-shaped. (`ExecContainer` IS wired in REST —
+  `POST /api/v1/containers/exec`, with the container name in the body.)
 - `RestoreLive` — keeps an NBD server alive for the duration of the
   stream; modelling that over HTTP is awkward.
 - `GetSpiceInfo` — short-lived URL handoff, but tied to a

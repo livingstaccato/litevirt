@@ -6,7 +6,6 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -155,45 +154,19 @@ func TestInspectHost_Found(t *testing.T) {
 	}
 }
 
-func TestGetHostHealth_Empty(t *testing.T) {
+func TestGetClusterHealth_Empty(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()
 
-	resp, err := s.GetHostHealth(ctx, &emptypb.Empty{})
+	resp, err := s.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{})
 	if err != nil {
-		t.Fatalf("GetHostHealth: %v", err)
+		t.Fatalf("GetClusterHealth: %v", err)
 	}
-	if len(resp.Entries) != 0 {
-		t.Errorf("expected 0 entries, got %d", len(resp.Entries))
+	if len(resp.GetConnectivity()) != 0 || len(resp.GetConditions()) != 0 {
+		t.Errorf("virgin cluster returned data: %+v", resp)
 	}
-}
-
-// TestGetHostHealth_ExcludesTombstoned pins that a removed host's connectivity
-// edge does not resurface: GetClusterHealth's own connectivity query already
-// filters deleted_at IS NULL, and GetHostHealth must match it.
-func TestGetHostHealth_ExcludesTombstoned(t *testing.T) {
-	s := testServer(t)
-	ctx := context.Background()
-
-	now := s.db.NowTS()
-	if err := s.db.Execute(ctx,
-		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-		 VALUES (?, ?, ?, 0, ?, ?)`,
-		"host-a", "host-b", "healthy", s.db.NowWall(), now); err != nil {
-		t.Fatalf("seed edge: %v", err)
-	}
-	if err := s.db.Execute(ctx,
-		`UPDATE host_health SET deleted_at = ? WHERE observer = ? AND target = ?`,
-		now, "host-a", "host-b"); err != nil {
-		t.Fatalf("tombstone edge: %v", err)
-	}
-
-	resp, err := s.GetHostHealth(adminCtx(), &emptypb.Empty{})
-	if err != nil {
-		t.Fatalf("GetHostHealth: %v", err)
-	}
-	if len(resp.Entries) != 0 {
-		t.Errorf("expected 0 entries (tombstoned edge should not resurface), got %d: %+v", len(resp.Entries), resp.Entries)
+	if resp.GetOverall() != HealthUnknown {
+		t.Errorf("overall = %q, want UNKNOWN (nothing has scanned)", resp.GetOverall())
 	}
 }
 
@@ -368,17 +341,6 @@ func TestRemoveHost_NoVMs(t *testing.T) {
 	_, err := s.RemoveHost(ctx, &pb.RemoveHostRequest{Name: "empty-host"})
 	if err != nil {
 		t.Fatalf("RemoveHost: %v", err)
-	}
-}
-
-func TestNewID_UniqueAndLength(t *testing.T) {
-	id1 := newID()
-	id2 := newID()
-	if id1 == id2 {
-		t.Error("newID returned same value twice")
-	}
-	if len(id1) != 16 { // 8 bytes = 16 hex chars
-		t.Errorf("newID length = %d, want 16", len(id1))
 	}
 }
 

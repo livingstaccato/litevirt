@@ -230,6 +230,7 @@ type syncTable struct {
 // GetStateDump/StreamStateDump are operator-callable.
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
+	"health_conditions", "health_evaluator_status", "host_capacity_observations",
 	"images", "image_hosts", "networks", "volumes", "stacks",
 	"vms", "vm_interfaces", "vm_disks", "vm_nics", "vm_pci_intent", "vm_pci_realizations", "snapshots",
 	"lb_configs", "lb_backends", "users", "tokens", "dns_records",
@@ -243,6 +244,7 @@ var tableNames = []string{
 	// notification_targets) and per-node/coordination state are intentionally
 	// excluded — see antiEntropyExcluded in tablenames_coverage_test.go.
 	"storage_pools", "backup_schedules", "backup_repos", "replication_checkpoints",
+	"quota_reservations",
 	"host_pci_devices", "roles", "role_bindings", "projects", "project_quotas",
 	"resource_mappings", "service_endpoints",
 	"ip_sets", "cluster_firewall_rules", "host_firewall_rules", "firewall_defaults",
@@ -259,9 +261,10 @@ var tableNames = []string{
 	// v47 cluster CRL — a revocation list is published to be read, and a node that
 	// missed the replicated write is exactly the node that must repair from a peer.
 	"cluster_crl",
-	// v48 durable cluster-health model — health is cluster state, so every node must
-	// converge on the same observed/confirmed/resolved conditions and evaluator status.
-	"health_conditions", "health_evaluator_status",
+	// v48 host network intent — operator-facing wiring config, read cluster-wide
+	// by the UI/CLI and repaired from peers if a host loses its DB. LWW-safe
+	// (PK + updated_at); the owning host is the only writer of its rows.
+	"host_networks",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

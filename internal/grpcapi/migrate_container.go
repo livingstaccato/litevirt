@@ -18,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // MigrateContainer cold-migrates a container to another host by reusing the
@@ -86,8 +87,15 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	// whole migrate, and the target's RestoreContainer recognises a verified
 	// peer-migrate and does NOT admit again (backup_container.go), so one move
 	// reserves exactly once instead of demanding twice the container's memory.
-	if rec.MemMiB > 0 {
-		lease, aerr := s.admitHostWithReservation(ctx, "MigrateContainer", req.TargetHost, project, 0, rec.MemMiB)
+	// Unconditional: an uncapped container reserves nothing on the target but
+	// still becomes resident there, and the safety half of the admission must run
+	// even at zero delta. The decision itself is the DESTINATION's
+	// (acquireDestinationHostLease): only the target daemon can probe its own
+	// runtime inventory, so it admits against fresh local state and holds the
+	// durable reservation; this side keeps the lease for the whole transfer and
+	// releases it on every return path.
+	{
+		lease, aerr := s.acquireDestinationHostLease(ctx, "MigrateContainer", req.TargetHost, project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
 		if aerr != nil {
 			return aerr
 		}
@@ -307,6 +315,16 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		return parkSource(fmt.Errorf("target landed but source runtime cleanup failed: %v (source left tracked+stopped on %s)", err, source))
 	}
 	if err := corrosion.DeleteContainer(ctx, s.db, source, req.Name); err != nil {
+		// DeleteContainer already retried with a fresh guard, so this is a real
+		// DB failure or persistent contention (the source row's authority kept
+		// moving — e.g. a concurrent failover claiming it). Either way the
+		// migration ITSELF succeeded: the target landed and owns the leases.
+		// Park the source so the duplicate row is visible for cleanup rather
+		// than silently serving two live copies.
+		if errors.Is(err, corrosion.ErrDeleteContended) {
+			return parkSource(fmt.Errorf("migration landed on %s, but the source row on %s kept changing under the delete guard "+
+				"(a concurrent writer holds it — check for a racing failover, then remove the source row)", req.TargetHost, source))
+		}
 		return parkSource(fmt.Errorf("target landed but source row tombstone failed: %v (remove the source row on %s)", err, source))
 	}
 	// Best-effort now (a stale source interface row is hidden once the source
@@ -372,9 +390,9 @@ func (s *Server) mintRelocationProof(ctx context.Context, containerName, destHos
 		return nil
 	}
 	pr := corrosion.ActionProof{
-		ID: newID(), Action: corrosion.ActionRelocate, TargetKind: "container",
+		ID: randid.New(), Action: corrosion.ActionRelocate, TargetKind: "container",
 		TargetName: containerName, DestHost: destHost, Coordinator: s.hostName,
-		LeaseHolder: s.hostName, RelocationToken: newID(),
+		LeaseHolder: s.hostName, RelocationToken: randid.New(),
 		OwnerEpoch: strconv.FormatInt(ownerEpoch, 10),
 	}
 	if err := corrosion.WriteActionProof(ctx, s.db, pr); err != nil {

@@ -2,12 +2,11 @@ package grpcapi
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -19,6 +18,7 @@ import (
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/placement"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.ListHostsResponse, error) {
@@ -104,31 +104,6 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 	}, nil
 }
 
-func (s *Server) GetHostHealth(ctx context.Context, _ *emptypb.Empty) (*pb.HostHealthMatrix, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
-		return nil, err
-	}
-	rows, err := s.db.Query(ctx,
-		`SELECT observer, target, status, consecutive_failures, last_seen
-		 FROM host_health WHERE deleted_at IS NULL`)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "query health: %v", err)
-	}
-
-	resp := &pb.HostHealthMatrix{}
-	for _, r := range rows {
-		resp.Entries = append(resp.Entries, &pb.HostHealthEntry{
-			Observer:            r.String("observer"),
-			Target:              r.String("target"),
-			Status:              r.String("status"),
-			ConsecutiveFailures: int32(r.Int("consecutive_failures")),
-			LastSeen:            parseTimestamp(r.String("last_seen")),
-		})
-	}
-
-	return resp, nil
-}
-
 func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
 	// SchemaVersion here is the BINARY const, deliberately — self-upgrade reads
 	// it to decide "which binary to adopt" (a binary question), not "do my
@@ -143,6 +118,13 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// Split-brain-hardening feature tokens this build supports. Read via a
 		// fresh Ping to compute cluster-wide activation of fail-closed checks.
 		Capabilities: s.advertisedCapabilities(),
+		// WALL clock, not the HLC: the caller uses it to detect NTP drift, and an
+		// HLC value would compare against its own wall clock as nonsense skew.
+		WallClock: time.Now().UTC().Format(time.RFC3339Nano),
+		// Self-report of degradation: see PingResponse.wal_quarantined. A peer
+		// records our isolation on the strength of this, because we cannot
+		// record it ourselves.
+		WalQuarantined: s.walQuarantinedNow(),
 	}, nil
 }
 
@@ -151,20 +133,30 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // the health checker (SetPeerPinger) so cluster-wide activation is computed from
 // live reachability, never from stale replicated rows. An unreachable peer
 // returns an error so the caller can fail closed.
-func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, error) {
+// It also returns the peer's WALL clock so the health checker can detect NTP
+// drift without a second RPC. A peer that predates the field reports the zero
+// time, which the caller must read as "unknown", never as skew. Self returns the
+// zero time too: a node cannot be skewed against itself.
+func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, time.Time, error) {
 	if host == s.hostName {
-		return s.advertisedCapabilities(), nil
+		return s.advertisedCapabilities(), time.Time{}, nil
 	}
 	c, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	defer closeConn()
 	resp, err := c.Ping(ctx, &pb.PingRequest{})
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
-	return resp.GetCapabilities(), nil
+	peerWall := time.Time{}
+	if s := resp.GetWallClock(); s != "" {
+		if parsed, perr := time.Parse(time.RFC3339Nano, s); perr == nil {
+			peerWall = parsed
+		}
+	}
+	return resp.GetCapabilities(), peerWall, nil
 }
 
 // DrainHost marks the host as draining and migrates all its VMs to healthy hosts.
@@ -444,6 +436,25 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		}
 	}
 
+	// Destination admission for a RUNNING VM, before anything irreversible: a
+	// drain is an OPERATOR-initiated move and lands the same full-sized VM on
+	// the target an explicit migrate would — placement.Select is a read-only
+	// filter over replicated data, not an admission. The decision belongs to
+	// the DESTINATION daemon (fresh local inventory, ownership conditions,
+	// serialized reserve-then-verify), exactly like MigrateVM; the lease is
+	// held across the move and released when this VM's drain step returns. A
+	// STOPPED VM's reassign moves only the row — it consumes nothing on the
+	// target until StartVM admits it there — so it takes no lease.
+	if fresh.State == "running" {
+		migLease, aerr := s.acquireDestinationHostLease(ctx, "DrainHost", target.Name, fresh.Project,
+			"vm:"+vm.Name, fresh.CPUActual, fresh.MemActual, intentVMResident)
+		if aerr != nil {
+			return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+				Error: "target admission refused: " + aerr.Error()}
+		}
+		defer migLease.release(ctx)
+	}
+
 	if fresh.State == "running" && !hasLocalOnly {
 		// Live migrate — disks are on shared storage. (Ownership confirmed above.)
 		progress.Strategy = pb.MigrateStrategy_MIGRATE_LIVE
@@ -597,7 +608,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 			return nil, status.Errorf(codes.Internal, "update host state: %v", err)
 		}
 		if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
-			ID:       newID(),
+			ID:       randid.New(),
 			HostName: req.Name,
 			Method:   "manual",
 			Result:   "manual-confirmed",
@@ -659,7 +670,7 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 
 	// Record in fencing log.
 	if logErr := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
-		ID:       newID(),
+		ID:       randid.New(),
 		HostName: req.Name,
 		Method:   method,
 		Result:   result,
@@ -916,11 +927,4 @@ func parseTimestamp(s string) *timestamppb.Timestamp {
 		return nil
 	}
 	return timestamppb.New(t)
-}
-
-// newID generates a random 8-byte hex ID.
-func newID() string {
-	b := make([]byte, 8)
-	rand.Read(b) //nolint:errcheck
-	return hex.EncodeToString(b)
 }

@@ -9,6 +9,29 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// ADMISSION CONTRACT — who may be admitted at all.
+//
+// Capacity admission is for OPERATOR-INITIATED requests only (create, start,
+// restart-of-stopped, clone, import, restore, migrate, promote, resize). The
+// automated recovery paths (startVMLocked's reconciler/failover callers,
+// PrepareHardwareForStart, operation recovery) must never be admitted: after a
+// host reboot every VM restarts at once, and admitting there would start the
+// first few and strand the rest, turning a clean recovery into a partial one.
+// Do not push admission down into a shared primitive those paths also call.
+// (This doctrine predates reserve-then-verify — it used to live on the
+// in-process admission ledger that replicated reservations replaced — and it
+// binds the admitReserved family in reservation_admission.go exactly the same.)
+
+// noopRelease is the release func for an admission that reserved nothing.
+func noopRelease() {}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // requireOvercommit gates the --allow-overcommit capacity bypass. Skipping the
 // host capacity check is an operator-level judgment call, not a routine
 // lifecycle action: a binding that grants only lifecycle verbs (vm.start,
@@ -18,15 +41,24 @@ func (s *Server) requireOvercommit(ctx context.Context, path string) error {
 	return s.RequirePerm(ctx, path, "vm.overcommit", "operator")
 }
 
-// checkHostCapacity verifies a proposed CPU/memory GROW (positive deltas, MiB)
-// fits the target host's free capacity — quota-free, for start-time paths
-// where the allocation is already counted in project usage (see StartVM).
+// checkHostCapacity reports whether a proposed CPU/memory GROW (positive deltas,
+// MiB) fits the target host's free capacity AT THIS INSTANT — quota-free, for
+// start-time paths where the allocation is already counted in project usage
+// (see StartVM).
+//
+// This function only READS. It is NOT serialized against a concurrent admission:
+// two callers can both pass it and both proceed. Use it as a REMOTE fail-fast
+// only. A caller that will actually commit the workload must use the
+// admitReserved family (reservation_admission.go), whose replicated
+// reservation spans the commit.
 func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, memMiBDelta int) error {
 	if cpuDelta <= 0 && memMiBDelta <= 0 {
 		return nil
 	}
-	// Host capacity (owner-serialized). HostFreeCapacity already nets out committed
-	// running-VM actuals and in-flight reservations.
+	// HostFreeCapacity nets out committed running-VM/container actuals and
+	// in-flight nonterminal operation reservations (reserve-then-verify made
+	// the replicated reservation the ONLY in-flight ledger; the old in-process
+	// one had no writers left and is gone).
 	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityWithPolicy(ctx, s.db, host, s.capacity)
 	if err != nil {
 		return status.Errorf(codes.Internal, "check host capacity: %v", err)
@@ -39,12 +71,15 @@ func (s *Server) checkHostCapacity(ctx context.Context, host string, cpuDelta, m
 	return nil
 }
 
-// checkResourceAdmission verifies a proposed CPU/memory GROW (positive deltas, MiB)
-// fits BOTH the target host's free capacity AND the project's quota, counting
-// in-flight reservations from nonterminal operations — not just committed usage — so
-// two concurrent grows can't both pass and over-commit (F2). Host capacity is
-// serialized by the target-host owner (the caller holds the VM lock on the owning
-// host); project quota is checked against committed usage + reserved deltas.
+// checkResourceAdmission is the UNSERIALIZED, read-only form: it reports whether a
+// proposed CPU/memory GROW (positive deltas, MiB) fits BOTH the target host's free
+// capacity AND the project's quota AT THIS INSTANT, counting in-flight reservations
+// from nonterminal operations as well as committed usage.
+//
+// Two concurrent callers CAN both pass it. It remains correct as a remote
+// fail-fast; a caller that will commit the workload must use the admitReserved
+// family, which reserves-then-verifies per host and routes project quota to
+// the project's authority holder.
 //
 // It returns codes.ResourceExhausted when a dimension would be exceeded, and nil for
 // a shrink/no-op (deltas ≤ 0 never need capacity). An unbounded project (no quota
@@ -113,19 +148,28 @@ func quotaWouldExceed(limit, used, reserved, delta int) bool {
 }
 
 // ensureProjectAuthority makes sure the project has a D1 admission-authority epoch,
-// minting the initial one if none exists. Best-effort establishment; the returned
-// authority is the current one (for recording in an operation's reserved step).
+// minting the initial one if none exists. The returned authority is the current one
+// (for recording in an operation's reserved step, and for routing quota admission).
 //
-// The initial holder is DERIVED from the project name over the cluster's hosts, not
-// set to this node. Claiming for self is the obvious move and it defeats the purpose:
-// every node serves its own creates, so every node would become the holder of its own
-// replica, every admission would stay local, and delegation would never fire. It also
-// mints conflicting rows — one epoch, two holders. Deriving instead means two nodes
-// racing the claim write the SAME row, so the race stops being a conflict.
+// Only the DETERMINISTIC candidate mints. The previous version had every node claim
+// with holder = s.hostName and treated a concurrent claim as harmless — "exactly one
+// wins the guarded initial claim". That is not what happens.
+// ClaimInitialProjectAuthority's guard runs inside ExecuteBatchGuarded, which is a
+// LOCAL transaction, so on two nodes both guards see COUNT(*) = 0 before either has
+// replicated and both insert epoch 1. project_authority_epochs then merges via
+// immutableMergeKeepLocalRow, which does NOT coin-flip an immutable row: differing
+// facts for one primary key are kept-local on both sides and flagged
+// immutable_conflict, permanently. The project ends up with two holders and an
+// operator has to repair it. (And since immutableFactsEqual compares created_at,
+// per-node wall time, even two claims naming the same holder conflict — so making
+// the holder agree is not enough; only one node may write.)
 //
-// With no host list to derive from, this node claims for itself: a cluster whose hosts
-// cannot be read has bigger problems, and refusing to establish authority at all would
-// block admission entirely.
+// Reachable before this change: the resize path calls this best-effort on whichever
+// owner resizes, so two owners resizing VMs in one project were enough.
+//
+// A non-candidate returns whatever authority currently exists (ok=false → zero
+// value) rather than minting. It converges as soon as the candidate handles a
+// request for the project.
 func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (corrosion.ProjectAuthority, error) {
 	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
 	if err != nil {
@@ -134,11 +178,15 @@ func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (co
 	if ok {
 		return cur, nil
 	}
-	holder := s.derivedProjectHolder(ctx, project)
-	if holder == "" {
-		holder = s.hostName
+	hosts, err := corrosion.ListHosts(ctx, s.db)
+	if err != nil {
+		return corrosion.ProjectAuthority{}, err
 	}
-	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, holder); err != nil {
+	candidate, hasCandidate := corrosion.DeterministicAuthorityCandidate(hosts, project)
+	if !hasCandidate || candidate != s.hostName {
+		return corrosion.ProjectAuthority{}, nil
+	}
+	if _, err := corrosion.ClaimInitialProjectAuthority(ctx, s.db, project, s.hostName); err != nil {
 		return corrosion.ProjectAuthority{}, err
 	}
 	cur, _, err = corrosion.CurrentProjectAuthority(ctx, s.db, project)
@@ -152,16 +200,21 @@ func (s *Server) ensureProjectAuthority(ctx context.Context, project string) (co
 // bootstrap work: the claim is written on the CALLER's replica, so the holder does not
 // yet have the row naming it. Rather than wait for replication — during which the
 // admission would fail — the holder re-derives and confirms the answer for itself.
+// It MUST agree with corrosion.DeterministicAuthorityCandidate, which is why it
+// simply calls it: that function decides who may MINT, and this one decides who may
+// CONFIRM a not-yet-replicated mint. Two derivations here would let a node confirm
+// authority no node was allowed to mint — and they did diverge, on both the hash
+// and the host filter, until they were collapsed onto one.
 func (s *Server) derivedProjectHolder(ctx context.Context, project string) string {
 	hosts, err := corrosion.ListHosts(ctx, s.db)
 	if err != nil || len(hosts) == 0 {
 		return ""
 	}
-	names := make([]string, 0, len(hosts))
-	for _, h := range hosts {
-		names = append(names, h.Name)
+	candidate, ok := corrosion.DeterministicAuthorityCandidate(hosts, project)
+	if !ok {
+		return ""
 	}
-	return corrosion.DeriveProjectAuthorityHolder(project, names)
+	return candidate
 }
 
 // stampReservationAuthority records which authority epoch admitted a reservation.
@@ -172,11 +225,22 @@ func (s *Server) derivedProjectHolder(ctx context.Context, project string) strin
 // the journal while the headroom it should be protecting is handed to the next
 // admission. Every reservation writer calls this immediately after inserting.
 //
-// A project with no authority yet stamps empty facts, which aggregation treats as a
-// legacy claim and keeps counting.
+// A project with DEFINITELY no authority yet stamps empty facts, which aggregation
+// treats as a legacy claim and keeps counting. An authority read FAILURE is a
+// different state and fails closed: treating it as "no authority" would stamp
+// empty facts on a project that does have a current authority, and aggregation
+// would then refuse to count the reservation — a live lease consuming nothing,
+// its headroom handed to the next admission. The caller releases the provisional
+// operation and refuses the admission; nothing is admitted on an unreadable
+// authority ledger.
 func (s *Server) stampReservationAuthority(ctx context.Context, opID, project string) error {
+	cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project)
+	if err != nil {
+		return status.Errorf(codes.Unavailable,
+			"cannot read project-quota authority for %q before attributing its reservation: %v", project, err)
+	}
 	var facts *corrosion.ReservationFacts
-	if cur, ok, err := corrosion.CurrentProjectAuthority(ctx, s.db, project); err == nil && ok {
+	if ok {
 		facts = corrosion.ReservationFactsFor(project, cur.Epoch, cur.Holder)
 	}
 	if err := corrosion.AppendReservationFacts(ctx, s.db, opID, 0, project, facts); err != nil {

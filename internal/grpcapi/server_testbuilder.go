@@ -78,3 +78,17 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
 }
+
+// RecordSelfReportedIsolationForTest drives one §A self-reported-quarantine
+// check synchronously, so a fleet scenario can assert the observation without
+// waiting on the HA monitor's timer.
+func (s *Server) RecordSelfReportedIsolationForTest(ctx context.Context) {
+	s.observeOneSelfReportedQuarantine(ctx)
+}
+
+// SetWALQuarantinedForTest makes this server report itself WAL-quarantined, the
+// state the shipped rollback detector produces on a binary below a latched token.
+func (s *Server) SetWALQuarantinedForTest(on bool) {
+	fn := func() bool { return on }
+	s.walQuarantined.Store(&fn)
+}

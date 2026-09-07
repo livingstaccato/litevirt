@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -123,6 +124,12 @@ func IsInfrastructureError(err error) bool {
 	var target *InfrastructureError
 	return errors.As(err, &target)
 }
+
+// ErrNoEligibleHost marks a per-VM infeasibility: no host satisfies the VM's
+// hard constraints. SelectBatch converts it into an empty-Host result for that
+// VM instead of failing the whole batch; the single-VM Select surfaces it as
+// the error it always was.
+var ErrNoEligibleHost = errors.New("no eligible host")
 
 // hostCandidate is an evaluated host during selection.
 type hostCandidate struct {
@@ -282,6 +289,12 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		if h.IsWitness() {
 			continue
 		}
+		// Hard: the host's effective-capacity observation is neither incomplete
+		// nor stale. A host that cannot account for its own runtime consumption
+		// must be treated as unknown, never as headroom.
+		if snap.CapacityUnknown[h.Name] {
+			continue
+		}
 
 		// Hard: resources fit. ALLOCATABLE (physical adjusted by the cluster's
 		// overcommit ratios and host reserves), not raw physical — the same
@@ -295,7 +308,16 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		if req.CPUNeeded > 0 && freeCPU < req.CPUNeeded {
 			continue
 		}
-		if req.MemMiBNeeded > 0 && freeMem < req.MemMiBNeeded {
+		// MemChargeFor: the INCOMING VM costs its guest memory plus one qemu
+		// overhead, exactly like the VMs already counted in freeMem above. Comparing
+		// bare guest memory made the two sides disagree by one overhead, so with
+		// 1024 MiB free a 1024 MiB VM was accepted although it draws 1024+128.
+		//
+		// Charged at the COMPARISON, not folded into req.MemMiBNeeded: that field is
+		// guest memory, and CommitPlacement (batch placement) adds it to MemUsed AND
+		// increments VMCount — which re-applies MemOverheadFor. Folding it in would
+		// double-count every batch member.
+		if req.MemMiBNeeded > 0 && freeMem < req.Capacity.MemChargeFor(req.MemMiBNeeded) {
 			continue
 		}
 
@@ -391,7 +413,8 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 	}
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no eligible host found for VM %q (insufficient resources, constraint violation, or strict-spread pressure cap)", req.VMName)
+		return nil, fmt.Errorf("no eligible host found for VM %q (insufficient resources, constraint violation, or strict-spread pressure cap): %w",
+			req.VMName, ErrNoEligibleHost)
 	}
 
 	// Sort by score descending; ties by fewest VMs then name (stable).
@@ -471,17 +494,28 @@ type BatchDevice struct {
 // Each request's Policy is honored independently: a batch can mix
 // bin-pack batch jobs and spread-strict prod VMs without one's policy
 // influencing the other's placement.
+//
+// capacity/now fold in the effective-capacity observations exactly like the
+// single-VM Select path (BuildSnapshot) does: runtime-only extra usage counts
+// against headroom, and an incomplete or stale observation disqualifies the
+// host. Without them the batch path's CapacityUnknown filter was a permanent
+// no-op — batch placements (deploys, failover) admitted against a database
+// view the runtime had already outgrown, and never excluded a host that
+// cannot account for what it runs.
 func SelectBatch(
 	hosts []corrosion.HostRecord,
 	vms []corrosion.VMRecord,
 	devices map[string][]corrosion.PCIDeviceRecord,
 	containerMemMiB map[string]int,
+	capacity []corrosion.HostCapacityObservation,
+	now time.Time,
 	requests []Request,
 ) (map[string]BatchResult, error) {
 	snap := BuildSnapshotFrom(hosts, vms)
 	// Containers hold host memory as surely as VMs do; fold them in exactly
 	// like the single-VM Select path (BuildSnapshot) does.
 	snap.AddContainerMemory(containerMemMiB)
+	snap.AddCapacityObservations(capacity, now)
 
 	// Deep-copy device pools so the scoring loop can mutate them as we
 	// place each VM.
@@ -519,6 +553,15 @@ func SelectBatch(
 
 		candidates, err := scoreCandidates(evalSnap, &req, true)
 		if err != nil {
+			// One infeasible VM must not fail the WHOLE batch: failover needs
+			// per-VM isolation (strand the one VM nothing can hold, recover the
+			// rest), and compose re-checks per-VM below. An empty-Host result is
+			// the per-VM "no eligible host" signal; structural errors (a bad
+			// pin) still abort everything.
+			if errors.Is(err, ErrNoEligibleHost) {
+				results[req.VMName] = BatchResult{}
+				continue
+			}
 			return nil, err
 		}
 		chosen := pickBest(candidates)

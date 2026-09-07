@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 )
 
@@ -257,14 +258,13 @@ func SumProjectUsage(ctx context.Context, c *Client, name string) (*ProjectUsage
 	}
 
 	diskRows, err := c.Query(ctx,
-		`SELECT COALESCE(SUM(vm_disks.size_bytes), 0) AS bytes
+		`SELECT `+quotaDiskGiBSum("vm_disks.size_bytes")+` AS gib
 		 FROM vm_disks
 		 JOIN vms ON vm_disks.vm_name = vms.name
 		 WHERE vms.project = ? AND vms.deleted_at IS NULL AND vm_disks.deleted_at IS NULL`,
 		name)
 	if err == nil && len(diskRows) > 0 {
-		bytes := diskRows[0].Int64("bytes")
-		u.DiskGiBUsed = int(bytes / (1 << 30))
+		u.DiskGiBUsed = diskRows[0].Int("gib")
 	}
 
 	// NIC count + public-IP count from the same interface set. Public-IP
@@ -372,6 +372,71 @@ type QuotaCheck struct {
 	NIC     int
 }
 
+// bytesPerGiB is the quota accounting unit for disk.
+const bytesPerGiB = 1 << 30
+
+// DiskQuotaGiB is THE bytes→GiB rule for project disk quota: each disk rounds
+// UP, so a partial GiB occupies a whole one.
+//
+// Every site that measures disk against the quota must use it — admission, the
+// committed-usage sum, and the per-workload contribution the settle rule reads.
+// They diverged once: admission rounded up while usage truncated the summed
+// bytes, so a 512 MiB disk was charged 1 GiB and counted 0. The charge could
+// never be observed as paid, so its lease rode out the whole settle grace and
+// then freed a GiB that committed usage had never picked up — double-counted
+// first, uncounted after.
+func DiskQuotaGiB(sizeBytes int64) int {
+	if sizeBytes <= 0 {
+		return 0
+	}
+	// Divide first, then carry the remainder: adding bytesPerGiB-1 up front
+	// overflows int64 for a size near the maximum.
+	gib := sizeBytes / bytesPerGiB
+	if sizeBytes%bytesPerGiB != 0 {
+		gib++
+	}
+	return int(gib)
+}
+
+// quotaDiskGiBSum is DiskQuotaGiB as a SQL aggregate over col — the round-up
+// applies PER ROW, then sums, so it matches DiskQuotaGiB applied per disk.
+// Rounding after the sum would be a different (and smaller) number.
+func quotaDiskGiBSum(col string) string {
+	return "COALESCE(SUM((" + col + " + " + strconv.Itoa(bytesPerGiB-1) + ") / " + strconv.Itoa(bytesPerGiB) + "), 0)"
+}
+
+// QuotaAmount is an amount of project quota in EVERY dimension a project quota
+// bounds. It is the shape the serialized admission path passes around: a
+// requested delta, a summed reservation total, and one workload's contribution
+// are all the same four numbers, so admission compares like with like.
+//
+// Carrying all four together is the point. Reserving only cpu/mem while
+// checking disk/NIC with an unserialized read left those two dimensions
+// enforceable one request at a time: two concurrent creates each read a view
+// containing neither, both fit, and both committed.
+type QuotaAmount struct {
+	VCPU    int
+	MemMiB  int
+	DiskGiB int
+	NIC     int
+}
+
+// IsZero reports whether the amount asks for nothing in any dimension — the
+// admission fast path (nothing to reserve, nothing to check).
+func (a QuotaAmount) IsZero() bool {
+	return a.VCPU <= 0 && a.MemMiB <= 0 && a.DiskGiB <= 0 && a.NIC <= 0
+}
+
+// Add returns the dimension-wise sum.
+func (a QuotaAmount) Add(b QuotaAmount) QuotaAmount {
+	return QuotaAmount{
+		VCPU:    a.VCPU + b.VCPU,
+		MemMiB:  a.MemMiB + b.MemMiB,
+		DiskGiB: a.DiskGiB + b.DiskGiB,
+		NIC:     a.NIC + b.NIC,
+	}
+}
+
 // CheckProjectQuota returns nil if the proposed allocation would fit
 // under the project's quotas, or a descriptive error otherwise.
 // Empty/missing quota row means unbounded — admission passes.
@@ -413,4 +478,97 @@ func CheckProjectQuota(ctx context.Context, c *Client, projectName string, req Q
 			projectName, strings.Join(violations, "; "))
 	}
 	return nil
+}
+
+// Workload kinds for quota observation. A name alone is NOT a unique identity: a VM
+// and a container may share a name, and container names are unique only per HOST.
+// Retiring a charge on the wrong row would free quota that is still owed.
+const (
+	WorkloadVM        = "vm"
+	WorkloadContainer = "container"
+)
+
+// WorkloadQuotaContribution reports what one specific workload contributes to a
+// project's quota usage on THIS node's replica, and whether its row is visible here.
+//
+// This is the observation primitive the settle rule needs: a lease held for a
+// committed-but-unreplicated workload may only be retired by seeing THAT workload,
+// at (or above) the size it was admitted for. Aggregate usage growth is not a sound
+// substitute — any unrelated increase (a workload that replicated late, or one
+// admitted through a fail-open path) would clear the charge early and let the next
+// request over-admit.
+//
+// Identity is (kind, host, name), not name alone. kind separates a VM from a
+// same-named container; host disambiguates containers, whose names are unique only
+// per host, so a container of the same name elsewhere cannot retire this charge.
+//
+// The accounting mirrors SumProjectUsage exactly, so "contributes at least what it
+// was admitted for" is comparable against the same numbers the quota check uses: VMs
+// count their spec cpu/memory_mib plus their disk and interface rows, containers
+// their declared limits plus their interface rows (containers contribute no disk
+// quota), and a soft-deleted row — of the workload or of an individual disk/NIC —
+// counts as absent.
+func WorkloadQuotaContribution(ctx context.Context, c *Client, project, kind, host, workload string) (QuotaAmount, bool, error) {
+	project = projectOrDefault(project)
+	switch kind {
+	case WorkloadContainer:
+		rows, err := c.Query(ctx,
+			`SELECT COALESCE(cpu_limit,0)  AS cpu,
+			        COALESCE(memory_mib,0) AS mem
+			 FROM containers
+			 WHERE name = ? AND host_name = ? AND project = ? AND deleted_at IS NULL`,
+			workload, host, project)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(rows) == 0 {
+			return QuotaAmount{}, false, nil
+		}
+		amt := QuotaAmount{VCPU: rows[0].Int("cpu"), MemMiB: rows[0].Int("mem")}
+		nicRows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM container_interfaces
+			 WHERE ct_name = ? AND host_name = ? AND deleted_at IS NULL`, workload, host)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(nicRows) > 0 {
+			amt.NIC = nicRows[0].Int("n")
+		}
+		return amt, true, nil
+	default: // WorkloadVM
+		rows, err := c.Query(ctx,
+			`SELECT COALESCE(json_extract(spec,'$.cpu'),0)        AS cpu,
+			        COALESCE(json_extract(spec,'$.memory_mib'),0) AS mem
+			 FROM vms WHERE name = ? AND project = ? AND deleted_at IS NULL`, workload, project)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(rows) == 0 {
+			return QuotaAmount{}, false, nil
+		}
+		amt := QuotaAmount{VCPU: rows[0].Int("cpu"), MemMiB: rows[0].Int("mem")}
+		diskRows, err := c.Query(ctx,
+			`SELECT `+quotaDiskGiBSum("size_bytes")+` AS gib FROM vm_disks
+			 WHERE vm_name = ? AND deleted_at IS NULL`, workload)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(diskRows) > 0 {
+			// Measured by the SAME rule as the usage this contribution is compared
+			// against — a contribution counted differently from the charge could
+			// never be observed as paid, so the lease would ride out its whole
+			// grace and then free a charge usage had never picked up.
+			amt.DiskGiB = diskRows[0].Int("gib")
+		}
+		nicRows, err := c.Query(ctx,
+			`SELECT COUNT(*) AS n FROM vm_interfaces
+			 WHERE vm_name = ? AND deleted_at IS NULL`, workload)
+		if err != nil {
+			return QuotaAmount{}, false, err
+		}
+		if len(nicRows) > 0 {
+			amt.NIC = nicRows[0].Int("n")
+		}
+		return amt, true, nil
+	}
 }

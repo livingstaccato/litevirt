@@ -187,10 +187,29 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 	opID := corrosion.DeterministicOperationID("ResizeVMLive", principal, vm.Project, vm.Name, idemKey)
 
 	lease, aerr := s.admitResizeReservation(
-		ctx, opID, "ResizeVMLive", principal, vm, cpuDelta, memDelta)
+		ctx, opID, "ResizeVMLive", principal, vm, cpuDelta, memDelta,
+		int(target.Cpu), int(target.MemoryMib))
 	if aerr != nil {
 		return aerr
 	}
+	// One cleanup discipline for every return. Before BeginVMOperation commits,
+	// the WHOLE lease is freed — including the two early error returns below,
+	// which previously leaked it. After the commit, only the delegated QUOTA
+	// half: the local op row is the workload operation itself (terminated by
+	// CompleteVMOperation, or left nonterminal for recovery), but the holder's
+	// quota lease is a separate row nothing else terminates — the success path
+	// previously never released it, so every delegated resize permanently
+	// consumed project quota as an eternal earlier claimant. Releasing it
+	// post-commit is sound: the desired spec is durably committed at the new
+	// size, and the settle rule holds the charge until usage reflects it.
+	committed := false
+	defer func() {
+		if committed {
+			lease.releaseQuota(ctx)
+			return
+		}
+		lease.release(ctx)
+	}()
 
 	resJSON, err := (corrosion.ReservationVector{
 		Project: vm.Project, ProjectCPU: cpuDelta, ProjectMemMiB: memDelta,
@@ -216,18 +235,21 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 		IdempotencyKey:  idemKey,
 		ReservationJSON: resJSON,
 	}
+	// FENCE before BeginVMOperation commits the desired spec; see CreateVM.
+	if ferr := lease.allowCommit(ctx); ferr != nil {
+		return ferr
+	}
 	applied, err := s.db.BeginVMOperation(ctx, op, string(targetJSON), vm.OwnerEpoch, vm.SpecGeneration)
 	if err != nil {
-		lease.release(ctx)
 		if errors.Is(err, corrosion.ErrOperationHashConflict) {
 			return status.Errorf(codes.AlreadyExists, "idempotency key reused with a different resize for %q", vm.Name)
 		}
 		return status.Errorf(codes.Internal, "begin operation: %v", err)
 	}
 	if !applied {
-		lease.release(ctx)
 		return status.Errorf(codes.FailedPrecondition, "cannot resize %q: an operation is in progress or the VM changed underneath", vm.Name)
 	}
+	committed = true
 	newGen := vm.SpecGeneration + 1
 	return s.driveResourceUpdate(ctx, vm, op.ID, vm.OwnerEpoch, newGen, target, stored, obsCPU, obsMem)
 }
@@ -241,19 +263,39 @@ func (s *Server) resizeVMLiveCoordinated(ctx context.Context, vm *corrosion.VMRe
 // persistence record and drives recovery. Marking the operation as a transient
 // CAPACITY lease would let stale-lease expiry free real in-flight reservations.
 func (s *Server) admitResizeReservation(
-	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta int,
+	ctx context.Context, opID, method, principal string, vm *corrosion.VMRecord, cpuDelta, memDelta, wantCPU, wantMem int,
 ) (*reservationLease, error) {
+	// The same host-safety gate as the equivalent UpdateVM grow
+	// (admitGrowWithReservation → admitReserved → checkHostSafety): a resize is
+	// not new residency, but a grow of a DISPUTED workload — or onto a host
+	// involved in an active ownership condition — must refuse here exactly as
+	// it does on every other admission path. Before the zero-delta fast path,
+	// same as everywhere else.
+	if err := s.checkHostSafety(ctx, vm.HostName, corrosion.WorkloadVM, vm.Name, false,
+		cpuDelta > 0 || memDelta > 0); err != nil {
+		return nil, err
+	}
 	if cpuDelta <= 0 && memDelta <= 0 {
 		return &reservationLease{}, nil
 	}
 
 	delegated := s.projectAuthorityActive(ctx)
+	// The subject carries the ABSOLUTE resize target: the VM's row is already
+	// visible at its old size, so a released lease may only settle once the row
+	// contributes the grown size — presence alone would free it instantly while
+	// the holder's usage still counted the smaller spec.
+	subject := quotaSubject{
+		Kind: corrosion.WorkloadVM, Host: vm.HostName, Name: vm.Name,
+		Want: corrosion.QuotaAmount{VCPU: wantCPU, MemMiB: wantMem},
+	}
 	rv := corrosion.ReservationVector{
 		Project:    vm.Project,
 		TargetHost: vm.HostName, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
 	}
 	if !delegated {
 		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
+		rv.Workload, rv.WorkloadKind, rv.WorkloadHost = subject.Name, subject.Kind, subject.Host
+		rv.WantCPU, rv.WantMemMiB = subject.Want.VCPU, subject.Want.MemMiB
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -285,19 +327,20 @@ func (s *Server) admitResizeReservation(
 	}
 
 	if !delegated {
-		if err := s.checkProjectQuotaBefore(ctx, vm.Project, cpuDelta, memDelta, op.ID); err != nil {
+		if err := s.checkProjectQuotaBefore(ctx, vm.Project, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, op.ID); err != nil {
 			lease.release(ctx)
 			return nil, err
 		}
 		return lease, nil
 	}
 
-	holder, quotaLease, qerr := s.admitProjectQuota(ctx, method, vm.Project, vm.Name, cpuDelta, memDelta)
+	holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, vm.Project, "vm:"+vm.Name, subject, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta})
 	if qerr != nil {
 		lease.release(ctx)
 		return nil, qerr
 	}
 	lease.quotaHolder, lease.quotaProject, lease.quotaLease = holder, vm.Project, quotaLease
+	lease.quotaEpoch = epoch
 	return lease, nil
 }
 

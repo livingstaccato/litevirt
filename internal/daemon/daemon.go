@@ -34,6 +34,7 @@ import (
 	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/hlc"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	"github.com/litevirt/litevirt/internal/libvirt"
@@ -593,24 +594,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.virt.StartReconnectLoop(ctx)
 
 	// Register domain event callback for immediate VM death detection (#44).
-	d.virt.RegisterDomainEventCallback(func(domName string, event libvirt.DomainEventType, detail int) {
-		switch event {
-		case libvirt.DomainEventCrashed, libvirt.DomainEventStopped:
-			vm, err := corrosion.GetVM(ctx, d.db, domName)
-			if err != nil || vm == nil || vm.HostName != d.cfg.HostName {
-				return
-			}
-			if vm.StateDetail == "operator-stop" {
-				return // don't act on intentional stops
-			}
-			slog.Warn("domain event: VM stopped/crashed", "vm", domName, "event", event, "detail", detail)
-			if err := corrosion.UpdateVMState(ctx, d.db, domName, "error",
-				fmt.Sprintf("domain event: stopped (detail=%d). Check host dmesg for OOM.", detail)); err != nil {
-				slog.Error("domain event: failed to record crash state — reconciler will re-detect", "vm", domName, "error", err)
-				stateWriteMetrics.Failed(corrosion.OpVMState, corrosion.ClassifyWriteErr(err))
-			}
-		}
-	})
+	eventHandler := health.NewDomainEventHandler(d.cfg.HostName, d.db)
+	eventHandler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+	d.virt.RegisterDomainEventCallback(eventHandler.Callback(ctx))
 
 	// Create the VM reconciler (picks up "pending" VMs from failover and starts
 	// them). Wire the split-brain gate now, but DON'T start the reconcile loop or
@@ -782,11 +768,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// this node.s owned workloads have all graduated out of the pre-epoch 0, so
 	// the fleet can never latch across a node whose generations do not exist yet.
 	svc.SetOwnerEpochEnforce(d.cfg.Enforcement.OwnerEpoch)
+	svc.SetIsolationEpochEnforce(d.cfg.Enforcement.IsolationEpoch)
 	svc.SetOwnerEpochReady(func() bool {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		ok, err := corrosion.OwnerEpochBackfillComplete(ctx, d.db, d.cfg.HostName)
-		return err == nil && ok
+		ready, reason := svc.OwnerEpochReadiness(ctx)
+		if !ready {
+			slog.Debug("owner_epoch_v1 readiness withheld", "reason", reason)
+		}
+		return ready
 	})
 	// Once the whole cluster has latched audit_signature_v1, a write this node
 	// cannot sign is an error-level event rather than a normal one.
@@ -848,6 +838,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else {
 		d.opJournal = j
 		svc.SetOpJournal(j) // so the device-lease path can durably record allocations
+		// Host network apply protocol (v48): the real netplan-touching System,
+		// plus crash recovery INSIDE this barrier — a half-applied netplan
+		// change is restored before any RPC or runtime loop can observe it.
+		svc.SetHostNetworkEnv(&hostnet.RealSystem{
+			AdvertiseIP: d.hostAddress(),
+			GRPCPort:    d.cfg.GRPCPort,
+		}, d.hostAddress())
+		svc.RecoverHostNetworks(ctx)
 		d.runOperationRecovery(ctx)
 		svc.RecoverDeviceLeases(ctx) // roll back device leases a crash orphaned
 	}
@@ -978,6 +976,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// two hosts and no DB owner disagrees with runtime. One node (the lease holder) does
 	// the work so the fleet pages once, not N times.
 	go svc.RunDualRunDetector(ctx, 60*time.Second)
+	// Effective-capacity sampler: every host publishes what it is ACTUALLY
+	// carrying (union of DB and runtime workloads), so placement counts rogue
+	// runtimes and refuses hosts whose observation is stale or incomplete.
+	go svc.RunCapacitySampler(ctx, 60*time.Second)
 
 	// Start periodic IP scanner — discovers VM IPs via ARP/DHCP and broadcasts FDB entries.
 	ipScanner := grpcapi.NewIPScanner(svc)
@@ -1013,6 +1015,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// is more useful than a blanket "container runtime not wired".
 	// lxcRunner was created above (shared with the metrics collector).
 	svc.SetContainerRuntime(grpcapi.NewLXCRuntimeAdapter(lxcRunner))
+	// The runtime-inventory collector reads owner-epoch markers from the same
+	// root the container checker converges them into.
+	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 
 	// Advertise LXC capability as a host label so the compose planner places
 	// container (kind=lxc/oci) workloads only on hosts that can actually run

@@ -146,6 +146,22 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return nil, status.Errorf(codes.AlreadyExists, "VM %q already exists", spec.Name)
 	}
 
+	// Resource defaults BEFORE admission. Everything below — quota, placement,
+	// host capacity — reads spec.Cpu/spec.MemoryMib, and every one of those checks
+	// is a no-op at zero: the admission helpers early-return on non-positive
+	// deltas, placement skips its fit filter behind `if req.CPUNeeded > 0`, and a
+	// quota check can't be violated by adding 0. So a client sending 0 (documented
+	// as "use defaults") was admitted as a zero-sized VM and then persisted at
+	// 2 vCPU / 4096 MiB — repeatable, and it bypassed BOTH project quota and host
+	// capacity. Normalize first so every check sees what the VM will actually cost.
+	//
+	// Both copies. spec is a CLONE of req.Spec (normalizeCreateVMSpec clones so the
+	// server-owned UUID mint can't be steered by the caller), so normalizing only
+	// spec would leave the request forwarded to the owning host still carrying
+	// zeros. It re-runs admission from that copy, so the defaults have to be on it.
+	compose.NormalizeVMSpecResources(spec)
+	compose.NormalizeVMSpecResources(req.Spec)
+
 	// admission: prefer the tenancy engine (live billing +
 	// public-IP/backup-GiB checks); fall back to the corrosion-direct
 	// path for harnesses that haven't wired an Engine.
@@ -201,9 +217,23 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Before pinned filtering was fixed, three 1 GiB VMs could be pinned to a
 	// ~3 GiB host and accepted until the node thrashed.
 	//
-	// This is the same check the resize path has used all along (resize.go:116), so
+	// This is the same check the resize path has used all along (resize.go), so
 	// growing a VM into a host was refused while creating one there was not. The
-	// This runs on the entry node to fail fast and again on the owning host.
+	// spec (and therefore the pin) travels with a forwarded request, so this runs
+	// on the entry node as an UNSERIALIZED fail-fast that reserves nothing (it will
+	// not commit the VM) and again on the owning host, where it is authoritative:
+	// the owner admits and RESERVES, so two concurrent creates onto one host cannot
+	// both pass. The reservation is held until this RPC returns, which is what
+	// covers the long gap to InsertVMWithHardware below (image pull, disk creation,
+	// DefineDomain) — see admitWithReservation.
+	//
+	// The reservation is REPLICATED rather than a per-process lock because the race
+	// that bit us was cross-node: two same-project creates entering on different
+	// hosts both passed against a view containing neither, which no amount of
+	// in-process serialization can see.
+	// createLease carries the commit FENCE for whichever branch charges quota;
+	// checked immediately before the durable write.
+	var createLease *reservationLease
 	if req.AllowOvercommit {
 		// Deliberate density on a host the operator judges can take it. Project
 		// quota still applies (that is a tenancy limit, not a physical one); only
@@ -216,6 +246,32 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		s.audit(ctx, "vm.create", spec.Name,
 			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 				targetHost, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+		// Bypassing the CHECK does not mean hiding the DRAW: an overcommit create
+		// that reserved nothing would be invisible to the very next admission, so a
+		// normal create could be admitted against memory this one is already using.
+		// Reserved on the OWNING node only, for the same double-count reason the
+		// checked path reserves there.
+		if targetHost == s.hostName {
+			lease, aerr := s.reserveWithoutCheck(ctx, "CreateVM", targetHost, project,
+				"vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
+			// --allow-overcommit bypasses HOST capacity only. Project quota is a
+			// tenancy limit, not a physical judgment call, so it goes through the
+			// SERIALIZED admission like any other create — the earlier tenancy
+			// fail-fast cannot see in-flight reservations, so relying on it here
+			// let concurrent overcommit creates all observe the same headroom.
+			createQuota := vmSpecQuotaAmount(spec)
+			qLease, qerr := s.admitQuotaWithReservation(ctx, "CreateVM", targetHost, project,
+				corrosion.WorkloadVM, spec.Name, createQuota, createQuota, intentVMResident)
+			if qerr != nil {
+				return nil, qerr
+			}
+			defer qLease.release(ctx)
+			createLease = qLease
+		}
 	} else if err := s.checkResourceAdmission(ctx, targetHost, project, int(spec.Cpu), int(spec.MemoryMib)); err != nil {
 		// Advisory fail-fast on the ENTRY node: read-only, so it costs nothing and
 		// rejects the hopeless case before we forward. The authoritative
@@ -263,11 +319,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// bug was intermittent (it depended on which operation id sorted first) and was
 	// caught by the per-host-override fleet test, not by reasoning.
 	if !req.AllowOvercommit {
-		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name, int(spec.Cpu), int(spec.MemoryMib))
+		lease, aerr := s.admitWithReservation(ctx, "CreateVM", s.hostName, project, "vm:"+spec.Name,
+			int(spec.Cpu), int(spec.MemoryMib), vmSpecQuotaAmount(spec), intentVMResident)
 		if aerr != nil {
 			return nil, aerr
 		}
 		defer lease.release(ctx)
+		createLease = lease
 	}
 
 	slog.Info("creating VM", "name", spec.Name, "image", spec.Image, "cpu", spec.Cpu, "memory", spec.MemoryMib)
@@ -279,6 +337,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// supplied value, so a client can't bind a new VM to existing swtpm state.
 	// Restore/migrate set the preserved UUID via their own record-building paths.
 	spec.Uuid = uuid.NewString()
+	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
 
 	// Prepare disks — track created paths for cleanup on failure.
 	var diskConfigs []lv.DiskConfig
@@ -757,6 +816,25 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		Project:   project, // tenancy label
 	}
 
+	// FENCE, immediately before the durable write: if project-quota authority moved
+	// while this create was in flight (image pull, disk work), the successor may
+	// already have admitted the same quota against a view that cannot contain this
+	// grant, so this VM must not be recorded. Nothing durable exists yet, so a
+	// refusal here costs only a retry — the running domain is torn down like any
+	// other post-start failure, INCLUDING its disks, cloud-init ISO, and firmware
+	// state: UndefineDomainPreservingState deliberately keeps nvram/swtpm, so
+	// without the explicit wipe (and cleanupDisks) an aborted create strands
+	// exactly the orphans the start-failure path above already cleans.
+	if ferr := createLease.allowCommit(ctx); ferr != nil {
+		if derr := s.virt.DestroyDomain(spec.Name); derr != nil {
+			slog.Warn("vm create: teardown after an aborted admission also failed",
+				"name", spec.Name, "error", derr)
+		}
+		_ = s.virt.UndefineDomain(spec.Name, false)
+		cleanupDisks()
+		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid)
+		return nil, ferr
+	}
 	if err := corrosion.InsertVMWithHardware(ctx, s.db, vmRecord, ifaceRecords, diskRecords, nicRecords, pciIntents, true); err != nil {
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
@@ -1007,6 +1085,12 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	// Skipped when the VM is already running: `lv start` on a running VM is a
 	// no-op that adds nothing, and must not be refused for capacity it already
 	// occupies.
+	//
+	// The reservation must outlive startVMLocked's state write, so release is
+	// declared out here and deferred through a closure — `defer release()` would
+	// capture the no-op value instead of whatever the admission assigns below.
+	release := noopRelease
+	defer func() { release() }()
 	if vm.State != "running" {
 		spec := &pb.VMSpec{}
 		if vm.Spec != "" {
@@ -1021,11 +1105,20 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 			s.audit(ctx, "vm.start", vm.Name,
 				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
 					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
+			lease, aerr := s.reserveWithoutCheck(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib))
+			if aerr != nil {
+				return nil, aerr
+			}
+			defer lease.release(ctx)
 		} else {
 			// Reserve-then-verify (F2): publish this start's demand before deciding,
 			// so a concurrent start on another node sees it instead of both reading a
 			// view containing neither.
-			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, int(spec.Cpu), int(spec.MemoryMib))
+			//
+			// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
+			// per-VM overhead subtraction, so starting it adds both its guest memory
+			// and a new qemu overhead.
+			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
 			if aerr != nil {
 				return nil, aerr
 			}
@@ -1330,6 +1423,26 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 		return nil, status.Errorf(codes.FailedPrecondition, "restart refused: %s", reason)
 	}
 
+	// A restart of a STOPPED VM is an operator START in restart clothing: the VM
+	// contributes nothing to host usage or per-domain overhead while stopped, so
+	// bringing it up adds both — exactly what StartVM admits — and without this
+	// gate RestartVM was the one unadmitted operator start. A restart of a
+	// RUNNING VM is net-zero (destroy+start of consumption already counted,
+	// overhead included) and deliberately admits nothing: a full host must
+	// always be able to restart what it already runs.
+	if vm.State != "running" {
+		var spec pb.VMSpec
+		if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse vm spec: %v", err)
+		}
+		lease, aerr := s.admitHostWithReservation(ctx, "RestartVM", vm.HostName, vm.Project,
+			"vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
+		if aerr != nil {
+			return nil, aerr
+		}
+		defer lease.release(ctx)
+	}
+
 	// Destroy, then bring it back up through the shared start primitive (so VLAN taps
 	// are reapplied and PostStart hooks run — a plain inline StartDomain skipped both).
 	s.virt.DestroyDomain(vm.Name)
@@ -1491,7 +1604,9 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, err
 		}
 		if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
-			slog.Error("failed to clean up stale VM record", "vm", req.Name, "error", err)
+			// A declined delete means the stale row is still live cluster-wide;
+			// claiming OK here would hide it. Idempotent — retry.
+			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
 		s.clearDeviceLease(req.Name)
 		return &emptypb.Empty{}, nil
@@ -1617,9 +1732,15 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Broadcast FDB removal for VXLAN networks so peers remove stale entries.
 	s.CleanupFDBForVM(ctx, req.Name)
 
-	// Tombstone in corrosion
+	// Tombstone in corrosion — MANDATORY. Returning OK with the row still live
+	// (the guarded delete declines when the row's authority moved under it, and
+	// only reports that after retrying with a fresh guard) would leave a ghost
+	// row every node keeps serving, scheduling around and failing over — the
+	// exact stale-live state the mandatory tombstone exists to kill. The domain
+	// teardown above is idempotent, so the caller can simply retry.
 	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
-		slog.Error("failed to delete VM from corrosion", "error", err)
+		s.audit(ctx, "vm.delete", req.Name, "project="+tenancy.NormalizeProject(vm.Project), "error")
+		return nil, status.Errorf(codes.Internal, "delete: tombstone cluster row: %v", err)
 	}
 
 	slog.Info("VM deleted", "name", req.Name)
@@ -2327,8 +2448,15 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 
-	// Tombstone old records (they'll be replaced by CreateVM).
-	corrosion.DeleteVM(ctx, s.db, req.Name)
+	// Tombstone old records (they'll be replaced by CreateVM). This must not be
+	// best-effort: the disks and firmware state are already gone above, and if
+	// the guarded delete declines (authority moved under it) the still-live row
+	// makes the CreateVM below fail AlreadyExists — surfacing the real cause
+	// here beats erroring one step later with a misleading message. The rebuild
+	// is retryable: everything before this point is idempotent teardown.
+	if err := corrosion.DeleteVM(ctx, s.db, req.Name); err != nil {
+		return nil, status.Errorf(codes.Internal, "rebuild: tombstone old records: %v", err)
+	}
 
 	// Recreate the VM using the stored spec.
 	slog.Info("rebuilding VM", "name", req.Name)
@@ -2413,7 +2541,13 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 		}
 		s.images.DeleteVMDisks(req.VmName)
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.VmName))
-		corrosion.DeleteVM(ctx, s.db, req.VmName)
+		// A declined tombstone must abort BEFORE the rename below: proceeding
+		// would leave the replaced VM's row live (a duplicate identity) while
+		// its disks and firmware are already gone. Everything up to here is
+		// idempotent teardown, so the cutover can simply be retried.
+		if err := corrosion.DeleteVM(ctx, s.db, req.VmName); err != nil {
+			return nil, status.Errorf(codes.Internal, "cutover: tombstone replaced VM: %v", err)
+		}
 	}
 
 	// Rename the -next VM to the original name.
@@ -2704,6 +2838,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
+	// updLease carries the commit FENCE for a quota-admitted grow: authority can
+	// move while the stop → redefine below is in flight, and committing then would
+	// land a charge the new authority knows nothing about. Nil (no grow admitted)
+	// allows. Checked immediately before the durable spec write.
+	var updLease *reservationLease
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2832,25 +2971,42 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				if err := s.requireOvercommit(ctx, vmRBACPath(fresh)); err != nil {
 					return nil, err
 				}
-				// Only the HOST check is bypassed; quota is a tenancy limit.
-				if err := s.checkProjectQuota(ctx, fresh.Project, cpuGrow, memGrow); err != nil {
-					return nil, err
+				// Only the HOST check is bypassed; quota is a tenancy limit — and
+				// it must be the SERIALIZED admission, not the unserialized local
+				// check, or concurrent overcommit grows all see the same headroom.
+				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project,
+					corrosion.WorkloadVM, req.Name,
+					corrosion.QuotaAmount{VCPU: cpuGrow, MemMiB: memGrow},
+					corrosion.QuotaAmount{VCPU: int(wantCPU), MemMiB: int(wantMem)}, intentResourceGrow)
+				if qerr != nil {
+					return nil, qerr
 				}
+				defer qLease.release(ctx)
+				updLease = qLease
 				if cpuGrow > 0 || memGrow > 0 {
 					s.audit(ctx, "vm.update", req.Name,
 						fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s +%dvCPU/+%dMiB",
 							fresh.HostName, cpuGrow, memGrow), "allow-overcommit")
 				}
 			} else {
-				// No resource id: a GROW's row is already visible everywhere, so a
-				// visibility signal would free the delegated lease immediately while the
-				// holder's usage still reflects the OLD size — under-counting exactly the
-				// amount being added. A grow leans on the settle grace instead.
-				lease, aerr := s.admitWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project, "", cpuGrow, memGrow)
+				// Reserved across the stop → redefine → start below, so a concurrent
+				// grow on this host can't claim the same headroom.
+				//
+				// The subject carries the ABSOLUTE target size: a grow's row is
+				// already visible everywhere at its OLD size, so a presence signal
+				// would free the delegated lease immediately while the holder's usage
+				// still reflected the smaller spec — under-counting exactly the
+				// amount being added. The lease now settles only once the grown size
+				// is what usage counts, instead of leaning on the settle grace.
+				// newVMOnHost=false: the VM is running and already counted, overhead
+				// included, so the delta must not be charged another one.
+				lease, aerr := s.admitGrowWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project,
+					corrosion.WorkloadVM, req.Name, cpuGrow, memGrow, int(wantCPU), int(wantMem))
 				if aerr != nil {
 					return nil, aerr
 				}
 				defer lease.release(ctx)
+				updLease = lease
 			}
 
 			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
@@ -2860,6 +3016,61 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			vm = fresh
 			vm.State = "stopped"
 			restartAfter = true
+			// The stop creates an OBLIGATION, not just a step: the operator asked
+			// --restart-if-needed for a RUNNING VM, so every failure return between
+			// here and the success-path restart (capability checks, XML generation,
+			// redefine, the commit fence, the spec persist) must bring the VM back
+			// up on whatever definition it was rolled back to — a VM the operator
+			// asked to keep running must not stay down because a reconfigure step
+			// (or a quota authority handoff) refused. The success path clears the
+			// flag before its own restart, so this fires only on the abort routes;
+			// if the restart itself also fails, say so plainly.
+			defer func() {
+				if !restartAfter {
+					return
+				}
+				if _, serr := s.startVMLocked(ctx, vm); serr != nil {
+					slog.Error("reconfigure aborted and the restart after it ALSO failed — VM left stopped, manual start needed",
+						"vm", req.Name, "error", serr)
+					s.recordVMEvent(ctx, req.Name, "vm.restart", "error", "reconfigure aborted; restart failed: "+serr.Error())
+					return
+				}
+				s.recordVMEvent(ctx, req.Name, "vm.restarted", "ok", "reconfigure aborted; VM restarted on its previous definition")
+			}()
+		}
+		if !restartAfter {
+			// The VM is ALREADY stopped, so the branch above (which admits) was
+			// skipped — and a stopped VM's spec still counts toward
+			// SumProjectUsage, so growing it here used to persist a larger size
+			// with no project-quota admission at all. Charge the grow.
+			//
+			// QUOTA ONLY, deliberately: a stopped VM contributes nothing to the
+			// host's running usage, so this consumes no host capacity now —
+			// StartVM admits the whole size when it starts.
+			wantCPU, wantMem := spec.Cpu, spec.MemoryMib
+			if req.Cpu > 0 {
+				wantCPU = req.Cpu
+			}
+			if req.MemoryMib > 0 {
+				wantMem = req.MemoryMib
+			}
+			cpuGrow, memGrow := posOnly(int(wantCPU-spec.Cpu)), posOnly(int(wantMem-spec.MemoryMib))
+			if cpuGrow > 0 || memGrow > 0 {
+				if req.AllowOvercommit {
+					if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
+						return nil, err
+					}
+				}
+				qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", vm.HostName, vm.Project,
+					corrosion.WorkloadVM, req.Name,
+					corrosion.QuotaAmount{VCPU: cpuGrow, MemMiB: memGrow},
+					corrosion.QuotaAmount{VCPU: int(wantCPU), MemMiB: int(wantMem)}, intentResourceGrow)
+				if qerr != nil {
+					return nil, qerr
+				}
+				defer qLease.release(ctx)
+				updLease = qLease
+			}
 		}
 		if req.Cpu > 0 {
 			spec.Cpu = req.Cpu
@@ -3139,6 +3350,17 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		specJSON, _ = json.Marshal(spec)
 	}
 
+	// FENCE before the durable write; see CreateVM. On a refusal the domain is
+	// rolled back to its previous definition, exactly as a failed write below is
+	// — and the deferred --restart-if-needed recovery restarts the VM on it.
+	s.fireCommitFenceHook("UpdateVM")
+	if ferr := updLease.allowCommit(ctx); ferr != nil {
+		if oldXML != "" {
+			_ = s.virt.UndefineDomainPreservingState(req.Name)
+			_ = s.virt.DefineDomain(oldXML)
+		}
+		return nil, ferr
+	}
 	// The durable spec MUST match the live domain. If the write fails or is deferred
 	// by the mutation barrier, roll the domain back to its old XML rather than return
 	// success with libvirt and the stored spec desynced (fatal — never report a
@@ -3171,7 +3393,10 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 
 	// --restart-if-needed: bring the VM back up through the shared start primitive
 	// (still holding the VM lock taken above), completing the stop → redefine → start.
+	// The flag is cleared FIRST so the deferred abort-recovery above cannot
+	// double-start (or retry a start that just failed with the reason attached).
 	if restartAfter {
+		restartAfter = false
 		if _, serr := s.startVMLocked(ctx, vm); serr != nil {
 			return nil, status.Errorf(codes.Internal, "reconfigured %q but restart failed (VM left stopped): %v", req.Name, serr)
 		}

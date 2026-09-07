@@ -100,7 +100,8 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// report as its usage — admitting a different number than the row we go on to
 	// write would leave the accounting permanently off by the difference.
 	lease, aerr := s.admitWithReservation(
-		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target, int(srcSpec.Cpu), int(srcSpec.MemoryMib))
+		ctx, "CloneVM", s.hostName, project, "vm:"+req.Target,
+		int(srcSpec.Cpu), int(srcSpec.MemoryMib), vmSpecQuotaAmount(&srcSpec), intentVMResident)
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -310,6 +311,18 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			return nil, status.Errorf(codes.Internal, "start clone: %v", err)
 		}
 		state = "running"
+	}
+
+	// FENCE, immediately before the durable write (see allowCommit). Disk
+	// copying, cloud-init materialisation, and the optional start all sit
+	// between admission and here — one of the widest grant-to-commit gaps of
+	// any create-shaped path — so the project's quota authority can genuinely
+	// move mid-clone. Refusing tears the clone down exactly like any other
+	// pre-persist failure: nothing durable exists yet, so it costs a retry.
+	s.fireCommitFenceHook("CloneVM")
+	if ferr := lease.allowCommit(ctx); ferr != nil {
+		rollbackClone(state == "running")
+		return nil, ferr
 	}
 
 	// adopt=false: the clone best-effort-populates vm_nics from its fresh network

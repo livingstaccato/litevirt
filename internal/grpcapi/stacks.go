@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // DeployStack parses a compose YAML, runs the declarative planner to resolve all
@@ -191,7 +192,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 
 	// Security groups + their rules.
 	for name, sg := range f.SecurityGroups {
-		sgID := newID()
+		sgID := randid.New()
 		if err := corrosion.InsertSecurityGroup(ctx, s.db, corrosion.SecurityGroup{
 			ID: sgID, Name: name, StackName: f.Name,
 		}); err != nil {
@@ -202,7 +203,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 			// sequence renders deterministically — equal priorities would sort
 			// arbitrarily and could drop traffic an earlier rule meant to allow.
 			if err := corrosion.InsertSGRule(ctx, s.db, corrosion.SGRule{
-				ID: newID(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
+				ID: randid.New(), SGID: sgID, Direction: r.Direction, Proto: r.Proto,
 				PortRange: r.Port, CIDR: r.CIDR, Action: r.Action, Priority: (i + 1) * 10,
 			}); err != nil {
 				return fmt.Errorf("security-group %q rule: %w", name, err)
@@ -213,7 +214,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 	// IP sets.
 	for name, set := range f.IPSets {
 		if err := corrosion.InsertIPSet(ctx, s.db, corrosion.IPSet{
-			ID: newID(), Name: name, CIDRs: set.CIDRs, StackName: f.Name,
+			ID: randid.New(), Name: name, CIDRs: set.CIDRs, StackName: f.Name,
 		}); err != nil {
 			return fmt.Errorf("ipset %q: %w", name, err)
 		}
@@ -223,7 +224,7 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 	if fd := f.FirewallDefaults; fd != nil {
 		for i, r := range fd.ClusterRules {
 			if err := corrosion.InsertClusterFirewallRule(ctx, s.db, corrosion.FirewallRule{
-				ID: newID(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
+				ID: randid.New(), Direction: r.Direction, Proto: r.Proto, PortRange: r.Port,
 				CIDR: r.CIDR, Action: r.Action, Comment: r.Comment, StackName: f.Name, Priority: (i + 1) * 10,
 			}); err != nil {
 				return fmt.Errorf("cluster rule: %w", err)
@@ -941,6 +942,29 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName string, keepDisks bo
 	}
 
 	return fmt.Errorf("VM %q not found on any peer", vmName)
+}
+
+// DeleteVMForStackCleanup exposes DeleteVM to the StackReconciler with a SYSTEM
+// principal attached.
+//
+// The reconciler is a background loop, so its context carries no identity — and
+// DeleteVM is RBAC-gated. Calling the handler directly therefore failed every single
+// time with "no authenticated principal", and because the reconciler treats a failure
+// as retryable it looped every 30s forever: the stack never finished deleting and the
+// VM could not be removed through the UI either. Observed in production on
+// 2026-08-06 (stack przemek-sfs, vm przemek-sfs-test).
+//
+// Both values are required. RequirePerm rejects an empty username BEFORE it reaches
+// the role fallback, so a role alone is not enough — same reasoning as the
+// health-checker-driven migrate path in migrate.go.
+//
+// The username is deliberately a distinguishable system principal rather than a real
+// user, so the audit trail attributes the deletion to stack cleanup instead of
+// implying an operator did it.
+func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
+	return s.DeleteVM(authCtx, req)
 }
 
 // RemoveLBForStack exposes removeLBForStack for the StackReconciler.

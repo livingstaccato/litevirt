@@ -58,7 +58,9 @@ type VMRecord struct {
 	// protocol columns: OwnerEpoch bumps on every ownership transfer (ABA-proof
 	// recovery), SpecGeneration bumps on every desired-spec mutation, and
 	// ActiveOperationID is the VM-wide mutation barrier (non-empty ⇒ an operation
-	// holds the VM). Populated by GetVM; the ListVMs projection omits them.
+	// holds the VM). All three are populated by GetVM; SpecGeneration and
+	// ActiveOperationID are omitted by BOTH list projections, while OwnerEpoch
+	// rides the unpaginated ListVMs read only (not ListVMsPage) — see scanVMRow.
 	OwnerEpoch        int64
 	SpecGeneration    int64
 	ActiveOperationID string
@@ -151,8 +153,8 @@ func InsertVM(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRec
 // reuses SetHardwareAdoptionState's exact UPDATE shape — no new replicated
 // statement shape is introduced.
 func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []InterfaceRecord, disks []DiskRecord, nics []NICRecord, pciIntents []PCIIntentRecord, adopt bool) error {
-	now := nowRFC3339() // created_at (bare)
-	uts := c.NowTS()    // updated_at (monotonic LWW key)
+	now := nowRFC3339Nano() // created_at — fresh incarnation stamp (see nowRFC3339Nano)
+	uts := c.NowTS()        // updated_at (monotonic LWW key)
 
 	stmts := []Statement{
 		// Purge any soft-deleted record with the same name so the INSERT succeeds.
@@ -247,7 +249,9 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRecord, error) {
 	sql := `SELECT name, stack_name, host_name, spec, state, state_detail,
 		cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
-		COALESCE(is_template, 0) AS is_template, created_at, updated_at
+		COALESCE(is_template, 0) AS is_template,
+		COALESCE(pending_action_id, '') AS pending_action_id,
+		COALESCE(vm_owner_epoch, 0) AS vm_owner_epoch, created_at, updated_at
 		FROM vms WHERE deleted_at IS NULL`
 	var params []interface{}
 
@@ -272,21 +276,45 @@ func ListVMs(ctx context.Context, c *Client, stackName, hostName string) ([]VMRe
 	return vms, nil
 }
 
-// scanVMRow maps a row carrying the ListVMs column set to a VMRecord.
+// scanVMRow maps a row from a VM-list projection to a VMRecord. It reads the UNION of the
+// columns its callers select, and an absent column reads as a ZERO VALUE, not an error
+// (Row.String/Int64 on a missing column) — so a field is only trustworthy on the paths whose
+// SELECT actually carries it:
+//
+//   - pending_action_id: carried by BOTH ListVMs and ListVMsPage. It must be, because
+//     grpcapi's anyStrandedPending treats an empty marker on a pending VM as a stranded
+//     transfer — an omission here reads as "markerless" and reports a legitimately-minted
+//     transfer as stranded (fixed here; previously omitted by both).
+//   - vm_owner_epoch: carried by ListVMs ONLY, so OwnerEpoch reads 0 through ListVMsPage.
+//     Deliberate: the dual-run detector's index is built from the unpaginated ListVMs and no
+//     ListVMsPage consumer reads OwnerEpoch. Anything that starts reading it on the
+//     paginated path must add the column there first.
+//   - spec_generation / active_operation_id: read by NEITHER list projection. Use GetVM or
+//     ListVMsWithActiveOperation.
+//
+// Adding a field to this scanner therefore means adding its column to every caller whose
+// consumers actually read that field.
 func scanVMRow(r Row) VMRecord {
 	return VMRecord{
-		Name:        r.String("name"),
-		StackName:   r.String("stack_name"),
-		HostName:    r.String("host_name"),
-		Spec:        r.String("spec"),
-		State:       r.String("state"),
-		StateDetail: r.String("state_detail"),
-		CPUActual:   r.Int("cpu_actual"),
-		MemActual:   r.Int("mem_actual"),
-		Project:     r.String("project"),
-		IsTemplate:  r.Int("is_template") == 1,
-		CreatedAt:   r.String("created_at"),
-		UpdatedAt:   r.String("updated_at"),
+		Name:            r.String("name"),
+		StackName:       r.String("stack_name"),
+		HostName:        r.String("host_name"),
+		Spec:            r.String("spec"),
+		State:           r.String("state"),
+		StateDetail:     r.String("state_detail"),
+		CPUActual:       r.Int("cpu_actual"),
+		MemActual:       r.Int("mem_actual"),
+		Project:         r.String("project"),
+		IsTemplate:      r.Int("is_template") == 1,
+		PendingActionID: r.String("pending_action_id"),
+		// OwnerEpoch rides the list read because the dual-run detector's DB
+		// index is built from ListVMs. Omitting it made every epoched running
+		// VM read as marker-vs-0 and page a false owner_epoch_mismatch — a bug
+		// the LAB caught, not the unit tests: the fixture VMs happened to be
+		// epoch 0, so marker 0 == "missing epoch" 0 and nothing fired.
+		OwnerEpoch: r.Int64("vm_owner_epoch"),
+		CreatedAt:  r.String("created_at"),
+		UpdatedAt:  r.String("updated_at"),
 	}
 }
 
@@ -297,7 +325,8 @@ func scanVMRow(r Row) VMRecord {
 func ListVMsPage(ctx context.Context, c *Client, stackName, hostName, afterName string, limit int) ([]VMRecord, error) {
 	sql := `SELECT name, stack_name, host_name, spec, state, state_detail,
 		cpu_actual, mem_actual, COALESCE(project, '_default') AS project,
-		COALESCE(is_template, 0) AS is_template, created_at, updated_at
+		COALESCE(is_template, 0) AS is_template,
+		COALESCE(pending_action_id, '') AS pending_action_id, created_at, updated_at
 		FROM vms WHERE deleted_at IS NULL`
 	var params []interface{}
 	if stackName != "" {
@@ -842,30 +871,45 @@ func TransferVMOwnerFresh(ctx context.Context, c *Client, name, hostName, state 
 // expansion on apply (safe because each statement binds updated_at). This does
 // NOT release any host_pci_devices ownership/vfio-unbind lease — that is the
 // grpcapi DeleteVM handler's releaseDevices call, out of scope here.
+// It emits the AUTHORITY-BEARING tombstone (vmDeleteSQL) — the only VM delete
+// shape litevirt emits. See DeleteContainer for why the pre-authority shape is
+// receive-only: a peer admits it only while its own row has zero authority, so
+// after the owner-epoch backfill it is silently dropped everywhere.
 func DeleteVM(ctx context.Context, c *Client, name string) error {
-	now := c.NowTS()
-	wall := nowRFC3339()
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: legacyVMDeleteSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmInterfacesCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmDisksCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmNICsCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmPCIIntentCreateCleanupSQL, Params: []interface{}{wall, now, name}},
-		{SQL: vmPCIRealCreateCleanupSQL, Params: []interface{}{wall, now, name}},
+	// Absent/already-tombstoned is the idempotent success callers expect; a row
+	// still live after every fresh-guard retry means its authority keeps moving
+	// under the CAS and the caller must not be told the delete landed.
+	outcome, err := retriedDelete(func() (deleteOutcome, error) {
+		return deleteVMGuarded(ctx, c, name)
 	})
+	if err != nil {
+		return err
+	}
+	return deleteOutcomeError(outcome, false)
 }
 
-// deleteVMGuarded is reserved for capability-gated authority-aware callers.
-// Ordinary DeleteVM retains the v43 wire contract during rolling upgrades.
-func deleteVMGuarded(ctx context.Context, c *Client, name string) (bool, error) {
+// deleteVMGuarded is the single VM delete emitter; every caller routes through
+// DeleteVM's retry loop. It reports the tri-state outcome from its own guard
+// read — see deleteOutcome for why absent and CAS-miss must not be conflated.
+func deleteVMGuarded(ctx context.Context, c *Client, name string) (deleteOutcome, error) {
 	vm, err := GetVM(ctx, c, name)
-	if err != nil || vm == nil {
-		return false, err
+	if err != nil {
+		return deleteContended, err
 	}
-	guard := vmDeleteMutationGuard(*vm)
+	if vm == nil {
+		return deleteAbsent, nil
+	}
+	return deleteVMGuardedFrom(ctx, c, *vm)
+}
+
+// deleteVMGuardedFrom runs the guarded CAS against the caller's row snapshot —
+// split from the read for the same testability reason as its container twin.
+func deleteVMGuardedFrom(ctx context.Context, c *Client, vm VMRecord) (deleteOutcome, error) {
+	name := vm.Name
+	guard := vmDeleteMutationGuard(vm)
 	now := c.NowTS()     // LWW key (updated_at)
 	wall := nowRFC3339() // deleted_at is a wall/display column, never the HLC key
-	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, guard)
 	}, []Statement{
 		// Children are fenced while the parent is still live; the parent
@@ -879,6 +923,13 @@ func deleteVMGuarded(ctx context.Context, c *Client, name string) (bool, error) 
 			wall, now, name, vm.OwnerEpoch, vm.SpecGeneration,
 		}, Guard: guard},
 	})
+	if err != nil {
+		return deleteContended, err
+	}
+	if !applied {
+		return deleteContended, nil
+	}
+	return deleteApplied, nil
 }
 
 // RenameVM changes a VM's name across all tables, including the name embedded in

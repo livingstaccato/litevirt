@@ -6,144 +6,185 @@ import (
 	"time"
 )
 
-func TestHealthCondition_UpsertObserveConfirmResolve(t *testing.T) {
-	c := testClient(t)
-	ctx := context.Background()
-
-	h := HealthCondition{
-		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm1",
+func seedCondition(name string) HealthCondition {
+	return HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: name,
 		Lifecycle: ConditionObserved, Severity: SeverityWarning,
-		Hosts: []string{"host-a", "host-b"}, Evidence: `{"detail":"first pass"}`,
-		ObserveCount: 1, FirstSeen: "2026-09-06T00:00:00Z", LastSeen: "2026-09-06T00:00:00Z",
-		Reporter: "host-a",
-	}
-	if err := UpsertHealthCondition(ctx, c, h); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
-	got, ok, err := GetHealthCondition(ctx, c, "dual_run", "vm_dual_run", "vm", "vm1")
-	if err != nil || !ok {
-		t.Fatalf("get after insert: ok=%v err=%v", ok, err)
-	}
-	if got.Lifecycle != ConditionObserved || got.ObserveCount != 1 || len(got.Hosts) != 2 {
-		t.Fatalf("got = %#v, want observed/1/2-hosts", got)
-	}
-
-	// Second pass confirms it.
-	h.Lifecycle = ConditionConfirmed
-	h.Severity = SeverityCritical
-	h.ObserveCount = 2
-	h.ConfirmedAt = "2026-09-06T00:01:00Z"
-	h.LastSeen = "2026-09-06T00:01:00Z"
-	if err := UpsertHealthCondition(ctx, c, h); err != nil {
-		t.Fatalf("confirm upsert: %v", err)
-	}
-	got, ok, err = GetHealthCondition(ctx, c, "dual_run", "vm_dual_run", "vm", "vm1")
-	if err != nil || !ok || got.Lifecycle != ConditionConfirmed || got.ConfirmedAt == "" {
-		t.Fatalf("got after confirm = %#v (ok=%v err=%v), want confirmed with ConfirmedAt set", got, ok, err)
-	}
-
-	// Resolve.
-	h.Lifecycle = ConditionResolved
-	h.ResolvedAt = "2026-09-06T00:02:00Z"
-	if err := UpsertHealthCondition(ctx, c, h); err != nil {
-		t.Fatalf("resolve upsert: %v", err)
-	}
-	all, err := ListHealthConditions(ctx, c, false)
-	if err != nil {
-		t.Fatalf("list active: %v", err)
-	}
-	for _, cond := range all {
-		if cond.SubjectID == "vm1" {
-			t.Fatalf("resolved condition still returned by ListHealthConditions(includeResolved=false): %#v", cond)
-		}
-	}
-	allIncl, err := ListHealthConditions(ctx, c, true)
-	if err != nil {
-		t.Fatalf("list all: %v", err)
-	}
-	found := false
-	for _, cond := range allIncl {
-		if cond.SubjectID == "vm1" && cond.Lifecycle == ConditionResolved {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("resolved condition missing from ListHealthConditions(includeResolved=true)")
+		Hosts: []string{"h1", "h2"}, Evidence: `{"holders":["h1","h2"]}`,
+		ObserveCount: 1, FirstSeen: "2026-08-04T10:00:00Z", LastSeen: "2026-08-04T10:00:00Z",
+		Reporter: "h1",
 	}
 }
 
-func TestTombstoneResolvedHealthConditions_RetentionCutoff(t *testing.T) {
-	c := testClient(t)
+func TestHealthCondition_UpsertRoundTrips(t *testing.T) {
+	db := newTestDB(t)
 	ctx := context.Background()
-	now := time.Date(2026, 9, 6, 12, 0, 0, 0, time.UTC)
 
-	old := HealthCondition{
-		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "old-vm",
-		Lifecycle: ConditionResolved, Severity: SeverityWarning,
-		FirstSeen: "2026-08-01T00:00:00Z", LastSeen: "2026-08-01T00:00:00Z",
-		ResolvedAt: now.Add(-31 * 24 * time.Hour).UTC().Format(time.RFC3339),
-		Reporter:   "host-a",
+	want := seedCondition("web-1")
+	if err := UpsertHealthCondition(ctx, db, want); err != nil {
+		t.Fatalf("UpsertHealthCondition: %v", err)
 	}
-	recent := old
-	recent.SubjectID = "recent-vm"
-	recent.ResolvedAt = now.Add(-1 * time.Hour).UTC().Format(time.RFC3339)
-
-	if err := UpsertHealthCondition(ctx, c, old); err != nil {
-		t.Fatalf("insert old: %v", err)
+	got, ok, err := GetHealthCondition(ctx, db, "dual_run", "vm_dual_run", "vm", "web-1")
+	if err != nil || !ok {
+		t.Fatalf("GetHealthCondition: ok=%v err=%v", ok, err)
 	}
-	if err := UpsertHealthCondition(ctx, c, recent); err != nil {
-		t.Fatalf("insert recent: %v", err)
+	if got.Lifecycle != ConditionObserved || got.Severity != SeverityWarning ||
+		got.ObserveCount != 1 || got.Evidence != want.Evidence || got.Reporter != "h1" {
+		t.Errorf("round trip mismatch: %+v", got)
+	}
+	if len(got.Hosts) != 2 || got.Hosts[0] != "h1" || got.Hosts[1] != "h2" {
+		t.Errorf("hosts = %v, want [h1 h2]", got.Hosts)
 	}
 
-	n, err := TombstoneResolvedHealthConditions(ctx, c, now)
+	// A later scan's transition replaces the row's state wholesale.
+	want.Lifecycle = ConditionConfirmed
+	want.Severity = SeverityCritical
+	want.ObserveCount = 2
+	want.ConfirmedAt = "2026-08-04T10:01:00Z"
+	if err := UpsertHealthCondition(ctx, db, want); err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	got, _, err = GetHealthCondition(ctx, db, "dual_run", "vm_dual_run", "vm", "web-1")
 	if err != nil {
-		t.Fatalf("tombstone: %v", err)
+		t.Fatalf("re-read: %v", err)
+	}
+	if got.Lifecycle != ConditionConfirmed || got.Severity != SeverityCritical ||
+		got.ObserveCount != 2 || got.ConfirmedAt != "2026-08-04T10:01:00Z" {
+		t.Errorf("after confirm: %+v", got)
+	}
+}
+
+func TestHealthCondition_ListFiltersResolved(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	active := seedCondition("active-vm")
+	if err := UpsertHealthCondition(ctx, db, active); err != nil {
+		t.Fatalf("upsert active: %v", err)
+	}
+	resolved := seedCondition("fixed-vm")
+	resolved.Lifecycle = ConditionResolved
+	resolved.ResolvedAt = "2026-08-01T00:00:00Z"
+	if err := UpsertHealthCondition(ctx, db, resolved); err != nil {
+		t.Fatalf("upsert resolved: %v", err)
+	}
+
+	activeOnly, err := ListHealthConditions(ctx, db, false)
+	if err != nil {
+		t.Fatalf("ListHealthConditions(active): %v", err)
+	}
+	if len(activeOnly) != 1 || activeOnly[0].SubjectID != "active-vm" {
+		t.Errorf("active list = %+v, want the one unresolved condition", activeOnly)
+	}
+	all, err := ListHealthConditions(ctx, db, true)
+	if err != nil {
+		t.Fatalf("ListHealthConditions(all): %v", err)
+	}
+	if len(all) != 2 {
+		t.Errorf("full list has %d rows, want 2 (resolved history is readable)", len(all))
+	}
+}
+
+// TestHealthCondition_GCKeepsRecentResolved: the 30-day retention is an operator
+// affordance — "what happened last week" must still be answerable — and the GC
+// must never touch an ACTIVE condition regardless of age.
+func TestHealthCondition_GCKeepsRecentResolved(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+
+	old := seedCondition("ancient")
+	old.Lifecycle = ConditionResolved
+	old.ResolvedAt = now.Add(-31 * 24 * time.Hour).Format(time.RFC3339)
+	recent := seedCondition("last-week")
+	recent.Lifecycle = ConditionResolved
+	recent.ResolvedAt = now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)
+	stillActive := seedCondition("ongoing")
+	stillActive.FirstSeen = now.Add(-90 * 24 * time.Hour).Format(time.RFC3339)
+	for _, h := range []HealthCondition{old, recent, stillActive} {
+		if err := UpsertHealthCondition(ctx, db, h); err != nil {
+			t.Fatalf("upsert %s: %v", h.SubjectID, err)
+		}
+	}
+
+	n, err := TombstoneResolvedHealthConditions(ctx, db, now)
+	if err != nil {
+		t.Fatalf("TombstoneResolvedHealthConditions: %v", err)
 	}
 	if n != 1 {
-		t.Fatalf("tombstoned %d rows, want exactly 1 (the 31-day-old one)", n)
+		t.Errorf("GC removed %d rows, want exactly 1 (the 31-day-old resolved one)", n)
 	}
-	all, err := ListHealthConditions(ctx, c, true)
+	all, err := ListHealthConditions(ctx, db, true)
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	for _, cond := range all {
-		if cond.SubjectID == "old-vm" {
-			t.Fatal("31-day-old resolved condition still returned after tombstoning — deleted_at not filtered or not set")
-		}
+	names := map[string]bool{}
+	for _, h := range all {
+		names[h.SubjectID] = true
 	}
-	foundRecent := false
-	for _, cond := range all {
-		if cond.SubjectID == "recent-vm" {
-			foundRecent = true
-		}
-	}
-	if !foundRecent {
-		t.Fatal("1-hour-old resolved condition was tombstoned — retention cutoff is wrong")
+	if names["ancient"] || !names["last-week"] || !names["ongoing"] {
+		t.Errorf("post-GC rows = %v, want last-week + ongoing only", names)
 	}
 }
 
-func TestHealthEvaluatorStatus_UpsertAndList(t *testing.T) {
-	c := testClient(t)
+func TestHealthEvaluatorStatus_RoundTrips(t *testing.T) {
+	db := newTestDB(t)
 	ctx := context.Background()
 
-	if err := UpsertHealthEvaluatorStatus(ctx, c, HealthEvaluatorStatus{
-		Evaluator: "dual_run", LastScan: "2026-09-06T00:00:00Z", Coverage: CoverageComplete, Reporter: "host-a",
+	if err := UpsertHealthEvaluatorStatus(ctx, db, HealthEvaluatorStatus{
+		Evaluator: "dual_run", LastScan: "2026-08-04T10:00:00Z",
+		Coverage: CoveragePartial, Reporter: "h1", Detail: "h3 unreachable",
 	}); err != nil {
-		t.Fatalf("insert: %v", err)
+		t.Fatalf("UpsertHealthEvaluatorStatus: %v", err)
 	}
-	if err := UpsertHealthEvaluatorStatus(ctx, c, HealthEvaluatorStatus{
-		Evaluator: "dual_run", LastScan: "2026-09-06T00:01:00Z", Coverage: CoveragePartial, Reporter: "host-b", Detail: "host-c unreachable",
+	// The next scan overwrites — status is "latest scan", not history.
+	if err := UpsertHealthEvaluatorStatus(ctx, db, HealthEvaluatorStatus{
+		Evaluator: "dual_run", LastScan: "2026-08-04T10:05:00Z",
+		Coverage: CoverageComplete, Reporter: "h1",
 	}); err != nil {
-		t.Fatalf("update: %v", err)
+		t.Fatalf("second upsert: %v", err)
 	}
-	all, err := ListHealthEvaluatorStatus(ctx, c)
+	sts, err := ListHealthEvaluatorStatus(ctx, db)
 	if err != nil {
-		t.Fatalf("list: %v", err)
+		t.Fatalf("ListHealthEvaluatorStatus: %v", err)
 	}
-	if len(all) != 1 {
-		t.Fatalf("got %d evaluator rows, want 1 (upsert must replace, not duplicate)", len(all))
+	if len(sts) != 1 || sts[0].Coverage != CoverageComplete || sts[0].LastScan != "2026-08-04T10:05:00Z" {
+		t.Errorf("status = %+v, want the newest complete scan", sts)
 	}
-	if all[0].Coverage != CoveragePartial || all[0].Reporter != "host-b" {
-		t.Fatalf("got %#v, want the SECOND upsert's values (latest scan wins)", all[0])
+}
+
+func TestHostCapacityObservation_RoundTrips(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+
+	if err := UpsertHostCapacityObservation(ctx, db, HostCapacityObservation{
+		HostName: "h1", DBCPU: 8, DBMemMiB: 8192,
+		ExtraCPU: 2, ExtraMemMiB: 2048,
+		EffectiveCPU: 10, EffectiveMemMiB: 10240,
+		Complete: false, Detail: "uncapped container rogue-ct",
+		SampledAt: "2026-08-04T10:00:00Z",
+	}); err != nil {
+		t.Fatalf("UpsertHostCapacityObservation: %v", err)
+	}
+	got, ok, err := GetHostCapacityObservation(ctx, db, "h1")
+	if err != nil || !ok {
+		t.Fatalf("GetHostCapacityObservation: ok=%v err=%v", ok, err)
+	}
+	if got.EffectiveCPU != 10 || got.EffectiveMemMiB != 10240 || got.Complete ||
+		got.ExtraCPU != 2 || got.Detail == "" {
+		t.Errorf("observation = %+v", got)
+	}
+
+	// The next sample replaces the row; completeness can recover.
+	if err := UpsertHostCapacityObservation(ctx, db, HostCapacityObservation{
+		HostName: "h1", DBCPU: 8, DBMemMiB: 8192,
+		EffectiveCPU: 8, EffectiveMemMiB: 8192, Complete: true,
+		SampledAt: "2026-08-04T10:01:00Z",
+	}); err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	got, _, _ = GetHostCapacityObservation(ctx, db, "h1")
+	if !got.Complete || got.ExtraCPU != 0 || got.SampledAt != "2026-08-04T10:01:00Z" {
+		t.Errorf("after recovery sample: %+v", got)
 	}
 }

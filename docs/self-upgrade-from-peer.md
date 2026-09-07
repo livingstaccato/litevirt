@@ -1,5 +1,16 @@
 # Self-upgrade from a peer (auto-catch-up)
 
+> **v50 is a coordinated major upgrade.** The v50 release replaces the health,
+> runtime-inventory, and capacity RPC surface outright (no mixed-version
+> compatibility): `GetHostHealth`, `ReportRuntime`, `CheckVMRuntime`,
+> `CheckContainerRuntime`, and `ClusterStatus.alerts` are gone, and every
+> consumer reads `GetClusterHealth` / `GetRuntimeInventory`. Upgrade the whole
+> cluster together — take a consistent database backup first, then replace
+> every daemon and client in one campaign. Stored data migrates automatically
+> (schema v42 → v50 is verified end to end); running MIXED versions is
+> unsupported and will surface as `Unimplemented` peer RPCs and dual-run
+> coverage gauge entries until the stragglers are upgraded.
+
 ## Problem
 
 `lv host upgrade` is operator-initiated and only touches **reachable** hosts. A
@@ -76,8 +87,9 @@ spreads the binary pulls across the ~R relays instead of all hammering one node.
 
 ## Safety / anti-thrash
 
-- Config-gated: `auto_upgrade.from_peer` (default **on**); `auto_upgrade.interval`
-  (default 5m). Set off to require manual `lv host upgrade`.
+- Config-gated: `auto_upgrade.from_peer` (default **on**);
+  `auto_upgrade.interval_minutes` (integer minutes, default **5**). Set off to
+  require manual `lv host upgrade`.
 - **Jittered** startup delay and tick (±50%) so a synchronized fleet reboot
   doesn't herd on the first check or on each interval.
 - Only pulls from **active** peers; verifies the **checksum** and the

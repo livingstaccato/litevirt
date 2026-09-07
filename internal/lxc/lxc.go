@@ -119,6 +119,12 @@ type Runtime interface {
 	IP(ctx context.Context, name string) (string, error)
 	// List enumerates every container known to LXC on this host.
 	List(ctx context.Context) ([]string, error)
+	// Limits reads the container's configured cgroup limits back from its
+	// on-disk config — the runtime's own truth, not the cluster DB's opinion.
+	// 0 means unlimited for that dimension. The runtime-inventory collector
+	// reports these so capacity accounting can charge runtime-only containers
+	// and flag uncapped ones.
+	Limits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
 	// Freeze suspends every process in a running container (lxc-freeze) so its
 	// rootfs can be read consistently (backup/snapshot quiesce). Pair with
 	// Unfreeze; a no-op-ish error on an already-frozen/stopped container is fine.

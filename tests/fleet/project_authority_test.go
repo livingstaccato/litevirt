@@ -235,21 +235,95 @@ func TestFleet_ProjectAuthority_BootstrapsWithoutWaitingForReplication(t *testin
 		}
 	}
 
-	// And every node must have landed on the SAME holder; disagreement here means two
-	// deciders, which is the state the mechanism exists to prevent.
+	// Every node that HAS a record must have landed on the SAME holder; disagreement
+	// means two deciders, which is the state the mechanism exists to prevent.
+	//
+	// Absence is not a failure. Only the deterministic candidate MINTS the initial
+	// authority — a non-candidate deliberately returns "none" rather than writing its
+	// own, because project_authority_epochs merges immutably: two minters at epoch 1
+	// are kept-local on both sides and flagged immutable_conflict permanently, and
+	// since immutableFactsEqual compares created_at, even two claims naming the same
+	// holder conflict. So a peer legitimately has no row until the candidate's mint
+	// replicates. What must never happen is two DIFFERENT holders.
 	ctx := context.Background()
 	var first string
+	var haveRecord int
 	for _, n := range c.Nodes {
 		cur, ok, err := corrosion.CurrentProjectAuthority(ctx, n.DB, "tenant")
-		if err != nil || !ok {
-			t.Fatalf("%s has no authority record after admitting: ok=%v err=%v", n.Name, ok, err)
+		if err != nil {
+			t.Fatalf("%s: CurrentProjectAuthority: %v", n.Name, err)
 		}
+		if !ok {
+			continue
+		}
+		haveRecord++
 		if first == "" {
 			first = cur.Holder
 		} else if cur.Holder != first {
 			t.Errorf("%s thinks %q holds the project but another node thinks %q — two holders at one epoch",
 				n.Name, cur.Holder, first)
 		}
+	}
+	// Guard against the vacuous pass: if NO node minted, the loop above compares
+	// nothing and agrees trivially.
+	if haveRecord == 0 {
+		t.Fatal("no node recorded a project authority after admitting — the deterministic " +
+			"candidate must mint, or quota admission has no decider at all")
+	}
+}
+
+// TestFleet_ProjectAuthority_BootstrapNeverDowngradesToLocal: once delegation is
+// LATCHED, a project with no authority record must be decided by the deterministic
+// candidate or refused — never checked locally by whichever node the request
+// entered. The previous behavior fell back to an unreserved, unfenced local check
+// when no authority could be established (a non-candidate legitimately reads an
+// empty authority for a brand-new project), so the very first admissions of a
+// project on two nodes could both pass and together exceed quota — the exact
+// failure the latch promises is gone. Here the candidate is unreachable, so the
+// non-candidate must refuse with Unavailable, exactly like an unreachable
+// RECORDED holder; admitting locally would prove the downgrade path still exists.
+func TestFleet_ProjectAuthority_BootstrapNeverDowngradesToLocal(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	defer c.Stop()
+	gates := gateAll(t, c)
+	roomyHosts(t, c)
+	seedTenantQuota(t, c, "tenant", 8)
+	// Deliberately NO seedProjectAuthority: the project is brand-new everywhere.
+	latchProjectAuthority(t, c, gates)
+
+	ctx := context.Background()
+	hosts, err := corrosion.ListHosts(ctx, c.Nodes[0].DB)
+	if err != nil {
+		t.Fatalf("ListHosts: %v", err)
+	}
+	candidateName, ok := corrosion.DeterministicAuthorityCandidate(hosts, "tenant")
+	if !ok {
+		t.Fatal("no deterministic candidate derivable")
+	}
+	var candidate, other *Node
+	for _, n := range c.Nodes {
+		if n.Name == candidateName {
+			candidate = n
+		} else {
+			other = n
+		}
+	}
+	if candidate == nil || other == nil {
+		t.Fatalf("candidate %q not among the cluster nodes", candidateName)
+	}
+
+	c.Partition(candidate, other)
+	defer c.Heal(candidate, other)
+
+	_, cerr := runProjectVM(t, c, other, "vm-boot", other.Name, 2, 1024, "tenant")
+	if status.Code(cerr) != codes.Unavailable {
+		t.Fatalf("bootstrap admission on a non-candidate with the candidate unreachable returned %v (code %s), "+
+			"want Unavailable — a latched cluster must refuse, not downgrade to an unserialized local check",
+			cerr, status.Code(cerr))
+	}
+	// And no authority row may have been minted by the non-candidate.
+	if _, ok, _ := corrosion.CurrentProjectAuthority(ctx, other.DB, "tenant"); ok {
+		t.Fatal("the non-candidate minted an authority row — only the deterministic candidate may mint")
 	}
 }
 

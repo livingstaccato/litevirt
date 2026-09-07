@@ -112,6 +112,8 @@ func main() {
 	}
 
 	gaps := computeGaps(findings)
+	// A registered shape with no caller never reaches a peer — see reachable.go.
+	gaps = append(gaps, unreachableEmitters(pkgs, findings)...)
 	if len(gaps) == 0 {
 		fmt.Printf("stmtshapecheck: %d replicated builder statement(s) all registered; OK\n", len(findings))
 		return
@@ -433,10 +435,6 @@ func scanPkg(pkg *packages.Package) []finding {
 					if len(call.Args) >= 2 {
 						got = s.resolveBatchArg(call.Args[1])
 					}
-				case "ExecuteBatchDeferred": // (ctx, stmts)
-					if len(call.Args) >= 2 {
-						got = s.resolveBatchArg(call.Args[1])
-					}
 				case "ExecuteBatchGuarded": // (ctx, guard, stmts)
 					if len(call.Args) >= 3 {
 						got = s.resolveBatchArg(call.Args[2])
@@ -455,7 +453,7 @@ func scanPkg(pkg *packages.Package) []finding {
 
 func isReplicatingMethod(m string) bool {
 	switch m {
-	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchDeferred", "ExecuteBatchGuarded":
+	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded":
 		return true
 	}
 	return false
@@ -472,7 +470,7 @@ func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
 		return false
 	}
 	switch fd.Name.Name {
-	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchDeferred", "ExecuteBatchGuarded",
+	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
 		"executeBatchInternal", "execLocal", "execLocalRows", "execBatchLocal":
 		return true
 	}

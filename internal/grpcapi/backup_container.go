@@ -700,16 +700,24 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
 
-	// Capacity + quota admission, MEMORY only — a container's cpu_limit is CPU
-	// *shares* (a relative cgroup weight), not a vCPU reservation, so only its
-	// memory cap is comparable to a VM's, and an uncapped container reserves
-	// nothing (mirrors CreateContainer). Restore admitted NOTHING, so a full-sized
-	// container could be materialised on any host, at any size, past both that
-	// host's capacity and its project's quota — while CreateContainer refused the
-	// identical shape.
+	// Capacity + quota admission, the SAME two-scope split as CreateContainer.
 	//
-	// WHICH admission depends on the caller, because one handler serves three with
-	// different accounting:
+	//   HOST capacity — memory only. A container's cpu_limit is CPU *shares* (a
+	//   relative cgroup weight), not a vCPU reservation, so it must not be added
+	//   to a host's vCPU total; an uncapped container reserves nothing, matching
+	//   how it is accounted.
+	//
+	//   PROJECT quota — CPU **and** memory. SumProjectUsage counts the restored
+	//   row's cpu_limit against the project vCPU budget the moment it lands, so
+	//   admission has to charge it or the limit is unenforceable — and it must run
+	//   whenever EITHER dimension is set: this path previously passed 0 for CPU
+	//   and ran only when memory was non-zero, so a CPU-limited container with
+	//   unlimited memory was restored past every gate this handler has (no host
+	//   check, no quota check, no host-safety check) while CreateContainer refused
+	//   the identical shape.
+	//
+	// WHICH halves run depends on the caller, because one handler serves three
+	// with different accounting:
 	//
 	//   - operator restore → a NEW allocation (the source container, if it still
 	//     exists, is still counted), so quota is charged, exactly like a create.
@@ -724,24 +732,42 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	//     (migrate_container.go), so re-admitting here would demand twice the
 	//     container's memory and refuse migrations that fit.
 	//
-	// It runs before the import, so a refusal costs no I/O; the lease is released
-	// when this handler returns, i.e. after the container's own row lands and
-	// accounts for the same memory.
-	if mem := spec.MemMiB; mem > 0 && s.migrateSourceFromPeer(ctx) == "" {
-		var (
-			lease *reservationLease
-			aerr  error
-		)
-		if req.Proof != nil || relocateTokenFromMD(ctx) != "" {
-			lease, aerr = s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, 0, mem)
-		} else {
-			lease, aerr = s.admitWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, mem)
+	// It runs before the import, so a refusal costs no I/O; the leases are
+	// released when this handler returns, i.e. after the container's own row lands
+	// and accounts for the same figures.
+	var restoreQuotaLease *reservationLease
+	if s.migrateSourceFromPeer(ctx) == "" {
+		relocation := req.Proof != nil || relocateTokenFromMD(ctx) != ""
+		// Unconditional, like CreateContainer: an archived spec with no limits
+		// still restores into RESIDENCY, and that is the safety decision.
+		{
+			lease, aerr := s.admitHostWithReservation(ctx, "RestoreContainer", s.hostName, project, "ct:"+req.Name, 0, spec.MemMiB, intentContainerResident)
+			if aerr != nil {
+				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+				return aerr
+			}
+			defer lease.release(ctx)
 		}
-		if aerr != nil {
-			s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
-			return aerr
+		// The restore rebuilds the archived spec's MANAGED NICs into
+		// container_interfaces rows, which the project's NIC budget counts — so
+		// the charge includes them, from the same spec the rebuild reads. A
+		// RELOCATION still charges nothing: the workload is moving, not new.
+		restoreQuota := corrosion.QuotaAmount{
+			VCPU: spec.CPULimit, MemMiB: spec.MemMiB,
+			NIC: managedNICCount(corrosion.DecodeCreateSpec(spec.CreateSpec)),
 		}
-		defer lease.release(ctx)
+		if !relocation && !restoreQuota.IsZero() {
+			lease, aerr := s.admitQuotaWithReservation(ctx, "RestoreContainer", s.hostName, project,
+				corrosion.WorkloadContainer, req.Name, restoreQuota, restoreQuota, intentContainerResident)
+			if aerr != nil {
+				s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+				return aerr
+			}
+			defer lease.release(ctx)
+			// Held for the commit fence before CreateContainerAtomic: the whole
+			// archive import runs between this grant and that write.
+			restoreQuotaLease = lease
+		}
 	}
 
 	send := func(p *pb.RestoreContainerProgress) error { return stream.Send(p) }
@@ -880,6 +906,23 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		// restore-relocation) so it can prove this row is its restore.
 		RelocateToken: relocateTokenFromMD(ctx),
 	}
+	// FENCE, immediately before the durable write (see allowCommit): the whole
+	// archive import sat between the quota grant and here, so the project's
+	// authority can genuinely move mid-restore. A refusal tears down the
+	// imported runtime container exactly like the cluster-state-write failure
+	// below — nothing durable exists yet, so it costs a retry. A nil lease
+	// (relocation, migrate, or an unquota'd restore) allows.
+	s.fireCommitFenceHook("RestoreContainer")
+	if ferr := restoreQuotaLease.allowCommit(ctx); ferr != nil {
+		if delErr := s.containerRuntime.DeleteContainer(ctx, req.Name); delErr != nil {
+			slog.Warn("container restore: failed to clean up imported container after a fence refusal",
+				"name", req.Name, "error", delErr)
+		}
+		s.removeRestoreMarker(req.Name)
+		s.audit(ctx, "ct.restore", req.Name, "project="+project, "error")
+		return ferr
+	}
+
 	// The cluster-state write is MANDATORY and atomic: the container row AND its
 	// managed interface rows go in ONE batch, so a restore can't land a tracked
 	// container with missing NIC state (failover relies on "row exists ⇒ restore
@@ -977,6 +1020,16 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 // resolveContainerHost finds the host that owns a container. When hostHint is
 // set it's trusted (and the row fetched directly); otherwise the cluster is
 // scanned by name. Returns the host plus the record.
+//
+// A name-only scan can match MORE THAN ONE container: the primary key is
+// (host_name, name), so the same name on two hosts is two distinct, legitimate
+// containers, not a duplicate to be deduplicated. Returning the first match
+// picked one of them by list order — a delete then destroyed a container the
+// operator never named, and start/stop acted on the wrong one, with nothing in
+// the response distinguishing that from the intended container. So an ambiguous
+// name is refused with the candidates named; --host is exact and always
+// resolves. Fail-closed here covers every caller (delete/start/stop, backup,
+// snapshot, migrate, template) at once, since they all resolve through this.
 func (s *Server) resolveContainerHost(ctx context.Context, hostHint, name string) (string, *corrosion.ContainerRecord, error) {
 	if hostHint != "" {
 		rec, err := corrosion.GetContainer(ctx, s.db, hostHint, name)
@@ -992,10 +1045,25 @@ func (s *Server) resolveContainerHost(ctx context.Context, hostHint, name string
 	if err != nil {
 		return "", nil, status.Errorf(codes.Internal, "list containers: %v", err)
 	}
+	var match *corrosion.ContainerRecord
+	var hosts []string
 	for i := range cts {
 		if cts[i].Name == name {
-			return cts[i].HostName, &cts[i], nil
+			if match == nil {
+				match = &cts[i]
+			}
+			hosts = append(hosts, cts[i].HostName)
 		}
 	}
-	return "", nil, status.Errorf(codes.NotFound, "container %q not found in cluster", name)
+	switch {
+	case len(hosts) == 0:
+		return "", nil, status.Errorf(codes.NotFound, "container %q not found in cluster", name)
+	case len(hosts) > 1:
+		// ListContainers orders by (host_name, name), so the candidate list is
+		// already deterministic and stable across nodes.
+		return "", nil, status.Errorf(codes.FailedPrecondition,
+			"container %q exists on %d hosts (%s); pass --host to name the one you mean",
+			name, len(hosts), strings.Join(hosts, ", "))
+	}
+	return match.HostName, match, nil
 }

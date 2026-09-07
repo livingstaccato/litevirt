@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -190,9 +191,18 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	}
 
 	ctMem := corrosion.ContainerMemoryByHost(state.Containers)
-	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, ctMem, placementReqs)
+	placements, err := placement.SelectBatch(state.Hosts, state.VMs, state.Devices, ctMem,
+		state.Observations, time.Now(), placementReqs)
 	if err != nil {
 		return nil, fmt.Errorf("batch placement failed: %w", err)
+	}
+	// SelectBatch reports per-VM infeasibility as an empty Host (so failover
+	// can strand one VM without abandoning the rest); a compose plan is
+	// all-or-nothing, so re-raise it as the hard error it always was here.
+	for _, name := range placementVMNames {
+		if placements[name].Host == "" {
+			return nil, fmt.Errorf("batch placement failed: %w for VM %q", placement.ErrNoEligibleHost, name)
+		}
 	}
 
 	// Stored specs for this stack's VMs (for classifying in-place updates). Built
@@ -687,7 +697,14 @@ func collectWarnings(plan *ResolvedPlan, f *compose.File) {
 }
 
 // buildPlacementRequest converts a VMSpec into a placement.Request.
+//
+// Normalizes cpu/memory first: compose merges those fields but never defaults
+// them (parse.go only copies non-zero child values), so a service with no `cpu:`
+// or `memory:` planned at 0/0 — and placement skips its fit filter entirely for a
+// 0/0 request, so a full host looked like a valid candidate. The VM then
+// materialized at the create defaults via CreateVM. Plan against what it costs.
 func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) placement.Request {
+	compose.NormalizeVMSpecResources(spec)
 	req := placement.Request{
 		VMName:       spec.Name,
 		CPUNeeded:    int(spec.Cpu),

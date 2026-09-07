@@ -45,13 +45,10 @@ message PublishCRLRequest  { string crl_pem = 1; }
 message PublishCRLResponse { int64 version = 1; }
 message FenceResult        { string host_name = 1; string method = 2;
     string result = 3; string detail = 4; }
-message HostHealthMatrix   { repeated HostHealthEntry entries = 1; }
-message HostHealthEntry    { string observer = 1; string target = 2;
-    string status = 3; int32 consecutive_failures = 4;
-    google.protobuf.Timestamp last_seen = 5; }
 // GetClusterHealth is THE health read: the durable condition set, evaluator
-// coverage, and observer→target connectivity, rolled up into one overall
-// state. There is no per-signal health RPC.
+// coverage, observer→target connectivity, and per-host capacity assessments,
+// rolled up into one overall state. Every consumer (CLI, REST, MCP, UI,
+// dashboard) reads this; there is no per-signal health RPC.
 message GetClusterHealthRequest {
     // include_resolved adds recently-resolved conditions (kept 30 days) to the
     // response — the operator's "what happened last week" view.
@@ -87,7 +84,19 @@ message ConnectivityEdge {
     string target   = 2;
     string status   = 3;       // healthy | suspect | failing
     int32  consecutive_failures = 4;
-    google.protobuf.Timestamp last_seen = 5;
+    string last_seen = 5;      // RFC3339
+}
+message HostCapacityAssessment {
+    string host_name = 1;
+    int32  db_cpu = 2;         // database-allocated
+    int32  db_mem_mib = 3;
+    int32  extra_cpu = 4;      // runtime-only workloads on top
+    int32  extra_mem_mib = 5;
+    int32  effective_cpu = 6;  // union accounting
+    int32  effective_mem_mib = 7;
+    bool   complete = 8;       // false = placement must treat as unknown
+    string detail = 9;
+    string sampled_at = 10;    // RFC3339
 }
 message ClusterHealth {
     // HEALTHY: no active conditions, complete fresh coverage.
@@ -98,7 +107,8 @@ message ClusterHealth {
     repeated HealthCondition conditions = 2;
     repeated HealthEvaluatorStatus evaluators = 3;
     repeated ConnectivityEdge connectivity = 4;
-    string generated_at = 5;   // RFC3339
+    repeated HostCapacityAssessment capacity = 5;
+    string generated_at = 6;   // RFC3339
 }
 message RescanHostRequest  { string name = 1; }
 message RescanHostResponse { int32 added = 1; int32 removed = 2;
@@ -192,8 +202,6 @@ message RepairVMOwnerResponse { string host = 1; string previous_host = 2; }
 // unknown}. The runtime owner-assert reconciler queries this on every
 // workload-capable peer (worker hosts that aren't fenced) before reclaiming a
 // VM it runs locally.
-message CheckVMRuntimeRequest  { string name = 1; }
-message CheckVMRuntimeResponse { string state = 1; }
 
 // CheckVIPParticipant asks a peer whether it could HOLD or BECOME MASTER of a VIP: it
 // renders a keepalived config whose virtual_ipaddress includes vip (a VRRP participant —
@@ -232,26 +240,62 @@ message CheckLBPresentResponse { bool present = 1; }
 // re-key reconciler queries it on every workload-capable peer before reclaiming a
 // container it runs locally (a PK re-key, since container ownership is part of
 // the primary key).
-message CheckContainerRuntimeRequest  { string name = 1; }
-message CheckContainerRuntimeResponse { string state = 1; }
 
-// ReportRuntime returns the responding host's LOCAL ground-truth runtime snapshot for
-// the leader-gated dual-run detector: VMs that are active DISK-HOLDERS (a domain in a
-// disk-writing state — RUNNING or BLOCKED), running containers, VIP addresses assigned
-// on this host's KERNEL (not a keepalived-pid signal), and the count of unresolved LWW
-// ties this node is currently tracking. Peer-only (host-cert mTLS); never consults the
-// cluster DB — the detector cross-references the DB itself.
-message ReportRuntimeRequest {}
-message ReportRuntimeResponse {
-    repeated string disk_holder_vms      = 1;
-    repeated string running_containers   = 2;
+// GetRuntimeInventory returns the responding host's LOCAL ground-truth runtime view —
+// the ONE runtime source every consumer reads: the dual-run detector, owner assertion,
+// owner-epoch readiness, capacity sampling, and health evidence. It never consults the
+// cluster DB (the DB is exactly the disputed value its callers corroborate against);
+// database comparison is the caller's job. Peer-only (host-cert mTLS).
+//
+// An empty filter returns the full inventory. A (kind, name) filter returns just that
+// workload's entry — the targeted form owner assertion uses, cheap enough to call per
+// workload on every peer.
+message GetRuntimeInventoryRequest {
+    // Optional workload filter: kind "vm" | "container" plus the workload name.
+    // Both empty = full inventory.
+    string kind = 1;
+    string name = 2;
+}
+// One workload as the local runtime actually sees it.
+message RuntimeWorkload {
+    string kind  = 1;               // "vm" | "container"
+    string name  = 2;
+    string state = 3;               // running | defined_stopped | absent | unknown
+    // A VM domain in a disk-writing state (RUNNING or BLOCKED) — the signal the
+    // dual-run detector groups on. Two hosts must never both be writing one disk.
+    bool disk_holder = 4;
+    // The runtime's own configured size — libvirt's current vcpu/memory for a VM,
+    // cgroup limits for a container. NOT the database's opinion.
+    int32 cpu        = 5;
+    int32 memory_mib = 6;
+    // The host-local owner-epoch marker: its value, and whether it could be read.
+    // marker_status: valid | missing | corrupt | unreadable. A marker that cannot
+    // be read is never epoch 0 — garbage read as the zero generation would
+    // authorize exactly the stale actions the marker exists to refuse.
+    int64  owner_epoch_marker = 7;
+    string marker_status      = 8;
+    // A container with no cpu AND no memory limit: it consumes unbounded host
+    // resources that capacity accounting cannot attribute, so its presence makes
+    // the host's capacity observation INCOMPLETE.
+    bool uncapped = 9;
+    // Per-item probe failure (state read failed, config unreadable). The item is
+    // still listed — presence is real — but its details are unreliable.
+    string probe_error = 10;
+}
+message RuntimeInventory {
+    string host = 1;
+    repeated RuntimeWorkload workloads = 2;
+    // VIP addresses assigned on this host's KERNEL (bare IPs; not a keepalived-pid
+    // signal — a VRRP backup renders config but holds no address).
     repeated string kernel_assigned_vips = 3;
-    int32           unresolved_tie_count = 4;
-    // partial is true when ANY local runtime probe errored (libvirt list/state, container
-    // list/state, LB-config read, or the kernel `ip` dump). The positive holders reported
-    // are still real, but the ABSENCE of a workload is NOT reliable — the leader must not
-    // use a partial snapshot as "probed and absent" proof, and raises a coverage gap for it.
-    bool            partial              = 5;
+    int32 unresolved_tie_count = 4;
+    // complete is false when ANY local probe errored (libvirt list/state, container
+    // list/state, LB-config read, the kernel `ip` dump, or a marker read). Positive
+    // entries are still real, but ABSENCE is unreliable: a caller must never treat
+    // an incomplete inventory as proof a workload is gone.
+    bool complete = 5;
+    repeated string errors = 6;
+    string sampled_at = 7;          // RFC3339
 }
 
 // CloneVM creates a new VM from a template or an existing VM (optionally a
@@ -1260,7 +1304,10 @@ message GetHostStatsRequest  { string name = 1; }
 // ── Monitoring ──
 message ClusterStatus { string cluster_name = 1; int32 hosts_total = 2;
     int32 hosts_active = 3; int32 vms_total = 4; int32 vms_running = 5;
-    int32 vms_error = 6; repeated Host hosts = 7; repeated Alert alerts = 8;
+    int32 vms_error = 6; repeated Host hosts = 7;
+    // 8 was `repeated Alert alerts` — never populated by any release; health
+    // now lives exclusively in GetClusterHealth.
+    reserved 8;
     repeated ClusterEvent recent_events = 9; }
 message StreamEventsRequest { repeated string event_types = 1; }
 
@@ -1540,6 +1587,19 @@ message PingResponse {
   // empty list and is treated as unsupported. Enforcement of a fail-closed check
   // activates only once every enforcement-relevant member advertises its token.
   repeated string capabilities = 4;
+  // wall_clock is the responder's WALL clock (RFC3339 nanos) at the moment it
+  // answered — never the HLC. The caller compares it with its own to detect NTP
+  // drift, which corrupts LWW conflict resolution. Empty from a peer that
+  // predates this field; a caller must read that as "unknown", never as skew.
+  string wall_clock = 5;
+  // wal_quarantined: this node detected that its own binary is a rollback below
+  // a capability token it had ALREADY latched, so it is WAL-quarantined —
+  // emitting no replicated writes and advertising nothing. It is a SELF-REPORT
+  // of degradation, which is the one direction worth trusting: a node lying
+  // about its state claims health, not quarantine. A healthy peer acts on it by
+  // recording the isolation (§A), because the quarantined node may not record
+  // its own.
+  bool wal_quarantined = 6;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -1834,6 +1894,72 @@ message AdmitHostRequest {
     string cert_serial = 3;
 }
 
+// ── Host network configuration (schema v48, §O Tier 1) ──
+// Declarative per-host interface intent, rendered by the OWNING host into the
+// single litevirt-managed netplan file behind a journaled apply-with-rollback.
+message HostNetwork {
+    string host_name = 1;
+    string name = 2;              // interface name (Linux rules, <=15 chars)
+    string kind = 3;              // bridge | bond | vlan | ethernet
+    repeated string members = 4;  // bond/bridge member interfaces
+    int32 vlan_id = 5;            // vlan only, 1..4094
+    string vlan_link = 6;         // vlan only
+    string addressing = 7;        // JSON: {dhcp4,dhcp6,addresses,gateway,gateway6,nameservers}
+    int32 mtu = 8;
+    string bond_mode = 9;         // bond only (default active-backup)
+    string lacp_rate = 10;        // bond only
+    string hash_policy = 11;      // bond only
+    string state = 12;            // desired | applying | applied | rolled_back
+    int64 generation = 13;        // count of CONFIRMED applies
+    string last_error = 14;
+    string created_at = 15;
+    string updated_at = 16;
+}
+message ListHostNetworksRequest { string host_name = 1; } // '' = cluster-wide
+message ListHostNetworksResponse { repeated HostNetwork networks = 1; }
+message UpsertHostNetworkRequest { HostNetwork network = 1; }
+message PlanHostNetworkRequest { string host_name = 1; }
+message PlanHostNetworkResponse {
+    string rendered = 1;          // the full desired netplan file
+    string current = 2;           // the managed file as it is on disk
+    bool no_op = 3;               // rendered == current: apply would change nothing
+    string cutoff_reason = 4;     // non-empty: apply will refuse without force_interface
+    string cluster_interface = 5; // the interface carrying the advertise address
+    map<string, string> conflicts = 6; // planned interface -> foreign netplan file defining it
+}
+message ApplyHostNetworkRequest {
+    string host_name = 1;
+    // force_interface must NAME the cluster interface to override a
+    // self-cutoff refusal — a written confirmation, not a boolean.
+    string force_interface = 2;
+}
+message DeleteHostNetworkRequest { string host_name = 1; string name = 2; }
+
+// ── Isolation epoch / reseed (§A, schema v49) ──
+message IsolateHostRequest {
+    string name = 1;    // the host to isolate
+    string reason = 2;  // rolled_back_latch | manual | schema_forward
+}
+message HostIsolationStatus {
+    string host_name = 1;
+    int64 isolation_epoch = 2;  // 0 = not isolated
+    string isolation_reason = 3;
+}
+message ReseedHostRequest {
+    string name = 1;    // the isolated host to reseed
+    string source = 2;  // healthy peer to reseed FROM ('' = pick any healthy peer)
+    // driven_by_peer is set by the healthy peer when it forwards the request to
+    // the isolated host. Empty means an operator aimed reseed directly at the
+    // isolated node, which is refused: the epoch clear must be peer-written.
+    string driven_by_peer = 3;
+}
+message ReseedHostResponse {
+    string host_name = 1;
+    string source = 2;         // the peer the state came from
+    int64 cleared_epoch = 3;   // the isolation epoch this reseed reconciled
+    int32 tables_converged = 4;
+}
+
 service LiteVirt {
     // ── Hosts ──
     rpc ListHosts(ListHostsRequest)           returns (ListHostsResponse);
@@ -1843,10 +1969,22 @@ service LiteVirt {
     rpc UndrainHost(UndrainHostRequest)        returns (Host);
     rpc SetHostLabels(SetHostLabelsRequest)    returns (Host);
     rpc FenceHost(FenceHostRequest)            returns (FenceResult);
-    rpc GetHostHealth(google.protobuf.Empty)   returns (HostHealthMatrix);
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
     rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
+    // Host network configuration (v48): intent CRUD runs anywhere (replicated
+    // rows); Plan and Apply are forwarded to the OWNING host — they read and
+    // mutate its local netplan state.
+    rpc ListHostNetworks(ListHostNetworksRequest)   returns (ListHostNetworksResponse);
+    rpc UpsertHostNetwork(UpsertHostNetworkRequest) returns (HostNetwork);
+    rpc PlanHostNetwork(PlanHostNetworkRequest)     returns (PlanHostNetworkResponse);
+    rpc ApplyHostNetwork(ApplyHostNetworkRequest)   returns (google.protobuf.Empty);
+    rpc DeleteHostNetwork(DeleteHostNetworkRequest) returns (google.protobuf.Empty);
+    // Isolation epoch (v49): isolate is written by a HEALTHY PEER about another
+    // host; reseed is forwarded to the isolated host, which pulls a full state
+    // dump from a healthy peer and clears its epoch only on verified convergence.
+    rpc IsolateHost(IsolateHostRequest)   returns (HostIsolationStatus);
+    rpc ReseedHost(ReseedHostRequest)     returns (ReseedHostResponse);
     // PublishCRL hands the cluster a CA-signed certificate revocation list, which
     // replication then carries to every node. `lv host rm` calls it after revoking
     // the removed host's certificate — revocation needs the CA private key, which
@@ -1883,9 +2021,7 @@ service LiteVirt {
     rpc RestartVM(RestartVMRequest)   returns (VM);
     rpc DeleteVM(DeleteVMRequest)        returns (google.protobuf.Empty);
     rpc RepairVMOwner(RepairVMOwnerRequest) returns (RepairVMOwnerResponse);
-    rpc CheckVMRuntime(CheckVMRuntimeRequest) returns (CheckVMRuntimeResponse);
-    rpc CheckContainerRuntime(CheckContainerRuntimeRequest) returns (CheckContainerRuntimeResponse);
-    rpc ReportRuntime(ReportRuntimeRequest) returns (ReportRuntimeResponse);
+    rpc GetRuntimeInventory(GetRuntimeInventoryRequest) returns (RuntimeInventory);
     rpc CheckVIPParticipant(CheckVIPParticipantRequest) returns (CheckVIPParticipantResponse);
     rpc RelayCheckVIPParticipant(RelayCheckVIPParticipantRequest) returns (RelayCheckVIPParticipantResponse);
     rpc CheckLBPresent(CheckLBPresentRequest) returns (CheckLBPresentResponse);
@@ -2240,6 +2376,21 @@ service LiteVirt {
     // owner, which is the only node that reserves against it.
     rpc ReserveProjectCapacity(ReserveProjectCapacityRequest) returns (ReserveProjectCapacityResponse);
     rpc ReleaseProjectCapacity(ReleaseProjectCapacityRequest) returns (google.protobuf.Empty);
+
+    // ── destination-owned migration host admission ──
+    // PEER-ONLY. A migration's HOST admission belongs to the DESTINATION daemon:
+    // only it can probe its own runtime inventory, and replicated capacity
+    // observations degrade to DB-only arithmetic exactly when they are missing,
+    // stale, or unreadable — so a source-side decision silently loses the final
+    // target-local safety gate. The source obtains this lease before stopping a
+    // container or beginning a VM transfer, holds it across the whole move, and
+    // releases it on every return path. The destination refuses a request naming
+    // any host but itself, runs full local host admission (fresh inventory,
+    // ownership conditions, runtime-only load), persists a durable reservation
+    // operation, and returns its id as the lease. Release is idempotent and only
+    // ever terminates a capacity operation targeting the local host.
+    rpc ReserveHostCapacity(ReserveHostCapacityRequest) returns (ReserveHostCapacityResponse);
+    rpc ReleaseHostCapacity(ReleaseHostCapacityRequest) returns (google.protobuf.Empty);
 }
 
 // Pre-flight check before `lv host upgrade`. Surfaces in-flight work,
@@ -2685,6 +2836,25 @@ message ReserveProjectCapacityRequest {
     // own replica — the winner commits on its own node, so without that the holder
     // under-counts until replication catches up and hands the same quota out twice.
     string resource_id     = 7;
+    // workload_host completes the identity: container names are unique only per
+    // HOST, so without it a same-named container elsewhere could retire a charge
+    // that is still owed. Ignored for VMs (cluster-unique names).
+    string workload_host   = 8;
+    // The ABSOLUTE post-commit counted size, not the delta. A grow's row is
+    // already visible at its old size, so the holder retires the released lease
+    // only once the workload CONTRIBUTES this much — presence alone would free
+    // the lease instantly while usage still counted the smaller spec.
+    int32  want_cpu        = 9;
+    int32  want_mem_mib    = 10;
+    // The other two dimensions a project quota bounds, reserved on the SAME
+    // lease. Checking them with an unserialized read just before the insert left
+    // them enforceable one request at a time: concurrent creates each saw a view
+    // without the other's claim, both fit the remaining budget, and both
+    // committed over the limit.
+    int32  disk_gib_delta  = 11;
+    int32  nic_delta       = 12;
+    int32  want_disk_gib   = 13;
+    int32  want_nic        = 14;
 }
 message ReserveProjectCapacityResponse {
     string lease_id        = 1;  // holder-local operation id, passed back to release
@@ -2693,4 +2863,27 @@ message ReserveProjectCapacityResponse {
 message ReleaseProjectCapacityRequest {
     string project  = 1;
     string lease_id = 2;
+}
+
+message ReserveHostCapacityRequest {
+    string host          = 1;  // MUST name the destination daemon itself
+    string project       = 2;
+    string method        = 3;  // originating RPC name, recorded in the journal
+    string principal     = 4;  // originating end-user, preserved for audit
+    string resource_id   = 5;  // "vm:<name>" / "ct:<name>" — the workload moving in
+    int32  cpu_delta     = 6;  // positive grow only; ≤0 reserves nothing
+    int32  mem_mib_delta = 7;
+    // The two admission-intent facts, named independently (see admissionIntent):
+    // new_residency gates on fresh local inventory even at zero delta;
+    // vm_overhead charges the per-domain qemu overhead to HOST figures only.
+    bool   new_residency = 8;
+    bool   vm_overhead   = 9;
+}
+message ReserveHostCapacityResponse {
+    // Destination-local operation id; passed back to ReleaseHostCapacity. Empty
+    // when the admission passed safety but reserved nothing (zero delta).
+    string lease_id = 1;
+}
+message ReleaseHostCapacityRequest {
+    string lease_id = 1;
 }

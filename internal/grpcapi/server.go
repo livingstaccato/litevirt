@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/hostnet"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/lb"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
@@ -32,8 +33,18 @@ import (
 type Server struct {
 	pb.UnimplementedLiteVirtServer
 
-	hostName   string
-	dataDir    string
+	hostName string
+	dataDir  string
+	// containersRoot is where per-container state (and the owner-epoch marker)
+	// lives — <dataDir>/containers in production, injected by the daemon so the
+	// runtime-inventory collector can read markers. Empty disables marker reads
+	// (they report missing).
+	containersRoot string
+
+	// Admission-gate local-inventory cache (see localInventoryCached).
+	invCacheMu sync.Mutex
+	invCache   runtimeInventory
+	invCacheAt time.Time
 	pkiDir     string
 	db         *corrosion.Client
 	virt       LibvirtBackend
@@ -130,6 +141,8 @@ type Server struct {
 	// its own replica would bypass the single decider entirely, so serializing against
 	// one is worthless until every node has opted in.
 	enfProjectAuthority bool
+	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
+	commitFenceHook func(op string)
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
 	// It alone turns SIGNING on (a signed row is backward-compatible, so nothing has
 	// to wait); combined with the AuditSignatureV1 latch it also makes an UNSIGNABLE
@@ -142,8 +155,11 @@ type Server struct {
 	// is the operator opt-in, readiness is "no owned workload left at epoch 0"
 	// (the health backfill reports it). Both required — the fleet must never
 	// latch across a node whose workloads are ungraduated.
-	enfOwnerEpoch   bool
-	ownerEpochReady func() bool
+	enfOwnerEpoch bool
+	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
+	// and the token latched, this node refuses replication from an isolated host.
+	enfIsolationEpoch bool
+	ownerEpochReady   func() bool
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -165,6 +181,9 @@ type Server struct {
 	capHealthMu     sync.Mutex
 	capHealthLast   map[string]bool
 	capHealthCursor int
+	// isolationCursor round-robins the §A self-reported-quarantine check
+	// (one peer per HA cycle). Guarded by capHealthMu.
+	isolationCursor int
 
 	// firmware holds the host's resolved OVMF paths (Secure Boot + vTPM, G1), set
 	// at daemon startup so CreateVM/restore render the same files the capability
@@ -244,10 +263,10 @@ type Server struct {
 	dualRunMetrics   *metrics.DualRunMetrics
 
 	// gatherRuntimeOverride is a test seam for the dual-run detector's per-host runtime
-	// gather (self-local + peer ReportRuntime): when non-nil it replaces the real probes,
+	// gather (self-local + peer GetRuntimeInventory): when non-nil it replaces the real probes,
 	// returning the snapshot per successfully-gathered host, the hosts that could not be
 	// reached this pass (a coverage gap), and the hosts on an older binary that does not
-	// implement ReportRuntime (surfaced but NOT paged as a coverage gap — expected during
+	// implement GetRuntimeInventory (surfaced but NOT paged as a coverage gap — expected during
 	// a rolling upgrade).
 	gatherRuntimeOverride func(ctx context.Context, hosts []string) (snaps map[string]runtimeSnapshot, unreachable, unsupported []string)
 
@@ -295,6 +314,13 @@ type Server struct {
 	// in tests / when unwired (durable recovery disabled, in-memory rollback still
 	// applies).
 	opJournal *opjournal.Journal
+
+	// hostNetSys + hostNetAdvertiseIP wire the host network apply protocol
+	// (SetHostNetworkEnv): the netplan-touching System (real on a daemon, fake
+	// in fleet tests) and the address whose loss the connectivity confirm and
+	// self-cutoff guard protect. nil/'' = feature unwired, RPCs refuse.
+	hostNetSys         hostnet.System
+	hostNetAdvertiseIP string
 
 	// realmRegistry is consulted by Login to dispatch authentication
 	// to the right realm by name. Always contains "local"; OIDC/LDAP
@@ -455,6 +481,13 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfOperationProtocol {
 		caps = withoutCapability(caps, capabilities.OperationProtocolV1)
 		caps = withoutCapability(caps, capabilities.CapacityAdmissionV1)
+	}
+	// isolation_epoch_v1 is likewise conditional on its flag: the regime refuses
+	// a peer outright, and a node that isn't enforcing would keep accepting the
+	// isolated node's state and re-inject it — so the latch requires CONFIG
+	// uniformity, not just a uniform build.
+	if !s.enfIsolationEpoch {
+		caps = withoutCapability(caps, capabilities.IsolationEpochV1)
 	}
 	// canonical_identity_v1 is likewise advertised CONDITIONALLY on its config flag: identity
 	// resolution mutates shared state, so the fleet-wide latch (and any node acting on it) must
@@ -627,6 +660,23 @@ func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry =
 // ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
 func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = on }
 
+// SetCommitFenceHook installs a TEST-ONLY hook run immediately before a commit
+// fence (reservationLease.allowCommit) is evaluated on a long-running operation
+// (clone, live restore, container restore). Moving a project's authority AFTER
+// admission but BEFORE the durable write inside one handler invocation is
+// otherwise impossible to arrange, and a fence test that cannot arrange it
+// cannot fail. Production never calls this; the hook must be set before the
+// operation starts and cleared after.
+func (s *Server) SetCommitFenceHook(h func(op string)) { s.commitFenceHook = h }
+
+// fireCommitFenceHook runs the test hook, if any, naming the operation about to
+// evaluate its commit fence.
+func (s *Server) fireCommitFenceHook(op string) {
+	if h := s.commitFenceHook; h != nil {
+		h(op)
+	}
+}
+
 // SetAuditSignatureEnforce sets this node's kill-switch for tamper-evident audit
 // logging (enforcement.audit_signature). This flag alone enables SIGNING; refusing
 // an unsignable audit write additionally requires the AuditSignatureV1 latch, and
@@ -635,6 +685,11 @@ func (s *Server) SetAuditSignatureEnforce(on bool) { s.enfAuditSignature = on }
 
 // SetOwnerEpochEnforce wires the Phase 4 config flag (enforcement.owner_epoch).
 func (s *Server) SetOwnerEpochEnforce(on bool) { s.enfOwnerEpoch = on }
+
+// SetIsolationEpochEnforce toggles isolation_epoch_v1 advertisement (§A): with
+// it on and the token latched, this node refuses replication from a host the
+// cluster recorded as isolated.
+func (s *Server) SetIsolationEpochEnforce(on bool) { s.enfIsolationEpoch = on }
 
 // SetOwnerEpochReady wires the readiness probe consulted before advertising
 // owner_epoch_v1 (nil = never ready).
@@ -703,6 +758,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
+	case capabilities.IsolationEpochV1:
+		return s.enfIsolationEpoch
 	default:
 		return false
 	}
@@ -893,6 +950,11 @@ type ContainerRuntime interface {
 	DeleteContainer(ctx context.Context, name string) error
 	ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error)
 	StateContainer(ctx context.Context, name string) (string, error)
+	// ContainerLimits reads the container's configured cgroup limits back from
+	// the runtime's own on-disk config (0 = unlimited). The runtime-inventory
+	// collector reports these so capacity accounting can charge runtime-only
+	// containers and flag uncapped ones.
+	ContainerLimits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
 	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
 	// ContainerExists reports whether the on-disk container artifact (dir) exists —
@@ -1313,3 +1375,7 @@ func (s *Server) peerClient(ctx context.Context, hostName string) (pb.LiteVirtCl
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
+
+// SetContainersRoot tells the runtime-inventory collector where per-container
+// owner-epoch markers live (the same root the container checker converges).
+func (s *Server) SetContainersRoot(root string) { s.containersRoot = root }

@@ -2,16 +2,15 @@ package health
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"log/slog"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
-// VM runtime states reported by CheckVMRuntime — the single vocabulary the
+// VM runtime states reported by the runtime inventory — the single vocabulary the
 // owner-assert reconciler interprets and the gRPC handler produces.
 const (
 	RuntimeAbsent         = "absent"
@@ -20,7 +19,7 @@ const (
 	RuntimeUnknown        = "unknown"
 )
 
-// peerRuntimeProbeTimeout bounds each peer CheckVMRuntime probe. PeerDial is lazy
+// peerRuntimeProbeTimeout bounds each peer runtime-inventory probe. PeerDial is lazy
 // (it doesn't connect at construction), so an unreachable/segmented peer would
 // otherwise hang on the reconciler's long-lived daemon context and wedge the
 // whole tick (including normal reconcile + selfFence). A timed-out probe is
@@ -69,7 +68,8 @@ func localHostIsActiveWorker(hosts []corrosion.HostRecord, self string) bool {
 	return false
 }
 
-// SetPeerRuntimeChecker injects the peer CheckVMRuntime client. Without it,
+// SetPeerRuntimeChecker injects the peer runtime checker (answered from the
+// peer's GetRuntimeInventory). Without it,
 // runtime owner-assert is disabled (no peer corroboration possible).
 func (r *Reconciler) SetPeerRuntimeChecker(fn func(ctx context.Context, host, name string) (string, error)) {
 	r.checkPeerRuntime = fn
@@ -173,7 +173,7 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 		cancel()
 		if err != nil {
 			// Unreachable / segmented / timed-out / old build with no
-			// CheckVMRuntime → we cannot confirm absence, so we must not assert.
+			// the runtime probe → we cannot confirm absence, so we must not assert.
 			allAbsent = false
 			slog.Info("owner-assert: peer unreachable, deferring", "vm", name, "peer", h, "error", err)
 			continue
@@ -216,6 +216,47 @@ func (r *Reconciler) tryAssertOwnership(ctx context.Context, name, dbHost string
 		if gerr != nil || fresh == nil {
 			slog.Warn("owner-assert: re-read before re-key failed", "vm", name, "error", gerr)
 			r.observeOwnerAssert(name, "error")
+			return
+		}
+		// EXACT-MARKER PROOF. The re-key supersedes fresh.OwnerEpoch, so this
+		// host's own marker must say its runtime BELONGS to exactly that epoch:
+		//
+		//   - unreadable/corrupt evidence NEVER authorizes (garbage read as any
+		//     epoch is how stale actions get authorized);
+		//   - an UNEQUAL marker means this runtime is from another generation —
+		//     older (superseded, must not resurrect) or newer (the DB row is the
+		//     stale one and will catch up) — either way not ours to re-key;
+		//   - a MISSING marker refuses once owner_epoch_v1 is enforced; before
+		//     the latch, pre-epoch runtimes legitimately have none and the
+		//     unanimous-absence rule above remains the (weaker) standard.
+		markerEpoch, found, merr := ReadVMOwnerEpochMarker(r.dataDir, name)
+		switch {
+		case merr != nil:
+			slog.Warn("owner-assert: refusing re-key — owner-epoch marker unreadable or corrupt",
+				"vm", name, "error", merr)
+			r.observeOwnerAssert(name, "marker_unreadable")
+			return
+		case found && markerEpoch != fresh.OwnerEpoch:
+			slog.Warn("owner-assert: refusing re-key — marker epoch does not equal the DB epoch being superseded",
+				"vm", name, "marker_epoch", markerEpoch, "db_epoch", fresh.OwnerEpoch)
+			r.observeOwnerAssert(name, "marker_epoch_mismatch")
+			return
+		case !found && r.ownerEpochEnforced(ctx):
+			slog.Warn("owner-assert: refusing re-key — owner-epoch marker missing under owner_epoch_v1",
+				"vm", name)
+			r.observeOwnerAssert(name, "marker_missing")
+			return
+		}
+		// An ACTIVE ownership condition on this workload freezes automated
+		// repair outright: the evaluator has standing evidence of a dispute,
+		// and repairing under a dispute is how the dispute becomes damage.
+		if disputed, code, cerr := corrosion.WorkloadHasActiveOwnershipCondition(ctx, r.db, "vm", name); cerr != nil {
+			slog.Warn("owner-assert: cannot read health conditions; deferring", "vm", name, "error", cerr)
+			r.observeOwnerAssert(name, "inconclusive")
+			return
+		} else if disputed {
+			slog.Warn("owner-assert: refusing re-key — active ownership condition", "vm", name, "condition", code)
+			r.observeOwnerAssert(name, "disputed")
 			return
 		}
 		if err := corrosion.TransferVMOwner(ctx, r.db, name, r.hostName, RuntimeRunning, fresh.OwnerEpoch); err != nil {
@@ -280,7 +321,7 @@ func (r *Reconciler) pruneOwnershipDebounce(stillCandidate map[string]bool) {
 
 func (r *Reconciler) auditOwnerAssert(ctx context.Context, name, fromHost string) {
 	_ = corrosion.InsertAuditLog(ctx, r.db, corrosion.AuditRecord{
-		ID:       ownerAssertID(),
+		ID:       randid.New(),
 		Username: "system",
 		HostName: r.hostName,
 		Action:   "vm.runtime-owner-assert",
@@ -288,10 +329,4 @@ func (r *Reconciler) auditOwnerAssert(ctx context.Context, name, fromHost string
 		Detail:   "reclaimed from " + fromHost + " (runs locally; all workload-capable peers absent)",
 		Result:   "ok",
 	})
-}
-
-func ownerAssertID() string {
-	b := make([]byte, 8)
-	rand.Read(b) //nolint:errcheck
-	return hex.EncodeToString(b)
 }

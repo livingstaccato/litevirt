@@ -7,26 +7,26 @@ import (
 	"time"
 )
 
-// Durable cluster-health storage (v48).
+// Durable cluster-health storage (v50).
 //
 // These are STORAGE primitives: full-row writes and typed reads. The lifecycle
 // POLICY — what counts as an observation, when a condition confirms, who may
-// resolve it and under what coverage — lives in the health evaluator
-// (internal/grpcapi/dualrun_lifecycle.go), which is the only writer. Keeping
-// policy out of the storage layer means the rules are in one place and the
-// rows can never encode a transition the evaluator did not decide.
+// resolve it and under what coverage — lives in the health evaluator, which is
+// the only writer. Keeping policy out of the storage layer means the rules are
+// in one place and the rows can never encode a transition the evaluator did not
+// decide.
 //
 // Merge is default LWW. Condition rows are keyed per evaluator and written by
-// one evaluator instance at a time (the detector lease holder), so last-
-// writer-wins converges every replica to the newest scan.
+// one evaluator instance at a time (the detector lease holder), so last-writer-
+// wins converges every replica to the newest scan; capacity rows are written
+// only by the host they describe (host_name is the ownership, the same rule
+// host_networks uses).
 
 // Condition lifecycle states.
 const (
 	ConditionObserved  = "observed"
 	ConditionConfirmed = "confirmed"
-	// ConditionResolved is also hardcoded as a SQL literal in
-	// TombstoneResolvedHealthConditions — keep them in sync.
-	ConditionResolved = "resolved"
+	ConditionResolved  = "resolved"
 )
 
 // Condition severities.
@@ -71,43 +71,22 @@ type HealthCondition struct {
 
 // UpsertHealthCondition writes a condition's full current state. The caller (the
 // evaluator) has already decided the lifecycle transition; this persists it.
-//
-// It is the single-write form: one statement, one transaction, immediate
-// replicator wake. An evaluator pass that touches several conditions at once
-// should use UpsertHealthBatch instead, which issues the whole pass as one
-// atomic deferred batch.
 func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) error {
-	stmt, err := HealthConditionStatement(c, h)
-	if err != nil {
-		return err
-	}
-	// A one-element ExecuteBatch, not Execute(stmt.SQL, ...): both take the
-	// same immediate-wake path (executeBatchInternal with wake=true), but the
-	// batch form keeps the statement a traceable Statement value rather than a
-	// field access the replicated-shape guard cannot fingerprint statically.
-	return c.ExecuteBatch(ctx, []Statement{stmt})
-}
-
-// HealthConditionStatement builds the upsert for one condition WITHOUT
-// executing it, so a caller writing several rows in one pass can collect them
-// into a single atomic batch. The SQL and parameters are identical to what
-// UpsertHealthCondition issues.
-func HealthConditionStatement(c *Client, h HealthCondition) (Statement, error) {
 	if h.Evaluator == "" || h.Code == "" || h.SubjectKind == "" {
-		return Statement{}, fmt.Errorf("corrosion: health condition requires evaluator, code and subject_kind (got %q/%q/%q)",
+		return fmt.Errorf("corrosion: health condition requires evaluator, code and subject_kind (got %q/%q/%q)",
 			h.Evaluator, h.Code, h.SubjectKind)
 	}
 	hosts := ""
 	if len(h.Hosts) > 0 {
 		b, err := json.Marshal(h.Hosts)
 		if err != nil {
-			return Statement{}, err
+			return err
 		}
 		hosts = string(b)
 	}
 	now := c.NowTS()
-	return Statement{
-		SQL: `INSERT INTO health_conditions (evaluator, code, subject_kind, subject_id,
+	return c.Execute(ctx,
+		`INSERT INTO health_conditions (evaluator, code, subject_kind, subject_id,
 		   lifecycle, severity, hosts, evidence, observe_count, clean_count,
 		   first_seen, last_seen, confirmed_at, resolved_at, reporter,
 		   created_at, updated_at)
@@ -126,13 +105,10 @@ func HealthConditionStatement(c *Client, h HealthCondition) (Statement, error) {
 		   reporter = excluded.reporter,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		Params: []interface{}{
-			h.Evaluator, h.Code, h.SubjectKind, h.SubjectID,
-			h.Lifecycle, h.Severity, hosts, h.Evidence, h.ObserveCount, h.CleanCount,
-			h.FirstSeen, h.LastSeen, nullIfEmpty(h.ConfirmedAt), nullIfEmpty(h.ResolvedAt), h.Reporter,
-			nowRFC3339(), now,
-		},
-	}, nil
+		h.Evaluator, h.Code, h.SubjectKind, h.SubjectID,
+		h.Lifecycle, h.Severity, hosts, h.Evidence, h.ObserveCount, h.CleanCount,
+		h.FirstSeen, h.LastSeen, nullIfEmpty(h.ConfirmedAt), nullIfEmpty(h.ResolvedAt), h.Reporter,
+		nowRFC3339Nano(), now)
 }
 
 // GetHealthCondition reads one condition by identity; ok=false when absent.
@@ -152,7 +128,8 @@ func GetHealthCondition(ctx context.Context, c *Client, evaluator, code, subject
 }
 
 // ListHealthConditions returns every live condition. includeResolved=false
-// filters to observed+confirmed — the "active conditions" GetClusterHealth reads.
+// filters to observed+confirmed — the "active conditions" every consumer
+// (GetClusterHealth, admission) reads.
 func ListHealthConditions(ctx context.Context, c *Client, includeResolved bool) ([]HealthCondition, error) {
 	q := `SELECT evaluator, code, subject_kind, subject_id, lifecycle, severity, hosts,
 	             evidence, observe_count, clean_count, first_seen, last_seen,
@@ -227,27 +204,14 @@ type HealthEvaluatorStatus struct {
 	Detail    string
 }
 
-// UpsertHealthEvaluatorStatus records an evaluator's completed scan. Like
-// UpsertHealthCondition this is the single-write form; a pass batching several
-// health writes together should use UpsertHealthBatch.
+// UpsertHealthEvaluatorStatus records an evaluator's completed scan.
 func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvaluatorStatus) error {
-	stmt, err := HealthEvaluatorStatusStatement(c, st)
-	if err != nil {
-		return err
-	}
-	// One-element batch for the same reason as UpsertHealthCondition.
-	return c.ExecuteBatch(ctx, []Statement{stmt})
-}
-
-// HealthEvaluatorStatusStatement builds the evaluator-status upsert WITHOUT
-// executing it, for callers collecting a pass's writes into one batch.
-func HealthEvaluatorStatusStatement(c *Client, st HealthEvaluatorStatus) (Statement, error) {
 	if st.Evaluator == "" {
-		return Statement{}, fmt.Errorf("corrosion: evaluator status requires an evaluator name")
+		return fmt.Errorf("corrosion: evaluator status requires an evaluator name")
 	}
 	now := c.NowTS()
-	return Statement{
-		SQL: `INSERT INTO health_evaluator_status (evaluator, last_scan, coverage, reporter, detail,
+	return c.Execute(ctx,
+		`INSERT INTO health_evaluator_status (evaluator, last_scan, coverage, reporter, detail,
 		   created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(evaluator) DO UPDATE SET
@@ -257,47 +221,8 @@ func HealthEvaluatorStatusStatement(c *Client, st HealthEvaluatorStatus) (Statem
 		   detail = excluded.detail,
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
-		Params: []interface{}{
-			st.Evaluator, st.LastScan, st.Coverage, st.Reporter, st.Detail,
-			nowRFC3339(), now,
-		},
-	}, nil
-}
-
-// UpsertHealthBatch atomically writes every condition from one detector pass,
-// plus that pass's evaluator status (nil to omit it), as a single deferred
-// replicated batch. It is the pass-scoped counterpart to the single-write
-// UpsertHealthCondition/UpsertHealthEvaluatorStatus, for a caller that must not
-// leave a partial pass visible: a mid-pass failure rolls back everything rather
-// than leaving some conditions written and others not.
-//
-// Deferred, not immediate: these are periodic-probe writes, the same class as
-// host_health/clock_skew, and one exclusive-lock transaction per pass beats N
-// of them when an incident storm produces many findings at once.
-//
-// Statement construction lives here rather than at the call site so the whole
-// batch is built inside this package — the replicated-shape guard can only
-// trace a batch assembled from same-package statement builders.
-func UpsertHealthBatch(ctx context.Context, c *Client, conditions []HealthCondition, evaluatorStatus *HealthEvaluatorStatus) error {
-	var stmts []Statement
-	for _, h := range conditions {
-		stmt, err := HealthConditionStatement(c, h)
-		if err != nil {
-			return err
-		}
-		stmts = append(stmts, stmt)
-	}
-	if evaluatorStatus != nil {
-		stmt, err := HealthEvaluatorStatusStatement(c, *evaluatorStatus)
-		if err != nil {
-			return err
-		}
-		stmts = append(stmts, stmt)
-	}
-	if len(stmts) == 0 {
-		return nil
-	}
-	return c.ExecuteBatchDeferred(ctx, stmts)
+		st.Evaluator, st.LastScan, st.Coverage, st.Reporter, st.Detail,
+		nowRFC3339Nano(), now)
 }
 
 // ListHealthEvaluatorStatus returns every evaluator's latest scan record.
@@ -319,4 +244,120 @@ func ListHealthEvaluatorStatus(ctx context.Context, c *Client) ([]HealthEvaluato
 		})
 	}
 	return out, nil
+}
+
+// HostCapacityObservation is one host's runtime-inventory capacity sample: what
+// the database has allocated there, what runtime-only workloads add on top, and
+// the effective union. Complete=false marks a sample that could not account for
+// everything — placement must treat that as "unknown", never as headroom.
+type HostCapacityObservation struct {
+	HostName        string
+	DBCPU           int
+	DBMemMiB        int
+	ExtraCPU        int
+	ExtraMemMiB     int
+	EffectiveCPU    int
+	EffectiveMemMiB int
+	Complete        bool
+	Detail          string
+	SampledAt       string // RFC3339 of the local inventory scan
+}
+
+// UpsertHostCapacityObservation writes a host's latest sample. Only the
+// observed host itself calls this — host_name is the ownership.
+func UpsertHostCapacityObservation(ctx context.Context, c *Client, o HostCapacityObservation) error {
+	if o.HostName == "" {
+		return fmt.Errorf("corrosion: capacity observation requires a host name")
+	}
+	complete := 0
+	if o.Complete {
+		complete = 1
+	}
+	now := c.NowTS()
+	return c.Execute(ctx,
+		`INSERT INTO host_capacity_observations (host_name, db_cpu, db_mem_mib,
+		   extra_cpu, extra_mem_mib, effective_cpu, effective_mem_mib, complete,
+		   detail, sampled_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(host_name) DO UPDATE SET
+		   db_cpu = excluded.db_cpu,
+		   db_mem_mib = excluded.db_mem_mib,
+		   extra_cpu = excluded.extra_cpu,
+		   extra_mem_mib = excluded.extra_mem_mib,
+		   effective_cpu = excluded.effective_cpu,
+		   effective_mem_mib = excluded.effective_mem_mib,
+		   complete = excluded.complete,
+		   detail = excluded.detail,
+		   sampled_at = excluded.sampled_at,
+		   updated_at = excluded.updated_at,
+		   deleted_at = NULL`,
+		o.HostName, o.DBCPU, o.DBMemMiB, o.ExtraCPU, o.ExtraMemMiB,
+		o.EffectiveCPU, o.EffectiveMemMiB, complete, o.Detail, o.SampledAt,
+		nowRFC3339Nano(), now)
+}
+
+// GetHostCapacityObservation reads one host's sample; ok=false when the host
+// has never reported.
+func GetHostCapacityObservation(ctx context.Context, c *Client, host string) (HostCapacityObservation, bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, db_cpu, db_mem_mib, extra_cpu, extra_mem_mib,
+		        effective_cpu, effective_mem_mib, complete, detail, sampled_at
+		 FROM host_capacity_observations WHERE host_name = ? AND deleted_at IS NULL`, host)
+	if err != nil || len(rows) == 0 {
+		return HostCapacityObservation{}, false, err
+	}
+	return scanCapacityObservation(rows[0]), true, nil
+}
+
+// ListHostCapacityObservations returns every host's latest sample.
+func ListHostCapacityObservations(ctx context.Context, c *Client) ([]HostCapacityObservation, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, db_cpu, db_mem_mib, extra_cpu, extra_mem_mib,
+		        effective_cpu, effective_mem_mib, complete, detail, sampled_at
+		 FROM host_capacity_observations WHERE deleted_at IS NULL ORDER BY host_name`)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]HostCapacityObservation, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, scanCapacityObservation(r))
+	}
+	return out, nil
+}
+
+func scanCapacityObservation(r Row) HostCapacityObservation {
+	return HostCapacityObservation{
+		HostName:        r.String("host_name"),
+		DBCPU:           r.Int("db_cpu"),
+		DBMemMiB:        r.Int("db_mem_mib"),
+		ExtraCPU:        r.Int("extra_cpu"),
+		ExtraMemMiB:     r.Int("extra_mem_mib"),
+		EffectiveCPU:    r.Int("effective_cpu"),
+		EffectiveMemMiB: r.Int("effective_mem_mib"),
+		Complete:        r.Int("complete") != 0,
+		Detail:          r.String("detail"),
+		SampledAt:       r.String("sampled_at"),
+	}
+}
+
+// WorkloadHasActiveOwnershipCondition reports whether an ACTIVE (observed or
+// confirmed) ownership-class condition names this workload. Automated recovery
+// consults it before restoring anything: recovery may restore an
+// already-database-accounted workload, but it must never act on a workload
+// whose ownership is in dispute — restarting one side of a dual-run is exactly
+// how a transient condition becomes a corrupted disk.
+func WorkloadHasActiveOwnershipCondition(ctx context.Context, c *Client, subjectKind, name string) (bool, string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT code FROM health_conditions
+		 WHERE subject_kind = ? AND subject_id = ? AND lifecycle != 'resolved'
+		   AND deleted_at IS NULL
+		   AND code IN ('vm_dual_run', 'ct_dual_run', 'runtime_owner_mismatch', 'owner_epoch_mismatch')
+		 LIMIT 1`, subjectKind, name)
+	if err != nil {
+		return false, "", err
+	}
+	if len(rows) == 0 {
+		return false, "", nil
+	}
+	return true, rows[0].String("code"), nil
 }

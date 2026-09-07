@@ -63,7 +63,7 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			Observer: r.String("observer"), Target: r.String("target"),
 			Status:              r.String("status"),
 			ConsecutiveFailures: int32(r.Int("consecutive_failures")),
-			LastSeen:            r.String("last_seen"),
+			LastSeen:            parseTimestamp(r.String("last_seen")),
 		})
 	}
 	return resp, nil

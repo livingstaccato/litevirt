@@ -87,7 +87,7 @@ message ConnectivityEdge {
     string target   = 2;
     string status   = 3;       // healthy | suspect | failing
     int32  consecutive_failures = 4;
-    string last_seen = 5;      // RFC3339
+    google.protobuf.Timestamp last_seen = 5;
 }
 message ClusterHealth {
     // HEALTHY: no active conditions, complete fresh coverage.

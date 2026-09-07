@@ -110,7 +110,7 @@ func (s *Server) GetHostHealth(ctx context.Context, _ *emptypb.Empty) (*pb.HostH
 	}
 	rows, err := s.db.Query(ctx,
 		`SELECT observer, target, status, consecutive_failures, last_seen
-		 FROM host_health`)
+		 FROM host_health WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query health: %v", err)
 	}

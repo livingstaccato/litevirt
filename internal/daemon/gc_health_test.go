@@ -13,7 +13,23 @@ func TestRunSupersededGC_TombstonesOldResolvedHealthConditions(t *testing.T) {
 	c := newHostTestClient(t) // defined in host_address_test.go, same package
 	d := &Daemon{db: c, cfg: &Config{}}
 	gcCtx, gcCancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer gcCancel()
+
+	// runSupersededGC is an infinite ticker loop: it keeps querying d.db after
+	// the assertion below until its context is cancelled. newHostTestClient
+	// registered a t.Cleanup that closes that db, and cleanups run as soon as
+	// this function returns — so the goroutine must be JOINED here, not left to
+	// race the close. gcDone is closed by the goroutine on exit and waited on at
+	// the end of the test, after gcCancel has told the loop to stop.
+	gcDone := make(chan struct{})
+	defer func() {
+		gcCancel()
+		select {
+		case <-gcDone:
+		case <-time.After(30 * time.Second):
+			t.Error("runSupersededGC did not exit within 30s of context cancellation; " +
+				"the test db may be closed underneath it")
+		}
+	}()
 
 	old := corrosion.HealthCondition{
 		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "old-vm",
@@ -37,7 +53,10 @@ func TestRunSupersededGC_TombstonesOldResolvedHealthConditions(t *testing.T) {
 		t.Fatalf("seed condition: %v", err)
 	}
 
-	go d.runSupersededGC(gcCtx, metrics.NewGCMetrics())
+	go func() {
+		defer close(gcDone)
+		d.runSupersededGC(gcCtx, metrics.NewGCMetrics())
+	}()
 	time.Sleep(121 * time.Second) // Wait for initial 2-minute sleep to complete, then GC to run
 
 	all, err := corrosion.ListHealthConditions(context.Background(), c, true)

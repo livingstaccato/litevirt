@@ -433,6 +433,10 @@ func scanPkg(pkg *packages.Package) []finding {
 					if len(call.Args) >= 2 {
 						got = s.resolveBatchArg(call.Args[1])
 					}
+				case "ExecuteBatchDeferred": // (ctx, stmts)
+					if len(call.Args) >= 2 {
+						got = s.resolveBatchArg(call.Args[1])
+					}
 				case "ExecuteBatchGuarded": // (ctx, guard, stmts)
 					if len(call.Args) >= 3 {
 						got = s.resolveBatchArg(call.Args[2])
@@ -451,7 +455,7 @@ func scanPkg(pkg *packages.Package) []finding {
 
 func isReplicatingMethod(m string) bool {
 	switch m {
-	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded":
+	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchDeferred", "ExecuteBatchGuarded":
 		return true
 	}
 	return false
@@ -468,7 +472,7 @@ func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
 		return false
 	}
 	switch fd.Name.Name {
-	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
+	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchDeferred", "ExecuteBatchGuarded",
 		"executeBatchInternal", "execLocal", "execLocalRows", "execBatchLocal":
 		return true
 	}

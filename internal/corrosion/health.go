@@ -74,14 +74,18 @@ type HealthCondition struct {
 //
 // It is the single-write form: one statement, one transaction, immediate
 // replicator wake. An evaluator pass that touches several conditions at once
-// should build statements with HealthConditionStatement instead and issue them
-// as one deferred batch.
+// should use UpsertHealthBatch instead, which issues the whole pass as one
+// atomic deferred batch.
 func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) error {
 	stmt, err := HealthConditionStatement(c, h)
 	if err != nil {
 		return err
 	}
-	return c.Execute(ctx, stmt.SQL, stmt.Params...)
+	// A one-element ExecuteBatch, not Execute(stmt.SQL, ...): both take the
+	// same immediate-wake path (executeBatchInternal with wake=true), but the
+	// batch form keeps the statement a traceable Statement value rather than a
+	// field access the replicated-shape guard cannot fingerprint statically.
+	return c.ExecuteBatch(ctx, []Statement{stmt})
 }
 
 // HealthConditionStatement builds the upsert for one condition WITHOUT
@@ -225,13 +229,14 @@ type HealthEvaluatorStatus struct {
 
 // UpsertHealthEvaluatorStatus records an evaluator's completed scan. Like
 // UpsertHealthCondition this is the single-write form; a pass batching several
-// health writes together should use HealthEvaluatorStatusStatement.
+// health writes together should use UpsertHealthBatch.
 func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvaluatorStatus) error {
 	stmt, err := HealthEvaluatorStatusStatement(c, st)
 	if err != nil {
 		return err
 	}
-	return c.Execute(ctx, stmt.SQL, stmt.Params...)
+	// One-element batch for the same reason as UpsertHealthCondition.
+	return c.ExecuteBatch(ctx, []Statement{stmt})
 }
 
 // HealthEvaluatorStatusStatement builds the evaluator-status upsert WITHOUT
@@ -257,6 +262,42 @@ func HealthEvaluatorStatusStatement(c *Client, st HealthEvaluatorStatus) (Statem
 			nowRFC3339(), now,
 		},
 	}, nil
+}
+
+// UpsertHealthBatch atomically writes every condition from one detector pass,
+// plus that pass's evaluator status (nil to omit it), as a single deferred
+// replicated batch. It is the pass-scoped counterpart to the single-write
+// UpsertHealthCondition/UpsertHealthEvaluatorStatus, for a caller that must not
+// leave a partial pass visible: a mid-pass failure rolls back everything rather
+// than leaving some conditions written and others not.
+//
+// Deferred, not immediate: these are periodic-probe writes, the same class as
+// host_health/clock_skew, and one exclusive-lock transaction per pass beats N
+// of them when an incident storm produces many findings at once.
+//
+// Statement construction lives here rather than at the call site so the whole
+// batch is built inside this package — the replicated-shape guard can only
+// trace a batch assembled from same-package statement builders.
+func UpsertHealthBatch(ctx context.Context, c *Client, conditions []HealthCondition, evaluatorStatus *HealthEvaluatorStatus) error {
+	var stmts []Statement
+	for _, h := range conditions {
+		stmt, err := HealthConditionStatement(c, h)
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, stmt)
+	}
+	if evaluatorStatus != nil {
+		stmt, err := HealthEvaluatorStatusStatement(c, *evaluatorStatus)
+		if err != nil {
+			return err
+		}
+		stmts = append(stmts, stmt)
+	}
+	if len(stmts) == 0 {
+		return nil
+	}
+	return c.ExecuteBatchDeferred(ctx, stmts)
 }
 
 // ListHealthEvaluatorStatus returns every evaluator's latest scan record.

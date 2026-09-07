@@ -176,25 +176,17 @@ func (s *Server) applyConditionLifecycle(
 		byIdentity[finding{kind: notifyKindForCondition(h.Code), target: h.SubjectID}] = h
 	}
 
-	// Every row this pass touches is collected here and issued as ONE deferred
-	// batch at the end, rather than one Execute per row. Two reasons: each
-	// Execute takes the client's EXCLUSIVE lock for its own transaction, so a
-	// pass with many findings — the incident storm this detector exists to
-	// catch — would otherwise block concurrent readers (GetClusterHealth) N
-	// times in a row; and these are periodic-probe writes, the same class as
-	// host_health/clock_skew, which use the deferred (no immediate replicator
-	// wake) path by convention. The batch is also atomic, so a pass now lands
-	// completely or not at all instead of leaving a half-applied lifecycle.
-	var stmts []corrosion.Statement
-	appendCondition := func(f finding, row corrosion.HealthCondition) {
-		stmt, err := corrosion.HealthConditionStatement(s.db, row)
-		if err != nil {
-			slog.Error("dual-run detector: build condition statement",
-				"kind", f.kind, "target", f.target, "error", err)
-			return
-		}
-		stmts = append(stmts, stmt)
-	}
+	// Every row this pass touches is collected here and handed to
+	// corrosion.UpsertHealthBatch as ONE deferred batch at the end, rather than
+	// one write per row. Two reasons: each single write takes the client's
+	// EXCLUSIVE lock for its own transaction, so a pass with many findings — the
+	// incident storm this detector exists to catch — would otherwise block
+	// concurrent readers (GetClusterHealth) N times in a row; and these are
+	// periodic-probe writes, the same class as host_health/clock_skew, which use
+	// the deferred (no immediate replicator wake) path by convention. The batch
+	// is also atomic, so a pass lands completely or not at all instead of
+	// leaving a half-applied lifecycle.
+	var conditions []corrosion.HealthCondition
 
 	// Positive findings first: observe or confirm. Recorded without quorum.
 	for f := range current {
@@ -255,7 +247,7 @@ func (s *Server) applyConditionLifecycle(
 			row.LastSeen = now
 			row.Hosts, row.Evidence, row.Reporter = evidenceHosts[f], evidence, s.hostName
 		}
-		appendCondition(f, row)
+		conditions = append(conditions, row)
 		byIdentity[f] = row
 	}
 
@@ -277,7 +269,7 @@ func (s *Server) applyConditionLifecycle(
 			if row.CleanCount != 0 {
 				row.CleanCount = 0
 				row.Reporter = s.hostName
-				appendCondition(f, row)
+				conditions = append(conditions, row)
 				byIdentity[f] = row
 			}
 			continue
@@ -295,7 +287,7 @@ func (s *Server) applyConditionLifecycle(
 			})
 			slog.Info("dual-run detector: condition resolved", "kind", f.kind, "target", f.target)
 		}
-		appendCondition(f, row)
+		conditions = append(conditions, row)
 		byIdentity[f] = row
 	}
 
@@ -304,24 +296,18 @@ func (s *Server) applyConditionLifecycle(
 	if !coverageComplete {
 		coverage = corrosion.CoveragePartial
 	}
-	if stmt, err := corrosion.HealthEvaluatorStatusStatement(s.db, corrosion.HealthEvaluatorStatus{
+	status := corrosion.HealthEvaluatorStatus{
 		Evaluator: dualRunEvaluator, LastScan: now, Coverage: coverage,
 		Reporter: s.hostName, Detail: coverageDetail,
-	}); err != nil {
-		slog.Warn("dual-run detector: build evaluator status statement", "error", err)
-	} else {
-		stmts = append(stmts, stmt)
 	}
 
 	// One transaction for the whole pass. The batch is atomic, so there is no
 	// per-row error to report — a failure means nothing landed, and the next
 	// pass (60s) recomputes and rewrites the same rows from scratch.
-	if len(stmts) > 0 {
-		if err := s.db.ExecuteBatchDeferred(ctx, stmts); err != nil {
-			slog.Error("dual-run detector: persist condition pass",
-				"evaluator", dualRunEvaluator, "scan", now, "statements", len(stmts),
-				"coverage", coverage, "error", err)
-		}
+	if err := corrosion.UpsertHealthBatch(ctx, s.db, conditions, &status); err != nil {
+		slog.Error("dual-run detector: persist condition pass",
+			"evaluator", dualRunEvaluator, "scan", now, "conditions", len(conditions),
+			"coverage", coverage, "error", err)
 	}
 
 	// Gauges rebuild from the CONFIRMED conditions (the durable state), so a

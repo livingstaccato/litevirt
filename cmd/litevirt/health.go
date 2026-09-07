@@ -15,7 +15,7 @@ import (
 func newHealthCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "health",
-		Short: "Show cluster health matrix",
+		Short: "Show the per-host connectivity matrix (see `lv cluster health` for the cluster roll-up)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				resp, err := c.GetHostHealth(ctx, nil)

@@ -168,6 +168,35 @@ func TestGetHostHealth_Empty(t *testing.T) {
 	}
 }
 
+// TestGetHostHealth_ExcludesTombstoned pins that a removed host's connectivity
+// edge does not resurface: GetClusterHealth's own connectivity query already
+// filters deleted_at IS NULL, and GetHostHealth must match it.
+func TestGetHostHealth_ExcludesTombstoned(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+
+	now := s.db.NowTS()
+	if err := s.db.Execute(ctx,
+		`INSERT INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+		 VALUES (?, ?, ?, 0, ?, ?)`,
+		"host-a", "host-b", "healthy", s.db.NowWall(), now); err != nil {
+		t.Fatalf("seed edge: %v", err)
+	}
+	if err := s.db.Execute(ctx,
+		`UPDATE host_health SET deleted_at = ? WHERE observer = ? AND target = ?`,
+		now, "host-a", "host-b"); err != nil {
+		t.Fatalf("tombstone edge: %v", err)
+	}
+
+	resp, err := s.GetHostHealth(adminCtx(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("GetHostHealth: %v", err)
+	}
+	if len(resp.Entries) != 0 {
+		t.Errorf("expected 0 entries (tombstoned edge should not resurface), got %d: %+v", len(resp.Entries), resp.Entries)
+	}
+}
+
 func TestPing(t *testing.T) {
 	s := testServer(t)
 	ctx := adminCtx()

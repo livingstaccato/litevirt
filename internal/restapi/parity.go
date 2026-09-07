@@ -50,6 +50,10 @@ func (s *Server) registerParityRoutes() {
 	// Backup schedules. GET lists, POST creates/replaces,
 	// DELETE with {vm_name, repo} body removes.
 	s.mux.HandleFunc("/api/v1/backup/schedules", s.wrap(s.handleBackupSchedules))
+
+	// Cluster health. THE health read — conditions, evaluator coverage,
+	// connectivity, rolled up into one overall state.
+	s.mux.HandleFunc("/api/v1/cluster/health", s.wrap(s.handleClusterHealth))
 }
 
 // ── Rebalance proposals ────────────────────────────────────────────────────
@@ -260,4 +264,26 @@ func (s *Server) handleBackupSchedules(w http.ResponseWriter, r *http.Request) {
 	default:
 		jsonError(w, http.StatusMethodNotAllowed, "GET, POST or DELETE")
 	}
+}
+
+// ── Cluster health ─────────────────────────────────────────────────────────
+
+func (s *Server) handleClusterHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	includeResolved, err := boolQuery(r, "include_resolved")
+	if err != nil {
+		jsonError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resp, err := s.grpc.GetClusterHealth(s.grpcCtx(r), &pb.GetClusterHealthRequest{
+		IncludeResolved: includeResolved,
+	})
+	if err != nil {
+		grpcHTTPError(w, http.StatusInternalServerError, err)
+		return
+	}
+	jsonProto(w, resp)
 }

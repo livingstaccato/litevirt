@@ -80,6 +80,53 @@ func TestGetClusterHealth_OverallStates(t *testing.T) {
 	if got := get().GetOverall(); got != HealthHealthy {
 		t.Fatalf("after resolution overall = %q, want HEALTHY — a resolved condition must not count", got)
 	}
+
+	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm2",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning,
+		FirstSeen: freshScan(), LastSeen: freshScan(), ConfirmedAt: freshScan(), Reporter: "h1",
+	}); err != nil {
+		t.Fatalf("condition: %v", err)
+	}
+	if got := get().GetOverall(); got != HealthDegraded {
+		t.Fatalf("active warning condition overall = %q, want DEGRADED", got)
+	}
+
+	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm2",
+		Lifecycle: corrosion.ConditionResolved, Severity: corrosion.SeverityWarning,
+		FirstSeen: freshScan(), LastSeen: freshScan(), ConfirmedAt: freshScan(), ResolvedAt: freshScan(), Reporter: "h1",
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if got := get().GetOverall(); got != HealthHealthy {
+		t.Fatalf("after resolving warning overall = %q, want HEALTHY", got)
+	}
+
+	if err := corrosion.UpsertHealthCondition(context.Background(), s.db, corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "vm3",
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityInfo,
+		FirstSeen: freshScan(), LastSeen: freshScan(), ConfirmedAt: freshScan(), Reporter: "h1",
+	}); err != nil {
+		t.Fatalf("condition: %v", err)
+	}
+	if got := get().GetOverall(); got != HealthHealthy {
+		t.Fatalf("active info-severity condition overall = %q, want HEALTHY — info must not degrade", got)
+	}
+}
+
+// TestOverallHealth_FutureLastScanIsNotFresh pins the clock-skew lower bound:
+// a future-dated LastScan produces a negative delta, which must not read as
+// "fresh" (that would mask a wedged detector behind an apparently-recent scan).
+func TestOverallHealth_FutureLastScanIsNotFresh(t *testing.T) {
+	now := time.Now().UTC()
+	future := now.Add(1 * time.Hour).Format(time.RFC3339)
+	evaluators := []corrosion.HealthEvaluatorStatus{
+		{Evaluator: "dual_run", LastScan: future, Coverage: corrosion.CoverageComplete, Reporter: "h1"},
+	}
+	if got := overallHealth(nil, evaluators, now); got != HealthUnknown {
+		t.Fatalf("future-dated LastScan overall = %q, want UNKNOWN — clock skew must not read as fresh", got)
+	}
 }
 
 // TestGetClusterHealth_IncludeResolved checks the request flag actually gates

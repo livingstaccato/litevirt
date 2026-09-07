@@ -110,14 +110,22 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		if h.Severity == corrosion.SeverityCritical {
 			return HealthCritical
 		}
-		degraded = true
+		if h.Severity == corrosion.SeverityWarning {
+			degraded = true
+		}
 	}
 	allStale := true
 	for _, e := range evaluators {
 		stale := true
-		if at, err := time.Parse(time.RFC3339, e.LastScan); err == nil && now.Sub(at) <= evaluatorScanTTL {
-			stale = false
-			allStale = false
+		if at, err := time.Parse(time.RFC3339, e.LastScan); err == nil {
+			// A future-dated LastScan (clock skew) yields a negative Sub, which
+			// would otherwise read as "fresh" and mask a wedged detector — so
+			// require the delta be non-negative as well as within the TTL.
+			d := now.Sub(at)
+			if d >= 0 && d <= evaluatorScanTTL {
+				stale = false
+				allStale = false
+			}
 		}
 		if stale || e.Coverage != corrosion.CoverageComplete {
 			degraded = true

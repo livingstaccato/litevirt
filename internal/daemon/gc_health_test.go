@@ -26,6 +26,17 @@ func TestRunSupersededGC_TombstonesOldResolvedHealthConditions(t *testing.T) {
 		t.Fatalf("seed condition: %v", err)
 	}
 
+	recent := corrosion.HealthCondition{
+		Evaluator: "dual_run", Code: "vm_dual_run", SubjectKind: "vm", SubjectID: "recent-vm",
+		Lifecycle: corrosion.ConditionResolved, Severity: corrosion.SeverityWarning,
+		FirstSeen: "2026-08-01T00:00:00Z", LastSeen: "2026-08-01T00:00:00Z",
+		ResolvedAt: time.Now().Add(-1 * time.Hour).UTC().Format(time.RFC3339),
+		Reporter:   "host-a",
+	}
+	if err := corrosion.UpsertHealthCondition(context.Background(), c, recent); err != nil {
+		t.Fatalf("seed condition: %v", err)
+	}
+
 	go d.runSupersededGC(gcCtx, metrics.NewGCMetrics())
 	time.Sleep(121 * time.Second) // Wait for initial 2-minute sleep to complete, then GC to run
 
@@ -33,9 +44,16 @@ func TestRunSupersededGC_TombstonesOldResolvedHealthConditions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
+	var sawRecent bool
 	for _, cond := range all {
 		if cond.SubjectID == "old-vm" {
 			t.Fatal("40-day-old resolved condition survived runSupersededGC")
 		}
+		if cond.SubjectID == "recent-vm" {
+			sawRecent = true
+		}
+	}
+	if !sawRecent {
+		t.Fatal("recently-resolved condition was tombstoned by runSupersededGC; retention should only remove conditions past ResolvedConditionRetention")
 	}
 }

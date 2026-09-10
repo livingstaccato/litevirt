@@ -66,9 +66,40 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   cannot prove its generation — now for the width of a few calls inside one RPC
   rather than a sweep interval. The dual-run detector's newborn grace remains
   the backstop for that residue, and closing it needs the create path reordered
-  to record the row before the runtime exists. VMs that arrive by template
-  instantiation, import, restore or promote, and all containers, are unchanged:
+  to record the row before the runtime exists. All containers are unchanged:
   they graduate on the backfill sweep as before.
+- **A VM published as `running` is marked at the same time, on the host that
+  runs it.** Every local transition that sets a VM to `running` — start,
+  snapshot restore, import, a failed migration healing back, the reconciler's
+  self-heals, the health checker's restarts, repair-owner, and replica
+  promotion — goes through one of two chokepoints, and a CI guard
+  (`make ci-guards`) fails the build on a new call site that does not.
+  The two orderings are not interchangeable. A write that leaves the ownership
+  generation alone marks first and commits only if the markers landed. A write
+  that ADVANCES the generation in the same statement must commit first, read
+  back, and mark that — marking first would stamp the generation the row is
+  about to leave, which is the marker/row disagreement the dual-run detector
+  reports. Three producers that insert a row already at `running` — a clone
+  started with `--start`, a live-restore with autostart, and a renamed replica
+  promotion — assign the first generation at insert instead.
+  **Two gaps remain, deliberately.** Neither is new.
+  1. *Ownership handoffs.* Migration cutover, drain, the cold firmware handoff,
+     and the health checker's migration retry all commit a row naming a
+     DIFFERENT host, while running on the host giving the VM away — whose domain
+     libvirt has already undefined. There is nothing local left to mark, and
+     gating those commits on a marker write would refuse them on every
+     successful migration. The destination marks its own runtime on its next
+     convergence pass (at most one reconcile interval, 15s), and until then it
+     runs a VM it cannot prove. The source also keeps a now-meaningless marker
+     file for a VM it no longer runs; nothing reads it, because its domain is
+     gone.
+  2. *A generation that moves mid-publish.* The generation is read before a
+     non-minting commit and after a minting one, and a concurrent ownership
+     transition can land in that window. A marker that lags the row is safe —
+     it is exactly what the superseded-runtime check should see when ownership
+     has genuinely moved. The unsafe direction, stamping a runtime with the NEXT
+     owner's generation, is refused: a minting publish re-checks that the row
+     still names this host before writing anything.
 - **A marker value of `0` is not a generation.** It is refused wherever it would
   be written — the marker file and the domain metadata alike — and reported as a
   corrupt marker wherever it is read, with one deliberate exception: the

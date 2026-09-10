@@ -895,6 +895,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
+		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
+		// promotion inserts a fresh row and no transfer ever follows it, so
+		// nothing here mints a generation. Without this the row is born running
+		// at epoch 0 and stays there — convergence early-returns on zero and the
+		// backfill is off by default.
+		s.assignOwnerEpochAtCreate(ctx, targetName)
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
 		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {

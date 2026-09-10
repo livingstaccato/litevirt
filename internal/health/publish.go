@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -160,4 +161,54 @@ func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *cor
 			"vm", name, "epoch", row.OwnerEpoch, "error", merr)
 	}
 	return nil
+}
+
+// EpochForPublish reads the generation a running publish will stamp, retried
+// with the same 4-attempt/backoff policy the state writes it guards use.
+//
+// Retried because several callers only log a failed state write and continue:
+// an unretried read in front of such a write turns one transient SQLITE_BUSY
+// into a DROPPED transition, which the code being routed did not do.
+//
+// A read that SUCCEEDS and finds no row returns immediately — the row is gone,
+// and retrying cannot conjure one. A read that never succeeds refuses the
+// transition rather than falling back to 0: a successful read of 0 is a
+// pre-epoch row, a failed read is nothing at all, and treating them alike makes
+// the chokepoint a no-op exactly under the conditions it exists for.
+func EpochForPublish(ctx context.Context, db *corrosion.Client, name string) (int64, error) {
+	return epochForPublish(ctx, name, func(ctx context.Context) (*corrosion.VMRecord, error) {
+		return corrosion.GetVM(ctx, db, name)
+	})
+}
+
+// epochForPublish is EpochForPublish's policy over an injectable read, so the
+// retry is testable without a fault hook on the shared corrosion client.
+func epochForPublish(ctx context.Context, name string, read func(context.Context) (*corrosion.VMRecord, error)) (int64, error) {
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		var row *corrosion.VMRecord
+		if row, err = read(ctx); err == nil {
+			if row == nil {
+				return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: no row", name)
+			}
+			return row.OwnerEpoch, nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: %w", name, err)
+}
+
+// PublishRunningVia routes a NON-MINTING transition for a caller that holds its
+// own virt/dataDir/db. A non-running state passes straight through, costing no
+// row read and — more importantly — never gating a stop on a running-marker
+// write it would fail.
+func PublishRunningVia(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, name, state string, commit func(context.Context) error) error {
+	if state != "running" {
+		return commit(ctx)
+	}
+	epoch, err := EpochForPublish(ctx, db, name)
+	if err != nil {
+		return err
+	}
+	return PublishVMRunning(ctx, virt, dataDir, name, state, epoch, commit)
 }

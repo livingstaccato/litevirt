@@ -989,26 +989,7 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 // at all, and treating them alike would make the chokepoint a no-op exactly
 // under the conditions it exists for.
 func (s *Server) vmEpochForPublish(ctx context.Context, name string) (int64, error) {
-	return readEpochWithRetry(ctx, name, func(ctx context.Context) (*corrosion.VMRecord, error) {
-		return corrosion.GetVM(ctx, s.db, name)
-	})
-}
-
-// readEpochWithRetry is vmEpochForPublish's policy, split out so the retry can
-// be tested without a fault-injection hook on the shared corrosion client.
-func readEpochWithRetry(ctx context.Context, name string, read func(context.Context) (*corrosion.VMRecord, error)) (int64, error) {
-	var err error
-	for attempt := 0; attempt < 4; attempt++ {
-		var row *corrosion.VMRecord
-		if row, err = read(ctx); err == nil {
-			if row == nil {
-				return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: no row", name)
-			}
-			return row.OwnerEpoch, nil
-		}
-		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
-	}
-	return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: %w", name, err)
+	return health.EpochForPublish(ctx, s.db, name)
 }
 
 // publishRunning routes a NON-MINTING transition through the marker chokepoint:
@@ -1025,14 +1006,7 @@ func readEpochWithRetry(ctx context.Context, name string, read func(context.Cont
 // ownership commit down with it. Those sites are excluded by name; see
 // scripts/ci/runningcheck's allowlist.
 func (s *Server) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
-	if state != "running" {
-		return commit(ctx)
-	}
-	epoch, err := s.vmEpochForPublish(ctx, name)
-	if err != nil {
-		return err
-	}
-	return health.PublishVMRunning(ctx, s.virt, s.dataDir, name, state, epoch, commit)
+	return health.PublishRunningVia(ctx, s.virt, s.db, s.dataDir, name, state, commit)
 }
 
 // publishRunningMinted routes a MINTING transition — one whose statement sets
@@ -1069,6 +1043,8 @@ func (s *Server) persistVMState(ctx context.Context, name, state, detail, op str
 func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, op string) error {
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
+		//runningcheck:allow routed by its only caller — persistVMStateDirect is the body
+		// persistVMState hands to publishRunning, and is private with no other call site.
 		if err = corrosion.UpdateVMStateStrict(ctx, s.db, name, state, detail); err == nil {
 			return nil
 		}

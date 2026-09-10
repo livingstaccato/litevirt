@@ -533,8 +533,12 @@ poll:
 				// Check if the domain is still alive; if so, restore to "running"
 				// instead of leaving it in "error" (#21).
 				if state, sErr := s.virt.DomainState(vm.Name); sErr == nil && state == "running" {
-					if werr := corrosion.UpdateVMState(ctx, s.db, vm.Name, "running",
-						fmt.Sprintf("migration to %s failed: %v", req.TargetHost, res.err)); werr != nil {
+					// A LOCAL publish, unlike the post-cutover commit below: the
+					// migration failed, so the guest and its domain are still here.
+					if werr := s.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+						return corrosion.UpdateVMState(ctx, s.db, vm.Name, "running",
+							fmt.Sprintf("migration to %s failed: %v", req.TargetHost, res.err))
+					}); werr != nil {
 						s.noteStateWriteFail(corrosion.OpVMState, werr)
 					}
 					slog.Warn("migration failed but VM still running on source",

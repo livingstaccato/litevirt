@@ -60,6 +60,10 @@ func usable(virt DomainEpochSetter) bool {
 // An epoch below 1 writes nothing: a pre-epoch row has no generation to name,
 // the backfill is what graduates it, and a marker against an epoch-0 row is the
 // one mismatch convergeOwnerEpochMarker returns early on and never repairs.
+//
+// Only ever called for a RUNNING publish, which is why the domain write takes
+// running=true: LIVE|CONFIG needs a live domain, and LIVE against an inactive
+// one is a libvirt error. PublishVMRunning's state gate is what guarantees that.
 func writeBothMarkers(virt DomainEpochSetter, dataDir, name string, epoch int64) error {
 	if epoch < 1 {
 		return nil
@@ -88,12 +92,25 @@ func writeBothMarkers(virt DomainEpochSetter, dataDir, name string, epoch int64)
 // wider change than the invariant needs. Each site keeps its SQL and its error
 // handling.
 //
+// state is the state being published, and markers are written ONLY for
+// "running". Several call sites write a state that is dynamic at the call but
+// provably never "running" (classifyStop's output, a drift heal toward
+// libvirt), and one of them is genuinely either. Taking the state here makes a
+// uniform wrap correct everywhere instead of making each caller prove its own
+// branch — and it keeps SetDomainOwnerEpoch's LIVE flag off inactive domains,
+// where libvirt rejects it.
+//
 // epoch must be a value the caller READ SUCCESSFULLY. A caller that cannot read
 // the row must refuse its transition rather than pass 0: a successful read of 0
 // is a pre-epoch row, a failed read is nothing at all, and treating them alike
 // turns this into a no-op exactly when the store is unhealthy — under the
-// conditions it exists for.
-func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name string, epoch int64, commit func(context.Context) error) error {
+// conditions it exists for. A caller whose read is the only thing standing
+// between a transient store error and a dropped write retries that read with
+// the same policy as the write it guards.
+func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name, state string, epoch int64, commit func(context.Context) error) error {
+	if state != "running" {
+		return commit(ctx)
+	}
 	if err := writeBothMarkers(virt, dataDir, name, epoch); err != nil {
 		return err
 	}
@@ -113,7 +130,16 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 // A failed READ-BACK is returned, because then nothing is known about which
 // generation to repair toward, and a caller that cannot learn it should surface
 // that rather than leave a running row silently unmarked.
-func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, name string, commit func(context.Context) error) error {
+//
+// hostName is this host, and the read-back row must still name it. A second
+// ownership transition landing between our commit and our read gives us the
+// NEXT owner's generation, and stamping our own runtime with it would make a
+// superseded runtime look current — the one direction of this race that is not
+// fail-safe. (The other direction, a marker lagging the row, is exactly what
+// runtimeSuperseded should see when ownership has genuinely moved.) When the
+// row has moved on we write nothing: the new owner's convergence marks its own
+// runtime, and ours is no longer the one the generation describes.
+func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name string, commit func(context.Context) error) error {
 	if err := commit(ctx); err != nil {
 		return err
 	}
@@ -123,6 +149,11 @@ func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *cor
 	}
 	if row == nil {
 		return fmt.Errorf("owner-epoch read-back for %q after a minting publish: no row", name)
+	}
+	if hostName != "" && row.HostName != hostName {
+		slog.Warn("publish: ownership moved during a minting transition — leaving the markers to the new owner",
+			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", hostName)
+		return nil
 	}
 	if merr := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); merr != nil {
 		slog.Warn("publish: markers not written after a minting transition — convergence will repair",

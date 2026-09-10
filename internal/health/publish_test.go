@@ -22,7 +22,7 @@ func TestPublishVMRunning_MarksBeforeItCommits(t *testing.T) {
 	fake.SetState("vm1", libvirtfake.StateRunning)
 
 	var fileAtCommit, domAtCommit int64
-	err := PublishVMRunning(context.Background(), fake, dir, "vm1", 5,
+	err := PublishVMRunning(context.Background(), fake, dir, "vm1", "running", 5,
 		func(context.Context) error {
 			fileAtCommit, _, _ = ReadVMOwnerEpochMarker(dir, "vm1")
 			domAtCommit, _, _ = fake.GetDomainOwnerEpoch("vm1")
@@ -42,7 +42,7 @@ func TestPublishVMRunning_MarksBeforeItCommits(t *testing.T) {
 func TestPublishVMRunning_AMarkerFailureDoesNotCommit(t *testing.T) {
 	fake := libvirtfake.New() // no domain, so SetDomainOwnerEpoch fails
 	committed := false
-	err := PublishVMRunning(context.Background(), fake, t.TempDir(), "vm1", 5,
+	err := PublishVMRunning(context.Background(), fake, t.TempDir(), "vm1", "running", 5,
 		func(context.Context) error { committed = true; return nil })
 	if err == nil {
 		t.Error("a marker failure must be returned, not swallowed")
@@ -63,7 +63,7 @@ func TestPublishVMRunning_APreEpochRowStillPublishes(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	committed := false
-	if err := PublishVMRunning(context.Background(), fake, dir, "vm1", 0,
+	if err := PublishVMRunning(context.Background(), fake, dir, "vm1", "running", 0,
 		func(context.Context) error { committed = true; return nil }); err != nil {
 		t.Fatalf("a pre-epoch row must still publish: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestPublishVMRunning_APreEpochRowStillPublishes(t *testing.T) {
 func TestPublishVMRunning_ANilConcreteClientDoesNotPanic(t *testing.T) {
 	var nilClient *libvirtfake.Fake // concrete nil; non-nil once boxed
 	committed := false
-	err := PublishVMRunning(context.Background(), nilClient, t.TempDir(), "vm1", 5,
+	err := PublishVMRunning(context.Background(), nilClient, t.TempDir(), "vm1", "running", 5,
 		func(context.Context) error { committed = true; return nil })
 	if err != nil {
 		t.Fatalf("a nil backend must skip the domain marker, not fail: %v", err)
@@ -100,7 +100,7 @@ func TestPublishVMRunning_ReturnsTheCommitError(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	want := errors.New("state write refused")
-	if got := PublishVMRunning(context.Background(), fake, t.TempDir(), "vm1", 5,
+	if got := PublishVMRunning(context.Background(), fake, t.TempDir(), "vm1", "running", 5,
 		func(context.Context) error { return want }); !errors.Is(got, want) {
 		t.Errorf("err = %v, want the commit's own error", got)
 	}
@@ -112,7 +112,7 @@ func TestPublishVMRunning_SkipsTheFileMarkerWithoutADataDir(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	t.Chdir(t.TempDir())
-	if err := PublishVMRunning(context.Background(), fake, "", "vm1", 5,
+	if err := PublishVMRunning(context.Background(), fake, "", "vm1", "running", 5,
 		func(context.Context) error { return nil }); err != nil {
 		t.Fatalf("PublishVMRunning: %v", err)
 	}
@@ -143,12 +143,15 @@ func TestPublishVMRunningMinted_MarksTheEpochTheCommitProduced(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 
-	if err := PublishVMRunningMinted(ctx, fake, db, dir, "vm1", func(ctx context.Context) error {
+	if err := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1", func(ctx context.Context) error {
 		return corrosion.TransferVMOwner(ctx, db, "vm1", "node-a", "running", 6)
 	}); err != nil {
 		t.Fatalf("PublishVMRunningMinted: %v", err)
 	}
-	row, _ := corrosion.GetVM(ctx, db, "vm1")
+	row, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || row == nil {
+		t.Fatalf("GetVM = (%v, %v), want a row", row, err)
+	}
 	if row.OwnerEpoch != 7 {
 		t.Fatalf("row epoch = %d, want 7 (the transfer mints)", row.OwnerEpoch)
 	}
@@ -170,7 +173,7 @@ func TestPublishVMRunningMinted_AFailedCommitMarksNothing(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	want := errors.New("mint refused")
-	if got := PublishVMRunningMinted(ctx, fake, db, dir, "vm1",
+	if got := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1",
 		func(context.Context) error { return want }); !errors.Is(got, want) {
 		t.Errorf("err = %v, want the commit's error", got)
 	}
@@ -199,14 +202,17 @@ func TestPublishVMRunningMinted_AMarkerFailureIsNotFatal(t *testing.T) {
 	}
 	fake := libvirtfake.New() // NO domain, so the domain marker write fails
 
-	if err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "vm1",
+	if err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "node-a", "vm1",
 		func(ctx context.Context) error {
 			return corrosion.UpdateVMState(ctx, db, "vm1", "running", "test")
 		}); err != nil {
 		t.Errorf("a marker failure after a landed commit must not be reported as failure "+
 			"(convergence repairs it): %v", err)
 	}
-	row, _ := corrosion.GetVM(ctx, db, "vm1")
+	row, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || row == nil {
+		t.Fatalf("GetVM = (%v, %v), want a row", row, err)
+	}
 	if row.State != "running" {
 		t.Errorf("state = %q, want running — the commit had already landed", row.State)
 	}
@@ -219,9 +225,83 @@ func TestPublishVMRunningMinted_AnEpochReadFailureIsReported(t *testing.T) {
 	db := testReconcilerDB(t)
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
-	err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "vm1",
+	err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "node-a", "vm1",
 		func(context.Context) error { db.Close(); return nil })
 	if err == nil {
 		t.Error("a read-back failure must be reported, not swallowed into a skipped marker")
+	}
+}
+
+// TestPublishVMRunning_ANonRunningStateWritesNoMarkers is the state gate.
+//
+// Several routed sites write a state that is dynamic at the call but provably
+// never "running" — classifyStop's output, a drift heal toward libvirt — and one
+// is genuinely either. Without the gate a uniform wrap stamps a RUNNING marker
+// (and a LIVE domain write, which libvirt rejects on an inactive domain) on an
+// out-of-band STOP, and PublishVMRunning's fatal contract then drops the stop
+// sync entirely: the row stays "running" for a VM that is down.
+func TestPublishVMRunning_ANonRunningStateWritesNoMarkers(t *testing.T) {
+	dir := t.TempDir()
+	fake := libvirtfake.New() // no domain: a marker write would fail
+	committed := false
+	if err := PublishVMRunning(context.Background(), fake, dir, "vm1", "stopped", 5,
+		func(context.Context) error { committed = true; return nil }); err != nil {
+		t.Fatalf("a non-running publish must not be gated on markers: %v", err)
+	}
+	if !committed {
+		t.Error("the stop sync was dropped because a running-marker write failed")
+	}
+	if _, ok, _ := ReadVMOwnerEpochMarker(dir, "vm1"); ok {
+		t.Error("a running marker was written for a stopped publish")
+	}
+}
+
+// TestPublishVMRunningMinted_OwnershipMovedLeavesTheMarkersAlone.
+//
+// A second ownership transition landing between our commit and our read-back
+// hands us the NEXT owner's generation. Stamping our own runtime with it makes a
+// superseded runtime look current — the one direction of this race that is not
+// fail-safe, because runtimeSuperseded then sees a marker that agrees with the
+// row and declines to refuse a runtime it should have refused.
+func TestPublishVMRunningMinted_OwnershipMovedLeavesTheMarkersAlone(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dir := t.TempDir()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "stopped",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.BackfillOwnerEpochs(ctx, db, "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	// We are node-a. Our commit lands, then node-b takes the VM before our
+	// read-back — so the row we read names node-b's generation, not ours.
+	err := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1",
+		func(ctx context.Context) error {
+			if cerr := corrosion.UpdateVMState(ctx, db, "vm1", "running", "ours"); cerr != nil {
+				return cerr
+			}
+			return corrosion.TransferVMOwnerFresh(ctx, db, "vm1", "node-b", "running")
+		})
+	if err != nil {
+		t.Fatalf("PublishVMRunningMinted: %v", err)
+	}
+	row, gerr := corrosion.GetVM(ctx, db, "vm1")
+	if gerr != nil || row == nil {
+		t.Fatalf("GetVM = (%v, %v), want a row", row, gerr)
+	}
+	if row.HostName != "node-b" {
+		t.Fatalf("owner = %q, want node-b — the test did not reproduce the race", row.HostName)
+	}
+	if _, ok, _ := ReadVMOwnerEpochMarker(dir, "vm1"); ok {
+		t.Errorf("node-a stamped its own runtime with node-b's generation %d; a superseded "+
+			"runtime must not be made to look current", row.OwnerEpoch)
+	}
+	if _, ok, _ := fake.GetDomainOwnerEpoch("vm1"); ok {
+		t.Error("the domain marker was stamped with the new owner's generation")
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -168,4 +169,86 @@ func (v *stateObservingVirt) SetDomainOwnerEpoch(name string, epoch int64, runni
 		return v.failWith
 	}
 	return v.Fake.SetDomainOwnerEpoch(name, epoch, running)
+}
+
+// TestRepairVMOwner_MarksTheGenerationTheCommitMinted is why there are two
+// orderings rather than one.
+//
+// TransferVMOwner sets state='running' AND vm_owner_epoch = vm_owner_epoch + 1
+// in a single guarded statement, so the value the marker should carry does not
+// EXIST until the commit lands. Marking first would stamp the generation the row
+// is about to leave — the exact marker/row disagreement the dual-run detector
+// reports as condition 7.
+func TestRepairVMOwner_MarksTheGenerationTheCommitMinted(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir() // testServer has none, and an empty dataDir skips the file marker
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := context.Background()
+
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "host-b", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	// Graduate the row so the transition is 3 -> 4, not 0 -> 1: an off-by-one in
+	// the ordering is invisible when the prior generation is the zero value.
+	if err := s.db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 3 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	if _, err := s.RepairVMOwner(adminCtx(), &pb.RepairVMOwnerRequest{Name: "vm1", Host: "host-a"}); err != nil {
+		t.Fatalf("RepairVMOwner: %v", err)
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM = (%v, %v), want a row", vm, err)
+	}
+	if vm.OwnerEpoch != 4 {
+		t.Fatalf("row epoch = %d, want 4 (the transfer mints)", vm.OwnerEpoch)
+	}
+	epoch, ok, rerr := health.ReadVMOwnerEpochMarker(s.dataDir, "vm1")
+	if rerr != nil || !ok || epoch != 4 {
+		t.Errorf("file marker = (%d,%v,%v), want (4,true,nil) — a marker written before a "+
+			"minting commit names the generation the row just left", epoch, ok, rerr)
+	}
+	if e, ok, _ := fake.GetDomainOwnerEpoch("vm1"); !ok || e != 4 {
+		t.Errorf("domain marker = (%d,%v), want (4,true)", e, ok)
+	}
+}
+
+// TestRepairVMOwner_AMarkerFailureDoesNotUndoTheRepair is the minting contract's
+// opposite half.
+//
+// The commit has landed and the guest is running, so refusing undoes nothing —
+// and a positive epoch with a missing marker is exactly convergeOwnerEpochMarker's
+// repair case, whose call site fires for any confirmed-running VM regardless of
+// the enforcement flag. Reporting failure here would make an operator re-run a
+// repair that already succeeded.
+func TestRepairVMOwner_AMarkerFailureDoesNotUndoTheRepair(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	fake := libvirtfake.New()
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "host-b", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake.SetState("vm1", libvirtfake.StateRunning)
+	s.virt = &stateObservingVirt{Fake: fake, ctx: ctx, db: s.db, failWith: errors.New("libvirt is down")}
+
+	if _, err := s.RepairVMOwner(adminCtx(), &pb.RepairVMOwnerRequest{Name: "vm1", Host: "host-a"}); err != nil {
+		t.Fatalf("a marker failure after a landed commit must not fail the repair: %v", err)
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, "vm1")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM = (%v, %v), want a row", vm, err)
+	}
+	if vm.HostName != "host-a" {
+		t.Errorf("owner = %q, want host-a — the repair had already committed", vm.HostName)
+	}
 }

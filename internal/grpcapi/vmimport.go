@@ -325,7 +325,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "imported but failed to start: %v", err)
 		}
-		if err := corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started"); err != nil {
+		if err := s.publishRunning(ctx, name, "running", func(ctx context.Context) error {
+			return corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started")
+		}); err != nil {
 			slog.Warn("import: recording running state failed — reconciler will heal", "vm", name, "error", err)
 			s.noteStateWriteFail(corrosion.OpVMState, err)
 		}

@@ -973,7 +973,78 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 	}
 }
 
-// persistVMState records an authoritative VM state via the strict helper,
+// vmEpochForPublish reads the generation a running publish will stamp.
+//
+// Retried with the same 4-attempt/backoff policy as the state write it guards.
+// The write already absorbs a transient Corrosion/DB error; putting a single
+// unretried read in front of it would convert one SQLITE_BUSY into a DROPPED
+// state write, because the two running callers of persistVMState only log and
+// continue — there is no outer retry to re-drive anything.
+//
+// A read that succeeds and finds NO row returns immediately: the row is gone,
+// and no amount of retrying conjures one.
+//
+// A read that never succeeds refuses the transition rather than falling back to
+// epoch 0. A successful read of 0 is a pre-epoch row; a failed read is nothing
+// at all, and treating them alike would make the chokepoint a no-op exactly
+// under the conditions it exists for.
+func (s *Server) vmEpochForPublish(ctx context.Context, name string) (int64, error) {
+	return readEpochWithRetry(ctx, name, func(ctx context.Context) (*corrosion.VMRecord, error) {
+		return corrosion.GetVM(ctx, s.db, name)
+	})
+}
+
+// readEpochWithRetry is vmEpochForPublish's policy, split out so the retry can
+// be tested without a fault-injection hook on the shared corrosion client.
+func readEpochWithRetry(ctx context.Context, name string, read func(context.Context) (*corrosion.VMRecord, error)) (int64, error) {
+	var err error
+	for attempt := 0; attempt < 4; attempt++ {
+		var row *corrosion.VMRecord
+		if row, err = read(ctx); err == nil {
+			if row == nil {
+				return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: no row", name)
+			}
+			return row.OwnerEpoch, nil
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: %w", name, err)
+}
+
+// publishRunning routes a NON-MINTING transition through the marker chokepoint:
+// for "running" the markers are written first and the commit runs only if they
+// landed; any other state passes straight through.
+//
+// The state check is here as well as inside health.PublishVMRunning so a stop
+// costs no row read. The helper keeps its own gate for callers that reach it
+// directly.
+//
+// Not for a cross-host handoff. s.virt and s.dataDir are THIS host's, and after
+// a migration cutover the domain they name is gone (MigrateToTarget sets
+// MigrateUndefineSource) — marking would fail and, in this ordering, take the
+// ownership commit down with it. Those sites are excluded by name; see
+// scripts/ci/runningcheck's allowlist.
+func (s *Server) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
+	if state != "running" {
+		return commit(ctx)
+	}
+	epoch, err := s.vmEpochForPublish(ctx, name)
+	if err != nil {
+		return err
+	}
+	return health.PublishVMRunning(ctx, s.virt, s.dataDir, name, state, epoch, commit)
+}
+
+// persistVMState records an authoritative VM state, routing a "running" write
+// through the marker chokepoint so the row never says running before a marker
+// names its generation.
+func (s *Server) persistVMState(ctx context.Context, name, state, detail, op string) error {
+	return s.publishRunning(ctx, name, state, func(ctx context.Context) error {
+		return s.persistVMStateDirect(ctx, name, state, detail, op)
+	})
+}
+
+// persistVMStateDirect is the state write itself, via the strict helper,
 // retrying briefly to absorb a transient Corrosion/DB error (the realistic
 // failure after a runtime action already succeeded). A zero-row result
 // (ErrNoRowsAffected — the row vanished) returns immediately; retrying it is
@@ -981,7 +1052,7 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 // returns the error, letting the caller decide whether losing THIS write is fatal
 // (operator-stop, whose loss lets HA restart a stopped VM) or merely observed (a
 // "running" state the reconciler heals from libvirt).
-func (s *Server) persistVMState(ctx context.Context, name, state, detail, op string) error {
+func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, op string) error {
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		if err = corrosion.UpdateVMStateStrict(ctx, s.db, name, state, detail); err == nil {

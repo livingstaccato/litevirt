@@ -172,6 +172,13 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 
+// publishRunningMinted routes a MINTING transition through the chokepoint:
+// commit, read back the generation the commit produced, then mark that. Marking
+// first would stamp the generation the row is about to leave.
+func (r *Reconciler) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
+	return PublishVMRunningMinted(ctx, r.virt, r.db, r.dataDir, r.hostName, name, commit)
+}
+
 // NewReconciler creates a VM reconciler for the local host. virt is a
 // LibvirtBackend — production passes the real *libvirt.Client; tests/the fleet
 // harness pass a fake. A nil virt is tolerated (the reconcile loop guards every

@@ -1035,6 +1035,20 @@ func (s *Server) publishRunning(ctx context.Context, name, state string, commit 
 	return health.PublishVMRunning(ctx, s.virt, s.dataDir, name, state, epoch, commit)
 }
 
+// publishRunningMinted routes a MINTING transition — one whose statement sets
+// state='running' AND advances vm_owner_epoch together — through the chokepoint
+// in the OTHER order: commit, read back the generation the commit produced, then
+// mark that.
+//
+// Marking first here would stamp the generation the row is about to LEAVE, which
+// is precisely the marker/row disagreement the dual-run detector reports. The
+// correct value does not exist until the commit lands.
+//
+// Local publishes only, for the same reason publishRunning is: see its comment.
+func (s *Server) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
+	return health.PublishVMRunningMinted(ctx, s.virt, s.db, s.dataDir, s.hostName, name, commit)
+}
+
 // persistVMState records an authoritative VM state, routing a "running" write
 // through the marker chokepoint so the row never says running before a marker
 // names its generation.

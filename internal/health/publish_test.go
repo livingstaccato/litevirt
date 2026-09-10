@@ -305,3 +305,44 @@ func TestPublishVMRunningMinted_OwnershipMovedLeavesTheMarkersAlone(t *testing.T
 		t.Error("the domain marker was stamped with the new owner's generation")
 	}
 }
+
+// TestEpochForPublish_RetriesATransientReadFailure.
+//
+// The state write persistVMState guards already retries 4 times, and its two
+// running callers only log and continue. An unretried read in front of it would
+// turn one transient store error into a DROPPED state write — a regression the
+// old code did not have.
+func TestEpochForPublish_RetriesATransientReadFailure(t *testing.T) {
+	calls := 0
+	epoch, err := epochForPublish(context.Background(), "vm1",
+		func(context.Context) (*corrosion.VMRecord, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("database is locked")
+			}
+			return &corrosion.VMRecord{Name: "vm1", OwnerEpoch: 4}, nil
+		})
+	if err != nil {
+		t.Fatalf("a transient read failure must be retried, not fatal: %v", err)
+	}
+	if epoch != 4 {
+		t.Errorf("epoch = %d, want 4", epoch)
+	}
+	if calls != 2 {
+		t.Errorf("read attempted %d time(s), want 2 — the retry never happened", calls)
+	}
+}
+
+// TestEpochForPublish_AMissingRowDoesNotRetry: a successful read finding no
+// row is an answer, not a transient failure. Retrying cannot conjure a row.
+func TestEpochForPublish_AMissingRowDoesNotRetry(t *testing.T) {
+	calls := 0
+	_, err := epochForPublish(context.Background(), "gone",
+		func(context.Context) (*corrosion.VMRecord, error) { calls++; return nil, nil })
+	if err == nil {
+		t.Error("a missing row must refuse the publish")
+	}
+	if calls != 1 {
+		t.Errorf("read attempted %d time(s), want 1 — a definite answer must not be retried", calls)
+	}
+}

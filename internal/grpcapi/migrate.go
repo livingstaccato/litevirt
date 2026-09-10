@@ -684,6 +684,12 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 	var lastErr error
 	committed := false
 	for attempt := 0; attempt < 3; attempt++ {
+		//runningcheck:allow ownership handoff — this runs on the SOURCE after cutover, whose
+		// domain libvirt has already undefined (MigrateToTarget sets MigrateUndefineSource).
+		// Routing it through the mark-then-commit helper would fail the marker write and
+		// REFUSE this commit on every successful migration, leaving the row naming the
+		// source while the guest runs on the target — the exact split-ownership state this
+		// call site exists to prevent. The destination's convergence marks its own runtime.
 		ok, err := corrosion.CommitMigrationOwnership(fctx, s.db, vm.Name, s.hostName, targetHost, "running", disks)
 		if err != nil {
 			lastErr = err
@@ -1065,6 +1071,8 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 	// Hand the VM to the target, PRESERVING its (stopped) state. On failure, roll
 	// the disks AND target back and abort (source still owns it + is intact).
 	// Phase 4: migration commit is an ownership transition (fresh-read CAS + increment).
+	//runningcheck:allow ownership handoff — the cold firmware migration hands the VM to
+	// targetHost while running on the source. Same reason as the cutover commit above.
 	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
 		rollbackDisks()
 		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)

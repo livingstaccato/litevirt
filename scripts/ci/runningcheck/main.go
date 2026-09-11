@@ -62,17 +62,43 @@ import (
 	"strings"
 )
 
+// The two meanings a state-argument index can have besides a real position.
+// They were both spelled -1 once, and that overload is exactly how UpdateVMHost
+// ended up permanently exempt under a comment describing the other case.
+const (
+	// stateInVMRecord: the state travels inside a corrosion.VMRecord argument,
+	// so rule 4 (born-running inserts) is what polices it.
+	stateInVMRecord = -1
+	// alwaysRunning: the statement hardcodes state='running' and takes no state
+	// argument, so no literal can ever exempt it.
+	alwaysRunning = -2
+)
+
 // nonMinting are corrosion writers that can set state='running' while leaving
 // vm_owner_epoch alone. stateArg is the zero-based index of the state parameter,
 // or -1 where the state travels inside a VMRecord (rule 4 covers those).
 var nonMinting = map[string]int{
-	"UpdateVMState":            3,
-	"UpdateVMStateStrict":      3,
-	"UpdateVMStateAtEpoch":     3,
-	"UpdateVMHost":             -1,
+	"UpdateVMState":        3,
+	"UpdateVMStateStrict":  3,
+	"UpdateVMStateAtEpoch": 3,
+	// UpdateVMHost(ctx, c, name, hostName, state) — a plain state argument that
+	// goes straight into `UPDATE vms SET host_name = ?, state = ?`. It was
+	// registered -1 here under a comment claiming the state travelled inside a
+	// VMRecord; it does not, and -1 made it unconditionally exempt.
+	"UpdateVMHost":             4,
 	"CommitMigrationOwnership": 5,
-	"InsertVM":                 -1,
-	"InsertVMWithHardware":     -1,
+	"InsertVM":                 stateInVMRecord,
+	"InsertVMWithHardware":     stateInVMRecord,
+}
+
+// clientMethods are writers invoked as methods on the corrosion client
+// (s.db.X(...)) rather than as package functions. corrosionCall cannot see
+// them, and CommitVMCreateOperation's statement is a literal
+// `UPDATE vms SET state = 'running'`.
+var clientMethods = map[string]int{
+	// Takes a VMRecord (index 3) whose State the guarded statement writes, so
+	// rule 4 polices it exactly as it does the package-level inserts.
+	"CommitVMCreateOperation": stateInVMRecord,
 }
 
 // minting are writers whose statement sets state='running' AND advances
@@ -82,7 +108,7 @@ var nonMinting = map[string]int{
 var minting = map[string]int{
 	"TransferVMOwner":      4,
 	"TransferVMOwnerFresh": 4,
-	"CompleteVMStartProof": -1,
+	"CompleteVMStartProof": alwaysRunning,
 }
 
 // mintedHelpers take the commit-then-mark ordering; plainHelpers the
@@ -162,11 +188,27 @@ func main() {
 }
 
 // fileScan carries the per-file state the rules share.
+// directive is one //runningcheck:allow, tracked as a unit rather than as a set
+// of lines: a reason block marks several lines, and per-line bookkeeping made
+// every line but one look orphaned.
+type directive struct {
+	// line is where the token sits, and where a stale directive is reported.
+	line int
+	// covers are the lines this directive may suppress a statement on: its own
+	// (the trailing form) and the one after its comment block (the block form).
+	covers []int
+	// used records whether it actually suppressed something. An orphaned
+	// directive — its statement deleted or moved — would otherwise sit there
+	// silently exempting whatever code next occupies those lines, which is the
+	// self-defeating allowlist this guard exists to rule out.
+	used bool
+}
+
 type fileScan struct {
-	path  string
-	fset  *token.FileSet
-	allow map[int]bool
-	out   []violation
+	path       string
+	fset       *token.FileSet
+	directives []*directive
+	out        []violation
 }
 
 func scanFile(path string) ([]violation, error) {
@@ -175,23 +217,33 @@ func scanFile(path string) ([]violation, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	s := &fileScan{path: path, fset: fset, allow: map[int]bool{}}
+	s := &fileScan{path: path, fset: fset}
 	// A directive is honored on any line the statement spans (the trailing form
 	// writecheck uses) AND on the line immediately after a comment block that
 	// carries it — these reasons run to several lines, and a block sitting
 	// directly above the call reads far better than a trailing fragment.
+	//
+	// The token must START its comment, so this tool's own documentation of the
+	// directive (which quotes it inside backticks) is not mistaken for one.
 	for _, cg := range file.Comments {
-		carries := false
+		d := (*directive)(nil)
 		for _, c := range cg.List {
-			if strings.Contains(c.Text, "runningcheck:allow") {
-				carries = true
-				s.allow[fset.Position(c.Slash).Line] = true
+			body := strings.TrimSpace(strings.TrimPrefix(c.Text, "//"))
+			if !strings.HasPrefix(body, "runningcheck:allow") {
+				continue
 			}
+			ln := fset.Position(c.Slash).Line
+			if d == nil {
+				d = &directive{line: ln}
+			}
+			d.covers = append(d.covers, ln)
 		}
-		if carries {
-			s.allow[fset.Position(cg.End()).Line+1] = true
+		if d != nil {
+			d.covers = append(d.covers, fset.Position(cg.End()).Line+1)
+			s.directives = append(s.directives, d)
 		}
 	}
+
 	// Rules are per-function: routing evidence (which closures reach a helper,
 	// whether the function graduates its insert) is function-scoped.
 	ast.Inspect(file, func(n ast.Node) bool {
@@ -203,6 +255,16 @@ func scanFile(path string) ([]violation, error) {
 		}
 		return true
 	})
+	// A directive that suppressed nothing is itself a violation.
+	for _, d := range s.directives {
+		if d.used {
+			continue
+		}
+		s.out = append(s.out, violation{file: s.path, line: d.line,
+			msg: "this //runningcheck:allow directive suppressed nothing — its statement was " +
+				"deleted or moved. Remove it: left in place it silently exempts whatever code " +
+				"next occupies these lines"})
+	}
 	return s.out, nil
 }
 
@@ -212,9 +274,12 @@ func scanFile(path string) ([]violation, error) {
 func (s *fileScan) report(n ast.Node, msg string) {
 	start := s.fset.Position(n.Pos()).Line
 	end := s.fset.Position(n.End()).Line
-	for ln := start; ln <= end; ln++ {
-		if s.allow[ln] {
-			return
+	for _, d := range s.directives {
+		for _, ln := range d.covers {
+			if ln >= start && ln <= end {
+				d.used = true
+				return
+			}
 		}
 	}
 	s.out = append(s.out, violation{file: s.path, line: start, msg: msg})
@@ -222,7 +287,6 @@ func (s *fileScan) report(n ast.Node, msg string) {
 
 func (s *fileScan) checkFunc(body *ast.BlockStmt) {
 	routed := collectRouting(body, s.fset)
-	graduates := callsGraduation(body)
 
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -230,9 +294,12 @@ func (s *fileScan) checkFunc(body *ast.BlockStmt) {
 			return true
 		}
 		name := corrosionCall(call)
+		if name == "" {
+			name = clientMethodCall(call)
+		}
 		switch {
 		case hasKey(minting, name):
-			if idx := minting[name]; idx >= 0 && idx < len(call.Args) {
+			if idx := minting[name]; idx >= 0 && idx < len(call.Args) { //nolint:nestif // one literal check
 				if lit, ok := stringLit(call.Args[idx]); ok && lit != "running" {
 					return true // a transfer that hands over a STOPPED VM publishes no runtime
 				}
@@ -248,15 +315,18 @@ func (s *fileScan) checkFunc(body *ast.BlockStmt) {
 				s.report(call, fmt.Sprintf("corrosion.%s(...) publishes a running VM at a NEW generation "+
 					"but is not routed through publishRunningMinted", name))
 			}
-		case hasKey(nonMinting, name):
-			idx := nonMinting[name]
+		case hasKey(nonMinting, name) || hasKey(clientMethods, name):
+			idx, ok := nonMinting[name]
+			if !ok {
+				idx = clientMethods[name]
+			}
 			if idx >= 0 && idx < len(call.Args) {
 				if lit, ok := stringLit(call.Args[idx]); ok && lit != "running" {
 					return true // cannot publish a running VM
 				}
 			}
-			if idx < 0 {
-				return true // state travels in a VMRecord; rule 4 covers it
+			if idx == stateInVMRecord {
+				return true // rule 4 polices the VMRecord it carries
 			}
 			if routed.family(call, s.fset) == familyNone {
 				s.report(call, fmt.Sprintf("corrosion.%s(...) can publish a running VM but is not routed "+
@@ -273,10 +343,11 @@ func (s *fileScan) checkFunc(body *ast.BlockStmt) {
 			"that proves the state is not \"running\"; that invocation publishes unmarked", use.name))
 	}
 
-	// Rule 4: born-running inserts must graduate.
-	if graduates {
-		return
-	}
+	// Rule 4: born-running inserts must graduate, and the graduation must be in
+	// the insert's OWN block. A function-wide check let a second born-running
+	// insert on another branch ride on the first branch's call — and the routed
+	// code already depends on branch placement: promote.go graduates inside
+	// `if renamed`, templates.go inside `if state == "running"`.
 	ast.Inspect(body, func(n ast.Node) bool {
 		cl, ok := n.(*ast.CompositeLit)
 		if !ok || !isVMRecord(cl) {
@@ -289,11 +360,46 @@ func (s *fileScan) checkFunc(body *ast.BlockStmt) {
 		if lit, ok := stringLit(st); ok && lit != "running" {
 			return true
 		}
+		if graduatedInScope(body, cl, s.fset) {
+			return true
+		}
 		s.report(cl, "a corrosion.VMRecord is inserted at a running (or runtime-determined) state "+
-			"without an assignOwnerEpochAtCreate call in the same function; it would be born at "+
+			"with no assignOwnerEpochAtCreate call in the same block; it would be born at "+
 			"epoch 0, which convergence never repairs and the default-off backfill never graduates")
 		return true
 	})
+}
+
+// graduatedInScope reports whether the INNERMOST block enclosing the insert
+// graduates it — searching that block and anything nested inside it, but not
+// its parents.
+//
+// Innermost, not function-wide: promote.go's insert sits inside `if renamed`
+// alongside its graduation, so a sibling `else` that inserts without one must
+// not ride on it. Nested still counts, because templates.go inserts in the
+// function body and graduates from an `if state == "running"` block inside it.
+func graduatedInScope(root ast.Node, insert ast.Node, fset *token.FileSet) bool {
+	line := fset.Position(insert.Pos()).Line
+	var best *ast.BlockStmt
+	bestSpan := 1 << 30
+	ast.Inspect(root, func(n ast.Node) bool {
+		blk, ok := n.(*ast.BlockStmt)
+		if !ok {
+			return true
+		}
+		start, end := fset.Position(blk.Pos()).Line, fset.Position(blk.End()).Line
+		if line < start || line > end {
+			return true
+		}
+		if span := end - start; span < bestSpan {
+			best, bestSpan = blk, span
+		}
+		return true
+	})
+	if best == nil {
+		return false
+	}
+	return callsGraduation(best)
 }
 
 func hasKey(m map[string]int, k string) bool { _, ok := m[k]; return ok }
@@ -309,6 +415,21 @@ func corrosionCall(call *ast.CallExpr) string {
 		return ""
 	}
 	return sel.Sel.Name
+}
+
+// clientMethodCall returns the writer name for a corrosion-client METHOD call —
+// s.db.X(...), c.X(...) — that writes vms.state. Matched on the selector name
+// alone, because the receiver is a client value whose type this AST-only pass
+// cannot resolve. The set is deliberately tiny for that reason.
+func clientMethodCall(call *ast.CallExpr) string {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return ""
+	}
+	if _, known := clientMethods[sel.Sel.Name]; known {
+		return sel.Sel.Name
+	}
+	return ""
 }
 
 // helperName returns the publish-helper name a call targets, else "".
@@ -375,8 +496,14 @@ func collectRouting(body *ast.BlockStmt, fset *token.FileSet) routing {
 		if fam == familyNone {
 			return true
 		}
-		for _, arg := range call.Args {
-			switch a := arg.(type) {
+		// Only the LAST argument can be the commit callback. Registering every
+		// identifier argument put ctx, name and state into vars, so a local
+		// helper or shadowing variable of one of those names was reported as
+		// "the routed closure invoked directly", and pass 2 attached a closure
+		// span to an unrelated assignment of that name — silently marking
+		// whatever writes lived in it as routed.
+		if len(call.Args) > 0 {
+			switch a := call.Args[len(call.Args)-1].(type) {
 			case *ast.FuncLit:
 				// Written inline at the call.
 				r.spans = append(r.spans, span{
@@ -491,8 +618,14 @@ func provesNotRunning(e ast.Expr) bool {
 			if lit, ok := stringLit(b.X); ok && lit == "running" {
 				return true
 			}
-		case token.LAND, token.LOR:
+		case token.LAND:
+			// Either conjunct proving it is enough: both must hold to enter.
 			return provesNotRunning(b.X) || provesNotRunning(b.Y)
+		case token.LOR:
+			// BOTH alternatives must prove it. `state != "running" || retry`
+			// is entered with state == "running" whenever retry is true, and
+			// treating OR like AND accepted exactly that bypass.
+			return provesNotRunning(b.X) && provesNotRunning(b.Y)
 		}
 	}
 	return false

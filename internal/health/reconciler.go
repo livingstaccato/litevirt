@@ -176,7 +176,7 @@ func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 // for "running" both markers are written first and the commit runs only if they
 // landed. Any other state passes straight through.
 func (r *Reconciler) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
-	return PublishRunningVia(ctx, r.virt, r.db, r.dataDir, name, state, commit)
+	return PublishRunningVia(ctx, r.virt, r.db, r.dataDir, r.hostName, name, state, commit)
 }
 
 // publishRunningMinted routes a MINTING transition through the chokepoint:

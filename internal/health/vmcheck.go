@@ -143,7 +143,7 @@ func NewVMChecker(hostName, dataDir string, db *corrosion.Client, virt *lv.Clien
 // into an interface is not a nil interface, which is what DomainEpochSetter's
 // usable() check exists for.
 func (v *VMChecker) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
-	return PublishRunningVia(ctx, v.virt, v.db, v.dataDir, name, state, commit)
+	return PublishRunningVia(ctx, v.virt, v.db, v.dataDir, v.hostName, name, state, commit)
 }
 
 // Start begins the sweep loop. Blocks until ctx is cancelled.
@@ -592,9 +592,14 @@ func (v *VMChecker) migrateVM(ctx context.Context, vm corrosion.VMRecord) {
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
 	if err := v.virt.MigrateToTarget(vm.Name, dconnuri, lv.MigrateParams{Live: true}); err != nil {
 		slog.Error("vmcheck: migration failed", "vm", vm.Name, "target", target.Name, "error", err)
-		// A LOCAL publish: the migration failed, so the guest and its domain are
-		// still here. (The successful handoff below is NOT routed — it repoints
-		// the row to another host while running on this one.)
+		// A LOCAL publish, unlike the successful handoff below, which repoints the
+		// row to another host while running on this one.
+		//
+		// No DomainState guard here, unlike migrate.go's twin: a migration that
+		// failed after libvirt destroyed the source domain makes the domain-marker
+		// write fail, and writeBothMarkers publishes on the strength of the file
+		// marker instead of refusing. The state-detail write is what matters on
+		// this path and it is no longer gated on a domain that may be gone.
 		if werr := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 			return corrosion.UpdateVMState(ctx, v.db, vm.Name, "running", fmt.Sprintf("migration to %s failed: %v", target.Name, err))
 		}); werr != nil {

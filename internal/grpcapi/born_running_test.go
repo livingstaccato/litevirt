@@ -217,3 +217,39 @@ func TestRestoreLive_AutoStart_IsBornProvable(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestImportVM_StartedImportIsProvable.
+//
+// An import inserts its row at "stopped" with vm_owner_epoch at the column
+// default of 0, then starts the VM and publishes it running. The chokepoint
+// writes NOTHING for a pre-epoch row — a marker against an epoch-0 row is the
+// one mismatch convergence returns early on and never repairs — so routing that
+// publish accomplished nothing on its own: the started VM was exactly as
+// unprovable as before, for as long as the default-off backfill stayed off. The
+// import has to graduate its own VM, like the other born-running producers.
+func TestImportVM_StartedImportIsProvable(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	fake := libvirtfake.New()
+	s.virt = fake
+
+	if err := importSmallVM(t, s, "imp1", "", 512, true); err != nil {
+		t.Fatalf("ImportVM: %v", err)
+	}
+	ctx := context.Background()
+	row, err := corrosion.GetVM(ctx, s.db, "imp1")
+	if err != nil || row == nil {
+		t.Fatalf("GetVM = (%v, %v), want a row", row, err)
+	}
+	if row.State != "running" {
+		t.Fatalf("state = %q, want running — this test does not exercise the started path", row.State)
+	}
+	if row.OwnerEpoch < 1 {
+		t.Errorf("row epoch = %d, want >= 1 — an imported-and-started VM publishes running, so "+
+			"it must carry a generation the markers can name", row.OwnerEpoch)
+	}
+	if epoch, ok, _ := health.ReadVMOwnerEpochMarker(s.dataDir, "imp1"); !ok || epoch != row.OwnerEpoch {
+		t.Errorf("file marker = (%d,%v), want (%d,true)", epoch, ok, row.OwnerEpoch)
+	}
+}

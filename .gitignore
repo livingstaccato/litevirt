@@ -64,6 +64,10 @@ testdata/tmp/
 tmp/
 /litevirt
 
+# CI guard binaries, if someone builds one instead of ing it.
+/runningcheck
+/stmtshapecheck
+
 # Private working notes — internal roadmap/specs/bug-plans, never published to the mirror
 /TODO.md
 /BUGS.md

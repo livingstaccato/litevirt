@@ -170,3 +170,74 @@ func TestVMChecker_AStopIsNotGatedOnMarkers(t *testing.T) {
 		t.Error("a running marker was written for an error state")
 	}
 }
+
+// TestConvergence_RefusesToStampAVMTheRowSaysBelongsElsewhere.
+//
+// The publish chokepoint refuses to stamp this host's runtime with a generation
+// another host now owns. Convergence — the REPAIR path for exactly that marker —
+// had no host check at all: its caller confirms only that the local domain is
+// running, which is also true of a domain this host has not yet torn down after
+// losing ownership.
+//
+// runtimeSuperseded decides by `row.OwnerEpoch > marker`, so a marker EQUAL to
+// the row reads as current. Stamping here therefore made a superseded runtime
+// look live, defeating the comparison for the one case it exists for — through
+// the repair path rather than through a publish.
+func TestConvergence_RefusesToStampAVMTheRowSaysBelongsElsewhere(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dir := t.TempDir()
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	// The row has moved to node-b at a real generation; node-a still runs the
+	// domain it has not yet torn down.
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-b", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.GraduateVMOwnerEpoch(ctx, db, "vm1"); err != nil {
+		t.Fatalf("GraduateVMOwnerEpoch: %v", err)
+	}
+
+	r := NewReconciler("node-a", dir, db, fake)
+	r.convergeOwnerEpochMarker(ctx, "vm1")
+
+	if epoch, ok, err := ReadVMOwnerEpochMarker(dir, "vm1"); ok || err != nil || epoch != 0 {
+		t.Errorf("file marker = (%d, %v, %v), want none — node-a stamped a generation node-b owns",
+			epoch, ok, err)
+	}
+	if epoch, ok, _ := fake.GetDomainOwnerEpoch("vm1"); ok {
+		t.Errorf("domain marker = %d, want none — node-a stamped a generation node-b owns", epoch)
+	}
+}
+
+// TestConvergence_StampsAVMThisHostStillOwns is the other half: the check must
+// narrow convergence, not disable it. Without this the test above passes on a
+// convergence that never stamps anything.
+func TestConvergence_StampsAVMThisHostStillOwns(t *testing.T) {
+	ctx := context.Background()
+	db := testReconcilerDB(t)
+	dir := t.TempDir()
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", State: "running", Spec: "{}",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := corrosion.GraduateVMOwnerEpoch(ctx, db, "vm1"); err != nil {
+		t.Fatalf("GraduateVMOwnerEpoch: %v", err)
+	}
+
+	r := NewReconciler("node-a", dir, db, fake)
+	r.convergeOwnerEpochMarker(ctx, "vm1")
+
+	epoch, ok, err := ReadVMOwnerEpochMarker(dir, "vm1")
+	if err != nil || !ok || epoch != 1 {
+		t.Errorf("file marker = (%d, %v, %v), want 1 — convergence must still repair its own VMs",
+			epoch, ok, err)
+	}
+}

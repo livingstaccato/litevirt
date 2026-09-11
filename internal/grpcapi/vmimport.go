@@ -332,6 +332,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		// below is a no-op on the markers, and an imported-and-started VM is
 		// exactly as unprovable as it was before — for as long as the
 		// default-off backfill stays off.
+		//
+		// Graduation is best-effort and reports a failure only in its own log
+		// line, so this ordering makes the markers POSSIBLE, not certain. When it
+		// does fail the publish below warns that it is publishing an unprovable
+		// runtime, rather than skipping the markers in silence.
 		s.assignOwnerEpochAtCreate(ctx, name)
 		if err := s.publishRunning(ctx, name, "running", func(ctx context.Context) error {
 			return corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started")

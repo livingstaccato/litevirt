@@ -562,3 +562,118 @@ func TestRowForPublish_DoesNotSleepAfterTheFinalAttempt(t *testing.T) {
 		t.Errorf("took %v, want at least ~600ms — the backoff between retries is gone", elapsed)
 	}
 }
+
+// TestPublishVMRunning_RefusesWhenNoMarkerCouldEvenBeAttempted.
+//
+// Both markers failing was already refused. NEITHER being possible — a nil
+// libvirt backend together with an empty dataDir — returned (nil, nil) and
+// committed a running row at a positive generation with no marker and no
+// warning. That is the same "proves nothing" state, reached by a configuration
+// instead of a fault, and therefore silent on every single publish.
+func TestPublishVMRunning_RefusesWhenNoMarkerCouldEvenBeAttempted(t *testing.T) {
+	committed := false
+	err := PublishVMRunning(context.Background(), nil, "", "vm1", "running", 3,
+		func(context.Context) error { committed = true; return nil })
+	if err == nil {
+		t.Fatal("a publish that can write no marker at all must be refused")
+	}
+	if committed {
+		t.Error("the commit ran — a running row was published that can prove nothing")
+	}
+}
+
+// TestPublishVMRunning_ADomainMarkerFailureIsNotReportedAsAFileFailure.
+//
+// writeBothMarkers used to return `(partial error, fatal error)`, two same-typed
+// returns told apart only by position. The minted caller bound the first to a
+// variable named fileErr and logged it as "file_error" — so a libvirt metadata
+// failure sent an operator to check a full data volume. The named result keeps
+// the two apart by field.
+func TestPublishVMRunning_ADomainMarkerFailureIsNotReportedAsAFileFailure(t *testing.T) {
+	fake := libvirtfake.New() // no domain, so SetDomainOwnerEpoch fails
+
+	res := writeBothMarkers(fake, t.TempDir(), "vm1", 3)
+	if res.domainErr == nil {
+		t.Error("domainErr is nil — the libvirt failure was not recorded as a domain failure")
+	}
+	if res.fileErr != nil {
+		t.Errorf("fileErr = %v, want nil — the file marker succeeded", res.fileErr)
+	}
+	if !res.landed {
+		t.Error("landed is false — the file marker did land, so the publish may proceed")
+	}
+	if res.unproven() {
+		t.Error("unproven() is true — one marker landed, which is enough to publish")
+	}
+}
+
+// TestWriteBothMarkers_APreEpochRowIsSkippedNotUnproven: epoch 0 has no
+// generation to name, so writing nothing is correct — and must not be confused
+// with failing to write anything, which is refused.
+func TestWriteBothMarkers_APreEpochRowIsSkippedNotUnproven(t *testing.T) {
+	res := writeBothMarkers(nil, "", "vm1", 0)
+	if !res.skipped {
+		t.Error("skipped is false for a pre-epoch row")
+	}
+	if res.unproven() {
+		t.Error("unproven() is true — a pre-epoch row publishes unmarked by design")
+	}
+	if res.failures() != nil {
+		t.Errorf("failures() = %v, want nil", res.failures())
+	}
+}
+
+// TestPublishVMRunningMinted_RetriesTheReadBack.
+//
+// This is the one read that decides whether a freshly minted generation is ever
+// marked, and its failure is deliberately silent — the commit has landed, so
+// returning an error would abort durable writes the caller still owes. Unretried,
+// a single SQLITE_BUSY therefore dropped the markers for a brand-new generation
+// with no error reaching anyone. RowForPublish existed 40 lines away, with a doc
+// comment giving exactly this reason, and this read was the only one not using it.
+func TestPublishVMRunningMinted_RetriesTheReadBack(t *testing.T) {
+	dir := t.TempDir()
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	calls := 0
+	err := publishVMRunningMinted(context.Background(), fake, dir, "node-a", "vm1",
+		func(context.Context) (*corrosion.VMRecord, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("database is locked")
+			}
+			return &corrosion.VMRecord{Name: "vm1", HostName: "node-a", OwnerEpoch: 4}, nil
+		},
+		func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatalf("publishVMRunningMinted: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("read attempted %d time(s), want 2 — the read-back was not retried", calls)
+	}
+	epoch, ok, rerr := ReadVMOwnerEpochMarker(dir, "vm1")
+	if rerr != nil || !ok || epoch != 4 {
+		t.Errorf("file marker = (%d, %v, %v), want 4 — a transient read dropped the markers for a "+
+			"generation that had just been minted", epoch, ok, rerr)
+	}
+}
+
+// TestPublishVMRunningMinted_ADeletedRowIsNotAReadFailure: collapsing the two
+// logged a concurrently deleted row as a "read-back failure" with error=<nil>,
+// naming no cause at all.
+func TestPublishVMRunningMinted_ADeletedRowIsNotAReadFailure(t *testing.T) {
+	dir := t.TempDir()
+	fake := libvirtfake.New()
+	fake.SetState("vm1", libvirtfake.StateRunning)
+
+	err := publishVMRunningMinted(context.Background(), fake, dir, "node-a", "vm1",
+		func(context.Context) (*corrosion.VMRecord, error) { return nil, nil },
+		func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatalf("a deleted row must not fail the transition: %v", err)
+	}
+	if _, ok, _ := ReadVMOwnerEpochMarker(dir, "vm1"); ok {
+		t.Error("a marker was written for a row that no longer exists")
+	}
+}

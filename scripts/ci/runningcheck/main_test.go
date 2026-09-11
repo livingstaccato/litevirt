@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -453,12 +455,15 @@ func TestStateDetailIsNotAStateWrite(t *testing.T) {
 	}
 }
 
-// TestStateStatementsOutsideCorrosionAreNotInventoried: rule 5 is scoped to the
-// one package that holds the statements, so a fixture or a doc example elsewhere
-// does not have to be registered.
-func TestStateStatementsOutsideCorrosionAreNotInventoried(t *testing.T) {
-	wantNone(t, "const q = `UPDATE vms SET state = ?, updated_at = ? WHERE name = ?`\n",
-		"an unregistered state statement outside internal/corrosion")
+// TestStateStatementsOutsideCorrosionAreAlsoInventoried.
+//
+// Rule 5 was gated on internal/corrosion under a comment asserting no other
+// package holds a vms.state statement — the unenforced assumption rule 5 exists
+// to replace. A statement added in internal/health or internal/failover escaped
+// the inventory entirely and nothing failed.
+func TestStateStatementsOutsideCorrosionAreAlsoInventoried(t *testing.T) {
+	wantOne(t, "const q = `UPDATE vms SET state = ?, updated_at = ? WHERE name = ?`\n",
+		"stateWritingStatements", "an unregistered state statement outside internal/corrosion")
 }
 
 // TestEveryInventoryEntryIsStillPresent: an entry whose statement was deleted or
@@ -466,8 +471,12 @@ func TestStateStatementsOutsideCorrosionAreNotInventoried(t *testing.T) {
 // pre-approves whatever statement later normalizes to the same text.
 func TestEveryInventoryEntryIsStillPresent(t *testing.T) {
 	found := map[string]bool{}
+	// _test.go is skipped, exactly as main()'s own walk skips it. internal/corrosion
+	// has ~20 test files holding UPDATE vms / INSERT INTO vms literals, so counting
+	// them let a fixture mirroring a production statement keep a DEAD entry alive —
+	// the silent pre-approval this test exists to prevent.
 	err := filepath.WalkDir("../../../internal/corrosion", func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return err
 		}
 		for _, sql := range stateStatementsIn(t, path) {
@@ -481,7 +490,7 @@ func TestEveryInventoryEntryIsStillPresent(t *testing.T) {
 	for _, st := range stateWritingStatements {
 		if !found[normalizeSQL(st.sql)] {
 			t.Errorf("inventory entry %q matches no statement in internal/corrosion any more — "+
-				"remove it, or it pre-approves whatever next normalizes to the same text", st.owner)
+				"remove it, or it pre-approves whatever next normalizes to the same text", st.note)
 		}
 	}
 }
@@ -506,4 +515,238 @@ func stateStatementsIn(t *testing.T, path string) []string {
 		return true
 	})
 	return out
+}
+
+// TestBornRunningInsertInASwitchCaseNeedsItsOwnGraduation.
+//
+// Rule 4's scope search walked only *ast.BlockStmt, and a switch case is not
+// one — so every case fell through to the enclosing function body, where ONE
+// case's graduation covered all its siblings. That is the exact function-wide
+// hole the block-scoped search was written to close, surviving in the construct
+// branchy code reaches for most.
+func TestBornRunningInsertInASwitchCaseNeedsItsOwnGraduation(t *testing.T) {
+	wantOne(t, `
+func f() {
+	switch mode {
+	case "clone":
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm1", State: "running"}, nil, nil)
+		s.assignOwnerEpochAtCreate(ctx, "vm1")
+	case "restore":
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm2", State: "running"}, nil, nil)
+	}
+}`, "assignOwnerEpochAtCreate", "a second switch case inserting without its own graduation")
+}
+
+// TestBornRunningInsertInASwitchCaseWithGraduationIsAccepted: the fix must
+// narrow rule 4, not break the legitimate shape.
+func TestBornRunningInsertInASwitchCaseWithGraduationIsAccepted(t *testing.T) {
+	wantNone(t, `
+func f() {
+	switch mode {
+	case "clone":
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm1", State: "running"}, nil, nil)
+		s.assignOwnerEpochAtCreate(ctx, "vm1")
+	case "restore":
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm2", State: "running"}, nil, nil)
+		s.assignOwnerEpochAtCreate(ctx, "vm2")
+	}
+}`, "every switch case graduating its own insert")
+}
+
+// TestBornRunningInsertInASelectCaseNeedsItsOwnGraduation: *ast.CommClause has
+// the same shape as CaseClause and the same hole.
+func TestBornRunningInsertInASelectCaseNeedsItsOwnGraduation(t *testing.T) {
+	wantOne(t, `
+func f() {
+	select {
+	case <-a:
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm1", State: "running"}, nil, nil)
+		s.assignOwnerEpochAtCreate(ctx, "vm1")
+	case <-b:
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm2", State: "running"}, nil, nil)
+	}
+}`, "assignOwnerEpochAtCreate", "a second select case inserting without its own graduation")
+}
+
+// TestConcatenatedStateStatementIsInventoried.
+//
+// Rule 5 scanned one *ast.BasicLit at a time, so a statement split across lines
+// with `+` — the ordinary way to keep long SQL readable — escaped the inventory:
+// neither fragment carries the `update vms set` prefix the matcher needs.
+func TestConcatenatedStateStatementIsInventoried(t *testing.T) {
+	vs := scanCorrosionSrc(t, "const q = `UPDATE vms SET ` +\n"+
+		"\t`state = ?, evil = ? WHERE name = ?`\n")
+	if len(vs) != 1 {
+		t.Fatalf("got %d violation(s), want 1 — a concatenated statement escaped rule 5", len(vs))
+	}
+	if !strings.Contains(vs[0].msg, "stateWritingStatements") {
+		t.Errorf("message = %q, want it to name the inventory", vs[0].msg)
+	}
+}
+
+// TestConcatenatedRegisteredStatementIsAccepted: folding must recognise a
+// registered statement too, or reflowing one in corrosion breaks CI.
+func TestConcatenatedRegisteredStatementIsAccepted(t *testing.T) {
+	vs := scanCorrosionSrc(t, "const q = `UPDATE vms SET state = ?, ` +\n"+
+		"\t`state_detail = ?, updated_at = ? WHERE name = ?`\n")
+	if len(vs) != 0 {
+		t.Errorf("got %d violation(s), want 0:\n  %s", len(vs), vs[0].msg)
+	}
+}
+
+// TestInventoryDumpEmitsAPasteableEntry.
+//
+// Rule 5's doc and its violation message both tell a maintainer to run
+// -inventory to get what to add. It printed map-literal syntax with a stray
+// backslash for a SLICE inventory, so the thing they were told to paste was a
+// syntax error — and it printed the lowercase normalized text, contradicting the
+// inventory's own rule that entries carry the statement in source form.
+func TestInventoryDumpEmitsAPasteableEntry(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "corrosion")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "x.go")
+	src := "package corrosion\nconst q = `UPDATE vms SET state = ?, evil = ? WHERE name = ?`\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out := captureStdout(t, func() {
+		if _, err := scanFileOpts(path, true); err != nil {
+			t.Fatalf("scanFileOpts: %v", err)
+		}
+	})
+
+	// The printed entry must parse as the Go it claims to be: a slice element.
+	wrapped := "package p\nvar _ = []stateStatement{\n" + out + "}\n"
+	if _, err := parser.ParseFile(token.NewFileSet(), "x.go", wrapped, 0); err != nil {
+		t.Errorf("the -inventory output does not compile as a stateWritingStatements entry: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "UPDATE vms SET state = ?, evil = ?") {
+		t.Errorf("output = %q, want the statement in its SOURCE form, not normalized", out)
+	}
+}
+
+// TestInventoryDumpDoesNotLeakIntoOtherScans: the dump flag is per-scan state.
+// As a package global, one test exercising the dump path would have made every
+// later rule-5 assertion pass vacuously.
+func TestInventoryDumpDoesNotLeakIntoOtherScans(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "corrosion")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "x.go")
+	src := "package corrosion\nconst q = `UPDATE vms SET state = ?, evil = ? WHERE name = ?`\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	captureStdout(t, func() {
+		if _, err := scanFileOpts(path, true); err != nil {
+			t.Fatalf("scanFileOpts: %v", err)
+		}
+	})
+	vs, err := scanFile(path)
+	if err != nil {
+		t.Fatalf("scanFile: %v", err)
+	}
+	if len(vs) != 1 {
+		t.Errorf("got %d violation(s) after a dump scan, want 1 — the flag leaked", len(vs))
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected and returns what it wrote.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+	fn()
+	os.Stdout = saved
+	_ = w.Close()
+	out := <-done
+	_ = r.Close()
+	return out
+}
+
+// TestEveryInventoriedWriterIsPoliced.
+//
+// The inventory used to record its owning writer as free prose, so it could
+// claim an ordering for a function the call-site rules never looked at — the
+// inventory describing a connection to nonMinting/minting/clientMethods that did
+// not exist. Now every name it lists has to actually be in one of them.
+func TestEveryInventoriedWriterIsPoliced(t *testing.T) {
+	for _, st := range stateWritingStatements {
+		for _, w := range st.writers {
+			_, isNonMinting := nonMinting[w]
+			_, isMinting := minting[w]
+			_, isClient := clientMethods[w]
+			if !isNonMinting && !isMinting && !isClient {
+				t.Errorf("inventory names %q as a writer of a vms.state statement, but no call-site "+
+					"rule polices it: add it to nonMinting, minting or clientMethods", w)
+			}
+		}
+	}
+}
+
+// TestEveryPolicedWriterIsInventoried is the other direction: a name in the maps
+// with no statement behind it is a rule guarding nothing, which is how
+// UpdateVMHost sat exempt under a comment describing a different statement.
+func TestEveryPolicedWriterIsInventoried(t *testing.T) {
+	named := map[string]bool{}
+	for _, st := range stateWritingStatements {
+		for _, w := range st.writers {
+			named[w] = true
+		}
+	}
+	for _, m := range []map[string]int{nonMinting, minting, clientMethods} {
+		for w := range m {
+			if !named[w] {
+				t.Errorf("%q is policed as a vms.state writer but the inventory lists no statement "+
+					"for it — either it no longer writes state, or its statement is unregistered", w)
+			}
+		}
+	}
+}
+
+// TestAHardcodedRunningStatementNamesAMintingWriter: a statement that writes
+// state='running' as a literal cannot be exempted by a call site's argument, so
+// something in the minting or client family has to own it.
+func TestAHardcodedRunningStatementNamesAMintingWriter(t *testing.T) {
+	for _, st := range stateWritingStatements {
+		sql := normalizeSQL(st.sql)
+		if !strings.Contains(sql, "state = 'running'") {
+			continue
+		}
+		if len(st.writers) == 0 {
+			// A frozen receive-only shape has no Go writer; note must say so.
+			if !strings.Contains(st.note, "RECEIVE-ONLY") {
+				t.Errorf("a statement hardcoding state='running' names no writer and is not marked "+
+					"receive-only: %q", st.note)
+			}
+			continue
+		}
+		ok := false
+		for _, w := range st.writers {
+			if _, isMinting := minting[w]; isMinting {
+				ok = true
+			}
+			if _, isClient := clientMethods[w]; isClient {
+				ok = true
+			}
+		}
+		if !ok {
+			t.Errorf("a statement hardcoding state='running' is owned only by non-minting writers "+
+				"%v — nothing can exempt it by argument: %q", st.writers, st.note)
+		}
+	}
 }

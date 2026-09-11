@@ -35,8 +35,16 @@
 //     police call sites against hand-maintained maps of writer NAMES, and a map
 //     nobody is forced to update is a guard that decays — UpdateVMHost sat in one
 //     as permanently exempt for exactly that reason. This rule closes the loop
-//     from the other end: a new state writer fails the build until someone says
+//     from the other end: a new statement fails the build until someone says
 //     which ordering it takes. `runningcheck -inventory` prints what to add.
+//  6. Every FUNCTION that executes such a statement must be classified — in
+//     nonMinting, minting or clientMethods, or in one of the two exemption maps
+//     in writers.go. Rule 5 catches a new STATEMENT; on its own it passed a new
+//     FUNCTION that ran an existing one, while rules 1-4 never looked at that
+//     function because its name was in none of their maps. Rule 6 is the only
+//     type-aware pass: half these statements are package-level consts referenced
+//     across files, so resolving what SQL a function executes needs go/types
+//     constant folding. See writers.go.
 //
 // A site that genuinely cannot be routed opts out with a trailing
 // `//runningcheck:allow <reason>` comment on any line the statement spans. The
@@ -151,6 +159,14 @@ func main() {
 	flag.Parse()
 
 	violations, err := scanTree(*root, *dump)
+	if err == nil && !*dump {
+		// Rule 6 is a separate, type-aware pass: it loads the module so a
+		// statement held in a package-level const resolves to the functions that
+		// execute it. Skipped under -inventory, which is about statements.
+		var wv []violation
+		wv, err = checkWriters(*root)
+		violations = append(violations, wv...)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runningcheck: %v\n", err)
 		os.Exit(2)

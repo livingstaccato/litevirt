@@ -210,6 +210,14 @@ func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *cor
 // transition rather than falling back to epoch 0: a successful read of 0 is a
 // pre-epoch row, a failed read is nothing at all, and treating them alike makes
 // the chokepoint a no-op exactly under the conditions it exists for.
+//
+// This read is NOT skippable for a caller that already holds a row. Every such
+// caller read its row before the work the publish concludes — vmcheck's restart
+// reads at the top of its action and publishes after a DestroyDomain and a
+// StartDomain; the reconciler reads after taking the VM lock and publishes after
+// the whole start sequence. A row read seconds before a domain boot is exactly
+// the stale snapshot the host check below exists to catch, and reusing it would
+// stamp this host's runtime with a generation another host now owns.
 func RowForPublish(ctx context.Context, db *corrosion.Client, name string) (*corrosion.VMRecord, error) {
 	return rowForPublish(ctx, name, func(ctx context.Context) (*corrosion.VMRecord, error) {
 		return corrosion.GetVM(ctx, db, name)
@@ -218,9 +226,25 @@ func RowForPublish(ctx context.Context, db *corrosion.Client, name string) (*cor
 
 // rowForPublish is RowForPublish's policy over an injectable read, so the retry
 // is testable without a fault hook on the shared corrosion client.
+// The backoff sits BEFORE each retry rather than after each failure, and waits
+// on ctx as well as the clock. Sleeping after the final attempt bought nothing
+// and cost the caller an extra 400ms of the 1s a fully failed lookup took; and
+// an unwaited sleep ignored cancellation, so a shutdown mid-sweep still paid the
+// full backoff for every VM in turn — VMChecker.sweep publishes sequentially.
 func rowForPublish(ctx context.Context, name string, read func(context.Context) (*corrosion.VMRecord, error)) (*corrosion.VMRecord, error) {
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				// Joined, not replaced: the read error says what the store did,
+				// and ctx.Err() keeps errors.Is(err, context.Canceled) true for
+				// callers that classify a cancelled shutdown apart from a fault.
+				return nil, fmt.Errorf("owner-epoch lookup before publishing %q running: %w",
+					name, errors.Join(err, ctx.Err()))
+			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+			}
+		}
 		var row *corrosion.VMRecord
 		if row, err = read(ctx); err == nil {
 			if row == nil {
@@ -232,7 +256,6 @@ func rowForPublish(ctx context.Context, name string, read func(context.Context) 
 			}
 			return row, nil
 		}
-		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("owner-epoch lookup before publishing %q running: %w", name, err)
 }

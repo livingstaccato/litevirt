@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -501,5 +502,63 @@ func TestPublishVMRunning_ADomainMarkerFailureStillWritesTheFileMarker(t *testin
 	if epoch, ok, _ := ReadVMOwnerEpochMarker(dir, "vm1"); !ok || epoch != 5 {
 		t.Errorf("file marker = (%d,%v), want (5,true) — a failed domain write must not skip "+
 			"the marker that survives the domain being undefined", epoch, ok)
+	}
+}
+
+// TestRowForPublish_ACancelledContextAbandonsTheRetries.
+//
+// VMChecker.sweep publishes its VMs SEQUENTIALLY, so an unwaited backoff meant a
+// shutdown mid-sweep still paid the full retry budget for every remaining VM in
+// turn. The wait now selects on ctx, and the error keeps context.Canceled
+// reachable so a caller can tell a cancelled shutdown from a store fault.
+func TestRowForPublish_ACancelledContextAbandonsTheRetries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	start := time.Now()
+	_, err := rowForPublish(ctx, "vm1", func(context.Context) (*corrosion.VMRecord, error) {
+		calls++
+		cancel() // the store faults, and the daemon is going down
+		return nil, errors.New("database is locked")
+	})
+	if err == nil {
+		t.Fatal("a lookup that never succeeded must refuse the publish")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v, want context.Canceled reachable so a shutdown is not read as a store fault", err)
+	}
+	if calls != 1 {
+		t.Errorf("read attempted %d time(s), want 1 — the cancelled backoff kept retrying", calls)
+	}
+	if elapsed := time.Since(start); elapsed > 50*time.Millisecond {
+		t.Errorf("returned after %v, want promptly — the backoff ignored cancellation", elapsed)
+	}
+}
+
+// TestRowForPublish_DoesNotSleepAfterTheFinalAttempt.
+//
+// The backoff belongs BEFORE a retry, not after a failure. Sleeping after the
+// last attempt bought nothing and cost every caller an extra 400ms: a fully
+// failed lookup took 1s where 600ms is the whole wait it actually needs.
+func TestRowForPublish_DoesNotSleepAfterTheFinalAttempt(t *testing.T) {
+	calls := 0
+	start := time.Now()
+	_, err := rowForPublish(context.Background(), "vm1",
+		func(context.Context) (*corrosion.VMRecord, error) {
+			calls++
+			return nil, errors.New("database is locked")
+		})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a lookup that never succeeded must refuse the publish")
+	}
+	if calls != 4 {
+		t.Errorf("read attempted %d time(s), want 4", calls)
+	}
+	// 100+200+300 = 600ms of real waiting; the removed trailing sleep was 400ms.
+	if elapsed >= 900*time.Millisecond {
+		t.Errorf("took %v, want under 900ms — a sleep still follows the final failed attempt", elapsed)
+	}
+	if elapsed < 500*time.Millisecond {
+		t.Errorf("took %v, want at least ~600ms — the backoff between retries is gone", elapsed)
 	}
 }

@@ -973,13 +973,9 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 	}
 }
 
-// publishRunning routes a NON-MINTING transition through the marker chokepoint:
-// for "running" the markers are written first and the commit runs only if they
-// landed; any other state passes straight through.
-//
-// The state check is here as well as inside health.PublishVMRunning so a stop
-// costs no row read. The helper keeps its own gate for callers that reach it
-// directly.
+// publishRunning routes a NON-MINTING transition through the marker chokepoint.
+// Why there are two orderings, and why this one marks first, lives on
+// health.PublishVMRunning; do not restate it here, or the copies drift.
 //
 // Not for a cross-host handoff. s.virt and s.dataDir are THIS host's, and after
 // a migration cutover the domain they name is gone (MigrateToTarget sets
@@ -992,12 +988,8 @@ func (s *Server) publishRunning(ctx context.Context, name, state string, commit 
 
 // publishRunningMinted routes a MINTING transition — one whose statement sets
 // state='running' AND advances vm_owner_epoch together — through the chokepoint
-// in the OTHER order: commit, read back the generation the commit produced, then
-// mark that.
-//
-// Marking first here would stamp the generation the row is about to LEAVE, which
-// is precisely the marker/row disagreement the dual-run detector reports. The
-// correct value does not exist until the commit lands.
+// in the OTHER order. See health.PublishVMRunningMinted for why that order is
+// the only correct one here.
 //
 // Local publishes only, for the same reason publishRunning is: see its comment.
 func (s *Server) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {

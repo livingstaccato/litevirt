@@ -7,17 +7,11 @@
 // exists to tolerate, so closing it everywhere is what eventually makes that
 // grace deletable — and a new unrouted call site would silently reopen it.
 //
-// There are two publish orderings, and using the wrong one is as much a defect
-// as using neither:
-//
-//   - NON-MINTING writers (UpdateVMState and friends) leave the generation
-//     unchanged, so the marker value is already known. Mark first, then commit.
-//   - MINTING writers (TransferVMOwner*, CompleteVMStartProof) set
-//     state='running' AND advance vm_owner_epoch in one statement, so the
-//     correct value does not EXIST until the commit lands. Commit, read back,
-//     then mark. Routing one of these through the non-minting helper stamps the
-//     generation the row is about to LEAVE — the exact marker/row disagreement
-//     the detector reports.
+// There are two publish orderings — mark-then-commit for a writer that leaves
+// the ownership generation alone, commit-then-mark for one that advances it in
+// the same statement. internal/health/publish.go states why; this tool only has
+// to enforce that each writer takes the right one, because using the WRONG
+// ordering is as much a defect as using neither.
 //
 // The rules, all AST-checked:
 //
@@ -36,6 +30,13 @@
 //     same function. An insert lands at the vm_owner_epoch column default of 0,
 //     convergence early-returns on zero, and the backfill that would graduate it
 //     is gated behind enforcement.owner_epoch, which is off by default.
+//  5. Every SQL statement in internal/corrosion that writes the vms.state column
+//     must be registered in the stateWritingStatements inventory below. Rules 1-4
+//     police call sites against hand-maintained maps of writer NAMES, and a map
+//     nobody is forced to update is a guard that decays — UpdateVMHost sat in one
+//     as permanently exempt for exactly that reason. This rule closes the loop
+//     from the other end: a new state writer fails the build until someone says
+//     which ordering it takes. `runningcheck -inventory` prints what to add.
 //
 // A site that genuinely cannot be routed opts out with a trailing
 // `//runningcheck:allow <reason>` comment on any line the statement spans. The
@@ -51,13 +52,16 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -111,18 +115,27 @@ var minting = map[string]int{
 	"CompleteVMStartProof": alwaysRunning,
 }
 
+// The publish helpers, mapped to the zero-based index of their state argument —
+// the value rule 3 must see a branch disprove before it accepts a direct
+// invocation of a routed closure.
+//
 // mintedHelpers take the commit-then-mark ordering; plainHelpers the
-// mark-then-commit one. A minting primitive routed through a plain helper is a
-// family mismatch, not a pass.
-var mintedHelpers = map[string]bool{
-	"publishRunningMinted":   true,
-	"PublishVMRunningMinted": true,
+// mark-then-commit one (see internal/health/publish.go for why the two exist).
+// A minting primitive routed through a plain helper is a family mismatch, not a
+// pass. A minted helper has NO state argument — it always publishes running —
+// which is alwaysRunning here exactly as it is for the primitives.
+var mintedHelpers = map[string]int{
+	"publishRunningMinted":   alwaysRunning,
+	"PublishVMRunningMinted": alwaysRunning,
 }
 
-var plainHelpers = map[string]bool{
-	"publishRunning":    true,
-	"PublishVMRunning":  true,
-	"PublishRunningVia": true,
+var plainHelpers = map[string]int{
+	// publishRunning(ctx, name, state, commit)
+	"publishRunning": 2,
+	// PublishVMRunning(ctx, virt, dataDir, name, state, epoch, commit)
+	"PublishVMRunning": 4,
+	// PublishRunningVia(ctx, virt, db, dataDir, hostName, name, state, commit)
+	"PublishRunningVia": 6,
 }
 
 type violation struct {
@@ -133,7 +146,10 @@ type violation struct {
 
 func main() {
 	root := flag.String("root", ".", "repository root to scan for production .go files")
+	dump := flag.Bool("inventory", false,
+		"print the normalized fingerprint of every UNREGISTERED vms.state statement and exit 0")
 	flag.Parse()
+	dumpInventory = *dump
 
 	var violations []violation
 	err := filepath.WalkDir(*root, func(path string, d os.DirEntry, err error) error {
@@ -162,6 +178,9 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *dump {
+		return
+	}
 	if len(violations) == 0 {
 		fmt.Println("runningcheck: every running publish is routed through the marker chokepoint; OK")
 		return
@@ -255,6 +274,12 @@ func scanFile(path string) ([]violation, error) {
 		}
 		return true
 	})
+	// Rule 5 is corrosion-only: it inventories the SQL the other rules'''s maps
+	// name writers for, and no other package holds a vms.state statement.
+	if inCorrosionPackage(path) {
+		s.checkStateStatements(file)
+	}
+
 	// A directive that suppressed nothing is itself a violation.
 	for _, d := range s.directives {
 		if d.used {
@@ -402,6 +427,208 @@ func graduatedInScope(root ast.Node, insert ast.Node, fset *token.FileSet) bool 
 	return callsGraduation(best)
 }
 
+// Rule 5: every SQL statement in internal/corrosion that writes the vms.state
+// column must be registered here.
+//
+// Rules 1-4 police CALL SITES against hand-maintained maps of writer names, and
+// a map nobody is forced to update is a guard that decays: UpdateVMHost sat in
+// nonMinting as permanently exempt for exactly that reason. This rule closes the
+// loop from the other end — a new `UPDATE vms SET ... state = ?` fails the build
+// until someone says which writer owns it and which ordering it takes.
+//
+// Matched on the statement's normalized text (whitespace collapsed, lowercased)
+// rather than on its enclosing function: half of these are package-level consts
+// that an AST-only pass cannot attribute to the function that executes them.
+// Written here in their SOURCE form and normalized at startup, so reflowing a
+// statement in corrosion does not read as a new one and the inventory stays
+// legible as SQL.
+//
+// Each entry names the Go writer and how it is policed. Adding one is the point
+// at which to ask whether that writer belongs in nonMinting, minting or
+// clientMethods above. `runningcheck -inventory` prints the entries a new
+// statement needs.
+//
+// Statements that normalize to the same text share an entry — UpdateVMState and
+// UpdateVMStateStrict differ only in their Go-side row-count check, and
+// UpdateVMHost and CommitMigrationOwnership execute character-identical SQL.
+type stateStatement struct {
+	sql   string
+	owner string
+}
+
+var stateWritingStatements = []stateStatement{
+	{`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
+		"UpdateVMState and UpdateVMStateStrict — nonMinting, state at arg 3"},
+	{`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
+		"UpdateVMStateAtEpoch — nonMinting, state at arg 3"},
+	{`UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
+		"UpdateVMHost (nonMinting, state at arg 4) and CommitMigrationOwnership " +
+			"(nonMinting, state at arg 5) — identical SQL, different guards in Go"},
+	{`UPDATE vms
+	  SET host_name = ?, state = ?, state_detail = '',
+	      vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+	  WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		"TransferVMOwner and TransferVMOwnerFresh — MINTING (it advances the " +
+			"generation in the same statement), state at arg 4"},
+	{`UPDATE vms SET state = 'running', pending_action_id = '',
+	        vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+	        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`,
+		"CompleteVMStartProof — MINTING, and alwaysRunning: no state argument " +
+			"can exempt it"},
+	{`INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+			cpu_actual, mem_actual, project, is_template, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		"InsertVM and InsertVMWithHardware — stateInVMRecord, so rule 4 polices " +
+			"the record's State field. Also HistoricalShapes' insert_vm_pre_authority, " +
+			"which is receive-only and writes nothing"},
+	{`UPDATE vms SET state = 'running', state_detail = ?,
+			cpu_actual = ?, mem_actual = ?,
+			hardware_adoption_state = 'adopted', hardware_adoption_error = NULL,
+			active_operation_id = '', updated_at = ?
+		 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
+		   AND vm_owner_epoch = ? AND spec_generation = ? AND deleted_at IS NULL`,
+		"CommitVMCreateOperation — clientMethods, stateInVMRecord; the create " +
+			"path graduates via assignOwnerEpochAtCreate"},
+
+	// The rest publish a state this statement HARDCODES to something other than
+	// "running", so no call site of theirs can publish a runtime. They are
+	// registered rather than skipped: the point of the inventory is that a later
+	// edit turning one of these literals into a parameter fails the build.
+	{`UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
+	        WHERE name = ? AND deleted_at IS NULL`,
+		"WriteVMRescheduleProof — literal state='pending', never a runtime"},
+	{`UPDATE vms SET state = 'error', state_detail = ?, pending_action_id = '', updated_at = ?
+	       WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`,
+		"FailActionProof — literal state='error', never a runtime"},
+	{`INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
+				spec_generation, active_operation_id, created_at, updated_at,
+				deleted_at, pending_action_id, hardware_adoption_state,
+				hardware_adoption_error)
+			 VALUES (?, ?, ?, ?, 'creating', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+				NULL, '', 'pending', NULL)
+			 ON CONFLICT(name) DO UPDATE SET
+				stack_name = excluded.stack_name, host_name = excluded.host_name,
+				spec = excluded.spec, state = excluded.state,
+				state_detail = excluded.state_detail,
+				cpu_actual = excluded.cpu_actual, mem_actual = excluded.mem_actual,
+				project = excluded.project, is_template = excluded.is_template,
+				vm_owner_epoch = excluded.vm_owner_epoch,
+				spec_generation = excluded.spec_generation,
+				active_operation_id = excluded.active_operation_id,
+				created_at = excluded.created_at, updated_at = excluded.updated_at,
+				deleted_at = excluded.deleted_at,
+				pending_action_id = excluded.pending_action_id,
+				hardware_adoption_state = excluded.hardware_adoption_state,
+				hardware_adoption_error = excluded.hardware_adoption_error
+			 WHERE vms.deleted_at IS NOT NULL
+			   AND excluded.vm_owner_epoch > vms.vm_owner_epoch
+			   AND excluded.spec_generation > vms.spec_generation`,
+		"vmCreateBeginSQL — literal state='creating'; the conflict arm resurrects " +
+			"a tombstone at that same state"},
+	{`UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
+	        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`,
+		"HistoricalShapes' complete_vm_start_pre_epoch_v47 — a frozen " +
+			"RECEIVE-ONLY shape for the support horizon; no Go writer emits it"},
+}
+
+// stateInventory is stateWritingStatements keyed by normalized text.
+var stateInventory = func() map[string]string {
+	m := make(map[string]string, len(stateWritingStatements))
+	for _, st := range stateWritingStatements {
+		m[normalizeSQL(st.sql)] = st.owner
+	}
+	return m
+}()
+
+// dumpInventory is set by -inventory: print unregistered fingerprints instead of
+// failing on them, so adding a statement does not mean hand-normalizing its SQL.
+var dumpInventory bool
+
+var insertVMsRe = regexp.MustCompile(`^insert into vms *\(([^)]*)\)`)
+
+// writesVMState reports whether a normalized statement assigns vms.state.
+//
+// The SET clause is split on commas and each assignment's LEFT side compared for
+// equality, rather than pattern-matched. A regex looking for "state =" anywhere
+// matches state_detail, hardware_adoption_state and a WHERE clause's `state = ?`
+// as readily as the column itself; equality on the split target cannot.
+func writesVMState(sql string) bool {
+	if rest, ok := cutPrefix(sql, "update vms set "); ok {
+		if where := strings.Index(rest, " where "); where >= 0 {
+			rest = rest[:where]
+		}
+		return assignsState(rest)
+	}
+	if m := insertVMsRe.FindStringSubmatch(sql); m != nil {
+		for _, col := range strings.Split(m[1], ",") {
+			if strings.TrimSpace(col) == "state" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// assignsState reports whether a comma-separated SET clause assigns `state`.
+func assignsState(setClause string) bool {
+	for _, assign := range strings.Split(setClause, ",") {
+		target, _, found := strings.Cut(assign, "=")
+		if found && strings.TrimSpace(target) == "state" {
+			return true
+		}
+	}
+	return false
+}
+
+func cutPrefix(s, prefix string) (string, bool) {
+	if !strings.HasPrefix(s, prefix) {
+		return s, false
+	}
+	return s[len(prefix):], true
+}
+
+// normalizeSQL collapses whitespace and lowercases, so reflowing a statement
+// across lines does not read as a new one.
+func normalizeSQL(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
+
+// checkStateStatements walks a corrosion file for unregistered state writers.
+func (s *fileScan) checkStateStatements(file *ast.File) {
+	ast.Inspect(file, func(n ast.Node) bool {
+		bl, ok := n.(*ast.BasicLit)
+		if !ok || bl.Kind != token.STRING {
+			return true
+		}
+		sql := normalizeSQL(strings.Trim(bl.Value, "`\""))
+		if !writesVMState(sql) {
+			return true
+		}
+		if _, known := stateInventory[sql]; known {
+			return true
+		}
+		if dumpInventory {
+			// The fingerprint, ready to paste. A maintainer adding a statement
+			// should not have to reimplement normalizeSQL by hand to satisfy the
+			// guard that just failed on them.
+			fmt.Printf("\t%q: \\\n\t\t\"<writer>, <how it is policed>\",\n", sql)
+			return true
+		}
+		s.report(bl, "this statement writes the vms.state column but is not registered in "+
+			"runningcheck's stateWritingStatements inventory. A writer nobody registered is a "+
+			"writer rules 1-4 do not police: add the statement, and add its Go writer to "+
+			"nonMinting, minting or clientMethods (or record there why it can never publish "+
+			"a running VM)")
+		return true
+	})
+}
+
+// inCorrosionPackage reports whether path is a file of internal/corrosion.
+func inCorrosionPackage(path string) bool {
+	return filepath.Base(filepath.Dir(path)) == "corrosion"
+}
+
 func hasKey(m map[string]int, k string) bool { _, ok := m[k]; return ok }
 
 // corrosionCall returns the function name for a corrosion.<Fn>(...) call, else "".
@@ -456,7 +683,19 @@ const (
 // variable's name.
 type routing struct {
 	spans []span
-	vars  map[string]family
+	vars  map[string]routedVar
+}
+
+// routedVar is a closure variable handed to a publish helper, together with the
+// state expression that helper was given alongside it. Rule 3 needs the
+// expression, not just the fact of routing: a branch proving some OTHER string
+// is not "running" proves nothing about the state this closure will write.
+type routedVar struct {
+	fam family
+	// stateText is the state argument's source text, or "" when the helper takes
+	// no state argument (a minted publish is always running, so no branch can
+	// disprove it).
+	stateText string
 }
 
 type span struct {
@@ -484,7 +723,7 @@ func (r routing) family(n ast.Node, fset *token.FileSet) family {
 // reached through a variable — and records the source span it covers, so a
 // primitive can be tested for "is lexically inside a routed closure".
 func collectRouting(body *ast.BlockStmt, fset *token.FileSet) routing {
-	r := routing{vars: map[string]family{}}
+	r := routing{vars: map[string]routedVar{}}
 
 	// Pass 1: which arguments reach a helper, and with which ordering.
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -492,9 +731,13 @@ func collectRouting(body *ast.BlockStmt, fset *token.FileSet) routing {
 		if !ok {
 			return true
 		}
-		fam := helperFamily(helperName(call))
+		fam, stateIdx := helperFamily(helperName(call))
 		if fam == familyNone {
 			return true
+		}
+		stateText := ""
+		if stateIdx >= 0 && stateIdx < len(call.Args) {
+			stateText = exprText(call.Args[stateIdx])
 		}
 		// Only the LAST argument can be the commit callback. Registering every
 		// identifier argument put ctx, name and state into vars, so a local
@@ -513,7 +756,7 @@ func collectRouting(body *ast.BlockStmt, fset *token.FileSet) routing {
 				})
 			case *ast.Ident:
 				// Reached through a variable; its closure body is found below.
-				r.vars[a.Name] = fam
+				r.vars[a.Name] = routedVar{fam: fam, stateText: stateText}
 			}
 		}
 		return true
@@ -529,7 +772,7 @@ func collectRouting(body *ast.BlockStmt, fset *token.FileSet) routing {
 		if !ok {
 			return true
 		}
-		fam, routed := r.vars[id.Name]
+		rv, routed := r.vars[id.Name]
 		if !routed {
 			return true
 		}
@@ -537,7 +780,7 @@ func collectRouting(body *ast.BlockStmt, fset *token.FileSet) routing {
 			r.spans = append(r.spans, span{
 				start: fset.Position(fl.Body.Pos()).Line,
 				end:   fset.Position(fl.Body.End()).Line,
-				fam:   fam,
+				fam:   rv.fam,
 			})
 		}
 		return true
@@ -545,14 +788,16 @@ func collectRouting(body *ast.BlockStmt, fset *token.FileSet) routing {
 	return r
 }
 
-func helperFamily(name string) family {
-	switch {
-	case mintedHelpers[name]:
-		return familyMinted
-	case plainHelpers[name]:
-		return familyPlain
+// helperFamily returns a helper's ordering family and the index of its state
+// argument (alwaysRunning when it has none).
+func helperFamily(name string) (family, int) {
+	if idx, ok := mintedHelpers[name]; ok {
+		return familyMinted, idx
 	}
-	return familyNone
+	if idx, ok := plainHelpers[name]; ok {
+		return familyPlain, idx
+	}
+	return familyNone, alwaysRunning
 }
 
 // directUse names a direct invocation of a routed closure variable.
@@ -562,20 +807,31 @@ type directUse struct {
 }
 
 func (r routing) directCalls(body *ast.BlockStmt, fset *token.FileSet) []directUse {
-	// Collect the source ranges of `if` statements whose condition proves the
-	// state is not "running"; a direct invocation inside one is legitimate.
-	var proven []span
-	ast.Inspect(body, func(n ast.Node) bool {
-		ifs, ok := n.(*ast.IfStmt)
-		if !ok || ifs.Cond == nil || !provesNotRunning(ifs.Cond) {
-			return true
+	// Per routed closure variable, the source ranges of `if` statements whose
+	// condition proves THAT closure's state expression is not "running". A direct
+	// invocation inside one is legitimate.
+	//
+	// Per-variable, not one shared set: the proof has to be about the value the
+	// closure will actually write. `detail != "running"` was accepted as proof
+	// for a closure writing `state`, which proves nothing — it only has to
+	// mention the string.
+	proven := map[string][]span{}
+	for name, rv := range r.vars {
+		if rv.stateText == "" {
+			continue // no state argument: always running, nothing can disprove it
 		}
-		proven = append(proven, span{
-			start: fset.Position(ifs.Body.Pos()).Line,
-			end:   fset.Position(ifs.Body.End()).Line,
+		ast.Inspect(body, func(n ast.Node) bool {
+			ifs, ok := n.(*ast.IfStmt)
+			if !ok || ifs.Cond == nil || !provesNotRunning(ifs.Cond, rv.stateText) {
+				return true
+			}
+			proven[name] = append(proven[name], span{
+				start: fset.Position(ifs.Body.Pos()).Line,
+				end:   fset.Position(ifs.Body.End()).Line,
+			})
+			return true
 		})
-		return true
-	})
+	}
 
 	var out []directUse
 	ast.Inspect(body, func(n ast.Node) bool {
@@ -587,11 +843,11 @@ func (r routing) directCalls(body *ast.BlockStmt, fset *token.FileSet) []directU
 		if !ok {
 			return true
 		}
-		if _, routedVar := r.vars[id.Name]; !routedVar {
+		if _, routed := r.vars[id.Name]; !routed {
 			return true
 		}
 		line := fset.Position(call.Pos()).Line
-		for _, sp := range proven {
+		for _, sp := range proven[id.Name] {
 			if line >= sp.start && line <= sp.end {
 				return true
 			}
@@ -602,33 +858,68 @@ func (r routing) directCalls(body *ast.BlockStmt, fset *token.FileSet) []directU
 	return out
 }
 
-// provesNotRunning reports whether a condition establishes that the state is
-// something other than "running" — `state != "running"`, or a disjunction of
-// such comparisons.
-func provesNotRunning(e ast.Expr) bool {
+// provesNotRunning reports whether a condition establishes that the expression
+// whose source text is stateText holds something other than "running".
+//
+// Both comparison directions count, because both appear in real code:
+//
+//   - `state != "running"` — the negative form.
+//   - `state == "stopped"` — the positive form, against any literal that is not
+//     "running". classifyStop's callers read this way, and rejecting it would
+//     have pushed a future site toward a directive instead of a proof.
+//
+// The non-literal operand must BE stateText. Accepting any expression compared
+// against "running" made `detail != "running"` — or any unrelated string — read
+// as proof about the state, which is a bypass, not a proof.
+func provesNotRunning(e ast.Expr, stateText string) bool {
 	switch b := e.(type) {
 	case *ast.ParenExpr:
-		return provesNotRunning(b.X)
+		return provesNotRunning(b.X, stateText)
 	case *ast.BinaryExpr:
 		switch b.Op {
-		case token.NEQ:
-			if lit, ok := stringLit(b.Y); ok && lit == "running" {
-				return true
+		case token.NEQ, token.EQL:
+			lit, other, ok := litAndOther(b)
+			if !ok || exprText(other) != stateText {
+				return false
 			}
-			if lit, ok := stringLit(b.X); ok && lit == "running" {
-				return true
+			if b.Op == token.NEQ {
+				return lit == "running"
 			}
+			return lit != "running"
 		case token.LAND:
 			// Either conjunct proving it is enough: both must hold to enter.
-			return provesNotRunning(b.X) || provesNotRunning(b.Y)
+			return provesNotRunning(b.X, stateText) || provesNotRunning(b.Y, stateText)
 		case token.LOR:
 			// BOTH alternatives must prove it. `state != "running" || retry`
 			// is entered with state == "running" whenever retry is true, and
 			// treating OR like AND accepted exactly that bypass.
-			return provesNotRunning(b.X) && provesNotRunning(b.Y)
+			return provesNotRunning(b.X, stateText) && provesNotRunning(b.Y, stateText)
 		}
 	}
 	return false
+}
+
+// litAndOther splits a comparison into its string literal and its other side.
+func litAndOther(b *ast.BinaryExpr) (lit string, other ast.Expr, ok bool) {
+	if l, isLit := stringLit(b.Y); isLit {
+		return l, b.X, true
+	}
+	if l, isLit := stringLit(b.X); isLit {
+		return l, b.Y, true
+	}
+	return "", nil, false
+}
+
+// exprText renders an expression back to source so two occurrences of the same
+// state expression can be compared. Printed rather than compared structurally:
+// the state is `state`, `vm.State` or `fresh.State` at real call sites, and
+// go/printer normalizes all of those to a single canonical form.
+func exprText(e ast.Expr) string {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, token.NewFileSet(), e); err != nil {
+		return ""
+	}
+	return buf.String()
 }
 
 func callsGraduation(body *ast.BlockStmt) bool {

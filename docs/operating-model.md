@@ -84,7 +84,8 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   reports. Three producers that insert a row already at `running` — a clone
   started with `--start`, a live-restore with autostart, and a renamed replica
   promotion — assign the first generation at insert instead.
-  **Two gaps remain, deliberately.** Neither is new.
+  **Three gaps remain, deliberately.** The first two predate this work; the
+  third is the cost of the rule that one marker is enough to publish.
   1. *Ownership handoffs.* Migration cutover, drain, the cold firmware handoff,
      and the health checker's migration retry all commit a row naming a
      DIFFERENT host, while running on the host giving the VM away — whose domain
@@ -102,14 +103,19 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
      has genuinely moved. The unsafe direction, stamping a runtime with the NEXT
      owner's generation, is refused: BOTH orderings re-check that the row still
      names this host before writing anything, and the non-minting one refuses
-     the whole transition rather than publish a row another host owns.
+     the whole transition rather than publish a row another host owns. The
+     convergence sweep that REPAIRS a marker checks the same thing — its own
+     precondition is only that the local domain is running, which is also true
+     of a domain this host has not yet torn down after losing ownership.
   3. *A host that can write neither marker.* One marker is enough to publish, so
      a failed libvirt metadata write falls back to the durable file marker and
      vice versa. Losing BOTH refuses the transition — the invariant working as
      intended — but a host whose data volume is full or read-only AND whose
      libvirt refuses metadata will leave its rows behind while its guests run.
-     That refusal is counted on the state-write-failure metric rather than left
-     to logs.
+     A non-minting transition REFUSES in that case, and the refusal is counted
+     on the state-write-failure metric. A minting one cannot: its commit has
+     already landed by the time the markers are attempted, so losing both is
+     logged for convergence to repair and is neither refused nor counted.
 - **A marker value of `0` is not a generation.** It is refused wherever it would
   be written — the marker file and the domain metadata alike — and reported as a
   corrupt marker wherever it is read, with one deliberate exception: the

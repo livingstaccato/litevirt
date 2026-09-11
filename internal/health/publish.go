@@ -87,33 +87,58 @@ func usable(virt DomainEpochSetter) bool {
 // repaired by convergeOwnerEpochMarker, which fires for any confirmed-running VM
 // regardless of the enforcement flag. Both failing means the VM genuinely cannot
 // prove anything, and that is what mark-then-commit exists to refuse.
-func writeBothMarkers(virt DomainEpochSetter, dataDir, name string, epoch int64) (partial error, fatal error) {
+// markerResult is what an attempt to mark a generation produced.
+//
+// A named result rather than the `(partial error, fatal error)` pair it replaces.
+// That signature invited binding the joined DOMAIN+file error to a variable
+// called fileErr and logging it as "file_error", which sent an operator to check
+// a full data volume when the fault was libvirt metadata. Two same-typed returns
+// distinguished only by position and a doc comment is a trap, and it caught the
+// only caller that had to read them.
+type markerResult struct {
+	// skipped: a pre-epoch row has no generation to name, so writing nothing is
+	// correct here and is NOT an unproven publish.
+	skipped bool
+	// domainErr / fileErr are nil when their write succeeded OR was not possible.
+	// attempted says which of those it was.
+	domainErr, fileErr             error
+	domainAttempted, fileAttempted bool
+	// landed: at least one marker now names the generation.
+	landed bool
+}
+
+// unproven reports that the VM ends up able to prove nothing — no marker landed
+// and none was skipped by design. That is what mark-then-commit refuses.
+func (r markerResult) unproven() bool { return !r.skipped && !r.landed }
+
+// failures joins whatever went wrong, for a log line. Nil when both markers
+// landed or the write was skipped.
+func (r markerResult) failures() error { return errors.Join(r.domainErr, r.fileErr) }
+
+func writeBothMarkers(virt DomainEpochSetter, dataDir, name string, epoch int64) markerResult {
 	if epoch < 1 {
-		return nil, nil
+		return markerResult{skipped: true}
 	}
-	var domErr, fileErr error
-	domAttempted, fileAttempted := false, false
+	var res markerResult
 
 	if usable(virt) {
-		domAttempted = true
+		res.domainAttempted = true
 		if err := virt.SetDomainOwnerEpoch(name, epoch, true); err != nil {
-			domErr = fmt.Errorf("owner-epoch domain marker for %q at generation %d: %w", name, epoch, err)
+			res.domainErr = fmt.Errorf("owner-epoch domain marker for %q at generation %d: %w", name, epoch, err)
 		}
 	}
 	// Skipped rather than written to a relative path: readVMMarker treats an
 	// empty dataDir as MarkerMissing, so such a marker is one no reader resolves.
 	if dataDir != "" {
-		fileAttempted = true
+		res.fileAttempted = true
 		if err := WriteVMOwnerEpochMarker(dataDir, name, epoch); err != nil {
-			fileErr = fmt.Errorf("owner-epoch file marker for %q at generation %d: %w", name, epoch, err)
+			res.fileErr = fmt.Errorf("owner-epoch file marker for %q at generation %d: %w", name, epoch, err)
 		}
 	}
 
-	landed := (domAttempted && domErr == nil) || (fileAttempted && fileErr == nil)
-	if !landed && (domAttempted || fileAttempted) {
-		return nil, errors.Join(domErr, fileErr)
-	}
-	return errors.Join(domErr, fileErr), nil
+	res.landed = (res.domainAttempted && res.domainErr == nil) ||
+		(res.fileAttempted && res.fileErr == nil)
+	return res
 }
 
 // PublishVMRunning publishes a NON-MINTING running transition: both markers
@@ -144,15 +169,42 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 	if state != "running" {
 		return commit(ctx)
 	}
-	partial, fatal := writeBothMarkers(virt, dataDir, name, epoch)
-	if fatal != nil {
-		return fatal
+	res := writeBothMarkers(virt, dataDir, name, epoch)
+	if res.skipped {
+		// A pre-epoch row publishes unmarked BY DESIGN, but silently is wrong.
+		// Every routed site upstream of a graduation assumes the graduation
+		// worked: the import path's own comment says "graduate BEFORE publishing
+		// … without this the routed publish is a no-op on the markers", and
+		// assignOwnerEpochAtCreate reports a failed graduation only in its own
+		// log line, with no way for the publish to know. So the publish says it:
+		// this VM is running and unprovable until the backfill graduates it, and
+		// the backfill is off by default.
+		slog.Warn("publish: publishing a running VM that has no ownership generation — the row is "+
+			"pre-epoch, so no marker is written and the runtime cannot be proven until the "+
+			"owner-epoch backfill graduates it (enforcement.owner_epoch is off by default)",
+			"vm", name)
+		return commit(ctx)
 	}
-	if partial != nil {
+	if res.unproven() {
+		// Either both writes failed, or neither was POSSIBLE — a nil libvirt
+		// backend together with an empty dataDir. The second case returned
+		// (nil, nil) before and committed a running row at a positive generation
+		// with no marker and no warning: the exact "proves nothing" state this
+		// ordering exists to refuse, reached by a configuration rather than a
+		// fault, and therefore silent every time.
+		if err := res.failures(); err != nil {
+			return err
+		}
+		return fmt.Errorf("refusing to publish %q running at generation %d: no owner-epoch marker "+
+			"could be written (no usable libvirt backend and no data directory), so the runtime "+
+			"would be unprovable", name, epoch)
+	}
+	if err := res.failures(); err != nil {
 		slog.Warn("publish: one owner-epoch marker did not land before a running commit — "+
 			"publishing on the strength of the other and leaving the gap to convergence, "+
 			"because refusing would wedge this host's rows while its guests run",
-			"vm", name, "epoch", epoch, "error", partial)
+			"vm", name, "epoch", epoch,
+			"domain_error", res.domainErr, "file_error", res.fileErr)
 	}
 	return commit(ctx)
 }
@@ -175,11 +227,34 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 // had actually succeeded. Convergence repairs an unmarked running VM; it cannot
 // reconstruct the durable writes an aborted caller skipped.
 func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name string, commit func(context.Context) error) error {
+	return publishVMRunningMinted(ctx, virt, dataDir, hostName, name,
+		func(ctx context.Context) (*corrosion.VMRecord, error) { return corrosion.GetVM(ctx, db, name) },
+		commit)
+}
+
+// publishVMRunningMinted is PublishVMRunningMinted over an injectable read, for
+// the same reason rowForPublish has that seam: the read-back's RETRY policy is
+// the behaviour under test, and it cannot be exercised through a fault hook on
+// the shared corrosion client.
+func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir, hostName, name string, read func(context.Context) (*corrosion.VMRecord, error), commit func(context.Context) error) error {
 	if err := commit(ctx); err != nil {
 		return err
 	}
-	row, err := corrosion.GetVM(ctx, db, name)
-	if err != nil || row == nil {
+	// RETRIED, with the same policy as the reads that guard the non-minting
+	// commits. This is the one read that decides whether a freshly minted
+	// generation is ever marked, and its failure is deliberately silent (below),
+	// so an unretried single SQLITE_BUSY here dropped the markers for a new
+	// generation with no error reaching anyone.
+	row, err := rowForPublish(ctx, name, read)
+	switch {
+	case errors.Is(err, corrosion.ErrNoRowsAffected):
+		// Told apart from a read fault: collapsing the two logged a deleted row
+		// as a "read-back failure" with error=<nil>, which names no cause at all.
+		slog.Warn("publish: the row was deleted during a minting transition — the commit HAS "+
+			"landed, so there is nothing to undo and nothing left to mark",
+			"vm", name)
+		return nil
+	case err != nil:
 		slog.Warn("publish: owner-epoch read-back failed after a minting transition — the commit "+
 			"HAS landed, so this is reported as an unmarked VM for convergence to repair "+
 			"rather than as a failed transition",
@@ -191,9 +266,10 @@ func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *cor
 			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", hostName)
 		return nil
 	}
-	if fileErr, fatal := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); fileErr != nil || fatal != nil {
+	if res := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); res.failures() != nil || res.unproven() {
 		slog.Warn("publish: markers not written after a minting transition — convergence will repair",
-			"vm", name, "epoch", row.OwnerEpoch, "file_error", fileErr, "error", fatal)
+			"vm", name, "epoch", row.OwnerEpoch,
+			"domain_error", res.domainErr, "file_error", res.fileErr, "unproven", res.unproven())
 	}
 	return nil
 }
@@ -262,7 +338,27 @@ func rowForPublish(ctx context.Context, name string, read func(context.Context) 
 
 // ErrOwnershipMoved reports that the row a publish was about to mark names a
 // different host. Callers treat it as "not mine to publish", not as a fault.
-var ErrOwnershipMoved = errors.New("ownership moved to another host before the publish")
+//
+// corrosion's, not its own: the sentinel has to be visible to ClassifyWriteErr,
+// and health imports corrosion rather than the reverse. Defined here it was
+// invisible to the classifier, so every routed call site charted a routine
+// ownership move as a store fault on the state-write-failure metric.
+var ErrOwnershipMoved = corrosion.ErrOwnershipMoved
+
+// LogPublishRefusal logs a refused routed publish at the level it deserves.
+//
+// An ownership move and a cancelled shutdown are EXPECTED outcomes of a routed
+// publish, not faults: the first is routine on a rebalancing or draining fleet,
+// the second happens on every clean stop. Logged at ERROR they bury the store
+// faults an operator actually has to act on, and this is the level half of the
+// same problem corrosion.ClassifyWriteErr fixes for the metric.
+func LogPublishRefusal(msg, vm string, err error) {
+	if corrosion.Routine(err) {
+		slog.Info(msg+" — declined, not a fault", "vm", vm, "error", err)
+		return
+	}
+	slog.Error(msg, "vm", vm, "error", err)
+}
 
 // PublishRunningVia routes a NON-MINTING transition for a caller that holds its
 // own virt/dataDir/db. A non-running state passes straight through, costing no

@@ -909,7 +909,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			} else if err := r.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 				return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "domain already present")
 			}); err != nil {
-				slog.Error("reconciler: already-present running-state write failed", "vm", vm.Name, "error", err)
+				LogPublishRefusal("reconciler: already-present running-state write failed", vm.Name, err)
 				r.noteStateWriteFail(corrosion.OpVMState, err)
 			}
 			r.clearOnbootPending(vm.Name) // onboot duty discharged
@@ -1201,7 +1201,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	} else if err := r.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
 	}); err != nil {
-		slog.Error("reconciler: post-failover running-state write failed", "vm", vm.Name, "error", err)
+		LogPublishRefusal("reconciler: post-failover running-state write failed", vm.Name, err)
 		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 	r.clearOnbootPending(vm.Name) // onboot duty discharged
@@ -1324,9 +1324,26 @@ func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
 // at epoch 0 is pre-epoch: the sweep never stamps it — deciding when a
 // workload graduates into the marker regime is the backfill's job, and a
 // sweep-stamped zero would be indistinguishable from a real generation.
+//
+// The row must still name THIS host. Its caller confirms only that the local
+// domain is running, which is also true of a domain this host has not yet torn
+// down after losing ownership — so without this check convergence stamped the
+// old runtime with the NEW owner's generation. runtimeSuperseded decides by
+// `row.OwnerEpoch > marker`, so a marker equal to the row reads as current, and
+// the superseded runtime it exists to catch was made to look live. That is the
+// same unsafe direction the publish chokepoint refuses, reached by the repair
+// path rather than by a publish — and refusing to converge is the fail-safe
+// answer: a marker LAGGING the row is exactly what the check should see when
+// ownership has genuinely moved.
 func (r *Reconciler) convergeOwnerEpochMarker(ctx context.Context, name string) {
 	row, err := corrosion.GetVM(ctx, r.db, name)
 	if err != nil || row == nil || row.OwnerEpoch == 0 {
+		return
+	}
+	if row.HostName != r.hostName {
+		slog.Warn("reconciler: not converging the owner-epoch marker for a VM the row says "+
+			"belongs elsewhere — stamping it would make this superseded runtime look current",
+			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", r.hostName)
 		return
 	}
 	// Each marker converges INDEPENDENTLY. A single early-return keyed on the

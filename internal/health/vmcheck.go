@@ -234,8 +234,8 @@ func (v *VMChecker) sweep(ctx context.Context) {
 						slog.Debug("vmcheck: reconcile target row gone; skipping", "vm", vm.Name)
 						continue
 					}
-					slog.Error("vmcheck: reconcile write failed — NOT publishing reconciled event",
-						"vm", vm.Name, "error", werr)
+					LogPublishRefusal("vmcheck: reconcile write failed — NOT publishing reconciled event",
+						vm.Name, werr)
 					v.noteStateWriteFail(corrosion.OpVMState, werr)
 					continue
 				}
@@ -532,7 +532,7 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 		if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 			return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restarted by health checker")
 		}); err != nil {
-			slog.Error("vmcheck: restart state write failed — NOT publishing restarted event", "vm", vm.Name, "error", err)
+			LogPublishRefusal("vmcheck: restart state write failed — NOT publishing restarted event", vm.Name, err)
 			v.noteStateWriteFail(corrosion.OpVMState, err)
 			return
 		}
@@ -788,7 +788,7 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 		return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restart policy: "+decision)
 	}); err != nil {
-		slog.Error("vmcheck: restart-policy state write failed — NOT publishing restart event", "vm", vm.Name, "error", err)
+		LogPublishRefusal("vmcheck: restart-policy state write failed — NOT publishing restart event", vm.Name, err)
 		v.noteStateWriteFail(corrosion.OpVMState, err)
 		return
 	}

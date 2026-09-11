@@ -30,7 +30,7 @@
 //     same function. An insert lands at the vm_owner_epoch column default of 0,
 //     convergence early-returns on zero, and the backfill that would graduate it
 //     is gated behind enforcement.owner_epoch, which is off by default.
-//  5. Every SQL statement in internal/corrosion that writes the vms.state column
+//  5. Every SQL statement in production code that writes the vms.state column
 //     must be registered in the stateWritingStatements inventory below. Rules 1-4
 //     police call sites against hand-maintained maps of writer NAMES, and a map
 //     nobody is forced to update is a guard that decays — UpdateVMHost sat in one
@@ -149,7 +149,6 @@ func main() {
 	dump := flag.Bool("inventory", false,
 		"print the normalized fingerprint of every UNREGISTERED vms.state statement and exit 0")
 	flag.Parse()
-	dumpInventory = *dump
 
 	var violations []violation
 	err := filepath.WalkDir(*root, func(path string, d os.DirEntry, err error) error {
@@ -166,7 +165,7 @@ func main() {
 		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
-		vs, perr := scanFile(path)
+		vs, perr := scanFileOpts(path, *dump)
 		if perr != nil {
 			return perr
 		}
@@ -228,15 +227,22 @@ type fileScan struct {
 	fset       *token.FileSet
 	directives []*directive
 	out        []violation
+	// dump is -inventory: print unregistered fingerprints instead of failing on
+	// them. Per-scan state, not a package global — scanFile is called directly by
+	// 20+ tests in one binary, and a global one of them set and did not restore
+	// would make every later rule-5 assertion pass vacuously.
+	dump bool
 }
 
-func scanFile(path string) ([]violation, error) {
+func scanFile(path string) ([]violation, error) { return scanFileOpts(path, false) }
+
+func scanFileOpts(path string, dump bool) ([]violation, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	s := &fileScan{path: path, fset: fset}
+	s := &fileScan{path: path, fset: fset, dump: dump}
 	// A directive is honored on any line the statement spans (the trailing form
 	// writecheck uses) AND on the line immediately after a comment block that
 	// carries it — these reasons run to several lines, and a block sitting
@@ -274,11 +280,12 @@ func scanFile(path string) ([]violation, error) {
 		}
 		return true
 	})
-	// Rule 5 is corrosion-only: it inventories the SQL the other rules'''s maps
-	// name writers for, and no other package holds a vms.state statement.
-	if inCorrosionPackage(path) {
-		s.checkStateStatements(file)
-	}
+	// Rule 5 runs on EVERY production file. It was gated on internal/corrosion
+	// under a comment asserting that no other package holds a vms.state
+	// statement — exactly the sort of unenforced assumption rule 5 was written
+	// to replace. The tool already walks every file, so the gate bought nothing
+	// and let a statement added anywhere else escape the inventory entirely.
+	s.checkStateStatements(file)
 
 	// A directive that suppressed nothing is itself a violation.
 	for _, d := range s.directives {
@@ -395,29 +402,36 @@ func (s *fileScan) checkFunc(body *ast.BlockStmt) {
 	})
 }
 
-// graduatedInScope reports whether the INNERMOST block enclosing the insert
-// graduates it — searching that block and anything nested inside it, but not
+// graduatedInScope reports whether the INNERMOST scope enclosing the insert
+// graduates it — searching that scope and anything nested inside it, but not
 // its parents.
 //
 // Innermost, not function-wide: promote.go's insert sits inside `if renamed`
 // alongside its graduation, so a sibling `else` that inserts without one must
 // not ride on it. Nested still counts, because templates.go inserts in the
 // function body and graduates from an `if state == "running"` block inside it.
+//
+// A scope is a *ast.BlockStmt OR a switch/select case. A case clause holds its
+// statements directly and is NOT a BlockStmt, so searching only blocks fell
+// through every case to the enclosing function body — and one case's graduation
+// then covered every sibling case, which is the function-wide hole this function
+// was written to close, surviving in the one construct branchy code uses most.
 func graduatedInScope(root ast.Node, insert ast.Node, fset *token.FileSet) bool {
 	line := fset.Position(insert.Pos()).Line
-	var best *ast.BlockStmt
+	var best ast.Node
 	bestSpan := 1 << 30
 	ast.Inspect(root, func(n ast.Node) bool {
-		blk, ok := n.(*ast.BlockStmt)
-		if !ok {
+		switch n.(type) {
+		case *ast.BlockStmt, *ast.CaseClause, *ast.CommClause:
+		default:
 			return true
 		}
-		start, end := fset.Position(blk.Pos()).Line, fset.Position(blk.End()).Line
+		start, end := fset.Position(n.Pos()).Line, fset.Position(n.End()).Line
 		if line < start || line > end {
 			return true
 		}
 		if span := end - start; span < bestSpan {
-			best, bestSpan = blk, span
+			best, bestSpan = n, span
 		}
 		return true
 	})
@@ -427,7 +441,7 @@ func graduatedInScope(root ast.Node, insert ast.Node, fset *token.FileSet) bool 
 	return callsGraduation(best)
 }
 
-// Rule 5: every SQL statement in internal/corrosion that writes the vms.state
+// Rule 5: every SQL statement in production code that writes the vms.state
 // column must be registered here.
 //
 // Rules 1-4 police CALL SITES against hand-maintained maps of writer names, and
@@ -452,55 +466,81 @@ func graduatedInScope(root ast.Node, insert ast.Node, fset *token.FileSet) bool 
 // UpdateVMStateStrict differ only in their Go-side row-count check, and
 // UpdateVMHost and CommitMigrationOwnership execute character-identical SQL.
 type stateStatement struct {
-	sql   string
-	owner string
+	sql string
+	// writers names the Go functions that execute this statement. CHECKED, not
+	// prose: a test asserts every name here appears in nonMinting, minting or
+	// clientMethods, so the inventory cannot claim an ordering for a writer the
+	// call-site rules do not police. An unchecked owner string left the inventory
+	// describing a connection to those maps that did not exist.
+	//
+	// Empty only for a statement whose state is a hardcoded non-running literal,
+	// or for a frozen receive-only shape — note says which.
+	writers []string
+	note    string
 }
 
 var stateWritingStatements = []stateStatement{
-	{`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
-		"UpdateVMState and UpdateVMStateStrict — nonMinting, state at arg 3"},
-	{`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
-		"UpdateVMStateAtEpoch — nonMinting, state at arg 3"},
-	{`UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
-		"UpdateVMHost (nonMinting, state at arg 4) and CommitMigrationOwnership " +
-			"(nonMinting, state at arg 5) — identical SQL, different guards in Go"},
-	{`UPDATE vms
+	{
+		sql:     `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
+		writers: []string{"UpdateVMState", "UpdateVMStateStrict"},
+		note:    "nonMinting, state at arg 3; they differ only in their Go-side row-count check",
+	},
+	{
+		sql:     `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
+		writers: []string{"UpdateVMStateAtEpoch"},
+		note:    "nonMinting, state at arg 3",
+	},
+	{
+		sql:     `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
+		writers: []string{"UpdateVMHost", "CommitMigrationOwnership"},
+		note:    "both nonMinting (state at arg 4 and arg 5) - identical SQL, different guards in Go",
+	},
+	{
+		sql: `UPDATE vms
 	  SET host_name = ?, state = ?, state_detail = '',
 	      vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
 	  WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
-		"TransferVMOwner and TransferVMOwnerFresh — MINTING (it advances the " +
-			"generation in the same statement), state at arg 4"},
-	{`UPDATE vms SET state = 'running', pending_action_id = '',
+		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh"},
+		note:    "MINTING: the statement advances the generation, so the correct marker value does not exist until it commits",
+	},
+	{
+		sql: `UPDATE vms SET state = 'running', pending_action_id = '',
 	        vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
 	        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`,
-		"CompleteVMStartProof — MINTING, and alwaysRunning: no state argument " +
-			"can exempt it"},
-	{`INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+		writers: []string{"CompleteVMStartProof"},
+		note:    "MINTING, and alwaysRunning - no state argument can exempt it",
+	},
+	{
+		sql: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
 			cpu_actual, mem_actual, project, is_template, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		"InsertVM and InsertVMWithHardware — stateInVMRecord, so rule 4 polices " +
-			"the record's State field. Also HistoricalShapes' insert_vm_pre_authority, " +
-			"which is receive-only and writes nothing"},
-	{`UPDATE vms SET state = 'running', state_detail = ?,
+		writers: []string{"InsertVM", "InsertVMWithHardware"},
+		note:    "stateInVMRecord, so rule 4 polices the record's State field. HistoricalShapes' insert_vm_pre_authority is the same text: receive-only, writes nothing",
+	},
+	{
+		sql: `UPDATE vms SET state = 'running', state_detail = ?,
 			cpu_actual = ?, mem_actual = ?,
 			hardware_adoption_state = 'adopted', hardware_adoption_error = NULL,
 			active_operation_id = '', updated_at = ?
 		 WHERE name = ? AND state = 'creating' AND active_operation_id = ?
 		   AND vm_owner_epoch = ? AND spec_generation = ? AND deleted_at IS NULL`,
-		"CommitVMCreateOperation — clientMethods, stateInVMRecord; the create " +
-			"path graduates via assignOwnerEpochAtCreate"},
-
-	// The rest publish a state this statement HARDCODES to something other than
-	// "running", so no call site of theirs can publish a runtime. They are
-	// registered rather than skipped: the point of the inventory is that a later
-	// edit turning one of these literals into a parameter fails the build.
-	{`UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
+		writers: []string{"CommitVMCreateOperation"},
+		note:    "clientMethods, stateInVMRecord; the create path graduates via assignOwnerEpochAtCreate",
+	},
+	{
+		sql: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
 	        WHERE name = ? AND deleted_at IS NULL`,
-		"WriteVMRescheduleProof — literal state='pending', never a runtime"},
-	{`UPDATE vms SET state = 'error', state_detail = ?, pending_action_id = '', updated_at = ?
+		writers: nil,
+		note:    "WriteVMRescheduleProof - literal state='pending', never a runtime",
+	},
+	{
+		sql: `UPDATE vms SET state = 'error', state_detail = ?, pending_action_id = '', updated_at = ?
 	       WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`,
-		"FailActionProof — literal state='error', never a runtime"},
-	{`INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+		writers: nil,
+		note:    "FailActionProof - literal state='error', never a runtime",
+	},
+	{
+		sql: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
 				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
 				spec_generation, active_operation_id, created_at, updated_at,
 				deleted_at, pending_action_id, hardware_adoption_state,
@@ -524,26 +564,25 @@ var stateWritingStatements = []stateStatement{
 			 WHERE vms.deleted_at IS NOT NULL
 			   AND excluded.vm_owner_epoch > vms.vm_owner_epoch
 			   AND excluded.spec_generation > vms.spec_generation`,
-		"vmCreateBeginSQL — literal state='creating'; the conflict arm resurrects " +
-			"a tombstone at that same state"},
-	{`UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
+		writers: nil,
+		note:    "vmCreateBeginSQL - literal state='creating'; the conflict arm resurrects a tombstone at that same state",
+	},
+	{
+		sql: `UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
 	        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`,
-		"HistoricalShapes' complete_vm_start_pre_epoch_v47 — a frozen " +
-			"RECEIVE-ONLY shape for the support horizon; no Go writer emits it"},
+		writers: nil,
+		note:    "HistoricalShapes' complete_vm_start_pre_epoch_v47 - a frozen RECEIVE-ONLY shape for the support horizon; no Go writer emits it",
+	},
 }
 
 // stateInventory is stateWritingStatements keyed by normalized text.
 var stateInventory = func() map[string]string {
 	m := make(map[string]string, len(stateWritingStatements))
 	for _, st := range stateWritingStatements {
-		m[normalizeSQL(st.sql)] = st.owner
+		m[normalizeSQL(st.sql)] = st.note
 	}
 	return m
 }()
-
-// dumpInventory is set by -inventory: print unregistered fingerprints instead of
-// failing on them, so adding a statement does not mean hand-normalizing its SQL.
-var dumpInventory bool
 
 var insertVMsRe = regexp.MustCompile(`^insert into vms *\(([^)]*)\)`)
 
@@ -554,7 +593,7 @@ var insertVMsRe = regexp.MustCompile(`^insert into vms *\(([^)]*)\)`)
 // matches state_detail, hardware_adoption_state and a WHERE clause's `state = ?`
 // as readily as the column itself; equality on the split target cannot.
 func writesVMState(sql string) bool {
-	if rest, ok := cutPrefix(sql, "update vms set "); ok {
+	if rest, ok := strings.CutPrefix(sql, "update vms set "); ok {
 		if where := strings.Index(rest, " where "); where >= 0 {
 			rest = rest[:where]
 		}
@@ -581,11 +620,34 @@ func assignsState(setClause string) bool {
 	return false
 }
 
-func cutPrefix(s, prefix string) (string, bool) {
-	if !strings.HasPrefix(s, prefix) {
-		return s, false
+// constStringExpr returns the text of a string literal, INCLUDING one assembled
+// from `"a" + "b"` concatenation.
+//
+// Scanning one *ast.BasicLit at a time missed any statement split across source
+// lines with `+`, which is the ordinary way to keep a long SQL string readable —
+// neither fragment carries the `update vms set` prefix writesVMState needs, so a
+// new state writer escaped the inventory by being formatted nicely. Only a
+// `+`-tree of string literals is folded; a literal concatenated with a variable
+// is not constant SQL and the shape guards refuse it elsewhere.
+func constStringExpr(n ast.Node) (string, bool) {
+	switch e := n.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		return strings.Trim(e.Value, "`\""), true
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		l, lok := constStringExpr(e.X)
+		r, rok := constStringExpr(e.Y)
+		if !lok || !rok {
+			return "", false
+		}
+		return l + r, true
 	}
-	return s[len(prefix):], true
+	return "", false
 }
 
 // normalizeSQL collapses whitespace and lowercases, so reflowing a statement
@@ -597,36 +659,39 @@ func normalizeSQL(s string) string {
 // checkStateStatements walks a corrosion file for unregistered state writers.
 func (s *fileScan) checkStateStatements(file *ast.File) {
 	ast.Inspect(file, func(n ast.Node) bool {
-		bl, ok := n.(*ast.BasicLit)
-		if !ok || bl.Kind != token.STRING {
+		text, ok := constStringExpr(n)
+		if !ok {
 			return true
 		}
-		sql := normalizeSQL(strings.Trim(bl.Value, "`\""))
+		// Do NOT descend into a folded concatenation. Its fragments are not
+		// statements, and a leading `UPDATE vms SET state = ?,` fragment matches
+		// the SET-clause test on its own — so a correctly registered statement
+		// split across two lines was reported unregistered by its own first half.
+		descend := false
+		sql := normalizeSQL(text)
 		if !writesVMState(sql) {
-			return true
+			return descend
 		}
 		if _, known := stateInventory[sql]; known {
-			return true
+			return descend
 		}
-		if dumpInventory {
-			// The fingerprint, ready to paste. A maintainer adding a statement
-			// should not have to reimplement normalizeSQL by hand to satisfy the
-			// guard that just failed on them.
-			fmt.Printf("\t%q: \\\n\t\t\"<writer>, <how it is policed>\",\n", sql)
-			return true
+		if s.dump {
+			// A pasteable stateWritingStatements entry, carrying the statement in
+			// its SOURCE form — the inventory's own rule, and the only form that
+			// stays legible as SQL. It printed map-literal syntax with a stray
+			// backslash for a SLICE inventory, so the output the failure message
+			// tells a maintainer to paste did not compile.
+			fmt.Printf("\t{\n\t\tsql:     `%s`,\n\t\twriters: []string{\"<the Go writers>\"},\n"+
+				"\t\tnote:    \"<which ordering, and why>\",\n\t},\n", text)
+			return descend
 		}
-		s.report(bl, "this statement writes the vms.state column but is not registered in "+
+		s.report(n, "this statement writes the vms.state column but is not registered in "+
 			"runningcheck's stateWritingStatements inventory. A writer nobody registered is a "+
 			"writer rules 1-4 do not police: add the statement, and add its Go writer to "+
 			"nonMinting, minting or clientMethods (or record there why it can never publish "+
 			"a running VM)")
-		return true
+		return descend
 	})
-}
-
-// inCorrosionPackage reports whether path is a file of internal/corrosion.
-func inCorrosionPackage(path string) bool {
-	return filepath.Base(filepath.Dir(path)) == "corrosion"
 }
 
 func hasKey(m map[string]int, k string) bool { _, ok := m[k]; return ok }
@@ -922,7 +987,7 @@ func exprText(e ast.Expr) string {
 	return buf.String()
 }
 
-func callsGraduation(body *ast.BlockStmt) bool {
+func callsGraduation(body ast.Node) bool {
 	found := false
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)

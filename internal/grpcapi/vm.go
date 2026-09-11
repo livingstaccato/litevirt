@@ -1147,6 +1147,9 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 					// VM crashed or was stopped externally — trust libvirt. Best-effort
 					// drift heal in a read path; a failed write is re-healed next list.
 					state = liveState
+					//runningcheck:allow provably not running — this is the
+					// `vm.State == "running" && liveState == "stopped"` case, so liveState
+					// is "stopped" here. The guard cannot see through the switch.
 					if err := corrosion.UpdateVMState(ctx, s.db, vm.Name, liveState, ""); err != nil {
 						s.noteStateWriteFail(corrosion.OpVMState, err)
 					}

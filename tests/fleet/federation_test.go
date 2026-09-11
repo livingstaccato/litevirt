@@ -108,11 +108,12 @@ func TestFleet_FederationAndAnycast(t *testing.T) {
 	// package looks up service_endpoints by exact service_name; the
 	// trailing-dot from miekg/dns gets stripped in lookupService.
 	dnsPort := freeUDPPort(t)
-	srv := litedns.NewServer("litevirt.local", dnsPort, ny1.DB)
+	const dnsZone = "litevirt.local"
+	srv := litedns.NewServer(dnsZone, dnsPort, ny1.DB)
 	dnsCtx, cancelDNS := context.WithCancel(ctx)
 	defer cancelDNS()
 	go srv.Start(dnsCtx)
-	if err := waitUDP("127.0.0.1", dnsPort, "litevirt.local", 1*time.Second); err != nil {
+	if err := waitUDP("127.0.0.1", dnsPort, dnsZone, 1*time.Second); err != nil {
 		t.Fatalf("dns server didn't start: %v", err)
 	}
 
@@ -194,21 +195,28 @@ func freeUDPPort(t *testing.T) int {
 	return port
 }
 
-// waitUDP polls until the litedns server is answering on the UDP port. The
-// server starts inside a goroutine, so the test races the listener without this.
+// waitUDP polls until something is listening on the UDP port. The
+// litedns server starts inside a goroutine so the test races the
+// listener without this.
 //
-// The probe name must be INSIDE zone. litedns registers two handlers — the zone
-// on handleLocal and "." on handleForward — and handleForward proxies to a real
-// upstream resolver with a 3s timeout. A probe for a name outside the zone
-// therefore could not succeed under this function's own budget even with working
-// outbound DNS, and could never succeed without it: the probe took the forward
-// path, waited on the network, and timed out while the server sat there ready.
-// handleLocal always writes a reply (NXDOMAIN for a name it does not hold),
-// which is all a readiness probe needs, and it touches nothing but the local DB.
+// The probe MUST name something inside `zone`. It used to ask for the
+// root-level name "probe.", which the server's mux routes to handleForward —
+// so readiness depended on a round trip to whatever resolvConfUpstream()
+// picked. That function deliberately skips loopback nameservers, so on any
+// host whose /etc/resolv.conf lists only a stub resolver (systemd-resolved,
+// i.e. default Ubuntu/Fedora/Debian) it falls through to 8.8.8.8, and a
+// public NXDOMAIN for a nonexistent TLD measures ~215ms against the 200ms
+// budget below. The probe then failed every attempt inside its 1s deadline
+// and the test reported "dns server didn't start" while the server was up
+// and serving. Offline it can never pass at all: forwardTimeout is 3s, so
+// the SERVFAIL that would satisfy the probe is written long after the whole
+// deadline has expired.
+//
+// An in-zone name is answered by handleLocal straight from the DB, which is
+// both instant and the thing readiness actually needs to establish.
 func waitUDP(host string, port int, zone string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	addr := net.JoinHostPort(host, fmt.Sprint(port))
-	probe := "readiness-probe." + dns.Fqdn(zone)
 	for time.Now().Before(deadline) {
 		c, err := net.DialTimeout("udp", addr, 100*time.Millisecond)
 		if err == nil {
@@ -216,7 +224,7 @@ func waitUDP(host string, port int, zone string, timeout time.Duration) error {
 			// UDP "dial" succeeds even when nothing listens; send a
 			// tiny query and look for a response.
 			m := new(dns.Msg)
-			m.SetQuestion(probe, dns.TypeA)
+			m.SetQuestion(dns.Fqdn("probe."+zone), dns.TypeA)
 			cl := &dns.Client{Timeout: 200 * time.Millisecond}
 			if _, _, derr := cl.Exchange(m, addr); derr == nil {
 				return nil
@@ -224,5 +232,5 @@ func waitUDP(host string, port int, zone string, timeout time.Duration) error {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	return fmt.Errorf("udp probe timeout %s (probe %s)", addr, probe)
+	return fmt.Errorf("udp probe timeout %s", addr)
 }

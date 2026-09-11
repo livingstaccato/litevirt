@@ -150,28 +150,7 @@ func main() {
 		"print the normalized fingerprint of every UNREGISTERED vms.state statement and exit 0")
 	flag.Parse()
 
-	var violations []violation
-	err := filepath.WalkDir(*root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			switch d.Name() {
-			case "vendor", ".git", "gen":
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
-			return nil
-		}
-		vs, perr := scanFileOpts(path, *dump)
-		if perr != nil {
-			return perr
-		}
-		violations = append(violations, vs...)
-		return nil
-	})
+	violations, err := scanTree(*root, *dump)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "runningcheck: %v\n", err)
 		os.Exit(2)
@@ -203,6 +182,44 @@ func main() {
 			"If the site genuinely cannot be routed — an ownership handoff marks the host\n"+
 			"that is giving the VM away — add a trailing `//runningcheck:allow <reason>`.\n")
 	os.Exit(1)
+}
+
+// scanTree walks root for production .go files and returns every violation.
+//
+// Extracted from main so a test can exercise THIS walk. The skip list used to
+// live inline, and the test that covered it carried its own copy — which would
+// have passed while main() regressed, since the two lists were never compared.
+func scanTree(root string, dump bool) ([]violation, error) {
+	var violations []violation
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			// .worktrees holds full checkouts of OTHER branches. They are
+			// gitignored and not part of this tree, but the walk read their .go
+			// files anyway: on a machine with six worktrees `make ci-guards`
+			// reported 161 violations, every one a call site on another branch.
+			// CI never saw it, because Actions checks out a clean tree — so the
+			// guard was broken for exactly the local command developers are
+			// told to run.
+			case "vendor", ".git", "gen", ".worktrees":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		vs, perr := scanFileOpts(path, dump)
+		if perr != nil {
+			return perr
+		}
+		violations = append(violations, vs...)
+		return nil
+	})
+	return violations, err
 }
 
 // fileScan carries the per-file state the rules share.

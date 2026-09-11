@@ -750,3 +750,41 @@ func TestAHardcodedRunningStatementNamesAMintingWriter(t *testing.T) {
 		}
 	}
 }
+
+// TestWorktreesAreNotScanned.
+//
+// .worktrees holds full checkouts of other branches: gitignored, not part of
+// this tree, and full of .go files the walk happily read. On a machine with six
+// worktrees `make ci-guards` reported 161 violations, all of them call sites on
+// other branches. CI never caught it because Actions checks out a clean tree, so
+// the guard was broken for precisely the local command developers are told to
+// run.
+func TestWorktreesAreNotScanned(t *testing.T) {
+	root := t.TempDir()
+
+	// An unrouted write in the real tree: must be reported.
+	if err := os.WriteFile(filepath.Join(root, "real.go"), []byte(
+		"package p\nfunc f() {\n\tcorrosion.UpdateVMState(ctx, db, \"vm1\", state, \"d\")\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The same write inside a worktree: must be ignored.
+	wt := filepath.Join(root, ".worktrees", "other-branch", "internal", "health")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wt, "other.go"), []byte(
+		"package p\nfunc g() {\n\tcorrosion.UpdateVMState(ctx, db, \"vm2\", state, \"d\")\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := scanTree(root, false)
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d violation(s), want 1 — the worktree copy was scanned", len(got))
+	}
+	if strings.Contains(got[0].file, ".worktrees") {
+		t.Errorf("the reported violation is inside .worktrees: %s", got[0].file)
+	}
+}

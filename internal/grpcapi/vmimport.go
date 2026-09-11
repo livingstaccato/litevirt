@@ -325,6 +325,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "imported but failed to start: %v", err)
 		}
+		// Graduate BEFORE publishing. The import inserts at "stopped" with
+		// vm_owner_epoch at the column default of 0, and the chokepoint writes
+		// nothing for a pre-epoch row (a marker against an epoch-0 row is the one
+		// mismatch convergence never repairs). Without this the routed publish
+		// below is a no-op on the markers, and an imported-and-started VM is
+		// exactly as unprovable as it was before — for as long as the
+		// default-off backfill stays off.
+		s.assignOwnerEpochAtCreate(ctx, name)
 		if err := s.publishRunning(ctx, name, "running", func(ctx context.Context) error {
 			return corrosion.UpdateVMState(ctx, s.db, name, "running", "imported+started")
 		}); err != nil {

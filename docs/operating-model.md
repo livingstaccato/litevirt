@@ -98,8 +98,16 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
      transition can land in that window. A marker that lags the row is safe —
      it is exactly what the superseded-runtime check should see when ownership
      has genuinely moved. The unsafe direction, stamping a runtime with the NEXT
-     owner's generation, is refused: a minting publish re-checks that the row
-     still names this host before writing anything.
+     owner's generation, is refused: BOTH orderings re-check that the row still
+     names this host before writing anything, and the non-minting one refuses
+     the whole transition rather than publish a row another host owns.
+  3. *A host that can write neither marker.* One marker is enough to publish, so
+     a failed libvirt metadata write falls back to the durable file marker and
+     vice versa. Losing BOTH refuses the transition — the invariant working as
+     intended — but a host whose data volume is full or read-only AND whose
+     libvirt refuses metadata will leave its rows behind while its guests run.
+     That refusal is counted on the state-write-failure metric rather than left
+     to logs.
 - **A marker value of `0` is not a generation.** It is refused wherever it would
   be written — the marker file and the domain metadata alike — and reported as a
   corrupt marker wherever it is read, with one deliberate exception: the

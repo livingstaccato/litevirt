@@ -186,3 +186,128 @@ func f() {
 	corrosion.UpdateVMState(ctx, db, "vm1", "running", "d")
 }`, "a directive block above the statement")
 }
+
+// TestUpdateVMHostRunningIsFlagged: UpdateVMHost(ctx, c, name, host, state)
+// takes its state at index 4 and writes `UPDATE vms SET host_name = ?, state = ?`.
+// It was registered with index -1 under a comment claiming the state travelled
+// inside a VMRecord, which made it unconditionally exempt — a hole in the guard
+// exactly where a same-host re-point would publish running unmarked.
+func TestUpdateVMHostRunningIsFlagged(t *testing.T) {
+	wantOne(t, `
+func f() {
+	corrosion.UpdateVMHost(ctx, db, "vm1", "host-a", "running")
+}`, "not routed", "a bare UpdateVMHost running write")
+}
+
+// TestUpdateVMHostStoppedIsExempt: the literal exemption does the work now that
+// the index is real.
+func TestUpdateVMHostStoppedIsExempt(t *testing.T) {
+	wantNone(t, `
+func f() {
+	corrosion.UpdateVMHost(ctx, db, "vm1", "host-a", "stopped")
+}`, "a stopped UpdateVMHost")
+}
+
+// TestClientMethodWriterIsSeen: a writer reached as a METHOD on the corrosion
+// client is invisible to a selector test keyed on the package identifier.
+// CommitVMCreateOperation's statement is a literal UPDATE vms SET state='running'.
+func TestClientMethodWriterIsSeen(t *testing.T) {
+	wantOne(t, `
+func f() {
+	s.db.CommitVMCreateOperation(ctx, "op1", 1, corrosion.VMRecord{
+		Name: "vm1", State: "running",
+	}, nil, nil, nil, nil)
+}`, "born at", "a client-method born-running commit")
+}
+
+// TestDisjunctiveConditionDoesNotProveNonRunning is the bypass an OR-as-AND
+// reading let through: `state != "running" || force` is entered with state ==
+// "running" whenever force is true.
+func TestDisjunctiveConditionDoesNotProveNonRunning(t *testing.T) {
+	wantOne(t, `
+func f() error {
+	commit := func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", state, "d")
+	}
+	if state != "running" || force {
+		return commit(ctx)
+	}
+	return s.publishRunning(ctx, name, state, commit)
+}`, "invoked directly", "a disjunctive guard")
+}
+
+// TestConjunctiveConditionStillProvesNonRunning: either conjunct proving it is
+// enough, because both must hold to enter the branch.
+func TestConjunctiveConditionStillProvesNonRunning(t *testing.T) {
+	wantNone(t, `
+func f() error {
+	commit := func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", state, "d")
+	}
+	if state != "running" && ready {
+		return commit(ctx)
+	}
+	return s.publishRunning(ctx, name, state, commit)
+}`, "a conjunctive guard")
+}
+
+// TestStaleAllowDirectiveIsFlagged: a directive whose statement was deleted or
+// moved silently exempts whatever code next occupies those lines. That is the
+// self-defeating allowlist this guard exists to rule out, in the other
+// direction.
+func TestStaleAllowDirectiveIsFlagged(t *testing.T) {
+	wantOne(t, `
+func f() {
+	//runningcheck:allow ownership handoff — but the call it covered is gone
+	x := 1
+	_ = x
+}`, "suppressed nothing", "an orphaned directive")
+}
+
+// TestSecondBornRunningInsertNeedsItsOwnGraduation: the graduation evidence is
+// block-scoped, because the routed code already depends on branch placement —
+// promote.go graduates inside `if renamed`, templates.go inside
+// `if state == "running"`. A function-wide check let a second insert on another
+// branch ride on the first branch's call.
+func TestSecondBornRunningInsertNeedsItsOwnGraduation(t *testing.T) {
+	wantOne(t, `
+func f() {
+	if renamed {
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "a", State: "running"}, nil, nil)
+		s.assignOwnerEpochAtCreate(ctx, "a")
+	} else {
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "b", State: "running"}, nil, nil)
+	}
+}`, "same block", "a second born-running insert with no graduation of its own")
+}
+
+// TestPerBranchGraduationIsAccepted: both branches graduating is the shape the
+// routed code actually has.
+func TestPerBranchGraduationIsAccepted(t *testing.T) {
+	wantNone(t, `
+func f() {
+	if renamed {
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "a", State: "running"}, nil, nil)
+		s.assignOwnerEpochAtCreate(ctx, "a")
+	} else {
+		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "b", State: "running"}, nil, nil)
+		s.assignOwnerEpochAtCreate(ctx, "b")
+	}
+}`, "per-branch graduation")
+}
+
+// TestHelperArgumentsAreNotTreatedAsClosures: registering every identifier
+// argument put ctx, name and state into the routed-variable set, so an
+// unrelated local of one of those names was reported as the routed closure
+// invoked directly.
+func TestHelperArgumentsAreNotTreatedAsClosures(t *testing.T) {
+	wantNone(t, `
+func f() error {
+	if err := s.publishRunning(ctx, name, state, func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", state, "d")
+	}); err != nil {
+		return err
+	}
+	return name(ctx)
+}`, "an unrelated call sharing an argument name")
+}

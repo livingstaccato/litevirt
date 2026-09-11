@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -84,25 +86,32 @@ func TestPersistVMState_AStopIsNotGatedOnMarkers(t *testing.T) {
 	}
 }
 
-// TestPersistVMState_AMarkerFailureDoesNotCommitRunning: before the commit,
-// refusing costs only the caller's retry, so the evidence lands or nothing does.
-func TestPersistVMState_AMarkerFailureDoesNotCommitRunning(t *testing.T) {
+// TestPersistVMState_NoMarkerAtAllDoesNotCommitRunning: mark-then-commit's
+// refusal, at the RPC layer. Both markers must fail — either alone is enough to
+// prove the generation.
+func TestPersistVMState_NoMarkerAtAllDoesNotCommitRunning(t *testing.T) {
 	s, fake := publishServer(t)
 	ctx := adminCtx()
 	if err := corrosion.UpdateVMState(ctx, s.db, "vm1", "stopped", ""); err != nil {
 		t.Fatal(err)
 	}
+	// Fail the domain marker, and make the marker tree uncreatable so the file
+	// marker fails too.
 	s.virt = &stateObservingVirt{Fake: fake, ctx: ctx, db: s.db, failWith: errors.New("libvirt is down")}
+	s.dataDir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(s.dataDir, "vms"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.persistVMState(ctx, "vm1", "running", "test", corrosion.OpVMState); err == nil {
-		t.Error("a marker failure must be returned, not swallowed")
+		t.Error("losing both markers must be returned, not swallowed")
 	}
 	row, err := corrosion.GetVM(ctx, s.db, "vm1")
 	if err != nil || row == nil {
 		t.Fatalf("GetVM = (%v, %v), want a row", row, err)
 	}
 	if row.State == "running" {
-		t.Error("the row says running with no marker written; that publishes an unprovable VM")
+		t.Error("the row says running with no marker at all; that publishes an unprovable VM")
 	}
 }
 

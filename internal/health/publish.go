@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -64,24 +65,55 @@ func usable(virt DomainEpochSetter) bool {
 //
 // Only ever called for a RUNNING publish, which is why the domain write takes
 // running=true: LIVE|CONFIG needs a live domain, and LIVE against an inactive
-// one is a libvirt error. PublishVMRunning's state gate is what guarantees that.
-func writeBothMarkers(virt DomainEpochSetter, dataDir, name string, epoch int64) error {
+// one is a libvirt error. PublishVMRunning's state gate guarantees that.
+//
+// Both writes are ALWAYS attempted, and the commit is refused only when the VM
+// ends up with no marker at all. Neither half is a precondition for the other:
+//
+//   - Returning early on the domain write would skip the FILE marker, which is
+//     the durable one — undefining a domain destroys its metadata with it, so a
+//     metadata-only marker is unreadable exactly when it is needed. The
+//     hand-rolled write-through this replaced warned on the domain write and
+//     wrote the file marker anyway; short-circuiting would have left a VM with
+//     NEITHER marker where the old code left the one that survives.
+//   - Making either one individually fatal wedges the host. The file marker is a
+//     real filesystem write — MkdirAll, CreateTemp, rename — so a full or
+//     read-only data volume fails it PERSISTENTLY, and a refused publish leaves
+//     the row "stopped" while the guest runs, with the self-heal that would fix
+//     it routed through this same chokepoint and refusing for the same reason.
+//     Unrecoverable, and visible only as one log line per attempt.
+//
+// So: one marker is enough to publish. A single failure is warned about and
+// repaired by convergeOwnerEpochMarker, which fires for any confirmed-running VM
+// regardless of the enforcement flag. Both failing means the VM genuinely cannot
+// prove anything, and that is what mark-then-commit exists to refuse.
+func writeBothMarkers(virt DomainEpochSetter, dataDir, name string, epoch int64) (partial error, fatal error) {
 	if epoch < 1 {
-		return nil
+		return nil, nil
 	}
+	var domErr, fileErr error
+	domAttempted, fileAttempted := false, false
+
 	if usable(virt) {
+		domAttempted = true
 		if err := virt.SetDomainOwnerEpoch(name, epoch, true); err != nil {
-			return fmt.Errorf("owner-epoch domain marker for %q at generation %d: %w", name, epoch, err)
+			domErr = fmt.Errorf("owner-epoch domain marker for %q at generation %d: %w", name, epoch, err)
 		}
 	}
 	// Skipped rather than written to a relative path: readVMMarker treats an
 	// empty dataDir as MarkerMissing, so such a marker is one no reader resolves.
 	if dataDir != "" {
+		fileAttempted = true
 		if err := WriteVMOwnerEpochMarker(dataDir, name, epoch); err != nil {
-			return fmt.Errorf("owner-epoch file marker for %q at generation %d: %w", name, epoch, err)
+			fileErr = fmt.Errorf("owner-epoch file marker for %q at generation %d: %w", name, epoch, err)
 		}
 	}
-	return nil
+
+	landed := (domAttempted && domErr == nil) || (fileAttempted && fileErr == nil)
+	if !landed && (domAttempted || fileAttempted) {
+		return nil, errors.Join(domErr, fileErr)
+	}
+	return errors.Join(domErr, fileErr), nil
 }
 
 // PublishVMRunning publishes a NON-MINTING running transition: both markers
@@ -112,8 +144,15 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 	if state != "running" {
 		return commit(ctx)
 	}
-	if err := writeBothMarkers(virt, dataDir, name, epoch); err != nil {
-		return err
+	partial, fatal := writeBothMarkers(virt, dataDir, name, epoch)
+	if fatal != nil {
+		return fatal
+	}
+	if partial != nil {
+		slog.Warn("publish: one owner-epoch marker did not land before a running commit — "+
+			"publishing on the strength of the other and leaving the gap to convergence, "+
+			"because refusing would wedge this host's rows while its guests run",
+			"vm", name, "epoch", epoch, "error", partial)
 	}
 	return commit(ctx)
 }
@@ -128,43 +167,39 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 // whose call site fires for any confirmed-running VM regardless of the
 // enforcement flag.
 //
-// A failed READ-BACK is returned, because then nothing is known about which
-// generation to repair toward, and a caller that cannot learn it should surface
-// that rather than leave a running row silently unmarked.
-//
-// hostName is this host, and the read-back row must still name it. A second
-// ownership transition landing between our commit and our read gives us the
-// NEXT owner's generation, and stamping our own runtime with it would make a
-// superseded runtime look current — the one direction of this race that is not
-// fail-safe. (The other direction, a marker lagging the row, is exactly what
-// runtimeSuperseded should see when ownership has genuinely moved.) When the
-// row has moved on we write nothing: the new owner's convergence marks its own
-// runtime, and ours is no longer the one the generation describes.
+// A failed READ-BACK is likewise NOT returned. It happens AFTER the commit has
+// landed, so there is nothing to undo and nothing the caller can retry — and
+// three of the four call sites treat any error as "the write did not land" and
+// abort the rest of their sequence. That cost a promotion its disk re-point, and
+// repair-owner and owner-assert their audit records, for ownership changes that
+// had actually succeeded. Convergence repairs an unmarked running VM; it cannot
+// reconstruct the durable writes an aborted caller skipped.
 func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name string, commit func(context.Context) error) error {
 	if err := commit(ctx); err != nil {
 		return err
 	}
 	row, err := corrosion.GetVM(ctx, db, name)
-	if err != nil {
-		return fmt.Errorf("owner-epoch read-back for %q after a minting publish: %w", name, err)
-	}
-	if row == nil {
-		return fmt.Errorf("owner-epoch read-back for %q after a minting publish: no row", name)
+	if err != nil || row == nil {
+		slog.Warn("publish: owner-epoch read-back failed after a minting transition — the commit "+
+			"HAS landed, so this is reported as an unmarked VM for convergence to repair "+
+			"rather than as a failed transition",
+			"vm", name, "error", err)
+		return nil
 	}
 	if hostName != "" && row.HostName != hostName {
 		slog.Warn("publish: ownership moved during a minting transition — leaving the markers to the new owner",
 			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", hostName)
 		return nil
 	}
-	if merr := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); merr != nil {
+	if fileErr, fatal := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); fileErr != nil || fatal != nil {
 		slog.Warn("publish: markers not written after a minting transition — convergence will repair",
-			"vm", name, "epoch", row.OwnerEpoch, "error", merr)
+			"vm", name, "epoch", row.OwnerEpoch, "file_error", fileErr, "error", fatal)
 	}
 	return nil
 }
 
-// EpochForPublish reads the generation a running publish will stamp, retried
-// with the same 4-attempt/backoff policy the state writes it guards use.
+// RowForPublish reads the row a running publish will stamp a marker from,
+// retried with the same 4-attempt/backoff policy as the state writes it guards.
 //
 // Retried because several callers only log a failed state write and continue:
 // an unretried read in front of such a write turns one transient SQLITE_BUSY
@@ -172,43 +207,64 @@ func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *cor
 //
 // A read that SUCCEEDS and finds no row returns immediately — the row is gone,
 // and retrying cannot conjure one. A read that never succeeds refuses the
-// transition rather than falling back to 0: a successful read of 0 is a
+// transition rather than falling back to epoch 0: a successful read of 0 is a
 // pre-epoch row, a failed read is nothing at all, and treating them alike makes
 // the chokepoint a no-op exactly under the conditions it exists for.
-func EpochForPublish(ctx context.Context, db *corrosion.Client, name string) (int64, error) {
-	return epochForPublish(ctx, name, func(ctx context.Context) (*corrosion.VMRecord, error) {
+func RowForPublish(ctx context.Context, db *corrosion.Client, name string) (*corrosion.VMRecord, error) {
+	return rowForPublish(ctx, name, func(ctx context.Context) (*corrosion.VMRecord, error) {
 		return corrosion.GetVM(ctx, db, name)
 	})
 }
 
-// epochForPublish is EpochForPublish's policy over an injectable read, so the
-// retry is testable without a fault hook on the shared corrosion client.
-func epochForPublish(ctx context.Context, name string, read func(context.Context) (*corrosion.VMRecord, error)) (int64, error) {
+// rowForPublish is RowForPublish's policy over an injectable read, so the retry
+// is testable without a fault hook on the shared corrosion client.
+func rowForPublish(ctx context.Context, name string, read func(context.Context) (*corrosion.VMRecord, error)) (*corrosion.VMRecord, error) {
 	var err error
 	for attempt := 0; attempt < 4; attempt++ {
 		var row *corrosion.VMRecord
 		if row, err = read(ctx); err == nil {
 			if row == nil {
-				return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: no row", name)
+				// Wrapped so the routed callers' concurrent-delete branches keep
+				// working: they test errors.Is(err, corrosion.ErrNoRowsAffected)
+				// to tell "the row vanished" from "the write faulted".
+				return nil, fmt.Errorf("owner-epoch lookup before publishing %q running: no row: %w",
+					name, corrosion.ErrNoRowsAffected)
 			}
-			return row.OwnerEpoch, nil
+			return row, nil
 		}
 		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 	}
-	return 0, fmt.Errorf("owner-epoch lookup before publishing %q running: %w", name, err)
+	return nil, fmt.Errorf("owner-epoch lookup before publishing %q running: %w", name, err)
 }
+
+// ErrOwnershipMoved reports that the row a publish was about to mark names a
+// different host. Callers treat it as "not mine to publish", not as a fault.
+var ErrOwnershipMoved = errors.New("ownership moved to another host before the publish")
 
 // PublishRunningVia routes a NON-MINTING transition for a caller that holds its
 // own virt/dataDir/db. A non-running state passes straight through, costing no
 // row read and — more importantly — never gating a stop on a running-marker
 // write it would fail.
-func PublishRunningVia(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, name, state string, commit func(context.Context) error) error {
+// The row must still name hostName. A publish reached from a list snapshot taken
+// seconds earlier can find that ownership has already moved, and stamping the
+// CURRENT epoch onto THIS host's runtime would then make a superseded runtime
+// look current: runtimeSuperseded decides by `row.OwnerEpoch > marker`, so a
+// marker equal to the row reads as up to date. That is the one direction of this
+// race that is not fail-safe, and it defeats the marker comparison for exactly
+// the split-ownership case it exists for. Publishing a row another host owns
+// would also be a stale write in its own right, so the whole transition is
+// refused rather than merely left unmarked.
+func PublishRunningVia(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name, state string, commit func(context.Context) error) error {
 	if state != "running" {
 		return commit(ctx)
 	}
-	epoch, err := EpochForPublish(ctx, db, name)
+	row, err := RowForPublish(ctx, db, name)
 	if err != nil {
 		return err
 	}
-	return PublishVMRunning(ctx, virt, dataDir, name, state, epoch, commit)
+	if hostName != "" && row.HostName != hostName {
+		return fmt.Errorf("refusing to publish %q running on %q: %w (row names %q at generation %d)",
+			name, hostName, ErrOwnershipMoved, row.HostName, row.OwnerEpoch)
+	}
+	return PublishVMRunning(ctx, virt, dataDir, name, state, row.OwnerEpoch, commit)
 }

@@ -973,25 +973,6 @@ func (s *Server) noteStateWriteFail(op string, err error) {
 	}
 }
 
-// vmEpochForPublish reads the generation a running publish will stamp.
-//
-// Retried with the same 4-attempt/backoff policy as the state write it guards.
-// The write already absorbs a transient Corrosion/DB error; putting a single
-// unretried read in front of it would convert one SQLITE_BUSY into a DROPPED
-// state write, because the two running callers of persistVMState only log and
-// continue — there is no outer retry to re-drive anything.
-//
-// A read that succeeds and finds NO row returns immediately: the row is gone,
-// and no amount of retrying conjures one.
-//
-// A read that never succeeds refuses the transition rather than falling back to
-// epoch 0. A successful read of 0 is a pre-epoch row; a failed read is nothing
-// at all, and treating them alike would make the chokepoint a no-op exactly
-// under the conditions it exists for.
-func (s *Server) vmEpochForPublish(ctx context.Context, name string) (int64, error) {
-	return health.EpochForPublish(ctx, s.db, name)
-}
-
 // publishRunning routes a NON-MINTING transition through the marker chokepoint:
 // for "running" the markers are written first and the commit runs only if they
 // landed; any other state passes straight through.
@@ -1006,7 +987,7 @@ func (s *Server) vmEpochForPublish(ctx context.Context, name string) (int64, err
 // ownership commit down with it. Those sites are excluded by name; see
 // scripts/ci/runningcheck's allowlist.
 func (s *Server) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
-	return health.PublishRunningVia(ctx, s.virt, s.db, s.dataDir, name, state, commit)
+	return health.PublishRunningVia(ctx, s.virt, s.db, s.dataDir, s.hostName, name, state, commit)
 }
 
 // publishRunningMinted routes a MINTING transition — one whose statement sets
@@ -1027,9 +1008,20 @@ func (s *Server) publishRunningMinted(ctx context.Context, name string, commit f
 // through the marker chokepoint so the row never says running before a marker
 // names its generation.
 func (s *Server) persistVMState(ctx context.Context, name, state, detail, op string) error {
-	return s.publishRunning(ctx, name, state, func(ctx context.Context) error {
+	committed := false
+	err := s.publishRunning(ctx, name, state, func(ctx context.Context) error {
+		committed = true
 		return s.persistVMStateDirect(ctx, name, state, detail, op)
 	})
+	// A publish refused BEFORE the commit never reaches persistVMStateDirect,
+	// which is the only place that counts a dropped state write. Without this the
+	// metric is blind to the entire drop class the chokepoint introduces — a
+	// failed epoch read or a lost marker — and on a fleet with an unhealthy store
+	// running writes disappear against a flat graph.
+	if err != nil && !committed {
+		s.noteStateWriteFail(op, err)
+	}
+	return err
 }
 
 // persistVMStateDirect is the state write itself, via the strict helper,

@@ -1,6 +1,9 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
@@ -310,4 +313,197 @@ func f() error {
 	}
 	return name(ctx)
 }`, "an unrelated call sharing an argument name")
+}
+
+// TestProofAboutAnotherStringIsNotAProof: the condition has to be about the
+// value the closure will WRITE. Accepting any expression compared against
+// "running" made this bypass — a proof about the detail string, of all things —
+// read as a proof about the state.
+func TestProofAboutAnotherStringIsNotAProof(t *testing.T) {
+	wantOne(t, `
+func f() error {
+	commit := func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", state, detail)
+	}
+	if detail != "running" {
+		return commit(ctx)
+	}
+	return s.publishRunning(ctx, name, state, commit)
+}`, "invoked directly", "a proof about an unrelated string")
+}
+
+// TestPositiveStateComparisonProvesNonRunning: `state == "stopped"` is as good
+// a proof as `state != "running"`, and it is how classifyStop's callers read.
+// Rejecting it would have pushed a future site toward a directive instead.
+func TestPositiveStateComparisonProvesNonRunning(t *testing.T) {
+	wantNone(t, `
+func f() error {
+	commit := func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", state, "d")
+	}
+	if state == "stopped" {
+		return commit(ctx)
+	}
+	return s.publishRunning(ctx, name, state, commit)
+}`, "a positive comparison against a non-running literal")
+}
+
+// TestPositiveRunningComparisonIsNotAProof: the same shape with the literal
+// "running" proves the OPPOSITE, and must not be read as a proof.
+func TestPositiveRunningComparisonIsNotAProof(t *testing.T) {
+	wantOne(t, `
+func f() error {
+	commit := func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", state, "d")
+	}
+	if state == "running" {
+		return commit(ctx)
+	}
+	return s.publishRunning(ctx, name, state, commit)
+}`, "invoked directly", "a positive comparison against \"running\"")
+}
+
+// TestSelectorStateExpressionIsMatched: the state at real call sites is
+// `vm.State`, not a bare identifier. The proof must match it through the
+// selector, or every routed site in the codebase would need a directive.
+func TestSelectorStateExpressionIsMatched(t *testing.T) {
+	wantNone(t, `
+func f() error {
+	commit := func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", vm.State, "d")
+	}
+	if vm.State != "running" {
+		return commit(ctx)
+	}
+	return s.publishRunning(ctx, name, vm.State, commit)
+}`, "a proof through the same selector expression")
+}
+
+// TestMintedClosureIsNeverProvenNonRunning: a minted helper takes no state
+// argument because it ALWAYS publishes running. No branch can disprove that, so
+// a direct invocation of its closure is unroutable by construction.
+func TestMintedClosureIsNeverProvenNonRunning(t *testing.T) {
+	wantOne(t, `
+func f() error {
+	commit := func(ctx context.Context) error {
+		return corrosion.CompleteVMStartProof(ctx, db, id, "vm1", host)
+	}
+	if state != "running" {
+		return commit(ctx)
+	}
+	return s.publishRunningMinted(ctx, name, commit)
+}`, "invoked directly", "a minted closure under a state proof")
+}
+
+// scanCorrosionSrc runs the checker over one in-memory file placed where rule 5
+// applies — the rule is corrosion-only, and the package is identified by path.
+func scanCorrosionSrc(t *testing.T, src string) []violation {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "corrosion")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "x.go")
+	if err := os.WriteFile(path, []byte("package corrosion\n"+src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vs, err := scanFile(path)
+	if err != nil {
+		t.Fatalf("scanFile: %v", err)
+	}
+	return vs
+}
+
+// TestUnregisteredStateStatementIsFlagged is rule 5's reason to exist: rules 1-4
+// only police writers somebody remembered to name in a map.
+func TestUnregisteredStateStatementIsFlagged(t *testing.T) {
+	vs := scanCorrosionSrc(t, "const q = `UPDATE vms SET state = ?, updated_at = ? WHERE name = ?`\n")
+	if len(vs) != 1 {
+		t.Fatalf("got %d violation(s), want 1", len(vs))
+	}
+	if !strings.Contains(vs[0].msg, "stateWritingStatements") {
+		t.Errorf("message = %q, want it to name the inventory", vs[0].msg)
+	}
+}
+
+// TestRegisteredStateStatementIsAccepted, reflowed: the inventory is matched on
+// normalized text, so re-wrapping a statement in corrosion must not fail CI.
+func TestRegisteredStateStatementIsAccepted(t *testing.T) {
+	vs := scanCorrosionSrc(t, "const q = `UPDATE vms\n"+
+		"    SET state = ?, state_detail = ?, updated_at = ?\n"+
+		"    WHERE name = ?`\n")
+	if len(vs) != 0 {
+		t.Errorf("a registered statement, reflowed, got %d violation(s), want 0:\n  %s", len(vs), vs[0].msg)
+	}
+}
+
+// TestStateDetailIsNotAStateWrite: the near-misses a pattern match would trip
+// over. Only the state column itself publishes a runtime.
+func TestStateDetailIsNotAStateWrite(t *testing.T) {
+	for _, sql := range []string{
+		"UPDATE vms SET state_detail = ?, updated_at = ? WHERE name = ?",
+		"UPDATE vms SET hardware_adoption_state = ?, updated_at = ? WHERE name = ?",
+		"UPDATE vms SET updated_at = ? WHERE name = ? AND state = 'running'",
+		"UPDATE vm_disks SET state = ?, updated_at = ? WHERE name = ?",
+		"INSERT INTO vms (name, host_name, spec) VALUES (?, ?, ?)",
+	} {
+		if vs := scanCorrosionSrc(t, "const q = `"+sql+"`\n"); len(vs) != 0 {
+			t.Errorf("%q was read as a vms.state write: %s", sql, vs[0].msg)
+		}
+	}
+}
+
+// TestStateStatementsOutsideCorrosionAreNotInventoried: rule 5 is scoped to the
+// one package that holds the statements, so a fixture or a doc example elsewhere
+// does not have to be registered.
+func TestStateStatementsOutsideCorrosionAreNotInventoried(t *testing.T) {
+	wantNone(t, "const q = `UPDATE vms SET state = ?, updated_at = ? WHERE name = ?`\n",
+		"an unregistered state statement outside internal/corrosion")
+}
+
+// TestEveryInventoryEntryIsStillPresent: an entry whose statement was deleted or
+// edited is the inventory's own stale-directive case. Left in place it silently
+// pre-approves whatever statement later normalizes to the same text.
+func TestEveryInventoryEntryIsStillPresent(t *testing.T) {
+	found := map[string]bool{}
+	err := filepath.WalkDir("../../../internal/corrosion", func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+		for _, sql := range stateStatementsIn(t, path) {
+			found[sql] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk internal/corrosion: %v", err)
+	}
+	for _, st := range stateWritingStatements {
+		if !found[normalizeSQL(st.sql)] {
+			t.Errorf("inventory entry %q matches no statement in internal/corrosion any more — "+
+				"remove it, or it pre-approves whatever next normalizes to the same text", st.owner)
+		}
+	}
+}
+
+// stateStatementsIn returns the normalized vms.state statements a file holds.
+func stateStatementsIn(t *testing.T, path string) []string {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	var out []string
+	ast.Inspect(file, func(n ast.Node) bool {
+		bl, ok := n.(*ast.BasicLit)
+		if !ok || bl.Kind != token.STRING {
+			return true
+		}
+		if sql := normalizeSQL(strings.Trim(bl.Value, "`\"")); writesVMState(sql) {
+			out = append(out, sql)
+		}
+		return true
+	})
+	return out
 }

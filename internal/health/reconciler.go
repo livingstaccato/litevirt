@@ -172,16 +172,14 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 
-// publishRunning routes a NON-MINTING transition through the marker chokepoint:
-// for "running" both markers are written first and the commit runs only if they
-// landed. Any other state passes straight through.
+// publishRunning routes a NON-MINTING transition through the marker chokepoint.
+// See PublishVMRunning for the ordering and why it is the right one here.
 func (r *Reconciler) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
 	return PublishRunningVia(ctx, r.virt, r.db, r.dataDir, r.hostName, name, state, commit)
 }
 
-// publishRunningMinted routes a MINTING transition through the chokepoint:
-// commit, read back the generation the commit produced, then mark that. Marking
-// first would stamp the generation the row is about to leave.
+// publishRunningMinted routes a MINTING transition through the chokepoint in the
+// other order. See PublishVMRunningMinted.
 func (r *Reconciler) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
 	return PublishVMRunningMinted(ctx, r.virt, r.db, r.dataDir, r.hostName, name, commit)
 }
@@ -1191,9 +1189,8 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// until it lands (the marker safely blocks any re-start meanwhile).
 	if proofID != "" {
 		// Routed through the minting chokepoint, which IS the hand-rolled
-		// write-through this block used to carry: commit, read back the
-		// generation the completion minted, then mark both markers. Identical
-		// ordering, one implementation, and it gains the typed-nil guard and the
+		// write-through this block used to carry — same ordering, one
+		// implementation, and it gains the typed-nil guard and the
 		// ownership-moved check the hand-rolled version did not have.
 		if err := r.publishRunningMinted(ctx, vm.Name, func(ctx context.Context) error {
 			return corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName)

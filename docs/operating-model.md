@@ -73,7 +73,9 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   snapshot restore, import, a failed migration healing back, the reconciler's
   self-heals, the health checker's restarts, repair-owner, and replica
   promotion — goes through one of two chokepoints, and a CI guard
-  (`make ci-guards`) fails the build on a new call site that does not.
+  (`make ci-guards`) fails the build on a new call site that does not — and on a
+  new statement in `internal/corrosion` that writes the `state` column without
+  being registered as belonging to one ordering or the other.
   The two orderings are not interchangeable. A write that leaves the ownership
   generation alone marks first and commits only if the markers landed. A write
   that ADVANCES the generation in the same statement must commit first, read

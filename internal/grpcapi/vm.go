@@ -3035,7 +3035,16 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// write. ReplaceVM does it as ONE guarded transition — a single receiver
 	// decision over both VMs' incarnations and authority — which is why it needs
 	// vm_replace_v1 and why that was checked before any of the teardown above.
-	if err := corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared); err != nil {
+	//
+	// It is a MINTING transition — the row lands at a generation above both VMs —
+	// so it goes through publishRunningMinted, which marks the generation the
+	// commit produced. Left unmarked, the replaced VM's marker at this same name
+	// still names its own older generation, and runtimeSuperseded refuses the
+	// replacement's self-heal rebuild. Local by construction: CutoverVM forwarded
+	// to the replacement's host above.
+	if err := s.publishRunningMinted(ctx, req.VmName, func(ctx context.Context) error {
+		return corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared)
+	}); err != nil {
 		return nil, status.Errorf(codes.Internal, "cutover: give %q the name %q: %v",
 			nextName, req.VmName, err)
 	}

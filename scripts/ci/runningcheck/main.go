@@ -121,6 +121,9 @@ var minting = map[string]int{
 	"TransferVMOwner":      4,
 	"TransferVMOwnerFresh": 4,
 	"CompleteVMStartProof": alwaysRunning,
+	// ReplaceVM installs a cutover's replacement with the state copied from its
+	// row, not taken as an argument, so no literal can ever exempt a call.
+	"ReplaceVM": alwaysRunning,
 }
 
 // The publish helpers, mapped to the zero-based index of their state argument —
@@ -535,6 +538,38 @@ var stateWritingStatements = []stateStatement{
 	  WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
 		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh"},
 		note:    "MINTING: the statement advances the generation, so the correct marker value does not exist until it commits",
+	},
+	{
+		sql: `INSERT INTO vms (name, stack_name, host_name, spec, state, state_detail,
+				cpu_actual, mem_actual, project, is_template, vm_owner_epoch,
+				spec_generation, active_operation_id, created_at, updated_at,
+				deleted_at, pending_action_id, hardware_adoption_state,
+				hardware_adoption_error)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, NULL, '', ?, NULL)
+			 ON CONFLICT(name) DO UPDATE SET
+			   stack_name = excluded.stack_name,
+			   host_name = excluded.host_name,
+			   spec = excluded.spec,
+			   state = excluded.state,
+			   state_detail = excluded.state_detail,
+			   cpu_actual = excluded.cpu_actual,
+			   mem_actual = excluded.mem_actual,
+			   project = excluded.project,
+			   is_template = excluded.is_template,
+			   vm_owner_epoch = excluded.vm_owner_epoch,
+			   spec_generation = excluded.spec_generation,
+			   active_operation_id = excluded.active_operation_id,
+			   created_at = excluded.created_at,
+			   updated_at = excluded.updated_at,
+			   deleted_at = excluded.deleted_at,
+			   pending_action_id = excluded.pending_action_id,
+			   hardware_adoption_state = excluded.hardware_adoption_state,
+			   hardware_adoption_error = excluded.hardware_adoption_error
+			 WHERE excluded.vm_owner_epoch > vms.vm_owner_epoch
+			   AND excluded.spec_generation > vms.spec_generation
+			   AND (vms.deleted_at IS NOT NULL OR vms.created_at = excluded.created_at)`,
+		writers: []string{"ReplaceVM"},
+		note:    "MINTING: a cutover installs the replacement above both VMs' generations, with its state copied from the replacement's row",
 	},
 	{
 		sql: `UPDATE vms SET state = 'running', pending_action_id = '',

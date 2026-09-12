@@ -47,6 +47,8 @@ var nonPublishingWriters = map[string]string{
 	"validateGuardedCreateBeginEntry":    "validates an INBOUND create-begin entry",
 	"validateGuardedTransitionStatement": "validates an INBOUND transition statement",
 	"guardedEntryRoleAllowed":            "decides whether a peer role may send a known shape",
+	"validateGuardedVMReplaceEntry":      "validates an INBOUND guarded replace batch against its known shapes",
+	"vmReplaceStatements":                "builds the cutover batch; ReplaceVM executes it and is registered in minting, where its call site is policed",
 }
 
 // literalNonRunningWriters DO execute a state write, but their statement

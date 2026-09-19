@@ -109,6 +109,25 @@ func (c *Controller) SelfFence() {
 // node (de-advertise capabilities, refuse runtime-ownership work): a node committed to
 // fencing itself must not keep acting as a healthy member while it waits to go down.
 // Nil-safe (a nil controller is never fenced).
+// wdiofMagicClose is WDIOF_MAGICCLOSE from linux/watchdog.h.
+const wdiofMagicClose = 0x0100
+
+// selfFenceMayClose reports whether closing the device leaves the watchdog
+// RUNNING, which is the whole mechanism the self-fence path relies on.
+//
+// The kernel's watchdog_release() stops the timer when
+// `expect_close == 42 || !(options & WDIOF_MAGICCLOSE)`. We never write the
+// magic 'V' when self-fencing, so the first half is false — but the second half
+// means a driver that does not ADVERTISE magic-close is stopped by the close
+// itself. The host then never reboots while Fenced() reports true, which is the
+// one state this subsystem exists to make impossible.
+//
+// known=false (identity unreadable, or not Linux) is treated as unsafe: the fd
+// stays open, which keeps every driver armed.
+func selfFenceMayClose(options uint32, known bool) bool {
+	return known && options&wdiofMagicClose != 0
+}
+
 func (c *Controller) Fenced() bool { return c != nil && c.tripped.Load() }
 
 // fenceCh returns the trip channel, or nil (which blocks forever in a select) when
@@ -250,9 +269,25 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 			slog.Info("watchdog disarmed", "dev", devPath)
 			return
 		}
-		// Self-fence: close WITHOUT disarming — leave the watchdog armed so it fires.
-		f.Close()
-		slog.Error("watchdog left ARMED (self-fence) — this host will reboot at the hardware watchdog timeout", "dev", devPath)
+		// Self-fence: leave the watchdog ARMED so it fires and reboots this host.
+		//
+		// Closing the fd is only safe on a driver advertising WDIOF_MAGICCLOSE.
+		// The kernel's watchdog_release() stops the timer when
+		// `expect_close == 42 || !(options & WDIOF_MAGICCLOSE)`, and self-fence
+		// deliberately never writes the magic 'V' — so on a driver without the
+		// flag the close itself disarms the watchdog. The host would not reboot
+		// while Fenced() reported true, and a coordinator would treat a live
+		// node running its workloads as one being reset.
+		//
+		// Where the flag is absent or unreadable the fd is deliberately NOT
+		// closed: an open fd keeps every driver armed. It leaks one descriptor
+		// on a host that is seconds from resetting.
+		opts, known := watchdogOptions(f.Fd())
+		if selfFenceMayClose(opts, known) {
+			f.Close()
+		}
+		slog.Error("watchdog left ARMED (self-fence) — this host will reboot at the hardware watchdog timeout",
+			"dev", devPath, "magic_close", selfFenceMayClose(opts, known))
 	}()
 
 	slog.Info("watchdog heartbeat started", "dev", devPath, "interval", interval)

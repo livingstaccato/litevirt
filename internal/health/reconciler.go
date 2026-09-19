@@ -27,6 +27,25 @@ import (
 
 const reconcileInterval = 15 * time.Second
 
+// reconcileWalkBudget bounds the pending-VM walk inside ONE pass.
+//
+// The walk is serial and every per-VM step is bounded only on its own — the
+// lease-term barrier, for instance, has a budget per call. Nothing bounded the
+// SUM, so a large failover, or a partition where peers time out, could spend
+// unbounded time in the walk. selfFence and assertRuntimeOwnership run after it
+// on this same goroutine, and selfFence is how a doomed node stops driving
+// decisions while it waits for the watchdog — it must not be pushed arbitrarily
+// past the tick it is supposed to run on.
+//
+// Cutting the walk short costs a delayed VM start: it is idempotent and the next
+// tick picks the row up again. Not cutting it short costs a delayed self-fence.
+// That asymmetry is the whole reason for this value.
+//
+// Kept below reconcileInterval so a pass that spends its whole budget still
+// leaves room for the two sweeps before the next tick. A var, not a const, so
+// tests can shrink it.
+var reconcileWalkBudget = 10 * time.Second
+
 // Reconciler watches for VMs in "pending" state on the local host
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
@@ -70,6 +89,9 @@ type Reconciler struct {
 	// and validates/claims the linked runtime_action_proofs row before starting.
 	// nil disables gating (tests that don't exercise it). See SetGate.
 	gate runtimeGate
+
+	// leaseTermGate judges a pending proof's lease term. See SetLeaseTermGate.
+	leaseTermGate LeaseTermGate
 	// sharedStorageFenceEnforce is the config kill-switch for the shared-disk
 	// ownership-transfer fence gate (enforcement.shared_storage_fence). With it AND
 	// SharedStorageFenceV1 latched, an ownership-transfer start of a VM with a
@@ -120,6 +142,11 @@ func (r *Reconciler) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord)
 }
 
 // runtimeGate is the subset of *Checker the reconciler needs (injectable for tests).
+// LeaseTermGate judges a proof read off the replicated row and returns the
+// fence its claim must carry (nil = unfenced), or a countable refusal reason
+// and an error. Implemented by grpcapi.
+type LeaseTermGate func(ctx context.Context, pr corrosion.ProofRecord) (*corrosion.TermFence, string, error)
+
 type runtimeGate interface {
 	ExecutionGate(ctx context.Context) GateResult
 	CapabilityActive(ctx context.Context, token string) (bool, string)
@@ -141,6 +168,16 @@ func selfFenceHardGate(g runtimeGate) bool { return g != nil && g.SelfFenced() }
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
+
+// SetLeaseTermGate injects the executor-side lease-term judgment for a pending
+// proof (grpcapi's LeaseTermGateForPendingProof).
+//
+// Injected rather than implemented here because internal/grpcapi imports this
+// package: the barrier, the closed key set and the two-arm check all live
+// there, and a second copy of a quorum comparison would diverge as a wrong
+// verdict rather than a compile error. nil leaves the path exactly as it was
+// before Phase 2.
+func (r *Reconciler) SetLeaseTermGate(fn LeaseTermGate) { r.leaseTermGate = fn }
 
 // SetOwnerEpochBackfill enables the Phase 4 backfill pass in each sweep
 // (enforcement.owner_epoch; the daemon wires it).
@@ -216,7 +253,17 @@ func (r *Reconciler) SetBackupInProgress(fn func(vmName string) bool) {
 // periodic loop, exported for the fleet harness (and one-shot ops) to drive a
 // deterministic pass without waiting on the ticker.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) {
-	r.reconcile(ctx)
+	r.reconcilePass(ctx)
+}
+
+// reconcilePass is one tick's work: the bounded pending-VM walk, then the two
+// safety sweeps. The sweeps deliberately take the UNBOUNDED ctx — they are what
+// the walk's budget exists to protect, not things to cut short.
+func (r *Reconciler) reconcilePass(ctx context.Context) {
+	wctx, cancel := context.WithTimeout(ctx, reconcileWalkBudget)
+	r.reconcile(wctx)
+	cancel()
+
 	r.selfFence(ctx)
 	r.assertRuntimeOwnership(ctx)
 }
@@ -230,9 +277,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.reconcile(ctx)
-			r.selfFence(ctx)
-			r.assertRuntimeOwnership(ctx)
+			r.reconcilePass(ctx)
 		}
 	}
 }
@@ -957,7 +1002,51 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			return
 		}
 		proofFenceEpoch = pr.FenceEpoch
-		if err := corrosion.ClaimActionProof(ctx, r.db, proofID, r.hostName); err != nil {
+
+		// Lease-term enforcement (Phase 2), EXECUTE side. This is the SECOND
+		// executor trust boundary and it is easy to miss: a reschedule proof
+		// never travels over an RPC, so grpcapi's claimCarriedProof — where the
+		// rest of this regime lives — is never reached on the failover path.
+		// The coordinator writes the row with the pending marker and this
+		// reconciler claims it straight off replication. Without the check
+		// here, a superseded coordinator's reschedules execute exactly as they
+		// did before the feature existed, while every other proof path is
+		// gated.
+		//
+		// The judgment is INJECTED (see SetLeaseTermGate) rather than
+		// reimplemented: it lives in internal/grpcapi, which imports this
+		// package, so this package cannot import it back. A second copy of a
+		// quorum comparison is the class of bug this phase has already paid for
+		// twice.
+		//
+		// Unwired = inert, which is deliberate. A nil gate here is the
+		// pre-Phase-2 daemon, not a refusal: the enforcement decision is inside
+		// the injected function, which answers "no fence, no refusal" whenever
+		// the token is unlatched or the flag is off.
+		var termFence *corrosion.TermFence
+		if r.leaseTermGate != nil {
+			fence, reason, terr := r.leaseTermGate(ctx, pr)
+			if terr != nil {
+				slog.Warn("reconciler: pending proof refused by the lease-term gate",
+					"vm", vm.Name, "proof", proofID, "reason", reason, "error", terr)
+				r.noteGateRefused(corrosion.ActionReschedule, reason)
+				return
+			}
+			termFence = fence
+		}
+
+		if err := corrosion.ClaimActionProofFenced(ctx, r.db, proofID, r.hostName, termFence); err != nil {
+			if errors.Is(err, corrosion.ErrTermClaimantConflict) {
+				// This host already acted at this (key, term) for a different
+				// coordinator. Distinct from a spent proof: the proof is fine,
+				// the CLAIMANT is the problem.
+				slog.Warn("reconciler: this host has already acted at this lease term for another "+
+					"coordinator — refusing start",
+					"vm", vm.Name, "proof", proofID, "term", pr.LeaseTerm,
+					"key", pr.LeaseKey, "coordinator", pr.Coordinator)
+				r.noteGateRefused(corrosion.ActionReschedule, ReasonStaleLeaseTerm)
+				return
+			}
 			if errors.Is(err, corrosion.ErrProofSpent) {
 				slog.Warn("reconciler: pending proof terminal/missing, refusing start",
 					"vm", vm.Name, "proof", proofID)
@@ -1280,6 +1369,13 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			// checked against. Best-effort — the VM is already running, and the
 			// convergence pass repairs a missed write; failing the start over a
 			// marker would be strictly worse than a temporarily absent marker.
+			// No pre-epoch guard here on purpose: the epoch cannot be 0 at this
+			// point. This block runs only where CompleteVMStartProof APPLIED, and
+			// its second statement is `vm_owner_epoch = vm_owner_epoch + 1` under
+			// the same guard, so the row re-read below is at 1 or more by
+			// construction. A `fresh.OwnerEpoch < 1` branch would be unreachable,
+			// and unreachable branches can only be tested vacuously. The writers
+			// refuse a pre-epoch value anyway, which is where that rule belongs.
 			if fresh, gerr := corrosion.GetVM(ctx, r.db, vm.Name); gerr == nil && fresh != nil {
 				if merr := r.virt.SetDomainOwnerEpoch(vm.Name, fresh.OwnerEpoch, true); merr != nil {
 					slog.Warn("reconciler: owner-epoch marker write failed (convergence will repair)",
@@ -1451,13 +1547,32 @@ func (r *Reconciler) ownerEpochEnforced(ctx context.Context) bool {
 // and convergence passes are what graduate them), and failing closed on an
 // unreadable marker would strand a legitimately-owned VM.
 func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
-	// Prefer the HOST-LOCAL marker: this check runs when libvirt has no domain,
-	// and undefining a domain destroys its metadata, so a metadata-only read is
-	// unreadable exactly when it matters (lab-proven 2026-08-02). Fall back to
-	// the domain metadata for a VM whose file marker has not been written yet.
+	// The HOST-LOCAL FILE MARKER IS THE ONLY INPUT, deliberately and by
+	// necessity. The sole caller sits inside `!DomainExists`, so by the time this
+	// runs libvirt has no domain for the VM — and undefining a domain destroys
+	// its metadata with it, which is the whole reason the durable file marker
+	// exists (lab-proven 2026-08-02).
+	//
+	// There used to be a domain-metadata fallback here "for a VM whose file
+	// marker has not been written yet". It could not fire: DomainExists IS a
+	// DomainLookupByName, the same lookup GetDomainOwnerEpoch performs first, so
+	// at this point that call can only ever return a lookup error. It read as a
+	// second line of defence that did not exist.
+	//
+	// So: a host with no readable file marker is never treated as superseded.
+	// That is fail-open, which is the intended direction for an unreadable
+	// marker, but it is the actual coverage — do not add a metadata read back
+	// without moving the call site to somewhere a domain still exists.
 	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
-	if err != nil || !ok {
-		marker, ok, err = r.virt.GetDomainOwnerEpoch(name)
+	if errors.Is(err, ErrPreEpochMarker) {
+		// A marker asserting generation 0 is not an unreadable marker, and must not
+		// be treated as one. It is this host's own statement that its runtime
+		// belongs to NO generation — so any row at a real generation has superseded
+		// it, and the comparison below reaches that conclusion with marker = 0.
+		// Collapsing it into the unreadable case instead would license exactly the
+		// resurrection this check exists to refuse, for precisely the population
+		// most likely to carry such a marker: a node returning from an older build.
+		marker, ok, err = 0, true, nil
 	}
 	if err != nil || !ok {
 		return false

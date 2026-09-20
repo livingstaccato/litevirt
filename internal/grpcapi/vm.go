@@ -1180,7 +1180,7 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	}
 	if vm.IsTemplate {
 		return nil, status.Errorf(codes.FailedPrecondition,
-			"%q is a template and cannot be started; clone it first (lv vm clone %s <new-name>)", req.Name, req.Name)
+			"%q is a template and cannot be started; clone it first (`lv clone %s <new-name>`)", req.Name, req.Name)
 	}
 	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
 	// non-template VM as a linked-clone source, so a plain VM can be backing

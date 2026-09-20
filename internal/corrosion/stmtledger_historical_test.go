@@ -60,7 +60,14 @@ import (
 // shapes are receive-only on this integration line and were added as the
 // quota_reservations_upstream_v44 family. No previously accepted historical
 // identity was removed or changed.
-const compatibilityDigest = "23dbf172dc6f828aebf4cd8815412923e6852e685e9f95e2ad336e65eef75c73"
+//
+// Updated again for the UpsertBinding tombstone guard: the pre-guard shape
+// (WHERE prefix_id = ? alone, which let `deleted_at = NULL` resurrect a
+// released binding) moved from the current ledger to the
+// upsert_binding_pre_tombstone_guard family. It is an ADDITION — a shape this
+// tree stopped emitting but a supported peer still sends — and no previously
+// accepted historical identity was removed or changed.
+const compatibilityDigest = "75c5e7f306221fe14fc9d4f3303ac2496af4cb7779efe8934db10df6243ae4d8"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -121,6 +128,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"audit_log_insert_v44":                  1,   // audit insert before key_id/signature/seq
 	"audit_reseal_v44":                      1,   // audit reseal before it refused to touch a signed row
 	"complete_vm_start_pre_epoch_v47":       1,   // reschedule completion before the Phase 4 owner-epoch mint
+	"upsert_binding_pre_tombstone_guard":    1,   // UpsertBinding before `AND deleted_at IS NULL` stopped it resurrecting a released prefix
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

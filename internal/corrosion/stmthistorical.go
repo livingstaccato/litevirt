@@ -216,5 +216,28 @@ func HistoricalShapes() []HistoricalShape {
 	add(`UPDATE vms SET state = 'running', pending_action_id = '', updated_at = ?
 		        WHERE name = ? AND deleted_at IS NULL AND pending_action_id = ?`, "complete_vm_start_pre_epoch_v47")
 
+	// UpsertBinding before the tombstone guard: the WHERE was `prefix_id = ?`
+	// alone, so the `deleted_at = NULL` in its SET clause resurrected a released
+	// binding. The current tree appends `AND deleted_at IS NULL`.
+	//
+	// A peer on the older build still EMITS the unguarded shape, and dropping it
+	// here would back-pressure that peer's stream. It stays RECEIVE-ONLY: the
+	// receiver's apply is a full-PK update of a row it already holds, so
+	// accepting it cannot resurrect a tombstone the receiver has — the hazard
+	// was in the WRITER choosing to clear deleted_at, which this tree no longer
+	// does.
+	add(`UPDATE netbox_bindings SET
+		   network = ?,
+		   observed_cidr = ?,
+		   vrf_id = ?,
+		   cluster_fingerprint = ?,
+		   netbox_cluster = ?,
+		   suspended = ?,
+		   suspend_reason = ?,
+		   validated_at = ?,
+		   updated_at = ?,
+		   deleted_at = NULL
+		 WHERE prefix_id = ?`, "upsert_binding_pre_tombstone_guard")
+
 	return out
 }

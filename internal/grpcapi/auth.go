@@ -159,6 +159,7 @@ func (s *Server) UnaryAuthInterceptor(
 		if err := s.refuseLoginWhileReseedIncomplete(ctx, info.FullMethod); err != nil {
 			return nil, err
 		}
+		ctx = s.stampReseedFence(ctx, info.FullMethod)
 		return handler(ctx, req)
 	}
 	ctx, err := s.authenticate(ctx)

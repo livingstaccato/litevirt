@@ -54,6 +54,14 @@ func (c *Client) BeginReseed(ctx context.Context, source string) error {
 		c.NowTS(), source); err != nil {
 		return fmt.Errorf("mark reseed in progress: %w", err)
 	}
+	// Bumped for every reseed that STARTS, including a repeat of one that failed,
+	// and never reset: a caller holding the old value must be able to see that
+	// something happened even if the reseed has since finished.
+	if err := c.execLocal(ctx,
+		`INSERT INTO reseed_generation (id, generation) VALUES (1, 1)
+		 ON CONFLICT(id) DO UPDATE SET generation = reseed_generation.generation + 1`); err != nil {
+		return fmt.Errorf("bump reseed generation: %w", err)
+	}
 	return nil
 }
 
@@ -82,4 +90,44 @@ func (c *Client) ReseedIncomplete(ctx context.Context) (bool, string, error) {
 		return false, "", nil
 	}
 	return true, rows[0].String("source"), nil
+}
+
+// reseedGenerationDDL counts reseeds that have STARTED on this node, and only
+// ever increases.
+//
+// The marker alone cannot close the window a credential check opens. A login
+// reads the marker, spends a deliberately-slow bcrypt verifying a password, and
+// only then reads user_2fa — so an entire reseed can start AND finish inside one
+// request, and re-reading the boolean would find it clear and conclude nothing
+// had happened. A caller that captures this number before it reads any
+// credential state and re-checks it before granting anything sees the reseed
+// either way.
+//
+// Local-only and framework-created, like the marker beside it: it describes this
+// node's own history, costs no schema version, and survives the discard by being
+// absent from the replicated table lists that loop walks.
+const reseedGenerationDDL = `CREATE TABLE IF NOT EXISTS reseed_generation (
+	id         INTEGER PRIMARY KEY CHECK (id = 1),
+	generation INTEGER NOT NULL
+)`
+
+// ReseedFence reports whether a reseed is currently incomplete, the source it
+// was pulling from, and the monotone count of reseeds started on this node.
+//
+// A read failure is reported rather than folded into "no reseed pending": the
+// caller is a credential gate, and an unreadable fence must not read as
+// permission to serve.
+func (c *Client) ReseedFence(ctx context.Context) (incomplete bool, source string, generation int64, err error) {
+	incomplete, source, err = c.ReseedIncomplete(ctx)
+	if err != nil {
+		return false, "", 0, err
+	}
+	rows, qerr := c.Query(ctx, `SELECT generation FROM reseed_generation WHERE id = 1`)
+	if qerr != nil {
+		return false, "", 0, fmt.Errorf("read reseed generation: %w", qerr)
+	}
+	if len(rows) == 0 {
+		return incomplete, source, 0, nil
+	}
+	return incomplete, source, rows[0].Int64("generation"), nil
 }

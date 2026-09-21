@@ -566,21 +566,43 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 // a read error, so an unreadable REFERENCE check keeps the file. The remaining
 // gap — we cannot list this VM's own disks — is logged rather than silent.
 func (s *Server) protectedDiskPaths(ctx context.Context, vmName string) map[string]bool {
-	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
+	// Keyed off the files the glob will actually walk, NOT off this VM's own live
+	// rows. Deriving it from the rows cannot work on the create path: createVM
+	// refuses a duplicate live name before it gets here, so the VM it is about to
+	// create has no live rows by construction and the keep set was always empty —
+	// while `lv vm delete base --keep-disks` leaves base-root.qcow2 on disk,
+	// tombstoned but still named by every overlay's backing_disk. Reusing the name
+	// then globbed base-*.qcow2 with nothing protected and destroyed every clone's
+	// chain, unrecoverably.
+	candidates, err := s.images.VMDiskCandidates(vmName)
 	if err != nil {
-		slog.Warn("delete: list disks for glob protection failed; the default-dir "+
-			"glob cannot tell a still-referenced disk from debris",
+		slog.Error("delete: cannot list candidate disk files, so every one of them is "+
+			"protected; a still-referenced base must not be removed on a failed read",
 			"vm", vmName, "error", err)
 		return nil
 	}
-	keep := make(map[string]bool)
-	for i := range disks {
-		d := &disks[i]
-		if d.Path == "" {
+	keep := make(map[string]bool, len(candidates))
+	for _, path := range candidates {
+		referrers, rerr := corrosion.DisksReferencingPath(ctx, s.db, path)
+		if rerr != nil {
+			// FAIL CLOSED, which is what this function's comment always claimed
+			// and its old `return nil` did the opposite of: a read that failed is
+			// not evidence that nothing references this file. A transient
+			// SQLITE_BUSY was enough to sweep a live clone base.
+			slog.Error("delete: cannot tell whether a disk file is still referenced; "+
+				"protecting it rather than deleting on a guess",
+				"vm", vmName, "path", path, "error", rerr)
+			keep[path] = true
 			continue
 		}
-		if s.diskPathReferencedByOtherVM(ctx, vmName, d) {
-			keep[d.Path] = true
+		for i := range referrers {
+			// Another VM still names it — as its own disk, its backing_image, or
+			// its linked-clone backing_disk. Our OWN live rows are not a reason to
+			// keep anything: deleting them is the point.
+			if referrers[i].VMName != vmName {
+				keep[path] = true
+				break
+			}
 		}
 	}
 	return keep

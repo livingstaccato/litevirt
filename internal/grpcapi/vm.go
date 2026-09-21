@@ -1263,6 +1263,10 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q is a template and cannot be started; clone it first (`lv clone %s <new-name>`)", req.Name, req.Name)
 	}
+	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.start", "operator"); err != nil {
+		return nil, err
+	}
+
 	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
 	// non-template VM as a linked-clone source, so a plain VM can be backing
 	// overlays; starting it lets qemu write into the backing file underneath
@@ -1283,9 +1287,6 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 				"re-create them as independent copies with `lv clone <source> <name> "+
 				"--mode full`, first",
 			req.Name, len(clones), strings.Join(clones, ", "))
-	}
-	if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.start", "operator"); err != nil {
-		return nil, err
 	}
 
 	if vm.HostName != s.hostName {
@@ -1870,6 +1871,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 			return nil, status.Errorf(codes.Internal, "clean up stale VM record: %v", err)
 		}
 		s.clearDeviceLease(req.Name)
+		// This path returns without reaching the main cleanup below, so the
+		// marker has to be dropped here too. A ghost row whose domain is already
+		// gone still leaves <dataDir>/vms/<name>/owner_epoch behind, and the next
+		// VM to take the name meets a marker above its own generation.
+		if err := health.RemoveVMOwnerEpochMarker(s.dataDir, req.Name); err != nil {
+			slog.Warn("delete: owner-epoch marker not removed from a stale record",
+				"vm", req.Name, "error", err)
+		}
 		return &emptypb.Empty{}, nil
 	}
 
@@ -1976,6 +1985,16 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		if err := lv.WriteRetainedFirmwareMarker(s.dataDir, req.Name, parseFirmwareSpec(vm.Spec).UUID); err != nil {
 			slog.Warn("failed to write retained-firmware marker", "vm", req.Name, "error", err)
 		}
+	}
+
+	// The owner-epoch marker goes UNCONDITIONALLY, --keep-disks included: that
+	// flag retains disks and firmware state, but the row is tombstoned either
+	// way, so the marker names a VM that no longer exists. Left behind, it meets
+	// the next VM to take this name as a marker above a row at 0 — the mismatch
+	// convergence never repairs and which refuses that VM's re-key for good.
+	if err := health.RemoveVMOwnerEpochMarker(s.dataDir, req.Name); err != nil {
+		slog.Warn("delete: owner-epoch marker not removed; a VM that reuses this name may "+
+			"meet a marker above its own generation", "vm", req.Name, "error", err)
 	}
 
 	// Remove the VM's DNS A-record UNCONDITIONALLY — not gated on a live
@@ -2788,7 +2807,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// firmware state — it was the only destructive VM-lifecycle RPC in this file
 	// without the lock, so it could run straight through a concurrent start,
 	// resize or migrate of the same VM. Same placement as DeleteVM.
-	unlock := s.lockVM(req.Name)
+	unlock := releaseOnce(s.lockVM(req.Name))
 	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
@@ -2799,6 +2818,10 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		return nil, err
 	}
 	if vm.HostName != s.hostName {
+		// Released BEFORE the forward: the lock must not be held across a peer
+		// RPC. See releaseOnce.
+		unlock()
+
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
@@ -2932,9 +2955,18 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// accepted in between would be silently undone by the handoff starting the VM
 	// from a stale snapshot — leaving the runtime running and the database
 	// recording an operator stop. Locked in name order, since two locks are held.
+	// Both releases are captured, because the forward below has to drop BOTH
+	// before calling a peer — not just whichever one happened to be last.
+	var releases []func()
 	for _, n := range sortedPair(req.VmName, nextName) {
-		unlock := s.lockVM(n)
+		unlock := releaseOnce(s.lockVM(n))
+		releases = append(releases, unlock)
 		defer unlock()
+	}
+	unlock := func() {
+		for _, r := range releases {
+			r()
+		}
 	}
 	nextVM, err := corrosion.GetVM(ctx, s.db, nextName)
 	if err != nil || nextVM == nil {
@@ -2953,6 +2985,10 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// never renamed on the real host, so it would come up with mismatched
 	// firmware (G1). The forwarded call runs locally on the owning host.
 	if nextVM.HostName != s.hostName {
+		// Released BEFORE the forward: the lock must not be held across a peer
+		// RPC. See releaseOnce.
+		unlock()
+
 		client, conn, err := s.peerClient(ctx, nextVM.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable,

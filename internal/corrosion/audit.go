@@ -213,7 +213,7 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	// is stored verbatim but is not a reading of this node's clock, and letting
 	// it set the floor for every later row hands any caller a lever on the whole
 	// host's timeline.
-	if generated && r.Timestamp > tail.ts {
+	if generated && raisesStampCeiling(r.Timestamp, tail.ts) {
 		tail.ts = r.Timestamp
 	}
 	return nil
@@ -908,4 +908,32 @@ func HostManualFenceConfirmed(ctx context.Context, c *Client, host string, now t
 		}
 	}
 	return false, nil
+}
+
+// raisesStampCeiling reports whether a newly generated stamp is later than the
+// current ceiling, comparing INSTANTS rather than strings.
+//
+// The two sides are not the same format. A generated stamp is fixed-width
+// nowTSLayout; the ceiling comes back verbatim from audit_log and may be a
+// legacy RFC3339Nano value with trailing zeros trimmed. A string compare then
+// gets it exactly backwards whenever the new stamp extends the stored one as a
+// prefix — '.' is 0x2E and 'Z' is 0x5A, so "…10:00:00.000000001Z" sorts BEFORE
+// "…10:00:00Z" though it is a nanosecond later. The ceiling never rose past such
+// a row, and stampAfter went on returning prev+1ns from that same unchanged
+// ceiling, so every row written while the clock was behind carried an identical
+// timestamp — the strict ordering the clamp exists to preserve.
+//
+// An unparseable side falls back to the string compare rather than to a verdict:
+// it is the only ordering information left, and treating garbage as "later"
+// would let one bad row pin the ceiling for good.
+func raisesStampCeiling(stamp, ceiling string) bool {
+	if ceiling == "" {
+		return true
+	}
+	newT, nerr := time.Parse(time.RFC3339Nano, stamp)
+	oldT, oerr := time.Parse(time.RFC3339Nano, ceiling)
+	if nerr != nil || oerr != nil {
+		return stamp > ceiling
+	}
+	return newT.After(oldT)
 }

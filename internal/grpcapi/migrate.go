@@ -96,7 +96,7 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// released here UNLESS the migration outlives this request, in which case it
 	// travels with the adopter — dropping it while libvirt is still moving the
 	// guest is what lets a snapshot or delete run against a VM mid-flight.
-	unlock := s.lockVM(req.VmName)
+	unlock := releaseOnce(s.lockVM(req.VmName))
 	adopted := false
 	defer func() {
 		if !adopted {
@@ -126,6 +126,10 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return err
 	}
 	if vm.HostName != s.hostName {
+		// Released BEFORE the forward: the lock must not be held across a peer
+		// RPC. See releaseOnce.
+		unlock()
+
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)

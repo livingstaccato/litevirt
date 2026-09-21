@@ -13,7 +13,13 @@ type UserRecord struct {
 	Username     string
 	Role         string
 	PasswordHash string
-	CreatedAt    string
+	// Realm names the authority this row belongs to. users is keyed on username
+	// ALONE, so one name exists once across every realm — which makes this the
+	// only thing that can tell a local account from an external one that happens
+	// to share its name. A caller that shadows an external subject must consult
+	// it; see auth.EnsureUserShadow.
+	Realm     string
+	CreatedAt string
 	// ScopePaths is non-nil only when ValidateToken populates it from the
 	// matched API token. Empty slice = no scoping (inherit user's full
 	// perms). A scoped token may only operate on paths that are under one
@@ -54,7 +60,8 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 // GetUser returns a user by username, or nil if not found.
 func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT username, role, password_hash, created_at FROM users WHERE username = ? AND deleted_at IS NULL`,
+		`SELECT username, role, password_hash, COALESCE(realm, 'local') AS realm, created_at
+		 FROM users WHERE username = ? AND deleted_at IS NULL`,
 		username)
 	if err != nil {
 		return nil, err
@@ -67,6 +74,7 @@ func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, erro
 		Username:     r.String("username"),
 		Role:         r.String("role"),
 		PasswordHash: r.String("password_hash"),
+		Realm:        r.String("realm"),
 		CreatedAt:    r.String("created_at"),
 	}, nil
 }

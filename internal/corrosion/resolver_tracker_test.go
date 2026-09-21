@@ -794,3 +794,253 @@ func TestAcknowledgedTie_StopsBeingAttributedOnceTheRowConverges(t *testing.T) {
 		t.Errorf("TrackedTieCount = %d after the repair, want 0", n)
 	}
 }
+
+// An N-way collision has to be fully answerable, and before this it was not.
+//
+// Acknowledgement was single-slot per (table, PK): one content pair, replaced by
+// the next. That is sound while divergences arrive one at a time, which is the
+// two-node tie the feature was built for. It breaks when several are live at
+// once — four nodes each minting the same lease term gives node-1 three
+// simultaneous disagreements, one per peer, all under one PK.
+//
+// Anti-entropy then cycles the peers forever: acknowledging the pair against
+// node-2 overwrites the one against node-3, the next sweep re-raises node-3's,
+// and ha.lww.unresolved can never clear. The operator sees "Acknowledged",
+// an audit row is written, and nothing changes — which is the worst shape a
+// remedy can have.
+//
+// Found on the 4-node lab, where dual_run_detector term 2 had four different
+// holders and the condition survived an acknowledgement on every host.
+func TestAcknowledgeUnresolvedTie_EveryPairOfAnNWayCollisionStaysAcknowledged(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+	const (
+		table = "leader_lease_terms"
+		pk    = `["dual_run_detector","2"]`
+		cat   = "immutable_ledger_conflict"
+	)
+	// node-1's seat in a four-way collision: one row, three live divergences.
+	pairs := []string{"vs-node-2", "vs-node-3", "vs-node-4"}
+
+	for _, pair := range pairs {
+		c.trackUnresolvedPair(table, pk, pair, pathAE, cat)
+		if ok, err := c.AcknowledgeUnresolvedTie(ctx, table, pk, "op"); err != nil || !ok {
+			t.Fatalf("acknowledging %s: ok=%v err=%v", pair, ok, err)
+		}
+	}
+
+	// Anti-entropy keeps sweeping every peer. Each pair the operator answered
+	// for must stay quiet — the FIRST one included.
+	for _, pair := range pairs {
+		c.trackUnresolvedPair(table, pk, pair, pathAE, cat)
+		if n := c.UnresolvedTieCount(); n != 0 {
+			t.Errorf("%s re-registered as live after being acknowledged (count=%d): "+
+				"an acknowledgement of one peer's claim erased the answer given for another, "+
+				"so the condition can never clear", pair, n)
+		}
+	}
+
+	// A pair nobody answered for must still register — the acknowledgements
+	// cover three specific divergences, not the row.
+	c.trackUnresolvedPair(table, pk, "vs-node-5-never-seen", pathAE, cat)
+	if n := c.UnresolvedTieCount(); n != 1 {
+		t.Errorf("an unacknowledged divergence did not register (count=%d); acknowledging "+
+			"several pairs must not mute the row", n)
+	}
+}
+
+// An existing DB is rebuilt onto the wider key, and keeps what it already had.
+//
+// SQLite cannot ALTER a primary key, so the table is recreated and copied. The
+// rows in it are an operator's answers to real conflicts; losing them would put
+// every node back to re-acknowledging history it had already been through, which
+// is the exact failure the durable table exists to prevent.
+func TestMigrateAcknowledgedTiesPK_RebuildsAndKeepsExistingAnswers(t *testing.T) {
+	ctx := context.Background()
+	c := testClient(t)
+
+	// Recreate the pre-migration shape underneath the client.
+	for _, stmt := range []string{
+		`DROP TABLE acknowledged_ties`,
+		`CREATE TABLE acknowledged_ties (
+			table_name      TEXT NOT NULL,
+			pk              TEXT NOT NULL,
+			content_pair    TEXT NOT NULL,
+			acknowledged_at TEXT NOT NULL,
+			acknowledged_by TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (table_name, pk)
+		)`,
+		`INSERT INTO acknowledged_ties VALUES
+		   ('vms','vm1','pair-a','2026-09-20T19:44:06Z','alice')`,
+	} {
+		if err := c.execLocal(ctx, stmt); err != nil {
+			t.Fatalf("seed old shape (%.40s): %v", stmt, err)
+		}
+	}
+
+	if err := c.migrateAcknowledgedTiesPK(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	// content_pair is now part of the key...
+	info, err := c.Query(ctx, `PRAGMA table_info(acknowledged_ties)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	keyed := false
+	for _, r := range info {
+		if r.String("name") == "content_pair" && r.Int("pk") > 0 {
+			keyed = true
+		}
+	}
+	if !keyed {
+		t.Error("content_pair is still not part of the primary key, so a row can still " +
+			"hold only one answered divergence")
+	}
+
+	// ...the operator's answer survived it...
+	rows, err := c.Query(ctx, `SELECT content_pair, acknowledged_by FROM acknowledged_ties`)
+	if err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if len(rows) != 1 || rows[0].String("content_pair") != "pair-a" || rows[0].String("acknowledged_by") != "alice" {
+		t.Fatalf("the existing acknowledgement did not survive the rebuild: %+v", rows)
+	}
+
+	// ...and a second pair on the same row can now be stored beside it.
+	if err := c.execLocal(ctx, `INSERT INTO acknowledged_ties VALUES
+		('vms','vm1','pair-b','2026-09-21T02:22:15Z','bob')`); err != nil {
+		t.Fatalf("second pair on the same row was rejected: %v", err)
+	}
+
+	// Re-running is a no-op, not a second rebuild: startup calls it every time.
+	if err := c.migrateAcknowledgedTiesPK(ctx); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	after, err := c.Query(ctx, `SELECT content_pair FROM acknowledged_ties`)
+	if err != nil {
+		t.Fatalf("select after re-run: %v", err)
+	}
+	if len(after) != 2 {
+		t.Errorf("re-running the migration changed the table (%d rows, want 2)", len(after))
+	}
+}
+
+// Every acknowledged pair has to come back after a restart, not just one.
+//
+// The register is in-memory and primed from acknowledged_ties at startup, so the
+// load path decides what survives. While the table held one row per (table, PK)
+// this could not have been wrong; now that a row can carry several answered
+// pairs, a load that kept only the last would silently undo an operator's work
+// on every daemon restart — and the next sweep would re-raise the condition, the
+// exact loop the durable table exists to end.
+func TestAcknowledgedTies_EveryPairSurvivesARestart(t *testing.T) {
+	ctx := context.Background()
+	dsn := fmt.Sprintf("ackmultirestart%d", testDBCounter.Add(1))
+	const (
+		table = "leader_lease_terms"
+		pk    = `["dual_run_detector","2"]`
+		cat   = "immutable_ledger_conflict"
+	)
+	pairs := []string{"vs-node-2", "vs-node-3", "vs-node-4"}
+
+	before, err := NewSharedTestClient(dsn, "host-a")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer before.Close()
+	if err := InitSchema(ctx, before); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	for _, pair := range pairs {
+		before.trackUnresolvedPair(table, pk, pair, pathAE, cat)
+		if ok, err := before.AcknowledgeUnresolvedTie(ctx, table, pk, "op"); err != nil || !ok {
+			t.Fatalf("acknowledging %s: ok=%v err=%v", pair, ok, err)
+		}
+	}
+
+	after, err := NewSharedTestClient(dsn, "host-a")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer after.Close()
+	if err := InitSchema(ctx, after); err != nil {
+		t.Fatalf("InitSchema after restart: %v", err)
+	}
+	for _, pair := range pairs {
+		after.trackUnresolvedPair(table, pk, pair, pathAE, cat)
+		if n := after.UnresolvedTieCount(); n != 0 {
+			t.Errorf("%s registered as live after a restart (count=%d): the acknowledgement "+
+				"did not survive, so the operator must answer for it again", pair, n)
+		}
+	}
+}
+
+// The rebuild has to be WIRED INTO STARTUP, not merely available.
+//
+// This is the path a node actually takes: it comes up on the new binary with a
+// database written by the old one. Removing the call from InitSchema broke no
+// test while the migration was only ever invoked directly, which would have
+// shipped a fix that never ran anywhere.
+func TestInitSchema_MigratesAnExistingAcknowledgedTiesTable(t *testing.T) {
+	ctx := context.Background()
+	dsn := fmt.Sprintf("ackpkwiring%d", testDBCounter.Add(1))
+
+	first, err := NewSharedTestClient(dsn, "host-a")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer first.Close()
+	if err := InitSchema(ctx, first); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	// Put the database back to how the previous binary left it.
+	for _, stmt := range []string{
+		`DROP TABLE acknowledged_ties`,
+		`CREATE TABLE acknowledged_ties (
+			table_name      TEXT NOT NULL,
+			pk              TEXT NOT NULL,
+			content_pair    TEXT NOT NULL,
+			acknowledged_at TEXT NOT NULL,
+			acknowledged_by TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (table_name, pk)
+		)`,
+		`INSERT INTO acknowledged_ties VALUES
+		   ('leader_lease_terms','["dual_run_detector","2"]','vs-node-2','2026-09-20T19:44:06Z','admin')`,
+	} {
+		if err := first.execLocal(ctx, stmt); err != nil {
+			t.Fatalf("downgrade the table (%.40s): %v", stmt, err)
+		}
+	}
+
+	// Restart onto the new binary.
+	second, err := NewSharedTestClient(dsn, "host-a")
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer second.Close()
+	if err := InitSchema(ctx, second); err != nil {
+		t.Fatalf("InitSchema after restart: %v", err)
+	}
+
+	info, err := second.Query(ctx, `PRAGMA table_info(acknowledged_ties)`)
+	if err != nil {
+		t.Fatalf("table_info: %v", err)
+	}
+	for _, r := range info {
+		if r.String("name") == "content_pair" && r.Int("pk") > 0 {
+			// Migrated. The operator's existing answer must still be there.
+			rows, qerr := second.Query(ctx, `SELECT acknowledged_by FROM acknowledged_ties`)
+			if qerr != nil {
+				t.Fatalf("select: %v", qerr)
+			}
+			if len(rows) != 1 || rows[0].String("acknowledged_by") != "admin" {
+				t.Errorf("startup rebuilt the table but lost the acknowledgement: %+v", rows)
+			}
+			return
+		}
+	}
+	t.Error("startup left acknowledged_ties on the old primary key: the rebuild exists " +
+		"but nothing calls it, so no node would ever apply it")
+}

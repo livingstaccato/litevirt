@@ -359,6 +359,14 @@ func (s *Server) autoDefineRestoredVM(
 			return "", "", status.Errorf(codes.Internal, "persist restored firmware VM %q: %v", targetName, err)
 		}
 		slog.Error("live-restore: failed to write VM to corrosion", "vm", targetName, "error", err)
+	} else {
+		// Inserted at "running", so the row sits at the vm_owner_epoch default of
+		// 0, which convergence returns early on and the default-off backfill never
+		// graduates. Guarded on the insert having landed — which matters more here
+		// than elsewhere, because a non-firmware insert failure is NOT fatal on
+		// this path, so without the else a failed insert would graduate a row that
+		// does not exist.
+		s.assignOwnerEpochAtCreate(ctx, targetName)
 	}
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")

@@ -358,6 +358,18 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		rollbackClone(state == "running")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}
+	// A clone that came up running was inserted at the vm_owner_epoch default of
+	// 0, where convergence returns early and the default-off backfill never
+	// reaches it — a running VM nobody can prove. Graduate it the way CreateVM
+	// does, guarded on the insert having landed.
+	//
+	// Conditional, unlike CreateVM's unconditional call, because a clone can land
+	// stopped: assignOwnerEpochAtCreate also stamps the two RUNTIME markers, and
+	// stamping those for a domain that is not running would assert a generation
+	// owns a runtime that does not exist.
+	if state == "running" {
+		s.assignOwnerEpochAtCreate(ctx, req.Target)
+	}
 
 	slog.Info("VM cloned", "source", req.Source, "target", req.Target, "mode", mode, "host", s.hostName)
 	s.audit(ctx, "vm.clone", req.Target, fmt.Sprintf("source=%s mode=%s", req.Source, mode), "ok")

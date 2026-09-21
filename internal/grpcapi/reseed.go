@@ -212,6 +212,25 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	// what the quarantine contains) would survive and be re-injected once the
 	// epoch cleared. The lab proved it: a merge-only reseed failed its own
 	// convergence check because the stale rows were still there.
+	// MARK before the first DELETE. The three steps below cannot be one
+	// transaction, and the gap between the operator merge and the sensitive merge
+	// is a fail-OPEN window: users and their password hashes come back in the
+	// first, user_2fa only in the second, and LocalRealm.Authenticate reads an
+	// empty user_2fa as "nobody enrolled". A process that dies in between used to
+	// come back authenticating every enrolled account by password alone.
+	//
+	// The marker is durable and local-only, so it survives both the death and the
+	// discard, and the pre-session login paths refuse while it is set. It is
+	// cleared once the sensitive merge has committed — not after convergence,
+	// because by then the window is already shut and holding it longer would
+	// refuse logins on a node whose secrets are fully restored.
+	if err := s.db.BeginReseed(ctx, source); err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Internal,
+			"could not mark this node as mid-reseed, so the reseed was not started "+
+				"(nothing was discarded): %v", err)
+	}
+
 	cleared, err := s.db.DiscardReplicatedStateForReseed(ctx)
 	if err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
@@ -228,6 +247,14 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 		return nil, status.Errorf(codes.Internal,
 			"merge sensitive state from %s (this node's secret-bearing tables are now "+
 				"EMPTY and it needs a repeat reseed before it can serve): %v", source, err)
+	}
+
+	// The window is shut: user_2fa is restored, so the login gate may lift.
+	if err := s.db.FinishReseed(ctx); err != nil {
+		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		return nil, status.Errorf(codes.Internal,
+			"state was restored from %s but this node could not clear its reseed marker, so it "+
+				"will keep refusing logins until it does: %v", source, err)
 	}
 
 	// VERIFY convergence before clearing anything. Only a verified reseed earns

@@ -544,6 +544,9 @@ func InitSchema(ctx context.Context, c *Client) error {
 	if err := c.execLocal(ctx, acknowledgedTiesDDL); err != nil {
 		return fmt.Errorf("create acknowledged_ties: %w", err)
 	}
+	if err := c.execLocal(ctx, reseedInProgressDDL); err != nil {
+		return fmt.Errorf("create reseed_in_progress: %w", err)
+	}
 	if err := c.migrateAcknowledgedTiesPK(ctx); err != nil {
 		return err
 	}

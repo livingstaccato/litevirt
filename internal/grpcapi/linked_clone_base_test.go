@@ -8,7 +8,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// `lv vm delete base --keep-disks` exists so linked clones stay valid: it
+// `lv rm base --keep-disks` exists so linked clones stay valid: it
 // tombstones the base's rows and leaves base-root.qcow2 on disk, still named by
 // every overlay's backing_disk. Creating a NEW VM that reuses the name then runs
 // the debris glob for "base-*.qcow2" — and the keep set it is given is derived

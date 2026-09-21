@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"log/slog"
+	"net"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -43,10 +44,7 @@ func (s *Server) Login(ctx context.Context, req *pb.LoginRequest) (*pb.LoginResp
 			"login requires either username+password or oidc_code+oidc_state")
 	}
 
-	clientIP := ""
-	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
-		clientIP = p.Addr.String()
-	}
+	clientIP := throttleClientIP(ctx)
 
 	// Brute-force lockout: refuse early if this (username, IP) is currently
 	// locked out from too many recent failures. Keyed on the attempted
@@ -490,4 +488,28 @@ func (s *Server) RevokeToken(ctx context.Context, req *pb.RevokeTokenRequest) (*
 	slog.Info("token revoked", "id", req.Id)
 	s.audit(ctx, "token.revoke", req.Id, "", "ok")
 	return &emptypb.Empty{}, nil
+}
+
+// throttleClientIP is the address the brute-force lockout is keyed on.
+//
+// The HOST only. Addr.String() on TCP is "IP:PORT", and every reconnect gets a
+// fresh ephemeral source port — so keying on it gave each attempt its own
+// lockout bucket, and an attacker opening a new connection per try never
+// accumulated a single failure. The limit existed and never engaged.
+//
+// A malformed or non-TCP address falls back to the whole string rather than to
+// "": an unparsed address still separates one client from another, while ""
+// collapses every caller into one bucket and lets a single attacker lock out
+// the whole cluster.
+func throttleClientIP(ctx context.Context) string {
+	p, ok := peer.FromContext(ctx)
+	if !ok || p.Addr == nil {
+		return ""
+	}
+	full := p.Addr.String()
+	host, _, err := net.SplitHostPort(full)
+	if err != nil {
+		return full
+	}
+	return host
 }

@@ -55,6 +55,27 @@ func WriteVMOwnerEpochMarker(dataDir, name string, epoch int64) error {
 	return writeOwnerEpochMarker(filepath.Join(dataDir, "vms"), name, epoch)
 }
 
+// RemoveVMOwnerEpochMarker deletes a VM's host-local marker. Absent is success.
+//
+// Nothing used to do this, for VMs or containers, so a marker outlived the VM it
+// named. That is not merely untidy on a reused name: assignOwnerEpochAtCreate
+// deliberately writes NO marker when its graduation fails, because a marker
+// above a row at 0 is a mismatch convergeOwnerEpochMarker returns early on and
+// never repairs, and assertRuntimeOwnership then reads marker_epoch_mismatch and
+// refuses that VM's legitimate sole-holder re-key permanently. A leftover marker
+// from a previous VM of the same name reaches that state through a door the
+// create path cannot close, so the delete path has to shut it.
+func RemoveVMOwnerEpochMarker(dataDir, name string) error {
+	if err := safename.ValidateVMName(name); err != nil {
+		return err
+	}
+	err := os.Remove(filepath.Join(dataDir, "vms", name, ownerEpochMarkerFile))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // ReadVMOwnerEpochMarker reads the host-local VM marker.
 func ReadVMOwnerEpochMarker(dataDir, name string) (int64, bool, error) {
 	return readOwnerEpochMarker(filepath.Join(dataDir, "vms"), name)

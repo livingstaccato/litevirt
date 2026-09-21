@@ -570,7 +570,7 @@ func (s *Server) protectedDiskPaths(ctx context.Context, vmName string) map[stri
 	// rows. Deriving it from the rows cannot work on the create path: createVM
 	// refuses a duplicate live name before it gets here, so the VM it is about to
 	// create has no live rows by construction and the keep set was always empty —
-	// while `lv vm delete base --keep-disks` leaves base-root.qcow2 on disk,
+	// while `lv rm base --keep-disks` leaves base-root.qcow2 on disk,
 	// tombstoned but still named by every overlay's backing_disk. Reusing the name
 	// then globbed base-*.qcow2 with nothing protected and destroyed every clone's
 	// chain, unrecoverably.

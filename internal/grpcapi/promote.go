@@ -928,21 +928,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if err := corrosion.InsertVMWithHardware(ctx, s.db, rec, ifaceRecords, diskRecords, nicRecords, nil, false); err != nil {
 			return status.Errorf(codes.Internal, "persist promoted vm: %v", err)
 		}
-		// The row above was inserted at "running" and therefore at the
-		// vm_owner_epoch default of 0. Nothing routine graduates it — convergence
-		// returns early on a zero epoch and the backfill is gated behind
-		// enforcement.owner_epoch, off by default — so a promoted VM stayed
-		// running and unprovable. Guarded on the insert having landed, like
-		// CreateVM. The invariant lives on assignOwnerEpochAtCreate; do not
-		// restate it here, or the copies drift.
-		//
-		// Only this branch needs it. The else branch re-homes an EXISTING row
-		// through TransferVMOwnerFresh, which is an ownership transition that
-		// advances the epoch itself.
+		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
+		// promotion inserts a fresh row and no transfer ever follows it, so
+		// nothing here mints a generation. Without this the row is born running
+		// at epoch 0 and stays there — convergence early-returns on zero and the
+		// backfill is off by default.
 		s.assignOwnerEpochAtCreate(ctx, targetName)
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
-		if err := corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running"); err != nil {
+		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {
+			return corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running")
+		}); err != nil {
 			return status.Errorf(codes.Internal, "re-home vm record: %v", err)
 		}
 		if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, targetName, src.DiskName, s.hostName, livePath); err != nil {

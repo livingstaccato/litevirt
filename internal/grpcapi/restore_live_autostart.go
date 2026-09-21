@@ -360,12 +360,13 @@ func (s *Server) autoDefineRestoredVM(
 		}
 		slog.Error("live-restore: failed to write VM to corrosion", "vm", targetName, "error", err)
 	} else {
-		// Inserted at "running", so the row sits at the vm_owner_epoch default of
-		// 0, which convergence returns early on and the default-off backfill never
-		// graduates. Guarded on the insert having landed — which matters more here
-		// than elsewhere, because a non-firmware insert failure is NOT fatal on
-		// this path, so without the else a failed insert would graduate a row that
-		// does not exist.
+		// Born running at the column default of 0, exactly like CreateVM was
+		// before the create path graduated. Nothing else does it: convergence
+		// early-returns on a zero epoch, and the backfill that would graduate it
+		// is gated behind enforcement.owner_epoch, which is off by default.
+		//
+		// In the else on purpose: a non-firmware insert failure is NOT fatal on
+		// this path, so an unguarded call would graduate a row that does not exist.
 		s.assignOwnerEpochAtCreate(ctx, targetName)
 	}
 	restoreOK = true

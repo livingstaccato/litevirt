@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/safename"
@@ -135,6 +136,40 @@ func MachineTypeFromXML(domXML string) string {
 	}
 	return d.OS.Machine
 }
+
+// UUIDFromXML extracts a domain's <uuid> from its libvirt XML, lower-cased and
+// trimmed, or "" when absent or not a UUID.
+//
+// libvirt mints a UUID for every domain it defines, so the persistent XML is the
+// authority for a VM whose stored spec predates litevirt recording one. It is
+// read on the OWNING host, which is the only place that XML exists.
+//
+// Trimmed because libvirt pretty-prints its persistent XML, so the element body
+// arrives wrapped in whitespace; lower-cased because a UUID is compared as a
+// STRING everywhere it matters — most consequentially inside the NetBox identity
+// (`lv:<fingerprint>:<uuid>:<mac>`), where a differently-cased or padded value is
+// a different identity and would orphan the object it was meant to name.
+//
+// VALIDATED, not merely trimmed: a body that is not a UUID yields "" rather than
+// being written into a spec as though it were one. A wrong uuid is worse than an
+// absent one — absence is visible and skipped, while a bogus value mints a
+// confident, permanently wrong identity.
+func UUIDFromXML(domXML string) string {
+	var d struct {
+		UUID string `xml:"uuid"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &d); err != nil {
+		return ""
+	}
+	u := strings.ToLower(strings.TrimSpace(d.UUID))
+	if !uuidRe.MatchString(u) {
+		return ""
+	}
+	return u
+}
+
+// uuidRe is the canonical 8-4-4-4-12 hex form libvirt emits.
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
 // MaxVCPUFromXML returns a domain's MAXIMUM vCPU count from its XML — the <vcpu>
 // element's body (which is the hotplug ceiling when a current= attr is present, or
@@ -369,19 +404,29 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 		if targetDev == "" {
 			targetDev = DiskDevName(d.Bus, i)
 		}
+		// The <disk type>, its <source> attributes and the <driver type> are all
+		// decided by what the storage driver actually handed us: a file, a block
+		// device or an rbd locator. See diskBacking.
+		diskType, source, driverType, dbErr := diskBacking(d.Path)
+		if dbErr != nil {
+			return "", dbErr
+		}
 		disk := diskDevice{
-			Type:   "file",
+			Type:   diskType,
 			Device: "disk",
-			Driver: diskDriver{Name: "qemu", Type: "qcow2", Cache: d.Cache},
-			Source: diskSource{File: d.Path},
+			Driver: diskDriver{Name: "qemu", Type: driverType, Cache: d.Cache},
+			Source: source,
 			Target: diskTarget{Dev: targetDev, Bus: d.Bus},
 		}
 		if d.Cache == "" {
 			disk.Driver.Cache = "writeback"
 		}
 		if d.IsISO {
+			// An ISO is a raw file on the host whatever backs the VM's disks.
 			disk.Device = "cdrom"
+			disk.Type = "file"
 			disk.Driver.Type = "raw"
+			disk.Source = diskSource{File: d.Path}
 			disk.Target = diskTarget{Dev: fmt.Sprintf("sd%c", 'a'+i), Bus: "sata"}
 			disk.Readonly = &struct{}{}
 		}
@@ -873,8 +918,23 @@ type diskDriver struct {
 	Cache string `xml:"cache,attr,omitempty"`
 }
 
+// diskSource carries the three shapes libvirt accepts, selected by the
+// enclosing <disk type=…>: a file path, a block device, or a network locator.
+// Exactly one group is ever populated — see diskBacking.
 type diskSource struct {
-	File string `xml:"file,attr,omitempty"`
+	File string `xml:"file,attr,omitempty"` // type="file"
+	Dev  string `xml:"dev,attr,omitempty"`  // type="block"
+	// type="network"
+	Protocol string           `xml:"protocol,attr,omitempty"`
+	Name     string           `xml:"name,attr,omitempty"`
+	Hosts    []diskSourceHost `xml:"host,omitempty"`
+}
+
+// diskSourceHost is one monitor/target address for a network-backed disk.
+type diskSourceHost struct {
+	XMLName xml.Name `xml:"host"`
+	Name    string   `xml:"name,attr"`
+	Port    string   `xml:"port,attr,omitempty"`
 }
 
 type diskTarget struct {

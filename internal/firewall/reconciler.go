@@ -99,7 +99,7 @@ func (r *Reconciler) Stop() {
 }
 
 // LastError returns the most recent reconcile error (or nil). Useful
-// for `lv firewall status` — surfaces "Corrosion unreachable" without
+// for `lv firewall show` — surfaces "Corrosion unreachable" without
 // the operator needing to dig through logs.
 func (r *Reconciler) LastError() error {
 	r.mu.Lock()
@@ -137,6 +137,22 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// one if unchanged) — safe to clear the old out-of-band rules for these bridges.
 	r.migrateLegacy(plan)
 	return nil
+}
+
+// ReconcileForce is Reconcile with the change-detection cache cleared first, so
+// the ruleset reaches nft even when the rendered bytes are unchanged.
+//
+// This is what `lv firewall reload` must call. Routed through plain Reconcile
+// it hit the Applier's cache and did nothing — the one command an operator runs
+// when they believe the kernel has drifted out from under the daemon was a
+// no-op, which is the same defect as the "periodic re-apply self-heals" claim
+// above.
+//
+// Reset also clears the resync timestamp, so the forced apply restarts the
+// window rather than leaving the next tick due immediately.
+func (r *Reconciler) ReconcileForce(ctx context.Context) error {
+	r.applier.Reset()
+	return r.Reconcile(ctx)
 }
 
 // migrateLegacy removes, once per bridge, the pre-consolidation rules a prior

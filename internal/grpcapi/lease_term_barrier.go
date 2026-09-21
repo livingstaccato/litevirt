@@ -2,6 +2,9 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -44,16 +47,24 @@ const (
 	// safety it does not already have, and every accept pays for a fresh sweep
 	// regardless (see leaseTermBarrier).
 	//
-	// It exists for the one event that walks the observed high water BACKWARDS: a
-	// reseed. A reseeding node loses exactly the terms its reseed source never
-	// received, so its ledger's maximum can legitimately drop, and a pre-reseed
-	// observation left in cache would refuse proofs the post-reseed ledger
-	// considers current. This bounds that window, which makes it a small fixed
+	// It exists for the event that walks the observed high water BACKWARDS:
+	// losing the peer that held the highest term. The threshold is the maximum
+	// over every REACHABLE peer (sweepLeaseTermHighWater asks them all), so when
+	// the node holding term 6 goes away the next sweep legitimately answers 4,
+	// and an observation left in cache from before would refuse term-5 proofs the
+	// cluster now considers current. This bounds that window, which makes it a
+	// small fixed
 	// constant rather than a fraction of any lease TTL — the three consumers keep
 	// deliberately different TTLs (leaseDuration, 2*interval, 2*PollInterval), so
 	// deriving from one would couple the barrier to whichever it borrowed from.
 	// 3s matches health.capActiveNegTTL, the one short-lived negative cache
 	// already in service.
+	//
+	// Both comments here used to blame a RESEED for the backwards step, and that
+	// cause is wrong: leader_lease_terms is in corrosion.reseedKeepTables, so a
+	// reseed neither discards it nor lets the merge lower it — the ledger's
+	// maximum cannot regress that way. The window is real, the old explanation
+	// was not. TestLeaseBarrier_AReseedCannotRegressTheHighWater pins it.
 	leaseBarrierCacheTTL = 3 * time.Second
 	// leaseBarrierSilentTTL bounds how long a peer stays remembered as silent.
 	//
@@ -181,9 +192,9 @@ func (s *Server) storeLeaseThreshold(key string, threshold int64) {
 	// cachedLeaseThreshold's. Clamping against an EXPIRED entry resurrects it:
 	// the higher value is kept and `at` is re-stamped, so the entry never ages
 	// out while traffic continues, and since every accept pays for a fresh sweep
-	// (leaseTermBarrier), ordinary traffic renews it indefinitely. A post-reseed
-	// threshold that legitimately drops from 6 to 4 would then refuse term-5
-	// proofs forever — and the TTL, whose entire purpose is to bound exactly that
+	// (leaseTermBarrier), ordinary traffic renews it indefinitely. A threshold
+	// that legitimately drops from 6 to 4 — the peer holding 6 became
+	// unreachable — would then refuse term-5 proofs forever — and the TTL, whose entire purpose is to bound exactly that
 	// window, would bound nothing. Read expiry here or the constant is decorative.
 	if e, ok := s.leaseBarrierCache[key]; ok &&
 		time.Since(e.at) <= leaseBarrierCacheTTL && e.threshold > threshold {
@@ -325,22 +336,72 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 	// breaker: a peer that has recovered still answers, because answering takes
 	// milliseconds. The one thing it can cost is an answer from a peer that
 	// recovered but is slow, which is repaired below rather than left to a retry.
+	// Drop memo entries for hosts that have left the fleet before consulting
+	// them; nothing else ever visits those keys again.
+	s.forgetDepartedPeers(peers)
+
 	silent := s.recentlySilentPeers(peers)
 
 	highest, answers, answered := s.fanOutHighWater(sctx, key, local, peers, silent)
 
-	// A shortfall must never be caused by our own shortcut. If the quorum was
-	// missed and any peer was short-deadlined, pay full price before refusing —
+	// A MISSING ANSWER must never be caused by our own shortcut. This used to
+	// repair only on a quorum shortfall (`answers < needed`), which left the one
+	// case the shortcut can actually corrupt: quorum met by the other peers
+	// WITHOUT the short-deadlined one. The barrier's whole job is to find a term
+	// higher than this node's replica, and the peer we chose not to wait for is
+	// exactly as likely to hold it as any other — more so, because a superseding
+	// coordinator is often the node busiest with the same incident.
+	//
+	// noteSilentPeers re-stamps on every miss, so without this a healthy peer
+	// that is merely slower than the probe stays pinned in the silent set and
+	// the shortcut recurs on every later sweep, never repaired.
+	//
 	// sctx still bounds the whole sweep, so this cannot exceed the budget a
 	// single-pass sweep would have spent anyway.
-	if answers < needed && len(silent) > 0 {
-		highest, answers, answered = s.fanOutHighWater(sctx, key, local, peers, nil)
+	if len(silent) > 0 && s.repairWouldAskSomeoneNew(peers, answered) {
+		// The repair gets its OWN budget, derived from the caller's context
+		// rather than from sctx.
+		//
+		// Sharing sctx made the repair a no-op precisely when it was most needed:
+		// a peer we did NOT memoise can hang for the entire budget, and the
+		// repair — which exists solely to undo our short-deadlining of a
+		// DIFFERENT peer — then inherits an already-expired context and asks
+		// nobody. The sweep accepted on evidence it had chosen not to collect.
+		//
+		// Worst-case cost is now two budgets rather than one, and that is bounded
+		// on both sides: repairWouldAskSomeoneNew gives each unanswered peer only
+		// one full-price chance per memo window, so a dead peer cannot buy a
+		// second budget on every sweep.
+		rctx, rcancel := context.WithTimeout(ctx, leaseBarrierBudget)
+		highest, answers, answered = s.fanOutHighWater(rctx, key, local, peers, nil)
+		rcancel()
+		s.noteFullyProbed(peers, answered)
 	}
 
 	s.noteSilentPeers(peers, answered)
 
 	if answers < needed {
 		return 0, false
+	}
+
+	// An accept reached on INCOMPLETE evidence is byte-identical to one reached
+	// on a complete sweep, and it is the shape that can miss a superseding term.
+	// The accept criterion itself is deliberately left at quorum — tightening it
+	// to a complete sweep is an availability trade that belongs in its own
+	// change — but it must not also be invisible.
+	if len(answered) < len(peers) {
+		s.noteLeaseBarrierIncomplete(key, len(answered), len(peers))
+		missing := make([]string, 0, len(peers)-len(answered))
+		for _, p := range peers {
+			if !answered[p] {
+				missing = append(missing, p)
+			}
+		}
+		sort.Strings(missing)
+		slog.Warn("lease-term barrier: accepting on an INCOMPLETE sweep — these peers gave no "+
+			"answer, so a term higher than the one accepted could be held by one of them",
+			"key", key, "accepted_term", highest, "answered", len(answered),
+			"peers", len(peers), "unanswered", strings.Join(missing, ","))
 	}
 	return highest, true
 }
@@ -422,6 +483,85 @@ func (s *Server) recentlySilentPeers(peers []string) map[string]bool {
 		out[p] = true
 	}
 	return out
+}
+
+// forgetDepartedPeers drops memo entries for hosts that are no longer in the
+// fleet.
+//
+// Both memos are keyed by host name, and every other access — the TTL prune in
+// recentlySilentPeers included — iterates the CURRENT peer list. An entry for a
+// host that has left is therefore never visited again, so the TTL that looks
+// like it bounds these maps only ever runs for peers still present. That makes
+// them unowned state that grows with fleet churn: every decommission, rename or
+// re-IP leaves a key behind for the life of the process.
+//
+// Pruning on absence is also correct, not merely tidy. HealthyPeers already
+// excludes a peer this node cannot reach, and such a peer is not asked at all —
+// so there is nothing for a memo about it to optimise. When it returns it pays
+// one full-budget ask, which is exactly what a peer with no history should pay.
+func (s *Server) forgetDepartedPeers(peers []string) {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	if len(s.leaseBarrierSilent) == 0 && len(s.leaseBarrierFullProbe) == 0 {
+		return
+	}
+	present := make(map[string]bool, len(peers))
+	for _, p := range peers {
+		present[p] = true
+	}
+	for p := range s.leaseBarrierSilent {
+		if !present[p] {
+			delete(s.leaseBarrierSilent, p)
+		}
+	}
+	for p := range s.leaseBarrierFullProbe {
+		if !present[p] {
+			delete(s.leaseBarrierFullProbe, p)
+		}
+	}
+}
+
+// repairWouldAskSomeoneNew reports whether a full-price repair pass has anyone
+// left to learn from: some peer gave no answer on the short probe AND has not
+// already been given the full budget within the memo window.
+//
+// Without the second half, the repair undoes the very cost bound the silent memo
+// exists to provide — a permanently dead peer would buy a full budget on every
+// sweep, which is the 40-workload serial burst the shortcut was introduced to
+// stop. With it, a peer gets exactly one full-price chance per window: a slow
+// but living peer answers it and is un-memoised, while a dead one is charged
+// once and then stays cheap.
+func (s *Server) repairWouldAskSomeoneNew(peers []string, answered map[string]bool) bool {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	now := time.Now()
+	for _, p := range peers {
+		if answered[p] {
+			continue
+		}
+		at, ok := s.leaseBarrierFullProbe[p]
+		if !ok || now.Sub(at) > leaseBarrierSilentTTL {
+			return true
+		}
+	}
+	return false
+}
+
+// noteFullyProbed records that a peer has had its full-budget chance. A peer
+// that ANSWERED is cleared, so a recovered peer is never charged again.
+func (s *Server) noteFullyProbed(peers []string, answered map[string]bool) {
+	s.leaseBarrierMu.Lock()
+	defer s.leaseBarrierMu.Unlock()
+	for _, p := range peers {
+		if answered[p] {
+			delete(s.leaseBarrierFullProbe, p)
+			continue
+		}
+		if s.leaseBarrierFullProbe == nil {
+			s.leaseBarrierFullProbe = make(map[string]time.Time, len(peers))
+		}
+		s.leaseBarrierFullProbe[p] = time.Now()
+	}
 }
 
 // noteSilentPeers records which peers answered nothing and forgets the ones that

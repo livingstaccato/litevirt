@@ -27,6 +27,25 @@ import (
 
 const reconcileInterval = 15 * time.Second
 
+// reconcileWalkBudget bounds the pending-VM walk inside ONE pass.
+//
+// The walk is serial and every per-VM step is bounded only on its own — the
+// lease-term barrier, for instance, has a budget per call. Nothing bounded the
+// SUM, so a large failover, or a partition where peers time out, could spend
+// unbounded time in the walk. selfFence and assertRuntimeOwnership run after it
+// on this same goroutine, and selfFence is how a doomed node stops driving
+// decisions while it waits for the watchdog — it must not be pushed arbitrarily
+// past the tick it is supposed to run on.
+//
+// Cutting the walk short costs a delayed VM start: it is idempotent and the next
+// tick picks the row up again. Not cutting it short costs a delayed self-fence.
+// That asymmetry is the whole reason for this value.
+//
+// Kept below reconcileInterval so a pass that spends its whole budget still
+// leaves room for the two sweeps before the next tick. A var, not a const, so
+// tests can shrink it.
+var reconcileWalkBudget = 10 * time.Second
+
 // Reconciler watches for VMs in "pending" state on the local host
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
@@ -246,7 +265,17 @@ func (r *Reconciler) SetBackupInProgress(fn func(vmName string) bool) {
 // periodic loop, exported for the fleet harness (and one-shot ops) to drive a
 // deterministic pass without waiting on the ticker.
 func (r *Reconciler) ReconcileOnce(ctx context.Context) {
-	r.reconcile(ctx)
+	r.reconcilePass(ctx)
+}
+
+// reconcilePass is one tick's work: the bounded pending-VM walk, then the two
+// safety sweeps. The sweeps deliberately take the UNBOUNDED ctx — they are what
+// the walk's budget exists to protect, not things to cut short.
+func (r *Reconciler) reconcilePass(ctx context.Context) {
+	wctx, cancel := context.WithTimeout(ctx, reconcileWalkBudget)
+	r.reconcile(wctx)
+	cancel()
+
 	r.selfFence(ctx)
 	r.assertRuntimeOwnership(ctx)
 }
@@ -260,9 +289,7 @@ func (r *Reconciler) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r.reconcile(ctx)
-			r.selfFence(ctx)
-			r.assertRuntimeOwnership(ctx)
+			r.reconcilePass(ctx)
 		}
 	}
 }
@@ -481,6 +508,10 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// One-shot machine-type backfill: pin the concrete machine type for VMs created
 			// before pinning existed. No-op once pinned (cheap stored-spec check).
 			r.maybePinMachineType(ctx, vm)
+			// One-shot uuid backfill, same shape and same reason: a VM created
+			// before litevirt recorded a domain uuid cannot be named in NetBox,
+			// and its unreadable record blocks every mirror delete cluster-wide.
+			r.maybeBackfillUUID(ctx, vm)
 			// The domain is defined but may have been stopped out-of-band (a
 			// crash, an external `virsh destroy`, or a fence that powered it
 			// off). Reconcile the cluster state to libvirt reality so it doesn't
@@ -553,8 +584,20 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			// machine type from its persistent domain. No-op once pinned, and a
 			// no-op if the domain isn't defined (DumpXMLInactive errors → "").
 			r.maybePinMachineType(ctx, vm)
+			// A stopped VM is still defined, so its domain uuid is readable and
+			// worth recording — a legacy VM is no less invisible to the mirror
+			// for being powered off.
+			r.maybeBackfillUUID(ctx, vm)
 
 		case "error":
+			// An errored VM is still a DEFINED domain, so its uuid is readable —
+			// and it is no less invisible to the inventory mirror for being in
+			// error. Leaving it out stranded exactly the VMs most likely to be
+			// legacy, and one unreadable record withholds every mirror delete
+			// cluster-wide, so the gap was not confined to the VM itself.
+			// Unconditional like the other two sites: the backfill's own checks
+			// make an undefined domain a no-op (DumpXMLInactive errors → "").
+			r.maybeBackfillUUID(ctx, vm)
 			// Check if an errored VM is actually running in libvirt (e.g. after
 			// daemon crash mid-operation). If so, update state to running.
 			if r.virt != nil && r.virt.DomainExists(vm.Name) {
@@ -671,6 +714,87 @@ func (r *Reconciler) maybePinMachineType(ctx context.Context, vm corrosion.VMRec
 		return // spec changed underneath us / operation active; retry next tick off the fresh value
 	}
 	slog.Info("reconciler: pinned machine type (one-shot backfill)", "vm", vm.Name, "from", cur.Machine, "to", resolved)
+}
+
+// maybeBackfillUUID is the one-shot uuid backfill for VMs created before
+// litevirt recorded a domain uuid in the stored spec.
+//
+// WHY IT MATTERS beyond tidiness: the uuid is what makes an identity
+// incarnation-unique, so a VM without one cannot be named in NetBox at all. The
+// inventory mirror skips it AND counts it as an unreadable record — and an
+// unreadable record is indistinguishable from a destroyed VM, so the mirror
+// withholds EVERY delete for as long as one exists (see netboxsync's
+// deleteBlocker). One legacy VM therefore stops the whole mirror converging.
+//
+// libvirt minted a uuid for the domain whatever litevirt stored, so the
+// persistent XML on the OWNING host is the authority — which is why this runs in
+// the reconciler's per-VM sweep rather than in a cluster-wide command: no other
+// node can read that XML.
+//
+// It NEVER rewrites a uuid the spec already carries, even if libvirt reports a
+// different one (a restore or import can redefine a domain under a fresh uuid).
+// The stored value is the identity other systems already hold; replacing it
+// would orphan every object stamped with it and mint a duplicate under the new
+// one. Absence is the only state this fills in.
+//
+// Fires at most once per VM — the stored-spec pre-check makes every subsequent
+// tick a no-op — and preserves every other spec field via the same raw edit
+// maybePinMachineType uses.
+func (r *Reconciler) maybeBackfillUUID(ctx context.Context, vm corrosion.VMRecord) {
+	if r.virt == nil || vm.Spec == "" {
+		return
+	}
+	var cur struct {
+		UUID string `json:"uuid"`
+	}
+	if err := json.Unmarshal([]byte(vm.Spec), &cur); err != nil {
+		return
+	}
+	if cur.UUID != "" {
+		return // already recorded — the steady-state case
+	}
+	xmlDesc, err := r.virt.DumpXMLInactive(vm.Name)
+	if err != nil {
+		return
+	}
+	resolved := lv.UUIDFromXML(xmlDesc)
+	if resolved == "" {
+		return // no usable uuid; a bogus one is worse than none
+	}
+	// Same sanctioned writer as the machine-type pin: MutateDesiredSpec re-reads
+	// the FRESH spec and replaces only "uuid", so a concurrent UpdateVM is not
+	// clobbered, and it defers while an operation holds the VM's mutation
+	// barrier.
+	applied, _, err := corrosion.MutateDesiredSpec(ctx, r.db, vm.Name, func(old string) (string, error) {
+		var freshU struct {
+			UUID string `json:"uuid"`
+		}
+		if err := json.Unmarshal([]byte(old), &freshU); err == nil && freshU.UUID != "" {
+			return old, nil // filled in underneath us → no-op (no generation bump)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(old), &raw); err != nil {
+			return "", err
+		}
+		uj, err := json.Marshal(resolved)
+		if err != nil {
+			return "", err
+		}
+		raw["uuid"] = uj
+		b, err := json.Marshal(raw)
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	})
+	if err != nil {
+		slog.Warn("reconciler: uuid backfill failed", "vm", vm.Name, "uuid", resolved, "error", err)
+		return
+	}
+	if !applied {
+		return // spec moved underneath us / operation active; retry next tick
+	}
+	slog.Info("reconciler: recorded the domain uuid (one-shot backfill)", "vm", vm.Name, "uuid", resolved)
 }
 
 func (r *Reconciler) selfFence(ctx context.Context) {
@@ -1352,9 +1476,16 @@ const vmLockTTL = 10 * time.Minute
 // lock then discovered the VM moved, and we release without acting", not
 // "two hosts both started the VM."
 func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
+	return acquireVMLockFor(ctx, r.db, r.hostName, vmName, r.now())
+}
+
+// acquireVMLockFor is acquireVMLock without a Reconciler. The restart-policy
+// path in VMChecker needs the same lease and is not a Reconciler, and a second
+// copy of this CRDT-tolerant upsert would be a second thing to get wrong.
+func acquireVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmName string, nowT time.Time) bool {
 	// Read the clock ONCE so `now` and `expires` derive from the same instant
 	// (a per-call test clock could otherwise advance between two reads).
-	base := r.now().UTC()
+	base := nowT.UTC()
 	now := base.Format(time.RFC3339)
 	expires := base.Add(vmLockTTL).Format(time.RFC3339)
 	// expired-check compares RFC3339-vs-RFC3339 (bound now), not datetime('now'):
@@ -1362,7 +1493,7 @@ func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
 	// breaks on a date match ('T' > ' ') and a same-day lock NEVER looks expired —
 	// a crashed holder's vm_lock would then block another host from reconciling
 	// that VM until the UTC date rolls.
-	if err := r.db.Execute(ctx,
+	if err := db.Execute(ctx,
 		`INSERT INTO vm_locks (vm_name, holder, expires_at, updated_at)
 		 VALUES (?, ?, ?, ?)
 		 ON CONFLICT(vm_name) DO UPDATE
@@ -1371,25 +1502,30 @@ func (r *Reconciler) acquireVMLock(ctx context.Context, vmName string) bool {
 		       updated_at = excluded.updated_at
 		   WHERE vm_locks.expires_at < ?
 		      OR vm_locks.holder = excluded.holder`,
-		vmName, r.hostName, expires, now, now); err != nil {
-		slog.Warn("reconciler: vm_lock write failed", "vm", vmName, "error", err)
+		vmName, hostName, expires, now, now); err != nil {
+		slog.Warn("vm_lock write failed", "vm", vmName, "holder", hostName, "error", err)
 		return false
 	}
-	rows, err := r.db.Query(ctx,
+	rows, err := db.Query(ctx,
 		`SELECT holder FROM vm_locks WHERE vm_name = ?`, vmName)
 	if err != nil || len(rows) == 0 {
 		return false
 	}
-	return rows[0].String("holder") == r.hostName
+	return rows[0].String("holder") == hostName
 }
 
 // releaseVMLock clears the per-VM lock. Best-effort; leaving a stale lock
 // is recoverable (next acquire after vmLockTTL succeeds).
 func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
-	if err := r.db.Execute(ctx,
+	releaseVMLockFor(ctx, r.db, r.hostName, vmName)
+}
+
+// releaseVMLockFor is releaseVMLock without a Reconciler. See acquireVMLockFor.
+func releaseVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmName string) {
+	if err := db.Execute(ctx,
 		`DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?`,
-		vmName, r.hostName); err != nil {
-		slog.Debug("reconciler: vm_lock release failed", "vm", vmName, "error", err)
+		vmName, hostName); err != nil {
+		slog.Debug("vm_lock release failed", "vm", vmName, "holder", hostName, "error", err)
 	}
 }
 
@@ -1451,27 +1587,23 @@ func (r *Reconciler) ownerEpochEnforced(ctx context.Context) bool {
 // marker is missing must keep their existing self-heal behavior (the backfill
 // and convergence passes are what graduate them), and failing closed on an
 // unreadable marker would strand a legitimately-owned VM.
-//
-// The HOST-LOCAL FILE MARKER IS THE ONLY INPUT, deliberately and by necessity.
-// The sole caller sits inside `!DomainExists`, so by the time this runs libvirt
-// has no domain for the VM — and undefining a domain destroys its metadata with
-// it, which is the whole reason the durable file marker exists (lab-proven
-// 2026-08-02).
-//
-// There used to be a domain-metadata fallback here "for a VM whose file marker
-// has not been written yet". It could not fire: DomainExists IS a
-// DomainLookupByName, the same lookup GetDomainOwnerEpoch performs first, so at
-// this point that call can only ever return a lookup error. It read as a second
-// line of defence that did not exist, and the two unit tests covering it passed
-// only because their fake returned metadata for a domain it did not have —
-// something real libvirt cannot do. Both assertions are covered through the file
-// marker by TestSelfHealRestart_RefusedOnSupersededFileMarker.
-//
-// So: a host with no readable file marker is never treated as superseded. That
-// is fail-open, which is the intended direction for an unreadable marker, but it
-// is the actual coverage — do not add a metadata read back without moving the
-// call site to somewhere a domain still exists.
 func (r *Reconciler) runtimeSuperseded(ctx context.Context, name string) bool {
+	// The HOST-LOCAL FILE MARKER IS THE ONLY INPUT, deliberately and by
+	// necessity. The sole caller sits inside `!DomainExists`, so by the time this
+	// runs libvirt has no domain for the VM — and undefining a domain destroys
+	// its metadata with it, which is the whole reason the durable file marker
+	// exists (lab-proven 2026-08-02).
+	//
+	// There used to be a domain-metadata fallback here "for a VM whose file
+	// marker has not been written yet". It could not fire: DomainExists IS a
+	// DomainLookupByName, the same lookup GetDomainOwnerEpoch performs first, so
+	// at this point that call can only ever return a lookup error. It read as a
+	// second line of defence that did not exist.
+	//
+	// So: a host with no readable file marker is never treated as superseded.
+	// That is fail-open, which is the intended direction for an unreadable
+	// marker, but it is the actual coverage — do not add a metadata read back
+	// without moving the call site to somewhere a domain still exists.
 	marker, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name)
 	if errors.Is(err, ErrPreEpochMarker) {
 		// A marker asserting generation 0 is not an unreadable marker, and must not

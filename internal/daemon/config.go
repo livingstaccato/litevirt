@@ -240,6 +240,23 @@ type NetBoxConfig struct {
 	// the operator's to hold. The mirror logs the name it resolved at startup so
 	// a disagreement is one comparison across the fleet's logs.
 	ClusterName string `yaml:"cluster_name,omitempty"`
+	// Site is the NetBox SITE NAME this installation's cluster is scoped to.
+	//
+	// Every VM in a NetBox cluster inherits that cluster's site, and a VM with
+	// no site is invisible to anything that scopes by one — NetBox's own
+	// filters, and the DNS and inventory integrations built on them. litevirt
+	// cannot derive which site the hardware sits in, so like ClusterName it is
+	// operator-supplied.
+	//
+	// Empty leaves the cluster's scope UNMANAGED rather than clearing it: the
+	// scope was settable by hand long before this key existed, and writing an
+	// empty value through would strip the site off a working cluster and take
+	// every VM's inherited site with it.
+	//
+	// A name that does not exist in NetBox FAILS the sweep rather than being
+	// treated as unset — silently mirroring VMs with no site is the outcome this
+	// setting exists to prevent, so a typo has to be loud.
+	Site string `yaml:"site,omitempty"`
 	// MirrorInventory opts this node into the INVENTORY MIRROR — the half of the
 	// integration that creates NetBox `virtual_machine` and `vminterface`
 	// objects and assigns addresses to them. Default FALSE: NetBox is pure IPAM.
@@ -483,9 +500,21 @@ type EnforcementConfig struct {
 	// ENFORCEMENT (refusing stale-row self-heal restarts) activates only after
 	// the fleet-wide latch. Enable fleet-uniformly; reversible kill switch.
 	OwnerEpoch bool `yaml:"owner_epoch,omitempty"`
-	// LeaseTerm opts this node into leader-lease term enforcement. Also the
-	// reversible kill switch: enforcement is this flag AND the lease_term_v1
-	// latch, so clearing it disables enforcement even after the latch closes.
+	// LeaseTerm opts this node into leader-lease term enforcement. Enforcement is
+	// this flag AND the lease_term_v1 latch, so clearing the flag disables
+	// enforcement on this node even after the latch has closed — the latch itself
+	// is one-way and durable, and there is no way to re-open it.
+	//
+	// It is reversible, but it is NOT a control you can reach during an incident
+	// without cost. Config is read ONCE at startup and the daemon deliberately
+	// does not reload it (SIGHUP is logged and dropped — see cmd/litevirt/signals.go
+	// for why), so clearing this means editing the file and RESTARTING the daemon
+	// on each affected node. A restart discards that node's healthy-peer anchors
+	// and re-enters quorum warmup, which is disruptive in exactly the degraded
+	// state that would make an operator want to reach for it.
+	//
+	// Plan the rollback path accordingly: it is a per-node config-and-restart
+	// roll, not a switch.
 	LeaseTerm bool `yaml:"lease_term,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched

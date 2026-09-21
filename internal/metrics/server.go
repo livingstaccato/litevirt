@@ -98,22 +98,48 @@ func NewServer(port int, bindAddr string, db *corrosion.Client, virt *libvirt.Cl
 	}
 }
 
+// metricsRequestTimeout bounds one scrape end to end, and metricsIdleTimeout
+// bounds a kept-alive connection between scrapes.
+//
+// The endpoint is unauthenticated and every scrape drives DB queries, so a
+// server with no timeouts lets one slow or hostile client hold a connection for
+// the life of the process, and a stuck collection outlives the scrape that asked
+// for it while later ones queue behind it.
+//
+// Generous relative to a healthy scrape (single-digit ms) — the point is a
+// ceiling, not a tight SLA.
+const (
+	metricsRequestTimeout = 30 * time.Second
+	metricsIdleTimeout    = 60 * time.Second
+)
+
+// newHTTPServer builds the metrics HTTP server. Split out from Start so its
+// timeout configuration is reachable from a test: an unset timeout is invisible
+// at a glance and is exactly the kind of omission that persists.
+func (s *Server) newHTTPServer() *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/api/v1/status", s.handleStatus)
+
+	return &http.Server{
+		// Addr(), not Sprintf("%s:%d"): an IPv6 literal needs brackets and must
+		// not get them twice. See normalizeBind.
+		Addr:              s.Addr(),
+		Handler:           mux,
+		ReadHeaderTimeout: metricsRequestTimeout,
+		ReadTimeout:       metricsRequestTimeout,
+		WriteTimeout:      metricsRequestTimeout,
+		IdleTimeout:       metricsIdleTimeout,
+	}
+}
+
 // Start begins serving metrics. Blocks.
 func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
 	s.registerer().MustRegister(collector)
 	registerTelemetryMetrics()
 
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/api/v1/status", s.handleStatus)
-
-	srv := &http.Server{
-		// Addr(), not Sprintf("%s:%d"): an IPv6 literal needs brackets and must
-		// not get them twice. See normalizeBind.
-		Addr:    s.Addr(),
-		Handler: mux,
-	}
+	srv := s.newHTTPServer()
 
 	s.mu.Lock()
 	if s.stopped {
@@ -447,7 +473,7 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 		),
 		replicationMinSeq: prometheus.NewDesc(
 			"litevirt_replication_min_watermark_seq",
-			"MIN(last_seq) across replication_watermarks; gates mutation_log compaction",
+			"MIN(last_seq) across recently-acked peers; a value that stops advancing means a peer stopped acknowledging",
 			nil, prometheus.Labels{"host": hostName},
 		),
 		replicationPending: prometheus.NewDesc(
@@ -533,7 +559,11 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *collector) Collect(ch chan<- prometheus.Metric) {
-	ctx := context.Background()
+	// Bounded, not context.Background(). Collect runs per scrape and drives many
+	// DB queries; an unbounded one lets a stuck query outlive the scrape that
+	// asked for it, and Prometheus will have given up and started another.
+	ctx, cancel := context.WithTimeout(context.Background(), metricsRequestTimeout)
+	defer cancel()
 
 	// Host-level metrics
 	host, err := corrosion.GetHost(ctx, c.db, c.hostName)
@@ -660,9 +690,15 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// growth before any metric exposed it, leaving raw SQL as the only access
 	// path. The key label is bounded by the rows that exist, and only three keys
 	// are ever written (failover, the rebalancer's, dual_run_detector).
+	//
+	// NO deleted_at filter, matching nextLeaseTerm. The allocator computes
+	// MAX(term) over every row because a tombstoned tenure still consumed its
+	// number and reusing it would mint a duplicate. Filtering here made the gauge
+	// step BACKWARDS when the top term was GC'd, while the cluster's real
+	// high-water kept rising — and this is the gauge operators are told to alert
+	// on, so it must answer the allocator's question, not a different one.
 	if termRows, terr := c.db.Query(ctx,
-		`SELECT key, MAX(term) AS term FROM leader_lease_terms
-		 WHERE deleted_at IS NULL GROUP BY key`); terr == nil {
+		`SELECT key, MAX(term) AS term FROM leader_lease_terms GROUP BY key`); terr == nil {
 		for _, r := range termRows {
 			ch <- prometheus.MustNewConstMetric(c.leaseTerm, prometheus.GaugeValue,
 				float64(r.Int64("term")), r.String("key"))
@@ -696,9 +732,14 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// relay topology, so this node holds a permanently-stale watermark for any
 	// peer it does not itself serve — and an unfiltered MIN reported the
 	// slowest-EVER-seen peer instead of the current compaction floor, pinning
-	// the gauge far below reality. The prune has always filtered to live
-	// watermarks (pruneMutationLog); this now matches it, using the same cutoff
-	// the pending_entries query below computes.
+	// the gauge far below reality. The prune filters to live watermarks
+	// too (pruneMutationLog), using this same cutoff. It additionally drops
+	// peers whose pushes are currently FAILING (corrosion.UnreachablePeerGrace),
+	// which this collector cannot see — that state is the replicator's, not a
+	// column. So when a peer stops acknowledging, this gauge sits at that peer's
+	// frozen seq while the real compaction floor has already moved past it.
+	// That is the useful reading: a gauge that stops advancing is precisely the
+	// signal that some peer has stopped acknowledging.
 	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
 	if rows, rerr := c.db.Query(ctx,
 		`SELECT COALESCE(MIN(last_seq), 0) AS m FROM replication_watermarks WHERE updated_at > ?`,

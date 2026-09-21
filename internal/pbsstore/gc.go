@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ type GCStats struct {
 	ChunksOnDisk       int   // chunks present in chunks/ at scan time
 	ChunksDeleted      int   // chunks removed because no manifest pointed at them
 	ChunksSkippedYoung int   // unreferenced chunks retained because within the grace window
+	ManifestsInvalid   int   // manifests that parsed but failed validation; their chunks are RETAINED
 	BytesReclaimed     int64 // total bytes of deleted chunks
 }
 
@@ -64,7 +66,11 @@ func GC(ctx context.Context, r *Repo) (GCStats, error) {
 // passes racing each other, but is no longer required for push safety.
 func GCWithOptions(ctx context.Context, r *Repo, opts GCOptions) (GCStats, error) {
 	var stats GCStats
-	manifests, err := r.ListManifests()
+	// Reachability counts EVERY manifest that parsed, valid or not. An invalid
+	// manifest is not restorable, but it still names real chunks and it is
+	// repairable by hand — so treating it as referencing nothing is what turned
+	// one damaged field into permanent data loss on the next sweep.
+	manifests, invalid, err := r.listParsedManifests()
 	if err != nil {
 		return stats, fmt.Errorf("list manifests: %w", err)
 	}
@@ -74,6 +80,17 @@ func GCWithOptions(ctx context.Context, r *Repo, opts GCOptions) (GCStats, error
 		for _, c := range m.AllChunks() {
 			live[c.ID] = struct{}{}
 		}
+	}
+	for _, m := range invalid {
+		stats.ManifestsScanned++
+		stats.ManifestsInvalid++
+		for _, c := range m.AllChunks() {
+			live[c.ID] = struct{}{}
+		}
+	}
+	if stats.ManifestsInvalid > 0 {
+		slog.Warn("pbsstore: GC retained the chunks of invalid manifests; repair or delete them",
+			"invalid_manifests", stats.ManifestsInvalid)
 	}
 	stats.ChunksReferenced = len(live)
 
@@ -175,7 +192,14 @@ func Verify(ctx context.Context, r *Repo) (VerifyStats, error) {
 }
 
 // RetentionPolicy expresses Proxmox-style keep N daily/weekly/monthly/yearly.
-// Zero means unlimited for that bucket.
+//
+// Zero means that bucket keeps NOTHING of its own — it is not applied, which is
+// what selectByPolicy has always implemented and what the cascade depends on.
+// This comment used to say "unlimited", which is the opposite; read that way,
+// --keep-yearly would retain every daily forever.
+//
+// A policy where every field is zero therefore keeps nothing at all. That is a
+// mistake rather than a policy, and PlanPrune refuses it — see KeepsNothing.
 type RetentionPolicy struct {
 	KeepLast    int
 	KeepDaily   int
@@ -195,6 +219,17 @@ type PrunePlan struct {
 // PlanPrune applies the policy per VM+disk pair and returns the plan
 // without touching anything on disk.
 func PlanPrune(r *Repo, policy RetentionPolicy) (PrunePlan, error) {
+	// Refused here rather than in each caller. The scheduled path already
+	// checked before calling, but `lv backup repo prune <path> --apply` with no
+	// --keep flags and the blank web form both reached the planner directly and
+	// were handed a plan that deleted the entire repository. Chunks survive to
+	// the next GC, so there is a recovery window — but the manifests go
+	// immediately, and a manifest is what makes a pile of chunks restorable.
+	if policy.KeepsNothing() {
+		return PrunePlan{}, fmt.Errorf("retention policy keeps nothing: set at least one of " +
+			"--keep-last, --keep-daily, --keep-weekly, --keep-monthly or --keep-yearly")
+	}
+
 	manifests, err := r.ListManifests()
 	if err != nil {
 		return PrunePlan{}, err
@@ -213,6 +248,13 @@ func PlanPrune(r *Repo, policy RetentionPolicy) (PrunePlan, error) {
 		plan.Delete = append(plan.Delete, drop...)
 	}
 	return plan, nil
+}
+
+// KeepsNothing reports whether the policy sets no keep at all, in which case
+// applying it would delete every manifest in the repository.
+func (p RetentionPolicy) KeepsNothing() bool {
+	return p.KeepLast <= 0 && p.KeepDaily <= 0 && p.KeepWeekly <= 0 &&
+		p.KeepMonthly <= 0 && p.KeepYearly <= 0
 }
 
 // ApplyPrune deletes the manifests in plan.Delete from disk. Chunks

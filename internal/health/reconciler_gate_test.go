@@ -1045,52 +1045,6 @@ func TestStartPendingVM_NoLeaseTermGateIsInert(t *testing.T) {
 	}
 }
 
-// TestSelfHealRestart_RefusedOnALegacyZeroFileMarker: a marker asserting
-// generation 0 must refuse the self-heal restart, not license it.
-//
-// Regression guard for the reader now treating a 0 as corrupt. Before that, a 0
-// marker read back as (0, true, nil) and the row's generation 9 was plainly
-// greater, so runtimeSuperseded said "superseded" and the restart was refused.
-// Once the reader errored, the 0 collapsed into the SAME bucket as unparseable
-// garbage — and that bucket deliberately does NOT fail closed, because failing
-// closed on an unreadable marker would strand a legitimately-owned VM. The
-// refusal silently became a permission.
-//
-// The population that carries such a marker is precisely the one this check
-// exists for: a node returning from a build whose writer still emitted zeros.
-// Written with os.WriteFile because the writer now refuses to produce one.
-func TestSelfHealRestart_RefusedOnALegacyZeroFileMarker(t *testing.T) {
-	db := testReconcilerDB(t)
-	ctx := context.Background()
-	dataDir := t.TempDir()
-	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
-		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
-	}, nil, nil); err != nil {
-		t.Fatalf("InsertVM: %v", err)
-	}
-	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(dataDir, "vms", "vm1"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dataDir, "vms", "vm1", ownerEpochMarkerFile),
-		[]byte("0\n"), 0o600); err != nil {
-		t.Fatalf("seed legacy marker: %v", err)
-	}
-
-	fake := libvirtfake.New() // no domain — the rebooted/rejoined-host shape
-	r := NewReconciler("node-a", dataDir, db, fake)
-	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
-	r.reconcile(ctx)
-
-	if startedOrDefined(fake, "vm1") {
-		t.Fatal("a marker naming generation 0 against a row at generation 9 must refuse the " +
-			"self-heal restart — it is this host's own statement that its runtime belongs to " +
-			"no generation, which every real generation has superseded")
-	}
-}
-
 // metadataOnlyMarkerFake reports an owner-epoch in DOMAIN METADATA and nothing
 // on disk. Real libvirt cannot do this for an absent domain — which is the
 // point: it is the shape the deleted fallback needed in order to fire.
@@ -1108,7 +1062,7 @@ func (f *metadataOnlyMarkerFake) GetDomainOwnerEpoch(string) (int64, bool, error
 // TestRuntimeSuperseded_DoesNotConsultDomainMetadata pins the contract the
 // deleted fallback obscured.
 //
-// The check ran only from the `!DomainExists` branch, so its domain-metadata
+// The check runs only from the `!DomainExists` branch, so its domain-metadata
 // read could never return a marker — DomainExists IS the same lookup
 // GetDomainOwnerEpoch performs first. It read as a second line of defence that
 // did not exist, and two unit tests "covered" it only because their fake served
@@ -1170,5 +1124,51 @@ func TestRuntimeSuperseded_DecidesFromTheFileMarker(t *testing.T) {
 	}
 	if r.runtimeSuperseded(ctx, "vm1") {
 		t.Error("marker 9 equal to row 9 must NOT be superseded")
+	}
+}
+
+// TestSelfHealRestart_RefusedOnALegacyZeroFileMarker: a marker asserting
+// generation 0 must refuse the self-heal restart, not license it.
+//
+// Regression guard for the reader now treating a 0 as corrupt. Before that, a 0
+// marker read back as (0, true, nil) and the row's generation 9 was plainly
+// greater, so runtimeSuperseded said "superseded" and the restart was refused.
+// Once the reader errored, the 0 collapsed into the SAME bucket as unparseable
+// garbage — and that bucket deliberately does NOT fail closed, because failing
+// closed on an unreadable marker would strand a legitimately-owned VM. The
+// refusal silently became a permission.
+//
+// The population that carries such a marker is precisely the one this check
+// exists for: a node returning from a build whose writer still emitted zeros.
+// Written with os.WriteFile because the writer now refuses to produce one.
+func TestSelfHealRestart_RefusedOnALegacyZeroFileMarker(t *testing.T) {
+	db := testReconcilerDB(t)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-a", Spec: "{}", State: "running",
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := db.Execute(ctx, `UPDATE vms SET vm_owner_epoch = 9 WHERE name = 'vm1'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "vms", "vm1"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "vms", "vm1", ownerEpochMarkerFile),
+		[]byte("0\n"), 0o600); err != nil {
+		t.Fatalf("seed legacy marker: %v", err)
+	}
+
+	fake := libvirtfake.New() // no domain — the rebooted/rejoined-host shape
+	r := NewReconciler("node-a", dataDir, db, fake)
+	r.SetGate(fakeGate{exec: GateResult{OK: true}, active: true})
+	r.reconcile(ctx)
+
+	if startedOrDefined(fake, "vm1") {
+		t.Fatal("a marker naming generation 0 against a row at generation 9 must refuse the " +
+			"self-heal restart — it is this host's own statement that its runtime belongs to " +
+			"no generation, which every real generation has superseded")
 	}
 }

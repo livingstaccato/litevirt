@@ -27,6 +27,7 @@ import (
 	"github.com/litevirt/litevirt/internal/netbox"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/opjournal"
+	"github.com/litevirt/litevirt/internal/pci"
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
@@ -78,6 +79,7 @@ type Server struct {
 	// name" — see netboxsync.ClusterName, which is the single place that
 	// resolves it for both the mirror and the CA re-key.
 	netboxClusterName string
+	netboxSite        string
 
 	// nbMetricsSink counts NetBox IPAM outcomes. nil means "not wired", which
 	// nbMetrics() resolves to a noop — a metrics sink must never be a reason a
@@ -451,6 +453,16 @@ type Server struct {
 	// instead of dialing a real peer over mTLS, so the owner→sink push path is
 	// unit-testable in-process. Production leaves it nil → real peerClient.
 	peerClientOverride func(ctx context.Context, host string) (pb.LiteVirtClient, func(), error)
+	// pciScanOverride is a test seam for the host hardware scan. Nil in
+	// production, where RescanHost calls pci.Scan directly.
+	//
+	// It exists because the stranded-ownership sweep shipped dead: every test
+	// called corrosion.SweepStrandedPCIOwnership directly, so none of them
+	// reproduced the one thing that broke it — RescanHost refreshing every
+	// present device's updated_at immediately before invoking the sweep. A
+	// defect that only appears in the ORDER two correct pieces are called in
+	// needs a test that calls them in that order.
+	pciScanOverride func() ([]pci.Device, error)
 
 	// stopVMOverride is a test seam for ShutdownHostWorkloads: when non-nil it
 	// replaces the in-process StopVM call (unit tests have no libvirt/peer), so
@@ -590,6 +602,17 @@ type Server struct {
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
 	gate          serverGate
 	onGateRefused func(action, reason string)
+
+	// onLeaseBarrierIncomplete feeds the incomplete-sweep metric (nil-safe). A
+	// lease-term accept reached without every peer answering is byte-identical to
+	// one reached on a complete sweep, and it is the shape that can miss a
+	// superseding term — so it is counted rather than left to a log line.
+	onLeaseBarrierIncomplete func(key string, answered, peers int)
+
+	// leaseBarrierFullProbe remembers which peers have already been given the
+	// full budget in a repair pass and still said nothing, so a dead peer is
+	// charged once per window instead of on every sweep.
+	leaseBarrierFullProbe map[string]time.Time
 	// onStateWriteFail observes an authoritative state/image write that failed
 	// (nil-safe); the daemon wires it to litevirt_state_write_failures_total.
 	onStateWriteFail func(op, class string)
@@ -917,6 +940,10 @@ func (s *Server) SetNetBoxClient(c *netbox.Client) { s.netbox = c }
 // strands everything written under the previous one.
 func (s *Server) SetNetBoxClusterName(name string) { s.netboxClusterName = name }
 
+// SetNetBoxSite sets the NetBox site the cluster is scoped to (config
+// `netbox.site`). Empty leaves the cluster's scope unmanaged.
+func (s *Server) SetNetBoxSite(name string) { s.netboxSite = name }
+
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same
 // `flag && Enforced` model as the rest of the family.
@@ -1142,6 +1169,11 @@ func (s *Server) tokenEnabled(token string) bool {
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (s *Server) SetGateRefusedObserver(fn func(action, reason string)) { s.onGateRefused = fn }
 
+// SetLeaseBarrierIncompleteObserver wires the incomplete-sweep metric hook (nil-safe).
+func (s *Server) SetLeaseBarrierIncompleteObserver(fn func(key string, answered, peers int)) {
+	s.onLeaseBarrierIncomplete = fn
+}
+
 // SetStateWriteFailObserver wires the state-write-failure metric hook (nil-safe).
 func (s *Server) SetStateWriteFailObserver(fn func(op, class string)) { s.onStateWriteFail = fn }
 
@@ -1222,6 +1254,13 @@ func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, 
 func (s *Server) noteGateRefused(action, reason string) {
 	if s.onGateRefused != nil {
 		s.onGateRefused(action, reason)
+	}
+}
+
+// noteLeaseBarrierIncomplete records an accept reached without a complete sweep.
+func (s *Server) noteLeaseBarrierIncomplete(key string, answered, peers int) {
+	if s.onLeaseBarrierIncomplete != nil {
+		s.onLeaseBarrierIncomplete(key, answered, peers)
 	}
 }
 
@@ -1348,6 +1387,11 @@ func (s *Server) lbGateRefused(ctx context.Context) (string, bool) { return s.ex
 // importing internal/firewall at the test level.
 type FirewallReconciler interface {
 	Reconcile(ctx context.Context) error
+	// ReconcileForce clears the applier's change-detection cache first, so the
+	// ruleset reaches nft even when the rendered bytes are unchanged. An
+	// operator-driven reload must use it: the cache tracks what the daemon last
+	// SENT, which is not evidence about what the kernel currently holds.
+	ReconcileForce(ctx context.Context) error
 	LastError() error
 	LastTick() time.Time
 }

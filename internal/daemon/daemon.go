@@ -752,6 +752,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
+	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// SR-IOV VF-pool policy: which PFs litevirt may adopt for VF creation, the pool
 	// cap, and the degraded gauge. Validate the allowlist against live hardware now,
@@ -810,6 +811,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// BEFORE the mirror starts. The name decides which NetBox cluster object
 	// every mirrored VM hangs off, and the CA re-key resolves the same one.
 	svc.SetNetBoxClusterName(d.cfg.NetBox.ClusterName)
+	svc.SetNetBoxSite(d.cfg.NetBox.Site)
 	// The client itself. A node whose config ENABLES the integration but whose
 	// client cannot be built (missing/empty token file, no URL) must not start:
 	// it would advertise netbox_ipam_v1 — helping the cluster latch — while

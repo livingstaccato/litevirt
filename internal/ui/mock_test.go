@@ -32,6 +32,11 @@ type mockGRPC struct {
 	pb.LiteVirtClient
 
 	mu sync.Mutex
+	// whoamiRole overrides the role Whoami reports (default "admin"), and
+	// whoamiErr makes Whoami fail — both so a test can drive the UI's
+	// authorization gate rather than only its happy path.
+	whoamiRole string
+	whoamiErr  error
 	// Response fields
 	listHostsResp         *pb.ListHostsResponse
 	listHostNetworksResp  *pb.ListHostNetworksResponse
@@ -742,7 +747,16 @@ func (m *mockGRPC) Logout(context.Context, *emptypb.Empty, ...grpc.CallOption) (
 	return &emptypb.Empty{}, nil
 }
 func (m *mockGRPC) Whoami(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.WhoamiResponse, error) {
-	return &pb.WhoamiResponse{Username: "admin", Role: "admin", Realm: "local"}, nil
+	m.mu.Lock()
+	role, err := m.whoamiRole, m.whoamiErr
+	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if role == "" {
+		role = "admin"
+	}
+	return &pb.WhoamiResponse{Username: role, Role: role, Realm: "local"}, nil
 }
 func (m *mockGRPC) ChangePassword(context.Context, *pb.ChangePasswordRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil

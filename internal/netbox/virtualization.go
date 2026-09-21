@@ -16,6 +16,7 @@ const (
 	clusterTypesPath = "/api/virtualization/cluster-types/"
 	clustersPath     = "/api/virtualization/clusters/"
 	devicesPath      = "/api/dcim/devices/"
+	sitesPath        = "/api/dcim/sites/"
 	// macAddressesPath exists only on NetBox 4.2+, where a MAC became an object
 	// of its own. Reached only when a write shows the server is on that shape —
 	// see repairDroppedMAC.
@@ -38,6 +39,13 @@ type VirtualMachine struct {
 	DiskMB   int
 	Status   string
 	Identity string
+	// PrimaryIP4ID is virtual_machine.primary_ip4: NetBox's "this machine's
+	// main address", which is SEPARATE from assigning an ip_address to a
+	// vminterface. Everything downstream reads the primary — NetBox's own UI
+	// column, its DNS integrations, nb_inventory's ansible_host — so a VM with
+	// an assigned address but no primary reads to all of them as a machine with
+	// no address at all. 0 = none.
+	PrimaryIP4ID int
 }
 
 // bytesPerMB is NetBox's megabyte: DECIMAL, 1 MB = 1,000,000 bytes — not the
@@ -143,6 +151,9 @@ type vmJSON struct {
 	Device *struct {
 		ID int `json:"id"`
 	} `json:"device"`
+	PrimaryIP4 *struct {
+		ID int `json:"id"`
+	} `json:"primary_ip4"`
 	CustomFields map[string]any `json:"custom_fields"`
 }
 
@@ -163,6 +174,9 @@ func (j vmJSON) toVM() VirtualMachine {
 	}
 	if j.Device != nil {
 		out.DeviceID = j.Device.ID
+	}
+	if j.PrimaryIP4 != nil {
+		out.PrimaryIP4ID = j.PrimaryIP4.ID
 	}
 	if v, ok := j.CustomFields[IdentityField].(string); ok {
 		out.Identity = v
@@ -293,6 +307,21 @@ func (c *Client) CreateVM(ctx context.Context, vm VirtualMachine) (VirtualMachin
 // unconditional PATCH every sweep buries NetBox's changelog in noise.
 func (c *Client) UpdateVM(ctx context.Context, id int, vm VirtualMachine) error {
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmsPath+"%d/", id), vmBody(vm), nil)
+}
+
+// SetPrimaryIP4 sets (or, with ipID 0, clears) a virtual machine's primary_ip4.
+//
+// A TARGETED patch rather than a field on vmBody, because the two writes have
+// different preconditions: NetBox requires the address to already be assigned to
+// an interface of this VM, which is only true AFTER the interface phase — while
+// vmBody is also what CREATE sends, when the VM has no interfaces at all. Fold
+// them together and every create carries a field the server must reject.
+func (c *Client) SetPrimaryIP4(ctx context.Context, vmID, ipID int) error {
+	body := map[string]any{"primary_ip4": nil}
+	if ipID != 0 {
+		body["primary_ip4"] = ipID
+	}
+	return c.do(ctx, http.MethodPatch, fmt.Sprintf(vmsPath+"%d/", vmID), body, nil)
 }
 
 // DeleteVM removes one virtual machine. Its interfaces and their IP assignments
@@ -505,11 +534,34 @@ func (c *Client) ClearIPAssignment(ctx context.Context, ipID int) error {
 	return c.do(ctx, http.MethodPatch, fmt.Sprintf(ipAddressesPath+"%d/", ipID), body, nil)
 }
 
-// FindDeviceByName resolves a DCIM device id by name, returning 0 when absent.
-// Absence is NOT an error: the host link is best-effort by design, and an
-// operator who does not model hosts in NetBox must still get a working mirror.
-func (c *Client) FindDeviceByName(ctx context.Context, name string) (int, error) {
-	return c.firstIDByName(ctx, devicesPath, name)
+// FindDeviceInCluster resolves a DCIM device id by name SCOPED TO clusterID,
+// returning 0 when the device is absent or belongs to some other cluster.
+// Neither is an error: the host link is best-effort by design, and an operator
+// who does not model hosts in NetBox must still get a working mirror.
+//
+// THE SCOPE IS LOAD-BEARING, not an optimisation. NetBox validates that a
+// virtual_machine's device belongs to that VM's own cluster, so a device outside
+// it is not a weaker link — it is a 400 on the write. Resolving by name alone
+// therefore turned the optional link into a sweep-ending refusal for the most
+// ordinary NetBox there is: one whose hosts were already inventoried by
+// something else and belong to no virtualization cluster at all. Nothing was
+// mirrored, cluster-wide, for as long as that host stayed in the inventory,
+// because the create phase aborts on the first refusal.
+//
+// Folding the constraint into the QUERY makes "not modelled" and "modelled
+// outside this cluster" the same answer — no link — which is what best-effort
+// has to mean for a link the server may reject.
+//
+// clusterID 0 means the caller has not resolved a cluster yet. Nothing can be
+// scoped to it, so the answer is 0: no link, never an unscoped lookup that would
+// reintroduce the refusal this exists to prevent.
+func (c *Client) FindDeviceInCluster(ctx context.Context, name string, clusterID int) (int, error) {
+	if clusterID == 0 {
+		return 0, nil
+	}
+	scope := url.Values{}
+	scope.Set("cluster_id", strconv.Itoa(clusterID))
+	return c.firstIDByNameFiltered(ctx, devicesPath, name, scope)
 }
 
 // FindCluster resolves a cluster id by exact name, returning 0 when absent.
@@ -530,11 +582,98 @@ func (c *Client) EnsureClusterType(ctx context.Context, name string) (int, error
 	})
 }
 
-// EnsureCluster creates the cluster if absent, returning its id.
-func (c *Client) EnsureCluster(ctx context.Context, name string, typeID int) (int, error) {
-	return c.ensureNamed(ctx, clustersPath, name, map[string]any{
-		"name": name, "type": typeID,
-	})
+// EnsureCluster creates the cluster if absent and CONVERGES its site, returning
+// its id.
+//
+// THE SITE IS WHY THIS IS NOT JUST ensureNamed. Every VM in a cluster inherits
+// that cluster's site, and a mirrored VM with no site is invisible to anything
+// that scopes by one — NetBox's own filters, and the DNS and inventory
+// integrations built on them. litevirt cannot derive which site the hardware
+// sits in, so it is operator-supplied (netbox.site), exactly like the cluster
+// name.
+//
+// CONVERGED, not merely set at create. ensureNamed applies its body only when it
+// creates, so an operator adding the site to config later would see it silently
+// do nothing on every cluster that had ever mirrored — which is every cluster
+// that matters.
+//
+// siteID 0 means UNMANAGED, and it must never be written through as null. The
+// scope was settable by hand long before litevirt could supply it, so clearing
+// it on an empty config would strip the site off a working cluster and take
+// every VM's inherited site with it — silently undoing the thing this exists to
+// provide. Unset leaves whatever is there.
+func (c *Client) EnsureCluster(ctx context.Context, name string, typeID, siteID int) (int, error) {
+	id, curType, curSite, err := c.findClusterScope(ctx, name)
+	if err != nil {
+		return 0, err
+	}
+	if id == 0 {
+		body := map[string]any{"name": name, "type": typeID}
+		if siteID != 0 {
+			body["scope_type"] = siteScopeType
+			body["scope_id"] = siteID
+		}
+		var created struct {
+			ID int `json:"id"`
+		}
+		if err := c.do(ctx, http.MethodPost, clustersPath, body, &created); err != nil {
+			return 0, err
+		}
+		return created.ID, nil
+	}
+	// Write-on-change. The cluster is resolved on EVERY sweep, so a PATCH per
+	// sweep would be a write storm on a 15-minute timer.
+	if siteID == 0 || (curType == siteScopeType && curSite == siteID) {
+		return id, nil
+	}
+	return id, c.do(ctx, http.MethodPatch, fmt.Sprintf(clustersPath+"%d/", id), map[string]any{
+		"scope_type": siteScopeType,
+		"scope_id":   siteID,
+	}, nil)
+}
+
+// siteScopeType is the content type a cluster's generic scope takes for a site.
+// NetBox 4.2 replaced Cluster.site with scope_type/scope_id.
+const siteScopeType = "dcim.site"
+
+// findClusterScope resolves a cluster by exact name and returns its id and
+// current scope, or id 0 when absent.
+//
+// The scope comes back from the SAME request as the id: the alternative is a
+// detail GET per sweep purely to decide whether a PATCH is needed, which is a
+// round trip bought for nothing on every pass of a converged mirror.
+func (c *Client) findClusterScope(ctx context.Context, name string) (id int, scopeType string, scopeID int, err error) {
+	q := url.Values{}
+	q.Set("name", name)
+	q.Set("limit", "1")
+	var out struct {
+		Results []struct {
+			ID        int     `json:"id"`
+			ScopeType *string `json:"scope_type"`
+			ScopeID   *int    `json:"scope_id"`
+		} `json:"results"`
+	}
+	if err := c.do(ctx, http.MethodGet, clustersPath+"?"+q.Encode(), nil, &out); err != nil {
+		return 0, "", 0, err
+	}
+	if len(out.Results) == 0 {
+		return 0, "", 0, nil
+	}
+	r := out.Results[0]
+	if r.ScopeType != nil {
+		scopeType = *r.ScopeType
+	}
+	if r.ScopeID != nil {
+		scopeID = *r.ScopeID
+	}
+	return r.ID, scopeType, scopeID, nil
+}
+
+// FindSiteByName resolves a DCIM site id by name, returning 0 when absent.
+// Absence is not an error: the caller reports a configured-but-missing site to
+// the operator rather than failing a sweep over it.
+func (c *Client) FindSiteByName(ctx context.Context, name string) (int, error) {
+	return c.firstIDByName(ctx, sitesPath, name)
 }
 
 // ensureNamed resolves an object by exact name, creating it once if absent.
@@ -544,17 +683,25 @@ func (c *Client) EnsureCluster(ctx context.Context, name string, typeID int) (in
 // loser into a 4xx, which Classify reports as ClassClient — a caller retrying
 // the whole ensure then finds the winner's object.
 func (c *Client) ensureNamed(ctx context.Context, path, name string, body map[string]any) (int, error) {
+	id, _, err := c.ensureNamedReportingCreate(ctx, path, name, body)
+	return id, err
+}
+
+// ensureNamedReportingCreate is ensureNamed that also reports whether it created
+// the object, so a caller with fields to CONVERGE can skip the read-back on the
+// one path where the object provably already carries them.
+func (c *Client) ensureNamedReportingCreate(ctx context.Context, path, name string, body map[string]any) (int, bool, error) {
 	id, err := c.firstIDByName(ctx, path, name)
 	if err != nil || id != 0 {
-		return id, err
+		return id, false, err
 	}
 	var created struct {
 		ID int `json:"id"`
 	}
 	if err := c.do(ctx, http.MethodPost, path, body, &created); err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	return created.ID, nil
+	return created.ID, true, nil
 }
 
 // firstIDByName reads the first object with an exact name, or 0.
@@ -564,7 +711,19 @@ func (c *Client) ensureNamed(ctx context.Context, path, name string, body map[st
 // than leaving an unbounded request that silently stops at NetBox's default page
 // size.
 func (c *Client) firstIDByName(ctx context.Context, path, name string) (int, error) {
+	return c.firstIDByNameFiltered(ctx, path, name, nil)
+}
+
+// firstIDByNameFiltered is firstIDByName with additional filters ANDed in, for
+// a lookup whose answer is only usable within some scope. `name` and `limit`
+// are set last so a caller cannot accidentally widen either.
+func (c *Client) firstIDByNameFiltered(ctx context.Context, path, name string, extra url.Values) (int, error) {
 	q := url.Values{}
+	for k, vs := range extra {
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
 	q.Set("name", name)
 	q.Set("limit", "1")
 	var out struct {

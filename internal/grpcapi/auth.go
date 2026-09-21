@@ -156,6 +156,9 @@ func (s *Server) UnaryAuthInterceptor(
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
 	if skipAuth[info.FullMethod] {
+		if err := s.refuseLoginWhileReseedIncomplete(ctx, info.FullMethod); err != nil {
+			return nil, err
+		}
 		return handler(ctx, req)
 	}
 	ctx, err := s.authenticate(ctx)
@@ -173,6 +176,9 @@ func (s *Server) StreamAuthInterceptor(
 	handler grpc.StreamHandler,
 ) error {
 	if skipAuth[info.FullMethod] {
+		if err := s.refuseLoginWhileReseedIncomplete(ss.Context(), info.FullMethod); err != nil {
+			return err
+		}
 		return handler(srv, ss)
 	}
 	ctx, err := s.authenticate(ss.Context())

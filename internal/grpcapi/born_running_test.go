@@ -76,11 +76,25 @@ func TestCloneVM_AStartedCloneIsBornProvable(t *testing.T) {
 	}
 }
 
-// TestCloneVM_AStoppedCloneIsNotGraduated: the guard is on the state actually
-// inserted. A stopped clone has no runtime to prove, and stamping a generation
-// it did not earn would make the row and the marker disagree the moment
-// whatever starts it mints one.
-func TestCloneVM_AStoppedCloneIsNotGraduated(t *testing.T) {
+// TestCloneVM_AStoppedCloneIsGraduatedButUnmarked.
+//
+// This test previously asserted the opposite — that a stopped clone keeps epoch
+// 0 — on the premise that "whatever starts it mints one". That premise does not
+// hold. The direct StartVM path is startVMLocked → persistVMState(…, "running")
+// → publishRunning, which is the NON-minting chokepoint: it mints nothing and
+// graduates nothing, and at epoch 0 writeBothMarkers returns skipped, so the row
+// publishes running with no marker at all. Only the reconciler's startPendingVM
+// mints, via CompleteVMStartProof, and that runs for pending-start VMs rather
+// than for an operator starting a cold clone.
+//
+// So the old behaviour left a stopped clone at 0 until someone enabled the
+// default-off backfill, and made it running-and-unprovable the moment it
+// started — the very state the create path was fixed to prevent.
+//
+// The row is graduated; the RUNTIME markers still are not, because there is no
+// runtime yet. Nothing disagrees later: a non-minting start writes the marker at
+// the row's own generation, and a minting one moves row and marker together.
+func TestCloneVM_AStoppedCloneIsGraduatedButUnmarked(t *testing.T) {
 	s := cloneSourceTemplate(t)
 	ctx := adminCtx()
 
@@ -96,8 +110,9 @@ func TestCloneVM_AStoppedCloneIsNotGraduated(t *testing.T) {
 	if row.State != "stopped" {
 		t.Fatalf("state = %q, want stopped", row.State)
 	}
-	if row.OwnerEpoch != 0 {
-		t.Errorf("row epoch = %d, want 0 — a stopped clone has no runtime to prove", row.OwnerEpoch)
+	if row.OwnerEpoch == 0 {
+		t.Error("a stopped clone was left at epoch 0; nothing on the direct start path " +
+			"graduates it, so it becomes running and unprovable the moment it starts")
 	}
 	if _, ok, _ := health.ReadVMOwnerEpochMarker(s.dataDir, "cold1"); ok {
 		t.Error("a marker was written for a clone that is not running")

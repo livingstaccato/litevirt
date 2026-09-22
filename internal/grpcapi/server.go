@@ -34,6 +34,8 @@ import (
 
 // Server implements the LiteVirt gRPC service.
 type Server struct {
+	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
+	reseeding reseedInFlight
 	pb.UnimplementedLiteVirtServer
 
 	hostName string
@@ -1251,6 +1253,13 @@ func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, 
 		// wait the chokepoint's read half was rewritten to remove.
 		select {
 		case <-ctx.Done():
+			// COUNTED before returning. Returning straight out skipped
+			// noteStateWriteFail below, and persistVMState's own `!committed`
+			// guard cannot cover it either — so a write dropped to a shutdown or
+			// an expired deadline was recorded nowhere, against a flat failure
+			// total, during exactly the fleet-wide shutdown WriteClassCancelled
+			// was added to make visible.
+			s.noteStateWriteFail(op, ctx.Err())
 			return ctx.Err()
 		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
 		}

@@ -604,6 +604,25 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		wantRunning = false
 	}
 	if !wantRunning {
+		// The replaced incarnation's marker is deliberately LEFT IN PLACE.
+		//
+		// A review asked for it to be cleared here: after a stopped cutover the
+		// name carries a marker at the replaced VM's generation, below the row's,
+		// and runtimeSuperseded then refuses a later self-heal restart, so a VM
+		// that should be running can stay down. That is real, and clearing the
+		// marker is still the wrong answer, because runtimeSuperseded reads an
+		// ABSENT marker as "not superseded" (reconciler.go: `if err != nil || !ok
+		// { return false }`). Deleting it does not restore the restart to a
+		// correct decision — it removes the check, and the refusal it removes is
+		// the one that stops a rejoined host resurrecting a runtime that has been
+		// rescheduled elsewhere. That failure has happened here: 2026-08-01, a
+		// second live copy of a VM.
+		//
+		// So the choice is between a stale marker that can refuse a restart that
+		// should happen, and no marker that can permit one that must not. A VM
+		// left down is an operator action; a dual-run is a corrupted disk. The
+		// stale marker stays, and whatever next starts this VM mints a generation
+		// and overwrites it through the chokepoint.
 		return nil
 	}
 	state, sErr := s.virt.DomainState(m.ReplacedVM)

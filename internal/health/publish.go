@@ -35,9 +35,21 @@ import (
 // a single method so *grpcapi.Server's backend, the Reconciler's interface,
 // *libvirt.Client and libvirtfake all satisfy it without an adapter.
 // markAfterCommitTimeout bounds the detached marking that follows a committed
-// minting transition. Long enough to outlast a slow read and its retries, short
-// enough that a wedged store cannot pin the goroutine indefinitely.
-const markAfterCommitTimeout = 30 * time.Second
+// minting transition.
+//
+// This is the CALLER's wait, not a background budget: everything after the
+// commit runs on the caller's goroutine, and for CutoverVM that goroutine holds
+// two per-VM locks. Detaching from the caller's context is right — the commit
+// has landed and a client ^C must not decide whether the VM is provable — but
+// detaching with a generous budget replaced "fail fast when the caller is gone"
+// with a multi-second stall, which is the uninterruptible wait the rest of this
+// change set removed.
+//
+// Sized to the work, not to patience: one row read and two small marker writes.
+// A store that has not answered in five seconds is not going to be rescued by
+// twenty-five more, and the reconciler repairs a missing marker on its next
+// sweep anyway.
+const markAfterCommitTimeout = 5 * time.Second
 
 type DomainEpochSetter interface {
 	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
@@ -318,6 +330,35 @@ func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir
 	if hostName != "" && row.HostName != hostName {
 		slog.Warn("publish: ownership moved during a minting transition — leaving the markers to the new owner",
 			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", hostName)
+		return nil
+	}
+	// Markers are for a RUNNING runtime, and the minting path has to say so as
+	// explicitly as PublishVMRunning does. writeBothMarkers leans on it — "Only
+	// ever called for a RUNNING publish, which is why the domain write takes
+	// running=true" — and this twin had no gate at all: a stopped cutover fired
+	// SetDomainOwnerEpoch(name, epoch, true) at an inactive domain, which
+	// libvirt rejects, and still wrote a file marker claiming a generation owns
+	// a runtime that is not there.
+	//
+	// Gated on the state the COMMIT produced, read back here — NOT on a value
+	// the caller carried in. CutoverVM reads nextVM.State before the entire
+	// teardown while ReplaceVM writes the state it re-reads at commit time, so
+	// the caller's value can be stale in both directions. Trusting it let a
+	// commit that landed RUNNING skip its markers, leaving the row at a new
+	// generation with nothing naming it — the exact window this chokepoint
+	// exists to close, reached through the chokepoint itself.
+	//
+	// SKIPPED, never removed. This read is taken up to markAfterCommitTimeout
+	// after the commit, so a concurrent local writer can move the row inside the
+	// window — which is the same untrustworthiness the caller's value had, in
+	// the other direction. Skipping a marker write on a wrong answer is a no-op
+	// that convergence repairs; DELETING a marker on one takes a live VM's proof
+	// away. A stale marker left by a replacement is NOT cleared here or
+	// anywhere else, and that is deliberate rather than an omission:
+	// runtimeSuperseded reads an ABSENT marker as "not superseded", so removing
+	// one turns a refused self-heal restart into a permitted one. The whole
+	// argument lives at finishVMReplaceRuntime's non-running branch.
+	if row.State != "running" {
 		return nil
 	}
 	if res := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); res.failures() != nil || res.unproven() {

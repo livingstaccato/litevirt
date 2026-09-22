@@ -224,7 +224,22 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	// cleared once the sensitive merge has committed — not after convergence,
 	// because by then the window is already shut and holding it longer would
 	// refuse logins on a node whose secrets are fully restored.
-	if err := s.db.BeginReseed(ctx, source); err != nil {
+	// ONE at a time in this process. Two concurrent ReseedHost calls on the same
+	// node both reach BeginReseed, the second REPLACES the first's marker (the
+	// row is keyed id = 1), and whichever calls FinishReseed first clears the
+	// login gate while the other is still discarding — user_2fa empty, the gate
+	// open, and the generation unchanged between admission and mint. See
+	// reseedInFlight for why this refuses rather than represents the overlap.
+	releaseReseed, admitted := s.reseeding.acquire()
+	if !admitted {
+		return nil, status.Error(codes.FailedPrecondition,
+			"a reseed is already running on this node; wait for it to finish or fail before "+
+				"starting another (two at once would clear each other's login gate)")
+	}
+	defer releaseReseed()
+
+	reseedGeneration, err := s.db.BeginReseed(ctx, source)
+	if err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal,
 			"could not mark this node as mid-reseed, so the reseed was not started "+
@@ -250,7 +265,7 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	}
 
 	// The window is shut: user_2fa is restored, so the login gate may lift.
-	if err := s.db.FinishReseed(ctx); err != nil {
+	if err := s.db.FinishReseed(ctx, reseedGeneration); err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal,
 			"state was restored from %s but this node could not clear its reseed marker, so it "+

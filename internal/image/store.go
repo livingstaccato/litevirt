@@ -1,9 +1,11 @@
 package image
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -154,26 +156,104 @@ func (s *Store) CreateEmptyDisk(vmName, diskName, size string) (string, error) {
 // gets DELETED cannot drift apart — a guard computed against a different list
 // than the glob walks is a guard with a hole in it.
 func (s *Store) VMDiskCandidates(vmName string) ([]string, error) {
-	return filepath.Glob(filepath.Join(s.diskDir, vmName+"-*.qcow2"))
+	matches, err := filepath.Glob(filepath.Join(s.diskDir, vmName+"-*.qcow2"))
+	if err != nil {
+		return nil, err
+	}
+	// The LEGACY per-VM subdirectory's contents too, because DeleteVMDisksIn
+	// used to remove that whole tree with os.RemoveAll — a recursive delete no
+	// candidate list contained and no reference check ever saw, sitting behind a
+	// comment promising one listing drove everything. Listing its files here is
+	// what makes that promise true: they go through the same keep set as the
+	// flat ones, so a legacy disk another VM still references is protected.
+	legacyDir := filepath.Join(s.diskDir, vmName)
+	// LSTAT, and a real directory only. os.ReadDir FOLLOWS a symlink, so a
+	// legacy directory an operator symlinked onto another volume would have its
+	// contents enumerated as candidates and unlinked one by one — while the
+	// os.RemoveAll this replaced removed only the link and left the target
+	// intact. Enlarging the blast radius across a symlink is the opposite of
+	// what listing these files is for.
+	li, lerr := os.Lstat(legacyDir)
+	if lerr != nil || !li.Mode().IsDir() {
+		// Absent, a symlink, or not a directory at all: nothing this sweep owns.
+		// ENOTDIR matters in particular — a plain FILE at that path used to
+		// sweep normally, and returning an error here would disable the sweep
+		// for that VM name on every attempt, including createVM's pre-create
+		// debris pass.
+		return matches, nil
+	}
+	entries, err := os.ReadDir(legacyDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return matches, nil
+		}
+		// Reported, not swallowed: a directory that exists but cannot be read is
+		// not evidence it is empty, and the caller refuses to sweep at all on
+		// this error rather than deleting the flat files and guessing about
+		// these.
+		return nil, err
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			matches = append(matches, filepath.Join(legacyDir, e.Name()))
+		}
+	}
+	return matches, nil
 }
 
-func (s *Store) DeleteVMDisks(vmName string, keep map[string]bool) error {
-	matches, err := s.VMDiskCandidates(vmName)
-	if err != nil {
-		return err
+// DeleteVMDisksIn deletes from a candidate list the caller already holds,
+// instead of listing again.
+//
+// This is the form a protected sweep has to use. DeleteVMDisks re-lists, so the
+// set it deletes is not the set the caller computed protection against: a file
+// created after the keep set was built is in no keep set and gets removed with
+// no reference check ever run against it, and a listing that succeeds for the
+// caller but fails here turns "protect nothing" into "delete everything". One
+// listing, passed down, removes both — the guarantee stops depending on two
+// calls agreeing.
+func (s *Store) DeleteVMDisksIn(vmName string, candidates []string, keep map[string]bool) error {
+	// REFUSED before any path is built. Every path below is derived from this
+	// name, so a name carrying a separator or a parent reference would aim the
+	// delete outside the disk directory. Callers validate VM names, but this
+	// function's whole contract is about what it is allowed to remove, and it
+	// should not depend on someone else having checked.
+	if vmName == "" || strings.ContainsAny(vmName, `/\`) || vmName == ".." || strings.Contains(vmName, "..") {
+		return fmt.Errorf("refusing to delete disks for an unsafe VM name %q", vmName)
 	}
-	for _, m := range matches {
+	legacyDir := filepath.Join(s.diskDir, vmName)
+	var errs []error
+	for _, m := range candidates {
 		if keep[m] {
 			continue
 		}
-		os.Remove(m)
+		// EVERY path checked, not just the one built here. The name guard above
+		// only constrains legacyDir; the paths actually removed come from a
+		// caller-supplied slice, and sweepVMDiskDebrisIn is a package-internal
+		// seam any future caller can hand an arbitrary list. A function whose
+		// whole doc is "what it is allowed to remove" must enforce it.
+		if d := filepath.Dir(m); d != s.diskDir && d != legacyDir {
+			errs = append(errs, fmt.Errorf("refusing to delete %s: outside %s", m, s.diskDir))
+			continue
+		}
+		// COLLECTED, not discarded. These were dropped entirely, so a sweep that
+		// removed nothing — a read-only directory, a busy file — was reported to
+		// the caller as a successful sweep and logged as one. The caller then
+		// believes the debris is gone.
+		if err := os.Remove(m); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove %s: %w", m, err))
+		}
 	}
-	// Also clean up legacy VM subdirectory if it exists.
-	legacyDir := filepath.Join(s.diskDir, vmName)
-	if info, err := os.Stat(legacyDir); err == nil && info.IsDir() {
-		os.RemoveAll(legacyDir)
+	// The legacy directory itself, only once it is EMPTY. os.Remove refuses a
+	// non-empty one, which is the point: anything still inside was either kept
+	// by the keep set or is a subdirectory this sweep does not own, and the
+	// os.RemoveAll that used to be here destroyed both without ever consulting a
+	// reference check.
+	if info, err := os.Lstat(legacyDir); err == nil && info.Mode().IsDir() {
+		// Not an error when it fails: a non-empty directory is the EXPECTED
+		// outcome whenever the keep set spared something inside it.
+		_ = os.Remove(legacyDir)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // DiskInfo returns size info for a disk file.

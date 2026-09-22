@@ -162,7 +162,7 @@ func TestAssignOwnerEpochAtCreate_AFailedGraduationStampsNothing(t *testing.T) {
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	s.db.Close()
 
-	s.assignOwnerEpochAtCreate(ctx, "vm1")
+	s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 
 	if epoch, ok, _ := fake.GetDomainOwnerEpoch("vm1"); ok {
 		t.Errorf("a domain marker of %d was stamped although no row was graduated; a marker "+
@@ -185,7 +185,7 @@ func TestAssignOwnerEpochAtCreate_StampsBothOnSuccess(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	s.assignOwnerEpochAtCreate(ctx, "vm1")
+	s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 
 	// The postcondition FIRST: without it the two marker assertions below pass in
 	// exactly the case the sibling test forbids — a graduation that silently
@@ -281,7 +281,7 @@ func TestAssignOwnerEpochAtCreate_SkipsTheFileMarkerWithoutADataDir(t *testing.T
 	t.Chdir(cwd)
 	s.dataDir = ""
 
-	s.assignOwnerEpochAtCreate(ctx, "vm1")
+	s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 
 	if _, err := os.Stat(filepath.Join(cwd, "vms", "vm1", "owner_epoch")); err == nil {
 		t.Error("a file marker was written to a relative path with no dataDir set; no reader " +
@@ -315,7 +315,7 @@ func TestAssignOwnerEpochAtCreate_SurvivesACancelledRPCContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(adminCtx())
 	cancel() // the client is already gone
 
-	s.assignOwnerEpochAtCreate(ctx, "vm1")
+	s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 
 	row, err := corrosion.GetVM(adminCtx(), s.db, "vm1")
 	if err != nil || row == nil {

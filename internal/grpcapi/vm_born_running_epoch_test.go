@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
@@ -136,6 +137,17 @@ func callsAssignOwnerEpoch(fn *ast.FuncDecl) bool {
 			return true
 		}
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "assignOwnerEpochAtCreate" {
+			// A stamp told the VM is NOT running returns before the runtime
+			// markers, so it graduates nothing. runningcheck's callsGraduation
+			// had this identical hole and was fixed; this in-package twin was
+			// left matching by NAME only, which is the same evasion one file
+			// away — assignOwnerEpochAtCreate(ctx, n, false) beside a
+			// born-running insert satisfied it while stamping nothing.
+			if len(call.Args) >= 3 {
+				if id, isIdent := call.Args[2].(*ast.Ident); isIdent && id.Name == "false" {
+					return true
+				}
+			}
 			found = true
 			return false
 		}
@@ -209,5 +221,62 @@ func TestCloneVM_AStartedCloneIsProvable(t *testing.T) {
 		t.Fatal("the started clone is at vm_owner_epoch 0 — convergence returns early on a " +
 			"zero epoch and the default-off backfill never graduates it, so this running VM " +
 			"is permanently unprovable")
+	}
+}
+
+// A clone created WITHOUT --start must still be graduated off epoch 0.
+//
+// The guard's comment claimed "a stopped one is graduated by whatever later
+// starts it". Nothing does: GraduateVMOwnerEpoch has exactly one non-backfill
+// caller, and StartVM's publish hits the epoch < 1 skip and only logs
+// "pre-epoch … unprovable". So a stopped clone stayed at 0 forever unless the
+// default-off backfill was enabled — and the moment it starts it is running and
+// unprovable, which is the state the create path was fixed to prevent.
+//
+// The runtime markers still must NOT be written while it is stopped: they assert
+// a generation owns a runtime, and there is no runtime yet.
+func TestCloneVM_AStoppedCloneIsGraduatedWithoutRuntimeMarkers(t *testing.T) {
+	s, fake := provableCreateServer(t)
+	ctx := adminCtx()
+
+	srcDisk := s.images.DiskPath("src2", "root")
+	if err := os.MkdirAll(filepath.Dir(srcDisk), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := qcow2.Create(srcDisk, 64*1024*1024, nil); err != nil {
+		t.Fatalf("qcow2: %v", err)
+	}
+	specJSON, _ := json.Marshal(&pb.VMSpec{Name: "src2", Cpu: 1, MemoryMib: 512})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "src2", HostName: "test-host", State: "stopped", Spec: string(specJSON)},
+		nil,
+		[]corrosion.DiskRecord{{VMName: "src2", DiskName: "root", HostName: "test-host",
+			Path: srcDisk, SizeBytes: 64 * 1024 * 1024, StorageType: "local"}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+
+	if _, err := s.CloneVM(ctx, &pb.CloneVMRequest{
+		Source: "src2", Target: "clone2", Mode: "full", // no Start
+	}); err != nil {
+		t.Fatalf("CloneVM: %v", err)
+	}
+
+	rows, err := s.db.Query(ctx, `SELECT state, vm_owner_epoch FROM vms WHERE name = ?`, "clone2")
+	if err != nil || len(rows) == 0 {
+		t.Fatalf("read clone: %v", err)
+	}
+	if got := rows[0].String("state"); got != "stopped" {
+		t.Fatalf("clone state = %q, want stopped", got)
+	}
+	if rows[0].Int64("vm_owner_epoch") == 0 {
+		t.Error("a stopped clone was left at vm_owner_epoch 0; nothing on the start path " +
+			"graduates it, so it becomes running and unprovable the moment it starts")
+	}
+	if epoch, ok, _ := fake.GetDomainOwnerEpoch("clone2"); ok {
+		t.Errorf("a runtime domain marker (%d) was stamped for a STOPPED clone", epoch)
+	}
+	if epoch, ok, _ := health.ReadVMOwnerEpochMarker(s.dataDir, "clone2"); ok {
+		t.Errorf("a runtime file marker (%d) was written for a STOPPED clone", epoch)
 	}
 }

@@ -156,11 +156,11 @@ func (s *Server) UnaryAuthInterceptor(
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
 	if skipAuth[info.FullMethod] {
-		if err := s.refuseLoginWhileReseedIncomplete(ctx, info.FullMethod); err != nil {
+		admitted, err := s.admitPreSessionCredentialExchange(ctx, info.FullMethod)
+		if err != nil {
 			return nil, err
 		}
-		ctx = s.stampReseedFence(ctx, info.FullMethod)
-		return handler(ctx, req)
+		return handler(admitted, req)
 	}
 	ctx, err := s.authenticate(ctx)
 	if err != nil {
@@ -177,10 +177,14 @@ func (s *Server) StreamAuthInterceptor(
 	handler grpc.StreamHandler,
 ) error {
 	if skipAuth[info.FullMethod] {
-		if err := s.refuseLoginWhileReseedIncomplete(ss.Context(), info.FullMethod); err != nil {
+		// Stamped here too, so a pre-session credential exchange added as a
+		// STREAMING RPC later cannot slip in unstamped — the unary path would
+		// gate it and this one silently would not.
+		admitted, err := s.admitPreSessionCredentialExchange(ss.Context(), info.FullMethod)
+		if err != nil {
 			return err
 		}
-		return handler(srv, ss)
+		return handler(srv, &wrappedStream{ss, admitted})
 	}
 	ctx, err := s.authenticate(ss.Context())
 	if err != nil {

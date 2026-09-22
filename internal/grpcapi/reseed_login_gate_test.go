@@ -31,7 +31,7 @@ func gateTestServer(t *testing.T) *Server {
 func TestLoginGate_RefusesLoginWhileAReseedIsIncomplete(t *testing.T) {
 	ctx := context.Background()
 	s := gateTestServer(t)
-	if err := s.db.BeginReseed(ctx, "kvm001"); err != nil {
+	if _, err := s.db.BeginReseed(ctx, "kvm001"); err != nil {
 		t.Fatalf("BeginReseed: %v", err)
 	}
 
@@ -63,7 +63,7 @@ func TestLoginGate_RefusesLoginWhileAReseedIsIncomplete(t *testing.T) {
 func TestLoginGate_LeavesPingReachable(t *testing.T) {
 	ctx := context.Background()
 	s := gateTestServer(t)
-	if err := s.db.BeginReseed(ctx, "kvm001"); err != nil {
+	if _, err := s.db.BeginReseed(ctx, "kvm001"); err != nil {
 		t.Fatalf("BeginReseed: %v", err)
 	}
 
@@ -106,7 +106,7 @@ func TestLoginGate_AllowsLoginOnAHealthyNode(t *testing.T) {
 func TestLoginGate_RefusesWebAuthnLoginToo(t *testing.T) {
 	ctx := context.Background()
 	s := gateTestServer(t)
-	if err := s.db.BeginReseed(ctx, "kvm001"); err != nil {
+	if _, err := s.db.BeginReseed(ctx, "kvm001"); err != nil {
 		t.Fatalf("BeginReseed: %v", err)
 	}
 

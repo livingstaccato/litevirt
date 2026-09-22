@@ -51,6 +51,16 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 			if !lockPos.IsValid() {
 				continue
 			}
+			// The forward's receiver is whatever peerClient/dialPeer was assigned
+			// to, NOT a fixed name. Matching the literal identifier "client" made
+			// the scan blind to every handler that spells it otherwise —
+			// snapshot_container.go uses `c`, reseed.go uses `peer` — so an
+			// entire class of forwards was invisible and a new handler naming its
+			// client anything else got no coverage at all.
+			peerVars := peerClientVars(fn)
+			if len(peerVars) == 0 {
+				continue
+			}
 			// DEFERRED unlocks do not count: `defer unlock()` runs at RETURN, not
 			// where it is written, so a deferred release sitting above a forward
 			// releases nothing while that forward is in flight. Counting it was
@@ -81,7 +91,7 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 					return true
 				}
 				recv, ok := sel.X.(*ast.Ident)
-				if !ok || recv.Name != "client" {
+				if !ok || !peerVars[recv.Name] {
 					return true
 				}
 				forwards++
@@ -107,7 +117,7 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 				}
 				violations = append(violations,
 					name+":"+itoa(fset.Position(call.Pos()).Line)+" in "+fn.Name.Name+
-						" → client."+sel.Sel.Name)
+						" → "+recv.Name+"."+sel.Sel.Name)
 				return true
 			})
 		}
@@ -140,5 +150,53 @@ func firstCallPos(fn *ast.FuncDecl, match func(*ast.SelectorExpr) bool) token.Po
 		}
 		return true
 	})
+	return out
+}
+
+// peerClientVars returns the identifiers in fn that hold a peer client — the
+// left-hand side of an assignment from peerClient or dialPeer.
+func peerClientVars(fn *ast.FuncDecl) map[string]bool {
+	out := map[string]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return true
+		}
+		call, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		// The two helpers that hand back a peer client, plus the raw
+		// constructor.
+		//
+		// NewLiteVirtClient recovers no coverage in the tree as it stands: the
+		// one function that builds a client that way, notifyTargetHostOfVM,
+		// takes no per-VM lock, so the scan skips it before it ever looks for a
+		// client. An earlier version of this comment claimed the old scan "saw
+		// that one" — it did not, and neither does this one. The arm is here so
+		// that a future handler which locks AND builds its client directly is
+		// covered, which is the case the helper-only match would miss.
+		case "peerClient", "dialPeer", "NewLiteVirtClient":
+		default:
+			return true
+		}
+		if id, ok := as.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
+			out[id.Name] = true
+		}
+		return true
+	})
+	// Deliberately NOT seeded with the literal name "client". Adding it
+	// unconditionally restored the old coverage at the cost of matching every
+	// unrelated `client` in the package — an HTTP, IPAM or metrics client held
+	// across a lock would be reported as a peer RPC, failing CI on something
+	// that has nothing to do with peer forwarding. It also made the set never
+	// empty, so the fast-path skip below became dead code. The shape that
+	// mattered, `client := pb.NewLiteVirtClient(conn)`, is matched by name of
+	// the CONSTRUCTOR above, whatever the variable is called.
 	return out
 }

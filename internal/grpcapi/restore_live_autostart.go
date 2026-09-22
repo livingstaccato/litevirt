@@ -367,7 +367,7 @@ func (s *Server) autoDefineRestoredVM(
 		//
 		// In the else on purpose: a non-firmware insert failure is NOT fatal on
 		// this path, so an unguarded call would graduate a row that does not exist.
-		s.assignOwnerEpochAtCreate(ctx, targetName)
+		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	}
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")

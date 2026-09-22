@@ -372,7 +372,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
 	// incomplete delete, even if the libvirt domain is already gone.
-	s.images.DeleteVMDisks(spec.Name, s.protectedDiskPaths(ctx, spec.Name))
+	s.sweepVMDiskDebris(ctx, spec.Name)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
@@ -969,7 +969,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		// replicated no-op and a misleading log line. The invariant it maintains
 		// lives on assignOwnerEpochAtCreate; do not restate it here, or the two
 		// copies drift.
-		s.assignOwnerEpochAtCreate(ctx, spec.Name)
+		s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
 	}
 
 	slog.Info("VM created successfully", "name", spec.Name, "host", s.hostName)
@@ -1003,7 +1003,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 //
 // Nothing here is fatal. The VM is already running, and every outcome is one an
 // existing repair path handles — which is the whole reason for the ordering.
-func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string) {
+func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string, running bool) {
 	// Detached from the RPC context. The row is already committed and the guest is
 	// already running by the time this runs, so a client ^C or an RPC deadline that
 	// expired during the preceding image and disk work must not decide whether the
@@ -1029,6 +1029,15 @@ func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string) {
 			"name", name, "error", gerr)
 		return
 	}
+	// The RUNTIME markers are only for a runtime that exists. A VM created
+	// stopped still needs its row graduated — nothing on the start path does it,
+	// so it would otherwise become running at epoch 0, which is the state this
+	// function exists to prevent — but stamping a marker for it would assert a
+	// generation owns a runtime that is not there.
+	if !running {
+		return
+	}
+
 	// Stamp both runtime markers now, at the epoch just assigned.
 	//
 	// A marker failure is not fatal. The row is already at a positive epoch, which
@@ -1968,7 +1977,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	if !req.KeepDisks {
 		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-		s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
+		s.sweepVMDiskDebris(ctx, req.Name)
 		// Remove cloud-init ISO
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
@@ -2896,7 +2905,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),
 	// then glob the default dir. Must run before the tombstone below.
 	s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-	s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
+	s.sweepVMDiskDebris(ctx, req.Name)
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)
@@ -3171,6 +3180,26 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// still names its own older generation, and runtimeSuperseded refuses the
 	// replacement's self-heal rebuild. Local by construction: CutoverVM forwarded
 	// to the replacement's host above.
+	// No state argument: a cutover deliberately accepts a -next VM that is
+	// STOPPED (see the state check above), and the markers must not be written
+	// for a runtime that is not there — but the state that decides it is read
+	// back from the committed row inside the helper, NOT passed from here.
+	// nextVM.State was read before the entire teardown while ReplaceVM writes
+	// the state it re-reads at commit time, so the value this call site holds
+	// can be stale in both directions: it skipped the markers for a commit that
+	// landed running, leaving the row at a new generation with nothing naming
+	// it, and it wrote them for one that landed stopped.
+	//
+	// The DOMAIN half of the marker write always fails here, on every cutover,
+	// and that is structural rather than exceptional: retireOriginalDomain has
+	// already undefined the domain at this name, and the replacement is not
+	// redefined onto it until finishVMReplaceCleanup below. Only the FILE
+	// marker lands — which is the one runtimeSuperseded reads — so the publish
+	// is complete for every consumer that matters, and the "markers not
+	// written" warning it logs names a condition convergence repairs on its
+	// next sweep. An earlier note here had this backwards, claiming the old
+	// defect was a live write against an inactive domain; there is no domain at
+	// all at this point.
 	if err := s.publishRunningMinted(ctx, req.VmName, func(ctx context.Context) error {
 		return corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared)
 	}); err != nil {

@@ -396,9 +396,27 @@ func (s *fileScan) checkFunc(body *ast.BlockStmt) {
 			if idx == stateInVMRecord {
 				return true // rule 4 polices the VMRecord it carries
 			}
-			if routed.family(call, s.fset) == familyNone {
+			// BOTH directions, symmetrically with the minting branch above. Using
+			// the WRONG helper is as much a defect as using none — that is this
+			// tool's own stated rule — but only the minting side enforced it, so
+			// a non-minting writer inside a MINTED helper passed silently and no
+			// test could fail, because there was no code path that reported it.
+			//
+			// The orderings are not interchangeable: the minted helper marks
+			// AFTER its commit, which is right for a statement that advances the
+			// generation and wrong for one that does not. A non-minting write
+			// routed that way leaves the row at its old generation while the
+			// marker is written from a read-back that never moved — so the window
+			// where the row says running and nothing names its generation is
+			// exactly the one the chokepoint exists to close.
+			switch routed.family(call, s.fset) {
+			case familyNone:
 				s.report(call, fmt.Sprintf("corrosion.%s(...) can publish a running VM but is not routed "+
 					"through publishRunning", name))
+			case familyMinted:
+				s.report(call, fmt.Sprintf("corrosion.%s(...) is a NON-MINTING write routed through the "+
+					"MINTED helper; it marks after a commit that advances no generation, so use "+
+					"publishRunning", name))
 			}
 		}
 		return true

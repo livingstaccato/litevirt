@@ -51,6 +51,16 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 			if !lockPos.IsValid() {
 				continue
 			}
+			// The forward's receiver is whatever peerClient/dialPeer was assigned
+			// to, NOT a fixed name. Matching the literal identifier "client" made
+			// the scan blind to every handler that spells it otherwise —
+			// snapshot_container.go uses `c`, reseed.go uses `peer` — so an
+			// entire class of forwards was invisible and a new handler naming its
+			// client anything else got no coverage at all.
+			peerVars := peerClientVars(fn)
+			if len(peerVars) == 0 {
+				continue
+			}
 			// DEFERRED unlocks do not count: `defer unlock()` runs at RETURN, not
 			// where it is written, so a deferred release sitting above a forward
 			// releases nothing while that forward is in flight. Counting it was
@@ -81,7 +91,7 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 					return true
 				}
 				recv, ok := sel.X.(*ast.Ident)
-				if !ok || recv.Name != "client" {
+				if !ok || !peerVars[recv.Name] {
 					return true
 				}
 				forwards++
@@ -107,7 +117,7 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 				}
 				violations = append(violations,
 					name+":"+itoa(fset.Position(call.Pos()).Line)+" in "+fn.Name.Name+
-						" → client."+sel.Sel.Name)
+						" → "+recv.Name+"."+sel.Sel.Name)
 				return true
 			})
 		}
@@ -137,6 +147,36 @@ func firstCallPos(fn *ast.FuncDecl, match func(*ast.SelectorExpr) bool) token.Po
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && match(sel) {
 			out = call.Pos()
 			return false
+		}
+		return true
+	})
+	return out
+}
+
+// peerClientVars returns the identifiers in fn that hold a peer client — the
+// left-hand side of an assignment from peerClient or dialPeer.
+func peerClientVars(fn *ast.FuncDecl) map[string]bool {
+	out := map[string]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Rhs) != 1 {
+			return true
+		}
+		call, ok := as.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		switch sel.Sel.Name {
+		case "peerClient", "dialPeer":
+		default:
+			return true
+		}
+		if id, ok := as.Lhs[0].(*ast.Ident); ok && id.Name != "_" {
+			out[id.Name] = true
 		}
 		return true
 	})

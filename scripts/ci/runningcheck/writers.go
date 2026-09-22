@@ -71,7 +71,12 @@ func checkWriters(root string) ([]violation, error) {
 		Dir:   root,
 		Tests: false,
 	}
-	pkgs, err := packages.Load(cfg, "./internal/...")
+	// The WHOLE module, not just ./internal/... . Rules 1-5 walk every
+	// production file in the tree, so scoping the only type-aware pass to one
+	// subtree left a state-writing function outside internal/ unclassified by
+	// construction — and unfindable, because the test loaded the same
+	// restricted pattern the pass did.
+	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		return nil, fmt.Errorf("load: %w", err)
 	}
@@ -255,7 +260,12 @@ func stateWritingFuncs(root string) (map[string]bool, error) {
 		Dir:   root,
 		Tests: false,
 	}
-	pkgs, err := packages.Load(cfg, "./internal/...")
+	// The WHOLE module, not just ./internal/... . Rules 1-5 walk every
+	// production file in the tree, so scoping the only type-aware pass to one
+	// subtree left a state-writing function outside internal/ unclassified by
+	// construction — and unfindable, because the test loaded the same
+	// restricted pattern the pass did.
+	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		return nil, err
 	}

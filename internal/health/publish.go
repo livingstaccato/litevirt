@@ -35,9 +35,21 @@ import (
 // a single method so *grpcapi.Server's backend, the Reconciler's interface,
 // *libvirt.Client and libvirtfake all satisfy it without an adapter.
 // markAfterCommitTimeout bounds the detached marking that follows a committed
-// minting transition. Long enough to outlast a slow read and its retries, short
-// enough that a wedged store cannot pin the goroutine indefinitely.
-const markAfterCommitTimeout = 30 * time.Second
+// minting transition.
+//
+// This is the CALLER's wait, not a background budget: everything after the
+// commit runs on the caller's goroutine, and for CutoverVM that goroutine holds
+// two per-VM locks. Detaching from the caller's context is right — the commit
+// has landed and a client ^C must not decide whether the VM is provable — but
+// detaching with a generous budget replaced "fail fast when the caller is gone"
+// with a multi-second stall, which is the uninterruptible wait the rest of this
+// change set removed.
+//
+// Sized to the work, not to patience: one row read and two small marker writes.
+// A store that has not answered in five seconds is not going to be rescued by
+// twenty-five more, and the reconciler repairs a missing marker on its next
+// sweep anyway.
+const markAfterCommitTimeout = 5 * time.Second
 
 type DomainEpochSetter interface {
 	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
@@ -270,8 +282,8 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 // repair-owner and owner-assert their audit records, for ownership changes that
 // had actually succeeded. Convergence repairs an unmarked running VM; it cannot
 // reconstruct the durable writes an aborted caller skipped.
-func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name string, commit func(context.Context) error) error {
-	return publishVMRunningMinted(ctx, virt, dataDir, hostName, name,
+func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name, state string, commit func(context.Context) error) error {
+	return publishVMRunningMinted(ctx, virt, dataDir, hostName, name, state,
 		func(ctx context.Context) (*corrosion.VMRecord, error) { return corrosion.GetVM(ctx, db, name) },
 		commit)
 }
@@ -280,9 +292,23 @@ func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *cor
 // the same reason rowForPublish has that seam: the read-back's RETRY policy is
 // the behaviour under test, and it cannot be exercised through a fault hook on
 // the shared corrosion client.
-func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir, hostName, name string, read func(context.Context) (*corrosion.VMRecord, error), commit func(context.Context) error) error {
+func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir, hostName, name, state string, read func(context.Context) (*corrosion.VMRecord, error), commit func(context.Context) error) error {
 	if err := commit(ctx); err != nil {
 		return err
+	}
+	// Markers are for a RUNNING runtime, and the minting path has to say so as
+	// explicitly as PublishVMRunning does. writeBothMarkers leans on it —
+	// "Only ever called for a RUNNING publish, which is why the domain write
+	// takes running=true" — and this twin had no gate at all. CutoverVM
+	// deliberately accepts a -next VM in state "stopped" and routes it here, so a
+	// stopped cutover fired SetDomainOwnerEpoch(name, epoch, true) at an inactive
+	// domain, which libvirt rejects, and still wrote a runtime file marker
+	// claiming a generation owns a runtime that is not there.
+	//
+	// After the commit, not before: the commit is what the caller asked for and
+	// it has already succeeded.
+	if state != "running" {
+		return nil
 	}
 	// DETACHED from here on, and for the reason assignOwnerEpochAtCreate gives
 	// for detaching its own: the commit above HAS landed, so a client ^C or an

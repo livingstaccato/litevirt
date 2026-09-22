@@ -59,7 +59,7 @@ func TestReconciler_CompletingAStartProofMarksTheRuntime(t *testing.T) {
 		t.Fatalf("setup: epoch = %d, want 1", before.OwnerEpoch)
 	}
 
-	if err := r.publishRunningMinted(ctx, "vm1", func(ctx context.Context) error {
+	if err := r.publishRunningMinted(ctx, "vm1", "running", func(ctx context.Context) error {
 		return corrosion.CompleteVMStartProof(ctx, db, "p1", "vm1", "node-a")
 	}); err != nil {
 		t.Fatalf("publishRunningMinted: %v", err)
@@ -131,6 +131,19 @@ func TestVMChecker_ANilConcreteClientDoesNotPanic(t *testing.T) {
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
+	// GRADUATED first, or this test proves nothing. At epoch 0 writeBothMarkers
+	// returns {skipped:true} at its `epoch < 1` guard and never reaches usable()
+	// — the typed-nil guard this test is named for. Verified: with the row left
+	// at 0, mutating usable() to return true unconditionally leaves this test
+	// green while the sibling marking test panics.
+	if err := corrosion.BackfillOwnerEpochs(ctx, db, "node1"); err != nil {
+		t.Fatalf("BackfillOwnerEpochs: %v", err)
+	}
+	row, err := corrosion.GetVM(ctx, db, "vm1")
+	if err != nil || row == nil || row.OwnerEpoch < 1 {
+		t.Fatalf("precondition: the row must be at a real generation, got %+v (err %v)", row, err)
+	}
+
 	v := NewVMChecker("node1", t.TempDir(), db, nil)
 	committed := false
 	if err := v.publishRunning(ctx, "vm1", "running", func(context.Context) error {

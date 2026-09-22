@@ -1202,8 +1202,8 @@ func (s *Server) publishRunning(ctx context.Context, name, state string, commit 
 // the only correct one here.
 //
 // Local publishes only, for the same reason publishRunning is: see its comment.
-func (s *Server) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
-	return health.PublishVMRunningMinted(ctx, s.virt, s.db, s.dataDir, s.hostName, name, commit)
+func (s *Server) publishRunningMinted(ctx context.Context, name, state string, commit func(context.Context) error) error {
+	return health.PublishVMRunningMinted(ctx, s.virt, s.db, s.dataDir, s.hostName, name, state, commit)
 }
 
 // persistVMState records an authoritative VM state, routing a "running" write
@@ -1251,6 +1251,13 @@ func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, 
 		// wait the chokepoint's read half was rewritten to remove.
 		select {
 		case <-ctx.Done():
+			// COUNTED before returning. Returning straight out skipped
+			// noteStateWriteFail below, and persistVMState's own `!committed`
+			// guard cannot cover it either — so a write dropped to a shutdown or
+			// an expired deadline was recorded nowhere, against a flat failure
+			// total, during exactly the fleet-wide shutdown WriteClassCancelled
+			// was added to make visible.
+			s.noteStateWriteFail(op, ctx.Err())
 			return ctx.Err()
 		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
 		}

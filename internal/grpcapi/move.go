@@ -576,8 +576,13 @@ func (s *Server) protectedDiskPaths(ctx context.Context, vmName string) map[stri
 	// chain, unrecoverably.
 	candidates, err := s.images.VMDiskCandidates(vmName)
 	if err != nil {
-		slog.Error("delete: cannot list candidate disk files, so every one of them is "+
-			"protected; a still-referenced base must not be removed on a failed read",
+		// Returning nil here is an EMPTY keep set — it protects NOTHING, which is
+		// the opposite of what this path wants. sweepVMDiskDebris is the only
+		// caller and it refuses to run the glob at all on this error, so the
+		// guarantee lives there rather than resting on DeleteVMDisks happening to
+		// fail the same way.
+		slog.Error("delete: cannot list candidate disk files; the debris sweep is skipped "+
+			"entirely rather than run without protection",
 			"vm", vmName, "error", err)
 		return nil
 	}
@@ -909,3 +914,23 @@ func copyFileWithProgress(ctx context.Context, src, dst string, emit func(*pb.Mo
 
 // _ touches the context import used only when qemu-img is present.
 var _ context.Context
+
+// sweepVMDiskDebris removes leftover <vm>-*.qcow2 files, protecting any a live
+// row still references.
+//
+// The two steps go together: the keep set is derived from the same candidate
+// list the glob walks, and if that list cannot be built there is nothing to
+// derive protection FROM — so the sweep is skipped rather than run with an empty
+// keep set. Callers used to pass protectedDiskPaths straight into DeleteVMDisks,
+// which on a listing failure meant "delete everything, protect nothing", and was
+// survivable only because DeleteVMDisks re-listed and failed identically.
+func (s *Server) sweepVMDiskDebris(ctx context.Context, vmName string) {
+	if _, err := s.images.VMDiskCandidates(vmName); err != nil {
+		slog.Error("delete: skipping the disk debris sweep; its candidate list is unreadable",
+			"vm", vmName, "error", err)
+		return
+	}
+	if err := s.images.DeleteVMDisks(vmName, s.protectedDiskPaths(ctx, vmName)); err != nil {
+		slog.Warn("delete: disk debris sweep failed", "vm", vmName, "error", err)
+	}
+}

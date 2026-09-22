@@ -565,27 +565,15 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 // cannot name, but diskPathReferencedByOtherVM itself already answers "yes" on
 // a read error, so an unreadable REFERENCE check keeps the file. The remaining
 // gap — we cannot list this VM's own disks — is logged rather than silent.
-func (s *Server) protectedDiskPaths(ctx context.Context, vmName string) map[string]bool {
-	// Keyed off the files the glob will actually walk, NOT off this VM's own live
-	// rows. Deriving it from the rows cannot work on the create path: createVM
-	// refuses a duplicate live name before it gets here, so the VM it is about to
-	// create has no live rows by construction and the keep set was always empty —
-	// while `lv rm base --keep-disks` leaves base-root.qcow2 on disk,
-	// tombstoned but still named by every overlay's backing_disk. Reusing the name
-	// then globbed base-*.qcow2 with nothing protected and destroyed every clone's
-	// chain, unrecoverably.
-	candidates, err := s.images.VMDiskCandidates(vmName)
-	if err != nil {
-		// Returning nil here is an EMPTY keep set — it protects NOTHING, which is
-		// the opposite of what this path wants. sweepVMDiskDebris is the only
-		// caller and it refuses to run the glob at all on this error, so the
-		// guarantee lives there rather than resting on DeleteVMDisks happening to
-		// fail the same way.
-		slog.Error("delete: cannot list candidate disk files; the debris sweep is skipped "+
-			"entirely rather than run without protection",
-			"vm", vmName, "error", err)
-		return nil
-	}
+// protectedDiskPathsFrom takes the candidate list the caller already holds, so
+// that ONE listing drives both the protection and the deletion.
+//
+// There is deliberately no listing variant of this. The old one returned an
+// EMPTY keep set on a listing failure — protecting nothing — and every caller
+// that paired it with a re-listing delete was one transient error away from
+// sweeping a live clone base. Removing it rather than guarding it is what makes
+// that pairing unwriteable instead of merely discouraged.
+func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, candidates []string) map[string]bool {
 	keep := make(map[string]bool, len(candidates))
 	for _, path := range candidates {
 		referrers, rerr := corrosion.DisksReferencingPath(ctx, s.db, path)
@@ -925,12 +913,29 @@ var _ context.Context
 // which on a listing failure meant "delete everything, protect nothing", and was
 // survivable only because DeleteVMDisks re-listed and failed identically.
 func (s *Server) sweepVMDiskDebris(ctx context.Context, vmName string) {
-	if _, err := s.images.VMDiskCandidates(vmName); err != nil {
+	candidates, err := s.images.VMDiskCandidates(vmName)
+	if err != nil {
 		slog.Error("delete: skipping the disk debris sweep; its candidate list is unreadable",
 			"vm", vmName, "error", err)
 		return
 	}
-	if err := s.images.DeleteVMDisks(vmName, s.protectedDiskPaths(ctx, vmName)); err != nil {
+	s.sweepVMDiskDebrisIn(ctx, vmName, candidates)
+}
+
+// sweepVMDiskDebrisIn is the sweep over a candidate list, which is also the
+// seam its test drives.
+//
+// Taking the list is what lets a test show WHICH list the deletion walks,
+// without a package-level hook sitting in the live delete path of createVM,
+// DeleteVM and RebuildVM. The first version of this used such a hook; a
+// test-only mutable global steering production deletes is a worse trade than
+// one more parameter.
+func (s *Server) sweepVMDiskDebrisIn(ctx context.Context, vmName string, candidates []string) {
+	// ONE list, used for both halves. Deriving the keep set from a second
+	// listing and deleting against a third left the guarantee resting on all
+	// three agreeing: a file appearing after the keep set was built is in no
+	// keep set and would be swept with no reference check ever run against it.
+	if err := s.images.DeleteVMDisksIn(vmName, candidates, s.protectedDiskPathsFrom(ctx, vmName, candidates)); err != nil {
 		slog.Warn("delete: disk debris sweep failed", "vm", vmName, "error", err)
 	}
 }

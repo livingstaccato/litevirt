@@ -3180,11 +3180,16 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// still names its own older generation, and runtimeSuperseded refuses the
 	// replacement's self-heal rebuild. Local by construction: CutoverVM forwarded
 	// to the replacement's host above.
-	// nextVM.State, not a hardcoded "running": a cutover deliberately accepts a
-	// -next VM that is STOPPED (see the state check above), and the runtime
-	// markers must not be written for a runtime that is not there — the domain
-	// write is a LIVE metadata write libvirt rejects on an inactive domain.
-	if err := s.publishRunningMinted(ctx, req.VmName, nextVM.State, func(ctx context.Context) error {
+	// No state argument: a cutover deliberately accepts a -next VM that is
+	// STOPPED (see the state check above), and the markers must not be written
+	// for a runtime that is not there — but the state that decides it is read
+	// back from the committed row inside the helper, NOT passed from here.
+	// nextVM.State was read before the entire teardown while ReplaceVM writes
+	// the state it re-reads at commit time, so the value this call site holds
+	// can be stale in both directions: it fired a LIVE domain write at an
+	// inactive domain, and it skipped the markers for a commit that landed
+	// running, leaving the row at a new generation with nothing naming it.
+	if err := s.publishRunningMinted(ctx, req.VmName, func(ctx context.Context) error {
 		return corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared)
 	}); err != nil {
 		return nil, status.Errorf(codes.Internal, "cutover: give %q the name %q: %v",

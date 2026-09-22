@@ -84,6 +84,16 @@ const (
 	// alwaysRunning: the statement hardcodes state='running' and takes no state
 	// argument, so no literal can ever exempt it.
 	alwaysRunning = -2
+	// stateFromCommittedRow: the statement takes no state argument AND does not
+	// hardcode 'running' — it writes whatever state it re-reads from a row at
+	// commit time. Behaviourally identical to alwaysRunning here (both are
+	// negative, so no literal argument can exempt the call), but it is a
+	// different FACT, and labelling it alwaysRunning asserted the opposite of
+	// what this tool's own subject matter proves: publishVMRunningMinted stopped
+	// trusting a caller's state precisely because ReplaceVM's outcome is not
+	// knowable before the commit. A later rule reading alwaysRunning as "the
+	// committed row is running" would be wrong for exactly this statement.
+	stateFromCommittedRow = -3
 )
 
 // nonMinting are corrosion writers that can set state='running' while leaving
@@ -121,9 +131,11 @@ var minting = map[string]int{
 	"TransferVMOwner":      4,
 	"TransferVMOwnerFresh": 4,
 	"CompleteVMStartProof": alwaysRunning,
-	// ReplaceVM installs a cutover's replacement with the state copied from its
-	// row, not taken as an argument, so no literal can ever exempt a call.
-	"ReplaceVM": alwaysRunning,
+	// ReplaceVM installs a cutover's replacement with the state copied from the
+	// source row it re-reads at commit time, not taken as an argument, so no
+	// literal can ever exempt a call — and, unlike the entries above, the state
+	// it commits is not knowable here at all.
+	"ReplaceVM": stateFromCommittedRow,
 }
 
 // The publish helpers, mapped to the zero-based index of their state argument —
@@ -133,8 +145,16 @@ var minting = map[string]int{
 // mintedHelpers take the commit-then-mark ordering; plainHelpers the
 // mark-then-commit one (see internal/health/publish.go for why the two exist).
 // A minting primitive routed through a plain helper is a family mismatch, not a
-// pass. A minted helper has NO state argument — it always publishes running —
-// which is alwaysRunning here exactly as it is for the primitives.
+// pass.
+//
+// A minted helper has NO state argument, which is alwaysRunning here exactly as
+// it is for the primitives. It had one briefly, and that was a defect this
+// model could not see: the helper gated its markers on a value the CALLER had
+// read, CutoverVM passed a state read before the whole teardown while the
+// commit wrote the state it re-read at commit time, and the two could disagree
+// in both directions. The helper now reads the committed row back and decides
+// from that, so there is no argument left to contradict the primitive and
+// nothing for this map to model.
 var mintedHelpers = map[string]int{
 	"publishRunningMinted":   alwaysRunning,
 	"PublishVMRunningMinted": alwaysRunning,
@@ -1081,6 +1101,20 @@ func callsGraduation(body ast.Node) bool {
 			return true
 		}
 		if helperName(call) == "assignOwnerEpochAtCreate" {
+			// A stamp that is told the VM is NOT running returns before the
+			// runtime markers, so it graduates nothing. Matching the call by
+			// name alone accepted assignOwnerEpochAtCreate(ctx, n, false) beside
+			// a born-RUNNING insert: the row lands running, no marker is
+			// written, and this rule reported nothing.
+			//
+			// Only a literal false is rejected. A live expression —
+			// `state == "running"` on the clone path — is the correct shape and
+			// cannot be decided here.
+			if len(call.Args) >= 3 {
+				if id, ok := call.Args[2].(*ast.Ident); ok && id.Name == "false" {
+					return true
+				}
+			}
 			found = true
 		}
 		return true

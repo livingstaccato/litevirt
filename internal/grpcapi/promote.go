@@ -936,7 +936,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
-		if err := s.publishRunningMinted(ctx, targetName, "running", func(ctx context.Context) error {
+		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {
 			return corrosion.TransferVMOwnerFresh(ctx, s.db, targetName, s.hostName, "running")
 		}); err != nil {
 			return status.Errorf(codes.Internal, "re-home vm record: %v", err)

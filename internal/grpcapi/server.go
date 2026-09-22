@@ -1202,8 +1202,8 @@ func (s *Server) publishRunning(ctx context.Context, name, state string, commit 
 // the only correct one here.
 //
 // Local publishes only, for the same reason publishRunning is: see its comment.
-func (s *Server) publishRunningMinted(ctx context.Context, name, state string, commit func(context.Context) error) error {
-	return health.PublishVMRunningMinted(ctx, s.virt, s.db, s.dataDir, s.hostName, name, state, commit)
+func (s *Server) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
+	return health.PublishVMRunningMinted(ctx, s.virt, s.db, s.dataDir, s.hostName, name, commit)
 }
 
 // persistVMState records an authoritative VM state, routing a "running" write

@@ -171,7 +171,17 @@ func peerClientVars(fn *ast.FuncDecl) map[string]bool {
 			return true
 		}
 		switch sel.Sel.Name {
-		case "peerClient", "dialPeer":
+		// The two helpers that hand back a peer client, plus the raw
+		// constructor.
+		//
+		// NewLiteVirtClient recovers no coverage in the tree as it stands: the
+		// one function that builds a client that way, notifyTargetHostOfVM,
+		// takes no per-VM lock, so the scan skips it before it ever looks for a
+		// client. An earlier version of this comment claimed the old scan "saw
+		// that one" — it did not, and neither does this one. The arm is here so
+		// that a future handler which locks AND builds its client directly is
+		// covered, which is the case the helper-only match would miss.
+		case "peerClient", "dialPeer", "NewLiteVirtClient":
 		default:
 			return true
 		}
@@ -180,5 +190,13 @@ func peerClientVars(fn *ast.FuncDecl) map[string]bool {
 		}
 		return true
 	})
+	// Deliberately NOT seeded with the literal name "client". Adding it
+	// unconditionally restored the old coverage at the cost of matching every
+	// unrelated `client` in the package — an HTTP, IPAM or metrics client held
+	// across a lock would be reported as a peer RPC, failing CI on something
+	// that has nothing to do with peer forwarding. It also made the set never
+	// empty, so the fast-path skip below became dead code. The shape that
+	// mattered, `client := pb.NewLiteVirtClient(conn)`, is matched by name of
+	// the CONSTRUCTOR above, whatever the variable is called.
 	return out
 }

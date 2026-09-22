@@ -59,7 +59,7 @@ func TestReconciler_CompletingAStartProofMarksTheRuntime(t *testing.T) {
 		t.Fatalf("setup: epoch = %d, want 1", before.OwnerEpoch)
 	}
 
-	if err := r.publishRunningMinted(ctx, "vm1", "running", func(ctx context.Context) error {
+	if err := r.publishRunningMinted(ctx, "vm1", func(ctx context.Context) error {
 		return corrosion.CompleteVMStartProof(ctx, db, "p1", "vm1", "node-a")
 	}); err != nil {
 		t.Fatalf("publishRunningMinted: %v", err)

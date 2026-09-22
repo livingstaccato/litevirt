@@ -29,14 +29,14 @@ func TestPublishVMRunningMinted_ACancelledCallerStillMarks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := publishVMRunningMinted(ctx, fake, dir, "node1", "vm1", "running",
+	err := publishVMRunningMinted(ctx, fake, dir, "node1", "vm1",
 		func(rctx context.Context) (*corrosion.VMRecord, error) {
 			// A real read honours its context — corrosion.GetVM does. If the
 			// chokepoint hands it the caller's cancelled one, it fails here.
 			if err := rctx.Err(); err != nil {
 				return nil, err
 			}
-			return &corrosion.VMRecord{Name: "vm1", HostName: "node1", OwnerEpoch: 7}, nil
+			return &corrosion.VMRecord{Name: "vm1", HostName: "node1", State: "running", OwnerEpoch: 7}, nil
 		},
 		func(context.Context) error { return nil },
 	)
@@ -74,20 +74,81 @@ func TestPublishVMRunningMinted_DoesNotStallTheCallerOnAWedgedRead(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the caller is already gone
 
-	start := time.Now()
-	err := publishVMRunningMinted(ctx, fake, dir, "node1", "vm1", "running",
-		func(rctx context.Context) (*corrosion.VMRecord, error) {
-			<-rctx.Done() // a store that never answers
-			return nil, rctx.Err()
-		},
-		func(context.Context) error { return nil })
-	elapsed := time.Since(start)
+	// Run it OFF the test goroutine and race it against a hard ceiling. Calling
+	// it inline and measuring afterwards could only ever report a bound that was
+	// enforced: the mutation that actually breaks the bound — dropping the
+	// timeout from the detached context — makes the read block forever, so the
+	// test HUNG until the go test deadline killed the whole package instead of
+	// failing here with a reason. A test whose failure mode is a package-wide
+	// timeout names no defect.
+	type result struct {
+		err     error
+		elapsed time.Duration
+	}
+	done := make(chan result, 1)
+	go func() {
+		start := time.Now()
+		e := publishVMRunningMinted(ctx, fake, dir, "node1", "vm1",
+			func(rctx context.Context) (*corrosion.VMRecord, error) {
+				<-rctx.Done() // a store that never answers
+				return nil, rctx.Err()
+			},
+			func(context.Context) error { return nil })
+		done <- result{e, time.Since(start)}
+	}()
+
+	var got result
+	select {
+	case got = <-done:
+	case <-time.After(markAfterCommitTimeout + 5*time.Second):
+		t.Fatalf("the publish had not returned %v after the commit; the post-commit budget is "+
+			"not bounding the wait at all, and the caller is holding two per-VM locks for it",
+			markAfterCommitTimeout+5*time.Second)
+	}
+	err, elapsed := got.err, got.elapsed
 
 	if err != nil {
 		t.Fatalf("a failed read-back is reported, not returned: %v", err)
 	}
-	if elapsed > 8*time.Second {
-		t.Fatalf("the caller was held for %v after its own context was cancelled — the "+
-			"post-commit marking budget is the caller's wait, and it is holding locks", elapsed)
+	// Measured against the constant, not a hand-picked number. An 8-second
+	// threshold here was looser than the 5-second budget it was guarding, so it
+	// would have passed unchanged if the budget went back up to 7 — it admitted
+	// exactly the multi-second stall this test's own comment says the fix must
+	// not trade for.
+	//
+	// What is bounded is the ctx-aware work: the read-back. The two marker
+	// writes take no context (SetDomainOwnerEpoch and the file write are
+	// blocking calls), so a wedged libvirt is NOT bounded by this budget and the
+	// caller still waits on it holding its locks.
+	//
+	// That residual is real and unclosed. An earlier note here said closing it
+	// required moving the marking off the caller's goroutine entirely; that was
+	// a false dichotomy. The DOMAIN half could be bounded on its own while the
+	// durable file marker stays synchronous — writeBothMarkers already treats
+	// "file landed, domain failed" as a successful publish (res.landed is an
+	// OR), so a timed-out domain write needs no new contract.
+	//
+	// It is still not done here, for a narrower reason: an abandoned libvirt
+	// write can land after a later publish has set a higher generation, walking
+	// the domain marker backwards. That direction is the conservative one for
+	// every reader today, but this is a dual-run guard, and the last change made
+	// to one on a review suggestion turned a refusal into a permission. It wants
+	// its own decision, not a timeout fix carrying it in.
+	// TWO assertions, because either alone is defeatable. Measuring only against
+	// the constant makes the threshold move with the budget, so raising the
+	// budget back to 30s passes; asserting only a fixed number leaves it unclear
+	// whether the budget is enforced at all or the read merely returned early.
+	if elapsed > markAfterCommitTimeout+time.Second {
+		t.Fatalf("the caller was held for %v against a %v budget — the budget is not bounding "+
+			"the post-commit wait at all", elapsed, markAfterCommitTimeout)
+	}
+	// The budget itself has to stay small: it IS the caller's wait, taken while
+	// CutoverVM holds two per-VM locks. An 8-second threshold here was looser
+	// than the 5-second budget it guarded, so it admitted exactly the
+	// multi-second stall this test's comment says the fix must not trade for.
+	if markAfterCommitTimeout > 5*time.Second {
+		t.Errorf("markAfterCommitTimeout is %v; everything after the commit is one row read "+
+			"and two small marker writes, and the caller waits for all of it while holding "+
+			"locks", markAfterCommitTimeout)
 	}
 }

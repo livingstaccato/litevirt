@@ -282,8 +282,8 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 // repair-owner and owner-assert their audit records, for ownership changes that
 // had actually succeeded. Convergence repairs an unmarked running VM; it cannot
 // reconstruct the durable writes an aborted caller skipped.
-func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name, state string, commit func(context.Context) error) error {
-	return publishVMRunningMinted(ctx, virt, dataDir, hostName, name, state,
+func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *corrosion.Client, dataDir, hostName, name string, commit func(context.Context) error) error {
+	return publishVMRunningMinted(ctx, virt, dataDir, hostName, name,
 		func(ctx context.Context) (*corrosion.VMRecord, error) { return corrosion.GetVM(ctx, db, name) },
 		commit)
 }
@@ -292,23 +292,9 @@ func PublishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, db *cor
 // the same reason rowForPublish has that seam: the read-back's RETRY policy is
 // the behaviour under test, and it cannot be exercised through a fault hook on
 // the shared corrosion client.
-func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir, hostName, name, state string, read func(context.Context) (*corrosion.VMRecord, error), commit func(context.Context) error) error {
+func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir, hostName, name string, read func(context.Context) (*corrosion.VMRecord, error), commit func(context.Context) error) error {
 	if err := commit(ctx); err != nil {
 		return err
-	}
-	// Markers are for a RUNNING runtime, and the minting path has to say so as
-	// explicitly as PublishVMRunning does. writeBothMarkers leans on it —
-	// "Only ever called for a RUNNING publish, which is why the domain write
-	// takes running=true" — and this twin had no gate at all. CutoverVM
-	// deliberately accepts a -next VM in state "stopped" and routes it here, so a
-	// stopped cutover fired SetDomainOwnerEpoch(name, epoch, true) at an inactive
-	// domain, which libvirt rejects, and still wrote a runtime file marker
-	// claiming a generation owns a runtime that is not there.
-	//
-	// After the commit, not before: the commit is what the caller asked for and
-	// it has already succeeded.
-	if state != "running" {
-		return nil
 	}
 	// DETACHED from here on, and for the reason assignOwnerEpochAtCreate gives
 	// for detaching its own: the commit above HAS landed, so a client ^C or an
@@ -344,6 +330,33 @@ func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir
 	if hostName != "" && row.HostName != hostName {
 		slog.Warn("publish: ownership moved during a minting transition — leaving the markers to the new owner",
 			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", hostName)
+		return nil
+	}
+	// Markers are for a RUNNING runtime, and the minting path has to say so as
+	// explicitly as PublishVMRunning does. writeBothMarkers leans on it — "Only
+	// ever called for a RUNNING publish, which is why the domain write takes
+	// running=true" — and this twin had no gate at all: a stopped cutover fired
+	// SetDomainOwnerEpoch(name, epoch, true) at an inactive domain, which
+	// libvirt rejects, and still wrote a file marker claiming a generation owns
+	// a runtime that is not there.
+	//
+	// Gated on the state the COMMIT produced, read back here — NOT on a value
+	// the caller carried in. CutoverVM reads nextVM.State before the entire
+	// teardown while ReplaceVM writes the state it re-reads at commit time, so
+	// the caller's value can be stale in both directions. Trusting it let a
+	// commit that landed RUNNING skip its markers, leaving the row at a new
+	// generation with nothing naming it — the exact window this chokepoint
+	// exists to close, reached through the chokepoint itself.
+	//
+	// SKIPPED, never removed. This read is taken up to markAfterCommitTimeout
+	// after the commit, so a concurrent local writer can move the row inside the
+	// window — which is the same untrustworthiness the caller's value had, in
+	// the other direction. Skipping a marker write on a wrong answer is a no-op
+	// that convergence repairs; DELETING a marker on one takes a live VM's proof
+	// away. A stale marker left by a replacement is cleared where the intent is
+	// journaled rather than re-read: finishVMReplaceRuntime, which knows the
+	// cutover's accepted state and cannot race with it.
+	if row.State != "running" {
 		return nil
 	}
 	if res := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); res.failures() != nil || res.unproven() {

@@ -217,8 +217,8 @@ func (r *Reconciler) publishRunning(ctx context.Context, name, state string, com
 
 // publishRunningMinted routes a MINTING transition through the chokepoint in the
 // other order. See PublishVMRunningMinted.
-func (r *Reconciler) publishRunningMinted(ctx context.Context, name, state string, commit func(context.Context) error) error {
-	return PublishVMRunningMinted(ctx, r.virt, r.db, r.dataDir, r.hostName, name, state, commit)
+func (r *Reconciler) publishRunningMinted(ctx context.Context, name string, commit func(context.Context) error) error {
+	return PublishVMRunningMinted(ctx, r.virt, r.db, r.dataDir, r.hostName, name, commit)
 }
 
 // NewReconciler creates a VM reconciler for the local host. virt is a
@@ -1100,7 +1100,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				// vm_owner_epoch = vm_owner_epoch + 1 under the same guard), and
 				// before this it wrote no marker at all — a running VM at a fresh
 				// generation that could not prove it until the next sweep.
-				if cerr := r.publishRunningMinted(ctx, vm.Name, "running", func(ctx context.Context) error {
+				if cerr := r.publishRunningMinted(ctx, vm.Name, func(ctx context.Context) error {
 					return corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName)
 				}); cerr != nil {
 					slog.Error("reconciler: complete start proof (already-running) did not apply — leaving state for reconcile",
@@ -1392,7 +1392,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		// write-through this block used to carry — same ordering, one
 		// implementation, and it gains the typed-nil guard and the
 		// ownership-moved check the hand-rolled version did not have.
-		if err := r.publishRunningMinted(ctx, vm.Name, "running", func(ctx context.Context) error {
+		if err := r.publishRunningMinted(ctx, vm.Name, func(ctx context.Context) error {
 			return corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName)
 		}); err != nil {
 			slog.Error("reconciler: complete start proof did not apply after start — leaving 'starting' for the reconcile starting-case to retry",

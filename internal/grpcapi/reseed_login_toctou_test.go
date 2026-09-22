@@ -34,7 +34,7 @@ func (r *reseedRacingRealm) SyncGroups(context.Context) error { return nil }
 func (r *reseedRacingRealm) Authenticate(ctx context.Context, _ auth.Credentials) (*auth.Principal, error) {
 	if !r.ran {
 		r.ran = true
-		if err := r.db.BeginReseed(ctx, "peer1"); err != nil {
+		if _, err := r.db.BeginReseed(ctx, "peer1"); err != nil {
 			return nil, err
 		}
 		// The discard empties the sensitive tables, user_2fa among them.
@@ -42,7 +42,7 @@ func (r *reseedRacingRealm) Authenticate(ctx context.Context, _ auth.Credentials
 			return nil, err
 		}
 		if r.finish {
-			if err := r.db.FinishReseed(ctx); err != nil {
+			if err := r.db.FinishReseed(ctx, 1); err != nil {
 				return nil, err
 			}
 		}

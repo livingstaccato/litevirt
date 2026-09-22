@@ -61,7 +61,7 @@ func TestDeleteVM_KeepsADiskThatStillBacksALinkedClone(t *testing.T) {
 	// the disk-removal half directly: this is about what the glob does once the
 	// caller has decided to proceed.
 	s.deleteRecordedVMDiskVolumes(adminCtx(), "base")
-	if err := s.images.DeleteVMDisks("base", s.protectedDiskPaths(adminCtx(), "base")); err != nil {
+	if err := func() error { s.sweepVMDiskDebris(adminCtx(), "base"); return nil }(); err != nil {
 		t.Fatalf("DeleteVMDisks: %v", err)
 	}
 
@@ -83,7 +83,7 @@ func TestDeleteVM_StillSweepsUnreferencedDebris(t *testing.T) {
 	debris := filepath.Join(s.images.DiskDir(""), "base-scratch.qcow2")
 	mustWrite(t, debris)
 
-	if err := s.images.DeleteVMDisks("base", s.protectedDiskPaths(adminCtx(), "base")); err != nil {
+	if err := func() error { s.sweepVMDiskDebris(adminCtx(), "base"); return nil }(); err != nil {
 		t.Fatalf("DeleteVMDisks: %v", err)
 	}
 	if exists(debris) {

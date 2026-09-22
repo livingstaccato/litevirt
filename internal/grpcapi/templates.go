@@ -358,11 +358,6 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		rollbackClone(state == "running")
 		return nil, status.Errorf(codes.Internal, "persist clone: %v", err)
 	}
-	// Guarded on the state actually inserted: a clone started with req.Start is
-	// born running at epoch 0 and needs its first generation, while a stopped one
-	// is graduated by whatever later starts it. The condition also keeps
-	// assignOwnerEpochAtCreate's two RUNTIME markers off a domain that is not
-	// running, which would assert a generation owns a runtime that does not exist.
 	// UNCONDITIONAL, with the runtime markers gated on the state. The earlier
 	// version skipped a stopped clone entirely on the grounds that "a stopped one
 	// is graduated by whatever later starts it" — which is not true of anything:

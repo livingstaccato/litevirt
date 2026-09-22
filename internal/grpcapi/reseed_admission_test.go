@@ -24,8 +24,13 @@ import (
 // clear again and an enrolled account got a password-only session. That is the
 // very TOCTOU the generation was added to close, one layer in.
 //
-// Two reads cannot be made safe by ordering them differently; there has to be
-// one reading that both the refusal and the stamp are derived from.
+// This guard covers the ADMISSION layer only: that the gate makes one call.
+// It cannot see inside that call, and for a while that mattered — ReseedFence
+// itself then read twice, so this test passed against code with the very race
+// its name denies. The read count at the layer that actually reads is pinned
+// by corrosion.TestReseedFence_IsASingleRead; both are needed, because one
+// call to a two-read function and two calls to a one-read function are
+// different bugs with the same consequence.
 func TestPreSessionAdmission_ReadsTheFenceExactlyOnce(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "reseed_login_gate.go", nil, 0)

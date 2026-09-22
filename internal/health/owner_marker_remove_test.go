@@ -40,6 +40,11 @@ func TestRemoveVMOwnerEpochMarker_AStuckMarkerIsReported(t *testing.T) {
 	if err := WriteVMOwnerEpochMarker(dir, "vm1", 3); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
+	// Root ignores directory write permission, so the unlink below would succeed
+	// and this test would report a false failure rather than a real one.
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses the directory permission this test depends on")
+	}
 	vmDir := filepath.Join(dir, "vms", "vm1")
 	// Read-only directory: the marker file cannot be unlinked.
 	if err := os.Chmod(vmDir, 0o500); err != nil {

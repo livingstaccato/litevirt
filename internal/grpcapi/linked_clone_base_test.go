@@ -48,10 +48,7 @@ func TestProtectedDiskPaths_ProtectsABaseStillBackingALiveClone(t *testing.T) {
 
 	// The base itself has NO live rows — it was deleted with --keep-disks, and a
 	// new VM is about to be created under the same name.
-	keep := s.protectedDiskPaths(ctx, "base")
-	if err := s.images.DeleteVMDisks("base", keep); err != nil {
-		t.Fatalf("DeleteVMDisks: %v", err)
-	}
+	s.sweepVMDiskDebris(ctx, "base")
 
 	if _, err := os.Stat(basePath); os.IsNotExist(err) {
 		t.Fatal("the debris glob deleted a base image that a live linked clone still names as " +
@@ -78,10 +75,7 @@ func TestProtectedDiskPaths_FailsClosedWhenItCannotRead(t *testing.T) {
 	// Make every disk read fail.
 	s.db.Close()
 
-	keep := s.protectedDiskPaths(ctx, "base")
-	if err := s.images.DeleteVMDisks("base", keep); err != nil {
-		t.Fatalf("DeleteVMDisks: %v", err)
-	}
+	s.sweepVMDiskDebris(ctx, "base")
 
 	if _, err := os.Stat(basePath); os.IsNotExist(err) {
 		t.Fatal("a failed disk read let the glob delete everything — the read that decides " +
@@ -90,25 +84,33 @@ func TestProtectedDiskPaths_FailsClosedWhenItCannotRead(t *testing.T) {
 	}
 }
 
-// No caller may pass protectedDiskPaths straight into DeleteVMDisks.
+// No production caller may reach the RE-LISTING delete at all.
 //
-// That pairing is the fail-open: on a listing failure protectedDiskPaths returns
-// an EMPTY keep set, which protects nothing, while its log line claimed the
-// opposite. It survived only because DeleteVMDisks re-lists and bails on the
-// same error — so the safety rested on two independent calls failing
-// identically, and no behavioural test can tell the two apart precisely BECAUSE
-// the coincidence holds. (Verified: removing the guard leaves every test green.)
+// The rule used to be "do not pass protectedDiskPaths into DeleteVMDisks
+// inline", which matched one syntactic shape and nothing else. Splitting the
+// call across a variable —
 //
-// What is checkable is the shape. sweepVMDiskDebris owns the pairing and refuses
-// to glob when the candidate list is unreadable, so the guarantee is stated in
-// one place instead of emerging from a coincidence.
-func TestNoCallerPairsProtectedPathsWithTheGlobDirectly(t *testing.T) {
+//	keep := s.protectedDiskPaths(ctx, n)
+//	s.images.DeleteVMDisks(n, keep)
+//
+// — reintroduced the exact fail-open while the guard stayed green, so the guard
+// could be walked around by a line break.
+//
+// The rule is now about the FUNCTION, not the argument shape. DeleteVMDisks
+// lists again, so whatever it deletes is not what the caller computed
+// protection against: a file appearing after the keep set was built is in no
+// keep set, and a listing that succeeded for the caller but fails there turns
+// "protect nothing" into "delete everything". Production sweeps go through
+// sweepVMDiskDebris, which lists once and hands that one list to both halves
+// via DeleteVMDisksIn. There is no argument shape left to get wrong.
+func TestNoProductionCallerUsesTheRelistingDelete(t *testing.T) {
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var bad []string
+	seen := 0
 	for _, e := range entries {
 		n := e.Name()
 		if e.IsDir() || !strings.HasSuffix(n, ".go") || strings.HasSuffix(n, "_test.go") {
@@ -118,42 +120,89 @@ func TestNoCallerPairsProtectedPathsWithTheGlobDirectly(t *testing.T) {
 		if perr != nil {
 			t.Fatalf("parse %s: %v", n, perr)
 		}
-		for _, decl := range f.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
-			}
-			// sweepVMDiskDebris OWNS the pairing — that is the point of it. It
-			// guards the listing first, so the empty-keep-set case never reaches
-			// the glob. Everything else must go through it.
-			if fn.Name.Name == "sweepVMDiskDebris" {
-				continue
-			}
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || sel.Sel.Name != "DeleteVMDisks" {
-					return true
-				}
-				for _, a := range call.Args {
-					inner, ok := a.(*ast.CallExpr)
-					if !ok {
-						continue
-					}
-					if isel, ok := inner.Fun.(*ast.SelectorExpr); ok && isel.Sel.Name == "protectedDiskPaths" {
-						bad = append(bad, n+":"+itoa(fset.Position(call.Pos()).Line))
-					}
-				}
+		ast.Inspect(f, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
 				return true
-			})
-		}
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch sel.Sel.Name {
+			case "DeleteVMDisksIn":
+				seen++ // the sanctioned form; counted so this scan cannot pass by matching nothing
+			case "DeleteVMDisks":
+				bad = append(bad, n+":"+itoa(fset.Position(call.Pos()).Line))
+			case "protectedDiskPaths":
+				// The listing keep-set builder, deleted rather than guarded. It
+				// returned an EMPTY keep set on a listing failure, so banning
+				// only the delete half left the pair writeable: DeleteVMDisksIn
+				// with protectedDiskPaths still protects nothing. Naming it here
+				// keeps it from coming back under its inviting old name.
+				bad = append(bad, n+":"+itoa(fset.Position(call.Pos()).Line)+" (protectedDiskPaths)")
+			}
+			return true
+		})
+	}
+	if seen == 0 {
+		t.Error("no call to DeleteVMDisksIn was found anywhere in the package; either the sweep " +
+			"stopped deleting disks or this matcher no longer matches the call it polices")
 	}
 	for _, b := range bad {
-		t.Errorf("%s: DeleteVMDisks is called with protectedDiskPaths inline. On a listing "+
-			"failure that pair deletes with an empty keep set; route it through "+
-			"sweepVMDiskDebris, which refuses to glob when it cannot build the list.", b)
+		t.Errorf("%s: DeleteVMDisks re-lists, so it deletes a set the caller never computed "+
+			"protection against. Use sweepVMDiskDebris, which lists once and passes that list "+
+			"to both protectedDiskPathsFrom and DeleteVMDisksIn.", b)
+	}
+}
+
+// ONE listing must drive both the protection and the deletion.
+//
+// There were three independent VMDiskCandidates calls: the sweep's own guard,
+// another inside the keep-set builder, and a third inside the delete. Protection
+// was computed against one list and the deletion walked another, so the safety
+// still rested on all three agreeing — the "survivable only because the
+// downstream call fails identically" the change exists to remove.
+//
+// The observable consequence is a file that appears after the keep set was
+// built: it is in no keep set, because it did not exist when protection was
+// computed, and a re-listing deletion sweeps it anyway. A disk written
+// concurrently with a delete is destroyed with no reference check ever run
+// against it. Driving sweepVMDiskDebrisIn with an explicit list is that
+// interleaving, without a test-only global in the production delete path.
+func TestSweepVMDiskDebris_DeletesOnlyWhatItListedAndProtected(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	ctx := adminCtx()
+
+	seed := func(name string) string {
+		p := s.images.DiskPath(name, "root")
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("disk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	debris := seed("vm1")
+
+	candidates, err := s.images.VMDiskCandidates("vm1")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	// Appears AFTER the candidate list was taken, so nothing ever asked whether
+	// it is referenced.
+	latecomer := seed("vm1-extra")
+
+	s.sweepVMDiskDebrisIn(ctx, "vm1", candidates)
+
+	if _, err := os.Stat(debris); !os.IsNotExist(err) {
+		t.Errorf("the debris this sweep listed and did not protect was left behind (%v); the "+
+			"sweep did nothing, so this test proves nothing about what it spares", err)
+	}
+	if _, err := os.Stat(latecomer); os.IsNotExist(err) {
+		t.Error("a disk that did not exist when the candidate list was taken was deleted anyway " +
+			"— the deletion re-listed instead of walking the list protection was derived from, " +
+			"so a file no reference check ever saw was destroyed")
 	}
 }

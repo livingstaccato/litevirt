@@ -16,7 +16,12 @@ func loadCorrosion(t *testing.T) ([]*packages.Package, error) {
 		Dir:   repoRoot,
 		Tests: false,
 	}
-	return packages.Load(cfg, "./internal/...")
+	// "./..." , not "./internal/...", and the same pattern the pass itself uses.
+	// A test that loads LESS than the rule it exercises cannot see a violation
+	// outside its own narrower scope — which is how the restricted pattern in
+	// writers.go stayed unnoticed: the test loaded the same restricted pattern,
+	// so the gap was invisible from both sides.
+	return packages.Load(cfg, "./...")
 }
 
 // repoRoot is the module root relative to this package.

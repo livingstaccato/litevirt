@@ -137,6 +137,17 @@ func callsAssignOwnerEpoch(fn *ast.FuncDecl) bool {
 			return true
 		}
 		if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "assignOwnerEpochAtCreate" {
+			// A stamp told the VM is NOT running returns before the runtime
+			// markers, so it graduates nothing. runningcheck's callsGraduation
+			// had this identical hole and was fixed; this in-package twin was
+			// left matching by NAME only, which is the same evasion one file
+			// away — assignOwnerEpochAtCreate(ctx, n, false) beside a
+			// born-running insert satisfied it while stamping nothing.
+			if len(call.Args) >= 3 {
+				if id, isIdent := call.Args[2].(*ast.Ident); isIdent && id.Name == "false" {
+					return true
+				}
+			}
 			found = true
 			return false
 		}

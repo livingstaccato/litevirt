@@ -154,7 +154,7 @@ func TestPublishVMRunningMinted_MarksTheEpochTheCommitProduced(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 
-	if err := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1", "running", func(ctx context.Context) error {
+	if err := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1", func(ctx context.Context) error {
 		return corrosion.TransferVMOwner(ctx, db, "vm1", "node-a", "running", 6)
 	}); err != nil {
 		t.Fatalf("PublishVMRunningMinted: %v", err)
@@ -184,7 +184,7 @@ func TestPublishVMRunningMinted_AFailedCommitMarksNothing(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	want := errors.New("mint refused")
-	if got := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1", "running",
+	if got := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1",
 		func(context.Context) error { return want }); !errors.Is(got, want) {
 		t.Errorf("err = %v, want the commit's error", got)
 	}
@@ -213,7 +213,7 @@ func TestPublishVMRunningMinted_AMarkerFailureIsNotFatal(t *testing.T) {
 	}
 	fake := libvirtfake.New() // NO domain, so the domain marker write fails
 
-	if err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "node-a", "vm1", "running",
+	if err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "node-a", "vm1",
 		func(ctx context.Context) error {
 			return corrosion.UpdateVMState(ctx, db, "vm1", "running", "test")
 		}); err != nil {
@@ -243,7 +243,7 @@ func TestPublishVMRunningMinted_AReadBackFailureIsNotTheCommitsFailure(t *testin
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	committed := false
-	err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "node-a", "vm1", "running",
+	err := PublishVMRunningMinted(ctx, fake, db, t.TempDir(), "node-a", "vm1",
 		func(context.Context) error { committed = true; db.Close(); return nil })
 	if err != nil {
 		t.Errorf("a read-back failure after a landed commit must not be reported as a failed "+
@@ -302,7 +302,7 @@ func TestPublishVMRunningMinted_OwnershipMovedLeavesTheMarkersAlone(t *testing.T
 
 	// We are node-a. Our commit lands, then node-b takes the VM before our
 	// read-back — so the row we read names node-b's generation, not ours.
-	err := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1", "running",
+	err := PublishVMRunningMinted(ctx, fake, db, dir, "node-a", "vm1",
 		func(ctx context.Context) error {
 			if cerr := corrosion.UpdateVMState(ctx, db, "vm1", "running", "ours"); cerr != nil {
 				return cerr
@@ -637,13 +637,13 @@ func TestPublishVMRunningMinted_RetriesTheReadBack(t *testing.T) {
 	fake.SetState("vm1", libvirtfake.StateRunning)
 
 	calls := 0
-	err := publishVMRunningMinted(context.Background(), fake, dir, "node-a", "vm1", "running",
+	err := publishVMRunningMinted(context.Background(), fake, dir, "node-a", "vm1",
 		func(context.Context) (*corrosion.VMRecord, error) {
 			calls++
 			if calls == 1 {
 				return nil, errors.New("database is locked")
 			}
-			return &corrosion.VMRecord{Name: "vm1", HostName: "node-a", OwnerEpoch: 4}, nil
+			return &corrosion.VMRecord{Name: "vm1", HostName: "node-a", State: "running", OwnerEpoch: 4}, nil
 		},
 		func(context.Context) error { return nil })
 	if err != nil {
@@ -667,7 +667,7 @@ func TestPublishVMRunningMinted_ADeletedRowIsNotAReadFailure(t *testing.T) {
 	fake := libvirtfake.New()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 
-	err := publishVMRunningMinted(context.Background(), fake, dir, "node-a", "vm1", "running",
+	err := publishVMRunningMinted(context.Background(), fake, dir, "node-a", "vm1",
 		func(context.Context) (*corrosion.VMRecord, error) { return nil, nil },
 		func(context.Context) error { return nil })
 	if err != nil {

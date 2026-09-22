@@ -353,9 +353,11 @@ func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir
 	// window — which is the same untrustworthiness the caller's value had, in
 	// the other direction. Skipping a marker write on a wrong answer is a no-op
 	// that convergence repairs; DELETING a marker on one takes a live VM's proof
-	// away. A stale marker left by a replacement is cleared where the intent is
-	// journaled rather than re-read: finishVMReplaceRuntime, which knows the
-	// cutover's accepted state and cannot race with it.
+	// away. A stale marker left by a replacement is NOT cleared here or
+	// anywhere else, and that is deliberate rather than an omission:
+	// runtimeSuperseded reads an ABSENT marker as "not superseded", so removing
+	// one turns a refused self-heal restart into a permitted one. The whole
+	// argument lives at finishVMReplaceRuntime's non-running branch.
 	if row.State != "running" {
 		return nil
 	}

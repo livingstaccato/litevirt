@@ -83,8 +83,9 @@ func TestPublishVMRunningMinted_ARunningCommitStillMarks(t *testing.T) {
 // row inside that window — the same untrustworthiness the caller's value had,
 // pointing the other way. Skipping a write on a wrong answer is a no-op
 // convergence repairs; deleting on one strips a live VM of its proof. A stale
-// marker from a replacement is cleared by finishVMReplaceRuntime, off the
-// journaled accepted state, which cannot race.
+// marker from a replacement is not cleared at all: runtimeSuperseded reads an
+// ABSENT marker as "not superseded", so removing one turns a refused self-heal
+// restart into a permitted one.
 func TestPublishVMRunningMinted_ANonRunningCommitLeavesAnExistingMarkerAlone(t *testing.T) {
 	dir := t.TempDir()
 	fake := libvirtfake.New()

@@ -97,7 +97,7 @@ func TestStore_DeleteVMDisks(t *testing.T) {
 	}
 
 	// Delete
-	if err := s.DeleteVMDisks("test-vm", nil); err != nil {
+	if err := s.deleteAllVMDisksForTest(t, "test-vm"); err != nil {
 		t.Fatalf("DeleteVMDisks: %v", err)
 	}
 
@@ -115,7 +115,7 @@ func TestStore_DeleteVMDisks_NonExistent(t *testing.T) {
 	s := NewStore(dir)
 
 	// Should not error on non-existent VM
-	err := s.DeleteVMDisks("nonexistent", nil)
+	err := s.deleteAllVMDisksForTest(t, "nonexistent")
 	if err != nil {
 		t.Errorf("DeleteVMDisks on nonexistent: %v", err)
 	}
@@ -200,5 +200,82 @@ func TestStore_LegacyDirectoryContentsGoThroughTheKeepSet(t *testing.T) {
 	// The directory stays while something protected is still inside it.
 	if _, err := os.Stat(legacyDir); err != nil {
 		t.Errorf("the legacy directory was removed while a protected disk was still in it: %v", err)
+	}
+}
+
+// deleteAllVMDisksForTest is the old re-listing DeleteVMDisks, kept only here.
+//
+// The production form is gone: it listed again, so what it deleted was not what
+// the caller computed protection against. Tests that only want "remove this
+// VM's disks" list once and pass the list, which is what every caller now does.
+func (s *Store) deleteAllVMDisksForTest(t *testing.T, vmName string) error {
+	t.Helper()
+	candidates, err := s.VMDiskCandidates(vmName)
+	if err != nil {
+		return err
+	}
+	return s.DeleteVMDisksIn(vmName, candidates, nil)
+}
+
+// A symlinked legacy directory is not this sweep's to walk into.
+//
+// os.ReadDir FOLLOWS a symlink, so listing its contents as candidates would
+// unlink files on whatever volume it points at, one by one. The os.RemoveAll
+// this replaced removed only the link and left the target intact — so the
+// "safer" rewrite was, for this one layout, strictly more destructive.
+func TestStore_ALegacySymlinkIsNotWalkedInto(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	s.Init()
+
+	elsewhere := t.TempDir()
+	victim := filepath.Join(elsewhere, "someone-elses.qcow2")
+	if err := os.WriteFile(victim, []byte("disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "disks", "test-vm")
+	if err := os.Symlink(elsewhere, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	candidates, err := s.VMDiskCandidates("test-vm")
+	if err != nil {
+		t.Fatalf("VMDiskCandidates: %v", err)
+	}
+	for _, c := range candidates {
+		if c == victim {
+			t.Fatalf("the candidate list reached through a symlink to %s; sweeping it would "+
+				"delete files on another volume that this VM does not own", victim)
+		}
+	}
+	if err := s.DeleteVMDisksIn("test-vm", candidates, nil); err != nil {
+		t.Fatalf("DeleteVMDisksIn: %v", err)
+	}
+	if _, err := os.Stat(victim); err != nil {
+		t.Errorf("a file behind the symlink was deleted: %v", err)
+	}
+}
+
+// The delete refuses a path outside the directories it owns.
+//
+// The name guard only constrains the path this function builds; everything it
+// actually removes comes from a caller-supplied slice, and the sweep seam is
+// package-internal, so a future caller can hand it anything.
+func TestStore_DeleteVMDisksInRefusesAPathItDoesNotOwn(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	s.Init()
+
+	outside := filepath.Join(t.TempDir(), "not-ours.qcow2")
+	if err := os.WriteFile(outside, []byte("disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.DeleteVMDisksIn("test-vm", []string{outside}, nil)
+	if err == nil {
+		t.Error("a path outside the disk directory was accepted silently")
+	}
+	if _, serr := os.Stat(outside); serr != nil {
+		t.Errorf("a file outside the disk directory was deleted: %v", serr)
 	}
 }

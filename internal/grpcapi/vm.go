@@ -3186,9 +3186,20 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// back from the committed row inside the helper, NOT passed from here.
 	// nextVM.State was read before the entire teardown while ReplaceVM writes
 	// the state it re-reads at commit time, so the value this call site holds
-	// can be stale in both directions: it fired a LIVE domain write at an
-	// inactive domain, and it skipped the markers for a commit that landed
-	// running, leaving the row at a new generation with nothing naming it.
+	// can be stale in both directions: it skipped the markers for a commit that
+	// landed running, leaving the row at a new generation with nothing naming
+	// it, and it wrote them for one that landed stopped.
+	//
+	// The DOMAIN half of the marker write always fails here, on every cutover,
+	// and that is structural rather than exceptional: retireOriginalDomain has
+	// already undefined the domain at this name, and the replacement is not
+	// redefined onto it until finishVMReplaceCleanup below. Only the FILE
+	// marker lands — which is the one runtimeSuperseded reads — so the publish
+	// is complete for every consumer that matters, and the "markers not
+	// written" warning it logs names a condition convergence repairs on its
+	// next sweep. An earlier note here had this backwards, claiming the old
+	// defect was a live write against an inactive domain; there is no domain at
+	// all at this point.
 	if err := s.publishRunningMinted(ctx, req.VmName, func(ctx context.Context) error {
 		return corrosion.ReplaceVM(ctx, s.db, nextName, req.VmName, prepared)
 	}); err != nil {

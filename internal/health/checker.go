@@ -16,6 +16,20 @@ const (
 	checkInterval    = 2 * time.Second
 	checkTimeout     = 3 * time.Second
 	suspectThreshold = 3
+	// HeartbeatInterval is how often a host_health row is REWRITTEN unchanged,
+	// so its updated_at keeps advancing while nothing about the peer changes.
+	//
+	// It exists because the coordinator's recovery quorum only counts rows
+	// newer than failover.healthFreshness, and a steadily healthy peer
+	// produces no transitions at all — so its row froze at the moment it went
+	// healthy and aged out. See shouldPersistHealth for why this is applied
+	// only to hosts awaiting recovery.
+	//
+	// EXPORTED so internal/failover can pin it below its own freshness cutoff.
+	// The two live in different packages and are only correct relative to each
+	// other; TestRecovery_HeartbeatOutpacesFreshness is what stops them
+	// drifting apart into a silently unrecoverable host.
+	HeartbeatInterval = 10 * time.Second
 	// probeConcurrency caps how many peer health probes run at once per tick.
 	probeConcurrency = 16
 )
@@ -34,6 +48,9 @@ type peerState struct {
 	failures      int
 	lastHealthyAt time.Time // monotonic; zero if never probed healthy
 	lastFailureAt time.Time // monotonic; zero if never probed unhealthy
+	// lastWriteAt is when this observer last PERSISTED a row for the peer
+	// (monotonic). Drives the heartbeat rewrite; zero means never written.
+	lastWriteAt time.Time
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -42,6 +59,9 @@ type Checker struct {
 	pkiDir   string
 	db       *corrosion.Client
 	tlsCfg   *tls.Config
+	// probeFn replaces the real TLS dial in tests. Nil in production, where
+	// checkHost uses (*Checker).probe.
+	probeFn func(addr string) bool
 
 	mu     sync.Mutex
 	peers  map[string]*peerState // target hostname → cached state
@@ -271,13 +291,60 @@ func boundedFanout[T any](items []T, concurrency int, work func(T)) {
 	wg.Wait()
 }
 
+// CheckInterval exposes the probe cadence so other packages can pin timing
+// relationships against it (see failover.TestRecovery_HeartbeatOutpacesFreshness).
+func CheckInterval() time.Duration { return checkInterval }
+
+// recoveryPending reports whether the failover coordinator could auto-recover
+// a host in this state once it looks healthy again.
+//
+// These are exactly the two states recoverHosts will act on. 'maintenance' and
+// 'draining' are operator intent and are never auto-cleared, so a heartbeat
+// for them would be traffic with no reader.
+func recoveryPending(state string) bool {
+	return state == "offline" || state == "fenced"
+}
+
+// shouldPersistHealth decides whether this probe writes a host_health row.
+//
+// A transition always writes — that is the original contract and what every
+// other reader depends on. The second clause exists for ONE reader: the
+// coordinator's recovery quorum, which counts only rows newer than
+// failover.healthFreshness. A peer that comes back and then stays healthy
+// produces no further transitions, so without this its row froze at the
+// instant it went healthy; by the time recentlyFenced stopped suppressing
+// recovery five minutes later, the only healthy row on record was minutes old,
+// failed the freshness cutoff, and the host sat `offline` awaiting a manual
+// undrain.
+//
+// The heartbeat is deliberately narrow on both axes. It is limited to hosts
+// awaiting recovery, because rewriting every healthy row on a timer is
+// O(N^2) replicated writes across the cluster for a reader that only ever
+// looks at two states. And it is rate-limited to HeartbeatInterval rather than
+// firing per probe, because checkInterval is 2s and the cutoff it has to beat
+// is 30s.
+//
+// A FAILING peer needs none of this: consecutive_failures increments on every
+// probe, so changed is already true each time and those rows never go stale.
+// That asymmetry is why the bug only ever showed up on the recovery path.
+func shouldPersistHealth(changed, healthy, recoveryPending bool, sinceLastWrite time.Duration) bool {
+	if changed {
+		return true
+	}
+	return healthy && recoveryPending && sinceLastWrite >= HeartbeatInterval
+}
+
 func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// net.JoinHostPort (not Sprintf): host.Address is a bare host and may be an
 	// IPv6 literal, which "%s:%d" would mangle into an unparseable target. Every
 	// probe would then fail and this healthy peer would be marked suspect and
 	// fenced — a config value silently becoming a fencing event.
 	addr := corrosion.PeerTarget(host.Address, host.GRPCPort)
-	healthy := c.probe(addr)
+	probe := c.probe
+	if c.probeFn != nil {
+		probe = c.probeFn
+	}
+	healthy := probe(addr)
 
 	c.mu.Lock()
 	prev, exists := c.peers[host.Name]
@@ -321,9 +388,17 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	} else {
 		prev.lastFailureAt = mono
 	}
+	sinceWrite := time.Duration(0)
+	if !prev.lastWriteAt.IsZero() {
+		sinceWrite = mono.Sub(prev.lastWriteAt)
+	}
+	persist := shouldPersistHealth(changed, healthy, recoveryPending(host.State), sinceWrite)
+	if persist {
+		prev.lastWriteAt = mono
+	}
 	c.mu.Unlock()
 
-	if !changed {
+	if !persist {
 		return
 	}
 

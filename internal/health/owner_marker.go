@@ -69,8 +69,17 @@ func RemoveVMOwnerEpochMarker(dataDir, name string) error {
 	if err := safename.ValidateVMName(name); err != nil {
 		return err
 	}
-	err := os.Remove(filepath.Join(dataDir, "vms", name, ownerEpochMarkerFile))
-	if err != nil && !os.IsNotExist(err) {
+	dir := filepath.Join(dataDir, "vms", name)
+	if err := os.Remove(filepath.Join(dir, ownerEpochMarkerFile)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// And the directory. It holds nothing else — this marker is the only thing
+	// written under <dataDir>/vms/<name> — so leaving it behind accumulates one
+	// empty directory per deleted VM with nothing to clean them up: the same
+	// unowned growth the marker itself had, only quieter. os.Remove, not
+	// RemoveAll: if something ever does start living here, this fails loudly
+	// rather than deleting it.
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil

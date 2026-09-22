@@ -1,6 +1,8 @@
 package grpcapi
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -59,6 +61,14 @@ func TestDeleteVM_RemovesTheOwnerEpochMarker(t *testing.T) {
 				t.Fatalf("the owner-epoch marker (%d) outlived the VM it names; reusing the "+
 					"name lands a fresh row at epoch 0 beside a marker above it — the "+
 					"mismatch convergence never repairs", epoch)
+			}
+			// And its directory. Removing only the file leaves one empty dir per
+			// deleted VM under <dataDir>/vms, forever — the same unowned growth
+			// the marker itself had, just quieter. Seen on the lab after a real
+			// create/delete cycle.
+			if _, err := os.Stat(filepath.Join(s.dataDir, "vms", "vm1")); err == nil {
+				t.Error("the marker directory outlived the VM; it accumulates one empty " +
+					"directory per deleted VM with nothing to clean them up")
 			}
 		})
 	}

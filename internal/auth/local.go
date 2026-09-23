@@ -79,6 +79,16 @@ func (r *LocalRealm) Authenticate(ctx context.Context, creds Credentials) (*Prin
 	// transient database error downgrade an enrolled account to password-only, in
 	// exactly the conditions an attacker holding only the password benefits from.
 	// Every other failure in this function already returns rather than continuing.
+	// A node whose secret-bearing tables were emptied by a reseed that has not
+	// repopulated them reads EVERY user as having no second factor, because an
+	// empty user_2fa and an unenrolled user are the same zero rows. That is the
+	// same downgrade the read-error branch below refuses, arrived at by a
+	// different route, so it gets the same answer: refuse.
+	if r.db.CredentialsUnhydrated() {
+		return nil, fmt.Errorf("this node's credential tables are not hydrated yet (a reseed "+
+			"emptied them and has not repopulated them); refusing to authenticate %q rather "+
+			"than treating an enrolled account as having no second factor", user.Username)
+	}
 	factors, err := corrosion.ListUser2FA(ctx, r.db, user.Username)
 	if err != nil {
 		return nil, fmt.Errorf("check enrolled 2FA factors for %q: %w", user.Username, err)

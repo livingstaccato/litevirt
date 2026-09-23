@@ -102,6 +102,11 @@ type Client struct {
 	// (<dataDir>/nowts.hwm). Empty ⇒ no persistence (in-memory monotonic only:
 	// throwaway/legacy clients with no data dir).
 	dataDir string
+
+	// credUnhydrated marks this node's secret-bearing tables as emptied by a
+	// reseed that has not repopulated them. See CredentialsUnhydrated.
+	credMu         sync.Mutex
+	credUnhydrated bool
 	// nowFn is the wall-clock source behind NowTS, injectable for tests (default
 	// time.Now). The HLC clock has its own nowFn seam.
 	nowFn func() time.Time

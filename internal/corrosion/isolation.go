@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 )
 
 // Isolation epoch (§A). A node whose local state was produced OUTSIDE the
@@ -189,7 +192,74 @@ func ReseedKeepsTable(name string) bool { return reseedKeepTables[name] }
 // Callers MUST already hold the dump they intend to merge (fetch → discard →
 // merge): the gap between discard and merge is the one moment this node has no
 // cluster state, and a fetch failure there would strand it.
+// credentialsUnhydratedFile is the durable half of the mark. It is NODE-LOCAL
+// and never replicated: it describes this node's own storage, not cluster
+// state, and a reseed is exactly the operation whose replicated view is being
+// replaced.
+const credentialsUnhydratedFile = "credentials_unhydrated"
+
+// CredentialsUnhydrated reports whether this node's secret-bearing tables were
+// emptied by a reseed that has not yet repopulated them.
+//
+// While it is true, an empty user_2fa must NOT be read as "this user has no
+// second factor". ListUser2FA cannot tell the two apart -- both are zero rows
+// -- so the distinction has to be carried alongside.
+//
+// Both halves are consulted. The in-memory flag covers the window inside one
+// process; the file covers a crash between the discard and the merge, which is
+// precisely when the node comes back up with populated `users` and empty
+// `user_2fa`.
+func (c *Client) CredentialsUnhydrated() bool {
+	c.credMu.Lock()
+	defer c.credMu.Unlock()
+	if c.credUnhydrated {
+		return true
+	}
+	if c.dataDir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(c.dataDir, credentialsUnhydratedFile))
+	return err == nil
+}
+
+// MarkCredentialsUnhydrated records that the secret-bearing tables are empty.
+//
+// The in-memory flag is set FIRST and unconditionally, so the mark holds even
+// when the file cannot be written (a full or read-only disk -- the same
+// conditions that make a reseed fail halfway).
+func (c *Client) MarkCredentialsUnhydrated() {
+	c.credMu.Lock()
+	c.credUnhydrated = true
+	c.credMu.Unlock()
+	if c.dataDir == "" {
+		return
+	}
+	if err := os.WriteFile(filepath.Join(c.dataDir, credentialsUnhydratedFile),
+		[]byte("1\n"), 0o600); err != nil {
+		slog.Error("could not persist the credentials-unhydrated mark; a restart before "+
+			"the sensitive merge completes would authenticate enrolled users without 2FA",
+			"error", err)
+	}
+}
+
+// ClearCredentialsUnhydrated is called only after a sensitive merge has landed.
+// The FILE is removed first: if the removal fails, the flag stays set rather
+// than leaving a node that reads as hydrated in memory and unhydrated on disk.
+func (c *Client) ClearCredentialsUnhydrated() {
+	if c.dataDir != "" {
+		if err := os.Remove(filepath.Join(c.dataDir, credentialsUnhydratedFile)); err != nil && !os.IsNotExist(err) {
+			slog.Error("could not clear the credentials-unhydrated mark; this node will keep "+
+				"refusing password logins until it is removed", "error", err)
+			return
+		}
+	}
+	c.credMu.Lock()
+	c.credUnhydrated = false
+	c.credMu.Unlock()
+}
+
 func (c *Client) DiscardReplicatedStateForReseed(ctx context.Context) (int, error) {
+	c.MarkCredentialsUnhydrated()
 	cleared := 0
 	// The sensitive tables are discarded too. They used to be skipped — the loop
 	// walked tableNames only — so a node reseeding out of quarantine kept every
@@ -202,6 +272,11 @@ func (c *Client) DiscardReplicatedStateForReseed(ctx context.Context) (int, erro
 	// sensitive dump alongside the operator one). Leaving them to anti-entropy
 	// would open a window in which this node has no 2FA factors at all, and the
 	// API reads "no factors" as "no 2FA" — a discard that fails OPEN.
+	//
+	// That window is no longer left to the caller to avoid. The node is marked
+	// unhydrated BEFORE the first DELETE, and only a landed sensitive merge
+	// clears it; while it is set, LocalRealm.Authenticate refuses rather than
+	// downgrading an enrolled account to password-only.
 	for _, table := range append(append([]string{}, tableNames...), sensitiveTableNames...) {
 		if reseedKeepTables[table] {
 			continue

@@ -77,3 +77,8 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		leaseTermLedger:  testLeaseTermLedgerOpen,
 	}, nil
 }
+
+// SetDataDirForTest points a test client at a data directory, so the node-local
+// markers that survive a restart (the credentials-unhydrated mark) can be
+// exercised without standing up a daemon.
+func (c *Client) SetDataDirForTest(dir string) { c.dataDir = dir }

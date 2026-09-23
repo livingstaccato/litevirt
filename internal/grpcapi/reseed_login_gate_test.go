@@ -130,6 +130,10 @@ func TestLoginGate_EverySkipAuthMethodIsClassified(t *testing.T) {
 	diagnostic := map[string]bool{
 		"/litevirt.v1.LiteVirt/Ping":       true,
 		"/litevirt.v1.LiteVirt/ListRealms": true,
+		// Ready answers "can this daemon serve". A node mid-reseed genuinely
+		// cannot, and that answer is the useful one — gating the RPC would
+		// replace it with a refusal indistinguishable from the node being down.
+		"/litevirt.v1.LiteVirt/Ready": true,
 	}
 	for m := range skipAuth {
 		if diagnostic[m] == preSessionAuthMethods[m] {

@@ -36,6 +36,11 @@ type HostConfig struct {
 	IPMIPass    string
 	// Watchdog — only used when FenceStrategy = "watchdog" (self-fencing)
 	WatchdogDev string
+	// IsSelf reports that this process is running ON the host being fenced.
+	//
+	// Only the watchdog strategy reads it, and it FAILS CLOSED: a caller that
+	// forgets to set it gets a refusal, not somebody else's watchdog armed.
+	IsSelf bool
 }
 
 // Execute runs the fencing strategy specified by h.FenceStrategy.
@@ -46,7 +51,8 @@ type HostConfig struct {
 //	"ipmi"         – IPMI/BMC power off via ipmitool; must succeed
 //	"manual"       – log an alert and return Success=false; the coordinator will NOT
 //	                 reschedule until an operator confirms via `lv host fence-confirm`
-//	"watchdog"     – write to /dev/watchdog to stop heartbeat (self-fencing, caller is local)
+//	"watchdog"     – write to /dev/watchdog to stop heartbeat. SELF-fencing only:
+//	                 refused unless h.IsSelf, because it arms the CALLING node
 //	""             – treated as "best-effort"
 func Execute(ctx context.Context, h HostConfig) Result {
 	raw := strings.ToLower(strings.TrimSpace(h.FenceStrategy))
@@ -63,6 +69,29 @@ func Execute(ctx context.Context, h HostConfig) Result {
 	case "manual":
 		return fenceManual(h)
 	case "watchdog":
+		// A watchdog fence is a SELF-fence: fenceWatchdog opens WatchdogDev on
+		// THIS node. Dispatched at a peer it either arms the coordinator's own
+		// hardware watchdog -- rebooting a healthy node in the middle of a
+		// recovery it is running -- or fails on a missing device. The first case
+		// is the dangerous one, because it then reports Success: true and the
+		// coordinator reads a started LOCAL countdown as a verified power-off of
+		// the REMOTE host, and reschedules its VMs onto shared storage the
+		// original may still be writing to.
+		//
+		// Refused rather than silently downgraded to SSH: the configured
+		// strategy is what an operator chose for this host, and quietly running
+		// a different one is how a fence comes to mean three things. A refusal
+		// leaves the host unfenced and the coordinator declining to reschedule,
+		// which is the safe direction.
+		if !h.IsSelf {
+			return Result{
+				Method: "watchdog",
+				Detail: fmt.Sprintf("fence_strategy=watchdog is self-only and %q is not this host; "+
+					"a watchdog fence arms the CALLING node. Configure ipmi (or ssh) for a remotely "+
+					"fenceable host, or confirm manually with `lv host fence-confirm %s`", h.Name, h.Name),
+				Success: false,
+			}
+		}
 		return fenceWatchdog(h)
 	default: // "best-effort" — lenient fire-and-forget SSH
 		return fenceSSH(ctx, h, true)

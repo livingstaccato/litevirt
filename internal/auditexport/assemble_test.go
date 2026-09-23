@@ -225,3 +225,71 @@ func TestAssemble_OrdinaryChainStillAssembles(t *testing.T) {
 		t.Errorf("page-one evidence was dropped: %s", body)
 	}
 }
+
+// TestAssemble_RefusesRowsSignedByAnUnexportedKey is the mid-export key
+// rotation.
+//
+// The evidence tables — signing_keys, key_lifecycle, chain_heads — ride on page
+// ONE. A host that rotates its signing key after that page emits rows on later
+// pages signed by a certificate the document does not contain, and an external
+// verifier cannot check them at all. The artifact replays as broken, which is
+// indistinguishable from tampering — the one thing it exists to tell apart.
+func TestAssemble_RefusesRowsSignedByAnUnexportedKey(t *testing.T) {
+	calls := 0
+	_, _, err := Assemble(context.Background(), func(_ context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		calls++
+		if calls == 1 {
+			return &pb.ExportAuditChainResponse{
+				Json: `{"rows":[{"id":"a","host_name":"kvm001","key_id":"k1"}],
+				         "signing_keys":[{"key_id":"k1","host_name":"kvm001"}]}`,
+				RowCount: 1, NextCursor: "n1",
+			}, nil
+		}
+		// kvm001 rotated to k2 after page one; k2's certificate is not in the
+		// evidence this document carries.
+		return &pb.ExportAuditChainResponse{
+			Json:     `{"rows":[{"id":"b","host_name":"kvm001","key_id":"k2"}]}`,
+			RowCount: 1,
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("assembled a document whose rows are signed by a key it does not contain; " +
+			"offline verification of those rows is impossible and reads as tampering")
+	}
+	if !strings.Contains(err.Error(), "k2") {
+		t.Errorf("the refusal should name the uncovered key, got: %v", err)
+	}
+}
+
+// Pre-v45 rows carry no key_id. They are chain-verified but not
+// tamper-evident, and the verifier reports them as such — so an empty key_id
+// must not be treated as a coverage failure, or every upgraded cluster's
+// export would refuse.
+func TestAssemble_AllowsPreV45RowsWithNoKeyID(t *testing.T) {
+	_, _, err := Assemble(context.Background(), func(_ context.Context, _ string) (*pb.ExportAuditChainResponse, error) {
+		return &pb.ExportAuditChainResponse{
+			Json: `{"rows":[{"id":"a","host_name":"kvm001","key_id":""}],
+			         "signing_keys":[{"key_id":"k1","host_name":"kvm001"}]}`,
+			RowCount: 1,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("a pre-v45 row with no key_id was refused: %v", err)
+	}
+}
+
+// A seq gap the server reported must not be swallowed either: this package
+// exists to refuse a partial chain.
+func TestAssemble_RefusesAReportedSeqGap(t *testing.T) {
+	_, _, err := Assemble(context.Background(), func(_ context.Context, _ string) (*pb.ExportAuditChainResponse, error) {
+		return &pb.ExportAuditChainResponse{
+			Json: `{"rows":[{"id":"a","host_name":"kvm001","key_id":"k1"}],
+			         "signing_keys":[{"key_id":"k1","host_name":"kvm001"}],
+			         "seq_gaps":[{"host_name":"kvm001","missing_from":"3","missing_to":"3"}]}`,
+			RowCount: 1,
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("a reported seq gap was assembled into a document that looks whole")
+	}
+}

@@ -111,7 +111,7 @@ type ReplicaPromoter interface {
 	// old owner that authorizes this cross-host transfer (see proofGradeFenceRef);
 	// "" when no proof-grade fence exists (a best-effort/SSH fence), which the
 	// executor treats as fail-closed for a shared-disk VM.
-	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64, leaseKey string) error
+	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64) error
 }
 
 // ContainerRestorer restores a container onto a survivor host from its latest
@@ -1644,7 +1644,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			// relocate refused while its promote went through: gateEnforced
 			// passes (a lapse is not quorum loss) and, for a local-disk DR VM,
 			// requireProofGradeFence never fires either.
-			_, _, promoteTerm, promoteKey, ok := c.leaseStamp(ctx)
+			_, _, promoteTerm, _, ok := c.leaseStamp(ctx)
 			// stillOurTenure as well as leaseStamp: the stamp says a term may
 			// be recorded, not that the lease is still held. A tick that
 			// stalled after its own lease gate is exactly the case this has
@@ -1656,7 +1656,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
 				continue
 			}
-			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch, promoteTerm, promoteKey); err != nil {
+			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch, promoteTerm); err != nil {
 				// Fall through to the reschedule path on ANY promote error, including a
 				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
 				// replicated to the replica host yet). This is NOT a downgrade to a

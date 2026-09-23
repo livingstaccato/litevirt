@@ -221,31 +221,35 @@ func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration)
 // the lease itself still gates who runs at all, and refusing here would
 // silently disable the detector for the length of an upgrade.
 func (s *Server) stillDualRunLeader(ctx context.Context, passTerm int64) bool {
-	held, term, err := corrosion.AcquireLeaseWithTerm(
-		ctx, s.db, dualRunLeaseKey, s.hostName, 2*dualRunLeaseProbeTTL, time.Now())
+	// A READ, not AcquireLeaseWithTerm. That helper takes a free or expired
+	// lease as a side effect, so verifying leadership with it would ACQUIRE
+	// leadership merely by asking -- and a node whose pass should have been
+	// discarded would instead install itself as leader and apply it.
+	holder, term, live, err := corrosion.LeaseTenure(ctx, s.db, dualRunLeaseKey, time.Now())
 	if err != nil {
 		// Cannot prove we still lead. Fail CLOSED: discarding a pass costs one
 		// interval, applying a stale one re-opens admission to a split-brain.
 		slog.Warn("dual-run detector: re-assert lease", "error", err)
 		return false
 	}
-	if !held {
-		// Somebody else holds it. True whether or not a term exists.
+	if !live || holder != s.hostName {
 		return false
 	}
-	s.dualRunLeaseTerm.Store(term)
+	if term > 0 {
+		s.dualRunLeaseTerm.Store(term)
+	}
 
 	// passTerm 0 means the ledger could not mint when the pass began, which is
 	// every rolling upgrade and is PERMANENT on a cluster deliberately kept one
-	// host back. Returning true here BEFORE the read above made the whole fence
+	// host back. Returning true before reading anything made the whole fence
 	// inert in exactly that window.
 	//
-	// There is no tenure to compare, so holder identity is the strongest
-	// available test — and it still catches the case that matters, a successor
-	// taking the lease while this node was stalled. What it cannot see is a
+	// With no tenure to compare, holder identity is the strongest available
+	// test -- and it still catches the case that matters, a successor taking
+	// the lease while this node was stalled. What it cannot see is a
 	// lapse-and-retake by this same host, which is why the term comparison
 	// stays primary wherever a term exists.
-	if passTerm == 0 {
+	if passTerm == 0 || term == 0 {
 		return true
 	}
 	return term == passTerm

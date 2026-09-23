@@ -590,11 +590,16 @@ func TestClaimCarriedProof_ZeroTermIsRefusedForARequiredAction(t *testing.T) {
 // TestClaimCarriedProof_AnUnstampedLeaselessProducerStillWorks is the other
 // half of that scoping, and the one an unconditional refusal broke.
 //
-// mintLBProof, mintRelocationProof and AutoPromoteReplica hold no lease and
-// mint lease_term 0 with an empty key. Refusing those under enforcement fails
-// LB apply, container cold migration and restore, and automated post-fence
-// replica promotion CLOSED — the DR path broken by the feature meant to
-// protect it, and blamed on a stale tenure rather than an unstamped producer.
+// mintLBProof and mintRelocationProof hold no lease and mint lease_term 0 with
+// an empty key. Refusing those under enforcement fails LB apply and container
+// cold migration and restore CLOSED — broken by the feature meant to protect
+// them, and blamed on a stale tenure rather than an unstamped producer.
+//
+// PROMOTE was in this list and no longer is. Its only proof-carrying producer
+// is AutoPromoteReplica, whose only caller is the failover coordinator, which
+// holds the failover lease and always had a term to stamp; it simply was not
+// stamping. The operator override (`promote --force`) is proofless and never
+// reaches this path, so nothing lease-less produces a promote proof.
 func TestClaimCarriedProof_AnUnstampedLeaselessProducerStillWorks(t *testing.T) {
 	ctx := context.Background()
 	s := enforcingServer(t, map[string]int64{"node-c": 9})
@@ -602,7 +607,6 @@ func TestClaimCarriedProof_AnUnstampedLeaselessProducerStillWorks(t *testing.T) 
 
 	for _, tc := range []struct{ action, kind, target string }{
 		{corrosion.ActionLBApply, "lb", "lb1"},
-		{corrosion.ActionPromote, "vm", "vm1"},
 		{corrosion.ActionRelocate, "container", "ct1"},
 	} {
 		p := &pb.RuntimeActionProof{
@@ -899,5 +903,28 @@ func TestLeaseTermGateForPendingProof_RefusesARowWhoseKeyNoProducerHolds(t *test
 	}
 	if reason == "" {
 		t.Error("refusal returned no countable reason, so the reconciler cannot record it")
+	}
+}
+
+// TestClaimCarriedProof_AnUnstampedPromoteIsRefused is the other side of that
+// correction.
+//
+// Promote's only proof-carrying producer is the failover coordinator, which
+// holds the failover lease. An unstamped promote proof is therefore a DEFECT —
+// a coordinator running an older build, or one that skipped its stamp — not a
+// lease-less producer's normal output, and letting it through is what allowed
+// a coordinator whose tenure had lapsed to define and start a VM on a new host.
+func TestClaimCarriedProof_AnUnstampedPromoteIsRefused(t *testing.T) {
+	ctx := context.Background()
+	s := enforcingServer(t, map[string]int64{"node-c": 9})
+	seedFailoverTerm(t, s, 9, "node-a")
+
+	p := &pb.RuntimeActionProof{
+		Id: "p-promote", Action: corrosion.ActionPromote, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "host-a", Coordinator: "host-a",
+	}
+	if _, err := s.claimCarriedProof(ctx, p, corrosion.ActionPromote, "vm", "vm1"); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an unstamped promote proof was accepted (err=%v); its only producer holds "+
+			"the failover lease, so a missing term means a stale or defective coordinator", err)
 	}
 }

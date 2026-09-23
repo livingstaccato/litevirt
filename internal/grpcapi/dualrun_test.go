@@ -74,7 +74,23 @@ func gatherWith(snaps map[string]runtimeSnapshot, unreachable, unsupported []str
 }
 
 // dualRunTestServer builds a test server with hosts h1..hN (all active), self = h1.
+// dualRunTestServer builds the fixture AND takes the detector lease, because a
+// pass always follows an acquire in production: RunDualRunDetector calls
+// acquireDualRunLease and only then detectDualRunPass, and the mid-pass
+// re-assert checks that. A fixture that never took the lease would have every
+// pass correctly discarded.
 func dualRunTestServer(t *testing.T, n int) *Server {
+	t.Helper()
+	s := dualRunTestServerNoLease(t, n)
+	if !s.acquireDualRunLease(context.Background(), time.Minute) {
+		t.Fatal("fixture could not take the dual-run lease")
+	}
+	return s
+}
+
+// dualRunTestServerNoLease is the same fixture without the acquire, for the
+// tests that are about acquisition itself.
+func dualRunTestServerNoLease(t *testing.T, n int) *Server {
 	t.Helper()
 	s := testServer(t)
 	s.hostName = "h1"
@@ -478,6 +494,9 @@ func TestDualRun_FencedHostStillRunning_Detected(t *testing.T) {
 		"h1": {diskHolderVMs: []string{"vmA"}},
 		"h2": {diskHolderVMs: []string{"vmA"}},
 	})
+	if !s.acquireDualRunLease(ctx, time.Minute) {
+		t.Fatal("could not take the dual-run lease")
+	}
 	s.detectDualRunPass(ctx)
 	s.detectDualRunPass(ctx)
 	if !confirmedCond(s, kindDualRunVM, "vmA") {
@@ -897,6 +916,13 @@ func TestConditionLifecycle_SurvivesLeaderChange(t *testing.T) {
 	// Leadership moves: h2 shares the SAME replicated state, no in-memory carry.
 	s2 := &Server{hostName: "h2", db: s1.db, events: events.NewBus()}
 	s2.gatherRuntimeOverride = twoHolderGather()
+	// The new leader TAKES the lease — that is what a leadership change is,
+	// and h1's has to lapse first. Without this the mid-pass re-assert
+	// correctly discards h2's pass, because h2 would not in fact be leading.
+	if _, _, err := corrosion.AcquireLeaseWithTerm(ctx, s1.db, dualRunLeaseKey,
+		"h2", 10*time.Minute, time.Now().Add(10*time.Minute)); err != nil {
+		t.Fatalf("the new leader could not take the dual-run lease: %v", err)
+	}
 	sets, _, stop := captureDualRun(t, s2)
 	defer stop()
 	s2.detectDualRunPass(ctx)

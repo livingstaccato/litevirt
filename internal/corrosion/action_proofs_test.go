@@ -418,6 +418,13 @@ func TestProofsFreshAndUpgradedColumnOrderMatch(t *testing.T) {
 	// their migrations. Dropped in REVERSE order so each drop is the table's
 	// last column, which is what an upgrade never has to do and what makes the
 	// re-migration exercise the real append order.
+	// The index over those columns goes first. A real v52 database never had
+	// it -- schemaIndexes runs AFTER the migrations that add the columns -- but
+	// this simulation rewinds an already-initialised DB, where SQLite refuses
+	// to drop a column an index still references.
+	if err := upgraded.execLocal(ctx, `DROP INDEX IF EXISTS idx_proofs_term_claimant`); err != nil {
+		t.Fatalf("simulate v52 drop idx_proofs_term_claimant: %v", err)
+	}
 	for _, col := range []string{"lease_key", "lease_term"} {
 		if err := upgraded.execLocal(ctx,
 			`ALTER TABLE runtime_action_proofs DROP COLUMN `+col); err != nil {

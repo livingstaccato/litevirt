@@ -425,9 +425,15 @@ var ErrTermClaimantConflict = errors.New("lease term already claimed on this hos
 // It exists because the replicated ledger cannot carry this weight. During a
 // partition neither claimant's leader_lease_terms row has propagated, so a
 // holder lookup answers "not found" for both, and an executor reachable from
-// both coordinators while they cannot see each other would act for both. The
-// claim is the one place this host writes something durable about what it
-// agreed to act on, so the claim is where the binding belongs.
+// both coordinators while they cannot see each other would act for both.
+//
+// The binding lives in local_term_bindings, which is NODE-LOCAL and in no sync
+// path. It used to be derived from runtime_action_proofs, on the grounds that
+// "the claim is the one place this host writes something durable about what it
+// agreed to act on" -- but that table is replicated and anti-entropy repaired,
+// so the evidence was writable by any cluster member. A binding a peer can
+// author is not a binding; it is a lever for refusing a victim host's
+// recovery. See the guard in ClaimActionProofFenced.
 type TermFence struct {
 	// Key is the lease whose term this is. Part of the binding because term
 	// numbers COLLIDE across keys by design — the three leases allocate
@@ -515,15 +521,39 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 		// NOT by the reap, which deliberately cannot help here. If that index is
 		// ever made partial-on-live it stops serving this query and a host loss
 		// starts stalling lease renewals on the same node.
-		var conflict int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM runtime_action_proofs
-			  WHERE lease_term = ? AND lease_key = ? AND executor_host = ?
-			    AND coordinator <> ? AND id <> ?`,
-			fence.Term, fence.Key, executor, fence.Coordinator, id).Scan(&conflict); err != nil {
+		// The binding is read from NODE-LOCAL state, not from
+		// runtime_action_proofs.
+		//
+		// That table is replicated and anti-entropy repaired, so the evidence
+		// this guard reasons over was writable by any cluster member. Inserting
+		// rows for a victim host at a span of terms -- they are small monotone
+		// integers, so a few hundred cover months -- made every legitimate
+		// fenced claim on that host at those terms see a conflicting claimant
+		// and refuse. That is a remote, durable denial of recovery, and the
+		// type doc's claim that "the claim is the one place this host writes
+		// something durable about what it agreed to act on" was exactly the
+		// thing that was not true.
+		var bound string
+		err := tx.QueryRowContext(ctx,
+			`SELECT coordinator FROM local_term_bindings
+			  WHERE executor = ? AND lease_key = ? AND lease_term = ?`,
+			executor, fence.Key, fence.Term).Scan(&bound)
+		switch {
+		case err == sql.ErrNoRows:
+			// First claim for this (executor, key, term): bind to this
+			// coordinator. Inside the same transaction as the claim, so the
+			// binding and the claim cannot disagree.
+			if _, ierr := tx.ExecContext(ctx,
+				`INSERT INTO local_term_bindings (executor, lease_key, lease_term, coordinator, bound_at)
+				 VALUES (?, ?, ?, ?, ?)`,
+				executor, fence.Key, fence.Term, fence.Coordinator, nowRFC3339()); ierr != nil {
+				return false, ierr
+			}
+		case err != nil:
 			return false, err
-		}
-		if conflict > 0 {
+		case bound != fence.Coordinator:
+			// Already bound to a different claimant for this term. This is the
+			// split the fence exists to catch.
 			fenced = true
 			return false, nil
 		}

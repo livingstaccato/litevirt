@@ -1608,6 +1608,30 @@ var schemaDDL = []string{
 	)`,
 
 	// ═══════════ AUDIT LOG ═══════════
+	// NODE-LOCAL. Deliberately absent from tableNames and from every sync path:
+	// this records what THIS host bound itself to, and a binding a peer could
+	// write is not a binding at all.
+	//
+	// The fenced-claim guard used to read its evidence from
+	// runtime_action_proofs, which is replicated and anti-entropy repaired. Any
+	// cluster member could therefore insert rows naming a victim host as
+	// executor_host at a range of terms -- terms are small monotone integers, so
+	// a few hundred rows cover months -- and every legitimate fenced claim on
+	// that host at those terms would then see a "conflicting claimant" and
+	// refuse. A remote, durable denial of recovery, written as ordinary
+	// replicated data.
+	//
+	// No deleted_at: this is not replicated, so there is no tombstone to
+	// propagate, and the binding must outlive the proof rows it fenced.
+	`CREATE TABLE IF NOT EXISTS local_term_bindings (
+		executor    TEXT NOT NULL,
+		lease_key   TEXT NOT NULL,
+		lease_term  INTEGER NOT NULL,
+		coordinator TEXT NOT NULL,
+		bound_at    TEXT NOT NULL,
+		PRIMARY KEY (executor, lease_key, lease_term)
+	)`,
+
 	`CREATE TABLE IF NOT EXISTS audit_log (
 		id           TEXT PRIMARY KEY,
 		timestamp    TEXT NOT NULL,

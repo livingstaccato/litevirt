@@ -53,14 +53,15 @@ func NewAntiEntropy(client *Client, pkiDir string, interval time.Duration) *Anti
 // Start runs the anti-entropy loop until ctx is cancelled.
 func (ae *AntiEntropy) Start(ctx context.Context) {
 	slog.Info("anti-entropy: starting", "interval", ae.interval)
-	ticker := time.NewTicker(ae.interval)
-	defer ticker.Stop()
-
+	// A jittered sleep rather than a fixed ticker. Every node's loop starts at
+	// roughly the same moment after a cluster boot, and a shared fixed period
+	// kept them aligned indefinitely — each pass has every node pulling digests
+	// from every other, so aligned passes are an O(N²) burst on one beat.
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(jittered(ae.interval, loopJitter)):
 			ae.RunOnce(ctx) // debounced; scheduled ticks share the trigger guard
 		}
 	}

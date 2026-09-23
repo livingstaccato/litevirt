@@ -464,8 +464,10 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 				return
 			case <-r.client.ReplicatorNotify():
 				// New mutation available, loop immediately.
-			case <-time.After(10 * time.Second):
+			case <-time.After(jittered(pushIdleInterval, loopJitter)):
 				// Periodic check — picks up deferred writes (e.g. health data).
+				// Jittered: every peer's loop starts together and would
+				// otherwise wake together forever.
 			}
 		}
 	}

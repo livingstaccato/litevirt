@@ -257,6 +257,61 @@ func looksLikeAPIToken(s string) bool {
 // A read that fails is neither answer, and is returned as an error rather than
 // collapsed into one — see UsersEverExisted for the same distinction on the
 // seeding side.
+// ReinstateAdminIfNoneRemain restores the "at least one admin" invariant after
+// the fact, and reports which account it brought back ("" if none was needed).
+//
+// The delete path checks OtherLiveAdminExists and then deletes, as two
+// independent operations against replicated state. Nothing makes that pair
+// atomic across LWW replicas: with two admins and one delete issued on each of
+// two nodes, both checks see the other admin alive, both pass, both tombstones
+// replicate, and the cluster is left with no administrator and no way back in.
+// Serializing within one node does not help, because the two requests never
+// meet there.
+//
+// So the invariant is repaired instead of defended. A node that observes zero
+// live admins undoes the most recent admin tombstone -- most recent because
+// every replica agrees on that ordering from the replicated deleted_at, so two
+// racing nodes reach the same conclusion and pick the same row. A duplicate
+// reinstatement is harmless: two admins is the state the guard was trying to
+// preserve.
+//
+// Reinstating an account the operator deliberately deleted is the lesser
+// failure, and it is loud -- the caller logs and audits it. A cluster with no
+// admin is not recoverable through any supported path.
+func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) {
+	live, err := c.Query(ctx,
+		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL LIMIT 1`)
+	if err != nil {
+		return "", err
+	}
+	if len(live) > 0 {
+		return "", nil
+	}
+	// Deterministic across replicas: newest tombstone, then username as the
+	// tiebreak so two deletes sharing a marker still resolve identically.
+	rows, err := c.Query(ctx,
+		`SELECT username, password_hash FROM users WHERE role = 'admin' AND deleted_at IS NOT NULL
+		 ORDER BY deleted_at DESC, username ASC LIMIT 1`)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", nil // no admin ever existed; not this function's problem
+	}
+	victim := rows[0].String("username")
+	// The reactivation shape InsertUser already uses, with role and password
+	// written back unchanged. Deliberately NOT a new `SET deleted_at = NULL`
+	// statement: every replicated shape has to be in the compatibility ledger,
+	// and reusing the registered one keeps this off that ledger entirely.
+	now := c.NowTS()
+	if err := c.Execute(ctx,
+		`UPDATE users SET role = ?, password_hash = ?, deleted_at = NULL, updated_at = ? WHERE username = ?`,
+		"admin", rows[0].String("password_hash"), now, victim); err != nil {
+		return "", err
+	}
+	return victim, nil
+}
+
 func OtherLiveAdminExists(ctx context.Context, c *Client, username string) (bool, error) {
 	rows, err := c.Query(ctx,
 		`SELECT username FROM users WHERE role = 'admin' AND deleted_at IS NULL AND username != ? LIMIT 1`,

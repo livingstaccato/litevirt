@@ -388,6 +388,26 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	if err := corrosion.DeleteUser(ctx, s.db, req.Username); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete user: %v", err)
 	}
+	// The OtherLiveAdminExists check above and this delete are two independent
+	// operations against replicated state, and nothing makes that pair atomic
+	// across LWW replicas. Two admins, one delete issued on each of two nodes:
+	// both checks see the other admin alive, both pass, both tombstones
+	// replicate, and the cluster has no administrator and no way back in.
+	//
+	// So the invariant is repaired rather than defended. Every node that
+	// applies a delete re-reads, and one that sees zero live admins undoes the
+	// most recent admin tombstone -- deterministically, so two racing nodes
+	// pick the same row. context.WithoutCancel: the delete has already
+	// happened, and a cancelled request must not leave the cluster admin-less.
+	if reinstated, rerr := corrosion.ReinstateAdminIfNoneRemain(
+		context.WithoutCancel(ctx), s.db); rerr != nil {
+		slog.Error("could not verify an admin survived the delete", "deleted", req.Username, "error", rerr)
+	} else if reinstated != "" {
+		slog.Warn("deleting this user would have left the cluster with no administrator; "+
+			"the most recently deleted admin was reinstated",
+			"deleted", req.Username, "reinstated", reinstated)
+		s.audit(ctx, "user.admin_reinstated", reinstated, "", "ok")
+	}
 	// Drop the deleted user's bindings from the live engine immediately, in
 	// memory, for both the canonical and legacy-bare principal forms (matching
 	// the DB tombstone in corrosion.DeleteUser) so access is revoked without

@@ -245,6 +245,18 @@ machinery backups use) and IS crash-consistent. Replicating a STOPPED VM is
 consistent either way. Prefer `--incremental` for anything you intend to
 promote, or replicate on a schedule the workload can tolerate being torn.
 
+An `--incremental` run whose backup session fails **does not downgrade to the
+full copy while the VM is running** — the run fails and produces no replica,
+rather than silently substituting the weaker mechanism for the one you asked
+for. A stopped source still falls back, because there is nothing writing the
+image. Watch for `replication.failed` notifications: a schedule failing this
+way keeps its previous replicas and stops making new ones.
+
+A replica is also **published by rename**. The copy lands in a dotted
+`.partial` sibling and is renamed into its final name only once it has
+completed and is non-empty, so an interrupted run can no longer leave a
+truncated file under a name promotion would select.
+
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 
 ```bash

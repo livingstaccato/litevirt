@@ -114,8 +114,16 @@ func (ae *AntiEntropy) checkPeers(ctx context.Context) {
 		sensitiveMap[d.Name] = d
 	}
 
+	// Each peer gets a deadline of its own. The pass visits peers one at a time,
+	// and on the daemon's root context a peer that accepted the connection and
+	// then sat on GetStateDigest held the whole pass there indefinitely — every
+	// peer after it in the member list was never checked again, and whatever
+	// divergence anti-entropy exists to heal stayed unhealed. A dial timeout
+	// cannot catch that: the dial succeeded.
 	for _, peer := range peers {
-		ae.checkPeer(ctx, peer.Name, localMap, sensitiveMap)
+		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
+		ae.checkPeer(pctx, peer.Name, localMap, sensitiveMap)
+		cancel()
 	}
 }
 
@@ -321,6 +329,16 @@ func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.Lite
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
+
+// antiEntropyPeerTimeout bounds one peer's whole anti-entropy exchange: digest,
+// and when the digests disagree, the full state dump and its merge.
+//
+// Generous on purpose. A total deadline cannot tell an idle hang from a slow
+// transfer, and cutting a legitimate dump short is worse than the hang — it
+// would stop a large cluster from ever converging. Five minutes is far past
+// any dump this tree produces over a LAN and still bounds the pass. A var only
+// so tests can shrink it.
+var antiEntropyPeerTimeout = 5 * time.Minute
 
 // antiEntropyMaxMsgSize bounds the legacy unary state-dump fallback's receive
 // size; matches the server's grpcMaxMsgSize backstop.

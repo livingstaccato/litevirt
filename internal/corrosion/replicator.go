@@ -531,14 +531,27 @@ func (r *Replicator) replicateOnce(ctx context.Context, peerName string) (int, e
 		}
 	}
 
-	// Connect to peer and push mutations.
-	client, conn, err := r.peerGRPCClient(ctx, peerName)
+	// Connect to peer and push mutations, under a deadline of this push's own.
+	//
+	// The loop's context has no deadline, and a peer that accepts the call and
+	// never answers — a wedged daemon behind a live listener — held this loop
+	// inside PushMutations forever. No error came back, so no backoff ran and
+	// notePushFailure never fired, and the prune, which stops counting a peer
+	// only once it is RECORDED as failing, kept that peer's frozen watermark
+	// pinning the entire log. A deadline turns a hang into the failure it is.
+	//
+	// Only the dial and the RPC are bounded. The watermark write below is local,
+	// and running it on an expired context would throw away a push the peer had
+	// already applied.
+	pctx, pcancel := context.WithTimeout(ctx, pushRPCTimeout)
+	defer pcancel()
+	client, conn, err := r.peerGRPCClient(pctx, peerName)
 	if err != nil {
 		return 0, fmt.Errorf("connect to peer %s: %w", peerName, err)
 	}
 	defer conn.Close()
 
-	resp, err := client.PushMutations(ctx, &pb.ReplicateRequest{
+	resp, err := client.PushMutations(pctx, &pb.ReplicateRequest{
 		Sender:        r.client.HostName(),
 		AfterSeq:      lastSeq,
 		Entries:       pbEntries,
@@ -763,6 +776,12 @@ func (r *Replicator) peerGRPCClient(ctx context.Context, peerName string) (pb.Li
 	}
 	return pb.NewLiteVirtClient(conn), conn, nil
 }
+
+// pushRPCTimeout bounds one push to one peer: the dial and the PushMutations
+// call. A batch is at most replicateBatchSize entries, so a minute is far past
+// any legitimate push and short enough that a hung peer is recorded as failing
+// well inside UnreachablePeerGrace. A var only so tests can shrink it.
+var pushRPCTimeout = 60 * time.Second
 
 // pruneLoop periodically deletes old mutation_log and mutation_seen entries.
 func (r *Replicator) pruneLoop(ctx context.Context) {

@@ -16,6 +16,8 @@ import (
 	"fmt"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"sort"
+	"strings"
 )
 
 // FetchPage returns one export page for the given cursor. The empty cursor asks
@@ -107,6 +109,28 @@ func Assemble(ctx context.Context, fetch FetchPage) ([]byte, int, error) {
 		cursor = resp.NextCursor
 	}
 
+	// COMPLETENESS, before returning something that looks authoritative.
+	//
+	// The evidence tables -- signing_keys, key_lifecycle, chain_heads -- ride on
+	// page ONE. A host that rotates its signing key after that page produces
+	// rows on later pages signed by a key whose certificate is not in the
+	// document, and an external verifier cannot check them at all. It is the
+	// same class as a seq gap: the artifact replays as broken, and the operator
+	// cannot tell that from tampering.
+	//
+	// This package exists to refuse a partial chain -- it already errors when a
+	// server repeats a cursor -- so an uncheckable one is refused here too,
+	// naming the key and the remedy rather than writing a document whose
+	// verification will fail later for reasons nobody can attribute.
+	if err := checkKeyCoverage(doc, rows); err != nil {
+		return nil, 0, err
+	}
+	if raw, ok := doc["seq_gaps"]; ok {
+		return nil, 0, fmt.Errorf("export audit chain: the server reported gaps in a host's "+
+			"seq sequence (%s); the rows below a gap replay as a chain break, which is "+
+			"indistinguishable from tampering. Re-run once replication has caught up", raw)
+	}
+
 	merged, err := json.Marshal(rows)
 	if err != nil {
 		return nil, 0, fmt.Errorf("encode export rows: %w", err)
@@ -117,4 +141,53 @@ func Assemble(ctx context.Context, fetch FetchPage) ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("encode export: %w", err)
 	}
 	return body, total, nil
+}
+
+// checkKeyCoverage refuses a document whose rows reference a signing key the
+// page-one evidence does not carry.
+//
+// Rows written before v45 have no key_id: they are chain-verified but not
+// tamper-evident, and the verifier reports them as such, so an empty key_id is
+// not a coverage failure.
+func checkKeyCoverage(doc map[string]json.RawMessage, rows []json.RawMessage) error {
+	raw, ok := doc["signing_keys"]
+	if !ok {
+		return nil // no evidence section at all: page one carried none
+	}
+	var keys []struct {
+		KeyID string `json:"key_id"`
+	}
+	if err := json.Unmarshal(raw, &keys); err != nil {
+		return fmt.Errorf("decode signing_keys evidence: %w", err)
+	}
+	known := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		known[k.KeyID] = true
+	}
+
+	missing := map[string]bool{}
+	for _, r := range rows {
+		var row struct {
+			KeyID    string `json:"key_id"`
+			HostName string `json:"host_name"`
+		}
+		if err := json.Unmarshal(r, &row); err != nil {
+			return fmt.Errorf("decode export row: %w", err)
+		}
+		if row.KeyID != "" && !known[row.KeyID] {
+			missing[row.KeyID+" ("+row.HostName+")"] = true
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(missing))
+	for k := range missing {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return fmt.Errorf("export audit chain: %d row signing key(s) have no certificate in the "+
+		"exported evidence: %s. The evidence tables ride on page one, so a key rotated "+
+		"mid-export is absent and those rows cannot be verified offline at all. Re-run the "+
+		"export", len(names), strings.Join(names, ", "))
 }

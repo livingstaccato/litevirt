@@ -232,8 +232,18 @@ daemon config wins.
 The same scheduler also drives **volume replication** (`backup_schedules`
 rows with `type='replication'`). Each run copies the VM's root disk to a
 target pool as a timestamped, self-contained point-in-time copy, keeping the
-newest `keep_replicas`. It is **crash-consistent** (no guest quiesce) — a
-fast-recovery layer, not a backup replacement, so keep backups too.
+newest `keep_replicas`. A fast-recovery layer, not a backup replacement, so keep
+backups too.
+
+**Consistency differs between the two replication modes, and the default is the
+weaker one.** A full replica of a RUNNING VM is `qemu-img convert -U` reading
+the image the guest still has open — no snapshot is taken, so the copy is
+smeared over however long it ran. That is neither point-in-time nor
+crash-consistent, and a guest filesystem restored from it may need repair. The
+`--incremental` path opens a real point-in-time session (the same pull-mode
+machinery backups use) and IS crash-consistent. Replicating a STOPPED VM is
+consistent either way. Prefer `--incremental` for anything you intend to
+promote, or replicate on a schedule the workload can tolerate being torn.
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 
@@ -279,9 +289,11 @@ healthy host (`--force` overrides). The same action is on the VM detail page
 **Automatic promotion** (`--auto-promote` on the schedule): after the failover
 coordinator **confirms a fence**, it promotes the freshest replica for opted-in
 VMs onto a healthy peer (so a VM on lost local storage resumes), falling back to
-a bare reschedule on failure. Default off. Promotion uses the newest
-(crash-consistent, possibly lagging) replica — enable only where a small lag
-window is acceptable.
+a bare reschedule on failure. Default off. Promotion uses the newest replica,
+which is lagging by up to one schedule interval and — for a full (non-
+incremental) replica of a VM that was running — is a torn copy rather than a
+crash-consistent one, as above. Enable only where a small lag window is
+acceptable, and prefer `--incremental` on any schedule with `--auto-promote`.
 
 ## Live restore
 

@@ -123,10 +123,15 @@ REST surface (see `docs/rest-api.md`):
 
 ## When NOT to use multiple regions
 
-- The CRDT replicator works fine across regions but every
-  cross-region write pays the replication latency. If your workload
-  is chatty and consistency-sensitive, a single region with a
-  high-availability layout is simpler.
+- The CRDT replicator works fine across regions, but understand what the
+  latency buys and what it does not. A write does NOT wait for a remote
+  region — it commits locally and returns, and the cross-region latency
+  is how long the state stays divergent, not how long your call blocks.
+  So a chatty, consistency-sensitive workload does not get slower across
+  regions; it gets a wider window in which two regions disagree, and
+  last-writer-wins settles it. A single region with a high-availability
+  layout is simpler. See [Operating model](operating-model.md) → "Three
+  different guarantees, one vocabulary".
 - HA quorum is cluster-wide, not region-local. A 4-node cluster split
   2/2 across regions has the same quorum-stall risk as a 4-node LAN
   cluster split 2/2 — both sides compute `quorum=3` and neither

@@ -95,6 +95,12 @@ func TestFenceWatchdog_WithTempFile(t *testing.T) {
 		Name:          "node-4",
 		FenceStrategy: "watchdog",
 		WatchdogDev:   dev,
+		// IsSelf, because this exercises the DEVICE handling. Without it the
+		// dispatch now refuses (a watchdog fence arms the calling node), and
+		// this test asserted the behaviour that refusal exists to stop -- a
+		// remote target reporting a verified power-off from a local countdown.
+		// See TestExecute_RefusesAWatchdogFenceAimedAtAnotherHost.
+		IsSelf: true,
 	}
 	r := Execute(context.Background(), h)
 	if !r.Success {

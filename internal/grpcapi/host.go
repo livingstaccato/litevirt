@@ -772,6 +772,9 @@ func (s *Server) FenceHost(ctx context.Context, req *pb.FenceHostRequest) (*pb.F
 		IPMIUser:      h.IPMIUser,
 		IPMIPass:      h.IPMIPass,
 		WatchdogDev:   h.WatchdogDev,
+		// Only a fence aimed at THIS node may use the watchdog strategy; it arms
+		// the caller's own device. Everything else is unaffected.
+		IsSelf: h.Name == s.hostName,
 	})
 
 	// Always mark offline regardless of fence success.

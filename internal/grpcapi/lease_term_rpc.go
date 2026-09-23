@@ -97,6 +97,18 @@ func (s *Server) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTerm
 // to acknowledge got PermissionDenied. Widening cluster.update instead would
 // have pre-granted Operator every cluster verb added after this one.
 func (s *Server) AcknowledgeLeaseTermTie(ctx context.Context, req *pb.AcknowledgeLeaseTermTieRequest) (*pb.AcknowledgeLeaseTermTieResponse, error) {
+	// "Node-local and NOT peer-callable" was prose, not a check. A peer
+	// certificate authorizes as admin, so either claimant in a term contest --
+	// or any node an attacker holds a host key for -- could dial every peer and
+	// durably suppress the tie it is itself a party to, with the audit row
+	// attributing it to "admin". `lv health` and the digest then go clean while
+	// the SAFETY-FAULT stands.
+	if callerPrincipalKind(ctx) == principalKindPeer {
+		return nil, status.Error(codes.PermissionDenied,
+			"acknowledging a lease-term tie is node-local and not peer-callable: a node "+
+				"must never be able to acknowledge its own contest. Run it on each host the "+
+				"health condition names, as an operator or via LV_HOST")
+	}
 	if err := s.RequirePerm(ctx, "/", "cluster.lww.acknowledge", "operator"); err != nil {
 		return nil, err
 	}

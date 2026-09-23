@@ -375,8 +375,18 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	// Leader election: only one coordinator may drive recovery at a time.
 	// Acquire (or renew) the lease; if another coordinator holds it, skip.
-	if !c.acquireLease(ctx) {
-		c.stepDownGauges()
+	held, leaseErr := c.acquireLeaseResult(ctx)
+	if !held {
+		// stepDownGauges publishes stranded_workloads = 0, which is a CLAIM
+		// that nothing is stranded. Only a clean "another node holds the lease"
+		// supports it. On a read error this node knows nothing, and if the
+		// store problem is fleet-wide -- the case where workloads are most
+		// likely to be stranded -- every node takes this path, max() across
+		// instances reads 0, and the alert clears exactly when it should fire.
+		// Same rule the strandedWorkloads branch below already follows.
+		if leaseErr == nil {
+			c.stepDownGauges()
+		}
 		return
 	}
 
@@ -732,7 +742,17 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 // c.now() is the virtual clock the fleet harness overrides, and passing
 // time.Now() instead would make its scenarios unable to advance past lease
 // expiry without sleeping.
+// acquireLease reports only whether the lease is held. Prefer
+// acquireLeaseResult where the difference between "not the leader" and "could
+// not tell" matters -- publishing a gauge, above all.
 func (c *Coordinator) acquireLease(ctx context.Context) bool {
+	held, _ := c.acquireLeaseResult(ctx)
+	return held
+}
+
+// acquireLeaseResult takes or renews the failover lease and keeps the failure
+// reason, so a caller can tell a lost election from an unreadable store.
+func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 	held, term, err := corrosion.AcquireLeaseWithTerm(
 		ctx, c.db, failoverLeaseKey, c.hostName, leaseDuration, c.now())
 	if err != nil {
@@ -741,17 +761,17 @@ func (c *Coordinator) acquireLease(ctx context.Context) bool {
 		slog.Error("failover: lease write", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		c.leaseTerm.Store(0)
-		return false
+		return false, err
 	}
 	if !held {
 		// Another coordinator holds it — the normal non-leader case.
 		c.leaseTerm.Store(0)
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
-		return false
+		return false, nil
 	}
 	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
-	return true
+	return true, nil
 }
 
 // LeaseTerm is the fencing term of the lease incarnation this coordinator holds,

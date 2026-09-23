@@ -5,6 +5,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -95,13 +97,66 @@ func (s *Server) sessionValid(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 
-	if mutating && !uiRoleAtLeast(who.GetRole(), "operator") {
-		slog.Warn("ui: refusing a mutation from an under-privileged session",
-			"user", who.GetUsername(), "role", who.GetRole(), "method", r.Method, "path", r.URL.Path)
-		http.Error(w, "your role does not permit this change", http.StatusForbidden)
+	// A mutation is authorized by the DAEMON, not here. The write handlers now
+	// call their gRPC twins, whose RequirePerm consults the token's scope paths
+	// and the caller's RBAC bindings — neither of which is visible in the
+	// coarse role string this layer can see.
+	//
+	// What remains here is a cheap early refusal for the one case the coarse
+	// role settles on its own: a session with no role at all. It must not be
+	// the only check, and it deliberately does NOT refuse a low role, because
+	// an external-realm user is shadowed as "viewer" while their real
+	// authority comes from a binding the daemon holds.
+	if mutating && !selfServiceMutation(r.URL.Path) && who.GetRole() == "" {
+		slog.Warn("ui: refusing a mutation from a session with no role",
+			"user", who.GetUsername(), "method", r.Method, "path", r.URL.Path)
+		http.Error(w, "your credentials do not permit this change", http.StatusForbidden)
 		return false
 	}
 	return true
+}
+
+// selfServiceMutation reports whether path is a user acting on their OWN
+// credentials.
+//
+// These carry no authority beyond the session that already authenticated, and
+// the handlers behind them scope themselves to the caller. Holding them to the
+// cluster-write bar would stop a Viewer changing their own password or
+// enrolling a security key -- which is the thing to break, not the thing to
+// secure.
+//
+// path.Clean first: "/account/../ui/firewall/cluster-rules" must not be
+// laundered into the exempt set by a prefix match.
+func selfServiceMutation(p string) bool {
+	switch cleaned := path.Clean(p); {
+	case cleaned == "/account/password":
+		return true
+	case cleaned == "/account/2fa" || strings.HasPrefix(cleaned, "/account/2fa/"):
+		return true
+	}
+	return false
+}
+
+// httpStatusFor maps a gRPC error to the HTTP status the page should return.
+//
+// It exists because the write handlers now call their gRPC twins, so the
+// daemon's PermissionDenied has to arrive at the browser as 403 rather than
+// being flattened into 500 with the rest. A refusal that reads as a server
+// fault sends the operator to the logs instead of to their permissions.
+func httpStatusFor(err error) int {
+	switch status.Code(err) {
+	case codes.PermissionDenied:
+		return http.StatusForbidden
+	case codes.Unauthenticated:
+		return http.StatusUnauthorized
+	case codes.InvalidArgument, codes.FailedPrecondition, codes.AlreadyExists:
+		return http.StatusBadRequest
+	case codes.NotFound:
+		return http.StatusNotFound
+	case codes.Unavailable:
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusInternalServerError
 }
 
 // uiRoleLevels mirrors the daemon's admin > operator > viewer ordering. It is a

@@ -4,8 +4,10 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -45,6 +47,14 @@ type Server struct {
 	migrations sync.Map // vmName → *migrateState
 	backupOps  sync.Map // opID → *backupOpState (snapshot / restore / restore-live)
 	statsRings sync.Map // "host:<name>" or "vm:<name>" → *StatsRing
+
+	// authz is the daemon's own authorization entry point, used by the write
+	// handlers that have NO gRPC twin to route through (security groups).
+	// Without it those writes had nothing in front of them but a coarse role
+	// string, which neither honours a token's scope paths nor sees an RBAC
+	// binding. An interface, not *grpcapi.Server, so this package does not
+	// import it. Nil = those writes are refused rather than waved through.
+	authz Authorizer
 
 	// db is a host-local Corrosion handle for read-only pages that
 	// would otherwise require a new gRPC RPC for trivial reads
@@ -87,6 +97,30 @@ func (s *Server) SetCorrosionDB(db *corrosion.Client) { s.db = db }
 // `backup_repos:` map so /backups can list them without query-string
 // nudging. Pass the daemon's live map directly — the UI does not mutate.
 func (s *Server) SetBackupRepos(repos map[string]string) { s.backupRepos = repos }
+
+// Authorizer is the daemon's authorization entry point, narrowed to what the
+// UI needs. internal/grpcapi's *Server satisfies it.
+type Authorizer interface {
+	AuthorizeInProcess(ctx context.Context, path, verb, fallbackRole string) error
+}
+
+// SetAuthorizer wires the daemon's authorizer for the in-process write paths
+// that have no gRPC twin.
+func (s *Server) SetAuthorizer(a Authorizer) { s.authz = a }
+
+// authorize applies the daemon's authorization to an in-process write.
+//
+// It FAILS CLOSED when no authorizer is wired: an unauthorized cluster write
+// is worse than an unavailable page, and a nil authorizer means the one
+// component that can answer the question is absent.
+func (s *Server) authorize(r *http.Request, path, verb string) error {
+	if s.authz == nil {
+		return errNoAuthorizer
+	}
+	return s.authz.AuthorizeInProcess(s.uiBearerCtx(r), path, verb, "operator")
+}
+
+var errNoAuthorizer = errors.New("authorization unavailable on this build")
 
 // NewServer creates a UI server backed by the given gRPC client.
 func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {

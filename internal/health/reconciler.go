@@ -46,10 +46,45 @@ const reconcileInterval = 15 * time.Second
 // tests can shrink it.
 var reconcileWalkBudget = 10 * time.Second
 
+// imagePullBudget bounds one background backing-image transfer.
+//
+// The walk budget above must not be the transfer's deadline: a backing image
+// that needs longer than the remaining budget was cancelled on every attempt,
+// ImportImage discards its partial file on cancellation, and the next pass
+// started from byte zero — so a VM whose image was merely LARGE never
+// recovered. The transfer therefore runs detached from the walk (see
+// pullBackingImage), and this is the bound it runs under instead.
+//
+// It is a last-resort bound on a stream that has hung, not a performance
+// target, and it errs long on purpose: a hung transfer cut here delays that
+// VM's recovery by this much and is then retried; a healthy transfer cut here
+// restarts from zero and, if it is consistently this slow, never completes.
+// The second failure is permanent and the first is not. A var so tests can
+// shrink it.
+var imagePullBudget = 4 * time.Hour
+
+// errImagePullInProgress is pullBackingImage's answer when the walk's budget
+// ran out before the transfer finished. The transfer continues; the VM is
+// re-armed as pending and a later pass finds the image present.
+var errImagePullInProgress = errors.New("backing image transfer still in progress")
+
+// imagePullFlight is one in-progress background transfer of a backing image.
+// err is written before done is closed and read only after it.
+type imagePullFlight struct {
+	done chan struct{}
+	err  error
+}
+
 // Reconciler watches for VMs in "pending" state on the local host
 // and starts them. It also detects split-brain conditions where a VM
 // is running locally in libvirt but corrosion says it belongs to another host.
 type Reconciler struct {
+	// startDomainHook runs immediately before StartDomain, with the context
+	// the start is running under. Test-only seam: it makes a walk budget that
+	// expires between the start and the commit reproducible instead of a
+	// timing race, and lets a test see WHICH context the walk handed down.
+	// Nil in production.
+	startDomainHook  func(context.Context)
 	hostName         string
 	dataDir          string
 	db               *corrosion.Client
@@ -73,6 +108,12 @@ type Reconciler struct {
 	// split_brain / inconclusive / error) — nil-safe; tests assert on it and
 	// Phase 5 can wire a metric. See SetOwnerAssertObserver.
 	onOwnerAssert func(vm, result string)
+
+	// pullMu guards pulls: the background backing-image transfers in flight,
+	// keyed by image name, so every pass that needs the same image joins the
+	// one transfer rather than opening another stream. See pullBackingImage.
+	pullMu sync.Mutex
+	pulls  map[string]*imagePullFlight
 
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
@@ -905,7 +946,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.releaseVMLock(ctx, vm.Name)
 		return
 	}
-	defer r.releaseVMLock(ctx, vm.Name)
+	// Releasing the lease is CLEANUP, and cleanup must not inherit the caller's
+	// deadline. reconcilePass bounds this walk with reconcileWalkBudget; on the
+	// very case that budget exists for, it expires mid-start and the DELETE
+	// fails (Debug-logged), stranding the lease for the full vmLockTTL so no
+	// other host can reconcile this VM.
+	defer r.releaseVMLock(context.WithoutCancel(ctx), vm.Name)
 
 	// A pending transition that carries a proof marker (pending_action_id) was minted
 	// by a coordinator that held the lease + quorum, so we MUST validate + claim it
@@ -1182,7 +1228,20 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			if d.BackingImage != "" && r.autoPullImage != nil {
 				slog.Info("reconciler: disk missing, attempting auto-pull of backing image",
 					"vm", vm.Name, "disk", d.DiskName, "image", d.BackingImage)
-				if pullErr := r.autoPullImage(ctx, d.BackingImage); pullErr != nil {
+				if pullErr := r.pullBackingImage(ctx, d.BackingImage); pullErr != nil {
+					if errors.Is(pullErr, errImagePullInProgress) {
+						// The walk's budget ran out first. The transfer is still
+						// running in the background; hand the VM back to pending
+						// so a later pass — one that finds the image present —
+						// finishes the start. Not a failure, so not
+						// failPendingStart: a legacy (proof-less) VM would be
+						// parked in error for a transfer that is going fine.
+						slog.Info("reconciler: backing image still transferring; the start resumes on a later pass",
+							"vm", vm.Name, "disk", d.DiskName, "image", d.BackingImage)
+						r.deferPendingStart(ctx, vm.Name, proofID,
+							fmt.Sprintf("waiting for backing image %s to finish transferring", d.BackingImage))
+						return
+					}
 					slog.Error("reconciler: auto-pull failed", "vm", vm.Name, "image", d.BackingImage, "error", pullErr)
 					r.failPendingStart(ctx, vm.Name, proofID, true, // transient: a peer may return
 						fmt.Sprintf("disk %s not found and image auto-pull failed: %v", d.DiskName, pullErr))
@@ -1371,6 +1430,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		return
 	}
 
+	if r.startDomainHook != nil {
+		r.startDomainHook(ctx)
+	}
 	if err := r.virt.StartDomain(vm.Name); err != nil {
 		releaseHW() // release any passthrough the preflight bound for this failed start
 		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
@@ -1387,18 +1449,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// still in_progress — NOT stranded: the reconcile "starting" case re-drives
 	// startPendingVM, whose already-running-domain branch retries CompleteVMStartProof
 	// until it lands (the marker safely blocks any re-start meanwhile).
+	// StartDomain is not context-bound, so past this line the GUEST IS RUNNING
+	// whatever the walk budget says. Recording that is no longer optional work
+	// the caller may cancel: a running guest whose row still reads "starting"
+	// is a VM the cluster cannot account for, and the reconcile retry only
+	// converges it a tick later — after the budget has already cost the lease.
+	commitCtx := context.WithoutCancel(ctx)
 	if proofID != "" {
 		// Routed through the minting chokepoint, which IS the hand-rolled
 		// write-through this block used to carry — same ordering, one
 		// implementation, and it gains the typed-nil guard and the
 		// ownership-moved check the hand-rolled version did not have.
-		if err := r.publishRunningMinted(ctx, vm.Name, func(ctx context.Context) error {
+		if err := r.publishRunningMinted(commitCtx, vm.Name, func(ctx context.Context) error {
 			return corrosion.CompleteVMStartProof(ctx, r.db, proofID, vm.Name, r.hostName)
 		}); err != nil {
 			slog.Error("reconciler: complete start proof did not apply after start — leaving 'starting' for the reconcile starting-case to retry",
 				"vm", vm.Name, "proof", proofID, "error", err)
 		}
-	} else if err := r.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
+	} else if err := r.publishRunning(commitCtx, vm.Name, "running", func(ctx context.Context) error {
 		return corrosion.UpdateVMState(ctx, r.db, vm.Name, "running", "started by reconciler after failover")
 	}); err != nil {
 		LogPublishRefusal("reconciler: post-failover running-state write failed", vm.Name, err)
@@ -1410,6 +1478,104 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// Notify LB to refresh backends now that this VM is running.
 	if r.onVMStarted != nil && vm.StackName != "" {
 		go r.onVMStarted(context.Background(), vm.StackName)
+	}
+}
+
+// pullBackingImage fetches a missing backing image through autoPullImage
+// without letting the walk's budget become the transfer's deadline.
+//
+// The transfer runs in a background flight keyed by image name, under
+// imagePullBudget rather than under ctx: reconcilePass bounds the walk with
+// reconcileWalkBudget so the safety sweeps behind it run on their tick, and a
+// transfer of a whole image is the one per-VM step that legitimately needs
+// longer than that. Handing it the walk's context cancelled every transfer
+// that outlived the budget, and since ImportImage discards its partial file on
+// cancellation, each pass restarted from zero — a VM with a large backing image
+// never recovered.
+//
+// The caller waits as long as ITS context allows. With no deadline (onboot,
+// the fleet harness) that is the whole transfer, exactly as before. Under the
+// walk budget it is the remainder of the budget, after which the caller gets
+// errImagePullInProgress, re-arms the VM as pending and moves on; the flight
+// keeps running, and a later pass joins it or finds the image already present
+// (autoPullImage short-circuits on a complete local copy).
+//
+// One flight per image: forty VMs on one lost host that share a base image
+// open one stream, not forty.
+func (r *Reconciler) pullBackingImage(ctx context.Context, imageName string) error {
+	fl := r.imagePullFlight(ctx, imageName)
+	select {
+	case <-fl.done:
+		return fl.err
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %v", errImagePullInProgress, ctx.Err())
+	}
+}
+
+// imagePullFlight returns the in-flight transfer of imageName, starting one if
+// none is running. The transfer's context keeps ctx's values (identity) but
+// not its cancellation: it is bounded by imagePullBudget alone.
+func (r *Reconciler) imagePullFlight(ctx context.Context, imageName string) *imagePullFlight {
+	r.pullMu.Lock()
+	defer r.pullMu.Unlock()
+	if fl, ok := r.pulls[imageName]; ok {
+		return fl
+	}
+	if r.pulls == nil {
+		r.pulls = make(map[string]*imagePullFlight)
+	}
+	fl := &imagePullFlight{done: make(chan struct{})}
+	r.pulls[imageName] = fl
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), imagePullBudget)
+	go func() {
+		defer cancel()
+		err := r.autoPullImage(pctx, imageName)
+		r.pullMu.Lock()
+		delete(r.pulls, imageName)
+		r.pullMu.Unlock()
+		fl.err = err
+		close(fl.done)
+	}()
+	return fl
+}
+
+// deferPendingStart records that a VM's start is waiting on something still in
+// progress, with the reason, in a state the next pass re-drives. Distinct from
+// failPendingStart: nothing failed, so the proof (if any) is left in_progress
+// for the same executor to re-claim, and a proof-less VM is NOT parked in
+// error.
+//
+// WHICH state depends on whether the start is an ownership transfer:
+//
+//   - With a proof it goes back to "pending". The marker (pending_action_id)
+//     stays on the row, so the re-drive re-validates and re-claims the same
+//     proof — the shape failPendingStart's retryable arm already produces.
+//   - Without a proof it stays in "starting". A proof-less start is a LOCAL
+//     recovery — onboot autostart, a domain that died under a running row —
+//     and under the split-brain gate a markerless PENDING row is refused as
+//     proof_missing, by design: the coordinator writes pending and its marker
+//     atomically, so pending without one is stale or hand-mutated. Deferring a
+//     local start into pending therefore refused it on every later pass, even
+//     after the image had finished — a VM permanently unstarted for having a
+//     large image. A markerless "starting" row is the documented shape of an
+//     interrupted local start, and the "starting" arm of reconcile re-drives it.
+//
+// Written on a context that survives the walk budget, which is usually already
+// spent by the time this runs.
+//
+// Two literal writes rather than one with a variable state: the runningcheck
+// guard proves statically that no write here can publish "running".
+func (r *Reconciler) deferPendingStart(ctx context.Context, vmName, proofID, detail string) {
+	cctx := context.WithoutCancel(ctx)
+	var err error
+	if proofID != "" {
+		err = corrosion.UpdateVMState(cctx, r.db, vmName, "pending", detail)
+	} else {
+		err = corrosion.UpdateVMState(cctx, r.db, vmName, "starting", detail)
+	}
+	if err != nil {
+		slog.Error("reconciler: re-arm pending write failed", "vm", vmName, "error", err)
+		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 }
 

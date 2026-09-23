@@ -944,6 +944,28 @@ conflicting holder, no in-flight migration/operation/lock/failover, and quorum
 or explicit fencing authorization. The evidence and decision must be durable
 before any stop is issued.
 
+### Gossip isolation (`gossip_isolated`)
+
+A node that has lost every gossip peer, and whose re-join attempts reach none
+of its seeds or admitted hosts, raises a `gossip_isolated` condition about
+**itself**. The subject is the host, keyed on the node's own name, so each row
+has exactly one writer. No leader could raise this one: a leader cannot see
+another node's gossip view, and an isolated node cannot reach the leader.
+
+| Raised when | Clears when |
+|---|---|
+| A re-join pass (every 30–45 s) finds no visible peers **and** fails to join any target. Observed on the first such pass, confirmed on the second. The evidence carries the last join error. **Warning** severity: an isolated node is how a workload can end up running in two places — its peers may fence it and restart its VMs — but the isolation is the precondition, not the corruption. | The first pass that sees a peer, or that re-joins successfully. No run of clean passes is needed: visible peers are positive evidence of membership, not an absence of evidence of isolation. A condition left open by a previous daemon process is resolved too. |
+
+**Where you can see it.** Run `lv health` on the isolated node itself — it
+reads its own local store and shows the condition immediately. Its peers see
+the row only after replication resumes, by which point it is normally resolved;
+`lv health --resolved` then shows the episode with its `first_seen` and
+`resolved_at`. From the peers' side, the live signal while the node is isolated
+is its connectivity edges going `suspect`.
+
+A single-node cluster with no seeds is never reported: it has nobody to be
+isolated from.
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

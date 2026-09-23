@@ -86,3 +86,45 @@ func TestUIRead_StillSurvivesATransientError(t *testing.T) {
 			"that locks operators out of the dashboard during a blip", w.Code)
 	}
 }
+
+// TestUIMutation_SelfServiceSurvivesAViewerRole is the other half of the fix.
+//
+// The gate used to hold EVERY mutation to operator. An external-realm user is
+// shadowed locally as "viewer" while their real authority lives in an RBAC
+// binding the daemon holds, so on an SSO cluster that refused every write in
+// the web UI while `lv` kept working. It also stopped an ordinary local viewer
+// changing their own password.
+func TestUIMutation_SelfServiceSurvivesAViewerRole(t *testing.T) {
+	mock := newDefaultMock()
+	mock.whoamiRole = "viewer"
+	s := newTestUIServer(t, mock)
+
+	w := serveRequest(s, authReq(t, "POST", "/account/password", url.Values{
+		"old_password": {"old"}, "new_password": {"new"},
+	}))
+
+	if w.Code == http.StatusForbidden {
+		t.Fatal("a viewer was refused their own password change; self-service carries no " +
+			"authority beyond the session that already authenticated")
+	}
+}
+
+// TestUIMutation_SecurityGroupWriteFailsClosedWithoutAnAuthorizer pins the
+// direction of the SG fallback.
+//
+// Security groups have no gRPC twin, so the handler calls the daemon's
+// authorizer directly. If that is not wired, the write must be REFUSED — an
+// unauthorized cluster-wide firewall change is worse than an unavailable page,
+// and a nil authorizer means the one component that can answer is absent.
+func TestUIMutation_SecurityGroupWriteFailsClosedWithoutAnAuthorizer(t *testing.T) {
+	mock := newDefaultMock() // admin
+	s := newTestUIServer(t, mock)
+	s.SetAuthorizer(nil) // simulate a build/wiring where it is absent
+	s.SetCorrosionDB(newCorrosionForUITest(t))
+
+	w := serveRequest(s, authReq(t, "POST", "/ui/security-groups", url.Values{"name": {"web"}}))
+
+	if w.Code == http.StatusOK {
+		t.Fatal("a security-group write landed with no authorizer wired; it must fail closed")
+	}
+}

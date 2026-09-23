@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -154,9 +155,11 @@ func (s *Server) handleCreateNotifyRoute(w http.ResponseWriter, r *http.Request)
 	if minSev == "" {
 		minSev = "info"
 	}
-	rid := randid.New()
-	if err := corrosion.InsertNotificationRoute(r.Context(), s.db, corrosion.NotificationRoute{
-		ID: rid, EventPattern: pattern, TargetID: target, MinSeverity: minSev, Enabled: true,
+	// Through the gRPC twin, not the local DB handle: a notification route is
+	// cluster state, and RequirePerm/RequireRole on the far side is the only
+	// thing that sees the caller's token scopes and RBAC bindings.
+	if _, err := s.grpc.CreateNotificationRoute(s.uiBearerCtx(r), &pb.CreateNotificationRouteRequest{
+		EventPattern: pattern, TargetId: target, MinSeverity: minSev, Enabled: true,
 	}); err != nil {
 		sendToast(w, "create failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -173,9 +176,10 @@ func (s *Server) handleDeleteNotifyRoute(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if err := corrosion.DeleteNotificationRoute(r.Context(), s.db, r.PathValue("id")); err != nil {
+	if _, err := s.grpc.DeleteNotificationRoute(s.uiBearerCtx(r),
+		&pb.DeleteNotificationRouteRequest{Id: r.PathValue("id")}); err != nil {
 		sendToast(w, "delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Route deleted", "success")

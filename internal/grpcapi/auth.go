@@ -707,6 +707,28 @@ func scopesIncludeRoot(scopes []string) bool {
 	return false
 }
 
+// AuthorizeInProcess resolves the credential carried in ctx exactly as the
+// gRPC interceptor does, then applies RequirePerm to it.
+//
+// It exists for the web UI, whose write handlers reach the replicated DB
+// IN-PROCESS instead of through gRPC, so nothing authorizes them. The UI used
+// to re-derive its own answer from the coarse role string in WhoamiResponse,
+// which was wrong in both directions at once: it ignored token scope paths, so
+// a token deliberately scoped to /projects/acme could flip the CLUSTER default
+// firewall policy; and it ignored RBAC bindings, so every external-realm user
+// -- shadowed locally as "viewer" -- was refused every mutation even when
+// bound to Admin.
+//
+// Both follow from having two authorization implementations. This gives the UI
+// the daemon's own, so there is one.
+func (s *Server) AuthorizeInProcess(ctx context.Context, path, verb, fallbackRole string) error {
+	authed, err := s.authenticate(ctx)
+	if err != nil {
+		return err
+	}
+	return s.RequirePerm(authed, path, verb, fallbackRole)
+}
+
 // RequirePerm checks whether the caller may perform `verb` at `path` in
 // the path-based RBAC model. transitional contract:
 //

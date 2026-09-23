@@ -1385,6 +1385,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// pages (security-groups, etc.) can query cluster state without
 		// adding a dedicated gRPC RPC for every list view.
 		uiSrv.SetCorrosionDB(d.db)
+		// The authorizer for the write paths with no gRPC twin (security
+		// groups). Without it those writes fail closed.
+		uiSrv.SetAuthorizer(d.svc)
 		uiSrv.SetBackupRepos(d.cfg.BackupRepos)
 		uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
 		// ACME (#13): when enabled, terminate UI TLS via autocert (step-ca / LE)

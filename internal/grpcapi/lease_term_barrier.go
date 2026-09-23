@@ -196,11 +196,21 @@ func (s *Server) storeLeaseThreshold(key string, threshold int64) {
 	// that legitimately drops from 6 to 4 — the peer holding 6 became
 	// unreachable — would then refuse term-5 proofs forever — and the TTL, whose entire purpose is to bound exactly that
 	// window, would bound nothing. Read expiry here or the constant is decorative.
+	at := time.Now()
 	if e, ok := s.leaseBarrierCache[key]; ok &&
 		time.Since(e.at) <= leaseBarrierCacheTTL && e.threshold > threshold {
 		threshold = e.threshold
+		// Keep the RETAINED value's own timestamp. Re-stamping it renews a
+		// threshold nothing re-observed: every accept pays for a fresh sweep,
+		// so with traffic arriving faster than the TTL each lower observation
+		// would clamp up and reset the clock, and a threshold that legitimately
+		// dropped from 6 to 4 -- the peer holding 6 became unreachable -- would
+		// refuse term-5 proofs forever instead of for the documented TTL. The
+		// expiry check above then bounds nothing, because the entry can never
+		// reach it.
+		at = e.at
 	}
-	s.leaseBarrierCache[key] = leaseBarrierEntry{threshold: threshold, at: time.Now()}
+	s.leaseBarrierCache[key] = leaseBarrierEntry{threshold: threshold, at: at}
 }
 
 // sweepLeaseTermHighWater asks a quorum of live hosts for their newest term for
@@ -342,7 +352,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 
 	silent := s.recentlySilentPeers(peers)
 
-	highest, answers, answered := s.fanOutHighWater(sctx, key, local, peers, silent)
+	highest, answers, answered := s.fanOut(sctx, key, local, peers, silent)
 
 	// A MISSING ANSWER must never be caused by our own shortcut. This used to
 	// repair only on a quorum shortfall (`answers < needed`), which left the one
@@ -373,8 +383,19 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 		// one full-price chance per memo window, so a dead peer cannot buy a
 		// second budget on every sweep.
 		rctx, rcancel := context.WithTimeout(ctx, leaseBarrierBudget)
-		highest, answers, answered = s.fanOutHighWater(rctx, key, local, peers, nil)
+		repaired, rAnswers, rAnswered := s.fanOut(rctx, key, local, peers, nil)
 		rcancel()
+		// The repair's answers and coverage replace the first pass's -- it asked
+		// strictly more peers. Its HIGH-WATER does not: a term this node has
+		// already seen cannot be un-seen by a later round that failed to reach
+		// the peer holding it. The first sweep can observe term 9 from a peer
+		// that goes unreachable before the repair, and taking the repair's 4
+		// would admit a term-5 proof this node had directly observed to be
+		// superseded -- the exact admission the barrier exists to refuse.
+		if repaired > highest {
+			highest = repaired
+		}
+		answers, answered = rAnswers, rAnswered
 		s.noteFullyProbed(peers, answered)
 	}
 
@@ -414,6 +435,23 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 // for a periodic capability check; here it would serialise one timeout per
 // unreachable peer up to the whole budget, on the recovery path. The peer count
 // is already bounded by the host table.
+// fanOutFn replaces the peer fan-out in tests. Nil in production.
+//
+// The seam is here rather than on dialPeer because the property that needs
+// covering is about the TWO ROUNDS of a sweep disagreeing -- a peer that
+// answers in the first and is gone by the repair -- which is a property of
+// runLeaseTermSweep, not of any one dial.
+var fanOutFn func(ctx context.Context, key string, local int64, peers []string, silent map[string]bool) (int64, int, map[string]bool)
+
+func (s *Server) fanOut(
+	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
+) (int64, int, map[string]bool) {
+	if fanOutFn != nil {
+		return fanOutFn(ctx, key, local, peers, silent)
+	}
+	return s.fanOutHighWater(ctx, key, local, peers, silent)
+}
+
 func (s *Server) fanOutHighWater(
 	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
 ) (highest int64, answers int, answered map[string]bool) {

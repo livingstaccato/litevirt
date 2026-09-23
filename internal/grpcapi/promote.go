@@ -952,7 +952,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// nothing here mints a generation. Without this the row is born running
 		// at epoch 0 and stays there — convergence early-returns on zero and the
 		// backfill is off by default.
-		s.assignOwnerEpochAtCreate(ctx, targetName)
+		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).
 		if err := s.publishRunningMinted(ctx, targetName, func(ctx context.Context) error {

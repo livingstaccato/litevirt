@@ -643,7 +643,7 @@ func TestPublishVMRunningMinted_RetriesTheReadBack(t *testing.T) {
 			if calls == 1 {
 				return nil, errors.New("database is locked")
 			}
-			return &corrosion.VMRecord{Name: "vm1", HostName: "node-a", OwnerEpoch: 4}, nil
+			return &corrosion.VMRecord{Name: "vm1", HostName: "node-a", State: "running", OwnerEpoch: 4}, nil
 		},
 		func(context.Context) error { return nil })
 	if err != nil {

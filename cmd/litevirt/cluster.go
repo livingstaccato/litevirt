@@ -57,6 +57,12 @@ principal, the key and the term.
 Node-local: acknowledge on EVERY host the condition names, pointing LV_HOST at each in
 turn. Requires the cluster.lww.acknowledge verb (held by Operator and Admin).
 
+More than two claims needs more than one run per host. An acknowledgement answers ONE
+observed pair, and a host compares itself with one peer at a time, so a row contested by
+N nodes presents N-1 distinct disagreements from any one seat. Each run answers whichever
+is currently tracked; re-run until 'lv health' stops naming the host. Answers accumulate
+rather than replacing each other, so runs cannot undo one another.
+
   --key    which lease: failover, rebalancer, dual_run_detector
   --term   the contested term, as reported by the health condition
 

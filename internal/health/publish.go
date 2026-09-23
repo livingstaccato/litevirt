@@ -34,6 +34,23 @@ import (
 // DomainEpochSetter is the one libvirt method a marker write needs. Narrowed to
 // a single method so *grpcapi.Server's backend, the Reconciler's interface,
 // *libvirt.Client and libvirtfake all satisfy it without an adapter.
+// markAfterCommitTimeout bounds the detached marking that follows a committed
+// minting transition.
+//
+// This is the CALLER's wait, not a background budget: everything after the
+// commit runs on the caller's goroutine, and for CutoverVM that goroutine holds
+// two per-VM locks. Detaching from the caller's context is right — the commit
+// has landed and a client ^C must not decide whether the VM is provable — but
+// detaching with a generous budget replaced "fail fast when the caller is gone"
+// with a multi-second stall, which is the uninterruptible wait the rest of this
+// change set removed.
+//
+// Sized to the work, not to patience: one row read and two small marker writes.
+// A store that has not answered in five seconds is not going to be rescued by
+// twenty-five more, and the reconciler repairs a missing marker on its next
+// sweep anyway.
+const markAfterCommitTimeout = 5 * time.Second
+
 type DomainEpochSetter interface {
 	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
 }
@@ -108,8 +125,26 @@ type markerResult struct {
 }
 
 // unproven reports that the VM ends up able to prove nothing — no marker landed
-// and none was skipped by design. That is what mark-then-commit refuses.
+// and none was skipped by design.
 func (r markerResult) unproven() bool { return !r.skipped && !r.landed }
+
+// impossible reports that marking was never ATTEMPTED: no usable libvirt backend
+// and no data directory. That is a configuration in which no marker can ever be
+// written, so committing a running row at a positive generation would prove
+// nothing permanently, with nothing able to repair it.
+//
+// It is deliberately narrower than unproven, and the difference is the whole
+// point. unproven is also true when both writes were attempted and both FAILED —
+// which one correlated fault produces, a full or read-only root failing the
+// domain metadata write and the file write together. Refusing there reintroduced
+// exactly the wedge the single-failure path argues against ("refusing would wedge
+// this host's rows while its guests run"): the row stays at its old state while
+// the guest runs, and the dual-run detector suppresses that indefinitely. A fault
+// clears and convergence repairs the marker afterwards; a configuration never
+// does, and only the second is grounds to refuse.
+func (r markerResult) impossible() bool {
+	return !r.skipped && !r.domainAttempted && !r.fileAttempted
+}
 
 // failures joins whatever went wrong, for a log line. Nil when both markers
 // landed or the write was skipped.
@@ -185,19 +220,40 @@ func PublishVMRunning(ctx context.Context, virt DomainEpochSetter, dataDir, name
 			"vm", name)
 		return commit(ctx)
 	}
-	if res.unproven() {
-		// Either both writes failed, or neither was POSSIBLE — a nil libvirt
-		// backend together with an empty dataDir. The second case returned
-		// (nil, nil) before and committed a running row at a positive generation
-		// with no marker and no warning: the exact "proves nothing" state this
-		// ordering exists to refuse, reached by a configuration rather than a
-		// fault, and therefore silent every time.
-		if err := res.failures(); err != nil {
-			return err
-		}
+	if res.impossible() {
+		// Neither write was POSSIBLE — a nil libvirt backend together with an
+		// empty dataDir. This used to return (nil, nil) and commit a running row
+		// at a positive generation with no marker and no warning: the exact
+		// "proves nothing" state this ordering exists to refuse, reached by a
+		// configuration rather than a fault, and therefore silent every time.
 		return fmt.Errorf("refusing to publish %q running at generation %d: no owner-epoch marker "+
 			"could be written (no usable libvirt backend and no data directory), so the runtime "+
 			"would be unprovable", name, epoch)
+	}
+	if res.unproven() {
+		// Attempted, and every attempt failed. The refusal STANDS — publishing a
+		// running row that proves nothing is the state this ordering exists to
+		// prevent, and one landed marker is the whole reason the single-failure
+		// path below may proceed where this one may not.
+		//
+		// What changes is that it is no longer quiet. Both writes failing together
+		// is not two coincidences: it is one correlated fault, a full or
+		// read-only volume taking out the domain metadata write and the file
+		// write at once. Refusing then holds the row at its previous state while
+		// the guest runs, the caller retries, and the dual-run detector suppresses
+		// the result — so without this line an operator sees a VM that never
+		// finishes starting and no cause anywhere.
+		slog.Error("publish: NO owner-epoch marker landed, so this running transition is "+
+			"REFUSED and will keep being refused until the cause clears. Both writes failing "+
+			"together usually means one fault under both — check this host's disk for a full "+
+			"or read-only volume",
+			"vm", name, "epoch", epoch,
+			"domain_error", res.domainErr, "file_error", res.fileErr)
+		if err := res.failures(); err != nil {
+			return err
+		}
+		return fmt.Errorf("refusing to publish %q running at generation %d: no owner-epoch "+
+			"marker landed", name, epoch)
 	}
 	if err := res.failures(); err != nil {
 		slog.Warn("publish: one owner-epoch marker did not land before a running commit — "+
@@ -240,6 +296,16 @@ func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir
 	if err := commit(ctx); err != nil {
 		return err
 	}
+	// DETACHED from here on, and for the reason assignOwnerEpochAtCreate gives
+	// for detaching its own: the commit above HAS landed, so a client ^C or an
+	// RPC deadline that expired during it must not decide whether the VM is
+	// provable. On the caller's context the read below failed instantly with
+	// context.Canceled, and because that failure is deliberately silent (see
+	// the cases after it) the markers for a generation that exists were dropped
+	// with nothing reaching anyone. The retry policy could not help: a cancelled
+	// context fails every attempt immediately.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), markAfterCommitTimeout)
+	defer cancel()
 	// RETRIED, with the same policy as the reads that guard the non-minting
 	// commits. This is the one read that decides whether a freshly minted
 	// generation is ever marked, and its failure is deliberately silent (below),
@@ -264,6 +330,35 @@ func publishVMRunningMinted(ctx context.Context, virt DomainEpochSetter, dataDir
 	if hostName != "" && row.HostName != hostName {
 		slog.Warn("publish: ownership moved during a minting transition — leaving the markers to the new owner",
 			"vm", name, "epoch", row.OwnerEpoch, "owner", row.HostName, "self", hostName)
+		return nil
+	}
+	// Markers are for a RUNNING runtime, and the minting path has to say so as
+	// explicitly as PublishVMRunning does. writeBothMarkers leans on it — "Only
+	// ever called for a RUNNING publish, which is why the domain write takes
+	// running=true" — and this twin had no gate at all: a stopped cutover fired
+	// SetDomainOwnerEpoch(name, epoch, true) at an inactive domain, which
+	// libvirt rejects, and still wrote a file marker claiming a generation owns
+	// a runtime that is not there.
+	//
+	// Gated on the state the COMMIT produced, read back here — NOT on a value
+	// the caller carried in. CutoverVM reads nextVM.State before the entire
+	// teardown while ReplaceVM writes the state it re-reads at commit time, so
+	// the caller's value can be stale in both directions. Trusting it let a
+	// commit that landed RUNNING skip its markers, leaving the row at a new
+	// generation with nothing naming it — the exact window this chokepoint
+	// exists to close, reached through the chokepoint itself.
+	//
+	// SKIPPED, never removed. This read is taken up to markAfterCommitTimeout
+	// after the commit, so a concurrent local writer can move the row inside the
+	// window — which is the same untrustworthiness the caller's value had, in
+	// the other direction. Skipping a marker write on a wrong answer is a no-op
+	// that convergence repairs; DELETING a marker on one takes a live VM's proof
+	// away. A stale marker left by a replacement is NOT cleared here or
+	// anywhere else, and that is deliberate rather than an omission:
+	// runtimeSuperseded reads an ABSENT marker as "not superseded", so removing
+	// one turns a refused self-heal restart into a permitted one. The whole
+	// argument lives at finishVMReplaceRuntime's non-running branch.
+	if row.State != "running" {
 		return nil
 	}
 	if res := writeBothMarkers(virt, dataDir, name, row.OwnerEpoch); res.failures() != nil || res.unproven() {

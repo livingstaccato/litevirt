@@ -34,6 +34,8 @@ import (
 
 // Server implements the LiteVirt gRPC service.
 type Server struct {
+	// reseeding admits one local reseed at a time; see reseed_singleflight.go.
+	reseeding reseedInFlight
 	pb.UnimplementedLiteVirtServer
 
 	hostName string
@@ -85,6 +87,7 @@ type Server struct {
 	// name" — see netboxsync.ClusterName, which is the single place that
 	// resolves it for both the mirror and the CA re-key.
 	netboxClusterName string
+	netboxSite        string
 
 	// defaultCPUModeCfg is the node's `vm.default_cpu_mode` — the cpu_mode a
 	// create materializes into a spec that did not name one. Empty means
@@ -957,6 +960,10 @@ func (s *Server) SetNetBoxClient(c *netbox.Client) { s.netbox = c }
 // strands everything written under the previous one.
 func (s *Server) SetNetBoxClusterName(name string) { s.netboxClusterName = name }
 
+// SetNetBoxSite sets the NetBox site the cluster is scoped to (config
+// `netbox.site`). Empty leaves the cluster's scope unmanaged.
+func (s *Server) SetNetBoxSite(name string) { s.netboxSite = name }
+
 // operationProtocolActive reports whether this node relies on + enforces the v41
 // operation protocol: the config flag AND the cluster-wide latch. Same
 // `flag && Enforced` model as the rest of the family.
@@ -1258,7 +1265,22 @@ func (s *Server) persistVMStateDirect(ctx context.Context, name, state, detail, 
 		if errors.Is(err, corrosion.ErrNoRowsAffected) {
 			break
 		}
-		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+		// Interruptible. time.Sleep here meant a caller that had already gone
+		// away, or a shutdown, still waited out the whole 600ms backoff for a
+		// write nobody was going to read the result of — the same uncancellable
+		// wait the chokepoint's read half was rewritten to remove.
+		select {
+		case <-ctx.Done():
+			// COUNTED before returning. Returning straight out skipped
+			// noteStateWriteFail below, and persistVMState's own `!committed`
+			// guard cannot cover it either — so a write dropped to a shutdown or
+			// an expired deadline was recorded nowhere, against a flat failure
+			// total, during exactly the fleet-wide shutdown WriteClassCancelled
+			// was added to make visible.
+			s.noteStateWriteFail(op, ctx.Err())
+			return ctx.Err()
+		case <-time.After(time.Duration(attempt+1) * 100 * time.Millisecond):
+		}
 	}
 	s.noteStateWriteFail(op, err)
 	return err
@@ -2020,4 +2042,19 @@ func (s *Server) allocatorFor(ctx context.Context, ownerKind, netName string) (n
 			"network %q is bound to a NetBox prefix but this node has no netbox configuration", netName)
 	}
 	return network.NewNetBoxAllocator(s.db, s.netbox, s.nbMetrics()), b, nil
+}
+
+// releaseOnce makes a lock release safe to call more than once, so a handler can
+// release BEFORE forwarding to a peer and still `defer` the release for every
+// other path.
+//
+// The per-VM lock must not be held across a peer RPC. lockVM returns a plain
+// sync.Mutex release with no context, so waiting on it cannot be interrupted:
+// holding it across a forward pins that VM's lock for the whole remote call, and
+// on divergent vms.host_name replicas — A thinks B owns it, B thinks A does — the
+// two nodes lock, call each other, and each blocks forever on the mutex it
+// already holds. Neither call returns and the VM is wedged.
+func releaseOnce(unlock func()) func() {
+	var once sync.Once
+	return func() { once.Do(unlock) }
 }

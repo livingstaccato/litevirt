@@ -103,6 +103,22 @@ func f() {
 }`, "a minting write in the minted helper")
 }
 
+// A NON-minting write inside the MINTED helper is a family mismatch, and the
+// rule that reports it had no fixture at all — which is the same defect it was
+// added to fix. The minted helper marks AFTER its commit, which is right for a
+// statement that advances the generation and wrong for one that does not: the
+// marker is written from a read-back that never moved, so the row says running
+// at its OLD generation with the marker agreeing, and the window the chokepoint
+// exists to close is left open by the chokepoint itself.
+func TestNonMintingThroughTheMintedHelperIsReported(t *testing.T) {
+	wantOne(t, `
+func f() {
+	s.publishRunningMinted(ctx, name, func(ctx context.Context) error {
+		return corrosion.UpdateVMState(ctx, db, "vm1", "running")
+	})
+}`, "NON-MINTING write routed through the MINTED helper", "a non-minting write in the minted helper")
+}
+
 // TestMintingHandoffOfAStoppedVMIsExempt: a transfer that hands over a stopped
 // VM publishes no runtime, so there is nothing to mark.
 func TestMintingHandoffOfAStoppedVMIsExempt(t *testing.T) {
@@ -160,8 +176,57 @@ func f() {
 	corrosion.InsertVMWithHardware(ctx, db, corrosion.VMRecord{
 		Name: "vm1", State: "running",
 	}, nil, nil, nil, nil, false)
-	s.assignOwnerEpochAtCreate(ctx, "vm1")
+	s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 }`, "a graduated born-running insert")
+}
+
+// A graduation call that stamps NOTHING does not graduate anything.
+//
+// assignOwnerEpochAtCreate gained a `running` parameter and returns before the
+// runtime markers when it is false. This rule matched the call by NAME only, so
+// the false form sitting beside a born-RUNNING insert satisfied it: the row
+// lands running, no markers are written, and the build passes. The fixtures
+// here still used the old two-argument shape, so nothing forced the rule to be
+// revisited when the signature moved.
+func TestBornRunningInsertIsNotGraduatedByANonRunningStamp(t *testing.T) {
+	wantOne(t, `
+func f() {
+	corrosion.InsertVMWithHardware(ctx, db, corrosion.VMRecord{
+		Name: "vm1", State: "running",
+	}, nil, nil, nil, nil, false)
+	s.assignOwnerEpochAtCreate(ctx, "vm1", false)
+}`, "born at", "a born-running insert graduated with running=false")
+}
+
+// The three-argument form with a live value still graduates.
+func TestBornRunningInsertGraduatedWithARunningStampIsAccepted(t *testing.T) {
+	wantNone(t, `
+func f() {
+	corrosion.InsertVMWithHardware(ctx, db, corrosion.VMRecord{
+		Name: "vm1", State: state,
+	}, nil, nil, nil, nil, false)
+	s.assignOwnerEpochAtCreate(ctx, "vm1", state == "running")
+}`, "a born-running insert graduated with a live running flag")
+}
+
+// ReplaceVM commits a state it re-reads, so it must route no matter what any
+// argument says. It had no fixture at all, and its entry was mislabelled
+// alwaysRunning — "hardcodes state='running'" — which is the one claim the
+// minted publish's read-back change exists to contradict.
+func TestReplaceVMMustRouteThroughTheMintedHelper(t *testing.T) {
+	wantOne(t, `
+func f() {
+	corrosion.ReplaceVM(ctx, db, next, name, prepared)
+}`, "not routed through publishRunningMinted", "an unrouted ReplaceVM")
+}
+
+func TestReplaceVMThroughTheMintedHelperIsAccepted(t *testing.T) {
+	wantNone(t, `
+func f() {
+	s.publishRunningMinted(ctx, name, func(ctx context.Context) error {
+		return corrosion.ReplaceVM(ctx, db, next, name, prepared)
+	})
+}`, "a routed ReplaceVM")
 }
 
 // TestStoppedInsertNeedsNoGraduation: a stopped row has no runtime to prove,
@@ -279,7 +344,7 @@ func TestSecondBornRunningInsertNeedsItsOwnGraduation(t *testing.T) {
 func f() {
 	if renamed {
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "a", State: "running"}, nil, nil)
-		s.assignOwnerEpochAtCreate(ctx, "a")
+		s.assignOwnerEpochAtCreate(ctx, "a", true)
 	} else {
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "b", State: "running"}, nil, nil)
 	}
@@ -293,10 +358,10 @@ func TestPerBranchGraduationIsAccepted(t *testing.T) {
 func f() {
 	if renamed {
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "a", State: "running"}, nil, nil)
-		s.assignOwnerEpochAtCreate(ctx, "a")
+		s.assignOwnerEpochAtCreate(ctx, "a", true)
 	} else {
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "b", State: "running"}, nil, nil)
-		s.assignOwnerEpochAtCreate(ctx, "b")
+		s.assignOwnerEpochAtCreate(ctx, "b", true)
 	}
 }`, "per-branch graduation")
 }
@@ -530,7 +595,7 @@ func f() {
 	switch mode {
 	case "clone":
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm1", State: "running"}, nil, nil)
-		s.assignOwnerEpochAtCreate(ctx, "vm1")
+		s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 	case "restore":
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm2", State: "running"}, nil, nil)
 	}
@@ -545,10 +610,10 @@ func f() {
 	switch mode {
 	case "clone":
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm1", State: "running"}, nil, nil)
-		s.assignOwnerEpochAtCreate(ctx, "vm1")
+		s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 	case "restore":
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm2", State: "running"}, nil, nil)
-		s.assignOwnerEpochAtCreate(ctx, "vm2")
+		s.assignOwnerEpochAtCreate(ctx, "vm2", true)
 	}
 }`, "every switch case graduating its own insert")
 }
@@ -561,7 +626,7 @@ func f() {
 	select {
 	case <-a:
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm1", State: "running"}, nil, nil)
-		s.assignOwnerEpochAtCreate(ctx, "vm1")
+		s.assignOwnerEpochAtCreate(ctx, "vm1", true)
 	case <-b:
 		corrosion.InsertVM(ctx, db, corrosion.VMRecord{Name: "vm2", State: "running"}, nil, nil)
 	}

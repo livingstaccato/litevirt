@@ -388,7 +388,19 @@ import (
 //	     unproduced key does the same thing against a real ledger that happens
 //	     to be idle.
 //	     One additive column, appended LAST for the same digest reason as v53.
-const CurrentSchemaVersion = 54
+//	v55: the fenced-claim guard stops reading replicated evidence —
+//	     local_term_bindings (node-local, never in tableNames, so no peer
+//	     replicates it) records which coordinator bound an executor at a term.
+//	     The guard used to read runtime_action_proofs, which any cluster member
+//	     can write: a few hundred rows naming a victim as executor_host across a
+//	     range of terms made every legitimate fenced claim on that host look
+//	     conflicted — a remote, durable denial of recovery written as ordinary
+//	     replicated data. Also idx_proofs_term_claimant on
+//	     runtime_action_proofs(executor_host, lease_key, lease_term), which is
+//	     deliberately PLAIN rather than partial on deleted_at: the guard counts
+//	     tombstones too, so a `WHERE deleted_at IS NULL` index would not serve
+//	     the query and the scan would grow with every proof ever written.
+const CurrentSchemaVersion = 55
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -421,16 +433,82 @@ const appliedMigrationsDDL = `CREATE TABLE IF NOT EXISTS applied_migrations (
 // not a remedy; the register plus this table is.
 //
 // content_pair is part of the identity, not just the payload: an acknowledgement
-// describes ONE observed divergence. A different divergence on the same row must
-// still surface, so a changed pair supersedes the row rather than matching it.
+// describes ONE observed divergence, so a different divergence on the same row
+// must still surface.
+//
+// It is therefore IN THE PRIMARY KEY. Keying on (table_name, pk) alone made the
+// identity aspirational: each acknowledgement overwrote the last, so a row could
+// hold exactly one answered pair at a time. That is sufficient while divergences
+// arrive one after another — the two-node tie this was built for — and wrong the
+// moment several are live at once. Four nodes each minting one lease term gives
+// every node three simultaneous disagreements under one PK; acknowledging the
+// second erased the answer to the first, anti-entropy re-raised it on the next
+// sweep, and ha.lww.unresolved could never clear. The operator saw "Acknowledged"
+// and an audit row each time, and nothing changed. Found on the 4-node lab.
+//
+// Rows accumulate rather than being pruned, and that is deliberate — the same
+// reasoning the in-memory register already relied on. A stale acknowledgement is
+// inert, because suppression demands an exact pair match; and if its pair is ever
+// observed again, the operator answered for precisely that. Growth is bounded by
+// the number of distinct divergences a row has genuinely had, which for an N-way
+// collision is O(N) and in the ordinary case is one.
 const acknowledgedTiesDDL = `CREATE TABLE IF NOT EXISTS acknowledged_ties (
 	table_name      TEXT NOT NULL,
 	pk              TEXT NOT NULL,
 	content_pair    TEXT NOT NULL,
 	acknowledged_at TEXT NOT NULL,
 	acknowledged_by TEXT NOT NULL DEFAULT '',
-	PRIMARY KEY (table_name, pk)
+	PRIMARY KEY (table_name, pk, content_pair)
 )`
+
+// migrateAcknowledgedTiesPK widens an existing table's primary key to include
+// content_pair. SQLite cannot ALTER a primary key, so the table is rebuilt.
+//
+// This sits outside the migration ledger on purpose: acknowledged_ties is
+// local-only and is created before the ledger loads, so there is no replicated
+// statement shape and no schema version to carry. Every node fixes its own copy
+// on the next start.
+//
+// Copying cannot conflict. The old key admitted one row per (table_name, pk),
+// which is a strict subset of what the new key admits.
+func (c *Client) migrateAcknowledgedTiesPK(ctx context.Context) error {
+	info, err := c.Query(ctx, `PRAGMA table_info(acknowledged_ties)`)
+	if err != nil {
+		return fmt.Errorf("inspect acknowledged_ties: %w", err)
+	}
+	for _, r := range info {
+		// A non-zero pk ordinal means the column is part of the primary key.
+		if r.String("name") == "content_pair" && r.Int("pk") > 0 {
+			return nil
+		}
+	}
+	if len(info) == 0 {
+		return nil // no such table; the DDL above will have created it
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE acknowledged_ties_new (
+			table_name      TEXT NOT NULL,
+			pk              TEXT NOT NULL,
+			content_pair    TEXT NOT NULL,
+			acknowledged_at TEXT NOT NULL,
+			acknowledged_by TEXT NOT NULL DEFAULT '',
+			PRIMARY KEY (table_name, pk, content_pair)
+		)`,
+		`INSERT INTO acknowledged_ties_new
+		   (table_name, pk, content_pair, acknowledged_at, acknowledged_by)
+		 SELECT table_name, pk, content_pair, acknowledged_at, acknowledged_by
+		   FROM acknowledged_ties`,
+		`DROP TABLE acknowledged_ties`,
+		`ALTER TABLE acknowledged_ties_new RENAME TO acknowledged_ties`,
+	} {
+		if err := c.execLocal(ctx, stmt); err != nil {
+			return fmt.Errorf("rebuild acknowledged_ties: %w", err)
+		}
+	}
+	slog.Info("acknowledged_ties: primary key widened to include content_pair; " +
+		"several live divergences on one row can now each be acknowledged")
+	return nil
+}
 
 // InitSchema brings the local SQLite DB up to this binary's schema. DDL is not
 // broadcast — each node migrates its own DB on startup.
@@ -477,6 +555,15 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// anti-entropy sweep can land well before the first operator query.
 	if err := c.execLocal(ctx, acknowledgedTiesDDL); err != nil {
 		return fmt.Errorf("create acknowledged_ties: %w", err)
+	}
+	if err := c.execLocal(ctx, reseedInProgressDDL); err != nil {
+		return fmt.Errorf("create reseed_in_progress: %w", err)
+	}
+	if err := c.execLocal(ctx, reseedGenerationDDL); err != nil {
+		return fmt.Errorf("create reseed_generation: %w", err)
+	}
+	if err := c.migrateAcknowledgedTiesPK(ctx); err != nil {
+		return err
 	}
 	if err := c.loadAcknowledgedTies(ctx); err != nil {
 		return fmt.Errorf("load acknowledged_ties: %w", err)
@@ -2942,6 +3029,7 @@ var createTableUnits = []struct {
 	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
 	{51, "netbox_host_config"},
 	{52, "leader_lease_terms"},
+	{55, "local_term_bindings"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

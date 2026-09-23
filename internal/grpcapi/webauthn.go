@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -87,10 +86,7 @@ func (s *Server) FinishWebAuthnLogin(ctx context.Context, req *pb.FinishWebAuthn
 		return nil, status.Error(codes.InvalidArgument, "assertion_json is required")
 	}
 
-	clientIP := ""
-	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
-		clientIP = p.Addr.String()
-	}
+	clientIP := throttleClientIP(ctx)
 	// Share the brute-force lockout with password Login (keyed on username+IP).
 	throttleKey := loginThrottleKey(req.Username, clientIP)
 	if wait := s.loginThrottle.retryAfter(throttleKey); wait > 0 {

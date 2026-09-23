@@ -102,6 +102,9 @@ func (p ProofRecord) Terminal() bool {
 // batch, so the proof is linked to that exact pending transition — never matched
 // by a weak tuple. Used by the failover coordinator at the decide site.
 func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost string) error {
+	if err := proofStampEmittable(c, p); err != nil {
+		return err
+	}
 	now := c.NowTS()
 	// Guard: only mint the proof + stamp the pending link if the VM row still
 	// exists (not deleted) AND no proof already carries this id — so we never
@@ -155,6 +158,9 @@ func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
 	// statically, and handing it `st.SQL` makes the builder dynamic and
 	// unregisterable — correctly refused, since a shape it cannot see is a shape
 	// that could back-pressure a peer.
+	if err := proofStampEmittable(c, p); err != nil {
+		return err
+	}
 	now := c.NowTS()
 	if c.MayEmitTermCarryingProof() {
 		return c.Execute(ctx, insertProofSQL, proofInsertParams(p, now)...)
@@ -162,18 +168,18 @@ func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
 	return c.Execute(ctx, insertProofPreTermSQL, proofInsertParamsPreTerm(p, now)...)
 }
 
+// ErrTermStampNotEmittable means the proof carries a lease-term stamp and this
+// node may not yet put the term-carrying insert shape on the wire (its
+// lease_term_ledger_v1 latch has not formed), so persisting it would strip the
+// stamp. Retryable: the latch forms from the same peer set the coordinator's
+// did.
+var ErrTermStampNotEmittable = errors.New("proof carries a lease-term stamp this node cannot yet emit; retry once the ledger latch forms")
+
 // ErrProofDiverges means a row with this id already exists and disagrees with
 // the presented proof on a field that AUTHORIZES the action. Distinct from
 // ErrNoRowsAffected so a caller can refuse with FailedPrecondition rather than
 // retrying.
 var ErrProofDiverges = errors.New("a persisted proof with this id disagrees with the presented one")
-
-// ErrProofTermUnrecordable: this node validated a term-carrying proof it cannot
-// store faithfully, because its own emit gate is closed and the pre-term insert
-// shape would drop the term. Deliberately DISTINCT from ErrProofDiverges, which
-// asserts a real conflict between two proofs -- blaming a divergence that has
-// not happened sends an operator looking for a split-brain that does not exist.
-var ErrProofTermUnrecordable = errors.New("proof lease term cannot be recorded on this node")
 
 // ProofBindingEqual compares the fields that AUTHORIZE an action.
 //
@@ -233,35 +239,6 @@ func ProofBindingEqual(a, b ActionProof) bool {
 // must match a live one; whether a SPENT proof may be re-used is
 // ClaimActionProof's question, and it has its own deleted_at filter.
 func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) error {
-	// Refuse a binding this node cannot record.
-	//
-	// The validation below compares the presented proof's lease_term/lease_key
-	// against any existing row, and then the seed goes through proofInsertStmt
-	// -- which swaps in insertProofPreTermSQL when this node's emit gate is
-	// closed, omitting BOTH columns so the row lands at the NOT NULL defaults
-	// (0, ""). Reporting success there stores something OTHER than what was
-	// checked.
-	//
-	// It is not an exotic state: the gate is per-node
-	// (MayEmitTermCarryingProof == MayMintLeaseTerm, wired to DurablyLatched),
-	// so a staggered roll routinely has a latched coordinator forwarding a
-	// term-carrying proof to a peer that has not latched. The coordinator's
-	// identical RETRY then re-presents (5, "failover") against the persisted
-	// (0, ""), ProofBindingEqual is false, and the caller is told the proof
-	// diverges -- breaking the idempotent-retry contract stated above and
-	// blaming a divergence that never happened.
-	//
-	// Seeding the term anyway is not the alternative: insertProofPreTermSQL
-	// exists because a peer on the previous release cannot resolve the
-	// term-carrying shape, and an unregistered shape back-pressures its whole
-	// replication stream. So the honest answer is to refuse at the FIRST
-	// delivery, where the coordinator can still act on it, rather than succeed
-	// and fail confusingly on the retry.
-	if (p.LeaseTerm > 0 || p.LeaseKey != "") && !c.MayEmitTermCarryingProof() {
-		return fmt.Errorf("%w: this node cannot persist a proof's lease term yet "+
-			"(lease_term_ledger_v1 has not latched here), and storing it without one would "+
-			"record a different proof than the one validated", ErrProofTermUnrecordable)
-	}
 	now := c.NowTS()
 	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var existing ActionProof
@@ -274,6 +251,14 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm,
 				&existing.LeaseKey)
 		if errors.Is(err, sql.ErrNoRows) {
+			// Only the SEED emits a statement, so only the seed is bound by
+			// what this node may put on the wire. Checked here rather than
+			// before the transaction because the third outcome — the
+			// coordinator's genuine row already replicated here — emits nothing
+			// and must succeed whatever this node's latch says.
+			if serr := proofStampEmittable(c, p); serr != nil {
+				return false, serr
+			}
 			return true, nil
 		}
 		if err != nil {
@@ -287,6 +272,37 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 		proofInsertStmt(c, p, now),
 	})
 	return err
+}
+
+// proofStampEmittable refuses to persist a proof whose lease-term stamp this
+// node cannot yet carry on the wire.
+//
+// Capability latches form on each node independently, so a coordinator whose
+// lease_term_ledger_v1 latch has formed can hand a stamped proof to a receiver
+// whose own latch is still closed. That receiver may emit only the released
+// insert shape, which has no lease_term or lease_key columns: seeding through
+// it silently STRIPPED the stamp from the row — and, because the presented
+// statement is what replicates, from every peer's record of that proof. The
+// first claim succeeded on the stripped row; the retry of the identical proof
+// (how an interrupted action recovers) then compared a stamped proof against an
+// unstamped row and was refused as divergent, which no caller retries.
+//
+// A stamp is an authorization field. Persisting the proof without it is not a
+// degraded write, it is a different proof — so a node that cannot emit the
+// stamp refuses, before anything is written or logged, with an error callers
+// map to a RETRYABLE refusal. The receiver's latch forms from the same peer set
+// the coordinator's did, so the retry lands.
+//
+// An unstamped proof (term 0, empty key) is exactly what the released shape
+// carries, so it passes whatever the latch says.
+func proofStampEmittable(c *Client, p ActionProof) error {
+	if p.LeaseTerm == 0 && p.LeaseKey == "" {
+		return nil
+	}
+	if c.MayEmitTermCarryingProof() {
+		return nil
+	}
+	return fmt.Errorf("%w (proof %s, term %d, key %q)", ErrTermStampNotEmittable, p.ID, p.LeaseTerm, p.LeaseKey)
 }
 
 const insertProofSQL = `INSERT OR IGNORE INTO runtime_action_proofs
@@ -332,7 +348,10 @@ const insertProofPreTermSQL = `INSERT OR IGNORE INTO runtime_action_proofs
 // The wide form goes on the wire only once the term-carrying shapes are known
 // to be decodable by every peer this node replicates to — the same
 // lease_term_ledger_v1 latch that gates the mint, and for the same reason.
-// Before then every proof is written in the released shape.
+// Before then every proof is written in the released shape — which carries an
+// UNSTAMPED proof exactly. A stamped proof never reaches the narrow arm: every
+// writer refuses it first through proofStampEmittable, because writing it in
+// that shape would strip its authorization fields rather than degrade it.
 func proofInsertStmt(c *Client, p ActionProof, now string) Statement {
 	if c.MayEmitTermCarryingProof() {
 		return Statement{SQL: insertProofSQL, Params: proofInsertParams(p, now)}

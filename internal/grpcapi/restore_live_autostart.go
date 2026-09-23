@@ -365,7 +365,10 @@ func (s *Server) autoDefineRestoredVM(
 		// before the create path graduated. Nothing else does it: convergence
 		// early-returns on a zero epoch, and the backfill that would graduate it
 		// is gated behind enforcement.owner_epoch, which is off by default.
-		s.assignOwnerEpochAtCreate(ctx, targetName)
+		//
+		// In the else on purpose: a non-firmware insert failure is NOT fatal on
+		// this path, so an unguarded call would graduate a row that does not exist.
+		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	}
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")

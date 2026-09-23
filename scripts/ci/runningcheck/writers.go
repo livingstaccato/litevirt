@@ -72,10 +72,11 @@ func checkWriters(root string) ([]violation, error) {
 		Dir:   root,
 		Tests: false,
 	}
-	// ./... rather than ./internal/...: rule 6 asks whether a NEW function runs
-	// an existing state-writing statement, and a function outside internal/
-	// does so just as effectively. Scoping the load to internal/ made the rule
-	// blind to the rest of the module.
+	// The WHOLE module, not just ./internal/... . Rules 1-5 walk every
+	// production file in the tree, so scoping the only type-aware pass to one
+	// subtree left a state-writing function outside internal/ unclassified by
+	// construction — and unfindable, because the test loaded the same
+	// restricted pattern the pass did.
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		return nil, fmt.Errorf("load: %w", err)
@@ -260,7 +261,12 @@ func stateWritingFuncs(root string) (map[string]bool, error) {
 		Dir:   root,
 		Tests: false,
 	}
-	pkgs, err := packages.Load(cfg, "./internal/...")
+	// The WHOLE module, not just ./internal/... . Rules 1-5 walk every
+	// production file in the tree, so scoping the only type-aware pass to one
+	// subtree left a state-writing function outside internal/ unclassified by
+	// construction — and unfindable, because the test loaded the same
+	// restricted pattern the pass did.
+	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		return nil, err
 	}

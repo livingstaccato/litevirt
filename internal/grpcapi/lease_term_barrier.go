@@ -396,21 +396,38 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 		// on both sides: repairWouldAskSomeoneNew gives each unanswered peer only
 		// one full-price chance per memo window, so a dead peer cannot buy a
 		// second budget on every sweep.
+		//
+		// The repair ADDS to the first pass's evidence; it does not replace it.
+		// It used to re-seed `highest` from this node's own ledger and hand back
+		// only the second fan-out's answers, so a peer that reported the
+		// superseding term in the first pass and then stalled in the repair had
+		// its answer forgotten — the barrier accepted a term it had already seen
+		// superseded, on exactly the intermittent-peer failure it exists to
+		// survive. The observed maximum only rises, and an answer given once is
+		// evidence however the same peer fares a moment later.
 		rctx, rcancel := context.WithTimeout(ctx, leaseBarrierBudget)
-		repaired, rAnswers, rAnswered := s.fanOut(rctx, key, local, peers, nil)
+		rHighest, _, rAnswered := s.fanOut(rctx, key, local, peers, nil)
 		rcancel()
-		// The repair's answers and coverage replace the first pass's -- it asked
-		// strictly more peers. Its HIGH-WATER does not: a term this node has
-		// already seen cannot be un-seen by a later round that failed to reach
-		// the peer holding it. The first sweep can observe term 9 from a peer
-		// that goes unreachable before the repair, and taking the repair's 4
-		// would admit a term-5 proof this node had directly observed to be
-		// superseded -- the exact admission the barrier exists to refuse.
-		if repaired > highest {
-			highest = repaired
+		s.noteFullyProbed(peers, rAnswered)
+		// The repair's HIGH-WATER only ever raises the observed maximum. A term
+		// this node has already seen cannot be un-seen by a later round that
+		// failed to reach the peer holding it: the first sweep can observe term
+		// 9 from a peer that goes unreachable before the repair, and taking the
+		// repair's 4 would admit a term-5 proof this node had directly observed
+		// to be superseded -- the exact admission the barrier exists to refuse.
+		if rHighest > highest {
+			highest = rHighest
 		}
-		answers, answered = rAnswers, rAnswered
-		s.noteFullyProbed(peers, answered)
+		// Coverage is a UNION, not a replacement. The repair asks a superset of
+		// peers, but an answer is evidence at the moment it is given: a peer
+		// that answered the first pass and stalls in the repair must not have
+		// its answer forgotten.
+		for p := range rAnswered {
+			if !answered[p] {
+				answered[p] = true
+				answers++
+			}
+		}
 	}
 
 	s.noteSilentPeers(peers, answered)

@@ -239,6 +239,47 @@ func EnsureUserShadow(ctx context.Context, db *corrosion.Client, p *Principal, d
 		return err
 	}
 	if existing != nil {
+		// REFUSE a name that already belongs to another authority. users is keyed
+		// on username alone, so adopting the row silently hands this principal
+		// whatever role that row carries — mintSession reads the role from the row,
+		// not from the principal. An account in a configured LDAP or OIDC directory
+		// named after a local administrator could therefore mint a local admin
+		// session with neither the local password nor the local second factor.
+		//
+		// Refusing rather than namespacing: a rename would have to move the row's
+		// RBAC bindings, tokens and sessions with it, and doing that silently
+		// during a login is a larger and more surprising act than declining one.
+		// The operator renames one side.
+		// REFUSE to let an external principal adopt a LOCAL account. users is
+		// keyed on username alone, so adopting the row hands this principal
+		// whatever role it carries — mintSession reads the role from the row, not
+		// from the principal — and an account in a configured LDAP or OIDC
+		// directory named after a local administrator could otherwise mint a local
+		// admin session with neither the local password nor the local second
+		// factor.
+		//
+		// A non-empty password_hash is what identifies a local account: local users
+		// are created with one, and the shadow rows written below are created with
+		// "" precisely because an external subject has no local credential. The
+		// realm COLUMN cannot answer this — nothing in the tree ever writes it, so
+		// every row reads back as 'local' whatever authority created it.
+		//
+		// Residual, deliberately left: two EXTERNAL realms that share a username
+		// still collide with each other, because neither row carries a credential
+		// to tell them apart. Closing that needs the realm column actually
+		// populated, which is a new replicated statement shape — a previous-release
+		// peer cannot decode an unregistered shape and back-pressures its whole
+		// replication stream — so it belongs with a capability gate and its own
+		// change, not here.
+		//
+		// Refusing rather than namespacing: a rename would have to carry the row's
+		// RBAC bindings, tokens and sessions with it, and doing that silently
+		// during a login is a larger and more surprising act than declining one.
+		if p.Realm != "local" && existing.PasswordHash != "" {
+			return fmt.Errorf("user %q already exists as a local account; refusing to "+
+				"authenticate it from realm %q, because that would adopt the local account's "+
+				"role — rename one of the two", p.Subject, p.Realm)
+		}
 		return nil
 	}
 	role := defaultRole

@@ -3,6 +3,7 @@ package health
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -53,6 +54,46 @@ var ErrPreEpochMarker = errors.New("owner-epoch marker does not name a generatio
 // the domain, so the check can actually fire.
 func WriteVMOwnerEpochMarker(dataDir, name string, epoch int64) error {
 	return writeOwnerEpochMarker(filepath.Join(dataDir, "vms"), name, epoch)
+}
+
+// RemoveVMOwnerEpochMarker deletes a VM's host-local marker. Absent is success.
+//
+// Nothing used to do this, for VMs or containers, so a marker outlived the VM it
+// named. That is not merely untidy on a reused name: assignOwnerEpochAtCreate
+// deliberately writes NO marker when its graduation fails, because a marker
+// above a row at 0 is a mismatch convergeOwnerEpochMarker returns early on and
+// never repairs, and assertRuntimeOwnership then reads marker_epoch_mismatch and
+// refuses that VM's legitimate sole-holder re-key permanently. A leftover marker
+// from a previous VM of the same name reaches that state through a door the
+// create path cannot close, so the delete path has to shut it.
+func RemoveVMOwnerEpochMarker(dataDir, name string) error {
+	if err := safename.ValidateVMName(name); err != nil {
+		return err
+	}
+	dir := filepath.Join(dataDir, "vms", name)
+	if err := os.Remove(filepath.Join(dir, ownerEpochMarkerFile)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	// And the directory, best-effort. It holds nothing else today — this marker
+	// is the only thing written under <dataDir>/vms/<name> — so leaving it
+	// accumulates one empty directory per deleted VM with nothing to clean them
+	// up: the same unowned growth the marker itself had, only quieter.
+	//
+	// Its failure is NOT this function's error, and the difference matters. The
+	// two outcomes have opposite consequences: a marker still on disk wedges the
+	// next VM to take this name, because a marker above a row at 0 is a mismatch
+	// convergence never repairs; a leftover empty directory is inert. Returning
+	// one error for both made every caller log the dangerous reading, sending an
+	// operator after a wedge that was not there — and teaching them to ignore the
+	// line that reports the one that is.
+	//
+	// os.Remove, not RemoveAll: if something ever does start living here, this
+	// declines rather than deleting it.
+	if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+		slog.Debug("owner-epoch marker removed, but its directory remains",
+			"name", name, "dir", dir, "error", err)
+	}
+	return nil
 }
 
 // ReadVMOwnerEpochMarker reads the host-local VM marker.

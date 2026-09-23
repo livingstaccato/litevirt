@@ -96,18 +96,11 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// released here UNLESS the migration outlives this request, in which case it
 	// travels with the adopter — dropping it while libvirt is still moving the
 	// guest is what lets a snapshot or delete run against a VM mid-flight.
-	unlock := s.lockVM(req.VmName)
+	unlock := releaseOnce(s.lockVM(req.VmName))
 	adopted := false
-	unlocked := false
-	releaseLock := func() {
-		if !unlocked {
-			unlocked = true
-			unlock()
-		}
-	}
 	defer func() {
 		if !adopted {
-			releaseLock()
+			unlock()
 		}
 	}()
 
@@ -133,14 +126,10 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return err
 	}
 	if vm.HostName != s.hostName {
-		// This node does not own the VM, so its local per-VM lock protects
-		// nothing here -- and this forward STREAMS, so holding it would pin the
-		// lock for the entire remote migration. Two nodes with a contradictory
-		// view of the owner would each lock and forward to the other, and both
-		// block until the deadlines fire with every operation on that VM queued
-		// behind them. The lock is taken again, for real, by the handler on the
-		// node that actually owns it.
-		releaseLock()
+		// Released BEFORE the forward: the lock must not be held across a peer
+		// RPC. See releaseOnce.
+		unlock()
+
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
@@ -762,12 +751,11 @@ func (s *Server) adoptAbandonedMigration(
 			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				state, detail = "running", fmt.Sprintf("migration to %s failed after the request was abandoned; VM still running on %s: %v", targetHost, s.hostName, err)
 			}
-			// Routed through the chokepoint because this branch CAN publish
-			// "running" — the guest is still on this host after a failed
-			// adopted migration. A row saying running with no marker naming its
-			// generation is a workload nobody can prove, which is the whole
-			// reason the chokepoint exists; the "error" case passes through it
-			// unchanged.
+			// A LOCAL publish: the migration failed, so the guest and its domain
+			// are still on THIS host. state is "error" or "running" depending on
+			// what libvirt reports, so it can publish a running VM and has to be
+			// routed — this function was added after the chokepoint landed and so
+			// was never routed with the rest.
 			if werr := s.publishRunning(ctx, vm.Name, state, func(ctx context.Context) error {
 				return corrosion.UpdateVMState(ctx, s.db, vm.Name, state, detail)
 			}); werr != nil {

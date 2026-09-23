@@ -191,13 +191,19 @@ type Client struct {
 	// the same row still surfaces. An acknowledgement is a statement about one
 	// observed divergence, never a standing mute on a row.
 	//
+	// A SET of pairs per row, not one. It was one, and that quietly capped how
+	// many simultaneous divergences a row could have answered: acknowledging the
+	// second replaced the first, the next sweep re-raised it, and an N-way
+	// collision could never be cleared at all. See acknowledgedTiesDDL, whose
+	// primary key carries the same correction durably.
+	//
 	// A superseded entry is RETAINED, here and in the table. It cannot mask the
 	// live divergence — suppression demands an exact pair match — and if its
 	// pair is ever observed again the operator did acknowledge exactly that.
 	// Deleting it was tried and had to be reverted: the only place that knows a
 	// pair went stale is trackUnresolvedPair, which runs with c.mu held, so the
 	// delete deadlocked the merge. See the comment there.
-	acknowledgedTies map[string]string
+	acknowledgedTies map[string]map[string]bool
 	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
 	// clear-on-write hooks (which run on every applied/local row) skip the lock
 	// entirely when nothing is tracked — the overwhelmingly common case.

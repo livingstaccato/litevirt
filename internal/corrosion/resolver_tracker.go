@@ -256,8 +256,7 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 	// stale acknowledgement is inert — it cannot mask the live divergence. And
 	// if the acknowledged pair is ever observed again, the operator did
 	// acknowledge precisely that, so staying quiet is the answer they gave.
-	ack, hasAck := c.acknowledgedTies[key]
-	acknowledged := hasAck && ack == pair
+	acknowledged := c.acknowledgedTies[key][pair]
 
 	// An acknowledged tie is still TRACKED, marked. It is not deleted and not
 	// skipped, because "is this row currently divergent" and "should this
@@ -294,11 +293,12 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 	// suppression does make it inert on the SUPPRESSION path; masking came in
 	// through the overwrite instead.
 	//
-	// Keeping prev does not strand the remedy. Acknowledgement is single-slot
-	// per row, so acknowledging A–C moves the slot there, and the next
-	// observation of A–C finds acknowledged=true and marks the entry — while
-	// A–B, no longer covered by any acknowledgement, is correctly free to
-	// register as live again.
+	// Keeping prev does not strand the remedy. Acknowledgement is a SET per row,
+	// so acknowledging A–C adds it alongside A–B, and the next observation of
+	// either finds acknowledged=true and marks the entry. While it was one slot
+	// per row the second acknowledgement displaced the first, which meant a row
+	// with three live divergences could never be fully answered — see
+	// acknowledgedTiesDDL.
 	supersededByAck := existed && acknowledged && !prev.acknowledged && prev.pair != pair
 
 	livenessMoved := !existed
@@ -478,12 +478,15 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 	//
 	// execLocal: local-only, never replicated. See acknowledgedTiesDDL.
 	if err := c.execLocal(ctx,
+		// DO NOTHING, not DO UPDATE. The conflict target is now the full key
+		// including content_pair, so a conflict means THIS pair was already
+		// answered — and the original acknowledged_at/acknowledged_by must
+		// stand rather than be rewritten by a later operator. Sibling pairs on
+		// the same row are separate rows and are never touched; the previous
+		// statement overwrote them, which is what made an N-way tie unanswerable.
 		`INSERT INTO acknowledged_ties (table_name, pk, content_pair, acknowledged_at, acknowledged_by)
 		 VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(table_name, pk) DO UPDATE SET
-		   content_pair = excluded.content_pair,
-		   acknowledged_at = excluded.acknowledged_at,
-		   acknowledged_by = excluded.acknowledged_by`,
+		 ON CONFLICT(table_name, pk, content_pair) DO NOTHING`,
 		table, pk, t.pair, time.Now().UTC().Format(time.RFC3339), by); err != nil {
 		return false, fmt.Errorf("persist acknowledgement of %s/%s: %w", table, pk, err)
 	}
@@ -494,9 +497,12 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
 	if c.acknowledgedTies == nil {
-		c.acknowledgedTies = make(map[string]string, 1)
+		c.acknowledgedTies = make(map[string]map[string]bool, 1)
 	}
-	c.acknowledgedTies[key] = t.pair
+	if c.acknowledgedTies[key] == nil {
+		c.acknowledgedTies[key] = make(map[string]bool, 1)
+	}
+	c.acknowledgedTies[key][t.pair] = true
 
 	// Re-compare the PAIR before clearing anything, not just the key's
 	// presence. tieMu was released for the durable write, and a merge in that
@@ -540,8 +546,7 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 func (c *Client) TieAcknowledged(table, pk string) bool {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
-	_, ok := c.acknowledgedTies[unresolvedKey(table, pk)]
-	return ok
+	return len(c.acknowledgedTies[unresolvedKey(table, pk)]) > 0
 }
 
 // LeaseTermTieAcknowledged is TieAcknowledged for a contested lease term, with
@@ -561,10 +566,14 @@ func (c *Client) loadAcknowledgedTies(ctx context.Context) error {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
 	if c.acknowledgedTies == nil {
-		c.acknowledgedTies = make(map[string]string, len(rows))
+		c.acknowledgedTies = make(map[string]map[string]bool, len(rows))
 	}
 	for _, r := range rows {
-		c.acknowledgedTies[unresolvedKey(r.String("table_name"), r.String("pk"))] = r.String("content_pair")
+		key := unresolvedKey(r.String("table_name"), r.String("pk"))
+		if c.acknowledgedTies[key] == nil {
+			c.acknowledgedTies[key] = make(map[string]bool, 1)
+		}
+		c.acknowledgedTies[key][r.String("content_pair")] = true
 	}
 	return nil
 }

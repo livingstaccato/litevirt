@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -60,4 +61,65 @@ func ackAndDetach(op string, cancel context.CancelFunc, recv func() (proto.Messa
 			}
 		}
 	}()
+}
+
+// ackTimeout bounds how long the gateway will wait for a streaming operation's
+// FIRST message before acknowledging it anyway.
+//
+// It must stay well under the server's WriteTimeout (120s), or the client sees
+// a dead connection instead of an answer and retries — and every retry adds
+// another blocked goroutine, another gRPC stream and another queued lock
+// waiter, none of which the disconnected client can cancel.
+const ackTimeout = 30 * time.Second
+
+// ackTimeoutForTest is the budget firstOrDetach actually uses. A var so a test
+// can shrink it; nothing in production reassigns it.
+var ackTimeoutForTest = ackTimeout
+
+// firstOrDetach waits up to ackTimeout for the first message of a
+// server-streaming RPC.
+//
+// The operation itself runs on a detached, six-hour context, which is right:
+// once acknowledged it must outlive the request. But the ACKNOWLEDGEMENT was
+// waiting on that same context, so a first message that cannot be produced —
+// MigrateVM cannot send MIGRATE_VALIDATING until it holds the per-VM lock, and
+// a nightly backup can hold that for minutes — blocked the handler far past
+// the point the client gave up.
+//
+// On timeout the stream is handed on exactly as a normal ack would hand it on,
+// and the caller reports 202 Accepted. The in-flight Recv is NOT abandoned: its
+// result is delivered to the detached reader first, so no message is dropped.
+func firstOrDetach(recv func() (proto.Message, error)) (first proto.Message, err error, timedOut bool, rest func() (proto.Message, error)) {
+	type result struct {
+		m   proto.Message
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		m, e := recv()
+		ch <- result{m, e}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.m, r.err, false, recv
+	case <-time.After(ackTimeoutForTest):
+		// The goroutine above still owns the first Recv. The detached reader
+		// takes its result before reading anything further, or the first
+		// message would be lost.
+		var once sync.Once
+		var pending result
+		var got bool
+		return nil, nil, true, func() (proto.Message, error) {
+			once.Do(func() {
+				pending = <-ch
+				got = true
+			})
+			if got {
+				got = false
+				return pending.m, pending.err
+			}
+			return recv()
+		}
+	}
 }

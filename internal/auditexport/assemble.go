@@ -22,6 +22,17 @@ import (
 // for the first page.
 type FetchPage func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error)
 
+// MaxAssembledBytes bounds the in-memory audit-chain document.
+//
+// This package assembles the WHOLE chain in the daemon's own heap for the web
+// UI and the REST gateway. audit_log is append-only with no retention prune, so
+// there is no natural bound on the input and the peak allocation is several
+// times the document size once marshalling doubles it.
+//
+// A var, not a const, only so a test can shrink it; nothing in production
+// reassigns it.
+var MaxAssembledBytes = 256 << 20
+
 // Assemble follows the cursor to the end and merges every page into one JSON
 // document, returning it alongside the total row count.
 //
@@ -34,6 +45,7 @@ func Assemble(ctx context.Context, fetch FetchPage) ([]byte, int, error) {
 	doc := map[string]json.RawMessage{}
 	rows := []json.RawMessage{}
 	total := 0
+	bytesHeld := 0
 
 	for cursor, seen := "", map[string]bool{}; ; {
 		resp, err := fetch(ctx, cursor)
@@ -51,6 +63,25 @@ func Assemble(ctx context.Context, fetch FetchPage) ([]byte, int, error) {
 				return nil, 0, fmt.Errorf("decode export rows: %w", err)
 			}
 			rows = append(rows, pageRows...)
+			bytesHeld += len(raw)
+			// audit_log is append-only with no retention prune, so the input is
+			// unbounded: a two-year-old cluster asked for its whole chain walks
+			// every page into this slice and then DOUBLES the allocation twice
+			// to marshal it. The daemon is killed by the OOM killer, and
+			// because that is SIGKILL the watchdog Heartbeat's deferred disarm
+			// never runs -- on a host that still owns workloads the watchdog is
+			// left counting while the control plane is down.
+			//
+			// Refusing with a message naming the streaming alternative is a
+			// worse export and a much better failure than letting the kernel
+			// decide which process dies.
+			if bytesHeld > MaxAssembledBytes {
+				return nil, 0, fmt.Errorf(
+					"audit chain is too large to assemble in memory (%d MiB of rows so far, "+
+						"limit %d MiB); narrow the window with --since/--until, or use "+
+						"`lv audit export` which writes pages as they arrive",
+					bytesHeld>>20, MaxAssembledBytes>>20)
+			}
 		}
 		for k, v := range page {
 			if k == "rows" {

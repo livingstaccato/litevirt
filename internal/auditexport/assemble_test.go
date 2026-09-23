@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -168,5 +170,58 @@ func TestAssemble_ReturnsTheFetchError(t *testing.T) {
 	})
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want it to wrap %v", err, want)
+	}
+}
+
+// TestAssemble_RefusesAChainTooLargeToHold is the OOM bound.
+//
+// audit_log is append-only with no retention prune, so the input to this
+// assembler is unbounded — and it holds every row, then doubles the allocation
+// twice to marshal. A compliance poller asking a two-year-old cluster for the
+// whole chain takes the daemon out via the OOM killer, and because that is
+// SIGKILL the watchdog Heartbeat's deferred disarm never runs: on a host that
+// still owns workloads the watchdog keeps counting with the control plane down.
+//
+// Refusing, and naming the streaming alternative, is a worse export and a much
+// better failure than letting the kernel choose which process dies.
+func TestAssemble_RefusesAChainTooLargeToHold(t *testing.T) {
+	prev := MaxAssembledBytes
+	MaxAssembledBytes = 4 << 10
+	t.Cleanup(func() { MaxAssembledBytes = prev })
+
+	big := strings.Repeat("x", 2<<10)
+	page := fmt.Sprintf(`{"rows":[{"id":"%s"},{"id":"%s"},{"id":"%s"}]}`, big, big, big)
+
+	_, _, err := Assemble(context.Background(), func(_ context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		return &pb.ExportAuditChainResponse{Json: page, RowCount: 3, NextCursor: "keep-going-" + cursor}, nil
+	})
+	if err == nil {
+		t.Fatal("an unbounded chain assembled without complaint; this is the allocation " +
+			"that ends in the OOM killer")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("error = %v; it should name the size problem and the alternative", err)
+	}
+}
+
+// An ordinary export must still assemble — a bound that fires on normal input
+// would simply break the feature.
+func TestAssemble_OrdinaryChainStillAssembles(t *testing.T) {
+	calls := 0
+	body, total, err := Assemble(context.Background(), func(_ context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		calls++
+		if calls == 1 {
+			return &pb.ExportAuditChainResponse{Json: `{"rows":[{"id":"a"}],"chain_heads":[]}`, RowCount: 1, NextCursor: "n1"}, nil
+		}
+		return &pb.ExportAuditChainResponse{Json: `{"rows":[{"id":"b"}]}`, RowCount: 1}, nil
+	})
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("total = %d, want 2", total)
+	}
+	if !strings.Contains(string(body), `"chain_heads"`) {
+		t.Errorf("page-one evidence was dropped: %s", body)
 	}
 }

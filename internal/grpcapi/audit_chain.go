@@ -157,6 +157,36 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 	}
 	out := make([]map[string]string, 0, len(rows))
 	var last exportCursor
+	// Seq gaps, reported rather than silently emitted.
+	//
+	// A host's sub-chain is walked by seq and each row's prev_hash names the
+	// previous one, so a missing seq makes the export replay as a BREAK. That
+	// is indistinguishable from tampering to an external verifier, which is the
+	// one thing this document exists to tell apart.
+	//
+	// A gap is ordinary: replication can deliver a partitioned host's backlog
+	// out of order, so seq 3 can still be in flight while 4 and 5 have landed.
+	// Once the cursor passes 5, seq 3 is below it and is never exported at all.
+	// The rows that ARE here are still worth shipping, so the page carries them
+	// and says what is missing instead of pretending the chain is whole.
+	var gaps []map[string]string
+	prevHost, prevSeq := after.Host, after.Seq
+	for _, r := range rows {
+		host, seq := r.String("host_name"), r.Int64("seq")
+		// Only within one host, and only for v45+ rows: seq is 0 for rows
+		// written before it existed, and those are reported as not
+		// tamper-evident by the verifier anyway.
+		if host == prevHost && prevSeq > 0 && seq > prevSeq+1 {
+			gaps = append(gaps, map[string]string{
+				"host_name":    host,
+				"after_seq":    strconv.FormatInt(prevSeq, 10),
+				"before_seq":   strconv.FormatInt(seq, 10),
+				"missing_from": strconv.FormatInt(prevSeq+1, 10),
+				"missing_to":   strconv.FormatInt(seq-1, 10),
+			})
+		}
+		prevHost, prevSeq = host, seq
+	}
 	for _, r := range rows {
 		out = append(out, map[string]string{
 			"id":           r.String("id"),
@@ -180,6 +210,11 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 	}
 
 	doc := map[string]any{"rows": out}
+	if len(gaps) > 0 {
+		// Named "seq_gaps" so a verifier that does not know the key still sees
+		// an unexpected field rather than a silently short chain.
+		doc["seq_gaps"] = gaps
+	}
 	if req.Cursor == "" {
 		if err := s.addExportEvidence(ctx, doc); err != nil {
 			return nil, err

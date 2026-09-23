@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -57,10 +58,26 @@ const maxLeaseAttempts = 3
 // "not held", which is the same shape as losing the race and is what the callers
 // already handle.
 func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, ttl time.Duration, now time.Time) (bool, int64, error) {
-	nowRFC := now.UTC().Format(time.RFC3339)
-	expires := now.Add(ttl).UTC().Format(time.RFC3339)
+	// The clock is re-sampled on EVERY attempt, not once at entry.
+	//
+	// A holder that enters before its expiry and then stalls past the TTL -- a
+	// GC pause, an IO stall, a slow DB, or simply losing the classification
+	// race and looping -- used to resume and compare its own now-expired lease
+	// against the PRE-PAUSE instant. curExpires >= nowRFC was then still true,
+	// the call classified as a renewal, and it returned the OLD term while
+	// writing an expiry that could already be in the past. That is exactly the
+	// case the tenure rule below says must mint a new term.
+	//
+	// entry is a monotonic anchor and the offset is added to the CALLER's
+	// clock, so an injected `now` keeps its meaning (the first attempt is
+	// indistinguishable from sampling it directly) while real elapsed time
+	// still advances the comparison.
+	entry := time.Now()
 
 	for attempt := 0; attempt < maxLeaseAttempts; attempt++ {
+		cur := now.Add(time.Since(entry))
+		nowRFC := cur.UTC().Format(time.RFC3339)
+		expires := cur.Add(ttl).UTC().Format(time.RFC3339)
 		// Classification is re-derived on every iteration. It cannot be hoisted:
 		// a declined guard means the state it described has changed, and the most
 		// common change is a sibling caller on THIS node having just acquired the
@@ -109,12 +126,30 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 
 		if ourTenure {
 			switch {
-			case newest.Term > 0 && newest.Holder == holder:
+			case newest.Term > 0 && newest.Holder == holder && !c.heldTermlessIncarnation(key):
 				// Same tenure, term already recorded: renew, mint nothing. A
 				// renewal that bumped the term would make the holder invalidate
 				// its own in-flight work every renewal interval.
 				if renewClassifiedHook != nil {
 					renewClassifiedHook()
+				}
+				// Re-check the tenure against a FRESH clock before committing.
+				//
+				// Everything above was decided from an instant sampled before
+				// this point, and the gap is unbounded: the classification is
+				// held under no lock, and the caller can stall in it past its
+				// own TTL. Renewing on that stale reading returns the OLD term
+				// for a lease that has actually lapsed -- and a lapse is
+				// precisely the window in which other nodes were entitled to
+				// act, so work from before it must not carry the term used
+				// after it.
+				//
+				// curExpires is the DURABLE expiry, so comparing it against a
+				// fresh instant is the real question. Falling through to
+				// re-classify (rather than refusing) lets the next iteration
+				// take the lapsed lease properly and mint a new term.
+				if live := now.Add(time.Since(entry)).UTC().Format(time.RFC3339); curExpires < live {
+					continue
 				}
 				held, err := renewLeaseAtTerm(ctx, c, key, holder, expires, nowRFC, newest.Term)
 				if err != nil {
@@ -123,6 +158,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 				if !held {
 					continue // lost it mid-renewal; re-classify rather than guess
 				}
+				c.noteHandedTerm(key, newest.Term)
 				return true, newest.Term, nil
 
 			case newest.Term > 0 && newest.Holder != holder:
@@ -146,11 +182,17 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 			// and reseedKeepTables stops a reseed from deleting it.
 		}
 
-		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, now)
+		// Whether the ledger's newest term belongs to the incarnation we are
+		// holding right now, which is what separates a renewal from a
+		// lapse-and-retake by the same node.
+		incarnationHasTerm := newest.Term > 0 && newest.Holder == holder &&
+			!c.heldTermlessIncarnation(key)
+		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, incarnationHasTerm)
 		if err != nil {
 			return false, 0, err
 		}
 		if held {
+			c.noteHandedTerm(key, term)
 			return true, term, nil
 		}
 		if term == leaseContended {
@@ -192,7 +234,61 @@ func holdLeaseWithoutTerm(ctx context.Context, c *Client, key, holder, expires, 
 	if err != nil {
 		return false, 0, err
 	}
-	return held, 0, nil
+	if !held {
+		return false, 0, nil
+	}
+	// This incarnation carries NO term. Recording that is what stops a later
+	// gate-open acquisition mistaking the ledger's stale term for this tenure's
+	// own -- see noteHandedTerm.
+	c.noteHandedTerm(key, 0)
+	return true, 0, nil
+}
+
+// termlessIncarnations records, per lease key, that THIS PROCESS is currently
+// holding the lease with no term at all.
+//
+// leader_lease_terms records (key, term, holder) but not which INCARNATION of
+// that holder minted it, so holder identity alone cannot tell an unbroken
+// tenure from a lapse-and-retake by the same node. That gap is reachable
+// without any exotic failure: mint term N, lose the activation marker so
+// MayMintLeaseTerm goes false, let the lease lapse, re-take it termlessly, and
+// then have the marker come back. The ledger still says term N belongs to us,
+// the classification reads "same tenure, term already recorded", and work from
+// before the lapse carries the same term as work after it.
+//
+// The flag is deliberately narrow: ONLY an explicitly termless acquisition
+// clears the tenure. A sibling caller on this same node that advances the term
+// in the ledger is a legitimate move forward and is still adopted, and a fresh
+// process that finds its own term in the ledger still self-heals into it --
+// that is the documented rolling-upgrade path, not this defect.
+//
+// In memory, because the thing being tracked is a property of this process's
+// hold on the lease, not of the replicated row.
+var (
+	termlessMu           sync.Mutex
+	termlessIncarnations = map[*Client]map[string]bool{}
+)
+
+// noteHandedTerm records the term returned to a caller for key. Zero means this
+// incarnation holds the lease with no term; anything positive clears that.
+func (c *Client) noteHandedTerm(key string, term int64) {
+	termlessMu.Lock()
+	defer termlessMu.Unlock()
+	m := termlessIncarnations[c]
+	if m == nil {
+		m = map[string]bool{}
+		termlessIncarnations[c] = m
+	}
+	m[key] = term == 0
+}
+
+// heldTermlessIncarnation reports whether this process took the current lease
+// on key without a term. While that is true, a positive term in the ledger
+// belongs to an EARLIER tenure and must not be adopted as this one's.
+func (c *Client) heldTermlessIncarnation(key string) bool {
+	termlessMu.Lock()
+	defer termlessMu.Unlock()
+	return termlessIncarnations[c][key]
 }
 
 // leaseContended is the sentinel takeLeaseAndMintTerm returns alongside
@@ -301,7 +397,7 @@ func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC str
 // dropping them is worse than having no atomicity: losing the race while still
 // minting leaves an orphan term row that raises MAX(term) above the real
 // holder's own term, actively fencing the legitimate leader.
-func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time) (bool, int64, error) {
+func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, incarnationHasTerm bool) (bool, int64, error) {
 	acquiredAt := now.UTC().Format(time.RFC3339)
 
 	next, err := nextLeaseTerm(ctx, c, key)
@@ -311,7 +407,7 @@ func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, 
 
 	applied, err := c.ExecuteBatchGuarded(ctx,
 		func(tx *sql.Tx) (bool, error) {
-			return leaseAcquirableTx(ctx, tx, key, holder, nowRFC, next)
+			return leaseAcquirableTx(ctx, tx, key, holder, nowRFC, next, incarnationHasTerm)
 		},
 		[]Statement{
 			{SQL: leaseUpsertSQL, Params: []interface{}{key, holder, expires, c.NowTS(), nowRFC}},
@@ -387,7 +483,7 @@ func leaseRow(ctx context.Context, c *Client, key string) (holder, expiresAt str
 //     below that threshold — the same inversion as an orphan term, arriving on
 //     the success path. Comparing against MAX rather than existence also covers
 //     the slot check, since tombstoned rows keep their number reserved.
-func leaseAcquirableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC string, term int64) (bool, error) {
+func leaseAcquirableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC string, term int64, incarnationHasTerm bool) (bool, error) {
 	var curHolder, expiresAt string
 	err := tx.QueryRowContext(ctx,
 		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, key).Scan(&curHolder, &expiresAt)
@@ -410,8 +506,14 @@ func leaseAcquirableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC stri
 				key).Scan(&n); err != nil {
 				return false, err
 			}
-			if n > 0 {
-				return false, nil // a term exists: this is a renewal, not an acquisition
+			// A term exists for this key -- but it is only a RENEWAL if it
+			// belongs to the incarnation we are currently holding. A node that
+			// minted a term, lost its mint gate, let the lease lapse and
+			// re-took it termlessly still has that old term in the ledger under
+			// its own name; treating it as ours would carry a dead tenure's
+			// term into a new one.
+			if n > 0 && incarnationHasTerm {
+				return false, nil // this incarnation's own term: a renewal
 			}
 		}
 	}

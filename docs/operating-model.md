@@ -17,7 +17,9 @@ per node), so all hosts must run NTP (HLC does not arbitrate conflicts). An
 resolver**: a deterministic winner where any pick is safe, otherwise the row is
 kept-local and flagged for repair (ownership/tenancy/policy/auth are never
 coin-flipped) — see [Diagnostics](diagnostics.md). Health is observed
-peer-to-peer (TLS probes every 2 s).
+peer-to-peer every 2 s, by an
+application-level readiness probe that performs a trivial local read — not by a
+TLS handshake, which a daemon with a wedged database completes perfectly.
 Failover is decided by quorum among observers, gated by a CRDT-stored leader
 lease. Fencing has multiple strategies; safety guards refuse to reschedule
 VMs after a fence failure so that the same VM never runs on two hosts at once.
@@ -26,12 +28,46 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 
 ## What the cluster guarantees
 
+### Three different guarantees, one vocabulary
+
+Most of the confusion about what litevirt promises comes from one word —
+"replicated" — standing in for three things of very different strength. They are
+named separately here, and the rest of this page uses these names.
+
+| Term | What has happened | What it does NOT mean |
+|---|---|---|
+| **Local commit** | The write is durable in this host's SQLite store and the RPC has returned. | Nothing has left the host. |
+| **Peer-durable** | At least one other host has applied the write. | Not a majority, and not an ordering guarantee. |
+| **Quorum-authorized** | A majority of reachable voting members was confirmed *before the action was taken*. | Not that the action's record has replicated anywhere. |
+
+Almost every write is **local commit** only. Replication is an asynchronous push
+over the relay topology, woken by the write and backstopped by a 60 s
+anti-entropy pass; no ordinary API call waits for a peer to apply anything. A
+write that commits locally and is followed immediately by the loss of that host
+is lost, and no amount of peer *reachability* changes that — reachability is
+measured by a probe, not by an acknowledgment of your write. Peer-durability is
+observable after the fact (`litevirt_replication_min_watermark_seq` advances,
+`lv cluster converge` reports matching digests); it is not something an
+operation can be asked for.
+
+**Quorum-authorized** is a separate axis and applies to a short list: fencing a
+host, and every runtime-ownership action behind `DecisionGate`/`ExecutionGate`
+in `internal/health/gate.go`. Those refuse to proceed without a live majority
+this daemon itself probed. It is an authorization to act, computed at the moment
+of acting — it says nothing about whether the resulting rows have replicated.
+
 ### Replication
 - **Eventual consistency** of all CRDT-replicated tables across all healthy
   members. After any partition heals, all hosts converge to the same state
   for any record whose `updated_at` you can observe stabilizing.
-- **No data loss for committed local writes** as long as one healthy peer
-  remains reachable before the host dies.
+- **A local commit is not peer-durable.** A write returns once it is durable in
+  the local store; the push to peers is asynchronous. If the host dies between
+  those two moments the write is gone. A peer being *reachable* is not a peer
+  having *applied* anything — reachability is what the health probe measures,
+  and this page used to conflate the two. Where a write must survive the loss of
+  its origin host, confirm it landed — `litevirt_replication_min_watermark_seq`
+  advancing past the write, or `lv cluster converge` reporting matching digests
+  — rather than assuming a healthy cluster implies it did.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
   and is the safety net for divergence the WAL replicator missed. Public,
   operator-readable state uses `StreamStateDump`; eligible secret-bearing config
@@ -45,9 +81,16 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
   observers report `consecutive_failures ≥ 5` for it (where N is non-offline
   active hosts). Stale observer rows (older than 30 s) are excluded.
-- **Leader-gated recovery.** Only one coordinator at a time drives recovery.
-  The lease is held in a CRDT row with a 45 s TTL and re-validated before
-  every destructive action. A fence additionally requires 30 s of the lease
+- **Leader-gated recovery — best-effort, not exclusive.** The lease is a CRDT
+  row with a 45 s TTL, re-validated before every destructive action. A CRDT row
+  store cannot offer linearisable compare-and-swap across a partition, so the
+  lease *suppresses* concurrent coordinators rather than excluding them: both
+  sides of a partition can believe they hold it (`acquireLease` says so in as
+  many words). That is why the lease is never sufficient on its own — a decision
+  site requires `holdLease()` **and** `DecisionGate.OK`, which is a quorum this
+  daemon probed for itself, and the minority side fails closed there. Read "only
+  one coordinator acts" as the intended end state of the exclusivity work, not
+  as something the current code guarantees. A fence additionally requires 30 s of the lease
   still to run before it may start, because an IPMI power-off plus its
   verification can take 23 s and a fence cut short is reported as unconfirmed.
 - **Only the peers a node actually pushes to can pin its log.** Replication is
@@ -614,7 +657,15 @@ leadership churn or a partition.
 
 ### No application-aware quiescence
 - Backups, snapshots, and live migration are crash-consistent at the block
-  level. The guest's database, filesystem, etc. must tolerate "as if power
+  level: each takes a real point-in-time view (a libvirt pull-mode session for
+  backups, qemu's own machinery for migration).
+- **Scheduled volume replication is weaker than that, and the difference
+  matters.** A full (non-incremental) replica of a RUNNING VM is
+  `qemu-img convert -U` reading the image the guest still has open, with no
+  snapshot: the copy is smeared across however long it took, so it is not
+  point-in-time and not crash-consistent either. The `--incremental` path DOES
+  open a point-in-time session and is crash-consistent. See
+  [Backups](backups.md). The guest's database, filesystem, etc. must tolerate "as if power
   was cut" recovery. For application-consistent backups, install
   `qemu-guest-agent` in the guest and use the `freeze`/`thaw` hooks
   (currently best-effort; richer integration is on the roadmap).
@@ -627,9 +678,12 @@ leadership churn or a partition.
 - **3 nodes**: minimum for any HA workload. 1-node failure tolerated.
 - **5 nodes**: recommended. 2-node failure tolerated.
 - **Even N**: only with a witness. 2-node with witness is fine for homelab.
-- **Up to ~50 nodes**: tested and supported. Beyond, the relay-quorum
-  protocol scales O(n) but the cluster's anti-entropy interval may need
-  tuning.
+- **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
+  this repo is 3 nodes (`tests/fleet/`) and the largest by hand is the 4-node
+  lab. The relay-quorum protocol scales O(n) by design and there is no known
+  ceiling, but "tested and supported at ~50 nodes" — which this page used to
+  say — was never backed by a sustained load test and should not be planned
+  against. Larger clusters will likely need the anti-entropy interval tuned.
 
 ### Network
 - **Inter-host RTT < 10 ms**: comfortable. Default replicator and

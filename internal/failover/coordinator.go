@@ -414,13 +414,29 @@ func (c *Coordinator) run(ctx context.Context) {
 	// cutoff and read as permanently stale — silently killing fencing quorum). Both
 	// forms decode to a wall instant, so the DISTINCT-observer-per-target quorum
 	// aggregation is done here too. An unparseable/stale row simply doesn't count.
+	// The status exclusion below keeps a REACHABLE host out of fencing quorum.
+	//
+	// consecutive_failures counts failed observations, and once the health
+	// checker probes readiness rather than TLS reachability, "the peer answered
+	// and told me its database is wedged" is one of those. Left in, the new
+	// signal would arrive as a power-off: three ticks of a busy database on a
+	// host whose VMs are running fine, and quorum fences it. That is the
+	// opposite of what the readiness probe is for, and it is also the one
+	// direction that cannot be undone.
+	//
+	// Fencing is for a host that cannot be reasoned with. A host answering an
+	// RPC to say it cannot serve is being reasoned with — it loses its votes,
+	// its placements and its pushes by no longer being 'healthy' anywhere, and
+	// keeps its power. If it then goes genuinely silent, the probe records
+	// 'suspect' like any other unreachable peer and this query counts it.
 	freshCutoff := c.now().Add(-healthFreshness)
 	hh, err := c.db.Query(ctx,
 		`SELECT target, observer, updated_at
 		 FROM host_health
 		 WHERE target != ?
-		   AND consecutive_failures >= ?`,
-		c.hostName, offlineThreshold)
+		   AND consecutive_failures >= ?
+		   AND status != ?`,
+		c.hostName, offlineThreshold, health.StatusUnready)
 	if err != nil {
 		slog.Error("failover: query host_health", "error", err)
 		c.mAttempt(PhaseHealth, ResultError, ErrDBError)

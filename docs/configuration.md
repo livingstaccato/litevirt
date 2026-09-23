@@ -158,9 +158,22 @@ storage_pools:
 # hardening feature whose capability token the build advertises but does NOT enforce
 # until you opt in. Enforcement = this flag AND the token's cluster-wide latch, so the
 # flag is BOTH the enable and the kill switch: set it false + restart to disable,
-# regardless of any durable latch (never delete marker files). All default false; a
-# fresh deploy changes no behavior. Enable fleet-uniformly for lww_skew_guard (it
-# changes merge behavior) and for vip_* enable the pair together.
+# regardless of any durable latch (never delete marker files). Every flag is false when
+# absent, so an UPGRADE changes no behavior — the flip has to be deliberate.
+#
+# A NEW cluster is different, and `lv host init` treats it differently: with no cluster
+# to preserve the behavior of, it writes safe_fence_default and shared_storage_fence as
+# TRUE on the first node. Both protect against the same outcome — a best-effort fence
+# that never landed reporting success, the coordinator rescheduling, and a writable
+# shared disk being opened on a second host while the first still has it. Hosts JOINING
+# a cluster inherit that cluster's block verbatim instead, so adding a node never flips
+# a flag mid-roll. To adopt them on an existing cluster, set both on every node and
+# restart; `lv doctor fence` reports which nodes have not.
+#
+# Enable fleet-uniformly for lww_skew_guard (it changes merge behavior) and for vip_*
+# enable the pair together.
+#
+# The values below are the ABSENT-key defaults, not what `lv host init` writes.
 enforcement:
   safe_fence_default: false   # a best-effort (unconfirmable) fence must carry an operator
                               # proof (`lv host fence-confirm`) before reschedule/promote

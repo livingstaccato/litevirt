@@ -726,8 +726,53 @@ func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
 		// unsigned audit rows reported as tampering cluster-wide (2026-08-01).
 		// Base64: the remote path joins this env into one shell command line,
 		// so a multi-line YAML block must travel as a single token.
-		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcementYAMLFrom(daemonConfigPath))),
+		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcementYAML(daemonConfigPath, joinPeers))),
 	}
+}
+
+// newClusterEnforcement is the enforcement block a brand-new cluster starts
+// with. Only the two shared-storage protections: every other flag stays at its
+// documented default here, because this is a safety floor, not a policy.
+//
+// Default-off is the right design for an EXISTING cluster — a flag flip must
+// never change behaviour mid-roll, which is what the monotone latch buys. It is
+// the wrong design for a cluster that has no behaviour yet. Shipped off, a
+// best-effort (lenient SSH) fence that never landed reports success, the
+// coordinator reschedules, and a VM with a writable shared disk is started on a
+// second host while the first still has it open. The code to refuse that is in
+// the binary; it was simply switched off on every cluster ever created.
+//
+// Safe to write here precisely because a latch needs every enforcement-relevant
+// member: a node carrying these flags into an existing cluster changes nothing
+// on its own, which is why this is scoped to a new cluster rather than withheld
+// out of caution.
+const newClusterEnforcement = `enforcement:
+  safe_fence_default: true    # a best-effort (unconfirmable) fence must carry an operator
+                              # proof (` + "`lv host fence-confirm`" + `) before reschedule/promote
+  shared_storage_fence: true  # an ownership transfer of a writable shared disk needs a
+                              # proof-grade fence of the source host
+`
+
+// enforcementYAML decides what enforcement block a host being initialised
+// should boot with.
+//
+// A host JOINING a cluster inherits that cluster's block verbatim, whatever it
+// says and even when it says nothing: capability latches require config
+// uniformity, and a host that boots with flags its peers lack is the silent
+// mid-roll behaviour change the default-off design exists to prevent. The
+// migration path for those clusters is a deliberate operator flip, not a
+// side effect of adding a node.
+//
+// A host STARTING one — no join peers, and no enforcement block to inherit —
+// gets the safe defaults. There is no existing behaviour to preserve.
+func enforcementYAML(path, joinPeers string) string {
+	if block := enforcementYAMLFrom(path); block != "" {
+		return block
+	}
+	if joinPeers != "" {
+		return ""
+	}
+	return newClusterEnforcement
 }
 
 // enforcementYAMLFrom extracts the `enforcement:` mapping from a daemon config

@@ -210,9 +210,12 @@ enabled the flag. The executor re-verifies as defense-in-depth.
 
 This is **host-fence-gated shared storage, not storage-level exclusivity** — litevirt
 does not (yet) take storage-side locks (RBD blocklist, iSCSI PR keys). It is a
-config kill-switch (`enforcement.shared_storage_fence`, default off) plus the
-capability latch, so a deploy is behavior-neutral until enabled fleet-uniformly, and
-disabling the flag restores the legacy behavior.
+config kill-switch (`enforcement.shared_storage_fence`) plus the capability latch, so
+an UPGRADE is behavior-neutral until the flag is enabled fleet-uniformly, and disabling
+it restores the legacy behavior. The flag is false when absent — but a cluster created
+with `lv host init` starts with it on, because there is no prior behavior to preserve
+and the unguarded outcome is two hosts writing one disk. Hosts joining an existing
+cluster inherit that cluster's setting, never this default.
 
 **Per-host implication:** a host whose fence strategy is `best-effort`/`ssh`/`manual`
 (anything but `ipmi`) gives its shared-disk VMs *manual-confirm-only* automated

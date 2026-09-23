@@ -92,7 +92,7 @@ func (s *Server) requireProofGradeFence(ctx context.Context, fenceEpoch, oldOwne
 //     destroyed+rebuilt rather than refused. Retained for crash-recovery of a
 //     half-built promotion; a running domain that is OUR OWN prior promotion is
 //     still ADOPTED (never destroyed) via the promote marker / started checkpoint.
-func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error {
+func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64, leaseKey string) error {
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return fmt.Errorf("vm %q not found", vmName)
@@ -125,6 +125,12 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 			TargetName: vmName, Coordinator: s.hostName, LeaseHolder: s.hostName,
 			OwnerEpoch: strconv.FormatInt(vm.OwnerEpoch, 10),
 			FenceEpoch: fenceEpoch,
+			// The coordinator's tenure. It always had one to give -- it holds
+			// the failover lease -- and stamping it is what lets promote join
+			// leaseTermRequiredActions, so a promote proof arriving unstamped
+			// is a defect rather than a lease-less producer's normal output.
+			LeaseTerm: leaseTerm,
+			LeaseKey:  leaseKey,
 		}
 	}
 	return s.promoteResolved(ctx, req, vm, true /*automated*/, func(*pb.PromoteReplicaProgress) error { return nil })

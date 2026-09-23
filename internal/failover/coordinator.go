@@ -111,7 +111,7 @@ type ReplicaPromoter interface {
 	// old owner that authorizes this cross-host transfer (see proofGradeFenceRef);
 	// "" when no proof-grade fence exists (a best-effort/SSH fence), which the
 	// executor treats as fail-closed for a shared-disk VM.
-	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error
+	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64, leaseKey string) error
 }
 
 // ContainerRestorer restores a container onto a survivor host from its latest
@@ -1023,6 +1023,26 @@ func (c *Coordinator) leaseSnapshot(ctx context.Context) (holder, expiresAt stri
 	return rows[0].String("holder"), rows[0].String("expires_at")
 }
 
+// stillOurTenure re-reads the failover lease and reports whether this
+// coordinator still holds it.
+//
+// leaseStamp does NOT answer this. It reports whether stamping is allowed and
+// returns the term this coordinator recorded at acquisition -- deliberately,
+// so a displaced holder cannot adopt the winner's term -- but it never asks
+// whether the lease is still ours. A tick that passed its own lease gate at
+// the top and then stalled (a GC pause, a slow DB) can therefore act on a
+// tenure a successor already took.
+//
+// Fails CLOSED. leaseSnapshot returns an empty holder on a read error rather
+// than fabricating one, and an unknown holder is not a held lease: abandoning
+// one VM's recovery costs a cycle, while promoting on a lapsed tenure defines
+// and starts a VM on a new host while the old tenure's successor may be doing
+// the same.
+func (c *Coordinator) stillOurTenure(ctx context.Context) bool {
+	holder, _ := c.leaseSnapshot(ctx)
+	return holder != "" && holder == c.hostName
+}
+
 // recentlyFenced returns true if the fencing_log shows a successful fence for
 // host within the recentFenceWindow. Prevents re-fence after restart or race.
 func (c *Coordinator) recentlyFenced(ctx context.Context, host string) bool {
@@ -1597,7 +1617,26 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 					continue
 				}
 			}
-			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch); err != nil {
+			// Promote is as destructive as reschedule and relocate -- it
+			// defines and starts a VM on a new host -- so it takes the same
+			// stale-tenure abandon the three sibling sites take. Without it a
+			// coordinator whose lease lapsed mid-loop had its reschedule and
+			// relocate refused while its promote went through: gateEnforced
+			// passes (a lapse is not quorum loss) and, for a local-disk DR VM,
+			// requireProofGradeFence never fires either.
+			_, _, promoteTerm, promoteKey, ok := c.leaseStamp(ctx)
+			// stillOurTenure as well as leaseStamp: the stamp says a term may
+			// be recorded, not that the lease is still held. A tick that
+			// stalled after its own lease gate is exactly the case this has
+			// to catch, and it is the only one in which a stale-tenure
+			// promote is reachable at all.
+			if !ok || !c.stillOurTenure(ctx) {
+				c.noteGateRefused(corrosion.ActionPromote, health.ReasonStaleLeaseTerm)
+				c.mVM(ActionPromote, ResultError, ErrStaleLeaseTerm)
+				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
+				continue
+			}
+			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch, promoteTerm, promoteKey); err != nil {
 				// Fall through to the reschedule path on ANY promote error, including a
 				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
 				// replicated to the replica host yet). This is NOT a downgrade to a

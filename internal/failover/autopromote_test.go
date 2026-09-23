@@ -249,7 +249,7 @@ type dbPromoter struct {
 	fenceEpochs     []string // fence_epoch passed for each promote (bind-to-fence assertion)
 }
 
-func (p *dbPromoter) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error {
+func (p *dbPromoter) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64, leaseKey string) error {
 	p.promoted = append(p.promoted, vmName)
 	p.fenceEpochs = append(p.fenceEpochs, fenceEpoch)
 	if p.failUnavailable {

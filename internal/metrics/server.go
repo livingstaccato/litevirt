@@ -319,6 +319,7 @@ type collector struct {
 	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
 	replicationMinSeq  *prometheus.Desc // MIN(last_seq) across replication_watermarks
 	replicationPending *prometheus.Desc // entries ahead of the slowest LIVE peer
+	replicationAge     *prometheus.Desc // seconds the oldest un-acked entry has waited
 	replicationPeerLag *prometheus.Desc // per-peer backlog: MAX(seq) - peer last_seq
 
 	// NetBox IPAM gauges. Both are CURRENT state, which the NetBox counters
@@ -481,6 +482,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"mutation_log entries written but not yet acked by the slowest LIVE peer (MAX(seq) - MIN(live last_seq)); 0 when there are no live peers",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		replicationAge: prometheus.NewDesc(
+			"litevirt_replication_backlog_age_seconds",
+			"Seconds the oldest mutation_log entry not yet acked by the slowest LIVE peer has been waiting on this node; 0 when caught up or when there are no live peers",
+			nil, prometheus.Labels{"host": hostName},
+		),
 		replicationPeerLag: prometheus.NewDesc(
 			"litevirt_replication_peer_pending_entries",
 			"Per-peer replication backlog: local mutation_log tail (MAX(seq)) minus the peer's acknowledged last_seq. One series per live peer; a single climbing series identifies the lagging peer",
@@ -549,6 +555,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.mutationLogSize
 	ch <- c.replicationMinSeq
 	ch <- c.replicationPending
+	ch <- c.replicationAge
 	ch <- c.replicationPeerLag
 	ch <- c.netboxSyncQueueDepth
 	ch <- c.netboxBindingsSuspended
@@ -768,6 +775,35 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.replicationPending, prometheus.GaugeValue, pending)
+
+	// Backlog AGE: how long the oldest entry the slowest live peer has not
+	// acknowledged has been waiting on this node. pending_entries says how
+	// much is queued, which is the wrong quantity to alert on — a thousand
+	// entries a second behind is healthy, three entries an hour behind is a
+	// peer that has stopped acknowledging. Age is the one an operator can put
+	// a threshold on.
+	//
+	// created_at is stamped when the entry lands in THIS node's log, including
+	// for a relay's forwarded entries, so this is the wait on this hop, not end
+	// to end. MIN(created_at) rather than the lowest seq: in production the two
+	// agree, and created_at is the quantity being reported. The column is
+	// written as RFC3339 UTC everywhere, so the string MIN is chronological.
+	// Zero with no live peer, for the reason pending_entries is: nobody to be
+	// behind.
+	age := 0.0
+	if wm, werr := c.db.Query(ctx,
+		`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
+		 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff); werr == nil && len(wm) > 0 && wm[0].Int("live") > 0 {
+		if ol, oerr := c.db.Query(ctx,
+			`SELECT MIN(created_at) AS oldest FROM mutation_log WHERE seq > ?`, wm[0].Int("minseq")); oerr == nil && len(ol) > 0 {
+			if ts, perr := time.Parse(time.RFC3339, ol[0].String("oldest")); perr == nil {
+				if d := time.Since(ts).Seconds(); d > 0 {
+					age = d
+				}
+			}
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(c.replicationAge, prometheus.GaugeValue, age)
 
 	// Per-peer replication backlog: how far each LIVE peer is behind the local
 	// mutation_log tail. Restricted to watermarks updated within

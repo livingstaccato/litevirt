@@ -671,6 +671,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_failover_attempts_total{result="error"}` | rate > 0 over 5 min (a failover decision hit a store/fence error) |
 | `litevirt_mutation_log_rows` | rapidly growing (replication backlog) |
 | `litevirt_replication_min_watermark_seq` | not advancing for > 5 min |
+| `litevirt_replication_backlog_age_seconds` | > 300 s sustained |
 | `litevirt_daemon_open_fds` | > 5000 (FD leak) |
 | `litevirt_lb_keepalived_up{lb}` | `== 0` sustained (a load balancer's VIP is not assigned — see [compose.md](compose.md#load-balancer)) |
 

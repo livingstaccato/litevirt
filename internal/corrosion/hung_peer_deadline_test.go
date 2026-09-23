@@ -138,4 +138,3 @@ func TestCheckPeers_AHungPeerDoesNotStallTheRest(t *testing.T) {
 		t.Error("the healthy peer was never checked — one hung peer stalled anti-entropy for the rest")
 	}
 }
-

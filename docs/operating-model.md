@@ -237,11 +237,24 @@ so a host that looks stuck says which of the two is outstanding.
 
 There is no way to stand the ledger token down, deliberately. It has no config
 flag, and deleting its marker file does not last — the monitor re-latches as
-soon as the fleet is uniform. If you need minting to stop, stop the fleet being
-uniform: roll a host back below this build, or leave one on the previous
-release. Terms are additive audit facts and nothing acts on them until
-`enforcement.lease_term` is enabled, and that IS a flag — so the thing you would
-actually want to stop in an incident is reachable the ordinary way.
+soon as the fleet is uniform.
+
+**Rolling a host back does NOT stop minting, and makes things worse.** The
+latch is monotone by construction: `DurablyLatched` reads the persisted
+activation markers and never consults current peer support, which is the whole
+point of a fail-closed latch — a partition must not silently re-open the legacy
+path. A host that drops below this build therefore stops *nothing*. The nodes
+that already latched keep minting, and the rolled-back binary cannot resolve
+the mint's statement shape, so an unregistered shape back-pressures its entire
+replication stream. The one host you rolled back to regain control is the one
+that stops replicating.
+
+If you need minting to stop, there is no supported switch; treat it as a
+defect to report rather than an operation to perform. What you can stop is
+anything ACTING on the terms: `enforcement.lease_term` is a real config flag,
+it is authoritative for both enforcement and recovery, and terms are additive
+audit facts that nothing reads until it is on. In an incident that is the lever
+you want.
 
 So an ordinary rolling restart of an N-host cluster mints roughly 3N terms —
 each of the three leases moves once per host — on **every** roll. Size a

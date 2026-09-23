@@ -453,16 +453,28 @@ const (
 //
 //   - split_brain_gate_v1 flips via `supported` alone, so marker deletion
 //     remains its sole stand-down.
+//
 //   - lease_term_ledger_v1 has no stand-down at all, deliberately. Deleting its
 //     marker does nothing lasting, because the HA monitor re-establishes the
 //     latch the moment the fleet is uniform and there is no flag to stop it.
-//     The intended way to stop minting terms is to stop the fleet being
-//     uniform — roll a host back below this build, or leave one on the previous
-//     release — which the latch already reacts to, since it is
-//     ReplicationGated and so consults every host still receiving replication.
-//     Terms are additive audit facts and nothing reads them until
-//     enforcement.lease_term is on, which IS a flag, so the thing an operator
-//     might actually need to stop is reachable by ordinary means.
+//
+//     ROLLING A HOST BACK DOES NOT STOP MINTING. This comment used to say it
+//     did — "which the latch already reacts to, since it is ReplicationGated
+//     and so consults every host still receiving replication" — and that is
+//     false of the function the mint gate actually calls. wireLeaseTermLedgerGate
+//     uses Checker.DurablyLatched, which reads the persisted activation markers
+//     and never consults current peer support, BY DESIGN: a fail-closed latch
+//     must not re-open the legacy path when a peer goes away. So a host dropped
+//     below this build stops nothing, the latched nodes keep minting statement
+//     shapes it cannot resolve, and an unregistered shape back-pressures its
+//     whole replication stream. The host rolled back to regain control is the
+//     one that stops replicating.
+//
+//     What an operator can stop is anything ACTING on the terms:
+//     enforcement.lease_term is a real flag and is authoritative for
+//     enforcement and recovery both. Terms are additive audit facts that
+//     nothing reads until it is on, so that is the lever an incident wants.
+//     TestDurablyLatchedIsMonotone pins the behaviour this paragraph describes.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the

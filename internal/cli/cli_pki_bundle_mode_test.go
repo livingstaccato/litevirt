@@ -17,7 +17,10 @@ import (
 // the file has a name anyone else can reach.
 //
 // The directory chown is a separate matter and stays: it is created by MkdirAll
-// here, not supplied by the caller.
+// here, not supplied by the caller — and, since that assumption does not hold
+// either (MkdirAll neither guarantees a fresh directory nor stops it being
+// replaced), the directory chown goes through a descriptor rather than a path.
+// See TestChownDirNoFollow_RefusesASymlink.
 func TestInstallCLIClientBundle_DoesNotChownFilesByPathname(t *testing.T) {
 	src, dst := t.TempDir(), t.TempDir()
 	for _, n := range []string{"ca.crt", "client.crt", "client.key"} {
@@ -30,6 +33,13 @@ func TestInstallCLIClientBundle_DoesNotChownFilesByPathname(t *testing.T) {
 	orig := chownPath
 	chownPath = func(p string, uid, gid int) error { chowned = append(chowned, p); return nil }
 	t.Cleanup(func() { chownPath = orig })
+	// The DIRECTORY chown goes through chownDirNoFollow now — it opens the
+	// directory with O_NOFOLLOW|O_DIRECTORY and chowns the descriptor, so the
+	// pathname is never re-resolved. It still has to be observed here, or this
+	// test would silently stop covering the one chown that does happen.
+	origDir := chownDirNoFollow
+	chownDirNoFollow = func(p string, uid, gid int) error { chowned = append(chowned, p); return nil }
+	t.Cleanup(func() { chownDirNoFollow = origDir })
 
 	// The CALLER's own uid/gid. Any process may "change" ownership to what it
 	// already is; a hardcoded uid only works on a machine where that uid happens

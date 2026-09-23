@@ -107,7 +107,21 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout(ctx, 10)),
 		"-p", fmt.Sprintf("%d", port),
 		target,
-		"systemctl poweroff 2>/dev/null || poweroff 2>/dev/null || true",
+		// No trailing `|| true`. It used to be here, and it meant a host whose
+		// shutdown commands BOTH failed still exited 0, so this returned
+		// Method:"ssh", Success:true for a machine that was still running. That
+		// success is load-bearing: fenceProvedOff writes hosts.state="fenced"
+		// from it, and a later coordinator resumes the reschedule from that
+		// record alone — so a fence that never landed became authority to start
+		// the host's VMs somewhere else.
+		//
+		// Removing it moves exactly one case: the remote shell ran and its
+		// poweroff attempts failed. A poweroff that succeeds still exits 0, and
+		// a connection that drops (the other reason a real fence looks like a
+		// failure) makes ssh itself exit 255 — which was already reported as a
+		// failure before this change and still is. Nothing that used to be
+		// reported as a success and WAS one has changed.
+		"systemctl poweroff 2>/dev/null || poweroff 2>/dev/null",
 	)
 	out, runErr := cmd.CombinedOutput()
 	detail := fmt.Sprintf("SSH poweroff to %s: %s", target, strings.TrimSpace(string(out)))

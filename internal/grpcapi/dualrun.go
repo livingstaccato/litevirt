@@ -221,9 +221,6 @@ func (s *Server) RunDualRunDetector(ctx context.Context, interval time.Duration)
 // the lease itself still gates who runs at all, and refusing here would
 // silently disable the detector for the length of an upgrade.
 func (s *Server) stillDualRunLeader(ctx context.Context, passTerm int64) bool {
-	if passTerm == 0 {
-		return true
-	}
 	held, term, err := corrosion.AcquireLeaseWithTerm(
 		ctx, s.db, dualRunLeaseKey, s.hostName, 2*dualRunLeaseProbeTTL, time.Now())
 	if err != nil {
@@ -233,9 +230,24 @@ func (s *Server) stillDualRunLeader(ctx context.Context, passTerm int64) bool {
 		return false
 	}
 	if !held {
+		// Somebody else holds it. True whether or not a term exists.
 		return false
 	}
 	s.dualRunLeaseTerm.Store(term)
+
+	// passTerm 0 means the ledger could not mint when the pass began, which is
+	// every rolling upgrade and is PERMANENT on a cluster deliberately kept one
+	// host back. Returning true here BEFORE the read above made the whole fence
+	// inert in exactly that window.
+	//
+	// There is no tenure to compare, so holder identity is the strongest
+	// available test — and it still catches the case that matters, a successor
+	// taking the lease while this node was stalled. What it cannot see is a
+	// lapse-and-retake by this same host, which is why the term comparison
+	// stays primary wherever a term exists.
+	if passTerm == 0 {
+		return true
+	}
 	return term == passTerm
 }
 

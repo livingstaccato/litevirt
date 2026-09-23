@@ -69,6 +69,10 @@ type Checker struct {
 	db       *corrosion.Client
 	tlsCfg   *tls.Config
 
+	// writeFn replaces the host_health write in tests. Nil in production,
+	// where checkHost calls the corrosion client directly.
+	writeFn func(ctx context.Context, sqlStr string, params ...interface{}) error
+
 	mu     sync.Mutex
 	peers  map[string]*peerState // target hostname → cached state
 	crlVer int64                 // last published CRL version
@@ -402,9 +406,6 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		sinceWrite = HeartbeatInterval // never written: the first probe publishes
 	}
 	write := shouldPersistHealth(changed, healthy, recoveryPending(host.State), sinceWrite)
-	if write {
-		prev.lastWriteAt = mono
-	}
 	c.mu.Unlock()
 
 	if !write {
@@ -412,21 +413,40 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	}
 
 	now := c.db.NowTS()
+	exec := c.db.ExecuteDeferred
+	if c.writeFn != nil {
+		exec = c.writeFn
+	}
+	var err error
 	if healthy {
 		// last_seen is a wall/display column (read as wall time via parseTimestamp), so
 		// it must use NowWall, NOT NowTS — NowTS is the LWW key and becomes an HLC string.
-		c.db.ExecuteDeferred(ctx,
+		err = exec(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, ?, 0, ?, ?)`,
 			c.hostName, host.Name, "healthy", c.db.NowWall(), now,
 		)
 	} else {
-		c.db.ExecuteDeferred(ctx,
+		err = exec(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
 			c.hostName, host.Name, newStatus, newFailures, nil, now,
 		)
 	}
+	if err != nil {
+		// Do NOT advance lastWriteAt. It records when a verdict was PUBLISHED,
+		// and stamping it for a write that failed makes an observer publishing
+		// nothing indistinguishable from one heartbeating normally — the host
+		// it is meant to recover then sits fenced with no log line naming the
+		// cause. Leaving it unstamped also retries on the next probe instead
+		// of waiting a full heartbeat interval.
+		slog.Warn("health: publishing the peer verdict failed",
+			"observer", c.hostName, "target", host.Name, "healthy", healthy, "error", err)
+		return
+	}
+	c.mu.Lock()
+	prev.lastWriteAt = mono
+	c.mu.Unlock()
 }
 
 func (c *Checker) probe(addr string) bool {

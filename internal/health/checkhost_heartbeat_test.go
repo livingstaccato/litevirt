@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -177,5 +178,48 @@ func TestRecoveryPendingMatchesRecoverHosts(t *testing.T) {
 		if recoveryPending(s) {
 			t.Errorf("recoveryPending(%q) = true; recoverHosts hits `default: continue` for it", s)
 		}
+	}
+}
+
+// TestCheckHost_AFailedWriteDoesNotCountAsPublished is the failure mode the
+// heartbeat fix itself introduced.
+//
+// checkHost marked the row published — advancing lastWriteAt — BEFORE
+// attempting the write, and discarded the write's error. An observer whose
+// corrosion client is rejecting writes (WAL quarantine, sustained SQLITE_BUSY
+// under a replication catch-up) therefore looks exactly like one heartbeating
+// normally: recoverHosts never sees a fresh healthy observer, the host sits
+// fenced indefinitely, and no log line anywhere names the failed write.
+//
+// A write that did not happen must not advance the clock that decides when to
+// write next, or the retry waits a full interval for a write that will fail
+// again.
+func TestCheckHost_AFailedWriteDoesNotCountAsPublished(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	addr, port := healthyPeer(t)
+	c := probingChecker(t, db)
+	host := corrosion.HostRecord{Name: "host-b", Address: addr, GRPCPort: port, State: "offline"}
+
+	// First probe publishes and stamps lastWriteAt.
+	c.checkHost(ctx, host)
+
+	// Now make the write fail, and confirm the bookkeeping does not pretend
+	// otherwise: lastWriteAt must not move past a write that did not land.
+	c.mu.Lock()
+	c.peers["host-b"].lastWriteAt = time.Time{} // due a heartbeat
+	c.mu.Unlock()
+	c.writeFn = func(context.Context, string, ...interface{}) error {
+		return errors.New("corrosion write rejected")
+	}
+
+	c.checkHost(ctx, host)
+
+	c.mu.Lock()
+	stamped := c.peers["host-b"].lastWriteAt
+	c.mu.Unlock()
+	if !stamped.IsZero() {
+		t.Fatal("a failed health write advanced lastWriteAt; the observer now looks like " +
+			"it is heartbeating while publishing nothing, and the next retry waits a full interval")
 	}
 }

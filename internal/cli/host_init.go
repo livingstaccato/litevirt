@@ -55,14 +55,16 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	}
 	defer sc.Close()
 
-	// `cat ... || true` so an absent config reads as empty rather than as an
-	// error: a node with no config is exactly the node init is for.
-	existingCfg, err := sc.RunOutput(fmt.Sprintf("cat %s 2>/dev/null || true", daemonConfigPath))
-	if err != nil {
-		return fmt.Errorf("read the target's existing %s: %w", daemonConfigPath, err)
-	}
-	if err := refuseIfAlreadyAMember(sshTarget, existingCfg, force); err != nil {
+	// ABSENT and UNREADABLE must not look alike here: see classifyRemoteConfig.
+	rawCfg, runErr := sc.RunOutput(remoteConfigProbe(daemonConfigPath))
+	existingCfg, absent, err := classifyRemoteConfig(string(rawCfg), runErr)
+	if err != nil && !force {
 		return err
+	}
+	if !absent {
+		if err := refuseIfAlreadyAMember(sshTarget, []byte(existingCfg), force); err != nil {
+			return err
+		}
 	}
 
 	pkiDir := PKIDir()
@@ -730,6 +732,54 @@ func shellEnvPrefix(env []string) string {
 		out = append(out, k+"="+ssh.ShellQuote(v))
 	}
 	return strings.Join(out, " ")
+}
+
+// noConfigSentinel is what the remote probe prints when the config genuinely
+// does not exist, so that "absent" is a positive statement rather than the
+// absence of output.
+const noConfigSentinel = "__LV_NO_CONFIG__"
+
+// remoteConfigProbe reads the target's daemon config, distinguishing ABSENT
+// from UNREADABLE.
+//
+// The old probe was `cat <path> 2>/dev/null || true`, which turns both into
+// empty output. `-e` answers the existence question separately, and cat's exit
+// status is no longer swallowed, so a file that exists but cannot be read
+// fails the command instead of reporting nothing.
+func remoteConfigProbe(path string) string {
+	return fmt.Sprintf("if [ -e %s ]; then cat -- %s; else printf '%%s' '%s'; fi",
+		ssh.ShellQuote(path), ssh.ShellQuote(path), noConfigSentinel)
+}
+
+// classifyRemoteConfig turns the probe's result into absent/present, refusing
+// anything it cannot tell apart.
+//
+// A failed read is NOT an absence. refuseIfAlreadyAMember is the guard that
+// stops `lv host init` running against a live member, and the setup script it
+// gates rewrites config.yaml with join_peers: []. A node that loses that file
+// loses its peer list AND the signal that stops it minting an admin
+// credential -- a later state.db rebuild then mints a fresh admin row that
+// wins LWW and replaces the cluster's real admin password on every peer.
+//
+// So only the sentinel means absent. A non-zero exit, or empty output with no
+// sentinel, means the probe did not answer and the run is refused -- with the
+// same --force escape hatch the parse failure already has.
+func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
+	if runErr != nil {
+		return "", false, fmt.Errorf("could not read the target's %s: %w\n"+
+			"Refusing: an unreadable config is not an absent one, and initializing over a "+
+			"live member erases its join_peers. Fix the read, or pass --force if you are "+
+			"certain this node is spare", daemonConfigPath, runErr)
+	}
+	if strings.TrimSpace(out) == noConfigSentinel {
+		return "", true, nil
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", false, fmt.Errorf("the probe for the target's %s returned nothing at all, "+
+			"not even the absent-marker; refusing rather than assuming there is no config "+
+			"there. Pass --force if you are certain this node is spare", daemonConfigPath)
+	}
+	return out, false, nil
 }
 
 // setupScriptEnv is the environment the setup script reads to write the daemon

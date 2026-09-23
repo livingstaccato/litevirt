@@ -126,8 +126,12 @@ func (c *Client) CopyFileMode(localPath, remotePath string, mode os.FileMode) er
 	return c.WriteFile(remotePath, data, mode)
 }
 
-// shellQuote renders s as a single-quoted POSIX shell word.
-func shellQuote(s string) string {
+// ShellQuote renders s as a single-quoted POSIX shell word.
+//
+// Exported because every caller that builds a remote command line from data
+// needs it, not only this package: an SSH exec request is run by the login
+// shell, so anything interpolated into one is shell input.
+func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
@@ -154,7 +158,7 @@ func shellQuote(s string) string {
 // that case an error instead. -- stops a path that begins with "-" being read
 // as options.
 func writeFileCmd(remotePath string, mode os.FileMode) string {
-	q := shellQuote(remotePath)
+	q := ShellQuote(remotePath)
 	return fmt.Sprintf(
 		"set -e; d=$(dirname %s); t=$(mktemp \"$d/.litevirt.XXXXXX\"); "+
 			"trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; chmod %o \"$t\"; "+

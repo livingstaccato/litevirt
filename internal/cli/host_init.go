@@ -299,7 +299,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
 	if err := sc.RunWithInput(fmt.Sprintf("%s bash -s",
-		strings.Join(setupScriptEnv(hostName, hostAddr, peersYAML), " ")), []byte(setupScript)); err != nil {
+		shellEnvPrefix(setupScriptEnv(hostName, hostAddr, peersYAML))), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
@@ -700,6 +700,36 @@ func resolveHost(host string) (string, error) {
 	return "", fmt.Errorf("resolve host %q: only IPv6 addresses found (%v) and cluster "+
 		"transport is IPv4-only; give the host an A record or pass its IPv4 address directly",
 		host, addrs)
+}
+
+// shellEnvPrefix renders env assignments as a shell command prefix, with every
+// VALUE single-quoted.
+//
+// The remote path joins these into one command line and hands it to
+// session.Run, which is an SSH exec request: sshd runs it through the login
+// shell, so an assignment word undergoes command substitution before the
+// command it prefixes ever starts. JOIN_PEERS is built from hosts.address — a
+// replicated, peer-writable column — so an unquoted join let any node with SQL
+// access execute as root on every host added afterwards, before the daemon,
+// PKI or systemd units were in place.
+//
+// Only the value is quoted. Quoting the KEY too would stop the word being an
+// assignment at all.
+//
+// This is NOT applied to the local path, which passes the same slice as
+// cmd.Env, where a shell never sees it and quotes would become part of the
+// value.
+func shellEnvPrefix(env []string) string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			out = append(out, ssh.ShellQuote(kv))
+			continue
+		}
+		out = append(out, k+"="+ssh.ShellQuote(v))
+	}
+	return strings.Join(out, " ")
 }
 
 // setupScriptEnv is the environment the setup script reads to write the daemon

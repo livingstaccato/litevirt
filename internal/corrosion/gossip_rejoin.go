@@ -104,6 +104,7 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 		},
 	}
 
+	rep := &isolationReporter{c: c, host: c.hostName, now: time.Now}
 	for {
 		// Jittered so nodes recovering from one partition do not dial together.
 		d := rejoinInterval + time.Duration(rand.Int63n(int64(rejoinInterval/2)))
@@ -112,18 +113,28 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 			return
 		case <-time.After(d):
 		}
-		attempted, joined, err := r.tick()
-		if !attempted {
-			continue
-		}
-		if err != nil {
-			// REPORTED every attempt, not once at startup. "joined 0 of N" is
-			// the signal an operator needs, and logging it once and carrying on
-			// is what made a whole partition invisible.
-			slog.Warn("gossip: this node sees no peers and could not re-join",
-				"joined", joined, "error", err)
-			continue
-		}
-		slog.Info("gossip: re-joined after losing every peer", "peers", joined)
+		c.membershipTick(ctx, r, rep)
 	}
+}
+
+// membershipTick is one pass of the re-join loop: attempt a re-join if this
+// node sees nobody, log the outcome, and keep the isolation condition current.
+func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolationReporter) {
+	attempted, joined, err := r.tick()
+	// Isolated means this pass had to try AND got nowhere. A pass that did not
+	// try either sees peers already or has nobody to find (a single-node
+	// cluster with no seeds) — neither is isolation.
+	rep.report(ctx, attempted && (err != nil || joined == 0), err)
+	if !attempted {
+		return
+	}
+	if err != nil {
+		// REPORTED every attempt, not once at startup. "joined 0 of N" is
+		// the signal an operator needs, and logging it once and carrying on
+		// is what made a whole partition invisible.
+		slog.Warn("gossip: this node sees no peers and could not re-join",
+			"joined", joined, "error", err)
+		return
+	}
+	slog.Info("gossip: re-joined after losing every peer", "peers", joined)
 }

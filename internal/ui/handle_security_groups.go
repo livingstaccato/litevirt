@@ -87,6 +87,7 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.add", name, "")
 	sendToast(w, "Security group "+name+" created", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -114,6 +115,7 @@ func (s *Server) handleDeleteSG(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.rm", id, "")
 	sendToast(w, "Security group deleted", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -160,6 +162,7 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.rule.add", sgID, r.FormValue("direction")+" "+r.FormValue("action"))
 	sendToast(w, "Rule added", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -185,6 +188,7 @@ func (s *Server) handleDeleteSGRule(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.rule.rm", r.PathValue("rule"), "")
 	sendToast(w, "Rule removed", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)

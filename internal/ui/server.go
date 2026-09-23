@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -107,6 +109,38 @@ type Authorizer interface {
 // SetAuthorizer wires the daemon's authorizer for the in-process write paths
 // that have no gRPC twin.
 func (s *Server) SetAuthorizer(a Authorizer) { s.authz = a }
+
+// auditUIWrite records an in-process UI mutation in the audit chain.
+//
+// Security groups have no gRPC twin, so these writes never passed through a
+// handler that audits. The consequence is worse than a missing log: `lv audit
+// verify` reports a clean, unbroken, SIGNED chain in which nobody changed the
+// security groups, so post-incident the log reads as proof that the isolation
+// rules were never touched.
+//
+// The principal comes from the daemon's own Whoami for this session, not from
+// anything the request supplies. A failure is logged and not returned: the
+// write has already happened, and reporting an error the caller would read as
+// "the change did not land" is worse than a gap the log itself shows.
+func (s *Server) auditUIWrite(r *http.Request, action, target, detail string) {
+	ctx := s.uiBearerCtx(r)
+	user := "unknown"
+	if who, err := s.grpc.Whoami(ctx, &emptypb.Empty{}); err == nil && who.GetUsername() != "" {
+		user = who.GetUsername()
+	}
+	if s.db == nil {
+		slog.Error("ui: no cluster DB handle; a mutation went unaudited",
+			"action", action, "target", target, "user", user)
+		return
+	}
+	if err := corrosion.InsertAuditLog(context.WithoutCancel(ctx), s.db, corrosion.AuditRecord{
+		Username: user, HostName: s.cluster, Action: action, Target: target,
+		Detail: detail, Result: "ok",
+	}); err != nil {
+		slog.Error("ui: could not write the audit row for a mutation that already landed",
+			"action", action, "target", target, "user", user, "error", err)
+	}
+}
 
 // authorize applies the daemon's authorization to an in-process write.
 //

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -66,7 +67,12 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if err := corrosion.DeleteResourceMapping(r.Context(), s.db, r.PathValue("name")); err != nil {
+	// Through the twin: it authorizes with the caller's forwarded bearer AND
+	// writes the audit row. An in-process write leaves `lv audit verify`
+	// reporting a clean, unbroken, signed chain in which nobody changed
+	// anything -- which is worse than no audit log, because it reads as proof.
+	if _, err := s.grpc.DeleteResourceMapping(s.uiBearerCtx(r),
+		&pb.DeleteResourceMappingRequest{Name: r.PathValue("name")}); err != nil {
 		sendToast(w, "Delete failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return

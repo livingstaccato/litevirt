@@ -295,6 +295,15 @@ a bare reschedule on failure. Default off. Promotion uses the newest
 (crash-consistent, possibly lagging) replica — enable only where a small lag
 window is acceptable.
 
+Automatic promotion **refuses a replica older than 48 hours** (or one whose
+filename carries no readable timestamp) and falls back to a plain reschedule —
+the same outcome as having no replica. Without a bound, a schedule that had been
+failing for days left a replica as promotable as a fresh one, and failover would
+replace a VM running on current data with a week-old disk. 48 hours leaves room
+for a daily schedule plus one missed run. **Manual** `lv replication promote` is
+not bounded: an operator who has seen the age and chosen it anyway is making a
+different decision.
+
 ## Live restore
 
 `lv backup restore-live` exposes a manifest as an NBD source so a VM

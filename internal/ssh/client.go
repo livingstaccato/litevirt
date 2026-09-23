@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -35,8 +36,16 @@ func NewClient(target string) (*Client, error) {
 
 	hostKeyCallback, err := defaultHostKeyCallback()
 	if err != nil {
-		// Fall back to insecure if no known_hosts
-		hostKeyCallback = ssh.InsecureIgnoreHostKey()
+		// No usable known_hosts (no HOME, unreadable file). Accept-new still
+		// applies -- there is nothing to compare against, and refusing here
+		// would make provisioning impossible on a fresh workstation -- but say
+		// so, because this connection carries the cluster CA-signed host key
+		// and nothing is pinning the far end.
+		fmt.Fprintf(os.Stderr,
+			"warning: no usable known_hosts (%v); %s's host key cannot be checked "+
+				"against a previous one. This connection carries the cluster CA-signed "+
+				"host key.\n", err, host)
+		hostKeyCallback = firstContactOnlyCallback(host)
 	}
 
 	config := &ssh.ClientConfig{
@@ -327,6 +336,53 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 	return ssh.ParsePrivateKey(data)
 }
 
+// hostKeyVerdict decides what to do with the knownhosts callback's answer.
+//
+// The old policy accepted unknown hosts AND key mismatches, on the stated
+// grounds that "litevirt manages its own trust via mTLS -- SSH is just a
+// transport for setup/upgrade operations". That is exactly backwards for the
+// operation it is used by: `lv host init` and `lv host add` use SSH to carry
+// the cluster CA-signed HOST PRIVATE KEY to a machine that has no mTLS
+// identity yet. There is no other anchor at that moment, so accepting a
+// changed key hands that key to whoever answered.
+//
+// knownhosts.KeyError distinguishes the two cases by Want:
+//
+//   - empty  -- the host is UNKNOWN. Unavoidable: provisioning a new machine
+//     is always first contact. Accepted (the documented
+//     StrictHostKeyChecking=accept-new behaviour).
+//   - non-empty -- the host is KNOWN and the key CHANGED. Refused. Nothing
+//     about provisioning requires this, and it is the whole MITM.
+func hostKeyVerdict(hostname string, err error) error {
+	if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) {
+		if len(keyErr.Want) == 0 {
+			return nil // unknown host: accept-new
+		}
+		return fmt.Errorf("host key for %s CHANGED (known key at %s:%d) -- refusing: "+
+			"this connection would carry the cluster CA-signed host key, and a changed "+
+			"key means something other than the host we trusted is answering. If the "+
+			"host was genuinely rebuilt, remove its known_hosts entry first",
+			hostname, keyErr.Want[0].Filename, keyErr.Want[0].Line)
+	}
+	return err
+}
+
+// firstContactOnlyCallback is used when no known_hosts is usable at all.
+//
+// It accepts, because with no store there is no previous key to contradict and
+// refusing would make `lv host init` impossible on a fresh workstation. It is a
+// named function rather than ssh.InsecureIgnoreHostKey so the two cases cannot
+// be confused: this one has been reported to the operator, and it is reached
+// only when the store itself is missing -- never to paper over a MISMATCH,
+// which hostKeyVerdict refuses even here.
+func firstContactOnlyCallback(host string) ssh.HostKeyCallback {
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		slog.Warn("ssh: host key not verified (no known_hosts store)",
+			"host", host, "remote", remote.String(), "key_type", key.Type())
+		return nil
+	}
+}
+
 func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -337,18 +393,10 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Wrap the callback to accept unknown hosts (equivalent to
-	// StrictHostKeyChecking=accept-new). Mismatched keys for known
-	// hosts are still accepted since litevirt manages its own trust
-	// via mTLS — SSH is just a transport for setup/upgrade operations.
+	// accept-new, not accept-anything: see hostKeyVerdict for why a CHANGED
+	// key is refused even though an unknown one is not.
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		err := cb(hostname, remote, key)
-		if keyErr := (*knownhosts.KeyError)(nil); errors.As(err, &keyErr) {
-			// Accept unknown hosts and key mismatches — litevirt
-			// manages trust via mTLS, SSH is just a transport.
-			return nil
-		}
-		return err
+		return hostKeyVerdict(hostname, cb(hostname, remote, key))
 	}, nil
 }
 

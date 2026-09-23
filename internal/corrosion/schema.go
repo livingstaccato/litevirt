@@ -2450,6 +2450,22 @@ var schemaIndexes = []string{
 	// unindexed scan grows without bound on the renewal hot path, under the
 	// client read lock.
 	`CREATE INDEX IF NOT EXISTS idx_lease_terms_holder ON leader_lease_terms(key, holder, term) WHERE deleted_at IS NULL`,
+
+	// Runtime action proofs: the fenced-claim conflict guard selects on
+	// (lease_term, lease_key, executor_host) and no existing index covers it, so
+	// it was a FULL TABLE SCAN inside the claim's write transaction, while the
+	// global client mutex is held.
+	//
+	// Deliberately NOT partial-on-live. The guard includes tombstones on
+	// purpose -- a conflicting claim is evidence, not a consumable, and spending
+	// it is what created the evidence -- so a `WHERE deleted_at IS NULL` index
+	// would not serve the query at all. That also means the scan grows with
+	// every proof ever written, not with the live set: a year into a busy
+	// cluster it is hundreds of thousands of rows, walked once per claim, and a
+	// host loss drives dozens of claims at once. Everything else on that node --
+	// health publishes, lease renewals, replication applies -- queues behind it,
+	// and the lease-renewal path is the one that must not stall.
+	`CREATE INDEX IF NOT EXISTS idx_proofs_term_claimant ON runtime_action_proofs(executor_host, lease_key, lease_term)`,
 }
 
 // tablePrimaryKeys maps table names to their primary key column(s).

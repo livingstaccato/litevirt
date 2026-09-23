@@ -507,6 +507,14 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 		// them: a conflicting claim is evidence, not a consumable, and spending
 		// it is what created the evidence. Excluding them would let a reaped
 		// claim stop fencing and re-open the split this guard exists to catch.
+		//
+		// Because tombstones count, this query's cost grows with every proof
+		// ever written rather than with the live set, and it runs inside the
+		// claim's write transaction under the global client mutex. It is bounded
+		// by idx_proofs_term_claimant (executor_host, lease_key, lease_term) --
+		// NOT by the reap, which deliberately cannot help here. If that index is
+		// ever made partial-on-live it stops serving this query and a host loss
+		// starts stalling lease renewals on the same node.
 		var conflict int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM runtime_action_proofs

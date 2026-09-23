@@ -108,6 +108,11 @@ type Client struct {
 
 	// replicator is notified when new mutations are written to mutation_log.
 	// Set via SetReplicator after construction.
+	// replicatorNotify is a BROADCAST channel: it is closed and replaced, never
+	// sent to, so one local write wakes every per-peer push loop. notifyMu is
+	// its own lock rather than c.mu, because notifyReplicator is called from
+	// commit paths that already hold c.mu.
+	notifyMu         sync.Mutex
 	replicatorNotify chan struct{}
 
 	// membershipNotify is a coalescing wake (cap 1) for the replicator's
@@ -756,7 +761,7 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 		hostName:         cfg.HostName,
 		clock:            clock,
 		dataDir:          cfg.DataDir,
-		replicatorNotify: make(chan struct{}, 1),
+		replicatorNotify: make(chan struct{}),
 		membershipNotify: make(chan struct{}, 1),
 	}
 	if err := c.initClockPersistence(); err != nil {
@@ -818,7 +823,7 @@ func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 	c := &Client{
 		db:               db,
 		dataDir:          dataDir,
-		replicatorNotify: make(chan struct{}, 1),
+		replicatorNotify: make(chan struct{}),
 		membershipNotify: make(chan struct{}, 1),
 	}
 	if len(hostName) > 0 && hostName[0] != "" {
@@ -1175,16 +1180,39 @@ func (c *Client) execBatchLocal(ctx context.Context, stmts []Statement) error {
 	return nil
 }
 
-// notifyReplicator sends a non-blocking signal to the replicator.
+// notifyReplicator wakes every waiting per-peer push loop.
+//
+// It CLOSES the current channel and installs a fresh one. The previous form
+// sent one value into a capacity-1 channel that every per-peer goroutine
+// selected on, and a send wakes exactly one receiver: on a cluster with N peers
+// a committed write reached one peer promptly and the other N-1 waited out
+// their 10s periodic tick. That was the entire write-to-peer latency budget,
+// spent on a channel idiom rather than on anything about the network, and it
+// grew with the cluster.
+//
+// It was also invisible from both ends -- the push succeeded when it eventually
+// ran, the backlog drained, and nothing recorded that the entries had sat for
+// ten seconds first.
+//
+// Replacing the channel rather than leaving it closed matters: a closed channel
+// stays ready forever, which would spin every push loop at full tilt instead of
+// waking it once.
 func (c *Client) notifyReplicator() {
-	select {
-	case c.replicatorNotify <- struct{}{}:
-	default:
-	}
+	c.notifyMu.Lock()
+	ch := c.replicatorNotify
+	c.replicatorNotify = make(chan struct{})
+	c.notifyMu.Unlock()
+	close(ch)
 }
 
-// ReplicatorNotify returns the channel that fires when new mutations are available.
+// ReplicatorNotify returns the channel that fires when new mutations are
+// available.
+//
+// Callers must re-read it on every wait: notifyReplicator replaces it, so a
+// channel held across iterations would never fire again.
 func (c *Client) ReplicatorNotify() <-chan struct{} {
+	c.notifyMu.Lock()
+	defer c.notifyMu.Unlock()
 	return c.replicatorNotify
 }
 

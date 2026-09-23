@@ -120,6 +120,29 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 				slog.Error("incremental replication: chain reset write failed",
 					"vm", sched.VMName, "pool", sched.TargetPool, "error", rerr)
 			}
+			// Refuse the downgrade while the source is RUNNING. The full copy
+			// below is qemu-img convert -U reading an image the guest still has
+			// open, with no snapshot: it is smeared across the duration of the
+			// read, so it is neither point-in-time nor crash-consistent. Falling
+			// through to it means an operator who asked for the safe mechanism
+			// silently receives the unsafe one — and the replica is then
+			// promotable, so the downgrade does not surface until a failover
+			// boots a corrupt guest.
+			//
+			// Fail closed on anything that is not definitely stopped: "running"
+			// is not the only state in which qemu holds the image open, and a
+			// state this code does not recognise is not evidence of safety.
+			if vm.State != "stopped" {
+				slog.Error("incremental replication failed and the full-copy fallback is unsafe for a running source; producing no replica",
+					"vm", sched.VMName, "pool", sched.TargetPool, "state", vm.State, "error", err)
+				s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error",
+					fmt.Sprintf("%s: incremental failed (%v) and the full-copy fallback is not point-in-time for a %s VM", sched.TargetPool, err, vm.State))
+				s.notify(ctx, notify.Notification{
+					Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
+					Detail: fmt.Sprintf("incremental replication to %s failed and was not downgraded to a full copy: %v", sched.TargetPool, err),
+				})
+				return fmt.Errorf("incremental replication of %q failed (%v) and %w", sched.VMName, err, errUnsafeFullCopyFallback)
+			}
 			slog.Warn("incremental replication fell back to full copy",
 				"vm", sched.VMName, "pool", sched.TargetPool, "error", err)
 		}
@@ -134,6 +157,20 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 // replicateLocal writes the replica into a file-based pool on this host (the
 // shared-storage / same-host path), then prunes locally.
 func (s *Server) replicateLocal(ctx context.Context, sched corrosion.BackupScheduleRecord, src *corrosion.DiskRecord, ts string) error {
+	return s.replicateLocalWith(ctx, sched, src, ts, convertQcow2)
+}
+
+// errUnsafeFullCopyFallback marks a refusal to replace a failed incremental
+// replication with the full copy. Declared before it is consulted so the tests
+// that pin the refusal describe a behaviour, not a missing symbol.
+var errUnsafeFullCopyFallback = errors.New("full-copy fallback is not point-in-time for a running source")
+
+// replicaCopier copies a disk image to dst. convertQcow2 in production; the
+// parameter exists so the publication contract around it can be tested without
+// a real qemu-img failure, which is not something a test can stage.
+type replicaCopier func(ctx context.Context, src, dst string, emit func(*pb.MoveVolumeProgress) error) error
+
+func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupScheduleRecord, src *corrosion.DiskRecord, ts string, convert replicaCopier) error {
 	dstPool, ok := s.resolvePool(ctx, sched.TargetPool)
 	if !ok {
 		return fmt.Errorf("target pool %q not configured on host %q", sched.TargetPool, s.hostName)
@@ -159,7 +196,9 @@ func (s *Server) replicateLocal(ctx context.Context, sched corrosion.BackupSched
 		return fmt.Errorf("source and destination resolve to the same path")
 	}
 	noop := func(*pb.MoveVolumeProgress) error { return nil }
-	if err := convertQcow2(ctx, src.Path, dstPath, noop); err != nil {
+	if err := publishReplica(ctx, dstPath, func(tmp string) error {
+		return convert(ctx, src.Path, tmp, noop)
+	}); err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s: %v", src.DiskName, sched.TargetPool, err))
 		s.notify(ctx, notify.Notification{
 			Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
@@ -557,4 +596,50 @@ func pruneReplicas(dir, vmName, diskName string, keepN int) int {
 		}
 	}
 	return deleted
+}
+
+// publishReplica runs write against a temporary sibling of dst and renames it
+// into place only once it has succeeded and produced something.
+//
+// The local replication path used to hand the FINAL name to the converter. A
+// crash, a cancellation or a conversion error therefore left a truncated file
+// called `<vm>-<disk>-<ts>.qcow2`, which is exactly the name promotion looks
+// for — and promotion picks the lexically newest match, so the freshest
+// candidate on a failing schedule was the broken one. On a failure the file was
+// not even removed, so it stayed the newest until the next successful run.
+//
+// The temp name is dotted and does not end in .qcow2/.raw, so isReplicaOf never
+// matches it: a run that dies between the two steps leaves litter, not a
+// promotable lie. The cross-host path already worked this way — its upload
+// lands in an os.CreateTemp file and is renamed by the receiver — so this makes
+// the two paths agree.
+//
+// The emptiness check is the floor, not a validation: it catches a converter
+// that reported success and wrote nothing. A deeper check (qemu-img check,
+// format and size against the source) belongs with the per-replica manifest
+// that promotion should be selecting on instead of filename recency.
+func publishReplica(ctx context.Context, dst string, write func(tmp string) error) error {
+	_ = ctx
+	tmp := filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".partial")
+	// A leftover from an earlier interrupted run would otherwise be appended to
+	// or confuse the converter.
+	_ = os.Remove(tmp)
+	if err := write(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	fi, err := os.Stat(tmp)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replica was not written: %w", err)
+	}
+	if fi.Size() == 0 {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replica is empty; refusing to publish %s", filepath.Base(dst))
+	}
+	if err := os.Rename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("publish replica: %w", err)
+	}
+	return nil
 }

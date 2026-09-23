@@ -543,7 +543,7 @@ The guard has **two independent switches, and both must be on**:
 | Switch | Scope | Default |
 |---|---|---|
 | `shared_storage_fence_v1` | latches cluster-wide once every host advertises it | latches on upgrade |
-| `enforcement.shared_storage_fence` | per-host config | **false** |
+| `enforcement.shared_storage_fence` | per-host config | **false** when absent; `lv host init` writes **true** on a new cluster's first node |
 
 The gap this command exists to close: a host advertises the token **regardless
 of its own config flag**, because advertisement means "this binary supports the

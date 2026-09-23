@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -167,6 +168,13 @@ func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
 // retrying.
 var ErrProofDiverges = errors.New("a persisted proof with this id disagrees with the presented one")
 
+// ErrProofTermUnrecordable: this node validated a term-carrying proof it cannot
+// store faithfully, because its own emit gate is closed and the pre-term insert
+// shape would drop the term. Deliberately DISTINCT from ErrProofDiverges, which
+// asserts a real conflict between two proofs -- blaming a divergence that has
+// not happened sends an operator looking for a split-brain that does not exist.
+var ErrProofTermUnrecordable = errors.New("proof lease term cannot be recorded on this node")
+
 // ProofBindingEqual compares the fields that AUTHORIZE an action.
 //
 // It is the ONE definition of that field set. claimCarriedProof compares the
@@ -225,6 +233,35 @@ func ProofBindingEqual(a, b ActionProof) bool {
 // must match a live one; whether a SPENT proof may be re-used is
 // ClaimActionProof's question, and it has its own deleted_at filter.
 func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) error {
+	// Refuse a binding this node cannot record.
+	//
+	// The validation below compares the presented proof's lease_term/lease_key
+	// against any existing row, and then the seed goes through proofInsertStmt
+	// -- which swaps in insertProofPreTermSQL when this node's emit gate is
+	// closed, omitting BOTH columns so the row lands at the NOT NULL defaults
+	// (0, ""). Reporting success there stores something OTHER than what was
+	// checked.
+	//
+	// It is not an exotic state: the gate is per-node
+	// (MayEmitTermCarryingProof == MayMintLeaseTerm, wired to DurablyLatched),
+	// so a staggered roll routinely has a latched coordinator forwarding a
+	// term-carrying proof to a peer that has not latched. The coordinator's
+	// identical RETRY then re-presents (5, "failover") against the persisted
+	// (0, ""), ProofBindingEqual is false, and the caller is told the proof
+	// diverges -- breaking the idempotent-retry contract stated above and
+	// blaming a divergence that never happened.
+	//
+	// Seeding the term anyway is not the alternative: insertProofPreTermSQL
+	// exists because a peer on the previous release cannot resolve the
+	// term-carrying shape, and an unregistered shape back-pressures its whole
+	// replication stream. So the honest answer is to refuse at the FIRST
+	// delivery, where the coordinator can still act on it, rather than succeed
+	// and fail confusingly on the retry.
+	if (p.LeaseTerm > 0 || p.LeaseKey != "") && !c.MayEmitTermCarryingProof() {
+		return fmt.Errorf("%w: this node cannot persist a proof's lease term yet "+
+			"(lease_term_ledger_v1 has not latched here), and storing it without one would "+
+			"record a different proof than the one validated", ErrProofTermUnrecordable)
+	}
 	now := c.NowTS()
 	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var existing ActionProof

@@ -162,7 +162,7 @@ func retainArmed(f *os.File) {
 // Both callers make the same promise — "this host will reboot at the timeout" —
 // so both need the same care. Closing is safe only where the driver advertises
 // WDIOF_MAGICCLOSE; everywhere else the descriptor is retained instead.
-func leaveArmed(f *os.File, devPath, msg string) {
+func leaveArmed(f *os.File, devPath, msg string, processSurvives bool) {
 	opts, known := watchdogOptions(f.Fd())
 	mayClose := selfFenceMayClose(opts, known)
 	if mayClose {
@@ -170,7 +170,65 @@ func leaveArmed(f *os.File, devPath, msg string) {
 	} else {
 		retainArmed(f)
 	}
-	slog.Error(msg, "dev", devPath, "magic_close", mayClose, "descriptor", map[bool]string{true: "closed", false: "retained"}[mayClose])
+	d := armedGuarantee(mayClose, processSurvives)
+	log := slog.Error
+	attrs := []any{
+		"dev", devPath,
+		"magic_close", mayClose,
+		"descriptor", map[bool]string{true: "closed", false: "retained"}[mayClose],
+		"reboot_guaranteed", d.guaranteed,
+	}
+	if d.caveat != "" {
+		attrs = append(attrs, "caveat", d.caveat)
+	}
+	log(msg, attrs...)
+}
+
+// armedDisposition is what actually happens to the timer, as distinct from what
+// this process did with the descriptor.
+type armedDisposition struct {
+	guaranteed bool
+	caveat     string
+}
+
+// armedGuarantee reports whether leaving the device armed actually guarantees
+// the reboot, given the driver and whether THIS PROCESS survives the call.
+//
+// retainArmed only keeps the *os.File out of the garbage collector; it holds
+// the descriptor "for the life of the process" and no longer. That is enough on
+// the self-fence path, where the daemon keeps running until the watchdog
+// reboots it. It is NOT enough on the shutdown-with-workloads path: daemon.Run
+// returns, the process exits, and the kernel closes every descriptor it held.
+//
+// On a driver without WDIOF_MAGICCLOSE, watchdog_release() stops the timer on
+// ANY close, including that implicit one -- which is precisely the driver class
+// this code retains the descriptor FOR. So that path logged
+// descriptor=retained and promised the host would reboot, on exactly the
+// devices where it might not.
+//
+// The one thing that saves it is a driver built or configured with nowayout
+// (WDOG_NO_WAY_OUT), where release cannot stop the timer. That is not
+// detectable through the ioctl interface, so it is reported as a caveat rather
+// than assumed either way.
+func armedGuarantee(magicClose, processSurvives bool) armedDisposition {
+	switch {
+	case processSurvives:
+		// The descriptor stays open (retained) or was closed on a driver that
+		// documents close-is-safe. Either way the timer keeps counting.
+		return armedDisposition{guaranteed: true}
+	case magicClose:
+		// Closing is the documented safe route on this driver, and we closed
+		// explicitly rather than relying on process exit.
+		return armedDisposition{guaranteed: true}
+	default:
+		return armedDisposition{
+			guaranteed: false,
+			caveat: "this process is exiting and the driver does not advertise MAGICCLOSE, " +
+				"so the kernel's implicit close may STOP the timer and the host may not reboot; " +
+				"only a driver with nowayout keeps counting. Drain this host or stop its " +
+				"workloads rather than relying on the watchdog here",
+		}
+	}
 }
 
 // fenceCh returns the trip channel, or nil (which blocks forever in a select) when
@@ -296,9 +354,12 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 			// workloads abandoned lets the watchdog reboot the host into a
 			// safely fenced state. Operators drain before planned maintenance.
 			if ctrl.holdsOwnership() {
+				// processSurvives=false: daemon.Run returns right after this and
+				// the process exits, so a retained descriptor is closed by the
+				// kernel. See armedGuarantee.
 				leaveArmed(f, devPath, "watchdog left ARMED on shutdown: this host still owns running workloads; "+
 					"a successor daemon must resume petting before the timeout or the host reboots "+
-					"(drain or stop workloads first for maintenance)")
+					"(drain or stop workloads first for maintenance)", false)
 				return
 			}
 			// Graceful shutdown: disable + write 'V' to disarm so the watchdog doesn't fire.
@@ -325,7 +386,9 @@ func Heartbeat(ctx context.Context, devPath string, interval time.Duration, ctrl
 		// rather than merely left unclosed — see armedDevices for why those are
 		// not the same thing. It holds one descriptor for the life of a process
 		// that is seconds from resetting.
-		leaveArmed(f, devPath, "watchdog left ARMED (self-fence) — this host will reboot at the hardware watchdog timeout")
+		// processSurvives=true: the daemon keeps running until the watchdog
+		// reboots it, so a retained descriptor really does stay open.
+		leaveArmed(f, devPath, "watchdog left ARMED (self-fence) — this host will reboot at the hardware watchdog timeout", true)
 	}()
 
 	slog.Info("watchdog heartbeat started", "dev", devPath, "interval", interval)

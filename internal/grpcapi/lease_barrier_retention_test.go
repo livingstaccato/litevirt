@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -127,4 +128,49 @@ func TestRunLeaseTermSweep_RepairCannotLowerAnObservedTerm(t *testing.T) {
 			"cannot be un-seen by a later round that could not reach the peer holding it, "+
 			"and returning %d admits a term-5 proof known to be superseded", got, got)
 	}
+}
+
+// TestLeaseTermBarrier_RejectsAnImplausiblePeerAnswer is the fleet-wide
+// failover kill switch.
+//
+// The threshold is an unbounded MAX over peer RPC answers that nothing
+// corroborates. One member answering MaxInt64 for 'failover' writes no ledger
+// row, so the real coordinator keeps minting far below it and every executor's
+// barrier then refuses every proof as stale: VM failover stops cluster-wide and
+// permanently, from a single node, reported as a legitimate stale-tenure
+// refusal so it does not look like an attack.
+//
+// The bound is a plausibility check, not proof — during a partition the
+// replicated ledger row has not propagated, which is the whole reason this RPC
+// exists — so the test asserts the nonsense answer is rejected while a
+// genuinely-ahead peer is still believed.
+func TestLeaseTermBarrier_RejectsAnImplausiblePeerAnswer(t *testing.T) {
+	t.Run("a nonsense term is not adopted", func(t *testing.T) {
+		const local = int64(5)
+		if got := peerTermAcceptable(local, math.MaxInt64); got {
+			t.Fatal("a peer answering MaxInt64 was believed; that refuses every proof in " +
+				"the cluster forever, from one node")
+		}
+	})
+
+	t.Run("a genuinely-ahead peer is still believed", func(t *testing.T) {
+		const local = int64(5)
+		// Many rolling restarts' worth of drift: a long-partitioned node can
+		// legitimately be this far behind, and rejecting it would break the
+		// barrier's actual job.
+		if got := peerTermAcceptable(local, local+3_000); !got {
+			t.Fatal("a plausibly-ahead peer was rejected; the bound must clear real drift " +
+				"by a wide margin or it becomes its own outage")
+		}
+	})
+
+	t.Run("the boundary itself is inclusive", func(t *testing.T) {
+		const local = int64(5)
+		if !peerTermAcceptable(local, local+maxPeerTermAdvance) {
+			t.Error("the bound should accept exactly local+maxPeerTermAdvance")
+		}
+		if peerTermAcceptable(local, local+maxPeerTermAdvance+1) {
+			t.Error("the bound should reject one past it")
+		}
+	})
 }

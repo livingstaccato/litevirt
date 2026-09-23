@@ -66,6 +66,20 @@ const (
 	// maximum cannot regress that way. The window is real, the old explanation
 	// was not. TestLeaseBarrier_AReseedCannotRegressTheHighWater pins it.
 	leaseBarrierCacheTTL = 3 * time.Second
+
+	// maxPeerTermAdvance bounds how far above THIS node's own ledger a peer's
+	// high-water answer may be and still be believed. See fanOutHighWater: the
+	// threshold is otherwise an unbounded MAX over uncorroborated RPC answers,
+	// and one nonsense answer disables every lease-term-gated action in the
+	// cluster.
+	//
+	// Generous on purpose. A rolling restart of an N-host cluster mints roughly
+	// 3N terms, and a node can be many rolls behind after a long partition, so
+	// the bound has to clear real drift by a wide margin. It is a sanity check
+	// on an answer, not a security boundary -- a peer lying by a plausible
+	// amount is not detectable here at all, which is why an answer that raises
+	// the threshold by more than one tenure is also logged.
+	maxPeerTermAdvance = 100_000
 	// leaseBarrierSilentTTL bounds how long a peer stays remembered as silent.
 	//
 	// It only has to span one reconciler pass, which is the burst this exists
@@ -443,6 +457,12 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 // runLeaseTermSweep, not of any one dial.
 var fanOutFn func(ctx context.Context, key string, local int64, peers []string, silent map[string]bool) (int64, int, map[string]bool)
 
+// peerTermAcceptable reports whether a peer's high-water answer is close
+// enough to this node's own ledger to be believed. See maxPeerTermAdvance.
+func peerTermAcceptable(local, peer int64) bool {
+	return peer <= local+maxPeerTermAdvance
+}
+
 func (s *Server) fanOut(
 	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
 ) (int64, int, map[string]bool) {
@@ -484,10 +504,42 @@ func (s *Server) fanOutHighWater(
 			if rerr != nil || resp == nil || resp.GetKey() != key {
 				return
 			}
+			// An answer that cannot be true is NOT an answer.
+			//
+			// The threshold is an unbounded MAX over peer RPC answers, and
+			// nothing corroborates them: a peer answering MaxInt64 for
+			// 'failover' writes no ledger row, so the real coordinator keeps
+			// minting far below it and every executor's barrier then refuses
+			// every proof as stale. VM failover stops fleet-wide, permanently,
+			// from one node -- and it is reported as a legitimate stale-tenure
+			// refusal, so it does not look like an attack.
+			//
+			// Corroborating against a replicated leader_lease_terms row is not
+			// available here: during a partition that row has not propagated,
+			// which is the entire reason this RPC exists. So the check is a
+			// plausibility bound rather than proof. maxPeerTermAdvance is
+			// deliberately generous -- an ordinary rolling restart mints about
+			// 3N terms, and a long-partitioned node can legitimately be many
+			// rolls behind -- because its job is to reject nonsense, not to
+			// second-guess a real answer.
+			if t := resp.GetTerm(); !peerTermAcceptable(local, t) {
+				slog.Warn("lease-term barrier: refusing an implausible high-water answer",
+					"peer", peer, "key", key, "peer_term", t, "local_term", local,
+					"bound", local+maxPeerTermAdvance)
+				return // not counted as an answer either
+			}
 			mu.Lock()
 			answers++
 			answered[peer] = true
 			if t := resp.GetTerm(); t > highest {
+				if t > local+1 {
+					// Visible, not silent: a peer that raises the bar by more
+					// than one tenure is either genuinely far ahead of this
+					// node or lying, and both are worth seeing in a log when
+					// failover starts refusing.
+					slog.Info("lease-term barrier: a peer raised the threshold by more than one tenure",
+						"peer", peer, "key", key, "peer_term", t, "local_term", local)
+				}
 				highest = t
 			}
 			mu.Unlock()

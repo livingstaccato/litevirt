@@ -312,7 +312,20 @@ POST routes that wrap streaming RPCs (`/api/v1/backup/snapshot`,
 sends `Accept: text/event-stream` or appends `?stream=sse`. Otherwise
 they return the first progress frame and close.
 
-`/api/v1/stacks/delete` is the exception: without SSE it waits for the whole
+`/api/v1/stacks/deploy` without SSE waits for the whole deploy. It must: closing
+a `DeployStack` stream cancels the deploy on the server, so answering with the
+first frame used to create at most one VM and abandon the rest. The body lists
+each VM finished and each action that failed, and the status is `200` only when
+none did; otherwise `500` with the failures and an `error` summary (the stack is
+left `degraded`, and a re-deploy retries the failed actions):
+
+```json
+{"name": "web", "done": ["web-2"],
+ "failures": [{"name": "web-1", "error": "..."}],
+ "error": "stack \"web\": 1 of 2 actions failed (web-1); the stack is left degraded and a re-deploy retries them"}
+```
+
+`/api/v1/stacks/delete` is the other exception: without SSE it waits for the whole
 teardown and reports its outcome, because `DeleteStack` ends successfully even
 when resources could not be removed. The body names every resource deleted and
 every one that was not (a VM or container name, `network <name>`,

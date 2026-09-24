@@ -15,6 +15,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"gopkg.in/yaml.v3"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -82,14 +83,74 @@ func (s *Server) handleStackDeploy(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	// Non-SSE callers get the first progress frame; long-running
-	// callers should set Accept: text/event-stream.
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
+	// The whole stream is read. Returning early closes it, and a closed
+	// DeployStack stream cancels the deploy on the server: the old "first
+	// frame" answer created at most one VM, abandoned the rest and said 200.
+	// Per-action failures arrive as "error" frames on a stream that still ends
+	// OK, so the result is judged the way `lv compose up` judges it.
+	var named struct {
+		Name string `yaml:"name"`
 	}
-	jsonProto(w, first)
+	_ = yaml.Unmarshal([]byte(req.ComposeYaml), &named) // the name is only for the response
+	res := stackDeployResult{Name: named.Name, Done: []string{}, Failures: []stackDeleteFailure{}}
+	actions, failed := map[string]bool{}, map[string]bool{}
+	for {
+		p, rerr := stream.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			code, msg := grpcHTTPStatus(http.StatusInternalServerError, rerr)
+			if len(actions) == 0 && len(res.Done) == 0 {
+				jsonError(w, code, msg)
+				return
+			}
+			res.Error = fmt.Sprintf("stack %q: deploy failed: %s", res.Name, msg)
+			w.WriteHeader(code)
+			jsonWrite(w, res)
+			return
+		}
+		if p.VmName != "" {
+			actions[p.VmName] = true
+		}
+		switch p.Phase {
+		case "error":
+			item := p.VmName
+			if item == "" {
+				item = "stack resource"
+			}
+			if !failed[item] {
+				failed[item] = true
+				res.Failures = append(res.Failures, stackDeleteFailure{Name: item, Error: p.Error})
+			}
+		case "done":
+			if p.VmName != "" {
+				res.Done = append(res.Done, p.VmName)
+			}
+		}
+	}
+	if len(res.Failures) > 0 {
+		names := make([]string, len(res.Failures))
+		for i, f := range res.Failures {
+			names[i] = f.Name
+		}
+		total := len(actions)
+		if total < len(res.Failures) {
+			total = len(res.Failures)
+		}
+		res.Error = fmt.Sprintf("stack %q: %d of %d actions failed (%s); the stack is left degraded and a re-deploy retries them",
+			res.Name, len(res.Failures), total, strings.Join(names, ", "))
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	jsonWrite(w, res)
+}
+
+// stackDeployResult is the non-SSE response of /api/v1/stacks/deploy.
+type stackDeployResult struct {
+	Name     string               `json:"name"`
+	Done     []string             `json:"done"`
+	Failures []stackDeleteFailure `json:"failures"`
+	Error    string               `json:"error,omitempty"`
 }
 
 func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {

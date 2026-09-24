@@ -929,6 +929,21 @@ observed → confirmed → resolved lifecycle:
 - resolution needs **two consecutive clean scans with complete coverage** by
   the detector lease holder under a valid decision gate — an unreachable,
   partial, or older-binary peer blocks resolution (blind is not clean);
+- coverage is judged **per condition**, against the hosts that could hold the
+  condition's subject. A `coverage_gap` or `lww_unresolved` on host H needs
+  only H completely probed. A VM condition (`vm_dual_run`,
+  `runtime_owner_mismatch`, `owner_epoch_mismatch`) is not held open by an
+  unreachable host whose last liveness evidence in `host_health` (rows it
+  wrote, or rows a peer wrote after it answered) is more than 5 minutes older
+  than the VM's `created_at` — a host dead since before the VM existed cannot
+  be running a copy of it. That host is still probed, keeps its own
+  `coverage_gap`, and the evaluator still reports `partial`. The exemption
+  never applies to the VM's DB owner, a host the condition names as involved,
+  or a host that answered partially or from an older binary, and it fails
+  closed on missing or unparseable evidence, a post-dated `created_at`, or a
+  failed DB read. Container and VIP conditions keep the cluster-wide rule
+  (names are not unique; a VIP has no creation stamp), so a registered host
+  that is permanently gone still freezes those until `lv host rm`;
 - leadership changes and restarts preserve counts and confirmed state;
 - resolved conditions stay readable for 30 days (`lv health --resolved`),
   then are tombstoned;

@@ -506,7 +506,38 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 		return
 	}
 
-	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, coverageComplete, coverageDetail, probeFailed)
+	rc := resolutionCoverage{
+		complete:     coverageComplete,
+		dbOK:         dbIndexOK && ctIndexOK,
+		probeTargets: map[string]bool{},
+		snaps:        snaps,
+		unreachable:  map[string]bool{},
+		vmOwner:      vmOwner,
+		vmCreated:    vmCreated,
+		now:          time.Now(),
+	}
+	for _, h := range targets {
+		rc.probeTargets[h] = true
+	}
+	for _, h := range unreachable {
+		rc.unreachable[h] = true
+	}
+	// Liveness evidence for every host this pass did not see completely. Only
+	// an UNREACHABLE one can ever be exempted (canResolve checks that
+	// separately); a failed read leaves lastAlive empty, which exempts nothing.
+	notSeen := map[string]bool{}
+	for _, h := range targets {
+		if snap, ok := snaps[h]; !ok || snap.partial {
+			notSeen[h] = true
+		}
+	}
+	if !coverageComplete && len(notSeen) > 0 {
+		if la, ok := s.hostLastAlive(ctx, notSeen); ok {
+			rc.lastAlive = la
+		}
+	}
+
+	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, rc, coverageDetail, probeFailed)
 }
 
 // ctHostName keys a container by the pair the schema keys it by.

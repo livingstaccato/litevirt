@@ -22,6 +22,9 @@ type fakeCTDeletePeer struct {
 	calls      []*pb.DeleteContainerRequest
 	startCalls []*pb.StartContainerRequest
 	stopCalls  []*pb.StopContainerRequest
+	// onStart, when set, runs for each forwarded start — the owner's write
+	// arriving in this node's replica.
+	onStart func(*pb.StartContainerRequest)
 }
 
 func (f *fakeCTDeletePeer) DeleteContainer(_ context.Context, req *pb.DeleteContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
@@ -83,6 +86,9 @@ func (f *fakeCTDeletePeer) StartContainer(_ context.Context, req *pb.StartContai
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCalls = append(f.startCalls, req)
+	if f.onStart != nil {
+		f.onStart(req)
+	}
 	return &emptypb.Empty{}, nil
 }
 
@@ -111,6 +117,13 @@ func TestStartStopContainer_HostlessResolvesTheOwner(t *testing.T) {
 		HostName: "other-host", Name: "wanderer", State: "stopped", Project: "proj",
 	}); err != nil {
 		t.Fatalf("UpsertContainer: %v", err)
+	}
+	// A forwarded start returns once this node lists the container running;
+	// the owner's running write reaches this replica as the start is served.
+	fake.onStart = func(req *pb.StartContainerRequest) {
+		if err := corrosion.SetContainerStateDetail(ctx, s.db, req.HostName, req.Name, "running", ""); err != nil {
+			t.Errorf("model the owner's running write: %v", err)
+		}
 	}
 
 	if _, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "wanderer"}); err != nil {

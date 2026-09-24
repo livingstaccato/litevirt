@@ -70,6 +70,18 @@ $ lv ct rm web --host node-b
 
 `--host` is always exact, so it is the unambiguous form in scripts.
 
+### Asking one node about a container on another
+
+Every node serves `lv ct ls` from its own copy of the cluster state, and a
+container's create and start run on its owning host. When the node you are
+connected to is not the owner, `lv ct create` returns once that node lists the
+new container, and `lv ct start` once it lists it `running` — so an `lv ct ls`
+straight after either shows the result, not the state before it. `lv compose
+up` reports a container done on the same terms. If replication is slow to bring
+the owner's write across, the command still succeeds after waiting up to 15
+seconds, and the daemon logs `container operation succeeded on its owner, but
+this node's replica has not caught up`.
+
 ## Private registry credentials
 
 Pulling a private image (a private Docker Hub repo, `ghcr.io`, a self-hosted

@@ -8,6 +8,8 @@
 package restapi
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
@@ -109,12 +111,71 @@ func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
+
+	// DeleteStack ends OK even when resources could not be removed — each is an
+	// "error" status on the stream — so the whole stream is drained and judged
+	// the way `lv compose down` judges it: 200 only when nothing failed.
+	res := stackDeleteResult{Name: req.Name, Deleted: []string{}, Failures: []stackDeleteFailure{}}
+	seen, failed := map[string]bool{}, map[string]bool{}
+	for {
+		p, rerr := stream.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			code, msg := grpcHTTPStatus(http.StatusInternalServerError, rerr)
+			if len(seen) == 0 {
+				jsonError(w, code, msg)
+				return
+			}
+			res.Error = fmt.Sprintf("stack %q: delete failed: %s", req.Name, msg)
+			w.WriteHeader(code)
+			jsonWrite(w, res)
+			return
+		}
+		// Not only VMs: containers, a network that could not be deprovisioned
+		// or a failed container listing arrive named for themselves, and an
+		// unnamed error still counts.
+		item := p.VmName
+		if item == "" && p.Status == "error" {
+			item = "stack resource"
+		}
+		if item != "" {
+			seen[item] = true
+		}
+		switch p.Status {
+		case "error":
+			if !failed[item] {
+				failed[item] = true
+				res.Failures = append(res.Failures, stackDeleteFailure{Name: item, Error: p.Error})
+			}
+		case "deleted":
+			res.Deleted = append(res.Deleted, p.VmName)
+		}
 	}
-	jsonProto(w, first)
+	if len(res.Failures) > 0 {
+		names := make([]string, len(res.Failures))
+		for i, f := range res.Failures {
+			names[i] = f.Name
+		}
+		res.Error = fmt.Sprintf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",
+			req.Name, len(res.Failures), len(seen), strings.Join(names, ", "))
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	jsonWrite(w, res)
+}
+
+// stackDeleteResult is the non-SSE response of /api/v1/stacks/delete.
+type stackDeleteResult struct {
+	Name     string               `json:"name"`
+	Deleted  []string             `json:"deleted"`
+	Failures []stackDeleteFailure `json:"failures"`
+	Error    string               `json:"error,omitempty"`
+}
+
+type stackDeleteFailure struct {
+	Name  string `json:"name"`
+	Error string `json:"error"`
 }
 
 func (s *Server) handleStackExport(w http.ResponseWriter, r *http.Request) {

@@ -21,7 +21,6 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/lb"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -631,7 +630,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		for _, iface := range ifaces {
 			ip := iface.IP
 			if ip == "" && iface.MAC != "" {
-				ip = lv.GetIPFromARP(iface.MAC)
+				ip = s.discoverNICAddress(iface.MAC)
 			}
 			if ip != "" {
 				lbBackends = append(lbBackends, lb.Backend{Name: vmName, IP: ip, Port: backendPort})

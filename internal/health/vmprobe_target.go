@@ -103,7 +103,7 @@ func (v *VMChecker) vmAddress(ctx context.Context, vm corrosion.VMRecord) (strin
 	discover := v.nicIPDiscovery
 	v.mu.Unlock()
 	if discover == nil {
-		discover = discoverNICAddressLocal
+		discover = lv.DiscoverIPForMAC // the lookup grpcapi's discovery uses too
 	}
 	live := func(mac string) string {
 		if mac == "" {
@@ -129,22 +129,6 @@ func (v *VMChecker) vmAddress(ctx context.Context, vm corrosion.VMRecord) (strin
 		}
 	}
 	return "", fmt.Sprintf("no address known for VM yet: none recorded for its NICs and no ARP entry or DHCP lease on %s", v.hostName)
-}
-
-// discoverNICAddressLocal is where this host sees a MAC: its dnsmasq lease,
-// then the ARP cache. Lease first, unlike grpcapi's discoverNICAddress: the
-// lease is dnsmasq's one current answer for the MAC, while the ARP cache can
-// hold several complete entries for it. GetIPFromARP skips failed entries,
-// but after a guest moves to a new lease its OLD address can still sit in the
-// cache as a STALE entry — complete, and never garbage-collected on a small
-// table until it is next used — and /proc/net/arp lists entries in hash
-// order, so ARP first could confirm exactly the stale recorded address
-// vmAddress is checking.
-func discoverNICAddressLocal(mac string) string {
-	if ip := lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", mac); ip != "" {
-		return ip
-	}
-	return lv.GetIPFromARP(mac)
 }
 
 // bareIP returns s as a bare IP literal ("10.0.0.5/24" → "10.0.0.5"), or ""

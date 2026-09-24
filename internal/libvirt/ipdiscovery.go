@@ -58,6 +58,31 @@ func arpEntryComplete(flags string) bool {
 	return err == nil && v&atfCom != 0
 }
 
+// dhcpLeaseDir is where litevirt's per-bridge dnsmasq writes its leases
+// (network.dnsmasqLeaseDir must name the same directory). A variable so a test
+// can point DiscoverIPForMAC at a fixture.
+var dhcpLeaseDir = "/var/lib/libvirt/dnsmasq"
+
+// DiscoverIPForMAC is where THIS host sees a MAC: the one MAC→IP lookup every
+// discovery path uses (grpcapi's IP scanner, read RPCs, LB render and NetBox
+// discovery gate, and the VM healthcheck's address check), so the order below
+// cannot drift between them.
+//
+// dnsmasq's lease first, then a complete ARP entry. The lease is dnsmasq's
+// one current answer for the MAC. The ARP cache can hold several complete
+// entries for it: after a guest moves to a new lease its OLD address can stay
+// there as a STALE entry — complete, and on a small table never
+// garbage-collected until next used — and /proc/net/arp lists entries in hash
+// order. ARP first could therefore return the old address, and a path that
+// records what it discovers would record it. ARP still answers for a MAC with
+// no lease here (a static address, an external DHCP server).
+func DiscoverIPForMAC(mac string) string {
+	if ip := GetIPFromDHCPLeases(dhcpLeaseDir, mac); ip != "" {
+		return ip
+	}
+	return GetIPFromARP(mac)
+}
+
 // GetIPFromDHCPLeases scans dnsmasq lease files under leaseDir for a MAC address.
 // Standard libvirt lease dir is /var/lib/libvirt/dnsmasq.
 func GetIPFromDHCPLeases(leaseDir, mac string) string {

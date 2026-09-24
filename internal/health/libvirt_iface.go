@@ -15,6 +15,9 @@ type LibvirtBackend interface {
 	DomainExists(name string) bool
 	DomainState(name string) (string, error)
 	DomainStateReason(name string) (lv.DomainStatus, error)
+	// HasManagedSaveImage reports a managed-save (suspend-to-disk) image —
+	// saved RAM that an undefine would discard.
+	HasManagedSaveImage(name string) (bool, error)
 	DumpXMLInactive(name string) (string, error)
 	ListDomains() ([]string, error)
 	DefineDomain(xmlConfig string) error

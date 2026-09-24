@@ -849,6 +849,10 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		return
 	}
 
+	// Owners whose runtime probe failed this pass: probed once, not once per
+	// leftover, so a fence-and-return with many leftovers and an unreachable
+	// owner costs one probe timeout rather than one per VM.
+	unreachable := map[string]string{}
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
 		if err != nil || vm == nil {
@@ -876,10 +880,18 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// fencing ownership reconciliation. We use DomainStateReason, not the
 			// coarse DomainState, because the latter collapses paused/pm-suspended/
 			// saved/shutoff all into "stopped" and would destroy resumable workloads.
+			//
+			// Reason "unknown" is the one exception, and it needs MORE proof, not
+			// less: see provenOwnerLeftover.
 			st, serr := r.virt.DomainStateReason(domName)
-			if serr != nil || !cleanableLeftover(st) {
+			cleanable := serr == nil && cleanableLeftover(st)
+			why := ""
+			if serr == nil && !cleanable && unknownShutoff(st) {
+				cleanable, why = r.provenOwnerLeftover(ctx, domName, vm.HostName, unreachable)
+			}
+			if !cleanable {
 				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",
-					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", st.State, "reason", st.Reason, "state_err", serr)
+					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", st.State, "reason", st.Reason, "state_err", serr, "unproven", why)
 				continue
 			}
 			slog.Warn("reconciler: removing clearly-dead local leftover whose DB row moved to another host",
@@ -923,6 +935,69 @@ func cleanableLeftover(st lv.DomainStatus) bool {
 	default:
 		return false
 	}
+}
+
+// unknownShutoff reports a stopped domain whose shutoff reason libvirt could not
+// supply. Under the real mapping (normalizeDomainReason) a paused or pm-suspended
+// domain always carries its own reason, so a coarse "stopped" with reason
+// "unknown" can only be DomainShutoff with an unrecognised or lost reason — the
+// shape every leftover takes after the host reboots or loses power, because
+// libvirt does not persist the shutoff reason across that.
+func unknownShutoff(st lv.DomainStatus) bool {
+	return st.State == "stopped" && st.Reason == "unknown"
+}
+
+// provenOwnerLeftover decides whether a shut-off domain with reason "unknown" is
+// a leftover safe to destroy+undefine. "unknown" alone proves nothing — it is
+// the absence of a reason, and cleanableLeftover's allowlist rightly refuses it —
+// so it is admitted only on two further pieces of POSITIVE proof, each failing
+// closed when unreadable:
+//
+//   - no managed-save image. A managed-save is saved RAM; libvirt reports it as
+//     shutoff/"saved" while it knows, but after a reboot the reason can come
+//     back "unknown" with the image still on disk, and UndefineDomain would
+//     discard it.
+//   - the DB owner itself reports the VM RUNNING in its own libvirt (the peer
+//     runtime inventory, answered from the owner's libvirt, not from replicated
+//     rows). This is what defuses the converged-wrong host_name the non-
+//     destruction guard exists for: the claim "this copy is not the live one"
+//     rests on a live copy being observed elsewhere, not on a DB field. Absent,
+//     defined-but-stopped, unknown, an incomplete inventory, an unreachable
+//     owner, or no checker wired are all "not proven".
+//
+// It returns why the proof failed, for the refusal log line. unreachable
+// carries owners whose probe already failed in this pass; they are not probed
+// again, and a new failure is recorded there.
+func (r *Reconciler) provenOwnerLeftover(ctx context.Context, name, owner string, unreachable map[string]string) (bool, string) {
+	if owner == "" || owner == r.hostName {
+		return false, "no other owner recorded"
+	}
+	ms, err := r.virt.HasManagedSaveImage(name)
+	if err != nil {
+		return false, "managed-save image unreadable: " + err.Error()
+	}
+	if ms {
+		return false, "managed-save image present (saved RAM)"
+	}
+	if r.checkPeerRuntime == nil {
+		return false, "no peer runtime checker to confirm the owner runs it"
+	}
+	if why, ok := unreachable[owner]; ok {
+		return false, why
+	}
+	// Same bound as owner-assert: an unreachable owner must not stall the tick.
+	pctx, cancel := context.WithTimeout(ctx, peerRuntimeProbeTimeout)
+	state, err := r.checkPeerRuntime(pctx, owner, name)
+	cancel()
+	if err != nil {
+		why := "owner " + owner + " unreachable: " + err.Error()
+		unreachable[owner] = why
+		return false, why
+	}
+	if state != RuntimeRunning {
+		return false, "owner " + owner + " reports the VM " + state + ", not running"
+	}
+	return true, ""
 }
 
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {

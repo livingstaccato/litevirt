@@ -563,19 +563,46 @@ Requirements:
 
 ```yaml
     healthcheck:
-      type: "http"          # tcp | http | ping | exec
-      target: "http://localhost:8080/health"
+      type: "http"          # tcp | http | https | ping | exec
+      target: "http://localhost:8080/health"   # localhost = the VM, see below
       interval: "10s"
       timeout: "5s"
       retries: 3
       action: "restart"     # restart | migrate | alert
 ```
 
+**Targets are resolved relative to the VM.** The probe runs on the VM's owning *host*, not inside the guest, so a target that names a place on the VM — a bare port, an empty host, `localhost` or any loopback address (`127.0.0.0/8`, `::1`) — is sent to the VM's address. A target that names another host is probed as given.
+
+| `type` | `target` | Probes |
+|---|---|---|
+| `tcp` | `"22"`, `":22"`, `"localhost:22"`, `"127.0.0.1:22"` | TCP connect to `<vm-address>:22` |
+| `tcp` | `"db.internal:5432"` | `db.internal:5432`, as given |
+| `http` / `https` | `"http://localhost:8080/health"`, `":8080/health"` | `GET http://<vm-address>:8080/health` |
+| `http` / `https` | `"8080"`, `"/health"` | `GET http://<vm-address>:8080`, `GET http://<vm-address>/health` (scheme from `type`) |
+| `http` / `https` | `"http://example.com/health"` | that URL, as given |
+| `ping` | omitted, or `"localhost"` | one ICMP echo to `<vm-address>` |
+| `ping` | `"10.0.0.1"` | `10.0.0.1`, as given |
+| `exec` | `"systemctl is-active nginx"` | the command, run inside the guest by the guest agent (`guest-agent` must be on) |
+
+An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); service names such as `ssh` are not accepted.
+
+**The VM's address** is its NIC's recorded address — the one `lv ls` shows, lowest-ordinal NIC first — and, when none is recorded yet, what the owning host sees for the NIC's MAC in its ARP cache or dnsmasq leases.
+
+**When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.
+
+A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails before anything is deployed:
+
+```
+compose validation errors:
+  - vm "db" healthcheck: tcp target "postgres" is not a port or host:port: ...
+```
+
 The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:
 
 - one passing probe makes the VM **healthy**;
 - `retries` consecutive failures (default `3`) make it **unhealthy**; fewer leave the verdict where it was;
-- a VM that has not been probed since it last started — or was recreated or migrated — is **unknown**, and so is a stopped VM.
+- a VM that has not been probed since it last started — or was recreated or migrated — is **unknown**, and so is a stopped VM;
+- a VM whose probe cannot run — no address known for it yet, or a target that cannot be interpreted — is **unknown**, with the reason; it resets the run of consecutive failures and never counts toward the `action`.
 
 There is no `start-period`. Instead, for the first 5 minutes after a VM is created its failures do not count toward the healthcheck's `action`, so a VM still booting is not restarted; it is still probed, and its verdict is still published, because a `depends-on` or rolling-update wait needs its first pass.
 

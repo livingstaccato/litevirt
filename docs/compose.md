@@ -714,6 +714,15 @@ Control how VMs are updated when a compose file changes.
 - **restart** (`restart — the same VM is reconfigured and restarted, disks kept`) — a change that bakes into the domain (a cpu shrink or grow beyond the ceiling, an out-of-band memory size, `max-cpu`, memory bounds, `cpu-mode`/`cpu-model`, `machine`, `firmware`, `guest-agent`, VNC graphics, `secure-boot`, `tpm`) reconfigures and restarts the **same** VM: same disks, same MACs, same identity. A stopped VM is reconfigured and left stopped. Toggling `secure-boot` or `tpm` on a VM that already has firmware state is refused, as `lv update` refuses it without `--force`;
 - **recreate** (`recreate — disks are replaced (<why>)`) — only a change of VM identity (`image`, `iso`, disk or network topology, `cloud-init`) deletes the VM and creates it again, **which replaces its disks**. So does a change that needs only a redefine but that no reconfigure path can apply to an existing VM yet (SPICE graphics, resource tuning, passthrough devices), a VM left half-made by a deploy that did not finish, and a VM whose stored spec cannot be read. Disks are not carried over to the new VM. The plan says so on the VM's line, and `compose up` asks for confirmation before applying it (as it does for every plan, unless `-y`).
 
+An update of a VM stays on the host it runs on, and is placed as a **replacement** of what that VM holds there: its current cpu and memory are released and the updated request is charged in their place, so a VM that fills most of its host can still be shrunk, relabelled or otherwise updated. An update that no longer fits its host is refused before anything is touched, and the error names the resource and the numbers:
+
+```
+planner: batch placement failed: no eligible host for VM "db": db needs 4224 MiB of memory on node-2
+(4096 MiB + 128 MiB qemu overhead), which has 1947 MiB free after db's current 1024 MiB is released
+```
+
+A container update is placed the same way, against the container's current memory limit.
+
 The strategy decides how a change that needs a **new** VM is rolled out — `recreate` means "replace such a VM by deleting and creating it", not "recreate on any change":
 
 ```yaml

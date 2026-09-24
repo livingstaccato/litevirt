@@ -1077,6 +1077,11 @@ var schemaDDL = []string{
 	// to a question the cluster never agreed on. Enforcement must therefore treat
 	// an unresolved term as refuse, failing closed.
 	//
+	// The LEASE converges anyway, one layer up and without touching either row:
+	// the merge reports both claimants to the lease layer, every claimant but the
+	// lowest-sorting one stands down, and that one retires the contested term by
+	// minting above it. See leader_lease_contest.go.
+	//
 	// This is NOT project_authority_epochs. That one converges deterministically
 	// because several nodes legitimately mint one project epoch, so freezing a
 	// conflict would strand it. Two holders for one lease term is not legitimate.

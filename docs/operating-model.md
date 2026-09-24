@@ -90,7 +90,12 @@ of acting — it says nothing about whether the resulting rows have replicated.
   site requires `holdLease()` **and** `DecisionGate.OK`, which is a quorum this
   daemon probed for itself, and the minority side fails closed there. Read "only
   one coordinator acts" as the intended end state of the exclusivity work, not
-  as something the current code guarantees. A fence additionally requires 30 s of the lease
+  as something the current code guarantees. What the code *does* guarantee is
+  that a split with a healthy network does not last: when several survivors
+  claim an expired lease at once — the ordinary shape of a leader death, since
+  every node polls on the same interval — the lowest-sorting claimant keeps the
+  lease on a fresh term and every other claimant stands down on the tick it
+  learns of that claim (see *A contested lease still converges* below). A fence additionally requires 30 s of the lease
   still to run before it may start, because an IPMI power-off plus its
   verification can take 23 s and a fence cut short is reported as unconfirmed.
 - **Only the peers a node actually pushes to can pin its log.** Replication is
@@ -376,8 +381,10 @@ earns:
   linearizable* above still holds in full.
 - **It is not consensus, and a contested term is not resolved cluster-wide.**
   Two partitioned nodes can each mint the same term naming themselves, and
-  nothing here elects a winner or ever will — see *What this table will and will
-  not show you* below.
+  nothing here elects a winner *for that term's ledger rows* or ever will — see
+  *What this table will and will not show you* below. The LEASE moves on
+  instead: one claimant retires the contested term by minting above it, so the
+  term both rows name is never current again.
 - **One host will not act for two claimants of one tenure.** That is the real
   guarantee, and it is narrower than it sounds: the claim binds an executor to
   the first claimant it acted for at that `(key, term)`, so the second is
@@ -564,6 +571,42 @@ answer to a question the cluster never agreed on. Instead both claims persist on
 their own nodes and the conflict is flagged, which is why the alert above is the
 access path rather than a query.
 
+#### A contested lease still converges
+
+Keeping both claims is about the *evidence*. It does not mean both claimants
+keep acting, and before this was written they did: each replica's
+`leader_election` row named its own claimant (a peer's renewal is a no-op
+against a live row with another holder, and that table is anti-entropy
+excluded), each replica's term row named its own claimant, so every claimant
+classified every tick as a renewal of its own tenure and renewed forever. The
+lab showed it as three nodes all running the failover leader's resume path
+within two seconds of one another, ten days after the terms were contested.
+
+Now, once a node learns another node claimed its current term — on the WAL,
+the moment the peer's mint arrives, or on the next anti-entropy pass:
+
+- **Every claimant but the lowest-sorting holder name stands down.** It stops
+  renewing and reports the lease not held on that tick. Every claimant computes
+  the same answer from the same set of claims, and the lowest one can never be
+  told to stand down by it, so the rule cannot elect two or none.
+- **The one that continues does not act under the contested term.** It mints a
+  fresh term above it, atomically with its renewal. The contested term is then
+  below every replica's rejection threshold, so neither of its two rows can
+  authorise anything again. Both rows stay; the `ha.lww.unresolved` condition
+  still fires for them, and still needs the acknowledgement below.
+- **A stood-down claimant does not take the lease back when its own stale row
+  expires.** An expired lease whose row names someone other than the ledger's
+  current holder is left for one further TTL, which a live holder's renewal
+  lands well inside. If the holder is dead, the lease is taken over one TTL
+  later than an ordinary expiry would allow.
+
+Which claims a node knows about lives in memory. After a restart it is rebuilt
+by the next anti-entropy pass, because the two rows still disagree and the
+merge re-compares them every pass; until then a restarted claimant may renew a
+contested term it had already stood down from. A contested term that is not a
+key's *newest* term — history below the current tenure — needs nothing: it is
+already below every threshold, and only its tie condition remains.
+
 #### Clearing the condition once you have seen it
 
 Because a contested term is never resolved into a winner, there is no
@@ -594,6 +637,9 @@ Three things about that command:
 Investigate before acknowledging. Two nodes recording the same term means the
 fencing token did its job — enforcement will refuse proofs from the losing
 tenure — but something upstream let both nodes believe they held the lease.
+Usually that is only two survivors of a leader death claiming it within one
+replication round, which converges on its own as described above; a contested
+term whose claimants were cut off from each other is a partition.
 `litevirt_leader_lease_term` around the event tells you whether this was
 leadership churn or a partition.
 

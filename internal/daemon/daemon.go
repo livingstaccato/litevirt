@@ -1274,6 +1274,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.SetGateRefusedObserver(gateMetrics.Refused)
 	// A self-fenced coordinator stops driving failover during the fence-timeout window.
 	fc.SelfFenced = watchdogCtrl.Fenced
+	// A coordinator that was itself suspended or starved a moment ago decides no
+	// fence until it has watched for a full grace window (health/stall.go).
+	fc.LocalStall = d.checker.InStallGrace
 	go fc.Start(ctx)
 
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was

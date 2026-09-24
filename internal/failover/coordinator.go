@@ -170,6 +170,15 @@ type Coordinator struct {
 	// repeat, which recoverWorkloads tolerates: it re-derives its work from the
 	// rows still pointing at the host.
 	confirmResumed map[string]string
+	// LocalStall reports whether THIS node stopped running within the last
+	// health.StallGrace (implemented by *health.Checker.InStallGrace). While it
+	// is true the coordinator decides no new fence: a node that was suspended,
+	// swapped out or starved a moment ago has not been watching, and the view it
+	// resumes with — its own probe results, and the replicated rows it has not
+	// yet caught up on — is the least trustworthy it will ever hold. Recovery
+	// resumed from an already-recorded fence is not a new judgement and is not
+	// held back. nil (a hand-built coordinator) never defers.
+	LocalStall func() bool
 	// Now is the time source for lease TTL / fencing-log timestamps.
 	// Defaults to time.Now; the fleet harness overrides it with a
 	// virtual clock so scenarios can advance time deterministically
@@ -571,6 +580,16 @@ func (c *Coordinator) run(ctx context.Context) {
 			slog.Info("failover: host has recent fence record, skipping", "host", target)
 			c.fenced[target] = true
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrRecentlyFenced)
+			continue
+		}
+
+		// Checked last, immediately before the decision, so a stall that began
+		// while this cycle was reading the candidates still defers it. Nothing is
+		// cached: the next cycle after the grace window judges afresh.
+		if c.LocalStall != nil && c.LocalStall() {
+			slog.Warn("failover: quorum reached, but this node was itself not running moments ago — deferring the fence until it has watched for a full grace window",
+				"host", target, "observers", cand.observers, "quorum", quorum, "grace", health.StallGrace)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrLocalStall)
 			continue
 		}
 

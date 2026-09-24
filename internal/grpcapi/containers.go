@@ -134,9 +134,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 
 	// Admission. Two different scopes, deliberately split:
 	//
-	//   HOST capacity — MEMORY only. A container's cpu_limit is CPU *shares* (a
-	//   relative cgroup weight), not a vCPU reservation, so it cannot be added to
-	//   a host's vCPU total; only its memory cap is comparable to a VM's. An
+	//   HOST capacity — MEMORY only. A container's cpu_limit is a CAP in cores (a
+	//   ceiling the cgroup enforces), not a vCPU reservation, so it is not added
+	//   to a host's vCPU total; only its memory cap is comparable to a VM's. An
 	//   UNCAPPED container (memory 0) reserves nothing, matching how it is
 	//   accounted, and never pays the qemu overhead (newVMOnHost=false).
 	//

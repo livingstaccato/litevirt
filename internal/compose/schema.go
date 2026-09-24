@@ -475,8 +475,14 @@ type LBHealth struct {
 
 // HealthCheckDef defines VM-level health checking.
 type HealthCheckDef struct {
-	Type     string `yaml:"type"`   // tcp | http | ping | exec
-	Target   string `yaml:"target"` // port or URL
+	Type string `yaml:"type"` // tcp | http | https | ping | exec
+	// Target is resolved relative to the VM, because the probe runs on the
+	// VM's owning host: a bare port, an empty host, localhost or any loopback
+	// address means the VM's own address; another host is probed as given.
+	// tcp: "22" or host:port. http/https: a URL, "8080", ":8080/path" or
+	// "/path". ping: empty (the VM) or a host. exec: a command run in the
+	// guest by its agent. See ParseHealthTarget.
+	Target   string `yaml:"target"`
 	Interval string `yaml:"interval"`
 	Timeout  string `yaml:"timeout"`
 	Retries  int    `yaml:"retries"`

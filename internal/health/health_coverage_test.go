@@ -313,7 +313,7 @@ func TestCheckVM_Backoff_PreventsRepeatAction(t *testing.T) {
 		HostName: "node1",
 		Spec:     string(specJSON),
 		State:    "running",
-	}, nil, nil)
+	}, vmAtLoopback("vm-backoff"), nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
@@ -369,7 +369,7 @@ func TestCheckVM_MaxUnavailable_BlocksSecondAction(t *testing.T) {
 			StackName: "mystack",
 			Spec:      string(specJSON),
 			State:     "running",
-		}, nil, nil)
+		}, vmAtLoopback(name), nil)
 		if err != nil {
 			t.Fatalf("InsertVM(%s): %v", name, err)
 		}
@@ -425,7 +425,7 @@ func TestCheckVM_ZeroRetries_DefaultsToThree(t *testing.T) {
 		HostName: "node1",
 		Spec:     string(specJSON),
 		State:    "running",
-	}, nil, nil)
+	}, vmAtLoopback("vm-retries-default"), nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}

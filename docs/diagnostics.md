@@ -1085,7 +1085,7 @@ overall health state nor refuses admission.
 
 | Raised when | Clears when |
 |---|---|
-| `retries` consecutive probes fail (default 3) on the VM's current incarnation. Written once, on the transition — not once per probe. | One probe passes (verdict `healthy`); the VM stops or loses its healthcheck (verdict `unknown`); or the VM is deleted or moves to another host — the host that raised it resolves it, and the new owner publishes its own verdict after its first probe. |
+| `retries` consecutive probes fail (default 3) on the VM's current incarnation. Written once, on the transition — not once per probe. | One probe passes (verdict `healthy`); the VM stops or loses its healthcheck (verdict `unknown`); the probe can no longer be run — no address is known for the VM, or its target cannot be interpreted (verdict `unknown`, with the reason); or the VM is deleted or moves to another host — the host that raised it resolves it, and the new owner publishes its own verdict after its first probe. |
 
 **Reading it.** A verdict whose `incarnation` no longer matches the VM — the VM
 was restarted, recreated or migrated since — counts as `unknown`, never as a

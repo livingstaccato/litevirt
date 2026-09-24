@@ -20,6 +20,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -1403,37 +1404,56 @@ func (s *Server) waitForConditionWithin(ctx context.Context, vmName, condition s
 	}
 
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
+	last := "the VM does not exist yet"
+	for {
 		vm, err := corrosion.GetVM(ctx, s.db, vmName)
-		if err != nil || vm == nil {
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		switch condition {
-		case "vm_started":
+		switch {
+		case err != nil:
+			last = fmt.Sprintf("could not read the VM: %v", err)
+		case vm == nil:
+			last = "the VM does not exist"
+		case condition == "vm_started":
 			if vm.State == "running" {
 				return nil
 			}
-		case "vm_healthy":
-			if vm.State == "running" && vm.StateDetail != "unhealthy" {
-				// Check if healthcheck is passing — if no healthcheck defined,
-				// "running" is sufficient.
+			last = "the VM is " + vm.State
+		default: // vm_healthy
+			// With a healthcheck, only the owner's passing verdict for this
+			// incarnation of the VM counts; without one, running does.
+			h, herr := health.EvaluateVMHealth(ctx, s.db, vm)
+			if herr != nil {
+				last = herr.Error()
+				break
+			}
+			if h.Satisfied {
 				return nil
+			}
+			last = h.Detail
+			if h.Verdict != "" {
+				last = "healthcheck verdict " + h.Verdict + ": " + h.Detail
 			}
 		}
 
-		time.Sleep(2 * time.Second)
+		// Look once more AT the deadline rather than sleeping past it: a
+		// verdict that lands in the last poll interval is a pass.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		t := time.NewTimer(min(conditionPollInterval, remaining))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
 	}
 
-	return fmt.Errorf("timeout after %s waiting for %s on %s", timeout, condition, vmName)
+	return fmt.Errorf("timeout after %s waiting for %s on %s: %s", timeout, condition, vmName, last)
 }
+
+// conditionPollInterval is how often waitForConditionWithin re-reads the VM.
+const conditionPollInterval = time.Second
 
 // autoPullImages checks each image referenced by VMs in the compose file. If
 // an image is missing locally but has a source URL in the compose images:

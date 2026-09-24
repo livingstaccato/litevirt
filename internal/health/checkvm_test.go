@@ -25,6 +25,15 @@ func testCheckVMDB(t *testing.T) *corrosion.Client {
 	return c
 }
 
+// vmAtLoopback gives a VM one NIC whose address is 127.0.0.1, where the
+// httptest server standing in for its service listens. A probe target is
+// resolved against the VM's address (vmprobe_target.go), and srv.URL names
+// 127.0.0.1 — a loopback host, which means "the VM" — so without an address
+// the probe would not run at all.
+func vmAtLoopback(name string) []corrosion.InterfaceRecord {
+	return []corrosion.InterfaceRecord{{VMName: name, NetworkName: "lan", MAC: "52:54:00:00:00:01", IP: "127.0.0.1"}}
+}
+
 func TestCheckVM_HealthyProbe_ResetsFailures(t *testing.T) {
 	db := testCheckVMDB(t)
 	ctx := context.Background()
@@ -48,7 +57,7 @@ func TestCheckVM_HealthyProbe_ResetsFailures(t *testing.T) {
 		HostName: "node1",
 		Spec:     string(specJSON),
 		State:    "running",
-	}, nil, nil)
+	}, vmAtLoopback("vm-healthy"), nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
@@ -99,7 +108,7 @@ func TestCheckVM_FailedProbe_IncrementsFailures(t *testing.T) {
 		HostName: "node1",
 		Spec:     string(specJSON),
 		State:    "running",
-	}, nil, nil)
+	}, vmAtLoopback("vm-failing"), nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
@@ -151,7 +160,7 @@ func TestCheckVM_ThresholdCrossed_TriggersAction(t *testing.T) {
 		HostName: "node1",
 		Spec:     string(specJSON),
 		State:    "running",
-	}, nil, nil)
+	}, vmAtLoopback("vm-action"), nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
@@ -199,7 +208,7 @@ func TestCheckVM_AlertAction(t *testing.T) {
 		HostName: "node1",
 		Spec:     string(specJSON),
 		State:    "running",
-	}, nil, nil)
+	}, vmAtLoopback("vm-alert"), nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
@@ -408,7 +417,7 @@ func TestSweep_WithRunningVMAndHealthcheck(t *testing.T) {
 		HostName: "node1",
 		Spec:     string(specJSON),
 		State:    "running",
-	}, nil, nil)
+	}, vmAtLoopback("vm-sweep-running"), nil)
 	if err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}

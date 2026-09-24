@@ -51,6 +51,9 @@ type VMChecker struct {
 	// probeFn replaces the probe transport (SetProbeFunc). nil → the real
 	// tcp/http/ping/exec probe.
 	probeFn ProbeFunc
+	// nicIPDiscovery replaces the owner-host ARP / dnsmasq-lease lookup behind
+	// vmAddress (SetNICIPDiscovery). nil → the real lookup.
+	nicIPDiscovery func(mac string) string
 	// probes counts in-flight checkVM goroutines so SweepOnce can wait for
 	// them. Production's Start loop never waits.
 	probes sync.WaitGroup
@@ -115,7 +118,10 @@ func (v *VMChecker) noteStateWriteFail(op string, err error) {
 }
 
 // ProbeFunc runs one healthcheck probe against vm and reports whether it
-// passed and, when it did not, why. ctx carries the probe timeout.
+// passed and, when it did not, why. ctx carries the probe timeout. hspec's
+// Target is already RESOLVED against the VM's address (vmprobe_target.go): a
+// transport never sees a bare port or localhost, and is never called at all
+// for a VM whose address is not known.
 type ProbeFunc func(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec) (ok bool, reason string)
 
 // SetProbeFunc replaces the probe transport. It exists for tests that must
@@ -360,13 +366,25 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 	timeout := parseDuration(hspec.Timeout, 5*time.Second)
 	retries := probeRetries(hspec)
 
-	healthy, reason := v.runProbe(ctx, vm, hspec, timeout)
-	v.recordVerdict(ctx, vm, hspec, healthy, reason)
+	out := v.runProbe(ctx, vm, hspec, timeout)
+	v.recordVerdict(ctx, vm, hspec, out)
 	if inGrace {
 		return
 	}
 
 	v.mu.Lock()
+	if out.unknown {
+		// The probe could not be run (no address known for the VM yet, or a
+		// target that cannot be interpreted). That says nothing about the
+		// VM, so it is neither a pass nor a failure: it breaks any run of
+		// consecutive failures and never counts toward the action. The
+		// verdict published above says why.
+		v.failures[vm.Name] = 0
+		v.mu.Unlock()
+		slog.Debug("vmcheck: probe not run", "vm", vm.Name, "type", hspec.Type, "reason", out.reason)
+		return
+	}
+	healthy := out.ok
 	if healthy {
 		v.failures[vm.Name] = 0
 		v.actionCount[vm.Name] = 0
@@ -438,18 +456,33 @@ func probeRetries(hspec *pb.HealthCheckSpec) int {
 	return 3
 }
 
-// runProbe runs one probe through the wired transport (SetProbeFunc) or the
-// real one, bounded by timeout.
-func (v *VMChecker) runProbe(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, timeout time.Duration) (bool, string) {
+// probeOutcome is one probe's result. unknown means the probe could not be
+// run at all — see resolveProbeSpec — and is neither a pass nor a failure.
+type probeOutcome struct {
+	ok      bool
+	unknown bool
+	reason  string
+}
+
+// runProbe resolves the healthcheck's target against the VM, then runs one
+// probe through the wired transport (SetProbeFunc) or the real one, bounded by
+// timeout.
+func (v *VMChecker) runProbe(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, timeout time.Duration) probeOutcome {
+	resolved, why := v.resolveProbeSpec(ctx, vm, hspec)
+	if resolved == nil {
+		return probeOutcome{unknown: true, reason: why}
+	}
 	v.mu.Lock()
 	fn := v.probeFn
 	v.mu.Unlock()
 	if fn == nil {
-		return v.probeDetail(ctx, vm.Name, hspec, timeout)
+		ok, reason := v.probeDetail(ctx, vm.Name, resolved, timeout)
+		return probeOutcome{ok: ok, reason: reason}
 	}
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	return fn(tctx, vm, hspec)
+	ok, reason := fn(tctx, vm, resolved)
+	return probeOutcome{ok: ok, reason: reason}
 }
 
 func (v *VMChecker) probe(ctx context.Context, vmName string, hspec *pb.HealthCheckSpec, timeout time.Duration) bool {
@@ -457,8 +490,10 @@ func (v *VMChecker) probe(ctx context.Context, vmName string, hspec *pb.HealthCh
 	return ok
 }
 
-// probeDetail is the real probe. On failure it also says why, which is what
-// the published verdict carries to a waiter that times out.
+// probeDetail is the real probe transport. hspec.Target is used literally —
+// runProbe has already resolved it against the VM (vmprobe_target.go). On
+// failure it also says why, which is what the published verdict carries to a
+// waiter that times out.
 func (v *VMChecker) probeDetail(ctx context.Context, vmName string, hspec *pb.HealthCheckSpec, timeout time.Duration) (bool, string) {
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

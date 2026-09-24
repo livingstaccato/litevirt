@@ -262,7 +262,11 @@ func (v *VMChecker) probeDue(vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, n
 // is healthy; `retries` consecutive failures are unhealthy; fewer leave the
 // verdict where it was. The schema has no start-period, so none is applied to
 // the verdict (the start grace in sweep gates only the healthcheck's action).
-func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, ok bool, reason string) {
+//
+// A probe that could not be run (out.unknown: no address known for the VM, or
+// a target that cannot be interpreted) makes the verdict "unknown" with the
+// reason, and resets the failure run: it is not evidence either way.
+func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, out probeOutcome) {
 	inc := IncarnationOf(&vm)
 	retries := probeRetries(hspec)
 	v.mu.Lock()
@@ -281,11 +285,14 @@ func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hs
 		return
 	}
 	tr.inFlight = false
-	if ok {
+	switch {
+	case out.unknown:
+		tr.fails, tr.reason, tr.verdict = 0, out.reason, VerdictUnknown
+	case out.ok:
 		tr.fails, tr.reason, tr.verdict = 0, "", VerdictHealthy
-	} else {
+	default:
 		tr.fails++
-		tr.reason = reason
+		tr.reason = out.reason
 		if tr.fails >= retries {
 			tr.verdict = VerdictUnhealthy
 		}
@@ -299,7 +306,7 @@ func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hs
 		Incarnation:         inc,
 	}
 	v.mu.Unlock()
-	if ev.Verdict == VerdictUnknown {
+	if ev.Verdict == VerdictUnknown && !out.unknown {
 		return // no verdict yet for this incarnation: nothing to say
 	}
 	v.publishVerdict(ctx, vm.Name, ev)
@@ -389,9 +396,14 @@ func (v *VMChecker) publishVerdict(ctx context.Context, name string, ev vmProbeE
 	var prev *corrosion.HealthCondition
 	if ok {
 		prev = &prevRow
+		// No transition: the same verdict for the same incarnation — and, for
+		// "unknown", for the same reason, so a probe that cannot run replaces
+		// an older "unknown" with the reason a waiter needs to see. (The idle
+		// settle path never gets here with an unknown row: it stops first.)
 		if pe, good := decodeVerdict(prevRow); good && pe.Verdict == ev.Verdict &&
-			(pe.Incarnation == ev.Incarnation || ev.Verdict == VerdictUnknown) {
-			return // no transition
+			pe.Incarnation == ev.Incarnation &&
+			(ev.Verdict != VerdictUnknown || pe.Reason == ev.Reason) {
+			return
 		}
 	}
 	fresh, err := corrosion.GetVM(ctx, v.db, name)

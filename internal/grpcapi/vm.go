@@ -3771,7 +3771,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				updLease = lease
 			}
 
-			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
+			if compose.IsTransientOrErrorState(fresh.State) {
+				// A VM left in error or mid-transition (a create, start or
+				// rebuild that did not finish) has no clean shutdown to ask
+				// for — its domain may not even be defined. Make sure nothing
+				// of it runs, then redefine and start it: the repair a deploy
+				// retry asks for.
+				if active, _ := s.virt.DomainIsActive(req.Name); active {
+					if derr := s.virt.DestroyDomain(req.Name); derr != nil {
+						return nil, status.Errorf(codes.Internal, "stop %q before its repair: %v", req.Name, derr)
+					}
+				}
+			} else if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
 				return nil, serr
 			}
 			// Redefine + restart against the fresh (now-stopped) record.

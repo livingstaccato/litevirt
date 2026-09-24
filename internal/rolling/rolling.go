@@ -50,6 +50,10 @@ type VMAction struct {
 	// kept: its stored spec is unreadable, or a previous deploy left it
 	// half-made, or the change is not reconfigurable in place).
 	ForceRecreate bool
+	// Repair routes a VM a previous deploy left half-made through
+	// ReconfigureVM (redefine over its existing disks, then start) whatever
+	// its Plan says — never through a replacement.
+	Repair bool
 }
 
 // mechanism is how the action is applied: Plan.Max(), or a recreate when
@@ -57,6 +61,9 @@ type VMAction struct {
 func (a VMAction) mechanism() compose.Action {
 	if a.ForceRecreate {
 		return compose.ActionRecreate
+	}
+	if a.Repair {
+		return compose.ActionRestart
 	}
 	return a.Plan.Max()
 }

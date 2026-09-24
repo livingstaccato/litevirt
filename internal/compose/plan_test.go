@@ -387,8 +387,8 @@ func TestIsTransientOrErrorState(t *testing.T) {
 		"failed":     true,
 	}
 	for state, want := range cases {
-		if got := isTransientOrErrorState(state); got != want {
-			t.Errorf("isTransientOrErrorState(%q) = %v, want %v", state, got, want)
+		if got := IsTransientOrErrorState(state); got != want {
+			t.Errorf("IsTransientOrErrorState(%q) = %v, want %v", state, got, want)
 		}
 	}
 }

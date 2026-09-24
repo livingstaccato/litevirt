@@ -67,6 +67,24 @@ func TestForceRecreate_Replaces(t *testing.T) {
 	}
 }
 
+// Repair sends a half-made VM through ReconfigureVM whatever its plan says,
+// under every strategy that replaces VMs — never through a replacement.
+func TestRepair_ReconfiguresNeverReplaces(t *testing.T) {
+	for _, strategy := range replacingStrategies {
+		ops := &mockOps{}
+		fn, _ := collect()
+		a := act("web", strategy, compose.ChangePlan{})
+		a.Repair = true
+		if err := Run(context.Background(), ops, "s", []VMAction{a}, fn); err != nil {
+			t.Fatalf("%s: %v", strategy, err)
+		}
+		if len(ops.reconfigured) != 1 || len(ops.recreated)+len(ops.created)+len(ops.deleted) != 0 {
+			t.Errorf("%s: reconfigured=%v recreated=%v created=%v deleted=%v, want web repaired only", strategy,
+				ops.reconfigured, ops.recreated, ops.created, ops.deleted)
+		}
+	}
+}
+
 // in-place keeps refusing what it cannot do live, rather than restarting.
 func TestInPlace_StillRefusesARestart(t *testing.T) {
 	ops := &mockOps{}

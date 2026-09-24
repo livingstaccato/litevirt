@@ -608,6 +608,7 @@ func (s *Server) rollingUpdateWave(ctx context.Context, f *compose.File, updates
 			Plan:          a.Plan,
 			Desired:       a.Spec,
 			ForceRecreate: a.Apply == compose.ActionRecreate,
+			Repair:        a.Repair,
 		})
 	}
 	if len(actions) == 0 {

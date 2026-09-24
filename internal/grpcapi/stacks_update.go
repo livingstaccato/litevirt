@@ -86,6 +86,16 @@ func (s *Server) reconfigureWithRestart(ctx context.Context, name string, desire
 	}
 	allow := true
 	req := &pb.UpdateVMRequest{Name: name, AllowRestart: &allow, DisableVnc: desired.DisableVnc}
+	if compose.IsTransientOrErrorState(vm.State) {
+		// A VM a previous deploy left half-made: repair it — redefine the
+		// domain from the spec over its existing disks, and start it — even
+		// when nothing in the spec changed. Naming the cpu makes UpdateVM take
+		// its redefine path.
+		req.Cpu = stored.Cpu
+		if desired.Cpu != 0 {
+			req.Cpu = desired.Cpu
+		}
+	}
 	if desired.Cpu != 0 && desired.Cpu != stored.Cpu {
 		req.Cpu = desired.Cpu
 	}
@@ -190,7 +200,8 @@ func hasReason(reasons []string, prefix string) bool {
 }
 
 // applyPlannedUpdate carries out one inline OpUpdate by its planned mechanism.
-// It returns the failed-action error.
+// A repair that fails is the action's failure — the VM stays as it is, never
+// replaced. It returns the failed-action error.
 func (s *Server) applyPlannedUpdate(ctx context.Context, action planner.VMAction, f *compose.File, gate *dependsOnGate) error {
 	if action.IsContainer || action.Apply == compose.ActionRecreate {
 		return s.recreateInline(ctx, action, f, gate)

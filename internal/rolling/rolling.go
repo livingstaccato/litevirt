@@ -326,7 +326,10 @@ func snapshotAndReplace(ctx context.Context, ops Ops, actions []VMAction, ud com
 	return nil
 }
 
-// blueGreen creates a complete parallel set of new VMs, then cuts over.
+// blueGreen creates a complete parallel set of new VMs, then cuts over by
+// deleting the old (blue) ones. A green that fails to create aborts the group
+// and removes the greens already made. A blue that fails to delete does not: it
+// is reported as an "error" progress for that VM and the group returns nil.
 func blueGreen(ctx context.Context, ops Ops, stackName string, actions []VMAction, emit func(Progress)) error {
 	greenNames := make([]string, 0, len(actions))
 	for _, a := range actions {
@@ -335,7 +338,9 @@ func blueGreen(ctx context.Context, ops Ops, stackName string, actions []VMActio
 		if err := ops.RecreateVM(ctx, greenName, a.Desired); err != nil {
 			emit(Progress{VMName: greenName, Phase: "error", Detail: err.Error(), Err: err})
 			for _, gn := range greenNames {
-				_ = ops.DeleteVM(ctx, gn)
+				if derr := ops.DeleteVM(ctx, gn); derr != nil {
+					emit(Progress{VMName: gn, Phase: "error", Detail: "rollback: green instance not removed", Err: derr})
+				}
 			}
 			return err
 		}
@@ -343,10 +348,30 @@ func blueGreen(ctx context.Context, ops Ops, stackName string, actions []VMActio
 		emit(Progress{VMName: greenName, Phase: "done", Detail: "green instance ready"})
 	}
 
+	// Every green is up, so from here on a failure is not a failed cutover: the
+	// new side is serving. A blue that cannot be removed is still reported as a
+	// failure of that VM (an "error" progress carrying Err, which the caller
+	// counts) — it is still defined, may still be running, and still holds its
+	// disks, so the stack has not converged — and the cutover goes on for the
+	// rest.
+	notRemoved := 0
 	for i, a := range actions {
 		emit(Progress{VMName: a.Name, Phase: "stopping", Detail: "removing blue instance"})
-		_ = ops.DeleteVM(ctx, a.Name)
+		if err := ops.DeleteVM(ctx, a.Name); err != nil {
+			notRemoved++
+			emit(Progress{
+				VMName: a.Name,
+				Phase:  "error",
+				Detail: greenNames[i] + " is serving, but the old instance was not removed",
+				Err:    fmt.Errorf("blue-green cutover: %s is serving, but the old instance %s was not removed: %w", greenNames[i], a.Name, err),
+			})
+			continue
+		}
 		emit(Progress{VMName: greenNames[i], Phase: "done", Detail: "cutover complete"})
+	}
+	if notRemoved > 0 {
+		slog.Warn("blue-green cutover left old instances in place", "stack", stackName, "not_removed", notRemoved)
+		return nil
 	}
 	slog.Info("blue-green cutover complete", "stack", stackName)
 	return nil

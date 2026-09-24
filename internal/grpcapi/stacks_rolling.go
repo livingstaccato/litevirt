@@ -158,11 +158,17 @@ func newDeployFailures(stream grpc.ServerStreamingServer[pb.DeployProgress]) *de
 // fail records vm as failed and sends its "error" phase. The returned error is
 // a stream send failure only.
 func (d *deployFailures) fail(vm string, err error) error {
+	return d.failWithDetail(vm, "", err)
+}
+
+// failWithDetail is fail with a Detail on the "error" message, for failures
+// the rolling engine reports as progress.
+func (d *deployFailures) failWithDetail(vm, detail string, err error) error {
 	if !d.seen[vm] {
 		d.seen[vm] = true
 		d.names = append(d.names, vm)
 	}
-	return d.stream.Send(&pb.DeployProgress{Phase: "error", VmName: vm, Error: err.Error()})
+	return d.stream.Send(&pb.DeployProgress{Phase: "error", VmName: vm, Detail: detail, Error: err.Error()})
 }
 
 // deleteWorkloadIgnoringGone deletes a planned workload, treating NotFound as
@@ -365,7 +371,16 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 
 		if len(actions) > 0 {
 			ops := &serverOps{s: s}
+			// An "error" the engine reports goes through failures, like every
+			// other failed action: some are not fatal to the engine (a blue-green
+			// blue that could not be removed after its green is serving, a
+			// snapshot-and-replace -next that did not come up), and those are the
+			// only record that the stack has not converged.
 			rerr := rolling.Run(ctx, ops, f.Name, actions, func(p rolling.Progress) {
+				if p.Phase == "error" && p.Err != nil {
+					_ = failures.failWithDetail(p.VMName, p.Detail, p.Err)
+					return
+				}
 				errStr := ""
 				if p.Err != nil {
 					errStr = p.Err.Error()

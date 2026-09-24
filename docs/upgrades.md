@@ -58,8 +58,7 @@ Six guarantees the upgrade pipeline enforces:
    columns it does not know about, and that tolerance is what makes a rolling
    upgrade reversible.
 
-   This used to be a refusal and is documented here because the change is easy
-   to miss: rolling a binary back is **not** gated on the schema. What a
+   Rolling a binary back is **not** gated on the schema. What a
    rollback still needs care with is replicated statement shapes a downgraded
    node cannot decode — see the capability notes below.
 
@@ -454,11 +453,6 @@ control order:
 lv host upgrade host-01 --binary ./bin/litevirt --yes
 ```
 
-> Older builds compared each host to the *connected daemon's* version instead
-> of the binary's, so the no-arg form no-op'd (`All hosts are up-to-date.`) on a
-> version-uniform cluster and you had to seed a node by name first. That's
-> fixed — it now probes the binary.
-
 **2. NEVER seed by hand-restarting the daemon on a healthy host:**
 
 ```bash
@@ -477,7 +471,7 @@ which marks the host `upgrading` (the coordinator skips `offline`,
 host, put it in maintenance first (`lv host drain <host>`), restart, then
 return it.
 
-**Overriding a stale block.** `--force` is now sent to the daemon, so a
+**Overriding a stale block.** `--force` is sent to the daemon, so a
 genuinely-stale server-side block can be overridden:
 
 ```bash
@@ -531,7 +525,7 @@ on restart; a single-version skew self-heals) — so the very upgrade that
 introduces this feature still works as a plain rolling restart. Pass
 `--no-prestage` to skip the pass (not recommended for multi-version jumps).
 
-You generally do **not** need to run `schema-migrate` by hand anymore. It
+You generally do **not** need to run `schema-migrate` by hand. It
 remains available for manual control or recovery — e.g. forward-staging a
 long-offline node that's ≥2 versions behind before it rejoins:
 
@@ -659,6 +653,6 @@ convergence comparison: those legitimately differ between any two healthy nodes,
 and requiring them to match would make every reseed fail.
 
 The whole regime is gated on `isolation_epoch_v1`
-(`enforcement.isolation_epoch`, default off). A pre-latch cluster behaves exactly
-as it did before this shipped, so it can be rolled out incrementally — enable the
+(`enforcement.isolation_epoch`, default off). A pre-latch cluster does none of
+this, so it can be rolled out incrementally — enable the
 flag fleet-uniformly, since the token latches only under config uniformity.

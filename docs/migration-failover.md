@@ -151,7 +151,7 @@ does so it does not count toward fencing.
 
 The guard does not cover a **peer** that stalls. To every observer that kept
 running, a peer that answers no probe for about 10 s cannot be told apart from a
-dead one, and it is fenced exactly as before. That is the case fencing exists
+dead one, and it is fenced as a dead host would be. That is the case fencing exists
 for: the peer may come back with its workloads still running. Pausing an entire
 cluster at once and resuming it does not fence anything, with or without the
 guard. Rows written before the pause are stale against the resumed clocks, and
@@ -268,7 +268,7 @@ This is **host-fence-gated shared storage, not storage-level exclusivity** — l
 does not (yet) take storage-side locks (RBD blocklist, iSCSI PR keys). It is a
 config kill-switch (`enforcement.shared_storage_fence`) plus the capability latch, so
 an UPGRADE is behavior-neutral until the flag is enabled fleet-uniformly, and disabling
-it restores the legacy behavior. The flag is false when absent — but a cluster created
+it turns the fence gate off. The flag is false when absent — but a cluster created
 with `lv host init` starts with it on, because there is no prior behavior to preserve
 and the unguarded outcome is two hosts writing one disk. Hosts joining an existing
 cluster inherit that cluster's setting, never this default.
@@ -283,14 +283,14 @@ lv host label set <host> litevirt.fence_requires_confirmation=true
 ```
 
 With the label, a fence that did not **verify** the power-off — `ssh`, and
-`best-effort` in both its forms — no longer reschedules anything and no longer
-records the host as `fenced`; it is left `offline`. An IPMI fence, which does
+`best-effort` in both its forms — does not reschedule anything and does not
+record the host as `fenced`; it is left `offline`. An IPMI fence, which does
 verify, is unaffected. The fence's assurance is shown by `lv doctor fence` and
 `lv host fence` (see [Diagnostics](diagnostics.md)).
 
 It is a label rather than a config flag because only one place acts on it — the
 coordinator creating the recovery — so no peer needs to honour it, and a
-coordinator on an older binary ignores it and behaves exactly as before. Roll
+coordinator on an older binary ignores it and acts as if it were absent. Roll
 the binary out before relying on it.
 
 **Getting past the refusal.** Confirm the host is powered off, then run
@@ -302,10 +302,7 @@ cycle — see [Resuming a recovery from a confirmation](#resuming-a-recovery-fro
 A recovery refused for want of a confirmation — a `manual` fence, a
 `best-effort` fence under the safe-fence policy, or a host labelled
 `litevirt.fence_requires_confirmation` — resumes once an operator runs
-`lv host fence-confirm <host>`. Before this, it never did: the refusal marked the
-host handled for the outage, nothing looked at it again, and the confirmation
-landed on a host no code path would revisit, in the same process or after a
-restart.
+`lv host fence-confirm <host>`.
 
 The resume requires three things, not the confirmation alone:
 
@@ -455,7 +452,7 @@ back now": a fast, safe, operator-driven override — no weaker cluster-wide pol
 container to another host by reusing the backup→restore transport (stop →
 archive → restore on target → restart if it was running). The source archives
 into `--repo` locally and **streams the manifest to the target over peer mTLS**
-(into a per-transfer staging repo), so `--repo` no longer needs to be reachable
+(into a per-transfer staging repo), so `--repo` does not need to be reachable
 from both hosts. If the target predates peer streaming it falls back to
 re-opening `--repo` by name, which then must be shared. No live/CRIU migration.
 

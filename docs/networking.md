@@ -310,10 +310,7 @@ speak for the rest. Two things follow:
   on any host, under any local state: that part is unconditional.
 
   The refusal happens **before** the bridge is created, so it is idempotent: a
-  retry reads the same host state and refuses identically. (It used to create the
-  bridge and then refuse, so the second attempt read a pre-existing bridge,
-  concluded litevirt was not the DHCP authority, and provisioned with no DHCP
-  server at all — guests with no addresses and no explanation.)
+  retry reads the same host state and refuses identically.
 
   **It does not stop the placement.** Every caller of provisioning logs the
   refusal and falls back to the network name as the bridge, then creates that
@@ -1281,7 +1278,7 @@ things, in this order:
    drift you have repaired in NetBox, and `lv netbox rekey` rewrites the
    identities a moved fingerprint invalidated so a resume can then succeed.
 2. **Reclaim orphans** — addresses NetBox still holds under this cluster's
-   identity that nothing claims any more.
+   identity that nothing claims.
 
 The order is the safety property. A binding suspended by step 1 is out of scope
 for step 2 in that same pass, and a revalidation that could not COMPLETE — an
@@ -1317,14 +1314,14 @@ so it happens only under a whole-cluster proof:
   excused only from the scan.** A witness runs the daemon, gossips and receives
   every replicated row, so it is a first-class source of membership *and* of
   inventory; what it does not do is host a workload, so scanning it for a guest
-  proves nothing. Excluding a witness from the *question* was a bug twice over: a
-  host whose role this node had recorded as `witness` but which had since been
-  made a worker was never asked, and its stale role could never be corrected — an
-  exclusion must not skip the query that would have refuted it — and a genuine
-  witness that was the only node able to name a third host was never asked either.
-  Excluding it from the *inventory* comparison was a third: it held the only
-  replicated copy of a running guest's records, every other node's inventory was
-  equally short, they agreed with each other, and a bind went live over a held
+  proves nothing. Excluding a witness from the *question* would be a bug twice over: a
+  host whose role this node has recorded as `witness` but which has since been
+  made a worker would never be asked, and its stale role could never be corrected — an
+  exclusion must not skip the query that would refute it — and a genuine
+  witness that is the only node able to name a third host would never be asked either.
+  Excluding it from the *inventory* comparison would be a third: when it holds the only
+  replicated copy of a running guest's records, every other node's inventory is
+  equally short, they agree with each other, and a bind goes live over a held
   address. A host counts as a witness only while **every** `hosts` row read for it
   agrees; two rows that disagree, or no row anywhere, and it must answer with a
   scan like any worker;
@@ -1342,8 +1339,8 @@ so it happens only under a whole-cluster proof:
   soft-deleted may still be running the domain that holds the address. Its
   **gossip members** are the only source that can name a host with no `hosts` row
   anywhere — memberlist converges in seconds, independently of every table — so a
-  holder known only to another node's gossip is now covered too, which no
-  table-derived answer could ever have reached;
+  holder known only to another node's gossip is covered too, which no
+  table-derived answer could reach;
 - the same membership proof gates the **bind**, not only the sweep. A node that
   cannot establish the host set does not go live on a prefix: its binding is
   suspended, and the next maintenance pass resumes it by itself. Handing out an
@@ -1445,11 +1442,7 @@ reclaim is always preferable to handing a running guest's address to a new one.
 A supported recovery path is specified — the operator-attested substitution, its
 authorization rules, and the withdrawal that takes one back — in
 [the frozen trust-recovery lifecycle scope](reviews/2026-09-08-trust-lifecycle-followup-scope.md).
-It is **not implemented**. An earlier prerelease build of this work carried one —
-a retire-host command under `lv netbox`, with a withdrawal and a listing beside
-it — and it was removed before release so that its authorization rules could be
-reviewed on their own terms rather than as a rider on an addressing change. No
-released version ever had it.
+It is **not implemented**.
 
 > **If you ran a prerelease build of this feature, upgrading to this one is not
 > supported and the daemon refuses to start.** A database that carries the

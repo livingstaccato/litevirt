@@ -140,11 +140,11 @@ binding can:
   node-local and refuses peer certs — see
   [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
-> **Upgrade note (content RBAC):** storage-pool content ops moved off the legacy flat
-> path `/storage/pools/<name>` onto the project-scoped path above. Re-issue any explicit
-> `storage.content.*` grant on the old path (admin / role-floor grants are unaffected).
-> The check runs on the **entry** node a user authenticates to, so the isolation takes
-> effect once those nodes are upgraded — an un-upgraded entry node still uses the old path.
+> **Content RBAC path:** storage-pool content ops are checked on the project-scoped path
+> above, not on the flat path `/storage/pools/<name>`. An explicit `storage.content.*` grant
+> on the flat path does not apply; issue it on the project-scoped path (admin / role-floor grants are unaffected).
+> The check runs on the **entry** node a user authenticates to, so the isolation holds
+> only where those nodes run this build — an entry node on an older build checks the flat path.
 
 Interactive guest access — **console, VNC, and SPICE** — requires `vm.console`
 on the specific VM's project path (`/projects/<project>/vms/<name>`), not just a
@@ -255,8 +255,8 @@ To disable a factor: `lv 2fa disable --method totp --label phone`.
 
 ## Migration from the legacy admin/operator/viewer roles
 
-litevirt 0.x had a flat `admin > operator > viewer` ladder stored on
-`users.role`. The new engine respects existing rows for backward
+`users.role` holds a flat `admin > operator > viewer` ladder. The RBAC
+engine respects these rows for backward
 compatibility:
 
 - Each legacy role appears as a synthetic group `group:<role>@local`.
@@ -346,7 +346,7 @@ fan-out would be best-effort with a list of hosts it failed to reach.
 replicated state DB, so root on a node is already full local + cluster power —
 RBAC does not (and cannot) constrain it, and a host cert is a legitimately
 root-obtained *node* identity. What this model closes is that a **distributable**
-credential (the shared CLI client cert) no longer equals admin: hand someone CLI
+credential (the shared CLI client cert) does not equal admin: hand someone CLI
 reach and they still need to `lv login` to act.
 
 ### Enforcement (`auth.strict_mtls_identity`)

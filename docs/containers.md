@@ -155,7 +155,7 @@ container on an LXC-capable host (placement is capability-aware, so a container
 never lands on a node without the runtime); re-apply is idempotent (unchanged
 containers are left alone, a changed spec recreates); and `lv compose down`
 removes them and every trace they created (rootfs, the stack's network bridge +
-dnsmasq, and any load balancer processes). The legacy `vms:` map still parses —
+dnsmasq, and any load balancer processes). The legacy `vms:` map is accepted —
 every entry there gets `kind: vm` applied implicitly so existing stacks need no
 changes.
 

@@ -57,8 +57,8 @@ netfilter forward path and `jump`s into the three tiers in order.
 
 The same renderer also emits the host's network-infra rules into the
 `litevirt-fw` table, so a single atomic replace covers filtering **and**
-NAT/isolation (there is no separate `inet litevirt` table or out-of-band
-iptables any more):
+NAT/isolation (there is no separate `inet litevirt` table and no out-of-band
+iptables):
 
 - **Masquerade** — a `postrouting` nat chain SNATs managed-subnet guest egress
   out the host's uplink (`ip saddr <subnet> oifname != <bridge> masquerade`).
@@ -98,9 +98,6 @@ litevirt follows the AWS / GCP / Proxmox convention:
 |---|---|---|
 | `ingress` | traffic ARRIVING at the VM | `oifname <tap>`, `ip saddr` |
 | `egress`  | traffic LEAVING the VM | `iifname <tap>`, `ip daddr` |
-
-This is the inverse of the legacy `internal/network/acl.go` mapping —
-the firewall package is the canonical implementation going forward.
 
 ## Compose
 

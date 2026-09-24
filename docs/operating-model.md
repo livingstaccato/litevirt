@@ -68,8 +68,8 @@ of acting — it says nothing about whether the resulting rows have replicated.
 - **A local commit is not peer-durable.** A write returns once it is durable in
   the local store; the push to peers is asynchronous. If the host dies between
   those two moments the write is gone. A peer being *reachable* is not a peer
-  having *applied* anything — reachability is what the health probe measures,
-  and this page used to conflate the two. Where a write must survive the loss of
+  having *applied* anything — reachability is what the health probe measures.
+  Where a write must survive the loss of
   its origin host, confirm it landed — `litevirt_replication_min_watermark_seq`
   advancing past the write, or `lv cluster converge` reporting matching digests
   — rather than assuming a healthy cluster implies it did.
@@ -131,17 +131,14 @@ of acting — it says nothing about whether the resulting rows have replicated.
 - **A VM created through `CreateVM` is normally provable immediately.** It is
   assigned its first ownership generation and both runtime markers (libvirt
   domain metadata and the host-local marker file) are stamped before the call
-  returns. Previously the row was born at the pre-epoch default and carried no
-  marker until the reconciler's next backfill sweep, so for up to that interval
-  a running VM could not prove which generation it belonged to.
-  **This narrows that window; it does not close it**, and it covers only that
-  one path. The row is still published as `running` before the markers are
+  returns.
+  **This narrows the window in which a running VM cannot prove its generation;
+  it does not close it**, and it covers only that one path. The row is still published as `running` before the markers are
   written, so a crash or a failure in between still leaves a running VM that
-  cannot prove its generation — now for the width of a few calls inside one RPC
-  rather than a sweep interval. The dual-run detector's newborn grace remains
+  cannot prove its generation — for the width of a few calls inside one RPC. The dual-run detector's newborn grace remains
   the backstop for that residue, and closing it needs the create path reordered
-  to record the row before the runtime exists. All containers are unchanged:
-  they graduate on the backfill sweep as before.
+  to record the row before the runtime exists. Containers do not take this path:
+  they graduate on the backfill sweep.
 - **A VM published as `running` is marked at the same time, on the host that
   runs it.** Every local transition that sets a VM to `running` — start,
   snapshot restore, import, a failed migration healing back, the reconciler's
@@ -199,9 +196,8 @@ of acting — it says nothing about whether the resulting rows have replicated.
   legitimately-owned VM), so treating a `0` as unreadable there would turn its
   refusal into a permission — the dual-run the marker exists to prevent. A
   NEGATIVE marker gets no such treatment: it is garbage, and no decision is
-  derived from it. One consequence is visible on upgrade: a VM already running
-  with a `0` marker was never provable, and now reports as such rather than
-  passing silently.
+  derived from it. A VM running with a `0` marker is therefore not provable,
+  and reports as such rather than passing silently.
 
 ### Time
 - HLC rejects remote timestamps more than **5 minutes ahead** of local wall
@@ -262,7 +258,7 @@ empty `leader_lease_terms`.
 It gates the mint rather than the read because the mint is the first write this
 table ever replicated, and a host still on the previous release cannot decode
 it: the write would not be ignored, it would stall that host's replication
-entirely. So the latch is the proof that no such host is listening any more.
+entirely. So the latch is the proof that no such host is listening.
 
 **"Every host" means every host still receiving replication, not every host that
 votes.** A host in `maintenance` does not vote, but its daemon is up, it is in
@@ -368,7 +364,6 @@ costs milliseconds. When there is one, the numbers are:
 | --- | --- |
 | every peer answering | milliseconds per proof |
 | one connected-but-silent peer | ~13s total (one 3s sweep, then a 250ms probe per proof) |
-| the same, before this was bounded | up to 120s total (3s per proof) |
 
 The bound comes from remembering that a peer answered nothing and giving it a
 250ms probe on the next sweep instead of the full budget, for up to 10s. It
@@ -428,9 +423,9 @@ A proof's term and key are also part of a check that is INDEPENDENT of term
 enforcement and runs whether or not it is switched on. An executor field-matches
 the proof it was handed against the proof row it has persisted — action, target
 kind and name, coordinator, destination, relocation token, fence epoch, owner
-epoch, and now the lease term and key; `corrosion.ProofBindingEqual` is the one
+epoch, and the lease term and key; `corrosion.ProofBindingEqual` is the one
 definition of that set. A mismatch refuses the action ungated, exactly as a
-mismatched relocation token already did. That catches a DIVERGENT PROOF ROW,
+mismatched relocation token does. That catches a DIVERGENT PROOF ROW,
 which is a different question from whether the term is current.
 
 A proof's term and key are validated at every point where they could otherwise
@@ -579,15 +574,13 @@ access path rather than a query.
 #### A contested lease still converges
 
 Keeping both claims is about the *evidence*. It does not mean both claimants
-keep acting, and before this was written they did: each replica's
-`leader_election` row named its own claimant (a peer's renewal is a no-op
+keep acting. Without the rule below they would: each replica's
+`leader_election` row names its own claimant (a peer's renewal is a no-op
 against a live row with another holder, and that table is anti-entropy
-excluded), each replica's term row named its own claimant, so every claimant
-classified every tick as a renewal of its own tenure and renewed forever. The
-lab showed it as three nodes all running the failover leader's resume path
-within two seconds of one another, ten days after the terms were contested.
+excluded), each replica's term row names its own claimant, so every claimant
+classifies every tick as a renewal of its own tenure and renews forever.
 
-Now, once a node learns another node claimed its current term — on the WAL,
+Once a node learns another node claimed its current term — on the WAL,
 the moment the peer's mint arrives, or on the next anti-entropy pass:
 
 - **Every claimant but the lowest-sorting holder name stands down.** It stops
@@ -738,8 +731,8 @@ leadership churn or a partition.
 - **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
   this repo is 3 nodes (`tests/fleet/`) and the largest by hand is the 4-node
   lab. The relay-quorum protocol scales O(n) by design and there is no known
-  ceiling, but "tested and supported at ~50 nodes" — which this page used to
-  say — was never backed by a sustained load test and should not be planned
+  ceiling, but a figure like "tested and supported at ~50 nodes" is not
+  backed by a sustained load test and should not be planned
   against. Larger clusters will likely need the anti-entropy interval tuned.
 
 ### Network

@@ -318,7 +318,7 @@ the acknowledgement does not report how it ended.
 
 `/api/v1/stacks/deploy` without SSE waits for the whole deploy. It must: closing
 a `DeployStack` stream cancels the deploy on the server, so answering with the
-first frame used to create at most one VM and abandon the rest. The body lists
+first frame would create at most one VM and abandon the rest. The body lists
 each VM finished and each action that failed, and the status is `200` only when
 none did; otherwise `500` with the failures and an `error` summary (the stack is
 left `degraded`, and a re-deploy retries the failed actions):

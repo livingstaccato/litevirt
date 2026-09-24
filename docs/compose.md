@@ -121,7 +121,10 @@ container name, `network <name>`, or `containers (list failed)`), the success li
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 (web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
 the teardown in the background, and the `stack.delete` audit entry has result
-`error` and names what was not removed.
+`error` and names what was not removed. The web UI's stack **Destroy** action
+reports the same way: it says the stack was destroyed only after a complete
+teardown, and otherwise shows an error naming each failure and stays on the
+page.
 
 ## VM definition
 

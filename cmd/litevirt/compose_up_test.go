@@ -275,3 +275,42 @@ func TestComposeDown_AllSucceedStillSaysTornDown(t *testing.T) {
 		t.Errorf("success line missing:\n%s", out)
 	}
 }
+
+// TestComposeDown_FailedNetworkAndContainerListingAreCounted: DeleteStack
+// reports a network it could not deprovision, or a container listing that
+// failed, as an "error" status named for what was left. Those are failed
+// deletions like any VM's, even when every VM went.
+func TestComposeDown_FailedNetworkAndContainerListingAreCounted(t *testing.T) {
+	spy := &deployClient{teardown: []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "deleted"},
+		{VmName: "containers (list failed)", Status: "error", Error: "list the stack's containers: boom"},
+		{VmName: "network hb_back", Status: "error", Error: "deprovision network: boom"},
+	}}
+	out, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err == nil {
+		t.Fatalf("compose down with a failed network deprovision returned nil error; stdout:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), `2 of 3 deletions failed (containers (list failed), network hb_back)`) {
+		t.Errorf("error does not count the failures: %v", err)
+	}
+	if strings.Contains(out, "torn down.") {
+		t.Errorf("an incomplete teardown was reported as torn down:\n%s", out)
+	}
+}
+
+// TestComposeDown_UnnamedErrorIsStillCounted: an error status without a name
+// must still fail the command and read sensibly, not "1 of 0 deletions".
+func TestComposeDown_UnnamedErrorIsStillCounted(t *testing.T) {
+	spy := &deployClient{teardown: []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleted"},
+		{Status: "error", Error: "boom"},
+	}}
+	_, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err == nil {
+		t.Fatal("compose down with an unnamed error returned nil error")
+	}
+	if !strings.Contains(err.Error(), `1 of 2 deletions failed (stack resource)`) {
+		t.Errorf("error does not count the unnamed failure: %v", err)
+	}
+}

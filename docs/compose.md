@@ -114,8 +114,10 @@ exactly the actions that failed and the stack returns to `active` once they
 all succeed.
 
 `compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
-and exit status 0 only when every VM and container was deleted. If any could
-not be, each failure is printed, the success line is withheld, and the command
+and exit status 0 only when every VM and container was deleted and every stack
+network deprovisioned. If any could not be — or the stack's containers could
+not even be listed — each failure is printed, named for what was left (a VM or
+container name, `network <name>`, or `containers (list failed)`), the success line is withheld, and the command
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 (web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
 the teardown in the background, and the `stack.delete` audit entry has result

@@ -823,6 +823,16 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		hadFailures = true
 		notRemoved = append(notRemoved, "containers (list failed)")
 		slog.Warn("stack delete: list containers failed", "stack", req.Name, "error", ctErr)
+		// Every failure that keeps the stack "deleting" goes on the stream too:
+		// it ends OK either way, so an "error" status is the only way a client
+		// can tell the teardown was incomplete.
+		if sendErr := stream.Send(&pb.DeleteProgress{
+			VmName: "containers (list failed)",
+			Status: "error",
+			Error:  "list the stack's containers: " + ctErr.Error(),
+		}); sendErr != nil {
+			return sendErr
+		}
 	}
 	for _, ct := range containers {
 		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); delErr != nil {
@@ -868,6 +878,13 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 				hadFailures = true
 				notRemoved = append(notRemoved, "network "+nr.Name)
 				slog.Warn("stack network deprovision failed", "network", nr.Name, "error", err)
+				if sendErr := stream.Send(&pb.DeleteProgress{
+					VmName: "network " + nr.Name,
+					Status: "error",
+					Error:  "deprovision network: " + err.Error(),
+				}); sendErr != nil {
+					return sendErr
+				}
 			}
 		}
 	}

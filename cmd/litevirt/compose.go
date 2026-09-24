@@ -267,16 +267,23 @@ func newDownCmd() *cobra.Command {
 						}
 						break
 					}
-					if p.VmName != "" && !seenVM[p.VmName] {
-						seenVM[p.VmName] = true
-						seen = append(seen, p.VmName)
+					// Not only VMs: a network that could not be deprovisioned or
+					// a failed container listing arrives named for itself, and
+					// an unnamed error still counts.
+					item := p.VmName
+					if item == "" && p.Status == "error" {
+						item = "stack resource"
+					}
+					if item != "" && !seenVM[item] {
+						seenVM[item] = true
+						seen = append(seen, item)
 					}
 					switch p.Status {
 					case "error":
-						fmt.Fprintf(os.Stderr, "  error %s: %s\n", p.VmName, p.Error)
-						if !seenFailed[p.VmName] {
-							seenFailed[p.VmName] = true
-							failed = append(failed, p.VmName)
+						fmt.Fprintf(os.Stderr, "  error %s: %s\n", item, p.Error)
+						if !seenFailed[item] {
+							seenFailed[item] = true
+							failed = append(failed, item)
 						}
 					case "deleted":
 						fmt.Printf("  deleted %s\n", p.VmName)

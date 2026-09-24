@@ -581,3 +581,17 @@ func ScopedNetworkName(stackName, netName string) string {
 	}
 	return stackName + "_" + netName
 }
+
+// ResolveNetworkName returns the cluster network record a workload NIC
+// naming raw refers to. A network this file declares (and does not mark
+// external) belongs to the stack and is stored as "<stack>_<raw>". Any other
+// name — declared `external: true`, or not declared at all — is a cluster
+// network made outside the stack (`lv network create`), stored under its own
+// name. Every site that turns a NIC's network into a record name must use
+// this, so the VM, the container and the planner agree.
+func (f *File) ResolveNetworkName(raw string) string {
+	if nd, ok := f.Networks[raw]; ok && !nd.External {
+		return ScopedNetworkName(f.Name, raw)
+	}
+	return raw
+}

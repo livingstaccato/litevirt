@@ -99,7 +99,12 @@ func TestContainerRBACPathAndProject(t *testing.T) {
 func TestBuildContainerRequest_ScopedBridgeAndCIDR(t *testing.T) {
 	s := testServerR2(t)
 	ctx := context.Background()
-	f := &compose.File{Name: "lbmix"}
+	// lbnet is declared by the file, so it is the stack's own network, stored
+	// as "lbmix_lbnet". (An undeclared name would be the cluster network of that
+	// name — see TestBuildVMSpec_UndeclaredNetworkIsTheClusterNetwork.)
+	f := &compose.File{Name: "lbmix", Networks: map[string]compose.NetworkDef{
+		"lbnet": {Type: "isolated", Subnet: "10.77.0.0/24"},
+	}}
 
 	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{
 		Name: "lbmix_lbnet", Type: "isolated", Config: `{"subnet":"10.77.0.0/24"}`,

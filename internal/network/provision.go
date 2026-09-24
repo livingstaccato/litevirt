@@ -37,6 +37,39 @@ func IsolatedBridgeName(networkName string) string {
 	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
 }
 
+// BridgeName returns the host device a NIC on networkName attaches to: the
+// same name Provision returns for def. Code that needs the device without
+// provisioning (hot attach, restart, containers) must use this, so the NIC
+// and the provisioned bridge always agree.
+//
+// A "direct" network answers "direct:<iface>", as Provision does. A network
+// missing the field its type keys on (vni, pf, interface) falls back to its
+// own name, which is the flat-bridge answer.
+func BridgeName(networkName string, def compose.NetworkDef) string {
+	switch def.Type {
+	case "vxlan":
+		if def.VNI != 0 {
+			return vxlanBridgeName(def.VNI)
+		}
+	case "isolated":
+		return IsolatedBridgeName(networkName)
+	case "sriov":
+		if def.PF != "" {
+			return def.PF
+		}
+		return networkName
+	case "direct":
+		if def.Interface != "" {
+			return "direct:" + def.Interface
+		}
+		return networkName
+	}
+	if def.Interface != "" {
+		return def.Interface
+	}
+	return networkName
+}
+
 // VTEPRecord holds a host's VTEP information for a network.
 type VTEPRecord struct {
 	NetworkName string
@@ -480,11 +513,21 @@ func LocalIP() string {
 	return "127.0.0.1"
 }
 
+// ProvisionFunc provisions one network on this host and returns the device a
+// NIC attaches to. SafeProvision is the production one.
+type ProvisionFunc func(ctx context.Context, db *corrosion.Client, networkName string, def compose.NetworkDef, localIP, hostName string) (string, error)
+
 // ProvisionForVM looks up a network definition from corrosion and calls Provision
 // to ensure all infrastructure (bridge, DHCP, NAT, VXLAN, IRB) exists on this host.
 // Returns the bridge name, or "" if no provisioning is needed (flat bridge mode).
 // Shared by grpcapi.CreateVM and health.Reconciler.
 func ProvisionForVM(ctx context.Context, db *corrosion.Client, networkName, hostName string) (string, error) {
+	return ProvisionForVMWith(ctx, db, networkName, hostName, SafeProvision)
+}
+
+// ProvisionForVMWith is ProvisionForVM with the provisioning step supplied, so
+// a caller holding a provisioner seam uses the same record lookup.
+func ProvisionForVMWith(ctx context.Context, db *corrosion.Client, networkName, hostName string, provision ProvisionFunc) (string, error) {
 	rows, err := db.Query(ctx,
 		`SELECT type, config FROM networks WHERE name = ? AND deleted_at IS NULL`,
 		networkName)
@@ -505,7 +548,7 @@ func ProvisionForVM(ctx context.Context, db *corrosion.Client, networkName, host
 	}
 
 	localIP := LocalIP()
-	bridge, err := SafeProvision(ctx, db, networkName, def, localIP, hostName)
+	bridge, err := provision(ctx, db, networkName, def, localIP, hostName)
 	if err != nil {
 		return "", err
 	}

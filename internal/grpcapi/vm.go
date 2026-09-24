@@ -530,7 +530,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 
 		// Attempt network provisioning if the network is defined in the stack.
-		if provBridge, err := provisionNetworkForVM(ctx, s.db, n.Name, s.hostName); err != nil {
+		if provBridge, err := s.provisionForVM(ctx, n.Name); err != nil {
 			slog.Warn("network provision failed, falling back to bridge name", "network", n.Name, "error", err)
 		} else if provBridge != "" {
 			bridge = provBridge
@@ -2592,26 +2592,10 @@ func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string
 	if def == nil {
 		return networkName
 	}
-	switch def.Type {
-	case "sriov":
-		if def.PF != "" {
-			return def.PF
-		}
-	case "direct":
-		if def.Interface != "" {
-			return "direct:" + def.Interface
-		}
-	case "isolated":
-		// Must match the bridge name provisioning actually creates
-		// (network.IsolatedBridgeName), otherwise a hot attach-nic plugs
-		// into a non-existent device and fails with "Cannot get interface MTU".
-		return network.IsolatedBridgeName(networkName)
-	default:
-		if def.Interface != "" {
-			return def.Interface
-		}
-	}
-	return networkName
+	// Must match the device provisioning actually creates, otherwise a hot
+	// attach-nic plugs into a non-existent device and fails with "Cannot get
+	// interface MTU". network.BridgeName is the one place that names it.
+	return network.BridgeName(networkName, *def)
 }
 
 // lookupNetworkDef fetches a network definition from Corrosion.

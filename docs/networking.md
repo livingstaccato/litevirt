@@ -48,15 +48,21 @@ provisions later can also push its VTEP straight to this host, which adds the
 entry on the spot. Those kernel flood entries are only ever added — an
 individual entry is never withdrawn when a host leaves the network (they go away
 only with the local VXLAN device), and nothing re-derives the set from the
-database outside a provisioning pass, so a newly-joined host may stay absent
-from an existing peer's entries until that peer next provisions, which a daemon
-restart does. Unicast MAC→VTEP entries are programmed explicitly rather than
+database outside a provisioning pass. A newly-joined host gets into an existing
+peer's entries through that push, which it makes when its network reconcile
+pass provisions the network (see [Where a network is set up](#where-a-network-is-set-up));
+if the push is lost, it stays absent until that peer next provisions, which a
+daemon restart does. Unicast MAC→VTEP entries are programmed explicitly rather than
 learned: when a VM's address is discovered, and again when that VM migrates or
 is deleted, its host fans a `bridge fdb` add/delete out to every peer over the
 cluster's mTLS gRPC, so remote hosts point the MAC at whichever host now owns
 it. Setting `subnet:` also gives every host the same anycast gateway — the first
 usable address in the subnet — on the VNI bridge, so a VM's default route is
 host-local.
+
+The host bridge for a VXLAN network is `br-vni<VNI>` (for example `br-vni1000`),
+whatever `interface:` says. Every NIC path — create, restart, hot attach,
+containers — attaches to that bridge.
 
 ### Isolated
 
@@ -73,6 +79,11 @@ networks:
 The host bridge for an isolated network is `br-iso-<name>`; when that would
 exceed Linux's 15-char interface-name limit it is automatically shortened to a
 stable hashed form, so network names of any length work.
+
+An isolated network does not span hosts. Every host gets its own copy: its own
+`br-iso-<name>`, the subnet's first address as gateway, and its own `dnsmasq`
+leasing the same range. VMs on different hosts cannot reach each other over it,
+and two VMs on different hosts can be leased the same address.
 
 ### SR-IOV
 
@@ -115,6 +126,26 @@ Limitations:
 - **No VM-to-host communication** — macvtap in bridge mode does not allow the guest to reach the host's IP on the parent interface. This is a kernel-level restriction of macvtap. VMs can reach other devices on the network, but not the hypervisor itself via that interface.
 - **No DHCP from litevirt** — IP assignment must come from an external DHCP server or be configured statically via cloud-init.
 - **Interface must exist** — litevirt does not create the parent interface. It must be present on the host before deployment.
+
+## Where a network is set up
+
+Every host sets up every network. `lv network create` and a stack deploy set it
+up at once on the node that ran them. Each daemon then compares its own devices
+with the cluster's network table every 30 seconds, and at startup:
+
+- a network it has not set up yet is provisioned (bridge, gateway, `dnsmasq`,
+  VXLAN, NAT). This is how a network reaches the other nodes, a node that joins
+  later, and a node that restarted (`dnsmasq` dies with the daemon).
+- a deleted network is torn down. This is how `lv network delete` and a stack
+  delete reach every node, including one that was down at the time: it tears
+  down when it comes back.
+
+A deleted network whose bridge a live network still uses is left alone, so
+the live one keeps its bridge, gateway and `dnsmasq`.
+
+Creating a VM, migrating one, and restarting one after a failover also
+provision the VM's networks on its host straight away, without waiting for the
+next pass.
 
 ## VM network attachment
 

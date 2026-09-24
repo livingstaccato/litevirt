@@ -119,13 +119,10 @@ func BuildVMSpec(instanceName, baseName string, vm *VMDef, f *File) (*pb.VMSpec,
 		if netDef.VLAN > 0 && len(trunk) == 0 {
 			trunk = []int32{int32(netDef.VLAN)}
 		}
-		// Use the stack-scoped name so that DB lookups in CreateVM
-		// (provisionNetworkForVM, lookupNetworkDef) find the correct record.
-		// External networks keep their raw name.
-		networkName := n.Name
-		if !netDef.External {
-			networkName = ScopedNetworkName(f.Name, n.Name)
-		}
+		// The record name, so that DB lookups in CreateVM (provisioning,
+		// lookupNetworkDef) find the network: scoped for a stack-owned
+		// network, raw for an external or undeclared one.
+		networkName := f.ResolveNetworkName(n.Name)
 		spec.Network = append(spec.Network, &pb.NetworkAttachment{
 			Name:           networkName,
 			Model:          n.Model,

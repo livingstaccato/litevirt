@@ -1568,6 +1568,33 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 	// Network name collisions between stacks are prevented by scoping
 	// non-external network names with the stack prefix (e.g. stack1_LAN).
 
+	// A NIC naming a network the file does not declare attaches to the cluster
+	// network of that name, so that network must exist. Without this a typo, or
+	// a network that was never created, fell through to a flat bridge named
+	// after the NIC: created on the VM's host with no uplink, no gateway and no
+	// DHCP, and nothing reported.
+	undeclared := map[string][]string{} // network → workloads naming it
+	for name, vmDef := range f.VMs {
+		for _, n := range vmDef.Network {
+			if _, declared := f.Networks[n.Name]; !declared {
+				undeclared[n.Name] = append(undeclared[n.Name], name)
+			}
+		}
+	}
+	for netName, users := range undeclared {
+		nr, err := corrosion.GetNetwork(ctx, s.db, netName)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Sprintf("network %q: lookup failed: %v", netName, err))
+		case nr == nil:
+			sort.Strings(users)
+			errs = append(errs, fmt.Sprintf(
+				"network %q (used by %s) is not declared under networks: and no cluster network by that name exists — "+
+					"declare it in the file, or create it with `lv network create %s`",
+				netName, strings.Join(users, ", "), netName))
+		}
+	}
+
 	// Check named volumes reference accessible storage.
 	for volName, vol := range f.Volumes {
 		if vol.Driver == "nfs" && vol.Source != "" {

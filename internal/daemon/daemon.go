@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"github.com/litevirt/litevirt/internal/secretfile"
@@ -27,7 +26,6 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/billing"
 	"github.com/litevirt/litevirt/internal/capabilities"
-	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/failover"
@@ -738,11 +736,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Ensure libvirt storage pools exist.
 	d.ensureStoragePools()
 
-	// Re-provision networks (DHCP, NAT, VXLAN) for active stacks.
-	// dnsmasq is a child process that dies when the daemon restarts;
-	// this brings it back for any network with a subnet.
-	d.reconcileNetworks(ctx)
-
 	// Start gRPC server with mTLS
 	tlsCfg, err := pki.ServerTLSConfig(d.cfg.PKIDir)
 	if err != nil {
@@ -751,6 +744,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
+
+	// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
+	// down every deleted one. dnsmasq is a child process that dies when the
+	// daemon restarts; this brings it back. The same pass then runs on an
+	// interval (StartNetworkReconciler, below), which is what carries a
+	// network created or deleted on another node to this one.
+	if err := svc.ReconcileNetworksOnce(ctx); err != nil {
+		slog.Warn("startup network reconcile failed", "error", err)
+	}
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
@@ -1123,6 +1125,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetFirewallReconciler(d.fwReconciler)
 	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
 	d.fwReconciler.Start(ctx)
+
+	// Converge this host's network devices on the replicated networks table
+	// every 30s: a network created elsewhere is provisioned here, a deleted
+	// one is torn down here. Started after the firewall reconciler so a pass
+	// that records NAT/isolation intent has something to apply it.
+	svc.StartNetworkReconciler(ctx, 0)
 
 	// tenancy + billing engine. The webhook URL is empty
 	// for most clusters; the emitter resolves to a no-op in that
@@ -1962,37 +1970,6 @@ func (d *Daemon) storagePoolRefs() map[string]grpcapi.StoragePoolRef {
 		}
 	}
 	return refs
-}
-
-// reconcileNetworks re-provisions DHCP and NAT for active networks on daemon
-// startup. dnsmasq is a child process that dies when the daemon restarts, so
-// we need to bring it back for any network with a subnet.
-func (d *Daemon) reconcileNetworks(ctx context.Context) {
-	nets, err := corrosion.ListNetworks(ctx, d.db)
-	if err != nil {
-		slog.Warn("reconcileNetworks: list networks", "error", err)
-		return
-	}
-	localIP := network.LocalIP()
-	for _, n := range nets {
-		if n.Config == "" {
-			continue
-		}
-		var def compose.NetworkDef
-		if err := json.Unmarshal([]byte(n.Config), &def); err != nil {
-			slog.Warn("reconcileNetworks: parse config", "network", n.Name, "error", err)
-			continue
-		}
-		def.Type = n.Type
-		if def.Interface == "" {
-			def.Interface = n.Name
-		}
-		if _, err := network.SafeProvision(ctx, d.db, n.Name, def, localIP, d.cfg.HostName); err != nil {
-			slog.Warn("reconcileNetworks: provision failed", "network", n.Name, "error", err)
-		} else {
-			slog.Info("network reconciled", "network", n.Name, "type", n.Type)
-		}
-	}
 }
 
 // ensureStoragePools creates libvirt storage pools from config, or a default

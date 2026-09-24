@@ -374,6 +374,12 @@ type Server struct {
 	// haproxy). Production leaves it nil so apply failures surface + roll back.
 	lbApplyOverride func(context.Context, lb.Config) error
 
+	// netProvisioner is the host network provisioner seam (see
+	// NetworkProvisioner). Production leaves it nil: package network directly.
+	netProvisioner NetworkProvisioner
+	// netReconcile is what ReconcileNetworksOnce has done on this host.
+	netReconcile netReconcileState
+
 	// bridgeEnsure is a test seam for host bridge availability and provisioning.
 	// Production leaves it nil, preserving the net.InterfaceByName +
 	// network.EnsureBridge validation path.

@@ -84,6 +84,15 @@ func (c *Checker) openStallCondition(ctx context.Context, now, stallAt time.Time
 	}
 	if s.open != nil && s.open.Lifecycle != corrosion.ConditionResolved {
 		row = *s.open // a further stall inside the window: same episode, extended
+		// Report the episode's LONGEST pause. A long pause is commonly followed
+		// by a short one as the process catches up (8.0s then 2.2s on the lab),
+		// and the operator's question is about the first.
+		var prev stallEvidence
+		if json.Unmarshal([]byte(row.Evidence), &prev) == nil {
+			if d := time.Duration(prev.GapSeconds * float64(time.Second)); d > gap {
+				gap = d
+			}
+		}
 	}
 	row.Lifecycle = corrosion.ConditionConfirmed
 	if row.ConfirmedAt == "" {

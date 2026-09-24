@@ -119,3 +119,40 @@ func TestStallGrace_IsTheTimeAFenceVerdictTakes(t *testing.T) {
 		t.Fatalf("stallThreshold = %v, want one missed probe tick (%v)", stallThreshold, checkInterval)
 	}
 }
+
+// Resuming from a long pause is often followed by a short second stall — the
+// catch-up burst starves the heartbeat for just over one probe interval (seen
+// on the lab: 8.0s, then 2.2s). Both belong to one episode, and the evidence
+// must report the pause the operator is asking about, the longest, not the
+// last.
+func TestStall_AnEpisodeReportsItsLongestPause(t *testing.T) {
+	ctx := context.Background()
+	db := testCheckerDB(t)
+	c := NewChecker("host-a", t.TempDir(), db)
+	now := time.Now()
+	c.clock = func() time.Time { return now }
+	tick := func(d time.Duration) { now = now.Add(d); c.stallTick(ctx) }
+
+	tick(0)
+	tick(34 * time.Second)
+	tick(stallBeat)
+	tick(3 * time.Second) // a short second stall inside the window
+	row, ok := stallCondition(t, db, "host-a")
+	if !ok || row.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("no open condition: %+v", row)
+	}
+	var ev struct {
+		GapSeconds float64 `json:"gap_seconds"`
+		GraceUntil string  `json:"grace_until"`
+	}
+	if err := json.Unmarshal([]byte(row.Evidence), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if ev.GapSeconds < 33 {
+		t.Fatalf("episode evidence gap_seconds=%v, want the 34s pause, not the later 3s one", ev.GapSeconds)
+	}
+	until, _ := time.Parse(time.RFC3339, ev.GraceUntil)
+	if until.Before(now.Add(StallGrace - 2*time.Second)) {
+		t.Fatalf("grace_until=%v must extend to the later stall's window (now+%v)", ev.GraceUntil, StallGrace)
+	}
+}

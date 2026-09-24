@@ -15,7 +15,7 @@ name: test-stack
 images:
   ubuntu: { source: example.com/ubuntu.qcow2 }
 networks:
-  prod: { driver: bridge, bridge: br0 }
+  prod: { type: bridge, interface: br0 }
 workloads:
   web:
     kind: vm
@@ -53,7 +53,7 @@ name: test-stack
 images:
   ubuntu: { source: example.com/ubuntu.qcow2 }
 networks:
-  prod: { driver: bridge, bridge: br0 }
+  prod: { type: bridge, interface: br0 }
 workloads:
   vm-no-kind:
     image: ubuntu
@@ -81,7 +81,7 @@ name: test-stack
 images:
   alpine: { source: docker.io/library/alpine:3.19 }
 networks:
-  prod: { driver: bridge, bridge: br0 }
+  prod: { type: bridge, interface: br0 }
 workloads:
   ct1:
     kind: lxc
@@ -109,7 +109,7 @@ name: test-stack
 images:
   ubuntu: { source: example.com/ubuntu.qcow2 }
 networks:
-  prod: { driver: bridge, bridge: br0 }
+  prod: { type: bridge, interface: br0 }
 vms:
   shared:
     image: ubuntu
@@ -162,7 +162,7 @@ name: test-stack
 images:
   alpine: { source: foo }
 networks:
-  prod: { driver: bridge, bridge: br0 }
+  prod: { type: bridge, interface: br0 }
 workloads:
   weird:
     kind: kubernetes

@@ -118,12 +118,13 @@ vms:
   db-1:
     image: ubuntu-24.04
     disks:
-      data: { size: 500G, storage: rbd-fast, format: raw }
+      data: { size: 500G, storage: rbd-fast }
 ```
 
-`format: raw` is required for Ceph RBD — qcow2 over rbd costs you the
-zero-copy and snapshot guarantees. The package automatically maps the
-RBD image to a `rbd:pool/image` spec libvirt understands.
+An RBD disk is always raw, and there is no format to set: litevirt creates
+the image with `rbd create` (or clones a protected snapshot) and attaches it
+to the guest as a raw network disk, so qcow2 never sits over rbd. The
+package maps the RBD image to a `rbd:pool/image` spec libvirt understands.
 
 ## What's still in flight
 

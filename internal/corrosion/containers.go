@@ -54,6 +54,9 @@ const (
 	// proof of power-off," accepting the split-brain risk. Absent/anything-else =
 	// the safe default (require an operator fence-confirm).
 	LabelUnsafeAutoFailover = "litevirt.unsafe_auto_failover"
+	// LabelFenceRequiresConfirmation, when "true" on a host, makes an
+	// UNVERIFIED fence of that host insufficient to reschedule its workloads.
+	LabelFenceRequiresConfirmation = "litevirt.fence_requires_confirmation"
 	// LabelIP records a container's primary IPv4 so it can serve as a load
 	// balancer backend cluster-wide (containers have no vm_interfaces table).
 	// Set from a static compose NIC address at create; the LB host re-discovers

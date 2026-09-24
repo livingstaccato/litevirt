@@ -163,6 +163,8 @@ func printRecentFences(events []*pb.FenceEvent) {
 		fmt.Println("fence rescheduled on it. Shared-disk VMs are not affected — their transfer")
 		fmt.Println("needs an IPMI or operator-confirmed fence regardless — but a local-disk VM can")
 		fmt.Println("have been started elsewhere while the original was still running.")
+		fmt.Println("To stop rescheduling on an unverified fence of a host:")
+		fmt.Println("  lv host label set <host> " + corrosion.LabelFenceRequiresConfirmation + "=true")
 	}
 }
 

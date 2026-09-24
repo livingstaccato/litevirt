@@ -15,14 +15,15 @@ import (
 
 // mockOps records calls for assertion and can inject per-VM failures.
 type mockOps struct {
-	mu        sync.Mutex
-	recreated []string
-	stopped   []string
-	started   []string
-	created   []string // -next VMs via CreateNextVM
-	deleted   []string
-	resized   []string
-	metadata  map[string][]string
+	mu           sync.Mutex
+	recreated    []string
+	stopped      []string
+	started      []string
+	created      []string // -next VMs via CreateNextVM
+	deleted      []string
+	resized      []string
+	reconfigured []string
+	metadata     map[string][]string
 
 	failRecreateOn   string
 	failResizeOn     string
@@ -42,6 +43,12 @@ func (m *mockOps) RecreateVM(_ context.Context, name string, _ *pb.VMSpec) error
 	}
 	m.mu.Lock()
 	m.recreated = append(m.recreated, name)
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockOps) ReconfigureVM(_ context.Context, name string, _ *pb.VMSpec, _ compose.ChangePlan) error {
+	m.mu.Lock()
+	m.reconfigured = append(m.reconfigured, name)
 	m.mu.Unlock()
 	return nil
 }

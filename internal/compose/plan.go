@@ -26,6 +26,10 @@ type Op struct {
 	Detail    string
 	Warning   string    // non-fatal advisory (e.g. local disk + failover)
 	DependsOn DependsOn // boot-order dependencies (from compose)
+	// Retry marks an update planned because the workload is in a transient or
+	// error state (a previous deploy did not finish), not because its spec
+	// changed.
+	Retry bool
 	// Base is the compose name of the workload (db for replica db-2), which
 	// is what a depends-on entry names. Empty for a delete, whose definition
 	// may be gone from the file.
@@ -171,6 +175,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 					Detail:    fmt.Sprintf("retry %s (was state=%s)", instanceName, cur.State),
 					DependsOn: vmDef.DependsOn,
 					Base:      baseName,
+					Retry:     true,
 				})
 			} else if changed {
 				// An update carries its depends-on like a create: it is held

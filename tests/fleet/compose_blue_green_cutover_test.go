@@ -39,8 +39,13 @@ func TestFleet_ComposeBlueGreenFailedBlueDeleteLeavesStackDegraded(t *testing.T)
 		t.Fatalf("setup deploy: %v (%v)", err, msgs)
 	}
 
+	// An image change: a new VM is needed, so blue-green replaces it (a
+	// change that can keep the VM would be applied to it instead).
+	seedImage(t, ctx, node, "test2")
+	next := strings.Replace(composeBlueGreen, "    image: test\n", "    image: test2\n", 1)
+	next = strings.Replace(next, "images:\n  test:\n", "images:\n  test2:\n    source: file:///dev/null\n  test:\n", 1)
 	barVMDelete(t, ctx, node.DB, "hb-1")
-	msgs, err := deployRolling(t, ctx, client, rollingUpdateOf(composeBlueGreen), 20*time.Second)
+	msgs, err := deployRolling(t, ctx, client, next, 20*time.Second)
 	if err != nil {
 		// The green side is serving: this is not a failed cutover.
 		t.Fatalf("blue-green update ended the stream with an error: %v (%v)", err, msgs)
@@ -78,5 +83,18 @@ func TestFleet_ComposeBlueGreenFailedBlueDeleteLeavesStackDegraded(t *testing.T)
 		t.Errorf("stack.deploy audit result = %q (%s), want error", res, detail)
 	} else if !strings.Contains(detail, "hb-1") {
 		t.Errorf("stack.deploy audit detail %q does not name the VM whose blue was not removed", detail)
+	}
+}
+
+// seedImage registers and stages a second image on node.
+func seedImage(t *testing.T, ctx context.Context, node *Node, name string) {
+	t.Helper()
+	if err := node.DB.Execute(ctx,
+		`INSERT INTO images (name, format, source_url, checksum, size_bytes, created_at, updated_at)
+		 VALUES (?, 'qcow2', 'file:///dev/null', 'deadbeef', 1024, datetime('now'), datetime('now'))`, name); err != nil {
+		t.Fatalf("seed image %s: %v", name, err)
+	}
+	if err := writeEmptyImageFile(node.Server.ImagePathForTests(name)); err != nil {
+		t.Fatalf("stage image file %s: %v", name, err)
 	}
 }

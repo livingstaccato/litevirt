@@ -60,6 +60,18 @@ type VMAction struct {
 	// recreate buckets so the rolling engine can apply it without deleting a VM that
 	// only needs a live resize. Empty (Max()==NoChange) for non-update / container ops.
 	Plan compose.ChangePlan
+	// Apply is how an OpUpdate is carried out — the least destructive
+	// mechanism the change allows:
+	//   - ActionLive (or NoChange): in place on the running VM, no restart;
+	//   - ActionRestart: the same VM is reconfigured and restarted (same
+	//     disks, MAC, incarnation);
+	//   - ActionRecreate: the workload is deleted and created again, which
+	//     replaces its disks.
+	// Unset for non-update ops.
+	Apply compose.Action
+	// RecreateReason says why an ActionRecreate update cannot keep the
+	// workload.
+	RecreateReason string
 }
 
 // DeviceAssignment is a pre-resolved PCI device allocation.
@@ -101,6 +113,45 @@ type DNSAction struct {
 	FQDN     string
 	IP       string // empty if deferred
 	Deferred bool   // true = IP not known until VM boots (DHCP)
+}
+
+// updateMechanism picks how an update is applied (see VMAction.Apply) and,
+// for a recreate, why the workload cannot be kept.
+func updateMechanism(op compose.Op, a VMAction, haveStoredSpec bool) (compose.Action, string) {
+	switch {
+	case a.IsContainer:
+		return compose.ActionRecreate, "containers have no in-place reconfigure"
+	case op.Retry:
+		return compose.ActionRecreate, "a previous deploy did not finish (" + strings.TrimPrefix(op.Detail, "retry ") + ")"
+	case !haveStoredSpec:
+		return compose.ActionRecreate, "the VM's stored spec could not be read"
+	}
+	switch a.Plan.Max() {
+	case compose.ActionRecreate:
+		return compose.ActionRecreate, strings.Join(a.Plan.RecreateReasons, "; ")
+	case compose.ActionRestart:
+		if len(a.Plan.NotReconfigurable) > 0 {
+			return compose.ActionRecreate, strings.Join(a.Plan.NotReconfigurable, "; ") + " — not reconfigurable in place yet"
+		}
+		return compose.ActionRestart, ""
+	default:
+		return compose.ActionLive, ""
+	}
+}
+
+// UpdateMechanismText is the plan's description of how an update is applied.
+func UpdateMechanismText(a VMAction) string {
+	switch a.Apply {
+	case compose.ActionRecreate:
+		if a.IsContainer {
+			return "recreate — the container is replaced (" + a.RecreateReason + ")"
+		}
+		return "recreate — disks are replaced (" + a.RecreateReason + ")"
+	case compose.ActionRestart:
+		return "restart — the same VM is reconfigured and restarted, disks kept"
+	default:
+		return "applied in place, no restart"
+	}
 }
 
 // ComposeName is the name a depends-on entry refers to the action's workload
@@ -243,12 +294,16 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			IsContainer: isContainerWorkload(f, op.VMName, ctHost),
 		}
 
-		// Classify a VM update (desired vs stored) so the rolling engine can route it
-		// live/restart/recreate. Containers are recreated by their own path.
-		if op.Kind == OpUpdate && !action.IsContainer {
-			if stored := storedSpecByVM[op.VMName]; stored != nil {
-				action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
+		// Classify a VM update (desired vs stored) and pick the least destructive
+		// way to apply it. Containers are recreated by their own path.
+		if op.Kind == OpUpdate {
+			if !action.IsContainer {
+				if stored := storedSpecByVM[op.VMName]; stored != nil {
+					action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
+				}
 			}
+			action.Apply, action.RecreateReason = updateMechanism(op, action, storedSpecByVM[op.VMName] != nil)
+			action.Detail += " — " + UpdateMechanismText(action)
 		}
 
 		if op.Kind == OpCreate || op.Kind == OpUpdate {

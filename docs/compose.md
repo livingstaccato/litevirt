@@ -176,8 +176,9 @@ hardware), or `custom`, which requires `cpu-model`.
 Left unset, `cpu-mode` takes the cluster-wide `vm.default_cpu_mode`. It is not left
 empty: an empty mode emits no `<cpu>` element and drops the guest onto QEMU's
 `qemu64`, which has no AVX at all. Changing either field is restart-class — the CPU
-bakes into the domain XML — so an update under `strategy: in-place` (set in the
-VM's `update:` block) refuses it: in-place never restarts a VM.
+bakes into the domain XML — so a deploy reconfigures and restarts the same VM
+(disks kept), and an update under `strategy: in-place` (set in the VM's `update:`
+block) refuses it: in-place never restarts a VM.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 
@@ -207,7 +208,8 @@ workloads:
 `kind: lxc` and `kind: oci` route to the container runtime (see
 [`docs/containers.md`](containers.md)) and are full compose citizens: `lv compose
 up` creates **and starts** them, re-apply is idempotent (unchanged containers are
-left alone), a changed spec recreates the container, and `lv compose down`
+left alone), a changed spec recreates the container (the plan says `recreate —
+the container is replaced`: containers have no in-place reconfigure), and `lv compose down`
 removes them. Placement is **LXC-aware** — containers are only scheduled onto
 hosts that advertise the container runtime, so they never land on a node that
 can't run them. Image forms: `kind: lxc` takes a download template (`image:
@@ -704,7 +706,15 @@ any other stop is treated as unexpected and restarted per policy. A frozen
 
 ## Update strategy
 
-Control how VMs are updated when a compose file changes. The strategy determines how instances are replaced during `compose up`:
+Control how VMs are updated when a compose file changes.
+
+**Every update is applied with the least destructive mechanism the change allows, whatever the strategy** — the plan names the mechanism on each `~ update` line:
+
+- **in place** (`applied in place, no restart`) — the running VM is changed with no restart: a cpu grow within the `max-cpu` hotplug ceiling, a memory change within the `[min-memory, max-memory]` balloon band (the new size is also the VM's next-boot size), and spec settings read when they are used: restart policy, onboot, ordering, labels, placement, migrate, `healthcheck`, `hooks`, `stop-grace-period`;
+- **restart** (`restart — the same VM is reconfigured and restarted, disks kept`) — a change that bakes into the domain (a cpu shrink or grow beyond the ceiling, an out-of-band memory size, `max-cpu`, memory bounds, `cpu-mode`/`cpu-model`, `machine`, `firmware`, `guest-agent`, VNC graphics, `secure-boot`, `tpm`) reconfigures and restarts the **same** VM: same disks, same MACs, same identity. A stopped VM is reconfigured and left stopped. Toggling `secure-boot` or `tpm` on a VM that already has firmware state is refused, as `lv update` refuses it without `--force`;
+- **recreate** (`recreate — disks are replaced (<why>)`) — only a change of VM identity (`image`, `iso`, disk or network topology, `cloud-init`) deletes the VM and creates it again, **which replaces its disks**. So does a change that needs only a redefine but that no reconfigure path can apply to an existing VM yet (SPICE graphics, resource tuning, passthrough devices), a VM left half-made by a deploy that did not finish, and a VM whose stored spec cannot be read. Disks are not carried over to the new VM. The plan says so on the VM's line, and `compose up` asks for confirmation before applying it (as it does for every plan, unless `-y`).
+
+The strategy decides how a change that needs a **new** VM is rolled out — `recreate` means "replace such a VM by deleting and creating it", not "recreate on any change":
 
 ```yaml
     update:
@@ -719,16 +729,18 @@ Control how VMs are updated when a compose file changes. The strategy determines
 
 Strategies:
 
-- `recreate` — (default) Delete then create each VM sequentially. Simple but has downtime. Deleting a VM destroys its disks.
-- `rolling` / `stop-first` — Update VMs one at a time: stop old, create new, wait for health check, continue.
+- `recreate` — (default) Delete then create each VM that needs replacing, one after another. Simple but has downtime, and the replaced VM's disks are destroyed.
+- `rolling` / `stop-first` — Replace VMs one at a time: stop old, create new, wait for health check, continue.
 - `start-first` — Create new VM first, wait for health check, then stop old. Minimizes downtime.
-- `all-at-once` — Recreate all VMs simultaneously. Fast but risky.
+- `all-at-once` — Replace all VMs that need it simultaneously. Fast but risky.
 - `blue-green` — Create a parallel set of new VMs ("-green" suffix), then cut over by deleting the old (blue) VMs. A green that cannot be created aborts the deploy and removes the greens already made. A blue that cannot be deleted once its green is up is not a failed cutover — the green is serving — but it is reported as a failed action for that VM (the old VM is still there), and the stack ends `degraded`.
-- `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
+- `in-place` — **Live-or-fail: it applies in-place changes only and NEVER restarts or deletes a VM.** Any change that would need a restart or a recreate (see the lists above) is **refused with a clear error — nothing is deleted or partially applied.** Use another strategy (or stop the VM and `lv update`) for those.
+
+Under any strategy but `in-place`, in-place and restart changes are applied to each VM before the strategy replaces the VMs that need it; a restarted VM is waited on for `health-wait` like a replaced one.
 
 The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-replace` is the `vm_healthy` condition of `depends-on` (see above), bounded by `health-wait` (default `30s`). For a VM with a `healthcheck` that means the recreated VM's own probe must pass within `health-wait` — the previous VM's pass does not carry over — so leave room for at least one probe `interval` plus boot time. A VM without a `healthcheck` passes as soon as it is running. A VM that is not healthy by then fails with `<vm> did not become healthy within health-wait <d>: ...` followed by the last verdict and the probe's failure reason; under `rolling`, `stop-first` and `start-first` that aborts the deploy at that VM: the stream ends in error, later VMs are not touched, and the stack record keeps the last successful deploy (see the fail-fast note below).
 
-`in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
+`in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. Under the other strategies a VM's disks are replaced only for a change the plan names as `recreate — disks are replaced`.
 
 During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last. With `depends-on` between them, the creates and updates run in dependency waves — each wave's creates, then its updates — so a dependent's create or update starts only after its dependency's has finished and met its condition. A rolling update fails fast: if any VM update errors, the deploy stops **before** any later dependency wave and the scale-down step and the stack's stored desired state is left unchanged, so a failed update never deletes a VM the change didn't intend to and never records a half-applied stack.
 

@@ -91,10 +91,16 @@ type ChangePlan struct {
 	// coarser bucket is also populated).
 	ResourceChanges []Delta
 	// MetadataChanges are live-eligible spec patches (restart policy, onboot,
-	// ordering, labels, placement, migrate) — persisted, no runtime action.
+	// ordering, labels, placement, migrate, healthcheck, hooks, stop timeout)
+	// — persisted, no runtime action.
 	MetadataChanges []Delta
 	// RestartReasons are changes that need a stop→redefine→start.
 	RestartReasons []string
+	// NotReconfigurable are the RestartReasons no reconfigure path can apply
+	// to an existing VM yet (SPICE graphics, resource tuning, passthrough
+	// devices): the change itself only needs a redefine, but the only way the
+	// deploy can make it is to recreate the VM. Each is also in RestartReasons.
+	NotReconfigurable []string
 	// RecreateReasons are changes that alter VM identity (delete+create only).
 	RecreateReasons []string
 	// NICRetargets are NICs whose stored network is the stack-scoped
@@ -226,14 +232,21 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	// path stores (e.g. guest-agent via EffectiveGuestAgent), so an equality compare is
 	// safe and won't false-positive on a server default.
 	restartIf(desired.GuestAgent != stored.GuestAgent, "guest-agent toggle needs a redefine")
-	restartIf(desired.DisableVnc != stored.DisableVnc || desired.EnableSpice != stored.EnableSpice, "graphics change needs a redefine")
+	restartIf(desired.DisableVnc != stored.DisableVnc, "graphics (vnc) change needs a redefine")
 	restartIf(desired.SecureBoot != stored.SecureBoot, "secure-boot change needs a redefine")
 	restartIf(desired.Tpm != stored.Tpm, "tpm change needs a redefine")
-	restartIf(desired.StopTimeoutSec != 0 && desired.StopTimeoutSec != stored.StopTimeoutSec, "stop-grace-period change needs a redefine")
-	restartIf(desired.Resources != nil && !proto.Equal(desired.Resources, stored.Resources), "resource-tuning change needs a redefine")
-	restartIf(desired.Healthcheck != nil && !proto.Equal(desired.Healthcheck, stored.Healthcheck), "health-check change needs a redefine")
-	restartIf(desired.Hooks != nil && !proto.Equal(desired.Hooks, stored.Hooks), "lifecycle-hooks change needs a redefine")
-	restartIf(len(desired.Devices) > 0 && !devicesEqual(desired.Devices, stored.Devices), "passthrough-device change needs a redefine")
+	// Redefine-only fields that no reconfigure path can apply to an existing
+	// VM yet: recorded as restart-class (what the change needs) and as
+	// NotReconfigurable (what the deploy has to do instead).
+	notReconfigurableIf := func(cond bool, reason string) {
+		if cond {
+			p.RestartReasons = append(p.RestartReasons, reason)
+			p.NotReconfigurable = append(p.NotReconfigurable, reason)
+		}
+	}
+	notReconfigurableIf(desired.EnableSpice != stored.EnableSpice, "graphics (spice) change needs a redefine")
+	notReconfigurableIf(desired.Resources != nil && !proto.Equal(desired.Resources, stored.Resources), "resource-tuning change needs a redefine")
+	notReconfigurableIf(len(desired.Devices) > 0 && !devicesEqual(desired.Devices, stored.Devices), "passthrough-device change needs a redefine")
 
 	// --- Recreate-class: identity fields (delete+create only); unset desired inherits ---
 	recreateIf := func(cond bool, reason string) {
@@ -269,6 +282,13 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	metaIf(len(desired.Labels) > 0 && !maps.Equal(desired.Labels, stored.Labels), "labels", "", "")
 	metaIf(desired.Placement != nil && !placementEqual(desired.Placement, stored.Placement), "placement", "", "")
 	metaIf(desired.Migrate != nil && !proto.Equal(desired.Migrate, stored.Migrate), "migrate", "", "")
+	// Read from the stored spec when they are used — by the owner's health
+	// checker, at each start/stop/migrate, at each stop — never baked into the
+	// domain, so a spec patch is the whole change.
+	metaIf(desired.Healthcheck != nil && !proto.Equal(desired.Healthcheck, stored.Healthcheck), "healthcheck", "", "")
+	metaIf(desired.Hooks != nil && !proto.Equal(desired.Hooks, stored.Hooks), "hooks", "", "")
+	metaIf(desired.StopTimeoutSec != 0 && desired.StopTimeoutSec != stored.StopTimeoutSec, "stop_timeout",
+		fmt.Sprintf("%ds", stored.StopTimeoutSec), fmt.Sprintf("%ds", desired.StopTimeoutSec))
 
 	// --- Delegated: owned by another path, recorded not ignored ---
 	if desired.Loadbalancer != nil && !proto.Equal(desired.Loadbalancer, stored.Loadbalancer) {

@@ -139,11 +139,9 @@ func TestFenceRequiresConfirmation_CoversBestEffort(t *testing.T) {
 	}
 }
 
-// The gate itself honours an operator confirmation. Tested at recoverFenced,
-// not through run(): a fence cycle that has already refused a host does not
-// revisit it, so today a confirmation written AFTER the refusal never reaches
-// this gate — the #252 strand, shared with manual and safe-fence hosts. This
-// pins what the gate does once something does bring the host back to it.
+// The gate itself honours an operator confirmation present when it runs. (A
+// confirmation written AFTER a refusal takes a different route — the fence
+// loop's resumeFromConfirmation — covered in confirmation_resume_test.go.)
 func TestFenceRequiresConfirmation_TheGateAcceptsAnOperatorConfirmation(t *testing.T) {
 	db, ctx := seedDownHost(t, "ssh", requireConfirmation)
 	if err := corrosion.InsertFenceLog(ctx, db, corrosion.FenceLogRecord{

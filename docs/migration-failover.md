@@ -237,15 +237,48 @@ coordinator creating the recovery — so no peer needs to honour it, and a
 coordinator on an older binary ignores it and behaves exactly as before. Roll
 the binary out before relying on it.
 
-**Know what it costs today.** An operator confirmation is meant to be the way
-past the refusal, and the gate does accept one. But a coordinator that has
-refused a host does not revisit it in that outage, so a `lv host fence-confirm`
-written *after* the refusal does not move the workloads — not in the same
-process and not after a restart. This is the same strand that affects `manual`
-hosts and best-effort hosts under the safe-fence policy (#252). Until that is
-fixed, this label means "never reschedule this host automatically on an
-unverified fence": confirm the host is off and move its workloads by hand.
-`litevirt_failover_stranded_workloads` counts what is waiting.
+**Getting past the refusal.** Confirm the host is powered off, then run
+`lv host fence-confirm <host>`. The coordinator resumes the recovery on its next
+cycle — see [Resuming a recovery from a confirmation](#resuming-a-recovery-from-a-confirmation).
+
+### Resuming a recovery from a confirmation
+
+A recovery refused for want of a confirmation — a `manual` fence, a
+`best-effort` fence under the safe-fence policy, or a host labelled
+`litevirt.fence_requires_confirmation` — resumes once an operator runs
+`lv host fence-confirm <host>`. Before this, it never did: the refusal marked the
+host handled for the outage, nothing looked at it again, and the confirmation
+landed on a host no code path would revisit, in the same process or after a
+restart.
+
+The resume requires three things, not the confirmation alone:
+
+1. **The cluster itself fenced the host** — a `fencing_log` row with result
+   `fenced` or `partial`, which only a fence that ran writes.
+2. **The confirmation is newer than that fence**, so it attests to this outage
+   and not an earlier one.
+3. **The host is still down now** — a fresh quorum observes it failing. A host
+   that has come back, or that an operator has put into `maintenance`, is never
+   resumed.
+
+`fence-confirm` has no precondition and runs no fence, so on its own a mistyped
+hostname could otherwise authorise a recovery. With all three required, a
+mistype can only reach a host the cluster already fenced and still sees down.
+
+**Confirm after the fence, not before.** A confirmation written before the
+coordinator has fenced the host is not newer than any fence, so it resumes
+nothing — and while it is under 5 minutes old it also makes the coordinator
+treat the host as already fenced. Wait for the refusal in the coordinator log,
+then confirm.
+
+The resume takes the decision gate like every other ownership decision: a
+coordinator without quorum refuses, and does not spend the confirmation, so the
+resume happens once quorum returns. One confirmation resumes one recovery. It is
+counted as `phase=recovery, error_class=confirmation_resumed`. A shared-disk VM
+still needs a proof-grade fence reference, which a confirmation under 5 minutes
+old provides; a resume long after the confirmation (a daemon restart hours
+later) moves local-disk VMs and refuses shared-disk ones, which is the safe
+direction.
 
 **Per-host implication:** a host whose fence strategy is `best-effort`/`ssh`/`manual`
 (anything but `ipmi`) gives its shared-disk VMs *manual-confirm-only* automated
@@ -398,7 +431,7 @@ Scrape `http://<host>:7444/metrics` for:
   `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`, `recovery_resumed`). A skip is `result=skipped` with the reason in `error_class`
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions

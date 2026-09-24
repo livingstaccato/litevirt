@@ -164,6 +164,12 @@ type Coordinator struct {
 	// one that moved VMs (value=true) must wait for a manual `undrain` to avoid
 	// split-brain. Absent key ⇒ we can't prove it's safe ⇒ stays manual.
 	fenceRelocated map[string]bool
+	// confirmResumed records, per host, the operator confirmation a recovery
+	// was already resumed from in this process, so one confirmation resumes one
+	// recovery rather than one per cycle. Losing it on restart costs at most one
+	// repeat, which recoverWorkloads tolerates: it re-derives its work from the
+	// rows still pointing at the host.
+	confirmResumed map[string]string
 	// Now is the time source for lease TTL / fencing-log timestamps.
 	// Defaults to time.Now; the fleet harness overrides it with a
 	// virtual clock so scenarios can advance time deterministically
@@ -288,6 +294,7 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 		fencer:         fence.Execute,
 		fenced:         make(map[string]bool),
 		fenceRelocated: make(map[string]bool),
+		confirmResumed: make(map[string]string),
 		Now:            func() time.Time { return time.Now() },
 	}
 }
@@ -480,6 +487,10 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		target := cand.target
 		if c.fenced[target] {
+			// Handled this outage — unless an operator has since confirmed it
+			// off after a refusal. Without this check the confirmation landed
+			// on a host no code path would revisit (see confirmationResume).
+			c.resumeFromConfirmation(ctx, target)
 			continue
 		}
 
@@ -510,6 +521,12 @@ func (c *Coordinator) run(ctx context.Context) {
 					"host", target, "fence_id", rec.ID, "method", rec.Method)
 				c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
 				c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail})
+				continue
+			}
+			// The other way a stranded recovery can be resumed: a refusal for
+			// want of a confirmation, since confirmed. This is the path after a
+			// restart, when the refusing process's memory is gone.
+			if c.resumeFromConfirmation(ctx, target) {
 				continue
 			}
 			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
@@ -1140,6 +1157,112 @@ func (c *Coordinator) resumableFence(ctx context.Context, h *corrosion.HostRecor
 	return rec, true
 }
 
+// confirmationResume returns the operator confirmation that authorises
+// resuming a refused recovery of h, or ok=false.
+//
+// A recovery refused for want of an operator confirmation — a manual fence, a
+// best-effort fence under the safe-fence policy, a host carrying
+// LabelFenceRequiresConfirmation — was never revisited. recoverFenced marks the
+// host handled for the outage before its gates run, so a `lv host fence-confirm`
+// written afterwards landed on a host nothing would look at again, in the same
+// process or after a restart. The documented manual flow did not work.
+//
+// Authority to resume is three independent facts, not the confirmation alone:
+//
+//   - the cluster ITSELF attempted a fence of h (a fencing_log row with result
+//     "fenced" or "partial" — written only by a fence that ran);
+//   - an operator confirmation ("manual-confirmed") at or after the NEWEST such
+//     attempt, so it attests to this outage and not an earlier one;
+//   - h is still quorum-down, which the caller supplies by construction: this
+//     runs only for fence candidates, i.e. hosts a fresh quorum observes failing.
+//
+// That answers the objection that withdrew the earlier stranded-workload sweep
+// (397c39f4): fence-confirm has no precondition and runs no fence, so on its
+// own a mistyped hostname would forge the proof. Here a mistype can only reach a
+// host the cluster already fenced and still observes down — the same authority
+// the manual path has always accepted at fence time via manualFenceConfirmed.
+//
+// Timestamps are compared in Go on RFC3339, for fenceWithinWindow's reason.
+// ">=" rather than ">", because both rows carry second precision and a prompt
+// operator can land in the fence's own second.
+func (c *Coordinator) confirmationResume(ctx context.Context, h *corrosion.HostRecord) (fenceRecord, bool) {
+	if h == nil || (h.State != "offline" && h.State != "fenced") {
+		return fenceRecord{}, false
+	}
+	rows, err := c.db.Query(ctx,
+		`SELECT id, method, result, detail, timestamp FROM fencing_log WHERE host_name = ?`, h.Name)
+	if err != nil {
+		slog.Warn("failover: fencing_log read for confirmation resume failed", "host", h.Name, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return fenceRecord{}, false
+	}
+	var attempt, confirmedAt time.Time
+	var confirm fenceRecord
+	for _, r := range rows {
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil {
+			continue
+		}
+		switch r.String("result") {
+		case "fenced", "partial":
+			if ts.After(attempt) {
+				attempt = ts
+			}
+		case "manual-confirmed":
+			if ts.After(confirmedAt) {
+				confirmedAt = ts
+				confirm = fenceRecord{
+					ID: r.String("id"), Method: r.String("method"), Result: r.String("result"),
+					Detail: r.String("detail"), TS: r.String("timestamp"),
+				}
+			}
+		}
+	}
+	if attempt.IsZero() || confirmedAt.IsZero() || confirmedAt.Before(attempt) {
+		return fenceRecord{}, false
+	}
+	return confirm, true
+}
+
+// resumeFromConfirmation resumes the recovery of target if an operator has
+// confirmed it off since a refusal (confirmationResume), at most once per
+// confirmation per process. Reports whether it did.
+//
+// It resumes at recoverWorkloads, past recoverFenced's gates: those gates exist
+// to demand exactly the confirmation confirmationResume has just established,
+// and manualFenceConfirmed only looks back recentFenceWindow — five minutes, less
+// time than it takes to walk to a rack — so re-entering them would refuse a
+// genuine confirmation for being slow. recoverWorkloads keeps its own late
+// gates, and binds shared-disk transfers to a proof-grade fence, for which a
+// fresh confirmation qualifies.
+func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string) bool {
+	h, err := corrosion.GetHost(ctx, c.db, target)
+	if err != nil || h == nil {
+		return false
+	}
+	rec, ok := c.confirmationResume(ctx, h)
+	if !ok || c.confirmResumed[target] == rec.ID {
+		return false
+	}
+	// Decide-site gate, as at every other point that asserts runtime ownership:
+	// the lease alone can be held on both sides of a partition.
+	if c.gateEnforced(ctx) {
+		if g := c.Gate.DecisionGate(ctx); !g.OK {
+			slog.Warn("failover: decision gate refused a confirmation resume", "host", target, "reason", g.Reason)
+			c.noteGateRefused(ActionReschedule, g.Reason)
+			c.mAttempt(PhaseRecovery, ResultRefused, ErrNoQuorum)
+			return false
+		}
+	}
+	slog.Info("failover: operator confirmed a host whose recovery was refused, resuming",
+		"host", target, "confirmation", rec.ID, "confirmed_at", rec.TS)
+	c.mAttempt(PhaseRecovery, ResultOK, ErrConfirmationResumed)
+	c.fenced[target] = true
+	c.confirmResumed[target] = rec.ID
+	c.recoverWorkloads(ctx, h)
+	return true
+}
+
 // fenceRecord is one fencing_log row read back: the fence that physically
 // happened, as a coordinator that did not perform it sees it.
 type fenceRecord struct {
@@ -1466,18 +1589,14 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// an operator confirmation. A verified (IPMI) fence passes; a failed fence
 	// falls through to the split-brain guard below, which refuses it anyway.
 	//
-	// The refusal message says what actually happens today rather than what
-	// should. A cycle that refuses a host does not revisit it (c.fenced, set
-	// above), so a confirmation written AFTER this refusal does not by itself
-	// move the workloads — the #252 strand, shared with the manual and
-	// safe-fence paths. The operator is told to recover by hand.
+	// A confirmation written AFTER this refusal is picked up by the fence loop
+	// (resumeFromConfirmation), which resumes the recovery from it.
 	if requiresFenceConfirmation(h) && fr.Success && !corrosion.FenceProofGrade(fr.Method, "fenced") {
 		if !c.manualFenceConfirmed(ctx, h.Name) {
 			slog.Error("failover: host requires a verified fence and this one was not verified, NOT rescheduling",
 				"host", h.Name, "method", fr.Method, "detail", fr.Detail,
 				"label", corrosion.LabelFenceRequiresConfirmation,
-				"recover", "confirm "+h.Name+" is powered off, then move its workloads by hand — "+
-					"a later fence-confirm does not resume this recovery (litevirt_failover_stranded_workloads counts them)")
+				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
 			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
 			return
 		}

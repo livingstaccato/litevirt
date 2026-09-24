@@ -635,6 +635,7 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 	if e := s.virt.StartDomain(m.ReplacedVM); e != nil {
 		return failed("start", e)
 	}
+	s.noteVMStarted(m.ReplacedVM)
 	return nil
 }
 

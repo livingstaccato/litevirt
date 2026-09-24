@@ -626,6 +626,8 @@ type Server struct {
 	// pre-activation → unchanged. onGateRefused feeds the refusal metric (nil-safe).
 	gate          serverGate
 	onGateRefused func(action, reason string)
+	// vmStartObserver is told of every guest start (SetVMStartObserver).
+	vmStartObserver VMStartObserver
 
 	// onLeaseBarrierIncomplete feeds the incomplete-sweep metric (nil-safe). A
 	// lease-term accept reached without every peer answering is byte-identical to
@@ -1198,6 +1200,26 @@ func (s *Server) tokenEnabled(token string) bool {
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (s *Server) SetGateRefusedObserver(fn func(action, reason string)) { s.onGateRefused = fn }
+
+// VMStartObserver is told when this host has just booted a VM's guest. The
+// VM healthcheck (health.VMChecker) implements it to open its start grace: a
+// restart that keeps the VM's row "running" throughout — RestartVM, a
+// reconfigure with --restart-if-needed — is otherwise invisible to it.
+type VMStartObserver interface {
+	NoteVMStarted(name string)
+}
+
+// SetVMStartObserver wires the observer told of every guest start (nil-safe;
+// the daemon passes the VMChecker).
+func (s *Server) SetVMStartObserver(o VMStartObserver) { s.vmStartObserver = o }
+
+// noteVMStarted tells the start observer, if any, that vmName's guest has just
+// been started on this host.
+func (s *Server) noteVMStarted(vmName string) {
+	if s.vmStartObserver != nil {
+		s.vmStartObserver.NoteVMStarted(vmName)
+	}
+}
 
 // SetLeaseBarrierIncompleteObserver wires the incomplete-sweep metric hook (nil-safe).
 func (s *Server) SetLeaseBarrierIncompleteObserver(fn func(key string, answered, peers int)) {

@@ -18,7 +18,8 @@ import (
 //
 //   - the VM was created less than the grace ago (created_at);
 //   - this checker started the VM itself — a healthcheck restart or a
-//     restart-policy start (noteStarted);
+//     restart-policy start (noteStarted) — or the daemon's own start path did
+//     (NoteVMStarted: StartVM, RestartVM, a reconfigure restart);
 //   - a sweep saw the VM running where the previous sweep saw it not running
 //     (an operator start, a redefine and start, a restart policy);
 //   - a sweep saw it running under a different owner host, owner epoch or
@@ -36,8 +37,8 @@ import (
 // first sighting there opens no grace (created_at still covers a new VM). A
 // restart through a path that leaves the row running throughout — the
 // RestartVM RPC destroys and starts the domain under a running row — is not
-// visible to the sweep and opens no grace; the healthcheck's action backoff
-// still applies to it.
+// visible to the sweep; the daemon's start path reports it instead
+// (NoteVMStarted, wired as grpcapi's VMStartObserver).
 
 // vmSighting is what the sweep last saw of one owned VM.
 type vmSighting struct {
@@ -99,6 +100,13 @@ func (v *VMChecker) noteStarted(name string, at time.Time) {
 		v.sightings[name] = s
 	}
 	v.startedLocked(name, s, at)
+}
+
+// NoteVMStarted records that this host has just started vm's guest by a path
+// the sweep cannot see — the daemon's RestartVM and reconfigure restarts keep
+// the row "running" throughout. It implements grpcapi.VMStartObserver.
+func (v *VMChecker) NoteVMStarted(name string) {
+	v.noteStarted(name, v.clock())
 }
 
 // startedLocked records a start. The consecutive failures counted against the

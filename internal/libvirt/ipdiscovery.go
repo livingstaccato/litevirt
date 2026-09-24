@@ -4,14 +4,19 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
+
+// arpTablePath is the kernel's ARP table; a variable so a test can point
+// GetIPFromARP at a fixture.
+var arpTablePath = "/proc/net/arp"
 
 // GetIPFromARP scans /proc/net/arp to find the IP for a given MAC address.
 // Returns empty string if not found.
 func GetIPFromARP(mac string) string {
 	mac = strings.ToLower(mac)
-	f, err := os.Open("/proc/net/arp")
+	f, err := os.Open(arpTablePath)
 	if err != nil {
 		return ""
 	}
@@ -25,11 +30,32 @@ func GetIPFromARP(mac string) string {
 		if len(fields) < 4 {
 			continue
 		}
+		// Only a COMPLETE entry says the MAC answers at that IP. An
+		// incomplete one carries a zero address, and a FAILED one keeps the
+		// hardware address it once resolved to — after a guest moves to a new
+		// lease, its old address can linger here with its MAC — so both are
+		// skipped.
+		if !arpEntryComplete(fields[2]) || fields[3] == zeroMAC {
+			continue
+		}
 		if strings.ToLower(fields[3]) == mac {
 			return fields[0]
 		}
 	}
 	return ""
+}
+
+// atfCom is ATF_COM from <net/if_arp.h>: the entry is complete. The kernel
+// sets it for every entry in a valid state (REACHABLE, STALE, DELAY, PROBE,
+// PERMANENT) and clears it for INCOMPLETE and FAILED ones.
+const atfCom = 0x2
+
+const zeroMAC = "00:00:00:00:00:00"
+
+// arpEntryComplete parses a /proc/net/arp Flags column ("0x2").
+func arpEntryComplete(flags string) bool {
+	v, err := strconv.ParseUint(strings.TrimPrefix(strings.ToLower(flags), "0x"), 16, 32)
+	return err == nil && v&atfCom != 0
 }
 
 // GetIPFromDHCPLeases scans dnsmasq lease files under leaseDir for a MAC address.

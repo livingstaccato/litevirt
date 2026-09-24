@@ -968,7 +968,13 @@ volumes:
       vers: "3"
 ```
 
-Compose volumes take priority over host-level storage pools (defined in `config.yaml`). If a disk's `storage:` name matches a compose volume, that definition is used. Otherwise, the daemon falls back to host pools, then to the default local driver. See [storage.md](storage.md) for host-level pool configuration.
+A disk with no `storage:` uses the default local driver. A disk's `storage:` name resolves to a compose volume first, then to a storage pool of the VM's host (declared in `config.yaml` or created with `lv pool create`). A name that is neither is refused, never placed on the local driver: `lv compose up` refuses it before anything is deployed when no host in the cluster has a pool by that name, with the name it most likely meant,
+
+```
+  - 7:35: vms.web.disks.data.storage: storage "wram" is neither a volume of this file nor a storage pool — did you mean "warm"?
+```
+
+and creating the VM fails with `storage "fast" is neither a volume of stack "shop" nor a storage pool on host "node-2"` when the pool exists on other hosts but not the one the VM is placed on. See [storage.md](storage.md) for host-level pool configuration.
 
 ## Stack-level settings
 

@@ -51,7 +51,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 
 	// Pre-deploy validation: verify images and networks exist before creating
 	// any VMs. Abort early with clear errors if dependencies are missing (#52).
-	if errs := s.validateDeployDependencies(ctx, f); len(errs) > 0 {
+	if errs := s.validateDeployDependencies(ctx, f, []byte(req.ComposeYaml)); len(errs) > 0 {
 		detail := ""
 		for _, e := range errs {
 			detail += "\n  - " + e
@@ -1658,7 +1658,7 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 
 // validateDeployDependencies checks that images and networks referenced in the
 // compose file actually exist in the cluster before any VMs are created (#52).
-func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File) []string {
+func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File, composeYAML []byte) []string {
 	var errs []string
 
 	// Check images exist on at least one host.
@@ -1682,7 +1682,14 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 			continue
 		}
 		seenImages[img] = true
-		if !s.images.ImageExists(img) {
+		// Any host's ready copy will do: the VM's host pulls it from a peer
+		// at create time (autoPullImage). Only this node's own store used to
+		// count, so an image imported on another host was refused as "not
+		// found on any host" when the deploy was served elsewhere.
+		switch ok, err := s.imageAvailable(ctx, img); {
+		case err != nil:
+			errs = append(errs, fmt.Sprintf("image %q: lookup failed: %v", img, err))
+		case !ok:
 			errs = append(errs, fmt.Sprintf("image %q not found on any host — pull it first with 'lv image pull'", img))
 		}
 	}
@@ -1714,6 +1721,23 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 				"network %q (used by %s) is not declared under networks: and no cluster network by that name exists — "+
 					"declare it in the file, or create it with `lv network create %s`",
 				netName, strings.Join(users, ", "), netName))
+		}
+	}
+
+	// A disk's storage: must name a volume of the file or a pool somewhere in
+	// the cluster. Anything else used to fall back to the local driver at
+	// create time, silently; the VM's host is not chosen yet, so a pool that
+	// exists only on other hosts passes here and resolveVolume refuses it on
+	// a host that lacks it.
+	var poolNames []string
+	if pools, err := corrosion.ListAllStoragePools(ctx, s.db); err != nil {
+		errs = append(errs, fmt.Sprintf("storage pools: lookup failed: %v", err))
+	} else {
+		for _, p := range pools {
+			poolNames = append(poolNames, p.Name)
+		}
+		for _, p := range compose.CheckStorage(composeYAML, f, poolNames) {
+			errs = append(errs, p.String())
 		}
 	}
 

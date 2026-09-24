@@ -3386,8 +3386,9 @@ func (s *Server) storedStackFile(ctx context.Context, stackName string) (*compos
 	return f, nil
 }
 
-// resolveVolume looks up a named volume from the stack's compose YAML, then
-// falls back to host-level storage pools, then defaults to local driver.
+// resolveVolume looks up a named volume in the stack's compose YAML, then in
+// this host's storage pools. A name found in neither is an error — never the
+// local driver (a disk with no storage name is what uses that).
 func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string) (storage.Config, error) {
 	// 1. Try compose volumes. A stored stack that cannot be read is an
 	// error: falling through would put the disk on whatever storage the
@@ -3409,20 +3410,26 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 		}
 	}
 
-	// 2. Try host-level storage pools.
-	{
-		if pool, ok := s.lookupStoragePool(volumeName); ok {
-			return storage.Config{
-				Driver:  pool.Driver,
-				Source:  pool.Source,
-				Target:  pool.Target,
-				Options: pool.Options,
-			}, nil
-		}
+	// 2. Try this host's storage pools: the cache, then the cluster table
+	// (a pool created since the cache was last refreshed, e.g. just after a
+	// restart, is only there).
+	if pool, ok := s.resolvePool(ctx, volumeName); ok {
+		return storage.Config{
+			Driver:  pool.Driver,
+			Source:  pool.Source,
+			Target:  pool.Target,
+			Options: pool.Options,
+		}, nil
 	}
 
-	// 3. Fallback to local.
-	return storage.Config{Driver: "local"}, nil
+	// 3. Nothing by that name. Falling back to the local driver would put
+	// the disk somewhere nobody asked for; a disk that wants local storage
+	// says so by naming no storage at all.
+	if stackName != "" {
+		return storage.Config{}, fmt.Errorf("storage %q is neither a volume of stack %q nor a storage pool on host %q",
+			volumeName, stackName, s.hostName)
+	}
+	return storage.Config{}, fmt.Errorf("storage %q is not a storage pool on host %q", volumeName, s.hostName)
 }
 
 // parseDiskSizeBytes converts a human-readable size string (e.g. "20G", "512M")

@@ -1611,20 +1611,14 @@ func TestResolveVolume_NoStack(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
-	cfg := mustResolveVolume(t, s, ctx, "", "vol1")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "", "vol1")
 }
 
 func TestResolveVolume_StackNotFound(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
-	cfg := mustResolveVolume(t, s, ctx, "nonexistent-stack", "vol1")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "nonexistent-stack", "vol1")
 }
 
 func TestResolveVolume_VolumeNotInCompose(t *testing.T) {
@@ -1642,10 +1636,7 @@ vms:
 		State:       "active",
 	})
 
-	cfg := mustResolveVolume(t, s, ctx, "teststack", "missing-vol")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "teststack", "missing-vol")
 }
 
 func TestResolveVolume_WithNFSVolume(t *testing.T) {

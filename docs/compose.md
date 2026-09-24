@@ -586,6 +586,8 @@ Requirements:
 
 An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); service names such as `ssh` are not accepted.
 
+**`type` can be left out when the target settles it**: an `http://` or `https://` URL is that type, and a port, `:port` or `host:port` is `tcp`. A `type` that is written always wins (`type: http` with `target: "8080"` probes HTTP). `ping` and `exec` are never inferred, and neither is anything else — an empty target, a bare path such as `/health`, a bare host — so those need a `type`, and the error says which types there are.
+
 **The VM's address** is its NIC's recorded address — the one `lv ls` shows, lowest-ordinal NIC first — and, when none is recorded yet, what the owning host sees for the NIC's MAC in its ARP cache or dnsmasq leases.
 
 **When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.

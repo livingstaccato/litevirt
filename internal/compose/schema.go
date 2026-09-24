@@ -475,7 +475,9 @@ type LBHealth struct {
 
 // HealthCheckDef defines VM-level health checking.
 type HealthCheckDef struct {
-	Type string `yaml:"type"` // tcp | http | https | ping | exec
+	// Type is tcp | http | https | ping | exec. When omitted, the parser
+	// infers it from a target that settles it (see inferHealthType).
+	Type string `yaml:"type"`
 	// Target is resolved relative to the VM, because the probe runs on the
 	// VM's owning host: a bare port, an empty host, localhost or any loopback
 	// address means the VM's own address; another host is probed as given.
@@ -487,6 +489,8 @@ type HealthCheckDef struct {
 	Timeout  string `yaml:"timeout"`
 	Retries  int    `yaml:"retries"`
 	Action   string `yaml:"action"` // restart | migrate | alert
+
+	typeInferred bool // Type was inferred from Target, not written
 }
 
 // HooksDef contains lifecycle hook scripts.

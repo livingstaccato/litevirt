@@ -70,6 +70,7 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 	v.foldWorkloads(&f)
 	v.resolveExtends(&f)
 	if v.ps.empty() {
+		inferHealthTypes(&f)
 		v.validate(&f)
 	}
 	if err := v.ps.err(); err != nil {

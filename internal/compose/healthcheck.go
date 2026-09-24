@@ -183,6 +183,42 @@ func ValidateHealthCheck(hc *HealthCheckDef) error {
 	return errors.New(strings.Join(msgs, "; "))
 }
 
+// inferHealthType is the probe type an untyped target can only mean: an
+// http:// or https:// URL is that scheme; a port, ":port" or "host:port" is
+// tcp. Anything else — an empty target, a path, a bare host (ping?), a
+// command (exec?) — is not inferred, and ok is false.
+func inferHealthType(target string) (typ string, ok bool) {
+	t := strings.TrimSpace(target)
+	lower := strings.ToLower(t)
+	switch {
+	case strings.HasPrefix(lower, "http://"):
+		return "http", true
+	case strings.HasPrefix(lower, "https://"):
+		return "https", true
+	case strings.Contains(t, "/"), strings.ContainsAny(t, " \t"):
+		return "", false
+	case isAllDigits(t):
+		return "tcp", true
+	}
+	if _, _, err := net.SplitHostPort(t); err == nil {
+		return "tcp", true
+	}
+	return "", false
+}
+
+// inferHealthTypes fills in the type of every healthcheck that has none and
+// whose target settles it.
+func inferHealthTypes(f *File) {
+	for _, vm := range f.VMs {
+		if hc := vm.HealthCheck; hc != nil && hc.Type == "" {
+			if typ, ok := inferHealthType(hc.Target); ok {
+				hc.Type = typ
+				hc.typeInferred = true
+			}
+		}
+	}
+}
+
 // fieldProblem is a problem with one field of a block, relative to it.
 type fieldProblem struct {
 	field, msg, hint string
@@ -200,7 +236,8 @@ func healthProblems(hc *HealthCheckDef) []fieldProblem {
 			out = append(out, fieldProblem{field: "target", msg: err.Error()})
 		}
 	case "":
-		out = append(out, fieldProblem{field: "type", msg: "healthcheck type is required", hint: "want tcp | http | https | ping | exec"})
+		out = append(out, fieldProblem{field: "type", msg: "healthcheck type is required",
+			hint: "want tcp | http | https | ping | exec (inferred only from a port, host:port or http(s):// URL target)"})
 	default:
 		out = append(out, fieldProblem{field: "type", msg: fmt.Sprintf("unknown healthcheck type %q", hc.Type), hint: "want tcp | http | https | ping | exec"})
 	}

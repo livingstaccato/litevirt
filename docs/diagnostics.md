@@ -973,6 +973,39 @@ conflicting holder, no in-flight migration/operation/lock/failover, and quorum
 or explicit fencing authorization. The evidence and decision must be durable
 before any stop is issued.
 
+### Deferred out-of-band stop sync after a restart or rejoin
+
+When a VM's domain is found shut off out of band (a crash, an external
+`virsh destroy`, a fence that powered the host off), the owning host's
+reconciler syncs the cluster record to `stopped`. That write is decided from
+the host's own replica and replicated to every peer, so it waits until that
+replica is known to be current: the host must have completed an anti-entropy
+exchange with at least one peer — digests compared equal, or the peer's state
+merged without error — since the daemon started and since the host last lost
+sight of every gossip peer. Until then the sync is deferred and retried every
+pass, and the journal says so once per VM:
+
+```
+reconciler: VM looks stopped out-of-band, but deferring the cluster state sync (retries each pass) vm=ha1 cause="replica not caught up" ...
+replica caught up: anti-entropy exchange with a peer completed; decisions published from the local replica may proceed peer=node-1
+```
+
+The reason is a host that comes back after a fence: its replica can still name
+it the owner of a VM that was rescheduled and is running elsewhere, and an
+unguarded sync would replicate `stopped` over the real owner's row (the VM
+lists as stopped while it runs; the owner's health sweep flips it back each
+time). This guard is on in every configuration; with `enforcement.owner_epoch`
+enabled and latched the write is additionally epoch-conditioned. Expect the
+deferral to last up to one anti-entropy interval (`anti_entropy_interval_sec`,
+60 s by default) after a restart. A single-node cluster — no other host in the
+hosts table — is not gated. The same sync is also withheld, on a current
+replica, while the VM has an active ownership condition (`vm_dual_run`,
+`runtime_owner_mismatch`, `owner_epoch_mismatch`), matching the self-heal
+restart.
+
+A host that stays `replica not caught up` is not completing anti-entropy with
+anyone: check that it sees gossip peers and can reach them over gRPC.
+
 ### Gossip isolation (`gossip_isolated`)
 
 A node that has lost every gossip peer, and whose re-join attempts reach none

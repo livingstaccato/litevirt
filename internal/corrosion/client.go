@@ -94,9 +94,13 @@ type Client struct {
 	// has not replicated yet — the bootstrap case — and it had no test at all,
 	// because a harness without a real memberlist can never reach that branch.
 	membersForTests func() []PeerInfo
-	hostName        string
-	clock           *hlc.Clock
-	version         string // local litevirtd binary version, for skew checks
+	// freshness records whether this node's replica has been reconciled
+	// against a peer since it last had reason to believe it is stale. See
+	// ReplicaCaughtUp.
+	freshness replicaFreshness
+	hostName  string
+	clock     *hlc.Clock
+	version   string // local litevirtd binary version, for skew checks
 
 	// dataDir is where the durable monotonic-clock high-water lives
 	// (<dataDir>/nowts.hwm). Empty ⇒ no persistence (in-memory monotonic only:

@@ -91,8 +91,12 @@ func (ae *AntiEntropy) RunOnce(ctx context.Context) bool {
 }
 
 func (ae *AntiEntropy) checkPeers(ctx context.Context) {
+	// Captured before ANY read, so a completed exchange marks the replica
+	// caught up only if no staleness reset happened while it ran.
+	gen := ae.client.replicaFreshnessGen()
 	peers := ae.client.Members()
 	if len(peers) == 0 {
+		ae.client.MarkReplicaStale("sees no gossip peers (anti-entropy)")
 		return
 	}
 
@@ -123,12 +127,19 @@ func (ae *AntiEntropy) checkPeers(ctx context.Context) {
 	// cannot catch that: the dial succeeded.
 	for _, peer := range peers {
 		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
-		ae.checkPeer(pctx, peer.Name, localMap, sensitiveMap)
+		if ae.checkPeer(pctx, peer.Name, localMap, sensitiveMap) {
+			ae.client.markReplicaCaughtUp(gen, peer.Name)
+		}
 		cancel()
 	}
 }
 
-func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest) {
+// checkPeer runs one peer's exchange. It returns true only when the exchange
+// COMPLETED — the peer's digests were read and either matched ours or its full
+// state was merged without error — which is what marks the local replica
+// caught up (see replicaFreshness). An isolated peer, an unreachable one, or a
+// failed dump/merge proves nothing and returns false.
+func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest) bool {
 	// The pull half of the isolation regime (§A). PushMutations refuses an
 	// isolated node's INJECTION server-side, but anti-entropy is a PULL: we
 	// would otherwise merge a quarantined node's state into ours voluntarily,
@@ -142,36 +153,40 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		slog.Warn("anti-entropy: NOT merging from an isolated peer",
 			"peer", peerName, "isolation_epoch", epoch, "reason", reason,
 			"fix", "reseed "+peerName+" to bring it back into the compatibility regime")
-		return
+		return false
 	}
 	client, conn, err := ae.peerClient(ctx, peerName)
 	if err != nil {
 		slog.Debug("anti-entropy: cannot reach peer", "peer", peerName, "error", err)
-		return
+		return false
 	}
 	defer conn.Close()
 
 	resp, err := client.GetStateDigest(ctx, &emptypb.Empty{})
 	if err != nil {
 		slog.Debug("anti-entropy: digest RPC error", "peer", peerName, "error", err)
-		return
+		return false
 	}
 
+	completed := true
 	if mismatched := digestMismatches(peerName, resp.Tables, localMap); len(mismatched) > 0 {
 		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", mismatched)
 		data, err := fetchStateDump(ctx, client)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
+			completed = false
 		} else if mergeErr := ae.client.MergeStateBytesLWW(data); mergeErr != nil {
 			// Operational/commit failure during merge: this cycle's convergence is incomplete.
 			// The merge is per-row-idempotent and non-destructive, so the next cycle retries.
 			slog.Warn("anti-entropy: merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
+			completed = false
 		} else {
 			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
 		}
 	}
 
 	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap)
+	return completed
 }
 
 // TableDigestsAgree reports whether one table's local digest and a peer's say

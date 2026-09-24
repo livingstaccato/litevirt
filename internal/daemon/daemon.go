@@ -650,6 +650,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	reconciler.SetGate(d.checker)
 	reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
+	// Unconditional: the out-of-band stop sync waits until this node's replica
+	// has caught up with a peer (anti-entropy, above) since start / last rejoin.
+	reconciler.SetReplicaFreshness(d.db.ReplicaCaughtUp)
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch

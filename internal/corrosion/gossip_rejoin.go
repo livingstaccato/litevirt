@@ -128,6 +128,10 @@ func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolation
 	if !attempted {
 		return
 	}
+	// A pass only attempts when this node sees no peer at all, so whatever it
+	// held as caught up no longer covers what the cluster may be deciding
+	// without it. Backstop for the leave event, which is the primary reset.
+	c.MarkReplicaStale("sees no gossip peers (re-join loop)")
 	if err != nil {
 		// REPORTED every attempt, not once at startup. "joined 0 of N" is
 		// the signal an operator needs, and logging it once and carrying on

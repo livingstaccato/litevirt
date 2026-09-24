@@ -125,6 +125,18 @@ type Reconciler struct {
 	// (enforcement.owner_epoch).
 	ownerEpochBackfill bool
 
+	// replicaCaughtUp reports whether this node's replica has been reconciled
+	// against a peer since it last had reason to believe it is stale (process
+	// start, or losing every gossip peer). The daemon wires the corrosion
+	// client's ReplicaCaughtUp. nil = unwired (tests that do not exercise it):
+	// the replica is treated as trusted. See SetReplicaFreshness.
+	replicaCaughtUp func() (bool, string)
+	// staleDeferMu guards staleDeferLogged: VM name → the cause its out-of-band
+	// stop sync is currently deferred on, already logged, so a deferral that
+	// lasts several ticks logs once, not every 15s. See stopSyncAllowed.
+	staleDeferMu     sync.Mutex
+	staleDeferLogged map[string]string
+
 	// gate is the split-brain safety gate (Phase 1). When a pending VM carries a
 	// proof marker (vms.pending_action_id), the reconciler enforces ExecutionGate
 	// and validates/claims the linked runtime_action_proofs row before starting.
@@ -223,6 +235,10 @@ func (r *Reconciler) SetLeaseTermGate(fn LeaseTermGate) { r.leaseTermGate = fn }
 // SetOwnerEpochBackfill enables the Phase 4 backfill pass in each sweep
 // (enforcement.owner_epoch; the daemon wires it).
 func (r *Reconciler) SetOwnerEpochBackfill(on bool) { r.ownerEpochBackfill = on }
+
+// SetReplicaFreshness wires the replica-freshness signal the out-of-band stop
+// sync is gated on (the daemon passes corrosion.Client.ReplicaCaughtUp).
+func (r *Reconciler) SetReplicaFreshness(fn func() (bool, string)) { r.replicaCaughtUp = fn }
 
 // SetSharedStorageFenceEnforce sets the config kill-switch for the shared-disk
 // ownership-transfer fence gate (enforcement.shared_storage_fence).
@@ -594,6 +610,16 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			newState, detail, sync := classifyStop(st.State, st.Reason)
 			if !sync {
 				break // paused / migrated / not genuinely down — leave alone
+			}
+			// This write PUBLISHES a belief read from this node's replica, and
+			// a replica that has not caught up since the node came back is
+			// exactly the one that can be wrong: on 2026-09-24 a fenced host
+			// that booted back still read "ha1 is mine, running" for ~75s and
+			// wrote stopped over the VM's real owner four times. The owner-
+			// epoch write below only guards that with enforcement on, so this
+			// gate is unconditional; it fails closed and retries next tick.
+			if !r.stopSyncAllowed(ctx, vm.Name) {
+				break
 			}
 			slog.Warn("reconciler: VM stopped out-of-band — syncing cluster state",
 				"vm", vm.Name, "reason", st.Reason, "to", newState)

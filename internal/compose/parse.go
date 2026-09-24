@@ -44,12 +44,12 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse compose YAML: %w", err)
 	}
-	v := &validator{ps: problems{idx: indexNodes(&doc)}, origin: map[string]string{}, stored: opts.stored}
+	v := &validator{ps: problems{idx: indexNodes(&doc)}, origin: map[string]string{}}
 
 	var f File
 	if root := documentRoot(&doc); root != nil {
 		if !opts.stored {
-			v.checkHealthcheckFields(root)
+			v.checkFileFields(root)
 		}
 		if err := root.Decode(&f); err != nil {
 			// A field that did not decode leaves the file half-read;
@@ -71,7 +71,13 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 	// report what they would have inherited as missing.
 	if v.resolveExtends(&f) {
 		inferHealthTypes(&f)
-		v.validate(&f)
+		if opts.stored {
+			// Reading, not judging: a check added after the stack was
+			// deployed must not make it unreadable.
+			enableImpliedLoadBalancers(&f)
+		} else {
+			v.validate(&f)
+		}
 	}
 	if err := v.ps.err(); err != nil {
 		return nil, err
@@ -85,9 +91,6 @@ type validator struct {
 	// origin is the map each workload was written under: "vms" or
 	// "workloads" (which the parser folds into VMs).
 	origin map[string]string
-	// stored: re-reading YAML accepted earlier (ParseStored); checks that
-	// only guard against a person's mistakes are skipped.
-	stored bool
 }
 
 // vm is the path of the workload called name.
@@ -461,12 +464,7 @@ func (v *validator) validate(f *File) {
 		// the plan (see Plan).
 
 		// LB: implicitly enable if VIP is set.
-		// NOTE: VMDef is a value type in this map, so we must copy, mutate,
-		// and write back. Apply the same pattern for any other mutations.
-		if vm.LoadBalancer != nil && !vm.LoadBalancer.Enabled && vm.LoadBalancer.VIP != "" {
-			vm.LoadBalancer.Enabled = true
-			f.VMs[name] = vm
-		}
+		enableImpliedLoadBalancers(f)
 		// LB validation
 		if vm.LoadBalancer != nil && vm.LoadBalancer.Enabled {
 			lb := p + ".loadbalancer"
@@ -491,12 +489,9 @@ func (v *validator) validate(f *File) {
 
 		// Healthcheck: a target the checker cannot interpret can never pass,
 		// and with the default restart action it would restart the VM forever.
-		hps := healthProblems(vm.HealthCheck)
-		if !v.stored {
-			hps = append(hps, healthTimingProblems(vm.HealthCheck, func(field string) bool {
-				return v.ps.idx.has(p + ".healthcheck." + field)
-			})...)
-		}
+		hps := append(healthProblems(vm.HealthCheck), healthTimingProblems(vm.HealthCheck, func(field string) bool {
+			return v.ps.idx.has(p + ".healthcheck." + field)
+		})...)
 		for _, hp := range hps {
 			v.ps.add(joinPath(p+".healthcheck", hp.field), hp.msg, hp.hint)
 		}
@@ -677,6 +672,16 @@ func (v *validator) validateDependsOn(f *File) {
 		sort.Strings(cyc)
 		v.ps.add(v.vm(cyc[0])+".depends-on",
 			fmt.Sprintf("depends-on cycle detected (involves %s)", strings.Join(cyc, ", ")), "")
+	}
+}
+
+// enableImpliedLoadBalancers enables every load balancer that sets a VIP
+// without saying enabled: a VIP means one.
+func enableImpliedLoadBalancers(f *File) {
+	for _, vm := range f.VMs {
+		if lb := vm.LoadBalancer; lb != nil && !lb.Enabled && lb.VIP != "" {
+			lb.Enabled = true
+		}
 	}
 }
 

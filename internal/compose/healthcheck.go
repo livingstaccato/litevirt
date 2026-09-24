@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/healthdefaults"
 )
 
 // Healthcheck targets are resolved relative to the VM.
@@ -232,14 +234,14 @@ func inferHealthTypes(f *File) {
 	}
 }
 
-// The healthcheck defaults, as the VM health checker applies them. interval's
-// default is also its floor: the checker sweeps every 10 seconds, so a
-// shorter interval probes at each sweep.
+// The healthcheck defaults, as the VM health checker applies them (one
+// source: internal/healthdefaults). interval's default is also its floor: the
+// checker sweeps that often, so a shorter interval probes at each sweep.
 const (
-	defaultHealthInterval = 10 * time.Second
-	defaultHealthTimeout  = 5 * time.Second
-	defaultHealthRetries  = 3
-	defaultHealthAction   = "restart"
+	defaultHealthInterval = healthdefaults.Interval
+	defaultHealthTimeout  = healthdefaults.Timeout
+	defaultHealthRetries  = healthdefaults.Retries
+	defaultHealthAction   = healthdefaults.Action
 )
 
 // vmAddrPlaceholder stands for the VM's address in Describe; the sentinel is a

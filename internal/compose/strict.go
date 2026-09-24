@@ -21,49 +21,24 @@ import (
 // a YAML anchor) and YAML merge keys (`<<: *anchor`), whose merged keys are
 // checked in turn, positioned where the anchor writes them.
 
-// ParseStored parses compose YAML that was validated when it was deployed and
-// has been stored since. It skips the checks a later build may have added
-// (unknown fields) so a stack stays readable to the code that tears it down or
-// resolves its volumes; it still refuses what cannot be decoded at all.
-// Anything a person has just written goes through ParseBytes.
+// ParseStored reads compose YAML that was accepted when it was deployed and
+// has been stored since. It does only what reading needs — decoding, the
+// workloads fold, extends — and validates nothing, so no check added after a
+// stack was deployed can make it unreadable to the code that tears it down or
+// resolves its volumes. Anything a person has just written goes through
+// ParseBytes.
 func ParseStored(data []byte) (*File, error) {
 	return parseWith(data, parseOpts{stored: true})
 }
 
 type parseOpts struct {
-	// stored: the YAML was accepted earlier; skip the checks that only
-	// guard against a person's mistakes.
+	// stored: the YAML was accepted earlier; read it, validate nothing.
 	stored bool
 }
 
-// checkHealthcheckFields reports unknown fields in every workload's
-// healthcheck block.
-func (v *validator) checkHealthcheckFields(root *yaml.Node) {
-	root = resolveAlias(root)
-	if root == nil || root.Kind != yaml.MappingNode {
-		return
-	}
-	hcType := reflect.TypeOf(HealthCheckDef{})
-	for _, top := range mappingEntries(root) {
-		if top.key.Value != "vms" && top.key.Value != "workloads" {
-			continue
-		}
-		wls := resolveAlias(top.val)
-		if wls == nil || wls.Kind != yaml.MappingNode {
-			continue
-		}
-		for _, wl := range mappingEntries(wls) {
-			body := resolveAlias(wl.val)
-			if body == nil || body.Kind != yaml.MappingNode {
-				continue
-			}
-			for _, f := range mappingEntries(body) {
-				if f.key.Value == "healthcheck" {
-					v.checkFields(f.val, hcType, top.key.Value+"."+wl.key.Value+".healthcheck", 0)
-				}
-			}
-		}
-	}
+// checkFileFields reports every unknown field in the file.
+func (v *validator) checkFileFields(root *yaml.Node) {
+	v.checkFields(root, reflect.TypeOf(File{}), "", 0)
 }
 
 // checkFields reports every key of mapping n that struct type t has no field

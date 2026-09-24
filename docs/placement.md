@@ -278,9 +278,9 @@ imbalance. Operators almost never see proposals on prod hours.
 
 ```yaml
 vms:
-  db-1: { ... placement: { mode: ha-critical, anti-affinity: [db-2, db-3] } }
-  db-2: { ... placement: { mode: ha-critical, anti-affinity: [db-1, db-3] } }
-  db-3: { ... placement: { mode: ha-critical, anti-affinity: [db-1, db-2] } }
+  db-1: { image: postgres-16, placement: { mode: ha-critical, anti-affinity: [db-2, db-3] } }
+  db-2: { image: postgres-16, placement: { mode: ha-critical, anti-affinity: [db-1, db-3] } }
+  db-3: { image: postgres-16, placement: { mode: ha-critical, anti-affinity: [db-1, db-2] } }
 ```
 
 Three replicas always on three different hosts; if a host goes offline, the

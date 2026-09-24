@@ -253,7 +253,12 @@ func newDownCmd() *cobra.Command {
 					return fmt.Errorf("delete stack: %w", err)
 				}
 
+				// Per-VM failures arrive as "error" status and the stream still
+				// ends OK, so they must be counted here, as compose up does: a
+				// stack with a VM that could not be deleted is not torn down.
 				var downErr error
+				var failed, seen []string
+				seenFailed, seenVM := map[string]bool{}, map[string]bool{}
 				for {
 					p, err := stream.Recv()
 					if err != nil {
@@ -262,9 +267,17 @@ func newDownCmd() *cobra.Command {
 						}
 						break
 					}
+					if p.VmName != "" && !seenVM[p.VmName] {
+						seenVM[p.VmName] = true
+						seen = append(seen, p.VmName)
+					}
 					switch p.Status {
 					case "error":
 						fmt.Fprintf(os.Stderr, "  error %s: %s\n", p.VmName, p.Error)
+						if !seenFailed[p.VmName] {
+							seenFailed[p.VmName] = true
+							failed = append(failed, p.VmName)
+						}
 					case "deleted":
 						fmt.Printf("  deleted %s\n", p.VmName)
 					default:
@@ -273,6 +286,10 @@ func newDownCmd() *cobra.Command {
 				}
 				if downErr != nil {
 					return downErr
+				}
+				if len(failed) > 0 {
+					return fmt.Errorf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",
+						name, len(failed), len(seen), strings.Join(failed, ", "))
 				}
 
 				fmt.Printf("Stack %q torn down.\n", name)

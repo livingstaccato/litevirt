@@ -279,6 +279,52 @@ func TestFleet_ComposeFailedDependsOnWaitIsReported(t *testing.T) {
 	}
 }
 
+// A teardown that could not delete a VM leaves the stack "deleting" for the
+// reconciler, reports the VM in-band, and must not be audited "ok".
+func TestFleet_ComposeFailedTeardownIsAuditedAsError(t *testing.T) {
+	_, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+
+	msgs := deployCollect(t, ctx, client, composeFailTwo)
+	for _, vm := range []string{"hb-1", "hb-2"} {
+		if p := errorPhaseFor(msgs, vm); p != nil {
+			t.Fatalf("setup deploy failed for %s: %s", vm, p.Error)
+		}
+	}
+	barVMDelete(t, ctx, node.DB, "hb-2")
+
+	dctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	stream, err := client.DeleteStack(dctx, &pb.DeleteStackRequest{Name: "hb"})
+	if err != nil {
+		t.Fatalf("DeleteStack: %v", err)
+	}
+	sawErr := false
+	for {
+		p, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("DeleteStack stream: %v", err)
+		}
+		if p.Status == "error" && p.VmName == "hb-2" {
+			sawErr = true
+		}
+	}
+	if !sawErr {
+		t.Fatal("DeleteStack sent no error status for hb-2")
+	}
+	if got := stackState(t, ctx, node.DB, "hb"); got != "deleting" {
+		t.Errorf("stack state after a failed teardown = %q, want deleting", got)
+	}
+	if res, detail := lastAuditResult(t, ctx, node.DB, "stack.delete", "hb"); res != "error" {
+		t.Errorf("stack.delete audit result = %q (%s), want error", res, detail)
+	} else if !strings.Contains(detail, "hb-2") {
+		t.Errorf("stack.delete audit detail %q does not name the VM that was not deleted", detail)
+	}
+}
+
 // The rolling-update path (any non-recreate strategy; all-at-once here, which
 // has no health wait) has its own scale-down loop; a failed delete there
 // must be reported the same way.

@@ -780,7 +780,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	corrosion.SoftDeleteLBBackends(ctx, s.db, lbName)
 	_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
 
+	// hadFailures keeps the stack in "deleting"; notRemoved names what is left,
+	// for the audit row.
 	hadFailures := false
+	var notRemoved []string
 	for _, vm := range vms {
 		if err := stream.Send(&pb.DeleteProgress{
 			VmName: vm.Name,
@@ -792,6 +795,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		delErr := s.deleteVMWithFanout(ctx, vm.Name, req.KeepDisks)
 		if delErr != nil {
 			hadFailures = true
+			notRemoved = append(notRemoved, vm.Name)
 			slog.Warn("stack delete vm failed", "vm", vm.Name, "error", delErr)
 			if sendErr := stream.Send(&pb.DeleteProgress{
 				VmName: vm.Name,
@@ -817,11 +821,13 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	containers, ctErr := corrosion.ListContainersByStack(ctx, s.db, req.Name)
 	if ctErr != nil {
 		hadFailures = true
+		notRemoved = append(notRemoved, "containers (list failed)")
 		slog.Warn("stack delete: list containers failed", "stack", req.Name, "error", ctErr)
 	}
 	for _, ct := range containers {
 		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); delErr != nil {
 			hadFailures = true
+			notRemoved = append(notRemoved, ct.Name)
 			slog.Warn("stack delete container failed", "container", ct.Name, "host", ct.HostName, "error", delErr)
 			if sendErr := stream.Send(&pb.DeleteProgress{VmName: ct.Name, Status: "error", Error: delErr.Error()}); sendErr != nil {
 				return sendErr
@@ -860,6 +866,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			}
 			if err := s.deprovisionNetworkByName(ctx, nr.Name); err != nil {
 				hadFailures = true
+				notRemoved = append(notRemoved, "network "+nr.Name)
 				slog.Warn("stack network deprovision failed", "network", nr.Name, "error", err)
 			}
 		}
@@ -897,6 +904,11 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		s.publish("stack.deleted", req.Name, fmt.Sprintf("%d VMs", len(vms)))
 	}
 
+	if hadFailures {
+		s.audit(ctx, "stack.delete", req.Name,
+			"incomplete, left in deleting for the reconciler; not removed: "+strings.Join(notRemoved, ", "), "error")
+		return nil
+	}
 	s.audit(ctx, "stack.delete", req.Name, "", "ok")
 	return nil
 }

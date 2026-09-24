@@ -3244,4 +3244,23 @@ message FenceReadiness {
     repeated string sample_vms = 4;
     repeated FenceHostPosture hosts = 5;
     string generated_at = 6;   // RFC3339
+    // recent_fences: the newest fencing_log rows from the last
+    // fenceReadinessRecentWindow, newest first and capped. Each carries the
+    // ASSURANCE of what it established — corrosion.FenceAssurance, the same
+    // classification the shared-storage gate uses — because the stored result
+    // writes "fenced" both for an IPMI power-off that was observed off and for
+    // an SSH poweroff nobody checked. DIAGNOSTIC ONLY.
+    repeated FenceEvent recent_fences = 7;
+}
+
+// FenceEvent is one fencing_log row, labelled with what it established.
+message FenceEvent {
+    string host = 1;
+    string method = 2;
+    string result = 3;     // as stored: fenced | partial | manual-confirmed
+    // assurance: verified | operator-confirmed | requested | assumed |
+    // awaiting-confirmation | failed | unknown. See corrosion.FenceAssurance.
+    string assurance = 4;
+    string timestamp = 5;  // RFC3339
+    string detail = 6;
 }

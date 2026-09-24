@@ -582,6 +582,35 @@ warning on permanently.
 
 Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
 
+### What a fence established
+
+`lv doctor fence` also lists the fences of the last 7 days (newest 20), each
+with an **assurance** — what that fence actually establishes about the host.
+The stored `fencing_log.result` cannot make this distinction: it says `fenced`
+both for an IPMI power-off that was observed off and for an SSH poweroff nobody
+checked.
+
+| Assurance | Produced by | Means |
+|---|---|---|
+| `verified` | `ipmi` + `fenced` | Powered off, then observed off. |
+| `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
+| `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a poweroff, or its watchdog heartbeat was stopped. Nothing checked it went down. |
+| `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |
+| `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
+| `failed` | any + `partial` | The fence ran and reported failure. |
+
+Only `verified` and `operator-confirmed` satisfy the shared-storage fence
+(`corrosion.FenceProofGrade` is defined in terms of this table). A `requested` or
+`assumed` fence still lets the coordinator that ran it reschedule **local-disk**
+VMs, which is why the command prints a note when it finds one. A later
+coordinator never resumes a recovery from one — resuming needs a proof-grade
+fence. `lv host fence` prints the same assurance for the fence it just ran.
+
+`litevirt_fences_total{method,assurance}` counts the same classification. Note
+that the older `litevirt_fence_failures_total` counts every result other than
+`fenced` and `manual-confirmed`, so a manual fence **awaiting confirmation**
+shows there as a failure; read `litevirt_fences_total` for the distinction.
+
 ### What it does not establish
 
 Printed on **every** run, clean or not. These are the two things that would make

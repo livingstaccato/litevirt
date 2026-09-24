@@ -1320,6 +1320,15 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.OnFence(h.Name, fr.Method, logResult, fr.Detail)
 	}
 
+	// Say so, at the moment it matters, when the fence proves nothing. The row
+	// above reads "fenced" either way; this is the line an on-call engineer
+	// reading this node's journal during a failover will actually see.
+	if a := corrosion.FenceAssurance(fr.Method, logResult); a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
+		slog.Warn("failover: this fence was not verified — the host may still be running",
+			"host", h.Name, "method", fr.Method, "assurance", a,
+			"fix", "give "+h.Name+" an ipmi fence strategy to make its fences verifiable")
+	}
+
 	// Step 2a: a VERIFIED power-off is a fact about the host, the same class of
 	// thing as the fencing_log row above — it is true no matter who holds the
 	// lease a moment later. Write it BEFORE the leadership re-check so a handoff

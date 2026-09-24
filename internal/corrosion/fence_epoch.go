@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 )
@@ -73,6 +74,71 @@ func CheckProofGradeFence(ctx context.Context, c *Client, fenceEpoch, oldOwner s
 	return FenceOK, ""
 }
 
+// Fence assurance levels: what a recorded fence actually ESTABLISHES about the
+// host, as opposed to what its result string says happened.
+const (
+	// FenceVerified: the host was powered off AND observed off afterwards
+	// (IPMI: chassis power off, then a power-status read that says off).
+	FenceVerified = "verified"
+	// FenceOperatorConfirmed: a human ran `lv host fence-confirm` after
+	// ensuring the host is down.
+	FenceOperatorConfirmed = "operator-confirmed"
+	// FenceRequested: the host accepted a poweroff (SSH) or the heartbeat was
+	// stopped (watchdog), and nothing looked afterwards. The host may be off;
+	// the record cannot say.
+	FenceRequested = "requested"
+	// FenceAssumed: the request itself is not known to have arrived. Only the
+	// lenient best-effort path produces it — SSH failed and it proceeded.
+	FenceAssumed = "assumed"
+	// FenceAwaitingConfirmation: a manual fence, waiting for a human. Not a
+	// failure — that is the strategy working as designed.
+	FenceAwaitingConfirmation = "awaiting-confirmation"
+	// FenceFailed: the fence ran and reported failure.
+	FenceFailed = "failed"
+	// FenceUnknown: a pair this code does not recognise. Never a success.
+	FenceUnknown = "unknown"
+)
+
+// FenceAssurance classifies a fencing_log (method, result) pair.
+//
+// It exists because the result column cannot make the distinction that
+// matters. The coordinator and the operator FenceHost path both write "fenced"
+// for any fence.Result with Success, so an ssh row and an ipmi row are
+// identical in the table while meaning different things: IPMI powered the host
+// off and then observed it off; SSH had a shell accept a poweroff command.
+//
+// The classification is derived at READ time from what every row already
+// records, rather than stored. That needs no schema change and no new
+// replicated statement shape, and it classifies every historical row too,
+// which a new column never could.
+//
+// FenceProofGrade is defined in terms of this, so the shared-storage gate and
+// every operator surface read one classification rather than two that can
+// drift apart.
+func FenceAssurance(method, result string) string {
+	switch {
+	case result == "manual-confirmed":
+		return FenceOperatorConfirmed
+	case method == "manual" && result == "partial":
+		return FenceAwaitingConfirmation
+	case result == "partial":
+		switch method {
+		case "ipmi", "ssh", "watchdog", "best-effort-ssh":
+			return FenceFailed
+		}
+	case result == "fenced":
+		switch method {
+		case "ipmi":
+			return FenceVerified
+		case "ssh", "watchdog":
+			return FenceRequested
+		case "best-effort-ssh":
+			return FenceAssumed
+		}
+	}
+	return FenceUnknown
+}
+
 // FenceProofGrade reports whether a fencing_log (method, result) pair PROVES the
 // old owner is actually powered off — the bar a cross-host SHARED-disk ownership
 // transfer must clear (capabilities.SharedStorageFenceV1). It accepts ONLY a
@@ -90,10 +156,8 @@ func CheckProofGradeFence(ctx context.Context, c *Client, fenceEpoch, oldOwner s
 // writable disk started on a second host while the first may still write it
 // corrupts the disk, so only a proven power-off is acceptable.
 func FenceProofGrade(method, result string) bool {
-	switch {
-	case result == "manual-confirmed":
-		return true
-	case result == "fenced" && method == "ipmi":
+	switch FenceAssurance(method, result) {
+	case FenceVerified, FenceOperatorConfirmed:
 		return true
 	default:
 		return false
@@ -165,4 +229,44 @@ func GetFenceLog(ctx context.Context, c *Client, id string) (FenceLogRecord, boo
 		ID: r.String("id"), HostName: r.String("host_name"), Method: r.String("method"),
 		Result: r.String("result"), Detail: r.String("detail"), Timestamp: r.String("timestamp"),
 	}, true, nil
+}
+
+// RecentFences returns fencing_log rows newer than since, newest first, at most
+// limit of them.
+//
+// The recency filter and the ordering are done in Go on the parsed RFC3339
+// timestamp, not in SQL, for the reason fenceWithinWindow gives: comparing
+// fencing_log.timestamp as text against anything but another RFC3339 string is
+// unreliable across the SQLite engines this code runs on. A row whose timestamp
+// does not parse is skipped — it cannot be shown to be recent.
+func RecentFences(ctx context.Context, c *Client, since time.Time, limit int) ([]FenceLogRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT id, host_name, method, result, timestamp, detail FROM fencing_log`)
+	if err != nil {
+		return nil, err
+	}
+	type stamped struct {
+		at  time.Time
+		rec FenceLogRecord
+	}
+	var out []stamped
+	for _, r := range rows {
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil || !ts.After(since) {
+			continue
+		}
+		out = append(out, stamped{ts, FenceLogRecord{
+			ID: r.String("id"), HostName: r.String("host_name"), Method: r.String("method"),
+			Result: r.String("result"), Detail: r.String("detail"), Timestamp: r.String("timestamp"),
+		}})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].at.After(out[j].at) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	recs := make([]FenceLogRecord, len(out))
+	for i, s := range out {
+		recs[i] = s.rec
+	}
+	return recs, nil
 }

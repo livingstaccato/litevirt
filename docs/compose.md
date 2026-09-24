@@ -728,11 +728,11 @@ A retry whose compose change is itself a change of identity (an image change, sa
 An update of a VM stays on the host it runs on, and is placed as a **replacement** of what that VM holds there: its current cpu and memory are released and the updated request is charged in their place, so a VM that fills most of its host can still be shrunk, relabelled or otherwise updated. An update that no longer fits its host is refused before anything is touched, and the error names the resource and the numbers:
 
 ```
-planner: batch placement failed: no eligible host for VM "db": db needs 4224 MiB of memory on node-2
-(4096 MiB + 128 MiB qemu overhead), which has 1947 MiB free after db's current 1024 MiB is released
+planner: batch placement failed: no eligible host for VM "db":
+node-2: memory (needs 4224 MiB incl. 128 qemu overhead, 1947 free after db's current 1024 is released)
 ```
 
-A container update is placed the same way, against the container's current memory limit.
+A container update is placed the same way, against the container's current memory limit. A container is charged its memory limit only — no qemu overhead and no vCPU for its `cpu`, which is a cgroup CPU limit rather than a vCPU reservation.
 
 The strategy decides how a change that needs a **new** VM is rolled out — `recreate` means "replace such a VM by deleting and creating it", not "recreate on any change":
 

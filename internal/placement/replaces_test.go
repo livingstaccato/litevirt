@@ -71,8 +71,7 @@ func TestSelectBatch_PinnedUpdateThatDoesNotFitSaysWhy(t *testing.T) {
 	if !errors.Is(got.Err, ErrNoEligibleHost) {
 		t.Fatalf("Err = %v, want ErrNoEligibleHost", got.Err)
 	}
-	want := "db needs 4224 MiB of memory on node-2 (4096 MiB + 128 MiB qemu overhead), " +
-		"which has 1947 MiB free after db's current 1024 MiB is released"
+	want := "node-2: memory (needs 4224 MiB incl. 128 qemu overhead, 1947 free after db's current 1024 is released)"
 	if got.Err == nil || !strings.Contains(got.Err.Error(), want) {
 		t.Fatalf("Err = %v\nwant it to contain %q", got.Err, want)
 	}
@@ -179,9 +178,9 @@ func TestSelectBatch_NoEligibleHostNamesEachRejection(t *testing.T) {
 		t.Fatalf("Err = %v, want *NoEligibleHostError", e)
 	}
 	for _, want := range []string{
-		"node-1 lacks required label tier=data",
-		"node-2 is not active (state: draining)",
-		"db needs 2176 MiB of memory on node-3 (2048 MiB + 128 MiB qemu overhead), which has 1947 MiB free",
+		"node-1: labels (needs tier=data)",
+		"node-2: not active (draining)",
+		"node-3: memory (needs 2176 MiB incl. 128 qemu overhead, 1947 free)",
 	} {
 		if !strings.Contains(e.Error(), want) {
 			t.Errorf("Err = %v\nwant it to contain %q", e, want)
@@ -189,5 +188,23 @@ func TestSelectBatch_NoEligibleHostNamesEachRejection(t *testing.T) {
 	}
 	if len(ne.Rejections) != 3 {
 		t.Errorf("Rejections = %+v, want one per host", ne.Rejections)
+	}
+}
+
+// Every filter a host fails is named, not only the first: an operator fixing
+// the memory shortfall must not then discover the anti-affinity and the label.
+func TestSelectBatch_RejectionNamesEveryFailingFilter(t *testing.T) {
+	web2 := makeVM("web-2", "node-2", 1, 1024, "running")
+	results, err := SelectBatch(labHosts()[1:2], []corrosion.VMRecord{web2}, nil, nil, nil, time.Time{}, []Request{{
+		VMName: "db", CPUNeeded: 1, MemMiBNeeded: 1024,
+		AntiAffinity: []string{"web-2"}, RequireLabels: map[string]string{"tier": "data"},
+	}})
+	if err != nil {
+		t.Fatalf("SelectBatch: %v", err)
+	}
+	want := `no eligible host for VM "db": node-2: memory (needs 1152 MiB incl. 128 qemu overhead, 795 free), ` +
+		"anti-affinity (web-2), labels (needs tier=data)"
+	if e := results["db"].Err; e == nil || e.Error() != want {
+		t.Fatalf("Err = %v\nwant   %s", e, want)
 	}
 }

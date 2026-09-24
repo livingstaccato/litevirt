@@ -84,8 +84,7 @@ func TestFleet_ComposeUpdateBeyondItsHostIsRefusedWithTheShortfall(t *testing.T)
 	bigger := edit(t, composeFillHost, "    memory: 1024\n", "    memory: 4096\n")
 	from := len(node.Virt.EventLog())
 	err := deployErr(t, ctx, client, bigger)
-	want := "db needs 4224 MiB of memory on node-0 (4096 MiB + 128 MiB qemu overhead), " +
-		"which has 1947 MiB free after db's current 1024 MiB is released"
+	want := "node-0: memory (needs 4224 MiB incl. 128 qemu overhead, 1947 free after db's current 1024 is released)"
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("deploy of a 4096 MiB db = %v\nwant a refusal containing %q", err, want)
 	}

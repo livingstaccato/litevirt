@@ -2357,7 +2357,9 @@ func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.Cont
 	// did not fit. "" tells the caller to skip loudly and leave the row for
 	// operator recovery instead.
 	target, err := placement.Select(ctx, c.db, placement.Request{
-		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
+		// A container holds memory only: its cpu_limit is no vCPU reservation
+		// and it carries no qemu overhead.
+		VMName: ct.Name, Container: true, MemMiBNeeded: ct.MemMiB,
 		Capacity: c.capacity,
 	})
 	if err != nil {

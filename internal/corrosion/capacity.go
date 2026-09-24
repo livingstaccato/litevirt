@@ -259,9 +259,17 @@ func SumContainerMemoryByHost(ctx context.Context, c *Client) (map[string]int, e
 func ContainerMemoryByHost(cts []ContainerRecord) map[string]int {
 	out := make(map[string]int)
 	for _, ct := range cts {
-		if ct.State == "running" && ct.MemMiB > 0 {
+		if ContainerHoldsHostMemory(ct) {
 			out[ct.HostName] += ct.MemMiB
 		}
 	}
 	return out
+}
+
+// ContainerHoldsHostMemory is the in-memory counting rule for a container's
+// host charge: running and memory-capped, and then its memory limit only.
+// Placement's ContainerAllocation (what an update releases) uses the same rule,
+// so a container is released exactly as it was counted.
+func ContainerHoldsHostMemory(ct ContainerRecord) bool {
+	return ct.State == "running" && ct.MemMiB > 0
 }

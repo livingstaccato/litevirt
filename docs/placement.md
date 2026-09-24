@@ -349,27 +349,31 @@ Rebalance executor (internal/grpcapi/, leader-gated):
 
 ## Why a placement failed
 
-When no host qualifies, the error names every candidate host and the hard
+When no host qualifies, the error names every candidate host and every hard
 filter that refused it, instead of a bare "no eligible host":
 
 ```
-no eligible host for VM "db": node-1 lacks required label tier=data; node-2 is not active (state: draining);
-db needs 2176 MiB of memory on node-3 (2048 MiB + 128 MiB qemu overhead), which has 1947 MiB free
+no eligible host for VM "db": node-1: labels (needs tier=data); node-2: not active (draining);
+node-3: memory (needs 1152 MiB incl. 128 qemu overhead, 795 free), anti-affinity (web-2)
 ```
 
-A host is refused for the first filter it fails, in this order: not active,
-witness, incomplete or stale capacity observation, vCPU, memory, anti-affinity,
-`max-per-node`, required labels, devices, and the `spread-strict` pressure cap.
-Memory is compared as the VM's guest memory plus one qemu overhead against the
-host's allocatable memory net of what already runs there. Compose plans report
+A host that is not active, or is a witness, is reported as that alone. Every
+other host lists each filter it fails, in this order: `capacity observation
+incomplete or stale`, `vcpu`, `memory`, `anti-affinity`, `max-per-node`,
+`labels`, `devices`, and the `spread-strict pressure cap`. Compose plans report
 it on `lv compose up`; a VM that failover cannot place records it in the
 `failover.skip` audit row.
+
+A VM is charged its vCPUs and its guest memory plus one qemu overhead, against
+the host's allocatable capacity net of what already runs there. A **container**
+is charged its memory limit only: no qemu overhead, and no vCPU — its `cpu` is a
+cgroup CPU limit, not a vCPU reservation, which is also how running containers
+are counted against a host and how host admission charges a new one.
 
 An **update** of a workload is placed as a replacement of what it holds now:
 its current cpu and memory are released on its host while the updated request
 is evaluated, so a workload never counts twice against the host it runs on. The
-free figure then says so — `which has 1947 MiB free after db's current 1024 MiB
-is released`. A VM moving to another host (failover, drain, rebalance) is
+free figure then says so — `1947 free after db's current 1024 is released`. A VM moving to another host (failover, drain, rebalance) is
 counted on its source, never on its destination.
 
 ---
@@ -378,7 +382,7 @@ counted on its source, never on its destination.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| VM creation fails with "… would exceed the spread-strict pressure cap (50%)" | `spread-strict` would put all candidates above 50% on a wired dimension | Add hosts, or relax to `policy: balance` |
+| VM creation fails with "… spread-strict pressure cap (50%)" | `spread-strict` would put all candidates above 50% on a wired dimension | Add hosts, or relax to `policy: balance` |
 | Rebalancer proposes nothing despite obvious imbalance | All VMs in `mode: off` | Set `mode: dry-run` cluster-wide |
 | Same VM proposed every cycle | Cooldown only suppresses the *same* VM after a successful proposal write | Approve (the executor applies it) or reject the proposal; cooldown then takes effect |
 | Approved proposal never applies | Not the leader, or cluster budget exhausted (`applying` ≥ MaxConcurrent / `applied` ≥ MaxPerHour this hour), or it failed re-validation | `lv rebalance list --status applying\|failed`; check `detail`; confirm a leader holds the `rebalancer` lease |

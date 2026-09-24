@@ -39,10 +39,12 @@ type CTFake struct {
 	state map[string]string
 	// ips is what IPContainer reports, keyed by name.
 	ips map[string]string
-	// limits is what ContainerLimits reports, keyed by name — recorded at
-	// create from the request's CPU/memory so the runtime-inventory collector
-	// sees the same limits the caller configured. Absent = uncapped (0,0).
-	limits map[string][2]int
+	// cgroup is the container's cgroup stanza, keyed by name — rendered at
+	// create by the REAL lxc.ResourceConfig from the request's CPU/memory, and
+	// parsed back by the real lxc parser for ContainerLimits, so a test sees the
+	// cpu.max a real container would get and the runtime-inventory collector
+	// reads the limits the way it reads a real config. Absent = uncapped.
+	cgroup map[string]string
 
 	// Call counters/records. Read them with the accessors, never directly —
 	// the handlers write these from other goroutines.
@@ -195,10 +197,10 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 	defer f.mu.Unlock()
 	f.createCalls = append(f.createCalls, opts)
 	f.seedLocked(opts.Name, "created-by-"+opts.Name)
-	if f.limits == nil {
-		f.limits = map[string][2]int{}
+	if f.cgroup == nil {
+		f.cgroup = map[string]string{}
 	}
-	f.limits[opts.Name] = [2]int{opts.CPULimit, opts.MemoryMiB}
+	f.cgroup[opts.Name] = lxc.ResourceConfig(opts.CPULimit, opts.MemoryMiB)
 	return &grpcapi.ContainerInfo{Name: opts.Name, State: "stopped"}, nil
 }
 
@@ -211,8 +213,15 @@ func (f *CTFake) ContainerLimits(_ context.Context, name string) (int, int, erro
 	if _, ok := f.state[name]; !ok {
 		return 0, 0, fmt.Errorf("container %q does not exist", name)
 	}
-	l := f.limits[name]
-	return l[0], l[1], nil
+	return lxc.ParseResourceConfig(f.cgroup[name])
+}
+
+// CgroupConfig is the cgroup stanza container name was created with, as the
+// real runtime would write it into the container's config.
+func (f *CTFake) CgroupConfig(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cgroup[name]
 }
 
 func (f *CTFake) StartContainer(_ context.Context, name string) error {

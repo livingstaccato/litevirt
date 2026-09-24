@@ -732,7 +732,7 @@ planner: batch placement failed: no eligible host for VM "db":
 node-2: memory (needs 4224 MiB incl. 128 qemu overhead, 1947 free after db's current 1024 is released)
 ```
 
-A container update is placed the same way, against the container's current memory limit. A container is charged its memory limit only — no qemu overhead and no vCPU for its `cpu`, which is a cgroup CPU limit rather than a vCPU reservation.
+A container update is placed the same way, against the container's current memory limit. A container is charged its memory limit only — no qemu overhead and no vCPU for its `cpu`, which caps the container at that many cores rather than reserving them (see [containers.md](containers.md#resource-limits)).
 
 The strategy decides how a change that needs a **new** VM is rolled out — `recreate` means "replace such a VM by deleting and creating it", not "recreate on any change":
 

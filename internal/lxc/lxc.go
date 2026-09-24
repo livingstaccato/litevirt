@@ -72,7 +72,7 @@ type Container struct {
 	Name      string
 	State     State
 	RootFS    string            // path to the container's rootfs (file or dir)
-	CPULimit  int               // shares; 0 = unlimited
+	CPULimit  int               // cap in cores; 0 = unlimited
 	MemoryMiB int               // hard cap; 0 = unlimited
 	Network   []NetworkAttach   // veth attachments, each into an existing bridge
 	Labels    map[string]string // free-form metadata used by compose / UI
@@ -1114,14 +1114,20 @@ func (r *LxcRunner) Limits(_ context.Context, name string) (int, int, error) {
 	return parseResourceConfig(string(raw))
 }
 
+// ParseResourceConfig is parseResourceConfig for callers outside the package
+// that hold a config rendering (the fleet harness's container fake).
+func ParseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
+	return parseResourceConfig(cfg)
+}
+
 // parseResourceConfig inverts ResourceConfig — but the config file is
 // root-editable and cgroup2 accepts forms litevirt never writes, so the parse
 // accepts the full cgroup2/lxc vocabulary rather than only its own emission:
 //
 //   - cpu.max: "<quota> <period>" (period defaults to 100000 when absent, the
-//     cgroup2 default; litevirt writes cpuLimit*1000 with period 100000, so the
-//     limit is quota scaled by the ACTUAL period — a hand-written period keeps
-//     the same ratio instead of silently mis-scaling), or "max" = unlimited;
+//     cgroup2 default; litevirt writes N cores as N*100000 over 100000, so the
+//     limit is quota/period cores, rounded up — a hand-written period keeps the
+//     same ratio instead of silently mis-scaling), or "max" = unlimited;
 //   - memory.max: litevirt's "<MiB>M", any K/M/G/T-suffixed size, "max" =
 //     unlimited, or a BARE INTEGER — which is BYTES, the cgroup2 native unit.
 //     The old parse read bare bytes as MiB, turning a hand-written 256 MiB cap
@@ -1172,26 +1178,15 @@ func parseResourceConfig(cfg string) (cpuLimit, memMiB int, err error) {
 			if quota <= 0 {
 				return 0, 0, fmt.Errorf("non-positive cpu.max quota %q", val)
 			}
-			if quota > math.MaxInt64/100 {
-				return 0, 0, fmt.Errorf("cpu.max quota %q too large", val)
-			}
-			// litevirt writes quota = cpuLimit*1000 at period 100000; the
-			// general inversion preserves that ratio for any period. Round UP,
-			// symmetric with the memory round-up: a positive cap must never
-			// truncate to 0, which the codebase reads as UNLIMITED — a genuine
-			// sub-1%-of-a-core cap becomes 1, never 0. litevirt's own emission
-			// (quota = cpuLimit*1000) still round-trips exactly.
-			//
-			// The ceiling is taken by remainder rather than the usual
-			// (n + d - 1) / d: the guard above only bounds quota*100, so adding
-			// the period could still overflow int64 and wrap the numerator
-			// NEGATIVE — which divided back into a plausible answer instead of
-			// an error. At period 100000, a quota one below the guard's ceiling
-			// produced -92233720368546; at larger periods it produced 0, i.e.
-			// unlimited. This form cannot overflow for any admitted pair.
-			num := quota * 100
-			lim := num / period
-			if num%period != 0 {
+			// quota/period is the cap in cores (ResourceConfig writes N cores
+			// as N*period over period); the general inversion holds for any
+			// period. Round UP, symmetric with the memory round-up: a positive
+			// cap must never truncate to 0, which the codebase reads as
+			// UNLIMITED — half a core, or a config written before cpu meant
+			// cores (2000/100000, 2% of a core), reads as 1. Taken by remainder,
+			// so no intermediate can overflow for any admitted pair.
+			lim := quota / period
+			if quota%period != 0 {
 				lim++
 			}
 			// Finally bound the result to what an int holds on every platform,

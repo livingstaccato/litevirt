@@ -73,7 +73,7 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 	}
 
 	// Capacity admission on the TARGET, MEMORY only — a container's cpu_limit is a
-	// cgroup weight, not a vCPU reservation, so only its memory cap is comparable
+	// cap in cores, not a vCPU reservation, so only its memory cap is comparable
 	// to a VM's (mirrors CreateContainer). An uncapped container reserves nothing,
 	// matching how it is accounted.
 	//

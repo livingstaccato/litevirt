@@ -70,7 +70,7 @@ type Request struct {
 	Replaces *Allocation
 
 	// Container marks a container workload. A container holds host MEMORY only:
-	// its cpu_limit is a cgroup cpu figure, never a vCPU reservation (the
+	// its cpu_limit is a cap in cores, never a vCPU reservation (the
 	// snapshot, host admission and the capacity sampler all leave container CPU
 	// out of host usage), and it has no qemu process, so no per-VM overhead and
 	// no VMCount slot. CPUNeeded is ignored, and MemMiBNeeded is charged as is.

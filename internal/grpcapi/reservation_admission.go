@@ -571,8 +571,8 @@ func quotaVerdict(project string, q *corrosion.ProjectQuotaRecord, used, reserve
 // admitQuotaWithReservation admits a grow against PROJECT QUOTA ONLY — no host
 // figures. Three callers need exactly this shape:
 //
-//   - container creates: host capacity charges memory only (cpu_limit is cgroup
-//     shares, not a vCPU reservation), but quota charges BOTH — SumProjectUsage
+//   - container creates: host capacity charges memory only (cpu_limit is a cap
+//     in cores, not a vCPU reservation), but quota charges BOTH — SumProjectUsage
 //     counts a container's cpu_limit against the project vCPU budget, so admission
 //     must too or the limit is unenforceable;
 //   - --allow-overcommit: the operator is bypassing a PHYSICAL judgment, not a

@@ -225,10 +225,9 @@ func (p CapacityPolicy) MemChargeFor(guestMiB int) int {
 // the vms table alone, so a host packed with containers still reported 100% of
 // its memory free and VMs were admitted onto memory containers already held.
 //
-// MEMORY ONLY, deliberately. A container's cpu_limit is CPU *shares* — a
-// relative cgroup weight, not a reservation — so adding it to a vCPU total would
-// be meaningless arithmetic (a container with the conventional 1024 shares is not
-// 1024 vCPUs). Container CPU therefore stays uncounted rather than counted wrong.
+// MEMORY ONLY, deliberately. A container's cpu_limit is a CAP in cores — a
+// ceiling the cgroup enforces, not a reservation the container holds — so it is
+// not added to the host's vCPU total, just as a VM's hotplug ceiling is not.
 //
 // A container with memory_mib = 0 is UNCAPPED and contributes nothing here. That
 // is a real limitation, not an oversight: litevirt knows the cap, not the actual

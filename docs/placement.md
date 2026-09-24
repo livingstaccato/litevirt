@@ -367,7 +367,7 @@ it on `lv compose up`; a VM that failover cannot place records it in the
 A VM is charged its vCPUs and its guest memory plus one qemu overhead, against
 the host's allocatable capacity net of what already runs there. A **container**
 is charged its memory limit only: no qemu overhead, and no vCPU — its `cpu` is a
-cgroup CPU limit, not a vCPU reservation, which is also how running containers
+cap in cores, not a vCPU reservation, which is also how running containers
 are counted against a host and how host admission charges a new one.
 
 An **update** of a workload is placed as a replacement of what it holds now:

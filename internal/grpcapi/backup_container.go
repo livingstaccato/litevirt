@@ -707,9 +707,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.
 	//
-	//   HOST capacity — memory only. A container's cpu_limit is CPU *shares* (a
-	//   relative cgroup weight), not a vCPU reservation, so it must not be added
-	//   to a host's vCPU total; an uncapped container reserves nothing, matching
+	//   HOST capacity — memory only. A container's cpu_limit is a cap in cores (a
+	//   ceiling the cgroup enforces), not a vCPU reservation, so it must not be
+	//   added to a host's vCPU total; an uncapped container reserves nothing, matching
 	//   how it is accounted.
 	//
 	//   PROJECT quota — CPU **and** memory. SumProjectUsage counts the restored

@@ -266,7 +266,10 @@ func (v *VMChecker) probeDue(vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, n
 // A probe that could not be run (out.unknown: no address known for the VM, or
 // a target that cannot be interpreted) makes the verdict "unknown" with the
 // reason, and resets the failure run: it is not evidence either way.
-func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, out probeOutcome) {
+//
+// It reports whether the result was for the VM's current incarnation; one
+// that is not is dropped here and must not count toward the action either.
+func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, out probeOutcome) bool {
 	inc := IncarnationOf(&vm)
 	retries := probeRetries(hspec)
 	v.mu.Lock()
@@ -282,7 +285,7 @@ func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hs
 		// The VM was restarted, recreated or moved while this probe ran: the
 		// result belongs to an incarnation that no longer exists.
 		v.mu.Unlock()
-		return
+		return false
 	}
 	tr.inFlight = false
 	switch {
@@ -307,9 +310,10 @@ func (v *VMChecker) recordVerdict(ctx context.Context, vm corrosion.VMRecord, hs
 	}
 	v.mu.Unlock()
 	if ev.Verdict == VerdictUnknown && !out.unknown {
-		return // no verdict yet for this incarnation: nothing to say
+		return true // no verdict yet for this incarnation: nothing to say
 	}
 	v.publishVerdict(ctx, vm.Name, ev)
+	return true
 }
 
 // loadVerdicts reads every vm_probe row once per sweep, by VM name. nil on a

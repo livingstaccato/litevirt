@@ -412,7 +412,13 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 	retries := probeRetries(hspec)
 
 	out := v.runProbe(ctx, vm, hspec, timeout)
-	v.recordVerdict(ctx, vm, hspec, out)
+	if !v.recordVerdict(ctx, vm, hspec, out) {
+		// The VM's incarnation changed while this probe ran (a restart, a
+		// move, a redefine): the result describes a VM that no longer exists,
+		// and the new incarnation is probed by a sweep of its own. Counting it
+		// would feed two probes into one failure run.
+		return
+	}
 	if inGrace {
 		return
 	}
@@ -447,8 +453,10 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 	}
 
 	// Threshold crossed — take action (with backoff and max-unavailable).
+	// The failure run is reset only once the action is actually taken: a run
+	// the backoff or the max-unavailable limit holds back keeps counting, so
+	// the first failed probe after the hold acts, rather than `retries` more.
 	v.mu.Lock()
-	v.failures[vm.Name] = 0
 
 	// Exponential backoff: if we've already acted on this VM without recovery,
 	// wait progressively longer before acting again.
@@ -476,6 +484,7 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 		v.activeActions[stack]++
 	}
 
+	v.failures[vm.Name] = 0
 	v.actionCount[vm.Name]++
 	v.lastAction[vm.Name] = v.clock()
 	v.mu.Unlock()

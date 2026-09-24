@@ -254,15 +254,48 @@ func TestVMProbe_DiscoversTheAddressByMAC(t *testing.T) {
 	}
 }
 
-// The recorded address — what `lv ls`, DNS and the LB use — wins over a live
-// lookup.
-func TestVMProbe_RecordedAddressWinsOverDiscovery(t *testing.T) {
+// The recorded address is kept when the owner host sees nothing for the MAC:
+// a static address, or one NetBox assigned, need not show up in ARP or the
+// dnsmasq leases.
+func TestVMProbe_RecordedAddressIsKeptWhenDiscoveryFindsNothing(t *testing.T) {
 	_, port := listenAsVM(t)
 	f := newTargetFixture(t, hc("tcp", port), withIP(vmStandIn))
-	f.v.SetNICIPDiscovery(func(string) string { return "127.0.0.9" })
+	f.v.SetNICIPDiscovery(func(string) string { return "" })
 	f.v.SweepOnce(f.ctx)
 	if h := f.health(); h.Verdict != VerdictHealthy {
 		t.Fatalf("recorded address should be probed: %+v", h)
+	}
+}
+
+// The lab failure: the VM rebooted onto a new DHCP lease, the IP scanner
+// never refreshes a recorded address, and the probe went on dialling the old
+// one ("no route to host"). What the owner host sees live for the NIC's MAC
+// now wins over a recorded address it contradicts.
+func TestVMProbe_LiveAddressWinsOverAStaleRecordedOne(t *testing.T) {
+	_, port := listenAsVM(t)
+	const stale = "127.0.0.9" // nothing listens here
+	f := newTargetFixture(t, hc("tcp", port), withIP(stale))
+	var probed []string
+	f.v.SetProbeFunc(func(ctx context.Context, vm corrosion.VMRecord, h *pb.HealthCheckSpec) (bool, string) {
+		probed = append(probed, h.Target)
+		ok, why := f.v.probeDetail(ctx, vm.Name, h, time.Second)
+		return ok, why
+	})
+	f.v.SetNICIPDiscovery(func(mac string) string {
+		if mac == "52:54:00:aa:bb:01" {
+			return vmStandIn
+		}
+		return ""
+	})
+	f.v.SweepOnce(f.ctx)
+	if len(probed) != 1 || probed[0] != net.JoinHostPort(vmStandIn, port) {
+		t.Fatalf("probed %v, want the live address %s", probed, net.JoinHostPort(vmStandIn, port))
+	}
+	if h := f.health(); h.Verdict != VerdictHealthy {
+		t.Fatalf("live address should be probed: %+v", h)
+	}
+	if f.acted() {
+		t.Fatal("the healthcheck acted on a VM that answers at its live address")
 	}
 }
 

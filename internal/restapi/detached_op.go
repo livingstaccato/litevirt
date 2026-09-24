@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -60,4 +61,30 @@ func ackAndDetach(op string, cancel context.CancelFunc, recv func() (proto.Messa
 			}
 		}
 	}()
+}
+
+// opContext is the context a handler opens a server-streaming RPC on: the
+// request's own for SSE, which ends when the client stops listening, and a
+// detached one otherwise, because the non-SSE answer is an acknowledgement and
+// the operation must outlive it. cancel must be called on every path.
+func (s *Server) opContext(r *http.Request) (context.Context, context.CancelFunc) {
+	ctx := s.grpcCtx(r)
+	if wantsSSE(r) {
+		return ctx, func() {}
+	}
+	return detachedOpContext(ctx)
+}
+
+// ackFirstAndDetach answers a non-SSE call with the stream's first frame and
+// keeps the operation running behind it (ackAndDetach). A stream that fails
+// before its first frame is reported, and its context released.
+func ackFirstAndDetach(w http.ResponseWriter, op string, cancel context.CancelFunc, recv func() (proto.Message, error)) {
+	first, err := recv()
+	if err != nil {
+		cancel()
+		grpcHTTPError(w, http.StatusInternalServerError, err)
+		return
+	}
+	ackAndDetach(op, cancel, recv)
+	jsonProto(w, first)
 }

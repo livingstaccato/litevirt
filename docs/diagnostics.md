@@ -995,6 +995,65 @@ is its connectivity edges going `suspect`.
 A single-node cluster with no seeds is never reported: it has nobody to be
 isolated from.
 
+### Runtime owner mismatch (`runtime_owner_mismatch`)
+
+The dual-run detector raises `runtime_owner_mismatch` about a **VM** when the
+host its database row names as owner is not the host actually running it:
+exactly one host runs the VM, and it is a different host. The involved hosts
+are the DB owner and the host running the VM. It is a corruption-class code.
+While it is active it blocks admission onto both hosts and runtime-changing
+actions on the VM, and automated recovery (self-heal restart, owner-assert)
+refuses to act on that VM.
+
+| Raised when | Clears when |
+|---|---|
+| A detector scan finds exactly one host running the VM, that host is not the DB owner, **and** the DB owner was fully probed and reported the VM not running. A VM whose owner could not be probed is left to `coverage_gap` instead, and a VM mid-migration is skipped. Observed on the first such scan, confirmed (critical) on the second. | Two consecutive clean scans with complete coverage: the owner in the row and the host running the VM agree again. |
+
+**The common benign cause is a host coming back after a fence.** While the
+host was down its VMs were rescheduled, and the database moved their rows to
+the survivors. The evaluator reads its own replica, so a node whose replica is
+still catching up right after it rejoins can briefly see the old owner in the
+row while a survivor is running the VM. That clears on its own once
+replication delivers the move, two scans later.
+
+**The returning host also keeps a leftover libvirt domain** for every VM that
+was moved away. The fence cut the power, so `virsh domstate --reason <vm>`
+there prints `shut off (unknown)`: libvirt does not keep the shutoff reason
+across a power loss. A shut-off domain is not running, so it does not raise
+this condition by itself. The reconciler on that host removes it (destroy and
+undefine, NVRAM included; disks are kept) once it has proof that the domain is
+a leftover. A shutoff reason of `guest-shutdown`, `destroyed`, `daemon` or
+`failed` counts as proof on its own. Reason `unknown` needs two more checks:
+the domain has **no managed-save image**, and the DB owner, asked for its own
+libvirt view, reports the VM **running**. Until then it logs every tick:
+
+```
+reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair
+```
+
+The `unproven` field on that line says which check failed. The usual one is
+that the owner has not started the VM yet or cannot be reached. Any other
+reason (`paused`, `pmsuspended`, `saved`, `crashed`, `migrated`,
+`from-snapshot`, `shutting-down`) is never removed automatically, because the
+domain may still hold state that can be resumed.
+
+**If the condition persists** past a few scans:
+
+1. Run `lv health` to see the condition and its two hosts, then
+   `lv doctor divergence` to check whether the replicas disagree about the VM's
+   row. Save the output before you change anything.
+2. Check on each host which one is really running the VM
+   (`virsh domstate --reason <vm>`).
+3. If the host running it is the right owner, run
+   `lv doctor repair-owner <vm> <host>`. It writes the row only if `<host>`
+   confirms it is running the VM, and it never touches the domain itself.
+4. If a host keeps a leftover domain that the reconciler will not remove,
+   check the `unproven` field first. Remove it by hand only after confirming
+   that another host is running the VM, and that the leftover has no
+   managed-save image (`virsh dominfo <vm>` reports `Managed save: no`). Then
+   run `virsh undefine --nvram <vm>` on that host. Use `--keep-nvram` instead
+   if you want to keep the firmware variables.
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

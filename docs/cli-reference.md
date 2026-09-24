@@ -125,9 +125,11 @@ lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 
 **Delete keeps its handle on failure.** `lv rm` removes the VM's record only once
 its libvirt domain is gone. If the running (or paused) domain cannot be stopped,
-nothing is removed; if it is stopped but cannot be undefined, the record and the
-disks are kept and the VM is recorded `stopped` (`operator-stop`, so no restart
-policy brings it back). Either way the command fails and a retry is safe. The
+nothing is removed; if it is stopped but cannot be undefined — or its PCI
+passthrough devices cannot be released, or another host still owns one of them —
+the record and the disks are kept and the VM is recorded `stopped`
+(`operator-stop`, so no restart policy brings it back). Either way the command
+fails, the `vm.delete` audit entry has result `error`, and a retry is safe. The
 record is the only thing in the cluster that names the domain, so it is never
 dropped while the domain may still exist.
 

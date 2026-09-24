@@ -10,6 +10,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/vfio"
 )
 
 // The VM row is the cluster's only handle on a domain. DeleteVM used to log a
@@ -162,5 +163,81 @@ func TestFleet_DeleteVMStopsAPausedDomainBeforeUndefine(t *testing.T) {
 	}
 	if len(ops) < 2 || ops[0] != "destroy" || ops[1] != "undefine" {
 		t.Errorf("libvirt ops on hb-1 = %v, want destroy before undefine", ops)
+	}
+}
+
+// stuckSysfs makes vfio unable to read one device's driver link, so
+// releaseDevices cannot prove it unbound and fails closed. Every other path
+// reads as absent (no vfio-bound devices, no IOMMU groups).
+type stuckSysfs struct{ addr string }
+
+func (f stuckSysfs) ReadFile(string) ([]byte, error)             { return nil, os.ErrNotExist }
+func (f stuckSysfs) WriteFile(string, []byte, os.FileMode) error { return os.ErrPermission }
+func (f stuckSysfs) ReadDir(string) ([]os.DirEntry, error)       { return nil, os.ErrNotExist }
+func (f stuckSysfs) Readlink(p string) (string, error) {
+	if strings.Contains(p, f.addr) {
+		return "", errors.New("injected: sysfs driver link unreadable")
+	}
+	return "", os.ErrNotExist
+}
+
+// The PCI release (and the remote-owner check after it) run after the domain
+// has been stopped. A delete that fails there keeps the row — but the row went
+// on saying "running" over a destroyed domain, where a restart policy would
+// bring back a VM that is being deleted, and the failure left no audit row.
+func TestFleet_DeleteVMFailedDeviceReleaseRecordsTheStop(t *testing.T) {
+	const addr = "0000:41:00.0"
+	for _, tc := range []struct {
+		name, owner, wantErr string
+		stuck                bool
+	}{
+		{name: "local-release", owner: "node-0", wantErr: "could not be released", stuck: true},
+		{name: "remote-owner", owner: "node-9", wantErr: "still own its PCI"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, node, client := newComposeFailNode(t)
+			ctx := context.Background()
+			disks := deployOneVM(t, ctx, node, client)
+			if vm, _ := corrosion.GetVM(ctx, node.DB, "hb-1"); vm == nil || vm.State != "running" {
+				t.Fatalf("precondition: hb-1 should be running, got %+v", vm)
+			}
+
+			if tc.owner != node.Name {
+				// Only a live host's reservation counts as a remote owner.
+				if err := corrosion.InsertHost(ctx, node.DB, corrosion.HostRecord{
+					Name: tc.owner, Address: "10.9.9.9", State: "maintenance",
+				}); err != nil {
+					t.Fatalf("seed host %s: %v", tc.owner, err)
+				}
+			}
+			if err := corrosion.UpsertPCIDevice(ctx, node.DB, corrosion.PCIDeviceRecord{
+				HostName: tc.owner, Address: addr, Type: "gpu", VendorID: "10de", IOMMUGroup: -1, VMName: "hb-1",
+			}); err != nil {
+				t.Fatalf("seed PCI device owned by hb-1: %v", err)
+			}
+			if tc.stuck {
+				restore := vfio.SetFS(stuckSysfs{addr: addr})
+				defer restore()
+			}
+
+			_, err := client.DeleteVM(ctx, &pb.DeleteVMRequest{Name: "hb-1"})
+			if err == nil {
+				t.Fatal("DeleteVM reported success although the VM's PCI device was not released")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("DeleteVM error %q, want it to say %q", err, tc.wantErr)
+			}
+			vm := assertDeleteKeptHandle(t, ctx, node, disks)
+			if st, _ := node.Virt.DomainState("hb-1"); st == "running" {
+				t.Fatal("the domain is still running — the delete did not reach the device release")
+			}
+			if vm.State != "stopped" || vm.StateDetail != "operator-stop" {
+				t.Errorf("hb-1 recorded as %q/%q after its domain was destroyed, want stopped/operator-stop",
+					vm.State, vm.StateDetail)
+			}
+			if res, detail := lastAuditResult(t, ctx, node.DB, "vm.delete", "hb-1"); res != "error" {
+				t.Errorf("vm.delete audit result = %q (%s), want error", res, detail)
+			}
+		})
 	}
 }

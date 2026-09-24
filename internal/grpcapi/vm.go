@@ -1749,6 +1749,20 @@ func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error
 	return nil
 }
 
+// abortDeleteAfterStop records a DeleteVM that fails after its stop step, with
+// the row kept so the delete can be retried. When the delete destroyed the
+// domain, the row is recorded stopped with operator-stop: it must not go on
+// claiming a running guest, and no restart policy may bring back a VM that is
+// being deleted. The audit row carries why the delete stopped.
+func (s *Server) abortDeleteAfterStop(ctx context.Context, name string, destroyed bool, why string) {
+	if destroyed {
+		if werr := s.persistVMState(ctx, name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+			slog.Warn("DeleteVM: recording the stop of a VM whose delete failed also failed", "vm", name, "error", werr)
+		}
+	}
+	s.audit(ctx, "vm.delete", name, why, "error")
+}
+
 // without returns ss with every occurrence of drop removed (order preserved).
 func without(ss []string, drop string) []string {
 	var out []string
@@ -1964,11 +1978,16 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// (the same stale-owner class, one host over). So after the local release succeeds, and
 	// BEFORE the tombstone, fail closed on any surviving remote owner (retryable once that
 	// host releases its row; fail closed on the ownership-read error too).
+	//
+	// Every failure from here on returns with the row kept but the domain
+	// possibly already destroyed; abortDeleteAfterStop records that.
 	if err := s.releaseDevices(ctx, req.Name); err != nil {
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "PCI device release failed: "+err.Error())
 		return nil, status.Errorf(codes.Internal,
 			"cannot delete VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
 	}
 	if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "remote PCI owner: "+err.Error())
 		return nil, err
 	}
 	// Devices released → clear any lingering durable device lease so a deleted VM's
@@ -1996,14 +2015,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 	if undefErr != nil && s.virt.DomainExists(req.Name) {
 		slog.Error("DeleteVM: domain could not be undefined; keeping the VM record", "vm", req.Name, "error", undefErr)
-		if destroyed {
-			// The domain is down; say so, and make the stop stick so no
-			// restart policy brings back a VM that is being deleted.
-			if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
-				slog.Warn("DeleteVM: recording the stop of a VM whose undefine failed also failed", "vm", req.Name, "error", werr)
-			}
-		}
-		s.audit(ctx, "vm.delete", req.Name, "undefine failed: "+undefErr.Error(), "error")
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "undefine failed: "+undefErr.Error())
 		return nil, status.Errorf(codes.Internal,
 			"cannot delete VM %q: its libvirt domain could not be undefined, so its record and disks were kept (retry is safe): %v",
 			req.Name, undefErr)

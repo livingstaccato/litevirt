@@ -136,14 +136,15 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		}
 	}
 
+	failures := newDeployFailures(stream)
 	if rollingStrategy != "" && hasUpdates {
 		// Rolling update mode: creates first, then rolling updates, then deletes.
-		if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err != nil {
+		if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, failures); err != nil {
 			return err
 		}
 	} else {
 		// Inline mode: process all actions sequentially (existing behavior).
-		if err := s.executeInlineActions(ctx, f, resolved, stream); err != nil {
+		if err := s.executeInlineActions(ctx, f, resolved, stream, failures); err != nil {
 			return err
 		}
 	}
@@ -151,28 +152,52 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// Apply LB actions.
 	s.applyLBActions(ctx, f, resolved, stream)
 
-	// Persist stack record.
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
-	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
-		Name:        f.Name,
-		ComposeHash: hash,
-		ComposeYAML: req.ComposeYaml,
-		State:       "active",
-	}); dbErr != nil {
-		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
-	}
-
 	vmOps := 0
 	for _, a := range resolved.VMs {
 		if a.Kind != planner.OpNoChange {
 			vmOps++
 		}
 	}
+
+	// Persist stack record. The new compose file IS recorded even when some
+	// actions failed — the actions that succeeded applied it, and it is the
+	// desired state a re-run converges to — but the stack is "degraded", not
+	// "active". A re-run retries the failed actions because the planner diffs
+	// the compose file against the live workloads, not against this record.
+	stackState := stackStateActive
+	if len(failures.names) > 0 {
+		stackState = stackStateDegraded
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
+	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name:        f.Name,
+		ComposeHash: hash,
+		ComposeYAML: req.ComposeYaml,
+		State:       stackState,
+	}); dbErr != nil {
+		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
+	}
+
+	if len(failures.names) > 0 {
+		detail := fmt.Sprintf("%d of %d VM ops failed (%s)",
+			len(failures.names), max(vmOps, len(failures.names)), strings.Join(failures.names, ", "))
+		s.publish("stack.degraded", f.Name, detail)
+		s.audit(ctx, "stack.deploy", f.Name, detail, "error")
+		return nil
+	}
 	s.publish("stack.deployed", f.Name, fmt.Sprintf("%d VM ops, %d network ops, %d LB ops",
 		vmOps, len(resolved.Networks), len(resolved.LBs)))
 	s.audit(ctx, "stack.deploy", f.Name, fmt.Sprintf("%d VM ops", vmOps), "ok")
 	return nil
 }
+
+// Stack record states. "deleting" is set by DeleteStack and retried by the
+// StackReconciler; "degraded" means the last deploy recorded the compose file
+// but at least one of its VM actions failed, so the stack has not converged.
+const (
+	stackStateActive   = "active"
+	stackStateDegraded = "degraded"
+)
 
 // persistStackFirewall writes a compose file's distributed-firewall config to
 // Corrosion: security groups (+ rules), ip sets, cluster-tier rules, and the
@@ -1327,6 +1352,9 @@ func (s *Server) waitForCondition(ctx context.Context, vmName, condition string)
 	timeout := 5 * time.Minute
 	if condition == "vm_healthy" {
 		timeout = 10 * time.Minute
+	}
+	if d := s.dependsOnWaitTimeout.Load(); d > 0 {
+		timeout = time.Duration(d)
 	}
 
 	deadline := time.Now().Add(timeout)

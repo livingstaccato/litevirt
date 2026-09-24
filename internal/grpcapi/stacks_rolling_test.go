@@ -29,7 +29,7 @@ func TestExecuteWithRollingUpdates_InPlaceRecreate_FailsNoDelete(t *testing.T) {
 	}}}
 	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
 
-	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err == nil {
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, newDeployFailures(stream)); err == nil {
 		t.Fatal("in-place of a recreate-class change must fail")
 	}
 	if vm, _ := corrosion.GetVM(ctx, s.db, "web"); vm == nil {
@@ -56,7 +56,7 @@ func TestExecuteWithRollingUpdates_InPlaceCombined_AppliesCpuAndMem(t *testing.T
 	}}}
 	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
 
-	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err != nil {
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, newDeployFailures(stream)); err != nil {
 		t.Fatalf("combined in-place resize: %v", err)
 	}
 	vm, _ := corrosion.GetVM(ctx, s.db, "web")
@@ -86,7 +86,7 @@ func TestExecuteWithRollingUpdates_InPlaceResizeError_Propagates(t *testing.T) {
 	}}}
 	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
 
-	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err == nil {
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, newDeployFailures(stream)); err == nil {
 		t.Fatal("a live-resize failure must propagate from the executor")
 	}
 	if vm, _ := corrosion.GetVM(ctx, s.db, "web"); vm == nil {

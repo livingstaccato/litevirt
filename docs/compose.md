@@ -102,6 +102,17 @@ non-zero with a summary such as `stack "web": 1 of 3 actions failed (web-2)`.
 The actions that did succeed are not rolled back; fix the cause and re-run
 `compose up` to converge the rest.
 
+A failed action is any create, update or delete the daemon could not carry
+out — including a scale-down delete, the delete half of a recreate (the
+recreate then stops rather than create over a VM that was never torn down),
+and a `depends-on` wait that timed out. After such a deploy the stack is
+recorded as `degraded` rather than `active` (the STATE column of
+`lv compose ls`), and the `stack.deploy` audit entry has result `error` and
+names the failed VMs. The new compose file is still stored: it is the desired
+state, and the next `compose up` plans against the live VMs, so it retries
+exactly the actions that failed and the stack returns to `active` once they
+all succeed.
+
 ## VM definition
 
 ```yaml

@@ -53,6 +53,10 @@ type Server struct {
 	pkiDir     string
 	db         *corrosion.Client
 
+	// dependsOnWaitTimeout, when > 0, overrides waitForCondition's timeout.
+	// Test seam only (SetDependsOnWaitTimeoutForTests); zero in production.
+	dependsOnWaitTimeout atomic.Int64
+
 	// dualRunLeaseTerm is the fencing term of the dual-run detector's current
 	// lease incarnation, 0 when this node does not hold it.
 	//

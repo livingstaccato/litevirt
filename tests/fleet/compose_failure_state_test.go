@@ -131,8 +131,8 @@ func lastAuditResult(t *testing.T, ctx context.Context, db *corrosion.Client, ac
 }
 
 // barVMDelete makes DeleteVM refuse vm the way it does for real: an in-flight
-// operation holds the VM-wide mutation barrier. (A libvirt undefine failure is
-// not a usable injection — DeleteVM logs it and carries on.)
+// operation holds the VM-wide mutation barrier. It fails at once, where an
+// injected undefine failure is retried by deleteVMWithFanout for ~18s.
 func barVMDelete(t *testing.T, ctx context.Context, db *corrosion.Client, vm string) {
 	t.Helper()
 	if err := db.Execute(ctx, `UPDATE vms SET active_operation_id = 'op-injected' WHERE name = ?`, vm); err != nil {

@@ -123,6 +123,14 @@ lv ssh <vm> [-u root] [-i key] [-- cmd]   # SSH into VM
 lv logs <vm> [-f] [-n 50]                 # VM logs (-f to follow)
 ```
 
+**Delete keeps its handle on failure.** `lv rm` removes the VM's record only once
+its libvirt domain is gone. If the running (or paused) domain cannot be stopped,
+nothing is removed; if it is stopped but cannot be undefined, the record and the
+disks are kept and the VM is recorded `stopped` (`operator-stop`, so no restart
+policy brings it back). Either way the command fails and a retry is safe. The
+record is the only thing in the cluster that names the domain, so it is never
+dropped while the domain may still exist.
+
 **CPU mode.** The default, `host-model`, gives the guest the host's modern
 instruction set — SSE4.2, AVX, AVX2, AVX-512 as the host has them — while keeping
 live migration to a host with an equal-or-richer CPU. It matters because the

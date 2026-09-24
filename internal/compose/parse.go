@@ -48,17 +48,16 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 
 	var f File
 	if root := documentRoot(&doc); root != nil {
-		if err := root.Decode(&f); err != nil {
-			v.decodeError(err)
-		}
 		if !opts.stored {
 			v.checkHealthcheckFields(root)
 		}
-	}
-	if !v.ps.empty() {
-		// A field that did not decode leaves the file half-read; checking
-		// the rest would report the gaps as problems of their own.
-		return nil, v.ps.err()
+		if err := root.Decode(&f); err != nil {
+			// A field that did not decode leaves the file half-read;
+			// checking the rest would report the gaps as problems of
+			// their own.
+			v.decodeError(err)
+			return nil, v.ps.err()
+		}
 	}
 
 	for name := range f.VMs {
@@ -68,8 +67,9 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 		v.origin[name] = "workloads"
 	}
 	v.foldWorkloads(&f)
-	v.resolveExtends(&f)
-	if v.ps.empty() {
+	// A broken extends leaves its children unmerged; checking them would
+	// report what they would have inherited as missing.
+	if v.resolveExtends(&f) {
 		inferHealthTypes(&f)
 		v.validate(&f)
 	}
@@ -162,10 +162,11 @@ func (v *validator) foldWorkloads(f *File) {
 // child wins collisions. Slices — child replaces entirely. Pointer structs —
 // child nil = inherit parent, child non-nil = use child's.
 //
-// Nothing is merged when any extends is broken: every broken one is reported.
-func (v *validator) resolveExtends(f *File) {
+// Nothing is merged when any extends is broken: every broken one is
+// reported, and ok is false.
+func (v *validator) resolveExtends(f *File) (ok bool) {
 	if len(f.VMs) == 0 {
-		return
+		return true
 	}
 	broken := false
 
@@ -229,7 +230,7 @@ func (v *validator) resolveExtends(f *File) {
 		broken = true
 	}
 	if broken {
-		return
+		return false
 	}
 
 	// Apply inheritance in topological order (bases resolved before children).
@@ -243,6 +244,7 @@ func (v *validator) resolveExtends(f *File) {
 		merged.Extends = "" // clear after resolution
 		f.VMs[name] = merged
 	}
+	return true
 }
 
 // mergeVMDef merges a base VMDef into a child. Child values take precedence.

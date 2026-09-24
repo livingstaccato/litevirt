@@ -45,6 +45,32 @@ func TestHealthcheck_UnknownFieldDidYouMean(t *testing.T) {
 	}
 }
 
+// An unknown field does not hide the file's other problems.
+func TestHealthcheck_UnknownFieldAndOtherProblemsTogether(t *testing.T) {
+	ps := problemsOf(t, hcBase+"      retires: 5\n      retries: 0\n  web:\n    cpu: 1\n")
+	for _, w := range []struct{ path, substr string }{
+		{"vms.db.healthcheck", `unknown field "retires"`},
+		{"vms.db.healthcheck.retries", "at least 1"},
+		{"vms.web", "image or iso required"},
+	} {
+		if _, ok := findProblem(ps, w.path, w.substr); !ok {
+			t.Errorf("no problem %q at %s; got:\n%s", w.substr, w.path, dumpProblems(ps))
+		}
+	}
+}
+
+// A broken extends is reported alone for its child: the child's inherited
+// fields were never merged, and reporting them missing would mislead.
+func TestValidation_BrokenExtendsDoesNotReportInheritedFieldsMissing(t *testing.T) {
+	ps := problemsOf(t, "name: s\nvms:\n  web:\n    extends: base\n")
+	if _, ok := findProblem(ps, "vms.web.extends", `extends unknown vm "base"`); !ok {
+		t.Errorf("no extends problem; got:\n%s", dumpProblems(ps))
+	}
+	if _, ok := findProblem(ps, "vms.web", "image or iso required"); ok {
+		t.Errorf("an unmerged child was reported missing its image:\n%s", dumpProblems(ps))
+	}
+}
+
 // With nothing close to suggest, the hint lists the fields there are.
 func TestHealthcheck_UnknownFieldListsValidFields(t *testing.T) {
 	ps := problemsOf(t, hcBase+"      colour: red\n")

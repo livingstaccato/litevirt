@@ -696,19 +696,74 @@ func (s *Server) applyLBActions(ctx context.Context, f *compose.File, plan *plan
 	}
 }
 
-// sortVMActions reorders update operations so that already-failed replicas
-// are processed first (#32).
+// sortVMActions puts already-failed replicas' updates first (#32) without
+// breaking the planner's dependency order: it re-runs the topological sort
+// over the create and update actions, choosing among the READY ones by state
+// priority (error, then stopped, then the rest) and then by their planned
+// position. Deletes and no-change actions keep their slots.
 func sortVMActions(actions []planner.VMAction, current []compose.CurrentVM) {
 	stateOf := make(map[string]string, len(current))
 	for _, c := range current {
 		stateOf[c.Name] = c.State
 	}
-	sort.SliceStable(actions, func(i, j int) bool {
-		if actions[i].Kind != planner.OpUpdate || actions[j].Kind != planner.OpUpdate {
-			return false
+	var slots []int // positions of the create/update actions
+	for i, a := range actions {
+		if a.Kind == planner.OpCreate || a.Kind == planner.OpUpdate {
+			slots = append(slots, i)
 		}
-		return statePriority(stateOf[actions[i].VMName]) < statePriority(stateOf[actions[j].VMName])
-	})
+	}
+	n := len(slots)
+	prio := make([]int, n)
+	inDegree := make([]int, n)
+	dependents := make([][]int, n)
+	for i, si := range slots {
+		prio[i] = 2
+		if actions[si].Kind == planner.OpUpdate {
+			prio[i] = statePriority(stateOf[actions[si].VMName])
+		}
+		for dep := range actions[si].DependsOn {
+			for j, sj := range slots {
+				if j != i && compose.DependsOnTarget(dep, actions[sj].VMName) {
+					inDegree[i]++
+					dependents[j] = append(dependents[j], i)
+				}
+			}
+		}
+	}
+	done := make([]bool, n)
+	order := make([]int, 0, n)
+	for len(order) < n {
+		pick := -1
+		for i := 0; i < n; i++ {
+			if done[i] || inDegree[i] > 0 {
+				continue
+			}
+			if pick < 0 || prio[i] < prio[pick] {
+				pick = i
+			}
+		}
+		if pick < 0 { // a cycle: keep the rest in planned order
+			for i := 0; i < n; i++ {
+				if !done[i] {
+					done[i] = true
+					order = append(order, i)
+				}
+			}
+			break
+		}
+		done[pick] = true
+		order = append(order, pick)
+		for _, d := range dependents[pick] {
+			inDegree[d]--
+		}
+	}
+	sorted := make([]planner.VMAction, n)
+	for k, i := range order {
+		sorted[k] = actions[slots[i]]
+	}
+	for k, si := range slots {
+		actions[si] = sorted[k]
+	}
 }
 
 // buildCurrentVMsFromState converts snapshot VMs to compose.CurrentVM for sorting.

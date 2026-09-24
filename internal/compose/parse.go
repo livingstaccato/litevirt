@@ -387,6 +387,12 @@ func validate(f *File) error {
 			}
 		}
 
+		// Healthcheck: a target the checker cannot interpret can never pass,
+		// and with the default restart action it would restart the VM forever.
+		if err := ValidateHealthCheck(vm.HealthCheck); err != nil {
+			errs = append(errs, fmt.Sprintf("vm %q healthcheck: %v", name, err))
+		}
+
 		// Replicas validation
 		if vm.Replicas != nil && *vm.Replicas < 0 {
 			errs = append(errs, fmt.Sprintf("vm %q: replicas must be >= 0", name))

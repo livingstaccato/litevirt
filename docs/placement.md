@@ -68,8 +68,8 @@ host's budget with a label; usage is sampled automatically from libvirt domain
 stats into `host_runtime_usage`:
 
 ```bash
-lv host config host-a --label placement.iops_capacity=20000   # ops/sec
-lv host config host-a --label placement.netbw_mbps=10000      # Mbps
+lv host label set host-a placement.iops_capacity=20000   # ops/sec
+lv host label set host-a placement.netbw_mbps=10000      # Mbps
 ```
 
 Hosts without the label leave those dimensions inert (capacity 0 → skipped), so

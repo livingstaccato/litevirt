@@ -73,6 +73,81 @@ func TestDocsReferenceRealCLICommands(t *testing.T) {
 	}
 }
 
+// TestDocsUseRealFlags fails if README/docs pass a flag to a real command that
+// the command does not define. The command-path guard above stops at the first
+// flag, so `lv compose up --strategy in-place` passed it: `compose up` exists,
+// `--strategy` does not.
+func TestDocsUseRealFlags(t *testing.T) {
+	root := newRootCmd()
+	rootDir := repoRoot(t)
+
+	var problems []string
+	for _, f := range docFiles(t, rootDir) {
+		content, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		rel, _ := filepath.Rel(rootDir, f)
+		for _, args := range extractInvocations(string(content)) {
+			if bad := unknownFlag(root, args); bad != "" {
+				problems = append(problems, fmt.Sprintf("%s: `lv %s` — %q is not a flag of `lv %s`",
+					rel, strings.Join(args, " "), bad, commandPath(resolveInvocation(root, args))))
+			}
+		}
+	}
+
+	if len(problems) > 0 {
+		t.Errorf("docs pass %d flag(s) that the command does not define:\n  %s\n\n"+
+			"Fix the doc, add the flag, or add `ci:skip-cmd` to the line if the reference is an intentional placeholder.",
+			len(problems), strings.Join(problems, "\n  "))
+	}
+}
+
+// unknownFlag returns the first flag token in a doc invocation that the command
+// it resolves to does not define (locally or inherited), or "". Placeholders
+// (`--<flag>`, `-…`) are skipped, as is everything after a bare `--`.
+// `--help`/`-h` are cobra built-ins, added lazily at execute time.
+func unknownFlag(root *cobra.Command, args []string) string {
+	cmd := resolveInvocation(root, args)
+	if cmd == nil {
+		return ""
+	}
+	lookup := func(name string) bool {
+		return cmd.Flags().Lookup(name) != nil || cmd.InheritedFlags().Lookup(name) != nil
+	}
+	lookupShort := func(sh string) bool {
+		return cmd.Flags().ShorthandLookup(sh) != nil || cmd.InheritedFlags().ShorthandLookup(sh) != nil
+	}
+	for _, tok := range args {
+		if tok == "--" {
+			break
+		}
+		if !strings.HasPrefix(tok, "-") || tok == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tok, "=")
+		if strings.ContainsAny(name, "<>[]{}|…$`\"'()") || strings.Contains(name, "...") {
+			continue
+		}
+		if long, ok := strings.CutPrefix(name, "--"); ok {
+			if long != "help" && !lookup(long) {
+				return tok
+			}
+			continue
+		}
+		// Short flags, possibly combined (`-it`). A negative number is an arg.
+		if _, err := fmt.Sscanf(name, "-%d", new(int)); err == nil {
+			continue
+		}
+		for _, c := range name[1:] {
+			if sh := string(c); sh != "h" && !lookupShort(sh) {
+				return tok
+			}
+		}
+	}
+	return ""
+}
+
 // TestDocsReferenceRealMetrics fails if an inline-code `litevirt_*` identifier
 // in the docs has no matching string literal in the Go source (and isn't an
 // allowlisted roadmap item). Catches a metric / Ansible var that was renamed or
@@ -504,6 +579,31 @@ func TestValidateInvocation(t *testing.T) {
 	for _, tc := range cases {
 		if got := validateInvocation(root, tc.args); got != tc.bad {
 			t.Errorf("validateInvocation(%v) = %q, want %q", tc.args, got, tc.bad)
+		}
+	}
+}
+
+// TestUnknownFlag pins the flag guard: real flags (long, short, `=value`,
+// combined shorthand) pass, and a flag the command does not define is caught.
+func TestUnknownFlag(t *testing.T) {
+	root := newRootCmd()
+	cases := []struct {
+		args []string
+		bad  string
+	}{
+		{[]string{"compose", "up", "-f", "x.yml", "-y"}, ""},
+		{[]string{"compose", "up", "--file=x.yml", "--yes"}, ""},
+		{[]string{"compose", "up", "--help"}, ""},
+		{[]string{"compose", "up", "--<flag>"}, ""}, // placeholder
+		{[]string{"migrate", "vm1", "node-2", "--cold"}, ""},
+		{[]string{"compose", "up", "--strategy", "in-place"}, "--strategy"},
+		{[]string{"migrate", "vm1", "node-2", "--strategy=cold"}, "--strategy=cold"},
+		{[]string{"compose", "up", "-q"}, "-q"},
+		{[]string{"frobnicate", "--anything"}, ""}, // not a command: the path guard's job
+	}
+	for _, tc := range cases {
+		if got := unknownFlag(root, tc.args); got != tc.bad {
+			t.Errorf("unknownFlag(%v) = %q, want %q", tc.args, got, tc.bad)
 		}
 	}
 }

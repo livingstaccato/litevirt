@@ -168,7 +168,8 @@ hardware), or `custom`, which requires `cpu-model`.
 Left unset, `cpu-mode` takes the cluster-wide `vm.default_cpu_mode`. It is not left
 empty: an empty mode emits no `<cpu>` element and drops the guest onto QEMU's
 `qemu64`, which has no AVX at all. Changing either field is restart-class — the CPU
-bakes into the domain XML — so `lv compose up --strategy in-place` refuses it.
+bakes into the domain XML — so an update under `strategy: in-place` (set in the
+VM's `update:` block) refuses it: in-place never restarts a VM.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 

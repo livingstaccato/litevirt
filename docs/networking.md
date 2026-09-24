@@ -453,7 +453,7 @@ inventory changing while the plan was being built — the bind still succeeds, b
 the binding is created **suspended**:
 
 ```
-$ lv network create prod-a --type bridge --interface br-prod --netbox-prefix 12
+$ lv network create prod-a --type bridge --interface br-prod --netbox-prefix-id 12
 Error: network "prod-a" was created and its NetBox binding for prefix 12 is
 SUSPENDED, so it serves no address claims yet: ... this node could not
 corroborate its VM inventory when NetBox prefix was bound ...

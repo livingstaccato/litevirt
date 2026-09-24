@@ -318,25 +318,30 @@ func TopologicalSortOps(ops []Op) []Op {
 		}
 	}
 
-	// Kahn's algorithm.
-	var queue []string
+	// Kahn's algorithm, taking the lowest-named ready VM at each step. The
+	// ready set comes from map iteration, so without a fixed choice VMs with no
+	// ordering between them were created in a different order on every deploy
+	// of an unchanged file — different output, a different partial-failure
+	// shape, and nothing an operator could reproduce.
+	var ready []string
 	for name, deg := range inDegree {
 		if deg == 0 {
-			queue = append(queue, name)
+			ready = append(ready, name)
 		}
 	}
 
 	var sorted []Op
-	for len(queue) > 0 {
-		cur := queue[0]
-		queue = queue[1:]
+	for len(ready) > 0 {
+		sort.Strings(ready)
+		cur := ready[0]
+		ready = ready[1:]
 		if op, ok := byName[cur]; ok {
 			sorted = append(sorted, *op)
 		}
 		for _, dep := range dependents[cur] {
 			inDegree[dep]--
 			if inDegree[dep] == 0 {
-				queue = append(queue, dep)
+				ready = append(ready, dep)
 			}
 		}
 	}

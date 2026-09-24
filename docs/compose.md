@@ -421,7 +421,7 @@ See [`docs/placement.md`](placement.md) for the cost function, troubleshooting, 
 
 ## Boot ordering (depends-on)
 
-Control the order VMs are created during deployment. Dependencies are respected: a VM won't be created until its dependencies reach the specified condition.
+Control the order VMs are created during deployment. Dependencies are respected: a VM won't be created until its dependencies reach the specified condition. VMs with no ordering between them are created in name order, so an unchanged file always deploys in the same order.
 
 ```yaml
 vms:

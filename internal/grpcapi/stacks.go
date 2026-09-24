@@ -1682,7 +1682,14 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 			continue
 		}
 		seenImages[img] = true
-		if !s.images.ImageExists(img) {
+		// Any host's ready copy will do: the VM's host pulls it from a peer
+		// at create time (autoPullImage). Only this node's own store used to
+		// count, so an image imported on another host was refused as "not
+		// found on any host" when the deploy was served elsewhere.
+		switch ok, err := s.imageAvailable(ctx, img); {
+		case err != nil:
+			errs = append(errs, fmt.Sprintf("image %q: lookup failed: %v", img, err))
+		case !ok:
 			errs = append(errs, fmt.Sprintf("image %q not found on any host — pull it first with 'lv image pull'", img))
 		}
 	}

@@ -168,7 +168,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			// re-attempts. Without this, a partial deploy leaves a permanent
 			// "exists but doesn't actually run" zombie row that no further
 			// `compose up` can recover.
-			if isTransientOrErrorState(cur.State) {
+			if IsTransientOrErrorState(cur.State) {
 				plan.Ops = append(plan.Ops, Op{
 					Kind:      OpUpdate,
 					VMName:    instanceName,
@@ -242,7 +242,10 @@ func (p *Plan) Summary() string {
 // Stable states (running / stopped / paused / fenced / migrating) are
 // treated as steady-state. Migrating is intentionally excluded from
 // "needs retry" because a redeploy mid-migration would interrupt it.
-func isTransientOrErrorState(state string) bool {
+// IsTransientOrErrorState reports whether a workload in this state is left
+// over from a deploy (or lifecycle operation) that did not finish, so the next
+// deploy retries it.
+func IsTransientOrErrorState(state string) bool {
 	switch state {
 	case "creating", "starting", "stopping", "rebuilding", "error", "failed":
 		return true

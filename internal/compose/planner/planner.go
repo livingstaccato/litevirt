@@ -72,6 +72,11 @@ type VMAction struct {
 	// RecreateReason says why an ActionRecreate update cannot keep the
 	// workload.
 	RecreateReason string
+	// Repair marks the retry of a VM a previous deploy left half-made whose
+	// disks exist: it is repaired in place (ActionRestart — the domain is
+	// redefined from the desired spec over the existing disks and started),
+	// never replaced. Retry marks any retry.
+	Repair, Retry bool
 }
 
 // DeviceAssignment is a pre-resolved PCI device allocation.
@@ -115,32 +120,54 @@ type DNSAction struct {
 	Deferred bool   // true = IP not known until VM boots (DHCP)
 }
 
-// updateMechanism picks how an update is applied (see VMAction.Apply) and,
-// for a recreate, why the workload cannot be kept.
-func updateMechanism(op compose.Op, a VMAction, haveStoredSpec bool) (compose.Action, string) {
+// updateMechanism picks how an update is applied (see VMAction.Apply), for a
+// recreate why the workload cannot be kept, and whether a retry is a repair.
+// hasDisks says disks are recorded for the VM.
+func updateMechanism(op compose.Op, a VMAction, haveStoredSpec, hasDisks bool) (compose.Action, string, bool) {
 	switch {
 	case a.IsContainer:
-		return compose.ActionRecreate, "containers have no in-place reconfigure"
-	case op.Retry:
-		return compose.ActionRecreate, "a previous deploy did not finish (" + strings.TrimPrefix(op.Detail, "retry ") + ")"
+		return compose.ActionRecreate, "containers have no in-place reconfigure", false
 	case !haveStoredSpec:
-		return compose.ActionRecreate, "the VM's stored spec could not be read"
+		return compose.ActionRecreate, "the VM's stored spec could not be read", false
 	}
+	var classified compose.Action
+	reason := ""
 	switch a.Plan.Max() {
 	case compose.ActionRecreate:
-		return compose.ActionRecreate, strings.Join(a.Plan.RecreateReasons, "; ")
+		classified, reason = compose.ActionRecreate, strings.Join(a.Plan.RecreateReasons, "; ")
 	case compose.ActionRestart:
 		if len(a.Plan.NotReconfigurable) > 0 {
-			return compose.ActionRecreate, strings.Join(a.Plan.NotReconfigurable, "; ") + " — not reconfigurable in place yet"
+			classified, reason = compose.ActionRecreate, strings.Join(a.Plan.NotReconfigurable, "; ")+" — not reconfigurable in place yet"
+		} else {
+			classified = compose.ActionRestart
 		}
-		return compose.ActionRestart, ""
 	default:
-		return compose.ActionLive, ""
+		classified = compose.ActionLive
+	}
+	if !op.Retry {
+		return classified, reason, false
+	}
+	// A retry: a previous deploy left the VM half-made. A change of identity
+	// in the file still replaces it (and says so); otherwise what exists is
+	// repaired, and only a VM of which nothing was made is created again.
+	switch {
+	case classified == compose.ActionRecreate:
+		return classified, reason, false
+	case hasDisks:
+		return compose.ActionRestart, "", true
+	default:
+		return compose.ActionRecreate, "nothing was made", false
 	}
 }
 
 // UpdateMechanismText is the plan's description of how an update is applied.
 func UpdateMechanismText(a VMAction) string {
+	switch {
+	case a.Repair:
+		return "retry — repaired in place, disks kept"
+	case a.Retry && a.Apply == compose.ActionRecreate && a.RecreateReason == "nothing was made":
+		return "retry — created again (nothing was made)"
+	}
 	switch a.Apply {
 	case compose.ActionRecreate:
 		if a.IsContainer {
@@ -302,7 +329,8 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 					action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
 				}
 			}
-			action.Apply, action.RecreateReason = updateMechanism(op, action, storedSpecByVM[op.VMName] != nil)
+			action.Retry = op.Retry
+			action.Apply, action.RecreateReason, action.Repair = updateMechanism(op, action, storedSpecByVM[op.VMName] != nil, state.RecordedDisks[op.VMName] > 0)
 			action.Detail += " — " + UpdateMechanismText(action)
 		}
 

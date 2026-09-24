@@ -32,8 +32,14 @@ type VMChecker struct {
 	// SKIPS the file marker — so the path would be untested by construction.
 	dataDir string
 	db      *corrosion.Client
-	virt    *lv.Client
-	bus     *events.Bus
+	// virt is nil when there is no libvirt connection (most tests). An
+	// interface, not *lv.Client, so a test can drive a restart through
+	// libvirtfake; NewVMChecker keeps a nil *lv.Client a nil interface.
+	virt vmCheckBackend
+	bus  *events.Bus
+	// now is the clock (nil → time.Now). A test seam: the start grace and the
+	// action backoff are minutes long.
+	now func() time.Time
 
 	mu          sync.Mutex
 	failures    map[string]int       // vmName → consecutive failures
@@ -48,6 +54,13 @@ type VMChecker struct {
 	// one per owned VM, reset whenever the VM's incarnation changes. Guarded
 	// by mu; created lazily so a literal VMChecker{} in a test stays usable.
 	tracks map[string]*probeTrack
+	// sightings is what the sweep last saw of each owned VM, and when it last
+	// saw one start (vmcheck_grace.go). Guarded by mu; created lazily.
+	sightings map[string]*vmSighting
+	// swept is set once a sweep has listed this host's VMs: a VM first seen
+	// after that has arrived here, one seen on the first sweep may have been
+	// running for weeks.
+	swept bool
 	// probeFn replaces the probe transport (SetProbeFunc). nil → the real
 	// tcp/http/ping/exec probe.
 	probeFn ProbeFunc
@@ -78,6 +91,28 @@ type VMChecker struct {
 	// PCI VM comes back with them bound. A strict NO-OP unless hardware_v2 is latched, so a
 	// pre-latch fleet's health-restart is byte-for-behavior unchanged. nil → no-op.
 	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
+}
+
+// vmCheckBackend is the subset of *lv.Client the VMChecker calls.
+// libvirtfake satisfies it too.
+type vmCheckBackend interface {
+	DomainState(name string) (string, error)
+	DomainStateReason(name string) (lv.DomainStatus, error)
+	HasManagedSaveImage(name string) (bool, error)
+	StartDomain(name string) error
+	DestroyDomain(name string) error
+	MigrateToTarget(name, dconnuri string, p lv.MigrateParams) error
+	ExecInGuest(name, command string, args []string) (string, error)
+	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
+	GetDomainOwnerEpoch(name string) (int64, bool, error)
+}
+
+// clock is the checker's time source.
+func (v *VMChecker) clock() time.Time {
+	if v.now != nil {
+		return v.now()
+	}
+	return time.Now()
 }
 
 // SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
@@ -164,24 +199,30 @@ func (v *VMChecker) publish(action, target, detail string) {
 
 // NewVMChecker creates a VM-level health checker for the local host.
 func NewVMChecker(hostName, dataDir string, db *corrosion.Client, virt *lv.Client) *VMChecker {
-	return &VMChecker{
+	v := &VMChecker{
 		hostName:      hostName,
 		dataDir:       dataDir,
 		db:            db,
-		virt:          virt,
 		failures:      make(map[string]int),
 		lastAction:    make(map[string]time.Time),
 		actionCount:   make(map[string]int),
 		activeActions: make(map[string]int),
 	}
+	if virt != nil {
+		v.virt = virt // a nil *lv.Client boxed here would pass every `v.virt != nil`
+	}
+	return v
 }
 
 // publishRunning routes a NON-MINTING transition through the marker chokepoint.
-// v.virt is a *lv.Client that is nil in most tests; a nil CONCRETE pointer boxed
-// into an interface is not a nil interface, which is what DomainEpochSetter's
-// usable() check exists for.
+// v.virt is nil in most tests, and a nil vmCheckBackend must reach
+// PublishRunningVia as a nil DomainEpochSetter, not as a boxed nil.
 func (v *VMChecker) publishRunning(ctx context.Context, name, state string, commit func(context.Context) error) error {
-	return PublishRunningVia(ctx, v.virt, v.db, v.dataDir, v.hostName, name, state, commit)
+	var setter DomainEpochSetter
+	if v.virt != nil {
+		setter = v.virt
+	}
+	return PublishRunningVia(ctx, setter, v.db, v.dataDir, v.hostName, name, state, commit)
 }
 
 // Start begins the sweep loop. Blocks until ctx is cancelled.
@@ -216,11 +257,13 @@ func (v *VMChecker) sweep(ctx context.Context) {
 	// counters mid-episode. Benign race: an in-flight async checkVM for a just-deleted
 	// VM can repopulate its key AFTER this prune; the next sweep re-prunes it — do NOT
 	// "fix" that by holding v.mu across the whole sweep.
+	now := v.clock()
 	current := make(map[string]bool, len(vms))
 	for i := range vms {
 		current[vms[i].Name] = true
 	}
 	v.pruneVMState(current)
+	v.observeStarts(vms, now)
 
 	// Pre-sweep: count how many VMs are in a failing state. If many are
 	// failing simultaneously, it's likely correlated (NFS outage, etc.) (#47).
@@ -229,7 +272,6 @@ func (v *VMChecker) sweep(ctx context.Context) {
 			"host", v.hostName)
 	}
 
-	now := time.Now()
 	durable := v.loadVerdicts(ctx)
 	for _, vm := range vms {
 		hspec := vmCheckSpec(&vm)
@@ -242,16 +284,14 @@ func (v *VMChecker) sweep(ctx context.Context) {
 		if !v.probeDue(vm, hspec, now) {
 			continue
 		}
-		// Grace period: a VM created less than 5 minutes ago is still
-		// finishing cloud-init, getting IPs, starting services, so a failed
-		// probe does not count toward the healthcheck's ACTION yet. The probe
-		// still runs and its verdict is still published: a depends-on or
-		// rolling-update wait on a just-created VM needs its first pass, and
-		// "not passing yet" is the truth about a VM that is still booting.
-		inGrace := false
-		if created, err := time.Parse(time.RFC3339, vm.CreatedAt); err == nil {
-			inGrace = now.Sub(created) < healthCheckGracePeriod
-		}
+		// Start grace: a VM created or started less than 5 minutes ago is
+		// still finishing cloud-init, getting IPs, starting services, so a
+		// failed probe does not count toward the healthcheck's ACTION yet.
+		// The probe still runs and its verdict is still published: a
+		// depends-on or rolling-update wait on a just-started VM needs its
+		// first pass, and "not passing yet" is the truth about a VM that is
+		// still booting.
+		inGrace := v.inStartGrace(vm, now)
 		v.probes.Add(1)
 		go func(vm corrosion.VMRecord) {
 			defer v.probes.Done()
@@ -339,6 +379,11 @@ func (v *VMChecker) pruneVMState(current map[string]bool) {
 			delete(v.tracks, name)
 		}
 	}
+	for name := range v.sightings {
+		if !current[name] {
+			delete(v.sightings, name)
+		}
+	}
 }
 
 // isCorrelatedFailure returns true if many VMs are failing simultaneously,
@@ -409,8 +454,8 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 	// wait progressively longer before acting again.
 	acts := v.actionCount[vm.Name]
 	if acts > 0 {
-		backoff := time.Duration(1<<min(acts, 6)) * 30 * time.Second // 30s, 60s, 120s, ... max ~32min
-		if last, ok := v.lastAction[vm.Name]; ok && time.Since(last) < backoff {
+		backoff := actionBackoff(acts)
+		if last, ok := v.lastAction[vm.Name]; ok && v.clock().Sub(last) < backoff {
 			v.mu.Unlock()
 			slog.Warn("vmcheck: action backoff active", "vm", vm.Name, "consecutive_actions", acts,
 				"next_eligible", last.Add(backoff).Format(time.RFC3339))
@@ -432,7 +477,7 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 	}
 
 	v.actionCount[vm.Name]++
-	v.lastAction[vm.Name] = time.Now()
+	v.lastAction[vm.Name] = v.clock()
 	v.mu.Unlock()
 
 	// Release the stack action slot when done.
@@ -445,6 +490,20 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 	}()
 
 	v.takeAction(ctx, vm, hspec)
+}
+
+// maxActionBackoff caps actionBackoff.
+const maxActionBackoff = 32 * time.Minute
+
+// actionBackoff is how long after its last action a VM that has had acts
+// consecutive actions without recovering must wait before the next one:
+// 1 min after the first, doubling per action, capped at maxActionBackoff.
+// A passing probe resets acts to 0.
+func actionBackoff(acts int) time.Duration {
+	if acts <= 0 {
+		return 0
+	}
+	return time.Duration(1<<min(acts, 6)) * 30 * time.Second
 }
 
 // probeRetries is the healthcheck's retries: consecutive failures before the
@@ -656,6 +715,9 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 			}
 			return
 		}
+		// The guest is booting again from here, whether or not the running
+		// publication below lands: its start grace begins now.
+		v.noteStarted(vm.Name, v.clock())
 		if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 			return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restarted by health checker")
 		}); err != nil {
@@ -964,6 +1026,7 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 		}
 		return
 	}
+	v.noteStarted(vm.Name, v.clock())
 	if err := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 		return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running", "restart policy: "+decision)
 	}); err != nil {

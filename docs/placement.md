@@ -7,8 +7,7 @@
 >   1. **Policy** — initial-placement scoring (where new VMs go).
 >   2. **Rebalancer mode** — day-2 reconciliation (does the engine react to ongoing imbalance?).
 >
-> Earlier the placement engine defaulted to bin-pack (the bug behind
-> "VMs pile onto a single host"). The cluster default is now
+> The cluster default is
 > **balance + dry-run**: spread by default, propose moves to operators
 > rather than acting unilaterally.
 
@@ -361,19 +360,17 @@ Rebalance executor (internal/grpcapi/, leader-gated):
 
 ---
 
-## Migrating from earlier defaults
+## Defaults and related surface
 
-If you were running litevirt before the placement-engine rewrite:
-
-- **The default placement policy changed from bin-pack to balance.** New VMs spread by default. To restore the old behavior cluster-wide:
+- **The default placement policy is balance.** New VMs spread by default. To pack VMs onto as few hosts as possible cluster-wide, with rebalancing off:
   ```yaml
   # /etc/litevirt/cluster.yaml
   placement: { policy: bin-pack, rebalance: { mode: off } }
   ```
-- The old `placement.spread: true` flag still works (translates to
-  `policy: spread-strict`). Migrate to `policy:` when convenient.
-- New tables: `rebalance_proposals`. Auto-created by the schema migration.
-- New gRPC: `ListRebalanceProposals`, `RunRebalance`,
+- The legacy `placement.spread: true` flag translates to
+  `policy: spread-strict`. Prefer `policy:`.
+- Tables: `rebalance_proposals`. Auto-created by the schema migration.
+- gRPC: `ListRebalanceProposals`, `RunRebalance`,
   `ApproveRebalanceProposal`, `RejectRebalanceProposal`.
-- New CLI: `lv rebalance` group.
-- New metrics: `litevirt_host_pressure`, `litevirt_rebalance_*`.
+- CLI: `lv rebalance` group.
+- Metrics: `litevirt_host_pressure`, `litevirt_rebalance_*`.

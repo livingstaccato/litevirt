@@ -44,9 +44,7 @@ devices rather than editing them itself.
 
 The per-VM Hardware tab (`/vms/{name}?tab=hardware`) is the single place to
 add, remove, or inspect disks, NICs, and PCI passthrough devices, on running
-and stopped VMs alike. Hotplug works for disks and NICs on running VMs. This
-tab replaces the Disks/Network/Devices panes that used to live in the VM
-Edit modal. If PCI adoption for the VM is blocked, the tab shows the reason
+and stopped VMs alike. Hotplug works for disks and NICs on running VMs. If PCI adoption for the VM is blocked, the tab shows the reason
 and hides the add/detach forms until it resolves.
 
 ## VNC Console
@@ -187,7 +185,7 @@ files in any file-based pool — `ListStoragePoolContents`, forwarded to the
 pool's owning host. Pick an ISO to fill the create form's installer field, or
 **upload** a file straight into the pool: the browser streams it to
 `UploadStoragePoolContent` (1 MiB chunks; written to a temp file then atomically
-renamed) so admins no longer need to `scp` ISOs onto hosts.
+renamed) so admins do not need to `scp` ISOs onto hosts.
 
 ## Load Balancer Management
 
@@ -347,7 +345,7 @@ Each running VM exposes two in-app consoles from its detail page:
 
 Both work across hosts: if the VM runs on a different host than the one serving
 the UI, the daemon forwards the stream to the owning host. When a session can't
-start, the console now shows the **reason** (instead of a bare "disconnected")
+start, the console shows the **reason**
 and a **Retry** button:
 
 | Message | Cause / fix |

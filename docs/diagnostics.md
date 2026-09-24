@@ -101,7 +101,7 @@ compares per-row metadata, and returns a classified report.
 | `missing_row` | Present on some nodes, absent on others. |
 | `tombstone_vs_live` | Tombstoned (soft-deleted) on some nodes, live on others. |
 | `terminal_vs_live` | A workload terminal (stopped/error) on some nodes, running on others. |
-| `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` no longer trips this. |
+| `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` does not trip this. |
 
 A divergence is reported **only when it persists across two samples** with
 unchanged per-node content hashes — an in-flight replication delta changes between
@@ -150,7 +150,7 @@ operation on the offending node:
    workload listing is unchanged and `lv doctor divergence` (and the cluster
    digest) have converged.
 
-> A pure column-order skew that previously mis-reported here classifies as
+> A pure column-order skew classifies as
 > row-content divergence when the positional (v1) digest is in force. The
 > order-invariant **digest_v2** (below) makes that skew hash identically across
 > nodes, preventing the recurrence entirely — enable it fleet-wide instead of
@@ -417,7 +417,7 @@ ids; a replicated legacy batch can lose LWW on its by-triple tombstone and its I
 back-pressures fail-closed against the peer's live row (safe — no corruption — but it stalls
 that sender's stream to the peer until the conflicting state is remediated and the blocked
 entry successfully retries; a later WAL entry cannot supersede an ordered entry stuck ahead
-of it). This is unchanged from before the canonical work; the reversible core below does not
+of it). The reversible core below does not
 resolve it.
 
 The one runtime behavior that ships is the **accept gate**: once `canonical_registry_v1` is

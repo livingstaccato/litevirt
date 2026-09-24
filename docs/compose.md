@@ -184,7 +184,7 @@ With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`,
 
 The unified `workloads:` map holds VMs *and* containers; the `kind:`
 discriminator selects the runtime. Entries without `kind:` (or `kind: vm`)
-behave exactly like a `vms:` entry. The legacy `vms:` map still works and is
+behave exactly like a `vms:` entry. The legacy `vms:` map is accepted and is
 folded into `workloads` with `kind: vm` at parse time.
 
 ```yaml
@@ -377,7 +377,7 @@ options (VNC via noVNC; SPICE-in-browser is on the roadmap).
           max-per-hour: 10
           window: off-hours         # named cluster time-window (planned)
 
-      # Legacy (still works; translates to policy=spread-strict):
+      # Legacy form (translates to policy=spread-strict):
       spread: true
 ```
 
@@ -453,10 +453,10 @@ Conditions:
 - `vm_started` — VM is in "running" state (default). Timeout: 5 minutes.
 - `vm_healthy` — the VM's `healthcheck` has **passed**. Timeout: 10 minutes.
   - The probe runs on the host that owns the VM, which publishes its verdict (`healthy`, `unhealthy` or `unknown`) to the cluster whenever it changes. The wait is met only by a `healthy` verdict for the VM **as it is now**: a pass recorded before the VM was restarted, recreated or migrated does not count, and neither does one from an owner host that is `offline`, `fenced` or in `maintenance` — a host that is down cannot take back its last pass, so the wait keeps waiting (the VM may yet fail over and pass on its new host).
-  - A VM with **no** `healthcheck` keeps the old meaning: running is healthy.
+  - A VM with **no** `healthcheck` is healthy once it is running.
   - A wait that times out says which VM and the last thing it saw, for example `timeout after 10m0s waiting for vm_healthy on db: healthcheck verdict unhealthy: tcp probe failing (3 consecutive): tcp 10.0.0.5:5432: connection refused`, or `... the last verdict (healthy) is from a previous incarnation of the VM; no probe of this one has passed yet`.
   - `lv inspect <vm>` shows the same verdict as `health` / `healthDetail`.
-  - Mixed versions: the node serving the deploy decides what `vm_healthy` means, and the VM's owner publishes the verdict. An older node serving a deploy still treats running as healthy; a newer one waiting on a VM with a `healthcheck` whose owner runs an older build sees no verdict and times out. Upgrade every node before relying on it.
+  - Mixed versions: the node serving the deploy decides what `vm_healthy` means, and the VM's owner publishes the verdict. An older node serving a deploy treats running as healthy; a newer one waiting on a VM with a `healthcheck` whose owner runs an older build sees no verdict and times out. Upgrade every node before relying on it.
 
 If a dependency wait times out, the dependency is reported as a failed action (an `error` line naming it) and the stack ends `degraded`, but the rest of the deploy still runs — it does not block the entire stack.
 

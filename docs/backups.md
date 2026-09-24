@@ -11,7 +11,7 @@ cross-repo sync, and live restore.
 VM advertises a QEMU guest agent, litevirt freezes the guest's filesystems
 (`fs-freeze`) for the brief moment the pull-mode session establishes its
 point-in-time, then thaws — yielding an **application-consistent** backup. Without a
-guest agent (or with `--quiesce off`) the backup is crash-consistent, as before.
+guest agent (or with `--quiesce off`) the backup is crash-consistent.
 A freeze failure is logged and the backup proceeds crash-consistent — it never fails
 an otherwise-good backup. Scheduled backups inherit the `auto` default.
 
@@ -254,7 +254,7 @@ way keeps its previous replicas and stops making new ones.
 
 A replica is also **published by rename**. The copy lands in a dotted
 `.partial` sibling and is renamed into its final name only once it has
-completed and is non-empty, so an interrupted run can no longer leave a
+completed and is non-empty, so an interrupted run cannot leave a
 truncated file under a name promotion would select.
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
@@ -454,7 +454,7 @@ schedule.
 ## Deprecated: raw full-disk backup/restore
 
 The legacy raw-stream RPCs `BackupVM`/`RestoreVM` (streaming a whole disk
-to/from the client) are **deprecated** and now return `Unimplemented`. Use the
+to/from the client) are **deprecated** and return `Unimplemented`. Use the
 snapshot path instead — it is incremental, deduplicated, repo-backed, scoped to
 the VM's project via path RBAC, and quota-aware:
 
@@ -469,7 +469,7 @@ Restore destinations are a pool-relative filename by default; a custom absolute
 
 - **gRPC `BackupSnapshot` + `RestoreFromBackup` + `RestoreLive`** —
   the CLI commands are thin wrappers; programmatic clients can call
-  the RPCs directly. A cross-host VM no longer needs a re-run against
+  the RPCs directly. A cross-host VM does not need a re-run against
   its owning daemon: the daemon you call (which owns the repo) has the
   owning host read the disk locally and **stream the manifest back**
   over peer mTLS (see *Peer streaming* below). A direct absolute

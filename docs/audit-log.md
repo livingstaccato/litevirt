@@ -56,8 +56,8 @@ Two columns join the audit row to the chain:
 
 The first row of each host's sub-chain has `prev_hash = NULL`. Rows with a NULL
 `content_hash` (written before the chain columns existed) **and** rows with no
-host identity (background-context writes such as the failover coordinator's, now
-stamped with the host going forward) are treated as **chain-reset points** —
+host identity (background-context writes such as the failover coordinator's, from
+builds that did not stamp the host) are treated as **chain-reset points** —
 verification accepts them without a linkage check and continues. So audit logs
 migrated from older binaries don't reject; they just have unverified gaps.
 
@@ -66,11 +66,11 @@ is entirely unsigned**: rows written under the pre-v1.0.16 global-chain model ar
 re-linked per host the first time the upgraded daemon runs, so `verify` passes
 after a rolling upgrade without operator action.
 
-The moment one signed row exists, the reseal stops touching that host. It used to
-run unconditionally, and that was the single largest hole in the whole design —
+The moment one signed row exists, the reseal stops touching that host. An
+unconditional reseal would be the single largest hole in the whole design —
 reseal recomputes hashes from whatever the rows currently say, so an attacker with
 database write access could edit a row, wait for a restart, and have the daemon
-itself rewrite the chain around the edit. `verify` then came back clean. A signed
+itself rewrite the chain around the edit. `verify` would then come back clean. A signed
 row is never resealed, locally or via replication, and the guard lives in the SQL
 as well as the caller because peers apply that statement by primary key.
 
@@ -314,7 +314,7 @@ simply changed their mind. The two are told apart by who can still sign:
 
 - **Ordinary rollback** — set `enforcement.audit_signature: false` and restart.
   The daemon signs its own retirement at the sequence its chain had reached.
-  Rows up to there stay verifiable; rows after it are unsigned and are no longer
+  Rows up to there stay verifiable; rows after it are unsigned and are not
   treated as evidence. No command needed.
 - **The host cannot sign one** — key lost or unreadable, machine destroyed,
   decommission:
@@ -471,10 +471,10 @@ which is the one failure an attestation must not have. The page size exists
 because the response is a unary gRPC message against a 64 MiB server cap, and a
 chain worth attesting to is larger than that.
 
-One limit remains, and it is inherent: `--since` / `--until` bound the window
+One limit exists, and it is inherent: `--since` / `--until` bound the window
 by timestamp, so a window starting mid-chain exports a fragment whose first
 row links to a row outside it. Narrow the window to answer a question about a
-period; export the whole chain to attest to it. Size is no longer a reason to
+period; export the whole chain to attest to it. Size is not a reason to
 narrow it.
 
 Pair with the cluster's storage offload (Ceph snapshot, ZFS send to a

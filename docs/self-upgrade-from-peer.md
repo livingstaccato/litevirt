@@ -1,9 +1,9 @@
 # Self-upgrade from a peer (auto-catch-up)
 
-> **v50 is a coordinated major upgrade.** The v50 release replaces the health,
-> runtime-inventory, and capacity RPC surface outright (no mixed-version
-> compatibility): `GetHostHealth`, `ReportRuntime`, `CheckVMRuntime`,
-> `CheckContainerRuntime`, and `ClusterStatus.alerts` are gone, and every
+> **v50 is a coordinated major upgrade.** From v50 the health,
+> runtime-inventory, and capacity RPC surface has no mixed-version
+> compatibility: `GetHostHealth`, `ReportRuntime`, `CheckVMRuntime`,
+> `CheckContainerRuntime`, and `ClusterStatus.alerts` do not exist, and every
 > consumer reads `GetClusterHealth` / `GetRuntimeInventory`. Upgrade the whole
 > cluster together — take a consistent database backup first, then replace
 > every daemon and client in one campaign. Stored data migrates automatically

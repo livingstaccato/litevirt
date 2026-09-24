@@ -136,6 +136,9 @@ with the cluster's network table every 30 seconds, and at startup:
 - a network it has not set up yet is provisioned (bridge, gateway, `dnsmasq`,
   VXLAN, NAT). This is how a network reaches the other nodes, a node that joins
   later, and a node that restarted (`dnsmasq` dies with the daemon).
+- a network it set up but has since lost is provisioned again: its bridge is
+  gone, or its `dnsmasq` died. The check reads the kernel's interface table and
+  the `dnsmasq` pidfile, so it costs no commands per pass.
 - a deleted network is torn down. This is how `lv network delete` and a stack
   delete reach every node, including one that was down at the time: it tears
   down when it comes back.

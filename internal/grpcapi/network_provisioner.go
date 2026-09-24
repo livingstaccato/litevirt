@@ -18,6 +18,10 @@ import (
 type NetworkProvisioner interface {
 	Provision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error)
 	Deprovision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error
+	// Provisioned reports whether this host still has what Provision set up
+	// for the network (its bridge, and its dnsmasq where one runs). It must
+	// be cheap: the network reconciler asks it for every network every pass.
+	Provisioned(name string, def compose.NetworkDef) bool
 }
 
 type hostNetworkProvisioner struct{}
@@ -28,6 +32,10 @@ func (hostNetworkProvisioner) Provision(ctx context.Context, db *corrosion.Clien
 
 func (hostNetworkProvisioner) Deprovision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error {
 	return network.Deprovision(ctx, db, name, def, hostName)
+}
+
+func (hostNetworkProvisioner) Provisioned(name string, def compose.NetworkDef) bool {
+	return network.ProvisionedHere(name, def)
 }
 
 // SetNetworkProvisioner replaces the host network provisioner (tests only;

@@ -81,6 +81,10 @@ vms:
       action: "restart"
 ```
 
+## Images
+
+An `images:` entry's `source` is downloaded at deploy time only when no host in the cluster holds a ready copy of the image. When one does — on the host serving the deploy or on a peer — that copy is used: the VM's host pulls it from the peer when the VM is created. A `checksum` in the entry must then match the checksum recorded for that copy; a mismatch, or a copy with no recorded checksum, fails the deploy with both checksums named, and the source is never downloaded over it. Correct the checksum, or remove the image with `lv image rm` so the source is downloaded again.
+
 ## Deploy and manage
 
 ```bash

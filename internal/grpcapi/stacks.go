@@ -136,14 +136,15 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		}
 	}
 
+	failures := newDeployFailures(stream)
 	if rollingStrategy != "" && hasUpdates {
 		// Rolling update mode: creates first, then rolling updates, then deletes.
-		if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err != nil {
+		if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, failures); err != nil {
 			return err
 		}
 	} else {
 		// Inline mode: process all actions sequentially (existing behavior).
-		if err := s.executeInlineActions(ctx, f, resolved, stream); err != nil {
+		if err := s.executeInlineActions(ctx, f, resolved, stream, failures); err != nil {
 			return err
 		}
 	}
@@ -151,28 +152,52 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// Apply LB actions.
 	s.applyLBActions(ctx, f, resolved, stream)
 
-	// Persist stack record.
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
-	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
-		Name:        f.Name,
-		ComposeHash: hash,
-		ComposeYAML: req.ComposeYaml,
-		State:       "active",
-	}); dbErr != nil {
-		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
-	}
-
 	vmOps := 0
 	for _, a := range resolved.VMs {
 		if a.Kind != planner.OpNoChange {
 			vmOps++
 		}
 	}
+
+	// Persist stack record. The new compose file IS recorded even when some
+	// actions failed — the actions that succeeded applied it, and it is the
+	// desired state a re-run converges to — but the stack is "degraded", not
+	// "active". A re-run retries the failed actions because the planner diffs
+	// the compose file against the live workloads, not against this record.
+	stackState := stackStateActive
+	if len(failures.names) > 0 {
+		stackState = stackStateDegraded
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
+	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name:        f.Name,
+		ComposeHash: hash,
+		ComposeYAML: req.ComposeYaml,
+		State:       stackState,
+	}); dbErr != nil {
+		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
+	}
+
+	if len(failures.names) > 0 {
+		detail := fmt.Sprintf("%d of %d VM ops failed (%s)",
+			len(failures.names), max(vmOps, len(failures.names)), strings.Join(failures.names, ", "))
+		s.publish("stack.degraded", f.Name, detail)
+		s.audit(ctx, "stack.deploy", f.Name, detail, "error")
+		return nil
+	}
 	s.publish("stack.deployed", f.Name, fmt.Sprintf("%d VM ops, %d network ops, %d LB ops",
 		vmOps, len(resolved.Networks), len(resolved.LBs)))
 	s.audit(ctx, "stack.deploy", f.Name, fmt.Sprintf("%d VM ops", vmOps), "ok")
 	return nil
 }
+
+// Stack record states. "deleting" is set by DeleteStack and retried by the
+// StackReconciler; "degraded" means the last deploy recorded the compose file
+// but at least one of its VM actions failed, so the stack has not converged.
+const (
+	stackStateActive   = "active"
+	stackStateDegraded = "degraded"
+)
 
 // persistStackFirewall writes a compose file's distributed-firewall config to
 // Corrosion: security groups (+ rules), ip sets, cluster-tier rules, and the
@@ -755,7 +780,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	corrosion.SoftDeleteLBBackends(ctx, s.db, lbName)
 	_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
 
+	// hadFailures keeps the stack in "deleting"; notRemoved names what is left,
+	// for the audit row.
 	hadFailures := false
+	var notRemoved []string
 	for _, vm := range vms {
 		if err := stream.Send(&pb.DeleteProgress{
 			VmName: vm.Name,
@@ -767,6 +795,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		delErr := s.deleteVMWithFanout(ctx, vm.Name, req.KeepDisks)
 		if delErr != nil {
 			hadFailures = true
+			notRemoved = append(notRemoved, vm.Name)
 			slog.Warn("stack delete vm failed", "vm", vm.Name, "error", delErr)
 			if sendErr := stream.Send(&pb.DeleteProgress{
 				VmName: vm.Name,
@@ -792,11 +821,23 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	containers, ctErr := corrosion.ListContainersByStack(ctx, s.db, req.Name)
 	if ctErr != nil {
 		hadFailures = true
+		notRemoved = append(notRemoved, "containers (list failed)")
 		slog.Warn("stack delete: list containers failed", "stack", req.Name, "error", ctErr)
+		// Every failure that keeps the stack "deleting" goes on the stream too:
+		// it ends OK either way, so an "error" status is the only way a client
+		// can tell the teardown was incomplete.
+		if sendErr := stream.Send(&pb.DeleteProgress{
+			VmName: "containers (list failed)",
+			Status: "error",
+			Error:  "list the stack's containers: " + ctErr.Error(),
+		}); sendErr != nil {
+			return sendErr
+		}
 	}
 	for _, ct := range containers {
 		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); delErr != nil {
 			hadFailures = true
+			notRemoved = append(notRemoved, ct.Name)
 			slog.Warn("stack delete container failed", "container", ct.Name, "host", ct.HostName, "error", delErr)
 			if sendErr := stream.Send(&pb.DeleteProgress{VmName: ct.Name, Status: "error", Error: delErr.Error()}); sendErr != nil {
 				return sendErr
@@ -835,7 +876,15 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			}
 			if err := s.deprovisionNetworkByName(ctx, nr.Name); err != nil {
 				hadFailures = true
+				notRemoved = append(notRemoved, "network "+nr.Name)
 				slog.Warn("stack network deprovision failed", "network", nr.Name, "error", err)
+				if sendErr := stream.Send(&pb.DeleteProgress{
+					VmName: "network " + nr.Name,
+					Status: "error",
+					Error:  "deprovision network: " + err.Error(),
+				}); sendErr != nil {
+					return sendErr
+				}
 			}
 		}
 	}
@@ -872,6 +921,11 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		s.publish("stack.deleted", req.Name, fmt.Sprintf("%d VMs", len(vms)))
 	}
 
+	if hadFailures {
+		s.audit(ctx, "stack.delete", req.Name,
+			"incomplete, left in deleting for the reconciler; not removed: "+strings.Join(notRemoved, ", "), "error")
+		return nil
+	}
 	s.audit(ctx, "stack.delete", req.Name, "", "ok")
 	return nil
 }
@@ -1322,11 +1376,30 @@ func highestDependencyCondition(vmName string, ops []compose.Op) string {
 	return best
 }
 
-// waitForCondition polls until a VM reaches the specified condition or times out.
+// waitForCondition waits for a depends-on condition ("vm_started" or
+// "vm_healthy", the compose depends-on vocabulary) with that condition's
+// default timeout.
 func (s *Server) waitForCondition(ctx context.Context, vmName, condition string) error {
 	timeout := 5 * time.Minute
 	if condition == "vm_healthy" {
 		timeout = 10 * time.Minute
+	}
+	if d := s.dependsOnWaitTimeout.Load(); d > 0 {
+		timeout = time.Duration(d)
+	}
+	return s.waitForConditionWithin(ctx, vmName, condition, timeout)
+}
+
+// waitForConditionWithin polls until vmName satisfies condition or timeout
+// elapses. condition must be "vm_started" or "vm_healthy": anything else is
+// refused at once, because a condition that matches no branch can never be
+// met and would only spin until the deadline (the rolling health wait used to
+// pass "healthy:<dur>" and fail every update exactly that way).
+func (s *Server) waitForConditionWithin(ctx context.Context, vmName, condition string, timeout time.Duration) error {
+	switch condition {
+	case "vm_started", "vm_healthy":
+	default:
+		return fmt.Errorf("unknown wait condition %q for %s (want vm_started or vm_healthy)", condition, vmName)
 	}
 
 	deadline := time.Now().Add(timeout)
@@ -1359,7 +1432,7 @@ func (s *Server) waitForCondition(ctx context.Context, vmName, condition string)
 		time.Sleep(2 * time.Second)
 	}
 
-	return fmt.Errorf("timeout waiting for %s on %s", condition, vmName)
+	return fmt.Errorf("timeout after %s waiting for %s on %s", timeout, condition, vmName)
 }
 
 // autoPullImages checks each image referenced by VMs in the compose file. If

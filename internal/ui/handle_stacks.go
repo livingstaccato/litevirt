@@ -2,9 +2,11 @@ package ui
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -186,11 +188,45 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Consume the stream to completion.
+	// Consume the stream to completion, counting failures the way `lv compose
+	// down` does: DeleteStack reports anything it could not remove as an
+	// "error" status and still ends the stream OK, leaving the stack
+	// "deleting" for the daemon to retry. That is not "destroyed".
+	var failed, seen []string
+	seenItem := map[string]bool{}
+	var streamErr error
 	for {
-		if _, err := stream.Recv(); err != nil {
+		p, err := stream.Recv()
+		if err != nil {
+			if err != io.EOF {
+				streamErr = err
+			}
 			break
 		}
+		item := p.VmName
+		if item == "" && p.Status == "error" {
+			item = "stack resource"
+		}
+		if item != "" && !seenItem[item] {
+			seenItem[item] = true
+			seen = append(seen, item)
+		}
+		if p.Status == "error" {
+			failed = append(failed, item+": "+p.Error)
+		}
+	}
+	if streamErr != nil {
+		slog.Error("UI: destroy stack stream failed", "stack", name, "error", streamErr)
+		sendToast(w, "Destroy of stack '"+name+"' did not complete: "+streamErr.Error(), "error")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if len(failed) > 0 {
+		slog.Warn("UI: destroy stack incomplete", "stack", name, "failures", failed)
+		sendToast(w, fmt.Sprintf("Stack '%s' not fully destroyed: %d of %d deletions failed (%s). It is left deleting and the daemon retries the teardown.",
+			name, len(failed), len(seen), strings.Join(failed, "; ")), "error")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
 
 	w.Header().Set("HX-Redirect", "/stacks")

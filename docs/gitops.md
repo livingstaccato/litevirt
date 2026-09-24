@@ -27,8 +27,14 @@ The controller:
 3. For each file, calls `DiffStack` against the daemon. If the diff
    reports zero mutation-bearing entries, skips the deploy entirely —
    a whitespace-only repo bump doesn't redeploy.
-4. For files with non-empty diffs, calls `DeployStack` and streams
-   progress to its own stderr.
+4. For files with non-empty diffs, calls `DeployStack` and reads its
+   progress stream to the end. A deploy reports each failed VM action
+   in-band and carries on with the rest of the plan, so the controller
+   collects every failure and marks the file failed with all of them
+   (`deploy: 2 failure(s): web-1: ...; web-3: ...`), rather than stopping
+   at the first. It never stops reading early: a client that walks away
+   from the stream cancels the server-side deploy, abandoning every action
+   planned after the failure and leaving the stack record unwritten.
 5. On completion, posts a markdown comment back to the commit via
    `gh api repos/<owner>/<repo>/commits/<sha>/comments` if `gh` is
    installed on the controller's host. Falls back to a `slog.Info`

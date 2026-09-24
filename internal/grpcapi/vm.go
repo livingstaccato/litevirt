@@ -1923,9 +1923,22 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 
-	// Stop if running
-	if vm.State == "running" {
-		s.virt.DestroyDomain(req.Name)
+	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
+	// paused — which the row does not call "running") survives the undefine
+	// below as a transient domain that keeps running, and the disks would then be
+	// freed under a live guest whose row is gone. A stop that fails while the
+	// domain is still active therefore fails the delete, before anything is
+	// removed.
+	active, activeErr := s.virt.DomainIsActive(req.Name)
+	destroyed := false
+	if vm.State == "running" || activeErr != nil || active {
+		if err := s.virt.DestroyDomain(req.Name); err != nil {
+			if still, serr := s.virt.DomainIsActive(req.Name); serr != nil || still {
+				return nil, status.Errorf(codes.Internal,
+					"cannot delete VM %q: could not stop its domain, so nothing was removed (retry is safe): %v", req.Name, err)
+			}
+		}
+		destroyed = true
 	}
 
 	// Release PCI passthrough devices and unbind from vfio-pci. releaseDevices is strict
@@ -1966,16 +1979,34 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// name-keyed and DomainUndefineNvram would delete it — bricking the retained
 	// BitLocker disk); the explicit WipeFirmwareState in the !KeepDisks branch
 	// below handles true delete (G1).
+	//
+	// A failed undefine FAILS THE DELETE, before the disks and the row go. The
+	// row is the cluster's only handle on this domain: tombstoning it over a
+	// domain that is still defined orphans the domain on this host with nothing
+	// that names it, and freeing the disks would leave that domain pointing at
+	// files that no longer exist. Returning keeps the delete retryable — the only
+	// destructive step so far is the stop above.
+	var undefErr error
 	if req.KeepDisks {
-		if err := s.virt.UndefineDomainPreservingState(req.Name); err != nil {
-			slog.Warn("failed to undefine domain (keep-disks)", "vm", req.Name, "error", err)
-		}
+		undefErr = s.virt.UndefineDomainPreservingState(req.Name)
 	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
 		slog.Warn("failed to undefine domain", "vm", req.Name, "error", err)
 		// Retry without flags in case the domain has no managed save/snapshots.
-		if err2 := s.virt.UndefineDomain(req.Name, false); err2 != nil {
-			slog.Error("failed to undefine domain (retry)", "vm", req.Name, "error", err2)
+		undefErr = s.virt.UndefineDomain(req.Name, false)
+	}
+	if undefErr != nil && s.virt.DomainExists(req.Name) {
+		slog.Error("DeleteVM: domain could not be undefined; keeping the VM record", "vm", req.Name, "error", undefErr)
+		if destroyed {
+			// The domain is down; say so, and make the stop stick so no
+			// restart policy brings back a VM that is being deleted.
+			if werr := s.persistVMState(ctx, req.Name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+				slog.Warn("DeleteVM: recording the stop of a VM whose undefine failed also failed", "vm", req.Name, "error", werr)
+			}
 		}
+		s.audit(ctx, "vm.delete", req.Name, "undefine failed: "+undefErr.Error(), "error")
+		return nil, status.Errorf(codes.Internal,
+			"cannot delete VM %q: its libvirt domain could not be undefined, so its record and disks were kept (retry is safe): %v",
+			req.Name, undefErr)
 	}
 
 	// Delete disks unless keep-disks. Free each disk at its RECORDED location

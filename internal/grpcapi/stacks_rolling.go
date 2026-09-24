@@ -104,8 +104,14 @@ func (o *serverOps) StartVM(ctx context.Context, name string) error {
 	return err
 }
 
+// WaitHealthy is the rolling engine's health wait: the depends-on "vm_healthy"
+// condition, bounded by the strategy's health-wait rather than depends-on's
+// ten-minute default.
 func (o *serverOps) WaitHealthy(ctx context.Context, name string, timeout time.Duration) error {
-	return o.s.waitForCondition(ctx, name, fmt.Sprintf("healthy:%s", timeout))
+	if err := o.s.waitForConditionWithin(ctx, name, "vm_healthy", timeout); err != nil {
+		return fmt.Errorf("%s did not become healthy within health-wait %s: %w", name, timeout, err)
+	}
+	return nil
 }
 
 // useRollingUpdate returns the update strategy if the compose file specifies
@@ -134,9 +140,59 @@ func vmUpdateDef(f *compose.File, name string) compose.UpdateDef {
 	return compose.UpdateDef{Strategy: "recreate"}
 }
 
+// deployFailures collects the VM actions of one deploy that failed, in the
+// order they failed. Each failure is also sent to the client as an "error"
+// progress message naming the VM — the stream itself still ends OK, so that
+// message is the only way a client can count it — and the set decides the
+// stack's stored state and audit result.
+type deployFailures struct {
+	stream grpc.ServerStreamingServer[pb.DeployProgress]
+	names  []string
+	seen   map[string]bool
+}
+
+func newDeployFailures(stream grpc.ServerStreamingServer[pb.DeployProgress]) *deployFailures {
+	return &deployFailures{stream: stream, seen: map[string]bool{}}
+}
+
+// fail records vm as failed and sends its "error" phase. The returned error is
+// a stream send failure only.
+func (d *deployFailures) fail(vm string, err error) error {
+	if !d.seen[vm] {
+		d.seen[vm] = true
+		d.names = append(d.names, vm)
+	}
+	return d.stream.Send(&pb.DeployProgress{Phase: "error", VmName: vm, Error: err.Error()})
+}
+
+// deleteWorkloadIgnoringGone deletes a planned workload, treating NotFound as
+// success: the plan wanted it gone and it is.
+func (s *Server) deleteWorkloadIgnoringGone(ctx context.Context, a planner.VMAction) error {
+	if err := s.deleteWorkload(ctx, a); err != nil && status.Code(err) != codes.NotFound {
+		return err
+	}
+	return nil
+}
+
+// waitDependsOn waits for a just-created VM to satisfy the condition its
+// dependents need. A wait that fails is a failed action: the VM is not in the
+// state the rest of the stack was told to expect.
+func (s *Server) waitDependsOn(ctx context.Context, action planner.VMAction, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
+	_ = stream.Send(&pb.DeployProgress{
+		Phase:  "waiting",
+		VmName: action.VMName,
+		Detail: fmt.Sprintf("waiting for %s", action.WaitFor),
+	})
+	if err := s.waitForCondition(ctx, action.VMName, action.WaitFor); err != nil {
+		return fmt.Errorf("depends-on wait for %s: %w", action.WaitFor, err)
+	}
+	return nil
+}
+
 // executeInlineActions processes all VM actions sequentially using inline
-// delete-then-create for updates (the original behavior).
-func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, resolved *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
+// delete-then-create for updates (the original behavior). Failed actions are
+// recorded in failures; the returned error is a stream failure only.
+func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, resolved *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress], failures *deployFailures) error {
 	for _, action := range resolved.VMs {
 		if action.Kind == planner.OpNoChange {
 			continue
@@ -154,49 +210,51 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 		case planner.OpCreate:
 			if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 				slog.Warn("deploy create failed", "vm", action.VMName, "host", action.TargetHost, "error", vmErr)
-				if sendErr := stream.Send(&pb.DeployProgress{
-					Phase:  "error",
-					VmName: action.VMName,
-					Error:  vmErr.Error(),
-				}); sendErr != nil {
+				if sendErr := failures.fail(action.VMName, vmErr); sendErr != nil {
 					return sendErr
 				}
 				continue
 			}
 
 			if action.WaitFor != "" {
-				_ = stream.Send(&pb.DeployProgress{
-					Phase:  "waiting",
-					VmName: action.VMName,
-					Detail: fmt.Sprintf("waiting for %s", action.WaitFor),
-				})
-				if err := s.waitForCondition(ctx, action.VMName, action.WaitFor); err != nil {
-					slog.Warn("depends-on wait failed, continuing", "vm", action.VMName, "error", err)
+				if err := s.waitDependsOn(ctx, action, stream); err != nil {
+					slog.Warn("depends-on wait failed", "vm", action.VMName, "error", err)
+					if sendErr := failures.fail(action.VMName, err); sendErr != nil {
+						return sendErr
+					}
+					continue
 				}
 			}
 
 		case planner.OpUpdate:
 			// Recreate: delete then re-create. For containers (no in-place
 			// reconfigure yet) this is the update strategy; deleteWorkload +
-			// deployCreatePlanned route by workload kind.
-			if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+			// deployCreatePlanned route by workload kind. A delete that could
+			// not tear the workload down must NOT be followed by a create: the
+			// old runtime may still be alive (the same rule as
+			// serverOps.recreateAs).
+			if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 				slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
+				if sendErr := failures.fail(action.VMName, fmt.Errorf("delete before recreate: %w", delErr)); sendErr != nil {
+					return sendErr
+				}
+				continue
 			}
 			if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 				slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)
-				if sendErr := stream.Send(&pb.DeployProgress{
-					Phase:  "error",
-					VmName: action.VMName,
-					Error:  vmErr.Error(),
-				}); sendErr != nil {
+				if sendErr := failures.fail(action.VMName, vmErr); sendErr != nil {
 					return sendErr
 				}
 				continue
 			}
 
 		case planner.OpDelete:
-			if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+			if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 				slog.Warn("deploy delete failed", "workload", action.VMName, "error", delErr)
+				if sendErr := failures.fail(action.VMName, delErr); sendErr != nil {
+					return sendErr
+				}
+				continue
 			}
 		}
 
@@ -214,7 +272,7 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 // executeWithRollingUpdates partitions the plan into creates, updates, and
 // deletes. Creates execute first (scale-up), then updates are delegated to
 // the rolling update engine, then deletes execute (scale-down).
-func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File, resolved *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress]) error {
+func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File, resolved *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress], failures *deployFailures) error {
 	var creates, updates, ctUpdates, deletes []planner.VMAction
 	for _, a := range resolved.VMs {
 		switch a.Kind {
@@ -240,13 +298,14 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 
 		if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 			slog.Warn("deploy create failed", "vm", action.VMName, "error", vmErr)
-			_ = stream.Send(&pb.DeployProgress{Phase: "error", VmName: action.VMName, Error: vmErr.Error()})
+			_ = failures.fail(action.VMName, vmErr)
 			continue
 		}
 		if action.WaitFor != "" {
-			_ = stream.Send(&pb.DeployProgress{Phase: "waiting", VmName: action.VMName, Detail: fmt.Sprintf("waiting for %s", action.WaitFor)})
-			if err := s.waitForCondition(ctx, action.VMName, action.WaitFor); err != nil {
-				slog.Warn("depends-on wait failed, continuing", "vm", action.VMName, "error", err)
+			if err := s.waitDependsOn(ctx, action, stream); err != nil {
+				slog.Warn("depends-on wait failed", "vm", action.VMName, "error", err)
+				_ = failures.fail(action.VMName, err)
+				continue
 			}
 		}
 		_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: action.VMName, ProgressPct: 100})
@@ -256,12 +315,14 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 	// containers). delete-then-create on the resolved host.
 	for _, action := range ctUpdates {
 		_ = stream.Send(&pb.DeployProgress{Phase: "applying", VmName: action.VMName, Detail: action.Detail})
-		if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+		if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 			slog.Warn("rolling update: container delete failed", "workload", action.VMName, "error", delErr)
+			_ = failures.fail(action.VMName, fmt.Errorf("delete before recreate: %w", delErr))
+			continue
 		}
 		if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 			slog.Warn("rolling update: container recreate failed", "workload", action.VMName, "error", vmErr)
-			_ = stream.Send(&pb.DeployProgress{Phase: "error", VmName: action.VMName, Error: vmErr.Error()})
+			_ = failures.fail(action.VMName, vmErr)
 			continue
 		}
 		_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: action.VMName, ProgressPct: 100})
@@ -321,8 +382,10 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 	// Execute deletes (scale-down).
 	for _, action := range deletes {
 		_ = stream.Send(&pb.DeployProgress{Phase: "applying", VmName: action.VMName, Detail: action.Detail})
-		if delErr := s.deleteWorkload(ctx, action); delErr != nil {
+		if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 			slog.Warn("deploy delete failed", "workload", action.VMName, "error", delErr)
+			_ = failures.fail(action.VMName, delErr)
+			continue
 		}
 		_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: action.VMName, ProgressPct: 100})
 	}

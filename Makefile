@@ -112,7 +112,7 @@ ci-guards:
 	go run ./scripts/ci/runningcheck -root .
 	go test ./scripts/ci/runningcheck/
 	go test ./internal/corrosion/ -run 'TestSchemaHistoryDocumentsCurrentVersion|TestHistoricalLedgerComplete|TestHistoricalLedgerNonEmpty|TestSupportedReleaseFamilyManifest|TestLegacyTransformerManifest|TestCompatibilityDigestFrozen'
-	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestDocsDocumentEvery|TestValidateInvocation|TestResolveInvocation|TestCheckIdentifier|TestExtractInvocations'
+	go test ./cmd/litevirt/ -run 'TestDocsReferenceReal|TestDocsUseRealFlags|TestUnknownFlag|TestDocsDocumentEvery|TestValidateInvocation|TestResolveInvocation|TestCheckIdentifier|TestExtractInvocations'
 
 build-e2e:
 	CGO_ENABLED=0 go test -c -ldflags="$(LDFLAGS)" -o bin/e2e-test ./tests/e2e/

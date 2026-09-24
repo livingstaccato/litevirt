@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -91,4 +92,11 @@ func (s *Server) RecordSelfReportedIsolationForTest(ctx context.Context) {
 func (s *Server) SetWALQuarantinedForTest(on bool) {
 	fn := func() bool { return on }
 	s.walQuarantined.Store(&fn)
+}
+
+// SetDependsOnWaitTimeoutForTests shortens waitForCondition's timeout so a
+// fleet scenario can reach a failed compose depends-on wait without waiting
+// the production 5-10 minutes. Zero restores the default.
+func (s *Server) SetDependsOnWaitTimeoutForTests(d time.Duration) {
+	s.dependsOnWaitTimeout.Store(int64(d))
 }

@@ -34,6 +34,7 @@ type deployClient struct {
 	pb.LiteVirtClient
 	plan     []*pb.DeployProgress
 	progress []*pb.DeployProgress
+	teardown []*pb.DeleteProgress
 	applied  bool // a non-dry-run DeployStack was issued
 	deleted  bool // DeleteStack was issued
 }
@@ -52,7 +53,7 @@ func (d *deployClient) ListVMs(_ context.Context, _ *pb.ListVMsRequest, _ ...grp
 
 func (d *deployClient) DeleteStack(_ context.Context, _ *pb.DeleteStackRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DeleteProgress], error) {
 	d.deleted = true
-	return &fakeStream[pb.DeleteProgress]{}, nil
+	return &scriptedStream[pb.DeleteProgress]{msgs: append([]*pb.DeleteProgress(nil), d.teardown...)}, nil
 }
 
 const hbCompose = "name: hb\nvms:\n  ha1:\n    image: ubuntu\n    cpu: 1\n    memory: 512\n  ha2:\n    image: ubuntu\n    cpu: 1\n    memory: 512\n"
@@ -234,5 +235,82 @@ func TestComposeDown_TTYStillPrompts(t *testing.T) {
 	}
 	if !spy.deleted {
 		t.Errorf("tty compose down answered y did not delete:\n%s", out)
+	}
+}
+
+// TestComposeDown_FailedDeleteIsNotReportedAsTornDown: DeleteStack reports a
+// per-VM failure as an "error" status and still ends the stream OK. The CLI
+// printed the error and then `Stack "hb" torn down.` with exit 0, although the
+// VM was still there and the stack was left "deleting".
+func TestComposeDown_FailedDeleteIsNotReportedAsTornDown(t *testing.T) {
+	spy := &deployClient{teardown: []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "deleted"},
+		{VmName: "ha2", Status: "deleting"},
+		{VmName: "ha2", Status: "error", Error: "an operation is in progress"},
+	}}
+	out, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err == nil {
+		t.Fatalf("compose down with a failed delete returned nil error (exit 0); stdout:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), `stack "hb": 1 of 2 deletions failed (ha2)`) {
+		t.Errorf("error does not summarise the failure: %v", err)
+	}
+	if strings.Contains(out, "torn down.") {
+		t.Errorf("a failed teardown was reported as torn down:\n%s", out)
+	}
+}
+
+// TestComposeDown_AllSucceedStillSaysTornDown pins the unchanged success path.
+func TestComposeDown_AllSucceedStillSaysTornDown(t *testing.T) {
+	spy := &deployClient{teardown: []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "deleted"},
+	}}
+	out, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err != nil {
+		t.Fatalf("successful teardown returned error: %v", err)
+	}
+	if !strings.Contains(out, "Stack \"hb\" torn down.\n") {
+		t.Errorf("success line missing:\n%s", out)
+	}
+}
+
+// TestComposeDown_FailedNetworkAndContainerListingAreCounted: DeleteStack
+// reports a network it could not deprovision, or a container listing that
+// failed, as an "error" status named for what was left. Those are failed
+// deletions like any VM's, even when every VM went.
+func TestComposeDown_FailedNetworkAndContainerListingAreCounted(t *testing.T) {
+	spy := &deployClient{teardown: []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleting"},
+		{VmName: "ha1", Status: "deleted"},
+		{VmName: "containers (list failed)", Status: "error", Error: "list the stack's containers: boom"},
+		{VmName: "network hb_back", Status: "error", Error: "deprovision network: boom"},
+	}}
+	out, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err == nil {
+		t.Fatalf("compose down with a failed network deprovision returned nil error; stdout:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), `2 of 3 deletions failed (containers (list failed), network hb_back)`) {
+		t.Errorf("error does not count the failures: %v", err)
+	}
+	if strings.Contains(out, "torn down.") {
+		t.Errorf("an incomplete teardown was reported as torn down:\n%s", out)
+	}
+}
+
+// TestComposeDown_UnnamedErrorIsStillCounted: an error status without a name
+// must still fail the command and read sensibly, not "1 of 0 deletions".
+func TestComposeDown_UnnamedErrorIsStillCounted(t *testing.T) {
+	spy := &deployClient{teardown: []*pb.DeleteProgress{
+		{VmName: "ha1", Status: "deleted"},
+		{Status: "error", Error: "boom"},
+	}}
+	_, err := runComposeCLI(t, spy, false, "", "down", "-y")
+	if err == nil {
+		t.Fatal("compose down with an unnamed error returned nil error")
+	}
+	if !strings.Contains(err.Error(), `1 of 2 deletions failed (stack resource)`) {
+		t.Errorf("error does not count the unnamed failure: %v", err)
 	}
 }

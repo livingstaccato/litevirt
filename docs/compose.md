@@ -102,6 +102,30 @@ non-zero with a summary such as `stack "web": 1 of 3 actions failed (web-2)`.
 The actions that did succeed are not rolled back; fix the cause and re-run
 `compose up` to converge the rest.
 
+A failed action is any create, update or delete the daemon could not carry
+out — including a scale-down delete, the delete half of a recreate (the
+recreate then stops rather than create over a VM that was never torn down),
+and a `depends-on` wait that timed out. After such a deploy the stack is
+recorded as `degraded` rather than `active` (the STATE column of
+`lv compose ls`), and the `stack.deploy` audit entry has result `error` and
+names the failed VMs. The new compose file is still stored: it is the desired
+state, and the next `compose up` plans against the live VMs, so it retries
+exactly the actions that failed and the stack returns to `active` once they
+all succeed.
+
+`compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
+and exit status 0 only when every VM and container was deleted and every stack
+network deprovisioned. If any could not be — or the stack's containers could
+not even be listed — each failure is printed, named for what was left (a VM or
+container name, `network <name>`, or `containers (list failed)`), the success line is withheld, and the command
+exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
+(web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
+the teardown in the background, and the `stack.delete` audit entry has result
+`error` and names what was not removed. The web UI's stack **Destroy** action
+reports the same way: it says the stack was destroyed only after a complete
+teardown, and otherwise shows an error naming each failure and stays on the
+page.
+
 ## VM definition
 
 ```yaml
@@ -149,7 +173,8 @@ hardware), or `custom`, which requires `cpu-model`.
 Left unset, `cpu-mode` takes the cluster-wide `vm.default_cpu_mode`. It is not left
 empty: an empty mode emits no `<cpu>` element and drops the guest onto QEMU's
 `qemu64`, which has no AVX at all. Changing either field is restart-class — the CPU
-bakes into the domain XML — so `lv compose up --strategy in-place` refuses it.
+bakes into the domain XML — so an update under `strategy: in-place` (set in the
+VM's `update:` block) refuses it: in-place never restarts a VM.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 
@@ -424,9 +449,9 @@ Shorthand form (all conditions default to `vm_started`):
 Conditions:
 
 - `vm_started` — VM is in "running" state (default). Timeout: 5 minutes.
-- `vm_healthy` — VM is running and healthcheck is passing (requires a `healthcheck` on the dependency). Timeout: 10 minutes.
+- `vm_healthy` — VM is running and not marked unhealthy. Timeout: 10 minutes. Note that the VM health checker does not currently record probe results on the VM, so today this condition is met as soon as the VM is running; it is not yet a guarantee that the `healthcheck` passes.
 
-If a dependency times out, deployment continues with a warning — it does not block the entire stack.
+If a dependency wait times out, the dependency is reported as a failed action (an `error` line naming it) and the stack ends `degraded`, but the rest of the deploy still runs — it does not block the entire stack.
 
 Cycles are detected at parse time and rejected.
 
@@ -599,6 +624,8 @@ Strategies:
 - `all-at-once` — Recreate all VMs simultaneously. Fast but risky.
 - `blue-green` — Create a parallel set of new VMs ("-green" suffix), verify health, then cut over.
 - `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
+
+The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-replace` is the `vm_healthy` condition of `depends-on` (see its note above), bounded by `health-wait` (default `30s`). A VM that is not healthy by then fails with `<vm> did not become healthy within health-wait <d>`; under `rolling`, `stop-first` and `start-first` that aborts the deploy.
 
 `in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
 

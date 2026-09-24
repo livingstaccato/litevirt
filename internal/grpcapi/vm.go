@@ -1523,6 +1523,11 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
 
+	// The guest is booting from here. Tell the healthcheck before anything
+	// else: for RestartVM the row never leaves "running", so this is the only
+	// way its start grace opens.
+	s.noteVMStarted(vm.Name)
+
 	// The domain is up. A lost "running" write is low-harm (the reconciler heals
 	// it from libvirt), so record it best-effort with retry and still run the
 	// follow-up (VLAN taps, PostStart hook) — skipping those would leave a running

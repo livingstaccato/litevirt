@@ -926,6 +926,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetRealmRegistry(d.realmRegistry)
 	vmChecker.SetEventBus(svc.EventBus())
 	vmChecker.SetMigrateFunc(svc.MigrateVMForHealthCheck)
+	// Every guest start the Server performs opens the healthcheck's start grace,
+	// including RestartVM's, which keeps the row "running" and is otherwise
+	// invisible to the checker's sweep.
+	svc.SetVMStartObserver(vmChecker)
 	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
 	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so

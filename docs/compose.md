@@ -607,11 +607,11 @@ The VM's owning host probes it every `interval` (default, and floor, the checker
 There is no `start-period`. Instead, for the first 5 minutes after a VM **starts** its failures do not count toward the healthcheck's `action`, so a VM still booting is not restarted; it is still probed, and its verdict is still published, because a `depends-on` or rolling-update wait needs its first pass. "Starts" is every start the owning host sees, measured from when it saw it:
 
 - the VM was created;
-- its healthcheck restarted it, or its restart policy started it;
+- its healthcheck restarted it, its restart policy started it, or the daemon started or restarted it (`lv start`, `lv restart` — including on a running VM — and a reconfigure that restarts it);
 - it went from not running to running (an operator start, a redefine and start);
 - it arrived on the host — migrated or failed over there — or began a new ownership generation.
 
-Failures from before a start do not carry over: after the grace the VM needs `retries` failures of its own before the `action` runs. Not covered: a restart that keeps the VM recorded as running throughout (`lv restart` on a running VM), and a VM the host first sees just after its daemon starts — it cannot tell a VM that has run for weeks from one that just started.
+Failures from before a start do not carry over: after the grace the VM needs `retries` failures of its own before the `action` runs. Not covered: a VM the host first sees just after its daemon starts — it cannot tell a VM that has run for weeks from one that just started.
 
 **Repeated actions back off.** When the `action` has run and the VM still has not passed a probe, the next action on it waits at least 1 minute after the last one, doubling with each further action — 2, 4, 8, 16 minutes — up to a cap of **32 minutes**, where it stays until the VM passes a probe (which resets the backoff). With `action: restart` the 5-minute start grace comes first, so a VM that never passes is restarted at most about every 5 minutes plus `retries` × `interval` at first, and no more often than every 32 minutes once the backoff has grown. Failed probes that arrive while the backoff is holding the action back keep counting — the log shows `consecutive` still rising next to `action backoff active` — so the action runs on the first failed probe after the backoff ends, not after another `retries` failures.
 

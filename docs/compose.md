@@ -444,9 +444,9 @@ Shorthand form (all conditions default to `vm_started`):
 Conditions:
 
 - `vm_started` — VM is in "running" state (default). Timeout: 5 minutes.
-- `vm_healthy` — VM is running and healthcheck is passing (requires a `healthcheck` on the dependency). Timeout: 10 minutes.
+- `vm_healthy` — VM is running and not marked unhealthy. Timeout: 10 minutes. Note that the VM health checker does not currently record probe results on the VM, so today this condition is met as soon as the VM is running; it is not yet a guarantee that the `healthcheck` passes.
 
-If a dependency times out, deployment continues with a warning — it does not block the entire stack.
+If a dependency wait times out, the dependency is reported as a failed action (an `error` line naming it) and the stack ends `degraded`, but the rest of the deploy still runs — it does not block the entire stack.
 
 Cycles are detected at parse time and rejected.
 
@@ -619,6 +619,8 @@ Strategies:
 - `all-at-once` — Recreate all VMs simultaneously. Fast but risky.
 - `blue-green` — Create a parallel set of new VMs ("-green" suffix), verify health, then cut over.
 - `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
+
+The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-replace` is the `vm_healthy` condition of `depends-on` (see its note above), bounded by `health-wait` (default `30s`). A VM that is not healthy by then fails with `<vm> did not become healthy within health-wait <d>`; under `rolling`, `stop-first` and `start-first` that aborts the deploy.
 
 `in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
 

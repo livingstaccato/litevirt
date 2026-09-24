@@ -104,8 +104,14 @@ func (o *serverOps) StartVM(ctx context.Context, name string) error {
 	return err
 }
 
+// WaitHealthy is the rolling engine's health wait: the depends-on "vm_healthy"
+// condition, bounded by the strategy's health-wait rather than depends-on's
+// ten-minute default.
 func (o *serverOps) WaitHealthy(ctx context.Context, name string, timeout time.Duration) error {
-	return o.s.waitForCondition(ctx, name, fmt.Sprintf("healthy:%s", timeout))
+	if err := o.s.waitForConditionWithin(ctx, name, "vm_healthy", timeout); err != nil {
+		return fmt.Errorf("%s did not become healthy within health-wait %s: %w", name, timeout, err)
+	}
+	return nil
 }
 
 // useRollingUpdate returns the update strategy if the compose file specifies

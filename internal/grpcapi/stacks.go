@@ -1359,7 +1359,9 @@ func highestDependencyCondition(vmName string, ops []compose.Op) string {
 	return best
 }
 
-// waitForCondition polls until a VM reaches the specified condition or times out.
+// waitForCondition waits for a depends-on condition ("vm_started" or
+// "vm_healthy", the compose depends-on vocabulary) with that condition's
+// default timeout.
 func (s *Server) waitForCondition(ctx context.Context, vmName, condition string) error {
 	timeout := 5 * time.Minute
 	if condition == "vm_healthy" {
@@ -1367,6 +1369,20 @@ func (s *Server) waitForCondition(ctx context.Context, vmName, condition string)
 	}
 	if d := s.dependsOnWaitTimeout.Load(); d > 0 {
 		timeout = time.Duration(d)
+	}
+	return s.waitForConditionWithin(ctx, vmName, condition, timeout)
+}
+
+// waitForConditionWithin polls until vmName satisfies condition or timeout
+// elapses. condition must be "vm_started" or "vm_healthy": anything else is
+// refused at once, because a condition that matches no branch can never be
+// met and would only spin until the deadline (the rolling health wait used to
+// pass "healthy:<dur>" and fail every update exactly that way).
+func (s *Server) waitForConditionWithin(ctx context.Context, vmName, condition string, timeout time.Duration) error {
+	switch condition {
+	case "vm_started", "vm_healthy":
+	default:
+		return fmt.Errorf("unknown wait condition %q for %s (want vm_started or vm_healthy)", condition, vmName)
 	}
 
 	deadline := time.Now().Add(timeout)
@@ -1399,7 +1415,7 @@ func (s *Server) waitForCondition(ctx context.Context, vmName, condition string)
 		time.Sleep(2 * time.Second)
 	}
 
-	return fmt.Errorf("timeout waiting for %s on %s", condition, vmName)
+	return fmt.Errorf("timeout after %s waiting for %s on %s", timeout, condition, vmName)
 }
 
 // autoPullImages checks each image referenced by VMs in the compose file. If

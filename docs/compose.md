@@ -91,6 +91,17 @@ lv compose ps                    # List VMs in the stack
 lv compose down                  # Tear down
 ```
 
+`compose up` prints the plan and asks for confirmation; `-y` skips the prompt.
+`up` and `down` refuse to prompt when stdin is not a terminal (ssh without
+`-t`, CI, a pipe) and exit non-zero instead of waiting — pass `-y` in scripts.
+
+`compose up` ends with `Stack "<name>" deployed.` and exit status 0 only when
+every action in the plan succeeded. If any VM action fails, each failure is
+printed as it happens, the success line is withheld, and the command exits
+non-zero with a summary such as `stack "web": 1 of 3 actions failed (web-2)`.
+The actions that did succeed are not rolled back; fix the cause and re-run
+`compose up` to converge the rest.
+
 ## VM definition
 
 ```yaml

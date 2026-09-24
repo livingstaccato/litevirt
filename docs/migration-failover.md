@@ -271,7 +271,18 @@ nothing — and while it is under 5 minutes old it also makes the coordinator
 treat the host as already fenced. Wait for the refusal in the coordinator log,
 then confirm.
 
-The resume takes the decision gate like every other ownership decision: a
+**The failover leader resumes it.** Every coordinator reads the same
+`fencing_log`, but only the one holding the failover lease acts on it. The check
+is the same one fencing uses, run once per cycle and again for each host before
+anything is decided. A coordinator that is not the leader does nothing and does
+not spend the confirmation. If the leader that refused the recovery dies before
+the confirmation arrives, the coordinator that takes over the lease finds the
+confirmation in `fencing_log` and resumes the recovery. The lease is best-effort,
+not exclusive (see
+[Leader-gated recovery](operating-model.md#ha--failover)). If two
+coordinators each believe they hold it, both can resume, just as both can fence.
+
+The resume also takes the decision gate, like every other ownership decision: a
 coordinator without quorum refuses, and does not spend the confirmation, so the
 resume happens once quorum returns. One confirmation resumes one recovery. It is
 counted as `phase=recovery, error_class=confirmation_resumed`. A shared-disk VM

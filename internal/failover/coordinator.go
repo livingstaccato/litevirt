@@ -1228,6 +1228,17 @@ func (c *Coordinator) confirmationResume(ctx context.Context, h *corrosion.HostR
 // confirmed it off since a refusal (confirmationResume), at most once per
 // confirmation per process. Reports whether it did.
 //
+// Only the failover leader reaches it. Both call sites are inside run()'s
+// candidate loop, after acquireLease and the per-candidate holdLease, which is
+// the same lease check the fence path makes. That is also why the once-only map
+// is enough: a non-leader never reaches this function, so it never spends a
+// confirmation, and a coordinator that takes over the lease has not spent it
+// either, so it still resumes. TestConfirmationResume_OnlyTheLeaderResumes and
+// TestConfirmationResume_TheNextLeaderResumesAfterHandover pin both halves.
+// The lease is best-effort (docs/operating-model.md, "Leader-gated recovery"). If
+// two coordinators each hold it in their own replica, both get here, exactly as
+// both would fence.
+//
 // It resumes at recoverWorkloads, past recoverFenced's gates: those gates exist
 // to demand exactly the confirmation confirmationResume has just established,
 // and manualFenceConfirmed only looks back recentFenceWindow — five minutes, less

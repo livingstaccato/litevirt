@@ -242,3 +242,77 @@ func TestConfirmationResume_OncePerConfirmation(t *testing.T) {
 		t.Errorf("confirmation_resumed counted %d times over four cycles, want exactly 1", got)
 	}
 }
+
+// Only the failover leader resumes a recovery on a confirmation, and a
+// coordinator that is not the leader neither acts on it nor spends it.
+//
+// Every coordinator in the cluster sees the same fencing_log and the same
+// quorum-down host, so without the lease each of them would resume the same
+// recovery on the same confirmation — correctness would rest on whichever
+// reschedule replicated first. The "not spent" half matters as much: a
+// non-leader that recorded the confirmation as used would, on becoming leader,
+// never resume it.
+func TestConfirmationResume_OnlyTheLeaderResumes(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	leader := newTestCoordinator("coordinator", db)
+	leader.SetFencer(manualFencer())
+	leader.run(ctx) // takes the lease, fences, refuses for want of a confirmation
+
+	operatorConfirms(t, db, ctx, "down")
+
+	fm := newFakeMetrics()
+	peer := newTestCoordinator("peer", db)
+	peer.SetFencer(manualFencer())
+	peer.Metrics = fm
+	peer.run(ctx)
+	peer.run(ctx)
+
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Errorf("VM moved to %q by a coordinator that does not hold the failover lease", got)
+	}
+	if got := fm.attempts[foKey(PhaseRecovery, ResultOK, ErrConfirmationResumed)]; got != 0 {
+		t.Errorf("non-leader counted confirmation_resumed %d times, want 0", got)
+	}
+	if id, spent := peer.confirmResumed["down"]; spent {
+		t.Errorf("non-leader recorded confirmation %q as spent", id)
+	}
+
+	leader.run(ctx)
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Errorf("VM still on %q after the leader ran with the confirmation on record", got)
+	}
+}
+
+// A confirmation the old leader never acted on is resumed by the next one.
+//
+// The refusing coordinator's lease lapses before it sees the confirmation (it
+// died, or was partitioned away); the coordinator that takes the lease over
+// must still find and resume the recovery, from fencing_log alone.
+func TestConfirmationResume_TheNextLeaderResumesAfterHandover(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	old := newTestCoordinator("coordinator", db)
+	old.SetFencer(manualFencer())
+	old.run(ctx)
+
+	operatorConfirms(t, db, ctx, "down")
+
+	next := newTestCoordinator("peer", db)
+	next.SetFencer(manualFencer())
+	next.run(ctx) // the old lease is still live: stands down
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Fatalf("VM moved to %q while another coordinator held the lease", got)
+	}
+
+	// The old leader is gone; its lease runs out. (Expired in the row rather
+	// than by advancing next's clock, which would also age out the health rows
+	// that make the host a candidate at all.)
+	if err := db.Execute(ctx, `UPDATE leader_election SET expires_at = ? WHERE key = 'failover'`,
+		time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	next.run(ctx)
+
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Errorf("VM still on %q after the lease changed hands — the new leader did not resume the confirmation", got)
+	}
+}

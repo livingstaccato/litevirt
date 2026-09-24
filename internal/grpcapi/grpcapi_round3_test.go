@@ -1810,20 +1810,14 @@ func TestR3_ResolveVolume_EmptyStackR3(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 
-	cfg := mustResolveVolume(t, s, ctx, "", "vol1")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "", "vol1")
 }
 
 func TestR3_ResolveVolume_StackNotFoundR3(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 
-	cfg := mustResolveVolume(t, s, ctx, "nonexistent", "vol1")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "nonexistent", "vol1")
 }
 
 // ── publish / audit ─────────────────────────────────────────────────────────

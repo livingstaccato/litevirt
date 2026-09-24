@@ -27,8 +27,9 @@ const (
 	// pollInterval is how often the coordinator checks for offline hosts.
 	pollInterval = 5 * time.Second
 	// offlineThreshold is the number of consecutive failures before a host
-	// is considered offline by the coordinator.
-	offlineThreshold = 5
+	// is considered offline by the coordinator. It is defined in package
+	// health because the stall guard's grace window is derived from it.
+	offlineThreshold = health.FailuresToFence
 	// leaseDuration is the TTL for the failover-leader lease. It has to clear
 	// minFenceLease with room to spare: holdLeaseAtLeast requires STRICTLY more
 	// than the floor, so a lease whose full term only just reaches it could

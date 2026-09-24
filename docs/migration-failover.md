@@ -125,15 +125,23 @@ does not advance across a system suspend. After a gap:
 - **The failure count this node had built against every peer is discarded.** A
   verdict against a peer is made only of probes attempted after the node resumed.
   The probe that straddled the gap is never one of them.
-- **For 10 s (the stall grace window), an unreachable probe is not counted.** No
+- **For the stall grace window, an unreachable probe is not counted.** The window
+  is the time a normal fence verdict takes to build — 5 failed probes at the 2 s
+  probe interval, 10 s — and it is derived from those two numbers, not tuned
+  separately, so it moves with them. There is no setting for it. No
   row is written for it, so a previously published `suspect` row is not refreshed
   and ages out of fencing quorum's 30 s freshness window. A successful probe still
   counts, and so does a peer's explicit not-ready answer.
-- **This node's failover coordinator decides no new fence for the same 10 s.** It
+- **This node's failover coordinator decides no new fence for the same window.** It
   logs `quorum reached, but this node was itself not running moments ago` and
   counts `litevirt_failover_attempts_total{phase="skip",error_class="local_stall"}`.
   Resuming a recovery from a fence that is already recorded is not a new decision,
   and it is not held back.
+
+**Seeing it.** The node records an `observer_stalled` condition about itself for
+the length of the window — `lv health` lists it, and `lv doctor fence` names the
+node with how long it was paused and until when its votes are withheld. See
+[Diagnostics](diagnostics.md#observer-stalled-observer_stalled).
 
 A host that really is dead is still fenced. After a stall its observers need the
 grace window plus the usual 5 failed probes, about 20 s from resume instead of

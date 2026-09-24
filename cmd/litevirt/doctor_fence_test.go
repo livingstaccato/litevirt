@@ -14,7 +14,15 @@ import (
 
 type fenceReadinessClient struct {
 	pb.LiteVirtClient
-	resp *pb.FenceReadiness
+	resp   *pb.FenceReadiness
+	health *pb.ClusterHealth // nil → an empty health report
+}
+
+func (c *fenceReadinessClient) GetClusterHealth(context.Context, *pb.GetClusterHealthRequest, ...grpc.CallOption) (*pb.ClusterHealth, error) {
+	if c.health == nil {
+		return &pb.ClusterHealth{}, nil
+	}
+	return c.health, nil
 }
 
 func (c *fenceReadinessClient) GetFenceReadiness(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.FenceReadiness, error) {
@@ -25,9 +33,14 @@ func (c *fenceReadinessClient) GetFenceReadiness(context.Context, *emptypb.Empty
 // stdout and the exit code it signalled (0 when it returned no error).
 func runDoctorFence(t *testing.T, resp *pb.FenceReadiness) (string, int) {
 	t.Helper()
+	return runDoctorFenceWithHealth(t, resp, nil)
+}
+
+func runDoctorFenceWithHealth(t *testing.T, resp *pb.FenceReadiness, health *pb.ClusterHealth) (string, int) {
+	t.Helper()
 	orig := withClient
 	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
-		return fn(ctx, &fenceReadinessClient{resp: resp})
+		return fn(ctx, &fenceReadinessClient{resp: resp, health: health})
 	}
 	t.Cleanup(func() { withClient = orig })
 

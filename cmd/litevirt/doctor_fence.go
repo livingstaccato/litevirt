@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -48,6 +51,11 @@ shared-disk count comes from the queried node's replicated rows.`,
 					return fmt.Errorf("get fence readiness: %w", err)
 				}
 				printFenceReadiness(r)
+				// Best-effort: the stall section is an explanation, not part of
+				// the verdict, so a failed read does not fail the command.
+				if h, herr := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
+					printStalledObservers(os.Stdout, h.GetConditions())
+				}
 				if fenceHazard(r) {
 					return silentExitError{code: 1}
 				}
@@ -215,4 +223,45 @@ func hostPostureWord(h *pb.FenceHostPosture) string {
 	default:
 		return "NOT enforcing"
 	}
+}
+
+// printStalledObservers lists hosts with an open observer_stalled condition:
+// nodes that were not running recently and, until the window closes, count no
+// failed probes against peers and decide no fence. It is the usual answer to
+// "why has a dead host not been fenced yet?", so the doctor names them. Prints
+// nothing when there are none.
+func printStalledObservers(w io.Writer, conds []*pb.HealthCondition) {
+	type stalled struct{ host, paused, until string }
+	var rows []stalled
+	for _, c := range conds {
+		if c.GetCode() != "observer_stalled" || c.GetLifecycle() == "resolved" {
+			continue
+		}
+		var ev struct {
+			GapSeconds float64 `json:"gap_seconds"`
+			GraceUntil string  `json:"grace_until"`
+		}
+		_ = json.Unmarshal([]byte(c.GetEvidence()), &ev) // unreadable evidence still names the host
+		paused, until := "?", ev.GraceUntil
+		if ev.GapSeconds > 0 {
+			paused = (time.Duration(ev.GapSeconds * float64(time.Second))).Round(time.Second).String()
+		}
+		if until == "" {
+			until = "?"
+		}
+		rows = append(rows, stalled{c.GetSubjectId(), paused, until})
+	}
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nstalled observers (fence votes withheld):")
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "  HOST\tPAUSED\tWITHHELD UNTIL")
+	for _, r := range rows {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", r.host, r.paused, r.until)
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "\nThese nodes were not running (suspended, swapped out or starved of CPU).")
+	fmt.Fprintln(w, "Until the time shown they count no failed probe against a peer and decide")
+	fmt.Fprintln(w, "no fence, so a fence can be up to that much later than usual.")
 }

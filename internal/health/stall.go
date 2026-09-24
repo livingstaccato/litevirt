@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // Local stall detection.
@@ -47,22 +49,34 @@ const (
 	// stopped. It equals checkInterval: an observer that missed a whole probe
 	// tick was not observing.
 	stallThreshold = checkInterval
+	// FailuresToFence is how many consecutive failed probes from an observer
+	// make it a witness against a peer (failover's offlineThreshold). It lives
+	// here so StallGrace can be derived from it.
+	FailuresToFence = 5
 	// StallGrace is how long after a local stall this node refuses to count a
-	// failed probe, and (via InStallGrace) its coordinator refuses to fence. It
-	// is long enough for every peer resumed by the same event to answer fresh
-	// probes — five probe ticks — and it bounds the delay a stall adds to
-	// fencing a peer that really is dead: after it, offlineThreshold fresh
-	// failures are needed as usual.
-	StallGrace = 10 * time.Second
+	// failed probe, and (via InStallGrace) its coordinator refuses to fence.
+	// It is the time a normal fence verdict takes to build — FailuresToFence
+	// probe ticks — so every peer resumed by the same event has had as many
+	// chances to answer as it would have had to fail. Derived, not tuned: a
+	// change to the probe cadence or the failure count moves it with them. It
+	// also bounds the delay a stall adds to fencing a peer that really is dead:
+	// after it, FailuresToFence fresh failures are needed as usual.
+	StallGrace = FailuresToFence * checkInterval
 )
 
 // stallState is the heartbeat's record. Its own lock, not Checker.mu, because
 // beat runs on every probe result and the probe path already holds c.mu.
 type stallState struct {
 	mu       sync.Mutex
-	lastBeat time.Time // local clock at the previous beat; zero before the first
-	stallAt  time.Time // local clock when the most recent stall was noticed
-	epoch    uint64    // incremented once per stall
+	lastBeat time.Time     // local clock at the previous beat; zero before the first
+	stallAt  time.Time     // local clock when the most recent stall was noticed
+	epoch    uint64        // incremented once per stall
+	gap      time.Duration // length of the most recent stall
+
+	// reporter state, touched only by the heartbeat goroutine (stallTick).
+	loaded   bool                       // the store was read for a row an earlier process left open
+	open     *corrosion.HealthCondition // this node's unresolved observer_stalled row, or nil
+	reported uint64                     // the stall epoch the open row describes
 }
 
 // stallGap is how long the process was away between two beats, taking the
@@ -88,6 +102,7 @@ func (c *Checker) beat(now time.Time) (stallAt time.Time, epoch uint64) {
 			gap = g
 			s.stallAt = now
 			s.epoch++
+			s.gap = g
 		}
 	}
 	if s.lastBeat.IsZero() || now.Sub(s.lastBeat) > 0 {
@@ -120,13 +135,13 @@ func (c *Checker) InStallGrace() bool {
 func (c *Checker) runStallHeartbeat(ctx context.Context) {
 	t := time.NewTicker(stallBeat)
 	defer t.Stop()
-	c.beat(c.now())
+	c.stallTick(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c.beat(c.now())
+			c.stallTick(ctx)
 		}
 	}
 }

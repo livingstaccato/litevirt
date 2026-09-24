@@ -104,3 +104,52 @@ func TestTopologicalSortOps_CreatesAndUpdatesInterleaveByDependency(t *testing.T
 		}
 	}
 }
+
+func buildOrder(t *testing.T, yml string) []string {
+	t.Helper()
+	f, err := ParseBytes([]byte(yml))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	plan, err := Build(f, nil)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return createOrder(TopologicalSortOps(plan.Ops))
+}
+
+// "db" is not "db-backup". Matched by prefix, zapp (depends on db) would also
+// depend on db-backup — which depends on zapp: a false cycle, broken by
+// falling back to name order, which puts db-backup before zapp.
+func TestTopologicalSortOps_PrefixIsNotADependency(t *testing.T) {
+	got := buildOrder(t, `name: s
+vms:
+  db:
+    image: i
+  zapp:
+    image: i
+    depends-on: [db]
+  db-backup:
+    image: i
+    depends-on: [zapp]
+`)
+	if want := []string{"db", "zapp", "db-backup"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("create order %v, want %v", got, want)
+	}
+}
+
+// Replicas are still matched through their compose name.
+func TestTopologicalSortOps_ReplicasMatchTheirComposeName(t *testing.T) {
+	got := buildOrder(t, `name: s
+vms:
+  app:
+    image: i
+    depends-on: [zdb]
+  zdb:
+    image: i
+    replicas: 2
+`)
+	if want := []string{"zdb-1", "zdb-2", "app"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("create order %v, want %v", got, want)
+	}
+}

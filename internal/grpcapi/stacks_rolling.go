@@ -190,10 +190,12 @@ type dependsOnGate struct {
 	all    []planner.VMAction // every workload of the plan, unchanged ones included
 	unmet  map[string]string  // compose base name → why its condition was not met
 	met    map[string]int     // instance → highest condition level verified
+	// rolledOut marks the VMs this deploy handed to the rolling engine.
+	rolledOut map[string]bool
 }
 
 func newDependsOnGate(s *Server, f *compose.File, actions []planner.VMAction, stream grpc.ServerStreamingServer[pb.DeployProgress]) *dependsOnGate {
-	return &dependsOnGate{s: s, f: f, stream: stream, all: actions, unmet: map[string]string{}, met: map[string]int{}}
+	return &dependsOnGate{s: s, f: f, stream: stream, all: actions, unmet: map[string]string{}, met: map[string]int{}, rolledOut: map[string]bool{}}
 }
 
 // conditionLevel ranks the depends-on conditions: vm_healthy implies
@@ -215,10 +217,7 @@ func dependencyCondition(def compose.DependencyDef) string {
 // baseName maps a planned workload (an instance name such as db-2) to the
 // compose name dependents refer to it by.
 func (g *dependsOnGate) baseName(vm string) string {
-	if _, base := compose.FindVMDef(g.f, vm); base != "" {
-		return base
-	}
-	return vm
+	return compose.BaseName(g.f, vm)
 }
 
 // markMet records that vm was verified to meet cond in this deploy.
@@ -273,7 +272,7 @@ func (g *dependsOnGate) ensure(ctx context.Context, action planner.VMAction) {
 			if _, ok := g.unmet[dep]; ok {
 				break
 			}
-			if d.Kind == planner.OpDelete || g.baseName(d.VMName) != dep || g.met[d.VMName] >= conditionLevel(cond) {
+			if d.Kind == planner.OpDelete || !compose.DependsOnTarget(dep, g.baseName(d.VMName)) || g.met[d.VMName] >= conditionLevel(cond) {
 				continue
 			}
 			_ = g.stream.Send(&pb.DeployProgress{
@@ -281,7 +280,7 @@ func (g *dependsOnGate) ensure(ctx context.Context, action planner.VMAction) {
 				VmName: action.VMName,
 				Detail: fmt.Sprintf("waiting for %s to be %s", d.VMName, cond),
 			})
-			if err := g.s.waitForWorkloadCondition(ctx, d, cond); err != nil {
+			if err := g.wait(ctx, d, cond); err != nil {
 				slog.Warn("depends-on wait failed", "dependency", d.VMName, "dependent", action.VMName, "error", err)
 				g.markUnmet(d.VMName, fmt.Errorf("depends-on wait for %s: %w", cond, err))
 				break
@@ -289,6 +288,20 @@ func (g *dependsOnGate) ensure(ctx context.Context, action planner.VMAction) {
 			g.markMet(d.VMName, cond)
 		}
 	}
+}
+
+// wait waits for dependency d to meet cond. A VM the rolling engine updated
+// in this deploy is waited on for its strategy's health-wait when the
+// strategy sets one; anything else for depends-on's default.
+func (g *dependsOnGate) wait(ctx context.Context, d planner.VMAction, cond string) error {
+	if g.rolledOut[d.VMName] {
+		if hw := vmUpdateDef(g.f, d.VMName).HealthWait; hw != "" {
+			if timeout, err := time.ParseDuration(hw); err == nil && timeout > 0 {
+				return g.s.waitForConditionWithin(ctx, d.VMName, cond, timeout)
+			}
+		}
+	}
+	return g.s.waitForWorkloadCondition(ctx, d, cond)
 }
 
 // hold makes sure every dependency of action meets its condition, and reports
@@ -442,12 +455,7 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 // holds the actions none of whose dependencies still has an action to run, in
 // planned order. With no depends-on between them, everything is one wave.
 func dependencyWaves(f *compose.File, actions []planner.VMAction) [][]planner.VMAction {
-	base := func(vm string) string {
-		if _, b := compose.FindVMDef(f, vm); b != "" {
-			return b
-		}
-		return vm
-	}
+	base := func(vm string) string { return compose.BaseName(f, vm) }
 	var pending []planner.VMAction
 	for _, a := range actions {
 		if a.Kind == planner.OpCreate || a.Kind == planner.OpUpdate {
@@ -602,6 +610,9 @@ func (s *Server) rollingUpdateWave(ctx context.Context, f *compose.File, updates
 		return nil
 	}
 
+	for _, a := range actions {
+		gate.rolledOut[a.Name] = true
+	}
 	ops := &serverOps{s: s}
 	// An "error" the engine reports goes through failures, like every other
 	// failed action: some are not fatal to the engine (a blue-green blue that

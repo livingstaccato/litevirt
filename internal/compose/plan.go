@@ -26,6 +26,19 @@ type Op struct {
 	Detail    string
 	Warning   string    // non-fatal advisory (e.g. local disk + failover)
 	DependsOn DependsOn // boot-order dependencies (from compose)
+	// Base is the compose name of the workload (db for replica db-2), which
+	// is what a depends-on entry names. Empty for a delete, whose definition
+	// may be gone from the file.
+	Base string
+}
+
+// ComposeName is the name a depends-on entry refers to the op's workload by:
+// its compose name, or — for an op built without one — its instance name.
+func (o Op) ComposeName() string {
+	if o.Base != "" {
+		return o.Base
+	}
+	return o.VMName
 }
 
 // Plan is the ordered set of operations to converge the cluster to the desired state.
@@ -81,7 +94,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 
 			cur, exists := currentByName[instanceName]
 			if !exists {
-				op := Op{Kind: OpCreate, VMName: instanceName,
+				op := Op{Kind: OpCreate, VMName: instanceName, Base: baseName,
 					Detail: fmt.Sprintf("create %s (image=%s cpu=%d mem=%dMiB)",
 						instanceName, vmDef.Image, vmDef.CPU, int(vmDef.Memory)),
 					DependsOn: vmDef.DependsOn}
@@ -157,6 +170,7 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 					VMName:    instanceName,
 					Detail:    fmt.Sprintf("retry %s (was state=%s)", instanceName, cur.State),
 					DependsOn: vmDef.DependsOn,
+					Base:      baseName,
 				})
 			} else if changed {
 				// An update carries its depends-on like a create: it is held
@@ -167,12 +181,14 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 					VMName:    instanceName,
 					Detail:    fmt.Sprintf("update %s:%s", instanceName, detail),
 					DependsOn: vmDef.DependsOn,
+					Base:      baseName,
 				})
 			} else {
 				plan.Ops = append(plan.Ops, Op{
 					Kind:   OpNoChange,
 					VMName: instanceName,
 					Detail: fmt.Sprintf("%s: no changes", instanceName),
+					Base:   baseName,
 				})
 				_ = cur
 			}
@@ -273,11 +289,22 @@ func CloudInitHashFromSpec(specJSON string) string {
 	return CloudInitHash(raw.CloudInit.Userdata, raw.CloudInit.Networkconfig)
 }
 
-// DependsOnTarget reports whether the workload instance name is (a replica
-// of) the compose name dep that a depends-on entry refers to: "db" matches
-// "db" and "db-2".
-func DependsOnTarget(dep, instance string) bool {
-	return instance == dep || (len(instance) > len(dep) && instance[:len(dep)] == dep && instance[len(dep)] == '-')
+// DependsOnTarget reports whether a depends-on entry naming dep refers to the
+// workload whose compose name is composeName. Dependencies are matched by
+// compose name only — "db" matches db and its replicas db-1, db-2 (all of
+// compose name db), never a workload named db-backup. Every depends-on match
+// goes through here.
+func DependsOnTarget(dep, composeName string) bool {
+	return dep == composeName
+}
+
+// BaseName is the compose name of a workload instance in f (db for replica
+// db-2), or the instance name itself when f defines no such instance.
+func BaseName(f *File, instance string) string {
+	if _, base := FindVMDef(f, instance); base != "" {
+		return base
+	}
+	return instance
 }
 
 // TopologicalSortOps orders the create and update ops in dependency order —
@@ -294,7 +321,7 @@ func TopologicalSortOps(ops []Op) []Op {
 		}
 	}
 
-	// VM names are instance names (web-1) whose DependsOn uses base names (db).
+	// VM names are instance names (web-1); DependsOn uses compose names (db).
 	byName := map[string]*Op{}
 	inDegree := map[string]int{}
 	for i := range active {
@@ -305,8 +332,8 @@ func TopologicalSortOps(ops []Op) []Op {
 	for i := range active {
 		op := &active[i]
 		for depBase := range op.DependsOn {
-			for name := range byName {
-				if DependsOnTarget(depBase, name) {
+			for name, other := range byName {
+				if DependsOnTarget(depBase, other.ComposeName()) {
 					inDegree[op.VMName]++
 					dependents[name] = append(dependents[name], op.VMName)
 				}

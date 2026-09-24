@@ -427,7 +427,7 @@ See [`docs/placement.md`](placement.md) for the cost function, troubleshooting, 
 Control the order workloads are created and updated during deployment. A workload that is created or updated by a deploy does not start until each of its dependencies meets the specified condition, whatever the deploy does to the dependency:
 
 - a dependency **created or recreated** by the deploy is created first and waited on right after;
-- a dependency **updated by the rolling engine** is updated first, and the dependent waits on it before its own create or update starts;
+- a dependency **updated by the rolling engine** is updated first, and the dependent waits on it before its own create or update starts — for the dependency's `health-wait` when its update strategy sets one, else the condition's default timeout;
 - a dependency the deploy leaves **unchanged** is still a dependency: it is waited on before the dependent starts (so a re-run does not create `app` while `db` is still unhealthy).
 
 Creates and updates are ordered together: a new VM that depends on a VM being updated runs after that update. A workload that the deploy leaves unchanged waits on nothing, even when its dependency is not in the state it once needed. Workloads with no ordering between them run in name order (a failed replica's update first, #32), so an unchanged file always deploys in the same order; deletes run where they always have, after the creates and updates.
@@ -448,6 +448,8 @@ vms:
       cache:
         condition: vm_started     # Wait for Redis to be running
 ```
+
+A dependency is named by its compose name: `db` means the workload `db` and, if it is replicated, every replica (`db-1`, `db-2`, …) — never a different workload whose name merely starts with `db-`, such as `db-backup`.
 
 Shorthand form (all conditions default to `vm_started`):
 

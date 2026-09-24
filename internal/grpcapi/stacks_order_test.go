@@ -36,3 +36,21 @@ func TestSortVMActions_FailedFirstWithoutBreakingDependencyOrder(t *testing.T) {
 		t.Fatalf("order %v, want %v", got, want)
 	}
 }
+
+// "db" is not "db-backup": a prefix match makes zapp wait for db-backup, which
+// itself depends on zapp — a false cycle, broken in planned order.
+func TestSortVMActions_PrefixIsNotADependency(t *testing.T) {
+	actions := []planner.VMAction{
+		{Kind: planner.OpCreate, VMName: "db-backup", DependsOn: compose.DependsOn{"zapp": {}}},
+		{Kind: planner.OpCreate, VMName: "zapp", DependsOn: compose.DependsOn{"db": {}}},
+		{Kind: planner.OpUpdate, VMName: "db"},
+	}
+	sortVMActions(actions, []compose.CurrentVM{{Name: "db", State: "running"}})
+	var got []string
+	for _, a := range actions {
+		got = append(got, a.VMName)
+	}
+	if want := []string{"db", "zapp", "db-backup"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order %v, want %v", got, want)
+	}
+}

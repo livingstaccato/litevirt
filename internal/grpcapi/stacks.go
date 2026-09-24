@@ -723,7 +723,7 @@ func sortVMActions(actions []planner.VMAction, current []compose.CurrentVM) {
 		}
 		for dep := range actions[si].DependsOn {
 			for j, sj := range slots {
-				if j != i && compose.DependsOnTarget(dep, actions[sj].VMName) {
+				if j != i && compose.DependsOnTarget(dep, actions[sj].ComposeName()) {
 					inDegree[i]++
 					dependents[j] = append(dependents[j], i)
 				}
@@ -1410,26 +1410,6 @@ func (s *Server) externalNetworkNames(ctx context.Context, stackName string) map
 		}
 	}
 	return ext
-}
-
-// highestDependencyCondition checks if any later ops depend on vmName and returns
-// the most demanding condition ("vm_healthy" > "vm_started").
-func highestDependencyCondition(vmName string, ops []compose.Op) string {
-	best := ""
-	for _, op := range ops {
-		for dep, def := range op.DependsOn {
-			// Match exact name or base name (for replicas: "db" matches "db-1").
-			if dep == vmName || (len(vmName) > len(dep) && vmName[:len(dep)] == dep && vmName[len(dep)] == '-') {
-				if def.Condition == "vm_healthy" {
-					return "vm_healthy" // highest possible
-				}
-				if best == "" {
-					best = def.Condition
-				}
-			}
-		}
-	}
-	return best
 }
 
 // waitForCondition waits for a depends-on condition ("vm_started" or

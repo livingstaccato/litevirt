@@ -10,7 +10,6 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -313,70 +312,6 @@ func TestResolveBridge_SRIOVEmptyPF(t *testing.T) {
 	got := resolveBridge(ctx, s.db, "sriov-empty")
 	if got != "sriov-empty" {
 		t.Errorf("resolveBridge = %q, want sriov-empty (fallback)", got)
-	}
-}
-
-// ── highestDependencyCondition ──────────────────────────────────────────────
-
-func TestHighestDependencyCondition_NoDependencies(t *testing.T) {
-	ops := []compose.Op{
-		{VMName: "web-1", DependsOn: nil},
-	}
-	got := highestDependencyCondition("db-1", ops)
-	if got != "" {
-		t.Errorf("expected empty, got %q", got)
-	}
-}
-
-func TestHighestDependencyCondition_VMStarted(t *testing.T) {
-	ops := []compose.Op{
-		{VMName: "web-1", DependsOn: compose.DependsOn{
-			"db": {Condition: "vm_started"},
-		}},
-	}
-	got := highestDependencyCondition("db-1", ops)
-	if got != "vm_started" {
-		t.Errorf("expected vm_started, got %q", got)
-	}
-}
-
-func TestHighestDependencyCondition_VMHealthy(t *testing.T) {
-	ops := []compose.Op{
-		{VMName: "web-1", DependsOn: compose.DependsOn{
-			"db": {Condition: "vm_started"},
-		}},
-		{VMName: "api-1", DependsOn: compose.DependsOn{
-			"db": {Condition: "vm_healthy"},
-		}},
-	}
-	got := highestDependencyCondition("db-1", ops)
-	if got != "vm_healthy" {
-		t.Errorf("expected vm_healthy (highest), got %q", got)
-	}
-}
-
-func TestHighestDependencyCondition_ExactNameMatch(t *testing.T) {
-	ops := []compose.Op{
-		{VMName: "worker-1", DependsOn: compose.DependsOn{
-			"db": {Condition: "vm_started"},
-		}},
-	}
-	// Exact name match (no replica suffix).
-	got := highestDependencyCondition("db", ops)
-	if got != "vm_started" {
-		t.Errorf("expected vm_started for exact match, got %q", got)
-	}
-}
-
-func TestHighestDependencyCondition_NoMatch(t *testing.T) {
-	ops := []compose.Op{
-		{VMName: "web-1", DependsOn: compose.DependsOn{
-			"cache": {Condition: "vm_started"},
-		}},
-	}
-	got := highestDependencyCondition("db-1", ops)
-	if got != "" {
-		t.Errorf("expected empty for no match, got %q", got)
 	}
 }
 

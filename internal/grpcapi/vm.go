@@ -530,7 +530,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 
 		// Attempt network provisioning if the network is defined in the stack.
-		if provBridge, err := provisionNetworkForVM(ctx, s.db, n.Name, s.hostName); err != nil {
+		if provBridge, err := s.provisionForVM(ctx, n.Name); err != nil {
 			slog.Warn("network provision failed, falling back to bridge name", "network", n.Name, "error", err)
 		} else if provBridge != "" {
 			bridge = provBridge

@@ -198,7 +198,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	for i, n := range srcSpec.Network {
 		mac := lv.GenerateMAC()
 		bridge := n.Name
-		if pb, perr := provisionNetworkForVM(ctx, s.db, n.Name, s.hostName); perr == nil && pb != "" {
+		if pb, perr := s.provisionForVM(ctx, n.Name); perr == nil && pb != "" {
 			bridge = pb
 		}
 		ip := ""

@@ -124,6 +124,7 @@ type Node struct {
 	Virt     *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
 	CT       *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
 	HostNet  *HostNetFake      // in-memory netplan System for the host-network apply protocol
+	Net      *NetProvFake      // per-node network provisioner: what this node set up, on which device
 	GRPCSrv  *grpc.Server
 	Listener net.Listener
 	// peerConn caches a self-loopback client for scenario assertions
@@ -563,6 +564,13 @@ func (c *Cluster) buildServer(n *Node) {
 		n.Server.SetOpJournal(j)
 	}
 	n.Server.SetHostNetworkEnv(n.HostNet, "127.0.0.1")
+
+	// Network provisioning: every create/provision/deprovision path on the
+	// server goes through this per-node fake instead of `ip` and dnsmasq, so a
+	// scenario can see what EACH node set up. The flat-bridge fallback
+	// (bridgeEnsure) is left alone; see NetProvFake.EnsureBridge.
+	n.Net = NewNetProvFake()
+	n.Server.SetNetworkProvisioner(n.Net)
 
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node

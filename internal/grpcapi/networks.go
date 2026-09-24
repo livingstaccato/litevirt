@@ -14,7 +14,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -572,11 +571,7 @@ func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb
 		}
 		return &pb.GetVMIPResponse{Ip: ip}, nil
 	}
-	ip := lv.GetIPFromARP(req.Mac)
-	if ip == "" {
-		ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", req.Mac)
-	}
-	return &pb.GetVMIPResponse{Ip: ip}, nil
+	return &pb.GetVMIPResponse{Ip: s.discoverNICAddress(req.Mac)}, nil
 }
 
 // UpdateFDB updates a unicast FDB entry on this host (called by peers during migration/discovery).

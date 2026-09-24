@@ -58,8 +58,8 @@ var startDHCPFunc = StartDHCP
 // binds only its own bridge gateway IP:53, which never collides.
 // dnsmasqLeaseDir is where litevirt's per-bridge dnsmasq writes its lease
 // files. It MUST match the directory the IP scanner reads
-// (grpcapi.IPScanner → GetIPFromDHCPLeases) — otherwise the lease-based IP
-// fallback never fires and runtime IP discovery silently relies on ARP alone
+// (libvirt.DiscoverIPForMAC, via its dhcpLeaseDir) — otherwise the lease
+// lookup never finds anything and runtime IP discovery silently relies on ARP alone
 // (so a just-booted or quiet VM can show no IP). Without --dhcp-leasefile,
 // dnsmasq writes to its compiled-in default (/var/lib/misc/...), which the
 // scanner doesn't read.

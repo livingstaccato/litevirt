@@ -50,6 +50,47 @@ func TestGetIPFromARP_OnlyCompleteEntriesCount(t *testing.T) {
 	}
 }
 
+func withLeaseDir(t *testing.T, leases string) {
+	t.Helper()
+	dir := t.TempDir()
+	if leases != "" {
+		if err := os.WriteFile(filepath.Join(dir, "br0.leases"), []byte(leases), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := dhcpLeaseDir
+	dhcpLeaseDir = dir
+	t.Cleanup(func() { dhcpLeaseDir = old })
+}
+
+// The guest rebooted onto a new lease. Its old address is still in the ARP
+// cache as a STALE entry — complete (ATF_COM), and on a small table never
+// garbage-collected until it is next used — while dnsmasq's lease file holds
+// the one current answer for the MAC. The lease wins: ARP first would hand
+// every discovery path, the recording ones included, the old address.
+func TestDiscoverIPForMAC_LeaseWinsOverAStaleARPEntry(t *testing.T) {
+	withARPTable(t, `IP address       HW type     Flags       HW address            Mask     Device
+172.16.60.23     0x1         0x2         52:54:00:aa:bb:01     *        br0
+`)
+	withLeaseDir(t, "1790000000 52:54:00:aa:bb:01 172.16.60.41 web *\n")
+	if got := DiscoverIPForMAC("52:54:00:aa:bb:01"); got != "172.16.60.41" {
+		t.Fatalf("DiscoverIPForMAC = %q, want the lease's 172.16.60.41 over the stale ARP entry", got)
+	}
+}
+
+// With no lease (a static address, an external DHCP server) a complete ARP
+// entry answers, and a failed one does not.
+func TestDiscoverIPForMAC_FallsBackToCompleteARP(t *testing.T) {
+	withARPTable(t, arpFixture)
+	withLeaseDir(t, "")
+	if got := DiscoverIPForMAC("52:54:00:aa:bb:01"); got != "172.16.60.41" {
+		t.Errorf("DiscoverIPForMAC with no lease = %q, want the complete ARP entry 172.16.60.41", got)
+	}
+	if got := DiscoverIPForMAC("52:54:00:aa:bb:03"); got != "" {
+		t.Errorf("DiscoverIPForMAC = %q for a MAC with only a failed ARP entry and no lease, want \"\"", got)
+	}
+}
+
 func TestGetIPFromARP_MissingTable(t *testing.T) {
 	old := arpTablePath
 	arpTablePath = filepath.Join(t.TempDir(), "absent")

@@ -67,20 +67,17 @@ const (
 	discoveryRefusedNoIdentity = "no_identity"
 )
 
-// discoverNICAddress asks THIS host where a MAC is answering: the ARP cache
-// first, then libvirt's dnsmasq leases.
+// discoverNICAddress asks THIS host where a MAC is answering: the dnsmasq
+// lease first, then a complete ARP entry — lv.DiscoverIPForMAC, which says
+// why that order, and which the VM healthcheck uses too.
 //
-// One implementation for all four discovery paths, which each had their own
-// copy of the same two-line fallback, and the seam that lets a test drive
-// discovery without a guest (see SetNICIPDiscovery).
+// One implementation for all the discovery paths, and the seam that lets a
+// test drive discovery without a guest (see SetNICIPDiscovery).
 func (s *Server) discoverNICAddress(mac string) string {
 	if s.nicIPDiscovery != nil {
 		return s.nicIPDiscovery(mac)
 	}
-	if ip := lv.GetIPFromARP(mac); ip != "" {
-		return ip
-	}
-	return lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", mac)
+	return lv.DiscoverIPForMAC(mac)
 }
 
 // SetNICIPDiscovery replaces the ARP / dnsmasq-lease lookup behind

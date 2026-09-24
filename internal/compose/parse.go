@@ -49,7 +49,7 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 	var f File
 	if root := documentRoot(&doc); root != nil {
 		if !opts.stored {
-			v.checkHealthcheckFields(root)
+			v.checkFileFields(root)
 		}
 		if err := root.Decode(&f); err != nil {
 			// A field that did not decode leaves the file half-read;

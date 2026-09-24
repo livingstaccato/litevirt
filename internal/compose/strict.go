@@ -36,34 +36,9 @@ type parseOpts struct {
 	stored bool
 }
 
-// checkHealthcheckFields reports unknown fields in every workload's
-// healthcheck block.
-func (v *validator) checkHealthcheckFields(root *yaml.Node) {
-	root = resolveAlias(root)
-	if root == nil || root.Kind != yaml.MappingNode {
-		return
-	}
-	hcType := reflect.TypeOf(HealthCheckDef{})
-	for _, top := range mappingEntries(root) {
-		if top.key.Value != "vms" && top.key.Value != "workloads" {
-			continue
-		}
-		wls := resolveAlias(top.val)
-		if wls == nil || wls.Kind != yaml.MappingNode {
-			continue
-		}
-		for _, wl := range mappingEntries(wls) {
-			body := resolveAlias(wl.val)
-			if body == nil || body.Kind != yaml.MappingNode {
-				continue
-			}
-			for _, f := range mappingEntries(body) {
-				if f.key.Value == "healthcheck" {
-					v.checkFields(f.val, hcType, top.key.Value+"."+wl.key.Value+".healthcheck", 0)
-				}
-			}
-		}
-	}
+// checkFileFields reports every unknown field in the file.
+func (v *validator) checkFileFields(root *yaml.Node) {
+	v.checkFields(root, reflect.TypeOf(File{}), "", 0)
 }
 
 // checkFields reports every key of mapping n that struct type t has no field

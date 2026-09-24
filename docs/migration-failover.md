@@ -143,10 +143,10 @@ When a host goes offline, the failover coordinator:
 | Method | How it works |
 |--------|-------------|
 | `ipmi` | Power cycle via IPMI/BMC (requires `ipmi_address`, `ipmi_user`, `ipmi_pass` on host). Verified post-fence by polling `chassis power status`. |
-| `ssh` | `systemctl poweroff` over SSH; reports failure if unreachable. |
+| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. |
 | `watchdog` | Local watchdog self-fence (the host writes its own watchdog timer dead). Requires `watchdog_dev` in config. When `watchdog_dev` is set the daemon validates the device at startup and refuses to start if it's absent, so a broken watchdog is caught before it's needed rather than at fence time (override: `LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1`). On a graceful daemon shutdown the watchdog is disarmed only when this host owns no running VMs or containers; while it owns any, the device stays armed — a restarting daemon resumes petting well inside the timeout, and a daemon stopped for good with workloads left behind lets the watchdog reboot the host into a safely fenced state. Drain (or `lv host shutdown-workloads`) before planned maintenance. |
 | `manual` | Coordinator does NOT auto-reschedule; operator must run `lv host fence-confirm <host>` after physically powering it off. Required when shared storage would corrupt under split-brain. |
-| `best-effort` | Tries SSH; succeeds regardless. Used in homelabs / single-tenant clusters that explicitly opt out of split-brain protection. |
+| `best-effort` | Tries the same forced SSH power-off as `ssh`; succeeds regardless. Used in homelabs / single-tenant clusters that explicitly opt out of split-brain protection. |
 
 Configure per-host:
 
@@ -219,8 +219,8 @@ cluster inherit that cluster's setting, never this default.
 
 **Requiring a verified fence, per host.** By default a successful SSH fence is
 enough for the coordinator that ran it to reschedule the host's local-disk VMs.
-An SSH success only means a shell accepted a poweroff; nothing checks the host
-went down. To refuse that on a particular host:
+An SSH success only means a shell accepted a forced power-off; nothing checks the
+host went down. To refuse that on a particular host:
 
 ```bash
 lv host label set <host> litevirt.fence_requires_confirmation=true

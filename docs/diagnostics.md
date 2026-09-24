@@ -594,7 +594,7 @@ checked.
 |---|---|---|
 | `verified` | `ipmi` + `fenced` | Powered off, then observed off. |
 | `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
-| `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a poweroff, or its watchdog heartbeat was stopped. Nothing checked it went down. |
+| `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a forced power-off, or its watchdog heartbeat was stopped. Nothing checked it went down. |
 | `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |
 | `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
 | `failed` | any + `partial` | The fence ran and reported failure. |

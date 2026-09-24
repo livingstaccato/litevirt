@@ -1436,6 +1436,11 @@ func highestDependencyCondition(vmName string, ops []compose.Op) string {
 // "vm_healthy", the compose depends-on vocabulary) with that condition's
 // default timeout.
 func (s *Server) waitForCondition(ctx context.Context, vmName, condition string) error {
+	return s.waitForConditionWithin(ctx, vmName, condition, s.dependsOnTimeout(condition))
+}
+
+// dependsOnTimeout is a depends-on condition's default wait.
+func (s *Server) dependsOnTimeout(condition string) time.Duration {
 	timeout := 5 * time.Minute
 	if condition == "vm_healthy" {
 		timeout = 10 * time.Minute
@@ -1443,7 +1448,56 @@ func (s *Server) waitForCondition(ctx context.Context, vmName, condition string)
 	if d := s.dependsOnWaitTimeout.Load(); d > 0 {
 		timeout = time.Duration(d)
 	}
-	return s.waitForConditionWithin(ctx, vmName, condition, timeout)
+	return timeout
+}
+
+// waitForWorkloadCondition waits for a planned workload — a VM or a
+// container — to satisfy a depends-on condition, with the condition's default
+// timeout.
+func (s *Server) waitForWorkloadCondition(ctx context.Context, a planner.VMAction, condition string) error {
+	if a.IsContainer {
+		return s.waitForContainerConditionWithin(ctx, a.TargetHost, a.VMName, condition, s.dependsOnTimeout(condition))
+	}
+	return s.waitForCondition(ctx, a.VMName, condition)
+}
+
+// waitForContainerConditionWithin is waitForConditionWithin for a container
+// on host. A container has no probe verdict — compose refuses vm_healthy on a
+// container that declares a healthcheck — so both conditions mean running,
+// as vm_healthy does for a VM without a healthcheck.
+func (s *Server) waitForContainerConditionWithin(ctx context.Context, host, name, condition string, timeout time.Duration) error {
+	switch condition {
+	case "vm_started", "vm_healthy":
+	default:
+		return fmt.Errorf("unknown wait condition %q for %s (want vm_started or vm_healthy)", condition, name)
+	}
+	deadline := time.Now().Add(timeout)
+	last := "the container does not exist yet"
+	for {
+		rec, err := corrosion.GetContainer(ctx, s.db, host, name)
+		switch {
+		case err != nil:
+			last = fmt.Sprintf("could not read the container: %v", err)
+		case rec == nil:
+			last = "the container does not exist on " + host
+		case rec.State == "running":
+			return nil
+		default:
+			last = "the container is " + rec.State
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		t := time.NewTimer(min(conditionPollInterval, remaining))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	return fmt.Errorf("timeout after %s waiting for %s on container %s: %s", timeout, condition, name, last)
 }
 
 // waitForConditionWithin polls until vmName satisfies condition or timeout

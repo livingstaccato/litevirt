@@ -424,7 +424,13 @@ See [`docs/placement.md`](placement.md) for the cost function, troubleshooting, 
 
 ## Boot ordering (depends-on)
 
-Control the order VMs are created during deployment. Dependencies are respected: a VM won't be created until its dependencies reach the specified condition. VMs with no ordering between them are created in name order, so an unchanged file always deploys in the same order.
+Control the order workloads are created and updated during deployment. A workload that is created or updated by a deploy does not start until each of its dependencies meets the specified condition, whatever the deploy does to the dependency:
+
+- a dependency **created or recreated** by the deploy is created first and waited on right after;
+- a dependency **updated by the rolling engine** is updated first, and the dependent waits on it before its own create or update starts;
+- a dependency the deploy leaves **unchanged** is still a dependency: it is waited on before the dependent starts (so a re-run does not create `app` while `db` is still unhealthy).
+
+Creates and updates are ordered together: a new VM that depends on a VM being updated runs after that update. A workload that the deploy leaves unchanged waits on nothing, even when its dependency is not in the state it once needed. Workloads with no ordering between them run in name order (a failed replica's update first, #32), so an unchanged file always deploys in the same order; deletes run where they always have, after the creates and updates.
 
 ```yaml
 vms:
@@ -459,9 +465,9 @@ Conditions:
   - `lv inspect <vm>` shows the same verdict as `health` / `healthDetail`.
   - Mixed versions: the node serving the deploy decides what `vm_healthy` means, and the VM's owner publishes the verdict. An older node serving a deploy still treats running as healthy; a newer one waiting on a VM with a `healthcheck` whose owner runs an older build sees no verdict and times out. Upgrade every node before relying on it.
 
-If a dependency's condition is not met — its wait times out, or its create (or the recreate of an update) fails — the dependency is reported as a failed action (an `error` line naming it), and **its dependents are held back**: they are neither created nor updated (an existing dependent keeps running as it is), and each is reported as a failed action of its own, naming the dependency, the condition and why it was not met, for example `blocked: depends-on db (condition vm_healthy) was not met: depends-on wait for vm_healthy: timeout after 10m0s waiting for vm_healthy on db: ...`. The block is transitive — whatever depends on a held-back VM is held back too, with `blocked: depends-on app (condition vm_started) was not met: blocked: ...`. VMs that do not depend on the failed one are deployed as usual. The stack ends `degraded`, `compose up` exits non-zero, and the next `compose up` creates the held-back VMs once their dependency is in place. For a replicated dependency, one failed replica holds its dependents back.
+Containers (`kind: lxc` / `kind: oci`) take part in `depends-on` both ways — a VM can depend on a container and a container on a VM. For a container, `vm_started` means the container is running. A container has no probe verdict (a container `healthcheck` is not probed), so `vm_healthy` on a container also means running — the rule for a VM without a `healthcheck` — and a file that asks for `vm_healthy` on a container that **declares** a `healthcheck` is refused at validation (`... is a container (kind lxc) and container healthchecks are not probed — use condition vm_started, or remove the container's healthcheck`), because that promise could not be kept.
 
-A dependency that is unchanged in this deploy is not waited on, so a re-run creates the held-back VMs as soon as the dependency exists — even if it is still not healthy.
+If a dependency's condition is not met — its wait times out, or its create (or the recreate of an update) fails — the dependency is reported as a failed action (an `error` line naming it), and **its dependents are held back**: they are neither created nor updated (an existing dependent keeps running as it is), and each is reported as a failed action of its own, naming the dependency, the condition and why it was not met, for example `blocked: depends-on db (condition vm_healthy) was not met: depends-on wait for vm_healthy: timeout after 10m0s waiting for vm_healthy on db: ...`. The block is transitive — whatever depends on a held-back VM is held back too, with `blocked: depends-on app (condition vm_started) was not met: blocked: ...`. VMs that do not depend on the failed one are deployed as usual. The stack ends `degraded`, `compose up` exits non-zero, and the next `compose up` creates the held-back VMs once their dependency meets its condition — until then the re-run holds them back the same way, with the same `blocked: depends-on ...` line. For a replicated dependency, one failed replica holds its dependents back.
 
 Cycles are detected at parse time and rejected.
 
@@ -676,7 +682,7 @@ The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-repl
 
 `in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
 
-During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last. A rolling update fails fast: if any VM update errors, the deploy stops **before** the scale-down step and the stack's stored desired state is left unchanged, so a failed update never deletes a VM the change didn't intend to and never records a half-applied stack.
+During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last. With `depends-on` between them, the creates and updates run in dependency waves — each wave's creates, then its updates — so a dependent's create or update starts only after its dependency's has finished and met its condition. A rolling update fails fast: if any VM update errors, the deploy stops **before** any later dependency wave and the scale-down step and the stack's stored desired state is left unchanged, so a failed update never deletes a VM the change didn't intend to and never records a half-applied stack.
 
 > Mixed-version note: `in-place`'s non-destructive behavior is enforced by the entry node serving the deploy. Do not rely on the `in-place` strategy until every mutation-serving node in the cluster runs a build that supports it.
 

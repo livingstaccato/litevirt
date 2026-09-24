@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -492,6 +493,24 @@ func validateDependsOn(f *File) error {
 		}
 	}
 
+	// vm_healthy on a container means running (a container has no probe
+	// verdict), which silently breaks the promise when the container declares
+	// a healthcheck: nothing probes it. Refuse that pairing rather than wait
+	// on a check that never runs.
+	names := make([]string, 0, len(f.VMs))
+	for name := range f.VMs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		for target, def := range f.VMs[name].DependsOn {
+			t := f.VMs[target]
+			if def.Condition == "vm_healthy" && t.IsContainer() && t.HealthCheck != nil {
+				return fmt.Errorf("vm %q depends-on %q with condition vm_healthy, but %q is a container (kind %s) and container healthchecks are not probed — use condition vm_started, or remove the container's healthcheck", name, target, target, t.Kind)
+			}
+		}
+	}
+
 	// Cycle detection via topological sort (Kahn's algorithm).
 	inDegree := make(map[string]int)
 	dependents := make(map[string][]string) // target → VMs that depend on it
@@ -558,6 +577,12 @@ func parseMemoryString(s string) (int, error) {
 		return 0, fmt.Errorf("invalid memory value %q: %w", s, err)
 	}
 	return n, nil
+}
+
+// IsContainer reports whether the workload runs in the container runtime
+// (kind lxc or oci) rather than as a VM.
+func (vm *VMDef) IsContainer() bool {
+	return vm.Kind == WorkloadKindLXC || vm.Kind == WorkloadKindOCI
 }
 
 // EffectiveReplicas returns 1 if replicas is nil (unset/omitted).

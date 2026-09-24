@@ -217,6 +217,36 @@ with `lv host init` starts with it on, because there is no prior behavior to pre
 and the unguarded outcome is two hosts writing one disk. Hosts joining an existing
 cluster inherit that cluster's setting, never this default.
 
+**Requiring a verified fence, per host.** By default a successful SSH fence is
+enough for the coordinator that ran it to reschedule the host's local-disk VMs.
+An SSH success only means a shell accepted a poweroff; nothing checks the host
+went down. To refuse that on a particular host:
+
+```bash
+lv host label set <host> litevirt.fence_requires_confirmation=true
+```
+
+With the label, a fence that did not **verify** the power-off — `ssh`, and
+`best-effort` in both its forms — no longer reschedules anything and no longer
+records the host as `fenced`; it is left `offline`. An IPMI fence, which does
+verify, is unaffected. The fence's assurance is shown by `lv doctor fence` and
+`lv host fence` (see [Diagnostics](diagnostics.md)).
+
+It is a label rather than a config flag because only one place acts on it — the
+coordinator creating the recovery — so no peer needs to honour it, and a
+coordinator on an older binary ignores it and behaves exactly as before. Roll
+the binary out before relying on it.
+
+**Know what it costs today.** An operator confirmation is meant to be the way
+past the refusal, and the gate does accept one. But a coordinator that has
+refused a host does not revisit it in that outage, so a `lv host fence-confirm`
+written *after* the refusal does not move the workloads — not in the same
+process and not after a restart. This is the same strand that affects `manual`
+hosts and best-effort hosts under the safe-fence policy (#252). Until that is
+fixed, this label means "never reschedule this host automatically on an
+unverified fence": confirm the host is off and move its workloads by hand.
+`litevirt_failover_stranded_workloads` counts what is waiting.
+
 **Per-host implication:** a host whose fence strategy is `best-effort`/`ssh`/`manual`
 (anything but `ipmi`) gives its shared-disk VMs *manual-confirm-only* automated
 failover once this is enforced. `lv host inspect <host>` prints a note when a host's

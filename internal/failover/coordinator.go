@@ -1337,7 +1337,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// path) instead of leaving the workloads on a powered-off host. The
 	// "offline" state is an INFERENCE about a fence that could not prove itself,
 	// so recoverFenced writes that one, behind the check, with the reschedule.
-	if fenceProvedOff(fr) {
+	if fenceProvedOff(h, fr) {
 		c.markHostState(ctx, h.Name, "fenced")
 	}
 
@@ -1373,8 +1373,32 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 // and whether a later coordinator may resume the recovery from the record
 // alone — the two must agree, or a resumed recovery would act on a fence that
 // never established the host was down.
-func fenceProvedOff(fr fence.Result) bool {
+//
+// A host carrying LabelFenceRequiresConfirmation raises the bar to the
+// shared-storage one: only a VERIFIED fence (corrosion.FenceProofGrade) counts,
+// so an SSH or best-effort success leaves the host "offline" rather than
+// recording it as known to be off. Without the label the rule is unchanged.
+func fenceProvedOff(h *corrosion.HostRecord, fr fence.Result) bool {
+	if requiresFenceConfirmation(h) {
+		return fr.Success && corrosion.FenceProofGrade(fr.Method, "fenced")
+	}
 	return fr.Success && fr.Method != "manual"
+}
+
+// requiresFenceConfirmation reports whether h has opted into "an unverified
+// fence is not enough" via LabelFenceRequiresConfirmation.
+//
+// A per-host label, not a config flag or a capability token, and deliberately
+// so. The decision it changes is made in ONE place — the coordinator creating
+// the recovery — so no peer has to honour anything, and a coordinator on an
+// older binary simply does not read the label and behaves exactly as today:
+// the fail-mode of a mixed-version roll is the existing behaviour, never a
+// weaker one. It is per host because the answer differs by host: one with a
+// separate management network is safer to trust than one without. And it
+// needs no schema change, beside LabelUnsafeAutoFailover, the fencing policy
+// label already here.
+func requiresFenceConfirmation(h *corrosion.HostRecord) bool {
+	return h != nil && h.Labels[corrosion.LabelFenceRequiresConfirmation] == "true"
 }
 
 // markHostState records a host-state transition the coordinator decided on,
@@ -1410,7 +1434,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// rather than "fenced" — a weaker claim, and the one the split-brain guards
 	// below still demand confirmation for. The proof-grade case was written by
 	// the caller, before the lease re-check, so it survives a handoff.
-	if !fenceProvedOff(fr) {
+	if !fenceProvedOff(h, fr) {
 		c.markHostState(ctx, h.Name, "offline")
 	}
 
@@ -1433,6 +1457,31 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
+		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+	}
+
+	// Per-host "an unverified fence is not enough" (LabelFenceRequiresConfirmation).
+	// A successful fence that did not VERIFY the power-off — SSH, or best-effort
+	// in either of its forms — is treated like a manual one: reschedule only on
+	// an operator confirmation. A verified (IPMI) fence passes; a failed fence
+	// falls through to the split-brain guard below, which refuses it anyway.
+	//
+	// The refusal message says what actually happens today rather than what
+	// should. A cycle that refuses a host does not revisit it (c.fenced, set
+	// above), so a confirmation written AFTER this refusal does not by itself
+	// move the workloads — the #252 strand, shared with the manual and
+	// safe-fence paths. The operator is told to recover by hand.
+	if requiresFenceConfirmation(h) && fr.Success && !corrosion.FenceProofGrade(fr.Method, "fenced") {
+		if !c.manualFenceConfirmed(ctx, h.Name) {
+			slog.Error("failover: host requires a verified fence and this one was not verified, NOT rescheduling",
+				"host", h.Name, "method", fr.Method, "detail", fr.Detail,
+				"label", corrosion.LabelFenceRequiresConfirmation,
+				"recover", "confirm "+h.Name+" is powered off, then move its workloads by hand — "+
+					"a later fence-confirm does not resume this recovery (litevirt_failover_stranded_workloads counts them)")
+			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			return
+		}
+		slog.Info("failover: operator confirmed an unverified fence, proceeding", "host", h.Name, "method", fr.Method)
 		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
 	}
 

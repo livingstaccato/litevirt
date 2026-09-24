@@ -179,3 +179,27 @@ func TestDeferTakeover(t *testing.T) {
 		}
 	}
 }
+
+// TestLeaseContest_AStoodDownLoserIsNotReportedAsHolder: before the winner's
+// fresh term reaches it, the loser's replica knows only that its term is
+// contested — its own lease row and its own term-1 row still name it. It must
+// not report itself as the holder from that moment, not one TTL later.
+func TestLeaseContest_AStoodDownLoserIsNotReportedAsHolder(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	now := leaseTestNow.Add(time.Second)
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-b", time.Minute, leaseTestNow)
+	if err != nil || !held || term != 1 {
+		t.Fatalf("seed tenure: held=%v term=%d err=%v", held, term, err)
+	}
+	if got, err := IsLeaseHolder(ctx, c, LeaseKeyFailover, "host-b", now); err != nil || !got {
+		t.Fatalf("uncontested holder: IsLeaseHolder=%v err=%v, want true", got, err)
+	}
+
+	c.noteLeaseTermClaims(LeaseKeyFailover, 1, "host-b", "host-a")
+
+	if got, err := IsLeaseHolder(ctx, c, LeaseKeyFailover, "host-b", now); err != nil || got {
+		t.Fatalf("host-b lost the contest for term 1 to host-a but IsLeaseHolder=%v err=%v, want false", got, err)
+	}
+}

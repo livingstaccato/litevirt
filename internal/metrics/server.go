@@ -688,14 +688,13 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// Failover-leader lease holder. expires_at is RFC3339, so compare against an
 	// RFC3339 cutoff, not datetime('now') (whose space text mis-sorts a same-day
 	// lease and would always report it valid).
+	// IsLeaseHolder also consults the term ledger, so a claimant that stood down
+	// from a contested term stops reporting itself leader at once instead of
+	// when its own row expires.
 	leaderVal := 0.0
-	if leaderRows, lerr := c.db.Query(ctx,
-		`SELECT holder FROM leader_election
-		 WHERE key = 'failover' AND expires_at >= ?`,
-		time.Now().UTC().Format(time.RFC3339)); lerr == nil {
-		if len(leaderRows) > 0 && leaderRows[0].String("holder") == c.hostName {
-			leaderVal = 1.0
-		}
+	if held, lerr := corrosion.IsLeaseHolder(ctx, c.db, corrosion.LeaseKeyFailover,
+		c.hostName, time.Now()); lerr == nil && held {
+		leaderVal = 1.0
 	}
 	ch <- prometheus.MustNewConstMetric(c.leaderHolder, prometheus.GaugeValue, leaderVal)
 

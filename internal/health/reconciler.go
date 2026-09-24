@@ -922,9 +922,12 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			}
 			slog.Warn("reconciler: removing clearly-dead local leftover whose DB row moved to another host",
 				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "reason", st.Reason)
-			if err := r.virt.DestroyDomain(domName); err != nil {
-				slog.Warn("reconciler: destroy stale domain failed", "vm", domName, "error", err)
-			}
+			// No DestroyDomain: every path here proved the domain shut off
+			// (cleanableLeftover and unknownShutoff both require it), so a
+			// destroy only fails with "domain is not running". And were the
+			// domain to start between that check and now, undefining leaves
+			// the running copy alone, where a destroy would kill it.
+			//
 			// wipe by design: a stopped/defined leftover whose VM now lives on
 			// another host (the authoritative firmware state travels with it).
 			if err := r.virt.UndefineDomain(domName, false); err != nil {

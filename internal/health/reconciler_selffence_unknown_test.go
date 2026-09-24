@@ -52,8 +52,8 @@ func TestReconciler_SelfFence_UnknownReasonLeftoverCleanedWhenOwnerRunsIt(t *tes
 
 	r.selfFence(context.Background())
 
-	if fake.DomainExists("vm1") || !wasDestroyed(fake, "vm1") {
-		t.Fatalf("a shut-off (unknown) leftover with no managed-save image, whose DB owner runs the VM, must be cleaned; probed=%v", probed)
+	if fake.DomainExists("vm1") || !wasUndefined(fake, "vm1") || wasDestroyed(fake, "vm1") {
+		t.Fatalf("a shut-off (unknown) leftover with no managed-save image, whose DB owner runs the VM, must be undefined without a destroy call; probed=%v", probed)
 	}
 	if len(probed) != 1 || probed[0] != "node-b/vm1" {
 		t.Fatalf("the proof must come from the DB owner's own runtime, probed=%v", probed)

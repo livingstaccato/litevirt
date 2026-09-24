@@ -97,8 +97,16 @@ func TestReconciler_StartPendingVM_RefusesWhenLockHeld(t *testing.T) {
 // (paused/pmsuspended/saved), nor on an unreadable state — that defers to the
 // Phase-3 runtime/fencing ownership reconciliation.
 func wasDestroyed(fake *libvirtfake.Fake, name string) bool {
+	return hadOp(fake, name, "destroy")
+}
+
+func wasUndefined(fake *libvirtfake.Fake, name string) bool {
+	return hadOp(fake, name, "undefine")
+}
+
+func hadOp(fake *libvirtfake.Fake, name, op string) bool {
 	for _, e := range fake.EventLog() {
-		if e.Domain == name && e.Op == "destroy" {
+		if e.Domain == name && e.Op == op {
 			return true
 		}
 	}
@@ -208,8 +216,14 @@ func TestReconciler_SelfFence_DeadLeftoverDestroyed(t *testing.T) {
 
 			NewReconciler("node-a", t.TempDir(), db, fake).selfFence(ctx)
 
-			if fake.DomainExists("vm1") || !wasDestroyed(fake, "vm1") {
+			if fake.DomainExists("vm1") || !wasUndefined(fake, "vm1") {
 				t.Fatalf("selfFence must clean up a clearly-dead leftover (reason %q) whose VM moved away", reason)
+			}
+			// The leftover is already shut off, so there is nothing to destroy:
+			// libvirt rejects the call ("domain is not running") and it only
+			// logged a spurious failure before every cleanup.
+			if wasDestroyed(fake, "vm1") {
+				t.Fatalf("a shut-off leftover (reason %q) must be undefined without a destroy call", reason)
 			}
 		})
 	}

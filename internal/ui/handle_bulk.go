@@ -2,7 +2,9 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -166,13 +168,24 @@ func (s *Server) handleBulkHosts(w http.ResponseWriter, r *http.Request) {
 		fn = func(ctx context.Context, name string) error {
 			// DrainHost is a streaming RPC — we just need it to start
 			// successfully. The drain happens asynchronously.
-			stream, err := s.grpc.DrainHost(ctx, &pb.DrainHostRequest{Name: name})
+			// Detached: the drain must outlive this request (#192).
+			opCtx, cancel := detachedOpContext(ctx)
+			stream, err := s.grpc.DrainHost(opCtx, &pb.DrainHostRequest{Name: name})
 			if err != nil {
+				cancel()
 				return err
 			}
-			// Consume one message to confirm the stream opened cleanly.
-			_, err = stream.Recv()
-			return err
+			// Consume one message to confirm the stream opened cleanly, then
+			// keep reading so the drain runs to its end.
+			if _, err = stream.Recv(); err != nil {
+				cancel()
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
+			}
+			drainInBackground("drain host "+name, cancel, func() error { _, rerr := stream.Recv(); return rerr })
+			return nil
 		}
 	case "undrain":
 		fn = func(ctx context.Context, name string) error {

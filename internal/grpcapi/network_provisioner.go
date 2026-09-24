@@ -18,6 +18,14 @@ import (
 type NetworkProvisioner interface {
 	Provision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error)
 	Deprovision(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, hostName string) error
+	// Provisioned reports whether this host still has what Provision set up
+	// for the network (its bridge, and its dnsmasq where one runs). It must
+	// be cheap: the network reconciler asks it for every network every pass.
+	Provisioned(name string, def compose.NetworkDef) bool
+	// RemoveUnusedBridge deletes bridge name from this host if it is a bridge
+	// with no ports and no IPv4 address, and reports whether it did. Absent is
+	// not an error.
+	RemoveUnusedBridge(name string) (bool, error)
 }
 
 type hostNetworkProvisioner struct{}
@@ -30,6 +38,14 @@ func (hostNetworkProvisioner) Deprovision(ctx context.Context, db *corrosion.Cli
 	return network.Deprovision(ctx, db, name, def, hostName)
 }
 
+func (hostNetworkProvisioner) Provisioned(name string, def compose.NetworkDef) bool {
+	return network.ProvisionedHere(name, def)
+}
+
+func (hostNetworkProvisioner) RemoveUnusedBridge(name string) (bool, error) {
+	return network.RemoveBridgeIfUnused(name)
+}
+
 // SetNetworkProvisioner replaces the host network provisioner (tests only;
 // nil restores the real one).
 func (s *Server) SetNetworkProvisioner(p NetworkProvisioner) { s.netProvisioner = p }
@@ -39,6 +55,13 @@ func (s *Server) networkProvisioner() NetworkProvisioner {
 		return s.netProvisioner
 	}
 	return hostNetworkProvisioner{}
+}
+
+// ProvisionNetworkHere provisions one network on this host through the
+// server's provisioner. It is a network.ProvisionFunc, handed to the health
+// reconciler so a failover restart provisions exactly as a VM create does.
+func (s *Server) ProvisionNetworkHere(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error) {
+	return s.networkProvisioner().Provision(ctx, db, name, def, localIP, hostName)
 }
 
 // provisionForVM provisions networkName on this host for a NIC and returns its

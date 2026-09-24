@@ -932,6 +932,15 @@ treated the same way: it attaches to the cluster network of that name, made with
 network "hc" (used by db) is not declared under networks: and no cluster network by that name exists
 ```
 
+Stacks deployed before this rule stored such a NIC on `<stack>_<name>`, a name
+with no network behind it, so the VM sat on an empty bridge of that name with
+no gateway and no DHCP. Deploying the same file again moves the NIC onto the
+cluster network in place: same VM, same MAC, same disks. It is not a recreate.
+The VM's host re-plugs the NIC at once when the deploy ran there, and otherwise
+on its next network pass (within 30 seconds). Once no NIC uses the old
+`<stack>_<name>` bridge, the host removes it. If `<stack>_<name>` is a real
+network, the move is refused for that VM and the VM is left as it is.
+
 Networks the file declares belong to the stack. They are stored as
 `<stack>_<name>`, so two stacks can each have a network called `lan`.
 

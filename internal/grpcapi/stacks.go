@@ -127,6 +127,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	current := buildCurrentVMsFromState(state, f.Name)
 	sortVMActions(resolved.VMs, current)
 
+	// Move NICs off a legacy stack-scoped flat bridge in place, before either
+	// executor sees the update: both apply an update by recreating the VM.
+	failures := newDeployFailures(stream)
+	if err := s.applyNICRetargets(ctx, resolved, stream, failures); err != nil {
+		return err
+	}
+
 	// Check if the compose file specifies a rolling update strategy.
 	rollingStrategy := useRollingUpdate(f)
 	hasUpdates := false
@@ -137,7 +144,6 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		}
 	}
 
-	failures := newDeployFailures(stream)
 	if rollingStrategy != "" && hasUpdates {
 		// Rolling update mode: creates first, then rolling updates, then deletes.
 		if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, failures); err != nil {

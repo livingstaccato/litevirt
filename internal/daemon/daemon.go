@@ -943,6 +943,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
+	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
 	// row points elsewhere against every other active host's libvirt before
 	// reclaiming it.

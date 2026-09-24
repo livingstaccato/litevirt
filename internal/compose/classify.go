@@ -97,10 +97,23 @@ type ChangePlan struct {
 	RestartReasons []string
 	// RecreateReasons are changes that alter VM identity (delete+create only).
 	RecreateReasons []string
+	// NICRetargets are NICs whose stored network is the stack-scoped
+	// "<stack>_<name>" and whose desired network is the cluster network
+	// "<name>" — a stack deployed before undeclared NIC networks resolved to
+	// the cluster network. The NIC keeps its MAC and the VM its disks; only the
+	// bridge it is plugged into changes, so it is applied in place (Max=Live).
+	NICRetargets []NICRetarget
 	// Delegated records changes owned by another path (load-balancer, backup,
 	// rolling-update strategy) — recorded, not silently ignored, and never a VM
 	// lifecycle action here.
 	Delegated []string
+}
+
+// NICRetarget is one NIC moving from its stack-scoped network to the cluster
+// network of the same short name.
+type NICRetarget struct {
+	Ordinal  int
+	From, To string
 }
 
 // Max returns the coarsest action the plan requires (Recreate > Restart > Live >
@@ -112,7 +125,7 @@ func (p ChangePlan) Max() Action {
 		return ActionRecreate
 	case len(p.RestartReasons) > 0:
 		return ActionRestart
-	case len(p.ResourceChanges) > 0 || len(p.MetadataChanges) > 0:
+	case len(p.ResourceChanges) > 0 || len(p.MetadataChanges) > 0 || len(p.NICRetargets) > 0:
 		return ActionLive
 	default:
 		return ActionNoChange
@@ -128,6 +141,9 @@ func (p ChangePlan) Reasons() string {
 	out = append(out, p.RestartReasons...)
 	for _, d := range p.ResourceChanges {
 		out = append(out, fmt.Sprintf("%s %s→%s", d.Field, d.Old, d.New))
+	}
+	for _, r := range p.NICRetargets {
+		out = append(out, fmt.Sprintf("nic %d network %s→%s (re-plugged in place, same MAC, disks kept)", r.Ordinal, r.From, r.To))
 	}
 	for _, d := range p.MetadataChanges {
 		if d.Old == "" && d.New == "" {
@@ -230,7 +246,13 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	if dd := StoredDisksFromSpec(desired); len(dd) > 0 {
 		recreateIf(!disksTopologyEqual(dd, storedDisks), "disk-topology change recreates")
 	}
-	recreateIf(len(desired.Network) > 0 && !networkTopologyEqual(desired.Network, stored.Network), "network-topology change recreates")
+	if len(desired.Network) > 0 && !networkTopologyEqual(desired.Network, stored.Network) {
+		if rt, ok := nicRetargets(desired, stored); ok {
+			p.NICRetargets = rt
+		} else {
+			recreateIf(true, "network-topology change recreates")
+		}
+	}
 	recreateIf(desired.CloudInit != nil && !proto.Equal(desired.CloudInit, stored.CloudInit), "cloud-init change recreates")
 
 	// --- Live metadata: spec-persisted, no runtime action; unset desired inherits ---
@@ -351,6 +373,36 @@ func disksTopologyEqual(desired, stored []StoredDisk) bool {
 		}
 	}
 	return true
+}
+
+// nicRetargets reports whether the ONLY NIC differences between desired and
+// stored are NICs moving from the stack-scoped "<stack>_<name>" to the cluster
+// network "<name>" (same count, same order, same model), and lists them.
+//
+// That is exactly the shape a stack deployed before undeclared NIC networks
+// resolved to the cluster network (ResolveNetworkName) takes when the same
+// file is applied again. Whether the old name really was a record-less flat
+// bridge is a cluster fact the classifier cannot see; the executor checks it
+// before it moves anything.
+func nicRetargets(desired, stored *pb.VMSpec) ([]NICRetarget, bool) {
+	if desired.StackName == "" || len(desired.Network) != len(stored.Network) {
+		return nil, false
+	}
+	var out []NICRetarget
+	for i, d := range desired.Network {
+		s := stored.Network[i]
+		if m := d.GetModel(); m != "" && m != s.GetModel() {
+			return nil, false
+		}
+		if d.GetName() == s.GetName() {
+			continue
+		}
+		if s.GetName() != ScopedNetworkName(desired.StackName, d.GetName()) {
+			return nil, false
+		}
+		out = append(out, NICRetarget{Ordinal: i, From: s.GetName(), To: d.GetName()})
+	}
+	return out, len(out) > 0
 }
 
 // networkTopologyEqual compares NIC topology by the stable, non-server-resolved

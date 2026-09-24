@@ -196,7 +196,13 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 	for _, r := range live {
 		sig := r.typ + "\x00" + r.config
 		if a, ok := st.applied[r.name]; ok && a.sig == sig {
-			continue
+			// Unchanged and set up by this process. Provision again only if the
+			// host lost it since: a dnsmasq that died, a bridge someone deleted.
+			if prov.Provisioned(r.name, a.def) {
+				continue
+			}
+			slog.Warn("network reconcile: this host lost the network's bridge or dnsmasq; provisioning it again",
+				"network", r.name)
 		}
 		def, err := networkRowDef(r)
 		if err != nil {
@@ -219,6 +225,11 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 	if changed {
 		s.reconcileFirewall(ctx)
 	}
+
+	// With the networks in place, finish any NIC move a deploy recorded for a
+	// VM on this host, then remove flat bridges nothing uses any more.
+	s.reconcileLegacyNICs(ctx)
+	s.removeLeftoverStackBridges(ctx, st)
 	return nil
 }
 

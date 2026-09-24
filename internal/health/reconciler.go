@@ -93,6 +93,9 @@ type Reconciler struct {
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
+	// provision sets up a network on this host for a VM start. nil means
+	// network.SafeProvision. Set via SetNetworkProvision.
+	provision network.ProvisionFunc
 
 	// Now is the reconciler's clock for vm_lock lease timestamps. Defaults to
 	// time.Now; the fleet harness overrides it so lock-expiry scenarios advance
@@ -265,6 +268,12 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1) so the
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
+
+// SetNetworkProvision replaces how a VM start provisions the VM's networks on
+// this host (nil restores network.SafeProvision). The daemon passes the same
+// provisioner the gRPC server uses, so a failover restart and a VM create set
+// a network up the same way; the fleet harness passes its per-node fake.
+func (r *Reconciler) SetNetworkProvision(fn network.ProvisionFunc) { r.provision = fn }
 
 // publishRunning routes a NON-MINTING transition through the marker chokepoint.
 // See PublishVMRunning for the ordering and why it is the right one here.
@@ -1430,7 +1439,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		bridge := iface.NetworkName
 		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
 		// This is critical after failover — the new host may not have the network set up.
-		if provBridge, err := network.ProvisionForVM(ctx, r.db, iface.NetworkName, r.hostName); err != nil {
+		provision := r.provision
+		if provision == nil {
+			provision = network.SafeProvision
+		}
+		if provBridge, err := network.ProvisionForVMWith(ctx, r.db, iface.NetworkName, r.hostName, provision); err != nil {
 			slog.Warn("reconciler: network provision failed, using raw name",
 				"vm", vm.Name, "network", iface.NetworkName, "error", err)
 		} else if provBridge != "" {

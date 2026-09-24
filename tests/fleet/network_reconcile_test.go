@@ -86,6 +86,38 @@ func TestFleet_NetworkLifecycleReachesEveryHost(t *testing.T) {
 	}
 }
 
+// A host that loses what provisioning set up — dnsmasq died, or someone
+// deleted the bridge — gets it back on the next pass, not at the next
+// restart. A network that is still intact is left alone.
+func TestFleet_NetworkReconcileHealsAHostThatLostTheNetwork(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	n0, n1 := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	want := network.IsolatedBridgeName("hc")
+
+	for _, name := range []string{"hc", "other"} {
+		if _, err := c.SelfClient(n0).CreateNetwork(ctx, &pb.CreateNetworkRequest{
+			Name: name, Type: "isolated", Subnet: "172.16.50.0/24", Dhcp: true,
+		}); err != nil {
+			t.Fatalf("CreateNetwork %s: %v", name, err)
+		}
+	}
+	n1.DB.MergeStateBytesLWW(pullDump(t, c, n0))
+	reconcileNetworks(t, n1)
+
+	n1.Net.Lose("hc")
+	reconcileNetworks(t, n1)
+	if dev, ok := n1.Net.Up("hc"); !ok || dev != want {
+		t.Errorf("%s: hc provisioned=%v on %q after the host lost it, want it back on %s", n1.Name, ok, dev, want)
+	}
+	if got := n1.Net.Provisions("hc"); got != 2 {
+		t.Errorf("%s: hc provisioned %d times, want 2 (once, then once more after the loss)", n1.Name, got)
+	}
+	if got := n1.Net.Provisions("other"); got != 1 {
+		t.Errorf("%s: intact network other provisioned %d times, want 1", n1.Name, got)
+	}
+}
+
 // A deleted network whose device a live network still uses is not torn down:
 // that would pull the bridge, gateway or dnsmasq out from under the live one.
 func TestFleet_NetworkReconcileSparesADeviceALiveNetworkUses(t *testing.T) {

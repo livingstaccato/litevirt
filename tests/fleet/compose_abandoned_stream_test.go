@@ -39,7 +39,14 @@ func injectFirstFailsSecondWaits(node *Node, release <-chan struct{}) {
 		case strings.Contains(xml, "<name>hb-1</name>"):
 			return errors.New("injected: define refused")
 		case strings.Contains(xml, "<name>hb-2</name>"):
-			once.Do(func() { <-release })
+			// Bounded: a test that never releases must fail, not hang the
+			// package until the 10-minute test timeout.
+			once.Do(func() {
+				select {
+				case <-release:
+				case <-time.After(30 * time.Second):
+				}
+			})
 		}
 		return nil
 	}
@@ -58,14 +65,36 @@ func TestFleet_ComposeAbandonedDeployStreamCancelsTheRestOfTheDeploy(t *testing.
 	if err != nil {
 		t.Fatalf("DeployStack: %v", err)
 	}
-	for {
-		p, err := stream.Recv()
+	var (
+		mu   sync.Mutex
+		seen []string
+	)
+	seenNow := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), seen...) }
+	gotErr := make(chan error, 1)
+	go func() {
+		for {
+			p, err := stream.Recv()
+			if err != nil {
+				gotErr <- err
+				return
+			}
+			mu.Lock()
+			seen = append(seen, p.GetVmName()+"/"+p.GetPhase()+"/"+p.GetError())
+			mu.Unlock()
+			if p.Error != "" {
+				gotErr <- nil // what the old deployer did: return, closing the connection
+				return
+			}
+		}
+	}()
+	select {
+	case err := <-gotErr:
 		if err != nil {
-			t.Fatalf("stream ended before any error phase: %v", err)
+			t.Fatalf("stream ended before any error phase: %v (saw %v)", err, seenNow())
 		}
-		if p.Error != "" {
-			break // what the old deployer did: return, closing the connection
-		}
+	case <-time.After(20 * time.Second):
+		close(release)
+		t.Fatalf("no error phase within 20s (saw %v)", seenNow())
 	}
 	cancel()
 	time.Sleep(200 * time.Millisecond) // let the cancellation reach the server

@@ -23,7 +23,7 @@ var (
 
 // SetLocalResolver configures the embedded-DNS domain + port that new dnsmasq
 // instances forward that domain's queries to (127.0.0.1#port). Call once at
-// daemon start before reconcileNetworks.
+// daemon start, before the first network reconcile pass.
 func SetLocalResolver(domain string, port int) {
 	localResolverDomain = strings.TrimSuffix(domain, ".")
 	localResolverPort = port

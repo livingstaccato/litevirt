@@ -377,6 +377,8 @@ type Server struct {
 	// netProvisioner is the host network provisioner seam (see
 	// NetworkProvisioner). Production leaves it nil: package network directly.
 	netProvisioner NetworkProvisioner
+	// netReconcile is what ReconcileNetworksOnce has done on this host.
+	netReconcile netReconcileState
 
 	// bridgeEnsure is a test seam for host bridge availability and provisioning.
 	// Production leaves it nil, preserving the net.InterfaceByName +

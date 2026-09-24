@@ -61,3 +61,30 @@ func TestRelocateContainers(t *testing.T) {
 		t.Error("expected a ct.relocate.skipped audit row for novol")
 	}
 }
+
+// A relocating container is charged what it uses on the survivor: its memory
+// limit, with no qemu overhead, and no host vCPU for its cpu figure. It was
+// placed like a VM, so a container whose cpu figure exceeded the survivor's
+// vCPU, or whose memory fit only without a VM's overhead, was stranded.
+func TestRelocateContainers_ChargesMemoryOnly(t *testing.T) {
+	db := newTestDB(t)
+	ctx := context.Background()
+	// 1 vCPU / 4096 MiB: 3 allocatable vCPU, 3072 allocatable MiB.
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: "live", Address: "10.0.0.2", SSHUser: "root", SSHPort: 22, GRPCPort: 7443, State: "active", CPUTotal: 1, MemTotal: 4096,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "dead", Name: "web", State: "running", Image: "alpine:3.19",
+		CPULimit: 8, MemMiB: 3000, Project: "p1", OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	c := newTestCoordinator("coord", db)
+	c.relocateContainers(ctx, &corrosion.HostRecord{Name: "dead"}, []corrosion.HostRecord{{Name: "live", State: "active"}})
+
+	if web, _ := corrosion.GetContainer(ctx, db, "live", "web"); web == nil {
+		t.Fatal("web (cpu 8, 3000 MiB) was not relocated to live (3 vCPU, 3072 MiB allocatable)")
+	}
+}

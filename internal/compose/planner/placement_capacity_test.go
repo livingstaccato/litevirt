@@ -96,8 +96,7 @@ func TestResolve_UpdateBeyondItsHostNamesTheShortfall(t *testing.T) {
 		"db": {Image: "ubuntu", CPU: 1, Memory: 4096, Placement: &compose.PlacementDef{Host: "node-2"}},
 	})
 	_, err := Resolve(context.Background(), f, labUpdateState())
-	want := "db needs 4224 MiB of memory on node-2 (4096 MiB + 128 MiB qemu overhead), " +
-		"which has 1947 MiB free after db's current 1024 MiB is released"
+	want := "node-2: memory (needs 4224 MiB incl. 128 qemu overhead, 1947 free after db's current 1024 is released)"
 	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("Resolve err = %v\nwant it to contain %q", err, want)
 	}
@@ -107,7 +106,7 @@ func TestResolve_UpdateBeyondItsHostNamesTheShortfall(t *testing.T) {
 // charged alongside the recreated one.
 func TestResolve_ContainerUpdateReplacesItsAllocation(t *testing.T) {
 	// 4096 − 1024 reserve = 3072 allocatable. The running container holds 2000;
-	// its 2000 MiB replacement (+128) fits only once the old 2000 is released.
+	// its 2000 MiB replacement fits only once the old 2000 is released.
 	f := makeFile("mystack", map[string]compose.VMDef{
 		"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.21", CPU: 2, Memory: 2000},
 	})
@@ -122,5 +121,26 @@ func TestResolve_ContainerUpdateReplacesItsAllocation(t *testing.T) {
 	}
 	if a := ctAction(plan, "web"); a == nil || a.Kind != OpUpdate || a.TargetHost != "lxc1" {
 		t.Fatalf("container update = %+v, want an update on lxc1", a)
+	}
+}
+
+// A container is charged what it uses: its memory limit, with no qemu overhead,
+// and no host vCPU for its cpu figure — the rule the snapshot counts running
+// containers by, and the one host admission applies. The planner used to build
+// a container's request like a VM's.
+func TestResolve_ContainerChargesMemoryOnly(t *testing.T) {
+	// 1 vCPU / 4096 MiB: 3 allocatable vCPU, 3072 allocatable MiB. cpu 8 and
+	// 3000 MiB fit only without a vCPU charge and without a 128 MiB overhead.
+	f := makeFile("mystack", map[string]compose.VMDef{
+		"web": {Kind: compose.WorkloadKindLXC, Image: "alpine:3.21", CPU: 8, Memory: 3000},
+	})
+	state := makeState([]corrosion.HostRecord{lxcHost("lxc1", 1, 4096)}, nil, nil)
+
+	plan, err := Resolve(context.Background(), f, state)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if a := ctAction(plan, "web"); a == nil || a.TargetHost != "lxc1" {
+		t.Fatalf("container = %+v, want placed on lxc1", a)
 	}
 }

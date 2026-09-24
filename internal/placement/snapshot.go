@@ -275,6 +275,19 @@ func (s *ClusterSnapshot) CommitPlacement(host, vmName, baseName string, cpu, me
 	}
 }
 
+// commitContainer is CommitPlacement for a container: it holds memory and
+// nothing else — no vCPU, no VMCount slot (and so no qemu overhead) — exactly as
+// AddContainerMemory counts the containers already running.
+func (s *ClusterSnapshot) commitContainer(host, name, baseName string, mem int) {
+	s.MemUsed[host] += mem
+	if baseName != "" {
+		if s.ReplicasByBase[baseName] == nil {
+			s.ReplicasByBase[baseName] = map[string]int{}
+		}
+		s.ReplicasByBase[baseName][host]++
+	}
+}
+
 // hostCostMultiplier reads the cost.hourly label off a host. Used by
 // PolicyCostAware. Default 1.0 if missing/unparseable.
 func hostCostMultiplier(h corrosion.HostRecord) float64 {

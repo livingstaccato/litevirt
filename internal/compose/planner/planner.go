@@ -272,6 +272,8 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		// don't mutate the compose def's Require map). On update, pin to the
 		// current host so the recreate happens in place.
 		if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
+			// Charged as a container: memory only, no qemu overhead, no vCPU.
+			req.Container = true
 			rl := map[string]string{corrosion.LabelLXCCapable: "true"}
 			for k, v := range req.RequireLabels {
 				rl[k] = v
@@ -281,7 +283,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 				if h := ctHost[op.VMName]; h != "" {
 					req.PinHost = h
 				}
-				req.Replaces = containerAllocation(ctRecordByName[op.VMName])
+				req.Replaces = placement.ContainerAllocation(ctRecordByName[op.VMName])
 			}
 		} else if op.Kind == OpUpdate {
 			// A VM UPDATE stays on its current host — re-running placement could pick a
@@ -857,16 +859,6 @@ func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) p
 		})
 	}
 	return req
-}
-
-// containerAllocation is what a container holds by the snapshot's counting rule
-// (corrosion.ContainerMemoryByHost: running and capped, memory only — its CPU
-// limit is shares, never counted), or nil when it holds nothing.
-func containerAllocation(ct corrosion.ContainerRecord) *placement.Allocation {
-	if ct.HostName == "" || ct.State != "running" || ct.MemMiB <= 0 {
-		return nil
-	}
-	return &placement.Allocation{Host: ct.HostName, MemMiB: ct.MemMiB}
 }
 
 // vmBaseName strips a trailing "-N" replica suffix.

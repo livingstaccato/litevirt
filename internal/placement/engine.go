@@ -68,6 +68,13 @@ type Request struct {
 	// is released while this request is evaluated, and the new one is committed
 	// in its place — "replace", never "add".
 	Replaces *Allocation
+
+	// Container marks a container workload. A container holds host MEMORY only:
+	// its cpu_limit is a cgroup cpu figure, never a vCPU reservation (the
+	// snapshot, host admission and the capacity sampler all leave container CPU
+	// out of host usage), and it has no qemu process, so no per-VM overhead and
+	// no VMCount slot. CPUNeeded is ignored, and MemMiBNeeded is charged as is.
+	Container bool
 }
 
 // Allocation is what one workload currently holds on one host, in the units
@@ -89,6 +96,16 @@ func VMAllocation(vm corrosion.VMRecord) *Allocation {
 		return nil
 	}
 	return &Allocation{Host: vm.HostName, CPU: vm.CPUActual, MemMiB: vm.MemActual, VM: true}
+}
+
+// ContainerAllocation is what ct holds on its host by the snapshot's counting
+// rule for containers (corrosion.ContainerHoldsHostMemory: running and
+// memory-capped, memory only), or nil when it holds nothing.
+func ContainerAllocation(ct corrosion.ContainerRecord) *Allocation {
+	if ct.HostName == "" || !corrosion.ContainerHoldsHostMemory(ct) {
+		return nil
+	}
+	return &Allocation{Host: ct.HostName, MemMiB: ct.MemMiB}
 }
 
 // effectivePolicy resolves Policy + Spread legacy toggle into a canonical Policy.
@@ -165,7 +182,8 @@ func IsInfrastructureError(err error) bool {
 var ErrNoEligibleHost = errors.New("no eligible host")
 
 // HostRejection is one candidate host and why the hard-filter pipeline
-// refused it.
+// refused it: every filter it failed, comma-separated, e.g.
+// "memory (needs 1152 MiB incl. 128 qemu overhead, 795 free), anti-affinity (web-2)".
 type HostRejection struct {
 	Host   string
 	Reason string
@@ -186,7 +204,7 @@ func (e *NoEligibleHostError) Error() string {
 	}
 	reasons := make([]string, len(e.Rejections))
 	for i, r := range e.Rejections {
-		reasons[i] = r.Reason
+		reasons[i] = r.Host + ": " + r.Reason
 	}
 	return msg + ": " + strings.Join(reasons, "; ")
 }
@@ -325,6 +343,13 @@ func restrictToPinnedHost(snap *ClusterSnapshot, host string) error {
 // fromBatch=true uses the snapshot's mutable Devices pool (already deep-
 // copied by SelectBatch); fromBatch=false uses the read-only pool.
 func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hostCandidate, error) {
+	if req.Container && req.CPUNeeded != 0 {
+		// A container's cpu figure is not a host vCPU demand — not for the hard
+		// filter, and not for the CPU dimension's scoring or spread-strict cap.
+		r := *req
+		r.CPUNeeded = 0
+		req = &r
+	}
 	policy := req.effectivePolicy()
 	weights := req.effectiveWeights()
 	dims := AllDimensions(weights)
@@ -347,24 +372,28 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 
 	var candidates []hostCandidate
 	var rejections []HostRejection
-	reject := func(host, format string, args ...any) {
-		rejections = append(rejections, HostRejection{Host: host, Reason: fmt.Sprintf(format, args...)})
-	}
 	for _, h := range snap.HostsBy {
+		// A host that cannot take workloads at all gets that one reason: the
+		// resource figures of a draining host or a witness are beside the point.
 		if h.State != "active" {
-			reject(h.Name, "%s is not active (state: %s)", h.Name, h.State)
+			rejections = append(rejections, HostRejection{Host: h.Name, Reason: "not active (" + h.State + ")"})
 			continue
 		}
 		if h.IsWitness() {
-			reject(h.Name, "%s is a witness", h.Name)
+			rejections = append(rejections, HostRejection{Host: h.Name, Reason: "witness"})
 			continue
 		}
+
+		// Every other hard filter runs even after one fails, and each failure is
+		// named: an operator who fixes the memory shortfall must not then discover
+		// the anti-affinity and the missing label one deploy at a time.
+		var failed []string
+
 		// Hard: the host's effective-capacity observation is neither incomplete
 		// nor stale. A host that cannot account for its own runtime consumption
 		// must be treated as unknown, never as headroom.
 		if snap.CapacityUnknown[h.Name] {
-			reject(h.Name, "%s has an incomplete or stale capacity observation", h.Name)
-			continue
+			failed = append(failed, "capacity observation incomplete or stale")
 		}
 
 		// Hard: resources fit. ALLOCATABLE (physical adjusted by the cluster's
@@ -377,11 +406,10 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		freeCPU := allocCPU - snap.CPUUsed[h.Name]
 		freeMem := allocMem - snap.MemUsed[h.Name] - req.Capacity.MemOverheadFor(snap.VMCount[h.Name])
 		if req.CPUNeeded > 0 && freeCPU < req.CPUNeeded {
-			reject(h.Name, "%s needs %d vCPU on %s, which has %d allocatable vCPU free%s",
-				req.VMName, req.CPUNeeded, h.Name, freeCPU, releasedNote(req, h.Name, "vCPU"))
-			continue
+			failed = append(failed, fmt.Sprintf("vcpu (needs %d, %d free%s)",
+				req.CPUNeeded, freeCPU, releasedNote(req, h.Name, false)))
 		}
-		// MemChargeFor: the INCOMING VM costs its guest memory plus one qemu
+		// memCharge: the INCOMING VM costs its guest memory plus one qemu
 		// overhead, exactly like the VMs already counted in freeMem above. Comparing
 		// bare guest memory made the two sides disagree by one overhead, so with
 		// 1024 MiB free a 1024 MiB VM was accepted although it draws 1024+128.
@@ -390,33 +418,30 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		// guest memory, and CommitPlacement (batch placement) adds it to MemUsed AND
 		// increments VMCount — which re-applies MemOverheadFor. Folding it in would
 		// double-count every batch member.
-		if charge := req.Capacity.MemChargeFor(req.MemMiBNeeded); req.MemMiBNeeded > 0 && freeMem < charge {
-			reject(h.Name, "%s needs %d MiB of memory on %s (%d MiB + %d MiB qemu overhead), which has %d MiB free%s",
-				req.VMName, charge, h.Name, req.MemMiBNeeded, charge-req.MemMiBNeeded, freeMem,
-				releasedNote(req, h.Name, "MiB"))
-			continue
+		if charge := req.memCharge(); req.MemMiBNeeded > 0 && freeMem < charge {
+			needs := fmt.Sprintf("%d MiB", charge)
+			if overhead := charge - req.MemMiBNeeded; overhead > 0 {
+				needs += fmt.Sprintf(" incl. %d qemu overhead", overhead)
+			}
+			failed = append(failed, fmt.Sprintf("memory (needs %s, %d free%s)",
+				needs, freeMem, releasedNote(req, h.Name, true)))
 		}
 
 		// Hard: anti-affinity.
 		if antiAffinityHosts[h.Name] {
-			reject(h.Name, "%s runs a VM %s has anti-affinity with (%s)",
-				h.Name, req.VMName, strings.Join(vmsOnHost(snap, req.AntiAffinity, h.Name), ", "))
-			continue
+			failed = append(failed, "anti-affinity ("+strings.Join(vmsOnHost(snap, req.AntiAffinity, h.Name), ", ")+")")
 		}
 
 		// Hard: max-per-node replica limit.
 		if req.MaxPerNode > 0 && req.VMBaseName != "" {
 			if n := snap.ReplicasByBase[req.VMBaseName][h.Name]; n >= req.MaxPerNode {
-				reject(h.Name, "%s already runs %d %s replica(s), max_per_node is %d",
-					h.Name, n, req.VMBaseName, req.MaxPerNode)
-				continue
+				failed = append(failed, fmt.Sprintf("max-per-node (%d of %d %s replicas)", n, req.MaxPerNode, req.VMBaseName))
 			}
 		}
 
 		// Hard: required labels.
 		if len(req.RequireLabels) > 0 && !labelsMatch(h.Labels, req.RequireLabels) {
-			reject(h.Name, "%s lacks required label %s", h.Name, missingLabels(h.Labels, req.RequireLabels))
-			continue
+			failed = append(failed, "labels (needs "+missingLabels(h.Labels, req.RequireLabels)+")")
 		}
 
 		// Hard: device requirements.
@@ -425,28 +450,27 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 			pool := snap.Devices[h.Name]
 			ok, bonus := scoreHostDevicesForHost(pool, req.Devices, snap.MappingDevices, h.Name)
 			if !ok {
-				reject(h.Name, "%s cannot satisfy %s's device requirements", h.Name, req.VMName)
-				continue
+				failed = append(failed, "devices")
 			}
 			deviceBonus = bonus
 		}
 
 		// Hard (spread-strict only): no dimension may exceed the pressure cap.
 		if policy == PolicySpreadStrict {
-			over := false
 			for _, d := range dims {
 				if d.Weight() <= 0 || d.Capacity(snap, h.Name) <= 0 {
 					continue
 				}
 				if Pressure(d, snap, h.Name, req) > strictSpreadPressureCap {
-					over = true
+					failed = append(failed, fmt.Sprintf("spread-strict pressure cap (%.0f%%)", strictSpreadPressureCap*100))
 					break
 				}
 			}
-			if over {
-				reject(h.Name, "%s would exceed the spread-strict pressure cap (%.0f%%)", h.Name, strictSpreadPressureCap*100)
-				continue
-			}
+		}
+
+		if len(failed) > 0 {
+			rejections = append(rejections, HostRejection{Host: h.Name, Reason: strings.Join(failed, ", ")})
+			continue
 		}
 
 		// Weighted-sum dimensional score.
@@ -662,7 +686,11 @@ func SelectBatch(
 
 		devAssign := assignDevices(snap.Devices, chosen, req.Devices)
 		results[req.VMName] = BatchResult{Host: chosen, Devices: devAssign}
-		snap.CommitPlacement(chosen, req.VMName, req.VMBaseName, req.CPUNeeded, req.MemMiBNeeded)
+		if req.Container {
+			snap.commitContainer(chosen, req.VMName, req.VMBaseName, req.MemMiBNeeded)
+		} else {
+			snap.CommitPlacement(chosen, req.VMName, req.VMBaseName, req.CPUNeeded, req.MemMiBNeeded)
+		}
 	}
 
 	return results, nil
@@ -737,17 +765,27 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 
 // releasedNote qualifies a free-capacity figure on the host a replaced workload
 // is leaving: the figure already includes what it gives back, and an operator
-// reading "1947 MiB free" beside a running 1 GiB VM must be told why.
-func releasedNote(req *Request, host, unit string) string {
+// reading "1947 free" beside a running 1 GiB VM must be told why.
+func releasedNote(req *Request, host string, memory bool) string {
 	r := req.Replaces
 	if r == nil || r.Host != host {
 		return ""
 	}
-	amount := r.MemMiB
-	if unit == "vCPU" {
-		amount = r.CPU
+	amount := r.CPU
+	if memory {
+		amount = r.MemMiB
 	}
-	return fmt.Sprintf(" after %s's current %d %s is released", req.VMName, amount, unit)
+	return fmt.Sprintf(" after %s's current %d is released", req.VMName, amount)
+}
+
+// memCharge is the host memory this request draws when it appears on a host:
+// a VM's guest memory plus one qemu overhead (MemChargeFor), a container's
+// memory limit as is.
+func (r *Request) memCharge() int {
+	if r.Container {
+		return r.MemMiBNeeded
+	}
+	return r.Capacity.MemChargeFor(r.MemMiBNeeded)
 }
 
 // vmsOnHost returns the names in vms that snap places on host, sorted.

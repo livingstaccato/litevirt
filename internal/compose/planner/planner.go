@@ -478,12 +478,7 @@ func resolveNetworkTargets(plan *ResolvedPlan, f *compose.File, vmHostMap map[st
 	// Build network → hosts map from VM placements.
 	// Keys use scoped names to match plan.Networks[].Name.
 	netHosts := map[string]map[string]bool{}
-	scopeNet := func(rawName string) string {
-		if nd, ok := f.Networks[rawName]; ok && nd.External {
-			return rawName
-		}
-		return compose.ScopedNetworkName(f.Name, rawName)
-	}
+	scopeNet := f.ResolveNetworkName
 	for _, vmDef := range f.VMs {
 		for _, na := range vmDef.Network {
 			key := scopeNet(na.Name)

@@ -867,6 +867,17 @@ External networks must not set `subnet`, `dhcp`, `vni`, or `type` — these are 
 
 This is useful for shared infrastructure networks managed outside of compose stacks, or for connecting VMs in different stacks to the same network.
 
+A VM or container NIC that names a network the file does not declare at all is
+treated the same way: it attaches to the cluster network of that name, made with
+`lv network create`. The deploy is refused if no such network exists:
+
+```
+network "hc" (used by db) is not declared under networks: and no cluster network by that name exists
+```
+
+Networks the file declares belong to the stack. They are stored as
+`<stack>_<name>`, so two stacks can each have a network called `lan`.
+
 ## Volume definitions
 
 ```yaml

@@ -105,6 +105,60 @@ Every host probes every other host via TLS connection to the gRPC port (7443) ev
 
 A host transitions to `suspect` after 3 consecutive probe failures. The failover coordinator takes action after quorum confirmation.
 
+#### An observer that stopped running is not a witness
+
+A failed probe counts against the peer only if the observer was running while it
+waited for the answer. A host that suspends, swaps out or starves the node
+running litevirt stops the whole daemon. The node's clocks keep moving (inside a
+VM they follow the hypervisor), so each probe the node had in flight runs out its
+deadline without the daemon ever waiting for a reply. The probe reports
+"unreachable" about a peer that answered the whole time. If every observer runs
+on one overloaded host, they can all build up failures against a live peer at
+the same moment and reach fencing quorum.
+
+Each health checker therefore runs a heartbeat that measures only its own
+scheduling. It beats every 250 ms. A gap between beats longer than the 2 s probe
+interval means this node was not running for that long. The gap is measured on
+both the monotonic and the wall clock, because on bare metal the monotonic clock
+does not advance across a system suspend. After a gap:
+
+- **The failure count this node had built against every peer is discarded.** A
+  verdict against a peer is made only of probes attempted after the node resumed.
+  The probe that straddled the gap is never one of them.
+- **For the stall grace window, an unreachable probe is not counted.** The window
+  is the time a normal fence verdict takes to build — 5 failed probes at the 2 s
+  probe interval, 10 s — and it is derived from those two numbers, not tuned
+  separately, so it moves with them. There is no setting for it. No
+  row is written for it, so a previously published `suspect` row is not refreshed
+  and ages out of fencing quorum's 30 s freshness window. A successful probe still
+  counts, and so does a peer's explicit not-ready answer.
+- **This node's failover coordinator decides no new fence for the same window.** It
+  logs `quorum reached, but this node was itself not running moments ago` and
+  counts `litevirt_failover_attempts_total{phase="skip",error_class="local_stall"}`.
+  Resuming a recovery from a fence that is already recorded is not a new decision,
+  and it is not held back.
+
+**Seeing it.** The node records an `observer_stalled` condition about itself for
+the length of the window — `lv health` lists it, and `lv doctor fence` names the
+node with how long it was paused and until when its votes are withheld. See
+[Diagnostics](diagnostics.md#observer-stalled-observer_stalled).
+
+A host that really is dead is still fenced. After a stall its observers need the
+grace window plus the usual 5 failed probes, about 20 s from resume instead of
+about 10 s. That bound holds once the observer has stayed running through it. An
+observer that stalls again and again keeps withholding its vote, and while it
+does so it does not count toward fencing.
+
+The guard does not cover a **peer** that stalls. To every observer that kept
+running, a peer that answers no probe for about 10 s cannot be told apart from a
+dead one, and it is fenced exactly as before. That is the case fencing exists
+for: the peer may come back with its workloads still running. Pausing an entire
+cluster at once and resuming it does not fence anything, with or without the
+guard. Rows written before the pause are stale against the resumed clocks, and
+no failure is counted for time that merely passed. What the guard adds is that
+failure debt from before the pause, together with a probe caught by the pause,
+cannot add up to a quorum.
+
 Clock skew between hosts is also monitored — warnings are logged if skew exceeds 1 second.
 
 ### VM health
@@ -442,7 +496,7 @@ Scrape `http://<host>:7444/metrics` for:
   `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`). A skip is `result=skipped` with the reason in `error_class`
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`, `local_stall`). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions

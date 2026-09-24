@@ -19,7 +19,12 @@ kept-local and flagged for repair (ownership/tenancy/policy/auth are never
 coin-flipped) — see [Diagnostics](diagnostics.md). Health is observed
 peer-to-peer every 2 s, by an
 application-level readiness probe that performs a trivial local read — not by a
-TLS handshake, which a daemon with a wedged database completes perfectly.
+TLS handshake, which a daemon with a wedged database completes perfectly. An
+observer that was itself not running (suspended, swapped out, starved of CPU)
+does not count the probes it timed out while stopped, or any unreachable probe
+in the 10 s after it resumes, and its coordinator decides no fence in that
+window. See [Migration & Failover](migration-failover.md) → "An observer that
+stopped running is not a witness".
 Failover is decided by quorum among observers, gated by a CRDT-stored leader
 lease. Fencing has multiple strategies; safety guards refuse to reschedule
 VMs after a fence failure so that the same VM never runs on two hosts at once.

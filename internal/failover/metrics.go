@@ -83,6 +83,9 @@ const (
 	ErrRelocateFailed      = "relocate_failed"
 	ErrOwnershipDispute    = "ownership_dispute" // active ownership condition on the workload; recovery refused
 	ErrRestoreUnknown      = "restore_unknown"
+	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
+	// stopped running within health.StallGrace, so the fence is deferred.
+	ErrLocalStall = "local_stall"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

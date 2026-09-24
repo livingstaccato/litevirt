@@ -1043,6 +1043,29 @@ is its connectivity edges going `suspect`.
 A single-node cluster with no seeds is never reported: it has nobody to be
 isolated from.
 
+### Observer stalled (`observer_stalled`)
+
+A node that was itself not running — its VM suspended, swapped out, or starved
+of CPU — raises `observer_stalled` about **itself**, with one writer per row like
+`gossip_isolated`. While it is open, the node counts no failed probe against a
+peer and its failover coordinator decides no fence: probes that timed out while
+it was not running say nothing about the peer. It is not an ownership condition
+and never blocks admission.
+
+| Raised when | Clears when |
+|---|---|
+| The health checker's heartbeat (every 250 ms) sees a gap longer than one probe interval (2 s), on either the monotonic or the wall clock. Confirmed at once: it is a measurement of the node's own scheduling, not an inference from a scan. **Warning** severity. The evidence carries `gap_seconds` and `grace_until`. A further stall inside the window extends the same episode. | The grace window closes: 5 probe intervals (10 s) after the stall, the time a normal fence verdict takes to build. A condition left open by a previous daemon process is resolved on start. |
+
+**What you see.** A host that died while its observers were stalled is fenced
+up to one grace window later than usual. `lv doctor fence` lists the stalled
+nodes under `stalled observers (fence votes withheld)` with the pause length
+and the time the window closes. A forward NTP step larger than 2 s also reads
+as a stall; it delays a fence by one window and never causes one.
+
+**If it keeps reappearing,** the node is being starved: an overcommitted host, a
+VM swapping, or a laptop running the lab alongside heavy builds. A node that
+stalls repeatedly keeps withholding its vote, which is safe but slows failover.
+
 ### Runtime owner mismatch (`runtime_owner_mismatch`)
 
 The dual-run detector raises `runtime_owner_mismatch` about a **VM** when the

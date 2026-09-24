@@ -96,10 +96,7 @@ func TestDHCPWouldServeMatchesProvisioning(t *testing.T) {
 			}
 			defer func() { startDHCPFunc = StartDHCP }()
 
-			db, err := corrosion.NewTestClient()
-			if err != nil {
-				t.Fatalf("NewTestClient: %v", err)
-			}
+			db := corrosion.NewTestClientT(t)
 			ctx := context.Background()
 			if err := corrosion.InitSchema(ctx, db); err != nil {
 				t.Fatalf("InitSchema: %v", err)
@@ -272,10 +269,7 @@ func TestProvisionRefusesDHCPOverABoundPrefix(t *testing.T) {
 	}
 	defer func() { startDHCPFunc = StartDHCP }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -285,7 +279,7 @@ func TestProvisionRefusesDHCPOverABoundPrefix(t *testing.T) {
 		Type: "bridge", Interface: "lv-no-such-br1", Subnet: "10.0.5.0/24",
 		NetBoxPrefixID: 7,
 	}
-	_, err = Provision(ctx, db, "bound-net", def, "10.0.0.1", "host1")
+	_, err := Provision(ctx, db, "bound-net", def, "10.0.0.1", "host1")
 	if err == nil {
 		t.Fatal("want Provision to refuse: this host would start a DHCP server over a bound prefix")
 	}
@@ -311,10 +305,7 @@ func TestProvisionServesDHCPOnAnUnboundNetwork(t *testing.T) {
 	}
 	defer func() { startDHCPFunc = StartDHCP }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

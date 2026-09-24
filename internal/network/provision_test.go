@@ -32,10 +32,7 @@ func TestProvision_Bridge(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -82,10 +79,7 @@ func TestProvision_Bridge_PreExistingNAT_NoDHCP(t *testing.T) {
 	}
 	defer func() { startDHCPFunc = StartDHCP }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -141,10 +135,7 @@ func TestProvision_Bridge_PreExistingNAT_NoDHCP(t *testing.T) {
 func TestProvision_DnsmasqPidFilePaths(t *testing.T) {
 	newDB := func(t *testing.T) *corrosion.Client {
 		t.Helper()
-		db, err := corrosion.NewTestClient()
-		if err != nil {
-			t.Fatalf("NewTestClient: %v", err)
-		}
+		db := corrosion.NewTestClientT(t)
 		if err := corrosion.InitSchema(context.Background(), db); err != nil {
 			t.Fatalf("InitSchema: %v", err)
 		}
@@ -227,10 +218,7 @@ func TestProvision_VXLAN(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -275,10 +263,7 @@ func TestProvision_WithSubnet(t *testing.T) {
 	}
 	defer func() { startDHCPFunc = StartDHCP }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -291,7 +276,7 @@ func TestProvision_WithSubnet(t *testing.T) {
 		Underlay:  "eth0",
 		Subnet:    "10.200.0.0/24",
 	}
-	_, err = Provision(ctx, db, "test-net", def,"10.1.0.2", "host1")
+	_, err := Provision(ctx, db, "test-net", def,"10.1.0.2", "host1")
 	if err != nil {
 		t.Fatalf("Provision with subnet: %v", err)
 	}
@@ -316,10 +301,7 @@ func TestProvision_SRIOV(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -339,10 +321,7 @@ func TestProvision_SRIOV(t *testing.T) {
 }
 
 func TestProvision_Direct(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -363,10 +342,7 @@ func TestProvision_Direct(t *testing.T) {
 }
 
 func TestProvision_Direct_MissingInterface(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -376,17 +352,14 @@ func TestProvision_Direct_MissingInterface(t *testing.T) {
 		Type:      "direct",
 		Interface: "nonexistent-iface-xyz",
 	}
-	_, err = Provision(ctx, db, "test-direct", def, "10.0.0.1", "host1")
+	_, err := Provision(ctx, db, "test-direct", def, "10.0.0.1", "host1")
 	if err == nil {
 		t.Fatal("expected error for non-existent interface, got nil")
 	}
 }
 
 func TestProvision_Direct_NoInterface(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -396,7 +369,7 @@ func TestProvision_Direct_NoInterface(t *testing.T) {
 		Type: "direct",
 		// Interface intentionally empty
 	}
-	_, err = Provision(ctx, db, "test-direct", def, "10.0.0.1", "host1")
+	_, err := Provision(ctx, db, "test-direct", def, "10.0.0.1", "host1")
 	if err == nil {
 		t.Fatal("expected error for empty interface, got nil")
 	}
@@ -414,10 +387,7 @@ func TestDeprovision_Direct(t *testing.T) {
 }
 
 func TestUpsertAndGetVTEPs(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -459,10 +429,7 @@ func TestSyncFloodEntries(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

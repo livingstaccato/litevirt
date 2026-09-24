@@ -154,10 +154,7 @@ func cleanAdvertisingNode(t *testing.T) (*Server, *libvirtfake.Fake) {
 // produces rather than hand-built rows.
 func peerClient(t *testing.T) *corrosion.Client {
 	t.Helper()
-	c, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("peer client: %v", err)
-	}
+	c := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(context.Background(), c); err != nil {
 		t.Fatalf("peer InitSchema: %v", err)
 	}

@@ -32,10 +32,7 @@ import (
 func TestWireLeaseTermLedgerGate_TheMintTracksTheDurableLatch(t *testing.T) {
 	ctx := context.Background()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("test client: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("init schema: %v", err)
 	}

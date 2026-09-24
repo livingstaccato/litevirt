@@ -38,10 +38,7 @@ func TestJitterDuration(t *testing.T) {
 
 func newPeerAuthServer(t *testing.T) *Server {
 	t.Helper()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatal(err)
@@ -146,10 +143,7 @@ func TestVerifyPulledBinary(t *testing.T) {
 // TestPreferRelaySource_Fallback: with no gossip members (no relays elected),
 // preferRelaySource returns a candidate matching the target without panicking.
 func TestPreferRelaySource_Fallback(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := corrosion.NewTestClientT(t)
 	s := NewServerForTests(TestServerOpts{HostName: "self", DataDir: t.TempDir(), DB: db, Virt: libvirtfake.New()})
 	target := peerVersionInfo{host: "p1", version: "v2", schema: 30}
 	peers := []peerVersionInfo{target, {host: "p2", version: "v2", schema: 30}}

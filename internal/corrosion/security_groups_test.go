@@ -6,10 +6,7 @@ import (
 )
 
 func TestSecurityGroupCRUD(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -41,10 +38,7 @@ func TestSecurityGroupCRUD(t *testing.T) {
 }
 
 func TestListSecurityGroups(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -80,10 +74,7 @@ func TestListSecurityGroups(t *testing.T) {
 }
 
 func TestDeleteSecurityGroup(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -111,10 +102,7 @@ func TestDeleteSecurityGroup(t *testing.T) {
 // rejected at creation (the renderer only emits IPv4, so accepting them would
 // silently fail to filter IPv6). IPv4 and empty (any) CIDRs are accepted.
 func TestInsertSGRule_RejectsIPv6(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -153,10 +141,7 @@ func TestIsIPv6CIDR(t *testing.T) {
 }
 
 func TestSGRulesCRUD(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -199,10 +184,7 @@ func TestSGRulesCRUD(t *testing.T) {
 }
 
 func TestGetSecurityGroup_NotFound(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

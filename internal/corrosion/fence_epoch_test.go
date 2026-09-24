@@ -81,10 +81,7 @@ func seedFenceLog(t *testing.T, c *Client, id, host, method, result, ts string) 
 }
 
 func TestCheckProofGradeFence(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)

@@ -16,10 +16,7 @@ import (
 // executor refuses it as stale.
 func TestAcquireLeaseWithTerm_NeverReturnsASupersededTerm(t *testing.T) {
 	ctx := context.Background()
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -77,10 +74,7 @@ func TestAcquireLeaseWithTerm_NeverReturnsASupersededTerm(t *testing.T) {
 // minted would make the holder invalidate its own in-flight work every interval.
 func TestAcquireLeaseWithTerm_APlainRenewalKeepsItsTerm(t *testing.T) {
 	ctx := context.Background()
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -113,10 +107,7 @@ func TestAcquireLeaseWithTerm_APlainRenewalKeepsItsTerm(t *testing.T) {
 // renewal's guard checks expiry and not just holder identity.
 func TestAcquireLeaseWithTerm_ALapsedTenureIsNotRenewedAcross(t *testing.T) {
 	ctx := context.Background()
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

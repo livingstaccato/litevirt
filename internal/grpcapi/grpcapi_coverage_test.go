@@ -27,10 +27,7 @@ import (
 // testServerWithLocksAndDataDir creates a server with vmLocks and a temp dataDir.
 func testServerCov(t *testing.T) *Server {
 	t.Helper()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -1718,10 +1715,7 @@ func TestRecordMigrationMetrics_Nil(t *testing.T) {
 }
 
 func TestNewServer(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	corrosion.InitSchema(ctx, db)
 
@@ -3890,10 +3884,7 @@ func TestReconcileDeadLBs_OnlyReappliesDead(t *testing.T) {
 func TestMigrateRestore_MintsRelocationProofUnderEnforcement(t *testing.T) {
 	ctx := context.Background()
 	newS := func(destGated bool) *Server {
-		db, err := corrosion.NewTestClient()
-		if err != nil {
-			t.Fatal(err)
-		}
+		db := corrosion.NewTestClientT(t)
 		if err := corrosion.InitSchema(ctx, db); err != nil {
 			t.Fatal(err)
 		}

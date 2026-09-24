@@ -31,7 +31,7 @@ func ParseBytes(data []byte) (*File, error) {
 // ParseNamed is ParseBytes for YAML read from the file name, which prefixes
 // the position of every validation problem.
 func ParseNamed(name string, data []byte) (*File, error) {
-	f, err := parse(data)
+	f, err := parseWith(data, parseOpts{})
 	var ve *ValidationError
 	if errors.As(err, &ve) {
 		ve.File = name
@@ -39,7 +39,7 @@ func ParseNamed(name string, data []byte) (*File, error) {
 	return f, err
 }
 
-func parse(data []byte) (*File, error) {
+func parseWith(data []byte, opts parseOpts) (*File, error) {
 	var doc yaml.Node
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse compose YAML: %w", err)
@@ -50,6 +50,9 @@ func parse(data []byte) (*File, error) {
 	if root := documentRoot(&doc); root != nil {
 		if err := root.Decode(&f); err != nil {
 			v.decodeError(err)
+		}
+		if !opts.stored {
+			v.checkHealthcheckFields(root)
 		}
 	}
 	if !v.ps.empty() {

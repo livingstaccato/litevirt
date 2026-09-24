@@ -598,6 +598,14 @@ compose validation errors:
   - stack.yaml:8:15: vms.db.healthcheck.action: unknown healthcheck action "reboot" — want restart | migrate | alert
 ```
 
+A field the healthcheck does not have is refused, with the field it most likely meant, so a misspelling never leaves a default silently in force:
+
+```
+  - stack.yaml:9:7: vms.db.healthcheck: unknown field "retires" — did you mean "retries"?
+```
+
+Keys starting `x-` (extension fields, free for your own use) and YAML merge keys (`<<: *anchor`) are allowed; the keys an anchor merges in are checked like any other.
+
 The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:
 
 - one passing probe makes the VM **healthy**;

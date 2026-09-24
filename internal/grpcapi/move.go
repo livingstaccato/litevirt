@@ -689,7 +689,7 @@ func (s *Server) syncStackComposeForMovedDisk(ctx context.Context, vm *corrosion
 	if err != nil || st == nil || st.ComposeYAML == "" {
 		return
 	}
-	f, perr := compose.ParseBytes([]byte(st.ComposeYAML))
+	f, perr := compose.ParseStored([]byte(st.ComposeYAML))
 	if perr != nil {
 		slog.Warn("move: parse stack compose for sync", "stack", st.Name, "error", perr)
 		return

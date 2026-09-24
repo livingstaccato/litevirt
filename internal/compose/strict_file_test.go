@@ -90,6 +90,45 @@ networks:
 	}
 }
 
+// ParseStored reads a stored stack without validating it: only what is needed
+// to read it (decoding, the workloads fold, extends) can fail. A stack the
+// current validator refuses — a check added after it was deployed — reads.
+func TestParseStored_ReadsWhatTheValidatorRefuses(t *testing.T) {
+	src := `volumes:
+  shared: { driver: nfs, source: "nas:/export" }
+vms:
+  base:
+    image: u
+  db:
+    extends: base
+    healthcheck: { type: tcp, target: postgres }
+    depends-on: [ghost]
+  web:
+    cpu: 1
+  lb:
+    image: u
+    loadbalancer: { vip: 10.0.0.5/24, ports: [{ listen: 80, target: 80 }] }
+`
+	if _, err := ParseBytes([]byte(src)); err == nil {
+		t.Fatal("the validator accepted the file; the test needs one it refuses")
+	}
+	f, err := ParseStored([]byte(src))
+	if err != nil {
+		t.Fatalf("ParseStored refused a stack over validation: %v", err)
+	}
+	if f.Volumes["shared"].Driver != "nfs" || f.VMs["db"].Image != "u" {
+		t.Errorf("ParseStored read volumes=%+v db=%+v, want the nfs volume and db extending base", f.Volumes, f.VMs["db"])
+	}
+	if !f.VMs["lb"].LoadBalancer.Enabled {
+		t.Error("ParseStored did not read a VIP as an enabled load balancer, as ParseBytes does")
+	}
+	for _, bad := range []string{"vms: [a, b]\n", "vms:\n  a: {extends: nope}\n"} {
+		if _, err := ParseStored([]byte(bad)); err == nil {
+			t.Errorf("ParseStored read a stack it cannot read:\n%s", bad)
+		}
+	}
+}
+
 // Stored stacks stay readable whatever a later build refuses.
 func TestParseStored_AcceptsUnknownFieldsAnywhere(t *testing.T) {
 	src := "name: s\nvm: {}\nvms:\n  web:\n    image: u\n    cpus: 2\n"

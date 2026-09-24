@@ -146,6 +146,13 @@ with the cluster's network table every 30 seconds, and at startup:
 A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
 
+The same pass removes a leftover flat stack bridge: a bridge named
+`<stack>_<name>` that a NIC was once plugged into because that name had no
+network, and that no NIC uses now. It is removed only when no network has that
+name or bridge, no live NIC names it, and on the host it has no ports and no
+IPv4 address. See [compose.md](compose.md#external-networks) for how such a NIC
+is moved.
+
 Creating a VM, migrating one, and restarting one after a failover also
 provision the VM's networks on its host straight away, without waiting for the
 next pass.

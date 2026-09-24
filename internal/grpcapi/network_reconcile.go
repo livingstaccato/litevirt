@@ -225,6 +225,11 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 	if changed {
 		s.reconcileFirewall(ctx)
 	}
+
+	// With the networks in place, finish any NIC move a deploy recorded for a
+	// VM on this host, then remove flat bridges nothing uses any more.
+	s.reconcileLegacyNICs(ctx)
+	s.removeLeftoverStackBridges(ctx, st)
 	return nil
 }
 

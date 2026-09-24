@@ -24,6 +24,7 @@ type NetProvFake struct {
 	provisions   map[string]int    // network → Provision calls
 	deprovisions map[string]int    // network → Deprovision calls
 	flat         map[string]bool   // bridges EnsureBridge created (flat-bridge fallback)
+	busy         map[string]bool   // flat bridges a scenario says have a port attached
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -75,6 +76,29 @@ func (f *NetProvFake) EnsureBridge(name string) error {
 	defer f.mu.Unlock()
 	f.flat[name] = true
 	return nil
+}
+
+// RemoveUnusedBridge removes a flat bridge EnsureBridge made, unless a
+// scenario marked it busy (SetBridgeBusy).
+func (f *NetProvFake) RemoveUnusedBridge(name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.flat[name] || f.busy[name] {
+		return false, nil
+	}
+	delete(f.flat, name)
+	return true, nil
+}
+
+// SetBridgeBusy marks a flat bridge as having a port attached, so
+// RemoveUnusedBridge leaves it.
+func (f *NetProvFake) SetBridgeBusy(name string, busy bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.busy == nil {
+		f.busy = map[string]bool{}
+	}
+	f.busy[name] = busy
 }
 
 // Up returns the device network is provisioned on here, and whether it is.

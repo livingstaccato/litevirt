@@ -22,6 +22,10 @@ type NetworkProvisioner interface {
 	// for the network (its bridge, and its dnsmasq where one runs). It must
 	// be cheap: the network reconciler asks it for every network every pass.
 	Provisioned(name string, def compose.NetworkDef) bool
+	// RemoveUnusedBridge deletes bridge name from this host if it is a bridge
+	// with no ports and no IPv4 address, and reports whether it did. Absent is
+	// not an error.
+	RemoveUnusedBridge(name string) (bool, error)
 }
 
 type hostNetworkProvisioner struct{}
@@ -36,6 +40,10 @@ func (hostNetworkProvisioner) Deprovision(ctx context.Context, db *corrosion.Cli
 
 func (hostNetworkProvisioner) Provisioned(name string, def compose.NetworkDef) bool {
 	return network.ProvisionedHere(name, def)
+}
+
+func (hostNetworkProvisioner) RemoveUnusedBridge(name string) (bool, error) {
+	return network.RemoveBridgeIfUnused(name)
 }
 
 // SetNetworkProvisioner replaces the host network provisioner (tests only;

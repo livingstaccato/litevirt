@@ -62,6 +62,10 @@ type LibvirtBackend interface {
 	DetachDisk(domainName, targetDev string) error
 	AttachNIC(domainName, bridge, model, mac string) error
 	DetachNIC(domainName, mac string) error
+	// SetNICBridge moves an existing NIC (by MAC) onto another bridge in place
+	// — same device and MAC, no detach, no redefine — persistently and, for a
+	// running domain, live.
+	SetNICBridge(domainName, mac, bridge string) error
 	AttachHostdev(domainName, pciAddress string) error
 	// AttachHostdevWithAlias hot-attaches a PCI passthrough device carrying a stable
 	// user alias (ua-<device>-<member>) so the topology-preserving reconcile can key

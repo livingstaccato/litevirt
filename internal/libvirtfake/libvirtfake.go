@@ -926,6 +926,26 @@ func (f *Fake) DetachNIC(domainName, mac string) error {
 	return nil
 }
 
+// SetNICBridge moves domainName's NIC with MAC mac onto bridge in both the
+// persistent and the live view, as the real update-device does. It records a
+// "set-nic-bridge" event and never a define.
+func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	x, ok := libvirt.RetargetDomainXML(f.xml[domainName], mac, bridge)
+	if !ok {
+		return fmt.Errorf("domain %s has no bridge interface with MAC %s", domainName, mac)
+	}
+	f.xml[domainName] = x
+	if live, ok := f.activeXML[domainName]; ok && live != "" {
+		if lx, ok := libvirt.RetargetDomainXML(live, mac, bridge); ok {
+			f.activeXML[domainName] = lx
+		}
+	}
+	f.record("set-nic-bridge", domainName, fmt.Sprintf("mac=%s bridge=%s", mac, bridge))
+	return nil
+}
+
 // nicMacInDomainXML reports whether a domain XML carries an <interface> with the
 // given MAC address (case-insensitive — real libvirt normalizes MAC case, and
 // callers may supply either). Mirrors grpcapi.nicMacInXML — the substring the

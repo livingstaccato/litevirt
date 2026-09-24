@@ -592,11 +592,11 @@ An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`
 
 **When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.
 
-A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails before anything is deployed. Every problem in the file is reported at once, each with its position, field path and, where there is one, a fix:
+A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails, with a non-zero exit, before anything is deployed. Every problem in the file is reported at once — healthcheck or not, in one format — each as `file:line:col: field.path: problem — fix`, the fix given where there is one:
 
 ```
 compose validation errors:
-  - stack.yaml:7:15: vms.db.healthcheck.target: tcp target "postgres" is not a port or host:port: address postgres: missing port in address
+  - stack.yaml:7:15: vms.db.healthcheck.target: "postgres" is not a port number — use 5432
   - stack.yaml:8:15: vms.db.healthcheck.action: unknown healthcheck action "reboot" — want restart | migrate | alert
 ```
 

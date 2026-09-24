@@ -584,7 +584,7 @@ Requirements:
 | `ping` | `"10.0.0.1"` | `10.0.0.1`, as given |
 | `exec` | `"systemctl is-active nginx"` | the command, run inside the guest by the guest agent (`guest-agent` must be on) |
 
-An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); service names such as `ssh` are not accepted.
+An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); a service name such as `ssh` is refused, and for a well-known name (`ssh`, `http`, `https`, `postgres`, `mysql`, `redis`, `dns`, `smtp` and a few more) the error gives the number: `"ssh" is not a port number — use 22`. The table of names is fixed and never read from the host's `/etc/services`, which differs from host to host.
 
 **`type` can be left out when the target settles it**: an `http://` or `https://` URL is that type, and a port, `:port` or `host:port` is `tcp`. A `type` that is written always wins (`type: http` with `target: "8080"` probes HTTP). `ping` and `exec` are never inferred, and neither is anything else — an empty target, a bare path such as `/health`, a bare host — so those need a `type`, and the error says which types there are.
 

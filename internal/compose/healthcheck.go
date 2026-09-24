@@ -61,12 +61,21 @@ func ParseHealthTarget(typ, target string) (HealthTarget, error) {
 		if !isAllDigits(target) {
 			h, p, err := net.SplitHostPort(target)
 			if err != nil {
+				if !strings.Contains(target, ":") {
+					if isPortName(target) && !strings.Contains(target, ".") {
+						return ht, namedPortError(target)
+					}
+					if validPingHost(target) {
+						return ht, &targetError{msg: fmt.Sprintf("tcp target %q has no port", target),
+							hint: fmt.Sprintf("add one, e.g. %q", target+":22")}
+					}
+				}
 				return ht, fmt.Errorf("tcp target %q is not a port or host:port: %v", target, err)
 			}
 			host, port = h, p
 		}
 		if err := checkPort(port); err != nil {
-			return ht, fmt.Errorf("tcp target %q: %v", target, err)
+			return ht, prefixTarget("tcp", target, err)
 		}
 		ht.port = port
 		if isVMSelf(host) {
@@ -87,6 +96,9 @@ func ParseHealthTarget(typ, target string) (HealthTarget, error) {
 			}
 			raw = typ + "://" + raw
 		}
+		if name := urlPortName(raw); name != "" {
+			return ht, namedPortError(name)
+		}
 		u, err := url.Parse(raw)
 		if err != nil {
 			return ht, fmt.Errorf("%s target %q is not a URL: %v", typ, target, err)
@@ -96,7 +108,7 @@ func ParseHealthTarget(typ, target string) (HealthTarget, error) {
 		}
 		if p := u.Port(); p != "" {
 			if err := checkPort(p); err != nil {
-				return ht, fmt.Errorf("%s target %q: %v", typ, target, err)
+				return ht, prefixTarget(typ, target, err)
 			}
 		} else if strings.HasSuffix(u.Host, ":") {
 			return ht, fmt.Errorf("%s target %q: empty port", typ, target)
@@ -233,7 +245,12 @@ func healthProblems(hc *HealthCheckDef) []fieldProblem {
 	switch hc.Type {
 	case "tcp", "http", "https", "ping", "exec":
 		if _, err := ParseHealthTarget(hc.Type, hc.Target); err != nil {
-			out = append(out, fieldProblem{field: "target", msg: err.Error()})
+			fp := fieldProblem{field: "target", msg: err.Error()}
+			var te *targetError
+			if errors.As(err, &te) {
+				fp.msg, fp.hint = te.msg, te.hint
+			}
+			out = append(out, fp)
 		}
 	case "":
 		out = append(out, fieldProblem{field: "type", msg: "healthcheck type is required",
@@ -274,6 +291,9 @@ func isAllDigits(s string) bool {
 
 func checkPort(p string) error {
 	if !isAllDigits(p) {
+		if isPortName(p) {
+			return namedPortError(p)
+		}
 		return fmt.Errorf("port %q must be a number from 1 to 65535", p)
 	}
 	n, err := strconv.Atoi(p)
@@ -281,6 +301,108 @@ func checkPort(p string) error {
 		return fmt.Errorf("port %q must be a number from 1 to 65535", p)
 	}
 	return nil
+}
+
+// targetError is a healthcheck target problem with a one-line fix.
+type targetError struct {
+	msg, hint string
+}
+
+func (e *targetError) Error() string {
+	if e.hint == "" {
+		return e.msg
+	}
+	return e.msg + " — " + e.hint
+}
+
+// prefixTarget names the target in a plain error; a targetError already says
+// what it needs to.
+func prefixTarget(typ, target string, err error) error {
+	var te *targetError
+	if errors.As(err, &te) {
+		return err
+	}
+	return fmt.Errorf("%s target %q: %v", typ, target, err)
+}
+
+// wellKnownPorts is the number to suggest for a service name written where a
+// port belongs. It is fixed on purpose: /etc/services differs from host to
+// host, and a healthcheck must mean the same thing on every one.
+var wellKnownPorts = map[string]int{
+	"ssh":        22,
+	"smtp":       25,
+	"dns":        53,
+	"domain":     53,
+	"http":       80,
+	"https":      443,
+	"submission": 587,
+	"imap":       143,
+	"imaps":      993,
+	"ldap":       389,
+	"ldaps":      636,
+	"mysql":      3306,
+	"mariadb":    3306,
+	"rdp":        3389,
+	"postgres":   5432,
+	"postgresql": 5432,
+	"amqp":       5672,
+	"vnc":        5900,
+	"redis":      6379,
+	"etcd":       2379,
+	"memcached":  11211,
+	"mongodb":    27017,
+}
+
+// namedPortError refuses a service name where a port number belongs, naming
+// the number when the name is well known.
+func namedPortError(name string) error {
+	e := &targetError{msg: fmt.Sprintf("%q is not a port number", name)}
+	if n, ok := wellKnownPorts[strings.ToLower(name)]; ok {
+		e.hint = fmt.Sprintf("use %d", n)
+	} else {
+		e.hint = "ports are numbers from 1 to 65535"
+	}
+	return e
+}
+
+// isPortName reports whether s looks like a service name: letters, digits and
+// '-', with at least one letter.
+func isPortName(s string) bool {
+	letter := false
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+			letter = true
+		case r >= '0' && r <= '9', r == '-':
+		default:
+			return false
+		}
+	}
+	return letter
+}
+
+// urlPortName is the service name a URL writes in its port position
+// ("http://localhost:http/"), or "".
+func urlPortName(raw string) string {
+	rest := raw
+	if i := strings.Index(rest, "://"); i >= 0 {
+		rest = rest[i+3:]
+	}
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		rest = rest[:i]
+	}
+	if i := strings.LastIndexByte(rest, '@'); i >= 0 {
+		rest = rest[i+1:]
+	}
+	// An IPv6 literal's last group ends in ']', which is never a name.
+	i := strings.LastIndexByte(rest, ':')
+	if i < 0 {
+		return ""
+	}
+	if p := rest[i+1:]; isPortName(p) {
+		return p
+	}
+	return ""
 }
 
 // validPingHost accepts an IP literal or a DNS name. It refuses anything ping

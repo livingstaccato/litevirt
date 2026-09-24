@@ -593,18 +593,55 @@ Requirements:
 | `ping` | `"10.0.0.1"` | `10.0.0.1`, as given |
 | `exec` | `"systemctl is-active nginx"` | the command, run inside the guest by the guest agent (`guest-agent` must be on) |
 
-An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); service names such as `ssh` are not accepted.
+An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); a service name such as `ssh` is refused, and for a well-known name (`ssh`, `http`, `https`, `postgres`, `mysql`, `redis`, `dns`, `smtp` and a few more) the error gives the number: `"ssh" is not a port number — use 22`. The table of names is fixed and never read from the host's `/etc/services`, which differs from host to host.
+
+**`type` can be left out when the target settles it**: an `http://` or `https://` URL is that type, and a port, `:port` or `host:port` is `tcp`. A `type` that is written always wins (`type: http` with `target: "8080"` probes HTTP). `ping` and `exec` are never inferred, and neither is anything else — an empty target, a bare path such as `/health`, a bare host — so those need a `type`, and the error says which types there are.
 
 **The VM's address** is its NIC's recorded address — the one `lv ls` shows, lowest-ordinal NIC first — unless the owning host sees a *different* address for that NIC's MAC in its dnsmasq leases or ARP cache, in which case the probe goes to the live one: a DHCP address is recorded once and not updated, so after the guest reboots onto a new lease the recorded address is stale (`lv ls`, DNS and the load balancer keep showing it until it is changed). When the host sees nothing for the MAC — a static or NetBox-assigned address — the recorded address is used. When no address is recorded yet, the probe uses what the host sees for the NIC's MAC.
 
 **When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.
 
-A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails before anything is deployed:
+A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails, with a non-zero exit, before anything is deployed. Every problem in the file is reported at once — healthcheck or not, in one format — each as `file:line:col: field.path: problem — fix`, the fix given where there is one:
 
 ```
 compose validation errors:
-  - vm "db" healthcheck: tcp target "postgres" is not a port or host:port: ...
+  - stack.yaml:7:15: vms.db.healthcheck.target: "postgres" is not a port number — use 5432
+  - stack.yaml:8:15: vms.db.healthcheck.action: unknown healthcheck action "reboot" — want restart | migrate | alert
 ```
+
+A field the healthcheck does not have is refused, with the field it most likely meant, so a misspelling never leaves a default silently in force:
+
+```
+  - stack.yaml:9:7: vms.db.healthcheck: unknown field "retires" — did you mean "retries"?
+```
+
+Keys starting `x-` (extension fields, free for your own use) and YAML merge keys (`<<: *anchor`) are allowed; the keys an anchor merges in are checked like any other.
+
+`interval` and `timeout` are durations with a unit (`"10s"`, `"1m"`) greater than zero; a `timeout` must not exceed the `interval` (written, or its default), since a probe must finish before the next is due; and `retries`, when written, is at least `1`. A field that is left out takes its default:
+
+| Field | Default |
+|---|---|
+| `type` | inferred from `target` (see above), otherwise required |
+| `interval` | `10s` (also the floor: the checker sweeps every 10 seconds) |
+| `timeout` | `5s` |
+| `retries` | `3` |
+| `action` | `restart` |
+
+```
+  - stack.yaml:7:17: vms.db.healthcheck.interval: interval "10" is not a duration — add a unit, e.g. "10s"
+  - stack.yaml:9:16: vms.db.healthcheck.retries: retries must be at least 1 — omit it for the default, 3
+```
+
+A `timeout` of `30s` with no `interval` is refused as `timeout 30s exceeds interval 10s (the default) — lower timeout or raise interval`. The default `timeout` is never held against a short `interval`.
+
+**The plan shows what will be probed.** `lv compose up` prints, under each VM it creates or updates, the healthcheck as the checker will run it: the resolved target (`<vm address>` for a VM-relative one), whether the type was inferred, and every default filled in:
+
+```
+  + create db
+      healthcheck: tcp (inferred) <vm address>:5432 every 10s, timeout 5s, 3 retries, then restart
+```
+
+An `interval` below the checker's 10-second sweep is shown as `every 10s (1ms is below the checker's 10s sweep)`.
 
 The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice, and a probe that was still running when the VM restarted, moved or was redefined is discarded rather than counted against the new one) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:
 

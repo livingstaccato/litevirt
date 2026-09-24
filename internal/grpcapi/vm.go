@@ -3372,7 +3372,7 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	if stackName != "" {
 		st, err := corrosion.GetStack(ctx, s.db, stackName)
 		if err == nil && st != nil && st.ComposeYAML != "" {
-			f, err := compose.ParseBytes([]byte(st.ComposeYAML))
+			f, err := compose.ParseStored([]byte(st.ComposeYAML))
 			if err == nil {
 				if vol, ok := f.Volumes[volumeName]; ok {
 					return storage.Config{

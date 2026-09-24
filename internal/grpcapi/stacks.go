@@ -802,7 +802,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		vmNames[vm.Name] = true
 	}
 	if st, err := corrosion.GetStack(ctx, s.db, req.Name); err == nil && st != nil && st.ComposeYAML != "" {
-		if f, err := compose.ParseBytes([]byte(st.ComposeYAML)); err == nil {
+		if f, err := compose.ParseStored([]byte(st.ComposeYAML)); err == nil {
 			for baseName, vmDef := range f.VMs {
 				// Container workloads are torn down separately via
 				// ListContainersByStack below — don't add them to the VM
@@ -1396,7 +1396,7 @@ func (s *Server) externalNetworkNames(ctx context.Context, stackName string) map
 	if err != nil || st == nil || st.ComposeYAML == "" {
 		return nil
 	}
-	f, err := compose.ParseBytes([]byte(st.ComposeYAML))
+	f, err := compose.ParseStored([]byte(st.ComposeYAML))
 	if err != nil {
 		return nil
 	}

@@ -133,11 +133,11 @@ vms:
 		}
 	}
 	bad := []struct{ hc, want string }{
-		{"      type: tcp\n      target: \"ssh\"\n", `vm "web" healthcheck`},
+		{"      type: tcp\n      target: \"ssh\"\n", "vms.web.healthcheck.target"},
 		{"      type: tcp\n      target: \"ssh\"\n", "port"},
 		{"      type: http\n      target: \"ftp://x/\"\n", "http or https"},
 		{"      type: tcp\n      target: \"22\"\n      action: reboot\n", "action"},
-		{"      target: \"22\"\n", "type"},
+		{"      target: \"/health\"\n", "type"},
 	}
 	for _, c := range bad {
 		_, err := ParseBytes([]byte(base + c.hc))

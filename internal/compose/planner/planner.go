@@ -48,6 +48,7 @@ type VMAction struct {
 	Storage    string // resolved storage backend
 	Detail     string
 	DependsOn  compose.DependsOn
+	Base       string // compose name (db for replica db-2); see compose.Op.Base
 	WaitFor    string // condition dependents wait for
 	Warning    string
 	// IsContainer marks a kind=lxc/oci workload so the executor routes it to the
@@ -100,6 +101,16 @@ type DNSAction struct {
 	FQDN     string
 	IP       string // empty if deferred
 	Deferred bool   // true = IP not known until VM boots (DHCP)
+}
+
+// ComposeName is the name a depends-on entry refers to the action's workload
+// by: its compose name, or — for an action built without one — its instance
+// name.
+func (a VMAction) ComposeName() string {
+	if a.Base != "" {
+		return a.Base
+	}
+	return a.VMName
 }
 
 // Resolve takes a compose file and cluster state snapshot and produces a
@@ -227,6 +238,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			VMName:      op.VMName,
 			Detail:      op.Detail,
 			DependsOn:   op.DependsOn,
+			Base:        op.Base,
 			Warning:     op.Warning,
 			IsContainer: isContainerWorkload(f, op.VMName, ctHost),
 		}
@@ -269,7 +281,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			action.Storage = resolveStorage(spec, f)
 
 			// Set wait condition for dependents.
-			action.WaitFor = highestWaitCondition(op.VMName, vmPlan.Ops)
+			action.WaitFor = highestWaitCondition(op.ComposeName(), vmPlan.Ops)
 		} else if op.Kind == OpNoChange {
 			// Carry forward existing host for network/LB resolution.
 			for _, c := range current {
@@ -762,19 +774,22 @@ func vmBaseName(name string) string {
 	return name
 }
 
-// highestWaitCondition checks if any later op depends on vmName.
-func highestWaitCondition(vmName string, ops []compose.Op) string {
+// highestWaitCondition returns the most demanding condition ("vm_healthy" >
+// "vm_started") any op's depends-on asks of the workload whose compose name
+// is composeName, or "" when nothing depends on it.
+func highestWaitCondition(composeName string, ops []compose.Op) string {
 	best := ""
 	for _, op := range ops {
 		for dep, def := range op.DependsOn {
-			if dep == vmName || strings.HasPrefix(vmName, dep+"-") {
-				cond := def.Condition
-				if cond == "" {
-					cond = "vm_started"
-				}
-				if cond == "vm_healthy" || (cond == "vm_started" && best == "") {
-					best = cond
-				}
+			if !compose.DependsOnTarget(dep, composeName) {
+				continue
+			}
+			cond := def.Condition
+			if cond == "" {
+				cond = "vm_started"
+			}
+			if cond == "vm_healthy" || best == "" {
+				best = cond
 			}
 		}
 	}

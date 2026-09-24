@@ -390,3 +390,38 @@ func TestFleet_ComposeVMHealthyOnAContainerHealthcheckIsRefused(t *testing.T) {
 		t.Errorf("ct was created from a refused file")
 	}
 }
+
+// A dependency the rolling engine updated is waited on for its strategy's
+// health-wait, not depends-on's default.
+func TestFleet_ComposeRollingDependencyWaitUsesItsHealthWait(t *testing.T) {
+	_, node, client := newComposeFailNode(t)
+	ctx := context.Background()
+	node.Server.SetDependsOnWaitTimeoutForTests(8 * time.Second) // the "default" here
+
+	withHealthWait := func(y string) string {
+		return strings.Replace(y, "  db:\n    update:\n      strategy: all-at-once\n",
+			"  db:\n    update:\n      strategy: all-at-once\n      health-wait: 300ms\n", 1)
+	}
+	app := strings.Replace(orderAppVM("vm_healthy"), "    depends-on:\n      db:\n        condition: vm_healthy\n", "", 1)
+	setup := withHealthWait(withRolling(withRolling(withDBHealthcheck(composeOrderBase)+app, "db"), "app"))
+	if !strings.Contains(setup, "health-wait: 300ms") {
+		t.Fatal("fixture edit did not apply")
+	}
+	deployClean(t, ctx, client, setup)
+
+	next := withRolling(withRolling(withDBHealthcheck(composeOrderBase)+orderAppVM("vm_healthy"), "db"), "app")
+	next = withHealthWait(bumpCPU(t, bumpCPU(t, next, "db"), "app"))
+	start := time.Now()
+	msgs := deployCollect(t, ctx, client, next)
+	elapsed := time.Since(start)
+	p := errorPhaseFor(msgs, "app")
+	if p == nil {
+		t.Fatalf("app's update was not held back; got %v", msgs)
+	}
+	if !strings.Contains(p.Error, "timeout after 300ms") {
+		t.Errorf("app's error %q: want db waited on for its health-wait (300ms)", p.Error)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("deploy took %s: the wait on db did not use its 300ms health-wait", elapsed)
+	}
+}

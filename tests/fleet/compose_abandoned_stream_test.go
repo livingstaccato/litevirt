@@ -60,6 +60,10 @@ func TestFleet_ComposeAbandonedDeployStreamCancelsTheRestOfTheDeploy(t *testing.
 	release := make(chan struct{})
 	injectFirstFailsSecondWaits(node, release)
 
+	// The assertions below are about what the server did NOT do, so they are
+	// made only once its DeployStack handler has returned — a sleep would pass
+	// vacuously whenever the server is merely slow to reach hb-3.
+	watch := node.WatchStream("DeployStack")
 	dctx, cancel := context.WithCancel(ctx)
 	stream, err := client.DeployStack(dctx, &pb.DeployStackRequest{ComposeYaml: composeFailThree})
 	if err != nil {
@@ -96,12 +100,34 @@ func TestFleet_ComposeAbandonedDeployStreamCancelsTheRestOfTheDeploy(t *testing.
 		close(release)
 		t.Fatalf("no error phase within 20s (saw %v)", seenNow())
 	}
+	var srvCtx context.Context
+	select {
+	case srvCtx = <-watch.Started:
+	default:
+		close(release)
+		t.Fatal("the server's DeployStack handler was never entered — the watch saw a different call")
+	}
 	cancel()
-	time.Sleep(200 * time.Millisecond) // let the cancellation reach the server
+	// Hold hb-2 until the cancellation has reached the server.
+	select {
+	case <-srvCtx.Done():
+	case <-time.After(20 * time.Second):
+		close(release)
+		t.Fatal("the server's stream context was not cancelled within 20s of the client leaving")
+	}
 	close(release)
 
-	// hb-3 is planned after hb-2; the server never gets to it.
-	time.Sleep(time.Second)
+	// hb-3 is planned after hb-2; the server never gets to it. Wait for the
+	// handler to return — bounded past hb-2's 30s hold, so this fails rather
+	// than hangs.
+	select {
+	case herr := <-watch.Returned:
+		if herr == nil {
+			t.Error("the server's DeployStack returned OK for a deploy its client abandoned")
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("the server's DeployStack handler had not returned 40s after its client left")
+	}
 	if vm, _ := corrosion.GetVM(ctx, node.DB, "hb-3"); vm != nil {
 		t.Fatal("hb-3 was created although the client abandoned the deploy — the server did not cancel")
 	}

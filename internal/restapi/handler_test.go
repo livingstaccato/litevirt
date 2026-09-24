@@ -127,6 +127,8 @@ type mockGRPC struct {
 	lastSetVMIPReq  *pb.SetVMIPRequest
 	migrateVMStream grpc.ServerStreamingClient[pb.MigrateProgress]
 
+	deleteStackStream grpc.ServerStreamingClient[pb.DeleteProgress]
+
 	// Image/User/Auth tracking
 	lastDeleteImageName string
 	deleteImageCalled   bool
@@ -318,7 +320,7 @@ func (m *mockGRPC) DeployStack(context.Context, *pb.DeployStackRequest, ...grpc.
 	return nil, nil
 }
 func (m *mockGRPC) DeleteStack(context.Context, *pb.DeleteStackRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DeleteProgress], error) {
-	return nil, nil
+	return m.deleteStackStream, nil
 }
 func (m *mockGRPC) DiffStack(context.Context, *pb.DiffStackRequest, ...grpc.CallOption) (*pb.DiffStackResponse, error) {
 	return nil, nil

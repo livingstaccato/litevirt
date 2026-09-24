@@ -1275,27 +1275,26 @@ func jsonError(w http.ResponseWriter, code int, msg string) {
 
 // grpcHTTPError writes an error response, mapping gRPC status codes to HTTP codes.
 func grpcHTTPError(w http.ResponseWriter, fallbackCode int, err error) {
+	code, msg := grpcHTTPStatus(fallbackCode, err)
+	jsonError(w, code, msg)
+}
+
+// grpcHTTPStatus maps a gRPC error to the HTTP status and message
+// grpcHTTPError would write for it.
+func grpcHTTPStatus(fallbackCode int, err error) (int, string) {
 	if st, ok := grpcstatus.FromError(err); ok {
 		switch st.Code() {
 		case codes.Unauthenticated:
-			jsonError(w, http.StatusUnauthorized, st.Message())
-			return
+			return http.StatusUnauthorized, st.Message()
 		case codes.PermissionDenied:
-			jsonError(w, http.StatusForbidden, st.Message())
-			return
+			return http.StatusForbidden, st.Message()
 		case codes.NotFound:
-			jsonError(w, http.StatusNotFound, st.Message())
-			return
+			return http.StatusNotFound, st.Message()
 		case codes.InvalidArgument:
-			jsonError(w, http.StatusBadRequest, st.Message())
-			return
-		case codes.AlreadyExists:
-			jsonError(w, http.StatusConflict, st.Message())
-			return
-		case codes.FailedPrecondition:
-			jsonError(w, http.StatusConflict, st.Message())
-			return
+			return http.StatusBadRequest, st.Message()
+		case codes.AlreadyExists, codes.FailedPrecondition:
+			return http.StatusConflict, st.Message()
 		}
 	}
-	jsonError(w, fallbackCode, err.Error())
+	return fallbackCode, err.Error()
 }

@@ -105,7 +105,9 @@ The actions that did succeed are not rolled back; fix the cause and re-run
 A failed action is any create, update or delete the daemon could not carry
 out — including a scale-down delete, the delete half of a recreate (the
 recreate then stops rather than create over a VM that was never torn down),
-and a `depends-on` wait that timed out. After such a deploy the stack is
+a `depends-on` wait that timed out, a `blue-green` old (blue) VM that could not
+be removed after its `-green` replacement came up, and a `snapshot-and-replace`
+`-next` VM that could not be created or did not become healthy. After such a deploy the stack is
 recorded as `degraded` rather than `active` (the STATE column of
 `lv compose ls`), and the `stack.deploy` audit entry has result `error` and
 names the failed VMs. The new compose file is still stored: it is the desired
@@ -622,7 +624,7 @@ Strategies:
 - `rolling` / `stop-first` — Update VMs one at a time: stop old, create new, wait for health check, continue.
 - `start-first` — Create new VM first, wait for health check, then stop old. Minimizes downtime.
 - `all-at-once` — Recreate all VMs simultaneously. Fast but risky.
-- `blue-green` — Create a parallel set of new VMs ("-green" suffix), verify health, then cut over.
+- `blue-green` — Create a parallel set of new VMs ("-green" suffix), then cut over by deleting the old (blue) VMs. A green that cannot be created aborts the deploy and removes the greens already made. A blue that cannot be deleted once its green is up is not a failed cutover — the green is serving — but it is reported as a failed action for that VM (the old VM is still there), and the stack ends `degraded`.
 - `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
 
 The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-replace` is the `vm_healthy` condition of `depends-on` (see its note above), bounded by `health-wait` (default `30s`). A VM that is not healthy by then fails with `<vm> did not become healthy within health-wait <d>`; under `rolling`, `stop-first` and `start-first` that aborts the deploy.

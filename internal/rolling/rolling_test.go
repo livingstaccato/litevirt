@@ -27,6 +27,7 @@ type mockOps struct {
 	failResizeOn     string
 	failHealthOn     string
 	failCreateNextOn string
+	failDeleteOn     string
 	onRecreate       func()
 }
 
@@ -70,6 +71,9 @@ func (m *mockOps) CreateNextVM(_ context.Context, name string, _ *pb.VMSpec) err
 	return nil
 }
 func (m *mockOps) DeleteVM(_ context.Context, name string) error {
+	if m.failDeleteOn == name {
+		return fmt.Errorf("simulated delete failure for %s", name)
+	}
 	m.mu.Lock()
 	m.deleted = append(m.deleted, name)
 	m.mu.Unlock()
@@ -437,6 +441,69 @@ func TestBlueGreen_FailureRollsBackGreens(t *testing.T) {
 	// The already-created green (web-1-green) is cleaned up; blue instances untouched.
 	if len(ops.deleted) != 1 || ops.deleted[0] != "web-1-green" {
 		t.Errorf("expected the created green rolled back, got deleted=%v", ops.deleted)
+	}
+}
+
+// A green that the rollback cannot remove is left behind; it must be reported,
+// not dropped with the rollback's discarded error.
+func TestBlueGreen_FailedGreenRollbackIsReported(t *testing.T) {
+	ops := &mockOps{failRecreateOn: "web-2-green", failDeleteOn: "web-1-green"}
+	fn, got := collect()
+	actions := []VMAction{
+		act("web-1", "blue-green", recreatePlan()),
+		act("web-2", "blue-green", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err == nil {
+		t.Fatal("blue-green failure must return an error")
+	}
+	for _, p := range *got {
+		if p.Phase == "error" && p.VMName == "web-1-green" && p.Err != nil {
+			return
+		}
+	}
+	t.Errorf("no error progress for web-1-green, which the rollback could not remove; got %+v", *got)
+}
+
+// After the greens are up, a blue that cannot be deleted is not a failed
+// cutover — the new side is serving — but the old VM is still there, so it must
+// be reported as a failure of that VM rather than as "cutover complete".
+func TestBlueGreen_FailedBlueDeleteIsReported(t *testing.T) {
+	ops := &mockOps{failDeleteOn: "web-1"}
+	fn, got := collect()
+	actions := []VMAction{
+		act("web-1", "blue-green", recreatePlan()),
+		act("web-2", "blue-green", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err != nil {
+		t.Fatalf("a failed blue delete after the greens are serving is not a failed cutover: %v", err)
+	}
+	var blueErr *Progress
+	for i, p := range *got {
+		if p.Phase == "error" && p.VMName == "web-1" {
+			blueErr = &(*got)[i]
+		}
+		if p.Phase == "done" && p.VMName == "web-1-green" && p.Detail == "cutover complete" {
+			t.Error("web-1 cutover reported complete although its blue instance was not removed")
+		}
+	}
+	if blueErr == nil {
+		t.Fatalf("no error progress for the blue instance that was not removed; got %+v", *got)
+	}
+	if blueErr.Err == nil {
+		t.Error("the blue-delete error progress carries no Err, so a caller cannot count it as a failure")
+	}
+	// The other VM's cutover still completes.
+	if len(ops.deleted) != 1 || ops.deleted[0] != "web-2" {
+		t.Errorf("expected web-2's blue deleted, got %v", ops.deleted)
+	}
+	sawWeb2 := false
+	for _, p := range *got {
+		if p.Phase == "done" && p.VMName == "web-2-green" && p.Detail == "cutover complete" {
+			sawWeb2 = true
+		}
+	}
+	if !sawWeb2 {
+		t.Error("web-2's cutover was not reported complete")
 	}
 }
 

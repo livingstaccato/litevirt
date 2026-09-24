@@ -625,6 +625,15 @@ Keys starting `x-` (extension fields, free for your own use) and YAML merge keys
 
 A `timeout` of `30s` with no `interval` is refused as `timeout 30s exceeds interval 10s (the default) — lower timeout or raise interval`. The default `timeout` is never held against a short `interval`.
 
+**The plan shows what will be probed.** `lv compose up` prints, under each VM it creates or updates, the healthcheck as the checker will run it: the resolved target (`<vm address>` for a VM-relative one), whether the type was inferred, and every default filled in:
+
+```
+  + create db
+      healthcheck: tcp (inferred) <vm address>:5432 every 10s, timeout 5s, 3 retries, then restart
+```
+
+An `interval` below the checker's 10-second sweep is shown as `every 10s (1ms is below the checker's 10s sweep)`.
+
 The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:
 
 - one passing probe makes the VM **healthy**;

@@ -92,14 +92,18 @@ func newUpCmd() *cobra.Command {
 					return nil
 				}
 
-				// Print plan
+				// Print plan. Under each VM created or updated, what its
+				// healthcheck will actually probe.
+				healthchecks := healthchecksByInstance(f)
 				fmt.Printf("Stack %q:\n\n", f.Name)
 				for _, op := range ops {
 					switch op.Kind {
 					case compose.OpCreate:
 						fmt.Printf("  + %s\n", op.Detail)
+						printHealthcheck(healthchecks, op.VMName)
 					case compose.OpUpdate:
 						fmt.Printf("  ~ %s\n", op.Detail)
+						printHealthcheck(healthchecks, op.VMName)
 					case compose.OpDelete:
 						fmt.Printf("  - %s\n", op.Detail)
 					case "network":
@@ -182,6 +186,28 @@ func newUpCmd() *cobra.Command {
 // a non-tty session (ssh without -t, CI, a pipe) stdin can stay open and
 // silent, and the prompt would block forever with no hint why.
 var errNoTTYConfirm = errors.New("stdin is not a terminal, so the confirmation prompt cannot be answered; review the plan and re-run with -y to apply")
+
+// healthchecksByInstance maps every VM instance the file defines to a
+// one-line description of what its healthcheck probes.
+func healthchecksByInstance(f *compose.File) map[string]string {
+	out := map[string]string{}
+	for base, vm := range f.VMs {
+		if vm.HealthCheck == nil {
+			continue
+		}
+		d := vm.HealthCheck.Describe()
+		for r := 0; r < vm.EffectiveReplicas(); r++ {
+			out[vm.InstanceName(base, r)] = d
+		}
+	}
+	return out
+}
+
+func printHealthcheck(healthchecks map[string]string, vm string) {
+	if d, ok := healthchecks[vm]; ok {
+		fmt.Printf("      healthcheck: %s\n", d)
+	}
+}
 
 // countVMActions counts the plan entries that execute a VM action (create,
 // update, delete) — the denominator for the failure summary.

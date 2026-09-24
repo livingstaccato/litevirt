@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -318,6 +319,32 @@ func TestComposeDown_UnnamedErrorIsStillCounted(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `1 of 2 deletions failed (stack resource)`) {
 		t.Errorf("error does not count the unnamed failure: %v", err)
+	}
+}
+
+// The plan shows, under each VM it creates or updates, what its healthcheck
+// will actually probe — resolved target, defaults filled in — so a target that
+// means something other than the author thought is visible before applying.
+func TestComposeUp_PlanShowsResolvedHealthcheck(t *testing.T) {
+	spy := &deployClient{plan: []*pb.DeployProgress{
+		{Phase: "create", VmName: "web-1", Detail: "create web-1"},
+		{Phase: "update", VmName: "web-2", Detail: "update web-2"},
+		{Phase: "create", VmName: "db", Detail: "create db"},
+	}}
+	src := "name: s\nvms:\n  web:\n    image: u\n    replicas: 2\n    healthcheck:\n      target: \"22\"\n  db:\n    image: u\n"
+	out, err := runComposeFileCLI(t, spy, src, false, "", "up")
+	if !errors.Is(err, errNoTTYConfirm) {
+		t.Fatalf("compose up (no tty, no -y): err=%v, want the confirmation refusal after the plan", err)
+	}
+	hc := "      healthcheck: tcp (inferred) <vm address>:22 every 10s, timeout 5s, 3 retries, then restart\n"
+	for _, want := range []string{
+		"  + create web-1\n" + hc,
+		"  ~ update web-2\n" + hc,
+		"  + create db\n\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plan does not contain %q:\n%s", want, out)
+		}
 	}
 }
 

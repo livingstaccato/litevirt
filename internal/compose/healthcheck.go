@@ -242,6 +242,74 @@ const (
 	defaultHealthAction   = "restart"
 )
 
+// vmAddrPlaceholder stands for the VM's address in Describe; the sentinel is a
+// reserved name that survives URL formatting, swapped for the placeholder.
+const (
+	vmAddrPlaceholder = "<vm address>"
+	vmAddrSentinel    = "vm-address.invalid"
+)
+
+// Describe says, in one line, what the VM health checker will probe for hc —
+// the resolved target, with <vm address> for a VM-relative host, and the
+// interval, timeout, retries and action in effect, defaults included:
+//
+//	tcp (inferred) <vm address>:22 every 10s, timeout 5s, 3 retries, then restart
+//
+// hc must have passed validation.
+func (hc *HealthCheckDef) Describe() string {
+	if hc == nil {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(hc.Type)
+	if hc.typeInferred {
+		b.WriteString(" (inferred)")
+	}
+	b.WriteString(" ")
+	if ht, err := ParseHealthTarget(hc.Type, hc.Target); err != nil {
+		fmt.Fprintf(&b, "%q", hc.Target)
+	} else {
+		target := strings.ReplaceAll(ht.Resolve(vmAddrSentinel), vmAddrSentinel, vmAddrPlaceholder)
+		switch hc.Type {
+		case "http", "https":
+			b.WriteString("GET " + target)
+		case "exec":
+			fmt.Fprintf(&b, "%q in the guest", target)
+		default:
+			b.WriteString(target)
+		}
+	}
+
+	interval := defaultHealthInterval
+	if d, err := time.ParseDuration(hc.Interval); err == nil && d > 0 {
+		interval = d
+	}
+	fmt.Fprintf(&b, " every %s", max(interval, defaultHealthInterval))
+	if interval < defaultHealthInterval {
+		fmt.Fprintf(&b, " (%s is below the checker's %s sweep)", hc.Interval, defaultHealthInterval)
+	}
+	timeout := defaultHealthTimeout
+	if d, err := time.ParseDuration(hc.Timeout); err == nil && d > 0 {
+		timeout = d
+	}
+	fmt.Fprintf(&b, ", timeout %s", timeout)
+	retries := defaultHealthRetries
+	if hc.Retries > 0 {
+		retries = hc.Retries
+	}
+	if retries == 1 {
+		b.WriteString(", 1 retry")
+	} else {
+		fmt.Fprintf(&b, ", %d retries", retries)
+	}
+	action := hc.Action
+	if action == "" {
+		action = defaultHealthAction
+	}
+	b.WriteString(", then " + action)
+	return b.String()
+}
+
 // healthTimingProblems checks interval, timeout and retries: durations must
 // parse and be greater than zero, a timeout must not outlast the interval,
 // and retries, when written, must be at least 1. written reports whether the

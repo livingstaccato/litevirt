@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"sync"
@@ -112,8 +113,30 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 		}
 	}
 	resp.EnforcedEverywhere = everywhere
+
+	// Recent fences, labelled with what each one established. A read failure
+	// leaves the list empty and says so in the log: the posture above is still
+	// correct and worth returning, and this section is diagnostic.
+	recent, rerr := corrosion.RecentFences(ctx, s.db,
+		time.Now().Add(-fenceReadinessRecentWindow), fenceReadinessRecentMax)
+	if rerr != nil {
+		slog.Warn("fence readiness: could not read recent fences", "error", rerr)
+	}
+	for _, f := range recent {
+		resp.RecentFences = append(resp.RecentFences, &pb.FenceEvent{
+			Host: f.HostName, Method: f.Method, Result: f.Result,
+			Assurance: corrosion.FenceAssurance(f.Method, f.Result),
+			Timestamp: f.Timestamp, Detail: f.Detail,
+		})
+	}
 	return resp, nil
 }
+
+// fenceReadinessRecentWindow bounds how far back the report looks for fences.
+var fenceReadinessRecentWindow = 7 * 24 * time.Hour
+
+// fenceReadinessRecentMax caps how many recent fences the report carries.
+const fenceReadinessRecentMax = 20
 
 // probeFencePostures asks every host for its posture, concurrently and under one
 // overall budget, returning results in the order given.

@@ -315,6 +315,7 @@ type collector struct {
 	leaderHolder       *prometheus.Desc // who holds the failover lease
 	leaseTerm          *prometheus.Desc // highest lease incarnation per lease key
 	fenceFailures      *prometheus.Desc // count of fencing_log rows with non-success result
+	fencesByAssurance  *prometheus.Desc // fencing_log rows by method and what they establish
 	hlcRejected        *prometheus.Desc // remote HLC timestamps rejected for skew
 	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
 	replicationMinSeq  *prometheus.Desc // MIN(last_seq) across replication_watermarks
@@ -462,6 +463,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"Cumulative count of fencing_log rows with result != 'fenced' or 'manual-confirmed'",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		fencesByAssurance: prometheus.NewDesc(
+			"litevirt_fences_total",
+			"Cumulative fencing_log rows by method and assurance",
+			[]string{"method", "assurance"}, prometheus.Labels{"host": hostName},
+		),
 		hlcRejected: prometheus.NewDesc(
 			"litevirt_hlc_rejected_total",
 			"Cumulative count of remote HLC timestamps rejected for exceeding MaxSkewMS",
@@ -551,6 +557,7 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.leaderHolder
 	ch <- c.leaseTerm
 	ch <- c.fenceFailures
+	ch <- c.fencesByAssurance
 	ch <- c.hlcRejected
 	ch <- c.mutationLogSize
 	ch <- c.replicationMinSeq
@@ -718,6 +725,25 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		 WHERE result NOT IN ('fenced', 'manual-confirmed')`); ferr == nil && len(rows) > 0 {
 		ch <- prometheus.MustNewConstMetric(c.fenceFailures,
 			prometheus.CounterValue, float64(rows[0].Int("cnt")))
+	}
+
+	// Fences by what they ESTABLISH. fencing_log.result writes "fenced" for an
+	// IPMI power-off that was observed off and for an SSH poweroff nobody
+	// checked, and the only other fence metric counts failures — so an
+	// unverified success was invisible. Grouped by the stored (method, result)
+	// pair and classified here with corrosion.FenceAssurance, the same function
+	// the shared-storage gate uses, so this and the gate cannot disagree.
+	if rows, ferr := c.db.Query(ctx,
+		`SELECT method, result, COUNT(*) AS cnt FROM fencing_log GROUP BY method, result`); ferr == nil {
+		byLabel := map[[2]string]int{}
+		for _, r := range rows {
+			method := r.String("method")
+			byLabel[[2]string{method, corrosion.FenceAssurance(method, r.String("result"))}] += r.Int("cnt")
+		}
+		for k, n := range byLabel {
+			ch <- prometheus.MustNewConstMetric(c.fencesByAssurance,
+				prometheus.CounterValue, float64(n), k[0], k[1])
+		}
 	}
 
 	// HLC rejected timestamps. Surfaced via Clock.Rejected().

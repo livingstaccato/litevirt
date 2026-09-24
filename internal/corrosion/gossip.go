@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"log/slog"
+	"sync"
 
 	"github.com/hashicorp/memberlist"
 )
@@ -11,12 +12,44 @@ import (
 // updates, instead of waiting for the periodic backstop poll. Callbacks fire on
 // memberlist's own goroutines, so they must be cheap and non-blocking — they
 // only signal a coalescing channel.
+//
+// It also keeps its own set of live PEERS, because losing the last one is what
+// makes this node's replica stale (see replicaFreshness). The set cannot be
+// read back from memberlist here: these callbacks run with memberlist's node
+// lock held, and Members() takes the same lock.
 type membershipEvents struct {
 	client *Client
+
+	mu    sync.Mutex
+	peers map[string]struct{}
 }
 
-func (e *membershipEvents) NotifyJoin(*memberlist.Node)   { e.client.kickMembership() }
-func (e *membershipEvents) NotifyLeave(*memberlist.Node)  { e.client.kickMembership() }
+func (e *membershipEvents) NotifyJoin(n *memberlist.Node) {
+	if n != nil && n.Name != e.client.hostName {
+		e.mu.Lock()
+		if e.peers == nil {
+			e.peers = make(map[string]struct{})
+		}
+		e.peers[n.Name] = struct{}{}
+		e.mu.Unlock()
+	}
+	e.client.kickMembership()
+}
+
+func (e *membershipEvents) NotifyLeave(n *memberlist.Node) {
+	if n != nil && n.Name != e.client.hostName {
+		e.mu.Lock()
+		_, had := e.peers[n.Name]
+		delete(e.peers, n.Name)
+		lastGone := had && len(e.peers) == 0
+		e.mu.Unlock()
+		if lastGone {
+			e.client.MarkReplicaStale("lost sight of every gossip peer (last to leave: " + n.Name + ")")
+		}
+	}
+	e.client.kickMembership()
+}
+
 func (e *membershipEvents) NotifyUpdate(*memberlist.Node) { e.client.kickMembership() }
 
 // delegate implements memberlist.Delegate for the Client.

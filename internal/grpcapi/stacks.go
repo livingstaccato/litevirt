@@ -1589,12 +1589,26 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		}
 		seen[img] = true
 
-		if s.images.ImageExists(img) {
+		// A ready copy anywhere in the cluster is used, not downloaded
+		// again: here, or on a peer the VM's host pulls from at create
+		// time (the same peers autoPullImage would pull from). A checksum
+		// the file declares must match the one recorded for that copy — a
+		// mismatch is an error, never a silent re-download over it.
+		def, hasDef := f.Images[img]
+		sources, err := s.imagePullSources(ctx, img)
+		if err != nil {
+			return status.Errorf(codes.Internal, "image %q: %v", img, err)
+		}
+		if local := s.images.ImageExists(img); local || len(sources) > 0 {
+			if hasDef && def.Checksum != "" {
+				if err := s.checkHeldImageChecksum(ctx, img, def.Checksum, local, sources); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 
-		def, ok := f.Images[img]
-		if !ok || def.Source == "" {
+		if !hasDef || def.Source == "" {
 			continue // no source URL — validateDeployDependencies will catch it
 		}
 
@@ -1654,6 +1668,42 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		})
 	}
 	return nil
+}
+
+// checkHeldImageChecksum refuses a copy of img the cluster already holds when
+// the compose file declares a checksum that differs from the one recorded for
+// it. A copy with no recorded checksum cannot be shown to match, so it is
+// refused too.
+func (s *Server) checkHeldImageChecksum(ctx context.Context, img, declared string, local bool, peers []string) error {
+	rec, err := corrosion.GetImage(ctx, s.db, img)
+	if err != nil {
+		return status.Errorf(codes.Internal, "image %q: read catalogue: %v", img, err)
+	}
+	recorded := ""
+	if rec != nil {
+		recorded = rec.Checksum
+	}
+	if recorded != "" && normalizeChecksum(recorded) == normalizeChecksum(declared) {
+		return nil
+	}
+	holders := append([]string(nil), peers...)
+	if local {
+		holders = append([]string{s.hostName}, holders...)
+	}
+	shown := recorded
+	if shown == "" {
+		shown = "none"
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"image %q: the compose file declares checksum %s, but the copy held on %s records checksum %s — "+
+			"correct the checksum, or remove the image (`lv image rm %s`) so the source is downloaded again",
+		img, declared, strings.Join(holders, ", "), shown, img)
+}
+
+// normalizeChecksum compares checksums written with or without the sha256:
+// prefix, in either case.
+func normalizeChecksum(c string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(c)), "sha256:")
 }
 
 // validateDeployDependencies checks that images and networks referenced in the

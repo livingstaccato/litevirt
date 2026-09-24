@@ -144,6 +144,15 @@ fallback.
   keep the dial paths correct if one gets in anyway.
 - **`internal/pki` is not importable across modules.** External consumers build
   their own peer TLS config from `ca.crt` / `host.crt` / `host.key`.
+- **Open a test database with `corrosion.NewTestClientT(t)`, not
+  `NewTestClient()`.** A shared-cache in-memory DB lives as long as a handle to
+  it is open, and modernc's sqlite allocates outside the Go heap — so a client
+  that is never closed holds ~2 MB that no heap profile shows. Once per test,
+  that grew the `internal/grpcapi` test binary to 4.4 GB of RSS, and two of
+  them at once took down a 22 GB laptop. `NewTestClientT` closes the client in
+  `t.Cleanup`. If you must use `NewTestClient()`, close what it returns. RSS
+  that climbs steadily through a test run while `GODEBUG=gctrace=1` shows a
+  flat live heap is this.
 - **Docs are guarded in both directions.** `cmd/litevirt/docs_triangulation_test.go`
   fails on a doc referencing a command that does not exist, a command or config
   key that no doc mentions, and a `litevirt_*` identifier absent from the code.

@@ -425,6 +425,14 @@ message VM {
     google.protobuf.Timestamp      updated_at   = 12;
     string                         vnc_address  = 13;
     bool                           is_template  = 14;  // a template: can't start; clone source
+    // health is the VM's healthcheck verdict for its CURRENT incarnation, as
+    // its owning host published it: healthy | unhealthy | unknown. Empty when
+    // the VM defines no healthcheck (then running is healthy). unknown covers
+    // no verdict yet, a verdict from before a restart/recreate/migration, a
+    // stopped VM, and an owner host that is offline, fenced or in maintenance.
+    // Set by InspectVM/GetVM; not by ListVMs.
+    string                         health        = 15;
+    string                         health_detail = 16; // why, in words: the probe's last failure reason, etc.
 }
 
 message VMInterface {

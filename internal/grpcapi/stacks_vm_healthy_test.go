@@ -105,6 +105,36 @@ func TestWaitVMHealthy_VerdictArrivingMidWaitIsSeen(t *testing.T) {
 	}
 }
 
+// lv inspect shows the verdict an operator would otherwise have to dig out
+// of `lv health --resolved`.
+func TestInspectVM_ShowsTheHealthVerdict(t *testing.T) {
+	s, checker, p := healthWaitServer(t)
+	ctx := adminCtx()
+
+	vm, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "web"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if vm.Health != health.VerdictUnknown || !strings.Contains(vm.HealthDetail, "no probe verdict") {
+		t.Errorf("before any probe: health=%q detail=%q, want unknown / no probe verdict", vm.Health, vm.HealthDetail)
+	}
+
+	p.set(false)
+	checker.SweepOnce(ctx)
+	vm, err = s.InspectVM(ctx, &pb.InspectVMRequest{Name: "web"})
+	if err != nil {
+		t.Fatalf("InspectVM: %v", err)
+	}
+	if vm.Health != health.VerdictUnhealthy || !strings.Contains(vm.HealthDetail, "connection refused") {
+		t.Errorf("failing probe: health=%q detail=%q, want unhealthy with the reason", vm.Health, vm.HealthDetail)
+	}
+
+	seedRunningVM(t, s, "plain", &pb.VMSpec{Name: "plain", Cpu: 1, MemoryMib: 256}, 1, 256)
+	if vm, err := s.InspectVM(ctx, &pb.InspectVMRequest{Name: "plain"}); err != nil || vm.Health != "" {
+		t.Errorf("VM without a healthcheck: health=%q err=%v, want empty", vm.GetHealth(), err)
+	}
+}
+
 // A VM without a healthcheck keeps the old meaning: running is healthy.
 func TestWaitVMHealthy_NoHealthcheckRunningSuffices(t *testing.T) {
 	s := coordResizeServer(t)

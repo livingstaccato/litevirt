@@ -3111,21 +3111,29 @@ func (x *DetachDeviceRequest) GetIdempotencyKey() string {
 }
 
 type VM struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	StackName     string                 `protobuf:"bytes,2,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
-	HostName      string                 `protobuf:"bytes,3,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
-	Spec          *VMSpec                `protobuf:"bytes,4,opt,name=spec,proto3" json:"spec,omitempty"`
-	State         VMState                `protobuf:"varint,5,opt,name=state,proto3,enum=litevirt.v1.VMState" json:"state,omitempty"`
-	StateDetail   string                 `protobuf:"bytes,6,opt,name=state_detail,json=stateDetail,proto3" json:"state_detail,omitempty"`
-	CpuActual     int32                  `protobuf:"varint,7,opt,name=cpu_actual,json=cpuActual,proto3" json:"cpu_actual,omitempty"`
-	MemActualMib  int32                  `protobuf:"varint,8,opt,name=mem_actual_mib,json=memActualMib,proto3" json:"mem_actual_mib,omitempty"`
-	Interfaces    []*VMInterface         `protobuf:"bytes,9,rep,name=interfaces,proto3" json:"interfaces,omitempty"`
-	Disks         []*VMDisk              `protobuf:"bytes,10,rep,name=disks,proto3" json:"disks,omitempty"`
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
-	VncAddress    string                 `protobuf:"bytes,13,opt,name=vnc_address,json=vncAddress,proto3" json:"vnc_address,omitempty"`
-	IsTemplate    bool                   `protobuf:"varint,14,opt,name=is_template,json=isTemplate,proto3" json:"is_template,omitempty"` // a template: can't start; clone source
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Name         string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	StackName    string                 `protobuf:"bytes,2,opt,name=stack_name,json=stackName,proto3" json:"stack_name,omitempty"`
+	HostName     string                 `protobuf:"bytes,3,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	Spec         *VMSpec                `protobuf:"bytes,4,opt,name=spec,proto3" json:"spec,omitempty"`
+	State        VMState                `protobuf:"varint,5,opt,name=state,proto3,enum=litevirt.v1.VMState" json:"state,omitempty"`
+	StateDetail  string                 `protobuf:"bytes,6,opt,name=state_detail,json=stateDetail,proto3" json:"state_detail,omitempty"`
+	CpuActual    int32                  `protobuf:"varint,7,opt,name=cpu_actual,json=cpuActual,proto3" json:"cpu_actual,omitempty"`
+	MemActualMib int32                  `protobuf:"varint,8,opt,name=mem_actual_mib,json=memActualMib,proto3" json:"mem_actual_mib,omitempty"`
+	Interfaces   []*VMInterface         `protobuf:"bytes,9,rep,name=interfaces,proto3" json:"interfaces,omitempty"`
+	Disks        []*VMDisk              `protobuf:"bytes,10,rep,name=disks,proto3" json:"disks,omitempty"`
+	CreatedAt    *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	UpdatedAt    *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	VncAddress   string                 `protobuf:"bytes,13,opt,name=vnc_address,json=vncAddress,proto3" json:"vnc_address,omitempty"`
+	IsTemplate   bool                   `protobuf:"varint,14,opt,name=is_template,json=isTemplate,proto3" json:"is_template,omitempty"` // a template: can't start; clone source
+	// health is the VM's healthcheck verdict for its CURRENT incarnation, as
+	// its owning host published it: healthy | unhealthy | unknown. Empty when
+	// the VM defines no healthcheck (then running is healthy). unknown covers
+	// no verdict yet, a verdict from before a restart/recreate/migration, a
+	// stopped VM, and an owner host that is offline, fenced or in maintenance.
+	// Set by InspectVM/GetVM; not by ListVMs.
+	Health        string `protobuf:"bytes,15,opt,name=health,proto3" json:"health,omitempty"`
+	HealthDetail  string `protobuf:"bytes,16,opt,name=health_detail,json=healthDetail,proto3" json:"health_detail,omitempty"` // why, in words: the probe's last failure reason, etc.
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -3256,6 +3264,20 @@ func (x *VM) GetIsTemplate() bool {
 		return x.IsTemplate
 	}
 	return false
+}
+
+func (x *VM) GetHealth() string {
+	if x != nil {
+		return x.Health
+	}
+	return ""
+}
+
+func (x *VM) GetHealthDetail() string {
+	if x != nil {
+		return x.HealthDetail
+	}
+	return ""
 }
 
 type VMInterface struct {
@@ -5753,7 +5775,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\anic_mac\x18\x03 \x01(\tR\x06nicMac\x12\x1f\n" +
 	"\vpci_address\x18\x04 \x01(\tR\n" +
 	"pciAddress\x12'\n" +
-	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xae\x04\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"\xeb\x04\n" +
 	"\x02VM\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1d\n" +
 	"\n" +
@@ -5777,7 +5799,9 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\vvnc_address\x18\r \x01(\tR\n" +
 	"vncAddress\x12\x1f\n" +
 	"\vis_template\x18\x0e \x01(\bR\n" +
-	"isTemplate\"\x8b\x01\n" +
+	"isTemplate\x12\x16\n" +
+	"\x06health\x18\x0f \x01(\tR\x06health\x12#\n" +
+	"\rhealth_detail\x18\x10 \x01(\tR\fhealthDetail\"\x8b\x01\n" +
 	"\vVMInterface\x12!\n" +
 	"\fnetwork_name\x18\x01 \x01(\tR\vnetworkName\x12\x18\n" +
 	"\aordinal\x18\x02 \x01(\x05R\aordinal\x12\x10\n" +

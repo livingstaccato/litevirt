@@ -7,10 +7,16 @@
 // re-resolves a spec, or re-classifies a change. Run is synchronous and returns the
 // first error so the caller can leave the prior stack record untouched on failure.
 //
+// Every strategy applies an update with the least destructive mechanism its
+// change allows: a live-class change in place, a restart-class change by
+// reconfiguring and restarting the same VM (disks, MACs and incarnation
+// kept), and only a recreate-class change through the strategy's own
+// replacement procedure — the strategy says how to roll out a change that
+// needs a new VM, never that every change gets one.
+//
 // The in-place strategy is LIVE-OR-FAIL: it applies live cpu/mem resizes and
 // live-metadata patches, and REFUSES (without deleting anything) any change that
-// needs a restart or a recreate. Destructive recreation happens ONLY under the
-// explicit recreate / all-at-once / blue-green / snapshot-and-replace strategies.
+// needs a restart or a recreate.
 package rolling
 
 import (
@@ -39,6 +45,20 @@ type VMAction struct {
 	Strategy compose.UpdateDef
 	Plan     compose.ChangePlan
 	Desired  *pb.VMSpec
+	// ForceRecreate routes the action through the strategy's replacement
+	// procedure whatever its Plan says (the planner decided the VM cannot be
+	// kept: its stored spec is unreadable, or a previous deploy left it
+	// half-made, or the change is not reconfigurable in place).
+	ForceRecreate bool
+}
+
+// mechanism is how the action is applied: Plan.Max(), or a recreate when
+// ForceRecreate is set.
+func (a VMAction) mechanism() compose.Action {
+	if a.ForceRecreate {
+		return compose.ActionRecreate
+	}
+	return a.Plan.Max()
 }
 
 // Ops abstracts the VM lifecycle operations the rolling updater needs.
@@ -48,6 +68,10 @@ type Ops interface {
 	// It DESTROYS the VM's disks — reachable only under an explicit recreate-class
 	// strategy, never from in-place.
 	RecreateVM(ctx context.Context, name string, desired *pb.VMSpec) error
+	// ReconfigureVM applies a restart-class change to the SAME VM: stop →
+	// redefine → start, keeping its disks, MACs and incarnation, plus the
+	// plan's metadata changes. It never deletes the VM.
+	ReconfigureVM(ctx context.Context, name string, desired *pb.VMSpec, plan compose.ChangePlan) error
 	// ResizeVMLive applies a live cpu grow and/or balloon resize (no restart).
 	ResizeVMLive(ctx context.Context, name string, desired *pb.VMSpec) error
 	// ApplyLiveMetadata patches the named live-metadata fields (restart policy,
@@ -79,6 +103,25 @@ func Run(ctx context.Context, ops Ops, stackName string, actions []VMAction, pro
 			strategy = "recreate"
 		}
 		slog.Info("rolling update group", "stack", stackName, "strategy", strategy, "vms", len(g.actions))
+
+		if strategy != "in-place" {
+			// Changes that can keep the VM are applied to it, one VM at a
+			// time; only the rest go through the strategy's replacement.
+			var replace []VMAction
+			for _, a := range g.actions {
+				if a.mechanism() == compose.ActionRecreate {
+					replace = append(replace, a)
+					continue
+				}
+				if err := keepVM(ctx, ops, a, g.ud, emit); err != nil {
+					return err
+				}
+			}
+			if len(replace) == 0 {
+				continue
+			}
+			g.actions = replace
+		}
 
 		var err error
 		switch strategy {
@@ -135,26 +178,78 @@ func resolveGroups(actions []VMAction) []updateGroup {
 	return out
 }
 
+// keepVM applies an action whose change does not need a new VM: live changes
+// in place, a restart-class change by reconfiguring and restarting the same
+// VM (then, under a strategy that waits for health, waiting for it to be
+// healthy within health-wait).
+func keepVM(ctx context.Context, ops Ops, a VMAction, ud compose.UpdateDef, emit func(Progress)) error {
+	switch a.mechanism() {
+	case compose.ActionNoChange:
+		emit(Progress{VMName: a.Name, Phase: "done", Detail: "no change"})
+		return nil
+	case compose.ActionLive:
+		if err := applyLive(ctx, ops, a, emit); err != nil {
+			return fmt.Errorf("update aborted: %w", err)
+		}
+		emit(Progress{VMName: a.Name, Phase: "done", Detail: "applied in place"})
+		return nil
+	default: // ActionRestart
+		emit(Progress{VMName: a.Name, Phase: "restarting", Detail: "reconfigure and restart: " + firstReason(a.Plan.RestartReasons)})
+		if err := ops.ReconfigureVM(ctx, a.Name, a.Desired, a.Plan); err != nil {
+			emit(Progress{VMName: a.Name, Phase: "error", Detail: err.Error(), Err: err})
+			return fmt.Errorf("update aborted: reconfigure %s failed: %w", a.Name, err)
+		}
+		if waitsForHealth(ud.Strategy) {
+			healthWait := parseDuration(ud.HealthWait, 30*time.Second)
+			if err := ops.WaitHealthy(ctx, a.Name, healthWait); err != nil {
+				emit(Progress{VMName: a.Name, Phase: "error", Detail: "health check: " + err.Error(), Err: err})
+				return fmt.Errorf("update aborted: %s failed health check after its restart: %w", a.Name, err)
+			}
+		}
+		emit(Progress{VMName: a.Name, Phase: "done", Detail: "reconfigured and restarted, disks kept"})
+		return nil
+	}
+}
+
+// waitsForHealth reports whether a strategy waits for each VM it replaces to
+// be healthy before moving on — the one-at-a-time strategies do; all-at-once
+// and blue-green do not — so a restarted VM is held to the same rule.
+func waitsForHealth(strategy string) bool {
+	switch strategy {
+	case "all-at-once", "blue-green", "snapshot-and-replace":
+		return false
+	}
+	return true
+}
+
+// applyLive applies an action's live resource and metadata changes.
+func applyLive(ctx context.Context, ops Ops, a VMAction, emit func(Progress)) error {
+	emit(Progress{VMName: a.Name, Phase: "resizing", Detail: "applying live changes"})
+	if len(a.Plan.ResourceChanges) > 0 {
+		if err := ops.ResizeVMLive(ctx, a.Name, a.Desired); err != nil {
+			emit(Progress{VMName: a.Name, Phase: "error", Detail: err.Error(), Err: err})
+			return fmt.Errorf("live resize %s failed: %w", a.Name, err)
+		}
+	}
+	if fields := metadataFields(a.Plan); len(fields) > 0 {
+		if err := ops.ApplyLiveMetadata(ctx, a.Name, a.Desired, fields); err != nil {
+			emit(Progress{VMName: a.Name, Phase: "error", Detail: err.Error(), Err: err})
+			return fmt.Errorf("live metadata %s failed: %w", a.Name, err)
+		}
+	}
+	return nil
+}
+
 // inPlace is LIVE-OR-FAIL: it applies each action's classified live changes and
 // REFUSES (without deleting anything) any change that needs a restart or recreate.
 func inPlace(ctx context.Context, ops Ops, actions []VMAction, emit func(Progress)) error {
 	for _, a := range actions {
-		switch a.Plan.Max() {
+		switch a.mechanism() {
 		case compose.ActionNoChange:
 			emit(Progress{VMName: a.Name, Phase: "done", Detail: "no change"})
 		case compose.ActionLive:
-			emit(Progress{VMName: a.Name, Phase: "resizing", Detail: "applying live changes"})
-			if len(a.Plan.ResourceChanges) > 0 {
-				if err := ops.ResizeVMLive(ctx, a.Name, a.Desired); err != nil {
-					emit(Progress{VMName: a.Name, Phase: "error", Detail: err.Error(), Err: err})
-					return fmt.Errorf("in-place update aborted: live resize %s failed: %w", a.Name, err)
-				}
-			}
-			if fields := metadataFields(a.Plan); len(fields) > 0 {
-				if err := ops.ApplyLiveMetadata(ctx, a.Name, a.Desired, fields); err != nil {
-					emit(Progress{VMName: a.Name, Phase: "error", Detail: err.Error(), Err: err})
-					return fmt.Errorf("in-place update aborted: live metadata %s failed: %w", a.Name, err)
-				}
+			if err := applyLive(ctx, ops, a, emit); err != nil {
+				return fmt.Errorf("in-place update aborted: %w", err)
 			}
 			emit(Progress{VMName: a.Name, Phase: "done"})
 		case compose.ActionRestart:

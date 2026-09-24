@@ -54,6 +54,10 @@ func (o *serverOps) CreateNextVM(ctx context.Context, name string, desired *pb.V
 	return o.recreateAs(ctx, name+"-next", desired)
 }
 
+func (o *serverOps) ReconfigureVM(ctx context.Context, name string, desired *pb.VMSpec, plan compose.ChangePlan) error {
+	return o.s.reconfigureWithRestart(ctx, name, desired, plan)
+}
+
 func (o *serverOps) ResizeVMLive(ctx context.Context, name string, desired *pb.VMSpec) error {
 	// Route through the owner-forwarding RPCs so a rolling in-place resize works when
 	// the VM is on a peer of the deploy entry node (resizeVMLive itself is owner-local
@@ -423,10 +427,9 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 		case planner.OpCreate:
 			actErr = s.createPlanned(ctx, action, f, gate)
 		case planner.OpUpdate:
-			// Recreate. For containers (no in-place reconfigure yet) this is
-			// the update strategy; deleteWorkload + deployCreatePlanned route
-			// by workload kind.
-			actErr = s.recreateInline(ctx, action, f, gate)
+			// By the planned mechanism: in place, reconfigure + restart, or
+			// (a change of identity, or a container) recreate.
+			actErr = s.applyPlannedUpdate(ctx, action, f, gate)
 		case planner.OpDelete:
 			if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 				slog.Warn("deploy delete failed", "workload", action.VMName, "error", delErr)
@@ -600,10 +603,11 @@ func (s *Server) rollingUpdateWave(ctx context.Context, f *compose.File, updates
 			continue
 		}
 		actions = append(actions, rolling.VMAction{
-			Name:     a.VMName,
-			Strategy: vmUpdateDef(f, a.VMName),
-			Plan:     a.Plan,
-			Desired:  a.Spec,
+			Name:          a.VMName,
+			Strategy:      vmUpdateDef(f, a.VMName),
+			Plan:          a.Plan,
+			Desired:       a.Spec,
+			ForceRecreate: a.Apply == compose.ActionRecreate,
 		})
 	}
 	if len(actions) == 0 {

@@ -171,13 +171,15 @@ func TestFleet_ComposeRollingUpdateStopsAtAVMWhoseProbeFails(t *testing.T) {
 	if d := time.Since(start); d > 10*time.Second {
 		t.Errorf("failed health wait took %s; health-wait is 3s", d)
 	}
-	// Exactly one VM was recreated — the one that failed.
+	// Exactly one VM was updated — the one that failed. (A cpu grow with no
+	// hotplug ceiling restarts the same VM; a recreate would say "creating".)
+	touched := func(vm string) bool { return sawPhase(msgs, vm, "creating") || sawPhase(msgs, vm, "restarting") }
 	failed, untouched := "hc-a", "hc-b"
-	if !sawPhase(msgs, "hc-a", "creating") {
+	if !touched("hc-a") {
 		failed, untouched = "hc-b", "hc-a"
 	}
-	if sawPhase(msgs, untouched, "creating") {
-		t.Fatalf("rolling update did not stop at %s: %s was recreated too; got %v", failed, untouched, msgs)
+	if touched(untouched) {
+		t.Fatalf("rolling update did not stop at %s: %s was updated too; got %v", failed, untouched, msgs)
 	}
 	for _, want := range []string{failed, "health-wait", "unhealthy", "connection refused"} {
 		if !strings.Contains(err.Error(), want) {

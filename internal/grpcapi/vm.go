@@ -399,7 +399,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 		if d.Storage != "" {
 			// Use a named storage volume (nfs, ceph, iscsi, etc.).
-			volCfg := s.resolveVolume(ctx, spec.StackName, d.Storage)
+			volCfg, volErr := s.resolveVolume(ctx, spec.StackName, d.Storage)
+			if volErr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
+			}
 			drv, drvErr := storage.New(s.dataDir, volCfg)
 			if drvErr != nil {
 				return nil, status.Errorf(codes.Internal, "storage driver %q: %v", d.Storage, drvErr)
@@ -3365,23 +3368,43 @@ func replaceFirst(s, old, new string) string {
 	return s[:i] + new + s[i+len(old):]
 }
 
+// storedStackFile reads a stack's stored compose YAML: nil when there is no
+// such stack (or it stored none), an error when it cannot be read. It never
+// validates — see compose.ParseStored.
+func (s *Server) storedStackFile(ctx context.Context, stackName string) (*compose.File, error) {
+	st, err := corrosion.GetStack(ctx, s.db, stackName)
+	if err != nil {
+		return nil, fmt.Errorf("read stack %q: %w", stackName, err)
+	}
+	if st == nil || st.ComposeYAML == "" {
+		return nil, nil
+	}
+	f, err := compose.ParseStored([]byte(st.ComposeYAML))
+	if err != nil {
+		return nil, fmt.Errorf("stored compose for stack %q cannot be read: %w", stackName, err)
+	}
+	return f, nil
+}
+
 // resolveVolume looks up a named volume from the stack's compose YAML, then
 // falls back to host-level storage pools, then defaults to local driver.
-func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string) storage.Config {
-	// 1. Try compose volumes.
+func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string) (storage.Config, error) {
+	// 1. Try compose volumes. A stored stack that cannot be read is an
+	// error: falling through would put the disk on whatever storage the
+	// later steps find, most likely the local driver.
 	if stackName != "" {
-		st, err := corrosion.GetStack(ctx, s.db, stackName)
-		if err == nil && st != nil && st.ComposeYAML != "" {
-			f, err := compose.ParseStored([]byte(st.ComposeYAML))
-			if err == nil {
-				if vol, ok := f.Volumes[volumeName]; ok {
-					return storage.Config{
-						Driver:  vol.Driver,
-						Source:  vol.Source,
-						Target:  vol.Target,
-						Options: vol.Options,
-					}
-				}
+		f, err := s.storedStackFile(ctx, stackName)
+		if err != nil {
+			return storage.Config{}, err
+		}
+		if f != nil {
+			if vol, ok := f.Volumes[volumeName]; ok {
+				return storage.Config{
+					Driver:  vol.Driver,
+					Source:  vol.Source,
+					Target:  vol.Target,
+					Options: vol.Options,
+				}, nil
 			}
 		}
 	}
@@ -3394,12 +3417,12 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 				Source:  pool.Source,
 				Target:  pool.Target,
 				Options: pool.Options,
-			}
+			}, nil
 		}
 	}
 
 	// 3. Fallback to local.
-	return storage.Config{Driver: "local"}
+	return storage.Config{Driver: "local"}, nil
 }
 
 // parseDiskSizeBytes converts a human-readable size string (e.g. "20G", "512M")

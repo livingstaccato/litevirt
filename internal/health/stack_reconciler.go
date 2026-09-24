@@ -21,7 +21,7 @@ type StackCleaner interface {
 	DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error)
 	RemoveLBForStack(ctx context.Context, stackName string, vms []corrosion.VMRecord)
 	DeprovisionNetworkByName(ctx context.Context, name string) error
-	ExternalNetworkNames(ctx context.Context, stackName string) map[string]bool
+	ExternalNetworkNames(ctx context.Context, stackName string) (map[string]bool, error)
 }
 
 // StackReconciler watches for stacks in "deleting" state and retries
@@ -100,7 +100,16 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 	r.cleaner.RemoveLBForStack(ctx, stack.Name, vms)
 
 	// 3. Deprovision remaining networks.
-	externalNets := r.cleaner.ExternalNetworkNames(ctx, stack.Name)
+	// When the stored compose cannot be read, which networks are external
+	// (not the stack's to delete) is unknown: deprovision none, and keep the
+	// stack in "deleting" rather than tombstone it with networks unaccounted
+	// for.
+	externalNets, extErr := r.cleaner.ExternalNetworkNames(ctx, stack.Name)
+	if extErr != nil {
+		slog.Error("stack-reconciler: networks not deprovisioned, stack kept in deleting",
+			"stack", stack.Name, "error", extErr)
+		return
+	}
 	nets, _ := corrosion.ListNetworks(ctx, r.db)
 	for _, nr := range nets {
 		if nr.StackName == stack.Name && !externalNets[nr.Name] {

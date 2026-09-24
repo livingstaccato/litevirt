@@ -801,24 +801,26 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	for _, vm := range vms {
 		vmNames[vm.Name] = true
 	}
-	if st, err := corrosion.GetStack(ctx, s.db, req.Name); err == nil && st != nil && st.ComposeYAML != "" {
-		if f, err := compose.ParseStored([]byte(st.ComposeYAML)); err == nil {
-			for baseName, vmDef := range f.VMs {
-				// Container workloads are torn down separately via
-				// ListContainersByStack below — don't add them to the VM
-				// delete list (DeleteVM would just NotFound them).
-				if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
-					continue
-				}
-				for r := 0; r < vmDef.EffectiveReplicas(); r++ {
-					instName := vmDef.InstanceName(baseName, r)
-					if !vmNames[instName] {
-						vmNames[instName] = true
-						vms = append(vms, corrosion.VMRecord{
-							Name:      instName,
-							StackName: req.Name,
-						})
-					}
+	// storedErr: the stored compose cannot be read, so neither the VMs it
+	// names nor which of the stack's networks are external are known. VMs
+	// in the store are still deleted; networks are left (see below).
+	stored, storedErr := s.storedStackFile(ctx, req.Name)
+	if stored != nil {
+		for baseName, vmDef := range stored.VMs {
+			// Container workloads are torn down separately via
+			// ListContainersByStack below — don't add them to the VM
+			// delete list (DeleteVM would just NotFound them).
+			if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
+				continue
+			}
+			for r := 0; r < vmDef.EffectiveReplicas(); r++ {
+				instName := vmDef.InstanceName(baseName, r)
+				if !vmNames[instName] {
+					vmNames[instName] = true
+					vms = append(vms, corrosion.VMRecord{
+						Name:      instName,
+						StackName: req.Name,
+					})
 				}
 			}
 		}
@@ -910,8 +912,26 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// ("<stack>_<net>"): a migration re-provisions the network on the target via
 	// ProvisionNetwork and can land a row with an empty stack_name, which would
 	// otherwise orphan the bridge + dnsmasq + row at teardown.
-	externalNets := s.externalNetworkNames(ctx, req.Name)
+	//
+	// When the stored compose cannot be read, which networks are external is
+	// unknown, and guessing "none" deletes networks the stack never made. So
+	// none is deprovisioned; the stack stays in "deleting", and the error says
+	// why.
+	externalNets := externalNetworksOf(stored, req.Name)
 	nets, _ := corrosion.ListNetworks(ctx, s.db)
+	if storedErr != nil {
+		hadFailures = true
+		notRemoved = append(notRemoved, "networks")
+		slog.Warn("stack networks not deprovisioned: stored compose unreadable", "stack", req.Name, "error", storedErr)
+		if sendErr := stream.Send(&pb.DeleteProgress{
+			VmName: "networks",
+			Status: "error",
+			Error:  "networks not deprovisioned: " + storedErr.Error(),
+		}); sendErr != nil {
+			return sendErr
+		}
+		nets = nil
+	}
 	for _, nr := range nets {
 		if networkBelongsToStack(nr, req.Name) && !externalNets[nr.Name] {
 			// Tear down the static subnet route injected on deploy (injectSubnetRoutes),
@@ -1106,7 +1126,7 @@ func (s *Server) DeprovisionNetworkByName(ctx context.Context, name string) erro
 }
 
 // ExternalNetworkNames exposes externalNetworkNames for the StackReconciler.
-func (s *Server) ExternalNetworkNames(ctx context.Context, stackName string) map[string]bool {
+func (s *Server) ExternalNetworkNames(ctx context.Context, stackName string) (map[string]bool, error) {
 	return s.externalNetworkNames(ctx, stackName)
 }
 
@@ -1389,15 +1409,22 @@ func networkBelongsToStack(nr corrosion.NetworkRecord, stackName string) bool {
 	return nr.StackName == stackName || strings.HasPrefix(nr.Name, stackName+"_")
 }
 
-// externalNetworkNames returns a set of network names marked as external in the
-// stored compose YAML for a stack. Returns an empty map on any error.
-func (s *Server) externalNetworkNames(ctx context.Context, stackName string) map[string]bool {
-	st, err := corrosion.GetStack(ctx, s.db, stackName)
-	if err != nil || st == nil || st.ComposeYAML == "" {
-		return nil
-	}
-	f, err := compose.ParseStored([]byte(st.ComposeYAML))
+// externalNetworkNames returns the set of network names marked external in a
+// stack's stored compose YAML (nil when there is no stored stack), or an error
+// when it cannot be read — the teardown must then not guess which are the
+// stack's own.
+func (s *Server) externalNetworkNames(ctx context.Context, stackName string) (map[string]bool, error) {
+	f, err := s.storedStackFile(ctx, stackName)
 	if err != nil {
+		return nil, err
+	}
+	return externalNetworksOf(f, stackName), nil
+}
+
+// externalNetworksOf is the set of f's external networks, by plain and
+// stack-scoped name; nil for a nil f.
+func externalNetworksOf(f *compose.File, stackName string) map[string]bool {
+	if f == nil {
 		return nil
 	}
 	ext := make(map[string]bool)

@@ -825,7 +825,7 @@ func TestResolveVolume_EmptyStack(t *testing.T) {
 	ctx := adminCtx()
 	_ = ctx
 
-	cfg := s.resolveVolume(context.Background(), "", "vol1")
+	cfg := mustResolveVolume(t, s, context.Background(), "", "vol1")
 	if cfg.Driver != "local" {
 		t.Errorf("Driver = %q, want local", cfg.Driver)
 	}

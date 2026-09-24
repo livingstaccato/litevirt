@@ -58,6 +58,10 @@ it. Setting `subnet:` also gives every host the same anycast gateway — the fir
 usable address in the subnet — on the VNI bridge, so a VM's default route is
 host-local.
 
+The host bridge for a VXLAN network is `br-vni<VNI>` (for example `br-vni1000`),
+whatever `interface:` says. Every NIC path — create, restart, hot attach,
+containers — attaches to that bridge.
+
 ### Isolated
 
 A host-local bridge with no external connectivity. VMs on the same host can communicate, but there is no path to the outside.

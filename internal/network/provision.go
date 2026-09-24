@@ -37,6 +37,39 @@ func IsolatedBridgeName(networkName string) string {
 	return prefix + hex.EncodeToString(sum[:])[:maxIfaceName-len(prefix)]
 }
 
+// BridgeName returns the host device a NIC on networkName attaches to: the
+// same name Provision returns for def. Code that needs the device without
+// provisioning (hot attach, restart, containers) must use this, so the NIC
+// and the provisioned bridge always agree.
+//
+// A "direct" network answers "direct:<iface>", as Provision does. A network
+// missing the field its type keys on (vni, pf, interface) falls back to its
+// own name, which is the flat-bridge answer.
+func BridgeName(networkName string, def compose.NetworkDef) string {
+	switch def.Type {
+	case "vxlan":
+		if def.VNI != 0 {
+			return vxlanBridgeName(def.VNI)
+		}
+	case "isolated":
+		return IsolatedBridgeName(networkName)
+	case "sriov":
+		if def.PF != "" {
+			return def.PF
+		}
+		return networkName
+	case "direct":
+		if def.Interface != "" {
+			return "direct:" + def.Interface
+		}
+		return networkName
+	}
+	if def.Interface != "" {
+		return def.Interface
+	}
+	return networkName
+}
+
 // VTEPRecord holds a host's VTEP information for a network.
 type VTEPRecord struct {
 	NetworkName string

@@ -362,7 +362,8 @@ witness, incomplete or stale capacity observation, vCPU, memory, anti-affinity,
 `max-per-node`, required labels, devices, and the `spread-strict` pressure cap.
 Memory is compared as the VM's guest memory plus one qemu overhead against the
 host's allocatable memory net of what already runs there. Compose plans report
-it on `lv compose up`.
+it on `lv compose up`; a VM that failover cannot place records it in the
+`failover.skip` audit row.
 
 An **update** of a workload is placed as a replacement of what it holds now:
 its current cpu and memory are released on its host while the updated request

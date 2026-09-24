@@ -1942,12 +1942,18 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if !ok || result.Host == "" {
 				// No eligible host under the VM's hard constraints. Same
 				// reasoning as the batch-error path above: skip loudly.
+				// result.Err names the filter that refused each survivor — the
+				// operator's only clue to what would let the VM place.
+				detail := "no eligible host satisfies its placement constraints after fencing " + h.Name
+				if result.Err != nil {
+					detail += ": " + result.Err.Error()
+				}
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
-					"vm", vm.Name, "from", h.Name)
+					"vm", vm.Name, "from", h.Name, "reason", result.Err)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
 				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 					ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
-					Target: vm.Name, Detail: "no eligible host satisfies its placement constraints after fencing " + h.Name, Result: "skipped",
+					Target: vm.Name, Detail: detail, Result: "skipped",
 				})
 				continue
 			}

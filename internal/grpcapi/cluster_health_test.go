@@ -356,3 +356,59 @@ func TestOverallHealth_TheInfoPolicyResolvesNothing(t *testing.T) {
 			"state nobody can see", len(h.GetConditions()))
 	}
 }
+
+// TestGetClusterHealth_CapacityCountsContainers: the DB column is what the
+// database holds NOW, read with placement's rules — running VMs at their
+// actuals, running containers at their memory (no cpu) — and the container
+// share is reported apart. It is not the sampler's last copy of it: a
+// container deployed after the last sample is already charged, as placement
+// charges it. EXTRA stays the sampler's runtime-beyond-DB finding and
+// EFFECTIVE is the sum.
+func TestGetClusterHealth_CapacityCountsContainers(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+
+	// A sample taken before anything was deployed, with one rogue on top.
+	if err := corrosion.UpsertHostCapacityObservation(ctx, s.db, corrosion.HostCapacityObservation{
+		HostName: "node-4", ExtraCPU: 1, ExtraMemMiB: 64, EffectiveCPU: 1, EffectiveMemMiB: 64,
+		Complete: true, SampledAt: freshScan(),
+	}); err != nil {
+		t.Fatalf("observation: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "node-4", State: "running", CPUActual: 1, MemActual: 768,
+	}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	for _, ct := range []corrosion.ContainerRecord{
+		{Name: "web-ct", HostName: "node-4", State: "running", CPULimit: 8, MemMiB: 512},
+		{Name: "idle-ct", HostName: "node-4", State: "stopped", CPULimit: 2, MemMiB: 1024},
+		{Name: "elsewhere", HostName: "node-1", State: "running", CPULimit: 1, MemMiB: 256},
+	} {
+		if err := corrosion.UpsertContainer(ctx, s.db, ct); err != nil {
+			t.Fatalf("UpsertContainer %s: %v", ct.Name, err)
+		}
+	}
+
+	h, err := s.GetClusterHealth(adminCtx(), &pb.GetClusterHealthRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterHealth: %v", err)
+	}
+	if len(h.GetCapacity()) != 1 {
+		t.Fatalf("capacity rows = %d, want 1", len(h.GetCapacity()))
+	}
+	c := h.GetCapacity()[0]
+	if c.GetDbCpu() != 1 || c.GetDbMemMib() != 1280 {
+		t.Fatalf("db = %dc/%dMiB, want 1c/1280MiB (vm 1c/768 + running container 512, container cpu not charged)",
+			c.GetDbCpu(), c.GetDbMemMib())
+	}
+	if c.GetDbCtMemMib() != 512 {
+		t.Fatalf("db container share = %d MiB, want 512", c.GetDbCtMemMib())
+	}
+	if c.GetExtraCpu() != 1 || c.GetExtraMemMib() != 64 {
+		t.Fatalf("extra = %dc/%dMiB, want the sampled 1c/64MiB", c.GetExtraCpu(), c.GetExtraMemMib())
+	}
+	if c.GetEffectiveCpu() != 2 || c.GetEffectiveMemMib() != 1344 {
+		t.Fatalf("effective = %dc/%dMiB, want db + extra = 2c/1344MiB", c.GetEffectiveCpu(), c.GetEffectiveMemMib())
+	}
+}

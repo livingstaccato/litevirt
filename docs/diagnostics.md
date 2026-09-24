@@ -981,6 +981,27 @@ placement, and an uncapped rogue container makes the host's capacity
 explicitly *incomplete*, which disqualifies it as a placement target until
 resolved.
 
+The `capacity:` table in `lv health` has one row per host that has sampled:
+
+```
+capacity:
+  HOST    EFFECTIVE   DB                    EXTRA    COMPLETE  DETAIL
+  node-4  1c/1280MiB  1c/768MiB +512MiB ct  0c/0MiB  true
+```
+
+- **DB** is what the database holds on the host now, read at request time
+  with the rules placement charges by: running VMs at their recorded vCPU and
+  memory, then (`+… ct`) the memory of running containers. A container is
+  charged its memory and nothing else — its cpu is a cap in cores, not a
+  reservation — and carries no qemu overhead.
+- **EXTRA** is the sampler's finding: runtime usage beyond the database (a
+  runtime grown past its record, or a rogue the database does not know). A
+  container the database records is never counted here again, and a rogue
+  container adds only its memory.
+- **EFFECTIVE** is DB + EXTRA — what placement admits against.
+- **COMPLETE** false means the host's runtime could not be fully accounted
+  for, and placement treats it as unknown.
+
 Automatic containment is intentionally not implemented: no path destroys a
 disputed runtime. Any future containment mechanism must first prove complete
 fleet runtime coverage, a current-epoch authoritative holder, a strictly older

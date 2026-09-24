@@ -119,16 +119,16 @@ func TestFleet_ComposeRollingUpdateOfNeverHealthyVMFailsWithinHealthWait(t *test
 		t.Fatalf("setup deploy: %v (%v)", err, msgs)
 	}
 
-	// The recreated hb-1 comes up reported unhealthy and stays that way — the
-	// one signal the vm_healthy condition refuses on besides "not running".
-	if err := node.DB.Execute(ctx, `CREATE TRIGGER test_hb1_never_healthy AFTER INSERT ON vms
-		WHEN NEW.name = 'hb-1'
-		BEGIN UPDATE vms SET state_detail = 'unhealthy' WHERE name = NEW.name; END`); err != nil {
-		t.Fatalf("install never-healthy trigger: %v", err)
-	}
+	// The recreated hb-1 gets a healthcheck whose probe never passes. (This
+	// used to be a trigger writing state_detail='unhealthy', which nothing in
+	// production ever wrote; vm_healthy now reads the owner's probe verdict.)
+	probe := startVMChecks(t, node)
+	probe.set("hb-1", false)
+	neverHealthy := strings.Replace(rollingUpdateOf(composeRolling), "    update:\n",
+		"    healthcheck:\n      type: tcp\n      target: 10.0.0.9:80\n      interval: 1ms\n      retries: 1\n      action: alert\n    update:\n", 1)
 
 	start := time.Now()
-	msgs, err := deployRolling(t, ctx, client, rollingUpdateOf(composeRolling), 20*time.Second)
+	msgs, err := deployRolling(t, ctx, client, neverHealthy, 20*time.Second)
 	elapsed := time.Since(start)
 	if err == nil {
 		t.Fatalf("rolling update of a VM that never became healthy succeeded; got %v", msgs)

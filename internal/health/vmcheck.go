@@ -44,6 +44,17 @@ type VMChecker struct {
 	// to enforce max-unavailable limits.
 	activeActions map[string]int // stackName → count of VMs mid-action
 
+	// tracks is the probe state behind the published verdict (vmprobe.go),
+	// one per owned VM, reset whenever the VM's incarnation changes. Guarded
+	// by mu; created lazily so a literal VMChecker{} in a test stays usable.
+	tracks map[string]*probeTrack
+	// probeFn replaces the probe transport (SetProbeFunc). nil → the real
+	// tcp/http/ping/exec probe.
+	probeFn ProbeFunc
+	// probes counts in-flight checkVM goroutines so SweepOnce can wait for
+	// them. Production's Start loop never waits.
+	probes sync.WaitGroup
+
 	// migrateVM is an optional callback to migrate a VM via the full MigrateVM
 	// RPC path (with post-migration steps: GARP, LB, FDB, DNS, network provisioning).
 	migrateVMFunc func(ctx context.Context, vmName, targetHost string) error
@@ -101,6 +112,27 @@ func (v *VMChecker) noteStateWriteFail(op string, err error) {
 	if v.onStateWriteFail != nil {
 		v.onStateWriteFail(op, corrosion.ClassifyWriteErr(err))
 	}
+}
+
+// ProbeFunc runs one healthcheck probe against vm and reports whether it
+// passed and, when it did not, why. ctx carries the probe timeout.
+type ProbeFunc func(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec) (ok bool, reason string)
+
+// SetProbeFunc replaces the probe transport. It exists for tests that must
+// script probe results (a fleet VM has no guest to answer a real probe); the
+// daemon never calls it. nil restores the real probe.
+func (v *VMChecker) SetProbeFunc(fn ProbeFunc) {
+	v.mu.Lock()
+	v.probeFn = fn
+	v.mu.Unlock()
+}
+
+// SweepOnce runs one sweep and waits for the probes it started, verdict
+// publication included. For tests that drive the checker instead of running
+// its ticker; the daemon uses Start.
+func (v *VMChecker) SweepOnce(ctx context.Context) {
+	v.sweep(ctx)
+	v.probes.Wait()
 }
 
 // SetEventBus sets the event bus for publishing health check events.
@@ -192,23 +224,35 @@ func (v *VMChecker) sweep(ctx context.Context) {
 	}
 
 	now := time.Now()
+	durable := v.loadVerdicts(ctx)
 	for _, vm := range vms {
-		if vm.State != "running" {
-			continue
-		}
-		// Grace period: skip health checks for VMs created less than 5 minutes ago.
-		// Freshly booted VMs need time to finish cloud-init, get IPs, start services.
-		if created, err := time.Parse(time.RFC3339, vm.CreatedAt); err == nil {
-			if now.Sub(created) < healthCheckGracePeriod {
-				continue
-			}
-		}
 		hspec := vmCheckSpec(&vm)
-		if hspec == nil || hspec.Type == "" {
+		if vm.State != "running" || hspec == nil || hspec.Type == "" {
+			// Nothing to probe. A verdict this host published for the VM
+			// no longer describes it: bring the row to "unknown".
+			v.settleIdleVerdict(ctx, vm, hspec, durable[vm.Name])
 			continue
 		}
-		go v.checkVM(ctx, vm, hspec)
+		if !v.probeDue(vm, hspec, now) {
+			continue
+		}
+		// Grace period: a VM created less than 5 minutes ago is still
+		// finishing cloud-init, getting IPs, starting services, so a failed
+		// probe does not count toward the healthcheck's ACTION yet. The probe
+		// still runs and its verdict is still published: a depends-on or
+		// rolling-update wait on a just-created VM needs its first pass, and
+		// "not passing yet" is the truth about a VM that is still booting.
+		inGrace := false
+		if created, err := time.Parse(time.RFC3339, vm.CreatedAt); err == nil {
+			inGrace = now.Sub(created) < healthCheckGracePeriod
+		}
+		v.probes.Add(1)
+		go func(vm corrosion.VMRecord) {
+			defer v.probes.Done()
+			v.checkVMAt(ctx, vm, hspec, inGrace)
+		}(vm)
 	}
+	v.settleOrphanVerdicts(ctx, durable, current)
 
 	// Second pass: restart policy for stopped/error VMs.
 	for _, vm := range vms {
@@ -284,6 +328,11 @@ func (v *VMChecker) pruneVMState(current map[string]bool) {
 			delete(v.activeActions, stack)
 		}
 	}
+	for name := range v.tracks {
+		if !current[name] {
+			delete(v.tracks, name)
+		}
+	}
 }
 
 // isCorrelatedFailure returns true if many VMs are failing simultaneously,
@@ -301,17 +350,21 @@ func (v *VMChecker) isCorrelatedFailure() bool {
 }
 
 func (v *VMChecker) checkVM(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec) {
-	interval := parseDuration(hspec.Interval, 30*time.Second)
+	v.checkVMAt(ctx, vm, hspec, false)
+}
+
+// checkVMAt probes vm once, publishes the verdict that result leads to, and —
+// outside the start grace period — counts it toward the healthcheck's action.
+// Interval enforcement is the sweep's (probeDue), not this function's.
+func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, inGrace bool) {
 	timeout := parseDuration(hspec.Timeout, 5*time.Second)
-	retries := int(hspec.Retries)
-	if retries == 0 {
-		retries = 3
+	retries := probeRetries(hspec)
+
+	healthy, reason := v.runProbe(ctx, vm, hspec, timeout)
+	v.recordVerdict(ctx, vm, hspec, healthy, reason)
+	if inGrace {
+		return
 	}
-
-	// Rate-limit: only check if it's been at least one interval since the last sweep.
-	_ = interval // interval enforcement is handled by the sweep ticker + goroutine lifecycle
-
-	healthy := v.probe(ctx, vm.Name, hspec, timeout)
 
 	v.mu.Lock()
 	if healthy {
@@ -376,7 +429,37 @@ func (v *VMChecker) checkVM(ctx context.Context, vm corrosion.VMRecord, hspec *p
 	v.takeAction(ctx, vm, hspec)
 }
 
+// probeRetries is the healthcheck's retries: consecutive failures before the
+// VM is unhealthy (and before its action runs). Default 3.
+func probeRetries(hspec *pb.HealthCheckSpec) int {
+	if hspec.Retries > 0 {
+		return int(hspec.Retries)
+	}
+	return 3
+}
+
+// runProbe runs one probe through the wired transport (SetProbeFunc) or the
+// real one, bounded by timeout.
+func (v *VMChecker) runProbe(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, timeout time.Duration) (bool, string) {
+	v.mu.Lock()
+	fn := v.probeFn
+	v.mu.Unlock()
+	if fn == nil {
+		return v.probeDetail(ctx, vm.Name, hspec, timeout)
+	}
+	tctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return fn(tctx, vm, hspec)
+}
+
 func (v *VMChecker) probe(ctx context.Context, vmName string, hspec *pb.HealthCheckSpec, timeout time.Duration) bool {
+	ok, _ := v.probeDetail(ctx, vmName, hspec, timeout)
+	return ok
+}
+
+// probeDetail is the real probe. On failure it also says why, which is what
+// the published verdict carries to a waiter that times out.
+func (v *VMChecker) probeDetail(ctx context.Context, vmName string, hspec *pb.HealthCheckSpec, timeout time.Duration) (bool, string) {
 	tctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -384,39 +467,45 @@ func (v *VMChecker) probe(ctx context.Context, vmName string, hspec *pb.HealthCh
 	case "tcp":
 		conn, err := (&net.Dialer{}).DialContext(tctx, "tcp", hspec.Target)
 		if err != nil {
-			return false
+			return false, fmt.Sprintf("tcp %s: %v", hspec.Target, err)
 		}
 		conn.Close()
-		return true
+		return true, ""
 
 	case "http", "https":
 		req, err := http.NewRequestWithContext(tctx, http.MethodGet, hspec.Target, nil)
 		if err != nil {
-			return false
+			return false, fmt.Sprintf("%s %s: %v", hspec.Type, hspec.Target, err)
 		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			return false
+			return false, fmt.Sprintf("%s %s: %v", hspec.Type, hspec.Target, err)
 		}
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		return resp.StatusCode < 500
+		if resp.StatusCode >= 500 {
+			return false, fmt.Sprintf("%s %s: status %d", hspec.Type, hspec.Target, resp.StatusCode)
+		}
+		return true, ""
 
 	case "ping":
 		cmd := exec.CommandContext(tctx, "ping", "-c", "1", "-W", "2", hspec.Target)
-		return cmd.Run() == nil
+		if err := cmd.Run(); err != nil {
+			return false, fmt.Sprintf("ping %s: %v", hspec.Target, err)
+		}
+		return true, ""
 
 	case "exec":
 		// Run command inside the VM via guest agent.
 		if v.virt == nil {
-			return false
+			return false, "exec probe: no libvirt connection on this host"
 		}
 		// Guard: exec probes require a guest agent. If the VM spec says
 		// guest_agent is disabled, skip the probe and treat as healthy (#9).
 		spec := vmSpecFromDB(ctx, v.db, vmName)
 		if spec != nil && !spec.GuestAgent {
 			slog.Warn("vmcheck: exec probe skipped — guest agent disabled", "vm", vmName)
-			return true
+			return true, ""
 		}
 		// ExecInGuest takes no context (the guest-agent call can block ~30-60s),
 		// so honor the probe timeout ourselves — otherwise a hung agent makes the
@@ -426,15 +515,18 @@ func (v *VMChecker) probe(ctx context.Context, vmName string, hspec *pb.HealthCh
 		go func() { _, e := v.virt.ExecInGuest(vmName, "/bin/sh", []string{"-c", hspec.Target}); done <- e }()
 		select {
 		case err := <-done:
-			return err == nil
+			if err != nil {
+				return false, fmt.Sprintf("exec %q: %v", hspec.Target, err)
+			}
+			return true, ""
 		case <-tctx.Done():
 			slog.Warn("vmcheck: exec probe timed out", "vm", vmName, "timeout", timeout)
-			return false
+			return false, fmt.Sprintf("exec %q: timed out after %s", hspec.Target, timeout)
 		}
 
 	default:
 		slog.Warn("vmcheck: unknown probe type", "type", hspec.Type)
-		return true
+		return true, ""
 	}
 }
 

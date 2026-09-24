@@ -263,9 +263,14 @@ func TestFleet_ComposeFailedUpdateDeleteIsReported(t *testing.T) {
 func TestFleet_ComposeFailedDependsOnWaitIsReported(t *testing.T) {
 	_, node, client := newComposeFailNode(t)
 	ctx := context.Background()
-	node.Server.SetDependsOnWaitTimeoutForTests(time.Nanosecond)
+	node.Server.SetDependsOnWaitTimeoutForTests(200 * time.Millisecond)
 
-	yaml := composeFailTwo + "    depends-on: [hb-1]\n"
+	// hb-1 has a healthcheck and nothing in this scenario probes it, so it
+	// runs but never becomes healthy. (A wait always looks at least once, so
+	// a bare vm_started on a VM that is already running cannot time out.)
+	yaml := strings.Replace(composeFailTwo, "      host: node-0\n  hb-2:",
+		"      host: node-0\n    healthcheck:\n      type: tcp\n      target: 10.0.0.9:80\n  hb-2:", 1) +
+		"    depends-on:\n      hb-1:\n        condition: vm_healthy\n"
 	msgs := deployCollect(t, ctx, client, yaml)
 	p := errorPhaseFor(msgs, "hb-1")
 	if p == nil {

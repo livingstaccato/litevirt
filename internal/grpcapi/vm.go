@@ -2215,6 +2215,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		MemActualMib: int32(vm.MemActual),
 		IsTemplate:   vm.IsTemplate,
 	}
+	// The healthcheck verdict, read exactly as the vm_healthy wait reads it.
+	// Best-effort: an unreadable verdict leaves the fields empty.
+	if h, herr := health.EvaluateVMHealth(ctx, s.db, vm); herr == nil && h.HasHealthcheck {
+		pbVM.Health, pbVM.HealthDetail = h.Verdict, h.Detail
+	}
 
 	// Interfaces — run IP discovery fallback if IP is unknown.
 	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, name)

@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
 	"strings"
 
@@ -31,8 +32,9 @@ import (
 // was never run says nothing about the VM, and restarting a VM because the
 // checker does not know where it is would restart it forever.
 
-// SetNICIPDiscovery replaces the owner-host lookup vmAddress falls back to
-// when a NIC has no recorded address (ARP cache, then dnsmasq leases). Test
+// SetNICIPDiscovery replaces the owner-host lookup vmAddress checks a NIC's
+// recorded address against, and falls back to when none is recorded (dnsmasq
+// leases, then the ARP cache). Test
 // seam, nil in production — the same seam grpcapi's discovery has, for the
 // same reason: no test host has a guest answering ARP.
 func (v *VMChecker) SetNICIPDiscovery(fn func(mac string) string) {
@@ -67,16 +69,25 @@ func (v *VMChecker) resolveProbeSpec(ctx context.Context, vm corrosion.VMRecord,
 // vmAddress is the address a VM-relative probe goes to, or "" and why there
 // is none.
 //
-// Sources, in order:
+// Sources:
 //  1. the NIC's recorded address (vm_interfaces.ip, lowest ordinal first) —
 //     a static assignment or one the IP scanner / NetBox gate recorded. It is
-//     what `lv ls`, DNS and the load balancer use, so the probe checks the
-//     address everything else sends traffic to.
-//  2. a live lookup of each NIC's MAC on THIS host — the ARP cache, then the
-//     dnsmasq leases — which is possible because the probe runs on the VM's
-//     owner. This covers the window before the IP scanner (30s) records a DHCP
-//     address, and a bound network whose claim has not been granted yet. The
-//     address is used, never written: recording belongs to the gated paths.
+//     what `lv ls`, DNS and the load balancer use.
+//  2. a live lookup of that NIC's MAC on THIS host — the dnsmasq leases, then
+//     the ARP cache — which is possible because the probe runs on the VM's
+//     owner. When it finds an address and that address is not the recorded
+//     one, the live one wins: the IP scanner records a DHCP address once and
+//     never updates it, so after the guest reboots onto a new lease the
+//     recorded address is stale, and probing it fails a healthy VM (and its
+//     action restarts it). When the lookup finds nothing, the recorded address
+//     stands — a static or NetBox-assigned address need not appear in either.
+//  3. with no address recorded for any NIC, the same live lookup for each
+//     NIC's MAC in turn. This covers the window before the IP scanner (30s)
+//     records a DHCP address, and a bound network whose claim has not been
+//     granted yet.
+//
+// A live address is used, never written: recording belongs to the gated
+// discovery paths (grpcapi/netbox_discovery.go).
 func (v *VMChecker) vmAddress(ctx context.Context, vm corrosion.VMRecord) (string, string) {
 	if v.db == nil {
 		return "", "no address known for VM yet: no cluster state to read its NICs from"
@@ -88,35 +99,48 @@ func (v *VMChecker) vmAddress(ctx context.Context, vm corrosion.VMRecord) (strin
 	if len(ifaces) == 0 {
 		return "", "no address known for VM yet: it has no network interface to probe"
 	}
-	for _, ifc := range ifaces {
-		if ip := bareIP(ifc.IP); ip != "" {
-			return ip, ""
-		}
-	}
 	v.mu.Lock()
 	discover := v.nicIPDiscovery
 	v.mu.Unlock()
 	if discover == nil {
 		discover = discoverNICAddressLocal
 	}
+	live := func(mac string) string {
+		if mac == "" {
+			return ""
+		}
+		return bareIP(discover(mac))
+	}
 	for _, ifc := range ifaces {
-		if ifc.MAC == "" {
+		recorded := bareIP(ifc.IP)
+		if recorded == "" {
 			continue
 		}
-		if ip := bareIP(discover(ifc.MAC)); ip != "" {
+		if seen := live(ifc.MAC); seen != "" && seen != recorded {
+			slog.Debug("vmcheck: probing the live address, not the recorded one",
+				"vm", vm.Name, "mac", ifc.MAC, "recorded", recorded, "live", seen)
+			return seen, ""
+		}
+		return recorded, ""
+	}
+	for _, ifc := range ifaces {
+		if ip := live(ifc.MAC); ip != "" {
 			return ip, ""
 		}
 	}
 	return "", fmt.Sprintf("no address known for VM yet: none recorded for its NICs and no ARP entry or DHCP lease on %s", v.hostName)
 }
 
-// discoverNICAddressLocal is grpcapi's discoverNICAddress: where this host
-// sees a MAC answering.
+// discoverNICAddressLocal is where this host sees a MAC: its dnsmasq lease,
+// then the ARP cache. Lease first, unlike grpcapi's discoverNICAddress: after
+// a guest moves to a new lease the ARP cache can still hold its OLD address
+// (a failed neighbour entry keeps its hardware address), which would confirm
+// exactly the stale recorded address vmAddress is checking.
 func discoverNICAddressLocal(mac string) string {
-	if ip := lv.GetIPFromARP(mac); ip != "" {
+	if ip := lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", mac); ip != "" {
 		return ip
 	}
-	return lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", mac)
+	return lv.GetIPFromARP(mac)
 }
 
 // bareIP returns s as a bare IP literal ("10.0.0.5/24" → "10.0.0.5"), or ""

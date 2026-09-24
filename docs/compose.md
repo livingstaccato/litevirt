@@ -586,7 +586,7 @@ Requirements:
 
 An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); service names such as `ssh` are not accepted.
 
-**The VM's address** is its NIC's recorded address — the one `lv ls` shows, lowest-ordinal NIC first — and, when none is recorded yet, what the owning host sees for the NIC's MAC in its ARP cache or dnsmasq leases.
+**The VM's address** is its NIC's recorded address — the one `lv ls` shows, lowest-ordinal NIC first — unless the owning host sees a *different* address for that NIC's MAC in its dnsmasq leases or ARP cache, in which case the probe goes to the live one: a DHCP address is recorded once and not updated, so after the guest reboots onto a new lease the recorded address is stale (`lv ls`, DNS and the load balancer keep showing it until it is changed). When the host sees nothing for the MAC — a static or NetBox-assigned address — the recorded address is used. When no address is recorded yet, the probe uses what the host sees for the NIC's MAC.
 
 **When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.
 

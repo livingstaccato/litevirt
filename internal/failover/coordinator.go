@@ -724,7 +724,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 			continue
 		}
 		slog.Info("failover: host healthy again, marking active",
-			"host", h.Name, "from", h.State, "healthy_observers", rows[0].Int("n"), "quorum", quorum)
+			"host", h.Name, "from", h.State, "healthy_observers", len(fresh), "quorum", quorum)
 		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
 		delete(c.fenced, h.Name)
 		delete(c.fenceRelocated, h.Name)

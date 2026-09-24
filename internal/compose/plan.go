@@ -273,49 +273,40 @@ func CloudInitHashFromSpec(specJSON string) string {
 	return CloudInitHash(raw.CloudInit.Userdata, raw.CloudInit.Networkconfig)
 }
 
-// TopologicalSortOps reorders OpCreate operations in dependency order.
-// Non-create ops retain their relative order at the end.
+// DependsOnTarget reports whether the workload instance name is (a replica
+// of) the compose name dep that a depends-on entry refers to: "db" matches
+// "db" and "db-2".
+func DependsOnTarget(dep, instance string) bool {
+	return instance == dep || (len(instance) > len(dep) && instance[:len(dep)] == dep && instance[len(dep)] == '-')
+}
+
+// TopologicalSortOps orders the create and update ops in dependency order —
+// together, so a create that depends on a VM being updated comes after that
+// update — taking the lowest-named ready op at each step. No-change and
+// delete ops keep their relative order after them.
 func TopologicalSortOps(ops []Op) []Op {
-	// Separate creates from other ops.
-	var creates []Op
-	var others []Op
+	var active, others []Op
 	for _, op := range ops {
-		if op.Kind == OpCreate && len(op.DependsOn) > 0 {
-			creates = append(creates, op)
-		} else if op.Kind == OpCreate {
-			creates = append(creates, op)
+		if op.Kind == OpCreate || op.Kind == OpUpdate {
+			active = append(active, op)
 		} else {
 			others = append(others, op)
 		}
 	}
 
-	if len(creates) <= 1 {
-		return ops
-	}
-
-	// Build dependency graph among create ops.
-	// VM names may be instance names (web-1) whose DependsOn uses base names (db).
-	// We need to map base names to instance names.
+	// VM names are instance names (web-1) whose DependsOn uses base names (db).
 	byName := map[string]*Op{}
-	for i := range creates {
-		byName[creates[i].VMName] = &creates[i]
-	}
-
 	inDegree := map[string]int{}
-	dependents := map[string][]string{} // dependency → list of ops that depend on it
-
-	for i := range creates {
-		op := &creates[i]
-		inDegree[op.VMName] = 0
+	for i := range active {
+		byName[active[i].VMName] = &active[i]
+		inDegree[active[i].VMName] = 0
 	}
-
-	for i := range creates {
-		op := &creates[i]
+	dependents := map[string][]string{} // dependency → ops that depend on it
+	for i := range active {
+		op := &active[i]
 		for depBase := range op.DependsOn {
-			// Find the actual instance name(s) for this dependency.
-			// Match exact name or any name that starts with depBase (replica).
 			for name := range byName {
-				if name == depBase || (len(name) > len(depBase) && name[:len(depBase)] == depBase && name[len(depBase)] == '-') {
+				if DependsOnTarget(depBase, name) {
 					inDegree[op.VMName]++
 					dependents[name] = append(dependents[name], op.VMName)
 				}
@@ -323,26 +314,23 @@ func TopologicalSortOps(ops []Op) []Op {
 		}
 	}
 
-	// Kahn's algorithm, taking the lowest-named ready VM at each step. The
-	// ready set comes from map iteration, so without a fixed choice VMs with no
-	// ordering between them were created in a different order on every deploy
-	// of an unchanged file — different output, a different partial-failure
-	// shape, and nothing an operator could reproduce.
+	// Kahn's algorithm, taking the lowest-named ready op at each step. The
+	// ready set comes from map iteration, so without a fixed choice ops with no
+	// ordering between them ran in a different order on every deploy of an
+	// unchanged file — different output, a different partial-failure shape,
+	// and nothing an operator could reproduce.
 	var ready []string
 	for name, deg := range inDegree {
 		if deg == 0 {
 			ready = append(ready, name)
 		}
 	}
-
-	var sorted []Op
+	sorted := make([]Op, 0, len(ops))
 	for len(ready) > 0 {
 		sort.Strings(ready)
 		cur := ready[0]
 		ready = ready[1:]
-		if op, ok := byName[cur]; ok {
-			sorted = append(sorted, *op)
-		}
+		sorted = append(sorted, *byName[cur])
 		for _, dep := range dependents[cur] {
 			inDegree[dep]--
 			if inDegree[dep] == 0 {
@@ -351,14 +339,14 @@ func TopologicalSortOps(ops []Op) []Op {
 		}
 	}
 
-	// If sorting didn't cover all creates (shouldn't happen if validation passed),
-	// append remaining.
-	if len(sorted) < len(creates) {
+	// A cycle (validation rejects them; the replica-prefix match can in
+	// principle invent one) leaves ops unsorted: append them in their order.
+	if len(sorted) < len(active) {
 		seen := map[string]bool{}
 		for _, op := range sorted {
 			seen[op.VMName] = true
 		}
-		for _, op := range creates {
+		for _, op := range active {
 			if !seen[op.VMName] {
 				sorted = append(sorted, op)
 			}

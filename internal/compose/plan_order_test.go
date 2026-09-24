@@ -71,3 +71,36 @@ func TestBuild_OpOrderIsStableAcrossRuns(t *testing.T) {
 		}
 	}
 }
+
+func opOrder(ops []Op) []string {
+	out := make([]string, 0, len(ops))
+	for _, op := range ops {
+		out = append(out, string(op.Kind)+":"+op.VMName)
+	}
+	return out
+}
+
+// Creates and updates are ordered together by depends-on: a new VM that
+// depends on a VM being updated comes after that update, and an update that
+// depends on another op comes after it. Among ready ops, name order; no-change
+// and delete ops keep their relative place after them.
+func TestTopologicalSortOps_CreatesAndUpdatesInterleaveByDependency(t *testing.T) {
+	want := []string{
+		"create:a", "update:db", "create:app", "update:web-1", "update:web-2",
+		"no-change:zz", "delete:old",
+	}
+	for i := 0; i < 50; i++ {
+		ops := []Op{
+			{Kind: OpCreate, VMName: "app", DependsOn: DependsOn{"db": {}}},
+			{Kind: OpCreate, VMName: "a"},
+			{Kind: OpUpdate, VMName: "web-2", DependsOn: DependsOn{"app": {}}},
+			{Kind: OpNoChange, VMName: "zz"},
+			{Kind: OpUpdate, VMName: "web-1", DependsOn: DependsOn{"app": {}}},
+			{Kind: OpUpdate, VMName: "db"},
+			{Kind: OpDelete, VMName: "old"},
+		}
+		if got := opOrder(TopologicalSortOps(ops)); !reflect.DeepEqual(got, want) {
+			t.Fatalf("run %d: op order %v, want %v", i, got, want)
+		}
+	}
+}

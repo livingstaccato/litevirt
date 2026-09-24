@@ -696,19 +696,74 @@ func (s *Server) applyLBActions(ctx context.Context, f *compose.File, plan *plan
 	}
 }
 
-// sortVMActions reorders update operations so that already-failed replicas
-// are processed first (#32).
+// sortVMActions puts already-failed replicas' updates first (#32) without
+// breaking the planner's dependency order: it re-runs the topological sort
+// over the create and update actions, choosing among the READY ones by state
+// priority (error, then stopped, then the rest) and then by their planned
+// position. Deletes and no-change actions keep their slots.
 func sortVMActions(actions []planner.VMAction, current []compose.CurrentVM) {
 	stateOf := make(map[string]string, len(current))
 	for _, c := range current {
 		stateOf[c.Name] = c.State
 	}
-	sort.SliceStable(actions, func(i, j int) bool {
-		if actions[i].Kind != planner.OpUpdate || actions[j].Kind != planner.OpUpdate {
-			return false
+	var slots []int // positions of the create/update actions
+	for i, a := range actions {
+		if a.Kind == planner.OpCreate || a.Kind == planner.OpUpdate {
+			slots = append(slots, i)
 		}
-		return statePriority(stateOf[actions[i].VMName]) < statePriority(stateOf[actions[j].VMName])
-	})
+	}
+	n := len(slots)
+	prio := make([]int, n)
+	inDegree := make([]int, n)
+	dependents := make([][]int, n)
+	for i, si := range slots {
+		prio[i] = 2
+		if actions[si].Kind == planner.OpUpdate {
+			prio[i] = statePriority(stateOf[actions[si].VMName])
+		}
+		for dep := range actions[si].DependsOn {
+			for j, sj := range slots {
+				if j != i && compose.DependsOnTarget(dep, actions[sj].VMName) {
+					inDegree[i]++
+					dependents[j] = append(dependents[j], i)
+				}
+			}
+		}
+	}
+	done := make([]bool, n)
+	order := make([]int, 0, n)
+	for len(order) < n {
+		pick := -1
+		for i := 0; i < n; i++ {
+			if done[i] || inDegree[i] > 0 {
+				continue
+			}
+			if pick < 0 || prio[i] < prio[pick] {
+				pick = i
+			}
+		}
+		if pick < 0 { // a cycle: keep the rest in planned order
+			for i := 0; i < n; i++ {
+				if !done[i] {
+					done[i] = true
+					order = append(order, i)
+				}
+			}
+			break
+		}
+		done[pick] = true
+		order = append(order, pick)
+		for _, d := range dependents[pick] {
+			inDegree[d]--
+		}
+	}
+	sorted := make([]planner.VMAction, n)
+	for k, i := range order {
+		sorted[k] = actions[slots[i]]
+	}
+	for k, si := range slots {
+		actions[si] = sorted[k]
+	}
 }
 
 // buildCurrentVMsFromState converts snapshot VMs to compose.CurrentVM for sorting.
@@ -1381,6 +1436,11 @@ func highestDependencyCondition(vmName string, ops []compose.Op) string {
 // "vm_healthy", the compose depends-on vocabulary) with that condition's
 // default timeout.
 func (s *Server) waitForCondition(ctx context.Context, vmName, condition string) error {
+	return s.waitForConditionWithin(ctx, vmName, condition, s.dependsOnTimeout(condition))
+}
+
+// dependsOnTimeout is a depends-on condition's default wait.
+func (s *Server) dependsOnTimeout(condition string) time.Duration {
 	timeout := 5 * time.Minute
 	if condition == "vm_healthy" {
 		timeout = 10 * time.Minute
@@ -1388,7 +1448,56 @@ func (s *Server) waitForCondition(ctx context.Context, vmName, condition string)
 	if d := s.dependsOnWaitTimeout.Load(); d > 0 {
 		timeout = time.Duration(d)
 	}
-	return s.waitForConditionWithin(ctx, vmName, condition, timeout)
+	return timeout
+}
+
+// waitForWorkloadCondition waits for a planned workload — a VM or a
+// container — to satisfy a depends-on condition, with the condition's default
+// timeout.
+func (s *Server) waitForWorkloadCondition(ctx context.Context, a planner.VMAction, condition string) error {
+	if a.IsContainer {
+		return s.waitForContainerConditionWithin(ctx, a.TargetHost, a.VMName, condition, s.dependsOnTimeout(condition))
+	}
+	return s.waitForCondition(ctx, a.VMName, condition)
+}
+
+// waitForContainerConditionWithin is waitForConditionWithin for a container
+// on host. A container has no probe verdict — compose refuses vm_healthy on a
+// container that declares a healthcheck — so both conditions mean running,
+// as vm_healthy does for a VM without a healthcheck.
+func (s *Server) waitForContainerConditionWithin(ctx context.Context, host, name, condition string, timeout time.Duration) error {
+	switch condition {
+	case "vm_started", "vm_healthy":
+	default:
+		return fmt.Errorf("unknown wait condition %q for %s (want vm_started or vm_healthy)", condition, name)
+	}
+	deadline := time.Now().Add(timeout)
+	last := "the container does not exist yet"
+	for {
+		rec, err := corrosion.GetContainer(ctx, s.db, host, name)
+		switch {
+		case err != nil:
+			last = fmt.Sprintf("could not read the container: %v", err)
+		case rec == nil:
+			last = "the container does not exist on " + host
+		case rec.State == "running":
+			return nil
+		default:
+			last = "the container is " + rec.State
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		t := time.NewTimer(min(conditionPollInterval, remaining))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	return fmt.Errorf("timeout after %s waiting for %s on container %s: %s", timeout, condition, name, last)
 }
 
 // waitForConditionWithin polls until vmName satisfies condition or timeout

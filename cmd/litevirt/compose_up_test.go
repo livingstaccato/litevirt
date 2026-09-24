@@ -1,0 +1,238 @@
+package main
+
+import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"google.golang.org/grpc"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+)
+
+// scriptedStream yields a fixed sequence of messages, then io.EOF.
+type scriptedStream[T any] struct {
+	fakeStream[T]
+	msgs []*T
+}
+
+func (s *scriptedStream[T]) Recv() (*T, error) {
+	if len(s.msgs) == 0 {
+		return nil, io.EOF
+	}
+	m := s.msgs[0]
+	s.msgs = s.msgs[1:]
+	return m, nil
+}
+
+// deployClient answers the dry-run DeployStack with plan and the real one with
+// progress — the two streams `lv compose up` reads, in that order.
+type deployClient struct {
+	pb.LiteVirtClient
+	plan     []*pb.DeployProgress
+	progress []*pb.DeployProgress
+	applied  bool // a non-dry-run DeployStack was issued
+	deleted  bool // DeleteStack was issued
+}
+
+func (d *deployClient) DeployStack(_ context.Context, in *pb.DeployStackRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DeployProgress], error) {
+	if in.DryRun {
+		return &scriptedStream[pb.DeployProgress]{msgs: append([]*pb.DeployProgress(nil), d.plan...)}, nil
+	}
+	d.applied = true
+	return &scriptedStream[pb.DeployProgress]{msgs: append([]*pb.DeployProgress(nil), d.progress...)}, nil
+}
+
+func (d *deployClient) ListVMs(_ context.Context, _ *pb.ListVMsRequest, _ ...grpc.CallOption) (*pb.ListVMsResponse, error) {
+	return &pb.ListVMsResponse{Vms: []*pb.VM{{Name: "ha1", State: pb.VMState_VM_RUNNING}}}, nil
+}
+
+func (d *deployClient) DeleteStack(_ context.Context, _ *pb.DeleteStackRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DeleteProgress], error) {
+	d.deleted = true
+	return &fakeStream[pb.DeleteProgress]{}, nil
+}
+
+const hbCompose = "name: hb\nvms:\n  ha1:\n    image: ubuntu\n    cpu: 1\n    memory: 512\n  ha2:\n    image: ubuntu\n    cpu: 1\n    memory: 512\n"
+
+// runComposeCLI runs `lv compose <args>` against spy with stdin fed from
+// stdinData and the terminal check pinned to tty. It returns stdout and the
+// command's error.
+func runComposeCLI(t *testing.T, spy *deployClient, tty bool, stdinData string, args ...string) (string, error) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "compose.yml")
+	if err := os.WriteFile(file, []byte(hbCompose), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	origClient := withClient
+	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
+		return fn(ctx, spy)
+	}
+	origTTY := stdinIsTerminal
+	stdinIsTerminal = func() bool { return tty }
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString(stdinData); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	origStdin := os.Stdin
+	os.Stdin = r
+	t.Cleanup(func() {
+		withClient = origClient
+		stdinIsTerminal = origTTY
+		os.Stdin = origStdin
+		r.Close()
+	})
+
+	cmd := newComposeCmd()
+	cmd.SetArgs(append(args, "-f", file))
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
+	var runErr error
+	out := captureStdout(t, func() { runErr = cmd.Execute() })
+	return out, runErr
+}
+
+func createPlan(names ...string) []*pb.DeployProgress {
+	var out []*pb.DeployProgress
+	for _, n := range names {
+		out = append(out, &pb.DeployProgress{Phase: "create", VmName: n, Detail: "create " + n})
+	}
+	return out
+}
+
+// TestComposeUp_FailedCreateIsNotReportedAsDeployed reproduces the lab run: the
+// daemon streamed an "error" phase for the only VM and returned OK, and the CLI
+// printed `Stack "hb" deployed.` and exited 0. A failed action must become a
+// non-nil error (non-zero exit) that names it, and the success line must not
+// appear.
+func TestComposeUp_FailedCreateIsNotReportedAsDeployed(t *testing.T) {
+	spy := &deployClient{
+		plan: createPlan("ha2"),
+		progress: []*pb.DeployProgress{
+			{Phase: "applying", VmName: "ha2", Detail: "create ha2"},
+			{Phase: "error", VmName: "ha2", Error: `refusing admission to host "node-4"`},
+		},
+	}
+	out, err := runComposeCLI(t, spy, false, "", "up", "-y")
+	if err == nil {
+		t.Fatalf("compose up with a failed create returned nil error (exit 0); stdout:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), `stack "hb": 1 of 1 actions failed (ha2)`) {
+		t.Errorf("error does not summarise the failure: %v", err)
+	}
+	if strings.Contains(out, "deployed.") {
+		t.Errorf("a failed deploy was reported as deployed:\n%s", out)
+	}
+}
+
+// TestComposeUp_PartialFailureIsVisibleAsPartial: one of two creates fails.
+// The summary must count against the whole plan and name only the failure.
+func TestComposeUp_PartialFailureIsVisibleAsPartial(t *testing.T) {
+	spy := &deployClient{
+		plan: createPlan("ha1", "ha2"),
+		progress: []*pb.DeployProgress{
+			{Phase: "applying", VmName: "ha1", Detail: "create ha1"},
+			{Phase: "done", VmName: "ha1", ProgressPct: 100},
+			{Phase: "applying", VmName: "ha2", Detail: "create ha2"},
+			{Phase: "error", VmName: "ha2", Error: "no capacity"},
+		},
+	}
+	out, err := runComposeCLI(t, spy, false, "", "up", "-y")
+	if err == nil {
+		t.Fatalf("partial failure returned nil error; stdout:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), `stack "hb": 1 of 2 actions failed (ha2)`) {
+		t.Errorf("error does not summarise the partial failure: %v", err)
+	}
+	if strings.Contains(out, "deployed.") {
+		t.Errorf("a partially failed deploy was reported as deployed:\n%s", out)
+	}
+}
+
+// TestComposeUp_AllSucceedStillSaysDeployed pins the unchanged success path.
+func TestComposeUp_AllSucceedStillSaysDeployed(t *testing.T) {
+	spy := &deployClient{
+		plan: createPlan("ha1", "ha2"),
+		progress: []*pb.DeployProgress{
+			{Phase: "applying", VmName: "ha1", Detail: "create ha1"},
+			{Phase: "done", VmName: "ha1", ProgressPct: 100},
+			{Phase: "applying", VmName: "ha2", Detail: "create ha2"},
+			{Phase: "done", VmName: "ha2", ProgressPct: 100},
+		},
+	}
+	out, err := runComposeCLI(t, spy, false, "", "up", "-y")
+	if err != nil {
+		t.Fatalf("successful deploy returned error: %v", err)
+	}
+	if !strings.Contains(out, "\nStack \"hb\" deployed.\n") {
+		t.Errorf("success line missing:\n%s", out)
+	}
+}
+
+// TestComposeUp_NonTTYWithoutYesRefuses: over a non-tty ssh session the
+// confirmation prompt used to block forever on an open, silent stdin. Without
+// -y and without a terminal the command must refuse and say how to proceed —
+// and must not apply, even if stdin happens to carry a "y".
+func TestComposeUp_NonTTYWithoutYesRefuses(t *testing.T) {
+	spy := &deployClient{plan: createPlan("ha1")}
+	out, err := runComposeCLI(t, spy, false, "y\n", "up")
+	if err == nil {
+		t.Fatalf("non-tty compose up without -y returned nil; stdout:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "-y") {
+		t.Errorf("refusal does not point at -y: %v", err)
+	}
+	if spy.applied {
+		t.Error("non-tty compose up without -y applied the plan")
+	}
+}
+
+// TestComposeUp_TTYStillPrompts: on a terminal the prompt is still honoured —
+// the refusal is about the missing terminal, not about a missing -y.
+func TestComposeUp_TTYStillPrompts(t *testing.T) {
+	spy := &deployClient{plan: createPlan("ha1")}
+	out, err := runComposeCLI(t, spy, true, "y\n", "up")
+	if err != nil {
+		t.Fatalf("tty compose up answered y returned error: %v\n%s", err, out)
+	}
+	if !spy.applied {
+		t.Errorf("tty compose up answered y did not apply:\n%s", out)
+	}
+}
+
+// TestComposeDown_NonTTYWithoutYesRefuses: `compose down` has the same prompt
+// and the same hang.
+func TestComposeDown_NonTTYWithoutYesRefuses(t *testing.T) {
+	spy := &deployClient{}
+	out, err := runComposeCLI(t, spy, false, "y\n", "down")
+	if err == nil {
+		t.Fatalf("non-tty compose down without -y returned nil; stdout:\n%s", out)
+	}
+	if !strings.Contains(err.Error(), "-y") {
+		t.Errorf("refusal does not point at -y: %v", err)
+	}
+	if spy.deleted {
+		t.Error("non-tty compose down without -y deleted the stack")
+	}
+}
+
+// TestComposeDown_TTYStillPrompts mirrors the up case.
+func TestComposeDown_TTYStillPrompts(t *testing.T) {
+	spy := &deployClient{}
+	out, err := runComposeCLI(t, spy, true, "y\n", "down")
+	if err != nil {
+		t.Fatalf("tty compose down answered y returned error: %v\n%s", err, out)
+	}
+	if !spy.deleted {
+		t.Errorf("tty compose down answered y did not delete:\n%s", out)
+	}
+}

@@ -2,18 +2,24 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 )
+
+// stdinIsTerminal reports whether stdin is an interactive terminal. A var so
+// tests can pin it.
+var stdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
 
 func newComposeCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -107,6 +113,9 @@ func newUpCmd() *cobra.Command {
 				fmt.Println()
 
 				if !yes {
+					if !stdinIsTerminal() {
+						return errNoTTYConfirm
+					}
 					fmt.Print("Apply? [y/N] ")
 					var ans string
 					fmt.Scanln(&ans)
@@ -124,7 +133,12 @@ func newUpCmd() *cobra.Command {
 					return fmt.Errorf("deploy stack: %w", err)
 				}
 
+				// Per-action failures arrive as "error" progress and the stream
+				// still ends OK, so they must be counted here: a stack with a
+				// failed action is not "deployed".
 				var deployErr error
+				var failed []string
+				seenFailed := map[string]bool{}
 				for {
 					p, err := stream.Recv()
 					if err != nil {
@@ -136,6 +150,10 @@ func newUpCmd() *cobra.Command {
 					switch p.Phase {
 					case "error":
 						fmt.Fprintf(os.Stderr, "  error %s: %s\n", p.VmName, p.Error)
+						if !seenFailed[p.VmName] {
+							seenFailed[p.VmName] = true
+							failed = append(failed, p.VmName)
+						}
 					case "done":
 						fmt.Printf("  %s: done\n", p.VmName)
 					default:
@@ -144,6 +162,10 @@ func newUpCmd() *cobra.Command {
 				}
 				if deployErr != nil {
 					return deployErr
+				}
+				if len(failed) > 0 {
+					return fmt.Errorf("stack %q: %d of %d actions failed (%s)",
+						f.Name, len(failed), max(countVMActions(ops), len(failed)), strings.Join(failed, ", "))
 				}
 
 				fmt.Printf("\nStack %q deployed.\n", f.Name)
@@ -154,6 +176,24 @@ func newUpCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&file, "file", "f", "litevirt-compose.yaml", "Compose file path")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
 	return cmd
+}
+
+// errNoTTYConfirm refuses a confirmation prompt that nobody can answer: over
+// a non-tty session (ssh without -t, CI, a pipe) stdin can stay open and
+// silent, and the prompt would block forever with no hint why.
+var errNoTTYConfirm = errors.New("stdin is not a terminal, so the confirmation prompt cannot be answered; review the plan and re-run with -y to apply")
+
+// countVMActions counts the plan entries that execute a VM action (create,
+// update, delete) — the denominator for the failure summary.
+func countVMActions(ops []compose.Op) int {
+	n := 0
+	for _, op := range ops {
+		switch op.Kind {
+		case compose.OpCreate, compose.OpUpdate, compose.OpDelete:
+			n++
+		}
+	}
+	return n
 }
 
 func newDownCmd() *cobra.Command {
@@ -193,6 +233,9 @@ func newDownCmd() *cobra.Command {
 				}
 
 				if !yes {
+					if !stdinIsTerminal() {
+						return errNoTTYConfirm
+					}
 					fmt.Print("Confirm? [y/N] ")
 					var ans string
 					fmt.Scanln(&ans)

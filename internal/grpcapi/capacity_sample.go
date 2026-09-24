@@ -28,6 +28,9 @@ import (
 //     observation INCOMPLETE — its consumption cannot be attributed, and
 //     placement must treat the host as unknown, never as headroom.
 //
+// A container is charged its memory and nothing else, on both sides: its cpu
+// is a cap in cores, not a reservation (the rule placement uses).
+//
 // Only the observed host samples itself (host_name is the row's ownership),
 // from its own runtime inventory — replicated telemetry is never the input.
 
@@ -87,19 +90,18 @@ func computeCapacityObservation(
 		details = append(details, "runtime inventory incomplete: "+strings.Join(inv.Errors, "; "))
 	}
 
-	// The database's charge: running VMs at their recorded actuals, running
-	// containers at their declared limits — the same accounting the placement
-	// snapshot uses.
+	// The database's charge, by the rules placement uses (dbVMCharge,
+	// dbContainerCharge).
 	type dbEntry struct{ cpu, mem int }
 	dbSide := map[finding]dbEntry{}
 	for _, vm := range vms {
-		if vm.State == "running" {
-			dbSide[finding{kind: corrosion.WorkloadVM, target: vm.Name}] = dbEntry{cpu: vm.CPUActual, mem: vm.MemActual}
+		if cpu, mem, ok := dbVMCharge(vm); ok {
+			dbSide[finding{kind: corrosion.WorkloadVM, target: vm.Name}] = dbEntry{cpu: cpu, mem: mem}
 		}
 	}
 	for _, ct := range cts {
-		if ct.State == "running" {
-			dbSide[finding{kind: corrosion.WorkloadContainer, target: ct.Name}] = dbEntry{cpu: ct.CPULimit, mem: ct.MemMiB}
+		if mem, ok := dbContainerCharge(ct); ok {
+			dbSide[finding{kind: corrosion.WorkloadContainer, target: ct.Name}] = dbEntry{mem: mem}
 		}
 	}
 	for _, e := range dbSide {
@@ -116,6 +118,11 @@ func computeCapacityObservation(
 		if w.ProbeError != "" {
 			obs.Complete = false
 			details = append(details, fmt.Sprintf("%s %s: %s", w.Kind, w.Name, w.ProbeError))
+		}
+		// A container's cpu is a cap in cores, not a reservation: capacity
+		// never charges it, on the runtime side any more than on the DB side.
+		if w.Kind == corrosion.WorkloadContainer {
+			w.CPU = 0
 		}
 		key := finding{kind: w.Kind, target: w.Name}
 		if db, matched := dbSide[key]; matched {
@@ -148,4 +155,30 @@ func computeCapacityObservation(
 	sort.Strings(details)
 	obs.Detail = strings.Join(details, "; ")
 	return obs
+}
+
+// dbVMCharge is what the database says a VM holds on its host: a running VM
+// at its recorded actuals. ok=false for a VM that holds nothing.
+func dbVMCharge(vm corrosion.VMRecord) (cpu, mem int, ok bool) {
+	if vm.State != "running" {
+		return 0, 0, false
+	}
+	return vm.CPUActual, vm.MemActual, true
+}
+
+// dbContainerCharge is what the database says a container holds on its host:
+// its memory, by corrosion.ContainerHoldsHostMemory — the rule placement
+// counts and releases containers by. A container's cpu_limit is a cap in
+// cores, not a reservation, so it is never charged. ok is true for every
+// running container: one with no memory cap holds 0 MiB but is still the
+// database's record of that runtime, so the runtime side matches it rather
+// than reading it as a rogue.
+func dbContainerCharge(ct corrosion.ContainerRecord) (mem int, ok bool) {
+	if ct.State != "running" {
+		return 0, false
+	}
+	if corrosion.ContainerHoldsHostMemory(ct) {
+		mem = ct.MemMiB
+	}
+	return mem, true
 }

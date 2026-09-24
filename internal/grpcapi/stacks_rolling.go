@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"google.golang.org/grpc"
@@ -171,6 +172,110 @@ func (d *deployFailures) failWithDetail(vm, detail string, err error) error {
 	return d.stream.Send(&pb.DeployProgress{Phase: "error", VmName: vm, Detail: detail, Error: err.Error()})
 }
 
+// dependsOnGate holds back the dependents of a workload whose depends-on
+// condition was not met in this deploy: its create or recreate failed, or the
+// wait for the condition its dependents need timed out. A dependent asked for
+// its dependency to be started (or healthy) FIRST; creating it anyway broke
+// that promise, so it is reported as a failed action — naming the dependency,
+// the condition and why it was not met — and neither created nor updated. A
+// blocked workload is itself unmet, so the block is transitive. Workloads that
+// depend on nothing that failed proceed.
+type dependsOnGate struct {
+	f       *compose.File
+	unmet   map[string]string  // compose base name → why its condition was not met
+	planned []planner.VMAction // every create/update of the deploy, for propagation
+}
+
+func newDependsOnGate(f *compose.File, actions []planner.VMAction) *dependsOnGate {
+	g := &dependsOnGate{f: f, unmet: map[string]string{}}
+	for _, a := range actions {
+		if a.Kind == planner.OpCreate || a.Kind == planner.OpUpdate {
+			g.planned = append(g.planned, a)
+		}
+	}
+	return g
+}
+
+// propagate marks unmet every planned action a failure already blocks, to a
+// fixpoint. The executors do not run actions in dependency order across kinds
+// — creates run before updates — so a create that depends on an update would
+// otherwise be reached before the update it depends on is found blocked.
+func (g *dependsOnGate) propagate() {
+	for changed := true; changed; {
+		changed = false
+		for _, a := range g.planned {
+			if _, ok := g.unmet[g.baseName(a.VMName)]; ok {
+				continue
+			}
+			if berr := g.blocked(a); berr != nil {
+				g.markUnmet(a.VMName, berr)
+				changed = true
+			}
+		}
+	}
+}
+
+// baseName maps a planned workload (an instance name such as db-2) to the
+// compose name dependents refer to it by.
+func (g *dependsOnGate) baseName(vm string) string {
+	if _, base := compose.FindVMDef(g.f, vm); base != "" {
+		return base
+	}
+	return vm
+}
+
+// markUnmet records that vm is not in the state its dependents were promised.
+// For a replicated workload one failed replica is enough: a dependent waits
+// for every replica.
+func (g *dependsOnGate) markUnmet(vm string, err error) {
+	base := g.baseName(vm)
+	if _, ok := g.unmet[base]; ok {
+		return
+	}
+	reason := err.Error()
+	if base != vm {
+		reason = vm + ": " + reason
+	}
+	g.unmet[base] = reason
+}
+
+// blocked returns the error a dependent of an unmet workload is failed with,
+// or nil when every dependency of action was met (or is not part of this
+// deploy).
+func (g *dependsOnGate) blocked(action planner.VMAction) error {
+	deps := make([]string, 0, len(action.DependsOn))
+	for dep := range action.DependsOn {
+		deps = append(deps, dep)
+	}
+	sort.Strings(deps)
+	for _, dep := range deps {
+		reason, ok := g.unmet[dep]
+		if !ok {
+			continue
+		}
+		cond := action.DependsOn[dep].Condition
+		if cond == "" {
+			cond = "vm_started"
+		}
+		return fmt.Errorf("blocked: depends-on %s (condition %s) was not met: %s", dep, cond, reason)
+	}
+	return nil
+}
+
+// hold reports action as blocked when a dependency of it was not met, and
+// marks it unmet in turn. It returns true when the action must be skipped,
+// and a stream send failure only as its error.
+func (g *dependsOnGate) hold(action planner.VMAction, failures *deployFailures) (bool, error) {
+	g.propagate()
+	berr := g.blocked(action)
+	if berr == nil {
+		return false, nil
+	}
+	slog.Warn("deploy action blocked by an unmet dependency", "workload", action.VMName, "error", berr)
+	g.markUnmet(action.VMName, berr)
+	return true, failures.failWithDetail(action.VMName, "skipped: a dependency was not met", berr)
+}
+
 // deleteWorkloadIgnoringGone deletes a planned workload, treating NotFound as
 // success: the plan wanted it gone and it is.
 func (s *Server) deleteWorkloadIgnoringGone(ctx context.Context, a planner.VMAction) error {
@@ -199,9 +304,17 @@ func (s *Server) waitDependsOn(ctx context.Context, action planner.VMAction, str
 // delete-then-create for updates (the original behavior). Failed actions are
 // recorded in failures; the returned error is a stream failure only.
 func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, resolved *planner.ResolvedPlan, stream grpc.ServerStreamingServer[pb.DeployProgress], failures *deployFailures) error {
+	gate := newDependsOnGate(f, resolved.VMs)
 	for _, action := range resolved.VMs {
 		if action.Kind == planner.OpNoChange {
 			continue
+		}
+		if action.Kind != planner.OpDelete {
+			if skip, sendErr := gate.hold(action, failures); sendErr != nil {
+				return sendErr
+			} else if skip {
+				continue
+			}
 		}
 
 		if err := stream.Send(&pb.DeployProgress{
@@ -216,6 +329,7 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 		case planner.OpCreate:
 			if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 				slog.Warn("deploy create failed", "vm", action.VMName, "host", action.TargetHost, "error", vmErr)
+				gate.markUnmet(action.VMName, fmt.Errorf("create failed: %w", vmErr))
 				if sendErr := failures.fail(action.VMName, vmErr); sendErr != nil {
 					return sendErr
 				}
@@ -225,6 +339,7 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 			if action.WaitFor != "" {
 				if err := s.waitDependsOn(ctx, action, stream); err != nil {
 					slog.Warn("depends-on wait failed", "vm", action.VMName, "error", err)
+					gate.markUnmet(action.VMName, err)
 					if sendErr := failures.fail(action.VMName, err); sendErr != nil {
 						return sendErr
 					}
@@ -241,6 +356,7 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 			// serverOps.recreateAs).
 			if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 				slog.Warn("deploy update delete failed", "workload", action.VMName, "error", delErr)
+				gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 				if sendErr := failures.fail(action.VMName, fmt.Errorf("delete before recreate: %w", delErr)); sendErr != nil {
 					return sendErr
 				}
@@ -248,6 +364,7 @@ func (s *Server) executeInlineActions(ctx context.Context, f *compose.File, reso
 			}
 			if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 				slog.Warn("deploy update recreate failed", "workload", action.VMName, "host", action.TargetHost, "error", vmErr)
+				gate.markUnmet(action.VMName, fmt.Errorf("recreate failed: %w", vmErr))
 				if sendErr := failures.fail(action.VMName, vmErr); sendErr != nil {
 					return sendErr
 				}
@@ -299,17 +416,23 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 	}
 
 	// Execute creates (scale-up).
+	gate := newDependsOnGate(f, resolved.VMs)
 	for _, action := range creates {
+		if skip, _ := gate.hold(action, failures); skip {
+			continue
+		}
 		_ = stream.Send(&pb.DeployProgress{Phase: "applying", VmName: action.VMName, Detail: action.Detail})
 
 		if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 			slog.Warn("deploy create failed", "vm", action.VMName, "error", vmErr)
+			gate.markUnmet(action.VMName, fmt.Errorf("create failed: %w", vmErr))
 			_ = failures.fail(action.VMName, vmErr)
 			continue
 		}
 		if action.WaitFor != "" {
 			if err := s.waitDependsOn(ctx, action, stream); err != nil {
 				slog.Warn("depends-on wait failed", "vm", action.VMName, "error", err)
+				gate.markUnmet(action.VMName, err)
 				_ = failures.fail(action.VMName, err)
 				continue
 			}
@@ -320,14 +443,19 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 	// Container updates: inline recreate (the rolling engine doesn't handle
 	// containers). delete-then-create on the resolved host.
 	for _, action := range ctUpdates {
+		if skip, _ := gate.hold(action, failures); skip {
+			continue
+		}
 		_ = stream.Send(&pb.DeployProgress{Phase: "applying", VmName: action.VMName, Detail: action.Detail})
 		if delErr := s.deleteWorkloadIgnoringGone(ctx, action); delErr != nil {
 			slog.Warn("rolling update: container delete failed", "workload", action.VMName, "error", delErr)
+			gate.markUnmet(action.VMName, fmt.Errorf("delete before recreate failed: %w", delErr))
 			_ = failures.fail(action.VMName, fmt.Errorf("delete before recreate: %w", delErr))
 			continue
 		}
 		if vmErr := s.deployCreatePlanned(ctx, action, f); vmErr != nil {
 			slog.Warn("rolling update: container recreate failed", "workload", action.VMName, "error", vmErr)
+			gate.markUnmet(action.VMName, fmt.Errorf("recreate failed: %w", vmErr))
 			_ = failures.fail(action.VMName, vmErr)
 			continue
 		}
@@ -357,6 +485,11 @@ func (s *Server) executeWithRollingUpdates(ctx context.Context, f *compose.File,
 
 		actions := make([]rolling.VMAction, 0, len(updates))
 		for _, a := range updates {
+			// A VM whose dependency was not met is not handed to the engine:
+			// it keeps running as it is.
+			if skip, _ := gate.hold(a, failures); skip {
+				continue
+			}
 			if drainingHosts[a.TargetHost] {
 				_ = stream.Send(&pb.DeployProgress{Phase: "done", VmName: a.VMName, Detail: "skipped — host is draining/fenced"})
 				continue

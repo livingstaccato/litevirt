@@ -105,7 +105,8 @@ The actions that did succeed are not rolled back; fix the cause and re-run
 A failed action is any create, update or delete the daemon could not carry
 out — including a scale-down delete, the delete half of a recreate (the
 recreate then stops rather than create over a VM that was never torn down),
-a `depends-on` wait that timed out, a `blue-green` old (blue) VM that could not
+a `depends-on` wait that timed out, a VM held back because a `depends-on`
+dependency of it was not met (see [Boot ordering](#boot-ordering-depends-on)), a `blue-green` old (blue) VM that could not
 be removed after its `-green` replacement came up, and a `snapshot-and-replace`
 `-next` VM that could not be created or did not become healthy. After such a deploy the stack is
 recorded as `degraded` rather than `active` (the STATE column of
@@ -458,7 +459,9 @@ Conditions:
   - `lv inspect <vm>` shows the same verdict as `health` / `healthDetail`.
   - Mixed versions: the node serving the deploy decides what `vm_healthy` means, and the VM's owner publishes the verdict. An older node serving a deploy treats running as healthy; a newer one waiting on a VM with a `healthcheck` whose owner runs an older build sees no verdict and times out. Upgrade every node before relying on it.
 
-If a dependency wait times out, the dependency is reported as a failed action (an `error` line naming it) and the stack ends `degraded`, but the rest of the deploy still runs — it does not block the entire stack.
+If a dependency's condition is not met — its wait times out, or its create (or the recreate of an update) fails — the dependency is reported as a failed action (an `error` line naming it), and **its dependents are held back**: they are neither created nor updated (an existing dependent keeps running as it is), and each is reported as a failed action of its own, naming the dependency, the condition and why it was not met, for example `blocked: depends-on db (condition vm_healthy) was not met: depends-on wait for vm_healthy: timeout after 10m0s waiting for vm_healthy on db: ...`. The block is transitive — whatever depends on a held-back VM is held back too, with `blocked: depends-on app (condition vm_started) was not met: blocked: ...`. VMs that do not depend on the failed one are deployed as usual. The stack ends `degraded`, `compose up` exits non-zero, and the next `compose up` creates the held-back VMs once their dependency is in place. For a replicated dependency, one failed replica holds its dependents back.
+
+A dependency that is unchanged in this deploy is not waited on, so a re-run creates the held-back VMs as soon as the dependency exists — even if it is still not healthy.
 
 Cycles are detected at parse time and rejected.
 

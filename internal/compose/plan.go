@@ -153,15 +153,20 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			// `compose up` can recover.
 			if isTransientOrErrorState(cur.State) {
 				plan.Ops = append(plan.Ops, Op{
-					Kind:   OpUpdate,
-					VMName: instanceName,
-					Detail: fmt.Sprintf("retry %s (was state=%s)", instanceName, cur.State),
+					Kind:      OpUpdate,
+					VMName:    instanceName,
+					Detail:    fmt.Sprintf("retry %s (was state=%s)", instanceName, cur.State),
+					DependsOn: vmDef.DependsOn,
 				})
 			} else if changed {
+				// An update carries its depends-on like a create: it is held
+				// back when a dependency is not met, and the dependency is
+				// waited on for it.
 				plan.Ops = append(plan.Ops, Op{
-					Kind:   OpUpdate,
-					VMName: instanceName,
-					Detail: fmt.Sprintf("update %s:%s", instanceName, detail),
+					Kind:      OpUpdate,
+					VMName:    instanceName,
+					Detail:    fmt.Sprintf("update %s:%s", instanceName, detail),
+					DependsOn: vmDef.DependsOn,
 				})
 			} else {
 				plan.Ops = append(plan.Ops, Op{

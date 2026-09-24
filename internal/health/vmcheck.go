@@ -17,10 +17,13 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
+	"github.com/litevirt/litevirt/internal/healthdefaults"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
-const vmCheckSweepInterval = 10 * time.Second
+// vmCheckSweepInterval is the sweep period: every healthcheck interval's
+// default and floor.
+const vmCheckSweepInterval = healthdefaults.Interval
 const healthCheckGracePeriod = 5 * time.Minute
 
 // VMChecker runs per-VM health checks defined in each VM's HealthCheckSpec.
@@ -408,7 +411,7 @@ func (v *VMChecker) checkVM(ctx context.Context, vm corrosion.VMRecord, hspec *p
 // outside the start grace period — counts it toward the healthcheck's action.
 // Interval enforcement is the sweep's (probeDue), not this function's.
 func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec, inGrace bool) {
-	timeout := parseDuration(hspec.Timeout, 5*time.Second)
+	timeout := probeTimeout(hspec)
 	retries := probeRetries(hspec)
 
 	out := v.runProbe(ctx, vm, hspec, timeout)
@@ -516,12 +519,27 @@ func actionBackoff(acts int) time.Duration {
 }
 
 // probeRetries is the healthcheck's retries: consecutive failures before the
-// VM is unhealthy (and before its action runs). Default 3.
+// VM is unhealthy (and before its action runs). Default healthdefaults.Retries.
 func probeRetries(hspec *pb.HealthCheckSpec) int {
 	if hspec.Retries > 0 {
 		return int(hspec.Retries)
 	}
-	return 3
+	return healthdefaults.Retries
+}
+
+// probeTimeout bounds one probe: the healthcheck's timeout, default
+// healthdefaults.Timeout.
+func probeTimeout(hspec *pb.HealthCheckSpec) time.Duration {
+	return parseDuration(hspec.Timeout, healthdefaults.Timeout)
+}
+
+// probeAction is what is done to an unhealthy VM: the healthcheck's action,
+// default healthdefaults.Action.
+func probeAction(hspec *pb.HealthCheckSpec) string {
+	if hspec.Action != "" {
+		return hspec.Action
+	}
+	return healthdefaults.Action
 }
 
 // probeOutcome is one probe's result. unknown means the probe could not be
@@ -634,10 +652,7 @@ func (v *VMChecker) probeDetail(ctx context.Context, vmName string, hspec *pb.He
 }
 
 func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec) {
-	action := hspec.Action
-	if action == "" {
-		action = "restart"
-	}
+	action := probeAction(hspec)
 
 	// Suppress action if correlated failures detected (#47).
 	if v.isCorrelatedFailure() {

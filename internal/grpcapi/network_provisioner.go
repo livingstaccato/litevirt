@@ -41,6 +41,13 @@ func (s *Server) networkProvisioner() NetworkProvisioner {
 	return hostNetworkProvisioner{}
 }
 
+// ProvisionNetworkHere provisions one network on this host through the
+// server's provisioner. It is a network.ProvisionFunc, handed to the health
+// reconciler so a failover restart provisions exactly as a VM create does.
+func (s *Server) ProvisionNetworkHere(ctx context.Context, db *corrosion.Client, name string, def compose.NetworkDef, localIP, hostName string) (string, error) {
+	return s.networkProvisioner().Provision(ctx, db, name, def, localIP, hostName)
+}
+
 // provisionForVM provisions networkName on this host for a NIC and returns its
 // device, or "" when the network has no record (flat bridge mode).
 func (s *Server) provisionForVM(ctx context.Context, networkName string) (string, error) {

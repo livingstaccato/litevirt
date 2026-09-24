@@ -608,6 +608,23 @@ A field the healthcheck does not have is refused, with the field it most likely 
 
 Keys starting `x-` (extension fields, free for your own use) and YAML merge keys (`<<: *anchor`) are allowed; the keys an anchor merges in are checked like any other.
 
+`interval` and `timeout` are durations with a unit (`"10s"`, `"1m"`) greater than zero; a `timeout` must not exceed the `interval` (written, or its default), since a probe must finish before the next is due; and `retries`, when written, is at least `1`. A field that is left out takes its default:
+
+| Field | Default |
+|---|---|
+| `type` | inferred from `target` (see above), otherwise required |
+| `interval` | `10s` (also the floor: the checker sweeps every 10 seconds) |
+| `timeout` | `5s` |
+| `retries` | `3` |
+| `action` | `restart` |
+
+```
+  - stack.yaml:7:17: vms.db.healthcheck.interval: interval "10" is not a duration — add a unit, e.g. "10s"
+  - stack.yaml:9:16: vms.db.healthcheck.retries: retries must be at least 1 — omit it for the default, 3
+```
+
+A `timeout` of `30s` with no `interval` is refused as `timeout 30s exceeds interval 10s (the default) — lower timeout or raise interval`. The default `timeout` is never held against a short `interval`.
+
 The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:
 
 - one passing probe makes the VM **healthy**;

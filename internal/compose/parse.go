@@ -44,7 +44,7 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse compose YAML: %w", err)
 	}
-	v := &validator{ps: problems{idx: indexNodes(&doc)}, origin: map[string]string{}}
+	v := &validator{ps: problems{idx: indexNodes(&doc)}, origin: map[string]string{}, stored: opts.stored}
 
 	var f File
 	if root := documentRoot(&doc); root != nil {
@@ -85,6 +85,9 @@ type validator struct {
 	// origin is the map each workload was written under: "vms" or
 	// "workloads" (which the parser folds into VMs).
 	origin map[string]string
+	// stored: re-reading YAML accepted earlier (ParseStored); checks that
+	// only guard against a person's mistakes are skipped.
+	stored bool
 }
 
 // vm is the path of the workload called name.
@@ -486,7 +489,13 @@ func (v *validator) validate(f *File) {
 
 		// Healthcheck: a target the checker cannot interpret can never pass,
 		// and with the default restart action it would restart the VM forever.
-		for _, hp := range healthProblems(vm.HealthCheck) {
+		hps := healthProblems(vm.HealthCheck)
+		if !v.stored {
+			hps = append(hps, healthTimingProblems(vm.HealthCheck, func(field string) bool {
+				return v.ps.idx.has(p + ".healthcheck." + field)
+			})...)
+		}
+		for _, hp := range hps {
 			v.ps.add(joinPath(p+".healthcheck", hp.field), hp.msg, hp.hint)
 		}
 

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Healthcheck targets are resolved relative to the VM.
@@ -229,6 +230,67 @@ func inferHealthTypes(f *File) {
 			}
 		}
 	}
+}
+
+// The healthcheck defaults, as the VM health checker applies them. interval's
+// default is also its floor: the checker sweeps every 10 seconds, so a
+// shorter interval probes at each sweep.
+const (
+	defaultHealthInterval = 10 * time.Second
+	defaultHealthTimeout  = 5 * time.Second
+	defaultHealthRetries  = 3
+	defaultHealthAction   = "restart"
+)
+
+// healthTimingProblems checks interval, timeout and retries: durations must
+// parse and be greater than zero, a timeout must not outlast the interval,
+// and retries, when written, must be at least 1. written reports whether the
+// file writes a field (an omitted retries decodes as 0, meaning the default).
+func healthTimingProblems(hc *HealthCheckDef, written func(field string) bool) []fieldProblem {
+	if hc == nil {
+		return nil
+	}
+	var out []fieldProblem
+	interval, intervalOK := parseHealthDuration("interval", hc.Interval, &out)
+	timeout, timeoutOK := parseHealthDuration("timeout", hc.Timeout, &out)
+	if hc.Timeout != "" && timeoutOK && intervalOK {
+		shown := hc.Interval
+		if hc.Interval == "" {
+			interval, shown = defaultHealthInterval, defaultHealthInterval.String()+" (the default)"
+		}
+		if timeout > interval {
+			out = append(out, fieldProblem{field: "timeout",
+				msg:  fmt.Sprintf("timeout %s exceeds interval %s", hc.Timeout, shown),
+				hint: "lower timeout or raise interval"})
+		}
+	}
+	if hc.Retries < 0 || (hc.Retries == 0 && written("retries")) {
+		out = append(out, fieldProblem{field: "retries", msg: "retries must be at least 1",
+			hint: fmt.Sprintf("omit it for the default, %d", defaultHealthRetries)})
+	}
+	return out
+}
+
+// parseHealthDuration parses a written duration field; ok is false when it is
+// written and invalid (a problem is appended). An omitted field is ok, 0.
+func parseHealthDuration(field, s string, out *[]fieldProblem) (time.Duration, bool) {
+	if s == "" {
+		return 0, true
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		hint := `e.g. "10s" or "1m"`
+		if isAllDigits(s) {
+			hint = fmt.Sprintf("add a unit, e.g. %q", s+"s")
+		}
+		*out = append(*out, fieldProblem{field: field, msg: fmt.Sprintf("%s %q is not a duration", field, s), hint: hint})
+		return 0, false
+	}
+	if d <= 0 {
+		*out = append(*out, fieldProblem{field: field, msg: field + " must be greater than 0"})
+		return 0, false
+	}
+	return d, true
 }
 
 // fieldProblem is a problem with one field of a block, relative to it.

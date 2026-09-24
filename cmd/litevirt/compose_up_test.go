@@ -63,8 +63,14 @@ const hbCompose = "name: hb\nvms:\n  ha1:\n    image: ubuntu\n    cpu: 1\n    me
 // command's error.
 func runComposeCLI(t *testing.T, spy *deployClient, tty bool, stdinData string, args ...string) (string, error) {
 	t.Helper()
+	return runComposeFileCLI(t, spy, hbCompose, tty, stdinData, args...)
+}
+
+// runComposeFileCLI is runComposeCLI with the compose file's contents given.
+func runComposeFileCLI(t *testing.T, spy *deployClient, composeYAML string, tty bool, stdinData string, args ...string) (string, error) {
+	t.Helper()
 	file := filepath.Join(t.TempDir(), "compose.yml")
-	if err := os.WriteFile(file, []byte(hbCompose), 0o644); err != nil {
+	if err := os.WriteFile(file, []byte(composeYAML), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -312,5 +318,24 @@ func TestComposeDown_UnnamedErrorIsStillCounted(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `1 of 2 deletions failed (stack resource)`) {
 		t.Errorf("error does not count the unnamed failure: %v", err)
+	}
+}
+
+// An invalid compose file is refused before anything is sent to the daemon,
+// with every problem positioned in the named file, and a non-zero exit.
+func TestComposeUp_ValidationErrorsNameTheFile(t *testing.T) {
+	spy := &deployClient{plan: createPlan("web")}
+	src := "name: s\nvms:\n  web:\n    cpu: 1\n  db:\n    image: u\n    replicas: -1\n"
+	_, err := runComposeFileCLI(t, spy, src, false, "", "up", "-y")
+	if err == nil {
+		t.Fatal("compose up accepted an invalid file")
+	}
+	for _, want := range []string{"compose.yml:3:3: vms.web: image or iso required", "compose.yml:7:15: vms.db.replicas: replicas must be >= 0"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not contain %q:\n%v", want, err)
+		}
+	}
+	if spy.applied {
+		t.Error("an invalid compose file was deployed")
 	}
 }

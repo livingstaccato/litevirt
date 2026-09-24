@@ -590,11 +590,12 @@ An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`
 
 **When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.
 
-A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails before anything is deployed:
+A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails before anything is deployed. Every problem in the file is reported at once, each with its position, field path and, where there is one, a fix:
 
 ```
 compose validation errors:
-  - vm "db" healthcheck: tcp target "postgres" is not a port or host:port: ...
+  - stack.yaml:7:15: vms.db.healthcheck.target: tcp target "postgres" is not a port or host:port: address postgres: missing port in address
+  - stack.yaml:8:15: vms.db.healthcheck.action: unknown healthcheck action "reboot" — want restart | migrate | alert
 ```
 
 The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:

@@ -145,7 +145,7 @@ func TestFleet_ComposeUninterpretableHealthcheckTargetIsRefused(t *testing.T) {
 	if err == nil {
 		_, err = stream.Recv()
 	}
-	if err == nil || !strings.Contains(err.Error(), `vm "db" healthcheck`) {
+	if err == nil || !strings.Contains(err.Error(), "vms.db.healthcheck.target") {
 		t.Fatalf("deploy with tcp target %q: err=%v, want a healthcheck validation error", "postgres", err)
 	}
 	if db, _ := corrosion.GetVM(ctx, node.DB, "db"); db != nil {

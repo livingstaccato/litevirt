@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -168,18 +169,47 @@ func (t HealthTarget) Resolve(vmAddr string) string {
 
 // ValidateHealthCheck reports why hc cannot be run, or nil.
 func ValidateHealthCheck(hc *HealthCheckDef) error {
+	ps := healthProblems(hc)
+	if len(ps) == 0 {
+		return nil
+	}
+	msgs := make([]string, len(ps))
+	for i, p := range ps {
+		msgs[i] = p.field + ": " + p.msg
+		if p.hint != "" {
+			msgs[i] += " — " + p.hint
+		}
+	}
+	return errors.New(strings.Join(msgs, "; "))
+}
+
+// fieldProblem is a problem with one field of a block, relative to it.
+type fieldProblem struct {
+	field, msg, hint string
+}
+
+// healthProblems is every reason hc cannot be run, each naming its field.
+func healthProblems(hc *HealthCheckDef) []fieldProblem {
 	if hc == nil {
 		return nil
 	}
-	if _, err := ParseHealthTarget(hc.Type, hc.Target); err != nil {
-		return err
+	var out []fieldProblem
+	switch hc.Type {
+	case "tcp", "http", "https", "ping", "exec":
+		if _, err := ParseHealthTarget(hc.Type, hc.Target); err != nil {
+			out = append(out, fieldProblem{field: "target", msg: err.Error()})
+		}
+	case "":
+		out = append(out, fieldProblem{field: "type", msg: "healthcheck type is required", hint: "want tcp | http | https | ping | exec"})
+	default:
+		out = append(out, fieldProblem{field: "type", msg: fmt.Sprintf("unknown healthcheck type %q", hc.Type), hint: "want tcp | http | https | ping | exec"})
 	}
 	switch hc.Action {
 	case "", "restart", "migrate", "alert":
 	default:
-		return fmt.Errorf("unknown healthcheck action %q: want restart | migrate | alert", hc.Action)
+		out = append(out, fieldProblem{field: "action", msg: fmt.Sprintf("unknown healthcheck action %q", hc.Action), hint: "want restart | migrate | alert"})
 	}
-	return nil
+	return out
 }
 
 // isVMSelf reports whether host, in a healthcheck target, means the VM itself:

@@ -52,7 +52,7 @@ func newUpCmd() *cobra.Command {
 				return fmt.Errorf("read compose file: %w", err)
 			}
 
-			f, err := compose.ParseBytes(yamlData)
+			f, err := compose.ParseNamed(file, yamlData)
 			if err != nil {
 				return err
 			}

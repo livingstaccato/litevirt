@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -56,6 +57,38 @@ type Request struct {
 	// Weights overrides DefaultWeights for this request. Zero value uses
 	// DefaultWeights. Tests use this; production paths leave it zero.
 	Weights *DimensionWeights
+
+	// Replaces is the allocation this placement supersedes — an UPDATE of a
+	// workload that already holds resources somewhere. nil means a new workload.
+	//
+	// The snapshot already counts the running workload on its current host, so
+	// evaluating the update's request on top of it charges the same workload
+	// twice: a VM filling most of its host could not be updated in place at all,
+	// not even a label change or a shrink. With Replaces set, the old allocation
+	// is released while this request is evaluated, and the new one is committed
+	// in its place — "replace", never "add".
+	Replaces *Allocation
+}
+
+// Allocation is what one workload currently holds on one host, in the units
+// the placement snapshot counts.
+type Allocation struct {
+	Host   string
+	CPU    int
+	MemMiB int
+	// VM marks a qemu VM: besides CPU and memory it holds one VMCount slot, and
+	// with it one per-VM memory overhead, on Host. A container holds neither.
+	VM bool
+}
+
+// VMAllocation is what vm currently holds according to the snapshot's counting
+// rule (BuildSnapshotFromUsage), or nil when the snapshot does not count it — a
+// stopped VM holds nothing, so there is nothing to release.
+func VMAllocation(vm corrosion.VMRecord) *Allocation {
+	if !countsAgainstHost(vm.State) {
+		return nil
+	}
+	return &Allocation{Host: vm.HostName, CPU: vm.CPUActual, MemMiB: vm.MemActual, VM: true}
 }
 
 // effectivePolicy resolves Policy + Spread legacy toggle into a canonical Policy.
@@ -131,6 +164,35 @@ func IsInfrastructureError(err error) bool {
 // the error it always was.
 var ErrNoEligibleHost = errors.New("no eligible host")
 
+// HostRejection is one candidate host and why the hard-filter pipeline
+// refused it.
+type HostRejection struct {
+	Host   string
+	Reason string
+}
+
+// NoEligibleHostError is ErrNoEligibleHost with the evidence: every candidate
+// host and the filter that rejected it. "no eligible host" alone tells an
+// operator nothing about what to change.
+type NoEligibleHostError struct {
+	VMName     string
+	Rejections []HostRejection
+}
+
+func (e *NoEligibleHostError) Error() string {
+	msg := fmt.Sprintf("no eligible host for VM %q", e.VMName)
+	if len(e.Rejections) == 0 {
+		return msg
+	}
+	reasons := make([]string, len(e.Rejections))
+	for i, r := range e.Rejections {
+		reasons[i] = r.Reason
+	}
+	return msg + ": " + strings.Join(reasons, "; ")
+}
+
+func (e *NoEligibleHostError) Unwrap() error { return ErrNoEligibleHost }
+
 // hostCandidate is an evaluated host during selection.
 type hostCandidate struct {
 	host    corrosion.HostRecord
@@ -168,6 +230,7 @@ func Select(ctx context.Context, db *corrosion.Client, req Request) (string, err
 			return "", err
 		}
 	}
+	snap.releaseAllocation(&req)
 
 	candidates, err := scoreCandidates(snap, &req, false)
 	if err != nil {
@@ -191,6 +254,7 @@ func ValidatePinned(ctx context.Context, db *corrosion.Client, req Request, host
 	if err := restrictToPinnedHost(snap, host); err != nil {
 		return err
 	}
+	snap.releaseAllocation(&req)
 	_, err = scoreCandidates(snap, &req, false)
 	return err
 }
@@ -282,17 +346,24 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 	}
 
 	var candidates []hostCandidate
+	var rejections []HostRejection
+	reject := func(host, format string, args ...any) {
+		rejections = append(rejections, HostRejection{Host: host, Reason: fmt.Sprintf(format, args...)})
+	}
 	for _, h := range snap.HostsBy {
 		if h.State != "active" {
+			reject(h.Name, "%s is not active (state: %s)", h.Name, h.State)
 			continue
 		}
 		if h.IsWitness() {
+			reject(h.Name, "%s is a witness", h.Name)
 			continue
 		}
 		// Hard: the host's effective-capacity observation is neither incomplete
 		// nor stale. A host that cannot account for its own runtime consumption
 		// must be treated as unknown, never as headroom.
 		if snap.CapacityUnknown[h.Name] {
+			reject(h.Name, "%s has an incomplete or stale capacity observation", h.Name)
 			continue
 		}
 
@@ -306,6 +377,8 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		freeCPU := allocCPU - snap.CPUUsed[h.Name]
 		freeMem := allocMem - snap.MemUsed[h.Name] - req.Capacity.MemOverheadFor(snap.VMCount[h.Name])
 		if req.CPUNeeded > 0 && freeCPU < req.CPUNeeded {
+			reject(h.Name, "%s needs %d vCPU on %s, which has %d allocatable vCPU free%s",
+				req.VMName, req.CPUNeeded, h.Name, freeCPU, releasedNote(req, h.Name, "vCPU"))
 			continue
 		}
 		// MemChargeFor: the INCOMING VM costs its guest memory plus one qemu
@@ -317,24 +390,32 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		// guest memory, and CommitPlacement (batch placement) adds it to MemUsed AND
 		// increments VMCount — which re-applies MemOverheadFor. Folding it in would
 		// double-count every batch member.
-		if req.MemMiBNeeded > 0 && freeMem < req.Capacity.MemChargeFor(req.MemMiBNeeded) {
+		if charge := req.Capacity.MemChargeFor(req.MemMiBNeeded); req.MemMiBNeeded > 0 && freeMem < charge {
+			reject(h.Name, "%s needs %d MiB of memory on %s (%d MiB + %d MiB qemu overhead), which has %d MiB free%s",
+				req.VMName, charge, h.Name, req.MemMiBNeeded, charge-req.MemMiBNeeded, freeMem,
+				releasedNote(req, h.Name, "MiB"))
 			continue
 		}
 
 		// Hard: anti-affinity.
 		if antiAffinityHosts[h.Name] {
+			reject(h.Name, "%s runs a VM %s has anti-affinity with (%s)",
+				h.Name, req.VMName, strings.Join(vmsOnHost(snap, req.AntiAffinity, h.Name), ", "))
 			continue
 		}
 
 		// Hard: max-per-node replica limit.
 		if req.MaxPerNode > 0 && req.VMBaseName != "" {
-			if snap.ReplicasByBase[req.VMBaseName][h.Name] >= req.MaxPerNode {
+			if n := snap.ReplicasByBase[req.VMBaseName][h.Name]; n >= req.MaxPerNode {
+				reject(h.Name, "%s already runs %d %s replica(s), max_per_node is %d",
+					h.Name, n, req.VMBaseName, req.MaxPerNode)
 				continue
 			}
 		}
 
 		// Hard: required labels.
 		if len(req.RequireLabels) > 0 && !labelsMatch(h.Labels, req.RequireLabels) {
+			reject(h.Name, "%s lacks required label %s", h.Name, missingLabels(h.Labels, req.RequireLabels))
 			continue
 		}
 
@@ -344,6 +425,7 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 			pool := snap.Devices[h.Name]
 			ok, bonus := scoreHostDevicesForHost(pool, req.Devices, snap.MappingDevices, h.Name)
 			if !ok {
+				reject(h.Name, "%s cannot satisfy %s's device requirements", h.Name, req.VMName)
 				continue
 			}
 			deviceBonus = bonus
@@ -362,6 +444,7 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 				}
 			}
 			if over {
+				reject(h.Name, "%s would exceed the spread-strict pressure cap (%.0f%%)", h.Name, strictSpreadPressureCap*100)
 				continue
 			}
 		}
@@ -413,8 +496,7 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 	}
 
 	if len(candidates) == 0 {
-		return nil, fmt.Errorf("no eligible host found for VM %q (insufficient resources, constraint violation, or strict-spread pressure cap): %w",
-			req.VMName, ErrNoEligibleHost)
+		return nil, &NoEligibleHostError{VMName: req.VMName, Rejections: rejections}
 	}
 
 	// Sort by score descending; ties by fewest VMs then name (stable).
@@ -475,6 +557,9 @@ func RankFromSnapshot(snap *ClusterSnapshot, req *Request) ([]Candidate, error) 
 type BatchResult struct {
 	Host    string
 	Devices []BatchDevice
+	// Err explains an empty Host: a *NoEligibleHostError naming, per candidate
+	// host, the filter that rejected it. nil whenever Host is set.
+	Err error
 }
 
 // BatchDevice is a pre-assigned PCI device.
@@ -551,15 +636,24 @@ func SelectBatch(
 			evalSnap = &pinnedSnap
 		}
 
+		// An update releases what the workload holds now for the length of its
+		// own evaluation, then commits the new allocation in its place. Released
+		// per request, not up front for the whole batch: the requests evaluated
+		// before this one still see the old allocation, which is still there.
+		released := snap.releaseAllocation(&req)
+
 		candidates, err := scoreCandidates(evalSnap, &req, true)
 		if err != nil {
+			if released {
+				snap.restoreAllocation(&req)
+			}
 			// One infeasible VM must not fail the WHOLE batch: failover needs
 			// per-VM isolation (strand the one VM nothing can hold, recover the
 			// rest), and compose re-checks per-VM below. An empty-Host result is
 			// the per-VM "no eligible host" signal; structural errors (a bad
 			// pin) still abort everything.
 			if errors.Is(err, ErrNoEligibleHost) {
-				results[req.VMName] = BatchResult{}
+				results[req.VMName] = BatchResult{Err: err}
 				continue
 			}
 			return nil, err
@@ -639,6 +733,45 @@ func assignDevices(devPool map[string][]corrosion.PCIDeviceRecord, host string, 
 
 	devPool[host] = pool
 	return assigned
+}
+
+// releasedNote qualifies a free-capacity figure on the host a replaced workload
+// is leaving: the figure already includes what it gives back, and an operator
+// reading "1947 MiB free" beside a running 1 GiB VM must be told why.
+func releasedNote(req *Request, host, unit string) string {
+	r := req.Replaces
+	if r == nil || r.Host != host {
+		return ""
+	}
+	amount := r.MemMiB
+	if unit == "vCPU" {
+		amount = r.CPU
+	}
+	return fmt.Sprintf(" after %s's current %d %s is released", req.VMName, amount, unit)
+}
+
+// vmsOnHost returns the names in vms that snap places on host, sorted.
+func vmsOnHost(snap *ClusterSnapshot, vms []string, host string) []string {
+	var out []string
+	for _, name := range vms {
+		if snap.VMHost[name] == host {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// missingLabels renders the required k=v pairs a host does not carry, sorted.
+func missingLabels(hostLabels, required map[string]string) string {
+	var out []string
+	for k, v := range required {
+		if hostLabels[k] != v {
+			out = append(out, k+"="+v)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
 }
 
 func labelsMatch(hostLabels, required map[string]string) bool {

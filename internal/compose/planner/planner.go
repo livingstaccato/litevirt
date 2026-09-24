@@ -233,6 +233,22 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			currentHostByVM[c.Name] = c.HostName
 		}
 	}
+	// What each of this stack's running workloads holds now. An update REPLACES
+	// that allocation: the snapshot already counts it on its host, and charging
+	// the new request on top counted the workload twice — a VM filling most of
+	// its host could not be updated in place at all, not even to add a label.
+	vmRecordByName := map[string]corrosion.VMRecord{}
+	for _, vm := range state.VMs {
+		if vm.StackName == f.Name {
+			vmRecordByName[vm.Name] = vm
+		}
+	}
+	ctRecordByName := map[string]corrosion.ContainerRecord{}
+	for _, ct := range state.Containers {
+		if ct.Labels[corrosion.LabelStack] == f.Name {
+			ctRecordByName[ct.Name] = ct
+		}
+	}
 
 	for _, op := range vmPlan.Ops {
 		if op.Kind != OpCreate && op.Kind != OpUpdate {
@@ -265,6 +281,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 				if h := ctHost[op.VMName]; h != "" {
 					req.PinHost = h
 				}
+				req.Replaces = containerAllocation(ctRecordByName[op.VMName])
 			}
 		} else if op.Kind == OpUpdate {
 			// A VM UPDATE stays on its current host — re-running placement could pick a
@@ -273,6 +290,9 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			// actually move the VM (and its SR-IOV VF / local disk) off its host.
 			if h := currentHostByVM[op.VMName]; h != "" {
 				req.PinHost = h
+			}
+			if vm, ok := vmRecordByName[op.VMName]; ok {
+				req.Replaces = placement.VMAllocation(vm)
 			}
 		}
 		placementReqs = append(placementReqs, req)
@@ -289,7 +309,10 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	// can strand one VM without abandoning the rest); a compose plan is
 	// all-or-nothing, so re-raise it as the hard error it always was here.
 	for _, name := range placementVMNames {
-		if placements[name].Host == "" {
+		if r := placements[name]; r.Host == "" {
+			if r.Err != nil {
+				return nil, fmt.Errorf("batch placement failed: %w", r.Err)
+			}
 			return nil, fmt.Errorf("batch placement failed: %w for VM %q", placement.ErrNoEligibleHost, name)
 		}
 	}
@@ -834,6 +857,16 @@ func buildPlacementRequest(spec *pb.VMSpec, capacity corrosion.CapacityPolicy) p
 		})
 	}
 	return req
+}
+
+// containerAllocation is what a container holds by the snapshot's counting rule
+// (corrosion.ContainerMemoryByHost: running and capped, memory only — its CPU
+// limit is shares, never counted), or nil when it holds nothing.
+func containerAllocation(ct corrosion.ContainerRecord) *placement.Allocation {
+	if ct.HostName == "" || ct.State != "running" || ct.MemMiB <= 0 {
+		return nil
+	}
+	return &placement.Allocation{Host: ct.HostName, MemMiB: ct.MemMiB}
 }
 
 // vmBaseName strips a trailing "-N" replica suffix.

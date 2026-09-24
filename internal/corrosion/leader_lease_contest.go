@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -213,4 +214,39 @@ func (c *Client) noteLeaseTermWALClaim(ctx context.Context, tx *sql.Tx, cols []s
 	if local != incoming {
 		c.noteLeaseTermClaims(key, term, local, incoming)
 	}
+}
+
+// IsLeaseHolder reports whether host is the current holder of the lease `key`
+// as this replica's term ledger sees it: its leader_election row is live and
+// names host, AND the ledger's newest incarnation (contest-aware, via
+// effectiveLeaseHolder) is host's.
+//
+// The row alone is not enough. A claimant that stood down from a contested term
+// keeps a live row naming itself for up to one TTL — the winner's renewals are
+// no-ops against it — while the ledger already carries the winner's fresh term,
+// or at least records the contest. Reading only the row, two hosts both reported
+// themselves leader for that window.
+//
+// A key with no term rows (a lease never minted through the ledger) falls back
+// to the row. A ledger read error returns it: this is a reporting question, and
+// the caller decides what an unanswerable one means.
+func IsLeaseHolder(ctx context.Context, c *Client, key, host string, now time.Time) (bool, error) {
+	rows, err := c.Query(ctx,
+		`SELECT holder FROM leader_election WHERE key = ? AND expires_at >= ?`,
+		key, now.UTC().Format(time.RFC3339))
+	if err != nil {
+		return false, fmt.Errorf("read lease %q: %w", key, err)
+	}
+	if len(rows) == 0 || rows[0].String("holder") != host {
+		return false, nil
+	}
+	newest, err := newestLeaseTerm(ctx, c, key)
+	if err != nil {
+		return false, err
+	}
+	if newest.Term <= 0 {
+		return true, nil
+	}
+	effective, _ := c.effectiveLeaseHolder(key, newest)
+	return effective == host, nil
 }

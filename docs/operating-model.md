@@ -599,6 +599,12 @@ the moment the peer's mint arrives, or on the next anti-entropy pass:
   current holder is left for one further TTL, which a live holder's renewal
   lands well inside. If the holder is dead, the lease is taken over one TTL
   later than an ordinary expiry would allow.
+- **`litevirt_failover_leader` follows the ledger, not the row.** A stood-down
+  claimant's own lease row still names it until that row expires, but the gauge
+  reads the ledger's newest (contest-aware) holder too, so it drops to `0` on
+  the loser as soon as its replica learns of the contest or of the winner's
+  fresh term. `sum(litevirt_failover_leader) != 1` does not stay tripped for a
+  TTL after the lease has converged.
 
 Which claims a node knows about lives in memory. After a restart it is rebuilt
 by the next anti-entropy pass, because the two rows still disagree and the

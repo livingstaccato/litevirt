@@ -167,6 +167,10 @@ type Client struct {
 	// so the resolver (called while mu is held during a merge) records without
 	// re-entrancy.
 	tieMu sync.Mutex
+	// leaseContests is every claimant this node has seen for a contested
+	// leader-lease term. See leader_lease_contest.go: it is what lets a
+	// contested lease converge while the contested ledger row is kept.
+	leaseContests leaseContestRegister
 	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
 	// its sorted content-hash pair and its CATEGORY. The pair makes
 	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is

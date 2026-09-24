@@ -63,6 +63,10 @@ var customMergeTables = map[string]customMergeFn{
 	// NOT authorityMergeRow: that one converges deterministically because several
 	// nodes legitimately mint one project epoch. Two nodes holding one lease term is
 	// not legitimate — it is the event this table exists to make visible.
+	//
+	// The row stays contested; the LEASE does not. The merge also hands both
+	// claimants to the lease layer, which lets exactly one of them keep acting
+	// (leader_lease_contest.go).
 	"leader_lease_terms": (*Client).immutableMergeKeepLocalRow,
 }
 
@@ -1302,6 +1306,13 @@ func (c *Client) immutableMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []i
 	// category forced consumers to re-derive which was which from the table name.
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE,
 		immutableTieCategory(table.Name))
+	// The row is kept either way; what a contested LEASE TERM additionally needs
+	// is for the lease layer to know both claimants, so exactly one of them keeps
+	// acting. Only when both sides are live: tombstoneDominates has already
+	// decided every mixed case, and two tombstones claim nothing.
+	if table.Name == "leader_lease_terms" && (delIdx < 0 || !cellNonEmpty(localRow[delIdx])) {
+		c.noteLeaseTermMergeConflict(table.Columns, localRow, row)
+	}
 	return true, nil
 }
 

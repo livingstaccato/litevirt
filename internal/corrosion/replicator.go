@@ -1393,6 +1393,14 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		if sh.Kind == KindInsert {
 			r.noteIgnoredInsert(ctx, tx, res, s, sh, tableName, "custom_merge")
+			// A peer's lease-term mint dropped against a different local holder
+			// is a contested term. The row stays as it is; the lease layer needs
+			// the claimant so the contest converges (leader_lease_contest.go).
+			if tableName == "leader_lease_terms" && res != nil && !rowsChanged(res) {
+				if cols, vals, ok := insertRowFromShape(sh, s); ok {
+					r.client.noteLeaseTermWALClaim(ctx, tx, cols, vals)
+				}
+			}
 		}
 		return nil
 

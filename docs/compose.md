@@ -449,7 +449,12 @@ Shorthand form (all conditions default to `vm_started`):
 Conditions:
 
 - `vm_started` — VM is in "running" state (default). Timeout: 5 minutes.
-- `vm_healthy` — VM is running and not marked unhealthy. Timeout: 10 minutes. Note that the VM health checker does not currently record probe results on the VM, so today this condition is met as soon as the VM is running; it is not yet a guarantee that the `healthcheck` passes.
+- `vm_healthy` — the VM's `healthcheck` has **passed**. Timeout: 10 minutes.
+  - The probe runs on the host that owns the VM, which publishes its verdict (`healthy`, `unhealthy` or `unknown`) to the cluster whenever it changes. The wait is met only by a `healthy` verdict for the VM **as it is now**: a pass recorded before the VM was restarted, recreated or migrated does not count, and neither does one from an owner host that is `offline`, `fenced` or in `maintenance` — a host that is down cannot take back its last pass, so the wait keeps waiting (the VM may yet fail over and pass on its new host).
+  - A VM with **no** `healthcheck` keeps the old meaning: running is healthy.
+  - A wait that times out says which VM and the last thing it saw, for example `timeout after 10m0s waiting for vm_healthy on db: healthcheck verdict unhealthy: tcp probe failing (3 consecutive): tcp 10.0.0.5:5432: connection refused`, or `... the last verdict (healthy) is from a previous incarnation of the VM; no probe of this one has passed yet`.
+  - `lv inspect <vm>` shows the same verdict as `health` / `healthDetail`.
+  - Mixed versions: the node serving the deploy decides what `vm_healthy` means, and the VM's owner publishes the verdict. An older node serving a deploy still treats running as healthy; a newer one waiting on a VM with a `healthcheck` whose owner runs an older build sees no verdict and times out. Upgrade every node before relying on it.
 
 If a dependency wait times out, the dependency is reported as a failed action (an `error` line naming it) and the stack ends `degraded`, but the rest of the deploy still runs — it does not block the entire stack.
 
@@ -564,6 +569,16 @@ Requirements:
       action: "restart"     # restart | migrate | alert
 ```
 
+The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:
+
+- one passing probe makes the VM **healthy**;
+- `retries` consecutive failures (default `3`) make it **unhealthy**; fewer leave the verdict where it was;
+- a VM that has not been probed since it last started — or was recreated or migrated — is **unknown**, and so is a stopped VM.
+
+There is no `start-period`. Instead, for the first 5 minutes after a VM is created its failures do not count toward the healthcheck's `action`, so a VM still booting is not restarted; it is still probed, and its verdict is still published, because a `depends-on` or rolling-update wait needs its first pass.
+
+The verdict is replicated state, written only when it changes (never once per probe), and it is what `vm_healthy` waits for (see `depends-on`). A failing verdict appears in `lv health` as a `vm_probe_failing` condition at **info** severity: visible, but it neither degrades the cluster's overall state nor blocks admission — see [Diagnostics](diagnostics.md#vm-probe-failing-vm_probe_failing).
+
 ## Restart policy
 
 Auto-restart VMs that crash or stop unexpectedly. This is distinct from healthcheck actions: healthcheck `action: restart` restarts a *running* VM that fails probes, while restart policy restarts a *stopped or crashed* VM.
@@ -625,7 +640,7 @@ Strategies:
 - `blue-green` — Create a parallel set of new VMs ("-green" suffix), verify health, then cut over.
 - `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
 
-The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-replace` is the `vm_healthy` condition of `depends-on` (see its note above), bounded by `health-wait` (default `30s`). A VM that is not healthy by then fails with `<vm> did not become healthy within health-wait <d>`; under `rolling`, `stop-first` and `start-first` that aborts the deploy.
+The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-replace` is the `vm_healthy` condition of `depends-on` (see above), bounded by `health-wait` (default `30s`). For a VM with a `healthcheck` that means the recreated VM's own probe must pass within `health-wait` — the previous VM's pass does not carry over — so leave room for at least one probe `interval` plus boot time. A VM without a `healthcheck` passes as soon as it is running. A VM that is not healthy by then fails with `<vm> did not become healthy within health-wait <d>: ...` followed by the last verdict and the probe's failure reason; under `rolling`, `stop-first` and `start-first` that aborts the deploy at that VM: the stream ends in error, later VMs are not touched, and the stack record keeps the last successful deploy (see the fail-fast note below).
 
 `in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
 

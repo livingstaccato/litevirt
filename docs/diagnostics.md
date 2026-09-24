@@ -1066,6 +1066,34 @@ as a stall; it delays a fence by one window and never causes one.
 VM swapping, or a laptop running the lab alongside heavy builds. A node that
 stalls repeatedly keeps withholding its vote, which is safe but slows failover.
 
+### VM probe failing (`vm_probe_failing`)
+
+A VM's compose `healthcheck` is probed by the host that owns the VM, and that
+host keeps one `vm_probe_failing` row per VM (evaluator `vm_probe`, subject
+`vm/<name>`) with its current verdict in the evidence: `verdict` (`healthy`,
+`unhealthy` or `unknown`), the probe's last failure `reason`,
+`consecutive_failures`, and the `incarnation` it was observed on (owner host,
+owner epoch, `created_at` and the VM row's `updated_at`). The row is **open**
+(confirmed) while the probe is failing and **resolved** otherwise, so `lv health`
+lists failing VMs and `lv health --resolved` lists every probed VM. This row is
+what the compose `depends-on: { condition: vm_healthy }` wait and the rolling
+update's `health-wait` read — see [Compose](compose.md#health-checks).
+
+It is **info** severity and not an ownership condition: a failing application
+probe is the workload's state, not the cluster's, so it neither degrades the
+overall health state nor refuses admission.
+
+| Raised when | Clears when |
+|---|---|
+| `retries` consecutive probes fail (default 3) on the VM's current incarnation. Written once, on the transition — not once per probe. | One probe passes (verdict `healthy`); the VM stops or loses its healthcheck (verdict `unknown`); or the VM is deleted or moves to another host — the host that raised it resolves it, and the new owner publishes its own verdict after its first probe. |
+
+**Reading it.** A verdict whose `incarnation` no longer matches the VM — the VM
+was restarted, recreated or migrated since — counts as `unknown`, never as a
+pass, and so does any verdict while the owner host is `offline`, `fenced` or in
+`maintenance`. `lv inspect <vm>` shows the verdict as it is read that way
+(`health` / `healthDetail`), which is the quickest way to see why a
+`vm_healthy` wait is still waiting.
+
 ### Runtime owner mismatch (`runtime_owner_mismatch`)
 
 The dual-run detector raises `runtime_owner_mismatch` about a **VM** when the

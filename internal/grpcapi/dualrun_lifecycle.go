@@ -32,10 +32,13 @@ import (
 //     corruption because the cluster is degraded would hide exactly the state
 //     an operator needs most;
 //   - RESOLUTION is stricter than observation: it requires two consecutive
-//     clean scans with COMPLETE coverage (no unreachable, partial, or
-//     unsupported peer) while the leader's decision gate is valid. An
-//     incomplete scan can neither resolve nor reset the observation streak —
-//     it proves nothing about absence;
+//     clean scans with COMPLETE coverage of every host that could hold the
+//     condition's subject (no unreachable, partial, or unsupported such host)
+//     while the leader's decision gate is valid. A scan incomplete for that
+//     subject can neither resolve nor reset the observation streak — it proves
+//     nothing about absence. Coverage is judged PER CONDITION (see
+//     dualrun_resolve_coverage.go), so a host dead since before a VM existed
+//     does not hold that VM's condition open;
 //   - there is no operator force-clear: operators remove the cause, the
 //     evaluator proves the resolution.
 
@@ -136,14 +139,14 @@ func (s *Server) resolveGateValid(ctx context.Context) bool {
 
 // applyConditionLifecycle advances every dual_run condition against this pass's
 // findings and writes the evaluator's scan status. current/details/hosts are
-// this pass's positive findings; coverageComplete says whether ABSENCE proved
-// anything this pass.
+// this pass's positive findings; rc says, per condition, whether ABSENCE
+// proved anything this pass.
 func (s *Server) applyConditionLifecycle(
 	ctx context.Context,
 	current map[finding]bool,
 	details map[finding]string,
 	evidenceHosts map[finding][]string,
-	coverageComplete bool,
+	rc resolutionCoverage,
 	coverageDetail string,
 	probeFailed []string,
 ) {
@@ -211,16 +214,16 @@ func (s *Server) applyConditionLifecycle(
 		byIdentity[f] = row
 	}
 
-	// Absent conditions: advance the clean streak — but ONLY under complete
-	// coverage and a valid decision gate. An unreachable, partial, unsupported,
-	// or quorum-less scan proves nothing about absence, so it neither resolves
-	// nor resets anything.
-	canResolve := coverageComplete && s.resolveGateValid(ctx)
+	// Absent conditions: advance the clean streak — but ONLY under a valid
+	// decision gate and complete coverage of the hosts that could hold the
+	// condition's subject. A quorum-less scan, or one blind to such a host,
+	// proves nothing about absence, so it neither resolves nor resets anything.
+	gateOK := s.resolveGateValid(ctx)
 	for f, row := range byIdentity {
 		if current[f] {
 			continue
 		}
-		if !canResolve {
+		if !gateOK || !rc.canResolve(f, row) {
 			continue
 		}
 		row.CleanCount++
@@ -232,7 +235,7 @@ func (s *Server) applyConditionLifecycle(
 			s.publish("ha.dualrun.cleared", f.kind+":"+f.target, "")
 			s.notify(ctx, notify.Notification{
 				Kind: f.kind, Severity: notify.SevInfo, Subject: f.target,
-				Detail: "resolved: two consecutive complete clean scans",
+				Detail: "resolved: two consecutive clean scans with complete coverage of every host that could hold it",
 			})
 			slog.Info("dual-run detector: condition resolved", "kind", f.kind, "target", f.target)
 		}
@@ -245,7 +248,7 @@ func (s *Server) applyConditionLifecycle(
 	// Scan status: when it ran, what it could see. Consumers use this to tell
 	// "clean" from "blind".
 	coverage := corrosion.CoverageComplete
-	if !coverageComplete {
+	if !rc.complete {
 		coverage = corrosion.CoveragePartial
 	}
 	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{

@@ -2,6 +2,7 @@ package restapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -151,7 +152,10 @@ func ackFirstAndDetach(w http.ResponseWriter, op string, cancel context.CancelFu
 		ackAndDetach(op, cancel, rest)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"status":"accepted","detail":"operation started; no progress reported yet"}`))
+		body, _ := json.Marshal(map[string]string{
+			"status": "accepted", "detail": op + " started; no progress reported yet",
+		})
+		_, _ = w.Write(body)
 		return
 	}
 	if err != nil {

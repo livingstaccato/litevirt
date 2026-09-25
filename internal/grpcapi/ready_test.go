@@ -131,3 +131,37 @@ func TestReady_AnswersWithinItsBudgetWhenTheReadBlocks(t *testing.T) {
 		t.Errorf("second Ready took %v; with a read already outstanding it should answer immediately", elapsed)
 	}
 }
+
+// Concurrent probes of a HEALTHY node are all answered ready.
+//
+// Every peer probes every node each interval, so overlapping Ready calls are
+// the normal case. A single-flight that refused any probe arriving while
+// another read was merely in progress answered "not ready" for a node whose
+// store was fine — and an unready observation is recorded on the first one,
+// so healthy nodes flapped out of quorum as the cluster grew. Only a read that
+// has actually outlived its budget makes later probes answer at once.
+func TestReady_ConcurrentProbesOfAHealthyNodeAreAllReady(t *testing.T) {
+	s := testServer(t)
+	insertReadyHost(t, s, "test-host")
+	gate := make(chan struct{})
+	s.readyRead = func(context.Context) ([]corrosion.Row, error) {
+		<-gate // both reads are in flight at once, then both complete
+		return []corrosion.Row{{Columns: []string{"name"}, Values: []interface{}{"test-host"}}}, nil
+	}
+
+	const probes = 2
+	answers := make(chan bool, probes)
+	for range probes {
+		go func() {
+			resp, _ := s.Ready(context.Background(), &pb.ReadyRequest{})
+			answers <- resp.GetReady()
+		}()
+	}
+	time.Sleep(100 * time.Millisecond) // let both reach the read
+	close(gate)
+	for range probes {
+		if !<-answers {
+			t.Fatal("a probe of a healthy node was answered not-ready because another probe's read was in flight")
+		}
+	}
+}

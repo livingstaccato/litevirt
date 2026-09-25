@@ -1,6 +1,7 @@
 package corrosion
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -87,5 +88,41 @@ func TestNotifyReplicator_DoesNotLatchReady(t *testing.T) {
 		t.Fatal("the notify channel stayed ready after a broadcast; every push loop would " +
 			"spin instead of waiting, burning CPU and hammering peers")
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// A write that commits while a push loop is between its read of mutation_log
+// and its wait must still wake that loop.
+//
+// The broadcast closes the current channel and installs a fresh one. A loop
+// that fetched the channel only when it reached its select waited on the FRESH
+// one, so a notify fired in between closed a channel nobody held: the entry sat
+// for the full 10 s idle interval. The capacity-1 send it replaced kept that
+// wakeup in its buffer, so this was a regression the broadcast introduced.
+func TestReplicateToPeer_AWriteDuringThePushIsNotLost(t *testing.T) {
+	c := mustTestClient(t)
+	r := NewReplicator(c, "", RelayConfig{})
+
+	calls := make(chan time.Time, 8)
+	var first atomic.Bool
+	r.afterReplicateOnceForTests = func() {
+		if first.CompareAndSwap(false, true) {
+			c.notifyReplicator() // a local write lands after the read, before the wait
+		}
+		calls <- time.Now()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go r.replicateToPeer(ctx, "peer-b")
+
+	start := <-calls
+	select {
+	case again := <-calls:
+		if d := again.Sub(start); d > 2*time.Second {
+			t.Fatalf("the loop re-ran %v after the write; the wakeup was lost", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the loop did not re-run within 5s of a write that landed during its push: the wakeup was lost and it is waiting out the 10s idle interval")
 	}
 }

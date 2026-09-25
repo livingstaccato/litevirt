@@ -29,6 +29,11 @@ type Replicator struct {
 	pkiDir   string
 	relayCfg RelayConfig
 
+	// afterReplicateOnceForTests runs between a push attempt and the wait that
+	// follows it. Test seam only: it is how a test lands a local write in the
+	// window a lost wakeup lives in.
+	afterReplicateOnceForTests func()
+
 	mu             sync.Mutex
 	peers          map[string]context.CancelFunc // peer name → cancel for its goroutine
 	relaySet       *RelaySet                     // current relay election result
@@ -448,7 +453,17 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 		default:
 		}
 
+		// Take the wake channel BEFORE reading mutation_log. notifyReplicator
+		// closes the current channel and installs a fresh one, so a loop that
+		// fetched it only on reaching its select would wait on the fresh one,
+		// and a write that committed after this read — but before that select —
+		// would have closed a channel nobody held: its entry sat out the full
+		// idle interval. Holding this one, that write wakes us.
+		notify := r.client.ReplicatorNotify()
 		sent, err := r.replicateOnce(ctx, peerName)
+		if r.afterReplicateOnceForTests != nil {
+			r.afterReplicateOnceForTests()
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -517,7 +532,7 @@ func (r *Replicator) replicateToPeer(ctx context.Context, peerName string) {
 				return
 			case <-r.stopCh:
 				return
-			case <-r.client.ReplicatorNotify():
+			case <-notify:
 				// New mutation available, loop immediately.
 			case <-time.After(jittered(pushIdleInterval, loopJitter)):
 				// Periodic check — picks up deferred writes (e.g. health data).

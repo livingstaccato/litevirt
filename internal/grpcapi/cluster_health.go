@@ -9,6 +9,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // GetClusterHealth is THE health read. It aggregates the durable condition
@@ -135,7 +136,9 @@ type connectivityEdge struct {
 // would turn any new status value the checker starts writing into an immediate
 // cluster-wide DEGRADED on every node that has not been upgraded yet.
 func connectivityDegrades(status string) bool {
-	return status == "failing" || status == "suspect"
+	// unready is the peer's own answer that it cannot serve: it degrades the
+	// cluster as much as a suspect edge, though it licenses no fence.
+	return status == "failing" || status == "suspect" || status == health.StatusUnready
 }
 
 // Overall cluster-health states.

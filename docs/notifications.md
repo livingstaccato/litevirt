@@ -66,7 +66,9 @@ A notification has a `kind` (verb.noun), `severity` (`info` | `warn` | `error`),
 > health conditions (schema v50): the first positive scan emits the kind at `warn`
 > (lifecycle *observed*), the second consecutive scan CONFIRMS and pages at the kind's
 > listed severity, and the condition resolves — emitting the kind once at `info` — only
-> after two consecutive clean scans with complete coverage. Conditions survive detector
+> after two consecutive clean scans with complete coverage of every host that could hold
+> the condition's subject (a host that has been down since before a VM was created does
+> not hold that VM's condition open — see *Cluster health* in docs/diagnostics.md). Conditions survive detector
 > leadership changes and daemon restarts, and the same rows drive admission refusals
 > (`lv health` shows exactly what admission enforces). Route `ha.dualrun.*` at `error` (or
 > `ha.*` broadly). Expect standing `ha.dualrun.coverage` alerts for any host that is

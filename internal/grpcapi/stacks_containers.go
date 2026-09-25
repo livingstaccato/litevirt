@@ -86,12 +86,14 @@ func (s *Server) buildContainerRequest(ctx context.Context, instanceName string,
 	}
 
 	for _, n := range d.Network {
-		// Resolve against the SCOPED network name. Compose registers each network
-		// as "<stack>_<name>", and an isolated network's host bridge is derived
-		// from that scoped name (br-iso-<hash>). Resolving the bare name misses
-		// the lookup and returns an invalid bridge, so the container's veth can't
-		// attach and lxc-start aborts (the VM path scopes it the same way).
-		scoped := compose.ScopedNetworkName(f.Name, n.Name)
+		// Resolve against the network's RECORD name. Compose registers each
+		// stack-owned network as "<stack>_<name>", and an isolated network's host
+		// bridge is derived from that name (br-iso-<hash>). Resolving the wrong
+		// name misses the lookup and returns an invalid bridge, so the
+		// container's veth can't attach and lxc-start aborts. External and
+		// undeclared names are cluster networks and keep their own name; the VM
+		// path resolves them through the same function.
+		scoped := f.ResolveNetworkName(n.Name)
 		ipCIDR, bareIP := n.IP, n.IP
 		if n.IP != "" {
 			if addr, _, hasPrefix := strings.Cut(n.IP, "/"); hasPrefix {

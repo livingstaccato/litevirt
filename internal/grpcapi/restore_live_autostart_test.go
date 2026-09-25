@@ -46,8 +46,19 @@ func runRestoreLiveUntil(t *testing.T, s *Server, req *pb.RestoreLiveRequest, ph
 	done := make(chan error, 1)
 	go func() { done <- s.RestoreLive(req, stream) }()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	// Judged on STALL, not elapsed wall clock. See phaseWaiter: a flat budget
+	// here belongs to work this helper does not control, and on a loaded machine
+	// it expired mid-restore and reported unrelated branches as broken.
+	hardStop := time.Now().Add(2 * time.Minute)
+	if d, ok := t.Deadline(); ok {
+		// Stop short of the binary's own deadline so this failure is reported
+		// rather than swallowed by the package timeout.
+		if d = d.Add(-5 * time.Second); d.Before(hardStop) {
+			hardStop = d
+		}
+	}
+	w := newPhaseWaiter(30*time.Second, hardStop)
+	for {
 		stream.mu.Lock()
 		var seen bool
 		for _, p := range stream.out {
@@ -55,6 +66,7 @@ func runRestoreLiveUntil(t *testing.T, s *Server, req *pb.RestoreLiveRequest, ph
 				seen = true
 			}
 		}
+		frames := len(stream.out)
 		stream.mu.Unlock()
 		if seen {
 			return stream, cancel, done
@@ -66,10 +78,11 @@ func runRestoreLiveUntil(t *testing.T, s *Server, req *pb.RestoreLiveRequest, ph
 			return stream, cancel, done
 		default:
 		}
+		if giveUp, why := w.observe(frames, time.Now()); giveUp {
+			t.Fatalf("never reached phase %v: %s", phase, why)
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("never reached phase %v; frames=%d", phase, len(stream.out))
-	return nil, cancel, done
 }
 
 func sawPhase(stream *restoreLiveStream, phase pb.RestoreLiveProgress_Phase) bool {

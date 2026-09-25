@@ -7,8 +7,7 @@
 >   1. **Policy** — initial-placement scoring (where new VMs go).
 >   2. **Rebalancer mode** — day-2 reconciliation (does the engine react to ongoing imbalance?).
 >
-> Earlier the placement engine defaulted to bin-pack (the bug behind
-> "VMs pile onto a single host"). The cluster default is now
+> The cluster default is
 > **balance + dry-run**: spread by default, propose moves to operators
 > rather than acting unilaterally.
 
@@ -68,8 +67,8 @@ host's budget with a label; usage is sampled automatically from libvirt domain
 stats into `host_runtime_usage`:
 
 ```bash
-lv host config host-a --label placement.iops_capacity=20000   # ops/sec
-lv host config host-a --label placement.netbw_mbps=10000      # Mbps
+lv host label set host-a placement.iops_capacity=20000   # ops/sec
+lv host label set host-a placement.netbw_mbps=10000      # Mbps
 ```
 
 Hosts without the label leave those dimensions inert (capacity 0 → skipped), so
@@ -315,9 +314,9 @@ imbalance. Operators almost never see proposals on prod hours.
 
 ```yaml
 vms:
-  db-1: { ... placement: { mode: ha-critical, anti-affinity: [db-2, db-3] } }
-  db-2: { ... placement: { mode: ha-critical, anti-affinity: [db-1, db-3] } }
-  db-3: { ... placement: { mode: ha-critical, anti-affinity: [db-1, db-2] } }
+  db-1: { image: postgres-16, placement: { mode: ha-critical, anti-affinity: [db-2, db-3] } }
+  db-2: { image: postgres-16, placement: { mode: ha-critical, anti-affinity: [db-1, db-3] } }
+  db-3: { image: postgres-16, placement: { mode: ha-critical, anti-affinity: [db-1, db-2] } }
 ```
 
 Three replicas always on three different hosts; if a host goes offline, the
@@ -384,11 +383,42 @@ Rebalance executor (internal/grpcapi/, leader-gated):
 
 ---
 
+## Why a placement failed
+
+When no host qualifies, the error names every candidate host and every hard
+filter that refused it, instead of a bare "no eligible host":
+
+```
+no eligible host for VM "db": node-1: labels (needs tier=data); node-2: not active (draining);
+node-3: memory (needs 1152 MiB incl. 128 qemu overhead, 795 free), anti-affinity (web-2)
+```
+
+A host that is not active, or is a witness, is reported as that alone. Every
+other host lists each filter it fails, in this order: `capacity observation
+incomplete or stale`, `vcpu`, `memory`, `anti-affinity`, `max-per-node`,
+`labels`, `devices`, and the `spread-strict pressure cap`. Compose plans report
+it on `lv compose up`; a VM that failover cannot place records it in the
+`failover.skip` audit row.
+
+A VM is charged its vCPUs and its guest memory plus one qemu overhead, against
+the host's allocatable capacity net of what already runs there. A **container**
+is charged its memory limit only: no qemu overhead, and no vCPU — its `cpu` is a
+cap in cores, not a vCPU reservation, which is also how running containers
+are counted against a host and how host admission charges a new one.
+
+An **update** of a workload is placed as a replacement of what it holds now:
+its current cpu and memory are released on its host while the updated request
+is evaluated, so a workload never counts twice against the host it runs on. The
+free figure then says so — `1947 free after db's current 1024 is released`. A VM moving to another host (failover, drain, rebalance) is
+counted on its source, never on its destination.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| VM creation fails with "no eligible host found … strict-spread pressure cap" | `spread-strict` would put all candidates above 50% on a wired dimension | Add hosts, or relax to `policy: balance` |
+| VM creation fails with "… spread-strict pressure cap (50%)" | `spread-strict` would put all candidates above 50% on a wired dimension | Add hosts, or relax to `policy: balance` |
 | Rebalancer proposes nothing despite obvious imbalance | All VMs in `mode: off` | Set `mode: dry-run` cluster-wide |
 | Same VM proposed every cycle | Cooldown only suppresses the *same* VM after a successful proposal write | Approve (the executor applies it) or reject the proposal; cooldown then takes effect |
 | Approved proposal never applies | Not the leader, or cluster budget exhausted (`applying` ≥ MaxConcurrent / `applied` ≥ MaxPerHour this hour), or it failed re-validation | `lv rebalance list --status applying\|failed`; check `detail`; confirm a leader holds the `rebalancer` lease |
@@ -397,19 +427,17 @@ Rebalance executor (internal/grpcapi/, leader-gated):
 
 ---
 
-## Migrating from earlier defaults
+## Defaults and related surface
 
-If you were running litevirt before the placement-engine rewrite:
-
-- **The default placement policy changed from bin-pack to balance.** New VMs spread by default. To restore the old behavior cluster-wide:
+- **The default placement policy is balance.** New VMs spread by default. To pack VMs onto as few hosts as possible cluster-wide, with rebalancing off:
   ```yaml
   # /etc/litevirt/cluster.yaml
   placement: { policy: bin-pack, rebalance: { mode: off } }
   ```
-- The old `placement.spread: true` flag still works (translates to
-  `policy: spread-strict`). Migrate to `policy:` when convenient.
-- New tables: `rebalance_proposals`. Auto-created by the schema migration.
-- New gRPC: `ListRebalanceProposals`, `RunRebalance`,
+- The legacy `placement.spread: true` flag translates to
+  `policy: spread-strict`. Prefer `policy:`.
+- Tables: `rebalance_proposals`. Auto-created by the schema migration.
+- gRPC: `ListRebalanceProposals`, `RunRebalance`,
   `ApproveRebalanceProposal`, `RejectRebalanceProposal`.
-- New CLI: `lv rebalance` group.
-- New metrics: `litevirt_host_pressure`, `litevirt_rebalance_*`.
+- CLI: `lv rebalance` group.
+- Metrics: `litevirt_host_pressure`, `litevirt_rebalance_*`.

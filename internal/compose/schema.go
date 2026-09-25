@@ -475,12 +475,22 @@ type LBHealth struct {
 
 // HealthCheckDef defines VM-level health checking.
 type HealthCheckDef struct {
-	Type     string `yaml:"type"`   // tcp | http | ping | exec
-	Target   string `yaml:"target"` // port or URL
+	// Type is tcp | http | https | ping | exec. When omitted, the parser
+	// infers it from a target that settles it (see inferHealthType).
+	Type string `yaml:"type"`
+	// Target is resolved relative to the VM, because the probe runs on the
+	// VM's owning host: a bare port, an empty host, localhost or any loopback
+	// address means the VM's own address; another host is probed as given.
+	// tcp: "22" or host:port. http/https: a URL, "8080", ":8080/path" or
+	// "/path". ping: empty (the VM) or a host. exec: a command run in the
+	// guest by its agent. See ParseHealthTarget.
+	Target   string `yaml:"target"`
 	Interval string `yaml:"interval"`
 	Timeout  string `yaml:"timeout"`
 	Retries  int    `yaml:"retries"`
 	Action   string `yaml:"action"` // restart | migrate | alert
+
+	typeInferred bool // Type was inferred from Target, not written
 }
 
 // HooksDef contains lifecycle hook scripts.
@@ -574,4 +584,18 @@ func ScopedNetworkName(stackName, netName string) string {
 		return netName
 	}
 	return stackName + "_" + netName
+}
+
+// ResolveNetworkName returns the cluster network record a workload NIC
+// naming raw refers to. A network this file declares (and does not mark
+// external) belongs to the stack and is stored as "<stack>_<raw>". Any other
+// name — declared `external: true`, or not declared at all — is a cluster
+// network made outside the stack (`lv network create`), stored under its own
+// name. Every site that turns a NIC's network into a record name must use
+// this, so the VM, the container and the planner agree.
+func (f *File) ResolveNetworkName(raw string) string {
+	if nd, ok := f.Networks[raw]; ok && !nd.External {
+		return ScopedNetworkName(f.Name, raw)
+	}
+	return raw
 }

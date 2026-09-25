@@ -36,17 +36,23 @@ type HostConfig struct {
 	IPMIPass    string
 	// Watchdog — only used when FenceStrategy = "watchdog" (self-fencing)
 	WatchdogDev string
+	// IsSelf reports that this process is running ON the host being fenced.
+	//
+	// Only the watchdog strategy reads it, and it FAILS CLOSED: a caller that
+	// forgets to set it gets a refusal, not somebody else's watchdog armed.
+	IsSelf bool
 }
 
 // Execute runs the fencing strategy specified by h.FenceStrategy.
 // Strategies:
 //
-//	"best-effort"  – try SSH poweroff; succeed regardless (never blocks failover)
-//	"ssh"          – SSH poweroff; report failure if unreachable
+//	"best-effort"  – try an SSH forced power-off; succeed regardless (never blocks failover)
+//	"ssh"          – SSH forced (immediate) power-off; report failure if unreachable
 //	"ipmi"         – IPMI/BMC power off via ipmitool; must succeed
 //	"manual"       – log an alert and return Success=false; the coordinator will NOT
 //	                 reschedule until an operator confirms via `lv host fence-confirm`
-//	"watchdog"     – write to /dev/watchdog to stop heartbeat (self-fencing, caller is local)
+//	"watchdog"     – write to /dev/watchdog to stop heartbeat. SELF-fencing only:
+//	                 refused unless h.IsSelf, because it arms the CALLING node
 //	""             – treated as "best-effort"
 func Execute(ctx context.Context, h HostConfig) Result {
 	raw := strings.ToLower(strings.TrimSpace(h.FenceStrategy))
@@ -63,6 +69,29 @@ func Execute(ctx context.Context, h HostConfig) Result {
 	case "manual":
 		return fenceManual(h)
 	case "watchdog":
+		// A watchdog fence is a SELF-fence: fenceWatchdog opens WatchdogDev on
+		// THIS node. Dispatched at a peer it either arms the coordinator's own
+		// hardware watchdog -- rebooting a healthy node in the middle of a
+		// recovery it is running -- or fails on a missing device. The first case
+		// is the dangerous one, because it then reports Success: true and the
+		// coordinator reads a started LOCAL countdown as a verified power-off of
+		// the REMOTE host, and reschedules its VMs onto shared storage the
+		// original may still be writing to.
+		//
+		// Refused rather than silently downgraded to SSH: the configured
+		// strategy is what an operator chose for this host, and quietly running
+		// a different one is how a fence comes to mean three things. A refusal
+		// leaves the host unfenced and the coordinator declining to reschedule,
+		// which is the safe direction.
+		if !h.IsSelf {
+			return Result{
+				Method: "watchdog",
+				Detail: fmt.Sprintf("fence_strategy=watchdog is self-only and %q is not this host; "+
+					"a watchdog fence arms the CALLING node. Configure ipmi (or ssh) for a remotely "+
+					"fenceable host, or confirm manually with `lv host fence-confirm %s`", h.Name, h.Name),
+				Success: false,
+			}
+		}
 		return fenceWatchdog(h)
 	default: // "best-effort" — lenient fire-and-forget SSH
 		return fenceSSH(ctx, h, true)
@@ -86,7 +115,46 @@ func ResolveStrategy(raw string) string {
 	}
 }
 
-// fenceSSH sends "systemctl poweroff" to the host over SSH.
+// sshFenceArmed is the line the remote fence command prints once it is running
+// on the target and about to power it off. See sshPowerOffCommand.
+const sshFenceArmed = "litevirt-fence-armed"
+
+// sshPowerOffCommand is the remote command an SSH fence runs. It powers the
+// host off IMMEDIATELY, not gracefully.
+//
+// It used to be `systemctl poweroff || poweroff`, which is an orderly shutdown:
+// systemctl queues the job and returns 0 at once, and the host then runs its
+// stop units — including libvirt-guests, which waits for every VM to shut down
+// cleanly. On the lab the fence read "fenced" at 02:25:12 and the host powered
+// down at ~02:27:55, with its VM running throughout. A coordinator that
+// rescheduled on that fence started a second copy of a VM that was still
+// writing to its disks. A fence has to stop the machine now.
+//
+//   - `systemctl poweroff --force --force` calls reboot(2) directly, skipping
+//     every unit (libvirt-guests included) — the equivalent of pulling power.
+//   - `echo o > /proc/sysrq-trigger` is the fallback for a host without
+//     systemd: the kernel powers off without involving userspace at all.
+//
+// The marker is printed FIRST, by the remote shell, so the caller can tell a
+// session the power-off killed from one that never ran (see fenceSSH). It is
+// assembled by printf so the literal marker never appears in the command text
+// itself, which is what ssh would be echoing if anything ever echoed it. The
+// one-second pause lets the marker leave the host before the power-off takes
+// the network down with it; without it the marker races the kernel and a
+// successful fence can read as a failure.
+//
+// There is no trailing `|| true`. It was once here, and it meant a host whose
+// shutdown commands BOTH failed still exited 0, so the fence returned
+// Method:"ssh", Success:true for a machine that was still running. That
+// success is load-bearing: fenceProvedOff writes hosts.state="fenced" from it,
+// and a later coordinator resumes the reschedule from that record alone. When
+// both commands here fail, the shell exits non-zero (and not 255: neither
+// systemctl nor a failed redirect exits 255), and that is reported as a
+// failure.
+const sshPowerOffCommand = "printf '%s-%s\\n' litevirt-fence armed; sleep 1; " +
+	"systemctl poweroff --force --force || echo o > /proc/sysrq-trigger"
+
+// fenceSSH powers the host off immediately over SSH (see sshPowerOffCommand).
 // If lenient=true, failures are reported as successful (best-effort mode).
 func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 	port := h.SSHPort
@@ -105,25 +173,91 @@ func fenceSSH(ctx context.Context, h HostConfig, lenient bool) Result {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "BatchMode=yes",
 		"-o", fmt.Sprintf("ConnectTimeout=%d", connectTimeout(ctx, 10)),
+		// A forced power-off takes the host down without closing the TCP
+		// connection, so no FIN or RST ever arrives. Without a keepalive the
+		// client waits on a machine that no longer exists until the fence's
+		// context kills it — and a killed ssh is not a classifiable result.
+		// This bounds that to ~6s and turns it into ssh's own exit 255.
+		"-o", "ServerAliveInterval=2",
+		"-o", "ServerAliveCountMax=3",
 		"-p", fmt.Sprintf("%d", port),
 		target,
-		"systemctl poweroff 2>/dev/null || poweroff 2>/dev/null || true",
+		sshPowerOffCommand,
 	)
 	out, runErr := cmd.CombinedOutput()
-	detail := fmt.Sprintf("SSH poweroff to %s: %s", target, strings.TrimSpace(string(out)))
+	armed := sawFenceArmed(out)
+	detail := fmt.Sprintf("SSH forced poweroff to %s: %s", target, strings.TrimSpace(string(out)))
 
-	if runErr != nil {
-		if lenient {
-			slog.Warn("SSH fence failed (best-effort, ignoring)", "host", h.Name, "error", runErr)
-			return Result{
-				Method:  "best-effort-ssh",
-				Detail:  fmt.Sprintf("SSH failed (%v), proceeding anyway: %s", runErr, strings.TrimSpace(string(out))),
-				Success: true,
-			}
+	// Classification. A success requires the marker, always: it is the only
+	// evidence that OUR command ran on the target. An exit 0 without it means
+	// something else answered — e.g. an authorized_keys forced command.
+	//
+	//   - exit 0 + marker: the command returned success (in practice the sysrq
+	//     write, whose power-off lands just after the shell exits).
+	//   - exit 255 + marker: the connection died AFTER the remote shell had
+	//     started the forced power-off. This is the normal signature of a
+	//     fence that worked, because `systemctl poweroff --force --force` never
+	//     returns: the host is gone before any exit status can be sent, and
+	//     ServerAliveInterval turns the silence into ssh's 255. It is classified
+	//     as a SUCCESS — reported exactly like the exit 0 the old graceful
+	//     command produced, i.e. "requested" assurance, which already means
+	//     nobody checked the host went down. Reading it as a failure instead
+	//     would make every working SSH fence strand its host's VMs.
+	//
+	//     The residual risk is a connection that drops for an unrelated reason
+	//     in the one second between the marker and the power-off, followed by
+	//     BOTH power-off commands failing. That needs a coincident network
+	//     failure and a host that cannot power itself off; it is accepted.
+	//   - exit 255 without the marker: ssh never got our command running
+	//     (unreachable, refused, auth failed, dropped before the shell ran).
+	//     Not a fence.
+	//   - any other non-zero status: the remote shell ran and both power-off
+	//     commands failed. Not a fence — this is the `|| true` case.
+	//   - killed by the context: not a fence, marker or not. With the keepalive
+	//     above this needs the fence budget to run out first, and an unfinished
+	//     call is not evidence the host went down.
+	switch {
+	case runErr == nil && armed:
+		return Result{Method: "ssh", Detail: detail, Success: true}
+	case armed && sshExitCode(runErr) == 255:
+		return Result{
+			Method:  "ssh",
+			Detail:  detail + " (connection lost after the forced power-off was issued)",
+			Success: true,
 		}
-		return Result{Method: "ssh", Detail: detail, Success: false}
 	}
-	return Result{Method: "ssh", Detail: detail, Success: true}
+	if runErr == nil {
+		runErr = errors.New("remote command exited 0 without confirming it ran")
+	}
+	if lenient {
+		slog.Warn("SSH fence failed (best-effort, ignoring)", "host", h.Name, "error", runErr)
+		return Result{
+			Method:  "best-effort-ssh",
+			Detail:  fmt.Sprintf("SSH failed (%v), proceeding anyway: %s", runErr, strings.TrimSpace(string(out))),
+			Success: true,
+		}
+	}
+	return Result{Method: "ssh", Detail: fmt.Sprintf("%s (%v)", detail, runErr), Success: false}
+}
+
+// sawFenceArmed reports whether out contains the fence marker as a whole line.
+func sawFenceArmed(out []byte) bool {
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.TrimSpace(line) == sshFenceArmed {
+			return true
+		}
+	}
+	return false
+}
+
+// sshExitCode returns the process exit status carried by err, or -1 when err
+// is not an exit status (e.g. the process was killed by a signal).
+func sshExitCode(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
 }
 
 // fenceIPMI powers off the host via ipmitool chassis power off.

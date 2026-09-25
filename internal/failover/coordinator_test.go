@@ -701,6 +701,10 @@ func TestCoordinator_NoEligibleHost_SkipsInsteadOfRoundRobin(t *testing.T) {
 		`SELECT detail FROM audit_log WHERE action = 'failover.skip' AND target = 'big-vm'`)
 	if qerr != nil || len(rows) == 0 {
 		t.Errorf("expected a failover.skip audit row for big-vm (err=%v rows=%d) — a stranded VM must be loud", qerr, len(rows))
+	} else if detail := rows[0].String("detail"); !strings.Contains(detail, "tiny: vcpu (needs 8, 3 free), memory (needs 32896 MiB incl. 128 qemu overhead, 0 free)") {
+		// ...and says which filter refused each survivor, so the operator knows
+		// what to change.
+		t.Errorf("failover.skip detail = %q, want it to name tiny's vCPU shortfall", detail)
 	}
 }
 

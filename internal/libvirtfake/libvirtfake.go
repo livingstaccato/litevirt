@@ -65,6 +65,7 @@ type Fake struct {
 	diskSources            map[string]map[string]string   // domain → target-dev → source file
 	stats                  map[string]*libvirt.DomainStats
 	reasons                map[string]string // domain → injected DomainStateReason.Reason
+	managedSave            map[string]bool   // domain → has a managed-save (suspend-to-disk) image
 	ownerEpochs            map[string]int64  // domain → Phase 4 owner-epoch metadata marker
 	events                 []Event
 
@@ -157,6 +158,9 @@ type Fake struct {
 	FailCreateLiveSnapshot func(domain, snap string) error
 	FailDomainState        func(name string) error
 	FailDomainStateReason  func(name string) error
+	// FailHasManagedSaveImage makes HasManagedSaveImage unreadable, for the
+	// fail-closed paths that must not treat "cannot tell" as "no saved RAM".
+	FailHasManagedSaveImage func(name string) error
 	// FailSetVCPUs / FailSetMemory inject a resize primitive failure so scenarios
 	// can exercise partial-apply recovery (e.g. cpu ok, mem fails).
 	FailSetVCPUs        func(name string, count int) error
@@ -215,6 +219,7 @@ func New() *Fake {
 		diskSources: make(map[string]map[string]string),
 		stats:       make(map[string]*libvirt.DomainStats),
 		reasons:     make(map[string]string),
+		managedSave: make(map[string]bool),
 
 		pendingUnplug:  make(map[string][]func()),
 		unplugRequests: make(map[string]int),
@@ -462,6 +467,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.activeXML, name)
 	delete(f.snapshots, name)
 	delete(f.stats, name)
+	delete(f.managedSave, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
 	return nil
 }
@@ -558,6 +564,31 @@ func (f *Fake) SetStateReason(name, reason string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reasons[name] = reason
+}
+
+// SetManagedSaveImage injects whether a domain carries a managed-save
+// (suspend-to-disk) image, as reported by HasManagedSaveImage.
+func (f *Fake) SetManagedSaveImage(name string, has bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.managedSave[name] = has
+}
+
+// HasManagedSaveImage reports an injected managed-save image (default: none),
+// satisfying health.LibvirtBackend. Like the real client, an undefined domain
+// is a lookup error, never a confident "no image".
+func (f *Fake) HasManagedSaveImage(name string) (bool, error) {
+	if f.FailHasManagedSaveImage != nil {
+		if err := f.FailHasManagedSaveImage(name); err != nil {
+			return false, err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return false, fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	return f.managedSave[name], nil
 }
 
 // DomainStateReason returns the coarse state + a reason, satisfying
@@ -892,6 +923,26 @@ func (f *Fake) DetachNIC(domainName, mac string) error {
 	}
 	f.detachNICN++
 	f.record("detach-nic", domainName, "mac="+mac)
+	return nil
+}
+
+// SetNICBridge moves domainName's NIC with MAC mac onto bridge in both the
+// persistent and the live view, as the real update-device does. It records a
+// "set-nic-bridge" event and never a define.
+func (f *Fake) SetNICBridge(domainName, mac, bridge string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	x, ok := libvirt.RetargetDomainXML(f.xml[domainName], mac, bridge)
+	if !ok {
+		return fmt.Errorf("domain %s has no bridge interface with MAC %s", domainName, mac)
+	}
+	f.xml[domainName] = x
+	if live, ok := f.activeXML[domainName]; ok && live != "" {
+		if lx, ok := libvirt.RetargetDomainXML(live, mac, bridge); ok {
+			f.activeXML[domainName] = lx
+		}
+	}
+	f.record("set-nic-bridge", domainName, fmt.Sprintf("mac=%s bridge=%s", mac, bridge))
 	return nil
 }
 

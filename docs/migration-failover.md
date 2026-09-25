@@ -116,6 +116,60 @@ states — rewriting every healthy row on a timer would be N*(N-1) writes per
 interval across the cluster, for a reader that only ever looks at hosts
 awaiting recovery.
 
+#### An observer that stopped running is not a witness
+
+A failed probe counts against the peer only if the observer was running while it
+waited for the answer. A host that suspends, swaps out or starves the node
+running litevirt stops the whole daemon. The node's clocks keep moving (inside a
+VM they follow the hypervisor), so each probe the node had in flight runs out its
+deadline without the daemon ever waiting for a reply. The probe reports
+"unreachable" about a peer that answered the whole time. If every observer runs
+on one overloaded host, they can all build up failures against a live peer at
+the same moment and reach fencing quorum.
+
+Each health checker therefore runs a heartbeat that measures only its own
+scheduling. It beats every 250 ms. A gap between beats longer than the 2 s probe
+interval means this node was not running for that long. The gap is measured on
+both the monotonic and the wall clock, because on bare metal the monotonic clock
+does not advance across a system suspend. After a gap:
+
+- **The failure count this node had built against every peer is discarded.** A
+  verdict against a peer is made only of probes attempted after the node resumed.
+  The probe that straddled the gap is never one of them.
+- **For the stall grace window, an unreachable probe is not counted.** The window
+  is the time a normal fence verdict takes to build — 5 failed probes at the 2 s
+  probe interval, 10 s — and it is derived from those two numbers, not tuned
+  separately, so it moves with them. There is no setting for it. No
+  row is written for it, so a previously published `suspect` row is not refreshed
+  and ages out of fencing quorum's 30 s freshness window. A successful probe still
+  counts, and so does a peer's explicit not-ready answer.
+- **This node's failover coordinator decides no new fence for the same window.** It
+  logs `quorum reached, but this node was itself not running moments ago` and
+  counts `litevirt_failover_attempts_total{phase="skip",error_class="local_stall"}`.
+  Resuming a recovery from a fence that is already recorded is not a new decision,
+  and it is not held back.
+
+**Seeing it.** The node records an `observer_stalled` condition about itself for
+the length of the window — `lv health` lists it, and `lv doctor fence` names the
+node with how long it was paused and until when its votes are withheld. See
+[Diagnostics](diagnostics.md#observer-stalled-observer_stalled).
+
+A host that really is dead is still fenced. After a stall its observers need the
+grace window plus the usual 5 failed probes, about 20 s from resume instead of
+about 10 s. That bound holds once the observer has stayed running through it. An
+observer that stalls again and again keeps withholding its vote, and while it
+does so it does not count toward fencing.
+
+The guard does not cover a **peer** that stalls. To every observer that kept
+running, a peer that answers no probe for about 10 s cannot be told apart from a
+dead one, and it is fenced as a dead host would be. That is the case fencing exists
+for: the peer may come back with its workloads still running. Pausing an entire
+cluster at once and resuming it does not fence anything, with or without the
+guard. Rows written before the pause are stale against the resumed clocks, and
+no failure is counted for time that merely passed. What the guard adds is that
+failure debt from before the pause, together with a probe caught by the pause,
+cannot add up to a quorum.
+
 Clock skew between hosts is also monitored — warnings are logged if skew exceeds 1 second.
 
 ### VM health
@@ -140,12 +194,14 @@ VMs with a `healthcheck` defined in their compose spec are periodically checked:
 
 **Correlated failure detection:** If 3+ VMs fail health checks simultaneously, litevirt suppresses automatic restarts (likely a shared dependency failure, not individual VM issues).
 
+**The verdict is cluster state.** The owning host publishes each VM's verdict — `healthy`, `unhealthy` or `unknown` — whenever it changes, bound to the VM's current incarnation. That is what compose `vm_healthy` waits for, what `lv inspect` shows, and what `lv health` lists as `vm_probe_failing` (info severity). When the owner goes down nobody is left to retract a pass, so readers treat any verdict from an `offline`, `fenced` or `maintenance` owner as `unknown`; after failover the VM is a new incarnation on its new host and needs a fresh pass there. The action (`restart` / `migrate` / `alert`) is unchanged, and still waits out the first 5 minutes after a VM is created. See [Diagnostics](diagnostics.md#vm-probe-failing-vm_probe_failing).
+
 ## Automatic failover
 
 When a host goes offline, the failover coordinator:
 
-1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1)
-2. **Acquires leader lease** — only one host coordinates failover (45s TTL lease; a fence needs 30s of it still to run before it may begin)
+1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1). Only fresh observations count: a `host_health` row older than 30s, or dated more than 30s ahead of the coordinator's own clock (a skewed observer), is not evidence
+2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery".
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
 4. **Reschedules VMs** — based on each VM's `on-host-failure` policy
 
@@ -154,10 +210,10 @@ When a host goes offline, the failover coordinator:
 | Method | How it works |
 |--------|-------------|
 | `ipmi` | Power cycle via IPMI/BMC (requires `ipmi_address`, `ipmi_user`, `ipmi_pass` on host). Verified post-fence by polling `chassis power status`. |
-| `ssh` | `systemctl poweroff` over SSH; reports failure if unreachable. |
+| `ssh` | Forced, immediate power-off over SSH: `systemctl poweroff --force --force`, falling back to `echo o > /proc/sysrq-trigger`. Not a graceful shutdown — no units are stopped, so `libvirt-guests` does not get to shut guests down cleanly first; the host stops now, as if its power were pulled. The session dies with the host, and that is reported as success only when the remote shell had already confirmed it was issuing the power-off. Reports failure if the host is unreachable or both power-off commands fail. |
 | `watchdog` | Local watchdog self-fence (the host writes its own watchdog timer dead). Requires `watchdog_dev` in config. When `watchdog_dev` is set the daemon validates the device at startup and refuses to start if it's absent, so a broken watchdog is caught before it's needed rather than at fence time (override: `LITEVIRT_UNSAFE_SKIP_WATCHDOG_CHECK=1`). On a graceful daemon shutdown the watchdog is disarmed only when this host owns no running VMs or containers; while it owns any, the device stays armed — a restarting daemon resumes petting well inside the timeout, and a daemon stopped for good with workloads left behind lets the watchdog reboot the host into a safely fenced state. Drain (or `lv host shutdown-workloads`) before planned maintenance. |
 | `manual` | Coordinator does NOT auto-reschedule; operator must run `lv host fence-confirm <host>` after physically powering it off. Required when shared storage would corrupt under split-brain. |
-| `best-effort` | Tries SSH; succeeds regardless. Used in homelabs / single-tenant clusters that explicitly opt out of split-brain protection. |
+| `best-effort` | Tries the same forced SSH power-off as `ssh`; succeeds regardless. Used in homelabs / single-tenant clusters that explicitly opt out of split-brain protection. |
 
 Configure per-host:
 
@@ -221,9 +277,83 @@ enabled the flag. The executor re-verifies as defense-in-depth.
 
 This is **host-fence-gated shared storage, not storage-level exclusivity** — litevirt
 does not (yet) take storage-side locks (RBD blocklist, iSCSI PR keys). It is a
-config kill-switch (`enforcement.shared_storage_fence`, default off) plus the
-capability latch, so a deploy is behavior-neutral until enabled fleet-uniformly, and
-disabling the flag restores the legacy behavior.
+config kill-switch (`enforcement.shared_storage_fence`) plus the capability latch, so
+an UPGRADE is behavior-neutral until the flag is enabled fleet-uniformly, and disabling
+it turns the fence gate off. The flag is false when absent — but a cluster created
+with `lv host init` starts with it on, because there is no prior behavior to preserve
+and the unguarded outcome is two hosts writing one disk. Hosts joining an existing
+cluster inherit that cluster's setting, never this default.
+
+**Requiring a verified fence, per host.** By default a successful SSH fence is
+enough for the coordinator that ran it to reschedule the host's local-disk VMs.
+An SSH success only means a shell accepted a forced power-off; nothing checks the
+host went down. To refuse that on a particular host:
+
+```bash
+lv host label set <host> litevirt.fence_requires_confirmation=true
+```
+
+With the label, a fence that did not **verify** the power-off — `ssh`, and
+`best-effort` in both its forms — does not reschedule anything and does not
+record the host as `fenced`; it is left `offline`. An IPMI fence, which does
+verify, is unaffected. The fence's assurance is shown by `lv doctor fence` and
+`lv host fence` (see [Diagnostics](diagnostics.md)).
+
+It is a label rather than a config flag because only one place acts on it — the
+coordinator creating the recovery — so no peer needs to honour it, and a
+coordinator on an older binary ignores it and acts as if it were absent. Roll
+the binary out before relying on it.
+
+**Getting past the refusal.** Confirm the host is powered off, then run
+`lv host fence-confirm <host>`. The coordinator resumes the recovery on its next
+cycle — see [Resuming a recovery from a confirmation](#resuming-a-recovery-from-a-confirmation).
+
+### Resuming a recovery from a confirmation
+
+A recovery refused for want of a confirmation — a `manual` fence, a
+`best-effort` fence under the safe-fence policy, or a host labelled
+`litevirt.fence_requires_confirmation` — resumes once an operator runs
+`lv host fence-confirm <host>`.
+
+The resume requires three things, not the confirmation alone:
+
+1. **The cluster itself fenced the host** — a `fencing_log` row with result
+   `fenced` or `partial`, which only a fence that ran writes.
+2. **The confirmation is newer than that fence**, so it attests to this outage
+   and not an earlier one.
+3. **The host is still down now** — a fresh quorum observes it failing. A host
+   that has come back, or that an operator has put into `maintenance`, is never
+   resumed.
+
+`fence-confirm` has no precondition and runs no fence, so on its own a mistyped
+hostname could otherwise authorise a recovery. With all three required, a
+mistype can only reach a host the cluster already fenced and still sees down.
+
+**Confirm after the fence, not before.** A confirmation written before the
+coordinator has fenced the host is not newer than any fence, so it resumes
+nothing — and while it is under 5 minutes old it also makes the coordinator
+treat the host as already fenced. Wait for the refusal in the coordinator log,
+then confirm.
+
+**The failover leader resumes it.** Every coordinator reads the same
+`fencing_log`, but only the one holding the failover lease acts on it. The check
+is the same one fencing uses, run once per cycle and again for each host before
+anything is decided. A coordinator that is not the leader does nothing and does
+not spend the confirmation. If the leader that refused the recovery dies before
+the confirmation arrives, the coordinator that takes over the lease finds the
+confirmation in `fencing_log` and resumes the recovery. The lease is best-effort,
+not exclusive (see
+[Leader-gated recovery](operating-model.md#ha--failover)). If two
+coordinators each believe they hold it, both can resume, just as both can fence.
+
+The resume also takes the decision gate, like every other ownership decision: a
+coordinator without quorum refuses, and does not spend the confirmation, so the
+resume happens once quorum returns. One confirmation resumes one recovery. It is
+counted as `phase=recovery, error_class=confirmation_resumed`. A shared-disk VM
+still needs a proof-grade fence reference, which a confirmation under 5 minutes
+old provides; a resume long after the confirmation (a daemon restart hours
+later) moves local-disk VMs and refuses shared-disk ones, which is the safe
+direction.
 
 **Per-host implication:** a host whose fence strategy is `best-effort`/`ssh`/`manual`
 (anything but `ipmi`) gives its shared-disk VMs *manual-confirm-only* automated
@@ -333,7 +463,7 @@ back now": a fast, safe, operator-driven override — no weaker cluster-wide pol
 container to another host by reusing the backup→restore transport (stop →
 archive → restore on target → restart if it was running). The source archives
 into `--repo` locally and **streams the manifest to the target over peer mTLS**
-(into a per-transfer staging repo), so `--repo` no longer needs to be reachable
+(into a per-transfer staging repo), so `--repo` does not need to be reachable
 from both hosts. If the target predates peer streaming it falls back to
 re-opening `--repo` by name, which then must be shared. No live/CRIU migration.
 
@@ -376,7 +506,7 @@ Scrape `http://<host>:7444/metrics` for:
   `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`, `recovery_resumed`). A skip is `result=skipped` with the reason in `error_class`
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`, `local_stall`). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
@@ -391,6 +521,7 @@ Scrape `http://<host>:7444/metrics` for:
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across recently-acked peers; a value that stops advancing means some peer has stopped acknowledging. It is not the compaction floor: the prune additionally skips peers whose pushes are currently failing, so it can reclaim past a seq this gauge still sits on
 - `litevirt_mutation_log_rows` — total rows in `mutation_log`; coupled with the watermark above this gives backlog visibility
 - `litevirt_replication_pending_entries` — `mutation_log` entries written but not yet acknowledged by the slowest **live** peer (`MAX(seq) − MIN(live last_seq)`); reads `0` when there are no live peers. A sustained climb means one peer is falling behind even though replication itself is healthy
+- `litevirt_replication_backlog_age_seconds` — how long the oldest entry the slowest **live** peer has not acknowledged has been waiting on this node; `0` when caught up or when there are no live peers. **The one to alert on.** `pending_entries` measures volume, which is the wrong quantity for a threshold — a thousand entries a second behind is healthy, three entries an hour behind is a peer that has stopped acknowledging. The age is measured on this hop: a relay's forwarded entries are stamped when they land in the relay's log
 - `litevirt_replication_peer_pending_entries` — per-peer backlog (`MAX(seq) − peer last_seq`), one series per live peer; a single series climbing while the others stay flat pinpoints the lagging peer. The daemon also logs a warning when a peer stays maxed-out for several rounds
 
 ### Event stream

@@ -315,10 +315,12 @@ type collector struct {
 	leaderHolder       *prometheus.Desc // who holds the failover lease
 	leaseTerm          *prometheus.Desc // highest lease incarnation per lease key
 	fenceFailures      *prometheus.Desc // count of fencing_log rows with non-success result
+	fencesByAssurance  *prometheus.Desc // fencing_log rows by method and what they establish
 	hlcRejected        *prometheus.Desc // remote HLC timestamps rejected for skew
 	mutationLogSize    *prometheus.Desc // mutation_log row count (replication backlog)
 	replicationMinSeq  *prometheus.Desc // MIN(last_seq) across replication_watermarks
 	replicationPending *prometheus.Desc // entries ahead of the slowest LIVE peer
+	replicationAge     *prometheus.Desc // seconds the oldest un-acked entry has waited
 	replicationPeerLag *prometheus.Desc // per-peer backlog: MAX(seq) - peer last_seq
 
 	// NetBox IPAM gauges. Both are CURRENT state, which the NetBox counters
@@ -373,7 +375,7 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			[]string{"container", "state"}, nil,
 		),
 		ctCPULimit: prometheus.NewDesc(
-			"litevirt_container_cpu_limit", "Container CPU-shares limit (0=unlimited)",
+			"litevirt_container_cpu_limit", "Container CPU limit in cores (0=unlimited)",
 			[]string{"container"}, nil,
 		),
 		ctMemLimit: prometheus.NewDesc(
@@ -461,6 +463,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 			"Cumulative count of fencing_log rows with result != 'fenced' or 'manual-confirmed'",
 			nil, prometheus.Labels{"host": hostName},
 		),
+		fencesByAssurance: prometheus.NewDesc(
+			"litevirt_fences_total",
+			"Cumulative fencing_log rows by method and assurance",
+			[]string{"method", "assurance"}, prometheus.Labels{"host": hostName},
+		),
 		hlcRejected: prometheus.NewDesc(
 			"litevirt_hlc_rejected_total",
 			"Cumulative count of remote HLC timestamps rejected for exceeding MaxSkewMS",
@@ -479,6 +486,11 @@ func newCollector(db *corrosion.Client, virt *libvirt.Client, ctStat containerSt
 		replicationPending: prometheus.NewDesc(
 			"litevirt_replication_pending_entries",
 			"mutation_log entries written but not yet acked by the slowest LIVE peer (MAX(seq) - MIN(live last_seq)); 0 when there are no live peers",
+			nil, prometheus.Labels{"host": hostName},
+		),
+		replicationAge: prometheus.NewDesc(
+			"litevirt_replication_backlog_age_seconds",
+			"Seconds the oldest mutation_log entry not yet acked by the slowest LIVE peer has been waiting on this node; 0 when caught up or when there are no live peers",
 			nil, prometheus.Labels{"host": hostName},
 		),
 		replicationPeerLag: prometheus.NewDesc(
@@ -545,10 +557,12 @@ func (c *collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.leaderHolder
 	ch <- c.leaseTerm
 	ch <- c.fenceFailures
+	ch <- c.fencesByAssurance
 	ch <- c.hlcRejected
 	ch <- c.mutationLogSize
 	ch <- c.replicationMinSeq
 	ch <- c.replicationPending
+	ch <- c.replicationAge
 	ch <- c.replicationPeerLag
 	ch <- c.netboxSyncQueueDepth
 	ch <- c.netboxBindingsSuspended
@@ -674,14 +688,13 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// Failover-leader lease holder. expires_at is RFC3339, so compare against an
 	// RFC3339 cutoff, not datetime('now') (whose space text mis-sorts a same-day
 	// lease and would always report it valid).
+	// IsLeaseHolder also consults the term ledger, so a claimant that stood down
+	// from a contested term stops reporting itself leader at once instead of
+	// when its own row expires.
 	leaderVal := 0.0
-	if leaderRows, lerr := c.db.Query(ctx,
-		`SELECT holder FROM leader_election
-		 WHERE key = 'failover' AND expires_at >= ?`,
-		time.Now().UTC().Format(time.RFC3339)); lerr == nil {
-		if len(leaderRows) > 0 && leaderRows[0].String("holder") == c.hostName {
-			leaderVal = 1.0
-		}
+	if held, lerr := corrosion.IsLeaseHolder(ctx, c.db, corrosion.LeaseKeyFailover,
+		c.hostName, time.Now()); lerr == nil && held {
+		leaderVal = 1.0
 	}
 	ch <- prometheus.MustNewConstMetric(c.leaderHolder, prometheus.GaugeValue, leaderVal)
 
@@ -711,6 +724,25 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		 WHERE result NOT IN ('fenced', 'manual-confirmed')`); ferr == nil && len(rows) > 0 {
 		ch <- prometheus.MustNewConstMetric(c.fenceFailures,
 			prometheus.CounterValue, float64(rows[0].Int("cnt")))
+	}
+
+	// Fences by what they ESTABLISH. fencing_log.result writes "fenced" for an
+	// IPMI power-off that was observed off and for an SSH poweroff nobody
+	// checked, and the only other fence metric counts failures — so an
+	// unverified success was invisible. Grouped by the stored (method, result)
+	// pair and classified here with corrosion.FenceAssurance, the same function
+	// the shared-storage gate uses, so this and the gate cannot disagree.
+	if rows, ferr := c.db.Query(ctx,
+		`SELECT method, result, COUNT(*) AS cnt FROM fencing_log GROUP BY method, result`); ferr == nil {
+		byLabel := map[[2]string]int{}
+		for _, r := range rows {
+			method := r.String("method")
+			byLabel[[2]string{method, corrosion.FenceAssurance(method, r.String("result"))}] += r.Int("cnt")
+		}
+		for k, n := range byLabel {
+			ch <- prometheus.MustNewConstMetric(c.fencesByAssurance,
+				prometheus.CounterValue, float64(n), k[0], k[1])
+		}
 	}
 
 	// HLC rejected timestamps. Surfaced via Clock.Rejected().
@@ -768,6 +800,35 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 		}
 	}
 	ch <- prometheus.MustNewConstMetric(c.replicationPending, prometheus.GaugeValue, pending)
+
+	// Backlog AGE: how long the oldest entry the slowest live peer has not
+	// acknowledged has been waiting on this node. pending_entries says how
+	// much is queued, which is the wrong quantity to alert on — a thousand
+	// entries a second behind is healthy, three entries an hour behind is a
+	// peer that has stopped acknowledging. Age is the one an operator can put
+	// a threshold on.
+	//
+	// created_at is stamped when the entry lands in THIS node's log, including
+	// for a relay's forwarded entries, so this is the wait on this hop, not end
+	// to end. MIN(created_at) rather than the lowest seq: in production the two
+	// agree, and created_at is the quantity being reported. The column is
+	// written as RFC3339 UTC everywhere, so the string MIN is chronological.
+	// Zero with no live peer, for the reason pending_entries is: nobody to be
+	// behind.
+	age := 0.0
+	if wm, werr := c.db.Query(ctx,
+		`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
+		 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff); werr == nil && len(wm) > 0 && wm[0].Int("live") > 0 {
+		if ol, oerr := c.db.Query(ctx,
+			`SELECT MIN(created_at) AS oldest FROM mutation_log WHERE seq > ?`, wm[0].Int("minseq")); oerr == nil && len(ol) > 0 {
+			if ts, perr := time.Parse(time.RFC3339, ol[0].String("oldest")); perr == nil {
+				if d := time.Since(ts).Seconds(); d > 0 {
+					age = d
+				}
+			}
+		}
+	}
+	ch <- prometheus.MustNewConstMetric(c.replicationAge, prometheus.GaugeValue, age)
 
 	// Per-peer replication backlog: how far each LIVE peer is behind the local
 	// mutation_log tail. Restricted to watermarks updated within

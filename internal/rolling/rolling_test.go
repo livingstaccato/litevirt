@@ -3,6 +3,7 @@ package rolling
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,19 +15,22 @@ import (
 
 // mockOps records calls for assertion and can inject per-VM failures.
 type mockOps struct {
-	mu        sync.Mutex
-	recreated []string
-	stopped   []string
-	started   []string
-	created   []string // -next VMs via CreateNextVM
-	deleted   []string
-	resized   []string
-	metadata  map[string][]string
+	mu           sync.Mutex
+	recreated    []string
+	stopped      []string
+	started      []string
+	created      []string // -next VMs via CreateNextVM
+	deleted      []string
+	resized      []string
+	reconfigured []string
+	metadata     map[string][]string
 
 	failRecreateOn   string
 	failResizeOn     string
 	failHealthOn     string
 	failCreateNextOn string
+	failDeleteOn     string
+	failStopOn       string
 	onRecreate       func()
 }
 
@@ -39,6 +43,12 @@ func (m *mockOps) RecreateVM(_ context.Context, name string, _ *pb.VMSpec) error
 	}
 	m.mu.Lock()
 	m.recreated = append(m.recreated, name)
+	m.mu.Unlock()
+	return nil
+}
+func (m *mockOps) ReconfigureVM(_ context.Context, name string, _ *pb.VMSpec, _ compose.ChangePlan) error {
+	m.mu.Lock()
+	m.reconfigured = append(m.reconfigured, name)
 	m.mu.Unlock()
 	return nil
 }
@@ -70,12 +80,18 @@ func (m *mockOps) CreateNextVM(_ context.Context, name string, _ *pb.VMSpec) err
 	return nil
 }
 func (m *mockOps) DeleteVM(_ context.Context, name string) error {
+	if m.failDeleteOn == name {
+		return fmt.Errorf("simulated delete failure for %s", name)
+	}
 	m.mu.Lock()
 	m.deleted = append(m.deleted, name)
 	m.mu.Unlock()
 	return nil
 }
 func (m *mockOps) StopVM(_ context.Context, name string) error {
+	if m.failStopOn == name {
+		return fmt.Errorf("simulated stop failure for %s", name)
+	}
 	m.mu.Lock()
 	m.stopped = append(m.stopped, name)
 	m.mu.Unlock()
@@ -328,6 +344,31 @@ func TestOrdered_MaxUnavailableBatching(t *testing.T) {
 	}
 }
 
+// start-first stopped the VM before recreating it and threw the stop's error
+// away, so a VM that would not stop was recreated over while still running.
+// A failed stop aborts the update for that VM like a failed start or health
+// check does, and is reported against it.
+func TestOrdered_StartFirstAFailedStopAborts(t *testing.T) {
+	ops := &mockOps{failStopOn: "web-1"}
+	fn, got := collect()
+	err := Run(context.Background(), ops, "s", []VMAction{act("web-1", "start-first", recreatePlan())}, fn)
+	if err == nil || !strings.Contains(err.Error(), "stop web-1") {
+		t.Fatalf("Run = %v, want an abort naming the failed stop of web-1", err)
+	}
+	if len(ops.recreated) != 0 {
+		t.Fatalf("web-1 was recreated after its stop failed: %v", ops.recreated)
+	}
+	var reported bool
+	for _, p := range *got {
+		if p.VMName == "web-1" && p.Phase == "error" && p.Err != nil {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Fatalf("no error progress for web-1: %+v", *got)
+	}
+}
+
 func TestOrdered_StartFirst(t *testing.T) {
 	ops := &mockOps{}
 	a := act("web-1", "start-first", recreatePlan())
@@ -437,6 +478,69 @@ func TestBlueGreen_FailureRollsBackGreens(t *testing.T) {
 	// The already-created green (web-1-green) is cleaned up; blue instances untouched.
 	if len(ops.deleted) != 1 || ops.deleted[0] != "web-1-green" {
 		t.Errorf("expected the created green rolled back, got deleted=%v", ops.deleted)
+	}
+}
+
+// A green that the rollback cannot remove is left behind; it must be reported,
+// not dropped with the rollback's discarded error.
+func TestBlueGreen_FailedGreenRollbackIsReported(t *testing.T) {
+	ops := &mockOps{failRecreateOn: "web-2-green", failDeleteOn: "web-1-green"}
+	fn, got := collect()
+	actions := []VMAction{
+		act("web-1", "blue-green", recreatePlan()),
+		act("web-2", "blue-green", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err == nil {
+		t.Fatal("blue-green failure must return an error")
+	}
+	for _, p := range *got {
+		if p.Phase == "error" && p.VMName == "web-1-green" && p.Err != nil {
+			return
+		}
+	}
+	t.Errorf("no error progress for web-1-green, which the rollback could not remove; got %+v", *got)
+}
+
+// After the greens are up, a blue that cannot be deleted is not a failed
+// cutover — the new side is serving — but the old VM is still there, so it must
+// be reported as a failure of that VM rather than as "cutover complete".
+func TestBlueGreen_FailedBlueDeleteIsReported(t *testing.T) {
+	ops := &mockOps{failDeleteOn: "web-1"}
+	fn, got := collect()
+	actions := []VMAction{
+		act("web-1", "blue-green", recreatePlan()),
+		act("web-2", "blue-green", recreatePlan()),
+	}
+	if err := Run(context.Background(), ops, "s", actions, fn); err != nil {
+		t.Fatalf("a failed blue delete after the greens are serving is not a failed cutover: %v", err)
+	}
+	var blueErr *Progress
+	for i, p := range *got {
+		if p.Phase == "error" && p.VMName == "web-1" {
+			blueErr = &(*got)[i]
+		}
+		if p.Phase == "done" && p.VMName == "web-1-green" && p.Detail == "cutover complete" {
+			t.Error("web-1 cutover reported complete although its blue instance was not removed")
+		}
+	}
+	if blueErr == nil {
+		t.Fatalf("no error progress for the blue instance that was not removed; got %+v", *got)
+	}
+	if blueErr.Err == nil {
+		t.Error("the blue-delete error progress carries no Err, so a caller cannot count it as a failure")
+	}
+	// The other VM's cutover still completes.
+	if len(ops.deleted) != 1 || ops.deleted[0] != "web-2" {
+		t.Errorf("expected web-2's blue deleted, got %v", ops.deleted)
+	}
+	sawWeb2 := false
+	for _, p := range *got {
+		if p.Phase == "done" && p.VMName == "web-2-green" && p.Detail == "cutover complete" {
+			sawWeb2 = true
+		}
+	}
+	if !sawWeb2 {
+		t.Error("web-2's cutover was not reported complete")
 	}
 }
 

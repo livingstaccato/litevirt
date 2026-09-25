@@ -101,7 +101,7 @@ compares per-row metadata, and returns a classified report.
 | `missing_row` | Present on some nodes, absent on others. |
 | `tombstone_vs_live` | Tombstoned (soft-deleted) on some nodes, live on others. |
 | `terminal_vs_live` | A workload terminal (stopped/error) on some nodes, running on others. |
-| `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` no longer trips this. |
+| `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` does not trip this. |
 
 A divergence is reported **only when it persists across two samples** with
 unchanged per-node content hashes — an in-flight replication delta changes between
@@ -150,7 +150,7 @@ operation on the offending node:
    workload listing is unchanged and `lv doctor divergence` (and the cluster
    digest) have converged.
 
-> A pure column-order skew that previously mis-reported here classifies as
+> A pure column-order skew classifies as
 > row-content divergence when the positional (v1) digest is in force. The
 > order-invariant **digest_v2** (below) makes that skew hash identically across
 > nodes, preventing the recurrence entirely — enable it fleet-wide instead of
@@ -417,7 +417,7 @@ ids; a replicated legacy batch can lose LWW on its by-triple tombstone and its I
 back-pressures fail-closed against the peer's live row (safe — no corruption — but it stalls
 that sender's stream to the peer until the conflicting state is remediated and the blocked
 entry successfully retries; a later WAL entry cannot supersede an ordered entry stuck ahead
-of it). This is unchanged from before the canonical work; the reversible core below does not
+of it). The reversible core below does not
 resolve it.
 
 The one runtime behavior that ships is the **accept gate**: once `canonical_registry_v1` is
@@ -543,7 +543,7 @@ The guard has **two independent switches, and both must be on**:
 | Switch | Scope | Default |
 |---|---|---|
 | `shared_storage_fence_v1` | latches cluster-wide once every host advertises it | latches on upgrade |
-| `enforcement.shared_storage_fence` | per-host config | **false** |
+| `enforcement.shared_storage_fence` | per-host config | **false** when absent; `lv host init` writes **true** on a new cluster's first node |
 
 The gap this command exists to close: a host advertises the token **regardless
 of its own config flag**, because advertisement means "this binary supports the
@@ -581,6 +581,35 @@ perform the fence and its flag will never be on; counting it would pin the
 warning on permanently.
 
 Exit code: `0` when no shared-disk VM is exposed · `1` when one or more are.
+
+### What a fence established
+
+`lv doctor fence` also lists the fences of the last 7 days (newest 20), each
+with an **assurance** — what that fence actually establishes about the host.
+The stored `fencing_log.result` cannot make this distinction: it says `fenced`
+both for an IPMI power-off that was observed off and for an SSH poweroff nobody
+checked.
+
+| Assurance | Produced by | Means |
+|---|---|---|
+| `verified` | `ipmi` + `fenced` | Powered off, then observed off. |
+| `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
+| `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a forced power-off, or its watchdog heartbeat was stopped. Nothing checked it went down. |
+| `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |
+| `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
+| `failed` | any + `partial` | The fence ran and reported failure. |
+
+Only `verified` and `operator-confirmed` satisfy the shared-storage fence
+(`corrosion.FenceProofGrade` is defined in terms of this table). A `requested` or
+`assumed` fence still lets the coordinator that ran it reschedule **local-disk**
+VMs, which is why the command prints a note when it finds one. A later
+coordinator never resumes a recovery from one — resuming needs a proof-grade
+fence. `lv host fence` prints the same assurance for the fence it just ran.
+
+`litevirt_fences_total{method,assurance}` counts the same classification. Note
+that the older `litevirt_fence_failures_total` counts every result other than
+`fenced` and `manual-confirmed`, so a manual fence **awaiting confirmation**
+shows there as a failure; read `litevirt_fences_total` for the distinction.
 
 ### What it does not establish
 
@@ -900,6 +929,21 @@ observed → confirmed → resolved lifecycle:
 - resolution needs **two consecutive clean scans with complete coverage** by
   the detector lease holder under a valid decision gate — an unreachable,
   partial, or older-binary peer blocks resolution (blind is not clean);
+- coverage is judged **per condition**, against the hosts that could hold the
+  condition's subject. A `coverage_gap` or `lww_unresolved` on host H needs
+  only H completely probed. A VM condition (`vm_dual_run`,
+  `runtime_owner_mismatch`, `owner_epoch_mismatch`) is not held open by an
+  unreachable host whose last liveness evidence in `host_health` (rows it
+  wrote, or rows a peer wrote after it answered) is more than 5 minutes older
+  than the VM's `created_at` — a host dead since before the VM existed cannot
+  be running a copy of it. That host is still probed, keeps its own
+  `coverage_gap`, and the evaluator still reports `partial`. The exemption
+  never applies to the VM's DB owner, a host the condition names as involved,
+  or a host that answered partially or from an older binary, and it fails
+  closed on missing or unparseable evidence, a post-dated `created_at`, or a
+  failed DB read. Container and VIP conditions keep the cluster-wide rule
+  (names are not unique; a VIP has no creation stamp), so a registered host
+  that is permanently gone still freezes those until `lv host rm`;
 - leadership changes and restarts preserve counts and confirmed state;
 - resolved conditions stay readable for 30 days (`lv health --resolved`),
   then are tombstoned;
@@ -943,6 +987,171 @@ fleet runtime coverage, a current-epoch authoritative holder, a strictly older
 conflicting holder, no in-flight migration/operation/lock/failover, and quorum
 or explicit fencing authorization. The evidence and decision must be durable
 before any stop is issued.
+
+### Deferred out-of-band stop sync after a restart or rejoin
+
+When a VM's domain is found shut off out of band (a crash, an external
+`virsh destroy`, a fence that powered the host off), the owning host's
+reconciler syncs the cluster record to `stopped`. That write is decided from
+the host's own replica and replicated to every peer, so it waits until that
+replica is known to be current: the host must have completed an anti-entropy
+exchange with at least one peer — digests compared equal, or the peer's state
+merged without error — since the daemon started and since the host last lost
+sight of every gossip peer. Until then the sync is deferred and retried every
+pass, and the journal says so once per VM:
+
+```
+reconciler: VM looks stopped out-of-band, but deferring the cluster state sync (retries each pass) vm=ha1 cause="replica not caught up" ...
+replica caught up: anti-entropy exchange with a peer completed; decisions published from the local replica may proceed peer=node-1
+```
+
+The reason is a host that comes back after a fence: its replica can still name
+it the owner of a VM that was rescheduled and is running elsewhere, and an
+unguarded sync would replicate `stopped` over the real owner's row (the VM
+lists as stopped while it runs; the owner's health sweep flips it back each
+time). This guard is on in every configuration; with `enforcement.owner_epoch`
+enabled and latched the write is additionally epoch-conditioned. Expect the
+deferral to last up to one anti-entropy interval (`anti_entropy_interval_sec`,
+60 s by default) after a restart. A single-node cluster — no other host in the
+hosts table — is not gated. The same sync is also withheld, on a current
+replica, while the VM has an active ownership condition (`vm_dual_run`,
+`runtime_owner_mismatch`, `owner_epoch_mismatch`), matching the self-heal
+restart.
+
+A host that stays `replica not caught up` is not completing anti-entropy with
+anyone: check that it sees gossip peers and can reach them over gRPC.
+
+### Gossip isolation (`gossip_isolated`)
+
+A node that has lost every gossip peer, and whose re-join attempts reach none
+of its seeds or admitted hosts, raises a `gossip_isolated` condition about
+**itself**. The subject is the host, keyed on the node's own name, so each row
+has exactly one writer. No leader could raise this one: a leader cannot see
+another node's gossip view, and an isolated node cannot reach the leader.
+
+| Raised when | Clears when |
+|---|---|
+| A re-join pass (every 30–45 s) finds no visible peers **and** fails to join any target. Observed on the first such pass, confirmed on the second. The evidence carries the last join error. **Warning** severity: an isolated node is how a workload can end up running in two places — its peers may fence it and restart its VMs — but the isolation is the precondition, not the corruption. | The first pass that sees a peer, or that re-joins successfully. No run of clean passes is needed: visible peers are positive evidence of membership, not an absence of evidence of isolation. A condition left open by a previous daemon process is resolved too. |
+
+**Where you can see it.** Run `lv health` on the isolated node itself — it
+reads its own local store and shows the condition immediately. Its peers see
+the row only after replication resumes, by which point it is normally resolved;
+`lv health --resolved` then shows the episode with its `first_seen` and
+`resolved_at`. From the peers' side, the live signal while the node is isolated
+is its connectivity edges going `suspect`.
+
+A single-node cluster with no seeds is never reported: it has nobody to be
+isolated from.
+
+### Observer stalled (`observer_stalled`)
+
+A node that was itself not running — its VM suspended, swapped out, or starved
+of CPU — raises `observer_stalled` about **itself**, with one writer per row like
+`gossip_isolated`. While it is open, the node counts no failed probe against a
+peer and its failover coordinator decides no fence: probes that timed out while
+it was not running say nothing about the peer. It is not an ownership condition
+and never blocks admission.
+
+| Raised when | Clears when |
+|---|---|
+| The health checker's heartbeat (every 250 ms) sees a gap longer than one probe interval (2 s), on either the monotonic or the wall clock. Confirmed at once: it is a measurement of the node's own scheduling, not an inference from a scan. **Warning** severity. The evidence carries `gap_seconds` and `grace_until`. A further stall inside the window extends the same episode, and `gap_seconds` keeps its longest pause: a long pause is often followed by a short one as the node catches up. | The grace window closes: 5 probe intervals (10 s) after the stall, the time a normal fence verdict takes to build. A condition left open by a previous daemon process is resolved on start. |
+
+**What you see.** A host that died while its observers were stalled is fenced
+up to one grace window later than usual. `lv doctor fence` lists the stalled
+nodes under `stalled observers (fence votes withheld)` with the pause length
+and the time the window closes. A forward NTP step larger than 2 s also reads
+as a stall; it delays a fence by one window and never causes one.
+
+**If it keeps reappearing,** the node is being starved: an overcommitted host, a
+VM swapping, or a laptop running the lab alongside heavy builds. A node that
+stalls repeatedly keeps withholding its vote, which is safe but slows failover.
+
+### VM probe failing (`vm_probe_failing`)
+
+A VM's compose `healthcheck` is probed by the host that owns the VM, and that
+host keeps one `vm_probe_failing` row per VM (evaluator `vm_probe`, subject
+`vm/<name>`) with its current verdict in the evidence: `verdict` (`healthy`,
+`unhealthy` or `unknown`), the probe's last failure `reason`,
+`consecutive_failures`, and the `incarnation` it was observed on (owner host,
+owner epoch, `created_at` and the VM row's `updated_at`). The row is **open**
+(confirmed) while the probe is failing and **resolved** otherwise, so `lv health`
+lists failing VMs and `lv health --resolved` lists every probed VM. This row is
+what the compose `depends-on: { condition: vm_healthy }` wait and the rolling
+update's `health-wait` read — see [Compose](compose.md#health-checks).
+
+It is **info** severity and not an ownership condition: a failing application
+probe is the workload's state, not the cluster's, so it neither degrades the
+overall health state nor refuses admission.
+
+| Raised when | Clears when |
+|---|---|
+| `retries` consecutive probes fail (default 3) on the VM's current incarnation. Written once, on the transition — not once per probe. | One probe passes (verdict `healthy`); the VM stops or loses its healthcheck (verdict `unknown`); the probe can no longer be run — no address is known for the VM, or its target cannot be interpreted (verdict `unknown`, with the reason); or the VM is deleted or moves to another host — the host that raised it resolves it, and the new owner publishes its own verdict after its first probe. |
+
+**Reading it.** A verdict whose `incarnation` no longer matches the VM — the VM
+was restarted, recreated or migrated since — counts as `unknown`, never as a
+pass, and so does any verdict while the owner host is `offline`, `fenced` or in
+`maintenance`. `lv inspect <vm>` shows the verdict as it is read that way
+(`health` / `healthDetail`), which is the quickest way to see why a
+`vm_healthy` wait is still waiting.
+
+### Runtime owner mismatch (`runtime_owner_mismatch`)
+
+The dual-run detector raises `runtime_owner_mismatch` about a **VM** when the
+host its database row names as owner is not the host actually running it:
+exactly one host runs the VM, and it is a different host. The involved hosts
+are the DB owner and the host running the VM. It is a corruption-class code.
+While it is active it blocks admission onto both hosts and runtime-changing
+actions on the VM, and automated recovery (self-heal restart, owner-assert)
+refuses to act on that VM.
+
+| Raised when | Clears when |
+|---|---|
+| A detector scan finds exactly one host running the VM, that host is not the DB owner, **and** the DB owner was fully probed and reported the VM not running. A VM whose owner could not be probed is left to `coverage_gap` instead, and a VM mid-migration is skipped. Observed on the first such scan, confirmed (critical) on the second. | Two consecutive clean scans with complete coverage: the owner in the row and the host running the VM agree again. |
+
+**The common benign cause is a host coming back after a fence.** While the
+host was down its VMs were rescheduled, and the database moved their rows to
+the survivors. The evaluator reads its own replica, so a node whose replica is
+still catching up right after it rejoins can briefly see the old owner in the
+row while a survivor is running the VM. That clears on its own once
+replication delivers the move, two scans later.
+
+**The returning host also keeps a leftover libvirt domain** for every VM that
+was moved away. The fence cut the power, so `virsh domstate --reason <vm>`
+there prints `shut off (unknown)`: libvirt does not keep the shutoff reason
+across a power loss. A shut-off domain is not running, so it does not raise
+this condition by itself. The reconciler on that host removes it (destroy and
+undefine, NVRAM included; disks are kept) once it has proof that the domain is
+a leftover. A shutoff reason of `guest-shutdown`, `destroyed`, `daemon` or
+`failed` counts as proof on its own. Reason `unknown` needs two more checks:
+the domain has **no managed-save image**, and the DB owner, asked for its own
+libvirt view, reports the VM **running**. Until then it logs every tick:
+
+```
+reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair
+```
+
+The `unproven` field on that line says which check failed. The usual one is
+that the owner has not started the VM yet or cannot be reached. Any other
+reason (`paused`, `pmsuspended`, `saved`, `crashed`, `migrated`,
+`from-snapshot`, `shutting-down`) is never removed automatically, because the
+domain may still hold state that can be resumed.
+
+**If the condition persists** past a few scans:
+
+1. Run `lv health` to see the condition and its two hosts, then
+   `lv doctor divergence` to check whether the replicas disagree about the VM's
+   row. Save the output before you change anything.
+2. Check on each host which one is really running the VM
+   (`virsh domstate --reason <vm>`).
+3. If the host running it is the right owner, run
+   `lv doctor repair-owner <vm> <host>`. It writes the row only if `<host>`
+   confirms it is running the VM, and it never touches the domain itself.
+4. If a host keeps a leftover domain that the reconciler will not remove,
+   check the `unproven` field first. Remove it by hand only after confirming
+   that another host is running the VM, and that the leftover has no
+   managed-save image (`virsh dominfo <vm>` reports `Managed save: no`). Then
+   run `virsh undefine --nvram <vm>` on that host. Use `--keep-nvram` instead
+   if you want to keep the firmware variables.
 
 ## NetBox IPAM: metrics and health findings
 

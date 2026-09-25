@@ -225,10 +225,9 @@ func (p CapacityPolicy) MemChargeFor(guestMiB int) int {
 // the vms table alone, so a host packed with containers still reported 100% of
 // its memory free and VMs were admitted onto memory containers already held.
 //
-// MEMORY ONLY, deliberately. A container's cpu_limit is CPU *shares* — a
-// relative cgroup weight, not a reservation — so adding it to a vCPU total would
-// be meaningless arithmetic (a container with the conventional 1024 shares is not
-// 1024 vCPUs). Container CPU therefore stays uncounted rather than counted wrong.
+// MEMORY ONLY, deliberately. A container's cpu_limit is a CAP in cores — a
+// ceiling the cgroup enforces, not a reservation the container holds — so it is
+// not added to the host's vCPU total, just as a VM's hotplug ceiling is not.
 //
 // A container with memory_mib = 0 is UNCAPPED and contributes nothing here. That
 // is a real limitation, not an oversight: litevirt knows the cap, not the actual
@@ -259,9 +258,17 @@ func SumContainerMemoryByHost(ctx context.Context, c *Client) (map[string]int, e
 func ContainerMemoryByHost(cts []ContainerRecord) map[string]int {
 	out := make(map[string]int)
 	for _, ct := range cts {
-		if ct.State == "running" && ct.MemMiB > 0 {
+		if ContainerHoldsHostMemory(ct) {
 			out[ct.HostName] += ct.MemMiB
 		}
 	}
 	return out
+}
+
+// ContainerHoldsHostMemory is the in-memory counting rule for a container's
+// host charge: running and memory-capped, and then its memory limit only.
+// Placement's ContainerAllocation (what an update releases) uses the same rule,
+// so a container is released exactly as it was counted.
+func ContainerHoldsHostMemory(ct ContainerRecord) bool {
+	return ct.State == "running" && ct.MemMiB > 0
 }

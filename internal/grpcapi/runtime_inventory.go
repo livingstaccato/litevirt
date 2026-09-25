@@ -274,10 +274,10 @@ func (s *Server) collectRuntimeInventory(ctx context.Context) runtimeInventory {
 			} else {
 				w.CPU, w.MemoryMiB = cpu, mem.MiB
 				// Uncapped is per the dimension that matters. MEMORY is the only
-				// host-reservable container dimension (cpu_limit is cgroup shares,
+				// host-reservable container dimension (cpu_limit is a cap in cores,
 				// not a vCPU reservation — host capacity never counts it), so a
 				// container with no memory cap is unbounded in the dimension
-				// capacity accounting cares about, whatever its CPU shares say.
+				// capacity accounting cares about, whatever its CPU cap says.
 				// The old cpu==0 && mem==0 form classified a cpu-limited,
 				// memory-unlimited container as bounded: it was charged 0 MiB,
 				// left the observation Complete, and slid past the rogue gate —

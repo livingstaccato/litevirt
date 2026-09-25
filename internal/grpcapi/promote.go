@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -197,6 +198,18 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 	if err != nil {
 		return err
 	}
+	// Before any proof is persisted or any request relayed: a stale replica is
+	// refused at the point it is chosen, not after the destination has been
+	// told to expect it.
+	//
+	// Returned unwrapped rather than as a gRPC status: `automated` is only ever
+	// the in-process AutoPromoteReplica call, and a status would drop the
+	// errReplicaTooOld chain that says WHY recovery fell back to a reschedule.
+	if automated {
+		if err := checkAutoPromoteReplicaAge(replica, time.Now()); err != nil {
+			return err
+		}
+	}
 	// Bind the proof to the resolved executor (the replica-holding host) so it
 	// validates dest_host == self, then persist the durable row NOW (with the
 	// correct dest) — before relaying/executing — so the replicated row and the
@@ -277,6 +290,63 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 	}
 
 	return s.doPromoteLocal(ctx, req, vm, src, pool, replica, automated, send)
+}
+
+// errReplicaTooOld marks an automatic promotion refused because the newest
+// replica is older than autoPromoteMaxReplicaAge, or carries no timestamp this
+// code can read.
+var errReplicaTooOld = errors.New("newest replica is too old for automatic promotion")
+
+// autoPromoteMaxReplicaAge bounds how old a replica AUTOMATIC promotion will use.
+//
+// There was no bound at all. A schedule that had been failing for days left a
+// replica exactly as promotable as one from ten minutes ago, and failover would
+// replace a VM running on current data with a disk from last week and report a
+// recovery. The coordinator falls back to a plain reschedule on any promote
+// error, so a refusal here costs nothing that having no replica would not.
+//
+// 48 hours rather than something tighter because the bound has no knowledge of
+// the schedule's interval: a daily schedule's newest replica is legitimately up
+// to 24 hours old at the moment of failure, and one missed run should not by
+// itself turn automatic recovery off. A bound relative to the schedule belongs
+// with the per-replica recovery manifest (#258). Manual promotion is NOT
+// bounded — an operator who has looked at the age and chosen it anyway is
+// making a different decision.
+//
+// A var, not a const, only so tests can move it; nothing in production
+// reassigns it.
+var autoPromoteMaxReplicaAge = 48 * time.Hour
+
+// replicaTimestamp reads the UTC run time out of a replica filename, which the
+// replication runner writes as `<vm>-<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>`. The
+// VM and disk names may themselves contain dashes, so the stamp is taken from
+// the END of the name.
+func replicaTimestamp(name string) (time.Time, bool) {
+	const layout = "20060102-150405"
+	base := strings.TrimSuffix(strings.TrimSuffix(name, ".qcow2"), ".raw")
+	if len(base) < len(layout) {
+		return time.Time{}, false
+	}
+	ts, err := time.Parse(layout, base[len(base)-len(layout):])
+	if err != nil {
+		return time.Time{}, false
+	}
+	return ts, true
+}
+
+// checkAutoPromoteReplicaAge refuses a replica too old — or too unreadable —
+// for automatic promotion. Unreadable fails closed: a replica whose age cannot
+// be established cannot be shown to be within the bound.
+func checkAutoPromoteReplicaAge(replica string, now time.Time) error {
+	ts, ok := replicaTimestamp(replica)
+	if !ok {
+		return fmt.Errorf("%w: cannot read a timestamp from %q", errReplicaTooOld, replica)
+	}
+	if age := now.Sub(ts); age > autoPromoteMaxReplicaAge {
+		return fmt.Errorf("%w: %q is %s old (limit %s); promote it manually if it is still the best available",
+			errReplicaTooOld, replica, age.Round(time.Minute), autoPromoteMaxReplicaAge)
+	}
+	return nil
 }
 
 // replicationTargetForVM returns the (pool, host) of the VM's first vm-scoped

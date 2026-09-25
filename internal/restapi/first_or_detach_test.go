@@ -2,6 +2,9 @@ package restapi
 
 import (
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -61,5 +64,47 @@ func TestFirstOrDetach_DoesNotDropTheFirstMessageOnTimeout(t *testing.T) {
 	}
 	if _, err := rest(); !errors.Is(err, second) {
 		t.Fatalf("the second read returned %v, want the stream's own next result", err)
+	}
+}
+
+// TestAckFirstAndDetach_AcceptsASlowFirstFrame: the volume, backup and
+// cross-region handlers acknowledge through ackFirstAndDetach, so it has to
+// carry the same ack budget the migrate handler does. A first frame queued
+// behind a per-resource lock must be answered 202 inside the budget, not hold
+// the handler past the server's WriteTimeout — and the operation must still
+// be read to completion behind the answer.
+func TestAckFirstAndDetach_AcceptsASlowFirstFrame(t *testing.T) {
+	prev := ackTimeoutForTest
+	ackTimeoutForTest = 50 * time.Millisecond
+	t.Cleanup(func() { ackTimeoutForTest = prev })
+
+	drained := make(chan struct{})
+	calls := 0
+	recv := func() (proto.Message, error) {
+		calls++
+		if calls == 1 {
+			time.Sleep(200 * time.Millisecond)
+			return &emptypb.Empty{}, nil
+		}
+		close(drained)
+		return nil, io.EOF
+	}
+	canceled := make(chan struct{})
+	w := httptest.NewRecorder()
+	start := time.Now()
+	ackFirstAndDetach(w, "move volume", func() { close(canceled) }, recv)
+
+	if elapsed := time.Since(start); elapsed >= 200*time.Millisecond {
+		t.Fatalf("the handler waited %v for the first frame; it must answer within the ack budget", elapsed)
+	}
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202 Accepted for a first frame that missed the budget", w.Code)
+	}
+	for name, ch := range map[string]chan struct{}{"stream drained": drained, "context released": canceled} {
+		select {
+		case <-ch:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("detached reader: %s never happened", name)
+		}
 	}
 }

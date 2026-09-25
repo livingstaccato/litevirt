@@ -176,7 +176,7 @@ func BuildSnapshotFromUsage(hosts []corrosion.HostRecord, vms []corrosion.VMReco
 	for _, vm := range vms {
 		s.VMs[vm.Name] = vm
 		// Only count VMs that are or are about to consume resources.
-		if vm.State == "running" || vm.State == "creating" || vm.State == "starting" {
+		if countsAgainstHost(vm.State) {
 			s.CPUUsed[vm.HostName] += vm.CPUActual
 			s.MemUsed[vm.HostName] += vm.MemActual
 			s.VMCount[vm.HostName]++
@@ -185,6 +185,46 @@ func BuildSnapshotFromUsage(hosts []corrosion.HostRecord, vms []corrosion.VMReco
 		}
 	}
 	return s
+}
+
+// countsAgainstHost is the snapshot's counting rule: a VM holds host resources
+// while it runs or is about to.
+func countsAgainstHost(state string) bool {
+	return state == "running" || state == "creating" || state == "starting"
+}
+
+// releaseAllocation removes req.Replaces from the snapshot — the exact inverse
+// of how BuildSnapshotFromUsage (and CommitPlacement) counted it — so req is
+// evaluated as a replacement of that allocation rather than an addition to it.
+// It reports whether anything was released. VMHost is left alone: the workload
+// keeps anchoring other requests' (anti-)affinity while it is being replaced.
+func (s *ClusterSnapshot) releaseAllocation(req *Request) bool {
+	return s.adjustAllocation(req, -1)
+}
+
+// restoreAllocation undoes releaseAllocation for a request that was not placed:
+// the workload keeps what it held.
+func (s *ClusterSnapshot) restoreAllocation(req *Request) {
+	s.adjustAllocation(req, +1)
+}
+
+func (s *ClusterSnapshot) adjustAllocation(req *Request, sign int) bool {
+	r := req.Replaces
+	if r == nil || r.Host == "" {
+		return false
+	}
+	s.CPUUsed[r.Host] += sign * r.CPU
+	s.MemUsed[r.Host] += sign * r.MemMiB
+	if !r.VM {
+		return true
+	}
+	s.VMCount[r.Host] += sign
+	base := req.VMBaseName
+	if replicas := s.ReplicasByBase[base]; replicas != nil &&
+		(req.VMName == base || strings.HasPrefix(req.VMName, base+"-")) {
+		replicas[r.Host] += sign
+	}
+	return true
 }
 
 // CountReplicas adds VM `name` (with base `base`) on `host` to the replica
@@ -211,7 +251,7 @@ func (s *ClusterSnapshot) SeedReplicasForBase(base string) {
 	}
 	s.ReplicasByBase[base] = map[string]int{}
 	for _, vm := range s.VMs {
-		if vm.State != "running" && vm.State != "creating" && vm.State != "starting" {
+		if !countsAgainstHost(vm.State) {
 			continue
 		}
 		if vm.Name == base || strings.HasPrefix(vm.Name, base+"-") {
@@ -227,6 +267,19 @@ func (s *ClusterSnapshot) CommitPlacement(host, vmName, baseName string, cpu, me
 	s.MemUsed[host] += mem
 	s.VMCount[host]++
 	s.VMHost[vmName] = host
+	if baseName != "" {
+		if s.ReplicasByBase[baseName] == nil {
+			s.ReplicasByBase[baseName] = map[string]int{}
+		}
+		s.ReplicasByBase[baseName][host]++
+	}
+}
+
+// commitContainer is CommitPlacement for a container: it holds memory and
+// nothing else — no vCPU, no VMCount slot (and so no qemu overhead) — exactly as
+// AddContainerMemory counts the containers already running.
+func (s *ClusterSnapshot) commitContainer(host, name, baseName string, mem int) {
+	s.MemUsed[host] += mem
 	if baseName != "" {
 		if s.ReplicasByBase[baseName] == nil {
 			s.ReplicasByBase[baseName] = map[string]int{}

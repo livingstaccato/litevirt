@@ -113,7 +113,7 @@ pci:
   # How often to rescan PCI devices. "0" disables periodic rescan.
   rescan_interval: "5m"
 
-  # DEPRECATED: no longer installs a udev rule. Real-time PCI events are covered by
+  # DEPRECATED: installs no udev rule. Real-time PCI events are covered by
   # rescan_interval. Setting it true only logs a warning; remove any leftover
   # /etc/udev/rules.d/99-litevirt-pci.rules (an upgrade cleans up the litevirt one).
   udev_hook: false
@@ -158,9 +158,22 @@ storage_pools:
 # hardening feature whose capability token the build advertises but does NOT enforce
 # until you opt in. Enforcement = this flag AND the token's cluster-wide latch, so the
 # flag is BOTH the enable and the kill switch: set it false + restart to disable,
-# regardless of any durable latch (never delete marker files). All default false; a
-# fresh deploy changes no behavior. Enable fleet-uniformly for lww_skew_guard (it
-# changes merge behavior) and for vip_* enable the pair together.
+# regardless of any durable latch (never delete marker files). Every flag is false when
+# absent, so an UPGRADE changes no behavior — the flip has to be deliberate.
+#
+# A NEW cluster is different, and `lv host init` treats it differently: with no cluster
+# to preserve the behavior of, it writes safe_fence_default and shared_storage_fence as
+# TRUE on the first node. Both protect against the same outcome — a best-effort fence
+# that never landed reporting success, the coordinator rescheduling, and a writable
+# shared disk being opened on a second host while the first still has it. Hosts JOINING
+# a cluster inherit that cluster's block verbatim instead, so adding a node never flips
+# a flag mid-roll. To adopt them on an existing cluster, set both on every node and
+# restart; `lv doctor fence` reports which nodes have not.
+#
+# Enable fleet-uniformly for lww_skew_guard (it changes merge behavior) and for vip_*
+# enable the pair together.
+#
+# The values below are the ABSENT-key defaults, not what `lv host init` writes.
 enforcement:
   safe_fence_default: false   # a best-effort (unconfirmable) fence must carry an operator
                               # proof (`lv host fence-confirm`) before reschedule/promote
@@ -271,12 +284,12 @@ enforcement:
                               # reversible kill switch.
   audit_signature: false      # sign every audit row this host writes with its cluster key
                               # (the same host.key that identifies it on the wire, under a
-                              # separate signing domain). The pre-v45 chain is an UNKEYED
+                              # separate signing domain). An unsigned chain is an UNKEYED
                               # hash: anyone who can write the database can edit a row,
                               # recompute the hashes after it, and `lv audit verify` comes
                               # back clean. A signature makes that require the host's private
                               # key instead of just the algorithm, and any OTHER node can
-                              # check it — a compromised host can no longer certify its own
+                              # check it — a compromised host cannot certify its own
                               # rewritten history. Setting this flag turns SIGNING on by
                               # itself (signed rows are backward-compatible; old peers
                               # replicate the new columns untouched). The token is advertised
@@ -380,8 +393,8 @@ netbox:
                             # which site the hardware sits in, so like
                             # cluster_name it is operator-supplied.
                             # Empty leaves the cluster's scope UNMANAGED rather
-                            # than clearing it: the scope was settable by hand
-                            # long before this key existed, and writing an empty
+                            # than clearing it: the scope is also settable by
+                            # hand, outside this key, and writing an empty
                             # value through would strip the site off a working
                             # cluster and take every VM's inherited site with
                             # it. A name that does NOT exist in NetBox fails the
@@ -439,7 +452,7 @@ auth:
   session_hard_expiry: ""                 # e.g. "168h" (7 days)
   # Strict mTLS identity: when true (and the strict_mtls_identity_v1 capability
   # is active cluster-wide), a bearerless "client" certificate (the distributable
-  # CLI client cert, or any cert whose CN is not a live cluster host) is no longer
+  # CLI client cert, or any cert whose CN is not a live cluster host) is not
   # treated as admin — it must present a session bearer (`lv login`). Host/peer
   # certs and on-node loopback are unaffected. Default false. This flag is the
   # enforcement + kill switch. See docs/auth.md.
@@ -663,7 +676,7 @@ exit, so a `SIGHUP` from `needrestart` or `unattended-upgrades` would leave the
 node down with the unit reporting success. Each ignored signal is logged and
 counted as `litevirt_signal_ignored_total` (labeled by `signal`) — a rising count
 means something on the host keeps trying to bounce the orchestrator, which is
-worth chasing even though the daemon now survives it.
+worth chasing even though the daemon survives it.
 
 ## VM defaults
 
@@ -701,8 +714,8 @@ For a deliberately heterogeneous fleet, hold one baseline per VM instead:
 `lv run --cpu-mode custom --cpu-model x86-64-v3`. `custom` is not accepted here,
 because a cluster-wide default cannot supply the per-VM model it requires.
 
-A VM created before this default existed keeps its empty `cpu_mode` and renders
-exactly as it always has. List them with `lv doctor cpu-mode` and move one
+A VM with an empty `cpu_mode` (one created before this default existed) keeps
+it, and the default does not change how it renders. List them with `lv doctor cpu-mode` and move one
 forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
 
 ## Capacity and overcommit
@@ -759,8 +772,8 @@ missing telemetry would break every cluster whose pools have not been sampled ye
 **Containers count too, for memory.** A running container's memory cap is
 subtracted from host capacity exactly like a VM's, and `lv ct create` / `lv ct
 start` are admitted against it. Container CPU is *not* counted: `--cpu` on a
-container is cgroup **shares** — a relative weight, not a vCPU reservation — so
-adding it to a vCPU total would be meaningless. An **uncapped** container
+container is a **cap** in cores — a ceiling the cgroup enforces, not a vCPU
+reservation — so it is not added to the host's vCPU total. An **uncapped** container
 (`--memory 0`) is not accounted at all: litevirt knows the cap, not the
 footprint. Cap your containers if you want them to count.
 

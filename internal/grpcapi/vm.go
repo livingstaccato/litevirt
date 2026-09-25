@@ -399,7 +399,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 		if d.Storage != "" {
 			// Use a named storage volume (nfs, ceph, iscsi, etc.).
-			volCfg := s.resolveVolume(ctx, spec.StackName, d.Storage)
+			volCfg, volErr := s.resolveVolume(ctx, spec.StackName, d.Storage)
+			if volErr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "storage %q: %v", d.Storage, volErr)
+			}
 			drv, drvErr := storage.New(s.dataDir, volCfg)
 			if drvErr != nil {
 				return nil, status.Errorf(codes.Internal, "storage driver %q: %v", d.Storage, drvErr)
@@ -530,7 +533,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 
 		// Attempt network provisioning if the network is defined in the stack.
-		if provBridge, err := provisionNetworkForVM(ctx, s.db, n.Name, s.hostName); err != nil {
+		if provBridge, err := s.provisionForVM(ctx, n.Name); err != nil {
 			slog.Warn("network provision failed, falling back to bridge name", "network", n.Name, "error", err)
 		} else if provBridge != "" {
 			bridge = provBridge
@@ -1529,6 +1532,11 @@ func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb
 		return nil, status.Errorf(codes.Internal, "start: %v", err)
 	}
 
+	// The guest is booting from here. Tell the healthcheck before anything
+	// else: for RestartVM the row never leaves "running", so this is the only
+	// way its start grace opens.
+	s.noteVMStarted(vm.Name)
+
 	// The domain is up. A lost "running" write is low-harm (the reconciler heals
 	// it from libvirt), so record it best-effort with retry and still run the
 	// follow-up (VLAN taps, PostStart hook) — skipping those would leave a running
@@ -1755,6 +1763,20 @@ func (s *Server) checkNoRemotePCIOwner(ctx context.Context, vmName string) error
 	return nil
 }
 
+// abortDeleteAfterStop records a DeleteVM that fails after its stop step, with
+// the row kept so the delete can be retried. When the delete destroyed the
+// domain, the row is recorded stopped with operator-stop: it must not go on
+// claiming a running guest, and no restart policy may bring back a VM that is
+// being deleted. The audit row carries why the delete stopped.
+func (s *Server) abortDeleteAfterStop(ctx context.Context, name string, destroyed bool, why string) {
+	if destroyed {
+		if werr := s.persistVMState(ctx, name, "stopped", "operator-stop", corrosion.OpVMState); werr != nil {
+			slog.Warn("DeleteVM: recording the stop of a VM whose delete failed also failed", "vm", name, "error", werr)
+		}
+	}
+	s.audit(ctx, "vm.delete", name, why, "error")
+}
+
 // without returns ss with every occurrence of drop removed (order preserved).
 func without(ss []string, drop string) []string {
 	var out []string
@@ -1937,9 +1959,22 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 		}
 	}
 
-	// Stop if running
-	if vm.State == "running" {
-		s.virt.DestroyDomain(req.Name)
+	// Stop it. Ask libvirt, not only the row: an ACTIVE domain (running, or
+	// paused — which the row does not call "running") survives the undefine
+	// below as a transient domain that keeps running, and the disks would then be
+	// freed under a live guest whose row is gone. A stop that fails while the
+	// domain is still active therefore fails the delete, before anything is
+	// removed.
+	active, activeErr := s.virt.DomainIsActive(req.Name)
+	destroyed := false
+	if vm.State == "running" || activeErr != nil || active {
+		if err := s.virt.DestroyDomain(req.Name); err != nil {
+			if still, serr := s.virt.DomainIsActive(req.Name); serr != nil || still {
+				return nil, status.Errorf(codes.Internal,
+					"cannot delete VM %q: could not stop its domain, so nothing was removed (retry is safe): %v", req.Name, err)
+			}
+		}
+		destroyed = true
 	}
 
 	// Release PCI passthrough devices and unbind from vfio-pci. releaseDevices is strict
@@ -1965,11 +2000,16 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// (the same stale-owner class, one host over). So after the local release succeeds, and
 	// BEFORE the tombstone, fail closed on any surviving remote owner (retryable once that
 	// host releases its row; fail closed on the ownership-read error too).
+	//
+	// Every failure from here on returns with the row kept but the domain
+	// possibly already destroyed; abortDeleteAfterStop records that.
 	if err := s.releaseDevices(ctx, req.Name); err != nil {
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "PCI device release failed: "+err.Error())
 		return nil, status.Errorf(codes.Internal,
 			"cannot delete VM %q: its PCI device(s) could not be released (still bound to vfio-pci); resolve the device and retry: %v", req.Name, err)
 	}
 	if err := s.checkNoRemotePCIOwner(ctx, req.Name); err != nil {
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "remote PCI owner: "+err.Error())
 		return nil, err
 	}
 	// Devices released → clear any lingering durable device lease so a deleted VM's
@@ -1980,16 +2020,27 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// name-keyed and DomainUndefineNvram would delete it — bricking the retained
 	// BitLocker disk); the explicit WipeFirmwareState in the !KeepDisks branch
 	// below handles true delete (G1).
+	//
+	// A failed undefine FAILS THE DELETE, before the disks and the row go. The
+	// row is the cluster's only handle on this domain: tombstoning it over a
+	// domain that is still defined orphans the domain on this host with nothing
+	// that names it, and freeing the disks would leave that domain pointing at
+	// files that no longer exist. Returning keeps the delete retryable — the only
+	// destructive step so far is the stop above.
+	var undefErr error
 	if req.KeepDisks {
-		if err := s.virt.UndefineDomainPreservingState(req.Name); err != nil {
-			slog.Warn("failed to undefine domain (keep-disks)", "vm", req.Name, "error", err)
-		}
+		undefErr = s.virt.UndefineDomainPreservingState(req.Name)
 	} else if err := s.virt.UndefineDomain(req.Name, true); err != nil {
 		slog.Warn("failed to undefine domain", "vm", req.Name, "error", err)
 		// Retry without flags in case the domain has no managed save/snapshots.
-		if err2 := s.virt.UndefineDomain(req.Name, false); err2 != nil {
-			slog.Error("failed to undefine domain (retry)", "vm", req.Name, "error", err2)
-		}
+		undefErr = s.virt.UndefineDomain(req.Name, false)
+	}
+	if undefErr != nil && s.virt.DomainExists(req.Name) {
+		slog.Error("DeleteVM: domain could not be undefined; keeping the VM record", "vm", req.Name, "error", undefErr)
+		s.abortDeleteAfterStop(ctx, req.Name, destroyed, "undefine failed: "+undefErr.Error())
+		return nil, status.Errorf(codes.Internal,
+			"cannot delete VM %q: its libvirt domain could not be undefined, so its record and disks were kept (retry is safe): %v",
+			req.Name, undefErr)
 	}
 
 	// Delete disks unless keep-disks. Free each disk at its RECORDED location
@@ -2185,6 +2236,11 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 		CpuActual:    int32(vm.CPUActual),
 		MemActualMib: int32(vm.MemActual),
 		IsTemplate:   vm.IsTemplate,
+	}
+	// The healthcheck verdict, read exactly as the vm_healthy wait reads it.
+	// Best-effort: an unreadable verdict leaves the fields empty.
+	if h, herr := health.EvaluateVMHealth(ctx, s.db, vm); herr == nil && h.HasHealthcheck {
+		pbVM.Health, pbVM.HealthDetail = h.Verdict, h.Detail
 	}
 
 	// Interfaces — run IP discovery fallback if IP is unknown.
@@ -2558,26 +2614,10 @@ func resolveBridge(ctx context.Context, db *corrosion.Client, networkName string
 	if def == nil {
 		return networkName
 	}
-	switch def.Type {
-	case "sriov":
-		if def.PF != "" {
-			return def.PF
-		}
-	case "direct":
-		if def.Interface != "" {
-			return "direct:" + def.Interface
-		}
-	case "isolated":
-		// Must match the bridge name provisioning actually creates
-		// (network.IsolatedBridgeName), otherwise a hot attach-nic plugs
-		// into a non-existent device and fails with "Cannot get interface MTU".
-		return network.IsolatedBridgeName(networkName)
-	default:
-		if def.Interface != "" {
-			return def.Interface
-		}
-	}
-	return networkName
+	// Must match the device provisioning actually creates, otherwise a hot
+	// attach-nic plugs into a non-existent device and fails with "Cannot get
+	// interface MTU". network.BridgeName is the one place that names it.
+	return network.BridgeName(networkName, *def)
 }
 
 // lookupNetworkDef fetches a network definition from Corrosion.
@@ -3342,41 +3382,68 @@ func replaceFirst(s, old, new string) string {
 	return s[:i] + new + s[i+len(old):]
 }
 
-// resolveVolume looks up a named volume from the stack's compose YAML, then
-// falls back to host-level storage pools, then defaults to local driver.
-func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string) storage.Config {
-	// 1. Try compose volumes.
+// storedStackFile reads a stack's stored compose YAML: nil when there is no
+// such stack (or it stored none), an error when it cannot be read. It never
+// validates — see compose.ParseStored.
+func (s *Server) storedStackFile(ctx context.Context, stackName string) (*compose.File, error) {
+	st, err := corrosion.GetStack(ctx, s.db, stackName)
+	if err != nil {
+		return nil, fmt.Errorf("read stack %q: %w", stackName, err)
+	}
+	if st == nil || st.ComposeYAML == "" {
+		return nil, nil
+	}
+	f, err := compose.ParseStored([]byte(st.ComposeYAML))
+	if err != nil {
+		return nil, fmt.Errorf("stored compose for stack %q cannot be read: %w", stackName, err)
+	}
+	return f, nil
+}
+
+// resolveVolume looks up a named volume in the stack's compose YAML, then in
+// this host's storage pools. A name found in neither is an error — never the
+// local driver (a disk with no storage name is what uses that).
+func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string) (storage.Config, error) {
+	// 1. Try compose volumes. A stored stack that cannot be read is an
+	// error: falling through would put the disk on whatever storage the
+	// later steps find, most likely the local driver.
 	if stackName != "" {
-		st, err := corrosion.GetStack(ctx, s.db, stackName)
-		if err == nil && st != nil && st.ComposeYAML != "" {
-			f, err := compose.ParseBytes([]byte(st.ComposeYAML))
-			if err == nil {
-				if vol, ok := f.Volumes[volumeName]; ok {
-					return storage.Config{
-						Driver:  vol.Driver,
-						Source:  vol.Source,
-						Target:  vol.Target,
-						Options: vol.Options,
-					}
-				}
+		f, err := s.storedStackFile(ctx, stackName)
+		if err != nil {
+			return storage.Config{}, err
+		}
+		if f != nil {
+			if vol, ok := f.Volumes[volumeName]; ok {
+				return storage.Config{
+					Driver:  vol.Driver,
+					Source:  vol.Source,
+					Target:  vol.Target,
+					Options: vol.Options,
+				}, nil
 			}
 		}
 	}
 
-	// 2. Try host-level storage pools.
-	{
-		if pool, ok := s.lookupStoragePool(volumeName); ok {
-			return storage.Config{
-				Driver:  pool.Driver,
-				Source:  pool.Source,
-				Target:  pool.Target,
-				Options: pool.Options,
-			}
-		}
+	// 2. Try this host's storage pools: the cache, then the cluster table
+	// (a pool created since the cache was last refreshed, e.g. just after a
+	// restart, is only there).
+	if pool, ok := s.resolvePool(ctx, volumeName); ok {
+		return storage.Config{
+			Driver:  pool.Driver,
+			Source:  pool.Source,
+			Target:  pool.Target,
+			Options: pool.Options,
+		}, nil
 	}
 
-	// 3. Fallback to local.
-	return storage.Config{Driver: "local"}
+	// 3. Nothing by that name. Falling back to the local driver would put
+	// the disk somewhere nobody asked for; a disk that wants local storage
+	// says so by naming no storage at all.
+	if stackName != "" {
+		return storage.Config{}, fmt.Errorf("storage %q is neither a volume of stack %q nor a storage pool on host %q",
+			volumeName, stackName, s.hostName)
+	}
+	return storage.Config{}, fmt.Errorf("storage %q is not a storage pool on host %q", volumeName, s.hostName)
 }
 
 // parseDiskSizeBytes converts a human-readable size string (e.g. "20G", "512M")
@@ -3718,7 +3785,18 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				updLease = lease
 			}
 
-			if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
+			if compose.IsTransientOrErrorState(fresh.State) {
+				// A VM left in error or mid-transition (a create, start or
+				// rebuild that did not finish) has no clean shutdown to ask
+				// for — its domain may not even be defined. Make sure nothing
+				// of it runs, then redefine and start it: the repair a deploy
+				// retry asks for.
+				if active, _ := s.virt.DomainIsActive(req.Name); active {
+					if derr := s.virt.DestroyDomain(req.Name); derr != nil {
+						return nil, status.Errorf(codes.Internal, "stop %q before its repair: %v", req.Name, derr)
+					}
+				}
+			} else if _, serr := s.stopVMLocked(ctx, fresh, false, 0); serr != nil {
 				return nil, serr
 			}
 			// Redefine + restart against the fresh (now-stopped) record.

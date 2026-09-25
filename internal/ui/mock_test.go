@@ -120,13 +120,17 @@ type mockGRPC struct {
 	updateVMErr        error
 
 	// Call tracking
-	lastInspectVMName      string
-	lastInspectHostName    string
-	lastStartVMName        string
-	lastStopVMName         string
-	lastRestartVMName      string
-	lastDeleteVMName       string
-	deleteVMCalled         bool
+	lastInspectVMName   string
+	lastInspectHostName string
+	lastStartVMName     string
+	lastStopVMName      string
+	lastRestartVMName   string
+	lastDeleteVMName    string
+	deleteVMCalled      bool
+	// deleteStackFrames is what DeleteStack streams; deleteStackStreamErr, when
+	// set, ends that stream instead of io.EOF.
+	deleteStackFrames      []*pb.DeleteProgress
+	deleteStackStreamErr   error
 	lastCreateVMReq        *pb.CreateVMRequest
 	lastUpdateVMReq        *pb.UpdateVMRequest
 	lastLoginReq           *pb.LoginRequest
@@ -145,6 +149,8 @@ type mockGRPC struct {
 	deleteLBCalled         bool
 	lastDrainReq           *pb.DrainBackendRequest
 	lastDrainHostName      string
+	drainCtx               context.Context                              // ctx the last DrainHost was opened on
+	drainStream            grpc.ServerStreamingClient[pb.DrainProgress] // nil → an empty stream
 	lastUndrainHostName    string
 	lastFenceHostReq       *pb.FenceHostRequest
 	lastRemoveHostName     string
@@ -491,12 +497,16 @@ func (m *mockGRPC) LBStats(_ context.Context, in *pb.LBStatsRequest, _ ...grpc.C
 
 // ── Host actions ─────────────────────────────────────────────────────────────
 
-func (m *mockGRPC) DrainHost(_ context.Context, in *pb.DrainHostRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DrainProgress], error) {
+func (m *mockGRPC) DrainHost(ctx context.Context, in *pb.DrainHostRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DrainProgress], error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.lastDrainHostName = in.Name
 	if m.drainHostErr != nil {
 		return nil, m.drainHostErr
+	}
+	m.drainCtx = ctx
+	if m.drainStream != nil {
+		return m.drainStream, nil
 	}
 	return &fakeStream[pb.DrainProgress]{}, nil
 }
@@ -813,7 +823,7 @@ func (m *mockGRPC) DeployStack(context.Context, *pb.DeployStackRequest, ...grpc.
 }
 
 func (m *mockGRPC) DeleteStack(context.Context, *pb.DeleteStackRequest, ...grpc.CallOption) (grpc.ServerStreamingClient[pb.DeleteProgress], error) {
-	return &fakeStream[pb.DeleteProgress]{}, nil
+	return &scriptedStream[pb.DeleteProgress]{frames: m.deleteStackFrames, err: m.deleteStackStreamErr}, nil
 }
 
 func (m *mockGRPC) DiffStack(_ context.Context, in *pb.DiffStackRequest, _ ...grpc.CallOption) (*pb.DiffStackResponse, error) {
@@ -1084,10 +1094,15 @@ type scriptedStream[T any] struct {
 	grpc.ClientStream
 	frames []*T
 	i      int
+	// err, when set, ends the stream instead of io.EOF.
+	err error
 }
 
 func (s *scriptedStream[T]) Recv() (*T, error) {
 	if s.i >= len(s.frames) {
+		if s.err != nil {
+			return nil, s.err
+		}
 		return nil, io.EOF
 	}
 	f := s.frames[s.i]

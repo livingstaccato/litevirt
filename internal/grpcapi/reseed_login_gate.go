@@ -13,10 +13,13 @@ import (
 // means they are the only RPCs that can be reached on a node whose secret
 // state is incomplete.
 //
-// Ping and ListRealms are deliberately NOT here. Ping is how an operator and
-// every peer diagnose this node, and the reseed path itself calls it; gating it
-// would hide the very condition the marker records and break the recovery it
-// points at.
+// Ping, Ready and ListRealms are deliberately NOT here. Ping is how an operator
+// and every peer diagnose this node, and the reseed path itself calls it;
+// gating it would hide the very condition the marker records and break the
+// recovery it points at. Ready is the same argument one step further: it exists
+// to answer "can this daemon serve", a node mid-reseed cannot, and refusing the
+// question would make that node indistinguishable from an unreachable one —
+// which is the exact conflation Ready was added to end.
 var preSessionAuthMethods = map[string]bool{
 	"/litevirt.v1.LiteVirt/Login":               true,
 	"/litevirt.v1.LiteVirt/BeginWebAuthnLogin":  true,

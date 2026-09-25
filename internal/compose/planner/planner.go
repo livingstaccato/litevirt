@@ -48,6 +48,7 @@ type VMAction struct {
 	Storage    string // resolved storage backend
 	Detail     string
 	DependsOn  compose.DependsOn
+	Base       string // compose name (db for replica db-2); see compose.Op.Base
 	WaitFor    string // condition dependents wait for
 	Warning    string
 	// IsContainer marks a kind=lxc/oci workload so the executor routes it to the
@@ -59,6 +60,23 @@ type VMAction struct {
 	// recreate buckets so the rolling engine can apply it without deleting a VM that
 	// only needs a live resize. Empty (Max()==NoChange) for non-update / container ops.
 	Plan compose.ChangePlan
+	// Apply is how an OpUpdate is carried out — the least destructive
+	// mechanism the change allows:
+	//   - ActionLive (or NoChange): in place on the running VM, no restart;
+	//   - ActionRestart: the same VM is reconfigured and restarted (same
+	//     disks, MAC, incarnation);
+	//   - ActionRecreate: the workload is deleted and created again, which
+	//     replaces its disks.
+	// Unset for non-update ops.
+	Apply compose.Action
+	// RecreateReason says why an ActionRecreate update cannot keep the
+	// workload.
+	RecreateReason string
+	// Repair marks the retry of a VM a previous deploy left half-made whose
+	// disks exist: it is repaired in place (ActionRestart — the domain is
+	// redefined from the desired spec over the existing disks and started),
+	// never replaced. Retry marks any retry.
+	Repair, Retry bool
 }
 
 // DeviceAssignment is a pre-resolved PCI device allocation.
@@ -100,6 +118,77 @@ type DNSAction struct {
 	FQDN     string
 	IP       string // empty if deferred
 	Deferred bool   // true = IP not known until VM boots (DHCP)
+}
+
+// updateMechanism picks how an update is applied (see VMAction.Apply), for a
+// recreate why the workload cannot be kept, and whether a retry is a repair.
+// hasDisks says disks are recorded for the VM.
+func updateMechanism(op compose.Op, a VMAction, haveStoredSpec, hasDisks bool) (compose.Action, string, bool) {
+	switch {
+	case a.IsContainer:
+		return compose.ActionRecreate, "containers have no in-place reconfigure", false
+	case !haveStoredSpec:
+		return compose.ActionRecreate, "the VM's stored spec could not be read", false
+	}
+	var classified compose.Action
+	reason := ""
+	switch a.Plan.Max() {
+	case compose.ActionRecreate:
+		classified, reason = compose.ActionRecreate, strings.Join(a.Plan.RecreateReasons, "; ")
+	case compose.ActionRestart:
+		if len(a.Plan.NotReconfigurable) > 0 {
+			classified, reason = compose.ActionRecreate, strings.Join(a.Plan.NotReconfigurable, "; ")+" — not reconfigurable in place yet"
+		} else {
+			classified = compose.ActionRestart
+		}
+	default:
+		classified = compose.ActionLive
+	}
+	if !op.Retry {
+		return classified, reason, false
+	}
+	// A retry: a previous deploy left the VM half-made. A change of identity
+	// in the file still replaces it (and says so); otherwise what exists is
+	// repaired, and only a VM of which nothing was made is created again.
+	switch {
+	case classified == compose.ActionRecreate:
+		return classified, reason, false
+	case hasDisks:
+		return compose.ActionRestart, "", true
+	default:
+		return compose.ActionRecreate, "nothing was made", false
+	}
+}
+
+// UpdateMechanismText is the plan's description of how an update is applied.
+func UpdateMechanismText(a VMAction) string {
+	switch {
+	case a.Repair:
+		return "retry — repaired in place, disks kept"
+	case a.Retry && a.Apply == compose.ActionRecreate && a.RecreateReason == "nothing was made":
+		return "retry — created again (nothing was made)"
+	}
+	switch a.Apply {
+	case compose.ActionRecreate:
+		if a.IsContainer {
+			return "recreate — the container is replaced (" + a.RecreateReason + ")"
+		}
+		return "recreate — disks are replaced (" + a.RecreateReason + ")"
+	case compose.ActionRestart:
+		return "restart — the same VM is reconfigured and restarted, disks kept"
+	default:
+		return "applied in place, no restart"
+	}
+}
+
+// ComposeName is the name a depends-on entry refers to the action's workload
+// by: its compose name, or — for an action built without one — its instance
+// name.
+func (a VMAction) ComposeName() string {
+	if a.Base != "" {
+		return a.Base
+	}
+	return a.VMName
 }
 
 // Resolve takes a compose file and cluster state snapshot and produces a
@@ -144,6 +233,22 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			currentHostByVM[c.Name] = c.HostName
 		}
 	}
+	// What each of this stack's running workloads holds now. An update REPLACES
+	// that allocation: the snapshot already counts it on its host, and charging
+	// the new request on top counted the workload twice — a VM filling most of
+	// its host could not be updated in place at all, not even to add a label.
+	vmRecordByName := map[string]corrosion.VMRecord{}
+	for _, vm := range state.VMs {
+		if vm.StackName == f.Name {
+			vmRecordByName[vm.Name] = vm
+		}
+	}
+	ctRecordByName := map[string]corrosion.ContainerRecord{}
+	for _, ct := range state.Containers {
+		if ct.Labels[corrosion.LabelStack] == f.Name {
+			ctRecordByName[ct.Name] = ct
+		}
+	}
 
 	for _, op := range vmPlan.Ops {
 		if op.Kind != OpCreate && op.Kind != OpUpdate {
@@ -167,6 +272,8 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		// don't mutate the compose def's Require map). On update, pin to the
 		// current host so the recreate happens in place.
 		if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
+			// Charged as a container: memory only, no qemu overhead, no vCPU.
+			req.Container = true
 			rl := map[string]string{corrosion.LabelLXCCapable: "true"}
 			for k, v := range req.RequireLabels {
 				rl[k] = v
@@ -176,6 +283,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 				if h := ctHost[op.VMName]; h != "" {
 					req.PinHost = h
 				}
+				req.Replaces = placement.ContainerAllocation(ctRecordByName[op.VMName])
 			}
 		} else if op.Kind == OpUpdate {
 			// A VM UPDATE stays on its current host — re-running placement could pick a
@@ -184,6 +292,9 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			// actually move the VM (and its SR-IOV VF / local disk) off its host.
 			if h := currentHostByVM[op.VMName]; h != "" {
 				req.PinHost = h
+			}
+			if vm, ok := vmRecordByName[op.VMName]; ok {
+				req.Replaces = placement.VMAllocation(vm)
 			}
 		}
 		placementReqs = append(placementReqs, req)
@@ -200,7 +311,10 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 	// can strand one VM without abandoning the rest); a compose plan is
 	// all-or-nothing, so re-raise it as the hard error it always was here.
 	for _, name := range placementVMNames {
-		if placements[name].Host == "" {
+		if r := placements[name]; r.Host == "" {
+			if r.Err != nil {
+				return nil, fmt.Errorf("batch placement failed: %w", r.Err)
+			}
 			return nil, fmt.Errorf("batch placement failed: %w for VM %q", placement.ErrNoEligibleHost, name)
 		}
 	}
@@ -227,16 +341,22 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			VMName:      op.VMName,
 			Detail:      op.Detail,
 			DependsOn:   op.DependsOn,
+			Base:        op.Base,
 			Warning:     op.Warning,
 			IsContainer: isContainerWorkload(f, op.VMName, ctHost),
 		}
 
-		// Classify a VM update (desired vs stored) so the rolling engine can route it
-		// live/restart/recreate. Containers are recreated by their own path.
-		if op.Kind == OpUpdate && !action.IsContainer {
-			if stored := storedSpecByVM[op.VMName]; stored != nil {
-				action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
+		// Classify a VM update (desired vs stored) and pick the least destructive
+		// way to apply it. Containers are recreated by their own path.
+		if op.Kind == OpUpdate {
+			if !action.IsContainer {
+				if stored := storedSpecByVM[op.VMName]; stored != nil {
+					action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
+				}
 			}
+			action.Retry = op.Retry
+			action.Apply, action.RecreateReason, action.Repair = updateMechanism(op, action, storedSpecByVM[op.VMName] != nil, state.RecordedDisks[op.VMName] > 0)
+			action.Detail += " — " + UpdateMechanismText(action)
 		}
 
 		if op.Kind == OpCreate || op.Kind == OpUpdate {
@@ -269,7 +389,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			action.Storage = resolveStorage(spec, f)
 
 			// Set wait condition for dependents.
-			action.WaitFor = highestWaitCondition(op.VMName, vmPlan.Ops)
+			action.WaitFor = highestWaitCondition(op.ComposeName(), vmPlan.Ops)
 		} else if op.Kind == OpNoChange {
 			// Carry forward existing host for network/LB resolution.
 			for _, c := range current {
@@ -478,12 +598,7 @@ func resolveNetworkTargets(plan *ResolvedPlan, f *compose.File, vmHostMap map[st
 	// Build network → hosts map from VM placements.
 	// Keys use scoped names to match plan.Networks[].Name.
 	netHosts := map[string]map[string]bool{}
-	scopeNet := func(rawName string) string {
-		if nd, ok := f.Networks[rawName]; ok && nd.External {
-			return rawName
-		}
-		return compose.ScopedNetworkName(f.Name, rawName)
-	}
+	scopeNet := f.ResolveNetworkName
 	for _, vmDef := range f.VMs {
 		for _, na := range vmDef.Network {
 			key := scopeNet(na.Name)
@@ -767,19 +882,22 @@ func vmBaseName(name string) string {
 	return name
 }
 
-// highestWaitCondition checks if any later op depends on vmName.
-func highestWaitCondition(vmName string, ops []compose.Op) string {
+// highestWaitCondition returns the most demanding condition ("vm_healthy" >
+// "vm_started") any op's depends-on asks of the workload whose compose name
+// is composeName, or "" when nothing depends on it.
+func highestWaitCondition(composeName string, ops []compose.Op) string {
 	best := ""
 	for _, op := range ops {
 		for dep, def := range op.DependsOn {
-			if dep == vmName || strings.HasPrefix(vmName, dep+"-") {
-				cond := def.Condition
-				if cond == "" {
-					cond = "vm_started"
-				}
-				if cond == "vm_healthy" || (cond == "vm_started" && best == "") {
-					best = cond
-				}
+			if !compose.DependsOnTarget(dep, composeName) {
+				continue
+			}
+			cond := def.Condition
+			if cond == "" {
+				cond = "vm_started"
+			}
+			if cond == "vm_healthy" || best == "" {
+				best = cond
 			}
 		}
 	}

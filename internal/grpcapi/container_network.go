@@ -167,7 +167,7 @@ func (s *Server) resolveContainerNICs(ctx context.Context, project, ctName strin
 		}
 		// Provision the network on this host (creates/ensures the bridge/vxlan/
 		// isolated device) and use the real bridge — like the VM path.
-		bridge, perr := provisionNetworkForVM(ctx, s.db, netName, s.hostName)
+		bridge, perr := s.provisionForVM(ctx, netName)
 		if perr != nil {
 			// vxlan / isolated devices MUST be provisioned by litevirt (lxc can't
 			// auto-create them), so a provision failure means the link won't exist —

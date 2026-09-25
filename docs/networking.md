@@ -48,15 +48,21 @@ provisions later can also push its VTEP straight to this host, which adds the
 entry on the spot. Those kernel flood entries are only ever added — an
 individual entry is never withdrawn when a host leaves the network (they go away
 only with the local VXLAN device), and nothing re-derives the set from the
-database outside a provisioning pass, so a newly-joined host may stay absent
-from an existing peer's entries until that peer next provisions, which a daemon
-restart does. Unicast MAC→VTEP entries are programmed explicitly rather than
+database outside a provisioning pass. A newly-joined host gets into an existing
+peer's entries through that push, which it makes when its network reconcile
+pass provisions the network (see [Where a network is set up](#where-a-network-is-set-up));
+if the push is lost, it stays absent until that peer next provisions, which a
+daemon restart does. Unicast MAC→VTEP entries are programmed explicitly rather than
 learned: when a VM's address is discovered, and again when that VM migrates or
 is deleted, its host fans a `bridge fdb` add/delete out to every peer over the
 cluster's mTLS gRPC, so remote hosts point the MAC at whichever host now owns
 it. Setting `subnet:` also gives every host the same anycast gateway — the first
 usable address in the subnet — on the VNI bridge, so a VM's default route is
 host-local.
+
+The host bridge for a VXLAN network is `br-vni<VNI>` (for example `br-vni1000`),
+whatever `interface:` says. Every NIC path — create, restart, hot attach,
+containers — attaches to that bridge.
 
 ### Isolated
 
@@ -73,6 +79,11 @@ networks:
 The host bridge for an isolated network is `br-iso-<name>`; when that would
 exceed Linux's 15-char interface-name limit it is automatically shortened to a
 stable hashed form, so network names of any length work.
+
+An isolated network does not span hosts. Every host gets its own copy: its own
+`br-iso-<name>`, the subnet's first address as gateway, and its own `dnsmasq`
+leasing the same range. VMs on different hosts cannot reach each other over it,
+and two VMs on different hosts can be leased the same address.
 
 ### SR-IOV
 
@@ -115,6 +126,36 @@ Limitations:
 - **No VM-to-host communication** — macvtap in bridge mode does not allow the guest to reach the host's IP on the parent interface. This is a kernel-level restriction of macvtap. VMs can reach other devices on the network, but not the hypervisor itself via that interface.
 - **No DHCP from litevirt** — IP assignment must come from an external DHCP server or be configured statically via cloud-init.
 - **Interface must exist** — litevirt does not create the parent interface. It must be present on the host before deployment.
+
+## Where a network is set up
+
+Every host sets up every network. `lv network create` and a stack deploy set it
+up at once on the node that ran them. Each daemon then compares its own devices
+with the cluster's network table every 30 seconds, and at startup:
+
+- a network it has not set up yet is provisioned (bridge, gateway, `dnsmasq`,
+  VXLAN, NAT). This is how a network reaches the other nodes, a node that joins
+  later, and a node that restarted (`dnsmasq` dies with the daemon).
+- a network it set up but has since lost is provisioned again: its bridge is
+  gone, or its `dnsmasq` died. The check reads the kernel's interface table and
+  the `dnsmasq` pidfile, so it costs no commands per pass.
+- a deleted network is torn down. This is how `lv network delete` and a stack
+  delete reach every node, including one that was down at the time: it tears
+  down when it comes back.
+
+A deleted network whose bridge a live network still uses is left alone, so
+the live one keeps its bridge, gateway and `dnsmasq`.
+
+The same pass removes a leftover flat stack bridge: a bridge named
+`<stack>_<name>` that a NIC was once plugged into because that name had no
+network, and that no NIC uses now. It is removed only when no network has that
+name or bridge, no live NIC names it, and on the host it has no ports and no
+IPv4 address. See [compose.md](compose.md#external-networks) for how such a NIC
+is moved.
+
+Creating a VM, migrating one, and restarting one after a failover also
+provision the VM's networks on its host straight away, without waiting for the
+next pass.
 
 ## VM network attachment
 
@@ -310,10 +351,7 @@ speak for the rest. Two things follow:
   on any host, under any local state: that part is unconditional.
 
   The refusal happens **before** the bridge is created, so it is idempotent: a
-  retry reads the same host state and refuses identically. (It used to create the
-  bridge and then refuse, so the second attempt read a pre-existing bridge,
-  concluded litevirt was not the DHCP authority, and provisioned with no DHCP
-  server at all — guests with no addresses and no explanation.)
+  retry reads the same host state and refuses identically.
 
   **It does not stop the placement.** Every caller of provisioning logs the
   refusal and falls back to the network name as the bridge, then creates that
@@ -453,7 +491,7 @@ inventory changing while the plan was being built — the bind still succeeds, b
 the binding is created **suspended**:
 
 ```
-$ lv network create prod-a --type bridge --interface br-prod --netbox-prefix 12
+$ lv network create prod-a --type bridge --interface br-prod --netbox-prefix-id 12
 Error: network "prod-a" was created and its NetBox binding for prefix 12 is
 SUSPENDED, so it serves no address claims yet: ... this node could not
 corroborate its VM inventory when NetBox prefix was bound ...
@@ -1281,7 +1319,7 @@ things, in this order:
    drift you have repaired in NetBox, and `lv netbox rekey` rewrites the
    identities a moved fingerprint invalidated so a resume can then succeed.
 2. **Reclaim orphans** — addresses NetBox still holds under this cluster's
-   identity that nothing claims any more.
+   identity that nothing claims.
 
 The order is the safety property. A binding suspended by step 1 is out of scope
 for step 2 in that same pass, and a revalidation that could not COMPLETE — an
@@ -1317,14 +1355,14 @@ so it happens only under a whole-cluster proof:
   excused only from the scan.** A witness runs the daemon, gossips and receives
   every replicated row, so it is a first-class source of membership *and* of
   inventory; what it does not do is host a workload, so scanning it for a guest
-  proves nothing. Excluding a witness from the *question* was a bug twice over: a
-  host whose role this node had recorded as `witness` but which had since been
-  made a worker was never asked, and its stale role could never be corrected — an
-  exclusion must not skip the query that would have refuted it — and a genuine
-  witness that was the only node able to name a third host was never asked either.
-  Excluding it from the *inventory* comparison was a third: it held the only
-  replicated copy of a running guest's records, every other node's inventory was
-  equally short, they agreed with each other, and a bind went live over a held
+  proves nothing. Excluding a witness from the *question* would be a bug twice over: a
+  host whose role this node has recorded as `witness` but which has since been
+  made a worker would never be asked, and its stale role could never be corrected — an
+  exclusion must not skip the query that would refute it — and a genuine
+  witness that is the only node able to name a third host would never be asked either.
+  Excluding it from the *inventory* comparison would be a third: when it holds the only
+  replicated copy of a running guest's records, every other node's inventory is
+  equally short, they agree with each other, and a bind goes live over a held
   address. A host counts as a witness only while **every** `hosts` row read for it
   agrees; two rows that disagree, or no row anywhere, and it must answer with a
   scan like any worker;
@@ -1342,8 +1380,8 @@ so it happens only under a whole-cluster proof:
   soft-deleted may still be running the domain that holds the address. Its
   **gossip members** are the only source that can name a host with no `hosts` row
   anywhere — memberlist converges in seconds, independently of every table — so a
-  holder known only to another node's gossip is now covered too, which no
-  table-derived answer could ever have reached;
+  holder known only to another node's gossip is covered too, which no
+  table-derived answer could reach;
 - the same membership proof gates the **bind**, not only the sweep. A node that
   cannot establish the host set does not go live on a prefix: its binding is
   suspended, and the next maintenance pass resumes it by itself. Handing out an
@@ -1445,11 +1483,7 @@ reclaim is always preferable to handing a running guest's address to a new one.
 A supported recovery path is specified — the operator-attested substitution, its
 authorization rules, and the withdrawal that takes one back — in
 [the frozen trust-recovery lifecycle scope](reviews/2026-09-08-trust-lifecycle-followup-scope.md).
-It is **not implemented**. An earlier prerelease build of this work carried one —
-a retire-host command under `lv netbox`, with a withdrawal and a listing beside
-it — and it was removed before release so that its authorization rules could be
-reviewed on their own terms rather than as a rider on an addressing change. No
-released version ever had it.
+It is **not implemented**.
 
 > **If you ran a prerelease build of this feature, upgrading to this one is not
 > supported and the daemon refuses to start.** A database that carries the

@@ -6,7 +6,9 @@ package planner
 
 import (
 	"context"
+	"fmt"
 
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
@@ -30,6 +32,11 @@ type ClusterState struct {
 	// incomplete/stale host is excluded — the same rules the single-VM Select
 	// path applies.
 	Observations []corrosion.HostCapacityObservation
+
+	// RecordedDisks counts the disks recorded for each VM a deploy would
+	// retry (one in a transient or error state): what of it was already made,
+	// which a retry repairs rather than replaces.
+	RecordedDisks map[string]int
 }
 
 // LoadClusterState queries Corrosion once and builds an immutable snapshot.
@@ -101,15 +108,28 @@ func LoadClusterState(ctx context.Context, db *corrosion.Client, capacity corros
 		}
 	}
 
+	recordedDisks := map[string]int{}
+	for _, vm := range vms {
+		if !compose.IsTransientOrErrorState(vm.State) {
+			continue
+		}
+		disks, err := corrosion.GetVMDisks(ctx, db, vm.Name)
+		if err != nil {
+			return nil, fmt.Errorf("read the disks of %s: %w", vm.Name, err)
+		}
+		recordedDisks[vm.Name] = len(disks)
+	}
+
 	return &ClusterState{
-		Hosts:        hosts,
-		VMs:          vms,
-		Containers:   containers,
-		Networks:     networks,
-		LBs:          lbs,
-		Devices:      devices,
-		ImageHosts:   imageHosts,
-		Capacity:     capacity,
-		Observations: observations,
+		RecordedDisks: recordedDisks,
+		Hosts:         hosts,
+		VMs:           vms,
+		Containers:    containers,
+		Networks:      networks,
+		LBs:           lbs,
+		Devices:       devices,
+		ImageHosts:    imageHosts,
+		Capacity:      capacity,
+		Observations:  observations,
 	}, nil
 }

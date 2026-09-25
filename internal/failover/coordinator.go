@@ -27,8 +27,9 @@ const (
 	// pollInterval is how often the coordinator checks for offline hosts.
 	pollInterval = 5 * time.Second
 	// offlineThreshold is the number of consecutive failures before a host
-	// is considered offline by the coordinator.
-	offlineThreshold = 5
+	// is considered offline by the coordinator. It is defined in package
+	// health because the stall guard's grace window is derived from it.
+	offlineThreshold = health.FailuresToFence
 	// leaseDuration is the TTL for the failover-leader lease. It has to clear
 	// minFenceLease with room to spare: holdLeaseAtLeast requires STRICTLY more
 	// than the floor, so a lease whose full term only just reaches it could
@@ -164,6 +165,21 @@ type Coordinator struct {
 	// one that moved VMs (value=true) must wait for a manual `undrain` to avoid
 	// split-brain. Absent key ⇒ we can't prove it's safe ⇒ stays manual.
 	fenceRelocated map[string]bool
+	// confirmResumed records, per host, the operator confirmation a recovery
+	// was already resumed from in this process, so one confirmation resumes one
+	// recovery rather than one per cycle. Losing it on restart costs at most one
+	// repeat, which recoverWorkloads tolerates: it re-derives its work from the
+	// rows still pointing at the host.
+	confirmResumed map[string]string
+	// LocalStall reports whether THIS node stopped running within the last
+	// health.StallGrace (implemented by *health.Checker.InStallGrace). While it
+	// is true the coordinator decides no new fence: a node that was suspended,
+	// swapped out or starved a moment ago has not been watching, and the view it
+	// resumes with — its own probe results, and the replicated rows it has not
+	// yet caught up on — is the least trustworthy it will ever hold. Recovery
+	// resumed from an already-recorded fence is not a new judgement and is not
+	// held back. nil (a hand-built coordinator) never defers.
+	LocalStall func() bool
 	// Now is the time source for lease TTL / fencing-log timestamps.
 	// Defaults to time.Now; the fleet harness overrides it with a
 	// virtual clock so scenarios can advance time deterministically
@@ -288,6 +304,7 @@ func NewCoordinator(hostName string, db *corrosion.Client) *Coordinator {
 		fencer:         fence.Execute,
 		fenced:         make(map[string]bool),
 		fenceRelocated: make(map[string]bool),
+		confirmResumed: make(map[string]string),
 		Now:            func() time.Time { return time.Now() },
 	}
 }
@@ -424,23 +441,54 @@ func (c *Coordinator) run(ctx context.Context) {
 	// cutoff and read as permanently stale — silently killing fencing quorum). Both
 	// forms decode to a wall instant, so the DISTINCT-observer-per-target quorum
 	// aggregation is done here too. An unparseable/stale row simply doesn't count.
+	// The status exclusion below keeps a REACHABLE host out of fencing quorum.
+	//
+	// consecutive_failures counts failed observations, and once the health
+	// checker probes readiness rather than TLS reachability, "the peer answered
+	// and told me its database is wedged" is one of those. Left in, the new
+	// signal would arrive as a power-off: three ticks of a busy database on a
+	// host whose VMs are running fine, and quorum fences it. That is the
+	// opposite of what the readiness probe is for, and it is also the one
+	// direction that cannot be undone.
+	//
+	// Fencing is for a host that cannot be reasoned with. A host answering an
+	// RPC to say it cannot serve is being reasoned with — it loses its votes,
+	// its placements and its pushes by no longer being 'healthy' anywhere, and
+	// keeps its power. If it then goes genuinely silent, the probe records
+	// 'suspect' like any other unreachable peer and this query counts it.
 	freshCutoff := c.now().Add(-healthFreshness)
 	hh, err := c.db.Query(ctx,
 		`SELECT target, observer, updated_at
 		 FROM host_health
 		 WHERE target != ?
-		   AND consecutive_failures >= ?`,
-		c.hostName, offlineThreshold)
+		   AND consecutive_failures >= ?
+		   AND status != ?`,
+		c.hostName, offlineThreshold, health.StatusUnready)
 	if err != nil {
 		slog.Error("failover: query host_health", "error", err)
 		c.mAttempt(PhaseHealth, ResultError, ErrDBError)
 		return
 	}
+	// Freshness is bounded on BOTH sides. A row stamped further ahead of this
+	// node's clock than a whole freshness window is not a recent observation
+	// but a skewed one — an observer whose clock runs fast, or one stepped
+	// forward on resume before ours was — and without the upper bound it
+	// stayed "fresh" for healthFreshness plus the skew. It counts once our
+	// clock reaches it. This errs toward not fencing, and only for as long as
+	// the skew lasts; host recovery (recoverHosts) deliberately keeps the
+	// one-sided test, since readmitting a host is not the irreversible act.
+	futureCutoff := c.now().Add(healthFreshness)
 	freshObservers := map[string]map[string]struct{}{}
 	for _, r := range hh {
 		inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
 		if !ok || !inst.After(freshCutoff) {
 			continue // stale or unparseable → does not count toward quorum
+		}
+		if inst.After(futureCutoff) {
+			slog.Warn("failover: ignoring a future-dated health observation (clock skew)",
+				"target", r.String("target"), "observer", r.String("observer"),
+				"updated_at", r.String("updated_at"), "ahead", inst.Sub(c.now()).Round(time.Second))
+			continue
 		}
 		t := r.String("target")
 		if freshObservers[t] == nil {
@@ -474,6 +522,10 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		target := cand.target
 		if c.fenced[target] {
+			// Handled this outage — unless an operator has since confirmed it
+			// off after a refusal. Without this check the confirmation landed
+			// on a host no code path would revisit (see confirmationResume).
+			c.resumeFromConfirmation(ctx, target)
 			continue
 		}
 
@@ -504,6 +556,12 @@ func (c *Coordinator) run(ctx context.Context) {
 					"host", target, "fence_id", rec.ID, "method", rec.Method)
 				c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
 				c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail})
+				continue
+			}
+			// The other way a stranded recovery can be resumed: a refusal for
+			// want of a confirmation, since confirmed. This is the path after a
+			// restart, when the refusing process's memory is gone.
+			if c.resumeFromConfirmation(ctx, target) {
 				continue
 			}
 			// A 'fenced' host WITHOUT that proof is not settled, it is unproven:
@@ -548,6 +606,16 @@ func (c *Coordinator) run(ctx context.Context) {
 			slog.Info("failover: host has recent fence record, skipping", "host", target)
 			c.fenced[target] = true
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrRecentlyFenced)
+			continue
+		}
+
+		// Checked last, immediately before the decision, so a stall that began
+		// while this cycle was reading the candidates still defers it. Nothing is
+		// cached: the next cycle after the grace window judges afresh.
+		if c.LocalStall != nil && c.LocalStall() {
+			slog.Warn("failover: quorum reached, but this node was itself not running moments ago — deferring the fence until it has watched for a full grace window",
+				"host", target, "observers", cand.observers, "quorum", quorum, "grace", health.StallGrace)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrLocalStall)
 			continue
 		}
 
@@ -701,7 +769,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 			continue
 		}
 		slog.Info("failover: host healthy again, marking active",
-			"host", h.Name, "from", h.State, "healthy_observers", rows[0].Int("n"), "quorum", quorum)
+			"host", h.Name, "from", h.State, "healthy_observers", len(fresh), "quorum", quorum)
 		c.mAttempt(PhaseRecovery, ResultRecovered, errClassNone)
 		delete(c.fenced, h.Name)
 		delete(c.fenceRelocated, h.Name)
@@ -1164,6 +1232,123 @@ func (c *Coordinator) resumableFence(ctx context.Context, h *corrosion.HostRecor
 	return rec, true
 }
 
+// confirmationResume returns the operator confirmation that authorises
+// resuming a refused recovery of h, or ok=false.
+//
+// A recovery refused for want of an operator confirmation — a manual fence, a
+// best-effort fence under the safe-fence policy, a host carrying
+// LabelFenceRequiresConfirmation — was never revisited. recoverFenced marks the
+// host handled for the outage before its gates run, so a `lv host fence-confirm`
+// written afterwards landed on a host nothing would look at again, in the same
+// process or after a restart. The documented manual flow did not work.
+//
+// Authority to resume is three independent facts, not the confirmation alone:
+//
+//   - the cluster ITSELF attempted a fence of h (a fencing_log row with result
+//     "fenced" or "partial" — written only by a fence that ran);
+//   - an operator confirmation ("manual-confirmed") at or after the NEWEST such
+//     attempt, so it attests to this outage and not an earlier one;
+//   - h is still quorum-down, which the caller supplies by construction: this
+//     runs only for fence candidates, i.e. hosts a fresh quorum observes failing.
+//
+// That answers the objection that withdrew the earlier stranded-workload sweep
+// (397c39f4): fence-confirm has no precondition and runs no fence, so on its
+// own a mistyped hostname would forge the proof. Here a mistype can only reach a
+// host the cluster already fenced and still observes down — the same authority
+// the manual path has always accepted at fence time via manualFenceConfirmed.
+//
+// Timestamps are compared in Go on RFC3339, for fenceWithinWindow's reason.
+// ">=" rather than ">", because both rows carry second precision and a prompt
+// operator can land in the fence's own second.
+func (c *Coordinator) confirmationResume(ctx context.Context, h *corrosion.HostRecord) (fenceRecord, bool) {
+	if h == nil || (h.State != "offline" && h.State != "fenced") {
+		return fenceRecord{}, false
+	}
+	rows, err := c.db.Query(ctx,
+		`SELECT id, method, result, detail, timestamp FROM fencing_log WHERE host_name = ?`, h.Name)
+	if err != nil {
+		slog.Warn("failover: fencing_log read for confirmation resume failed", "host", h.Name, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return fenceRecord{}, false
+	}
+	var attempt, confirmedAt time.Time
+	var confirm fenceRecord
+	for _, r := range rows {
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil {
+			continue
+		}
+		switch r.String("result") {
+		case "fenced", "partial":
+			if ts.After(attempt) {
+				attempt = ts
+			}
+		case "manual-confirmed":
+			if ts.After(confirmedAt) {
+				confirmedAt = ts
+				confirm = fenceRecord{
+					ID: r.String("id"), Method: r.String("method"), Result: r.String("result"),
+					Detail: r.String("detail"), TS: r.String("timestamp"),
+				}
+			}
+		}
+	}
+	if attempt.IsZero() || confirmedAt.IsZero() || confirmedAt.Before(attempt) {
+		return fenceRecord{}, false
+	}
+	return confirm, true
+}
+
+// resumeFromConfirmation resumes the recovery of target if an operator has
+// confirmed it off since a refusal (confirmationResume), at most once per
+// confirmation per process. Reports whether it did.
+//
+// Only the failover leader reaches it. Both call sites are inside run()'s
+// candidate loop, after acquireLease and the per-candidate holdLease, which is
+// the same lease check the fence path makes. That is also why the once-only map
+// is enough: a non-leader never reaches this function, so it never spends a
+// confirmation, and a coordinator that takes over the lease has not spent it
+// either, so it still resumes. TestConfirmationResume_OnlyTheLeaderResumes and
+// TestConfirmationResume_TheNextLeaderResumesAfterHandover pin both halves.
+// The lease is best-effort (docs/operating-model.md, "Leader-gated recovery"). If
+// two coordinators each hold it in their own replica, both get here, exactly as
+// both would fence.
+//
+// It resumes at recoverWorkloads, past recoverFenced's gates: those gates exist
+// to demand exactly the confirmation confirmationResume has just established,
+// and manualFenceConfirmed only looks back recentFenceWindow — five minutes, less
+// time than it takes to walk to a rack — so re-entering them would refuse a
+// genuine confirmation for being slow. recoverWorkloads keeps its own late
+// gates, and binds shared-disk transfers to a proof-grade fence, for which a
+// fresh confirmation qualifies.
+func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string) bool {
+	h, err := corrosion.GetHost(ctx, c.db, target)
+	if err != nil || h == nil {
+		return false
+	}
+	rec, ok := c.confirmationResume(ctx, h)
+	if !ok || c.confirmResumed[target] == rec.ID {
+		return false
+	}
+	// Decide-site gate, as at every other point that asserts runtime ownership:
+	// the lease alone can be held on both sides of a partition.
+	if c.gateEnforced(ctx) {
+		if g := c.Gate.DecisionGate(ctx); !g.OK {
+			slog.Warn("failover: decision gate refused a confirmation resume", "host", target, "reason", g.Reason)
+			c.noteGateRefused(ActionReschedule, g.Reason)
+			c.mAttempt(PhaseRecovery, ResultRefused, ErrNoQuorum)
+			return false
+		}
+	}
+	slog.Info("failover: operator confirmed a host whose recovery was refused, resuming",
+		"host", target, "confirmation", rec.ID, "confirmed_at", rec.TS)
+	c.mAttempt(PhaseRecovery, ResultOK, ErrConfirmationResumed)
+	c.fenced[target] = true
+	c.confirmResumed[target] = rec.ID
+	c.recoverWorkloads(ctx, h)
+	return true
+}
+
 // fenceRecord is one fencing_log row read back: the fence that physically
 // happened, as a coordinator that did not perform it sees it.
 type fenceRecord struct {
@@ -1344,6 +1529,15 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.OnFence(h.Name, fr.Method, logResult, fr.Detail)
 	}
 
+	// Say so, at the moment it matters, when the fence proves nothing. The row
+	// above reads "fenced" either way; this is the line an on-call engineer
+	// reading this node's journal during a failover will actually see.
+	if a := corrosion.FenceAssurance(fr.Method, logResult); a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
+		slog.Warn("failover: this fence was not verified — the host may still be running",
+			"host", h.Name, "method", fr.Method, "assurance", a,
+			"fix", "give "+h.Name+" an ipmi fence strategy to make its fences verifiable")
+	}
+
 	// Step 2a: a VERIFIED power-off is a fact about the host, the same class of
 	// thing as the fencing_log row above — it is true no matter who holds the
 	// lease a moment later. Write it BEFORE the leadership re-check so a handoff
@@ -1352,7 +1546,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// path) instead of leaving the workloads on a powered-off host. The
 	// "offline" state is an INFERENCE about a fence that could not prove itself,
 	// so recoverFenced writes that one, behind the check, with the reschedule.
-	if fenceProvedOff(fr) {
+	if fenceProvedOff(h, fr) {
 		c.markHostState(ctx, h.Name, "fenced")
 	}
 
@@ -1388,8 +1582,32 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 // and whether a later coordinator may resume the recovery from the record
 // alone — the two must agree, or a resumed recovery would act on a fence that
 // never established the host was down.
-func fenceProvedOff(fr fence.Result) bool {
+//
+// A host carrying LabelFenceRequiresConfirmation raises the bar to the
+// shared-storage one: only a VERIFIED fence (corrosion.FenceProofGrade) counts,
+// so an SSH or best-effort success leaves the host "offline" rather than
+// recording it as known to be off. Without the label the rule is unchanged.
+func fenceProvedOff(h *corrosion.HostRecord, fr fence.Result) bool {
+	if requiresFenceConfirmation(h) {
+		return fr.Success && corrosion.FenceProofGrade(fr.Method, "fenced")
+	}
 	return fr.Success && fr.Method != "manual"
+}
+
+// requiresFenceConfirmation reports whether h has opted into "an unverified
+// fence is not enough" via LabelFenceRequiresConfirmation.
+//
+// A per-host label, not a config flag or a capability token, and deliberately
+// so. The decision it changes is made in ONE place — the coordinator creating
+// the recovery — so no peer has to honour anything, and a coordinator on an
+// older binary simply does not read the label and behaves exactly as today:
+// the fail-mode of a mixed-version roll is the existing behaviour, never a
+// weaker one. It is per host because the answer differs by host: one with a
+// separate management network is safer to trust than one without. And it
+// needs no schema change, beside LabelUnsafeAutoFailover, the fencing policy
+// label already here.
+func requiresFenceConfirmation(h *corrosion.HostRecord) bool {
+	return h != nil && h.Labels[corrosion.LabelFenceRequiresConfirmation] == "true"
 }
 
 // markHostState records a host-state transition the coordinator decided on,
@@ -1425,7 +1643,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// rather than "fenced" — a weaker claim, and the one the split-brain guards
 	// below still demand confirmation for. The proof-grade case was written by
 	// the caller, before the lease re-check, so it survives a handoff.
-	if !fenceProvedOff(fr) {
+	if !fenceProvedOff(h, fr) {
 		c.markHostState(ctx, h.Name, "offline")
 	}
 
@@ -1448,6 +1666,27 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			return
 		}
 		slog.Info("failover: operator confirmed best-effort fence, proceeding", "host", h.Name)
+		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
+	}
+
+	// Per-host "an unverified fence is not enough" (LabelFenceRequiresConfirmation).
+	// A successful fence that did not VERIFY the power-off — SSH, or best-effort
+	// in either of its forms — is treated like a manual one: reschedule only on
+	// an operator confirmation. A verified (IPMI) fence passes; a failed fence
+	// falls through to the split-brain guard below, which refuses it anyway.
+	//
+	// A confirmation written AFTER this refusal is picked up by the fence loop
+	// (resumeFromConfirmation), which resumes the recovery from it.
+	if requiresFenceConfirmation(h) && fr.Success && !corrosion.FenceProofGrade(fr.Method, "fenced") {
+		if !c.manualFenceConfirmed(ctx, h.Name) {
+			slog.Error("failover: host requires a verified fence and this one was not verified, NOT rescheduling",
+				"host", h.Name, "method", fr.Method, "detail", fr.Detail,
+				"label", corrosion.LabelFenceRequiresConfirmation,
+				"hint", "run 'lv host fence-confirm "+h.Name+"' once the host is powered off; the recovery resumes from it")
+			c.mAttempt(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)
+			return
+		}
+		slog.Info("failover: operator confirmed an unverified fence, proceeding", "host", h.Name, "method", fr.Method)
 		c.mAttempt(PhaseSplitBrain, ResultOK, ErrManualConfirmed)
 	}
 
@@ -1762,12 +2001,18 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			if !ok || result.Host == "" {
 				// No eligible host under the VM's hard constraints. Same
 				// reasoning as the batch-error path above: skip loudly.
+				// result.Err names the filter that refused each survivor — the
+				// operator's only clue to what would let the VM place.
+				detail := "no eligible host satisfies its placement constraints after fencing " + h.Name
+				if result.Err != nil {
+					detail += ": " + result.Err.Error()
+				}
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
-					"vm", vm.Name, "from", h.Name)
+					"vm", vm.Name, "from", h.Name, "reason", result.Err)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
 				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 					ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
-					Target: vm.Name, Detail: "no eligible host satisfies its placement constraints after fencing " + h.Name, Result: "skipped",
+					Target: vm.Name, Detail: detail, Result: "skipped",
 				})
 				continue
 			}
@@ -2171,7 +2416,9 @@ func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.Cont
 	// did not fit. "" tells the caller to skip loudly and leave the row for
 	// operator recovery instead.
 	target, err := placement.Select(ctx, c.db, placement.Request{
-		VMName: ct.Name, CPUNeeded: ct.CPULimit, MemMiBNeeded: ct.MemMiB,
+		// A container holds memory only: its cpu_limit is no vCPU reservation
+		// and it carries no qemu overhead.
+		VMName: ct.Name, Container: true, MemMiBNeeded: ct.MemMiB,
 		Capacity: c.capacity,
 	})
 	if err != nil {

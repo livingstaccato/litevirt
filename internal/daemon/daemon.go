@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"github.com/litevirt/litevirt/internal/secretfile"
@@ -27,7 +26,6 @@ import (
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/billing"
 	"github.com/litevirt/litevirt/internal/capabilities"
-	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/failover"
@@ -650,6 +648,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler := health.NewReconciler(d.cfg.HostName, d.cfg.DataDir, d.db, d.virt)
 	reconciler.SetGate(d.checker)
 	reconciler.SetOwnerEpochBackfill(d.cfg.Enforcement.OwnerEpoch) // Phase 4 backfill pass
+	// Unconditional: the out-of-band stop sync waits until this node's replica
+	// has caught up with a peer (anti-entropy, above) since start / last rejoin.
+	reconciler.SetReplicaFreshness(d.db.ReplicaCaughtUp)
 	reconciler.SetGateRefusedObserver(gateMetrics.Refused)
 	reconciler.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	reconciler.SetSharedStorageFenceEnforce(d.cfg.Enforcement.SharedStorageFence) // shared-disk transfer fence kill-switch
@@ -735,11 +736,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Ensure libvirt storage pools exist.
 	d.ensureStoragePools()
 
-	// Re-provision networks (DHCP, NAT, VXLAN) for active stacks.
-	// dnsmasq is a child process that dies when the daemon restarts;
-	// this brings it back for any network with a subnet.
-	d.reconcileNetworks(ctx)
-
 	// Start gRPC server with mTLS
 	tlsCfg, err := pki.ServerTLSConfig(d.cfg.PKIDir)
 	if err != nil {
@@ -748,6 +744,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
+
+	// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
+	// down every deleted one. dnsmasq is a child process that dies when the
+	// daemon restarts; this brings it back. The same pass then runs on an
+	// interval (StartNetworkReconciler, below), which is what carries a
+	// network created or deleted on another node to this one.
+	if err := svc.ReconcileNetworksOnce(ctx); err != nil {
+		slog.Warn("startup network reconcile failed", "error", err)
+	}
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
@@ -923,6 +928,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetRealmRegistry(d.realmRegistry)
 	vmChecker.SetEventBus(svc.EventBus())
 	vmChecker.SetMigrateFunc(svc.MigrateVMForHealthCheck)
+	// Every guest start the Server performs opens the healthcheck's start grace,
+	// including RestartVM's, which keeps the row "running" and is otherwise
+	// invisible to the checker's sweep.
+	svc.SetVMStartObserver(vmChecker)
 	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
 	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
@@ -934,6 +943,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	reconciler.SetHardwareStartPreparer(svc.PrepareHardwareForStart)
 	reconciler.SetAutoPullImage(svc.AutoPullImage)
 	reconciler.SetBackupInProgress(svc.BackupInProgress)
+	reconciler.SetNetworkProvision(svc.ProvisionNetworkHere) // a failover start provisions like a VM create
 	// Runtime owner-assert (Phase 3): corroborate a locally-running VM whose DB
 	// row points elsewhere against every other active host's libvirt before
 	// reclaiming it.
@@ -943,7 +953,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// reachability, never stale replicated rows. Once this is set, the proof-table
 	// WAL gate (wired before repl.Start above) can positively confirm peers; until
 	// now PeerSupports failed closed, deferring proof entries rather than leaking.
-	d.checker.SetPeerPinger(svc.PeerCapabilities)
+	// Paired with the readiness probe, which turns the peer health check from a
+	// TLS handshake into an application-level question — see wirePeerProbes.
+	wirePeerProbes(d.checker, svc)
 	// Runtime ownership repair metrics (Phase 5): VM owner-assert + CT re-key
 	// outcomes → litevirt_runtime_owner_assert_total.
 	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
@@ -1119,6 +1131,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetAntiEntropy(ae) // `lv cluster converge` kicks an immediate debounced pass
 	d.fwReconciler.Start(ctx)
 
+	// Converge this host's network devices on the replicated networks table
+	// every 30s: a network created elsewhere is provisioned here, a deleted
+	// one is torn down here. Started after the firewall reconciler so a pass
+	// that records NAT/isolation intent has something to apply it.
+	svc.StartNetworkReconciler(ctx, 0)
+
 	// tenancy + billing engine. The webhook URL is empty
 	// for most clusters; the emitter resolves to a no-op in that
 	// case so production-without-billing is the zero-config default.
@@ -1269,6 +1287,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fc.SetGateRefusedObserver(gateMetrics.Refused)
 	// A self-fenced coordinator stops driving failover during the fence-timeout window.
 	fc.SelfFenced = watchdogCtrl.Fenced
+	// A coordinator that was itself suspended or starved a moment ago decides no
+	// fence until it has watched for a full grace window (health/stall.go).
+	fc.LocalStall = d.checker.InStallGrace
 	go fc.Start(ctx)
 
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
@@ -1957,37 +1978,6 @@ func (d *Daemon) storagePoolRefs() map[string]grpcapi.StoragePoolRef {
 		}
 	}
 	return refs
-}
-
-// reconcileNetworks re-provisions DHCP and NAT for active networks on daemon
-// startup. dnsmasq is a child process that dies when the daemon restarts, so
-// we need to bring it back for any network with a subnet.
-func (d *Daemon) reconcileNetworks(ctx context.Context) {
-	nets, err := corrosion.ListNetworks(ctx, d.db)
-	if err != nil {
-		slog.Warn("reconcileNetworks: list networks", "error", err)
-		return
-	}
-	localIP := network.LocalIP()
-	for _, n := range nets {
-		if n.Config == "" {
-			continue
-		}
-		var def compose.NetworkDef
-		if err := json.Unmarshal([]byte(n.Config), &def); err != nil {
-			slog.Warn("reconcileNetworks: parse config", "network", n.Name, "error", err)
-			continue
-		}
-		def.Type = n.Type
-		if def.Interface == "" {
-			def.Interface = n.Name
-		}
-		if _, err := network.SafeProvision(ctx, d.db, n.Name, def, localIP, d.cfg.HostName); err != nil {
-			slog.Warn("reconcileNetworks: provision failed", "network", n.Name, "error", err)
-		} else {
-			slog.Info("network reconciled", "network", n.Name, "type", n.Type)
-		}
-	}
 }
 
 // ensureStoragePools creates libvirt storage pools from config, or a default

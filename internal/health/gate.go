@@ -142,6 +142,14 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		return QuorumUnknown, 0, 0
 	}
 
+	// A peer this node last saw healthy BEFORE its own most recent stall is not
+	// proven live: the stall is exactly the window in which it may have died,
+	// and the failures that would have said so were withheld (stall.go). It
+	// counts again after one successful probe. This is the fail-closed half of
+	// the stall guard — without it, withholding failures would leave a node that
+	// resumed into a partition claiming quorum for longer than before.
+	stallAt, _ := c.beat(c.now())
+
 	c.mu.Lock()
 	probed := c.probedOnce
 	started := c.startedAt
@@ -154,7 +162,8 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		// THIS run probes the peer healthy at least once, so a peer can never be
 		// credited toward quorum on anything but a fresh probe of our own —
 		// whatever a future bootstrap decides to pre-populate.
-		healthy[name] = ps.status == "healthy" && !ps.lastHealthyAt.IsZero()
+		healthy[name] = ps.status == "healthy" && !ps.lastHealthyAt.IsZero() &&
+			!ps.lastHealthyAt.Before(stallAt)
 	}
 	c.mu.Unlock()
 

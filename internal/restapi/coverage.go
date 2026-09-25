@@ -8,11 +8,14 @@
 package restapi
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
 
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"gopkg.in/yaml.v3"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -80,14 +83,74 @@ func (s *Server) handleStackDeploy(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	// Non-SSE callers get the first progress frame; long-running
-	// callers should set Accept: text/event-stream.
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
+	// The whole stream is read. Returning early closes it, and a closed
+	// DeployStack stream cancels the deploy on the server: the old "first
+	// frame" answer created at most one VM, abandoned the rest and said 200.
+	// Per-action failures arrive as "error" frames on a stream that still ends
+	// OK, so the result is judged the way `lv compose up` judges it.
+	var named struct {
+		Name string `yaml:"name"`
 	}
-	jsonProto(w, first)
+	_ = yaml.Unmarshal([]byte(req.ComposeYaml), &named) // the name is only for the response
+	res := stackDeployResult{Name: named.Name, Done: []string{}, Failures: []stackDeleteFailure{}}
+	actions, failed := map[string]bool{}, map[string]bool{}
+	for {
+		p, rerr := stream.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			code, msg := grpcHTTPStatus(http.StatusInternalServerError, rerr)
+			if len(actions) == 0 && len(res.Done) == 0 {
+				jsonError(w, code, msg)
+				return
+			}
+			res.Error = fmt.Sprintf("stack %q: deploy failed: %s", res.Name, msg)
+			w.WriteHeader(code)
+			jsonWrite(w, res)
+			return
+		}
+		if p.VmName != "" {
+			actions[p.VmName] = true
+		}
+		switch p.Phase {
+		case "error":
+			item := p.VmName
+			if item == "" {
+				item = "stack resource"
+			}
+			if !failed[item] {
+				failed[item] = true
+				res.Failures = append(res.Failures, stackDeleteFailure{Name: item, Error: p.Error})
+			}
+		case "done":
+			if p.VmName != "" {
+				res.Done = append(res.Done, p.VmName)
+			}
+		}
+	}
+	if len(res.Failures) > 0 {
+		names := make([]string, len(res.Failures))
+		for i, f := range res.Failures {
+			names[i] = f.Name
+		}
+		total := len(actions)
+		if total < len(res.Failures) {
+			total = len(res.Failures)
+		}
+		res.Error = fmt.Sprintf("stack %q: %d of %d actions failed (%s); the stack is left degraded and a re-deploy retries them",
+			res.Name, len(res.Failures), total, strings.Join(names, ", "))
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	jsonWrite(w, res)
+}
+
+// stackDeployResult is the non-SSE response of /api/v1/stacks/deploy.
+type stackDeployResult struct {
+	Name     string               `json:"name"`
+	Done     []string             `json:"done"`
+	Failures []stackDeleteFailure `json:"failures"`
+	Error    string               `json:"error,omitempty"`
 }
 
 func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
@@ -109,12 +172,71 @@ func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
+
+	// DeleteStack ends OK even when resources could not be removed — each is an
+	// "error" status on the stream — so the whole stream is drained and judged
+	// the way `lv compose down` judges it: 200 only when nothing failed.
+	res := stackDeleteResult{Name: req.Name, Deleted: []string{}, Failures: []stackDeleteFailure{}}
+	seen, failed := map[string]bool{}, map[string]bool{}
+	for {
+		p, rerr := stream.Recv()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			code, msg := grpcHTTPStatus(http.StatusInternalServerError, rerr)
+			if len(seen) == 0 {
+				jsonError(w, code, msg)
+				return
+			}
+			res.Error = fmt.Sprintf("stack %q: delete failed: %s", req.Name, msg)
+			w.WriteHeader(code)
+			jsonWrite(w, res)
+			return
+		}
+		// Not only VMs: containers, a network that could not be deprovisioned
+		// or a failed container listing arrive named for themselves, and an
+		// unnamed error still counts.
+		item := p.VmName
+		if item == "" && p.Status == "error" {
+			item = "stack resource"
+		}
+		if item != "" {
+			seen[item] = true
+		}
+		switch p.Status {
+		case "error":
+			if !failed[item] {
+				failed[item] = true
+				res.Failures = append(res.Failures, stackDeleteFailure{Name: item, Error: p.Error})
+			}
+		case "deleted":
+			res.Deleted = append(res.Deleted, p.VmName)
+		}
 	}
-	jsonProto(w, first)
+	if len(res.Failures) > 0 {
+		names := make([]string, len(res.Failures))
+		for i, f := range res.Failures {
+			names[i] = f.Name
+		}
+		res.Error = fmt.Sprintf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",
+			req.Name, len(res.Failures), len(seen), strings.Join(names, ", "))
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	jsonWrite(w, res)
+}
+
+// stackDeleteResult is the non-SSE response of /api/v1/stacks/delete.
+type stackDeleteResult struct {
+	Name     string               `json:"name"`
+	Deleted  []string             `json:"deleted"`
+	Failures []stackDeleteFailure `json:"failures"`
+	Error    string               `json:"error,omitempty"`
+}
+
+type stackDeleteFailure struct {
+	Name  string `json:"name"`
+	Error string `json:"error"`
 }
 
 func (s *Server) handleStackExport(w http.ResponseWriter, r *http.Request) {
@@ -368,21 +490,21 @@ func (s *Server) handleVMMoveVolume(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.MoveVolume(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.MoveVolume(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "move volume", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 func (s *Server) handleVMReplicateVolume(w http.ResponseWriter, r *http.Request) {
@@ -395,21 +517,21 @@ func (s *Server) handleVMReplicateVolume(w http.ResponseWriter, r *http.Request)
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.ReplicateVolume(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.ReplicateVolume(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "replicate volume", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 // ── Backup snapshot push / pull ──────────────────────────────────────────────
@@ -424,21 +546,21 @@ func (s *Server) handleBackupSnapshot(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.BackupSnapshot(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.BackupSnapshot(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "backup snapshot", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
@@ -451,21 +573,21 @@ func (s *Server) handleBackupRestore(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.RestoreFromBackup(s.grpcCtx(r), &req)
+	ctx, cancel := s.opContext(r)
+	stream, err := s.grpc.RestoreFromBackup(ctx, &req)
 	if err != nil {
+		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
 	if wantsSSE(r) {
+		defer cancel()
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
-	first, rerr := stream.Recv()
-	if rerr != nil {
-		grpcHTTPError(w, http.StatusInternalServerError, rerr)
-		return
-	}
-	jsonProto(w, first)
+	// Without SSE the answer is an acknowledgement; the operation keeps
+	// running on a detached context (#192).
+	ackFirstAndDetach(w, "restore from backup", cancel, func() (proto.Message, error) { return stream.Recv() })
 }
 
 // ── Preflight ────────────────────────────────────────────────────────────────

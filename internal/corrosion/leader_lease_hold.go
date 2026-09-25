@@ -113,6 +113,10 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		if err != nil {
 			return false, 0, err
 		}
+		// Who the ledger says holds the newest incarnation. For a contested term
+		// that is the one claimant allowed to continue, not whichever claim this
+		// replica happened to keep — see leader_lease_contest.go.
+		effective, contested := c.effectiveLeaseHolder(key, newest)
 
 		// Both sides are RFC3339 UTC, so a lexical compare is a time compare.
 		// Expiry is consulted deliberately: holder identity alone does NOT prove
@@ -126,6 +130,31 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 
 		if ourTenure {
 			switch {
+			case newest.Term > 0 && newest.Holder == holder && contested && effective != holder:
+				// Our term is contested and a lower-sorting claimant exists: STAND
+				// DOWN. No renewal, no term. Our leader_election row keeps naming us
+				// until it expires, and deferTakeover stops us re-taking it then.
+				return false, 0, nil
+
+			case newest.Term > 0 && newest.Holder == holder && contested:
+				// Our term is contested and we are the claimant that continues —
+				// but not under this term, whose other claims every other replica
+				// still records. Retire it: mint above it, atomically with the
+				// renewal, so the term we act under is one no replica attributes to
+				// anyone else and the contested one falls below every threshold.
+				held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur,
+					!c.heldTermlessIncarnation(key), newest.Term)
+				if err != nil {
+					return false, 0, err
+				}
+				if held {
+					return true, term, nil
+				}
+				if term == leaseContended {
+					continue
+				}
+				return false, 0, nil
+
 			case newest.Term > 0 && newest.Holder == holder && !c.heldTermlessIncarnation(key):
 				// Same tenure, term already recorded: renew, mint nothing. A
 				// renewal that bumped the term would make the holder invalidate
@@ -182,12 +211,20 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 			// and reseedKeepTables stops a reseed from deleting it.
 		}
 
+		// Not ours. An expired lease whose row names someone other than the
+		// ledger's current incarnation is not ours to take yet — its real holder
+		// may be renewing over it right now. See deferTakeover.
+		if !ourTenure && curExpires < nowRFC && newest.Term > 0 &&
+			deferTakeover(curHolder, curExpires, effective, holder, now, ttl) {
+			return false, 0, nil
+		}
+
 		// Whether the ledger's newest term belongs to the incarnation we are
 		// holding right now, which is what separates a renewal from a
 		// lapse-and-retake by the same node.
 		incarnationHasTerm := newest.Term > 0 && newest.Holder == holder &&
 			!c.heldTermlessIncarnation(key)
-		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, incarnationHasTerm)
+		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, incarnationHasTerm, 0)
 		if err != nil {
 			return false, 0, err
 		}
@@ -397,7 +434,13 @@ func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC str
 // dropping them is worse than having no atomicity: losing the race while still
 // minting leaves an orphan term row that raises MAX(term) above the real
 // holder's own term, actively fencing the legitimate leader.
-func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, incarnationHasTerm bool) (bool, int64, error) {
+//
+// incarnationHasTerm says the ledger's newest term belongs to the incarnation
+// the caller holds now; retire is the contested term the caller is retiring
+// (0 for an ordinary acquisition), which lets the caller's own live tenure mint
+// above its own term where clause 2 of leaseAcquirableTx would otherwise refuse
+// it as a renewal.
+func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, incarnationHasTerm bool, retire int64) (bool, int64, error) {
 	acquiredAt := now.UTC().Format(time.RFC3339)
 
 	next, err := nextLeaseTerm(ctx, c, key)
@@ -407,7 +450,7 @@ func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, 
 
 	applied, err := c.ExecuteBatchGuarded(ctx,
 		func(tx *sql.Tx) (bool, error) {
-			return leaseAcquirableTx(ctx, tx, key, holder, nowRFC, next, incarnationHasTerm)
+			return leaseAcquirableTx(ctx, tx, key, holder, nowRFC, next, incarnationHasTerm, retire)
 		},
 		[]Statement{
 			{SQL: leaseUpsertSQL, Params: []interface{}{key, holder, expires, c.NowTS(), nowRFC}},
@@ -483,7 +526,18 @@ func leaseRow(ctx context.Context, c *Client, key string) (holder, expiresAt str
 //     below that threshold — the same inversion as an orphan term, arriving on
 //     the success path. Comparing against MAX rather than existence also covers
 //     the slot check, since tombstoned rows keep their number reserved.
-func leaseAcquirableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC string, term int64, incarnationHasTerm bool) (bool, error) {
+//
+// incarnationHasTerm narrows clause 2 to the term of the incarnation being
+// held: a same-holder term left by a tenure that lapsed and was re-taken
+// termlessly is an earlier tenure's, not a renewal of this one.
+//
+// retire > 0 relaxes clause 2 for exactly one case: retiring a contested term
+// (see leader_lease_contest.go). The newest live term must still be that term
+// and still recorded as ours on this replica, so a retirement classified from a
+// read that has since been superseded — by a peer's higher term, or by a
+// sibling caller that already retired it — declines like any other stale
+// classification.
+func leaseAcquirableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC string, term int64, incarnationHasTerm bool, retire int64) (bool, error) {
 	var curHolder, expiresAt string
 	err := tx.QueryRowContext(ctx,
 		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, key).Scan(&curHolder, &expiresAt)
@@ -512,8 +566,21 @@ func leaseAcquirableTx(ctx context.Context, tx *sql.Tx, key, holder, nowRFC stri
 			// re-took it termlessly still has that old term in the ledger under
 			// its own name; treating it as ours would carry a dead tenure's
 			// term into a new one.
-			if n > 0 && incarnationHasTerm {
+			if n > 0 && retire <= 0 && incarnationHasTerm {
 				return false, nil // this incarnation's own term: a renewal
+			}
+			if n > 0 && retire > 0 {
+				var newestTerm int64
+				var newestHolder string
+				if err := tx.QueryRowContext(ctx,
+					`SELECT term, holder FROM leader_lease_terms
+					  WHERE key = ? AND deleted_at IS NULL
+					  ORDER BY term DESC LIMIT 1`, key).Scan(&newestTerm, &newestHolder); err != nil {
+					return false, err
+				}
+				if newestTerm != retire || newestHolder != holder {
+					return false, nil
+				}
 			}
 		}
 	}

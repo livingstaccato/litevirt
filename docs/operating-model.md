@@ -17,7 +17,14 @@ per node), so all hosts must run NTP (HLC does not arbitrate conflicts). An
 resolver**: a deterministic winner where any pick is safe, otherwise the row is
 kept-local and flagged for repair (ownership/tenancy/policy/auth are never
 coin-flipped) — see [Diagnostics](diagnostics.md). Health is observed
-peer-to-peer (TLS probes every 2 s).
+peer-to-peer every 2 s, by an
+application-level readiness probe that performs a trivial local read — not by a
+TLS handshake, which a daemon with a wedged database completes perfectly. An
+observer that was itself not running (suspended, swapped out, starved of CPU)
+does not count the probes it timed out while stopped, or any unreachable probe
+in the 10 s after it resumes, and its coordinator decides no fence in that
+window. See [Migration & Failover](migration-failover.md) → "An observer that
+stopped running is not a witness".
 Failover is decided by quorum among observers, gated by a CRDT-stored leader
 lease. Fencing has multiple strategies; safety guards refuse to reschedule
 VMs after a fence failure so that the same VM never runs on two hosts at once.
@@ -26,12 +33,46 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 
 ## What the cluster guarantees
 
+### Three different guarantees, one vocabulary
+
+Most of the confusion about what litevirt promises comes from one word —
+"replicated" — standing in for three things of very different strength. They are
+named separately here, and the rest of this page uses these names.
+
+| Term | What has happened | What it does NOT mean |
+|---|---|---|
+| **Local commit** | The write is durable in this host's SQLite store and the RPC has returned. | Nothing has left the host. |
+| **Peer-durable** | At least one other host has applied the write. | Not a majority, and not an ordering guarantee. |
+| **Quorum-authorized** | A majority of reachable voting members was confirmed *before the action was taken*. | Not that the action's record has replicated anywhere. |
+
+Almost every write is **local commit** only. Replication is an asynchronous push
+over the relay topology, woken by the write and backstopped by a 60 s
+anti-entropy pass; no ordinary API call waits for a peer to apply anything. A
+write that commits locally and is followed immediately by the loss of that host
+is lost, and no amount of peer *reachability* changes that — reachability is
+measured by a probe, not by an acknowledgment of your write. Peer-durability is
+observable after the fact (`litevirt_replication_min_watermark_seq` advances,
+`lv cluster converge` reports matching digests); it is not something an
+operation can be asked for.
+
+**Quorum-authorized** is a separate axis and applies to a short list: fencing a
+host, and every runtime-ownership action behind `DecisionGate`/`ExecutionGate`
+in `internal/health/gate.go`. Those refuse to proceed without a live majority
+this daemon itself probed. It is an authorization to act, computed at the moment
+of acting — it says nothing about whether the resulting rows have replicated.
+
 ### Replication
 - **Eventual consistency** of all CRDT-replicated tables across all healthy
   members. After any partition heals, all hosts converge to the same state
   for any record whose `updated_at` you can observe stabilizing.
-- **No data loss for committed local writes** as long as one healthy peer
-  remains reachable before the host dies.
+- **A local commit is not peer-durable.** A write returns once it is durable in
+  the local store; the push to peers is asynchronous. If the host dies between
+  those two moments the write is gone. A peer being *reachable* is not a peer
+  having *applied* anything — reachability is what the health probe measures.
+  Where a write must survive the loss of
+  its origin host, confirm it landed — `litevirt_replication_min_watermark_seq`
+  advancing past the write, or `lv cluster converge` reporting matching digests
+  — rather than assuming a healthy cluster implies it did.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
   and is the safety net for divergence the WAL replicator missed. Public,
   operator-readable state uses `StreamStateDump`; eligible secret-bearing config
@@ -45,9 +86,21 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
   observers report `consecutive_failures ≥ 5` for it (where N is non-offline
   active hosts). Stale observer rows (older than 30 s) are excluded.
-- **Leader-gated recovery.** Only one coordinator at a time drives recovery.
-  The lease is held in a CRDT row with a 45 s TTL and re-validated before
-  every destructive action. A fence additionally requires 30 s of the lease
+- **Leader-gated recovery — best-effort, not exclusive.** The lease is a CRDT
+  row with a 45 s TTL, re-validated before every destructive action. A CRDT row
+  store cannot offer linearisable compare-and-swap across a partition, so the
+  lease *suppresses* concurrent coordinators rather than excluding them: both
+  sides of a partition can believe they hold it (`acquireLease` says so in as
+  many words). That is why the lease is never sufficient on its own — a decision
+  site requires `holdLease()` **and** `DecisionGate.OK`, which is a quorum this
+  daemon probed for itself, and the minority side fails closed there. Read "only
+  one coordinator acts" as the intended end state of the exclusivity work, not
+  as something the current code guarantees. What the code *does* guarantee is
+  that a split with a healthy network does not last: when several survivors
+  claim an expired lease at once — the ordinary shape of a leader death, since
+  every node polls on the same interval — the lowest-sorting claimant keeps the
+  lease on a fresh term and every other claimant stands down on the tick it
+  learns of that claim (see *A contested lease still converges* below). A fence additionally requires 30 s of the lease
   still to run before it may start, because an IPMI power-off plus its
   verification can take 23 s and a fence cut short is reported as unconfirmed.
 - **Only the peers a node actually pushes to can pin its log.** Replication is
@@ -78,17 +131,14 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
 - **A VM created through `CreateVM` is normally provable immediately.** It is
   assigned its first ownership generation and both runtime markers (libvirt
   domain metadata and the host-local marker file) are stamped before the call
-  returns. Previously the row was born at the pre-epoch default and carried no
-  marker until the reconciler's next backfill sweep, so for up to that interval
-  a running VM could not prove which generation it belonged to.
-  **This narrows that window; it does not close it**, and it covers only that
-  one path. The row is still published as `running` before the markers are
+  returns.
+  **This narrows the window in which a running VM cannot prove its generation;
+  it does not close it**, and it covers only that one path. The row is still published as `running` before the markers are
   written, so a crash or a failure in between still leaves a running VM that
-  cannot prove its generation — now for the width of a few calls inside one RPC
-  rather than a sweep interval. The dual-run detector's newborn grace remains
+  cannot prove its generation — for the width of a few calls inside one RPC. The dual-run detector's newborn grace remains
   the backstop for that residue, and closing it needs the create path reordered
-  to record the row before the runtime exists. All containers are unchanged:
-  they graduate on the backfill sweep as before.
+  to record the row before the runtime exists. Containers do not take this path:
+  they graduate on the backfill sweep.
 - **A VM published as `running` is marked at the same time, on the host that
   runs it.** Every local transition that sets a VM to `running` — start,
   snapshot restore, import, a failed migration healing back, the reconciler's
@@ -146,9 +196,8 @@ VMs after a fence failure so that the same VM never runs on two hosts at once.
   legitimately-owned VM), so treating a `0` as unreadable there would turn its
   refusal into a permission — the dual-run the marker exists to prevent. A
   NEGATIVE marker gets no such treatment: it is garbage, and no decision is
-  derived from it. One consequence is visible on upgrade: a VM already running
-  with a `0` marker was never provable, and now reports as such rather than
-  passing silently.
+  derived from it. A VM running with a `0` marker is therefore not provable,
+  and reports as such rather than passing silently.
 
 ### Time
 - HLC rejects remote timestamps more than **5 minutes ahead** of local wall
@@ -209,7 +258,7 @@ empty `leader_lease_terms`.
 It gates the mint rather than the read because the mint is the first write this
 table ever replicated, and a host still on the previous release cannot decode
 it: the write would not be ignored, it would stall that host's replication
-entirely. So the latch is the proof that no such host is listening any more.
+entirely. So the latch is the proof that no such host is listening.
 
 **"Every host" means every host still receiving replication, not every host that
 votes.** A host in `maintenance` does not vote, but its daemon is up, it is in
@@ -328,7 +377,6 @@ costs milliseconds. When there is one, the numbers are:
 | --- | --- |
 | every peer answering | milliseconds per proof |
 | one connected-but-silent peer | ~13s total (one 3s sweep, then a 250ms probe per proof) |
-| the same, before this was bounded | up to 120s total (3s per proof) |
 
 The bound comes from remembering that a peer answered nothing and giving it a
 250ms probe on the next sweep instead of the full budget, for up to 10s. It
@@ -346,8 +394,10 @@ earns:
   linearizable* above still holds in full.
 - **It is not consensus, and a contested term is not resolved cluster-wide.**
   Two partitioned nodes can each mint the same term naming themselves, and
-  nothing here elects a winner or ever will — see *What this table will and will
-  not show you* below.
+  nothing here elects a winner *for that term's ledger rows* or ever will — see
+  *What this table will and will not show you* below. The LEASE moves on
+  instead: one claimant retires the contested term by minting above it, so the
+  term both rows name is never current again.
 - **One host will not act for two claimants of one tenure.** That is the real
   guarantee, and it is narrower than it sounds: the claim binds an executor to
   the first claimant it acted for at that `(key, term)`, so the second is
@@ -386,9 +436,9 @@ A proof's term and key are also part of a check that is INDEPENDENT of term
 enforcement and runs whether or not it is switched on. An executor field-matches
 the proof it was handed against the proof row it has persisted — action, target
 kind and name, coordinator, destination, relocation token, fence epoch, owner
-epoch, and now the lease term and key; `corrosion.ProofBindingEqual` is the one
+epoch, and the lease term and key; `corrosion.ProofBindingEqual` is the one
 definition of that set. A mismatch refuses the action ungated, exactly as a
-mismatched relocation token already did. That catches a DIVERGENT PROOF ROW,
+mismatched relocation token does. That catches a DIVERGENT PROOF ROW,
 which is a different question from whether the term is current.
 
 A proof's term and key are validated at every point where they could otherwise
@@ -534,6 +584,46 @@ answer to a question the cluster never agreed on. Instead both claims persist on
 their own nodes and the conflict is flagged, which is why the alert above is the
 access path rather than a query.
 
+#### A contested lease still converges
+
+Keeping both claims is about the *evidence*. It does not mean both claimants
+keep acting. Without the rule below they would: each replica's
+`leader_election` row names its own claimant (a peer's renewal is a no-op
+against a live row with another holder, and that table is anti-entropy
+excluded), each replica's term row names its own claimant, so every claimant
+classifies every tick as a renewal of its own tenure and renews forever.
+
+Once a node learns another node claimed its current term — on the WAL,
+the moment the peer's mint arrives, or on the next anti-entropy pass:
+
+- **Every claimant but the lowest-sorting holder name stands down.** It stops
+  renewing and reports the lease not held on that tick. Every claimant computes
+  the same answer from the same set of claims, and the lowest one can never be
+  told to stand down by it, so the rule cannot elect two or none.
+- **The one that continues does not act under the contested term.** It mints a
+  fresh term above it, atomically with its renewal. The contested term is then
+  below every replica's rejection threshold, so neither of its two rows can
+  authorise anything again. Both rows stay; the `ha.lww.unresolved` condition
+  still fires for them, and still needs the acknowledgement below.
+- **A stood-down claimant does not take the lease back when its own stale row
+  expires.** An expired lease whose row names someone other than the ledger's
+  current holder is left for one further TTL, which a live holder's renewal
+  lands well inside. If the holder is dead, the lease is taken over one TTL
+  later than an ordinary expiry would allow.
+- **`litevirt_failover_leader` follows the ledger, not the row.** A stood-down
+  claimant's own lease row still names it until that row expires, but the gauge
+  reads the ledger's newest (contest-aware) holder too, so it drops to `0` on
+  the loser as soon as its replica learns of the contest or of the winner's
+  fresh term. `sum(litevirt_failover_leader) != 1` does not stay tripped for a
+  TTL after the lease has converged.
+
+Which claims a node knows about lives in memory. After a restart it is rebuilt
+by the next anti-entropy pass, because the two rows still disagree and the
+merge re-compares them every pass; until then a restarted claimant may renew a
+contested term it had already stood down from. A contested term that is not a
+key's *newest* term — history below the current tenure — needs nothing: it is
+already below every threshold, and only its tie condition remains.
+
 #### Clearing the condition once you have seen it
 
 Because a contested term is never resolved into a winner, there is no
@@ -564,6 +654,9 @@ Three things about that command:
 Investigate before acknowledging. Two nodes recording the same term means the
 fencing token did its job — enforcement will refuse proofs from the losing
 tenure — but something upstream let both nodes believe they held the lease.
+Usually that is only two survivors of a leader death claiming it within one
+replication round, which converges on its own as described above; a contested
+term whose claimants were cut off from each other is a partition.
 `litevirt_leader_lease_term` around the event tells you whether this was
 leadership churn or a partition.
 
@@ -627,7 +720,15 @@ leadership churn or a partition.
 
 ### No application-aware quiescence
 - Backups, snapshots, and live migration are crash-consistent at the block
-  level. The guest's database, filesystem, etc. must tolerate "as if power
+  level: each takes a real point-in-time view (a libvirt pull-mode session for
+  backups, qemu's own machinery for migration).
+- **Scheduled volume replication is weaker than that, and the difference
+  matters.** A full (non-incremental) replica of a RUNNING VM is
+  `qemu-img convert -U` reading the image the guest still has open, with no
+  snapshot: the copy is smeared across however long it took, so it is not
+  point-in-time and not crash-consistent either. The `--incremental` path DOES
+  open a point-in-time session and is crash-consistent. See
+  [Backups](backups.md). The guest's database, filesystem, etc. must tolerate "as if power
   was cut" recovery. For application-consistent backups, install
   `qemu-guest-agent` in the guest and use the `freeze`/`thaw` hooks
   (currently best-effort; richer integration is on the roadmap).
@@ -640,9 +741,12 @@ leadership churn or a partition.
 - **3 nodes**: minimum for any HA workload. 1-node failure tolerated.
 - **5 nodes**: recommended. 2-node failure tolerated.
 - **Even N**: only with a witness. 2-node with witness is fine for homelab.
-- **Up to ~50 nodes**: tested and supported. Beyond, the relay-quorum
-  protocol scales O(n) but the cluster's anti-entropy interval may need
-  tuning.
+- **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
+  this repo is 3 nodes (`tests/fleet/`) and the largest by hand is the 4-node
+  lab. The relay-quorum protocol scales O(n) by design and there is no known
+  ceiling, but a figure like "tested and supported at ~50 nodes" is not
+  backed by a sustained load test and should not be planned
+  against. Larger clusters will likely need the anti-entropy interval tuned.
 
 ### Network
 - **Inter-host RTT < 10 ms**: comfortable. Default replicator and
@@ -684,6 +788,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_failover_attempts_total{result="error"}` | rate > 0 over 5 min (a failover decision hit a store/fence error) |
 | `litevirt_mutation_log_rows` | rapidly growing (replication backlog) |
 | `litevirt_replication_min_watermark_seq` | not advancing for > 5 min |
+| `litevirt_replication_backlog_age_seconds` | > 300 s sustained |
 | `litevirt_daemon_open_fds` | > 5000 (FD leak) |
 | `litevirt_lb_keepalived_up{lb}` | `== 0` sustained (a load balancer's VIP is not assigned — see [compose.md](compose.md#load-balancer)) |
 

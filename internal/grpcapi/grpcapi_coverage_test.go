@@ -1611,20 +1611,14 @@ func TestResolveVolume_NoStack(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
-	cfg := s.resolveVolume(ctx, "", "vol1")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "", "vol1")
 }
 
 func TestResolveVolume_StackNotFound(t *testing.T) {
 	s := testServerCov(t)
 	ctx := adminCtx()
 
-	cfg := s.resolveVolume(ctx, "nonexistent-stack", "vol1")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "nonexistent-stack", "vol1")
 }
 
 func TestResolveVolume_VolumeNotInCompose(t *testing.T) {
@@ -1642,10 +1636,7 @@ vms:
 		State:       "active",
 	})
 
-	cfg := s.resolveVolume(ctx, "teststack", "missing-vol")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
-	}
+	wantUnresolvedVolume(t, s, ctx, "teststack", "missing-vol")
 }
 
 func TestResolveVolume_WithNFSVolume(t *testing.T) {
@@ -1667,7 +1658,7 @@ volumes:
 		State:       "active",
 	})
 
-	cfg := s.resolveVolume(ctx, "volstack", "shared")
+	cfg := mustResolveVolume(t, s, ctx, "volstack", "shared")
 	if cfg.Driver != "nfs" {
 		t.Errorf("Driver = %q, want nfs", cfg.Driver)
 	}
@@ -1686,9 +1677,11 @@ func TestResolveVolume_InvalidYAML(t *testing.T) {
 		State:       "active",
 	})
 
-	cfg := s.resolveVolume(ctx, "badyaml", "vol1")
-	if cfg.Driver != "local" {
-		t.Errorf("Driver = %q, want local", cfg.Driver)
+	// A stored stack that cannot be read is an error, never a silent fallback
+	// to the local driver: that would put the disk on the wrong storage.
+	cfg, err := s.resolveVolume(ctx, "badyaml", "vol1")
+	if err == nil {
+		t.Errorf("resolveVolume on an unreadable stored stack = %+v, nil error; want an error", cfg)
 	}
 }
 

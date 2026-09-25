@@ -124,6 +124,7 @@ type Node struct {
 	Virt     *libvirtfake.Fake // in-process libvirt fake; scenarios assert on its Events
 	CT       *CTFake           // in-process container runtime; real on-disk rootfs + tar export/import
 	HostNet  *HostNetFake      // in-memory netplan System for the host-network apply protocol
+	Net      *NetProvFake      // per-node network provisioner: what this node set up, on which device
 	GRPCSrv  *grpc.Server
 	Listener net.Listener
 	// peerConn caches a self-loopback client for scenario assertions
@@ -160,6 +161,39 @@ type Node struct {
 	// upgrade, which no same-build cluster can otherwise exercise. Guarded by
 	// partMu.
 	unimplemented map[string]bool
+	// streamWatches are armed by WatchStream, keyed by method name, and
+	// consumed by the next call to that stream method. Guarded by partMu.
+	streamWatches map[string][]*StreamWatch
+}
+
+// StreamWatch observes one server-side streaming handler on a node: Started
+// receives the handler's stream context when it is entered, and Returned the
+// handler's error once it has returned. Both are buffered, so the handler
+// never blocks on a scenario that is not reading.
+type StreamWatch struct {
+	Started  chan context.Context
+	Returned chan error
+}
+
+// WatchStream arms a watch on the next call of the named streaming method
+// (e.g. "DeployStack") served by this node. It is the positive signal that
+// the server has finished — a scenario asserting that a handler did NOT do
+// something must wait for the handler to return, not sleep and hope.
+func (n *Node) WatchStream(method string) *StreamWatch {
+	w := &StreamWatch{Started: make(chan context.Context, 1), Returned: make(chan error, 1)}
+	n.partMu.Lock()
+	n.streamWatches[method] = append(n.streamWatches[method], w)
+	n.partMu.Unlock()
+	return w
+}
+
+// takeStreamWatches removes and returns the watches armed for method.
+func (n *Node) takeStreamWatches(method string) []*StreamWatch {
+	n.partMu.Lock()
+	defer n.partMu.Unlock()
+	ws := n.streamWatches[method]
+	delete(n.streamWatches, method)
+	return ws
 }
 
 // New brings up a Cluster ready for scenarios. Each node has:
@@ -201,6 +235,7 @@ func New(t *testing.T, opts Options) *Cluster {
 			PKIDir:        filepath.Join(c.tmpRoot, name, "pki"),
 			blockedFrom:   make(map[string]bool),
 			unimplemented: make(map[string]bool),
+			streamWatches: make(map[string][]*StreamWatch),
 			cluster:       c,
 		}
 		c.mintHostCert(n)
@@ -530,6 +565,13 @@ func (c *Cluster) buildServer(n *Node) {
 	}
 	n.Server.SetHostNetworkEnv(n.HostNet, "127.0.0.1")
 
+	// Network provisioning: every create/provision/deprovision path on the
+	// server goes through this per-node fake instead of `ip` and dnsmasq, so a
+	// scenario can see what EACH node set up. The flat-bridge fallback
+	// (bridgeEnsure) is left alone; see NetProvFake.EnsureBridge.
+	n.Net = NewNetProvFake()
+	n.Server.SetNetworkProvisioner(n.Net)
+
 	// External IPAM: a REAL netbox.Client (token file and all) pointed at the
 	// scenario's fake server, plus the config kill-switch that lets this node
 	// ADVERTISE netbox_ipam_v1. Both together are what the daemon does from
@@ -701,7 +743,15 @@ func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *g
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
 	}
-	return handler(srv, ss)
+	watches := n.takeStreamWatches(methodName(info.FullMethod))
+	for _, w := range watches {
+		w.Started <- ss.Context()
+	}
+	err := handler(srv, ss)
+	for _, w := range watches {
+		w.Returned <- err
+	}
+	return err
 }
 
 func (n *Node) setBlocked(peer string, blocked bool) {

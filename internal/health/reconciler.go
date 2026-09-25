@@ -93,6 +93,9 @@ type Reconciler struct {
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
+	// provision sets up a network on this host for a VM start. nil means
+	// network.SafeProvision. Set via SetNetworkProvision.
+	provision network.ProvisionFunc
 
 	// Now is the reconciler's clock for vm_lock lease timestamps. Defaults to
 	// time.Now; the fleet harness overrides it so lock-expiry scenarios advance
@@ -124,6 +127,18 @@ type Reconciler struct {
 	// ownerEpochBackfill enables the Phase 4 per-sweep backfill
 	// (enforcement.owner_epoch).
 	ownerEpochBackfill bool
+
+	// replicaCaughtUp reports whether this node's replica has been reconciled
+	// against a peer since it last had reason to believe it is stale (process
+	// start, or losing every gossip peer). The daemon wires the corrosion
+	// client's ReplicaCaughtUp. nil = unwired (tests that do not exercise it):
+	// the replica is treated as trusted. See SetReplicaFreshness.
+	replicaCaughtUp func() (bool, string)
+	// staleDeferMu guards staleDeferLogged: VM name → the cause its out-of-band
+	// stop sync is currently deferred on, already logged, so a deferral that
+	// lasts several ticks logs once, not every 15s. See stopSyncAllowed.
+	staleDeferMu     sync.Mutex
+	staleDeferLogged map[string]string
 
 	// gate is the split-brain safety gate (Phase 1). When a pending VM carries a
 	// proof marker (vms.pending_action_id), the reconciler enforces ExecutionGate
@@ -224,6 +239,10 @@ func (r *Reconciler) SetLeaseTermGate(fn LeaseTermGate) { r.leaseTermGate = fn }
 // (enforcement.owner_epoch; the daemon wires it).
 func (r *Reconciler) SetOwnerEpochBackfill(on bool) { r.ownerEpochBackfill = on }
 
+// SetReplicaFreshness wires the replica-freshness signal the out-of-band stop
+// sync is gated on (the daemon passes corrosion.Client.ReplicaCaughtUp).
+func (r *Reconciler) SetReplicaFreshness(fn func() (bool, string)) { r.replicaCaughtUp = fn }
+
 // SetSharedStorageFenceEnforce sets the config kill-switch for the shared-disk
 // ownership-transfer fence gate (enforcement.shared_storage_fence).
 func (r *Reconciler) SetSharedStorageFenceEnforce(v bool) { r.sharedStorageFenceEnforce = v }
@@ -249,6 +268,12 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1) so the
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
+
+// SetNetworkProvision replaces how a VM start provisions the VM's networks on
+// this host (nil restores network.SafeProvision). The daemon passes the same
+// provisioner the gRPC server uses, so a failover restart and a VM create set
+// a network up the same way; the fleet harness passes its per-node fake.
+func (r *Reconciler) SetNetworkProvision(fn network.ProvisionFunc) { r.provision = fn }
 
 // publishRunning routes a NON-MINTING transition through the marker chokepoint.
 // See PublishVMRunning for the ordering and why it is the right one here.
@@ -595,6 +620,16 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 			if !sync {
 				break // paused / migrated / not genuinely down — leave alone
 			}
+			// This write PUBLISHES a belief read from this node's replica, and
+			// a replica that has not caught up since the node came back is
+			// exactly the one that can be wrong: on 2026-09-24 a fenced host
+			// that booted back still read "ha1 is mine, running" for ~75s and
+			// wrote stopped over the VM's real owner four times. The owner-
+			// epoch write below only guards that with enforcement on, so this
+			// gate is unconditional; it fails closed and retries next tick.
+			if !r.stopSyncAllowed(ctx, vm.Name) {
+				break
+			}
 			slog.Warn("reconciler: VM stopped out-of-band — syncing cluster state",
 				"vm", vm.Name, "reason", st.Reason, "to", newState)
 			// Phase 4: carry the generation this decision was made against, so
@@ -849,6 +884,10 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		return
 	}
 
+	// Owners whose runtime probe failed this pass: probed once, not once per
+	// leftover, so a fence-and-return with many leftovers and an unreachable
+	// owner costs one probe timeout rather than one per VM.
+	unreachable := map[string]string{}
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
 		if err != nil || vm == nil {
@@ -876,17 +915,28 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// fencing ownership reconciliation. We use DomainStateReason, not the
 			// coarse DomainState, because the latter collapses paused/pm-suspended/
 			// saved/shutoff all into "stopped" and would destroy resumable workloads.
+			//
+			// Reason "unknown" is the one exception, and it needs MORE proof, not
+			// less: see provenOwnerLeftover.
 			st, serr := r.virt.DomainStateReason(domName)
-			if serr != nil || !cleanableLeftover(st) {
+			cleanable := serr == nil && cleanableLeftover(st)
+			why := ""
+			if serr == nil && !cleanable && unknownShutoff(st) {
+				cleanable, why = r.provenOwnerLeftover(ctx, domName, vm.HostName, unreachable)
+			}
+			if !cleanable {
 				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",
-					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", st.State, "reason", st.Reason, "state_err", serr)
+					"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "state", st.State, "reason", st.Reason, "state_err", serr, "unproven", why)
 				continue
 			}
 			slog.Warn("reconciler: removing clearly-dead local leftover whose DB row moved to another host",
 				"vm", domName, "local_host", r.hostName, "corrosion_host", vm.HostName, "reason", st.Reason)
-			if err := r.virt.DestroyDomain(domName); err != nil {
-				slog.Warn("reconciler: destroy stale domain failed", "vm", domName, "error", err)
-			}
+			// No DestroyDomain: every path here proved the domain shut off
+			// (cleanableLeftover and unknownShutoff both require it), so a
+			// destroy only fails with "domain is not running". And were the
+			// domain to start between that check and now, undefining leaves
+			// the running copy alone, where a destroy would kill it.
+			//
 			// wipe by design: a stopped/defined leftover whose VM now lives on
 			// another host (the authoritative firmware state travels with it).
 			if err := r.virt.UndefineDomain(domName, false); err != nil {
@@ -923,6 +973,69 @@ func cleanableLeftover(st lv.DomainStatus) bool {
 	default:
 		return false
 	}
+}
+
+// unknownShutoff reports a stopped domain whose shutoff reason libvirt could not
+// supply. Under the real mapping (normalizeDomainReason) a paused or pm-suspended
+// domain always carries its own reason, so a coarse "stopped" with reason
+// "unknown" can only be DomainShutoff with an unrecognised or lost reason — the
+// shape every leftover takes after the host reboots or loses power, because
+// libvirt does not persist the shutoff reason across that.
+func unknownShutoff(st lv.DomainStatus) bool {
+	return st.State == "stopped" && st.Reason == "unknown"
+}
+
+// provenOwnerLeftover decides whether a shut-off domain with reason "unknown" is
+// a leftover safe to destroy+undefine. "unknown" alone proves nothing — it is
+// the absence of a reason, and cleanableLeftover's allowlist rightly refuses it —
+// so it is admitted only on two further pieces of POSITIVE proof, each failing
+// closed when unreadable:
+//
+//   - no managed-save image. A managed-save is saved RAM; libvirt reports it as
+//     shutoff/"saved" while it knows, but after a reboot the reason can come
+//     back "unknown" with the image still on disk, and UndefineDomain would
+//     discard it.
+//   - the DB owner itself reports the VM RUNNING in its own libvirt (the peer
+//     runtime inventory, answered from the owner's libvirt, not from replicated
+//     rows). This is what defuses the converged-wrong host_name the non-
+//     destruction guard exists for: the claim "this copy is not the live one"
+//     rests on a live copy being observed elsewhere, not on a DB field. Absent,
+//     defined-but-stopped, unknown, an incomplete inventory, an unreachable
+//     owner, or no checker wired are all "not proven".
+//
+// It returns why the proof failed, for the refusal log line. unreachable
+// carries owners whose probe already failed in this pass; they are not probed
+// again, and a new failure is recorded there.
+func (r *Reconciler) provenOwnerLeftover(ctx context.Context, name, owner string, unreachable map[string]string) (bool, string) {
+	if owner == "" || owner == r.hostName {
+		return false, "no other owner recorded"
+	}
+	ms, err := r.virt.HasManagedSaveImage(name)
+	if err != nil {
+		return false, "managed-save image unreadable: " + err.Error()
+	}
+	if ms {
+		return false, "managed-save image present (saved RAM)"
+	}
+	if r.checkPeerRuntime == nil {
+		return false, "no peer runtime checker to confirm the owner runs it"
+	}
+	if why, ok := unreachable[owner]; ok {
+		return false, why
+	}
+	// Same bound as owner-assert: an unreachable owner must not stall the tick.
+	pctx, cancel := context.WithTimeout(ctx, peerRuntimeProbeTimeout)
+	state, err := r.checkPeerRuntime(pctx, owner, name)
+	cancel()
+	if err != nil {
+		why := "owner " + owner + " unreachable: " + err.Error()
+		unreachable[owner] = why
+		return false, why
+	}
+	if state != RuntimeRunning {
+		return false, "owner " + owner + " reports the VM " + state + ", not running"
+	}
+	return true, ""
 }
 
 func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) {
@@ -1326,7 +1439,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		bridge := iface.NetworkName
 		// Provision network infrastructure (VXLAN tunnels, DHCP, NAT, bridges).
 		// This is critical after failover — the new host may not have the network set up.
-		if provBridge, err := network.ProvisionForVM(ctx, r.db, iface.NetworkName, r.hostName); err != nil {
+		provision := r.provision
+		if provision == nil {
+			provision = network.SafeProvision
+		}
+		if provBridge, err := network.ProvisionForVMWith(ctx, r.db, iface.NetworkName, r.hostName, provision); err != nil {
 			slog.Warn("reconciler: network provision failed, using raw name",
 				"vm", vm.Name, "network", iface.NetworkName, "error", err)
 		} else if provBridge != "" {

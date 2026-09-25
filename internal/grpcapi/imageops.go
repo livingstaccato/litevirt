@@ -276,12 +276,32 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 		}
 	}
 
-	// Find peer hosts that have this image ready.
-	hosts, err := corrosion.GetImageHosts(ctx, s.db, imageName)
+	sources, err := s.imagePullSources(ctx, imageName)
 	if err != nil {
-		return fmt.Errorf("query image_hosts: %w", err)
+		return err
 	}
 	var lastErr error
+	for _, host := range sources {
+		if perr := s.pullImageFromPeer(ctx, imageName, host); perr != nil {
+			lastErr = perr
+			continue // next candidate — one bad source must not end recovery
+		}
+		return nil
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+	return fmt.Errorf("no peer host has image %q with status=ready", imageName)
+}
+
+// imagePullSources is the peers autoPullImage may pull imageName from: every
+// other host whose copy is ready, except one the cluster knows is dead.
+func (s *Server) imagePullSources(ctx context.Context, imageName string) ([]string, error) {
+	hosts, err := corrosion.GetImageHosts(ctx, s.db, imageName)
+	if err != nil {
+		return nil, fmt.Errorf("query image_hosts: %w", err)
+	}
+	var out []string
 	for _, ih := range hosts {
 		if ih.Status != "ready" || ih.HostName == s.hostName {
 			continue
@@ -295,16 +315,24 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 				continue
 			}
 		}
-		if perr := s.pullImageFromPeer(ctx, imageName, ih.HostName); perr != nil {
-			lastErr = perr
-			continue // next candidate — one bad source must not end recovery
-		}
-		return nil
+		out = append(out, ih.HostName)
 	}
-	if lastErr != nil {
-		return lastErr
+	return out, nil
+}
+
+// imageAvailable reports whether a VM on this host could get imageName: it is
+// in the local store, or autoPullImage has a peer to pull it from. It is the
+// same test the pull applies, so a check that passes never ends in a pull
+// with nowhere to pull from.
+func (s *Server) imageAvailable(ctx context.Context, imageName string) (bool, error) {
+	if s.images != nil && s.images.ImageExists(imageName) {
+		return true, nil
 	}
-	return fmt.Errorf("no peer host has image %q with status=ready", imageName)
+	sources, err := s.imagePullSources(ctx, imageName)
+	if err != nil {
+		return false, err
+	}
+	return len(sources) > 0, nil
 }
 
 // pullImageFromPeer asks one specific ready holder to push imageName to this

@@ -2,18 +2,24 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 )
+
+// stdinIsTerminal reports whether stdin is an interactive terminal. A var so
+// tests can pin it.
+var stdinIsTerminal = func() bool { return term.IsTerminal(int(os.Stdin.Fd())) }
 
 func newComposeCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -46,7 +52,7 @@ func newUpCmd() *cobra.Command {
 				return fmt.Errorf("read compose file: %w", err)
 			}
 
-			f, err := compose.ParseBytes(yamlData)
+			f, err := compose.ParseNamed(file, yamlData)
 			if err != nil {
 				return err
 			}
@@ -86,14 +92,18 @@ func newUpCmd() *cobra.Command {
 					return nil
 				}
 
-				// Print plan
+				// Print plan. Under each VM created or updated, what its
+				// healthcheck will actually probe.
+				healthchecks := healthchecksByInstance(f)
 				fmt.Printf("Stack %q:\n\n", f.Name)
 				for _, op := range ops {
 					switch op.Kind {
 					case compose.OpCreate:
 						fmt.Printf("  + %s\n", op.Detail)
+						printHealthcheck(healthchecks, op.VMName)
 					case compose.OpUpdate:
 						fmt.Printf("  ~ %s\n", op.Detail)
+						printHealthcheck(healthchecks, op.VMName)
 					case compose.OpDelete:
 						fmt.Printf("  - %s\n", op.Detail)
 					case "network":
@@ -107,6 +117,9 @@ func newUpCmd() *cobra.Command {
 				fmt.Println()
 
 				if !yes {
+					if !stdinIsTerminal() {
+						return errNoTTYConfirm
+					}
 					fmt.Print("Apply? [y/N] ")
 					var ans string
 					fmt.Scanln(&ans)
@@ -124,7 +137,12 @@ func newUpCmd() *cobra.Command {
 					return fmt.Errorf("deploy stack: %w", err)
 				}
 
+				// Per-action failures arrive as "error" progress and the stream
+				// still ends OK, so they must be counted here: a stack with a
+				// failed action is not "deployed".
 				var deployErr error
+				var failed []string
+				seenFailed := map[string]bool{}
 				for {
 					p, err := stream.Recv()
 					if err != nil {
@@ -136,6 +154,10 @@ func newUpCmd() *cobra.Command {
 					switch p.Phase {
 					case "error":
 						fmt.Fprintf(os.Stderr, "  error %s: %s\n", p.VmName, p.Error)
+						if !seenFailed[p.VmName] {
+							seenFailed[p.VmName] = true
+							failed = append(failed, p.VmName)
+						}
 					case "done":
 						fmt.Printf("  %s: done\n", p.VmName)
 					default:
@@ -144,6 +166,10 @@ func newUpCmd() *cobra.Command {
 				}
 				if deployErr != nil {
 					return deployErr
+				}
+				if len(failed) > 0 {
+					return fmt.Errorf("stack %q: %d of %d actions failed (%s)",
+						f.Name, len(failed), max(countVMActions(ops), len(failed)), strings.Join(failed, ", "))
 				}
 
 				fmt.Printf("\nStack %q deployed.\n", f.Name)
@@ -154,6 +180,46 @@ func newUpCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&file, "file", "f", "litevirt-compose.yaml", "Compose file path")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
 	return cmd
+}
+
+// errNoTTYConfirm refuses a confirmation prompt that nobody can answer: over
+// a non-tty session (ssh without -t, CI, a pipe) stdin can stay open and
+// silent, and the prompt would block forever with no hint why.
+var errNoTTYConfirm = errors.New("stdin is not a terminal, so the confirmation prompt cannot be answered; review the plan and re-run with -y to apply")
+
+// healthchecksByInstance maps every VM instance the file defines to a
+// one-line description of what its healthcheck probes.
+func healthchecksByInstance(f *compose.File) map[string]string {
+	out := map[string]string{}
+	for base, vm := range f.VMs {
+		if vm.HealthCheck == nil {
+			continue
+		}
+		d := vm.HealthCheck.Describe()
+		for r := 0; r < vm.EffectiveReplicas(); r++ {
+			out[vm.InstanceName(base, r)] = d
+		}
+	}
+	return out
+}
+
+func printHealthcheck(healthchecks map[string]string, vm string) {
+	if d, ok := healthchecks[vm]; ok {
+		fmt.Printf("      healthcheck: %s\n", d)
+	}
+}
+
+// countVMActions counts the plan entries that execute a VM action (create,
+// update, delete) — the denominator for the failure summary.
+func countVMActions(ops []compose.Op) int {
+	n := 0
+	for _, op := range ops {
+		switch op.Kind {
+		case compose.OpCreate, compose.OpUpdate, compose.OpDelete:
+			n++
+		}
+	}
+	return n
 }
 
 func newDownCmd() *cobra.Command {
@@ -193,6 +259,9 @@ func newDownCmd() *cobra.Command {
 				}
 
 				if !yes {
+					if !stdinIsTerminal() {
+						return errNoTTYConfirm
+					}
 					fmt.Print("Confirm? [y/N] ")
 					var ans string
 					fmt.Scanln(&ans)
@@ -210,7 +279,12 @@ func newDownCmd() *cobra.Command {
 					return fmt.Errorf("delete stack: %w", err)
 				}
 
+				// Per-VM failures arrive as "error" status and the stream still
+				// ends OK, so they must be counted here, as compose up does: a
+				// stack with a VM that could not be deleted is not torn down.
 				var downErr error
+				var failed, seen []string
+				seenFailed, seenVM := map[string]bool{}, map[string]bool{}
 				for {
 					p, err := stream.Recv()
 					if err != nil {
@@ -219,9 +293,24 @@ func newDownCmd() *cobra.Command {
 						}
 						break
 					}
+					// Not only VMs: a network that could not be deprovisioned or
+					// a failed container listing arrives named for itself, and
+					// an unnamed error still counts.
+					item := p.VmName
+					if item == "" && p.Status == "error" {
+						item = "stack resource"
+					}
+					if item != "" && !seenVM[item] {
+						seenVM[item] = true
+						seen = append(seen, item)
+					}
 					switch p.Status {
 					case "error":
-						fmt.Fprintf(os.Stderr, "  error %s: %s\n", p.VmName, p.Error)
+						fmt.Fprintf(os.Stderr, "  error %s: %s\n", item, p.Error)
+						if !seenFailed[item] {
+							seenFailed[item] = true
+							failed = append(failed, item)
+						}
 					case "deleted":
 						fmt.Printf("  deleted %s\n", p.VmName)
 					default:
@@ -230,6 +319,10 @@ func newDownCmd() *cobra.Command {
 				}
 				if downErr != nil {
 					return downErr
+				}
+				if len(failed) > 0 {
+					return fmt.Errorf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",
+						name, len(failed), len(seen), strings.Join(failed, ", "))
 				}
 
 				fmt.Printf("Stack %q torn down.\n", name)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -122,4 +123,42 @@ func firstOrDetach(recv func() (proto.Message, error)) (first proto.Message, err
 			return recv()
 		}
 	}
+}
+
+// opContext is the context a handler opens a server-streaming RPC on: the
+// request's own for SSE, which ends when the client stops listening, and a
+// detached one otherwise, because the non-SSE answer is an acknowledgement and
+// the operation must outlive it. cancel must be called on every path.
+func (s *Server) opContext(r *http.Request) (context.Context, context.CancelFunc) {
+	ctx := s.grpcCtx(r)
+	if wantsSSE(r) {
+		return ctx, func() {}
+	}
+	return detachedOpContext(ctx)
+}
+
+// ackFirstAndDetach answers a non-SSE call with the stream's first frame and
+// keeps the operation running behind it (ackAndDetach). A stream that fails
+// before its first frame is reported, and its context released.
+//
+// The first frame is awaited through firstOrDetach, so an operation that is
+// slow to report (it is queued behind a per-resource lock) is acknowledged
+// with 202 Accepted after ackTimeout rather than holding the handler past the
+// server's WriteTimeout.
+func ackFirstAndDetach(w http.ResponseWriter, op string, cancel context.CancelFunc, recv func() (proto.Message, error)) {
+	first, err, timedOut, rest := firstOrDetach(recv)
+	if timedOut {
+		ackAndDetach(op, cancel, rest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"accepted","detail":"operation started; no progress reported yet"}`))
+		return
+	}
+	if err != nil {
+		cancel()
+		grpcHTTPError(w, http.StatusInternalServerError, err)
+		return
+	}
+	ackAndDetach(op, cancel, rest)
+	jsonProto(w, first)
 }

@@ -60,6 +60,11 @@ type peerState struct {
 	// (monotonic; zero until the first write). It drives the HeartbeatInterval
 	// re-publish that keeps an unchanged row's updated_at current.
 	lastWriteAt time.Time
+	// stallEpoch is the local stall epoch (stall.go) `failures` was counted in.
+	// A stall since then discards the count: failures observed before the
+	// observer stopped, and the probe that straddled the stop, are not the same
+	// run of evidence as failures observed after it.
+	stallEpoch uint64
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -83,6 +88,9 @@ type Checker struct {
 
 	// peerPinger fresh-Pings a peer for its capability tokens (SetPeerPinger).
 	peerPinger PeerPinger
+	// peerReady asks a peer whether it can serve, not merely whether it accepts
+	// a TLS connection (SetPeerReadiness). nil keeps the TLS-only probe.
+	peerReady PeerReadiness
 	// peerCaps caches each peer's advertised capabilities with a short TTL so the
 	// replicator can gate proof replication per-peer without a Ping storm.
 	peerCaps map[string]peerCapEntry
@@ -122,6 +130,24 @@ type Checker struct {
 	// nil-safe (unset → never fenced). This is the central chokepoint that also covers the
 	// reconciler's startPendingVM and every other gate consumer.
 	selfFenced func() bool
+
+	// clock is the checker's local time source (nil → time.Now). It must carry a
+	// monotonic reading in production; tests replace it to model time passing
+	// without sleeping.
+	clock func() time.Time
+
+	// stall is the local liveness heartbeat's record (stall.go): failed probes
+	// observed across, or shortly after, a gap in this process's own execution
+	// are not evidence against the peer.
+	stall stallState
+}
+
+// now reads the checker's local clock.
+func (c *Checker) now() time.Time {
+	if c.clock != nil {
+		return c.clock()
+	}
+	return time.Now()
 }
 
 // SetSelfFenced injects the self-fenced predicate (Phase 2 defense-in-depth). nil-safe.
@@ -169,6 +195,10 @@ func (c *Checker) Start(ctx context.Context) {
 	c.mu.Lock()
 	c.startedAt = time.Now()
 	c.mu.Unlock()
+
+	// The heartbeat first: a probe must never run without it, or every failure
+	// after a quiet spell would read as observed across a stall.
+	go c.runStallHeartbeat(ctx)
 
 	// Load TLS config for peer connections; RETRY a transient failure (e.g. a PKI-setup race
 	// at boot) rather than giving up — a checker that never loads TLS never probes peers, so
@@ -353,7 +383,26 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// probe would then fail and this healthy peer would be marked suspect and
 	// fenced — a config value silently becoming a fencing event.
 	addr := corrosion.PeerTarget(host.Address, host.GRPCPort)
-	healthy := c.probe(addr)
+	_, epochBefore := c.beat(c.now())
+	result := c.probeHost(ctx, host.Name, addr)
+	healthy := result == probeReady
+
+	// Beat on the result, not only in the heartbeat loop: the probe whose
+	// deadline ran out while this process was stopped completes the moment it
+	// resumes, possibly before the heartbeat goroutine is scheduled.
+	observedAt := c.now()
+	stallAt, stallEpoch := c.beat(observedAt)
+	// Withheld entirely — no state change, no write:
+	//   - any result of a probe that STRADDLED a stall. It proves nothing about
+	//     the peer after the stall: a timeout ran out while this process was
+	//     stopped, and an answer may have arrived before it stopped.
+	//   - an unreachable verdict inside the grace window after a stall: this
+	//     observer has only just resumed, alongside peers that may be resuming
+	//     too. A success there still counts — a peer that answered a probe sent
+	//     after the stall is proven — and so does an explicit not-ready answer,
+	//     which is the peer's own statement and licenses no fence.
+	straddled := stallEpoch != epochBefore
+	withhold := straddled || (result == probeUnreachable && inGrace(stallAt, observedAt))
 
 	c.mu.Lock()
 	prev, exists := c.peers[host.Name]
@@ -369,8 +418,19 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		// The cost is bounded and correct: after a restart a node must re-earn
 		// suspectThreshold consecutive failures — about 6 s at checkInterval —
 		// before it votes to fence again.
-		prev = &peerState{status: "", failures: 0}
+		prev = &peerState{status: "", failures: 0, stallEpoch: stallEpoch}
 		c.peers[host.Name] = prev
+	}
+	if prev.stallEpoch != stallEpoch {
+		prev.failures = 0
+		prev.stallEpoch = stallEpoch
+	}
+	if withhold {
+		// No state change and no write: the published row keeps its old
+		// updated_at and ages out of fencing quorum's freshness window rather
+		// than being refreshed by a probe that proves nothing.
+		c.mu.Unlock()
+		return
 	}
 
 	var newStatus string
@@ -381,9 +441,21 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		newFailures = 0
 	} else {
 		newFailures = prev.failures + 1
-		if newFailures >= suspectThreshold {
+		switch {
+		case result == probeNotReady:
+			// Recorded on the FIRST observation, unlike "suspect", which needs
+			// suspectThreshold consecutive misses. The threshold exists because
+			// silence is ambiguous — one dropped packet must not fence a live
+			// host — and because "suspect" is the verdict fencing quorum counts.
+			// An unready answer is neither: it is the peer's own statement about
+			// itself, delivered over a connection that plainly works, and it
+			// licenses no destructive action. Waiting three ticks to write down
+			// something the peer already told us only delays the operator's view
+			// of it.
+			newStatus = StatusUnready
+		case newFailures >= suspectThreshold:
 			newStatus = "suspect"
-		} else {
+		default:
 			newStatus = "healthy"
 		}
 	}
@@ -393,7 +465,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	prev.failures = newFailures
 	// Local monotonic anchors updated every probe (not just on change) so Phase 2/5
 	// timers measure "time since last direct contact" by our own clock.
-	mono := time.Now()
+	mono := c.now()
 	if healthy {
 		prev.lastHealthyAt = mono
 	} else {

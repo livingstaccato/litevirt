@@ -14,7 +14,15 @@ import (
 
 type fenceReadinessClient struct {
 	pb.LiteVirtClient
-	resp *pb.FenceReadiness
+	resp   *pb.FenceReadiness
+	health *pb.ClusterHealth // nil → an empty health report
+}
+
+func (c *fenceReadinessClient) GetClusterHealth(context.Context, *pb.GetClusterHealthRequest, ...grpc.CallOption) (*pb.ClusterHealth, error) {
+	if c.health == nil {
+		return &pb.ClusterHealth{}, nil
+	}
+	return c.health, nil
 }
 
 func (c *fenceReadinessClient) GetFenceReadiness(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.FenceReadiness, error) {
@@ -25,9 +33,14 @@ func (c *fenceReadinessClient) GetFenceReadiness(context.Context, *emptypb.Empty
 // stdout and the exit code it signalled (0 when it returned no error).
 func runDoctorFence(t *testing.T, resp *pb.FenceReadiness) (string, int) {
 	t.Helper()
+	return runDoctorFenceWithHealth(t, resp, nil)
+}
+
+func runDoctorFenceWithHealth(t *testing.T, resp *pb.FenceReadiness, health *pb.ClusterHealth) (string, int) {
+	t.Helper()
 	orig := withClient
 	withClient = func(ctx context.Context, fn func(context.Context, pb.LiteVirtClient) error) error {
-		return fn(ctx, &fenceReadinessClient{resp: resp})
+		return fn(ctx, &fenceReadinessClient{resp: resp, health: health})
 	}
 	t.Cleanup(func() { withClient = orig })
 
@@ -247,5 +260,64 @@ func TestDoctorFence_UnlatchedEnforcingHostsAreQualified(t *testing.T) {
 	})
 	if strings.Contains(covered, "no host is fencing") {
 		t.Errorf("a latched, fully-enforcing cluster is told no host is fencing; got:\n%s", covered)
+	}
+}
+
+// Recent fences print with what they ESTABLISHED, and an unverified one is
+// called out in words.
+//
+// fencing_log writes "fenced" for an IPMI power-off observed off and for an SSH
+// poweroff nobody checked, so a table of results would show two identical rows
+// meaning different things. The assurance column is the difference, and the
+// note says why it matters: the coordinator that ran such a fence rescheduled
+// on it.
+func TestDoctorFence_RecentFencesShowAssurance(t *testing.T) {
+	out, _ := runDoctorFence(t, &pb.FenceReadiness{
+		CapabilityLatched: true, EnforcedEverywhere: true,
+		Hosts: []*pb.FenceHostPosture{enforcingHost("node-1")},
+		RecentFences: []*pb.FenceEvent{
+			{Host: "node-2", Method: "ipmi", Result: "fenced", Assurance: "verified", Timestamp: "2026-09-23T10:00:00Z"},
+			{Host: "node-3", Method: "ssh", Result: "fenced", Assurance: "requested", Timestamp: "2026-09-23T11:00:00Z"},
+		},
+	})
+
+	for _, want := range []string{"node-2", "verified", "node-3", "requested"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output does not mention %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "not verified") {
+		t.Errorf("an unverified fence is listed without saying it was not verified:\n%s", out)
+	}
+}
+
+// A cluster whose recent fences were all verified gets no warning — otherwise
+// the note is noise an operator learns to skip.
+func TestDoctorFence_VerifiedFencesRaiseNoWarning(t *testing.T) {
+	out, _ := runDoctorFence(t, &pb.FenceReadiness{
+		CapabilityLatched: true, EnforcedEverywhere: true,
+		Hosts: []*pb.FenceHostPosture{enforcingHost("node-1")},
+		RecentFences: []*pb.FenceEvent{
+			{Host: "node-2", Method: "ipmi", Result: "fenced", Assurance: "verified", Timestamp: "2026-09-23T10:00:00Z"},
+			{Host: "node-3", Method: "manual", Result: "manual-confirmed", Assurance: "operator-confirmed", Timestamp: "2026-09-23T11:00:00Z"},
+		},
+	})
+	if strings.Contains(out, "not verified") {
+		t.Errorf("verified and confirmed fences drew an unverified warning:\n%s", out)
+	}
+}
+
+// A server too old to send assurance still gets labelled rows: the CLI derives
+// the label from method and result, which every server has always sent.
+func TestDoctorFence_DerivesAssuranceFromAnOlderServer(t *testing.T) {
+	out, _ := runDoctorFence(t, &pb.FenceReadiness{
+		CapabilityLatched: true, EnforcedEverywhere: true,
+		Hosts: []*pb.FenceHostPosture{enforcingHost("node-1")},
+		RecentFences: []*pb.FenceEvent{
+			{Host: "node-3", Method: "ssh", Result: "fenced", Timestamp: "2026-09-23T11:00:00Z"},
+		},
+	})
+	if !strings.Contains(out, "requested") || !strings.Contains(out, "not verified") {
+		t.Errorf("an ssh fence with no server-sent assurance was not labelled:\n%s", out)
 	}
 }

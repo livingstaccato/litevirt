@@ -566,6 +566,17 @@ func TestHighestWaitCondition(t *testing.T) {
 	}
 }
 
+// A dependency is named by its compose name: "db" is not "db-backup", so a
+// VM depending on db puts no wait on db-backup.
+func TestHighestWaitCondition_PrefixIsNotTheDependency(t *testing.T) {
+	ops := []compose.Op{
+		{Kind: "create", VMName: "app", DependsOn: compose.DependsOn{"db": {Condition: "vm_healthy"}}},
+	}
+	if got := highestWaitCondition("db-backup", ops); got != "" {
+		t.Errorf("highestWaitCondition(db-backup) = %q, want none (only db is depended on)", got)
+	}
+}
+
 func TestHostHasImage(t *testing.T) {
 	imageHosts := map[string][]string{
 		"ubuntu": {"h1", "h2"},

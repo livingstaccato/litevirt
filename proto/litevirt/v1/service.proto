@@ -1792,6 +1792,30 @@ message PingResponse {
   bool posture_reported = 8;
 }
 
+// Ready: application-level readiness. Ping answers "is this daemon's TLS
+// endpoint up and what does this BUILD support"; neither question touches the
+// database, so a daemon whose DB is wedged answers Ping perfectly while being
+// unable to serve a single request. Ready is the probe that does work: it
+// performs a trivial local read and says whether it succeeded.
+//
+// Deliberately a separate RPC rather than another PingResponse field. Ping is
+// on the health checker's hot path and already does non-trivial work
+// (advertisedCapabilities walks the runtime inventory with enforcement.owner_epoch
+// on); the peer probe runs every checkInterval against every peer, and must stay
+// cheap enough to run at that rate.
+message ReadyRequest {}
+message ReadyResponse {
+  string host_name = 1;
+  // ready is false when this node cannot serve. It is a SELF-REPORT OF
+  // DEGRADATION, the direction worth trusting: a node lying about its state
+  // claims to be ready, not broken.
+  bool ready = 2;
+  // not_ready_reason explains a false `ready` for an operator. DIAGNOSTIC ONLY
+  // — no decision path may read it, and it is served only to a caller holding a
+  // host certificate, because it carries local error text.
+  string not_ready_reason = 3;
+}
+
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
 message FetchBinaryRequest {}
 message FetchBinaryChunk {
@@ -2460,6 +2484,9 @@ service LiteVirt {
 
     // ── Internal ──
     rpc Ping(PingRequest) returns (PingResponse);
+    // Application-level readiness — see ReadyResponse. Ping says the endpoint is
+    // up; Ready says the daemon can actually do something.
+    rpc Ready(ReadyRequest) returns (ReadyResponse);
 
     // ── Internal: Network Sync ──
     rpc ProvisionNetwork(ProvisionNetworkRequest)  returns (google.protobuf.Empty);
@@ -3228,4 +3255,23 @@ message FenceReadiness {
     repeated string sample_vms = 4;
     repeated FenceHostPosture hosts = 5;
     string generated_at = 6;   // RFC3339
+    // recent_fences: the newest fencing_log rows from the last
+    // fenceReadinessRecentWindow, newest first and capped. Each carries the
+    // ASSURANCE of what it established — corrosion.FenceAssurance, the same
+    // classification the shared-storage gate uses — because the stored result
+    // writes "fenced" both for an IPMI power-off that was observed off and for
+    // an SSH poweroff nobody checked. DIAGNOSTIC ONLY.
+    repeated FenceEvent recent_fences = 7;
+}
+
+// FenceEvent is one fencing_log row, labelled with what it established.
+message FenceEvent {
+    string host = 1;
+    string method = 2;
+    string result = 3;     // as stored: fenced | partial | manual-confirmed
+    // assurance: verified | operator-confirmed | requested | assumed |
+    // awaiting-confirmation | failed | unknown. See corrosion.FenceAssurance.
+    string assurance = 4;
+    string timestamp = 5;  // RFC3339
+    string detail = 6;
 }

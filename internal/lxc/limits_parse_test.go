@@ -30,8 +30,9 @@ func TestParseResourceConfig_CgroupNativeForms(t *testing.T) {
 		{"gigabyte suffix", "lxc.cgroup2.memory.max = 1G\n", 0, 1024, false, false},
 		{"lowercase suffix", "lxc.cgroup2.memory.max = 512m\n", 0, 512, false, false},
 		{"kilobyte suffix", "lxc.cgroup2.memory.max = 2048K\n", 0, 2, false, false},
-		{"custom period same ratio", "lxc.cgroup2.cpu.max = 25000 50000\n", 50, 0, true, false},
-		{"default period when absent", "lxc.cgroup2.cpu.max = 2000\n", 2, 0, true, false},
+		{"custom period same ratio", "lxc.cgroup2.cpu.max = 150000 50000\n", 3, 0, true, false},
+		{"default period when absent", "lxc.cgroup2.cpu.max = 200000\n", 2, 0, true, false},
+		{"half a core rounds up to 1", "lxc.cgroup2.cpu.max = 50000 100000\n", 1, 0, true, false},
 		{"garbage memory still errors", "lxc.cgroup2.memory.max = banana\n", 0, 0, false, true},
 		{"garbage cpu still errors", "lxc.cgroup2.cpu.max = banana 100000\n", 0, 0, false, true},
 	}
@@ -88,10 +89,13 @@ func TestParseResourceConfig_RejectsAndGuardsBadInput(t *testing.T) {
 		cfg     string
 		wantCPU int
 	}{
-		{"sub-1% CPU cap rounds up to 1, not 0/unlimited", "lxc.cgroup2.cpu.max = 500 100000\n", 1},
+		{"sub-core CPU cap rounds up to 1, not 0/unlimited", "lxc.cgroup2.cpu.max = 500 100000\n", 1},
 		{"tiny fractional CPU cap rounds up to 1", "lxc.cgroup2.cpu.max = 1 100000\n", 1},
-		{"litevirt 2-core emission still round-trips", "lxc.cgroup2.cpu.max = 2000 100000\n", 2},
-		{"custom-period ratio preserved", "lxc.cgroup2.cpu.max = 25000 50000\n", 50},
+		{"litevirt 2-core emission round-trips", "lxc.cgroup2.cpu.max = 200000 100000\n", 2},
+		// A config written before cpu meant cores (2000 = 2% of a core) reads as
+		// what it enforces: under one core, rounded up.
+		{"pre-cores emission reads as what it enforces", "lxc.cgroup2.cpu.max = 2000 100000\n", 1},
+		{"custom-period ratio preserved", "lxc.cgroup2.cpu.max = 150000 50000\n", 3},
 	}
 	for _, c := range okCases {
 		cpu, _, err := parseResourceConfig(c.cfg)

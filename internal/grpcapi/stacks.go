@@ -20,6 +20,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose/planner"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -50,7 +51,7 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 
 	// Pre-deploy validation: verify images and networks exist before creating
 	// any VMs. Abort early with clear errors if dependencies are missing (#52).
-	if errs := s.validateDeployDependencies(ctx, f); len(errs) > 0 {
+	if errs := s.validateDeployDependencies(ctx, f, []byte(req.ComposeYaml)); len(errs) > 0 {
 		detail := ""
 		for _, e := range errs {
 			detail += "\n  - " + e
@@ -126,6 +127,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	current := buildCurrentVMsFromState(state, f.Name)
 	sortVMActions(resolved.VMs, current)
 
+	// Move NICs off a legacy stack-scoped flat bridge in place, before either
+	// executor sees the update: both apply an update by recreating the VM.
+	failures := newDeployFailures(stream)
+	if err := s.applyNICRetargets(ctx, resolved, stream, failures); err != nil {
+		return err
+	}
+
 	// Check if the compose file specifies a rolling update strategy.
 	rollingStrategy := useRollingUpdate(f)
 	hasUpdates := false
@@ -138,12 +146,12 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 
 	if rollingStrategy != "" && hasUpdates {
 		// Rolling update mode: creates first, then rolling updates, then deletes.
-		if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err != nil {
+		if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, failures); err != nil {
 			return err
 		}
 	} else {
 		// Inline mode: process all actions sequentially (existing behavior).
-		if err := s.executeInlineActions(ctx, f, resolved, stream); err != nil {
+		if err := s.executeInlineActions(ctx, f, resolved, stream, failures); err != nil {
 			return err
 		}
 	}
@@ -151,28 +159,52 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 	// Apply LB actions.
 	s.applyLBActions(ctx, f, resolved, stream)
 
-	// Persist stack record.
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
-	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
-		Name:        f.Name,
-		ComposeHash: hash,
-		ComposeYAML: req.ComposeYaml,
-		State:       "active",
-	}); dbErr != nil {
-		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
-	}
-
 	vmOps := 0
 	for _, a := range resolved.VMs {
 		if a.Kind != planner.OpNoChange {
 			vmOps++
 		}
 	}
+
+	// Persist stack record. The new compose file IS recorded even when some
+	// actions failed — the actions that succeeded applied it, and it is the
+	// desired state a re-run converges to — but the stack is "degraded", not
+	// "active". A re-run retries the failed actions because the planner diffs
+	// the compose file against the live workloads, not against this record.
+	stackState := stackStateActive
+	if len(failures.names) > 0 {
+		stackState = stackStateDegraded
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(req.ComposeYaml)))
+	if dbErr := corrosion.UpsertStack(ctx, s.db, corrosion.StackRecord{
+		Name:        f.Name,
+		ComposeHash: hash,
+		ComposeYAML: req.ComposeYaml,
+		State:       stackState,
+	}); dbErr != nil {
+		slog.Warn("upsert stack record failed", "stack", f.Name, "error", dbErr)
+	}
+
+	if len(failures.names) > 0 {
+		detail := fmt.Sprintf("%d of %d VM ops failed (%s)",
+			len(failures.names), max(vmOps, len(failures.names)), strings.Join(failures.names, ", "))
+		s.publish("stack.degraded", f.Name, detail)
+		s.audit(ctx, "stack.deploy", f.Name, detail, "error")
+		return nil
+	}
 	s.publish("stack.deployed", f.Name, fmt.Sprintf("%d VM ops, %d network ops, %d LB ops",
 		vmOps, len(resolved.Networks), len(resolved.LBs)))
 	s.audit(ctx, "stack.deploy", f.Name, fmt.Sprintf("%d VM ops", vmOps), "ok")
 	return nil
 }
+
+// Stack record states. "deleting" is set by DeleteStack and retried by the
+// StackReconciler; "degraded" means the last deploy recorded the compose file
+// but at least one of its VM actions failed, so the stack has not converged.
+const (
+	stackStateActive   = "active"
+	stackStateDegraded = "degraded"
+)
 
 // persistStackFirewall writes a compose file's distributed-firewall config to
 // Corrosion: security groups (+ rules), ip sets, cluster-tier rules, and the
@@ -670,19 +702,74 @@ func (s *Server) applyLBActions(ctx context.Context, f *compose.File, plan *plan
 	}
 }
 
-// sortVMActions reorders update operations so that already-failed replicas
-// are processed first (#32).
+// sortVMActions puts already-failed replicas' updates first (#32) without
+// breaking the planner's dependency order: it re-runs the topological sort
+// over the create and update actions, choosing among the READY ones by state
+// priority (error, then stopped, then the rest) and then by their planned
+// position. Deletes and no-change actions keep their slots.
 func sortVMActions(actions []planner.VMAction, current []compose.CurrentVM) {
 	stateOf := make(map[string]string, len(current))
 	for _, c := range current {
 		stateOf[c.Name] = c.State
 	}
-	sort.SliceStable(actions, func(i, j int) bool {
-		if actions[i].Kind != planner.OpUpdate || actions[j].Kind != planner.OpUpdate {
-			return false
+	var slots []int // positions of the create/update actions
+	for i, a := range actions {
+		if a.Kind == planner.OpCreate || a.Kind == planner.OpUpdate {
+			slots = append(slots, i)
 		}
-		return statePriority(stateOf[actions[i].VMName]) < statePriority(stateOf[actions[j].VMName])
-	})
+	}
+	n := len(slots)
+	prio := make([]int, n)
+	inDegree := make([]int, n)
+	dependents := make([][]int, n)
+	for i, si := range slots {
+		prio[i] = 2
+		if actions[si].Kind == planner.OpUpdate {
+			prio[i] = statePriority(stateOf[actions[si].VMName])
+		}
+		for dep := range actions[si].DependsOn {
+			for j, sj := range slots {
+				if j != i && compose.DependsOnTarget(dep, actions[sj].ComposeName()) {
+					inDegree[i]++
+					dependents[j] = append(dependents[j], i)
+				}
+			}
+		}
+	}
+	done := make([]bool, n)
+	order := make([]int, 0, n)
+	for len(order) < n {
+		pick := -1
+		for i := 0; i < n; i++ {
+			if done[i] || inDegree[i] > 0 {
+				continue
+			}
+			if pick < 0 || prio[i] < prio[pick] {
+				pick = i
+			}
+		}
+		if pick < 0 { // a cycle: keep the rest in planned order
+			for i := 0; i < n; i++ {
+				if !done[i] {
+					done[i] = true
+					order = append(order, i)
+				}
+			}
+			break
+		}
+		done[pick] = true
+		order = append(order, pick)
+		for _, d := range dependents[pick] {
+			inDegree[d]--
+		}
+	}
+	sorted := make([]planner.VMAction, n)
+	for k, i := range order {
+		sorted[k] = actions[slots[i]]
+	}
+	for k, si := range slots {
+		actions[si] = sorted[k]
+	}
 }
 
 // buildCurrentVMsFromState converts snapshot VMs to compose.CurrentVM for sorting.
@@ -720,24 +807,26 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	for _, vm := range vms {
 		vmNames[vm.Name] = true
 	}
-	if st, err := corrosion.GetStack(ctx, s.db, req.Name); err == nil && st != nil && st.ComposeYAML != "" {
-		if f, err := compose.ParseBytes([]byte(st.ComposeYAML)); err == nil {
-			for baseName, vmDef := range f.VMs {
-				// Container workloads are torn down separately via
-				// ListContainersByStack below — don't add them to the VM
-				// delete list (DeleteVM would just NotFound them).
-				if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
-					continue
-				}
-				for r := 0; r < vmDef.EffectiveReplicas(); r++ {
-					instName := vmDef.InstanceName(baseName, r)
-					if !vmNames[instName] {
-						vmNames[instName] = true
-						vms = append(vms, corrosion.VMRecord{
-							Name:      instName,
-							StackName: req.Name,
-						})
-					}
+	// storedErr: the stored compose cannot be read, so neither the VMs it
+	// names nor which of the stack's networks are external are known. VMs
+	// in the store are still deleted; networks are left (see below).
+	stored, storedErr := s.storedStackFile(ctx, req.Name)
+	if stored != nil {
+		for baseName, vmDef := range stored.VMs {
+			// Container workloads are torn down separately via
+			// ListContainersByStack below — don't add them to the VM
+			// delete list (DeleteVM would just NotFound them).
+			if vmDef.Kind == compose.WorkloadKindLXC || vmDef.Kind == compose.WorkloadKindOCI {
+				continue
+			}
+			for r := 0; r < vmDef.EffectiveReplicas(); r++ {
+				instName := vmDef.InstanceName(baseName, r)
+				if !vmNames[instName] {
+					vmNames[instName] = true
+					vms = append(vms, corrosion.VMRecord{
+						Name:      instName,
+						StackName: req.Name,
+					})
 				}
 			}
 		}
@@ -755,7 +844,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	corrosion.SoftDeleteLBBackends(ctx, s.db, lbName)
 	_ = corrosion.SoftDeleteLBConfig(ctx, s.db, lbName)
 
+	// hadFailures keeps the stack in "deleting"; notRemoved names what is left,
+	// for the audit row.
 	hadFailures := false
+	var notRemoved []string
 	for _, vm := range vms {
 		if err := stream.Send(&pb.DeleteProgress{
 			VmName: vm.Name,
@@ -767,6 +859,7 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		delErr := s.deleteVMWithFanout(ctx, vm.Name, req.KeepDisks)
 		if delErr != nil {
 			hadFailures = true
+			notRemoved = append(notRemoved, vm.Name)
 			slog.Warn("stack delete vm failed", "vm", vm.Name, "error", delErr)
 			if sendErr := stream.Send(&pb.DeleteProgress{
 				VmName: vm.Name,
@@ -792,11 +885,23 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	containers, ctErr := corrosion.ListContainersByStack(ctx, s.db, req.Name)
 	if ctErr != nil {
 		hadFailures = true
+		notRemoved = append(notRemoved, "containers (list failed)")
 		slog.Warn("stack delete: list containers failed", "stack", req.Name, "error", ctErr)
+		// Every failure that keeps the stack "deleting" goes on the stream too:
+		// it ends OK either way, so an "error" status is the only way a client
+		// can tell the teardown was incomplete.
+		if sendErr := stream.Send(&pb.DeleteProgress{
+			VmName: "containers (list failed)",
+			Status: "error",
+			Error:  "list the stack's containers: " + ctErr.Error(),
+		}); sendErr != nil {
+			return sendErr
+		}
 	}
 	for _, ct := range containers {
 		if _, delErr := s.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); delErr != nil {
 			hadFailures = true
+			notRemoved = append(notRemoved, ct.Name)
 			slog.Warn("stack delete container failed", "container", ct.Name, "host", ct.HostName, "error", delErr)
 			if sendErr := stream.Send(&pb.DeleteProgress{VmName: ct.Name, Status: "error", Error: delErr.Error()}); sendErr != nil {
 				return sendErr
@@ -813,8 +918,26 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// ("<stack>_<net>"): a migration re-provisions the network on the target via
 	// ProvisionNetwork and can land a row with an empty stack_name, which would
 	// otherwise orphan the bridge + dnsmasq + row at teardown.
-	externalNets := s.externalNetworkNames(ctx, req.Name)
+	//
+	// When the stored compose cannot be read, which networks are external is
+	// unknown, and guessing "none" deletes networks the stack never made. So
+	// none is deprovisioned; the stack stays in "deleting", and the error says
+	// why.
+	externalNets := externalNetworksOf(stored, req.Name)
 	nets, _ := corrosion.ListNetworks(ctx, s.db)
+	if storedErr != nil {
+		hadFailures = true
+		notRemoved = append(notRemoved, "networks")
+		slog.Warn("stack networks not deprovisioned: stored compose unreadable", "stack", req.Name, "error", storedErr)
+		if sendErr := stream.Send(&pb.DeleteProgress{
+			VmName: "networks",
+			Status: "error",
+			Error:  "networks not deprovisioned: " + storedErr.Error(),
+		}); sendErr != nil {
+			return sendErr
+		}
+		nets = nil
+	}
 	for _, nr := range nets {
 		if networkBelongsToStack(nr, req.Name) && !externalNets[nr.Name] {
 			// Tear down the static subnet route injected on deploy (injectSubnetRoutes),
@@ -835,7 +958,15 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 			}
 			if err := s.deprovisionNetworkByName(ctx, nr.Name); err != nil {
 				hadFailures = true
+				notRemoved = append(notRemoved, "network "+nr.Name)
 				slog.Warn("stack network deprovision failed", "network", nr.Name, "error", err)
+				if sendErr := stream.Send(&pb.DeleteProgress{
+					VmName: "network " + nr.Name,
+					Status: "error",
+					Error:  "deprovision network: " + err.Error(),
+				}); sendErr != nil {
+					return sendErr
+				}
 			}
 		}
 	}
@@ -872,6 +1003,11 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		s.publish("stack.deleted", req.Name, fmt.Sprintf("%d VMs", len(vms)))
 	}
 
+	if hadFailures {
+		s.audit(ctx, "stack.delete", req.Name,
+			"incomplete, left in deleting for the reconciler; not removed: "+strings.Join(notRemoved, ", "), "error")
+		return nil
+	}
 	s.audit(ctx, "stack.delete", req.Name, "", "ok")
 	return nil
 }
@@ -996,7 +1132,7 @@ func (s *Server) DeprovisionNetworkByName(ctx context.Context, name string) erro
 }
 
 // ExternalNetworkNames exposes externalNetworkNames for the StackReconciler.
-func (s *Server) ExternalNetworkNames(ctx context.Context, stackName string) map[string]bool {
+func (s *Server) ExternalNetworkNames(ctx context.Context, stackName string) (map[string]bool, error) {
 	return s.externalNetworkNames(ctx, stackName)
 }
 
@@ -1279,15 +1415,22 @@ func networkBelongsToStack(nr corrosion.NetworkRecord, stackName string) bool {
 	return nr.StackName == stackName || strings.HasPrefix(nr.Name, stackName+"_")
 }
 
-// externalNetworkNames returns a set of network names marked as external in the
-// stored compose YAML for a stack. Returns an empty map on any error.
-func (s *Server) externalNetworkNames(ctx context.Context, stackName string) map[string]bool {
-	st, err := corrosion.GetStack(ctx, s.db, stackName)
-	if err != nil || st == nil || st.ComposeYAML == "" {
-		return nil
-	}
-	f, err := compose.ParseBytes([]byte(st.ComposeYAML))
+// externalNetworkNames returns the set of network names marked external in a
+// stack's stored compose YAML (nil when there is no stored stack), or an error
+// when it cannot be read — the teardown must then not guess which are the
+// stack's own.
+func (s *Server) externalNetworkNames(ctx context.Context, stackName string) (map[string]bool, error) {
+	f, err := s.storedStackFile(ctx, stackName)
 	if err != nil {
+		return nil, err
+	}
+	return externalNetworksOf(f, stackName), nil
+}
+
+// externalNetworksOf is the set of f's external networks, by plain and
+// stack-scoped name; nil for a nil f.
+func externalNetworksOf(f *compose.File, stackName string) map[string]bool {
+	if f == nil {
 		return nil
 	}
 	ext := make(map[string]bool)
@@ -1302,65 +1445,137 @@ func (s *Server) externalNetworkNames(ctx context.Context, stackName string) map
 	return ext
 }
 
-// highestDependencyCondition checks if any later ops depend on vmName and returns
-// the most demanding condition ("vm_healthy" > "vm_started").
-func highestDependencyCondition(vmName string, ops []compose.Op) string {
-	best := ""
-	for _, op := range ops {
-		for dep, def := range op.DependsOn {
-			// Match exact name or base name (for replicas: "db" matches "db-1").
-			if dep == vmName || (len(vmName) > len(dep) && vmName[:len(dep)] == dep && vmName[len(dep)] == '-') {
-				if def.Condition == "vm_healthy" {
-					return "vm_healthy" // highest possible
-				}
-				if best == "" {
-					best = def.Condition
-				}
-			}
-		}
-	}
-	return best
+// waitForCondition waits for a depends-on condition ("vm_started" or
+// "vm_healthy", the compose depends-on vocabulary) with that condition's
+// default timeout.
+func (s *Server) waitForCondition(ctx context.Context, vmName, condition string) error {
+	return s.waitForConditionWithin(ctx, vmName, condition, s.dependsOnTimeout(condition))
 }
 
-// waitForCondition polls until a VM reaches the specified condition or times out.
-func (s *Server) waitForCondition(ctx context.Context, vmName, condition string) error {
+// dependsOnTimeout is a depends-on condition's default wait.
+func (s *Server) dependsOnTimeout(condition string) time.Duration {
 	timeout := 5 * time.Minute
 	if condition == "vm_healthy" {
 		timeout = 10 * time.Minute
 	}
+	if d := s.dependsOnWaitTimeout.Load(); d > 0 {
+		timeout = time.Duration(d)
+	}
+	return timeout
+}
 
+// waitForWorkloadCondition waits for a planned workload — a VM or a
+// container — to satisfy a depends-on condition, with the condition's default
+// timeout.
+func (s *Server) waitForWorkloadCondition(ctx context.Context, a planner.VMAction, condition string) error {
+	if a.IsContainer {
+		return s.waitForContainerConditionWithin(ctx, a.TargetHost, a.VMName, condition, s.dependsOnTimeout(condition))
+	}
+	return s.waitForCondition(ctx, a.VMName, condition)
+}
+
+// waitForContainerConditionWithin is waitForConditionWithin for a container
+// on host. A container has no probe verdict — compose refuses vm_healthy on a
+// container that declares a healthcheck — so both conditions mean running,
+// as vm_healthy does for a VM without a healthcheck.
+func (s *Server) waitForContainerConditionWithin(ctx context.Context, host, name, condition string, timeout time.Duration) error {
+	switch condition {
+	case "vm_started", "vm_healthy":
+	default:
+		return fmt.Errorf("unknown wait condition %q for %s (want vm_started or vm_healthy)", condition, name)
+	}
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
+	last := "the container does not exist yet"
+	for {
+		rec, err := corrosion.GetContainer(ctx, s.db, host, name)
+		switch {
+		case err != nil:
+			last = fmt.Sprintf("could not read the container: %v", err)
+		case rec == nil:
+			last = "the container does not exist on " + host
+		case rec.State == "running":
+			return nil
+		default:
+			last = "the container is " + rec.State
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		t := time.NewTimer(min(conditionPollInterval, remaining))
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return ctx.Err()
-		default:
+		case <-t.C:
 		}
+	}
+	return fmt.Errorf("timeout after %s waiting for %s on container %s: %s", timeout, condition, name, last)
+}
 
+// waitForConditionWithin polls until vmName satisfies condition or timeout
+// elapses. condition must be "vm_started" or "vm_healthy": anything else is
+// refused at once, because a condition that matches no branch can never be
+// met and would only spin until the deadline (the rolling health wait used to
+// pass "healthy:<dur>" and fail every update exactly that way).
+func (s *Server) waitForConditionWithin(ctx context.Context, vmName, condition string, timeout time.Duration) error {
+	switch condition {
+	case "vm_started", "vm_healthy":
+	default:
+		return fmt.Errorf("unknown wait condition %q for %s (want vm_started or vm_healthy)", condition, vmName)
+	}
+
+	deadline := time.Now().Add(timeout)
+	last := "the VM does not exist yet"
+	for {
 		vm, err := corrosion.GetVM(ctx, s.db, vmName)
-		if err != nil || vm == nil {
-			time.Sleep(2 * time.Second)
-			continue
-		}
-
-		switch condition {
-		case "vm_started":
+		switch {
+		case err != nil:
+			last = fmt.Sprintf("could not read the VM: %v", err)
+		case vm == nil:
+			last = "the VM does not exist"
+		case condition == "vm_started":
 			if vm.State == "running" {
 				return nil
 			}
-		case "vm_healthy":
-			if vm.State == "running" && vm.StateDetail != "unhealthy" {
-				// Check if healthcheck is passing — if no healthcheck defined,
-				// "running" is sufficient.
+			last = "the VM is " + vm.State
+		default: // vm_healthy
+			// With a healthcheck, only the owner's passing verdict for this
+			// incarnation of the VM counts; without one, running does.
+			h, herr := health.EvaluateVMHealth(ctx, s.db, vm)
+			if herr != nil {
+				last = herr.Error()
+				break
+			}
+			if h.Satisfied {
 				return nil
+			}
+			last = h.Detail
+			if h.Verdict != "" {
+				last = "healthcheck verdict " + h.Verdict + ": " + h.Detail
 			}
 		}
 
-		time.Sleep(2 * time.Second)
+		// Look once more AT the deadline rather than sleeping past it: a
+		// verdict that lands in the last poll interval is a pass.
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		t := time.NewTimer(min(conditionPollInterval, remaining))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
 	}
 
-	return fmt.Errorf("timeout waiting for %s on %s", condition, vmName)
+	return fmt.Errorf("timeout after %s waiting for %s on %s: %s", timeout, condition, vmName, last)
 }
+
+// conditionPollInterval is how often waitForConditionWithin re-reads the VM.
+const conditionPollInterval = time.Second
 
 // autoPullImages checks each image referenced by VMs in the compose file. If
 // an image is missing locally but has a source URL in the compose images:
@@ -1374,12 +1589,26 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		}
 		seen[img] = true
 
-		if s.images.ImageExists(img) {
+		// A ready copy anywhere in the cluster is used, not downloaded
+		// again: here, or on a peer the VM's host pulls from at create
+		// time (the same peers autoPullImage would pull from). A checksum
+		// the file declares must match the one recorded for that copy — a
+		// mismatch is an error, never a silent re-download over it.
+		def, hasDef := f.Images[img]
+		sources, err := s.imagePullSources(ctx, img)
+		if err != nil {
+			return status.Errorf(codes.Internal, "image %q: %v", img, err)
+		}
+		if local := s.images.ImageExists(img); local || len(sources) > 0 {
+			if hasDef && def.Checksum != "" {
+				if err := s.checkHeldImageChecksum(ctx, img, def.Checksum, local, sources); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 
-		def, ok := f.Images[img]
-		if !ok || def.Source == "" {
+		if !hasDef || def.Source == "" {
 			continue // no source URL — validateDeployDependencies will catch it
 		}
 
@@ -1441,9 +1670,45 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 	return nil
 }
 
+// checkHeldImageChecksum refuses a copy of img the cluster already holds when
+// the compose file declares a checksum that differs from the one recorded for
+// it. A copy with no recorded checksum cannot be shown to match, so it is
+// refused too.
+func (s *Server) checkHeldImageChecksum(ctx context.Context, img, declared string, local bool, peers []string) error {
+	rec, err := corrosion.GetImage(ctx, s.db, img)
+	if err != nil {
+		return status.Errorf(codes.Internal, "image %q: read catalogue: %v", img, err)
+	}
+	recorded := ""
+	if rec != nil {
+		recorded = rec.Checksum
+	}
+	if recorded != "" && normalizeChecksum(recorded) == normalizeChecksum(declared) {
+		return nil
+	}
+	holders := append([]string(nil), peers...)
+	if local {
+		holders = append([]string{s.hostName}, holders...)
+	}
+	shown := recorded
+	if shown == "" {
+		shown = "none"
+	}
+	return status.Errorf(codes.FailedPrecondition,
+		"image %q: the compose file declares checksum %s, but the copy held on %s records checksum %s — "+
+			"correct the checksum, or remove the image (`lv image rm %s`) so the source is downloaded again",
+		img, declared, strings.Join(holders, ", "), shown, img)
+}
+
+// normalizeChecksum compares checksums written with or without the sha256:
+// prefix, in either case.
+func normalizeChecksum(c string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(c)), "sha256:")
+}
+
 // validateDeployDependencies checks that images and networks referenced in the
 // compose file actually exist in the cluster before any VMs are created (#52).
-func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File) []string {
+func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File, composeYAML []byte) []string {
 	var errs []string
 
 	// Check images exist on at least one host.
@@ -1467,13 +1732,64 @@ func (s *Server) validateDeployDependencies(ctx context.Context, f *compose.File
 			continue
 		}
 		seenImages[img] = true
-		if !s.images.ImageExists(img) {
+		// Any host's ready copy will do: the VM's host pulls it from a peer
+		// at create time (autoPullImage). Only this node's own store used to
+		// count, so an image imported on another host was refused as "not
+		// found on any host" when the deploy was served elsewhere.
+		switch ok, err := s.imageAvailable(ctx, img); {
+		case err != nil:
+			errs = append(errs, fmt.Sprintf("image %q: lookup failed: %v", img, err))
+		case !ok:
 			errs = append(errs, fmt.Sprintf("image %q not found on any host — pull it first with 'lv image pull'", img))
 		}
 	}
 
 	// Network name collisions between stacks are prevented by scoping
 	// non-external network names with the stack prefix (e.g. stack1_LAN).
+
+	// A NIC naming a network the file does not declare attaches to the cluster
+	// network of that name, so that network must exist. Without this a typo, or
+	// a network that was never created, fell through to a flat bridge named
+	// after the NIC: created on the VM's host with no uplink, no gateway and no
+	// DHCP, and nothing reported.
+	undeclared := map[string][]string{} // network → workloads naming it
+	for name, vmDef := range f.VMs {
+		for _, n := range vmDef.Network {
+			if _, declared := f.Networks[n.Name]; !declared {
+				undeclared[n.Name] = append(undeclared[n.Name], name)
+			}
+		}
+	}
+	for netName, users := range undeclared {
+		nr, err := corrosion.GetNetwork(ctx, s.db, netName)
+		switch {
+		case err != nil:
+			errs = append(errs, fmt.Sprintf("network %q: lookup failed: %v", netName, err))
+		case nr == nil:
+			sort.Strings(users)
+			errs = append(errs, fmt.Sprintf(
+				"network %q (used by %s) is not declared under networks: and no cluster network by that name exists — "+
+					"declare it in the file, or create it with `lv network create %s`",
+				netName, strings.Join(users, ", "), netName))
+		}
+	}
+
+	// A disk's storage: must name a volume of the file or a pool somewhere in
+	// the cluster. Anything else used to fall back to the local driver at
+	// create time, silently; the VM's host is not chosen yet, so a pool that
+	// exists only on other hosts passes here and resolveVolume refuses it on
+	// a host that lacks it.
+	var poolNames []string
+	if pools, err := corrosion.ListAllStoragePools(ctx, s.db); err != nil {
+		errs = append(errs, fmt.Sprintf("storage pools: lookup failed: %v", err))
+	} else {
+		for _, p := range pools {
+			poolNames = append(poolNames, p.Name)
+		}
+		for _, p := range compose.CheckStorage(composeYAML, f, poolNames) {
+			errs = append(errs, p.String())
+		}
+	}
 
 	// Check named volumes reference accessible storage.
 	for volName, vol := range f.Volumes {

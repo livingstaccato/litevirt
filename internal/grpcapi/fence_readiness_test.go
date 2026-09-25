@@ -3,9 +3,11 @@ package grpcapi
 import (
 	"context"
 	"crypto/x509"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -583,5 +585,80 @@ func TestGetFenceReadiness_WitnessIsNotCounted(t *testing.T) {
 	}
 	if !r.GetEnforcedEverywhere() {
 		t.Error("enforced_everywhere = false because of a witness; every workload host enforces")
+	}
+}
+
+// The readiness report carries recent fences labelled by what they established.
+//
+// A cluster whose failovers have been resting on SSH fences nobody verified
+// looked, from every operator surface, exactly like one fencing by IPMI: the
+// stored result says "fenced" for both. This is where an operator checking
+// fence posture would expect to see that.
+func TestFenceReadiness_RecentFencesCarryTheirAssurance(t *testing.T) {
+	s := fenceTestServer(t, true, true)
+	ctx := context.Background()
+	for _, f := range []corrosion.FenceLogRecord{
+		{ID: "a", HostName: "node-2", Method: "ipmi", Result: "fenced"},
+		{ID: "b", HostName: "node-3", Method: "ssh", Result: "fenced"},
+		{ID: "c", HostName: "node-4", Method: "best-effort-ssh", Result: "fenced"},
+	} {
+		if err := corrosion.InsertFenceLog(ctx, s.db, f); err != nil {
+			t.Fatalf("InsertFenceLog: %v", err)
+		}
+	}
+
+	r, err := s.GetFenceReadiness(adminCtx(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("GetFenceReadiness: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, e := range r.GetRecentFences() {
+		got[e.GetHost()] = e.GetAssurance()
+	}
+	want := map[string]string{
+		"node-2": corrosion.FenceVerified,
+		"node-3": corrosion.FenceRequested,
+		"node-4": corrosion.FenceAssumed,
+	}
+	for h, w := range want {
+		if got[h] != w {
+			t.Errorf("recent fence on %s: assurance %q, want %q", h, got[h], w)
+		}
+	}
+}
+
+// Only RECENT fences, and a bounded number of them. The report is a posture
+// check, not an audit log, and a year of fencing history would bury the one
+// row an operator came for.
+func TestFenceReadiness_RecentFencesAreRecentAndBounded(t *testing.T) {
+	s := fenceTestServer(t, true, true)
+	ctx := context.Background()
+	old := time.Now().Add(-2 * fenceReadinessRecentWindow).UTC().Format(time.RFC3339)
+	if err := s.db.Execute(ctx,
+		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
+		"ancient", "node-9", "ssh", "fenced", old, ""); err != nil {
+		t.Fatalf("seed old fence: %v", err)
+	}
+	for i := 0; i < fenceReadinessRecentMax+5; i++ {
+		if err := corrosion.InsertFenceLog(ctx, s.db, corrosion.FenceLogRecord{
+			ID: fmt.Sprintf("n%02d", i), HostName: "node-2", Method: "ipmi", Result: "fenced",
+		}); err != nil {
+			t.Fatalf("InsertFenceLog: %v", err)
+		}
+	}
+
+	r, err := s.GetFenceReadiness(adminCtx(), &emptypb.Empty{})
+	if err != nil {
+		t.Fatalf("GetFenceReadiness: %v", err)
+	}
+
+	if n := len(r.GetRecentFences()); n != fenceReadinessRecentMax {
+		t.Errorf("got %d recent fences, want the cap of %d", n, fenceReadinessRecentMax)
+	}
+	for _, e := range r.GetRecentFences() {
+		if e.GetHost() == "node-9" {
+			t.Error("a fence older than the recent window was reported")
+		}
 	}
 }

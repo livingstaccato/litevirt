@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -91,4 +92,20 @@ func (s *Server) RecordSelfReportedIsolationForTest(ctx context.Context) {
 func (s *Server) SetWALQuarantinedForTest(on bool) {
 	fn := func() bool { return on }
 	s.walQuarantined.Store(&fn)
+}
+
+// SetDependsOnWaitTimeoutForTests shortens waitForCondition's timeout so a
+// fleet scenario can reach a failed compose depends-on wait without waiting
+// the production 5-10 minutes. Zero restores the default.
+func (s *Server) SetDependsOnWaitTimeoutForTests(d time.Duration) {
+	s.dependsOnWaitTimeout.Store(int64(d))
+}
+
+// ForgetNetworkReconcileForTests drops everything ReconcileNetworksOnce
+// remembers about this host, as a daemon restart does: the next pass
+// provisions every live network and tears down every tombstoned one again.
+func (s *Server) ForgetNetworkReconcileForTests() {
+	s.netReconcile.mu.Lock()
+	defer s.netReconcile.mu.Unlock()
+	s.netReconcile.applied, s.netReconcile.torn, s.netReconcile.lastErr = nil, nil, nil
 }

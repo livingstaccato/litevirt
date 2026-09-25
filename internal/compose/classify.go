@@ -91,16 +91,35 @@ type ChangePlan struct {
 	// coarser bucket is also populated).
 	ResourceChanges []Delta
 	// MetadataChanges are live-eligible spec patches (restart policy, onboot,
-	// ordering, labels, placement, migrate) — persisted, no runtime action.
+	// ordering, labels, placement, migrate, healthcheck, hooks, stop timeout)
+	// — persisted, no runtime action.
 	MetadataChanges []Delta
 	// RestartReasons are changes that need a stop→redefine→start.
 	RestartReasons []string
+	// NotReconfigurable are the RestartReasons no reconfigure path can apply
+	// to an existing VM yet (SPICE graphics, resource tuning, passthrough
+	// devices): the change itself only needs a redefine, but the only way the
+	// deploy can make it is to recreate the VM. Each is also in RestartReasons.
+	NotReconfigurable []string
 	// RecreateReasons are changes that alter VM identity (delete+create only).
 	RecreateReasons []string
+	// NICRetargets are NICs whose stored network is the stack-scoped
+	// "<stack>_<name>" and whose desired network is the cluster network
+	// "<name>" — a stack deployed before undeclared NIC networks resolved to
+	// the cluster network. The NIC keeps its MAC and the VM its disks; only the
+	// bridge it is plugged into changes, so it is applied in place (Max=Live).
+	NICRetargets []NICRetarget
 	// Delegated records changes owned by another path (load-balancer, backup,
 	// rolling-update strategy) — recorded, not silently ignored, and never a VM
 	// lifecycle action here.
 	Delegated []string
+}
+
+// NICRetarget is one NIC moving from its stack-scoped network to the cluster
+// network of the same short name.
+type NICRetarget struct {
+	Ordinal  int
+	From, To string
 }
 
 // Max returns the coarsest action the plan requires (Recreate > Restart > Live >
@@ -112,7 +131,7 @@ func (p ChangePlan) Max() Action {
 		return ActionRecreate
 	case len(p.RestartReasons) > 0:
 		return ActionRestart
-	case len(p.ResourceChanges) > 0 || len(p.MetadataChanges) > 0:
+	case len(p.ResourceChanges) > 0 || len(p.MetadataChanges) > 0 || len(p.NICRetargets) > 0:
 		return ActionLive
 	default:
 		return ActionNoChange
@@ -128,6 +147,9 @@ func (p ChangePlan) Reasons() string {
 	out = append(out, p.RestartReasons...)
 	for _, d := range p.ResourceChanges {
 		out = append(out, fmt.Sprintf("%s %s→%s", d.Field, d.Old, d.New))
+	}
+	for _, r := range p.NICRetargets {
+		out = append(out, fmt.Sprintf("nic %d network %s→%s (re-plugged in place, same MAC, disks kept)", r.Ordinal, r.From, r.To))
 	}
 	for _, d := range p.MetadataChanges {
 		if d.Old == "" && d.New == "" {
@@ -210,14 +232,21 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	// path stores (e.g. guest-agent via EffectiveGuestAgent), so an equality compare is
 	// safe and won't false-positive on a server default.
 	restartIf(desired.GuestAgent != stored.GuestAgent, "guest-agent toggle needs a redefine")
-	restartIf(desired.DisableVnc != stored.DisableVnc || desired.EnableSpice != stored.EnableSpice, "graphics change needs a redefine")
+	restartIf(desired.DisableVnc != stored.DisableVnc, "graphics (vnc) change needs a redefine")
 	restartIf(desired.SecureBoot != stored.SecureBoot, "secure-boot change needs a redefine")
 	restartIf(desired.Tpm != stored.Tpm, "tpm change needs a redefine")
-	restartIf(desired.StopTimeoutSec != 0 && desired.StopTimeoutSec != stored.StopTimeoutSec, "stop-grace-period change needs a redefine")
-	restartIf(desired.Resources != nil && !proto.Equal(desired.Resources, stored.Resources), "resource-tuning change needs a redefine")
-	restartIf(desired.Healthcheck != nil && !proto.Equal(desired.Healthcheck, stored.Healthcheck), "health-check change needs a redefine")
-	restartIf(desired.Hooks != nil && !proto.Equal(desired.Hooks, stored.Hooks), "lifecycle-hooks change needs a redefine")
-	restartIf(len(desired.Devices) > 0 && !devicesEqual(desired.Devices, stored.Devices), "passthrough-device change needs a redefine")
+	// Redefine-only fields that no reconfigure path can apply to an existing
+	// VM yet: recorded as restart-class (what the change needs) and as
+	// NotReconfigurable (what the deploy has to do instead).
+	notReconfigurableIf := func(cond bool, reason string) {
+		if cond {
+			p.RestartReasons = append(p.RestartReasons, reason)
+			p.NotReconfigurable = append(p.NotReconfigurable, reason)
+		}
+	}
+	notReconfigurableIf(desired.EnableSpice != stored.EnableSpice, "graphics (spice) change needs a redefine")
+	notReconfigurableIf(desired.Resources != nil && !proto.Equal(desired.Resources, stored.Resources), "resource-tuning change needs a redefine")
+	notReconfigurableIf(len(desired.Devices) > 0 && !devicesEqual(desired.Devices, stored.Devices), "passthrough-device change needs a redefine")
 
 	// --- Recreate-class: identity fields (delete+create only); unset desired inherits ---
 	recreateIf := func(cond bool, reason string) {
@@ -230,7 +259,13 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	if dd := StoredDisksFromSpec(desired); len(dd) > 0 {
 		recreateIf(!disksTopologyEqual(dd, storedDisks), "disk-topology change recreates")
 	}
-	recreateIf(len(desired.Network) > 0 && !networkTopologyEqual(desired.Network, stored.Network), "network-topology change recreates")
+	if len(desired.Network) > 0 && !networkTopologyEqual(desired.Network, stored.Network) {
+		if rt, ok := nicRetargets(desired, stored); ok {
+			p.NICRetargets = rt
+		} else {
+			recreateIf(true, "network-topology change recreates")
+		}
+	}
 	recreateIf(desired.CloudInit != nil && !proto.Equal(desired.CloudInit, stored.CloudInit), "cloud-init change recreates")
 
 	// --- Live metadata: spec-persisted, no runtime action; unset desired inherits ---
@@ -247,6 +282,13 @@ func Classify(desired, stored *pb.VMSpec, storedDisks []StoredDisk) ChangePlan {
 	metaIf(len(desired.Labels) > 0 && !maps.Equal(desired.Labels, stored.Labels), "labels", "", "")
 	metaIf(desired.Placement != nil && !placementEqual(desired.Placement, stored.Placement), "placement", "", "")
 	metaIf(desired.Migrate != nil && !proto.Equal(desired.Migrate, stored.Migrate), "migrate", "", "")
+	// Read from the stored spec when they are used — by the owner's health
+	// checker, at each start/stop/migrate, at each stop — never baked into the
+	// domain, so a spec patch is the whole change.
+	metaIf(desired.Healthcheck != nil && !proto.Equal(desired.Healthcheck, stored.Healthcheck), "healthcheck", "", "")
+	metaIf(desired.Hooks != nil && !proto.Equal(desired.Hooks, stored.Hooks), "hooks", "", "")
+	metaIf(desired.StopTimeoutSec != 0 && desired.StopTimeoutSec != stored.StopTimeoutSec, "stop_timeout",
+		fmt.Sprintf("%ds", stored.StopTimeoutSec), fmt.Sprintf("%ds", desired.StopTimeoutSec))
 
 	// --- Delegated: owned by another path, recorded not ignored ---
 	if desired.Loadbalancer != nil && !proto.Equal(desired.Loadbalancer, stored.Loadbalancer) {
@@ -351,6 +393,36 @@ func disksTopologyEqual(desired, stored []StoredDisk) bool {
 		}
 	}
 	return true
+}
+
+// nicRetargets reports whether the ONLY NIC differences between desired and
+// stored are NICs moving from the stack-scoped "<stack>_<name>" to the cluster
+// network "<name>" (same count, same order, same model), and lists them.
+//
+// That is exactly the shape a stack deployed before undeclared NIC networks
+// resolved to the cluster network (ResolveNetworkName) takes when the same
+// file is applied again. Whether the old name really was a record-less flat
+// bridge is a cluster fact the classifier cannot see; the executor checks it
+// before it moves anything.
+func nicRetargets(desired, stored *pb.VMSpec) ([]NICRetarget, bool) {
+	if desired.StackName == "" || len(desired.Network) != len(stored.Network) {
+		return nil, false
+	}
+	var out []NICRetarget
+	for i, d := range desired.Network {
+		s := stored.Network[i]
+		if m := d.GetModel(); m != "" && m != s.GetModel() {
+			return nil, false
+		}
+		if d.GetName() == s.GetName() {
+			continue
+		}
+		if s.GetName() != ScopedNetworkName(desired.StackName, d.GetName()) {
+			return nil, false
+		}
+		out = append(out, NICRetarget{Ordinal: i, From: s.GetName(), To: d.GetName()})
+	}
+	return out, len(out) > 0
 }
 
 // networkTopologyEqual compares NIC topology by the stable, non-server-resolved

@@ -48,8 +48,9 @@ func newGitopsCmd() *cobra.Command {
 				syscall.SIGINT, syscall.SIGTERM)
 			defer cancel()
 
-			// Deployer applies one compose file by streaming DeployStack and
-			// surfacing the last error, if any.
+			// Deployer applies one compose file by streaming DeployStack to its
+			// end and reporting every failure (see gitops.DrainDeploy for why
+			// it must never stop reading early).
 			deployer := func(ctx context.Context, path, body string) error {
 				client, closer, err := cli.Connect(ctx)
 				if err != nil {
@@ -62,18 +63,7 @@ func newGitopsCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("DeployStack: %w", err)
 				}
-				for {
-					p, err := stream.Recv()
-					if err != nil {
-						if err.Error() == "EOF" {
-							return nil
-						}
-						return fmt.Errorf("stream: %w", err)
-					}
-					if p.Error != "" {
-						return fmt.Errorf("deploy: %s", p.Error)
-					}
-				}
+				return gitops.DrainDeploy(stream)
 			}
 
 			// Differ short-circuits no-op cycles: it returns the number of

@@ -14,7 +14,6 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/network"
 	"github.com/litevirt/litevirt/internal/safename"
 )
@@ -223,7 +222,7 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 
 	// Deprovision the network infrastructure.
 	def := networkRecordToDef(nr)
-	if err := network.Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
+	if err := s.networkProvisioner().Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
 		slog.Warn("network deprovision failed", "network", req.Name, "error", err)
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
@@ -382,7 +381,7 @@ func (s *Server) provisionAndPersistNetwork(ctx context.Context, name, stackName
 	}
 
 	localIP := getLocalIP()
-	if _, err := network.SafeProvision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
+	if _, err := s.networkProvisioner().Provision(ctx, s.db, name, def, localIP, s.hostName); err != nil {
 		return nil, err
 	}
 	// Fail closed: don't report a provisioned network while its host-isolation/NAT
@@ -411,7 +410,7 @@ func (s *Server) deprovisionNetworkByName(ctx context.Context, name string) erro
 		return nil // nothing to deprovision
 	}
 	def := networkRecordToDef(nr)
-	if err := network.Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
+	if err := s.networkProvisioner().Deprovision(ctx, s.db, name, def, s.hostName); err != nil {
 		return err
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now
@@ -509,7 +508,7 @@ func (s *Server) ProvisionNetwork(ctx context.Context, req *pb.ProvisionNetworkR
 	}
 
 	localIP := getLocalIP()
-	if _, err := network.SafeProvision(ctx, s.db, req.Name, def, localIP, s.hostName); err != nil {
+	if _, err := s.networkProvisioner().Provision(ctx, s.db, req.Name, def, localIP, s.hostName); err != nil {
 		return nil, status.Errorf(codes.Internal, "provision network %q: %v", req.Name, err)
 	}
 	// Fail closed: don't report a provisioned network while its host-isolation/NAT
@@ -572,11 +571,7 @@ func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb
 		}
 		return &pb.GetVMIPResponse{Ip: ip}, nil
 	}
-	ip := lv.GetIPFromARP(req.Mac)
-	if ip == "" {
-		ip = lv.GetIPFromDHCPLeases("/var/lib/libvirt/dnsmasq", req.Mac)
-	}
-	return &pb.GetVMIPResponse{Ip: ip}, nil
+	return &pb.GetVMIPResponse{Ip: s.discoverNICAddress(req.Mac)}, nil
 }
 
 // UpdateFDB updates a unicast FDB entry on this host (called by peers during migration/discovery).

@@ -81,6 +81,10 @@ vms:
       action: "restart"
 ```
 
+## Images
+
+An `images:` entry's `source` is downloaded at deploy time only when no host in the cluster holds a ready copy of the image. When one does — on the host serving the deploy or on a peer — that copy is used: the VM's host pulls it from the peer when the VM is created. A `checksum` in the entry must then match the checksum recorded for that copy; a mismatch, or a copy with no recorded checksum, fails the deploy with both checksums named, and the source is never downloaded over it. Correct the checksum, or remove the image with `lv image rm` so the source is downloaded again.
+
 ## Deploy and manage
 
 ```bash
@@ -90,6 +94,44 @@ lv compose diff                  # Preview what would change
 lv compose ps                    # List VMs in the stack
 lv compose down                  # Tear down
 ```
+
+`compose up` prints the plan and asks for confirmation; `-y` skips the prompt.
+`up` and `down` refuse to prompt when stdin is not a terminal (ssh without
+`-t`, CI, a pipe) and exit non-zero instead of waiting — pass `-y` in scripts.
+
+`compose up` ends with `Stack "<name>" deployed.` and exit status 0 only when
+every action in the plan succeeded. If any VM action fails, each failure is
+printed as it happens, the success line is withheld, and the command exits
+non-zero with a summary such as `stack "web": 1 of 3 actions failed (web-2)`.
+The actions that did succeed are not rolled back; fix the cause and re-run
+`compose up` to converge the rest.
+
+A failed action is any create, update or delete the daemon could not carry
+out — including a scale-down delete, the delete half of a recreate (the
+recreate then stops rather than create over a VM that was never torn down),
+a `depends-on` wait that timed out, a VM held back because a `depends-on`
+dependency of it was not met (see [Boot ordering](#boot-ordering-depends-on)), a `blue-green` old (blue) VM that could not
+be removed after its `-green` replacement came up, and a `snapshot-and-replace`
+`-next` VM that could not be created or did not become healthy. After such a deploy the stack is
+recorded as `degraded` rather than `active` (the STATE column of
+`lv compose ls`), and the `stack.deploy` audit entry has result `error` and
+names the failed VMs. The new compose file is still stored: it is the desired
+state, and the next `compose up` plans against the live VMs, so it retries
+exactly the actions that failed and the stack returns to `active` once they
+all succeed.
+
+`compose down` follows the same rule. It ends with `Stack "<name>" torn down.`
+and exit status 0 only when every VM and container was deleted and every stack
+network deprovisioned. If any could not be — or the stack's containers could
+not even be listed — each failure is printed, named for what was left (a VM or
+container name, `network <name>`, or `containers (list failed)`), the success line is withheld, and the command
+exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
+(web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
+the teardown in the background, and the `stack.delete` audit entry has result
+`error` and names what was not removed. The web UI's stack **Destroy** action
+reports the same way: it says the stack was destroyed only after a complete
+teardown, and otherwise shows an error naming each failure and stays on the
+page.
 
 ## VM definition
 
@@ -138,7 +180,9 @@ hardware), or `custom`, which requires `cpu-model`.
 Left unset, `cpu-mode` takes the cluster-wide `vm.default_cpu_mode`. It is not left
 empty: an empty mode emits no `<cpu>` element and drops the guest onto QEMU's
 `qemu64`, which has no AVX at all. Changing either field is restart-class — the CPU
-bakes into the domain XML — so `lv compose up --strategy in-place` refuses it.
+bakes into the domain XML — so a deploy reconfigures and restarts the same VM
+(disks kept), and an update under `strategy: in-place` (set in the VM's `update:`
+block) refuses it: in-place never restarts a VM.
 
 With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`, the base name is used directly.
 
@@ -146,7 +190,7 @@ With `replicas: 3`, VMs are named `web-1`, `web-2`, `web-3`. With `replicas: 1`,
 
 The unified `workloads:` map holds VMs *and* containers; the `kind:`
 discriminator selects the runtime. Entries without `kind:` (or `kind: vm`)
-behave exactly like a `vms:` entry. The legacy `vms:` map still works and is
+behave exactly like a `vms:` entry. The legacy `vms:` map is accepted and is
 folded into `workloads` with `kind: vm` at parse time.
 
 ```yaml
@@ -168,7 +212,8 @@ workloads:
 `kind: lxc` and `kind: oci` route to the container runtime (see
 [`docs/containers.md`](containers.md)) and are full compose citizens: `lv compose
 up` creates **and starts** them, re-apply is idempotent (unchanged containers are
-left alone), a changed spec recreates the container, and `lv compose down`
+left alone), a changed spec recreates the container (the plan says `recreate —
+the container is replaced`: containers have no in-place reconfigure), and `lv compose down`
 removes them. Placement is **LXC-aware** — containers are only scheduled onto
 hosts that advertise the container runtime, so they never land on a node that
 can't run them. Image forms: `kind: lxc` takes a download template (`image:
@@ -339,7 +384,7 @@ options (VNC via noVNC; SPICE-in-browser is on the roadmap).
           max-per-hour: 10
           window: off-hours         # named cluster time-window (planned)
 
-      # Legacy (still works; translates to policy=spread-strict):
+      # Legacy form (translates to policy=spread-strict):
       spread: true
 ```
 
@@ -385,7 +430,13 @@ See [`docs/placement.md`](placement.md) for the cost function, troubleshooting, 
 
 ## Boot ordering (depends-on)
 
-Control the order VMs are created during deployment. Dependencies are respected: a VM won't be created until its dependencies reach the specified condition.
+Control the order workloads are created and updated during deployment. A workload that is created or updated by a deploy does not start until each of its dependencies meets the specified condition, whatever the deploy does to the dependency:
+
+- a dependency **created or recreated** by the deploy is created first and waited on right after;
+- a dependency **updated by the rolling engine** is updated first, and the dependent waits on it before its own create or update starts — for the dependency's `health-wait` when its update strategy sets one, else the condition's default timeout;
+- a dependency the deploy leaves **unchanged** is still a dependency: it is waited on before the dependent starts (so a re-run does not create `app` while `db` is still unhealthy).
+
+Creates and updates are ordered together: a new VM that depends on a VM being updated runs after that update. A workload that the deploy leaves unchanged waits on nothing, even when its dependency is not in the state it once needed. Workloads with no ordering between them run in name order (a failed replica's update first, #32), so an unchanged file always deploys in the same order; deletes run where they always have, after the creates and updates.
 
 ```yaml
 vms:
@@ -404,6 +455,8 @@ vms:
         condition: vm_started     # Wait for Redis to be running
 ```
 
+A dependency is named by its compose name: `db` means the workload `db` and, if it is replicated, every replica (`db-1`, `db-2`, …) — never a different workload whose name merely starts with `db-`, such as `db-backup`.
+
 Shorthand form (all conditions default to `vm_started`):
 
 ```yaml
@@ -413,9 +466,16 @@ Shorthand form (all conditions default to `vm_started`):
 Conditions:
 
 - `vm_started` — VM is in "running" state (default). Timeout: 5 minutes.
-- `vm_healthy` — VM is running and healthcheck is passing (requires a `healthcheck` on the dependency). Timeout: 10 minutes.
+- `vm_healthy` — the VM's `healthcheck` has **passed**. Timeout: 10 minutes.
+  - The probe runs on the host that owns the VM, which publishes its verdict (`healthy`, `unhealthy` or `unknown`) to the cluster whenever it changes. The wait is met only by a `healthy` verdict for the VM **as it is now**: a pass recorded before the VM was restarted, recreated or migrated does not count, and neither does one from an owner host that is `offline`, `fenced` or in `maintenance` — a host that is down cannot take back its last pass, so the wait keeps waiting (the VM may yet fail over and pass on its new host).
+  - A VM with **no** `healthcheck` is healthy once it is running.
+  - A wait that times out says which VM and the last thing it saw, for example `timeout after 10m0s waiting for vm_healthy on db: healthcheck verdict unhealthy: tcp probe failing (3 consecutive): tcp 10.0.0.5:5432: connection refused`, or `... the last verdict (healthy) is from a previous incarnation of the VM; no probe of this one has passed yet`.
+  - `lv inspect <vm>` shows the same verdict as `health` / `healthDetail`.
+  - Mixed versions: the node serving the deploy decides what `vm_healthy` means, and the VM's owner publishes the verdict. An older node serving a deploy treats running as healthy; a newer one waiting on a VM with a `healthcheck` whose owner runs an older build sees no verdict and times out. Upgrade every node before relying on it.
 
-If a dependency times out, deployment continues with a warning — it does not block the entire stack.
+Containers (`kind: lxc` / `kind: oci`) take part in `depends-on` both ways — a VM can depend on a container and a container on a VM. For a container, `vm_started` means the container is running. A container has no probe verdict (a container `healthcheck` is not probed), so `vm_healthy` on a container also means running — the rule for a VM without a `healthcheck` — and a file that asks for `vm_healthy` on a container that **declares** a `healthcheck` is refused at validation (`... is a container (kind lxc) and container healthchecks are not probed — use condition vm_started, or remove the container's healthcheck`), because that promise could not be kept.
+
+If a dependency's condition is not met — its wait times out, or its create (or the recreate of an update) fails — the dependency is reported as a failed action (an `error` line naming it), and **its dependents are held back**: they are neither created nor updated (an existing dependent keeps running as it is), and each is reported as a failed action of its own, naming the dependency, the condition and why it was not met, for example `blocked: depends-on db (condition vm_healthy) was not met: depends-on wait for vm_healthy: timeout after 10m0s waiting for vm_healthy on db: ...`. The block is transitive — whatever depends on a held-back VM is held back too, with `blocked: depends-on app (condition vm_started) was not met: blocked: ...`. VMs that do not depend on the failed one are deployed as usual. The stack ends `degraded`, `compose up` exits non-zero, and the next `compose up` creates the held-back VMs once their dependency meets its condition — until then the re-run holds them back the same way, with the same `blocked: depends-on ...` line. For a replicated dependency, one failed replica holds its dependents back.
 
 Cycles are detected at parse time and rejected.
 
@@ -520,13 +580,96 @@ Requirements:
 
 ```yaml
     healthcheck:
-      type: "http"          # tcp | http | ping | exec
-      target: "http://localhost:8080/health"
+      type: "http"          # tcp | http | https | ping | exec
+      target: "http://localhost:8080/health"   # localhost = the VM, see below
       interval: "10s"
       timeout: "5s"
       retries: 3
       action: "restart"     # restart | migrate | alert
 ```
+
+**Targets are resolved relative to the VM.** The probe runs on the VM's owning *host*, not inside the guest, so a target that names a place on the VM — a bare port, an empty host, `localhost` or any loopback address (`127.0.0.0/8`, `::1`) — is sent to the VM's address. A target that names another host is probed as given.
+
+| `type` | `target` | Probes |
+|---|---|---|
+| `tcp` | `"22"`, `":22"`, `"localhost:22"`, `"127.0.0.1:22"` | TCP connect to `<vm-address>:22` |
+| `tcp` | `"db.internal:5432"` | `db.internal:5432`, as given |
+| `http` / `https` | `"http://localhost:8080/health"`, `":8080/health"` | `GET http://<vm-address>:8080/health` |
+| `http` / `https` | `"8080"`, `"/health"` | `GET http://<vm-address>:8080`, `GET http://<vm-address>/health` (scheme from `type`) |
+| `http` / `https` | `"http://example.com/health"` | that URL, as given |
+| `ping` | omitted, or `"localhost"` | one ICMP echo to `<vm-address>` |
+| `ping` | `"10.0.0.1"` | `10.0.0.1`, as given |
+| `exec` | `"systemctl is-active nginx"` | the command, run inside the guest by the guest agent (`guest-agent` must be on) |
+
+An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`); a service name such as `ssh` is refused, and for a well-known name (`ssh`, `http`, `https`, `postgres`, `mysql`, `redis`, `dns`, `smtp` and a few more) the error gives the number: `"ssh" is not a port number — use 22`. The table of names is fixed and never read from the host's `/etc/services`, which differs from host to host.
+
+**`type` can be left out when the target settles it**: an `http://` or `https://` URL is that type, and a port, `:port` or `host:port` is `tcp`. A `type` that is written always wins (`type: http` with `target: "8080"` probes HTTP). `ping` and `exec` are never inferred, and neither is anything else — an empty target, a bare path such as `/health`, a bare host — so those need a `type`, and the error says which types there are.
+
+**The VM's address** is its NIC's recorded address — the one `lv ls` shows, lowest-ordinal NIC first — unless the owning host sees a *different* address for that NIC's MAC in its dnsmasq leases or ARP cache, in which case the probe goes to the live one: a DHCP address is recorded once and not updated, so after the guest reboots onto a new lease the recorded address is stale (`lv ls`, DNS and the load balancer keep showing it until it is changed). When the host sees nothing for the MAC — a static or NetBox-assigned address — the recorded address is used. When no address is recorded yet, the probe uses what the host sees for the NIC's MAC.
+
+**When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.
+
+A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails, with a non-zero exit, before anything is deployed. Every problem in the file is reported at once — healthcheck or not, in one format — each as `file:line:col: field.path: problem — fix`, the fix given where there is one:
+
+```
+compose validation errors:
+  - stack.yaml:7:15: vms.db.healthcheck.target: "postgres" is not a port number — use 5432
+  - stack.yaml:8:15: vms.db.healthcheck.action: unknown healthcheck action "reboot" — want restart | migrate | alert
+```
+
+A field the file does not have — in a healthcheck or anywhere else: the top level, a VM or workload, a network, a disk, a depends-on entry — is refused, with the field it most likely meant, so a misspelling never leaves a default silently in force:
+
+```
+  - stack.yaml:9:7: vms.db.healthcheck: unknown field "retires" — did you mean "retries"?
+```
+
+Keys starting `x-` (extension fields, free for your own use, at the top level or inside any block) and YAML merge keys (`<<: *anchor`) are allowed; the keys an anchor merges in are checked like any other. The shorthand forms stay valid: a disk as `root: 20G`, memory as `4G`, `depends-on` as a list.
+
+`interval` and `timeout` are durations with a unit (`"10s"`, `"1m"`) greater than zero; a `timeout` must not exceed the `interval` (written, or its default), since a probe must finish before the next is due; and `retries`, when written, is at least `1`. A field that is left out takes its default:
+
+| Field | Default |
+|---|---|
+| `type` | inferred from `target` (see above), otherwise required |
+| `interval` | `10s` (also the floor: the checker sweeps every 10 seconds) |
+| `timeout` | `5s` |
+| `retries` | `3` |
+| `action` | `restart` |
+
+```
+  - stack.yaml:7:17: vms.db.healthcheck.interval: interval "10" is not a duration — add a unit, e.g. "10s"
+  - stack.yaml:9:16: vms.db.healthcheck.retries: retries must be at least 1 — omit it for the default, 3
+```
+
+A `timeout` of `30s` with no `interval` is refused as `timeout 30s exceeds interval 10s (the default) — lower timeout or raise interval`. The default `timeout` is never held against a short `interval`.
+
+**The plan shows what will be probed.** `lv compose up` prints, under each VM it creates or updates, the healthcheck as the checker will run it: the resolved target (`<vm address>` for a VM-relative one), whether the type was inferred, and every default filled in:
+
+```
+  + create db
+      healthcheck: tcp (inferred) <vm address>:5432 every 10s, timeout 5s, 3 retries, then restart
+```
+
+An `interval` below the checker's 10-second sweep is shown as `every 10s (1ms is below the checker's 10s sweep)`.
+
+The VM's owning host probes it every `interval` (default, and floor, the checker's 10-second sweep; a probe still running is never started twice, and a probe that was still running when the VM restarted, moved or was redefined is discarded rather than counted against the new one) with a `timeout` of its own (default `5s`). The verdict follows the fields the schema has, Docker-style:
+
+- one passing probe makes the VM **healthy**;
+- `retries` consecutive failures (default `3`) make it **unhealthy**; fewer leave the verdict where it was;
+- a VM that has not been probed since it last started — or was recreated or migrated — is **unknown**, and so is a stopped VM;
+- a VM whose probe cannot run — no address known for it yet, or a target that cannot be interpreted — is **unknown**, with the reason; it resets the run of consecutive failures and never counts toward the `action`.
+
+There is no `start-period`. Instead, for the first 5 minutes after a VM **starts** its failures do not count toward the healthcheck's `action`, so a VM still booting is not restarted; it is still probed, and its verdict is still published, because a `depends-on` or rolling-update wait needs its first pass. "Starts" is every start the owning host sees, measured from when it saw it:
+
+- the VM was created;
+- its healthcheck restarted it, its restart policy started it, or the daemon started or restarted it (`lv start`, `lv restart` — including on a running VM — and a reconfigure that restarts it);
+- it went from not running to running (an operator start, a redefine and start);
+- it arrived on the host — migrated or failed over there — or began a new ownership generation.
+
+Failures from before a start do not carry over: after the grace the VM needs `retries` failures of its own before the `action` runs. Not covered: a VM the host first sees just after its daemon starts — it cannot tell a VM that has run for weeks from one that just started.
+
+**Repeated actions back off.** When the `action` has run and the VM still has not passed a probe, the next action on it waits at least 1 minute after the last one, doubling with each further action — 2, 4, 8, 16 minutes — up to a cap of **32 minutes**, where it stays until the VM passes a probe (which resets the backoff). With `action: restart` the 5-minute start grace comes first, so a VM that never passes is restarted at most about every 5 minutes plus `retries` × `interval` at first, and no more often than every 32 minutes once the backoff has grown. Failed probes that arrive while the backoff is holding the action back keep counting — the log shows `consecutive` still rising next to `action backoff active` — so the action runs on the first failed probe after the backoff ends, not after another `retries` failures.
+
+The verdict is replicated state, written only when it changes (never once per probe), and it is what `vm_healthy` waits for (see `depends-on`). A failing verdict appears in `lv health` as a `vm_probe_failing` condition at **info** severity: visible, but it neither degrades the cluster's overall state nor blocks admission — see [Diagnostics](diagnostics.md#vm-probe-failing-vm_probe_failing).
 
 ## Restart policy
 
@@ -567,7 +710,31 @@ any other stop is treated as unexpected and restarted per policy. A frozen
 
 ## Update strategy
 
-Control how VMs are updated when a compose file changes. The strategy determines how instances are replaced during `compose up`:
+Control how VMs are updated when a compose file changes.
+
+**Every update is applied with the least destructive mechanism the change allows, whatever the strategy** — the plan names the mechanism on each `~ update` line:
+
+- **in place** (`applied in place, no restart`) — the running VM is changed with no restart: a cpu grow within the `max-cpu` hotplug ceiling, a memory change within the `[min-memory, max-memory]` balloon band (the new size is also the VM's next-boot size), and spec settings read when they are used: restart policy, onboot, ordering, labels, placement, migrate, `healthcheck`, `hooks`, `stop-grace-period`;
+- **restart** (`restart — the same VM is reconfigured and restarted, disks kept`) — a change that bakes into the domain (a cpu shrink or grow beyond the ceiling, an out-of-band memory size, `max-cpu`, memory bounds, `cpu-mode`/`cpu-model`, `machine`, `firmware`, `guest-agent`, VNC graphics, `secure-boot`, `tpm`) reconfigures and restarts the **same** VM: same disks, same MACs, same identity. A stopped VM is reconfigured and left stopped. Toggling `secure-boot` or `tpm` on a VM that already has firmware state is refused, as `lv update` refuses it without `--force`;
+- **recreate** (`recreate — disks are replaced (<why>)`) — only a change of VM identity (`image`, `iso`, disk or network topology, `cloud-init`) deletes the VM and creates it again, **which replaces its disks**. So does a change that needs only a redefine but that no reconfigure path can apply to an existing VM yet (SPICE graphics, resource tuning, passthrough devices), and a VM whose stored spec cannot be read. Disks are not carried over to the new VM. The plan says so on the VM's line, and `compose up` asks for confirmation before applying it (as it does for every plan, unless `-y`).
+
+A VM left in `error` (or mid-create, -start, -stop or -rebuild) by an operation that did not finish is **retried** by the next deploy, and a retry never replaces disks that exist:
+
+- **`retry — repaired in place, disks kept`** — disks are recorded for the VM: its domain is redefined from the desired spec over those disks (whether or not the domain is still defined) and started. Same disks, same MACs, same identity. A repair that fails is reported as a failed action and leaves the VM in `error`; it never falls back to a recreate.
+- **`retry — created again (nothing was made)`** — no disks were made (the create failed before them), so the VM is created from scratch.
+
+A retry whose compose change is itself a change of identity (an image change, say) is a `recreate — disks are replaced` like any other.
+
+An update of a VM stays on the host it runs on, and is placed as a **replacement** of what that VM holds there: its current cpu and memory are released and the updated request is charged in their place, so a VM that fills most of its host can still be shrunk, relabelled or otherwise updated. An update that no longer fits its host is refused before anything is touched, and the error names the resource and the numbers:
+
+```
+planner: batch placement failed: no eligible host for VM "db":
+node-2: memory (needs 4224 MiB incl. 128 qemu overhead, 1947 free after db's current 1024 is released)
+```
+
+A container update is placed the same way, against the container's current memory limit. A container is charged its memory limit only — no qemu overhead and no vCPU for its `cpu`, which caps the container at that many cores rather than reserving them (see [containers.md](containers.md#resource-limits)).
+
+The strategy decides how a change that needs a **new** VM is rolled out — `recreate` means "replace such a VM by deleting and creating it", not "recreate on any change":
 
 ```yaml
     update:
@@ -582,16 +749,20 @@ Control how VMs are updated when a compose file changes. The strategy determines
 
 Strategies:
 
-- `recreate` — (default) Delete then create each VM sequentially. Simple but has downtime. Deleting a VM destroys its disks.
-- `rolling` / `stop-first` — Update VMs one at a time: stop old, create new, wait for health check, continue.
+- `recreate` — (default) Delete then create each VM that needs replacing, one after another. Simple but has downtime, and the replaced VM's disks are destroyed.
+- `rolling` / `stop-first` — Replace VMs one at a time: stop old, create new, wait for health check, continue.
 - `start-first` — Create new VM first, wait for health check, then stop old. Minimizes downtime.
-- `all-at-once` — Recreate all VMs simultaneously. Fast but risky.
-- `blue-green` — Create a parallel set of new VMs ("-green" suffix), verify health, then cut over.
-- `in-place` — **Live-or-fail: it applies live changes only and NEVER deletes a VM.** A cpu grow (within the `max-cpu` hotplug ceiling) and a memory change (within the `[min-memory, max-memory]` balloon band) are applied to the running VM with no restart; live-metadata changes (restart policy, onboot, ordering, labels, placement, migrate) are patched into the spec. Any change that would need a restart (max-cpu / mem-bounds / cpu-mode / machine / firmware / graphics / secure-boot / tpm / passthrough devices / health-check / hooks / stop-grace / a cpu shrink or grow beyond the ceiling / an out-of-band memory target) or a recreate (image / iso / disk or network topology / cloud-init) is **refused with a clear error — nothing is deleted or partially applied.** Use `recreate` (or stop the VM and `lv update`) for those.
+- `all-at-once` — Replace all VMs that need it simultaneously. Fast but risky.
+- `blue-green` — Create a parallel set of new VMs ("-green" suffix), then cut over by deleting the old (blue) VMs. A green that cannot be created aborts the deploy and removes the greens already made. A blue that cannot be deleted once its green is up is not a failed cutover — the green is serving — but it is reported as a failed action for that VM (the old VM is still there), and the stack ends `degraded`.
+- `in-place` — **Live-or-fail: it applies in-place changes only and NEVER restarts or deletes a VM.** Any change that would need a restart or a recreate (see the lists above) is **refused with a clear error — nothing is deleted or partially applied.** Use another strategy (or stop the VM and `lv update`) for those.
 
-`in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. A destructive recreate happens only under the explicit `recreate` / `all-at-once` / `blue-green` / `snapshot-and-replace` strategies.
+Under any strategy but `in-place`, in-place and restart changes are applied to each VM before the strategy replaces the VMs that need it; a restarted VM is waited on for `health-wait` like a replaced one.
 
-During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last. A rolling update fails fast: if any VM update errors, the deploy stops **before** the scale-down step and the stack's stored desired state is left unchanged, so a failed update never deletes a VM the change didn't intend to and never records a half-applied stack.
+The health wait of `rolling`, `stop-first`, `start-first` and `snapshot-and-replace` is the `vm_healthy` condition of `depends-on` (see above), bounded by `health-wait` (default `30s`). For a VM with a `healthcheck` that means the recreated VM's own probe must pass within `health-wait` — the previous VM's pass does not carry over — so leave room for at least one probe `interval` plus boot time. A VM without a `healthcheck` passes as soon as it is running. A VM that is not healthy by then fails with `<vm> did not become healthy within health-wait <d>: ...` followed by the last verdict and the probe's failure reason; under `rolling`, `stop-first` and `start-first` that aborts the deploy at that VM: the stream ends in error, later VMs are not touched, and the stack record keeps the last successful deploy (see the fail-fast note below).
+
+`in-place` is safe to run against a running production VM: the worst case is a refused deployment that leaves the VM and its disks exactly as they were. Under the other strategies a VM's disks are replaced only for a change the plan names as `recreate — disks are replaced`.
+
+During a rolling update, creates (scale-up) execute first, then updates are processed according to the strategy, then deletes (scale-down) execute last. With `depends-on` between them, the creates and updates run in dependency waves — each wave's creates, then its updates — so a dependent's create or update starts only after its dependency's has finished and met its condition. A rolling update fails fast: if any VM update errors, the deploy stops **before** any later dependency wave and the scale-down step and the stack's stored desired state is left unchanged, so a failed update never deletes a VM the change didn't intend to and never records a half-applied stack.
 
 > Mixed-version note: `in-place`'s non-destructive behavior is enforced by the entry node serving the deploy. Do not rely on the `in-place` strategy until every mutation-serving node in the cluster runs a build that supports it.
 
@@ -785,6 +956,26 @@ External networks must not set `subnet`, `dhcp`, `vni`, or `type` — these are 
 
 This is useful for shared infrastructure networks managed outside of compose stacks, or for connecting VMs in different stacks to the same network.
 
+A VM or container NIC that names a network the file does not declare at all is
+treated the same way: it attaches to the cluster network of that name, made with
+`lv network create`. The deploy is refused if no such network exists:
+
+```
+network "hc" (used by db) is not declared under networks: and no cluster network by that name exists
+```
+
+Stacks deployed before this rule stored such a NIC on `<stack>_<name>`, a name
+with no network behind it, so the VM sat on an empty bridge of that name with
+no gateway and no DHCP. Deploying the same file again moves the NIC onto the
+cluster network in place: same VM, same MAC, same disks. It is not a recreate.
+The VM's host re-plugs the NIC at once when the deploy ran there, and otherwise
+on its next network pass (within 30 seconds). Once no NIC uses the old
+`<stack>_<name>` bridge, the host removes it. If `<stack>_<name>` is a real
+network, the move is refused for that VM and the VM is left as it is.
+
+Networks the file declares belong to the stack. They are stored as
+`<stack>_<name>`, so two stacks can each have a network called `lan`.
+
 ## Volume definitions
 
 ```yaml
@@ -797,7 +988,13 @@ volumes:
       vers: "3"
 ```
 
-Compose volumes take priority over host-level storage pools (defined in `config.yaml`). If a disk's `storage:` name matches a compose volume, that definition is used. Otherwise, the daemon falls back to host pools, then to the default local driver. See [storage.md](storage.md) for host-level pool configuration.
+A disk with no `storage:` uses the default local driver. A disk's `storage:` name resolves to a compose volume first, then to a storage pool of the VM's host (declared in `config.yaml` or created with `lv pool create`). A name that is neither is refused, never placed on the local driver: `lv compose up` refuses it before anything is deployed when no host in the cluster has a pool by that name, with the name it most likely meant,
+
+```
+  - 7:35: vms.web.disks.data.storage: storage "wram" is neither a volume of this file nor a storage pool — did you mean "warm"?
+```
+
+and creating the VM fails with `storage "fast" is neither a volume of stack "shop" nor a storage pool on host "node-2"` when the pool exists on other hosts but not the one the VM is placed on. See [storage.md](storage.md) for host-level pool configuration.
 
 ## Stack-level settings
 

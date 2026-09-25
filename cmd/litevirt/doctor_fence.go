@@ -2,15 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func newDoctorFenceCmd() *cobra.Command {
@@ -47,6 +51,11 @@ shared-disk count comes from the queried node's replicated rows.`,
 					return fmt.Errorf("get fence readiness: %w", err)
 				}
 				printFenceReadiness(r)
+				// Best-effort: the stall section is an explanation, not part of
+				// the verdict, so a failed read does not fail the command.
+				if h, herr := c.GetClusterHealth(ctx, &pb.GetClusterHealthRequest{}); herr == nil {
+					printStalledObservers(os.Stdout, h.GetConditions())
+				}
 				if fenceHazard(r) {
 					return silentExitError{code: 1}
 				}
@@ -116,7 +125,55 @@ func printFenceReadiness(r *pb.FenceReadiness) {
 		fmt.Println("\nnothing is switched off: every host reports the fence enabled")
 	}
 
+	printRecentFences(r.GetRecentFences())
 	printFenceCaveats(r)
+}
+
+// fenceEventAssurance is the event's assurance, derived from method and result
+// when the server did not send one. Every server has always sent method and
+// result; only newer ones send the label, and an older server's rows are
+// exactly the ones an operator is least likely to have looked at.
+func fenceEventAssurance(e *pb.FenceEvent) string {
+	if a := e.GetAssurance(); a != "" {
+		return a
+	}
+	return corrosion.FenceAssurance(e.GetMethod(), e.GetResult())
+}
+
+// printRecentFences lists recent fences with what each one ESTABLISHED.
+//
+// The stored result writes "fenced" for an IPMI power-off that was observed off
+// and for an SSH poweroff nobody checked, so the result column alone shows two
+// identical rows meaning different things. The assurance column is the
+// difference, and an unverified success is called out, because the coordinator
+// that ran it rescheduled the host's workloads on the strength of it.
+func printRecentFences(events []*pb.FenceEvent) {
+	if len(events) == 0 {
+		return
+	}
+	fmt.Println("\nrecent fences:")
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "  WHEN\tHOST\tMETHOD\tRESULT\tASSURANCE")
+	var unverified []string
+	for _, e := range events {
+		a := fenceEventAssurance(e)
+		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n", e.GetTimestamp(), e.GetHost(), e.GetMethod(), e.GetResult(), a)
+		if a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
+			unverified = append(unverified, e.GetHost())
+		}
+	}
+	w.Flush()
+	if len(unverified) > 0 {
+		fmt.Printf("\nnote: %d fence(s) above were not verified (%s).\n", len(unverified), strings.Join(unverified, ", "))
+		fmt.Println("`requested` means the host accepted a poweroff (SSH) or its watchdog heartbeat")
+		fmt.Println("was stopped, and nothing checked the host actually went down. `assumed` means")
+		fmt.Println("not even the request is known to have arrived. The coordinator that ran such a")
+		fmt.Println("fence rescheduled on it. Shared-disk VMs are not affected — their transfer")
+		fmt.Println("needs an IPMI or operator-confirmed fence regardless — but a local-disk VM can")
+		fmt.Println("have been started elsewhere while the original was still running.")
+		fmt.Println("To stop rescheduling on an unverified fence of a host:")
+		fmt.Println("  lv host label set <host> " + corrosion.LabelFenceRequiresConfirmation + "=true")
+	}
 }
 
 // printFenceCaveats says what the report does not establish, on EVERY path.
@@ -166,4 +223,45 @@ func hostPostureWord(h *pb.FenceHostPosture) string {
 	default:
 		return "NOT enforcing"
 	}
+}
+
+// printStalledObservers lists hosts with an open observer_stalled condition:
+// nodes that were not running recently and, until the window closes, count no
+// failed probes against peers and decide no fence. It is the usual answer to
+// "why has a dead host not been fenced yet?", so the doctor names them. Prints
+// nothing when there are none.
+func printStalledObservers(w io.Writer, conds []*pb.HealthCondition) {
+	type stalled struct{ host, paused, until string }
+	var rows []stalled
+	for _, c := range conds {
+		if c.GetCode() != "observer_stalled" || c.GetLifecycle() == "resolved" {
+			continue
+		}
+		var ev struct {
+			GapSeconds float64 `json:"gap_seconds"`
+			GraceUntil string  `json:"grace_until"`
+		}
+		_ = json.Unmarshal([]byte(c.GetEvidence()), &ev) // unreadable evidence still names the host
+		paused, until := "?", ev.GraceUntil
+		if ev.GapSeconds > 0 {
+			paused = (time.Duration(ev.GapSeconds * float64(time.Second))).Round(time.Second).String()
+		}
+		if until == "" {
+			until = "?"
+		}
+		rows = append(rows, stalled{c.GetSubjectId(), paused, until})
+	}
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprintln(w, "\nstalled observers (fence votes withheld):")
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "  HOST\tPAUSED\tWITHHELD UNTIL")
+	for _, r := range rows {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", r.host, r.paused, r.until)
+	}
+	tw.Flush()
+	fmt.Fprintln(w, "\nThese nodes were not running (suspended, swapped out or starved of CPU).")
+	fmt.Fprintln(w, "Until the time shown they count no failed probe against a peer and decide")
+	fmt.Fprintln(w, "no fence, so a fence can be up to that much later than usual.")
 }

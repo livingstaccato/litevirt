@@ -273,7 +273,7 @@ name in the JSON body rather than a path segment, so they are
 | `/api/v1/2fa` | DELETE | `DisableTwoFactor` (body: `{method, label}`) |
 | `/api/v1/2fa/totp/enroll` | POST | `EnrollTOTP` |
 | `/api/v1/containers` | GET | `ListContainers` (?host=&page_size=&page_token=) |
-| `/api/v1/containers/create` | POST | `CreateContainer` |
+| `/api/v1/containers/create` | POST | `CreateContainer` (`cpu` is a cap in whole cores, 0 = unlimited; see [containers.md](containers.md#resource-limits)) |
 | `/api/v1/containers/start` | POST | `StartContainer` (name in body) |
 | `/api/v1/containers/stop` | POST | `StopContainer` (name in body) |
 | `/api/v1/containers/delete` | POST / DELETE | `DeleteContainer` (name in body) |
@@ -293,7 +293,7 @@ name in the JSON body rather than a path segment, so they are
 | `/api/v1/audit/export` | GET | `ExportAuditChain` (?since=&until=) |
 | `/api/v1/stacks/plan` | POST | `DiffStack` (full resolved plan) |
 | `/api/v1/stacks/deploy` | POST (SSE) | `DeployStack` |
-| `/api/v1/stacks/delete` | POST / DELETE | `DeleteStack` (name in body) |
+| `/api/v1/stacks/delete` | POST / DELETE (SSE) | `DeleteStack` (name in body; see below for the non-SSE result) |
 | `/api/v1/stacks/export` | GET / POST | `ExportStack` (?name= or body) |
 | `/api/v1/stacks/{name}/migrate-volumes` | POST (SSE) | `MigrateStackVolumes` |
 | `/api/v1/realms` | GET | `ListRealms` |
@@ -310,7 +310,43 @@ POST routes that wrap streaming RPCs (`/api/v1/backup/snapshot`,
 `/api/v1/backup/restore`, `/api/v1/vms/move-volume`, `/api/v1/stacks/deploy`,
 `/api/v1/regions/migrate`, etc.) emit Server-Sent Events when the client
 sends `Accept: text/event-stream` or appends `?stream=sse`. Otherwise
-they return the first progress frame and close.
+they answer with the first progress frame as an acknowledgement, and the
+operation keeps running on the server after the response: the stream is opened
+on a context detached from the request (bounded at 6 hours) and read to its end
+in the background. Follow a long operation with SSE, or poll its resource;
+the acknowledgement does not report how it ended.
+
+`/api/v1/stacks/deploy` without SSE waits for the whole deploy. It must: closing
+a `DeployStack` stream cancels the deploy on the server, so answering with the
+first frame would create at most one VM and abandon the rest. The body lists
+each VM finished and each action that failed, and the status is `200` only when
+none did; otherwise `500` with the failures and an `error` summary (the stack is
+left `degraded`, and a re-deploy retries the failed actions):
+
+```json
+{"name": "web", "done": ["web-2"],
+ "failures": [{"name": "web-1", "error": "..."}],
+ "error": "stack \"web\": 1 of 2 actions failed (web-1); the stack is left degraded and a re-deploy retries them"}
+```
+
+`/api/v1/stacks/delete` is the other exception: without SSE it waits for the whole
+teardown and reports its outcome, because `DeleteStack` ends successfully even
+when resources could not be removed. The body names every resource deleted and
+every one that was not (a VM or container name, `network <name>`,
+`containers (list failed)`, or `stack resource` for an unnamed failure):
+
+```json
+{"name": "web", "deleted": ["web-1"],
+ "failures": [{"name": "web-2", "error": "..."}],
+ "error": "stack \"web\": 1 of 2 deletions failed (web-2); the stack is left in state \"deleting\" and the daemon retries the teardown"}
+```
+
+The status is `200` only when every resource was removed (`failures` empty, no
+`error`). Any failure returns `500` with that body; the stack stays `deleting`
+and the reconciler retries it. A stream that fails outright after some progress
+returns the mapped status of its error (`500` by default) with the same body and
+the failure in `error`; one refused before any progress returns the usual
+`{"error": ...}`.
 
 ## Still gRPC-only
 

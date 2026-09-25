@@ -2,7 +2,9 @@ package grpcapi
 
 import (
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -29,7 +31,7 @@ func TestExecuteWithRollingUpdates_InPlaceRecreate_FailsNoDelete(t *testing.T) {
 	}}}
 	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
 
-	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err == nil {
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, newDeployFailures(stream)); err == nil {
 		t.Fatal("in-place of a recreate-class change must fail")
 	}
 	if vm, _ := corrosion.GetVM(ctx, s.db, "web"); vm == nil {
@@ -56,7 +58,7 @@ func TestExecuteWithRollingUpdates_InPlaceCombined_AppliesCpuAndMem(t *testing.T
 	}}}
 	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
 
-	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err != nil {
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, newDeployFailures(stream)); err != nil {
 		t.Fatalf("combined in-place resize: %v", err)
 	}
 	vm, _ := corrosion.GetVM(ctx, s.db, "web")
@@ -86,7 +88,7 @@ func TestExecuteWithRollingUpdates_InPlaceResizeError_Propagates(t *testing.T) {
 	}}}
 	stream := &progressStream[pb.DeployProgress]{ctx: ctx}
 
-	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream); err == nil {
+	if err := s.executeWithRollingUpdates(ctx, f, resolved, stream, newDeployFailures(stream)); err == nil {
 		t.Fatal("a live-resize failure must propagate from the executor")
 	}
 	if vm, _ := corrosion.GetVM(ctx, s.db, "web"); vm == nil {
@@ -169,5 +171,30 @@ func TestUseRollingUpdate_Empty(t *testing.T) {
 	got := useRollingUpdate(f)
 	if got != "" {
 		t.Errorf("useRollingUpdate() = %q, want %q", got, "")
+	}
+}
+
+// A wait condition outside the depends-on vocabulary can never be met; it must
+// be refused at once rather than spin to the deadline. The rolling health wait
+// once passed "healthy:<dur>" here and failed every update after five minutes.
+func TestWaitForConditionWithin_UnknownConditionRefusedAtOnce(t *testing.T) {
+	s := coordResizeServer(t)
+	ctx := adminCtx()
+	seedRunningVM(t, s, "web", &pb.VMSpec{Name: "web", Cpu: 1, MemoryMib: 256}, 1, 256)
+
+	start := time.Now()
+	err := s.waitForConditionWithin(ctx, "web", "healthy:30s", 3*time.Second)
+	if err == nil {
+		t.Fatal("an unknown condition was reported as met")
+	}
+	if !strings.Contains(err.Error(), "unknown wait condition") {
+		t.Errorf("error %q does not name the unknown condition", err)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("unknown condition took %s to refuse", d)
+	}
+	// The same running VM satisfies the real condition immediately.
+	if err := (&serverOps{s: s}).WaitHealthy(ctx, "web", time.Minute); err != nil {
+		t.Errorf("WaitHealthy on a running VM: %v", err)
 	}
 }

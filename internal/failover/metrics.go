@@ -53,33 +53,39 @@ const (
 	// errClassNone is the empty error class (a clean outcome).
 	errClassNone = ""
 
-	ErrNoQuorum          = "no_quorum"
-	ErrDestUngated       = "dest_ungated" // target no longer advertises the split-brain gate
-	ErrSelfFenced        = "self_fenced"  // this coordinator self-fenced; skips driving failover until reboot
-	ErrLeaseLost         = "lease_lost"
-	ErrStaleLeaseTerm    = "stale_lease_term" // still named holder locally, but a peer's term has superseded ours
-	ErrNotLeader         = "not_leader"
-	ErrTerminalState     = "terminal_state"
-	ErrAlreadyFenced     = "already_fenced"
-	ErrUpgrading         = "upgrading"
-	ErrRecentlyFenced    = "recently_fenced"
-	ErrRecoveryResumed   = "recovery_resumed" // recovery picked up from a fence a previous leader recorded
-	ErrFirmwareState     = "firmware_state_missing"
-	ErrPolicyNone        = "policy_none"
-	ErrNoCandidates      = "no_candidates"
-	ErrPlacementFailed   = "placement_failed"
-	ErrFenceFailed       = "fence_failed"
-	ErrManualUnconfirmed = "manual_unconfirmed"
-	ErrBestEffort        = "best_effort"
-	ErrManualConfirmed   = "manual_confirmed"
-	ErrNonRepullable     = "non_repullable_image"
-	ErrDBError           = "db_error"
-	ErrFenceLogWrite     = "fence_log_write_failed"
-	ErrPromoteFailed     = "promote_failed"
-	ErrStorageUnverified = "storage_unverified" // shared-disk transfer with no proof-grade fence
-	ErrRelocateFailed    = "relocate_failed"
-	ErrOwnershipDispute  = "ownership_dispute" // active ownership condition on the workload; recovery refused
-	ErrRestoreUnknown    = "restore_unknown"
+	ErrNoQuorum        = "no_quorum"
+	ErrDestUngated     = "dest_ungated" // target no longer advertises the split-brain gate
+	ErrSelfFenced      = "self_fenced"  // this coordinator self-fenced; skips driving failover until reboot
+	ErrLeaseLost       = "lease_lost"
+	ErrStaleLeaseTerm  = "stale_lease_term" // still named holder locally, but a peer's term has superseded ours
+	ErrNotLeader       = "not_leader"
+	ErrTerminalState   = "terminal_state"
+	ErrAlreadyFenced   = "already_fenced"
+	ErrUpgrading       = "upgrading"
+	ErrRecentlyFenced  = "recently_fenced"
+	ErrRecoveryResumed = "recovery_resumed" // recovery picked up from a fence a previous leader recorded
+	// recovery picked up from an operator confirmation of a host whose recovery
+	// was refused for lack of one
+	ErrConfirmationResumed = "confirmation_resumed"
+	ErrFirmwareState       = "firmware_state_missing"
+	ErrPolicyNone          = "policy_none"
+	ErrNoCandidates        = "no_candidates"
+	ErrPlacementFailed     = "placement_failed"
+	ErrFenceFailed         = "fence_failed"
+	ErrManualUnconfirmed   = "manual_unconfirmed"
+	ErrBestEffort          = "best_effort"
+	ErrManualConfirmed     = "manual_confirmed"
+	ErrNonRepullable       = "non_repullable_image"
+	ErrDBError             = "db_error"
+	ErrFenceLogWrite       = "fence_log_write_failed"
+	ErrPromoteFailed       = "promote_failed"
+	ErrStorageUnverified   = "storage_unverified" // shared-disk transfer with no proof-grade fence
+	ErrRelocateFailed      = "relocate_failed"
+	ErrOwnershipDispute    = "ownership_dispute" // active ownership condition on the workload; recovery refused
+	ErrRestoreUnknown      = "restore_unknown"
+	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
+	// stopped running within health.StallGrace, so the fence is deferred.
+	ErrLocalStall = "local_stall"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

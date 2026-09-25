@@ -411,6 +411,16 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 	if len(fields) == 0 {
 		return nil
 	}
+	// Defining a lifecycle hook needs admin (hooks run as root on the host;
+	// see CreateVM) — changing one through an update is no different.
+	for _, f := range fields {
+		if f == "hooks" && hooksDefined(desired.GetHooks()) {
+			if err := RequireRole(ctx, "admin"); err != nil {
+				return status.Error(codes.PermissionDenied,
+					"changing VM lifecycle hooks requires the admin role (hooks execute as root on the target host)")
+			}
+		}
+	}
 	applied, _, err := corrosion.MutateDesiredSpec(ctx, s.db, name, func(old string) (string, error) {
 		fresh := &pb.VMSpec{}
 		if old != "" {
@@ -436,6 +446,12 @@ func (s *Server) applyLiveMetadata(ctx context.Context, name string, desired *pb
 				fresh.Placement = desired.Placement
 			case "migrate":
 				fresh.Migrate = desired.Migrate
+			case "healthcheck":
+				fresh.Healthcheck = desired.Healthcheck
+			case "hooks":
+				fresh.Hooks = desired.Hooks
+			case "stop_timeout":
+				fresh.StopTimeoutSec = desired.StopTimeoutSec
 			default:
 				slog.Warn("applyLiveMetadata: ignoring unknown live-metadata field", "vm", name, "field", f)
 			}

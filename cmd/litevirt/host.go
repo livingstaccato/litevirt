@@ -460,8 +460,13 @@ func newHostFenceCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("fence: %w", err)
 				}
-				fmt.Printf("Host %s: method=%s result=%s detail=%s\n",
-					result.HostName, result.Method, result.Result, result.Detail)
+				// assurance is derived here rather than sent: result says
+				// "fenced" for an IPMI power-off observed off and for an SSH
+				// poweroff nobody checked, and the operator running this is the
+				// person who most needs to know which one they just got.
+				fmt.Printf("Host %s: method=%s result=%s assurance=%s detail=%s\n",
+					result.HostName, result.Method, result.Result,
+					corrosion.FenceAssurance(result.Method, result.Result), result.Detail)
 				return nil
 			})
 		},

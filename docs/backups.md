@@ -11,7 +11,7 @@ cross-repo sync, and live restore.
 VM advertises a QEMU guest agent, litevirt freezes the guest's filesystems
 (`fs-freeze`) for the brief moment the pull-mode session establishes its
 point-in-time, then thaws — yielding an **application-consistent** backup. Without a
-guest agent (or with `--quiesce off`) the backup is crash-consistent, as before.
+guest agent (or with `--quiesce off`) the backup is crash-consistent.
 A freeze failure is logged and the backup proceeds crash-consistent — it never fails
 an otherwise-good backup. Scheduled backups inherit the `auto` default.
 
@@ -232,8 +232,30 @@ daemon config wins.
 The same scheduler also drives **volume replication** (`backup_schedules`
 rows with `type='replication'`). Each run copies the VM's root disk to a
 target pool as a timestamped, self-contained point-in-time copy, keeping the
-newest `keep_replicas`. It is **crash-consistent** (no guest quiesce) — a
-fast-recovery layer, not a backup replacement, so keep backups too.
+newest `keep_replicas`. A fast-recovery layer, not a backup replacement, so keep
+backups too.
+
+**Consistency differs between the two replication modes, and the default is the
+weaker one.** A full replica of a RUNNING VM is `qemu-img convert -U` reading
+the image the guest still has open — no snapshot is taken, so the copy is
+smeared over however long it ran. That is neither point-in-time nor
+crash-consistent, and a guest filesystem restored from it may need repair. The
+`--incremental` path opens a real point-in-time session (the same pull-mode
+machinery backups use) and IS crash-consistent. Replicating a STOPPED VM is
+consistent either way. Prefer `--incremental` for anything you intend to
+promote, or replicate on a schedule the workload can tolerate being torn.
+
+An `--incremental` run whose backup session fails **does not downgrade to the
+full copy while the VM is running** — the run fails and produces no replica,
+rather than silently substituting the weaker mechanism for the one you asked
+for. A stopped source still falls back, because there is nothing writing the
+image. Watch for `replication.failed` notifications: a schedule failing this
+way keeps its previous replicas and stops making new ones.
+
+A replica is also **published by rename**. The copy lands in a dotted
+`.partial` sibling and is renamed into its final name only once it has
+completed and is non-empty, so an interrupted run cannot leave a
+truncated file under a name promotion would select.
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 
@@ -279,9 +301,20 @@ healthy host (`--force` overrides). The same action is on the VM detail page
 **Automatic promotion** (`--auto-promote` on the schedule): after the failover
 coordinator **confirms a fence**, it promotes the freshest replica for opted-in
 VMs onto a healthy peer (so a VM on lost local storage resumes), falling back to
-a bare reschedule on failure. Default off. Promotion uses the newest
-(crash-consistent, possibly lagging) replica — enable only where a small lag
-window is acceptable.
+a bare reschedule on failure. Default off. Promotion uses the newest replica,
+which is lagging by up to one schedule interval and — for a full (non-
+incremental) replica of a VM that was running — is a torn copy rather than a
+crash-consistent one, as above. Enable only where a small lag window is
+acceptable, and prefer `--incremental` on any schedule with `--auto-promote`.
+
+Automatic promotion **refuses a replica older than 48 hours** (or one whose
+filename carries no readable timestamp) and falls back to a plain reschedule —
+the same outcome as having no replica. Without a bound, a schedule that had been
+failing for days left a replica as promotable as a fresh one, and failover would
+replace a VM running on current data with a week-old disk. 48 hours leaves room
+for a daily schedule plus one missed run. **Manual** `lv replication promote` is
+not bounded: an operator who has seen the age and chosen it anyway is making a
+different decision.
 
 ## Live restore
 
@@ -421,7 +454,7 @@ schedule.
 ## Deprecated: raw full-disk backup/restore
 
 The legacy raw-stream RPCs `BackupVM`/`RestoreVM` (streaming a whole disk
-to/from the client) are **deprecated** and now return `Unimplemented`. Use the
+to/from the client) are **deprecated** and return `Unimplemented`. Use the
 snapshot path instead — it is incremental, deduplicated, repo-backed, scoped to
 the VM's project via path RBAC, and quota-aware:
 
@@ -436,7 +469,7 @@ Restore destinations are a pool-relative filename by default; a custom absolute
 
 - **gRPC `BackupSnapshot` + `RestoreFromBackup` + `RestoreLive`** —
   the CLI commands are thin wrappers; programmatic clients can call
-  the RPCs directly. A cross-host VM no longer needs a re-run against
+  the RPCs directly. A cross-host VM does not need a re-run against
   its owning daemon: the daemon you call (which owns the repo) has the
   owning host read the disk locally and **stream the manifest back**
   over peer mTLS (see *Peer streaming* below). A direct absolute

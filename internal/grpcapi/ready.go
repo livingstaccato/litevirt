@@ -5,6 +5,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -46,8 +47,11 @@ func (s *Server) Ready(ctx context.Context, _ *pb.ReadyRequest) (*pb.ReadyRespon
 
 	resp := &pb.ReadyResponse{HostName: s.hostName, Ready: true}
 	reason := ""
-	rows, err := s.db.Query(rctx, `SELECT name FROM hosts WHERE name = ?`, s.hostName)
+	rows, finished, err := s.boundedReadyQuery(rctx)
 	switch {
+	case !finished:
+		resp.Ready = false
+		reason = "local read did not return within " + readyReadTimeout.String()
 	case err != nil:
 		resp.Ready = false
 		reason = "local read failed: " + err.Error()
@@ -94,4 +98,44 @@ func (s *Server) PeerReady(ctx context.Context, host string) (bool, string, erro
 		return false, "", err
 	}
 	return resp.GetReady(), resp.GetNotReadyReason(), nil
+}
+
+// readyQuery is Ready's local read: this node's own hosts row.
+func (s *Server) readyQuery(ctx context.Context) ([]corrosion.Row, error) {
+	if s.readyRead != nil {
+		return s.readyRead(ctx)
+	}
+	return s.db.Query(ctx, `SELECT name FROM hosts WHERE name = ?`, s.hostName)
+}
+
+// boundedReadyQuery runs readyQuery but returns when ctx does, whether or not
+// the read has. corrosion.Client.Query takes the client lock before it honours
+// any context, so a node whose writer is stuck inside a commit blocks the read
+// past every timeout; waiting on it made Ready hang for the caller's whole
+// budget, which the caller reads as unreachable — the fencing verdict — rather
+// than as the not-ready answer it is.
+//
+// At most one read is outstanding. While one is still blocked, the next probe
+// is answered not-ready at once rather than parking another goroutine behind
+// the same lock every probe interval.
+func (s *Server) boundedReadyQuery(ctx context.Context) (rows []corrosion.Row, finished bool, err error) {
+	if !s.readyInFlight.CompareAndSwap(false, true) {
+		return nil, false, nil
+	}
+	type result struct {
+		rows []corrosion.Row
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		defer s.readyInFlight.Store(false)
+		r, e := s.readyQuery(ctx)
+		ch <- result{r, e}
+	}()
+	select {
+	case r := <-ch:
+		return r.rows, true, r.err
+	case <-ctx.Done():
+		return nil, false, nil
+	}
 }

@@ -670,6 +670,14 @@ type Server struct {
 	// fleet-wide while this node could still miss data. Stored atomically: the daemon
 	// sets it from the startup backfill goroutine while the Ping/HA paths read it.
 	hwV2Ready atomic.Bool
+
+	// readyRead is Ready's one local read; nil means the real hosts-table
+	// query. A seam so a test can stand in for a read blocked on the client
+	// lock, which honours no context. readyInFlight is set while a read is
+	// outstanding, so a wedged store is answered "not ready" at once instead
+	// of accumulating one blocked goroutine per probe.
+	readyRead     func(ctx context.Context) ([]corrosion.Row, error)
+	readyInFlight atomic.Bool
 }
 
 // SetDemotionUnfenced records whether a minority VIP demote failed with no verified

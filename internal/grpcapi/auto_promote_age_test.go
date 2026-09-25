@@ -156,7 +156,7 @@ func TestAutoPromote_AWeeklyScheduleReplicaIsNotTooOld(t *testing.T) {
 	s := testServer(t)
 	seedReplicaOfAge(t, s, "db-4", "0 3 * * 0", 5*24*time.Hour)
 
-	if err := s.AutoPromoteReplica(context.Background(), "db-4", ""); errors.Is(err, errReplicaTooOld) {
+	if err := s.AutoPromoteReplica(context.Background(), "db-4", "", 0); errors.Is(err, errReplicaTooOld) {
 		t.Errorf("a 5-day-old replica of a WEEKLY schedule was refused as too old: %v", err)
 	}
 }
@@ -165,7 +165,7 @@ func TestAutoPromote_AnHourlyScheduleRefusesADayOldReplica(t *testing.T) {
 	s := testServer(t)
 	seedReplicaOfAge(t, s, "db-5", "0 * * * *", 24*time.Hour)
 
-	if err := s.AutoPromoteReplica(context.Background(), "db-5", ""); !errors.Is(err, errReplicaTooOld) {
+	if err := s.AutoPromoteReplica(context.Background(), "db-5", "", 0); !errors.Is(err, errReplicaTooOld) {
 		t.Errorf("a day-old replica of an HOURLY schedule returned %v, want errReplicaTooOld", err)
 	}
 }

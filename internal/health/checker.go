@@ -478,7 +478,11 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		}
 	}
 
-	changed := !exists || newStatus != prev.status || newFailures != prev.failures
+	// A growing count inside the unready status is not news: nothing decides
+	// on it, and treating it as a change had every observer write a replicated
+	// row every probe for as long as a peer stayed unready.
+	countChanged := newFailures != prev.failures && !(newStatus == StatusUnready && prev.status == StatusUnready)
+	changed := !exists || newStatus != prev.status || countChanged
 	prev.answeredUnready = result == probeNotReady
 	prev.status = newStatus
 	prev.failures = newFailures

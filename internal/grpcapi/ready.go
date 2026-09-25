@@ -115,11 +115,13 @@ func (s *Server) readyQuery(ctx context.Context) ([]corrosion.Row, error) {
 // budget, which the caller reads as unreachable — the fencing verdict — rather
 // than as the not-ready answer it is.
 //
-// At most one read is outstanding. While one is still blocked, the next probe
-// is answered not-ready at once rather than parking another goroutine behind
-// the same lock every probe interval.
+// A read that outlives its budget is counted until it finally returns. While
+// one is outstanding the store is known to be wedged, so the next probe is
+// answered not-ready at once rather than parking another goroutine behind the
+// same lock every interval. Reads that simply overlap — every peer probing at
+// once — run side by side; refusing those answered a healthy node not-ready.
 func (s *Server) boundedReadyQuery(ctx context.Context) (rows []corrosion.Row, finished bool, err error) {
-	if !s.readyInFlight.CompareAndSwap(false, true) {
+	if s.readyOverdue.Load() > 0 {
 		return nil, false, nil
 	}
 	type result struct {
@@ -128,7 +130,6 @@ func (s *Server) boundedReadyQuery(ctx context.Context) (rows []corrosion.Row, f
 	}
 	ch := make(chan result, 1)
 	go func() {
-		defer s.readyInFlight.Store(false)
 		r, e := s.readyQuery(ctx)
 		ch <- result{r, e}
 	}()
@@ -136,6 +137,11 @@ func (s *Server) boundedReadyQuery(ctx context.Context) (rows []corrosion.Row, f
 	case r := <-ch:
 		return r.rows, true, r.err
 	case <-ctx.Done():
+		s.readyOverdue.Add(1)
+		go func() {
+			<-ch
+			s.readyOverdue.Add(-1)
+		}()
 		return nil, false, nil
 	}
 }

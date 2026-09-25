@@ -673,11 +673,13 @@ type Server struct {
 
 	// readyRead is Ready's one local read; nil means the real hosts-table
 	// query. A seam so a test can stand in for a read blocked on the client
-	// lock, which honours no context. readyInFlight is set while a read is
-	// outstanding, so a wedged store is answered "not ready" at once instead
-	// of accumulating one blocked goroutine per probe.
-	readyRead     func(ctx context.Context) ([]corrosion.Row, error)
-	readyInFlight atomic.Bool
+	// lock, which honours no context. readyOverdue counts reads that outlived
+	// readyReadTimeout and have not returned yet: while any has, the store is
+	// wedged and later probes are answered "not ready" at once instead of
+	// parking another goroutine behind the same lock. Reads that are merely
+	// in flight at the same time — every peer probing at once — are normal.
+	readyRead    func(ctx context.Context) ([]corrosion.Row, error)
+	readyOverdue atomic.Int32
 }
 
 // SetDemotionUnfenced records whether a minority VIP demote failed with no verified

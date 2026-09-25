@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
 // failingBackupSource refuses to open a backup session, which is how the
@@ -81,6 +82,9 @@ func TestRunReplication_AStoppedSourceStillFallsBack(t *testing.T) {
 	s := testServer(t)
 	s.SetBackupSource(failingBackupSource{})
 	dir := seedReplicationVM(t, s, "web-2", "stopped")
+	fake := libvirtfake.New()
+	fake.SetState("web-2", libvirtfake.StateShutdown)
+	s.virt = fake
 
 	if err := s.RunReplication(context.Background(), corrosion.BackupScheduleRecord{
 		VMName: "web-2", Type: "replication", TargetPool: "dr",
@@ -90,5 +94,30 @@ func TestRunReplication_AStoppedSourceStillFallsBack(t *testing.T) {
 	}
 	if left := promotableIn(t, dir, "web-2", "root"); len(left) != 1 {
 		t.Errorf("stopped-source fallback produced %v, want one replica", left)
+	}
+}
+
+// "stopped" in the store is not "shut off". The coarse libvirt state folds
+// paused and pm-suspended domains into "stopped", and qemu still holds their
+// images open: resuming the guest mid-copy smears the full copy exactly as a
+// running source does. So the fallback asks libvirt for the state REASON and
+// runs only for a genuine shut-off.
+func TestRunReplication_APausedSourceDoesNotFallBack(t *testing.T) {
+	s := testServer(t)
+	s.SetBackupSource(failingBackupSource{})
+	dir := seedReplicationVM(t, s, "web-3", "stopped")
+	fake := libvirtfake.New()
+	fake.SetState("web-3", libvirtfake.StatePaused)
+	s.virt = fake
+
+	err := s.RunReplication(context.Background(), corrosion.BackupScheduleRecord{
+		VMName: "web-3", Type: "replication", TargetPool: "dr",
+		Incremental: true, KeepReplicas: 3,
+	}, time.Now())
+	if !errors.Is(err, errUnsafeFullCopyFallback) {
+		t.Fatalf("RunReplication on a paused source returned %v; the full copy of an image qemu still holds open must be refused", err)
+	}
+	if left := promotableIn(t, dir, "web-3", "root"); len(left) != 0 {
+		t.Errorf("a replica was produced from a paused source: %v", left)
 	}
 }

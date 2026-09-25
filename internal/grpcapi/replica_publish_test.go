@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -155,5 +156,61 @@ func TestReplicateLocal_AnEmptyResultIsNotPublished(t *testing.T) {
 	}
 	if left := promotableIn(t, dir, "web-1", "root"); len(left) != 0 {
 		t.Errorf("an empty replica was published as %v", left)
+	}
+}
+
+// A replica is durable before it becomes promotable.
+//
+// qemu-img convert does not flush its output by default, and a rename is only
+// a metadata operation: after a power loss the final, promotable name can
+// point at a file whose data never reached the disk — short or zero-filled,
+// and the lexically newest candidate auto-promote will boot. So the .partial
+// file is synced BEFORE the rename, and the directory after it, so the rename
+// itself survives.
+func TestPublishReplica_SyncsBeforeItIsPromotable(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "web-1-root-20260924T120000Z.qcow2")
+
+	var order []string
+	prev := syncPath
+	t.Cleanup(func() { syncPath = prev })
+	syncPath = func(p string) error {
+		_, err := os.Stat(dst)
+		order = append(order, fmt.Sprintf("%s published=%v", filepath.Base(p), err == nil))
+		return nil
+	}
+
+	if err := publishReplica(context.Background(), dst, func(tmp string) error {
+		return os.WriteFile(tmp, []byte("qcow2"), 0o600)
+	}); err != nil {
+		t.Fatalf("publishReplica: %v", err)
+	}
+	want := []string{
+		"." + filepath.Base(dst) + ".partial published=false", // the data, before the rename
+		filepath.Base(dir) + " published=true",                // the rename itself
+	}
+	if fmt.Sprint(order) != fmt.Sprint(want) {
+		t.Fatalf("sync order = %v, want %v", order, want)
+	}
+}
+
+// A replica whose data could not be made durable is not published: a sync
+// failure is the storage saying it cannot promise the bytes.
+func TestPublishReplica_ASyncFailurePublishesNothing(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "web-1-root-20260924T120000Z.qcow2")
+	prev := syncPath
+	t.Cleanup(func() { syncPath = prev })
+	syncPath = func(string) error { return errors.New("EIO") }
+
+	err := publishReplica(context.Background(), dst, func(tmp string) error {
+		return os.WriteFile(tmp, []byte("qcow2"), 0o600)
+	})
+	if err == nil {
+		t.Fatal("publishReplica succeeded although the replica could not be synced")
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Errorf("left %d file(s) behind after a failed sync; want none", len(entries))
 	}
 }

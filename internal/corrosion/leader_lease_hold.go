@@ -148,6 +148,11 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 					return false, 0, err
 				}
 				if held {
+					// A retirement hands a term like any acquisition, so it
+					// records that this incarnation now holds one. Without it a
+					// previously termless incarnation failed the renewal case on
+					// the next tick and minted again.
+					c.noteHandedTerm(key, term)
 					return true, term, nil
 				}
 				if term == leaseContended {
@@ -215,7 +220,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		// ledger's current incarnation is not ours to take yet — its real holder
 		// may be renewing over it right now. See deferTakeover.
 		if !ourTenure && curExpires < nowRFC && newest.Term > 0 &&
-			deferTakeover(curHolder, curExpires, effective, holder, now, ttl) {
+			deferTakeover(curHolder, curExpires, effective, holder, cur, ttl) {
 			return false, 0, nil
 		}
 

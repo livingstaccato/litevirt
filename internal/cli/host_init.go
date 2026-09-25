@@ -524,7 +524,7 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	// local user to pre-create and no write-then-execute window.
 	cmd := execCommand("bash", "-s")
 	cmd.Stdin = strings.NewReader(setupScript)
-	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, "[]")...)
+	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, localInitJoinPeers)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -817,6 +817,11 @@ func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
 // setupScriptEnv is the environment the setup script reads to write the daemon
 // config. One place, so the local and remote paths cannot disagree about it —
 // they already had, which is how the local path shipped with no advertise_address.
+// localInitJoinPeers is the JOIN_PEERS value `lv host init` hands the setup
+// script: an empty YAML list, because the local host is starting a cluster and
+// has nobody to join.
+const localInitJoinPeers = "[]"
+
 func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
 	return []string{
 		"HOST_NAME=" + hostName,
@@ -881,10 +886,18 @@ func enforcementYAML(path, joinPeers string) string {
 	if block := enforcementYAMLFrom(path); block != "" {
 		return block
 	}
-	if joinPeers != "" {
+	if hasJoinPeers(joinPeers) {
 		return ""
 	}
 	return newClusterEnforcement
+}
+
+// hasJoinPeers reports whether a JOIN_PEERS value names anybody. It arrives
+// as YAML, so an empty list — "[]", which is what `lv host init` sends — means
+// no peers just as "" does.
+func hasJoinPeers(joinPeers string) bool {
+	p := strings.TrimSpace(joinPeers)
+	return p != "" && strings.ReplaceAll(p, " ", "") != "[]"
 }
 
 // enforcementYAMLFrom extracts the `enforcement:` mapping from a daemon config

@@ -11,10 +11,7 @@ import (
 
 func testServer(t *testing.T) *Server {
 	t.Helper()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

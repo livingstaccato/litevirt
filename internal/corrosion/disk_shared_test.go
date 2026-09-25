@@ -7,10 +7,7 @@ import (
 
 func sharedDiskTestClient(t *testing.T) *Client {
 	t.Helper()
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	if err := InitSchema(context.Background(), c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

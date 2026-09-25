@@ -1830,10 +1830,7 @@ const createVMIntegrationToken = "0123456789abcdef0123456789abcdef0123456789abcd
 func newCreateVMIntegrationServer(t *testing.T) (*Server, *corrosion.Client, *libvirtfake.Fake) {
 	t.Helper()
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

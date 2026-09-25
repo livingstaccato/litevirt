@@ -65,10 +65,7 @@ func (f *fakeNetBoxDeletes) handler(w http.ResponseWriter, r *http.Request) {
 func newTestServerWithFakeNetBox(t *testing.T) (*Server, *fakeNetBoxDeletes) {
 	t.Helper()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

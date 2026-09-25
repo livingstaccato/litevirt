@@ -25,10 +25,7 @@ func ensureObserverHost(t *testing.T, db *corrosion.Client, name string) {
 
 func newTestDB(t *testing.T) *corrosion.Client {
 	t.Helper()
-	c, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)

@@ -55,10 +55,7 @@ func restoreVars(v pruneVars) {
 
 func newPruneTestClient(t *testing.T) *Client {
 	t.Helper()
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewTestClientT(t)
 	t.Cleanup(func() { c.db.Close() })
 	if err := InitSchema(context.Background(), c); err != nil {
 		t.Fatal(err)

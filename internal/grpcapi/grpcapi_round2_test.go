@@ -61,10 +61,7 @@ func (g *flipExecGate) QuorumProof(context.Context) (health.QuorumState, int, in
 // testServerR2 creates a Server with vmLocks, dataDir, images store, and DB.
 func testServerR2(t *testing.T) *Server {
 	t.Helper()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

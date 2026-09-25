@@ -94,10 +94,7 @@ func TestLedger_CoversEveryVersion(t *testing.T) {
 // Fresh DB: CREATE TABLE includes every column, so every ledger unit is present
 // (mark-only, zero ALTERs run); ledger fully populated, version == current.
 func TestInitSchema_FreshDB(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	if err := InitSchema(context.Background(), c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -110,10 +107,7 @@ func TestInitSchema_FreshDB(t *testing.T) {
 }
 
 func TestInitSchema_RebuildsTheEarlierV47ClusterCRLShape(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := c.execLocal(ctx, `CREATE TABLE cluster_crl (
 		id TEXT PRIMARY KEY,
@@ -139,10 +133,7 @@ func TestInitSchema_RebuildsTheEarlierV47ClusterCRLShape(t *testing.T) {
 // Bootstrap: a legacy v28 DB (no ledger) gets the ledger seeded by mark-only
 // (nothing re-run), version stays 28.
 func TestInitSchema_SeedsLedgerOnExistingDB(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	buildLegacyV28DB(t, c)
 	if err := InitSchema(context.Background(), c); err != nil {
 		t.Fatalf("InitSchema on legacy DB: %v", err)
@@ -159,10 +150,7 @@ func TestInitSchema_SeedsLedgerOnExistingDB(t *testing.T) {
 // drift the old swallow-benign loop could leave) must be HEALED, not falsely
 // marked — proving mark-applied is gated on presence, never the version number.
 func TestInitSchema_HealsSilentGap(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	buildLegacyV28DB(t, c)
 	// Introduce a silent gap: drop a v28 column and a v27 table, leave version 28.
@@ -192,10 +180,7 @@ func TestInitSchema_HealsSilentGap(t *testing.T) {
 // An applied migration whose recorded checksum no longer matches the code (the
 // SQL was edited after shipping) aborts loudly.
 func TestInitSchema_ChecksumDriftAborts(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -205,7 +190,7 @@ func TestInitSchema_ChecksumDriftAborts(t *testing.T) {
 		schemaMigrationLedger[0].ID); err != nil {
 		t.Fatalf("corrupt checksum: %v", err)
 	}
-	err = InitSchema(ctx, c)
+	err := InitSchema(ctx, c)
 	if err == nil || !containsFold(err.Error(), "checksum drift") {
 		t.Fatalf("want checksum drift abort, got: %v", err)
 	}
@@ -214,10 +199,7 @@ func TestInitSchema_ChecksumDriftAborts(t *testing.T) {
 // InitSchema must not write a single mutation_log row — proving the ledger +
 // DDL are local-only and never replicate to peers.
 func TestInitSchema_NoReplication(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -244,10 +226,7 @@ func TestInitSchema_NoReplication(t *testing.T) {
 // TestInitSchema_IdempotentOnSecondCall: running InitSchema twice (the on-restart
 // case) is a clean no-op — every ledger unit is already recorded, checksums match.
 func TestInitSchema_IdempotentOnSecondCall(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("first InitSchema: %v", err)
@@ -263,10 +242,7 @@ func TestInitSchema_IdempotentOnSecondCall(t *testing.T) {
 // regressed, and EffectiveDBSchema reports the DB's real (forward) level via
 // max(derived, stored) — so this node still advertises the true schema to peers.
 func TestInitSchema_AllowsForwardDB(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("first InitSchema: %v", err)
@@ -341,10 +317,7 @@ func buildV42DB(t *testing.T, c *Client) {
 // CurrentSchemaVersion with every intervening table and column present and the
 // whole ledger recorded — and with pre-existing data intact.
 func TestInitSchema_MigratesV42ToV54(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	buildV42DB(t, c)
 

@@ -244,10 +244,7 @@ func newOrphanQueueServer(t *testing.T) (*Server, *fakeNetBoxQueue) {
 	t.Helper()
 	ctx := context.Background()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

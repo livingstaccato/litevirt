@@ -208,3 +208,37 @@ func TestCheckHost_ASilentPeerAfterUnreadyIsNotHealthy(t *testing.T) {
 		t.Errorf("after %d unanswered probes, status = %q, want suspect", suspectThreshold, got)
 	}
 }
+
+// A peer that stays unready is written once, not once per probe.
+//
+// consecutive_failures grows on every unready observation, and a changed count
+// counted as a changed verdict, so every observer wrote a replicated
+// host_health row every probe interval for as long as the peer stayed unready
+// — an hour of a wedged store was ~1,800 writes per observer, pushed around the
+// cluster, including to the wedged peer. Nothing decides on the unready count;
+// the transition is the news.
+func TestCheckHost_AStillUnreadyPeerIsNotRewrittenEveryProbe(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	c := probingChecker(t, db)
+	c.SetPeerReadiness(func(context.Context, string) (bool, string, error) {
+		return false, "database read timed out", nil
+	})
+	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
+	logRows := func() int {
+		rows, err := db.Query(ctx, `SELECT COUNT(*) AS n FROM mutation_log`)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("count mutation_log: %v", err)
+		}
+		return rows[0].Int("n")
+	}
+
+	c.checkHost(ctx, host) // the transition to unready: one replicated write
+	before := logRows()
+	for i := 0; i < 10; i++ {
+		c.checkHost(ctx, host)
+	}
+	if writes := logRows() - before; writes > 0 {
+		t.Errorf("an unchanged unready verdict was written %d more times over 10 probes; want none after the first", writes)
+	}
+}

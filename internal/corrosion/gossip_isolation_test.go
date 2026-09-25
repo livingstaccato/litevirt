@@ -117,8 +117,12 @@ func TestMembershipTick_ASuccessfulRejoinResolves(t *testing.T) {
 	rep := reporter(c)
 	c.membershipTick(context.Background(), isolatedRejoiner(), rep)
 
+	// A real successful join makes its peers visible, and visibility — not
+	// Join's count — is what decides the pass.
 	rejoined := isolatedRejoiner()
-	rejoined.join = func([]string) (int, error) { return 2, nil }
+	visible := 0
+	rejoined.peerCount = func() int { return visible }
+	rejoined.join = func([]string) (int, error) { visible = 2; return 2, nil }
 	c.membershipTick(context.Background(), rejoined, rep)
 
 	if row, _ := isolationRow(t, c); row.Lifecycle != ConditionResolved {
@@ -170,5 +174,29 @@ func TestMembershipTick_ASingleNodeClusterIsNotIsolated(t *testing.T) {
 
 	if _, ok := isolationRow(t, c); ok {
 		t.Error("a single-node cluster was reported as isolated")
+	}
+}
+
+// Joining yourself is not rejoining the cluster.
+//
+// rejoinTargets keeps a configured seed that names this node — on a fleet that
+// shares one join_peers list, every node's list includes itself — and
+// memberlist's push/pull to its own address succeeds. So a node that had lost
+// every peer got Join = (1, nil) and was reported recovered, every pass, while
+// it still saw nobody. Isolation is decided by what the node can see after the
+// attempt, not by what Join returned.
+func TestMembershipTick_JoiningOnlyItselfIsStillIsolated(t *testing.T) {
+	c := isolationClient(t)
+	selfJoin := &rejoiner{
+		peerCount: func() int { return 0 }, // before and after: nobody
+		targets:   func() []string { return []string{"10.0.0.3", "10.0.0.1"} },
+		join:      func([]string) (int, error) { return 1, nil }, // reached itself
+	}
+
+	c.membershipTick(context.Background(), selfJoin, reporter(c))
+
+	if _, ok := isolationRow(t, c); !ok {
+		t.Fatal("no gossip_isolated condition: a Join that reached only this node was taken for a re-join " +
+			"although the node still sees no peers")
 	}
 }

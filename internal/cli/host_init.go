@@ -156,7 +156,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	// so there is no path for a local user on the target to pre-create, no window
 	// between writing it and running it, and nothing to clean up if this process
 	// dies in between.
-	if err := sc.RunWithInput(fmt.Sprintf("HOST_NAME=%s bash -s", hostName), []byte(setupScript)); err != nil {
+	if err := sc.RunWithInput(remoteInitSetupCommand(hostName, hostAddr), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -817,9 +817,20 @@ func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
 // setupScriptEnv is the environment the setup script reads to write the daemon
 // config. One place, so the local and remote paths cannot disagree about it —
 // they already had, which is how the local path shipped with no advertise_address.
-// localInitJoinPeers is the JOIN_PEERS value `lv host init` hands the setup
-// script: an empty YAML list, because the local host is starting a cluster and
-// has nobody to join.
+// remoteInitSetupCommand is the command `lv host init root@<ip>` runs on the
+// new host: the same environment --local and `add` hand the script.
+//
+// It used to pass HOST_NAME alone. The remote form is the one to use for any
+// multi-node cluster — --local bakes a 127.0.0.1-only certificate SAN — so the
+// documented way to start a real cluster wrote no enforcement block (both
+// fence guards off) and let the daemon auto-detect its advertise address.
+func remoteInitSetupCommand(hostName, hostAddr string) string {
+	return strings.Join(setupScriptEnv(hostName, hostAddr, localInitJoinPeers), " ") + " bash -s"
+}
+
+// localInitJoinPeers is the JOIN_PEERS value both forms of `lv host init` hand
+// the setup script: an empty YAML list, because the host is starting a cluster
+// and has nobody to join.
 const localInitJoinPeers = "[]"
 
 func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {

@@ -35,6 +35,8 @@ type Server struct {
 	virt     *libvirt.Client
 	ctStat   containerStatter
 	hostName string
+	// replicationTargets is handed to the collector; see SetReplicationTargets.
+	replicationTargets func() []string
 	// mu guards httpSrv and stopped. Start assigns httpSrv from whatever
 	// goroutine the daemon launches it on (`go d.metrics.Start()`), and Stop
 	// runs on the shutdown path — so the two race, and an unsynchronised Stop
@@ -81,6 +83,13 @@ func (s *Server) logger() *slog.Logger {
 // is how the banner came to claim 0.0.0.0 for a loopback-bound endpoint.
 func (s *Server) Addr() string {
 	return net.JoinHostPort(normalizeBind(s.bindAddr), strconv.Itoa(s.port))
+}
+
+// SetReplicationTargets tells the collector which peers the replicator is
+// pushing to, so the backlog gauges keep counting a peer that has stopped
+// acknowledging. Call before Start.
+func (s *Server) SetReplicationTargets(targets func() []string) {
+	s.replicationTargets = targets
 }
 
 // NewServer creates a metrics server. bindAddr is the interface to listen on
@@ -136,6 +145,7 @@ func (s *Server) newHTTPServer() *http.Server {
 // Start begins serving metrics. Blocks.
 func (s *Server) Start() {
 	collector := newCollector(s.db, s.virt, s.ctStat, s.hostName)
+	collector.replicationTargets = s.replicationTargets
 	s.registerer().MustRegister(collector)
 	registerTelemetryMetrics()
 
@@ -286,6 +296,10 @@ type collector struct {
 	virt     *libvirt.Client
 	ctStat   containerStatter
 	hostName string
+	// replicationTargets names the peers the replicator is pushing to right
+	// now. Nil when not wired; the backlog gauges then fall back to watermark
+	// rows updated within LiveWatermarkWindow.
+	replicationTargets func() []string
 
 	hostVMCount    *prometheus.Desc
 	hostCPUTotal   *prometheus.Desc
@@ -786,16 +800,13 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// replication_min_watermark_seq. Reported as 0 when there are no live peers
 	// so a single node (or a fully-partitioned one) doesn't report its whole
 	// log as "pending". The live cutoff matches the replicator's prune logic.
+	floor, behindAnyone, floorErr := c.replicationFloor(ctx, liveCutoff)
 	pending := 0.0
-	if wm, werr := c.db.Query(ctx,
-		`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
-		 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff); werr == nil && len(wm) > 0 {
-		if wm[0].Int("live") > 0 {
-			if mx, merr := c.db.Query(ctx,
-				`SELECT COALESCE(MAX(seq), 0) AS m FROM mutation_log`); merr == nil && len(mx) > 0 {
-				if lag := mx[0].Int("m") - wm[0].Int("minseq"); lag > 0 {
-					pending = float64(lag)
-				}
+	if floorErr == nil && behindAnyone {
+		if mx, merr := c.db.Query(ctx,
+			`SELECT COALESCE(MAX(seq), 0) AS m FROM mutation_log`); merr == nil && len(mx) > 0 {
+			if lag := mx[0].Int("m") - floor; lag > 0 {
+				pending = float64(lag)
 			}
 		}
 	}
@@ -816,11 +827,9 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// Zero with no live peer, for the reason pending_entries is: nobody to be
 	// behind.
 	age := 0.0
-	if wm, werr := c.db.Query(ctx,
-		`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
-		 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff); werr == nil && len(wm) > 0 && wm[0].Int("live") > 0 {
+	if floorErr == nil && behindAnyone {
 		if ol, oerr := c.db.Query(ctx,
-			`SELECT MIN(created_at) AS oldest FROM mutation_log WHERE seq > ?`, wm[0].Int("minseq")); oerr == nil && len(ol) > 0 {
+			`SELECT MIN(created_at) AS oldest FROM mutation_log WHERE seq > ?`, floor); oerr == nil && len(ol) > 0 {
 			if ts, perr := time.Parse(time.RFC3339, ol[0].String("oldest")); perr == nil {
 				if d := time.Since(ts).Seconds(); d > 0 {
 					age = d
@@ -922,4 +931,47 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 				prometheus.CounterValue, float64(r.Int("cnt")), r.String("status"))
 		}
 	}
+}
+
+// replicationFloor is the lowest sequence acknowledged by any peer this node
+// is responsible for replicating to, and whether there is such a peer at all —
+// the basis both backlog gauges share.
+//
+// With the replicator wired in, that set is its current push targets, read
+// from their watermark rows however stale: a peer that has stopped
+// acknowledging stops updating its row, and that is exactly the peer the
+// gauges exist to report. A target with no row yet has acknowledged nothing.
+// Without the replicator (tests, a collector built standalone) it falls back to
+// rows updated within LiveWatermarkWindow, which is blind to a peer stuck for
+// longer than the window.
+func (c *collector) replicationFloor(ctx context.Context, liveCutoff string) (floor int, behindAnyone bool, err error) {
+	if c.replicationTargets == nil {
+		rows, qerr := c.db.Query(ctx,
+			`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
+			 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff)
+		if qerr != nil || len(rows) == 0 {
+			return 0, false, qerr
+		}
+		return rows[0].Int("minseq"), rows[0].Int("live") > 0, nil
+	}
+	targets := c.replicationTargets()
+	if len(targets) == 0 {
+		return 0, false, nil
+	}
+	rows, qerr := c.db.Query(ctx, `SELECT peer_name, last_seq FROM replication_watermarks`)
+	if qerr != nil {
+		return 0, false, qerr
+	}
+	acked := make(map[string]int, len(rows))
+	for _, r := range rows {
+		acked[r.String("peer_name")] = r.Int("last_seq")
+	}
+	floor = -1
+	for _, t := range targets {
+		seq := acked[t] // absent: nothing acknowledged yet
+		if floor < 0 || seq < floor {
+			floor = seq
+		}
+	}
+	return floor, true, nil
 }

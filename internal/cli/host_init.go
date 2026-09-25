@@ -24,6 +24,7 @@ import (
 	"github.com/litevirt/litevirt/internal/secretfile"
 	"github.com/litevirt/litevirt/internal/ssh"
 	"github.com/litevirt/litevirt/internal/systemdunit"
+	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 var (
@@ -180,6 +181,9 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 			"hosts, so %s would be provisioned with an empty join_peers and never reach the "+
 			"cluster. Check that a daemon is reachable from here (lv host ls), or that this "+
 			"is not the first host — the first one is `lv host init`", hostName)
+	}
+	if err := checkJoinEnforcementSource(ctx, c, daemonConfigPath); err != nil {
+		return err
 	}
 	pkiDir := PKIDir()
 
@@ -1108,4 +1112,38 @@ func refuseIfAlreadyAMember(target string, cfgYAML []byte, force bool) error {
 		"an admin credential of its own. Use `lv host add` to add a node to a cluster, "+
 		"or re-run with --force to re-initialise this one anyway",
 		target, daemonConfigPath, strings.Join(cfg.JoinPeers, ", "))
+}
+
+// checkJoinEnforcementSource guards `lv host add` run from a machine with no
+// enforcement block to copy.
+//
+// A joining host inherits the enforcement block of the machine running `lv`,
+// which is right on a cluster node and wrong from a workstation, where there is
+// none: a node added from a laptop to a cluster founded with the safe fence
+// defaults booted with both off, and as coordinator would reschedule after a
+// fence nobody can confirm. No RPC carries the whole block, so this cannot copy
+// the cluster's — it refuses instead, when the cluster enforces or when it
+// cannot tell. A cluster that genuinely has no block joins as before.
+func checkJoinEnforcementSource(ctx context.Context, c pb.LiteVirtClient, path string) error {
+	if enforcementYAMLFrom(path) != "" {
+		return nil
+	}
+	const fix = "run `lv host add` from an existing cluster node, whose config holds the cluster's enforcement block, " +
+		"so the new host inherits it"
+	fr, err := c.GetFenceReadiness(ctx, &emptypb.Empty{})
+	if err != nil {
+		return fmt.Errorf("this machine has no enforcement block to give the new host, and the cluster's "+
+			"fence posture could not be read (%v), so cannot tell whether it enforces one: %s", err, fix)
+	}
+	for _, h := range fr.GetHosts() {
+		if !h.GetReachable() || !h.GetPostureKnown() {
+			return fmt.Errorf("this machine has no enforcement block to give the new host, and %s's fence "+
+				"posture is unknown, so cannot tell whether the cluster enforces one: %s", h.GetHost(), fix)
+		}
+		if h.GetEnforcing() {
+			return fmt.Errorf("the cluster enforces the shared-storage fence (%s does), but this machine has no "+
+				"enforcement block to give the new host, which would join with it switched off: %s", h.GetHost(), fix)
+		}
+	}
+	return nil
 }

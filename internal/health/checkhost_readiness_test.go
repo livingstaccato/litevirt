@@ -125,3 +125,45 @@ func TestCheckHost_ReadinessIsAskedAboutTheProbedPeer(t *testing.T) {
 		t.Errorf("readiness prober asked about %v, want [host-b]", asked)
 	}
 }
+
+// A run of unready answers is not a run of silence. Each of those probes
+// reached the peer and got an answer, so none of them is evidence toward
+// "suspect" — the verdict fencing quorum counts. The first probe that goes
+// unanswered afterwards starts the silence count at one, and the peer has to
+// miss suspectThreshold in a row like any other before it can be suspect.
+//
+// Carrying the unready count over let a single dropped packet after a long
+// unready stretch jump straight to suspect with consecutive_failures well past
+// offlineThreshold: fence-eligible on one miss.
+func TestCheckHost_UnreadyAnswersDoNotCountTowardSuspect(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	c := probingChecker(t, db)
+	answer := func(context.Context, string) (bool, string, error) {
+		return false, "database read timed out", nil
+	}
+	c.SetPeerReadiness(func(ctx context.Context, h string) (bool, string, error) { return answer(ctx, h) })
+	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
+
+	for i := 0; i < 20; i++ {
+		c.checkHost(ctx, host)
+	}
+	answer = func(context.Context, string) (bool, string, error) {
+		return false, "", errors.New("context deadline exceeded")
+	}
+	c.checkHost(ctx, host)
+
+	rows, err := db.Query(ctx,
+		`SELECT status, consecutive_failures FROM host_health WHERE observer = ? AND target = ?`,
+		"host-a", "host-b")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("query: rows=%d err=%v", len(rows), err)
+	}
+	if got := rows[0].String("status"); got == "suspect" {
+		t.Fatalf("one unanswered probe after 20 unready answers made the peer suspect (consecutive_failures=%d); "+
+			"it needs %d unanswered probes in a row", rows[0].Int("consecutive_failures"), suspectThreshold)
+	}
+	if got := rows[0].Int("consecutive_failures"); got != 1 {
+		t.Errorf("consecutive_failures = %d after the first unanswered probe, want 1", got)
+	}
+}

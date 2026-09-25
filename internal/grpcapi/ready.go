@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -68,7 +69,7 @@ func (s *Server) Ready(ctx context.Context, _ *pb.ReadyRequest) (*pb.ReadyRespon
 // PeerReady asks a peer whether it can serve. Injected into the health checker
 // (SetPeerReadiness) so the peer probe is an application-level question rather
 // than a TLS handshake.
-func (s *Server) PeerReady(ctx context.Context, host string) (bool, string, error) {
+func (s *Server) PeerReady(ctx context.Context, host, addr string) (bool, string, error) {
 	// Self is answered locally. A node cannot dial itself to learn whether its
 	// own database is wedged: the dial goes through the same daemon, and a
 	// readiness probe that depends on the thing it is probing proves nothing.
@@ -79,7 +80,7 @@ func (s *Server) PeerReady(ctx context.Context, host string) (bool, string, erro
 		}
 		return resp.GetReady(), resp.GetNotReadyReason(), nil
 	}
-	c, closeConn, err := s.dialPeer(ctx, host)
+	c, closeConn, err := s.dialReadyTarget(ctx, host, addr)
 	if err != nil {
 		return false, "", err
 	}
@@ -144,4 +145,21 @@ func (s *Server) boundedReadyQuery(ctx context.Context) (rows []corrosion.Row, f
 		}()
 		return nil, false, nil
 	}
+}
+
+// dialReadyTarget reaches the peer at the address the health checker already
+// resolved. Going through dialPeer re-resolved it via ResolvePeerTarget — a read
+// of THIS node's hosts table, under its own lock, on every probe — so an
+// observer whose store was stalled failed every probe before sending anything,
+// and booked it as the peer being unreachable. With no address it falls back to
+// resolving by name.
+func (s *Server) dialReadyTarget(ctx context.Context, host, addr string) (pb.LiteVirtClient, func(), error) {
+	if s.peerClientOverride != nil || addr == "" {
+		return s.dialPeer(ctx, host)
+	}
+	conn, err := s.dialPeerAddr(addr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial host %s at %s: %w", host, addr, err)
+	}
+	return pb.NewLiteVirtClient(conn), func() { _ = conn.Close() }, nil
 }

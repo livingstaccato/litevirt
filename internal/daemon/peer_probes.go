@@ -15,7 +15,7 @@ type peerProber interface {
 	// activation.
 	PeerCapabilities(ctx context.Context, host string) ([]string, time.Time, error)
 	// PeerReady answers "can that DAEMON serve", for the health probe.
-	PeerReady(ctx context.Context, host string) (bool, string, error)
+	PeerReady(ctx context.Context, host, addr string) (bool, string, error)
 }
 
 // peerProbeSink is the health checker's injection surface. An interface so the

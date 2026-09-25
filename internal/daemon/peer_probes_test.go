@@ -22,7 +22,7 @@ func (fakeProber) PeerCapabilities(_ context.Context, host string) ([]string, ti
 	return []string{"cap_for_" + host}, time.Time{}, nil
 }
 
-func (fakeProber) PeerReady(_ context.Context, host string) (bool, string, error) {
+func (fakeProber) PeerReady(_ context.Context, host, _ string) (bool, string, error) {
 	if host == "wedged" {
 		return false, "database read timed out", nil
 	}
@@ -41,7 +41,7 @@ func TestWirePeerProbes_InjectsReadiness(t *testing.T) {
 	if sink.ready == nil {
 		t.Fatal("no readiness prober was injected")
 	}
-	ready, reason, err := sink.ready(context.Background(), "wedged")
+	ready, reason, err := sink.ready(context.Background(), "wedged", "10.0.0.9:7443")
 	if err != nil {
 		t.Fatalf("readiness prober: %v", err)
 	}

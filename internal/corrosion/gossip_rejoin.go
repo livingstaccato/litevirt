@@ -96,12 +96,12 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 			}
 			return rejoinTargets(seeds, hosts, c.hostName, selfAddr)
 		},
-		join: func(ts []string) (int, error) {
+		join: cancellableJoin(ctx, func(ts []string) (int, error) {
 			if c.list == nil {
 				return 0, nil
 			}
 			return c.list.Join(ts)
-		},
+		}),
 	}
 
 	rep := &isolationReporter{c: c, host: c.hostName, now: time.Now}
@@ -121,6 +121,11 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 // node sees nobody, log the outcome, and keep the isolation condition current.
 func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolationReporter) {
 	attempted, joined, err := r.tick()
+	if ctx.Err() != nil {
+		// Close cancelled this pass. Nothing it learned is worth writing into
+		// a store that is about to close.
+		return
+	}
 	// Isolated means this pass had to try AND still sees nobody. A pass that
 	// did not try either sees peers already or has nobody to find (a
 	// single-node cluster with no seeds) — neither is isolation.
@@ -154,4 +159,32 @@ func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolation
 		return
 	}
 	slog.Info("gossip: re-joined after losing every peer", "peers", joined)
+}
+
+// cancellableJoin wraps a join so the loop can stop waiting for it.
+//
+// memberlist.Join takes no context and dials its targets one at a time, each
+// bounded only by its TCP timeout: an isolated node with ten unreachable
+// targets sits in a single Join for about 100 s. Close waits for the loop, so
+// shutdown waited with it — past systemd's stop timeout. On cancellation the
+// join is left to finish on its own goroutine; it touches only memberlist,
+// which Close shuts down next, never the database.
+func cancellableJoin(ctx context.Context, join func([]string) (int, error)) func([]string) (int, error) {
+	return func(targets []string) (int, error) {
+		type result struct {
+			n   int
+			err error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			n, err := join(targets)
+			ch <- result{n, err}
+		}()
+		select {
+		case r := <-ch:
+			return r.n, r.err
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 }

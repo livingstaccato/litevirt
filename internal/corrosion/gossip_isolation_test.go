@@ -200,3 +200,37 @@ func TestMembershipTick_JoiningOnlyItselfIsStillIsolated(t *testing.T) {
 			"although the node still sees no peers")
 	}
 }
+
+// Close cannot be held hostage by a join. memberlist.Join takes no context and
+// dials its targets one at a time, each bounded only by its TCP timeout, so an
+// isolated node with ten unreachable targets sat in one Join for about 100 s —
+// and Close waits for the membership loop, so shutdown waited too, past
+// systemd's stop timeout. A cancelled pass stops waiting for the join and
+// writes nothing: the store it would write to is about to close.
+func TestMembershipTick_ACancelledPassDoesNotWaitForTheJoin(t *testing.T) {
+	c := isolationClient(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stuck := &rejoiner{
+		peerCount: func() int { return 0 },
+		targets:   func() []string { return []string{"10.0.0.1"} },
+		join: cancellableJoin(ctx, func([]string) (int, error) {
+			<-release // memberlist.Join ignores ctx
+			return 0, errors.New("i/o timeout")
+		}),
+	}
+	done := make(chan struct{})
+	go func() { c.membershipTick(ctx, stuck, reporter(c)); close(done) }()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("membershipTick kept waiting on a join after its context was cancelled; Close would wait with it")
+	}
+	if _, ok := isolationRow(t, c); ok {
+		t.Error("a cancelled pass wrote an isolation condition into a store that is closing")
+	}
+}

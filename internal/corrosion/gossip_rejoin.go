@@ -121,10 +121,16 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 // node sees nobody, log the outcome, and keep the isolation condition current.
 func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolationReporter) {
 	attempted, joined, err := r.tick()
-	// Isolated means this pass had to try AND got nowhere. A pass that did not
-	// try either sees peers already or has nobody to find (a single-node
-	// cluster with no seeds) — neither is isolation.
-	rep.report(ctx, attempted && (err != nil || joined == 0), err)
+	// Isolated means this pass had to try AND still sees nobody. A pass that
+	// did not try either sees peers already or has nobody to find (a
+	// single-node cluster with no seeds) — neither is isolation.
+	//
+	// Decided by the peers visible AFTER the attempt, not by Join's count: a
+	// seed list that names this node (the shape a fleet sharing one join_peers
+	// list has) lets Join reach itself and return (1, nil) while the node
+	// still sees no one.
+	isolated := attempted && r.peerCount() == 0
+	rep.report(ctx, isolated, err)
 	if !attempted {
 		return
 	}
@@ -132,11 +138,18 @@ func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolation
 	// held as caught up no longer covers what the cluster may be deciding
 	// without it. Backstop for the leave event, which is the primary reset.
 	c.MarkReplicaStale("sees no gossip peers (re-join loop)")
-	if err != nil {
+	if isolated {
 		// REPORTED every attempt, not once at startup. "joined 0 of N" is
 		// the signal an operator needs, and logging it once and carrying on
 		// is what made a whole partition invisible.
 		slog.Warn("gossip: this node sees no peers and could not re-join",
+			"joined", joined, "error", err)
+		return
+	}
+	if err != nil {
+		// Some targets answered and the node now sees peers, so this pass
+		// recovered; the partial failure is worth a line, not a condition.
+		slog.Warn("gossip: re-joined after losing every peer, but some targets failed",
 			"joined", joined, "error", err)
 		return
 	}

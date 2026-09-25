@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -37,7 +38,7 @@ func TestPeerReady_CarriesThePeersOwnVerdict(t *testing.T) {
 		resp: &pb.ReadyResponse{HostName: "host-b", Ready: false, NotReadyReason: "local read failed"},
 	})
 
-	ready, reason, err := s.PeerReady(context.Background(), "host-b")
+	ready, reason, err := s.PeerReady(context.Background(), "host-b", "127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("PeerReady returned an error: %v — the RPC completed, so this is not unreachable", err)
 	}
@@ -54,7 +55,7 @@ func TestPeerReady_CarriesThePeersOwnVerdict(t *testing.T) {
 func TestPeerReady_TransportFailureIsAnError(t *testing.T) {
 	s := serverWithPeerReady(t, readyClient{err: errors.New("connection refused")})
 
-	if _, _, err := s.PeerReady(context.Background(), "host-b"); err == nil {
+	if _, _, err := s.PeerReady(context.Background(), "host-b", "127.0.0.1:1"); err == nil {
 		t.Error("PeerReady returned no error for a peer that could not be reached")
 	}
 }
@@ -69,7 +70,7 @@ func TestPeerReady_OldPeerWithoutTheRPCIsNotDegraded(t *testing.T) {
 		err: status.Error(codes.Unimplemented, "unknown method Ready"),
 	})
 
-	ready, _, err := s.PeerReady(context.Background(), "host-b")
+	ready, _, err := s.PeerReady(context.Background(), "host-b", "127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("PeerReady: %v — an Unimplemented answer is not a transport failure", err)
 	}
@@ -83,7 +84,7 @@ func TestPeerReady_OldPeerWithoutTheRPCIsNotDegraded(t *testing.T) {
 func TestPeerReady_ReadyPeerReadsAsReady(t *testing.T) {
 	s := serverWithPeerReady(t, readyClient{resp: &pb.ReadyResponse{HostName: "host-b", Ready: true}})
 
-	ready, _, err := s.PeerReady(context.Background(), "host-b")
+	ready, _, err := s.PeerReady(context.Background(), "host-b", "127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("PeerReady: %v", err)
 	}
@@ -102,11 +103,24 @@ func TestPeerReady_SelfIsAnsweredLocally(t *testing.T) {
 	}
 	insertReadyHost(t, s, "test-host")
 
-	ready, _, err := s.PeerReady(context.Background(), "test-host")
+	ready, _, err := s.PeerReady(context.Background(), "test-host", "127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("PeerReady: %v", err)
 	}
 	if !ready {
 		t.Error("ready = false for this node with a working database")
+	}
+}
+
+// PeerReady dials the address it is given and reads nothing locally. A probe
+// that consulted the observer's own hosts table failed whenever that store was
+// busy, and the failure was booked against the peer.
+func TestPeerReady_DoesNotReadTheLocalStore(t *testing.T) {
+	s := testServer(t)
+	s.db.Close() // any local read would now fail with "database is closed"
+
+	_, _, err := s.PeerReady(context.Background(), "host-b", "127.0.0.1:1")
+	if err != nil && strings.Contains(err.Error(), "database is closed") {
+		t.Fatalf("PeerReady read the local store to reach a peer it already had the address for: %v", err)
 	}
 }

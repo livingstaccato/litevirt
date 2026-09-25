@@ -2,11 +2,13 @@ package metrics
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func insertLogRowAt(t *testing.T, db *corrosion.Client, at time.Time) {
@@ -140,5 +142,56 @@ func TestCollect_BacklogAgeKeepsCountingAPeerThatStoppedAcking(t *testing.T) {
 	if got < 3500 {
 		t.Errorf("backlog age = %.0fs with a replication target an hour behind; want ~3600s — "+
 			"the gauge went quiet because the stuck peer's watermark row aged out", got)
+	}
+}
+
+// The per-peer series and the watermark floor keep a stuck peer in view too.
+//
+// Both read only rows updated within LiveWatermarkWindow. Thirty minutes after
+// a peer stopped acknowledging, its peer_pending_entries series vanished —
+// the "single climbing series identifies the lagging peer" signal — and
+// min_watermark_seq jumped forward past writes that peer never received, which
+// the operating-model docs tell operators to read as proof a write is
+// peer-durable.
+func TestCollect_PeerSeriesAndFloorKeepAPeerThatStoppedAcking(t *testing.T) {
+	db := initTestDB(t)
+	insertLogRowAt(t, db, time.Now().Add(-3*time.Hour))
+	insertLogRowAt(t, db, time.Now().Add(-3*time.Hour))
+	setWatermark(t, db, "peer-b", 1, time.Now().Add(-2*time.Hour)) // stuck at seq 1
+	insertLogRowAt(t, db, time.Now())
+	setWatermark(t, db, "peer-c", maxSeq(t, db), time.Now()) // caught up
+
+	c := newCollector(db, nil, nil, "host-a")
+	c.replicationTargets = func() []string { return []string{"peer-b", "peer-c"} }
+	collect := func(name string) (float64, bool) {
+		ch := make(chan prometheus.Metric, 200)
+		c.Collect(ch)
+		close(ch)
+		return gaugeValue(t, ch, name)
+	}
+
+	if got, _ := collect("litevirt_replication_min_watermark_seq"); got != 1 {
+		t.Errorf("min_watermark_seq = %.0f, want 1 — the stuck peer's floor, not the caught-up peer's", got)
+	}
+	ch := make(chan prometheus.Metric, 200)
+	c.Collect(ch)
+	close(ch)
+	seen := false
+	for m := range ch {
+		if strings.Contains(m.Desc().String(), "litevirt_replication_peer_pending_entries") {
+			var dm dto.Metric
+			_ = m.Write(&dm)
+			for _, l := range dm.GetLabel() {
+				if l.GetName() == "peer" && l.GetValue() == "peer-b" {
+					seen = true
+					if want := float64(maxSeq(t, db) - 1); dm.GetGauge().GetValue() != want {
+						t.Errorf("peer-b pending = %v, want %v", dm.GetGauge().GetValue(), want)
+					}
+				}
+			}
+		}
+	}
+	if !seen {
+		t.Error("no peer_pending_entries series for peer-b: the lagging peer's series vanished once its row aged out")
 	}
 }

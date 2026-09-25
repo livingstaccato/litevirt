@@ -150,7 +150,9 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	}
 	defer conn.Close()
 
-	resp, err := client.GetStateDigest(ctx, &emptypb.Empty{})
+	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
+	resp, err := client.GetStateDigest(dctx, &emptypb.Empty{})
+	dcancel()
 	if err != nil {
 		slog.Debug("anti-entropy: digest RPC error", "peer", peerName, "error", err)
 		return
@@ -228,7 +230,9 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		return
 	}
 	req := &pb.SensitiveStateRequest{Sender: ae.client.HostName()}
-	resp, err := client.GetSensitiveStateDigest(ctx, req)
+	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
+	resp, err := client.GetSensitiveStateDigest(dctx, req)
+	dcancel()
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
 			slog.Debug("anti-entropy: peer has no sensitive state digest RPC", "peer", peerName)
@@ -339,6 +343,12 @@ func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.Lite
 // any dump this tree produces over a LAN and still bounds the pass. A var only
 // so tests can shrink it.
 var antiEntropyPeerTimeout = 5 * time.Minute
+
+// antiEntropyDigestTimeout bounds each digest RPC on its own. A digest is a few
+// bytes; the generous per-peer budget exists for the dump and merge, and on the
+// digest it let K hung peers stall every serial pass for K × that budget before
+// the healthy peers behind them were reached. A var so tests can move it.
+var antiEntropyDigestTimeout = 30 * time.Second
 
 // antiEntropyMaxMsgSize bounds the legacy unary state-dump fallback's receive
 // size; matches the server's grpcMaxMsgSize backstop.

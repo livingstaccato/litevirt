@@ -167,3 +167,44 @@ func TestCheckHost_UnreadyAnswersDoNotCountTowardSuspect(t *testing.T) {
 		t.Errorf("consecutive_failures = %d after the first unanswered probe, want 1", got)
 	}
 }
+
+// A peer that goes silent after being unready is not promoted to healthy.
+//
+// Restarting the silence count at one is right — the unready answers were not
+// silence — but the sub-threshold branch then published "healthy", which
+// QuorumProof counts. A peer that had been excluded as unready and then
+// stopped answering altogether was counted as live for the probes until it
+// reached suspect. Until the silence is long enough to call it suspect, it
+// stays what it last said it was.
+func TestCheckHost_ASilentPeerAfterUnreadyIsNotHealthy(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	c := probingChecker(t, db)
+	answer := func(context.Context, string) (bool, string, error) {
+		return false, "database read timed out", nil
+	}
+	c.SetPeerReadiness(func(ctx context.Context, h string) (bool, string, error) { return answer(ctx, h) })
+	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
+	c.checkHost(ctx, host)
+
+	answer = func(context.Context, string) (bool, string, error) {
+		return false, "", errors.New("context deadline exceeded")
+	}
+	status := func() string {
+		rows, err := db.Query(ctx, `SELECT status FROM host_health WHERE observer = ? AND target = ?`, "host-a", "host-b")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("query: rows=%d err=%v", len(rows), err)
+		}
+		return rows[0].String("status")
+	}
+	for i := 1; i < suspectThreshold; i++ {
+		c.checkHost(ctx, host)
+		if got := status(); got == "healthy" {
+			t.Fatalf("after %d unanswered probe(s) following unready, status = healthy; a silent peer is not live", i)
+		}
+	}
+	c.checkHost(ctx, host)
+	if got := status(); got != "suspect" {
+		t.Errorf("after %d unanswered probes, status = %q, want suspect", suspectThreshold, got)
+	}
+}

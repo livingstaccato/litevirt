@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -185,12 +187,9 @@ func TestPublishReplica_SyncsBeforeItIsPromotable(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("publishReplica: %v", err)
 	}
-	want := []string{
-		"." + filepath.Base(dst) + ".partial published=false", // the data, before the rename
-		filepath.Base(dir) + " published=true",                // the rename itself
-	}
-	if fmt.Sprint(order) != fmt.Sprint(want) {
-		t.Fatalf("sync order = %v, want %v", order, want)
+	if len(order) != 2 || !strings.HasSuffix(order[0], " published=false") ||
+		order[1] != filepath.Base(dir)+" published=true" {
+		t.Fatalf("sync order = %v, want the temp synced before the rename, then the directory", order)
 	}
 }
 
@@ -212,5 +211,35 @@ func TestPublishReplica_ASyncFailurePublishesNothing(t *testing.T) {
 	entries, _ := os.ReadDir(dir)
 	if len(entries) != 0 {
 		t.Errorf("left %d file(s) behind after a failed sync; want none", len(entries))
+	}
+}
+
+// A replica left half-written by a crash is swept like any other staging temp.
+//
+// The temp was `.<name>.partial`, which matches neither stagingTempPrefixes nor
+// the .tmp suffix, and the next run uses a new timestamp so it never overwrote
+// it either. Each crash mid-convert left a full-size disk image in the pool
+// that nothing ever removed — the leak sweepStaleStagingTemps exists for.
+func TestPublishReplica_ItsTempIsOneTheStagingSweepCollects(t *testing.T) {
+	dir := t.TempDir()
+	dst := filepath.Join(dir, "web-1-root-20260925T010000Z.qcow2")
+	var tmpName string
+	_ = publishReplica(context.Background(), dst, func(tmp string) error {
+		tmpName = filepath.Base(tmp)
+		if err := os.WriteFile(tmp, []byte("qcow2"), 0o600); err != nil {
+			return err
+		}
+		return errors.New("crash stand-in: the convert never finished")
+	})
+	// Re-create it where a crash would have left it, aged past the sweep's guard.
+	left := filepath.Join(dir, tmpName)
+	if err := os.WriteFile(left, []byte("half a disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	_ = os.Chtimes(left, old, old)
+
+	if n := sweepStaleStagingTemps(dir, time.Hour, time.Now()); n != 1 {
+		t.Fatalf("the staging sweep removed %d file(s); a crash-left replica temp %q must be collected", n, tmpName)
 	}
 }

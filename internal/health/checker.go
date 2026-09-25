@@ -381,6 +381,15 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		newFailures = 0
 	} else {
 		newFailures = prev.failures + 1
+		if result == probeUnreachable && prev.status == StatusUnready {
+			// Every unready probe before this one reached the peer and got an
+			// answer, so none of them is silence. The silence count starts
+			// here, and "suspect" — what fencing quorum counts — has to be
+			// earned with suspectThreshold unanswered probes in a row, as for
+			// any peer. Carrying the unready run over made one dropped packet
+			// after a long unready stretch fence-eligible on its own.
+			newFailures = 1
+		}
 		switch {
 		case result == probeNotReady:
 			// Recorded on the FIRST observation, unlike "suspect", which needs

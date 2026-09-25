@@ -89,6 +89,14 @@ type Client struct {
 	db   *sql.DB
 	mu   sync.RWMutex
 	list *memberlist.Memberlist
+	// stopMembership ends the gossip re-join loop and membershipDone closes
+	// once it has returned. Close waits on it before closing the database: the
+	// loop reads the hosts table and stamps the isolation condition, and a loop
+	// that outlived its client did both against a closed database — and against
+	// a data directory that may already be gone, which the monotonic-clock
+	// persistence answers by exiting the process. Nil when no loop was started.
+	stopMembership context.CancelFunc
+	membershipDone chan struct{}
 	// membersForTests overrides gossip membership. Test seam only: the gossip
 	// fallback in ResolvePeerTarget is what lets a node dial a peer whose hosts row
 	// has not replicated yet — the bootstrap case — and it had no test at all,
@@ -826,7 +834,12 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	// a membership that aged out across a long partition -- otherwise keeps an
 	// empty peer set for the life of the process, and anti-entropy cannot repair
 	// against a peer it never discovers. See maintainMembership.
-	go c.maintainMembership(context.Background(), cfg.JoinPeers, cfg.AdvertiseAddr)
+	mctx, stop := context.WithCancel(context.Background())
+	c.stopMembership, c.membershipDone = stop, make(chan struct{})
+	go func() {
+		defer close(c.membershipDone)
+		c.maintainMembership(mctx, cfg.JoinPeers, cfg.AdvertiseAddr)
+	}()
 
 	return c, nil
 }
@@ -864,6 +877,10 @@ func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 
 // Close leaves the gossip cluster and closes the database.
 func (c *Client) Close() error {
+	if c.stopMembership != nil {
+		c.stopMembership()
+		<-c.membershipDone
+	}
 	if c.list != nil {
 		c.list.Leave(5 * time.Second)
 		c.list.Shutdown()

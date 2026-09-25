@@ -206,6 +206,7 @@ const (
 	LiteVirt_DeleteStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
 	LiteVirt_PushReplicaIncrement_FullMethodName       = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
 	LiteVirt_Ping_FullMethodName                       = "/litevirt.v1.LiteVirt/Ping"
+	LiteVirt_Ready_FullMethodName                      = "/litevirt.v1.LiteVirt/Ready"
 	LiteVirt_ProvisionNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ProvisionNetwork"
 	LiteVirt_SyncVTEP_FullMethodName                   = "/litevirt.v1.LiteVirt/SyncVTEP"
 	LiteVirt_GetVMIPRemote_FullMethodName              = "/litevirt.v1.LiteVirt/GetVMIPRemote"
@@ -538,6 +539,9 @@ type LiteVirtClient interface {
 	PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error)
 	// ── Internal ──
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
+	// Application-level readiness — see ReadyResponse. Ping says the endpoint is
+	// up; Ready says the daemon can actually do something.
+	Ready(ctx context.Context, in *ReadyRequest, opts ...grpc.CallOption) (*ReadyResponse, error)
 	// ── Internal: Network Sync ──
 	ProvisionNetwork(ctx context.Context, in *ProvisionNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	SyncVTEP(ctx context.Context, in *SyncVTEPRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2781,6 +2785,16 @@ func (c *liteVirtClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc
 	return out, nil
 }
 
+func (c *liteVirtClient) Ready(ctx context.Context, in *ReadyRequest, opts ...grpc.CallOption) (*ReadyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReadyResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_Ready_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) ProvisionNetwork(ctx context.Context, in *ProvisionNetworkRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
@@ -3660,6 +3674,9 @@ type LiteVirtServer interface {
 	PushReplicaIncrement(grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]) error
 	// ── Internal ──
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
+	// Application-level readiness — see ReadyResponse. Ping says the endpoint is
+	// up; Ready says the daemon can actually do something.
+	Ready(context.Context, *ReadyRequest) (*ReadyResponse, error)
 	// ── Internal: Network Sync ──
 	ProvisionNetwork(context.Context, *ProvisionNetworkRequest) (*emptypb.Empty, error)
 	SyncVTEP(context.Context, *SyncVTEPRequest) (*emptypb.Empty, error)
@@ -4390,6 +4407,9 @@ func (UnimplementedLiteVirtServer) PushReplicaIncrement(grpc.ClientStreamingServ
 }
 func (UnimplementedLiteVirtServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
+}
+func (UnimplementedLiteVirtServer) Ready(context.Context, *ReadyRequest) (*ReadyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Ready not implemented")
 }
 func (UnimplementedLiteVirtServer) ProvisionNetwork(context.Context, *ProvisionNetworkRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ProvisionNetwork not implemented")
@@ -7681,6 +7701,24 @@ func _LiteVirt_Ping_Handler(srv interface{}, ctx context.Context, dec func(inter
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_Ready_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReadyRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).Ready(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_Ready_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).Ready(ctx, req.(*ReadyRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_ProvisionNetwork_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ProvisionNetworkRequest)
 	if err := dec(in); err != nil {
@@ -9309,6 +9347,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Ping",
 			Handler:    _LiteVirt_Ping_Handler,
+		},
+		{
+			MethodName: "Ready",
+			Handler:    _LiteVirt_Ready_Handler,
 		},
 		{
 			MethodName: "ProvisionNetwork",

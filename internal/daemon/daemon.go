@@ -925,7 +925,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// reachability, never stale replicated rows. Once this is set, the proof-table
 	// WAL gate (wired before repl.Start above) can positively confirm peers; until
 	// now PeerSupports failed closed, deferring proof entries rather than leaking.
-	d.checker.SetPeerPinger(svc.PeerCapabilities)
+	// Paired with the readiness probe, which turns the peer health check from a
+	// TLS handshake into an application-level question — see wirePeerProbes.
+	wirePeerProbes(d.checker, svc)
 	// Runtime ownership repair metrics (Phase 5): VM owner-assert + CT re-key
 	// outcomes → litevirt_runtime_owner_assert_total.
 	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()

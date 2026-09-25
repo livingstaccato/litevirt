@@ -79,6 +79,9 @@ type Checker struct {
 
 	// peerPinger fresh-Pings a peer for its capability tokens (SetPeerPinger).
 	peerPinger PeerPinger
+	// peerReady asks a peer whether it can serve, not merely whether it accepts
+	// a TLS connection (SetPeerReadiness). nil keeps the TLS-only probe.
+	peerReady PeerReadiness
 	// peerCaps caches each peer's advertised capabilities with a short TTL so the
 	// replicator can gate proof replication per-peer without a Ping storm.
 	peerCaps map[string]peerCapEntry
@@ -349,7 +352,8 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// probe would then fail and this healthy peer would be marked suspect and
 	// fenced — a config value silently becoming a fencing event.
 	addr := corrosion.PeerTarget(host.Address, host.GRPCPort)
-	healthy := c.probe(addr)
+	result := c.probeHost(ctx, host.Name, addr)
+	healthy := result == probeReady
 
 	c.mu.Lock()
 	prev, exists := c.peers[host.Name]
@@ -377,9 +381,21 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		newFailures = 0
 	} else {
 		newFailures = prev.failures + 1
-		if newFailures >= suspectThreshold {
+		switch {
+		case result == probeNotReady:
+			// Recorded on the FIRST observation, unlike "suspect", which needs
+			// suspectThreshold consecutive misses. The threshold exists because
+			// silence is ambiguous — one dropped packet must not fence a live
+			// host — and because "suspect" is the verdict fencing quorum counts.
+			// An unready answer is neither: it is the peer's own statement about
+			// itself, delivered over a connection that plainly works, and it
+			// licenses no destructive action. Waiting three ticks to write down
+			// something the peer already told us only delays the operator's view
+			// of it.
+			newStatus = StatusUnready
+		case newFailures >= suspectThreshold:
 			newStatus = "suspect"
-		} else {
+		default:
 			newStatus = "healthy"
 		}
 	}

@@ -137,6 +137,7 @@ func (s *Server) SetRBACRealm(on bool) { s.rbacRealm = on }
 // skipAuth lists RPC methods that bypass authentication.
 var skipAuth = map[string]bool{
 	"/litevirt.v1.LiteVirt/Ping":       true,
+	"/litevirt.v1.LiteVirt/Ready":      true,
 	"/litevirt.v1.LiteVirt/Login":      true,
 	"/litevirt.v1.LiteVirt/ListRealms": true,
 	// WebAuthn login is pre-session (passwordless): the caller has no bearer

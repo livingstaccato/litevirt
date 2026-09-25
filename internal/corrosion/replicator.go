@@ -3760,3 +3760,17 @@ func insertRowFromShape(sh StmtShape, s Statement) (cols []string, vals []interf
 	}
 	return sh.InsertCols, vals, true
 }
+
+// Targets names the peers this node is currently pushing to — one per running
+// per-peer push loop, including a peer whose pushes are failing. The metrics
+// collector reads it so the backlog gauges keep counting a peer that has
+// stopped acknowledging, whose watermark row has stopped moving.
+func (r *Replicator) Targets() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.peers))
+	for name := range r.peers {
+		out = append(out, name)
+	}
+	return out
+}

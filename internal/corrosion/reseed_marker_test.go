@@ -103,10 +103,7 @@ func TestReseedMarker_FinishClears(t *testing.T) {
 // A fresh node has never reseeded and must serve normally.
 func TestReseedMarker_AbsentOnAFreshNode(t *testing.T) {
 	ctx := context.Background()
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -170,10 +167,7 @@ func TestReseedMarker_IsNotReplicated(t *testing.T) {
 // before the discard must still be there after it.
 func TestReseedMarker_SurvivesTheDiscardItGuards(t *testing.T) {
 	ctx := context.Background()
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

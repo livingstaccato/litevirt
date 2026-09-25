@@ -10,10 +10,7 @@ import (
 
 func shadowTestDB(t *testing.T) *corrosion.Client {
 	t.Helper()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

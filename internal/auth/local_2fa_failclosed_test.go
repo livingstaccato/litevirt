@@ -20,10 +20,7 @@ import (
 // from it must reach the caller rather than being folded into "no factors".
 func TestLocalRealm_A2FAReadThatFailsDeniesRatherThanDowngrades(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -55,10 +52,7 @@ func TestLocalRealm_A2FAReadThatFailsDeniesRatherThanDowngrades(t *testing.T) {
 // authenticates and is not asked for one.
 func TestLocalRealm_NoEnrolledFactorStillAuthenticates(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -89,10 +83,7 @@ func TestLocalRealm_NoEnrolledFactorStillAuthenticates(t *testing.T) {
 // clears it; while it is set, this must refuse rather than downgrade.
 func TestLocalRealm_UnhydratedCredentialsRefuse(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

@@ -31,10 +31,7 @@ func (c *unreadableStackCleaner) ExternalNetworkNames(context.Context, string) (
 // external is unknown: the reconciler deprovisions none, and keeps the stack
 // in "deleting" rather than tombstoning it with its networks unaccounted for.
 func TestStackReconciler_UnreadableStoredComposeKeepsNetworksAndStack(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatal(err)

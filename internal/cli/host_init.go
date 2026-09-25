@@ -137,7 +137,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 		return fmt.Errorf("push setup script: %w", err)
 	}
 
-	if err := sc.Run(fmt.Sprintf("HOST_NAME=%s bash /tmp/litevirt-setup.sh", hostName)); err != nil {
+	if err := sc.Run(remoteInitSetupCommand(hostName, hostAddr)); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -661,9 +661,21 @@ func resolveHost(host string) (string, error) {
 // setupScriptEnv is the environment the setup script reads to write the daemon
 // config. One place, so the local and remote paths cannot disagree about it —
 // they already had, which is how the local path shipped with no advertise_address.
-// localInitJoinPeers is the JOIN_PEERS value `lv host init` hands the setup
-// script: an empty YAML list, because the local host is starting a cluster and
-// has nobody to join.
+// remoteInitSetupCommand is the command `lv host init root@<ip>` runs on the
+// new host: the same environment --local and `add` hand the script.
+//
+// It used to pass HOST_NAME alone. The remote form is the one to use for any
+// multi-node cluster — --local bakes a 127.0.0.1-only certificate SAN — so the
+// documented way to start a real cluster wrote no enforcement block (both
+// fence guards off) and let the daemon auto-detect its advertise address.
+func remoteInitSetupCommand(hostName, hostAddr string) string {
+	return strings.Join(setupScriptEnv(hostName, hostAddr, localInitJoinPeers), " ") +
+		" bash /tmp/litevirt-setup.sh"
+}
+
+// localInitJoinPeers is the JOIN_PEERS value both forms of `lv host init` hand
+// the setup script: an empty YAML list, because the host is starting a cluster
+// and has nobody to join.
 const localInitJoinPeers = "[]"
 
 func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {

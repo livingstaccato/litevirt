@@ -50,7 +50,7 @@ func useConfig(t *testing.T, body string) {
 func TestSetupScriptEnv_NewClusterDefaultsFenceSafetyOn(t *testing.T) {
 	useConfig(t, "")
 
-	// localInitJoinPeers is exactly what HostInit passes. The first version of
+	// localInitJoinPeers is exactly what both init forms pass. The first version of
 	// this test passed "" — a value no caller ever sends — and stayed green
 	// while `lv host init` still wrote no enforcement block at all.
 	block := enforcementBlockFor(t, setupScriptEnv("node-1", "10.0.0.1", localInitJoinPeers))
@@ -95,5 +95,37 @@ func TestSetupScriptEnv_JoiningANonEnforcingClusterInventsNothing(t *testing.T) 
 
 	if block != "" {
 		t.Errorf("a joining host was handed an enforcement block its cluster does not have:\n%s", block)
+	}
+}
+
+// The remote form of `lv host init` gets the new-cluster defaults too.
+//
+// It is the form this repo recommends for anything multi-node (--local bakes a
+// 127.0.0.1-only certificate SAN), and it ran the setup script with HOST_NAME
+// alone: no ENFORCEMENT_B64 and no ADVERTISE_ADDRESS. Only --local got the safe
+// fence defaults, so the documented way to start a real cluster still started
+// it with both switched off.
+func TestRemoteInitSetupCommand_CarriesTheNewClusterDefaults(t *testing.T) {
+	useConfig(t, "")
+
+	cmd := remoteInitSetupCommand("node-1", "10.0.0.1")
+
+	var env []string
+	for _, f := range strings.Fields(cmd) {
+		if strings.Contains(f, "=") {
+			env = append(env, f)
+		}
+	}
+	block := enforcementBlockFor(t, env)
+	for _, want := range []string{"safe_fence_default: true", "shared_storage_fence: true"} {
+		if !strings.Contains(block, want) {
+			t.Errorf("remote init's enforcement block is missing %q; got:\n%s", want, block)
+		}
+	}
+	if !strings.Contains(cmd, "ADVERTISE_ADDRESS=10.0.0.1") {
+		t.Errorf("remote init does not pass the address it put in the certificate SAN: %q", cmd)
+	}
+	if !strings.HasSuffix(cmd, "bash /tmp/litevirt-setup.sh") {
+		t.Errorf("remote init command no longer runs the setup script: %q", cmd)
 	}
 }

@@ -179,8 +179,8 @@ func TestCheckHost_UnreadyAnswersDoNotCountTowardSuspect(t *testing.T) {
 // off a host that is answering. The only way no build's query can count them
 // is for the row never to carry the count.
 //
-// The row is still rewritten on every unready probe, as it was while the count
-// climbed, so its updated_at stays as fresh as a failing row's.
+// How often the unchanged row is re-published is pinned separately, by
+// TestCheckHost_UnreadyRewritesAreRateLimited.
 func TestCheckHost_AnUnreadyStreakNeverReachesTheFenceThreshold(t *testing.T) {
 	db := testCheckHostDB(t)
 	ctx := context.Background()
@@ -188,11 +188,6 @@ func TestCheckHost_AnUnreadyStreakNeverReachesTheFenceThreshold(t *testing.T) {
 	c.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) {
 		return false, "database read timed out", nil
 	})
-	writes := 0
-	c.writeFn = func(ctx context.Context, q string, args ...interface{}) error {
-		writes++
-		return db.Execute(ctx, q, args...)
-	}
 	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
 
 	const probes = 4 * FailuresToFence
@@ -212,9 +207,6 @@ func TestCheckHost_AnUnreadyStreakNeverReachesTheFenceThreshold(t *testing.T) {
 				"fence threshold (%d) an older-build leader counts without looking at status",
 				i+1, got, FailuresToFence)
 		}
-	}
-	if writes != probes {
-		t.Errorf("%d writes over %d unready probes, want one per probe — the row went stale", writes, probes)
 	}
 }
 

@@ -143,23 +143,25 @@ func TestCheckHost_ActiveHostIsNotHeartbeated(t *testing.T) {
 func TestShouldPersistHealth_Table(t *testing.T) {
 	long := 2 * HeartbeatInterval
 	cases := []struct {
-		name                      string
-		changed, healthy, pending bool
-		since                     time.Duration
-		want                      bool
+		name                               string
+		changed, healthy, unready, pending bool
+		since                              time.Duration
+		want                               bool
 	}{
-		{"a transition always writes", true, true, false, 0, true},
-		{"a transition writes even for an active host", true, false, false, 0, true},
-		{"unchanged active host: never", false, true, false, long, false},
-		{"unchanged pending host inside the interval", false, true, true, 0, false},
-		{"unchanged pending host past the interval", false, true, true, long, true},
-		{"unchanged UNHEALTHY pending host is not restamped", false, false, true, long, false},
+		{"a transition always writes", true, true, false, false, 0, true},
+		{"a transition writes even for an active host", true, false, false, false, 0, true},
+		{"unchanged active host: never", false, true, false, false, long, false},
+		{"unchanged pending host inside the interval", false, true, false, true, 0, false},
+		{"unchanged pending host past the interval", false, true, false, true, long, true},
+		{"unchanged UNHEALTHY pending host is not restamped", false, false, false, true, long, false},
+		{"unchanged unready answer inside the interval", false, false, true, false, 0, false},
+		{"unchanged unready answer past the interval, active host", false, false, true, false, long, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldPersistHealth(tc.changed, tc.healthy, tc.pending, tc.since); got != tc.want {
-				t.Errorf("shouldPersistHealth(%v,%v,%v,%v) = %v, want %v",
-					tc.changed, tc.healthy, tc.pending, tc.since, got, tc.want)
+			if got := shouldPersistHealth(tc.changed, tc.healthy, tc.unready, tc.pending, tc.since); got != tc.want {
+				t.Errorf("shouldPersistHealth(%v,%v,%v,%v,%v) = %v, want %v",
+					tc.changed, tc.healthy, tc.unready, tc.pending, tc.since, got, tc.want)
 			}
 		})
 	}

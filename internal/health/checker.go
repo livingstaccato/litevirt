@@ -386,11 +386,23 @@ func recoveryPending(state string) bool {
 //
 // That asymmetry — failing rows self-refresh, healthy ones do not — is why the
 // bug only ever showed up on the recovery path.
-func shouldPersistHealth(changed, healthy, recoveryPending bool, sinceLastWrite time.Duration) bool {
+//
+// An unready ANSWER gets the same heartbeat, whatever the host's state. Its
+// stored count is pinned (see checkHost), so an unready run changes nothing
+// after its first probe and would otherwise be written once and go stale. It
+// used to be rewritten on every probe instead — ~1,800 replicated writes per
+// observer per hour while a peer's store stayed wedged. Nothing reads
+// unready-row freshness more tightly than HeartbeatInterval: the fence and
+// confirmation quorums exclude unready rows outright, and the dual-run
+// detector's last-alive evidence tolerates deadHostSkewMargin (minutes).
+func shouldPersistHealth(changed, healthy, answeredUnready, recoveryPending bool, sinceLastWrite time.Duration) bool {
 	if changed {
 		return true
 	}
-	return healthy && recoveryPending && HeartbeatInterval > 0 && sinceLastWrite >= HeartbeatInterval
+	if HeartbeatInterval <= 0 || sinceLastWrite < HeartbeatInterval {
+		return false
+	}
+	return answeredUnready || (healthy && recoveryPending)
 }
 
 func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
@@ -499,10 +511,10 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		}
 	}
 
-	// An unready verdict is republished on every probe, as it was while its
-	// count still climbed: the count is pinned now, and without this the row
-	// would be written once and go stale while the peer kept answering.
-	changed := !exists || newStatus != prev.status || newFailures != prev.failures || newStatus == StatusUnready
+	// An unchanged unready verdict is not a change. Its count is pinned, so it
+	// is kept fresh by the HeartbeatInterval re-publish in shouldPersistHealth
+	// rather than by a replicated write on every probe.
+	changed := !exists || newStatus != prev.status || newFailures != prev.failures
 	prev.answeredUnready = result == probeNotReady
 	prev.status = newStatus
 	prev.failures = newFailures
@@ -520,7 +532,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	} else {
 		sinceWrite = HeartbeatInterval // never written: the first probe publishes
 	}
-	write := shouldPersistHealth(changed, healthy, recoveryPending(host.State), sinceWrite)
+	write := shouldPersistHealth(changed, healthy, result == probeNotReady, recoveryPending(host.State), sinceWrite)
 	c.mu.Unlock()
 
 	if !write {

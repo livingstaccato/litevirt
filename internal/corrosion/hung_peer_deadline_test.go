@@ -42,7 +42,7 @@ func (p *fakePeer) PushMutations(ctx context.Context, _ *pb.ReplicateRequest) (*
 
 // startFakePeer serves p over mTLS on 127.0.0.1 and registers it in c's hosts
 // table under name, so the production dial path resolves and reaches it.
-func startFakePeer(t *testing.T, c *Client, pkiDir, name string, p *fakePeer) {
+func startFakePeer(t *testing.T, c *Client, pkiDir, name string, p pb.LiteVirtServer) {
 	t.Helper()
 	tlsCfg, err := pki.ServerTLSConfig(pkiDir)
 	if err != nil {

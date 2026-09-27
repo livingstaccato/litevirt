@@ -6,6 +6,47 @@ import (
 	"testing"
 )
 
+// VoterSet is both halves of every quorum count (colonelpanik/litevirt#251):
+// a host is a voter iff it is not deleted and its state is VotingEligible.
+// Witnesses, draining and upgrading hosts vote; offline, maintenance and
+// fenced hosts do not; a deleted host never does, whatever its state says.
+func TestVoterSet(t *testing.T) {
+	c := testClient(t)
+	ctx := context.Background()
+	for _, h := range []HostRecord{
+		{Name: "active", State: "active"},
+		{Name: "witness", State: "active", Role: "witness"},
+		{Name: "draining", State: "draining"},
+		{Name: "upgrading", State: "upgrading"},
+		{Name: "offline", State: "offline"},
+		{Name: "maintenance", State: "maintenance"},
+		{Name: "fenced", State: "fenced"},
+		{Name: "deleted", State: "active"},
+	} {
+		h.Address, h.SSHUser, h.SSHPort, h.GRPCPort = "10.0.0.1", "root", 22, 7443
+		if err := InsertHost(ctx, c, h); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.Name, err)
+		}
+	}
+	if err := DeleteHost(ctx, c, "deleted"); err != nil {
+		t.Fatalf("DeleteHost: %v", err)
+	}
+
+	voters, err := VoterSet(ctx, c)
+	if err != nil {
+		t.Fatalf("VoterSet: %v", err)
+	}
+	want := map[string]bool{"active": true, "witness": true, "draining": true, "upgrading": true}
+	if len(voters) != len(want) {
+		t.Errorf("VoterSet = %v, want exactly %v", voters, want)
+	}
+	for name := range want {
+		if !voters[name] {
+			t.Errorf("%s must be a voter; VoterSet = %v", name, voters)
+		}
+	}
+}
+
 func TestInsertAndGetHost(t *testing.T) {
 	c := testClient(t)
 	ctx := context.Background()

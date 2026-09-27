@@ -39,6 +39,7 @@ func TestCoordinator_RefenceAfterRecovery(t *testing.T) {
 
 	failing := func() {
 		for _, obs := range []string{"coordinator", "good"} {
+			ensureVoter(t, db, obs)
 			if err := db.Execute(ctx,
 				`INSERT OR REPLACE INTO host_health
 				 (observer, target, status, consecutive_failures, last_seen, updated_at)

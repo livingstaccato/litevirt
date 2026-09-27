@@ -141,6 +141,7 @@ func TestConfirmationResume_AHostThatCameBackIsNotResumed(t *testing.T) {
 
 	operatorConfirms(t, db, ctx, "down")
 	for _, o := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, o)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, 'down', 'healthy', 0, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`, o); err != nil {

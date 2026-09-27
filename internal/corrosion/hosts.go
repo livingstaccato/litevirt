@@ -242,6 +242,38 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 	return hosts, nil
 }
 
+// VotingEligible is the one definition of a voting member's state: a host
+// votes iff its state is not offline, maintenance or fenced. Witnesses vote;
+// draining and upgrading hosts vote. health.VotingEligible and the failover
+// coordinator's quorum both come from here, so the self-count, the quorum
+// denominator and the set of observers whose rows count cannot drift apart.
+func VotingEligible(state string) bool {
+	switch state {
+	case "offline", "maintenance", "fenced":
+		return false
+	}
+	return true
+}
+
+// VoterSet returns the names of the cluster's voting members: hosts that are
+// not deleted and whose state is VotingEligible. It is both halves of every
+// quorum count: its size is the denominator, and an observation counts toward
+// the numerator only if its observer is a member (colonelpanik/litevirt#251).
+// A read error is returned as-is; callers fail closed on it.
+func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
+	rows, err := c.Query(ctx, `SELECT name, state FROM hosts WHERE deleted_at IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	voters := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if VotingEligible(r.String("state")) {
+			voters[r.String("name")] = true
+		}
+	}
+	return voters, nil
+}
+
 // GetHost returns a single host by name.
 func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 	rows, err := c.Query(ctx,

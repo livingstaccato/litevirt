@@ -31,6 +31,7 @@ func seedFenceQuorum(t *testing.T, status string) (*Coordinator, *corrosion.Clie
 
 	fresh := time.Now().UTC().Format(time.RFC3339)
 	for _, obs := range []string{"coordinator", "good"} {
+		ensureVoter(t, db, obs)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)

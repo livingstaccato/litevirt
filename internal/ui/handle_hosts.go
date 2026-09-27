@@ -122,12 +122,18 @@ func (s *Server) handleHostDetail(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDrainHost(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	// Detached: the drain must outlive this request (#192). The first frame
-	// confirms the daemon accepted it, so a refusal is reported here.
+	// confirms the daemon accepted it, so a refusal is reported here — but it
+	// comes only after the first VM is drained, so the wait for it is bounded
+	// and a drain still quiet after drainAckTimeout is reported started.
 	ctx, cancel := detachedOpContext(s.uiBearerCtx(r))
 	stream, err := s.grpc.DrainHost(ctx, &pb.DrainHostRequest{Name: name})
-	if err == nil {
-		_, err = stream.Recv()
+	if err != nil {
+		cancel()
+		sendToast(w, "Drain failed: "+err.Error(), "error")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
+	err, timedOut, rest := firstOrDetach(func() error { _, rerr := stream.Recv(); return rerr }, drainAckTimeout)
 	if err != nil && !errors.Is(err, io.EOF) {
 		cancel()
 		sendToast(w, "Drain failed: "+err.Error(), "error")
@@ -135,11 +141,15 @@ func (s *Server) handleDrainHost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err == nil {
-		drainInBackground("drain host "+name, cancel, func() error { _, rerr := stream.Recv(); return rerr })
+		drainInBackground("drain host "+name, cancel, rest)
 	} else {
 		cancel() // the stream already ended
 	}
-	sendToast(w, "Drain started for "+name, "success")
+	msg := "Drain started for " + name
+	if timedOut {
+		msg += " (no progress reported yet)"
+	}
+	sendToast(w, msg, "success")
 	w.WriteHeader(http.StatusOK)
 }
 

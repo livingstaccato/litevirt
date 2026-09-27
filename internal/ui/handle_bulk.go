@@ -175,16 +175,20 @@ func (s *Server) handleBulkHosts(w http.ResponseWriter, r *http.Request) {
 				cancel()
 				return err
 			}
-			// Consume one message to confirm the stream opened cleanly, then
-			// keep reading so the drain runs to its end.
-			if _, err = stream.Recv(); err != nil {
+			// Wait for one message to confirm the stream opened cleanly, then
+			// keep reading so the drain runs to its end. The first message
+			// comes only after the first VM is drained, so the wait is
+			// bounded: a slot is held for drainAckTimeout at most, not for a
+			// whole migration per host.
+			err, _, rest := firstOrDetach(func() error { _, rerr := stream.Recv(); return rerr }, drainAckTimeout)
+			if err != nil {
 				cancel()
 				if errors.Is(err, io.EOF) {
 					return nil
 				}
 				return err
 			}
-			drainInBackground("drain host "+name, cancel, func() error { _, rerr := stream.Recv(); return rerr })
+			drainInBackground("drain host "+name, cancel, rest)
 			return nil
 		}
 	case "undrain":

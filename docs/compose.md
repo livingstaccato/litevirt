@@ -623,7 +623,7 @@ A field the file does not have — in a healthcheck or anywhere else: the top le
   - stack.yaml:9:7: vms.db.healthcheck: unknown field "retires" — did you mean "retries"?
 ```
 
-Keys starting `x-` (extension fields, free for your own use, at the top level or inside any block) and YAML merge keys (`<<: *anchor`) are allowed; the keys an anchor merges in are checked like any other. The shorthand forms stay valid: a disk as `root: 20G`, memory as `4G`, `depends-on` as a list.
+Keys starting `x-` (extension fields, free for your own use, at the top level or inside any block) and YAML merge keys (`<<: *anchor`) are allowed; the keys an anchor merges in are checked like any other. A file whose aliases expand it past what can be checked — an anchor reused inside another anchor, over and over, so a few kilobytes stand for millions of nodes — is refused as a whole (`document contains excessive aliasing`, or `the file expands to too many nodes to check`), before any of it is deployed. The shorthand forms stay valid: a disk as `root: 20G`, memory as `4G`, `depends-on` as a list.
 
 `interval` and `timeout` are durations with a unit (`"10s"`, `"1m"`) greater than zero; a `timeout` must not exceed the `interval` (written, or its default), since a probe must finish before the next is due; and `retries`, when written, is at least `1`. A field that is left out takes its default:
 

@@ -36,18 +36,35 @@ type parseOpts struct {
 	stored bool
 }
 
+// maxFieldVisits bounds the nodes the unknown-field check visits. The check
+// follows aliases and merge keys, so a few kilobytes of YAML can expand to
+// millions of nodes (an alias of a list of aliases of a map of aliases…), and
+// it runs before the decoder, whose own excessive-aliasing guard would
+// otherwise be the first thing to stop it. A file that needs more visits than
+// this is refused, not half-checked; no real compose file comes near it.
+const maxFieldVisits = maxIndexNodes
+
 // checkFileFields reports every unknown field in the file.
 func (v *validator) checkFileFields(root *yaml.Node) {
 	v.checkFields(root, reflect.TypeOf(File{}), "", 0)
+	if v.fieldBudgetHit {
+		v.ps.add("", fmt.Sprintf("the file expands to too many nodes to check (more than %d once its aliases and merge keys are followed)", maxFieldVisits),
+			"an anchor used inside another anchor multiplies: write the repeated parts out, or reuse fewer levels")
+	}
 }
 
 // checkFields reports every key of mapping n that struct type t has no field
 // for, and recurses into the fields it does have.
 func (v *validator) checkFields(n *yaml.Node, t reflect.Type, path string, depth int) {
 	n = resolveAlias(n)
-	if n == nil || depth > 32 {
+	if n == nil || depth > 32 || v.fieldBudgetHit {
 		return
 	}
+	if v.fieldVisits >= maxFieldVisits {
+		v.fieldBudgetHit = true
+		return
+	}
+	v.fieldVisits++
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}

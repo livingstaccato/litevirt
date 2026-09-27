@@ -44,18 +44,39 @@ func parseWith(data []byte, opts parseOpts) (*File, error) {
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("parse compose YAML: %w", err)
 	}
-	v := &validator{ps: problems{idx: indexNodes(&doc)}, origin: map[string]string{}}
+	root := documentRoot(&doc)
 
+	// Decode before anything walks the tree. Aliases and merge keys can make a
+	// few kilobytes expand to millions of nodes, and the decoder is what
+	// refuses a document that does ("excessive aliasing") — cheaply, before it
+	// has expanded much. Nothing else that follows aliases runs on a document
+	// it refused that way; the walks keep budgets of their own for shapes
+	// below its threshold. (Any other decode error is reported below, beside
+	// the unknown fields.)
 	var f File
-	if root := documentRoot(&doc); root != nil {
+	var decodeErr error
+	if root != nil {
+		decodeErr = root.Decode(&f)
+		if decodeErr != nil && strings.Contains(decodeErr.Error(), "excessive aliasing") {
+			v := &validator{ps: problems{}}
+			v.decodeError(decodeErr)
+			return nil, v.ps.err()
+		}
+	}
+
+	v := &validator{ps: problems{idx: indexNodes(&doc)}, origin: map[string]string{}}
+	if root != nil {
 		if !opts.stored {
 			v.checkFileFields(root)
 		}
-		if err := root.Decode(&f); err != nil {
+		if decodeErr != nil {
 			// A field that did not decode leaves the file half-read;
 			// checking the rest would report the gaps as problems of
 			// their own.
-			v.decodeError(err)
+			v.decodeError(decodeErr)
+			return nil, v.ps.err()
+		}
+		if v.fieldBudgetHit {
 			return nil, v.ps.err()
 		}
 	}
@@ -91,6 +112,10 @@ type validator struct {
 	// origin is the map each workload was written under: "vms" or
 	// "workloads" (which the parser folds into VMs).
 	origin map[string]string
+	// fieldVisits counts the nodes checkFields has visited, up to
+	// maxFieldVisits; fieldBudgetHit is set once it would go past it.
+	fieldVisits    int
+	fieldBudgetHit bool
 }
 
 // vm is the path of the workload called name.

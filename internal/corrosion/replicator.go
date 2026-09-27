@@ -1360,6 +1360,10 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 					"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
 				return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 			}
+			// A row this statement created may be one an earlier update
+			// is parked on. Replayed here, inside the batch, so the rest of
+			// the batch applies on top of it. See parked_updates.go.
+			r.replayParked(ctx, tx, s)
 		}
 
 	}
@@ -1713,7 +1717,18 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		return execErr
 
-	case DispPlainInsert, DispExplicitUpsert, DispFullPKUpdate:
+	case DispFullPKUpdate:
+		if err := r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC); err != nil {
+			return err
+		}
+		// An update that reached this node ahead of its row: hold it for the
+		// row's INSERT rather than let it be marked seen and lost here.
+		if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {
+			r.client.deferAfterCommit(tx, park)
+		}
+		return nil
+
+	case DispPlainInsert, DispExplicitUpsert:
 		return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 	}
 	return invalidf("unhandled disposition %q for %s", disp, tableName)

@@ -251,6 +251,11 @@ type Client struct {
 	txEffectsMu sync.Mutex
 	txEffects   map[*sql.Tx][]func()
 
+	// parked holds LWW updates that met no row because the row had not
+	// arrived yet, for the WAL apply path to replay when it does. See
+	// parked_updates.go.
+	parked parkedUpdates
+
 	// hlcSkewGuard, when non-nil and returning true, enables LWW skew quarantine:
 	// an incoming row whose updated_at is beyond hlc.MaxSkewMS into the
 	// future (relative to local wall clock) is NOT allowed to win a conflict —
@@ -1036,6 +1041,7 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		return false, nil
 	}
 	var mutated []Statement
+	var parks []func() // see executeBatchInternal
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
 		if s.Guard != nil {
@@ -1066,6 +1072,11 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		if n, e := res.RowsAffected(); e == nil && n > 0 {
 			changed = true
 			mutated = append(mutated, s)
+		}
+		if !changed {
+			if park := c.parkIfRowAbsent(ctx, tx, s, ""); park != nil {
+				parks = append(parks, park)
+			}
 		}
 		if relayStatement(s, changed) {
 			relay = append(relay, s)
@@ -1098,6 +1109,9 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		return false, fmt.Errorf("commit: %w", err)
 	}
 	c.mu.Unlock()
+	for _, park := range parks {
+		park()
+	}
 
 	if c.anyUnresolved() {
 		for _, s := range mutated {
@@ -1134,6 +1148,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 
 	var affected int64
 	var mutated []Statement // statements that changed ≥1 row (for unresolved-clear)
+	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
 		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
@@ -1148,6 +1163,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			if n > 0 {
 				changed = true
 				mutated = append(mutated, s)
+			}
+		}
+		if !changed {
+			if park := c.parkIfRowAbsent(ctx, tx, s, ""); park != nil {
+				parks = append(parks, park)
 			}
 		}
 		if relayStatement(s, changed) {
@@ -1183,6 +1203,9 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		return 0, fmt.Errorf("commit: %w", err)
 	}
 	c.mu.Unlock()
+	for _, park := range parks {
+		park()
+	}
 
 	// A local write that actually CHANGED a row clears any stale unresolved-tie
 	// tracking for that PK — the remediation path (e.g. repair-owner's

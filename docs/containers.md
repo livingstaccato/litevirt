@@ -330,7 +330,11 @@ reality, so `lv ct ls` and the detail view never disagree.
 
 A container that has been created and never started has not stopped, so the
 restart policy does not apply to it: it stays stopped until `lv ct start` (or
-the start `lv compose up` makes right after the create). The reconciler also
+the start `lv compose up` makes right after the create). The same holds for a
+container made by `lv ct clone` or `lv ct restore` without starting it: it keeps
+the restart policy it was made with, but stays stopped until it is started (a
+restore of a backup taken of a stopped container keeps that container's stop
+intent instead). The reconciler also
 takes the same per-container lock as `lv ct create`, `start`, `stop` and `rm`
 on that host, and reads the row again once it holds it, so a sweep never acts
 on a container while one of those is changing it — a `lv ct stop` that lands

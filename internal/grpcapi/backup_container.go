@@ -892,9 +892,17 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// treats it as an out-of-band stop, restarting a CT the operator had stopped.
 	// When we DO start it, leave the detail empty (a successful start clears it; a
 	// failed start must not inherit a stale stop intent).
+	//
+	// Not started and no stop intent to carry (the source was running when it was
+	// backed up): the restored container has never run HERE, so it lands as
+	// created — otherwise its restored restart policy would start it on the next
+	// sweep, a start nobody asked for.
 	stateDetail := ""
 	if !req.Start {
 		stateDetail = spec.StateDetail
+		if stateDetail == "" {
+			stateDetail = corrosion.ContainerCreatedDetail
+		}
 	}
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Name, State: "stopped", StateDetail: stateDetail,

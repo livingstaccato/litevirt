@@ -244,6 +244,27 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 const cloudInitKeptWarning = "cloud-init is no longer in the file; the VM keeps the cloud-init it was created with " +
 	"(it ran at first boot and removing it changes nothing in the guest — only a new VM starts without it)"
 
+// EffectiveUpdate is the update strategy a workload instance is updated with:
+// its own `update:` block, else the stack default (the first VM, by compose
+// name, with an `update:` block), else recreate. The planner and the executor
+// both read it here, so they cannot pick different defaults.
+func EffectiveUpdate(f *File, instance string) UpdateDef {
+	if def, _ := FindVMDef(f, instance); def != nil && def.Update != nil {
+		return *def.Update
+	}
+	names := make([]string, 0, len(f.VMs))
+	for n := range f.VMs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if u := f.VMs[n].Update; u != nil {
+			return *u
+		}
+	}
+	return UpdateDef{Strategy: "recreate"}
+}
+
 // Summary returns a human-readable one-line summary of the plan.
 func (p *Plan) Summary() string {
 	var creates, updates, deletes, nochange int

@@ -16,7 +16,8 @@
 //
 // The in-place strategy is LIVE-OR-FAIL: it applies live cpu/mem resizes and
 // live-metadata patches, and REFUSES (without deleting anything) any change that
-// needs a restart or a recreate.
+// needs a restart or a recreate. The one restart it makes is a repair of a VM a
+// previous deploy left half-made, which every strategy makes.
 package rolling
 
 import (
@@ -50,6 +51,9 @@ type VMAction struct {
 	// kept: its stored spec is unreadable, or a previous deploy left it
 	// half-made, or the change is not reconfigurable in place).
 	ForceRecreate bool
+	// RecreateReason is why the planner decided the VM cannot be kept (the
+	// planner's VMAction.RecreateReason), for the errors that name it.
+	RecreateReason string
 	// Repair routes a VM a previous deploy left half-made through
 	// ReconfigureVM (redefine over its existing disks, then start) whatever
 	// its Plan says — never through a replacement.
@@ -133,7 +137,20 @@ func Run(ctx context.Context, ops Ops, stackName string, actions []VMAction, pro
 		var err error
 		switch strategy {
 		case "in-place":
-			err = inPlace(ctx, ops, g.actions, emit)
+			// A repair of a VM a previous deploy left half-made is not a
+			// live-change question: it keeps the VM (redefined over its
+			// disks, then started) under every strategy, in-place too.
+			var rest []VMAction
+			for _, a := range g.actions {
+				if a.Repair {
+					if err := keepVM(ctx, ops, a, g.ud, emit); err != nil {
+						return err
+					}
+					continue
+				}
+				rest = append(rest, a)
+			}
+			err = inPlace(ctx, ops, rest, emit)
 		case "all-at-once":
 			err = allAtOnce(ctx, ops, g.actions, emit)
 		case "blue-green":
@@ -266,7 +283,7 @@ func inPlace(ctx context.Context, ops Ops, actions []VMAction, emit func(Progres
 			return err
 		case compose.ActionRecreate:
 			err := fmt.Errorf("in-place update of %s needs a recreate (%s); use the `recreate` strategy — in-place never deletes a VM",
-				a.Name, firstReason(a.Plan.RecreateReasons))
+				a.Name, a.recreateReason())
 			emit(Progress{VMName: a.Name, Phase: "error", Detail: err.Error(), Err: err})
 			return err
 		}
@@ -281,6 +298,15 @@ func metadataFields(p compose.ChangePlan) []string {
 		fields = append(fields, d.Field)
 	}
 	return fields
+}
+
+// recreateReason is why the action needs a new VM: the planner's reason when
+// it decided so, else the first recreate-class change in the plan.
+func (a VMAction) recreateReason() string {
+	if a.RecreateReason != "" {
+		return a.RecreateReason
+	}
+	return firstReason(a.Plan.RecreateReasons)
 }
 
 func firstReason(reasons []string) string {

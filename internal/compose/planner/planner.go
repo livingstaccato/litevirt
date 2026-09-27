@@ -160,6 +160,29 @@ func updateMechanism(op compose.Op, a VMAction, haveStoredSpec, hasDisks bool) (
 	}
 }
 
+// inPlaceRefusal is why a VM update planned under the in-place strategy cannot
+// be carried out, or nil. In-place never restarts or deletes a VM, so an
+// update whose mechanism is a restart or a recreate is refused here, when the
+// plan is made — the plan would otherwise say "restart — …" or "recreate —
+// disks are replaced" and the executor refuse it partway through the deploy.
+// A repair of a half-made VM is not refused: every strategy repairs.
+// Containers are recreated by their own path, whatever the strategy.
+func inPlaceRefusal(f *compose.File, a VMAction) error {
+	if a.IsContainer || a.Repair || compose.EffectiveUpdate(f, a.VMName).Strategy != "in-place" {
+		return nil
+	}
+	switch a.Apply {
+	case compose.ActionRecreate:
+		return fmt.Errorf("%s: the in-place strategy never deletes a VM, and this update needs a recreate (%s); "+
+			"use another strategy, such as recreate or rolling", a.VMName, a.RecreateReason)
+	case compose.ActionRestart:
+		return fmt.Errorf("%s: the in-place strategy never restarts a VM, and this update needs a restart (%s); "+
+			"use another strategy, such as recreate or rolling, which reconfigure and restart the same VM", a.VMName,
+			strings.Join(a.Plan.RestartReasons, "; "))
+	}
+	return nil
+}
+
 // UpdateMechanismText is the plan's description of how an update is applied.
 func UpdateMechanismText(a VMAction) string {
 	switch {
@@ -366,6 +389,9 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			}
 			action.Retry = op.Retry
 			action.Apply, action.RecreateReason, action.Repair = updateMechanism(op, action, storedSpecByVM[op.VMName] != nil, state.RecordedDisks[op.VMName] > 0)
+			if err := inPlaceRefusal(f, action); err != nil {
+				return nil, err
+			}
 			action.Detail += " — " + UpdateMechanismText(action)
 		}
 

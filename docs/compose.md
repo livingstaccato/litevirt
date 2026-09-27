@@ -756,7 +756,7 @@ Strategies:
 - `start-first` — Create new VM first, wait for health check, then stop old. Minimizes downtime.
 - `all-at-once` — Replace all VMs that need it simultaneously. Fast but risky.
 - `blue-green` — Create a parallel set of new VMs ("-green" suffix), then cut over by deleting the old (blue) VMs. A green that cannot be created aborts the deploy and removes the greens already made. A blue that cannot be deleted once its green is up is not a failed cutover — the green is serving — but it is reported as a failed action for that VM (the old VM is still there), and the stack ends `degraded`.
-- `in-place` — **Live-or-fail: it applies in-place changes only and NEVER restarts or deletes a VM.** Any change that would need a restart or a recreate (see the lists above) is **refused with a clear error — nothing is deleted or partially applied.** Use another strategy (or stop the VM and `lv update`) for those.
+- `in-place` — **Live-or-fail: it applies in-place changes only and NEVER restarts or deletes a VM.** Any change that would need a restart or a recreate (see the lists above) — or a VM that has to be replaced for another reason (its stored spec cannot be read, say) — is **refused when the plan is made, with an error naming the VM and the reason — nothing is deleted or partially applied.** Use another strategy (or stop the VM and `lv update`) for those. A VM a previous deploy left half-made is still repaired (`retry — repaired in place, disks kept`), as under every strategy.
 
 Under any strategy but `in-place`, in-place and restart changes are applied to each VM before the strategy replaces the VMs that need it; a restarted VM is waited on for `health-wait` like a replaced one.
 

@@ -1328,33 +1328,40 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	return s.startVMLocked(ctx, vm)
 }
 
-// repairRefused refuses a compose repair of vm while another operation is
-// working on it. Server.lockVM serializes only this process's RPCs; the
-// health reconciler's failover and restart paths start a VM under the
-// cluster-wide vm_locks lease instead, and a transition in flight carries a
+// takeRepairLease refuses a compose repair of vm while another operation is
+// working on it, and otherwise takes the VM's cluster-wide start lease for
+// the repair. The caller holds the returned release until the repair's start
+// is done (or it is refused), then calls it.
+//
+// Server.lockVM serializes only this process's RPCs; the health
+// reconciler's failover and restart paths start a VM under the replicated
+// vm_locks lease instead, and a transition in flight carries a
 // pending_action_id. A repair that ignored either would destroy the domain
 // that start just brought up, and start it again without its start proof.
-func (s *Server) repairRefused(ctx context.Context, vm *corrosion.VMRecord) error {
+// READING the lease is not enough: a failover that takes it just after the
+// read starts the VM alongside the repair's start — two writers on one disk.
+// So the repair ACQUIRES it, through the very statement those paths use, and
+// the paths exclude each other rather than each checking and then acting.
+func (s *Server) takeRepairLease(ctx context.Context, vm *corrosion.VMRecord) (func(), error) {
 	if vm.PendingActionID != "" {
-		return status.Errorf(codes.FailedPrecondition,
+		return nil, status.Errorf(codes.FailedPrecondition,
 			"cannot repair %q: action %s is in progress on it; retry once it finishes", vm.Name, vm.PendingActionID)
 	}
-	rows, err := s.db.Query(ctx, `SELECT holder, expires_at FROM vm_locks WHERE vm_name = ?`, vm.Name)
+	holder := health.RepairLockHolder(s.hostName)
+	heldBy, err := health.TryVMStartLease(ctx, s.db, holder, vm.Name, time.Now())
 	if err != nil {
-		return status.Errorf(codes.Internal, "cannot repair %q: read its start lease: %v", vm.Name, err)
+		return nil, status.Errorf(codes.Unavailable, "cannot repair %q: take its start lease: %v", vm.Name, err)
 	}
-	now := time.Now().UTC()
-	for _, r := range rows {
-		exp, perr := time.Parse(time.RFC3339, r.String("expires_at"))
-		if perr == nil && exp.Before(now) {
-			continue // expired: no one's
-		}
-		// Unexpired, or unreadable (fail closed).
-		return status.Errorf(codes.FailedPrecondition,
-			"cannot repair %q: %s holds its start lease until %s (a failover or restart is starting it); retry once it finishes",
-			vm.Name, r.String("holder"), r.String("expires_at"))
+	if heldBy != holder {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"cannot repair %q: %s holds its start lease (a failover or restart is starting it); retry once it finishes",
+			vm.Name, heldBy)
 	}
-	return nil
+	return func() {
+		// Cleanup must not inherit a cancelled request's context, or the
+		// lease is stranded for its whole TTL (see Reconciler.startPendingVM).
+		health.ReleaseVMStartLease(context.WithoutCancel(ctx), s.db, holder, vm.Name)
+	}, nil
 }
 
 // startGatesLocked is every check an operator-asked start of a LOCAL VM must
@@ -3784,9 +3791,14 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// WHOLE size as new, not the desired-minus-stored delta (zero for
 				// an unchanged spec). Quota still charges only the grow: the
 				// stored spec already counts toward the project.
-				if err := s.repairRefused(ctx, fresh); err != nil {
+				releaseStartLease, err := s.takeRepairLease(ctx, fresh)
+				if err != nil {
 					return nil, err
 				}
+				// Held through the start at the end of UpdateVM, so no failover
+				// or restart can start this VM between the repair's redefine
+				// and its start.
+				defer releaseStartLease()
 				hostLease, gerr := s.startGatesLocked(ctx, "UpdateVM", fresh, int(wantCPU), int(wantMem), req.AllowOvercommit)
 				if gerr != nil {
 					return nil, gerr
@@ -3853,6 +3865,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				// of it runs, then redefine and start it: the repair a deploy
 				// retry asks for. Whether it runs must be KNOWN: an absent
 				// domain does not, but any other error could hide a live guest.
+				if h := s.repairLeaseHook; h != nil {
+					h(req.Name)
+				}
 				active, aerr := s.virt.DomainIsActive(req.Name)
 				if aerr != nil && !lv.IsNotFound(aerr) {
 					return nil, status.Errorf(codes.Unavailable,

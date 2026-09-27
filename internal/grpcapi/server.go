@@ -296,6 +296,9 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// repairLeaseHook is a test-only seam run while a compose repair holds the
+	// VM's start lease, before it touches the domain.
+	repairLeaseHook func(vmName string)
 	// cutoverCrashHook is a test-only seam; see SetCutoverCrashHook.
 	cutoverCrashHook func(stage string) error
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.

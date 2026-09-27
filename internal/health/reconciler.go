@@ -1802,6 +1802,29 @@ func vmcheckLockHolder(hostName string) string { return hostName + "/vmcheck" }
 // path in VMChecker needs the same lease and is not a Reconciler, and a second
 // copy of this CRDT-tolerant upsert would be a second thing to get wrong.
 func acquireVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmName string, nowT time.Time) bool {
+	heldBy, err := TryVMStartLease(ctx, db, hostName, vmName, nowT)
+	return err == nil && heldBy == hostName
+}
+
+// RepairLockHolder is the per-VM lease identity of an operator-asked compose
+// repair (UpdateVM on a VM in error or mid-transition), which starts the VM
+// and so must exclude every other start path for its duration. Distinct from
+// the reconciler's bare host name for the reason reconcilerLockHolder gives:
+// sharing it would let one component re-take and then free the other's lease.
+func RepairLockHolder(hostName string) string { return hostName + "/repair" }
+
+// TryVMStartLease attempts the per-VM start lease for holder and returns the
+// holder the lease names afterwards: holder itself when it was taken (or
+// already held by holder), another holder's name when that one's unexpired
+// lease stands. A non-nil error means the lease state is unknown, which a
+// caller about to start a VM treats as not holding it.
+//
+// It is THE lease write — the reconciler, the restart-policy path and the
+// grpcapi repair all take the lease through it, so every start path is
+// mutually exclusive through one replicated statement. Release with
+// ReleaseVMStartLease under the same holder.
+func TryVMStartLease(ctx context.Context, db *corrosion.Client, holder, vmName string, nowT time.Time) (string, error) {
+	hostName := holder
 	// Read the clock ONCE so `now` and `expires` derive from the same instant
 	// (a per-call test clock could otherwise advance between two reads).
 	base := nowT.UTC()
@@ -1823,14 +1846,17 @@ func acquireVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmNam
 		      OR vm_locks.holder = excluded.holder`,
 		vmName, hostName, expires, now, now); err != nil {
 		slog.Warn("vm_lock write failed", "vm", vmName, "holder", hostName, "error", err)
-		return false
+		return "", err
 	}
 	rows, err := db.Query(ctx,
 		`SELECT holder FROM vm_locks WHERE vm_name = ?`, vmName)
-	if err != nil || len(rows) == 0 {
-		return false
+	if err != nil {
+		return "", err
 	}
-	return rows[0].String("holder") == hostName
+	if len(rows) == 0 {
+		return "", fmt.Errorf("vm_lock for %s absent after its write", vmName)
+	}
+	return rows[0].String("holder"), nil
 }
 
 // releaseVMLock clears the per-VM lock. Best-effort; leaving a stale lock
@@ -1841,6 +1867,14 @@ func (r *Reconciler) releaseVMLock(ctx context.Context, vmName string) {
 
 // releaseVMLockFor is releaseVMLock without a Reconciler. See acquireVMLockFor.
 func releaseVMLockFor(ctx context.Context, db *corrosion.Client, hostName, vmName string) {
+	ReleaseVMStartLease(ctx, db, hostName, vmName)
+}
+
+// ReleaseVMStartLease frees the per-VM start lease holder took with
+// TryVMStartLease; a lease another holder has taken since is left alone.
+// Best-effort: a lease left behind expires after its TTL.
+func ReleaseVMStartLease(ctx context.Context, db *corrosion.Client, holder, vmName string) {
+	hostName := holder
 	if err := db.Execute(ctx,
 		`DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?`,
 		vmName, hostName); err != nil {

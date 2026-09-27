@@ -12,6 +12,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
@@ -186,6 +187,73 @@ func TestUpdateVM_RepairRefusedWhenDomainActivityIsUnknown(t *testing.T) {
 		t.Fatalf("repair with its domain's activity unknown = %v, want a refusal saying so", err)
 	}
 	assertUntouched(t, s, f, from, "error")
+}
+
+// The repair and a failover start are mutually exclusive through the
+// replicated start lease itself, not a check-then-act read of it: once the
+// repair holds the lease, a failover that asks for it between the repair's
+// acquire and its start is refused, so it cannot start the VM a second time.
+func TestUpdateVM_RepairHoldsTheStartLeaseThroughItsStart(t *testing.T) {
+	s, _ := repairFixture(t, "error", 1024, libvirtfake.StateDefined)
+	fired := false
+	s.repairLeaseHook = func(name string) {
+		fired = true
+		heldBy, err := health.TryVMStartLease(adminCtx(), s.db, "node-2", name, time.Now())
+		if err != nil {
+			t.Errorf("failover lease attempt: %v", err)
+			return
+		}
+		if heldBy == "node-2" {
+			t.Errorf("a failover took %q's start lease while the repair was starting it", name)
+		}
+	}
+	if err := repairHB(s); err != nil {
+		t.Fatalf("repair: %v", err)
+	}
+	if !fired {
+		t.Fatal("the repair never reached its start-lease seam")
+	}
+}
+
+// The repair frees the lease once it is done, so a later failover or restart
+// can take it — including after a repair refused past the acquire.
+func TestUpdateVM_RepairReleasesTheStartLease(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		refused bool
+	}{{"after a repair", false}, {"after a refused repair", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := repairFixture(t, "error", 1024, libvirtfake.StateDefined)
+			if tc.refused {
+				s.SetGate(fakeServerGate{enforced: true, execOK: false})
+			}
+			err := repairHB(s)
+			if tc.refused != (err != nil) {
+				t.Fatalf("repair = %v, refused want %v", err, tc.refused)
+			}
+			heldBy, lerr := health.TryVMStartLease(adminCtx(), s.db, "node-2", "hb", time.Now())
+			if lerr != nil || heldBy != "node-2" {
+				t.Fatalf("failover after the repair: lease held by %q (%v), want node-2 to take it", heldBy, lerr)
+			}
+		})
+	}
+}
+
+// The refusal names the holder, and leaves the holder's lease standing.
+func TestUpdateVM_RepairRefusalNamesTheLeaseHolder(t *testing.T) {
+	s, f := repairFixture(t, "error", 1024, libvirtfake.StateDefined)
+	if heldBy, err := health.TryVMStartLease(adminCtx(), s.db, "node-2", "hb", time.Now()); err != nil || heldBy != "node-2" {
+		t.Fatalf("seed failover lease: %q %v", heldBy, err)
+	}
+	from := len(f.EventLog())
+	err := repairHB(s)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "node-2") {
+		t.Fatalf("repair under node-2's lease = %v, want FailedPrecondition naming node-2", err)
+	}
+	assertUntouched(t, s, f, from, "error")
+	if heldBy, _ := health.TryVMStartLease(adminCtx(), s.db, "node-3", "hb", time.Now()); heldBy != "node-2" {
+		t.Errorf("after the refusal the lease is held by %q, want node-2's still standing", heldBy)
+	}
 }
 
 // activityUnknownVirt fails only the activity question, so every other step

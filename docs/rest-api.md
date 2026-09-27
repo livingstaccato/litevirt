@@ -342,8 +342,8 @@ every one that was not (a VM or container name, `network <name>`,
 ```
 
 The status is `200` only when every resource was removed (`failures` empty, no
-`error`). Any failure returns `500` with that body; the stack stays `deleting`
-and the reconciler retries it. A stream that fails outright after some progress
+`error`). Any failure returns `409 Conflict` with that body: the stack still
+exists, stays `deleting`, and the reconciler retries it. A stream that fails outright after some progress
 returns the mapped status of its error (`500` by default) with the same body and
 the failure in `error`; one refused before any progress returns the usual
 `{"error": ...}`.

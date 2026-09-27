@@ -97,6 +97,7 @@ message HostCapacityAssessment {
     bool   complete = 8;       // false = placement must treat as unknown
     string detail = 9;
     string sampled_at = 10;    // RFC3339
+    int32  db_ct_mem_mib = 11; // the part of db_mem_mib running containers hold
 }
 message ClusterHealth {
     // HEALTHY: no active conditions, complete fresh coverage.

@@ -1769,7 +1769,8 @@ type HostCapacityAssessment struct {
 	EffectiveMemMib int32                  `protobuf:"varint,7,opt,name=effective_mem_mib,json=effectiveMemMib,proto3" json:"effective_mem_mib,omitempty"`
 	Complete        bool                   `protobuf:"varint,8,opt,name=complete,proto3" json:"complete,omitempty"` // false = placement must treat as unknown
 	Detail          string                 `protobuf:"bytes,9,opt,name=detail,proto3" json:"detail,omitempty"`
-	SampledAt       string                 `protobuf:"bytes,10,opt,name=sampled_at,json=sampledAt,proto3" json:"sampled_at,omitempty"` // RFC3339
+	SampledAt       string                 `protobuf:"bytes,10,opt,name=sampled_at,json=sampledAt,proto3" json:"sampled_at,omitempty"`         // RFC3339
+	DbCtMemMib      int32                  `protobuf:"varint,11,opt,name=db_ct_mem_mib,json=dbCtMemMib,proto3" json:"db_ct_mem_mib,omitempty"` // the part of db_mem_mib running containers hold
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -1872,6 +1873,13 @@ func (x *HostCapacityAssessment) GetSampledAt() string {
 		return x.SampledAt
 	}
 	return ""
+}
+
+func (x *HostCapacityAssessment) GetDbCtMemMib() int32 {
+	if x != nil {
+		return x.DbCtMemMib
+	}
+	return 0
 }
 
 type ClusterHealth struct {
@@ -26318,7 +26326,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06target\x18\x02 \x01(\tR\x06target\x12\x16\n" +
 	"\x06status\x18\x03 \x01(\tR\x06status\x121\n" +
 	"\x14consecutive_failures\x18\x04 \x01(\x05R\x13consecutiveFailures\x12\x1b\n" +
-	"\tlast_seen\x18\x05 \x01(\tR\blastSeen\"\xcf\x02\n" +
+	"\tlast_seen\x18\x05 \x01(\tR\blastSeen\"\xf2\x02\n" +
 	"\x16HostCapacityAssessment\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x15\n" +
 	"\x06db_cpu\x18\x02 \x01(\x05R\x05dbCpu\x12\x1c\n" +
@@ -26332,7 +26340,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06detail\x18\t \x01(\tR\x06detail\x12\x1d\n" +
 	"\n" +
 	"sampled_at\x18\n" +
-	" \x01(\tR\tsampledAt\"\xd2\x02\n" +
+	" \x01(\tR\tsampledAt\x12!\n" +
+	"\rdb_ct_mem_mib\x18\v \x01(\x05R\n" +
+	"dbCtMemMib\"\xd2\x02\n" +
 	"\rClusterHealth\x12\x18\n" +
 	"\aoverall\x18\x01 \x01(\tR\aoverall\x12<\n" +
 	"\n" +

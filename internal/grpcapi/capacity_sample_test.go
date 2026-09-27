@@ -44,7 +44,9 @@ func TestCapacityObservation_MatchingWorkloadChargesGreater(t *testing.T) {
 
 func TestCapacityObservation_RuntimeOnlyWorkloadAdds(t *testing.T) {
 	inv := obsInv(true,
-		runtimeWorkload{Kind: corrosion.WorkloadContainer, Name: "rogue", State: health.RuntimeRunning, CPU: 2, MemoryMiB: 1024},
+		// A VM: a rogue container is charged memory only
+		// (TestCapacityObservation_ContainerChargesMemoryOnly).
+		runtimeWorkload{Kind: corrosion.WorkloadVM, Name: "rogue", State: health.RuntimeRunning, CPU: 2, MemoryMiB: 1024},
 	)
 	obs := computeCapacityObservation("h1", inv, nil, nil)
 	if obs.EffectiveCPU != 2 || obs.EffectiveMemMiB != 1024 {
@@ -96,5 +98,32 @@ func TestCapacityObservation_StoppedIsNotCharged(t *testing.T) {
 	obs := computeCapacityObservation("h1", inv, vms, nil)
 	if obs.EffectiveCPU != 0 || obs.EffectiveMemMiB != 0 {
 		t.Fatalf("stopped workload charged %d/%d, want 0/0", obs.EffectiveCPU, obs.EffectiveMemMiB)
+	}
+}
+
+// A container's cpu_limit is a cap in cores, not a reservation, so capacity
+// charges a container its memory and nothing else — the rule placement uses
+// (corrosion.ContainerHoldsHostMemory). The runtime side must follow it too:
+// a matched container whose cgroup reports its 8-core cap is not 8 vCPU of
+// EXTRA, and a rogue container costs only the memory it is capped at.
+func TestCapacityObservation_ContainerChargesMemoryOnly(t *testing.T) {
+	inv := obsInv(true,
+		runtimeWorkload{Kind: corrosion.WorkloadContainer, Name: "web-ct", State: health.RuntimeRunning, CPU: 8, MemoryMiB: 512},
+		runtimeWorkload{Kind: corrosion.WorkloadContainer, Name: "rogue", State: health.RuntimeRunning, CPU: 4, MemoryMiB: 256},
+	)
+	cts := []corrosion.ContainerRecord{
+		{Name: "web-ct", HostName: "h1", State: "running", CPULimit: 8, MemMiB: 512},
+		{Name: "idle", HostName: "h1", State: "stopped", CPULimit: 2, MemMiB: 1024},
+	}
+	obs := computeCapacityObservation("h1", inv, nil, cts)
+	if obs.DBCPU != 0 || obs.DBMemMiB != 512 {
+		t.Fatalf("db charge = %dc/%dMiB, want 0c/512MiB (memory of the running container only)", obs.DBCPU, obs.DBMemMiB)
+	}
+	if obs.ExtraCPU != 0 || obs.ExtraMemMiB != 256 {
+		t.Fatalf("extra = %dc/%dMiB, want 0c/256MiB (the rogue's memory; no container cpu, no double count of web-ct)",
+			obs.ExtraCPU, obs.ExtraMemMiB)
+	}
+	if obs.EffectiveCPU != 0 || obs.EffectiveMemMiB != 768 {
+		t.Fatalf("effective = %dc/%dMiB, want 0c/768MiB", obs.EffectiveCPU, obs.EffectiveMemMiB)
 	}
 }

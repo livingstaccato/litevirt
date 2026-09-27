@@ -111,13 +111,26 @@ func printClusterHealth(h *pb.ClusterHealth) {
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "  HOST\tEFFECTIVE\tDB\tEXTRA\tCOMPLETE\tDETAIL")
 		for _, c := range caps {
-			fmt.Fprintf(w, "  %s\t%dc/%dMiB\t%dc/%dMiB\t%dc/%dMiB\t%v\t%s\n",
+			fmt.Fprintf(w, "  %s\t%dc/%dMiB\t%s\t%dc/%dMiB\t%v\t%s\n",
 				c.GetHostName(),
 				c.GetEffectiveCpu(), c.GetEffectiveMemMib(),
-				c.GetDbCpu(), c.GetDbMemMib(),
+				capacityDBCell(c),
 				c.GetExtraCpu(), c.GetExtraMemMib(),
 				c.GetComplete(), c.GetDetail())
 		}
 		w.Flush()
 	}
+}
+
+// capacityDBCell renders the capacity table's DB column: what running VMs
+// hold, then the memory running containers hold ("1c/768MiB +512MiB ct").
+// Containers carry no cpu term — a container's cpu is a cap, not a
+// reservation, and capacity never charges it.
+func capacityDBCell(c *pb.HostCapacityAssessment) string {
+	ct := c.GetDbCtMemMib()
+	cell := fmt.Sprintf("%dc/%dMiB", c.GetDbCpu(), c.GetDbMemMib()-ct)
+	if ct > 0 {
+		cell += fmt.Sprintf(" +%dMiB ct", ct)
+	}
+	return cell
 }

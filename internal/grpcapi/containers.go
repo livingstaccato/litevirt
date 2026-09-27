@@ -97,6 +97,11 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		}()
 	}
 	if forwarded, err := s.forwardCreateContainer(ctx, req); err != nil || forwarded != nil {
+		if err == nil {
+			// Report the create once this node lists the row (see
+			// awaitForwardedContainer).
+			s.awaitForwardedContainer(ctx, forwarded.GetHostName(), forwarded.GetName(), "created", containerRowPresent)
+		}
 		return forwarded, err
 	}
 	if s.containerRuntime == nil {
@@ -293,6 +298,11 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if forwarded, err := s.forwardSimpleCT(ctx, startHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
 		return c.StartContainer(ctx, &pb.StartContainerRequest{Name: req.Name, HostName: startHost})
 	}); err != nil || forwarded != nil {
+		if err == nil {
+			// Report the start once this node lists it running (see
+			// awaitForwardedContainer).
+			s.awaitForwardedContainer(ctx, startHost, req.Name, "running", containerRunning)
+		}
 		return forwarded, err
 	}
 	if s.containerRuntime == nil {

@@ -70,8 +70,10 @@ func TestStackDelete_IncompleteTeardownIsNotOK(t *testing.T) {
 		{VmName: "network hb_net", Status: "error", Error: "deprovision network: busy"},
 		{Status: "error", Error: "unnamed failure"},
 	}, nil)
-	if code >= 200 && code < 300 {
-		t.Fatalf("teardown that left resources behind → %d, want non-2xx: %s", code, raw)
+	// 409: the stack still exists, in state "deleting", and the daemon retries
+	// the teardown — a conflict with the request, not a server fault.
+	if code != http.StatusConflict {
+		t.Fatalf("teardown that left resources behind → %d, want 409: %s", code, raw)
 	}
 	got := map[string]string{}
 	for _, f := range body.Failures {

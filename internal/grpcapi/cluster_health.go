@@ -100,16 +100,63 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			LastSeen:            e.LastSeen,
 		})
 	}
-	for _, c := range capacity {
-		resp.Capacity = append(resp.Capacity, &pb.HostCapacityAssessment{
-			HostName: c.HostName,
-			DbCpu:    int32(c.DBCPU), DbMemMib: int32(c.DBMemMiB),
-			ExtraCpu: int32(c.ExtraCPU), ExtraMemMib: int32(c.ExtraMemMiB),
-			EffectiveCpu: int32(c.EffectiveCPU), EffectiveMemMib: int32(c.EffectiveMemMiB),
-			Complete: c.Complete, Detail: c.Detail, SampledAt: c.SampledAt,
-		})
+	if len(capacity) > 0 {
+		db, err := s.dbCapacityByHost(ctx)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "database capacity: %v", err)
+		}
+		for _, c := range capacity {
+			d := db[c.HostName]
+			resp.Capacity = append(resp.Capacity, &pb.HostCapacityAssessment{
+				HostName: c.HostName,
+				DbCpu:    int32(d.cpu), DbMemMib: int32(d.mem), DbCtMemMib: int32(d.ctMem),
+				ExtraCpu: int32(c.ExtraCPU), ExtraMemMib: int32(c.ExtraMemMiB),
+				EffectiveCpu: int32(d.cpu + c.ExtraCPU), EffectiveMemMib: int32(d.mem + c.ExtraMemMiB),
+				Complete: c.Complete, Detail: c.Detail, SampledAt: c.SampledAt,
+			})
+		}
 	}
 	return resp, nil
+}
+
+// hostDBCapacity is what the database says one host holds: cpu and memory
+// over running VMs and containers, with the containers' memory share apart.
+type hostDBCapacity struct{ cpu, mem, ctMem int }
+
+// dbCapacityByHost reads the capacity section's DB column from the database
+// as it is NOW, by the rules placement charges by (dbVMCharge,
+// dbContainerCharge) — not from the sampler's last copy of it, which is up to
+// a minute old and would show a container deployed since as not there while
+// placement already counts it. EXTRA (runtime beyond the database) is the
+// sampler's finding, and EFFECTIVE is DB + EXTRA, which is what placement
+// admits against.
+func (s *Server) dbCapacityByHost(ctx context.Context) (map[string]hostDBCapacity, error) {
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return nil, err
+	}
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]hostDBCapacity{}
+	for _, vm := range vms {
+		if cpu, mem, ok := dbVMCharge(vm); ok {
+			d := out[vm.HostName]
+			d.cpu += cpu
+			d.mem += mem
+			out[vm.HostName] = d
+		}
+	}
+	for _, ct := range cts {
+		if mem, ok := dbContainerCharge(ct); ok {
+			d := out[ct.HostName]
+			d.mem += mem
+			d.ctMem += mem
+			out[ct.HostName] = d
+		}
+	}
+	return out, nil
 }
 
 // connectivityEdge is one observer→target peer-probe result from host_health,

@@ -400,8 +400,9 @@ func clusterHealthDTO(h *pb.ClusterHealth) map[string]any {
 		capacity = append(capacity, map[string]any{
 			"host_name": c.GetHostName(), "effective_cpu": c.GetEffectiveCpu(),
 			"effective_mem_mib": c.GetEffectiveMemMib(), "extra_cpu": c.GetExtraCpu(),
-			"extra_mem_mib": c.GetExtraMemMib(), "complete": c.GetComplete(),
-			"detail": c.GetDetail(), "sampled_at": c.GetSampledAt(),
+			"extra_mem_mib": c.GetExtraMemMib(), "db_cpu": c.GetDbCpu(),
+			"db_mem_mib": c.GetDbMemMib(), "db_ct_mem_mib": c.GetDbCtMemMib(),
+			"complete": c.GetComplete(), "detail": c.GetDetail(), "sampled_at": c.GetSampledAt(),
 		})
 	}
 	return map[string]any{

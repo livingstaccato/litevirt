@@ -162,3 +162,14 @@ func ackFirstAndDetach(w http.ResponseWriter, op string, cancel context.CancelFu
 	ackAndDetach(op, cancel, rest)
 	jsonProto(w, first)
 }
+
+// awaitVerdict lifts the write deadline for a non-SSE handler that answers only
+// once its operation is over (stack deploy and delete). Its operation runs on
+// opContext's detached context, so it finishes whatever the client does; but
+// the answer is written at the end, and under the server's WriteTimeout (120s)
+// a verdict for a longer operation went to a connection net/http had already
+// given up on — the client read EOF, with no status and no failures list, and
+// retried. (httptest.ResponseRecorder returns ErrNotSupported — harmless.)
+func awaitVerdict(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+}

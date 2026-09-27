@@ -157,3 +157,41 @@ func TestFleet_ContainerCreateAndStartThroughAPeerAreVisibleOnReturn(t *testing.
 		t.Fatalf("ct1 on %s right after start returned = %+v err=%v, want running", entry.Name, rec, err)
 	}
 }
+
+// `lv ct stop` and `lv ct rm` through a node that does not own the container:
+// each reports success only once the node it was asked on lists the result —
+// not running after the stop, gone after the delete — so an `lv ct ls` straight
+// after does not show the container as it was.
+func TestFleet_ContainerStopAndDeleteThroughAPeerAreVisibleOnReturn(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	entry, owner := c.Nodes[0], c.Nodes[1]
+	ctx := context.Background()
+	laggingPump(t, c, owner, entry, 300*time.Millisecond)
+	client := c.SelfClient(entry)
+
+	if _, err := client.CreateContainer(ctx, &pb.CreateContainerRequest{
+		HostName: owner.Name, Name: "ct1", Template: "download", Distro: "alpine", Release: "3.21",
+		Arch: "amd64", MemoryMib: 256,
+	}); err != nil {
+		t.Fatalf("CreateContainer via %s: %v", entry.Name, err)
+	}
+	if _, err := client.StartContainer(ctx, &pb.StartContainerRequest{HostName: owner.Name, Name: "ct1"}); err != nil {
+		t.Fatalf("StartContainer via %s: %v", entry.Name, err)
+	}
+
+	if _, err := client.StopContainer(ctx, &pb.StopContainerRequest{HostName: owner.Name, Name: "ct1"}); err != nil {
+		t.Fatalf("StopContainer via %s: %v", entry.Name, err)
+	}
+	rec, err := corrosion.GetContainer(ctx, entry.DB, owner.Name, "ct1")
+	if err != nil || rec == nil || rec.State == "running" {
+		t.Fatalf("ct1 on %s right after stop returned = %+v err=%v, want it listed and not running", entry.Name, rec, err)
+	}
+
+	if _, err := client.DeleteContainer(ctx, &pb.DeleteContainerRequest{HostName: owner.Name, Name: "ct1"}); err != nil {
+		t.Fatalf("DeleteContainer via %s: %v", entry.Name, err)
+	}
+	rec, err = corrosion.GetContainer(ctx, entry.DB, owner.Name, "ct1")
+	if err != nil || rec != nil {
+		t.Fatalf("ct1 on %s right after delete returned = %+v err=%v, want it gone", entry.Name, rec, err)
+	}
+}

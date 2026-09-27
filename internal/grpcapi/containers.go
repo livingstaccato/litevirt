@@ -388,6 +388,11 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if forwarded, err := s.forwardSimpleCT(ctx, stopHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
 		return c.StopContainer(ctx, &pb.StopContainerRequest{Name: req.Name, HostName: stopHost, TimeoutSec: req.TimeoutSec})
 	}); err != nil || forwarded != nil {
+		if err == nil {
+			// Report the stop once this node no longer lists it running (see
+			// awaitForwardedContainer).
+			s.awaitForwardedContainer(ctx, stopHost, req.Name, "not running", containerNotRunning)
+		}
 		return forwarded, err
 	}
 	if s.containerRuntime == nil {
@@ -437,6 +442,11 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
 		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost})
 	}); err != nil || forwarded != nil {
+		if err == nil {
+			// Report the delete once this node no longer lists the row (see
+			// awaitForwardedContainer).
+			s.awaitForwardedContainer(ctx, targetHost, req.Name, "deleted", containerRowGone)
+		}
 		return forwarded, err
 	}
 	if s.containerRuntime == nil {

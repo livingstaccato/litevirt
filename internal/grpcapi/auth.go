@@ -566,8 +566,10 @@ func callerPrincipalKind(ctx context.Context) string {
 }
 
 // requirePeerOrRole gates a dual-use RPC that BOTH cluster peers (host cert) and
-// operator bearers legitimately invoke — e.g. the anti-entropy state RPCs, which
-// the UI diagnostics page and `lv cluster sync` also call with a bearer. A
+// operator bearers legitimately invoke — e.g. the anti-entropy digest RPCs, which
+// the UI diagnostics page and `lv cluster converge` also call with a bearer. It
+// is only for RPCs that return no row contents: the state dump is peer-only
+// (requirePeerCert), because it carries secret columns. A
 // trusted peer passes; otherwise the caller must hold at least minRole. A pure
 // requirePeerCert here would break the bearer (UI/CLI) path.
 func (s *Server) requirePeerOrRole(ctx context.Context, minRole string) error {

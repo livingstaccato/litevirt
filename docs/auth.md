@@ -430,3 +430,22 @@ it to impersonate a user.
 > `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
 > peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
 > `PushReplicaIncrement`. Not enforced today.
+
+### Who can read the state dump
+
+`GetStateDump` and `StreamStateDump` return the full replication dump, the
+representation anti-entropy repair merges. It is unredacted, so it carries the
+secret columns of replicated tables: `hosts.ipmi_pass`, `users.password_hash` and
+`tokens.token_hash`. Only a **peer** or **local-root** caller (a cluster host
+certificate) can read it. An operator or admin bearer, a session, and the `lv-cli`
+client certificate are all refused with `PermissionDenied`, whatever their role.
+The secret-bearing tables (`StreamSensitiveStateDump`, `GetSensitiveStateDigest`)
+are narrower still: peer only, and the certificate must name the sender.
+
+Operators see convergence without row contents. `GetStateDigest` and
+`GetClusterStateDigest` return per-table counts and hashes to an `operator`
+bearer; `lv cluster converge` and the UI's **Force Sync** button call
+`TriggerAntiEntropy`, which schedules a repair pass between the peers and returns
+no state. `lv doctor divergence` (admin) has the connected node fetch each peer's
+dump with its own host certificate, and returns only table names, primary keys
+and row hashes — keyed HMAC labels for the secret-bearing tables.

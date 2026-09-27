@@ -39,6 +39,11 @@ type mockGRPC struct {
 	// authorization gate rather than only its happy path.
 	whoamiRole string
 	whoamiErr  error
+	// stateDumpCalls counts GetStateDump calls: the UI must never make one (the
+	// dump is peer-only and carries secret columns). lastTriggerAntiEntropy
+	// records the Force Sync button's request.
+	stateDumpCalls         int
+	lastTriggerAntiEntropy *pb.TriggerAntiEntropyRequest
 	// Response fields
 	listHostsResp          *pb.ListHostsResponse
 	listHostNetworksResp   *pb.ListHostNetworksResponse
@@ -971,7 +976,16 @@ func (m *mockGRPC) GetStateDigest(context.Context, *emptypb.Empty, ...grpc.CallO
 	return &pb.StateDigestResponse{}, nil
 }
 func (m *mockGRPC) GetStateDump(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.StateDumpResponse, error) {
+	m.mu.Lock()
+	m.stateDumpCalls++
+	m.mu.Unlock()
 	return &pb.StateDumpResponse{}, nil
+}
+func (m *mockGRPC) TriggerAntiEntropy(_ context.Context, req *pb.TriggerAntiEntropyRequest, _ ...grpc.CallOption) (*pb.TriggerAntiEntropyResponse, error) {
+	m.mu.Lock()
+	m.lastTriggerAntiEntropy = req
+	m.mu.Unlock()
+	return &pb.TriggerAntiEntropyResponse{Triggered: []string{"host1"}}, nil
 }
 func (m *mockGRPC) PushMutations(context.Context, *pb.ReplicateRequest, ...grpc.CallOption) (*pb.ReplicateResponse, error) {
 	return &pb.ReplicateResponse{}, nil

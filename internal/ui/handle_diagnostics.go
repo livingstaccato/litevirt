@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"google.golang.org/protobuf/types/known/emptypb"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -29,8 +31,10 @@ func (s *Server) handleDiagnosticsPartial(w http.ResponseWriter, r *http.Request
 }
 
 func (s *Server) handleForceSync(w http.ResponseWriter, r *http.Request) {
-	// GetStateDump triggers a full state dump which can be used to force resync.
-	_, err := s.grpc.GetStateDump(s.uiBearerCtx(r), &emptypb.Empty{})
+	// Kick an immediate anti-entropy pass on the connected host, as
+	// `lv cluster converge` does. The state dump is peer-only — it carries
+	// secret columns — so the UI never pulls it.
+	_, err := s.grpc.TriggerAntiEntropy(s.uiBearerCtx(r), &pb.TriggerAntiEntropyRequest{})
 	if err != nil {
 		sendToast(w, "Sync failed: "+err.Error(), "error")
 		w.WriteHeader(500)

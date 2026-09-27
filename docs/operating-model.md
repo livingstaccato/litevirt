@@ -74,7 +74,11 @@ of acting — it says nothing about whether the resulting rows have replicated.
   advancing past the write, or `lv cluster converge` reporting matching digests
   — rather than assuming a healthy cluster implies it did.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
-  and is the safety net for divergence the WAL replicator missed. Public,
+  and is the safety net for divergence the WAL replicator missed. A scheduled
+  pass does not contact every peer: it contacts this node's relays (a leaf's
+  assigned pair, or a relay's fellow relays) plus two other peers, taken in
+  turn from a random ordering of the rest. With M non-relay peers every peer
+  is reached within any 2·⌈M/2⌉−1 consecutive passes. Public,
   operator-readable state is repaired table by table: a pass pulls only the
   tables whose digests disagreed (`StreamTableDump`, which adds the parent rows a
   child table's merge checks against), and falls back to the full
@@ -82,7 +86,7 @@ of acting — it says nothing about whether the resulting rows have replicated.
   uses a separate peer-mTLS-only sensitive dump. The older unary `GetStateDump`
   is retained as a fallback for mixed-version clusters. Convergence is automatic;
   `lv cluster converge` only *accelerates* it (kicks an immediate anti-entropy
-  pass) and *verifies* it (cross-host digest report) — it never exports or merges
+  pass, which contacts every peer rather than a sample) and *verifies* it (cross-host digest report) — it never exports or merges
   redacted state itself.
 
 ### HA / Failover

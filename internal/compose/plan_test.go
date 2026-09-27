@@ -259,11 +259,14 @@ func TestBuild_CloudInitRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build error: %v", err)
 	}
-	if len(plan.Ops) != 1 || plan.Ops[0].Kind != OpUpdate {
-		t.Fatalf("expected OpUpdate, got %v", plan.Ops)
+	// Without the stored spec as with it: leaving cloud-init out keeps the
+	// VM's, and the plan says so rather than planning an update (which,
+	// without a stored spec, would be a recreate).
+	if len(plan.Ops) != 1 || plan.Ops[0].Kind != OpNoChange {
+		t.Fatalf("expected OpNoChange, got %v", plan.Ops)
 	}
-	if !stringContains(plan.Ops[0].Detail, "cloud-init removed") {
-		t.Errorf("expected 'cloud-init removed' in Detail, got %q", plan.Ops[0].Detail)
+	if !stringContains(plan.Ops[0].Warning, "keeps the cloud-init") {
+		t.Errorf("expected a warning that the VM keeps its cloud-init, got %q", plan.Ops[0].Warning)
 	}
 }
 
@@ -465,4 +468,53 @@ func TestBuild_FullSpecComparison(t *testing.T) {
 			}
 		})
 	}
+}
+
+// With the stored spec present, Classify decides whether anything changed —
+// Build and the executor must agree. A coarse field Classify does not count as
+// a change used to make Build plan an update the executor then had nothing to
+// apply for: planned "applied in place, no restart", applied nothing, and
+// planned again on every later deploy.
+func TestBuild_StoredSpecIsTheAuthority(t *testing.T) {
+	t.Run("cloud-init removed from the file keeps the VM's and says so", func(t *testing.T) {
+		def := createdDef()
+		def.CloudInit = nil
+		plan := buildWithStored(t, def, storedAsCreated())
+		if len(plan.Ops) != 1 || plan.Ops[0].Kind != OpNoChange {
+			t.Fatalf("cloud-init removal planned %+v, want no-change", plan.Ops)
+		}
+		if w := plan.Ops[0].Warning; !strings.Contains(w, "cloud-init") || !strings.Contains(w, "keeps") {
+			t.Errorf("warning %q should say the VM keeps the cloud-init it was created with", w)
+		}
+	})
+	t.Run("actual cpu and memory drifting from the stored spec is not a change", func(t *testing.T) {
+		stored := storedAsCreated()
+		f := makeFile("stack", map[string]VMDef{"api": createdDef()})
+		f.Networks = map[string]NetworkDef{"lan": {Type: "bridge"}}
+		plan, err := Build(f, []CurrentVM{{
+			Name: "api", Image: stored.Image,
+			// What the host reports now: a ballooned-down guest, one vCPU offline.
+			CPU: 1, MemMiB: 384,
+			State: "running", HostName: "h1",
+			CloudInitHash: CloudInitHash(stored.CloudInit.GetUserdata(), ""),
+			Spec:          stored,
+		}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(plan.Ops) != 1 || plan.Ops[0].Kind != OpNoChange {
+			t.Fatalf("actuals differing from the stored spec planned %+v, want no-change", plan.Ops)
+		}
+	})
+	t.Run("an update carries the classification the executor applies", func(t *testing.T) {
+		def := createdDef()
+		def.CPUMode = "host-passthrough"
+		plan := buildWithStored(t, def, storedAsCreated())
+		if len(plan.Ops) != 1 || plan.Ops[0].Kind != OpUpdate {
+			t.Fatalf("got %+v, want one update", plan.Ops)
+		}
+		if !plan.Ops[0].Classified || plan.Ops[0].Change.Max() != ActionRestart {
+			t.Errorf("op classified=%v as %v, want restart", plan.Ops[0].Classified, plan.Ops[0].Change.Max())
+		}
+	})
 }

@@ -2,6 +2,7 @@ package rolling
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -94,5 +95,39 @@ func TestInPlace_StillRefusesARestart(t *testing.T) {
 	}
 	if len(ops.reconfigured) != 0 {
 		t.Errorf("in-place reconfigured %v", ops.reconfigured)
+	}
+}
+
+// Repairing a VM a previous deploy left half-made is not a live-change policy
+// question: under in-place too it is redefined over its disks and started,
+// as the plan's "retry — repaired in place, disks kept" says.
+func TestInPlace_RepairsAHalfMadeVM(t *testing.T) {
+	ops := &mockOps{}
+	fn, _ := collect()
+	a := act("web", "in-place", compose.ChangePlan{})
+	a.Repair = true
+	if err := Run(context.Background(), ops, "s", []VMAction{a}, fn); err != nil {
+		t.Fatalf("in-place repair: %v", err)
+	}
+	if len(ops.reconfigured) != 1 || len(ops.recreated)+len(ops.created)+len(ops.deleted) != 0 {
+		t.Errorf("reconfigured=%v recreated=%v created=%v deleted=%v, want web repaired only",
+			ops.reconfigured, ops.recreated, ops.created, ops.deleted)
+	}
+}
+
+// A VM the planner decided cannot be kept is refused by in-place with the
+// planner's reason, not "spec change".
+func TestInPlace_ForceRecreateNamesTheReason(t *testing.T) {
+	ops := &mockOps{}
+	fn, _ := collect()
+	a := act("web", "in-place", compose.ChangePlan{})
+	a.ForceRecreate = true
+	a.RecreateReason = "the VM's stored spec could not be read"
+	err := Run(context.Background(), ops, "s", []VMAction{a}, fn)
+	if err == nil || !strings.Contains(err.Error(), a.RecreateReason) {
+		t.Errorf("in-place ForceRecreate: err = %v, want it to name %q", err, a.RecreateReason)
+	}
+	if len(ops.recreated)+len(ops.deleted) != 0 {
+		t.Errorf("in-place replaced the VM: recreated=%v deleted=%v", ops.recreated, ops.deleted)
 	}
 }

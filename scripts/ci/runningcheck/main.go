@@ -3,9 +3,9 @@
 // runtime belongs to.
 //
 // A row that says running while no marker names its generation is a workload
-// nobody can prove. That window is what the dual-run detector's newborn grace
-// exists to tolerate, so closing it everywhere is what eventually makes that
-// grace deletable — and a new unrouted call site would silently reopen it.
+// nobody can prove, and the dual-run detector pages it with no newborn grace —
+// so a new unrouted call site would reopen a window the detector no longer
+// tolerates.
 //
 // There are two publish orderings — mark-then-commit for a writer that leaves
 // the ownership generation alone, commit-then-mark for one that advances it in

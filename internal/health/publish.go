@@ -13,9 +13,9 @@ import (
 
 // Publishing a VM as running is the moment its ownership generation becomes a
 // claim other nodes act on. A row that says "running" while no marker names its
-// generation is a workload nobody can prove, and that window is what the
-// dual-run detector's newborn grace exists to tolerate — so closing it
-// everywhere is what eventually makes that grace deletable.
+// generation is a workload nobody can prove, and the dual-run detector pages
+// it: there is no newborn grace, because no path publishes a VM running before
+// it is marked. A new VM is finished by PublishNewbornVMRunning.
 //
 // There are TWO orderings here, not one, because a running write is one of two
 // kinds and a single ordering is wrong for one of them:

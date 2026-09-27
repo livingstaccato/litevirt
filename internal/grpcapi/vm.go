@@ -1285,34 +1285,11 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, err
 	}
 
-	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
-	// non-template VM as a linked-clone source, so a plain VM can be backing
-	// overlays; starting it lets qemu write into the backing file underneath
-	// every one of them, corrupting each overlay silently.
-	//
-	// Fails CLOSED on a read error, like ConvertToTemplate's guard: "we cannot
-	// tell whether anything is layered on this disk" is not permission to write
-	// to it.
-	//
-	// BELOW RequirePerm, not above it. Only the path-blind requirePermPrecheck
-	// has run before that call, so evaluating this guard first let an operator
-	// scoped to one project name the linked clones of a VM in another — the
-	// error text lists them — and charged a DB read to an unauthorized caller.
-	// Authorize the resource, then touch it.
-	clones, cErr := s.linkedClonesOf(ctx, req.Name)
-	if cErr != nil {
-		return nil, status.Errorf(codes.Internal,
-			"cannot determine whether %q still backs linked clones: %v", req.Name, cErr)
-	}
-	if len(clones) > 0 {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"%q still backs %d linked clone(s) (%s); starting it would let qemu write "+
-				"into the backing file under each overlay. Delete those clones, or "+
-				"re-create them as independent copies with `lv clone <source> <name> "+
-				"--mode full`, first",
-			req.Name, len(clones), strings.Join(clones, ", "))
-	}
-
+	// The linked-clone guard runs BELOW RequirePerm, not above it: only the
+	// path-blind requirePermPrecheck has run before that call, so evaluating it
+	// first let an operator scoped to one project name the linked clones of a
+	// VM in another — the error text lists them. It lives in startGatesLocked,
+	// on the owning host, with the other start gates.
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -1336,6 +1313,59 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.Aborted, "ownership of %q moved to %s mid-operation; retry", req.Name, vm.HostName)
 	}
 
+	spec := &pb.VMSpec{}
+	if vm.Spec != "" {
+		if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
+			return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
+		}
+	}
+	lease, err := s.startGatesLocked(ctx, "StartVM", vm, int(spec.Cpu), int(spec.MemoryMib), req.AllowOvercommit)
+	if err != nil {
+		return nil, err
+	}
+	// The reservation must outlive startVMLocked's state write.
+	defer lease.release(ctx)
+	return s.startVMLocked(ctx, vm)
+}
+
+// repairRefused refuses a compose repair of vm while another operation is
+// working on it. Server.lockVM serializes only this process's RPCs; the
+// health reconciler's failover and restart paths start a VM under the
+// cluster-wide vm_locks lease instead, and a transition in flight carries a
+// pending_action_id. A repair that ignored either would destroy the domain
+// that start just brought up, and start it again without its start proof.
+func (s *Server) repairRefused(ctx context.Context, vm *corrosion.VMRecord) error {
+	if vm.PendingActionID != "" {
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot repair %q: action %s is in progress on it; retry once it finishes", vm.Name, vm.PendingActionID)
+	}
+	rows, err := s.db.Query(ctx, `SELECT holder, expires_at FROM vm_locks WHERE vm_name = ?`, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "cannot repair %q: read its start lease: %v", vm.Name, err)
+	}
+	now := time.Now().UTC()
+	for _, r := range rows {
+		exp, perr := time.Parse(time.RFC3339, r.String("expires_at"))
+		if perr == nil && exp.Before(now) {
+			continue // expired: no one's
+		}
+		// Unexpired, or unreadable (fail closed).
+		return status.Errorf(codes.FailedPrecondition,
+			"cannot repair %q: %s holds its start lease until %s (a failover or restart is starting it); retry once it finishes",
+			vm.Name, r.String("holder"), r.String("expires_at"))
+	}
+	return nil
+}
+
+// startGatesLocked is every check an operator-asked start of a LOCAL VM must
+// pass before anything touches it — StartVM's, and a compose repair's, which
+// starts a VM too. The caller holds the VM lock and has re-read vm under it.
+// cpu/memMiB is the size the VM starts at. The returned lease reserves that
+// capacity (nil when vm already runs); the caller releases it after the start.
+//
+// startVMLocked adds the hardware-adoption gate and PCI preflight, which the
+// automated restart paths share.
+func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corrosion.VMRecord, cpu, memMiB int, allowOvercommit bool) (*reservationLease, error) {
 	// Split-brain gate (Phase 1): bringing an owned VM to running is a runtime action
 	// that, under STALE ownership (the VM was failed over elsewhere during a partition
 	// but this side's row still says stopped+here), would double-run it. Require local
@@ -1346,12 +1376,34 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
 	}
 
+	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
+	// non-template VM as a linked-clone source, so a plain VM can be backing
+	// overlays; starting it lets qemu write into the backing file underneath
+	// every one of them, corrupting each overlay silently.
+	//
+	// Fails CLOSED on a read error, like ConvertToTemplate's guard: "we cannot
+	// tell whether anything is layered on this disk" is not permission to write
+	// to it.
+	clones, cErr := s.linkedClonesOf(ctx, vm.Name)
+	if cErr != nil {
+		return nil, status.Errorf(codes.Internal,
+			"cannot determine whether %q still backs linked clones: %v", vm.Name, cErr)
+	}
+	if len(clones) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q still backs %d linked clone(s) (%s); starting it would let qemu write "+
+				"into the backing file under each overlay. Delete those clones, or "+
+				"re-create them as independent copies with `lv clone <source> <name> "+
+				"--mode full`, first",
+			vm.Name, len(clones), strings.Join(clones, ", "))
+	}
+
 	// Host capacity admission. Starting is where memory is actually CONSUMED —
 	// usage counts running VMs only, so a stopped VM contributes nothing until
 	// now. Without this, create-time admission is trivially sidestepped: create a
 	// pile of VMs (each fitting at the time), then start them all.
 	//
-	// Deliberately on the OPERATOR RPC, not inside startVMLocked. The automated
+	// Deliberately on the OPERATOR paths, not inside startVMLocked. The automated
 	// failover / reconciler / health-restart paths bypass startVMLocked (see
 	// PrepareHardwareForStart), and they must stay unblocked: after a host reboot
 	// every VM is stopped and restarted at once, so an admission check there would
@@ -1361,49 +1413,28 @@ func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, e
 	//
 	// Skipped when the VM is already running: `lv start` on a running VM is a
 	// no-op that adds nothing, and must not be refused for capacity it already
-	// occupies.
-	//
-	// The reservation must outlive startVMLocked's state write, so release is
-	// declared out here and deferred through a closure — `defer release()` would
-	// capture the no-op value instead of whatever the admission assigns below.
-	release := noopRelease
-	defer func() { release() }()
-	if vm.State != "running" {
-		spec := &pb.VMSpec{}
-		if vm.Spec != "" {
-			if err := json.Unmarshal([]byte(vm.Spec), spec); err != nil {
-				return nil, status.Errorf(codes.Internal, "parse stored spec: %v", err)
-			}
-		}
-		if req.AllowOvercommit {
-			if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
-				return nil, err
-			}
-			s.audit(ctx, "vm.start", vm.Name,
-				fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
-					vm.HostName, spec.Cpu, spec.MemoryMib), "allow-overcommit")
-			lease, aerr := s.reserveWithoutCheck(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib))
-			if aerr != nil {
-				return nil, aerr
-			}
-			defer lease.release(ctx)
-		} else {
-			// Reserve-then-verify (F2): publish this start's demand before deciding,
-			// so a concurrent start on another node sees it instead of both reading a
-			// view containing neither.
-			//
-			// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
-			// per-VM overhead subtraction, so starting it adds both its guest memory
-			// and a new qemu overhead.
-			lease, aerr := s.admitHostWithReservation(ctx, "StartVM", vm.HostName, vm.Project, "vm:"+vm.Name, int(spec.Cpu), int(spec.MemoryMib), intentVMResident)
-			if aerr != nil {
-				return nil, aerr
-			}
-			defer lease.release(ctx)
-		}
+	// occupies. Anything else — stopped, error, mid-transition — is counted
+	// nowhere, so its whole size is admitted as new to the host.
+	if vm.State == "running" {
+		return nil, nil
 	}
-
-	return s.startVMLocked(ctx, vm)
+	if allowOvercommit {
+		if err := s.requireOvercommit(ctx, vmRBACPath(vm)); err != nil {
+			return nil, err
+		}
+		s.audit(ctx, "vm.start", vm.Name,
+			fmt.Sprintf("host capacity admission bypassed (--allow-overcommit) host=%s cpu=%d mem=%dMiB",
+				vm.HostName, cpu, memMiB), "allow-overcommit")
+		return s.reserveWithoutCheck(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB)
+	}
+	// Reserve-then-verify (F2): publish this start's demand before deciding,
+	// so a concurrent start on another node sees it instead of both reading a
+	// view containing neither.
+	//
+	// newVMOnHost=true: a stopped VM contributes nothing to usage OR to the
+	// per-VM overhead subtraction, so starting it adds both its guest memory
+	// and a new qemu overhead.
+	return s.admitHostWithReservation(ctx, method, vm.HostName, vm.Project, "vm:"+vm.Name, cpu, memMiB, intentVMResident)
 }
 
 // hardwareAdoptionRefused fails closed when the active hardware_v2 regime finds a VM
@@ -3700,6 +3731,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		req.GuestAgent == nil && req.SecureBoot == nil && req.Tpm == nil &&
 		req.MaxCpu == nil && req.DisableVnc == origDisableVnc
 	restartAfter := false
+	repair := false // a VM in error or mid-transition, redefined and started (see below)
 	if redefine {
 		if vm.State != "stopped" {
 			// UpdateVM NEVER restarts implicitly. A redefine-class change on a running
@@ -3722,6 +3754,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			if fresh.ActiveOperationID != "" {
 				return nil, status.Errorf(codes.FailedPrecondition, "cannot reconfigure %q: an operation is in progress", req.Name)
 			}
+			repair = compose.IsTransientOrErrorState(fresh.State)
 
 			// Host capacity admission for a reconfigure that GROWS the VM.
 			//
@@ -3743,7 +3776,35 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				wantMem = req.MemoryMib
 			}
 			cpuGrow, memGrow := posOnly(int(wantCPU-spec.Cpu)), posOnly(int(wantMem-spec.MemoryMib))
-			if req.AllowOvercommit {
+			if repair {
+				// A repair ends in a start, so it passes StartVM's gates first
+				// (startGatesLocked) — before anything of the VM is touched, so a
+				// refusal leaves it exactly as it was. The VM is in error or
+				// mid-transition and counted nowhere, so the host admits its
+				// WHOLE size as new, not the desired-minus-stored delta (zero for
+				// an unchanged spec). Quota still charges only the grow: the
+				// stored spec already counts toward the project.
+				if err := s.repairRefused(ctx, fresh); err != nil {
+					return nil, err
+				}
+				hostLease, gerr := s.startGatesLocked(ctx, "UpdateVM", fresh, int(wantCPU), int(wantMem), req.AllowOvercommit)
+				if gerr != nil {
+					return nil, gerr
+				}
+				defer hostLease.release(ctx)
+				updLease = hostLease
+				if cpuGrow > 0 || memGrow > 0 {
+					qLease, qerr := s.admitQuotaWithReservation(ctx, "UpdateVM", fresh.HostName, fresh.Project,
+						corrosion.WorkloadVM, req.Name,
+						corrosion.QuotaAmount{VCPU: cpuGrow, MemMiB: memGrow},
+						corrosion.QuotaAmount{VCPU: int(wantCPU), MemMiB: int(wantMem)}, intentResourceGrow)
+					if qerr != nil {
+						return nil, qerr
+					}
+					defer qLease.release(ctx)
+					updLease = qLease
+				}
+			} else if req.AllowOvercommit {
 				if err := s.requireOvercommit(ctx, vmRBACPath(fresh)); err != nil {
 					return nil, err
 				}
@@ -3785,13 +3846,19 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 				updLease = lease
 			}
 
-			if compose.IsTransientOrErrorState(fresh.State) {
+			if repair {
 				// A VM left in error or mid-transition (a create, start or
 				// rebuild that did not finish) has no clean shutdown to ask
 				// for — its domain may not even be defined. Make sure nothing
 				// of it runs, then redefine and start it: the repair a deploy
-				// retry asks for.
-				if active, _ := s.virt.DomainIsActive(req.Name); active {
+				// retry asks for. Whether it runs must be KNOWN: an absent
+				// domain does not, but any other error could hide a live guest.
+				active, aerr := s.virt.DomainIsActive(req.Name)
+				if aerr != nil && !lv.IsNotFound(aerr) {
+					return nil, status.Errorf(codes.Unavailable,
+						"cannot repair %q: whether its domain runs is unknown: %v", req.Name, aerr)
+				}
+				if active {
 					if derr := s.virt.DestroyDomain(req.Name); derr != nil {
 						return nil, status.Errorf(codes.Internal, "stop %q before its repair: %v", req.Name, derr)
 					}
@@ -3812,8 +3879,11 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			// (or a quota authority handoff) refused. The success path clears the
 			// flag before its own restart, so this fires only on the abort routes;
 			// if the restart itself also fails, say so plainly.
+			//
+			// Not for a repair: that VM was not running when asked, and a
+			// repair that fails leaves it as it was, stopped and in its state.
 			defer func() {
-				if !restartAfter {
+				if !restartAfter || repair {
 					return
 				}
 				if _, serr := s.startVMLocked(ctx, vm); serr != nil {

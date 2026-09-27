@@ -724,7 +724,7 @@ Control how VMs are updated when a compose file changes.
 
 A VM left in `error` (or mid-create, -start, -stop or -rebuild) by an operation that did not finish is **retried** by the next deploy, and a retry never replaces disks that exist:
 
-- **`retry — repaired in place, disks kept`** — disks are recorded for the VM: its domain is redefined from the desired spec over those disks (whether or not the domain is still defined) and started. Same disks, same MACs, same identity. A repair that fails is reported as a failed action and leaves the VM in `error`; it never falls back to a recreate.
+- **`retry — repaired in place, disks kept`** — disks are recorded for the VM: its domain is redefined from the desired spec over those disks (whether or not the domain is still defined) and started. Same disks, same MACs, same identity. The start is checked like `lv start`: it is refused without split-brain quorum, when the host has no room for the whole VM, or while the VM backs linked clones. A VM another operation is working on — one with a pending action, or one a failover or restart holds the start lease for — is not touched, and neither is one whose domain cannot be asked whether it runs. A refused repair changes nothing. A repair that fails is reported as a failed action and leaves the VM as it was; it never falls back to a recreate.
 - **`retry — created again (nothing was made)`** — no disks were made (the create failed before them), so the VM is created from scratch.
 
 A retry whose compose change is itself a change of identity (an image change, say) is a `recreate — disks are replaced` like any other.

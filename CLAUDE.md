@@ -143,9 +143,10 @@ Hardening features are gated on cluster-wide capability tokens
   cost of withholding is concrete: `internal/health/capability.go` has no role
   filter, so a **witness** with the flag off (its operator has no reason to set
   it) would hold the fence off fleet-wide forever; every node mid-rollout would
-  stop enforcing; and a config-on token that cannot latch consumes
-  `driveCapabilityActivation`'s one-token-per-cycle budget permanently, starving
-  every later token in `Supported()`
+  stop enforcing; and a config-on token that cannot latch costs
+  `driveCapabilityActivation` one Ping sweep of its one-token-per-cycle budget
+  on every rotation (`activateOneUnlatched` rotates its starting token, so later
+  tokens in `Supported()` still get their turn)
 - the latch is monotone and durable: once formed it survives a restart and does
   not re-open when a peer becomes unreachable (a partition fails **closed**)
 - enabling on one node changes nothing

@@ -1354,8 +1354,10 @@ so it happens only under a whole-cluster proof:
   with gossip membership**, because the replicated table can simply be missing a
   peer — and a peer missing from it would otherwise be absent from both samples,
   making the two samples agree about a cluster neither of them saw whole.
-  Membership converges in seconds and independently of every table, so a host it
-  names is a host that exists;
+  Gossip admits only hosts with a `hosts` row on the node that admits them (see
+  [the operating model](operating-model.md#gossip-admits-only-known-hosts-but-is-not-authenticated)),
+  so a host it names is one some node has admitted, and a node whose table
+  already has the row still counts it through that row;
 - that set is then **closed over every host's own membership view**: each one is
   asked which hosts it knows of at all, the answers are folded in, and the
   fan-out repeats until the set stops growing. A holder any reachable node can
@@ -1397,10 +1399,10 @@ so it happens only under a whole-cluster proof:
   substitute for the other. Its `hosts` rows include **tombstoned** ones: `lv
   host rm --force` does not power a machine off, so a host whose row a peer has
   soft-deleted may still be running the domain that holds the address. Its
-  **gossip members** are the only source that can name a host with no `hosts` row
-  anywhere — memberlist converges in seconds, independently of every table — so a
-  holder known only to another node's gossip is covered too, which no
-  table-derived answer could reach;
+  **gossip members** can name a host this node's table does not have yet: a node
+  that is still learning the cluster admits what its seeds introduce before it
+  holds their rows, so a holder known only to that node's gossip is covered too,
+  which no table-derived answer could reach;
 - the same membership proof gates the **bind**, not only the sweep. A node that
   cannot establish the host set does not go live on a prefix: its binding is
   suspended, and the next maintenance pass resumes it by itself. Handing out an

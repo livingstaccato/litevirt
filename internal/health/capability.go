@@ -304,6 +304,11 @@ func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, str
 // Membership rather than "every host that is not decommissioned": a host
 // outside memberlist receives nothing and so cannot stall, while demanding a
 // confirmation from an unreachable host would stop the latch ever forming.
+//
+// ADMITTED membership: Members() drops any gossip member that is not a live
+// hosts row at its recorded address (corrosion's gossip admission). Without that,
+// memberlist has no keyring, and one member injected onto the gossip segment
+// held this latch off cluster-wide (colonelpanik/litevirt#259).
 func (c *Checker) activationTargets(hosts []corrosion.HostRecord, token string) []string {
 	seen := make(map[string]bool, len(hosts))
 	out := make([]string, 0, len(hosts))

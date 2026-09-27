@@ -711,6 +711,35 @@ leadership churn or a partition.
   visible everywhere before I act" should use a confirmation read on the
   target peer, not assume convergence.
 
+### Gossip admits only known hosts, but is not authenticated
+- Gossip membership (memberlist, `gossip_port`) admits a member only when its
+  name is a `hosts` row this node holds that is not removed, and it announces
+  the address that row records. A name with no row, a removed host, and a real
+  host's name announced from another address are all refused, and none of them
+  counts anywhere membership is counted: relay election, replication and
+  anti-entropy targets, and the recipients a replication-gated capability such
+  as `lease_term_ledger_v1` must confirm.
+- A host that joins before its `hosts` row has replicated to some existing node
+  is refused by that node until the row arrives, then admitted by the next
+  gossip exchange that mentions it — memberlist's periodic full-state exchange,
+  30 s on the LAN profile and longer past 32 members. `lv host add` writes the
+  row on the node it talks to before it starts the new daemon, so that node
+  admits the newcomer at once, and the rest follow within replication time plus
+  that interval.
+- A node that holds no `hosts` row but its own, live or removed, and was given
+  `join_peers`, admits what its seeds introduce, because that is the only way a
+  newly added host can find the peers it learns the hosts table from. That
+  window closes at the first replicated row. A founder with no `join_peers`
+  never opens it.
+- A host whose gossip address differs from its recorded address is refused and
+  logged with both addresses. On a multi-homed host, set `advertise_address` to
+  the address the host was added with.
+- **An untrusted gossip segment is not supported.** Admission checks names and
+  addresses, and neither is a secret: gossip carries no key yet, so a machine on
+  the segment can still announce a real host's name from that host's own
+  address, or disturb failure detection. Keep `gossip_port` on a network only
+  cluster hosts can reach.
+
 ### Secret-bearing repair is peer-only
 - Secret-bearing config is **excluded from the operator-readable full-state
   dump**. `GetStateDump` (and the `lv cluster converge` digest report, which shows

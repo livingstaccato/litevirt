@@ -311,6 +311,14 @@ runtime every ~15s and restarts a down container per its policy, honouring
 `max-attempts`/`window`/`delay`. The cluster row is also synced to the runtime's
 reality, so `lv ct ls` and the detail view never disagree.
 
+A container that has been created and never started has not stopped, so the
+restart policy does not apply to it: it stays stopped until `lv ct start` (or
+the start `lv compose up` makes right after the create). The reconciler also
+takes the same per-container lock as `lv ct create`, `start`, `stop` and `rm`
+on that host, and reads the row again once it holds it, so a sweep never acts
+on a container while one of those is changing it — a `lv ct stop` that lands
+mid-sweep stays stopped.
+
 **Caveat (coarser than VMs):** LXC reports only `RUNNING`/`STOPPED`/`FROZEN` — no
 stop *reason*. A container therefore cannot distinguish a clean in-guest shutdown
 from a crash. Only an operator `lv ct stop` is guaranteed-stick (it records

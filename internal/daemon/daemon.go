@@ -1218,6 +1218,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ctChecker.SetGate(d.checker)
 	ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
 	ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
+	// The sweep holds the same per-container lock as this host's container
+	// operations, so it never reconciles a container mid-create/start/stop.
+	ctChecker.SetContainerLock(svc.LockContainer)
 	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume

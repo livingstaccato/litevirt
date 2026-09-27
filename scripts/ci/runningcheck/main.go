@@ -29,7 +29,9 @@
 //     at runtime — must be graduated by an assignOwnerEpochAtCreate call in the
 //     same function. An insert lands at the vm_owner_epoch column default of 0,
 //     convergence early-returns on zero, and the backfill that would graduate it
-//     is gated behind enforcement.owner_epoch, which is off by default.
+//     is gated behind enforcement.owner_epoch, which is off by default. The
+//     production create paths insert a VM that will run as "creating" and let
+//     assignOwnerEpochAtCreate publish it running after the markers.
 //  5. Every SQL statement in production code that writes the vms.state column
 //     must be registered in the stateWritingStatements inventory below. Rules 1-4
 //     police call sites against hand-maintained maps of writer NAMES, and a map

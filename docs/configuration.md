@@ -898,7 +898,7 @@ difference rather than a judgement that this endpoint carries less.
 | `metrics_port` | 7444 | HTTP | **no** | **all** | Prometheus `/metrics` — see above |
 | `ui_port` | 7445 | HTTP | session cookie | `127.0.0.1` | Web dashboard |
 | `rest_port` | 7446 | HTTP | bearer token | `127.0.0.1` | REST API gateway |
-| `gossip_port` | 7946 | TCP+UDP | **no** — no memberlist `SecretKey` | **all** | Cluster membership |
+| `gossip_port` | 7946 | TCP+UDP | **no** — no memberlist `SecretKey`; members are admitted only if they are in the `hosts` table ([details](operating-model.md#gossip-admits-only-known-hosts-but-is-not-authenticated)) | **all** | Cluster membership |
 | `dns_port` | 5354 | UDP | **no** | **all** | VM name DNS |
 
 Three of these are unauthenticated, not one. `rest_port` and `ui_port` are

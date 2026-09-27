@@ -82,6 +82,10 @@ type Config struct {
 	AdvertiseAddr string
 	BindPort      int      // gossip port (default 7946)
 	JoinPeers     []string // initial peers to join
+
+	// pushPullInterval overrides memberlist's periodic full-state exchange.
+	// Test-only: zero keeps the LAN default.
+	pushPullInterval time.Duration
 }
 
 // Client is the embedded state store with WAL-based replication.
@@ -102,6 +106,15 @@ type Client struct {
 	// has not replicated yet — the bootstrap case — and it had no test at all,
 	// because a harness without a real memberlist can never reach that branch.
 	membersForTests func() []PeerInfo
+	// gossipForTests overrides the RAW memberlist view that Members() filters
+	// through admission. See SetGossipForTests.
+	gossipForTests func() []PeerInfo
+	// gossipSeeded records that this node was started with join_peers, which is
+	// what lets a node that knows no other host trust what its seeds introduce.
+	// See gossip_admission.go.
+	gossipSeeded bool
+	// admission is the last gossip-admission snapshot read successfully.
+	admission atomic.Pointer[gossipAdmission]
 	// freshness records whether this node's replica has been reconciled
 	// against a peer since it last had reason to believe it is stale. See
 	// ReplicaCaughtUp.
@@ -807,8 +820,21 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	mlCfg.AdvertiseAddr = cfg.AdvertiseAddr
 	mlCfg.LogOutput = &slogWriter{}
 
+	if cfg.pushPullInterval > 0 {
+		mlCfg.PushPullInterval = cfg.pushPullInterval
+	}
+
 	del := &delegate{client: c}
 	mlCfg.Delegate = del
+	// Admission: only hosts in this cluster's hosts table become members (see
+	// gossip_admission.go). Both delegates are needed — memberlist notes that a
+	// merge delegate alone misses passive merging — and the first snapshot is
+	// taken now, before memberlist exists, so the delegate always has one.
+	c.gossipSeeded = len(cfg.JoinPeers) > 0
+	c.loadAdmission()
+	adm := &admissionDelegate{client: c}
+	mlCfg.Alive = adm
+	mlCfg.Merge = adm
 	// EventDelegate wakes the replicator's discovery loop on membership changes
 	// (separate from Delegate, which carries gossip metadata) — set before Create.
 	mlCfg.Events = &membershipEvents{client: c}
@@ -1268,7 +1294,6 @@ func (c *Client) HostName() string {
 	return c.hostName
 }
 
-// Members returns the current memberlist members (for peer discovery).
 // kickMembership wakes the replicator's peer-discovery loop after a gossip
 // membership change. Non-blocking and coalescing: a kick already pending covers
 // this one, so it's safe to call from memberlist's event goroutines.
@@ -1286,26 +1311,50 @@ func (c *Client) MembershipChanged() <-chan struct{} {
 	return c.membershipNotify
 }
 
+// Members returns this node's ADMITTED gossip peers, self excluded: memberlist
+// members that pass the gossip admission predicate (see gossip_admission.go).
+//
+// Everything that counts or dials membership reads it — relay election's N and
+// R, the replicator's targets, anti-entropy, the re-join loop's "do I see
+// anyone", capability activation — so the filter is here, once, and not in each
+// of them. The memberlist delegates already refuse a non-admitted member at the
+// door; this second pass drops one admitted earlier whose standing has since
+// changed — bootstrap-trusted before this node learned the cluster, tombstoned
+// by a removal, or re-addressed by a re-admission.
 func (c *Client) Members() []PeerInfo {
 	if fn := c.membersForTests; fn != nil {
 		return fn()
 	}
-	if c.list == nil {
-		return nil
-	}
-	var peers []PeerInfo
-	for _, m := range c.list.Members() {
-		if m.Name == c.hostName {
-			continue
+	var raw []PeerInfo
+	if fn := c.gossipForTests; fn != nil {
+		raw = fn()
+	} else {
+		if c.list == nil {
+			return nil
 		}
-		peers = append(peers, PeerInfo{Name: m.Name, Addr: m.Address()})
+		for _, m := range c.list.Members() {
+			raw = append(raw, PeerInfo{Name: m.Name, Addr: m.Address()})
+		}
 	}
-	return peers
+	peers := make([]PeerInfo, 0, len(raw))
+	for _, p := range raw {
+		if p.Name != c.hostName {
+			peers = append(peers, p)
+		}
+	}
+	return c.admittedOnly(peers)
 }
 
-// SetMembersForTests injects gossip membership. Test-only; production membership
-// comes from memberlist.
+// SetMembersForTests injects the ADMITTED membership view directly, bypassing
+// admission — for tests that model what a node has already let in. Test-only;
+// production membership comes from memberlist.
 func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
+
+// SetGossipForTests injects RAW memberlist membership, which Members() then
+// filters through gossip admission exactly as it filters memberlist's. Use it to
+// model what an unauthenticated gossip segment can put in front of a node.
+// Test-only.
+func (c *Client) SetGossipForTests(fn func() []PeerInfo) { c.gossipForTests = fn }
 
 // PeerInfo holds basic peer identity from memberlist.
 type PeerInfo struct {

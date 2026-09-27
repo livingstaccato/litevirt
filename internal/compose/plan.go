@@ -9,6 +9,18 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
+// NameCollision is the refusal for a planned create whose name a workload
+// outside this stack already holds. exists says what holds it (`vm "v1" already
+// exists`); owner is that workload's stack, "" for one outside any stack.
+// Shared by the server's plan and `lv compose diff`, so both say the same.
+func NameCollision(exists, owner string) string {
+	where := "outside any stack"
+	if owner != "" {
+		where = fmt.Sprintf("in stack %q", owner)
+	}
+	return exists + " " + where + " — rename it in this file or delete it there"
+}
+
 // OpKind is the type of change in an execution plan.
 type OpKind string
 

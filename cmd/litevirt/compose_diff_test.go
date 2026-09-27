@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
@@ -44,7 +46,7 @@ func (p *projectionClient) InspectVM(_ context.Context, in *pb.InspectVMRequest,
 			return vm, nil
 		}
 	}
-	return nil, os.ErrNotExist
+	return nil, status.Errorf(codes.NotFound, "VM %q not found", in.Name)
 }
 
 func TestComposeDiff_UnchangedCloudInitStackIsNoChange(t *testing.T) {
@@ -143,5 +145,48 @@ func TestComposeDiff_CPUModeEditIsUpdate(t *testing.T) {
 	})
 	if !strings.Contains(out, "1 to update") || !strings.Contains(out, "cpu-mode") {
 		t.Errorf("a cpu-mode edit must show as an update naming the reason, got:\n%s", out)
+	}
+}
+
+// VM names are cluster-wide: a create whose name a VM of another stack holds
+// is refused by the diff as the server's plan refuses it, instead of showing
+// "+ create". A VM of no stack collides the same way; a new name does not.
+func TestComposeDiff_CreateCollidingWithAnotherStackIsRefused(t *testing.T) {
+	yaml := "name: app_v2\nvms:\n  v1:\n    image: LTS-24.04\n  lone:\n    image: LTS-24.04\n  fresh:\n    image: LTS-24.04\n"
+	file := filepath.Join(t.TempDir(), "litevirt.yaml")
+	if err := os.WriteFile(file, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origConnect := cli.Connect
+	t.Cleanup(func() { cli.Connect = origConnect })
+	cli.Connect = func(_ context.Context) (pb.LiteVirtClient, func(), error) {
+		return &projectionClient{full: []*pb.VM{
+			{Name: "v1", StackName: "app", HostName: "h1", State: pb.VMState_VM_RUNNING, Spec: &pb.VMSpec{Name: "v1"}},
+			{Name: "lone", HostName: "h1", State: pb.VMState_VM_RUNNING, Spec: &pb.VMSpec{Name: "lone"}},
+		}}, func() {}, nil
+	}
+	var err error
+	out := captureStdout(t, func() {
+		cmd := newDiffCmd()
+		cmd.SetArgs([]string{"-f", file})
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		err = cmd.Execute()
+	})
+	if err == nil {
+		t.Fatalf("diff of a file whose v1 is another stack's VM passed:\n%s", out)
+	}
+	for _, want := range []string{
+		`vm "v1" already exists in stack "app" — rename it in this file or delete it there`,
+		`vm "lone" already exists outside any stack — rename it in this file or delete it there`,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("diff error %q\nwant it to contain %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), `"fresh"`) {
+		t.Errorf("fresh collides with nothing but was reported: %v", err)
+	}
+	if strings.Contains(out, "+ create v1") {
+		t.Errorf("diff still shows the colliding create:\n%s", out)
 	}
 }

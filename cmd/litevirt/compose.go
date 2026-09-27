@@ -431,6 +431,11 @@ func newDiffCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
+				if collisions, err := composeDiffNameCollisions(ctx, c, f, plan); err != nil {
+					return err
+				} else if len(collisions) > 0 {
+					return fmt.Errorf("pre-deploy validation failed:\n  - %s", strings.Join(collisions, "\n  - "))
+				}
 
 				fmt.Println(plan.Summary())
 				for _, op := range plan.Ops {
@@ -454,6 +459,36 @@ func newDiffCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&file, "file", "f", "litevirt-compose.yaml", "Compose file path")
 	return cmd
+}
+
+// composeDiffNameCollisions is the diff's copy of the server plan's name check:
+// a VM the diff would create whose name a VM of another stack (or of no stack)
+// already holds. VM names are cluster-wide, so `lv compose up` would refuse the
+// file; the diff says so instead of showing a create. Containers are left to
+// the server's plan: their names are per host, and only placement knows the
+// host.
+func composeDiffNameCollisions(ctx context.Context, c pb.LiteVirtClient, f *compose.File, plan *compose.Plan) ([]string, error) {
+	var out []string
+	for _, op := range plan.Ops {
+		if op.Kind != compose.OpCreate {
+			continue
+		}
+		if def, _ := compose.FindVMDef(f, op.VMName); def != nil &&
+			(def.Kind == compose.WorkloadKindLXC || def.Kind == compose.WorkloadKindOCI) {
+			continue
+		}
+		vm, err := c.InspectVM(ctx, &pb.InspectVMRequest{Name: op.VMName})
+		if status.Code(err) == codes.NotFound {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect %s: %w", op.VMName, err)
+		}
+		if vm.GetStackName() != f.Name {
+			out = append(out, compose.NameCollision(fmt.Sprintf("vm %q already exists", op.VMName), vm.GetStackName()))
+		}
+	}
+	return out, nil
 }
 
 func newStackLsCmd() *cobra.Command {

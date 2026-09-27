@@ -84,8 +84,10 @@ of acting — it says nothing about whether the resulting rows have replicated.
 
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
-  observers report `consecutive_failures ≥ 5` for it (where N is non-offline
-  active hosts). Stale observer rows (older than 30 s) are excluded.
+  observers report `consecutive_failures ≥ 5` for it (where N is the voter
+  set: every host not `offline`, `maintenance` or `fenced`, witnesses
+  included, in every region). Stale observer rows (older than 30 s) are
+  excluded.
 - **Leader-gated recovery — best-effort, not exclusive.** The lease is a CRDT
   row with a 45 s TTL, re-validated before every destructive action. A CRDT row
   store cannot offer linearisable compare-and-swap across a partition, so the
@@ -670,6 +672,26 @@ leadership churn or a partition.
   lv host config witness-1 --role witness
   ```
 
+### A site partition is a majority/minority split of one cluster
+- Region is a placement label, not an HA boundary. Quorum, gossip and health
+  probes span every region, and failover picks its targets from every `active`
+  host in the cluster. So when the link between two sites fails, the site
+  holding a majority of voters fences the other site's hosts and reschedules
+  their workloads onto itself, across the WAN, even though the other site may
+  be alive. The minority site stalls. It fences and reschedules nothing, and
+  its runtime-ownership actions refuse without quorum. Its running workloads
+  keep running.
+- What protects you on the majority side is the fence strategy.
+  `ipmi` over a management path that survives the partition powers the
+  minority off first. `ssh` and `manual`, and `ipmi` with an unreachable BMC,
+  all fail closed and move nothing. `best-effort` does not: without
+  `enforcement.safe_fence_default`, it reschedules VMs that are still running
+  on the other side.
+- Region-scoped quorum and failover are not available. Keep an odd number of
+  voting sites, or put a witness in a third site, and pin workloads that must
+  not cross with `placement.require` on a per-site host label. See
+  [Federation](federation.md) → "Regions and failure" for the full contract.
+
 ### NTP is required
 - All hosts must run NTP (chrony / systemd-timesyncd / ntpd). HLC tolerates
   ±5 minutes, but **anti-entropy LWW depends on monotonic, comparable
@@ -755,8 +777,9 @@ leadership churn or a partition.
   `healthFreshness`, and `leaseDuration` proportionally to avoid lease
   thrash.
 - **Multi-DC (RTT > 100 ms)**: supported in principle; tune intervals up
-  significantly. The federation API on the roadmap is the recommended
-  approach for cross-DC clusters once it ships.
+  significantly. A multi-DC cluster is still one failure domain: a site
+  partition fences and reschedules across the WAN (see "A site partition is a
+  majority/minority split of one cluster" above).
 
 ### Fencing strategy
 - **Production with shared storage**: `ipmi` (mandatory). SSH and watchdog

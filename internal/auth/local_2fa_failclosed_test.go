@@ -20,10 +20,7 @@ import (
 // from it must reach the caller rather than being folded into "no factors".
 func TestLocalRealm_A2FAReadThatFailsDeniesRatherThanDowngrades(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -55,10 +52,7 @@ func TestLocalRealm_A2FAReadThatFailsDeniesRatherThanDowngrades(t *testing.T) {
 // authenticates and is not asked for one.
 func TestLocalRealm_NoEnrolledFactorStillAuthenticates(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -73,5 +67,44 @@ func TestLocalRealm_NoEnrolledFactorStillAuthenticates(t *testing.T) {
 	}
 	if p.Requires2FA {
 		t.Error("Requires2FA = true for a user with no enrolled factor")
+	}
+}
+
+// TestLocalRealm_UnhydratedCredentialsRefuse is the same downgrade reached by a
+// different route.
+//
+// A reseed DELETEs the secret-bearing tables and repopulates them from a peer.
+// Between those two steps -- or permanently, if the sensitive merge fails --
+// user_2fa is readable and EMPTY, which ListUser2FA reports as "no factors
+// enrolled". The table is not unreadable, so the check above does not fire, and
+// every enrolled operator authenticates with a password alone on that node.
+//
+// The discard marks the node unhydrated and only a landed sensitive merge
+// clears it; while it is set, this must refuse rather than downgrade.
+func TestLocalRealm_UnhydratedCredentialsRefuse(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	hash, _ := bcrypt.GenerateFromPassword([]byte("correct-horse"), bcrypt.DefaultCost)
+	if err := corrosion.InsertUser(ctx, db, "carol", "admin", string(hash)); err != nil {
+		t.Fatalf("InsertUser: %v", err)
+	}
+
+	// The state a half-finished reseed leaves: users populated, secrets empty.
+	db.MarkCredentialsUnhydrated()
+
+	p, err := NewLocalRealm(db).Authenticate(ctx, Credentials{Username: "carol", Password: "correct-horse"})
+	if err == nil {
+		t.Fatalf("an admin authenticated against a node whose credential tables are not "+
+			"hydrated; principal = %+v (Requires2FA=%v) — an empty user_2fa is not proof "+
+			"that the account has no second factor", p, p != nil && p.Requires2FA)
+	}
+
+	// And the ordinary path returns once the merge lands.
+	db.ClearCredentialsUnhydrated()
+	if _, err := NewLocalRealm(db).Authenticate(ctx, Credentials{Username: "carol", Password: "correct-horse"}); err != nil {
+		t.Fatalf("a hydrated node refused a valid login: %v", err)
 	}
 }

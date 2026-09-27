@@ -141,10 +141,7 @@ func TestPCISpecParsing_NoDevicesField(t *testing.T) {
 // TestCorrosion_ListPCIDevices_FilterByType verifies that ListPCIDevices
 // correctly filters devices by type on a given host.
 func TestCorrosion_ListPCIDevices_FilterByType(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

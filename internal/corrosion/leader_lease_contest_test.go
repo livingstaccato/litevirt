@@ -203,3 +203,50 @@ func TestLeaseContest_AStoodDownLoserIsNotReportedAsHolder(t *testing.T) {
 		t.Fatalf("host-b lost the contest for term 1 to host-a but IsLeaseHolder=%v err=%v, want false", got, err)
 	}
 }
+
+// A retirement hands a term, so it records that this incarnation holds one.
+//
+// The retire path returned its freshly minted term without noteHandedTerm. A
+// process whose incarnation was recorded termless — it took the lease while the
+// mint gate was closed — therefore kept that record after retiring: the next
+// tick failed the renewal case's "this incarnation owns the term" check, fell
+// through to an acquisition, and minted AGAIN, invalidating the in-flight work
+// it had just started under the retired-into term.
+func TestLeaseContest_ARetirementIsRecordedAsThisIncarnationsTerm(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	contestedTenure(t, c, "host-a", "host-b")
+	c.noteHandedTerm(LeaseKeyFailover, 0) // this incarnation had held the lease termless
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-a", time.Minute, leaseTestNow.Add(5*time.Second))
+	if err != nil || !held || term != 2 {
+		t.Fatalf("retirement: held=%v term=%d err=%v, want held at term 2", held, term, err)
+	}
+	held, term, err = AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-a", time.Minute, leaseTestNow.Add(10*time.Second))
+	if err != nil || !held || term != 2 {
+		t.Fatalf("tick after retirement: held=%v term=%d err=%v, want a renewal at term 2, not a fresh mint", held, term, err)
+	}
+}
+
+// A non-minimum claimant stands down even when its current incarnation is
+// termless. The contested term naming it is an earlier tenure's, but minting a
+// fresh term over it would promote this node above the claimant every replica
+// already treats as the holder (IsLeaseHolder) and restart the contest one
+// term higher.
+func TestLeaseContest_ATermlessLoserStandsDown(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	contestedTenure(t, c, "host-b", "host-a")
+	c.noteHandedTerm(LeaseKeyFailover, 0) // this incarnation had held the lease termless
+
+	held, term, err := AcquireLeaseWithTerm(ctx, c, LeaseKeyFailover, "host-b", time.Minute, leaseTestNow.Add(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held {
+		t.Fatalf("termless loser held the lease at term %d; host-a sorts lower and continues", term)
+	}
+	if n, _ := CurrentLeaseTerm(ctx, c, LeaseKeyFailover); n != 1 {
+		t.Errorf("a standing-down termless loser moved the threshold to %d; it must mint nothing", n)
+	}
+}

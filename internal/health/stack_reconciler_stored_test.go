@@ -18,6 +18,9 @@ type unreadableStackCleaner struct {
 func (c *unreadableStackCleaner) DeleteVMForStackCleanup(context.Context, *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
+func (c *unreadableStackCleaner) DeleteContainerForStackCleanup(context.Context, *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
 func (c *unreadableStackCleaner) RemoveLBForStack(context.Context, string, []corrosion.VMRecord) {}
 func (c *unreadableStackCleaner) DeprovisionNetworkByName(_ context.Context, name string) error {
 	c.deprovisioned = append(c.deprovisioned, name)
@@ -31,10 +34,7 @@ func (c *unreadableStackCleaner) ExternalNetworkNames(context.Context, string) (
 // external is unknown: the reconciler deprovisions none, and keeps the stack
 // in "deleting" rather than tombstoning it with its networks unaccounted for.
 func TestStackReconciler_UnreadableStoredComposeKeepsNetworksAndStack(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatal(err)

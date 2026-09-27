@@ -4,6 +4,9 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // An isolated node has to be able to find the cluster again.
@@ -128,5 +131,34 @@ func TestRejoiner_NoTargetsIsNotAnAttempt(t *testing.T) {
 	}
 	if attempted, _, err := r.tick(); attempted || err != nil {
 		t.Errorf("attempted=%v err=%v; a single-node cluster is not a fault", attempted, err)
+	}
+}
+
+// TestClose_StopsTheMembershipLoop: the re-join loop belongs to its client and
+// has to end with it. A loop that outlived Close read the hosts table through a
+// closed database and stamped the isolation condition into a data directory
+// that may already be gone — which the monotonic-clock persistence answers by
+// exiting the process, taking a whole test binary (or a daemon mid-shutdown)
+// down with it.
+func TestClose_StopsTheMembershipLoop(t *testing.T) {
+	c, err := NewClient(Config{
+		HostName: "node-a",
+		DataDir:  t.TempDir(),
+		BindAddr: "127.0.0.1",
+		BindPort: freePort(t),
+	}, hlc.NewClock("node-a"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if c.membershipDone == nil {
+		t.Fatal("NewClient started no membership loop")
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Close did not return: it is waiting on a membership loop nothing stopped")
 	}
 }

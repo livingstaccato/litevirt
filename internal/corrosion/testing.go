@@ -12,8 +12,35 @@ import (
 
 var testDBCounter atomic.Int64
 
+// TestingT is the part of testing.TB that NewTestClientT needs. It is an
+// interface so this non-test file does not import "testing".
+type TestingT interface {
+	Helper()
+	Fatalf(format string, args ...any)
+	Cleanup(func())
+}
+
+// NewTestClientT is NewTestClient for a test: it fails t on error and closes
+// the client when t finishes.
+//
+// Prefer it. A shared-cache in-memory database lives exactly as long as a
+// handle to it is open, and modernc's sqlite allocates outside the Go heap, so
+// an unclosed test client holds ~2 MB that neither the GC nor a heap profile
+// ever sees. Leaked once per test, that grew the internal/grpcapi test binary
+// to 4.4 GB of RSS.
+func NewTestClientT(t TestingT) *Client {
+	t.Helper()
+	c, err := NewTestClient()
+	if err != nil {
+		t.Fatalf("corrosion.NewTestClient: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
 // NewTestClient creates an in-memory SQLite client with no gossip.
-// Intended for use in tests across packages.
+// Intended for use in tests across packages. The caller must Close it — see
+// NewTestClientT, which does.
 func NewTestClient() (*Client, error) {
 	// Each test client gets a unique in-memory DB
 	id := testDBCounter.Add(1)
@@ -77,3 +104,8 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		leaseTermLedger:  testLeaseTermLedgerOpen,
 	}, nil
 }
+
+// SetDataDirForTest points a test client at a data directory, so the node-local
+// markers that survive a restart (the credentials-unhydrated mark) can be
+// exercised without standing up a daemon.
+func (c *Client) SetDataDirForTest(dir string) { c.dataDir = dir }

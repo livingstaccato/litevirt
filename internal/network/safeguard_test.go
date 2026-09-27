@@ -20,10 +20,7 @@ func TestSafeProvision_DirectSkipsSafeguard(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -85,10 +82,7 @@ func TestSafeProvision_RollbackOnConnectivityLoss(t *testing.T) {
 	SafeProvisionTimeout = 12 * time.Second
 	defer func() { SafeProvisionTimeout = origTimeout }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -99,7 +93,7 @@ func TestSafeProvision_RollbackOnConnectivityLoss(t *testing.T) {
 		Interface: "lv-test-br",
 	}
 
-	_, err = SafeProvision(ctx, db, "test-net", def, "127.0.0.1", "test-host")
+	_, err := SafeProvision(ctx, db, "test-net", def, "127.0.0.1", "test-host")
 	if err == nil {
 		t.Fatal("expected error from SafeProvision after connectivity loss, got nil")
 	}

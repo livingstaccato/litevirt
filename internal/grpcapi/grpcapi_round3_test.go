@@ -20,10 +20,7 @@ import (
 // ── NewServer constructor ───────────────────────────────────────────────────
 
 func TestR3_NewServer(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	corrosion.InitSchema(ctx, db)
 

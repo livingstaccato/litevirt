@@ -16,7 +16,10 @@ import (
 // assertion. An unread field that nothing checks is the shape that lets a
 // silent drop pass review.
 func TestAcquireDualRunLease_RecordsTerm(t *testing.T) {
-	s1 := dualRunTestServer(t, 2)
+	// Not dualRunTestServer: that fixture takes the lease, which is what a
+	// real pass always follows. This test is about the acquire itself, so it
+	// has to start before one.
+	s1 := dualRunTestServerNoLease(t, 2)
 	s2 := &Server{hostName: "h2", db: s1.db, events: events.NewBus()}
 	ctx := context.Background()
 

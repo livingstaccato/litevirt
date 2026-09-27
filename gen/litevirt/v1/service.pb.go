@@ -20647,8 +20647,14 @@ type ReplicateRequest struct {
 	Entries             []*MutationEntry       `protobuf:"bytes,3,rep,name=entries,proto3" json:"entries,omitempty"`                                                       // mutations to push to the receiver
 	SenderVersion       string                 `protobuf:"bytes,4,opt,name=sender_version,json=senderVersion,proto3" json:"sender_version,omitempty"`                      // sender's binary version, e.g. "0.5.2"
 	SenderSchemaVersion int32                  `protobuf:"varint,5,opt,name=sender_schema_version,json=senderSchemaVersion,proto3" json:"sender_schema_version,omitempty"` // sender's CurrentSchemaVersion
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// The sender's belief that the RECEIVER is a relay. Relay eligibility comes
+	// from hosts.state, which replicates asynchronously, so two nodes can
+	// compute different relay sets; a receiver that does not share the sender's
+	// belief used to apply the push locally and forward nothing. Absent (false)
+	// from a released peer, which reproduces exactly that prior behaviour.
+	ReceiverIsRelay bool `protobuf:"varint,6,opt,name=receiver_is_relay,json=receiverIsRelay,proto3" json:"receiver_is_relay,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ReplicateRequest) Reset() {
@@ -20714,6 +20720,13 @@ func (x *ReplicateRequest) GetSenderSchemaVersion() int32 {
 		return x.SenderSchemaVersion
 	}
 	return 0
+}
+
+func (x *ReplicateRequest) GetReceiverIsRelay() bool {
+	if x != nil {
+		return x.ReceiverIsRelay
+	}
+	return false
 }
 
 type ReplicateResponse struct {
@@ -22478,8 +22491,14 @@ func (x *RebalanceProposal) GetDetail() string {
 }
 
 type ListRebalanceProposalsRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StatusFilter  string                 `protobuf:"bytes,1,opt,name=status_filter,json=statusFilter,proto3" json:"status_filter,omitempty"` // empty = all
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	StatusFilter string                 `protobuf:"bytes,1,opt,name=status_filter,json=statusFilter,proto3" json:"status_filter,omitempty"` // empty = all
+	// limit caps the page size. 0 means the server default; the server also
+	// applies a hard ceiling, so the response can never outgrow the gRPC
+	// message limit however large the table is.
+	Limit int32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
+	// offset pages through older proposals, newest first.
+	Offset        int32 `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22521,9 +22540,28 @@ func (x *ListRebalanceProposalsRequest) GetStatusFilter() string {
 	return ""
 }
 
+func (x *ListRebalanceProposalsRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+func (x *ListRebalanceProposalsRequest) GetOffset() int32 {
+	if x != nil {
+		return x.Offset
+	}
+	return 0
+}
+
 type ListRebalanceProposalsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Proposals     []*RebalanceProposal   `protobuf:"bytes,1,rep,name=proposals,proto3" json:"proposals,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Proposals []*RebalanceProposal   `protobuf:"bytes,1,rep,name=proposals,proto3" json:"proposals,omitempty"`
+	// total_count is how many proposals match status_filter, ignoring
+	// limit/offset, so a caller can tell a full page from the whole table.
+	TotalCount int32 `protobuf:"varint,2,opt,name=total_count,json=totalCount,proto3" json:"total_count,omitempty"`
+	// truncated is true when more rows match past this page.
+	Truncated     bool `protobuf:"varint,3,opt,name=truncated,proto3" json:"truncated,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -22563,6 +22601,20 @@ func (x *ListRebalanceProposalsResponse) GetProposals() []*RebalanceProposal {
 		return x.Proposals
 	}
 	return nil
+}
+
+func (x *ListRebalanceProposalsResponse) GetTotalCount() int32 {
+	if x != nil {
+		return x.TotalCount
+	}
+	return 0
+}
+
+func (x *ListRebalanceProposalsResponse) GetTruncated() bool {
+	if x != nil {
+		return x.Truncated
+	}
+	return false
 }
 
 type RunRebalanceRequest struct {
@@ -27783,13 +27835,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03seq\x18\x01 \x01(\x03R\x03seq\x12\x10\n" +
 	"\x03hlc\x18\x02 \x01(\tR\x03hlc\x12\x16\n" +
 	"\x06origin\x18\x03 \x01(\tR\x06origin\x12\x14\n" +
-	"\x05stmts\x18\x04 \x01(\tR\x05stmts\"\xd8\x01\n" +
+	"\x05stmts\x18\x04 \x01(\tR\x05stmts\"\x84\x02\n" +
 	"\x10ReplicateRequest\x12\x16\n" +
 	"\x06sender\x18\x01 \x01(\tR\x06sender\x12\x1b\n" +
 	"\tafter_seq\x18\x02 \x01(\x03R\bafterSeq\x124\n" +
 	"\aentries\x18\x03 \x03(\v2\x1a.litevirt.v1.MutationEntryR\aentries\x12%\n" +
 	"\x0esender_version\x18\x04 \x01(\tR\rsenderVersion\x122\n" +
-	"\x15sender_schema_version\x18\x05 \x01(\x05R\x13senderSchemaVersion\"7\n" +
+	"\x15sender_schema_version\x18\x05 \x01(\x05R\x13senderSchemaVersion\x12*\n" +
+	"\x11receiver_is_relay\x18\x06 \x01(\bR\x0freceiverIsRelay\"7\n" +
 	"\x11ReplicateResponse\x12\"\n" +
 	"\rapplied_up_to\x18\x01 \x01(\x03R\vappliedUpTo\"A\n" +
 	"\n" +
@@ -27933,11 +27986,16 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"expires_at\x18\n" +
 	" \x01(\tR\texpiresAt\x12\x16\n" +
-	"\x06detail\x18\v \x01(\tR\x06detail\"D\n" +
+	"\x06detail\x18\v \x01(\tR\x06detail\"r\n" +
 	"\x1dListRebalanceProposalsRequest\x12#\n" +
-	"\rstatus_filter\x18\x01 \x01(\tR\fstatusFilter\"^\n" +
+	"\rstatus_filter\x18\x01 \x01(\tR\fstatusFilter\x12\x14\n" +
+	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
+	"\x06offset\x18\x03 \x01(\x05R\x06offset\"\x9d\x01\n" +
 	"\x1eListRebalanceProposalsResponse\x12<\n" +
-	"\tproposals\x18\x01 \x03(\v2\x1e.litevirt.v1.RebalanceProposalR\tproposals\".\n" +
+	"\tproposals\x18\x01 \x03(\v2\x1e.litevirt.v1.RebalanceProposalR\tproposals\x12\x1f\n" +
+	"\vtotal_count\x18\x02 \x01(\x05R\n" +
+	"totalCount\x12\x1c\n" +
+	"\ttruncated\x18\x03 \x01(\bR\ttruncated\".\n" +
 	"\x13RunRebalanceRequest\x12\x17\n" +
 	"\adry_run\x18\x01 \x01(\bR\x06dryRun\"C\n" +
 	"\x14RunRebalanceResponse\x12+\n" +

@@ -259,18 +259,29 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	}
 	if err := s.db.MergeSensitiveStateBytesLWW(sensitiveDump); err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
+		// The unhydrated mark set by the discard stays SET here, which is what
+		// makes this error a refusal rather than a warning: until a reseed
+		// repopulates them, password logins on this node are refused instead
+		// of silently dropping the second factor.
 		return nil, status.Errorf(codes.Internal,
 			"merge sensitive state from %s (this node's secret-bearing tables are now "+
 				"EMPTY and it needs a repeat reseed before it can serve): %v", source, err)
 	}
 
 	// The window is shut: user_2fa is restored, so the login gate may lift.
+	//
+	// BOTH gates, because they fail in different directions. The durable
+	// reseed marker survives a crash between the two merges; the in-memory
+	// unhydrated mark is what LocalRealm.Authenticate consults on the hot path
+	// without a read. A reseed that lifted one and not the other would either
+	// wedge logins forever or reopen the window it just closed.
 	if err := s.db.FinishReseed(ctx, reseedGeneration); err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal,
 			"state was restored from %s but this node could not clear its reseed marker, so it "+
 				"will keep refusing logins until it does: %v", source, err)
 	}
+	s.db.ClearCredentialsUnhydrated()
 
 	// VERIFY convergence before clearing anything. Only a verified reseed earns
 	// the epoch clear; anything else leaves the node isolated with the reason

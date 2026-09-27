@@ -112,7 +112,7 @@ type ReplicaPromoter interface {
 	// old owner that authorizes this cross-host transfer (see proofGradeFenceRef);
 	// "" when no proof-grade fence exists (a best-effort/SSH fence), which the
 	// executor treats as fail-closed for a shared-disk VM.
-	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string) error
+	AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64) error
 }
 
 // ContainerRestorer restores a container onto a survivor host from its latest
@@ -392,8 +392,18 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	// Leader election: only one coordinator may drive recovery at a time.
 	// Acquire (or renew) the lease; if another coordinator holds it, skip.
-	if !c.acquireLease(ctx) {
-		c.stepDownGauges()
+	held, leaseErr := c.acquireLeaseResult(ctx)
+	if !held {
+		// stepDownGauges publishes stranded_workloads = 0, which is a CLAIM
+		// that nothing is stranded. Only a clean "another node holds the lease"
+		// supports it. On a read error this node knows nothing, and if the
+		// store problem is fleet-wide -- the case where workloads are most
+		// likely to be stranded -- every node takes this path, max() across
+		// instances reads 0, and the alert clears exactly when it should fire.
+		// Same rule the strandedWorkloads branch below already follows.
+		if leaseErr == nil {
+			c.stepDownGauges()
+		}
 		return
 	}
 
@@ -446,6 +456,11 @@ func (c *Coordinator) run(ctx context.Context) {
 	// its placements and its pushes by no longer being 'healthy' anywhere, and
 	// keeps its power. If it then goes genuinely silent, the probe records
 	// 'suspect' like any other unreachable peer and this query counts it.
+	//
+	// The status exclusion is the second line, not the only one: an unready row
+	// also carries a pinned consecutive_failures of 1 (health.checkHost), so a
+	// coordinator on an older build, whose query has no status clause, cannot
+	// count it during a rolling upgrade either.
 	freshCutoff := c.now().Add(-healthFreshness)
 	hh, err := c.db.Query(ctx,
 		`SELECT target, observer, updated_at
@@ -800,7 +815,17 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 // c.now() is the virtual clock the fleet harness overrides, and passing
 // time.Now() instead would make its scenarios unable to advance past lease
 // expiry without sleeping.
+// acquireLease reports only whether the lease is held. Prefer
+// acquireLeaseResult where the difference between "not the leader" and "could
+// not tell" matters -- publishing a gauge, above all.
 func (c *Coordinator) acquireLease(ctx context.Context) bool {
+	held, _ := c.acquireLeaseResult(ctx)
+	return held
+}
+
+// acquireLeaseResult takes or renews the failover lease and keeps the failure
+// reason, so a caller can tell a lost election from an unreadable store.
+func (c *Coordinator) acquireLeaseResult(ctx context.Context) (bool, error) {
 	held, term, err := corrosion.AcquireLeaseWithTerm(
 		ctx, c.db, failoverLeaseKey, c.hostName, leaseDuration, c.now())
 	if err != nil {
@@ -809,17 +834,17 @@ func (c *Coordinator) acquireLease(ctx context.Context) bool {
 		slog.Error("failover: lease write", "error", err)
 		c.mAttempt(PhaseLease, ResultError, ErrDBError)
 		c.leaseTerm.Store(0)
-		return false
+		return false, err
 	}
 	if !held {
 		// Another coordinator holds it — the normal non-leader case.
 		c.leaseTerm.Store(0)
 		c.mAttempt(PhaseLease, ResultSkipped, ErrNotLeader)
-		return false
+		return false, nil
 	}
 	c.leaseTerm.Store(term)
 	c.mAttempt(PhaseLease, ResultOK, errClassNone)
-	return true
+	return true, nil
 }
 
 // LeaseTerm is the fencing term of the lease incarnation this coordinator holds,
@@ -1091,6 +1116,26 @@ func (c *Coordinator) leaseSnapshot(ctx context.Context) (holder, expiresAt stri
 	return rows[0].String("holder"), rows[0].String("expires_at")
 }
 
+// stillOurTenure re-reads the failover lease and reports whether this
+// coordinator still holds it.
+//
+// leaseStamp does NOT answer this. It reports whether stamping is allowed and
+// returns the term this coordinator recorded at acquisition -- deliberately,
+// so a displaced holder cannot adopt the winner's term -- but it never asks
+// whether the lease is still ours. A tick that passed its own lease gate at
+// the top and then stalled (a GC pause, a slow DB) can therefore act on a
+// tenure a successor already took.
+//
+// Fails CLOSED. leaseSnapshot returns an empty holder on a read error rather
+// than fabricating one, and an unknown holder is not a held lease: abandoning
+// one VM's recovery costs a cycle, while promoting on a lapsed tenure defines
+// and starts a VM on a new host while the old tenure's successor may be doing
+// the same.
+func (c *Coordinator) stillOurTenure(ctx context.Context) bool {
+	holder, _ := c.leaseSnapshot(ctx)
+	return holder != "" && holder == c.hostName
+}
+
 // recentlyFenced returns true if the fencing_log shows a successful fence for
 // host within the recentFenceWindow. Prevents re-fence after restart or race.
 func (c *Coordinator) recentlyFenced(ctx context.Context, host string) bool {
@@ -1256,7 +1301,74 @@ func (c *Coordinator) confirmationResume(ctx context.Context, h *corrosion.HostR
 	if attempt.IsZero() || confirmedAt.IsZero() || confirmedAt.Before(attempt) {
 		return fenceRecord{}, false
 	}
+	if !c.attemptIsThisOutage(ctx, h.Name, attempt) {
+		slog.Warn("failover: the newest fence attempt predates this outage, NOT resuming on the confirmation",
+			"host", h.Name, "attempt", attempt.Format(time.RFC3339), "confirmation", confirm.ID,
+			"hint", "no fence has run for the outage in progress; 'lv host undrain "+h.Name+"' lets the coordinator fence it afresh")
+		c.mAttempt(PhaseRecovery, ResultRefused, ErrManualUnconfirmed)
+		return fenceRecord{}, false
+	}
 	return confirm, true
+}
+
+// attemptIsThisOutage reports whether a fence attempt at attempt belongs to the
+// outage h is in NOW, rather than to an earlier one.
+//
+// Ordering the confirmation against the attempt only says the operator spoke
+// after the cluster fenced. It says nothing about whether that fence is about
+// the host as it stands: a host fenced two days ago, back in service since,
+// and terminal again without a fence of its own (an operator's fence-confirm
+// writes 'fenced' and runs nothing) would otherwise have its workloads moved on
+// the strength of a power-off that the host has long since recovered from.
+//
+// Either of two things binds the attempt to this outage:
+//
+//   - it is within recentFenceWindow — the window every other fence-recency
+//     question in the coordinator uses — so there has been no time for the
+//     host to come back and go down again; or
+//   - some observer has watched the host fail WITHOUT A BREAK since before the
+//     attempt. Its fresh row's consecutive_failures is that unbroken run, and a
+//     run of N probes spans at least (N-1) × health.ProbeInterval, so
+//     updated_at minus that is no earlier than the start of the run. If it is
+//     at or before the attempt, the host was not seen up at any point after the
+//     fence. This is what honours an operator who took twenty minutes to reach
+//     the rack.
+//
+// Both fail towards refusing. A streak is reset by an observer restart or a
+// stall, so across a cluster-wide restart a genuine confirmation can be
+// refused; the recovery then needs a fresh fence, which `lv host undrain`
+// followed by the ordinary fence path provides. An 'unready' row is an answer,
+// not silence, and never counts as a streak.
+func (c *Coordinator) attemptIsThisOutage(ctx context.Context, host string, attempt time.Time) bool {
+	now := c.now()
+	if attempt.After(now.Add(-recentFenceWindow)) {
+		return true
+	}
+	rows, err := c.db.Query(ctx,
+		`SELECT consecutive_failures, updated_at FROM host_health
+		 WHERE target = ? AND status != ?`, host, health.StatusUnready)
+	if err != nil {
+		slog.Warn("failover: host_health read for confirmation resume failed", "host", host, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return false
+	}
+	freshCutoff := now.Add(-healthFreshness)
+	for _, r := range rows {
+		n := r.Int("consecutive_failures")
+		if n < offlineThreshold {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !upd.After(freshCutoff) {
+			continue
+		}
+		runStart := upd.Add(-time.Duration(n-1) * health.ProbeInterval)
+		// fencing_log timestamps carry second precision, truncated.
+		if !runStart.After(attempt.Add(time.Second)) {
+			return true
+		}
+	}
+	return false
 }
 
 // resumeFromConfirmation resumes the recovery of target if an operator has
@@ -1836,7 +1948,26 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 					continue
 				}
 			}
-			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch); err != nil {
+			// Promote is as destructive as reschedule and relocate -- it
+			// defines and starts a VM on a new host -- so it takes the same
+			// stale-tenure abandon the three sibling sites take. Without it a
+			// coordinator whose lease lapsed mid-loop had its reschedule and
+			// relocate refused while its promote went through: gateEnforced
+			// passes (a lapse is not quorum loss) and, for a local-disk DR VM,
+			// requireProofGradeFence never fires either.
+			_, _, promoteTerm, _, ok := c.leaseStamp(ctx)
+			// stillOurTenure as well as leaseStamp: the stamp says a term may
+			// be recorded, not that the lease is still held. A tick that
+			// stalled after its own lease gate is exactly the case this has
+			// to catch, and it is the only one in which a stale-tenure
+			// promote is reachable at all.
+			if !ok || !c.stillOurTenure(ctx) {
+				c.noteGateRefused(corrosion.ActionPromote, health.ReasonStaleLeaseTerm)
+				c.mVM(ActionPromote, ResultError, ErrStaleLeaseTerm)
+				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
+				continue
+			}
+			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch, promoteTerm); err != nil {
 				// Fall through to the reschedule path on ANY promote error, including a
 				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
 				// replicated to the replica host yet). This is NOT a downgrade to a

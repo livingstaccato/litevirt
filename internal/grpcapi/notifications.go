@@ -117,6 +117,7 @@ func (s *Server) CreateNotificationTarget(ctx context.Context, req *pb.CreateNot
 		return nil, status.Errorf(codes.Internal, "create target: %v", err)
 	}
 	slog.Info("notification target created", "name", t.Name, "type", t.Type)
+	s.audit(ctx, "notify.target.add", t.ID, t.Name+" "+t.Type, "ok")
 	return toPbTarget(t), nil
 }
 
@@ -153,6 +154,7 @@ func (s *Server) DeleteNotificationTarget(ctx context.Context, req *pb.DeleteNot
 	if err := corrosion.DeleteNotificationTarget(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete target: %v", err)
 	}
+	s.audit(ctx, "notify.target.rm", req.Id, "", "ok")
 	return &emptypb.Empty{}, nil
 }
 
@@ -197,6 +199,7 @@ func (s *Server) CreateNotificationRoute(ctx context.Context, req *pb.CreateNoti
 	if err := corrosion.InsertNotificationRoute(ctx, s.db, r); err != nil {
 		return nil, status.Errorf(codes.Internal, "create route: %v", err)
 	}
+	s.audit(ctx, "notify.route.add", r.ID, r.EventPattern+" -> "+r.TargetID, "ok")
 	return toPbRoute(r), nil
 }
 
@@ -222,5 +225,6 @@ func (s *Server) DeleteNotificationRoute(ctx context.Context, req *pb.DeleteNoti
 	if err := corrosion.DeleteNotificationRoute(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete route: %v", err)
 	}
+	s.audit(ctx, "notify.route.rm", req.Id, "", "ok")
 	return &emptypb.Empty{}, nil
 }

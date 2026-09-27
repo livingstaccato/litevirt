@@ -244,12 +244,17 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 // leader lease, so a proof arriving with no term is a defect rather than a
 // lease-less producer's normal output.
 //
-// reschedule qualifies and nothing else does. Its single mint site is
-// failover/coordinator.go's WriteVMRescheduleProof call, and that coordinator
-// holds the failover lease. Every other action has at least one producer that
-// holds no lease at all and therefore has no term to stamp: mintLBProof
-// (lb.go), mintRelocationProof (migrate_container.go) and AutoPromoteReplica
-// (promote.go) all mint lease_term 0 with an empty key.
+// reschedule and promote qualify. Both mint only from the failover
+// coordinator, which holds the failover lease and therefore always had a term
+// to stamp. Every other action has at least one producer that holds no lease at
+// all and so has no term to stamp: mintLBProof (lb.go) and mintRelocationProof
+// (migrate_container.go) mint lease_term 0 with an empty key.
+//
+// Promote was listed here as a lease-less producer, which was never true of its
+// only caller -- coordinator.go's post-fence recovery loop. The doc recorded
+// the omission as a property of the producer instead of a gap, and the gap was
+// real: a coordinator whose tenure had lapsed had its reschedule and relocate
+// refused while its promote went through unstamped.
 //
 // This is why the term requirement is scoped rather than unconditional. An
 // unconditional `term <= 0` refusal — which is what this task originally
@@ -273,6 +278,7 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 // container cold migration then requires the coordinator.
 var leaseTermRequiredActions = map[string]bool{
 	corrosion.ActionReschedule: true,
+	corrosion.ActionPromote:    true,
 }
 
 // leaseTermFenceFor returns the claim fence for this proof, or nil for an

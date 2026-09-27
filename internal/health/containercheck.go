@@ -62,7 +62,7 @@ type ContainerChecker struct {
 	onStateWriteFail func(op, class string)
 	// lockContainer is the per-container operation lock (see SetContainerLock).
 	// nil = no lock (unit tests that drive the checker alone).
-	lockContainer func(name string) (unlock func())
+	lockContainer func(name string) (unlock func(), ok bool)
 
 	// Now is the clock for the re-key debounce (defaults to time.Now); tests
 	// override it to advance deterministically.
@@ -140,10 +140,12 @@ func (c *ContainerChecker) SetStateWriteFailObserver(fn func(op, class string)) 
 }
 
 // SetContainerLock injects the per-container lock this host's container
-// operations (create, start, stop, delete) hold — grpcapi's Server.LockContainer.
-// The sweep holds it for each container's read → probe → write, so it never acts
-// on a row or a runtime state an operation is in the middle of changing.
-func (c *ContainerChecker) SetContainerLock(lock func(name string) (unlock func())) {
+// operations (create, start, stop, delete, backup, migrate, ...) hold, as a
+// non-blocking try — grpcapi's Server.TryLockContainer, which reports false
+// when an operation holds it. The sweep holds it for each container's read →
+// probe → write, so it never acts on a row or a runtime state an operation is
+// in the middle of changing, and skips a container it cannot take.
+func (c *ContainerChecker) SetContainerLock(lock func(name string) (unlock func(), ok bool)) {
 	c.lockContainer = lock
 }
 
@@ -430,12 +432,23 @@ func (c *ContainerChecker) claimRelocationProof(ctx context.Context, ct corrosio
 // restart the container, or overwrite the state a start or stop just wrote.
 // Under the lock no operation on this container is in flight, and the re-read
 // row is what the last one left.
+//
+// The lock is TRIED, not waited for. Backup, migrate, snapshot, restore and
+// clone hold it for their whole run, and the sweep is serial: waiting would
+// hold every other container's restart, drift heal and ownership check behind
+// one long operation. A container whose lock is held is skipped this pass and
+// reconciled by the next sweep.
 func (c *ContainerChecker) checkContainerLocked(ctx context.Context, listed corrosion.ContainerRecord, now time.Time) {
 	if c.lockContainer == nil {
 		c.checkContainer(ctx, listed, now)
 		return
 	}
-	unlock := c.lockContainer(listed.Name)
+	unlock, ok := c.lockContainer(listed.Name)
+	if !ok {
+		slog.Debug("containercheck: an operation holds the container; skipping it this sweep",
+			"container", listed.Name)
+		return
+	}
 	defer unlock()
 	ct, err := corrosion.GetContainer(ctx, c.db, c.hostName, listed.Name)
 	if err != nil {

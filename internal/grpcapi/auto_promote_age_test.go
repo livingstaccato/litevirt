@@ -55,7 +55,7 @@ func TestAutoPromote_RefusesAStaleReplica(t *testing.T) {
 	s := testServer(t)
 	seedReplicaOfAge(t, s, "db-1", 5*24*time.Hour)
 
-	err := s.AutoPromoteReplica(context.Background(), "db-1", "")
+	err := s.AutoPromoteReplica(context.Background(), "db-1", "", 0)
 
 	if !errors.Is(err, errReplicaTooOld) {
 		t.Errorf("AutoPromoteReplica with a 5-day-old replica returned %v, want errReplicaTooOld", err)
@@ -69,7 +69,7 @@ func TestAutoPromote_DoesNotRefuseAFreshReplicaForAge(t *testing.T) {
 	s := testServer(t)
 	seedReplicaOfAge(t, s, "db-2", 10*time.Minute)
 
-	err := s.AutoPromoteReplica(context.Background(), "db-2", "")
+	err := s.AutoPromoteReplica(context.Background(), "db-2", "", 0)
 
 	if errors.Is(err, errReplicaTooOld) {
 		t.Errorf("a 10-minute-old replica was refused as too old: %v", err)

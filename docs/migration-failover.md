@@ -105,6 +105,17 @@ Every host probes every other host via TLS connection to the gRPC port (7443) ev
 
 A host transitions to `suspect` after 3 consecutive probe failures. The failover coordinator takes action after quorum confirmation.
 
+Rows are written on **transition**, not on every probe, so a steadily healthy
+peer costs no replication traffic. The one exception is a host in `offline` or
+`fenced`: its healthy row is rewritten every 10 seconds even when nothing has
+changed, because auto-recovery only counts rows younger than 30 seconds and a
+recovered host produces no further transitions to write one. Without that
+heartbeat a host that genuinely came back would sit `offline` until someone ran
+`lv host undrain` by hand. The heartbeat is deliberately limited to those two
+states — rewriting every healthy row on a timer would be N*(N-1) writes per
+interval across the cluster, for a reader that only ever looks at hosts
+awaiting recovery.
+
 #### An observer that stopped running is not a witness
 
 A failed probe counts against the peer only if the observer was running while it
@@ -181,7 +192,7 @@ VMs with a `healthcheck` defined in their compose spec are periodically checked:
 | `tcp` | TCP connection succeeds |
 | `exec` | Command exits 0 via guest agent |
 
-**Correlated failure detection:** If 3+ VMs fail health checks simultaneously, litevirt suppresses automatic restarts (likely a shared dependency failure, not individual VM issues).
+**Correlated failure detection:** If 3+ VMs fail health checks simultaneously, litevirt suppresses automatic restarts (likely a shared dependency failure, not individual VM issues). A VM whose next action is still held back by its action backoff does not count toward the 3 — it has already been acted on — and a suppressed action is not counted toward the VM's backoff, so once the event is over the first failed probe acts without a backoff built up during it.
 
 **The verdict is cluster state.** The owning host publishes each VM's verdict — `healthy`, `unhealthy` or `unknown` — whenever it changes, bound to the VM's current incarnation. That is what compose `vm_healthy` waits for, what `lv inspect` shows, and what `lv health` lists as `vm_probe_failing` (info severity). When the owner goes down nobody is left to retract a pass, so readers treat any verdict from an `offline`, `fenced` or `maintenance` owner as `unknown`; after failover the VM is a new incarnation on its new host and needs a fresh pass there. The action (`restart` / `migrate` / `alert`) is unchanged, and still waits out the first 5 minutes after a VM is created. See [Diagnostics](diagnostics.md#vm-probe-failing-vm_probe_failing).
 
@@ -304,15 +315,26 @@ A recovery refused for want of a confirmation — a `manual` fence, a
 `litevirt.fence_requires_confirmation` — resumes once an operator runs
 `lv host fence-confirm <host>`.
 
-The resume requires three things, not the confirmation alone:
+The resume requires four things, not the confirmation alone:
 
 1. **The cluster itself fenced the host** — a `fencing_log` row with result
    `fenced` or `partial`, which only a fence that ran writes.
-2. **The confirmation is newer than that fence**, so it attests to this outage
+2. **That fence belongs to this outage.** It is either under 5 minutes old, or
+   some observer has probed the host and failed without a break since before
+   it — so the host has not been seen up at any point after the fence. A fence
+   from an earlier outage the host has since recovered from authorises nothing,
+   and the coordinator logs "the newest fence attempt predates this outage".
+3. **The confirmation is newer than that fence**, so it attests to this outage
    and not an earlier one.
-3. **The host is still down now** — a fresh quorum observes it failing. A host
+4. **The host is still down now** — a fresh quorum observes it failing. A host
    that has come back, or that an operator has put into `maintenance`, is never
    resumed.
+
+An observer's unbroken run of failed probes restarts when that observer's
+daemon restarts, so after every observer has restarted a genuine confirmation
+of an older fence is refused too. Run `lv host undrain <host>`: the coordinator
+then fences the host for the outage in progress, refuses for want of a
+confirmation, and resumes once you confirm again.
 
 `fence-confirm` has no precondition and runs no fence, so on its own a mistyped
 hostname could otherwise authorise a recovery. With all three required, a

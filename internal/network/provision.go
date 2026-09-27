@@ -94,7 +94,18 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		// Check if bridge pre-exists before we touch anything. Pre-existing
 		// bridges (infrastructure bridges like br0) should not get DHCP/NAT
 		// added unless the user explicitly enables them.
-		bridgePreExisted := BridgeExists(bridge)
+		//
+		// A litevirt dnsmasq pidfile for the bridge overrides that: litevirt
+		// served DHCP here, so the bridge is litevirt's (or --dhcp named it),
+		// whatever its existence says now. Without it, a dnsmasq that died on
+		// a bridge litevirt made would never be restarted — the bridge exists
+		// on every pass after the first — and the reconciler, reading the dead
+		// pidfile, would re-provision forever. A NetBox-bound network is left
+		// to the plain fact: its refusal below must read the same host state
+		// on every attempt.
+		pidFile := dnsmasqPidFile(bridge)
+		bridgePreExisted := BridgeExists(bridge) &&
+			(def.NetBoxPrefixID != 0 || !litevirtServedDHCP(pidFile))
 
 		// REFUSE BEFORE CREATING ANYTHING, and this ordering is the whole of
 		// whether the refusal survives a retry.
@@ -136,6 +147,9 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		onPhysicalVLAN := def.VLAN > 0
 
 		scope := fwScopeNet(networkName)
+		if def.HostIsolation || onPhysicalVLAN {
+			clearStaleDnsmasqPidFile(pidFile) // no DHCP here
+		}
 		if def.HostIsolation {
 			// Host-isolated: no DHCP, no NAT. IPs delivered via cloud-init.
 			if err := corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{
@@ -151,7 +165,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 			// because the NetBox bind-time refusal decides from the same
 			// predicate, and two copies of it would drift.
 			if err := startDHCPFor(def, DHCPHostFacts{BridgePreExisted: bridgePreExisted},
-				networkName, bridge, hostName, dnsmasqPidFile(bridge)); err != nil {
+				networkName, bridge, hostName, pidFile); err != nil {
 				return "", err
 			}
 			// Record NAT (masquerade) intent whenever this managed subnet-network
@@ -218,6 +232,9 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 		}
 
 		natSubnet := ""
+		if def.Subnet == "" || def.HostIsolation {
+			clearStaleDnsmasqPidFile(dnsmasqPidFileVNI(vni)) // no DHCP here
+		}
 		if def.Subnet != "" {
 			// IRB (anycast gateway) is always set up — VMs need a default route.
 			if _, err := EnsureIRB(vni, def.Subnet); err != nil {
@@ -271,6 +288,7 @@ func Provision(ctx context.Context, db *corrosion.Client, networkName string, de
 
 		scope := fwScopeNet(networkName)
 		if def.HostIsolation {
+			clearStaleDnsmasqPidFile(dnsmasqPidFile(bridge)) // no DHCP here
 			// Host-isolated: no DHCP. IPs delivered via cloud-init.
 			if err := corrosion.UpsertHostFWIntent(ctx, db, hostName, corrosion.HostFWIntent{
 				ScopeKey: scope, Bridge: bridge, Isolate: true,
@@ -349,7 +367,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		// Stop DHCP and remove gateway IP + NAT if subnet was configured.
 		if def.Subnet != "" {
 			pidFile := dnsmasqPidFile(bridge)
-			StopDHCP(pidFile) //nolint:errcheck
+			stopDHCPAndForgetLeases(pidFile, bridge)
 			// Remove the gateway IP that StartDHCP added to the bridge.
 			//
 			// SubnetRange already returns the gateway WITH its prefix (see
@@ -383,7 +401,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 			RemoveIRB(vni, def.Subnet)    //nolint:errcheck
 			RemoveNAT(def.Subnet, bridge) //nolint:errcheck
 			pidFile := dnsmasqPidFileVNI(vni)
-			StopDHCP(pidFile) //nolint:errcheck
+			stopDHCPAndForgetLeases(pidFile, bridge)
 		}
 		return DeprovisionVXLAN(vni)
 
@@ -394,7 +412,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		// Stop DHCP if subnet was configured.
 		if def.Subnet != "" {
 			pidFile := dnsmasqPidFile(bridge)
-			StopDHCP(pidFile) //nolint:errcheck
+			stopDHCPAndForgetLeases(pidFile, bridge)
 		}
 		// Delete the isolated bridge (litevirt created it, safe to remove).
 		out, err := execCommand("ip", "link", "del", bridge)

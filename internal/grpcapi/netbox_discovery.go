@@ -67,17 +67,28 @@ const (
 	discoveryRefusedNoIdentity = "no_identity"
 )
 
-// discoverNICAddress asks THIS host where a MAC is answering: the dnsmasq
-// lease first, then a complete ARP entry — lv.DiscoverIPForMAC, which says
-// why that order, and which the VM healthcheck uses too.
+// discoverNICAddress asks THIS host where a NIC on networkName is answering:
+// the dnsmasq lease first, then a complete ARP entry — lv.DiscoverIPForMAC,
+// which says why that order — restricted to the bridge networkName leases on
+// (network.LeaseBridge), as the IP scanner and the VM healthcheck probe look
+// it up. With the network unknown (no name, no record, an unreadable config)
+// there is no bridge to restrict to, and every bridge's leases are read.
 //
 // One implementation for all the discovery paths, and the seam that lets a
 // test drive discovery without a guest (see SetNICIPDiscovery).
-func (s *Server) discoverNICAddress(mac string) string {
+func (s *Server) discoverNICAddress(ctx context.Context, mac, networkName string) string {
+	return s.discoverNICAddressOnBridge(mac, network.LeaseBridge(ctx, s.db, networkName))
+}
+
+// discoverNICAddressOnBridge is discoverNICAddress restricted to the bridge the
+// NIC's network leases on (network.LeaseBridge; "" for no restriction), so a
+// lease another bridge's dnsmasq holds for the MAC — a deprovisioned network's
+// leftover file, a network the guest has left — is not taken for its address.
+func (s *Server) discoverNICAddressOnBridge(mac, bridge string) string {
 	if s.nicIPDiscovery != nil {
-		return s.nicIPDiscovery(mac)
+		return s.nicIPDiscovery(mac, bridge)
 	}
-	return lv.DiscoverIPForMAC(mac)
+	return lv.DiscoverIPForMACOnBridge(mac, bridge)
 }
 
 // SetNICIPDiscovery replaces the ARP / dnsmasq-lease lookup behind
@@ -87,7 +98,19 @@ func (s *Server) discoverNICAddress(mac string) string {
 // gate at all without a real guest answering ARP on the test host: every path
 // that records a discovered address starts from that lookup, so with no seam the
 // whole gate is unreachable and would be pinned by nothing.
-func (s *Server) SetNICIPDiscovery(fn func(mac string) string) { s.nicIPDiscovery = fn }
+func (s *Server) SetNICIPDiscovery(fn func(mac string) string) {
+	if fn == nil {
+		s.nicIPDiscovery = nil
+		return
+	}
+	s.nicIPDiscovery = func(mac, _ string) string { return fn(mac) }
+}
+
+// setNICIPDiscoveryOnBridge is SetNICIPDiscovery for a test that needs to see
+// which bridge a lookup was restricted to.
+func (s *Server) setNICIPDiscoveryOnBridge(fn func(mac, bridge string) string) {
+	s.nicIPDiscovery = fn
+}
 
 // claimAndRecordDiscoveredVMIP records a discovered address, claiming it from
 // NetBox first if the network is bound. For the BACKGROUND passes only.

@@ -20,8 +20,24 @@ const (
 	probeConcurrency = 16
 )
 
+// ProbeInterval is the cadence at which an observer probes each peer. A probe
+// is started at most once per tick, so N consecutive failed probes from one
+// observer span at least (N-1) × ProbeInterval — the lower bound failover uses
+// to tell whether a peer has been down without a break since some instant.
+const ProbeInterval = checkInterval
+
+// unreadyFailures is the consecutive_failures an 'unready' row carries, for
+// every unready observation in a run: below any fence threshold, and non-zero
+// so that recovery (which counts consecutive_failures = 0) never reads it as
+// healthy. See checkHost.
+const unreadyFailures = 1
+
 // HeartbeatInterval is how often an UNCHANGED host_health verdict is
 // re-published so it keeps a current updated_at.
+//
+// It applies ONLY to peers whose host row is 'offline' or 'fenced' — see
+// shouldPersistHealth, which is where that scoping is argued. Restamping every
+// healthy peer instead would be N*(N-1) replicated writes per interval.
 //
 // checkHost used to write only on transition. A failing peer changes every
 // probe (consecutive_failures increments), so the failing direction was always
@@ -69,6 +85,10 @@ type Checker struct {
 	pkiDir   string
 	db       *corrosion.Client
 	tlsCfg   *tls.Config
+
+	// writeFn replaces the host_health write in tests. Nil in production,
+	// where checkHost calls the corrosion client directly.
+	writeFn func(ctx context.Context, sqlStr string, params ...interface{}) error
 
 	mu     sync.Mutex
 	peers  map[string]*peerState // target hostname → cached state
@@ -323,6 +343,52 @@ func boundedFanout[T any](items []T, concurrency int, work func(T)) {
 	wg.Wait()
 }
 
+// recoveryPending reports whether the failover coordinator could auto-recover
+// a host in this state once it looks healthy again.
+//
+// These are exactly the two states recoverHosts acts on — everything else hits
+// its `default: continue`. 'maintenance' and 'draining' are operator intent and
+// are never auto-cleared, so a heartbeat for them would be traffic with no
+// reader.
+func recoveryPending(state string) bool {
+	return state == "offline" || state == "fenced"
+}
+
+// shouldPersistHealth decides whether this probe writes a host_health row.
+//
+// A transition always writes — that is the original contract and what every
+// other reader depends on. The second clause exists for ONE reader: the
+// coordinator's recovery quorum, which counts only rows newer than
+// failover.healthFreshness. A peer that comes back and then stays healthy
+// produces no further transitions, so without it the row froze at the instant
+// the peer went healthy; by the time recentlyFenced stopped suppressing
+// recovery five minutes later, the only healthy row on record was minutes old,
+// failed the freshness cutoff, and the host sat `offline` awaiting a manual
+// undrain.
+//
+// The heartbeat is deliberately narrow on both axes.
+//
+// It is limited to hosts AWAITING RECOVERY because the alternative — restamping
+// every healthy row on a timer — is N*(N-1) replicated writes per interval
+// across the cluster, for a reader that only ever looks at two states. The
+// other three consumers of this table do not need it: the fence quorum selects
+// `consecutive_failures >= offlineThreshold`, and a failing peer increments
+// that on every probe, so `changed` is already true and those rows are never
+// stale; GetClusterHealth and the metrics server read status and last_seen with
+// no freshness cutoff at all.
+//
+// And it is rate-limited to HeartbeatInterval rather than firing every probe,
+// because checkInterval is 2s and the cutoff it has to beat is 30s.
+//
+// That asymmetry — failing rows self-refresh, healthy ones do not — is why the
+// bug only ever showed up on the recovery path.
+func shouldPersistHealth(changed, healthy, recoveryPending bool, sinceLastWrite time.Duration) bool {
+	if changed {
+		return true
+	}
+	return healthy && recoveryPending && HeartbeatInterval > 0 && sinceLastWrite >= HeartbeatInterval
+}
+
 func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// net.JoinHostPort (not Sprintf): host.Address is a bare host and may be an
 	// IPv6 literal, which "%s:%d" would mangle into an unparseable target. Every
@@ -387,6 +453,15 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		newFailures = 0
 	} else {
 		newFailures = prev.failures + 1
+		if result == probeUnreachable && prev.status == StatusUnready {
+			// Every unready probe before this one reached the peer and got an
+			// answer, so none of them is silence. The silence count starts
+			// here, and "suspect" — what fencing quorum counts — has to be
+			// earned with suspectThreshold unanswered probes in a row, as for
+			// any peer. Carrying the unready run over made one dropped packet
+			// after a long unready stretch fence-eligible on its own.
+			newFailures = 1
+		}
 		switch {
 		case result == probeNotReady:
 			// Recorded on the FIRST observation, unlike "suspect", which needs
@@ -399,6 +474,15 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 			// something the peer already told us only delays the operator's view
 			// of it.
 			newStatus = StatusUnready
+			// And the stored count stays at one, however long the answers go on.
+			// Only a coordinator that knows 'unready' excludes it from fence
+			// quorum; an older-build leader during a rolling upgrade counts
+			// `consecutive_failures >= FailuresToFence` and nothing else, so a
+			// climbing count here would read to it as a quorum of observers
+			// agreeing the host is dead — a power-off of a host that is
+			// answering. The row never carries the count, so no build can count
+			// it. One, not zero: zero is what recovery reads as healthy.
+			newFailures = unreadyFailures
 		case newFailures >= suspectThreshold:
 			newStatus = "suspect"
 		default:
@@ -406,7 +490,10 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		}
 	}
 
-	changed := !exists || newStatus != prev.status || newFailures != prev.failures
+	// An unready verdict is republished on every probe, as it was while its
+	// count still climbed: the count is pinned now, and without this the row
+	// would be written once and go stale while the peer kept answering.
+	changed := !exists || newStatus != prev.status || newFailures != prev.failures || newStatus == StatusUnready
 	prev.status = newStatus
 	prev.failures = newFailures
 	// Local monotonic anchors updated every probe (not just on change) so Phase 2/5
@@ -417,17 +504,13 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	} else {
 		prev.lastFailureAt = mono
 	}
-	// Re-publish an unchanged verdict once its row has gone quiet for
-	// HeartbeatInterval. Without this a steadily healthy peer is written once
-	// and never again, and every consumer that asks "is this observation still
-	// current" — failover.recoverHosts' freshness cutoff above all — sees a row
-	// that grows arbitrarily old while the peer is perfectly fine.
-	stale := HeartbeatInterval > 0 &&
-		(prev.lastWriteAt.IsZero() || mono.Sub(prev.lastWriteAt) >= HeartbeatInterval)
-	write := changed || stale
-	if write {
-		prev.lastWriteAt = mono
+	sinceWrite := time.Duration(0)
+	if !prev.lastWriteAt.IsZero() {
+		sinceWrite = mono.Sub(prev.lastWriteAt)
+	} else {
+		sinceWrite = HeartbeatInterval // never written: the first probe publishes
 	}
+	write := shouldPersistHealth(changed, healthy, recoveryPending(host.State), sinceWrite)
 	c.mu.Unlock()
 
 	if !write {
@@ -435,21 +518,40 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	}
 
 	now := c.db.NowTS()
+	exec := c.db.ExecuteDeferred
+	if c.writeFn != nil {
+		exec = c.writeFn
+	}
+	var err error
 	if healthy {
 		// last_seen is a wall/display column (read as wall time via parseTimestamp), so
 		// it must use NowWall, NOT NowTS — NowTS is the LWW key and becomes an HLC string.
-		c.db.ExecuteDeferred(ctx,
+		err = exec(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, ?, 0, ?, ?)`,
 			c.hostName, host.Name, "healthy", c.db.NowWall(), now,
 		)
 	} else {
-		c.db.ExecuteDeferred(ctx,
+		err = exec(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
 			c.hostName, host.Name, newStatus, newFailures, nil, now,
 		)
 	}
+	if err != nil {
+		// Do NOT advance lastWriteAt. It records when a verdict was PUBLISHED,
+		// and stamping it for a write that failed makes an observer publishing
+		// nothing indistinguishable from one heartbeating normally — the host
+		// it is meant to recover then sits fenced with no log line naming the
+		// cause. Leaving it unstamped also retries on the next probe instead
+		// of waiting a full heartbeat interval.
+		slog.Warn("health: publishing the peer verdict failed",
+			"observer", c.hostName, "target", host.Name, "healthy", healthy, "error", err)
+		return
+	}
+	c.mu.Lock()
+	prev.lastWriteAt = mono
+	c.mu.Unlock()
 }
 
 func (c *Checker) probe(addr string) bool {

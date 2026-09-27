@@ -7,10 +7,7 @@ import (
 )
 
 func TestInsertAndGetVM(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -42,10 +39,7 @@ func TestInsertAndGetVM(t *testing.T) {
 }
 
 func TestInsertVM_WithInterfaces(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -73,10 +67,7 @@ func TestInsertVM_WithInterfaces(t *testing.T) {
 }
 
 func TestInsertVM_WithDisks(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -153,10 +144,7 @@ func TestInsertVMWithHardware_WritesNICsAndPCIIntents(t *testing.T) {
 }
 
 func TestListVMs_Filter(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -225,10 +213,7 @@ func TestListVMs_SurfacesPendingActionID(t *testing.T) {
 }
 
 func TestUpdateVMState(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -250,10 +235,7 @@ func TestUpdateVMState(t *testing.T) {
 }
 
 func TestUpdateVMHost_VMs(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -275,10 +257,7 @@ func TestUpdateVMHost_VMs(t *testing.T) {
 }
 
 func TestDeleteVM(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -854,10 +833,7 @@ func TestDeleteVM_TombstonesHardwareTables(t *testing.T) {
 }
 
 func TestUpdateVMInterfaceIP(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)

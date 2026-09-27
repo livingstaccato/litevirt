@@ -17,10 +17,7 @@ import (
 func newPoolTestServer(t *testing.T) *Server {
 	t.Helper()
 	dataDir := t.TempDir()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

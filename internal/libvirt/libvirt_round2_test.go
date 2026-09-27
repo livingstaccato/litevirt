@@ -551,8 +551,8 @@ func TestCanHotModify_OnlyMemIncrease(t *testing.T) {
 
 func TestGetIPFromDHCPLeases_MultipleFiles(t *testing.T) {
 	tmp := t.TempDir()
-	writeFileHelper(t, tmp, "net1.leases", "1234567890 aa:bb:cc:dd:ee:ff 10.0.0.1 host1 *\n")
-	writeFileHelper(t, tmp, "net2.leases", "1234567890 52:54:00:11:22:33 10.0.0.99 host2 *\n")
+	writeFileHelper(t, tmp, "net1.leases", "4102444800 aa:bb:cc:dd:ee:ff 10.0.0.1 host1 *\n")
+	writeFileHelper(t, tmp, "net2.leases", "4102444800 52:54:00:11:22:33 10.0.0.99 host2 *\n")
 
 	ip := GetIPFromDHCPLeases(tmp, "52:54:00:11:22:33")
 	if ip != "10.0.0.99" {
@@ -562,7 +562,7 @@ func TestGetIPFromDHCPLeases_MultipleFiles(t *testing.T) {
 
 func TestGetIPFromDHCPLeases_EmptyMAC(t *testing.T) {
 	tmp := t.TempDir()
-	writeFileHelper(t, tmp, "default.leases", "1234567890 52:54:00:aa:bb:cc 10.0.0.5 host *\n")
+	writeFileHelper(t, tmp, "default.leases", "4102444800 52:54:00:aa:bb:cc 10.0.0.5 host *\n")
 	ip := GetIPFromDHCPLeases(tmp, "")
 	if ip != "" {
 		t.Errorf("empty MAC should return empty, got %q", ip)
@@ -575,7 +575,7 @@ func TestGetIPFromDHCPLeases_UnreadableFile(t *testing.T) {
 	tmp := t.TempDir()
 	leaseFile := filepath.Join(tmp, "test.leases")
 	// Create file then make it unreadable.
-	os.WriteFile(leaseFile, []byte("1234567890 52:54:00:aa:bb:cc 10.0.0.5 host *\n"), 0644)
+	os.WriteFile(leaseFile, []byte("4102444800 52:54:00:aa:bb:cc 10.0.0.5 host *\n"), 0644)
 	os.Chmod(leaseFile, 0000)
 	defer os.Chmod(leaseFile, 0644) // cleanup
 

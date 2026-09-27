@@ -117,3 +117,28 @@ func TestCollect_BacklogAgeFollowsTheSlowestLivePeer(t *testing.T) {
 		t.Errorf("backlog age = %.0fs, want ~600s — the slow peer has not acked the 10-minute-old entry", got)
 	}
 }
+
+// A peer that stops acknowledging stops updating its watermark row, so after
+// LiveWatermarkWindow it falls out of the "live" set — and a gauge computed
+// over live rows dropped back to 0, resolving the very alert it is documented
+// for while the peer was still wedged. The peers the replicator is actively
+// pushing to are the set that is behind, however stale their rows look.
+func TestCollect_BacklogAgeKeepsCountingAPeerThatStoppedAcking(t *testing.T) {
+	db := initTestDB(t)
+	setWatermark(t, db, "peer-b", 0, time.Now().Add(-2*time.Hour)) // last ack two hours ago
+	insertLogRowAt(t, db, time.Now().Add(-time.Hour))              // waiting an hour
+
+	c := newCollector(db, nil, nil, "host-a")
+	c.replicationTargets = func() []string { return []string{"peer-b"} }
+	ch := make(chan prometheus.Metric, 200)
+	c.Collect(ch)
+	close(ch)
+	got, found := gaugeValue(t, ch, "litevirt_replication_backlog_age_seconds")
+	if !found {
+		t.Fatal("missing litevirt_replication_backlog_age_seconds")
+	}
+	if got < 3500 {
+		t.Errorf("backlog age = %.0fs with a replication target an hour behind; want ~3600s — "+
+			"the gauge went quiet because the stuck peer's watermark row aged out", got)
+	}
+}

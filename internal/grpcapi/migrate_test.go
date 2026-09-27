@@ -590,10 +590,7 @@ func TestUpdateFDBForMigration_NonVXLAN(t *testing.T) {
 }
 
 func TestMigrateVM_SnapshotWarning(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -639,7 +636,7 @@ func TestMigrateVM_SnapshotWarning(t *testing.T) {
 	// previously migration only warned then failed mid-copy because the snapshot
 	// overlay's backing chain is left behind (R2). The error names the count and
 	// tells the operator to remove snapshots first.
-	err = s.MigrateVM(&pb.MigrateVMRequest{
+	err := s.MigrateVM(&pb.MigrateVMRequest{
 		VmName:     "snap-vm",
 		TargetHost: "target-host",
 		Strategy:   pb.MigrateStrategy_MIGRATE_LIVE,

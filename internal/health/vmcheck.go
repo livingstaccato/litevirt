@@ -69,7 +69,7 @@ type VMChecker struct {
 	probeFn ProbeFunc
 	// nicIPDiscovery replaces the owner-host ARP / dnsmasq-lease lookup behind
 	// vmAddress (SetNICIPDiscovery). nil → the real lookup.
-	nicIPDiscovery func(mac string) string
+	nicIPDiscovery func(mac, bridge string) string
 	// probes counts in-flight checkVM goroutines so SweepOnce can wait for
 	// them. Production's Start loop never waits.
 	probes sync.WaitGroup
@@ -394,13 +394,35 @@ func (v *VMChecker) pruneVMState(current map[string]bool) {
 func (v *VMChecker) isCorrelatedFailure() bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	return v.correlatedFailureLocked(v.clock())
+}
+
+// correlatedFailureLocked is isCorrelatedFailure for a caller holding mu.
+//
+// A VM whose action its backoff is holding back does not count: it has
+// already been acted on, and its failure run survives the hold (so the first
+// failure after it acts). Counting it, a few VMs sitting in backoff would
+// keep the guard on — suppressing every other VM's action — for as long as
+// their backoff lasted, and longer, since a suppressed action is retried.
+func (v *VMChecker) correlatedFailureLocked(now time.Time) bool {
 	count := 0
-	for _, f := range v.failures {
-		if f >= 2 {
+	for name, f := range v.failures {
+		if f >= 2 && !v.inActionBackoffLocked(name, now) {
 			count++
 		}
 	}
 	return count >= correlatedFailureThreshold
+}
+
+// inActionBackoffLocked reports whether the backoff after name's last action
+// still holds its next one back. Caller holds mu.
+func (v *VMChecker) inActionBackoffLocked(name string, now time.Time) bool {
+	acts := v.actionCount[name]
+	if acts <= 0 {
+		return false
+	}
+	last, ok := v.lastAction[name]
+	return ok && now.Sub(last) < actionBackoff(acts)
 }
 
 func (v *VMChecker) checkVM(ctx context.Context, vm corrosion.VMRecord, hspec *pb.HealthCheckSpec) {
@@ -422,7 +444,12 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 		// would feed two probes into one failure run.
 		return
 	}
-	if inGrace {
+	// The grace is judged again now the result has landed: a start this host
+	// saw WHILE the probe ran — `lv restart` keeps the row running, so the
+	// incarnation above is unchanged — cleared the failure run, and this
+	// result, from before that start, must not begin a new one against the
+	// freshly booted guest.
+	if inGrace || v.inStartGrace(vm, v.clock()) {
 		return
 	}
 
@@ -463,15 +490,26 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 
 	// Exponential backoff: if we've already acted on this VM without recovery,
 	// wait progressively longer before acting again.
-	acts := v.actionCount[vm.Name]
-	if acts > 0 {
-		backoff := actionBackoff(acts)
-		if last, ok := v.lastAction[vm.Name]; ok && v.clock().Sub(last) < backoff {
-			v.mu.Unlock()
-			slog.Warn("vmcheck: action backoff active", "vm", vm.Name, "consecutive_actions", acts,
-				"next_eligible", last.Add(backoff).Format(time.RFC3339))
-			return
-		}
+	now := v.clock()
+	if acts := v.actionCount[vm.Name]; v.inActionBackoffLocked(vm.Name, now) {
+		next := v.lastAction[vm.Name].Add(actionBackoff(acts))
+		v.mu.Unlock()
+		slog.Warn("vmcheck: action backoff active", "vm", vm.Name, "consecutive_actions", acts,
+			"next_eligible", next.Format(time.RFC3339))
+		return
+	}
+
+	// Correlated failures (#47): many VMs failing at once is likely a shared
+	// storage or network event, and acting on each would be a thundering herd.
+	// Decided HERE, before anything is counted: a suppressed action was not
+	// taken, so it neither grows the backoff nor ends the failure run — the
+	// first failed probe once the event is over acts.
+	if v.correlatedFailureLocked(now) {
+		v.mu.Unlock()
+		v.publish("vm.health.suppressed", vm.Name, "correlated failures detected — possible storage/network event")
+		slog.Warn("vmcheck: suppressing action due to correlated failures — likely storage/network event",
+			"vm", vm.Name, "action", probeAction(hspec))
+		return
 	}
 
 	// Max-unavailable: limit concurrent actions per stack to 1 (or configurable).
@@ -489,7 +527,7 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 
 	v.failures[vm.Name] = 0
 	v.actionCount[vm.Name]++
-	v.lastAction[vm.Name] = v.clock()
+	v.lastAction[vm.Name] = now
 	v.mu.Unlock()
 
 	// Release the stack action slot when done.
@@ -993,11 +1031,18 @@ func (v *VMChecker) maybeRestartVM(ctx context.Context, vm corrosion.VMRecord, n
 	// 2. Take the per-VM lease, so this host's own reconciler cannot start the
 	// same VM concurrently. Its comment is the reason: "the same physical disk
 	// gets two QEMU writers -> guaranteed corruption".
-	if !acquireVMLockFor(ctx, v.db, v.hostName, vm.Name, time.Now()) {
+	//
+	// Under vmcheckLockHolder, NOT the bare host name. The upsert admits
+	// `holder = excluded.holder` so a component can re-take its own lease
+	// across passes; sharing the host name with the reconciler made that
+	// clause match ITS lease too, so this path acquired a lease held for a
+	// start already in flight and then freed it on the way out.
+	holder := vmcheckLockHolder(v.hostName)
+	if !acquireVMLockFor(ctx, v.db, holder, vm.Name, time.Now()) {
 		slog.Info("vmcheck: restart-policy skipped — vm_lock held elsewhere", "vm", vm.Name)
 		return
 	}
-	defer releaseVMLockFor(ctx, v.db, v.hostName, vm.Name)
+	defer releaseVMLockFor(ctx, v.db, holder, vm.Name)
 
 	// 3. Refuse a runtime this cluster has superseded. The row can still name us
 	// while the owner epoch has moved on, which is what the self-heal path

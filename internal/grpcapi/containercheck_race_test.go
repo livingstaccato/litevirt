@@ -86,7 +86,9 @@ func (f *raceLXC) List(context.Context) ([]string, error) {
 	return out, nil
 }
 
-func (f *raceLXC) Limits(context.Context, string) (int, int, error) { return 0, 0, nil }
+func (f *raceLXC) Limits(context.Context, string) (int, lxc.MemoryLimit, error) {
+	return 0, lxc.MemoryLimit{Unlimited: true}, nil
+}
 
 func (f *raceLXC) snapshot(name string) (lxc.State, int) {
 	f.mu.Lock()
@@ -100,11 +102,42 @@ func raceRig(t *testing.T) (*Server, *raceLXC, *health.ContainerChecker) {
 	rt := newRaceLXC()
 	s.SetContainerRuntime(NewLXCRuntimeAdapter(rt))
 	ck := health.NewContainerChecker(s.hostName, s.db, rt)
-	ck.SetContainerLock(s.LockContainer)
+	ck.SetContainerLock(s.TryLockContainer)
 	return s, rt, ck
 }
 
 var alwaysRestart = &pb.RestartPolicy{Condition: "always"}
+
+// TryLockContainer is the lock the operations hold, tried: it fails while an
+// operation holds that container's lock, is not blocked by another
+// container's, and once taken excludes the operations in turn.
+func TestTryLockContainer_SharesTheOperationLock(t *testing.T) {
+	s := testServer(t)
+	unlockA := s.LockContainer("a") // an operation on "a" (a backup, say)
+	if _, ok := s.TryLockContainer("a"); ok {
+		t.Fatal("TryLockContainer(a) succeeded while an operation held a's lock")
+	}
+	unlockB, ok := s.TryLockContainer("b")
+	if !ok {
+		t.Fatal("TryLockContainer(b) failed while only a's lock was held")
+	}
+	unlockB()
+	unlockA()
+
+	unlock, ok := s.TryLockContainer("a")
+	if !ok {
+		t.Fatal("TryLockContainer(a) failed after the operation released it")
+	}
+	got := make(chan struct{})
+	go func() { s.LockContainer("a")(); close(got) }()
+	select {
+	case <-got:
+		t.Fatal("LockContainer(a) was granted while the checker held a's lock")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlock()
+	<-got
+}
 
 // A sweep between a create and its start — compose's create-then-start, or
 // `lv ct create` followed by `lv ct start` — must leave the container to the
@@ -156,14 +189,14 @@ func TestContainerChecker_StopBetweenListAndLockIsNotUndone(t *testing.T) {
 	}
 
 	stoppedOnce := false
-	ck.SetContainerLock(func(name string) func() {
+	ck.SetContainerLock(func(name string) (func(), bool) {
 		if !stoppedOnce {
 			stoppedOnce = true
 			if _, err := s.StopContainer(ctx, &pb.StopContainerRequest{Name: name}); err != nil {
 				t.Errorf("StopContainer between list and lock: %v", err)
 			}
 		}
-		return s.LockContainer(name)
+		return s.TryLockContainer(name)
 	})
 	ck.SweepOnce(context.Background())
 

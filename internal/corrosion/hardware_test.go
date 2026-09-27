@@ -139,10 +139,7 @@ func TestDeterministicNICID_StableAndDistinct(t *testing.T) {
 }
 
 func TestUpsertAndGetNIC(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -168,10 +165,7 @@ func TestUpsertAndGetNIC(t *testing.T) {
 // updated_at/deleted_at are fully controlled — UpsertNIC's c.NowTS() is
 // monotonic-increasing and can't produce a controlled tie or backdated tombstone.
 func TestMergedVMNICs_OverlayTieAndTombstone(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -254,10 +248,7 @@ func TestMergedVMNICs_OverlayTieAndTombstone(t *testing.T) {
 // chronologically newer vm_nics HLC row, inverting the overlay. The comparison
 // must go through lwwOrder, which compares by wall instant across formats.
 func TestMergedVMNICs_HLCBeatsLegacyRFC3339(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -309,10 +300,7 @@ func TestMergedVMNICs_HLCBeatsLegacyRFC3339(t *testing.T) {
 // merge and emits a duplicate. The join key must normalize case (the returned
 // record's MAC field itself must NOT be mutated).
 func TestMergedVMNICs_MACCaseInsensitiveJoinKey(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -359,10 +347,7 @@ func TestMergedVMNICs_MACCaseInsensitiveJoinKey(t *testing.T) {
 // CanonicalPCISelector + DeterministicPCIIntentID, the way a real caller
 // would), then TombstonePCIIntent and confirms the live-only list hides it.
 func TestUpsertAndListPCIIntent(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -437,10 +422,7 @@ func TestUpsertAndListPCIIntent(t *testing.T) {
 // SR-IOV VF-pool realizing as several VFs), then TombstonePCIRealizations
 // and confirms it retracts EVERY member for that device_id, not just one.
 func TestUpsertAndListPCIRealization(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)

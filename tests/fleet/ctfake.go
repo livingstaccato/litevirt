@@ -207,13 +207,14 @@ func (f *CTFake) CreateContainer(_ context.Context, opts grpcapi.CreateContainer
 // ContainerLimits reports the limits recorded at create; a container seeded
 // outside CreateContainer (a bare Seed) is uncapped, matching a runtime-only
 // rogue with no configured limits.
-func (f *CTFake) ContainerLimits(_ context.Context, name string) (int, int, error) {
+func (f *CTFake) ContainerLimits(_ context.Context, name string) (int, grpcapi.ContainerMemoryLimit, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.state[name]; !ok {
-		return 0, 0, fmt.Errorf("container %q does not exist", name)
+		return 0, grpcapi.ContainerMemoryLimit{Unlimited: true}, fmt.Errorf("container %q does not exist", name)
 	}
-	return lxc.ParseResourceConfig(f.cgroup[name])
+	cpu, mem, err := lxc.ParseResourceConfig(f.cgroup[name])
+	return cpu, grpcapi.ContainerMemoryLimit{MiB: mem.MiB, Unlimited: mem.Unlimited}, err
 }
 
 // CgroupConfig is the cgroup stanza container name was created with, as the

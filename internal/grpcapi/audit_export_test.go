@@ -260,3 +260,81 @@ func TestExportAuditChain_PagesWithoutLosingOrDuplicatingRows(t *testing.T) {
 		}
 	}
 }
+
+// TestExportAuditChain_ReportsASeqGap: a host's sub-chain is walked by seq and
+// each row's prev_hash names the previous one, so a MISSING seq makes the
+// export replay as a chain break — indistinguishable from tampering, which is
+// the one thing this document exists to tell apart.
+//
+// Gaps are ordinary: replication delivers a partitioned host's backlog out of
+// order, so seq 3 can still be in flight while 4 and 5 have landed. Once the
+// cursor passes 5, seq 3 is below it and is never exported at all.
+func TestExportAuditChain_ReportsASeqGap(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+
+	// seq 1, 2, then 4 — seq 3 is still in flight.
+	for _, seq := range []int64{1, 2, 4} {
+		if err := s.db.Execute(ctx,
+			`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+			 result, prev_hash, content_hash, key_id, signature, seq)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("g-%d", seq), fmt.Sprintf("2026-09-22T00:00:0%dZ", seq),
+			"u", "kvm001", "vm.start", "vm-x", "", "ok", "ph", "ch", "k", "sig", seq); err != nil {
+			t.Fatalf("insert seq %d: %v", seq, err)
+		}
+	}
+
+	resp, err := s.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{Limit: 50})
+	if err != nil {
+		t.Fatalf("ExportAuditChain: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(resp.Json), &doc); err != nil {
+		t.Fatalf("unmarshal export: %v", err)
+	}
+	gaps, ok := doc["seq_gaps"]
+	if !ok {
+		t.Fatal("the export emitted a chain with a hole at seq 3 and said nothing; an " +
+			"external verifier sees a prev_hash mismatch and cannot tell a partition " +
+			"from tampering")
+	}
+	list, ok := gaps.([]any)
+	if !ok || len(list) != 1 {
+		t.Fatalf("seq_gaps = %#v, want exactly one gap", gaps)
+	}
+	g := list[0].(map[string]any)
+	if g["host_name"] != "kvm001" || g["missing_from"] != "3" || g["missing_to"] != "3" {
+		t.Errorf("gap = %#v, want kvm001 missing 3..3", g)
+	}
+}
+
+// A complete chain must report NO gaps — otherwise every ordinary export would
+// carry a spurious incompleteness warning and operators would learn to ignore it.
+func TestExportAuditChain_NoGapsOnACompleteChain(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+
+	for _, seq := range []int64{1, 2, 3} {
+		if err := s.db.Execute(ctx,
+			`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+			 result, prev_hash, content_hash, key_id, signature, seq)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("c-%d", seq), fmt.Sprintf("2026-09-22T00:00:0%dZ", seq),
+			"u", "kvm002", "vm.start", "vm-y", "", "ok", "ph", "ch", "k", "sig", seq); err != nil {
+			t.Fatalf("insert seq %d: %v", seq, err)
+		}
+	}
+
+	resp, err := s.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{Limit: 50})
+	if err != nil {
+		t.Fatalf("ExportAuditChain: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(resp.Json), &doc); err != nil {
+		t.Fatalf("unmarshal export: %v", err)
+	}
+	if g, ok := doc["seq_gaps"]; ok {
+		t.Fatalf("a contiguous chain reported gaps: %#v", g)
+	}
+}

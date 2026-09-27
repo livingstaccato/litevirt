@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // LeaseKeyFailover is the failover coordinator's lease key. It lives here, not
@@ -80,6 +81,39 @@ func mintLeaseTermStmt(key string, term int64, holder, acquiredAt, updatedAt str
 type leaseTerm struct {
 	Term   int64
 	Holder string
+}
+
+// LeaseTenure reports who holds key right now and under which term, WITHOUT
+// taking or renewing anything.
+//
+// AcquireLeaseWithTerm is the wrong tool for a verification: it acquires a free
+// or expired lease as a side effect, so a caller asking "do I still lead?"
+// would take the lease merely by asking. A mid-pass re-assert needs a read.
+//
+// live is false when nobody holds it, when the row is missing, or when the
+// recorded expiry has passed. A read error is returned as an error, never as
+// "not held" -- the caller decides how to fail.
+func LeaseTenure(ctx context.Context, c *Client, key string, now time.Time) (holder string, term int64, live bool, err error) {
+	rows, err := c.Query(ctx,
+		`SELECT holder, expires_at FROM leader_election WHERE key = ?`, key)
+	if err != nil {
+		return "", 0, false, fmt.Errorf("read lease %q: %w", key, err)
+	}
+	if len(rows) == 0 {
+		return "", 0, false, nil
+	}
+	holder = rows[0].String("holder")
+	// Both sides RFC3339 UTC, so a lexical compare is a time compare.
+	live = holder != "" && rows[0].String("expires_at") >= now.UTC().Format(time.RFC3339)
+
+	newest, terr := newestLeaseTerm(ctx, c, key)
+	if terr != nil {
+		return holder, 0, live, terr
+	}
+	if newest.Holder == holder {
+		term = newest.Term
+	}
+	return holder, term, live, nil
 }
 
 // newestLeaseTerm is the highest LIVE term recorded for key, together with the

@@ -516,3 +516,37 @@ func TestRun_StrandedGaugeClearsOnMidCycleLeaseLoss(t *testing.T) {
 			"and no aggregation can distinguish them", fm.stranded)
 	}
 }
+
+// TestRun_UnreadableLeaseLeavesTheStrandedGaugeAlone is the "a failed read is
+// not an absence" invariant applied to a gauge.
+//
+// stepDownGauges publishes stranded_workloads = 0, which is a CLAIM that
+// nothing is stranded. run() called it whenever acquireLease returned false --
+// including when the lease could not be READ at all. If the store problem is
+// fleet-wide, which is exactly the case where workloads are most likely to be
+// stranded, every node takes that path, no node holds the lease, max() across
+// instances reads 0, and the alert clears during the incident it exists for.
+//
+// The strandedWorkloads branch further down already follows this rule: on a
+// read error it leaves the gauge untouched rather than publishing a number it
+// failed to read.
+func TestRun_UnreadableLeaseLeavesTheStrandedGaugeAlone(t *testing.T) {
+	db := newTestDB(t)
+	fm := newFakeMetrics()
+	c := newTestCoordinator("coordinator", db)
+	c.Metrics = fm
+
+	// Make the lease READ fail, which is what a read-only file or a full disk
+	// looks like from here — as distinct from a clean "another node holds it".
+	if err := db.Execute(context.Background(), `DROP TABLE leader_election`); err != nil {
+		t.Fatalf("could not break the lease read: %v", err)
+	}
+
+	c.run(context.Background())
+
+	if fm.strandedSets != 0 {
+		t.Fatalf("an unreadable lease published stranded_workloads = %d (%d write(s)); "+
+			"publishing 0 asserts that nothing is stranded, and this node knows nothing",
+			fm.stranded, fm.strandedSets)
+	}
+}

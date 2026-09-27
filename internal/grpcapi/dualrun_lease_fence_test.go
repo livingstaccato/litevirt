@@ -143,3 +143,59 @@ func TestDualRun_UnreadableLeaseDiscardsThePass(t *testing.T) {
 			"the re-assert must fail closed")
 	}
 }
+
+// TestDualRun_StalePassDiscardedEvenWithNoTermLedger is the hole the fence
+// itself left open.
+//
+// stillDualRunLeader returned true immediately when passTerm was 0, on the
+// grounds that a cluster whose lease_term_ledger_v1 has not latched has no
+// tenure to compare and should not have its detector disabled. But term 0 is
+// not a rare edge: it is every rolling upgrade, and it is PERMANENT on a
+// cluster deliberately kept one host back. In that window the fence read
+// nothing at all and the whole change was inert.
+//
+// Holder identity is still available there, and it still catches the case that
+// matters — a successor took the lease while this node was stalled. It cannot
+// see a lapse-and-retake by this same host, which is why the term comparison
+// remains the primary test when a term exists.
+func TestDualRun_StalePassDiscardedEvenWithNoTermLedger(t *testing.T) {
+	s := dualRunTestServer(t, 2)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.OwnerEpochV1: true}})
+	ctx := context.Background()
+	seedVM(t, s, "vmA", "h1", "running")
+
+	s.gatherRuntimeOverride = fixedGather(map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}},
+		"h2": {diskHolderVMs: []string{"vmA"}},
+	})
+	s.acquireDualRunLease(ctx, time.Minute)
+	s.detectDualRunPass(ctx)
+	s.acquireDualRunLease(ctx, time.Minute)
+	s.detectDualRunPass(ctx)
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
+		t.Fatal("fixture inert: the dual-run was never confirmed")
+	}
+
+	// Mid rolling upgrade: the ledger cannot mint, so every term is 0.
+	s.db.SetLeaseTermLedgerGate(func() bool { return false })
+	s.dualRunLeaseTerm.Store(0)
+
+	// This node stalls; a successor takes the lease during the gather.
+	s.gatherRuntimeOverride = func(_ context.Context, hosts []string) (map[string]runtimeSnapshot, []string, []string) {
+		if _, _, err := corrosion.AcquireLeaseWithTerm(
+			ctx, s.db, dualRunLeaseKey, "successor-host", 2*time.Minute,
+			time.Now().Add(10*time.Minute)); err != nil {
+			t.Errorf("successor could not take the lease: %v", err)
+		}
+		return map[string]runtimeSnapshot{"h1": {}, "h2": {}}, nil, nil
+	}
+
+	s.detectDualRunPass(ctx)
+	s.detectDualRunPass(ctx)
+
+	if !confirmedCond(s, kindDualRunVM, "vmA") {
+		t.Fatal("with no term ledger the fence waved a stale pass through and it resolved a " +
+			"confirmed dual-run; term 0 is every rolling upgrade, so the fence was inert " +
+			"exactly when a cluster is most likely to be mid-handover")
+	}
+}

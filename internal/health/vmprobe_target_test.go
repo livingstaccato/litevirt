@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/events"
 )
@@ -251,6 +252,33 @@ func TestVMProbe_DiscoversTheAddressByMAC(t *testing.T) {
 	}
 	if asked != "52:54:00:aa:bb:01" {
 		t.Errorf("discovery asked for MAC %q, want the NIC's", asked)
+	}
+}
+
+// The lookup is restricted to the bridge the NIC's network leases on: a lease
+// for the MAC in another bridge's file (a deprovisioned network's leftover, a
+// network the guest has left) is not where the NIC is.
+func TestVMProbe_DiscoveryAsksOnTheNICsBridge(t *testing.T) {
+	_, port := listenAsVM(t)
+	f := newTargetFixture(t, hc("tcp", port), withIP(""))
+	cfg, _ := json.Marshal(compose.NetworkDef{Interface: "br-lan"})
+	if err := corrosion.UpsertNetwork(f.ctx, f.db, corrosion.NetworkRecord{Name: "lan", Type: "bridge", Config: string(cfg)}); err != nil {
+		t.Fatal(err)
+	}
+	var askedBridge string
+	f.v.setNICIPDiscoveryOnBridge(func(mac, bridge string) string {
+		askedBridge = bridge
+		if bridge == "br-lan" {
+			return vmStandIn
+		}
+		return "127.0.0.9" // another bridge's stale lease: nothing listens
+	})
+	f.v.SweepOnce(f.ctx)
+	if askedBridge != "br-lan" {
+		t.Fatalf("discovery asked on bridge %q, want the NIC network's bridge br-lan", askedBridge)
+	}
+	if h := f.health(); h.Verdict != VerdictHealthy {
+		t.Fatalf("address discovered on the NIC's bridge: %+v, want healthy", h)
 	}
 }
 

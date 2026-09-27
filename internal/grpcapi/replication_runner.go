@@ -132,7 +132,7 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 			// Fail closed on anything that is not definitely stopped: "running"
 			// is not the only state in which qemu holds the image open, and a
 			// state this code does not recognise is not evidence of safety.
-			if vm.State != "stopped" {
+			if !s.sourceIsShutOff(vm) {
 				slog.Error("incremental replication failed and the full-copy fallback is unsafe for a running source; producing no replica",
 					"vm", sched.VMName, "pool", sched.TargetPool, "state", vm.State, "error", err)
 				s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error",
@@ -618,6 +618,17 @@ func pruneReplicas(dir, vmName, diskName string, keepN int) int {
 // that reported success and wrote nothing. A deeper check (qemu-img check,
 // format and size against the source) belongs with the per-replica manifest
 // that promotion should be selecting on instead of filename recency.
+// syncPath flushes a file or directory to stable storage. A var so a test can
+// observe the order publishReplica syncs in.
+var syncPath = func(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 func publishReplica(ctx context.Context, dst string, write func(tmp string) error) error {
 	_ = ctx
 	tmp := filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".partial")
@@ -637,9 +648,46 @@ func publishReplica(ctx context.Context, dst string, write func(tmp string) erro
 		_ = os.Remove(tmp)
 		return fmt.Errorf("replica is empty; refusing to publish %s", filepath.Base(dst))
 	}
+	// Durable before promotable. qemu-img convert does not flush its output by
+	// default and a rename is metadata only, so without these a power loss
+	// could leave the final, promotable name on a file whose data never
+	// reached the disk. The data is synced before the rename, the directory
+	// after it so the rename itself survives.
+	if err := syncPath(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("sync replica before publishing: %w", err)
+	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("publish replica: %w", err)
 	}
+	if err := syncPath(filepath.Dir(dst)); err != nil {
+		// The rename happened but may not survive a crash. Withdraw it rather
+		// than leave a promotable name the storage would not vouch for.
+		_ = os.Remove(dst)
+		return fmt.Errorf("sync replica directory after publishing: %w", err)
+	}
 	return nil
+}
+
+// sourceIsShutOff reports whether a VM's disks are definitely closed, which is
+// the only case where the full-copy fallback is a consistent copy.
+//
+// The store's "stopped" is not enough. The coarse libvirt state folds paused
+// and pm-suspended domains into "stopped", and qemu still holds their images
+// open — a guest resumed mid-copy smears it exactly as a running one does. So
+// this asks libvirt for the state reason, as recoveryDomainDisposition does,
+// and answers true only for a genuine shut-off. Anything it cannot establish —
+// no libvirt connection, an error, a state it does not recognise — is false.
+func (s *Server) sourceIsShutOff(vm *corrosion.VMRecord) bool {
+	if vm.State != "stopped" || s.virt == nil {
+		return false
+	}
+	st, err := s.virt.DomainStateReason(vm.Name)
+	if err != nil {
+		slog.Warn("replication: live domain state indeterminate; treating the source as open",
+			"vm", vm.Name, "error", err)
+		return false
+	}
+	return st.State == "stopped" && st.Reason != "paused" && st.Reason != "pmsuspended"
 }

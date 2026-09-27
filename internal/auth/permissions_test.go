@@ -9,10 +9,7 @@ import (
 
 func setupEngine(t *testing.T) (*Engine, *corrosion.Client) {
 	t.Helper()
-	c, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(t.Context(), c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

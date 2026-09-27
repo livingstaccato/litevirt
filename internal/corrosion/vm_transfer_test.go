@@ -18,10 +18,7 @@ import (
 
 func transferFixture(t *testing.T) (*Client, context.Context) {
 	t.Helper()
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -112,10 +109,7 @@ func TestTransferVMOwnerFresh_IncrementsFromCurrentRow(t *testing.T) {
 // state + exact token so a retry can't double-mint and an unrelated row can't
 // be touched.
 func TestCompleteContainerRelocation_MintsOnce(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -161,10 +155,7 @@ func TestCompleteContainerRelocation_MintsOnce(t *testing.T) {
 // live rows are touched: another host's workloads are its own to graduate,
 // and tombstones stay pre-epoch forever.
 func TestBackfillOwnerEpochs(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -250,10 +241,7 @@ func TestBackfillOwnerEpochs(t *testing.T) {
 // Carrying the epoch in the WHERE clause makes the statement replicate with its
 // own precondition.
 func TestSetContainerStateAtEpoch(t *testing.T) {
-	db, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

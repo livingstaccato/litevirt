@@ -290,6 +290,23 @@ lxc.cgroup2.memory.max = 512M
 lxc.cgroup.memory.limit_in_bytes = 512M
 ```
 
+`--memory 0` means "no cap", and litevirt expresses that by **omitting** the
+key rather than writing a zero. That distinction matters when the limits are
+read back, because the config is root-editable and cgroup2 accepts both
+spellings of a very different thing:
+
+| In the config | Read back as |
+|---|---|
+| key absent | unlimited |
+| `memory.max = max` | unlimited |
+| `memory.max = 0` | a **finite** zero-byte cap |
+| `memory.max = 512M` | a 512 MiB cap |
+
+A hand-written `memory.max = 0` is a legal cgroup2 value and the most
+restrictive cap there is, so it is read as finite rather than rejected or
+treated as unlimited. Reading it as unlimited would flag the container as
+uncapped, which trips the uncapped gate and blocks new admission on the host.
+
 A container created by an earlier release keeps the cgroup limits it was created
 with until it is recreated (a compose update, a restore, a relocation or a
 clone writes a fresh config): those releases wrote `cpu.max` as `N*1000 100000`,
@@ -313,11 +330,19 @@ reality, so `lv ct ls` and the detail view never disagree.
 
 A container that has been created and never started has not stopped, so the
 restart policy does not apply to it: it stays stopped until `lv ct start` (or
-the start `lv compose up` makes right after the create). The reconciler also
+the start `lv compose up` makes right after the create). The same holds for a
+container made by `lv ct clone` or `lv ct restore` without starting it: it keeps
+the restart policy it was made with, but stays stopped until it is started (a
+restore of a backup taken of a stopped container keeps that container's stop
+intent instead). The reconciler also
 takes the same per-container lock as `lv ct create`, `start`, `stop` and `rm`
 on that host, and reads the row again once it holds it, so a sweep never acts
 on a container while one of those is changing it — a `lv ct stop` that lands
-mid-sweep stays stopped.
+mid-sweep stays stopped. The reconciler does not wait for that lock: a
+container that an operation holds — a `lv ct backup`, `lv ct migrate`,
+`lv ct snapshot`, `lv ct restore` or `lv ct clone` holds it for its whole run —
+is skipped for that sweep and reconciled by the next one, so one long operation
+never delays the reconcile of the host's other containers.
 
 **Caveat (coarser than VMs):** LXC reports only `RUNNING`/`STOPPED`/`FROZEN` — no
 stop *reason*. A container therefore cannot distinguish a clean in-guest shutdown

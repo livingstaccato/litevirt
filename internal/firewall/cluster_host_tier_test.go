@@ -13,10 +13,7 @@ import (
 // sets — all of which were dead (never read) before the firewall wire-up.
 func TestCorrosionPlanLoader_LoadsAllTiers(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -93,10 +90,7 @@ func TestCorrosionPlanLoader_LoadsAllTiers(t *testing.T) {
 // pre-v21 behaviour: no firewall_defaults row ⇒ policy accept.
 func TestCorrosionPlanLoader_DefaultAcceptWhenUnset(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -120,10 +114,7 @@ func TestCorrosionPlanLoader_DefaultAcceptWhenUnset(t *testing.T) {
 // host-scoped policy over the cluster default.
 func TestHostDefaultOverridesCluster(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

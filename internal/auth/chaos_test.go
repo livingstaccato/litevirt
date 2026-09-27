@@ -18,10 +18,7 @@ func TestEngine_ConcurrentReloadAndRead(t *testing.T) {
 		t.Skip("chaos test")
 	}
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -91,10 +88,7 @@ func TestEngine_ConcurrentReloadAndRead(t *testing.T) {
 // preserves a previously-granted permission.
 func TestEngine_ReloadKeepsAlicePermissionsStable(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

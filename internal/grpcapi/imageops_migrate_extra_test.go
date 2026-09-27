@@ -203,10 +203,7 @@ func TestAutoPullImage_PeerNotReady(t *testing.T) {
 
 func TestAutoPullImage_PeerExists_DialFails(t *testing.T) {
 	// Peer is ready but peerClient will fail (no real host to connect to).
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -236,7 +233,7 @@ func TestAutoPullImage_PeerExists_DialFails(t *testing.T) {
 		PulledAt:  "2026-01-01T00:00:00Z",
 	})
 
-	err = s.AutoPullImage(ctx, "ubuntu")
+	err := s.AutoPullImage(ctx, "ubuntu")
 	if err == nil {
 		t.Fatal("expected error when peer dial fails")
 	}
@@ -319,10 +316,7 @@ func TestImportImage_MissingName(t *testing.T) {
 
 func TestImportImage_ChecksumMismatch(t *testing.T) {
 	dataDir := t.TempDir()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -343,7 +337,7 @@ func TestImportImage_ChecksumMismatch(t *testing.T) {
 		},
 	}
 
-	err = s.ImportImage(stream)
+	err := s.ImportImage(stream)
 	if err == nil {
 		t.Fatal("expected error for checksum mismatch")
 	}
@@ -357,10 +351,7 @@ func TestImportImage_ChecksumMismatch(t *testing.T) {
 
 func TestImportImage_Success(t *testing.T) {
 	dataDir := t.TempDir()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -388,7 +379,7 @@ func TestImportImage_Success(t *testing.T) {
 		},
 	}
 
-	err = s.ImportImage(stream)
+	err := s.ImportImage(stream)
 	if err != nil {
 		t.Fatalf("ImportImage: %v", err)
 	}
@@ -418,10 +409,7 @@ func TestImportImage_Success(t *testing.T) {
 
 func TestImportImage_DefaultFormat(t *testing.T) {
 	dataDir := t.TempDir()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	corrosion.InitSchema(ctx, db)
 
@@ -443,7 +431,7 @@ func TestImportImage_DefaultFormat(t *testing.T) {
 		},
 	}
 
-	err = s.ImportImage(stream)
+	err := s.ImportImage(stream)
 	if err != nil {
 		t.Fatalf("ImportImage: %v", err)
 	}
@@ -510,10 +498,7 @@ func TestPushImage_gRPC_ImageNotFoundLocally(t *testing.T) {
 func TestPushImage_gRPC_PeerConnectionFails(t *testing.T) {
 	// Image exists locally but target host's daemon is unreachable.
 	dataDir := t.TempDir()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	corrosion.InitSchema(ctx, db)
 
@@ -542,7 +527,7 @@ func TestPushImage_gRPC_PeerConnectionFails(t *testing.T) {
 	})
 
 	stream := &mockPushImageStream{ctx: ctx}
-	err = s.PushImage(&pb.PushImageRequest{Name: "test-img", TargetHost: "target-host"}, stream)
+	err := s.PushImage(&pb.PushImageRequest{Name: "test-img", TargetHost: "target-host"}, stream)
 	if err == nil {
 		t.Fatal("expected Unavailable error for unreachable peer")
 	}
@@ -554,10 +539,7 @@ func TestPushImage_gRPC_PeerConnectionFails(t *testing.T) {
 func TestPushImage_gRPC_LooksUpChecksum(t *testing.T) {
 	// Verify that PushImage queries the DB for image metadata (checksum/format).
 	dataDir := t.TempDir()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	corrosion.InitSchema(ctx, db)
 
@@ -585,7 +567,7 @@ func TestPushImage_gRPC_LooksUpChecksum(t *testing.T) {
 	// No target host → will fail at peerClient, but we can verify it got past
 	// the metadata lookup without error.
 	stream := &mockPushImageStream{ctx: ctx}
-	err = s.PushImage(&pb.PushImageRequest{Name: "checksummed", TargetHost: "ghost"}, stream)
+	err := s.PushImage(&pb.PushImageRequest{Name: "checksummed", TargetHost: "ghost"}, stream)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -599,10 +581,7 @@ func TestPushImage_gRPC_NoProgressOnEarlyFailure(t *testing.T) {
 	// When peer connection fails early, no progress messages should be sent
 	// (the "copying" message is sent after the connection is established).
 	dataDir := t.TempDir()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := adminCtx()
 	corrosion.InitSchema(ctx, db)
 
@@ -629,7 +608,7 @@ func TestPushImage_gRPC_NoProgressOnEarlyFailure(t *testing.T) {
 	}
 
 	stream := &mockPushImageStream{ctx: ctx}
-	err = s.PushImage(&pb.PushImageRequest{Name: "progress-img", TargetHost: "target"}, stream)
+	err := s.PushImage(&pb.PushImageRequest{Name: "progress-img", TargetHost: "target"}, stream)
 
 	// Should fail at Unavailable (peer TLS failure).
 	if err == nil {

@@ -74,7 +74,13 @@ func (s *Server) handleStackDeploy(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, "compose_yaml required")
 		return
 	}
-	stream, err := s.grpc.DeployStack(s.grpcCtx(r), &req)
+	// Non-SSE, the answer is the verdict, so the stream runs on a detached
+	// context (a client that stops waiting does not cancel the deploy) and the
+	// write deadline is lifted (the verdict of a deploy longer than the
+	// WriteTimeout still reaches a client that waits for it).
+	ctx, cancel := s.opContext(r)
+	defer cancel()
+	stream, err := s.grpc.DeployStack(ctx, &req)
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
@@ -83,6 +89,7 @@ func (s *Server) handleStackDeploy(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
+	awaitVerdict(w)
 	// The whole stream is read. Returning early closes it, and a closed
 	// DeployStack stream cancels the deploy on the server: the old "first
 	// frame" answer created at most one VM, abandoned the rest and said 200.
@@ -163,7 +170,11 @@ func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	stream, err := s.grpc.DeleteStack(s.grpcCtx(r), &req)
+	// As for deploy: detached so a departing client does not cancel the
+	// teardown, and no write deadline so a waiting client gets the verdict.
+	ctx, cancel := s.opContext(r)
+	defer cancel()
+	stream, err := s.grpc.DeleteStack(ctx, &req)
 	if err != nil {
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
@@ -172,6 +183,7 @@ func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
 		streamSSE(w, r, func() (proto.Message, error) { return stream.Recv() })
 		return
 	}
+	awaitVerdict(w)
 
 	// DeleteStack ends OK even when resources could not be removed — each is an
 	// "error" status on the stream — so the whole stream is drained and judged

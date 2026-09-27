@@ -56,6 +56,14 @@ func (s *Server) handleSGCreateModal(w http.ResponseWriter, r *http.Request) {
 
 // handleCreateSG creates a security group. Mirrors `lv sg create`.
 func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
+	// Security groups have no gRPC twin to route through, so the daemon's
+	// authorizer is called directly. Without it this handler wrote
+	// CRDT-replicated firewall state behind nothing but a coarse role string.
+	if err := s.authorize(r, "/", "write"); err != nil {
+		sendToast(w, "Not permitted: "+err.Error(), "error")
+		w.WriteHeader(httpStatusFor(err))
+		return
+	}
 	if s.db == nil {
 		sendToast(w, "cluster DB unavailable", "error")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -79,6 +87,7 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.add", name, "")
 	sendToast(w, "Security group "+name+" created", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -86,6 +95,14 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteSG removes a security group and its rules. Mirrors `lv sg rm`.
 func (s *Server) handleDeleteSG(w http.ResponseWriter, r *http.Request) {
+	// Security groups have no gRPC twin to route through, so the daemon's
+	// authorizer is called directly. Without it this handler wrote
+	// CRDT-replicated firewall state behind nothing but a coarse role string.
+	if err := s.authorize(r, "/", "write"); err != nil {
+		sendToast(w, "Not permitted: "+err.Error(), "error")
+		w.WriteHeader(httpStatusFor(err))
+		return
+	}
 	if s.db == nil {
 		sendToast(w, "cluster DB unavailable", "error")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -98,6 +115,7 @@ func (s *Server) handleDeleteSG(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.rm", id, "")
 	sendToast(w, "Security group deleted", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -110,6 +128,14 @@ func (s *Server) handleSGRuleModal(w http.ResponseWriter, r *http.Request) {
 
 // handleAddSGRule appends a rule to a security group. Mirrors `lv sg rule-add`.
 func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
+	// Security groups have no gRPC twin to route through, so the daemon's
+	// authorizer is called directly. Without it this handler wrote
+	// CRDT-replicated firewall state behind nothing but a coarse role string.
+	if err := s.authorize(r, "/", "write"); err != nil {
+		sendToast(w, "Not permitted: "+err.Error(), "error")
+		w.WriteHeader(httpStatusFor(err))
+		return
+	}
 	if s.db == nil {
 		sendToast(w, "cluster DB unavailable", "error")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -136,6 +162,7 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.rule.add", sgID, r.FormValue("direction")+" "+r.FormValue("action"))
 	sendToast(w, "Rule added", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -143,6 +170,14 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteSGRule removes a single rule.
 func (s *Server) handleDeleteSGRule(w http.ResponseWriter, r *http.Request) {
+	// Security groups have no gRPC twin to route through, so the daemon's
+	// authorizer is called directly. Without it this handler wrote
+	// CRDT-replicated firewall state behind nothing but a coarse role string.
+	if err := s.authorize(r, "/", "write"); err != nil {
+		sendToast(w, "Not permitted: "+err.Error(), "error")
+		w.WriteHeader(httpStatusFor(err))
+		return
+	}
 	if s.db == nil {
 		sendToast(w, "cluster DB unavailable", "error")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -153,6 +188,7 @@ func (s *Server) handleDeleteSGRule(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
+	s.auditUIWrite(r, "sg.rule.rm", r.PathValue("rule"), "")
 	sendToast(w, "Rule removed", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)

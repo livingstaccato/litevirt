@@ -84,10 +84,7 @@ func TestNextFreeIPv6_Canonicalization(t *testing.T) {
 
 // TestAllocateIPv6 wires v6 through the full DB-backed allocation path.
 func TestAllocateIPv6(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -109,10 +106,7 @@ func TestAllocateIPv6(t *testing.T) {
 }
 
 func TestAllocateAndRelease(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -152,10 +146,7 @@ func TestAllocateAndRelease(t *testing.T) {
 }
 
 func TestAllocateIP_TwoVMs(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -183,10 +174,7 @@ func TestAllocateIP_TwoVMs(t *testing.T) {
 }
 
 func TestGetAllocation_NotFound(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

@@ -4,8 +4,10 @@ package ui
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"embed"
+	"errors"
 	"fmt"
 	"html/template"
 	"log/slog"
@@ -14,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -45,6 +49,14 @@ type Server struct {
 	migrations sync.Map // vmName → *migrateState
 	backupOps  sync.Map // opID → *backupOpState (snapshot / restore / restore-live)
 	statsRings sync.Map // "host:<name>" or "vm:<name>" → *StatsRing
+
+	// authz is the daemon's own authorization entry point, used by the write
+	// handlers that have NO gRPC twin to route through (security groups).
+	// Without it those writes had nothing in front of them but a coarse role
+	// string, which neither honours a token's scope paths nor sees an RBAC
+	// binding. An interface, not *grpcapi.Server, so this package does not
+	// import it. Nil = those writes are refused rather than waved through.
+	authz Authorizer
 
 	// db is a host-local Corrosion handle for read-only pages that
 	// would otherwise require a new gRPC RPC for trivial reads
@@ -87,6 +99,62 @@ func (s *Server) SetCorrosionDB(db *corrosion.Client) { s.db = db }
 // `backup_repos:` map so /backups can list them without query-string
 // nudging. Pass the daemon's live map directly — the UI does not mutate.
 func (s *Server) SetBackupRepos(repos map[string]string) { s.backupRepos = repos }
+
+// Authorizer is the daemon's authorization entry point, narrowed to what the
+// UI needs. internal/grpcapi's *Server satisfies it.
+type Authorizer interface {
+	AuthorizeInProcess(ctx context.Context, path, verb, fallbackRole string) error
+}
+
+// SetAuthorizer wires the daemon's authorizer for the in-process write paths
+// that have no gRPC twin.
+func (s *Server) SetAuthorizer(a Authorizer) { s.authz = a }
+
+// auditUIWrite records an in-process UI mutation in the audit chain.
+//
+// Security groups have no gRPC twin, so these writes never passed through a
+// handler that audits. The consequence is worse than a missing log: `lv audit
+// verify` reports a clean, unbroken, SIGNED chain in which nobody changed the
+// security groups, so post-incident the log reads as proof that the isolation
+// rules were never touched.
+//
+// The principal comes from the daemon's own Whoami for this session, not from
+// anything the request supplies. A failure is logged and not returned: the
+// write has already happened, and reporting an error the caller would read as
+// "the change did not land" is worse than a gap the log itself shows.
+func (s *Server) auditUIWrite(r *http.Request, action, target, detail string) {
+	ctx := s.uiBearerCtx(r)
+	user := "unknown"
+	if who, err := s.grpc.Whoami(ctx, &emptypb.Empty{}); err == nil && who.GetUsername() != "" {
+		user = who.GetUsername()
+	}
+	if s.db == nil {
+		slog.Error("ui: no cluster DB handle; a mutation went unaudited",
+			"action", action, "target", target, "user", user)
+		return
+	}
+	if err := corrosion.InsertAuditLog(context.WithoutCancel(ctx), s.db, corrosion.AuditRecord{
+		Username: user, HostName: s.cluster, Action: action, Target: target,
+		Detail: detail, Result: "ok",
+	}); err != nil {
+		slog.Error("ui: could not write the audit row for a mutation that already landed",
+			"action", action, "target", target, "user", user, "error", err)
+	}
+}
+
+// authorize applies the daemon's authorization to an in-process write.
+//
+// It FAILS CLOSED when no authorizer is wired: an unauthorized cluster write
+// is worse than an unavailable page, and a nil authorizer means the one
+// component that can answer the question is absent.
+func (s *Server) authorize(r *http.Request, path, verb string) error {
+	if s.authz == nil {
+		return errNoAuthorizer
+	}
+	return s.authz.AuthorizeInProcess(s.uiBearerCtx(r), path, verb, "operator")
+}
+
+var errNoAuthorizer = errors.New("authorization unavailable on this build")
 
 // NewServer creates a UI server backed by the given gRPC client.
 func NewServer(client pb.LiteVirtClient, clusterName string) (*Server, error) {

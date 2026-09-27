@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -17,9 +18,17 @@ type fakeFailoverGate struct {
 	// enforced maps token → enforcement decision. A nil map means "all enforced"
 	// (back-compat for tests that only exercise the mint-site PeerSupports path).
 	enforced map[string]bool
+	// onDecision runs inside DecisionGate, which is the last thing the loop
+	// does before acting on a VM. It is the seam for "the tenure ended
+	// MID-LOOP" -- the only shape in which a stale-tenure write is reachable,
+	// since a lapse before the tick is caught by the tick's own lease gate.
+	onDecision func()
 }
 
 func (f fakeFailoverGate) DecisionGate(context.Context) health.GateResult {
+	if f.onDecision != nil {
+		f.onDecision()
+	}
 	return health.GateResult{OK: true}
 }
 func (f fakeFailoverGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
@@ -204,5 +213,103 @@ func TestVMRescheduleProofCarriesLeaseTerm(t *testing.T) {
 		t.Errorf("proof lease_key = %q, want %q. The three leases allocate terms "+
 			"independently and their numbers collide by design, so a term without its "+
 			"key cannot be judged against anything", got, corrosion.LeaseKeyFailover)
+	}
+}
+
+// TestAutoPromoteAbandonsOnAStaleTenure is promote's half of the same rule.
+//
+// Promote is as destructive as reschedule -- it defines and starts a VM on a
+// new host -- but coordinator.go called it with no leaseStamp guard, so a
+// coordinator whose lease had lapsed mid-loop had its reschedule and relocate
+// refused while its promote went through. gateEnforced/DecisionGate does not
+// catch it, because a lapse is not quorum loss; and for a local-disk DR VM
+// requireProofGradeFence does not fire either.
+func TestAutoPromoteAbandonsOnAStaleTenure(t *testing.T) {
+	seed := func(t *testing.T, db *corrosion.Client) *dbPromoter {
+		t.Helper()
+		ctx := context.Background()
+		for _, h := range []string{"bad", "good"} {
+			if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+				Name: h, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+				GRPCPort: 7443, State: "active", FenceStrategy: "manual",
+			}); err != nil {
+				t.Fatalf("InsertHost %s: %v", h, err)
+			}
+		}
+		if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
+			Name: "vm1", HostName: "bad", Spec: `{"on_host_failure":"restart-any"}`, State: "running",
+		}, nil, nil); err != nil {
+			t.Fatalf("InsertVM: %v", err)
+		}
+		if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+			VMName: "vm1", Repo: "dr", Scope: "vm", Cron: "* * * * *", Enabled: true,
+			Type: "replication", TargetPool: "dr", TargetHost: "good", KeepReplicas: 3,
+			Incremental: true, AutoPromote: true,
+		}); err != nil {
+			t.Fatalf("UpsertBackupSchedule: %v", err)
+		}
+		fenceQuorum(t, ctx, db, []string{"coordinator", "good"}, "bad")
+		return &dbPromoter{db: db, target: "promoted-host"}
+	}
+
+	// Positive control FIRST: without it, a fixture that never reaches the
+	// promote branch would pass the real assertion for the wrong reason.
+	t.Run("a held lease still promotes", func(t *testing.T) {
+		db := newTestDB(t)
+		prom := seed(t, db)
+		c := newTestCoordinator("coordinator", db)
+		c.Promoter = prom
+		c.run(context.Background())
+		if len(prom.promoted) != 1 {
+			t.Fatalf("fixture inert: a coordinator holding the lease promoted %v, want [vm1]", prom.promoted)
+		}
+	})
+
+	t.Run("a tenure that ends mid-loop does not", func(t *testing.T) {
+		db := newTestDB(t)
+		ctx := context.Background()
+		prom := seed(t, db)
+		c := newTestCoordinator("coordinator", db)
+		c.Promoter = prom
+		// The successor takes the lease DURING the tick, right before the
+		// promote decision -- the coordinator passed its own lease gate at the
+		// top of the tick and is now acting on a tenure it no longer holds.
+		c.Gate = fakeFailoverGate{
+			supports: map[string]bool{"good": true},
+			enforced: map[string]bool{capabilities.SplitBrainGateV1: true},
+			onDecision: func() {
+				if _, _, err := corrosion.AcquireLeaseWithTerm(ctx, db, corrosion.LeaseKeyFailover,
+					"successor", 10*time.Minute, time.Now().Add(10*time.Minute)); err != nil {
+					t.Errorf("successor could not take the failover lease: %v", err)
+				}
+			},
+		}
+
+		c.run(ctx)
+
+		if len(prom.promoted) != 0 {
+			t.Fatalf("a coordinator whose tenure ended mid-loop promoted %v; promote "+
+				"defines and starts a VM on a new host and must take the same "+
+				"stale-tenure abandon reschedule and relocate take", prom.promoted)
+		}
+	})
+}
+
+// TestStillOurTenureFailsClosedOnAnUnknownHolder pins the direction of the
+// re-check's failure mode.
+//
+// leaseSnapshot returns an empty holder on a read error rather than
+// fabricating one — reporting self would falsely assert this node held the
+// lease. An unknown holder is therefore NOT a held lease: abandoning one VM's
+// recovery costs a cycle, while promoting on a tenure that may already belong
+// to a successor defines and starts a VM on a new host while that successor
+// may be doing the same.
+func TestStillOurTenureFailsClosedOnAnUnknownHolder(t *testing.T) {
+	db := newTestDB(t)
+	c := newTestCoordinator("coordinator", db)
+
+	// No leader_election row at all: leaseSnapshot reports "" (unknown).
+	if c.stillOurTenure(context.Background()) {
+		t.Fatal("an unknown lease holder was read as 'still ours'; the re-check must fail closed")
 	}
 }

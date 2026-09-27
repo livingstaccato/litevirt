@@ -111,7 +111,7 @@ type Server struct {
 	// nicIPDiscovery replaces the ARP / dnsmasq-lease lookup every discovery
 	// path uses to find the address a MAC is answering on. nil in production;
 	// see SetNICIPDiscovery.
-	nicIPDiscovery func(mac string) string
+	nicIPDiscovery func(mac, bridge string) string
 
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
@@ -296,6 +296,9 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// repairLeaseHook is a test-only seam run while a compose repair holds the
+	// VM's start lease, before it touches the domain.
+	repairLeaseHook func(vmName string)
 	// cutoverCrashHook is a test-only seam; see SetCutoverCrashHook.
 	cutoverCrashHook func(stage string) error
 	// enfAuditSignature is this node's kill-switch for tamper-evident audit logging.
@@ -670,6 +673,16 @@ type Server struct {
 	// fleet-wide while this node could still miss data. Stored atomically: the daemon
 	// sets it from the startup backfill goroutine while the Ping/HA paths read it.
 	hwV2Ready atomic.Bool
+
+	// readyRead is Ready's one local read; nil means the real hosts-table
+	// query. A seam so a test can stand in for a read blocked on the client
+	// lock, which honours no context. readyFlight is the outstanding read,
+	// shared by concurrent callers (see boundedReadyQuery), so a wedged store is
+	// answered "not ready" at once instead of accumulating one blocked
+	// goroutine per probe. Guarded by readyMu.
+	readyRead   func(ctx context.Context) ([]corrosion.Row, error)
+	readyMu     sync.Mutex
+	readyFlight *readyFlight
 }
 
 // SetDemotionUnfenced records whether a minority VIP demote failed with no verified
@@ -1481,10 +1494,11 @@ type ContainerRuntime interface {
 	ExecContainer(ctx context.Context, name string, argv []string) (ContainerExecResult, error)
 	StateContainer(ctx context.Context, name string) (string, error)
 	// ContainerLimits reads the container's configured cgroup limits back from
-	// the runtime's own on-disk config (0 = unlimited). The runtime-inventory
-	// collector reports these so capacity accounting can charge runtime-only
-	// containers and flag uncapped ones.
-	ContainerLimits(ctx context.Context, name string) (cpuLimit, memMiB int, err error)
+	// the runtime's own on-disk config. The runtime-inventory collector
+	// reports these so capacity accounting can charge runtime-only containers
+	// and flag uncapped ones — which is why memory carries Unlimited as its
+	// own field and not as a zero.
+	ContainerLimits(ctx context.Context, name string) (cpuLimit int, mem ContainerMemoryLimit, err error)
 	IPContainer(ctx context.Context, name string) (string, error)
 	ListContainers(ctx context.Context) ([]string, error)
 	// ContainerExists reports whether the on-disk container artifact (dir) exists —
@@ -1539,6 +1553,16 @@ type ContainerInfo struct {
 	Name  string
 	State string
 	Image string
+}
+
+// ContainerMemoryLimit mirrors lxc.MemoryLimit at the gRPC boundary.
+//
+// Unlimited is a field rather than MiB==0 because cgroup2 accepts both "max"
+// and "0": collapsing them reported a finite zero-byte cap as uncapped, which
+// trips the uncapped gate and blocks new admission.
+type ContainerMemoryLimit struct {
+	MiB       int
+	Unlimited bool
 }
 
 // ContainerExecResult mirrors lxc.ExecResult.
@@ -1650,7 +1674,7 @@ func (s *Server) SetContainerRuntime(r ContainerRuntime) { s.containerRuntime = 
 
 // LockContainer takes the per-container lock this host's container operations
 // hold (create, start, stop, delete), and returns its unlock. The container
-// checker takes it too (health.ContainerChecker.SetContainerLock), so its
+// checker tries it too (TryLockContainer), so its
 // reconcile never interleaves with an operation on the same container.
 func (s *Server) LockContainer(name string) func() { return s.lockVM("ct/" + name) }
 

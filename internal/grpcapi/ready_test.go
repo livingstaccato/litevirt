@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -87,5 +88,85 @@ func insertReadyHost(t *testing.T, s *Server, name string) {
 	}
 	if h, err := corrosion.GetHost(ctx, s.db, name); err != nil || h == nil {
 		t.Fatalf("read back host %q: %v", name, err)
+	}
+}
+
+// Ready answers "not ready" within its own budget even when the read cannot
+// start. corrosion.Client.Query takes the client lock before anything honours
+// the context, so on a node whose writer is stuck inside a commit — a stalled
+// WAL checkpoint, a slow fsync — the read blocks past any timeout handed to
+// it. Ready then hung for the caller's whole budget, the observer saw an RPC
+// that never came back, and classified the peer UNREACHABLE: the silence path,
+// the one fence quorum counts. The wedged-store case this RPC exists to report
+// as "here, and cannot serve" became a fencing verdict.
+func TestReady_AnswersWithinItsBudgetWhenTheReadBlocks(t *testing.T) {
+	s := testServer(t)
+	insertReadyHost(t, s, "test-host") // so a read that completed would say ready
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	s.readyRead = func(context.Context) ([]corrosion.Row, error) {
+		<-release // ignores ctx, as a read waiting on the client lock does
+		return nil, nil
+	}
+
+	start := time.Now()
+	resp, err := s.Ready(context.Background(), &pb.ReadyRequest{})
+	if elapsed := time.Since(start); elapsed > readyReadTimeout+time.Second {
+		t.Fatalf("Ready took %v with the read blocked; it must answer within readyReadTimeout (%v)", elapsed, readyReadTimeout)
+	}
+	if err != nil {
+		t.Fatalf("Ready returned an error (%v); a blocked read is a not-ready ANSWER", err)
+	}
+	if resp.GetReady() {
+		t.Fatal("Ready reported ready while its read could not complete")
+	}
+
+	// A second probe while the first read is still stuck — outstanding for
+	// longer than the whole budget now — answers at once, rather than stacking
+	// another blocked goroutine behind the lock or waiting on the stuck read.
+	start = time.Now()
+	if resp, _ := s.Ready(context.Background(), &pb.ReadyRequest{}); resp.GetReady() {
+		t.Fatal("second Ready reported ready while the first read was still blocked")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Errorf("second Ready took %v; with a read already outstanding it should answer immediately", elapsed)
+	}
+}
+
+// Probes that arrive together all get the answer of the read that is running.
+//
+// Every observer probes every peer on the same two-second tick, so concurrent
+// Ready calls on a healthy node are the normal case, not a corner. One shared
+// in-flight flag answered every caller but the first "not ready" at once, for
+// the whole length of a perfectly ordinary read — and the consumers believe a
+// not-ready answer on first sight: the checker records the peer unready, and
+// QuorumProof drops it from the proof. A healthy node lost its vote for being
+// asked twice in the same 50 ms.
+func TestReady_ConcurrentProbesOfAHealthyNodeAreAllReady(t *testing.T) {
+	s := testServer(t)
+	insertReadyHost(t, s, "test-host")
+	s.readyRead = func(ctx context.Context) ([]corrosion.Row, error) {
+		time.Sleep(50 * time.Millisecond) // an ordinary read, well inside the budget
+		return s.db.Query(ctx, `SELECT name FROM hosts WHERE name = ?`, "test-host")
+	}
+
+	const callers = 4
+	results := make(chan *pb.ReadyResponse, callers)
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		go func() {
+			<-start
+			resp, err := s.Ready(context.Background(), &pb.ReadyRequest{})
+			if err != nil {
+				t.Errorf("Ready: %v", err)
+			}
+			results <- resp
+		}()
+	}
+	close(start)
+	for i := 0; i < callers; i++ {
+		if resp := <-results; !resp.GetReady() {
+			t.Errorf("a concurrent probe of a healthy node answered not ready (%q)", resp.GetNotReadyReason())
+		}
 	}
 }

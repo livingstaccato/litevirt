@@ -6,10 +6,7 @@ import (
 )
 
 func TestUpsertAndGetStack(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -38,10 +35,7 @@ func TestUpsertAndGetStack(t *testing.T) {
 }
 
 func TestUpsertStack_Updates(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -65,10 +59,7 @@ func TestUpsertStack_Updates(t *testing.T) {
 }
 
 func TestListStacks(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -92,10 +83,7 @@ func TestListStacks(t *testing.T) {
 }
 
 func TestDeleteStackRecord(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -118,10 +106,7 @@ func TestDeleteStackRecord(t *testing.T) {
 }
 
 func TestGetStack_NotFound(t *testing.T) {
-	c, err := NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	c := NewTestClientT(t)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
 		t.Fatalf("InitSchema: %v", err)

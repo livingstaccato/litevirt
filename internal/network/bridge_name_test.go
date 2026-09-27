@@ -21,10 +21,7 @@ func TestBridgeName_AgreesWithProvision(t *testing.T) {
 	startDHCPFunc = func(bridge, gw, rangeStart, rangeEnd, mask, pidFile string) error { return nil }
 	defer func() { startDHCPFunc = StartDHCP }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

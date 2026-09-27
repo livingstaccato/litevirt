@@ -117,8 +117,12 @@ func TestMembershipTick_ASuccessfulRejoinResolves(t *testing.T) {
 	rep := reporter(c)
 	c.membershipTick(context.Background(), isolatedRejoiner(), rep)
 
+	// A real successful join makes its peers visible, and visibility — not
+	// Join's count — is what decides the pass.
 	rejoined := isolatedRejoiner()
-	rejoined.join = func([]string) (int, error) { return 2, nil }
+	visible := 0
+	rejoined.peerCount = func() int { return visible }
+	rejoined.join = func([]string) (int, error) { visible = 2; return 2, nil }
 	c.membershipTick(context.Background(), rejoined, rep)
 
 	if row, _ := isolationRow(t, c); row.Lifecycle != ConditionResolved {
@@ -170,5 +174,63 @@ func TestMembershipTick_ASingleNodeClusterIsNotIsolated(t *testing.T) {
 
 	if _, ok := isolationRow(t, c); ok {
 		t.Error("a single-node cluster was reported as isolated")
+	}
+}
+
+// Joining yourself is not rejoining the cluster.
+//
+// rejoinTargets keeps a configured seed that names this node — on a fleet that
+// shares one join_peers list, every node's list includes itself — and
+// memberlist's push/pull to its own address succeeds. So a node that had lost
+// every peer got Join = (1, nil) and was reported recovered, every pass, while
+// it still saw nobody. Isolation is decided by what the node can see after the
+// attempt, not by what Join returned.
+func TestMembershipTick_JoiningOnlyItselfIsStillIsolated(t *testing.T) {
+	c := isolationClient(t)
+	selfJoin := &rejoiner{
+		peerCount: func() int { return 0 }, // before and after: nobody
+		targets:   func() []string { return []string{"10.0.0.3", "10.0.0.1"} },
+		join:      func([]string) (int, error) { return 1, nil }, // reached itself
+	}
+
+	c.membershipTick(context.Background(), selfJoin, reporter(c))
+
+	if _, ok := isolationRow(t, c); !ok {
+		t.Fatal("no gossip_isolated condition: a Join that reached only this node was taken for a re-join " +
+			"although the node still sees no peers")
+	}
+}
+
+// Close cannot be held hostage by a join. memberlist.Join takes no context and
+// dials its targets one at a time, each bounded only by its TCP timeout, so an
+// isolated node with ten unreachable targets sat in one Join for about 100 s —
+// and Close waits for the membership loop, so shutdown waited too, past
+// systemd's stop timeout. A cancelled pass stops waiting for the join and
+// writes nothing: the store it would write to is about to close.
+func TestMembershipTick_ACancelledPassDoesNotWaitForTheJoin(t *testing.T) {
+	c := isolationClient(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	ctx, cancel := context.WithCancel(context.Background())
+
+	stuck := &rejoiner{
+		peerCount: func() int { return 0 },
+		targets:   func() []string { return []string{"10.0.0.1"} },
+		join: cancellableJoin(ctx, func([]string) (int, error) {
+			<-release // memberlist.Join ignores ctx
+			return 0, errors.New("i/o timeout")
+		}),
+	}
+	done := make(chan struct{})
+	go func() { c.membershipTick(ctx, stuck, reporter(c)); close(done) }()
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("membershipTick kept waiting on a join after its context was cancelled; Close would wait with it")
+	}
+	if _, ok := isolationRow(t, c); ok {
+		t.Error("a cancelled pass wrote an isolation condition into a store that is closing")
 	}
 }

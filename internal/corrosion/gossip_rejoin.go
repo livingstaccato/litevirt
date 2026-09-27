@@ -96,12 +96,12 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 			}
 			return rejoinTargets(seeds, hosts, c.hostName, selfAddr)
 		},
-		join: func(ts []string) (int, error) {
+		join: cancellableJoin(ctx, func(ts []string) (int, error) {
 			if c.list == nil {
 				return 0, nil
 			}
 			return c.list.Join(ts)
-		},
+		}),
 	}
 
 	rep := &isolationReporter{c: c, host: c.hostName, now: time.Now}
@@ -121,10 +121,21 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 // node sees nobody, log the outcome, and keep the isolation condition current.
 func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolationReporter) {
 	attempted, joined, err := r.tick()
-	// Isolated means this pass had to try AND got nowhere. A pass that did not
-	// try either sees peers already or has nobody to find (a single-node
-	// cluster with no seeds) — neither is isolation.
-	rep.report(ctx, attempted && (err != nil || joined == 0), err)
+	if ctx.Err() != nil {
+		// Close cancelled this pass. Nothing it learned is worth writing into
+		// a store that is about to close.
+		return
+	}
+	// Isolated means this pass had to try AND still sees nobody. A pass that
+	// did not try either sees peers already or has nobody to find (a
+	// single-node cluster with no seeds) — neither is isolation.
+	//
+	// Decided by the peers visible AFTER the attempt, not by Join's count: a
+	// seed list that names this node (the shape a fleet sharing one join_peers
+	// list has) lets Join reach itself and return (1, nil) while the node
+	// still sees no one.
+	isolated := attempted && r.peerCount() == 0
+	rep.report(ctx, isolated, err)
 	if !attempted {
 		return
 	}
@@ -132,7 +143,7 @@ func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolation
 	// held as caught up no longer covers what the cluster may be deciding
 	// without it. Backstop for the leave event, which is the primary reset.
 	c.MarkReplicaStale("sees no gossip peers (re-join loop)")
-	if err != nil {
+	if isolated {
 		// REPORTED every attempt, not once at startup. "joined 0 of N" is
 		// the signal an operator needs, and logging it once and carrying on
 		// is what made a whole partition invisible.
@@ -140,5 +151,40 @@ func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolation
 			"joined", joined, "error", err)
 		return
 	}
+	if err != nil {
+		// Some targets answered and the node now sees peers, so this pass
+		// recovered; the partial failure is worth a line, not a condition.
+		slog.Warn("gossip: re-joined after losing every peer, but some targets failed",
+			"joined", joined, "error", err)
+		return
+	}
 	slog.Info("gossip: re-joined after losing every peer", "peers", joined)
+}
+
+// cancellableJoin wraps a join so the loop can stop waiting for it.
+//
+// memberlist.Join takes no context and dials its targets one at a time, each
+// bounded only by its TCP timeout: an isolated node with ten unreachable
+// targets sits in a single Join for about 100 s. Close waits for the loop, so
+// shutdown waited with it — past systemd's stop timeout. On cancellation the
+// join is left to finish on its own goroutine; it touches only memberlist,
+// which Close shuts down next, never the database.
+func cancellableJoin(ctx context.Context, join func([]string) (int, error)) func([]string) (int, error) {
+	return func(targets []string) (int, error) {
+		type result struct {
+			n   int
+			err error
+		}
+		ch := make(chan result, 1)
+		go func() {
+			n, err := join(targets)
+			ch <- result{n, err}
+		}()
+		select {
+		case r := <-ch:
+			return r.n, r.err
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 }

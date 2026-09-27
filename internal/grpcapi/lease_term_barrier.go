@@ -66,6 +66,20 @@ const (
 	// maximum cannot regress that way. The window is real, the old explanation
 	// was not. TestLeaseBarrier_AReseedCannotRegressTheHighWater pins it.
 	leaseBarrierCacheTTL = 3 * time.Second
+
+	// maxPeerTermAdvance bounds how far above THIS node's own ledger a peer's
+	// high-water answer may be and still be believed. See fanOutHighWater: the
+	// threshold is otherwise an unbounded MAX over uncorroborated RPC answers,
+	// and one nonsense answer disables every lease-term-gated action in the
+	// cluster.
+	//
+	// Generous on purpose. A rolling restart of an N-host cluster mints roughly
+	// 3N terms, and a node can be many rolls behind after a long partition, so
+	// the bound has to clear real drift by a wide margin. It is a sanity check
+	// on an answer, not a security boundary -- a peer lying by a plausible
+	// amount is not detectable here at all, which is why an answer that raises
+	// the threshold by more than one tenure is also logged.
+	maxPeerTermAdvance = 100_000
 	// leaseBarrierSilentTTL bounds how long a peer stays remembered as silent.
 	//
 	// It only has to span one reconciler pass, which is the burst this exists
@@ -196,11 +210,21 @@ func (s *Server) storeLeaseThreshold(key string, threshold int64) {
 	// that legitimately drops from 6 to 4 — the peer holding 6 became
 	// unreachable — would then refuse term-5 proofs forever — and the TTL, whose entire purpose is to bound exactly that
 	// window, would bound nothing. Read expiry here or the constant is decorative.
+	at := time.Now()
 	if e, ok := s.leaseBarrierCache[key]; ok &&
 		time.Since(e.at) <= leaseBarrierCacheTTL && e.threshold > threshold {
 		threshold = e.threshold
+		// Keep the RETAINED value's own timestamp. Re-stamping it renews a
+		// threshold nothing re-observed: every accept pays for a fresh sweep,
+		// so with traffic arriving faster than the TTL each lower observation
+		// would clamp up and reset the clock, and a threshold that legitimately
+		// dropped from 6 to 4 -- the peer holding 6 became unreachable -- would
+		// refuse term-5 proofs forever instead of for the documented TTL. The
+		// expiry check above then bounds nothing, because the entry can never
+		// reach it.
+		at = e.at
 	}
-	s.leaseBarrierCache[key] = leaseBarrierEntry{threshold: threshold, at: time.Now()}
+	s.leaseBarrierCache[key] = leaseBarrierEntry{threshold: threshold, at: at}
 }
 
 // sweepLeaseTermHighWater asks a quorum of live hosts for their newest term for
@@ -342,7 +366,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 
 	silent := s.recentlySilentPeers(peers)
 
-	highest, answers, answered := s.fanOutHighWater(sctx, key, local, peers, silent)
+	highest, answers, answered := s.fanOut(sctx, key, local, peers, silent)
 
 	// A MISSING ANSWER must never be caused by our own shortcut. This used to
 	// repair only on a quorum shortfall (`answers < needed`), which left the one
@@ -382,12 +406,22 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 		// survive. The observed maximum only rises, and an answer given once is
 		// evidence however the same peer fares a moment later.
 		rctx, rcancel := context.WithTimeout(ctx, leaseBarrierBudget)
-		rHighest, _, rAnswered := s.fanOutHighWater(rctx, key, local, peers, nil)
+		rHighest, _, rAnswered := s.fanOut(rctx, key, local, peers, nil)
 		rcancel()
 		s.noteFullyProbed(peers, rAnswered)
+		// The repair's HIGH-WATER only ever raises the observed maximum. A term
+		// this node has already seen cannot be un-seen by a later round that
+		// failed to reach the peer holding it: the first sweep can observe term
+		// 9 from a peer that goes unreachable before the repair, and taking the
+		// repair's 4 would admit a term-5 proof this node had directly observed
+		// to be superseded -- the exact admission the barrier exists to refuse.
 		if rHighest > highest {
 			highest = rHighest
 		}
+		// Coverage is a UNION, not a replacement. The repair asks a superset of
+		// peers, but an answer is evidence at the moment it is given: a peer
+		// that answered the first pass and stalls in the repair must not have
+		// its answer forgotten.
 		for p := range rAnswered {
 			if !answered[p] {
 				answered[p] = true
@@ -432,6 +466,29 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 // for a periodic capability check; here it would serialise one timeout per
 // unreachable peer up to the whole budget, on the recovery path. The peer count
 // is already bounded by the host table.
+// fanOutFn replaces the peer fan-out in tests. Nil in production.
+//
+// The seam is here rather than on dialPeer because the property that needs
+// covering is about the TWO ROUNDS of a sweep disagreeing -- a peer that
+// answers in the first and is gone by the repair -- which is a property of
+// runLeaseTermSweep, not of any one dial.
+var fanOutFn func(ctx context.Context, key string, local int64, peers []string, silent map[string]bool) (int64, int, map[string]bool)
+
+// peerTermAcceptable reports whether a peer's high-water answer is close
+// enough to this node's own ledger to be believed. See maxPeerTermAdvance.
+func peerTermAcceptable(local, peer int64) bool {
+	return peer <= local+maxPeerTermAdvance
+}
+
+func (s *Server) fanOut(
+	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
+) (int64, int, map[string]bool) {
+	if fanOutFn != nil {
+		return fanOutFn(ctx, key, local, peers, silent)
+	}
+	return s.fanOutHighWater(ctx, key, local, peers, silent)
+}
+
 func (s *Server) fanOutHighWater(
 	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
 ) (highest int64, answers int, answered map[string]bool) {
@@ -464,10 +521,42 @@ func (s *Server) fanOutHighWater(
 			if rerr != nil || resp == nil || resp.GetKey() != key {
 				return
 			}
+			// An answer that cannot be true is NOT an answer.
+			//
+			// The threshold is an unbounded MAX over peer RPC answers, and
+			// nothing corroborates them: a peer answering MaxInt64 for
+			// 'failover' writes no ledger row, so the real coordinator keeps
+			// minting far below it and every executor's barrier then refuses
+			// every proof as stale. VM failover stops fleet-wide, permanently,
+			// from one node -- and it is reported as a legitimate stale-tenure
+			// refusal, so it does not look like an attack.
+			//
+			// Corroborating against a replicated leader_lease_terms row is not
+			// available here: during a partition that row has not propagated,
+			// which is the entire reason this RPC exists. So the check is a
+			// plausibility bound rather than proof. maxPeerTermAdvance is
+			// deliberately generous -- an ordinary rolling restart mints about
+			// 3N terms, and a long-partitioned node can legitimately be many
+			// rolls behind -- because its job is to reject nonsense, not to
+			// second-guess a real answer.
+			if t := resp.GetTerm(); !peerTermAcceptable(local, t) {
+				slog.Warn("lease-term barrier: refusing an implausible high-water answer",
+					"peer", peer, "key", key, "peer_term", t, "local_term", local,
+					"bound", local+maxPeerTermAdvance)
+				return // not counted as an answer either
+			}
 			mu.Lock()
 			answers++
 			answered[peer] = true
 			if t := resp.GetTerm(); t > highest {
+				if t > local+1 {
+					// Visible, not silent: a peer that raises the bar by more
+					// than one tenure is either genuinely far ahead of this
+					// node or lying, and both are worth seeing in a log when
+					// failover starts refusing.
+					slog.Info("lease-term barrier: a peer raised the threshold by more than one tenure",
+						"peer", peer, "key", key, "peer_term", t, "local_term", local)
+				}
 				highest = t
 			}
 			mu.Unlock()

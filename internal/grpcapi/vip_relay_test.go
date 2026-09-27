@@ -18,10 +18,7 @@ import (
 // is a known host, so requirePeerCert passes for mtlsCtx("caller").
 func relayHandlerServer(t *testing.T, gate serverGate) *Server {
 	t.Helper()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatal(err)
@@ -256,10 +253,7 @@ func TestPeerVIPClaims_ManualFenceConfirmRelease(t *testing.T) {
 	ctx := context.Background()
 	const vip = "10.0.0.9/24"
 	newS := func() *Server {
-		db, err := corrosion.NewTestClient()
-		if err != nil {
-			t.Fatal(err)
-		}
+		db := corrosion.NewTestClientT(t)
 		if err := corrosion.InitSchema(ctx, db); err != nil {
 			t.Fatal(err)
 		}
@@ -304,10 +298,7 @@ func TestPeerVIPClaims_ManualFenceConfirmRelease(t *testing.T) {
 func TestManualFenceConfirmedVIP_GatedOnHealthyMember(t *testing.T) {
 	ctx := context.Background()
 	mk := func(healthy []string) *Server {
-		db, err := corrosion.NewTestClient()
-		if err != nil {
-			t.Fatal(err)
-		}
+		db := corrosion.NewTestClientT(t)
 		if err := corrosion.InitSchema(ctx, db); err != nil {
 			t.Fatal(err)
 		}
@@ -333,10 +324,7 @@ func TestStandDownHolder_ManualFenceConfirmedUnreachable(t *testing.T) {
 	//   rpcErr:  dialPeer "succeeds" (gRPC dials LAZILY) but the RemoveLB CALL fails — the
 	//            REAL production path for a dead peer, which the first fix missed.
 	newS := func(rpcErr bool) *Server {
-		db, err := corrosion.NewTestClient()
-		if err != nil {
-			t.Fatal(err)
-		}
+		db := corrosion.NewTestClientT(t)
 		if err := corrosion.InitSchema(ctx, db); err != nil {
 			t.Fatal(err)
 		}

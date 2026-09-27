@@ -130,19 +130,10 @@ func useRollingUpdate(f *compose.File) string {
 	return ""
 }
 
-// vmUpdateDef returns the effective update strategy for a VM: its own `update:`
-// block, else the stack default (first VM with an explicit update block), else
-// recreate.
+// vmUpdateDef returns the effective update strategy for a VM (see
+// compose.EffectiveUpdate, which the planner reads too).
 func vmUpdateDef(f *compose.File, name string) compose.UpdateDef {
-	if def, _ := compose.FindVMDef(f, name); def != nil && def.Update != nil {
-		return *def.Update
-	}
-	for _, vm := range f.VMs {
-		if vm.Update != nil {
-			return *vm.Update
-		}
-	}
-	return compose.UpdateDef{Strategy: "recreate"}
+	return compose.EffectiveUpdate(f, name)
 }
 
 // deployFailures collects the VM actions of one deploy that failed, in the
@@ -603,12 +594,13 @@ func (s *Server) rollingUpdateWave(ctx context.Context, f *compose.File, updates
 			continue
 		}
 		actions = append(actions, rolling.VMAction{
-			Name:          a.VMName,
-			Strategy:      vmUpdateDef(f, a.VMName),
-			Plan:          a.Plan,
-			Desired:       a.Spec,
-			ForceRecreate: a.Apply == compose.ActionRecreate,
-			Repair:        a.Repair,
+			Name:           a.VMName,
+			Strategy:       vmUpdateDef(f, a.VMName),
+			Plan:           a.Plan,
+			Desired:        a.Spec,
+			ForceRecreate:  a.Apply == compose.ActionRecreate,
+			RecreateReason: a.RecreateReason,
+			Repair:         a.Repair,
 		})
 	}
 	if len(actions) == 0 {

@@ -39,6 +39,7 @@ func (s *Server) CreateResourceMapping(ctx context.Context, req *pb.CreateResour
 	}
 	slog.Info("resource mapping created", "name", req.Name)
 	m, err := corrosion.GetResourceMapping(ctx, s.db, req.Name)
+	s.audit(ctx, "resourcemap.add", req.Name, req.Description, "ok")
 	if err != nil || m == nil {
 		return &pb.ResourceMapping{Name: req.Name, Description: req.Description}, nil
 	}
@@ -68,6 +69,7 @@ func (s *Server) DeleteResourceMapping(ctx context.Context, req *pb.DeleteResour
 		return nil, status.Errorf(codes.Internal, "delete resource mapping: %v", err)
 	}
 	slog.Info("resource mapping deleted", "name", req.Name)
+	s.audit(ctx, "resourcemap.rm", req.Name, "", "ok")
 	return &emptypb.Empty{}, nil
 }
 

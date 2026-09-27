@@ -50,7 +50,10 @@ func useConfig(t *testing.T, body string) {
 func TestSetupScriptEnv_NewClusterDefaultsFenceSafetyOn(t *testing.T) {
 	useConfig(t, "")
 
-	block := enforcementBlockFor(t, setupScriptEnv("node-1", "10.0.0.1", ""))
+	// localInitJoinPeers is exactly what HostInit passes. The first version of
+	// this test passed "" — a value no caller ever sends — and stayed green
+	// while `lv host init` still wrote no enforcement block at all.
+	block := enforcementBlockFor(t, setupScriptEnv("node-1", "10.0.0.1", localInitJoinPeers))
 
 	for _, want := range []string{"safe_fence_default: true", "shared_storage_fence: true"} {
 		if !strings.Contains(block, want) {

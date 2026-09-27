@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -168,5 +170,126 @@ func TestAssemble_ReturnsTheFetchError(t *testing.T) {
 	})
 	if !errors.Is(err, want) {
 		t.Fatalf("err = %v, want it to wrap %v", err, want)
+	}
+}
+
+// TestAssemble_RefusesAChainTooLargeToHold is the OOM bound.
+//
+// audit_log is append-only with no retention prune, so the input to this
+// assembler is unbounded — and it holds every row, then doubles the allocation
+// twice to marshal. A compliance poller asking a two-year-old cluster for the
+// whole chain takes the daemon out via the OOM killer, and because that is
+// SIGKILL the watchdog Heartbeat's deferred disarm never runs: on a host that
+// still owns workloads the watchdog keeps counting with the control plane down.
+//
+// Refusing, and naming the streaming alternative, is a worse export and a much
+// better failure than letting the kernel choose which process dies.
+func TestAssemble_RefusesAChainTooLargeToHold(t *testing.T) {
+	prev := MaxAssembledBytes
+	MaxAssembledBytes = 4 << 10
+	t.Cleanup(func() { MaxAssembledBytes = prev })
+
+	big := strings.Repeat("x", 2<<10)
+	page := fmt.Sprintf(`{"rows":[{"id":"%s"},{"id":"%s"},{"id":"%s"}]}`, big, big, big)
+
+	_, _, err := Assemble(context.Background(), func(_ context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		return &pb.ExportAuditChainResponse{Json: page, RowCount: 3, NextCursor: "keep-going-" + cursor}, nil
+	})
+	if err == nil {
+		t.Fatal("an unbounded chain assembled without complaint; this is the allocation " +
+			"that ends in the OOM killer")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("error = %v; it should name the size problem and the alternative", err)
+	}
+}
+
+// An ordinary export must still assemble — a bound that fires on normal input
+// would simply break the feature.
+func TestAssemble_OrdinaryChainStillAssembles(t *testing.T) {
+	calls := 0
+	body, total, err := Assemble(context.Background(), func(_ context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		calls++
+		if calls == 1 {
+			return &pb.ExportAuditChainResponse{Json: `{"rows":[{"id":"a"}],"chain_heads":[]}`, RowCount: 1, NextCursor: "n1"}, nil
+		}
+		return &pb.ExportAuditChainResponse{Json: `{"rows":[{"id":"b"}]}`, RowCount: 1}, nil
+	})
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	if total != 2 {
+		t.Errorf("total = %d, want 2", total)
+	}
+	if !strings.Contains(string(body), `"chain_heads"`) {
+		t.Errorf("page-one evidence was dropped: %s", body)
+	}
+}
+
+// TestAssemble_RefusesRowsSignedByAnUnexportedKey is the mid-export key
+// rotation.
+//
+// The evidence tables — signing_keys, key_lifecycle, chain_heads — ride on page
+// ONE. A host that rotates its signing key after that page emits rows on later
+// pages signed by a certificate the document does not contain, and an external
+// verifier cannot check them at all. The artifact replays as broken, which is
+// indistinguishable from tampering — the one thing it exists to tell apart.
+func TestAssemble_RefusesRowsSignedByAnUnexportedKey(t *testing.T) {
+	calls := 0
+	_, _, err := Assemble(context.Background(), func(_ context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+		calls++
+		if calls == 1 {
+			return &pb.ExportAuditChainResponse{
+				Json: `{"rows":[{"id":"a","host_name":"kvm001","key_id":"k1"}],
+				         "signing_keys":[{"key_id":"k1","host_name":"kvm001"}]}`,
+				RowCount: 1, NextCursor: "n1",
+			}, nil
+		}
+		// kvm001 rotated to k2 after page one; k2's certificate is not in the
+		// evidence this document carries.
+		return &pb.ExportAuditChainResponse{
+			Json:     `{"rows":[{"id":"b","host_name":"kvm001","key_id":"k2"}]}`,
+			RowCount: 1,
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("assembled a document whose rows are signed by a key it does not contain; " +
+			"offline verification of those rows is impossible and reads as tampering")
+	}
+	if !strings.Contains(err.Error(), "k2") {
+		t.Errorf("the refusal should name the uncovered key, got: %v", err)
+	}
+}
+
+// Pre-v45 rows carry no key_id. They are chain-verified but not
+// tamper-evident, and the verifier reports them as such — so an empty key_id
+// must not be treated as a coverage failure, or every upgraded cluster's
+// export would refuse.
+func TestAssemble_AllowsPreV45RowsWithNoKeyID(t *testing.T) {
+	_, _, err := Assemble(context.Background(), func(_ context.Context, _ string) (*pb.ExportAuditChainResponse, error) {
+		return &pb.ExportAuditChainResponse{
+			Json: `{"rows":[{"id":"a","host_name":"kvm001","key_id":""}],
+			         "signing_keys":[{"key_id":"k1","host_name":"kvm001"}]}`,
+			RowCount: 1,
+		}, nil
+	})
+	if err != nil {
+		t.Fatalf("a pre-v45 row with no key_id was refused: %v", err)
+	}
+}
+
+// A seq gap the server reported must not be swallowed either: this package
+// exists to refuse a partial chain.
+func TestAssemble_RefusesAReportedSeqGap(t *testing.T) {
+	_, _, err := Assemble(context.Background(), func(_ context.Context, _ string) (*pb.ExportAuditChainResponse, error) {
+		return &pb.ExportAuditChainResponse{
+			Json: `{"rows":[{"id":"a","host_name":"kvm001","key_id":"k1"}],
+			         "signing_keys":[{"key_id":"k1","host_name":"kvm001"}],
+			         "seq_gaps":[{"host_name":"kvm001","missing_from":"3","missing_to":"3"}]}`,
+			RowCount: 1,
+		}, nil
+	})
+	if err == nil {
+		t.Fatal("a reported seq gap was assembled into a document that looks whole")
 	}
 }

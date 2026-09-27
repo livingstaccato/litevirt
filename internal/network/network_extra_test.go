@@ -15,10 +15,7 @@ func TestProvision_EmptyType_IsBridge(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -43,27 +40,21 @@ func TestProvision_UnknownType(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
 
 	def := compose.NetworkDef{Type: "magic"}
-	_, err = Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
+	_, err := Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
 	if err == nil {
 		t.Error("expected error for unknown type")
 	}
 }
 
 func TestProvision_VXLAN_MissingVNI(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -74,17 +65,14 @@ func TestProvision_VXLAN_MissingVNI(t *testing.T) {
 		VNI:      0,
 		Underlay: "eth0",
 	}
-	_, err = Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
+	_, err := Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
 	if err == nil {
 		t.Error("expected error for missing VNI")
 	}
 }
 
 func TestProvision_VXLAN_MissingUnderlay(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -96,7 +84,7 @@ func TestProvision_VXLAN_MissingUnderlay(t *testing.T) {
 		Underlay:  "",
 		Interface: "",
 	}
-	_, err = Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
+	_, err := Provision(ctx, db, "test-net", def, "10.0.0.1", "host1")
 	if err == nil {
 		t.Error("expected error for missing underlay")
 	}
@@ -114,10 +102,7 @@ func TestProvision_VXLAN_FallbackToInterface(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -146,10 +131,7 @@ func TestProvision_Isolated(t *testing.T) {
 	}
 	defer func() { execCommand = defaultExec }()
 
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -384,10 +366,7 @@ func TestNextFreeIP_InvalidSubnet(t *testing.T) {
 }
 
 func TestCheckIPConflict(t *testing.T) {
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	ctx := context.Background()
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)

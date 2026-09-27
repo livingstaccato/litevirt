@@ -388,7 +388,19 @@ import (
 //	     unproduced key does the same thing against a real ledger that happens
 //	     to be idle.
 //	     One additive column, appended LAST for the same digest reason as v53.
-const CurrentSchemaVersion = 54
+//	v55: the fenced-claim guard stops reading replicated evidence —
+//	     local_term_bindings (node-local, never in tableNames, so no peer
+//	     replicates it) records which coordinator bound an executor at a term.
+//	     The guard used to read runtime_action_proofs, which any cluster member
+//	     can write: a few hundred rows naming a victim as executor_host across a
+//	     range of terms made every legitimate fenced claim on that host look
+//	     conflicted — a remote, durable denial of recovery written as ordinary
+//	     replicated data. Also idx_proofs_term_claimant on
+//	     runtime_action_proofs(executor_host, lease_key, lease_term), which is
+//	     deliberately PLAIN rather than partial on deleted_at: the guard counts
+//	     tombstones too, so a `WHERE deleted_at IS NULL` index would not serve
+//	     the query and the scan would grow with every proof ever written.
+const CurrentSchemaVersion = 55
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1688,6 +1700,30 @@ var schemaDDL = []string{
 	)`,
 
 	// ═══════════ AUDIT LOG ═══════════
+	// NODE-LOCAL. Deliberately absent from tableNames and from every sync path:
+	// this records what THIS host bound itself to, and a binding a peer could
+	// write is not a binding at all.
+	//
+	// The fenced-claim guard used to read its evidence from
+	// runtime_action_proofs, which is replicated and anti-entropy repaired. Any
+	// cluster member could therefore insert rows naming a victim host as
+	// executor_host at a range of terms -- terms are small monotone integers, so
+	// a few hundred rows cover months -- and every legitimate fenced claim on
+	// that host at those terms would then see a "conflicting claimant" and
+	// refuse. A remote, durable denial of recovery, written as ordinary
+	// replicated data.
+	//
+	// No deleted_at: this is not replicated, so there is no tombstone to
+	// propagate, and the binding must outlive the proof rows it fenced.
+	`CREATE TABLE IF NOT EXISTS local_term_bindings (
+		executor    TEXT NOT NULL,
+		lease_key   TEXT NOT NULL,
+		lease_term  INTEGER NOT NULL,
+		coordinator TEXT NOT NULL,
+		bound_at    TEXT NOT NULL,
+		PRIMARY KEY (executor, lease_key, lease_term)
+	)`,
+
 	`CREATE TABLE IF NOT EXISTS audit_log (
 		id           TEXT PRIMARY KEY,
 		timestamp    TEXT NOT NULL,
@@ -2530,6 +2566,22 @@ var schemaIndexes = []string{
 	// unindexed scan grows without bound on the renewal hot path, under the
 	// client read lock.
 	`CREATE INDEX IF NOT EXISTS idx_lease_terms_holder ON leader_lease_terms(key, holder, term) WHERE deleted_at IS NULL`,
+
+	// Runtime action proofs: the fenced-claim conflict guard selects on
+	// (lease_term, lease_key, executor_host) and no existing index covers it, so
+	// it was a FULL TABLE SCAN inside the claim's write transaction, while the
+	// global client mutex is held.
+	//
+	// Deliberately NOT partial-on-live. The guard includes tombstones on
+	// purpose -- a conflicting claim is evidence, not a consumable, and spending
+	// it is what created the evidence -- so a `WHERE deleted_at IS NULL` index
+	// would not serve the query at all. That also means the scan grows with
+	// every proof ever written, not with the live set: a year into a busy
+	// cluster it is hundreds of thousands of rows, walked once per claim, and a
+	// host loss drives dozens of claims at once. Everything else on that node --
+	// health publishes, lease renewals, replication applies -- queues behind it,
+	// and the lease-renewal path is the one that must not stall.
+	`CREATE INDEX IF NOT EXISTS idx_proofs_term_claimant ON runtime_action_proofs(executor_host, lease_key, lease_term)`,
 }
 
 // tablePrimaryKeys maps table names to their primary key column(s).
@@ -2982,6 +3034,7 @@ var createTableUnits = []struct {
 	{51, "netbox_bindings"}, {51, "netbox_objects"}, {51, "netbox_sync_queue"},
 	{51, "netbox_host_config"},
 	{52, "leader_lease_terms"},
+	{55, "local_term_bindings"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

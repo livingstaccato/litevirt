@@ -586,6 +586,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	lxcRunner := lxc.NewLxcRunner()
 	lxcRunner.HostName = d.cfg.HostName
 	d.metrics = metrics.NewServer(d.cfg.MetricsPort, d.cfg.MetricsBind, d.db, d.virt, lxcRunner, d.cfg.HostName)
+	d.metrics.SetReplicationTargets(repl.Targets)
 	// metrics_port: 0 DISABLES the endpoint, matching rest_port below and what
 	// docs/configuration.md says about it. Without the guard, 0 composed ":0"
 	// and bound an EPHEMERAL port on every interface — an unauthenticated
@@ -932,6 +933,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// including RestartVM's, which keeps the row "running" and is otherwise
 	// invisible to the checker's sweep.
 	svc.SetVMStartObserver(vmChecker)
+	reconciler.SetVMStartObserver(vmChecker) // onboot and failover starts open the healthcheck start grace too
 	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
 	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so
@@ -1220,7 +1222,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// The sweep holds the same per-container lock as this host's container
 	// operations, so it never reconciles a container mid-create/start/stop.
-	ctChecker.SetContainerLock(svc.LockContainer)
+	ctChecker.SetContainerLock(svc.TryLockContainer)
 	go ctChecker.Start(ctx)
 
 	// wire the libvirt blockdev-mirror driver so MoveVolume
@@ -1410,6 +1412,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// pages (security-groups, etc.) can query cluster state without
 		// adding a dedicated gRPC RPC for every list view.
 		uiSrv.SetCorrosionDB(d.db)
+		// The authorizer for the write paths with no gRPC twin (security
+		// groups). Without it those writes fail closed.
+		uiSrv.SetAuthorizer(d.svc)
 		uiSrv.SetBackupRepos(d.cfg.BackupRepos)
 		uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
 		// ACME (#13): when enabled, terminate UI TLS via autocert (step-ca / LE)

@@ -16,10 +16,7 @@ import (
 // chain.
 func TestCorrosionPlanLoader_BindsSGsToNICs(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -84,10 +81,7 @@ func TestCorrosionPlanLoader_BindsSGsToNICs(t *testing.T) {
 // yet (not provisioned) is skipped.
 func TestCorrosionPlanLoader_BindsSGsToContainerVeths(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -150,10 +144,7 @@ func TestCorrosionPlanLoader_BindsSGsToContainerVeths(t *testing.T) {
 // the rest of the plan applies.
 func TestCorrosionPlanLoader_DropsUnknownSGNamesGracefully(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -195,10 +186,7 @@ func TestCorrosionPlanLoader_DropsUnknownSGNamesGracefully(t *testing.T) {
 // the loader again, see the new bindings.
 func TestSetInterfaceSecurityGroups_RuntimeMutation(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
@@ -235,10 +223,7 @@ func TestSetInterfaceSecurityGroups_RuntimeMutation(t *testing.T) {
 // actually exist on that host.
 func TestCorrosionPlanLoader_SkipsNICsOnOtherHosts(t *testing.T) {
 	ctx := context.Background()
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
+	db := corrosion.NewTestClientT(t)
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}

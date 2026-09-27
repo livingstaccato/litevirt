@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/netutil"
@@ -55,14 +56,16 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	}
 	defer sc.Close()
 
-	// `cat ... || true` so an absent config reads as empty rather than as an
-	// error: a node with no config is exactly the node init is for.
-	existingCfg, err := sc.RunOutput(fmt.Sprintf("cat %s 2>/dev/null || true", daemonConfigPath))
-	if err != nil {
-		return fmt.Errorf("read the target's existing %s: %w", daemonConfigPath, err)
-	}
-	if err := refuseIfAlreadyAMember(sshTarget, existingCfg, force); err != nil {
+	// ABSENT and UNREADABLE must not look alike here: see classifyRemoteConfig.
+	rawCfg, runErr := sc.RunOutput(remoteConfigProbe(daemonConfigPath))
+	existingCfg, absent, err := classifyRemoteConfig(string(rawCfg), runErr)
+	if err != nil && !force {
 		return err
+	}
+	if !absent {
+		if err := refuseIfAlreadyAMember(sshTarget, []byte(existingCfg), force); err != nil {
+			return err
+		}
 	}
 
 	pkiDir := PKIDir()
@@ -153,7 +156,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	// so there is no path for a local user on the target to pre-create, no window
 	// between writing it and running it, and nothing to clean up if this process
 	// dies in between.
-	if err := sc.RunWithInput(fmt.Sprintf("HOST_NAME=%s bash -s", hostName), []byte(setupScript)); err != nil {
+	if err := sc.RunWithInput(remoteInitSetupCommand(hostName, hostAddr, existingCfg), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -186,11 +189,28 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 		return fmt.Errorf("no cluster CA found — run 'lv host init' first")
 	}
 
-	parsedHost, _, err := parseSSHTarget(sshTarget)
+	parsedHost, sshUser, err := parseSSHTarget(sshTarget)
 	if err != nil {
 		return err
 	}
 	hostAddr, err := resolveHost(parsedHost)
+	if err != nil {
+		return err
+	}
+
+	// Format join_peers as YAML array, e.g. ["10.0.50.10:7946","10.0.50.11:7946"]
+	peersYAML := "["
+	for i, p := range joinPeers {
+		if i > 0 {
+			peersYAML += ","
+		}
+		peersYAML += fmt.Sprintf("%q", p)
+	}
+	peersYAML += "]"
+
+	// Decided before anything is minted or pushed, like the peer list: a refusal
+	// here must leave the target untouched.
+	enforcement, err := addSetupEnforcement(sshUser, joinPeers)
 	if err != nil {
 		return err
 	}
@@ -267,19 +287,6 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("read setup script: %w", err)
 	}
-	// Format join_peers as YAML array, e.g. ["10.0.50.10:7946","10.0.50.11:7946"]
-	peersYAML := "[]"
-	if len(joinPeers) > 0 {
-		peersYAML = "["
-		for i, p := range joinPeers {
-			if i > 0 {
-				peersYAML += ","
-			}
-			peersYAML += fmt.Sprintf("%q", p)
-		}
-		peersYAML += "]"
-	}
-
 	// hostAddr is the address this command just put in the certificate SAN and the
 	// address peers were told to dial, so it is also the address the node must
 	// advertise. Leaving the daemon to auto-detect meant it registered with its
@@ -299,7 +306,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
 	if err := sc.RunWithInput(fmt.Sprintf("%s bash -s",
-		strings.Join(setupScriptEnv(hostName, hostAddr, peersYAML), " ")), []byte(setupScript)); err != nil {
+		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement))), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
@@ -521,7 +528,7 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	// local user to pre-create and no write-then-execute window.
 	cmd := execCommand("bash", "-s")
 	cmd.Stdin = strings.NewReader(setupScript)
-	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, "[]")...)
+	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, localInitJoinPeers)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -629,9 +636,40 @@ func installCLIClientBundle(srcPKIDir string, target cliPKITarget) error {
 		}
 	}
 	if target.chown {
-		if err := chownPath(target.dir, target.uid, target.gid); err != nil {
+		if err := chownDirNoFollow(target.dir, target.uid, target.gid); err != nil {
 			return fmt.Errorf("chown CLI PKI dir %s: %w", target.dir, err)
 		}
+	}
+	return nil
+}
+
+// chownDirNoFollow changes the ownership of a DIRECTORY without following a
+// symlink at the final path component.
+//
+// os.Chown resolves the whole path, which is unsafe for a directory whose name
+// the target user controls. installCLIClientBundle chowns the CLI PKI
+// directory to the invoking user, and localCLIClientPKITargets places it under
+// that user's own home -- and MkdirAll neither guarantees the directory is
+// newly created nor stops it being REPLACED between the writes and the chown.
+// Under `sudo lv host init` the user renames the directory and drops a symlink
+// to a root-owned one in its place; root follows it and hands that directory's
+// ownership over.
+//
+// O_NOFOLLOW makes the final component a symlink an ERROR rather than
+// something to resolve, O_DIRECTORY makes "is it a directory" part of the open
+// instead of an assumption, and chowning the DESCRIPTOR lands the change on
+// the inode that was opened rather than on whatever the name means by the time
+// the syscall runs. Together they close the window instead of narrowing it.
+//
+// A var so tests can substitute it; nothing in production reassigns it.
+var chownDirNoFollow = func(dir string, uid, gid int) error {
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return fmt.Errorf("open %s without following symlinks: %w", dir, err)
+	}
+	defer f.Close()
+	if err := f.Chown(uid, gid); err != nil {
+		return fmt.Errorf("chown %s: %w", dir, err)
 	}
 	return nil
 }
@@ -702,10 +740,185 @@ func resolveHost(host string) (string, error) {
 		host, addrs)
 }
 
+// shellEnvPrefix renders env assignments as a shell command prefix, with every
+// VALUE single-quoted.
+//
+// The remote path joins these into one command line and hands it to
+// session.Run, which is an SSH exec request: sshd runs it through the login
+// shell, so an assignment word undergoes command substitution before the
+// command it prefixes ever starts. JOIN_PEERS is built from hosts.address — a
+// replicated, peer-writable column — so an unquoted join let any node with SQL
+// access execute as root on every host added afterwards, before the daemon,
+// PKI or systemd units were in place.
+//
+// Only the value is quoted. Quoting the KEY too would stop the word being an
+// assignment at all.
+//
+// This is NOT applied to the local path, which passes the same slice as
+// cmd.Env, where a shell never sees it and quotes would become part of the
+// value.
+func shellEnvPrefix(env []string) string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok {
+			out = append(out, ssh.ShellQuote(kv))
+			continue
+		}
+		out = append(out, k+"="+ssh.ShellQuote(v))
+	}
+	return strings.Join(out, " ")
+}
+
+// noConfigSentinel is what the remote probe prints when the config genuinely
+// does not exist, so that "absent" is a positive statement rather than the
+// absence of output.
+const noConfigSentinel = "__LV_NO_CONFIG__"
+
+// remoteConfigProbe reads the target's daemon config, distinguishing ABSENT
+// from UNREADABLE.
+//
+// The old probe was `cat <path> 2>/dev/null || true`, which turns both into
+// empty output. `-e` answers the existence question separately, and cat's exit
+// status is no longer swallowed, so a file that exists but cannot be read
+// fails the command instead of reporting nothing.
+func remoteConfigProbe(path string) string {
+	return fmt.Sprintf("if [ -e %s ]; then cat -- %s; else printf '%%s' '%s'; fi",
+		ssh.ShellQuote(path), ssh.ShellQuote(path), noConfigSentinel)
+}
+
+// classifyRemoteConfig turns the probe's result into absent/present, refusing
+// anything it cannot tell apart.
+//
+// A failed read is NOT an absence. refuseIfAlreadyAMember is the guard that
+// stops `lv host init` running against a live member, and the setup script it
+// gates rewrites config.yaml with join_peers: []. A node that loses that file
+// loses its peer list AND the signal that stops it minting an admin
+// credential -- a later state.db rebuild then mints a fresh admin row that
+// wins LWW and replaces the cluster's real admin password on every peer.
+//
+// So only the sentinel means absent. A non-zero exit, or empty output with no
+// sentinel, means the probe did not answer and the run is refused -- with the
+// same --force escape hatch the parse failure already has.
+func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
+	if runErr != nil {
+		return "", false, fmt.Errorf("could not read the target's %s: %w\n"+
+			"Refusing: an unreadable config is not an absent one, and initializing over a "+
+			"live member erases its join_peers. Fix the read, or pass --force if you are "+
+			"certain this node is spare", daemonConfigPath, runErr)
+	}
+	if strings.TrimSpace(out) == noConfigSentinel {
+		return "", true, nil
+	}
+	if strings.TrimSpace(out) == "" {
+		return "", false, fmt.Errorf("the probe for the target's %s returned nothing at all, "+
+			"not even the absent-marker; refusing rather than assuming there is no config "+
+			"there. Pass --force if you are certain this node is spare", daemonConfigPath)
+	}
+	return out, false, nil
+}
+
 // setupScriptEnv is the environment the setup script reads to write the daemon
 // config. One place, so the local and remote paths cannot disagree about it —
 // they already had, which is how the local path shipped with no advertise_address.
+// localInitJoinPeers is the JOIN_PEERS value `lv host init` hands the setup
+// script: an empty YAML list, because the local host is starting a cluster and
+// has nobody to join.
+const localInitJoinPeers = "[]"
+
 func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
+	return setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcementYAML(daemonConfigPath, joinPeers))
+}
+
+// remoteInitSetupCommand is the command line `lv host init <target>` runs the
+// setup script under: the same setupScriptEnv the --local form passes, as
+// shell-quoted assignments.
+//
+// It used to be `HOST_NAME=<name> bash -s` and nothing more, so a cluster
+// founded from a workstation got no advertise_address and none of the
+// new-cluster enforcement defaults — only a --local init ever wrote them.
+//
+// The block is decided from the TARGET's config (targetCfg, the text the
+// member probe read; empty when it had none), never from the invoking
+// machine's: that machine may be a workstation, or a node of some other
+// cluster whose flags have nothing to do with the one being founded. A target
+// re-initialised with --force keeps its own block, as --local keeps the local
+// one; a fresh target starts with newClusterEnforcement.
+func remoteInitSetupCommand(hostName, hostAddr, targetCfg string) string {
+	block := enforcementBlockOf(targetCfg)
+	if block == "" {
+		block = newClusterEnforcement
+	}
+	return shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block)) + " bash -s"
+}
+
+// readPeerConfig reads an existing cluster node's daemon config over SSH. It
+// returns ok=false when the node answered that it has no config. A seam so the
+// add path can be tested without a node to SSH into.
+var readPeerConfig = func(sshTarget string) (cfg string, ok bool, err error) {
+	sc, err := ssh.NewClient(sshTarget)
+	if err != nil {
+		return "", false, fmt.Errorf("SSH connect: %w", err)
+	}
+	defer sc.Close()
+	raw, runErr := sc.RunOutput(remoteConfigProbe(daemonConfigPath))
+	cfg, absent, err := classifyRemoteConfig(string(raw), runErr)
+	if err != nil {
+		return "", false, err
+	}
+	return cfg, !absent, nil
+}
+
+// addSetupEnforcement is the enforcement block `lv host add` hands the new
+// host: the CLUSTER's block, read from a node of it, verbatim — including when
+// the answer is "no block".
+//
+// Capability latches need config uniformity, so the new host must boot with
+// the flags its peers have. This used to read only the invoking machine's
+// config and fall back to nothing, so an add run from a workstation (which has
+// no daemon config) silently provisioned a host with no enforcement block.
+//
+// In order:
+//   - this machine's own daemon config, when it has one: it is a cluster node;
+//   - otherwise each join peer's config over SSH, as sshUser (the user the
+//     target is being reached as), first answer wins;
+//   - otherwise a refusal. Guessing is what the old fallback did.
+func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
+	raw, err := os.ReadFile(daemonConfigPath)
+	if err == nil {
+		return enforcementBlockOf(string(raw)), nil
+	}
+	var why []string
+	if !errors.Is(err, os.ErrNotExist) {
+		why = append(why, fmt.Sprintf("this machine's %s: %v", daemonConfigPath, err))
+	}
+	for _, p := range joinPeers {
+		host := p
+		if h, _, serr := net.SplitHostPort(p); serr == nil {
+			host = h
+		}
+		target := host
+		if sshUser != "" {
+			target = sshUser + "@" + host
+		}
+		cfg, ok, rerr := readPeerConfig(target)
+		switch {
+		case rerr != nil:
+			why = append(why, fmt.Sprintf("%s: %v", target, rerr))
+		case !ok:
+			why = append(why, fmt.Sprintf("%s: no %s", target, daemonConfigPath))
+		default:
+			return enforcementBlockOf(cfg), nil
+		}
+	}
+	return "", fmt.Errorf("could not read the cluster's enforcement block, which the new host "+
+		"must boot with so its flags match its peers': %s. Run `lv host add` on a cluster node, "+
+		"or from a machine that can SSH to one as %q", strings.Join(why, "; "), sshUser)
+}
+
+// setupScriptEnvWith is setupScriptEnv with the enforcement block decided by
+// the caller.
+func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) []string {
 	return []string{
 		"HOST_NAME=" + hostName,
 		// The address that just went into the certificate SAN. Without it the daemon
@@ -726,7 +939,7 @@ func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
 		// unsigned audit rows reported as tampering cluster-wide (2026-08-01).
 		// Base64: the remote path joins this env into one shell command line,
 		// so a multi-line YAML block must travel as a single token.
-		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcementYAML(daemonConfigPath, joinPeers))),
+		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcement)),
 	}
 }
 
@@ -769,10 +982,18 @@ func enforcementYAML(path, joinPeers string) string {
 	if block := enforcementYAMLFrom(path); block != "" {
 		return block
 	}
-	if joinPeers != "" {
+	if hasJoinPeers(joinPeers) {
 		return ""
 	}
 	return newClusterEnforcement
+}
+
+// hasJoinPeers reports whether a JOIN_PEERS value names anybody. It arrives
+// as YAML, so an empty list — "[]", which is what `lv host init` sends — means
+// no peers just as "" does.
+func hasJoinPeers(joinPeers string) bool {
+	p := strings.TrimSpace(joinPeers)
+	return p != "" && strings.ReplaceAll(p, " ", "") != "[]"
 }
 
 // enforcementYAMLFrom extracts the `enforcement:` mapping from a daemon config
@@ -784,7 +1005,12 @@ func enforcementYAMLFrom(path string) string {
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(string(raw), "\n")
+	return enforcementBlockOf(string(raw))
+}
+
+// enforcementBlockOf is enforcementYAMLFrom over a config's text.
+func enforcementBlockOf(raw string) string {
+	lines := strings.Split(raw, "\n")
 	var b strings.Builder
 	in := false
 	for _, line := range lines {

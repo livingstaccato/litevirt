@@ -159,7 +159,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 				}
 				return false, 0, nil
 
-			case newest.Term > 0 && newest.Holder == holder && !c.heldTermlessIncarnation(key):
+			case newest.Term > 0 && newest.Holder == holder && !c.termBelongsToEarlierTenure(key, newest.Term):
 				// Same tenure, term already recorded: renew, mint nothing. A
 				// renewal that bumped the term would make the holder invalidate
 				// its own in-flight work every renewal interval.
@@ -229,7 +229,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		// acquisition supersedes nothing, so an existing term on our own live
 		// lease makes it a renewal.
 		var supersede int64
-		if ourTenure && newest.Term > 0 && newest.Holder == holder && c.heldTermlessIncarnation(key) {
+		if ourTenure && newest.Term > 0 && newest.Holder == holder && c.termBelongsToEarlierTenure(key, newest.Term) {
 			supersede = newest.Term
 		}
 		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, supersede)
@@ -237,6 +237,9 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 			return false, 0, err
 		}
 		if held {
+			if mintCommittedHook != nil {
+				mintCommittedHook()
+			}
 			c.noteHandedTerm(key, term)
 			return true, term, nil
 		}
@@ -312,10 +315,18 @@ func holdLeaseWithoutTerm(ctx context.Context, c *Client, key, holder, expires, 
 var (
 	termlessMu           sync.Mutex
 	termlessIncarnations = map[*Client]map[string]bool{}
+	// mintedHere is, per lease key, the newest term THIS PROCESS minted since
+	// its lease on the key was last taken termlessly. Recorded inside the
+	// mint's own guarded transaction (see takeLeaseAndMintTerm), so it is in
+	// place before the term is visible to any reader — unlike noteHandedTerm,
+	// which runs after the commit returns. Guarded by termlessMu.
+	mintedHere = map[*Client]map[string]int64{}
 )
 
 // noteHandedTerm records the term returned to a caller for key. Zero means this
 // incarnation holds the lease with no term; anything positive clears that.
+// A termless hold also forgets any term this process minted before it: that
+// term belongs to the tenure the termless hold ended.
 func (c *Client) noteHandedTerm(key string, term int64) {
 	termlessMu.Lock()
 	defer termlessMu.Unlock()
@@ -325,6 +336,22 @@ func (c *Client) noteHandedTerm(key string, term int64) {
 		termlessIncarnations[c] = m
 	}
 	m[key] = term == 0
+	if term == 0 {
+		delete(mintedHere[c], key)
+	}
+}
+
+// noteMintedTerm records, from inside the mint's transaction, that this
+// process minted term for key.
+func (c *Client) noteMintedTerm(key string, term int64) {
+	termlessMu.Lock()
+	defer termlessMu.Unlock()
+	m := mintedHere[c]
+	if m == nil {
+		m = map[string]int64{}
+		mintedHere[c] = m
+	}
+	m[key] = term
 }
 
 // heldTermlessIncarnation reports whether this process took the current lease
@@ -334,6 +361,27 @@ func (c *Client) heldTermlessIncarnation(key string) bool {
 	termlessMu.Lock()
 	defer termlessMu.Unlock()
 	return termlessIncarnations[c][key]
+}
+
+// termBelongsToEarlierTenure reports whether newest — a term the ledger
+// records as ours — belongs to an earlier tenure than the lease this process
+// holds on key: the incarnation is termless AND this process did not just mint
+// newest itself.
+//
+// The second half closes a gap between two same-holder callers on one Client.
+// A caller that supersedes the earlier tenure's term mints N+1 and only
+// afterwards records the handed term; a sibling reading N+1 in between saw a
+// termless incarnation and superseded N+1 too, minting N+2 — two mints for one
+// tenure. A term this process minted during the current hold is, by
+// construction, the current tenure's, so the sibling renews at it instead.
+func (c *Client) termBelongsToEarlierTenure(key string, newest int64) bool {
+	termlessMu.Lock()
+	defer termlessMu.Unlock()
+	if !termlessIncarnations[c][key] {
+		return false
+	}
+	minted, ok := mintedHere[c][key]
+	return !ok || minted != newest
 }
 
 // leaseContended is the sentinel takeLeaseAndMintTerm returns alongside
@@ -357,6 +405,12 @@ const leaseContended int64 = -1
 // Same shape and same reason as ackPersistedHook in resolver_tracker.go: the
 // window cannot be reached deterministically from outside.
 var renewClassifiedHook func()
+
+// mintCommittedHook is a test-only seam fired after a mint has committed and
+// BEFORE AcquireLeaseWithTerm records the handed term (noteHandedTerm). A
+// sibling caller on this same Client running in that gap sees the fresh term
+// in the ledger while this incarnation is still recorded as termless.
+var mintCommittedHook func()
 
 // renewLeaseAtTerm renews a lease the caller classified as its own live tenure
 // at expectTerm, and declines if either half of that classification no longer
@@ -455,7 +509,16 @@ func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, 
 
 	applied, err := c.ExecuteBatchGuarded(ctx,
 		func(tx *sql.Tx) (bool, error) {
-			return leaseAcquirableTx(ctx, tx, key, holder, nowRFC, next, supersede)
+			ok, err := leaseAcquirableTx(ctx, tx, key, holder, nowRFC, next, supersede)
+			if ok && err == nil {
+				// Inside the transaction and under the client lock, so the
+				// record exists before any reader can see the term: see
+				// termBelongsToEarlierTenure. Should the commit then fail, the
+				// record names a term that does not exist, which nothing can
+				// match.
+				c.noteMintedTerm(key, next)
+			}
+			return ok, err
 		},
 		[]Statement{
 			{SQL: leaseUpsertSQL, Params: []interface{}{key, holder, expires, c.NowTS(), nowRFC}},

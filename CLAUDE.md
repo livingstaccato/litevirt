@@ -42,6 +42,14 @@ runtime to look like the detector found something. It did not — the same packa
 passes at 90m in 4091s with no warnings. Anything under ~70m on grpcapi is a
 budget failure.
 
+**`internal/health` needs one too.** It takes about 20 minutes under `-race`
+in full, so a 15m budget dies with `panic: test timed out` — the budget, not a
+race:
+
+```bash
+go test -race -timeout 45m ./internal/health/
+```
+
 Do not pipe a race run through `tail -N`. That discards the `panic: test timed
 out` header and leaves only a goroutine dump, which is exactly the evidence you
 need to tell the two apart. Redirect to a file and grep it.

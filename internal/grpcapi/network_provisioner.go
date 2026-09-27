@@ -23,8 +23,9 @@ type NetworkProvisioner interface {
 	// be cheap: the network reconciler asks it for every network every pass.
 	Provisioned(name string, def compose.NetworkDef) bool
 	// RemoveUnusedBridge deletes bridge name from this host if it is a bridge
-	// with no ports and no IPv4 address, and reports whether it did. Absent is
-	// not an error.
+	// with no ports and no address beyond an IPv6 link-local one, and reports
+	// whether it did. Absent is not an error; an invalid interface name or
+	// unreadable addresses are.
 	RemoveUnusedBridge(name string) (bool, error)
 }
 

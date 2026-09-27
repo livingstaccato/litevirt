@@ -150,7 +150,10 @@ The same pass removes a leftover flat stack bridge: a bridge named
 `<stack>_<name>` that a NIC was once plugged into because that name had no
 network, and that no NIC uses now. It is removed only when no network has that
 name or bridge, no live NIC names it, and on the host it has no ports and no
-IPv4 address. See [compose.md](compose.md#external-networks) for how such a NIC
+address other than the kernel's own IPv6 link-local (`fe80::`) one. A bridge
+whose addresses cannot be read is left alone. Each name is checked again right
+before its bridge is removed, so a network created under that name in the
+meantime keeps its bridge. See [compose.md](compose.md#external-networks) for how such a NIC
 is moved.
 
 Creating a VM, migrating one, and restarting one after a failover also

@@ -422,7 +422,12 @@ func (v *VMChecker) checkVMAt(ctx context.Context, vm corrosion.VMRecord, hspec 
 		// would feed two probes into one failure run.
 		return
 	}
-	if inGrace {
+	// The grace is judged again now the result has landed: a start this host
+	// saw WHILE the probe ran — `lv restart` keeps the row running, so the
+	// incarnation above is unchanged — cleared the failure run, and this
+	// result, from before that start, must not begin a new one against the
+	// freshly booted guest.
+	if inGrace || v.inStartGrace(vm, v.clock()) {
 		return
 	}
 

@@ -245,6 +245,8 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 		Project:       req.Project, // UpsertContainer normalizes "" → "_default"
 		OnHostFailure: req.OnHostFailure,
 		CreateSpec:    corrosion.EncodeCreateSpec(createSpec),
+		// Never started: the checker leaves it to the operator's start.
+		StateDetail: corrosion.ContainerCreatedDetail,
 	}
 	// FENCE before the durable write; see CreateVM. The cleanup mirrors the
 	// failed-write path below: the runtime container exists but must not be
@@ -388,11 +390,22 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if forwarded, err := s.forwardSimpleCT(ctx, stopHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
 		return c.StopContainer(ctx, &pb.StopContainerRequest{Name: req.Name, HostName: stopHost, TimeoutSec: req.TimeoutSec})
 	}); err != nil || forwarded != nil {
+		if err == nil {
+			// Report the stop once this node no longer lists it running (see
+			// awaitForwardedContainer).
+			s.awaitForwardedContainer(ctx, stopHost, req.Name, "not running", containerNotRunning)
+		}
 		return forwarded, err
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// Serialize with the other operations on this container and with the
+	// container checker's sweep (LockContainer): a sweep that read the row as
+	// running and then saw this stop in the runtime would take it for an
+	// unexpected stop and restart the container.
+	unlock := s.LockContainer(req.Name)
+	defer unlock()
 	if err := s.containerRuntime.StopContainer(ctx, req.Name, int(req.TimeoutSec)); err != nil {
 		s.audit(ctx, "ct.stop", req.Name, "project="+project, "error")
 		return nil, status.Errorf(codes.Internal, "stop: %v", err)
@@ -437,11 +450,21 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
 		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost})
 	}); err != nil || forwarded != nil {
+		if err == nil {
+			// Report the delete once this node no longer lists the row (see
+			// awaitForwardedContainer).
+			s.awaitForwardedContainer(ctx, targetHost, req.Name, "deleted", containerRowGone)
+		}
 		return forwarded, err
 	}
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired")
 	}
+	// Serialize with the other operations on this container and with the
+	// container checker's sweep (LockContainer), so a sweep never reconciles a
+	// container that is half deleted.
+	unlock := s.LockContainer(req.Name)
+	defer unlock()
 	// Capture the stack label NOW (for the DNS-record name) — the row is about to be
 	// tombstoned. Best-effort: if the row is already gone, the reaper backstops.
 	dnsStack := ""

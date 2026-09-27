@@ -22,15 +22,22 @@ type fakeCTDeletePeer struct {
 	calls      []*pb.DeleteContainerRequest
 	startCalls []*pb.StartContainerRequest
 	stopCalls  []*pb.StopContainerRequest
-	// onStart, when set, runs for each forwarded start — the owner's write
-	// arriving in this node's replica.
-	onStart func(*pb.StartContainerRequest)
+	// replica, when set, is the asking node's DB: each forwarded op writes
+	// there what the owner's write would bring it (running, stopped, the
+	// tombstone). A forwarded op returns once the asking node lists its
+	// result, so without it every forward waits out forwardedVisibleTimeout.
+	replica *corrosion.Client
 }
 
-func (f *fakeCTDeletePeer) DeleteContainer(_ context.Context, req *pb.DeleteContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (f *fakeCTDeletePeer) DeleteContainer(ctx context.Context, req *pb.DeleteContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, req)
+	if f.replica != nil {
+		if err := corrosion.DeleteContainerStrict(ctx, f.replica, req.HostName, req.Name); err != nil {
+			return nil, err
+		}
+	}
 	return &emptypb.Empty{}, nil
 }
 
@@ -45,7 +52,7 @@ func TestDeleteContainer_HostlessResolvesTheOwner(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	s.SetContainerRuntime(&fakeCTRuntime{})
-	fake := &fakeCTDeletePeer{}
+	fake := &fakeCTDeletePeer{replica: s.db}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return fake, func() {}, nil
 	}
@@ -82,21 +89,26 @@ func TestDeleteContainer_HostlessResolvesTheOwner(t *testing.T) {
 	}
 }
 
-func (f *fakeCTDeletePeer) StartContainer(_ context.Context, req *pb.StartContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (f *fakeCTDeletePeer) StartContainer(ctx context.Context, req *pb.StartContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCalls = append(f.startCalls, req)
-	if f.onStart != nil {
-		f.onStart(req)
-	}
-	return &emptypb.Empty{}, nil
+	return &emptypb.Empty{}, f.replicate(ctx, req.HostName, req.Name, "running")
 }
 
-func (f *fakeCTDeletePeer) StopContainer(_ context.Context, req *pb.StopContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+func (f *fakeCTDeletePeer) StopContainer(ctx context.Context, req *pb.StopContainerRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stopCalls = append(f.stopCalls, req)
-	return &emptypb.Empty{}, nil
+	return &emptypb.Empty{}, f.replicate(ctx, req.HostName, req.Name, "stopped")
+}
+
+// replicate writes a forwarded start's or stop's state into the replica.
+func (f *fakeCTDeletePeer) replicate(ctx context.Context, host, name, state string) error {
+	if f.replica == nil {
+		return nil
+	}
+	return corrosion.SetContainerStateDetail(ctx, f.replica, host, name, state, "")
 }
 
 // TestStartStopContainer_HostlessResolvesTheOwner: start and stop get the same
@@ -109,7 +121,7 @@ func TestStartStopContainer_HostlessResolvesTheOwner(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	s.SetContainerRuntime(&fakeCTRuntime{})
-	fake := &fakeCTDeletePeer{}
+	fake := &fakeCTDeletePeer{replica: s.db}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return fake, func() {}, nil
 	}
@@ -118,14 +130,6 @@ func TestStartStopContainer_HostlessResolvesTheOwner(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertContainer: %v", err)
 	}
-	// A forwarded start returns once this node lists the container running;
-	// the owner's running write reaches this replica as the start is served.
-	fake.onStart = func(req *pb.StartContainerRequest) {
-		if err := corrosion.SetContainerStateDetail(ctx, s.db, req.HostName, req.Name, "running", ""); err != nil {
-			t.Errorf("model the owner's running write: %v", err)
-		}
-	}
-
 	if _, err := s.StartContainer(adminCtx(), &pb.StartContainerRequest{Name: "wanderer"}); err != nil {
 		t.Fatalf("host-less start of a container owned elsewhere: %v", err)
 	}
@@ -169,7 +173,7 @@ func TestResolveContainerHost_AmbiguousNameRefuses(t *testing.T) {
 	s := testServer(t)
 	ctx := context.Background()
 	s.SetContainerRuntime(&fakeCTRuntime{})
-	fake := &fakeCTDeletePeer{}
+	fake := &fakeCTDeletePeer{replica: s.db}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return fake, func() {}, nil
 	}

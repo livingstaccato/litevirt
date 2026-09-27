@@ -1667,6 +1667,12 @@ func (s *Server) SetTenancyEngine(t *tenancy.Engine) { s.tenancy = t }
 // RPCs can act on this host. nil = container RPCs return Unavailable.
 func (s *Server) SetContainerRuntime(r ContainerRuntime) { s.containerRuntime = r }
 
+// LockContainer takes the per-container lock this host's container operations
+// hold (create, start, stop, delete), and returns its unlock. The container
+// checker takes it too (health.ContainerChecker.SetContainerLock), so its
+// reconcile never interleaves with an operation on the same container.
+func (s *Server) LockContainer(name string) func() { return s.lockVM("ct/" + name) }
+
 // SetCapacityPolicy wires the cluster-wide capacity policy (overcommit ratios and
 // host reserves) used by admission and placement.
 func (s *Server) SetCapacityPolicy(p corrosion.CapacityPolicy) { s.capacity = p }

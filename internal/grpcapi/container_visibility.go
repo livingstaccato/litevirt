@@ -68,3 +68,13 @@ func containerRowPresent(rec *corrosion.ContainerRecord) bool { return rec != ni
 func containerRunning(rec *corrosion.ContainerRecord) bool {
 	return rec != nil && rec.State == "running"
 }
+
+// containerNotRunning accepts a row not recorded running, or no row: a stop is
+// visible once the owner's stopped write is.
+func containerNotRunning(rec *corrosion.ContainerRecord) bool {
+	return rec == nil || rec.State != "running"
+}
+
+// containerRowGone accepts no live row: a delete is visible once the owner's
+// tombstone is.
+func containerRowGone(rec *corrosion.ContainerRecord) bool { return rec == nil }

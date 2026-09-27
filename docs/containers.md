@@ -75,9 +75,11 @@ $ lv ct rm web --host node-b
 Every node serves `lv ct ls` from its own copy of the cluster state, and a
 container's create and start run on its owning host. When the node you are
 connected to is not the owner, `lv ct create` returns once that node lists the
-new container, and `lv ct start` once it lists it `running` — so an `lv ct ls`
-straight after either shows the result, not the state before it. `lv compose
-up` reports a container done on the same terms. If replication is slow to bring
+new container, `lv ct start` once it lists it `running`, `lv ct stop` once it no
+longer lists it `running`, and `lv ct rm` once it no longer lists it at all — so
+an `lv ct ls` straight after any of them shows the result, not the state before
+it. `lv compose up` and `lv compose down` report a container done on the same
+terms. If replication is slow to bring
 the owner's write across, the command still succeeds after waiting up to 15
 seconds, and the daemon logs `container operation succeeded on its owner, but
 this node's replica has not caught up`.
@@ -325,6 +327,14 @@ A per-host reconciler reconciles each container's cluster-state row against the 
 runtime every ~15s and restarts a down container per its policy, honouring
 `max-attempts`/`window`/`delay`. The cluster row is also synced to the runtime's
 reality, so `lv ct ls` and the detail view never disagree.
+
+A container that has been created and never started has not stopped, so the
+restart policy does not apply to it: it stays stopped until `lv ct start` (or
+the start `lv compose up` makes right after the create). The reconciler also
+takes the same per-container lock as `lv ct create`, `start`, `stop` and `rm`
+on that host, and reads the row again once it holds it, so a sweep never acts
+on a container while one of those is changing it — a `lv ct stop` that lands
+mid-sweep stays stopped.
 
 **Caveat (coarser than VMs):** LXC reports only `RUNNING`/`STOPPED`/`FROZEN` — no
 stop *reason*. A container therefore cannot distinguish a clean in-guest shutdown

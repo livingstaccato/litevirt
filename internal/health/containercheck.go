@@ -60,6 +60,9 @@ type ContainerChecker struct {
 	// onStateWriteFail observes an authoritative state write that failed (nil-safe);
 	// wired to the litevirt_state_write_failures_total counter by the daemon.
 	onStateWriteFail func(op, class string)
+	// lockContainer is the per-container operation lock (see SetContainerLock).
+	// nil = no lock (unit tests that drive the checker alone).
+	lockContainer func(name string) (unlock func())
 
 	// Now is the clock for the re-key debounce (defaults to time.Now); tests
 	// override it to advance deterministically.
@@ -136,6 +139,14 @@ func (c *ContainerChecker) SetStateWriteFailObserver(fn func(op, class string)) 
 	c.onStateWriteFail = fn
 }
 
+// SetContainerLock injects the per-container lock this host's container
+// operations (create, start, stop, delete) hold — grpcapi's Server.LockContainer.
+// The sweep holds it for each container's read → probe → write, so it never acts
+// on a row or a runtime state an operation is in the middle of changing.
+func (c *ContainerChecker) SetContainerLock(lock func(name string) (unlock func())) {
+	c.lockContainer = lock
+}
+
 func (c *ContainerChecker) noteStateWriteFail(op string, err error) {
 	if c.onStateWriteFail != nil {
 		c.onStateWriteFail(op, corrosion.ClassifyWriteErr(err))
@@ -181,7 +192,7 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 	live := make(map[string]bool, len(cts))
 	for _, ct := range cts {
 		live[ct.Name] = true
-		c.checkContainer(ctx, ct, now)
+		c.checkContainerLocked(ctx, ct, now)
 	}
 
 	// Runtime owner re-key (Phase 4): reclaim a container running locally whose
@@ -412,6 +423,32 @@ func (c *ContainerChecker) claimRelocationProof(ctx context.Context, ct corrosio
 	return pr.ID, true
 }
 
+// checkContainerLocked is checkContainer under the container's operation lock
+// (SetContainerLock), against the row as it is once the lock is held. The
+// listed row is a copy from before any operation that ran since; reconciling
+// from it, a sweep could judge a stop the operator just made unexpected and
+// restart the container, or overwrite the state a start or stop just wrote.
+// Under the lock no operation on this container is in flight, and the re-read
+// row is what the last one left.
+func (c *ContainerChecker) checkContainerLocked(ctx context.Context, listed corrosion.ContainerRecord, now time.Time) {
+	if c.lockContainer == nil {
+		c.checkContainer(ctx, listed, now)
+		return
+	}
+	unlock := c.lockContainer(listed.Name)
+	defer unlock()
+	ct, err := corrosion.GetContainer(ctx, c.db, c.hostName, listed.Name)
+	if err != nil {
+		slog.Warn("containercheck: re-read container under its lock failed; skipping this sweep",
+			"container", listed.Name, "error", err)
+		return
+	}
+	if ct == nil {
+		return // deleted since the list: nothing to reconcile
+	}
+	c.checkContainer(ctx, *ct, now)
+}
+
 // checkContainer reconciles one container's cluster row to the runtime's reality
 // and applies the restart policy when it stopped unexpectedly.
 func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.ContainerRecord, now time.Time) {
@@ -534,6 +571,14 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 		// genuinely down — fall through to the restart decision
 	default:
 		// StateUnknown: container not present on this host / indeterminate.
+		return
+	}
+
+	// Created and never started: it has not stopped, so there is neither drift
+	// to heal nor a restart to make — the start that follows a create is the
+	// operator's (compose, `lv ct create` then `lv ct start`), and restarting it
+	// here makes that start fail on a running container.
+	if ct.StateDetail == corrosion.ContainerCreatedDetail {
 		return
 	}
 

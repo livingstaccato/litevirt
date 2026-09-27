@@ -401,6 +401,13 @@ func SetContainerStateDetailStrict(ctx context.Context, c *Client, hostName, nam
 	return nil
 }
 
+// ContainerCreatedDetail is the state_detail CreateContainer records on a new
+// container: created and not yet started. The container checker leaves such a
+// container alone — it has not stopped, it has never run, and the start that
+// follows a create (compose, `lv ct create` then `lv ct start`) is the
+// operator's, not the restart policy's. The first start clears it.
+const ContainerCreatedDetail = "created"
+
 // ContainerRelocateRecreateDetail is the state_detail the failover coordinator
 // stamps on a container it re-homes after a host loss. The target host's
 // container reconciler reads it to recreate the container from its image (B5).

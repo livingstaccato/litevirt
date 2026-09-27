@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -97,20 +98,22 @@ func TestCredentialsSplit_UnlatchedEmitsNothingAPreviousReleaseCannotDecode(t *t
 }
 
 // TestCredentialsSplit_LatchedCopiesAndDualWrites: once the gate opens the
-// pass copies every old-column secret into its credential table, idempotently,
-// and every writer from then on writes both in one batch.
+// pass copies every old-column secret into its credential table and clears the
+// column, idempotently, and every writer from then on writes the credential
+// row and leaves the old column empty.
 func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
 	seedSecrets(t, c, "$2a$10$alicehash", "$2a$10$tokenhash", "bmc-secret")
 
+	srcTS := oneString(t, c, `SELECT updated_at FROM users WHERE username = 'alice'`, "updated_at")
 	c.SetCredentialsSplitGate(func() bool { return true })
 	rep, err := c.SplitCredentials(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Copied != 3 {
-		t.Fatalf("copied %d secrets, want 3 (one per table)", rep.Copied)
+	if rep.Copied != 3 || rep.Cleared != 3 {
+		t.Fatalf("pass = %+v, want 3 copied and 3 cleared (one per table)", rep)
 	}
 	for _, q := range []struct{ query, col, want string }{
 		{`SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = 'bmc-host'`, "ipmi_pass", "bmc-secret"},
@@ -123,15 +126,14 @@ func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	}
 	// The copy carries the parent's updated_at, so two nodes copying the same
 	// parent write the same row.
-	if src, cp := oneString(t, c, `SELECT updated_at FROM users WHERE username = 'alice'`, "updated_at"),
-		oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'alice'`, "updated_at"); src != cp {
-		t.Errorf("copied credential stamped %q, parent row %q; per-node stamps race instead of converging", cp, src)
+	if cp := oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'alice'`, "updated_at"); cp != srcTS {
+		t.Errorf("copied credential stamped %q, parent row %q; per-node stamps race instead of converging", cp, srcTS)
 	}
-	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 0 {
+	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 0 || rep.Cleared != 0 {
 		t.Fatalf("a second pass copied again: %+v err=%v — the pass must be idempotent", rep, err)
 	}
 
-	// Dual-write: a password change after the latch lands in both places.
+	// After the latch: a password change lands in the credential row only.
 	if err := UpdateUserPassword(ctx, c, "alice", "$2a$10$alicehash2"); err != nil {
 		t.Fatal(err)
 	}
@@ -144,11 +146,19 @@ func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	if got := oneString(t, c, `SELECT password_hash FROM user_credentials WHERE username = 'bob'`, "password_hash"); got != "$2a$10$bobhash" {
 		t.Errorf("user_credentials for a user created after the latch = %q", got)
 	}
+	for _, u := range []string{"alice", "bob"} {
+		if got := oneString(t, c, `SELECT password_hash FROM users WHERE username = ?`, "password_hash", u); got != "" {
+			t.Errorf("users.password_hash for %s = %q after the latch; the public row must not carry it", u, got)
+		}
+	}
 	if err := InsertToken(ctx, c, TokenRecord{ID: "tok-2", Username: "bob", Name: "x", TokenHash: "$2a$10$tok2"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := oneString(t, c, `SELECT token_hash FROM token_credentials WHERE token_id = 'tok-2'`, "token_hash"); got != "$2a$10$tok2" {
 		t.Errorf("token_credentials for a token created after the latch = %q", got)
+	}
+	if got := oneString(t, c, `SELECT token_hash FROM tokens WHERE id = 'tok-2'`, "token_hash"); got != "" {
+		t.Errorf("tokens.token_hash for a token created after the latch = %q", got)
 	}
 
 	// The sensitive lane carries every one of them.
@@ -194,7 +204,7 @@ func TestCredentialsSplit_TheCredentialTableIsReadFirst(t *testing.T) {
 	if err := InsertHost(ctx, c, HostRecord{Name: "bmc-host", Address: "10.0.0.20", State: "active"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.copyHostCredential(ctx, "bmc-host", "bmc-secret", c.NowTS()); err != nil {
+	if err := c.Execute(ctx, HostFenceCredentialUpsertSQL, "bmc-host", "bmc-secret", c.NowTS()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -246,4 +256,116 @@ func TestResolveCredential(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCredentialsSplit_ThePublicDumpCarriesNoSecretAfterTheClear is the point
+// of #268: after the split, the operator-safe dump holds no secret value, and
+// the sensitive dump holds every one.
+func TestCredentialsSplit_ThePublicDumpCarriesNoSecretAfterTheClear(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	secrets := []string{"$2a$10$dump-user-hash", "$2a$10$dump-token-hash", "dump-bmc-secret"}
+	seedSecrets(t, c, secrets[0], secrets[1], secrets[2])
+	// Deleted and revoked rows hold secrets too.
+	if err := RevokeToken(ctx, c, "tok-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := DeleteUser(ctx, c, "alice"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before the latch the dump is unchanged — it is where a previous-release
+	// node reads them.
+	if plain := string(publicDumpJSON(t, c)); !strings.Contains(plain, secrets[2]) {
+		t.Fatal("the public dump lost hosts.ipmi_pass before the latch; a previous-release " +
+			"peer repairing from it would lose the BMC password")
+	}
+
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	public := publicDumpJSON(t, c)
+	sensitive, err := decompressPayload(c.DumpSensitiveStateBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sensJSON, _ := json.Marshal(sensitive)
+	for _, secret := range secrets {
+		if strings.Contains(string(public), secret) {
+			t.Errorf("the public dump still carries %q after the split", secret)
+		}
+		if !strings.Contains(string(sensJSON), secret) {
+			t.Errorf("the sensitive dump does not carry %q; it would be lost to any node that "+
+				"repairs from a peer", secret)
+		}
+	}
+}
+
+// TestCredentialsSplit_AnInFlightRevokeBeatsTheClear: the clear is stamped
+// just past the row it read, not with a fresh clock, so a revoke issued on a
+// peer BEFORE the clear ran — still in flight when it did — wins LWW when it
+// lands. A clear stamped with NowTS would be newer than that revoke, the
+// replicated revoke would be skipped, and anti-entropy would spread the
+// un-revoked row.
+func TestCredentialsSplit_AnInFlightRevokeBeatsTheClear(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedSecrets(t, c, "$2a$10$h", "$2a$10$t", "p")
+	revokeTS := c.NowTS() // a peer's revoke, minted now, not yet delivered
+
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`SELECT updated_at FROM tokens WHERE id = 'tok-1'`,
+		`SELECT updated_at FROM users WHERE username = 'alice'`,
+		`SELECT updated_at FROM hosts WHERE name = 'bmc-host'`,
+	} {
+		cleared := oneString(t, c, q, "updated_at")
+		if lwwOrder(cleared, revokeTS) >= 0 {
+			t.Errorf("%s: the clear stamped %q, not older than an in-flight write minted at %q "+
+				"before it ran; that write would be LWW-skipped", q, cleared, revokeTS)
+		}
+	}
+}
+
+// TestCredentialsSplit_ReadersStopFallingBackAfterThePass: once this node has
+// latched and completed a pass, a value that reappears in an old column is
+// not served. Before that pass the same value is.
+func TestCredentialsSplit_ReadersStopFallingBackAfterThePass(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedSecrets(t, c, "$2a$10$current", "$2a$10$t", "p")
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if !c.credentialFallback() {
+		t.Fatal("readers stopped falling back before this node's first pass; a secret still " +
+			"only in the old column would read as absent")
+	}
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// A newer, different old-column value arrives (local-only, so the test
+	// controls it) — what a stale anti-entropy copy looks like.
+	if err := c.execLocal(ctx, `UPDATE users SET password_hash = 'resurrected', updated_at = '2999-01-01T00:00:00Z' WHERE username = 'alice'`); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := GetUser(ctx, c, "alice"); u == nil || u.PasswordHash != "$2a$10$current" {
+		t.Errorf("GetUser after the pass returned %+v; it must read user_credentials only", u)
+	}
+}
+
+// publicDumpJSON is the operator-safe dump as the JSON a reader would see.
+func publicDumpJSON(t *testing.T, c *Client) []byte {
+	t.Helper()
+	payload, err := decompressPayload(c.DumpStateBytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

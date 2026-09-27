@@ -203,7 +203,8 @@ func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties 
 // another node's database: the legacy unary form of the anti-entropy repair
 // pull.
 //
-// Peer-only. The dump is the unredacted repair representation, so it carries
+// Peer-only. The dump is the unredacted repair representation, so until
+// credentials_split_v1 has latched and every node has cleared them it carries
 // secret-bearing columns of replicated tables (hosts.ipmi_pass,
 // users.password_hash, tokens.token_hash). Only a cluster host certificate may
 // read it; an operator or admin bearer and the lv-cli client certificate are

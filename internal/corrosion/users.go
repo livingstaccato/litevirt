@@ -46,7 +46,7 @@ const usersReactivateSQL = `UPDATE users SET role = ?, password_hash = ?, delete
 // it reactivates the row with the new role and password.
 //
 // Once credentials_split_v1 has latched the hash is written to user_credentials
-// in the same batch (see credentials_split.go).
+// in the same batch and users.password_hash gets ” (see credentials_split.go).
 func InsertUser(ctx context.Context, c *Client, username, role, passwordHash string) error {
 	now := c.NowTS()
 	split := c.MayWriteCredentialTables()
@@ -56,7 +56,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 	if err == nil && len(rows) > 0 {
 		if split {
 			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: usersReactivateSQL, Params: []interface{}{role, passwordHash, now, username}},
+				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), now, username}},
 				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 			})
 		}
@@ -64,7 +64,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 	}
 	if split {
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersInsertSQL, Params: []interface{}{username, role, passwordHash, nowRFC3339(), now}},
+			{SQL: usersInsertSQL, Params: []interface{}{username, role, c.oldColumnValue(passwordHash), nowRFC3339(), now}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 		})
 	}
@@ -147,7 +147,7 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 			return nil
 		}
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}},
+			{SQL: usersUpdatePasswordSQL, Params: []interface{}{c.oldColumnValue(passwordHash), now, username}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 		})
 	}
@@ -202,7 +202,7 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 	}
 	if c.MayWriteCredentialTables() {
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now}},
+			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, c.oldColumnValue(t.TokenHash), t.ExpiresAt, scope, nowRFC3339(), now}},
 			{SQL: tokenCredentialUpsertSQL, Params: []interface{}{t.ID, t.TokenHash, now}},
 		})
 	}
@@ -375,7 +375,7 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 	now := c.NowTS()
 	if c.MayWriteCredentialTables() {
 		if err := c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersReactivateSQL, Params: []interface{}{"admin", hash, now, victim}},
+			{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}},
 		}); err != nil {
 			return "", err

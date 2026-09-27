@@ -505,13 +505,30 @@ parked in `maintenance` — runs the previous release:
 `credentials_split_v1` is mandatory and replication-gated: it latches only once
 every memberlist member advertises it. From then on, on each host:
 
-- every writer writes the credential table in the same batch as the public row;
-- a pass that runs at start and every minute copies any old-column secret the
-  credential table does not already hold.
+- every writer writes the credential table in the same batch as the public row,
+  and writes an empty old column;
+- a pass that runs at start and every minute copies any old-column secret into
+  the credential table and **clears the old column**, in one batch. The clears
+  replicate like any other write, so once every host has run a pass no public
+  row — and no operator-safe state dump — carries a secret.
 
-A reader takes the credential row, except where the old column holds a
-different value on a newer public row — the state a host's write leaves in the
-short window before its own latch forms, while its neighbour's already has.
+Until a host's first complete pass, its readers take the credential row but
+fall back to the old column where the credential row is missing, or holds a
+different value on an older row than the public one. After that pass they read
+the credential tables only.
+
+Latches form per host, so for a few seconds after one host latches its
+neighbour may not have yet. A password or IPMI change made through that
+neighbour in that window goes to the old column. The latched host's next pass,
+within a minute, carries it across. Until then the latched host still serves the
+previous value.
+
+**Clearing is one-way.** After it, a build that reads only the old columns has
+nothing to read: rolled back to the previous release, a host loses every IPMI
+password, local login and API token, and cannot decode the credential tables'
+replication either. The startup rollback preflight refuses to start a binary
+that does not know a token this host has already latched, but only for a binary
+that carries that preflight. Roll forward, or reseed the host from a peer.
 
 Until the token latches, `litevirt_ha_degraded{reason="capability_rollout_pending"}`
 is set, as it is for every mandatory token mid-roll. If it stays set after the

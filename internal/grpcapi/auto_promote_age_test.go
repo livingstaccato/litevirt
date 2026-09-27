@@ -15,7 +15,7 @@ import (
 
 // seedReplicaOfAge gives vmName a root disk, a replication schedule into a local
 // "dr" pool, and one replica in that pool stamped `age` ago.
-func seedReplicaOfAge(t *testing.T, s *Server, vmName string, age time.Duration) {
+func seedReplicaOfAge(t *testing.T, s *Server, vmName, cron string, age time.Duration) {
 	t.Helper()
 	ctx := context.Background()
 	src := filepath.Join(t.TempDir(), "root.qcow2")
@@ -31,7 +31,7 @@ func seedReplicaOfAge(t *testing.T, s *Server, vmName string, age time.Duration)
 	}
 	if err := corrosion.UpsertBackupSchedule(ctx, s.db, corrosion.BackupScheduleRecord{
 		VMName: vmName, Repo: "dr", Type: "replication", TargetPool: "dr",
-		TargetHost: s.hostName, Cron: "0 * * * *", KeepReplicas: 3,
+		TargetHost: s.hostName, Cron: cron, KeepReplicas: 3,
 	}); err != nil {
 		t.Fatalf("UpsertBackupSchedule: %v", err)
 	}
@@ -53,7 +53,7 @@ func seedReplicaOfAge(t *testing.T, s *Server, vmName string, age time.Duration)
 // not also cost.
 func TestAutoPromote_RefusesAStaleReplica(t *testing.T) {
 	s := testServer(t)
-	seedReplicaOfAge(t, s, "db-1", 5*24*time.Hour)
+	seedReplicaOfAge(t, s, "db-1", "0 * * * *", 5*24*time.Hour)
 
 	err := s.AutoPromoteReplica(context.Background(), "db-1", "", 0)
 
@@ -67,7 +67,7 @@ func TestAutoPromote_RefusesAStaleReplica(t *testing.T) {
 // every automatic promotion would pass the test above.
 func TestAutoPromote_DoesNotRefuseAFreshReplicaForAge(t *testing.T) {
 	s := testServer(t)
-	seedReplicaOfAge(t, s, "db-2", 10*time.Minute)
+	seedReplicaOfAge(t, s, "db-2", "0 * * * *", 10*time.Minute)
 
 	err := s.AutoPromoteReplica(context.Background(), "db-2", "", 0)
 
@@ -81,7 +81,7 @@ func TestAutoPromote_DoesNotRefuseAFreshReplicaForAge(t *testing.T) {
 // it is the best available is making a different decision.
 func TestManualPromote_IsNotAgeBounded(t *testing.T) {
 	s := testServer(t)
-	seedReplicaOfAge(t, s, "db-3", 5*24*time.Hour)
+	seedReplicaOfAge(t, s, "db-3", "0 * * * *", 5*24*time.Hour)
 	vm, err := corrosion.GetVM(context.Background(), s.db, "db-3")
 	if err != nil || vm == nil {
 		t.Fatalf("GetVM: %v", err)
@@ -116,7 +116,7 @@ func TestReplicaTimestamp_ParsesFromTheEndAndFailsClosed(t *testing.T) {
 		if ok != c.wantOK {
 			t.Errorf("replicaTimestamp(%q) ok=%v, want %v", c.name, ok, c.wantOK)
 		}
-		err := checkAutoPromoteReplicaAge(c.name, now)
+		err := checkAutoPromoteReplicaAge(c.name, now, autoPromoteMaxReplicaAge)
 		if (err != nil) != c.wantErr {
 			t.Errorf("checkAutoPromoteReplicaAge(%q) err=%v, wantErr=%v", c.name, err, c.wantErr)
 		}
@@ -126,5 +126,46 @@ func TestReplicaTimestamp_ParsesFromTheEndAndFailsClosed(t *testing.T) {
 		if !c.wantOK && (err == nil || !strings.Contains(err.Error(), "cannot read a timestamp")) {
 			t.Errorf("checkAutoPromoteReplicaAge(%q) = %v; an unreadable stamp must be refused as unreadable", c.name, err)
 		}
+	}
+}
+
+// The bound follows the VM's own schedule: two of its longest intervals, plus
+// an hour for the copy itself. A fixed 48 hours refused every weekly schedule's
+// newest replica for most of each week — automatic recovery silently off for a
+// schedule working exactly as configured — and let an hourly schedule promote a
+// replica two days behind it. With no readable schedule it stays at 48 hours.
+func TestAutoPromoteAgeLimit_FollowsTheSchedule(t *testing.T) {
+	cases := []struct {
+		cron string
+		want time.Duration
+	}{
+		{"0 * * * *", 3 * time.Hour},                  // hourly
+		{"0 3 * * 0", 2*7*24*time.Hour + time.Hour},   // weekly
+		{"0 2 * * 1-5", 2*3*24*time.Hour + time.Hour}, // weekdays: the weekend is the longest gap
+		{"", autoPromoteMaxReplicaAge},
+		{"not a cron", autoPromoteMaxReplicaAge},
+	}
+	for _, c := range cases {
+		if got := autoPromoteAgeLimit(c.cron); got != c.want {
+			t.Errorf("autoPromoteAgeLimit(%q) = %v, want %v", c.cron, got, c.want)
+		}
+	}
+}
+
+func TestAutoPromote_AWeeklyScheduleReplicaIsNotTooOld(t *testing.T) {
+	s := testServer(t)
+	seedReplicaOfAge(t, s, "db-4", "0 3 * * 0", 5*24*time.Hour)
+
+	if err := s.AutoPromoteReplica(context.Background(), "db-4", "", 0); errors.Is(err, errReplicaTooOld) {
+		t.Errorf("a 5-day-old replica of a WEEKLY schedule was refused as too old: %v", err)
+	}
+}
+
+func TestAutoPromote_AnHourlyScheduleRefusesADayOldReplica(t *testing.T) {
+	s := testServer(t)
+	seedReplicaOfAge(t, s, "db-5", "0 * * * *", 24*time.Hour)
+
+	if err := s.AutoPromoteReplica(context.Background(), "db-5", "", 0); !errors.Is(err, errReplicaTooOld) {
+		t.Errorf("a day-old replica of an HOURLY schedule returned %v, want errReplicaTooOld", err)
 	}
 }

@@ -23,6 +23,7 @@ import (
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/scheduler"
 )
 
 // PromoteReplica brings an inert replica online for disaster recovery: it
@@ -206,7 +207,8 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 	// the in-process AutoPromoteReplica call, and a status would drop the
 	// errReplicaTooOld chain that says WHY recovery fell back to a reschedule.
 	if automated {
-		if err := checkAutoPromoteReplicaAge(replica, time.Now()); err != nil {
+		sched, _ := s.replicationScheduleForVM(ctx, req.VmName)
+		if err := checkAutoPromoteReplicaAge(replica, time.Now(), autoPromoteAgeLimit(sched.Cron)); err != nil {
 			return err
 		}
 	}
@@ -305,11 +307,11 @@ var errReplicaTooOld = errors.New("newest replica is too old for automatic promo
 // recovery. The coordinator falls back to a plain reschedule on any promote
 // error, so a refusal here costs nothing that having no replica would not.
 //
-// 48 hours rather than something tighter because the bound has no knowledge of
-// the schedule's interval: a daily schedule's newest replica is legitimately up
-// to 24 hours old at the moment of failure, and one missed run should not by
-// itself turn automatic recovery off. A bound relative to the schedule belongs
-// with the per-replica recovery manifest (#258). Manual promotion is NOT
+// This is the FALLBACK, used when the VM's schedule cannot be read; normally
+// the bound follows the schedule (autoPromoteAgeLimit). 48 hours because a
+// daily schedule's newest replica is legitimately up to 24 hours old at the
+// moment of failure, and one missed run should not by itself turn automatic
+// recovery off. Manual promotion is NOT
 // bounded — an operator who has looked at the age and chosen it anyway is
 // making a different decision.
 //
@@ -337,14 +339,14 @@ func replicaTimestamp(name string) (time.Time, bool) {
 // checkAutoPromoteReplicaAge refuses a replica too old — or too unreadable —
 // for automatic promotion. Unreadable fails closed: a replica whose age cannot
 // be established cannot be shown to be within the bound.
-func checkAutoPromoteReplicaAge(replica string, now time.Time) error {
+func checkAutoPromoteReplicaAge(replica string, now time.Time, limit time.Duration) error {
 	ts, ok := replicaTimestamp(replica)
 	if !ok {
 		return fmt.Errorf("%w: cannot read a timestamp from %q", errReplicaTooOld, replica)
 	}
-	if age := now.Sub(ts); age > autoPromoteMaxReplicaAge {
+	if age := now.Sub(ts); age > limit {
 		return fmt.Errorf("%w: %q is %s old (limit %s); promote it manually if it is still the best available",
-			errReplicaTooOld, replica, age.Round(time.Minute), autoPromoteMaxReplicaAge)
+			errReplicaTooOld, replica, age.Round(time.Minute), limit)
 	}
 	return nil
 }
@@ -352,16 +354,25 @@ func checkAutoPromoteReplicaAge(replica string, now time.Time) error {
 // replicationTargetForVM returns the (pool, host) of the VM's first vm-scoped
 // replication schedule, used to infer where its replicas live.
 func (s *Server) replicationTargetForVM(ctx context.Context, vmName string) (pool, host string, ok bool) {
+	r, ok := s.replicationScheduleForVM(ctx, vmName)
+	if !ok {
+		return "", "", false
+	}
+	return r.TargetPool, r.TargetHost, true
+}
+
+// replicationScheduleForVM is the VM's first vm-scoped replication schedule.
+func (s *Server) replicationScheduleForVM(ctx context.Context, vmName string) (corrosion.BackupScheduleRecord, bool) {
 	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
 	if err != nil {
-		return "", "", false
+		return corrosion.BackupScheduleRecord{}, false
 	}
 	for _, r := range rows {
 		if r.Type == "replication" && r.VMName == vmName && r.TargetPool != "" {
-			return r.TargetPool, r.TargetHost, true
+			return r, true
 		}
 	}
-	return "", "", false
+	return corrosion.BackupScheduleRecord{}, false
 }
 
 // replicaPattern matches a replica file for (vm, disk): both the full-copy
@@ -1047,4 +1058,45 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		Replica: replica, DiskPath: livePath, Status: "promotion complete" + multiDiskNote,
 	})
 	return nil
+}
+
+// autoPromoteAgeLimit is the bound for a VM replicated on schedule cron: two of
+// the schedule's longest intervals, plus an hour for the copy itself. One
+// missed run is tolerated, two are not.
+//
+// The fixed 48 hours refused every weekly schedule's newest replica for most of
+// each week — automatic recovery silently off for a schedule working exactly
+// as configured — while letting an hourly one promote a replica two days
+// behind. An unreadable or never-firing schedule keeps the fixed bound.
+func autoPromoteAgeLimit(cron string) time.Duration {
+	gap, ok := longestCronGap(cron)
+	if !ok {
+		return autoPromoteMaxReplicaAge
+	}
+	return 2*gap + time.Hour
+}
+
+// longestCronGap is the longest wait between consecutive runs of cron, found by
+// walking every minute of a fixed 93-day window — long enough for a monthly
+// schedule to fire more than once, and fixed so the answer does not depend on
+// when it is asked. The longest gap, not the typical one: a weekday schedule's
+// replica is legitimately three days old on a Monday morning.
+func longestCronGap(expr string) (time.Duration, bool) {
+	c, err := scheduler.ParseCron(expr)
+	if err != nil {
+		return 0, false
+	}
+	start := time.Date(2026, 1, 5, 0, 0, 0, 0, time.UTC) // a Monday
+	var prev time.Time
+	var longest time.Duration
+	for t := start; t.Before(start.AddDate(0, 0, 93)); t = t.Add(time.Minute) {
+		if !c.Matches(t) {
+			continue
+		}
+		if !prev.IsZero() && t.Sub(prev) > longest {
+			longest = t.Sub(prev)
+		}
+		prev = t
+	}
+	return longest, longest > 0
 }

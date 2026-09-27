@@ -163,12 +163,16 @@ storage_pools:
 #
 # A NEW cluster is different, and `lv host init` treats it differently: with no cluster
 # to preserve the behavior of, it writes safe_fence_default and shared_storage_fence as
-# TRUE on the first node. Both protect against the same outcome — a best-effort fence
-# that never landed reporting success, the coordinator rescheduling, and a writable
-# shared disk being opened on a second host while the first still has it. Hosts JOINING
-# a cluster inherit that cluster's block verbatim instead, so adding a node never flips
-# a flag mid-roll. To adopt them on an existing cluster, set both on every node and
-# restart; `lv doctor fence` reports which nodes have not.
+# TRUE on the first node, in both its remote and `--local` forms (a target re-initialised
+# with --force keeps the block it already has). Both protect against the same outcome — a
+# best-effort fence that never landed reporting success, the coordinator rescheduling, and
+# a writable shared disk being opened on a second host while the first still has it.
+# Hosts JOINING a cluster inherit that cluster's block verbatim instead, so adding a node
+# never flips a flag mid-roll. `lv host add` reads the block from this machine's config
+# when it is a cluster node, and otherwise from an existing node's config over SSH (as
+# the same user as the target); when it can read neither, it refuses before touching the
+# target. To adopt them on an existing cluster, set both on every node and restart;
+# `lv doctor fence` reports which nodes have not.
 #
 # Enable fleet-uniformly for lww_skew_guard (it changes merge behavior) and for vip_*
 # enable the pair together.

@@ -267,6 +267,16 @@ Keyboard-accessible search bar in the navigation. Searches across all resource t
 
 Download a stack's compose YAML as a file. Available from the stack detail page via an "Export YAML" button.
 
+## Stack Destroy
+
+"Destroy" on the stack detail page waits for the whole teardown and then
+reports it: "destroyed" only when every VM, container and network was removed,
+otherwise a "not fully destroyed" error naming each resource that was not (the
+stack stays `deleting` and the daemon retries the teardown). The wait has no
+time limit — a large stack can take minutes — and the teardown runs on the
+server whatever the browser does: navigating away or closing the tab loses only
+the toast, not the teardown.
+
 ## Host Upgrade
 
 Upload a new litevirt binary to upgrade a host. Available from the host detail page via an "Upgrade" button. Features upload progress tracking and automatic daemon restart.

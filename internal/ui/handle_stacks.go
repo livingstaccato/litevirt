@@ -180,7 +180,14 @@ func (s *Server) handlePlanPreview(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	stream, err := s.grpc.DeleteStack(s.uiBearerCtx(r), &pb.DeleteStackRequest{Name: name})
+	// The toast is the teardown's verdict, so the handler waits for the whole
+	// stream: on a detached context, so a browser that navigates away does not
+	// cancel the teardown half-way, and with the write deadline lifted, so a
+	// teardown longer than the 30s WriteTimeout still delivers its toast.
+	opCtx, cancel := detachedOpContext(s.uiBearerCtx(r))
+	defer cancel()
+	disableStreamWriteTimeout(w)
+	stream, err := s.grpc.DeleteStack(opCtx, &pb.DeleteStackRequest{Name: name})
 	if err != nil {
 		slog.Error("UI: destroy stack failed", "error", err)
 		sendToast(w, "Destroy failed: "+err.Error(), "error")

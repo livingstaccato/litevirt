@@ -86,7 +86,9 @@ func (f *raceLXC) List(context.Context) ([]string, error) {
 	return out, nil
 }
 
-func (f *raceLXC) Limits(context.Context, string) (int, int, error) { return 0, 0, nil }
+func (f *raceLXC) Limits(context.Context, string) (int, lxc.MemoryLimit, error) {
+	return 0, lxc.MemoryLimit{Unlimited: true}, nil
+}
 
 func (f *raceLXC) snapshot(name string) (lxc.State, int) {
 	f.mu.Lock()

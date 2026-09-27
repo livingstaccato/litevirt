@@ -99,6 +99,20 @@ lv compose down                  # Tear down
 `up` and `down` refuse to prompt when stdin is not a terminal (ssh without
 `-t`, CI, a pipe) and exit non-zero instead of waiting — pass `-y` in scripts.
 
+VM names are cluster-wide, not per stack. A workload the plan would create —
+replica names such as `web-1` included — whose name a VM of another stack, or
+of no stack, already holds is refused before anything runs: `compose up`'s plan,
+`compose diff` and the deploy itself fail with `pre-deploy validation failed:`
+and a line such as `vm "v1" already exists in stack "app" — rename it in this
+file or delete it there` (`... already exists outside any stack ...` for a VM
+created outside compose). A VM of the same stack is not a collision; the plan
+updates it. Container names are per host, so a container collides only with a
+container of that name on the host the plan places it on (`container "web"
+already exists on host "node-1" in stack "app" ...`), and VMs and containers do
+not collide with each other. `compose diff` computes its plan without
+placement, so only the server's plan (`compose up`) reports container
+collisions.
+
 `compose up` ends with `Stack "<name>" deployed.` and exit status 0 only when
 every action in the plan succeeded. If any VM action fails, each failure is
 printed as it happens, the success line is withheld, and the command exits

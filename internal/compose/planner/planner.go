@@ -160,6 +160,36 @@ func updateMechanism(op compose.Op, a VMAction, haveStoredSpec, hasDisks bool) (
 	}
 }
 
+// updatePlan is a VM update's classification: the one Build decided the op
+// with, so the plan and what is applied cannot disagree about whether (and
+// what) anything changed; or, for an op Build could not classify, the
+// planner's own when it has the stored spec.
+func updatePlan(op compose.Op, desired, stored *pb.VMSpec) compose.ChangePlan {
+	if op.Classified {
+		return op.Change
+	}
+	if stored != nil {
+		return compose.Classify(desired, stored, compose.StoredDisksFromSpec(stored))
+	}
+	return compose.ChangePlan{}
+}
+
+// surgesBeside reports whether a VM update is rolled out by creating the new
+// VM beside the running one until a cutover — a replacement (recreate-class)
+// under blue-green or snapshot-and-replace — so its host must hold both. Every
+// other update replaces the VM's allocation: it is applied to the same VM, or
+// the old VM is deleted before the new one is created.
+func surgesBeside(f *compose.File, op compose.Op, desired, stored *pb.VMSpec, state *ClusterState) bool {
+	switch compose.EffectiveUpdate(f, op.VMName).Strategy {
+	case "blue-green", "snapshot-and-replace":
+	default:
+		return false
+	}
+	a := VMAction{Plan: updatePlan(op, desired, stored)}
+	apply, _, _ := updateMechanism(op, a, stored != nil, state.RecordedDisks[op.VMName] > 0)
+	return apply == compose.ActionRecreate
+}
+
 // inPlaceRefusal is why a VM update planned under the in-place strategy cannot
 // be carried out, or nil. In-place never restarts or deletes a VM, so an
 // update whose mechanism is a restart or a recreate is refused here, when the
@@ -273,6 +303,20 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 		}
 	}
 
+	// Stored specs for this stack's VMs (for classifying in-place updates). Built
+	// from the snapshot — no extra queries.
+	storedSpecByVM := map[string]*pb.VMSpec{}
+	for i := range state.VMs {
+		vm := &state.VMs[i]
+		if vm.StackName != f.Name || vm.Spec == "" {
+			continue
+		}
+		ss := &pb.VMSpec{}
+		if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
+			storedSpecByVM[vm.Name] = ss
+		}
+	}
+
 	for _, op := range vmPlan.Ops {
 		if op.Kind != OpCreate && op.Kind != OpUpdate {
 			continue
@@ -316,7 +360,10 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 			if h := currentHostByVM[op.VMName]; h != "" {
 				req.PinHost = h
 			}
-			if vm, ok := vmRecordByName[op.VMName]; ok {
+			// The update replaces what the VM holds — unless its strategy
+			// runs the new VM beside the old one until a cutover, which
+			// needs room for both.
+			if vm, ok := vmRecordByName[op.VMName]; ok && !surgesBeside(f, op, spec, storedSpecByVM[op.VMName], state) {
 				req.Replaces = placement.VMAllocation(vm)
 			}
 		}
@@ -339,20 +386,6 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 				return nil, fmt.Errorf("batch placement failed: %w", r.Err)
 			}
 			return nil, fmt.Errorf("batch placement failed: %w for VM %q", placement.ErrNoEligibleHost, name)
-		}
-	}
-
-	// Stored specs for this stack's VMs (for classifying in-place updates). Built
-	// from the snapshot — no extra queries.
-	storedSpecByVM := map[string]*pb.VMSpec{}
-	for i := range state.VMs {
-		vm := &state.VMs[i]
-		if vm.StackName != f.Name || vm.Spec == "" {
-			continue
-		}
-		ss := &pb.VMSpec{}
-		if err := json.Unmarshal([]byte(vm.Spec), ss); err == nil {
-			storedSpecByVM[vm.Name] = ss
 		}
 	}
 
@@ -381,11 +414,7 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 				// The classification Build decided the op with, so the
 				// plan and what is applied cannot disagree about whether
 				// (and what) anything changed.
-				if op.Classified {
-					action.Plan = op.Change
-				} else if stored := storedSpecByVM[op.VMName]; stored != nil {
-					action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
-				}
+				action.Plan = updatePlan(op, specByVM[op.VMName], storedSpecByVM[op.VMName])
 			}
 			action.Retry = op.Retry
 			action.Apply, action.RecreateReason, action.Repair = updateMechanism(op, action, storedSpecByVM[op.VMName] != nil, state.RecordedDisks[op.VMName] > 0)

@@ -3,7 +3,6 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
-	"strings"
 
 	"github.com/litevirt/litevirt/internal/network"
 )
@@ -97,13 +96,11 @@ func (s *Server) unusedStackFlatBridgeNames(ctx context.Context, only string) ([
 			stacks = append(stacks, n)
 		}
 	}
+	// Attributed the way a stack's networks are (stackOwningName): to the
+	// longest known stack a "<stack>_" prefix names, since stack names may
+	// themselves contain "_".
 	isStackScoped := func(name string) bool {
-		for _, st := range stacks {
-			if strings.HasPrefix(name, st+"_") && len(name) > len(st)+1 {
-				return true
-			}
-		}
-		return false
+		return stackOwningName(name, stacks) != ""
 	}
 	live := map[string]bool{}
 	var candidates []string

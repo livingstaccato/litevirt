@@ -914,8 +914,9 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	}
 
 	// Deprovision networks associated with this stack (skip external networks).
-	// Match on the stack_name column OR the scoped-name convention
-	// ("<stack>_<net>"): a migration re-provisions the network on the target via
+	// Match on the stack_name column, or — for a row with none — the
+	// scoped-name convention ("<stack>_<net>") attributed to the longest known
+	// stack name (networkBelongsToStack): a migration re-provisions the network on the target via
 	// ProvisionNetwork and can land a row with an empty stack_name, which would
 	// otherwise orphan the bridge + dnsmasq + row at teardown.
 	//
@@ -925,6 +926,22 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// why.
 	externalNets := externalNetworksOf(stored, req.Name)
 	nets, _ := corrosion.ListNetworks(ctx, s.db)
+	knownStacks, ksErr := s.knownStackNames(ctx)
+	if ksErr != nil && storedErr == nil {
+		// Without the other stacks' names, a "<stack>_" prefix cannot tell this
+		// stack's rows from a longer-named stack's. Networks naming this stack
+		// are still removed; unnamed ones wait for the reconciler.
+		hadFailures = true
+		notRemoved = append(notRemoved, "networks without a stack name")
+		slog.Warn("stack delete: list stack names failed", "stack", req.Name, "error", ksErr)
+		if sendErr := stream.Send(&pb.DeleteProgress{
+			VmName: "networks",
+			Status: "error",
+			Error:  "list stack names: " + ksErr.Error(),
+		}); sendErr != nil {
+			return sendErr
+		}
+	}
 	if storedErr != nil {
 		hadFailures = true
 		notRemoved = append(notRemoved, "networks")
@@ -939,7 +956,10 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 		nets = nil
 	}
 	for _, nr := range nets {
-		if networkBelongsToStack(nr, req.Name) && !externalNets[nr.Name] {
+		if ksErr != nil && nr.StackName == "" {
+			continue
+		}
+		if networkBelongsToStack(nr, req.Name, knownStacks) && !externalNets[nr.Name] {
 			// Tear down the static subnet route injected on deploy (injectSubnetRoutes),
 			// which network.Deprovision otherwise leaves behind → CIDR reuse can misroute.
 			// RemoveSubnetRoute is idempotent (deletes only a route whose `via` matches),
@@ -1404,15 +1424,60 @@ func opKindToDiffOp(k compose.OpKind) pb.DiffOp {
 }
 
 // networkBelongsToStack reports whether a network row was created by the named
-// stack — by its stack_name column OR the scoped-name convention
-// "<stack>_<net>". The name fallback matters because a migration re-provisions
-// the network on the target via ProvisionNetwork and can land a row with an
-// empty stack_name; without it, teardown orphans the bridge + dnsmasq + row.
-func networkBelongsToStack(nr corrosion.NetworkRecord, stackName string) bool {
+// stack. A row that names its stack is that stack's and no other's. A row with
+// an empty stack_name falls back to the scoped-name convention "<stack>_<net>",
+// because a migration re-provisions the network on the target via
+// ProvisionNetwork and can land a row with an empty stack_name; without it,
+// teardown orphans the bridge + dnsmasq + row.
+//
+// Stack names may contain "_", so the prefix alone is ambiguous: "app_v2_lan"
+// starts with "app_" too. The fallback attributes a name to the LONGEST known
+// stack whose "<stack>_" prefixes it (knownStacks), so stack "app" never claims
+// stack "app_v2"'s network.
+func networkBelongsToStack(nr corrosion.NetworkRecord, stackName string, knownStacks []string) bool {
 	if stackName == "" {
 		return false
 	}
-	return nr.StackName == stackName || strings.HasPrefix(nr.Name, stackName+"_")
+	if nr.StackName != "" {
+		return nr.StackName == stackName
+	}
+	return stackOwningName(nr.Name, append([]string{stackName}, knownStacks...)) == stackName
+}
+
+// stackOwningName is the stack a "<stack>_<rest>" name belongs to: the longest
+// of stacks whose "<stack>_" prefixes name with a non-empty rest, or "" when
+// none does.
+func stackOwningName(name string, stacks []string) string {
+	owner := ""
+	for _, st := range stacks {
+		if st == "" || len(st) <= len(owner) {
+			continue
+		}
+		if strings.HasPrefix(name, st+"_") && len(name) > len(st)+1 {
+			owner = st
+		}
+	}
+	return owner
+}
+
+// knownStackNames is every stack name this node knows of: stack records (live
+// or deleted), and the stack_name of any VM or network row (a deploy writes the
+// stack record only once it has finished).
+func (s *Server) knownStackNames(ctx context.Context) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT name FROM stacks
+		 UNION SELECT DISTINCT stack_name AS name FROM vms WHERE stack_name != ''
+		 UNION SELECT DISTINCT stack_name AS name FROM networks WHERE stack_name != ''`)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, r := range rows {
+		if n := r.String("name"); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out, nil
 }
 
 // externalNetworkNames returns the set of network names marked external in a

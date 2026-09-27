@@ -975,6 +975,10 @@ network, the move is refused for that VM and the VM is left as it is.
 
 Networks the file declares belong to the stack. They are stored as
 `<stack>_<name>`, so two stacks can each have a network called `lan`.
+Deleting a stack removes the networks recorded as that stack's. A network
+record that names no stack is matched by its `<stack>_` prefix, and goes to the
+longest stack name that fits: deleting stack `app` leaves `app_v2_lan` to stack
+`app_v2`.
 
 ## Volume definitions
 

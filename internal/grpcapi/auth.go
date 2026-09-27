@@ -706,6 +706,34 @@ func (s *Server) RequirePerm(ctx context.Context, path, verb, fallbackRole strin
 	return RequireRole(ctx, fallbackRole)
 }
 
+// requirePermResolved is RequirePerm for a resource whose project comes from
+// its local row. known reports whether that row was found. When it was, path —
+// built from the row's project — decides, exactly as RequirePerm does.
+//
+// When it was not, the project cannot be named here: the row has not reached
+// this node yet, or the resource does not exist. Guessing _default was an
+// authorization bypass — a caller whose only grant was on _default passed for a
+// resource in any other project, through any node its row had not reached,
+// and the action then ran on the owner (a forward) or relayed a write every
+// node holding the row applied. So an unresolved project is judged against the
+// cluster root: a root grant (or the legacy no-bindings role fallback, which is
+// cluster-wide anyway) still reaches it, which keeps an admin's idempotent
+// re-issue of a delete working; anyone else gets a retryable NotFound rather
+// than a PermissionDenied that would name a path they never asked about.
+func (s *Server) requirePermResolved(ctx context.Context, known bool, path, verb, fallbackRole, what string) error {
+	if known {
+		return s.RequirePerm(ctx, path, verb, fallbackRole)
+	}
+	if err := s.RequirePerm(ctx, "/", verb, fallbackRole); err != nil {
+		if status.Code(err) == codes.PermissionDenied {
+			return status.Errorf(codes.NotFound,
+				"%s not found on this node (if it was just created it may still be replicating; retry)", what)
+		}
+		return err
+	}
+	return nil
+}
+
 // requirePermPrecheck is a path-independent gate used by handlers that must
 // resolve the target object (and its tenancy project) before they can build
 // the real RBAC path for RequirePerm. It denies callers who could never be

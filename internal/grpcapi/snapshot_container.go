@@ -33,8 +33,8 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.create", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "snapshot.create", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.snapshot.create", req.Name, "project="+project, "denied")
 		return nil, err
 	}
@@ -154,8 +154,8 @@ func (s *Server) RevertContainerSnapshot(ctx context.Context, req *pb.RevertCont
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.restore", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "snapshot.restore", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.snapshot.revert", req.Name, "project="+project, "denied")
 		return nil, err
 	}
@@ -225,8 +225,8 @@ func (s *Server) DeleteContainerSnapshot(ctx context.Context, req *pb.DeleteCont
 	if req.Name == "" || req.Snapshot == "" {
 		return nil, status.Error(codes.InvalidArgument, "name and snapshot required")
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "snapshot.delete", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "snapshot.delete", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.snapshot.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}

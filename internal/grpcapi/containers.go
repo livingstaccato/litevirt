@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"google.golang.org/grpc/codes"
@@ -31,24 +32,35 @@ import (
 //     the host that performed the action so the row reflects truth.
 
 // CreateContainer creates an LXC/OCI container on the named host.
-// containerProject resolves a container's tenancy project for RBAC/audit,
-// defaulting to "_default" when the row isn't found yet. When host is empty it
-// scans by name (lifecycle RPCs usually carry the owning host).
-func (s *Server) containerProject(ctx context.Context, host, name string) string {
+// containerProject resolves a container's tenancy project for RBAC/audit.
+// known is false when no row was found here (or the read failed): the project
+// is then unknown, NOT "_default", and the caller must authorize through
+// requirePermResolved, which refuses to guess. The "_default" returned
+// alongside known=false is only for audit text and the admission a root caller
+// reaches. When host is empty it scans by name (lifecycle RPCs usually carry
+// the owning host).
+func (s *Server) containerProject(ctx context.Context, host, name string) (project string, known bool) {
 	if host != "" {
-		if ct, _ := corrosion.GetContainer(ctx, s.db, host, name); ct != nil && ct.Project != "" {
-			return ct.Project
+		ct, err := corrosion.GetContainer(ctx, s.db, host, name)
+		if err != nil || ct == nil {
+			return tenancy.Default, false
 		}
-		return "_default"
+		return tenancy.NormalizeProject(ct.Project), true
 	}
-	cts, _ := corrosion.ListContainers(ctx, s.db, "")
+	cts, err := corrosion.ListContainers(ctx, s.db, "")
+	if err != nil {
+		return tenancy.Default, false
+	}
 	for _, ct := range cts {
-		if ct.Name == name && ct.Project != "" {
-			return ct.Project
+		if ct.Name == name {
+			return tenancy.NormalizeProject(ct.Project), true
 		}
 	}
-	return "_default"
+	return tenancy.Default, false
 }
+
+// containerWhat names a container in requirePermResolved's NotFound.
+func containerWhat(name string) string { return "container " + strconv.Quote(name) }
 
 func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerRequest) (resp *pb.Container, retErr error) {
 	if req.Name == "" {
@@ -274,8 +286,8 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.start", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "ct.start", "operator", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
 	// Resolve the OWNER when no host was named (same shape as DeleteContainer):
@@ -362,8 +374,8 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.stop", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "ct.stop", "operator", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
 	// Owner resolution, same as StartContainer/DeleteContainer.
@@ -403,8 +415,8 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 	if err := safename.ValidateContainerName(req.Name); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "ct.delete", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "ct.delete", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}

@@ -119,3 +119,72 @@ func TestReopenedMintGateDoesNotReuseAnEarlierTenuresTerm(t *testing.T) {
 			"lapse; work from before it is now indistinguishable from work after it", first)
 	}
 }
+
+// TestTermlessIncarnation_ASiblingInTheNoteGapDoesNotMintAgain is the same
+// termless incarnation, with two same-holder callers on the one Client.
+//
+// The first caller supersedes the earlier tenure's term N and mints N+1. It
+// records that this incarnation now holds a term only AFTER the mint's
+// transaction has committed, so a sibling running in that gap reads term N+1
+// naming us while the incarnation is still recorded termless — and classified
+// N+1 as "an earlier tenure's term" too, superseding it with N+2. Two mints for
+// one tenure, and the first caller is left holding a term below the threshold:
+// fenced by its own ledger, exactly what ConcurrentSameHolderMintsOnce guards
+// for the ordinary acquisition.
+//
+// The hook forces the sibling into the gap on every run.
+func TestTermlessIncarnation_ASiblingInTheNoteGapDoesNotMintAgain(t *testing.T) {
+	ctx := context.Background()
+	db := newTestDB(t)
+
+	held, first, err := AcquireLeaseWithTerm(ctx, db, LeaseKeyFailover, "h1", time.Second, time.Now())
+	if err != nil || !held || first <= 0 {
+		t.Fatalf("setup: held=%v term=%d err=%v", held, first, err)
+	}
+	db.SetLeaseTermLedgerGate(func() bool { return false })
+	lapsed := time.Now().Add(5 * time.Second)
+	if held, term, err := AcquireLeaseWithTerm(ctx, db, LeaseKeyFailover, "h1", time.Second, lapsed); err != nil || !held || term != 0 {
+		t.Fatalf("termless re-take: held=%v term=%d err=%v", held, term, err)
+	}
+	db.SetLeaseTermLedgerGate(func() bool { return true })
+
+	var sibling int64
+	var siblingErr error
+	fired := false
+	mintCommittedHook = func() {
+		if fired {
+			return
+		}
+		fired = true
+		var ok bool
+		ok, sibling, siblingErr = AcquireLeaseWithTerm(ctx, db, LeaseKeyFailover, "h1", time.Minute, lapsed)
+		if !ok && siblingErr == nil {
+			siblingErr = errNotHeldForTest
+		}
+	}
+	t.Cleanup(func() { mintCommittedHook = nil })
+
+	held, term, err := AcquireLeaseWithTerm(ctx, db, LeaseKeyFailover, "h1", time.Minute, lapsed)
+	if err != nil || !held {
+		t.Fatalf("gate reopened: held=%v err=%v", held, err)
+	}
+	if !fired {
+		t.Fatal("the mint hook never fired; the sibling did not run in the gap")
+	}
+	if siblingErr != nil {
+		t.Fatalf("sibling: %v", siblingErr)
+	}
+	if n := termRowCount(t, db, LeaseKeyFailover); n != 2 {
+		t.Errorf("%d term rows, want 2 (the earlier tenure's and this one's) — the sibling "+
+			"minted a second term for one tenure", n)
+	}
+	if sibling != term {
+		t.Errorf("the caller holds term %d and its sibling %d — one tenure must have one term", term, sibling)
+	}
+}
+
+var errNotHeldForTest = errorString("sibling did not hold the lease")
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }

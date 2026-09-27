@@ -167,3 +167,53 @@ func TestCheckHost_UnreadyAnswersDoNotCountTowardSuspect(t *testing.T) {
 		t.Errorf("consecutive_failures = %d after the first unanswered probe, want 1", got)
 	}
 }
+
+// However long a peer answers "not ready", the STORED row never reaches the
+// fence threshold.
+//
+// Only a coordinator built with the readiness probe knows to exclude
+// status='unready' from its fence quorum. During a rolling upgrade the leader
+// can be an older build, and its query is `consecutive_failures >= 5` and
+// nothing else — so a streak of unready answers written with a climbing count
+// is, to that leader, five observers agreeing the host is dead, and it powers
+// off a host that is answering. The only way no build's query can count them
+// is for the row never to carry the count.
+//
+// The row is still rewritten on every unready probe, as it was while the count
+// climbed, so its updated_at stays as fresh as a failing row's.
+func TestCheckHost_AnUnreadyStreakNeverReachesTheFenceThreshold(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	c := probingChecker(t, db)
+	c.SetPeerReadiness(func(context.Context, string) (bool, string, error) {
+		return false, "database read timed out", nil
+	})
+	writes := 0
+	c.writeFn = func(ctx context.Context, q string, args ...interface{}) error {
+		writes++
+		return db.Execute(ctx, q, args...)
+	}
+	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
+
+	const probes = 4 * FailuresToFence
+	for i := 0; i < probes; i++ {
+		c.checkHost(ctx, host)
+		rows, err := db.Query(ctx,
+			`SELECT status, consecutive_failures FROM host_health WHERE observer = ? AND target = ?`,
+			"host-a", "host-b")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("probe %d: rows=%d err=%v", i+1, len(rows), err)
+		}
+		if got := rows[0].String("status"); got != StatusUnready {
+			t.Fatalf("probe %d: status = %q, want %q", i+1, got, StatusUnready)
+		}
+		if got := rows[0].Int("consecutive_failures"); got >= FailuresToFence {
+			t.Fatalf("after %d unready answers the stored consecutive_failures is %d — at or past the "+
+				"fence threshold (%d) an older-build leader counts without looking at status",
+				i+1, got, FailuresToFence)
+		}
+	}
+	if writes != probes {
+		t.Errorf("%d writes over %d unready probes, want one per probe — the row went stale", writes, probes)
+	}
+}

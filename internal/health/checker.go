@@ -20,6 +20,18 @@ const (
 	probeConcurrency = 16
 )
 
+// ProbeInterval is the cadence at which an observer probes each peer. A probe
+// is started at most once per tick, so N consecutive failed probes from one
+// observer span at least (N-1) × ProbeInterval — the lower bound failover uses
+// to tell whether a peer has been down without a break since some instant.
+const ProbeInterval = checkInterval
+
+// unreadyFailures is the consecutive_failures an 'unready' row carries, for
+// every unready observation in a run: below any fence threshold, and non-zero
+// so that recovery (which counts consecutive_failures = 0) never reads it as
+// healthy. See checkHost.
+const unreadyFailures = 1
+
 // HeartbeatInterval is how often an UNCHANGED host_health verdict is
 // re-published so it keeps a current updated_at.
 //
@@ -462,6 +474,15 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 			// something the peer already told us only delays the operator's view
 			// of it.
 			newStatus = StatusUnready
+			// And the stored count stays at one, however long the answers go on.
+			// Only a coordinator that knows 'unready' excludes it from fence
+			// quorum; an older-build leader during a rolling upgrade counts
+			// `consecutive_failures >= FailuresToFence` and nothing else, so a
+			// climbing count here would read to it as a quorum of observers
+			// agreeing the host is dead — a power-off of a host that is
+			// answering. The row never carries the count, so no build can count
+			// it. One, not zero: zero is what recovery reads as healthy.
+			newFailures = unreadyFailures
 		case newFailures >= suspectThreshold:
 			newStatus = "suspect"
 		default:
@@ -469,7 +490,10 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		}
 	}
 
-	changed := !exists || newStatus != prev.status || newFailures != prev.failures
+	// An unready verdict is republished on every probe, as it was while its
+	// count still climbed: the count is pinned now, and without this the row
+	// would be written once and go stale while the peer kept answering.
+	changed := !exists || newStatus != prev.status || newFailures != prev.failures || newStatus == StatusUnready
 	prev.status = newStatus
 	prev.failures = newFailures
 	// Local monotonic anchors updated every probe (not just on change) so Phase 2/5

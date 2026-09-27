@@ -316,3 +316,86 @@ func TestConfirmationResume_TheNextLeaderResumesAfterHandover(t *testing.T) {
 		t.Errorf("VM still on %q after the lease changed hands — the new leader did not resume the confirmation", got)
 	}
 }
+
+// A fence attempt and a confirmation from an EARLIER outage do not move the
+// workloads in this one.
+//
+// The attempt is two days old and the confirmation one; the host is terminal
+// and quorum-down now, and nothing fenced it for this outage. "The newest
+// confirmation is at or after the newest attempt" is true of those two rows, and
+// it is no evidence at all about the machine as it stands: whatever that fence
+// did, it did two days ago. Resuming here reschedules the VMs of a host nobody
+// has powered off, past every gate the fence path would apply.
+func TestConfirmationResume_AnEarlierOutagesConfirmationDoesNotCount(t *testing.T) {
+	for _, state := range []string{"fenced", "offline"} {
+		t.Run(state, func(t *testing.T) {
+			db, ctx := seedDownHost(t, "manual", nil)
+			if err := corrosion.UpdateHostState(ctx, db, "down", state); err != nil {
+				t.Fatalf("UpdateHostState: %v", err)
+			}
+			seedFenceRow(t, db, ctx, "old-attempt", "partial", 48*time.Hour)
+			seedFenceRow(t, db, ctx, "old-confirm", "manual-confirmed", 24*time.Hour)
+			c := newTestCoordinator("coordinator", db)
+			c.SetFencer(manualFencer())
+
+			c.run(ctx)
+			c.run(ctx)
+
+			if got := vmHost(t, db, ctx); got != "down" {
+				t.Errorf("VM moved to %q on a fence attempt and a confirmation from an earlier outage", got)
+			}
+		})
+	}
+}
+
+// The same holds for a FRESH confirmation of an old attempt: `lv host
+// fence-confirm` runs no fence, so an operator confirming today does not turn
+// a fence from two days ago into one for this outage.
+func TestConfirmationResume_AFreshConfirmationOfAnOldAttemptDoesNotCount(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	seedFenceRow(t, db, ctx, "old-attempt", "partial", 48*time.Hour)
+	operatorConfirms(t, db, ctx, "down")
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(manualFencer())
+
+	c.run(ctx)
+	c.run(ctx)
+
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Errorf("VM moved to %q on today's confirmation of a two-day-old fence attempt", got)
+	}
+}
+
+// An operator who takes longer than recentFenceWindow to walk to the rack is
+// still honoured, because the observers have watched the host down without a
+// break since the attempt: the attempt is this outage's, however old it is.
+func TestConfirmationResume_ASlowConfirmationOfThisOutageStillCounts(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	// Twenty minutes of unbroken failed probes from both observers.
+	streak := int((20 * time.Minute) / health.ProbeInterval)
+	if err := db.Execute(ctx, `UPDATE host_health SET consecutive_failures = ? WHERE target = 'down'`, streak); err != nil {
+		t.Fatalf("lengthen streak: %v", err)
+	}
+	if err := corrosion.UpdateHostState(ctx, db, "down", "offline"); err != nil {
+		t.Fatalf("UpdateHostState: %v", err)
+	}
+	seedFenceRow(t, db, ctx, "attempt", "partial", 15*time.Minute)
+	operatorConfirms(t, db, ctx, "down")
+	c := newTestCoordinator("coordinator", db)
+	c.SetFencer(manualFencer())
+
+	c.run(ctx)
+
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Errorf("VM still on %q after a confirmation of this outage's fence, fifteen minutes on", got)
+	}
+}
+
+func seedFenceRow(t *testing.T, db *corrosion.Client, ctx context.Context, id, result string, age time.Duration) {
+	t.Helper()
+	if err := db.Execute(ctx,
+		`INSERT INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, "down", "manual", result, time.Now().Add(-age).UTC().Format(time.RFC3339), "seeded"); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+}

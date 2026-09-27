@@ -156,7 +156,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 	// so there is no path for a local user on the target to pre-create, no window
 	// between writing it and running it, and nothing to clean up if this process
 	// dies in between.
-	if err := sc.RunWithInput(fmt.Sprintf("HOST_NAME=%s bash -s", hostName), []byte(setupScript)); err != nil {
+	if err := sc.RunWithInput(remoteInitSetupCommand(hostName, hostAddr, existingCfg), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -189,11 +189,28 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 		return fmt.Errorf("no cluster CA found — run 'lv host init' first")
 	}
 
-	parsedHost, _, err := parseSSHTarget(sshTarget)
+	parsedHost, sshUser, err := parseSSHTarget(sshTarget)
 	if err != nil {
 		return err
 	}
 	hostAddr, err := resolveHost(parsedHost)
+	if err != nil {
+		return err
+	}
+
+	// Format join_peers as YAML array, e.g. ["10.0.50.10:7946","10.0.50.11:7946"]
+	peersYAML := "["
+	for i, p := range joinPeers {
+		if i > 0 {
+			peersYAML += ","
+		}
+		peersYAML += fmt.Sprintf("%q", p)
+	}
+	peersYAML += "]"
+
+	// Decided before anything is minted or pushed, like the peer list: a refusal
+	// here must leave the target untouched.
+	enforcement, err := addSetupEnforcement(sshUser, joinPeers)
 	if err != nil {
 		return err
 	}
@@ -270,19 +287,6 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("read setup script: %w", err)
 	}
-	// Format join_peers as YAML array, e.g. ["10.0.50.10:7946","10.0.50.11:7946"]
-	peersYAML := "[]"
-	if len(joinPeers) > 0 {
-		peersYAML = "["
-		for i, p := range joinPeers {
-			if i > 0 {
-				peersYAML += ","
-			}
-			peersYAML += fmt.Sprintf("%q", p)
-		}
-		peersYAML += "]"
-	}
-
 	// hostAddr is the address this command just put in the certificate SAN and the
 	// address peers were told to dial, so it is also the address the node must
 	// advertise. Leaving the daemon to auto-detect meant it registered with its
@@ -302,7 +306,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
 	if err := sc.RunWithInput(fmt.Sprintf("%s bash -s",
-		shellEnvPrefix(setupScriptEnv(hostName, hostAddr, peersYAML))), []byte(setupScript)); err != nil {
+		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement))), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
@@ -823,6 +827,98 @@ func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
 const localInitJoinPeers = "[]"
 
 func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
+	return setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcementYAML(daemonConfigPath, joinPeers))
+}
+
+// remoteInitSetupCommand is the command line `lv host init <target>` runs the
+// setup script under: the same setupScriptEnv the --local form passes, as
+// shell-quoted assignments.
+//
+// It used to be `HOST_NAME=<name> bash -s` and nothing more, so a cluster
+// founded from a workstation got no advertise_address and none of the
+// new-cluster enforcement defaults — only a --local init ever wrote them.
+//
+// The block is decided from the TARGET's config (targetCfg, the text the
+// member probe read; empty when it had none), never from the invoking
+// machine's: that machine may be a workstation, or a node of some other
+// cluster whose flags have nothing to do with the one being founded. A target
+// re-initialised with --force keeps its own block, as --local keeps the local
+// one; a fresh target starts with newClusterEnforcement.
+func remoteInitSetupCommand(hostName, hostAddr, targetCfg string) string {
+	block := enforcementBlockOf(targetCfg)
+	if block == "" {
+		block = newClusterEnforcement
+	}
+	return shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block)) + " bash -s"
+}
+
+// readPeerConfig reads an existing cluster node's daemon config over SSH. It
+// returns ok=false when the node answered that it has no config. A seam so the
+// add path can be tested without a node to SSH into.
+var readPeerConfig = func(sshTarget string) (cfg string, ok bool, err error) {
+	sc, err := ssh.NewClient(sshTarget)
+	if err != nil {
+		return "", false, fmt.Errorf("SSH connect: %w", err)
+	}
+	defer sc.Close()
+	raw, runErr := sc.RunOutput(remoteConfigProbe(daemonConfigPath))
+	cfg, absent, err := classifyRemoteConfig(string(raw), runErr)
+	if err != nil {
+		return "", false, err
+	}
+	return cfg, !absent, nil
+}
+
+// addSetupEnforcement is the enforcement block `lv host add` hands the new
+// host: the CLUSTER's block, read from a node of it, verbatim — including when
+// the answer is "no block".
+//
+// Capability latches need config uniformity, so the new host must boot with
+// the flags its peers have. This used to read only the invoking machine's
+// config and fall back to nothing, so an add run from a workstation (which has
+// no daemon config) silently provisioned a host with no enforcement block.
+//
+// In order:
+//   - this machine's own daemon config, when it has one: it is a cluster node;
+//   - otherwise each join peer's config over SSH, as sshUser (the user the
+//     target is being reached as), first answer wins;
+//   - otherwise a refusal. Guessing is what the old fallback did.
+func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
+	raw, err := os.ReadFile(daemonConfigPath)
+	if err == nil {
+		return enforcementBlockOf(string(raw)), nil
+	}
+	var why []string
+	if !errors.Is(err, os.ErrNotExist) {
+		why = append(why, fmt.Sprintf("this machine's %s: %v", daemonConfigPath, err))
+	}
+	for _, p := range joinPeers {
+		host := p
+		if h, _, serr := net.SplitHostPort(p); serr == nil {
+			host = h
+		}
+		target := host
+		if sshUser != "" {
+			target = sshUser + "@" + host
+		}
+		cfg, ok, rerr := readPeerConfig(target)
+		switch {
+		case rerr != nil:
+			why = append(why, fmt.Sprintf("%s: %v", target, rerr))
+		case !ok:
+			why = append(why, fmt.Sprintf("%s: no %s", target, daemonConfigPath))
+		default:
+			return enforcementBlockOf(cfg), nil
+		}
+	}
+	return "", fmt.Errorf("could not read the cluster's enforcement block, which the new host "+
+		"must boot with so its flags match its peers': %s. Run `lv host add` on a cluster node, "+
+		"or from a machine that can SSH to one as %q", strings.Join(why, "; "), sshUser)
+}
+
+// setupScriptEnvWith is setupScriptEnv with the enforcement block decided by
+// the caller.
+func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) []string {
 	return []string{
 		"HOST_NAME=" + hostName,
 		// The address that just went into the certificate SAN. Without it the daemon
@@ -843,7 +939,7 @@ func setupScriptEnv(hostName, advertiseAddr, joinPeers string) []string {
 		// unsigned audit rows reported as tampering cluster-wide (2026-08-01).
 		// Base64: the remote path joins this env into one shell command line,
 		// so a multi-line YAML block must travel as a single token.
-		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcementYAML(daemonConfigPath, joinPeers))),
+		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcement)),
 	}
 }
 
@@ -909,7 +1005,12 @@ func enforcementYAMLFrom(path string) string {
 	if err != nil {
 		return ""
 	}
-	lines := strings.Split(string(raw), "\n")
+	return enforcementBlockOf(string(raw))
+}
+
+// enforcementBlockOf is enforcementYAMLFrom over a config's text.
+func enforcementBlockOf(raw string) string {
+	lines := strings.Split(raw, "\n")
 	var b strings.Builder
 	in := false
 	for _, line := range lines {

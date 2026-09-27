@@ -1004,9 +1004,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			s.removePromoteMarker(targetName)
 			return err
 		}
+		// Inserted "creating": assignOwnerEpochAtCreate publishes it running
+		// only once it holds a positive epoch and a marker names it.
 		rec := corrosion.VMRecord{
 			Name: targetName, HostName: s.hostName, Spec: string(specJSON),
-			State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
+			State: "creating", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 			Project: vm.Project,
 		}
 		// adopt=false: a promotion best-effort-populates vm_nics from its rebuilt
@@ -1019,9 +1021,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		}
 		// This branch and the transfer below are mutually EXCLUSIVE: a renamed
 		// promotion inserts a fresh row and no transfer ever follows it, so
-		// nothing here mints a generation. Without this the row is born running
-		// at epoch 0 and stays there — convergence early-returns on zero and the
-		// backfill is off by default.
+		// nothing here mints a generation; this assigns the first one, marks it,
+		// and publishes the row running.
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	} else {
 		// Phase 4: promotion commit is an ownership transition (fresh-read CAS + increment).

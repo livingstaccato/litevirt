@@ -69,7 +69,7 @@ type VMChecker struct {
 	probeFn ProbeFunc
 	// nicIPDiscovery replaces the owner-host ARP / dnsmasq-lease lookup behind
 	// vmAddress (SetNICIPDiscovery). nil → the real lookup.
-	nicIPDiscovery func(mac string) string
+	nicIPDiscovery func(mac, bridge string) string
 	// probes counts in-flight checkVM goroutines so SweepOnce can wait for
 	// them. Production's Start loop never waits.
 	probes sync.WaitGroup

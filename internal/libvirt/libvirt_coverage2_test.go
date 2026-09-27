@@ -697,7 +697,7 @@ func TestGenerateDomainXML_NoDisks(t *testing.T) {
 func TestGetIPFromDHCPLeases_MalformedLines(t *testing.T) {
 	tmp := t.TempDir()
 	leaseFile := tmp + "/test.leases"
-	content := "short line\n\n1234567890 52:54:00:aa:bb:cc 10.0.0.8 host *\n"
+	content := "short line\n\n4102444800 52:54:00:aa:bb:cc 10.0.0.8 host *\n"
 	if err := writeTestFile(leaseFile, content); err != nil {
 		t.Fatal(err)
 	}

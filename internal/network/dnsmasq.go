@@ -63,7 +63,7 @@ var startDHCPFunc = StartDHCP
 // (so a just-booted or quiet VM can show no IP). Without --dhcp-leasefile,
 // dnsmasq writes to its compiled-in default (/var/lib/misc/...), which the
 // scanner doesn't read.
-const dnsmasqLeaseDir = "/var/lib/libvirt/dnsmasq"
+var dnsmasqLeaseDir = "/var/lib/libvirt/dnsmasq" // a variable so a test can point it at a fixture
 
 // dnsmasqPidFile returns the pidfile path for the dnsmasq instance keyed on
 // `key`. It is the ONLY place this path is constructed: StopDHCP signals the
@@ -99,7 +99,7 @@ func dnsmasqArgs(bridge, rangeStart, rangeEnd, mask, gateway, pidFile string, up
 		"--interface=" + bridge,
 		"--except-interface=lo",
 		"--dhcp-range=" + rangeStart + "," + rangeEnd + "," + mask + ",12h",
-		"--dhcp-leasefile=" + dnsmasqLeaseDir + "/litevirt-" + bridge + ".leases",
+		"--dhcp-leasefile=" + dnsmasqLeaseFile(bridge),
 		"--bind-dynamic",
 		"--no-daemon",
 		"--pid-file=" + pidFile,

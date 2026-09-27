@@ -111,7 +111,7 @@ type Server struct {
 	// nicIPDiscovery replaces the ARP / dnsmasq-lease lookup every discovery
 	// path uses to find the address a MAC is answering on. nil in production;
 	// see SetNICIPDiscovery.
-	nicIPDiscovery func(mac string) string
+	nicIPDiscovery func(mac, bridge string) string
 
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which

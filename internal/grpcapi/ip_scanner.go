@@ -9,6 +9,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // IPScanner periodically discovers IPs for local VMs via ARP/DHCP and
@@ -72,7 +73,7 @@ func (s *IPScanner) scanVMs(ctx context.Context) {
 			if iface.IP != "" {
 				continue
 			}
-			ip := s.server.discoverNICAddress(iface.MAC)
+			ip := s.server.discoverNICAddressOnBridge(iface.MAC, network.LeaseBridge(ctx, s.db, iface.NetworkName))
 			if ip == "" {
 				continue
 			}

@@ -2,9 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/dns"
 )
@@ -41,6 +43,39 @@ func TestIPScanner_ScanSkipsVMsWithIP(t *testing.T) {
 	// scan should skip VMs that already have IPs (no ARP/DHCP lookup).
 	// Since there's no real ARP table, scan just returns without changes.
 	scanner.scan(ctx) // should not panic
+}
+
+// The scanner looks a NIC's address up on the bridge its network leases on,
+// so another bridge's lease for the MAC (a deprovisioned network's leftover
+// file, a network the guest left) is never recorded as its address.
+func TestIPScanner_DiscoversOnTheNICsBridge(t *testing.T) {
+	s := testServer(t)
+	ctx := context.Background()
+	cfg, _ := json.Marshal(compose.NetworkDef{Interface: "br-lan"})
+	if err := corrosion.UpsertNetwork(ctx, s.db, corrosion.NetworkRecord{Name: "lan", Type: "bridge", Config: string(cfg)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "web", HostName: "test-host", State: "running",
+	}, []corrosion.InterfaceRecord{
+		{VMName: "web", NetworkName: "lan", MAC: "52:54:00:11:22:44"},
+	}, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	s.setNICIPDiscoveryOnBridge(func(mac, bridge string) string {
+		if bridge == "br-lan" {
+			return "10.0.60.5"
+		}
+		return "10.0.99.5" // another bridge's stale lease
+	})
+	NewIPScanner(s).scan(ctx)
+	ifaces, err := corrosion.GetVMInterfaces(ctx, s.db, "web")
+	if err != nil || len(ifaces) != 1 {
+		t.Fatalf("GetVMInterfaces: %v %v", ifaces, err)
+	}
+	if ifaces[0].IP != "10.0.60.5" {
+		t.Fatalf("recorded IP = %q, want 10.0.60.5 from the NIC's bridge br-lan", ifaces[0].IP)
+	}
 }
 
 func TestIPScanner_ScanSkipsNonRunning(t *testing.T) {

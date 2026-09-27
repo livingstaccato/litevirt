@@ -349,7 +349,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		// Stop DHCP and remove gateway IP + NAT if subnet was configured.
 		if def.Subnet != "" {
 			pidFile := dnsmasqPidFile(bridge)
-			StopDHCP(pidFile) //nolint:errcheck
+			stopDHCPAndForgetLeases(pidFile, bridge)
 			// Remove the gateway IP that StartDHCP added to the bridge.
 			//
 			// SubnetRange already returns the gateway WITH its prefix (see
@@ -383,7 +383,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 			RemoveIRB(vni, def.Subnet)    //nolint:errcheck
 			RemoveNAT(def.Subnet, bridge) //nolint:errcheck
 			pidFile := dnsmasqPidFileVNI(vni)
-			StopDHCP(pidFile) //nolint:errcheck
+			stopDHCPAndForgetLeases(pidFile, bridge)
 		}
 		return DeprovisionVXLAN(vni)
 
@@ -394,7 +394,7 @@ func Deprovision(ctx context.Context, db *corrosion.Client, networkName string, 
 		// Stop DHCP if subnet was configured.
 		if def.Subnet != "" {
 			pidFile := dnsmasqPidFile(bridge)
-			StopDHCP(pidFile) //nolint:errcheck
+			stopDHCPAndForgetLeases(pidFile, bridge)
 		}
 		// Delete the isolated bridge (litevirt created it, safe to remove).
 		out, err := execCommand("ip", "link", "del", bridge)

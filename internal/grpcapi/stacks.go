@@ -924,10 +924,21 @@ func (s *Server) DeleteStack(req *pb.DeleteStackRequest, stream grpc.ServerStrea
 	// unknown, and guessing "none" deletes networks the stack never made. So
 	// none is deprovisioned; the stack stays in "deleting", and the error says
 	// why.
+	//
+	// While any of the stack's workloads is left (its delete failed, above),
+	// none of its networks is deprovisioned either: the tombstone reaches every
+	// host and would tear the network down under that workload. The stack stays
+	// in "deleting", and the StackReconciler removes the networks once the
+	// workloads are gone. The workload failure is already on the stream.
+	workloadsLeft := hadFailures
 	externalNets := externalNetworksOf(stored, req.Name)
 	nets, _ := corrosion.ListNetworks(ctx, s.db)
+	if workloadsLeft {
+		notRemoved = append(notRemoved, "networks (kept while workloads remain)")
+		nets = nil
+	}
 	knownStacks, ksErr := s.knownStackNames(ctx)
-	if ksErr != nil && storedErr == nil {
+	if ksErr != nil && storedErr == nil && !workloadsLeft {
 		// Without the other stacks' names, a "<stack>_" prefix cannot tell this
 		// stack's rows from a longer-named stack's. Networks naming this stack
 		// are still removed; unnamed ones wait for the reconciler.
@@ -1139,6 +1150,14 @@ func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRe
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	return s.DeleteVM(authCtx, req)
+}
+
+// DeleteContainerForStackCleanup is DeleteVMForStackCleanup for a stack's
+// container: DeleteContainer under the reconciler's system principal.
+func (s *Server) DeleteContainerForStackCleanup(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
+	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
+	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
+	return s.DeleteContainer(authCtx, req)
 }
 
 // RemoveLBForStack exposes removeLBForStack for the StackReconciler.

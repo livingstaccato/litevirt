@@ -105,6 +105,27 @@ func CountVMsOnNetwork(ctx context.Context, c *Client, networkName string) (int,
 	return rows[0].Int("cnt"), nil
 }
 
+// CountWorkloadsOnNetwork counts the VMs (by a live vm_interfaces or vm_nics
+// row) and the containers (by a live container_interfaces row) with a NIC on
+// networkName, on any host.
+func CountWorkloadsOnNetwork(ctx context.Context, c *Client, networkName string) (vms, containers int, err error) {
+	rows, err := c.Query(ctx,
+		`SELECT
+		   (SELECT COUNT(DISTINCT vm_name) FROM (
+		      SELECT vm_name FROM vm_interfaces WHERE network_name = ? AND deleted_at IS NULL
+		      UNION SELECT vm_name FROM vm_nics WHERE network_name = ? AND deleted_at IS NULL)) AS vms,
+		   (SELECT COUNT(DISTINCT host_name || '/' || ct_name) FROM container_interfaces
+		      WHERE network_name = ? AND deleted_at IS NULL) AS cts`,
+		networkName, networkName, networkName)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(rows) == 0 {
+		return 0, 0, nil
+	}
+	return rows[0].Int("vms"), rows[0].Int("cts"), nil
+}
+
 // ListNetworksByHost returns networks relevant to a host — those with VTEPs
 // on the host or VMs on the host attached to them.
 func ListNetworksByHost(ctx context.Context, c *Client, hostName string) ([]NetworkRecord, error) {

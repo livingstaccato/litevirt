@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"unicode"
 )
 
@@ -65,6 +66,37 @@ func validLinkName(name string) error {
 		}
 	}
 	return nil
+}
+
+// BridgeGuestPorts lists the guest devices plugged into bridge name on this
+// host: a VM's tap (a tun device, which has tun_flags in sysfs) or a
+// container's veth (litevirt names them "lvc…"; LXC's own default is
+// "veth…"). An uplink — a NIC, bond or VLAN sub-interface enslaved to an
+// infrastructure bridge — is not a guest and is not listed. An absent bridge,
+// or a name that is not an interface name, has none.
+func BridgeGuestPorts(name string) ([]string, error) {
+	if validLinkName(name) != nil {
+		return nil, nil
+	}
+	ports, err := os.ReadDir(filepath.Join(sysClassNet, name, "brif"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range ports {
+		port := p.Name()
+		if strings.HasPrefix(port, "lvc") || strings.HasPrefix(port, "veth") {
+			out = append(out, port)
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(sysClassNet, port, "tun_flags")); err == nil {
+			out = append(out, port)
+		}
+	}
+	return out, nil
 }
 
 // RemoveBridgeIfUnused deletes bridge name from this host when it exists, is

@@ -166,11 +166,15 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 			delete(st.applied, r.name)
 			continue
 		}
+		if s.teardownWaitsForLocalUse(ctx, st, r.name, network.BridgeName(r.name, def)) {
+			continue // not torn: retried next pass
+		}
 		if err := prov.Deprovision(ctx, s.db, r.name, def, s.hostName); err != nil {
 			slog.Warn("network reconcile: tear down deleted network failed (will retry)",
 				"network", r.name, "error", err)
 			continue
 		}
+		delete(st.lastErr, "teardown:"+r.name)
 		st.torn[r.name] = r.deletedAt
 		delete(st.applied, r.name)
 		changed = true
@@ -182,6 +186,9 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 	}
 	for name, a := range st.applied {
 		if present[name] {
+			continue
+		}
+		if s.teardownWaitsForLocalUse(ctx, st, name, network.BridgeName(name, a.def)) {
 			continue
 		}
 		if err := prov.Deprovision(ctx, s.db, name, a.def, s.hostName); err != nil {
@@ -231,6 +238,59 @@ func (s *Server) ReconcileNetworksOnce(ctx context.Context) error {
 	s.reconcileLegacyNICs(ctx)
 	s.removeLeftoverStackBridges(ctx, st)
 	return nil
+}
+
+// teardownWaitsForLocalUse reports whether the teardown of deleted network
+// name must wait because something on THIS host still uses it
+// (networkUseHere), logging once per distinct reason. A use that cannot be
+// read waits too: tearing down a network a guest is on is not undoable.
+func (s *Server) teardownWaitsForLocalUse(ctx context.Context, st *netReconcileState, name, bridge string) bool {
+	what, err := s.networkUseHere(ctx, name, bridge)
+	if err == nil && what == "" {
+		return false
+	}
+	reason := what
+	if err != nil {
+		reason = "unknown: " + err.Error()
+	}
+	if key := "teardown:" + name; st.lastErr[key] != reason {
+		st.lastErr[key] = reason
+		slog.Info("network reconcile: a deleted network is still in use on this host; teardown waits",
+			"network", name, "in_use_by", reason)
+	}
+	return true
+}
+
+// networkUseHere names something on THIS host that still uses network name —
+// a live NIC row (vm_interfaces or vm_nics of a live VM on this host, or
+// container_interfaces for this host), or a guest port on its bridge — or ""
+// when nothing does.
+func (s *Server) networkUseHere(ctx context.Context, name, bridge string) (string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT 'VM ' || i.vm_name AS what FROM vm_interfaces i JOIN vms v ON v.name = i.vm_name
+		  WHERE i.network_name = ? AND i.deleted_at IS NULL AND v.deleted_at IS NULL AND v.host_name = ?
+		 UNION ALL
+		 SELECT 'VM ' || n.vm_name AS what FROM vm_nics n JOIN vms v ON v.name = n.vm_name
+		  WHERE n.network_name = ? AND n.deleted_at IS NULL AND v.deleted_at IS NULL AND v.host_name = ?
+		 UNION ALL
+		 SELECT 'container ' || ct_name AS what FROM container_interfaces
+		  WHERE network_name = ? AND deleted_at IS NULL AND host_name = ?
+		 LIMIT 1`,
+		name, s.hostName, name, s.hostName, name, s.hostName)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) > 0 {
+		return rows[0].String("what"), nil
+	}
+	ports, err := s.networkProvisioner().GuestPorts(bridge)
+	if err != nil {
+		return "", err
+	}
+	if len(ports) > 0 {
+		return "guest port " + ports[0] + " on " + bridge, nil
+	}
+	return "", nil
 }
 
 func (s *Server) noteNetworkReconcileErr(st *netReconcileState, name string, err error) {

@@ -27,6 +27,9 @@ type NetworkProvisioner interface {
 	// whether it did. Absent is not an error; an invalid interface name or
 	// unreadable addresses are.
 	RemoveUnusedBridge(name string) (bool, error)
+	// GuestPorts lists the guest devices (VM taps, container veths) plugged
+	// into bridge on this host. An absent bridge has none.
+	GuestPorts(bridge string) ([]string, error)
 }
 
 type hostNetworkProvisioner struct{}
@@ -45,6 +48,10 @@ func (hostNetworkProvisioner) Provisioned(name string, def compose.NetworkDef) b
 
 func (hostNetworkProvisioner) RemoveUnusedBridge(name string) (bool, error) {
 	return network.RemoveBridgeIfUnused(name)
+}
+
+func (hostNetworkProvisioner) GuestPorts(bridge string) ([]string, error) {
+	return network.BridgeGuestPorts(bridge)
 }
 
 // SetNetworkProvisioner replaces the host network provisioner (tests only;

@@ -146,7 +146,11 @@ with the cluster's network table every 30 seconds, and at startup:
   pidfile is removed instead, so the next pass finds nothing to do.
 - a deleted network is torn down. This is how `lv network delete` and a stack
   delete reach every node, including one that was down at the time: it tears
-  down when it comes back.
+  down when it comes back. A node tears a deleted network down only once
+  nothing on it uses the network — no VM or container on that node has a NIC
+  on it, and its bridge carries no guest port (a VM tap or a container veth).
+  Until then it tries again every pass. This is what keeps
+  `lv network delete --force` from cutting off the guests still on it.
 
 A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.

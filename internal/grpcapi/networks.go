@@ -213,16 +213,29 @@ func (s *Server) DeleteNetwork(ctx context.Context, req *pb.DeleteNetworkRequest
 		return nil, err
 	}
 
-	// Check if VMs are still using this network.
-	count, _ := corrosion.CountVMsOnNetwork(ctx, s.db, req.Name)
-	if count > 0 && !req.Force {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"network %q has %d VM(s) attached — use --force to delete anyway", req.Name, count)
+	// Check if VMs or containers are still using this network. Fail closed:
+	// a count that cannot be read is not zero.
+	if !req.Force {
+		vms, cts, err := corrosion.CountWorkloadsOnNetwork(ctx, s.db, req.Name)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal,
+				"count the workloads on network %q: %v — use --force to delete anyway", req.Name, err)
+		}
+		if vms > 0 || cts > 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"network %q has %d VM(s) and %d container(s) attached — use --force to delete anyway",
+				req.Name, vms, cts)
+		}
 	}
 
-	// Deprovision the network infrastructure.
+	// Deprovision the network infrastructure — unless a workload on this host
+	// still uses it (a --force delete). Then the network reconciler tears it
+	// down here once nothing on this host uses it, as on every other host.
 	def := networkRecordToDef(nr)
-	if err := s.networkProvisioner().Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
+	if what, err := s.networkUseHere(ctx, req.Name, network.BridgeName(req.Name, def)); err != nil || what != "" {
+		slog.Warn("network deleted; its teardown on this host waits until nothing here uses it",
+			"network", req.Name, "in_use_by", what, "error", err)
+	} else if err := s.networkProvisioner().Deprovision(ctx, s.db, req.Name, def, s.hostName); err != nil {
 		slog.Warn("network deprovision failed", "network", req.Name, "error", err)
 	}
 	s.reconcileFirewall(ctx) // drop this network's NAT/isolation from the ruleset now

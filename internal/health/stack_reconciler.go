@@ -19,6 +19,8 @@ type StackCleaner interface {
 	// RBAC-gated — calling it directly fails "no authenticated principal" every time and
 	// the retry loop spins forever. The implementation attaches a system principal.
 	DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error)
+	// DeleteContainerForStackCleanup is the same for a stack's container.
+	DeleteContainerForStackCleanup(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error)
 	RemoveLBForStack(ctx context.Context, stackName string, vms []corrosion.VMRecord)
 	DeprovisionNetworkByName(ctx context.Context, name string) error
 	ExternalNetworkNames(ctx context.Context, stackName string) (map[string]bool, error)
@@ -94,10 +96,35 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 		}
 	}
 
+	// 1b. Delete remaining containers (tagged with the stack label).
+	remainingCTs := 0
+	cts, err := corrosion.ListContainersByStack(ctx, r.db, stack.Name)
+	if err != nil {
+		slog.Warn("stack-reconciler: list containers failed, will retry",
+			"stack", stack.Name, "error", err)
+		remainingCTs++
+	}
+	for _, ct := range cts {
+		if _, err := r.cleaner.DeleteContainerForStackCleanup(ctx,
+			&pb.DeleteContainerRequest{HostName: ct.HostName, Name: ct.Name}); err != nil {
+			slog.Warn("stack-reconciler: delete container failed, will retry",
+				"stack", stack.Name, "container", ct.Name, "host", ct.HostName, "error", err)
+			remainingCTs++
+		}
+	}
+
 	// 2. Ensure LB config is soft-deleted and processes are stopped.
 	lbName := stack.Name + "-lb"
 	_ = corrosion.SoftDeleteLBConfig(ctx, r.db, lbName)
 	r.cleaner.RemoveLBForStack(ctx, stack.Name, vms)
+
+	// While a workload is left, its networks stay: a network tombstone reaches
+	// every host and would tear the network down under that workload.
+	if remainingVMs > 0 || remainingCTs > 0 {
+		slog.Info("stack-reconciler: stack still has workloads, networks kept; will retry",
+			"stack", stack.Name, "remaining_vms", remainingVMs, "remaining_containers", remainingCTs)
+		return
+	}
 
 	// 3. Deprovision remaining networks.
 	// When the stored compose cannot be read, which networks are external
@@ -120,13 +147,7 @@ func (r *StackReconciler) reconcileStack(ctx context.Context, stack corrosion.St
 		}
 	}
 
-	// 4. If all VMs are gone, tombstone the stack.
-	if remainingVMs > 0 {
-		slog.Info("stack-reconciler: stack still has resources, will retry",
-			"stack", stack.Name, "remaining_vms", remainingVMs)
-		return
-	}
-
+	// 4. All workloads are gone: tombstone the stack.
 	// Hard-delete the LB config now that everything is cleaned up.
 	_ = corrosion.SoftDeleteLBConfig(ctx, r.db, lbName)
 	corrosion.SoftDeleteLBBackends(ctx, r.db, lbName)

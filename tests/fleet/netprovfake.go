@@ -25,6 +25,7 @@ type NetProvFake struct {
 	deprovisions map[string]int    // network → Deprovision calls
 	flat         map[string]bool   // bridges EnsureBridge created (flat-bridge fallback)
 	busy         map[string]bool   // flat bridges a scenario says have a port attached
+	guestPorts   map[string][]string
 }
 
 func NewNetProvFake() *NetProvFake {
@@ -88,6 +89,24 @@ func (f *NetProvFake) RemoveUnusedBridge(name string) (bool, error) {
 	}
 	delete(f.flat, name)
 	return true, nil
+}
+
+// GuestPorts lists the guest ports a scenario put on bridge (SetGuestPorts).
+func (f *NetProvFake) GuestPorts(bridge string) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.guestPorts[bridge]...), nil
+}
+
+// SetGuestPorts sets the guest devices plugged into bridge on this node; no
+// ports clears them.
+func (f *NetProvFake) SetGuestPorts(bridge string, ports ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.guestPorts == nil {
+		f.guestPorts = map[string][]string{}
+	}
+	f.guestPorts[bridge] = ports
 }
 
 // SetBridgeBusy marks a flat bridge as having a port attached, so

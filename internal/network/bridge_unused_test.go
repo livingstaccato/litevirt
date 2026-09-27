@@ -9,6 +9,37 @@ import (
 	"testing"
 )
 
+// A guest port is a VM tap (tun_flags in sysfs) or a container veth; an
+// infrastructure bridge's uplink is not.
+func TestBridgeGuestPorts(t *testing.T) {
+	root := t.TempDir()
+	sysClassNet = root
+	defer func() { sysClassNet = "/sys/class/net" }()
+	for _, p := range []string{"br0/bridge", "br0/brif", "vnet3", "eth0", "bond0"} {
+		if err := os.MkdirAll(filepath.Join(root, p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, port := range []string{"vnet3", "eth0", "lvc0123456789ab", "vethX1", "bond0"} {
+		if err := os.WriteFile(filepath.Join(root, "br0", "brif", port), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "vnet3", "tun_flags"), []byte("0x1002\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := BridgeGuestPorts("br0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "lvc0123456789ab,vethX1,vnet3" {
+		t.Errorf("BridgeGuestPorts(br0) = %v, want the tap and the two veths, not eth0 or bond0", got)
+	}
+	if got, err := BridgeGuestPorts("absent"); err != nil || len(got) != 0 {
+		t.Errorf("BridgeGuestPorts(absent) = %v, %v; want none", got, err)
+	}
+}
+
 func TestRemoveBridgeIfUnused(t *testing.T) {
 	root := t.TempDir()
 	sysClassNet = root

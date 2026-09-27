@@ -128,7 +128,11 @@ container name, `network <name>`, or `containers (list failed)`), the success li
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 (web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
 the teardown in the background, and the `stack.delete` audit entry has result
-`error` and names what was not removed. The web UI's stack **Destroy** action
+`error` and names what was not removed. While any of the stack's VMs or
+containers is left, none of its networks is deprovisioned: a deleted network
+is torn down on every host, and would be pulled out from under that workload.
+The background retry deletes the remaining VMs and containers first, and
+removes the networks only once they are all gone. The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.

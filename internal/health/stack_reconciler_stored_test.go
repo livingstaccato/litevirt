@@ -18,6 +18,9 @@ type unreadableStackCleaner struct {
 func (c *unreadableStackCleaner) DeleteVMForStackCleanup(context.Context, *pb.DeleteVMRequest) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
+func (c *unreadableStackCleaner) DeleteContainerForStackCleanup(context.Context, *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
+	return &emptypb.Empty{}, nil
+}
 func (c *unreadableStackCleaner) RemoveLBForStack(context.Context, string, []corrosion.VMRecord) {}
 func (c *unreadableStackCleaner) DeprovisionNetworkByName(_ context.Context, name string) error {
 	c.deprovisioned = append(c.deprovisioned, name)

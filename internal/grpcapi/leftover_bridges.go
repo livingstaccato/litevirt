@@ -3,7 +3,6 @@ package grpcapi
 import (
 	"context"
 	"log/slog"
-	"strings"
 
 	"github.com/litevirt/litevirt/internal/network"
 )
@@ -18,8 +17,8 @@ import (
 //   - it is the network name some litevirt NIC row used, and no live NIC row
 //     anywhere uses it now,
 //   - no network record has that name, and no network's bridge has it,
-//   - on this host it is a bridge with no ports and no IPv4 address
-//     (NetworkProvisioner.RemoveUnusedBridge checks that).
+//   - on this host it is a bridge with no ports and no address beyond an
+//     IPv6 link-local one (NetworkProvisioner.RemoveUnusedBridge checks that).
 //
 // litevirt keeps no marker saying it created a bridge, so this pattern is the
 // proof. An operator's own bridge would need an operator to have pointed a
@@ -33,8 +32,10 @@ func (s *Server) removeLeftoverStackBridges(ctx context.Context, _ *netReconcile
 		slog.Warn("network reconcile: list leftover stack bridges", "error", err)
 		return
 	}
+	// Each name is checked again right before its removal: a network created
+	// under it since the scan read the tables owns a fresh bridge of that name.
 	for _, name := range names {
-		s.removeBridgeIfUnusedHere(name)
+		s.removeStackBridgeIfUnused(ctx, name)
 	}
 }
 
@@ -97,13 +98,11 @@ func (s *Server) unusedStackFlatBridgeNames(ctx context.Context, only string) ([
 			stacks = append(stacks, n)
 		}
 	}
+	// Attributed the way a stack's networks are (stackOwningName): to the
+	// longest known stack a "<stack>_" prefix names, since stack names may
+	// themselves contain "_".
 	isStackScoped := func(name string) bool {
-		for _, st := range stacks {
-			if strings.HasPrefix(name, st+"_") && len(name) > len(st)+1 {
-				return true
-			}
-		}
-		return false
+		return stackOwningName(name, stacks) != ""
 	}
 	live := map[string]bool{}
 	var candidates []string

@@ -198,6 +198,6 @@ func newNetworkRmCmd() *cobra.Command {
 			})
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "Delete even if VMs are attached")
+	cmd.Flags().BoolVar(&force, "force", false, "Delete even if VMs or containers are attached (each host tears it down once nothing there uses it)")
 	return cmd
 }

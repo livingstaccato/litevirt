@@ -22,9 +22,13 @@ func TestNetworkBelongsToStack(t *testing.T) {
 		{"unrelated network", corrosion.NetworkRecord{Name: "br0", StackName: ""}, "lbmix", false},
 		{"other stack's network", corrosion.NetworkRecord{Name: "other_net", StackName: "other"}, "lbmix", false},
 		{"empty stack name never matches", corrosion.NetworkRecord{Name: "_x", StackName: ""}, "", false},
+		{"a longer stack's named row", corrosion.NetworkRecord{Name: "lbmix_v2_net", StackName: "lbmix_v2"}, "lbmix", false},
+		{"a longer known stack's unnamed row", corrosion.NetworkRecord{Name: "lbmix_v2_net", StackName: ""}, "lbmix", false},
+		{"the longer stack claims its unnamed row", corrosion.NetworkRecord{Name: "lbmix_v2_net", StackName: ""}, "lbmix_v2", true},
 	}
+	known := []string{"lbmix", "lbmix_v2", "other"}
 	for _, c := range cases {
-		if got := networkBelongsToStack(c.nr, c.stack); got != c.want {
+		if got := networkBelongsToStack(c.nr, c.stack, known); got != c.want {
 			t.Errorf("%s: networkBelongsToStack(%+v, %q) = %v, want %v", c.name, c.nr, c.stack, got, c.want)
 		}
 	}

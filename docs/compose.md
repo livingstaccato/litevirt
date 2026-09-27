@@ -128,7 +128,11 @@ container name, `network <name>`, or `containers (list failed)`), the success li
 exits non-zero with a summary such as `stack "web": 1 of 3 deletions failed
 (web-2)`. The stack is then left in state `deleting`, the daemon keeps retrying
 the teardown in the background, and the `stack.delete` audit entry has result
-`error` and names what was not removed. The web UI's stack **Destroy** action
+`error` and names what was not removed. While any of the stack's VMs or
+containers is left, none of its networks is deprovisioned: a deleted network
+is torn down on every host, and would be pulled out from under that workload.
+The background retry deletes the remaining VMs and containers first, and
+removes the networks only once they are all gone. The web UI's stack **Destroy** action
 reports the same way: it says the stack was destroyed only after a complete
 teardown, and otherwise shows an error naming each failure and stays on the
 page.
@@ -722,7 +726,7 @@ What the file is compared with is the spec each VM was deployed from, not what i
 
 A VM left in `error` (or mid-create, -start, -stop or -rebuild) by an operation that did not finish is **retried** by the next deploy, and a retry never replaces disks that exist:
 
-- **`retry — repaired in place, disks kept`** — disks are recorded for the VM: its domain is redefined from the desired spec over those disks (whether or not the domain is still defined) and started. Same disks, same MACs, same identity. A repair that fails is reported as a failed action and leaves the VM in `error`; it never falls back to a recreate.
+- **`retry — repaired in place, disks kept`** — disks are recorded for the VM: its domain is redefined from the desired spec over those disks (whether or not the domain is still defined) and started. Same disks, same MACs, same identity. The start is checked like `lv start`: it is refused without split-brain quorum, when the host has no room for the whole VM, or while the VM backs linked clones. A VM another operation is working on — one with a pending action, or one a failover or restart holds the start lease for — is not touched, and neither is one whose domain cannot be asked whether it runs. A refused repair changes nothing. A repair that fails is reported as a failed action and leaves the VM as it was; it never falls back to a recreate.
 - **`retry — created again (nothing was made)`** — no disks were made (the create failed before them), so the VM is created from scratch.
 
 A retry whose compose change is itself a change of identity (an image change, say) is a `recreate — disks are replaced` like any other.
@@ -979,6 +983,10 @@ network, the move is refused for that VM and the VM is left as it is.
 
 Networks the file declares belong to the stack. They are stored as
 `<stack>_<name>`, so two stacks can each have a network called `lan`.
+Deleting a stack removes the networks recorded as that stack's. A network
+record that names no stack is matched by its `<stack>_` prefix, and goes to the
+longest stack name that fits: deleting stack `app` leaves `app_v2_lan` to stack
+`app_v2`.
 
 ## Volume definitions
 

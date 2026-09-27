@@ -23,9 +23,13 @@ type NetworkProvisioner interface {
 	// be cheap: the network reconciler asks it for every network every pass.
 	Provisioned(name string, def compose.NetworkDef) bool
 	// RemoveUnusedBridge deletes bridge name from this host if it is a bridge
-	// with no ports and no IPv4 address, and reports whether it did. Absent is
-	// not an error.
+	// with no ports and no address beyond an IPv6 link-local one, and reports
+	// whether it did. Absent is not an error; an invalid interface name or
+	// unreadable addresses are.
 	RemoveUnusedBridge(name string) (bool, error)
+	// GuestPorts lists the guest devices (VM taps, container veths) plugged
+	// into bridge on this host. An absent bridge has none.
+	GuestPorts(bridge string) ([]string, error)
 }
 
 type hostNetworkProvisioner struct{}
@@ -44,6 +48,10 @@ func (hostNetworkProvisioner) Provisioned(name string, def compose.NetworkDef) b
 
 func (hostNetworkProvisioner) RemoveUnusedBridge(name string) (bool, error) {
 	return network.RemoveBridgeIfUnused(name)
+}
+
+func (hostNetworkProvisioner) GuestPorts(bridge string) ([]string, error) {
+	return network.BridgeGuestPorts(bridge)
 }
 
 // SetNetworkProvisioner replaces the host network provisioner (tests only;

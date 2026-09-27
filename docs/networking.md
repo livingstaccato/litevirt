@@ -138,10 +138,19 @@ with the cluster's network table every 30 seconds, and at startup:
   later, and a node that restarted (`dnsmasq` dies with the daemon).
 - a network it set up but has since lost is provisioned again: its bridge is
   gone, or its `dnsmasq` died. The check reads the kernel's interface table and
-  the `dnsmasq` pidfile, so it costs no commands per pass.
+  the `dnsmasq` pidfile, so it costs no commands per pass. A litevirt
+  `dnsmasq` pidfile is the record that litevirt served DHCP on that bridge:
+  when its `dnsmasq` died, provisioning starts it again, even on a bridge that
+  now exists. Where this host serves no DHCP for the network (a vxlan host that
+  is no longer the gateway, a host-isolated network), a dead `dnsmasq`'s
+  pidfile is removed instead, so the next pass finds nothing to do.
 - a deleted network is torn down. This is how `lv network delete` and a stack
   delete reach every node, including one that was down at the time: it tears
-  down when it comes back.
+  down when it comes back. A node tears a deleted network down only once
+  nothing on it uses the network — no VM or container on that node has a NIC
+  on it, and its bridge carries no guest port (a VM tap or a container veth).
+  Until then it tries again every pass. This is what keeps
+  `lv network delete --force` from cutting off the guests still on it.
 
 A deleted network whose bridge a live network still uses is left alone, so
 the live one keeps its bridge, gateway and `dnsmasq`.
@@ -150,7 +159,10 @@ The same pass removes a leftover flat stack bridge: a bridge named
 `<stack>_<name>` that a NIC was once plugged into because that name had no
 network, and that no NIC uses now. It is removed only when no network has that
 name or bridge, no live NIC names it, and on the host it has no ports and no
-IPv4 address. See [compose.md](compose.md#external-networks) for how such a NIC
+address other than the kernel's own IPv6 link-local (`fe80::`) one. A bridge
+whose addresses cannot be read is left alone. Each name is checked again right
+before its bridge is removed, so a network created under that name in the
+meantime keeps its bridge. See [compose.md](compose.md#external-networks) for how such a NIC
 is moved.
 
 Creating a VM, migrating one, and restarting one after a failover also

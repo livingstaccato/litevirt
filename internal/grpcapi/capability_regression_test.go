@@ -17,19 +17,21 @@ func TestCheckOneCapabilityHealth_DetectsPostLatchRegression(t *testing.T) {
 	// Both configured-on tokens already latched; split_brain still confirms active,
 	// but lww's peer support regressed (CapabilityActiveForHealth → false).
 	//
-	// lease_term_ledger_v1 is latched too, not because this test is about it but
-	// because it has no kill switch: an unlatched one would consume the driver's
-	// one-per-cycle budget and the loop below would never reach the freshness
-	// check it is actually asserting on.
+	// lease_term_ledger_v1 and credentials_split_v1 are latched too, not because
+	// this test is about them but because they have no kill switch: an
+	// unlatched one would consume the driver's one-per-cycle budget and the loop
+	// below would never reach the freshness check it is actually asserting on.
 	g.latched = map[string]bool{
-		capabilities.SplitBrainGateV1:  true,
-		capabilities.LeaseTermLedgerV1: true,
-		capabilities.LWWSkewGuardV1:    true,
+		capabilities.SplitBrainGateV1:   true,
+		capabilities.LeaseTermLedgerV1:  true,
+		capabilities.CredentialsSplitV1: true,
+		capabilities.LWWSkewGuardV1:     true,
 	}
 	g.enforcedTok = map[string]bool{
-		capabilities.SplitBrainGateV1:  true,  // still active
-		capabilities.LeaseTermLedgerV1: true,  // still active
-		capabilities.LWWSkewGuardV1:    false, // regressed: a peer stopped advertising
+		capabilities.SplitBrainGateV1:   true,  // still active
+		capabilities.LeaseTermLedgerV1:  true,  // still active
+		capabilities.CredentialsSplitV1: true,  // still active
+		capabilities.LWWSkewGuardV1:     false, // regressed: a peer stopped advertising
 	}
 	s := testServer(t) // real db so evaluateHADegraded's stranded-pending query is safe
 	s.gate = g

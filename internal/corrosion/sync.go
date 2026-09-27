@@ -249,12 +249,13 @@ type syncTable struct {
 }
 
 // tableNames are the tables carried by the public full-state dump. Wholly
-// secret-bearing tables stay out of this list (see sensitiveTableNames), but
-// some tables here still hold secret COLUMNS — hosts.ipmi_pass,
-// users.password_hash, tokens.token_hash — and the dump carries them
-// unredacted, because it is the repair representation. That is why
-// GetStateDump/StreamStateDump are peer-only (host certificate); no operator
-// credential reads this dump.
+// secret-bearing tables stay out of this list (see sensitiveTableNames). Three
+// tables here still have a secret COLUMN — hosts.ipmi_pass,
+// users.password_hash, tokens.token_hash — whose value lives in a sensitive
+// credential table once credentials_split_v1 has latched and each node has
+// cleared the column (credentials_split.go). Until then the dump carries them
+// unredacted, because it is the repair representation, which is one reason
+// GetStateDump/StreamStateDump are peer-only (host certificate).
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
 	"health_conditions", "health_evaluator_status", "host_capacity_observations",
@@ -340,6 +341,11 @@ var sensitiveTableNames = []string{
 	// cluster-wide. The pull applier is always a v38 node (it runs this code), so no
 	// LWW-only node ever merges a proof.
 	"runtime_action_proofs",
+	// v56 credentials: the secret halves of hosts, users and tokens. Written
+	// only once credentials_split_v1 has latched (credentials_split.go).
+	"host_fence_credentials",
+	"user_credentials",
+	"token_credentials",
 }
 
 func tableSet(tables []string) map[string]bool {

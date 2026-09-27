@@ -98,6 +98,12 @@ func TestPublicDumpExcludesSensitiveState(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// v56 credentials: written only once credentials_split_v1 has latched.
+	c.SetCredentialsSplitGate(func() bool { return true })
+	seedSecrets(t, c, "$2a$10$user-cred-hash", "$2a$10$token-cred-hash", "bmc-cred-secret")
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
 
 	publicPayload, err := decompressPayload(c.DumpStateBytes())
 	if err != nil {

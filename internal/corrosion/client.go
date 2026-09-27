@@ -288,6 +288,14 @@ type Client struct {
 	// predicate fails CLOSED when unset.
 	leaseTermLedger func() bool
 
+	// credentialsSplit, when non-nil and returning true, permits WRITING the
+	// sensitive credential tables (host_fence_credentials, user_credentials,
+	// token_credentials). Injected via SetCredentialsSplitGate, wired to
+	// DurablyLatched(CredentialsSplitV1). Fails CLOSED when unset, for the
+	// leaseTermLedger reason: those tables' shapes back-pressure a
+	// previous-release peer. See credentials_split.go.
+	credentialsSplit func() bool
+
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
 	// minted random id. Gated on `enforcement.canonical_identity && CanonicalIdentityV1

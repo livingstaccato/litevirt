@@ -432,6 +432,9 @@ type Coordinators struct {
 // FenceCall is one fence a coordinator issued.
 type FenceCall struct {
 	By, Target string
+	// IPMIPass is the BMC password the coordinator handed the fencer — what
+	// an `ipmi` fence would authenticate with.
+	IPMIPass string
 }
 
 // NewCoordinators builds a coordinator on every node.
@@ -443,7 +446,7 @@ func (c *Cluster) NewCoordinators(clock *VirtualClock) *Coordinators {
 		coord.Now = clock.Now
 		coord.SetFencer(func(_ context.Context, h fence.HostConfig) fence.Result {
 			cs.mu.Lock()
-			cs.fences = append(cs.fences, FenceCall{By: by, Target: h.Name})
+			cs.fences = append(cs.fences, FenceCall{By: by, Target: h.Name, IPMIPass: h.IPMIPass})
 			cs.mu.Unlock()
 			return fence.Result{Method: "fleet-test", Success: true}
 		})

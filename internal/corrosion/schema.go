@@ -400,7 +400,20 @@ import (
 //	     deliberately PLAIN rather than partial on deleted_at: the guard counts
 //	     tombstones too, so a `WHERE deleted_at IS NULL` index would not serve
 //	     the query and the scan would grow with every proof ever written.
-const CurrentSchemaVersion = 55
+//	v56: secret columns move to the sensitive lane — host_fence_credentials
+//	     (host_name PK, ipmi_pass), user_credentials (username PK,
+//	     password_hash) and token_credentials (token_id PK, token_hash), all
+//	     in sensitiveTableNames so the operator-safe state dump never carries
+//	     them. hosts.ipmi_pass, users.password_hash and tokens.token_hash stay
+//	     (migrations are additive-only), and a previous-release node still
+//	     reads them, so nothing is written to the new tables until
+//	     credentials_split_v1 latches — a latch that cannot form while any
+//	     replication recipient is on the previous build. Once it has, each
+//	     node copies the old columns across and clears them. No created_at:
+//	     every node backfills the same row, and a per-node creation instant
+//	     would turn identical rows into a permanent equal-timestamp content
+//	     tie. Three new tables.
+const CurrentSchemaVersion = 56
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2492,6 +2505,31 @@ var schemaDDL = []string{
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT
 	)`,
+	// v56 credential tables — the secret halves of hosts, users and tokens,
+	// carried only by the peer-only sensitive lane (sensitiveTableNames). The
+	// public rows keep their old secret column, which is cleared once
+	// credentials_split_v1 latches; see credentials_split.go. Keyed on the
+	// parent's primary key, one row per parent. updated_at is the LWW key and,
+	// for a row the backfill wrote, it is the PARENT row's updated_at, so every
+	// node that backfills the same parent writes the same row.
+	`CREATE TABLE IF NOT EXISTS host_fence_credentials (
+		host_name  TEXT PRIMARY KEY,
+		ipmi_pass  TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+	`CREATE TABLE IF NOT EXISTS user_credentials (
+		username      TEXT PRIMARY KEY,
+		password_hash TEXT NOT NULL DEFAULT '',
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT
+	)`,
+	`CREATE TABLE IF NOT EXISTS token_credentials (
+		token_id   TEXT PRIMARY KEY,
+		token_hash TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2675,6 +2713,9 @@ var tablePrimaryKeys = map[string][]string{
 	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
 	"netbox_sync_queue":       {"id"},
 	"netbox_host_config":      {"host_name"},
+	"host_fence_credentials":  {"host_name"},
+	"user_credentials":        {"username"},
+	"token_credentials":       {"token_id"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3035,6 +3076,7 @@ var createTableUnits = []struct {
 	{51, "netbox_host_config"},
 	{52, "leader_lease_terms"},
 	{55, "local_term_bindings"},
+	{56, "host_fence_credentials"}, {56, "user_credentials"}, {56, "token_credentials"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

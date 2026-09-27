@@ -82,6 +82,38 @@ const (
 	// audit fact before anything decides on one (docs/operating-model.md).
 	LeaseTermLedgerV1 = "lease_term_ledger_v1"
 
+	// CredentialsSplitV1 gates moving the three secret COLUMNS of public
+	// inventory tables — hosts.ipmi_pass, users.password_hash and
+	// tokens.token_hash — into their own sensitive-lane tables
+	// (host_fence_credentials, user_credentials, token_credentials), and then
+	// clearing the old columns so the operator-safe state dump carries no secret.
+	//
+	// It states two facts about the BINARY, which is why it is mandatory and has
+	// no config flag:
+	//
+	//   - it can DECODE the credential tables' statement shapes. They are the
+	//     first replicated shapes those tables ever had, and an unregistered shape
+	//     back-pressures a previous-release peer rather than degrading: its apply
+	//     fails closed, the batch rolls back and its watermark stalls. So nothing
+	//     writes to the credential tables until this token has latched.
+	//   - it READS a credential from the credential table. The latch is what
+	//     licenses clearing the old column, and a previous-release node reads
+	//     only the old column — it would lose every IPMI password, login and API
+	//     token the moment the clear reached it.
+	//
+	// Both facts must hold of every host this node REPLICATES TO, not merely of
+	// every host that votes, so the token is in replicationGated. A host parked
+	// in `maintenance` on the old build still receives the clear and still
+	// serves logins; a latch computed over voting members alone would clear the
+	// column out from under it.
+	//
+	// A flag would be worse than useless: driveCapabilityLatches skips an
+	// unlatched token whose flag is off, so a flag-gated split would never latch
+	// and the secrets would stay in the public dump forever. There is nothing an
+	// operator could correctly decline — the split changes where a secret is
+	// stored, not a policy.
+	CredentialsSplitV1 = "credentials_split_v1"
+
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
 	// minted it, and an executor refuses a proof whose term is below the
@@ -448,7 +480,7 @@ const (
 // not state a policy an operator chooses; it states a FACT about this binary,
 // and letting an operator misreport that fact is how a cluster corrupts itself.
 //
-// Standing one down therefore differs per token and neither has a config flag
+// Standing one down therefore differs per token and none has a config flag
 // to turn off:
 //
 //   - split_brain_gate_v1 flips via `supported` alone, so marker deletion
@@ -475,6 +507,16 @@ const (
 //     enforcement and recovery both. Terms are additive audit facts that
 //     nothing reads until it is on, so that is the lever an incident wants.
 //     TestDurablyLatchedIsMonotone pins the behaviour this paragraph describes.
+//
+//   - credentials_split_v1 has no stand-down either, and for a harder reason:
+//     once it latches, each node copies the three secret columns into the
+//     credential tables and then CLEARS the columns. The clear is the point of
+//     the token and it is not reversible — a build that reads only the old
+//     columns has nothing left to read. Rolling a host back below this build
+//     after the latch costs that host its IPMI passwords, logins and API
+//     tokens as well as its replication stream (the credential tables' shapes
+//     back-pressure it). The startup rollback preflight refuses such a
+//     binary if it carries the preflight; one that predates it does not.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -524,6 +566,12 @@ var supported = []string{
 	// ledger's statement shapes". Withholding it on a flag would keep the latch
 	// from forming on a fleet that is fully rolled.
 	LeaseTermLedgerV1,
+	// CredentialsSplitV1 is advertised UNCONDITIONALLY, for the same reason as
+	// LeaseTermLedgerV1: it says "this build decodes the credential tables'
+	// statement shapes and reads a credential from them", a fact no flag should
+	// be able to misreport, and a flag would keep the latch from forming on a
+	// fully rolled fleet.
+	CredentialsSplitV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
 	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
@@ -542,7 +590,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -582,6 +630,12 @@ func Supported() []string {
 // availability of the feature, not of the cluster.
 var replicationGated = map[string]bool{
 	LeaseTermLedgerV1: true,
+	// Confirmed against every replication recipient for BOTH of its claims: the
+	// credential tables' shapes must be decodable by every host we stream to,
+	// and the old-column clear must not reach a host that still reads only the
+	// old column — a maintenance host on the previous build serves logins and
+	// can coordinate a fence once it returns to service.
+	CredentialsSplitV1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -609,6 +663,10 @@ func ReplicationGated(token string) bool {
 var mandatory = map[string]bool{
 	SplitBrainGateV1:  true,
 	LeaseTermLedgerV1: true,
+	// A fact about the binary (it decodes and reads the credential tables),
+	// not a policy. See CredentialsSplitV1 for why a flag would leave the
+	// secrets in the public dump forever.
+	CredentialsSplitV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

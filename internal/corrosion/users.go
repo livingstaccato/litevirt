@@ -38,30 +38,48 @@ type TokenRecord struct {
 	ScopePaths []string // empty/nil = no scoping
 }
 
+// usersReactivateSQL is InsertUser's reactivation shape, also reused by
+// ReinstateAdminIfNoneRemain so that path adds no shape of its own.
+const usersReactivateSQL = `UPDATE users SET role = ?, password_hash = ?, deleted_at = NULL, updated_at = ? WHERE username = ?`
+
 // InsertUser creates a new user. If the username was previously soft-deleted,
 // it reactivates the row with the new role and password.
+//
+// Once credentials_split_v1 has latched the hash is written to user_credentials
+// in the same batch (see credentials_split.go).
 func InsertUser(ctx context.Context, c *Client, username, role, passwordHash string) error {
 	now := c.NowTS()
+	split := c.MayWriteCredentialTables()
 	// Try reactivating a soft-deleted user first.
 	rows, err := c.Query(ctx,
 		`SELECT username FROM users WHERE username = ? AND deleted_at IS NOT NULL`, username)
 	if err == nil && len(rows) > 0 {
-		return c.Execute(ctx,
-			`UPDATE users SET role = ?, password_hash = ?, deleted_at = NULL, updated_at = ? WHERE username = ?`,
-			role, passwordHash, now, username,
-		)
+		if split {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: usersReactivateSQL, Params: []interface{}{role, passwordHash, now, username}},
+				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
+			})
+		}
+		return c.Execute(ctx, usersReactivateSQL, role, passwordHash, now, username)
 	}
-	return c.Execute(ctx,
-		`INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
-		username, role, passwordHash, nowRFC3339(), now,
-	)
+	if split {
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: usersInsertSQL, Params: []interface{}{username, role, passwordHash, nowRFC3339(), now}},
+			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
+		})
+	}
+	return c.Execute(ctx, usersInsertSQL, username, role, passwordHash, nowRFC3339(), now)
 }
+
+const usersInsertSQL = `INSERT INTO users (username, role, password_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`
 
 // GetUser returns a user by username, or nil if not found.
 func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, error) {
 	rows, err := c.Query(ctx,
-		`SELECT username, role, password_hash, COALESCE(realm, 'local') AS realm, created_at
-		 FROM users WHERE username = ? AND deleted_at IS NULL`,
+		`SELECT u.username, u.role, u.password_hash, COALESCE(u.realm, 'local') AS realm, u.created_at,
+		        u.updated_at, c.username AS cred_key, c.password_hash AS cred_val, c.updated_at AS cred_ts
+		 FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
+		 WHERE u.username = ? AND u.deleted_at IS NULL`,
 		username)
 	if err != nil {
 		return nil, err
@@ -71,11 +89,12 @@ func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, erro
 	}
 	r := rows[0]
 	return &UserRecord{
-		Username:     r.String("username"),
-		Role:         r.String("role"),
-		PasswordHash: r.String("password_hash"),
-		Realm:        r.String("realm"),
-		CreatedAt:    r.String("created_at"),
+		Username: r.String("username"),
+		Role:     r.String("role"),
+		PasswordHash: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
+			r.String("password_hash"), r.String("updated_at"), c.credentialFallback()),
+		Realm:     r.String("realm"),
+		CreatedAt: r.String("created_at"),
 	}, nil
 }
 
@@ -116,11 +135,26 @@ func ListUsers(ctx context.Context, c *Client) ([]UserRecord, error) {
 // UpdateUserPassword updates the password hash for a user.
 func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`,
-		passwordHash, now, username,
-	)
+	if c.MayWriteCredentialTables() {
+		// The credential row is written only for a LIVE user, matching the
+		// parent UPDATE's guard: resetting a deleted account's password must
+		// not give it a credential.
+		live, err := c.Query(ctx, `SELECT username FROM users WHERE username = ? AND deleted_at IS NULL`, username)
+		if err != nil {
+			return err
+		}
+		if len(live) == 0 {
+			return nil
+		}
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}},
+			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
+		})
+	}
+	return c.Execute(ctx, usersUpdatePasswordSQL, passwordHash, now, username)
 }
+
+const usersUpdatePasswordSQL = `UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ? AND deleted_at IS NULL`
 
 // DeleteUser tombstones a user and CASCADES the tombstone to its 2FA factors,
 // recovery codes, both active-set pointers, AND its role bindings — all in one
@@ -166,11 +200,18 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 		}
 		scope = string(b)
 	}
-	return c.Execute(ctx,
-		`INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+	if c.MayWriteCredentialTables() {
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now}},
+			{SQL: tokenCredentialUpsertSQL, Params: []interface{}{t.ID, t.TokenHash, now}},
+		})
+	}
+	return c.Execute(ctx, tokensInsertSQL,
 		t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now,
 	)
 }
+
+const tokensInsertSQL = `INSERT INTO tokens (id, username, name, token_hash, expires_at, scope_paths, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 
 // RevokeToken tombstones a token. updated_at is bumped alongside deleted_at so the
 // revocation wins LWW over a stale peer's still-live copy under anti-entropy.
@@ -203,19 +244,18 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 	// cutoff would let a token expiring at "…01Z" survive until the next second
 	// because "…01Z" sorts AFTER "…01.5Z" ('Z' > '.'). Compare like-with-like.
 	now := nowRFC3339()
-	rows, err := c.Query(ctx,
-		`SELECT t.id, t.username, t.token_hash, t.scope_paths, u.role
-		 FROM tokens t
-		 JOIN users u ON u.username = t.username
-		 WHERE t.deleted_at IS NULL AND u.deleted_at IS NULL
-		   AND (t.expires_at IS NULL OR t.expires_at = '' OR t.expires_at > ?)`,
-		now)
+	rows, err := liveTokenCandidates(ctx, c, now)
 	if err != nil {
 		return nil, err
 	}
 
+	fallback := c.credentialFallback()
 	for _, r := range rows {
-		hash := r.String("token_hash")
+		hash := resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
+			r.String("token_hash"), r.String("src_ts"), fallback)
+		if hash == "" {
+			continue // bcrypt rejects it anyway; skip the cost
+		}
 		if bcrypt.CompareHashAndPassword([]byte(hash), []byte(rawToken)) == nil {
 			_ = c.Execute(ctx, `UPDATE tokens SET last_used_at = ? WHERE id = ?`,
 				time.Now().UTC().Format(time.RFC3339), r.String("id"))
@@ -233,6 +273,22 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 		}
 	}
 	return nil, nil
+}
+
+// liveTokenCandidates reads every unexpired, unrevoked token of a live user
+// together with its credential row, so ValidateToken can resolve the hash
+// new-first (credentials_split.go). cutoff is a bare RFC3339 instant.
+func liveTokenCandidates(ctx context.Context, c *Client, cutoff string) ([]Row, error) {
+	return c.Query(ctx,
+		`SELECT t.id, t.username, t.token_hash, t.scope_paths, u.role,
+		        COALESCE(NULLIF(t.updated_at, ''), t.created_at) AS src_ts,
+		        c.token_id AS cred_key, c.token_hash AS cred_val, c.updated_at AS cred_ts
+		 FROM tokens t
+		 JOIN users u ON u.username = t.username
+		 LEFT JOIN token_credentials c ON c.token_id = t.id AND c.deleted_at IS NULL
+		 WHERE t.deleted_at IS NULL AND u.deleted_at IS NULL
+		   AND (t.expires_at IS NULL OR t.expires_at = '' OR t.expires_at > ?)`,
+		cutoff)
 }
 
 // looksLikeAPIToken reports whether s has the exact shape CreateToken emits:
@@ -298,8 +354,11 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 	// Deterministic across replicas: newest tombstone, then username as the
 	// tiebreak so two deletes sharing a marker still resolve identically.
 	rows, err := c.Query(ctx,
-		`SELECT username, password_hash FROM users WHERE role = 'admin' AND deleted_at IS NOT NULL
-		 ORDER BY deleted_at DESC, username ASC LIMIT 1`)
+		`SELECT u.username, u.password_hash, u.updated_at,
+		        c.username AS cred_key, c.password_hash AS cred_val, c.updated_at AS cred_ts
+		 FROM users u LEFT JOIN user_credentials c ON c.username = u.username AND c.deleted_at IS NULL
+		 WHERE u.role = 'admin' AND u.deleted_at IS NOT NULL
+		 ORDER BY u.deleted_at DESC, u.username ASC LIMIT 1`)
 	if err != nil {
 		return "", err
 	}
@@ -307,14 +366,23 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 		return "", nil // no admin ever existed; not this function's problem
 	}
 	victim := rows[0].String("username")
+	hash := resolveCredential(rows[0].String("cred_key") != "", rows[0].String("cred_val"), rows[0].String("cred_ts"),
+		rows[0].String("password_hash"), rows[0].String("updated_at"), c.credentialFallback())
 	// The reactivation shape InsertUser already uses, with role and password
 	// written back unchanged. Deliberately NOT a new `SET deleted_at = NULL`
 	// statement: every replicated shape has to be in the compatibility ledger,
 	// and reusing the registered one keeps this off that ledger entirely.
 	now := c.NowTS()
-	if err := c.Execute(ctx,
-		`UPDATE users SET role = ?, password_hash = ?, deleted_at = NULL, updated_at = ? WHERE username = ?`,
-		"admin", rows[0].String("password_hash"), now, victim); err != nil {
+	if c.MayWriteCredentialTables() {
+		if err := c.ExecuteBatch(ctx, []Statement{
+			{SQL: usersReactivateSQL, Params: []interface{}{"admin", hash, now, victim}},
+			{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}},
+		}); err != nil {
+			return "", err
+		}
+		return victim, nil
+	}
+	if err := c.Execute(ctx, usersReactivateSQL, "admin", hash, now, victim); err != nil {
 		return "", err
 	}
 	return victim, nil

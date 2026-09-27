@@ -222,22 +222,15 @@ func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
 
 // ListHosts returns all active hosts.
 func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
-	rows, err := c.Query(ctx,
-		`SELECT name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
-			cpu_total, mem_total, disk_total, fence_strategy,
-			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
-			labels, version, schema_version, role, region,
-			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
-			capacity_policy_hash,
-			created_at, updated_at
-		 FROM hosts WHERE deleted_at IS NULL`)
+	rows, err := c.Query(ctx, hostSelectSQL+` WHERE h.deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
 
+	fallback := c.credentialFallback()
 	hosts := make([]HostRecord, len(rows))
 	for i, r := range rows {
-		hosts[i] = scanHost(r)
+		hosts[i] = scanHost(r, fallback)
 	}
 	return hosts, nil
 }
@@ -276,41 +269,48 @@ func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
 
 // GetHost returns a single host by name.
 func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
-	rows, err := c.Query(ctx,
-		`SELECT name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
-			cpu_total, mem_total, disk_total, fence_strategy,
-			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
-			labels, version, schema_version, role, region,
-			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
-			capacity_policy_hash,
-			created_at, updated_at
-		 FROM hosts WHERE name = ? AND deleted_at IS NULL`, name)
+	rows, err := c.Query(ctx, hostSelectSQL+` WHERE h.name = ? AND h.deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	h := scanHost(rows[0])
+	h := scanHost(rows[0], c.credentialFallback())
 	return &h, nil
 }
 
-func scanHost(r Row) HostRecord {
+// hostSelectSQL is the column list scanHost reads, joined to the host's fence
+// credential so IPMIPass is resolved new-first (credentials_split.go). Columns
+// the two tables share are qualified; SQLite names a qualified result column by
+// its bare name, which is what scanHost looks up.
+const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_port, h.state, h.cert_serial,
+			h.cpu_total, h.mem_total, h.disk_total, h.fence_strategy,
+			h.ipmi_address, h.ipmi_user, h.ipmi_pass, h.watchdog_dev,
+			h.labels, h.version, h.schema_version, h.role, h.region,
+			h.cpu_overcommit, h.mem_overcommit, h.cpu_reserve, h.mem_reserve_mib,
+			h.capacity_policy_hash,
+			h.created_at, h.updated_at,
+			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts
+		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL`
+
+func scanHost(r Row, credFallback bool) HostRecord {
 	return HostRecord{
-		Name:               r.String("name"),
-		Address:            r.String("address"),
-		SSHUser:            r.String("ssh_user"),
-		SSHPort:            r.Int("ssh_port"),
-		GRPCPort:           r.Int("grpc_port"),
-		State:              r.String("state"),
-		CertSerial:         r.String("cert_serial"),
-		CPUTotal:           r.Int("cpu_total"),
-		MemTotal:           r.Int("mem_total"),
-		DiskTotal:          r.Int("disk_total"),
-		FenceStrategy:      r.String("fence_strategy"),
-		IPMIAddress:        r.String("ipmi_address"),
-		IPMIUser:           r.String("ipmi_user"),
-		IPMIPass:           r.String("ipmi_pass"),
+		Name:          r.String("name"),
+		Address:       r.String("address"),
+		SSHUser:       r.String("ssh_user"),
+		SSHPort:       r.Int("ssh_port"),
+		GRPCPort:      r.Int("grpc_port"),
+		State:         r.String("state"),
+		CertSerial:    r.String("cert_serial"),
+		CPUTotal:      r.Int("cpu_total"),
+		MemTotal:      r.Int("mem_total"),
+		DiskTotal:     r.Int("disk_total"),
+		FenceStrategy: r.String("fence_strategy"),
+		IPMIAddress:   r.String("ipmi_address"),
+		IPMIUser:      r.String("ipmi_user"),
+		IPMIPass: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
+			r.String("ipmi_pass"), r.String("updated_at"), credFallback),
 		WatchdogDev:        r.String("watchdog_dev"),
 		Labels:             decodeLabels(r.String("labels")),
 		Version:            r.String("version"),

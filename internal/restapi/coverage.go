@@ -221,7 +221,9 @@ func (s *Server) handleStackDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		res.Error = fmt.Sprintf("stack %q: %d of %d deletions failed (%s); the stack is left in state \"deleting\" and the daemon retries the teardown",
 			req.Name, len(res.Failures), len(seen), strings.Join(names, ", "))
-		w.WriteHeader(http.StatusInternalServerError)
+		// The stack still exists, in state "deleting", and the daemon retries
+		// the teardown: a conflict with the request, not a server fault.
+		w.WriteHeader(http.StatusConflict)
 	}
 	jsonWrite(w, res)
 }

@@ -334,7 +334,11 @@ the start `lv compose up` makes right after the create). The reconciler also
 takes the same per-container lock as `lv ct create`, `start`, `stop` and `rm`
 on that host, and reads the row again once it holds it, so a sweep never acts
 on a container while one of those is changing it — a `lv ct stop` that lands
-mid-sweep stays stopped.
+mid-sweep stays stopped. The reconciler does not wait for that lock: a
+container that an operation holds — a `lv ct backup`, `lv ct migrate`,
+`lv ct snapshot`, `lv ct restore` or `lv ct clone` holds it for its whole run —
+is skipped for that sweep and reconciled by the next one, so one long operation
+never delays the reconcile of the host's other containers.
 
 **Caveat (coarser than VMs):** LXC reports only `RUNNING`/`STOPPED`/`FROZEN` — no
 stop *reason*. A container therefore cannot distinguish a clean in-guest shutdown

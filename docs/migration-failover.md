@@ -192,7 +192,7 @@ VMs with a `healthcheck` defined in their compose spec are periodically checked:
 | `tcp` | TCP connection succeeds |
 | `exec` | Command exits 0 via guest agent |
 
-**Correlated failure detection:** If 3+ VMs fail health checks simultaneously, litevirt suppresses automatic restarts (likely a shared dependency failure, not individual VM issues).
+**Correlated failure detection:** If 3+ VMs fail health checks simultaneously, litevirt suppresses automatic restarts (likely a shared dependency failure, not individual VM issues). A VM whose next action is still held back by its action backoff does not count toward the 3 — it has already been acted on — and a suppressed action is not counted toward the VM's backoff, so once the event is over the first failed probe acts without a backoff built up during it.
 
 **The verdict is cluster state.** The owning host publishes each VM's verdict — `healthy`, `unhealthy` or `unknown` — whenever it changes, bound to the VM's current incarnation. That is what compose `vm_healthy` waits for, what `lv inspect` shows, and what `lv health` lists as `vm_probe_failing` (info severity). When the owner goes down nobody is left to retract a pass, so readers treat any verdict from an `offline`, `fenced` or `maintenance` owner as `unknown`; after failover the VM is a new incarnation on its new host and needs a fresh pass there. The action (`restart` / `migrate` / `alert`) is unchanged, and still waits out the first 5 minutes after a VM is created. See [Diagnostics](diagnostics.md#vm-probe-failing-vm_probe_failing).
 

@@ -68,9 +68,12 @@ func TestFleet_AntiEntropy_TableDumpFallsBackOnAnOlderPeer(t *testing.T) {
 	if !hasStack(t, b, "drifted-stack") {
 		t.Fatal("b did not receive the drifted stacks row from a peer without StreamTableDump")
 	}
+	// The meter counts calls a handler served, so the refused table dump does
+	// not appear; that it was attempted first is pinned by
+	// TestFetchTableDump_FallsBackToTheFullDumpOnUnimplemented.
 	st := c.AEStats()
-	if st["StreamTableDump"].Calls == 0 {
-		t.Errorf("precondition: StreamTableDump was never attempted, so this proves nothing: %+v", st)
+	if st["StreamTableDump"].Calls != 0 {
+		t.Errorf("precondition: a StreamTableDump was served by the peer standing in for an older build: %+v", st)
 	}
 	if st["StreamStateDump"].Calls == 0 {
 		t.Errorf("no fallback to the full dump: %+v", st)

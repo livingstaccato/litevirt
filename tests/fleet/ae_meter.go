@@ -8,6 +8,10 @@ package fleet
 //
 // Bytes are the marshalled size of each response message (proto.Size), which
 // is what crosses the wire before framing and TLS.
+//
+// It sits behind the partition interceptor, so a call the harness refused —
+// a partitioned link, or a method DoNotImplement stands in for an older build
+// on — is not counted: the tally is what the node's handlers actually served.
 
 import (
 	"context"

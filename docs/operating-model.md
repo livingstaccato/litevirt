@@ -802,11 +802,22 @@ leadership churn or a partition.
 - **5 nodes**: recommended. 2-node failure tolerated.
 - **Even N**: only with a witness. 2-node with witness is fine for homelab.
 - **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
-  this repo is 3 nodes (`tests/fleet/`) and the largest by hand is the 4-node
-  lab. The relay-quorum protocol scales O(n) by design and there is no known
+  this repo that runs workload scenarios is 3 nodes (`tests/fleet/`), the only
+  larger one measures anti-entropy alone (below), and the largest by hand is
+  the 4-node lab. The relay-quorum protocol scales O(n) by design and there is no known
   ceiling, but a figure like "tested and supported at ~50 nodes" is not
   backed by a sustained load test and should not be planned
   against. Larger clusters will likely need the anti-entropy interval tuned.
+- **Anti-entropy pass cost, measured at 50 nodes.** `TestFleet_AntiEntropyScale_PassCost`
+  in `tests/fleet/` runs 50 daemons in one process, each with its own replica
+  and real gRPC/mTLS, holding 200 VMs of state; `LITEVIRT_FLEET_AE_NODES=50`
+  selects that size. One scheduled pass on every node costs 408 anti-entropy
+  RPCs and 0.53 MB of responses when the replicas agree (8.2 RPCs per node),
+  where a pass contacting every member costs 4,900 RPCs and 6.3 MB. With one
+  row drifted on one node the pass pulls 730 bytes of table dumps, where
+  answering every mismatch with the full dump pulls 7.9 MB, and the row reaches
+  all 50 replicas within 3 passes. That is the cost of one pass in one
+  process, not a sustained load test.
 
 ### Network
 - **Inter-host RTT < 10 ms**: comfortable. Default replicator and

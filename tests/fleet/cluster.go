@@ -683,8 +683,8 @@ func (c *Cluster) buildServer(n *Node) {
 	// never hit a unary interceptor.
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.ChainUnaryInterceptor(n.aeMeterUnaryInterceptor, n.partitionUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor),
-		grpc.ChainStreamInterceptor(n.aeMeterStreamInterceptor, n.partitionStreamInterceptor, n.Server.StreamAuthInterceptor),
+		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor),
+		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor),
 	)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv

@@ -41,3 +41,37 @@ func drainInBackground(op string, cancel context.CancelFunc, recv func() error) 
 		}
 	}()
 }
+
+// drainAckTimeout bounds how long a drain request waits for DrainHost's first
+// frame before answering "drain started" anyway. DrainHost sends that frame
+// only once its first VM is drained — a whole live migration — so an unbounded
+// wait held the request past the UI's 30s WriteTimeout, and held a bulk drain's
+// slot for a migration per host. It stays well under the WriteTimeout. A var so
+// a test can shrink it; nothing in production reassigns it.
+var drainAckTimeout = 10 * time.Second
+
+// firstOrDetach waits up to bound for the first Recv of a server-streaming RPC:
+// the UI's equivalent of the REST gateway's (internal/restapi/detached_op.go),
+// over the func() error shape drainInBackground reads.
+//
+// It returns that Recv's error (nil, io.EOF or a refusal) when it arrives in
+// time. Otherwise timedOut is set and the first Recv is still in flight; rest
+// then hands its result to the background reader before reading further, so no
+// frame is dropped. On both paths rest is what drainInBackground should read.
+func firstOrDetach(recv func() error, bound time.Duration) (err error, timedOut bool, rest func() error) {
+	ch := make(chan error, 1)
+	go func() { ch <- recv() }()
+	select {
+	case err := <-ch:
+		return err, false, recv
+	case <-time.After(bound):
+		pending := true
+		return nil, true, func() error {
+			if pending {
+				pending = false
+				return <-ch
+			}
+			return recv()
+		}
+	}
+}

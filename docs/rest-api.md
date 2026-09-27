@@ -348,6 +348,14 @@ returns the mapped status of its error (`500` by default) with the same body and
 the failure in `error`; one refused before any progress returns the usual
 `{"error": ...}`.
 
+Both waits outlast the gateway's 120-second write timeout: a non-SSE deploy or
+delete answers when the operation is over, however long that takes, so give the
+client a timeout to match (a large stack can take many minutes). The operation
+runs on a context detached from the request (bounded at 6 hours), so a client
+that disconnects or times out does not cancel it — the deploy or teardown
+finishes on the server and only its verdict is lost; check it with
+`GET /api/v1/stacks` rather than repeating the call.
+
 ## Still gRPC-only
 
 A handful of RPCs remain gRPC-only because they're bidirectional

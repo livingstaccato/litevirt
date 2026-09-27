@@ -115,27 +115,58 @@ func (s *Server) readyQuery(ctx context.Context) ([]corrosion.Row, error) {
 // budget, which the caller reads as unreachable — the fencing verdict — rather
 // than as the not-ready answer it is.
 //
-// At most one read is outstanding. While one is still blocked, the next probe
-// is answered not-ready at once rather than parking another goroutine behind
-// the same lock every probe interval.
+// At most one read is outstanding, and callers SHARE it. Every observer probes
+// on the same tick, so concurrent calls on a healthy node are the normal case;
+// answering all but the first "not ready" for the length of an ordinary read
+// cost a healthy node its vote (the checker and QuorumProof both believe a
+// not-ready answer on first sight). A caller arriving while a read runs waits
+// on that read, within its own budget, and gets its result.
+//
+// Only a read that has been outstanding longer than readyReadTimeout — one
+// that has already overrun the budget every caller is held to, so is blocked,
+// not slow — is answered not-ready at once, rather than parking another
+// goroutine behind the same lock every probe interval.
+//
+// The shared read runs under its own readyReadTimeout context, not the first
+// caller's: one caller hanging up must not fail the read the others are
+// waiting on.
 func (s *Server) boundedReadyQuery(ctx context.Context) (rows []corrosion.Row, finished bool, err error) {
-	if !s.readyInFlight.CompareAndSwap(false, true) {
+	s.readyMu.Lock()
+	f := s.readyFlight
+	switch {
+	case f != nil && time.Since(f.started) > readyReadTimeout:
+		s.readyMu.Unlock()
 		return nil, false, nil
+	case f == nil:
+		f = &readyFlight{started: time.Now(), done: make(chan struct{})}
+		s.readyFlight = f
+		go func() {
+			rctx, cancel := context.WithTimeout(context.Background(), readyReadTimeout)
+			defer cancel()
+			f.rows, f.err = s.readyQuery(rctx)
+			s.readyMu.Lock()
+			if s.readyFlight == f {
+				s.readyFlight = nil
+			}
+			s.readyMu.Unlock()
+			close(f.done)
+		}()
 	}
-	type result struct {
-		rows []corrosion.Row
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		defer s.readyInFlight.Store(false)
-		r, e := s.readyQuery(ctx)
-		ch <- result{r, e}
-	}()
+	s.readyMu.Unlock()
 	select {
-	case r := <-ch:
-		return r.rows, true, r.err
+	case <-f.done:
+		return f.rows, true, f.err
 	case <-ctx.Done():
 		return nil, false, nil
 	}
+}
+
+// readyFlight is one outstanding readyQuery, shared by every Ready caller that
+// arrives while it runs. rows and err are written before done is closed and
+// read only after.
+type readyFlight struct {
+	started time.Time
+	done    chan struct{}
+	rows    []corrosion.Row
+	err     error
 }

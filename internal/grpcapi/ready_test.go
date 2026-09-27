@@ -121,13 +121,52 @@ func TestReady_AnswersWithinItsBudgetWhenTheReadBlocks(t *testing.T) {
 		t.Fatal("Ready reported ready while its read could not complete")
 	}
 
-	// A second probe while the first read is still stuck answers at once,
-	// rather than stacking another blocked goroutine behind the lock.
+	// A second probe while the first read is still stuck — outstanding for
+	// longer than the whole budget now — answers at once, rather than stacking
+	// another blocked goroutine behind the lock or waiting on the stuck read.
 	start = time.Now()
 	if resp, _ := s.Ready(context.Background(), &pb.ReadyRequest{}); resp.GetReady() {
 		t.Fatal("second Ready reported ready while the first read was still blocked")
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Errorf("second Ready took %v; with a read already outstanding it should answer immediately", elapsed)
+	}
+}
+
+// Probes that arrive together all get the answer of the read that is running.
+//
+// Every observer probes every peer on the same two-second tick, so concurrent
+// Ready calls on a healthy node are the normal case, not a corner. One shared
+// in-flight flag answered every caller but the first "not ready" at once, for
+// the whole length of a perfectly ordinary read — and the consumers believe a
+// not-ready answer on first sight: the checker records the peer unready, and
+// QuorumProof drops it from the proof. A healthy node lost its vote for being
+// asked twice in the same 50 ms.
+func TestReady_ConcurrentProbesOfAHealthyNodeAreAllReady(t *testing.T) {
+	s := testServer(t)
+	insertReadyHost(t, s, "test-host")
+	s.readyRead = func(ctx context.Context) ([]corrosion.Row, error) {
+		time.Sleep(50 * time.Millisecond) // an ordinary read, well inside the budget
+		return s.db.Query(ctx, `SELECT name FROM hosts WHERE name = ?`, "test-host")
+	}
+
+	const callers = 4
+	results := make(chan *pb.ReadyResponse, callers)
+	start := make(chan struct{})
+	for i := 0; i < callers; i++ {
+		go func() {
+			<-start
+			resp, err := s.Ready(context.Background(), &pb.ReadyRequest{})
+			if err != nil {
+				t.Errorf("Ready: %v", err)
+			}
+			results <- resp
+		}()
+	}
+	close(start)
+	for i := 0; i < callers; i++ {
+		if resp := <-results; !resp.GetReady() {
+			t.Errorf("a concurrent probe of a healthy node answered not ready (%q)", resp.GetNotReadyReason())
+		}
 	}
 }

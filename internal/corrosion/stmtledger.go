@@ -176,7 +176,10 @@ func CurrentLedgerHas(fp string) bool {
 // Scoped deliberately to create-only shapes. A zero-row UPDATE or DELETE is
 // still relayed: those dispositions are LWW-gated or per-category, so the
 // receiver decides for itself, and the row the statement targets may be one
-// this node simply does not hold. An UNCLASSIFIED shape is relayed too —
+// this node simply does not hold. When it is a plain LWW full-PK update and
+// that row is absent, this node also parks it for the row's arrival, so the
+// origin does not end up behind the peers that applied it (parked_updates.go).
+// An UNCLASSIFIED shape is relayed too —
 // unknown means "not known to be create-only", and silently withholding a
 // statement whose semantics we cannot name is the more dangerous default.
 func relayStatement(s Statement, changed bool) bool {

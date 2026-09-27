@@ -125,11 +125,9 @@ func TestFleet_IndependentReplicas_FaultyLinksConverge(t *testing.T) {
 	c.WaitConverged(t, convergeTimeout)
 
 	// The contested row exists everywhere BEFORE the faults start. An UPDATE
-	// issued on a node that has not yet received the row is a no-op there but
-	// replicates as a statement and lands on every peer that has it, so the WAL
-	// lane alone leaves the origin behind its peers until anti-entropy repairs
-	// it — a real property of statement replication, and not what this scenario
-	// is about.
+	// issued on a node that has not yet received the row is parked there until
+	// the row arrives (update_before_row_test.go pins that); this scenario is
+	// about the dedup, LWW and retry machinery, so it keeps the two apart.
 	insertVM(t, a, "vm-shared", a.Name)
 	c.WaitConverged(t, convergeTimeout)
 

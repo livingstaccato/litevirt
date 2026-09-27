@@ -138,3 +138,31 @@ func TestCheckPeers_AHungPeerDoesNotStallTheRest(t *testing.T) {
 		t.Error("the healthy peer was never checked — one hung peer stalled anti-entropy for the rest")
 	}
 }
+
+// A hung DIGEST gives up on the digest's own budget, not the whole exchange's.
+//
+// The per-peer deadline has to be generous — a real state dump and merge of a
+// large cluster takes minutes — but it covered the digest RPC too, which is a
+// few bytes. With peers visited one at a time, K peers hung on GetStateDigest
+// stalled every pass for K × that budget before anti-entropy reached the
+// healthy peers behind them.
+func TestCheckPeers_AHungDigestGivesUpOnTheDigestBudget(t *testing.T) {
+	shrink(t, &antiEntropyPeerTimeout, time.Minute) // the exchange budget stays long
+	shrink(t, &antiEntropyDigestTimeout, 200*time.Millisecond)
+	pkiDir := testPKI(t, "self")
+	c := newPruneTestClient(t)
+	hung := &fakePeer{hang: true}
+	startFakePeer(t, c, pkiDir, "hung-peer", hung)
+	c.SetMembersForTests(func() []PeerInfo { return []PeerInfo{{Name: "hung-peer"}} })
+	ae := NewAntiEntropy(c, pkiDir, time.Minute)
+
+	start := time.Now()
+	ae.checkPeers(context.Background())
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("a hung digest held the pass %v; it must give up on the digest budget, not the %v exchange budget",
+			d, antiEntropyPeerTimeout)
+	}
+	if hung.digestCalls.Load() == 0 {
+		t.Fatal("precondition: the hung peer was never contacted, so this proves nothing")
+	}
+}

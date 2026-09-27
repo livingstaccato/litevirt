@@ -307,12 +307,16 @@ incremental) replica of a VM that was running — is a torn copy rather than a
 crash-consistent one, as above. Enable only where a small lag window is
 acceptable, and prefer `--incremental` on any schedule with `--auto-promote`.
 
-Automatic promotion **refuses a replica older than 48 hours** (or one whose
-filename carries no readable timestamp) and falls back to a plain reschedule —
-the same outcome as having no replica. Without a bound, a schedule that had been
-failing for days left a replica as promotable as a fresh one, and failover would
-replace a VM running on current data with a week-old disk. 48 hours leaves room
-for a daily schedule plus one missed run. **Manual** `lv replication promote` is
+Automatic promotion **refuses a replica older than two of the schedule's
+longest intervals plus an hour** (or one whose filename carries no readable
+timestamp) and falls back to a plain reschedule — the same outcome as having no
+replica. Without a bound, a schedule that had been failing for days left a
+replica as promotable as a fresh one, and failover would replace a VM running on
+current data with a week-old disk. Two intervals tolerate one missed run; the
+longest interval, not the typical one, so a weekday schedule's replica is not
+refused on a Monday. An hourly schedule is bounded at 3 hours, a weekly one at
+two weeks and an hour. When the schedule cannot be read the bound is 48 hours.
+**Manual** `lv replication promote` is
 not bounded: an operator who has seen the age and chosen it anyway is making a
 different decision.
 

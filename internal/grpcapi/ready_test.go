@@ -7,6 +7,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // A daemon whose database will not answer is NOT ready, however healthy its
@@ -168,5 +169,20 @@ func TestReady_ConcurrentProbesOfAHealthyNodeAreAllReady(t *testing.T) {
 		if resp := <-results; !resp.GetReady() {
 			t.Errorf("a concurrent probe of a healthy node answered not ready (%q)", resp.GetNotReadyReason())
 		}
+	}
+}
+
+// An unready edge degrades the cluster rollup, as a suspect one does.
+//
+// host_health gained "unready" beside healthy and suspect, but the rollup only
+// counted failing and suspect as degraded, so a cluster whose every observer
+// recorded a peer's store as wedged still reported HEALTHY in `lv health` —
+// the operator-surface blind spot the readiness probe exists to remove.
+func TestConnectivityDegrades_UnreadyIsDegraded(t *testing.T) {
+	if !connectivityDegrades(health.StatusUnready) {
+		t.Errorf("connectivityDegrades(%q) = false; a peer that cannot serve degrades the cluster", health.StatusUnready)
+	}
+	if connectivityDegrades("healthy") {
+		t.Error(`connectivityDegrades("healthy") = true`)
 	}
 }

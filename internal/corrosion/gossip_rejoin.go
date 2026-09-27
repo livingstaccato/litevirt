@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"log/slog"
-	"math/rand"
 	"slices"
 	"time"
 )
@@ -107,7 +106,9 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 	rep := &isolationReporter{c: c, host: c.hostName, now: time.Now}
 	for {
 		// Jittered so nodes recovering from one partition do not dial together.
-		d := rejoinInterval + time.Duration(rand.Int63n(int64(rejoinInterval/2)))
+		// 30–45 s: the package's symmetric jitter, centred so the range is the
+		// one this loop has always had.
+		d := jittered(rejoinInterval+rejoinInterval/4, 0.2)
 		select {
 		case <-ctx.Done():
 			return

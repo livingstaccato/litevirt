@@ -290,6 +290,13 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := tmp.Close(); err != nil {
 		return status.Errorf(codes.Internal, "close: %v", err)
 	}
+	// Durable before visible. This receiver carries cross-host replicas into
+	// their promotable name, so it follows publishReplica: data synced before
+	// the rename, the directory after it, or a power loss can leave the final
+	// name on a file whose bytes never reached the disk.
+	if err := syncPath(tmpName); err != nil {
+		return status.Errorf(codes.Internal, "sync: %v", err)
+	}
 	dest, err := safename.SafeJoin(dir, first.Filename)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
@@ -300,6 +307,12 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	}
 	if err := os.Rename(tmpName, dest); err != nil {
 		return status.Errorf(codes.Internal, "finalize: %v", err)
+	}
+	if err := syncPath(dir); err != nil {
+		// The rename may not survive a crash; withdraw it rather than leave a
+		// name the storage will not vouch for.
+		_ = os.Remove(dest)
+		return status.Errorf(codes.Internal, "sync directory: %v", err)
 	}
 	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total})
 }

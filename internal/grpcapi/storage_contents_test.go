@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -219,5 +220,42 @@ func TestStoragePoolContents_PeerStillValidates(t *testing.T) {
 	}}
 	if err := s.UploadStoragePoolContent(st); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("peer must still reject an invalid pool name, got %v", err)
+	}
+}
+
+// A cross-host replica is durable before it is promotable, as a local one is.
+//
+// replicateCrossHost streams the copy through this upload receiver, which
+// closed its temp and renamed it into the final name without syncing either.
+// A power loss on the target after the rename could leave the lexically newest
+// replica name on a short or zero-filled file, which auto-promote then boots.
+// publishReplica fixed only the local path while saying the two agreed.
+func TestStoragePoolContents_AnUploadIsSyncedBeforeItIsVisible(t *testing.T) {
+	s, _, dirB, _ := contentServer(t)
+	peer := contentPeerCtx(t, s)
+	dst := filepath.Join(dirB, "web-1-root-20260925T010000Z.qcow2")
+
+	var order []string
+	prev := syncPath
+	t.Cleanup(func() { syncPath = prev })
+	syncPath = func(p string) error {
+		_, err := os.Stat(dst)
+		kind := "file"
+		if p == dirB {
+			kind = "dir"
+		}
+		order = append(order, fmt.Sprintf("%s visible=%v", kind, err == nil))
+		return nil
+	}
+
+	st := &fakeUploadStream{ctx: peer, msgs: []*pb.UploadStoragePoolContentRequest{
+		{PoolName: "poolB", Filename: filepath.Base(dst)},
+		{Chunk: []byte("qcow2")},
+	}}
+	if err := s.UploadStoragePoolContent(st); err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	if want := "[file visible=false dir visible=true]"; fmt.Sprint(order) != want {
+		t.Errorf("sync order = %v, want %s: the data before the rename, the directory after it", order, want)
 	}
 }

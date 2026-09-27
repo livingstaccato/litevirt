@@ -774,24 +774,21 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, float64(rows[0].Int("cnt")))
 	}
 
-	// Replication watermark floor over LIVE peers. Replication is PUSH over the
-	// relay topology, so this node holds a permanently-stale watermark for any
-	// peer it does not itself serve — and an unfiltered MIN reported the
-	// slowest-EVER-seen peer instead of the current compaction floor, pinning
-	// the gauge far below reality. The prune filters to live watermarks
-	// too (pruneMutationLog), using this same cutoff. It additionally drops
-	// peers whose pushes are currently FAILING (corrosion.UnreachablePeerGrace),
-	// which this collector cannot see — that state is the replicator's, not a
-	// column. So when a peer stops acknowledging, this gauge sits at that peer's
-	// frozen seq while the real compaction floor has already moved past it.
-	// That is the useful reading: a gauge that stops advancing is precisely the
-	// signal that some peer has stopped acknowledging.
+	// Replication watermark floor over the peers this node serves (see
+	// replicationPeers). Replication is PUSH over the relay topology, so this
+	// node holds a permanently-stale watermark for any peer it does NOT serve —
+	// an unfiltered MIN reported the slowest-EVER-seen peer and pinned the gauge
+	// far below reality. Filtering to recently-updated rows fixed that but was
+	// blind to a peer it DOES serve that had stopped acknowledging: after
+	// LiveWatermarkWindow its row dropped out and the floor jumped forward past
+	// writes it never received. The replicator's push targets are the set that
+	// is both served and possibly stuck; a gauge that stops advancing is the
+	// signal that one of them has stopped acknowledging.
 	liveCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
-	if rows, rerr := c.db.Query(ctx,
-		`SELECT COALESCE(MIN(last_seq), 0) AS m FROM replication_watermarks WHERE updated_at > ?`,
-		liveCutoff); rerr == nil && len(rows) > 0 {
-		ch <- prometheus.MustNewConstMetric(c.replicationMinSeq,
-			prometheus.GaugeValue, float64(rows[0].Int("m")))
+	peers, peersErr := c.replicationPeers(ctx, liveCutoff)
+	floor, behindAnyone := replicationFloor(peers)
+	if peersErr == nil {
+		ch <- prometheus.MustNewConstMetric(c.replicationMinSeq, prometheus.GaugeValue, float64(floor))
 	}
 
 	// Replication backlog ahead of the slowest LIVE peer: entries written but
@@ -800,9 +797,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// replication_min_watermark_seq. Reported as 0 when there are no live peers
 	// so a single node (or a fully-partitioned one) doesn't report its whole
 	// log as "pending". The live cutoff matches the replicator's prune logic.
-	floor, behindAnyone, floorErr := c.replicationFloor(ctx, liveCutoff)
 	pending := 0.0
-	if floorErr == nil && behindAnyone {
+	if peersErr == nil && behindAnyone {
 		if mx, merr := c.db.Query(ctx,
 			`SELECT COALESCE(MAX(seq), 0) AS m FROM mutation_log`); merr == nil && len(mx) > 0 {
 			if lag := mx[0].Int("m") - floor; lag > 0 {
@@ -827,7 +823,7 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	// Zero with no live peer, for the reason pending_entries is: nobody to be
 	// behind.
 	age := 0.0
-	if floorErr == nil && behindAnyone {
+	if peersErr == nil && behindAnyone {
 		if ol, oerr := c.db.Query(ctx,
 			`SELECT MIN(created_at) AS oldest FROM mutation_log WHERE seq > ?`, floor); oerr == nil && len(ol) > 0 {
 			if ts, perr := time.Parse(time.RFC3339, ol[0].String("oldest")); perr == nil {
@@ -839,25 +835,24 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(c.replicationAge, prometheus.GaugeValue, age)
 
-	// Per-peer replication backlog: how far each LIVE peer is behind the local
-	// mutation_log tail. Restricted to watermarks updated within
-	// LiveWatermarkWindow so a departed peer doesn't leave a stuck series
-	// behind forever; the lag is clamped at 0 (a peer can momentarily report a
-	// watermark past our local MAX after applying our own filtered entries).
+	// Per-peer replication backlog: how far each peer this node serves is behind
+	// the local mutation_log tail, one series per replicationPeers entry. A peer
+	// that stops acknowledging keeps its series and it keeps climbing; a peer
+	// that leaves the push targets leaves no stuck series behind. The lag is
+	// clamped at 0 (a peer can momentarily report a watermark past our local MAX
+	// after applying our own filtered entries).
 	maxSeq := 0
 	if mx, merr := c.db.Query(ctx, `SELECT COALESCE(MAX(seq),0) AS m FROM mutation_log`); merr == nil && len(mx) > 0 {
 		maxSeq = mx[0].Int("m")
 	}
-	peerCutoff := time.Now().Add(-corrosion.LiveWatermarkWindow).UTC().Format(time.RFC3339)
-	if pr, perr := c.db.Query(ctx,
-		`SELECT peer_name, last_seq FROM replication_watermarks WHERE updated_at > ?`, peerCutoff); perr == nil {
-		for _, row := range pr {
-			lag := maxSeq - row.Int("last_seq")
+	if peersErr == nil {
+		for peer, seq := range peers {
+			lag := maxSeq - seq
 			if lag < 0 {
 				lag = 0
 			}
 			ch <- prometheus.MustNewConstMetric(c.replicationPeerLag,
-				prometheus.GaugeValue, float64(lag), row.String("peer_name"))
+				prometheus.GaugeValue, float64(lag), peer)
 		}
 	}
 
@@ -933,9 +928,8 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-// replicationFloor is the lowest sequence acknowledged by any peer this node
-// is responsible for replicating to, and whether there is such a peer at all —
-// the basis both backlog gauges share.
+// replicationPeers is the acknowledged sequence of every peer this node is
+// responsible for replicating to — the basis all four replication gauges share.
 //
 // With the replicator wired in, that set is its current push targets, read
 // from their watermark rows however stale: a peer that has stopped
@@ -944,34 +938,46 @@ func (c *collector) Collect(ch chan<- prometheus.Metric) {
 // Without the replicator (tests, a collector built standalone) it falls back to
 // rows updated within LiveWatermarkWindow, which is blind to a peer stuck for
 // longer than the window.
-func (c *collector) replicationFloor(ctx context.Context, liveCutoff string) (floor int, behindAnyone bool, err error) {
+func (c *collector) replicationPeers(ctx context.Context, liveCutoff string) (map[string]int, error) {
 	if c.replicationTargets == nil {
-		rows, qerr := c.db.Query(ctx,
-			`SELECT COUNT(*) AS live, COALESCE(MIN(last_seq), 0) AS minseq
-			 FROM replication_watermarks WHERE updated_at > ?`, liveCutoff)
-		if qerr != nil || len(rows) == 0 {
-			return 0, false, qerr
+		rows, err := c.db.Query(ctx,
+			`SELECT peer_name, last_seq FROM replication_watermarks WHERE updated_at > ?`, liveCutoff)
+		if err != nil {
+			return nil, err
 		}
-		return rows[0].Int("minseq"), rows[0].Int("live") > 0, nil
+		out := make(map[string]int, len(rows))
+		for _, r := range rows {
+			out[r.String("peer_name")] = r.Int("last_seq")
+		}
+		return out, nil
 	}
 	targets := c.replicationTargets()
 	if len(targets) == 0 {
-		return 0, false, nil
+		return map[string]int{}, nil
 	}
-	rows, qerr := c.db.Query(ctx, `SELECT peer_name, last_seq FROM replication_watermarks`)
-	if qerr != nil {
-		return 0, false, qerr
+	rows, err := c.db.Query(ctx, `SELECT peer_name, last_seq FROM replication_watermarks`)
+	if err != nil {
+		return nil, err
 	}
 	acked := make(map[string]int, len(rows))
 	for _, r := range rows {
 		acked[r.String("peer_name")] = r.Int("last_seq")
 	}
-	floor = -1
+	out := make(map[string]int, len(targets))
 	for _, t := range targets {
-		seq := acked[t] // absent: nothing acknowledged yet
-		if floor < 0 || seq < floor {
-			floor = seq
+		out[t] = acked[t] // absent: nothing acknowledged yet
+	}
+	return out, nil
+}
+
+// replicationFloor is the lowest acknowledged sequence among peers, and whether
+// there are any.
+func replicationFloor(peers map[string]int) (floor int, any bool) {
+	first := true
+	for _, seq := range peers {
+		if first || seq < floor {
+			floor, first = seq, false
 		}
 	}
-	return floor, true, nil
+	return floor, !first
 }

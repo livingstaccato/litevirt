@@ -77,6 +77,10 @@ type peerState struct {
 	// observer stopped, and the probe that straddled the stop, are not the same
 	// run of evidence as failures observed after it.
 	stallEpoch uint64
+	// answeredUnready is whether the last probe got an unready ANSWER. The
+	// silence count restarts after one, because an answer is not silence; it
+	// must not restart on every silent probe that follows.
+	answeredUnready bool
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -453,7 +457,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		newFailures = 0
 	} else {
 		newFailures = prev.failures + 1
-		if result == probeUnreachable && prev.status == StatusUnready {
+		if result == probeUnreachable && prev.answeredUnready {
 			// Every unready probe before this one reached the peer and got an
 			// answer, so none of them is silence. The silence count starts
 			// here, and "suspect" — what fencing quorum counts — has to be
@@ -485,6 +489,11 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 			newFailures = unreadyFailures
 		case newFailures >= suspectThreshold:
 			newStatus = "suspect"
+		case prev.status == StatusUnready:
+			// Silent, but not yet long enough to call suspect. It stays what
+			// it last said it was: publishing "healthy" here would have
+			// QuorumProof count a peer that is neither answering nor ready.
+			newStatus = StatusUnready
 		default:
 			newStatus = "healthy"
 		}
@@ -494,6 +503,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// count still climbed: the count is pinned now, and without this the row
 	// would be written once and go stale while the peer kept answering.
 	changed := !exists || newStatus != prev.status || newFailures != prev.failures || newStatus == StatusUnready
+	prev.answeredUnready = result == probeNotReady
 	prev.status = newStatus
 	prev.failures = newFailures
 	// Local monotonic anchors updated every probe (not just on change) so Phase 2/5

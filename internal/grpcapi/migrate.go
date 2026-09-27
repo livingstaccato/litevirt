@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -547,6 +548,7 @@ poll:
 	for {
 		select {
 		case <-migrateCtx.Done():
+			s.abortOnMigrateTimeout(ctx, migrateCtx, vm.Name)
 			// libvirt is still migrating. MigrateToTarget takes no context, so
 			// cancelling this request does not stop the guest moving — it only
 			// stops us watching. Returning bare here left the VM at
@@ -554,7 +556,9 @@ poll:
 			// the reconciler skips `migrating`, so nothing ever healed it.
 			adopted = true
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
-				withStorage, disks, done, unlock)
+				withStorage, disks, done, unlock, migrationFinish{
+					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+				})
 			return status.Errorf(codes.DeadlineExceeded,
 				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
 					"libvirt and will be completed in the background — watch `lv events %s`",
@@ -580,27 +584,7 @@ poll:
 						s.noteStateWriteFail(corrosion.OpVMState, werr)
 					}
 				}
-				// Remove the disk stubs + cloud-init ISO we pre-created on the
-				// target — the VM never got defined there, so they're orphaned
-				// and would otherwise leak space and shadow a retry. Detached
-				// context: the request ctx may itself be the cause of failure.
-				var stubPaths []string
-				if withStorage {
-					if ds, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name); derr == nil {
-						for _, d := range ds {
-							if d.Path != "" {
-								stubPaths = append(stubPaths, d.Path)
-							}
-						}
-					}
-				}
-				// (Firmware VMs never reach this runtime-migration path — they take
-				// the stopped cold-move in coldMigrateFirmwareVM — so no firmware
-				// cleanup is needed here.)
-				cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 15*time.Second)
-				s.cleanupMigrationArtifactsOnTarget(cleanupCtx, req.TargetHost, vm.Name, stubPaths, "")
-				cancelCleanup()
-
+				s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, withStorage)
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
@@ -632,12 +616,6 @@ poll:
 			"VM %q cut over to %s but committing ownership failed: %v", vm.Name, req.TargetHost, err)
 	}
 
-	// The host link is what the mirror now has to catch up on: the VM's NetBox
-	// object still points at the source's device. Queued on a DETACHED context,
-	// like the rest of the post-commit work — the request context may already be
-	// cancelled by the time the cutover finishes.
-	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
-
 	downtimeMs := float64(time.Since(cutoverStart).Milliseconds())
 	s.recordMigrationMetrics(strategyLabel, "success", time.Since(migrationStart), downtimeMs, 0)
 	slog.Info("migration complete", "vm", vm.Name, "from", s.hostName, "to", req.TargetHost)
@@ -646,52 +624,9 @@ poll:
 
 	// (Firmware-state cleanup is handled in coldMigrateFirmwareVM, which firmware
 	// VMs take instead of this runtime-migration path — see the early return above.)
-
-	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
-	if len(detachedVFs) > 0 {
-		s.reattachVFsOnTarget(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name, detachedVFs)
-	}
-
-	// Send gratuitous ARP for each VM interface to update switch MAC tables.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.IP != "" {
-			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
-		}
-	}
-
-	// Update DNS records so VM names resolve correctly after migration.
-	if s.dnsDomain != "" {
-		for _, iface := range ifaces {
-			if iface.IP != "" {
-				dnsName := dns.VMRecordName(vm.Name, vm.StackName, s.dnsDomain)
-				if err := dns.UpsertRecord(ctx, s.db, dnsName, iface.IP); err != nil {
-					slog.Warn("post-migration DNS update failed", "vm", vm.Name, "name", dnsName, "error", err)
-				}
-				break // one A record per VM
-			}
-		}
-	}
-
-	// Refresh LB backends so traffic routes to the new host.
-	go s.refreshLBForStack(context.Background(), vm.StackName)
-
-	// Update FDB entries: VM MACs now live on target host's VTEP.
-	for _, iface := range ifaces {
-		s.updateFDBForMigration(ctx, iface, s.hostName, req.TargetHost)
-	}
-
-	// post_migrate hook (notify with new host)
-	pbVM.HostName = req.TargetHost
-	pbVM.State = pb.VMState_VM_RUNNING
-	hooks.Run(ctx, hooks.PostMigrate, pbVM, hspec)
-
-	// Dial target host to re-establish gRPC so it can load TLS creds.
-	go s.notifyTargetHostOfVM(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name)
-
-	// Clean up orphaned files on the source host (cloud-init ISO, and disk
-	// files for --with-storage migrations where copies now live on target).
-	go s.cleanupPostMigration(vm.Name)
+	s.finishMigrationOnTarget(ctx, vm, migrationFinish{
+		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+	})
 
 	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)
 }
@@ -733,6 +668,7 @@ func (s *Server) adoptAbandonedMigration(
 	disks []corrosion.DiskRecord,
 	done <-chan error,
 	unlock func(),
+	finish migrationFinish,
 ) {
 	go func() {
 		defer unlock()
@@ -742,7 +678,22 @@ func (s *Server) adoptAbandonedMigration(
 			}
 		}()
 
-		err := <-done
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(adoptedMigrationCeiling):
+			// MigrateToTarget takes no context, so a migration that will not
+			// converge runs for as long as libvirt lets it — with this VM's lock
+			// held, blocking every later operation on it. Past the ceiling it is
+			// aborted; libvirt then returns an error and the guest stays on the
+			// source, which the failure branch below records.
+			slog.Warn("migrate: adopted migration exceeded its ceiling; aborting it",
+				"vm", vm.Name, "target", targetHost, "ceiling", adoptedMigrationCeiling)
+			if aerr := s.virt.AbortMigration(vm.Name); aerr != nil {
+				slog.Error("migrate: could not abort the adopted migration", "vm", vm.Name, "error", aerr)
+			}
+			err = <-done
+		}
 		if err != nil {
 			// The migration failed after we stopped watching; the guest is still
 			// on the source. Anything but `migrating` — that is the state nothing
@@ -761,6 +712,7 @@ func (s *Server) adoptAbandonedMigration(
 			}); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
+			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, withStorage)
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
 			return
@@ -780,7 +732,15 @@ func (s *Server) adoptAbandonedMigration(
 		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
 		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok",
 			"abandoned request; completed to "+targetHost)
-		s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+		// The same finish a watched migration gets. Committing ownership and
+		// stopping here left the guest without its SR-IOV VFs, its FDB entries
+		// on the old VTEP, its LB backends and DNS stale, and the source's files
+		// orphaned.
+		if finish.target != nil {
+			s.finishMigrationOnTarget(ctx, vm, finish)
+		} else {
+			s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+		}
 	}()
 }
 
@@ -1300,12 +1260,12 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 // cleanupMigrationArtifactsOnTarget best-effort removes the stubs + ISO the
 // target pre-created, after a failed migration. Never blocks/fails the caller.
 func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHost, vmName string, diskPaths []string, firmwareUUID string) {
-	client, conn, err := s.peerClient(ctx, targetHost)
+	client, closeConn, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
 		slog.Warn("cleanupMigrationArtifactsOnTarget: cannot reach host", "host", targetHost, "error", err)
 		return
 	}
-	defer conn.Close()
+	defer closeConn()
 	if _, err := client.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
 		VmName:          vmName,
 		DiskPaths:       diskPaths,
@@ -1457,4 +1417,116 @@ func (s *Server) notifyTargetHostOfVM(ctx context.Context, targetHostName, addr 
 		return
 	}
 	slog.Info("migrate: target acknowledged VM", "host", targetHostName, "vm", vmName)
+}
+
+// migrationFinish is what the post-cutover work needs beyond the VM itself.
+type migrationFinish struct {
+	target      *corrosion.HostRecord
+	detachedVFs []corrosion.PCIDeviceRecord
+	pbVM        *pb.VM
+	hspec       *pb.HooksSpec
+}
+
+// adoptedMigrationCeiling bounds how long an adopted migration may run before
+// it is aborted. A var so tests can shorten it.
+var adoptedMigrationCeiling = time.Hour
+
+// abortOnMigrateTimeout aborts the libvirt job when the MIGRATE TIMEOUT is what
+// ended the wait. timeout_sec is a policy on the operation — give up after N —
+// and MigrateToTarget ignores contexts, so without the abort a migration that
+// would not converge kept running, adopted, with the VM's lock held. A client
+// that merely stopped listening (ctx itself done) is not a policy: that
+// migration is adopted and allowed to finish.
+func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName string) {
+	if ctx.Err() != nil || !errors.Is(migrateCtx.Err(), context.DeadlineExceeded) {
+		return
+	}
+	slog.Warn("migrate: timeout reached; aborting the libvirt migration job", "vm", vmName)
+	if err := s.virt.AbortMigration(vmName); err != nil {
+		slog.Error("migrate: could not abort the timed-out migration", "vm", vmName, "error", err)
+	}
+}
+
+// finishMigrationOnTarget is everything after a committed cut-over that makes
+// the rest of the cluster agree the guest has moved: the NetBox mirror, SR-IOV
+// VFs, switch MAC tables, DNS, LB backends, VXLAN FDB, the post_migrate hook,
+// the target's own view, and the source's leftovers. Shared by the watched
+// path and an adopted migration, which used to commit ownership and stop.
+func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRecord, f migrationFinish) {
+	target := f.target.Name
+	// Queued on a DETACHED context, like the rest of the post-commit work — the
+	// request context may already be cancelled by the time the cutover finishes.
+	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
+
+	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
+	if len(f.detachedVFs) > 0 {
+		s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
+	}
+
+	// Send gratuitous ARP for each VM interface to update switch MAC tables.
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	for _, iface := range ifaces {
+		if iface.IP != "" {
+			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
+		}
+	}
+
+	// Update DNS records so VM names resolve correctly after migration.
+	if s.dnsDomain != "" {
+		for _, iface := range ifaces {
+			if iface.IP != "" {
+				dnsName := dns.VMRecordName(vm.Name, vm.StackName, s.dnsDomain)
+				if err := dns.UpsertRecord(ctx, s.db, dnsName, iface.IP); err != nil {
+					slog.Warn("post-migration DNS update failed", "vm", vm.Name, "name", dnsName, "error", err)
+				}
+				break // one A record per VM
+			}
+		}
+	}
+
+	// Refresh LB backends so traffic routes to the new host.
+	go s.refreshLBForStack(context.Background(), vm.StackName)
+
+	// Update FDB entries: VM MACs now live on target host's VTEP.
+	for _, iface := range ifaces {
+		s.updateFDBForMigration(ctx, iface, s.hostName, target)
+	}
+
+	// post_migrate hook (notify with new host)
+	if f.pbVM != nil {
+		f.pbVM.HostName = target
+		f.pbVM.State = pb.VMState_VM_RUNNING
+		hooks.Run(ctx, hooks.PostMigrate, f.pbVM, f.hspec)
+	}
+
+	// Dial target host to re-establish gRPC so it can load TLS creds.
+	go s.notifyTargetHostOfVM(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name)
+
+	// Clean up orphaned files on the source host (cloud-init ISO, and disk
+	// files for --with-storage migrations where copies now live on target).
+	go s.cleanupPostMigration(vm.Name)
+}
+
+// cleanupFailedMigrationTarget removes the disk stubs and cloud-init ISO a
+// migration pre-created on the target. The VM never got defined there, so they
+// are orphaned and would otherwise leak space and shadow a retry. Detached
+// context: the request context may itself be the cause of the failure. Shared
+// by the watched failure and an adopted one, which used to skip it.
+func (s *Server) cleanupFailedMigrationTarget(ctx context.Context, vmName, target string, withStorage bool) {
+	var stubPaths []string
+	if withStorage {
+		if ds, derr := corrosion.GetVMDisks(ctx, s.db, vmName); derr == nil {
+			for _, d := range ds {
+				if d.Path != "" {
+					stubPaths = append(stubPaths, d.Path)
+				}
+			}
+		}
+	}
+	// (Firmware VMs never reach this runtime-migration path — they take the
+	// stopped cold-move in coldMigrateFirmwareVM — so no firmware cleanup is
+	// needed here.)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	s.cleanupMigrationArtifactsOnTarget(cleanupCtx, target, vmName, stubPaths, "")
 }

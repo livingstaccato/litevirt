@@ -103,10 +103,11 @@ type GateResult struct {
 func gateOK() GateResult         { return GateResult{OK: true} }
 func gateNo(r string) GateResult { return GateResult{OK: false, Reason: r} }
 
-// VotingEligible mirrors failover.countLiveHosts' predicate exactly: a host is a
-// live voting member iff its state is not offline/maintenance/fenced (witnesses
-// included, since countLiveHosts counts them in the denominator). The self-count
-// predicate and the quorum denominator MUST be identical or quorum skews.
+// VotingEligible is corrosion.VotingEligible, the one definition of a voting
+// member: a host votes iff its state is not offline/maintenance/fenced
+// (witnesses included). The failover coordinator's fence and recovery quorums
+// use the same rule through corrosion.VoterSet, so the self-count here, the
+// quorum denominator and the observers whose votes count cannot skew.
 //
 // Exported because callers outside this package need "is this host live" and
 // must not invent a fourth answer to it. The NetBox cluster-name uniformity
@@ -118,20 +119,14 @@ func gateNo(r string) GateResult { return GateResult{OK: false, Reason: r} }
 // daemon, so two nodes would disagree about who is live and a restart would
 // briefly count nobody. This predicate is cluster STATE, so every node
 // computes the same set.
-func VotingEligible(state string) bool {
-	switch state {
-	case "offline", "maintenance", "fenced":
-		return false
-	}
-	return true
-}
+func VotingEligible(state string) bool { return corrosion.VotingEligible(state) }
 
 // QuorumProof computes whether this daemon currently sees a live voting majority,
 // using its OWN probe results. Returns the tri-state plus the live/needed counts
 // for observability. `needed = liveVotingHosts/2 + 1`; `live` counts self (if
 // voting-eligible) plus each voting-eligible peer this daemon has probed healthy.
 func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, needed int) {
-	hosts, err := corrosion.ListHosts(ctx, c.db)
+	voters, err := corrosion.VoterSet(ctx, c.db)
 	if err != nil {
 		// Can't read the host table → UNKNOWN, not No. For gates this still fails closed
 		// (Unknown refuses). But the VIPDemoter treats sustained No as a TRIGGER to demote
@@ -167,27 +162,12 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 	}
 	c.mu.Unlock()
 
-	denom := 0
-	selfEligible := false
-	for _, h := range hosts {
-		if !VotingEligible(h.State) {
-			continue
-		}
-		denom++
-		if h.Name == c.hostName {
-			selfEligible = true
-		}
-	}
-	needed = denom/2 + 1
-
-	if selfEligible {
-		live++
-	}
-	for _, h := range hosts {
-		if h.Name == c.hostName || !VotingEligible(h.State) {
-			continue
-		}
-		if healthy[h.Name] {
+	// The denominator is the voter set, the same one the failover
+	// coordinator's fence and recovery quorums count over; only its members
+	// count toward live.
+	needed = len(voters)/2 + 1
+	for name := range voters {
+		if name == c.hostName || healthy[name] {
 			live++
 		}
 	}

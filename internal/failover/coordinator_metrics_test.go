@@ -145,13 +145,17 @@ func TestFailoverMetrics_NoCandidates(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Single observer "coordinator" (not a host row), so "bad" is the only host →
-	// no healthy candidate after fencing it.
-	for i := 0; i < offlineThreshold; i++ {
+	// The other two voters are draining — they vote, but are not 'active' —
+	// so there is no healthy candidate after fencing "bad".
+	for _, o := range []string{"coordinator", "witness"} {
+		ensureVoter(t, db, o)
+		if err := corrosion.UpdateHostState(ctx, db, o, "draining"); err != nil {
+			t.Fatal(err)
+		}
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-			"coordinator", "bad", offlineThreshold); err != nil {
+			o, "bad", offlineThreshold); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -279,7 +283,7 @@ func TestFailoverMetrics_RecoveryQuorumQueryErrorObservable(t *testing.T) {
 	c := newTestCoordinator("coordinator", db)
 	fm := newFakeMetrics()
 	c.Metrics = fm
-	c.recoverHosts(ctx, 1)
+	c.recoverHosts(ctx, map[string]bool{"coordinator": true}, 1)
 
 	if got := fm.attempts[foKey(PhaseRecovery, ResultError, ErrDBError)]; got != 1 {
 		t.Errorf("recovery-query-error counter = %d, want 1 (attempts=%v)", got, fm.attempts)

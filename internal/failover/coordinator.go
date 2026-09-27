@@ -407,20 +407,30 @@ func (c *Coordinator) run(ctx context.Context) {
 		return
 	}
 
-	// Count *live* hosts for quorum: hosts we have recent health from. This
-	// shrinks the denominator on the minority side of a partition so quorum
-	// stays above the partitioned-observer count.
-	liveHosts, err := c.countLiveHosts(ctx)
+	// The voter set is both halves of the quorum: its size is the
+	// denominator, and an observation counts toward a fence or a recovery only
+	// if its observer is a member and is not the target itself. A fenced host
+	// still probing, a deleted host whose daemon was never stopped, or a name
+	// no host carries cannot supply a vote (colonelpanik/litevirt#251). It is
+	// the same set health.QuorumProof counts over. A read error fails closed:
+	// no voters, no fence, no recovery.
+	//
+	// Partition tolerance comes from the observer count, not from tightening
+	// this denominator: a minority side computes the same N but has too few
+	// observers to reach N/2+1. Tightening it further (e.g. requiring fresh
+	// self-probes) creates a bootstrap hole where a just-started coordinator
+	// has no probe rows yet and refuses to act on any failure.
+	voters, err := corrosion.VoterSet(ctx, c.db)
 	if err != nil {
-		slog.Error("failover: count live hosts", "error", err)
+		slog.Error("failover: read voter set", "error", err)
 		c.mAttempt(PhaseQuorum, ResultError, ErrDBError)
 		return
 	}
-	if liveHosts < 1 {
+	if len(voters) < 1 {
 		c.mAttempt(PhaseQuorum, ResultSkipped, ErrNoQuorum)
 		return
 	}
-	quorum := liveHosts/2 + 1
+	quorum := len(voters)/2 + 1
 
 	// Clear the "already handled this down-episode" flag for any host that has
 	// recovered to active. Without this, the in-memory fenced set — which is
@@ -495,11 +505,14 @@ func (c *Coordinator) run(ctx context.Context) {
 				"updated_at", r.String("updated_at"), "ahead", inst.Sub(c.now()).Round(time.Second))
 			continue
 		}
-		t := r.String("target")
+		t, o := r.String("target"), r.String("observer")
+		if !countsAsVote(voters, o, t) {
+			continue
+		}
 		if freshObservers[t] == nil {
 			freshObservers[t] = map[string]struct{}{}
 		}
-		freshObservers[t][r.String("observer")] = struct{}{}
+		freshObservers[t][o] = struct{}{}
 	}
 	type fenceCandidate struct {
 		target    string
@@ -634,7 +647,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
 	// it's healthy again. A transient drop (a daemon restart, a brief blip) must
 	// self-heal — otherwise health reconverges in seconds but hosts.state sticks.
-	c.recoverHosts(ctx, quorum)
+	c.recoverHosts(ctx, voters, quorum)
 
 	// Settle any relocate-restore markers left by an indeterminate restore or a
 	// coordinator crash mid-restore. This runs every cycle, independent of the
@@ -721,7 +734,10 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 //     stays manual (`lv host undrain`), so we never resurrect a host into a
 //     split-brain where a moved VM runs in two places.
 //   - 'maintenance'/'draining': operator intent, never auto-cleared.
-func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
+//
+// Only a voter other than the host itself counts toward the recovery quorum,
+// the same rule as the fence quorum (see countsAsVote).
+func (c *Coordinator) recoverHosts(ctx context.Context, voters map[string]bool, quorum int) {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
 		slog.Error("failover: list hosts for recovery", "error", err)
@@ -761,8 +777,12 @@ func (c *Coordinator) recoverHosts(ctx context.Context, quorum int) {
 		}
 		fresh := map[string]struct{}{}
 		for _, r := range rows {
+			o := r.String("observer")
+			if !countsAsVote(voters, o, h.Name) {
+				continue
+			}
 			if inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at")); ok && inst.After(freshCutoff) {
-				fresh[r.String("observer")] = struct{}{}
+				fresh[o] = struct{}{}
 			}
 		}
 		if len(fresh) < quorum {
@@ -1498,27 +1518,11 @@ func (c *Coordinator) autoPromoteEnabled(ctx context.Context, vmName string) boo
 	return false
 }
 
-// countLiveHosts returns the number of hosts whose state is neither offline,
-// maintenance, nor fenced (all of which are terminal for failover purposes).
-//
-// Partition tolerance is provided by the *observer-count* gate in the quorum
-// query, not by tightening this denominator: if the minority side has too few
-// observers to satisfy `observer_count >= floor(N/2)+1`, it cannot fence even
-// though it computes the same N. Tightening this further (e.g. requiring
-// fresh self-probes) creates a bootstrap hole where a just-started coordinator
-// has no probe rows yet and refuses to act on any failure.
-func (c *Coordinator) countLiveHosts(ctx context.Context) (int, error) {
-	rows, err := c.db.Query(ctx,
-		`SELECT COUNT(*) AS cnt FROM hosts
-		 WHERE state NOT IN ('offline', 'maintenance', 'fenced')
-		   AND deleted_at IS NULL`)
-	if err != nil {
-		return 0, err
-	}
-	if len(rows) == 0 {
-		return 0, nil
-	}
-	return rows[0].Int("cnt"), nil
+// countsAsVote reports whether a host_health row from observer about target
+// may count toward a quorum over voters: the observer must be a voter, and a
+// host never votes on itself.
+func countsAsVote(voters map[string]bool, observer, target string) bool {
+	return observer != target && voters[observer]
 }
 
 // failover fences the host and reschedules its VMs.

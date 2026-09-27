@@ -14,6 +14,7 @@ import (
 func fenceQuorum(t *testing.T, ctx context.Context, db *corrosion.Client, observers []string, target string) {
 	t.Helper()
 	for _, observer := range observers {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)

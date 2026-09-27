@@ -23,6 +23,30 @@ func ensureObserverHost(t *testing.T, db *corrosion.Client, name string) {
 	}
 }
 
+// ensureVoter makes name a voting member unless a live host row of that name
+// already exists. Only a voter's host_health row counts toward quorum
+// (corrosion.VoterSet), and many fixtures vote as "coordinator" — which in a
+// real cluster is always a host. It is added as a WITNESS so it votes but is
+// never a placement candidate, leaving each fixture's reschedule target as it
+// was.
+func ensureVoter(t *testing.T, db *corrosion.Client, name string) {
+	t.Helper()
+	ctx := context.Background()
+	h, err := corrosion.GetHost(ctx, db, name)
+	if err != nil {
+		t.Fatalf("GetHost %s: %v", name, err)
+	}
+	if h != nil {
+		return
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: name, Address: "10.0.9.250", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "manual", Role: "witness",
+	}); err != nil {
+		t.Fatalf("InsertHost %s: %v", name, err)
+	}
+}
+
 func newTestDB(t *testing.T) *corrosion.Client {
 	t.Helper()
 	c := corrosion.NewTestClientT(t)
@@ -89,13 +113,15 @@ func TestCoordinator_FailedHost_MarkedOffline(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 
-	// Simulate health check failures exceeding the threshold.
-	for i := 0; i < offlineThreshold; i++ {
+	// Simulate health check failures exceeding the threshold, from both of
+	// the other voters.
+	for _, o := range []string{"coordinator", "witness"} {
+		ensureVoter(t, db, o)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-			"coordinator", "bad-host", offlineThreshold,
+			o, "bad-host", offlineThreshold,
 		); err != nil {
 			t.Fatalf("insert health row: %v", err)
 		}
@@ -331,6 +357,7 @@ func TestCoordinator_VMsRescheduled(t *testing.T) {
 
 	// Trigger health failure threshold — need quorum (2 observers for 2 active hosts).
 	for _, observer := range []string{"coordinator", "good"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -436,6 +463,7 @@ func TestCoordinator_FencingFailureBlocksReschedule(t *testing.T) {
 
 	// Quorum of observers report failure.
 	for _, observer := range []string{"coordinator", "healthy"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -479,13 +507,16 @@ func TestCoordinator_NoDoubleFailover(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 
-	if err := db.Execute(ctx,
-		`INSERT OR REPLACE INTO host_health
-		 (observer, target, status, consecutive_failures, last_seen, updated_at)
-		 VALUES ('coordinator', 'flaky', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-		offlineThreshold,
-	); err != nil {
-		t.Fatalf("insert health: %v", err)
+	for _, o := range []string{"coordinator", "witness"} {
+		ensureVoter(t, db, o)
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health
+			 (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, 'flaky', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+			o, offlineThreshold,
+		); err != nil {
+			t.Fatalf("insert health: %v", err)
+		}
 	}
 
 	c := NewCoordinator("coordinator", db)
@@ -672,6 +703,7 @@ func TestCoordinator_NoEligibleHost_SkipsInsteadOfRoundRobin(t *testing.T) {
 
 	// Quorum failure for "bad".
 	for _, observer := range []string{"coordinator", "tiny"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -815,6 +847,7 @@ func TestCoordinator_ManualFenceWithoutConfirmation_BlocksReschedule(t *testing.
 		t.Fatalf("InsertVM: %v", err)
 	}
 	for _, observer := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -871,6 +904,7 @@ func TestCoordinator_ManualFenceWithConfirmation_Reschedules(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	for _, observer := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)

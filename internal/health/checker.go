@@ -20,6 +20,12 @@ const (
 	probeConcurrency = 16
 )
 
+// ProbeInterval is the cadence at which an observer probes each peer. A probe
+// is started at most once per tick, so N consecutive failed probes from one
+// observer span at least (N-1) × ProbeInterval — the lower bound failover uses
+// to tell whether a peer has been down without a break since some instant.
+const ProbeInterval = checkInterval
+
 // HeartbeatInterval is how often an UNCHANGED host_health verdict is
 // re-published so it keeps a current updated_at.
 //

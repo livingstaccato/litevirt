@@ -315,15 +315,26 @@ A recovery refused for want of a confirmation — a `manual` fence, a
 `litevirt.fence_requires_confirmation` — resumes once an operator runs
 `lv host fence-confirm <host>`.
 
-The resume requires three things, not the confirmation alone:
+The resume requires four things, not the confirmation alone:
 
 1. **The cluster itself fenced the host** — a `fencing_log` row with result
    `fenced` or `partial`, which only a fence that ran writes.
-2. **The confirmation is newer than that fence**, so it attests to this outage
+2. **That fence belongs to this outage.** It is either under 5 minutes old, or
+   some observer has probed the host and failed without a break since before
+   it — so the host has not been seen up at any point after the fence. A fence
+   from an earlier outage the host has since recovered from authorises nothing,
+   and the coordinator logs "the newest fence attempt predates this outage".
+3. **The confirmation is newer than that fence**, so it attests to this outage
    and not an earlier one.
-3. **The host is still down now** — a fresh quorum observes it failing. A host
+4. **The host is still down now** — a fresh quorum observes it failing. A host
    that has come back, or that an operator has put into `maintenance`, is never
    resumed.
+
+An observer's unbroken run of failed probes restarts when that observer's
+daemon restarts, so after every observer has restarted a genuine confirmation
+of an older fence is refused too. Run `lv host undrain <host>`: the coordinator
+then fences the host for the outage in progress, refuses for want of a
+confirmation, and resumes once you confirm again.
 
 `fence-confirm` has no precondition and runs no fence, so on its own a mistyped
 hostname could otherwise authorise a recovery. With all three required, a

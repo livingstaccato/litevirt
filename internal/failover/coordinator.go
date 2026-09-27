@@ -1296,7 +1296,74 @@ func (c *Coordinator) confirmationResume(ctx context.Context, h *corrosion.HostR
 	if attempt.IsZero() || confirmedAt.IsZero() || confirmedAt.Before(attempt) {
 		return fenceRecord{}, false
 	}
+	if !c.attemptIsThisOutage(ctx, h.Name, attempt) {
+		slog.Warn("failover: the newest fence attempt predates this outage, NOT resuming on the confirmation",
+			"host", h.Name, "attempt", attempt.Format(time.RFC3339), "confirmation", confirm.ID,
+			"hint", "no fence has run for the outage in progress; 'lv host undrain "+h.Name+"' lets the coordinator fence it afresh")
+		c.mAttempt(PhaseRecovery, ResultRefused, ErrManualUnconfirmed)
+		return fenceRecord{}, false
+	}
 	return confirm, true
+}
+
+// attemptIsThisOutage reports whether a fence attempt at attempt belongs to the
+// outage h is in NOW, rather than to an earlier one.
+//
+// Ordering the confirmation against the attempt only says the operator spoke
+// after the cluster fenced. It says nothing about whether that fence is about
+// the host as it stands: a host fenced two days ago, back in service since,
+// and terminal again without a fence of its own (an operator's fence-confirm
+// writes 'fenced' and runs nothing) would otherwise have its workloads moved on
+// the strength of a power-off that the host has long since recovered from.
+//
+// Either of two things binds the attempt to this outage:
+//
+//   - it is within recentFenceWindow — the window every other fence-recency
+//     question in the coordinator uses — so there has been no time for the
+//     host to come back and go down again; or
+//   - some observer has watched the host fail WITHOUT A BREAK since before the
+//     attempt. Its fresh row's consecutive_failures is that unbroken run, and a
+//     run of N probes spans at least (N-1) × health.ProbeInterval, so
+//     updated_at minus that is no earlier than the start of the run. If it is
+//     at or before the attempt, the host was not seen up at any point after the
+//     fence. This is what honours an operator who took twenty minutes to reach
+//     the rack.
+//
+// Both fail towards refusing. A streak is reset by an observer restart or a
+// stall, so across a cluster-wide restart a genuine confirmation can be
+// refused; the recovery then needs a fresh fence, which `lv host undrain`
+// followed by the ordinary fence path provides. An 'unready' row is an answer,
+// not silence, and never counts as a streak.
+func (c *Coordinator) attemptIsThisOutage(ctx context.Context, host string, attempt time.Time) bool {
+	now := c.now()
+	if attempt.After(now.Add(-recentFenceWindow)) {
+		return true
+	}
+	rows, err := c.db.Query(ctx,
+		`SELECT consecutive_failures, updated_at FROM host_health
+		 WHERE target = ? AND status != ?`, host, health.StatusUnready)
+	if err != nil {
+		slog.Warn("failover: host_health read for confirmation resume failed", "host", host, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return false
+	}
+	freshCutoff := now.Add(-healthFreshness)
+	for _, r := range rows {
+		n := r.Int("consecutive_failures")
+		if n < offlineThreshold {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		if !ok || !upd.After(freshCutoff) {
+			continue
+		}
+		runStart := upd.Add(-time.Duration(n-1) * health.ProbeInterval)
+		// fencing_log timestamps carry second precision, truncated.
+		if !runStart.After(attempt.Add(time.Second)) {
+			return true
+		}
+	}
+	return false
 }
 
 // resumeFromConfirmation resumes the recovery of target if an operator has

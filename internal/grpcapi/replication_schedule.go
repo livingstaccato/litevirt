@@ -19,7 +19,7 @@ func (s *Server) CreateReplicationSchedule(ctx context.Context, req *pb.CreateRe
 	if scope == "" {
 		scope = "vm"
 	}
-	if err := s.RequirePerm(ctx, s.scheduleRBACTarget(ctx, scope, req.VmName, req.PoolName, req.ProjectName), "backup.schedule", "operator"); err != nil {
+	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
 	if req.TargetPool == "" || req.Cron == "" {
@@ -124,7 +124,7 @@ func (s *Server) DeleteReplicationSchedule(ctx context.Context, req *pb.DeleteRe
 	if scope == "" {
 		scope = "vm"
 	}
-	if err := s.RequirePerm(ctx, s.scheduleRBACTarget(ctx, scope, req.VmName, req.PoolName, req.ProjectName), "backup.schedule", "operator"); err != nil {
+	if err := s.authorizeSchedule(ctx, scope, req.VmName, req.PoolName, req.ProjectName); err != nil {
 		return nil, err
 	}
 	if req.TargetPool == "" {

@@ -25,7 +25,8 @@ import (
 //
 //	tcp    "22", ":22", "localhost:22", "127.0.0.1:22"  → <vm>:22
 //	       "db.internal:5432"                           → as given
-//	http   "http://localhost:8080/health", ":8080/health", "8080", "/health"
+//	http   "http://localhost:8080/health", ":8080/health", "8080/health",
+//	       "8080", "/health"
 //	                                                    → http://<vm>:8080/health …
 //	       "http://example.com/health"                  → as given
 //	ping   "" or "localhost"                            → <vm>
@@ -81,6 +82,10 @@ func ParseHealthTarget(typ, target string) (HealthTarget, error) {
 			return ht, prefixTarget("tcp", target, err)
 		}
 		ht.port = port
+		if isNumericName(host) {
+			return ht, &targetError{msg: fmt.Sprintf("tcp target %q: host %q is all numeric, which names no host", target, host),
+				hint: fmt.Sprintf("for a port on the VM write %q", port)}
+		}
 		if isVMSelf(host) {
 			ht.VMRelative = true
 		} else {
@@ -94,7 +99,14 @@ func ParseHealthTarget(typ, target string) (HealthTarget, error) {
 		}
 		raw := target
 		if !strings.Contains(raw, "://") {
-			if isAllDigits(raw) {
+			// A port, alone or before a path, query or fragment ("8080",
+			// "8080/health", "8080?x=1"), is a port on the VM — never a
+			// host named 8080.
+			host := raw
+			if i := strings.IndexAny(host, "/?#"); i >= 0 {
+				host = host[:i]
+			}
+			if isAllDigits(host) {
 				raw = ":" + raw
 			}
 			raw = typ + "://" + raw
@@ -116,6 +128,10 @@ func ParseHealthTarget(typ, target string) (HealthTarget, error) {
 		} else if strings.HasSuffix(u.Host, ":") {
 			return ht, fmt.Errorf("%s target %q: empty port", typ, target)
 		}
+		if h := u.Hostname(); isNumericName(h) {
+			return ht, &targetError{msg: fmt.Sprintf("%s target %q: host %q is all numeric, which names no host", typ, target, h),
+				hint: fmt.Sprintf("for port %s on the VM write %q", h, ":"+h+"/path")}
+		}
 		ht.u = u
 		ht.VMRelative = isVMSelf(u.Hostname())
 		return ht, nil
@@ -124,6 +140,10 @@ func ParseHealthTarget(typ, target string) (HealthTarget, error) {
 		if isVMSelf(target) {
 			ht.VMRelative = true
 			return ht, nil
+		}
+		if isNumericName(target) {
+			return ht, &targetError{msg: fmt.Sprintf("ping target %q is all numeric, which names no host", target),
+				hint: "write an IP address or a host name, or leave it empty for the VM"}
 		}
 		if !validPingHost(target) {
 			return ht, fmt.Errorf("ping target %q must be a host name or IP address (or empty, for the VM)", target)
@@ -407,6 +427,16 @@ func isVMSelf(host string) bool {
 	}
 	ip := net.ParseIP(strings.Trim(h, "[]"))
 	return ip != nil && ip.IsLoopback()
+}
+
+// isNumericName reports whether host is made only of digits and dots without
+// being an IP address ("8080", "1.2.3"). No DNS name is: a top-level label is
+// never all numeric.
+func isNumericName(host string) bool {
+	if host == "" || net.ParseIP(host) != nil {
+		return false
+	}
+	return isAllDigits(strings.ReplaceAll(host, ".", ""))
 }
 
 func isAllDigits(s string) bool {

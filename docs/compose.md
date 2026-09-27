@@ -595,7 +595,7 @@ Requirements:
 | `tcp` | `"22"`, `":22"`, `"localhost:22"`, `"127.0.0.1:22"` | TCP connect to `<vm-address>:22` |
 | `tcp` | `"db.internal:5432"` | `db.internal:5432`, as given |
 | `http` / `https` | `"http://localhost:8080/health"`, `":8080/health"` | `GET http://<vm-address>:8080/health` |
-| `http` / `https` | `"8080"`, `"/health"` | `GET http://<vm-address>:8080`, `GET http://<vm-address>/health` (scheme from `type`) |
+| `http` / `https` | `"8080"`, `"8080/health"`, `"/health"` | `GET http://<vm-address>:8080`, `GET http://<vm-address>:8080/health`, `GET http://<vm-address>/health` (scheme from `type`) |
 | `http` / `https` | `"http://example.com/health"` | that URL, as given |
 | `ping` | omitted, or `"localhost"` | one ICMP echo to `<vm-address>` |
 | `ping` | `"10.0.0.1"` | `10.0.0.1`, as given |
@@ -609,7 +609,7 @@ An `http` probe passes on any status below 500. Ports are numbers (`1`–`65535`
 
 **When no address is known** (the VM has no NIC, or no lease yet), the probe cannot run, and that is not a failure: the verdict is **unknown** with the reason `no address known for VM yet: …`, and the `action` never fires on it. A `vm_healthy` wait keeps waiting and, if the VM never gets an address, times out saying so. The same holds for a stored target that cannot be interpreted (a VM created before targets were validated): `unknown`, with the reason, and no action.
 
-A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails, with a non-zero exit, before anything is deployed. Every problem in the file is reported at once — healthcheck or not, in one format — each as `file:line:col: field.path: problem — fix`, the fix given where there is one:
+A target that cannot be interpreted — a `tcp` target that is not a port or `host:port`, a URL that is not `http`/`https`, a host made only of digits (`"http://8080/health"`, `"8080:22"`: a port written where the host goes), an unknown `type` or `action` — is refused when the compose file is parsed, so `lv compose up` fails, with a non-zero exit, before anything is deployed. Every problem in the file is reported at once — healthcheck or not, in one format — each as `file:line:col: field.path: problem — fix`, the fix given where there is one:
 
 ```
 compose validation errors:

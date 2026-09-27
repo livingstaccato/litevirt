@@ -123,7 +123,7 @@ func UpsertHostNetwork(ctx context.Context, c *Client, rec HostNetworkRecord) er
 // writer below because it also mints the generation.
 func SetHostNetworkState(ctx context.Context, c *Client, hostName, name, state, lastError string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE host_networks SET state = ?, last_error = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		state, lastError, now, hostName, name)
@@ -141,7 +141,7 @@ func SetHostNetworkState(ctx context.Context, c *Client, hostName, name, state, 
 // after the gateway/cluster-LAN/own-listener checks passed — may call this.
 func MarkHostNetworkApplied(ctx context.Context, c *Client, hostName, name string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE host_networks SET state = 'applied', last_error = '',
 		   generation = generation + 1, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
@@ -160,7 +160,7 @@ func MarkHostNetworkApplied(ctx context.Context, c *Client, hostName, name strin
 // tombstoned row with state=applied means "removal pending apply".
 func DeleteHostNetwork(ctx context.Context, c *Client, hostName, name string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE host_networks SET deleted_at = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		nowRFC3339(), now, hostName, name)

@@ -522,7 +522,7 @@ type TermFence struct {
 func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string, fence *TermFence) error {
 	now := c.NowTS()
 	if fence == nil {
-		n, err := c.ExecuteRows(ctx, claimProofSQL, executor, now, now, id, executor)
+		n, err := c.ExecuteRowsStrict(ctx, claimProofSQL, executor, now, now, id, executor)
 		if err != nil {
 			return err
 		}
@@ -751,7 +751,7 @@ func CompleteVMStartProof(ctx context.Context, c *Client, id, vmName, executor s
 // ErrNoRowsAffected.
 func CompleteActionProof(ctx context.Context, c *Client, id, executor string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE runtime_action_proofs
 		    SET status = 'completed', executor_host = ?, completed_at = ?, updated_at = ?
 		  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,

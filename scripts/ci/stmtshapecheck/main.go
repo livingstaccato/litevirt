@@ -437,7 +437,7 @@ func scanPkg(pkg *packages.Package) []finding {
 				s := &scanner{pkg: pkg, funcByName: funcByName, fn: fd, callPos: call.Pos(), visited: map[*ast.FuncDecl]bool{}}
 				var got []finding
 				switch method {
-				case "Execute", "ExecuteRows", "ExecuteDeferred":
+				case "Execute", "ExecuteRows", "ExecuteRowsStrict", "ExecuteDeferred":
 					if len(call.Args) >= 2 {
 						got = []finding{resolveSQL(pkg, call.Args[1])}
 					}
@@ -463,7 +463,7 @@ func scanPkg(pkg *packages.Package) []finding {
 
 func isReplicatingMethod(m string) bool {
 	switch m {
-	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded":
+	case "Execute", "ExecuteRows", "ExecuteRowsStrict", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded":
 		return true
 	}
 	return false
@@ -480,7 +480,7 @@ func isPlumbingMethod(pkg *packages.Package, fd *ast.FuncDecl) bool {
 		return false
 	}
 	switch fd.Name.Name {
-	case "Execute", "ExecuteRows", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
+	case "Execute", "ExecuteRows", "ExecuteRowsStrict", "ExecuteDeferred", "ExecuteBatch", "ExecuteBatchGuarded",
 		"executeBatchInternal", "execLocal", "execLocalRows", "execBatchLocal":
 		return true
 	}

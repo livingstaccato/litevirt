@@ -985,16 +985,41 @@ func (c *Client) Query(ctx context.Context, sqlStr string, params ...interface{}
 // Execute runs a mutation, logs it to mutation_log, and immediately notifies
 // the replicator to push it to peers.
 func (c *Client) Execute(ctx context.Context, sqlStr string, params ...interface{}) error {
-	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true)
+	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true, false)
 	return err
 }
 
 // ExecuteRows is Execute that also reports how many rows the application
-// statement changed. Use it when a no-op UPDATE must be distinguished from a
-// real one — e.g. consuming a single-use token, where a guarded WHERE matching
-// zero rows means "not consumed" and the caller must NOT treat it as success.
+// statement changed — for a caller that counts (a retention sweep, a bulk
+// hand-off whose completeness it checks separately).
+//
+// A zero-row result from ExecuteRows is still RELAYED (and, for a full-PK LWW
+// update whose row is absent, parked), exactly as from Execute. That is right
+// for a caller that only counts. A caller that treats zero rows as "did not
+// happen" wants ExecuteRowsStrict.
 func (c *Client) ExecuteRows(ctx context.Context, sqlStr string, params ...interface{}) (int64, error) {
-	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true)
+	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true, false)
+}
+
+// ExecuteRowsStrict is ExecuteRows for a write whose zero-row result is a
+// REFUSAL: a strict helper that returns ErrNoRowsAffected (or applied=false),
+// a CAS, a claim, a single-use consume. A statement that changed no row here is
+// neither written to mutation_log nor parked for its row's arrival.
+//
+// Both halves matter. mutation_log carries statements, so a relayed no-op is
+// REPLAYED by every peer: one that holds the row — or holds it at a state this
+// node's guard has already moved past — applies the change the caller was just
+// told failed, and LWW then carries it cluster-wide. Parking closes the loop on
+// the origin: an update that met no row here is applied here once the row
+// arrives. For a failed UpdateDiskPlacement the two together moved a disk's
+// recorded placement on every node, including the one that reported the move
+// as failed.
+//
+// A statement that did change a row is relayed exactly as ExecuteRows relays it.
+// The statement shape is unchanged, so the ledger and stmtshapecheck see it as
+// they see ExecuteRows.
+func (c *Client) ExecuteRowsStrict(ctx context.Context, sqlStr string, params ...interface{}) (int64, error) {
+	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true, true)
 }
 
 // ExecuteDeferred runs a mutation and logs it to mutation_log, but does NOT
@@ -1002,14 +1027,14 @@ func (c *Client) ExecuteRows(ctx context.Context, sqlStr string, params ...inter
 // periodic replication tick (~10s). Use this for high-frequency, low-priority
 // writes like health checks that don't need instant replication.
 func (c *Client) ExecuteDeferred(ctx context.Context, sqlStr string, params ...interface{}) error {
-	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, false)
+	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, false, false)
 	return err
 }
 
 // ExecuteBatch runs multiple mutations in a transaction, atomically writing
 // them to the mutation_log for replication to peers.
 func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
-	_, err := c.executeBatchInternal(ctx, stmts, true)
+	_, err := c.executeBatchInternal(ctx, stmts, true, false)
 	return err
 }
 
@@ -1135,7 +1160,10 @@ func isGuardedTransitionSQL(sql string) bool {
 		fp == mustStatementFingerprint(containerDeleteSQL)
 }
 
-func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) (int64, error) {
+// executeBatchInternal commits stmts in one transaction and logs what peers
+// must replay. strict makes a statement that changed no row a refusal: it is
+// neither relayed nor parked (see ExecuteRowsStrict).
+func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify, strict bool) (int64, error) {
 	if reason := c.quarantineReason(); reason != "" {
 		return 0, errQuarantined(reason)
 	}
@@ -1164,6 +1192,9 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 				changed = true
 				mutated = append(mutated, s)
 			}
+		}
+		if !changed && strict {
+			continue // a refusal: nothing for a peer to replay, nothing to wait for
 		}
 		if !changed {
 			if park := c.parkIfRowAbsent(ctx, tx, s, ""); park != nil {

@@ -208,7 +208,7 @@ func AssignPCIDevice(ctx context.Context, c *Client, hostName, address, vmName s
 // ownership-acquiring counterpart to ObservePCIDevice, which never changes
 // ownership. IOMMU-group siblings must each be claimed by the caller.
 func ClaimPCIDevice(ctx context.Context, c *Client, hostName, address, vmName string) (bool, error) {
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE host_pci_devices SET vm_name = ?, updated_at = ?
 		 WHERE host_name = ? AND address = ? AND deleted_at IS NULL
 		   AND (vm_name IS NULL OR vm_name = '')`,

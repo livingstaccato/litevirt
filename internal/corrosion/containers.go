@@ -322,7 +322,7 @@ func SetContainerStateAtEpoch(ctx context.Context, c *Client, hostName, name, st
 // leave state_detail unchanged.
 func SetContainerStateStrict(ctx context.Context, c *Client, hostName, name, state string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE containers SET state = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		state, now, hostName, name)
@@ -355,7 +355,7 @@ func SetContainerStateDetailAtEpoch(ctx context.Context, c *Client, hostName, na
 // either way the heal must not be believed to have landed.
 func SetContainerStateDetailStrictAtEpoch(ctx context.Context, c *Client, hostName, name, state, detail string, expectedEpoch int64) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL AND owner_epoch = ?`,
 		state, detail, now, hostName, name, expectedEpoch)
@@ -388,7 +388,7 @@ func SetContainerStateDetail(ctx context.Context, c *Client, hostName, name, sta
 // the runtime and the cluster row to diverge.
 func SetContainerStateDetailStrict(ctx context.Context, c *Client, hostName, name, state, detail string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE containers SET state = ?, state_detail = ?, updated_at = ?
 		 WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
 		state, detail, now, hostName, name)

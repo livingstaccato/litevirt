@@ -138,7 +138,12 @@ with the cluster's network table every 30 seconds, and at startup:
   later, and a node that restarted (`dnsmasq` dies with the daemon).
 - a network it set up but has since lost is provisioned again: its bridge is
   gone, or its `dnsmasq` died. The check reads the kernel's interface table and
-  the `dnsmasq` pidfile, so it costs no commands per pass.
+  the `dnsmasq` pidfile, so it costs no commands per pass. A litevirt
+  `dnsmasq` pidfile is the record that litevirt served DHCP on that bridge:
+  when its `dnsmasq` died, provisioning starts it again, even on a bridge that
+  now exists. Where this host serves no DHCP for the network (a vxlan host that
+  is no longer the gateway, a host-isolated network), a dead `dnsmasq`'s
+  pidfile is removed instead, so the next pass finds nothing to do.
 - a deleted network is torn down. This is how `lv network delete` and a stack
   delete reach every node, including one that was down at the time: it tears
   down when it comes back.

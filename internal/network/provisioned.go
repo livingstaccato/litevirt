@@ -3,6 +3,7 @@ package network
 import (
 	"errors"
 	"io/fs"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -22,20 +23,54 @@ type hostProbe struct {
 
 var realHostProbe = hostProbe{
 	ifaceExists: BridgeExists,
-	dnsmasq: func(pidFile string) (bool, bool) {
-		data, err := os.ReadFile(pidFile)
-		if errors.Is(err, fs.ErrNotExist) {
-			return false, false
-		}
-		if err != nil {
-			return true, false
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-		if err != nil {
-			return true, false
-		}
-		return true, procIsOurDnsmasq(pid, pidFile)
-	},
+	dnsmasq:     func(pidFile string) (bool, bool) { return dnsmasqState(pidFile) },
+}
+
+// dnsmasqState reports whether a litevirt dnsmasq pidfile exists at pidFile,
+// and whether the pid in it is one of our running dnsmasq instances. A seam:
+// Provision reads it too, and a test fixes its answers.
+var dnsmasqState = func(pidFile string) (present, alive bool) {
+	data, err := os.ReadFile(pidFile)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, false
+	}
+	if err != nil {
+		return true, false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return true, false
+	}
+	return true, procIsOurDnsmasq(pid, pidFile)
+}
+
+// removePidFile deletes a pidfile; a seam for the same reason.
+var removePidFile = func(path string) error { return os.Remove(path) }
+
+// litevirtServedDHCP reports whether a litevirt dnsmasq pidfile exists for
+// pidFile, live or not. dnsmasq is started only on a bridge litevirt created
+// or one --dhcp names, and Deprovision removes the pidfile, so it is the one
+// durable record that litevirt served DHCP on this bridge. Provision reads it
+// because "the bridge already exists" says nothing on the second pass: every
+// bridge litevirt made exists by then.
+func litevirtServedDHCP(pidFile string) bool {
+	present, _ := dnsmasqState(pidFile)
+	return present
+}
+
+// clearStaleDnsmasqPidFile removes pidFile when its dnsmasq is dead. Provision
+// calls it wherever this host serves no DHCP for the network: ProvisionedHere
+// reads a dead dnsmasq's pidfile as "dnsmasq died", so leaving it would make the
+// network reconciler provision again on every pass, forever. A live dnsmasq's
+// pidfile is left alone.
+func clearStaleDnsmasqPidFile(pidFile string) {
+	present, alive := dnsmasqState(pidFile)
+	if !present || alive {
+		return
+	}
+	if err := removePidFile(pidFile); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("remove stale dnsmasq pidfile", "pidfile", pidFile, "error", err)
+	}
 }
 
 // ProvisionedHere reports whether this host still has what Provision set up

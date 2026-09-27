@@ -330,6 +330,7 @@ func startDHCPFor(def compose.NetworkDef, f DHCPHostFacts, networkName, bridge, 
 		return err
 	}
 	if !DHCPWouldServe(def, f) {
+		clearStaleDnsmasqPidFile(pidFile)
 		return nil
 	}
 	gw, rangeStart, rangeEnd, mask, err := SubnetRange(def.Subnet)

@@ -109,7 +109,7 @@ func TestStreamStateDump_MatchesUnaryAndMerges(t *testing.T) {
 	defer func(orig int) { stateDumpChunkSize = orig }(stateDumpChunkSize)
 	stateDumpChunkSize = 16
 
-	stream := &fakeDumpStream{ctx: adminCtx()}
+	stream := &fakeDumpStream{ctx: unrowedPeerCtx()}
 	if err := s.StreamStateDump(&emptypb.Empty{}, stream); err != nil {
 		t.Fatalf("StreamStateDump: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestStreamStateDump_EmptyDump(t *testing.T) {
 	if data := s.db.DumpStateBytes(); len(data) != 0 {
 		t.Skipf("test DB is not empty (%d bytes); empty-dump path not exercised", len(data))
 	}
-	stream := &fakeDumpStream{ctx: adminCtx()}
+	stream := &fakeDumpStream{ctx: unrowedPeerCtx()}
 	if err := s.StreamStateDump(&emptypb.Empty{}, stream); err != nil {
 		t.Fatalf("StreamStateDump: %v", err)
 	}
@@ -149,8 +149,9 @@ func TestStreamStateDump_EmptyDump(t *testing.T) {
 	}
 }
 
-// Non-operators are rejected, same as the unary GetStateDump.
-func TestStreamStateDump_RequiresOperator(t *testing.T) {
+// An unauthenticated caller is rejected, same as the unary GetStateDump. The
+// full peer-only matrix is TestStateDump_PeerOnly.
+func TestStreamStateDump_RequiresPeer(t *testing.T) {
 	s := testServer(t)
 	stream := &fakeDumpStream{ctx: context.Background()} // no principal
 	if err := s.StreamStateDump(&emptypb.Empty{}, stream); err == nil {

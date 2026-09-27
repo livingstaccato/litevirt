@@ -200,10 +200,17 @@ func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties 
 }
 
 // GetStateDump returns a full gzipped state dump that can be merged into
-// another node's database. Used by `lv cluster sync` to force convergence.
+// another node's database: the legacy unary form of the anti-entropy repair
+// pull.
+//
+// Peer-only. The dump is the unredacted repair representation, so it carries
+// secret-bearing columns of replicated tables (hosts.ipmi_pass,
+// users.password_hash, tokens.token_hash). Only a cluster host certificate may
+// read it; an operator or admin bearer and the lv-cli client certificate are
+// refused. Operators see convergence through the digest RPCs, which carry
+// hashes, never row contents.
 func (s *Server) GetStateDump(ctx context.Context, _ *emptypb.Empty) (*pb.StateDumpResponse, error) {
-	// Dual-use: anti-entropy peers (host cert) OR an operator bearer.
-	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
+	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
 
@@ -223,9 +230,10 @@ var stateDumpChunkSize = 1 << 20 // 1 MiB
 // convergence at scale). The chunks are contiguous slices of the exact blob
 // GetStateDump returns, so the client reassembles and merges them identically.
 // GetStateDump is kept for old peers; see the StreamStateDump RPC comment.
+//
+// Peer-only, for the same reason as GetStateDump.
 func (s *Server) StreamStateDump(_ *emptypb.Empty, stream grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
-	// Dual-use: anti-entropy peers (host cert) OR an operator bearer.
-	if err := s.requirePeerOrRole(stream.Context(), "operator"); err != nil {
+	if err := s.requirePeerCert(stream.Context()); err != nil {
 		return err
 	}
 	return streamStateDump(s.db.DumpStateBytes(), stream.Send)

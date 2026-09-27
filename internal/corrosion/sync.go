@@ -248,9 +248,13 @@ type syncTable struct {
 	authority *mergeAuthorityManifest
 }
 
-// tableNames are the operator-safe tables carried by the public full-state
-// dump. Secret-bearing tables intentionally stay out of this list because
-// GetStateDump/StreamStateDump are operator-callable.
+// tableNames are the tables carried by the public full-state dump. Wholly
+// secret-bearing tables stay out of this list (see sensitiveTableNames), but
+// some tables here still hold secret COLUMNS — hosts.ipmi_pass,
+// users.password_hash, tokens.token_hash — and the dump carries them
+// unredacted, because it is the repair representation. That is why
+// GetStateDump/StreamStateDump are peer-only (host certificate); no operator
+// credential reads this dump.
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
 	"health_conditions", "health_evaluator_status", "host_capacity_observations",
@@ -425,7 +429,8 @@ func (c *Client) dumpTable(table string) (syncTable, bool) {
 	return st, true
 }
 
-// dumpState serializes all operator-safe replicated tables.
+// dumpState serializes the tableNames replicated tables, secret columns
+// included — peer-only; see tableNames.
 func (c *Client) dumpState() []byte {
 	return c.dumpStateForTables(tableNames)
 }

@@ -223,8 +223,10 @@ func TestStep0Gates_PeerOnly(t *testing.T) {
 	})
 }
 
-// TestStep0Gates_DualUse: GetStateDigest/GetStateDump accept BOTH a trusted peer
-// and an operator bearer (UI diagnostics / `lv cluster sync`), but deny a viewer.
+// TestStep0Gates_DualUse: GetStateDigest accepts BOTH a trusted peer and an
+// operator bearer (UI diagnostics / `lv cluster converge`), but denies a viewer.
+// GetStateDump is NOT dual-use — it carries secret columns and is peer-only
+// (TestStateDump_PeerOnly).
 func TestStep0Gates_DualUse(t *testing.T) {
 	s := testServer(t)
 	peerCtx := peerCtxFor(t, s, "peer-1")
@@ -236,7 +238,6 @@ func TestStep0Gates_DualUse(t *testing.T) {
 		call func(context.Context) error
 	}{
 		{"GetStateDigest", func(ctx context.Context) error { _, err := s.GetStateDigest(ctx, nil); return err }},
-		{"GetStateDump", func(ctx context.Context) error { _, err := s.GetStateDump(ctx, nil); return err }},
 	} {
 		if err := tc.call(peerCtx); err != nil {
 			t.Errorf("%s peer: unexpected err %v", tc.name, err)

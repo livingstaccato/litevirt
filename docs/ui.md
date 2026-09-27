@@ -218,7 +218,9 @@ State health inspection at `/diagnostics`:
 
 - Per-table row count and hash display
 - Drift detection (consistent vs drifted state)
-- "Force Sync" button to trigger state synchronization
+- "Force Sync" button to kick an immediate anti-entropy pass on the connected
+  host, the same as `lv cluster converge` (the UI never reads the state dump —
+  see [Who can read the state dump](auth.md#who-can-read-the-state-dump))
 - Auto-refreshes every 10 seconds
 
 ## Mass Operations

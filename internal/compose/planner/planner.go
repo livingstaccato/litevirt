@@ -348,9 +348,19 @@ func Resolve(ctx context.Context, f *compose.File, state *ClusterState) (*Resolv
 
 		// Classify a VM update (desired vs stored) and pick the least destructive
 		// way to apply it. Containers are recreated by their own path.
+		// A create's warning is collectWarnings'; any other op's is the
+		// plan's to show (a VM keeping cloud-init the file no longer has).
+		if op.Warning != "" && op.Kind != OpCreate {
+			plan.Warnings = append(plan.Warnings, op.VMName+": "+op.Warning)
+		}
 		if op.Kind == OpUpdate {
 			if !action.IsContainer {
-				if stored := storedSpecByVM[op.VMName]; stored != nil {
+				// The classification Build decided the op with, so the
+				// plan and what is applied cannot disagree about whether
+				// (and what) anything changed.
+				if op.Classified {
+					action.Plan = op.Change
+				} else if stored := storedSpecByVM[op.VMName]; stored != nil {
 					action.Plan = compose.Classify(specByVM[op.VMName], stored, compose.StoredDisksFromSpec(stored))
 				}
 			}

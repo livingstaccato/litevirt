@@ -34,6 +34,11 @@ type Op struct {
 	// is what a depends-on entry names. Empty for a delete, whose definition
 	// may be gone from the file.
 	Base string
+	// Change is the op's desired-vs-stored classification, and Classified
+	// says Build had the stored spec to make it. With it, Change is what
+	// decided the op's kind, and it is the one the executor applies.
+	Change     ChangePlan
+	Classified bool
 }
 
 // ComposeName is the name a depends-on entry refers to the op's workload by:
@@ -60,10 +65,11 @@ type CurrentVM struct {
 	State         string
 	HostName      string
 	CloudInitHash string // sha256 of userdata+networkconfig, empty if none
-	// Spec is the VM's full stored spec when the caller has it. With it, Build
-	// runs the whole desired-vs-stored comparison (Classify) before calling a VM
-	// unchanged; without it only Image/CPU/MemMiB/CloudInitHash are compared and
-	// an edit to any other field (cpu-mode, labels, disk topology, …) is invisible.
+	// Spec is the VM's full stored spec when the caller has it. With it, the
+	// desired-vs-stored comparison (Classify) alone decides whether the VM
+	// changed, and CPU/MemMiB/Image/CloudInitHash are not consulted; without
+	// it only those four are compared and an edit to any other field
+	// (cpu-mode, labels, disk topology, …) is invisible.
 	Spec *pb.VMSpec
 }
 
@@ -117,48 +123,55 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 				continue
 			}
 
-			// Check for in-place changes.
+			// What changed. With the stored spec, Classify decides — the
+			// comparison the executor applies, so a VM is never planned as an
+			// update the executor has nothing to apply for (and planned again on
+			// every later deploy). It compares the file with the spec the VM was
+			// deployed from, not with what the host reports it using now: a
+			// ballooned guest or a vCPU taken offline is not a change to the
+			// file. The coarse comparison is for a caller without the stored
+			// spec (a container, or a spec that does not parse).
 			changed := false
 			detail := ""
-			if vmDef.CPU != 0 && cur.CPU != vmDef.CPU {
-				detail += fmt.Sprintf(" cpu %d→%d", cur.CPU, vmDef.CPU)
-				changed = true
-			}
-			memMiB := int(vmDef.Memory)
-			if memMiB != 0 && cur.MemMiB != memMiB {
-				detail += fmt.Sprintf(" memory %dMiB→%dMiB", cur.MemMiB, memMiB)
-				changed = true
-			}
-			if vmDef.Image != "" && cur.Image != vmDef.Image {
-				detail += fmt.Sprintf(" image %s→%s", cur.Image, vmDef.Image)
-				changed = true
-			}
-			if vmDef.CloudInit != nil && cur.CloudInitHash != "" {
-				desiredHash := cloudInitHash(vmDef.CloudInit)
-				if desiredHash != cur.CloudInitHash {
-					detail += " cloud-init changed"
-					changed = true
-				}
-			} else if vmDef.CloudInit != nil && cur.CloudInitHash == "" {
-				detail += " cloud-init added"
-				changed = true
-			} else if vmDef.CloudInit == nil && cur.CloudInitHash != "" {
-				detail += " cloud-init removed"
-				changed = true
-			}
-
-			// The coarse fields above are what every caller can supply. When the
-			// stored spec is available, an edit to any other field must still be
-			// an update — otherwise it silently never reaches the executor.
-			if !changed && cur.Spec != nil {
+			var change ChangePlan
+			classified := cur.Spec != nil
+			if classified {
 				desired, err := BuildVMSpec(instanceName, baseName, &vmDef, f)
 				if err != nil {
 					return nil, fmt.Errorf("build spec for %s: %w", instanceName, err)
 				}
-				if cp := Classify(desired, cur.Spec, StoredDisksFromSpec(cur.Spec)); cp.Max() != ActionNoChange {
-					detail += " " + cp.Reasons()
+				change = Classify(desired, cur.Spec, StoredDisksFromSpec(cur.Spec))
+				if change.Max() != ActionNoChange {
+					detail = " " + change.Reasons()
 					changed = true
 				}
+			} else {
+				if vmDef.CPU != 0 && cur.CPU != vmDef.CPU {
+					detail += fmt.Sprintf(" cpu %d→%d", cur.CPU, vmDef.CPU)
+					changed = true
+				}
+				memMiB := int(vmDef.Memory)
+				if memMiB != 0 && cur.MemMiB != memMiB {
+					detail += fmt.Sprintf(" memory %dMiB→%dMiB", cur.MemMiB, memMiB)
+					changed = true
+				}
+				if vmDef.Image != "" && cur.Image != vmDef.Image {
+					detail += fmt.Sprintf(" image %s→%s", cur.Image, vmDef.Image)
+					changed = true
+				}
+				if vmDef.CloudInit != nil && cur.CloudInitHash != "" {
+					if cloudInitHash(vmDef.CloudInit) != cur.CloudInitHash {
+						detail += " cloud-init changed"
+						changed = true
+					}
+				} else if vmDef.CloudInit != nil && cur.CloudInitHash == "" {
+					detail += " cloud-init added"
+					changed = true
+				}
+			}
+			warning := ""
+			if vmDef.CloudInit == nil && (cur.Spec.GetCloudInit() != nil || (cur.Spec == nil && cur.CloudInitHash != "")) {
+				warning = cloudInitKeptWarning
 			}
 
 			// VMs in transient or error states are not in a stable steady
@@ -170,32 +183,39 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 			// `compose up` can recover.
 			if IsTransientOrErrorState(cur.State) {
 				plan.Ops = append(plan.Ops, Op{
-					Kind:      OpUpdate,
-					VMName:    instanceName,
-					Detail:    fmt.Sprintf("retry %s (was state=%s)", instanceName, cur.State),
-					DependsOn: vmDef.DependsOn,
-					Base:      baseName,
-					Retry:     true,
+					Kind:       OpUpdate,
+					VMName:     instanceName,
+					Detail:     fmt.Sprintf("retry %s (was state=%s)", instanceName, cur.State),
+					DependsOn:  vmDef.DependsOn,
+					Base:       baseName,
+					Retry:      true,
+					Warning:    warning,
+					Change:     change,
+					Classified: classified,
 				})
 			} else if changed {
 				// An update carries its depends-on like a create: it is held
 				// back when a dependency is not met, and the dependency is
 				// waited on for it.
 				plan.Ops = append(plan.Ops, Op{
-					Kind:      OpUpdate,
-					VMName:    instanceName,
-					Detail:    fmt.Sprintf("update %s:%s", instanceName, detail),
-					DependsOn: vmDef.DependsOn,
-					Base:      baseName,
+					Kind:       OpUpdate,
+					VMName:     instanceName,
+					Detail:     fmt.Sprintf("update %s:%s", instanceName, detail),
+					DependsOn:  vmDef.DependsOn,
+					Base:       baseName,
+					Warning:    warning,
+					Change:     change,
+					Classified: classified,
 				})
 			} else {
 				plan.Ops = append(plan.Ops, Op{
-					Kind:   OpNoChange,
-					VMName: instanceName,
-					Detail: fmt.Sprintf("%s: no changes", instanceName),
-					Base:   baseName,
+					Kind:       OpNoChange,
+					VMName:     instanceName,
+					Detail:     fmt.Sprintf("%s: no changes", instanceName),
+					Base:       baseName,
+					Warning:    warning,
+					Classified: classified,
 				})
-				_ = cur
 			}
 		}
 	}
@@ -214,6 +234,15 @@ func Build(f *File, current []CurrentVM) (*Plan, error) {
 
 	return plan, nil
 }
+
+// cloudInitKeptWarning is the plan's note on a VM whose cloud-init is no
+// longer in the file. Leaving it out keeps what is stored, as leaving out any
+// field does: cloud-init ran at the VM's first boot and is not run again for
+// the same VM, so dropping it from the file changes nothing in the guest, and
+// nothing short of replacing the VM — its disks with it — would undo what it
+// did. No update is planned for it.
+const cloudInitKeptWarning = "cloud-init is no longer in the file; the VM keeps the cloud-init it was created with " +
+	"(it ran at first boot and removing it changes nothing in the guest — only a new VM starts without it)"
 
 // Summary returns a human-readable one-line summary of the plan.
 func (p *Plan) Summary() string {

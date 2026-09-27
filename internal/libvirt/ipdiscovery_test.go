@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // A /proc/net/arp as the kernel prints it. Flags 0x2 is ATF_COM (a complete,
@@ -72,7 +73,7 @@ func TestDiscoverIPForMAC_LeaseWinsOverAStaleARPEntry(t *testing.T) {
 	withARPTable(t, `IP address       HW type     Flags       HW address            Mask     Device
 172.16.60.23     0x1         0x2         52:54:00:aa:bb:01     *        br0
 `)
-	withLeaseDir(t, "1790000000 52:54:00:aa:bb:01 172.16.60.41 web *\n")
+	withLeaseDir(t, "4102444800 52:54:00:aa:bb:01 172.16.60.41 web *\n")
 	if got := DiscoverIPForMAC("52:54:00:aa:bb:01"); got != "172.16.60.41" {
 		t.Fatalf("DiscoverIPForMAC = %q, want the lease's 172.16.60.41 over the stale ARP entry", got)
 	}
@@ -97,5 +98,69 @@ func TestGetIPFromARP_MissingTable(t *testing.T) {
 	t.Cleanup(func() { arpTablePath = old })
 	if got := GetIPFromARP("52:54:00:aa:bb:01"); got != "" {
 		t.Errorf("GetIPFromARP with no table = %q, want \"\"", got)
+	}
+}
+
+func writeLeaseFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func withLeaseClock(t *testing.T, now int64) {
+	t.Helper()
+	old := leaseNow
+	leaseNow = func() time.Time { return time.Unix(now, 0) }
+	t.Cleanup(func() { leaseNow = old })
+}
+
+// A network was deprovisioned and its lease file stayed behind; the guest now
+// holds a lease on another bridge. The expired lease in the leftover file
+// sorts first in glob order and must not win.
+func TestGetIPFromDHCPLeases_SkipsExpiredAndPrefersNewest(t *testing.T) {
+	dir := t.TempDir()
+	withLeaseClock(t, 2_000_000_000)
+	writeLeaseFile(t, dir, "litevirt-br-a.leases", "1999999000 52:54:00:aa:bb:01 10.0.1.5 web *\n")
+	if got := GetIPFromDHCPLeases(dir, "52:54:00:aa:bb:01"); got != "" {
+		t.Fatalf("GetIPFromDHCPLeases = %q with only an expired lease, want \"\" (the ARP fallback answers)", got)
+	}
+	writeLeaseFile(t, dir, "litevirt-br-b.leases", "2000003600 52:54:00:aa:bb:01 10.0.2.5 web *\n")
+	if got := GetIPFromDHCPLeases(dir, "52:54:00:aa:bb:01"); got != "10.0.2.5" {
+		t.Fatalf("GetIPFromDHCPLeases = %q, want the current lease 10.0.2.5 over the expired 10.0.1.5", got)
+	}
+
+	// Several live leases for one MAC: the one dnsmasq granted most recently
+	// (latest expiry) is the current answer, whichever file globs first.
+	writeLeaseFile(t, dir, "litevirt-br-c.leases", "2000007200 52:54:00:aa:bb:01 10.0.3.5 web *\n")
+	writeLeaseFile(t, dir, "litevirt-br-0.leases", "2000001800 52:54:00:aa:bb:01 10.0.4.5 web *\n")
+	if got := GetIPFromDHCPLeases(dir, "52:54:00:aa:bb:01"); got != "10.0.3.5" {
+		t.Fatalf("GetIPFromDHCPLeases = %q, want 10.0.3.5, the lease with the latest expiry", got)
+	}
+
+	// Expiry 0 is dnsmasq's infinite lease: never expired, and newer than any
+	// dated one.
+	writeLeaseFile(t, dir, "litevirt-br-d.leases", "0 52:54:00:aa:bb:01 10.0.5.5 web *\n")
+	if got := GetIPFromDHCPLeases(dir, "52:54:00:aa:bb:01"); got != "10.0.5.5" {
+		t.Fatalf("GetIPFromDHCPLeases = %q, want the infinite lease 10.0.5.5", got)
+	}
+}
+
+// Where the NIC's bridge is known, only that bridge's dnsmasq can be leasing
+// it an address: a lease for the same MAC in another bridge's file is not it.
+func TestDiscoverIPForMACOnBridge_IgnoresOtherBridges(t *testing.T) {
+	withARPTable(t, "IP address       HW type     Flags       HW address            Mask     Device\n")
+	withLeaseClock(t, 2_000_000_000)
+	withLeaseDir(t, "")
+	writeLeaseFile(t, dhcpLeaseDir, "litevirt-br-a.leases", "2000007200 52:54:00:aa:bb:01 10.0.1.5 web *\n")
+	writeLeaseFile(t, dhcpLeaseDir, "litevirt-br-b.leases", "2000003600 52:54:00:aa:bb:01 10.0.2.5 web *\n")
+	if got := DiscoverIPForMACOnBridge("52:54:00:aa:bb:01", "br-b"); got != "10.0.2.5" {
+		t.Fatalf("DiscoverIPForMACOnBridge(br-b) = %q, want br-b's lease 10.0.2.5", got)
+	}
+	if got := DiscoverIPForMACOnBridge("52:54:00:aa:bb:01", "br-c"); got != "" {
+		t.Fatalf("DiscoverIPForMACOnBridge(br-c) = %q, want \"\": br-c has no lease for the MAC", got)
+	}
+	if got := DiscoverIPForMACOnBridge("52:54:00:aa:bb:01", ""); got != "10.0.1.5" {
+		t.Fatalf("DiscoverIPForMACOnBridge with no bridge = %q, want the newest lease anywhere (10.0.1.5)", got)
 	}
 }

@@ -2,10 +2,12 @@ package libvirt
 
 import (
 	"bufio"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // arpTablePath is the kernel's ARP table; a variable so a test can point
@@ -77,22 +79,61 @@ var dhcpLeaseDir = "/var/lib/libvirt/dnsmasq"
 // records what it discovers would record it. ARP still answers for a MAC with
 // no lease here (a static address, an external DHCP server).
 func DiscoverIPForMAC(mac string) string {
-	if ip := GetIPFromDHCPLeases(dhcpLeaseDir, mac); ip != "" {
+	return DiscoverIPForMACOnBridge(mac, "")
+}
+
+// DiscoverIPForMACOnBridge is DiscoverIPForMAC for a NIC whose bridge is
+// known: only that bridge's dnsmasq lease file is read. Every lease file
+// litevirt ever wrote on this host is otherwise a candidate — including one a
+// deprovisioned network left behind, or another network's lease for a MAC
+// that has since moved — and none of those is where the NIC is now. An empty
+// bridge reads every file, as DiscoverIPForMAC does.
+func DiscoverIPForMACOnBridge(mac, bridge string) string {
+	var ip string
+	if bridge == "" {
+		ip = GetIPFromDHCPLeases(dhcpLeaseDir, mac)
+	} else {
+		ip = leaseIPFromFiles([]string{DHCPLeaseFile(dhcpLeaseDir, bridge)}, mac)
+	}
+	if ip != "" {
 		return ip
 	}
 	return GetIPFromARP(mac)
 }
 
+// DHCPLeaseFile is the lease file litevirt's dnsmasq for bridge writes under
+// leaseDir (network's dnsmasq args name the same file).
+func DHCPLeaseFile(leaseDir, bridge string) string {
+	return filepath.Join(leaseDir, "litevirt-"+bridge+".leases")
+}
+
+// leaseNow is the clock lease expiry is judged against; a variable so a test
+// can fix it.
+var leaseNow = time.Now
+
 // GetIPFromDHCPLeases scans dnsmasq lease files under leaseDir for a MAC address.
 // Standard libvirt lease dir is /var/lib/libvirt/dnsmasq.
+//
+// An expired lease is not an answer, and where several files lease the MAC
+// the latest expiry — the lease dnsmasq granted most recently — wins, not the
+// first file in glob order.
 func GetIPFromDHCPLeases(leaseDir, mac string) string {
-	mac = strings.ToLower(mac)
-	pattern := filepath.Join(leaseDir, "*.leases")
-	files, err := filepath.Glob(pattern)
-	if err != nil || len(files) == 0 {
+	files, err := filepath.Glob(filepath.Join(leaseDir, "*.leases"))
+	if err != nil {
 		return ""
 	}
+	return leaseIPFromFiles(files, mac)
+}
 
+// leaseIPFromFiles returns the address of the unexpired lease for mac with the
+// latest expiry across files. dnsmasq's lease format is
+// "<expiry> <mac> <ip> <hostname> <clientid>", where expiry is a Unix epoch and
+// 0 means an infinite lease.
+func leaseIPFromFiles(files []string, mac string) string {
+	mac = strings.ToLower(mac)
+	now := leaseNow().Unix()
+	var best string
+	var bestExpiry int64 = -1
 	for _, lf := range files {
 		f, err := os.Open(lf)
 		if err != nil {
@@ -100,14 +141,24 @@ func GetIPFromDHCPLeases(leaseDir, mac string) string {
 		}
 		scanner := bufio.NewScanner(f)
 		for scanner.Scan() {
-			// dnsmasq lease format: <expiry> <mac> <ip> <hostname> <clientid>
 			fields := strings.Fields(scanner.Text())
-			if len(fields) >= 3 && strings.ToLower(fields[1]) == mac {
-				f.Close()
-				return fields[2]
+			if len(fields) < 3 || strings.ToLower(fields[1]) != mac {
+				continue
+			}
+			expiry, err := strconv.ParseInt(fields[0], 10, 64)
+			if err != nil {
+				continue
+			}
+			if expiry == 0 {
+				expiry = math.MaxInt64 // infinite
+			} else if expiry <= now {
+				continue // expired: dnsmasq no longer holds this address for the MAC
+			}
+			if expiry > bestExpiry {
+				best, bestExpiry = fields[2], expiry
 			}
 		}
 		f.Close()
 	}
-	return ""
+	return best
 }

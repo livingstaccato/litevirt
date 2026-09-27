@@ -219,7 +219,7 @@ func TestGetIPFromDHCPLeases_NoFiles(t *testing.T) {
 func TestGetIPFromDHCPLeases_WithLease(t *testing.T) {
 	tmp := t.TempDir()
 	leaseFile := filepath.Join(tmp, "default.leases")
-	content := "1234567890 52:54:00:aa:bb:cc 10.0.0.5 myvm *\n1234567891 52:54:00:dd:ee:ff 10.0.0.6 othervm *\n"
+	content := "4102444800 52:54:00:aa:bb:cc 10.0.0.5 myvm *\n4102444801 52:54:00:dd:ee:ff 10.0.0.6 othervm *\n"
 	os.WriteFile(leaseFile, []byte(content), 0644)
 
 	ip := GetIPFromDHCPLeases(tmp, "52:54:00:aa:bb:cc")
@@ -241,7 +241,7 @@ func TestGetIPFromDHCPLeases_WithLease(t *testing.T) {
 func TestGetIPFromDHCPLeases_CaseInsensitive(t *testing.T) {
 	tmp := t.TempDir()
 	leaseFile := filepath.Join(tmp, "test.leases")
-	content := "1234567890 52:54:00:AA:BB:CC 10.0.0.7 myvm *\n"
+	content := "4102444800 52:54:00:AA:BB:CC 10.0.0.7 myvm *\n"
 	os.WriteFile(leaseFile, []byte(content), 0644)
 
 	ip := GetIPFromDHCPLeases(tmp, "52:54:00:aa:bb:cc")

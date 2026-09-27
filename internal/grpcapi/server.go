@@ -111,7 +111,7 @@ type Server struct {
 	// nicIPDiscovery replaces the ARP / dnsmasq-lease lookup every discovery
 	// path uses to find the address a MAC is answering on. nil in production;
 	// see SetNICIPDiscovery.
-	nicIPDiscovery func(mac string) string
+	nicIPDiscovery func(mac, bridge string) string
 
 	// nbSweepUnreachable / nbUnreachableStreak carry the orphan sweep's
 	// consecutive-blocked-pass state for the NetBox health evaluator, which
@@ -1671,7 +1671,7 @@ func (s *Server) SetContainerRuntime(r ContainerRuntime) { s.containerRuntime = 
 
 // LockContainer takes the per-container lock this host's container operations
 // hold (create, start, stop, delete), and returns its unlock. The container
-// checker takes it too (health.ContainerChecker.SetContainerLock), so its
+// checker tries it too (TryLockContainer), so its
 // reconcile never interleaves with an operation on the same container.
 func (s *Server) LockContainer(name string) func() { return s.lockVM("ct/" + name) }
 

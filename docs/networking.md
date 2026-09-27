@@ -574,8 +574,13 @@ suspended. Deleting the network is the other way out: that releases the prefix.
 ### Addresses discovered after the bind
 
 litevirt discovers addresses it did not allocate: the IP scanner reads the host's
-ARP cache and libvirt's DHCP leases every 30 seconds, and the load-balancer
-render does the same when it resolves backends. On an unbound network that
+ARP cache and litevirt's dnsmasq DHCP leases every 30 seconds, and the
+load-balancer render does the same when it resolves backends. An expired lease
+is never an answer; where more than one lease names the MAC, the latest-expiring
+one wins; and the IP scanner (like the VM healthcheck) reads only the lease file
+of the bridge the NIC's network uses, so a lease another network holds for the
+same MAC is not taken for its address. Deleting a network removes its dnsmasq
+lease file along with the dnsmasq. On an unbound network that
 discovery is simply recorded, and that is how every DHCP guest's address reaches
 the inventory.
 

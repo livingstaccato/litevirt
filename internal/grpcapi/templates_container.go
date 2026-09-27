@@ -189,7 +189,11 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	cloneSpec.Networks = specNets
 	rec := corrosion.ContainerRecord{
 		HostName: s.hostName, Name: req.Target, State: "stopped",
-		Image: src.Image, CPULimit: src.CPULimit, MemMiB: src.MemMiB,
+		// Never started yet: the restart policy copied from the source must not
+		// start it (the container checker leaves a "created" container alone).
+		// A start below clears it.
+		StateDetail: corrosion.ContainerCreatedDetail,
+		Image:       src.Image, CPULimit: src.CPULimit, MemMiB: src.MemMiB,
 		Labels: src.Labels, RestartPolicy: src.RestartPolicy,
 		Project: project, OnHostFailure: src.OnHostFailure,
 		CreateSpec: corrosion.EncodeCreateSpec(cloneSpec), CreatedAt: now,

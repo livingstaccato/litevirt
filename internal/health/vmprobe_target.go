@@ -13,6 +13,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/network"
 )
 
 // Probe targets are resolved relative to the VM.
@@ -38,6 +39,16 @@ import (
 // seam, nil in production — the same seam grpcapi's discovery has, for the
 // same reason: no test host has a guest answering ARP.
 func (v *VMChecker) SetNICIPDiscovery(fn func(mac string) string) {
+	if fn == nil {
+		v.setNICIPDiscoveryOnBridge(nil)
+		return
+	}
+	v.setNICIPDiscoveryOnBridge(func(mac, _ string) string { return fn(mac) })
+}
+
+// setNICIPDiscoveryOnBridge is SetNICIPDiscovery for a test that needs to see
+// which bridge the lookup was restricted to.
+func (v *VMChecker) setNICIPDiscoveryOnBridge(fn func(mac, bridge string) string) {
 	v.mu.Lock()
 	v.nicIPDiscovery = fn
 	v.mu.Unlock()
@@ -103,20 +114,24 @@ func (v *VMChecker) vmAddress(ctx context.Context, vm corrosion.VMRecord) (strin
 	discover := v.nicIPDiscovery
 	v.mu.Unlock()
 	if discover == nil {
-		discover = lv.DiscoverIPForMAC // the lookup grpcapi's discovery uses too
+		discover = lv.DiscoverIPForMACOnBridge // the lookup grpcapi's IP scanner uses too
 	}
-	live := func(mac string) string {
-		if mac == "" {
+	// The lookup is restricted to the bridge the NIC's network leases on, so a
+	// lease another bridge's dnsmasq holds for the MAC — a deprovisioned
+	// network's leftover, a network the guest has since left — is not taken for
+	// where the NIC is now.
+	live := func(ifc corrosion.InterfaceRecord) string {
+		if ifc.MAC == "" {
 			return ""
 		}
-		return bareIP(discover(mac))
+		return bareIP(discover(ifc.MAC, network.LeaseBridge(ctx, v.db, ifc.NetworkName)))
 	}
 	for _, ifc := range ifaces {
 		recorded := bareIP(ifc.IP)
 		if recorded == "" {
 			continue
 		}
-		if seen := live(ifc.MAC); seen != "" && seen != recorded {
+		if seen := live(ifc); seen != "" && seen != recorded {
 			slog.Debug("vmcheck: probing the live address, not the recorded one",
 				"vm", vm.Name, "mac", ifc.MAC, "recorded", recorded, "live", seen)
 			return seen, ""
@@ -124,7 +139,7 @@ func (v *VMChecker) vmAddress(ctx context.Context, vm corrosion.VMRecord) (strin
 		return recorded, ""
 	}
 	for _, ifc := range ifaces {
-		if ip := live(ifc.MAC); ip != "" {
+		if ip := live(ifc); ip != "" {
 			return ip, ""
 		}
 	}

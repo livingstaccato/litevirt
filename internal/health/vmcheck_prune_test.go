@@ -26,7 +26,7 @@ func TestSweepPrunesDeletedVMs_StopsPoisoning(t *testing.T) {
 	for _, n := range []string{"gone-1", "gone-2", "gone-3"} {
 		v.failures[n] = 2
 		v.actionCount[n] = 1
-		v.lastAction[n] = time.Now()
+		v.lastAction[n] = time.Now().Add(-time.Hour) // out of backoff: a held VM would not count toward correlation
 	}
 	v.mu.Unlock()
 	if !v.isCorrelatedFailure() {

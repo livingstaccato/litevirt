@@ -90,6 +90,7 @@ type Reconciler struct {
 	db               *corrosion.Client
 	virt             LibvirtBackend
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
+	vmStartObserver  VMStartObserver                                   // optional: told of every guest start (start grace)
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
@@ -313,6 +314,20 @@ func (r *Reconciler) now() time.Time {
 func (r *Reconciler) SetOnVMStarted(fn func(ctx context.Context, stackName string)) {
 	r.onVMStarted = fn
 }
+
+// VMStartObserver is told when this host has just booted a VM's guest — the
+// VM healthcheck (VMChecker.NoteVMStarted) opens its start grace from it.
+type VMStartObserver interface {
+	NoteVMStarted(name string)
+}
+
+// SetVMStartObserver wires the observer told of every guest start the
+// reconciler makes: a pending start (failover, reschedule, recovery) and a
+// boot-time onboot start. Without it, the healthcheck's first sweep after a
+// daemon start sees such a VM for the first time, and a first sighting then
+// opens no grace — a still-booting guest's failing probe would act on it.
+// nil-safe; the daemon passes the VMChecker.
+func (r *Reconciler) SetVMStartObserver(o VMStartObserver) { r.vmStartObserver = o }
 
 // SetAutoPullImage registers a callback to pull images from peers when missing locally.
 func (r *Reconciler) SetAutoPullImage(fn func(ctx context.Context, imageName string) error) {
@@ -1555,6 +1570,11 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		slog.Error("reconciler: start domain", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start: %v", err)) // transient libvirt
 		return
+	}
+	// The guest is booting: the healthcheck's start grace runs from now (every
+	// reconciler start — failover, reschedule, onboot — comes through here).
+	if r.vmStartObserver != nil {
+		r.vmStartObserver.NoteVMStarted(vm.Name)
 	}
 
 	// Success. When a proof authorized this start, mark it completed AND move the

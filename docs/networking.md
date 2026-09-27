@@ -577,9 +577,11 @@ litevirt discovers addresses it did not allocate: the IP scanner reads the host'
 ARP cache and litevirt's dnsmasq DHCP leases every 30 seconds, and the
 load-balancer render does the same when it resolves backends. An expired lease
 is never an answer; where more than one lease names the MAC, the latest-expiring
-one wins; and the IP scanner (like the VM healthcheck) reads only the lease file
-of the bridge the NIC's network uses, so a lease another network holds for the
-same MAC is not taken for its address. Deleting a network removes its dnsmasq
+one wins; and every lookup — the IP scanner, the load-balancer render, `lv ls`,
+`lv inspect`, a peer's backend lookup and the VM healthcheck — reads only the
+lease file of the bridge the NIC's network uses, so a lease another network
+holds for the same MAC is not taken for its address. Only a NIC whose network
+has no record to derive a bridge from is looked up across every bridge. Deleting a network removes its dnsmasq
 lease file along with the dnsmasq. On an unbound network that
 discovery is simply recorded, and that is how every DHCP guest's address reaches
 the inventory.

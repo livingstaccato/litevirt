@@ -584,7 +584,7 @@ func (s *Server) GetVMIPRemote(ctx context.Context, req *pb.GetVMIPRequest) (*pb
 		}
 		return &pb.GetVMIPResponse{Ip: ip}, nil
 	}
-	return &pb.GetVMIPResponse{Ip: s.discoverNICAddress(req.Mac)}, nil
+	return &pb.GetVMIPResponse{Ip: s.discoverNICAddress(ctx, req.Mac, req.NetworkName)}, nil
 }
 
 // UpdateFDB updates a unicast FDB entry on this host (called by peers during migration/discovery).

@@ -163,7 +163,7 @@ func (s *Server) resolveStackBackends(ctx context.Context, stackName string, all
 			ip = iface.IP
 			// Live discovery only makes sense for a running VM.
 			if ip == "" && running && vm.HostName == s.hostName {
-				ip = s.discoverNICAddress(iface.MAC)
+				ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
 			}
 			if ip == "" && running && allowRemote && vm.HostName != s.hostName {
 				ip = s.remoteVMIP(ctx, vm.HostName, iface.MAC, iface.NetworkName)
@@ -630,7 +630,7 @@ func (s *Server) CreateLoadBalancer(ctx context.Context, req *pb.CreateLBRequest
 		for _, iface := range ifaces {
 			ip := iface.IP
 			if ip == "" && iface.MAC != "" {
-				ip = s.discoverNICAddress(iface.MAC)
+				ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
 			}
 			if ip != "" {
 				lbBackends = append(lbBackends, lb.Backend{Name: vmName, IP: ip, Port: backendPort})

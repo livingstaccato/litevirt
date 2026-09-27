@@ -1222,7 +1222,7 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		for _, iface := range allIfaces[vm.Name] {
 			ip := iface.IP
 			if ip == "" && vm.HostName == s.hostName {
-				ip = s.discoverNICAddress(iface.MAC)
+				ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
 			}
 			if ip != "" && ip != iface.IP {
 				// GATED. A read RPC persisting a discovered address is still a
@@ -2286,7 +2286,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	for _, iface := range ifaces {
 		ip := iface.IP
 		if ip == "" && vm.HostName == s.hostName {
-			ip = s.discoverNICAddress(iface.MAC)
+			ip = s.discoverNICAddress(ctx, iface.MAC, iface.NetworkName)
 		}
 		// If we discovered a new IP, persist it — through the same gate ListVMs
 		// uses, and for the same reason (netbox_discovery.go): on a bound network

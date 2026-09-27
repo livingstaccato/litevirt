@@ -67,14 +67,17 @@ const (
 	discoveryRefusedNoIdentity = "no_identity"
 )
 
-// discoverNICAddress asks THIS host where a MAC is answering: the dnsmasq
-// lease first, then a complete ARP entry — lv.DiscoverIPForMAC, which says
-// why that order, and which the VM healthcheck uses too.
+// discoverNICAddress asks THIS host where a NIC on networkName is answering:
+// the dnsmasq lease first, then a complete ARP entry — lv.DiscoverIPForMAC,
+// which says why that order — restricted to the bridge networkName leases on
+// (network.LeaseBridge), as the IP scanner and the VM healthcheck probe look
+// it up. With the network unknown (no name, no record, an unreadable config)
+// there is no bridge to restrict to, and every bridge's leases are read.
 //
 // One implementation for all the discovery paths, and the seam that lets a
 // test drive discovery without a guest (see SetNICIPDiscovery).
-func (s *Server) discoverNICAddress(mac string) string {
-	return s.discoverNICAddressOnBridge(mac, "")
+func (s *Server) discoverNICAddress(ctx context.Context, mac, networkName string) string {
+	return s.discoverNICAddressOnBridge(mac, network.LeaseBridge(ctx, s.db, networkName))
 }
 
 // discoverNICAddressOnBridge is discoverNICAddress restricted to the bridge the

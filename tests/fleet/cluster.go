@@ -18,6 +18,28 @@
 // IS injected per node, so VM-lifecycle RPCs run against it; deeper scenarios
 // operate at the Corrosion / replicator layer and observe behaviour through DB
 // state changes.
+//
+// # Replication modes
+//
+// A scenario picks how state moves between nodes:
+//
+//   - SharedCRDT: every node reads and writes ONE database. Right for handler
+//     and state-transition coverage; it structurally removes independent
+//     histories, so it cannot reach a race between two nodes' decisions.
+//   - Default: each node has its own database and nothing moves until the
+//     scenario moves it — pumpMutations over the real PushMutations RPC, or an
+//     anti-entropy exchange. Delivery is exact and scenario-steered.
+//   - IndependentReplicas: each node has its own database and runs the
+//     production Replicator push loop, so writes travel on their own, over the
+//     seeded Members() view and the real RPC. Cluster.SetLinkFault then shapes
+//     each directed link — Block, Delay/Jitter, Drop, Duplicate, Reorder — from
+//     a PRNG seeded by Options.FaultSeed; Isolate cuts a node off entirely.
+//     WaitConverged waits, bounded, for every node's state digest to agree.
+//     NewCoordinators puts a failover coordinator on every node, over its own
+//     replica, reading one VirtualClock; Tick runs a poll on the nodes named.
+//     See replicas.go.
+//
+// Membership is seeded, not gossiped (seedGossipMembership), in every mode.
 package fleet
 
 import (
@@ -58,7 +80,8 @@ type Options struct {
 	// about the replication path (the rebalancer scenario, for
 	// example, already exercises shared state via NewSharedTestClient
 	// in tests/cluster/). When false (default), each node has its
-	// own DB and mutations must travel via the real Replicator.
+	// own DB and mutations must travel via the real Replicator —
+	// steered by the scenario unless IndependentReplicas starts its loop.
 	SharedCRDT bool
 	// RegionByIndex assigns regions to nodes 0..N-1. Empty → all "default".
 	RegionByIndex []string
@@ -86,6 +109,17 @@ type Options struct {
 	// VM. Empty (the default) leaves every existing scenario resolving the
 	// `cluster` row's name, exactly as before.
 	NetBoxClusterName string
+	// IndependentReplicas gives every node its own database AND starts the
+	// production Replicator push loop on it, so writes travel between nodes
+	// the way they do in production — over the seeded Members() view and the
+	// real PushMutations RPC — instead of being pumped by the scenario. It is
+	// what lets a scenario hold two coordinators' histories apart; combine it
+	// with SetLinkFault to delay, drop, duplicate, reorder or block that
+	// traffic per directed link. See replicas.go. Incompatible with SharedCRDT.
+	IndependentReplicas bool
+	// FaultSeed seeds every link's fault PRNG (see LinkFault). The zero value
+	// is a fixed seed like any other, so runs are reproducible by default.
+	FaultSeed int64
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -164,6 +198,13 @@ type Node struct {
 	// streamWatches are armed by WatchStream, keyed by method name, and
 	// consumed by the next call to that stream method. Guarded by partMu.
 	streamWatches map[string][]*StreamWatch
+
+	// faults is the per-link replication fault injector for pushes INTO this
+	// node (see LinkFault). Inert until a scenario sets a fault.
+	faults faults
+	// replStarted records that repl's push loop was started (IndependentReplicas),
+	// so Stop stops it before the database closes under it.
+	replStarted bool
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -209,6 +250,9 @@ func New(t *testing.T, opts Options) *Cluster {
 	t.Helper()
 	if opts.Nodes <= 0 {
 		opts.Nodes = 3
+	}
+	if opts.IndependentReplicas && opts.SharedCRDT {
+		t.Fatal("fleet: IndependentReplicas and SharedCRDT are mutually exclusive")
 	}
 
 	// The audit-chain tail used to be process-global, so this had to reset it
@@ -271,6 +315,11 @@ func New(t *testing.T, opts Options) *Cluster {
 		c.buildServer(n)
 	}
 
+	// Step 5 — independent replicas run the production push loop.
+	if opts.IndependentReplicas {
+		c.startReplicators()
+	}
+
 	t.Cleanup(c.Stop)
 	return c
 }
@@ -279,6 +328,13 @@ func New(t *testing.T, opts Options) *Cluster {
 func (c *Cluster) Stop() {
 	if c.cancel != nil {
 		c.cancel()
+	}
+	// Push loops first: they write watermarks into the databases closed below.
+	for _, n := range c.Nodes {
+		if n.replStarted {
+			n.repl.Stop()
+			n.replStarted = false
+		}
 	}
 	for _, n := range c.Nodes {
 		if n.selfConn != nil {
@@ -598,13 +654,13 @@ func (c *Cluster) buildServer(n *Node) {
 	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
-	// path are exercised. Its background push loop is deliberately NOT started: it
-	// discovers peers via memberlist (corrosion.Client.Members()), and the
-	// in-process fleet doesn't join a gossip mesh, so Members() is empty here and a
-	// started loop would be a no-op. Cross-node convergence is instead driven
-	// deterministically over the REAL anti-entropy repair RPC (StreamStateDump →
-	// MergeStateBytesLWW — the exact production path; see partition_test.go),
-	// rather than the gossip-timed ticker.
+	// path are exercised. By default its background push loop is NOT started, so
+	// cross-node convergence is driven deterministically by the scenario — over
+	// the REAL anti-entropy repair RPC (StreamStateDump → MergeStateBytesLWW; see
+	// partition_test.go) or the real PushMutations RPC (pumpMutations) — rather
+	// than on the loop's own timing. Options.IndependentReplicas starts the loop
+	// (see startReplicators): it discovers its peers from the seeded Members()
+	// view and dials them through the `hosts` table.
 	n.repl = corrosion.NewReplicator(n.DB, n.PKIDir, corrosion.RelayConfig{})
 	n.Server.SetReplicator(n.repl)
 
@@ -625,7 +681,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// never hit a unary interceptor.
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.Server.UnaryAuthInterceptor),
+		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor),
 		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.Server.StreamAuthInterceptor),
 	)
 	pb.RegisterLiteVirtServer(srv, n.Server)
@@ -703,8 +759,9 @@ func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
 		return false
 	}
 	n.partMu.Lock()
-	defer n.partMu.Unlock()
-	return n.blockedFrom[caller]
+	partitioned := n.blockedFrom[caller]
+	n.partMu.Unlock()
+	return partitioned || n.linkBlocked(caller)
 }
 
 func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {

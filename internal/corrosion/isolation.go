@@ -89,7 +89,7 @@ func IsolateHost(ctx context.Context, c *Client, observer, host, reason string) 
 	// out from under a reseed that pinned it, so a verified reseed could never
 	// clear anything. Two peers racing to isolate the same node converge for
 	// the same reason: the first write wins, the second is a no-op.
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE hosts SET isolation_epoch = ?, isolation_reason = ?, updated_at = ?
 		 WHERE name = ? AND deleted_at IS NULL AND isolation_epoch = 0`,
 		next, reason, now, host)
@@ -124,7 +124,7 @@ func ClearHostIsolation(ctx context.Context, c *Client, host string, expectedEpo
 		return invalidf("clearing isolation requires a host and the epoch being cleared")
 	}
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE hosts SET isolation_epoch = 0, isolation_reason = '', updated_at = ?
 		 WHERE name = ? AND deleted_at IS NULL AND isolation_epoch = ?`,
 		now, host, expectedEpoch)

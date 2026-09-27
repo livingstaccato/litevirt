@@ -266,10 +266,10 @@ func ReleaseLease(ctx context.Context, db *corrosion.Client, network, ip, mac, o
 	// Owner-scoped, not just (network, ip). A stale detach arriving after the
 	// address was reassigned would otherwise tombstone the NEW holder's lease.
 	//
-	// ExecuteRows, not Execute: its contract is that a guarded WHERE matching
-	// zero rows means the write did NOT happen, and the caller must not treat
-	// that as success.
-	n, err := db.ExecuteRows(ctx,
+	// ExecuteRowsStrict, not Execute: a guarded WHERE matching zero rows means
+	// the write did NOT happen, the caller must not treat that as success, and
+	// no peer may apply it either.
+	n, err := db.ExecuteRowsStrict(ctx,
 		`UPDATE ip_allocations SET deleted_at = ?, updated_at = ?
 		 WHERE network = ? AND ip = ? AND mac = ? AND vm_name = ?
 		   AND owner_kind = ? AND owner_host = ? AND deleted_at IS NULL`,

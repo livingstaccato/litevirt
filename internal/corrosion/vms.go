@@ -903,7 +903,7 @@ func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail st
 // handoff) so a vanished/renamed VM row cannot be mistaken for a completed write.
 func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
 		state, detail, now, name,
 	)
@@ -1354,7 +1354,7 @@ func UpdateDiskStorage(ctx context.Context, c *Client, vmName, diskName, storage
 // at the move sites (those remain for migration / snapshot reconcile).
 func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostName, path, storageType, storageVolume string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE vm_disks SET host_name = ?, path = ?, storage_type = ?, storage_volume = ?, updated_at = ?
 		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
 		hostName, path, storageType, storageVolume, now, vmName, diskName)
@@ -1533,7 +1533,7 @@ const graduateVMOwnerEpochSQL = `UPDATE vms SET vm_owner_epoch = ?, updated_at =
 // predicate across many rows, and a row a concurrent graduation already moved
 // is a success for it, not a fault.
 func GraduateVMOwnerEpoch(ctx context.Context, c *Client, name string) error {
-	n, err := c.ExecuteRows(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
+	n, err := c.ExecuteRowsStrict(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
 	if err != nil {
 		return err
 	}

@@ -182,6 +182,11 @@ func CurrentLedgerHas(fp string) bool {
 // An UNCLASSIFIED shape is relayed too —
 // unknown means "not known to be create-only", and silently withholding a
 // statement whose semantics we cannot name is the more dangerous default.
+//
+// That is the default for a shape. A CALLER that treats its own zero-row
+// result as a refusal overrides it by writing through ExecuteRowsStrict, which
+// never reaches this function for a statement that changed nothing: the
+// statement is then neither relayed nor parked, whatever its shape.
 func relayStatement(s Statement, changed bool) bool {
 	if changed {
 		return true

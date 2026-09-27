@@ -379,7 +379,7 @@ func ListUser2FA(ctx context.Context, c *Client, username string) ([]User2FAReco
 // confirms exactly the asserted credential.
 func TouchUser2FA(ctx context.Context, c *Client, username, method, label string) (bool, error) {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE user_2fa SET last_used_at = ?, updated_at = ?
 		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND deleted_at IS NULL
 		   AND epoch = (SELECT active_epoch FROM user_2fa_sets
@@ -402,7 +402,7 @@ func TouchUser2FA(ctx context.Context, c *Client, username, method, label string
 // the new high-water step so the code can't be replayed on another node either.
 func RecordTOTPStep(ctx context.Context, c *Client, username, method, label, secret string, step int64) (bool, error) {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE user_2fa SET last_step = ?, last_used_at = ?, updated_at = ?
 		 WHERE username = ? AND method = ? AND COALESCE(label,'') = ? AND secret = ?
 		   AND last_step < ? AND deleted_at IS NULL
@@ -535,7 +535,7 @@ func ListUnusedRecoveryCodes(ctx context.Context, c *Client, username string) ([
 // updated_at bump lets "used" beat a peer's stale "unused" under LWW.
 func MarkRecoveryCodeUsed(ctx context.Context, c *Client, username, codeHash string) (bool, error) {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE recovery_codes SET used_at = ?, updated_at = ?
 		 WHERE username = ? AND code_hash = ? AND used_at IS NULL AND deleted_at IS NULL
 		   AND set_id = (SELECT active_set_id FROM recovery_code_sets

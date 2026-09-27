@@ -98,7 +98,7 @@ func UpsertBinding(ctx context.Context, c *Client, r BindingRecord) error {
 	if r.Suspended {
 		susp = 1
 	}
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE netbox_bindings SET
 		   network = ?,
 		   observed_cidr = ?,

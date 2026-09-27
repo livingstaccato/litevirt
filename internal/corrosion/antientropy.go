@@ -23,7 +23,7 @@ import (
 const antiEntropyCooldown = 12 * time.Second
 
 // AntiEntropy periodically compares state digests with peers and triggers
-// a full state merge when drift is detected. This is a safety net — the
+// a merge of the mismatched tables when drift is detected. This is a safety net — the
 // primary replication path is the WAL-based Replicator.
 type AntiEntropy struct {
 	client   *Client
@@ -135,8 +135,10 @@ func (ae *AntiEntropy) checkPeers(ctx context.Context) {
 }
 
 // checkPeer runs one peer's exchange. It returns true only when the exchange
-// COMPLETED — the peer's digests were read and either matched ours or its full
-// state was merged without error — which is what marks the local replica
+// COMPLETED — the peer's digests were read and either matched ours or its copy
+// of every mismatched table was merged without error (the tables that matched
+// already agreed, so either way the local replica now holds what the peer
+// held) — which is what marks the local replica
 // caught up (see replicaFreshness). An isolated peer, an unreachable one, or a
 // failed dump/merge proves nothing and returns false.
 func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest) bool {
@@ -173,7 +175,9 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	completed := true
 	if mismatched := digestMismatches(peerName, resp.Tables, localMap); len(mismatched) > 0 {
 		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", mismatched)
-		data, err := fetchStateDump(ctx, client)
+		// Only the mismatched tables: pulling the full dump for one drifted
+		// row made every repair cost the whole cluster's state (#262).
+		data, err := fetchTableDump(ctx, client, mismatched)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
 			completed = false
@@ -316,6 +320,36 @@ func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, erro
 	return dump.Data, nil
 }
 
+// fetchTableDump pulls only the named public tables from a peer over
+// StreamTableDump, which adds any table their merge reads authority from (see
+// ResolveTableDump). A peer on an older build answers Unimplemented, on the call
+// or the first Recv, and the pull falls back to the full dump — correct, only
+// costlier — so a mixed-version cluster keeps repairing. Any other error is
+// this exchange failing and propagates.
+func fetchTableDump(ctx context.Context, client pb.LiteVirtClient, tables []string) ([]byte, error) {
+	stream, err := client.StreamTableDump(ctx, &pb.TableDumpRequest{Tables: tables})
+	if err != nil {
+		if status.Code(err) == codes.Unimplemented {
+			return fetchStateDump(ctx, client)
+		}
+		return nil, err
+	}
+	var buf []byte
+	for {
+		chunk, rerr := stream.Recv()
+		if rerr == io.EOF {
+			return buf, nil
+		}
+		if rerr != nil {
+			if status.Code(rerr) == codes.Unimplemented {
+				return fetchStateDump(ctx, client)
+			}
+			return nil, rerr
+		}
+		buf = append(buf, chunk.Data...)
+	}
+}
+
 func fetchSensitiveStateDump(ctx context.Context, client pb.LiteVirtClient, req *pb.SensitiveStateRequest) ([]byte, error) {
 	stream, err := client.StreamSensitiveStateDump(ctx, req)
 	if err != nil {
@@ -351,7 +385,7 @@ func (ae *AntiEntropy) peerClient(ctx context.Context, peerName string) (pb.Lite
 }
 
 // antiEntropyPeerTimeout bounds one peer's whole anti-entropy exchange: digest,
-// and when the digests disagree, the full state dump and its merge.
+// and when the digests disagree, the dump of the mismatched tables and its merge.
 //
 // Generous on purpose. A total deadline cannot tell an idle hang from a slow
 // transfer, and cutting a legitimate dump short is worse than the hang — it

@@ -239,6 +239,26 @@ func (s *Server) StreamStateDump(_ *emptypb.Empty, stream grpc.ServerStreamingSe
 	return streamStateDump(s.db.DumpStateBytes(), stream.Send)
 }
 
+// StreamTableDump streams the same gzipped dump as StreamStateDump restricted
+// to the named public tables (plus the parents their merge reads authority
+// from; see corrosion.ResolveTableDump), so anti-entropy repairs a mismatched
+// table without transferring and merging every other one (#262).
+//
+// Peer-only, for the same reason as StreamStateDump: a public table's dump
+// carries its secret columns. The sensitive lane keeps its own RPC — naming one
+// of its tables here is refused, since this RPC does not make the sender-CN
+// check StreamSensitiveStateDump does.
+func (s *Server) StreamTableDump(req *pb.TableDumpRequest, stream grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
+	if err := s.requirePeerCert(stream.Context()); err != nil {
+		return err
+	}
+	data, err := s.db.DumpTablesBytes(req.GetTables())
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return streamStateDump(data, stream.Send)
+}
+
 func streamStateDump(data []byte, send func(*pb.StateDumpChunk) error) error {
 	if len(data) == 0 {
 		// Send a single final empty chunk so the client gets a clean,

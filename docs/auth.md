@@ -434,11 +434,14 @@ it to impersonate a user.
 ### Who can read the state dump
 
 `GetStateDump` and `StreamStateDump` return the full replication dump, the
-representation anti-entropy repair merges. It is unredacted, so it carries the
-secret columns of replicated tables: `hosts.ipmi_pass`, `users.password_hash` and
-`tokens.token_hash`. Only a **peer** or **local-root** caller (a cluster host
-certificate) can read it. An operator or admin bearer, a session, and the `lv-cli`
-client certificate are all refused with `PermissionDenied`, whatever their role.
+representation anti-entropy repair merges, and `StreamTableDump` returns the
+same representation restricted to named tables. The dump is unredacted, so it
+carries the secret columns of replicated tables: `hosts.ipmi_pass`,
+`users.password_hash` and `tokens.token_hash`. Only a **peer** or **local-root**
+caller (a cluster host certificate) can read any of the three. An operator or
+admin bearer, a session, and the `lv-cli` client certificate are all refused
+with `PermissionDenied`, whatever their role. `StreamTableDump` never serves a
+table of the sensitive lane below; naming one is refused with `InvalidArgument`.
 The secret-bearing tables (`StreamSensitiveStateDump`, `GetSensitiveStateDigest`)
 are narrower still: peer only, and the certificate must name the sender.
 

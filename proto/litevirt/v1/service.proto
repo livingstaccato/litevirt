@@ -1976,6 +1976,16 @@ message StateDumpChunk {
     bool  final = 2; // true on the last chunk
 }
 
+// TableDumpRequest names the public replicated tables a StreamTableDump should
+// carry — the tables whose digests disagreed. The server adds any table a
+// requested one needs to merge (a child table's parent, whose rows are the
+// authority its merge checks against), refuses a sensitive-lane table, and
+// ignores a name it does not replicate. An empty list is refused rather than
+// read as "everything"; the full dump is StreamStateDump.
+message TableDumpRequest {
+    repeated string tables = 1;
+}
+
 // SensitiveStateRequest identifies the peer requesting the secret-bearing
 // anti-entropy lane. The server verifies sender against the peer certificate CN.
 message SensitiveStateRequest {
@@ -2533,6 +2543,11 @@ service LiteVirt {
     // is retained for mixed-version clusters — a new client falls back to it
     // when a peer doesn't implement the stream.
     rpc StreamStateDump(google.protobuf.Empty)      returns (stream StateDumpChunk);
+    // StreamTableDump is StreamStateDump restricted to the named public tables,
+    // so anti-entropy repairs a mismatched table without pulling every other
+    // one. Peer-only, like StreamStateDump. A caller falls back to
+    // StreamStateDump when a peer answers Unimplemented (an older build).
+    rpc StreamTableDump(TableDumpRequest)           returns (stream StateDumpChunk);
     // Sensitive state sync is peer-mTLS only. It carries secret-bearing tables
     // intentionally excluded from GetStateDump/StreamStateDump and is not an
     // operator or REST surface.

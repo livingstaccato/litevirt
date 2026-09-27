@@ -75,7 +75,10 @@ of acting — it says nothing about whether the resulting rows have replicated.
   — rather than assuming a healthy cluster implies it did.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
   and is the safety net for divergence the WAL replicator missed. Public,
-  operator-readable state uses `StreamStateDump`; eligible secret-bearing config
+  operator-readable state is repaired table by table: a pass pulls only the
+  tables whose digests disagreed (`StreamTableDump`, which adds the parent rows a
+  child table's merge checks against), and falls back to the full
+  `StreamStateDump` against a peer too old to serve it; eligible secret-bearing config
   uses a separate peer-mTLS-only sensitive dump. The older unary `GetStateDump`
   is retained as a fallback for mixed-version clusters. Convergence is automatic;
   `lv cluster converge` only *accelerates* it (kicks an immediate anti-entropy

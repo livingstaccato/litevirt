@@ -456,6 +456,11 @@ func (c *Coordinator) run(ctx context.Context) {
 	// its placements and its pushes by no longer being 'healthy' anywhere, and
 	// keeps its power. If it then goes genuinely silent, the probe records
 	// 'suspect' like any other unreachable peer and this query counts it.
+	//
+	// The status exclusion is the second line, not the only one: an unready row
+	// also carries a pinned consecutive_failures of 1 (health.checkHost), so a
+	// coordinator on an older build, whose query has no status clause, cannot
+	// count it during a rolling upgrade either.
 	freshCutoff := c.now().Add(-healthFreshness)
 	hh, err := c.db.Query(ctx,
 		`SELECT target, observer, updated_at

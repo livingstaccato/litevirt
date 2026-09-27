@@ -180,7 +180,7 @@ func TestAssignOwnerEpochAtCreate_StampsBothOnSuccess(t *testing.T) {
 	ctx := adminCtx()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
-		Name: "vm1", HostName: "test-host", State: "running", Spec: "{}",
+		Name: "vm1", HostName: "test-host", State: "creating", Spec: "{}",
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
@@ -197,6 +197,9 @@ func TestAssignOwnerEpochAtCreate_StampsBothOnSuccess(t *testing.T) {
 	if row.OwnerEpoch != 1 {
 		t.Fatalf("row epoch = %d, want 1 — the markers below are only meaningful if the row "+
 			"actually reached the generation they name", row.OwnerEpoch)
+	}
+	if row.State != "running" {
+		t.Errorf("state = %q, want running — a graduated, marked newborn is published", row.State)
 	}
 	if epoch, ok, err := fake.GetDomainOwnerEpoch("vm1"); err != nil || !ok || epoch != 1 {
 		t.Errorf("domain marker = (%d,%v,%v), want (1,true,nil)", epoch, ok, err)
@@ -271,7 +274,7 @@ func TestAssignOwnerEpochAtCreate_SkipsTheFileMarkerWithoutADataDir(t *testing.T
 	ctx := adminCtx()
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
-		Name: "vm1", HostName: "test-host", State: "running", Spec: "{}",
+		Name: "vm1", HostName: "test-host", State: "creating", Spec: "{}",
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
@@ -307,7 +310,7 @@ func TestAssignOwnerEpochAtCreate_SurvivesACancelledRPCContext(t *testing.T) {
 	s, fake := provableCreateServer(t)
 	fake.SetState("vm1", libvirtfake.StateRunning)
 	if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{
-		Name: "vm1", HostName: "test-host", State: "running", Spec: "{}",
+		Name: "vm1", HostName: "test-host", State: "creating", Spec: "{}",
 	}, nil, nil); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}

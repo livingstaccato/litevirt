@@ -19,7 +19,8 @@ import (
 //   - the VM was created less than the grace ago (created_at);
 //   - this checker started the VM itself — a healthcheck restart or a
 //     restart-policy start (noteStarted) — or the daemon's own start path did
-//     (NoteVMStarted: StartVM, RestartVM, a reconfigure restart);
+//     (NoteVMStarted: StartVM, RestartVM, a reconfigure restart, and the
+//     Reconciler's onboot and pending starts via its VMStartObserver);
 //   - a sweep saw the VM running where the previous sweep saw it not running
 //     (an operator start, a redefine and start, a restart policy);
 //   - a sweep saw it running under a different owner host, owner epoch or

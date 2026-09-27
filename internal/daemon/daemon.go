@@ -933,6 +933,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// including RestartVM's, which keeps the row "running" and is otherwise
 	// invisible to the checker's sweep.
 	svc.SetVMStartObserver(vmChecker)
+	reconciler.SetVMStartObserver(vmChecker) // onboot and failover starts open the healthcheck start grace too
 	// hardware_v2 pre-start hook: the automated (re)start paths (failover reconciler +
 	// health auto-restart) bypass startVMLocked, so wire them to the Server's shared
 	// adoption-gate + PCI-start-preflight. A strict no-op until hardware_v2 latches, so

@@ -202,6 +202,8 @@ type Node struct {
 	// faults is the per-link replication fault injector for pushes INTO this
 	// node (see LinkFault). Inert until a scenario sets a fault.
 	faults faults
+	// aeMeter counts the anti-entropy RPCs this node served (see ae_meter.go).
+	aeMeter aeMeter
 	// replStarted records that repl's push loop was started (IndependentReplicas),
 	// so Stop stops it before the database closes under it.
 	replStarted bool
@@ -681,8 +683,8 @@ func (c *Cluster) buildServer(n *Node) {
 	// never hit a unary interceptor.
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor),
-		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.Server.StreamAuthInterceptor),
+		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor),
+		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor),
 	)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv
@@ -712,6 +714,7 @@ var partitionedMethods = map[string]bool{
 	"GetStateDigest":           true,
 	"GetStateDump":             true,
 	"StreamStateDump":          true,
+	"StreamTableDump":          true,
 	"GetSensitiveStateDigest":  true,
 	"StreamSensitiveStateDump": true,
 	"ReserveProjectCapacity":   true,
@@ -799,6 +802,9 @@ func (n *Node) DoNotImplement(method string) func() {
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
+	}
+	if n.answersUnimplemented(info.FullMethod) {
+		return status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
 	}
 	watches := n.takeStreamWatches(methodName(info.FullMethod))
 	for _, w := range watches {

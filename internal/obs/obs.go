@@ -161,6 +161,7 @@ var noisyMethods = map[string]struct{}{
 	"GetStateDigest":           {},
 	"GetStateDump":             {},
 	"StreamStateDump":          {},
+	"StreamTableDump":          {},
 	"GetSensitiveStateDigest":  {},
 	"StreamSensitiveStateDump": {},
 	"PushMutations":            {},

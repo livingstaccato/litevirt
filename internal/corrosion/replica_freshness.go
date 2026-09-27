@@ -19,8 +19,9 @@ import (
 // the real owner's row.
 //
 // WHAT MARKS IT CAUGHT UP: one anti-entropy exchange with a peer that
-// COMPLETED — the digests compared equal, or the peer's full state dump was
-// merged without error. After either, the local replica holds everything that
+// COMPLETED — the digests compared equal, or the peer's dump of every table
+// whose digest differed was merged without error. After either, the local
+// replica holds everything that
 // peer held when the exchange began (LWW keeps whichever side is newer), so
 // anything the cluster decided while this node was away and that peer knew is
 // now here. The replicator's push path may deliver the same rows sooner; it

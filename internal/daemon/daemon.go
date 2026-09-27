@@ -497,11 +497,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
 	// Start WAL-based replicator with Crescent relay protocol.
-	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, corrosion.RelayConfig{
+	// One relay election for both the replicator and anti-entropy, whose
+	// scheduled pass always contacts this node's relays.
+	relayCfg := corrosion.RelayConfig{
 		BaseRelays:      3,
 		NodesPerRelay:   50,
 		FallbackTimeout: 15 * time.Second,
-	})
+	}
+	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, relayCfg)
 	// Token-based (fresh-Ping-cached) gate for proof-table WAL replication, wired
 	// BEFORE Start: only send runtime_action_proofs mutations to a peer that
 	// advertises the gate. Fail-closed until SetPeerPinger (below) — proofs defer.
@@ -578,6 +581,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
 	// default inside NewAntiEntropy. (P2-2)
 	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
+	ae.SetRelayConfig(relayCfg)
 	go ae.Start(ctx)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the

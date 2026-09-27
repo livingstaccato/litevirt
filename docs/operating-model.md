@@ -74,12 +74,19 @@ of acting — it says nothing about whether the resulting rows have replicated.
   advancing past the write, or `lv cluster converge` reporting matching digests
   — rather than assuming a healthy cluster implies it did.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
-  and is the safety net for divergence the WAL replicator missed. Public,
-  operator-readable state uses `StreamStateDump`; eligible secret-bearing config
+  and is the safety net for divergence the WAL replicator missed. A scheduled
+  pass does not contact every peer: it contacts this node's relays (a leaf's
+  assigned pair, or a relay's fellow relays) plus two other peers, taken in
+  turn from a random ordering of the rest. With M non-relay peers every peer
+  is reached within any 2·⌈M/2⌉−1 consecutive passes. Public,
+  operator-readable state is repaired table by table: a pass pulls only the
+  tables whose digests disagreed (`StreamTableDump`, which adds the parent rows a
+  child table's merge checks against), and falls back to the full
+  `StreamStateDump` against a peer too old to serve it; eligible secret-bearing config
   uses a separate peer-mTLS-only sensitive dump. The older unary `GetStateDump`
   is retained as a fallback for mixed-version clusters. Convergence is automatic;
   `lv cluster converge` only *accelerates* it (kicks an immediate anti-entropy
-  pass) and *verifies* it (cross-host digest report) — it never exports or merges
+  pass, which contacts every peer rather than a sample) and *verifies* it (cross-host digest report) — it never exports or merges
   redacted state itself.
 
 ### HA / Failover
@@ -795,11 +802,22 @@ leadership churn or a partition.
 - **5 nodes**: recommended. 2-node failure tolerated.
 - **Even N**: only with a witness. 2-node with witness is fine for homelab.
 - **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
-  this repo is 3 nodes (`tests/fleet/`) and the largest by hand is the 4-node
-  lab. The relay-quorum protocol scales O(n) by design and there is no known
+  this repo that runs workload scenarios is 3 nodes (`tests/fleet/`), the only
+  larger one measures anti-entropy alone (below), and the largest by hand is
+  the 4-node lab. The relay-quorum protocol scales O(n) by design and there is no known
   ceiling, but a figure like "tested and supported at ~50 nodes" is not
   backed by a sustained load test and should not be planned
   against. Larger clusters will likely need the anti-entropy interval tuned.
+- **Anti-entropy pass cost, measured at 50 nodes.** `TestFleet_AntiEntropyScale_PassCost`
+  in `tests/fleet/` runs 50 daemons in one process, each with its own replica
+  and real gRPC/mTLS, holding 200 VMs of state; `LITEVIRT_FLEET_AE_NODES=50`
+  selects that size. One scheduled pass on every node costs 408 anti-entropy
+  RPCs and 0.53 MB of responses when the replicas agree (8.2 RPCs per node),
+  where a pass contacting every member costs 4,900 RPCs and 6.3 MB. With one
+  row drifted on one node the pass pulls 730 bytes of table dumps, where
+  answering every mismatch with the full dump pulls 7.9 MB, and the row reaches
+  all 50 replicas within 3 passes. That is the cost of one pass in one
+  process, not a sustained load test.
 
 ### Network
 - **Inter-host RTT < 10 ms**: comfortable. Default replicator and

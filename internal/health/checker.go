@@ -156,6 +156,14 @@ type Checker struct {
 	// observed across, or shortly after, a gap in this process's own execution
 	// are not evidence against the peer.
 	stall stallState
+
+	// voterSet replaces corrosion.VoterSet for the probe plan in tests. Nil in
+	// production.
+	voterSet func(context.Context) (map[string]bool, error)
+	// planned is the set of peers the last completed cycle's plan probed
+	// (probe_plan.go); nil until one has run. PeerUp reads it to tell "not
+	// probed by me" from "probed and not healthy".
+	planned map[string]bool
 }
 
 // now reads the checker's local clock.
@@ -253,8 +261,8 @@ func (c *Checker) Start(ctx context.Context) {
 	}
 }
 
-// checkAllPeers probes every peer once. It returns true only when it actually
-// ENUMERATED the host list — a ListHosts error probes nobody and returns false, so the
+// checkAllPeers probes every peer in this node's probe plan (probe_plan.go)
+// once. It returns true only when it actually ENUMERATED the host list — a ListHosts error probes nobody and returns false, so the
 // caller must not treat that tick as a completed warmup cycle (else Unknown collapses to
 // No with an empty c.peers on a single transient DB error).
 func (c *Checker) checkAllPeers(ctx context.Context) bool {
@@ -313,6 +321,36 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 
 		targets = append(targets, host)
 	}
+
+	// All-pairs among voters, sampled for non-voters (probe_plan.go). A voter
+	// set that cannot be read leaves the full mesh: the plan only ever drops
+	// edges no quorum counts, and without the voter set it cannot tell which.
+	names := planCandidates(c.hostName, hosts)
+	voters, verr := c.voters(ctx)
+	if verr != nil {
+		slog.Warn("health check: voter set unreadable; probing every peer this cycle", "error", verr)
+		voters = nil
+	}
+	plan := probePlan(c.hostName, names, voters, nonVoterProbeSample)
+	planned := targets[:0:0]
+	for _, h := range targets {
+		if plan[h.Name] {
+			planned = append(planned, h)
+		}
+	}
+	// A peer that left the plan leaves c.peers with it. Its last verdict would
+	// otherwise stand forever, and HealthyPeers would keep offering it as
+	// proven live. Maintenance hosts are not candidates and keep their entry,
+	// exactly as before the plan existed.
+	c.mu.Lock()
+	for _, name := range names {
+		if !plan[name] {
+			delete(c.peers, name)
+		}
+	}
+	c.planned = plan
+	c.mu.Unlock()
+	targets = planned
 
 	// Probe peers with bounded concurrency and wait for the batch. Previously
 	// this fired one goroutine per host per tick with no bound — a probe that

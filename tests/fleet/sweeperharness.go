@@ -73,6 +73,18 @@ func (g *fleetGate) HealthyPeers(ctx context.Context) []string {
 	return out
 }
 
+// PeerUp is the checker's answer with the same overlay: without it the
+// promoted health.Checker.PeerUp would answer from the checker alone and a
+// Rejoin would be invisible to every reader that asks PeerUp.
+func (g *fleetGate) PeerUp(ctx context.Context, host string) bool {
+	for _, h := range g.reach.list() {
+		if h == host {
+			return true
+		}
+	}
+	return g.Checker.PeerUp(ctx, host)
+}
+
 // Rejoin declares this node reachable again to every node's gate.
 //
 // It is the counterpart to a fence confirmation: the attestation says "this

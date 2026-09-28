@@ -235,3 +235,52 @@ func clusterOverall(t *testing.T, s *Server, ctx context.Context) string {
 	}
 	return h.GetOverall()
 }
+
+// A non-voter probes every voter but only a sample of the other non-voters
+// (internal/health/probe_plan.go), so an edge between two non-voters outside
+// the observer's sample is frozen at whatever it last said, exactly like an
+// edge into maintenance. It must not hold the cluster DEGRADED; an edge the
+// observer still probes must.
+//
+// Non-voters here are offline hosts, the ones today's VoterSet leaves out:
+// host-c's plan is its three ring successors host-d, host-e and host-f, and
+// not host-g.
+func TestGetClusterHealth_UnprobedNonVoterEdgeDoesNotLatchDegraded(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	for _, name := range []string{"host-a", "host-b", "host-c", "host-d", "host-e", "host-f", "host-g"} {
+		state := "offline"
+		if name == "host-a" || name == "host-b" {
+			state = "active"
+		}
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{
+			Name: name, Address: "10.0.0.1", SSHUser: "root", SSHPort: 22,
+			GRPCPort: 7443, State: state,
+		}); err != nil {
+			t.Fatalf("InsertHost %s: %v", name, err)
+		}
+	}
+	if err := corrosion.UpsertHealthEvaluatorStatus(ctx, s.db, corrosion.HealthEvaluatorStatus{
+		Evaluator: "dual_run", LastScan: freshScan(), Coverage: corrosion.CoverageComplete, Reporter: "host-a",
+	}); err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	edge := func(target string) {
+		t.Helper()
+		if err := s.db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES ('host-c', ?, 'suspect', 3, '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')`, target); err != nil {
+			t.Fatalf("insert suspect edge: %v", err)
+		}
+	}
+
+	edge("host-g")
+	if got := clusterOverall(t, s, ctx); got != HealthHealthy {
+		t.Errorf("overall = %q, want HEALTHY: host-c does not probe host-g, so that edge is frozen, not failing", got)
+	}
+	edge("host-d")
+	if got := clusterOverall(t, s, ctx); got != HealthDegraded {
+		t.Errorf("overall = %q, want DEGRADED: host-c probes host-d, so its suspect edge is live", got)
+	}
+}

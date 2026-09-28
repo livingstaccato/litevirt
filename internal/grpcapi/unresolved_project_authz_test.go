@@ -16,7 +16,9 @@ import (
 // project: when this node cannot name that project — the row has not reached
 // it, or does not exist — the caller is NOT judged against _default. Only a
 // cluster-root grant authorizes (so an admin's idempotent re-issue of a delete
-// still works); anyone else gets a retryable NotFound.
+// still works). A caller the old _default guess would have admitted gets a
+// retryable NotFound and nothing happens; anyone else gets PermissionDenied,
+// with one message whether or not the name exists here.
 //
 // The hazard each test reaches: a caller whose only grant is on _default names
 // a resource in another project through a node that lacks its row. The old
@@ -180,5 +182,77 @@ func TestScheduleDelete_OwnerAndRootStillDelete(t *testing.T) {
 		VmName: "orphan", Repo: "/repo",
 	}); err != nil {
 		t.Errorf("root delete of an orphan schedule: %v", err)
+	}
+}
+
+// A caller with no rights on a name must not learn whether it exists on this
+// node. The same request, against a node that holds the resource (in a project
+// the caller cannot reach) and one that does not, must fail identically — code
+// AND message. RequirePerm's own denial names the resolved path, so without the
+// uniform message a denial would reveal the resource's project, and a NotFound
+// on the absent side would reveal its absence.
+//
+// Two callers: a grant confined to another project, and a root grant used
+// through a token scoped to another project.
+func TestResolvedAuthz_AnOutOfScopeCallerCannotTellWhetherANameExists(t *testing.T) {
+	type principal struct {
+		name  string
+		setup func(t *testing.T, s *Server) context.Context
+	}
+	principals := []principal{
+		{"project-confined grant", func(t *testing.T, s *Server) context.Context {
+			return grantUser(t, s, "carol", "/projects/acme", "Admin")
+		}},
+		{"root grant through an acme-scoped token", func(t *testing.T, s *Server) context.Context {
+			ctx := grantUser(t, s, "dave", "/", "Admin")
+			return context.WithValue(ctx, ctxKeyScopePaths, []string{"/projects/acme"})
+		}},
+	}
+	ops := map[string]func(s *Server, ctx context.Context) error{
+		"sg bind": func(s *Server, ctx context.Context) error {
+			_, err := s.BindSecurityGroups(ctx, &pb.BindSecurityGroupsRequest{
+				VmName: "probe", NetworkName: "lan", SecurityGroups: []string{"x"},
+			})
+			return err
+		},
+		"backup schedule delete": func(s *Server, ctx context.Context) error {
+			_, err := s.DeleteBackupSchedule(ctx, &pb.DeleteBackupScheduleRequest{VmName: "probe", Repo: "/repo"})
+			return err
+		},
+		"container stop": func(s *Server, ctx context.Context) error {
+			_, err := s.StopContainer(ctx, &pb.StopContainerRequest{Name: "probe", HostName: "host-b"})
+			return err
+		},
+	}
+	for _, p := range principals {
+		for opName, op := range ops {
+			t.Run(p.name+"/"+opName, func(t *testing.T) {
+				holder := testServer(t)
+				holder.SetContainerRuntime(&fakeCTRuntime{})
+				unresolvedPeer(holder)
+				seedSGVM(t, holder, "probe", "beta")
+				if err := corrosion.UpsertContainer(context.Background(), holder.db, corrosion.ContainerRecord{
+					HostName: "host-b", Name: "probe", State: "running", Project: "beta",
+				}); err != nil {
+					t.Fatalf("UpsertContainer: %v", err)
+				}
+				lacker := testServer(t)
+				lacker.SetContainerRuntime(&fakeCTRuntime{})
+				fake := unresolvedPeer(lacker)
+
+				present := op(holder, p.setup(t, holder))
+				absent := op(lacker, p.setup(t, lacker))
+				if status.Code(present) != codes.PermissionDenied {
+					t.Errorf("name present: %v, want PermissionDenied", present)
+				}
+				if status.Code(absent) != status.Code(present) || status.Convert(absent).Message() != status.Convert(present).Message() {
+					t.Errorf("the response tells a caller with no rights whether the name exists:\n  present: %v\n  absent:  %v",
+						present, absent)
+				}
+				if n := fake.forwards(); n != 0 {
+					t.Errorf("%d call(s) forwarded for a caller with no rights", n)
+				}
+			})
+		}
 	}
 }

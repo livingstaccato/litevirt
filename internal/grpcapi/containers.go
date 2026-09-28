@@ -287,7 +287,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	project, known := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "ct.start", "operator", containerWhat(req.Name)); err != nil {
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.start", "operator", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
 	// Resolve the OWNER when no host was named (same shape as DeleteContainer):
@@ -375,7 +375,7 @@ func (s *Server) StopContainer(ctx context.Context, req *pb.StopContainerRequest
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	project, known := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "ct.stop", "operator", containerWhat(req.Name)); err != nil {
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.stop", "operator", containerWhat(req.Name)); err != nil {
 		return nil, err
 	}
 	// Owner resolution, same as StartContainer/DeleteContainer.
@@ -416,7 +416,7 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 	project, known := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "ct.delete", "operator", containerWhat(req.Name)); err != nil {
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "ct.delete", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.delete", req.Name, "project="+project, "denied")
 		return nil, err
 	}

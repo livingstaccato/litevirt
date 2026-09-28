@@ -788,7 +788,7 @@ CREATE TABLE IF NOT EXISTS voter_configs (
     generation    INTEGER PRIMARY KEY,
     members_json  TEXT NOT NULL,   -- sorted [{name, incarnation}]
     members_hash  TEXT NOT NULL,
-    change        TEXT NOT NULL,   -- genesis | add:<name> | rm:<name> | force:<name,...>
+    change        TEXT NOT NULL,   -- genesis | add:<name> | rm:<name> | force:<name,...> | reset
     certificate   TEXT NOT NULL,   -- claim certificate deciding this generation (§4.3),
                                    -- or the forced-generation evidence (§4.6)
     created_by    TEXT NOT NULL,   -- principal, for audit
@@ -813,19 +813,55 @@ adopted and from which sealed majority it imported claim state (§4.4).
 
 ### 4.2 Bootstrap
 
-A cluster with no `voter_configs` rows keeps today's derived `corrosion.VoterSet`.
-The fixed set begins with an explicit operator action:
+A cluster with no `voter_configs` rows uses today's derived `corrosion.VoterSet`
+until genesis. Genesis is automatic, so every cluster reaches the explicit voter
+set without an operator remembering a step. A cluster that never ran a manual
+step would otherwise keep colonelpanik/litevirt#251's bug for good.
 
-- `lv cluster voter init` (proposed) takes the connected node's current
-  `VoterSet` as the proposed members, prints it, and asks for confirmation. It
-  writes generation 1 only if **every** proposed member returns a signed accept
-  for it. Genesis is unanimous because no earlier config exists whose majority
-  could decide it. Unanimity on a healthy cluster is a small cost for a one-time
-  step.
-- It is refused unless `voter_config_v1` is durably latched (§5.1), so it
-  cannot write a new replicated shape before every peer can decode it. It does
-  not need `recovery_claim_v1` or `enforcement.recovery_claim`: the voter set
-  is useful, and permanent, on its own (§4.5).
+- **Automatic genesis.** Once `voter_config_v1` is durably latched (§5.1), the
+  leader-lease holder proposes generation 1 on each reconcile tick, with its
+  derived `VoterSet` as the members. It proposes only on a **clean** cluster:
+  every non-deleted host is voting-eligible and reachable. None is in
+  `maintenance`, `offline` or fenced. Genesis therefore never freezes a host out
+  of the voter set because it happened to be away when the token latched. It
+  writes generation 1 only if **every** proposed member returns a signed
+  accept. Genesis is unanimous because no earlier config exists whose majority
+  could decide it. Genesis is itself a claim, with key `("voter_config", "", 0, 0)`,
+  so two proposers racing across a lease hand-off decide one value.
+- **While genesis is blocked**, the *proposed* health condition
+  `ha.voter.genesis_pending` names each host holding it back, its state, and
+  what clears it: finish the maintenance, bring the host back, or remove it
+  with `lv host rm --dead` (§3.12).
+- **Manual genesis.** `lv cluster voter init [--members a,b,c]` (proposed) is
+  the fallback for a cluster that cannot become clean, for example one with a
+  permanently dead host the operator has not removed yet. It prints the
+  proposed members, defaulting to the derived `VoterSet`, and asks for
+  confirmation. The same unanimity applies. It is refused while automatic
+  genesis could still succeed without it, which keeps one path for the common
+  case.
+- Both are refused until `voter_config_v1` is durably latched, so neither can
+  write a new replicated shape before every peer can decode it. Neither needs
+  `recovery_claim_v1` or `enforcement.recovery_claim`: the voter set is useful,
+  and permanent, on its own (§4.5).
+
+**Reset.** `lv cluster voter reset` (proposed) returns the cluster to the
+derived set. It is a config change like §4.3: change kind `reset`, empty
+members, decided by a majority of the current generation. So every node leaves
+the explicit set at the same generation, which is what a per-node flag cannot
+do (§5.1).
+
+- On adopting a `reset` generation, each node's `VoterSet` is derived again.
+  Claim enforcement stops, because its predicate needs an adopted member config
+  (§5.1), and recovery is authorized as today. The claim tables are kept.
+- A reset is sticky. Automatic genesis runs only while `voter_configs` is
+  empty, so after a reset only `lv cluster voter init` starts a new member
+  generation, unanimously, as genesis is.
+- If the majority needed to decide the reset is lost, `force-reconfigure`
+  (§4.6) comes first.
+- Reset is the exit from explicit voting when the voter config itself is
+  suspect. It is **not** a rollback tool. A binary rolled back below
+  `voter_config_v1` enters WAL quarantine whether or not a config exists, as it
+  does below every latched token (§5.1).
 
 ### 4.3 Add and remove
 
@@ -893,7 +929,7 @@ same set to its three consumers today (the fence quorum, the recovery quorum in
 This holds whatever `enforcement.recovery_claim` says. The voter set is a fact
 the cluster agreed on, not a policy, so no flag makes `VoterSet` ignore
 `voter_configs`, and colonelpanik/litevirt#251 step 2 ships and stands on its
-own (§9, Q4). The only ways to change it are §4.3 and §4.6.
+own (§9, Q4). The only ways to change it are §4.2 (reset), §4.3 and §4.6.
 
 The capability-latch sweep (`activationTargets`) keeps its current derived
 `VotingEligible` population, so a fenced voter that is still a member cannot
@@ -1006,9 +1042,8 @@ node-local grant tables and the voter incarnation.
 
 - **Mandatory: yes.** It states a fact about the binary: this build can decode
   `voter_configs` and can answer `Prepare` / `Accept` / `GetRecoveryClaim`
-  durably. It enforces nothing on its own. The operator's opt-in is
-  `lv cluster voter init` (proposed), and until that runs `VoterSet` is derived
-  exactly as today.
+  durably. Latching it starts automatic genesis (§4.2). Until genesis
+  completes, `VoterSet` is derived exactly as today.
 - **Advertised when ready:** `PRAGMA synchronous` ≥ FULL (§3.7), the host
   signing key loads, and the claim RPCs are registered. A *proposed*
   `grpcapi.VoterConfigReadiness` is the local-only probe, in the pattern of
@@ -1016,13 +1051,17 @@ node-local grant tables and the voter incarnation.
 - **`ReplicationGated`: yes.** Latching it allows the new replicated shape
   `voter_configs`. That is a claim about what every host still *receiving*
   replication can decode, which is the `lease_term_ledger_v1` argument.
-- **Stand-down: none, by design.** An adopted voter config is permanent. The
-  incident tools are `lv cluster voter rm` / `add`, `lv host rm --dead` and
-  `lv cluster voter force-reconfigure` (all proposed, §3.12, §4.3, §4.6), not a
-  flag. A host rolled back below this build after `voter init` cannot decode
-  `voter_configs` and back-pressures its stream, so rollback below it is
-  unsupported once a config exists. That note belongs beside the declaration
-  in `capabilities.mandatory` when it lands.
+- **Stand-down: no flag, by design.** A flag would be worse than none. A node
+  with it off would count a different majority from its peers, which is the
+  split-brain the voter set exists to prevent. The incident tools are
+  `lv cluster voter rm` / `add`, `lv host rm --dead`,
+  `lv cluster voter force-reconfigure` and `lv cluster voter reset` (all
+  proposed, §3.12, §4.2, §4.3, §4.6). Each is a decided change, so every node
+  moves at the same generation. `reset` is the full exit back to the derived
+  set. A host rolled back below this build after the token has latched enters
+  WAL quarantine, as for every latched token, whether or not a config exists.
+  That note belongs beside the declaration in `capabilities.mandatory` when it
+  lands.
 
 **`recovery_claim_v1`** (proposed, `capabilities.RecoveryClaimV1`) covers
 enforcement: coordinators claiming before they mint, and destinations
@@ -1090,11 +1129,11 @@ over:
 - **An old binary** advertises neither token, so neither can latch
   (`ReplicationGated` includes hosts in `maintenance`). Every node behaves as
   today.
-- **Every host on a new build, before `voter init`:** `voter_config_v1` latches
-  by itself, because it is mandatory. Nothing changes: `VoterSet` is still
-  derived. `lv doctor` (proposed check) says
-  `voter_config_v1 latched; run lv cluster voter init` (proposed command).
-- **After `voter init`:** `VoterSet` counts the explicit set for the fence
+- **Every host on a new build:** `voter_config_v1` latches by itself, because
+  it is mandatory, and automatic genesis follows on the next reconcile tick on
+  a clean cluster (§4.2). Until then `VoterSet` is derived, and
+  `ha.voter.genesis_pending` names whatever holds genesis back.
+- **After genesis:** `VoterSet` counts the explicit set for the fence
   quorum, the recovery quorum and `health.QuorumProof`, and voter changes are
   claims. Recovery itself is authorized as today until claims are enforced.
 - **A new binary with `enforcement.recovery_claim` on, before
@@ -1124,7 +1163,9 @@ over:
   its detail. This is the one place a stuck claim can be diagnosed.
 - **Health conditions** (proposed): `ha.claim.stranded` names each workload
   decided for a destination that is fenced or gone, with the exact
-  `lv host rm --dead <host>` command (§3.12). `ha.voter.unavailable` names
+  `lv host rm --dead <host>` command (§3.12). `ha.voter.genesis_pending` names
+  each host holding automatic genesis back and what clears it (§4.2).
+  `ha.voter.unavailable` names
   voters that are fenced, offline or abstaining (§4.3). `ha.voter.forced` marks
   a forced reconfiguration until its lost hosts are removed (§4.6).
 - **`lv cluster voter ls`** (proposed) shows the adopted generation, its
@@ -1135,10 +1176,12 @@ over:
 
 1. Roll every host to a build with the claim protocol. Run `lv doctor fence`
    and confirm the fence posture is what you expect.
-2. Wait for `voter_config_v1` to latch, which needs no config, and run
-   `lv cluster voter init` (proposed) from any node. Confirm the member list.
-   This step stands on its own: a cluster can stop here and keep an explicit
-   voter set without ever enforcing claims.
+2. Wait for `voter_config_v1` to latch and genesis to complete. Neither needs
+   config. `lv cluster voter ls` (proposed) shows generation 1 and its members.
+   If `ha.voter.genesis_pending` persists, clear what it names, or run
+   `lv cluster voter init --members` (proposed) for a cluster that cannot
+   become clean. This step stands on its own: a cluster can stop here and keep
+   an explicit voter set without ever enforcing claims.
 3. Set `enforcement.recovery_claim: true` on **every** host, witnesses included,
    and restart them one at a time.
 4. Wait for `recovery_claim_v1` to latch. `lv doctor` shows it, and
@@ -1209,7 +1252,7 @@ see the test go red, restore. Each item names its mutation.
 ### 7.1 Fleet (`tests/fleet/`)
 
 - **Un-skip `TestFleet_TwoCoordinators_OneFailedHost_AtMostOneWritableOwner`.**
-  The harness gains a way to latch `voter_config_v1`, run `voter init`, enable
+  The harness gains a way to latch `voter_config_v1`, complete genesis, enable
   `enforcement.recovery_claim` and latch `recovery_claim_v1` on the
   independent-replica fleet.
   - *proof-gated arm*, with claims enforced: assert at most one owner by libvirt
@@ -1299,10 +1342,26 @@ coordinator's health view.
   and the next tick supersedes at `attempt + 1` with one owner. Mutation: skip
   the revocation check in the voters' supersede verification. A supersede
   before the CRL lands then succeeds, which must fail.
-- **The voter set survives the kill switch.** After `voter init`, set
+- **The voter set survives the kill switch.** After genesis, set
   `enforcement.recovery_claim` false on every node. `VoterSet` still returns the
   config's members, and a fenced member still counts in the denominator.
   Mutation: make `VoterSet` fall back to the derived set when the flag is off.
+- **Automatic genesis waits for a clean cluster.** Five hosts, `voter_config_v1`
+  latched, `node-4` in `maintenance`. No generation is written and
+  `ha.voter.genesis_pending` names `node-4`. Ending the maintenance writes
+  generation 1 with all five members on the next tick. Mutation: drop the
+  clean-cluster check. Genesis then writes four members, which must fail.
+- **Genesis across a lease hand-off.** Two nodes each believe they hold the
+  lease, via IndependentReplicas with a directed link fault, and both propose
+  genesis. Exactly one generation-1 value is decided, and every node adopts
+  it. Mutation: write generation 1 without the claim. Two rows then exist,
+  which must fail.
+- **Reset is decided and sticky.** After genesis, `lv cluster voter reset`
+  (proposed) with one voter unreachable is decided by the other four. Every
+  node's `VoterSet` becomes derived at the same generation, and automatic
+  genesis does not run again on later ticks. Mutations: apply a reset on one
+  node without the claim, so the nodes disagree on `VoterSet`, which must fail.
+  Separately, let automatic genesis run after a reset, which must fail.
 - **`lv cluster voter force-reconfigure` (proposed).** Five voters, three destroyed. It
   refuses while any named host lacks a proof-grade fence, when only two are
   named (a majority survives), and while a non-voter host is neither reachable
@@ -1462,6 +1521,12 @@ document already follows every decision.
    incident in the middle of the first. A cluster that has permanently lost a
    majority of voters, where `voter rm` can never succeed, has the audited
    break-glass `lv cluster voter force-reconfigure` (proposed, §4.6) instead.
+   `voter_config_v1` is mandatory, with no flag, because a node with a flag off
+   would count a different majority from its peers. Genesis is automatic on a
+   clean cluster, so every cluster reaches the fixed set. The exit is a decided
+   `lv cluster voter reset` (proposed, §4.2), which moves every node back to
+   the derived set at one generation. Neither the exit nor anything else makes
+   a rollback below a latched token clean: that enters WAL quarantine.
 5. **Latch population.**
    **Decision: latch sweeps stay on derived liveness (`VotingEligible`), as
    written (§4.5).** Moving them to the voter config would let one fenced voter,

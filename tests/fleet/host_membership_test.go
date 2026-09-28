@@ -166,10 +166,12 @@ func TestFleet_HostMembership_ConcurrentStateAndVersionBothSurvive(t *testing.T)
 // stream, and state lives in hosts.state where that host reads it.
 //
 // Stage 2, one node latched and its neighbour not yet. An operator drains the
-// victim through the UNLATCHED node, which writes hosts.state only. The latched
-// node must see it at once — its voter set drops the victim — and its next pass
-// carries it into host_membership. A latched node that trusted its membership
-// row unconditionally would keep counting a host in maintenance as a voter.
+// victim through the UNLATCHED node, which writes hosts.state only — an entry
+// with no host_membership statement in it. The latched node absorbs that write
+// into its own host_membership row as it applies the entry, so its voter set
+// drops the victim at once. A latched node that ignored hosts-only writes would
+// keep counting a host in maintenance as a voter. The absorbed row is local; the
+// nodes that latch later learn it by anti-entropy.
 //
 // Stage 3, the roll completes. The victim fails and a coordinator fences it:
 // every node reads it fenced and out of the voter set, and hosts.state — still
@@ -204,28 +206,29 @@ func TestFleet_HostMembership_ARollKeepsFencingAndTheVoterSet(t *testing.T) {
 	if err := corrosion.UpdateHostState(ctx, b.DB, victim.Name, "maintenance"); err != nil {
 		t.Fatal(err)
 	}
-	c.WaitConverged(t, convergeTimeout)
+	// host_membership is apart by design here: a's row is its own absorbed copy.
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"host_membership"})
 	if got := hostOn(t, a, victim.Name).State; got != "maintenance" {
 		t.Fatalf("latched %s reads the victim %q after the unlatched %s put it in maintenance", a.Name, got, b.Name)
 	}
 	if votes(t, a, victim.Name) {
 		t.Fatalf("latched %s still counts the victim as a voter after it went into maintenance", a.Name)
 	}
-	if rep, err := a.DB.SplitHostMembership(ctx); err != nil || rep.Absorbed != 1 {
-		t.Fatalf("a's periodic pass: %+v %v, want the late drain carried across", rep, err)
-	}
 	if _, err := c.SelfClient(b).UndrainHost(ctx, &pb.UndrainHostRequest{Name: victim.Name}); err != nil {
 		t.Fatalf("undrain via %s: %v", b.Name, err)
 	}
-	c.WaitConverged(t, convergeTimeout)
-	if _, err := a.DB.SplitHostMembership(ctx); err != nil {
-		t.Fatal(err)
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"host_membership"})
+	if got := hostOn(t, a, victim.Name).State; got != "active" {
+		t.Fatalf("latched %s reads the victim %q after the unlatched %s undrained it", a.Name, got, b.Name)
 	}
 
-	// Stage 3: b and the victim latch.
+	// Stage 3: b and the victim latch, and anti-entropy brings them a's
+	// absorbed row.
 	splitMembership(t, b)
 	splitMembership(t, victim)
-	c.WaitConverged(t, convergeTimeout)
+	b.DB.MergeStateBytesLWW(pullDump(t, c, a))
+	victim.DB.MergeStateBytesLWW(pullDump(t, c, a))
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
 	for _, n := range c.Nodes {
 		if got := hostOn(t, n, victim.Name).State; got != "active" {
 			t.Fatalf("%s reads the victim %q after the roll, want active", n.Name, got)
@@ -288,6 +291,13 @@ func TestFleet_HostMembership_ARollbackOneReleaseStillReadsTheOldColumns(t *test
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2672})
 	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	// Every node's hosts rows must have arrived before the latch. The harness
+	// registers each host on every node with a hosts-only INSERT; one that
+	// reaches a node BEFORE its latch is not absorbed there, and a peer that
+	// absorbed it never re-emits the result, so that node's membership row
+	// waits for anti-entropy, which this harness does not run on a timer
+	// (host_membership.go names the gap).
+	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
@@ -343,4 +353,129 @@ func TestFleet_HostMembership_ARollbackOneReleaseStillReadsTheOldColumns(t *test
 	}
 	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
 	check("after the isolation is cleared through b", "active", false)
+}
+
+// TestFleet_HostMembership_AStaleDualWrittenStateNeverComesBack: the hosts copy
+// of state is dual-written and still shares the hosts row's clock, so a
+// replica can hold an OLD state there on a NEWER hosts row. No reader, and no
+// pass, may take it for a write made through an unlatched node.
+//
+// Replica c receives, in this order: a's drain (both halves), b's version
+// report (newer than everything a wrote), then a's fence — whose hosts half c
+// refuses as older than the version report, while its membership half
+// applies. c's hosts row now says draining, newer than the membership row that
+// says fenced, with no pass in between. A rule that took a moved hosts value
+// on a newer row would turn the fenced host back into a draining one; every
+// entry here was written by a live node, so nothing is noted and the
+// membership row stands.
+func TestFleet_HostMembership_AStaleDualWrittenStateNeverComesBack(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2673})
+	a, b, r := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	// Every node's hosts rows must have arrived before the latch. The harness
+	// registers each host on every node with a hosts-only INSERT; one that
+	// reaches a node BEFORE its latch is not absorbed there, and a peer that
+	// absorbed it never re-emits the result, so that node's membership row
+	// waits for anti-entropy, which this harness does not run on a timer
+	// (host_membership.go names the gap).
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		splitMembership(t, n)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+
+	// Only a→r and b→r carry anything until the end, so r sees the three
+	// writes in exactly the order they are released.
+	block := LinkFault{Block: true}
+	c.SetLinkFaultBoth(a, b, block)
+	c.SetLinkFault(r, a, block)
+	c.SetLinkFault(r, b, block)
+
+	if err := corrosion.UpdateHostState(ctx, a.DB, r.Name, "draining"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "the drain on "+r.Name, func() bool {
+		return oldColumn(t, r, `SELECT state FROM hosts WHERE name = ?`, r.Name) == "draining"
+	})
+	c.SetLinkFault(a, r, block)
+	if err := corrosion.UpdateHostState(ctx, a.DB, r.Name, "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(5 * time.Millisecond) // the version report is newer than the fence
+	if err := corrosion.UpdateHostVersion(ctx, b.DB, r.Name, "v-stale"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "the version report on "+r.Name, func() bool {
+		return hostOn(t, r, r.Name).Version == "v-stale"
+	})
+	c.SetLinkFault(a, r, LinkFault{})
+	eventually(t, convergeTimeout, "the fence's membership half on "+r.Name, func() bool {
+		rows, err := r.DB.Query(ctx, `SELECT state FROM host_membership WHERE host_name = ?`, r.Name)
+		return err == nil && len(rows) == 1 && rows[0].String("state") == "fenced"
+	})
+	if got := oldColumn(t, r, `SELECT state FROM hosts WHERE name = ?`, r.Name); got != "draining" {
+		t.Fatalf("%s: hosts.state = %q; the scenario needs the fence's hosts half refused there", r.Name, got)
+	}
+
+	c.ClearLinkFaults()
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+	for _, n := range c.Nodes {
+		if _, err := n.DB.SplitHostMembership(ctx); err != nil {
+			t.Fatalf("%s: pass: %v", n.Name, err)
+		}
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+	for _, n := range c.Nodes {
+		if got := hostOn(t, n, r.Name).State; got != "fenced" {
+			t.Errorf("%s reads the fenced host as %q: a stale dual-written hosts.state came back", n.Name, got)
+		}
+		if votes(t, n, r.Name) {
+			t.Errorf("%s counts the fenced host as a voter", n.Name)
+		}
+	}
+}
+
+// TestFleet_HostMembership_AntiEntropyCarriesAnAbsorbedWrite: a latched node
+// that missed the entry of a hosts-only write — made by a node not yet writing
+// host_membership — learns the absorbed row from a peer by anti-entropy. The
+// absorption is local and never re-emitted, so this is the only way it gets
+// there; every latched receiver of the entry computes the same row, so the
+// merge converges rather than conflicting.
+func TestFleet_HostMembership_AntiEntropyCarriesAnAbsorbedWrite(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2674})
+	u, a, r := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	// Every node's hosts rows must have arrived before the latch. The harness
+	// registers each host on every node with a hosts-only INSERT; one that
+	// reaches a node BEFORE its latch is not absorbed there, and a peer that
+	// absorbed it never re-emits the result, so that node's membership row
+	// waits for anti-entropy, which this harness does not run on a timer
+	// (host_membership.go names the gap).
+	c.WaitConverged(t, convergeTimeout)
+	splitMembership(t, a)
+	splitMembership(t, r)
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+
+	// r hears nothing, directly or relayed.
+	c.SetLinkFault(u, r, LinkFault{Block: true})
+	c.SetLinkFault(a, r, LinkFault{Block: true})
+	if err := corrosion.UpdateHostState(ctx, u.DB, r.Name, "maintenance"); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "the absorbed drain on "+a.Name, func() bool {
+		return hostOn(t, a, r.Name).State == "maintenance"
+	})
+	if got := hostOn(t, r, r.Name).State; got != "active" {
+		t.Fatalf("%s saw the drain although every link into it is blocked (%q)", r.Name, got)
+	}
+
+	r.DB.MergeStateBytesLWW(pullDump(t, c, a))
+	if got := hostOn(t, r, r.Name).State; got != "maintenance" {
+		t.Fatalf("%s reads %q after anti-entropy from %s; the absorbed row did not travel", r.Name, got, a.Name)
+	}
+	if votes(t, r, r.Name) {
+		t.Fatalf("%s still counts the host in maintenance as a voter", r.Name)
+	}
+	c.ClearLinkFaults()
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"}, a, r)
 }

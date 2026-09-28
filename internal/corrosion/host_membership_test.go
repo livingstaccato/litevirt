@@ -4,7 +4,6 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 )
 
 func openMembershipGate(c *Client) { c.SetHostMembershipGate(func() bool { return true }) }
@@ -37,13 +36,12 @@ func seedMembershipHosts(t *testing.T, c *Client, names ...string) {
 	}
 }
 
-// TestMembershipRow_Resolve pins the one read rule every reader and the pass
-// share.
+// TestMembershipRow_Resolve pins the read rule: once live, the membership row
+// is the answer, however new the hosts row is or whatever its copy says.
 func TestMembershipRow_Resolve(t *testing.T) {
 	const older, newer = "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"
 	active := membershipVals{State: "active"}
 	fenced := membershipVals{State: "fenced"}
-	isolated := membershipVals{State: "active", Epoch: 7, Reason: IsolationManual}
 	cases := []struct {
 		name string
 		row  membershipRow
@@ -55,38 +53,55 @@ func TestMembershipRow_Resolve(t *testing.T) {
 		{"no membership row falls back to the hosts columns",
 			membershipRow{hosts: fenced, hostsTS: older}, true, fenced},
 		{"live reads the membership row",
-			membershipRow{hosts: active, hostsTS: older, memPresent: true, mem: fenced, memTS: newer, absPresent: true, abs: active}, true, fenced},
+			membershipRow{hosts: active, hostsTS: older, memPresent: true, mem: fenced, memTS: newer}, true, fenced},
 		// THE case #267 is about: this replica refused the hosts half of the
 		// coordinator's fence because a concurrent version report made its hosts
-		// row newer. hosts.state is the stale value — a newer ROW, not a newer
-		// STATE — so "the newer copy wins" would undo the fence here.
-		{"a newer hosts row whose state did not move is not a state write",
-			membershipRow{hosts: active, hostsTS: newer, memPresent: true, mem: fenced, memTS: older, absPresent: true, abs: active}, true, fenced},
-		{"a hosts state written since it was carried across, on a newer row, wins",
-			membershipRow{hosts: membershipVals{State: "maintenance"}, hostsTS: newer, memPresent: true, mem: active, memTS: older, absPresent: true, abs: active},
-			true, membershipVals{State: "maintenance"}},
-		{"a moved hosts state on an OLDER row loses to the membership row",
-			membershipRow{hosts: membershipVals{State: "maintenance"}, hostsTS: older, memPresent: true, mem: fenced, memTS: newer, absPresent: true, abs: active}, true, fenced},
-		{"no absorbed record means no late write is recognised",
-			membershipRow{hosts: membershipVals{State: "maintenance"}, hostsTS: newer, memPresent: true, mem: fenced, memTS: older}, true, fenced},
-		{"a late state write does not undo an isolation recorded in host_membership",
-			membershipRow{hosts: membershipVals{State: "maintenance"}, hostsTS: newer, memPresent: true, mem: isolated, memTS: older, absPresent: true, abs: active},
-			true, membershipVals{State: "maintenance", Epoch: 7, Reason: IsolationManual}},
-		{"a late isolation write does not undo a state recorded in host_membership",
-			membershipRow{hosts: isolated, hostsTS: newer, memPresent: true, mem: fenced, memTS: older, absPresent: true, abs: active},
-			true, membershipVals{State: "fenced", Epoch: 7, Reason: IsolationManual}},
+		// row newer. hosts.state is the stale value on a newer ROW, so "the
+		// newer copy wins" would undo the fence here.
+		{"a newer hosts row holding a different state does not win",
+			membershipRow{hosts: active, hostsTS: newer, memPresent: true, mem: fenced, memTS: older}, true, fenced},
 	}
 	for _, tc := range cases {
-		if got := tc.row.resolve(tc.live, true); got != tc.want {
+		if got := tc.row.resolve(tc.live); got != tc.want {
 			t.Errorf("%s: resolve = %+v, want %+v", tc.name, got, tc.want)
 		}
 	}
-	// Outside the absorb window the membership row wins outright: legacy
-	// writers only exist during the roll, and the exception has a false
-	// positive (host_membership.go) the steady state must not carry.
-	late := membershipRow{hosts: membershipVals{State: "maintenance"}, hostsTS: newer, memPresent: true, mem: fenced, memTS: older, absPresent: true, abs: active}
-	if got := late.resolve(true, false); got != fenced {
-		t.Errorf("after the absorb window resolve = %+v, want the membership row %+v", got, fenced)
+}
+
+// TestUnlatchedMembershipWrites: an entry's hosts state and isolation writes
+// are absorbed only when the entry carries no host_membership statement — that
+// is what marks it as made by a node not writing host_membership — and their
+// values are read from the statements themselves, literals included.
+func TestUnlatchedMembershipWrites(t *testing.T) {
+	const ts = "2026-01-02T00:00:00Z"
+	state := Statement{SQL: updateHostStateSQL, Params: []interface{}{"fenced", ts, "h1"}}
+	member := Statement{SQL: hostMembershipStateSQL, Params: []interface{}{"h1", "fenced", int64(0), "", ts}}
+	iso := Statement{SQL: isolateHostSQL, Params: []interface{}{int64(3), IsolationManual, ts, "h1"}}
+	clear := Statement{SQL: clearHostIsolationSQL, Params: []interface{}{ts, "h1", int64(3)}}
+	version := Statement{SQL: `UPDATE hosts SET version = ?, updated_at = ? WHERE name = ?`, Params: []interface{}{"v2", ts, "h1"}}
+
+	if got := unlatchedMembershipWrites([]Statement{state}); len(got) != 1 ||
+		got[0] != (unlatchedMembershipWrite{host: "h1", ts: ts, hasState: true, state: "fenced"}) {
+		t.Errorf("a hosts-only state write: %+v", got)
+	}
+	if got := unlatchedMembershipWrites([]Statement{iso}); len(got) != 1 ||
+		got[0] != (unlatchedMembershipWrite{host: "h1", ts: ts, hasIso: true, epoch: 3, reason: IsolationManual}) {
+		t.Errorf("a hosts-only isolation: %+v", got)
+	}
+	if got := unlatchedMembershipWrites([]Statement{clear}); len(got) != 1 ||
+		got[0] != (unlatchedMembershipWrite{host: "h1", ts: ts, hasIso: true, epoch: 0, reason: ""}) {
+		t.Errorf("a hosts-only isolation clear (literal values): %+v", got)
+	}
+	if got := unlatchedMembershipWrites([]Statement{state, member}); len(got) != 0 {
+		t.Errorf("a live node's dual-write was taken for a hosts-only write: %+v", got)
+	}
+	if got := unlatchedMembershipWrites([]Statement{version}); len(got) != 0 {
+		t.Errorf("a version report was taken for a state write: %+v", got)
+	}
+	insert := Statement{SQL: insertHostSQL, Params: []interface{}{
+		"h9", "10.0.0.9", "root", 22, 7443, "active", "s", 0, 0, 0, "", "", "worker", 0.0, 0.0, -1, -1, "", ts, ts}}
+	if got := unlatchedMembershipWrites([]Statement{insert}); len(got) != 1 || got[0].host != "h9" || got[0].state != "active" {
+		t.Errorf("a hosts-only insert: %+v", got)
 	}
 }
 
@@ -244,11 +259,7 @@ func TestHostMembership_LiveWritersWriteBothHomes(t *testing.T) {
 
 	// Stand in for this replica having REFUSED the hosts half of the fence: a
 	// concurrent version report left hosts.state stale on a newer hosts row.
-	// The record catches up with it first, as a pass would have.
 	if err := c.Execute(ctx, `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`, "active", c.NowTS(), "h1"); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.execLocal(ctx, absorbedUpsertSQL, "h1", "active", 0, ""); err != nil {
 		t.Fatal(err)
 	}
 	// A version report now: the hosts row is newer again and its state column
@@ -259,7 +270,7 @@ func TestHostMembership_LiveWritersWriteBothHomes(t *testing.T) {
 	if got := resolvedState(t, c, "h1"); got != "fenced" {
 		t.Errorf("after a version report GetHost state = %q; the stale hosts.state came back", got)
 	}
-	if rep, err := c.SplitHostMembership(ctx); err != nil || rep.Absorbed != 0 {
+	if rep, err := c.SplitHostMembership(ctx); err != nil || rep.Copied != 0 {
 		t.Fatalf("a pass after a version report: %+v %v; it carried the stale hosts.state across", rep, err)
 	}
 	if got := resolvedState(t, c, "h1"); got != "fenced" {
@@ -281,10 +292,34 @@ func TestHostMembership_LiveWritersWriteBothHomes(t *testing.T) {
 	}
 }
 
-// TestHostMembership_ALateHostsWriteIsCarriedAcross: a node whose own latch has
-// not formed yet still writes hosts.state. A live node's readers see it at
-// once and its next pass carries it into host_membership.
-func TestHostMembership_ALateHostsWriteIsCarriedAcross(t *testing.T) {
+// applyAsReplicated runs stmts the way the apply path does for one entry from
+// a peer: applied, then absorbed inside the same transaction.
+func applyAsReplicated(t *testing.T, c *Client, stmts ...Statement) {
+	t.Helper()
+	ctx := context.Background()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range stmts {
+		if _, err := tx.ExecContext(ctx, s.SQL, s.Params...); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+	}
+	c.absorbUnlatchedMembershipWrite(ctx, tx, stmts)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestHostMembership_AHostsOnlyWriteIsAbsorbed: a node whose own latch has not
+// formed yet writes hosts.state alone. A latched node receiving that entry
+// absorbs it into host_membership at once — per column group, stamped with the
+// write's own updated_at, locally (not re-emitted) — and only when newer.
+func TestHostMembership_AHostsOnlyWriteIsAbsorbed(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
 	seedMembershipHosts(t, c, "h1", "h2")
@@ -292,66 +327,53 @@ func TestHostMembership_ALateHostsWriteIsCarriedAcross(t *testing.T) {
 	if _, err := c.SplitHostMembership(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// Isolation recorded after the split lives in host_membership.
 	if err := IsolateHost(ctx, c, "h2", "h1", IsolationManual); err != nil {
 		t.Fatal(err)
 	}
-	// The unlatched neighbour's drain, as it arrives here: its previous-release
-	// statement shape, with a newer updated_at.
-	if err := c.Execute(ctx, `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`, "maintenance", c.NowTS(), "h1"); err != nil {
-		t.Fatal(err)
-	}
+	before := len(mutationLogText(t, c))
+	ts := c.NowTS()
+	applyAsReplicated(t, c, Statement{SQL: updateHostStateSQL, Params: []interface{}{"maintenance", ts, "h1"}})
 	if got := resolvedState(t, c, "h1"); got != "maintenance" {
-		t.Errorf("GetHost state = %q; a live reader ignored the late drain", got)
+		t.Errorf("GetHost state = %q after a hosts-only drain arrived", got)
 	}
-	rep, err := c.SplitHostMembership(ctx)
-	if err != nil || rep.Absorbed != 1 {
-		t.Fatalf("pass: %+v %v, want the late write absorbed", rep, err)
-	}
-	if got := membershipCol(t, c, "h1", "state"); got != "maintenance" {
-		t.Errorf("host_membership.state = %q after the pass", got)
+	if got := membershipCol(t, c, "h1", "updated_at"); got != ts {
+		t.Errorf("absorbed row stamped %q, want the write's own %q", got, ts)
 	}
 	if e, _, _ := HostIsolation(ctx, c, "h1"); e == 0 {
-		t.Error("carrying the late state across undid the isolation recorded in host_membership")
+		t.Error("absorbing the state undid the isolation recorded in host_membership")
 	}
-	// Carried across once; a later version report does not carry it again.
-	if err := UpdateHostVersion(ctx, c, "h1", "v2"); err != nil {
-		t.Fatal(err)
+	if after := len(mutationLogText(t, c)); after != before {
+		t.Error("the absorption was put on this node's replication stream; it is a local derived copy")
 	}
-	if err := UpdateHostState(ctx, c, "h1", "active"); err != nil {
-		t.Fatal(err)
+
+	// An OLDER hosts-only write does not win.
+	applyAsReplicated(t, c, Statement{SQL: updateHostStateSQL, Params: []interface{}{"offline", "2000-01-01T00:00:00Z", "h1"}})
+	if got := resolvedState(t, c, "h1"); got != "maintenance" {
+		t.Errorf("an older hosts-only write was absorbed: %q", got)
 	}
-	if err := UpdateHostVersion(ctx, c, "h1", "v3"); err != nil {
-		t.Fatal(err)
-	}
-	if rep, _ := c.SplitHostMembership(ctx); rep.Absorbed != 0 {
-		t.Errorf("the late write was carried across twice: %+v", rep)
-	}
-	if got := resolvedState(t, c, "h1"); got != "active" {
-		t.Errorf("GetHost state = %q, want the later live write", got)
+
+	// A live node's dual-write, arriving as one entry, is taken from its
+	// membership half — the hosts half is never absorbed separately.
+	uts := c.NowTS()
+	applyAsReplicated(t, c,
+		Statement{SQL: updateHostStateSQL, Params: []interface{}{"draining", uts, "h2"}},
+		Statement{SQL: hostMembershipStateSQL, Params: []interface{}{"h2", "fenced", int64(0), "", uts}})
+	if got := resolvedState(t, c, "h2"); got != "fenced" {
+		t.Errorf("GetHost state = %q; a dual-write entry's hosts half was absorbed over its membership half", got)
 	}
 }
 
-// TestHostMembership_TheAbsorbWindowCloses: once the window after going live
-// has passed, a hosts-column value that moved is no longer taken over the
-// membership row, by readers or by the pass.
-func TestHostMembership_TheAbsorbWindowCloses(t *testing.T) {
-	ctx := context.Background()
+// TestHostMembership_AnUnlatchedReceiverAbsorbsNothing: before its own latch a
+// node writes nothing to host_membership, a hosts-only entry included.
+func TestHostMembership_AnUnlatchedReceiverAbsorbsNothing(t *testing.T) {
 	c := newTestDB(t)
 	seedMembershipHosts(t, c, "h1")
-	openMembershipGate(c)
-	if _, err := c.SplitHostMembership(ctx); err != nil {
+	if _, err := c.writeMembershipRow(context.Background(), "h1", membershipVals{State: "active"}, "2000-01-01T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
-	c.hostMembershipLiveSince.Store(time.Now().Add(-2 * hostMembershipAbsorbWindow).UnixNano())
-	if err := c.Execute(ctx, `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`, "maintenance", c.NowTS(), "h1"); err != nil {
-		t.Fatal(err)
-	}
-	if got := resolvedState(t, c, "h1"); got != "active" {
-		t.Errorf("GetHost state = %q after the window; a moved hosts value was still taken", got)
-	}
-	if rep, _ := c.SplitHostMembership(ctx); rep.Absorbed != 0 {
-		t.Errorf("a pass after the window carried a hosts value across: %+v", rep)
+	applyAsReplicated(t, c, Statement{SQL: updateHostStateSQL, Params: []interface{}{"maintenance", c.NowTS(), "h1"}})
+	if got := membershipCol(t, c, "h1", "state"); got != "active" {
+		t.Errorf("an unlatched receiver absorbed a write into host_membership: %q", got)
 	}
 }
 
@@ -367,5 +389,26 @@ func TestHostMembership_LiveSurvivesARestart(t *testing.T) {
 	c.markHostMembershipLive()
 	if !(&Client{dataDir: dir}).HostMembershipLive() {
 		t.Fatal("a restarted client with the same data dir is not live; its boot state would go to the frozen hosts.state")
+	}
+}
+
+// TestHostMembership_ACopyNeverOverwritesARowThatArrived: the pass's copy is
+// guarded on the row still being absent. A peer's newer copy that lands
+// between the pass's scan and its write must survive: the origin applies an
+// upsert unconditionally, and its own older write would never be repaired.
+func TestHostMembership_ACopyNeverOverwritesARowThatArrived(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1")
+	const newer = "2030-01-01T00:00:00Z"
+	if wrote, err := c.writeMembershipRow(ctx, "h1", membershipVals{State: "fenced"}, newer); err != nil || !wrote {
+		t.Fatalf("first copy: %v %v", wrote, err)
+	}
+	wrote, err := c.writeMembershipRow(ctx, "h1", membershipVals{State: "active"}, "2000-01-01T00:00:00Z")
+	if err != nil || wrote {
+		t.Fatalf("a copy over an existing row: wrote=%v err=%v", wrote, err)
+	}
+	if got := membershipCol(t, c, "h1", "state"); got != "fenced" {
+		t.Errorf("an older copy overwrote the row that was already there: %q", got)
 	}
 }

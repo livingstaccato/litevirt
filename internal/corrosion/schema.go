@@ -426,10 +426,7 @@ import (
 //	     from host_membership; the hosts columns stay current for a node
 //	     rolled back one release and are never cleared in this version. No
 //	     created_at, for the v56 reason: every node backfills the same row.
-//	     Also host_membership_absorbed, NODE-LOCAL (never in tableNames): the
-//	     hosts values this node last looked at, so a write that lands in the
-//	     hosts columns alone — from a node whose own latch has not formed yet —
-//	     is told apart from a stale copy on a newer hosts row. Two new tables.
+//	     One new table.
 const CurrentSchemaVersion = 57
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
@@ -2562,19 +2559,6 @@ var schemaDDL = []string{
 		updated_at       TEXT NOT NULL,
 		deleted_at       TEXT
 	)`,
-	// NODE-LOCAL, never replicated: the hosts.state / isolation values this
-	// node last looked at. A difference from this record on a hosts row newer
-	// than the membership row is a write some node made to the hosts columns
-	// alone, before ITS latch formed, and the next split pass carries it
-	// across (host_membership.go). No updated_at and no
-	// deleted_at: it is not replicated, so there is no clock or tombstone to
-	// propagate.
-	`CREATE TABLE IF NOT EXISTS host_membership_absorbed (
-		host_name        TEXT PRIMARY KEY,
-		state            TEXT NOT NULL,
-		isolation_epoch  INTEGER NOT NULL,
-		isolation_reason TEXT NOT NULL
-	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3123,7 +3107,7 @@ var createTableUnits = []struct {
 	{52, "leader_lease_terms"},
 	{55, "local_term_bindings"},
 	{56, "host_fence_credentials"}, {56, "user_credentials"}, {56, "token_credentials"},
-	{57, "host_membership"}, {57, "host_membership_absorbed"},
+	{57, "host_membership"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

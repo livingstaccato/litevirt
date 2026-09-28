@@ -38,8 +38,9 @@ Once it latches:
 1. Writers stop writing `hosts.state` and the isolation columns. A state
    change then moves only the `host_membership` row's clock, and the `hosts`
    row is written only by the host itself and by operator configuration.
-2. The absorb exception in the read rule goes away. With no writer left that
-   writes the `hosts` columns alone, nothing is there to absorb.
+2. Absorbing hosts-only writes (`absorbUnlatchedMembershipWrite`) goes away.
+   The retire token's latch proves no replication recipient still writes the
+   `hosts` columns alone, so there is nothing to absorb.
 3. The columns are **not** cleared. `hosts.state` is `NOT NULL`, and clearing
    it is a `hosts` write that would race the host's own reports. A column
    nothing writes or reads is inert. Dropping it is a schema change the

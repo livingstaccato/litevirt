@@ -1374,6 +1374,11 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
+		// A state or isolation write to hosts from a node that was not writing
+		// host_membership yet is absorbed into it here, locally. See
+		// host_membership.go.
+		r.client.absorbUnlatchedMembershipWrite(ctx, tx, stmts)
+
 	}
 
 	// Record all unseen entries in mutation_seen for future dedup. On failure,

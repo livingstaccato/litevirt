@@ -306,16 +306,15 @@ type Client struct {
 	// host_membership_split_v1 latch. Fails CLOSED when unset, for the
 	// leaseTermLedger reason: that table's shapes back-pressure a
 	// previous-release peer. See host_membership.go.
-	hostMembershipGate func() bool
+	// Atomic because the WAL apply path reads it (absorbUnlatchedMembershipWrite)
+	// on replication goroutines that may already be running when it is set.
+	hostMembershipGate atomic.Pointer[func() bool]
 	// hostMembershipLive is set once a SplitHostMembership pass has completed
 	// with the gate open (also persisted under dataDir); from then on writers
 	// write host_membership and readers read it.
 	hostMembershipLive atomic.Bool
 	// hostMembershipLiveChecked records that the persisted marker was read.
 	hostMembershipLiveChecked atomic.Bool
-	// hostMembershipLiveSince is when this node went live (unix nanos); it
-	// opens the window in which a late hosts-column write is recognised.
-	hostMembershipLiveSince atomic.Int64
 	// hostMembershipMu serializes the split pass with the membership writers,
 	// so a writer's read-modify-write sees what the pass just absorbed.
 	hostMembershipMu sync.Mutex

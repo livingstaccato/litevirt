@@ -615,23 +615,34 @@ latched on a host, that host:
   back to `hosts` for a host that has no row yet. Before its first pass it
   reads `hosts`, as before.
 
-A reader does not simply take whichever copy has the newer `updated_at`. The
-`hosts` copy still shares its row's clock with the host's own reports, so on a
-host that refused the `hosts` half of a fence because a version report was
-newer, the `hosts` row is the newer one and its state is the stale one.
-`host_membership` wins. The exception is the next paragraph.
+A reader never compares the two copies. The `hosts` copy still shares its
+row's clock with the host's own reports, so on a host that refused the `hosts`
+half of a fence because a version report was newer, the `hosts` row is the
+newer one and its state is the stale one. Readers take `host_membership`, and
+nothing moves a `hosts` value into it merely because that value differs or
+its row is newer.
 
 Latches form per host, so for a few seconds after one host latches its
 neighbour may not have yet. A drain or fence made through that neighbour in
-that window goes to `hosts` only. For ten minutes after it goes live, a latched
-host recognises such a write: it keeps a local record of the `hosts` values it
-last looked at, and a change from that record on a `hosts` row newer than the
-`host_membership` row is one. It reads the change at once, and its next pass
-carries it into `host_membership`. After ten minutes `host_membership` wins
-outright, because the same test can also mistake a stale dual-written value
-for a new one. The reverse direction has a window too: the unlatched neighbour
-reads `hosts` until its own first pass, and there the dual-written value is
-current.
+that window goes to `hosts` only, as does any write from a host rolled back
+one release. Such a write is recognised by where it came from: a latched
+host's writes always carry their `host_membership` statement in the same
+replicated batch, so a batch that writes `hosts` state or isolation without
+one came from a host that was not writing `host_membership` yet. A latched
+host applying such a batch writes the change into its own `host_membership` row in
+the same transaction, with the write's own `updated_at`, if that is newer than
+the row. It does not replicate that change: every latched host that receives
+the batch computes the same row from it, and anti-entropy carries the row to a
+latched host that did not. The unlatched neighbour, in turn, reads `hosts`
+until its own first pass, and there the dual-written value is current.
+
+The same means a host that was not yet latched when such a batch arrived — the
+unlatched writer itself included — keeps the older `host_membership` row it
+copied or received until anti-entropy repairs it from a peer that absorbed the
+change, typically within a minute or two. A change that reached no latched host
+except through anti-entropy repair of the `hosts` row alone (which moves rows,
+not batches) is not absorbed anywhere; it is lost exactly as it could be before
+v57.
 
 **Rolling back one release is safe for state.** The `hosts` columns stay
 current, so a host back on the previous release reads the right state, voter

@@ -99,7 +99,11 @@ of acting — it says nothing about whether the resulting rows have replicated.
   in `hosts`. A fence and a concurrent version report therefore both land on
   every host. The `hosts` row keeps a copy of state and isolation, written in
   the same batch, for a host rolled back one release; that copy can still lose
-  a concurrent write, exactly as before. State and isolation share their row
+  a concurrent write, exactly as before, and no reader ever takes it over the
+  `host_membership` row. A state change made through a host that is not yet
+  writing `host_membership` (mid-roll, or rolled back one release) is absorbed
+  into it by each latched host that applies that change, and reaches the rest
+  by anti-entropy. State and isolation share their row
   with each other, and a host's operator-set configuration (fence strategy,
   role, region) shares the `hosts` row with its self-reports. On a cluster that
   has not finished rolling to a build carrying `host_membership_split_v1`,

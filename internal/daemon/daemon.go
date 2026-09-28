@@ -436,8 +436,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// The membership split gate goes in BEFORE this host's first write. The
 	// boot state below is a state write, and on a node that has already split
-	// it must reach host_membership too: written to hosts.state alone it would
-	// look like a late write from an unlatched node.
+	// it must reach host_membership too. Written to hosts.state alone, this
+	// node's own host_membership row would miss it until anti-entropy.
 	d.wireHostMembershipGate()
 
 	// Register this host in corrosion
@@ -2369,10 +2369,9 @@ func HostMembershipLatchedOnDisk(dataDir string) func() bool {
 }
 
 // hostMembershipSplitInterval is how often the daemon re-runs the membership
-// split. Shorter than the credentials split's minute: a node goes live on its
-// first pass, and the record a late hosts-column write is recognised against is
-// refreshed by each pass. Each pass
-// is one join over the hosts table when there is nothing to do.
+// split. Shorter than the credentials split's minute: until a node's first
+// pass its readers read hosts, not host_membership. Each pass is one join over
+// the hosts table when there is nothing to do.
 const hostMembershipSplitInterval = 10 * time.Second
 
 // runHostMembershipSplit runs corrosion.SplitHostMembership at start and then
@@ -2384,9 +2383,9 @@ func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
 	for {
 		if rep, err := d.db.SplitHostMembership(ctx); err != nil {
 			slog.Warn("host membership split: pass failed", "error", err)
-		} else if rep.Copied > 0 || rep.Absorbed > 0 {
+		} else if rep.Copied > 0 {
 			slog.Info("host membership split: moved host state onto its own row",
-				"copied", rep.Copied, "absorbed", rep.Absorbed)
+				"copied", rep.Copied)
 		}
 		select {
 		case <-ctx.Done():

@@ -437,7 +437,7 @@ CREATE TABLE IF NOT EXISTS local_voter_incarnation (
 );
 ```
 
-This is a v57 schema change (v56 is the credentials split). The ledger entries
+This is a schema change at the next free version (v56 is the credentials split and v57 is `host_membership`, colonelpanik/litevirt#267). The ledger entries
 follow the pattern v55 used for `local_term_bindings`, plus the
 `createTableUnits` marker.
 
@@ -1167,7 +1167,7 @@ The kill switch follows the reversible `configFlag && latch` model described in
   `add`, `lv host rm --dead`, or, when a majority is gone for good,
   `lv cluster voter force-reconfigure` (all proposed, §4.6).
 
-### 5.7 Schema summary (v57, proposed)
+### 5.7 Schema summary (next free version, proposed)
 
 - Node-local tables: `local_recovery_claims`, `local_voter_incarnation`,
   `local_abandoned_proofs`, `local_voter_adoption`.
@@ -1177,7 +1177,7 @@ The kill switch follows the reversible `configFlag && latch` model described in
   and emitted only after `recovery_claim_v1` latches.
 - Statement-shape ledger entries for every new replicated shape
   (`stmtshapecheck`).
-- `check-schema-bump.sh`, `CurrentSchemaVersion = 57`, and a `v57:` history
+- `check-schema-bump.sh`, a `CurrentSchemaVersion` bump, and a matching history
   line.
 
 ---

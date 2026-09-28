@@ -209,3 +209,35 @@ func TestClusterAckLeaseTerm_RefusesIncompleteInputWithoutDialling(t *testing.T)
 		}
 	}
 }
+
+// TestPrintFailoverScope_MarksRegionsThatCannotFenceTheirOwn: a region with
+// fewer than three voters is marked in the table, and under region scope the
+// output says outright that its hosts have no automatic failover.
+func TestPrintFailoverScope_MarksRegionsThatCannotFenceTheirOwn(t *testing.T) {
+	st := &pb.FailoverScopeStatus{
+		Scope: "region", SetBy: "alice", UpdatedAt: "2026-09-28T00:00:00Z", Settable: true,
+		Regions: []*pb.FailoverScopeRegion{
+			{Name: "east", Hosts: 3, Workers: 3, Voters: 3, Quorum: 2, CanFenceOwn: true},
+			{Name: "tiebreak", Hosts: 1, Workers: 0, Voters: 1, VotingWitnesses: 1, Quorum: 1},
+			{Name: "west", Hosts: 2, Workers: 2, Voters: 2, Quorum: 2},
+		},
+	}
+	var buf bytes.Buffer
+	printFailoverScope(&buf, st)
+	out := buf.String()
+	for _, want := range []string{"Failover scope: region", "Set by:         alice", "cannot fence its own hosts",
+		"1 region(s) above hold workloads but have fewer than three voters"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output lacks %q:\n%s", want, out)
+		}
+	}
+
+	// Under the cluster scope a small region is still marked, but no warning is
+	// printed: nothing is region-scoped.
+	st.Scope = "cluster"
+	buf.Reset()
+	printFailoverScope(&buf, st)
+	if strings.Contains(buf.String(), "hold workloads but have fewer") {
+		t.Errorf("cluster scope printed the region-scope warning:\n%s", buf.String())
+	}
+}

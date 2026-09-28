@@ -401,6 +401,9 @@ var capabilityMap = map[string]tableResolver{
 	"registry_credentials":   {category: "policy", chain: policyChain()},
 	"notification_targets":   {category: "policy", chain: policyChain()},
 	"notification_routes":    {category: "policy", chain: policyChain()},
+	// v58 cluster-wide policy (failover_scope): two different values at one
+	// instant are two operators disagreeing about how the cluster fails over.
+	"cluster_policies": {category: "policy", chain: policyChain()},
 	// v56 credential tables: a tie naming two different secrets is never
 	// coin-flipped into one of them — tombstone wins, anything else differing
 	// goes to a human, same as the rest of this block.

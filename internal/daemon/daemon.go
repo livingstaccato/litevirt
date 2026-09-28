@@ -563,6 +563,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	d.wireLeaseTermLedgerGate()
 	d.wireCredentialsSplitGate()
+	d.wireClusterPolicyGate()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag, for the same reason as
@@ -2393,6 +2394,17 @@ func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// wireClusterPolicyGate lets corrosion write cluster_policies (the
+// failover_scope policy) only once failover_scope_v1 is DURABLY latched: the
+// table's statements stall a previous-release peer's stream, and the policy
+// means nothing to a coordinator that does not honour it. Unwired, the gate
+// fails closed and `lv cluster failover-scope` refuses to change anything.
+func (d *Daemon) wireClusterPolicyGate() {
+	d.db.SetClusterPolicyGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
+	})
 }
 
 func (d *Daemon) wireLeaseTermLedgerGate() {

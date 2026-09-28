@@ -80,6 +80,9 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// host_membership_split_v1 likewise: "this build decodes
 		// host_membership and reads state from it".
 		capabilities.HostMembershipSplitV1: true,
+		// failover_scope_v1 likewise: "this build decodes cluster_policies
+		// and honours failover_scope".
+		capabilities.FailoverScopeV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

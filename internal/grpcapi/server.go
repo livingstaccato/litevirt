@@ -844,6 +844,10 @@ func (s *Server) advertisedCapabilities() []string {
 	// host_membership statements — is enforced by the latch itself, which is
 	// ReplicationGated and so cannot form while any replication recipient
 	// cannot decode them.
+	// failover_scope_v1 is not withheld either: it is a fact about the build
+	// (this binary decodes cluster_policies and honours failover_scope). The
+	// opt-in is the replicated policy row, which cannot be written until the
+	// ReplicationGated latch has formed.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1219,6 +1223,10 @@ func (s *Server) tokenEnabled(token string) bool {
 		// No kill switch, for the credentials_split_v1 reason: the token says
 		// this build decodes host_membership and reads state from it — a fact
 		// about the binary. A flag-gated token would never latch.
+		return true
+	case capabilities.FailoverScopeV1:
+		// No kill switch: the token says this build decodes cluster_policies
+		// and honours failover_scope. The opt-in is the replicated policy row.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

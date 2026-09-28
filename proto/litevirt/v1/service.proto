@@ -2592,6 +2592,16 @@ service LiteVirt {
     rpc RegionStatus(RegionStatusRequest)              returns (RegionStatusResponse);
     rpc CrossRegionMigrate(CrossRegionMigrateRequest)  returns (stream MigrateProgress);
 
+    // GetFailoverScope reports the cluster-wide failover_scope policy as the
+    // answering host's replica holds it, with every region's voting strength.
+    // SetFailoverScope changes it (admin). With scope "region" a host is
+    // fenced and recovered only by a quorum of its own region's voters, and
+    // recovery stays in its region (docs/design/region-scoped-failover.md).
+    // SetFailoverScope refuses until failover_scope_v1 has durably latched
+    // and while any voter is unreachable from the answering host.
+    rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
+    rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
+
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
     // to N (ip, region) pairs. The embedded DNS server round-robins
@@ -2776,6 +2786,36 @@ message RegionStatus {
     int32  active_hosts   = 3;
     int32  vm_count       = 4;
     string last_updated   = 5;  // RFC3339, max(updated_at) across hosts in the region
+}
+
+// FailoverScopeStatus is the failover_scope policy and every region's voting
+// strength, as the answering host sees them.
+message FailoverScopeStatus {
+    string scope      = 1;  // "cluster" (default) | "region"
+    string set_by     = 2;  // principal of the last change; "" when never set
+    string updated_at = 3;  // "" when never set
+    // settable is false until failover_scope_v1 has durably latched on the
+    // answering host; SetFailoverScope refuses until then.
+    bool   settable   = 4;
+    repeated FailoverScopeRegion regions = 5;
+}
+
+// FailoverScopeRegion is one region's voting strength.
+message FailoverScopeRegion {
+    string name             = 1;
+    int32  hosts            = 2;  // every host in the region, whatever its state
+    int32  workers          = 3;  // hosts that can hold workloads (not witnesses)
+    int32  voters           = 4;  // the region's members of the voter set
+    int32  voting_witnesses = 5;
+    int32  quorum           = 6;  // floor(voters/2)+1
+    // can_fence_own is false for a region with fewer than three voters: under
+    // region scope it cannot fence one of its own hosts, so they have no
+    // automatic failover.
+    bool   can_fence_own    = 7;
+}
+
+message SetFailoverScopeRequest {
+    string scope = 1;  // "cluster" | "region"
 }
 
 // CrossRegionMigrate refuses when source/target hosts are in the

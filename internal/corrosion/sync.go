@@ -315,6 +315,11 @@ var tableNames = []string{
 	// here like any other cluster fact. Nothing secret. Written only once
 	// host_membership_split_v1 has latched (host_membership.go).
 	"host_membership",
+	// v58 cluster-wide policy (failover_scope). An operator decision every
+	// coordinator must read the same way, so a node that missed the write is
+	// repaired here like any cluster fact. Nothing secret. Written only once
+	// failover_scope_v1 has latched (cluster_policy.go).
+	"cluster_policies",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

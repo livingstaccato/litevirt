@@ -168,6 +168,35 @@ const (
 	// split changes where a fact is stored, not a policy.
 	HostMembershipSplitV1 = "host_membership_split_v1"
 
+	// FailoverScopeV1 gates the cluster-wide failover_scope policy
+	// (cluster_policies, schema v58; docs/design/region-scoped-failover.md).
+	// With the policy set to `region`, a host is fenced and its workloads
+	// recovered only by a quorum of its own region's voters, and recovery
+	// targets stay in that region (colonelpanik/litevirt#265).
+	//
+	// It states two facts about the BINARY, which is why it is mandatory and
+	// has no config flag:
+	//
+	//   - it can DECODE cluster_policies' statement shapes. They are the first
+	//     replicated shapes that table ever had, and an unregistered shape
+	//     back-pressures a previous-release peer: its apply fails closed and its
+	//     stream stalls. So nothing writes cluster_policies until this token
+	//     has latched.
+	//   - it HONOURS failover_scope: its coordinator counts region quorums and
+	//     keeps recovery in region, and its ExecutionGate counts its own
+	//     region. The guarantee is enforced where the fence is decided, and
+	//     that is whichever node holds the failover lease — any node. A
+	//     coordinator that did not read the policy would fence across regions
+	//     while every other node believed it would not, so the policy may not
+	//     be set until every node runs a build that honours it.
+	//
+	// The decode claim must hold of every host this node REPLICATES TO, so the
+	// token is in replicationGated. The row itself is the opt-in and it is
+	// replicated, so its uniformity comes from replication, not from matching
+	// config; a flag would only keep a mandatory token from latching. Standing
+	// down in an incident is `lv cluster failover-scope cluster`.
+	FailoverScopeV1 = "failover_scope_v1"
+
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
 	// minted it, and an executor refuses a proof whose term is below the
@@ -581,6 +610,11 @@ const (
 //     reader still reads the current state, voter set and isolation, and
 //     upgrading again loses nothing. Retiring the old columns is a later
 //     release's step (docs/design/host-membership-retire-old-columns.md).
+//
+//   - failover_scope_v1 has no stand-down of its own: the policy it licenses
+//     does. `lv cluster failover-scope cluster` returns every coordinator to
+//     the cluster-wide quorum without touching the token. A binary rolled
+//     back below it enters WAL quarantine, as below every latched token.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -640,6 +674,10 @@ var supported = []string{
 	// it says "this build decodes host_membership's statement shapes and reads
 	// state and isolation from it", a fact about the binary.
 	HostMembershipSplitV1,
+	// FailoverScopeV1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes cluster_policies and honours failover_scope", a fact about the
+	// binary. The policy is the row, not a flag.
+	FailoverScopeV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
 	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
@@ -658,7 +696,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -707,6 +745,9 @@ var replicationGated = map[string]bool{
 	// must be decodable by every host we stream to, a maintenance host on the
 	// previous build included.
 	HostMembershipSplitV1: true,
+	// Confirmed against every replication recipient: cluster_policies' shapes
+	// must be decodable by every host we stream to.
+	FailoverScopeV1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -741,6 +782,9 @@ var mandatory = map[string]bool{
 	// A fact about the binary (it decodes and reads host_membership), not a
 	// policy. See HostMembershipSplitV1.
 	HostMembershipSplitV1: true,
+	// A fact about the binary (it decodes cluster_policies and honours
+	// failover_scope). The policy is the replicated row. See FailoverScopeV1.
+	FailoverScopeV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

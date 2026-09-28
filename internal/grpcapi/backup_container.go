@@ -146,7 +146,7 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 		return err
 	}
 	project, known := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), "backup.create", "operator", containerWhat(req.Name)); err != nil {
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "backup.create", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.backup", req.Name, "project="+project, "denied")
 		return err
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"time"
 )
 
 // Secret columns on the sensitive lane (colonelpanik/litevirt#268).
@@ -34,20 +33,31 @@ import (
 // release did and every reader falls back to it: the credential tables are
 // empty, so a new-build node reads what an old-build node reads.
 //
-// Once latched, every writer writes the credential table in the SAME batch as
-// the parent row and writes '' to the old column, and SplitCredentials copies
-// any old-column value the credential table does not yet hold and then CLEARS
-// the column. The latch is what proves no replication recipient still reads
-// the column, which is the only thing that makes clearing it safe. After this
-// node's first complete pass, readers stop consulting the old column at all.
+// Once latched, every writer writes the secret to BOTH places in the SAME
+// batch under the same updated_at: the credential table and the old column.
+// SplitCredentials copies any old-column value the credential table lacks, or
+// holds an older value of, and never touches the old column. So a host rolled
+// back to the previous release — which reads only the old column — still finds
+// every current secret there.
 //
-// READ RULE. The credential row wins, except when the old column holds a
-// DIFFERENT value on a parent row whose updated_at is newer than the
-// credential row's. That exception is not a corner case: per-node markers mean
-// the latch forms per node, so between one node latching and the next, the
-// unlatched node's writers still write the old column only, and a reader that
-// trusted the credential row unconditionally would serve the value from before
-// that write.
+// Clearing the old columns is the NEXT release's step, behind a second
+// mandatory, ReplicationGated token (docs/design/credentials-clear.md). A
+// rollback from that release lands on this one, which already reads the
+// credential tables. Nothing in this release clears an old column.
+//
+// READ RULE. Readers read both copies and take the NEWER, by the rows' own
+// updated_at — the credential row's, and the parent row's for the old column
+// — so the answer is the one LWW converges on. Ties go to the credential row
+// (a dual-write stamps both with one updated_at, so a tie is the same value).
+// An EMPTY old column never wins: nothing in this release writes one over a
+// live secret, and a host that ran the pre-release clearing build holds
+// emptied old columns stamped after the credential rows.
+//
+// This is permanent in this release; there is no switch to reading the
+// credential table only. It is what closes the stale window: latches form per
+// node, so between one node latching and the next the unlatched node's writers
+// write the old column only, and a latched reader serves such a write the
+// moment it replicates rather than at its next pass.
 
 // SetCredentialsSplitGate injects the predicate that permits WRITING the
 // credential tables. Wired at daemon start to
@@ -67,38 +77,10 @@ func (c *Client) MayWriteCredentialTables() bool {
 	return c.credentialsSplit != nil && c.credentialsSplit()
 }
 
-// credentialFallback reports whether a reader may still take a secret from
-// the old column when the credential row is absent or older.
-//
-// It may until this node has latched AND finished one complete split pass.
-// From then on every old column this node holds has been copied and cleared,
-// so a value that turns up there later is one a node wrote before ITS latch
-// formed, and the next pass here moves it across; the reader does not act on
-// it in the meantime.
-func (c *Client) credentialFallback() bool {
-	return !(c.MayWriteCredentialTables() && c.credentialsCleared.Load())
-}
-
-// oldColumnValue is what a writer puts in the old secret column: the secret
-// itself before the latch, where a previous-release node reads it, and ”
-// after, where nothing does.
-func (c *Client) oldColumnValue(secret string) string {
-	if c.MayWriteCredentialTables() {
-		return ""
-	}
-	return secret
-}
-
 // resolveCredential picks the secret a reader returns. present/credVal/credTS
 // describe the live credential row; oldVal/oldTS the parent's old column and
 // the parent's updated_at. See READ RULE above.
-func resolveCredential(present bool, credVal, credTS, oldVal, oldTS string, fallback bool) string {
-	if !fallback {
-		if present {
-			return credVal
-		}
-		return ""
-	}
+func resolveCredential(present bool, credVal, credTS, oldVal, oldTS string) string {
 	if !present {
 		return oldVal
 	}
@@ -127,22 +109,10 @@ const (
 		   updated_at = excluded.updated_at, deleted_at = NULL`
 )
 
-// The old-column clears. Each is a full-primary-key UPDATE that binds
-// updated_at, so a receiver LWW-gates it (DispFullPKUpdate). It deliberately
-// has no deleted_at guard: a tombstoned user's hash and a revoked token's hash
-// are secrets too.
-const (
-	hostsClearIPMIPassSQL     = `UPDATE hosts SET ipmi_pass = ?, updated_at = ? WHERE name = ?`
-	usersClearPasswordHashSQL = `UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`
-	tokensClearTokenHashSQL   = `UPDATE tokens SET token_hash = ?, updated_at = ? WHERE id = ?`
-)
-
 // CredentialSplitReport is what one SplitCredentials pass did.
 type CredentialSplitReport struct {
 	// Copied counts old-column values written into a credential table.
 	Copied int
-	// Cleared counts old columns set to ''.
-	Cleared int
 }
 
 // The pass reads each parent together with its credential row, including
@@ -220,46 +190,13 @@ func (c *Client) copyTS(r credentialSplitRow) string {
 	return c.NowTS()
 }
 
-// clearTS is the updated_at an old-column clear carries: ONE MICROSECOND past
-// the parent row's own updated_at, not NowTS.
-//
-// The clear has to beat the stale copy of the row it replaces, or anti-entropy
-// would carry the secret back from a lagging peer. It must NOT beat any real
-// write the row has had since. Every node clears every row at about the same
-// moment the latch forms. With a fresh clock, a revoke or delete a peer issued
-// a moment earlier, still in flight, would arrive older than the clear and be
-// LWW-skipped, and anti-entropy would then spread the un-revoked row. The
-// successor of the row's own timestamp is newer than exactly the row it read.
-// A node whose row is behind the cluster produces a clear that loses to the
-// fresher row, and that fresher row is cleared by its own node's pass.
-func (c *Client) clearTS(r credentialSplitRow) string {
-	if t, ok := tsInstant(r.srcTS); ok {
-		return t.Add(time.Microsecond).UTC().Format(nowTSLayout)
-	}
-	return c.NowTS()
-}
-
-// credentialFor is the row a clear is paired with: the old column when it must
-// be copied, otherwise the credential row as it stands, re-emitted so this
-// node's stream carries it AHEAD of the clear. A receiver then never applies a
-// clear from this node before it holds the value the clear hands over to.
-func (c *Client) credentialFor(r credentialSplitRow) (val, ts string, copied bool) {
-	if r.needsCopy() {
-		return r.oldVal, c.copyTS(r), true
-	}
-	return r.credVal, r.credTS, false
-}
-
 // SplitCredentials copies secrets from the old columns into the credential
-// tables and clears the old columns. It does nothing unless the
-// credentials_split_v1 gate is open, and it is idempotent: it acts only on an
-// old column that still holds a value. Each copy and its clear go in ONE batch.
-// The daemon runs it at start and periodically. Its writes replicate on the WAL
-// lane and are repaired by anti-entropy: the credential rows on the sensitive
-// lane, the cleared parent rows on the public one.
-//
-// A complete pass (no error) with the gate open stops this node's readers from
-// falling back to the old column (credentialFallback).
+// tables. It does nothing unless the credentials_split_v1 gate is open, and it
+// is idempotent: it writes only where the credential row is missing or holds a
+// different, older value. It never writes the old column — that stays the copy
+// a previous-release host reads. The daemon runs it at start and periodically.
+// Its writes replicate on the WAL lane and are repaired by anti-entropy on the
+// sensitive lane.
 func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, error) {
 	var rep CredentialSplitReport
 	if !c.MayWriteCredentialTables() {
@@ -275,74 +212,50 @@ func (c *Client) SplitCredentials(ctx context.Context) (CredentialSplitReport, e
 			firstErr = fmt.Errorf("%s: %w", what, err)
 		}
 	}
-
 	hosts, err := scanCredentialSplitRows(ctx, c, hostCredentialSplitScanSQL)
 	note("host_fence_credentials", err)
 	for _, r := range hosts {
-		val, ts, copied := c.credentialFor(r)
-		if err := c.splitHostCredential(ctx, r.pk, val, ts, c.clearTS(r)); err != nil {
-			note("host_fence_credentials", err)
-			continue
+		if r.needsCopy() {
+			rep.note(c.copyHostCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "host_fence_credentials", note)
 		}
-		rep.count(copied)
 	}
-
 	users, err := scanCredentialSplitRows(ctx, c, userCredentialSplitScanSQL)
 	note("user_credentials", err)
 	for _, r := range users {
-		val, ts, copied := c.credentialFor(r)
-		if err := c.splitUserCredential(ctx, r.pk, val, ts, c.clearTS(r)); err != nil {
-			note("user_credentials", err)
-			continue
+		if r.needsCopy() {
+			rep.note(c.copyUserCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "user_credentials", note)
 		}
-		rep.count(copied)
 	}
-
 	tokens, err := scanCredentialSplitRows(ctx, c, tokenCredentialSplitScanSQL)
 	note("token_credentials", err)
 	for _, r := range tokens {
-		val, ts, copied := c.credentialFor(r)
-		if err := c.splitTokenCredential(ctx, r.pk, val, ts, c.clearTS(r)); err != nil {
-			note("token_credentials", err)
-			continue
+		if r.needsCopy() {
+			rep.note(c.copyTokenCredential(ctx, r.pk, r.oldVal, c.copyTS(r)), "token_credentials", note)
 		}
-		rep.count(copied)
-	}
-	if firstErr == nil {
-		c.credentialsCleared.Store(true)
 	}
 	return rep, firstErr
 }
 
-func (r *CredentialSplitReport) count(copied bool) {
-	if copied {
-		r.Copied++
+// note counts one copy, or hands its error to fail.
+func (r *CredentialSplitReport) note(err error, table string, fail func(string, error)) {
+	if err != nil {
+		fail(table, err)
+		return
 	}
-	r.Cleared++
+	r.Copied++
 }
 
-// The per-table batches: the credential row, then the clear, in one
-// transaction. Both timestamps are supplied by the caller — the credential
-// row's (copyTS, or the row's own when re-emitted) and the clear's (clearTS) —
-// and neither is a fresh clock, by design; see those two functions.
+// The per-table copies: one credential upsert each, stamped with the
+// updatedAt the caller supplies (copyTS, deliberately not a fresh clock).
 
-func (c *Client) splitHostCredential(ctx context.Context, host, pass, credTS, updatedAt string) error {
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: HostFenceCredentialUpsertSQL, Params: []interface{}{host, pass, credTS}},
-		{SQL: hostsClearIPMIPassSQL, Params: []interface{}{"", updatedAt, host}},
-	})
+func (c *Client) copyHostCredential(ctx context.Context, host, pass, updatedAt string) error {
+	return c.Execute(ctx, HostFenceCredentialUpsertSQL, host, pass, updatedAt)
 }
 
-func (c *Client) splitUserCredential(ctx context.Context, username, hash, credTS, updatedAt string) error {
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: userCredentialUpsertSQL, Params: []interface{}{username, hash, credTS}},
-		{SQL: usersClearPasswordHashSQL, Params: []interface{}{"", updatedAt, username}},
-	})
+func (c *Client) copyUserCredential(ctx context.Context, username, hash, updatedAt string) error {
+	return c.Execute(ctx, userCredentialUpsertSQL, username, hash, updatedAt)
 }
 
-func (c *Client) splitTokenCredential(ctx context.Context, tokenID, hash, credTS, updatedAt string) error {
-	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: tokenCredentialUpsertSQL, Params: []interface{}{tokenID, hash, credTS}},
-		{SQL: tokensClearTokenHashSQL, Params: []interface{}{"", updatedAt, tokenID}},
-	})
+func (c *Client) copyTokenCredential(ctx context.Context, tokenID, hash, updatedAt string) error {
+	return c.Execute(ctx, tokenCredentialUpsertSQL, tokenID, hash, updatedAt)
 }

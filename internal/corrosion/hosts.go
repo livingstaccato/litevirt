@@ -227,10 +227,9 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 		return nil, err
 	}
 
-	fallback := c.credentialFallback()
 	hosts := make([]HostRecord, len(rows))
 	for i, r := range rows {
-		hosts[i] = scanHost(r, fallback)
+		hosts[i] = scanHost(r)
 	}
 	return hosts, nil
 }
@@ -276,7 +275,7 @@ func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	h := scanHost(rows[0], c.credentialFallback())
+	h := scanHost(rows[0])
 	return &h, nil
 }
 
@@ -294,7 +293,7 @@ const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_
 			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts
 		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL`
 
-func scanHost(r Row, credFallback bool) HostRecord {
+func scanHost(r Row) HostRecord {
 	return HostRecord{
 		Name:          r.String("name"),
 		Address:       r.String("address"),
@@ -310,7 +309,7 @@ func scanHost(r Row, credFallback bool) HostRecord {
 		IPMIAddress:   r.String("ipmi_address"),
 		IPMIUser:      r.String("ipmi_user"),
 		IPMIPass: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
-			r.String("ipmi_pass"), r.String("updated_at"), credFallback),
+			r.String("ipmi_pass"), r.String("updated_at")),
 		WatchdogDev:        r.String("watchdog_dev"),
 		Labels:             decodeLabels(r.String("labels")),
 		Version:            r.String("version"),

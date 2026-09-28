@@ -24,6 +24,8 @@ const emitterV130 = "v1.3.0"
 const (
 	emitterFork39c75474 = "fork 39c75474 (unreleased)"
 	emitterForkA0037a7e = "fork a0037a7e (unreleased)"
+	emitterForkB1c95566 = "fork b1c95566 (unreleased)"
+	emitterFork53341a75 = "fork 53341a75 (unreleased)"
 )
 
 // HistoricalShape is one expanded historical statement plus its provenance.
@@ -340,6 +342,28 @@ func HistoricalShapes() []HistoricalShape {
 		LastEmitter:  emitterForkA0037a7e,
 		Removal:      "once no node runs a build from 39c75474..a0037a7e and no retained WAL predates 431c3a92",
 	})
+
+	// The old-column clears of the first credentials_split_v1 build (fork
+	// b1c95566 through 53341a75, unreleased), which emptied
+	// users.password_hash and tokens.token_hash once the split had latched. The
+	// current tree dual-writes instead and never clears in this release
+	// (docs/design/credentials-clear.md). A host still on that build — the lab
+	// ran it — emits these during the roll onto this one, and dropping them
+	// would back-pressure its stream; they are receive-only here and LWW-gated
+	// like any full-PK update. (The hosts.ipmi_pass clear is the same shape as
+	// configure_host_v130's ipmi_pass-only variant, already above.)
+	for _, sql := range []string{
+		`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`,
+		`UPDATE tokens SET token_hash = ?, updated_at = ? WHERE id = ?`,
+	} {
+		out = append(out, HistoricalShape{
+			SQL:          sql,
+			Family:       "credentials_split_clear_v56",
+			FirstEmitter: emitterForkB1c95566,
+			LastEmitter:  emitterFork53341a75,
+			Removal:      "once no node runs a build from b1c95566..53341a75 and no retained WAL predates the dual-write fix",
+		})
+	}
 
 	return out
 }

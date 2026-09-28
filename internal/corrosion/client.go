@@ -300,9 +300,6 @@ type Client struct {
 	// leaseTermLedger reason: those tables' shapes back-pressure a
 	// previous-release peer. See credentials_split.go.
 	credentialsSplit func() bool
-	// credentialsCleared is set once a SplitCredentials pass has completed with
-	// the gate open; from then on readers ignore the old secret columns.
-	credentialsCleared atomic.Bool
 
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the

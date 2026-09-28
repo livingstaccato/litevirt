@@ -251,9 +251,11 @@ type syncTable struct {
 // tableNames are the tables carried by the public full-state dump. Wholly
 // secret-bearing tables stay out of this list (see sensitiveTableNames). Three
 // tables here still have a secret COLUMN — hosts.ipmi_pass,
-// users.password_hash, tokens.token_hash — whose value lives in a sensitive
-// credential table once credentials_split_v1 has latched and each node has
-// cleared the column (credentials_split.go). Until then the dump carries them
+// users.password_hash, tokens.token_hash. Once credentials_split_v1 has latched
+// the value also lives in a sensitive credential table, but this release keeps
+// writing the old column too so a host rolled back one release can still read
+// it; clearing it is a later release's step (credentials_split.go,
+// docs/design/credentials-clear.md). So the dump still carries them
 // unredacted, because it is the repair representation, which is one reason
 // GetStateDump/StreamStateDump are peer-only (host certificate).
 var tableNames = []string{

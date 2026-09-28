@@ -15,7 +15,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 var credentialTables = []string{"host_fence_credentials", "user_credentials", "token_credentials"}
@@ -73,15 +76,16 @@ func assertNoCredentialStatements(t *testing.T, n *Node) {
 //
 // Stage 2, one node latched and its neighbour not yet — per-node markers make
 // this window routine. The latched node copies the password into its
-// credential row and clears the old column. Then the operator rotates the
-// password through the UNLATCHED node, which writes the old column only. The
-// latched node's next split pass must carry the rotation into its credential
-// row; a pass that trusted its existing row would fence with the password the
-// BMC no longer accepts.
+// credential row, and leaves the old column alone. Then the operator rotates
+// the password through the UNLATCHED node, which writes the old column only.
+// The latched node must serve the rotation at once, before any pass: its
+// reader takes the newer of the two copies. A reader that trusted its existing
+// credential row would fence with the password the BMC no longer accepts.
 //
-// Stage 3, the roll completes: the second node latches too. No node's public
-// hosts row carries the password any more, a further rotation writes the
-// credential row alone, and the fence authenticates with it.
+// Stage 3, the roll completes: the second node latches too. Every node's
+// public hosts row still carries the password — dual-write, so a host rolled
+// back one release still fences — and a further rotation on a latched node
+// writes both copies.
 func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T) {
 	ctx := context.Background()
 	clock := NewVirtualClock(time.Now().UTC())
@@ -102,14 +106,19 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 
 	// Stage 2: a latches; b has not yet.
 	a.DB.SetCredentialsSplitGate(func() bool { return true })
-	if rep, err := a.DB.SplitCredentials(ctx); err != nil || rep.Copied == 0 || rep.Cleared == 0 {
-		t.Fatalf("the latched node's pass did not copy and clear: %+v err=%v", rep, err)
+	if rep, err := a.DB.SplitCredentials(ctx); err != nil || rep.Copied == 0 {
+		t.Fatalf("the latched node's pass did not copy: %+v err=%v", rep, err)
 	}
 	c.WaitConverged(t, convergeTimeout)
 	configureIPMI(t, c, b, victim.Name, "bmc-pass-2")
 	c.WaitConverged(t, convergeTimeout)
 	if got := oldColumn(t, a, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, victim.Name); got != "bmc-pass-1" {
 		t.Fatalf("a's credential row holds %q; this scenario needs it to hold the OLDER password", got)
+	}
+	// Before any pass: a's reader already serves the rotation.
+	if h, err := corrosion.GetHost(ctx, a.DB, victim.Name); err != nil || h == nil || h.IPMIPass != "bmc-pass-2" {
+		t.Fatalf("%s serves IPMI password %+v (err %v) before its pass, want the rotated bmc-pass-2 — "+
+			"a latched reader must take the newer old column, not wait up to a minute", a.Name, h, err)
 	}
 	// a's periodic pass.
 	if _, err := a.DB.SplitCredentials(ctx); err != nil {
@@ -123,22 +132,23 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 	}
 	c.WaitConverged(t, convergeTimeout, a, b)
 	for _, n := range []*Node{a, b} {
-		if got := oldColumn(t, n, `SELECT ipmi_pass FROM hosts WHERE name = ?`, victim.Name); got != "" {
-			t.Errorf("%s: hosts.ipmi_pass = %q after both nodes latched; the public row still "+
-				"carries the BMC password", n.Name, got)
+		if got := oldColumn(t, n, `SELECT ipmi_pass FROM hosts WHERE name = ?`, victim.Name); got != "bmc-pass-2" {
+			t.Errorf("%s: hosts.ipmi_pass = %q after both nodes latched, want bmc-pass-2; a host "+
+				"rolled back one release reads only this column", n.Name, got)
 		}
 		if got := oldColumn(t, n, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, victim.Name); got != "bmc-pass-2" {
 			t.Errorf("%s: host_fence_credentials holds %q, want the rotated bmc-pass-2", n.Name, got)
 		}
 	}
 
-	// A rotation on a latched node never touches the public row.
+	// A rotation on a latched node writes both copies.
 	configureIPMI(t, c, a, victim.Name, "bmc-pass-3")
-	if got := oldColumn(t, a, `SELECT ipmi_pass FROM hosts WHERE name = ?`, victim.Name); got != "" {
-		t.Fatalf("a latched ConfigureHost wrote %q into hosts.ipmi_pass; after the latch the "+
-			"password belongs in host_fence_credentials only", got)
-	}
 	c.WaitConverged(t, convergeTimeout, a, b)
+	for _, n := range []*Node{a, b} {
+		assertBothCopies(t, n, "hosts.ipmi_pass", "bmc-pass-3",
+			`SELECT ipmi_pass FROM hosts WHERE name = ?`,
+			`SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, victim.Name)
+	}
 
 	// The victim fails; a coordinates.
 	c.Isolate(victim)
@@ -158,12 +168,247 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 	}
 }
 
-// TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheClear: once the split
-// has cleared the old columns, a node holding the secrets ONLY in the
-// credential tables still authenticates a password login and an API token —
-// through the real Login RPC and a real bearer-authenticated call, on a node
-// other than the one the credentials were created on.
-func TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheClear(t *testing.T) {
+// assertBothCopies checks that a secret's two copies on n — the old column a
+// previous-release reader uses and the credential row this release writes —
+// both hold want.
+func assertBothCopies(t *testing.T, n *Node, what, want, oldQuery, credQuery string, args ...interface{}) {
+	t.Helper()
+	if got := oldColumn(t, n, oldQuery, args...); got != want {
+		t.Errorf("%s: %s (old column) = %q, want %q; a host rolled back one release reads only "+
+			"this column", n.Name, what, got, want)
+	}
+	if got := oldColumn(t, n, credQuery, args...); got != want {
+		t.Errorf("%s: %s (credential row) = %q, want %q", n.Name, what, got, want)
+	}
+}
+
+// Previous-release readers. This harness runs one binary, so a host on the
+// previous release is stood in for by the exact reads that release runs: the
+// old column on the public row and nothing else.
+
+func previousReleaseLogin(t *testing.T, n *Node, username, password string) bool {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(),
+		`SELECT password_hash FROM users WHERE username = ? AND deleted_at IS NULL`, username)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("%s: previous-release user read for %s: rows=%d err=%v", n.Name, username, len(rows), err)
+	}
+	return bcrypt.CompareHashAndPassword([]byte(rows[0].String("password_hash")), []byte(password)) == nil
+}
+
+func previousReleaseTokenValid(t *testing.T, n *Node, raw string) bool {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(),
+		`SELECT t.token_hash FROM tokens t JOIN users u ON u.username = t.username
+		  WHERE t.deleted_at IS NULL AND u.deleted_at IS NULL`)
+	if err != nil {
+		t.Fatalf("%s: previous-release token read: %v", n.Name, err)
+	}
+	for _, r := range rows {
+		if bcrypt.CompareHashAndPassword([]byte(r.String("token_hash")), []byte(raw)) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func latchAndSplit(t *testing.T, nodes ...*Node) {
+	t.Helper()
+	for _, n := range nodes {
+		n.DB.SetCredentialsSplitGate(func() bool { return true })
+		if _, err := n.DB.SplitCredentials(context.Background()); err != nil {
+			t.Fatalf("%s split: %v", n.Name, err)
+		}
+	}
+}
+
+// TestFleet_CredentialsSplit_DualWriteKeepsBothCopies: the latch starts
+// writing the credential tables and stops writing nothing. After the split
+// pass every node still holds every secret in its old column, equal to the
+// credential row; and a password change, a new token and an IPMI rotation made
+// after the latch leave the two copies equal on every node.
+func TestFleet_CredentialsSplit_DualWriteKeepsBothCopies(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2683})
+	a, b, bmc := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	admin := c.SelfClient(a)
+
+	if _, err := admin.CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "dave", Password: "d4ve-pass", Role: "operator",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	tok1, err := admin.CreateToken(ctx, &pb.CreateTokenRequest{Username: "dave", Name: "before"})
+	if err != nil || tok1.Id == "" {
+		t.Fatalf("CreateToken: %+v %v", tok1, err)
+	}
+	configureIPMI(t, c, a, bmc.Name, "bmc-before")
+	c.WaitConverged(t, convergeTimeout)
+
+	latchAndSplit(t, c.Nodes...)
+	c.WaitConverged(t, convergeTimeout)
+
+	userHash := func(n *Node) string {
+		return oldColumn(t, n, `SELECT password_hash FROM user_credentials WHERE username = 'dave'`)
+	}
+	tokHash := func(n *Node, id string) string {
+		return oldColumn(t, n, `SELECT token_hash FROM token_credentials WHERE token_id = ?`, id)
+	}
+	for _, n := range c.Nodes {
+		if userHash(n) == "" || tokHash(n, tok1.Id) == "" {
+			t.Fatalf("%s holds no credential rows after the split; the scenario would prove nothing", n.Name)
+		}
+		assertBothCopies(t, n, "users.password_hash", userHash(n),
+			`SELECT password_hash FROM users WHERE username = ?`,
+			`SELECT password_hash FROM user_credentials WHERE username = ?`, "dave")
+		assertBothCopies(t, n, "tokens.token_hash", tokHash(n, tok1.Id),
+			`SELECT token_hash FROM tokens WHERE id = ?`,
+			`SELECT token_hash FROM token_credentials WHERE token_id = ?`, tok1.Id)
+		assertBothCopies(t, n, "hosts.ipmi_pass", "bmc-before",
+			`SELECT ipmi_pass FROM hosts WHERE name = ?`,
+			`SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, bmc.Name)
+	}
+	before := userHash(a)
+
+	// Changes made after the latch, through different nodes.
+	if _, err := c.SelfClient(b).ChangePassword(ctx, &pb.ChangePasswordRequest{
+		Username: "dave", NewPassword: "d4ve-pass-2",
+	}); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+	tok2, err := c.SelfClient(b).CreateToken(ctx, &pb.CreateTokenRequest{Username: "dave", Name: "after"})
+	if err != nil || tok2.Id == "" {
+		t.Fatalf("CreateToken after the latch: %+v %v", tok2, err)
+	}
+	configureIPMI(t, c, a, bmc.Name, "bmc-after")
+	c.WaitConverged(t, convergeTimeout)
+
+	for _, n := range c.Nodes {
+		if userHash(n) == before {
+			t.Fatalf("%s: user_credentials still holds the pre-change hash", n.Name)
+		}
+		assertBothCopies(t, n, "users.password_hash", userHash(n),
+			`SELECT password_hash FROM users WHERE username = ?`,
+			`SELECT password_hash FROM user_credentials WHERE username = ?`, "dave")
+		assertBothCopies(t, n, "tokens.token_hash", tokHash(n, tok2.Id),
+			`SELECT token_hash FROM tokens WHERE id = ?`,
+			`SELECT token_hash FROM token_credentials WHERE token_id = ?`, tok2.Id)
+		assertBothCopies(t, n, "hosts.ipmi_pass", "bmc-after",
+			`SELECT ipmi_pass FROM hosts WHERE name = ?`,
+			`SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, bmc.Name)
+	}
+}
+
+// TestFleet_CredentialsSplit_AnUnlatchedWriteIsServedWithoutWaitingForAPass:
+// latches form per node, so a neighbour that has not latched yet writes a
+// password change to the old column only. A latched node must serve that
+// change the moment it replicates — the new password logs in and the old one
+// is refused — without waiting for its next split pass. A rotated leaked
+// password that keeps working for up to a minute is the hazard.
+func TestFleet_CredentialsSplit_AnUnlatchedWriteIsServedWithoutWaitingForAPass(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 2684})
+	a, b := c.Nodes[0], c.Nodes[1]
+
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "erin", Password: "leaked-pass", Role: "operator",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	latchAndSplit(t, a) // b has not latched
+	c.WaitConverged(t, convergeTimeout)
+	credBefore := oldColumn(t, a, `SELECT password_hash FROM user_credentials WHERE username = 'erin'`)
+	if credBefore == "" {
+		t.Fatalf("%s holds no user_credentials row for erin; the scenario would prove nothing", a.Name)
+	}
+
+	// The rotation, through the unlatched node: old column only.
+	if _, err := c.SelfClient(b).ChangePassword(ctx, &pb.ChangePasswordRequest{
+		Username: "erin", NewPassword: "rotated-pass",
+	}); err != nil {
+		t.Fatalf("ChangePassword via %s: %v", b.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if got := oldColumn(t, a, `SELECT password_hash FROM user_credentials WHERE username = 'erin'`); got != credBefore {
+		t.Fatalf("%s's credential row changed without a pass; the scenario needs it to hold the "+
+			"PRE-rotation hash", a.Name)
+	}
+
+	// No pass on a. Its reader must still serve the rotation.
+	if _, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "erin", Password: "leaked-pass"}); err == nil {
+		t.Fatalf("%s accepted the rotated-out password; a latched reader served the stale "+
+			"credential row over a newer old column", a.Name)
+	}
+	if login, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "erin", Password: "rotated-pass"}); err != nil || login.Token == "" {
+		t.Fatalf("%s refused the rotated password: %+v %v", a.Name, login, err)
+	}
+}
+
+// TestFleet_CredentialsSplit_APreviousReleaseReaderAuthenticatesAfterTheLatch
+// is the rollback half. After every node has latched and split, and after
+// secrets were created and rotated on latched nodes, a host rolled back one
+// release — which reads only the old columns — still logs a user in,
+// validates an API token and fences with the current IPMI password.
+func TestFleet_CredentialsSplit_APreviousReleaseReaderAuthenticatesAfterTheLatch(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2685})
+	a, b, bmc := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "frank", Password: "fr4nk-before", Role: "operator",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	configureIPMI(t, c, a, bmc.Name, "bmc-before")
+	c.WaitConverged(t, convergeTimeout)
+	latchAndSplit(t, c.Nodes...)
+	c.WaitConverged(t, convergeTimeout)
+
+	// Everything below is written by latched nodes.
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "grace", Password: "gr4ce-pass", Role: "operator",
+	}); err != nil {
+		t.Fatalf("CreateUser after the latch: %v", err)
+	}
+	if _, err := c.SelfClient(b).ChangePassword(ctx, &pb.ChangePasswordRequest{
+		Username: "frank", NewPassword: "fr4nk-after",
+	}); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+	tok, err := c.SelfClient(b).CreateToken(ctx, &pb.CreateTokenRequest{Username: "grace", Name: "ci"})
+	if err != nil || tok.Token == "" {
+		t.Fatalf("CreateToken: %+v %v", tok, err)
+	}
+	configureIPMI(t, c, b, bmc.Name, "bmc-after")
+	c.WaitConverged(t, convergeTimeout)
+
+	for _, n := range c.Nodes {
+		if !previousReleaseLogin(t, n, "frank", "fr4nk-after") {
+			t.Errorf("%s: a previous-release reader refuses frank's current password; rolled back, "+
+				"this host locks out a password changed after the latch", n.Name)
+		}
+		if previousReleaseLogin(t, n, "frank", "fr4nk-before") {
+			t.Errorf("%s: a previous-release reader still accepts frank's OLD password", n.Name)
+		}
+		if !previousReleaseLogin(t, n, "grace", "gr4ce-pass") {
+			t.Errorf("%s: a previous-release reader refuses a user created after the latch", n.Name)
+		}
+		if !previousReleaseTokenValid(t, n, tok.Token) {
+			t.Errorf("%s: a previous-release reader refuses a token created after the latch", n.Name)
+		}
+		if got := oldColumn(t, n, `SELECT ipmi_pass FROM hosts WHERE name = ?`, bmc.Name); got != "bmc-after" {
+			t.Errorf("%s: a previous-release fencer would authenticate with %q, want bmc-after", n.Name, got)
+		}
+	}
+}
+
+// TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheSplit: once the split
+// has run, a password login and an API token authenticate through the real
+// Login RPC and a real bearer-authenticated call, on a node other than the one
+// the credentials were created on.
+func TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheSplit(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 2682})
 	a, b := c.Nodes[0], c.Nodes[1]
@@ -181,35 +426,21 @@ func TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheClear(t *testing.T) {
 	}
 	c.WaitConverged(t, convergeTimeout)
 
-	for _, n := range c.Nodes {
-		n.DB.SetCredentialsSplitGate(func() bool { return true })
-		if _, err := n.DB.SplitCredentials(ctx); err != nil {
-			t.Fatalf("%s split: %v", n.Name, err)
-		}
-	}
+	latchAndSplit(t, c.Nodes...)
 	c.WaitConverged(t, convergeTimeout)
 
-	// b's public rows carry no secret; the credential tables carry both.
-	if got := oldColumn(t, b, `SELECT password_hash FROM users WHERE username = 'carol'`); got != "" {
-		t.Fatalf("users.password_hash on %s = %q after the clear", b.Name, got)
-	}
-	if got := oldColumn(t, b, `SELECT token_hash FROM tokens WHERE username = 'carol'`); got != "" {
-		t.Fatalf("tokens.token_hash on %s = %q after the clear", b.Name, got)
-	}
 	if got := oldColumn(t, b, `SELECT password_hash FROM user_credentials WHERE username = 'carol'`); got == "" {
 		t.Fatalf("%s holds no user_credentials row for carol; the scenario would prove nothing", b.Name)
 	}
 
 	login, err := c.SelfClient(b).Login(ctx, &pb.LoginRequest{Username: "carol", Password: "c4rol-pass"})
 	if err != nil || login.Token == "" {
-		t.Fatalf("password login on %s after the clear: %+v %v — a node holding the hash only in "+
-			"user_credentials refused a valid password", b.Name, login, err)
+		t.Fatalf("password login on %s after the split: %+v %v", b.Name, login, err)
 	}
 	if _, err := c.SelfClient(b).Login(ctx, &pb.LoginRequest{Username: "carol", Password: "wrong"}); err == nil {
 		t.Fatal("a wrong password logged in; the login check is not reading a hash at all")
 	}
 	if _, err := c.bearerClient(b, tok.Token).ListHosts(ctx, &pb.ListHostsRequest{}); err != nil {
-		t.Fatalf("API token on %s after the clear: %v — a node holding the hash only in "+
-			"token_credentials refused a valid token", b.Name, err)
+		t.Fatalf("API token on %s after the split: %v", b.Name, err)
 	}
 }

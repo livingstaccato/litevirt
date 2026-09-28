@@ -157,19 +157,24 @@ There are exceptions, of two different kinds, and neither is "the one":
   so they latch on every cluster with no operator opt-in. The set is declared in
   one place, `capabilities.mandatory` (read it; prose copies of it have gone
   stale twice). They are reserved for a token stating a *fact about the binary*
-  rather than a policy: `split_brain_gate_v1` and `lease_term_ledger_v1`.
-  A mandatory token has no flag to turn off in an incident — see the
-  per-token stand-down notes beside that declaration.
+  rather than a policy — at the time of writing `split_brain_gate_v1`,
+  `lease_term_ledger_v1` and `credentials_split_v1`, but trust the declaration,
+  not this list. A mandatory token has no flag to turn off in an incident — see
+  the per-token stand-down notes beside that declaration.
+  `credentials_split_v1` has none at all: once latched, each host clears the
+  old secret columns, so a host rolled back to a build without it loses IPMI
+  passwords, logins and tokens (docs/upgrades.md).
 - **Conditionally advertised** — `hardware_v2` has no flag of its own either,
   but it is gated differently: each node's startup hardware audit plus a latched
   `operation_protocol_v1` decide whether it is advertised at all.
 
-One mandatory token, `lease_term_ledger_v1`, is additionally
-`capabilities.ReplicationGated`: its latch is a claim about which wire shapes
-peers can *decode*, so it is confirmed against every host still receiving
-replication — memberlist membership — and not merely against voting-eligible
-members. A host parked in `maintenance` on an older build therefore holds that
-latch off, which is the intended invariant and not a bug.
+Some mandatory tokens are additionally `capabilities.ReplicationGated`
+(`lease_term_ledger_v1`, `credentials_split_v1`; the set is
+`capabilities.replicationGated`): the latch is a claim about what every host
+still receiving replication can *decode* or *read*, so it is confirmed against
+admitted memberlist membership — not merely against voting-eligible members. A
+host parked in `maintenance` on an older build therefore holds that latch off,
+which is the intended invariant and not a bug.
 
 **`enforcement.operation_protocol` is required for all hotplug.** Disk, NIC, and
 concrete-address PCI attach/detach are journaled and have no un-journaled path,

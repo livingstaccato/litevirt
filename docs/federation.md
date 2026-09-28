@@ -60,8 +60,9 @@ whether a host is dead, or where its workloads go next, reads it:
   included. Fencing a host needs `floor(N/2)+1` of those voters to report it
   unreachable. No region has a quorum of its own.
 - **Membership and health probes span the WAN.** Gossip runs memberlist's LAN
-  profile on every host whatever its region, and every host probes every
-  peer not in `maintenance`.
+  profile on every host whatever its region, and every voter probes every
+  peer not in `maintenance` (a non-voter probes every voter and a sample of
+  the other non-voters; see docs/migration-failover.md).
 - **Failover targets are cluster-wide.** When a host is fenced, every other
   `active` host is a candidate for its VMs, and neither the failover
   coordinator nor the placement engine reads region. A VM fenced in `eu-west`

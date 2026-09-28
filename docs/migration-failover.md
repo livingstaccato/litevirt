@@ -101,7 +101,15 @@ lv host undrain host-a
 
 ### Host health
 
-Every host probes every other host via TLS connection to the gRPC port (7443) every 2 seconds. Results are stored in the `host_health` table.
+Hosts probe each other via TLS connection to the gRPC port (7443) every 2 seconds. Results are stored in the `host_health` table.
+
+A voter probes every host that is not in `maintenance`. A non-voter probes
+every voter plus three other non-voters (its successors in name order), so
+every host is observed by every voter, which is whose rows the fence and
+recovery quorums count. A non-voter's view of a peer it does not probe is
+taken by probing it on demand wherever a decision reads "is this host down".
+With today's voter set every host that is not `offline`, `maintenance` or
+`fenced` votes, so the probe mesh is still full.
 
 A host transitions to `suspect` after 3 consecutive probe failures. The failover coordinator takes action after quorum confirmation.
 

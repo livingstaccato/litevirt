@@ -577,6 +577,72 @@ is set, as it is for every mandatory token mid-roll. If it stays set after the
 roll, a host is still on the previous release — most often one in
 `maintenance`.
 
+### Host state moves to its own row after the roll
+
+A host's state (`active`, `draining`, `maintenance`, `upgrading`, `offline`,
+`fenced`) and its isolation epoch used to live only in the `hosts` row, beside
+the version, schema and resources the host reports about itself. That row has
+one `updated_at`, and replication applies a write only if it is newer than the
+row, so a state change and a concurrent version report could lose each other:
+the host that applied the newer one first refused the older one. Schema v57
+adds `host_membership`, one row per host with its own `updated_at`. State and
+isolation are copied into it **on their own, after the last host has
+upgraded**. No flag starts it; the `host_membership_split_v1` capability token
+does.
+
+The ordering is fixed the same way as for secrets. A host on the previous
+release cannot decode a statement on `host_membership`, and it reads state
+only from `hosts.state`. So while any host the cluster replicates to —
+including one parked in `maintenance` — runs the previous release:
+
+- nothing is written to `host_membership`;
+- every drain, fence, maintenance, boot and isolation is written to `hosts`,
+  exactly as before.
+
+`host_membership_split_v1` is mandatory and replication-gated. Once it has
+latched on a host, that host:
+
+- runs a pass at start and every 10 seconds that gives every host a
+  `host_membership` row, stamped with the `hosts` row's `updated_at` so every
+  host's copy is identical. The pass copies; it never clears or changes the
+  `hosts` columns;
+- after its first complete pass, writes every state and isolation change to
+  **both** `host_membership` and the `hosts` columns, in one batch with one
+  `updated_at`. The `hosts` half uses the previous release's statements, so a
+  host rolled back one release still reads every change;
+- reads state and isolation — for `lv host ls`, the voter set, fencing, relay
+  election and replication refusal alike — from `host_membership`, falling
+  back to `hosts` for a host that has no row yet. Before its first pass it
+  reads `hosts`, as before.
+
+A reader does not simply take whichever copy has the newer `updated_at`. The
+`hosts` copy still shares its row's clock with the host's own reports, so on a
+host that refused the `hosts` half of a fence because a version report was
+newer, the `hosts` row is the newer one and its state is the stale one.
+`host_membership` wins. The exception is the next paragraph.
+
+Latches form per host, so for a few seconds after one host latches its
+neighbour may not have yet. A drain or fence made through that neighbour in
+that window goes to `hosts` only. For ten minutes after it goes live, a latched
+host recognises such a write: it keeps a local record of the `hosts` values it
+last looked at, and a change from that record on a `hosts` row newer than the
+`host_membership` row is one. It reads the change at once, and its next pass
+carries it into `host_membership`. After ten minutes `host_membership` wins
+outright, because the same test can also mistake a stale dual-written value
+for a new one. The reverse direction has a window too: the unlatched neighbour
+reads `hosts` until its own first pass, and there the dual-written value is
+current.
+
+**Rolling back one release is safe for state.** The `hosts` columns stay
+current, so a host back on the previous release reads the right state, voter
+set and isolation. It cannot decode `host_membership` statements, though, so
+its inbound replication stalls while latched hosts keep writing them. The
+startup rollback preflight refuses a binary that does not know a token this
+host has latched, for a binary that carries the preflight. Roll forward.
+
+Retiring the `hosts` copy is a later release's step, behind a second token; see
+[design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

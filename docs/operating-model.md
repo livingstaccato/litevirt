@@ -89,6 +89,24 @@ of acting — it says nothing about whether the resulting rows have replicated.
   pass, which contacts every peer rather than a sample) and *verifies* it (cross-host digest report) — it never exports or merges
   redacted state itself.
 
+- **A host's state has its own clock.** Replication applies a write only if it
+  is newer than the row it lands on, so two writes to different columns of one
+  row are not independent: the host that applies the newer one first refuses
+  the older one. A host's state and isolation epoch are decided by the
+  coordinator, by operators and by the peers that isolate it, and they are
+  read from `host_membership`, one row per host with its own `updated_at`,
+  apart from the version, schema and resources the host reports about itself
+  in `hosts`. A fence and a concurrent version report therefore both land on
+  every host. The `hosts` row keeps a copy of state and isolation, written in
+  the same batch, for a host rolled back one release; that copy can still lose
+  a concurrent write, exactly as before. State and isolation share their row
+  with each other, and a host's operator-set configuration (fence strategy,
+  role, region) shares the `hosts` row with its self-reports. On a cluster that
+  has not finished rolling to a build carrying `host_membership_split_v1`,
+  state is read from `hosts.state` and a state change can lose to a concurrent
+  report — see
+  [upgrades.md](upgrades.md#host-state-moves-to-its-own-row-after-the-roll).
+
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
   observers report `consecutive_failures ≥ 5` for it (where N is the voter
@@ -561,7 +579,7 @@ they protect. So the coordinator reports the condition instead of retrying it.
 Automatic recovery was built, reviewed and withdrawn, and the reason is worth
 knowing before anyone proposes it again. Acting unattended requires proving the
 host was POWERED OFF, and nothing available to a coordinator proves that.
-`hosts.state` records only that somebody decided it — `lv host fence-confirm`
+A host's recorded state records only that somebody decided it — `lv host fence-confirm`
 writes `fenced` on any host with no precondition, so a mistyped hostname marks a
 live one. Health quorum proves unreachability, which is equally true of a
 partitioned host still running its VMs. Evacuating on either gives you two hosts

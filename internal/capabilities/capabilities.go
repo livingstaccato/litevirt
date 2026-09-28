@@ -196,6 +196,30 @@ const (
 	// config; a flag would only keep a mandatory token from latching. Standing
 	// down in an incident is `lv cluster failover-scope cluster`.
 	FailoverScopeV1 = "failover_scope_v1"
+	// VoterConfigV1 gates the explicit voter set (colonelpanik/litevirt#251
+	// step 2) and the voter side of recovery claims
+	// (docs/design/recovery-claims.md §3–§5.1): the voter_configs table, the
+	// claim RPCs, the node-local grant tables and the voter incarnation.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes voter_configs' statement shapes and
+	// answers Prepare / Accept / GetRecoveryClaim durably. Latching it starts
+	// automatic genesis; until generation 1 is adopted, VoterSet is derived
+	// exactly as before. A flag would be worse than none: a node with it off
+	// would count a different majority from its peers, which is the split the
+	// voter set exists to prevent.
+	//
+	// It is advertised only once this node is READY
+	// (grpcapi.VoterConfigReadiness): PRAGMA synchronous is FULL, so a promise
+	// is on disk before the reply that depends on it, and the host signing key
+	// loads, so this voter can sign an accept. A node that cannot vote durably
+	// must not let the fleet latch across it.
+	//
+	// ReplicationGated: latching it permits emitting voter_configs statements,
+	// whose shapes a previous-release peer has no ledger entry for, so the
+	// claim must hold of every host this node replicates to, a maintenance
+	// host on the previous build included.
+	VoterConfigV1 = "voter_config_v1"
 
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
@@ -615,6 +639,20 @@ const (
 //     does. `lv cluster failover-scope cluster` returns every coordinator to
 //     the cluster-wide quorum without touching the token. A binary rolled
 //     back below it enters WAL quarantine, as below every latched token.
+//
+//   - voter_config_v1 has no flag, by design, and needs none: turning it off
+//     on one node would make that node count a different majority from its
+//     peers. The incident tools are decided changes, so every node moves at the
+//     same generation: `lv cluster voter rm` / `add` to repair the membership,
+//     and `lv cluster voter reset` to return the whole cluster to the derived
+//     set (docs/design/recovery-claims.md §4.2, §4.3). A binary rolled back
+//     below it after it has latched enters WAL quarantine, as below every
+//     latched token, whether or not a voter generation exists — reset is not a
+//     rollback tool. Deleting its marker does nothing lasting: the HA monitor
+//     re-establishes the latch the moment the fleet is uniform. The claim
+//     tables and the adopted generation survive a stand-down of
+//     enforcement.recovery_claim (a later release's flag), which is the point:
+//     promise history stays unbroken.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -678,6 +716,11 @@ var supported = []string{
 	// decodes cluster_policies and honours failover_scope", a fact about the
 	// binary. The policy is the row, not a flag.
 	FailoverScopeV1,
+	// VoterConfigV1 is mandatory but advertised only when READY — this node
+	// commits a promise durably (synchronous=FULL) and can sign an accept. See
+	// grpcapi.VoterConfigReadiness. Readiness is a fact about this node, not a
+	// policy, so it is not a flag either.
+	VoterConfigV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
 	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
@@ -696,7 +739,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -748,6 +791,9 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: cluster_policies' shapes
 	// must be decodable by every host we stream to.
 	FailoverScopeV1: true,
+	// Confirmed against every replication recipient: voter_configs' shapes
+	// must be decodable by every host we stream to.
+	VoterConfigV1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -785,6 +831,11 @@ var mandatory = map[string]bool{
 	// A fact about the binary (it decodes cluster_policies and honours
 	// failover_scope). The policy is the replicated row. See FailoverScopeV1.
 	FailoverScopeV1: true,
+	// A fact about the binary (it decodes voter_configs and answers the claim
+	// RPCs durably), not a policy — and a flag would let one node count a
+	// different majority from its peers. Its stand-down is the decided
+	// `lv cluster voter reset`; see the KILL SWITCH notes above `supported`.
+	VoterConfigV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

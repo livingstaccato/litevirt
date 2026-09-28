@@ -119,6 +119,9 @@ type Client struct {
 	// against a peer since it last had reason to believe it is stale. See
 	// ReplicaCaughtUp.
 	freshness replicaFreshness
+	// obsRepair records when anti-entropy last repaired the observation
+	// tables (observation_tables.go).
+	obsRepair observationRepair
 	hostName  string
 	clock     *hlc.Clock
 	version   string // local litevirtd binary version, for skew checks

@@ -165,8 +165,11 @@ func (ae *AntiEntropy) relayTargets(ctx context.Context, peers []PeerInfo) []str
 }
 
 // checkPeerSet runs one pass against the members choose picks (every member
-// when choose is nil).
+// when choose is nil). A pass against every member is the operator's RunOnce,
+// and it repairs observation tables whatever their schedule
+// (observation_tables.go).
 func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo) []string) {
+	full := choose == nil
 	// Captured before ANY read, so a completed exchange marks the replica
 	// caught up only if no staleness reset happened while it ran.
 	gen := ae.client.replicaFreshnessGen()
@@ -211,7 +214,7 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 	// cannot catch that: the dial succeeded.
 	for _, peer := range targets {
 		pctx, cancel := context.WithTimeout(ctx, antiEntropyPeerTimeout)
-		if ae.checkPeer(pctx, peer, localMap, sensitiveMap) {
+		if ae.checkPeer(pctx, peer, localMap, sensitiveMap, full) {
 			ae.client.markReplicaCaughtUp(gen, peer)
 		}
 		cancel()
@@ -225,7 +228,7 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 // held) — which is what marks the local replica
 // caught up (see replicaFreshness). An isolated peer, an unreachable one, or a
 // failed dump/merge proves nothing and returns false.
-func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest) bool {
+func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap, sensitiveMap map[string]TableDigest, full bool) bool {
 	// The pull half of the isolation regime (§A). PushMutations refuses an
 	// isolated node's INJECTION server-side, but anti-entropy is a PULL: we
 	// would otherwise merge a quarantined node's state into ours voluntarily,
@@ -257,11 +260,25 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	}
 
 	completed := true
-	if mismatched := digestMismatches(peerName, resp.Tables, localMap); len(mismatched) > 0 {
-		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", mismatched)
+	mismatched := digestMismatches(peerName, resp.Tables, localMap)
+	// Observation tables are repaired on their own, slower schedule; control
+	// state is repaired now (observation_tables.go). Observations are always
+	// due on a replica that is not caught up, so deferring them never holds
+	// the replica-freshness signal back.
+	pull, observations := splitObservations(mismatched)
+	now := time.Now()
+	obsDue := len(observations) > 0 && (full || ae.client.observationRepairDue(now))
+	if obsDue {
+		pull = append(pull, observations...)
+	} else if len(observations) > 0 {
+		slog.Debug("anti-entropy: observation drift left to its writers until the next observation repair",
+			"peer", peerName, "tables", observations)
+	}
+	if len(pull) > 0 {
+		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", pull)
 		// Only the mismatched tables: pulling the full dump for one drifted
 		// row made every repair cost the whole cluster's state (#262).
-		data, err := fetchTableDump(ctx, client, mismatched)
+		data, err := fetchTableDump(ctx, client, pull)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
 			completed = false
@@ -272,6 +289,9 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 			completed = false
 		} else {
 			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
+			if obsDue {
+				ae.client.markObservationsRepaired(now)
+			}
 		}
 	}
 

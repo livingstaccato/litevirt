@@ -1009,6 +1009,21 @@ conflicting holder, no in-flight migration/operation/lock/failover, and quorum
 or explicit fencing authorization. The evidence and decision must be durable
 before any stop is issued.
 
+### Voter genesis pending (`ha.voter.genesis_pending`)
+
+Evaluator `voter_config`, subject `cluster/voters`, severity warning. Written by
+the leader-lease holder while `voter_config_v1` has latched but automatic
+genesis cannot write generation 1 of the explicit voter set: a host is in
+`maintenance`, `offline` or `fenced`, or did not sign. Genesis waits for a clean
+cluster so it never freezes a host out of the voter set because it happened to
+be away when the token latched. The evidence names each host, its state and
+what clears it; the condition resolves on the tick genesis succeeds.
+
+For a cluster that cannot become clean — a host that is dead for good and has
+not been removed — `lv cluster voter init --members <hosts>` proposes the
+generation by hand. Every listed member must sign. `lv cluster voter ls` shows
+the adopted generation once one exists.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

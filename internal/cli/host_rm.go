@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -35,6 +38,12 @@ import (
 // the cluster CA's private key, which lives with the operator and never on a
 // daemon. So this command produces the CRL and PublishCRL hands it to the cluster.
 func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force bool) error {
+	// A current voter keeps its vote whatever its hosts row says, so the daemon
+	// refuses to remove one. Ask BEFORE revoking: the revocation below is not
+	// undone by that refusal, and a revoked voter can no longer sign a vote.
+	if err := refuseVoterRemoval(ctx, c, hostName); err != nil {
+		return err
+	}
 	// Read and revoke BEFORE the tombstone. Once RemoveHost succeeds, ListHosts
 	// deliberately hides the row and there is no supported way to recover its
 	// certificate serial. A mint or publish failure must therefore leave the row
@@ -156,6 +165,27 @@ func revokeHostCert(pkiDir, hostName, serial string) error {
 	}
 	if err := pki.AppendToCRL(caCert, caKey, filepath.Join(pkiDir, "crl.pem"), serial); err != nil {
 		return fmt.Errorf("append %s to the CRL: %w", serial, err)
+	}
+	return nil
+}
+
+// refuseVoterRemoval refuses `lv host rm` of a member of the adopted voter
+// generation, naming the command that removes the vote (recovery-claims.md
+// §4.3). A daemon without the voter RPC (an older build) has no voter set to
+// protect, so Unimplemented is not a refusal.
+func refuseVoterRemoval(ctx context.Context, c pb.LiteVirtClient, hostName string) error {
+	resp, err := c.GetVoterConfig(ctx, &pb.GetVoterConfigRequest{})
+	if status.Code(err) == codes.Unimplemented {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read the voter set before removing %s: %w", hostName, err)
+	}
+	for _, m := range resp.GetMembers() {
+		if m.GetName() == hostName {
+			return fmt.Errorf("%s is a member of voter generation %d; removing the host would not remove its "+
+				"vote. Run `lv cluster voter rm %s` first, then remove the host", hostName, resp.GetAdoptedGeneration(), hostName)
+		}
 	}
 	return nil
 }

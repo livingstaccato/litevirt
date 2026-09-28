@@ -36,6 +36,11 @@ workloads:
 // works, and takes a moment — as it does on a real network.
 func laggingPump(t *testing.T, c *Cluster, from, to *Node, lag time.Duration) {
 	t.Helper()
+	// Dial once, before registering the pump's cleanup. Cleanups run last-in
+	// first-out, so a client dialled inside the loop registers a Close that
+	// runs BEFORE cancel, and an in-flight push then fails with "client
+	// connection is closing" while ctx is still live.
+	peer := c.PeerClient(from, to)
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	t.Cleanup(func() { cancel(); wg.Wait() })
@@ -76,7 +81,7 @@ func laggingPump(t *testing.T, c *Cluster, from, to *Node, lag time.Duration) {
 			if len(ready) == 0 {
 				continue
 			}
-			if _, err := c.PeerClient(from, to).PushMutations(ctx, &pb.ReplicateRequest{
+			if _, err := peer.PushMutations(ctx, &pb.ReplicateRequest{
 				Sender:              from.Name,
 				SenderVersion:       "fleet-test",
 				SenderSchemaVersion: int32(corrosion.CurrentSchemaVersion),

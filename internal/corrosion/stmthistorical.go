@@ -16,6 +16,16 @@ import "strings"
 
 const emitterV130 = "v1.3.0"
 
+// Emitters that are fork BUILDS, not releases. A shape whose only emitters are commits that no
+// release tag contains still needs an entry if a build of that range may have run on a cluster
+// (the lab) — its peers relayed the shape, and their retained WAL still holds it. Named by the
+// first and last commit that emitted the shape, so the entry says exactly what to check before
+// it is removed.
+const (
+	emitterFork39c75474 = "fork 39c75474 (unreleased)"
+	emitterForkA0037a7e = "fork a0037a7e (unreleased)"
+)
+
 // HistoricalShape is one expanded historical statement plus its provenance.
 type HistoricalShape struct {
 	SQL          string
@@ -313,6 +323,23 @@ func HistoricalShapes() []HistoricalShape {
 		   updated_at = ?,
 		   deleted_at = NULL
 		 WHERE prefix_id = ?`, "upsert_binding_pre_tombstone_guard")
+
+	// ClaimActionProofFenced with its fence as a NOT EXISTS subquery
+	// (claimProofFencedSQL). 39c75474 introduced this form (dropping the
+	// subquery's deleted_at filter); 431c3a92 moved the fence into a local
+	// guard, so a0037a7e is the last commit that emits it. No release tag
+	// contains that range without 431c3a92 — v1.8.1 predates it, v1.9.0 already
+	// has the local guard — so no released peer ever sent it. It is kept
+	// anyway: fork builds from that range may have run on the lab, and a
+	// receiver that stopped recognising it would back-pressure such a peer and
+	// any WAL it retained. Its disposition is the DispCustomMerge it always had.
+	out = append(out, HistoricalShape{
+		SQL:          claimProofFencedSQL,
+		Family:       "claim_proof_fenced_not_exists_fork",
+		FirstEmitter: emitterFork39c75474,
+		LastEmitter:  emitterForkA0037a7e,
+		Removal:      "once no node runs a build from 39c75474..a0037a7e and no retained WAL predates 431c3a92",
+	})
 
 	return out
 }

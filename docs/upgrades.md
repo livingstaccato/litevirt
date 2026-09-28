@@ -507,11 +507,19 @@ every memberlist member advertises it. From then on, on each host:
 
 - every writer writes the secret to **both** places, in one batch under one
   `updated_at`: the credential table and the old column;
-- a pass that runs at start and every minute copies any old-column secret the
-  credential table lacks, or holds an older value of, into the credential
-  table. It **never clears the old column**;
-- readers read both copies and take the newer, by each row's `updated_at`. An
-  empty old column never wins over a credential row.
+- a pass that runs at start and every minute copies an old-column secret into
+  the credential table only where the credential table has **no row** for it.
+  It **never clears the old column**;
+- readers take the credential row whenever one exists, and the old column only
+  when none does.
+
+Readers and the pass never compare the credential row's `updated_at` with the
+public row's. The public row's `updated_at` moves on every unrelated write to
+it, such as a host's version report or a user's role change. When one of those
+reaches a host ahead of a password rotation, that host's last-writer-wins check
+refuses the rotation's public-row half, so it holds the OLD password on a NEWER
+public row. A rule that preferred the newer row would serve the rotated-out
+password, and the pass would copy it over the credential row.
 
 This is the dual-write step of a column move, and the release stops there.
 Every old column still holds the current secret, so the public rows, and the
@@ -522,10 +530,19 @@ mandatory, replication-gated token (see
 
 Latches form per host, so for a few seconds after one host latches its
 neighbour may not have yet. A password or IPMI change made through that
-neighbour in that window goes to the old column only. A latched host serves it
-as soon as it replicates, because the old column is then the newer copy; its
-next pass copies it into the credential table. A rotated password stops working
-everywhere the rotation has reached, with no pass-interval delay.
+neighbour in that window goes to the old column only. Such a write is
+recognisable from the write itself: a latched host always writes the
+credential row in the same replicated batch, so a batch that sets a secret
+with no credential-table statement came from a host that had not latched. Every
+host that applies such a batch absorbs the secret into its credential row,
+locally, under the batch's own `updated_at` and only if that is newer. A latched
+host may create the row; a host that has not latched only updates a row it
+already holds, which includes the host the change was made through. A rotated
+password therefore stops working everywhere the rotation has reached, with no
+pass-interval delay. A host that missed the batch (for example, it repaired the
+public row from anti-entropy instead) picks up the absorbed credential row
+through sensitive-lane anti-entropy, because every host that applied the batch
+wrote the same row.
 
 **What the two copies buy on a rollback.** A rollback below a latched token
 is still not clean. A binary rolled back below a capability token this host

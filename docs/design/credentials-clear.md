@@ -15,7 +15,9 @@ dual-write step of a column move
   column, in one batch under one `updated_at`;
 - the periodic split pass copies old column to credential table where the
   credential row is missing or older, and never clears;
-- readers take the newer of the two copies.
+- readers take the credential row whenever one exists, and the old column only
+  when none does. A secret an unlatched node writes to the old column alone is
+  absorbed into the credential row where it is applied.
 
 So the old columns are always current. A host rolled back below
 `credentials_split_v1` still enters WAL quarantine (the capability-rollback
@@ -63,10 +65,11 @@ Once `credentials_clear_v1` has durably latched on a node:
    anti-entropy would then spread the un-revoked row. The first clearing build
    had this rule and a test for it (`AnInFlightRevokeBeatsTheClear`, removed
    with it). Bring both back.
-4. **Readers keep the newer-copy rule.** An empty old column never wins, so a
-   cleared column is transparent to them. A reader that ignores the old column
-   entirely is the release *after* this one, if ever. Keeping the rule costs
-   one join column.
+4. **Readers need no change.** They already take the credential row whenever
+   one exists, so a cleared column is transparent to them. The absorb step
+   already ignores empty values, so the clears are never absorbed. A reader
+   that ignores the old column entirely is the release *after* this one, if
+   ever.
 
 ## What a rollback from the clearing release costs
 
@@ -76,9 +79,8 @@ release before it, which is **this** release. That rollback is not clean
 either: this release does not know `credentials_clear_v1`, so the startup
 preflight puts the host under WAL quarantine, and it emits no replicated writes
 until it is upgraded again or reseeded. But its readers still find every
-secret. This release reads the credential tables and takes the newer copy, and
-an empty old column never wins, so it reads every secret from the credential
-rows the clearing release kept writing. Upgrading it again loses nothing.
+secret. This release reads the credential row whenever one exists, so it
+reads every secret from the credential rows the clearing release kept writing. Upgrading it again loses nothing.
 
 A rollback two releases, to before `credentials_split_v1`, is not supported
 once `credentials_clear_v1` has latched. That build reads only the old

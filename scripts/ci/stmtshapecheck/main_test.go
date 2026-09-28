@@ -43,6 +43,18 @@ func TestComputeGaps_UnregisteredStaticBuilderFails(t *testing.T) {
 	}
 }
 
+// TestComputeGaps_MethodValueFails: a replicating method taken as a func value must fail the
+// guard, not pass as "nothing to check". internal/health's checkHost once published both
+// host_health verdicts through `exec := c.db.ExecuteDeferred`, the scan saw neither, and their
+// ledger entries were one -emit-ledger away from being dropped.
+func TestComputeGaps_MethodValueFails(t *testing.T) {
+	f := finding{pos: token.Position{Filename: "x.go", Line: 7}, fn: "checkHost", dynamic: true, methodValue: true, method: "ExecuteDeferred"}
+	gaps := computeGaps([]finding{f})
+	if len(gaps) != 1 || !strings.Contains(gaps[0], "Client.ExecuteDeferred as a func value") {
+		t.Fatalf("a method-value finding must produce exactly one func-value gap, got %v", gaps)
+	}
+}
+
 // TestGuardE2E_UnregisteredStaticBuilderGaps (review 4): the true end-to-end path — SCAN a synthetic
 // static builder from the fixture package, locate its finding, and feed it through computeGaps. The
 // finding is correctly classified as resolved (it parses to a fingerprint), yet the complete guard
@@ -182,7 +194,7 @@ func TestRenderLedgerEntry_AllFields(t *testing.T) {
 }
 
 // classCount is a per-builder tally of finding classes.
-type classCount struct{ resolved, dynamic, unresolved, parseErr int }
+type classCount struct{ resolved, dynamic, unresolved, parseErr, methodValue int }
 
 // TestScanPkg_Fixtures loads the testdata fixture package with type info and asserts the
 // EXACT classification and multiplicity the guard produces for each builder function, so a
@@ -218,6 +230,8 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		switch {
 		case f.unresolvedBatch:
 			cc.unresolved++
+		case f.methodValue:
+			cc.methodValue++
 		case f.dynamic:
 			cc.dynamic++
 		case f.parseErr != "":
@@ -244,6 +258,8 @@ func TestScanPkg_Fixtures(t *testing.T) {
 		"IndexedReplacement":     {unresolved: 1}, // escape: stmts[i] replaced before the call
 		"HelperMutation":         {unresolved: 1}, // escape: slice passed to opaque helper
 		"DynamicBuilder":         {dynamic: 1},
+		"MethodValue":            {methodValue: 1}, // a func value hides every statement it is called with
+		"MethodExpr":             {methodValue: 1},
 		"UnregisteredStatic":     {resolved: 1}, // parses to a fp, but the shape isn't in the ledger
 		"SnapshotParentIDWriter": {resolved: 1}, // parses, but fails derivation (parent_id invariant)
 	}

@@ -49,6 +49,11 @@ type finding struct {
 	unresolvedBatch bool // an ExecuteBatch arg that could not be statically enumerated
 	fp              string
 	parseErr        string
+	// methodValue: a replicating Client method taken as a func VALUE (exec := c.db.Execute)
+	// rather than called. Whatever it is later called with is invisible to this scan, so it
+	// is also marked dynamic — every consumer that skips an unresolvable finding skips it too.
+	methodValue bool
+	method      string // the replicating method a methodValue finding references
 }
 
 func main() {
@@ -97,6 +102,8 @@ func main() {
 			switch {
 			case f.unresolvedBatch:
 				fmt.Printf("%s\tUNRESOLVED-BATCH\n", loc(f.pos))
+			case f.methodValue:
+				fmt.Printf("%s\tMETHOD-VALUE\n", loc(f.pos))
 			case f.dynamic:
 				fmt.Printf("%s\tDYNAMIC\n", loc(f.pos))
 			case f.parseErr != "":
@@ -149,6 +156,8 @@ func computeGaps(findings []finding) []string {
 		switch {
 		case f.unresolvedBatch:
 			gaps = append(gaps, fmt.Sprintf("%s: ExecuteBatch argument could not be statically enumerated; rewrite it as finite static SQL (a literal string per statement) so every replicated shape is in the ledger", loc(f.pos)))
+		case f.methodValue:
+			gaps = append(gaps, fmt.Sprintf("%s: %s takes corrosion Client.%s as a func value; the statements it is later called with are invisible to this check, so call the client directly with literal SQL at each site", loc(f.pos), f.fn, f.method))
 		case f.dynamic:
 			gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL; rewrite it as finite static SQL so every shape is in the ledger", loc(f.pos)))
 		case f.parseErr != "":
@@ -415,6 +424,38 @@ func scanPkg(pkg *packages.Package) []finding {
 			if isPlumbingMethod(pkg, fd) {
 				continue
 			}
+			// A replicating method REFERENCED without being called is a func value: record it,
+			// because the statements it is later called with never reach the call-site scan below.
+			called := map[*ast.SelectorExpr]bool{}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+						called[sel] = true
+					}
+				}
+				return true
+			})
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok || called[sel] || !isReplicatingMethod(sel.Sel.Name) {
+					return true
+				}
+				selection := pkg.TypesInfo.Selections[sel]
+				if selection == nil || (selection.Kind() != types.MethodVal && selection.Kind() != types.MethodExpr) {
+					return true
+				}
+				if !isCorrosionClient(selection.Recv()) {
+					return true
+				}
+				out = append(out, finding{
+					pos:         pkg.Fset.Position(sel.Pos()),
+					fn:          fd.Name.Name,
+					dynamic:     true,
+					methodValue: true,
+					method:      sel.Sel.Name,
+				})
+				return true
+			})
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok {

@@ -148,6 +148,22 @@ func HelperMutation(c *corrosion.Client, ctx context.Context) {
 	_ = c.ExecuteBatch(ctx, stmts) // want: unresolved (slice escapes to unknown helper)
 }
 
+// MethodValue takes a replicating method as a func value so a test can swap it; the SQL it
+// is later called with never reaches a call-site scan.
+func MethodValue(c *corrosion.Client, ctx context.Context, swap func(context.Context, string, ...interface{}) error) {
+	exec := c.ExecuteDeferred // want: method value
+	if swap != nil {
+		exec = swap
+	}
+	_ = exec(ctx, "INSERT INTO t (a, updated_at) VALUES (?, ?)", 1, 2)
+}
+
+// MethodExpr is the same escape through a method expression.
+func MethodExpr(c *corrosion.Client, ctx context.Context) {
+	f := (*corrosion.Client).Execute // want: method value
+	_ = f(c, ctx, "INSERT INTO t (a, updated_at) VALUES (?, ?)", 1, 2)
+}
+
 // UnrelatedExecute uses text/template.Execute — a different Execute; must NOT be flagged.
 func UnrelatedExecute(tmpl *template.Template) {
 	_ = tmpl.Execute(nil, "UPDATE t SET a = ? WHERE id = ?")

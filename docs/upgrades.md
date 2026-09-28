@@ -631,25 +631,35 @@ replicated batch, so a batch that writes `hosts` state or isolation without
 one came from a host that was not writing `host_membership` yet. A latched
 host applying such a batch writes the change into its own `host_membership` row in
 the same transaction, with the write's own `updated_at`, if that is newer than
-the row. It does not replicate that change: every latched host that receives
-the batch computes the same row from it, and anti-entropy carries the row to a
-latched host that did not. The unlatched neighbour, in turn, reads `hosts`
-until its own first pass, and there the dual-written value is current.
+the row, creating the row if it has none. It does not replicate that change:
+every host that sees the batch computes the same row from it, and anti-entropy
+carries the row to one that did not.
 
-The same means a host that was not yet latched when such a batch arrived — the
-unlatched writer itself included — keeps the older `host_membership` row it
-copied or received until anti-entropy repairs it from a peer that absorbed the
-change, typically within a minute or two. A change that reached no latched host
-except through anti-entropy repair of the `hosts` row alone (which moves rows,
-not batches) is not absorbed anywhere; it is lost exactly as it could be before
-v57.
+A host that has not latched yet does the same to a `host_membership` row it
+already holds — one a latched peer wrote — but never creates one. That includes
+its own writes: the host that fences another through the old columns alone
+updates its own copy of that host's row in the same transaction, so when it
+latches it reads the fence at once rather than a latched peer's older copy.
 
-**Rolling back one release is safe for state.** The `hosts` columns stay
-current, so a host back on the previous release reads the right state, voter
-set and isolation. It cannot decode `host_membership` statements, though, so
-its inbound replication stalls while latched hosts keep writing them. The
-startup rollback preflight refuses a binary that does not know a token this
-host has latched, for a binary that carries the preflight. Roll forward.
+Two changes still wait for anti-entropy, typically a minute or two. One is a
+change that reached a host before that host held any `host_membership` row for
+the host concerned; a peer's older copy arriving later is then what it serves.
+The other is a change that reached a latched host only through anti-entropy
+repair of the `hosts` row (which moves rows, not batches). If no latched host
+received the batch itself, that second change is not absorbed anywhere and is
+lost, exactly as it could be before v57.
+
+An absorb that fails fails its write: a replicated batch is rolled back and
+back-pressured, and a local write returns the error. It never commits the
+`hosts` half without the `host_membership` half.
+
+**What the two copies buy on a rollback.** The `hosts` columns stay current,
+so a host on the previous release reads the right state, voter set and
+isolation. As for `credentials_split_v1`, a binary rolled back below the
+latched token still enters WAL quarantine at startup and emits no replicated
+writes until it is upgraded again or reseeded, and it cannot decode the
+`host_membership` statements that latched peers keep sending. Upgrading it
+again loses nothing. Roll forward.
 
 Retiring the `hosts` copy is a later release's step, behind a second token; see
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).

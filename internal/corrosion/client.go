@@ -1145,6 +1145,13 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		c.mu.Unlock()
 		return false, err
 	}
+	// Likewise a state or isolation write this node makes to hosts alone
+	// updates the membership row it holds (host_membership.go).
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
 	if c.clock != nil && len(relay) > 0 {
 		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
@@ -1246,6 +1253,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
 	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
+	// Likewise a state or isolation write this node makes to hosts alone
+	// updates the membership row it holds (host_membership.go).
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

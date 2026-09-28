@@ -259,7 +259,9 @@ func TestHostMembership_LiveWritersWriteBothHomes(t *testing.T) {
 
 	// Stand in for this replica having REFUSED the hosts half of the fence: a
 	// concurrent version report left hosts.state stale on a newer hosts row.
-	if err := c.Execute(ctx, `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`, "active", c.NowTS(), "h1"); err != nil {
+	// Set directly (no write reached this node: the fence's hosts half was
+	// refused), so it is not a hosts-only write for the absorb to take.
+	if err := c.execLocal(ctx, `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`, "active", c.NowTS(), "h1"); err != nil {
 		t.Fatal(err)
 	}
 	// A version report now: the hosts row is newer again and its state column
@@ -309,7 +311,10 @@ func applyAsReplicated(t *testing.T, c *Client, stmts ...Statement) {
 			t.Fatal(err)
 		}
 	}
-	c.absorbUnlatchedMembershipWrite(ctx, tx, stmts)
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, c.MayWriteHostMembership()); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
@@ -363,17 +368,69 @@ func TestHostMembership_AHostsOnlyWriteIsAbsorbed(t *testing.T) {
 	}
 }
 
-// TestHostMembership_AnUnlatchedReceiverAbsorbsNothing: before its own latch a
-// node writes nothing to host_membership, a hosts-only entry included.
-func TestHostMembership_AnUnlatchedReceiverAbsorbsNothing(t *testing.T) {
+// TestHostMembership_AnUnlatchedNodeOnlyUpdatesRowsItHolds: before its own
+// latch a node never CREATES a membership row, but it keeps one it already
+// holds (a latched peer's) current with a hosts-only write — received, or its
+// own. Otherwise, once it latches, it would serve the state from before that
+// write: on the node that made a fence, the host would read active again.
+func TestHostMembership_AnUnlatchedNodeOnlyUpdatesRowsItHolds(t *testing.T) {
+	ctx := context.Background()
 	c := newTestDB(t)
-	seedMembershipHosts(t, c, "h1")
-	if _, err := c.writeMembershipRow(context.Background(), "h1", membershipVals{State: "active"}, "2000-01-01T00:00:00Z"); err != nil {
+	seedMembershipHosts(t, c, "h1", "h2")
+	if _, err := c.writeMembershipRow(ctx, "h1", membershipVals{State: "active"}, "2000-01-01T00:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
 	applyAsReplicated(t, c, Statement{SQL: updateHostStateSQL, Params: []interface{}{"maintenance", c.NowTS(), "h1"}})
-	if got := membershipCol(t, c, "h1", "state"); got != "active" {
-		t.Errorf("an unlatched receiver absorbed a write into host_membership: %q", got)
+	if got := membershipCol(t, c, "h1", "state"); got != "maintenance" {
+		t.Errorf("an unlatched receiver left the membership row it holds at %q", got)
+	}
+	applyAsReplicated(t, c, Statement{SQL: updateHostStateSQL, Params: []interface{}{"maintenance", c.NowTS(), "h2"}})
+	if n := tableCount(t, c, "host_membership"); n != 1 {
+		t.Errorf("an unlatched receiver created a membership row: %d rows", n)
+	}
+
+	// Its OWN hosts-only write, on the local write path.
+	logBefore := len(mutationLogText(t, c))
+	if err := UpdateHostState(ctx, c, "h1", "fenced"); err != nil {
+		t.Fatal(err)
+	}
+	if got := membershipCol(t, c, "h1", "state"); got != "fenced" {
+		t.Errorf("this node's own hosts-only fence left its membership row at %q", got)
+	}
+	if log := mutationLogText(t, c)[logBefore:]; strings.Contains(log, "host_membership") {
+		t.Fatalf("an unlatched node put a host_membership statement on its stream:\n%s", log)
+	}
+	// After it latches it reads the fence, not the peer's older active.
+	openMembershipGate(c)
+	if _, err := c.SplitHostMembership(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolvedState(t, c, "h1"); got != "fenced" {
+		t.Errorf("after its latch the fencing node reads the host as %q", got)
+	}
+}
+
+// TestHostMembership_ALatchedNodeCreatesTheRow: a latched node that has no
+// membership row for the host yet creates it from a hosts-only write, taking
+// the column group the write did not set from the hosts row.
+func TestHostMembership_ALatchedNodeCreatesTheRow(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1")
+	if err := IsolateHost(ctx, c, "hx", "h1", IsolationManual); err != nil {
+		t.Fatal(err)
+	}
+	openMembershipGate(c)
+	ts := c.NowTS()
+	applyAsReplicated(t, c, Statement{SQL: updateHostStateSQL, Params: []interface{}{"draining", ts, "h1"}})
+	if got := membershipCol(t, c, "h1", "state"); got != "draining" {
+		t.Errorf("state = %q", got)
+	}
+	if got := membershipCol(t, c, "h1", "isolation_epoch"); got == "0" {
+		t.Error("the created row dropped the isolation the hosts row holds")
+	}
+	if got := membershipCol(t, c, "h1", "updated_at"); got != ts {
+		t.Errorf("created row stamped %q, want the write's %q", got, ts)
 	}
 }
 
@@ -410,5 +467,45 @@ func TestHostMembership_ACopyNeverOverwritesARowThatArrived(t *testing.T) {
 	}
 	if got := membershipCol(t, c, "h1", "state"); got != "fenced" {
 		t.Errorf("an older copy overwrote the row that was already there: %q", got)
+	}
+}
+
+// TestHostMembership_AFailedAbsorbFailsTheWrite: an absorb that cannot write
+// the membership row fails the whole write rather than committing the hosts
+// half alone. On the apply path that back-pressures the sender (the entry is
+// not marked seen, so it is retried); on the local path the writer gets the
+// error. Swallowed, it would leave this node reading the membership row from
+// before a fence with nothing but anti-entropy to correct it.
+func TestHostMembership_AFailedAbsorbFailsTheWrite(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedMembershipHosts(t, c, "h1")
+	openMembershipGate(c)
+	if _, err := c.SplitHostMembership(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.execLocal(ctx, `CREATE TRIGGER zz_refuse_membership BEFORE UPDATE ON host_membership
+		BEGIN SELECT RAISE(ABORT, 'absorb refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	r := NewReplicator(c, "", RelayConfig{})
+	_, err := r.ApplyRemoteMutationsFrom(ctx, replayEntry(t, "peer-node", "2999000000000-0000-peer",
+		Statement{SQL: updateHostStateSQL, Params: []interface{}{"fenced", "2999-01-01T00:00:00Z", "h1"}}), false)
+	if err == nil {
+		t.Fatal("a failed absorb on the apply path was swallowed; the entry would be marked seen with its fence lost here")
+	}
+	if got := hostsCol(t, c, "h1", "state"); got != "active" {
+		t.Errorf("the apply committed the hosts half (%q) although its absorb failed", got)
+	}
+
+	// The local path: a node not yet writing host_membership fences through
+	// the hosts columns alone.
+	c.SetHostMembershipGate(nil)
+	c.hostMembershipLive.Store(false)
+	if err := UpdateHostState(ctx, c, "h1", "fenced"); err == nil {
+		t.Fatal("a failed absorb on the local write path was swallowed")
+	}
+	if got := hostsCol(t, c, "h1", "state"); got != "active" {
+		t.Errorf("the local write committed the hosts half (%q) although its absorb failed", got)
 	}
 }

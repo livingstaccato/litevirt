@@ -573,14 +573,14 @@ const (
 //     comes with a second token in a later one
 //     (docs/design/credentials-clear.md).
 //
-//   - host_membership_split_v1 has no stand-down either, and needs none to be
-//     rollback-safe: once it latches, state and isolation are written to both
-//     host_membership and the old hosts columns, so a host rolled back one
-//     release reads current values from the columns it knows. What such a host
-//     cannot do is decode host_membership's statements — the latched nodes
-//     keep emitting them and its inbound stream stalls, as for
-//     lease_term_ledger_v1. Roll forward. The startup rollback preflight
-//     refuses such a binary if it carries the preflight.
+//   - host_membership_split_v1 has no stand-down either, and the same
+//     rollback shape as credentials_split_v1: a binary rolled back below it
+//     enters WAL quarantine, and cannot decode the host_membership statements
+//     latched peers keep sending. Because this release dual-writes state and
+//     isolation to host_membership AND the old hosts columns, the rolled-back
+//     reader still reads the current state, voter set and isolation, and
+//     upgrading again loses nothing. Retiring the old columns is a later
+//     release's step (docs/design/host-membership-retire-old-columns.md).
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the

@@ -82,21 +82,19 @@ import (
 // host_membership (entryWritesTable). A latched receiver absorbs such a write
 // into its membership row inside the apply transaction, locally and without
 // re-emitting it, stamped with the write's own updated_at and only when that
-// is newer than the row (absorbUnlatchedMembershipWrite). Every latched
-// receiver of the entry computes the same row from the statement alone, so
-// anti-entropy carries it to a latched node that missed the entry.
+// is newer than the row (absorbUnlatchedMembershipWrite). It does so on the
+// WAL apply path and on the local write path, so the node that MADE a
+// hosts-only write updates the membership row it holds too; a node whose gate
+// is still closed only updates rows it already holds, never creates one. Every
+// node computes the same row from the statement alone, so anti-entropy carries
+// it to one that missed the entry.
 //
 // What is not absorbed: a hosts-only write that reached a node only by an
 // anti-entropy row merge (a merge carries rows, not entries), unless some
-// latched node received the entry itself; and a write that reached no latched
-// node at all before that node's own first pass, which copies whatever hosts
-// then holds. A node never absorbs its own hosts-only writes — it was not
-// latched when it made them — and learns the absorbed row by anti-entropy. The
-// same holds for a node that received the entry BEFORE its own latch and then
-// received a peer's older copy of the membership row: its first pass finds a
-// row and copies nothing, and it serves that older row until anti-entropy
-// brings the absorbed one (seen in the fleet under -race, where the harness's
-// own hosts registrations race the latch).
+// latched node received the entry itself; and, on a node whose gate was closed,
+// a write that arrived before any membership row for that host did — its
+// first pass then finds a peer's row and copies nothing, and it serves that
+// row until anti-entropy brings the absorbed one.
 // None of these can undo a fence: a value reaches host_membership only from a
 // live writer, a first copy, or a hosts-only write newer than the row.
 //
@@ -301,25 +299,6 @@ func membershipEpochIs(ctx context.Context, host string, want int64) func(tx *sq
 
 // ── writes made by a node that was not writing host_membership ─────────────
 
-// entryWritesTable reports whether one replicated entry (the statements a
-// single write committed together) writes table. It is the origin test of a
-// dual-write migration: a writer that has switched to the new table always
-// puts the new-table statement in the SAME entry as the old-column statement,
-// so an old-column write in an entry that does not write the new table was
-// made by a writer that had not switched. The table is taken from the
-// structural parse, never from a substring, so a comment cannot fake it.
-func entryWritesTable(stmts []Statement, table string) bool {
-	for _, s := range stmts {
-		if !strings.Contains(s.SQL, table) {
-			continue
-		}
-		if sh, _, err := parseResolved(s.SQL); err == nil && sh.Table == table {
-			return true
-		}
-	}
-	return false
-}
-
 // unlatchedMembershipWrite is what one entry from a node that was not writing
 // host_membership wrote to one host's state or isolation columns, and under
 // which updated_at. Later statements in the entry override earlier ones.
@@ -441,59 +420,89 @@ func assignedValue(e NormalizedExpr, params []interface{}) (interface{}, bool) {
 	return nil, false
 }
 
-// Local-only updates of a membership row by absorbUnlatchedMembershipWrite.
-// They run inside the WAL apply transaction and are never logged for
-// replication: every latched receiver of the same entry computes the same
-// row, and anti-entropy carries it to one that missed the entry.
+// Local-only writes of a membership row by absorbUnlatchedMembershipWrite.
+// They run inside the write's own transaction and are never logged for
+// replication: every node that sees the same entry computes the same row, and
+// anti-entropy carries it to one that did not.
 const (
-	absorbStateSQL = `UPDATE host_membership SET state = ?, updated_at = ? WHERE host_name = ? AND deleted_at IS NULL`
+	absorbStateSQL = `UPDATE host_membership SET state = ?, updated_at = ? WHERE host_name = ?`
 	absorbIsoSQL   = `UPDATE host_membership SET isolation_epoch = ?, isolation_reason = ?, updated_at = ?
-		 WHERE host_name = ? AND deleted_at IS NULL`
+		 WHERE host_name = ?`
 	absorbBothSQL = `UPDATE host_membership SET state = ?, isolation_epoch = ?, isolation_reason = ?, updated_at = ?
-		 WHERE host_name = ? AND deleted_at IS NULL`
+		 WHERE host_name = ?`
+	absorbInsertSQL = `INSERT INTO host_membership (host_name, state, isolation_epoch, isolation_reason, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, NULL)`
 )
 
-// absorbUnlatchedMembershipWrite carries one replicated entry's hosts-only
-// state and isolation writes into this node's host_membership, inside the
-// apply transaction. It does nothing unless this node's gate is open (an
-// unlatched receiver's first pass copies from hosts instead), and for a host
-// with no membership row yet (the pass copies it). A write is taken only when
-// its updated_at is newer than the membership row's, and the row takes the
-// write's own updated_at.
+// absorbUnlatchedMembershipWrite carries an entry's hosts-only state and
+// isolation writes into host_membership, inside the write's own transaction.
+// It runs on both paths a write reaches a node by: the WAL apply path (a
+// peer's entry) and the local write path (this node's own statements, just
+// before they are logged). An entry that writes host_membership itself is a
+// live writer's dual-write and is skipped (entryWritesTable).
 //
-// A failure is logged, not propagated: failing the batch would back-pressure
-// the peer's whole stream for this node's own derived copy, which
-// anti-entropy repairs from any peer that absorbed it.
-func (c *Client) absorbUnlatchedMembershipWrite(ctx context.Context, tx *sql.Tx, stmts []Statement) {
-	if !c.MayWriteHostMembership() {
-		return
-	}
+// A write is taken only for a live hosts row, only when its updated_at is
+// newer than the membership row's, and the row takes the write's own
+// updated_at. mayInsert — this node's host_membership_split_v1 gate is open —
+// lets it create a row that does not exist yet, taking the column group the
+// write did not set from the hosts row. With the gate closed it only UPDATES a
+// row this node already holds: such rows exist only because a latched peer
+// wrote them, and updating one keeps this node from serving the value from
+// before its own or a neighbour's write once it latches — the stale "active"
+// on the very node that fenced.
+//
+// An error is returned, never swallowed. The caller fails the write: the WAL
+// apply path rolls the batch back and back-pressures the sender, the local
+// path returns the error to the writer. Swallowing it would commit the hosts
+// half, mark the entry seen, and leave this node reading the membership row
+// from before a fence with nothing but anti-entropy to correct it. The absorb
+// runs in the same transaction and database as the statements that just
+// applied, so anything that fails it would fail them too.
+func absorbUnlatchedMembershipWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert bool) error {
 	for _, w := range unlatchedMembershipWrites(stmts) {
-		var memTS string
-		err := tx.QueryRowContext(ctx,
-			`SELECT updated_at FROM host_membership WHERE host_name = ? AND deleted_at IS NULL`, w.host).Scan(&memTS)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err == nil && lwwOrder(memTS, w.ts) >= 0 {
-			continue
-		}
-		if err == nil {
-			err = writeAbsorbed(ctx, tx, w, w.ts)
-		}
-		if err != nil {
-			slog.Warn("host membership split: could not absorb a state write from a node not "+
-				"writing host_membership; anti-entropy repairs it from a peer", "host", w.host, "error", err)
+		if err := absorbMembershipWrite(ctx, tx, w, w.ts, mayInsert); err != nil {
+			return fmt.Errorf("absorb hosts-only membership write for %s: %w", w.host, err)
 		}
 	}
+	return nil
 }
 
-// writeAbsorbed writes one absorbed write into its membership row, locally.
-// It takes updatedAt from its caller because an absorbed row carries the
-// WRITE's own updated_at, never a fresh clock: every receiver of the entry
-// must compute the same row.
-func writeAbsorbed(ctx context.Context, tx *sql.Tx, w unlatchedMembershipWrite, updatedAt string) error {
-	var err error
+// absorbMembershipWrite writes one absorbed write, LWW-gated on updatedAt. It
+// takes updatedAt from its caller because an absorbed row carries the WRITE's
+// own updated_at, never a fresh clock: every node must compute the same row.
+func absorbMembershipWrite(ctx context.Context, tx *sql.Tx, w unlatchedMembershipWrite, updatedAt string, mayInsert bool) error {
+	var hState, hReason string
+	var hEpoch int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT state, isolation_epoch, COALESCE(isolation_reason, '') FROM hosts WHERE name = ? AND deleted_at IS NULL`,
+		w.host).Scan(&hState, &hEpoch, &hReason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // no live host: nothing a live writer would record either
+	}
+	if err != nil {
+		return err
+	}
+	var memTS string
+	err = tx.QueryRowContext(ctx, `SELECT updated_at FROM host_membership WHERE host_name = ?`, w.host).Scan(&memTS)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if !mayInsert {
+			return nil
+		}
+		state, epoch, reason := hState, hEpoch, hReason
+		if w.hasState {
+			state = w.state
+		}
+		if w.hasIso {
+			epoch, reason = w.epoch, w.reason
+		}
+		_, err = tx.ExecContext(ctx, absorbInsertSQL, w.host, state, epoch, reason, updatedAt)
+		return err
+	case err != nil:
+		return err
+	case lwwOrder(memTS, updatedAt) >= 0:
+		return nil // the membership row is as new or newer
+	}
 	switch {
 	case w.hasState && w.hasIso:
 		_, err = tx.ExecContext(ctx, absorbBothSQL, w.state, w.epoch, w.reason, updatedAt, w.host)
@@ -503,6 +512,19 @@ func writeAbsorbed(ctx context.Context, tx *sql.Tx, w unlatchedMembershipWrite, 
 		_, err = tx.ExecContext(ctx, absorbIsoSQL, w.epoch, w.reason, updatedAt, w.host)
 	}
 	return err
+}
+
+// MembershipWrite is unlatchedMembershipWrites for the ledger guard in
+// scripts/ci/stmtshapecheck, which checks that every registered shape writing
+// hosts.state or the isolation columns is one this parser reads. ok is false
+// when the statement yields no write.
+func MembershipWrite(s Statement) (host, ts string, hasState bool, state string, hasIso bool, epoch int64, reason string, ok bool) {
+	ws := unlatchedMembershipWrites([]Statement{s})
+	if len(ws) != 1 {
+		return "", "", false, "", false, 0, "", false
+	}
+	w := ws[0]
+	return w.host, w.ts, w.hasState, w.state, w.hasIso, w.epoch, w.reason, true
 }
 
 // ── the pass ────────────────────────────────────────────────────────────────

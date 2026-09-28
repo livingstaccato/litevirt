@@ -102,8 +102,8 @@ of acting — it says nothing about whether the resulting rows have replicated.
   a concurrent write, exactly as before, and no reader ever takes it over the
   `host_membership` row. A state change made through a host that is not yet
   writing `host_membership` (mid-roll, or rolled back one release) is absorbed
-  into it by each latched host that applies that change, and reaches the rest
-  by anti-entropy. State and isolation share their row
+  into it by every host that applies that change, the writer included, and
+  reaches any host that missed it by anti-entropy. State and isolation share their row
   with each other, and a host's operator-set configuration (fence strategy,
   role, region) shares the `hosts` row with its self-reports. On a cluster that
   has not finished rolling to a build carrying `host_membership_split_v1`,

@@ -664,6 +664,18 @@ again loses nothing. Roll forward.
 Retiring the `hosts` copy is a later release's step, behind a second token; see
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
+### Gossip encryption is a separate roll, after the upgrade
+
+The upgrade itself changes nothing on the gossip wire: `enforcement.gossip_encryption`
+defaults to `false`, and an existing cluster has no `gossip.key` until
+`lv host install-gossip-key` puts one on every host. Turning it on is three more
+rolling restarts, one per stage (`install`, `staged`, `true`), and it must not
+start until **every** host runs a build with the flag — a host on an older build
+stays plaintext and the `staged` roll cuts it off. Rolling a binary back below
+this release on a host whose stage is `staged` or `true` does the same, so walk
+the stage back to `install` fleet-wide first. The sequence, and why no stage may
+be skipped, is in [auth.md](auth.md#turning-it-on-in-an-existing-cluster).
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

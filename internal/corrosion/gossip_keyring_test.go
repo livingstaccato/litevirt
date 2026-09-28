@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -339,6 +340,73 @@ func TestGossip_EnforcedClusterRefusesANodeWithoutTheKey(t *testing.T) {
 			"so the refusals above prove nothing about the keyring")
 	}
 	stopGossipNode(keyed)
+}
+
+// TestGossip_EnforcedNodeAnswersAKeyedStrangerOnly pins what the live-cluster
+// check (tests/e2e/gossip_keyring_test.go) relies on to tell the keyring from
+// admission. An enforced node ANSWERS a join from a stranger holding the key and
+// sending encrypted — memberlist sends its state before the merge delegate
+// refuses the name — so a refusal of anything else is the keyring's doing. The
+// sharpest of those is a stranger that HOLDS the key but sends plaintext (the
+// install stage): only GossipVerifyIncoming refuses it, since it could read an
+// encrypted answer. A staged node answers it.
+func TestGossip_EnforcedNodeAnswersAKeyedStrangerOnly(t *testing.T) {
+	key, other := newTestGossipKey(t), newTestGossipKey(t)
+	type probe struct {
+		ring      GossipKeys
+		plaintext bool
+	}
+	probes := map[string]probe{
+		"keyed": {GossipKeys{key}, false}, "keyed-plaintext": {GossipKeys{key}, true},
+		"unkeyed": {nil, false}, "other key": {GossipKeys{other}, false},
+	}
+	for _, tc := range []struct {
+		stage    GossipEncryption
+		answered map[string]bool
+	}{
+		{GossipEncryptionEnforced, map[string]bool{"keyed": true, "keyed-plaintext": false, "unkeyed": false, "other key": false}},
+		{GossipEncryptionStaged, map[string]bool{"keyed": true, "keyed-plaintext": true, "unkeyed": false, "other key": false}},
+	} {
+		name := "node-" + tc.stage.String()
+		n := keyedGossipNode(t, name, tc.stage, GossipKeys{key}, nil, name)
+		for what, want := range tc.answered {
+			p := probes[what]
+			err := probeGossipJoin(t, seedAddr(gossipPort(n)), p.ring, p.plaintext)
+			if got := err == nil; got != want {
+				t.Errorf("%v node: %s join answered=%v, want %v (%v)", tc.stage, what, got, want, err)
+			}
+		}
+		if sees := memberNames(n.Members()); len(sees) != 0 {
+			t.Fatalf("admission let a stranger in: %v", sees)
+		}
+	}
+}
+
+// probeGossipJoin is a bare memberlist stranger (no hosts row anywhere) joining
+// peer. plaintext keeps the keyring but sends unencrypted, as the install stage
+// does. It returns the join error: nil means the peer answered.
+func probeGossipJoin(t *testing.T, peer string, ring GossipKeys, plaintext bool) error {
+	t.Helper()
+	cfg := memberlist.DefaultLANConfig()
+	cfg.Name, cfg.BindAddr, cfg.BindPort = "stranger", "127.0.0.1", 0
+	cfg.LogOutput = io.Discard
+	if ring != nil {
+		kr, err := memberlist.NewKeyring(nil, ring[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Keyring = kr
+		if plaintext {
+			cfg.GossipVerifyIncoming, cfg.GossipVerifyOutgoing = false, false
+		}
+	}
+	ml, err := memberlist.Create(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ml.Shutdown()
+	_, err = ml.Join([]string{peer})
+	return err
 }
 
 // TestSetGossipKeys_LiveRotationKeepsMembership walks the three rotation phases

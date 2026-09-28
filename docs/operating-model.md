@@ -740,7 +740,7 @@ leadership churn or a partition.
   visible everywhere before I act" should use a confirmation read on the
   target peer, not assume convergence.
 
-### Gossip admits only known hosts, but is not authenticated
+### Gossip admits only known hosts, and is authenticated only when encrypted
 - Gossip membership (memberlist, `gossip_port`) admits a member only when its
   name is a `hosts` row this node holds that is not removed, and it announces
   the address that row records. A name with no row, a removed host, and a real
@@ -763,11 +763,23 @@ leadership churn or a partition.
 - A host whose gossip address differs from its recorded address is refused and
   logged with both addresses. On a multi-homed host, set `advertise_address` to
   the address the host was added with.
-- **An untrusted gossip segment is not supported.** Admission checks names and
-  addresses, and neither is a secret: gossip carries no key yet, so a machine on
-  the segment can still announce a real host's name from that host's own
-  address, or disturb failure detection. Keep `gossip_port` on a network only
-  cluster hosts can reach.
+- Admission checks names and addresses, and neither is a secret. What makes
+  gossip authenticated is the cluster gossip key (`<pki_dir>/gossip.key`) with
+  `enforcement.gossip_encryption: true` on every host: each packet and stream is
+  AES-256-GCM under that key, and a node drops anything unencrypted or under a
+  key it does not hold — before admission even sees it. See
+  [Gossip encryption](auth.md#gossip-encryption) for the key, the rollout and
+  rotation.
+- **An unauthenticated gossip segment is not supported.** Until every host runs
+  `gossip_encryption: true`, gossip is plaintext (or accepts plaintext, in the
+  `install` and `staged` rollout stages): a machine on the segment can announce
+  a real host's name from that host's own address, read the membership, or
+  disturb failure detection. Keep `gossip_port` on a network only cluster hosts
+  can reach until the rollout is finished. Even encrypted, the key is one shared
+  secret: every host holding it can speak for any member, a removed host keeps
+  what it knew, and encryption does not hide that gossip traffic exists — so
+  rotate the key after removing a host you no longer trust, and keep the port
+  firewalled regardless.
 
 ### Secret-bearing repair is peer-only
 - Secret-bearing config is **excluded from the operator-readable full-state

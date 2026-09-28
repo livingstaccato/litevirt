@@ -93,6 +93,13 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 		}
 	}
 
+	// The cluster gossip key, minted beside the CA the first time and reused
+	// after. The new-cluster enforcement block enforces it from the start.
+	gossipKeyPath, _, err := ensureLocalGossipKey(pkiDir)
+	if err != nil {
+		return fmt.Errorf("gossip key: %w", err)
+	}
+
 	// 3. Generate host certificate
 	slog.Info("generating host certificate", "host", hostName, "address", hostAddr)
 	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
@@ -122,6 +129,8 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
 		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
 		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
+		// 0600 for the same reason as host.key: whoever reads it speaks gossip.
+		{gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0600},
 	} {
 		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
 			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
@@ -214,6 +223,12 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return err
 	}
+	// The gossip key goes with ca.crt. A keyed cluster with no key here is a
+	// refusal now, before anything is minted or pushed.
+	gossipKeyPath, pushGossipKey, err := gossipKeyToPush(pkiDir, enforcement)
+	if err != nil {
+		return err
+	}
 
 	// Generate CLI client certificate if it doesn't exist
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
@@ -262,6 +277,11 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	} {
 		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
 			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
+		}
+	}
+	if pushGossipKey {
+		if err := sc.CopyFileMode(gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0600); err != nil {
+			return fmt.Errorf("push %s: %w", pki.GossipKeyName, err)
 		}
 	}
 
@@ -496,10 +516,15 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	if err := os.MkdirAll(remotePKIDir, 0700); err != nil {
 		return fmt.Errorf("create system PKI dir: %w", err)
 	}
+	gossipKeyPath, _, err := ensureLocalGossipKey(pkiDir)
+	if err != nil {
+		return fmt.Errorf("gossip key: %w", err)
+	}
 	for src, dst := range map[string]string{
-		caPath:       filepath.Join(remotePKIDir, "ca.crt"),
-		hostCertPath: filepath.Join(remotePKIDir, "host.crt"),
-		hostKeyPath:  filepath.Join(remotePKIDir, "host.key"),
+		caPath:        filepath.Join(remotePKIDir, "ca.crt"),
+		hostCertPath:  filepath.Join(remotePKIDir, "host.crt"),
+		hostKeyPath:   filepath.Join(remotePKIDir, "host.key"),
+		gossipKeyPath: filepath.Join(remotePKIDir, pki.GossipKeyName),
 	} {
 		data, err := os.ReadFile(src)
 		if err != nil {
@@ -944,8 +969,15 @@ func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) 
 }
 
 // newClusterEnforcement is the enforcement block a brand-new cluster starts
-// with. Only the two shared-storage protections: every other flag stays at its
-// documented default here, because this is a safety floor, not a policy.
+// with. The two shared-storage protections, and gossip encryption: every other
+// flag stays at its documented default here, because this is a safety floor,
+// not a policy.
+//
+// Gossip encryption is on the floor for the same reason as the fences: an
+// existing cluster has to walk it on in three rolling restarts because nodes
+// two stages apart cannot gossip, but a new cluster has no plaintext node to
+// stay compatible with. `lv host init` mints the key and `lv host add` pushes it
+// with this block, so every host starts enforced together.
 //
 // Default-off is the right design for an EXISTING cluster — a flag flip must
 // never change behaviour mid-roll, which is what the monotone latch buys. It is
@@ -964,6 +996,8 @@ const newClusterEnforcement = `enforcement:
                               # proof (` + "`lv host fence-confirm`" + `) before reschedule/promote
   shared_storage_fence: true  # an ownership transfer of a writable shared disk needs a
                               # proof-grade fence of the source host
+  gossip_encryption: true     # gossip is encrypted with pki_dir/gossip.key, and anything
+                              # unencrypted or under another key is dropped
 `
 
 // enforcementYAML decides what enforcement block a host being initialised

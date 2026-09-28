@@ -529,6 +529,21 @@ type EnforcementConfig struct {
 	// refused until `lv host reseed` verifies convergence. Pre-latch clusters
 	// behave exactly as today. Enable fleet-uniformly; reversible kill switch.
 	IsolationEpoch bool `yaml:"isolation_epoch,omitempty"`
+	// GossipEncryption: encrypt and authenticate gossip (memberlist, port 7946)
+	// with the cluster key in pki_dir/gossip.key. false (the default) is today's
+	// plaintext; true is the full guarantee — encrypted out, and anything
+	// unencrypted or under another key dropped. Between them are the two
+	// rolling-restart stages an existing cluster walks through, one fleet-wide
+	// roll each: install (key loaded, still sending plaintext) and staged
+	// (sending encrypted, still accepting plaintext). Nodes one stage apart
+	// always interoperate; two apart do not. See corrosion/gossip_keyring.go
+	// and docs/auth.md "Gossip encryption".
+	//
+	// No capability token: the receiver enforces this locally, no peer relies on
+	// another honouring it, and a mis-staged pair loses gossip between them —
+	// availability, never data. Every stage but false refuses to start without a
+	// usable gossip.key. Read once at startup; the KEYS reload live.
+	GossipEncryption corrosion.GossipEncryption `yaml:"gossip_encryption,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.

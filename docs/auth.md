@@ -463,3 +463,168 @@ bearer; `lv cluster converge` and the UI's **Force Sync** button call
 no state. `lv doctor divergence` (admin) has the connected node fetch each peer's
 dump with its own host certificate, and returns only table names, primary keys
 and row hashes — keyed HMAC labels for the secret-bearing tables.
+
+## Gossip encryption
+
+Everything above rides mTLS gRPC. Gossip does not: memberlist (`gossip_port`,
+7946, TCP and UDP) speaks its own protocol, and it carries the membership that
+relay election, replication targets, anti-entropy and capability activation all
+count. [Admission](operating-model.md#gossip-admits-only-known-hosts-and-is-authenticated-only-when-encrypted)
+refuses names that are not in the `hosts` table, but names and addresses are not
+secrets. What authenticates gossip is a cluster-wide AES-256 key:
+memberlist encrypts every packet and stream with it (AES-GCM), and a node that
+enforces it drops anything unencrypted or under a key it does not hold.
+
+**An unauthenticated gossip segment is not supported.** Until every host runs
+`enforcement.gossip_encryption: true`, anyone who can reach `gossip_port` can
+read the membership, announce a real host's name from its address, or disturb
+failure detection. Keep the port on a network only cluster hosts can reach until
+the rollout below is finished, and firewalled after it: the key is one shared
+secret, so every host holding it can speak for any member, and a removed host
+keeps what it knew until the key is rotated.
+
+### The key file
+
+`/etc/litevirt/pki/gossip.key` (`<pki_dir>/gossip.key`) on every host, mode
+0600, beside `ca.crt`. One base64 32-byte key per line; the **first** encrypts,
+**every** key decrypts; `#` lines are comments. The daemon refuses a file that
+group or other can read, a key that is not 32 bytes, and a duplicate.
+
+It is distributed exactly as the CA certificate is — pushed over SSH from the
+machine that holds the CA, which keeps the canonical copy in its CLI PKI
+directory (`~/.config/litevirt/pki/gossip.key`):
+
+- `lv host init` mints it next to the CA and pushes it; `lv host add` pushes it
+  alongside `ca.crt`, and refuses to add a host to a cluster whose enforcement
+  block keys gossip when this machine has no key to give it;
+- `lv host install-gossip-key` gives an existing cluster one;
+- `lv host rotate-gossip-key` replaces it.
+
+The key is never written to `config.yaml`, the replicated database (and so never
+to a state dump) or a log. Logs, the CLI and the state file below name keys by a
+16-hex-digit ID, a truncated domain-separated SHA-256 that cannot be reversed.
+If the CA machine loses its copy, copy any host's `gossip.key` back, mode 0600.
+
+The daemon re-reads `gossip.key` every 5 seconds and applies a changed keyring
+**without a restart**. A missing, loose or unparseable file is logged and
+ignored — the keys in use are kept, because an empty keyring would mean
+plaintext. It reports what it is USING to
+`/etc/litevirt/pki/gossip-keyring.state`:
+
+```
+mode=enforced
+primary=3f1c9e0a7b2d4c61
+keys=3f1c9e0a7b2d4c61
+rejected=0
+```
+
+`rejected` counts gossip this node dropped since it started for being
+unencrypted or under a key it does not hold. It should stay flat through every
+step below; a rising count is a peer this node cannot hear.
+
+### The flag
+
+`enforcement.gossip_encryption` defaults to `false`. Its values are four stages:
+
+| Stage | Keyring | Sends | Accepts |
+|---|---|---|---|
+| `false` | none (the file is not read) | plaintext | plaintext |
+| `install` | loaded | plaintext | plaintext and encrypted |
+| `staged` | loaded | encrypted | plaintext and encrypted |
+| `true` | loaded | encrypted | encrypted only |
+
+Two nodes gossip with each other exactly when their stages are **adjacent** in
+this table. Two apart cannot: a `staged` node is unreadable to a `false` one, and
+a `true` node is deaf to an `install` one. That is the whole rollout rule — each
+rolling restart moves every host one stage, and each finishes on **every** host
+before the next begins. `install` is the stage it is tempting to skip; skipping
+it makes the first `staged` host unreadable to every host with no keyring yet.
+
+Every value but `false` refuses to start without a usable `gossip.key`, rather
+than come up in plaintext under a flag that says otherwise. The stage is read
+once at startup (memberlist fixes it for the life of the process); the keys are
+not. A new cluster's enforcement block from `lv host init` sets it to `true`:
+there is no plaintext host to stay compatible with.
+
+There is no capability token for this flag, deliberately. The guarantee is
+enforced by the **receiver**, locally: a `true` node drops what it cannot
+authenticate, whatever its peers believe, so no node relies on a peer honouring
+anything. A mis-staged pair loses gossip between the two of them — an
+availability problem, visible in `rejected` and in membership — never a data
+problem, since replication rides mTLS gRPC. A latch could not drive the rollout
+either: memberlist cannot change stage under a running process, so it would take
+effect at the next restart, which is the rolling restart the sequence already is.
+
+### Turning it on in an existing cluster
+
+Every host must first run a build that has this flag: a host on an older build
+ignores the key and stays plaintext, so the `staged` roll would cut it off.
+
+1. From the machine that holds the CA, install the key everywhere. Nothing
+   changes on the wire yet:
+
+   ```bash
+   lv host install-gossip-key
+   ```
+
+2. On each host in turn, set the stage and restart, waiting for the host to be
+   back before moving on:
+
+   ```bash
+   # /etc/litevirt/config.yaml
+   enforcement:
+     gossip_encryption: install
+   ```
+
+   ```bash
+   systemctl restart litevirt
+   lv host ls                            # the host is back and active
+   cat /etc/litevirt/pki/gossip-keyring.state   # mode=install
+   ```
+
+   When **every** host is done, `lv host install-gossip-key` again: it writes
+   nothing and lists every host's stage. All must read `install`.
+
+3. The same roll with `gossip_encryption: staged`. All must read `staged`, and
+   `rejected` must be flat on every host.
+
+4. The same roll with `gossip_encryption: true`. All must read `enforced`, with
+   `rejected` still flat. Gossip is now authenticated.
+
+Do not add hosts in the middle of a roll: `lv host add` copies the enforcement
+block of the node it reads, and a host more than one stage from any peer cannot
+gossip with it. Rolling back is the same walk in reverse — `staged`, then
+`install`, then `false`, each on every host — never a jump of two.
+
+### Rotation
+
+```bash
+lv host rotate-gossip-key               # --grace 30s --timeout 2m
+```
+
+Run from the machine that holds the cluster's gossip key, with every host
+reachable over SSH and its daemon running. No restart. memberlist encrypts with
+the primary and decrypts with any installed key, so a new key must be on every
+host before any host encrypts with it, and every host must stop encrypting with
+the old one before any host drops it. The command does it in three phases, and
+each waits for every host's state file to report the phase **loaded** — not just
+the file written — before the next:
+
+1. `[old, new]` — the new key is accepted everywhere; the old one still encrypts;
+2. `[new, old]` — the new key encrypts; the old one is still accepted, for `--grace`;
+3. `[new]` — the old key is removed.
+
+"Add the new key as primary, then remove the old" in two steps is the tempting
+shortcut, and it cuts off every host that has not loaded the new key yet for as
+long as that takes.
+
+If the rotation stops part-way — a host down, a phase that times out, Ctrl-C —
+the cluster is safe as it stands, and the error names the host. Fix it and run
+the command again: finding hosts on different keyrings, it puts them all back on
+this machine's copy and then settles on that copy's primary alone (the new key
+if phase 2 had started, the old one otherwise), and stops. Run it once more to
+rotate. A host that is `false` takes the new file without being waited on; it
+loads whatever is current when its stage changes.
+
+Rotate after removing a host you no longer trust, after any suspected exposure
+of a `gossip.key`, and periodically.

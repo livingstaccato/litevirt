@@ -68,6 +68,12 @@ lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (h
 lv host undrain <host>                    # Return host to scheduling
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
+lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
+  [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
+                                          #   gossip stage. See auth.md "Gossip encryption"
+lv host rotate-gossip-key                 # Replace the gossip key everywhere, live, in three
+  [--grace 30s] [--timeout 2m]            #   barriered phases; re-run to settle an interrupted one
+  [--ssh-user root]
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
 lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence host
 lv host rescan [host]                     # Rescan PCI devices

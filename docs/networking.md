@@ -1355,7 +1355,7 @@ so it happens only under a whole-cluster proof:
   peer — and a peer missing from it would otherwise be absent from both samples,
   making the two samples agree about a cluster neither of them saw whole.
   Gossip admits only hosts with a `hosts` row on the node that admits them (see
-  [the operating model](operating-model.md#gossip-admits-only-known-hosts-but-is-not-authenticated)),
+  [the operating model](operating-model.md#gossip-admits-only-known-hosts-and-is-authenticated-only-when-encrypted)),
   so a host it names is one some node has admitted, and a node whose table
   already has the row still counts it through that row;
 - that set is then **closed over every host's own membership view**: each one is

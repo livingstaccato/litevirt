@@ -993,6 +993,11 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 	if err != nil || h == nil {
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
+	// A current voter keeps its vote whatever its hosts row says, so deleting
+	// the row must not look like removing the voter (recovery-claims.md §4.3).
+	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
+		return nil, err
+	}
 
 	// Check for VMs on this host.
 	vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)

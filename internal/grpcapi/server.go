@@ -324,6 +324,16 @@ type Server struct {
 	enfIsolationEpoch bool
 	ownerEpochReady   func() bool
 
+	// claims is the per-process recovery-claim state: signing identity,
+	// verifier, proposer, owner-probe cache and last refusals
+	// (recovery_claims.go). voterConfigReady caches a positive
+	// VoterConfigReadiness, which cannot regress within a process.
+	claims           claimRuntime
+	voterConfigReady atomic.Bool
+	// voterChangeMu serializes automatic genesis with `lv cluster voter`
+	// changes on this node, so one process proposes one change at a time.
+	voterChangeMu sync.Mutex
+
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
 	// pool. pfLocks serializes the inventory→create→observe→claim critical section
@@ -875,6 +885,15 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfLeaseTerm || s.leaseTermReady == nil || !s.leaseTermReady() {
 		caps = withoutCapability(caps, capabilities.LeaseTermV1)
 	}
+	// voter_config_v1 is MANDATORY — no flag, because a node with one off would
+	// count a different majority from its peers — but it is advertised only
+	// once this node can vote durably: synchronous=FULL and a loadable signing
+	// key (VoterConfigReadiness, local reads only). Latching it across a node
+	// that cannot keep a promise would put that node's forgotten promises under
+	// every decision it takes part in.
+	if !s.voterConfigAdvertisable() {
+		caps = withoutCapability(caps, capabilities.VoterConfigV1)
+	}
 	return caps
 }
 
@@ -1227,6 +1246,11 @@ func (s *Server) tokenEnabled(token string) bool {
 	case capabilities.FailoverScopeV1:
 		// No kill switch: the token says this build decodes cluster_policies
 		// and honours failover_scope. The opt-in is the replicated policy row.
+		return true
+	case capabilities.VoterConfigV1:
+		// No kill switch: a node with voter_config_v1 off would count a
+		// different majority from its peers. Its stand-down is the decided
+		// `lv cluster voter reset`, which moves every node at one generation.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

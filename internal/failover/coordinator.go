@@ -246,6 +246,14 @@ type Coordinator struct {
 	// window, even if quorum transiently returns first. Wired by the daemon from the
 	// watchdog controller; nil → never fenced.
 	SelfFenced func() bool
+	// VoterGenesis, when set, runs once per tick in which this coordinator
+	// holds the leader lease, with the lease term (the ballot round seed). It
+	// is automatic voter genesis (grpcapi.Server.VoterGenesisTick,
+	// docs/design/recovery-claims.md §4.2): the lease keeps usually one
+	// proposer active, and genesis being a claim makes two lease holders decide
+	// one value. It returns at once on a cluster that already has a voter
+	// generation. nil (a hand-built coordinator) never proposes.
+	VoterGenesis func(ctx context.Context, leaseTerm int64)
 }
 
 // FailoverGate is the subset of *health.Checker the coordinator consults at
@@ -414,6 +422,9 @@ func (c *Coordinator) run(ctx context.Context) {
 			c.stepDownGauges()
 		}
 		return
+	}
+	if c.VoterGenesis != nil {
+		c.VoterGenesis(ctx, c.LeaseTerm())
 	}
 
 	// The voter set is both halves of the quorum: its size is the

@@ -574,6 +574,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireLeaseTermLedgerGate()
 	d.wireCredentialsSplitGate()
 	d.wireClusterPolicyGate()
+	d.wireVoterConfigGate()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag, for the same reason as
@@ -1335,7 +1336,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A coordinator that was itself suspended or starved a moment ago decides no
 	// fence until it has watched for a full grace window (health/stall.go).
 	fc.LocalStall = d.checker.InStallGrace
+	// Automatic voter genesis runs on the leader-lease holder's tick
+	// (docs/design/recovery-claims.md §4.2). Inert until voter_config_v1 has
+	// durably latched, and once any voter generation exists.
+	fc.VoterGenesis = svc.VoterGenesisTick
 	go fc.Start(ctx)
+	// Adopt each decided voter generation once its certificate verifies,
+	// importing claim state first where this node is a member of it (§4.4).
+	go d.runVoterAdoption(ctx, svc)
 
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
 	// down during a cluster upgrade) pulls the newer binary from a healthy peer
@@ -2425,6 +2433,44 @@ func (d *Daemon) wireClusterPolicyGate() {
 	d.db.SetClusterPolicyGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
 	})
+}
+
+// wireVoterConfigGate lets corrosion write voter_configs only once
+// voter_config_v1 is DURABLY latched. Its statement shapes are the first that
+// table ever had, so a write before the latch back-pressures a
+// previous-release peer's replication stream. Mandatory, no config flag;
+// unwired, the gate fails closed and no voter generation is ever written, which
+// is the previous release's behaviour.
+func (d *Daemon) wireVoterConfigGate() {
+	d.db.SetVoterConfigGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.VoterConfigV1)
+	})
+}
+
+// voterAdoptionInterval is how often the daemon adopts newly replicated voter
+// generations. A pass with nothing new is one indexed read.
+const voterAdoptionInterval = 5 * time.Second
+
+// runVoterAdoption adopts decided voter generations as they replicate in.
+func (d *Daemon) runVoterAdoption(ctx context.Context, svc *grpcapi.Server) {
+	t := time.NewTicker(voterAdoptionInterval)
+	defer t.Stop()
+	var lastErr string
+	for {
+		if _, err := svc.AdoptVoterConfigs(ctx); err != nil {
+			if err.Error() != lastErr {
+				slog.Warn("voter set: adoption pass did not complete", "error", err)
+			}
+			lastErr = err.Error()
+		} else {
+			lastErr = ""
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }
 
 func (d *Daemon) wireLeaseTermLedgerGate() {

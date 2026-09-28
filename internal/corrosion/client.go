@@ -301,6 +301,24 @@ type Client struct {
 	// previous-release peer. See credentials_split.go.
 	credentialsSplit func() bool
 
+	// hostMembershipGate, when non-nil and returning true, permits WRITING
+	// host_membership. Injected via SetHostMembershipGate, wired to the durable
+	// host_membership_split_v1 latch. Fails CLOSED when unset, for the
+	// leaseTermLedger reason: that table's shapes back-pressure a
+	// previous-release peer. See host_membership.go.
+	// Atomic because the WAL apply path reads it (absorbUnlatchedMembershipWrite)
+	// on replication goroutines that may already be running when it is set.
+	hostMembershipGate atomic.Pointer[func() bool]
+	// hostMembershipLive is set once a SplitHostMembership pass has completed
+	// with the gate open (also persisted under dataDir); from then on writers
+	// write host_membership and readers read it.
+	hostMembershipLive atomic.Bool
+	// hostMembershipLiveChecked records that the persisted marker was read.
+	hostMembershipLiveChecked atomic.Bool
+	// hostMembershipMu serializes the split pass with the membership writers,
+	// so a writer's read-modify-write sees what the pass just absorbed.
+	hostMembershipMu sync.Mutex
+
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
 	// minted random id. Gated on `enforcement.canonical_identity && CanonicalIdentityV1
@@ -1127,6 +1145,13 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		c.mu.Unlock()
 		return false, err
 	}
+	// Likewise a state or isolation write this node makes to hosts alone
+	// updates the membership row it holds (host_membership.go).
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
 	if c.clock != nil && len(relay) > 0 {
 		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
@@ -1228,6 +1253,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// A secret this node writes without its credential statement (its gate is
 	// closed) also refreshes the credential row it holds (credentials_absorb.go).
 	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
+	// Likewise a state or isolation write this node makes to hosts alone
+	// updates the membership row it holds (host_membership.go).
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

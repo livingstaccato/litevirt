@@ -413,7 +413,21 @@ import (
 //	     every node backfills the same row, and a per-node creation instant
 //	     would turn identical rows into a permanent equal-timestamp content
 //	     tie. Three new tables.
-const CurrentSchemaVersion = 56
+//	v57: host membership gets its own clock — host_membership (host_name PK,
+//	     state, isolation_epoch, isolation_reason). Those columns were written
+//	     by the coordinator, operators and isolation detectors into the same
+//	     `hosts` row the daemon writes its version and resources into, under
+//	     one updated_at, so a replica could refuse one of two concurrent writes
+//	     to different columns as older and lose it (colonelpanik/litevirt#267).
+//	     A previous-release node cannot decode the new table's statements and
+//	     reads state only from hosts.state, so nothing touches host_membership
+//	     until host_membership_split_v1 latches (ReplicationGated). From then
+//	     on state and isolation are written to BOTH, in one batch, and read
+//	     from host_membership; the hosts columns stay current for a node
+//	     rolled back one release and are never cleared in this version. No
+//	     created_at, for the v56 reason: every node backfills the same row.
+//	     One new table.
+const CurrentSchemaVersion = 57
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2531,6 +2545,20 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
 	)`,
+	// v57 host membership — the coordinator-owned facts about a host, on a row
+	// with its own LWW clock so they no longer share one with the daemon's
+	// self-reported columns on `hosts` (which keep a dual-written copy). Written only once
+	// host_membership_split_v1 latches; see host_membership.go. A row the
+	// backfill wrote carries the hosts row's updated_at, so every node that
+	// backfills the same host writes the same row.
+	`CREATE TABLE IF NOT EXISTS host_membership (
+		host_name        TEXT PRIMARY KEY,
+		state            TEXT NOT NULL DEFAULT 'active',
+		isolation_epoch  INTEGER NOT NULL DEFAULT 0,
+		isolation_reason TEXT NOT NULL DEFAULT '',
+		updated_at       TEXT NOT NULL,
+		deleted_at       TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2717,6 +2745,7 @@ var tablePrimaryKeys = map[string][]string{
 	"host_fence_credentials":  {"host_name"},
 	"user_credentials":        {"username"},
 	"token_credentials":       {"token_id"},
+	"host_membership":         {"host_name"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3078,6 +3107,7 @@ var createTableUnits = []struct {
 	{52, "leader_lease_terms"},
 	{55, "local_term_bindings"},
 	{56, "host_fence_credentials"}, {56, "user_credentials"}, {56, "token_credentials"},
+	{57, "host_membership"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

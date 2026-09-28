@@ -97,19 +97,28 @@ func GetStoragePool(ctx context.Context, c *Client, hostName, name string) (Stor
 // have a non-deleted pool of the given name — used to pick a healthy peer for
 // cross-host replication when no target host was set explicitly.
 func HostsWithPool(ctx context.Context, c *Client, poolName, excludeHost string) ([]string, error) {
+	// The state filter is applied to the RESOLVED state (host_membership.go),
+	// not to hosts.state in SQL: after the membership split that column is a
+	// copy on the shared hosts clock, and can still lose a concurrent write.
+	states, err := resolvedHostStates(ctx, c)
+	if err != nil {
+		return nil, fmt.Errorf("hosts_with_pool: %w", err)
+	}
 	rows, err := c.Query(ctx,
 		`SELECT sp.host_name
 		 FROM storage_pools sp
 		 JOIN hosts h ON h.name = sp.host_name
 		 WHERE sp.name = ? AND sp.deleted_at IS NULL
-		   AND h.state = 'active' AND h.name != ?
+		   AND h.deleted_at IS NULL AND h.name != ?
 		 ORDER BY sp.host_name`, poolName, excludeHost)
 	if err != nil {
 		return nil, fmt.Errorf("hosts_with_pool: %w", err)
 	}
 	out := make([]string, 0, len(rows))
 	for _, r := range rows {
-		out = append(out, r.String("host_name"))
+		if states[r.String("host_name")] == "active" {
+			out = append(out, r.String("host_name"))
+		}
 	}
 	return out, nil
 }

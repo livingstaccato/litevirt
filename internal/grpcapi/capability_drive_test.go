@@ -77,6 +77,9 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// would keep it from ever being driven, and the secrets would stay in
 		// the public dump.
 		capabilities.CredentialsSplitV1: true,
+		// host_membership_split_v1 likewise: "this build decodes
+		// host_membership and reads state from it".
+		capabilities.HostMembershipSplitV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

@@ -577,6 +577,93 @@ is set, as it is for every mandatory token mid-roll. If it stays set after the
 roll, a host is still on the previous release — most often one in
 `maintenance`.
 
+### Host state moves to its own row after the roll
+
+A host's state (`active`, `draining`, `maintenance`, `upgrading`, `offline`,
+`fenced`) and its isolation epoch used to live only in the `hosts` row, beside
+the version, schema and resources the host reports about itself. That row has
+one `updated_at`, and replication applies a write only if it is newer than the
+row, so a state change and a concurrent version report could lose each other:
+the host that applied the newer one first refused the older one. Schema v57
+adds `host_membership`, one row per host with its own `updated_at`. State and
+isolation are copied into it **on their own, after the last host has
+upgraded**. No flag starts it; the `host_membership_split_v1` capability token
+does.
+
+The ordering is fixed the same way as for secrets. A host on the previous
+release cannot decode a statement on `host_membership`, and it reads state
+only from `hosts.state`. So while any host the cluster replicates to —
+including one parked in `maintenance` — runs the previous release:
+
+- nothing is written to `host_membership`;
+- every drain, fence, maintenance, boot and isolation is written to `hosts`,
+  exactly as before.
+
+`host_membership_split_v1` is mandatory and replication-gated. Once it has
+latched on a host, that host:
+
+- runs a pass at start and every 10 seconds that gives every host a
+  `host_membership` row, stamped with the `hosts` row's `updated_at` so every
+  host's copy is identical. The pass copies; it never clears or changes the
+  `hosts` columns;
+- after its first complete pass, writes every state and isolation change to
+  **both** `host_membership` and the `hosts` columns, in one batch with one
+  `updated_at`. The `hosts` half uses the previous release's statements, so a
+  host rolled back one release still reads every change;
+- reads state and isolation — for `lv host ls`, the voter set, fencing, relay
+  election and replication refusal alike — from `host_membership`, falling
+  back to `hosts` for a host that has no row yet. Before its first pass it
+  reads `hosts`, as before.
+
+A reader never compares the two copies. The `hosts` copy still shares its
+row's clock with the host's own reports, so on a host that refused the `hosts`
+half of a fence because a version report was newer, the `hosts` row is the
+newer one and its state is the stale one. Readers take `host_membership`, and
+nothing moves a `hosts` value into it merely because that value differs or
+its row is newer.
+
+Latches form per host, so for a few seconds after one host latches its
+neighbour may not have yet. A drain or fence made through that neighbour in
+that window goes to `hosts` only, as does any write from a host rolled back
+one release. Such a write is recognised by where it came from: a latched
+host's writes always carry their `host_membership` statement in the same
+replicated batch, so a batch that writes `hosts` state or isolation without
+one came from a host that was not writing `host_membership` yet. A latched
+host applying such a batch writes the change into its own `host_membership` row in
+the same transaction, with the write's own `updated_at`, if that is newer than
+the row, creating the row if it has none. It does not replicate that change:
+every host that sees the batch computes the same row from it, and anti-entropy
+carries the row to one that did not.
+
+A host that has not latched yet does the same to a `host_membership` row it
+already holds — one a latched peer wrote — but never creates one. That includes
+its own writes: the host that fences another through the old columns alone
+updates its own copy of that host's row in the same transaction, so when it
+latches it reads the fence at once rather than a latched peer's older copy.
+
+Two changes still wait for anti-entropy, typically a minute or two. One is a
+change that reached a host before that host held any `host_membership` row for
+the host concerned; a peer's older copy arriving later is then what it serves.
+The other is a change that reached a latched host only through anti-entropy
+repair of the `hosts` row (which moves rows, not batches). If no latched host
+received the batch itself, that second change is not absorbed anywhere and is
+lost, exactly as it could be before v57.
+
+An absorb that fails fails its write: a replicated batch is rolled back and
+back-pressured, and a local write returns the error. It never commits the
+`hosts` half without the `host_membership` half.
+
+**What the two copies buy on a rollback.** The `hosts` columns stay current,
+so a host on the previous release reads the right state, voter set and
+isolation. As for `credentials_split_v1`, a binary rolled back below the
+latched token still enters WAL quarantine at startup and emits no replicated
+writes until it is upgraded again or reseeded, and it cannot decode the
+`host_membership` statements that latched peers keep sending. Upgrading it
+again loses nothing. Roll forward.
+
+Retiring the `hosts` copy is a later release's step, behind a second token; see
+[design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

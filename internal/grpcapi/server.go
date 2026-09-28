@@ -838,6 +838,12 @@ func (s *Server) advertisedCapabilities() []string {
 	// columns) is enforced by the latch itself, which is ReplicationGated and so
 	// cannot form while any replication recipient is on a build that reads the
 	// old columns only.
+	// host_membership_split_v1 is not withheld either, for the same reason: it
+	// is a fact about the build (this binary decodes host_membership and reads
+	// state and isolation from it), and the guarantee it licenses — emitting
+	// host_membership statements — is enforced by the latch itself, which is
+	// ReplicationGated and so cannot form while any replication recipient
+	// cannot decode them.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1208,6 +1214,11 @@ func (s *Server) tokenEnabled(token string) bool {
 		// this build decodes the credential tables' shapes and reads a secret
 		// from them — a fact about the binary. A flag-gated token would never be
 		// driven, never latch, and leave the secrets in the public dump.
+		return true
+	case capabilities.HostMembershipSplitV1:
+		// No kill switch, for the credentials_split_v1 reason: the token says
+		// this build decodes host_membership and reads state from it — a fact
+		// about the binary. A flag-gated token would never latch.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

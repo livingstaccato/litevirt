@@ -434,6 +434,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("auth realms ready", "realms", names)
 	}
 
+	// The membership split gate goes in BEFORE this host's first write. The
+	// boot state below is a state write, and on a node that has already split
+	// it must reach host_membership too. Written to hosts.state alone, this
+	// node's own host_membership row would miss it until anti-entropy.
+	d.wireHostMembershipGate()
+
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
 		slog.Warn("failed to register host", "error", err)
@@ -581,6 +587,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Move the secret columns onto the sensitive lane once credentials_split_v1
 	// has durably latched. Inert until then; see corrosion.SplitCredentials.
 	go d.runCredentialsSplit(ctx)
+
+	// Give host state and isolation their own row once host_membership_split_v1
+	// has durably latched. Inert until then; see corrosion.SplitHostMembership.
+	go d.runHostMembershipSplit(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
@@ -2326,6 +2336,56 @@ func (d *Daemon) runCredentialsSplit(ctx context.Context) {
 			slog.Warn("credentials split: pass failed", "error", err)
 		} else if rep.Copied > 0 {
 			slog.Info("credentials split: copied secrets onto the sensitive lane", "copied", rep.Copied)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// wireHostMembershipGate lets corrosion write host_membership only once
+// host_membership_split_v1 is DURABLY latched.
+//
+// It reads the durable activation marker on disk rather than asking the health
+// checker, because it must be wired before the checker exists: the daemon
+// writes this host's boot state first. The marker is exactly what
+// Checker.DurablyLatched is backed by. No config flag: the split begins on its
+// own once the roll completes. Unwired, the gate fails closed and every state
+// change goes to hosts.state, the previous release's behaviour.
+func (d *Daemon) wireHostMembershipGate() {
+	d.db.SetHostMembershipGate(HostMembershipLatchedOnDisk(d.cfg.DataDir))
+}
+
+// HostMembershipLatchedOnDisk reports whether host_membership_split_v1 has
+// durably latched on the node whose data directory is dataDir.
+func HostMembershipLatchedOnDisk(dataDir string) func() bool {
+	path := filepath.Join(dataDir, activationMarkerPrefix+"."+capabilities.HostMembershipSplitV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+}
+
+// hostMembershipSplitInterval is how often the daemon re-runs the membership
+// split. Shorter than the credentials split's minute: until a node's first
+// pass its readers read hosts, not host_membership. Each pass is one join over
+// the hosts table when there is nothing to do.
+const hostMembershipSplitInterval = 10 * time.Second
+
+// runHostMembershipSplit runs corrosion.SplitHostMembership at start and then
+// every hostMembershipSplitInterval. A no-op until the gate opens, idempotent
+// after.
+func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
+	t := time.NewTicker(hostMembershipSplitInterval)
+	defer t.Stop()
+	for {
+		if rep, err := d.db.SplitHostMembership(ctx); err != nil {
+			slog.Warn("host membership split: pass failed", "error", err)
+		} else if rep.Copied > 0 {
+			slog.Info("host membership split: moved host state onto its own row",
+				"copied", rep.Copied)
 		}
 		select {
 		case <-ctx.Done():

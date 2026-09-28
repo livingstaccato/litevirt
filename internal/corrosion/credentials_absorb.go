@@ -68,12 +68,8 @@ type secretWrite struct {
 // paired credential statement. See the block comment above.
 func absorbUnlatchedSecretWrite(ctx context.Context, tx *sql.Tx, stmts []Statement, mayInsert bool) error {
 	paired := map[string]bool{}
-	for _, s := range stmts {
-		for _, sc := range secretColumns {
-			if statementTable(s.SQL) == sc.credTable {
-				paired[sc.credTable] = true
-			}
-		}
+	for _, sc := range secretColumns {
+		paired[sc.credTable] = entryWritesTable(stmts, sc.credTable)
 	}
 	for _, s := range stmts {
 		w, ok := secretWriteOf(s)

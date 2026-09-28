@@ -446,6 +446,14 @@ var capabilityMap = map[string]tableResolver{
 		}, TieCategoryControlPlane),
 		ruleContentMax(),
 	}},
+	// v57 host membership: the columns moved out of hosts are all in its
+	// unresolved set above — a tie between two different states or isolation
+	// epochs is never coin-flipped into one of them.
+	"host_membership": {category: "host-control-plane", chain: []tieRule{
+		ruleTombstone(),
+		ruleAnyColUnresolved([]string{"state", "isolation_epoch", "isolation_reason"}, TieCategoryControlPlane),
+		ruleContentMax(),
+	}},
 	"host_labels": {category: "content", chain: contentDefaultChain()},
 	"host_health": {category: "content", chain: contentDefaultChain()},
 	// v50 durable health: condition/status rows are written by one evaluator

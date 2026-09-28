@@ -125,6 +125,12 @@ func VotingEligible(state string) bool { return corrosion.VotingEligible(state) 
 // using its OWN probe results. Returns the tri-state plus the live/needed counts
 // for observability. `needed = liveVotingHosts/2 + 1`; `live` counts self (if
 // voting-eligible) plus each voting-eligible peer this daemon has probed healthy.
+//
+// It is CLUSTER-WIDE whatever the failover scope says. Its consumers outside
+// the failover path — VIP self-demotion, the lease-term barrier, dual-run
+// resolution — decide things a region's quorum does not own (see
+// docs/design/region-scoped-failover.md §2.4). The region-scoped counts are
+// RegionQuorumProof, ExecutionGate and DecisionGateForRegion.
 func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, needed int) {
 	voters, err := corrosion.VoterSet(ctx, c.db)
 	if err != nil {
@@ -136,7 +142,25 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		// Unknown = "neither proof nor loss" → no action, no loss-clock.
 		return QuorumUnknown, 0, 0
 	}
+	return c.quorumOver(voters)
+}
 
+// RegionQuorumProof is QuorumProof over one region's voters: the members of
+// the voter set whose hosts.region is region, counted from THIS daemon's own
+// probes. A region with no voters has nothing to prove and reports No. A read
+// error is Unknown, as for QuorumProof.
+func (c *Checker) RegionQuorumProof(ctx context.Context, region string) (state QuorumState, live, needed int) {
+	vr, err := corrosion.VoterRegions(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown, 0, 0
+	}
+	return c.quorumOver(vr.In(region))
+}
+
+// quorumOver counts this daemon's fresh probe results over voters: live is
+// self (when a member) plus each member probed healthy this run, needed is a
+// majority of voters.
+func (c *Checker) quorumOver(voters map[string]bool) (state QuorumState, live, needed int) {
 	// A peer this node last saw healthy BEFORE its own most recent stall is not
 	// proven live: the stall is exactly the window in which it may have died,
 	// and the failures that would have said so were withheld (stall.go). It
@@ -185,14 +209,44 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 	return QuorumNo, live, needed
 }
 
+// executionQuorum is the quorum ExecutionGate requires: cluster-wide, or this
+// host's own region's under region-scoped failover. A policy this build cannot
+// read, or does not know, is No: the gate refuses with no_quorum rather than
+// guessing a scope, and does not read as the startup warmup.
+//
+// Region scope REPLACES the cluster-wide count here rather than adding to it.
+// A host cut off from its own region's majority is exactly the host that
+// majority may fence and recover, so it must stop even if it can still reach
+// a cluster-wide majority through other regions; and a region's own majority
+// is enough, because nothing outside the region may recover its workloads.
+func (c *Checker) executionQuorum(ctx context.Context) QuorumState {
+	scope, err := corrosion.GetFailoverScope(ctx, c.db)
+	if err != nil {
+		return QuorumNo
+	}
+	if !scope.Region() {
+		st, _, _ := c.QuorumProof(ctx)
+		return st
+	}
+	vr, err := corrosion.VoterRegions(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown
+	}
+	st, _, _ := c.quorumOver(vr.In(vr.Region(c.hostName)))
+	return st
+}
+
 // ExecutionGate is the universal runtime gate: quorum held AND this host is an
 // active worker (never a witness). Used at execute sites (startPendingVM,
 // doPromoteLocal, container re-key, ApplyLB, owner-assert).
+//
+// The quorum is cluster-wide, or this host's own region's when failover is
+// region-scoped (executionQuorum).
 func (c *Checker) ExecutionGate(ctx context.Context) GateResult {
 	if c.isSelfFenced() {
 		return gateNo(ReasonSelfFenced)
 	}
-	switch state, _, _ := c.QuorumProof(ctx); state {
+	switch c.executionQuorum(ctx) {
 	case QuorumUnknown:
 		return gateNo(ReasonWarmup)
 	case QuorumNo:
@@ -214,10 +268,36 @@ func (c *Checker) ExecutionGate(ctx context.Context) GateResult {
 // blocked (a 1-1 split can't be safely arbitrated — each side is 1-of-2, neither a
 // majority). Callers must also hold the failover lease.
 func (c *Checker) DecisionGate(ctx context.Context) GateResult {
+	return c.decisionGate(ctx, func() QuorumState {
+		st, _, _ := c.QuorumProof(ctx)
+		return st
+	})
+}
+
+// DecisionGateForRegion is DecisionGate with the quorum of one region's voters
+// in place of the cluster-wide one: the failover coordinator's decide gate for
+// a host in region when failover is region-scoped. The daemon must itself have
+// probed a live majority of THAT region, whichever region it is in, and must
+// be coordinator-eligible exactly as for DecisionGate. It refuses outright when
+// the policy cannot be read or is not region scope: a caller asking for a
+// region's quorum under any other scope has read a different policy from the
+// one this daemon holds, and must not act on the difference.
+func (c *Checker) DecisionGateForRegion(ctx context.Context, region string) GateResult {
+	scope, err := corrosion.GetFailoverScope(ctx, c.db)
+	if err != nil || !scope.Region() {
+		return gateNo(ReasonNoQuorum)
+	}
+	return c.decisionGate(ctx, func() QuorumState {
+		st, _, _ := c.RegionQuorumProof(ctx, region)
+		return st
+	})
+}
+
+func (c *Checker) decisionGate(ctx context.Context, quorum func() QuorumState) GateResult {
 	if c.isSelfFenced() {
 		return gateNo(ReasonSelfFenced)
 	}
-	switch state, _, _ := c.QuorumProof(ctx); state {
+	switch quorum() {
 	case QuorumUnknown:
 		return gateNo(ReasonWarmup)
 	case QuorumNo:

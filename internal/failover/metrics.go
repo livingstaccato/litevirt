@@ -24,6 +24,11 @@ type Metrics interface {
 	// a human, and what they should do depends on WHY the host is down — see
 	// strandedWorkloads.
 	StrandedWorkloads(n int)
+	// RegionsWithoutQuorum reports how many regions hold at least one worker
+	// but have fewer than corrosion.MinRegionVoters voters, so cannot fence
+	// one of their own hosts while failover is region-scoped. A GAUGE, the
+	// lease holder's view like StrandedWorkloads; 0 under the cluster scope.
+	RegionsWithoutQuorum(n int)
 }
 
 // Phases, results, actions, and error classes are a CLOSED vocabulary kept as
@@ -86,6 +91,14 @@ const (
 	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
 	// stopped running within health.StallGrace, so the fence is deferred.
 	ErrLocalStall = "local_stall"
+	// ErrRegionTooSmall: under region-scoped failover, a host the cluster-wide
+	// count would fence was not, because its region has too few voters to
+	// fence one of its own.
+	ErrRegionTooSmall = "region_too_small"
+	// ErrRegionScoped: under region-scoped failover, a host the cluster-wide
+	// count would fence was not, because the observations came from voters
+	// outside its region. A site partition looks like this.
+	ErrRegionScoped = "region_scoped"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.
@@ -111,5 +124,12 @@ func (c *Coordinator) mCt(action, result, errClass string) {
 func (c *Coordinator) mStranded(n int) {
 	if c.Metrics != nil {
 		c.Metrics.StrandedWorkloads(n)
+	}
+}
+
+// mRegionsWithoutQuorum reports the regions-without-quorum gauge (nil-safe).
+func (c *Coordinator) mRegionsWithoutQuorum(n int) {
+	if c.Metrics != nil {
+		c.Metrics.RegionsWithoutQuorum(n)
 	}
 }

@@ -95,6 +95,23 @@ func (s *Server) requireProofGradeFence(ctx context.Context, fenceEpoch, oldOwne
 //     half-built promotion; a running domain that is OUR OWN prior promotion is
 //     still ADOPTED (never destroyed) via the promote marker / started checkpoint.
 func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64) error {
+	return s.autoPromote(ctx, vmName, fenceEpoch, leaseTerm, "")
+}
+
+// errReplicaOutOfRegion refuses an automatic promotion whose replica is held
+// by a host outside the region region-scoped failover keeps the recovery in.
+var errReplicaOutOfRegion = errors.New("replica is held outside the region recovery must stay in")
+
+// AutoPromoteReplicaInRegion is AutoPromoteReplica for region-scoped failover
+// (failover.RegionScopedPromoter): the promotion runs only if the host holding
+// the replica is in region. Otherwise it returns errReplicaOutOfRegion before
+// any proof is persisted or any request relayed, and the coordinator falls
+// back to its region-constrained reschedule.
+func (s *Server) AutoPromoteReplicaInRegion(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64, region string) error {
+	return s.autoPromote(ctx, vmName, fenceEpoch, leaseTerm, region)
+}
+
+func (s *Server) autoPromote(ctx context.Context, vmName, fenceEpoch string, leaseTerm int64, region string) error {
 	vm, err := corrosion.GetVM(ctx, s.db, vmName)
 	if err != nil || vm == nil {
 		return fmt.Errorf("vm %q not found", vmName)
@@ -148,7 +165,7 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 			req.Proof.LeaseKey = corrosion.LeaseKeyFailover
 		}
 	}
-	return s.promoteResolved(ctx, req, vm, true /*automated*/, func(*pb.PromoteReplicaProgress) error { return nil })
+	return s.promoteResolvedIn(ctx, req, vm, true /*automated*/, region, func(*pb.PromoteReplicaProgress) error { return nil })
 }
 
 // promoteResolved is the shared promotion core (no RBAC): resolve the replica's
@@ -156,6 +173,13 @@ func (s *Server) AutoPromoteReplica(ctx context.Context, vmName, fenceEpoch stri
 // the coordinator's AutoPromoteReplica (must carry a proof under enforcement) from an
 // operator PromoteReplica (RBAC-gated manual override, may run proofless).
 func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, automated bool, send func(*pb.PromoteReplicaProgress) error) error {
+	return s.promoteResolvedIn(ctx, req, vm, automated, "", send)
+}
+
+// promoteResolvedIn is promoteResolved with an optional region the replica's
+// host must be in ("" = anywhere). Only region-scoped automatic promotion sets
+// it; an operator promotion never does.
+func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, automated bool, requireRegion string, send func(*pb.PromoteReplicaProgress) error) error {
 	// A replica carries only disk data — not the VM's UEFI NVRAM or swtpm state.
 	// Promoting a Secure-Boot/vTPM VM from one would boot it with a fresh TPM and
 	// silently brick BitLocker, so refuse rather than recover it half-formed.
@@ -198,6 +222,21 @@ func (s *Server) promoteResolved(ctx context.Context, req *pb.PromoteReplicaRequ
 	host, replica, err := s.findReplicaHost(ctx, req, src.DiskName, pool, schedHost)
 	if err != nil {
 		return err
+	}
+	// Region-scoped failover keeps a recovery in the fenced host's region. The
+	// replica's host is known only now, so this is the first point it can be
+	// checked, and it is before any proof is persisted or relayed. An unknown
+	// host is refused: its region cannot be shown to match.
+	if requireRegion != "" {
+		hr, herr := corrosion.GetHost(ctx, s.db, host)
+		if herr != nil || hr == nil || hr.Region != requireRegion {
+			got := "unknown"
+			if hr != nil {
+				got = hr.Region
+			}
+			return fmt.Errorf("%w: vm %q's replica is on %s (region %s), recovery stays in %s",
+				errReplicaOutOfRegion, req.VmName, host, got, requireRegion)
+		}
 	}
 	// Before any proof is persisted or any request relayed: a stale replica is
 	// refused at the point it is chosen, not after the destination has been

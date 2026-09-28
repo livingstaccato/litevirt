@@ -128,7 +128,7 @@ func (s *Server) scheduleRBACTarget(ctx context.Context, scope, vmName, poolName
 // scheduleRBACTarget and requirePermResolved).
 func (s *Server) authorizeSchedule(ctx context.Context, scope, vmName, poolName, projectName string) error {
 	path, known := s.scheduleRBACTarget(ctx, scope, vmName, poolName, projectName)
-	return s.requirePermResolved(ctx, known, path, "backup.schedule", "operator", "vm "+strconv.Quote(vmName))
+	return s.requirePermResolved(ctx, known, path, vmRBACPathFor("", vmName), "backup.schedule", "operator", "vm "+strconv.Quote(vmName))
 }
 
 func (s *Server) ListBackupSchedules(ctx context.Context, _ *pb.ListBackupSchedulesRequest) (*pb.ListBackupSchedulesResponse, error) {

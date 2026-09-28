@@ -112,13 +112,17 @@ func TestFleet_CredentialsSplit_AnIPMIFenceReadsThePasswordMidRoll(t *testing.T)
 	c.WaitConverged(t, convergeTimeout)
 	configureIPMI(t, c, b, victim.Name, "bmc-pass-2")
 	c.WaitConverged(t, convergeTimeout)
-	if got := oldColumn(t, a, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, victim.Name); got != "bmc-pass-1" {
-		t.Fatalf("a's credential row holds %q; this scenario needs it to hold the OLDER password", got)
+	// Before any pass: every node's credential row already holds the rotation.
+	// a (latched) absorbed b's unlatched entry on apply; b updated the row it
+	// held from a when it wrote. Neither waits for a pass.
+	for _, n := range c.Nodes {
+		if got := oldColumn(t, n, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, victim.Name); got != "bmc-pass-2" {
+			t.Fatalf("%s: host_fence_credentials = %q before any pass, want the rotated bmc-pass-2 — "+
+				"an unlatched rotation must be absorbed where it lands, not wait up to a minute", n.Name, got)
+		}
 	}
-	// Before any pass: a's reader already serves the rotation.
 	if h, err := corrosion.GetHost(ctx, a.DB, victim.Name); err != nil || h == nil || h.IPMIPass != "bmc-pass-2" {
-		t.Fatalf("%s serves IPMI password %+v (err %v) before its pass, want the rotated bmc-pass-2 — "+
-			"a latched reader must take the newer old column, not wait up to a minute", a.Name, h, err)
+		t.Fatalf("%s serves IPMI password %+v (err %v) before its pass, want the rotated bmc-pass-2", a.Name, h, err)
 	}
 	// a's periodic pass.
 	if _, err := a.DB.SplitCredentials(ctx); err != nil {
@@ -331,18 +335,19 @@ func TestFleet_CredentialsSplit_AnUnlatchedWriteIsServedWithoutWaitingForAPass(t
 		t.Fatalf("ChangePassword via %s: %v", b.Name, err)
 	}
 	c.WaitConverged(t, convergeTimeout)
-	if got := oldColumn(t, a, `SELECT password_hash FROM user_credentials WHERE username = 'erin'`); got != credBefore {
-		t.Fatalf("%s's credential row changed without a pass; the scenario needs it to hold the "+
-			"PRE-rotation hash", a.Name)
-	}
-
-	// No pass on a. Its reader must still serve the rotation.
-	if _, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "erin", Password: "leaked-pass"}); err == nil {
-		t.Fatalf("%s accepted the rotated-out password; a latched reader served the stale "+
-			"credential row over a newer old column", a.Name)
-	}
-	if login, err := c.SelfClient(a).Login(ctx, &pb.LoginRequest{Username: "erin", Password: "rotated-pass"}); err != nil || login.Token == "" {
-		t.Fatalf("%s refused the rotated password: %+v %v", a.Name, login, err)
+	// No pass has run since the rotation. Both nodes must already serve it:
+	// a absorbed b's unlatched entry on apply, and b refreshed the credential
+	// row it held (replicated from a) when it wrote.
+	for _, n := range c.Nodes {
+		if got := oldColumn(t, n, `SELECT password_hash FROM user_credentials WHERE username = 'erin'`); got == credBefore {
+			t.Errorf("%s: user_credentials still holds the pre-rotation hash", n.Name)
+		}
+		if _, err := c.SelfClient(n).Login(ctx, &pb.LoginRequest{Username: "erin", Password: "leaked-pass"}); err == nil {
+			t.Errorf("%s accepted the rotated-out password", n.Name)
+		}
+		if login, err := c.SelfClient(n).Login(ctx, &pb.LoginRequest{Username: "erin", Password: "rotated-pass"}); err != nil || login.Token == "" {
+			t.Errorf("%s refused the rotated password: %+v %v", n.Name, login, err)
+		}
 	}
 }
 
@@ -442,5 +447,113 @@ func TestFleet_CredentialsSplit_LoginAndTokenAuthAfterTheSplit(t *testing.T) {
 	}
 	if _, err := c.bearerClient(b, tok.Token).ListHosts(ctx, &pb.ListHostsRequest{}); err != nil {
 		t.Fatalf("API token on %s after the split: %v", b.Name, err)
+	}
+}
+
+// TestFleet_CredentialsSplit_AConcurrentUnrelatedHostWriteDoesNotResurrectARotatedPassword
+// is the #267 race on the secret column. A latched node rotates the IPMI
+// password A→B, dual-written at T1. Before that reaches replica R, another
+// node's unrelated hosts write (a version report, T2 > T1) lands on R first,
+// so R's LWW gate then refuses the T1 hosts half: R holds hosts.ipmi_pass=A at
+// T2 and host_fence_credentials=B at T1. The parent row's updated_at no longer
+// dates the secret column, so neither R's reader nor any split pass may
+// prefer A.
+func TestFleet_CredentialsSplit_AConcurrentUnrelatedHostWriteDoesNotResurrectARotatedPassword(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2686})
+	l, v, r := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	target := v.Name
+
+	configureIPMI(t, c, l, target, "bmc-A")
+	c.WaitConverged(t, convergeTimeout)
+	latchAndSplit(t, c.Nodes...)
+	c.WaitConverged(t, convergeTimeout)
+
+	// Hold l's stream away from v and r, so v's write reaches r first.
+	c.SetLinkFault(l, r, LinkFault{Block: true})
+	c.SetLinkFault(l, v, LinkFault{Block: true})
+	configureIPMI(t, c, l, target, "bmc-B")                                                // T1, dual-written on l
+	if err := corrosion.UpdateHostVersion(ctx, v.DB, target, "v-concurrent"); err != nil { // T2 > T1
+		t.Fatal(err)
+	}
+	eventually(t, convergeTimeout, "r applies v's version report", func() bool {
+		return oldColumn(t, r, `SELECT version FROM hosts WHERE name = ?`, target) == "v-concurrent"
+	})
+	c.ClearLinkFaults()
+	eventually(t, convergeTimeout, "r applies l's rotation to the credential row", func() bool {
+		return oldColumn(t, r, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, target) == "bmc-B"
+	})
+	if got := oldColumn(t, r, `SELECT ipmi_pass FROM hosts WHERE name = ?`, target); got != "bmc-A" {
+		t.Fatalf("r's hosts.ipmi_pass = %q; the scenario needs the LWW gate to have refused the T1 hosts half", got)
+	}
+
+	if h, err := corrosion.GetHost(ctx, r.DB, target); err != nil || h == nil || h.IPMIPass != "bmc-B" {
+		t.Errorf("%s fences with %+v (err %v), want the rotated bmc-B: an unrelated write bumped the "+
+			"parent row's updated_at, and the reader took that as the secret's age", r.Name, h, err)
+	}
+	for _, n := range c.Nodes {
+		if _, err := n.DB.SplitCredentials(ctx); err != nil {
+			t.Fatalf("%s split: %v", n.Name, err)
+		}
+	}
+	time.Sleep(2 * time.Second) // let any copy a pass made replicate
+	for _, n := range c.Nodes {
+		if got := oldColumn(t, n, `SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = ?`, target); got != "bmc-B" {
+			t.Errorf("%s: host_fence_credentials = %q after the passes, want bmc-B: a pass copied the "+
+				"rotated-out password over the credential row", n.Name, got)
+		}
+	}
+}
+
+// TestFleet_CredentialsSplit_SensitiveAntiEntropyHealsAMissedAbsorb is gap (b):
+// a latched node that never applied an unlatched neighbour's entry (it missed
+// the WAL push and repaired the parent row some other way) holds the
+// pre-rotation credential row. Every node that did apply the entry absorbed the
+// same row under the entry's own updated_at, so sensitive-lane anti-entropy
+// pulls it and LWW takes it.
+func TestFleet_CredentialsSplit_SensitiveAntiEntropyHealsAMissedAbsorb(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2687})
+	a, x, u := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+
+	if _, err := c.SelfClient(a).CreateUser(ctx, &pb.CreateUserRequest{
+		Username: "hana", Password: "before-pass", Role: "operator",
+	}); err != nil {
+		t.Fatalf("CreateUser: %v", err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	latchAndSplit(t, a, x) // u has not latched
+	c.WaitConverged(t, convergeTimeout)
+	before := oldColumn(t, x, `SELECT password_hash FROM user_credentials WHERE username = 'hana'`)
+	beforeTS := oldColumn(t, x, `SELECT updated_at FROM user_credentials WHERE username = 'hana'`)
+
+	if _, err := c.SelfClient(u).ChangePassword(ctx, &pb.ChangePasswordRequest{
+		Username: "hana", NewPassword: "after-pass",
+	}); err != nil {
+		t.Fatalf("ChangePassword via %s: %v", u.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+
+	// x "missed" the entry: put its credential row back, locally only.
+	x.DB.Mu().Lock()
+	_, err := x.DB.DB().Exec(`UPDATE user_credentials SET password_hash = ?, updated_at = ? WHERE username = 'hana'`, before, beforeTS)
+	x.DB.Mu().Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(x).Login(ctx, &pb.LoginRequest{Username: "hana", Password: "before-pass"}); err != nil {
+		t.Fatalf("%s refuses the pre-rotation password with the stale row in place (%v); the "+
+			"scenario would prove nothing", x.Name, err)
+	}
+
+	aeCtx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	corrosion.NewAntiEntropy(x.DB, x.PKIDir, 0).RunOnce(aeCtx)
+
+	if _, err := c.SelfClient(x).Login(ctx, &pb.LoginRequest{Username: "hana", Password: "before-pass"}); err == nil {
+		t.Errorf("%s still accepts the rotated-out password after sensitive anti-entropy", x.Name)
+	}
+	if login, err := c.SelfClient(x).Login(ctx, &pb.LoginRequest{Username: "hana", Password: "after-pass"}); err != nil || login.Token == "" {
+		t.Errorf("%s refuses the rotated password after sensitive anti-entropy: %+v %v", x.Name, login, err)
 	}
 }

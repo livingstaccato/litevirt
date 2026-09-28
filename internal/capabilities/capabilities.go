@@ -88,8 +88,13 @@ const (
 	// (host_fence_credentials, user_credentials, token_credentials).
 	//
 	// This release DUAL-WRITES: once latched, every writer writes the credential
-	// table and the old column in one batch, readers take the newer of the two
-	// copies, and nothing clears an old column. A rollback below the latch is
+	// table and the old column in one batch, and nothing clears an old column.
+	// Readers take the credential row whenever one exists and the old column
+	// only when none does; they never date a secret by the PARENT row's
+	// updated_at, which unrelated writes bump (the #267 race). A secret written
+	// by a node that has not latched yet is recognised by its entry carrying no
+	// credential statement, and absorbed into the credential row where it is
+	// applied (corrosion/credentials_absorb.go). A rollback below the latch is
 	// still not clean: the rolled-back binary enters WAL quarantine
 	// (preflightCapabilityRollback) and emits no replicated writes until it is
 	// upgraded again or reseeded. What the two copies buy is that its
@@ -108,9 +113,10 @@ const (
 	//     back-pressures a previous-release peer rather than degrading: its apply
 	//     fails closed, the batch rolls back and its watermark stalls. So nothing
 	//     writes to the credential tables until this token has latched.
-	//   - it READS a credential from the credential table as well as the old
-	//     column, taking the newer. A previous-release node reads only the old
-	//     column, which is why this release keeps writing it.
+	//   - it READS a credential from the credential table, falling back to the
+	//     old column only where no credential row exists. A previous-release
+	//     node reads only the old column, which is why this release keeps
+	//     writing it.
 	//
 	// The first fact must hold of every host this node REPLICATES TO, not
 	// merely of every host that votes, so the token is in replicationGated. A

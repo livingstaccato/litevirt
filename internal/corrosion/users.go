@@ -90,12 +90,11 @@ func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, erro
 	}
 	r := rows[0]
 	return &UserRecord{
-		Username: r.String("username"),
-		Role:     r.String("role"),
-		PasswordHash: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
-			r.String("password_hash"), r.String("updated_at")),
-		Realm:     r.String("realm"),
-		CreatedAt: r.String("created_at"),
+		Username:     r.String("username"),
+		Role:         r.String("role"),
+		PasswordHash: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("password_hash")),
+		Realm:        r.String("realm"),
+		CreatedAt:    r.String("created_at"),
 	}, nil
 }
 
@@ -251,8 +250,7 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 	}
 
 	for _, r := range rows {
-		hash := resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
-			r.String("token_hash"), r.String("src_ts"))
+		hash := resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("token_hash"))
 		if hash == "" {
 			continue // bcrypt rejects it anyway; skip the cost
 		}
@@ -366,8 +364,7 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 		return "", nil // no admin ever existed; not this function's problem
 	}
 	victim := rows[0].String("username")
-	hash := resolveCredential(rows[0].String("cred_key") != "", rows[0].String("cred_val"), rows[0].String("cred_ts"),
-		rows[0].String("password_hash"), rows[0].String("updated_at"))
+	hash := resolveCredential(rows[0].String("cred_key") != "", rows[0].String("cred_val"), rows[0].String("password_hash"))
 	// The reactivation shape InsertUser already uses, with role and password
 	// written back unchanged. Deliberately NOT a new `SET deleted_at = NULL`
 	// statement: every replicated shape has to be in the compatibility ledger,

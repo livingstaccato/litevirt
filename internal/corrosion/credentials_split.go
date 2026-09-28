@@ -35,8 +35,8 @@ import (
 //
 // Once latched, every writer writes the secret to BOTH places in the SAME
 // batch under the same updated_at: the credential table and the old column.
-// SplitCredentials copies any old-column value the credential table lacks, or
-// holds an older value of, and never touches the old column. So a host rolled
+// SplitCredentials copies an old-column value only where the credential table
+// has no row for it, and never touches the old column. So a host rolled
 // back to the previous release — which reads only the old column — still finds
 // every current secret there.
 //
@@ -45,19 +45,22 @@ import (
 // rollback from that release lands on this one, which already reads the
 // credential tables. Nothing in this release clears an old column.
 //
-// READ RULE. Readers read both copies and take the NEWER, by the rows' own
-// updated_at — the credential row's, and the parent row's for the old column
-// — so the answer is the one LWW converges on. Ties go to the credential row
-// (a dual-write stamps both with one updated_at, so a tie is the same value).
-// An EMPTY old column never wins: nothing in this release writes one over a
-// live secret, and a host that ran the pre-release clearing build holds
-// emptied old columns stamped after the credential rows.
+// READ RULE. A reader takes the live credential row whenever one exists, and
+// the old column only when none does. It never compares the credential row's
+// updated_at with the PARENT row's: the parent's is bumped by every unrelated
+// write to the row, and when one of those reaches a replica ahead of a latched
+// rotation the LWW gate refuses the rotation's parent half there, leaving the
+// OLD secret on a NEWER parent row (the colonelpanik/litevirt#267 race). A rule
+// that preferred the newer parent would serve, and the split pass would copy,
+// the rotated-out secret. The split pass likewise copies only where no
+// credential row exists.
 //
-// This is permanent in this release; there is no switch to reading the
-// credential table only. It is what closes the stale window: latches form per
-// node, so between one node latching and the next the unlatched node's writers
-// write the old column only, and a latched reader serves such a write the
-// moment it replicates rather than at its next pass.
+// That leaves the one legitimate old-column-only write: a new-build neighbour
+// that has not latched yet. It is recognised structurally on the WAL apply path
+// — its entry sets the secret with no credential-table statement, which a
+// latched writer never emits — and absorbed into the credential row there,
+// stamped with the entry's own updated_at (credentials_absorb.go). A latched
+// reader therefore serves such a rotation as soon as it replicates.
 
 // SetCredentialsSplitGate injects the predicate that permits WRITING the
 // credential tables. Wired at daemon start to
@@ -77,17 +80,14 @@ func (c *Client) MayWriteCredentialTables() bool {
 	return c.credentialsSplit != nil && c.credentialsSplit()
 }
 
-// resolveCredential picks the secret a reader returns. present/credVal/credTS
-// describe the live credential row; oldVal/oldTS the parent's old column and
-// the parent's updated_at. See READ RULE above.
-func resolveCredential(present bool, credVal, credTS, oldVal, oldTS string) string {
-	if !present {
-		return oldVal
+// resolveCredential picks the secret a reader returns: the live credential
+// row's value when there is one, the parent's old column otherwise. See READ
+// RULE above.
+func resolveCredential(present bool, credVal, oldVal string) string {
+	if present {
+		return credVal
 	}
-	if oldVal != "" && oldVal != credVal && oldTS != "" && lwwOrder(credTS, oldTS) < 0 {
-		return oldVal
-	}
-	return credVal
+	return oldVal
 }
 
 // The credential writers. Each is an explicit upsert on the table's primary
@@ -166,13 +166,12 @@ func scanCredentialSplitRows(ctx context.Context, c *Client, query string) ([]cr
 }
 
 // needsCopy reports whether the old column holds a value the credential table
-// must take: there is no live credential row, or it holds a different value
-// that is older than the parent row.
+// must take: only when there is no live credential row. A credential row that
+// exists is never overwritten from the old column — the parent's updated_at
+// does not date the secret (READ RULE); an unlatched write that belongs in the
+// row is absorbed at apply time instead (credentials_absorb.go).
 func (r credentialSplitRow) needsCopy() bool {
-	if !r.present {
-		return true
-	}
-	return r.credVal != r.oldVal && lwwOrder(r.credTS, r.srcTS) < 0
+	return !r.present
 }
 
 // copyTS is the updated_at a copied credential row carries: the PARENT row's.
@@ -192,8 +191,7 @@ func (c *Client) copyTS(r credentialSplitRow) string {
 
 // SplitCredentials copies secrets from the old columns into the credential
 // tables. It does nothing unless the credentials_split_v1 gate is open, and it
-// is idempotent: it writes only where the credential row is missing or holds a
-// different, older value. It never writes the old column — that stays the copy
+// is idempotent: it writes only where no live credential row exists. It never writes the old column — that stays the copy
 // a previous-release host reads. The daemon runs it at start and periodically.
 // Its writes replicate on the WAL lane and are repaired by anti-entropy on the
 // sensitive lane.

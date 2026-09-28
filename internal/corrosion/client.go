@@ -1120,6 +1120,13 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	// row from an untrusted proof and compares inside one transaction, because
 	// the seeding INSERT OR IGNORE reached every peer even when it changed
 	// nothing locally.
+	// A secret this node writes without its credential statement (its gate is
+	// closed) also refreshes the credential row it holds (credentials_absorb.go).
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
 	if c.clock != nil && len(relay) > 0 {
 		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
@@ -1218,6 +1225,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	//
 	// `relay`, not `stmts`: a create-only statement that changed nothing here
 	// must not be replayed by a peer. See relayStatement.
+	// A secret this node writes without its credential statement (its gate is
+	// closed) also refreshes the credential row it holds (credentials_absorb.go).
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
 	if c.clock != nil && len(relay) > 0 {
 		hlcTS := c.clock.Now()
 		stmtsJSON, err := json.Marshal(relay)

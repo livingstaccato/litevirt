@@ -158,8 +158,8 @@ There are exceptions, of two different kinds, and neither is "the one":
   one place, `capabilities.mandatory` (read it; prose copies of it have gone
   stale twice). They are reserved for a token stating a *fact about the binary*
   rather than a policy — at the time of writing `split_brain_gate_v1`,
-  `lease_term_ledger_v1` and `credentials_split_v1`, but trust the declaration,
-  not this list. A mandatory token has no flag to turn off in an incident — see
+  `lease_term_ledger_v1`, `credentials_split_v1` and `host_membership_split_v1`,
+  but trust the declaration, not this list. A mandatory token has no flag to turn off in an incident — see
   the per-token stand-down notes beside that declaration.
   `credentials_split_v1` has none at all. Once latched, hosts dual-write the
   credential tables and the old secret columns and never clear the old ones.
@@ -170,12 +170,25 @@ There are exceptions, of two different kinds, and neither is "the one":
   a cleared column lost all three, and that upgrading again loses nothing.
   Clearing the old columns is a later release's step behind a second token
   (docs/design/credentials-clear.md). Do not add a clear to this one.
+  `host_membership_split_v1` follows the same shape for `hosts.state` and the
+  isolation pair: both copies written, nothing cleared, readers take the
+  `host_membership` row when it exists
+  (docs/design/host-membership-retire-old-columns.md).
+  **Neither split may compare a copy against its parent row's `updated_at`.**
+  Unrelated writes bump it (a version report bumps `hosts`), so a replica that
+  refused one half of a dual write holds a stale value on a newer row, and a
+  newer-row-wins rule brings a rotated-out password, or `active` over
+  `fenced`, back cluster-wide. A write from a node that has not latched is
+  recognised by its ENTRY instead — the old column is set with no new-table
+  statement beside it (`internal/corrosion/unlatched_origin.go`) — and
+  absorbed locally on apply and on the local write path.
 - **Conditionally advertised** — `hardware_v2` has no flag of its own either,
   but it is gated differently: each node's startup hardware audit plus a latched
   `operation_protocol_v1` decide whether it is advertised at all.
 
 Some mandatory tokens are additionally `capabilities.ReplicationGated`
-(`lease_term_ledger_v1`, `credentials_split_v1`; the set is
+(`lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`;
+the set is
 `capabilities.replicationGated`): the latch is a claim about what every host
 still receiving replication can *decode* or *read*, so it is confirmed against
 admitted memberlist membership — not merely against voting-eligible members. A

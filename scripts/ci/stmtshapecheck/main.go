@@ -108,6 +108,8 @@ func main() {
 	gaps = append(gaps, unreachableEmitters(pkgs, findings)...)
 	// A table's FIRST replicated shape needs a human gating decision — see newtables.go.
 	gaps = append(gaps, newTableShapeGaps(firstShapeTables(findings), replicatedTableBaseline, firstShapeAcks)...)
+	// ExecuteLocal is never relayed, so it may write node-local tables only — see localwrites.go.
+	gaps = append(gaps, localWriteGaps(pkgs)...)
 	if len(gaps) == 0 {
 		fmt.Printf("stmtshapecheck: %d replicated builder statement(s) all registered; OK\n", len(findings))
 		return

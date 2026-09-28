@@ -68,6 +68,45 @@ var customMergeTables = map[string]customMergeFn{
 	// claimants to the lease layer, which lets exactly one of them keep acting
 	// (leader_lease_contest.go).
 	"leader_lease_terms": (*Client).immutableMergeKeepLocalRow,
+	// v59 voter_configs: one immutable row per generation. Keep-local on both
+	// paths, like leader_lease_terms, but the certificate column is EVIDENCE
+	// rather than a fact of the row: two proposers that each completed the one
+	// decided value hold different, equally valid certificates for it. See
+	// voterConfigMergeKeepLocalRow.
+	"voter_configs": (*Client).voterConfigMergeKeepLocalRow,
+}
+
+// voterConfigMergeKeepLocalRow merges a voter_configs row.
+//
+// The decided value — every column but the certificate — is immutable: the
+// local row is kept. Two rows for one generation that differ in it cannot both
+// carry valid certificates (docs/design/recovery-claims.md §3.16), so the pair
+// is flagged on the ha.lww.unresolved path as ledger evidence and never
+// coin-flipped. Replication never decides which generation a node counts
+// anyway: a node adopts one only once its OWN copy's certificate verifies.
+//
+// The certificate is evidence, not a fact of the row. A proposer that learned
+// the decided value in phase 1 re-certifies it at its own ballot, so two nodes
+// can hold different, equally valid certificates for one decision. They
+// converge deterministically — the greater encoding wins — so the table's
+// digest settles instead of mismatching on every anti-entropy pass. The WAL
+// path applies the insert as INSERT OR IGNORE (DispCustomMerge), and this merge
+// then settles the certificate on the next anti-entropy pass.
+func (c *Client) voterConfigMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (bool, error) {
+	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if err != nil || !found {
+		return false, err
+	}
+	delIdx := indexOf(table.Columns, "deleted_at")
+	certIdx := indexOf(table.Columns, "certificate")
+	if rowFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx, certIdx) {
+		if certIdx < 0 {
+			return true, nil
+		}
+		return fmt.Sprint(localRow[certIdx]) >= fmt.Sprint(row[certIdx]), nil
+	}
+	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
+	return true, nil
 }
 
 // proofRank orders the runtime_action_proofs lifecycle so a terminal state can
@@ -320,6 +359,12 @@ var tableNames = []string{
 	// repaired here like any cluster fact. Nothing secret. Written only once
 	// failover_scope_v1 has latched (cluster_policy.go).
 	"cluster_policies",
+	// v59 voter set — one immutable row per decided generation. A node that
+	// missed one cannot adopt any later generation, so it must be repaired here
+	// like any other cluster fact. Nothing secret: host names, incarnations and
+	// signed accepts whose certificates are public. Written only once
+	// voter_config_v1 has latched (voter_config.go).
+	"voter_configs",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

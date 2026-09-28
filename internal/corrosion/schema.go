@@ -434,7 +434,21 @@ import (
 //	     docs/design/region-scoped-failover.md). A previous-release node cannot
 //	     decode the table's statements, so nothing writes it until
 //	     failover_scope_v1 latches (ReplicationGated). One new table.
-const CurrentSchemaVersion = 58
+//	v59: an explicit voter set and the voter side of single-decree recovery
+//	     claims (colonelpanik/litevirt#251 step 2; docs/design/recovery-claims.md
+//	     §3–§4). voter_configs (generation PK) is replicated and IMMUTABLE per
+//	     generation, merged by keep-local like leader_lease_terms; a node
+//	     adopts a generation only once its claim certificate verifies against
+//	     the generation before it. Nothing writes it until voter_config_v1 has
+//	     durably latched (ReplicationGated), so a previous-release peer never
+//	     sees a statement it cannot decode. Three NODE-LOCAL tables, never in
+//	     tableNames and written only through ExecuteLocal:
+//	     local_recovery_claims (this voter's promises and accepts, kept
+//	     forever), local_voter_incarnation (the identity of this state.db's
+//	     claim state, minted once when the table is first created) and
+//	     local_voter_adoption (which generations this node has adopted and
+//	     which sealed majority it imported claim state from). Four new tables.
+const CurrentSchemaVersion = 59
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -577,6 +591,13 @@ func InitSchema(ctx context.Context, c *Client) error {
 		if err := c.execLocal(ctx, ddl); err != nil {
 			return fmt.Errorf("schema init: %w", err)
 		}
+	}
+
+	// The voter incarnation is minted once, when its row is first absent
+	// (voter_local.go). Here, straight after the DDL, so no claim handler can
+	// ever run on a database without one.
+	if err := c.mintVoterIncarnation(ctx); err != nil {
+		return fmt.Errorf("schema init: %w", err)
 	}
 
 	// The ledger meta-table itself.
@@ -2576,6 +2597,64 @@ var schemaDDL = []string{
 		updated_at TEXT NOT NULL,
 		deleted_at TEXT
 	)`,
+	// v59 voter set — one IMMUTABLE row per generation (voter_config.go). The
+	// row is the decided value of the claim at key ("voter_config", "",
+	// generation-1, 0) plus the certificate that decided it, so every column
+	// but certificate is identical on every node that writes the same
+	// decision. Merged keep-local (customMergeTables). Written only once
+	// voter_config_v1 has durably latched.
+	`CREATE TABLE IF NOT EXISTS voter_configs (
+		generation   INTEGER PRIMARY KEY,
+		members_json TEXT NOT NULL,
+		members_hash TEXT NOT NULL,
+		change       TEXT NOT NULL,
+		certificate  TEXT NOT NULL,
+		created_by   TEXT NOT NULL,
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT
+	)`,
+	// NODE-LOCAL. Never in tableNames, never relayed, never anti-entropy
+	// repaired: a grant is a statement about what THIS voter promised, and a
+	// promise a peer could write is not a promise (§3.8). Written only through
+	// ExecuteLocal, one transaction per voter step, committed before the reply
+	// is built. Rows are never deleted or downgraded.
+	`CREATE TABLE IF NOT EXISTS local_recovery_claims (
+		target_kind       TEXT    NOT NULL,
+		target_name       TEXT    NOT NULL,
+		owner_epoch       INTEGER NOT NULL,
+		attempt           INTEGER NOT NULL,
+		promised_round    INTEGER NOT NULL DEFAULT 0,
+		promised_coord    TEXT    NOT NULL DEFAULT '',
+		promised_nonce    BLOB    NOT NULL DEFAULT x'',
+		accepted_round    INTEGER NOT NULL DEFAULT 0,
+		accepted_coord    TEXT    NOT NULL DEFAULT '',
+		accepted_nonce    BLOB    NOT NULL DEFAULT x'',
+		value_json        TEXT    NOT NULL DEFAULT '',
+		value_digest      TEXT    NOT NULL DEFAULT '',
+		accept_json       TEXT    NOT NULL DEFAULT '',
+		config_generation INTEGER NOT NULL,
+		updated_at        TEXT    NOT NULL,
+		PRIMARY KEY (target_kind, target_name, owner_epoch, attempt)
+	)`,
+	// NODE-LOCAL. The identity of this state.db's claim state (§3.11). Minted
+	// once, by InitSchema, when the row is absent — so it disappears in exactly
+	// the cases the claim state does (a re-imaged host, a restored or reseeded
+	// state.db), and a voter whose incarnation no longer matches its member
+	// entry abstains.
+	`CREATE TABLE IF NOT EXISTS local_voter_incarnation (
+		id          INTEGER PRIMARY KEY CHECK (id = 1),
+		incarnation TEXT NOT NULL,
+		created_at  TEXT NOT NULL
+	)`,
+	// NODE-LOCAL. Which voter_configs generations this node has adopted, and
+	// the sealed majority it imported claim state from before it voted under
+	// the generation (§4.4). The highest row is this node's current generation.
+	`CREATE TABLE IF NOT EXISTS local_voter_adoption (
+		generation    INTEGER PRIMARY KEY,
+		imported_from TEXT NOT NULL DEFAULT '',
+		adopted_at    TEXT NOT NULL
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2764,6 +2843,7 @@ var tablePrimaryKeys = map[string][]string{
 	"token_credentials":       {"token_id"},
 	"host_membership":         {"host_name"},
 	"cluster_policies":        {"key"},
+	"voter_configs":           {"generation"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3127,6 +3207,8 @@ var createTableUnits = []struct {
 	{56, "host_fence_credentials"}, {56, "user_credentials"}, {56, "token_credentials"},
 	{57, "host_membership"},
 	{58, "cluster_policies"},
+	{59, "voter_configs"}, {59, "local_recovery_claims"}, {59, "local_voter_incarnation"},
+	{59, "local_voter_adoption"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

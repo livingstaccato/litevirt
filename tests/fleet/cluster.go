@@ -761,6 +761,9 @@ func peerCertCN(ctx context.Context) string {
 // blocked reports whether a peer RPC from the given caller is currently
 // partitioned away from this node.
 func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
+	if n.claimBlocked(fullMethod, peerCertCN(ctx)) {
+		return true
+	}
 	if !partitionedMethods[methodName(fullMethod)] {
 		return false
 	}

@@ -71,6 +71,10 @@ type LinkFault struct {
 	Drop      float64
 	Duplicate float64
 	Reorder   float64
+	// BlockClaims refuses the recovery-claim RPCs on the link (claimMethods),
+	// independently of replication: a claim RPC is ordinary gRPC, and a
+	// scenario needs to reach a voter by one and not the other.
+	BlockClaims bool
 }
 
 // LinkStats counts what the injector did on one directed link.
@@ -172,6 +176,29 @@ func (c *Cluster) LinkStats(from, to *Node) LinkStats {
 	to.faults.mu.Lock()
 	defer to.faults.mu.Unlock()
 	return to.link(from.Name).stats
+}
+
+// claimMethods are the recovery-claim RPCs LinkFault.BlockClaims refuses.
+var claimMethods = map[string]bool{
+	"PrepareRecoveryClaim": true,
+	"AcceptRecoveryClaim":  true,
+	"GetRecoveryClaim":     true,
+	"ListRecoveryClaims":   true,
+}
+
+// claimBlocked reports whether BlockClaims refuses caller's claim RPC into n.
+func (n *Node) claimBlocked(fullMethod string, caller string) bool {
+	if !claimMethods[methodName(fullMethod)] || caller == "" {
+		return false
+	}
+	n.faults.mu.Lock()
+	defer n.faults.mu.Unlock()
+	ls := n.faults.links[caller]
+	if ls == nil || !ls.fault.BlockClaims {
+		return false
+	}
+	ls.stats.Blocked++
+	return true
 }
 
 // linkBlocked reports whether the Block fault refuses caller's replication RPCs
@@ -450,6 +477,10 @@ func (c *Cluster) NewCoordinators(clock *VirtualClock) *Coordinators {
 			cs.mu.Unlock()
 			return fence.Result{Method: "fleet-test", Success: true}
 		})
+		// Automatic voter genesis runs on the lease holder's tick, as the
+		// daemon wires it. Inert until a scenario opens the voter_configs
+		// gate (OpenVoterConfigGate).
+		coord.VoterGenesis = n.Server.VoterGenesisTick
 		cs.ByNode[n.Name] = coord
 	}
 	return cs

@@ -1365,7 +1365,15 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 			// the batch applies on top of it. See parked_updates.go.
 			r.replayParked(ctx, tx, s)
 		}
-
+		// A secret written by a node that had not latched credentials_split_v1
+		// reaches this node in its old column only; absorb it into the
+		// credential row readers use (credentials_absorb.go).
+		if err := absorbUnlatchedSecretWrite(ctx, tx, stmts, r.client.MayWriteCredentialTables()); err != nil {
+			_ = tx.Rollback()
+			slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
+				"origin", entry.Origin, "seq", entry.Seq, "error", err)
+			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
 	}
 
 	// Record all unseen entries in mutation_seen for future dedup. On failure,

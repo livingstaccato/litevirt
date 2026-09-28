@@ -98,9 +98,9 @@ func TestCredentialsSplit_UnlatchedEmitsNothingAPreviousReleaseCannotDecode(t *t
 }
 
 // TestCredentialsSplit_LatchedCopiesAndDualWrites: once the gate opens the
-// pass copies every old-column secret into its credential table and clears the
-// column, idempotently, and every writer from then on writes the credential
-// row and leaves the old column empty.
+// pass copies every old-column secret into its credential table, idempotently,
+// and leaves the old column alone; every writer from then on writes BOTH the
+// credential row and the old column.
 func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
@@ -112,8 +112,8 @@ func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rep.Copied != 3 || rep.Cleared != 3 {
-		t.Fatalf("pass = %+v, want 3 copied and 3 cleared (one per table)", rep)
+	if rep.Copied != 3 {
+		t.Fatalf("pass = %+v, want 3 copied (one per table)", rep)
 	}
 	for _, q := range []struct{ query, col, want string }{
 		{`SELECT ipmi_pass FROM host_fence_credentials WHERE host_name = 'bmc-host'`, "ipmi_pass", "bmc-secret"},
@@ -129,11 +129,11 @@ func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	if cp := oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'alice'`, "updated_at"); cp != srcTS {
 		t.Errorf("copied credential stamped %q, parent row %q; per-node stamps race instead of converging", cp, srcTS)
 	}
-	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 0 || rep.Cleared != 0 {
+	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 0 {
 		t.Fatalf("a second pass copied again: %+v err=%v — the pass must be idempotent", rep, err)
 	}
 
-	// After the latch: a password change lands in the credential row only.
+	// After the latch: a password change lands in both copies.
 	if err := UpdateUserPassword(ctx, c, "alice", "$2a$10$alicehash2"); err != nil {
 		t.Fatal(err)
 	}
@@ -146,9 +146,10 @@ func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	if got := oneString(t, c, `SELECT password_hash FROM user_credentials WHERE username = 'bob'`, "password_hash"); got != "$2a$10$bobhash" {
 		t.Errorf("user_credentials for a user created after the latch = %q", got)
 	}
-	for _, u := range []string{"alice", "bob"} {
-		if got := oneString(t, c, `SELECT password_hash FROM users WHERE username = ?`, "password_hash", u); got != "" {
-			t.Errorf("users.password_hash for %s = %q after the latch; the public row must not carry it", u, got)
+	for u, want := range map[string]string{"alice": "$2a$10$alicehash2", "bob": "$2a$10$bobhash"} {
+		if got := oneString(t, c, `SELECT password_hash FROM users WHERE username = ?`, "password_hash", u); got != want {
+			t.Errorf("users.password_hash for %s = %q after the latch, want %q; a host rolled back one "+
+				"release reads only this column", u, got, want)
 		}
 	}
 	if err := InsertToken(ctx, c, TokenRecord{ID: "tok-2", Username: "bob", Name: "x", TokenHash: "$2a$10$tok2"}); err != nil {
@@ -157,8 +158,9 @@ func TestCredentialsSplit_LatchedCopiesAndDualWrites(t *testing.T) {
 	if got := oneString(t, c, `SELECT token_hash FROM token_credentials WHERE token_id = 'tok-2'`, "token_hash"); got != "$2a$10$tok2" {
 		t.Errorf("token_credentials for a token created after the latch = %q", got)
 	}
-	if got := oneString(t, c, `SELECT token_hash FROM tokens WHERE id = 'tok-2'`, "token_hash"); got != "" {
-		t.Errorf("tokens.token_hash for a token created after the latch = %q", got)
+	if got := oneString(t, c, `SELECT token_hash FROM tokens WHERE id = 'tok-2'`, "token_hash"); got != "$2a$10$tok2" {
+		t.Errorf("tokens.token_hash for a token created after the latch = %q; a host rolled back one "+
+			"release reads only this column", got)
 	}
 
 	// The sensitive lane carries every one of them.
@@ -231,128 +233,230 @@ func TestCredentialsSplit_TheCredentialTableIsReadFirst(t *testing.T) {
 	}
 }
 
-// TestResolveCredential pins the read rule on its own.
+// TestResolveCredential pins the read rule on its own: the credential row
+// whenever one exists, the old column only when none does. No timestamp is
+// consulted.
 func TestResolveCredential(t *testing.T) {
-	const older, newer = "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z"
 	for _, tc := range []struct {
-		name                         string
-		present                      bool
-		credVal, credTS, oldV, oldTS string
-		fallback                     bool
-		want                         string
+		name          string
+		present       bool
+		credVal, oldV string
+		want          string
 	}{
-		{"no credential row: the old column", false, "", "", "old", newer, true, "old"},
-		{"credential row, old column empty", true, "new", older, "", newer, true, "new"},
-		{"credential row, old column older", true, "new", newer, "old", older, true, "new"},
-		{"credential row, same value", true, "same", older, "same", newer, true, "same"},
-		// An unlatched-but-upgraded node wrote the old column after the row.
-		{"old column newer and different", true, "new", older, "fresher", newer, true, "fresher"},
-		{"no fallback: never the old column", true, "new", older, "fresher", newer, false, "new"},
-		{"no fallback, no row: nothing", false, "", "", "old", newer, false, ""},
+		{"no credential row: the old column", false, "", "old", "old"},
+		{"credential row: the credential row", true, "new", "other", "new"},
+		{"credential row, old column emptied", true, "new", "", "new"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := resolveCredential(tc.present, tc.credVal, tc.credTS, tc.oldV, tc.oldTS, tc.fallback); got != tc.want {
+			if got := resolveCredential(tc.present, tc.credVal, tc.oldV); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})
 	}
 }
 
-// TestCredentialsSplit_ThePublicDumpCarriesNoSecretAfterTheClear is the point
-// of #268: after the split, the operator-safe dump holds no secret value, and
-// the sensitive dump holds every one.
-func TestCredentialsSplit_ThePublicDumpCarriesNoSecretAfterTheClear(t *testing.T) {
+// TestCredentialsSplit_ThePassNeverClearsAnOldColumn: this release copies and
+// never clears. After a pass every secret — a deleted user's hash and a revoked
+// token's hash included — is still in its old column, where a host rolled back
+// one release reads it, and the sensitive dump carries it too. Clearing is a
+// later release's step (docs/design/credentials-clear.md).
+func TestCredentialsSplit_ThePassNeverClearsAnOldColumn(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
 	secrets := []string{"$2a$10$dump-user-hash", "$2a$10$dump-token-hash", "dump-bmc-secret"}
 	seedSecrets(t, c, secrets[0], secrets[1], secrets[2])
-	// Deleted and revoked rows hold secrets too.
 	if err := RevokeToken(ctx, c, "tok-1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := DeleteUser(ctx, c, "alice"); err != nil {
 		t.Fatal(err)
 	}
-
-	// Before the latch the dump is unchanged — it is where a previous-release
-	// node reads them.
-	if plain := string(publicDumpJSON(t, c)); !strings.Contains(plain, secrets[2]) {
-		t.Fatal("the public dump lost hosts.ipmi_pass before the latch; a previous-release " +
-			"peer repairing from it would lose the BMC password")
-	}
-
 	c.SetCredentialsSplitGate(func() bool { return true })
-	if _, err := c.SplitCredentials(ctx); err != nil {
-		t.Fatal(err)
+	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 3 {
+		t.Fatalf("pass = %+v err=%v, want 3 copied", rep, err)
 	}
-	public := publicDumpJSON(t, c)
+	for _, q := range []struct{ query, col, want string }{
+		{`SELECT password_hash FROM users WHERE username = 'alice'`, "password_hash", secrets[0]},
+		{`SELECT token_hash FROM tokens WHERE id = 'tok-1'`, "token_hash", secrets[1]},
+		{`SELECT ipmi_pass FROM hosts WHERE name = 'bmc-host'`, "ipmi_pass", secrets[2]},
+	} {
+		if got := oneString(t, c, q.query, q.col); got != q.want {
+			t.Errorf("%s = %q after the pass, want %q; the old column must survive this release", q.query, got, q.want)
+		}
+	}
 	sensitive, err := decompressPayload(c.DumpSensitiveStateBytes())
 	if err != nil {
 		t.Fatal(err)
 	}
 	sensJSON, _ := json.Marshal(sensitive)
 	for _, secret := range secrets {
-		if strings.Contains(string(public), secret) {
-			t.Errorf("the public dump still carries %q after the split", secret)
-		}
 		if !strings.Contains(string(sensJSON), secret) {
-			t.Errorf("the sensitive dump does not carry %q; it would be lost to any node that "+
-				"repairs from a peer", secret)
+			t.Errorf("the sensitive dump does not carry %q", secret)
 		}
 	}
 }
 
-// TestCredentialsSplit_AnInFlightRevokeBeatsTheClear: the clear is stamped
-// just past the row it read, not with a fresh clock, so a revoke issued on a
-// peer BEFORE the clear ran — still in flight when it did — wins LWW when it
-// lands. A clear stamped with NowTS would be newer than that revoke, the
-// replicated revoke would be skipped, and anti-entropy would spread the
-// un-revoked row.
-func TestCredentialsSplit_AnInFlightRevokeBeatsTheClear(t *testing.T) {
+// TestCredentialsSplit_ThePassNeverRestampsAParentRow: the pass writes only
+// credential rows, and stamps each with its parent's updated_at. It never
+// writes a parent row, so it cannot out-timestamp a revoke or delete a peer
+// issued just before it ran and that has not arrived yet.
+func TestCredentialsSplit_ThePassNeverRestampsAParentRow(t *testing.T) {
 	ctx := context.Background()
 	c := newTestDB(t)
 	seedSecrets(t, c, "$2a$10$h", "$2a$10$t", "p")
-	revokeTS := c.NowTS() // a peer's revoke, minted now, not yet delivered
+	queries := []string{
+		`SELECT updated_at FROM tokens WHERE id = 'tok-1'`,
+		`SELECT updated_at FROM users WHERE username = 'alice'`,
+		`SELECT updated_at FROM hosts WHERE name = 'bmc-host'`,
+	}
+	before := map[string]string{}
+	for _, q := range queries {
+		before[q] = oneString(t, c, q, "updated_at")
+	}
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range queries {
+		if got := oneString(t, c, q, "updated_at"); got != before[q] {
+			t.Errorf("%s: the pass restamped the parent row %q -> %q", q, before[q], got)
+		}
+	}
+	if log := mutationLogText(t, c); strings.Contains(log, "UPDATE users") || strings.Contains(log, "UPDATE tokens") {
+		t.Errorf("the pass put a parent-row UPDATE on the replication stream:\n%s", log)
+	}
+}
 
+// applyRemote applies stmts on c as one entry from a peer, the way a pushed
+// mutation lands.
+func applyRemote(t *testing.T, c *Client, hlcTS string, stmts ...Statement) {
+	t.Helper()
+	r := NewReplicator(c, "", RelayConfig{})
+	if _, err := r.ApplyRemoteMutationsFrom(context.Background(), replayEntry(t, "peer-node", hlcTS, stmts...), false); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+}
+
+// TestCredentialsSplit_AnUnlatchedEntryIsAbsorbedOnApply: a password change
+// from a neighbour that has not latched arrives as a parent write with no
+// credential statement. A latched receiver absorbs it into the credential row
+// on apply, stamped with the entry's own updated_at, so its reader serves it
+// at once — no pass needed.
+func TestCredentialsSplit_AnUnlatchedEntryIsAbsorbedOnApply(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertUser(ctx, c, "alice", "operator", "$2a$10$before"); err != nil {
+		t.Fatal(err)
+	}
+	const ts = "2999-01-01T00:00:00.000001Z"
+	applyRemote(t, c, "2999000000000-0000-peer",
+		Statement{SQL: usersUpdatePasswordSQL, Params: []interface{}{"$2a$10$rotated", ts, "alice"}})
+	if u, _ := GetUser(ctx, c, "alice"); u == nil || u.PasswordHash != "$2a$10$rotated" {
+		t.Errorf("GetUser = %+v; an unlatched rotation was not absorbed on apply", u)
+	}
+	if got := oneString(t, c, `SELECT updated_at FROM user_credentials WHERE username = 'alice'`, "updated_at"); got != ts {
+		t.Errorf("absorbed row stamped %q, want the entry's own %q", got, ts)
+	}
+
+	// An older unlatched entry does not beat the credential row.
+	applyRemote(t, c, "2000000000000-0000-peer",
+		Statement{SQL: usersUpdatePasswordSQL, Params: []interface{}{"$2a$10$ancient", "2000-01-01T00:00:00Z", "alice"}})
+	if u, _ := GetUser(ctx, c, "alice"); u == nil || u.PasswordHash != "$2a$10$rotated" {
+		t.Errorf("GetUser = %+v; an OLDER unlatched write replaced a newer credential row", u)
+	}
+	// An empty value — the first build's clear — is never absorbed.
+	applyRemote(t, c, "2999000000001-0000-peer",
+		Statement{SQL: `UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`,
+			Params: []interface{}{"", "2999-06-01T00:00:00Z", "alice"}})
+	if u, _ := GetUser(ctx, c, "alice"); u == nil || u.PasswordHash != "$2a$10$rotated" {
+		t.Errorf("GetUser = %+v; a clear was absorbed as a password", u)
+	}
+}
+
+// TestCredentialsSplit_AnUnlatchedIPMIRotationIsAbsorbedOnApply covers the
+// ConfigureHost shape, whose secret binds through COALESCE(?, ipmi_pass).
+func TestCredentialsSplit_AnUnlatchedIPMIRotationIsAbsorbedOnApply(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertHost(ctx, c, HostRecord{Name: "bmc-host", Address: "10.0.0.20", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Execute(ctx, HostFenceCredentialUpsertSQL, "bmc-host", "bmc-before", c.NowTS()); err != nil {
+		t.Fatal(err)
+	}
+	const configureHost = `UPDATE hosts SET fence_strategy = COALESCE(?, fence_strategy), ipmi_address = COALESCE(?, ipmi_address), ipmi_user = COALESCE(?, ipmi_user), ipmi_pass = COALESCE(?, ipmi_pass), watchdog_dev = COALESCE(?, watchdog_dev), role = COALESCE(?, role), region = COALESCE(?, region), cpu_overcommit = COALESCE(?, cpu_overcommit), mem_overcommit = COALESCE(?, mem_overcommit), cpu_reserve = COALESCE(?, cpu_reserve), mem_reserve_mib = COALESCE(?, mem_reserve_mib), updated_at = ? WHERE name = ?`
+	applyRemote(t, c, "2999000000000-0000-peer", Statement{SQL: configureHost, Params: []interface{}{
+		"ipmi", nil, nil, "bmc-rotated", nil, nil, nil, nil, nil, nil, nil, "2999-01-01T00:00:00Z", "bmc-host"}})
+	if h, _ := GetHost(ctx, c, "bmc-host"); h == nil || h.IPMIPass != "bmc-rotated" {
+		t.Errorf("GetHost = %+v; an unlatched IPMI rotation was not absorbed", h)
+	}
+}
+
+// TestCredentialsSplit_APairedEntryIsNotAbsorbed: an entry that carries its
+// own credential statement came from a latched writer, and the credential
+// statement is authoritative for it. (Real latched writers stamp both halves
+// with one updated_at and one value, so absorbing their entries would be a
+// no-op; this entry deliberately differs so the pairing rule is observable.)
+func TestCredentialsSplit_APairedEntryIsNotAbsorbed(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertUser(ctx, c, "alice", "operator", "$2a$10$before"); err != nil {
+		t.Fatal(err)
+	}
+	applyRemote(t, c, "2999000000000-0000-peer",
+		Statement{SQL: usersUpdatePasswordSQL, Params: []interface{}{"$2a$10$parent-half", "2999-01-01T00:00:02Z", "alice"}},
+		Statement{SQL: userCredentialUpsertSQL, Params: []interface{}{"alice", "$2a$10$cred-half", "2999-01-01T00:00:01Z"}})
+	if got := oneString(t, c, `SELECT password_hash FROM user_credentials WHERE username = 'alice'`, "password_hash"); got != "$2a$10$cred-half" {
+		t.Errorf("user_credentials = %q; a latched writer's entry was absorbed over its own credential statement", got)
+	}
+}
+
+// TestCredentialsSplit_AnUnlatchedNodeAbsorbsNothing: absorption writes the
+// credential table, which an unlatched node must never do.
+func TestCredentialsSplit_AnUnlatchedNodeAbsorbsNothing(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	if err := InsertUser(ctx, c, "alice", "operator", "$2a$10$before"); err != nil {
+		t.Fatal(err)
+	}
+	applyRemote(t, c, "2999000000000-0000-peer",
+		Statement{SQL: usersUpdatePasswordSQL, Params: []interface{}{"$2a$10$rotated", "2999-01-01T00:00:00Z", "alice"}})
+	if n := tableCount(t, c, "user_credentials"); n != 0 {
+		t.Errorf("an unlatched node absorbed into user_credentials (%d rows)", n)
+	}
+}
+
+// TestCredentialsSplit_AnEmptiedOldColumnReadsTheCredentialRow: a host that
+// ran the pre-release clearing build holds emptied old columns stamped
+// after the credential rows. Readers must still take the credential row, and
+// the pass must not copy the empty value over it.
+func TestCredentialsSplit_AnEmptiedOldColumnReadsTheCredentialRow(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	seedSecrets(t, c, "$2a$10$current", "$2a$10$t", "bmc-secret")
 	c.SetCredentialsSplitGate(func() bool { return true })
 	if _, err := c.SplitCredentials(ctx); err != nil {
 		t.Fatal(err)
 	}
 	for _, q := range []string{
-		`SELECT updated_at FROM tokens WHERE id = 'tok-1'`,
-		`SELECT updated_at FROM users WHERE username = 'alice'`,
-		`SELECT updated_at FROM hosts WHERE name = 'bmc-host'`,
+		`UPDATE users SET password_hash = '', updated_at = '2999-01-01T00:00:00Z' WHERE username = 'alice'`,
+		`UPDATE hosts SET ipmi_pass = '', updated_at = '2999-01-01T00:00:00Z' WHERE name = 'bmc-host'`,
 	} {
-		cleared := oneString(t, c, q, "updated_at")
-		if lwwOrder(cleared, revokeTS) >= 0 {
-			t.Errorf("%s: the clear stamped %q, not older than an in-flight write minted at %q "+
-				"before it ran; that write would be LWW-skipped", q, cleared, revokeTS)
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
 		}
 	}
-}
-
-// TestCredentialsSplit_ReadersStopFallingBackAfterThePass: once this node has
-// latched and completed a pass, a value that reappears in an old column is
-// not served. Before that pass the same value is.
-func TestCredentialsSplit_ReadersStopFallingBackAfterThePass(t *testing.T) {
-	ctx := context.Background()
-	c := newTestDB(t)
-	seedSecrets(t, c, "$2a$10$current", "$2a$10$t", "p")
-	c.SetCredentialsSplitGate(func() bool { return true })
-	if !c.credentialFallback() {
-		t.Fatal("readers stopped falling back before this node's first pass; a secret still " +
-			"only in the old column would read as absent")
-	}
-	if _, err := c.SplitCredentials(ctx); err != nil {
-		t.Fatal(err)
-	}
-	// A newer, different old-column value arrives (local-only, so the test
-	// controls it) — what a stale anti-entropy copy looks like.
-	if err := c.execLocal(ctx, `UPDATE users SET password_hash = 'resurrected', updated_at = '2999-01-01T00:00:00Z' WHERE username = 'alice'`); err != nil {
-		t.Fatal(err)
+	if rep, err := c.SplitCredentials(ctx); err != nil || rep.Copied != 0 {
+		t.Fatalf("pass over emptied old columns = %+v err=%v, want nothing copied", rep, err)
 	}
 	if u, _ := GetUser(ctx, c, "alice"); u == nil || u.PasswordHash != "$2a$10$current" {
-		t.Errorf("GetUser after the pass returned %+v; it must read user_credentials only", u)
+		t.Errorf("GetUser = %+v; an emptied old column must not hide the credential row", u)
+	}
+	if h, _ := GetHost(ctx, c, "bmc-host"); h == nil || h.IPMIPass != "bmc-secret" {
+		t.Errorf("GetHost = %+v; an emptied old column must not hide the credential row", h)
 	}
 }
 
@@ -368,4 +472,36 @@ func publicDumpJSON(t *testing.T, c *Client) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// TestCredentialsSplit_AStaleOldColumnOnANewerParentRowDoesNotWin is the users
+// end state of the #267 race: a latched rotation A→B at T1 whose users half a
+// replica's LWW gate refused, because a concurrent non-password write to the
+// same row (T2 > T1) got there first. The replica holds users.password_hash=A
+// at T2 and user_credentials=B at T1. Neither the reader nor the pass may
+// bring A back.
+func TestCredentialsSplit_AStaleOldColumnOnANewerParentRowDoesNotWin(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	c.SetCredentialsSplitGate(func() bool { return true })
+	if err := InsertUser(ctx, c, "alice", "operator", "$2a$10$A"); err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`UPDATE user_credentials SET password_hash = '$2a$10$B', updated_at = '2026-06-01T00:00:01Z' WHERE username = 'alice'`,
+		`UPDATE users SET password_hash = '$2a$10$A', role = 'admin', updated_at = '2026-06-01T00:00:02Z' WHERE username = 'alice'`,
+	} {
+		if err := c.execLocal(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if u, _ := GetUser(ctx, c, "alice"); u == nil || u.PasswordHash != "$2a$10$B" {
+		t.Errorf("GetUser = %+v, want the rotated $2a$10$B; a rotated-out password came back", u)
+	}
+	if _, err := c.SplitCredentials(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := oneString(t, c, `SELECT password_hash FROM user_credentials WHERE username = 'alice'`, "password_hash"); got != "$2a$10$B" {
+		t.Errorf("user_credentials after the pass = %q, want $2a$10$B; the pass copied the stale old column", got)
+	}
 }

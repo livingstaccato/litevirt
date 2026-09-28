@@ -85,8 +85,25 @@ const (
 	// CredentialsSplitV1 gates moving the three secret COLUMNS of public
 	// inventory tables — hosts.ipmi_pass, users.password_hash and
 	// tokens.token_hash — into their own sensitive-lane tables
-	// (host_fence_credentials, user_credentials, token_credentials), and then
-	// clearing the old columns so the operator-safe state dump carries no secret.
+	// (host_fence_credentials, user_credentials, token_credentials).
+	//
+	// This release DUAL-WRITES: once latched, every writer writes the credential
+	// table and the old column in one batch, and nothing clears an old column.
+	// Readers take the credential row whenever one exists and the old column
+	// only when none does; they never date a secret by the PARENT row's
+	// updated_at, which unrelated writes bump (the #267 race). A secret written
+	// by a node that has not latched yet is recognised by its entry carrying no
+	// credential statement, and absorbed into the credential row where it is
+	// applied (corrosion/credentials_absorb.go). A rollback below the latch is
+	// still not clean: the rolled-back binary enters WAL quarantine
+	// (preflightCapabilityRollback) and emits no replicated writes until it is
+	// upgraded again or reseeded. What the two copies buy is that its
+	// old-column reader still validates tokens, checks passwords and fences,
+	// where a cleared column lost all three, and that upgrading again loses
+	// nothing. Clearing the old columns, which is what finally
+	// takes the secrets out of the operator-safe state dump, arrives in a later
+	// release behind a second mandatory, ReplicationGated token
+	// (docs/design/credentials-clear.md).
 	//
 	// It states two facts about the BINARY, which is why it is mandatory and has
 	// no config flag:
@@ -96,20 +113,22 @@ const (
 	//     back-pressures a previous-release peer rather than degrading: its apply
 	//     fails closed, the batch rolls back and its watermark stalls. So nothing
 	//     writes to the credential tables until this token has latched.
-	//   - it READS a credential from the credential table. The latch is what
-	//     licenses clearing the old column, and a previous-release node reads
-	//     only the old column — it would lose every IPMI password, login and API
-	//     token the moment the clear reached it.
+	//   - it READS a credential from the credential table, falling back to the
+	//     old column only where no credential row exists. A previous-release
+	//     node reads only the old column, which is why this release keeps
+	//     writing it.
 	//
-	// Both facts must hold of every host this node REPLICATES TO, not merely of
-	// every host that votes, so the token is in replicationGated. A host parked
-	// in `maintenance` on the old build still receives the clear and still
-	// serves logins; a latch computed over voting members alone would clear the
-	// column out from under it.
+	// The first fact must hold of every host this node REPLICATES TO, not
+	// merely of every host that votes, so the token is in replicationGated. A
+	// host parked in `maintenance` on the old build still receives every
+	// statement; a latch computed over voting members alone would stall its
+	// stream on the first credential-table write.
 	//
 	// A flag would be worse than useless: driveCapabilityLatches skips an
-	// unlatched token whose flag is off, so a flag-gated split would never latch
-	// and the secrets would stay in the public dump forever. There is nothing an
+	// unlatched token whose flag is off, so a flag-gated split would never latch,
+	// the later release's clear (which needs the credential tables populated)
+	// could never follow, and the secrets would stay in the public dump forever.
+	// There is nothing an
 	// operator could correctly decline — the split changes where a secret is
 	// stored, not a policy.
 	CredentialsSplitV1 = "credentials_split_v1"
@@ -508,15 +527,16 @@ const (
 //     nothing reads until it is on, so that is the lever an incident wants.
 //     TestDurablyLatchedIsMonotone pins the behaviour this paragraph describes.
 //
-//   - credentials_split_v1 has no stand-down either, and for a harder reason:
-//     once it latches, each node copies the three secret columns into the
-//     credential tables and then CLEARS the columns. The clear is the point of
-//     the token and it is not reversible — a build that reads only the old
-//     columns has nothing left to read. Rolling a host back below this build
-//     after the latch costs that host its IPMI passwords, logins and API
-//     tokens as well as its replication stream (the credential tables' shapes
-//     back-pressure it). The startup rollback preflight refuses such a
-//     binary if it carries the preflight; one that predates it does not.
+//   - credentials_split_v1 has no stand-down either. A binary rolled back
+//     below it enters WAL quarantine and emits no replicated writes until it
+//     is upgraded again or reseeded, and it cannot decode the credential
+//     tables' shapes latched peers keep sending. This release dual-writes, so
+//     every old column still holds the current value: the rolled-back reader
+//     still validates tokens, checks passwords and fences, and upgrading
+//     again loses nothing. The irreversible step —
+//     clearing the old columns — is deliberately NOT in this release; it
+//     comes with a second token in a later one
+//     (docs/design/credentials-clear.md).
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -630,11 +650,10 @@ func Supported() []string {
 // availability of the feature, not of the cluster.
 var replicationGated = map[string]bool{
 	LeaseTermLedgerV1: true,
-	// Confirmed against every replication recipient for BOTH of its claims: the
-	// credential tables' shapes must be decodable by every host we stream to,
-	// and the old-column clear must not reach a host that still reads only the
-	// old column — a maintenance host on the previous build serves logins and
-	// can coordinate a fence once it returns to service.
+	// Confirmed against every replication recipient: the
+	// credential tables' shapes must be decodable by every host we stream to —
+	// a maintenance host on the previous build still receives every statement.
+	// (The old-column clear that also needs this is a later release's token.)
 	CredentialsSplitV1: true,
 }
 

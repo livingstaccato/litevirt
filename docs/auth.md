@@ -437,12 +437,17 @@ it to impersonate a user.
 representation anti-entropy repair merges, and `StreamTableDump` returns the
 same representation restricted to named tables. It is unredacted, so it carries
 the secret columns of replicated tables: `hosts.ipmi_pass`,
-`users.password_hash` and `tokens.token_hash` — until every host runs a build
-carrying the `credentials_split_v1` capability. Then each host moves those
-secrets into `host_fence_credentials`, `user_credentials` and
-`token_credentials`, which only the sensitive lane below carries, and clears the
-three columns. From then on the state dump carries no secret (see
-[upgrades.md](upgrades.md#secrets-move-to-the-sensitive-lane-after-the-roll)).
+`users.password_hash` and `tokens.token_hash`. Once every host runs a build
+carrying the `credentials_split_v1` capability, each host also writes those
+secrets to `host_fence_credentials`, `user_credentials` and
+`token_credentials`, which only the sensitive lane below carries. This release
+keeps writing the three old columns too, so a host still reading only those
+columns (one on the previous release, including one rolled back and under WAL
+quarantine) reads current secrets. The state dump therefore **still carries
+the secrets**. Clearing the old columns, after which the dump carries none, is a
+later release's step (see
+[upgrades.md](upgrades.md#secrets-move-to-the-sensitive-lane-after-the-roll) and
+[design/credentials-clear.md](design/credentials-clear.md)).
 All three RPCs stay peer-only regardless: only a **peer** or **local-root**
 caller (a cluster host certificate) can read them. An operator or admin bearer,
 a session, and the `lv-cli` client certificate are all refused with

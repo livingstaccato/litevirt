@@ -203,10 +203,11 @@ func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties 
 // another node's database: the legacy unary form of the anti-entropy repair
 // pull.
 //
-// Peer-only. The dump is the unredacted repair representation, so until
-// credentials_split_v1 has latched and every node has cleared them it carries
+// Peer-only. The dump is the unredacted repair representation, so it carries
 // secret-bearing columns of replicated tables (hosts.ipmi_pass,
-// users.password_hash, tokens.token_hash). Only a cluster host certificate may
+// users.password_hash, tokens.token_hash). credentials_split_v1 also puts them
+// on the sensitive lane, but this release still dual-writes the old columns;
+// a later release clears them (docs/design/credentials-clear.md). Only a cluster host certificate may
 // read it; an operator or admin bearer and the lv-cli client certificate are
 // refused. Operators see convergence through the digest RPCs, which carry
 // hashes, never row contents.

@@ -46,7 +46,8 @@ const usersReactivateSQL = `UPDATE users SET role = ?, password_hash = ?, delete
 // it reactivates the row with the new role and password.
 //
 // Once credentials_split_v1 has latched the hash is written to user_credentials
-// in the same batch and users.password_hash gets ” (see credentials_split.go).
+// as well, in the same batch and under the same updated_at; users.password_hash
+// keeps it for a previous-release reader (see credentials_split.go).
 func InsertUser(ctx context.Context, c *Client, username, role, passwordHash string) error {
 	now := c.NowTS()
 	split := c.MayWriteCredentialTables()
@@ -56,7 +57,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 	if err == nil && len(rows) > 0 {
 		if split {
 			return c.ExecuteBatch(ctx, []Statement{
-				{SQL: usersReactivateSQL, Params: []interface{}{role, c.oldColumnValue(passwordHash), now, username}},
+				{SQL: usersReactivateSQL, Params: []interface{}{role, passwordHash, now, username}},
 				{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 			})
 		}
@@ -64,7 +65,7 @@ func InsertUser(ctx context.Context, c *Client, username, role, passwordHash str
 	}
 	if split {
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersInsertSQL, Params: []interface{}{username, role, c.oldColumnValue(passwordHash), nowRFC3339(), now}},
+			{SQL: usersInsertSQL, Params: []interface{}{username, role, passwordHash, nowRFC3339(), now}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 		})
 	}
@@ -89,12 +90,11 @@ func GetUser(ctx context.Context, c *Client, username string) (*UserRecord, erro
 	}
 	r := rows[0]
 	return &UserRecord{
-		Username: r.String("username"),
-		Role:     r.String("role"),
-		PasswordHash: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
-			r.String("password_hash"), r.String("updated_at"), c.credentialFallback()),
-		Realm:     r.String("realm"),
-		CreatedAt: r.String("created_at"),
+		Username:     r.String("username"),
+		Role:         r.String("role"),
+		PasswordHash: resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("password_hash")),
+		Realm:        r.String("realm"),
+		CreatedAt:    r.String("created_at"),
 	}, nil
 }
 
@@ -147,7 +147,7 @@ func UpdateUserPassword(ctx context.Context, c *Client, username, passwordHash s
 			return nil
 		}
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersUpdatePasswordSQL, Params: []interface{}{c.oldColumnValue(passwordHash), now, username}},
+			{SQL: usersUpdatePasswordSQL, Params: []interface{}{passwordHash, now, username}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{username, passwordHash, now}},
 		})
 	}
@@ -202,7 +202,7 @@ func InsertToken(ctx context.Context, c *Client, t TokenRecord) error {
 	}
 	if c.MayWriteCredentialTables() {
 		return c.ExecuteBatch(ctx, []Statement{
-			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, c.oldColumnValue(t.TokenHash), t.ExpiresAt, scope, nowRFC3339(), now}},
+			{SQL: tokensInsertSQL, Params: []interface{}{t.ID, t.Username, t.Name, t.TokenHash, t.ExpiresAt, scope, nowRFC3339(), now}},
 			{SQL: tokenCredentialUpsertSQL, Params: []interface{}{t.ID, t.TokenHash, now}},
 		})
 	}
@@ -249,10 +249,8 @@ func ValidateToken(ctx context.Context, c *Client, rawToken string) (*UserRecord
 		return nil, err
 	}
 
-	fallback := c.credentialFallback()
 	for _, r := range rows {
-		hash := resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("cred_ts"),
-			r.String("token_hash"), r.String("src_ts"), fallback)
+		hash := resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("token_hash"))
 		if hash == "" {
 			continue // bcrypt rejects it anyway; skip the cost
 		}
@@ -366,8 +364,7 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 		return "", nil // no admin ever existed; not this function's problem
 	}
 	victim := rows[0].String("username")
-	hash := resolveCredential(rows[0].String("cred_key") != "", rows[0].String("cred_val"), rows[0].String("cred_ts"),
-		rows[0].String("password_hash"), rows[0].String("updated_at"), c.credentialFallback())
+	hash := resolveCredential(rows[0].String("cred_key") != "", rows[0].String("cred_val"), rows[0].String("password_hash"))
 	// The reactivation shape InsertUser already uses, with role and password
 	// written back unchanged. Deliberately NOT a new `SET deleted_at = NULL`
 	// statement: every replicated shape has to be in the compatibility ledger,
@@ -375,7 +372,7 @@ func ReinstateAdminIfNoneRemain(ctx context.Context, c *Client) (string, error) 
 	now := c.NowTS()
 	if c.MayWriteCredentialTables() {
 		if err := c.ExecuteBatch(ctx, []Statement{
-			{SQL: usersReactivateSQL, Params: []interface{}{"admin", c.oldColumnValue(hash), now, victim}},
+			{SQL: usersReactivateSQL, Params: []interface{}{"admin", hash, now, victim}},
 			{SQL: userCredentialUpsertSQL, Params: []interface{}{victim, hash, now}},
 		}); err != nil {
 			return "", err

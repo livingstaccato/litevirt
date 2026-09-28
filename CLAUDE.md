@@ -161,9 +161,15 @@ There are exceptions, of two different kinds, and neither is "the one":
   `lease_term_ledger_v1` and `credentials_split_v1`, but trust the declaration,
   not this list. A mandatory token has no flag to turn off in an incident — see
   the per-token stand-down notes beside that declaration.
-  `credentials_split_v1` has none at all: once latched, each host clears the
-  old secret columns, so a host rolled back to a build without it loses IPMI
-  passwords, logins and tokens (docs/upgrades.md).
+  `credentials_split_v1` has none at all. Once latched, hosts dual-write the
+  credential tables and the old secret columns and never clear the old ones.
+  A rollback below it is still not clean: the rolled-back binary enters WAL
+  quarantine (`preflightCapabilityRollback`) and emits no replicated writes
+  until upgraded again or reseeded. What the two copies buy is that its
+  old-column reader still validates tokens, checks passwords and fences, where
+  a cleared column lost all three, and that upgrading again loses nothing.
+  Clearing the old columns is a later release's step behind a second token
+  (docs/design/credentials-clear.md). Do not add a clear to this one.
 - **Conditionally advertised** — `hardware_v2` has no flag of its own either,
   but it is gated differently: each node's startup hardware audit plus a latched
   `operation_protocol_v1` decide whether it is advertised at all.

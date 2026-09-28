@@ -505,30 +505,72 @@ parked in `maintenance` — runs the previous release:
 `credentials_split_v1` is mandatory and replication-gated: it latches only once
 every memberlist member advertises it. From then on, on each host:
 
-- every writer writes the credential table in the same batch as the public row,
-  and writes an empty old column;
-- a pass that runs at start and every minute copies any old-column secret into
-  the credential table and **clears the old column**, in one batch. The clears
-  replicate like any other write, so once every host has run a pass no public
-  row — and no operator-safe state dump — carries a secret.
+- every writer writes the secret to **both** places, in one batch under one
+  `updated_at`: the credential table and the old column;
+- a pass that runs at start and every minute copies an old-column secret into
+  the credential table only where the credential table has **no row** for it.
+  It **never clears the old column**;
+- readers take the credential row whenever one exists, and the old column only
+  when none does.
 
-Until a host's first complete pass, its readers take the credential row but
-fall back to the old column where the credential row is missing, or holds a
-different value on an older row than the public one. After that pass they read
-the credential tables only.
+Readers and the pass never compare the credential row's `updated_at` with the
+public row's. The public row's `updated_at` moves on every unrelated write to
+it, such as a host's version report or a user's role change. When one of those
+reaches a host ahead of a password rotation, that host's last-writer-wins check
+refuses the rotation's public-row half, so it holds the OLD password on a NEWER
+public row. A rule that preferred the newer row would serve the rotated-out
+password, and the pass would copy it over the credential row.
+
+This is the dual-write step of a column move, and the release stops there.
+Every old column still holds the current secret, so the public rows, and the
+operator-safe state dump built from them, **still carry the secrets in this
+release**. Clearing the old columns is a later release's step, behind a second
+mandatory, replication-gated token (see
+[design/credentials-clear.md](design/credentials-clear.md)).
 
 Latches form per host, so for a few seconds after one host latches its
 neighbour may not have yet. A password or IPMI change made through that
-neighbour in that window goes to the old column. The latched host's next pass,
-within a minute, carries it across. Until then the latched host still serves the
-previous value.
+neighbour in that window goes to the old column only. Such a write is
+recognisable from the write itself: a latched host always writes the
+credential row in the same replicated batch, so a batch that sets a secret
+with no credential-table statement came from a host that had not latched. Every
+host that applies such a batch absorbs the secret into its credential row,
+locally, under the batch's own `updated_at` and only if that is newer. A latched
+host may create the row; a host that has not latched only updates a row it
+already holds, which includes the host the change was made through. A rotated
+password therefore stops working everywhere the rotation has reached, with no
+pass-interval delay. A host that missed the batch (for example, it repaired the
+public row from anti-entropy instead) picks up the absorbed credential row
+through sensitive-lane anti-entropy, because every host that applied the batch
+wrote the same row.
 
-**Clearing is one-way.** After it, a build that reads only the old columns has
-nothing to read: rolled back to the previous release, a host loses every IPMI
-password, local login and API token, and cannot decode the credential tables'
-replication either. The startup rollback preflight refuses to start a binary
-that does not know a token this host has already latched, but only for a binary
-that carries that preflight. Roll forward, or reseed the host from a peer.
+**What the two copies buy on a rollback.** A rollback below a latched token
+is still not clean. A binary rolled back below a capability token this host
+already latched enters **WAL quarantine** at startup (the capability-rollback
+preflight; its log line says "entering WAL quarantine"). It keeps running, but
+it emits no replicated writes until it is upgraded again or reseeded. It also
+cannot decode the credential tables' statements that latched peers keep
+sending. What dual-writing changes is narrower:
+
+- a host on the previous release, whether it has not upgraded yet or was
+  rolled back, reads only the old columns, and they are current. It still
+  validates API tokens, checks passwords and fences with the current IPMI
+  password, including for secrets set or rotated after the latch. Under
+  quarantine a password login still cannot complete, because minting the
+  session is a replicated write. With the old columns cleared, as the first
+  `credentials_split_v1` build did, that host lost all three;
+- upgrading that host again loses nothing. The credential tables and the old
+  columns both hold every secret.
+
+A host that ran the **pre-release build that cleared the old columns** (the
+first `credentials_split_v1` build) holds empty old columns. This release
+reads its credential rows, so nothing is lost while it stays on this release or
+later. Until each secret is written again it gets none of the rollback benefit
+above: rolled back, its old-column reader finds nothing. A
+password change, or an IPMI password set again with
+`lv host config <host> --ipmi-pass`, puts the value back in the old column. An
+API token's hash cannot be rewritten; replace the token with a new one and
+revoke the old.
 
 Until the token latches, `litevirt_ha_degraded{reason="capability_rollout_pending"}`
 is set, as it is for every mandatory token mid-roll. If it stays set after the

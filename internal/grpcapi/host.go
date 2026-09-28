@@ -913,17 +913,15 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	now := s.db.NowTS()
 	args = append(args, now, req.Name)
 
-	// Once credentials_split_v1 has latched, a supplied IPMI password is
-	// written to the host's sensitive-lane credential row instead, in the same
-	// batch and under the same updated_at. Before the latch no node may write that
-	// table (a previous-release peer cannot decode it), so the password goes
-	// to hosts.ipmi_pass alone, as it always did.
+	// Once credentials_split_v1 has latched, a supplied IPMI password is ALSO
+	// written to the host's sensitive-lane credential row, in the same batch
+	// and under the same updated_at. hosts.ipmi_pass keeps it too: a host
+	// rolled back one release reads that column and nothing else, and clearing
+	// it is a later release's step (docs/design/credentials-clear.md). Before
+	// the latch no node may write the credential table (a previous-release
+	// peer cannot decode it), so the password goes to hosts.ipmi_pass alone.
 	// err is reused from the host lookup above.
 	if req.IpmiPass != "" && s.db.MayWriteCredentialTables() {
-		// After the latch the public row's column gets '', not the password:
-		// no replication recipient reads it any more, and COALESCE('', col)
-		// clears whatever an earlier write left there.
-		args[3] = ""
 		err = s.db.ExecuteBatch(ctx, []corrosion.Statement{
 			{SQL: configureHostSQL, Params: args},
 			{SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}},

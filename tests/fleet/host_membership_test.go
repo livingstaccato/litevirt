@@ -1,0 +1,346 @@
+// Fleet scenarios: host state and isolation on a row of their own
+// (colonelpanik/litevirt#267).
+//
+// hosts is one row with one updated_at and many writers. Two of them — the
+// coordinator or an operator moving a host's state, and that host's daemon
+// reporting its version — are different columns under the same clock, so a
+// replica that applies the newer write first refuses the older one and loses
+// it. The failure is multi-node by construction: it needs two writers and a
+// replica that sees them in the opposite order to the one that wrote last. So
+// it is driven here, over real replication between independent replicas.
+package fleet
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
+)
+
+// splitMembership is host_membership_split_v1 latching on n: the gate opens
+// and the node runs its first pass, as the daemon's split loop would.
+func splitMembership(t *testing.T, n *Node) corrosion.HostMembershipReport {
+	t.Helper()
+	n.DB.SetHostMembershipGate(func() bool { return true })
+	rep, err := n.DB.SplitHostMembership(context.Background())
+	if err != nil {
+		t.Fatalf("%s: split pass: %v", n.Name, err)
+	}
+	if !n.DB.HostMembershipLive() {
+		t.Fatalf("%s: a complete split pass did not make the node live", n.Name)
+	}
+	return rep
+}
+
+func hostOn(t *testing.T, n *Node, name string) *corrosion.HostRecord {
+	t.Helper()
+	h, err := corrosion.GetHost(context.Background(), n.DB, name)
+	if err != nil || h == nil {
+		t.Fatalf("%s: GetHost %s: %+v %v", n.Name, name, h, err)
+	}
+	return h
+}
+
+func votes(t *testing.T, n *Node, host string) bool {
+	t.Helper()
+	voters, err := corrosion.VoterSet(context.Background(), n.DB)
+	if err != nil {
+		t.Fatalf("%s: VoterSet: %v", n.Name, err)
+	}
+	return voters[host]
+}
+
+func assertNoMembershipStatements(t *testing.T, n *Node) {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(), `SELECT stmts FROM mutation_log`)
+	if err != nil {
+		t.Fatalf("read %s mutation_log: %v", n.Name, err)
+	}
+	for _, r := range rows {
+		if strings.Contains(r.String("stmts"), "host_membership") {
+			t.Fatalf("%s put a host_membership statement on its replication stream before the latch. "+
+				"A previous-release peer has no ledger entry for it, so its apply fails closed and its "+
+				"watermark stalls:\n%s", n.Name, r.String("stmts"))
+		}
+	}
+}
+
+// concurrentStateAndVersion has a write the coordinator owns (a's drain of
+// subject) and one the subject's daemon owns (b's version report) cross on the
+// wire: every link is down while both are made, b's strictly later, and then
+// the links heal. It returns each node's resulting (state, version) of subject.
+func concurrentStateAndVersion(t *testing.T, split bool) map[string][2]string {
+	t.Helper()
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 267})
+	a, b, subject := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	c.WaitConverged(t, convergeTimeout)
+	if split {
+		for _, n := range c.Nodes {
+			splitMembership(t, n)
+		}
+		c.WaitConverged(t, convergeTimeout)
+	}
+
+	// No relay either: with three nodes every node relays, so a's drain could
+	// reach b through subject before b writes.
+	c.Isolate(a)
+	c.Isolate(b)
+	if err := corrosion.UpdateHostState(ctx, a.DB, subject.Name, "draining"); err != nil {
+		t.Fatalf("drain on %s: %v", a.Name, err)
+	}
+	time.Sleep(5 * time.Millisecond) // b's write is the newer one on every clock
+	if err := corrosion.UpdateHostVersion(ctx, b.DB, subject.Name, "v-267"); err != nil {
+		t.Fatalf("version report on %s: %v", b.Name, err)
+	}
+	c.ClearLinkFaults()
+
+	if split {
+		// hosts itself still diverges: its state column is the previous
+		// release's copy, dual-written for a rolled-back reader, and it keeps
+		// the previous release's shared clock and the #267 loss with it. The
+		// membership copy is the one that must converge.
+		c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+	} else {
+		// Without the split the replicas never converge — that is the bug — so
+		// wait for both writes to have been delivered everywhere instead: the
+		// version is the newer write, and a node holding it has applied or
+		// refused the drain.
+		eventually(t, convergeTimeout, "the version report everywhere", func() bool {
+			for _, n := range c.Nodes {
+				if hostOn(t, n, subject.Name).Version != "v-267" {
+					return false
+				}
+			}
+			return true
+		})
+		time.Sleep(500 * time.Millisecond)
+	}
+	out := map[string][2]string{}
+	for _, n := range c.Nodes {
+		h := hostOn(t, n, subject.Name)
+		out[n.Name] = [2]string{h.State, h.Version}
+	}
+	return out
+}
+
+// TestFleet_HostMembership_ConcurrentStateAndVersionBothSurvive: a state
+// change and a version report made concurrently on two nodes both survive on
+// every replica once host state has its own row.
+//
+// The first subtest is the RED half and must keep failing to reproduce the
+// loss: without it the second could pass on a scenario that never raced.
+func TestFleet_HostMembership_ConcurrentStateAndVersionBothSurvive(t *testing.T) {
+	t.Run("before the split one replica loses the drain", func(t *testing.T) {
+		got := concurrentStateAndVersion(t, false)
+		lost := 0
+		for _, sv := range got {
+			if sv[0] != "draining" {
+				lost++
+			}
+		}
+		if lost == 0 {
+			t.Fatalf("every replica kept both writes with the shared hosts clock: %v. The scenario "+
+				"did not race, so the post-split half proves nothing", got)
+		}
+	})
+
+	t.Run("after the split both survive on every replica", func(t *testing.T) {
+		for node, sv := range concurrentStateAndVersion(t, true) {
+			if sv[0] != "draining" || sv[1] != "v-267" {
+				t.Errorf("%s holds state=%q version=%q, want draining and v-267: a write to one "+
+					"column of the host was lost to a concurrent write to another", node, sv[0], sv[1])
+			}
+		}
+	})
+}
+
+// TestFleet_HostMembership_ARollKeepsFencingAndTheVoterSet: host state and the
+// voter set stay right at every stage of a roll, and a fence works at the end.
+//
+// Stage 1, nothing latched — the state for as long as any previous-release
+// host is listening. Nothing naming host_membership may reach any replication
+// stream, and state lives in hosts.state where that host reads it.
+//
+// Stage 2, one node latched and its neighbour not yet. An operator drains the
+// victim through the UNLATCHED node, which writes hosts.state only. The latched
+// node must see it at once — its voter set drops the victim — and its next pass
+// carries it into host_membership. A latched node that trusted its membership
+// row unconditionally would keep counting a host in maintenance as a voter.
+//
+// Stage 3, the roll completes. The victim fails and a coordinator fences it:
+// every node reads it fenced and out of the voter set, and hosts.state — still
+// written, for a node rolled back one release — says fenced too.
+func TestFleet_HostMembership_ARollKeepsFencingAndTheVoterSet(t *testing.T) {
+	ctx := context.Background()
+	clock := NewVirtualClock(time.Now().UTC())
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2671})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	insertVM(t, a, "vm-victim", victim.Name)
+
+	// Stage 1.
+	if err := corrosion.UpdateHostState(ctx, b.DB, victim.Name, "draining"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.SelfClient(a).UndrainHost(ctx, &pb.UndrainHostRequest{Name: victim.Name}); err != nil {
+		t.Fatalf("undrain via %s: %v", a.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		assertNoMembershipStatements(t, n)
+		if got := oldColumn(t, n, `SELECT state FROM hosts WHERE name = ?`, victim.Name); got != "active" {
+			t.Fatalf("%s: hosts.state = %q; a previous-release node would read the wrong state", n.Name, got)
+		}
+	}
+
+	// Stage 2: a latches; b has not yet.
+	if rep := splitMembership(t, a); rep.Copied != len(c.Nodes) {
+		t.Fatalf("a's first pass copied %d hosts, want %d", rep.Copied, len(c.Nodes))
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if err := corrosion.UpdateHostState(ctx, b.DB, victim.Name, "maintenance"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if got := hostOn(t, a, victim.Name).State; got != "maintenance" {
+		t.Fatalf("latched %s reads the victim %q after the unlatched %s put it in maintenance", a.Name, got, b.Name)
+	}
+	if votes(t, a, victim.Name) {
+		t.Fatalf("latched %s still counts the victim as a voter after it went into maintenance", a.Name)
+	}
+	if rep, err := a.DB.SplitHostMembership(ctx); err != nil || rep.Absorbed != 1 {
+		t.Fatalf("a's periodic pass: %+v %v, want the late drain carried across", rep, err)
+	}
+	if _, err := c.SelfClient(b).UndrainHost(ctx, &pb.UndrainHostRequest{Name: victim.Name}); err != nil {
+		t.Fatalf("undrain via %s: %v", b.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout)
+	if _, err := a.DB.SplitHostMembership(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage 3: b and the victim latch.
+	splitMembership(t, b)
+	splitMembership(t, victim)
+	c.WaitConverged(t, convergeTimeout)
+	for _, n := range c.Nodes {
+		if got := hostOn(t, n, victim.Name).State; got != "active" {
+			t.Fatalf("%s reads the victim %q after the roll, want active", n.Name, got)
+		}
+		if !votes(t, n, victim.Name) {
+			t.Fatalf("%s does not count the active victim as a voter", n.Name)
+		}
+	}
+
+	c.Isolate(victim)
+	PublishHealth(t, a, victim.Name, 5, clock.Now())
+	PublishHealth(t, b, victim.Name, 5, clock.Now())
+	c.WaitConverged(t, convergeTimeout, a, b)
+	cs := c.NewCoordinators(clock)
+	cs.Tick(ctx, a)
+	if fences := cs.Fences(); len(fences) != 1 || fences[0].Target != victim.Name {
+		t.Fatalf("expected one fence of %s, got %+v", victim.Name, fences)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b)
+	for _, n := range []*Node{a, b} {
+		if got := hostOn(t, n, victim.Name).State; got != "fenced" {
+			t.Errorf("%s reads the fenced victim as %q", n.Name, got)
+		}
+		if votes(t, n, victim.Name) {
+			t.Errorf("%s still counts the fenced victim as a voter", n.Name)
+		}
+		if got := oldColumn(t, n, `SELECT state FROM hosts WHERE name = ?`, victim.Name); got != "fenced" {
+			t.Errorf("%s: hosts.state = %q after the fence; a node rolled back one release reads "+
+				"only that column and would count the fenced victim as live", n.Name, got)
+		}
+	}
+}
+
+// oldVoters is the voter set a PREVIOUS-RELEASE node computes: its VoterSet
+// read name and state from hosts and nothing else. This harness runs one
+// binary, so that reader is stood in for by the exact query it ran.
+func oldVoters(t *testing.T, n *Node) map[string]bool {
+	t.Helper()
+	rows, err := n.DB.Query(context.Background(), `SELECT name, state FROM hosts WHERE deleted_at IS NULL`)
+	if err != nil {
+		t.Fatalf("%s: old voter query: %v", n.Name, err)
+	}
+	out := map[string]bool{}
+	for _, r := range rows {
+		if corrosion.VotingEligible(r.String("state")) {
+			out[r.String("name")] = true
+		}
+	}
+	return out
+}
+
+// TestFleet_HostMembership_ARollbackOneReleaseStillReadsTheOldColumns: after
+// host_membership_split_v1 has latched on every node, a node rolled back to the
+// previous release — which reads state and isolation from hosts and nothing
+// else — still sees every state change and isolation made through latched
+// nodes. That holds only because every live writer ALSO writes the hosts
+// columns, in their previous-release shapes; nothing in this release clears or
+// freezes them.
+func TestFleet_HostMembership_ARollbackOneReleaseStillReadsTheOldColumns(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2672})
+	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	for _, n := range c.Nodes {
+		splitMembership(t, n)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+
+	check := func(stage, wantState string, wantIsolated bool) {
+		t.Helper()
+		for _, n := range c.Nodes {
+			if got := oldColumn(t, n, `SELECT state FROM hosts WHERE name = ?`, victim.Name); got != wantState {
+				t.Errorf("%s: %s: a rolled-back reader sees the victim %q, want %q", n.Name, stage, got, wantState)
+			}
+			if got := oldVoters(t, n)[victim.Name]; got != corrosion.VotingEligible(wantState) {
+				t.Errorf("%s: %s: a rolled-back reader's voter set has the victim voting=%v", n.Name, stage, got)
+			}
+			rows, err := n.DB.Query(ctx, `SELECT isolation_epoch AS e FROM hosts WHERE name = ?`, victim.Name)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("%s: read hosts.isolation_epoch: %v", n.Name, err)
+			}
+			if got := rows[0].Int64("e") != 0; got != wantIsolated {
+				t.Errorf("%s: %s: a rolled-back reader sees the victim isolated=%v, want %v — it "+
+					"refuses or accepts that host's replication from this column alone", n.Name, stage, got, wantIsolated)
+			}
+			if got := hostOn(t, n, victim.Name).State; got != wantState {
+				t.Errorf("%s: %s: this build reads the victim %q, want %q", n.Name, stage, got, wantState)
+			}
+		}
+	}
+
+	if err := corrosion.UpdateHostState(ctx, a.DB, victim.Name, "maintenance"); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+	check("after a maintenance through a", "maintenance", false)
+
+	if _, err := c.SelfClient(b).UndrainHost(ctx, &pb.UndrainHostRequest{Name: victim.Name}); err != nil {
+		t.Fatalf("undrain via %s: %v", b.Name, err)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+	check("after an undrain through b", "active", false)
+
+	if err := corrosion.IsolateHost(ctx, a.DB, a.Name, victim.Name, corrosion.IsolationManual); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+	check("after an isolation through a", "active", true)
+
+	epoch, _, err := corrosion.HostIsolation(ctx, b.DB, victim.Name)
+	if err != nil || epoch == 0 {
+		t.Fatalf("%s: HostIsolation = %d %v", b.Name, epoch, err)
+	}
+	if err := corrosion.ClearHostIsolation(ctx, b.DB, victim.Name, epoch); err != nil {
+		t.Fatal(err)
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"hosts"})
+	check("after the isolation is cleared through b", "active", false)
+}

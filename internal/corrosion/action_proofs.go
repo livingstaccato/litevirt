@@ -676,10 +676,11 @@ const claimProofSQL = `UPDATE runtime_action_proofs
 // because ReapSpentProofs never hard-deletes.
 // RETAINED, NOT EXECUTED. ClaimActionProofFenced no longer runs this shape —
 // its fence is a local guard now, because a NOT EXISTS over other rows is
-// re-evaluated on whichever node the statement reaches. The const stays so its
-// fingerprint stays in the ledger: a peer on a previous release still RELAYS
-// this shape, and this node has to keep resolving what arrives. Deleting it
-// would drop the entry and stall the stream from that peer.
+// re-evaluated on whichever node the statement reaches. The const stays because
+// stmthistorical.go registers it (claim_proof_fenced_not_exists_fork): a fork
+// build from before the local guard relays this shape, and this node has to
+// keep resolving what arrives. Keeping the const alone does NOT keep the entry
+// — stmtshapecheck reads call sites, and nothing calls this.
 const claimProofFencedSQL = `UPDATE runtime_action_proofs
 	    SET status = 'in_progress',
 	        executor_host = ?,

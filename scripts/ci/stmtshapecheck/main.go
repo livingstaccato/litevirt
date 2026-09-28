@@ -49,6 +49,11 @@ type finding struct {
 	unresolvedBatch bool // an ExecuteBatch arg that could not be statically enumerated
 	fp              string
 	parseErr        string
+	// methodValue: a replicating Client method taken as a func VALUE (exec := c.db.Execute)
+	// rather than called. Whatever it is later called with is invisible to this scan, so it
+	// is also marked dynamic — every consumer that skips an unresolvable finding skips it too.
+	methodValue bool
+	method      string // the replicating method a methodValue finding references
 }
 
 func main() {
@@ -66,37 +71,19 @@ func main() {
 		return
 	}
 
-	cfg := &packages.Config{
-		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
-			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
-		Dir:   *root,
-		Tests: false,
-	}
-	pkgs, err := packages.Load(cfg, "./internal/...")
+	pkgs, findings, err := scanTree(*root)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "stmtshapecheck: load: %v\n", err)
+		fmt.Fprintf(os.Stderr, "stmtshapecheck: %v\n", err)
 		os.Exit(2)
 	}
-	if packages.PrintErrors(pkgs) > 0 {
-		os.Exit(2)
-	}
-
-	var findings []finding
-	for _, pkg := range pkgs {
-		findings = append(findings, scanPkg(pkg)...)
-	}
-	sort.Slice(findings, func(i, j int) bool {
-		if findings[i].pos.Filename != findings[j].pos.Filename {
-			return findings[i].pos.Filename < findings[j].pos.Filename
-		}
-		return findings[i].pos.Line < findings[j].pos.Line
-	})
 
 	if *report {
 		for _, f := range findings {
 			switch {
 			case f.unresolvedBatch:
 				fmt.Printf("%s\tUNRESOLVED-BATCH\n", loc(f.pos))
+			case f.methodValue:
+				fmt.Printf("%s\tMETHOD-VALUE\n", loc(f.pos))
 			case f.dynamic:
 				fmt.Printf("%s\tDYNAMIC\n", loc(f.pos))
 			case f.parseErr != "":
@@ -137,6 +124,36 @@ func main() {
 	os.Exit(1)
 }
 
+// scanTree loads every package under root/internal and returns the replicated-statement
+// findings, sorted by position. It is the one scan both the CLI and the tree-level tests use,
+// so a test asserting something about "what the current tree emits" sees exactly what CI sees.
+func scanTree(root string) ([]*packages.Package, []finding, error) {
+	cfg := &packages.Config{
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
+			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports | packages.NeedDeps,
+		Dir:   root,
+		Tests: false,
+	}
+	pkgs, err := packages.Load(cfg, "./internal/...")
+	if err != nil {
+		return nil, nil, fmt.Errorf("load: %w", err)
+	}
+	if packages.PrintErrors(pkgs) > 0 {
+		return nil, nil, fmt.Errorf("load: package errors under %s/internal", root)
+	}
+	var findings []finding
+	for _, pkg := range pkgs {
+		findings = append(findings, scanPkg(pkg)...)
+	}
+	sort.Slice(findings, func(i, j int) bool {
+		if findings[i].pos.Filename != findings[j].pos.Filename {
+			return findings[i].pos.Filename < findings[j].pos.Filename
+		}
+		return findings[i].pos.Line < findings[j].pos.Line
+	})
+	return pkgs, findings, nil
+}
+
 func loc(p token.Position) string { return fmt.Sprintf("%s:%d", p.Filename, p.Line) }
 
 // computeGaps is the guard's top-level PASS/FAIL decision, factored out so it is unit-testable. A
@@ -149,6 +166,8 @@ func computeGaps(findings []finding) []string {
 		switch {
 		case f.unresolvedBatch:
 			gaps = append(gaps, fmt.Sprintf("%s: ExecuteBatch argument could not be statically enumerated; rewrite it as finite static SQL (a literal string per statement) so every replicated shape is in the ledger", loc(f.pos)))
+		case f.methodValue:
+			gaps = append(gaps, fmt.Sprintf("%s: %s takes corrosion Client.%s as a func value; the statements it is later called with are invisible to this check, so call the client directly with literal SQL at each site", loc(f.pos), f.fn, f.method))
 		case f.dynamic:
 			gaps = append(gaps, fmt.Sprintf("%s: dynamically-built replicated SQL; rewrite it as finite static SQL so every shape is in the ledger", loc(f.pos)))
 		case f.parseErr != "":
@@ -225,32 +244,48 @@ var catIdent = map[corrosion.ConcurrencyCategory]string{
 // checked-in historical ledger entries with provenance, and prints stmtledger_historical.go.
 // Shapes whose fingerprint is already in the current ledger are skipped (not historical-only).
 func emitHistoricalLedger() error {
+	byFP, family, err := historicalEntries()
+	if err != nil {
+		return err
+	}
+	fmt.Print(renderHistoricalLedger(byFP, family))
+	return nil
+}
+
+// historicalEntries expands corrosion.HistoricalShapes into the entries stmtledger_historical.go
+// should hold: rendered entry by fingerprint, and each family's fingerprints. A shape the CURRENT
+// ledger already holds is left out — it lives in stmtLedger, so the historical file needs no copy.
+func historicalEntries() (map[string]string, map[string][]string, error) {
 	byFP := map[string]string{}
 	family := map[string][]string{}
 	for _, hs := range corrosion.HistoricalShapes() {
 		le, err := corrosion.LedgerEntryFor(hs.SQL)
 		if err != nil {
-			return fmt.Errorf("derive historical entry for %q: %w", hs.SQL, err)
+			return nil, nil, fmt.Errorf("derive historical entry for %q: %w", hs.SQL, err)
 		}
 		if corrosion.CurrentLedgerHas(le.Fingerprint) {
 			continue // already a CURRENT-build shape; not historical-only (must not use
 			// LedgerLookup here — it also matches already-generated historical entries)
 		}
-		le.FirstEmitter, le.RemovalHorizon = hs.FirstEmitter, hs.Removal
+		le.FirstEmitter, le.LastEmitter, le.RemovalHorizon = hs.FirstEmitter, hs.LastEmitter, hs.Removal
 		rendered, err := renderLedgerEntry(le)
 		if err != nil {
-			return fmt.Errorf("%q: %w", hs.SQL, err)
+			return nil, nil, fmt.Errorf("%q: %w", hs.SQL, err)
 		}
 		if prev, dup := byFP[le.Fingerprint]; dup {
 			if prev != rendered {
-				return fmt.Errorf("fingerprint %s derived two different historical entries", le.Fingerprint)
+				return nil, nil, fmt.Errorf("fingerprint %s derived two different historical entries", le.Fingerprint)
 			}
 			continue
 		}
 		byFP[le.Fingerprint] = rendered
 		family[hs.Family] = append(family[hs.Family], le.Fingerprint)
 	}
+	return byFP, family, nil
+}
 
+// renderHistoricalLedger prints stmtledger_historical.go from historicalEntries' output.
+func renderHistoricalLedger(byFP map[string]string, family map[string][]string) string {
 	fps := make([]string, 0, len(byFP))
 	for fp := range byFP {
 		fps = append(fps, fp)
@@ -286,8 +321,7 @@ func emitHistoricalLedger() error {
 		b.WriteString("\t},\n")
 	}
 	b.WriteString("}\n")
-	fmt.Print(b.String())
-	return nil
+	return b.String()
 }
 
 // renderLedgerEntry renders a LedgerEntry as a Go composite literal, emitting every field the
@@ -415,6 +449,38 @@ func scanPkg(pkg *packages.Package) []finding {
 			if isPlumbingMethod(pkg, fd) {
 				continue
 			}
+			// A replicating method REFERENCED without being called is a func value: record it,
+			// because the statements it is later called with never reach the call-site scan below.
+			called := map[*ast.SelectorExpr]bool{}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				if call, ok := n.(*ast.CallExpr); ok {
+					if sel, ok := call.Fun.(*ast.SelectorExpr); ok {
+						called[sel] = true
+					}
+				}
+				return true
+			})
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				sel, ok := n.(*ast.SelectorExpr)
+				if !ok || called[sel] || !isReplicatingMethod(sel.Sel.Name) {
+					return true
+				}
+				selection := pkg.TypesInfo.Selections[sel]
+				if selection == nil || (selection.Kind() != types.MethodVal && selection.Kind() != types.MethodExpr) {
+					return true
+				}
+				if !isCorrosionClient(selection.Recv()) {
+					return true
+				}
+				out = append(out, finding{
+					pos:         pkg.Fset.Position(sel.Pos()),
+					fn:          fd.Name.Name,
+					dynamic:     true,
+					methodValue: true,
+					method:      sel.Sel.Name,
+				})
+				return true
+			})
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
 				if !ok {

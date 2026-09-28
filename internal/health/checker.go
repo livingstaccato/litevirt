@@ -405,6 +405,15 @@ func shouldPersistHealth(changed, healthy, answeredUnready, recoveryPending bool
 	return answeredUnready || (healthy && recoveryPending)
 }
 
+// The two host_health verdict shapes checkHost publishes. Every release since
+// v1.3.0 emits both, unchanged.
+const (
+	healthyVerdictSQL = `INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, ?, 0, ?, ?)`
+	unhealthyVerdictSQL = `INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`
+)
+
 func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// net.JoinHostPort (not Sprintf): host.Address is a bare host and may be an
 	// IPv6 literal, which "%s:%d" would mangle into an unparseable target. Every
@@ -540,25 +549,30 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	}
 
 	now := c.db.NowTS()
-	exec := c.db.ExecuteDeferred
-	if c.writeFn != nil {
-		exec = c.writeFn
-	}
+	// Each arm CALLS the corrosion client directly. Do not fold the two into a
+	// func value (exec := c.db.ExecuteDeferred): stmtshapecheck finds replicated
+	// statements at their call sites, so a write through a func value is
+	// invisible to it. That happened once — both verdict shapes vanished from
+	// the scan, their ledger entries survived only until the next
+	// -emit-ledger, and after that every peer would have refused this
+	// observer's verdicts.
 	var err error
 	if healthy {
 		// last_seen is a wall/display column (read as wall time via parseTimestamp), so
 		// it must use NowWall, NOT NowTS — NowTS is the LWW key and becomes an HLC string.
-		err = exec(ctx,
-			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, ?, ?, 0, ?, ?)`,
-			c.hostName, host.Name, "healthy", c.db.NowWall(), now,
-		)
+		args := []interface{}{c.hostName, host.Name, "healthy", c.db.NowWall(), now}
+		if c.writeFn != nil {
+			err = c.writeFn(ctx, healthyVerdictSQL, args...)
+		} else {
+			err = c.db.ExecuteDeferred(ctx, healthyVerdictSQL, args...)
+		}
 	} else {
-		err = exec(ctx,
-			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			c.hostName, host.Name, newStatus, newFailures, nil, now,
-		)
+		args := []interface{}{c.hostName, host.Name, newStatus, newFailures, nil, now}
+		if c.writeFn != nil {
+			err = c.writeFn(ctx, unhealthyVerdictSQL, args...)
+		} else {
+			err = c.db.ExecuteDeferred(ctx, unhealthyVerdictSQL, args...)
+		}
 	}
 	if err != nil {
 		// Do NOT advance lastWriteAt. It records when a verdict was PUBLISHED,

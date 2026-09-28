@@ -96,7 +96,13 @@ import (
 // upsert_binding_pre_tombstone_guard family. It is an ADDITION — a shape this
 // tree stopped emitting but a supported peer still sends — and no previously
 // accepted historical identity was removed or changed.
-const compatibilityDigest = "29a8bdab50aaf373dcb84f26d10267a3325d7d391b9006d9b0d28684f7272acc"
+// Updated again for claimProofFencedSQL: ClaimActionProofFenced stopped
+// relaying it at 431c3a92, but its entry stayed in the generated ledger only
+// because nobody regenerated, since stmtshapecheck reads call sites and keeping
+// the const kept nothing. It was ADDED as claim_proof_fenced_not_exists_fork,
+// whose emitters are unreleased fork builds that may have run on the lab. No
+// previously accepted historical identity was removed or changed.
+const compatibilityDigest = "4f4a0b3ec6db58d489130b8f6e6ece722db34bb6cce49e085775a49b1f930535"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -162,6 +168,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"proof_insert_pre_lease_term_v51":       1,   // proof insert before the fencing term column (v51 and earlier)
 	"proof_insert_pre_lease_key_v52":        1,   // proof insert with lease_term but before lease_key (v52)
 	"upsert_binding_pre_tombstone_guard":    1,   // UpsertBinding before `AND deleted_at IS NULL` stopped it resurrecting a released prefix
+	"claim_proof_fenced_not_exists_fork":    1,   // fenced claim with its fence as a receiver-evaluated NOT EXISTS (fork 39c75474..a0037a7e)
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

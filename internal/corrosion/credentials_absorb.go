@@ -237,3 +237,11 @@ func insertParamIndexes(sqlText string, sc secretColumn) (val, ts, key int, ok b
 	key, kok := idx[sc.parentPK]
 	return val, ts, key, vok && tok && kok
 }
+
+// SecretWrite is secretWriteOf for the ledger guard in scripts/ci/stmtshapecheck,
+// which checks that every registered shape naming a secret column is one this
+// parser reads: the parent table, and the key, value and updated_at it binds.
+func SecretWrite(s Statement) (table, key, value, updatedAt string, ok bool) {
+	w, ok := secretWriteOf(s)
+	return w.col.parent, w.key, w.value, w.ts, ok
+}

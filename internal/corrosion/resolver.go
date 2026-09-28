@@ -401,6 +401,12 @@ var capabilityMap = map[string]tableResolver{
 	"registry_credentials":   {category: "policy", chain: policyChain()},
 	"notification_targets":   {category: "policy", chain: policyChain()},
 	"notification_routes":    {category: "policy", chain: policyChain()},
+	// v56 credential tables: a tie naming two different secrets is never
+	// coin-flipped into one of them — tombstone wins, anything else differing
+	// goes to a human, same as the rest of this block.
+	"host_fence_credentials": {category: "policy", chain: policyChain()},
+	"user_credentials":       {category: "policy", chain: policyChain()},
+	"token_credentials":      {category: "policy", chain: policyChain()},
 
 	// Auth factor/code tables — per-table converging rules, then fail-to-human.
 	"user_2fa": {category: "auth", chain: []tieRule{

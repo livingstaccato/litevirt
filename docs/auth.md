@@ -435,13 +435,19 @@ it to impersonate a user.
 
 `GetStateDump` and `StreamStateDump` return the full replication dump, the
 representation anti-entropy repair merges, and `StreamTableDump` returns the
-same representation restricted to named tables. The dump is unredacted, so it
-carries the secret columns of replicated tables: `hosts.ipmi_pass`,
-`users.password_hash` and `tokens.token_hash`. Only a **peer** or **local-root**
-caller (a cluster host certificate) can read any of the three. An operator or
-admin bearer, a session, and the `lv-cli` client certificate are all refused
-with `PermissionDenied`, whatever their role. `StreamTableDump` never serves a
-table of the sensitive lane below; naming one is refused with `InvalidArgument`.
+same representation restricted to named tables. It is unredacted, so it carries
+the secret columns of replicated tables: `hosts.ipmi_pass`,
+`users.password_hash` and `tokens.token_hash` — until every host runs a build
+carrying the `credentials_split_v1` capability. Then each host moves those
+secrets into `host_fence_credentials`, `user_credentials` and
+`token_credentials`, which only the sensitive lane below carries, and clears the
+three columns. From then on the state dump carries no secret (see
+[upgrades.md](upgrades.md#secrets-move-to-the-sensitive-lane-after-the-roll)).
+All three RPCs stay peer-only regardless: only a **peer** or **local-root**
+caller (a cluster host certificate) can read them. An operator or admin bearer,
+a session, and the `lv-cli` client certificate are all refused with
+`PermissionDenied`, whatever their role. `StreamTableDump` never serves a table
+of the sensitive lane below; naming one is refused with `InvalidArgument`.
 The secret-bearing tables (`StreamSensitiveStateDump`, `GetSensitiveStateDigest`)
 are narrower still: peer only, and the certificate must name the sender.
 

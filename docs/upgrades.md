@@ -482,6 +482,59 @@ lv host upgrade <host> --binary <new> --force --yes
 Only force after confirming the finding is a false positive (e.g. a fence
 record from minutes ago for a host that's actually healthy).
 
+### Secrets move to the sensitive lane after the roll
+
+Three secrets used to live only in columns of public inventory tables:
+`hosts.ipmi_pass`, `users.password_hash` and `tokens.token_hash`. Schema v56
+adds three tables that only the peer-only sensitive lane carries —
+`host_fence_credentials`, `user_credentials` and `token_credentials` — and the
+secrets move into them **on their own, after the last host has upgraded**. No
+flag starts it; the `credentials_split_v1` capability token does.
+
+The ordering is fixed by what a host still on the previous release can do. It
+cannot decode a statement on a credential table (the apply fails closed and its
+replication stream stalls), and it reads a secret from the old column and
+nowhere else. So while any host the cluster replicates to — including one
+parked in `maintenance` — runs the previous release:
+
+- nothing is written to the credential tables;
+- every password change, token and IPMI password is written to the old column,
+  exactly as before, so every host fences, logs in and validates tokens the way
+  it did.
+
+`credentials_split_v1` is mandatory and replication-gated: it latches only once
+every memberlist member advertises it. From then on, on each host:
+
+- every writer writes the credential table in the same batch as the public row,
+  and writes an empty old column;
+- a pass that runs at start and every minute copies any old-column secret into
+  the credential table and **clears the old column**, in one batch. The clears
+  replicate like any other write, so once every host has run a pass no public
+  row — and no operator-safe state dump — carries a secret.
+
+Until a host's first complete pass, its readers take the credential row but
+fall back to the old column where the credential row is missing, or holds a
+different value on an older row than the public one. After that pass they read
+the credential tables only.
+
+Latches form per host, so for a few seconds after one host latches its
+neighbour may not have yet. A password or IPMI change made through that
+neighbour in that window goes to the old column. The latched host's next pass,
+within a minute, carries it across. Until then the latched host still serves the
+previous value.
+
+**Clearing is one-way.** After it, a build that reads only the old columns has
+nothing to read: rolled back to the previous release, a host loses every IPMI
+password, local login and API token, and cannot decode the credential tables'
+replication either. The startup rollback preflight refuses to start a binary
+that does not know a token this host has already latched, but only for a binary
+that carries that preflight. Roll forward, or reseed the host from a peer.
+
+Until the token latches, `litevirt_ha_degraded{reason="capability_rollout_pending"}`
+is set, as it is for every mandatory token mid-roll. If it stays set after the
+roll, a host is still on the previous release — most often one in
+`maintenance`.
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

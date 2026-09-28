@@ -72,6 +72,11 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// which no operator should be able to misreport. See its comment in
 		// internal/capabilities.
 		capabilities.LeaseTermLedgerV1: true,
+		// credentials_split_v1 is flag-less for the same reason: "this build
+		// decodes the credential tables and reads a secret from them". A flag
+		// would keep it from ever being driven, and the secrets would stay in
+		// the public dump.
+		capabilities.CredentialsSplitV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

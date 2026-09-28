@@ -910,9 +910,28 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	if provided == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no fields to update")
 	}
-	args = append(args, s.db.NowTS(), req.Name)
+	now := s.db.NowTS()
+	args = append(args, now, req.Name)
 
-	if err := s.db.Execute(ctx, configureHostSQL, args...); err != nil {
+	// Once credentials_split_v1 has latched, a supplied IPMI password is
+	// written to the host's sensitive-lane credential row instead, in the same
+	// batch and under the same updated_at. Before the latch no node may write that
+	// table (a previous-release peer cannot decode it), so the password goes
+	// to hosts.ipmi_pass alone, as it always did.
+	// err is reused from the host lookup above.
+	if req.IpmiPass != "" && s.db.MayWriteCredentialTables() {
+		// After the latch the public row's column gets '', not the password:
+		// no replication recipient reads it any more, and COALESCE('', col)
+		// clears whatever an earlier write left there.
+		args[3] = ""
+		err = s.db.ExecuteBatch(ctx, []corrosion.Statement{
+			{SQL: configureHostSQL, Params: args},
+			{SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}},
+		})
+	} else {
+		err = s.db.Execute(ctx, configureHostSQL, args...)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "update host config: %v", err)
 	}
 

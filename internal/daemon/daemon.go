@@ -556,6 +556,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 
 	d.wireLeaseTermLedgerGate()
+	d.wireCredentialsSplitGate()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag, for the same reason as
@@ -576,6 +577,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// real history, and every row in the gap became a permanent finding on every
 	// node the moment anti-entropy delivered it.
 	go d.finishAuditKeyLifecycle(ctx)
+
+	// Move the secret columns onto the sensitive lane once credentials_split_v1
+	// has durably latched. Inert until then; see corrosion.SplitCredentials.
+	go d.runCredentialsSplit(ctx)
 
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
@@ -2279,6 +2284,57 @@ func (d *Daemon) metricsAddrForBanner() string {
 // mid-roll — the same signature as a starved latch. Deleting this call left the
 // corrosion, grpcapi and daemon suites all green, because every test injects the
 // gate directly and the test constructors hardcode it open.
+// wireCredentialsSplitGate lets corrosion write the sensitive credential
+// tables only once credentials_split_v1 is DURABLY latched.
+//
+// Their statement shapes are the first those tables ever had, so a write
+// before the latch back-pressures a previous-release peer's replication
+// stream. No config flag: the split begins on its own once the roll completes.
+// Unwired, the gate fails closed and every secret stays in its old column,
+// which is the previous release's behaviour.
+func (d *Daemon) wireCredentialsSplitGate() {
+	d.db.SetCredentialsSplitGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.CredentialsSplitV1)
+	})
+}
+
+// CredentialsSplitLatchedOnDisk is the credentials_split_v1 gate for a process
+// that is NOT the daemon — `lv user reset-admin` opens the local database
+// directly and has no health checker to ask. It reads the same durable
+// activation marker Checker.DurablyLatched is backed by, so the CLI writes the
+// credential table exactly when the daemon on that node would.
+func CredentialsSplitLatchedOnDisk(dataDir string) func() bool {
+	path := filepath.Join(dataDir, activationMarkerPrefix+"."+capabilities.CredentialsSplitV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+}
+
+// credentialsSplitInterval is how often the daemon re-runs the credentials
+// split. Each pass is a few indexed reads when there is nothing to do.
+const credentialsSplitInterval = time.Minute
+
+// runCredentialsSplit runs corrosion.SplitCredentials at start and then every
+// credentialsSplitInterval. Every pass is a no-op until the gate opens, and
+// idempotent after.
+func (d *Daemon) runCredentialsSplit(ctx context.Context) {
+	t := time.NewTicker(credentialsSplitInterval)
+	defer t.Stop()
+	for {
+		if rep, err := d.db.SplitCredentials(ctx); err != nil {
+			slog.Warn("credentials split: pass failed", "error", err)
+		} else if rep.Copied > 0 {
+			slog.Info("credentials split: copied secrets onto the sensitive lane", "copied", rep.Copied)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)

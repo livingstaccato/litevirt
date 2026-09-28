@@ -831,6 +831,13 @@ func (s *Server) advertisedCapabilities() []string {
 	// The gap withholding WOULD close — a latched token proving config uniformity
 	// — is reported directly by `lv doctor fence` instead, which asks each host
 	// for its own posture. See TestAdvertise_SharedStorageFenceIsUnconditional.
+	// credentials_split_v1 is deliberately NOT withheld here either. It is a
+	// fact about the build — this binary decodes the credential tables and
+	// reads a secret from them first — so there is nothing a flag could
+	// truthfully withhold, and the guarantee it licenses (clearing the old
+	// columns) is enforced by the latch itself, which is ReplicationGated and so
+	// cannot form while any replication recipient is on a build that reads the
+	// old columns only.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1196,6 +1203,12 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
+	case capabilities.CredentialsSplitV1:
+		// No kill switch, for the lease_term_ledger_v1 reason: the token says
+		// this build decodes the credential tables' shapes and reads a secret
+		// from them — a fact about the binary. A flag-gated token would never be
+		// driven, never latch, and leave the secrets in the public dump.
+		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
 	case capabilities.IsolationEpochV1:

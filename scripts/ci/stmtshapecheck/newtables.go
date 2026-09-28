@@ -125,6 +125,28 @@ var firstShapeAcks = map[string]string{
 		"Pre-latch the lease still transfers through the bare leader_election upsert, whose " +
 		"shape predates this release, so nothing but the term waits on the roll. A subsequent " +
 		"downgrade below the latch is the isolation-epoch case (schema v49), not this guard's",
+	"host_fence_credentials": "every writer (grpcapi ConfigureHost and corrosion.SplitCredentials) checks " +
+		"Client.MayWriteCredentialTables first and writes only the parent row, in its previous-release " +
+		"shape, while it is false. The gate is DurablyLatched(credentials_split_v1) — mandatory, so " +
+		"advertised by every build carrying these tables and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
+		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
+		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
+	"user_credentials": "every writer (InsertUser, UpdateUserPassword, ReinstateAdminIfNoneRemain " +
+		"and corrosion.SplitCredentials) checks " +
+		"Client.MayWriteCredentialTables first and writes only the parent row, in its previous-release " +
+		"shape, while it is false. The gate is DurablyLatched(credentials_split_v1) — mandatory, so " +
+		"advertised by every build carrying these tables and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
+		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
+		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
+	"token_credentials": "every writer (InsertToken and corrosion.SplitCredentials) checks " +
+		"Client.MayWriteCredentialTables first and writes only the parent row, in its previous-release " +
+		"shape, while it is false. The gate is DurablyLatched(credentials_split_v1) — mandatory, so " +
+		"advertised by every build carrying these tables and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
+		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
+		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
 }
 
 // tableShape is one builder statement reduced to what this guard decides on.

@@ -236,6 +236,9 @@ The new password is written to /etc/litevirt/admin-password.`,
 				return fmt.Errorf("connect to corrosion: %w", err)
 			}
 			defer db.Close()
+			// Write user_credentials too once this node has latched
+			// credentials_split_v1, as the daemon would.
+			db.SetCredentialsSplitGate(daemon.CredentialsSplitLatchedOnDisk(cfg.DataDir))
 
 			ctx := cmd.Context()
 

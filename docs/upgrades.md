@@ -664,6 +664,24 @@ again loses nothing. Roll forward.
 Retiring the `hosts` copy is a later release's step, behind a second token; see
 [design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
 
+### Region-scoped failover needs every host upgraded
+
+Schema v58 adds `cluster_policies`, a replicated table holding the
+cluster-wide failover scope (`lv cluster failover-scope`). A host on the
+previous release cannot decode a statement on it, and its failover
+coordinator would not honour the policy if it held the lease. So
+`lv cluster failover-scope region` refuses until the `failover_scope_v1`
+capability token has latched, which it does on its own once every host the
+cluster replicates to — including one parked in `maintenance` — runs this
+release. Nothing is written to the table before then, and the scope stays
+`cluster`, exactly as before.
+
+`failover_scope_v1` is mandatory and replication-gated, like
+`host_membership_split_v1`. It has no flag: the policy row is the opt-in, and
+`lv cluster failover-scope cluster` is the stand-down. A binary rolled back
+below the latched token enters WAL quarantine, as below every latched token.
+Roll forward.
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

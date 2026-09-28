@@ -116,7 +116,9 @@ of acting — it says nothing about whether the resulting rows have replicated.
   observers report `consecutive_failures ≥ 5` for it (where N is the voter
   set: every host not `offline`, `maintenance` or `fenced`, witnesses
   included, in every region). Stale observer rows (older than 30 s) are
-  excluded.
+  excluded. Under region-scoped failover (`lv cluster failover-scope region`)
+  N and the observers are the host's own region's voters instead; see
+  "A site partition" below.
 - **Leader-gated recovery — best-effort, not exclusive.** The lease is a CRDT
   row with a 45 s TTL, re-validated before every destructive action. A CRDT row
   store cannot offer linearisable compare-and-swap across a partition, so the
@@ -703,10 +705,10 @@ leadership churn or a partition.
   lv host config witness-1 --role witness
   ```
 
-### A site partition is a majority/minority split of one cluster
-- Region is a placement label, not an HA boundary. Quorum, gossip and health
-  probes span every region, and failover picks its targets from every `active`
-  host in the cluster. So when the link between two sites fails, the site
+### A site partition is a majority/minority split of one cluster (by default)
+- Under the default failover scope (`cluster`), region is a placement label,
+  not an HA boundary. Quorum, gossip and health probes span every region, and
+  failover picks its targets from every `active` host in the cluster. So when the link between two sites fails, the site
   holding a majority of voters fences the other site's hosts and reschedules
   their workloads onto itself, across the WAN, even though the other site may
   be alive. The minority site stalls. It fences and reschedules nothing, and
@@ -718,10 +720,24 @@ leadership churn or a partition.
   all fail closed and move nothing. `best-effort` does not: without
   `enforcement.safe_fence_default`, it reschedules VMs that are still running
   on the other side.
-- Region-scoped quorum and failover are not available. Keep an odd number of
-  voting sites, or put a witness in a third site, and pin workloads that must
-  not cross with `placement.require` on a per-site host label. See
-  [Federation](federation.md) → "Regions and failure" for the full contract.
+- Under cluster scope, keep an odd number of voting sites, or put a witness in
+  a third site, and pin workloads that must not cross with `placement.require`
+  on a per-site host label.
+- **Region-scoped failover** is the opt-in alternative:
+  `lv cluster failover-scope region`. A host is then fenced, re-admitted and
+  recovered only on a majority of its own region's voters; its host's
+  execution gate counts its own region; and recovery targets stay in its
+  region. A site partition fences nothing on either side and the minority
+  site's workloads keep running where they are. A host that really dies is
+  still fenced and recovered by its own region, **if that region has at least
+  three voters** — a region with fewer has no automatic failover while the
+  policy is on, reported by `lv cluster failover-scope` and
+  `litevirt_failover_regions_without_quorum`. VIP self-demotion and the
+  lease-term barrier still count the whole cluster. The change is refused
+  mid-roll and while any voter is unreachable. See
+  [Federation](federation.md) → "Regions and failure" for the full contract
+  and [design/region-scoped-failover.md](design/region-scoped-failover.md) for
+  the reasoning.
 
 ### NTP is required
 - All hosts must run NTP (chrony / systemd-timesyncd / ntpd). HLC tolerates
@@ -848,9 +864,10 @@ leadership churn or a partition.
   `healthFreshness`, and `leaseDuration` proportionally to avoid lease
   thrash.
 - **Multi-DC (RTT > 100 ms)**: supported in principle; tune intervals up
-  significantly. A multi-DC cluster is still one failure domain: a site
-  partition fences and reschedules across the WAN (see "A site partition is a
-  majority/minority split of one cluster" above).
+  significantly. Under the default failover scope a multi-DC cluster is still
+  one failure domain: a site partition fences and reschedules across the WAN.
+  `lv cluster failover-scope region` makes each site its own failure domain
+  (see "A site partition is a majority/minority split of one cluster" above).
 
 ### Fencing strategy
 - **Production with shared storage**: `ipmi` (mandatory). SSH and watchdog
@@ -880,6 +897,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_fence_failures_total` | rate > 0 over 5 min |
 | `litevirt_failover_leader` | sum across cluster != 1 sustained |
 | `litevirt_failover_attempts_total{result="error"}` | rate > 0 over 5 min (a failover decision hit a store/fence error) |
+| `litevirt_failover_regions_without_quorum` | `max() > 0` under region-scoped failover (a region holding workloads cannot fence its own hosts) |
 | `litevirt_mutation_log_rows` | rapidly growing (replication backlog) |
 | `litevirt_replication_min_watermark_seq` | not advancing for > 5 min |
 | `litevirt_replication_backlog_age_seconds` | > 300 s sustained |

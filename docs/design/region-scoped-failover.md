@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Proposed**. Implemented in the commits that follow this one, off by default. |
+| Status | **Implemented**, off by default. |
 | Issue | colonelpanik/litevirt#265 |
 | Base | `main` at `8cbe00bb`, schema v57 |
 | Decision | Opt-in now, as a cluster-wide replicated policy rather than per-node YAML. A default for new clusters is revisited later. |
@@ -35,7 +35,7 @@ unless the workload says otherwise (§6).
 Definitions:
 
 - `V` is `corrosion.VoterSet`: whatever set of host names it returns. This
-  design reads nothing else about voting (§8).
+  design reads nothing else about voting (§9).
 - `region(h)` is `hosts.region`, `default` when empty.
 - `V_R = { v ∈ V : region(v) = R }`, R's voters. Witnesses in R are in it.
 - `q(R) = floor(|V_R| / 2) + 1`.
@@ -260,7 +260,18 @@ for. What remains:
   own region has fenced its host but has no room, not who may decide.
   Containers have no equivalent yet (*deferred*); they always stay in region.
 
-## 7. What does not change
+## 7. Replication relays
+
+A host that is not a replication relay pushes only to relays (three by
+default). If every relay sits in one site, then during a partition the other
+site's hosts reach each other only through the leaf fallback, which starts no
+sooner than 15 seconds after the relays stop answering. Until then their
+failure reports about each other do not meet, so their own region's fence
+waits for it. The fleet scenarios make every node a relay
+(`Options.Relays`) so each side of the cut converges at once. *Deferred:*
+region-aware relay election.
+
+## 8. What does not change
 
 - Policy `cluster` (the default) is today's behaviour, code path for code
   path: `DecisionGateForRegion` is not called, `ExecutionGate` counts `V`, and
@@ -269,7 +280,7 @@ for. What remains:
   every count and every candidate set is identical.
 - Gossip and health probes still span every region.
 
-## 8. The voter set
+## 9. The voter set
 
 This design depends only on `corrosion.VoterSet`'s contract: a set of host
 names whose size is a quorum denominator and whose members' observations
@@ -290,23 +301,43 @@ Two points for that work:
   of the generation's members in R. That is a change to the claim protocol and
   is not made here.
 
-## 9. Tests
+## 10. Tests
 
-- `tests/fleet/region_scoped_failover_test.go`, five independent replicas in
-  regions `east` (3) and `west` (2), coordinators on every node, and a site
-  partition cut with per-link `Block` faults:
-  - policy `cluster`: the east majority fences both west hosts and moves the
-    west VM east. This pins today's behaviour.
-  - policy `region`: nothing is fenced on either side, and the west VM stays
-    put in every replica.
-  - policy `region`, an east host dies (with and without the partition): east
-    fences it and reschedules its VM onto the other east host, never west,
-    even when the placement scorer prefers a west host.
-  - policy `region`, a west host dies: west cannot fence it (two voters), it
-    is not fenced, and the region is reported.
-  - the command refuses while a voter is unreachable, and refuses before the
-    token latches.
-- Unit tests in `internal/health` (regional quorum and gates),
-  `internal/failover` (quorum arithmetic, too-small reporting, targets),
-  `internal/placement` (the region constraint), `internal/corrosion` (the
-  policy row) and `internal/grpcapi` (the RPC preconditions).
+- `tests/fleet/region_scoped_failover_test.go`: five independent replicas in
+  regions `east` (3) and `west` (2), coordinators on the nodes, and a site
+  partition cut with per-link `Block` faults.
+  - `SitePartition/cluster`: the east majority fences both west hosts and moves
+    the west VM east. This pins today's behaviour.
+  - `SitePartition/region`: nothing is fenced on either side, both VMs stay put
+    in every replica, and east reports declining (`region_too_small`, since
+    west has two voters).
+  - `DeathInsideRegion` (connected, partitioned, and both again with the
+    proof-gated decide path): an east host dies, east fences it and
+    reschedules its VM onto another east host, never west, although the
+    scorer prefers the empty west hosts. Partitioned, east holds 2 of 5
+    voters, so a cluster-wide count could recover nothing.
+  - `ContainerRelocationStaysInRegion`: the same for a container, whose target
+    comes from a different placement call. It runs on scenario-steered
+    replicas because of a pre-existing defect: on independent replicas the
+    image-recreate relocation's entry is refused by every receiver (its
+    guarded source delete is not the batch's final statement), which stalls
+    the stream on `main` whatever the scope.
+  - `TooSmallRegionIsReported`: a west host dies; the cluster scope fences it,
+    the region scope does not, reports `region_too_small`, and publishes one
+    region without quorum.
+  - `ChangeFromTheFarSide`: `region` written on the west side of an existing
+    partition never reaches east, which fences west as before. This is the
+    mid-change behaviour §5.2 describes and the reason for the reachability
+    precondition.
+- `tests/fleet/failover_scope_command_test.go`: the RPC over real gRPC with a
+  real `health.Checker` per node. Refused before `failover_scope_v1` latches
+  (nothing on the stream), refused while a voter is unreachable, then written
+  and replicated to every replica.
+- Unit tests in `internal/health` (regional quorum, the execution gate under
+  each scope, `DecisionGateForRegion`, unknown scope), `internal/failover`
+  (fence and re-admission arithmetic, a single region unaffected, unknown
+  scope, the gauge, promotion and recovery regions, a cluster-only gate
+  refused), `internal/placement` (the region constraint),
+  `internal/corrosion` (the policy row and its gate), `internal/grpcapi` (the
+  RPC preconditions, the relabel guard, the in-region promotion, dual-run
+  resolution) and `internal/daemon` (the gate wiring).

@@ -147,6 +147,15 @@ var firstShapeAcks = map[string]string{
 		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
 		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
 		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
+	"host_membership": "every writer (UpdateHostState, UpdateHostStartup, InsertHost, AdmitHost, IsolateHost, " +
+		"ClearHostIsolation and corrosion.SplitHostMembership) goes through Client.withMembershipWrite or " +
+		"checks Client.MayWriteHostMembership, and writes only the hosts columns, in their previous-release " +
+		"shapes, while it is false. The gate is the durable host_membership_split_v1 marker — mandatory, so " +
+		"advertised by every build carrying this table and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather than " +
+		"the voting members only. It fails CLOSED when unwired, so the latch cannot form while a " +
+		"previous-release peer is listening. After the latch the hosts columns are still written, in their " +
+		"previous-release shapes, in the same batch — so no new hosts shape exists at all",
 }
 
 // tableShape is one builder statement reduced to what this guard decides on.

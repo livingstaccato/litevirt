@@ -309,6 +309,12 @@ var tableNames = []string{
 	// must re-learn its peers' published values rather than conclude they
 	// published nothing. Host-owned (host_name PK, only that host writes it).
 	"netbox_host_config",
+	// v57 host membership — state and isolation on a row of their own, so they
+	// stop sharing the hosts row's clock. The voting roster and the isolation
+	// regime are read from it, so a node that missed a write must be repaired
+	// here like any other cluster fact. Nothing secret. Written only once
+	// host_membership_split_v1 has latched (host_membership.go).
+	"host_membership",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS

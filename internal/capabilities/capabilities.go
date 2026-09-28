@@ -133,6 +133,41 @@ const (
 	// stored, not a policy.
 	CredentialsSplitV1 = "credentials_split_v1"
 
+	// HostMembershipSplitV1 gates moving a host's coordinator-owned membership
+	// facts — hosts.state and hosts.isolation_epoch/isolation_reason — out of
+	// the shared `hosts` row into host_membership, a row of their own with its
+	// own LWW clock (colonelpanik/litevirt#267). While they shared the hosts
+	// row, a coordinator marking a host fenced and that host's daemon
+	// reporting its version were two writes under ONE updated_at, so whichever
+	// a replica applied second could be refused as older and lost.
+	//
+	// It states two facts about the BINARY, which is why it is mandatory and has
+	// no config flag:
+	//
+	//   - it can DECODE host_membership's statement shapes. They are the first
+	//     replicated shapes that table ever had, and an unregistered shape
+	//     back-pressures a previous-release peer: its apply fails closed, the
+	//     batch rolls back and its watermark stalls. So nothing writes
+	//     host_membership until this token has latched.
+	//   - it READS state and isolation from host_membership first. Once
+	//     latched, every state and isolation change is written to BOTH
+	//     host_membership and the old hosts columns, in one batch — the old
+	//     columns in their previous-release shapes, so a host rolled back one
+	//     release still reads every change. Nothing clears them in this
+	//     release; that is a later release's step behind a second token.
+	//
+	// The decode claim must hold of every host this node REPLICATES TO, not
+	// merely of every host that votes, so the token is in replicationGated. A
+	// host parked in `maintenance` on the old build does not vote, but it still
+	// receives every statement, and a host_membership statement stalls its
+	// stream.
+	//
+	// A flag would be worse than useless, for the credentials_split_v1 reason:
+	// driveCapabilityLatches skips an unlatched token whose flag is off, so a
+	// flag-gated split would never latch and the lost updates would stay. The
+	// split changes where a fact is stored, not a policy.
+	HostMembershipSplitV1 = "host_membership_split_v1"
+
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
 	// minted it, and an executor refuses a proof whose term is below the
@@ -537,6 +572,15 @@ const (
 //     clearing the old columns — is deliberately NOT in this release; it
 //     comes with a second token in a later one
 //     (docs/design/credentials-clear.md).
+//
+//   - host_membership_split_v1 has no stand-down either, and needs none to be
+//     rollback-safe: once it latches, state and isolation are written to both
+//     host_membership and the old hosts columns, so a host rolled back one
+//     release reads current values from the columns it knows. What such a host
+//     cannot do is decode host_membership's statements — the latched nodes
+//     keep emitting them and its inbound stream stalls, as for
+//     lease_term_ledger_v1. Roll forward. The startup rollback preflight
+//     refuses such a binary if it carries the preflight.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -592,6 +636,10 @@ var supported = []string{
 	// be able to misreport, and a flag would keep the latch from forming on a
 	// fully rolled fleet.
 	CredentialsSplitV1,
+	// HostMembershipSplitV1 is advertised UNCONDITIONALLY, for the same reason:
+	// it says "this build decodes host_membership's statement shapes and reads
+	// state and isolation from it", a fact about the binary.
+	HostMembershipSplitV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
 	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
@@ -610,7 +658,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -655,6 +703,10 @@ var replicationGated = map[string]bool{
 	// a maintenance host on the previous build still receives every statement.
 	// (The old-column clear that also needs this is a later release's token.)
 	CredentialsSplitV1: true,
+	// Confirmed against every replication recipient: host_membership's shapes
+	// must be decodable by every host we stream to, a maintenance host on the
+	// previous build included.
+	HostMembershipSplitV1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -686,6 +738,9 @@ var mandatory = map[string]bool{
 	// not a policy. See CredentialsSplitV1 for why a flag would leave the
 	// secrets in the public dump forever.
 	CredentialsSplitV1: true,
+	// A fact about the binary (it decodes and reads host_membership), not a
+	// policy. See HostMembershipSplitV1.
+	HostMembershipSplitV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

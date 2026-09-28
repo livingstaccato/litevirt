@@ -302,10 +302,8 @@ func (s *Server) autoDefineRestoredVM(
 		_ = s.virt.UndefineDomain(targetName, false)
 		return "", "", status.Errorf(codes.Internal, "start domain: %v", err)
 	}
-	_ = send(&pb.RestoreLiveProgress{
-		Phase: pb.RestoreLiveProgress_STARTED, VmName: targetName,
-		TargetPath: overlayPath, Status: "VM started off overlay",
-	})
+	// STARTED is sent further down, once the row is committed and published: a
+	// client acts on it, and the fence below can still tear this domain down.
 
 	// FENCE, immediately before the durable write (see allowCommit). Firmware
 	// materialisation, define, hardware prepare, and the start off the overlay
@@ -370,6 +368,14 @@ func (s *Server) autoDefineRestoredVM(
 		// this path, so an unguarded call would act on a row that does not exist.
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	}
+	// Only now: the fence has passed and the row is in the cluster, published
+	// running unless assignOwnerEpochAtCreate left it "creating" for the
+	// reconciler. Sent earlier, a client could read no row at all, or be told
+	// a VM had started that the fence then destroyed.
+	_ = send(&pb.RestoreLiveProgress{
+		Phase: pb.RestoreLiveProgress_STARTED, VmName: targetName,
+		TargetPath: overlayPath, Status: "VM started off overlay",
+	})
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
 	return targetName, rootDev, nil

@@ -72,15 +72,29 @@ func isLive(s pki.GossipKeyringState, present bool) bool {
 	return present && s.Mode != "off" && s.Mode != ""
 }
 
+// describeLive says what a host's gossip is doing on the wire, from its stage.
+// The state file's primary is the keyring's first key at every stage but off —
+// install included, where the host holds it but still SENDS PLAINTEXT — so the
+// sending half comes from the stage, never from the presence of a primary
+// (colonelpanik/litevirt#259). The stage table is corrosion/gossip_keyring.go's.
 func describeLive(s pki.GossipKeyringState, present bool) string {
+	keys := strings.Join(s.Keys, ",")
 	switch {
 	case !present:
 		return "no state file (daemon not running this build, or not started)"
 	case s.Mode == "off":
 		return "off (gossip plaintext; key file ignored)"
+	case s.Mode == "install":
+		return fmt.Sprintf("install, sending plaintext, accepting plaintext and %s, %d rejected", keys, s.Rejected)
+	case s.Mode == "staged":
+		return fmt.Sprintf("staged, encrypting with %s, accepting plaintext and %s, %d rejected", s.Primary, keys, s.Rejected)
+	case s.Mode == "enforced":
+		return fmt.Sprintf("enforced, encrypting with %s, accepting only %s, %d rejected", s.Primary, keys, s.Rejected)
 	default:
-		return fmt.Sprintf("%s, encrypting with %s, accepting %s, %d rejected",
-			s.Mode, s.Primary, strings.Join(s.Keys, ","), s.Rejected)
+		// A stage this CLI does not know (a newer daemon): report the file,
+		// claim nothing about the wire.
+		return fmt.Sprintf("%s (stage unknown to this lv), primary key %s, keys %s, %d rejected",
+			s.Mode, s.Primary, keys, s.Rejected)
 	}
 }
 

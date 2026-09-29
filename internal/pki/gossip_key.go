@@ -161,7 +161,10 @@ type GossipKeyringState struct {
 	// Mode is the node's enforcement.gossip_encryption stage: off, install,
 	// staged or enforced.
 	Mode string
-	// Primary is the ID of the key this node encrypts with; empty when off.
+	// Primary is the ID of the keyring's primary key — the one memberlist
+	// encrypts with WHEN the stage sends encrypted (staged, enforced). At
+	// install the node holds it and still sends plaintext, so Primary alone
+	// never means "encrypting": that is the stage's to say. Empty when off.
 	Primary string
 	// Keys are the IDs of every key this node decrypts with, primary first.
 	Keys []string

@@ -398,3 +398,72 @@ func TestInstallGossipKey_NeverReplacesAHostsKey(t *testing.T) {
 		t.Fatal("a refused install still wrote a local key")
 	}
 }
+
+// ─── status wording ─────────────────────────────────────────────────────────
+
+// TestDescribeLive_SaysWhatEachStageSends pins that every stage's status line
+// is true about the wire (colonelpanik/litevirt#259). The state file's primary
+// is the keyring's first key at every stage but off, including install — where
+// the node holds it and does NOT send with it. So the line must be built from
+// the stage, not from the presence of a primary: "install, encrypting with"
+// told an operator mid-rollout that plaintext gossip was encrypted.
+func TestDescribeLive_SaysWhatEachStageSends(t *testing.T) {
+	k1, k2 := testKey(t), testKey(t)
+	ring := [][]byte{k1, k2}
+	id1, id2 := pki.GossipKeyID(k1), pki.GossipKeyID(k2)
+	for _, tc := range []struct {
+		mode string
+		want string
+	}{
+		{"off", "off (gossip plaintext; key file ignored)"},
+		{"install", fmt.Sprintf("install, sending plaintext, accepting plaintext and %s,%s, 3 rejected", id1, id2)},
+		{"staged", fmt.Sprintf("staged, encrypting with %s, accepting plaintext and %s,%s, 3 rejected", id1, id1, id2)},
+		{"enforced", fmt.Sprintf("enforced, encrypting with %s, accepting only %s,%s, 3 rejected", id1, id1, id2)},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			var keys [][]byte
+			if tc.mode != "off" {
+				keys = ring
+			}
+			// Round-trip through the file, as the CLI reads it over SSH.
+			s, err := pki.ParseGossipKeyringState(pki.NewGossipKeyringState(tc.mode, keys, 3).Marshal())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := describeLive(s, true); got != tc.want {
+				t.Fatalf("describeLive(%s)\n got: %s\nwant: %s", tc.mode, got, tc.want)
+			}
+		})
+	}
+
+	// A stage this CLI does not know (a newer daemon) makes no claim about
+	// what the host sends.
+	s := pki.NewGossipKeyringState("future", ring, 0)
+	if got := describeLive(s, true); strings.Contains(got, "encrypting") || strings.Contains(got, "plaintext") {
+		t.Fatalf("unknown stage described as %q: it claims what the host sends", got)
+	}
+}
+
+// TestInstallGossipKey_ReportsInstallHostsAsPlaintext is the reported line
+// itself: a re-run of install-gossip-key against hosts at stage install.
+func TestInstallGossipKey_ReportsInstallHostsAsPlaintext(t *testing.T) {
+	k := testKey(t)
+	local := writeLocal(t, [][]byte{k})
+	_, hosts := newKeyWorld(t, "install", [][]byte{k}, 0, 0)
+	var out bytes.Buffer
+	opt := fastOpts()
+	opt.Out = &out
+	if err := InstallGossipKey(context.Background(), local, hosts, opt); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(out.String(), "\n") {
+		if strings.Contains(line, "already holds") {
+			if strings.Contains(line, "encrypting") || !strings.Contains(line, "install, sending plaintext") {
+				t.Fatalf("an install-stage host is described as %q", line)
+			}
+		}
+	}
+	if !strings.Contains(out.String(), "install, sending plaintext") {
+		t.Fatalf("no host line in:\n%s", out.String())
+	}
+}

@@ -226,6 +226,10 @@ func TestFleet_VoterGenesis_AcrossALeaseHandOff(t *testing.T) {
 			t.Fatalf("%s did not take the lease; the scenario needs two lease holders", n.Name)
 		}
 	}
+	// Usually only one of them completes: the first to decide adopts
+	// generation 1 at once and then refuses the other's generation-0 Prepare,
+	// so the other writes nothing and learns generation 1 by replication.
+	// What must never happen is two different generation-1 rows.
 	c.ClearLinkFaults()
 	adoptAll(t, c, 1)
 
@@ -295,6 +299,9 @@ func TestFleet_VoterReset_DecidedAndSticky(t *testing.T) {
 		}
 	}
 	c.ClearLinkFaults()
+	// A clean cluster again, so the only thing keeping genesis from running
+	// is the reset being sticky.
+	setHostState(t, c, parked, "active")
 	clock := NewVirtualClock(time.Now().UTC())
 	cs := c.NewCoordinators(clock)
 	for i := 0; i < 3; i++ {

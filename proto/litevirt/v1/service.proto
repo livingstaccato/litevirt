@@ -1828,6 +1828,39 @@ message SignForcedVoterConfigResponse {
     string cert_pem    = 3;
     bytes  signature   = 4;
 }
+message InspectRecoveryClaimRequest {
+    string kind        = 1;   // vm | container
+    string name        = 2;
+    int64  owner_epoch = 3;   // -1 (default when unset by the CLI) = the row's current epoch
+    bool   epoch_set   = 4;
+}
+message RecoveryClaimVoterView {
+    string voter              = 1;
+    bool   reachable          = 2;
+    string error              = 3;
+    string promised           = 4;   // ballot, rendered
+    string accepted           = 5;
+    string value_digest       = 6;
+    string proof_id           = 7;
+    string dest_host          = 8;
+    string source_host        = 9;
+    string incarnation        = 10;
+    bool   incarnation_ok     = 11;
+    string last_refusal       = 12;
+    string last_refusal_detail = 13;
+    int64  adopted_generation = 14;
+}
+message RecoveryClaimAttemptView {
+    RecoveryClaimKey key = 1;
+    repeated RecoveryClaimVoterView voters = 2;
+    string decided_digest = 3;   // a digest a majority of members accepted, "" = none
+    string decided_dest   = 4;
+}
+message InspectRecoveryClaimResponse {
+    int64  generation = 1;
+    repeated RecoveryClaimAttemptView attempts = 2;
+    string detail     = 3;
+}
 message PlanDeadHostRemovalResponse {
     string host              = 1;
     bool   fenced            = 2;  // a proof-grade fence is recorded
@@ -2813,6 +2846,9 @@ service LiteVirt {
     // SignForcedVoterConfig: peer-only. A survivor checks the forced
     // generation for itself, seals the generation it replaces, and signs.
     rpc SignForcedVoterConfig(SignForcedVoterConfigRequest) returns (SignForcedVoterConfigResponse);
+    // InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
+    // member's recorded state for a workload's claim keys, and its last refusal.
+    rpc InspectRecoveryClaim(InspectRecoveryClaimRequest) returns (InspectRecoveryClaimResponse);
 
     // ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
     // GetVoterConfig reports the connected host's adopted voter generation and

@@ -1032,6 +1032,20 @@ not been removed — `lv cluster voter init --members <hosts>` proposes the
 generation by hand. Every listed member must sign. `lv cluster voter ls` shows
 the adopted generation once one exists.
 
+### Voters that cannot vote (`ha.voter.unavailable`)
+
+Evaluator `voter_config`, subject `cluster/voters`, severity warning. Written by
+the leader-lease holder. Every member of the adopted voter generation counts in
+every quorum's denominator whatever its state — there is no automatic shrink —
+so a member that is `fenced`, `offline`, in `maintenance`, removed, or
+abstaining (its claim state is a different incarnation from the one it was
+admitted with: re-imaged or reseeded) is fault tolerance the cluster does not
+have. A three-voter cluster with one fenced member needs both survivors. The
+evidence names each such member and the command that clears it:
+`lv host rm --dead <host>` for one gone for good, `lv cluster voter rm <host>`
+for one that should stay a host but stop voting, and `lv cluster voter rm`
+then `lv cluster voter add` for an abstaining one.
+
 ### A forced voter reconfiguration (`ha.voter.forced`)
 
 Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised
@@ -1066,6 +1080,12 @@ logged with every refusing voter's detail:
   does not verify here: usually `voter_configs` or `cluster_crl` replication
   lag, which clears on a later reconcile; compare `lv cluster voter ls` across
   hosts if it persists.
+
+`lv cluster claim vm/<name>` (or `container/<name>`) is where a stuck claim is
+diagnosed: per attempt and per voter it prints the promised and accepted
+ballot, the accepted value's digest, proof, destination and source, whether the
+voter's incarnation matches its entry, and its last refusal with the detail. A
+voter keeps its last refusal in memory only.
 
 ### Recovery stranded on a dead destination (`ha.claim.stranded`)
 

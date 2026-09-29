@@ -112,6 +112,24 @@ func TestFleet_RecoveryClaim_OwnerReachableFromAMajority(t *testing.T) {
 			t.Errorf("%s's refusal = %q %q, want %s naming %q", n.Name, reason, detail, corrosion.RefusalOwnerReachable, want)
 		}
 	}
+	// `lv cluster claim vm/vm-live` shows the same thing to an operator: each
+	// voter's last refusal with what it reached (§5.4).
+	insp, err := c.SelfClient(a).InspectRecoveryClaim(ctx, &pb.InspectRecoveryClaimRequest{Kind: "vm", Name: "vm-live"})
+	if err != nil || len(insp.GetAttempts()) == 0 {
+		t.Fatalf("lv cluster claim: %v %+v", err, insp)
+	}
+	for _, v := range insp.GetAttempts()[0].GetVoters() {
+		if v.GetVoter() == a.Name {
+			continue
+		}
+		want := fmt.Sprintf("%s still reaches %s", v.GetVoter(), d.Name)
+		if v.GetLastRefusal() != corrosion.RefusalOwnerReachable || !strings.Contains(v.GetLastRefusalDetail(), want) {
+			t.Errorf("lv cluster claim shows %s's refusal as %q %q, want %q", v.GetVoter(), v.GetLastRefusal(), v.GetLastRefusalDetail(), want)
+		}
+		if !v.GetReachable() || !v.GetIncarnationOk() || v.GetPromised() == "" {
+			t.Errorf("lv cluster claim's view of %s is incomplete: %+v", v.GetVoter(), v)
+		}
+	}
 	promised := voterState(t, b, key).Promised
 	before := len(refused)
 

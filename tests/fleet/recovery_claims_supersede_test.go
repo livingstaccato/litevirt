@@ -226,6 +226,14 @@ func TestFleet_RecoveryClaim_HostRmDeadSupersedesAStrandedRecovery(t *testing.T)
 	if vm := vmOn(t, a, "vm-dead"); vm.HostName != d.Name {
 		t.Fatalf("the stranded VM moved before d was removed: %+v", vm)
 	}
+	// d is fenced and still a voter: every quorum counts it, and
+	// ha.voter.unavailable says so with the command that removes it (§4.3).
+	unavail, found, err := corrosion.GetHealthCondition(ctx, a.DB, "voter_config", "ha.voter.unavailable", "cluster", "voters")
+	if err != nil || !found || unavail.Lifecycle == corrosion.ConditionResolved ||
+		!strings.Contains(unavail.Evidence, "lv host rm --dead "+d.Name) {
+		t.Fatalf("ha.voter.unavailable does not name the fenced voter %s: %+v found=%v err=%v", d.Name, unavail, found, err)
+	}
+
 	withOperatorPKI(t, a)
 	lv := c.SelfClient(a)
 	if err := cli.HostRemoveDead(ctx, lv, d.Name, false); err == nil || !strings.Contains(err.Error(), "lv host fence-confirm "+d.Name) {

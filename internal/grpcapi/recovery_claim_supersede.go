@@ -337,6 +337,7 @@ func (s *Server) RecoveryClaimHealthTick(ctx context.Context) {
 		return
 	}
 	s.applyVoterConditions(ctx)
+	s.applyVoterUnavailable(ctx)
 	if !s.RecoveryClaimEnforced(ctx) {
 		s.applyClusterCondition(ctx, claimEvaluator, condClaimStranded, claimConditionSubjct, nil, nil, "")
 		return

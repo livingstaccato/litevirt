@@ -256,7 +256,8 @@ type Coordinator struct {
 	VoterGenesis func(ctx context.Context, leaseTerm int64)
 	// ClaimHealth, when set, runs once per tick in which this coordinator
 	// holds the lease: the recovery-claim health conditions
-	// (grpcapi.Server.RecoveryClaimHealthTick — ha.claim.stranded). nil never evaluates them.
+	// (grpcapi.Server.RecoveryClaimHealthTick — ha.claim.stranded,
+	// ha.voter.unavailable). nil never evaluates them.
 	ClaimHealth func(ctx context.Context)
 	// Claimer decides recovery claims (docs/design/recovery-claims.md §3.13):
 	// *grpcapi.Server, whose proposer reaches every member of the adopted

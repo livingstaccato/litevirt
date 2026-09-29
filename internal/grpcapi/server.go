@@ -326,6 +326,9 @@ type Server struct {
 	// forced records forced voter generations this node refused to adopt
 	// (voter_force.go), for ha.voter.forced.
 	forced forcedConflicts
+	// abstain caches each voter's abstention check for ha.voter.unavailable
+	// (recovery_claim_inspect.go).
+	abstain abstainCache
 	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
 	// and the token latched, this node refuses replication from an isolated host.
 	enfIsolationEpoch bool

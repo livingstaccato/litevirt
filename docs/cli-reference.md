@@ -59,6 +59,8 @@ lv cluster voter force-reconfigure --lost a,b [--dry-run] [--yes]
                                    # Break-glass for a generation whose majority is gone for good:
                                    #   every named member fenced proof-grade, refused while a majority
                                    #   is reachable; audited, raises ha.voter.forced (§4.6 of the design)
+lv cluster claim <kind>/<name> [--epoch N]   # Every voter's recorded state for a vm/container recovery
+                                   #   claim: ballots, value, destination, source, last refusal
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 ```
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/metrics"
 	"github.com/litevirt/litevirt/internal/notify"
 )
@@ -138,7 +139,23 @@ func (s *Server) resolveGateValid(ctx context.Context) bool {
 	if s.gate == nil {
 		return true
 	}
-	return s.gate.ExecutionGate(ctx).OK
+	if !s.gate.ExecutionGate(ctx).OK {
+		return false
+	}
+	// Under region-scoped failover the execution gate passes on this host's
+	// region's quorum alone, and a region cannot promise the rest of the
+	// cluster is clean. Absence is a cluster-wide claim, so it needs the
+	// cluster-wide proof as well. Under cluster scope the execution gate
+	// already is that proof. A policy that cannot be read fails closed.
+	scope, err := corrosion.GetFailoverScope(ctx, s.db)
+	if err != nil {
+		return false
+	}
+	if scope.Region() {
+		st, _, _ := s.gate.QuorumProof(ctx)
+		return st == health.QuorumYes
+	}
+	return true
 }
 
 // applyConditionLifecycle advances every dual_run condition against this pass's

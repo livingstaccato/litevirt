@@ -32,6 +32,13 @@ type Request struct {
 	PinHost       string            // exact host name, empty = any
 	RequireLabels map[string]string // host must have all these label k/v pairs
 	AntiAffinity  []string          // VM names that must NOT be on the same host
+	// RequireRegion restricts candidates to hosts whose region is this one.
+	// Empty = any region. Set only by region-scoped failover
+	// (docs/design/region-scoped-failover.md): recovery of a workload whose
+	// host was fenced by region R's quorum stays in R. A region is a host
+	// column (hosts.region, "default" when unset), not a label, so
+	// RequireLabels cannot express it.
+	RequireRegion string
 
 	// Soft preferences — violation = lower score but not excluded
 	PreferLabels map[string]string
@@ -439,6 +446,11 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 			}
 		}
 
+		// Hard: region (region-scoped failover keeps recovery in region).
+		if req.RequireRegion != "" && hostRegion(h) != req.RequireRegion {
+			failed = append(failed, "region (host in "+hostRegion(h)+", recovery stays in "+req.RequireRegion+")")
+		}
+
 		// Hard: required labels.
 		if len(req.RequireLabels) > 0 && !labelsMatch(h.Labels, req.RequireLabels) {
 			failed = append(failed, "labels (needs "+missingLabels(h.Labels, req.RequireLabels)+")")
@@ -810,6 +822,15 @@ func missingLabels(hostLabels, required map[string]string) string {
 	}
 	sort.Strings(out)
 	return strings.Join(out, ", ")
+}
+
+// hostRegion is h's region with the same default the host reader applies, so
+// a record built without one (tests, a pre-v6 row) compares as "default".
+func hostRegion(h corrosion.HostRecord) string {
+	if h.Region == "" {
+		return "default"
+	}
+	return h.Region
 }
 
 func labelsMatch(hostLabels, required map[string]string) bool {

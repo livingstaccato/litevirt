@@ -327,6 +327,11 @@ type Client struct {
 	// Atomic because the WAL apply path reads it (absorbUnlatchedMembershipWrite)
 	// on replication goroutines that may already be running when it is set.
 	hostMembershipGate atomic.Pointer[func() bool]
+	// clusterPolicyGate, when non-nil and returning true, permits WRITING
+	// cluster_policies. Injected via SetClusterPolicyGate, wired to the durable
+	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
+	// back-pressure a previous-release peer. See cluster_policy.go.
+	clusterPolicyGate atomic.Pointer[func() bool]
 	// hostMembershipLive is set once a SplitHostMembership pass has completed
 	// with the gate open (also persisted under dataDir); from then on writers
 	// write host_membership and readers read it.

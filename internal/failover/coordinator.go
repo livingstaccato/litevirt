@@ -232,6 +232,15 @@ type Coordinator struct {
 	// onGateRefused observes gate refusals at decide sites (nil-safe; daemon wires
 	// it to litevirt_runtime_action_refused_total).
 	onGateRefused func(action, reason string)
+	// scope is this cycle's quorum rule — the failover_scope policy and the
+	// voter set with every host's region — read once at the top of run. The
+	// zero value is the cluster-wide rule, so a path reached outside run (a
+	// hand-built test) behaves exactly as before region scoping existed.
+	scope quorumView
+	// regionDeclined records, per host, the class under which region scoping
+	// last declined to fence it, so the explanation is logged once per change
+	// rather than once per poll. See noteRegionDeclined.
+	regionDeclined map[string]string
 	// SelfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
 	// waiting to reboot. A doomed node must not drive ANY failover decision during that
 	// window, even if quorum transiently returns first. Wired by the daemon from the
@@ -420,17 +429,33 @@ func (c *Coordinator) run(ctx context.Context) {
 	// observers to reach N/2+1. Tightening it further (e.g. requiring fresh
 	// self-probes) creates a bootstrap hole where a just-started coordinator
 	// has no probe rows yet and refuses to act on any failure.
-	voters, err := corrosion.VoterSet(ctx, c.db)
+	vr, err := corrosion.VoterRegions(ctx, c.db)
 	if err != nil {
 		slog.Error("failover: read voter set", "error", err)
 		c.mAttempt(PhaseQuorum, ResultError, ErrDBError)
 		return
 	}
+	voters := vr.Voters
 	if len(voters) < 1 {
 		c.mAttempt(PhaseQuorum, ResultSkipped, ErrNoQuorum)
 		return
 	}
 	quorum := len(voters)/2 + 1
+
+	// The failover scope decides whose observations count toward a decision
+	// about each host: every voter, or the host's own region's voters
+	// (docs/design/region-scoped-failover.md). Read once, so the whole cycle
+	// decides against one policy. A policy this build cannot read or does not
+	// know fails the cycle CLOSED — guessing either scope could fence what the
+	// operator meant to protect.
+	scope, err := corrosion.GetFailoverScope(ctx, c.db)
+	if err != nil {
+		slog.Error("failover: read failover scope; deciding nothing this cycle", "error", err)
+		c.mAttempt(PhaseQuorum, ResultError, ErrDBError)
+		return
+	}
+	c.scope = quorumView{region: scope.Region(), vr: vr}
+	c.publishRegionsWithoutQuorum(ctx, c.scope)
 
 	// Clear the "already handled this down-episode" flag for any host that has
 	// recovered to active. Without this, the in-memory fenced set — which is
@@ -494,6 +519,9 @@ func (c *Coordinator) run(ctx context.Context) {
 	// one-sided test, since readmitting a host is not the irreversible act.
 	futureCutoff := c.now().Add(healthFreshness)
 	freshObservers := map[string]map[string]struct{}{}
+	// clusterObservers is the cluster-wide count, kept under region scope only
+	// to report a host it would have fenced and the region count does not.
+	clusterObservers := map[string]map[string]struct{}{}
 	for _, r := range hh {
 		inst, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
 		if !ok || !inst.After(freshCutoff) {
@@ -506,7 +534,13 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 		t, o := r.String("target"), r.String("observer")
-		if !countsAsVote(voters, o, t) {
+		if c.scope.region && countsAsVote(voters, o, t) {
+			if clusterObservers[t] == nil {
+				clusterObservers[t] = map[string]struct{}{}
+			}
+			clusterObservers[t][o] = struct{}{}
+		}
+		if !countsAsVote(c.scope.voters(t), o, t) {
 			continue
 		}
 		if freshObservers[t] == nil {
@@ -520,10 +554,21 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	var candidates []fenceCandidate
 	for t, obs := range freshObservers {
-		if len(obs) >= quorum {
+		if len(obs) >= c.scope.quorum(t) {
 			candidates = append(candidates, fenceCandidate{t, len(obs)})
 		}
 	}
+	// Region scope: say so when the cluster-wide count would have fenced a
+	// host and the region count does not. Silence here would read as "nothing
+	// is down".
+	declined := map[string]bool{}
+	for t, obs := range clusterObservers {
+		if len(obs) >= quorum && len(freshObservers[t]) < c.scope.quorum(t) {
+			declined[t] = true
+			c.noteRegionDeclined(c.scope, t, len(obs), len(freshObservers[t]))
+		}
+	}
+	c.clearRegionDeclined(declined)
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].target < candidates[j].target })
 
 	for _, cand := range candidates {
@@ -632,13 +677,14 @@ func (c *Coordinator) run(ctx context.Context) {
 		// cached: the next cycle after the grace window judges afresh.
 		if c.LocalStall != nil && c.LocalStall() {
 			slog.Warn("failover: quorum reached, but this node was itself not running moments ago — deferring the fence until it has watched for a full grace window",
-				"host", target, "observers", cand.observers, "quorum", quorum, "grace", health.StallGrace)
+				"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target), "grace", health.StallGrace)
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrLocalStall)
 			continue
 		}
 
 		slog.Warn("failover: quorum reached — host exceeded failure threshold",
-			"host", target, "observers", cand.observers, "quorum", quorum)
+			"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target),
+			"region_scoped", c.scope.region)
 
 		c.failover(ctx, h)
 	}
@@ -647,7 +693,7 @@ func (c *Coordinator) run(ctx context.Context) {
 	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
 	// it's healthy again. A transient drop (a daemon restart, a brief blip) must
 	// self-heal — otherwise health reconverges in seconds but hosts.state sticks.
-	c.recoverHosts(ctx, voters, quorum)
+	c.recoverHosts(ctx, c.scope)
 
 	// Settle any relocate-restore markers left by an indeterminate restore or a
 	// coordinator crash mid-restore. This runs every cycle, independent of the
@@ -681,7 +727,10 @@ func (c *Coordinator) run(ctx context.Context) {
 // Nothing durable is lost by clearing. strandedWorkloads holds no state between
 // cycles — it re-derives the count from hosts/vms/containers — so the new
 // leader's first pass republishes the true value within one poll interval.
-func (c *Coordinator) stepDownGauges() { c.mStranded(0) }
+func (c *Coordinator) stepDownGauges() {
+	c.mStranded(0)
+	c.mRegionsWithoutQuorum(0)
+}
 
 // resolvePendingRelocations re-derives every relocate-restore marker in the
 // cluster (a container left "relocating" by an indeterminate restore or a crash),
@@ -695,7 +744,11 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 	// quorum, manufacturing the two-row split Phase 6 exists to repair (execution on the
 	// target is still ExecutionGate-blocked, so no double-run — but the DB ownership
 	// diverges). Once enforced, require DecisionGate (quorum + coordinator-eligible).
-	if c.gateEnforced(ctx) {
+	//
+	// Under region scope the gate is per container: the quorum that may settle
+	// a relocation is the source host's region's.
+	enforced := c.gateEnforced(ctx)
+	if enforced && !c.scope.region {
 		if g := c.Gate.DecisionGate(ctx); !g.OK {
 			c.noteGateRefused(ActionRelocate, g.Reason)
 			return
@@ -709,6 +762,12 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 		target, token, restoring := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail)
 		if !restoring {
 			continue
+		}
+		if enforced && c.scope.region {
+			if g := c.decideGate(ctx, ct.HostName); !g.OK {
+				c.noteGateRefused(ActionRelocate, g.Reason)
+				continue
+			}
 		}
 		src, err := corrosion.GetHost(ctx, c.db, ct.HostName)
 		if err != nil || src == nil {
@@ -736,8 +795,9 @@ func (c *Coordinator) resolvePendingRelocations(ctx context.Context) {
 //   - 'maintenance'/'draining': operator intent, never auto-cleared.
 //
 // Only a voter other than the host itself counts toward the recovery quorum,
-// the same rule as the fence quorum (see countsAsVote).
-func (c *Coordinator) recoverHosts(ctx context.Context, voters map[string]bool, quorum int) {
+// the same rule as the fence quorum (see countsAsVote). Under region scope the
+// voters are the host's own region's, the same population that may fence it.
+func (c *Coordinator) recoverHosts(ctx context.Context, q quorumView) {
 	hosts, err := corrosion.ListHosts(ctx, c.db)
 	if err != nil {
 		slog.Error("failover: list hosts for recovery", "error", err)
@@ -776,6 +836,7 @@ func (c *Coordinator) recoverHosts(ctx context.Context, voters map[string]bool, 
 			continue
 		}
 		fresh := map[string]struct{}{}
+		voters, quorum := q.voters(h.Name), q.quorum(h.Name)
 		for _, r := range rows {
 			o := r.String("observer")
 			if !countsAsVote(voters, o, h.Name) {
@@ -1425,7 +1486,7 @@ func (c *Coordinator) resumeFromConfirmation(ctx context.Context, target string)
 	// Decide-site gate, as at every other point that asserts runtime ownership:
 	// the lease alone can be held on both sides of a partition.
 	if c.gateEnforced(ctx) {
-		if g := c.Gate.DecisionGate(ctx); !g.OK {
+		if g := c.decideGate(ctx, target); !g.OK {
 			slog.Warn("failover: decision gate refused a confirmation resume", "host", target, "reason", g.Reason)
 			c.noteGateRefused(ActionReschedule, g.Reason)
 			c.mAttempt(PhaseRecovery, ResultRefused, ErrNoQuorum)
@@ -1945,7 +2006,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			// execute-side proof (metadata-carried, single-use) is the remaining
 			// direct-RPC closeout. Fail-open until cluster-wide.
 			if c.gateEnforced(ctx) {
-				if g := c.Gate.DecisionGate(ctx); !g.OK {
+				if g := c.decideGate(ctx, h.Name); !g.OK {
 					slog.Warn("failover: decision gate refused auto-promote", "vm", vm.Name, "reason", g.Reason)
 					c.noteGateRefused(corrosion.ActionPromote, g.Reason)
 					c.mVM(ActionPromote, ResultError, ErrNoQuorum)
@@ -1971,7 +2032,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.noteLeaseTermRefusal(ctx, "vm", vm.Name, h.Name)
 				continue
 			}
-			if err := c.Promoter.AutoPromoteReplica(ctx, vm.Name, fenceEpoch, promoteTerm); err != nil {
+			if err := c.autoPromote(ctx, h, vm, fenceEpoch, promoteTerm); err != nil {
 				// Fall through to the reschedule path on ANY promote error, including a
 				// retryable Unavailable (e.g. the fence_epoch fencing_log row hasn't
 				// replicated to the replica host yet). This is NOT a downgrade to a
@@ -2015,6 +2076,10 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 
 		if targetName == "" {
 			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity)
+			// Region scope keeps the recovery in the fenced host's region, as a
+			// hard constraint: a VM no host there can hold stays put, loudly,
+			// like any other unsatisfiable constraint.
+			req.RequireRegion = c.vmRecoveryRegion(h.Name, vm)
 			placementReqs = append(placementReqs, req)
 			plans = append(plans, failoverPlan{vm: vm, needsPlacement: true})
 			continue
@@ -2118,7 +2183,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			// the lease is already held in this failover path) as close to the write as
 			// possible, then write a durable proof linked to the pending transition so
 			// the target's reconciler can validate + single-use-claim it before starting.
-			if g := c.Gate.DecisionGate(ctx); !g.OK {
+			if g := c.decideGate(ctx, h.Name); !g.OK {
 				slog.Warn("failover: decision gate refused reschedule", "vm", vm.Name, "reason", g.Reason)
 				c.noteGateRefused(ActionReschedule, g.Reason)
 				c.mVM(ActionReschedule, ResultError, ErrNoQuorum)
@@ -2134,7 +2199,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.mVM(ActionReschedule, ResultError, ErrDestUngated)
 				continue
 			}
-			_, live, needed := c.Gate.QuorumProof(ctx)
+			live, needed := c.proofQuorum(ctx, h.Name)
 			// The fencing term of THIS tenure, taken from what the coordinator
 			// recorded at acquisition — never from a fresh MAX(term) read, which
 			// would let a displaced holder adopt the winner's term.
@@ -2206,7 +2271,7 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 	// before relocating any container off the fenced host — an isolated minority
 	// coordinator must not initiate relocation. Fail-open until cluster-wide.
 	if c.gateEnforced(ctx) {
-		if g := c.Gate.DecisionGate(ctx); !g.OK {
+		if g := c.decideGate(ctx, h.Name); !g.OK {
 			slog.Warn("failover: decision gate refused container relocation", "host", h.Name, "reason", g.Reason)
 			c.noteGateRefused(corrosion.ActionRelocate, g.Reason)
 			c.mCt(ActionRelocate, ResultError, ErrNoQuorum)
@@ -2496,6 +2561,8 @@ func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.Cont
 		// and it carries no qemu overhead.
 		VMName: ct.Name, Container: true, MemMiBNeeded: ct.MemMiB,
 		Capacity: c.capacity,
+		// Region scope keeps a relocation in the source host's region.
+		RequireRegion: c.containerRecoveryRegion(ct.HostName),
 	})
 	if err != nil {
 		slog.Warn("failover: container placement failed — left for operator recovery, NOT round-robined",

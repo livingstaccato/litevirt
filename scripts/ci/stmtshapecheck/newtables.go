@@ -147,6 +147,13 @@ var firstShapeAcks = map[string]string{
 		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
 		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
 		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
+	"cluster_policies": "the only writer is corrosion.SetFailoverScope, which returns " +
+		"ErrClusterPolicyGateClosed unless Client.MayWriteClusterPolicy. The daemon wires that gate to " +
+		"DurablyLatched(failover_scope_v1) — mandatory, so advertised by every build carrying this table and " +
+		"by none that does not, and in capabilities.replicationGated, so it is confirmed against every " +
+		"memberlist recipient rather than the voting members only. It fails CLOSED when unwired, so the " +
+		"latch cannot form, and nothing is written, while a previous-release peer is listening. Its one " +
+		"caller is the operator's SetFailoverScope RPC, which refuses on the same latch first",
 	"host_membership": "every writer (UpdateHostState, UpdateHostStartup, InsertHost, AdmitHost, IsolateHost, " +
 		"ClearHostIsolation and corrosion.SplitHostMembership) goes through Client.withMembershipWrite or " +
 		"checks Client.MayWriteHostMembership, and writes only the hosts columns, in their previous-release " +

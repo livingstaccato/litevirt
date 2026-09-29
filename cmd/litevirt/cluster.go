@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -23,8 +24,89 @@ func newClusterCmd() *cobra.Command {
 		newClusterDigestCmd(),
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
+		newClusterFailoverScopeCmd(),
 	)
 	return cmd
+}
+
+// lv cluster failover-scope [cluster|region] — show or change the cluster-wide
+// failover_scope policy (docs/design/region-scoped-failover.md).
+func newClusterFailoverScopeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "failover-scope [cluster|region]",
+		Short: "Show or set whether failover quorum is cluster-wide or per region",
+		Long: `With no argument, show the failover scope and every region's voting strength.
+
+  cluster  (the default) one quorum over every voter: a host is fenced when a
+           majority of the whole cluster reports it down, and its workloads may
+           be recovered onto any active host, in any region.
+  region   a host is fenced, and its workloads recovered, only by a majority of
+           its OWN region's voters, and recovery stays in that region. A site
+           partition then leaves the far site's workloads alone instead of
+           letting the majority site fence them over the WAN.
+
+A region with fewer than three voters cannot fence one of its own hosts, so
+under region scope its hosts have no automatic failover. It is never widened to
+the cluster-wide count; the table marks it, and the
+litevirt_failover_regions_without_quorum gauge counts it. A witness counts as a
+voter of its own region.
+
+The policy is replicated and cluster-wide. Changing it needs the admin role,
+refuses until every host runs a release that honours it (failover_scope_v1),
+and refuses while any voter is unreachable from the host you are connected to,
+because a change made from one side of a partition reaches only that side.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var st *pb.FailoverScopeStatus
+				var err error
+				if len(args) == 1 {
+					st, err = c.SetFailoverScope(ctx, &pb.SetFailoverScopeRequest{Scope: args[0]})
+					if err != nil {
+						return fmt.Errorf("set failover scope: %w", err)
+					}
+				} else {
+					st, err = c.GetFailoverScope(ctx, &emptypb.Empty{})
+					if err != nil {
+						return fmt.Errorf("get failover scope: %w", err)
+					}
+				}
+				printFailoverScope(os.Stdout, st)
+				return nil
+			})
+		},
+	}
+}
+
+func printFailoverScope(out io.Writer, st *pb.FailoverScopeStatus) {
+	fmt.Fprintf(out, "Failover scope: %s\n", st.GetScope())
+	if st.GetSetBy() != "" {
+		fmt.Fprintf(out, "Set by:         %s at %s\n", st.GetSetBy(), st.GetUpdatedAt())
+	}
+	if !st.GetSettable() {
+		fmt.Fprintln(out, "Changeable:     no — failover_scope_v1 has not latched on every host yet")
+	}
+	fmt.Fprintln(out)
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "REGION\tHOSTS\tWORKERS\tVOTERS\tWITNESSES\tQUORUM\tOWN FENCING\n")
+	small := 0
+	for _, r := range st.GetRegions() {
+		own := "yes"
+		if !r.GetCanFenceOwn() {
+			own = "cannot fence its own hosts"
+			if r.GetWorkers() > 0 {
+				small++
+			}
+		}
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n", r.GetName(), r.GetHosts(), r.GetWorkers(),
+			r.GetVoters(), r.GetVotingWitnesses(), r.GetQuorum(), own)
+	}
+	w.Flush()
+	if st.GetScope() == "region" && small > 0 {
+		fmt.Fprintf(out, "\n%d region(s) above hold workloads but have fewer than three voters. Their hosts are NOT\n"+
+			"automatically fenced or recovered under region scope. Add voters (a witness counts), or\n"+
+			"run 'lv cluster failover-scope cluster'.\n", small)
+	}
 }
 
 // lv cluster acknowledge-lease-term — clear a contested lease term from the CONNECTED

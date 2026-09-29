@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -858,6 +859,31 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"host %q still has %d VM(s); drain before promoting to witness",
 					req.Name, len(vms))
+			}
+		}
+	}
+
+	// Under region-scoped failover a host's region decides whose votes may fence
+	// it, so relabelling one is a change to two regions' voter sets. Made from
+	// one side of a partition, it would let that side count hosts on the other
+	// as its own and fence them. Same precondition as changing the policy: every
+	// voter reachable. A policy that cannot be read refuses.
+	if req.Region != "" && req.Region != h.Region {
+		scope, err := corrosion.GetFailoverScope(ctx, s.db)
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot read the failover scope, so a region change cannot be shown safe: %v", err)
+		}
+		if scope.Region() {
+			missing, err := s.unreachableVoters(ctx)
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "check voters are reachable: %v", err)
+			}
+			if len(missing) > 0 {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"failover is region-scoped, so a host's region decides who may fence it, and a region "+
+						"can only be changed while every voter is reachable; %s cannot reach %s",
+					s.hostName, strings.Join(missing, ", "))
 			}
 		}
 	}

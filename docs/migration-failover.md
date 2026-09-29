@@ -525,7 +525,9 @@ Scrape `http://<host>:7444/metrics` for:
   `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`, `local_stall`). A skip is `result=skipped` with the reason in `error_class`
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`, `local_stall`,
+  and under region-scoped failover `region_too_small` / `region_scoped` — see
+  [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
@@ -535,6 +537,10 @@ Scrape `http://<host>:7444/metrics` for:
   unless the node holds the failover lease — alert on `max()` across instances, never `avg()`.
   Zero is normal; the remedy for a sustained non-zero depends on why the host is down (see
   [operating-model.md](operating-model.md))
+- `litevirt_failover_regions_without_quorum` — GAUGE: under region-scoped failover
+  (`lv cluster failover-scope region`), the regions that hold at least one worker but have fewer
+  than three voters, so cannot fence one of their own hosts. The lease holder's view, like the
+  gauge above; always `0` under the default cluster scope
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across recently-acked peers; a value that stops advancing means some peer has stopped acknowledging. It is not the compaction floor: the prune additionally skips peers whose pushes are currently failing, so it can reclaim past a seq this gauge still sits on

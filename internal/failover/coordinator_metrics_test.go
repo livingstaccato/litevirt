@@ -18,6 +18,8 @@ type fakeMetrics struct {
 	// different assertion from its value: a read failure must leave the last
 	// measured value in place rather than publish a number nobody measured.
 	strandedSets int
+	// regionsWithoutQuorum is the last RegionsWithoutQuorum value.
+	regionsWithoutQuorum int
 }
 
 func newFakeMetrics() *fakeMetrics {
@@ -30,6 +32,7 @@ func (f *fakeMetrics) Attempt(p, r, e string)         { f.attempts[foKey(p, r, e
 func (f *fakeMetrics) VMAction(a, r, e string)        { f.vm[foKey(a, r, e)]++ }
 func (f *fakeMetrics) ContainerAction(a, r, e string) { f.ct[foKey(a, r, e)]++ }
 func (f *fakeMetrics) StrandedWorkloads(n int)        { f.stranded = n; f.strandedSets++ }
+func (f *fakeMetrics) RegionsWithoutQuorum(n int)     { f.regionsWithoutQuorum = n }
 
 // TestFailoverMetrics_SkipUpgrading: a recently-'upgrading' host is skipped, and
 // that skip is observable.
@@ -283,7 +286,7 @@ func TestFailoverMetrics_RecoveryQuorumQueryErrorObservable(t *testing.T) {
 	c := newTestCoordinator("coordinator", db)
 	fm := newFakeMetrics()
 	c.Metrics = fm
-	c.recoverHosts(ctx, map[string]bool{"coordinator": true}, 1)
+	c.recoverHosts(ctx, quorumView{vr: corrosion.VoterRegionSets{Voters: map[string]bool{"coordinator": true}}})
 
 	if got := fm.attempts[foKey(PhaseRecovery, ResultError, ErrDBError)]; got != 1 {
 		t.Errorf("recovery-query-error counter = %d, want 1 (attempts=%v)", got, fm.attempts)

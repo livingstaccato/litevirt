@@ -427,7 +427,14 @@ import (
 //	     rolled back one release and are never cleared in this version. No
 //	     created_at, for the v56 reason: every node backfills the same row.
 //	     One new table.
-const CurrentSchemaVersion = 57
+//	v58: cluster-wide replicated policy — cluster_policies (key PK, value,
+//	     set_by). Its one key today is failover_scope (cluster | region, no row
+//	     = cluster): whether a host is fenced and recovered by a quorum of the
+//	     whole cluster or of its own region (colonelpanik/litevirt#265,
+//	     docs/design/region-scoped-failover.md). A previous-release node cannot
+//	     decode the table's statements, so nothing writes it until
+//	     failover_scope_v1 latches (ReplicationGated). One new table.
+const CurrentSchemaVersion = 58
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2559,6 +2566,16 @@ var schemaDDL = []string{
 		updated_at       TEXT NOT NULL,
 		deleted_at       TEXT
 	)`,
+	// v58 cluster-wide policy — one row per key, operator-written through a
+	// gRPC handler, last-writer-wins like any cluster fact. Written only once
+	// failover_scope_v1 latches; see cluster_policy.go.
+	`CREATE TABLE IF NOT EXISTS cluster_policies (
+		key        TEXT PRIMARY KEY,
+		value      TEXT NOT NULL,
+		set_by     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2746,6 +2763,7 @@ var tablePrimaryKeys = map[string][]string{
 	"user_credentials":        {"username"},
 	"token_credentials":       {"token_id"},
 	"host_membership":         {"host_name"},
+	"cluster_policies":        {"key"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -3108,6 +3126,7 @@ var createTableUnits = []struct {
 	{55, "local_term_bindings"},
 	{56, "host_fence_credentials"}, {56, "user_credentials"}, {56, "token_credentials"},
 	{57, "host_membership"},
+	{58, "cluster_policies"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

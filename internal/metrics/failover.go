@@ -13,6 +13,7 @@ type FailoverMetrics struct {
 	vmActions        *prometheus.CounterVec
 	containerActions *prometheus.CounterVec
 	stranded         prometheus.Gauge
+	regionsNoQuorum  prometheus.Gauge
 }
 
 // NewFailoverMetrics registers the failover counters on the default registry
@@ -44,13 +45,25 @@ func newFailoverMetrics(reg prometheus.Registerer) *FailoverMetrics {
 				"failover lease, so alert on max() across instances, not avg(). Zero is " +
 				"normal; sustained non-zero needs an operator.",
 		}),
+		regionsNoQuorum: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "litevirt_failover_regions_without_quorum",
+			Help: "Regions holding at least one worker but fewer than three voters, so " +
+				"unable to fence one of their own hosts while failover is region-scoped " +
+				"(lv cluster failover-scope region). Their hosts have no automatic " +
+				"failover. THIS NODE's view: 0 unless it holds the failover lease, and " +
+				"always 0 under the cluster scope.",
+		}),
 	}
-	reg.MustRegister(m.attempts, m.vmActions, m.containerActions, m.stranded)
+	reg.MustRegister(m.attempts, m.vmActions, m.containerActions, m.stranded, m.regionsNoQuorum)
 	return m
 }
 
 // StrandedWorkloads sets the stranded-workload gauge. (Satisfies failover.Metrics.)
 func (m *FailoverMetrics) StrandedWorkloads(n int) { m.stranded.Set(float64(n)) }
+
+// RegionsWithoutQuorum sets the regions-without-quorum gauge. (Satisfies
+// failover.Metrics.)
+func (m *FailoverMetrics) RegionsWithoutQuorum(n int) { m.regionsNoQuorum.Set(float64(n)) }
 
 // Attempt records a failover decision point. (Satisfies failover.Metrics.)
 func (m *FailoverMetrics) Attempt(phase, result, errorClass string) {

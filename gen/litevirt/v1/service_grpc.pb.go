@@ -240,6 +240,8 @@ const (
 	LiteVirt_ListRegions_FullMethodName                = "/litevirt.v1.LiteVirt/ListRegions"
 	LiteVirt_RegionStatus_FullMethodName               = "/litevirt.v1.LiteVirt/RegionStatus"
 	LiteVirt_CrossRegionMigrate_FullMethodName         = "/litevirt.v1.LiteVirt/CrossRegionMigrate"
+	LiteVirt_GetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/GetFailoverScope"
+	LiteVirt_SetFailoverScope_FullMethodName           = "/litevirt.v1.LiteVirt/SetFailoverScope"
 	LiteVirt_UpsertServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/UpsertServiceEndpoint"
 	LiteVirt_ListServiceEndpoints_FullMethodName       = "/litevirt.v1.LiteVirt/ListServiceEndpoints"
 	LiteVirt_DeleteServiceEndpoint_FullMethodName      = "/litevirt.v1.LiteVirt/DeleteServiceEndpoint"
@@ -620,6 +622,15 @@ type LiteVirtClient interface {
 	ListRegions(ctx context.Context, in *ListRegionsRequest, opts ...grpc.CallOption) (*ListRegionsResponse, error)
 	RegionStatus(ctx context.Context, in *RegionStatusRequest, opts ...grpc.CallOption) (*RegionStatusResponse, error)
 	CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error)
+	// GetFailoverScope reports the cluster-wide failover_scope policy as the
+	// answering host's replica holds it, with every region's voting strength.
+	// SetFailoverScope changes it (admin). With scope "region" a host is
+	// fenced and recovered only by a quorum of its own region's voters, and
+	// recovery stays in its region (docs/design/region-scoped-failover.md).
+	// SetFailoverScope refuses until failover_scope_v1 has durably latched
+	// and while any voter is unreachable from the answering host.
+	GetFailoverScope(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
+	SetFailoverScope(ctx context.Context, in *SetFailoverScopeRequest, opts ...grpc.CallOption) (*FailoverScopeStatus, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -3167,6 +3178,26 @@ func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegion
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_CrossRegionMigrateClient = grpc.ServerStreamingClient[MigrateProgress]
 
+func (c *liteVirtClient) GetFailoverScope(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FailoverScopeStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FailoverScopeStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_GetFailoverScope_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SetFailoverScope(ctx context.Context, in *SetFailoverScopeRequest, opts ...grpc.CallOption) (*FailoverScopeStatus, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(FailoverScopeStatus)
+	err := c.cc.Invoke(ctx, LiteVirt_SetFailoverScope_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) UpsertServiceEndpoint(ctx context.Context, in *UpsertServiceEndpointRequest, opts ...grpc.CallOption) (*ServiceEndpoint, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ServiceEndpoint)
@@ -3779,6 +3810,15 @@ type LiteVirtServer interface {
 	ListRegions(context.Context, *ListRegionsRequest) (*ListRegionsResponse, error)
 	RegionStatus(context.Context, *RegionStatusRequest) (*RegionStatusResponse, error)
 	CrossRegionMigrate(*CrossRegionMigrateRequest, grpc.ServerStreamingServer[MigrateProgress]) error
+	// GetFailoverScope reports the cluster-wide failover_scope policy as the
+	// answering host's replica holds it, with every region's voting strength.
+	// SetFailoverScope changes it (admin). With scope "region" a host is
+	// fenced and recovered only by a quorum of its own region's voters, and
+	// recovery stays in its region (docs/design/region-scoped-failover.md).
+	// SetFailoverScope refuses until failover_scope_v1 has durably latched
+	// and while any voter is unreachable from the answering host.
+	GetFailoverScope(context.Context, *emptypb.Empty) (*FailoverScopeStatus, error)
+	SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error)
 	// ── anycast services ──
 	// service_endpoints map a logical name (e.g. "api.litevirt.local")
 	// to N (ip, region) pairs. The embedded DNS server round-robins
@@ -4539,6 +4579,12 @@ func (UnimplementedLiteVirtServer) RegionStatus(context.Context, *RegionStatusRe
 }
 func (UnimplementedLiteVirtServer) CrossRegionMigrate(*CrossRegionMigrateRequest, grpc.ServerStreamingServer[MigrateProgress]) error {
 	return status.Error(codes.Unimplemented, "method CrossRegionMigrate not implemented")
+}
+func (UnimplementedLiteVirtServer) GetFailoverScope(context.Context, *emptypb.Empty) (*FailoverScopeStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetFailoverScope not implemented")
+}
+func (UnimplementedLiteVirtServer) SetFailoverScope(context.Context, *SetFailoverScopeRequest) (*FailoverScopeStatus, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetFailoverScope not implemented")
 }
 func (UnimplementedLiteVirtServer) UpsertServiceEndpoint(context.Context, *UpsertServiceEndpointRequest) (*ServiceEndpoint, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpsertServiceEndpoint not implemented")
@@ -8318,6 +8364,42 @@ func _LiteVirt_CrossRegionMigrate_Handler(srv interface{}, stream grpc.ServerStr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_CrossRegionMigrateServer = grpc.ServerStreamingServer[MigrateProgress]
 
+func _LiteVirt_GetFailoverScope_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(emptypb.Empty)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetFailoverScope(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetFailoverScope_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetFailoverScope(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SetFailoverScope_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetFailoverScopeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SetFailoverScope(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SetFailoverScope_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SetFailoverScope(ctx, req.(*SetFailoverScopeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_UpsertServiceEndpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(UpsertServiceEndpointRequest)
 	if err := dec(in); err != nil {
@@ -9511,6 +9593,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RegionStatus",
 			Handler:    _LiteVirt_RegionStatus_Handler,
+		},
+		{
+			MethodName: "GetFailoverScope",
+			Handler:    _LiteVirt_GetFailoverScope_Handler,
+		},
+		{
+			MethodName: "SetFailoverScope",
+			Handler:    _LiteVirt_SetFailoverScope_Handler,
 		},
 		{
 			MethodName: "UpsertServiceEndpoint",

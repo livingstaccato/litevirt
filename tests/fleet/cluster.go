@@ -120,6 +120,13 @@ type Options struct {
 	// FaultSeed seeds every link's fault PRNG (see LinkFault). The zero value
 	// is a fixed seed like any other, so runs are reproducible by default.
 	FaultSeed int64
+	// Relays sets each replicator's minimum relay count
+	// (corrosion.RelayConfig.BaseRelays). Zero is the production default of
+	// three, under which a cluster of more than three nodes has LEAVES that
+	// push only to relays. A scenario that partitions leaves away from every
+	// relay and still wants each side to converge sets this to Nodes, which
+	// makes every node a relay and the mesh full.
+	Relays int
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -663,7 +670,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// than on the loop's own timing. Options.IndependentReplicas starts the loop
 	// (see startReplicators): it discovers its peers from the seeded Members()
 	// view and dials them through the `hosts` table.
-	n.repl = corrosion.NewReplicator(n.DB, n.PKIDir, corrosion.RelayConfig{})
+	n.repl = corrosion.NewReplicator(n.DB, n.PKIDir, corrosion.RelayConfig{BaseRelays: c.opts.Relays})
 	n.Server.SetReplicator(n.repl)
 
 	// Start the gRPC server on n.Listener.

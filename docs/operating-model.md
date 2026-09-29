@@ -87,7 +87,9 @@ of acting — it says nothing about whether the resulting rows have replicated.
   (`host_health`, `health_evaluator_status`, `host_capacity_observations`),
   whose writers re-publish them every few seconds to a minute, are pulled by a
   scheduled pass at most once per 5 minutes per node; control-state drift in
-  the same exchange is pulled at once. A node whose replica is not caught up,
+  the same exchange is pulled at once. A table held apart from a peer only by
+  unresolved ties this node already tracks, proven by the pull before, is not
+  pulled again until either side's digest moves. A node whose replica is not caught up,
   and `lv cluster converge`, pull everything that disagrees. The older unary `GetStateDump`
   is retained as a fallback for mixed-version clusters. Convergence is automatic;
   `lv cluster converge` only *accelerates* it (kicks an immediate anti-entropy
@@ -658,8 +660,10 @@ the moment the peer's mint arrives, or on the next anti-entropy pass:
   TTL after the lease has converged.
 
 Which claims a node knows about lives in memory. After a restart it is rebuilt
-by the next anti-entropy pass, because the two rows still disagree and the
-merge re-compares them every pass; until then a restarted claimant may renew a
+by the next anti-entropy pass, because the two rows still disagree and a
+restarted daemon's first pass against each peer pulls and re-compares them
+(later passes skip a table whose only difference is a tie already tracked);
+until then a restarted claimant may renew a
 contested term it had already stood down from. A contested term that is not a
 key's *newest* term — history below the current tenure — needs nothing: it is
 already below every threshold, and only its tie condition remains.

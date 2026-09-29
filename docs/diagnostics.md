@@ -827,10 +827,16 @@ rate(litevirt_merge_apply_rejected_total[15m]) > 0
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the
 alert fires once per distinct divergence, not per cycle. The **divergence itself
 is not suppressed**: while a row remains unresolved its table's digest stays
-mismatched, so anti-entropy may continue to re-pull that table each cycle until
-the row is repaired (a row-proofed suppression that re-pulls only when an
-unrelated row also diverges is a future optimization). In practice this cost is
-paid only by genuinely-stuck rows awaiting repair.
+mismatched, and the tie stays in the register, the `ha.lww.unresolved`
+condition, `lv doctor divergence` and `litevirt_lww_tie_unresolved_current`.
+What anti-entropy stops doing is re-pulling it. After a pull, the node checks
+the pulled rows against its own: when every row that still differs is a tie it
+already tracks under exactly those two versions, the table is settled against
+that peer, and scheduled passes skip it until either side's digest moves. Any
+write to the table on either side — a new row, a repair — moves a digest and the
+next pass pulls it. A table that also holds a difference the register does not
+explain is pulled every pass, as before. A replica that is not caught up, a
+restarted daemon's first pass, and `lv cluster converge` pull regardless.
 
 Resolve an unresolved row by making one side authoritative with a fresh write —
 which clears the tracking and lets the table converge.

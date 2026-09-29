@@ -111,6 +111,39 @@ func TestProbeOwner_Verdicts(t *testing.T) {
 	}
 }
 
+// TestProbeOwner_InterruptedProbeIsReachedAndNotCached: a probe whose
+// caller's context ends mid-dial fails the dial, but that failure says nothing
+// about the source. It reads as reached, like a waiter interrupted on the
+// same probe (§10 item 9), and it is not cached: the next Accept naming the
+// source within claimProbeMaxAge probes again rather than certifying the
+// eviction on a cancelled dial.
+//
+// Mutation: cache the interrupted result — the next probe reuses "not
+// reached" and the dial count stays at one.
+func TestProbeOwner_InterruptedProbeIsReachedAndNotCached(t *testing.T) {
+	s := testServer(t)
+	now := time.Unix(1000, 0)
+	s.claims.probe.now = func() time.Time { return now }
+	var dials atomic.Int32
+	s.claims.probe.dial = func(ctx context.Context, host string) (string, error) {
+		dials.Add(1)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+	if reached, detail := s.probeOwner(ctx, "victim"); !reached || !strings.Contains(detail, "interrupted") {
+		t.Fatalf("an interrupted probe read as %v %q, want reached and interrupted", reached, detail)
+	}
+	s.claims.probe.dial = func(context.Context, string) (string, error) {
+		dials.Add(1)
+		return "", errors.New("connection refused")
+	}
+	if reached, _ := s.probeOwner(context.Background(), "victim"); reached || dials.Load() != 2 {
+		t.Fatalf("the interrupted result was cached: reached=%v dials=%d, want a fresh probe", reached, dials.Load())
+	}
+}
+
 // TestRemoveHost_RefusesACurrentVoter: deleting a hosts row must no longer
 // change the voting population implicitly (§4.3). The refusal names the one
 // command that does.

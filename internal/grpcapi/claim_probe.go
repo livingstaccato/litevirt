@@ -92,12 +92,21 @@ func (s *Server) probeOwner(ctx context.Context, host string) (bool, string) {
 		c.mu.Unlock()
 
 		reached, detail := s.probeOnce(ctx, host)
+		// A dial the CALLER cancelled failed for the caller's reason, not the
+		// source's: it reads as reached, like an interrupted waiter above, and
+		// is not cached — a waiter woken by it probes again for itself.
+		interrupted := ctx.Err() != nil
+		if interrupted {
+			reached, detail = true, "probe interrupted: "+ctx.Err().Error()
+		}
 
 		c.mu.Lock()
 		if c.results == nil {
 			c.results = map[string]probeResult{}
 		}
-		c.results[host] = probeResult{reached: reached, detail: detail, at: c.clock()}
+		if !interrupted {
+			c.results[host] = probeResult{reached: reached, detail: detail, at: c.clock()}
+		}
 		delete(c.inflight, host)
 		close(ch)
 		c.mu.Unlock()

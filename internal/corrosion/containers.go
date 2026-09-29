@@ -61,7 +61,29 @@ const (
 	// balancer backend cluster-wide (containers have no vm_interfaces table).
 	// Set from a static compose NIC address at create; the LB host re-discovers
 	// a DHCP address locally via lxc-info when this is empty.
-	LabelIP                 = "litevirt.ip"
+	LabelIP = "litevirt.ip"
+	// containerUpsertSQL is UpsertContainer's statement, and the pre-epoch
+	// relocation's target row (the retained wire-compatible shape).
+	containerUpsertSQL = `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(host_name, name) DO UPDATE SET
+		   state = excluded.state,
+		   image = excluded.image,
+		   cpu_limit = excluded.cpu_limit,
+		   memory_mib = excluded.memory_mib,
+		   labels = excluded.labels,
+		   restart_policy = excluded.restart_policy,
+		   state_detail = excluded.state_detail,
+		   project = excluded.project,
+		   is_template = excluded.is_template,
+		   on_host_failure = excluded.on_host_failure,
+		   -- Keep an existing create_spec when the caller didn't supply one, so a
+		   -- generic upsert can't wipe the create-time intent (it's "current
+		   -- intent", forward-only).
+		   create_spec = CASE WHEN excluded.create_spec <> '' THEN excluded.create_spec ELSE create_spec END,
+		   relocate_token = excluded.relocate_token,
+		   updated_at = excluded.updated_at,
+		   deleted_at = NULL`
 	containerRekeyInsertSQL = `INSERT OR REPLACE INTO containers
 		 (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, owner_epoch, spec_generation, active_operation_id, created_at, updated_at, deleted_at)
 		 VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
@@ -214,26 +236,7 @@ func upsertContainerStmt(c *Client, r ContainerRecord) (Statement, error) {
 	// SQLite's UPSERT (INSERT... ON CONFLICT) is the right tool here;
 	// we keep created_at on update so the original timestamp survives.
 	return Statement{
-		SQL: `INSERT INTO containers (host_name, name, state, image, cpu_limit, memory_mib, labels, restart_policy, state_detail, project, is_template, on_host_failure, create_spec, relocate_token, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(host_name, name) DO UPDATE SET
-		   state = excluded.state,
-		   image = excluded.image,
-		   cpu_limit = excluded.cpu_limit,
-		   memory_mib = excluded.memory_mib,
-		   labels = excluded.labels,
-		   restart_policy = excluded.restart_policy,
-		   state_detail = excluded.state_detail,
-		   project = excluded.project,
-		   is_template = excluded.is_template,
-		   on_host_failure = excluded.on_host_failure,
-		   -- Keep an existing create_spec when the caller didn't supply one, so a
-		   -- generic upsert can't wipe the create-time intent (it's "current
-		   -- intent", forward-only).
-		   create_spec = CASE WHEN excluded.create_spec <> '' THEN excluded.create_spec ELSE create_spec END,
-		   relocate_token = excluded.relocate_token,
-		   updated_at = excluded.updated_at,
-		   deleted_at = NULL`,
+		SQL: containerUpsertSQL,
 		Params: []interface{}{
 			r.HostName, r.Name, r.State, r.Image, r.CPULimit, r.MemMiB,
 			labelsJSON, r.RestartPolicy, r.StateDetail, r.Project, boolToInt(r.IsTemplate), r.OnHostFailure, r.CreateSpec, r.RelocateToken,
@@ -860,26 +863,44 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	// ordering; insert-first would at least leave a recoverable duplicate.
 	// Atomic is better than either, and both siblings in this file already are.
 	//
-	// The source's mutation guard covers the batch, so a source row that moved
-	// between the read above and the CAS applies nothing at all.
+	// The source's mutation guard covers the transaction, so a source row that
+	// moved between the read above and the CAS applies nothing at all.
+	//
+	// ONE transaction, but TWO replicated entries. Receivers require a guarded
+	// tombstone to be the unique final statement of its entry, with every
+	// statement beside it under the same guard (validateGuardedMutationEntry),
+	// and the target row is neither. Packed into one entry, the move was
+	// refused by every peer, and since that refusal back-pressures, the
+	// coordinator's whole replication stream stopped behind it. Split, each
+	// half is exactly a shape every receiver already accepts: the first is
+	// deleteContainerGuardedFrom's entry, the second is the target write the
+	// relocation made on its own before it became atomic.
+	//
+	// Tombstone first. A peer that applies the entries in separate pushes
+	// holds, in between, the state the pre-atomic relocation held on every
+	// node for the same window — source gone, target not yet arrived — which
+	// the relocation sweep reads as nothing to do, rather than two live rows
+	// for one container.
 	guard, gErr := containerDeleteMutationGuard(*old)
 	if gErr != nil {
 		return gErr
 	}
 	now := c.NowTS()
 	wall := nowRFC3339()
-	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+	applied, err := c.ExecuteEntriesGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		return c.mutationGuardMatches(ctx, tx, guard)
-	}, []Statement{
-		// Fence the source's managed interfaces while its parent row is still
-		// live, tombstone the parent as the semantic barrier, then create the
-		// target — the same ordering deleteContainerGuardedFrom uses, with the
-		// target write brought inside.
-		{SQL: containerCreateCleanupSQL, Params: []interface{}{wall, now, old.HostName, old.Name}, Guard: guard},
-		{SQL: containerDeleteSQL, Params: []interface{}{
-			wall, now, old.HostName, old.Name, old.OwnerEpoch, old.SpecGeneration,
-		}, Guard: guard},
-		target,
+	}, [][]Statement{
+		{
+			// Fence the source's managed interfaces while its parent row is
+			// still live, then tombstone the parent LAST as the semantic
+			// barrier — deleteContainerGuardedFrom's entry, statement for
+			// statement.
+			{SQL: containerCreateCleanupSQL, Params: []interface{}{wall, now, old.HostName, old.Name}, Guard: guard},
+			{SQL: containerDeleteSQL, Params: []interface{}{
+				wall, now, old.HostName, old.Name, old.OwnerEpoch, old.SpecGeneration,
+			}, Guard: guard},
+		},
+		{target},
 	})
 	if err != nil {
 		return err

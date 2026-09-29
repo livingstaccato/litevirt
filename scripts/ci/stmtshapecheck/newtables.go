@@ -154,6 +154,13 @@ var firstShapeAcks = map[string]string{
 		"memberlist recipient rather than the voting members only. It fails CLOSED when unwired, so the " +
 		"latch cannot form, and nothing is written, while a previous-release peer is listening. Its one " +
 		"caller is the operator's SetFailoverScope RPC, which refuses on the same latch first",
+	"voter_configs": "the only writer is corrosion.WriteVoterConfig, which returns ErrVoterConfigGateClosed " +
+		"without touching the table unless Client.MayWriteVoterConfigs — the durable voter_config_v1 marker, " +
+		"wired by the daemon and failing CLOSED when unwired. voter_config_v1 is mandatory, so advertised by " +
+		"every build carrying this table (once its readiness probe passes) and by none that does not, and it " +
+		"is in capabilities.replicationGated, so the latch is confirmed against every memberlist recipient, a " +
+		"maintenance host on the previous build included, rather than the voting members only. The writers " +
+		"above it (automatic genesis and `lv cluster voter init|add|rm|reset`) refuse before the latch too",
 	"host_membership": "every writer (UpdateHostState, UpdateHostStartup, InsertHost, AdmitHost, IsolateHost, " +
 		"ClearHostIsolation and corrosion.SplitHostMembership) goes through Client.withMembershipWrite or " +
 		"checks Client.MayWriteHostMembership, and writes only the hosts columns, in their previous-release " +

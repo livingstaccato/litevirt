@@ -227,6 +227,12 @@ const (
 	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
 	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
 	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
+	LiteVirt_PrepareRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
+	LiteVirt_AcceptRecoveryClaim_FullMethodName        = "/litevirt.v1.LiteVirt/AcceptRecoveryClaim"
+	LiteVirt_GetRecoveryClaim_FullMethodName           = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
+	LiteVirt_ListRecoveryClaims_FullMethodName         = "/litevirt.v1.LiteVirt/ListRecoveryClaims"
+	LiteVirt_GetVoterConfig_FullMethodName             = "/litevirt.v1.LiteVirt/GetVoterConfig"
+	LiteVirt_ChangeVoterConfig_FullMethodName          = "/litevirt.v1.LiteVirt/ChangeVoterConfig"
 	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
 	LiteVirt_ScanSensitiveDivergence_FullMethodName    = "/litevirt.v1.LiteVirt/ScanSensitiveDivergence"
 	LiteVirt_PushMutations_FullMethodName              = "/litevirt.v1.LiteVirt/PushMutations"
@@ -594,6 +600,26 @@ type LiteVirtClient interface {
 	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
 	TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error)
 	GetClusterStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*ClusterStateDigestResponse, error)
+	// ── Internal: recovery claims (docs/design/recovery-claims.md §3) ──
+	// Single-decree Paxos per claim key. Peer-only: the caller must present a
+	// known host certificate, and a ballot must name its sender. A voter
+	// replies only after the state its reply depends on is committed.
+	PrepareRecoveryClaim(ctx context.Context, in *PrepareRecoveryClaimRequest, opts ...grpc.CallOption) (*PrepareRecoveryClaimResponse, error)
+	AcceptRecoveryClaim(ctx context.Context, in *AcceptRecoveryClaimRequest, opts ...grpc.CallOption) (*AcceptRecoveryClaimResponse, error)
+	// Read-only: a voter's recorded state for one key, its incarnation and
+	// its last refusal. Peer- or operator-callable; it changes nothing.
+	GetRecoveryClaim(ctx context.Context, in *GetRecoveryClaimRequest, opts ...grpc.CallOption) (*GetRecoveryClaimResponse, error)
+	// The bulk form of GetRecoveryClaim a member of a new voter generation
+	// imports from (§4.4). Peer-only. The first message is a header saying
+	// whether the asked-for generation is frozen on this voter.
+	ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error)
+	// ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
+	// GetVoterConfig reports the connected host's adopted voter generation and
+	// each member's state (`lv cluster voter ls`).
+	GetVoterConfig(ctx context.Context, in *GetVoterConfigRequest, opts ...grpc.CallOption) (*GetVoterConfigResponse, error)
+	// ChangeVoterConfig decides the next generation: init, add, rm or reset,
+	// one member per generation (`lv cluster voter init|add|rm|reset`).
+	ChangeVoterConfig(ctx context.Context, in *ChangeVoterConfigRequest, opts ...grpc.CallOption) (*ChangeVoterConfigResponse, error)
 	// ── Divergence scanner (Phase 0) ──
 	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
 	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
@@ -3039,6 +3065,75 @@ func (c *liteVirtClient) GetClusterStateDigest(ctx context.Context, in *emptypb.
 	return out, nil
 }
 
+func (c *liteVirtClient) PrepareRecoveryClaim(ctx context.Context, in *PrepareRecoveryClaimRequest, opts ...grpc.CallOption) (*PrepareRecoveryClaimResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareRecoveryClaimResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PrepareRecoveryClaim_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) AcceptRecoveryClaim(ctx context.Context, in *AcceptRecoveryClaimRequest, opts ...grpc.CallOption) (*AcceptRecoveryClaimResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AcceptRecoveryClaimResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AcceptRecoveryClaim_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GetRecoveryClaim(ctx context.Context, in *GetRecoveryClaimRequest, opts ...grpc.CallOption) (*GetRecoveryClaimResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRecoveryClaimResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetRecoveryClaim_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ListRecoveryClaimsRequest, RecoveryClaimState]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ListRecoveryClaimsClient = grpc.ServerStreamingClient[RecoveryClaimState]
+
+func (c *liteVirtClient) GetVoterConfig(ctx context.Context, in *GetVoterConfigRequest, opts ...grpc.CallOption) (*GetVoterConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetVoterConfigResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetVoterConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ChangeVoterConfig(ctx context.Context, in *ChangeVoterConfigRequest, opts ...grpc.CallOption) (*ChangeVoterConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ChangeVoterConfigResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ChangeVoterConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) DiagnoseDivergence(ctx context.Context, in *DiagnoseDivergenceRequest, opts ...grpc.CallOption) (*DivergenceReport, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DivergenceReport)
@@ -3161,7 +3256,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3290,7 +3385,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3782,6 +3877,26 @@ type LiteVirtServer interface {
 	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
 	TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error)
 	GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error)
+	// ── Internal: recovery claims (docs/design/recovery-claims.md §3) ──
+	// Single-decree Paxos per claim key. Peer-only: the caller must present a
+	// known host certificate, and a ballot must name its sender. A voter
+	// replies only after the state its reply depends on is committed.
+	PrepareRecoveryClaim(context.Context, *PrepareRecoveryClaimRequest) (*PrepareRecoveryClaimResponse, error)
+	AcceptRecoveryClaim(context.Context, *AcceptRecoveryClaimRequest) (*AcceptRecoveryClaimResponse, error)
+	// Read-only: a voter's recorded state for one key, its incarnation and
+	// its last refusal. Peer- or operator-callable; it changes nothing.
+	GetRecoveryClaim(context.Context, *GetRecoveryClaimRequest) (*GetRecoveryClaimResponse, error)
+	// The bulk form of GetRecoveryClaim a member of a new voter generation
+	// imports from (§4.4). Peer-only. The first message is a header saying
+	// whether the asked-for generation is frozen on this voter.
+	ListRecoveryClaims(*ListRecoveryClaimsRequest, grpc.ServerStreamingServer[RecoveryClaimState]) error
+	// ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
+	// GetVoterConfig reports the connected host's adopted voter generation and
+	// each member's state (`lv cluster voter ls`).
+	GetVoterConfig(context.Context, *GetVoterConfigRequest) (*GetVoterConfigResponse, error)
+	// ChangeVoterConfig decides the next generation: init, add, rm or reset,
+	// one member per generation (`lv cluster voter init|add|rm|reset`).
+	ChangeVoterConfig(context.Context, *ChangeVoterConfigRequest) (*ChangeVoterConfigResponse, error)
 	// ── Divergence scanner (Phase 0) ──
 	// DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
 	// and returns a classified cross-node divergence report. ScanSensitiveDivergence:
@@ -4540,6 +4655,24 @@ func (UnimplementedLiteVirtServer) TriggerAntiEntropy(context.Context, *TriggerA
 }
 func (UnimplementedLiteVirtServer) GetClusterStateDigest(context.Context, *emptypb.Empty) (*ClusterStateDigestResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetClusterStateDigest not implemented")
+}
+func (UnimplementedLiteVirtServer) PrepareRecoveryClaim(context.Context, *PrepareRecoveryClaimRequest) (*PrepareRecoveryClaimResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareRecoveryClaim not implemented")
+}
+func (UnimplementedLiteVirtServer) AcceptRecoveryClaim(context.Context, *AcceptRecoveryClaimRequest) (*AcceptRecoveryClaimResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AcceptRecoveryClaim not implemented")
+}
+func (UnimplementedLiteVirtServer) GetRecoveryClaim(context.Context, *GetRecoveryClaimRequest) (*GetRecoveryClaimResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRecoveryClaim not implemented")
+}
+func (UnimplementedLiteVirtServer) ListRecoveryClaims(*ListRecoveryClaimsRequest, grpc.ServerStreamingServer[RecoveryClaimState]) error {
+	return status.Error(codes.Unimplemented, "method ListRecoveryClaims not implemented")
+}
+func (UnimplementedLiteVirtServer) GetVoterConfig(context.Context, *GetVoterConfigRequest) (*GetVoterConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetVoterConfig not implemented")
+}
+func (UnimplementedLiteVirtServer) ChangeVoterConfig(context.Context, *ChangeVoterConfigRequest) (*ChangeVoterConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ChangeVoterConfig not implemented")
 }
 func (UnimplementedLiteVirtServer) DiagnoseDivergence(context.Context, *DiagnoseDivergenceRequest) (*DivergenceReport, error) {
 	return nil, status.Error(codes.Unimplemented, "method DiagnoseDivergence not implemented")
@@ -8137,6 +8270,107 @@ func _LiteVirt_GetClusterStateDigest_Handler(srv interface{}, ctx context.Contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_PrepareRecoveryClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareRecoveryClaimRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PrepareRecoveryClaim(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PrepareRecoveryClaim_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PrepareRecoveryClaim(ctx, req.(*PrepareRecoveryClaimRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_AcceptRecoveryClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AcceptRecoveryClaimRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AcceptRecoveryClaim(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AcceptRecoveryClaim_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AcceptRecoveryClaim(ctx, req.(*AcceptRecoveryClaimRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GetRecoveryClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRecoveryClaimRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetRecoveryClaim(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetRecoveryClaim_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetRecoveryClaim(ctx, req.(*GetRecoveryClaimRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListRecoveryClaims_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ListRecoveryClaimsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).ListRecoveryClaims(m, &grpc.GenericServerStream[ListRecoveryClaimsRequest, RecoveryClaimState]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ListRecoveryClaimsServer = grpc.ServerStreamingServer[RecoveryClaimState]
+
+func _LiteVirt_GetVoterConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetVoterConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetVoterConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetVoterConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetVoterConfig(ctx, req.(*GetVoterConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ChangeVoterConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChangeVoterConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ChangeVoterConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ChangeVoterConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ChangeVoterConfig(ctx, req.(*ChangeVoterConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_DiagnoseDivergence_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DiagnoseDivergenceRequest)
 	if err := dec(in); err != nil {
@@ -9547,6 +9781,26 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_GetClusterStateDigest_Handler,
 		},
 		{
+			MethodName: "PrepareRecoveryClaim",
+			Handler:    _LiteVirt_PrepareRecoveryClaim_Handler,
+		},
+		{
+			MethodName: "AcceptRecoveryClaim",
+			Handler:    _LiteVirt_AcceptRecoveryClaim_Handler,
+		},
+		{
+			MethodName: "GetRecoveryClaim",
+			Handler:    _LiteVirt_GetRecoveryClaim_Handler,
+		},
+		{
+			MethodName: "GetVoterConfig",
+			Handler:    _LiteVirt_GetVoterConfig_Handler,
+		},
+		{
+			MethodName: "ChangeVoterConfig",
+			Handler:    _LiteVirt_ChangeVoterConfig_Handler,
+		},
+		{
 			MethodName: "DiagnoseDivergence",
 			Handler:    _LiteVirt_DiagnoseDivergence_Handler,
 		},
@@ -9866,6 +10120,11 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamSensitiveStateDump",
 			Handler:       _LiteVirt_StreamSensitiveStateDump_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ListRecoveryClaims",
+			Handler:       _LiteVirt_ListRecoveryClaims_Handler,
 			ServerStreams: true,
 		},
 		{

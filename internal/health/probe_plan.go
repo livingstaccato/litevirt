@@ -35,11 +35,14 @@ import (
 // a peer outside this node's plan is probed on demand, never read as down
 // from its absence.
 //
-// With today's VoterSet every active host is a voter, so the plan is the full
-// mesh and nothing changes until the voter set is explicit
-// (colonelpanik/litevirt#251). The non-voters it samples today are the offline
-// and fenced hosts' own probes of each other; the probes OF an offline or fenced
-// host, which recovery counts, are all kept.
+// Until a voter generation is adopted, VoterSet is derived and every active
+// host is a voter, so the plan is the full mesh; the non-voters it samples are
+// the offline and fenced hosts' own probes of each other, and the probes OF an
+// offline or fenced host, which recovery counts, are all kept. Once a
+// generation is adopted (colonelpanik/litevirt#251 step 2), the voters are its
+// members whatever their state — a fenced member keeps probing all-pairs and
+// being counted — and an active host outside it is sampled like any non-voter
+// (TestProbePlan_ReadsTheAdoptedVoterSet).
 //
 // The ring is computed from each node's own view of the host table. Two nodes
 // that briefly disagree about membership pick slightly different samples; since

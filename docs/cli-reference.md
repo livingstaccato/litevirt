@@ -48,6 +48,13 @@ lv cluster converge [--all]        # Kick an immediate anti-entropy pass + repor
                                    #   (`lv cluster sync` is a deprecated alias)
 lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
                                    #   per region (see federation.md → Regions and failure)
+lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
+lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
+lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a
+                                   #   cluster that cannot become clean, or after a reset
+lv cluster voter add <host>        # Add one voter (decided by a majority of the current generation)
+lv cluster voter rm <host>         # Remove one voter; allowed while it is unreachable
+lv cluster voter reset [--yes]     # Decided exit to the voter set derived from host state (sticky)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 ```
 

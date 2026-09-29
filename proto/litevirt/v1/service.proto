@@ -1695,6 +1695,150 @@ message GetLeaseTermHighWaterResponse {
     string holder = 3;
 }
 
+// ── Recovery claims and the voter set (docs/design/recovery-claims.md) ──
+
+message RecoveryClaimKey {
+    string target_kind = 1;  // vm | container | voter_config
+    string target_name = 2;  // workload name; "" for voter_config
+    int64  owner_epoch = 3;  // generation being left; config generation for voter_config
+    int64  attempt     = 4;
+}
+message ClaimBallot {
+    uint64 round       = 1;
+    string coordinator = 2;
+    bytes  boot_nonce  = 3;
+}
+message ClaimVoterMember {
+    string name        = 1;
+    string incarnation = 2;
+}
+// VoterConfigValue is a voter_configs row without its certificate: what a
+// voter_config claim decides.
+message VoterConfigValue {
+    int64  generation = 1;
+    repeated ClaimVoterMember members = 2;
+    string change     = 3;  // genesis | add:<host> | rm:<host> | reset
+    string created_by = 4;
+    string created_at = 5;
+}
+// RecoveryClaimValue is what a claim decides: the ActionProof binding fields
+// plus the source host for a workload key, or a voter config.
+message RecoveryClaimValue {
+    string id               = 1;
+    string action           = 2;
+    string target_kind      = 3;
+    string target_name      = 4;
+    string dest_host        = 5;
+    string coordinator      = 6;
+    string relocation_token = 7;
+    string fence_epoch      = 8;
+    string owner_epoch      = 9;
+    int64  lease_term       = 10;
+    string lease_key        = 11;
+    string source_host      = 12;
+    VoterConfigValue voter_config = 13;
+}
+// ClaimAccept is one voter's signed accept.
+message ClaimAccept {
+    string voter             = 1;
+    string voter_incarnation = 2;
+    int64  config_generation = 3;
+    ClaimBallot ballot       = 4;
+    string value_digest      = 5;
+    string cert_pem          = 6;
+    bytes  signature         = 7;
+    RecoveryClaimKey key     = 8;
+}
+message PrepareRecoveryClaimRequest {
+    RecoveryClaimKey key    = 1;
+    ClaimBallot ballot      = 2;
+    int64 config_generation = 3;
+}
+message PrepareRecoveryClaimResponse {
+    bool        promised           = 1;
+    ClaimBallot promised_ballot    = 2;  // on refusal: what this voter has promised
+    ClaimBallot accepted_ballot    = 3;  // unset if nothing accepted
+    RecoveryClaimValue accepted_value = 4;
+    string      voter              = 5;
+    string      voter_incarnation  = 6;
+    string      refusal_reason     = 7;
+    string      refusal_detail     = 8;
+}
+message AcceptRecoveryClaimRequest {
+    RecoveryClaimKey key     = 1;
+    ClaimBallot ballot       = 2;
+    RecoveryClaimValue value = 3;
+    int64 config_generation  = 4;
+}
+message AcceptRecoveryClaimResponse {
+    bool        accepted        = 1;
+    ClaimBallot promised_ballot = 2;
+    ClaimAccept accept          = 3;
+    string      voter           = 4;
+    string      refusal_reason  = 5;  // e.g. recovery_claim_owner_reachable
+    string      refusal_detail  = 6;  // e.g. "node-3 still reaches node-2 (Ping answered in 4ms)"
+}
+message GetRecoveryClaimRequest {
+    RecoveryClaimKey key = 1;
+}
+message GetRecoveryClaimResponse {
+    PrepareRecoveryClaimResponse state = 1;  // promised/accepted ballot and value, voter, incarnation
+    ClaimAccept accept                 = 2;
+    string last_refusal_reason         = 3;  // this voter's most recent refusal for the key (memory only)
+    string last_refusal_detail         = 4;
+    int64  adopted_generation          = 5;
+}
+message ListRecoveryClaimsRequest {
+    int64 config_generation = 1;  // the generation the importer is leaving
+}
+message RecoveryClaimState {
+    bool   header             = 1;  // the first message: voter, frozen, adopted_generation
+    string voter              = 2;
+    bool   frozen             = 3;  // the asked-for generation is sealed or left behind here
+    int64  adopted_generation = 4;
+    RecoveryClaimKey key      = 5;
+    ClaimBallot promised      = 6;
+    ClaimBallot accepted      = 7;
+    RecoveryClaimValue value  = 8;
+    string value_digest       = 9;
+}
+
+message GetVoterConfigRequest {}
+message VoterMemberStatus {
+    string name        = 1;
+    string incarnation = 2;  // the incarnation it was admitted with
+    string host_state  = 3;  // hosts.state, or "removed"
+    bool   reachable   = 4;
+    bool   abstaining  = 5;  // its local incarnation does not match its entry
+    string detail      = 6;
+}
+message GetVoterConfigResponse {
+    string reporting_host      = 1;
+    int64  adopted_generation  = 2;  // 0 = none adopted yet
+    int64  latest_generation   = 3;  // highest voter_configs row on this host
+    bool   explicit            = 4;  // false = the voter set is derived from host state
+    string change              = 5;
+    string created_by          = 6;
+    string created_at          = 7;
+    repeated VoterMemberStatus members = 8;
+    repeated string derived_voters     = 9;  // the derived set, shown when not explicit
+    bool   gate_open           = 10; // voter_config_v1 has durably latched here
+    string genesis_pending     = 11; // why automatic genesis has not written generation 1
+}
+message ChangeVoterConfigRequest {
+    string op      = 1;  // init | add | rm | reset
+    string host    = 2;  // add, rm
+    repeated string members = 3;  // init: explicit member list (default: the derived set)
+    bool   dry_run = 4;  // report the value that would be proposed, change nothing
+}
+message ChangeVoterConfigResponse {
+    int64  generation = 1;
+    repeated ClaimVoterMember members = 2;
+    string change     = 3;
+    bool   applied    = 4;  // false for a dry run
+    string detail     = 5;
+}
+
 message PromoteReplicaRequest {
     string vm_name     = 1; // VM whose replica to promote
     string target_pool = 2; // optional — pool holding the replica; defaults to the VM's replication schedule
@@ -2557,6 +2701,28 @@ service LiteVirt {
     // fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
     rpc TriggerAntiEntropy(TriggerAntiEntropyRequest) returns (TriggerAntiEntropyResponse);
     rpc GetClusterStateDigest(google.protobuf.Empty) returns (ClusterStateDigestResponse);
+
+    // ── Internal: recovery claims (docs/design/recovery-claims.md §3) ──
+    // Single-decree Paxos per claim key. Peer-only: the caller must present a
+    // known host certificate, and a ballot must name its sender. A voter
+    // replies only after the state its reply depends on is committed.
+    rpc PrepareRecoveryClaim(PrepareRecoveryClaimRequest) returns (PrepareRecoveryClaimResponse);
+    rpc AcceptRecoveryClaim(AcceptRecoveryClaimRequest) returns (AcceptRecoveryClaimResponse);
+    // Read-only: a voter's recorded state for one key, its incarnation and
+    // its last refusal. Peer- or operator-callable; it changes nothing.
+    rpc GetRecoveryClaim(GetRecoveryClaimRequest) returns (GetRecoveryClaimResponse);
+    // The bulk form of GetRecoveryClaim a member of a new voter generation
+    // imports from (§4.4). Peer-only. The first message is a header saying
+    // whether the asked-for generation is frozen on this voter.
+    rpc ListRecoveryClaims(ListRecoveryClaimsRequest) returns (stream RecoveryClaimState);
+
+    // ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
+    // GetVoterConfig reports the connected host's adopted voter generation and
+    // each member's state (`lv cluster voter ls`).
+    rpc GetVoterConfig(GetVoterConfigRequest) returns (GetVoterConfigResponse);
+    // ChangeVoterConfig decides the next generation: init, add, rm or reset,
+    // one member per generation (`lv cluster voter init|add|rm|reset`).
+    rpc ChangeVoterConfig(ChangeVoterConfigRequest) returns (ChangeVoterConfigResponse);
 
     // ── Divergence scanner (Phase 0) ──
     // DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out

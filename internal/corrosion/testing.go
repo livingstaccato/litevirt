@@ -1,6 +1,7 @@
 package corrosion
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"sync/atomic"
@@ -109,3 +110,19 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 // markers that survive a restart (the credentials-unhydrated mark) can be
 // exercised without standing up a daemon.
 func (c *Client) SetDataDirForTest(dir string) { c.dataDir = dir }
+
+// ReplaceVoterIncarnationForTest re-mints this database's voter incarnation:
+// the state a re-imaged host or a reseeded state.db comes back with, which a
+// voter must abstain from voting under (docs/design/recovery-claims.md §3.11).
+func (c *Client) ReplaceVoterIncarnationForTest(ctx context.Context) (string, error) {
+	if err := c.ExecuteLocal(ctx, func(tx *LocalTx) error {
+		_, err := tx.Exec(ctx, `DELETE FROM local_voter_incarnation WHERE id = 1`)
+		return err
+	}); err != nil {
+		return "", err
+	}
+	if err := c.mintVoterIncarnation(ctx); err != nil {
+		return "", err
+	}
+	return c.VoterIncarnation(ctx)
+}

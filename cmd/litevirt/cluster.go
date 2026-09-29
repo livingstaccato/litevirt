@@ -25,6 +25,7 @@ func newClusterCmd() *cobra.Command {
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
 		newClusterFailoverScopeCmd(),
+		newClusterVoterCmd(),
 	)
 	return cmd
 }

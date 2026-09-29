@@ -694,6 +694,33 @@ release. Nothing is written to the table before then, and the scope stays
 below the latched token enters WAL quarantine, as below every latched token.
 Roll forward.
 
+### The voter set becomes explicit after the roll
+
+Schema v59 adds `voter_configs`, one immutable row per generation of an
+explicit voter set, and three tables every host keeps to itself: its promises
+and accepts (`local_recovery_claims`), the identity of that state
+(`local_voter_incarnation`) and which generations it has adopted
+(`local_voter_adoption`). Nothing writes `voter_configs` until the
+`voter_config_v1` capability token has latched. It is mandatory and
+replication-gated, so it cannot latch while any host the cluster replicates to
+— one parked in `maintenance` included — runs the previous release. A host
+advertises it only once it can vote durably: its `state.db` is at
+`synchronous=FULL` (the daemon now opens it that way) and its host signing key
+loads.
+
+Once it has latched and every host is voting-eligible and reachable, the
+leader-lease holder decides generation 1 from the hosts that vote today, and
+every host adopts it. From then on the voter set changes only through
+`lv cluster voter add`, `lv cluster voter rm` and `lv cluster voter reset`; see
+[Operating model](operating-model.md) → "The voter set is explicit once genesis
+has run". While genesis waits, `ha.voter.genesis_pending` says why.
+
+There is no flag to turn it off: a host with it off would count a different
+majority from its peers. `lv cluster voter reset` is the decided exit back to
+the derived set. It is not a rollback tool: a binary rolled back below the
+latched token enters WAL quarantine at startup, as below every latched token,
+whether or not a voter generation exists.
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

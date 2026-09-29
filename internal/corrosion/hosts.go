@@ -287,7 +287,33 @@ func VotingEligible(state string) bool {
 //
 // The state is the resolved one (host_membership.go), so the voter set a node
 // counts is the one its failover coordinator and health gate both read.
+//
+// Once this node has adopted a voter generation with members (voter_config.go,
+// colonelpanik/litevirt#251 step 2), the set is THAT generation's members and
+// nothing else: it no longer filters on host state, so a fenced, offline or
+// maintenance member still counts in the denominator until an operator removes
+// it with `lv cluster voter rm`. No flag changes this — the voter set is a fact
+// the cluster decided, not a policy (docs/design/recovery-claims.md §4.5). A
+// reset generation has no members, and the set is derived again.
 func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
+	cfg, err := AdoptedVoterConfig(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Explicit() {
+		voters := make(map[string]bool, len(cfg.Members))
+		for _, m := range cfg.Members {
+			voters[m.Name] = true
+		}
+		return voters, nil
+	}
+	return DerivedVoterSet(ctx, c)
+}
+
+// DerivedVoterSet is the voter set as it was before any explicit generation:
+// every non-deleted host whose state is VotingEligible. Automatic genesis
+// proposes it as generation 1's members.
+func DerivedVoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
 	states, err := resolvedHostStates(ctx, c)
 	if err != nil {
 		return nil, err

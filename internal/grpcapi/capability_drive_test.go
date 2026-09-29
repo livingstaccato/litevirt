@@ -83,6 +83,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// failover_scope_v1 likewise: "this build decodes cluster_policies
 		// and honours failover_scope".
 		capabilities.FailoverScopeV1: true,
+		// voter_config_v1: "this build decodes voter_configs and answers the
+		// claim RPCs durably". A flag would let one node count a different
+		// majority from its peers.
+		capabilities.VoterConfigV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

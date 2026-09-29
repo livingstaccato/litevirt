@@ -351,6 +351,11 @@ type Client struct {
 	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
 	// back-pressure a previous-release peer. See cluster_policy.go.
 	clusterPolicyGate atomic.Pointer[func() bool]
+	// voterConfigGate, when set and returning true, permits WRITING
+	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
+	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes
+	// back-pressure a previous-release peer. See voter_config.go.
+	voterConfigGate atomic.Pointer[func() bool]
 	// hostMembershipLive is set once a SplitHostMembership pass has completed
 	// with the gate open (also persisted under dataDir); from then on writers
 	// write host_membership and readers read it.
@@ -841,9 +846,17 @@ func (c *Client) SetLocalVersion(v string) { c.version = v }
 // NOTE: auto_vacuum only takes effect on a freshly-created database. An
 // existing DB adopts it only after a one-time VACUUM (see the upgrade/
 // maintenance runbook).
+//
+// synchronous(full) is set explicitly rather than inherited from the driver's
+// compiled default. A recovery-claim voter replies "promised" or "accepted" only
+// after its transaction commits, and that reply is only safe if the commit is on
+// disk: with FULL a WAL commit is fsynced before COMMIT returns. It is a no-op
+// where the default is already FULL; the voter_config_v1 readiness probe reads
+// PRAGMA synchronous and withholds the token below FULL
+// (docs/design/recovery-claims.md §3.7).
 func sqliteDSN(path string) string {
 	return fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_pragma=auto_vacuum(incremental)",
+		"file:%s?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_pragma=auto_vacuum(incremental)&_pragma=synchronous(full)",
 		path)
 }
 
@@ -1675,6 +1688,19 @@ func (r Row) Int64(col string) int64 {
 		return 0
 	default:
 		return 0
+	}
+}
+
+// Bytes reads a BLOB column. Query hands BLOBs back as strings, so both forms
+// are accepted; absent/NULL reads as nil.
+func (r Row) Bytes(col string) []byte {
+	switch v := r.get(col).(type) {
+	case []byte:
+		return append([]byte(nil), v...)
+	case string:
+		return []byte(v)
+	default:
+		return nil
 	}
 }
 

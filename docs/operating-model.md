@@ -120,12 +120,35 @@ of acting — it says nothing about whether the resulting rows have replicated.
 
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
-  observers report `consecutive_failures ≥ 5` for it (where N is the voter
-  set: every host not `offline`, `maintenance` or `fenced`, witnesses
-  included, in every region). Stale observer rows (older than 30 s) are
-  excluded. Under region-scoped failover (`lv cluster failover-scope region`)
-  N and the observers are the host's own region's voters instead; see
-  "A site partition" below.
+  observers report `consecutive_failures ≥ 5` for it, where N is the voter
+  set (see *The voter set is explicit once genesis has run*, below). Stale
+  observer rows (older than 30 s) are excluded. Under region-scoped failover
+  (`lv cluster failover-scope region`) N and the observers are the members of
+  the voter set in the host's own region instead; see "A site partition" below.
+- **The voter set is explicit once genesis has run.** Every quorum — the fence
+  quorum, the recovery quorum and `DecisionGate`'s quorum proof — counts over
+  one voter set. Until the cluster has a voter generation, that set is derived
+  from host state: every host not `offline`, `maintenance` or `fenced`,
+  witnesses included, in every region. A derived set is only as agreed as
+  replication, so two coordinators can count different denominators
+  (colonelpanik/litevirt#251). Once `voter_config_v1` has latched and every
+  host is voting-eligible and reachable, the leader-lease holder decides
+  **generation 1** of an explicit set, unanimously; each host adopts it once
+  its certificate — a signed accept from every member — verifies. From then on
+  the voter set is that generation's members and nothing else: a member that
+  goes `offline`, into `maintenance` or is fenced still counts in every
+  denominator until it is removed. It changes only through a decided change —
+  `lv cluster voter add` / `rm`, one member per generation, decided by a
+  majority of the current generation, or `lv cluster voter reset`, which
+  returns every host to the derived set at one generation. No flag changes it.
+  `lv host rm` of a current voter is refused. While genesis cannot run, the
+  `ha.voter.genesis_pending` health condition names each host holding it back;
+  `lv cluster voter init --members` is the fallback for a cluster that cannot
+  become clean. A voter whose state database was recreated (re-imaged or
+  reseeded) abstains from every decision until it is removed and re-added:
+  `lv cluster voter ls` shows it. Capability latches still count
+  voting-eligible hosts by state, so a fenced member cannot hold every future
+  latch off. Design: [design/recovery-claims.md](design/recovery-claims.md) §4.
 - **Leader-gated recovery — best-effort, not exclusive.** The lease is a CRDT
   row with a 45 s TTL, re-validated before every destructive action. A CRDT row
   store cannot offer linearisable compare-and-swap across a partition, so the
@@ -1002,6 +1025,9 @@ The web UI at port 7445 surfaces the most critical of these on the
 | HLC rejected counter rising on one peer | Check NTP on that peer; expect to fence it |
 | Replication backlog growing | Identify slow peer via watermarks; consider `lv host drain` |
 | Disk full on one host | Drain → repair disk → re-add as fresh peer |
+| A voter is gone for good | `lv cluster voter rm <host>`, then `lv host rm <host>` |
+| `lv cluster voter ls` shows a member ABSTAINING | `lv cluster voter rm <host>` then `lv cluster voter add <host>` |
+| `ha.voter.genesis_pending` persists | Clear what it names, or `lv cluster voter init --members <hosts>` |
 
 ---
 

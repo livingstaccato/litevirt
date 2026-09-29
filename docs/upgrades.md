@@ -721,6 +721,41 @@ the derived set. It is not a rollback tool: a binary rolled back below the
 latched token enters WAL quarantine at startup, as below every latched token,
 whether or not a voter generation exists.
 
+### Recovery claims are opt-in after the roll
+
+Schema v60 adds `runtime_action_proofs.claim_certificate`, the majority
+certificate that authorizes an ownership-transfer proof; v61 adds
+`local_abandoned_proofs` and v62 `local_voter_seals`, two tables each host
+keeps to itself (a recovery destination's signed abandonments, and the voter
+generations it sealed in a forced reconfiguration). Nothing writes the new
+column until the `recovery_claim_v1` capability token has latched. It is
+replication-gated, so it cannot latch while any host the cluster replicates to
+runs the previous release, and — unlike `voter_config_v1` — it is **not**
+mandatory: it latches only once every host has opted in.
+
+To turn recovery claims on:
+
+1. Finish the roll and let `voter_config_v1` latch and genesis complete
+   (`lv cluster voter ls` shows generation 1). A cluster can stop here.
+2. Set `enforcement.recovery_claim: true` on **every** host, witnesses
+   included, and restart them one at a time. A host advertises the token only
+   with the flag on, `split_brain_gate_v1` latched and the ability to vote
+   durably.
+3. Wait for `recovery_claim_v1` to latch. Until it does, a host with the
+   flag on reports `litevirt_ha_degraded{reason="unsupported_member"}`; once
+   that clears everywhere and `not_enforcing` is empty, the next failover is
+   claim-gated.
+4. Validate with a partition drill before relying on it.
+
+To stand down, set the flag off on **every** host and restart: coordinators
+mint uncertified proofs and destinations accept them, exactly the pre-claim
+behaviour; voters keep answering and keep their history, and the voter set does
+not move. A flag off on only some hosts is not a degraded mode but the hazard
+the token exists to prevent — such a host reports `recovery_claim_v1` in
+`PingResponse.not_enforcing` and its peers raise `ha_degraded`. A binary rolled
+back below the latched token enters WAL quarantine, as below every latched
+token.
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

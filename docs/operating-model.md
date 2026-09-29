@@ -141,14 +141,48 @@ of acting — it says nothing about whether the resulting rows have replicated.
   `lv cluster voter add` / `rm`, one member per generation, decided by a
   majority of the current generation, or `lv cluster voter reset`, which
   returns every host to the derived set at one generation. No flag changes it.
-  `lv host rm` of a current voter is refused. While genesis cannot run, the
+  `lv host rm` of a current voter is refused; `lv host rm --dead <host>` removes
+  a voter that is fenced proof-grade and gone for good, taking it out of the
+  voter set first. While genesis cannot run, the
   `ha.voter.genesis_pending` health condition names each host holding it back;
   `lv cluster voter init --members` is the fallback for a cluster that cannot
   become clean. A voter whose state database was recreated (re-imaged or
   reseeded) abstains from every decision until it is removed and re-added:
-  `lv cluster voter ls` shows it. Capability latches still count
-  voting-eligible hosts by state, so a fenced member cannot hold every future
-  latch off. Design: [design/recovery-claims.md](design/recovery-claims.md) §4.
+  `lv cluster voter ls` shows it. `ha.voter.unavailable` names every member
+  that is fenced, offline, removed or abstaining, with the command that removes
+  it — there is no automatic shrink, so each one is fault tolerance the cluster
+  does not have. Once a majority of the voters is gone for good no decided
+  change can succeed, and `lv cluster voter force-reconfigure --lost <hosts>` is
+  the audited break-glass: every named host must be fenced proof-grade, it is
+  refused while a majority is actually reachable, and `ha.voter.forced` stays
+  raised until each lost host is removed with `lv host rm --dead`. Capability
+  latches still count voting-eligible hosts by state, so a fenced member cannot
+  hold every future latch off. Design:
+  [design/recovery-claims.md](design/recovery-claims.md) §4.
+- **Recovery is a decided claim when recovery claims are enforced.** The lease
+  and `DecisionGate` cannot stop two coordinators that each believe they lead
+  from each authorizing a destination for the same workload. With
+  `enforcement.recovery_claim: true` on every host, `recovery_claim_v1`
+  latched and a voter generation adopted, a reschedule, promote or container
+  relocation is minted only once a majority of the voter set has certified it —
+  a single-decree Paxos decision per (workload, owner epoch, attempt) — and the
+  destination verifies that certificate against its own replica and the
+  cluster CA before it executes (`recovery_claim_unproven` otherwise). Each
+  voter probes the recorded owner before it accepts and refuses while it can
+  reach it (`recovery_claim_owner_reachable`), so a host most voters can reach
+  is never recovered, whatever the coordinator's health view. The loser of a
+  duel writes the winner's proof and nothing naming itself. A recovery decided
+  for a destination that then died is stranded (`ha.claim.stranded`) until the
+  destination returns or is removed with `lv host rm --dead`; the claim then
+  moves to the next attempt. `lv cluster claim <kind>/<name>` shows every
+  voter's state for a stuck claim. **A partial stand-down is the hazard, not a
+  degraded mode:** a host with the flag off mints and executes uncertified
+  proofs. The token is advertised only while the flag is on, so a stood-down
+  host drops it from its capabilities — its enforcing peers raise
+  `ha_degraded` (unsupported member) — and, having latched it, reports it in
+  `PingResponse.not_enforcing`. The full stand-down is the flag off on every
+  host and a restart; the voter set and the voters' history are unchanged.
+  Design: [design/recovery-claims.md](design/recovery-claims.md).
 - **Leader-gated recovery — best-effort, not exclusive.** The lease is a CRDT
   row with a 45 s TTL, re-validated before every destructive action. A CRDT row
   store cannot offer linearisable compare-and-swap across a partition, so the

@@ -83,7 +83,12 @@ of acting — it says nothing about whether the resulting rows have replicated.
   tables whose digests disagreed (`StreamTableDump`, which adds the parent rows a
   child table's merge checks against), and falls back to the full
   `StreamStateDump` against a peer too old to serve it; eligible secret-bearing config
-  uses a separate peer-mTLS-only sensitive dump. The older unary `GetStateDump`
+  uses a separate peer-mTLS-only sensitive dump. Observation tables
+  (`host_health`, `health_evaluator_status`, `host_capacity_observations`),
+  whose writers re-publish them every few seconds to a minute, are pulled by a
+  scheduled pass at most once per 5 minutes per node; control-state drift in
+  the same exchange is pulled at once. A node whose replica is not caught up,
+  and `lv cluster converge`, pull everything that disagrees. The older unary `GetStateDump`
   is retained as a fallback for mixed-version clusters. Convergence is automatic;
   `lv cluster converge` only *accelerates* it (kicks an immediate anti-entropy
   pass, which contacts every peer rather than a sample) and *verifies* it (cross-host digest report) — it never exports or merges
@@ -852,6 +857,19 @@ leadership churn or a partition.
   answering every mismatch with the full dump pulls 7.9 MB, and the row reaches
   all 50 replicas within 3 passes. That is the cost of one pass in one
   process, not a sustained load test.
+- **Health-probe cost.** Voters probe every peer; a non-voter probes every
+  voter plus three other non-voters, so every host is still observed by every
+  voter and fence and recovery quorums see the same rows as a full mesh.
+  `TestProbesPerCycle_Scale` in `internal/health/` counts real probe cycles,
+  per 2 s cycle: with every host voting (today's voter set, where every host
+  not `offline`, `maintenance` or `fenced` votes) the cost is unchanged at 20,
+  380 and 2,450 probes for 5, 20 and 50 nodes (2,450 is 1,225 probes/s).
+  With 3, 5 and 5 voters it is 20, 215 and 605. The saving needs a voter set
+  smaller than the cluster; until then the probe mesh is still N·(N−1).
+- **Digest cost.** One full public digest over a 50-node cluster's worth of
+  rows (a full `host_health` mesh and 2,000 VMs) takes about 55 ms and
+  allocates 5.7 MB (`BenchmarkStateDigest_50Nodes`), once per pass and once per
+  peer that asks. It is recomputed from a full scan every time.
 
 ### Network
 - **Inter-host RTT < 10 ms**: comfortable. Default replicator and

@@ -55,6 +55,21 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			maintenance[h.Name] = true
 		}
 	}
+	// The same holds for an edge outside its observer's probe plan: a non-voter
+	// probes only a sample of the other non-voters (health.ObserverPlan), so an
+	// edge it dropped from that sample is frozen too. An unreadable voter set
+	// excludes nothing — every edge keeps its vote, as before the plan.
+	var plans map[string]map[string]bool
+	if voters, verr := corrosion.VoterSet(ctx, s.db); verr == nil {
+		plans = make(map[string]map[string]bool, len(hosts))
+		for _, h := range hosts {
+			plans[h.Name] = health.ObserverPlan(h.Name, hosts, voters)
+		}
+	}
+	notProbed := func(observer, target string) bool {
+		plan, known := plans[observer]
+		return known && !plan[target]
+	}
 
 	// Parse the mesh once: the same edges feed both the response body and the
 	// roll-up, which counts a link that is not proven good as a coverage gap.
@@ -68,6 +83,7 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			ConsecutiveFailures: r.Int("consecutive_failures"),
 			LastSeen:            r.String("last_seen"),
 			TargetInMaintenance: maintenance[target],
+			NotProbed:           notProbed(r.String("observer"), target),
 		})
 	}
 
@@ -172,6 +188,9 @@ type connectivityEdge struct {
 	// TargetInMaintenance marks an edge whose target the checker has stopped
 	// probing. Reported in the body unchanged; excluded from the roll-up.
 	TargetInMaintenance bool
+	// NotProbed marks an edge outside its observer's probe plan
+	// (health.ObserverPlan). Reported unchanged; excluded from the roll-up.
+	NotProbed bool
 }
 
 // connectivityDegrades reports whether an edge's status means the link is not
@@ -306,7 +325,7 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		// it would latch the cluster DEGRADED for as long as the host stays in
 		// maintenance — a light stuck on, with no link left to fix. The edge is
 		// still reported in the body; it just stops voting.
-		if e.TargetInMaintenance {
+		if e.TargetInMaintenance || e.NotProbed {
 			continue
 		}
 		if connectivityDegrades(e.Status) {

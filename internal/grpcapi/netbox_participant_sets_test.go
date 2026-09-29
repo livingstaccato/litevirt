@@ -74,7 +74,7 @@ var roleReadingSelectors = []string{"witness", "role", "Role"}
 // powerOffReadingFuncs are the functions that sample or read power-off evidence.
 // Only the runtime-proof derivation may be downstream of any of them.
 var powerOffReadingFuncs = []string{"hasFreshPowerOffProof", "hostIsReachable",
-	"freshFenceConfirmation", "snapshotPowerOffEvidence", "HealthyPeers"}
+	"freshFenceConfirmation", "snapshotPowerOffEvidence", "HealthyPeers", "peerUp", "PeerUp"}
 
 // unfilterableSets are the sets that must exclude NOBODY, plus the leg all three
 // share. Each is pinned to a signature that cannot express an exclusion: NAMES

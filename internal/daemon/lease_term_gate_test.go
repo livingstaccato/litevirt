@@ -8,6 +8,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -74,5 +75,42 @@ func TestWireLeaseTermLedgerGate_TheMintTracksTheDurableLatch(t *testing.T) {
 			"Unwired, this predicate fails closed and no term is ever minted, which is " +
 			"indistinguishable from a legitimate mid-roll — so nothing surfaces and " +
 			"lease_term_v1 withholds readiness forever")
+	}
+}
+
+// TestWireLeaseMintClearance_WithholdsUntilTheServerIsPublished pins the
+// wiring's two halves. Until the gRPC server is published the clearance
+// withholds every new term — lease holders start before the server exists, and
+// a daemon's first seconds are when its ledger is stalest — and once it is
+// published the server's answer is what decides.
+//
+// An unset clearance means "no check", so deleting the wiring mints at once and
+// fails the first assertion; a wiring that never delegates fails the second.
+func TestWireLeaseMintClearance_WithholdsUntilTheServerIsPublished(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("init schema: %v", err)
+	}
+	if err := corrosion.RegisterHost(ctx, db, corrosion.HostRecord{
+		Name: "host-a", Address: "10.0.0.1", State: "active", Role: "worker",
+	}); err != nil {
+		t.Fatalf("register host: %v", err)
+	}
+	d := &Daemon{db: db, cfg: &Config{}}
+	d.wireLeaseMintClearance()
+
+	now := time.Date(2026, 9, 29, 8, 34, 45, 0, time.UTC)
+	if held, term, err := corrosion.AcquireLeaseWithTerm(ctx, db, corrosion.LeaseKeyDualRun, "host-a", time.Minute, now); err != nil || held {
+		t.Fatalf("held=%v term=%d err=%v before the server was published; a new term must wait for "+
+			"the quorum read to exist", held, term, err)
+	}
+
+	// A cluster of one: the published server clears it without asking anyone.
+	d.mintClearance.Store(grpcapi.NewServerForTests(grpcapi.TestServerOpts{
+		HostName: "host-a", DataDir: t.TempDir(), DB: db,
+	}))
+	if held, term, err := corrosion.AcquireLeaseWithTerm(ctx, db, corrosion.LeaseKeyDualRun, "host-a", time.Minute, now); err != nil || !held || term != 1 {
+		t.Fatalf("held=%v term=%d err=%v once published; want term 1", held, term, err)
 	}
 }

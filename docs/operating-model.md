@@ -626,6 +626,52 @@ answer to a question the cluster never agreed on. Instead both claims persist on
 their own nodes and the conflict is flagged, which is why the alert above is the
 access path rather than a query.
 
+#### A node that was away does not claim a term from a stale ledger
+
+A new tenure's term is one above the highest term in the claiming node's own
+replica. That is only unique if the replica already holds every term the
+cluster has minted, and a node that was away does not. A restarted daemon, or
+a node reconnecting after a partition, comes back holding the ledger as it was
+when it left. Its own expired lease then looks free, and it would claim the
+term a peer took while it was gone: two claimants for one term, which is the
+permanent conflict described above.
+
+So before recording a **new** term, a node asks its peers for their newest term
+for that key. This is the same quorum read the lease-term barrier makes for
+executors (`GetLeaseTermHighWater`, sent to every healthy peer, with a quorum of
+answers required). The node records the term only when no answer has reached
+it. Otherwise the claim is withheld and the lease reported not held. Replication
+then delivers the row the node was missing, and on its next poll the node sees
+the real holder: it defers to a live holder, or takes over a dead holder's lease
+at the term after the one it was missing. The check keys on the ledger rather
+than on uptime, so a long partition healing is covered the same way a restart
+is.
+
+What a node waits for, concretely:
+
+- **After a daemon start: one health-probe cycle.** Until the checker's first
+  cycle completes, quorum reads as unknown, so no new term is claimed. In the
+  fleet harness that is about 2 s from start. A peer's newer term then holds
+  the claim back until replication delivers the row, which took about 1 s in
+  the fleet harness once the links healed.
+- **In the common case, nothing measurable.** A takeover mint costs one RPC per
+  healthy peer: about 7 ms in the fleet harness, against under 1 ms without the
+  read, on a lease with a TTL of tens of seconds. A renewal claims no term and
+  asks nothing, so a holder keeps its lease exactly as before, and a node that
+  sees a peer's live lease never gets as far as asking.
+- **A cluster of one does not wait at all.** A node with no other host in its
+  `hosts` table and no gossip member has nobody to ask and nobody who could hold
+  a higher term. It claims at once, including during the checker's warm-up.
+- **A node that has peers but reaches no quorum of them does not claim.** It
+  cannot tell whether a peer already took the term. This withholds a number,
+  not an action: everything the lease authorises (a fence, a reschedule) needs
+  quorum anyway. It claims as soon as a quorum answers. A holder that loses its
+  peers keeps renewing the term it already has.
+
+While a claim is withheld the daemon logs `leader lease: not claiming a new term
+yet` once per key, with the reason, and logs `new-term claim cleared` when the
+claim goes through.
+
 #### A contested lease still converges
 
 Keeping both claims is about the *evidence*. It does not mean both claimants
@@ -700,7 +746,10 @@ fencing token did its job — enforcement will refuse proofs from the losing
 tenure — but something upstream let both nodes believe they held the lease.
 Usually that is only two survivors of a leader death claiming it within one
 replication round, which converges on its own as described above; a contested
-term whose claimants were cut off from each other is a partition.
+term whose claimants were cut off from each other is a partition. A term claimed
+a few seconds after its claimant's daemon started, minutes after the other
+claim, is the stale-ledger claim described above, made by a build that did not
+yet wait for the quorum read.
 `litevirt_leader_lease_term` around the event tells you whether this was
 leadership churn or a partition.
 

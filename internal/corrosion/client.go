@@ -219,6 +219,14 @@ type Client struct {
 	// leader-lease term. See leader_lease_contest.go: it is what lets a
 	// contested lease converge while the contested ledger row is kept.
 	leaseContests leaseContestRegister
+	// leaseMintClearance, when set, is asked before this node records a NEW
+	// leader-lease term. See SetLeaseMintClearance and leader_lease_clearance.go.
+	leaseMintClearance LeaseMintClearanceFunc
+	// mintWithheld is, per lease key, why the last mint was withheld ("" or
+	// absent when it was not), so a node polling every few seconds logs the
+	// withholding once rather than every tick. Guarded by its own mutex.
+	mintWithheldMu sync.Mutex
+	mintWithheld   map[string]string
 	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
 	// its sorted content-hash pair and its CATEGORY. The pair makes
 	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is

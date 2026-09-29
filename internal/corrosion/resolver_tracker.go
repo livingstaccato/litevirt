@@ -22,13 +22,11 @@ import (
 // timestamp), a convergent merge, or a local write to the PK — so a later
 // genuine divergence re-alerts and the count reflects reality after repair.
 //
-// NOTE: a divergent table is NOT suppressed from anti-entropy re-pulls here.
-// Table-level suppression could hide an unrelated divergent row in the same
-// table; a correct, row-proofed bound (only suppress when EVERY remaining
-// differing PK matches a tracked unresolved content-pair) is a deferred
-// follow-up. Until then a persistently-unresolved table may be re-pulled each
-// cycle — a bounded cost paid only by genuinely-stuck rows awaiting repair, and
-// strictly safer than risking hidden divergence.
+// Anti-entropy stops re-pulling a table held apart only by tracked ties, with
+// the row-proofed bound: a pull is followed by a check that EVERY remaining
+// differing PK matches a pair tracked here, and the table is then skipped only
+// while neither side's digest moves (settled_ties.go). Table-level suppression
+// without that proof could hide an unrelated divergent row, so there is none.
 
 func unresolvedKey(table, pk string) string { return table + "\x00" + pk }
 

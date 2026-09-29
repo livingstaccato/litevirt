@@ -137,9 +137,13 @@ type Client struct {
 	// obsRepair records when anti-entropy last repaired the observation
 	// tables (observation_tables.go).
 	obsRepair observationRepair
-	hostName  string
-	clock     *hlc.Clock
-	version   string // local litevirtd binary version, for skew checks
+	// settled records, per (peer, table), a digest pair a pull proved differs
+	// only by ties this node already tracks (settled_ties.go).
+	settled settledTies
+
+	hostName string
+	clock    *hlc.Clock
+	version  string // local litevirtd binary version, for skew checks
 
 	// dataDir is where the durable monotonic-clock high-water lives
 	// (<dataDir>/nowts.hwm). Empty ⇒ no persistence (in-memory monotonic only:

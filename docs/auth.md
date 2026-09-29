@@ -518,6 +518,19 @@ keys=3f1c9e0a7b2d4c61
 rejected=0
 ```
 
+`primary` is the keyring's first key, and `keys` every key it decrypts with,
+primary first. `primary` is set at every stage but `false` — `install` too, where
+the host holds the key but still **sends plaintext** — so it says which key the
+host encrypts with *once its stage sends encrypted*, not that it is encrypting;
+`mode` says that. `lv host install-gossip-key` reports each host from both:
+
+| `mode` | Reported as |
+|---|---|
+| `off` | `off (gossip plaintext; key file ignored)` |
+| `install` | `install, sending plaintext, accepting plaintext and <keys>` |
+| `staged` | `staged, encrypting with <primary>, accepting plaintext and <keys>` |
+| `enforced` | `enforced, encrypting with <primary>, accepting only <keys>` |
+
 `rejected` counts gossip this node dropped since it started for being
 unencrypted or under a key it does not hold. It should stay flat through every
 step below; a rising count is a peer this node cannot hear.

@@ -20,6 +20,8 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // aeMeteredMethods are the anti-entropy RPCs the meter counts.
@@ -42,6 +44,21 @@ type AEMethodStats struct {
 type aeMeter struct {
 	mu      sync.Mutex
 	methods map[string]*AEMethodStats
+	// tablePulls counts, per table, the StreamTableDump requests that named
+	// it — how often a pass pulled THAT table, which the per-method tally
+	// cannot say when one pass pulls several.
+	tablePulls map[string]int
+}
+
+func (m *aeMeter) addTablePulls(tables []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.tablePulls == nil {
+		m.tablePulls = make(map[string]int)
+	}
+	for _, t := range tables {
+		m.tablePulls[t]++
+	}
 }
 
 func (m *aeMeter) add(method string, calls int, bytes int64) {
@@ -72,10 +89,20 @@ func (n *Node) aeMeterUnaryInterceptor(ctx context.Context, req any, info *grpc.
 	return resp, err
 }
 
-// meteredStream counts the bytes of every message the handler sends.
+// meteredStream counts the bytes of every message the handler sends, and
+// the tables a StreamTableDump request names.
 type meteredStream struct {
 	grpc.ServerStream
-	bytes int64
+	bytes  int64
+	tables []string
+}
+
+func (s *meteredStream) RecvMsg(m any) error {
+	err := s.ServerStream.RecvMsg(m)
+	if req, ok := m.(*pb.TableDumpRequest); ok && err == nil {
+		s.tables = append(s.tables, req.GetTables()...)
+	}
+	return err
 }
 
 func (s *meteredStream) SendMsg(m any) error {
@@ -93,6 +120,9 @@ func (n *Node) aeMeterStreamInterceptor(srv any, ss grpc.ServerStream, info *grp
 	ms := &meteredStream{ServerStream: ss}
 	err := handler(srv, ms)
 	n.aeMeter.add(name, 1, ms.bytes)
+	if len(ms.tables) > 0 {
+		n.aeMeter.addTablePulls(ms.tables)
+	}
 	return err
 }
 
@@ -112,11 +142,24 @@ func (c *Cluster) AEStats() map[string]AEMethodStats {
 	return out
 }
 
+// AETablePulls is how many StreamTableDump requests, across every node, named
+// table since the last ResetAEStats.
+func (c *Cluster) AETablePulls(table string) int {
+	total := 0
+	for _, n := range c.Nodes {
+		n.aeMeter.mu.Lock()
+		total += n.aeMeter.tablePulls[table]
+		n.aeMeter.mu.Unlock()
+	}
+	return total
+}
+
 // ResetAEStats zeroes every node's anti-entropy tally.
 func (c *Cluster) ResetAEStats() {
 	for _, n := range c.Nodes {
 		n.aeMeter.mu.Lock()
 		n.aeMeter.methods = nil
+		n.aeMeter.tablePulls = nil
 		n.aeMeter.mu.Unlock()
 	}
 }

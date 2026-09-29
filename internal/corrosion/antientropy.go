@@ -274,6 +274,21 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		slog.Debug("anti-entropy: observation drift left to its writers until the next observation repair",
 			"peer", peerName, "tables", observations)
 	}
+	// A table whose only difference from this peer is a tie already tracked,
+	// proven by an earlier pull at exactly these digests, is not pulled again
+	// until either side's digest moves (settled_ties.go). The operator's full
+	// pass pulls it regardless.
+	remoteMap := make(map[string]*pb.TableDigest, len(resp.Tables))
+	for _, r := range resp.Tables {
+		remoteMap[r.Name] = r
+	}
+	if !full {
+		var settled []string
+		if pull, settled = ae.client.deferSettledTies(peerName, pull, localMap, remoteMap); len(settled) > 0 {
+			slog.Debug("anti-entropy: not re-pulling tables whose only difference is an unresolved tie already tracked",
+				"peer", peerName, "tables", settled)
+		}
+	}
 	if len(pull) > 0 {
 		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", pull)
 		// Only the mismatched tables: pulling the full dump for one drifted
@@ -289,6 +304,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 			completed = false
 		} else {
 			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
+			ae.client.recordSettledTies(ctx, peerName, pull, data, remoteMap)
 			if obsDue {
 				ae.client.markObservationsRepaired(now)
 			}

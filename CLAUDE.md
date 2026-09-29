@@ -158,8 +158,9 @@ There are exceptions, of two different kinds, and neither is "the one":
   one place, `capabilities.mandatory` (read it; prose copies of it have gone
   stale twice). They are reserved for a token stating a *fact about the binary*
   rather than a policy — at the time of writing `split_brain_gate_v1`,
-  `lease_term_ledger_v1`, `credentials_split_v1` and `host_membership_split_v1`,
-  but trust the declaration, not this list. A mandatory token has no flag to turn off in an incident — see
+  `lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
+  `failover_scope_v1` and `voter_config_v1`, but trust the declaration, not
+  this list. A mandatory token has no flag to turn off in an incident — see
   the per-token stand-down notes beside that declaration.
   `credentials_split_v1` has none at all. Once latched, hosts dual-write the
   credential tables and the old secret columns and never clear the old ones.
@@ -182,13 +183,23 @@ There are exceptions, of two different kinds, and neither is "the one":
   recognised by its ENTRY instead — the old column is set with no new-table
   statement beside it (`internal/corrosion/unlatched_origin.go`) — and
   absorbed locally on apply and on the local write path.
+  `failover_scope_v1` has no flag either: the replicated `cluster_policies`
+  row is the opt-in, and `lv cluster failover-scope cluster` is the stand-down
+  (docs/design/region-scoped-failover.md).
+  `voter_config_v1` is mandatory but advertised only once the node can vote
+  durably (`grpcapi.VoterConfigReadiness`: `synchronous=FULL`, host signing key
+  loads). A flag would let one node count a different majority from its peers,
+  so its stand-down is the decided `lv cluster voter reset`, which moves every
+  node back to the derived voter set at one generation. Once a generation is
+  adopted, `corrosion.VoterSet` returns its members whatever host state or any
+  flag says (docs/design/recovery-claims.md §4).
 - **Conditionally advertised** — `hardware_v2` has no flag of its own either,
   but it is gated differently: each node's startup hardware audit plus a latched
   `operation_protocol_v1` decide whether it is advertised at all.
 
 Some mandatory tokens are additionally `capabilities.ReplicationGated`
-(`lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`;
-the set is
+(`lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
+`failover_scope_v1`, `voter_config_v1`; the set is
 `capabilities.replicationGated`): the latch is a claim about what every host
 still receiving replication can *decode* or *read*, so it is confirmed against
 admitted memberlist membership — not merely against voting-eligible members. A

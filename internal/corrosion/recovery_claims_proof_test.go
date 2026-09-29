@@ -41,6 +41,127 @@ func lastMutationSQL(t *testing.T, c *Client) string {
 	return rows[0].String("stmts")
 }
 
+// TestVerifyClaimCertificate_AtTheDestination is §3.10 as a destination runs
+// it: against the proof it is about to claim and ITS OWN adopted voter set.
+//
+// Mutations: skip CertificateAuthorizesProof in VerifyClaimCertificate — the
+// proof for another destination verifies; skip the adopted-generation check —
+// the node that adopted nothing verifies; skip ReplacedByForcedGeneration —
+// the certificate from a replaced generation verifies; verify against a quorum
+// of 1 — the single accept verifies.
+func TestVerifyClaimCertificate_AtTheDestination(t *testing.T) {
+	ctx := context.Background()
+	f := newCertFixture(t)
+	dest := f.voters[2] // adopted generation 1, did not sign
+	enc, err := f.cert.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := *f.value.Proof
+	proof.ClaimCertificate = enc
+	// The value's source is part of the digest; a proof carries the binding
+	// fields and the certificate carries the source.
+	if _, err := VerifyClaimCertificate(ctx, dest.c, f.verifier, proof); err != nil {
+		t.Fatalf("a genuine certificate for this exact proof was refused: %v", err)
+	}
+
+	refused := func(t *testing.T, c *Client, p ActionProof, contains string) {
+		t.Helper()
+		_, err := VerifyClaimCertificate(ctx, c, f.verifier, p)
+		if err == nil || !strings.Contains(err.Error(), contains) {
+			t.Fatalf("want a refusal mentioning %q, got %v", contains, err)
+		}
+	}
+	t.Run("no certificate", func(t *testing.T) {
+		p := proof
+		p.ClaimCertificate = ""
+		refused(t, dest.c, p, "no recovery-claim certificate")
+	})
+	t.Run("another destination", func(t *testing.T) {
+		p := proof
+		p.DestHost = "c"
+		refused(t, dest.c, p, "digests to")
+	})
+	t.Run("another epoch", func(t *testing.T) {
+		p := proof
+		p.OwnerEpoch = "4"
+		refused(t, dest.c, p, "decides")
+	})
+	t.Run("generation not adopted here", func(t *testing.T) {
+		fresh := newClaimTestVoter(t, f.ca, "d")
+		refused(t, fresh.c, proof, "has not adopted")
+	})
+	t.Run("too few accepts", func(t *testing.T) {
+		c := f.cert
+		c.Accepts = c.Accepts[:1]
+		one, _ := c.Encode()
+		p := proof
+		p.ClaimCertificate = one
+		refused(t, dest.c, p, "needs 2")
+	})
+	t.Run("a generation a forced one replaced", func(t *testing.T) {
+		v := newClaimTestVoter(t, f.ca, "c")
+		adoptHandBuilt(t, 1, membersOf(f.voters...), v)
+		forced := VoterConfigValue{Generation: 2, Members: membersOf(f.voters[0]), Change: "force:b,c",
+			CreatedBy: "t", CreatedAt: "t"}
+		if err := WriteVoterConfig(ctx, v.c, forced, ClaimCertificate{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := RecordVoterAdoption(ctx, v.c, 2); err != nil {
+			t.Fatal(err)
+		}
+		refused(t, v.c, proof, "forced generation 2 replaced")
+	})
+}
+
+// TestSensitiveAE_ReMaterializedProofCopiesConverge: a coordinator that loses
+// a claim re-materializes the winner's proof with its own created_at and
+// without the winner's evidence fields; the winner's lifecycle UPDATEs then
+// stamp both copies with one updated_at. The two copies are one proof, and
+// anti-entropy must settle them on one row — keeping local on the exact tie
+// left the replicas' digests apart forever.
+//
+// Mutation: drop the equal-binding tie-break in proofMergeKeepLocalRow — the
+// two rows stay different after merging both ways.
+func TestSensitiveAE_ReMaterializedProofCopiesConverge(t *testing.T) {
+	ctx := context.Background()
+	winner, loser := mustTestClient(t), mustTestClient(t)
+	for _, c := range []*Client{winner, loser} {
+		c.SetRecoveryClaimGate(func() bool { return true })
+	}
+	p := claimProof("p-copy")
+	full := p
+	full.LeaseHolder, full.QuorumLive, full.QuorumNeeded = "a", 2, 2
+	full.ClaimCertificate = certFor(t, p, "v", 1, 0)
+	bare := p
+	bare.ClaimCertificate = certFor(t, p, "v", 1, 0)
+	if err := WriteActionProof(ctx, winner, full); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteActionProof(ctx, loser, bare); err != nil {
+		t.Fatal(err)
+	}
+	// The same lifecycle UPDATE, applied verbatim on both, as WAL relay does.
+	for _, c := range []*Client{winner, loser} {
+		if err := c.Execute(ctx, `UPDATE runtime_action_proofs SET status = 'completed', executor_host = 'b',
+			completed_at = 'T', updated_at = '2026-01-01T00:00:00Z' WHERE id = ?`, p.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	winner.MergeSensitiveStateBytesLWW(loser.DumpSensitiveStateBytes())
+	loser.MergeSensitiveStateBytesLWW(winner.DumpSensitiveStateBytes())
+	row := func(c *Client) string {
+		rows, err := c.Query(ctx, `SELECT * FROM runtime_action_proofs WHERE id = ?`, p.ID)
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("read proof: %v", err)
+		}
+		return proofRowEncoding(rows[0].Values)
+	}
+	if w, l := row(winner), row(loser); w != l {
+		t.Fatalf("two copies of one proof did not converge:\n  winner %q\n  loser  %q", w, l)
+	}
+}
+
 // TestProofClaimCertificate_EmittedOnlyOnceLatched: the claim_certificate
 // column's shapes are new in v60, and a previous-release peer that meets one
 // stalls its stream, so a proof carrying a certificate is refused — retryably

@@ -79,6 +79,77 @@ func CertificateAuthorizesProof(certJSON string, p ActionProof) (ClaimCertificat
 	return cert, nil
 }
 
+// VerifyClaimCertificate is the destination's check of the certificate on p
+// (docs/design/recovery-claims.md §3.10), in order:
+//
+//  1. the certificate is present and parses;
+//  2. it decides p's target at p's owner epoch (the caller has already
+//     compared p's owner epoch with its own fresh row — the existing ABA
+//     check — so this binds the certificate to the generation being left);
+//  3. its value digest is the digest of p's binding fields with its source;
+//  4. its voter generation is one this node has adopted, with members, and
+//     not one a forced reconfiguration replaced; and a majority of DISTINCT
+//     members of it signed at one ballot, each with the incarnation its entry
+//     records;
+//  5. every counted accept's certificate chains to the cluster CA, names the
+//     voter, is not revoked, and its signature verifies.
+//
+// It reads nothing but this node's own replica and makes no RPC: execution
+// stays independent of voter reachability beyond the quorum ExecutionGate
+// already requires. Signatures are what make that safe — a certificate in a
+// replicated row can be written by any peer, and without them a forged row
+// could name any voters.
+func VerifyClaimCertificate(ctx context.Context, c *Client, v *ClaimVerifier, p ActionProof) (ClaimCertificate, error) {
+	if p.ClaimCertificate == "" {
+		return ClaimCertificate{}, fmt.Errorf("proof %s carries no recovery-claim certificate", p.ID)
+	}
+	cert, err := CertificateAuthorizesProof(p.ClaimCertificate, p)
+	if err != nil {
+		return cert, err
+	}
+	adopted, err := AdoptedVoterGeneration(ctx, c)
+	if err != nil {
+		return cert, fmt.Errorf("read the adopted voter generation: %w", err)
+	}
+	if cert.ConfigGeneration < 1 || cert.ConfigGeneration > adopted {
+		return cert, fmt.Errorf("certificate is at voter generation %d, which this node has not adopted (adopted %d)",
+			cert.ConfigGeneration, adopted)
+	}
+	if forced, err := ReplacedByForcedGeneration(ctx, c, cert.ConfigGeneration); err != nil {
+		return cert, err
+	} else if forced > 0 {
+		return cert, fmt.Errorf("certificate is at voter generation %d, which forced generation %d replaced; "+
+			"it executes only once re-certified at %d or later", cert.ConfigGeneration, forced, forced)
+	}
+	cfg, err := GetVoterConfig(ctx, c, cert.ConfigGeneration)
+	if err != nil {
+		return cert, err
+	}
+	if !cfg.Explicit() {
+		return cert, fmt.Errorf("voter generation %d has no members to have certified anything", cert.ConfigGeneration)
+	}
+	err = v.Verify(cert, CertExpectation{
+		Key: cert.Key, ValueDigest: cert.ValueDigest, ConfigGeneration: cert.ConfigGeneration,
+		Electorate: cfg.Members, Quorum: MajorityOf(len(cfg.Members)),
+	})
+	return cert, err
+}
+
+// ClaimGatedAction reports whether a proof of this action transfers ownership
+// to a new destination and so needs a recovery-claim certificate once
+// recovery_claim_v1 is enforced (§9 Q7): reschedule, promote and relocate. LB
+// apply and owner assert stay on their current gates — neither transfers
+// ownership. A relocate an OWNER drives (container cold migration, the source
+// alive and moving its own workload) is exempted by the caller, which is the
+// one that can tell the two apart.
+func ClaimGatedAction(action string) bool {
+	switch action {
+	case ActionReschedule, ActionPromote, ActionRelocate:
+		return true
+	}
+	return false
+}
+
 // ClaimCertificateReplaces reports whether certificate next may take the place
 // of current on one proof row. An empty current is replaced by anything that
 // decodes; otherwise next must certify the same value and be at a LATER voter

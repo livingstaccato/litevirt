@@ -138,6 +138,45 @@ func claimRefusalReason(err error) string {
 	return health.ReasonClaimNoMajority
 }
 
+// verifyRecoveryClaim is the executor's check (§3.10): under enforcement, an
+// ownership-transfer proof executes only with a certificate that verifies
+// against this node's own adopted voter set and the cluster CA. It returns the
+// gate-refusal reason with the error; "" and nil when the proof may proceed.
+//
+// ownerMove exempts a relocate its OWNER drives (a container cold migration:
+// the source host, alive, moving its own workload), which claims do not cover
+// (§2 non-goals). Only the caller can tell the two apart.
+func (s *Server) verifyRecoveryClaim(ctx context.Context, p corrosion.ActionProof, ownerMove bool) (string, error) {
+	if !corrosion.ClaimGatedAction(p.Action) || (ownerMove && p.Action == corrosion.ActionRelocate) {
+		return "", nil
+	}
+	if !s.RecoveryClaimEnforced(ctx) {
+		return "", nil
+	}
+	_, verifier, err := s.claimIdentity()
+	if err != nil {
+		return health.ReasonClaimUnproven, status.Errorf(codes.Unavailable,
+			"cannot verify the recovery-claim certificate on proof %s: %v", p.ID, err)
+	}
+	if _, err := corrosion.VerifyClaimCertificate(ctx, s.db, verifier, p); err != nil {
+		return health.ReasonClaimUnproven, status.Errorf(codes.FailedPrecondition,
+			"%s: proof %s (%s of %s/%s to %s) is not authorized by a recovery-claim certificate this node can verify: %v",
+			health.ReasonClaimUnproven, p.ID, p.Action, p.TargetKind, p.TargetName, p.DestHost, err)
+	}
+	return "", nil
+}
+
+// RecoveryClaimGateForPendingProof is the executor-side certificate check for
+// a proof read off the REPLICATED ROW rather than received over an RPC: a VM
+// reschedule claimed by internal/health's reconciler, and a container
+// relocate-recreate claimed by its container checker. Injected into both, for
+// the LeaseTermGateForPendingProof reason — internal/health cannot import this
+// package, and one implementation serves every executor. Returns the
+// countable reason with the error; the caller counts it on its own observer.
+func (s *Server) RecoveryClaimGateForPendingProof(ctx context.Context, pr corrosion.ProofRecord) (string, error) {
+	return s.verifyRecoveryClaim(ctx, pr.ActionProof, false)
+}
+
 // RecoveryClaimEnforced is the enforcement predicate (§5.1): the flag AND the
 // cluster-wide latch AND an adopted voter generation with members. Without a
 // member generation there is no majority to certify anything, so enforcement

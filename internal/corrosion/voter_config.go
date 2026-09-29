@@ -244,6 +244,28 @@ func ListVoterAdoptions(ctx context.Context, c *Client) ([]VoterAdoption, error)
 	return out, nil
 }
 
+// IsForcedChange reports whether a generation's change is a forced
+// reconfiguration (force:<lost,...>, §4.6).
+func IsForcedChange(change string) bool { return strings.HasPrefix(change, voterChangeForcePfx) }
+
+// ReplacedByForcedGeneration returns the lowest ADOPTED forced generation above
+// gen, 0 when none. A generation at or below a forced one certifies nothing any
+// more (§3.10 step 4): the forced change could not keep its majority
+// intersecting the one it replaced, so a value certified before it executes
+// only once it is re-certified after it.
+func ReplacedByForcedGeneration(ctx context.Context, c *Client, gen int64) (int64, error) {
+	rows, err := c.Query(ctx, `SELECT COALESCE(MIN(v.generation), 0) AS g FROM voter_configs v
+		WHERE v.deleted_at IS NULL AND v.generation > ? AND v.change LIKE 'force:%'
+		  AND v.generation <= (SELECT COALESCE(MAX(generation), 0) FROM local_voter_adoption)`, gen)
+	if err != nil {
+		return 0, fmt.Errorf("read forced voter generations: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Int64("g"), nil
+}
+
 // ExpectedVoterConfigCertificate is what the certificate deciding next must
 // certify, given the generation it replaces (prev, nil for the first
 // generation). A generation that follows an empty one — genesis, or the first

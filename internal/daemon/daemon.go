@@ -949,6 +949,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// injected because internal/grpcapi imports internal/health and cannot be
 	// imported back — one implementation, wired to both callers.
 	reconciler.SetLeaseTermGate(svc.LeaseTermGateForPendingProof)
+	// The recovery-claim certificate is checked at the same boundary, for the
+	// same reason: a reschedule proof is claimed off the replicated row here,
+	// and a relocate-recreate proof by the container checker.
+	reconciler.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -1273,6 +1277,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
 	// enforced — wired before the container reconcile loop starts.
 	ctChecker.SetGate(d.checker)
+	ctChecker.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
 	ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
 	ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// The sweep holds the same per-container lock as this host's container

@@ -133,13 +133,15 @@ type VoterMember struct {
 	Incarnation string `json:"incarnation"`
 }
 
-// Voter-config change kinds (§4.1). force:<...> belongs to
-// the forced reconfiguration of design §4.6, which is not in this release.
+// Voter-config change kinds (§4.1). force:<lost,...> is the forced
+// reconfiguration of §4.6, decided by the survivors' unanimous signatures
+// rather than by a majority of the generation it replaces.
 const (
-	VoterChangeGenesis = "genesis"
-	VoterChangeReset   = "reset"
-	voterChangeAddPfx  = "add:"
-	voterChangeRmPfx   = "rm:"
+	VoterChangeGenesis  = "genesis"
+	VoterChangeReset    = "reset"
+	voterChangeAddPfx   = "add:"
+	voterChangeRmPfx    = "rm:"
+	voterChangeForcePfx = "force:"
 )
 
 // VoterChangeAdd and VoterChangeRm name a one-member change.

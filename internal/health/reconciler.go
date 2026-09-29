@@ -149,6 +149,9 @@ type Reconciler struct {
 
 	// leaseTermGate judges a pending proof's lease term. See SetLeaseTermGate.
 	leaseTermGate LeaseTermGate
+	// recoveryClaimGate verifies a pending proof's recovery-claim certificate.
+	// See SetRecoveryClaimGate.
+	recoveryClaimGate RecoveryClaimGate
 	// sharedStorageFenceEnforce is the config kill-switch for the shared-disk
 	// ownership-transfer fence gate (enforcement.shared_storage_fence). With it AND
 	// SharedStorageFenceV1 latched, an ownership-transfer start of a VM with a
@@ -204,6 +207,13 @@ func (r *Reconciler) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord)
 // and an error. Implemented by grpcapi.
 type LeaseTermGate func(ctx context.Context, pr corrosion.ProofRecord) (*corrosion.TermFence, string, error)
 
+// RecoveryClaimGate verifies the recovery-claim certificate on a proof read off
+// the replicated row (docs/design/recovery-claims.md §3.10) and returns a
+// countable refusal reason with an error, or "" and nil to proceed.
+// Implemented by grpcapi (RecoveryClaimGateForPendingProof), which answers
+// "proceed" whenever recovery claims are not enforced.
+type RecoveryClaimGate func(ctx context.Context, pr corrosion.ProofRecord) (string, error)
+
 type runtimeGate interface {
 	ExecutionGate(ctx context.Context) GateResult
 	CapabilityActive(ctx context.Context, token string) (bool, string)
@@ -235,6 +245,13 @@ func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
 // verdict rather than a compile error. nil leaves the path exactly as it was
 // before Phase 2.
 func (r *Reconciler) SetLeaseTermGate(fn LeaseTermGate) { r.leaseTermGate = fn }
+
+// SetRecoveryClaimGate injects the executor-side certificate check for a
+// pending proof (grpcapi's RecoveryClaimGateForPendingProof), for the
+// SetLeaseTermGate reason: it lives with the verifier and the voter set in
+// internal/grpcapi, which imports this package. nil leaves the path as it was
+// before recovery claims.
+func (r *Reconciler) SetRecoveryClaimGate(fn RecoveryClaimGate) { r.recoveryClaimGate = fn }
 
 // SetOwnerEpochBackfill enables the Phase 4 backfill pass in each sweep
 // (enforcement.owner_epoch; the daemon wires it).
@@ -1231,6 +1248,23 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				return
 			}
 			termFence = fence
+		}
+
+		// Recovery claims, EXECUTE side (docs/design/recovery-claims.md §3.10):
+		// after the exact-match and owner-epoch checks above and BEFORE the
+		// claim. This is the check that makes two coordinators' reschedules
+		// safe: each can write a well-formed proof into its own replica, and
+		// only the one a majority of voters certified verifies here. A refusal
+		// leaves the row pending, like every other gate refusal, so a
+		// certificate whose voter generation or CRL has not replicated yet
+		// verifies on a later tick.
+		if r.recoveryClaimGate != nil {
+			if reason, cerr := r.recoveryClaimGate(ctx, pr); cerr != nil {
+				slog.Warn("reconciler: pending proof refused — no recovery-claim certificate verifies",
+					"vm", vm.Name, "proof", proofID, "reason", reason, "error", cerr)
+				r.noteGateRefused(corrosion.ActionReschedule, reason)
+				return
+			}
 		}
 
 		if err := corrosion.ClaimActionProofFenced(ctx, r.db, proofID, r.hostName, termFence); err != nil {

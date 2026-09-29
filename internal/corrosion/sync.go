@@ -1302,6 +1302,19 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	}
 
 	keepLocal := proofMergeKeepLocal(localStatus, localTS, incomingStatus, incomingTS)
+	// Two copies of ONE proof — the same binding, at the same status and the
+	// same updated_at — that differ elsewhere converge on the greater encoding
+	// rather than each keeping its own. That is the shape a recovery claim
+	// produces on purpose: a coordinator that loses a claim re-materializes the
+	// winner's proof (docs/design/recovery-claims.md §3.13 step 5) with its own
+	// created_at and without the winner's evidence fields, and the winner's
+	// lifecycle UPDATEs then stamp both copies with one updated_at. Keeping
+	// local on that exact tie left the two replicas' digests apart forever. A
+	// copy that binds something ELSE is never taken this way.
+	if localStatus == incomingStatus && lwwOrder(localTS, incomingTS) == 0 &&
+		proofBindingCellsEqual(table.Columns, localRow, row) {
+		keepLocal = proofRowEncoding(localRow) >= proofRowEncoding(row)
+	}
 	// Forward-only step_state in BOTH directions: whichever row wins, the merge must
 	// not drop a checkpoint the other side already recorded — losing "started" would
 	// let a promote resume destroy a running domain.
@@ -1341,6 +1354,37 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 		}
 	}
 	return keepLocal, nil
+}
+
+// proofBindingColumns are the runtime_action_proofs columns ProofBindingEqual
+// compares.
+var proofBindingColumns = []string{"action", "target_kind", "target_name", "dest_host", "coordinator",
+	"relocation_token", "fence_epoch", "owner_epoch", "lease_term", "lease_key"}
+
+// proofBindingCellsEqual is ProofBindingEqual over two dumped rows. A binding
+// column one side lacks compares as unequal: an incomplete dump cannot prove
+// two rows are one proof.
+func proofBindingCellsEqual(cols []string, a, b []interface{}) bool {
+	for _, name := range proofBindingColumns {
+		i := indexOf(cols, name)
+		if i < 0 || i >= len(a) || i >= len(b) {
+			return false
+		}
+		if fmt.Sprint(a[i]) != fmt.Sprint(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// proofRowEncoding is a total order over dumped rows for the tie-break above.
+func proofRowEncoding(row []interface{}) string {
+	var sb strings.Builder
+	for _, v := range row {
+		sb.WriteString(fmt.Sprint(v))
+		sb.WriteByte(0)
+	}
+	return sb.String()
 }
 
 // updateProofStepState folds a unioned step_state back into the surviving local row

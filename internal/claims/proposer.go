@@ -69,8 +69,11 @@ type Outcome struct {
 	Value       corrosion.ClaimValue
 	Digest      string
 	Certificate corrosion.ClaimCertificate
-	// Ours reports whether the decided value is the one Propose built. When it
-	// is not, another proposer's value was chosen and this call completed it.
+	// Ours reports whether the decided value is one Propose built during this
+	// Decide — in the deciding round, or in an earlier round whose phase 2
+	// reached a voter before a higher ballot outranked it, so the value came
+	// back in a promise. When it is not, another proposer's value was chosen
+	// and this call completed it.
 	Ours bool
 }
 
@@ -206,6 +209,9 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 		round = 1
 	}
 	var lastErr error
+	// own is every value digest Propose built during this Decide, so a value
+	// re-learned from a promise can be recognised as this call's own.
+	own := map[string]bool{}
 	for attempt := 0; attempt < maxRounds; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
@@ -214,7 +220,7 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 			return Outcome{}, err
 		}
 		b := p.ballot(spec.Key, round, spec.ReuseRound && attempt == 0)
-		out, stale, err := p.try(ctx, spec, b)
+		out, stale, err := p.try(ctx, spec, b, own)
 		if err == nil {
 			return out, nil
 		}
@@ -236,7 +242,7 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 
 // try runs both phases at one ballot. stale is the highest promise a voter
 // refused us with, zero when no refusal was about the ballot.
-func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot) (Outcome, corrosion.Ballot, error) {
+func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot, own map[string]bool) (Outcome, corrosion.Ballot, error) {
 	var stale corrosion.Ballot
 	noteStale := func(reason string, promised corrosion.Ballot) {
 		if reason == corrosion.RefusalBallotStale && corrosion.CompareBallots(promised, stale) > 0 {
@@ -277,6 +283,11 @@ func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot) (Outc
 	digest, err := value.Digest()
 	if err != nil {
 		return Outcome{}, corrosion.Ballot{}, err
+	}
+	if ours {
+		own[digest] = true
+	} else {
+		ours = own[digest]
 	}
 	if !p.bind(spec.Key, b.Round, digest) {
 		// A reused round that would carry another value: move above it.

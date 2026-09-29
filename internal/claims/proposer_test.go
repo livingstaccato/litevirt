@@ -46,6 +46,8 @@ type memTransport struct {
 	down    map[string]bool
 	// probe is every voter's owner probe; nil reaches nothing.
 	probe corrosion.OwnerProbe
+	// beforeAccept, when set, runs before every Accept is delivered.
+	beforeAccept func(voter string, b corrosion.Ballot)
 }
 
 var dbSeq atomic.Int64
@@ -153,7 +155,11 @@ func (m *memTransport) Accept(ctx context.Context, voter string, key corrosion.C
 	if m.probe != nil {
 		probe = m.probe
 	}
+	hook := m.beforeAccept
 	m.mu.Unlock()
+	if hook != nil {
+		hook(voter, b)
+	}
 	res, err := mv.db.ClaimAccept(ctx, key, b, v, gen, mv.signer, probe)
 	if err == nil && res.Accepted {
 		m.mu.Lock()
@@ -316,6 +322,53 @@ func TestProposer_DuellingProposersConverge(t *testing.T) {
 	}
 	if outs[0].Ours == outs[1].Ours {
 		t.Fatalf("exactly one proposer's own value should win (ours=%v/%v)", outs[0].Ours, outs[1].Ours)
+	}
+}
+
+// TestProposer_RelearningItsOwnValueIsOurs: a proposer whose phase 2 reached
+// one voter before another proposer's Prepare outranked it retries higher,
+// finds its OWN value accepted in a promise and re-proposes it. The decided
+// value is the one it built, so the outcome is Ours — a caller that reads
+// !Ours as "another coordinator won" would otherwise count its own recovery
+// lost, and in a duel neither side would report the win.
+//
+// Mutation: report Ours only for a value built in the deciding round (the
+// old rule) — Ours is false.
+func TestProposer_RelearningItsOwnValueIsOurs(t *testing.T) {
+	tr, voters := newMemCluster(t, "a", "b", "c")
+	all := names(voters)
+	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "vm-relearn", OwnerEpoch: 1}
+	var once sync.Once
+	tr.beforeAccept = func(_ string, b corrosion.Ballot) {
+		if b.Round != 1 {
+			return
+		}
+		// Before any round-1 Accept lands, another proposer promises round 2
+		// on b and c: only a accepts round 1.
+		once.Do(func() {
+			rival := corrosion.Ballot{Round: 2, Coordinator: "rival", Nonce: []byte{7}}
+			for _, v := range []string{"b", "c"} {
+				if _, err := tr.voters[v].db.ClaimPrepare(context.Background(), key, rival, 1); err != nil {
+					t.Errorf("rival prepare on %s: %v", v, err)
+				}
+			}
+		})
+	}
+	p := NewProposer("a", tr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := p.Decide(ctx, workloadSpec(key, all, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Value.Proof.DestHost != "a" {
+		t.Fatalf("decided %s, want the proposer's own value", out.Value.Proof.DestHost)
+	}
+	if out.Certificate.Ballot.Round < 3 {
+		t.Fatalf("decided at round %d; the scenario needs a retry above the rival", out.Certificate.Ballot.Round)
+	}
+	if !out.Ours {
+		t.Fatal("the proposer re-learned and decided its own value, and reported it as another's")
 	}
 }
 

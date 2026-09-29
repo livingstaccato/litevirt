@@ -458,8 +458,9 @@ CREATE TABLE IF NOT EXISTS local_voter_incarnation (
 );
 ```
 
-This is schema v58 (v56 is the credentials split and v57 is `host_membership`,
-colonelpanik/litevirt#267), with the `createTableUnits` markers. The accept is
+This is schema v59 (v56 is the credentials split, v57 is `host_membership`,
+colonelpanik/litevirt#267, and v58 is `cluster_policies`,
+colonelpanik/litevirt#265), with the `createTableUnits` markers. The accept is
 stored as JSON in `accept_json`, which carries the signature, rather than in a
 bare `accept_signature` column.
 
@@ -1240,9 +1241,9 @@ The kill switch follows the reversible `configFlag && latch` model described in
 
 ### 5.7 Schema summary
 
-- Node-local tables (v58): `local_recovery_claims`, `local_voter_incarnation`,
+- Node-local tables (v59): `local_recovery_claims`, `local_voter_incarnation`,
   `local_voter_adoption`. `local_abandoned_proofs` (proposed) comes with §3.12.
-- Replicated table (v58): `voter_configs`, written only after `voter_config_v1`
+- Replicated table (v59): `voter_configs`, written only after `voter_config_v1`
   latches.
 - Replicated column (proposed, with `recovery_claim_v1`):
   `runtime_action_proofs.claim_certificate`, appended last and emitted only

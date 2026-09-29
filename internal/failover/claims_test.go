@@ -246,6 +246,80 @@ func TestImageRecreate_ClaimsBeforeItMints(t *testing.T) {
 	}
 }
 
+// TestClaimMetrics_PhaseClaimResults: every claim outcome is counted on the
+// existing attempt triple under PhaseClaim (§5.4) — ok, lost, owner_reachable,
+// no_majority and superseded — so a stuck recovery is visible on
+// litevirt_failover_attempts_total with no new series.
+//
+// Mutation: drop the mAttempt call in claimAttempt — no PhaseClaim sample is
+// recorded.
+func TestClaimMetrics_PhaseClaimResults(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		decide func(corrosion.ClaimKey, corrosion.ClaimValue) (claims.Outcome, error)
+		want   string
+	}{
+		{"ok", decideOurs, ResultOK},
+		{"lost", decideTheirs(corrosion.ActionReschedule, "other"), ResultLost},
+		{"owner reachable", func(corrosion.ClaimKey, corrosion.ClaimValue) (claims.Outcome, error) {
+			return claims.Outcome{}, &claims.NoMajorityError{Phase: "accept", Refusals: []claims.Refusal{
+				{Voter: "live", Reason: corrosion.RefusalOwnerReachable, Detail: "live still reaches dead"}}}
+		}, ResultOwnerReachable},
+		{"no majority", func(corrosion.ClaimKey, corrosion.ClaimValue) (claims.Outcome, error) {
+			return claims.Outcome{}, &claims.NoMajorityError{Phase: "prepare", Refusals: []claims.Refusal{
+				{Voter: "live", Reason: claims.ReasonUnreachable}}}
+		}, ResultNoMajority},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, c := claimFixture(t, &fakeClaimer{decide: tc.decide})
+			m := newFakeMetrics()
+			c.Metrics = m
+			c.run(context.Background())
+			if m.attempts[foKey(PhaseClaim, tc.want, "")] == 0 {
+				t.Fatalf("no %s/%s sample; attempts=%v", PhaseClaim, tc.want, m.attempts)
+			}
+		})
+	}
+}
+
+// TestClaimMetrics_Superseded: a decided promote of this coordinator's own,
+// abandoned by its destination, moves the claim to attempt 1 and is counted
+// as superseded; the reschedule is then minted at attempt 1.
+//
+// Mutation: drop the superseded sample in claimRecovery.
+func TestClaimMetrics_Superseded(t *testing.T) {
+	cl := &fakeClaimer{}
+	cl.decide = func(key corrosion.ClaimKey, v corrosion.ClaimValue) (claims.Outcome, error) {
+		if key.Attempt == 0 {
+			p := *v.Proof
+			p.ID, p.Action, p.DestHost = "own-promote", corrosion.ActionPromote, "other"
+			out, err := decideOurs(key, corrosion.ClaimValue{Proof: &p, SourceHost: v.SourceHost})
+			out.Ours = false
+			return out, err
+		}
+		return decideOurs(key, v)
+	}
+	cl.abandon = func(string, corrosion.ClaimKey, string) (string, error) { return `{"host":"other"}`, nil }
+	db, c := claimFixture(t, cl)
+	m := newFakeMetrics()
+	c.Metrics = m
+	c.run(context.Background())
+	if m.attempts[foKey(PhaseClaim, ResultSuperseded, "")] == 0 {
+		t.Fatalf("no superseded sample; attempts=%v", m.attempts)
+	}
+	if len(cl.abandonAsked) != 1 || cl.abandonAsked[0] != "other/own-promote" {
+		t.Fatalf("the abandonment was not asked of the promote's destination: %v", cl.abandonAsked)
+	}
+	ps := vmProofs(t, db)
+	if len(ps) != 1 {
+		t.Fatalf("want one reschedule proof after the supersede, got %+v", ps)
+	}
+	cert, err := corrosion.DecodeClaimCertificate(ps[0].ClaimCertificate)
+	if err != nil || cert.Key.Attempt != 1 {
+		t.Fatalf("the reschedule was not decided at attempt 1: %+v %v", cert.Key, err)
+	}
+}
+
 func mustVM(t *testing.T, db *corrosion.Client, name string) *corrosion.VMRecord {
 	t.Helper()
 	vm, err := corrosion.GetVM(context.Background(), db, name)

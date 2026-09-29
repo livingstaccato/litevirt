@@ -319,6 +319,10 @@ type Server struct {
 	// cluster is big enough that enforcing does not break failover".
 	enfLeaseTerm   bool
 	leaseTermReady func() bool
+	// enfRecoveryClaim is enforcement.recovery_claim: the opt-in that lets
+	// recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
+	// reversible kill switch afterwards (recovery_claim_enforce.go).
+	enfRecoveryClaim bool
 	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
 	// and the token latched, this node refuses replication from an isolated host.
 	enfIsolationEpoch bool
@@ -894,6 +898,19 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.voterConfigAdvertisable() {
 		caps = withoutCapability(caps, capabilities.VoterConfigV1)
 	}
+	// recovery_claim_v1 is withheld while enforcement.recovery_claim is off,
+	// and the reason is the question CLAUDE.md asks of every token: where is
+	// the guarantee enforced? At EXECUTION. A coordinator cannot stop another
+	// coordinator from minting, so every flag-on node relies on every peer
+	// claiming before it mints and verifying before it executes, and a
+	// flag-off peer is the uncertified second owner — not merely permissive.
+	// The latch has to mean config uniformity. Readiness is local reads only
+	// (this runs inside the Ping handler). See
+	// TestAdvertise_RecoveryClaimWithheldWhileOff and, for the opposite answer
+	// to the same question, TestAdvertise_SharedStorageFenceIsUnconditional.
+	if !s.enfRecoveryClaim || !s.recoveryClaimAdvertisable() {
+		caps = withoutCapability(caps, capabilities.RecoveryClaimV1)
+	}
 	return caps
 }
 
@@ -1254,6 +1271,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
+	case capabilities.RecoveryClaimV1:
+		return s.enfRecoveryClaim
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch
 	case capabilities.NetBoxIPAMV1:

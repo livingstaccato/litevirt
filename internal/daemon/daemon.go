@@ -938,6 +938,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// latched, and a cluster large enough that the quorum barrier does not break
 	// failover.
 	svc.SetLeaseTermEnforce(d.cfg.Enforcement.LeaseTerm)
+	// recovery_claim_v1: advertised only with the flag on and this node ready
+	// (split_brain_gate_v1 latched, able to vote durably), enforced only with
+	// the flag AND the latch AND an adopted voter generation.
+	svc.SetRecoveryClaimEnforce(d.cfg.Enforcement.RecoveryClaim)
 	// The reconciler is the SECOND executor boundary for this regime: a VM
 	// reschedule proof never travels over an RPC, so it is claimed off the
 	// replicated row there rather than in claimCarriedProof. The judgment is

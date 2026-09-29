@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -157,7 +158,7 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// The other self-report: tokens advertised above but NOT acted on,
 		// because their kill-switch is off here. DIAGNOSTIC ONLY — see
 		// PingResponse.not_enforcing and notEnforcingTokens.
-		NotEnforcing: notEnforcingIf(disclosePosture, advertised, s.tokenEnabled),
+		NotEnforcing: s.notEnforcingIf(disclosePosture, advertised),
 		// True on this binary for a caller allowed to see posture, so an empty
 		// NotEnforcing above reads as "nothing unenforced" rather than "too old
 		// to say". FALSE for a caller that is not, which lands in the same
@@ -202,7 +203,53 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // decisions it actually gates — so every supported token with no kill-switch
 // case (hardware_v2 today) would be reported unenforced on every node forever.
 func (s *Server) notEnforcingTokens() []string {
-	return notEnforcingFrom(s.advertisedCapabilities(), s.tokenEnabled)
+	return s.notEnforcingWith(s.advertisedCapabilities())
+}
+
+// notEnforcingWith is notEnforcingFrom plus the one report it cannot make: a
+// token this node has LATCHED but withholds because its flag is off.
+//
+// A conditionally-advertised token drops out of `advertised` the moment its
+// flag goes off, which is what keeps a fresh latch from forming across the
+// node — so notEnforcingFrom, scoped to what is advertised, never sees it. For
+// recovery_claim_v1 that silence is the dangerous case: the node has latched
+// the protocol with its peers, stopped claiming and verifying, and is now the
+// uncertified second owner a partial stand-down produces
+// (docs/design/recovery-claims.md §5.2, §5.6). Its enforcing peers raise
+// ha_degraded because it no longer advertises; this is the self-report beside
+// it, so the posture reads the same from either end.
+func (s *Server) notEnforcingWith(advertised []string) []string {
+	out := notEnforcingFrom(advertised, s.tokenEnabled)
+	return append(out, s.withheldStandDowns(advertised)...)
+}
+
+// withheldStandDowns lists latched tokens this node withholds because its own
+// flag is off. Only tokens whose stand-down a peer must be told about are
+// considered.
+func (s *Server) withheldStandDowns(advertised []string) []string {
+	if s.gate == nil {
+		return nil
+	}
+	var out []string
+	for _, tok := range []string{capabilities.RecoveryClaimV1} {
+		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && s.gate.Latched(tok) {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// notEnforcingIf is the disclosure gate, taking the same decision that sets
+// PingResponse.posture_reported so the two cannot drift apart. Populating the
+// list while reporting posture_reported=false would be worse than either
+// consistent answer: postureFromPing reads the flag first and would discard a
+// list it had already been handed, so the disclosure would happen with none of
+// the benefit.
+func (s *Server) notEnforcingIf(disclose bool, advertised []string) []string {
+	if !disclose {
+		return nil
+	}
+	return s.notEnforcingWith(advertised)
 }
 
 // tokensWithoutKillSwitch have no enforcement.* flag at all, so tokenEnabled
@@ -214,19 +261,6 @@ func (s *Server) notEnforcingTokens() []string {
 // (docs/diagnostics.md); token_enabled_test.go pins the same gap.
 var tokensWithoutKillSwitch = map[string]bool{
 	capabilities.HardwareV2: true,
-}
-
-// notEnforcingIf is the disclosure gate, taking the same decision that sets
-// PingResponse.posture_reported so the two cannot drift apart. Populating the
-// list while reporting posture_reported=false would be worse than either
-// consistent answer: postureFromPing reads the flag first and would discard a
-// list it had already been handed, so the disclosure would happen with none of
-// the benefit.
-func notEnforcingIf(disclose bool, advertised []string, enabled func(string) bool) []string {
-	if !disclose {
-		return nil
-	}
-	return notEnforcingFrom(advertised, enabled)
 }
 
 // notEnforcingFrom is the pure half of notEnforcingTokens, taking the advertised

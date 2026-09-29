@@ -343,6 +343,23 @@ enforcement:
                               # Deliberately not a version check — mixed-version rolling
                               # upgrades keep working. Pre-latch clusters behave exactly as
                               # before. Enable fleet-uniformly; reversible kill switch.
+  recovery_claim: false       # single-winner recovery claims (recovery_claim_v1,
+                              # design/recovery-claims.md). The failover coordinator
+                              # collects a majority certificate from the explicit voter set
+                              # before it mints a reschedule, promote or container-relocate
+                              # proof, and the destination verifies it before it executes
+                              # (refusing with recovery_claim_unproven otherwise), so two
+                              # coordinators that both think they lead can never both start
+                              # one workload. Enforced only with this flag AND the latch AND
+                              # an adopted voter generation (`lv cluster voter ls`).
+                              # Advertised only while the flag is on and the node is ready
+                              # (split_brain_gate_v1 latched, able to vote durably), so the
+                              # latch means every host opted in. Set it on EVERY host,
+                              # witnesses included. Off everywhere + restart is the full
+                              # stand-down: recovery is authorized as before, and voters keep
+                              # their history. Off on only some hosts is the hazard, not a
+                              # degraded mode — such a host reports recovery_claim_v1 in
+                              # PingResponse.not_enforcing and its peers raise ha_degraded.
   gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
                               # with the cluster key in <pki_dir>/gossip.key. false is
                               # plaintext; true is encrypted-only (anything unencrypted or

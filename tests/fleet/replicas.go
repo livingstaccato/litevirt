@@ -75,6 +75,11 @@ type LinkFault struct {
 	// independently of replication: a claim RPC is ordinary gRPC, and a
 	// scenario needs to reach a voter by one and not the other.
 	BlockClaims bool
+	// BlockProbe refuses the Ping a voter's owner probe dials
+	// (docs/design/recovery-claims.md §3.5.1) on the link. Directed, like
+	// every fault here: SetLinkFault(voter, owner, LinkFault{BlockProbe:
+	// true}) makes owner unreachable to that one voter and to nobody else.
+	BlockProbe bool
 }
 
 // LinkStats counts what the injector did on one directed link.
@@ -186,19 +191,31 @@ var claimMethods = map[string]bool{
 	"ListRecoveryClaims":   true,
 }
 
-// claimBlocked reports whether BlockClaims refuses caller's claim RPC into n.
+// claimBlocked reports whether BlockClaims refuses caller's claim RPC into n,
+// or BlockProbe the Ping an owner probe dials.
 func (n *Node) claimBlocked(fullMethod string, caller string) bool {
-	if !claimMethods[methodName(fullMethod)] || caller == "" {
+	m := methodName(fullMethod)
+	if (!claimMethods[m] && m != "Ping") || caller == "" {
 		return false
 	}
 	n.faults.mu.Lock()
 	defer n.faults.mu.Unlock()
 	ls := n.faults.links[caller]
-	if ls == nil || !ls.fault.BlockClaims {
+	if ls == nil || (claimMethods[m] && !ls.fault.BlockClaims) || (m == "Ping" && !ls.fault.BlockProbe) {
 		return false
 	}
 	ls.stats.Blocked++
 	return true
+}
+
+// Kill takes n out of the cluster as a powered-off host is: replication,
+// claim RPCs and the owner probe all fail in both directions.
+func (c *Cluster) Kill(n *Node) {
+	for _, o := range c.Nodes {
+		if o != n {
+			c.SetLinkFaultBoth(n, o, LinkFault{Block: true, BlockClaims: true, BlockProbe: true})
+		}
+	}
 }
 
 // linkBlocked reports whether the Block fault refuses caller's replication RPCs
@@ -481,6 +498,11 @@ func (c *Cluster) NewCoordinators(clock *VirtualClock) *Coordinators {
 		// daemon wires it. Inert until a scenario opens the voter_configs
 		// gate (OpenVoterConfigGate).
 		coord.VoterGenesis = n.Server.VoterGenesisTick
+		// Recovery claims, wired as the daemon wires them: the server is the
+		// claimer and its predicate decides whether to claim. Inert until a
+		// scenario enables them (enableRecoveryClaims).
+		coord.Claimer = n.Server
+		coord.RecoveryClaimEnforced = n.Server.RecoveryClaimEnforced
 		cs.ByNode[n.Name] = coord
 	}
 	return cs

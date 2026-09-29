@@ -11,7 +11,11 @@
 //
 // It is the scenario failover_independent_test.go runs with replication
 // completing inside one poll; here the two polls land inside one replication
-// round.
+// round. Without recovery claims both arms produce TWO owners — the bug the
+// issue reports, kept as a witness so the enforced arm cannot pass vacuously.
+// With recovery_claim_v1 enforced the two coordinators' claims are one Paxos
+// decision, so exactly one destination holds a certificate and only it starts
+// (docs/design/recovery-claims.md §3.16).
 package fleet
 
 import (
@@ -45,20 +49,39 @@ func (quorateGate) PeerSupportsFresh(context.Context, string, string) bool { ret
 
 var _ failover.FailoverGate = quorateGate{}
 
+// TestFleet_TwoCoordinators_OneFailedHost_AtMostOneWritableOwner.
+//
+// Mutation (claims arm): drop the recovery-claim gate in startPendingVM —
+// both destinations start the VM and the arm goes red. The two claims-off
+// arms are the same assertion inverted: they show the double owner the issue
+// reports, and fail if a change makes it disappear without claims (in which
+// case the enforced arm would be proving nothing).
 func TestFleet_TwoCoordinators_OneFailedHost_AtMostOneWritableOwner(t *testing.T) {
-	t.Skip("colonelpanik/litevirt#250: two coordinators can each authorize recovery inside one replication round; see issue")
-
 	for _, tc := range []struct {
-		name  string
-		gated bool // split_brain_gate_v1 enforced: proof-linked reschedule, claimed by the executor
+		name   string
+		gated  bool // split_brain_gate_v1 enforced: proof-linked reschedule, claimed by the executor
+		claims bool // recovery_claim_v1 enforced: claim before mint, verify before execute
+		// rogue: b's COORDINATOR does not claim — it mints an uncertified proof,
+		// as a coordinator with the flag off does — while every destination
+		// still verifies. The destination is where G2 says the guarantee is
+		// enforced, and this is the arm in which only it can hold.
+		rogue bool
 	}{
-		{"legacy", false},
-		{"proof-gated", true},
+		{"legacy", false, false, false},
+		{"proof-gated", true, false, false},
+		{"proof-gated-with-claims", true, true, false},
+		{"proof-gated-with-claims-and-an-uncertified-coordinator", true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			clock := NewVirtualClock(time.Now().UTC())
-			c, a, b, _ := failedHostFleet(t, clock, "vm-victim")
+			var c *Cluster
+			var a, b, victim *Node
+			if tc.claims {
+				c, a, b, victim = claimFleet(t, clock, 266, "vm-victim")
+			} else {
+				c, a, b, victim = failedHostFleet(t, clock, "vm-victim")
+			}
 
 			// Each survivor runs a workload of its own, known to both.
 			for _, n := range []*Node{a, b} {
@@ -72,6 +95,7 @@ func TestFleet_TwoCoordinators_OneFailedHost_AtMostOneWritableOwner(t *testing.T
 			c.WaitConverged(t, convergeTimeout, a, b)
 
 			// The decision window opens: nothing crosses between the coordinators.
+			// Claim RPCs are ordinary gRPC and still reach their peer (§3.16).
 			c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
 
 			// Each survivor stops its own workload, and the other does not hear of
@@ -92,14 +116,22 @@ func TestFleet_TwoCoordinators_OneFailedHost_AtMostOneWritableOwner(t *testing.T
 					coord.Gate = quorateGate{}
 				}
 			}
+			if tc.rogue {
+				cs.ByNode[b.Name].RecoveryClaimEnforced = func(context.Context) bool { return false }
+			}
 			// Both polls fire inside the window.
 			cs.Tick(ctx, a, b)
 
 			// Each survivor's executor acts on its own replica.
 			for _, n := range []*Node{a, b} {
-				rec := health.NewReconciler(n.Name, t.TempDir(), n.DB, n.Virt)
-				if tc.gated {
-					rec.SetGate(epochGate{})
+				var rec *health.Reconciler
+				if tc.claims {
+					rec = claimReconciler(t, n)
+				} else {
+					rec = health.NewReconciler(n.Name, t.TempDir(), n.DB, n.Virt)
+					if tc.gated {
+						rec.SetGate(epochGate{})
+					}
 				}
 				rec.ReconcileOnce(ctx)
 			}
@@ -114,10 +146,68 @@ func TestFleet_TwoCoordinators_OneFailedHost_AtMostOneWritableOwner(t *testing.T
 					owners = append(owners, n.Name)
 				}
 			}
-			if len(owners) > 1 {
-				t.Errorf("%d writable owners of vm-victim (%s) after one failed host and two coordinators; "+
-					"fences=%+v\n  %s",
-					len(owners), strings.Join(owners, ", "), cs.Fences(), strings.Join(views, "\n  "))
+			detail := fmt.Sprintf("fences=%+v\n  %s", cs.Fences(), strings.Join(views, "\n  "))
+			if !tc.claims {
+				// The issue, reproduced: each coordinator authorized its own
+				// destination and each destination started the VM.
+				if len(owners) != 2 {
+					t.Fatalf("without recovery claims this scenario produced %d writable owners, not the two "+
+						"colonelpanik/litevirt#250 reports — the witness no longer reproduces the bug\n  %s",
+						len(owners), detail)
+				}
+				return
+			}
+			if len(owners) != 1 {
+				t.Fatalf("%d writable owners of vm-victim (%s) with recovery claims enforced, want exactly one\n  %s",
+					len(owners), strings.Join(owners, ", "), detail)
+			}
+			winner, loser := a, b
+			if owners[0] == b.Name {
+				winner, loser = b, a
+			}
+			if tc.rogue {
+				// b minted its own proof in its own replica and pointed the VM at
+				// itself; its destination refused it for want of a certificate.
+				if winner != a {
+					t.Fatalf("the uncertified coordinator's destination %s started the VM\n  %s", b.Name, detail)
+				}
+				return
+			}
+			// The loser wrote no pending row naming itself and no proof naming
+			// itself: whatever it wrote is the winner's decided proof (§3.13).
+			if vm := vmOn(t, loser, "vm-victim"); vm.HostName == loser.Name {
+				t.Errorf("the loser %s's replica points vm-victim at itself: %+v", loser.Name, vm)
+			}
+			if ids := proofsNaming(t, loser, "vm-victim", loser.Name); len(ids) != 0 {
+				t.Errorf("the loser %s holds proof(s) naming itself as the destination: %v", loser.Name, ids)
+			}
+
+			// Heal: replication resumes between the survivors (the victim stays
+			// dead). Both replicas agree on one owner, and no second domain ever
+			// ran — the 40 s split in the issue's report becomes none.
+			c.ClearLinkFaults()
+			c.Kill(victim)
+			// leader_lease_terms keeps both survivors' claims of the contested
+			// term by design (leader_lease_contest_test.go); everything else,
+			// the proof rows included, converges.
+			// The two copies of the decided proof differ in what a value does not
+			// carry (the loser's created_at, the winner's evidence fields and
+			// certificate ballot); anti-entropy is what settles them, as it runs
+			// periodically in a daemon.
+			for _, n := range []*Node{a, b} {
+				corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
+			}
+			c.WaitConvergedExcept(t, convergeTimeout, []string{"leader_lease_terms"}, a, b)
+			for _, n := range []*Node{a, b} {
+				if vm := vmOn(t, n, "vm-victim"); vm.HostName != winner.Name {
+					t.Errorf("after the heal %s's replica says vm-victim is on %s, want the one owner %s",
+						n.Name, vm.HostName, winner.Name)
+				}
+			}
+			for _, ev := range loser.Virt.EventLog() {
+				if ev.Domain == "vm-victim" && ev.Op == "start" {
+					t.Errorf("the loser %s started vm-victim at %s", loser.Name, ev.When)
+				}
 			}
 		})
 	}

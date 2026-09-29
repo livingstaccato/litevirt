@@ -83,6 +83,13 @@ type Config struct {
 	BindPort      int      // gossip port (default 7946)
 	JoinPeers     []string // initial peers to join
 
+	// GossipEncryption is this node's enforcement.gossip_encryption stage and
+	// GossipKeys the keyring it starts with, primary first (see
+	// gossip_keyring.go). Every stage but off requires at least one key.
+	// GossipKeys formats as key IDs only, so a logged Config leaks nothing.
+	GossipEncryption GossipEncryption
+	GossipKeys       GossipKeys
+
 	// pushPullInterval overrides memberlist's periodic full-state exchange.
 	// Test-only: zero keeps the LAN default.
 	pushPullInterval time.Duration
@@ -93,6 +100,14 @@ type Client struct {
 	db   *sql.DB
 	mu   sync.RWMutex
 	list *memberlist.Memberlist
+	// gossipMode is the stage memberlist was created with, and gossipKeyring the
+	// keyring it encrypts with (nil when off). The keyring changes live through
+	// SetGossipKeys, serialised by gossipKeyMu; the stage never changes.
+	// gossipRejected counts gossip memberlist dropped on encryption grounds.
+	gossipMode     GossipEncryption
+	gossipKeyring  *memberlist.Keyring
+	gossipKeyMu    sync.Mutex
+	gossipRejected atomic.Uint64
 	// stopMembership ends the gossip re-join loop and membershipDone closes
 	// once it has returned. Close waits on it before closing the database: the
 	// loop reads the hosts table and stamps the isolation condition, and a loop
@@ -849,7 +864,13 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	// Empty leaves memberlist's auto-detection in place (see Config.AdvertiseAddr
 	// for why that is only safe on an unambiguously single-homed host).
 	mlCfg.AdvertiseAddr = cfg.AdvertiseAddr
-	mlCfg.LogOutput = &slogWriter{}
+	mlCfg.LogOutput = &slogWriter{client: c}
+	ring, err := configureGossipEncryption(mlCfg, cfg.GossipEncryption, cfg.GossipKeys)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	c.gossipMode, c.gossipKeyring = cfg.GossipEncryption, ring
 
 	if cfg.pushPullInterval > 0 {
 		mlCfg.PushPullInterval = cfg.pushPullInterval
@@ -1566,9 +1587,15 @@ func (r Row) get(col string) interface{} {
 }
 
 // slogWriter adapts slog for memberlist's io.Writer log output.
-type slogWriter struct{}
+type slogWriter struct {
+	// client, when set, counts the encryption rejections memberlist logs.
+	client *Client
+}
 
 func (w *slogWriter) Write(p []byte) (int, error) {
+	if w.client != nil {
+		w.client.observeGossipLog(string(p))
+	}
 	slog.Debug(string(p))
 	return len(p), nil
 }

@@ -136,13 +136,23 @@ func New(cfg *Config) (*Daemon, error) {
 	// Create HLC clock for this node
 	clock := hlc.NewClock(cfg.HostName)
 
+	// The gossip key is loaded before gossip starts: every stage but off refuses
+	// to come up without one rather than join plaintext under a flag that says
+	// otherwise.
+	gossipKeys, err := gossipKeysFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	// Open embedded state store and join gossip cluster
 	db, err := corrosion.NewClient(corrosion.Config{
-		HostName:      cfg.HostName,
-		DataDir:       cfg.DataDir,
-		BindPort:      cfg.GossipPort,
-		AdvertiseAddr: cfg.AdvertiseAddress,
-		JoinPeers:     cfg.JoinPeers,
+		HostName:         cfg.HostName,
+		DataDir:          cfg.DataDir,
+		BindPort:         cfg.GossipPort,
+		AdvertiseAddr:    cfg.AdvertiseAddress,
+		JoinPeers:        cfg.JoinPeers,
+		GossipEncryption: cfg.Enforcement.GossipEncryption,
+		GossipKeys:       gossipKeys,
 	}, clock)
 	if err != nil {
 		return nil, fmt.Errorf("state store: %w", err)
@@ -696,6 +706,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// certificate, and a revocation that never arrives is a decommissioned node
 	// still holding a working peer credential.
 	go d.runCRLSync(ctx)
+
+	// Keep the live gossip keyring in step with pki_dir/gossip.key, and report
+	// what it is using to pki_dir/gossip-keyring.state — the barrier
+	// `lv host rotate-gossip-key` waits on between phases. Runs when gossip
+	// encryption is off too, so the rotate and install commands can tell an
+	// off node from one that never started.
+	go d.db.WatchGossipKeyFile(ctx,
+		filepath.Join(d.cfg.PKIDir, pki.GossipKeyName),
+		filepath.Join(d.cfg.PKIDir, pki.GossipKeyringStateName),
+		gossipKeyReloadInterval)
 
 	// Publish this host's signed audit chain head periodically and at shutdown.
 	// Nothing else can detect a truncated tail: the hash chain links backward,

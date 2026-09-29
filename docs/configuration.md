@@ -343,6 +343,17 @@ enforcement:
                               # Deliberately not a version check — mixed-version rolling
                               # upgrades keep working. Pre-latch clusters behave exactly as
                               # before. Enable fleet-uniformly; reversible kill switch.
+  gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
+                              # with the cluster key in <pki_dir>/gossip.key. false is
+                              # plaintext; true is encrypted-only (anything unencrypted or
+                              # under another key is dropped). An EXISTING cluster walks
+                              # there in three rolling restarts, each finished on every host
+                              # first: install (key loaded, still sends plaintext), staged
+                              # (sends encrypted, still accepts plaintext), true. Nodes one
+                              # stage apart interoperate; two apart cannot gossip. Every
+                              # value but false refuses to start without a usable gossip.key.
+                              # `lv host init` writes true for a new cluster. No capability
+                              # token. See auth.md "Gossip encryption".
 
 # External NetBox IPAM integration. Disabled by default; when disabled no
 # NetBox client is constructed and no behaviour changes (no HTTP, no goroutine).
@@ -897,10 +908,10 @@ difference rather than a judgement that this endpoint carries less.
 | `metrics_port` | 7444 | HTTP | **no** | **all** | Prometheus `/metrics` — see above |
 | `ui_port` | 7445 | HTTP | session cookie | `127.0.0.1` | Web dashboard |
 | `rest_port` | 7446 | HTTP | bearer token | `127.0.0.1` | REST API gateway |
-| `gossip_port` | 7946 | TCP+UDP | **no** — no memberlist `SecretKey`; members are admitted only if they are in the `hosts` table ([details](operating-model.md#gossip-admits-only-known-hosts-but-is-not-authenticated)) | **all** | Cluster membership |
+| `gossip_port` | 7946 | TCP+UDP | only with `enforcement.gossip_encryption: true` — AES-256-GCM under `gossip.key` ([details](auth.md#gossip-encryption)); members are also admitted only if they are in the `hosts` table ([details](operating-model.md#gossip-admits-only-known-hosts-and-is-authenticated-only-when-encrypted)) | **all** | Cluster membership |
 | `dns_port` | 5354 | UDP | **no** | **all** | VM name DNS |
 
-Three of these are unauthenticated, not one. `rest_port` and `ui_port` are
+Three of these are unauthenticated, not one (two once `enforcement.gossip_encryption` is `true` on every host). `rest_port` and `ui_port` are
 protected by *binding to loopback* rather than by their credential, which is the
 same mechanism `metrics_bind` offers and the reason the bind column is here.
 Restricting `gossip_port` and `dns_port` is out of scope for this setting — they

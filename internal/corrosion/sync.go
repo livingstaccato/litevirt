@@ -1323,6 +1323,23 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 			}
 		}
 	}
+	// The claim certificate is evidence, merged like step_state: whichever row
+	// wins the lifecycle merge carries the better of the two certificates
+	// (betterClaimCertificate), so a row that gained one — or a
+	// re-certification — is never lost to a copy without it, and two replicas
+	// holding different certificates for one decision converge on one.
+	if certIdx := indexOf(table.Columns, "claim_certificate"); certIdx >= 0 {
+		lc, _ := localRow[certIdx].(string)
+		ic, _ := row[certIdx].(string)
+		best := betterClaimCertificate(lc, ic)
+		if !keepLocal {
+			row[certIdx] = best
+		} else if best != lc {
+			if err := c.updateProofClaimCertificateLocal(tx, table.Name, pkCols, pkIdx, row, best); err != nil {
+				return false, err
+			}
+		}
+	}
 	return keepLocal, nil
 }
 

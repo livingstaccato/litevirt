@@ -2,24 +2,47 @@ package grpcapi
 
 import (
 	"context"
+	"net"
+	"path/filepath"
 	"slices"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // recoveryClaimServer is a voter-ready server whose gate latches exactly the
 // given tokens.
 func recoveryClaimServer(t *testing.T, flag bool, latched ...string) *Server {
 	t.Helper()
-	s := voterTestServer(t)
+	s := namedVoterServer(t)
 	tok := map[string]bool{}
 	for _, l := range latched {
 		tok[l] = true
 	}
 	s.SetGate(fakeServerGate{execOK: true, enforcedTok: tok})
 	s.SetRecoveryClaimEnforce(flag)
+	return s
+}
+
+// namedVoterServer is voterTestServer whose server name is its database's, as
+// in a daemon: a voter answers as the client's host name and signs with the
+// server's certificate, and testServer's two names differ.
+func namedVoterServer(t *testing.T) *Server {
+	t.Helper()
+	s := testServer(t)
+	s.hostName = s.db.HostName()
+	dir := t.TempDir()
+	caCert, caKey := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")
+	if err := pki.GenerateCA(caCert, caKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := pki.GenerateHostCert(caCert, caKey, filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"),
+		s.hostName, net.ParseIP("127.0.0.1")); err != nil {
+		t.Fatal(err)
+	}
+	s.pkiDir = dir
 	return s
 }
 

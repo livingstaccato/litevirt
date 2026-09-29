@@ -22,7 +22,7 @@ func proofFromPB(p *pb.RuntimeActionProof) corrosion.ActionProof {
 		QuorumLive: int(p.GetQuorumLive()), QuorumNeeded: int(p.GetQuorumNeeded()),
 		RelocationToken: p.GetRelocationToken(), FenceEpoch: p.GetFenceEpoch(),
 		OwnerEpoch: p.GetOwnerEpoch(), LeaseTerm: p.GetLeaseTerm(),
-		LeaseKey: p.GetLeaseKey(),
+		LeaseKey: p.GetLeaseKey(), ClaimCertificate: p.GetClaimCertificate(),
 	}
 }
 
@@ -48,7 +48,7 @@ func proofToPB(p corrosion.ActionProof) *pb.RuntimeActionProof {
 		QuorumLive: int32(p.QuorumLive), QuorumNeeded: int32(p.QuorumNeeded),
 		RelocationToken: p.RelocationToken, FenceEpoch: p.FenceEpoch,
 		OwnerEpoch: p.OwnerEpoch, LeaseTerm: p.LeaseTerm,
-		LeaseKey: p.LeaseKey,
+		LeaseKey: p.LeaseKey, ClaimCertificate: p.ClaimCertificate,
 	}
 }
 

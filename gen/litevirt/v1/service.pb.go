@@ -17799,9 +17799,17 @@ type RuntimeActionProof struct {
 	// is received and where a term is judged — the reschedule path reads the
 	// replicated ROW rather than a carried proof, so the row cannot be trusted
 	// on the strength of some other node having checked it.
-	LeaseKey      string `protobuf:"bytes,15,opt,name=lease_key,json=leaseKey,proto3" json:"lease_key,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	LeaseKey string `protobuf:"bytes,15,opt,name=lease_key,json=leaseKey,proto3" json:"lease_key,omitempty"`
+	// claim_certificate is the recovery-claim certificate that authorizes an
+	// ownership-transfer proof (docs/design/recovery-claims.md §3.9): the JSON
+	// corrosion.ClaimCertificate, a majority of voters' signed accepts for
+	// exactly this binding. Evidence, not a binding field — the executor
+	// verifies it offline against the voter set and the cluster CA before it
+	// claims the proof, once recovery_claim_v1 is enforced. "" = none.
+	// Additive/wire-compatible.
+	ClaimCertificate string `protobuf:"bytes,16,opt,name=claim_certificate,json=claimCertificate,proto3" json:"claim_certificate,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RuntimeActionProof) Reset() {
@@ -17935,6 +17943,13 @@ func (x *RuntimeActionProof) GetLeaseTerm() int64 {
 func (x *RuntimeActionProof) GetLeaseKey() string {
 	if x != nil {
 		return x.LeaseKey
+	}
+	return ""
+}
+
+func (x *RuntimeActionProof) GetClaimCertificate() string {
+	if x != nil {
+		return x.ClaimCertificate
 	}
 	return ""
 }
@@ -29360,7 +29375,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04data\x18\a \x01(\fR\x04data\"W\n" +
 	"\x1cPushReplicaIncrementResponse\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12#\n" +
-	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xf9\x03\n" +
+	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\"\xa6\x04\n" +
 	"\x12RuntimeActionProof\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x16\n" +
 	"\x06action\x18\x02 \x01(\tR\x06action\x12\x1f\n" +
@@ -29383,7 +29398,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"ownerEpoch\x12\x1d\n" +
 	"\n" +
 	"lease_term\x18\x0e \x01(\x03R\tleaseTerm\x12\x1b\n" +
-	"\tlease_key\x18\x0f \x01(\tR\bleaseKey\"F\n" +
+	"\tlease_key\x18\x0f \x01(\tR\bleaseKey\x12+\n" +
+	"\x11claim_certificate\x18\x10 \x01(\tR\x10claimCertificate\"F\n" +
 	"\x1eAcknowledgeLeaseTermTieRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x03R\x04term\"E\n" +

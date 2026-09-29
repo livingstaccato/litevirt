@@ -356,6 +356,12 @@ type Client struct {
 	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes
 	// back-pressure a previous-release peer. See voter_config.go.
 	voterConfigGate atomic.Pointer[func() bool]
+	// recoveryClaimGate, when set and returning true, permits emitting the
+	// claim_certificate column's statement shapes on runtime_action_proofs.
+	// Injected via SetRecoveryClaimGate, wired to the durable
+	// recovery_claim_v1 latch. Fails CLOSED when unset: those shapes
+	// back-pressure a previous-release peer. See recovery_claims_proof.go.
+	recoveryClaimGate atomic.Pointer[func() bool]
 	// hostMembershipLive is set once a SplitHostMembership pass has completed
 	// with the gate open (also persisted under dataDir); from then on writers
 	// write host_membership and readers read it.

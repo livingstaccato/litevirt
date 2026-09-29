@@ -288,6 +288,16 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 				"promote refused: destination %q does not advertise the shared-storage fence gate", host)
 		}
 		req.Proof.DestHost = host
+		// Claim before mint (docs/design/recovery-claims.md §3.13): the promote
+		// proof's destination is known only now, so this — not the coordinator
+		// before it called AutoPromoteReplica — is where the promote is
+		// claimed. Only the coordinator's automated promotion claims; an
+		// operator PromoteReplica is a deliberate manual override (§2).
+		if automated && s.RecoveryClaimEnforced(ctx) {
+			if err := s.claimPromote(ctx, vm, req.Proof); err != nil {
+				return err
+			}
+		}
 		// WriteActionProofValidated, not WriteActionProof: req.Proof may be
 		// CALLER-SUPPLIED. This block is gated on req.Proof != nil, not on
 		// `automated`, so a peer-mTLS caller's proof lands here too.

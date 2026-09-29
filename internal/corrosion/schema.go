@@ -448,7 +448,17 @@ import (
 //	     claim state, minted once when the table is first created) and
 //	     local_voter_adoption (which generations this node has adopted and
 //	     which sealed majority it imported claim state from). Four new tables.
-const CurrentSchemaVersion = 59
+//	v60: recovery claims are enforced (recovery_claim_v1,
+//	     colonelpanik/litevirt#250) — runtime_action_proofs gains
+//	     claim_certificate, the majority certificate that authorizes an
+//	     ownership-transfer proof (reschedule, promote, failover relocate). It
+//	     is evidence, not a binding field: ProofBindingEqual ignores it, and a
+//	     row may gain one or have it replaced by a re-certification of the same
+//	     value. The column's statement shapes are emitted only once
+//	     recovery_claim_v1 has latched (ReplicationGated), so a
+//	     previous-release peer never sees one. One additive column, appended
+//	     LAST for the v53 digest reason.
+const CurrentSchemaVersion = 60
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1222,7 +1232,8 @@ var schemaDDL = []string{
 		-- about this table's digest forever with identical rows, wherever
 		-- digest_v2 is off. Put every future additive column here, not above.
 		lease_term        INTEGER NOT NULL DEFAULT 0, -- lease incarnation term (v52); 0 = proof minted without one
-		lease_key         TEXT NOT NULL DEFAULT '' -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
+		lease_key         TEXT NOT NULL DEFAULT '', -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
+		claim_certificate TEXT NOT NULL DEFAULT '' -- recovery-claim certificate authorizing this proof (v60); '' = none
 	)`,
 
 	// operations / operation_steps / project_authority_epochs (v41, F1 operation
@@ -3080,6 +3091,11 @@ var schemaMigrations = []string{
 	// by design — so a term is only interpretable together with its key.
 	// Additive with a '' default, which pairs with lease_term 0.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_key TEXT NOT NULL DEFAULT ''`,
+	// v60: the recovery-claim certificate authorizing an ownership-transfer
+	// proof (docs/design/recovery-claims.md §3.9). Evidence, not a binding
+	// field: '' reads as "no certificate", which a destination enforcing
+	// recovery_claim_v1 refuses.
+	`ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3171,6 +3187,7 @@ var alterVersions = []int{
 	51, // netbox_bindings.netbox_cluster
 	53, // runtime_action_proofs.lease_term
 	54, // runtime_action_proofs.lease_key
+	60, // runtime_action_proofs.claim_certificate
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema

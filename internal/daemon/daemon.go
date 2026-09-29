@@ -581,6 +581,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireCredentialsSplitGate()
 	d.wireClusterPolicyGate()
 	d.wireVoterConfigGate()
+	d.wireRecoveryClaimGate()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag, for the same reason as
@@ -1338,6 +1339,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// executor half, and both read this one flag so the source and the enforcer
 	// can never disagree about whether enforcement is on.
 	fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
+	// Recovery claims (docs/design/recovery-claims.md §3.13): the coordinator
+	// claims through the server's proposer before it mints a reschedule or
+	// relocate proof (the server claims a promote itself, once it knows the
+	// replica's host), and reads the server's enforcement predicate, so the
+	// mint side and the executor side on this node read one answer.
+	fc.Claimer = svc
+	fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is
@@ -2476,6 +2484,19 @@ func (d *Daemon) wireLeaseMintClearance() {
 func (d *Daemon) wireVoterConfigGate() {
 	d.db.SetVoterConfigGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.VoterConfigV1)
+	})
+}
+
+// wireRecoveryClaimGate lets corrosion emit the claim_certificate column's
+// statement shapes (schema v60) only once recovery_claim_v1 is DURABLY
+// latched. The token is replication-gated, so the latch proves every host
+// this one replicates to decodes them; unwired, the gate fails closed and a
+// certified proof is refused as not yet emittable — which, under
+// enforcement, refuses the recovery rather than shipping a shape a peer
+// cannot resolve.
+func (d *Daemon) wireRecoveryClaimGate() {
+	d.db.SetRecoveryClaimGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.RecoveryClaimV1)
 	})
 }
 

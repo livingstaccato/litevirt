@@ -425,14 +425,14 @@ func TestProofsFreshAndUpgradedColumnOrderMatch(t *testing.T) {
 	if err := upgraded.execLocal(ctx, `DROP INDEX IF EXISTS idx_proofs_term_claimant`); err != nil {
 		t.Fatalf("simulate v52 drop idx_proofs_term_claimant: %v", err)
 	}
-	for _, col := range []string{"lease_key", "lease_term"} {
+	for _, col := range []string{"claim_certificate", "lease_key", "lease_term"} {
 		if err := upgraded.execLocal(ctx,
 			`ALTER TABLE runtime_action_proofs DROP COLUMN `+col); err != nil {
 			t.Fatalf("simulate v52 drop runtime_action_proofs.%s: %v", col, err)
 		}
 	}
 	for _, m := range schemaMigrationLedger {
-		if m.Version == 53 || m.Version == 54 {
+		if m.Version == 53 || m.Version == 54 || (m.Version == 60 && m.Kind == kindAddColumn) {
 			if err := upgraded.execLocal(ctx,
 				`DELETE FROM applied_migrations WHERE id = ?`, m.ID); err != nil {
 				t.Fatalf("remove v53/v54 ledger %s: %v", m.ID, err)
@@ -458,7 +458,7 @@ func TestProofsFreshAndUpgradedColumnOrderMatch(t *testing.T) {
 	// SUFFIX rather than "lease_term is last", which had to change the moment
 	// v53 added another one — and the property was never about a particular
 	// column, only about additive columns going after deleted_at.
-	wantSuffix := []string{"deleted_at", "lease_term", "lease_key"}
+	wantSuffix := []string{"deleted_at", "lease_term", "lease_key", "claim_certificate"}
 	got := freshColumns[len(freshColumns)-len(wantSuffix):]
 	if !slices.Equal(got, wantSuffix) {
 		t.Errorf("the table's trailing columns are %v, want %v — an additive column must go "+

@@ -254,6 +254,25 @@ type Coordinator struct {
 	// one value. It returns at once on a cluster that already has a voter
 	// generation. nil (a hand-built coordinator) never proposes.
 	VoterGenesis func(ctx context.Context, leaseTerm int64)
+	// Claimer decides recovery claims (docs/design/recovery-claims.md §3.13):
+	// *grpcapi.Server, whose proposer reaches every member of the adopted
+	// voter generation. Consulted only while RecoveryClaimEnforced says so.
+	Claimer RecoveryClaimer
+	// RecoveryClaimEnforced is the enforcement predicate — the flag AND the
+	// recovery_claim_v1 latch AND an adopted voter generation — wired to
+	// grpcapi.Server.RecoveryClaimEnforced so this coordinator and the
+	// executors on its node read one answer. nil (a hand-built coordinator)
+	// never claims.
+	RecoveryClaimEnforced func(ctx context.Context) bool
+	// claimRetry records hosts whose recovery had a claim refused, so the next
+	// tick re-runs it; a fenced host is otherwise processed once (claims.go).
+	claimRetry map[string]bool
+	// relocDeferred records, per proof ID, when this coordinator first saw a
+	// container relocation decided for ANOTHER coordinator that it has not
+	// seen carried out. It completes that relocation itself only once the
+	// decision has stood unexecuted for RelocateRestoreTimeout (claimed
+	// container relocations, coordinator.go).
+	relocDeferred map[string]time.Time
 }
 
 // FailoverGate is the subset of *health.Checker the coordinator consults at
@@ -596,6 +615,11 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		target := cand.target
 		if c.fenced[target] {
+			// A recovery claim refused on an earlier tick is retried here: the
+			// host is handled, but its workloads are not all moved.
+			if c.retryClaims(ctx, target) {
+				continue
+			}
 			// Handled this outage — unless an operator has since confirmed it
 			// off after a refusal. Without this check the confirmation landed
 			// on a host no code path would revisit (see confirmationResume).
@@ -2237,6 +2261,22 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				OwnerEpoch: ownerEpochString(vm.OwnerEpoch),
 				LeaseTerm:  leaseTerm, LeaseKey: leaseKey,
 			}
+			// Claim before mint (docs/design/recovery-claims.md §3.13): the
+			// proof written below is the DECIDED value — ours, or another
+			// coordinator's, re-materialized with its own ID and destination.
+			// Without a certificate nothing is written.
+			if c.claimsEnforced(ctx) {
+				cl, cerr := c.claimRecovery(ctx, proof, h.Name)
+				if cerr != nil {
+					c.noteClaimRefused(ctx, ActionReschedule, "vm", vm.Name, h.Name, cerr)
+					continue
+				}
+				if cl.Proof.Action != corrosion.ActionReschedule {
+					c.noteClaimLost(ActionReschedule, "vm", vm.Name, h.Name, cl.Proof)
+					continue
+				}
+				proof, targetName = cl.Proof, cl.Proof.DestHost
+			}
 			if err := corrosion.WriteVMRescheduleProof(ctx, c.db, proof, vm.Name, targetName); err != nil {
 				slog.Error("failover: write reschedule proof", "vm", vm.Name, "error", err)
 				c.mVM(ActionReschedule, ResultError, ErrDBError)
@@ -2346,6 +2386,7 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 		// for that recovery, so if its write FAILS we must NOT proceed with the
 		// restore (an unmarked restore the next tick couldn't re-derive) — defer.
 		token := randid.New()
+		var claimed *corrosion.ActionProof
 		// Split-brain hardening: under active enforcement, mint a durable single-use
 		// proof bound to this restore token so RestoreContainer validates + claims it
 		// (dest==self + quorum) before importing/recording. Fail-open until cluster-wide.
@@ -2373,7 +2414,25 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 				OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
 				LeaseTerm:       leaseTerm, LeaseKey: leaseKey,
 			}
-			if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
+			if c.claimsEnforced(ctx) {
+				// Claim before mint. One decision covers the whole
+				// relocation: if the restore below falls back to
+				// image-recreate, the recreate carries THIS proof, token and
+				// destination rather than a second, unclaimed one.
+				decided, proceed := c.claimContainerRelocation(ctx, h, ct, proof)
+				if !proceed {
+					return
+				}
+				if decided.Coordinator != c.hostName {
+					// Completing another coordinator's decision: tier-1, as
+					// the decided value says. A restore it may have left
+					// half-streamed is its to resolve.
+					c.imageRecreateOrSkip(ctx, h, ct, decided.DestHost, &decided)
+					return
+				}
+				claimed = &decided
+				target, token = decided.DestHost, decided.RelocationToken
+			} else if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 				slog.Warn("failover: write restore-relocation proof; deferring", "container", ct.Name, "error", err)
 				c.mCt(ActionRelocate, ResultError, ErrDBError)
 				return
@@ -2408,11 +2467,14 @@ func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostReco
 			slog.Warn("failover: container restore not attempted / failed before any row; falling back to image-recreate",
 				"container", ct.Name, "target", target, "error", err)
 		}
+		// Tier-1 fallback under a claim carries the claimed proof.
+		c.imageRecreateOrSkip(ctx, h, ct, target, claimed)
+		return
 	}
 	// Tier-1: image-recreate (re-pullable) or skip. RelocateContainer (recreate)
 	// soft-deletes the source row, clearing any relocate-restore marker; the skip
 	// path replaces the marker with a terminal relocate-skipped detail.
-	c.imageRecreateOrSkip(ctx, h, ct, target)
+	c.imageRecreateOrSkip(ctx, h, ct, target, nil)
 }
 
 // resumeRestoreRelocation re-derives a relocate-restore marker on a re-tick
@@ -2437,10 +2499,23 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 	}
 	slog.Warn("failover: stale relocate-restore marker — falling back to image-recreate",
 		"container", ct.Name, "target", target)
+	// Under claims the relocation the marker records was decided, and its
+	// certificate is on the proof bound to the marker's token: reuse it rather
+	// than claim a second relocation (docs/design/recovery-claims.md §9 Q7).
+	// A marker whose proof carries no certificate is re-claimed below, which
+	// learns whatever was decided.
+	var claimed *corrosion.ActionProof
+	if token != "" && c.claimsEnforced(ctx) {
+		if pr, ok, _ := corrosion.GetActionProofByToken(ctx, c.db, token); ok && pr.ClaimCertificate != "" &&
+			pr.TargetName == ct.Name && pr.Action == corrosion.ActionRelocate {
+			p := pr.ActionProof
+			claimed, target = &p, p.DestHost
+		}
+	}
 	if target == "" {
 		target = c.pickContainerTarget(ctx, ct, candidates)
 	}
-	c.imageRecreateOrSkip(ctx, h, ct, target)
+	c.imageRecreateOrSkip(ctx, h, ct, target, claimed)
 }
 
 // completeRestore finalizes a successful restore: the target row was created by
@@ -2472,7 +2547,11 @@ func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostReco
 // skip. The skip leaves the row VISIBLE (for operator recovery) with a terminal
 // relocate-skipped detail — which also replaces any relocate-restore marker, so
 // the relocate loop won't re-process it.
-func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string) {
+//
+// claimed, when non-nil, is a relocation already decided under a recovery
+// claim (the restore it fell back from, or a marker's): the recreate carries
+// that proof, token and destination instead of minting another.
+func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, target string, claimed *corrosion.ActionProof) {
 	// A container with no re-pullable image can't be rebuilt here (its rootfs died
 	// with the host) — skip and loudly audit so the operator knows to recover it.
 	if !containerImageRepullable(ct.Image) {
@@ -2509,7 +2588,10 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 	// re-keyed row, so the target claims it by token before recreating. Fail-open
 	// (empty token, no proof) until split_brain_gate_v1 is cluster-wide.
 	relocToken := ""
-	if c.gateEnforced(ctx) {
+	if claimed != nil {
+		// Already decided and written: re-key to exactly what was decided.
+		target, relocToken = claimed.DestHost, claimed.RelocationToken
+	} else if c.gateEnforced(ctx) {
 		// Never stamp a proof for a target that doesn't advertise the gate.
 		if !c.destAdvertisesGate(ctx, target) {
 			slog.Warn("failover: relocation target does not advertise split-brain gate — refusing (fail closed)",
@@ -2534,7 +2616,19 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 			OwnerEpoch:      ownerEpochString(ct.OwnerEpoch),
 			LeaseTerm:       leaseTerm, LeaseKey: leaseKey,
 		}
-		if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
+		if c.claimsEnforced(ctx) {
+			decided, proceed := c.claimContainerRelocation(ctx, h, ct, proof)
+			if !proceed {
+				return
+			}
+			target, relocToken = decided.DestHost, decided.RelocationToken
+			if c.targetHasLiveContainer(ctx, target, ct.Name) {
+				slog.Warn("failover: the decided relocation target already holds a same-name container — left for operator recovery",
+					"container", ct.Name, "target", target)
+				c.mCt(ActionRelocate, ResultSkipped, ErrNoCandidates)
+				return
+			}
+		} else if err := corrosion.WriteActionProof(ctx, c.db, proof); err != nil {
 			slog.Error("failover: write relocation proof", "container", ct.Name, "error", err)
 			c.mCt(ActionRelocate, ResultError, ErrDBError)
 			return

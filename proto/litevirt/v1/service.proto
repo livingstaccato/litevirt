@@ -1662,6 +1662,14 @@ message RuntimeActionProof {
     // replicated ROW rather than a carried proof, so the row cannot be trusted
     // on the strength of some other node having checked it.
     string lease_key        = 15;
+    // claim_certificate is the recovery-claim certificate that authorizes an
+    // ownership-transfer proof (docs/design/recovery-claims.md §3.9): the JSON
+    // corrosion.ClaimCertificate, a majority of voters' signed accepts for
+    // exactly this binding. Evidence, not a binding field — the executor
+    // verifies it offline against the voter set and the cluster CA before it
+    // claims the proof, once recovery_claim_v1 is enforced. "" = none.
+    // Additive/wire-compatible.
+    string claim_certificate = 16;
 }
 
 message AcknowledgeLeaseTermTieRequest {

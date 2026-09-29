@@ -2,11 +2,19 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // recovery_claim_v1: enforcement of single-winner recovery claims
@@ -55,6 +63,79 @@ func (s *Server) recoveryClaimAdvertisable() bool {
 		slog.Debug("recovery_claim_v1 readiness withheld", "reason", reason)
 	}
 	return ok
+}
+
+// ErrRecoveryClaimLost is returned by an automated promotion whose claim
+// decided ANOTHER value — another coordinator's recovery of the same VM. The
+// promotion is not attempted; the coordinator's fallback learns the same
+// value and defers to it.
+var ErrRecoveryClaimLost = errors.New("another recovery was decided for this workload")
+
+// RecoveryClaimLostError carries the value that was decided instead.
+type RecoveryClaimLostError struct {
+	Decided corrosion.ActionProof
+}
+
+func (e *RecoveryClaimLostError) Error() string {
+	return fmt.Sprintf("%v: %s of %s/%s to %s by %s (proof %s)", ErrRecoveryClaimLost, e.Decided.Action,
+		e.Decided.TargetKind, e.Decided.TargetName, e.Decided.DestHost, e.Decided.Coordinator, e.Decided.ID)
+}
+
+func (e *RecoveryClaimLostError) Unwrap() error { return ErrRecoveryClaimLost }
+
+// claimPromote claims an automated promotion before its proof is persisted or
+// relayed, and stamps the certificate on p. The source is the VM's recorded
+// owner — the fenced host. A decided value that is not this proposal refuses
+// the promotion with a *RecoveryClaimLostError.
+func (s *Server) claimPromote(ctx context.Context, vm *corrosion.VMRecord, p *pb.RuntimeActionProof) error {
+	proposal := proofFromPB(p)
+	key, err := corrosion.ClaimKeyForProof(proposal, 0)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "claim promote of %s: %v", vm.Name, err)
+	}
+	round := uint64(1)
+	if p.GetLeaseTerm() > 0 {
+		round = uint64(p.GetLeaseTerm())
+	}
+	value := corrosion.ClaimValue{Proof: &proposal, SourceHost: vm.HostName}
+	out, err := s.DecideRecoveryClaim(ctx, key, value, round)
+	if err != nil {
+		s.noteGateRefused(corrosion.ActionPromote, claimRefusalReason(err))
+		return status.Errorf(codes.Unavailable, "promote of %s formed no recovery-claim certificate: %v", vm.Name, err)
+	}
+	if !out.Ours || out.Value.Proof == nil {
+		decided := corrosion.ActionProof{}
+		if out.Value.Proof != nil {
+			decided = *out.Value.Proof
+		}
+		s.noteGateRefused(corrosion.ActionPromote, health.ReasonClaimLost)
+		return &RecoveryClaimLostError{Decided: decided}
+	}
+	cert, err := out.Certificate.Encode()
+	if err != nil {
+		return status.Errorf(codes.Internal, "encode certificate: %v", err)
+	}
+	p.ClaimCertificate = cert
+	return nil
+}
+
+// claimRefusalReason names why a claim formed no certificate, for the
+// gate-refusal metric (§5.4).
+func claimRefusalReason(err error) string {
+	var nm *claims.NoMajorityError
+	if errors.As(err, &nm) {
+		for _, r := range nm.Refusals {
+			if r.Reason == corrosion.RefusalOwnerReachable {
+				return health.ReasonClaimOwnerReachable
+			}
+		}
+		for _, r := range nm.Refusals {
+			if r.Reason == corrosion.RefusalSourceMismatch {
+				return health.ReasonClaimSourceMismatch
+			}
+		}
+	}
+	return health.ReasonClaimNoMajority
 }
 
 // RecoveryClaimEnforced is the enforcement predicate (§5.1): the flag AND the

@@ -91,6 +91,29 @@ const (
 	ReasonSelfFenced            = "self_fenced"       // this node self-fenced; refuses decide/execute until it reboots
 	ReasonOwnershipDispute      = "ownership_dispute" // the workload has an active ownership condition; automated recovery must not add a holder
 	ReasonHardwareBlocked       = "hardware_blocked"  // hardware_v2 pre-start refused an automated (re)start (blocked adoption / unacquirable passthrough)
+
+	// Recovery claims (docs/design/recovery-claims.md §5.4). The destination
+	// refuses with ReasonClaimUnproven; the coordinator with the other four,
+	// which say why no certificate formed.
+	//
+	// ReasonClaimUnproven: an ownership-transfer proof reached its executor
+	// without a certificate that verifies — absent, for another value, from a
+	// generation this node has not adopted or a forced one replaced, or with
+	// too few valid signed accepts. The row stays pending; replication lag on
+	// voter_configs or cluster_crl clears on a later tick.
+	ReasonClaimUnproven = "recovery_claim_unproven"
+	// ReasonClaimLost: another value was decided for the key; this coordinator
+	// completed or deferred to it and minted nothing of its own.
+	ReasonClaimLost = "recovery_claim_lost"
+	// ReasonClaimNoMajority: no majority of the voter generation promised or
+	// accepted — unreachable voters, or ballots that kept losing.
+	ReasonClaimNoMajority = "recovery_claim_no_majority"
+	// ReasonClaimOwnerReachable: voters could still reach the recorded owner
+	// and refused to certify its eviction (§3.5.1).
+	ReasonClaimOwnerReachable = "recovery_claim_owner_reachable"
+	// ReasonClaimSourceMismatch: voters whose settled row names a different
+	// owner refused the named source (§3.5.1).
+	ReasonClaimSourceMismatch = "recovery_claim_source_mismatch"
 )
 
 // GateResult is the outcome of a gate check. Reason is set (from the closed

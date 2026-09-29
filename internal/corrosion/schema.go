@@ -466,7 +466,15 @@ import (
 //	     failed before StartDomain; every later claim of such a proof, and a
 //	     promote's start checkpoint, is refused in the same transaction that
 //	     reads it. One new table.
-const CurrentSchemaVersion = 61
+//	v62: forced reconfiguration of the voter set
+//	     (docs/design/recovery-claims.md §4.6) — local_voter_seals, NODE-LOCAL:
+//	     the generations this node sealed as a survivor of a lost majority, so
+//	     it answers no workload claim under them again and the other survivors
+//	     can import its state. The forced generation itself is an ordinary
+//	     voter_configs row whose change is force:<lost,...> and whose
+//	     certificate column holds the survivors' unanimous signatures and the
+//	     lost hosts' fence evidence. One new table.
+const CurrentSchemaVersion = 62
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2690,6 +2698,16 @@ var schemaDDL = []string{
 		reason       TEXT    NOT NULL DEFAULT '',
 		abandoned_at TEXT    NOT NULL
 	)`,
+	// NODE-LOCAL (v62). The voter generations this node sealed for a forced
+	// reconfiguration (docs/design/recovery-claims.md §4.6): once sealed it no
+	// longer answers Prepare or Accept for workload keys under the generation,
+	// which is what lets the other survivors import its state. Durable, so a
+	// survivor that restarts mid-procedure stays sealed. Never deleted.
+	`CREATE TABLE IF NOT EXISTS local_voter_seals (
+		generation INTEGER PRIMARY KEY,
+		reason     TEXT    NOT NULL DEFAULT '',
+		sealed_at  TEXT    NOT NULL
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3251,6 +3269,7 @@ var createTableUnits = []struct {
 	{59, "voter_configs"}, {59, "local_recovery_claims"}, {59, "local_voter_incarnation"},
 	{59, "local_voter_adoption"},
 	{61, "local_abandoned_proofs"},
+	{62, "local_voter_seals"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

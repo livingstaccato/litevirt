@@ -115,6 +115,18 @@ func (c *Client) voterConfigMergeKeepLocalRow(tx *sql.Tx, table syncTable, row [
 		}
 		return fmt.Sprint(localRow[updatedAtIdx]) >= fmt.Sprint(row[updatedAtIdx]), nil
 	}
+	// A forced generation replaces an ordinary row for the same generation
+	// (docs/design/recovery-claims.md §4.1, §4.6): an ordinary g+1 the
+	// survivors never saw was decided by a majority that is now lost, and a
+	// node adopts neither row on the strength of the merge — only its own copy
+	// verifying does. Settled deterministically, so the digest converges.
+	if changeIdx := indexOf(table.Columns, "change"); changeIdx >= 0 {
+		lf := IsForcedChange(fmt.Sprint(localRow[changeIdx]))
+		inf := IsForcedChange(fmt.Sprint(row[changeIdx]))
+		if lf != inf {
+			return lf, nil
+		}
+	}
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
 	return true, nil
 }

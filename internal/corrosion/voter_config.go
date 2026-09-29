@@ -108,6 +108,29 @@ func WriteVoterConfig(ctx context.Context, c *Client, v VoterConfigValue, cert C
 		v.Generation, string(mj), MembersHash(members), v.Change, cj, v.CreatedBy, v.CreatedAt, c.NowTS())
 }
 
+// WriteForcedVoterConfig records a forced generation (§4.6): the same row and
+// statement as WriteVoterConfig, with the survivors' evidence in the
+// certificate column in place of a claim certificate.
+func WriteForcedVoterConfig(ctx context.Context, c *Client, v VoterConfigValue, ev ForcedVoterEvidence) error {
+	if !c.MayWriteVoterConfigs() {
+		return ErrVoterConfigGateClosed
+	}
+	if !IsForcedChange(v.Change) {
+		return fmt.Errorf("generation %d is not a forced change (%q)", v.Generation, v.Change)
+	}
+	members := SortMembers(v.Members)
+	mj, err := json.Marshal(members)
+	if err != nil {
+		return err
+	}
+	ej, err := ev.Encode()
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, insertVoterConfigSQL,
+		v.Generation, string(mj), MembersHash(members), v.Change, ej, v.CreatedBy, v.CreatedAt, c.NowTS())
+}
+
 func scanVoterConfig(r Row) (*VoterConfig, error) {
 	var members []VoterMember
 	if s := r.String("members_json"); s != "" {

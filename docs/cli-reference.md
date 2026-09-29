@@ -55,6 +55,10 @@ lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by 
 lv cluster voter add <host>        # Add one voter (decided by a majority of the current generation)
 lv cluster voter rm <host>         # Remove one voter; allowed while it is unreachable
 lv cluster voter reset [--yes]     # Decided exit to the voter set derived from host state (sticky)
+lv cluster voter force-reconfigure --lost a,b [--dry-run] [--yes]
+                                   # Break-glass for a generation whose majority is gone for good:
+                                   #   every named member fenced proof-grade, refused while a majority
+                                   #   is reachable; audited, raises ha.voter.forced (§4.6 of the design)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 ```
 

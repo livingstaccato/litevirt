@@ -323,6 +323,9 @@ type Server struct {
 	// recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
 	// reversible kill switch afterwards (recovery_claim_enforce.go).
 	enfRecoveryClaim bool
+	// forced records forced voter generations this node refused to adopt
+	// (voter_force.go), for ha.voter.forced.
+	forced forcedConflicts
 	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
 	// and the token latched, this node refuses replication from an isolated host.
 	enfIsolationEpoch bool

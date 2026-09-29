@@ -748,6 +748,9 @@ func (c *Coordinator) run(ctx context.Context) {
 	// next attempt, and nothing else would ever visit them — a removed host is
 	// no fence candidate.
 	c.recoverRemovedHosts(ctx)
+	// Re-certify, at the current generation, proofs whose certificate a forced
+	// voter reconfiguration replaced: their destinations refuse them until then.
+	c.recertifyReplaced(ctx)
 
 	// Settle any relocate-restore markers left by an indeterminate restore or a
 	// coordinator crash mid-restore. This runs every cycle, independent of the

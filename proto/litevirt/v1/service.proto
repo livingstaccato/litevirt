@@ -1795,6 +1795,39 @@ message StrandedRecovery {
     string detail       = 3;  // what is stranded and why
     int64  next_attempt = 4;  // the claim attempt its recovery moves to
 }
+message ForceReconfigureVotersRequest {
+    repeated string lost = 1;   // the members of the adopted generation lost for good
+    bool   dry_run       = 2;   // run every check and print the plan, change nothing
+}
+message ForcedFenceEvidence {
+    string host      = 1;
+    string fence_id  = 2;
+    string method    = 3;
+    string result    = 4;
+    string timestamp = 5;
+}
+message ForceReconfigureVotersResponse {
+    int64  from_generation = 1;
+    int64  generation      = 2;   // the forced generation (0 on a dry run)
+    repeated string survivors = 3;
+    repeated string lost      = 4;
+    repeated ForcedFenceEvidence fences = 5;
+    int64  import_keys     = 6;   // claim keys the survivors will import
+    bool   applied         = 7;
+    string detail          = 8;
+}
+message SignForcedVoterConfigRequest {
+    int64  from_generation   = 1;
+    VoterConfigValue value   = 2;
+    repeated string lost     = 3;
+    repeated ForcedFenceEvidence fences = 4;
+}
+message SignForcedVoterConfigResponse {
+    string voter       = 1;
+    string incarnation = 2;
+    string cert_pem    = 3;
+    bytes  signature   = 4;
+}
 message PlanDeadHostRemovalResponse {
     string host              = 1;
     bool   fenced            = 2;  // a proof-grade fence is recorded
@@ -2772,6 +2805,14 @@ service LiteVirt {
     rpc AbandonRecoveryProof(AbandonRecoveryProofRequest) returns (AbandonRecoveryProofResponse);
     // PlanDeadHostRemoval reports what `lv host rm --dead` would do.
     rpc PlanDeadHostRemoval(PlanDeadHostRemovalRequest) returns (PlanDeadHostRemovalResponse);
+    // ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):
+    // the audited break-glass for a voter generation whose majority is gone for
+    // good. Run against one survivor, which drives the rest; refused while a
+    // majority is actually reachable.
+    rpc ForceReconfigureVoters(ForceReconfigureVotersRequest) returns (ForceReconfigureVotersResponse);
+    // SignForcedVoterConfig: peer-only. A survivor checks the forced
+    // generation for itself, seals the generation it replaces, and signs.
+    rpc SignForcedVoterConfig(SignForcedVoterConfigRequest) returns (SignForcedVoterConfigResponse);
 
     // ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
     // GetVoterConfig reports the connected host's adopted voter generation and

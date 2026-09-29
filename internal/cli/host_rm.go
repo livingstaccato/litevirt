@@ -90,7 +90,7 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 //  1. refuse unless the host is fenced proof-grade, naming the fence command;
 //  2. if it is a member of the adopted voter generation, remove it first
 //     through `lv cluster voter rm` (seal and transfer) — and if no majority of
-//     the generation is reachable, stop;
+//     the generation is reachable, stop and name force-reconfigure;
 //  3. remove the host as `lv host rm` does, including the CRL publication;
 //     its workloads stay in place for the recovery claims to supersede;
 //  4. report how many stranded recoveries will now retry, naming each.
@@ -116,7 +116,8 @@ func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, d
 		if _, err := c.ChangeVoterConfig(ctx, &pb.ChangeVoterConfigRequest{Op: "rm", Host: hostName}); err != nil {
 			if status.Code(err) == codes.Unavailable {
 				return fmt.Errorf("remove %s from voter generation %d: %w\nno majority of the generation is reachable; "+
-					"restore connectivity to a majority of the voters and retry", hostName, plan.GetVoterGeneration(), err)
+					"if a majority of the voters is gone for good, fence each lost host and run "+
+					"`lv cluster voter force-reconfigure --lost %s,...`", hostName, plan.GetVoterGeneration(), err, hostName)
 			}
 			return fmt.Errorf("remove %s from voter generation %d: %w", hostName, plan.GetVoterGeneration(), err)
 		}

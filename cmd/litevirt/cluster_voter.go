@@ -33,8 +33,84 @@ offline, into maintenance or was fenced.`,
 		newClusterVoterAddCmd(),
 		newClusterVoterRmCmd(),
 		newClusterVoterResetCmd(),
+		newClusterVoterForceReconfigureCmd(),
 	)
 	return cmd
+}
+
+func newClusterVoterForceReconfigureCmd() *cobra.Command {
+	var lost []string
+	var yes, dryRun bool
+	cmd := &cobra.Command{
+		Use:   "force-reconfigure --lost <host>[,<host>...]",
+		Short: "Break-glass: replace a voter generation whose majority is lost for good",
+		Long: `'lv cluster voter rm' is decided by a majority of the current generation, so once a
+majority of it is gone for good neither that nor any recovery claim can succeed again.
+force-reconfigure is the audited break-glass (docs/design/recovery-claims.md §4.6). Run it
+against one survivor, which drives the rest.
+
+It refuses, naming what failed, unless every named host is a member that is fenced
+proof-grade (an IPMI power-off or 'lv host fence-confirm'); the members not named are
+fewer than a majority (otherwise 'lv cluster voter rm' is the change); this host reaches
+no named host and no majority of the generation; every survivor is reachable and signs;
+and every other host is reachable or fenced proof-grade. It then seals the generation on
+every survivor, runs one anti-entropy pass, and writes the next generation with the
+survivors as members. Every survivor imports every value any of them accepted and every
+certificate any reachable host holds; certificates from the replaced generation execute
+only once re-certified at the new one. A signed audit event is written and
+ha.voter.forced stays raised until each lost host is removed with 'lv host rm --dead'.
+
+It gives up the guarantee a decided change keeps: a value accepted only by the lost hosts,
+whose certificate reached no reachable host, is invisible to the survivors. That is safe
+only because the lost hosts are OFF — a false 'lv host fence-confirm' here can produce two
+owners of one workload.
+
+  --lost a,b   the members of the adopted generation lost for good
+  --dry-run    run every check and print the plan, change nothing
+  --yes        skip the confirmation prompt`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(lost) == 0 {
+				return fmt.Errorf("--lost names the lost members")
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				plan, err := c.ForceReconfigureVoters(ctx, &pb.ForceReconfigureVotersRequest{Lost: lost, DryRun: true})
+				if err != nil {
+					return fmt.Errorf("voter force-reconfigure: %w", err)
+				}
+				printForcePlan(plan)
+				if dryRun {
+					fmt.Println("Dry run: nothing was changed.")
+					return nil
+				}
+				if ok, err := confirmVoterChange(yes, "Force this reconfiguration? The lost hosts must be powered off."); !ok || err != nil {
+					return err
+				}
+				resp, err := c.ForceReconfigureVoters(ctx, &pb.ForceReconfigureVotersRequest{Lost: lost})
+				if err != nil {
+					return fmt.Errorf("voter force-reconfigure: %w", err)
+				}
+				fmt.Printf("Forced generation %d written.\n  %s\n", resp.GetGeneration(), resp.GetDetail())
+				for _, l := range resp.GetLost() {
+					fmt.Printf("  next: lv host rm --dead %s\n", l)
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringSliceVar(&lost, "lost", nil, "comma-separated members of the adopted generation lost for good")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "run every check and print the plan, change nothing")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "Skip confirmation prompt")
+	return cmd
+}
+
+func printForcePlan(p *pb.ForceReconfigureVotersResponse) {
+	fmt.Printf("Forced reconfiguration of generation %d:\n", p.GetFromGeneration())
+	fmt.Printf("  survivors (the new generation's members): %s\n", strings.Join(p.GetSurvivors(), ", "))
+	fmt.Printf("  lost: %s\n", strings.Join(p.GetLost(), ", "))
+	for _, f := range p.GetFences() {
+		fmt.Printf("    %s: %s %s at %s (fencing_log %s)\n", f.GetHost(), f.GetMethod(), f.GetResult(), f.GetTimestamp(), f.GetFenceId())
+	}
+	fmt.Printf("  claim keys the survivors will import: %d\n", p.GetImportKeys())
 }
 
 func newClusterVoterLsCmd() *cobra.Command {

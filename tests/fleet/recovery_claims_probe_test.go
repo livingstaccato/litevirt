@@ -310,10 +310,16 @@ func TestFleet_RecoveryClaim_AVoterThatIsTheOldOwner(t *testing.T) {
 // key — has been subverted would.
 func rogueAccept(t *testing.T, c *Cluster, rogue, voter *Node, key corrosion.ClaimKey, source, dest string) *pb.AcceptRecoveryClaimResponse {
 	t.Helper()
+	return rogueAcceptAt(t, c, rogue, voter, key, source, dest, 2)
+}
+
+// rogueAcceptAt is rogueAccept under voter generation gen.
+func rogueAcceptAt(t *testing.T, c *Cluster, rogue, voter *Node, key corrosion.ClaimKey, source, dest string, gen int64) *pb.AcceptRecoveryClaimResponse {
+	t.Helper()
 	resp, err := c.PeerClient(rogue, voter).AcceptRecoveryClaim(context.Background(), &pb.AcceptRecoveryClaimRequest{
 		Key:              &pb.RecoveryClaimKey{TargetKind: key.TargetKind, TargetName: key.TargetName, OwnerEpoch: key.OwnerEpoch},
 		Ballot:           &pb.ClaimBallot{Round: 7, Coordinator: rogue.Name, BootNonce: []byte{9}},
-		ConfigGeneration: 2,
+		ConfigGeneration: gen,
 		Value: &pb.RecoveryClaimValue{Id: "rogue-" + source, Action: corrosion.ActionReschedule, TargetKind: key.TargetKind,
 			TargetName: key.TargetName, DestHost: dest, Coordinator: rogue.Name,
 			OwnerEpoch: fmt.Sprint(key.OwnerEpoch), SourceHost: source},

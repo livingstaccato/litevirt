@@ -121,6 +121,15 @@ func readStandingTx(ctx context.Context, tx *LocalTx, me string) (voterStanding,
 		return st, err
 	}
 	st.sealed = len(rows) > 0
+	if !st.sealed {
+		// A survivor of a forced reconfiguration seals its generation by force
+		// (§4.6 step 1): no majority of it is left to decide a change of it.
+		rows, err = tx.Query(ctx, `SELECT 1 AS one FROM local_voter_seals WHERE generation = ?`, st.adopted)
+		if err != nil {
+			return st, err
+		}
+		st.sealed = len(rows) > 0
+	}
 	return st, nil
 }
 

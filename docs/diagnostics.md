@@ -1032,6 +1032,18 @@ not been removed — `lv cluster voter init --members <hosts>` proposes the
 generation by hand. Every listed member must sign. `lv cluster voter ls` shows
 the adopted generation once one exists.
 
+### A forced voter reconfiguration (`ha.voter.forced`)
+
+Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised
+after `lv cluster voter force-reconfigure` until every host it named lost has
+been removed and revoked with `lv host rm --dead`: a lost host may hold an
+ordinary generation its majority decided that nobody saw, so it must not come
+back as it left. The evidence names each lost host still to remove. It is also
+raised by a node that REFUSED a forced generation — because it can reach a host
+the generation names lost, or because it is itself named lost and running —
+with the reason: valid signatures do not make a false claim of loss true.
+`lv cluster voter ls` on each host shows which generation it adopted.
+
 ### Recovery-claim refusals (`recovery_claim_*`)
 
 With recovery claims enforced (`enforcement.recovery_claim`), a recovery that

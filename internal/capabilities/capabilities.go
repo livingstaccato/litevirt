@@ -679,7 +679,7 @@ const (
 //     peers. The incident tools are decided changes, so every node moves at the
 //     same generation: `lv cluster voter rm` / `add` to repair the membership,
 //     `lv host rm --dead` for a voter that is fenced and gone for good,
-//     the forced reconfiguration of §4.6 when a majority is gone for good,
+//     `lv cluster voter force-reconfigure` when a majority is gone for good,
 //     and `lv cluster voter reset` to return the whole cluster to the derived
 //     set (docs/design/recovery-claims.md §3.12, §4.2, §4.3, §4.6). A binary
 //     rolled back below it after it has latched enters WAL quarantine, as

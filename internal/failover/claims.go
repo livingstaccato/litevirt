@@ -413,6 +413,59 @@ func (c *Coordinator) recoverRemovedHosts(ctx context.Context) {
 	}
 }
 
+// recertifyReplaced re-certifies, at the current voter generation, every
+// pending proof whose certificate is at a generation a FORCED reconfiguration
+// replaced (§4.6 "Replaced generations certify nothing"). A destination
+// refuses such a certificate; the value it certified was imported by every
+// survivor, so a claim at the new generation learns it and certifies it again
+// with the same proof ID, as a lagging coordinator would (§3.12). A key whose
+// new decision is a DIFFERENT value — the one case a forced change cannot
+// rule out — keeps its old proof, which then never executes.
+func (c *Coordinator) recertifyReplaced(ctx context.Context) {
+	if !c.claimsEnforced(ctx) || c.Claimer == nil {
+		return
+	}
+	rows, err := c.db.Query(ctx, `SELECT id FROM runtime_action_proofs
+		WHERE deleted_at IS NULL AND status = 'prepared' AND claim_certificate != ''`)
+	if err != nil {
+		return
+	}
+	for _, r := range rows {
+		pr, ok, err := corrosion.GetActionProof(ctx, c.db, r.String("id"))
+		if err != nil || !ok {
+			continue
+		}
+		cert, err := corrosion.DecodeClaimCertificate(pr.ClaimCertificate)
+		if err != nil {
+			continue
+		}
+		if forced, err := corrosion.ReplacedByForcedGeneration(ctx, c.db, cert.ConfigGeneration); err != nil || forced == 0 {
+			continue
+		}
+		proposal := pr.ActionProof
+		proposal.ClaimCertificate = ""
+		cl, out, err := c.claimAttempt(ctx, cert.Key, proposal, cert.SourceHost, nil)
+		if err != nil {
+			slog.Warn("failover: could not re-certify a proof its forced voter generation replaced; retrying next tick",
+				"proof", pr.ID, "key", cert.Key.String(), "error", err)
+			continue
+		}
+		if out.Digest != cert.ValueDigest {
+			slog.Error("failover: a forced voter generation decided a DIFFERENT value for a certified recovery; "+
+				"the old proof will never execute", "proof", pr.ID, "key", cert.Key.String())
+			continue
+		}
+		re := pr.ActionProof
+		re.ClaimCertificate = cl.Proof.ClaimCertificate
+		if err := corrosion.SetProofClaimCertificate(ctx, c.db, re); err != nil && !errors.Is(err, corrosion.ErrNoRowsAffected) {
+			slog.Warn("failover: record a re-certified proof", "proof", pr.ID, "error", err)
+			continue
+		}
+		slog.Info("failover: re-certified a recovery at the forced voter generation", "proof", pr.ID,
+			"key", cert.Key.String(), "generation", out.Certificate.ConfigGeneration)
+	}
+}
+
 // retryClaimsFor marks host's recovery to be re-run on the next tick.
 func (c *Coordinator) retryClaimsFor(host string) {
 	if c.claimRetry == nil {

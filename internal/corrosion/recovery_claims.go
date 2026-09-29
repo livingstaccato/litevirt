@@ -28,10 +28,10 @@ import (
 // key (voter_config, "", g, 0) decides generation g+1.
 const ClaimKindVoterConfig = "voter_config"
 
-// Claim target kinds a workload recovery is decided under. Nothing in this
-// release MINTS a workload claim — recovery_claim_v1 (colonelpanik/litevirt#250)
-// does — but voters already answer them, so promise history is unbroken when it
-// lands (§5.1, "Voters answer regardless of the flag").
+// Claim target kinds a workload recovery is decided under. A coordinator
+// claims one under recovery_claim_v1 before it mints the proof; voters answer
+// them whatever the flag says, so promise history is unbroken across a staged
+// rollout or a stand-down (§5.1, "Voters answer regardless of the flag").
 const (
 	ClaimKindVM        = "vm"
 	ClaimKindContainer = "container"

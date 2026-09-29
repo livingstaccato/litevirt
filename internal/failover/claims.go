@@ -121,6 +121,11 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 		return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimNoMajority,
 			Result: ResultNoMajority, Detail: "no recovery claimer is wired on " + c.hostName}
 	}
+	if prev, ok := c.claimRetryProposals[key]; ok && sameClaimIntent(prev, proposal) {
+		// The value the voters refused last time, not a fresh one: the same
+		// round then carries the same value.
+		proposal.ID, proposal.RelocationToken = prev.ID, prev.RelocationToken
+	}
 	binding := proposal
 	binding.ClaimCertificate = ""
 	value := corrosion.ClaimValue{Proof: &binding, SourceHost: source}
@@ -131,8 +136,17 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 	if err != nil {
 		ce := classifyClaimError(key, err)
 		c.mAttempt(PhaseClaim, ce.Result, "")
+		if ce.Result == ResultOwnerReachable || ce.Result == ResultSourceMismatch {
+			if c.claimRetryProposals == nil {
+				c.claimRetryProposals = map[corrosion.ClaimKey]corrosion.ActionProof{}
+			}
+			c.claimRetryProposals[key] = proposal
+		} else {
+			delete(c.claimRetryProposals, key)
+		}
 		return claimedProof{Key: key}, ce
 	}
+	delete(c.claimRetryProposals, key)
 	if out.Value.Proof == nil {
 		return claimedProof{Key: key}, fmt.Errorf("claim %s decided a value with no proof", key)
 	}
@@ -151,6 +165,16 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 	}
 	c.mAttempt(PhaseClaim, result, "")
 	return claimedProof{Proof: decided, Key: out.Certificate.Key, Ours: out.Ours}, nil
+}
+
+// sameClaimIntent reports whether two proposals for one key would be the same
+// decision but for the IDs a fresh mint draws: same action, destination,
+// coordinator, fence and lease stamp.
+func sameClaimIntent(a, b corrosion.ActionProof) bool {
+	return a.Action == b.Action && a.DestHost == b.DestHost && a.Coordinator == b.Coordinator &&
+		a.FenceEpoch == b.FenceEpoch && a.OwnerEpoch == b.OwnerEpoch &&
+		a.LeaseTerm == b.LeaseTerm && a.LeaseKey == b.LeaseKey &&
+		(a.RelocationToken == "") == (b.RelocationToken == "")
 }
 
 // claimRound seeds the ballot round with the lease term (§3.2), so a newer

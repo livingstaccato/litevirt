@@ -273,6 +273,12 @@ type Coordinator struct {
 	// decision has stood unexecuted for RelocateRestoreTimeout (claimed
 	// container relocations, coordinator.go).
 	relocDeferred map[string]time.Time
+	// claimRetryProposals holds, per claim key, the proposal the voters last
+	// refused because the recorded owner was still reachable (or its settled
+	// row named another). The next tick re-proposes THAT value — same proof
+	// ID, same token — so it can retry at the same round: nothing was
+	// contending, so nothing should have to outrank it (§3.13 step 6).
+	claimRetryProposals map[corrosion.ClaimKey]corrosion.ActionProof
 }
 
 // FailoverGate is the subset of *health.Checker the coordinator consults at

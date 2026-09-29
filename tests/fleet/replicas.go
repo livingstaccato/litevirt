@@ -80,6 +80,9 @@ type LinkFault struct {
 	// every fault here: SetLinkFault(voter, owner, LinkFault{BlockProbe:
 	// true}) makes owner unreachable to that one voter and to nobody else.
 	BlockProbe bool
+	// ProbeDelay holds each Ping on the link before it is answered — an owner
+	// that is slow to answer, or a probe that has to wait out its timeout.
+	ProbeDelay time.Duration
 }
 
 // LinkStats counts what the injector did on one directed link.
@@ -91,6 +94,7 @@ type LinkStats struct {
 	Reordered  int // batches held back and delivered later
 	Blocked    int // replication RPCs of any kind refused by Block
 	HeldFailed int // held batches whose late delivery the handler refused
+	Pings      int // Ping calls that reached the injector (an owner probe is one)
 }
 
 // heldPush is a batch the Reorder fault is sitting on.
@@ -251,6 +255,25 @@ func (n *Node) deliverHeld(from string, held []heldPush) {
 // faultUnaryInterceptor applies the link fault to PushMutations. Block is
 // handled by the partition interceptor ahead of it, for every replication RPC.
 func (n *Node) faultUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	if methodName(info.FullMethod) == "Ping" {
+		if from := peerCertCN(ctx); from != "" {
+			n.faults.mu.Lock()
+			ls := n.link(from)
+			ls.stats.Pings++
+			delay := ls.fault.ProbeDelay
+			n.faults.mu.Unlock()
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, status.FromContextError(ctx.Err()).Err()
+				}
+			}
+		}
+		return handler(ctx, req)
+	}
 	if methodName(info.FullMethod) != "PushMutations" {
 		return handler(ctx, req)
 	}

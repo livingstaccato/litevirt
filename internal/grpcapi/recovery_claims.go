@@ -482,10 +482,11 @@ func (s *Server) fetchImportSource(ctx context.Context, voter string, gen int64)
 // voter generation: every member is asked, a majority decides, and the
 // returned outcome carries the certificate (§3.13 steps 3–5).
 //
-// It is the seam recovery_claim_v1 (colonelpanik/litevirt#250) builds on: the
-// coordinator will call it at each ownership-transfer mint site, after the
-// fence and before any proof is written, and write the decided value's proof
-// with the certificate. Nothing in this release calls it outside tests.
+// Under recovery_claim_v1 (colonelpanik/litevirt#250) the failover
+// coordinator calls it at each ownership-transfer mint site — after the fence
+// and before any proof is written — and writes the decided value's proof with
+// the certificate; the server calls it for an automated promote once the
+// replica's host is known (claimPromote).
 func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64) (claims.Outcome, error) {
 	if !key.IsWorkload() {
 		return claims.Outcome{}, fmt.Errorf("%s is not a workload key", key)
@@ -504,5 +505,9 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 		Electorate: func(corrosion.ClaimValue) ([]string, int) { return names, q },
 		Propose:    func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return proposal, nil },
 		StartRound: startRound,
+		// A coordinator re-proposing the value the voters refused because the
+		// owner was reachable retries at the same round (§3.13 step 6); the
+		// proposer's per-round binding refuses a different value there.
+		ReuseRound: true,
 	})
 }

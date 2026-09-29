@@ -23,10 +23,12 @@ import (
 // replication, and a voter that trusted them would refuse, or accept, on
 // another node's stale observation.
 //
-// It is consulted only for WORKLOAD keys (corrosion.ClaimAccept), which
-// nothing in this release mints — recovery_claim_v1 (colonelpanik/litevirt#250)
-// does. The mechanism is here so the voter's rules are complete the day a
-// coordinator starts claiming.
+// It is consulted only for WORKLOAD keys (corrosion.ClaimAccept): the
+// recoveries a coordinator claims under recovery_claim_v1 before it mints a
+// reschedule, promote or relocate proof. A refusal names this voter and what
+// it reached; the coordinator reports every refusing voter, records
+// recovery_claim_owner_reachable, and retries at the same round on its next
+// tick — nothing is contending, the source is up (§3.13 step 6).
 
 const (
 	// claimProbeTimeout bounds one probe, the order of health.checkTimeout.

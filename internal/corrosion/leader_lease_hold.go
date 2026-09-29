@@ -215,6 +215,14 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 			// and reseedKeepTables stops a reseed from deleting it.
 		}
 
+		// Not ours, and live: a peer holds it. The guarded upsert below would
+		// decline, and returning here first is not only cheaper — it keeps a
+		// non-holder, which polls every few seconds, from running the mint
+		// clearance's peer read on every poll for a lease it cannot take.
+		if !ourTenure && curHolder != "" && curHolder != holder && curExpires >= nowRFC {
+			return false, 0, nil
+		}
+
 		// Not ours. An expired lease whose row names someone other than the
 		// ledger's current incarnation is not ours to take yet — its real holder
 		// may be renewing over it right now. See deferTakeover.
@@ -505,6 +513,13 @@ func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, 
 	next, err := nextLeaseTerm(ctx, c, key)
 	if err != nil {
 		return false, 0, err
+	}
+	// Confirm the cluster has not already minted `next` before claiming it from
+	// this replica's view. Withheld is "not held", never contended: retrying
+	// inside this call would ask the same peers the same question. See
+	// leader_lease_clearance.go.
+	if !c.clearLeaseMint(ctx, key, next) {
+		return false, 0, nil
 	}
 
 	applied, err := c.ExecuteBatchGuarded(ctx,

@@ -69,6 +69,11 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// mintClearance is the gRPC server the lease-mint clearance asks, published
+	// once its gate is wired. Atomic because lease holders (the rebalancer)
+	// start before the server exists. See wireLeaseMintClearance.
+	mintClearance atomic.Pointer[grpcapi.Server]
+
 	// authEngine is wired into the gRPC server below; kept on the daemon
 	// struct so the backstop reload loop (runAuthEngineReload) can refresh it.
 	authEngine *auth.Engine
@@ -572,6 +577,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 
 	d.wireLeaseTermLedgerGate()
+	d.wireLeaseMintClearance()
 	d.wireCredentialsSplitGate()
 	d.wireClusterPolicyGate()
 
@@ -797,6 +803,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
+	// The server can answer the lease-mint clearance from here on: it has the
+	// gate whose quorum and healthy-peer set its high-water read uses.
+	d.mintClearance.Store(svc)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
@@ -2424,6 +2433,25 @@ func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
 func (d *Daemon) wireClusterPolicyGate() {
 	d.db.SetClusterPolicyGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
+	})
+}
+
+// wireLeaseMintClearance makes every new lease term wait for the quorum
+// high-water read (grpcapi.Server.LeaseMintClearance): a node must not mint
+// term N+1 from its own replica while a peer already holds N+1, which is what a
+// restarted or reconnected node's stale ledger otherwise does.
+//
+// Wired BEFORE any lease holder starts, and answering "not yet" until the gRPC
+// server and its gate exist. The rebalancer starts ahead of the server, and a
+// daemon's first seconds are exactly when its ledger is stalest, so an unwired
+// window here would be the bug itself.
+func (d *Daemon) wireLeaseMintClearance() {
+	d.db.SetLeaseMintClearance(func(ctx context.Context, key string, next int64) (bool, string) {
+		svc := d.mintClearance.Load()
+		if svc == nil {
+			return false, "daemon starting: the lease-term quorum read is not wired yet"
+		}
+		return svc.LeaseMintClearance(ctx, key, next)
 	})
 }
 

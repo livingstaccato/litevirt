@@ -2,12 +2,13 @@
 
 | | |
 |---|---|
-| Status | **Proposed**. Nothing in this document is implemented. Its open questions are decided (§9). |
+| Status | **Partly implemented.** §3's voter side, proposer and certificates, §4's voter set (genesis, add, rm, reset, seal and transfer) and `voter_config_v1` exist on `feat/voter-set`. Recovery enforcement (`recovery_claim_v1`), `lv host rm --dead`, forced reconfiguration and the stranded-claim condition are the follow-up (colonelpanik/litevirt#250). See *Implementation status* below and §10. |
 | Issues | colonelpanik/litevirt#250; colonelpanik/litevirt#251 (step 2) |
 | Base | `main` at `8dde9cc7` |
 | Pinned by | `TestFleet_TwoCoordinators_OneFailedHost_AtMostOneWritableOwner` (`tests/fleet/failover_two_coordinators_test.go`, skipped until this lands) |
 
-**Reading this document.** Present tense describes code that exists on `main`.
+**Reading this document.** Present tense describes code that exists (on
+`feat/voter-set`, for the parts the status table below lists).
 Anything that does not exist yet is marked *proposed*: RPCs, tables, columns,
 config keys, commands, metrics and health reasons. The docs guard
 (`cmd/litevirt/docs_triangulation_test.go`) only scans `README.md` and
@@ -17,6 +18,22 @@ command that exists. If the guard is ever widened to `docs/design/`, those
 lines need `ci:skip-cmd`. When a section lands, its operator-facing parts move into
 `docs/migration-failover.md`, `docs/operating-model.md` and
 `docs/configuration.md`, and the guard checks them there.
+
+**Implementation status.**
+
+| Part | State | Where |
+|---|---|---|
+| Ballots, value digest, signed accepts, certificate verification (§3.2, §3.4, §3.9, §3.10 steps 1–5 as a primitive) | exists | `internal/corrosion/recovery_claims.go` (`ClaimVerifier.Verify`) |
+| Voter rules, grant table, durability, incarnation, owner checks (§3.5–§3.8, §3.11) | exists | `internal/corrosion/recovery_claims_voter.go`, `voter_local.go`, `internal/grpcapi/claim_probe.go` |
+| Claim RPCs (§3.3) | exist | `PrepareRecoveryClaim`, `AcceptRecoveryClaim`, `GetRecoveryClaim`, `ListRecoveryClaims` (`internal/grpcapi/recovery_claims.go`) |
+| Proposer (§3.13 steps 3–6) | exists, used for voter-config changes | `internal/claims`; `Server.DecideRecoveryClaim` is the seam for recovery |
+| Voter set, genesis, add / rm / reset, seal and transfer, `VoterSet` (§4.1–§4.5) | exists | `internal/corrosion/voter_config.go`, `internal/grpcapi/voter_config.go`, `lv cluster voter` |
+| `voter_config_v1` (§5.1) | exists | `capabilities.VoterConfigV1`, `grpcapi.VoterConfigReadiness` |
+| Owner probe (§3.5.1) | exists, consulted for workload keys only; nothing mints one yet | `claim_probe.go` |
+| `recovery_claim_v1`, `enforcement.recovery_claim`, `claim_certificate` column/field, `VerifyClaimCertificate` at the two executor boundaries, `claimRecovery` at the mint sites (§3.9 carriage, §3.10, §3.13 steps 1–2, §5.1–§5.2) | proposed | colonelpanik/litevirt#250 |
+| Abandonment, `local_abandoned_proofs`, `lv host rm --dead`, `ha.claim.stranded` (§3.12) | proposed | colonelpanik/litevirt#250 |
+| `lv cluster voter force-reconfigure`, `force:` rows, `ha.voter.forced` (§4.6) | proposed | follow-up |
+| `ha.voter.unavailable`, `lv cluster claim` (§4.3, §5.4) | proposed | follow-up |
 
 Sections are numbered so a reviewer can approve or reject each one separately.
 §3 and §4 carry the safety argument. §5 onward depends on them.
@@ -217,12 +234,15 @@ ballot = (round uint64, coordinator string, boot_nonce [16]byte)
 
 ### 3.3 Messages
 
-Three peer-only RPCs are *proposed* in `proto/litevirt/v1/service.proto`. They
-are authorized like replication RPCs: the caller must present a known host
-certificate. Operator and CLI certificates are refused.
+The claim RPCs are in `proto/litevirt/v1/service.proto`. Prepare, Accept and the
+bulk `ListRecoveryClaims` are authorized like replication RPCs: the caller must
+present a known host certificate, and a ballot's `coordinator` must be the
+caller's certificate CN. `GetRecoveryClaim` is read-only and also answers an
+operator. The wire messages carry a few more fields than the sketch below
+(`RecoveryClaimValue.voter_config`, refusal reason and detail on Prepare, the
+key on `ClaimAccept`, the adopted generation on `GetRecoveryClaim`).
 
 ```proto
-// proposed
 message RecoveryClaimKey {
   string target_kind = 1;  // vm | container | voter_config
   string target_name = 2;  // workload name; "" for voter_config
@@ -289,15 +309,16 @@ then idempotent. It never produces a second proof.
 
 ### 3.5 Voter rules
 
-The voter's handler, *proposed* as `internal/corrosion/recovery_claims.go`, does
-this for each message. Each step runs in one local SQLite transaction:
+The voter's handler, `internal/corrosion/recovery_claims_voter.go`, does this for
+each message. Each step runs in one local SQLite transaction:
 
 ```
 Prepare(key, b, gen):
   refuse unless gen == my adopted config generation AND I am a member at gen
          AND my voter_incarnation matches the member entry            (§3.11, §4)
   row := local_recovery_claims[key]
-  if row.promised >= b: reply {promised:false, promised_ballot: row.promised}
+  if row.promised > b: reply {promised:false, promised_ballot: row.promised}
+  if row.promised == b: reply {promised:true, ...}      (the same Prepare again: already on disk)
   row.promised := b ; COMMIT (durable) ; reply {promised:true, accepted_ballot, accepted_value}
 
 Accept(key, b, v, gen):
@@ -341,11 +362,11 @@ refuse, or accept, on another node's stale observation.
   *reached* only if the handshake completes, the peer certificate's CN is
   `source_host`, and the RPC returns. Anything else, including a different
   host answering on a reused address, is *not reached*. Its timeout is
-  `claimProbeTimeout` (proposed, 2 s), the same order as `health.checkTimeout`
+  `claimProbeTimeout` (2 s), the same order as `health.checkTimeout`
   (3 s).
 - **Cost per recovery.** The probe runs once per `(voter, source_host)`, not
   once per workload: every `Accept` naming the same source within
-  `claimProbeMaxAge` (proposed, 5 s, one `claimTimeout`) reuses the result. A
+  `claimProbeMaxAge` (5 s, one `claimTimeout`) reuses the result. A
   failed host with fifty workloads costs each voter one probe. Voters probe in
   parallel, so the claim's added latency is at most one `claimProbeTimeout`,
   and less when the probe started at `Prepare`. A powered-off host usually
@@ -359,13 +380,13 @@ refuse, or accept, on another node's stale observation.
 - **The source cross-check.** A voter whose own `vms` / `containers` row for
   the target is at `key.owner_epoch` and not pending checks that its
   `host_name` is `v.source_host`, and refuses with
-  `recovery_claim_source_mismatch` (proposed) if it is not. A row at another
+  `recovery_claim_source_mismatch` if it is not. A row at another
   epoch, or one mid-transfer, says nothing about this key, and the voter does
   not wait for it. The row for epoch `e` was written when the workload last
   moved, normally long before the failure, so this does not race the decision
   the way `host_health` freshness does.
 - **Refusals are named.** The refusal carries the voter and what it reached,
-  for example `recovery_claim_owner_reachable` (proposed) with detail
+  for example `recovery_claim_owner_reachable` with detail
   `node-3 still reaches node-2 (Ping answered in 4 ms)`. The coordinator
   reports every refusing voter in its gate refusal (§5.4), and
   `lv cluster claim` (proposed) prints each voter's last refusal for the key.
@@ -404,7 +425,7 @@ The probe applies to workload keys only. A `voter_config` key has no source
 
 ### 3.6 The local grant table
 
-*Proposed*, in `schemaDDL` (`internal/corrosion/schema.go`), and like
+In `schemaDDL` (`internal/corrosion/schema.go`), and like
 `local_term_bindings` absent from `tableNames` (`internal/corrosion/sync.go`)
 and from every sync path:
 
@@ -437,9 +458,10 @@ CREATE TABLE IF NOT EXISTS local_voter_incarnation (
 );
 ```
 
-This is a schema change at the next free version (v56 is the credentials split and v57 is `host_membership`, colonelpanik/litevirt#267). The ledger entries
-follow the pattern v55 used for `local_term_bindings`, plus the
-`createTableUnits` marker.
+This is schema v58 (v56 is the credentials split and v57 is `host_membership`,
+colonelpanik/litevirt#267), with the `createTableUnits` markers. The accept is
+stored as JSON in `accept_json`, which carries the signature, rather than in a
+bare `accept_signature` column.
 
 ### 3.7 What a voter persists, and when
 
@@ -454,18 +476,20 @@ intersection argument in §3.13.
   `journal_mode(wal)` and does not set `synchronous`, so it gets SQLite's
   compiled default. With `synchronous=FULL`, a WAL commit is fsynced before
   `COMMIT` returns. The design does not rely on the compiled default of
-  `modernc.org/sqlite`. It *proposes* adding `_pragma=synchronous(full)` to
-  `sqliteDSN`, which is a no-op if the default is already FULL, and a startup
-  check that reads `PRAGMA synchronous`. If the value is below 2, the node
-  advertises neither `voter_config_v1` nor `recovery_claim_v1` (§5.1), and
-  `Prepare` / `Accept` return `FailedPrecondition`.
+  `modernc.org/sqlite`: `sqliteDSN` sets `_pragma=synchronous(full)`, which is a
+  no-op where the default is already FULL (it is, on a WAL database under
+  modernc today), and `VoterConfigReadiness` reads `PRAGMA synchronous`. Below
+  2 the node does not advertise `voter_config_v1` (§5.1), and `Prepare` /
+  `Accept` return `FailedPrecondition`.
 - **Not through `mutation_log`.** The write must not be relayed. Today
   `local_term_bindings` avoids relaying by doing its `INSERT` inside the
   *guard* of `ExecuteBatchGuarded`, where statements are not logged. The claim
-  handler needs a plain local transaction with nothing to relay. It is
-  *proposed* as `Client.ExecuteLocal(ctx, func(*sql.Tx) error)`, which runs
-  under the same client mutex, writes nothing to `mutation_log`, and is refused
-  by `stmtshapecheck` for any table in `tableNames`. That keeps "local" a
+  handler needs a plain local transaction with nothing to relay:
+  `Client.ExecuteLocal(ctx, func(*corrosion.LocalTx) error)`, which runs under
+  the same client mutex and writes nothing to `mutation_log`. `LocalTx.Exec`
+  refuses any statement whose target is not a registered node-local claim
+  table, at runtime, and `stmtshapecheck` refuses the same statically at every
+  call site (`scripts/ci/stmtshapecheck/localwrites.go`). That keeps "local" a
   property the tooling checks, not a convention.
 
 ### 3.8 Why local and not replicated
@@ -587,7 +611,7 @@ the claim state disappears. Each voter-config member entry (§4.1) records the
 incarnation it was admitted with. A voter whose local incarnation does not match
 its member entry **abstains**: it refuses `Prepare` and `Accept`. It keeps
 answering `GetRecoveryClaim` so the mismatch is visible. The operator heals it
-with `lv cluster voter rm` then `lv cluster voter add` (proposed), which is two
+with `lv cluster voter rm` then `lv cluster voter add`, which is two
 config changes. A voter that lost its state costs availability, never safety.
 
 ### 3.12 Epoch and attempt progression
@@ -780,7 +804,7 @@ gives G1.
 
 ### 4.1 Tables
 
-*Proposed*, replicated:
+Replicated:
 
 ```sql
 -- Immutable once written, like leader_lease_terms. One row per generation.
@@ -797,8 +821,11 @@ CREATE TABLE IF NOT EXISTS voter_configs (
 );
 ```
 
-The merge rule is `immutableMergeKeepLocalRow`, the rule `leader_lease_terms`
-uses. A receiver adopts a generation only if its certificate verifies against
+The merge rule is keep-local, as for `leader_lease_terms`, in its own
+`voterConfigMergeKeepLocalRow`: the certificate is evidence rather than a fact
+of the row, since two proposers that completed one decision hold different,
+equally valid certificates for it, so those converge on the greater encoding;
+any other difference is flagged and never taken. A receiver adopts a generation only if its certificate verifies against
 the generation before it (§3.10 steps 4–5, with key
 `("voter_config", "", generation-1, 0)`). Two different rows for one generation
 cannot both carry valid certificates (§3.16). A row that fails to verify is
@@ -807,7 +834,7 @@ adopted. A `force:` row is verified by the rule in §4.6 instead, and it is the
 one exception to keep-local: a verified forced row replaces an ordinary row for
 the same generation.
 
-*Proposed*, node-local: `local_voter_adoption(generation PRIMARY KEY,
+Node-local: `local_voter_adoption(generation PRIMARY KEY,
 imported_from TEXT, adopted_at TEXT)`. It records which generation this node has
 adopted and from which sealed majority it imported claim state (§4.4).
 
@@ -828,11 +855,12 @@ step would otherwise keep colonelpanik/litevirt#251's bug for good.
   accept. Genesis is unanimous because no earlier config exists whose majority
   could decide it. Genesis is itself a claim, with key `("voter_config", "", 0, 0)`,
   so two proposers racing across a lease hand-off decide one value.
-- **While genesis is blocked**, the *proposed* health condition
-  `ha.voter.genesis_pending` names each host holding it back, its state, and
-  what clears it: finish the maintenance, bring the host back, or remove it
-  with `lv host rm --dead` (§3.12).
-- **Manual genesis.** `lv cluster voter init [--members a,b,c]` (proposed) is
+- **While genesis is blocked**, the health condition
+  `ha.voter.genesis_pending` (evaluator `voter_config`) names each host holding
+  it back, its state, and what clears it: finish the maintenance, bring the
+  host back, or leave it out with `lv cluster voter init --members`.
+  `lv host rm --dead` (proposed, §3.12) joins that list with the follow-up.
+- **Manual genesis.** `lv cluster voter init [--members a,b,c]` is
   the fallback for a cluster that cannot become clean, for example one with a
   permanently dead host the operator has not removed yet. It prints the
   proposed members, defaulting to the derived `VoterSet`, and asks for
@@ -844,7 +872,7 @@ step would otherwise keep colonelpanik/litevirt#251's bug for good.
   `recovery_claim_v1` or `enforcement.recovery_claim`: the voter set is useful,
   and permanent, on its own (§4.5).
 
-**Reset.** `lv cluster voter reset` (proposed) returns the cluster to the
+**Reset.** `lv cluster voter reset` returns the cluster to the
 derived set. It is a config change like §4.3: change kind `reset`, empty
 members, decided by a majority of the current generation. So every node leaves
 the explicit set at the same generation, which is what a per-node flag cannot
@@ -865,7 +893,7 @@ do (§5.1).
 
 ### 4.3 Add and remove
 
-- `lv cluster voter add <host>` (proposed) and `lv cluster voter rm <host>`
+- `lv cluster voter add <host>` and `lv cluster voter rm <host>`
   (proposed) change **exactly one** member per generation.
 - The change from generation `g` to `g+1` is itself a claim, with key
   `("voter_config", "", g, 0)` and the new member list as its value. It is
@@ -875,10 +903,10 @@ do (§5.1).
   imports claim state (§4.4) before it counts toward any majority.
 - `rm` of an unreachable member is allowed. That is the post-fence case, and a
   majority of `g` is enough.
-- `lv host rm <host>` of a current voter is refused (proposed change) and names
-  the two ways forward: `lv cluster voter rm` first, or
-  `lv host rm --dead <host>` (proposed, §3.12) for a host that is fenced and
-  gone for good, which makes the voter change itself. Deleting a `hosts` row
+- `lv host rm <host>` of a current voter is refused, by the CLI before it
+  revokes the certificate and by `RemoveHost` itself, and names
+  `lv cluster voter rm` first. `lv host rm --dead <host>` (proposed, §3.12), for
+  a host that is fenced and gone for good, will make the voter change itself. Deleting a `hosts` row
   must no longer change the voting population implicitly.
 - **No automatic shrink.** After a fence, the fenced host stays a member and
   counts in the denominator until the operator runs `lv cluster voter rm` or
@@ -902,7 +930,7 @@ that never saw `v`.
 1. Deciding `g+1` also **seals** `g`. A voter that accepts the config change
    stops answering `Prepare` / `Accept` for workload keys under `g`.
 2. Before a member of `g+1` votes under `g+1`, it **imports**. It calls
-   `GetRecoveryClaim` in bulk (a *proposed* streaming variant) on a majority of
+   `GetRecoveryClaim` in bulk (`ListRecoveryClaims`, streaming) on a majority of
    sealed `g` members. For every key, it records the highest-ballot accepted
    value it sees as its own accepted value, with `config_generation = g+1`.
    Because the sealed majority intersects every `g` majority, it sees any value
@@ -937,7 +965,7 @@ hold every future latch off (§9, Q5).
 
 ### 4.6 Losing a majority of voters for good: forced reconfiguration
 
-`lv cluster voter rm` (proposed) is a claim decided by a majority of generation
+`lv cluster voter rm` is a claim decided by a majority of generation
 `g`. Once a majority of `g` is permanently gone, it can never succeed, and
 neither can any recovery claim. The break-glass is
 `lv cluster voter force-reconfigure --lost <host>[,<host>...]` (proposed), in
@@ -1036,7 +1064,7 @@ There are two tokens, so that the voter set (colonelpanik/litevirt#251 step 2)
 ships and stays in force independently of whether claims are enforced (§4.5,
 §9, Q4).
 
-**`voter_config_v1`** (proposed, `capabilities.VoterConfigV1`) covers the voter
+**`voter_config_v1`** (`capabilities.VoterConfigV1`) covers the voter
 set and the voter side of the protocol: `voter_configs`, the claim RPCs, the
 node-local grant tables and the voter incarnation.
 
@@ -1045,23 +1073,22 @@ node-local grant tables and the voter incarnation.
   durably. Latching it starts automatic genesis (§4.2). Until genesis
   completes, `VoterSet` is derived exactly as today.
 - **Advertised when ready:** `PRAGMA synchronous` ≥ FULL (§3.7), the host
-  signing key loads, and the claim RPCs are registered. A *proposed*
-  `grpcapi.VoterConfigReadiness` is the local-only probe, in the pattern of
-  `LeaseTermReadiness`.
+  signing key loads, and the voter incarnation is readable; the claim RPCs are
+  compiled in. `grpcapi.VoterConfigReadiness` is the local-only probe, in the
+  pattern of `LeaseTermReadiness`.
 - **`ReplicationGated`: yes.** Latching it allows the new replicated shape
   `voter_configs`. That is a claim about what every host still *receiving*
   replication can decode, which is the `lease_term_ledger_v1` argument.
 - **Stand-down: no flag, by design.** A flag would be worse than none. A node
   with it off would count a different majority from its peers, which is the
   split-brain the voter set exists to prevent. The incident tools are
-  `lv cluster voter rm` / `add`, `lv host rm --dead`,
-  `lv cluster voter force-reconfigure` and `lv cluster voter reset` (all
-  proposed, §3.12, §4.2, §4.3, §4.6). Each is a decided change, so every node
+  `lv cluster voter rm` / `add` and `lv cluster voter reset` (§4.2, §4.3), and,
+  with the follow-up, `lv host rm --dead` and
+  `lv cluster voter force-reconfigure` (proposed, §3.12, §4.6). Each is a decided change, so every node
   moves at the same generation. `reset` is the full exit back to the derived
   set. A host rolled back below this build after the token has latched enters
   WAL quarantine, as for every latched token, whether or not a config exists.
-  That note belongs beside the declaration in `capabilities.mandatory` when it
-  lands.
+  That note is beside the declaration, above `capabilities.supported`.
 
 **`recovery_claim_v1`** (proposed, `capabilities.RecoveryClaimV1`) covers
 enforcement: coordinators claiming before they mint, and destinations
@@ -1168,7 +1195,7 @@ over:
   `ha.voter.unavailable` names
   voters that are fenced, offline or abstaining (§4.3). `ha.voter.forced` marks
   a forced reconfiguration until its lost hosts are removed (§4.6).
-- **`lv cluster voter ls`** (proposed) shows the adopted generation, its
+- **`lv cluster voter ls`** shows the adopted generation, its
   members, and per member reachable, fenced or abstaining, with incarnation
   mismatches.
 
@@ -1177,9 +1204,9 @@ over:
 1. Roll every host to a build with the claim protocol. Run `lv doctor fence`
    and confirm the fence posture is what you expect.
 2. Wait for `voter_config_v1` to latch and genesis to complete. Neither needs
-   config. `lv cluster voter ls` (proposed) shows generation 1 and its members.
+   config. `lv cluster voter ls` shows generation 1 and its members.
    If `ha.voter.genesis_pending` persists, clear what it names, or run
-   `lv cluster voter init --members` (proposed) for a cluster that cannot
+   `lv cluster voter init --members` for a cluster that cannot
    become clean. This step stands on its own: a cluster can stop here and keep
    an explicit voter set without ever enforcing claims.
 3. Set `enforcement.recovery_claim: true` on **every** host, witnesses included,
@@ -1207,17 +1234,19 @@ The kill switch follows the reversible `configFlag && latch` model described in
   agreed on, and `VoterSet` reads it whatever the flag says (§4.5, §9, Q4). The
   fence quorum and recovery quorum keep counting the explicit set. A voter set
   that has itself become the problem is repaired with `lv cluster voter rm` /
-  `add`, `lv host rm --dead`, or, when a majority is gone for good,
-  `lv cluster voter force-reconfigure` (all proposed, §4.6).
+  `add`, or `lv cluster voter reset`; with the follow-up, `lv host rm --dead`
+  and, when a majority is gone for good, `lv cluster voter force-reconfigure`
+  (both proposed, §3.12, §4.6).
 
-### 5.7 Schema summary (next free version, proposed)
+### 5.7 Schema summary
 
-- Node-local tables: `local_recovery_claims`, `local_voter_incarnation`,
-  `local_abandoned_proofs`, `local_voter_adoption`.
-- Replicated table: `voter_configs`, written only after `voter_config_v1`
+- Node-local tables (v58): `local_recovery_claims`, `local_voter_incarnation`,
+  `local_voter_adoption`. `local_abandoned_proofs` (proposed) comes with §3.12.
+- Replicated table (v58): `voter_configs`, written only after `voter_config_v1`
   latches.
-- Replicated column: `runtime_action_proofs.claim_certificate`, appended last
-  and emitted only after `recovery_claim_v1` latches.
+- Replicated column (proposed, with `recovery_claim_v1`):
+  `runtime_action_proofs.claim_certificate`, appended last and emitted only
+  after `recovery_claim_v1` latches.
 - Statement-shape ledger entries for every new replicated shape
   (`stmtshapecheck`).
 - `check-schema-bump.sh`, a `CurrentSchemaVersion` bump, and a matching history
@@ -1232,9 +1261,9 @@ stalls and how the operator unblocks it without giving up G1.
 
 | Stall | Symptom | Unblock |
 |---|---|---|
-| **No reachable majority of voters** | `recovery_claim_no_majority`. Workloads stay on the fenced host. | Same as today's no-quorum case: restore connectivity. If some voters are gone for good but a majority of the current generation remains, remove them with `lv host rm --dead` or `lv cluster voter rm` (proposed). If a majority is gone for good, fence each lost host proof-grade and run `lv cluster voter force-reconfigure --lost <hosts>` (proposed, §4.6). That is audited, raises `ha.voter.forced`, refuses while a majority is actually reachable, and gives up the guarantees §4.6 names. |
-| **Dead voter still in the config** | Fault tolerance is one lower than the host count suggests. For example, a 3-voter cluster with one fenced member needs both survivors. | If the host is gone for good: `lv host rm --dead <fenced>` (proposed), which removes it from the voter config and then from the cluster (§3.12). If it stays a host but should stop voting: `lv cluster voter rm <host>` (proposed). `ha.voter.unavailable` (proposed) names it. There is no automatic shrink, by decision. |
-| **Voter with a changed incarnation** (re-imaged or reseeded) | It abstains, and `lv cluster voter ls` shows the mismatch. | `lv cluster voter rm` then `lv cluster voter add` (proposed). |
+| **No reachable majority of voters** | `recovery_claim_no_majority`. Workloads stay on the fenced host. | Same as today's no-quorum case: restore connectivity. If some voters are gone for good but a majority of the current generation remains, remove them with `lv host rm --dead` or `lv cluster voter rm`. If a majority is gone for good, fence each lost host proof-grade and run `lv cluster voter force-reconfigure --lost <hosts>` (proposed, §4.6). That is audited, raises `ha.voter.forced`, refuses while a majority is actually reachable, and gives up the guarantees §4.6 names. |
+| **Dead voter still in the config** | Fault tolerance is one lower than the host count suggests. For example, a 3-voter cluster with one fenced member needs both survivors. | If the host is gone for good: `lv host rm --dead <fenced>` (proposed), which removes it from the voter config and then from the cluster (§3.12). If it stays a host but should stop voting: `lv cluster voter rm <host>`. `ha.voter.unavailable` (proposed) names it. There is no automatic shrink, by decision. |
+| **Voter with a changed incarnation** (re-imaged or reseeded) | It abstains, and `lv cluster voter ls` shows the mismatch. | `lv cluster voter rm` then `lv cluster voter add`. |
 | **Duelling proposers** | Repeated rejected ballots, and `recovery_claim_lost` alternating between nodes. | Self-heals: the lease-term round seed, the lease-contest rule, and randomized back-off (0–1 poll) on rejection. If it persists, look for a lease that is not converging (`ha.lww.unresolved`). |
 | **Stranded on a dead destination** (decided, destination died before starting) | The VM stays `pending` on D. `ha.claim.stranded` (proposed) names it with the command, and `lv cluster claim` shows a decided value naming D. | D returns and either executes or abandons. If D is gone for good: fence D proof-grade, then `lv host rm --dead D` (proposed; `--dry-run` first shows what it will do). It removes D from the voter config if it is a voter, removes the host, publishes the CRL and prints how many stranded recoveries will retry. Voters then accept the supersede evidence *"destination fenced proof-grade, not a member, and revoked"* for `attempt + 1` (§3.12). The residual risk, a revoked host rebooting from a stale replica, is the same exposure every removed host already carries. |
 | **Old owner still reachable** | `recovery_claim_owner_reachable` (proposed), naming each refusing voter and what it reached. Workloads stay where they are. | Not a stall to unblock: most of the cluster can reach the owner. Find out why the coordinator judged it failed (failure detector, `host_health`). If the host is up but must not keep its workloads, fence it proof-grade: the probe then fails, and the next tick's claim proceeds. |
@@ -1420,7 +1449,7 @@ the thing.
    coordinator judges n4 failed. Expect `recovery_claim_owner_reachable` naming
    the voters that still reach n4, and n4's domains untouched.
 5. **Stand-down.** Flag off everywhere, restart: behaviour matches the pre-claim
-   build, and `lv cluster voter ls` (proposed) still shows the explicit set. Flag on again:
+   build, and `lv cluster voter ls` still shows the explicit set. Flag on again:
    the claim history is intact (`lv cluster claim`).
 6. **Forced reconfiguration.** Destroy three of five voters, record
    `lv host fence-confirm` for each, and run
@@ -1524,7 +1553,7 @@ document already follows every decision.
    `voter_config_v1` is mandatory, with no flag, because a node with a flag off
    would count a different majority from its peers. Genesis is automatic on a
    clean cluster, so every cluster reaches the fixed set. The exit is a decided
-   `lv cluster voter reset` (proposed, §4.2), which moves every node back to
+   `lv cluster voter reset` (§4.2), which moves every node back to
    the derived set at one generation. Neither the exit nor anything else makes
    a rollback below a latched token clean: that enters WAL quarantine.
 5. **Latch population.**
@@ -1548,3 +1577,57 @@ document already follows every decision.
    bootstraps from. The `"litevirt-recovery-accept-v1"` and
    `"litevirt-recovery-abandon-v1"` separators keep its signatures disjoint
    from TLS and audit rows.
+
+---
+
+## 10. Where the implementation departs from the text above
+
+Each of these was found while writing the code. The body has been corrected
+where it described the mechanism; this list records what changed and why.
+
+1. **An identical Prepare is answered as the promise already made** (§3.5).
+   The sketch refused `promised >= b`. A duplicated Prepare at the ballot
+   already promised changes nothing, so the voter answers `promised` for it;
+   only a ballot strictly below the promise is refused.
+2. **The proposer always runs phase 2.** §3.13 step 4's shortcut (fetch stored
+   accepts when a majority already reports one value) is not implemented.
+   Re-accepting a value it already holds is idempotent for a voter and does not
+   re-probe, so running phase 2 costs one round trip and gives fresh accepts at
+   the current generation, which an imported value needs anyway.
+3. **Genesis unanimity is over both phases.** Phase 1 goes to every proposed
+   member and needs all of them; the promises carry each member's incarnation,
+   which is how the value's member entries are built. Phase 2 goes to the
+   decided value's members, which may be another proposer's. Two proposers'
+   member sets are both "every voting-eligible host", so they intersect.
+4. **A voter answers only under the generation it has adopted**, including for
+   voter-config keys. A proposer racing a config change that has already been
+   decided and adopted is refused `recovery_claim_wrong_generation`, writes
+   nothing, and learns the new generation from `voter_configs` by replication.
+   In a genesis race across a lease hand-off, usually only the first proposer
+   completes.
+5. **Import raises the promise** (§4.4 rule 2). An imported accepted ballot
+   can be higher than the importer's own promise; the importer raises its
+   promise to it, so the accepted ballot never exceeds the promise. Imported
+   state carries no signature; the value is re-signed at the new generation
+   when a proposer re-accepts it.
+6. **A frozen source is sealed or past.** An importer counts a member of `g`
+   whose own state for `g` can no longer change: it accepted a change of `g`
+   (sealed) or has already adopted a later generation.
+7. **Revocation is read from the installed CRL bundle** (§3.10 step 5), the
+   CA-verified union of every published `cluster_crl` row (`SyncClusterCRL`),
+   not from the replicated rows directly.
+8. **Digests.** Fields are length-prefixed rather than separator-terminated,
+   and a voter-config value has its own domain,
+   `litevirt-voter-config-value-v1`, so it can never collide with a workload
+   value.
+9. **An interrupted owner probe reads as reached.** A voter that could not
+   finish its own check does not certify the eviction.
+10. **`voter_configs` merge** — see §4.1: the certificate converges, the value
+    never does.
+11. **`lv host rm` names only `lv cluster voter rm`** while `--dead` does not
+    exist, and the CLI refuses before it revokes the certificate: the daemon's
+    own refusal would come after a revocation nothing undoes, leaving a voter
+    that can no longer sign.
+12. **Genesis proposes the derived voter set**, which on a clean cluster is
+    every host; `lv cluster voter init` also starts the first member
+    generation after a reset.

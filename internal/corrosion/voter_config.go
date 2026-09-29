@@ -88,8 +88,9 @@ const insertVoterConfigSQL = `INSERT OR IGNORE INTO voter_configs
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 
 // WriteVoterConfig records a decided generation. The caller holds its
-// certificate; the row's updated_at is the value's created_at, so every writer
-// of one decision writes the same row but for the certificate column.
+// certificate. Two writers of one decision write the same value; their rows
+// differ only in certificate and updated_at, and the merge converges them
+// (voterConfigMergeKeepLocalRow).
 func WriteVoterConfig(ctx context.Context, c *Client, v VoterConfigValue, cert ClaimCertificate) error {
 	if !c.MayWriteVoterConfigs() {
 		return ErrVoterConfigGateClosed
@@ -104,7 +105,7 @@ func WriteVoterConfig(ctx context.Context, c *Client, v VoterConfigValue, cert C
 		return err
 	}
 	return c.Execute(ctx, insertVoterConfigSQL,
-		v.Generation, string(mj), MembersHash(members), v.Change, cj, v.CreatedBy, v.CreatedAt, v.CreatedAt)
+		v.Generation, string(mj), MembersHash(members), v.Change, cj, v.CreatedBy, v.CreatedAt, c.NowTS())
 }
 
 func scanVoterConfig(r Row) (*VoterConfig, error) {

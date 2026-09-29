@@ -88,7 +88,7 @@ var customMergeTables = map[string]customMergeFn{
 // The certificate is evidence, not a fact of the row. A proposer that learned
 // the decided value in phase 1 re-certifies it at its own ballot, so two nodes
 // can hold different, equally valid certificates for one decision. They
-// converge deterministically — the greater encoding wins — so the table's
+// converge deterministically — the greater (certificate, updated_at) wins, whole — so the table's
 // digest settles instead of mismatching on every anti-entropy pass. The WAL
 // path applies the insert as INSERT OR IGNORE (DispCustomMerge), and this merge
 // then settles the certificate on the next anti-entropy pass.
@@ -103,7 +103,17 @@ func (c *Client) voterConfigMergeKeepLocalRow(tx *sql.Tx, table syncTable, row [
 		if certIdx < 0 {
 			return true, nil
 		}
-		return fmt.Sprint(localRow[certIdx]) >= fmt.Sprint(row[certIdx]), nil
+		// The greater (certificate, updated_at) wins whole, so two writers of
+		// one decision, each with its own certificate and updated_at, settle
+		// on one row.
+		lc, ic := fmt.Sprint(localRow[certIdx]), fmt.Sprint(row[certIdx])
+		if lc != ic {
+			return lc > ic, nil
+		}
+		if updatedAtIdx < 0 {
+			return true, nil
+		}
+		return fmt.Sprint(localRow[updatedAtIdx]) >= fmt.Sprint(row[updatedAtIdx]), nil
 	}
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
 	return true, nil

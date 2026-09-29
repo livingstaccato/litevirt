@@ -134,7 +134,7 @@ type VoterMember struct {
 }
 
 // Voter-config change kinds (§4.1). force:<...> belongs to
-// `lv cluster voter force-reconfigure`, which is not in this release.
+// the forced reconfiguration of design §4.6, which is not in this release.
 const (
 	VoterChangeGenesis = "genesis"
 	VoterChangeReset   = "reset"

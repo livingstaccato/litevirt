@@ -129,6 +129,11 @@ func newMockClient() *mockClient {
 
 // ── Host RPCs ──
 
+// GetVoterConfig: no voter generation, so `lv host rm` proceeds.
+func (m *mockClient) GetVoterConfig(_ context.Context, _ *pb.GetVoterConfigRequest, _ ...grpc.CallOption) (*pb.GetVoterConfigResponse, error) {
+	return &pb.GetVoterConfigResponse{}, nil
+}
+
 func (m *mockClient) ListHosts(_ context.Context, _ *pb.ListHostsRequest, _ ...grpc.CallOption) (*pb.ListHostsResponse, error) {
 	return &pb.ListHostsResponse{Hosts: m.hosts}, nil
 }

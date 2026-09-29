@@ -267,10 +267,29 @@ func ballotSenderCheck(b corrosion.Ballot, sender string) error {
 	return nil
 }
 
-// localPrepare is the voter step, after authentication.
-func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b corrosion.Ballot, gen int64) (corrosion.PrepareResult, error) {
+// localPrepare is the voter step, after authentication. A workload key past
+// attempt 0 is promised only on supersede evidence this voter checks for
+// itself (§3.12); a refusal writes nothing.
+func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b corrosion.Ballot, gen int64, ev *corrosion.SupersedeEvidence) (corrosion.PrepareResult, error) {
 	if err := s.claimDurable(ctx); err != nil {
 		return corrosion.PrepareResult{}, err
+	}
+	if key.IsWorkload() && key.Attempt > 0 {
+		// A voter that already holds an accepted value at this key admitted
+		// the attempt when it accepted it — or imported it from voters that
+		// did (§4.4, §4.6) — so a proposer learning or re-certifying that value
+		// needs no fresh evidence. Anything else does.
+		st, found, err := s.db.ClaimState(ctx, key)
+		if err != nil {
+			return corrosion.PrepareResult{}, status.Errorf(codes.Unavailable, "read claim state: %v", err)
+		}
+		if !found || st.Accepted.IsZero() {
+			if reason, detail := s.checkSupersede(ctx, key, ev); reason != "" {
+				res := corrosion.PrepareResult{Voter: s.hostName, Refusal: reason, Detail: detail}
+				s.noteClaimRefusal(key, reason, detail)
+				return res, nil
+			}
+		}
 	}
 	res, err := s.db.ClaimPrepare(ctx, key, b, gen)
 	if err != nil {
@@ -287,6 +306,21 @@ func (s *Server) localAccept(ctx context.Context, key corrosion.ClaimKey, b corr
 	signer, _, err := s.claimIdentity()
 	if err != nil {
 		return corrosion.AcceptResult{}, status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	if key.IsWorkload() && key.Attempt > 0 {
+		// The supersede evidence is checked when this voter promises; an Accept
+		// at attempt > 0 is taken only by a voter that has promised at the key,
+		// and so has checked it.
+		st, found, err := s.db.ClaimState(ctx, key)
+		if err != nil {
+			return corrosion.AcceptResult{}, status.Errorf(codes.Unavailable, "read claim state: %v", err)
+		}
+		if !found || st.Promised.IsZero() {
+			res := corrosion.AcceptResult{Voter: s.hostName, Refusal: corrosion.RefusalSupersedeUnproven,
+				Detail: fmt.Sprintf("%s has not promised at %s, so it has not checked the supersede evidence", s.hostName, key)}
+			s.noteClaimRefusal(key, res.Refusal, res.Detail)
+			return res, nil
+		}
 	}
 	res, err := s.db.ClaimAccept(ctx, key, b, v, gen, signer, s.probeOwner)
 	if err != nil {
@@ -308,7 +342,7 @@ func (s *Server) PrepareRecoveryClaim(ctx context.Context, req *pb.PrepareRecove
 	if err := ballotSenderCheck(b, callerMTLSCommonName(ctx)); err != nil {
 		return nil, err
 	}
-	res, err := s.localPrepare(ctx, keyFromPB(req.GetKey()), b, req.GetConfigGeneration())
+	res, err := s.localPrepare(ctx, keyFromPB(req.GetKey()), b, req.GetConfigGeneration(), supersedeFromPB(req.GetSupersede()))
 	if err != nil {
 		return nil, err
 	}
@@ -402,9 +436,9 @@ func (s *Server) ListRecoveryClaims(req *pb.ListRecoveryClaimsRequest, stream gr
 // peers over the claim RPCs with this node's host certificate.
 type serverClaimTransport struct{ s *Server }
 
-func (t serverClaimTransport) Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64) (corrosion.PrepareResult, error) {
+func (t serverClaimTransport) Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64, ev *corrosion.SupersedeEvidence) (corrosion.PrepareResult, error) {
 	if voter == t.s.hostName {
-		return t.s.localPrepare(ctx, key, b, gen)
+		return t.s.localPrepare(ctx, key, b, gen, ev)
 	}
 	cl, closer, err := t.s.dialPeer(ctx, voter)
 	if err != nil {
@@ -412,7 +446,7 @@ func (t serverClaimTransport) Prepare(ctx context.Context, voter string, key cor
 	}
 	defer closer()
 	resp, err := cl.PrepareRecoveryClaim(ctx, &pb.PrepareRecoveryClaimRequest{
-		Key: keyToPB(key), Ballot: ballotToPB(b), ConfigGeneration: gen})
+		Key: keyToPB(key), Ballot: ballotToPB(b), ConfigGeneration: gen, Supersede: supersedeToPB(ev)})
 	if err != nil {
 		return corrosion.PrepareResult{}, err
 	}
@@ -487,7 +521,10 @@ func (s *Server) fetchImportSource(ctx context.Context, voter string, gen int64)
 // and before any proof is written — and writes the decided value's proof with
 // the certificate; the server calls it for an automated promote once the
 // replica's host is known (claimPromote).
-func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64) (claims.Outcome, error) {
+//
+// ev is the supersede evidence a key past attempt 0 needs (§3.12), nil at
+// attempt 0.
+func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64, ev *corrosion.SupersedeEvidence) (claims.Outcome, error) {
 	if !key.IsWorkload() {
 		return claims.Outcome{}, fmt.Errorf("%s is not a workload key", key)
 	}
@@ -509,5 +546,6 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 		// owner was reachable retries at the same round (§3.13 step 6); the
 		// proposer's per-round binding refuses a different value there.
 		ReuseRound: true,
+		Supersede:  ev,
 	})
 }

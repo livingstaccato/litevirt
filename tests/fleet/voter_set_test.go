@@ -317,22 +317,27 @@ func TestFleet_VoterReset_DecidedAndSticky(t *testing.T) {
 // TestFleet_VoterSet_SurvivesTheKillSwitch: once a generation is adopted, the
 // voter set is its members on every node whatever host state and flags say —
 // two fenced members still count in the denominator, so the quorum a node
-// needs is a majority of five, not of the three it can see. The
-// enforcement.recovery_claim kill switch arrives with recovery_claim_v1
-// (colonelpanik/litevirt#250); no flag in this build reaches VoterSet, and
-// every enforcement flag is off here.
+// needs is a majority of five, not of the three it can see. Recovery claims
+// were enforced and are then stood down everywhere
+// (enforcement.recovery_claim false, §5.6): enforcement stops, the voter set
+// does not move (§4.5, §9 Q4).
 //
-// Mutation: make VoterSet fall back to the derived set — the fenced members
-// drop out and the needed quorum falls to 2.
+// Mutation: make VoterSet fall back to the derived set when the flag is off —
+// the fenced members drop out and the needed quorum falls to 2.
 func TestFleet_VoterSet_SurvivesTheKillSwitch(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 5, IndependentReplicas: true, FaultSeed: 2514})
 	c.WaitConverged(t, convergeTimeout)
 	runGenesis(t, c)
+	enableRecoveryClaims(t, c)
 	setHostState(t, c, c.Nodes[3], "fenced")
 	setHostState(t, c, c.Nodes[4], "fenced")
 	for _, n := range c.Nodes {
 		n.Server.SetEnforcementConfig(false, false, false, false, false, false)
+		n.Server.SetRecoveryClaimEnforce(false)
+		if n.Server.RecoveryClaimEnforced(ctx) {
+			t.Fatalf("%s still enforces recovery claims after the stand-down", n.Name)
+		}
 		if got := voterNames(t, n); !slices.Equal(got, nodeNames(c.Nodes...)) {
 			t.Errorf("%s counts %v; a fenced member must stay in the voter set until `lv cluster voter rm`", n.Name, got)
 		}
@@ -363,7 +368,7 @@ func TestFleet_VoterSet_SealAndTransferAfterTwoRemovals(t *testing.T) {
 	// Chosen by {0,1,2} only.
 	c.SetLinkFault(n0, n3, LinkFault{BlockClaims: true})
 	c.SetLinkFault(n0, n4, LinkFault{BlockClaims: true})
-	out, err := n0.Server.DecideRecoveryClaim(ctx, key, v, 1)
+	out, err := n0.Server.DecideRecoveryClaim(ctx, key, v, 1, nil)
 	if err != nil {
 		t.Fatalf("decide under generation 1: %v", err)
 	}
@@ -388,7 +393,7 @@ func TestFleet_VoterSet_SealAndTransferAfterTwoRemovals(t *testing.T) {
 
 	// A proposer that reaches only {3,4} — a majority of generation 3.
 	c.SetLinkFault(n3, n2, LinkFault{BlockClaims: true})
-	late, err := n3.Server.DecideRecoveryClaim(ctx, key, workloadClaimValue(key, n3.Name, "proof-late"), 1)
+	late, err := n3.Server.DecideRecoveryClaim(ctx, key, workloadClaimValue(key, n3.Name, "proof-late"), 1, nil)
 	if err != nil {
 		t.Fatalf("decide under generation 3: %v", err)
 	}
@@ -415,7 +420,7 @@ func TestFleet_Voter_ChangedIncarnationAbstains(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "vm-amnesia", OwnerEpoch: 1}
-	out, err := n0.Server.DecideRecoveryClaim(ctx, key, workloadClaimValue(key, n0.Name, "proof-a"), 1)
+	out, err := n0.Server.DecideRecoveryClaim(ctx, key, workloadClaimValue(key, n0.Name, "proof-a"), 1, nil)
 	if err != nil {
 		t.Fatalf("the remaining majority could not decide: %v", err)
 	}
@@ -447,7 +452,7 @@ func TestFleet_Voter_ChangedIncarnationAbstains(t *testing.T) {
 	}
 	key2 := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "vm-healed", OwnerEpoch: 1}
 	c.SetLinkFault(n0, c.Nodes[1], LinkFault{BlockClaims: true})
-	if _, err := n0.Server.DecideRecoveryClaim(ctx, key2, workloadClaimValue(key2, n0.Name, "proof-b"), 1); err != nil {
+	if _, err := n0.Server.DecideRecoveryClaim(ctx, key2, workloadClaimValue(key2, n0.Name, "proof-b"), 1, nil); err != nil {
 		t.Fatalf("after rm+add the healed voter still does not vote: %v", err)
 	}
 }
@@ -471,7 +476,7 @@ func TestFleet_Voter_DuellingProposersConverge(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			outs[i], errs[i] = n.Server.DecideRecoveryClaim(ctx, key, workloadClaimValue(key, n.Name, "proof-"+n.Name), 1)
+			outs[i], errs[i] = n.Server.DecideRecoveryClaim(ctx, key, workloadClaimValue(key, n.Name, "proof-"+n.Name), 1, nil)
 		}()
 	}
 	wg.Wait()

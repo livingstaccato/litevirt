@@ -604,11 +604,36 @@ type TermFence struct {
 func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string, fence *TermFence) error {
 	now := c.NowTS()
 	if fence == nil {
-		n, err := c.ExecuteRowsStrict(ctx, claimProofSQL, executor, now, now, id, executor)
+		// A proof this node abandoned (docs/design/recovery-claims.md §3.12) is
+		// never claimed here, decided in the same transaction as the claim. The
+		// relayed statement is the plain claim either way.
+		abandoned := false
+		ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			a, err := proofAbandonedTx(ctx, tx, id)
+			if err != nil {
+				return false, err
+			}
+			if a {
+				abandoned = true
+				return false, nil
+			}
+			var claimable int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM runtime_action_proofs
+				  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
+				    AND (executor_host = '' OR executor_host = ?)`,
+				id, executor).Scan(&claimable); err != nil {
+				return false, err
+			}
+			return claimable > 0, nil
+		}, []Statement{{SQL: claimProofSQL, Params: []interface{}{executor, now, now, id, executor}}})
 		if err != nil {
 			return err
 		}
-		if n == 0 {
+		if abandoned {
+			return ErrProofAbandoned
+		}
+		if !ok {
 			return ErrProofSpent // terminal, missing, or held by another executor
 		}
 		return nil
@@ -634,8 +659,14 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 	// ErrTermClaimantConflict. The guard runs in the same transaction as the
 	// UPDATE, so "claimable" cannot go stale between the two — which is what
 	// lets the relayed statement be the plain claim and still be exact.
-	var fenced bool
+	var fenced, abandoned bool
 	ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		if a, err := proofAbandonedTx(ctx, tx, id); err != nil {
+			return false, err
+		} else if a {
+			abandoned = true
+			return false, nil
+		}
 		var claimable int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM runtime_action_proofs
@@ -705,6 +736,9 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 	}
 	if ok {
 		return nil
+	}
+	if abandoned {
+		return ErrProofAbandoned
 	}
 	if fenced {
 		return ErrTermClaimantConflict

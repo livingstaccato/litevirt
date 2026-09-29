@@ -109,11 +109,20 @@ func proofsNaming(t *testing.T, n *Node, target, dest string) []string {
 // failed probe of it replicated to the other.
 func claimFleet(t *testing.T, clock *VirtualClock, seed int64, vms ...string) (c *Cluster, a, b, victim *Node) {
 	t.Helper()
+	return claimFleetWith(t, clock, seed, func(_ *Cluster, a, _, victim *Node) {
+		for _, vm := range vms {
+			insertVM(t, a, vm, victim.Name)
+		}
+	})
+}
+
+// claimFleetWith is claimFleet with the workloads placed by setup, before the
+// voter set is formed and the victim killed.
+func claimFleetWith(t *testing.T, clock *VirtualClock, seed int64, setup func(c *Cluster, a, b, victim *Node)) (c *Cluster, a, b, victim *Node) {
+	t.Helper()
 	c = New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: seed})
 	a, b, victim = c.Nodes[0], c.Nodes[1], c.Nodes[2]
-	for _, vm := range vms {
-		insertVM(t, a, vm, victim.Name)
-	}
+	setup(c, a, b, victim)
 	c.WaitConverged(t, convergeTimeout)
 	genesisByTick(t, c, a)
 	enableRecoveryClaims(t, c)

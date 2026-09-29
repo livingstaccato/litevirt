@@ -36,8 +36,17 @@ const claimTimeout = 5 * time.Second
 // proposer reaches every member of the adopted voter generation over the claim
 // RPCs, and its own voter directly.
 type RecoveryClaimer interface {
-	DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64) (claims.Outcome, error)
+	// DecideRecoveryClaim drives one claim; ev is the supersede evidence a
+	// key past attempt 0 needs (§3.12).
+	DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, startRound uint64, ev *corrosion.SupersedeEvidence) (claims.Outcome, error)
+	// RequestAbandonment asks host to sign that it has not executed, and never
+	// will, proofID at key, returning the encoded abandonment.
+	RequestAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string) (string, error)
 }
+
+// maxClaimAttempts bounds how far one claimRecovery walks a key's attempts.
+// Each step needs supersede evidence, so a real key rarely passes 1.
+const maxClaimAttempts = 8
 
 // claimsEnforced is the enforcement predicate, read from the server so the
 // coordinator and the executors on one node cannot disagree about it: the
@@ -108,6 +117,12 @@ type claimedProof struct {
 //
 // It never falls back to an uncertified proof: without a certificate it
 // returns a *ClaimRefusedError and the caller mints nothing (§3.13 step 6).
+//
+// A key's attempt starts at 0 and moves on only past a decided value whose
+// destination provably will never execute it (§3.12): this coordinator's own
+// promote that failed before StartDomain, abandoned by its destination, or a
+// value decided for a destination that has since been removed for good. Each
+// step carries the evidence, and every voter checks it before it promises.
 func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.ActionProof, source string) (claimedProof, error) {
 	epoch, err := strconv.ParseInt(proposal.OwnerEpoch, 10, 64)
 	if err != nil {
@@ -121,6 +136,62 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 		return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimNoMajority,
 			Result: ResultNoMajority, Detail: "no recovery claimer is wired on " + c.hostName}
 	}
+	var ev *corrosion.SupersedeEvidence
+	for attempt := int64(0); attempt < maxClaimAttempts; attempt++ {
+		key.Attempt = attempt
+		cl, out, err := c.claimAttempt(ctx, key, proposal, source, ev)
+		if err != nil || cl.Ours {
+			return cl, err
+		}
+		next := c.supersedeEvidence(ctx, key, out, cl.Proof, proposal)
+		if next == nil {
+			return cl, nil
+		}
+		slog.Warn("failover: a decided recovery will never execute; moving the claim to the next attempt",
+			"key", key.String(), "decided_dest", cl.Proof.DestHost, "decided_proof", cl.Proof.ID,
+			"evidence", map[bool]string{true: "abandonment", false: "destination removed"}[next.Abandonment != ""])
+		c.mAttempt(PhaseClaim, ResultSuperseded, "")
+		ev = next
+	}
+	return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimNoMajority, Result: ResultNoMajority,
+		Detail: fmt.Sprintf("%d attempts of %s were each superseded", maxClaimAttempts, key)}
+}
+
+// supersedeEvidence is the evidence that the value decided at key will never
+// execute, or nil when there is none and the decided value stands (§3.12).
+func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.ClaimKey, out claims.Outcome, decided corrosion.ActionProof, proposal corrosion.ActionProof) *corrosion.SupersedeEvidence {
+	cert, err := out.Certificate.Encode()
+	if err != nil {
+		return nil
+	}
+	value := out.Value
+	ev := &corrosion.SupersedeEvidence{PriorCertificate: cert, PriorValue: &value}
+	dest := decided.DestHost
+	// This coordinator's own promote, and it is not promoting now: the promote
+	// failed and it fell back. Only the destination can say it never started,
+	// and it signs that or refuses. Another coordinator's promote is never
+	// abandoned from here — it may be building its disk as this runs.
+	if decided.Action == corrosion.ActionPromote && decided.Coordinator == c.hostName && proposal.Action != corrosion.ActionPromote {
+		ab, err := c.Claimer.RequestAbandonment(ctx, dest, key, decided.ID,
+			"the promote failed before StartDomain; the coordinator is falling back to a reschedule")
+		if err != nil {
+			slog.Warn("failover: the decided promote's destination did not abandon it", "key", key.String(),
+				"dest", dest, "proof", decided.ID, "error", err)
+			return nil
+		}
+		ev.Abandonment = ab
+		return ev
+	}
+	// A destination removed for good (`lv host rm --dead`): voters check the
+	// fence, the removal and the revocation in their own replicas.
+	if h, err := corrosion.GetHost(ctx, c.db, dest); err == nil && h == nil {
+		return ev
+	}
+	return nil
+}
+
+// claimAttempt runs one claim at key (attempt included).
+func (c *Coordinator) claimAttempt(ctx context.Context, key corrosion.ClaimKey, proposal corrosion.ActionProof, source string, ev *corrosion.SupersedeEvidence) (claimedProof, claims.Outcome, error) {
 	if prev, ok := c.claimRetryProposals[key]; ok && sameClaimIntent(prev, proposal) {
 		// The value the voters refused last time, not a fresh one: the same
 		// round then carries the same value.
@@ -132,7 +203,7 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 
 	cctx, cancel := context.WithTimeout(ctx, c.claimDeadline(ctx))
 	defer cancel()
-	out, err := c.Claimer.DecideRecoveryClaim(cctx, key, value, c.claimRound())
+	out, err := c.Claimer.DecideRecoveryClaim(cctx, key, value, c.claimRound(), ev)
 	if err != nil {
 		ce := classifyClaimError(key, err)
 		c.mAttempt(PhaseClaim, ce.Result, "")
@@ -144,11 +215,11 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 		} else {
 			delete(c.claimRetryProposals, key)
 		}
-		return claimedProof{Key: key}, ce
+		return claimedProof{Key: key}, out, ce
 	}
 	delete(c.claimRetryProposals, key)
 	if out.Value.Proof == nil {
-		return claimedProof{Key: key}, fmt.Errorf("claim %s decided a value with no proof", key)
+		return claimedProof{Key: key}, out, fmt.Errorf("claim %s decided a value with no proof", key)
 	}
 	decided := *out.Value.Proof
 	if out.Ours {
@@ -156,7 +227,7 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 	}
 	cert, err := out.Certificate.Encode()
 	if err != nil {
-		return claimedProof{Key: key}, err
+		return claimedProof{Key: key}, out, err
 	}
 	decided.ClaimCertificate = cert
 	result := ResultOK
@@ -164,7 +235,7 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 		result = ResultLost
 	}
 	c.mAttempt(PhaseClaim, result, "")
-	return claimedProof{Proof: decided, Key: out.Certificate.Key, Ours: out.Ours}, nil
+	return claimedProof{Proof: decided, Key: out.Certificate.Key, Ours: out.Ours}, out, nil
 }
 
 // sameClaimIntent reports whether two proposals for one key would be the same
@@ -287,6 +358,59 @@ func (c *Coordinator) claimContainerRelocation(ctx context.Context, h *corrosion
 		"container", ct.Name, "dest", cl.Proof.DestHost, "decided_by", cl.Proof.Coordinator, "proof", cl.Proof.ID)
 	delete(c.relocDeferred, cl.Proof.ID)
 	return cl.Proof, true
+}
+
+// noteClaimStranded records a recovery decided for the very host being
+// recovered: it died after the decision and before it acted, no abandonment
+// can be had from it, and it might return and execute its valid certificate.
+// So the workload stays, deliberately, until the host returns or is removed
+// for good (§3.12); ha.claim.stranded names it with the command.
+func (c *Coordinator) noteClaimStranded(kind, name, host string, decided corrosion.ActionProof) {
+	if kind == "container" {
+		c.mCt(ActionRelocate, ResultRefused, ErrClaimStranded)
+	} else {
+		c.mVM(ActionReschedule, ResultRefused, ErrClaimStranded)
+	}
+	slog.Warn("failover: this recovery was decided for the host that failed, before it acted; it is stranded until "+
+		"that host returns or is removed for good", "kind", kind, "name", name, "host", host, "proof", decided.ID,
+		"fix", "if "+host+" is gone for good: lv host rm --dead "+host+" (--dry-run first)")
+	c.retryClaimsFor(host)
+}
+
+// recoverRemovedHosts recovers the workloads still recorded on hosts that
+// have been removed for good, under recovery claims only (§3.12). Their
+// claims move to the next attempt on the removal evidence — fenced
+// proof-grade, no live hosts row, revoked — which every voter checks in its
+// own replica; until all three have replicated the voters refuse and this
+// retries next tick. Without claims the pre-claim behaviour stands: a removed
+// host's rows are only ever there because an operator forced the removal.
+func (c *Coordinator) recoverRemovedHosts(ctx context.Context) {
+	if !c.claimsEnforced(ctx) {
+		return
+	}
+	rows, err := c.db.Query(ctx, `SELECT DISTINCT host_name FROM (
+			SELECT host_name FROM vms WHERE deleted_at IS NULL
+			UNION SELECT host_name FROM containers WHERE deleted_at IS NULL)
+		WHERE host_name != '' AND host_name NOT IN (SELECT name FROM hosts WHERE deleted_at IS NULL)`)
+	if err != nil {
+		slog.Warn("failover: list workloads on removed hosts", "error", err)
+		return
+	}
+	for _, r := range rows {
+		host := r.String("host_name")
+		if !c.holdLease(ctx) {
+			return
+		}
+		if _, fenced, err := corrosion.HostProofGradeFence(ctx, c.db, host); err != nil || !fenced {
+			// Removed without a proof-grade fence (a pre-claims `lv host rm
+			// --force`): not removed for good as far as the claims can tell,
+			// and the voters would refuse its supersede anyway.
+			slog.Debug("failover: workloads on a removed host with no proof-grade fence are left", "host", host)
+			continue
+		}
+		slog.Info("failover: recovering workloads recorded on a host removed for good", "host", host)
+		c.recoverWorkloads(ctx, &corrosion.HostRecord{Name: host, State: "removed"})
+	}
 }
 
 // retryClaimsFor marks host's recovery to be re-run on the next tick.

@@ -254,6 +254,10 @@ type Coordinator struct {
 	// one value. It returns at once on a cluster that already has a voter
 	// generation. nil (a hand-built coordinator) never proposes.
 	VoterGenesis func(ctx context.Context, leaseTerm int64)
+	// ClaimHealth, when set, runs once per tick in which this coordinator
+	// holds the lease: the recovery-claim health conditions
+	// (grpcapi.Server.RecoveryClaimHealthTick — ha.claim.stranded). nil never evaluates them.
+	ClaimHealth func(ctx context.Context)
 	// Claimer decides recovery claims (docs/design/recovery-claims.md §3.13):
 	// *grpcapi.Server, whose proposer reaches every member of the adopted
 	// voter generation. Consulted only while RecoveryClaimEnforced says so.
@@ -450,6 +454,9 @@ func (c *Coordinator) run(ctx context.Context) {
 	}
 	if c.VoterGenesis != nil {
 		c.VoterGenesis(ctx, c.LeaseTerm())
+	}
+	if c.ClaimHealth != nil {
+		c.ClaimHealth(ctx)
 	}
 
 	// The voter set is both halves of the quorum: its size is the
@@ -735,6 +742,12 @@ func (c *Coordinator) run(ctx context.Context) {
 	// it's healthy again. A transient drop (a daemon restart, a brief blip) must
 	// self-heal — otherwise health reconverges in seconds but hosts.state sticks.
 	c.recoverHosts(ctx, c.scope)
+
+	// Workloads still recorded on a host that has been removed for good (`lv
+	// host rm --dead`): under recovery claims their claims supersede to the
+	// next attempt, and nothing else would ever visit them — a removed host is
+	// no fence candidate.
+	c.recoverRemovedHosts(ctx)
 
 	// Settle any relocate-restore markers left by an indeterminate restore or a
 	// coordinator crash mid-restore. This runs every cycle, independent of the
@@ -2279,6 +2292,13 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				}
 				if cl.Proof.Action != corrosion.ActionReschedule {
 					c.noteClaimLost(ActionReschedule, "vm", vm.Name, h.Name, cl.Proof)
+					continue
+				}
+				if cl.Proof.DestHost == h.Name {
+					// Decided FOR the host being recovered, which died before
+					// it acted: stranded until it returns or is removed for
+					// good (ha.claim.stranded names the command).
+					c.noteClaimStranded("vm", vm.Name, h.Name, cl.Proof)
 					continue
 				}
 				proof, targetName = cl.Proof, cl.Proof.DestHost

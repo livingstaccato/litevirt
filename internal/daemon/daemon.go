@@ -1351,6 +1351,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// mint side and the executor side on this node read one answer.
 	fc.Claimer = svc
 	fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
+	// The recovery-claim health conditions (ha.claim.stranded) are the lease holder's to write, like genesis.
+	fc.ClaimHealth = svc.RecoveryClaimHealthTick
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

@@ -27,7 +27,9 @@ import (
 // Transport reaches one voter. An error is "no answer": the voter counts toward
 // neither side.
 type Transport interface {
-	Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64) (corrosion.PrepareResult, error)
+	// Prepare carries ev, the supersede evidence a key at attempt > 0 needs
+	// (docs/design/recovery-claims.md §3.12); nil otherwise.
+	Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64, ev *corrosion.SupersedeEvidence) (corrosion.PrepareResult, error)
 	Accept(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, v corrosion.ClaimValue, gen int64) (corrosion.AcceptResult, error)
 }
 
@@ -57,6 +59,9 @@ type Spec struct {
 	// owner was still reachable without raising its round: nothing was
 	// contending, so nothing should have to outrank it (§3.13 step 6).
 	ReuseRound bool
+	// Supersede is the evidence, sent with every Prepare, that the value
+	// decided at Key.Attempt-1 will never execute. Required at attempt > 0.
+	Supersede *corrosion.SupersedeEvidence
 }
 
 // Outcome is a decided value and the certificate that proves it.
@@ -325,7 +330,7 @@ func (p *Proposer) prepareAll(ctx context.Context, spec Spec, b corrosion.Ballot
 			defer wg.Done()
 			cctx, cancel := context.WithTimeout(ctx, p.callTimeout())
 			defer cancel()
-			res, err := p.Transport.Prepare(cctx, voter, spec.Key, b, spec.Generation)
+			res, err := p.Transport.Prepare(cctx, voter, spec.Key, b, spec.Generation, spec.Supersede)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {

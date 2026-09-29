@@ -2,6 +2,7 @@ package failover
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
@@ -12,16 +13,32 @@ import (
 
 // fakeClaimer decides every claim the way decide says, recording each call.
 type fakeClaimer struct {
-	mu     sync.Mutex
-	calls  []corrosion.ClaimKey
-	decide func(key corrosion.ClaimKey, proposal corrosion.ClaimValue) (claims.Outcome, error)
+	mu           sync.Mutex
+	calls        []corrosion.ClaimKey
+	evidence     []*corrosion.SupersedeEvidence
+	abandonAsked []string
+	decide       func(key corrosion.ClaimKey, proposal corrosion.ClaimValue) (claims.Outcome, error)
+	abandon      func(host string, key corrosion.ClaimKey, proofID string) (string, error)
 }
 
-func (f *fakeClaimer) DecideRecoveryClaim(_ context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, _ uint64) (claims.Outcome, error) {
+var errNoAbandonment = errors.New("the destination refused to abandon")
+
+func (f *fakeClaimer) DecideRecoveryClaim(_ context.Context, key corrosion.ClaimKey, proposal corrosion.ClaimValue, _ uint64, ev *corrosion.SupersedeEvidence) (claims.Outcome, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, key)
+	f.evidence = append(f.evidence, ev)
 	f.mu.Unlock()
 	return f.decide(key, proposal)
+}
+
+func (f *fakeClaimer) RequestAbandonment(_ context.Context, host string, key corrosion.ClaimKey, proofID, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.abandonAsked = append(f.abandonAsked, host+"/"+proofID)
+	if f.abandon != nil {
+		return f.abandon(host, key, proofID)
+	}
+	return "", errNoAbandonment
 }
 
 // decideOurs certifies whatever is proposed.

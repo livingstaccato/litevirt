@@ -1021,7 +1021,23 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// proof-keyed step covers a SAME-proof retry; the host-local promote marker covers
 		// a CROSS-proof retry (each failover cycle mints a fresh proof). Written before the
 		// start (fail closed on a marker error — nothing is running yet).
-		recordStep("start_attempted")
+		// The start checkpoint doubles as the abandonment fence
+		// (docs/design/recovery-claims.md §3.12): a destination abandons only a
+		// proof that never started, so the checkpoint is appended only if this
+		// host has not abandoned the proof — decided in one transaction, which
+		// is what makes "abandon only what never ran" exact.
+		if proofID != "" {
+			if err := corrosion.AppendProofStepUnlessAbandoned(ctx, s.db, proofID, "start_attempted"); err != nil {
+				os.Remove(livePath)
+				_ = s.virt.UndefineDomain(targetName, false)
+				if errors.Is(err, corrosion.ErrProofAbandoned) {
+					s.noteGateRefused(corrosion.ActionPromote, health.ReasonClaimLost)
+					return status.Errorf(codes.FailedPrecondition,
+						"promote of %s refused: this host abandoned proof %s and will never execute it", vm.Name, proofID)
+				}
+				return status.Errorf(codes.Unavailable, "record the start checkpoint of proof %s: %v", proofID, err)
+			}
+		}
 		if err := s.writePromoteMarker(targetName, proofID); err != nil {
 			os.Remove(livePath)
 			return status.Errorf(codes.Internal, "record promote marker: %v", err)

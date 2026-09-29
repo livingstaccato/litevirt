@@ -458,7 +458,15 @@ import (
 //	     recovery_claim_v1 has latched (ReplicationGated), so a
 //	     previous-release peer never sees one. One additive column, appended
 //	     LAST for the v53 digest reason.
-const CurrentSchemaVersion = 60
+//	v61: a recovery destination's abandonments (docs/design/recovery-claims.md
+//	     §3.12) — local_abandoned_proofs, NODE-LOCAL like local_term_bindings:
+//	     never in tableNames, written only through ExecuteLocal. It records the
+//	     proofs this node signed it will never execute, which is the supersede
+//	     evidence a claim needs to move to attempt+1 after a decided promote
+//	     failed before StartDomain; every later claim of such a proof, and a
+//	     promote's start checkpoint, is refused in the same transaction that
+//	     reads it. One new table.
+const CurrentSchemaVersion = 61
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2666,6 +2674,22 @@ var schemaDDL = []string{
 		imported_from TEXT NOT NULL DEFAULT '',
 		adopted_at    TEXT NOT NULL
 	)`,
+	// NODE-LOCAL (v61). The proofs this node, as a recovery destination, has
+	// signed that it will never execute (docs/design/recovery-claims.md
+	// §3.12). Written only through ExecuteLocal (AbandonProof), in the same
+	// transaction that checks the proof has not started here; every later
+	// claim of the proof, and a promote's start checkpoint, is refused in the
+	// same transaction that reads this table. Rows are never deleted: an
+	// abandonment is a promise, and a promise a peer could erase is not one.
+	`CREATE TABLE IF NOT EXISTS local_abandoned_proofs (
+		proof_id     TEXT    PRIMARY KEY,
+		target_kind  TEXT    NOT NULL,
+		target_name  TEXT    NOT NULL,
+		owner_epoch  INTEGER NOT NULL,
+		attempt      INTEGER NOT NULL,
+		reason       TEXT    NOT NULL DEFAULT '',
+		abandoned_at TEXT    NOT NULL
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3226,6 +3250,7 @@ var createTableUnits = []struct {
 	{58, "cluster_policies"},
 	{59, "voter_configs"}, {59, "local_recovery_claims"}, {59, "local_voter_incarnation"},
 	{59, "local_voter_adoption"},
+	{61, "local_abandoned_proofs"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

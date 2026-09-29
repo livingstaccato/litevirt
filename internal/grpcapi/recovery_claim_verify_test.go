@@ -29,7 +29,7 @@ func certify(t *testing.T, s *Server, p *pb.RuntimeActionProof, source string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := s.DecideRecoveryClaim(context.Background(), key, corrosion.ClaimValue{Proof: &proof, SourceHost: source}, 1)
+	out, err := s.DecideRecoveryClaim(context.Background(), key, corrosion.ClaimValue{Proof: &proof, SourceHost: source}, 1, nil)
 	if err != nil {
 		t.Fatalf("decide: %v", err)
 	}

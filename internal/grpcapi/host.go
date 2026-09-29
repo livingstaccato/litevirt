@@ -1033,11 +1033,21 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 		return nil, err
 	}
 
-	// Check for VMs on this host.
-	vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
-	if len(vms) > 0 && !req.Force {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
+	// `lv host rm --dead` (recovery-claims.md §3.12): a host fenced proof-grade
+	// and gone for good. Its workloads are not drained first — they are the
+	// stranded ones, and their rows stay in place for the recovery claims to
+	// supersede once this removal and the CRL have replicated.
+	if req.Dead {
+		if err := s.deadRemovalRefusal(ctx, h); err != nil {
+			return nil, err
+		}
+	} else {
+		// Check for VMs on this host.
+		vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
+		if len(vms) > 0 && !req.Force {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
+		}
 	}
 
 	// Soft-delete the host and clean up related records.

@@ -326,18 +326,36 @@ the cluster has published.`,
 }
 
 func newHostRmCmd() *cobra.Command {
-	var force bool
+	var force, dead, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "rm <host>",
 		Short: "Remove host from cluster",
-		Args:  cobra.ExactArgs(1),
+		Long: `Removes a host: revokes its certificate, publishes the CRL, and deletes its row.
+
+--dead removes a host that is fenced proof-grade and gone for good, so the
+recoveries decided for it can move on (recovery claims, docs/design/recovery-claims.md
+§3.12). It refuses unless the host has an IPMI power-off or an operator
+'lv host fence-confirm' recorded; removes it from the voter set first if it is a
+member; revokes and publishes as 'lv host rm' does; and reports how many
+stranded recoveries will retry. Its workloads need no --force: they are the
+stranded ones. --dry-run runs every check and prints the plan without changing
+anything.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if dryRun && !dead {
+				return fmt.Errorf("--dry-run applies to --dead")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if dead {
+					return cli.HostRemoveDead(ctx, c, args[0], dryRun)
+				}
 				return cli.HostRemove(ctx, c, args[0], force)
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Force removal even if VMs exist")
+	cmd.Flags().BoolVar(&dead, "dead", false, "Remove a host that is fenced proof-grade and gone for good, unblocking recoveries decided for it")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "With --dead: run every check and print the plan, changing nothing")
 	return cmd
 }
 

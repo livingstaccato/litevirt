@@ -798,7 +798,8 @@ func (s *Server) voterRemovalRefusal(ctx context.Context, host string) error {
 	if _, ok := cfg.Member(host); ok {
 		return status.Errorf(codes.FailedPrecondition,
 			"%s is a member of voter generation %d; removing the host would not remove its vote. "+
-				"Run `lv cluster voter rm %s` first, then remove the host", host, cfg.Generation, host)
+				"Run `lv cluster voter rm %s` first, then remove the host — or, if it is fenced and gone for "+
+				"good, `lv host rm --dead %s`, which does both", host, cfg.Generation, host, host)
 	}
 	return nil
 }

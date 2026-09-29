@@ -129,7 +129,7 @@ func (m *memTransport) fault(voter string) error {
 
 func unreachable(context.Context, string) (bool, string) { return false, "" }
 
-func (m *memTransport) Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64) (corrosion.PrepareResult, error) {
+func (m *memTransport) Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64, _ *corrosion.SupersedeEvidence) (corrosion.PrepareResult, error) {
 	if err := m.fault(voter); err != nil {
 		return corrosion.PrepareResult{}, err
 	}

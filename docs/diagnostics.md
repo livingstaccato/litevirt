@@ -1032,6 +1032,59 @@ not been removed — `lv cluster voter init --members <hosts>` proposes the
 generation by hand. Every listed member must sign. `lv cluster voter ls` shows
 the adopted generation once one exists.
 
+### Recovery-claim refusals (`recovery_claim_*`)
+
+With recovery claims enforced (`enforcement.recovery_claim`), a recovery that
+did not happen is counted in `litevirt_runtime_action_refused_total{reason}` and
+logged with every refusing voter's detail:
+
+- `recovery_claim_owner_reachable` — voters could still reach the workload's
+  recorded owner and refused to certify its eviction, for example
+  `node-3 still reaches node-2 (Ping answered in 4ms)`. The owner is up for
+  most of the cluster: find out why the coordinator judged it failed. If it
+  must not keep its workloads, fence it proof-grade; the probe then fails and
+  the next tick's claim proceeds (at the same round).
+- `recovery_claim_source_mismatch` — a voter's settled row names a different
+  owner than the one the coordinator named.
+- `recovery_claim_no_majority` — no majority of the voter generation answered:
+  restore connectivity, or remove voters gone for good.
+- `recovery_claim_lost` — another coordinator's recovery was decided; this one
+  wrote that proof (or deferred to it) and nothing of its own.
+- `recovery_claim_unproven` — a destination refused a proof whose certificate
+  does not verify here: usually `voter_configs` or `cluster_crl` replication
+  lag, which clears on a later reconcile; compare `lv cluster voter ls` across
+  hosts if it persists.
+
+### Recovery stranded on a dead destination (`ha.claim.stranded`)
+
+Evaluator `recovery_claim`, subject `cluster/claims`, severity warning. Written
+by the leader-lease holder while recovery claims are enforced
+(`enforcement.recovery_claim`). A recovery claim decided a destination for a
+workload, and that destination then failed before it started it: the workload
+stays pending on a host that is fenced or offline. This is deliberate. No
+abandonment can be obtained from a dead host, and it might come back and
+execute the certificate it holds, so no other destination may be authorized
+until it is proven gone. The evidence names each workload, the destination and
+its state, and the exact command:
+
+```
+vm/db-1 is decided for node-4, which is fenced and cannot run it; if node-4 is gone for good,
+`lv host rm --dead node-4` (try --dry-run first) lets it retry at attempt 1.
+```
+
+If the destination comes back it executes the recovery (or, having failed
+before starting, abandons it) and the condition resolves. If it is gone for
+good, `lv host rm --dead <host> --dry-run` shows the plan: the proof-grade
+fence it rests on (run `lv host fence-confirm <host>` first if there is none),
+whether the host is removed from the voter set first, and each stranded
+recovery. The real run removes the host from the voter set if it votes,
+revokes its certificate, publishes the CRL and removes it. Every voter then
+checks, in its own replica, that the destination is fenced proof-grade, no
+longer a member and revoked before it promises at the next attempt; until the
+CRL has reached them it refuses with `recovery_claim_supersede_unproven`, and
+the next lease-holder tick retries. See
+[design/recovery-claims.md](design/recovery-claims.md) §3.12.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

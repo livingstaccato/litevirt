@@ -98,10 +98,28 @@ func (s *Server) claimPromote(ctx context.Context, vm *corrosion.VMRecord, p *pb
 		round = uint64(p.GetLeaseTerm())
 	}
 	value := corrosion.ClaimValue{Proof: &proposal, SourceHost: vm.HostName}
-	out, err := s.DecideRecoveryClaim(ctx, key, value, round)
+	out, err := s.DecideRecoveryClaim(ctx, key, value, round, nil)
 	if err != nil {
 		s.noteGateRefused(corrosion.ActionPromote, claimRefusalReason(err))
 		return status.Errorf(codes.Unavailable, "promote of %s formed no recovery-claim certificate: %v", vm.Name, err)
+	}
+	cert, err := out.Certificate.Encode()
+	if err != nil {
+		return status.Errorf(codes.Internal, "encode certificate: %v", err)
+	}
+	if !out.Ours && out.Value.Proof != nil {
+		decided := *out.Value.Proof
+		// This host's own promote to the same destination, decided on an
+		// earlier tick and not carried out — a relay that failed before the
+		// destination did anything, say: complete THAT decision rather than
+		// refuse it, with its proof ID and certificate (§3.13 step 5).
+		if decided.Action == corrosion.ActionPromote && decided.Coordinator == s.hostName &&
+			decided.DestHost == p.GetDestHost() {
+			decided.LeaseHolder = p.GetLeaseHolder()
+			decided.ClaimCertificate = cert
+			*p = *proofToPB(decided)
+			return nil
+		}
 	}
 	if !out.Ours || out.Value.Proof == nil {
 		decided := corrosion.ActionProof{}
@@ -110,10 +128,6 @@ func (s *Server) claimPromote(ctx context.Context, vm *corrosion.VMRecord, p *pb
 		}
 		s.noteGateRefused(corrosion.ActionPromote, health.ReasonClaimLost)
 		return &RecoveryClaimLostError{Decided: decided}
-	}
-	cert, err := out.Certificate.Encode()
-	if err != nil {
-		return status.Errorf(codes.Internal, "encode certificate: %v", err)
 	}
 	p.ClaimCertificate = cert
 	return nil

@@ -526,6 +526,7 @@ func (c *Cluster) NewCoordinators(clock *VirtualClock) *Coordinators {
 		// scenario enables them (enableRecoveryClaims).
 		coord.Claimer = n.Server
 		coord.RecoveryClaimEnforced = n.Server.RecoveryClaimEnforced
+		coord.ClaimHealth = n.Server.RecoveryClaimHealthTick
 		cs.ByNode[n.Name] = coord
 	}
 	return cs

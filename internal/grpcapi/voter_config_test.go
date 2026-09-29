@@ -65,7 +65,7 @@ func TestAdvertise_VoterConfigWithheldUntilReady(t *testing.T) {
 		t.Error("a node at synchronous=NORMAL advertises voter_config_v1")
 	}
 	if _, err := normal.localPrepare(context.Background(), corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVoterConfig},
-		corrosion.Ballot{Round: 1, Coordinator: normal.hostName}, 0); status.Code(err) != codes.FailedPrecondition {
+		corrosion.Ballot{Round: 1, Coordinator: normal.hostName}, 0, nil); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("a voter below FULL answered Prepare: %v", err)
 	}
 }

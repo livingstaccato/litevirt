@@ -110,6 +110,10 @@ const (
 	// count would fence was not, because the observations came from voters
 	// outside its region. A site partition looks like this.
 	ErrRegionScoped = "region_scoped"
+	// ErrClaimStranded: a recovery claim decided a destination that has since
+	// failed before acting; the workload waits for it to return or be removed
+	// for good (`lv host rm --dead`).
+	ErrClaimStranded = "recovery_claim_stranded"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

@@ -76,6 +76,10 @@ lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host>                    # Return host to scheduling
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
+lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
+                                          #   fence, `voter rm` if it votes, revokes + publishes the CRL,
+                                          #   removes it, and reports the stranded recoveries that now retry
+                                          #   at the next claim attempt. --dry-run changes nothing
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's

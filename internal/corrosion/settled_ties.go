@@ -20,8 +20,8 @@ import (
 // A pull already carries everything needed to prove the difference is only
 // that. After the merge, the pulled rows are compared with the local table
 // under one read lock; if the two hold the same primary keys and every row that
-// differs is tracked in the tie register under exactly this pair of versions,
-// the table is SETTLED against this peer at the (local, remote) digest pair
+// differs is a tracked tie whose version set (tieVersions) holds BOTH this
+// node's version and the peer's, the table is SETTLED against this peer at the (local, remote) digest pair
 // the pass saw. The same scan yields the local digest, so the proof and the
 // digest describe one state.
 //
@@ -29,7 +29,7 @@ import (
 //   - the peer's digest is the one recorded, and so is ours: ANY write on
 //     either side — a new row, a repair, a tombstone — moves a digest, and
 //     the table is pulled on that very pass;
-//   - every tie the proof relied on is still tracked with the same pair, so a
+//   - every tie the proof relied on is still tracked with both versions, so a
 //     register cleared by some other path puts the table back to pulling;
 //   - the replica is caught up, as for observation tables.
 //
@@ -59,7 +59,7 @@ type settledTies struct {
 type settledTie struct {
 	local  TableDigest
 	remote TableDigest
-	ties   map[string]string // unresolvedKey -> pair fingerprint
+	ties   map[string][2]string // unresolvedKey -> (local, peer) version fingerprints
 }
 
 func settledKey(peer, table string) string { return peer + "\x00" + table }
@@ -94,12 +94,13 @@ func (c *Client) deferSettledTies(peer string, tables []string, local map[string
 	return pull, settled
 }
 
-// tiesStillTracked reports whether every (row, pair) is still in the register.
-func (c *Client) tiesStillTracked(ties map[string]string) bool {
+// tiesStillTracked reports whether every row is still a tracked tie holding
+// both versions the proof saw.
+func (c *Client) tiesStillTracked(ties map[string][2]string) bool {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
-	for key, pair := range ties {
-		if t, ok := c.unresolvedTies[key]; !ok || t.pair != pair {
+	for key, v := range ties {
+		if !c.tieVersionsKnownLocked(key, v[0], v[1]) {
 			return false
 		}
 	}
@@ -165,13 +166,15 @@ func (c *Client) dropSettled(key string) {
 }
 
 // residualIsTrackedTies reports whether the local table differs from the
-// peer's rows st only by ties this node tracks, under exactly the pair of
-// versions in front of it. It returns the local digest of the state it
+// peer's rows st only by ties this node tracks, with both versions in front of
+// it already in the row's version set — whichever peer each was first seen
+// from, so an N-way contest (every node its own claim) settles against every
+// peer, not only the last one met. It returns the local digest of the state it
 // examined (computed from the same scan, the same way StateDigest does) and
 // the ties it relied on. Any doubt — a column list that differs, a row on one
-// side only, a differing row the register does not hold with this pair —
+// side only, a differing row whose versions the register has not both seen —
 // answers false, which means "keep pulling".
-func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (TableDigest, map[string]string, bool) {
+func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (TableDigest, map[string][2]string, bool) {
 	pkCols := tablePrimaryKeys[st.Name]
 	if len(pkCols) == 0 {
 		return TableDigest{}, nil, false
@@ -241,7 +244,7 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (Table
 		return TableDigest{}, nil, false
 	}
 
-	ties := make(map[string]string)
+	ties := make(map[string][2]string)
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
 	for _, row := range st.Rows {
@@ -257,11 +260,11 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (Table
 			continue
 		}
 		key := unresolvedKey(st.Name, pk)
-		pair := pairFingerprint(contentPair(local, row))
-		if t, tracked := c.unresolvedTies[key]; !tracked || t.pair != pair {
+		v := [2]string{versionFingerprint(local), versionFingerprint(row)}
+		if !c.tieVersionsKnownLocked(key, v[0], v[1]) {
 			return TableDigest{}, nil, false
 		}
-		ties[key] = pair
+		ties[key] = v
 	}
 	if len(ties) == 0 {
 		// Nothing differs row by row: whatever the digests disagree on, it is

@@ -831,7 +831,9 @@ mismatched, and the tie stays in the register, the `ha.lww.unresolved`
 condition, `lv doctor divergence` and `litevirt_lww_tie_unresolved_current`.
 What anti-entropy stops doing is re-pulling it. After a pull, the node checks
 the pulled rows against its own: when every row that still differs is a tie it
-already tracks under exactly those two versions, the table is settled against
+already tracks and both versions — its own and the peer's — are among those it
+has met for that row (a lease term contested by every node has one version per
+node, and each peer's is recognised), the table is settled against
 that peer, and scheduled passes skip it until either side's digest moves. Any
 write to the table on either side — a new row, a repair — moves a digest and the
 next pass pulls it. A table that also holds a difference the register does not

@@ -98,8 +98,66 @@ func TestResidualIsTrackedTies(t *testing.T) {
 		}
 	})
 
+	t.Run("a clear drops the version set with the register entry", func(t *testing.T) {
+		key := unresolvedKey("leader_lease_terms", pkKey([]interface{}{"dual_run_detector", int64(2)}))
+		defer func() {
+			if err := a.MergeStateBytesLWW(b.DumpStateBytes()); err != nil {
+				t.Fatal(err)
+			}
+		}()
+		a.clearUnresolved("leader_lease_terms", pkKey([]interface{}{"dual_run_detector", int64(2)}))
+		a.tieMu.Lock()
+		_, kept := a.tieVersions[key]
+		a.tieMu.Unlock()
+		if kept {
+			t.Fatal("clearUnresolved left the row's version set behind; a later tie would inherit stale versions")
+		}
+	})
+
 	// Back where it started: settled again.
 	if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); !ok {
 		t.Fatal("the subtests did not restore the settled state")
+	}
+}
+
+// An N-way contest: one row, a different version on each of three nodes. The
+// register keeps one pair per row, and after meeting c's version it names
+// (a, c) — so a proof against b that asked for THE tracked pair failed, and b's
+// table was re-pulled every pass (the lab's five-version dual_run_detector
+// term). Every version met is in the row's set, so both peers settle.
+func TestResidualIsTrackedTies_NWay(t *testing.T) {
+	ctx := context.Background()
+	const ts = "2026-01-01T00:00:00Z"
+	a, b, c := newTestDB(t), newTestDB(t), newTestDB(t)
+	putLeaseTerm(t, a, "dual_run_detector", 2, "host-a", ts, ts)
+	putLeaseTerm(t, b, "dual_run_detector", 2, "host-b", ts, ts)
+	putLeaseTerm(t, c, "dual_run_detector", 2, "host-c", ts, ts)
+	for _, peer := range []*Client{b, c} {
+		if err := a.MergeStateBytesLWW(peer.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := a.UnresolvedTieCount(); got != 1 {
+		t.Fatalf("precondition: a tracks %d ties, want the one contested row", got)
+	}
+	for name, peer := range map[string]*Client{"b": b, "c": c} {
+		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, peer)); !ok {
+			t.Errorf("against %s: a three-way tie a has met every version of was not proven settled", name)
+		}
+	}
+	// A version set outliving its register entry (clearUnresolved removes both
+	// today; this pins that the set alone never vouches) proves nothing.
+	a.tieMu.Lock()
+	a.tieVersions["orphan\x00pk"] = map[string]struct{}{"v1": {}, "v2": {}}
+	orphanKnown := a.tieVersionsKnownLocked("orphan\x00pk", "v1", "v2")
+	a.tieMu.Unlock()
+	if orphanKnown {
+		t.Error("a version set with no tracked tie behind it vouched for a difference")
+	}
+
+	// A fourth version, never merged, is still unexplained.
+	putLeaseTerm(t, b, "dual_run_detector", 2, "host-d", ts, ts)
+	if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); ok {
+		t.Error("proven settled against a version of the tied row no merge has seen")
 	}
 }

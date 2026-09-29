@@ -239,6 +239,13 @@ type Client struct {
 	// schema. It used to be passed in and dropped, which is what forced
 	// internal/grpcapi to maintain one.
 	unresolvedTies map[string]unresolvedTie
+	// tieVersions records, per tracked (table,PK), the fingerprint of EVERY
+	// version of the row seen as a party to its unresolved tie — this node's
+	// own and each peer's. unresolvedTies holds one pair per row, which for an
+	// N-way contest describes only the last peer met; anti-entropy's settled
+	// proof needs the whole set (settled_ties.go). Guarded by tieMu, cleared
+	// with the register entry. Fingerprints only: no row content is kept.
+	tieVersions map[string]map[string]struct{}
 	// acknowledgedTies records, per (table,PK), the content pair an operator has
 	// stated they have seen. A re-observation of the SAME pair is then not
 	// tracked at all.

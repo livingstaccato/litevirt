@@ -24,7 +24,9 @@ import (
 //
 // Anti-entropy stops re-pulling a table held apart only by tracked ties, with
 // the row-proofed bound: a pull is followed by a check that EVERY remaining
-// differing PK matches a pair tracked here, and the table is then skipped only
+// differing PK is tracked here with both its local and its peer version in the
+// row's version set (tieVersions — the register's single pair names only the
+// last peer met, which an N-way contest outgrows), and the table is then skipped only
 // while neither side's digest moves (settled_ties.go). Table-level suppression
 // without that proof could hide an unrelated divergent row, so there is none.
 
@@ -217,6 +219,54 @@ func immutableTieCategory(table string) string {
 // divergence is a no-op (bounded). Safe to call with c.mu held (uses its own lock).
 func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}, path resolveTiePath, category string) {
 	c.trackUnresolvedPair(table, pk, contentPair(local, incoming), path, category)
+	c.noteTieVersions(unresolvedKey(table, pk), local, incoming)
+}
+
+// versionFingerprint is one row version's digest, in the same encoding
+// contentPair uses for each side, so settled_ties.go can fingerprint a row it
+// reads and find it here. Digested for the reason pairFingerprint is.
+func versionFingerprint(row []interface{}) string {
+	return pairFingerprint("version\x00" + encodeRowCells(row))
+}
+
+// noteTieVersions adds both versions of a just-tracked tie to its row's
+// version set. The register keeps ONE pair per row, and in an N-way contest —
+// a lease term every node claimed — that pair names only the last peer met;
+// the set is what lets anti-entropy recognise every peer's version as already
+// known (settled_ties.go). Only for a row still tracked: a clear that ran
+// between trackUnresolvedPair and here wins, and the next observation starts
+// the set afresh.
+func (c *Client) noteTieVersions(key string, local, incoming []interface{}) {
+	vl, vi := versionFingerprint(local), versionFingerprint(incoming)
+	c.tieMu.Lock()
+	defer c.tieMu.Unlock()
+	if _, tracked := c.unresolvedTies[key]; !tracked {
+		return
+	}
+	if c.tieVersions == nil {
+		c.tieVersions = make(map[string]map[string]struct{})
+	}
+	set := c.tieVersions[key]
+	if set == nil {
+		set = make(map[string]struct{}, 2)
+		c.tieVersions[key] = set
+	}
+	set[vl], set[vi] = struct{}{}, struct{}{}
+}
+
+// tieVersionsKnownLocked reports whether (table,PK) is a tracked tie whose
+// version set holds every one of versions. Caller holds tieMu.
+func (c *Client) tieVersionsKnownLocked(key string, versions ...string) bool {
+	if _, tracked := c.unresolvedTies[key]; !tracked {
+		return false
+	}
+	set := c.tieVersions[key]
+	for _, v := range versions {
+		if _, ok := set[v]; !ok {
+			return false
+		}
+	}
+	return len(versions) > 0
 }
 
 // trackUnresolvedPair is trackUnresolved with a precomputed content-pair fingerprint, so a caller
@@ -357,6 +407,7 @@ func (c *Client) clearUnresolved(table, pk string) {
 	c.tieMu.Lock()
 	if _, ok := c.unresolvedTies[unresolvedKey(table, pk)]; ok {
 		delete(c.unresolvedTies, unresolvedKey(table, pk))
+		delete(c.tieVersions, unresolvedKey(table, pk))
 		c.unresolvedLen.Store(int64(len(c.unresolvedTies)))
 		// Export under the lock (see trackUnresolved) so the gauge can't regress.
 		c.observeUnresolvedTieCurrent(c.liveTieCountLocked())

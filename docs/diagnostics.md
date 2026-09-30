@@ -1350,11 +1350,48 @@ never one guessed from a name:
 - a domain whose metadata holds the owner-epoch element
   (`https://litevirt.dev/xmlns/owner-epoch/1`; check with
   `virsh metadata <vm> https://litevirt.dev/xmlns/owner-epoch/1`)
+- a domain whose metadata holds the managed stamp
+  (`https://litevirt.dev/xmlns/managed/1`; check with
+  `virsh metadata <vm> https://litevirt.dev/xmlns/managed/1`)
 - a container with an owner-epoch marker at `<data_dir>/containers/<name>/owner_epoch`
+- a container with the managed stamp at `<lxcpath>/<name>/litevirt-managed`
+  (`/var/lib/lxc/<name>/litevirt-managed` by default)
 
-A domain or container you created by hand carries neither, so it is never
-reported, even when it reuses the name of a deleted VM. So is a litevirt VM
-from before owner-epoch markers existed, or one whose marker is unreadable.
+The evidence's `recognised_by` says which (`owner_epoch` or `managed_stamp`).
+
+**The managed stamp** is written by litevirt itself. On every reconcile pass
+(every container sweep, for containers) each host stamps every runtime it
+holds that has a **live row naming that host**, and nothing else. The stamp
+says only "litevirt manages this". It carries no ownership generation and
+gates nothing. It covers the runtimes the owner-epoch markers miss:
+
+- VMs created before owner-epoch markers existed
+- VMs whose row is still at the pre-epoch generation 0, because
+  `enforcement.owner_epoch` is off (the default)
+- shut-off VMs
+- containers (the owner-epoch marker is written only on relocation)
+
+A live row naming the host is the proof. It is what litevirt already manages
+the runtime by. The stamp then outlives the row, and that is when this report
+needs it. Stamping waits for a caught-up replica, as the report does. Both
+stamps are part of the runtime and go when it goes: undefining a domain drops
+its metadata, and `lxc-destroy` removes the container directory.
+
+Nothing older litevirt wrote proves more than this. The domain XML generator
+never emitted metadata, a title or a description. A name, or a disk path under
+`<data_dir>/disks/`, is a string anyone can reuse.
+
+A domain or container you created by hand is never stamped, because it never
+had a live row on that host. So it is never reported, even when it reuses a
+deleted VM's name and litevirt's disk paths. What stays unrecognised:
+
+- a litevirt runtime whose row was already gone before this release first ran
+  on its host
+- a runtime whose stamp is unreadable
+- a runtime on a container backend without stamp support
+
+A copy of a litevirt domain's XML (`virsh dumpxml` then `virsh define` under
+another name) carries its stamps with it. It is reported like the original.
 
 | Raised when | Clears when |
 |---|---|
@@ -1389,7 +1426,9 @@ on a stale decision.
 1. Run `lv health` and read the evidence. `row_host` and `row_owner_epoch` say
    which host and generation the deleted record last named. A `row_owner_epoch`
    below `marker_epoch` means the delete was decided against an older copy of
-   the workload, not the one still running.
+   the workload, not the one still running. A runtime recognised by the managed
+   stamp has no marker epoch (`marker_epoch` is 0), so there is no generation
+   to compare. Judge it by `row_host` and `row_deleted_at`.
 2. Decide whether the workload is still wanted. If its deletion was intended
    (`lv compose down`, `lv rm`, `lv ct rm`), reap it. If the record was lost
    by accident, keep the runtime and copy its disks out before you do anything
@@ -1399,8 +1438,9 @@ on a stale decision.
 3. VM: `virsh destroy <vm>`, then `virsh undefine --nvram <vm>`. Undefine
    leaves the disks in place; delete the files `domblklist` listed once you are
    sure.
-   Container: `lxc-stop -n <name>`, then `lxc-destroy -n <name>`, then remove
-   `<data_dir>/containers/<name>/owner_epoch`.
+   Container: `lxc-stop -n <name>`, then `lxc-destroy -n <name>` (which takes
+   the managed stamp with the container directory), then remove
+   `<data_dir>/containers/<name>/owner_epoch` if it exists.
 4. The next reconcile pass resolves the condition.
 
 ## NetBox IPAM: metrics and health findings

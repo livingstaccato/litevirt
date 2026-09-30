@@ -381,8 +381,10 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 
 	r.selfFence(ctx)
 	r.assertRuntimeOwnership(ctx)
-	// Both sweeps above skip a domain with no live row. This reports the ones
-	// litevirt created, and touches nothing.
+	// Both sweeps above skip a domain with no live row. Stamp every domain that
+	// has one here, so it stays recognisable once its row is gone; then report
+	// the ones litevirt created that have none. Neither touches the runtime.
+	r.adoptManagedDomains(ctx)
 	r.reportOrphanRuntimes(ctx)
 }
 

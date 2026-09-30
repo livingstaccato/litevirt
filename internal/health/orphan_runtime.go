@@ -27,14 +27,34 @@ import (
 // guessed from a name:
 //   - a domain whose <metadata> holds litevirt's owner-epoch element
 //     (https://litevirt.dev/xmlns/owner-epoch/1). The executor writes it when a
-//     VM is published running, and it lives and dies with the domain. A domain
-//     whose metadata is corrupt, or that predates the marker, is not
-//     recognised, so a hand-made domain can never be reported — even one that
-//     reuses a deleted VM's name;
+//     VM is published running, and it lives and dies with the domain;
+//   - a domain whose <metadata> holds litevirt's managed stamp
+//     (https://litevirt.dev/xmlns/managed/1, internal/libvirt/managed_stamp.go);
 //   - a container with an owner-epoch marker under the daemon's containers
-//     root (<data_dir>/containers/<name>/owner_epoch). LXC's own store keeps
-//     no litevirt stamp, and that marker is the one litevirt writes for every
-//     container it owns.
+//     root (<data_dir>/containers/<name>/owner_epoch);
+//   - a container carrying the managed stamp inside its own LXC directory
+//     (<lxcpath>/<name>/litevirt-managed, internal/lxc/managed_stamp.go).
+//
+// A domain whose metadata is corrupt, or that carries none of these, is not
+// recognised, so a hand-made domain can never be reported — even one that
+// reuses a deleted VM's name and litevirt's disk paths.
+//
+// WHY A SECOND STAMP. The owner-epoch markers cover too little on their own.
+// The domain element is written only for a running VM whose row holds a real
+// generation, so a VM created before stamping whose row is still at the
+// pre-epoch 0 (enforcement.owner_epoch off, the default), and every shut-off
+// VM, carries none; the container marker is written only on a relocation.
+// Nothing older litevirt wrote into a domain proves more: the generator never
+// emitted metadata, a title or a description, and a name or a disk path under
+// <data_dir>/disks is a string anyone can reuse. So the reconciler and the
+// container sweep ADOPT every runtime this host has a live row for into the
+// managed stamp (adoptManagedDomains, adoptManagedContainers). A live row
+// naming this host is the proof: it is what litevirt already manages the
+// runtime by. The stamp then outlives the row, which is when the report needs
+// it. It carries no generation and gates nothing, so writing it cannot bend
+// any owner-epoch rule. A runtime that never had a live row here is never
+// stamped, and one whose row was already gone before this release ran on the
+// host stays unrecognised: the price of never guessing.
 //
 // WHEN. A recognised runtime whose name has no live row anywhere — missing
 // entirely, or tombstoned — seen on two consecutive passes. A single sighting
@@ -70,6 +90,12 @@ const (
 	CondCTOrphanRuntime = "ct_orphan_runtime"
 )
 
+// How an orphan was recognised as litevirt's (evidence recognised_by).
+const (
+	OrphanRecognisedByOwnerEpoch   = "owner_epoch"
+	OrphanRecognisedByManagedStamp = "managed_stamp"
+)
+
 // Orphan row classification.
 const (
 	OrphanRowMissing    = "missing"
@@ -87,7 +113,8 @@ type OrphanRuntime struct {
 	Host         string // the host running it: always the reporter
 	Row          string // OrphanRowMissing | OrphanRowTombstoned
 	RuntimeState string
-	MarkerEpoch  int64
+	MarkerEpoch  int64  // 0 when recognised by the managed stamp alone
+	RecognisedBy string // OrphanRecognisedByOwnerEpoch | OrphanRecognisedByManagedStamp
 	// The row it last had, when Row is OrphanRowTombstoned.
 	RowHost       string
 	RowOwnerEpoch int64
@@ -100,6 +127,7 @@ type orphanEvidence struct {
 	Host          string `json:"host"`
 	RuntimeState  string `json:"runtime_state"`
 	MarkerEpoch   int64  `json:"marker_epoch"`
+	RecognisedBy  string `json:"recognised_by"`
 	Row           string `json:"row"`
 	RowHost       string `json:"row_host,omitempty"`
 	RowOwnerEpoch int64  `json:"row_owner_epoch,omitempty"`
@@ -181,7 +209,7 @@ func (o *orphanReporter) pass(ctx context.Context, db *corrosion.Client, host, k
 		ev := orphanEvidence{
 			Detail: "a runtime litevirt created is present on this host with no live record; " +
 				"nothing reaps it automatically — see docs/diagnostics.md, orphaned runtimes",
-			Name: f.Name, Host: host, RuntimeState: f.RuntimeState, MarkerEpoch: f.MarkerEpoch,
+			Name: f.Name, Host: host, RuntimeState: f.RuntimeState, MarkerEpoch: f.MarkerEpoch, RecognisedBy: f.RecognisedBy,
 			Row: f.Row, RowHost: f.RowHost, RowOwnerEpoch: f.RowOwnerEpoch, RowDeletedAt: f.RowDeletedAt,
 		}
 		b, err := json.Marshal(ev)
@@ -272,8 +300,8 @@ func (r *Reconciler) reportOrphanRuntimes(ctx context.Context) {
 		if vm != nil {
 			continue
 		}
-		epoch, marked, merr := r.virt.GetDomainOwnerEpoch(name)
-		if merr != nil || !marked {
+		epoch, by := r.recogniseDomain(name)
+		if by == "" {
 			continue // not stamped by litevirt: an operator's domain, never reported
 		}
 		trace, err := corrosion.LookupVMRowAnyState(ctx, r.db, name)
@@ -283,7 +311,7 @@ func (r *Reconciler) reportOrphanRuntimes(ctx context.Context) {
 		state, _ := r.virt.DomainState(name)
 		row, rowHost, rowEpoch, deletedAt := orphanRowOf(trace)
 		found = append(found, OrphanRuntime{
-			Kind: "vm", Name: name, Host: r.hostName, Row: row, RuntimeState: state, MarkerEpoch: epoch,
+			Kind: "vm", Name: name, Host: r.hostName, Row: row, RuntimeState: state, MarkerEpoch: epoch, RecognisedBy: by,
 			RowHost: rowHost, RowOwnerEpoch: rowEpoch, RowDeletedAt: deletedAt,
 		})
 	}
@@ -332,8 +360,8 @@ func (c *ContainerChecker) reportOrphanContainers(ctx context.Context) {
 		if live {
 			continue // a live row anywhere: the sweep or the re-key owns it
 		}
-		epoch, marked, merr := ReadContainerOwnerEpochMarker(c.containersRoot, name)
-		if merr != nil || !marked {
+		epoch, by := c.recogniseContainer(name)
+		if by == "" {
 			continue // not litevirt's container: never reported
 		}
 		var trace *corrosion.WorkloadRowTrace
@@ -347,7 +375,7 @@ func (c *ContainerChecker) reportOrphanContainers(ctx context.Context) {
 		}
 		row, rowHost, rowEpoch, deletedAt := orphanRowOf(trace)
 		found = append(found, OrphanRuntime{
-			Kind: "ct", Name: name, Host: c.hostName, Row: row, RuntimeState: state, MarkerEpoch: epoch,
+			Kind: "ct", Name: name, Host: c.hostName, Row: row, RuntimeState: state, MarkerEpoch: epoch, RecognisedBy: by,
 			RowHost: rowHost, RowOwnerEpoch: rowEpoch, RowDeletedAt: deletedAt,
 		})
 	}
@@ -358,5 +386,113 @@ func (c *ContainerChecker) reportOrphanContainers(ctx context.Context) {
 	reported := c.orphans.pass(ctx, c.db, c.hostName, "ct", found, now)
 	if c.onOrphans != nil {
 		c.onOrphans("ct", reported)
+	}
+}
+
+// recogniseDomain says how a domain is known to be litevirt's: by its
+// owner-epoch element (with that epoch), by the managed stamp, or not at all
+// (""). A metadata read that errors proves nothing and recognises nothing.
+func (r *Reconciler) recogniseDomain(name string) (int64, string) {
+	if epoch, marked, err := r.virt.GetDomainOwnerEpoch(name); err == nil && marked {
+		return epoch, OrphanRecognisedByOwnerEpoch
+	}
+	if stamped, err := r.virt.GetDomainManaged(name); err == nil && stamped {
+		return 0, OrphanRecognisedByManagedStamp
+	}
+	return 0, ""
+}
+
+// recogniseContainer is recogniseDomain for containers. The managed stamp is
+// read only from a runtime that implements lxc.ManagedStamper.
+func (c *ContainerChecker) recogniseContainer(name string) (int64, string) {
+	if epoch, marked, err := ReadContainerOwnerEpochMarker(c.containersRoot, name); err == nil && marked {
+		return epoch, OrphanRecognisedByOwnerEpoch
+	}
+	if st, ok := c.runtime.(lxc.ManagedStamper); ok {
+		if stamped, err := st.IsManaged(name); err == nil && stamped {
+			return 0, OrphanRecognisedByManagedStamp
+		}
+	}
+	return 0, ""
+}
+
+// adoptManagedDomains writes the managed stamp on every local domain whose
+// live row names this host and that does not carry it yet. See the file
+// comment, WHY A SECOND STAMP. It touches nothing else, and a domain with no
+// live row here (a hand-made one, or one whose row names another host) is
+// never stamped.
+//
+// It waits for a trusted replica, like the report: a replica that has not
+// caught up can still hold a live row for a VM deleted while this node was
+// away, and a same-named domain made by hand since must not be adopted on its
+// strength.
+func (r *Reconciler) adoptManagedDomains(ctx context.Context) {
+	if r.virt == nil {
+		return
+	}
+	if ok, why := r.replicaTrusted(ctx); !ok {
+		slog.Debug("orphan-runtime: replica not caught up; not adopting domains", "cause", why)
+		return
+	}
+	domains, err := r.virt.ListDomains()
+	if err != nil {
+		return
+	}
+	for _, name := range domains {
+		if stamped, err := r.virt.GetDomainManaged(name); err == nil && stamped {
+			continue
+		}
+		vm, err := corrosion.GetVM(ctx, r.db, name)
+		if err != nil {
+			return
+		}
+		if vm == nil || vm.HostName != r.hostName {
+			continue // no live row here: not proof that litevirt made it
+		}
+		state, _ := r.virt.DomainState(name)
+		active := state == RuntimeRunning || state == "paused"
+		if err := r.virt.SetDomainManaged(name, active); err != nil {
+			slog.Warn("orphan-runtime: could not write the managed stamp (retried next pass)",
+				"vm", name, "error", err)
+			continue
+		}
+		slog.Info("orphan-runtime: adopted a litevirt domain into the managed stamp", "vm", name)
+	}
+}
+
+// adoptManagedContainers is adoptManagedDomains for containers: every local
+// container with a live row in rows, which the sweep reads for this host only
+// (container rows are keyed by host and name, so another host's same-named row
+// is never among them). A runtime without lxc.ManagedStamper adopts nothing.
+func (c *ContainerChecker) adoptManagedContainers(ctx context.Context, rows []corrosion.ContainerRecord) {
+	st, ok := c.runtime.(lxc.ManagedStamper)
+	if !ok {
+		return
+	}
+	if ok, why := corrosion.ReplicaTrusted(ctx, c.db, c.hostName, c.replicaCaughtUp); !ok {
+		slog.Debug("orphan-runtime: replica not caught up; not adopting containers", "cause", why)
+		return
+	}
+	names, err := c.runtime.List(ctx)
+	if err != nil {
+		return
+	}
+	local := make(map[string]bool, len(names))
+	for _, n := range names {
+		local[n] = true
+	}
+	for _, ct := range rows {
+		if !local[ct.Name] {
+			continue
+		}
+		if stamped, err := st.IsManaged(ct.Name); err == nil && stamped {
+			continue
+		}
+		if err := st.StampManaged(ct.Name); err != nil {
+			slog.Warn("orphan-runtime: could not write the container managed stamp (retried next sweep)",
+				"container", ct.Name, "error", err)
+			continue
+		}
+		slog.Info("orphan-runtime: adopted a litevirt container into the managed stamp", "container", ct.Name)
 	}
 }

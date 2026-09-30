@@ -218,7 +218,9 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 	// a re-key (which transfers the container's leases to us) isn't racing a GC of
 	// those same leases.
 	c.assertContainerOwnership(ctx)
-	// Report litevirt containers with no live row anywhere; touches nothing.
+	// Stamp every local container with a live row here, then report litevirt
+	// containers with no live row anywhere. Neither touches the runtime.
+	c.adoptManagedContainers(ctx, cts)
 	c.reportOrphanContainers(ctx)
 
 	// GC IPAM leases stranded by a crash between allocating a lease and persisting

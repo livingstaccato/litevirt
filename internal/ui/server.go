@@ -21,6 +21,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 //go:embed templates/*
@@ -107,13 +108,13 @@ type Authorizer interface {
 }
 
 // SetAuthorizer wires the daemon's authorizer for the in-process write paths
-// that have no gRPC twin.
+// that do not go through gRPC.
 func (s *Server) SetAuthorizer(a Authorizer) { s.authz = a }
 
 // auditUIWrite records an in-process UI mutation in the audit chain.
 //
-// Security groups have no gRPC twin, so these writes never passed through a
-// handler that audits. The consequence is worse than a missing log: `lv audit
+// The UI's security-group writes run in-process, not through their gRPC twins,
+// so these writes never passed through a handler that audits. The consequence is worse than a missing log: `lv audit
 // verify` reports a clean, unbroken, SIGNED chain in which nobody changed the
 // security groups, so post-incident the log reads as proof that the isolation
 // rules were never touched.
@@ -134,7 +135,7 @@ func (s *Server) auditUIWrite(r *http.Request, action, target, detail string) {
 		return
 	}
 	if err := corrosion.InsertAuditLog(context.WithoutCancel(ctx), s.db, corrosion.AuditRecord{
-		Username: user, HostName: s.cluster, Action: action, Target: target,
+		ID: randid.New(), Username: user, HostName: s.cluster, Action: action, Target: target,
 		Detail: detail, Result: "ok",
 	}); err != nil {
 		slog.Error("ui: could not write the audit row for a mutation that already landed",

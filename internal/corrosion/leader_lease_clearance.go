@@ -34,14 +34,48 @@ import (
 // reaches the mint either (see AcquireLeaseWithTerm). Mints are rare — one per
 // change of tenure — so the read costs one RPC per healthy peer per takeover.
 //
+// A TAKEOVER needs a second answer from the same read. The term ledger can be
+// current while leader_election is not: a renewal writes only leader_election,
+// and leader_election is anti-entropy excluded (merging it would corrupt), so
+// a replica that has every term row — by anti-entropy, a reseed, or a WAL
+// stream that delivered the mint but not the renewals after it — can still
+// carry the holder's expiry from several renewals ago, or no row at all. It
+// then reads a live lease as lapsed, and the term check passes, because nobody
+// has minted the term it is about to claim. Minting it deposes the live holder:
+// the holder receives the higher term, fails closed on its next renewal, and
+// until then both nodes act as leader. ReplicaCaughtUp cannot close this — it
+// is marked by an anti-entropy exchange, which never carries leader_election.
+// So each peer's answer also carries its own leader_election row, and a
+// takeover is withheld while any answering peer shows the lease live for
+// another holder at the caller's instant. The holder itself, when reachable,
+// is one of those peers. A mint over this node's OWN live lease (retiring a
+// contested term, or a termless tenure taking its term) is not a takeover and
+// is not held to this: a contest loser's row names the loser live on its own
+// replica, and waiting it out would stall the convergence the retirement is.
+//
 // A withheld mint is reported as "not held", the same shape as losing the
 // race: the caller retries on its next poll, by which time replication has
 // usually delivered the row the node was missing, and it then classifies from
 // the real ledger.
 
-// LeaseMintClearanceFunc reports whether this node may record term `next` for
-// key now. ok=false withholds the mint; reason says why, for the log.
-type LeaseMintClearanceFunc func(ctx context.Context, key string, next int64) (ok bool, reason string)
+// LeaseMintRequest is what a mint clearance is asked about.
+type LeaseMintRequest struct {
+	Key    string
+	Term   int64  // the term this node would record
+	Holder string // this node
+	// Takeover is true when this node's own replica shows no live tenure of
+	// its own: it is taking the lease from a holder whose lease it reads as
+	// lapsed, or from nobody.
+	Takeover bool
+	// Now is the instant the caller classified the lease at, RFC3339 UTC —
+	// the clock its own expiry comparison used, so a peer's expiry is judged
+	// against the same instant.
+	Now string
+}
+
+// LeaseMintClearanceFunc reports whether this node may record req.Term for
+// req.Key now. ok=false withholds the mint; reason says why, for the log.
+type LeaseMintClearanceFunc func(ctx context.Context, req LeaseMintRequest) (ok bool, reason string)
 
 // SetLeaseMintClearance injects the check run before every new lease term is
 // recorded. Wired at daemon start to the gRPC server's quorum high-water read
@@ -51,13 +85,14 @@ type LeaseMintClearanceFunc func(ctx context.Context, key string, next int64) (o
 // no peers to ask. The daemon always wires it.
 func (c *Client) SetLeaseMintClearance(fn LeaseMintClearanceFunc) { c.leaseMintClearance = fn }
 
-// clearLeaseMint runs the clearance for (key, next) and logs a withholding
-// once per key per reason.
-func (c *Client) clearLeaseMint(ctx context.Context, key string, next int64) bool {
+// clearLeaseMint runs the clearance for req and logs a withholding once per
+// key per reason.
+func (c *Client) clearLeaseMint(ctx context.Context, req LeaseMintRequest) bool {
 	if c.leaseMintClearance == nil {
 		return true
 	}
-	ok, reason := c.leaseMintClearance(ctx, key, next)
+	key := req.Key
+	ok, reason := c.leaseMintClearance(ctx, req)
 	c.mintWithheldMu.Lock()
 	prev := c.mintWithheld[key]
 	if ok {
@@ -71,12 +106,12 @@ func (c *Client) clearLeaseMint(ctx context.Context, key string, next int64) boo
 	c.mintWithheldMu.Unlock()
 	switch {
 	case !ok && prev != reason:
-		slog.Warn("leader lease: not claiming a new term yet — this node cannot confirm its ledger "+
-			"is current for the key, and a term minted from a stale ledger is a permanent "+
-			"immutable-ledger conflict (retries each poll)",
-			"key", key, "term", next, "reason", reason)
+		slog.Warn("leader lease: not claiming a new term yet — this node cannot confirm its view "+
+			"of the key is current, and a term claimed from a stale view is either a permanent "+
+			"immutable-ledger conflict or a live holder deposed (retries each poll)",
+			"key", key, "term", req.Term, "takeover", req.Takeover, "reason", reason)
 	case ok && prev != "":
-		slog.Info("leader lease: new-term claim cleared", "key", key, "term", next)
+		slog.Info("leader lease: new-term claim cleared", "key", key, "term", req.Term)
 	}
 	return ok
 }

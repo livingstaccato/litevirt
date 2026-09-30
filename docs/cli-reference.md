@@ -806,6 +806,8 @@ lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
   # --network matches the compose network name on the NIC; --sg is repeatable
   # (an empty --sg list clears the bindings).
+  # create/rm/rule-add/rule-rm go through the daemon: they need sg.write and
+  # each leaves an sg.* audit row (see docs/firewall.md#audit-trail).
 
 lv firewall show              # Render the live nft ruleset for this host
 lv firewall reload            # Force the reconciler to re-read state and apply now

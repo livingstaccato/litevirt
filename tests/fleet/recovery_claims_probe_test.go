@@ -247,8 +247,9 @@ func TestFleet_RecoveryClaim_ProofGradeFenceClearsTheProbe(t *testing.T) {
 }
 
 // TestFleet_RecoveryClaim_ProbeBudget: twenty workloads on one slow owner cost
-// each voter ONE probe, not twenty — every Accept naming the same source
-// within claimProbeMaxAge reuses the result — and every claim completes.
+// each voter one probe per claimProbeRefreshAge, not twenty — every Accept
+// naming the same source within claimProbeMaxAge reuses the result — and
+// every claim completes.
 //
 // Mutation: drop the per-source result reuse in probeOwner — each voter
 // probes d once per claim.
@@ -278,9 +279,15 @@ func TestFleet_RecoveryClaim_ProbeBudget(t *testing.T) {
 	if moved != len(vms) {
 		t.Fatalf("%d of %d claims completed in one tick (took %s)", moved, len(vms), took)
 	}
+	// A Prepare refreshes a result once it is claimProbeRefreshAge (2 s) old
+	// (§10 item 36), so a tick slower than that — under -race — may probe
+	// once more per 2 s. Never once per workload: a fixed bound, not one
+	// scaled by how long the tick took, since without reuse every claim waits
+	// out its own probe and the tick grows with the count.
+	const maxPings = 5
 	for _, n := range []*Node{a, b, cc} {
-		if got := c.LinkStats(n, d).Pings; got != 1 {
-			t.Errorf("%s probed %s %d times for %d workloads, want once", n.Name, d.Name, got, len(vms))
+		if got := c.LinkStats(n, d).Pings; got < 1 || got > maxPings {
+			t.Errorf("%s probed %s %d times for %d workloads in %s, want 1..%d", n.Name, d.Name, got, len(vms), took, maxPings)
 		}
 	}
 }
@@ -419,4 +426,68 @@ func TestFleet_RecoveryClaim_OwnerReturnsAfterAValueWasChosen(t *testing.T) {
 	if err != nil || pr.ClaimCertificate == "" {
 		t.Fatalf("the completed proof carries no certificate: %v", err)
 	}
+}
+
+// TestFleet_RecoveryClaim_SlowDeadOwnerDecidesInBoundedRounds is the kvm003
+// run (§10 item 36). The dead owner d is a voter, and nothing about it fails
+// fast: its claim RPCs and its Ping each hang until the caller gives up, as a
+// dial does while ARP times out. So phase 1 waits out d's Prepare — the
+// proposer's whole call timeout — and the Accept arrives with less time left
+// than a probe of d takes. Before the fix every voter's probe ran under that
+// Accept and was cancelled with it, nothing ever learned "not reached", and
+// the claim refused round after round. Now the probe a Prepare starts runs
+// on its own and has finished by the Accept, so the claim decides in its
+// first round.
+//
+// Mutations: run the probe under the Accept's context and drop the
+// Prepare-time start (the pre-fix probeOwner) — no round decides; drop only
+// the Prepare-time start — the detached probe the first Accept started makes
+// the second round decide, one round too many.
+func TestFleet_RecoveryClaim_SlowDeadOwnerDecidesInBoundedRounds(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 2509})
+	a, b, cc, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	insertVM(t, a, "vm-slow", d.Name)
+	c.WaitConverged(t, convergeTimeout)
+	genesisByTick(t, c, a) // generation 1 = {a, b, c, d}: d is a voter
+	enableRecoveryClaims(t, c, a, b, cc)
+	for _, n := range []*Node{a, b, cc} {
+		c.SetLinkFault(n, d, LinkFault{Block: true, ClaimDelay: time.Minute, ProbeDelay: time.Minute})
+	}
+	now := time.Now().UTC()
+	for _, n := range []*Node{a, b, cc} {
+		PublishHealth(t, n, d.Name, 5, now)
+	}
+	c.WaitConverged(t, convergeTimeout, a, b, cc)
+
+	clock := NewVirtualClock(time.Now().UTC())
+	cs := probeCoordinator(c, clock, a)
+	var refused []string
+	cs.ByNode[a.Name].SetGateRefusedObserver(func(_, r string) { refused = append(refused, r) })
+
+	const maxRounds = 1
+	decided := func() bool {
+		vm := vmOn(t, a, "vm-slow")
+		return vm.PendingActionID != "" && vm.HostName != d.Name
+	}
+	rounds := 0
+	for rounds < 4 && !decided() {
+		if rounds > 0 {
+			clock.Advance(contentionPoll)
+		}
+		cs.Tick(ctx, a)
+		rounds++
+	}
+	vm := vmOn(t, a, "vm-slow")
+	if !decided() {
+		t.Fatalf("a dead owner whose dial is slow did not decide in %d rounds (refusals %v): %+v", rounds, refused, vm)
+	}
+	if rounds > maxRounds {
+		t.Fatalf("the claim took %d rounds, want at most %d (refusals %v)", rounds, maxRounds, refused)
+	}
+	pr, ok, err := corrosion.GetActionProof(ctx, a.DB, vm.PendingActionID)
+	if err != nil || !ok || pr.ClaimCertificate == "" {
+		t.Fatalf("the reschedule proof carries no certificate: ok=%v err=%v", ok, err)
+	}
+	t.Logf("decided in %d round(s); refusals before it: %v", rounds, refused)
 }

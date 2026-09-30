@@ -42,6 +42,51 @@ func (s *Server) reconcileLocal(ctx context.Context) {
 	}
 }
 
+// ── Audit states (colonelpanik/litevirt#182) ──
+//
+// Each mutation below records who made it (s.audit takes the caller from ctx),
+// what it touched (the target), and the policy before and after it. The
+// "before" is read ahead of the write, because a delete tombstones the row and
+// the audit log is then the only place left that can say what it was. A read
+// that fails is recorded as unknown, never as none.
+
+func ruleState(r *corrosion.FirewallRule, err error) string {
+	switch {
+	case err != nil:
+		return corrosion.AuditUnknown(err)
+	case r == nil:
+		return corrosion.AuditStateNone
+	}
+	return r.AuditText()
+}
+
+func ipSetState(set *corrosion.IPSet, err error) string {
+	switch {
+	case err != nil:
+		return corrosion.AuditUnknown(err)
+	case set == nil:
+		return corrosion.AuditStateNone
+	}
+	return set.AuditText()
+}
+
+func defaultState(d *corrosion.FirewallDefault, err error) string {
+	switch {
+	case err != nil:
+		return corrosion.AuditUnknown(err)
+	case d == nil:
+		return corrosion.AuditStateUnset
+	}
+	return verdictOf(d.DefaultDeny)
+}
+
+func verdictOf(deny bool) string {
+	if deny {
+		return "deny"
+	}
+	return "accept"
+}
+
 // ── Cluster-tier rules ──
 
 func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateClusterFirewallRuleRequest) (*pb.FirewallRule, error) {
@@ -59,7 +104,10 @@ func (s *Server) CreateClusterFirewallRule(ctx context.Context, req *pb.CreateCl
 	if err := corrosion.InsertClusterFirewallRule(ctx, s.db, row); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "create cluster rule: %v", err)
 	}
-	s.audit(ctx, "firewall.cluster-rule.add", row.ID, r.Direction+" "+r.Action, "ok")
+	// The "after" is read back so it is the rule as stored and enforced — the
+	// insert fills in defaults for an empty proto, action and priority.
+	s.audit(ctx, "firewall.cluster-rule.add", row.ID,
+		corrosion.AuditChange(corrosion.AuditStateNone, ruleState(corrosion.GetClusterFirewallRule(ctx, s.db, row.ID))), "ok")
 	s.reconcileLocal(ctx)
 	return toPbFirewallRule(row), nil
 }
@@ -83,10 +131,11 @@ func (s *Server) DeleteClusterFirewallRule(ctx context.Context, req *pb.DeleteCl
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	before := ruleState(corrosion.GetClusterFirewallRule(ctx, s.db, req.Id))
 	if err := corrosion.DeleteClusterFirewallRule(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete cluster rule: %v", err)
 	}
-	s.audit(ctx, "firewall.cluster-rule.rm", req.Id, "", "ok")
+	s.audit(ctx, "firewall.cluster-rule.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditStateNone), "ok")
 	s.reconcileLocal(ctx)
 	return &emptypb.Empty{}, nil
 }
@@ -108,7 +157,8 @@ func (s *Server) CreateHostFirewallRule(ctx context.Context, req *pb.CreateHostF
 	if err := corrosion.InsertHostFirewallRule(ctx, s.db, row); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "create host rule: %v", err)
 	}
-	s.audit(ctx, "firewall.host-rule.add", row.ID, r.HostName, "ok")
+	s.audit(ctx, "firewall.host-rule.add", row.ID,
+		corrosion.AuditChange(corrosion.AuditStateNone, ruleState(corrosion.GetHostFirewallRule(ctx, s.db, row.ID))), "ok")
 	s.reconcileLocal(ctx)
 	return toPbFirewallRule(row), nil
 }
@@ -132,10 +182,11 @@ func (s *Server) DeleteHostFirewallRule(ctx context.Context, req *pb.DeleteHostF
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	before := ruleState(corrosion.GetHostFirewallRule(ctx, s.db, req.Id))
 	if err := corrosion.DeleteHostFirewallRule(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete host rule: %v", err)
 	}
-	s.audit(ctx, "firewall.host-rule.rm", req.Id, "", "ok")
+	s.audit(ctx, "firewall.host-rule.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditStateNone), "ok")
 	s.reconcileLocal(ctx)
 	return &emptypb.Empty{}, nil
 }
@@ -153,7 +204,8 @@ func (s *Server) CreateIpSet(ctx context.Context, req *pb.CreateIpSetRequest) (*
 	if err := corrosion.InsertIPSet(ctx, s.db, row); err != nil {
 		return nil, status.Errorf(codes.Internal, "create ipset: %v", err)
 	}
-	s.audit(ctx, "firewall.ipset.add", row.Name, "", "ok")
+	s.audit(ctx, "firewall.ipset.add", row.Name,
+		corrosion.AuditChange(corrosion.AuditStateNone, ipSetState(corrosion.GetIPSet(ctx, s.db, row.ID))), "ok")
 	s.reconcileLocal(ctx)
 	return toPbIpSet(row), nil
 }
@@ -177,10 +229,11 @@ func (s *Server) DeleteIpSet(ctx context.Context, req *pb.DeleteIpSetRequest) (*
 	if err := RequireRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	before := ipSetState(corrosion.GetIPSet(ctx, s.db, req.Id))
 	if err := corrosion.DeleteIPSet(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete ipset: %v", err)
 	}
-	s.audit(ctx, "firewall.ipset.rm", req.Id, "", "ok")
+	s.audit(ctx, "firewall.ipset.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditStateNone), "ok")
 	s.reconcileLocal(ctx)
 	return &emptypb.Empty{}, nil
 }
@@ -195,14 +248,11 @@ func (s *Server) SetFirewallDefault(ctx context.Context, req *pb.SetFirewallDefa
 	if scope == "" {
 		scope = "cluster"
 	}
+	before := defaultState(corrosion.GetFirewallDefault(ctx, s.db, scope))
 	if err := corrosion.SetFirewallDefault(ctx, s.db, scope, req.DefaultDeny, ""); err != nil {
 		return nil, status.Errorf(codes.Internal, "set default policy: %v", err)
 	}
-	verdict := "accept"
-	if req.DefaultDeny {
-		verdict = "deny"
-	}
-	s.audit(ctx, "firewall.default-deny", scope, verdict, "ok")
+	s.audit(ctx, "firewall.default-deny", scope, corrosion.AuditChange(before, verdictOf(req.DefaultDeny)), "ok")
 	s.reconcileLocal(ctx)
 	return &emptypb.Empty{}, nil
 }

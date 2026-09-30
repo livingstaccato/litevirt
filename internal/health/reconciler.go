@@ -183,6 +183,11 @@ type Reconciler struct {
 	// exactly as before. nil in tests / when unwired → treated as a no-op. The returned
 	// release func is invoked ONLY if the subsequent StartDomain fails.
 	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
+
+	// orphans / onOrphans: the orphan-runtime report (orphan_runtime.go) — the
+	// sighting counts between passes, and the metric observer (nil-safe).
+	orphans   orphanReporter
+	onOrphans func(kind string, orphans []OrphanRuntime)
 }
 
 // SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
@@ -376,6 +381,11 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 
 	r.selfFence(ctx)
 	r.assertRuntimeOwnership(ctx)
+	// Both sweeps above skip a domain with no live row. Stamp every domain that
+	// has one here, so it stays recognisable once its row is gone; then report
+	// the ones litevirt created that have none. Neither touches the runtime.
+	r.adoptManagedDomains(ctx)
+	r.reportOrphanRuntimes(ctx)
 }
 
 // Start begins the reconcile loop. Blocks until ctx is cancelled.
@@ -927,6 +937,7 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
 		if err != nil || vm == nil {
 			// Domain exists locally but not in corrosion — might be external/manual.
+			// A litevirt-stamped one is reported by reportOrphanRuntimes, never here.
 			continue
 		}
 

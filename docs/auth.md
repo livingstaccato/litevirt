@@ -130,6 +130,10 @@ binding can:
   calls (an entry-node forward, cross-host replication, auto-promote) authenticate as a
   cluster host cert and bypass this tenant check — a deliberate peer-trust boundary:
   any known cluster host cert can reach pool contents via these RPCs.
+- **Security groups** (`sg.write`: `lv sg create/rm/rule-add/rule-rm`) are
+  cluster-global, bound to NICs by name, and checked at `/`. Admin and
+  NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
+  a NIC (`lv sg bind`) is `network.update` on the VM's own path.
 - **Networks** (`network.create`, `network.delete`) and **resource mappings**
   (`resourcemap.*`, PCI/device pools) are cluster-global, checked at `/`.
 - **Acknowledging a contested leader-lease term**

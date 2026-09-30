@@ -112,7 +112,7 @@ const ReasonUnreachable = "unreachable"
 type Proposer struct {
 	Self      string
 	Transport Transport
-	// CallTimeout bounds each voter RPC. 0 → 3s.
+	// CallTimeout bounds each voter RPC. 0 → DefaultCallTimeout.
 	CallTimeout time.Duration
 	// Backoff is how long to wait before retrying after a ballot was refused
 	// as stale. Nil → a random 0–50ms, which is what breaks a duel.
@@ -178,11 +178,15 @@ func (p *Proposer) bind(key corrosion.ClaimKey, round uint64, digest string) boo
 // value in this process; Decide moves to a higher round.
 var errBallotBound = errors.New("claims: ballot already bound to another value in this process")
 
+// DefaultCallTimeout bounds each voter RPC when CallTimeout is 0. The owner
+// probe's timing is budgeted against it (grpcapi claimProbeRefreshAge).
+const DefaultCallTimeout = 3 * time.Second
+
 func (p *Proposer) callTimeout() time.Duration {
 	if p.CallTimeout > 0 {
 		return p.CallTimeout
 	}
-	return 3 * time.Second
+	return DefaultCallTimeout
 }
 
 func (p *Proposer) backoff(attempt int) time.Duration {

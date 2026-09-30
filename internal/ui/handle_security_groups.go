@@ -11,8 +11,9 @@ import (
 
 // Security-group CRUD is performed in-process against the host-local Corrosion
 // handle (the same DB the read path uses), which CRDT-replicates the change
-// cluster-wide exactly like the `lv sg` CLI's direct writes; each host's
-// firewall reconciler re-renders on its next tick. These handlers run behind
+// cluster-wide; each host's firewall reconciler re-renders on its next tick.
+// The `lv sg` CLI goes through the daemon's security-group RPCs instead
+// (internal/grpcapi/security_groups.go), which record the same audit rows. These handlers run behind
 // the UI's authenticated session but do NOT pass the gRPC RBAC interceptor —
 // treat SG edits as an operator action (see docs/ui.md).
 
@@ -56,8 +57,8 @@ func (s *Server) handleSGCreateModal(w http.ResponseWriter, r *http.Request) {
 
 // handleCreateSG creates a security group. Mirrors `lv sg create`.
 func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
-	// Security groups have no gRPC twin to route through, so the daemon's
-	// authorizer is called directly. Without it this handler wrote
+	// This handler writes in-process rather than through the security-group
+	// RPCs, so the daemon's authorizer is called directly. Without it this handler wrote
 	// CRDT-replicated firewall state behind nothing but a coarse role string.
 	if err := s.authorize(r, "/", "write"); err != nil {
 		sendToast(w, "Not permitted: "+err.Error(), "error")
@@ -80,14 +81,13 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := randid.New()
-	if err := corrosion.InsertSecurityGroup(r.Context(), s.db, corrosion.SecurityGroup{
-		ID: id, Name: name, StackName: strings.TrimSpace(r.FormValue("stack")),
-	}); err != nil {
+	sg := corrosion.SecurityGroup{ID: id, Name: name, StackName: strings.TrimSpace(r.FormValue("stack"))}
+	if err := corrosion.InsertSecurityGroup(r.Context(), s.db, sg); err != nil {
 		sendToast(w, "Create failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	s.auditUIWrite(r, "sg.add", name, "")
+	s.auditUIWrite(r, "sg.add", name, corrosion.AuditChange(corrosion.AuditStateNone, sg.AuditText(nil)))
 	sendToast(w, "Security group "+name+" created", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -95,8 +95,8 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteSG removes a security group and its rules. Mirrors `lv sg rm`.
 func (s *Server) handleDeleteSG(w http.ResponseWriter, r *http.Request) {
-	// Security groups have no gRPC twin to route through, so the daemon's
-	// authorizer is called directly. Without it this handler wrote
+	// This handler writes in-process rather than through the security-group
+	// RPCs, so the daemon's authorizer is called directly. Without it this handler wrote
 	// CRDT-replicated firewall state behind nothing but a coarse role string.
 	if err := s.authorize(r, "/", "write"); err != nil {
 		sendToast(w, "Not permitted: "+err.Error(), "error")
@@ -109,13 +109,17 @@ func (s *Server) handleDeleteSG(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
+	// Read what is about to go, rules included: the group and its rules are
+	// tombstoned together, and the audit row is then the only record of which
+	// traffic they had been allowing or refusing (colonelpanik/litevirt#182).
+	before := corrosion.SecurityGroupAuditState(r.Context(), s.db, id)
 	_ = corrosion.DeleteSGRules(r.Context(), s.db, id)
 	if err := corrosion.DeleteSecurityGroup(r.Context(), s.db, id); err != nil {
 		sendToast(w, "Delete failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	s.auditUIWrite(r, "sg.rm", id, "")
+	s.auditUIWrite(r, "sg.rm", id, corrosion.AuditChange(before, corrosion.AuditStateNone))
 	sendToast(w, "Security group deleted", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -128,8 +132,8 @@ func (s *Server) handleSGRuleModal(w http.ResponseWriter, r *http.Request) {
 
 // handleAddSGRule appends a rule to a security group. Mirrors `lv sg rule-add`.
 func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
-	// Security groups have no gRPC twin to route through, so the daemon's
-	// authorizer is called directly. Without it this handler wrote
+	// This handler writes in-process rather than through the security-group
+	// RPCs, so the daemon's authorizer is called directly. Without it this handler wrote
 	// CRDT-replicated firewall state behind nothing but a coarse role string.
 	if err := s.authorize(r, "/", "write"); err != nil {
 		sendToast(w, "Not permitted: "+err.Error(), "error")
@@ -162,7 +166,10 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	s.auditUIWrite(r, "sg.rule.add", sgID, r.FormValue("direction")+" "+r.FormValue("action"))
+	// Read back, so the "after" is the rule as stored: the insert fills in the
+	// defaults for an empty proto, action and priority.
+	s.auditUIWrite(r, "sg.rule.add", sgID,
+		corrosion.AuditChange(corrosion.AuditStateNone, corrosion.SGRuleAuditState(corrosion.GetSGRule(r.Context(), s.db, id))))
 	sendToast(w, "Rule added", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)
@@ -170,8 +177,8 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 
 // handleDeleteSGRule removes a single rule.
 func (s *Server) handleDeleteSGRule(w http.ResponseWriter, r *http.Request) {
-	// Security groups have no gRPC twin to route through, so the daemon's
-	// authorizer is called directly. Without it this handler wrote
+	// This handler writes in-process rather than through the security-group
+	// RPCs, so the daemon's authorizer is called directly. Without it this handler wrote
 	// CRDT-replicated firewall state behind nothing but a coarse role string.
 	if err := s.authorize(r, "/", "write"); err != nil {
 		sendToast(w, "Not permitted: "+err.Error(), "error")
@@ -183,12 +190,14 @@ func (s *Server) handleDeleteSGRule(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if err := corrosion.DeleteSGRule(r.Context(), s.db, r.PathValue("rule")); err != nil {
+	ruleID := r.PathValue("rule")
+	before := corrosion.SGRuleAuditState(corrosion.GetSGRule(r.Context(), s.db, ruleID))
+	if err := corrosion.DeleteSGRule(r.Context(), s.db, ruleID); err != nil {
 		sendToast(w, "Delete rule failed: "+err.Error(), "error")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	s.auditUIWrite(r, "sg.rule.rm", r.PathValue("rule"), "")
+	s.auditUIWrite(r, "sg.rule.rm", ruleID, corrosion.AuditChange(before, corrosion.AuditStateNone))
 	sendToast(w, "Rule removed", "success")
 	w.Header().Set("HX-Redirect", "/security-groups")
 	w.WriteHeader(http.StatusOK)

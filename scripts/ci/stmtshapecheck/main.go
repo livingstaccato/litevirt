@@ -234,6 +234,7 @@ var dispIdent = map[corrosion.Disposition]string{
 	corrosion.DispReject:               "DispReject",
 	corrosion.DispCanonicalRegistry:    "DispCanonicalRegistry",
 	corrosion.DispGuardedReplace:       "DispGuardedReplace",
+	corrosion.DispLiveRowUpdate:        "DispLiveRowUpdate",
 }
 
 var catIdent = map[corrosion.ConcurrencyCategory]string{

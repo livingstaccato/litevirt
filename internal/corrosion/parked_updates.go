@@ -29,7 +29,7 @@ package corrosion
 // Deliberately narrow:
 //
 //   - only DispFullPKUpdate, the plain LWW-gated full-PK UPDATE with a bound
-//     updated_at. Bulk updates have no single row to wait for; custom-merge,
+//     updated_at, and its tombstone-guarded twin DispLiveRowUpdate. Bulk updates have no single row to wait for; custom-merge,
 //     guarded and no-clock updates carry their own ordering rule and are not
 //     LWW-replayable;
 //   - only when the row is ABSENT. An update whose extra predicates rejected a
@@ -226,7 +226,7 @@ func (c *Client) parkableUpdate(s Statement) (StmtShape, []string, []interface{}
 	if entry.RequiresCapability != "" && entry.DispositionAfter != "" && c.capabilityActive(entry.RequiresCapability) {
 		disp = entry.DispositionAfter
 	}
-	if disp != DispFullPKUpdate {
+	if disp != DispFullPKUpdate && disp != DispLiveRowUpdate {
 		return StmtShape{}, nil, nil, false
 	}
 	pk, ok := pkValuesFromShape(sh, s)
@@ -324,7 +324,9 @@ func (r *Replicator) replayParked(ctx context.Context, tx *sql.Tx, s Statement) 
 		// long ago and this node already accepted. A failed UPDATE changes
 		// nothing (SQLite reverts the statement), so the row is left as it
 		// arrived — the pre-park outcome, for anti-entropy to finish.
-		if err := r.applyLWWGated(ctx, tx, u.stmt, u.shape, u.table, u.pkCols, u.hlc); err != nil {
+		// A live-row update replays through its guarded form, as it would
+		// have applied had the row been here (live_row_update.go).
+		if err := r.applyLWWGated(ctx, tx, liveRowGuarded(u.stmt), u.shape, u.table, u.pkCols, u.hlc); err != nil {
 			slog.Warn("corrosion: dropped a parked update that failed to replay",
 				"table", u.table, "error", err)
 		}

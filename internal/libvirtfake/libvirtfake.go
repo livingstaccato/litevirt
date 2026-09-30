@@ -67,6 +67,7 @@ type Fake struct {
 	reasons                map[string]string // domain → injected DomainStateReason.Reason
 	managedSave            map[string]bool   // domain → has a managed-save (suspend-to-disk) image
 	ownerEpochs            map[string]int64  // domain → Phase 4 owner-epoch metadata marker
+	managed                map[string]bool   // domain → litevirt managed-stamp metadata
 	events                 []Event
 
 	// eventCB is the domain lifecycle callback registered by
@@ -472,6 +473,10 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.snapshots, name)
 	delete(f.stats, name)
 	delete(f.managedSave, name)
+	// Domain metadata lives and dies with the definition, as in libvirt: a later
+	// domain that reuses the name starts with none.
+	delete(f.ownerEpochs, name)
+	delete(f.managed, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
 	return nil
 }
@@ -503,6 +508,8 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	delete(f.activeXML, name)
 	delete(f.snapshots, name)
 	delete(f.stats, name)
+	delete(f.ownerEpochs, name)
+	delete(f.managed, name)
 	f.record("undefine", name, "keep_state=true")
 	return nil
 }
@@ -1586,6 +1593,31 @@ func (f *Fake) GetDomainOwnerEpoch(name string) (int64, bool, error) {
 	}
 	e, ok := f.ownerEpochs[name]
 	return e, ok, nil
+}
+
+// SetDomainManaged / GetDomainManaged mirror the managed-stamp metadata
+// element (internal/libvirt/managed_stamp.go). It dies with the domain on
+// undefine, as the real metadata does.
+func (f *Fake) SetDomainManaged(name string, running bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("domain %q not found", name)
+	}
+	if f.managed == nil {
+		f.managed = make(map[string]bool)
+	}
+	f.managed[name] = true
+	return nil
+}
+
+func (f *Fake) GetDomainManaged(name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return false, fmt.Errorf("domain %q not found", name)
+	}
+	return f.managed[name], nil
 }
 
 // AbortMigration records an abort of name's migration job and runs

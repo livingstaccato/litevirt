@@ -1523,6 +1523,15 @@ message SetFirewallDefaultRequest        { string scope = 1; bool default_deny =
 message ListFirewallDefaultsRequest      {}
 message ListFirewallDefaultsResponse     { repeated FirewallDefault defaults = 1; }
 
+// ── Security groups: the per-NIC tier ──
+// `lv sg create/rm/rule-add/rule-rm`. These used to write the host's database
+// straight from the CLI process, which skipped the daemon's authorization and
+// left no audit row (colonelpanik/litevirt#182).
+message CreateSecurityGroupRequest     { string name = 1; string stack_name = 2; }
+message DeleteSecurityGroupRequest     { string id = 1; }  // tombstones the group and its rules
+message AddSecurityGroupRuleRequest    { SecurityGroupRule rule = 1; }  // rule.id is ignored
+message RemoveSecurityGroupRuleRequest { string id = 1; }  // the RULE id
+
 // ── Storage ──
 message ListStoragePoolsRequest {}
 message ListStoragePoolsResponse { repeated StoragePool pools = 1; }
@@ -1706,6 +1715,15 @@ message GetLeaseTermHighWaterResponse {
     int64 term = 2;
     // holder is the holder recorded at that term; "" when term == 0.
     string holder = 3;
+    // lease_holder and lease_expires_at are this node's leader_election row
+    // for key (expires_at as RFC3339 UTC); both "" when it has none. A node
+    // about to take a lease over reads them as refusal evidence: a peer whose
+    // row shows the lease live has seen a renewal the caller has not, because
+    // renewals travel only in leader_election, which anti-entropy does not
+    // carry. A peer on an older build leaves them empty, which proves nothing
+    // either way and is treated as no evidence.
+    string lease_holder     = 4;
+    string lease_expires_at = 5;
 }
 
 // ── Recovery claims and the voter set (docs/design/recovery-claims.md) ──
@@ -2828,6 +2846,12 @@ service LiteVirt {
     rpc DeleteIpSet(DeleteIpSetRequest)                             returns (google.protobuf.Empty);
     rpc SetFirewallDefault(SetFirewallDefaultRequest)               returns (google.protobuf.Empty);
     rpc ListFirewallDefaults(ListFirewallDefaultsRequest)           returns (ListFirewallDefaultsResponse);
+
+    // ── Security groups: the per-NIC tier ──
+    rpc CreateSecurityGroup(CreateSecurityGroupRequest)             returns (SecurityGroup);
+    rpc DeleteSecurityGroup(DeleteSecurityGroupRequest)             returns (google.protobuf.Empty);
+    rpc AddSecurityGroupRule(AddSecurityGroupRuleRequest)           returns (SecurityGroupRule);
+    rpc RemoveSecurityGroupRule(RemoveSecurityGroupRuleRequest)     returns (google.protobuf.Empty);
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);

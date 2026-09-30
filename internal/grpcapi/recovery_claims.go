@@ -274,6 +274,9 @@ func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b cor
 	if err := s.claimDurable(ctx); err != nil {
 		return corrosion.PrepareResult{}, err
 	}
+	// Start the owner probe the round's Accept will want, so it has finished
+	// by the time the Accept arrives (§3.5.1, §10 item 36).
+	s.primeOwnerProbe(ctx, key)
 	if key.IsWorkload() && key.Attempt > 0 {
 		// A voter that already holds an accepted value at this key admitted
 		// the attempt when it accepted it — or imported it from voters that
@@ -322,6 +325,7 @@ func (s *Server) localAccept(ctx context.Context, key corrosion.ClaimKey, b corr
 			return res, nil
 		}
 	}
+	s.rememberClaimSource(key, v.SourceHost)
 	res, err := s.db.ClaimAccept(ctx, key, b, v, gen, signer, s.probeOwner)
 	if err != nil {
 		return corrosion.AcceptResult{}, status.Errorf(codes.Unavailable, "record accept: %v", err)

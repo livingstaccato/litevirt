@@ -1022,6 +1022,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// outcomes → litevirt_runtime_owner_assert_total.
 	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
 	reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
+	// Orphaned runtimes: litevirt domains/containers with no live record, reported
+	// (never reaped) as vm_orphan_runtime / ct_orphan_runtime and this gauge.
+	orphanMetrics := metrics.NewOrphanRuntimeMetrics()
+	observeOrphans := func(kind string, found []health.OrphanRuntime) {
+		samples := make([]metrics.OrphanRuntimeSample, 0, len(found))
+		for _, o := range found {
+			samples = append(samples, metrics.OrphanRuntimeSample{Name: o.Name, Row: o.Row})
+		}
+		orphanMetrics.Set(kind, d.cfg.HostName, samples)
+	}
+	reconciler.SetOrphanRuntimeObserver(observeOrphans)
 
 	// F1 startup recovery barrier: reduce the host-local operation journal against
 	// replicated state BEFORE any runtime loop or API mutation runs — DB +
@@ -1275,6 +1286,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.checker.Latched(capabilities.CapacityAdmissionV1)
 	})
 	ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
+	ctChecker.SetOrphanRuntimeObserver(observeOrphans)
+	ctChecker.SetReplicaFreshness(d.db.ReplicaCaughtUp)
 	// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
 	// enforced — wired before the container reconcile loop starts.
 	ctChecker.SetGate(d.checker)
@@ -2468,19 +2481,21 @@ func (d *Daemon) wireClusterPolicyGate() {
 // wireLeaseMintClearance makes every new lease term wait for the quorum
 // high-water read (grpcapi.Server.LeaseMintClearance): a node must not mint
 // term N+1 from its own replica while a peer already holds N+1, which is what a
-// restarted or reconnected node's stale ledger otherwise does.
+// restarted or reconnected node's stale ledger otherwise does — nor take over a
+// lease a peer still sees live, which is what a stale leader_election row
+// otherwise does.
 //
 // Wired BEFORE any lease holder starts, and answering "not yet" until the gRPC
 // server and its gate exist. The rebalancer starts ahead of the server, and a
 // daemon's first seconds are exactly when its ledger is stalest, so an unwired
 // window here would be the bug itself.
 func (d *Daemon) wireLeaseMintClearance() {
-	d.db.SetLeaseMintClearance(func(ctx context.Context, key string, next int64) (bool, string) {
+	d.db.SetLeaseMintClearance(func(ctx context.Context, req corrosion.LeaseMintRequest) (bool, string) {
 		svc := d.mintClearance.Load()
 		if svc == nil {
 			return false, "daemon starting: the lease-term quorum read is not wired yet"
 		}
-		return svc.LeaseMintClearance(ctx, key, next)
+		return svc.LeaseMintClearance(ctx, req)
 	})
 }
 

@@ -11,10 +11,12 @@ import (
 type clearanceProbe struct {
 	allow bool
 	asked []int64
+	reqs  []LeaseMintRequest
 }
 
-func (p *clearanceProbe) fn(_ context.Context, _ string, next int64) (bool, string) {
-	p.asked = append(p.asked, next)
+func (p *clearanceProbe) fn(_ context.Context, req LeaseMintRequest) (bool, string) {
+	p.asked = append(p.asked, req.Term)
+	p.reqs = append(p.reqs, req)
 	if p.allow {
 		return true, ""
 	}
@@ -91,4 +93,58 @@ func TestLeaseMintClearance_LivePeerLeaseDoesNotAsk(t *testing.T) {
 	if len(p.asked) != 0 {
 		t.Fatalf("polling a peer's live lease asked the mint clearance about %v", p.asked)
 	}
+}
+
+// The clearance is told whether a mint is a TAKEOVER — this replica shows no
+// live tenure of ours — because only a takeover must also confirm that no peer
+// sees the lease live. A mint over our own live lease (retiring a contested
+// term) must say false: the contest loser's own row names it live, and holding
+// the winner's retirement to it would stall the convergence.
+func TestLeaseMintClearance_TellsATakeoverFromAMintOverOurOwnLease(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("a free lease is a takeover", func(t *testing.T) {
+		c := testClient(t)
+		p := &clearanceProbe{allow: true}
+		c.SetLeaseMintClearance(p.fn)
+		if held, _, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow); err != nil || !held {
+			t.Fatalf("acquire: held=%v err=%v", held, err)
+		}
+		want := LeaseMintRequest{Key: "failover", Term: 1, Holder: "host-a", Takeover: true,
+			Now: leaseTestNow.Format(time.RFC3339)}
+		if len(p.reqs) != 1 || p.reqs[0] != want {
+			t.Fatalf("clearance asked %+v, want exactly [%+v]", p.reqs, want)
+		}
+	})
+
+	t.Run("an expired peer lease is a takeover", func(t *testing.T) {
+		c := testClient(t)
+		seedLease(t, c, "failover", "host-b", leaseTestNow.Add(-time.Second))
+		p := &clearanceProbe{allow: true}
+		c.SetLeaseMintClearance(p.fn)
+		if held, _, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow); err != nil || !held {
+			t.Fatalf("acquire: held=%v err=%v", held, err)
+		}
+		if len(p.reqs) != 1 || !p.reqs[0].Takeover {
+			t.Fatalf("clearance asked %+v, want one takeover", p.reqs)
+		}
+	})
+
+	t.Run("retiring our own contested term is not", func(t *testing.T) {
+		c := testClient(t)
+		p := &clearanceProbe{allow: true}
+		c.SetLeaseMintClearance(p.fn)
+		if held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow); err != nil || !held || term != 1 {
+			t.Fatalf("acquire: held=%v term=%d err=%v", held, term, err)
+		}
+		c.noteLeaseTermClaims("failover", 1, "host-a", "host-z") // host-a continues
+		p.reqs = nil
+		held, term, err := AcquireLeaseWithTerm(ctx, c, "failover", "host-a", 30*time.Second, leaseTestNow.Add(5*time.Second))
+		if err != nil || !held || term != 2 {
+			t.Fatalf("retire: held=%v term=%d err=%v, want term 2", held, term, err)
+		}
+		if len(p.reqs) != 1 || p.reqs[0].Takeover || p.reqs[0].Term != 2 {
+			t.Fatalf("clearance asked %+v, want one non-takeover mint of term 2", p.reqs)
+		}
+	})
 }

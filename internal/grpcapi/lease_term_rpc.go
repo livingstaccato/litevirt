@@ -66,7 +66,18 @@ func (s *Server) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTerm
 			holder = h
 		}
 	}
-	return &pb.GetLeaseTermHighWaterResponse{Key: key, Term: term, Holder: holder}, nil
+	// This node's leader_election row, raw, for a peer about to take the lease
+	// over (LeaseMintClearance): renewals travel only in that table, so a row
+	// here can be newer than the asker's. Unreadable is Unavailable like the
+	// ledger, never an empty row — an empty row reads as "nothing to report".
+	leaseHolder, leaseExpires, err := corrosion.ReadLeaseRow(ctx, s.db, key)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read lease row for %q: %v", key, err)
+	}
+	return &pb.GetLeaseTermHighWaterResponse{
+		Key: key, Term: term, Holder: holder,
+		LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExpires,
+	}, nil
 }
 
 // AcknowledgeLeaseTermTie clears a contested lease term from THIS node's

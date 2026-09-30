@@ -224,6 +224,20 @@ func ListOperationSteps(ctx context.Context, c *Client, operationID string, owne
 	return out, nil
 }
 
+// The VM operation barrier statements. Their WHERE is the name plus the
+// owner/generation CAS and nothing else — that is their wire shape, and a
+// receiver on the previous release recognises no other. What makes them
+// tombstone-safe is their ledger disposition, DispLiveRowUpdate: the origin and
+// every receiver apply them through the `AND deleted_at IS NULL` form (see
+// live_row_update.go). The origin's Go guards also read the row with that
+// predicate, but a receiver has only the statement.
+const (
+	vmOperationBeginSQL = `UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, active_operation_id = ?, updated_at = ?
+		       WHERE name = ? AND active_operation_id = '' AND vm_owner_epoch = ? AND spec_generation = ?`
+	vmOperationClearSQL = `UPDATE vms SET active_operation_id = '', updated_at = ?
+		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`
+)
+
 // BeginVMOperation atomically claims a VM for an operation. In ONE transaction
 // it verifies the VM's expected owner epoch + spec generation and that no OTHER
 // operation holds the barrier, then sets the desired spec, bumps spec_generation,
@@ -261,8 +275,7 @@ func (c *Client) BeginVMOperation(ctx context.Context, op OperationRecord, desir
 	}
 	stmts := []Statement{
 		// Self-contained CAS so a retry (active_operation_id already set) is a no-op.
-		{SQL: `UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, active_operation_id = ?, updated_at = ?
-		       WHERE name = ? AND active_operation_id = '' AND vm_owner_epoch = ? AND spec_generation = ?`,
+		{SQL: vmOperationBeginSQL,
 			Params: []interface{}{desiredSpec, op.ID, now, op.ResourceID, expectedOwnerEpoch, expectedSpecGen}},
 		{SQL: `INSERT OR IGNORE INTO operations (` + operationCols + `)
 		       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
@@ -298,8 +311,7 @@ func (c *Client) CompleteVMOperation(ctx context.Context, vmName, operationID st
 		return activeOp == operationID && oe == ownerEpoch && sg == expectedSpecGen, nil
 	}
 	stmts := []Statement{
-		{SQL: `UPDATE vms SET active_operation_id = '', updated_at = ?
-		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`,
+		{SQL: vmOperationClearSQL,
 			Params: []interface{}{now, vmName, operationID, ownerEpoch, expectedSpecGen}},
 		{SQL: `INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
 		       VALUES (?, ?, ?, '', ?, ?, NULL)`,
@@ -450,8 +462,7 @@ func (c *Client) AbortVMOperation(ctx context.Context, vmName, operationID strin
 		return active == operationID && oe == ownerEpoch && sg == specGen, nil
 	}
 	stmts := []Statement{
-		{SQL: `UPDATE vms SET active_operation_id = '', updated_at = ?
-		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`,
+		{SQL: vmOperationClearSQL,
 			Params: []interface{}{now, vmName, operationID, ownerEpoch, specGen}},
 		{SQL: `INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
 		       VALUES (?, ?, ?, ?, ?, ?, NULL)`,
@@ -489,8 +500,7 @@ func (c *Client) FailVMOperation(ctx context.Context, vmName, operationID string
 		return active == operationID && oe == ownerEpoch && sg == specGen, nil
 	}
 	stmts := []Statement{
-		{SQL: `UPDATE vms SET active_operation_id = '', updated_at = ?
-		       WHERE name = ? AND active_operation_id = ? AND vm_owner_epoch = ? AND spec_generation = ?`,
+		{SQL: vmOperationClearSQL,
 			Params: []interface{}{now, vmName, operationID, ownerEpoch, specGen}},
 		{SQL: `INSERT OR IGNORE INTO operation_steps (operation_id, owner_epoch, step_name, facts, created_at, updated_at, deleted_at)
 		       VALUES (?, ?, ?, ?, ?, ?, NULL)`,

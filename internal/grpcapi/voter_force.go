@@ -41,12 +41,18 @@ const (
 
 // forcedProbe is the fresh reachability check a forced reconfiguration uses:
 // the owner probe's transport and verdict, never its cached result — the
-// question is whether a host is reachable NOW.
+// question is whether a host is reachable NOW. It runs under the operator's
+// context, and a probe that context cut short learned nothing, so it reads as
+// reached (§10.9): a voter is named lost only on a probe that finished.
 func (s *Server) forcedProbe(ctx context.Context, host string) (bool, string) {
 	if host == s.hostName {
 		return true, "this host"
 	}
-	return s.probeOnce(ctx, host)
+	reached, detail := s.probeOnce(ctx, s.claims.probe.dial, host)
+	if !reached && ctx.Err() != nil {
+		return true, fmt.Sprintf("probe interrupted before it finished: %v", ctx.Err())
+	}
+	return reached, detail
 }
 
 // ForceReconfigureVoters is the operator RPC.

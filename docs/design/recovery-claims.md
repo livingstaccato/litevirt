@@ -354,8 +354,9 @@ refuse, or accept, on another node's stale observation.
   would protect nothing. Gating it would also break phase 1 as the way to
   *learn*: a lagging coordinator (§3.12) and `lv cluster claim` both
   read decided values through it, and must be able to while the owner is up. A
-  voter may start the probe when a `Prepare` arrives, so the `Accept` rarely
-  waits for it.
+  voter starts the probe when a `Prepare` arrives, so the `Accept` rarely
+  waits for it. The probe runs detached from both RPCs, and only a probe that
+  finished is stored (§10 item 36).
 - **The probe.** A `Ping` over the peer transport (mTLS, host certificate) to
   the address in the voter's `hosts` row for `source_host`. It counts as
   *reached* only if the handshake completes, the peer certificate's CN is
@@ -366,7 +367,8 @@ refuse, or accept, on another node's stale observation.
 - **Cost per recovery.** The probe runs once per `(voter, source_host)`, not
   once per workload: every `Accept` naming the same source within
   `claimProbeMaxAge` (5 s, one `claimTimeout`) reuses the result. A
-  failed host with fifty workloads costs each voter one probe. Voters probe in
+  failed host with fifty workloads costs each voter one probe per
+  `claimProbeRefreshAge` (2 s), never two at once. Voters probe in
   parallel, so the claim's added latency is at most one `claimProbeTimeout`,
   and less when the probe started at `Prepare`. A powered-off host usually
   costs the full timeout, because nothing answers the dial.
@@ -1734,8 +1736,46 @@ where it described the mechanism; this list records what changed and why.
     down until it has run.
 34. **An interrupted owner probe is not cached** (item 9). A probe whose
     caller's context ended mid-dial reads as reached and is not stored, so the
-    next Accept naming the source probes again.
+    next Accept naming the source probes again. Item 36 replaces the
+    mechanism: no caller's context reaches the probe any more, so no dial is
+    interrupted, and the rule that only a finished answer is stored remains.
 35. **A supersede's prior certificate obeys the destination's generation
     rule** (§3.12): at a generation this voter has adopted and not one a
     forced change replaced. The coordinator re-decides the previous attempt
     under the current generation first, which certifies the same value again.
+36. **The owner probe runs detached from the RPC that wants it, and a
+    Prepare starts it** (§3.5.1; supersedes item 34). On the kvm003 lab a
+    hard-killed owner that was also a voter took five rounds to decide. Its
+    dial failed only after about 3 s (ARP), phase 1 waited out its Prepare for
+    the proposer's whole call timeout (3 s), and the Accept then arrived with
+    under 2 s of `claimTimeout` left. The probe ran under that Accept's
+    context, so every voter's dial was cancelled with it. Item 34 rightly did
+    not cache an interrupted dial, and so nothing ever learned "not reached"
+    until a round happened to let a probe finish. Now:
+    - a probe runs under its own `claimProbeTimeout` and no caller's context,
+      one per source host at a time (fifty Accepts share one dial). It stores
+      only the answer it finished with, and that answer, "not reached"
+      included, is used for `claimProbeMaxAge` and no longer, so a host that
+      comes back is probed again. A probe that timed out on its own
+      `claimProbeTimeout` is a finished "not reached", as it always was;
+    - an Accept waits for the probe up to its own deadline. If the probe has
+      not finished by then, the Accept reads as reached ("probe in flight"),
+      as item 9 requires, and the probe runs on;
+    - a Prepare for a workload key starts the probe of the host this voter's
+      row names at the key's epoch, and of the source the last Accept at the
+      key named. It skips a host being probed and one whose answer is younger
+      than `claimProbeRefreshAge`. That age is `claimProbeMaxAge` minus the
+      proposer's call timeout, so a result the Prepare leaves alone is still
+      valid when the round's Accept arrives. The start decides nothing: the
+      Accept probes the source its value names.
+
+    The timing budget, with call timeout C = 3 s, `claimProbeTimeout` P = 2 s,
+    `claimProbeMaxAge` M = 5 s, refresh age M − C = 2 s and `claimTimeout`
+    5 s: a probe started at Prepare finishes within P < C. When the dead
+    source is a voter, phase 1 lasts C, so the answer is already cached when
+    the Accept arrives. When it is not a voter, the Accept arrives at once and
+    waits at most P for the answer. Either way a dead source decides in its
+    first round. A round that still misses, for example because the lease cut
+    the claim deadline short, is retried on the next coordinator tick, whose
+    Prepare refreshes the probe, so it decides in the second.
+    `forcedProbe` (§4.6) still probes afresh under the operator's context.

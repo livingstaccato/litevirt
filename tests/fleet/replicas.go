@@ -83,6 +83,11 @@ type LinkFault struct {
 	// ProbeDelay holds each Ping on the link before it is answered — an owner
 	// that is slow to answer, or a probe that has to wait out its timeout.
 	ProbeDelay time.Duration
+	// ClaimDelay holds each recovery-claim RPC on the link and then refuses
+	// it Unavailable — a dead host whose dial fails only once ARP gives up,
+	// seconds later, rather than at once. A caller whose deadline is shorter
+	// sees its own deadline instead.
+	ClaimDelay time.Duration
 }
 
 // LinkStats counts what the injector did on one directed link.
@@ -268,6 +273,24 @@ func (n *Node) faultUnaryInterceptor(ctx context.Context, req any, info *grpc.Un
 				case <-timer.C:
 				case <-ctx.Done():
 					timer.Stop()
+					return nil, status.FromContextError(ctx.Err()).Err()
+				}
+			}
+		}
+		return handler(ctx, req)
+	}
+	if claimMethods[methodName(info.FullMethod)] {
+		if from := peerCertCN(ctx); from != "" {
+			n.faults.mu.Lock()
+			delay := n.link(from).fault.ClaimDelay
+			n.faults.mu.Unlock()
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+					return nil, status.Errorf(codes.Unavailable, "fleet: %s: no route to host", n.Name)
+				case <-ctx.Done():
 					return nil, status.FromContextError(ctx.Err()).Err()
 				}
 			}

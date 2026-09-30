@@ -1736,6 +1736,18 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		return execErr
 
+	case DispLiveRowUpdate:
+		// Exactly DispFullPKUpdate, through the tombstone-guarded form: a state
+		// write that reaches a deleted row here changes nothing, whichever
+		// release sent it (live_row_update.go). An absent row still parks.
+		if err := r.applyLWWGated(ctx, tx, liveRowGuarded(s), sh, tableName, pkCols, incomingHLC); err != nil {
+			return err
+		}
+		if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {
+			r.client.deferAfterCommit(tx, park)
+		}
+		return nil
+
 	case DispFullPKUpdate:
 		if err := r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC); err != nil {
 			return err

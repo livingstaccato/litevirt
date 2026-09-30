@@ -80,6 +80,12 @@ type ContainerChecker struct {
 	// (<root>/<name>/owner_epoch). Empty disables marker writes (fixture
 	// checkers that predate markers); the daemon wires the real path.
 	containersRoot string
+
+	// replicaCaughtUp, orphans and onOrphans serve the orphan-runtime report
+	// (orphan_runtime.go). A nil replicaCaughtUp is unwired and trusted.
+	replicaCaughtUp func() (bool, string)
+	orphans         orphanReporter
+	onOrphans       func(kind string, orphans []OrphanRuntime)
 }
 
 // NewContainerChecker creates a container reconciler/restart engine for the
@@ -212,6 +218,8 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 	// a re-key (which transfers the container's leases to us) isn't racing a GC of
 	// those same leases.
 	c.assertContainerOwnership(ctx)
+	// Report litevirt containers with no live row anywhere; touches nothing.
+	c.reportOrphanContainers(ctx)
 
 	// GC IPAM leases stranded by a crash between allocating a lease and persisting
 	// the container row (an orphan lease — owner with no live container row). The

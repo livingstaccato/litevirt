@@ -1210,7 +1210,9 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 					return false, nil
 				}
 			}
-			res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+			// A live-row update runs here through the same guarded form every
+			// receiver uses; what is logged is the wire form (live_row_update.go).
+			res, err := tx.ExecContext(ctx, liveRowGuarded(s).SQL, s.Params...)
 			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
@@ -1365,7 +1367,9 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
-		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		// A live-row update runs here through the same guarded form every
+		// receiver uses; what is logged is the wire form (live_row_update.go).
+		res, err := tx.ExecContext(ctx, liveRowGuarded(s).SQL, s.Params...)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()

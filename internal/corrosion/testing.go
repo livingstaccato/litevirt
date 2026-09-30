@@ -62,7 +62,7 @@ func NewTestClient() (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{
+	c := &Client{
 		db:               db,
 		dsn:              dsn,
 		tableGens:        gens,
@@ -70,8 +70,9 @@ func NewTestClient() (*Client, error) {
 		clock:            hlc.NewClock("test-node"),
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
-		leaseTermLedger:  testLeaseTermLedgerOpen,
-	}, nil
+	}
+	c.SetLeaseTermLedgerGate(testLeaseTermLedgerOpen)
+	return c, nil
 }
 
 // testLeaseTermLedgerOpen is what the test constructors wire into
@@ -100,7 +101,7 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		releaseGenerations(dsn)
 		return nil, err
 	}
-	return &Client{
+	c := &Client{
 		db:               db,
 		dsn:              dsn,
 		tableGens:        gens,
@@ -108,8 +109,9 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		clock:            hlc.NewClock(hostName),
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
-		leaseTermLedger:  testLeaseTermLedgerOpen,
-	}, nil
+	}
+	c.SetLeaseTermLedgerGate(testLeaseTermLedgerOpen)
+	return c, nil
 }
 
 // ExecOutOfProcessForTest runs one statement on this client's database

@@ -212,3 +212,22 @@ func TestSecurityGroupRPCs_RejectBadRequests(t *testing.T) {
 		}
 	}
 }
+
+// TestSecurityGroupRPCs_UnknownIDIsNotFound: `lv sg rm` and `lv sg rule-rm`
+// take an id. Given one that matches nothing — a group's name, a typo — the
+// delete tombstoned no row, yet the CLI printed "Deleted" and the audit chain
+// recorded an "ok" removal of something that never existed. It is NotFound,
+// and nothing is recorded.
+//
+// Mutation: drop the not-found check in DeleteSecurityGroup (or
+// RemoveSecurityGroupRule) — the call succeeds.
+func TestSecurityGroupRPCs_UnknownIDIsNotFound(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtxWithEngine(t, s)
+	if _, err := s.DeleteSecurityGroup(ctx, &pb.DeleteSecurityGroupRequest{Id: "no-such-group"}); status.Code(err) != codes.NotFound {
+		t.Errorf("delete of an unknown group: err = %v, want NotFound", err)
+	}
+	if _, err := s.RemoveSecurityGroupRule(ctx, &pb.RemoveSecurityGroupRuleRequest{Id: "no-such-rule"}); status.Code(err) != codes.NotFound {
+		t.Errorf("remove of an unknown rule: err = %v, want NotFound", err)
+	}
+}

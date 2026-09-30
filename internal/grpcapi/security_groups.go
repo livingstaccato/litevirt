@@ -77,6 +77,11 @@ func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurity
 	// Read what is about to go, rules included: after this the audit row is
 	// the only record of which traffic they allowed or refused.
 	before := corrosion.SecurityGroupAuditState(ctx, s.db, req.Id)
+	if before == corrosion.AuditStateNone {
+		// An id that matches no live group (a group's name, a typo) would
+		// tombstone nothing and still record an "ok" removal.
+		return nil, status.Errorf(codes.NotFound, "no security group with id %q (lv sg ls shows ids)", req.Id)
+	}
 	if err := corrosion.DeleteSGRules(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete security group rules: %v", err)
 	}
@@ -129,6 +134,9 @@ func (s *Server) RemoveSecurityGroupRule(ctx context.Context, req *pb.RemoveSecu
 		return nil, status.Error(codes.InvalidArgument, "id required")
 	}
 	before := corrosion.SGRuleAuditState(corrosion.GetSGRule(ctx, s.db, req.Id))
+	if before == corrosion.AuditStateNone {
+		return nil, status.Errorf(codes.NotFound, "no security group rule with id %q (lv sg rule-ls shows ids)", req.Id)
+	}
 	if err := corrosion.DeleteSGRule(ctx, s.db, req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "remove security group rule: %v", err)
 	}

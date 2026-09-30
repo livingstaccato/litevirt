@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -150,12 +151,72 @@ func ClaimGatedAction(action string) bool {
 	return false
 }
 
+// SetClaimCertificateVerifier injects the verifier proof certificates are
+// judged with before one replaces another (grpcapi.NewServer wires the
+// server's claim verifier). Unset, or returning nil, nothing verifies, so a
+// certificate a row already holds is never replaced.
+func (c *Client) SetClaimCertificateVerifier(fn func() *ClaimVerifier) {
+	c.claimCertVerifier.Store(&fn)
+}
+
+func (c *Client) claimCertificateVerifier() *ClaimVerifier {
+	fn := c.claimCertVerifier.Load()
+	if fn == nil || *fn == nil {
+		return nil
+	}
+	return (*fn)()
+}
+
+// certificateVerifiesTx reports whether raw verifies on THIS node, reading
+// through tx: it decodes, is at a generation this node has adopted that no
+// adopted forced generation replaced, and carries a majority of that
+// generation's members' valid signatures (VerifyClaimCertificate's checks
+// minus the proof binding, which the callers compare separately). It is the
+// judge of which of two certificates for one proof a row keeps.
+func (c *Client) certificateVerifiesTx(tx *sql.Tx, raw string) bool {
+	v := c.claimCertificateVerifier()
+	if v == nil || raw == "" {
+		return false
+	}
+	cert, err := DecodeClaimCertificate(raw)
+	if err != nil || cert.ConfigGeneration < 1 {
+		return false
+	}
+	var adopted, forced int64
+	if err := tx.QueryRow(`SELECT COALESCE(MAX(generation), 0) FROM local_voter_adoption`).Scan(&adopted); err != nil ||
+		cert.ConfigGeneration > adopted {
+		return false
+	}
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM voter_configs
+		WHERE deleted_at IS NULL AND generation > ? AND generation <= ? AND change LIKE 'force:%'`,
+		cert.ConfigGeneration, adopted).Scan(&forced); err != nil || forced > 0 {
+		return false
+	}
+	var membersJSON string
+	if err := tx.QueryRow(`SELECT members_json FROM voter_configs WHERE generation = ? AND deleted_at IS NULL`,
+		cert.ConfigGeneration).Scan(&membersJSON); err != nil {
+		return false
+	}
+	var members []VoterMember
+	if err := json.Unmarshal([]byte(membersJSON), &members); err != nil || len(members) == 0 {
+		return false
+	}
+	return v.Verify(cert, CertExpectation{Key: cert.Key, ValueDigest: cert.ValueDigest,
+		ConfigGeneration: cert.ConfigGeneration, Electorate: members, Quorum: MajorityOf(len(members))}) == nil
+}
+
 // ClaimCertificateReplaces reports whether certificate next may take the place
-// of current on one proof row. An empty current is replaced by anything that
-// decodes; otherwise next must certify the same value and be at a LATER voter
-// generation — the re-certification a forced reconfiguration requires (§4.6).
-// Anything else leaves the row as it is.
-func ClaimCertificateReplaces(current, next string) bool {
+// of current on one proof row, with verifies judging a certificate on this
+// node (certificateVerifiesTx). An empty or unparseable current is replaced
+// by anything that decodes: it certifies nothing, and a genuine certificate
+// replaces a forged one later. Otherwise next must certify the same key and
+// value AND verify here, and then replaces a current that does not verify
+// here (a forgery, or one at a generation a forced change replaced), or one
+// at an earlier generation — the re-certification a forced reconfiguration
+// requires (§4.6). A certificate that does not verify never replaces one: an
+// unsigned "generation 999" would otherwise overwrite a genuine certificate
+// cluster-wide and every destination would refuse the recovery forever.
+func ClaimCertificateReplaces(current, next string, verifies func(string) bool) bool {
 	if next == "" || next == current {
 		return false
 	}
@@ -170,30 +231,43 @@ func ClaimCertificateReplaces(current, next string) bool {
 	if err != nil {
 		return true // a row whose certificate does not even parse certifies nothing
 	}
-	return n.ValueDigest == c.ValueDigest && n.Key == c.Key && n.ConfigGeneration > c.ConfigGeneration
+	if n.ValueDigest != c.ValueDigest || n.Key != c.Key || !verifies(next) {
+		return false
+	}
+	return !verifies(current) || n.ConfigGeneration > c.ConfigGeneration
 }
 
 // betterClaimCertificate is the merge's choice between two copies of one
-// proof's certificate: the one that replaces the other, and otherwise the
-// greater encoding, so two replicas holding different certificates for one
-// decision settle on the same one (the voter_configs rule, §4.1).
-func betterClaimCertificate(a, b string) string {
+// proof's certificate: the one that replaces the other; otherwise the one
+// that verifies here; otherwise the greater encoding. Nodes that have adopted
+// the same generations and CRL therefore choose the same copy. Nodes that
+// have not can choose differently for a while — the one behind cannot verify
+// a certificate at a generation it has not adopted — but the rows then still
+// differ, so the next anti-entropy pass merges them again, and once the
+// lagging node has adopted it chooses the same copy.
+func betterClaimCertificate(a, b string, verifies func(string) bool) string {
 	switch {
 	case a == b:
 		return a
-	case ClaimCertificateReplaces(a, b):
+	case ClaimCertificateReplaces(a, b, verifies):
 		return b
-	case ClaimCertificateReplaces(b, a):
+	case ClaimCertificateReplaces(b, a, verifies):
 		return a
 	case a == "":
 		return b
 	case b == "":
 		return a
-	case a > b:
-		return a
-	default:
+	}
+	if va, vb := verifies(a), verifies(b); va != vb {
+		if va {
+			return a
+		}
 		return b
 	}
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // updateProofCertificateSQL is the one statement that changes a proof's
@@ -238,7 +312,9 @@ func SetProofClaimCertificate(ctx context.Context, c *Client, p ActionProof) err
 			diverges = true
 			return false, nil
 		}
-		return ClaimCertificateReplaces(cert, p.ClaimCertificate), nil
+		return ClaimCertificateReplaces(cert, p.ClaimCertificate, func(raw string) bool {
+			return c.certificateVerifiesTx(tx, raw)
+		}), nil
 	}, []Statement{{SQL: updateProofCertificateSQL, Params: []interface{}{p.ClaimCertificate, c.NowTS(), p.ID}}})
 	if err != nil {
 		return err

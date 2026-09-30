@@ -362,6 +362,11 @@ type Client struct {
 	// recovery_claim_v1 latch. Fails CLOSED when unset: those shapes
 	// back-pressure a previous-release peer. See recovery_claims_proof.go.
 	recoveryClaimGate atomic.Pointer[func() bool]
+	// claimCertVerifier supplies the verifier a proof's claim certificate is
+	// judged with before it may REPLACE another (SetProofClaimCertificate and
+	// the anti-entropy merge). Unset, or returning nil, nothing verifies and
+	// a non-empty certificate is never replaced. See recovery_claims_proof.go.
+	claimCertVerifier atomic.Pointer[func() *ClaimVerifier]
 	// hostMembershipLive is set once a SplitHostMembership pass has completed
 	// with the gate open (also persisted under dataDir); from then on writers
 	// write host_membership and readers read it.

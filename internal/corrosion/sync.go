@@ -1356,7 +1356,7 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	if certIdx := indexOf(table.Columns, "claim_certificate"); certIdx >= 0 {
 		lc, _ := localRow[certIdx].(string)
 		ic, _ := row[certIdx].(string)
-		best := betterClaimCertificate(lc, ic)
+		best := betterClaimCertificate(lc, ic, func(raw string) bool { return c.certificateVerifiesTx(tx, raw) })
 		if !keepLocal {
 			row[certIdx] = best
 		} else if best != lc {

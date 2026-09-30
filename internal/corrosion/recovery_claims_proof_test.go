@@ -206,6 +206,10 @@ func TestProofClaimCertificate_EmittedOnlyOnceLatched(t *testing.T) {
 // at a later generation; a certificate for any other value is refused before
 // anything is written, and one at a lower generation changes nothing (§3.9).
 //
+// A certificate replaces one the row holds only if it verifies here, which
+// the unsigned ones below do not (TestClaimCertificate_ReplacedOnlyByOneThatVerifies
+// covers replacement).
+//
 // Mutations: accept a lower generation in ClaimCertificateReplaces — the older
 // certificate replaces the newer; skip CertificateAuthorizesProof in
 // WriteActionProofValidated — the certificate for another destination is
@@ -243,8 +247,8 @@ func TestWriteActionProofValidated_CertificateIsEvidence(t *testing.T) {
 	if cert() != certAt(2).ClaimCertificate {
 		t.Fatal("a certificate at a lower generation replaced a newer one")
 	}
-	if err := WriteActionProofValidated(ctx, c, certAt(3)); err != nil || cert() != certAt(3).ClaimCertificate {
-		t.Fatalf("a re-certification at a later generation was not recorded: %v", err)
+	if err := WriteActionProofValidated(ctx, c, certAt(3)); err != nil || cert() != certAt(2).ClaimCertificate {
+		t.Fatalf("an unverified certificate at a later generation replaced the row's: %v", err)
 	}
 
 	other := p
@@ -254,7 +258,7 @@ func TestWriteActionProofValidated_CertificateIsEvidence(t *testing.T) {
 	if err := WriteActionProofValidated(ctx, c, forged); !errors.Is(err, ErrProofDiverges) {
 		t.Fatalf("a certificate for another destination was accepted: %v", err)
 	}
-	if cert() != certAt(3).ClaimCertificate {
+	if cert() != certAt(2).ClaimCertificate {
 		t.Fatal("the forged certificate reached the row")
 	}
 
@@ -306,5 +310,123 @@ func TestSensitiveAE_ClaimCertificateSurvivesTheMerge(t *testing.T) {
 	}
 	if got.ClaimCertificate != q.ClaimCertificate {
 		t.Fatalf("the merged row lost the certificate: %q", got.ClaimCertificate)
+	}
+}
+
+// TestClaimCertificate_ReplacedOnlyByOneThatVerifies: a certificate on a
+// proof row is replaced only by one that verifies HERE — signatures and a
+// majority of a generation this node has adopted, not replaced by a forced
+// one. An unsigned certificate claiming generation 999 for the same value
+// must neither overwrite a genuine one on the write path nor win the merge,
+// or one peer could make every destination refuse the recovery forever. A
+// genuine one replaces a copy that does not verify, whichever node holds
+// which, so the replicas converge; a genuine re-certification at a later
+// adopted generation still replaces an earlier one.
+//
+// Mutations: judge nothing in ClaimCertificateReplaces (the old
+// later-generation rule) — the forged certificate replaces the genuine one;
+// drop the verified-first fallback in betterClaimCertificate — the forged
+// copy's greater encoding wins the merge on one side.
+func TestClaimCertificate_ReplacedOnlyByOneThatVerifies(t *testing.T) {
+	ctx := context.Background()
+	f := newCertFixture(t)
+	a, b := f.voters[0].c, f.voters[1].c
+	for _, c := range []*Client{a, b} {
+		c.SetRecoveryClaimGate(func() bool { return true })
+		c.SetClaimCertificateVerifier(func() *ClaimVerifier { return f.verifier })
+	}
+	genuine, err := f.cert.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fc := f.cert
+	fc.ConfigGeneration = 999
+	fc.Accepts = nil
+	forged, err := fc.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proof := *f.value.Proof
+	good, bad := proof, proof
+	good.ClaimCertificate, bad.ClaimCertificate = genuine, forged
+	certOn := func(c *Client) string {
+		got, ok, err := GetActionProof(ctx, c, proof.ID)
+		if err != nil || !ok {
+			t.Fatalf("read proof: ok=%v %v", ok, err)
+		}
+		return got.ClaimCertificate
+	}
+
+	// The write path.
+	if err := WriteActionProof(ctx, a, good); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetProofClaimCertificate(ctx, a, bad); !errors.Is(err, ErrNoRowsAffected) {
+		t.Fatalf("an unverified certificate at generation 999 was not refused: %v", err)
+	}
+	if certOn(a) != genuine {
+		t.Fatal("the forged certificate replaced the genuine one on the write path")
+	}
+
+	// The merge, both ways: b holds the forged copy.
+	if err := WriteActionProof(ctx, b, bad); err != nil {
+		t.Fatal(err)
+	}
+	a.MergeSensitiveStateBytesLWW(b.DumpSensitiveStateBytes())
+	b.MergeSensitiveStateBytesLWW(a.DumpSensitiveStateBytes())
+	if certOn(a) != genuine || certOn(b) != genuine {
+		t.Fatalf("the replicas did not converge on the genuine certificate:\n  a %q\n  b %q", certOn(a), certOn(b))
+	}
+
+	// A forged certificate for the same proof that names another source has
+	// another digest, so neither copy replaces the other; the merge must still
+	// keep the one that verifies, not the greater encoding. The forgery's
+	// ballot is picked so its encoding IS the greater.
+	other := f.value
+	other.SourceHost = "elsewhere"
+	var forged2 string
+	for round := uint64(3); round < 100 && forged2 <= genuine; round++ {
+		f2 := ClaimCertificate{Key: f.key, ConfigGeneration: 1, Ballot: testBallot(round, "z"),
+			ValueDigest: other.MustDigest(), SourceHost: "elsewhere"}
+		if forged2, err = f2.Encode(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if forged2 <= genuine {
+		t.Fatal("could not build a forgery whose encoding sorts above the genuine certificate")
+	}
+	c3 := f.voters[2].c
+	c3.SetRecoveryClaimGate(func() bool { return true })
+	c3.SetClaimCertificateVerifier(func() *ClaimVerifier { return f.verifier })
+	bad2 := proof
+	bad2.ClaimCertificate = forged2
+	if err := WriteActionProof(ctx, c3, bad2); err != nil {
+		t.Fatal(err)
+	}
+	a.MergeSensitiveStateBytesLWW(c3.DumpSensitiveStateBytes())
+	c3.MergeSensitiveStateBytesLWW(a.DumpSensitiveStateBytes())
+	if certOn(a) != genuine || certOn(c3) != genuine {
+		t.Fatalf("a forgery naming another source won the merge:\n  a %q\n  c %q", certOn(a), certOn(c3))
+	}
+
+	// A genuine re-certification at a later adopted generation still replaces.
+	adoptHandBuilt(t, 2, membersOf(f.voters...), f.voters...)
+	b3 := testBallot(3, "b")
+	c2 := ClaimCertificate{Key: f.key, ConfigGeneration: 2, Ballot: b3, ValueDigest: f.value.MustDigest(), SourceHost: "ghost"}
+	for _, v := range f.voters[:2] {
+		res, err := v.c.ClaimAccept(ctx, f.key, b3, f.value, 2, v.signer, unreachable)
+		if err != nil || !res.Accepted {
+			t.Fatalf("%s accept at generation 2: %+v %v", v.name, res, err)
+		}
+		c2.Accepts = append(c2.Accepts, *res.Accept)
+	}
+	recert, err := c2.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := proof
+	re.ClaimCertificate = recert
+	if err := SetProofClaimCertificate(ctx, a, re); err != nil || certOn(a) != recert {
+		t.Fatalf("a genuine re-certification at generation 2 did not replace generation 1: %v", err)
 	}
 }

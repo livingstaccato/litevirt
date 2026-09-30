@@ -1663,7 +1663,7 @@ type StoragePoolRef struct {
 
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
-	return &Server{
+	s := &Server{
 		hostName:       hostName,
 		dataDir:        dataDir,
 		pkiDir:         pkiDir,
@@ -1678,6 +1678,27 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
+	s.wireCertificateVerifier()
+	return s
+}
+
+// wireCertificateVerifier makes a proof's claim certificate replaceable only
+// by one that verifies on this node, on the write path and in the
+// anti-entropy merge alike (corrosion.ClaimCertificateReplaces).
+func (s *Server) wireCertificateVerifier() {
+	if s.db != nil {
+		s.db.SetClaimCertificateVerifier(s.certificateVerifier)
+	}
+}
+
+// certificateVerifier is this node's claim verifier, nil while the cluster CA
+// cannot be loaded (nothing then verifies, and no certificate is replaced).
+func (s *Server) certificateVerifier() *corrosion.ClaimVerifier {
+	_, v, err := s.claimIdentity()
+	if err != nil {
+		return nil
+	}
+	return v
 }
 
 // SetAuthEngine wires the path-based RBAC engine. Called by the daemon

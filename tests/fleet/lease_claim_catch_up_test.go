@@ -65,6 +65,13 @@ const (
 	catchUpPoll = 5 * time.Second
 )
 
+// termMint is the clearance question n asks before taking the lease over at
+// term, classified at at.
+func termMint(n *Node, term int64, at time.Time) corrosion.LeaseMintRequest {
+	return corrosion.LeaseMintRequest{Key: leaseTermKey, Term: term, Holder: n.Name,
+		Takeover: true, Now: at.UTC().Format(time.RFC3339)}
+}
+
 func acquireAt(t *testing.T, n *Node, at time.Time) (bool, int64) {
 	t.Helper()
 	held, term, err := corrosion.AcquireLeaseWithTerm(context.Background(), n.DB, leaseTermKey, n.Name, catchUpTTL, at)
@@ -137,7 +144,7 @@ func TestFleet_LeaseClaim_AReconnectedNodeDoesNotReclaimFromAStaleLedger(t *test
 	if st, live, need := gates[a.Name].QuorumProof(ctx); st != health.QuorumYes {
 		t.Fatalf("%s lost quorum (%v, %d/%d) — the refusal above proves nothing", a.Name, st, live, need)
 	}
-	if ok, why := a.Server.LeaseMintClearance(ctx, leaseTermKey, 2); ok || !strings.Contains(why, "term 2") {
+	if ok, why := a.Server.LeaseMintClearance(ctx, termMint(a, 2, takeover)); ok || !strings.Contains(why, "term 2") {
 		t.Fatalf("%s's clearance for term 2: ok=%v reason=%q; want it withheld because a peer "+
 			"has already recorded term 2", a.Name, ok, why)
 	}
@@ -201,7 +208,7 @@ func TestFleet_LeaseClaim_ACatchingUpNodeTakesOverOnceItHasTheRow(t *testing.T) 
 	if held, term := acquireAt(t, a, takeover); held {
 		t.Fatalf("%s minted term %d before its replica had the term-2 row", a.Name, term)
 	}
-	if ok, why := a.Server.LeaseMintClearance(context.Background(), leaseTermKey, 2); ok || !strings.Contains(why, "term 2") {
+	if ok, why := a.Server.LeaseMintClearance(context.Background(), termMint(a, 2, takeover)); ok || !strings.Contains(why, "term 2") {
 		t.Fatalf("%s's clearance for term 2: ok=%v reason=%q; want it withheld on the peer's term 2",
 			a.Name, ok, why)
 	}

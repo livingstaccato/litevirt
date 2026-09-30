@@ -18125,9 +18125,18 @@ type GetLeaseTermHighWaterResponse struct {
 	// than as agreeing at 0.
 	Term int64 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
 	// holder is the holder recorded at that term; "" when term == 0.
-	Holder        string `protobuf:"bytes,3,opt,name=holder,proto3" json:"holder,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Holder string `protobuf:"bytes,3,opt,name=holder,proto3" json:"holder,omitempty"`
+	// lease_holder and lease_expires_at are this node's leader_election row
+	// for key (expires_at as RFC3339 UTC); both "" when it has none. A node
+	// about to take a lease over reads them as refusal evidence: a peer whose
+	// row shows the lease live has seen a renewal the caller has not, because
+	// renewals travel only in leader_election, which anti-entropy does not
+	// carry. A peer on an older build leaves them empty, which proves nothing
+	// either way and is treated as no evidence.
+	LeaseHolder    string `protobuf:"bytes,4,opt,name=lease_holder,json=leaseHolder,proto3" json:"lease_holder,omitempty"`
+	LeaseExpiresAt string `protobuf:"bytes,5,opt,name=lease_expires_at,json=leaseExpiresAt,proto3" json:"lease_expires_at,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *GetLeaseTermHighWaterResponse) Reset() {
@@ -18177,6 +18186,20 @@ func (x *GetLeaseTermHighWaterResponse) GetTerm() int64 {
 func (x *GetLeaseTermHighWaterResponse) GetHolder() string {
 	if x != nil {
 		return x.Holder
+	}
+	return ""
+}
+
+func (x *GetLeaseTermHighWaterResponse) GetLeaseHolder() string {
+	if x != nil {
+		return x.LeaseHolder
+	}
+	return ""
+}
+
+func (x *GetLeaseTermHighWaterResponse) GetLeaseExpiresAt() string {
+	if x != nil {
+		return x.LeaseExpiresAt
 	}
 	return ""
 }
@@ -30519,11 +30542,13 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1fAcknowledgeLeaseTermTieResponse\x12\"\n" +
 	"\facknowledged\x18\x01 \x01(\bR\facknowledged\"0\n" +
 	"\x1cGetLeaseTermHighWaterRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\"]\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\"\xaa\x01\n" +
 	"\x1dGetLeaseTermHighWaterResponse\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x03R\x04term\x12\x16\n" +
-	"\x06holder\x18\x03 \x01(\tR\x06holder\"\x8f\x01\n" +
+	"\x06holder\x18\x03 \x01(\tR\x06holder\x12!\n" +
+	"\flease_holder\x18\x04 \x01(\tR\vleaseHolder\x12(\n" +
+	"\x10lease_expires_at\x18\x05 \x01(\tR\x0eleaseExpiresAt\"\x8f\x01\n" +
 	"\x10RecoveryClaimKey\x12\x1f\n" +
 	"\vtarget_kind\x18\x01 \x01(\tR\n" +
 	"targetKind\x12\x1f\n" +

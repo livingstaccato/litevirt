@@ -116,7 +116,7 @@ func TestLeaseContest_ARetirementClassifiedFromAStaleReadDeclines(t *testing.T) 
 	nowRFC := leaseTestNow.Add(5 * time.Second).UTC().Format(time.RFC3339)
 	expires := leaseTestNow.Add(time.Minute).UTC().Format(time.RFC3339)
 	held, _, err := takeLeaseAndMintTerm(ctx, c, LeaseKeyFailover, "host-a", expires, nowRFC,
-		leaseTestNow.Add(5*time.Second), 1)
+		leaseTestNow.Add(5*time.Second), 1, false)
 	if err != nil {
 		t.Fatal(err)
 	}

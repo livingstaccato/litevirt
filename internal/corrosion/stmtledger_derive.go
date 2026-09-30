@@ -182,6 +182,10 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: vmStateUpdateSQL, Disposition: DispLiveRowUpdate},
 	{SQL: vmStateAtEpochSQL, Disposition: DispLiveRowUpdate},
 	{SQL: vmHostStateSQL, Disposition: DispLiveRowUpdate},
+	// The VM operation barrier claim and clear, for the same reason: the
+	// origin's Go guard reads the live row, but a receiver has only the SQL.
+	{SQL: vmOperationBeginSQL, Disposition: DispLiveRowUpdate},
+	{SQL: vmOperationClearSQL, Disposition: DispLiveRowUpdate},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes), and
 	// applied through the signature-guarded form on the receiver.
 	//

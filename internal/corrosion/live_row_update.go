@@ -45,6 +45,13 @@ import "sync"
 // update that met no row at all is still parked for the row's arrival
 // (parked_updates.go), and it is replayed through the same guarded form.
 //
+// The VM operation barrier statements (BeginVMOperation's claim, and the clear
+// CompleteVMOperation, AbortVMOperation and FailVMOperation share) have the same
+// defect on the receive side only. Their origin reads the row through a Go
+// guard with `deleted_at IS NULL`, but a receiver has only the statement: an
+// operation begun while the VM was live on its origin stamped a barrier and a
+// new spec generation onto a peer's tombstone. They are registered here too.
+//
 // Anti-entropy moves rows, not statements, so it is unaffected. It carries the
 // newer of two copies, and after this change no upgraded node makes a
 // tombstone newer by writing state onto it.
@@ -57,6 +64,8 @@ var liveRowUpdateSQLs = []string{
 	vmStateUpdateSQL,
 	vmStateAtEpochSQL,
 	vmHostStateSQL,
+	vmOperationBeginSQL,
+	vmOperationClearSQL,
 }
 
 const liveRowPredicate = " AND deleted_at IS NULL"

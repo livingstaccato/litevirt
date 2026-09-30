@@ -120,10 +120,33 @@ func (c *Client) voterConfigMergeKeepLocalRow(tx *sql.Tx, table syncTable, row [
 	// survivors never saw was decided by a majority that is now lost, and a
 	// node adopts neither row on the strength of the merge — only its own copy
 	// verifying does. Settled deterministically, so the digest converges.
+	//
+	// Except on a node that has already ADOPTED the ordinary row. A majority
+	// of the previous generation told it that row was decided; replacing it
+	// here would switch the electorate it counts under without the forced
+	// row's checks or the import, and two electorates would each decide that
+	// generation. It keeps its row, the conflict stays flagged, and
+	// ha.voter.forced reports the refusal: such a node is one the forced
+	// change named lost, or one that must be removed and reseeded
+	// (§10 item 31).
 	if changeIdx := indexOf(table.Columns, "change"); changeIdx >= 0 {
 		lf := IsForcedChange(fmt.Sprint(localRow[changeIdx]))
 		inf := IsForcedChange(fmt.Sprint(row[changeIdx]))
 		if lf != inf {
+			if inf {
+				gen, _ := strconv.ParseInt(fmt.Sprint(row[indexOf(table.Columns, "generation")]), 10, 64)
+				var adopted int64
+				if err := tx.QueryRow(`SELECT COALESCE(MAX(generation), 0) FROM local_voter_adoption`).Scan(&adopted); err != nil {
+					return true, err
+				}
+				if gen > 0 && adopted >= gen {
+					c.noteRefusedForced(gen, fmt.Sprintf("this node adopted the ordinary generation %d (%s) before "+
+						"forced generation %d (%s) reached it; it keeps the one it adopted",
+						gen, fmt.Sprint(localRow[changeIdx]), gen, fmt.Sprint(row[changeIdx])))
+					c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
+					return true, nil
+				}
+			}
 			return lf, nil
 		}
 	}

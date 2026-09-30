@@ -367,6 +367,11 @@ type Client struct {
 	// the anti-entropy merge). Unset, or returning nil, nothing verifies and
 	// a non-empty certificate is never replaced. See recovery_claims_proof.go.
 	claimCertVerifier atomic.Pointer[func() *ClaimVerifier]
+	// forcedRefused is each forced voter generation the anti-entropy merge
+	// refused because this node had already adopted an ordinary row for that
+	// generation (voterConfigMergeKeepLocalRow), for ha.voter.forced.
+	forcedRefusedMu sync.Mutex
+	forcedRefused   map[int64]string
 	// hostMembershipLive is set once a SplitHostMembership pass has completed
 	// with the gate open (also persisted under dataDir); from then on writers
 	// write host_membership and readers read it.

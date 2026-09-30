@@ -74,6 +74,26 @@ func (s *Server) checkSupersede(ctx context.Context, key corrosion.ClaimKey, ev 
 	if p.TargetKind != key.TargetKind || p.TargetName != key.TargetName || p.OwnerEpoch != fmt.Sprint(key.OwnerEpoch) {
 		return refuse("the prior value binds %s/%s@%s", p.TargetKind, p.TargetName, p.OwnerEpoch)
 	}
+	// The same generation rule a destination applies (VerifyClaimCertificate):
+	// a certificate at a generation this voter has not adopted, or one a
+	// forced reconfiguration replaced, certifies nothing here — so it cannot
+	// prove what the previous attempt decided either. The coordinator
+	// re-decides that attempt under the current generation first, which
+	// certifies the same value again, and supersedes with that.
+	adopted, err := corrosion.AdoptedVoterGeneration(ctx, s.db)
+	if err != nil {
+		return refuse("read the adopted voter generation: %v", err)
+	}
+	if prior.ConfigGeneration < 1 || prior.ConfigGeneration > adopted {
+		return refuse("the prior certificate is at voter generation %d, which this voter has not adopted (adopted %d)",
+			prior.ConfigGeneration, adopted)
+	}
+	if forced, err := corrosion.ReplacedByForcedGeneration(ctx, s.db, prior.ConfigGeneration); err != nil {
+		return refuse("%v", err)
+	} else if forced > 0 {
+		return refuse("the prior certificate is at voter generation %d, which forced generation %d replaced; "+
+			"re-decide attempt %d under the current generation", prior.ConfigGeneration, forced, want.Attempt)
+	}
 	cfg, err := corrosion.GetVoterConfig(ctx, s.db, prior.ConfigGeneration)
 	if err != nil || !cfg.Explicit() {
 		return refuse("voter generation %d, which the prior certificate names, is not a member generation here", prior.ConfigGeneration)

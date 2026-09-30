@@ -550,6 +550,9 @@ func (s *Server) applyVoterConditions(ctx context.Context) {
 		}
 	}
 	s.forced.mu.Unlock()
+	for g, d := range s.db.RefusedForcedVoterConfigs() {
+		lines[fmt.Sprintf("refused-%d", g)] = fmt.Sprintf("%s refused forced generation %d: %s", s.hostName, g, d)
+	}
 	s.applyClusterCondition(ctx, voterEvaluator, condVoterForced, voterConditionSubject, lines, hosts,
 		"the voter set was reconfigured by force: ")
 }

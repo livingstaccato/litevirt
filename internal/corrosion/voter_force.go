@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -301,4 +302,30 @@ func CertifiedProofStates(ctx context.Context, c *Client, v *ClaimVerifier, gen 
 			Value: &val, ValueDigest: cert.ValueDigest, ConfigGeneration: cert.ConfigGeneration})
 	}
 	return out, nil
+}
+
+func (c *Client) noteRefusedForced(gen int64, detail string) {
+	c.forcedRefusedMu.Lock()
+	defer c.forcedRefusedMu.Unlock()
+	if c.forcedRefused == nil {
+		c.forcedRefused = map[int64]string{}
+	}
+	if _, seen := c.forcedRefused[gen]; !seen {
+		slog.Error("voter set: refusing a FORCED voter generation over the ordinary one this node adopted",
+			"generation", gen, "detail", detail)
+	}
+	c.forcedRefused[gen] = detail
+}
+
+// RefusedForcedVoterConfigs is every forced generation the anti-entropy merge
+// refused because this node had already adopted an ordinary row for it, with
+// why. In memory: a restart re-learns it on the next merge.
+func (c *Client) RefusedForcedVoterConfigs() map[int64]string {
+	c.forcedRefusedMu.Lock()
+	defer c.forcedRefusedMu.Unlock()
+	out := make(map[int64]string, len(c.forcedRefused))
+	for g, d := range c.forcedRefused {
+		out[g] = d
+	}
+	return out
 }

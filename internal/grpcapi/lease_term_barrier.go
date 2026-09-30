@@ -146,8 +146,26 @@ type leaseBarrierEntry struct {
 type leaseBarrierSweep struct {
 	done      chan struct{}
 	startedAt time.Time
+	leaseSweepResult
+}
+
+// leaseSweepResult is one sweep's evidence: the quorum high-water threshold,
+// whether quorum was established, and the leader_election rows the answering
+// peers reported.
+type leaseSweepResult struct {
 	threshold int64
 	ok        bool
+	// rows are the peers' own leader_election rows for the key, one per
+	// answering peer that has a row and reports it (a peer on an older build
+	// reports none). Refusal evidence only, for LeaseMintClearance: a row a
+	// peer reports live is a renewal that peer has seen. The executor barrier
+	// ignores them.
+	rows []peerLeaseRow
+}
+
+// peerLeaseRow is one peer's leader_election row for a key, as it reported it.
+type peerLeaseRow struct {
+	peer, holder, expiresAt string
 }
 
 // leaseTermBarrier judges `term` against the quorum-observed high-water mark for
@@ -248,8 +266,17 @@ func (s *Server) storeLeaseThreshold(key string, threshold int64) {
 // by one node's guarded upsert plus CRDT replication, so there is no
 // intersection guarantee to lean on. Every reachable peer is asked.
 func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64, bool) {
+	r := s.sweepLeaseTerm(ctx, key)
+	return r.threshold, r.ok
+}
+
+// sweepLeaseTerm is sweepLeaseTermHighWater with the whole of the sweep's
+// evidence, including the peers' leader_election rows. The sharing rule is the
+// same for the rows as for the threshold: a joiner uses only a sweep that began
+// after it arrived, so a row it reads was reported after it started asking.
+func (s *Server) sweepLeaseTerm(ctx context.Context, key string) leaseSweepResult {
 	if s.gate == nil {
-		return 0, false
+		return leaseSweepResult{}
 	}
 
 	// The instant this caller began validating. Only evidence gathered from here
@@ -288,14 +315,14 @@ func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64
 			select {
 			case <-fl.done:
 				if !fl.startedAt.Before(arrived) {
-					return fl.threshold, fl.ok
+					return fl.leaseSweepResult
 				}
 				// Its reads began before we did. Reusing it here would accept
 				// against a bound that may already have been superseded.
 				continue
 			case <-ctx.Done():
 				// The caller gave up first. Unconfirmed, not a pass.
-				return 0, false
+				return leaseSweepResult{}
 			}
 		}
 		if s.leaseBarrierFlight == nil {
@@ -316,19 +343,19 @@ func (s *Server) sweepLeaseTermHighWater(ctx context.Context, key string) (int64
 			close(fl.done)
 		}()
 
-		fl.threshold, fl.ok = s.runLeaseTermSweep(ctx, key)
-		return fl.threshold, fl.ok
+		fl.leaseSweepResult = s.runLeaseTermSweep(ctx, key)
+		return fl.leaseSweepResult
 	}
 }
 
 // runLeaseTermSweep is one actual fan-out. Only ever called with this key's
 // in-flight slot held.
-func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool) {
+func (s *Server) runLeaseTermSweep(ctx context.Context, key string) leaseSweepResult {
 	// Reuse the quorum every other gate in this path uses. Two different quorum
 	// rules inside one failover decision would be a defect in itself.
 	state, _, needed := s.gate.QuorumProof(ctx)
 	if state != health.QuorumYes {
-		return 0, false
+		return leaseSweepResult{}
 	}
 	// HealthyPeers already excludes peers whose last probe was not healthy
 	// (capability.go filters on status plus a non-zero lastHealthyAt), so a host
@@ -344,7 +371,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 	// establish anything, so this is a refusal rather than a zero answer.
 	local, err := corrosion.CurrentLeaseTerm(sctx, s.db, key)
 	if err != nil {
-		return 0, false
+		return leaseSweepResult{}
 	}
 	// Peers that gave no answer on this node's PREVIOUS sweep for this key are
 	// probed on a short deadline rather than the full budget.
@@ -366,7 +393,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 
 	silent := s.recentlySilentPeers(peers)
 
-	highest, answers, answered := s.fanOut(sctx, key, local, peers, silent)
+	highest, answers, answered, rows := s.fanOut(sctx, key, local, peers, silent)
 
 	// A MISSING ANSWER must never be caused by our own shortcut. This used to
 	// repair only on a quorum shortfall (`answers < needed`), which left the one
@@ -406,8 +433,10 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 		// survive. The observed maximum only rises, and an answer given once is
 		// evidence however the same peer fares a moment later.
 		rctx, rcancel := context.WithTimeout(ctx, leaseBarrierBudget)
-		rHighest, _, rAnswered := s.fanOut(rctx, key, local, peers, nil)
+		rHighest, _, rAnswered, rRows := s.fanOut(rctx, key, local, peers, nil)
 		rcancel()
+		// Rows are refusal evidence, so they are a union like the coverage.
+		rows = append(rows, rRows...)
 		s.noteFullyProbed(peers, rAnswered)
 		// The repair's HIGH-WATER only ever raises the observed maximum. A term
 		// this node has already seen cannot be un-seen by a later round that
@@ -433,7 +462,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 	s.noteSilentPeers(peers, answered)
 
 	if answers < needed {
-		return 0, false
+		return leaseSweepResult{}
 	}
 
 	// An accept reached on INCOMPLETE evidence is byte-identical to one reached
@@ -455,7 +484,7 @@ func (s *Server) runLeaseTermSweep(ctx context.Context, key string) (int64, bool
 			"key", key, "accepted_term", highest, "answered", len(answered),
 			"peers", len(peers), "unanswered", strings.Join(missing, ","))
 	}
-	return highest, true
+	return leaseSweepResult{threshold: highest, ok: true, rows: rows}
 }
 
 // fanOutHighWater asks every peer for key's high-water term in parallel and
@@ -482,16 +511,18 @@ func peerTermAcceptable(local, peer int64) bool {
 
 func (s *Server) fanOut(
 	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
-) (int64, int, map[string]bool) {
+) (int64, int, map[string]bool, []peerLeaseRow) {
 	if fanOutFn != nil {
-		return fanOutFn(ctx, key, local, peers, silent)
+		// The seam models terms only; it reports no peer rows.
+		h, n, a := fanOutFn(ctx, key, local, peers, silent)
+		return h, n, a, nil
 	}
 	return s.fanOutHighWater(ctx, key, local, peers, silent)
 }
 
 func (s *Server) fanOutHighWater(
 	ctx context.Context, key string, local int64, peers []string, silent map[string]bool,
-) (highest int64, answers int, answered map[string]bool) {
+) (highest int64, answers int, answered map[string]bool, rows []peerLeaseRow) {
 	highest, answers = local, 1 // this node's own ledger is one answer
 	answered = make(map[string]bool, len(peers))
 
@@ -559,11 +590,14 @@ func (s *Server) fanOutHighWater(
 				}
 				highest = t
 			}
+			if h := resp.GetLeaseHolder(); h != "" {
+				rows = append(rows, peerLeaseRow{peer: peer, holder: h, expiresAt: resp.GetLeaseExpiresAt()})
+			}
 			mu.Unlock()
 		}(peer)
 	}
 	wg.Wait()
-	return highest, answers, answered
+	return highest, answers, answered, rows
 }
 
 // recentlySilentPeers returns the subset of peers this node remembers answering

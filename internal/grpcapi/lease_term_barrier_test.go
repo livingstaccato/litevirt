@@ -23,6 +23,9 @@ type fakeHighWaterPeer struct {
 	delay    time.Duration // block before answering, to fake an unreachable peer
 	err      error
 	requests *int64 // optional call counter
+	// leaseHolder / leaseExpires are the leader_election row this peer
+	// reports; empty is a peer with no row, or on an older build.
+	leaseHolder, leaseExpires string
 }
 
 func (f *fakeHighWaterPeer) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTermHighWaterRequest, _ ...grpc.CallOption) (*pb.GetLeaseTermHighWaterResponse, error) {
@@ -46,7 +49,8 @@ func (f *fakeHighWaterPeer) GetLeaseTermHighWater(ctx context.Context, req *pb.G
 	if f.key != "" {
 		key = f.key
 	}
-	return &pb.GetLeaseTermHighWaterResponse{Key: key, Term: f.term, Holder: "node-x"}, nil
+	return &pb.GetLeaseTermHighWaterResponse{Key: key, Term: f.term, Holder: "node-x",
+		LeaseHolder: f.leaseHolder, LeaseExpiresAt: f.leaseExpires}, nil
 }
 
 // fakePeers wires a peer-name → newest-term map.

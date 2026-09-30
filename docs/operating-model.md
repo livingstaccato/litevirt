@@ -729,6 +729,30 @@ While a claim is withheld the daemon logs `leader lease: not claiming a new term
 yet` once per key, with the reason, and logs `new-term claim cleared` when the
 claim goes through.
 
+#### A node whose lease row is behind does not depose a live holder
+
+A current ledger is not enough on its own. Whether the lease is *live* is read
+from the node's own `leader_election` row, and that row can lag the ledger:
+renewals write only `leader_election`, and anti-entropy does not carry that
+table. So a node can hold every term row and still have the holder's expiry
+from several renewals ago, or no row at all (a node that got its ledger from
+anti-entropy or a reseed). Such a node reads a live lease as lapsed. The term
+check passes, because nobody has minted the term it would claim. Minting that
+term would depose the live holder. The holder would fail closed on its next
+renewal once the term arrived, and until then both nodes would act as leader.
+
+So when a node **takes over** a lease (its own replica shows no live tenure of
+its own), the same quorum read also returns each peer's own `leader_election`
+row. The takeover is withheld while any answering peer shows the lease live for
+another holder. The holder itself answers too if it is reachable. The node
+waits until the renewal reaches it, and then defers to the holder. If the
+holder is really gone, it waits until every expiry a peer reported has passed,
+which is one TTL after the last renewal that reached anyone, as with an ordinary
+expiry. A mint over the node's own live lease (retiring a contested term) is not
+a takeover and is not held to this. A peer on an older build reports no row, so
+against that peer a takeover is judged on the term alone, as before. The
+withholding reason names the peer and the holder it reported live.
+
 #### A contested lease still converges
 
 Keeping both claims is about the *evidence*. It does not mean both claimants

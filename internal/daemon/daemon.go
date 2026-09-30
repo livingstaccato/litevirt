@@ -2467,19 +2467,21 @@ func (d *Daemon) wireClusterPolicyGate() {
 // wireLeaseMintClearance makes every new lease term wait for the quorum
 // high-water read (grpcapi.Server.LeaseMintClearance): a node must not mint
 // term N+1 from its own replica while a peer already holds N+1, which is what a
-// restarted or reconnected node's stale ledger otherwise does.
+// restarted or reconnected node's stale ledger otherwise does — nor take over a
+// lease a peer still sees live, which is what a stale leader_election row
+// otherwise does.
 //
 // Wired BEFORE any lease holder starts, and answering "not yet" until the gRPC
 // server and its gate exist. The rebalancer starts ahead of the server, and a
 // daemon's first seconds are exactly when its ledger is stalest, so an unwired
 // window here would be the bug itself.
 func (d *Daemon) wireLeaseMintClearance() {
-	d.db.SetLeaseMintClearance(func(ctx context.Context, key string, next int64) (bool, string) {
+	d.db.SetLeaseMintClearance(func(ctx context.Context, req corrosion.LeaseMintRequest) (bool, string) {
 		svc := d.mintClearance.Load()
 		if svc == nil {
 			return false, "daemon starting: the lease-term quorum read is not wired yet"
 		}
-		return svc.LeaseMintClearance(ctx, key, next)
+		return svc.LeaseMintClearance(ctx, req)
 	})
 }
 

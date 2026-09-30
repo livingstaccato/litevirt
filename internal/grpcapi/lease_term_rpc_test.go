@@ -323,6 +323,12 @@ func TestGetLeaseTermHighWater_AnswersFromTheLocalLedger(t *testing.T) {
 	if resp.GetTerm() != 2 || resp.GetHolder() != "node-b" {
 		t.Errorf("= (%d, %q), want (2, node-b)", resp.GetTerm(), resp.GetHolder())
 	}
+	// And this node's own leader_election row, raw: a peer about to take the
+	// lease over reads it as evidence of a renewal it has not received.
+	if resp.GetLeaseHolder() != "node-b" || resp.GetLeaseExpiresAt() != "2026-09-08T12:01:30Z" {
+		t.Errorf("lease row = (%q, %q), want (node-b, 2026-09-08T12:01:30Z)",
+			resp.GetLeaseHolder(), resp.GetLeaseExpiresAt())
+	}
 }
 
 // TestGetLeaseTermHighWater_EmptyLedgerIsZeroNotAnError: a node that has never

@@ -116,7 +116,8 @@ func TestRunLeaseTermSweep_RepairCannotLowerAnObservedTerm(t *testing.T) {
 	}
 	t.Cleanup(func() { fanOutFn = nil })
 
-	got, ok := s.runLeaseTermSweep(context.Background(), "failover")
+	r := s.runLeaseTermSweep(context.Background(), "failover")
+	got, ok := r.threshold, r.ok
 	if !ok {
 		t.Fatal("fixture inert: the sweep refused rather than returning a threshold")
 	}

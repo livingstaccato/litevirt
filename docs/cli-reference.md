@@ -55,6 +55,12 @@ lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by 
 lv cluster voter add <host>        # Add one voter (decided by a majority of the current generation)
 lv cluster voter rm <host>         # Remove one voter; allowed while it is unreachable
 lv cluster voter reset [--yes]     # Decided exit to the voter set derived from host state (sticky)
+lv cluster voter force-reconfigure --lost a,b [--dry-run] [--yes]
+                                   # Break-glass for a generation whose majority is gone for good:
+                                   #   every named member fenced proof-grade, refused while a majority
+                                   #   is reachable; audited, raises ha.voter.forced (§4.6 of the design)
+lv cluster claim <kind>/<name> [--epoch N]   # Every voter's recorded state for a vm/container recovery
+                                   #   claim: ballots, value, destination, source, last refusal
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 ```
 
@@ -76,6 +82,10 @@ lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host>                    # Return host to scheduling
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
+lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
+                                          #   fence, `voter rm` if it votes, revokes + publishes the CRL,
+                                          #   removes it, and reports the stranded recoveries that now retry
+                                          #   at the next claim attempt. --dry-run changes nothing
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's

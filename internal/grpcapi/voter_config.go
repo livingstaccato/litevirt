@@ -135,6 +135,33 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 		if row == nil {
 			return adopted, nil
 		}
+		if corrosion.IsForcedChange(row.Change) {
+			// A forced generation (§4.6) is checked by its own rule — the
+			// survivors' unanimous signatures, the lost hosts' fences, and this
+			// node's own probes of the lost hosts — and a member imports from
+			// every survivor rather than from a sealed majority.
+			if err := s.verifyForcedRow(ctx, prev, row); err != nil {
+				slog.Error("voter set: refusing to adopt a FORCED voter generation", "generation", row.Generation,
+					"change", row.Change, "created_by", row.CreatedBy, "error", err)
+				s.noteForcedConflict(row.Generation, err.Error())
+				return adopted, fmt.Errorf("forced generation %d: %w", row.Generation, err)
+			}
+			if _, member := row.Member(s.hostName); member {
+				n, from, err := s.importForForced(ctx, prev, row)
+				if err != nil {
+					return adopted, fmt.Errorf("adopt forced generation %d: %w", row.Generation, err)
+				}
+				slog.Warn("voter set: adopted a FORCED generation after importing claim state from every survivor",
+					"generation", row.Generation, "change", row.Change, "imported", n, "from", strings.Join(from, ","))
+			} else {
+				if err := corrosion.RecordVoterAdoption(ctx, s.db, row.Generation); err != nil {
+					return adopted, err
+				}
+				slog.Warn("voter set: adopted a FORCED generation", "generation", row.Generation, "change", row.Change,
+					"members", strings.Join(row.Names(), ","))
+			}
+			continue
+		}
 		if err := s.verifyVoterConfigRow(prev, row); err != nil {
 			slog.Error("voter set: refusing to adopt a voter generation whose certificate does not verify",
 				"generation", row.Generation, "change", row.Change, "created_by", row.CreatedBy, "error", err)
@@ -798,7 +825,8 @@ func (s *Server) voterRemovalRefusal(ctx context.Context, host string) error {
 	if _, ok := cfg.Member(host); ok {
 		return status.Errorf(codes.FailedPrecondition,
 			"%s is a member of voter generation %d; removing the host would not remove its vote. "+
-				"Run `lv cluster voter rm %s` first, then remove the host", host, cfg.Generation, host)
+				"Run `lv cluster voter rm %s` first, then remove the host — or, if it is fenced and gone for "+
+				"good, `lv host rm --dead %s`, which does both", host, cfg.Generation, host, host)
 	}
 	return nil
 }

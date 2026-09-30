@@ -211,7 +211,8 @@ When a host goes offline, the failover coordinator:
 1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1). Only fresh observations count: a `host_health` row older than 30s, or dated more than 30s ahead of the coordinator's own clock (a skewed observer), is not evidence. Both halves of that count come from one **voter set**. Until the cluster has a voter generation it is derived: every host not removed from the cluster whose state is not `offline`, `maintenance` or `fenced` (witnesses, `draining` and `upgrading` hosts vote). Once automatic genesis has run it is the adopted generation's members, whatever their state — a fenced member keeps counting until `lv cluster voter rm` removes it (see [Operating model](operating-model.md) → "The voter set is explicit once genesis has run"). n is the size of that set, and an observation counts only if its observer is in it and is not the host being judged — a fenced host that is still running, a removed host whose daemon was never stopped, or a name no host carries cannot supply a vote. Bringing a host back to `active` counts the same way. It is the same set `DecisionGate` counts its locally-probed quorum over, and if the coordinator cannot read it, it does not fence
 2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery". A node taking over the lease first confirms with a quorum of peers that none of them has already recorded the term it is about to claim, so a node that has just restarted or reconnected waits until replication catches it up (one health-probe cycle after a start, then until any newer term row arrives) instead of claiming from its stale view. See [Operating model](operating-model.md) → "A node that was away does not claim a term from a stale ledger".
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
-4. **Reschedules VMs** — based on each VM's `on-host-failure` policy
+4. **Claims the recovery** — with `enforcement.recovery_claim` on every host (see *Recovery claims* below), a majority of the voter set certifies one destination per workload before any proof is minted, so two coordinators that both believe they lead cannot both recover it
+5. **Reschedules VMs** — based on each VM's `on-host-failure` policy
 
 ### Fencing methods
 
@@ -383,6 +384,56 @@ or expect to run `lv host fence-confirm` for their failover.
 Local-disk VMs are unaffected: their transfers keep the existing quorum/proof gate
 (a `best-effort` fence is sufficient — no shared-write hazard).
 
+### Recovery claims (single-winner recovery)
+
+The leader lease cannot stop two coordinators that both believe they hold it,
+and each could otherwise mint a valid proof for its own destination: two
+writable owners of one VM (colonelpanik/litevirt#250). With
+`enforcement.recovery_claim: true` on **every** host (witnesses included) and
+the `recovery_claim_v1` token latched, a recovery is a claim decided by the
+explicit voter set before anything is minted
+([design/recovery-claims.md](design/recovery-claims.md)):
+
+- **Claim before mint.** After the fence, the coordinator proposes the
+  reschedule, promote or container-relocate proof it would mint as the value of
+  a claim keyed by the workload, its owner epoch and an attempt number, and
+  writes a proof only once a majority of voters has signed an accept for one
+  value — its own, or another coordinator's, which it writes instead, with the
+  other destination. A claim that forms no certificate mints nothing and is
+  retried on the next tick. A promote is claimed once the replica's host is
+  known; a container relocation takes one decision for both the restore and
+  its image-recreate fallback.
+- **Verify before execute.** The destination starts a recovered workload only
+  with a certificate that verifies against its own adopted voter set and the
+  cluster CA; otherwise it refuses with `recovery_claim_unproven` and the row
+  stays pending. It asks no voter to decide.
+- **The owner probe.** Each voter probes the workload's recorded owner itself
+  before it accepts, and refuses with `recovery_claim_owner_reachable` if it can
+  reach it; a voter whose settled row names a different owner refuses with
+  `recovery_claim_source_mismatch`. A host most voters can still reach is never
+  certified evicted, whatever the coordinator's own health view says. The
+  coordinator retries such a claim at the same round.
+- **A destination that dies before it acts** strands the recovery: no other
+  destination may be authorized while it might come back and execute its
+  certificate. `ha.claim.stranded` names the workload and the command. If the
+  destination is gone for good, fence it proof-grade and run
+  `lv host rm --dead <host>` (try `--dry-run` first): the voters then accept
+  "fenced, removed and revoked" as evidence and the recovery retries at the
+  next attempt. A promote that fails before `StartDomain` is abandoned by its
+  destination, which signs that it never started it, and the coordinator's
+  fallback reschedule moves on with that evidence.
+- **Diagnosis.** `lv cluster claim vm/<name>` shows every voter's promised and
+  accepted ballot, the value's destination and source, and its last refusal.
+
+Enforcement needs the flag, the latch **and** an adopted voter generation
+(`lv cluster voter ls`). The token is advertised only while the flag is on, so a
+latched token means every host opted in. Standing down is the flag off on every
+host and a restart; a host with the flag off while others enforce is the
+uncertified second owner the claims exist to prevent — it reports
+`recovery_claim_v1` in `PingResponse.not_enforcing`, and its peers raise
+`ha_degraded`. See [Operating model](operating-model.md) → "Recovery is a
+decided claim when recovery claims are enforced".
+
 ### Witness hosts (even-N quorum)
 
 For 2-node or 4-node deployments, add a vote-only witness host to break
@@ -522,7 +573,9 @@ Scrape `http://<host>:7444/metrics` for:
 - `litevirt_fence_failures_total` — cumulative non-success rows in `fencing_log`; pages should fire on any non-zero increase
 - `litevirt_failover_leader` — `1` on the host currently holding the failover lease, `0` elsewhere
 - `litevirt_failover_attempts_total{phase,result,error_class}` — failover decision points, counted by
-  `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
+  `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`,
+  and `claim` for a recovery claim, whose results are `ok`, `lost`, `no_majority`,
+  `owner_reachable`, `source_mismatch` and `superseded`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
   `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`, `local_stall`,

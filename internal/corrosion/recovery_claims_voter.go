@@ -31,6 +31,12 @@ const (
 	RefusalOwnerReachable      = "recovery_claim_owner_reachable"
 	RefusalSourceMismatch      = "recovery_claim_source_mismatch"
 	RefusalProbeUnavailable    = "recovery_claim_probe_unavailable"
+	// RefusalSupersedeUnproven: a Prepare past attempt 0 whose evidence that the
+	// value decided at the previous attempt will never execute did not check out
+	// here (§3.12) — no abandonment by its destination that verifies, and not
+	// all of "fenced proof-grade, no longer a member, revoked" in this voter's
+	// own replica. Retryable: replica lag delays a supersede, never admits one.
+	RefusalSupersedeUnproven = "recovery_claim_supersede_unproven"
 )
 
 // ClaimVoterState is one voter's recorded state for a key.
@@ -115,6 +121,15 @@ func readStandingTx(ctx context.Context, tx *LocalTx, me string) (voterStanding,
 		return st, err
 	}
 	st.sealed = len(rows) > 0
+	if !st.sealed {
+		// A survivor of a forced reconfiguration seals its generation by force
+		// (§4.6 step 1): no majority of it is left to decide a change of it.
+		rows, err = tx.Query(ctx, `SELECT 1 AS one FROM local_voter_seals WHERE generation = ?`, st.adopted)
+		if err != nil {
+			return st, err
+		}
+		st.sealed = len(rows) > 0
+	}
 	return st, nil
 }
 

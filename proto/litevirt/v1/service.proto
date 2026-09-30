@@ -35,7 +35,12 @@ message FenceHostRequest   {
     // guard before VMs are rescheduled when fence_strategy = "manual".
     bool confirm_manual_only = 3;
 }
-message RemoveHostRequest  { string name = 1; bool force = 2; }
+// dead removes a host that is fenced proof-grade and gone for good
+// (`lv host rm --dead`, docs/design/recovery-claims.md §3.12): the daemon
+// re-checks the fence and that the host is no longer a voter, and does not
+// require its workloads to be drained — they are the stranded ones, and their
+// rows stay for the recovery claims to supersede.
+message RemoveHostRequest  { string name = 1; bool force = 2; bool dead = 3; }
 message PublishCRLRequest  { string crl_pem = 1; }
 // version is the published CRL's number, echoed back because the daemon has
 // verified it by then and the caller has not. Whether the answering node had to
@@ -1662,6 +1667,14 @@ message RuntimeActionProof {
     // replicated ROW rather than a carried proof, so the row cannot be trusted
     // on the strength of some other node having checked it.
     string lease_key        = 15;
+    // claim_certificate is the recovery-claim certificate that authorizes an
+    // ownership-transfer proof (docs/design/recovery-claims.md §3.9): the JSON
+    // corrosion.ClaimCertificate, a majority of voters' signed accepts for
+    // exactly this binding. Evidence, not a binding field — the executor
+    // verifies it offline against the voter set and the cluster CA before it
+    // claims the proof, once recovery_claim_v1 is enforced. "" = none.
+    // Additive/wire-compatible.
+    string claim_certificate = 16;
 }
 
 message AcknowledgeLeaseTermTieRequest {
@@ -1753,6 +1766,110 @@ message PrepareRecoveryClaimRequest {
     RecoveryClaimKey key    = 1;
     ClaimBallot ballot      = 2;
     int64 config_generation = 3;
+    // supersede is required at attempt > 0 (§3.12): the evidence that the
+    // value decided at attempt-1 will never execute.
+    RecoveryClaimSupersede supersede = 4;
+}
+// RecoveryClaimSupersede is the evidence a Prepare at attempt n+1 carries.
+message RecoveryClaimSupersede {
+    string prior_certificate        = 1;  // JSON certificate that decided attempt n
+    RecoveryClaimValue prior_value  = 2;  // the value it decided
+    string abandonment              = 3;  // JSON signed abandonment by that value's destination; "" = it was removed
+}
+// AbandonRecoveryProofRequest asks a recovery destination to sign that it has
+// not executed, and never will, the proof a decided claim named (§3.12).
+message AbandonRecoveryProofRequest {
+    RecoveryClaimKey key = 1;
+    string proof_id      = 2;
+    string reason        = 3;
+}
+message AbandonRecoveryProofResponse {
+    string abandonment = 1;  // JSON corrosion.ClaimAbandonment
+}
+// PlanDeadHostRemovalRequest is `lv host rm --dead`'s plan (also its
+// --dry-run): what the removal would do, and the recoveries it unblocks.
+message PlanDeadHostRemovalRequest { string name = 1; }
+message StrandedRecovery {
+    string kind         = 1;  // vm | container
+    string name         = 2;
+    string detail       = 3;  // what is stranded and why
+    int64  next_attempt = 4;  // the claim attempt its recovery moves to
+}
+message ForceReconfigureVotersRequest {
+    repeated string lost = 1;   // the members of the adopted generation lost for good
+    bool   dry_run       = 2;   // run every check and print the plan, change nothing
+}
+message ForcedFenceEvidence {
+    string host      = 1;
+    string fence_id  = 2;
+    string method    = 3;
+    string result    = 4;
+    string timestamp = 5;
+}
+message ForceReconfigureVotersResponse {
+    int64  from_generation = 1;
+    int64  generation      = 2;   // the forced generation (0 on a dry run)
+    repeated string survivors = 3;
+    repeated string lost      = 4;
+    repeated ForcedFenceEvidence fences = 5;
+    int64  import_keys     = 6;   // claim keys the survivors will import
+    bool   applied         = 7;
+    string detail          = 8;
+}
+message SignForcedVoterConfigRequest {
+    int64  from_generation   = 1;
+    VoterConfigValue value   = 2;
+    repeated string lost     = 3;
+    repeated ForcedFenceEvidence fences = 4;
+}
+message SignForcedVoterConfigResponse {
+    string voter       = 1;
+    string incarnation = 2;
+    string cert_pem    = 3;
+    bytes  signature   = 4;
+}
+message InspectRecoveryClaimRequest {
+    string kind        = 1;   // vm | container
+    string name        = 2;
+    int64  owner_epoch = 3;   // -1 (default when unset by the CLI) = the row's current epoch
+    bool   epoch_set   = 4;
+}
+message RecoveryClaimVoterView {
+    string voter              = 1;
+    bool   reachable          = 2;
+    string error              = 3;
+    string promised           = 4;   // ballot, rendered
+    string accepted           = 5;
+    string value_digest       = 6;
+    string proof_id           = 7;
+    string dest_host          = 8;
+    string source_host        = 9;
+    string incarnation        = 10;
+    bool   incarnation_ok     = 11;
+    string last_refusal       = 12;
+    string last_refusal_detail = 13;
+    int64  adopted_generation = 14;
+}
+message RecoveryClaimAttemptView {
+    RecoveryClaimKey key = 1;
+    repeated RecoveryClaimVoterView voters = 2;
+    string decided_digest = 3;   // a digest a majority of members accepted, "" = none
+    string decided_dest   = 4;
+}
+message InspectRecoveryClaimResponse {
+    int64  generation = 1;
+    repeated RecoveryClaimAttemptView attempts = 2;
+    string detail     = 3;
+}
+message PlanDeadHostRemovalResponse {
+    string host              = 1;
+    bool   fenced            = 2;  // a proof-grade fence is recorded
+    string fence_detail      = 3;
+    string fence_command     = 4;  // what to run when it is not
+    bool   voter             = 5;  // a member of the adopted voter generation
+    int64  voter_generation  = 6;
+    repeated StrandedRecovery stranded = 7;
+    string host_state        = 8;
 }
 message PrepareRecoveryClaimResponse {
     bool        promised           = 1;
@@ -2715,6 +2832,23 @@ service LiteVirt {
     // imports from (§4.4). Peer-only. The first message is a header saying
     // whether the asked-for generation is frozen on this voter.
     rpc ListRecoveryClaims(ListRecoveryClaimsRequest) returns (stream RecoveryClaimState);
+    // AbandonRecoveryProof: peer-only. A recovery destination signs that it has
+    // not executed, and never will, a proof a decided claim named — refused if
+    // it may already have (§3.12).
+    rpc AbandonRecoveryProof(AbandonRecoveryProofRequest) returns (AbandonRecoveryProofResponse);
+    // PlanDeadHostRemoval reports what `lv host rm --dead` would do.
+    rpc PlanDeadHostRemoval(PlanDeadHostRemovalRequest) returns (PlanDeadHostRemovalResponse);
+    // ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):
+    // the audited break-glass for a voter generation whose majority is gone for
+    // good. Run against one survivor, which drives the rest; refused while a
+    // majority is actually reachable.
+    rpc ForceReconfigureVoters(ForceReconfigureVotersRequest) returns (ForceReconfigureVotersResponse);
+    // SignForcedVoterConfig: peer-only. A survivor checks the forced
+    // generation for itself, seals the generation it replaces, and signs.
+    rpc SignForcedVoterConfig(SignForcedVoterConfigRequest) returns (SignForcedVoterConfigResponse);
+    // InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
+    // member's recorded state for a workload's claim keys, and its last refusal.
+    rpc InspectRecoveryClaim(InspectRecoveryClaimRequest) returns (InspectRecoveryClaimResponse);
 
     // ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
     // GetVoterConfig reports the connected host's adopted voter generation and

@@ -64,7 +64,7 @@ func NewServerForTests(opts TestServerOpts) *Server {
 	// opts.DataDir/images before calling the relevant RPC.
 	imgs := image.NewStore(opts.DataDir)
 	_ = imgs.Init()
-	return &Server{
+	s := &Server{
 		hostName:       opts.HostName,
 		dataDir:        opts.DataDir,
 		pkiDir:         opts.PKIDir,
@@ -78,6 +78,8 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
+	s.wireCertificateVerifier()
+	return s
 }
 
 // RecordSelfReportedIsolationForTest drives one §A self-reported-quarantine

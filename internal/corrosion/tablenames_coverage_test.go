@@ -39,6 +39,8 @@ var antiEntropyExcluded = map[string]string{
 	"local_recovery_claims":   "v59 a voter's promises and accepts; LOCAL-only and in NO sync path. A grant is a statement about what THIS voter promised, so a replicated one would let a peer write promises on its behalf, LWW would coin-flip two of them and anti-entropy would regress a voter that was correctly ahead (docs/design/recovery-claims.md §3.8). Written only through ExecuteLocal",
 	"local_voter_incarnation": "v59 the identity of this state.db's claim state; LOCAL-only by definition — it must disappear exactly when the claim state does (§3.11)",
 	"local_voter_adoption":    "v59 which voter generations THIS node has adopted and imported claim state for; a question about this node's own voting state (§4.4)",
+	"local_abandoned_proofs":  "v61 the proofs THIS destination signed it will never execute; LOCAL-only and in NO sync path — an abandonment is this node's own promise, and one a peer could erase or plant would let it either revive a superseded recovery or refuse a live one (docs/design/recovery-claims.md §3.12). Written only through ExecuteLocal",
+	"local_voter_seals":       "v62 the voter generations THIS node sealed as a survivor of a forced reconfiguration; a statement about this voter's own promises (§4.6). Written only through ExecuteLocal",
 	"netbox_sync_queue":       "work queue for the P2 NetBox inventory mirror (v51); a LATENCY optimisation only — the periodic full sweep is the correctness mechanism, so a lost/stale queue row self-heals on the next sweep (cf. vm_events/host_runtime_usage)",
 	// (user_2fa, recovery_codes, recovery_code_sets are now in sensitiveTableNames
 	//  — schema v32 made them LWW-repairable: soft-delete + active-set pointer.)
@@ -54,6 +56,8 @@ var localOnly = map[string]bool{
 	"local_recovery_claims":   true, // v59: ExecuteLocal writes, never replicated
 	"local_voter_incarnation": true, // v59: ExecuteLocal writes, never replicated
 	"local_voter_adoption":    true, // v59: ExecuteLocal writes, never replicated
+	"local_abandoned_proofs":  true, // v61: ExecuteLocal writes, never replicated
+	"local_voter_seals":       true, // v62: ExecuteLocal writes, never replicated
 }
 
 var createTableRe = regexp.MustCompile(`CREATE TABLE IF NOT EXISTS ([a-z_0-9]+)`)

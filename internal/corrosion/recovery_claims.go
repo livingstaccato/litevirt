@@ -28,10 +28,10 @@ import (
 // key (voter_config, "", g, 0) decides generation g+1.
 const ClaimKindVoterConfig = "voter_config"
 
-// Claim target kinds a workload recovery is decided under. Nothing in this
-// release MINTS a workload claim — recovery_claim_v1 (colonelpanik/litevirt#250)
-// does — but voters already answer them, so promise history is unbroken when it
-// lands (§5.1, "Voters answer regardless of the flag").
+// Claim target kinds a workload recovery is decided under. A coordinator
+// claims one under recovery_claim_v1 before it mints the proof; voters answer
+// them whatever the flag says, so promise history is unbroken across a staged
+// rollout or a stand-down (§5.1, "Voters answer regardless of the flag").
 const (
 	ClaimKindVM        = "vm"
 	ClaimKindContainer = "container"
@@ -133,13 +133,15 @@ type VoterMember struct {
 	Incarnation string `json:"incarnation"`
 }
 
-// Voter-config change kinds (§4.1). force:<...> belongs to
-// the forced reconfiguration of design §4.6, which is not in this release.
+// Voter-config change kinds (§4.1). force:<lost,...> is the forced
+// reconfiguration of §4.6, decided by the survivors' unanimous signatures
+// rather than by a majority of the generation it replaces.
 const (
-	VoterChangeGenesis = "genesis"
-	VoterChangeReset   = "reset"
-	voterChangeAddPfx  = "add:"
-	voterChangeRmPfx   = "rm:"
+	VoterChangeGenesis  = "genesis"
+	VoterChangeReset    = "reset"
+	voterChangeAddPfx   = "add:"
+	voterChangeRmPfx    = "rm:"
+	voterChangeForcePfx = "force:"
 )
 
 // VoterChangeAdd and VoterChangeRm name a one-member change.

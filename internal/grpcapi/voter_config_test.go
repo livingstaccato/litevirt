@@ -65,7 +65,7 @@ func TestAdvertise_VoterConfigWithheldUntilReady(t *testing.T) {
 		t.Error("a node at synchronous=NORMAL advertises voter_config_v1")
 	}
 	if _, err := normal.localPrepare(context.Background(), corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVoterConfig},
-		corrosion.Ballot{Round: 1, Coordinator: normal.hostName}, 0); status.Code(err) != codes.FailedPrecondition {
+		corrosion.Ballot{Round: 1, Coordinator: normal.hostName}, 0, nil); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("a voter below FULL answered Prepare: %v", err)
 	}
 }
@@ -108,6 +108,39 @@ func TestProbeOwner_Verdicts(t *testing.T) {
 	now = now.Add(claimProbeMaxAge)
 	if reached, _ := s.probeOwner(ctx, "victim"); reached || dials.Load() != before+1 {
 		t.Fatalf("a result older than claimProbeMaxAge was reused (dials %d -> %d)", before, dials.Load())
+	}
+}
+
+// TestProbeOwner_InterruptedProbeIsReachedAndNotCached: a probe whose
+// caller's context ends mid-dial fails the dial, but that failure says nothing
+// about the source. It reads as reached, like a waiter interrupted on the
+// same probe (§10 item 9), and it is not cached: the next Accept naming the
+// source within claimProbeMaxAge probes again rather than certifying the
+// eviction on a cancelled dial.
+//
+// Mutation: cache the interrupted result — the next probe reuses "not
+// reached" and the dial count stays at one.
+func TestProbeOwner_InterruptedProbeIsReachedAndNotCached(t *testing.T) {
+	s := testServer(t)
+	now := time.Unix(1000, 0)
+	s.claims.probe.now = func() time.Time { return now }
+	var dials atomic.Int32
+	s.claims.probe.dial = func(ctx context.Context, host string) (string, error) {
+		dials.Add(1)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+	if reached, detail := s.probeOwner(ctx, "victim"); !reached || !strings.Contains(detail, "interrupted") {
+		t.Fatalf("an interrupted probe read as %v %q, want reached and interrupted", reached, detail)
+	}
+	s.claims.probe.dial = func(context.Context, string) (string, error) {
+		dials.Add(1)
+		return "", errors.New("connection refused")
+	}
+	if reached, _ := s.probeOwner(context.Background(), "victim"); reached || dials.Load() != 2 {
+		t.Fatalf("the interrupted result was cached: reached=%v dials=%d, want a fresh probe", reached, dials.Load())
 	}
 }
 

@@ -108,6 +108,29 @@ func WriteVoterConfig(ctx context.Context, c *Client, v VoterConfigValue, cert C
 		v.Generation, string(mj), MembersHash(members), v.Change, cj, v.CreatedBy, v.CreatedAt, c.NowTS())
 }
 
+// WriteForcedVoterConfig records a forced generation (§4.6): the same row and
+// statement as WriteVoterConfig, with the survivors' evidence in the
+// certificate column in place of a claim certificate.
+func WriteForcedVoterConfig(ctx context.Context, c *Client, v VoterConfigValue, ev ForcedVoterEvidence) error {
+	if !c.MayWriteVoterConfigs() {
+		return ErrVoterConfigGateClosed
+	}
+	if !IsForcedChange(v.Change) {
+		return fmt.Errorf("generation %d is not a forced change (%q)", v.Generation, v.Change)
+	}
+	members := SortMembers(v.Members)
+	mj, err := json.Marshal(members)
+	if err != nil {
+		return err
+	}
+	ej, err := ev.Encode()
+	if err != nil {
+		return err
+	}
+	return c.Execute(ctx, insertVoterConfigSQL,
+		v.Generation, string(mj), MembersHash(members), v.Change, ej, v.CreatedBy, v.CreatedAt, c.NowTS())
+}
+
 func scanVoterConfig(r Row) (*VoterConfig, error) {
 	var members []VoterMember
 	if s := r.String("members_json"); s != "" {
@@ -242,6 +265,28 @@ func ListVoterAdoptions(ctx context.Context, c *Client) ([]VoterAdoption, error)
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// IsForcedChange reports whether a generation's change is a forced
+// reconfiguration (force:<lost,...>, §4.6).
+func IsForcedChange(change string) bool { return strings.HasPrefix(change, voterChangeForcePfx) }
+
+// ReplacedByForcedGeneration returns the lowest ADOPTED forced generation above
+// gen, 0 when none. A generation at or below a forced one certifies nothing any
+// more (§3.10 step 4): the forced change could not keep its majority
+// intersecting the one it replaced, so a value certified before it executes
+// only once it is re-certified after it.
+func ReplacedByForcedGeneration(ctx context.Context, c *Client, gen int64) (int64, error) {
+	rows, err := c.Query(ctx, `SELECT COALESCE(MIN(v.generation), 0) AS g FROM voter_configs v
+		WHERE v.deleted_at IS NULL AND v.generation > ? AND v.change LIKE 'force:%'
+		  AND v.generation <= (SELECT COALESCE(MAX(generation), 0) FROM local_voter_adoption)`, gen)
+	if err != nil {
+		return 0, fmt.Errorf("read forced voter generations: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	return rows[0].Int64("g"), nil
 }
 
 // ExpectedVoterConfigCertificate is what the certificate deciding next must

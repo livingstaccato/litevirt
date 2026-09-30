@@ -131,7 +131,11 @@ Hardening features are gated on cluster-wide capability tokens
   honouring it — where a flag-off peer would corrupt rather than merely be
   permissive. `advertisedCapabilities` is the authority on the list
   (operation_protocol_v1, isolation_epoch_v1, owner_epoch_v1 and the others
-  named there); for those, a latched token DOES mean config uniformity.
+  named there, `recovery_claim_v1` among them); for those, a latched token
+  DOES mean config uniformity. `recovery_claim_v1` is also withheld until the
+  node is ready (`grpcapi.RecoveryClaimReadiness`), and nothing enforces it
+  until the flag, the latch AND an adopted voter generation all hold
+  (docs/design/recovery-claims.md §5).
   **Ask where the guarantee is enforced before adding one.** A guarantee
   enforced at the point a dangerous action is CREATED does not need the peer
   to enforce anything, so withholding buys no safety and costs a great deal
@@ -199,7 +203,8 @@ There are exceptions, of two different kinds, and neither is "the one":
 
 Some mandatory tokens are additionally `capabilities.ReplicationGated`
 (`lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
-`failover_scope_v1`, `voter_config_v1`; the set is
+`failover_scope_v1`, `voter_config_v1`, plus the flag-gated `recovery_claim_v1`,
+the one member that is not mandatory; the set is
 `capabilities.replicationGated`): the latch is a claim about what every host
 still receiving replication can *decode* or *read*, so it is confirmed against
 admitted memberlist membership — not merely against voting-eligible members. A

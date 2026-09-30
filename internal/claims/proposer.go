@@ -5,10 +5,10 @@
 //
 // It knows nothing about transport or storage. The voter's rules live in
 // internal/corrosion; the server supplies a Transport that reaches each voter
-// (its own voter locally, peers over the claim RPCs). The failover coordinator
-// is the other intended caller, once recovery_claim_v1 claims recoveries
-// (colonelpanik/litevirt#250); today the voter-config changes are the only
-// decisions routed through it.
+// (its own voter locally, peers over the claim RPCs). Its callers are the
+// voter-config changes and, under recovery_claim_v1
+// (colonelpanik/litevirt#250), every recovery the failover coordinator
+// authorizes.
 package claims
 
 import (
@@ -27,7 +27,9 @@ import (
 // Transport reaches one voter. An error is "no answer": the voter counts toward
 // neither side.
 type Transport interface {
-	Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64) (corrosion.PrepareResult, error)
+	// Prepare carries ev, the supersede evidence a key at attempt > 0 needs
+	// (docs/design/recovery-claims.md §3.12); nil otherwise.
+	Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64, ev *corrosion.SupersedeEvidence) (corrosion.PrepareResult, error)
 	Accept(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, v corrosion.ClaimValue, gen int64) (corrosion.AcceptResult, error)
 }
 
@@ -49,6 +51,17 @@ type Spec struct {
 	StartRound uint64
 	// MaxRounds bounds how many ballots one Decide tries. 0 → 8.
 	MaxRounds int
+	// ReuseRound lets the FIRST ballot reuse StartRound even though this
+	// process has used it for the key before — as long as the value it ends up
+	// sending in phase 2 is the one it sent at that round last time (the
+	// per-round binding below refuses anything else and raises the round).
+	// It is how a coordinator retries a claim the voters refused because the
+	// owner was still reachable without raising its round: nothing was
+	// contending, so nothing should have to outrank it (§3.13 step 6).
+	ReuseRound bool
+	// Supersede is the evidence, sent with every Prepare, that the value
+	// decided at Key.Attempt-1 will never execute. Required at attempt > 0.
+	Supersede *corrosion.SupersedeEvidence
 }
 
 // Outcome is a decided value and the certificate that proves it.
@@ -56,8 +69,11 @@ type Outcome struct {
 	Value       corrosion.ClaimValue
 	Digest      string
 	Certificate corrosion.ClaimCertificate
-	// Ours reports whether the decided value is the one Propose built. When it
-	// is not, another proposer's value was chosen and this call completed it.
+	// Ours reports whether the decided value is one Propose built during this
+	// Decide — in the deciding round, or in an earlier round whose phase 2
+	// reached a voter before a higher ballot outranked it, so the value came
+	// back in a promise. When it is not, another proposer's value was chosen
+	// and this call completed it.
 	Ours bool
 }
 
@@ -105,28 +121,62 @@ type Proposer struct {
 	nonce []byte
 	mu    sync.Mutex
 	used  map[corrosion.ClaimKey]uint64
+	// bound is the value digest this process has sent in phase 2 at each
+	// (key, round). A ballot is bound to one value (§3.2): a second value at a
+	// bound round is refused before it is sent, and the proposer moves up.
+	bound map[corrosion.ClaimKey]map[uint64]string
 }
 
 // NewProposer draws the process's boot nonce.
 func NewProposer(self string, t Transport) *Proposer {
-	return &Proposer{Self: self, Transport: t, nonce: corrosion.NewBootNonce(), used: map[corrosion.ClaimKey]uint64{}}
+	return &Proposer{Self: self, Transport: t, nonce: corrosion.NewBootNonce(), used: map[corrosion.ClaimKey]uint64{},
+		bound: map[corrosion.ClaimKey]map[uint64]string{}}
 }
 
 // Nonce is this process's boot nonce.
 func (p *Proposer) Nonce() []byte { return append([]byte(nil), p.nonce...) }
 
 // ballot allocates a round at or above want that this process has not used for
-// key before.
-func (p *Proposer) ballot(key corrosion.ClaimKey, want uint64) corrosion.Ballot {
+// key before — or, with reuse, want itself when it is exactly the last round
+// used for key; bind then guarantees the reused round carries the same value.
+func (p *Proposer) ballot(key corrosion.ClaimKey, want uint64, reuse bool) corrosion.Ballot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	r := want
-	if last := p.used[key]; r <= last {
+	last := p.used[key]
+	switch {
+	case reuse && want > 0 && want == last:
+	case r <= last:
 		r = last + 1
 	}
 	p.used[key] = r
 	return corrosion.Ballot{Round: r, Coordinator: p.Self, Nonce: append([]byte(nil), p.nonce...)}
 }
+
+// bind records that phase 2 at (key, round) carries digest, and refuses a
+// different digest at a round already bound. It is what makes reusing a round
+// safe: one ballot, one value, across calls as well as within one.
+func (p *Proposer) bind(key corrosion.ClaimKey, round uint64, digest string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.bound == nil {
+		p.bound = map[corrosion.ClaimKey]map[uint64]string{}
+	}
+	byRound := p.bound[key]
+	if byRound == nil {
+		byRound = map[uint64]string{}
+		p.bound[key] = byRound
+	}
+	if d, ok := byRound[round]; ok && d != digest {
+		return false
+	}
+	byRound[round] = digest
+	return true
+}
+
+// errBallotBound is try's answer when the round it holds was bound to another
+// value in this process; Decide moves to a higher round.
+var errBallotBound = errors.New("claims: ballot already bound to another value in this process")
 
 func (p *Proposer) callTimeout() time.Duration {
 	if p.CallTimeout > 0 {
@@ -159,6 +209,9 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 		round = 1
 	}
 	var lastErr error
+	// own is every value digest Propose built during this Decide, so a value
+	// re-learned from a promise can be recognised as this call's own.
+	own := map[string]bool{}
 	for attempt := 0; attempt < maxRounds; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
@@ -166,8 +219,8 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 			}
 			return Outcome{}, err
 		}
-		b := p.ballot(spec.Key, round)
-		out, stale, err := p.try(ctx, spec, b)
+		b := p.ballot(spec.Key, round, spec.ReuseRound && attempt == 0)
+		out, stale, err := p.try(ctx, spec, b, own)
 		if err == nil {
 			return out, nil
 		}
@@ -189,7 +242,7 @@ func (p *Proposer) Decide(ctx context.Context, spec Spec) (Outcome, error) {
 
 // try runs both phases at one ballot. stale is the highest promise a voter
 // refused us with, zero when no refusal was about the ballot.
-func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot) (Outcome, corrosion.Ballot, error) {
+func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot, own map[string]bool) (Outcome, corrosion.Ballot, error) {
 	var stale corrosion.Ballot
 	noteStale := func(reason string, promised corrosion.Ballot) {
 		if reason == corrosion.RefusalBallotStale && corrosion.CompareBallots(promised, stale) > 0 {
@@ -230,6 +283,15 @@ func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot) (Outc
 	digest, err := value.Digest()
 	if err != nil {
 		return Outcome{}, corrosion.Ballot{}, err
+	}
+	if ours {
+		own[digest] = true
+	} else {
+		ours = own[digest]
+	}
+	if !p.bind(spec.Key, b.Round, digest) {
+		// A reused round that would carry another value: move above it.
+		return Outcome{}, b, errBallotBound
 	}
 
 	// Phase 2.
@@ -279,7 +341,7 @@ func (p *Proposer) prepareAll(ctx context.Context, spec Spec, b corrosion.Ballot
 			defer wg.Done()
 			cctx, cancel := context.WithTimeout(ctx, p.callTimeout())
 			defer cancel()
-			res, err := p.Transport.Prepare(cctx, voter, spec.Key, b, spec.Generation)
+			res, err := p.Transport.Prepare(cctx, voter, spec.Key, b, spec.Generation, spec.Supersede)
 			mu.Lock()
 			defer mu.Unlock()
 			switch {

@@ -115,6 +115,41 @@ func (c *Client) voterConfigMergeKeepLocalRow(tx *sql.Tx, table syncTable, row [
 		}
 		return fmt.Sprint(localRow[updatedAtIdx]) >= fmt.Sprint(row[updatedAtIdx]), nil
 	}
+	// A forced generation replaces an ordinary row for the same generation
+	// (docs/design/recovery-claims.md §4.1, §4.6): an ordinary g+1 the
+	// survivors never saw was decided by a majority that is now lost, and a
+	// node adopts neither row on the strength of the merge — only its own copy
+	// verifying does. Settled deterministically, so the digest converges.
+	//
+	// Except on a node that has already ADOPTED the ordinary row. A majority
+	// of the previous generation told it that row was decided; replacing it
+	// here would switch the electorate it counts under without the forced
+	// row's checks or the import, and two electorates would each decide that
+	// generation. It keeps its row, the conflict stays flagged, and
+	// ha.voter.forced reports the refusal: such a node is one the forced
+	// change named lost, or one that must be removed and reseeded
+	// (§10 item 31).
+	if changeIdx := indexOf(table.Columns, "change"); changeIdx >= 0 {
+		lf := IsForcedChange(fmt.Sprint(localRow[changeIdx]))
+		inf := IsForcedChange(fmt.Sprint(row[changeIdx]))
+		if lf != inf {
+			if inf {
+				gen, _ := strconv.ParseInt(fmt.Sprint(row[indexOf(table.Columns, "generation")]), 10, 64)
+				var adopted int64
+				if err := tx.QueryRow(`SELECT COALESCE(MAX(generation), 0) FROM local_voter_adoption`).Scan(&adopted); err != nil {
+					return true, err
+				}
+				if gen > 0 && adopted >= gen {
+					c.noteRefusedForced(gen, fmt.Sprintf("this node adopted the ordinary generation %d (%s) before "+
+						"forced generation %d (%s) reached it; it keeps the one it adopted",
+						gen, fmt.Sprint(localRow[changeIdx]), gen, fmt.Sprint(row[changeIdx])))
+					c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
+					return true, nil
+				}
+			}
+			return lf, nil
+		}
+	}
 	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
 	return true, nil
 }
@@ -1302,6 +1337,19 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	}
 
 	keepLocal := proofMergeKeepLocal(localStatus, localTS, incomingStatus, incomingTS)
+	// Two copies of ONE proof — the same binding, at the same status and the
+	// same updated_at — that differ elsewhere converge on the greater encoding
+	// rather than each keeping its own. That is the shape a recovery claim
+	// produces on purpose: a coordinator that loses a claim re-materializes the
+	// winner's proof (docs/design/recovery-claims.md §3.13 step 5) with its own
+	// created_at and without the winner's evidence fields, and the winner's
+	// lifecycle UPDATEs then stamp both copies with one updated_at. Keeping
+	// local on that exact tie left the two replicas' digests apart forever. A
+	// copy that binds something ELSE is never taken this way.
+	if localStatus == incomingStatus && lwwOrder(localTS, incomingTS) == 0 &&
+		proofBindingCellsEqual(table.Columns, localRow, row) {
+		keepLocal = proofRowEncoding(localRow) >= proofRowEncoding(row)
+	}
 	// Forward-only step_state in BOTH directions: whichever row wins, the merge must
 	// not drop a checkpoint the other side already recorded — losing "started" would
 	// let a promote resume destroy a running domain.
@@ -1323,7 +1371,55 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 			}
 		}
 	}
+	// The claim certificate is evidence, merged like step_state: whichever row
+	// wins the lifecycle merge carries the better of the two certificates
+	// (betterClaimCertificate), so a row that gained one — or a
+	// re-certification — is never lost to a copy without it, and two replicas
+	// holding different certificates for one decision converge on one.
+	if certIdx := indexOf(table.Columns, "claim_certificate"); certIdx >= 0 {
+		lc, _ := localRow[certIdx].(string)
+		ic, _ := row[certIdx].(string)
+		best := betterClaimCertificate(lc, ic, func(raw string) bool { return c.certificateVerifiesTx(tx, raw) })
+		if !keepLocal {
+			row[certIdx] = best
+		} else if best != lc {
+			if err := c.updateProofClaimCertificateLocal(tx, table.Name, pkCols, pkIdx, row, best); err != nil {
+				return false, err
+			}
+		}
+	}
 	return keepLocal, nil
+}
+
+// proofBindingColumns are the runtime_action_proofs columns ProofBindingEqual
+// compares.
+var proofBindingColumns = []string{"action", "target_kind", "target_name", "dest_host", "coordinator",
+	"relocation_token", "fence_epoch", "owner_epoch", "lease_term", "lease_key"}
+
+// proofBindingCellsEqual is ProofBindingEqual over two dumped rows. A binding
+// column one side lacks compares as unequal: an incomplete dump cannot prove
+// two rows are one proof.
+func proofBindingCellsEqual(cols []string, a, b []interface{}) bool {
+	for _, name := range proofBindingColumns {
+		i := indexOf(cols, name)
+		if i < 0 || i >= len(a) || i >= len(b) {
+			return false
+		}
+		if fmt.Sprint(a[i]) != fmt.Sprint(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// proofRowEncoding is a total order over dumped rows for the tie-break above.
+func proofRowEncoding(row []interface{}) string {
+	var sb strings.Builder
+	for _, v := range row {
+		sb.WriteString(fmt.Sprint(v))
+		sb.WriteByte(0)
+	}
+	return sb.String()
 }
 
 // updateProofStepState folds a unioned step_state back into the surviving local row

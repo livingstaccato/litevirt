@@ -26,6 +26,8 @@ var nodeLocalClaimTables = map[string]bool{
 	"local_recovery_claims":   true,
 	"local_voter_incarnation": true,
 	"local_voter_adoption":    true,
+	"local_abandoned_proofs":  true,
+	"local_voter_seals":       true,
 }
 
 // IsNodeLocalClaimTable reports whether ExecuteLocal may write table. Exported

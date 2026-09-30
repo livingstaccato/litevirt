@@ -44,6 +44,10 @@ type memTransport struct {
 	rng     *rand.Rand
 	accepts []acceptEvent
 	down    map[string]bool
+	// probe is every voter's owner probe; nil reaches nothing.
+	probe corrosion.OwnerProbe
+	// beforeAccept, when set, runs before every Accept is delivered.
+	beforeAccept func(voter string, b corrosion.Ballot)
 }
 
 var dbSeq atomic.Int64
@@ -127,7 +131,7 @@ func (m *memTransport) fault(voter string) error {
 
 func unreachable(context.Context, string) (bool, string) { return false, "" }
 
-func (m *memTransport) Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64) (corrosion.PrepareResult, error) {
+func (m *memTransport) Prepare(ctx context.Context, voter string, key corrosion.ClaimKey, b corrosion.Ballot, gen int64, _ *corrosion.SupersedeEvidence) (corrosion.PrepareResult, error) {
 	if err := m.fault(voter); err != nil {
 		return corrosion.PrepareResult{}, err
 	}
@@ -146,7 +150,17 @@ func (m *memTransport) Accept(ctx context.Context, voter string, key corrosion.C
 		return corrosion.AcceptResult{}, err
 	}
 	mv := m.voters[voter]
-	res, err := mv.db.ClaimAccept(ctx, key, b, v, gen, mv.signer, unreachable)
+	probe := corrosion.OwnerProbe(unreachable)
+	m.mu.Lock()
+	if m.probe != nil {
+		probe = m.probe
+	}
+	hook := m.beforeAccept
+	m.mu.Unlock()
+	if hook != nil {
+		hook(voter, b)
+	}
+	res, err := mv.db.ClaimAccept(ctx, key, b, v, gen, mv.signer, probe)
 	if err == nil && res.Accepted {
 		m.mu.Lock()
 		m.accepts = append(m.accepts, acceptEvent{voter: voter, ballot: b, digest: res.Accept.ValueDigest})
@@ -311,6 +325,53 @@ func TestProposer_DuellingProposersConverge(t *testing.T) {
 	}
 }
 
+// TestProposer_RelearningItsOwnValueIsOurs: a proposer whose phase 2 reached
+// one voter before another proposer's Prepare outranked it retries higher,
+// finds its OWN value accepted in a promise and re-proposes it. The decided
+// value is the one it built, so the outcome is Ours — a caller that reads
+// !Ours as "another coordinator won" would otherwise count its own recovery
+// lost, and in a duel neither side would report the win.
+//
+// Mutation: report Ours only for a value built in the deciding round (the
+// old rule) — Ours is false.
+func TestProposer_RelearningItsOwnValueIsOurs(t *testing.T) {
+	tr, voters := newMemCluster(t, "a", "b", "c")
+	all := names(voters)
+	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "vm-relearn", OwnerEpoch: 1}
+	var once sync.Once
+	tr.beforeAccept = func(_ string, b corrosion.Ballot) {
+		if b.Round != 1 {
+			return
+		}
+		// Before any round-1 Accept lands, another proposer promises round 2
+		// on b and c: only a accepts round 1.
+		once.Do(func() {
+			rival := corrosion.Ballot{Round: 2, Coordinator: "rival", Nonce: []byte{7}}
+			for _, v := range []string{"b", "c"} {
+				if _, err := tr.voters[v].db.ClaimPrepare(context.Background(), key, rival, 1); err != nil {
+					t.Errorf("rival prepare on %s: %v", v, err)
+				}
+			}
+		})
+	}
+	p := NewProposer("a", tr)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := p.Decide(ctx, workloadSpec(key, all, "a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Value.Proof.DestHost != "a" {
+		t.Fatalf("decided %s, want the proposer's own value", out.Value.Proof.DestHost)
+	}
+	if out.Certificate.Ballot.Round < 3 {
+		t.Fatalf("decided at round %d; the scenario needs a retry above the rival", out.Certificate.Ballot.Round)
+	}
+	if !out.Ours {
+		t.Fatal("the proposer re-learned and decided its own value, and reported it as another's")
+	}
+}
+
 // TestProposer_SplitVoteWithDeadVoterResolves is the harness scenario (§3.16):
 // config {a, b, victim}, the victim dead, and each coordinator's own voter has
 // already promised a ballot far above the proposer's lease-term seed (a
@@ -351,6 +412,58 @@ func TestProposer_SplitVoteWithDeadVoterResolves(t *testing.T) {
 	}
 }
 
+// TestProposer_OwnerRefusalRetriesAtTheSameRound: a claim the voters refused
+// because the owner was still reachable is retried at the SAME round with the
+// same value — nothing was contending, so nothing should have to outrank it —
+// and a different value at that round is never sent: the round is bound to
+// the value it carried (§3.2, §3.13 step 6).
+//
+// Mutations: drop the reuse arm in ballot — the retry moves up a round; drop
+// the bind check in try — the second value is sent at the bound round.
+func TestProposer_OwnerRefusalRetriesAtTheSameRound(t *testing.T) {
+	ctx := context.Background()
+	tr, vs := newMemCluster(t, "a", "b", "c")
+	var reached atomic.Bool
+	reached.Store(true)
+	tr.probe = func(context.Context, string) (bool, string) { return reached.Load(), "answered" }
+	p := NewProposer("a", tr)
+
+	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "same", OwnerEpoch: 1}
+	spec := workloadSpec(key, names(vs), "a")
+	spec.StartRound, spec.ReuseRound, spec.MaxRounds = 5, true, 1
+	var nm *NoMajorityError
+	if _, err := p.Decide(ctx, spec); !errors.As(err, &nm) {
+		t.Fatalf("with the owner reachable the claim must form no certificate: %v", err)
+	}
+	reached.Store(false)
+	out, err := p.Decide(ctx, spec)
+	if err != nil {
+		t.Fatalf("the retry once the owner is gone: %v", err)
+	}
+	if out.Certificate.Ballot.Round != 5 {
+		t.Fatalf("the retry decided at round %d, want the same round 5", out.Certificate.Ballot.Round)
+	}
+
+	// Another value at a bound round moves up rather than reuse it.
+	key2 := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "other", OwnerEpoch: 1}
+	first := workloadSpec(key2, names(vs), "a")
+	first.StartRound, first.ReuseRound, first.MaxRounds = 5, true, 1
+	reached.Store(true)
+	if _, err := p.Decide(ctx, first); !errors.As(err, &nm) {
+		t.Fatalf("with the owner reachable the claim must form no certificate: %v", err)
+	}
+	reached.Store(false)
+	second := workloadSpec(key2, names(vs), "b")
+	second.StartRound, second.ReuseRound, second.MaxRounds = 5, true, 3
+	out, err = p.Decide(ctx, second)
+	if err != nil {
+		t.Fatalf("a new value after a refusal: %v", err)
+	}
+	if out.Certificate.Ballot.Round <= 5 {
+		t.Fatalf("a second value was decided at bound round %d", out.Certificate.Ballot.Round)
+	}
+}
+
 // TestProposer_BallotNeverReusedInProcess: two concurrent Decide calls on one
 // key in one process never share a ballot (§3.2).
 func TestProposer_BallotNeverReusedInProcess(t *testing.T) {
@@ -358,7 +471,7 @@ func TestProposer_BallotNeverReusedInProcess(t *testing.T) {
 	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "x", OwnerEpoch: 1}
 	seen := map[uint64]bool{}
 	for i := 0; i < 10; i++ {
-		b := p.ballot(key, 3)
+		b := p.ballot(key, 3, false)
 		if seen[b.Round] {
 			t.Fatalf("round %d handed out twice", b.Round)
 		}

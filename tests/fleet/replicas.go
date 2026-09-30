@@ -75,6 +75,14 @@ type LinkFault struct {
 	// independently of replication: a claim RPC is ordinary gRPC, and a
 	// scenario needs to reach a voter by one and not the other.
 	BlockClaims bool
+	// BlockProbe refuses the Ping a voter's owner probe dials
+	// (docs/design/recovery-claims.md §3.5.1) on the link. Directed, like
+	// every fault here: SetLinkFault(voter, owner, LinkFault{BlockProbe:
+	// true}) makes owner unreachable to that one voter and to nobody else.
+	BlockProbe bool
+	// ProbeDelay holds each Ping on the link before it is answered — an owner
+	// that is slow to answer, or a probe that has to wait out its timeout.
+	ProbeDelay time.Duration
 }
 
 // LinkStats counts what the injector did on one directed link.
@@ -86,6 +94,7 @@ type LinkStats struct {
 	Reordered  int // batches held back and delivered later
 	Blocked    int // replication RPCs of any kind refused by Block
 	HeldFailed int // held batches whose late delivery the handler refused
+	Pings      int // Ping calls that reached the injector (an owner probe is one)
 }
 
 // heldPush is a batch the Reorder fault is sitting on.
@@ -186,19 +195,31 @@ var claimMethods = map[string]bool{
 	"ListRecoveryClaims":   true,
 }
 
-// claimBlocked reports whether BlockClaims refuses caller's claim RPC into n.
+// claimBlocked reports whether BlockClaims refuses caller's claim RPC into n,
+// or BlockProbe the Ping an owner probe dials.
 func (n *Node) claimBlocked(fullMethod string, caller string) bool {
-	if !claimMethods[methodName(fullMethod)] || caller == "" {
+	m := methodName(fullMethod)
+	if (!claimMethods[m] && m != "Ping") || caller == "" {
 		return false
 	}
 	n.faults.mu.Lock()
 	defer n.faults.mu.Unlock()
 	ls := n.faults.links[caller]
-	if ls == nil || !ls.fault.BlockClaims {
+	if ls == nil || (claimMethods[m] && !ls.fault.BlockClaims) || (m == "Ping" && !ls.fault.BlockProbe) {
 		return false
 	}
 	ls.stats.Blocked++
 	return true
+}
+
+// Kill takes n out of the cluster as a powered-off host is: replication,
+// claim RPCs and the owner probe all fail in both directions.
+func (c *Cluster) Kill(n *Node) {
+	for _, o := range c.Nodes {
+		if o != n {
+			c.SetLinkFaultBoth(n, o, LinkFault{Block: true, BlockClaims: true, BlockProbe: true})
+		}
+	}
 }
 
 // linkBlocked reports whether the Block fault refuses caller's replication RPCs
@@ -234,6 +255,25 @@ func (n *Node) deliverHeld(from string, held []heldPush) {
 // faultUnaryInterceptor applies the link fault to PushMutations. Block is
 // handled by the partition interceptor ahead of it, for every replication RPC.
 func (n *Node) faultUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	if methodName(info.FullMethod) == "Ping" {
+		if from := peerCertCN(ctx); from != "" {
+			n.faults.mu.Lock()
+			ls := n.link(from)
+			ls.stats.Pings++
+			delay := ls.fault.ProbeDelay
+			n.faults.mu.Unlock()
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
+					return nil, status.FromContextError(ctx.Err()).Err()
+				}
+			}
+		}
+		return handler(ctx, req)
+	}
 	if methodName(info.FullMethod) != "PushMutations" {
 		return handler(ctx, req)
 	}
@@ -481,6 +521,12 @@ func (c *Cluster) NewCoordinators(clock *VirtualClock) *Coordinators {
 		// daemon wires it. Inert until a scenario opens the voter_configs
 		// gate (OpenVoterConfigGate).
 		coord.VoterGenesis = n.Server.VoterGenesisTick
+		// Recovery claims, wired as the daemon wires them: the server is the
+		// claimer and its predicate decides whether to claim. Inert until a
+		// scenario enables them (enableRecoveryClaims).
+		coord.Claimer = n.Server
+		coord.RecoveryClaimEnforced = n.Server.RecoveryClaimEnforced
+		coord.ClaimHealth = n.Server.RecoveryClaimHealthTick
 		cs.ByNode[n.Name] = coord
 	}
 	return cs

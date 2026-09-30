@@ -520,6 +520,23 @@ type EnforcementConfig struct {
 	// Plan the rollback path accordingly: it is a per-node config-and-restart
 	// roll, not a switch.
 	LeaseTerm bool `yaml:"lease_term,omitempty"`
+	// RecoveryClaim opts this node into single-winner recovery claims
+	// (capabilities.RecoveryClaimV1, docs/design/recovery-claims.md): its
+	// failover coordinator collects a majority certificate from the voter set
+	// before it mints a reschedule, promote or relocate proof, and its
+	// executors verify that certificate before they act on one. Enforcement is
+	// this flag AND the recovery_claim_v1 latch AND an adopted voter
+	// generation with members.
+	//
+	// The token is advertised only while this flag is on, so the latch means
+	// CONFIG uniformity: a flag-off node would mint an uncertified proof or
+	// start one, which is the second owner the others are protecting against.
+	// Enable on every host, witnesses included. Turning it off everywhere and
+	// restarting returns recovery to the pre-claim behaviour; voters keep
+	// answering and keep their history either way. Off on SOME hosts is the
+	// hazard, not a degraded mode: those hosts report the token in
+	// PingResponse.not_enforcing and their peers raise ha_degraded.
+	RecoveryClaim bool `yaml:"recovery_claim,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched
 	// cluster-wide, this node REFUSES replication from any host recorded with a

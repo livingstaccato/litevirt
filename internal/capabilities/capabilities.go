@@ -221,6 +221,40 @@ const (
 	// host on the previous build included.
 	VoterConfigV1 = "voter_config_v1"
 
+	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
+	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
+	// colonelpanik/litevirt#250): a failover coordinator collects a majority
+	// certificate from the voter set before it mints a reschedule, promote or
+	// relocate proof, and a destination verifies that certificate before it
+	// executes one. The voter side — answering Prepare / Accept — is
+	// voter_config_v1's and runs whatever this token says.
+	//
+	// Config-gated (enforcement.recovery_claim) and advertised CONDITIONALLY on
+	// that flag, like operation_protocol_v1, and the reason is where the
+	// guarantee is enforced. It is enforced at EXECUTION: a coordinator cannot
+	// stop another coordinator from creating a transfer, so every flag-on node
+	// relies on every peer claiming before it mints and verifying before it
+	// executes. A flag-off coordinator mints an uncertified proof and a
+	// flag-off destination starts one — either way it is the second owner the
+	// flag-on nodes did everything right to prevent. So the latch must mean
+	// CONFIG uniformity, not just a uniform build, which is the opposite of
+	// shared_storage_fence_v1 (enforced where a transfer is CREATED, so no node
+	// relies on a peer). TestAdvertise_RecoveryClaimWithheldWhileOff pins it.
+	//
+	// It is advertised only when the flag is on AND this node is READY
+	// (grpcapi.RecoveryClaimReadiness, local reads only): split_brain_gate_v1
+	// has latched — the certificate rides on a runtime-action proof — and this
+	// node can vote durably (voter_config_v1 readiness).
+	//
+	// ReplicationGated: latching it permits emitting the new statement shapes
+	// of runtime_action_proofs.claim_certificate (schema v60), which a
+	// previous-release peer has no ledger entry for.
+	//
+	// Not mandatory: it states a policy, and a policy needs a flag to turn off
+	// in an incident. Enforcement is the flag AND Enforced(recovery_claim_v1)
+	// AND an adopted voter generation with members.
+	RecoveryClaimV1 = "recovery_claim_v1"
+
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
 	// minted it, and an executor refuses a proof whose term is below the
@@ -644,15 +678,26 @@ const (
 //     on one node would make that node count a different majority from its
 //     peers. The incident tools are decided changes, so every node moves at the
 //     same generation: `lv cluster voter rm` / `add` to repair the membership,
+//     `lv host rm --dead` for a voter that is fenced and gone for good,
+//     `lv cluster voter force-reconfigure` when a majority is gone for good,
 //     and `lv cluster voter reset` to return the whole cluster to the derived
-//     set (docs/design/recovery-claims.md §4.2, §4.3). A binary rolled back
-//     below it after it has latched enters WAL quarantine, as below every
-//     latched token, whether or not a voter generation exists — reset is not a
-//     rollback tool. Deleting its marker does nothing lasting: the HA monitor
-//     re-establishes the latch the moment the fleet is uniform. The claim
-//     tables and the adopted generation survive a stand-down of
-//     enforcement.recovery_claim (a later release's flag), which is the point:
-//     promise history stays unbroken.
+//     set (docs/design/recovery-claims.md §3.12, §4.2, §4.3, §4.6). A binary
+//     rolled back below it after it has latched enters WAL quarantine, as
+//     below every latched token, whether or not a voter generation exists —
+//     reset is not a rollback tool. Deleting its marker does nothing lasting:
+//     the HA monitor re-establishes the latch the moment the fleet is
+//     uniform. The claim tables and the adopted generation survive a
+//     stand-down of enforcement.recovery_claim, which is the point: promise
+//     history stays unbroken.
+//
+// recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
+// which is its stand-down: false on every node and a restart returns recovery
+// authorization to the pre-claim behaviour; voters keep answering and keep
+// their tables. A PARTIAL stand-down is the hazard the token is withheld to
+// prevent (a flag-off node is the uncertified second owner). A node that has
+// latched the token and turned its flag off reports it in
+// PingResponse.not_enforcing, and its enforcing peers raise ha_degraded
+// (unsupported_member) because it no longer advertises the token.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -721,6 +766,12 @@ var supported = []string{
 	// grpcapi.VoterConfigReadiness. Readiness is a fact about this node, not a
 	// policy, so it is not a flag either.
 	VoterConfigV1,
+	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
+	// on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
+	// ready). Withheld while the flag is off because every flag-on node relies
+	// on every peer honouring it — see RecoveryClaimV1 and
+	// grpcapi.RecoveryClaimReadiness.
+	RecoveryClaimV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
 	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
@@ -739,7 +790,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, RecoveryClaimV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -794,6 +845,10 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: voter_configs' shapes
 	// must be decodable by every host we stream to.
 	VoterConfigV1: true,
+	// Confirmed against every replication recipient: the claim_certificate
+	// column's statement shapes on runtime_action_proofs must be decodable by
+	// every host we stream to. Not mandatory: the flag is the opt-in.
+	RecoveryClaimV1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every

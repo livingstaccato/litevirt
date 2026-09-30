@@ -42,6 +42,11 @@ const (
 	PhaseFence      = "fence"
 	PhaseSplitBrain = "split-brain-guard"
 	PhaseRecovery   = "recovery"
+	// PhaseClaim is a recovery claim (docs/design/recovery-claims.md §5.4):
+	// the certificate a reschedule, promote or relocate needs before it is
+	// minted. Its results are ok, lost, no_majority, owner_reachable,
+	// source_mismatch and superseded.
+	PhaseClaim = "claim"
 
 	ResultOK        = "ok"
 	ResultSkipped   = "skipped"
@@ -50,6 +55,12 @@ const (
 	ResultRefused   = "refused"
 	ResultError     = "error"
 	ResultRecovered = "recovered"
+	// Claim results (PhaseClaim).
+	ResultLost           = "lost"            // another value was decided for the key
+	ResultNoMajority     = "no_majority"     // no majority promised or accepted
+	ResultOwnerReachable = "owner_reachable" // voters reached the recorded owner and refused
+	ResultSourceMismatch = "source_mismatch" // voters' settled row names another owner
+	ResultSuperseded     = "superseded"      // the key moved to attempt+1 on supersede evidence
 
 	ActionPromote    = "promote"
 	ActionReschedule = "reschedule"
@@ -99,6 +110,10 @@ const (
 	// count would fence was not, because the observations came from voters
 	// outside its region. A site partition looks like this.
 	ErrRegionScoped = "region_scoped"
+	// ErrClaimStranded: a recovery claim decided a destination that has since
+	// failed before acting; the workload waits for it to return or be removed
+	// for good (`lv host rm --dead`).
+	ErrClaimStranded = "recovery_claim_stranded"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

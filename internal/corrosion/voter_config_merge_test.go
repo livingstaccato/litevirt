@@ -68,3 +68,57 @@ func TestVoterConfigMerge_CertificateConvergesValueNever(t *testing.T) {
 		t.Fatal("two different values for one generation were not flagged")
 	}
 }
+
+// TestVoterConfigMerge_AForcedRowNeverReplacesAnAdoptedOrdinaryOne: a forced
+// generation replaces an ordinary row for the same generation on a node that
+// has not adopted that generation — the survivors never saw it, and a lost
+// majority may have decided it unseen (§4.6). A node that HAS adopted the
+// ordinary row was told by a majority of the previous generation that it was
+// decided; swapping its electorate underneath it by a merge, without the
+// forced row's checks or the import, would let two electorates decide one
+// generation. It keeps its row, the conflict is flagged, and the refusal is
+// reported for ha.voter.forced.
+//
+// Mutation: drop the adopted-generation check in voterConfigMergeKeepLocalRow
+// — the adopted ordinary row is replaced by the forced one.
+func TestVoterConfigMerge_AForcedRowNeverReplacesAnAdoptedOrdinaryOne(t *testing.T) {
+	ctx := context.Background()
+	adoptedNode, fresh, survivor := NewTestClientT(t), NewTestClientT(t), NewTestClientT(t)
+	for _, c := range []*Client{adoptedNode, fresh, survivor} {
+		if err := InitSchema(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		putVoterConfigRow(t, c, 1, `[{"name":"a"},{"name":"b"},{"name":"c"}]`, `g1`)
+		if err := RecordVoterAdoption(ctx, c, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range []*Client{adoptedNode, fresh} {
+		putVoterConfigRow(t, c, 2, `[{"name":"b"},{"name":"c"}]`, `ordinary`)
+	}
+	if err := RecordVoterAdoption(ctx, adoptedNode, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := survivor.db.Exec(`INSERT INTO voter_configs
+		(generation, members_json, members_hash, change, certificate, created_by, created_at, updated_at)
+		VALUES (2, '[{"name":"a"}]', 'h', 'force:b,c', 'forced-evidence', 'a', 't', 't')`); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []*Client{adoptedNode, fresh} {
+		if err := c.MergeStateBytesLWW(survivor.DumpStateBytes()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m, cert := voterConfigCert(t, fresh, 2); m != `[{"name":"a"}]` || cert != `forced-evidence` {
+		t.Fatalf("a node that had not adopted generation 2 did not take the forced row: %s %s", m, cert)
+	}
+	if m, _ := voterConfigCert(t, adoptedNode, 2); m != `[{"name":"b"},{"name":"c"}]` {
+		t.Fatalf("the ordinary generation 2 this node adopted was replaced by a merge: %s", m)
+	}
+	if adoptedNode.UnresolvedTieCount() == 0 {
+		t.Fatal("the refused forced row was not flagged as a conflict")
+	}
+	if got := adoptedNode.RefusedForcedVoterConfigs(); got[2] == "" {
+		t.Fatalf("the refusal was not reported for ha.voter.forced: %v", got)
+	}
+}

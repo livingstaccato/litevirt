@@ -83,6 +83,119 @@ func HostRemove(ctx context.Context, c pb.LiteVirtClient, hostName string, force
 	return nil
 }
 
+// HostRemoveDead is `lv host rm --dead <host>` (docs/design/recovery-claims.md
+// §3.12): the one command that turns a host that is fenced and gone for good
+// into supersede evidence for every recovery decided for it. In order:
+//
+//  1. refuse unless the host is fenced proof-grade, naming the fence command;
+//  2. if it is a member of the adopted voter generation, remove it first
+//     through `lv cluster voter rm` (seal and transfer) — and if no majority of
+//     the generation is reachable, stop and name force-reconfigure;
+//  3. remove the host as `lv host rm` does, including the CRL publication;
+//     its workloads stay in place for the recovery claims to supersede;
+//  4. report how many stranded recoveries will now retry, naming each.
+//
+// dryRun runs every check and prints the same plan and count without
+// changing anything. There is no command that asserts a decision away: an
+// operator only removes the host the decision named.
+func HostRemoveDead(ctx context.Context, c pb.LiteVirtClient, hostName string, dryRun bool) error {
+	plan, err := c.PlanDeadHostRemoval(ctx, &pb.PlanDeadHostRemovalRequest{Name: hostName})
+	if err != nil {
+		return fmt.Errorf("plan the removal of %s: %w", hostName, err)
+	}
+	printDeadRemovalPlan(plan)
+	if !plan.GetFenced() {
+		return fmt.Errorf("%s is not fenced proof-grade (%s): power it off, then run `%s` — `lv host rm --dead` "+
+			"removes only a host proven off", hostName, orDash(plan.GetFenceDetail()), plan.GetFenceCommand())
+	}
+	if dryRun {
+		fmt.Println("Dry run: nothing was changed.")
+		return nil
+	}
+	if plan.GetVoter() {
+		if _, err := c.ChangeVoterConfig(ctx, &pb.ChangeVoterConfigRequest{Op: "rm", Host: hostName}); err != nil {
+			if status.Code(err) == codes.Unavailable {
+				return fmt.Errorf("remove %s from voter generation %d: %w\nno majority of the generation is reachable; "+
+					"if a majority of the voters is gone for good, fence each lost host and run "+
+					"`lv cluster voter force-reconfigure --lost %s,...`", hostName, plan.GetVoterGeneration(), err, hostName)
+			}
+			return fmt.Errorf("remove %s from voter generation %d: %w", hostName, plan.GetVoterGeneration(), err)
+		}
+		fmt.Printf("  removed %s from the voter set (it was a member of generation %d)\n", hostName, plan.GetVoterGeneration())
+	}
+	serial, version, err := revokeAndPublish(ctx, c, hostName)
+	if err != nil {
+		return err
+	}
+	closeRemovedHostAuditContract(ctx, c, hostName)
+	if _, err := c.RemoveHost(ctx, &pb.RemoveHostRequest{Name: hostName, Dead: true}); err != nil {
+		return fmt.Errorf("remove host after publishing its certificate revocation: %w", err)
+	}
+	fmt.Printf("Host %s removed from the cluster for good.\n", hostName)
+	fmt.Printf("  revoked certificate %s in CRL %d before removing the host\n", serial, version)
+	n := 0
+	for _, s := range plan.GetStranded() {
+		if s.GetNextAttempt() > 0 {
+			n++
+		}
+	}
+	fmt.Printf("  %d stranded recover%s will now retry at the next claim attempt, once the removal and the CRL have replicated\n",
+		n, map[bool]string{true: "y", false: "ies"}[n == 1])
+	return nil
+}
+
+func printDeadRemovalPlan(plan *pb.PlanDeadHostRemovalResponse) {
+	fmt.Printf("Removing %s for good (state %s):\n", plan.GetHost(), plan.GetHostState())
+	if plan.GetFenced() {
+		fmt.Printf("  fence:   %s\n", plan.GetFenceDetail())
+	} else {
+		fmt.Printf("  fence:   NONE proof-grade — run `%s` once it is powered off\n", plan.GetFenceCommand())
+	}
+	if plan.GetVoter() {
+		fmt.Printf("  voter:   a member of generation %d; removed first with `lv cluster voter rm %s`\n",
+			plan.GetVoterGeneration(), plan.GetHost())
+	} else {
+		fmt.Println("  voter:   not a member of the adopted voter generation")
+	}
+	fmt.Println("  certificate revoked and the CRL published, then the host row removed")
+	retry := 0
+	for _, s := range plan.GetStranded() {
+		if s.GetNextAttempt() > 0 {
+			retry++
+		}
+	}
+	fmt.Printf("  stranded recoveries that will retry: %d\n", retry)
+	for _, s := range plan.GetStranded() {
+		fmt.Printf("    %s\n", s.GetDetail())
+	}
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+// revokeAndPublish revokes hostName's certificate in this machine's CRL and
+// publishes the CRL to the cluster: the part of a removal only the machine
+// holding the CA key can do.
+func revokeAndPublish(ctx context.Context, c pb.LiteVirtClient, hostName string) (string, int64, error) {
+	serial, err := hostCertSerial(ctx, c, hostName)
+	if err != nil {
+		return "", 0, fmt.Errorf("read %s's certificate serial before removal: %w", hostName, err)
+	}
+	if err := revokeHostCert(PKIDir(), hostName, serial); err != nil {
+		return "", 0, fmt.Errorf("refusing to remove %s before its certificate is revoked: %w", hostName, err)
+	}
+	version, err := publishClusterCRL(ctx, c, PKIDir())
+	if err != nil {
+		return "", 0, fmt.Errorf("refusing to remove %s before its certificate revocation is published: %w",
+			hostName, err)
+	}
+	return serial, version, nil
+}
+
 // PublishClusterCRL hands this machine's CRL to the cluster, for `lv host
 // publish-crl` — the recovery path when the publish inside `lv host rm` failed.
 func PublishClusterCRL(ctx context.Context, c pb.LiteVirtClient) error {
@@ -184,7 +297,8 @@ func refuseVoterRemoval(ctx context.Context, c pb.LiteVirtClient, hostName strin
 	for _, m := range resp.GetMembers() {
 		if m.GetName() == hostName {
 			return fmt.Errorf("%s is a member of voter generation %d; removing the host would not remove its "+
-				"vote. Run `lv cluster voter rm %s` first, then remove the host", hostName, resp.GetAdoptedGeneration(), hostName)
+				"vote. Run `lv cluster voter rm %s` first, then remove the host — or, if it is fenced and gone "+
+				"for good, `lv host rm --dead %s`, which does both", hostName, resp.GetAdoptedGeneration(), hostName, hostName)
 		}
 	}
 	return nil

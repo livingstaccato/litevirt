@@ -448,7 +448,33 @@ import (
 //	     claim state, minted once when the table is first created) and
 //	     local_voter_adoption (which generations this node has adopted and
 //	     which sealed majority it imported claim state from). Four new tables.
-const CurrentSchemaVersion = 59
+//	v60: recovery claims are enforced (recovery_claim_v1,
+//	     colonelpanik/litevirt#250) — runtime_action_proofs gains
+//	     claim_certificate, the majority certificate that authorizes an
+//	     ownership-transfer proof (reschedule, promote, failover relocate). It
+//	     is evidence, not a binding field: ProofBindingEqual ignores it, and a
+//	     row may gain one or have it replaced by a re-certification of the same
+//	     value. The column's statement shapes are emitted only once
+//	     recovery_claim_v1 has latched (ReplicationGated), so a
+//	     previous-release peer never sees one. One additive column, appended
+//	     LAST for the v53 digest reason.
+//	v61: a recovery destination's abandonments (docs/design/recovery-claims.md
+//	     §3.12) — local_abandoned_proofs, NODE-LOCAL like local_term_bindings:
+//	     never in tableNames, written only through ExecuteLocal. It records the
+//	     proofs this node signed it will never execute, which is the supersede
+//	     evidence a claim needs to move to attempt+1 after a decided promote
+//	     failed before StartDomain; every later claim of such a proof, and a
+//	     promote's start checkpoint, is refused in the same transaction that
+//	     reads it. One new table.
+//	v62: forced reconfiguration of the voter set
+//	     (docs/design/recovery-claims.md §4.6) — local_voter_seals, NODE-LOCAL:
+//	     the generations this node sealed as a survivor of a lost majority, so
+//	     it answers no workload claim under them again and the other survivors
+//	     can import its state. The forced generation itself is an ordinary
+//	     voter_configs row whose change is force:<lost,...> and whose
+//	     certificate column holds the survivors' unanimous signatures and the
+//	     lost hosts' fence evidence. One new table.
+const CurrentSchemaVersion = 62
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -1222,7 +1248,8 @@ var schemaDDL = []string{
 		-- about this table's digest forever with identical rows, wherever
 		-- digest_v2 is off. Put every future additive column here, not above.
 		lease_term        INTEGER NOT NULL DEFAULT 0, -- lease incarnation term (v52); 0 = proof minted without one
-		lease_key         TEXT NOT NULL DEFAULT '' -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
+		lease_key         TEXT NOT NULL DEFAULT '', -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
+		claim_certificate TEXT NOT NULL DEFAULT '' -- recovery-claim certificate authorizing this proof (v60); '' = none
 	)`,
 
 	// operations / operation_steps / project_authority_epochs (v41, F1 operation
@@ -2655,6 +2682,32 @@ var schemaDDL = []string{
 		imported_from TEXT NOT NULL DEFAULT '',
 		adopted_at    TEXT NOT NULL
 	)`,
+	// NODE-LOCAL (v61). The proofs this node, as a recovery destination, has
+	// signed that it will never execute (docs/design/recovery-claims.md
+	// §3.12). Written only through ExecuteLocal (AbandonProof), in the same
+	// transaction that checks the proof has not started here; every later
+	// claim of the proof, and a promote's start checkpoint, is refused in the
+	// same transaction that reads this table. Rows are never deleted: an
+	// abandonment is a promise, and a promise a peer could erase is not one.
+	`CREATE TABLE IF NOT EXISTS local_abandoned_proofs (
+		proof_id     TEXT    PRIMARY KEY,
+		target_kind  TEXT    NOT NULL,
+		target_name  TEXT    NOT NULL,
+		owner_epoch  INTEGER NOT NULL,
+		attempt      INTEGER NOT NULL,
+		reason       TEXT    NOT NULL DEFAULT '',
+		abandoned_at TEXT    NOT NULL
+	)`,
+	// NODE-LOCAL (v62). The voter generations this node sealed for a forced
+	// reconfiguration (docs/design/recovery-claims.md §4.6): once sealed it no
+	// longer answers Prepare or Accept for workload keys under the generation,
+	// which is what lets the other survivors import its state. Durable, so a
+	// survivor that restarts mid-procedure stays sealed. Never deleted.
+	`CREATE TABLE IF NOT EXISTS local_voter_seals (
+		generation INTEGER PRIMARY KEY,
+		reason     TEXT    NOT NULL DEFAULT '',
+		sealed_at  TEXT    NOT NULL
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3080,6 +3133,11 @@ var schemaMigrations = []string{
 	// by design — so a term is only interpretable together with its key.
 	// Additive with a '' default, which pairs with lease_term 0.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_key TEXT NOT NULL DEFAULT ''`,
+	// v60: the recovery-claim certificate authorizing an ownership-transfer
+	// proof (docs/design/recovery-claims.md §3.9). Evidence, not a binding
+	// field: '' reads as "no certificate", which a destination enforcing
+	// recovery_claim_v1 refuses.
+	`ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3171,6 +3229,7 @@ var alterVersions = []int{
 	51, // netbox_bindings.netbox_cluster
 	53, // runtime_action_proofs.lease_term
 	54, // runtime_action_proofs.lease_key
+	60, // runtime_action_proofs.claim_certificate
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -3209,6 +3268,8 @@ var createTableUnits = []struct {
 	{58, "cluster_policies"},
 	{59, "voter_configs"}, {59, "local_recovery_claims"}, {59, "local_voter_incarnation"},
 	{59, "local_voter_adoption"},
+	{61, "local_abandoned_proofs"},
+	{62, "local_voter_seals"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

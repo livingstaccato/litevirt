@@ -57,6 +57,9 @@ type ContainerChecker struct {
 	// SetGate. onGateRefused feeds the refusal metric (nil-safe).
 	gate          runtimeGate
 	onGateRefused func(action, reason string)
+	// recoveryClaimGate verifies a relocation proof's recovery-claim
+	// certificate before it is claimed. See SetRecoveryClaimGate.
+	recoveryClaimGate RecoveryClaimGate
 	// onStateWriteFail observes an authoritative state write that failed (nil-safe);
 	// wired to the litevirt_state_write_failures_total counter by the daemon.
 	onStateWriteFail func(op, class string)
@@ -99,6 +102,13 @@ func (c *ContainerChecker) SetGuardedContainerRekeyActive(fn func() bool) {
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (c *ContainerChecker) SetGate(g runtimeGate) { c.gate = g }
+
+// SetRecoveryClaimGate injects the executor-side certificate check for a
+// relocate-recreate proof (grpcapi's RecoveryClaimGateForPendingProof). A
+// relocate-recreate row is only ever written by the failover coordinator, so
+// under enforcement its proof always needs a certificate. nil leaves the path
+// as it was before recovery claims.
+func (c *ContainerChecker) SetRecoveryClaimGate(fn RecoveryClaimGate) { c.recoveryClaimGate = fn }
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (c *ContainerChecker) SetGateRefusedObserver(fn func(action, reason string)) {
@@ -412,6 +422,15 @@ func (c *ContainerChecker) claimRelocationProof(ctx context.Context, ct corrosio
 			"current_epoch", ct.OwnerEpoch)
 		c.noteGateRefused(corrosion.ActionRelocate, ReasonStaleEpoch)
 		return "", false
+	}
+	// Recovery claims (docs/design/recovery-claims.md §3.10): before the claim.
+	if c.recoveryClaimGate != nil {
+		if reason, cerr := c.recoveryClaimGate(ctx, pr); cerr != nil {
+			slog.Warn("containercheck: relocation proof refused — no recovery-claim certificate verifies",
+				"container", ct.Name, "proof", pr.ID, "reason", reason, "error", cerr)
+			c.noteGateRefused(corrosion.ActionRelocate, reason)
+			return "", false
+		}
 	}
 	if err := corrosion.ClaimActionProof(ctx, c.db, pr.ID, c.hostName); err != nil {
 		reason := ReasonProofTerminal

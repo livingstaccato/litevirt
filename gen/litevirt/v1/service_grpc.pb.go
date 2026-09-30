@@ -231,6 +231,11 @@ const (
 	LiteVirt_AcceptRecoveryClaim_FullMethodName        = "/litevirt.v1.LiteVirt/AcceptRecoveryClaim"
 	LiteVirt_GetRecoveryClaim_FullMethodName           = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
 	LiteVirt_ListRecoveryClaims_FullMethodName         = "/litevirt.v1.LiteVirt/ListRecoveryClaims"
+	LiteVirt_AbandonRecoveryProof_FullMethodName       = "/litevirt.v1.LiteVirt/AbandonRecoveryProof"
+	LiteVirt_PlanDeadHostRemoval_FullMethodName        = "/litevirt.v1.LiteVirt/PlanDeadHostRemoval"
+	LiteVirt_ForceReconfigureVoters_FullMethodName     = "/litevirt.v1.LiteVirt/ForceReconfigureVoters"
+	LiteVirt_SignForcedVoterConfig_FullMethodName      = "/litevirt.v1.LiteVirt/SignForcedVoterConfig"
+	LiteVirt_InspectRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/InspectRecoveryClaim"
 	LiteVirt_GetVoterConfig_FullMethodName             = "/litevirt.v1.LiteVirt/GetVoterConfig"
 	LiteVirt_ChangeVoterConfig_FullMethodName          = "/litevirt.v1.LiteVirt/ChangeVoterConfig"
 	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
@@ -613,6 +618,23 @@ type LiteVirtClient interface {
 	// imports from (§4.4). Peer-only. The first message is a header saying
 	// whether the asked-for generation is frozen on this voter.
 	ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error)
+	// AbandonRecoveryProof: peer-only. A recovery destination signs that it has
+	// not executed, and never will, a proof a decided claim named — refused if
+	// it may already have (§3.12).
+	AbandonRecoveryProof(ctx context.Context, in *AbandonRecoveryProofRequest, opts ...grpc.CallOption) (*AbandonRecoveryProofResponse, error)
+	// PlanDeadHostRemoval reports what `lv host rm --dead` would do.
+	PlanDeadHostRemoval(ctx context.Context, in *PlanDeadHostRemovalRequest, opts ...grpc.CallOption) (*PlanDeadHostRemovalResponse, error)
+	// ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):
+	// the audited break-glass for a voter generation whose majority is gone for
+	// good. Run against one survivor, which drives the rest; refused while a
+	// majority is actually reachable.
+	ForceReconfigureVoters(ctx context.Context, in *ForceReconfigureVotersRequest, opts ...grpc.CallOption) (*ForceReconfigureVotersResponse, error)
+	// SignForcedVoterConfig: peer-only. A survivor checks the forced
+	// generation for itself, seals the generation it replaces, and signs.
+	SignForcedVoterConfig(ctx context.Context, in *SignForcedVoterConfigRequest, opts ...grpc.CallOption) (*SignForcedVoterConfigResponse, error)
+	// InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
+	// member's recorded state for a workload's claim keys, and its last refusal.
+	InspectRecoveryClaim(ctx context.Context, in *InspectRecoveryClaimRequest, opts ...grpc.CallOption) (*InspectRecoveryClaimResponse, error)
 	// ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
 	// GetVoterConfig reports the connected host's adopted voter generation and
 	// each member's state (`lv cluster voter ls`).
@@ -3114,6 +3136,56 @@ func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecover
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_ListRecoveryClaimsClient = grpc.ServerStreamingClient[RecoveryClaimState]
 
+func (c *liteVirtClient) AbandonRecoveryProof(ctx context.Context, in *AbandonRecoveryProofRequest, opts ...grpc.CallOption) (*AbandonRecoveryProofResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbandonRecoveryProofResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_AbandonRecoveryProof_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PlanDeadHostRemoval(ctx context.Context, in *PlanDeadHostRemovalRequest, opts ...grpc.CallOption) (*PlanDeadHostRemovalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PlanDeadHostRemovalResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PlanDeadHostRemoval_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ForceReconfigureVoters(ctx context.Context, in *ForceReconfigureVotersRequest, opts ...grpc.CallOption) (*ForceReconfigureVotersResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForceReconfigureVotersResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ForceReconfigureVoters_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SignForcedVoterConfig(ctx context.Context, in *SignForcedVoterConfigRequest, opts ...grpc.CallOption) (*SignForcedVoterConfigResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SignForcedVoterConfigResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_SignForcedVoterConfig_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) InspectRecoveryClaim(ctx context.Context, in *InspectRecoveryClaimRequest, opts ...grpc.CallOption) (*InspectRecoveryClaimResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(InspectRecoveryClaimResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_InspectRecoveryClaim_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetVoterConfig(ctx context.Context, in *GetVoterConfigRequest, opts ...grpc.CallOption) (*GetVoterConfigResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetVoterConfigResponse)
@@ -3890,6 +3962,23 @@ type LiteVirtServer interface {
 	// imports from (§4.4). Peer-only. The first message is a header saying
 	// whether the asked-for generation is frozen on this voter.
 	ListRecoveryClaims(*ListRecoveryClaimsRequest, grpc.ServerStreamingServer[RecoveryClaimState]) error
+	// AbandonRecoveryProof: peer-only. A recovery destination signs that it has
+	// not executed, and never will, a proof a decided claim named — refused if
+	// it may already have (§3.12).
+	AbandonRecoveryProof(context.Context, *AbandonRecoveryProofRequest) (*AbandonRecoveryProofResponse, error)
+	// PlanDeadHostRemoval reports what `lv host rm --dead` would do.
+	PlanDeadHostRemoval(context.Context, *PlanDeadHostRemovalRequest) (*PlanDeadHostRemovalResponse, error)
+	// ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):
+	// the audited break-glass for a voter generation whose majority is gone for
+	// good. Run against one survivor, which drives the rest; refused while a
+	// majority is actually reachable.
+	ForceReconfigureVoters(context.Context, *ForceReconfigureVotersRequest) (*ForceReconfigureVotersResponse, error)
+	// SignForcedVoterConfig: peer-only. A survivor checks the forced
+	// generation for itself, seals the generation it replaces, and signs.
+	SignForcedVoterConfig(context.Context, *SignForcedVoterConfigRequest) (*SignForcedVoterConfigResponse, error)
+	// InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
+	// member's recorded state for a workload's claim keys, and its last refusal.
+	InspectRecoveryClaim(context.Context, *InspectRecoveryClaimRequest) (*InspectRecoveryClaimResponse, error)
 	// ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
 	// GetVoterConfig reports the connected host's adopted voter generation and
 	// each member's state (`lv cluster voter ls`).
@@ -4667,6 +4756,21 @@ func (UnimplementedLiteVirtServer) GetRecoveryClaim(context.Context, *GetRecover
 }
 func (UnimplementedLiteVirtServer) ListRecoveryClaims(*ListRecoveryClaimsRequest, grpc.ServerStreamingServer[RecoveryClaimState]) error {
 	return status.Error(codes.Unimplemented, "method ListRecoveryClaims not implemented")
+}
+func (UnimplementedLiteVirtServer) AbandonRecoveryProof(context.Context, *AbandonRecoveryProofRequest) (*AbandonRecoveryProofResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbandonRecoveryProof not implemented")
+}
+func (UnimplementedLiteVirtServer) PlanDeadHostRemoval(context.Context, *PlanDeadHostRemovalRequest) (*PlanDeadHostRemovalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PlanDeadHostRemoval not implemented")
+}
+func (UnimplementedLiteVirtServer) ForceReconfigureVoters(context.Context, *ForceReconfigureVotersRequest) (*ForceReconfigureVotersResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForceReconfigureVoters not implemented")
+}
+func (UnimplementedLiteVirtServer) SignForcedVoterConfig(context.Context, *SignForcedVoterConfigRequest) (*SignForcedVoterConfigResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SignForcedVoterConfig not implemented")
+}
+func (UnimplementedLiteVirtServer) InspectRecoveryClaim(context.Context, *InspectRecoveryClaimRequest) (*InspectRecoveryClaimResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method InspectRecoveryClaim not implemented")
 }
 func (UnimplementedLiteVirtServer) GetVoterConfig(context.Context, *GetVoterConfigRequest) (*GetVoterConfigResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVoterConfig not implemented")
@@ -8335,6 +8439,96 @@ func _LiteVirt_ListRecoveryClaims_Handler(srv interface{}, stream grpc.ServerStr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_ListRecoveryClaimsServer = grpc.ServerStreamingServer[RecoveryClaimState]
 
+func _LiteVirt_AbandonRecoveryProof_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbandonRecoveryProofRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).AbandonRecoveryProof(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_AbandonRecoveryProof_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).AbandonRecoveryProof(ctx, req.(*AbandonRecoveryProofRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PlanDeadHostRemoval_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PlanDeadHostRemovalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PlanDeadHostRemoval(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PlanDeadHostRemoval_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PlanDeadHostRemoval(ctx, req.(*PlanDeadHostRemovalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ForceReconfigureVoters_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForceReconfigureVotersRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ForceReconfigureVoters(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ForceReconfigureVoters_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ForceReconfigureVoters(ctx, req.(*ForceReconfigureVotersRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SignForcedVoterConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SignForcedVoterConfigRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SignForcedVoterConfig(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SignForcedVoterConfig_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SignForcedVoterConfig(ctx, req.(*SignForcedVoterConfigRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_InspectRecoveryClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(InspectRecoveryClaimRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).InspectRecoveryClaim(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_InspectRecoveryClaim_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).InspectRecoveryClaim(ctx, req.(*InspectRecoveryClaimRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetVoterConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVoterConfigRequest)
 	if err := dec(in); err != nil {
@@ -9791,6 +9985,26 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetRecoveryClaim",
 			Handler:    _LiteVirt_GetRecoveryClaim_Handler,
+		},
+		{
+			MethodName: "AbandonRecoveryProof",
+			Handler:    _LiteVirt_AbandonRecoveryProof_Handler,
+		},
+		{
+			MethodName: "PlanDeadHostRemoval",
+			Handler:    _LiteVirt_PlanDeadHostRemoval_Handler,
+		},
+		{
+			MethodName: "ForceReconfigureVoters",
+			Handler:    _LiteVirt_ForceReconfigureVoters_Handler,
+		},
+		{
+			MethodName: "SignForcedVoterConfig",
+			Handler:    _LiteVirt_SignForcedVoterConfig_Handler,
+		},
+		{
+			MethodName: "InspectRecoveryClaim",
+			Handler:    _LiteVirt_InspectRecoveryClaim_Handler,
 		},
 		{
 			MethodName: "GetVoterConfig",

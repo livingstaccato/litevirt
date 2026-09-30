@@ -1330,6 +1330,79 @@ domain may still hold state that can be resumed.
    run `virsh undefine --nvram <vm>` on that host. Use `--keep-nvram` instead
    if you want to keep the firmware variables.
 
+### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
+
+Each host reports the workloads **litevirt created** that are still present on
+it while their record is gone: no live row on the host's replica, either missing
+or tombstoned. The subject is the workload **and** the host (`vm/<name>@<host>`,
+`container/<name>@<host>`, evaluator `orphan_runtime`), so each row has exactly
+one writer. The condition is replicated, so `lv health` on any node shows it.
+
+This is the gap the reconciler's self-fence and owner-assert leave by design:
+both decide from a workload's row, so a domain with no row gives them nothing to
+decide from. The lab case that motivated it was a stale delete that tombstoned a
+VM's row on every replica while the VM kept running on its real owner. Nothing
+else reported it.
+
+**What counts as litevirt's.** Only a runtime carrying litevirt's own stamp,
+never one guessed from a name:
+
+- a domain whose metadata holds the owner-epoch element
+  (`https://litevirt.dev/xmlns/owner-epoch/1`; check with
+  `virsh metadata <vm> https://litevirt.dev/xmlns/owner-epoch/1`)
+- a container with an owner-epoch marker at `<data_dir>/containers/<name>/owner_epoch`
+
+A domain or container you created by hand carries neither, so it is never
+reported, even when it reuses the name of a deleted VM. So is a litevirt VM
+from before owner-epoch markers existed, or one whose marker is unreadable.
+
+| Raised when | Clears when |
+|---|---|
+| Two consecutive reconcile passes (15 s apart) see a recognised runtime whose name has no live row: `row` is `missing` (no row at all) or `tombstoned`. A single sighting is never reported, because a delete in flight removes the runtime a moment before or after its tombstone lands. **Warning** severity while the runtime is running, **info** otherwise. The evidence carries `runtime_state`, `marker_epoch`, `row`, and for a tombstone the `row_host`, `row_owner_epoch` and `row_deleted_at` it last had. | The first pass that no longer sees it: the runtime is gone, or its name has a live row again. |
+
+Nothing is reported, and nothing is resolved, while the host's replica has not
+caught up after a restart or rejoin. Until then it cannot tell a row that is gone
+from one it has not received yet. See
+[Deferred out-of-band stop sync](#deferred-out-of-band-stop-sync-after-a-restart-or-rejoin).
+It is not an ownership condition and never blocks admission.
+
+The same runtimes are exported as `litevirt_orphan_runtime{kind,host,name,row}`,
+a gauge of 1 per orphan while it is reported:
+
+```promql
+# A workload litevirt created is running with no record.
+max by (host, name) (litevirt_orphan_runtime{row="tombstoned"}) > 0
+max by (host, name) (litevirt_orphan_runtime{row="missing"}) > 0
+```
+
+**Nothing reaps an orphan automatically.** The only tombstone that could prove a
+running workload is unwanted is one naming this host at the runtime's own owner
+epoch. The delete paths remove the runtime before they write that tombstone, so
+such a pair only appears after a crash or a replication anomaly, which is
+exactly when an automatic destroy is least trustworthy. The lab tombstone named
+a different host at an older epoch: it was decided against a runtime that no
+longer existed. Destroying the running VM on the strength of it would have acted
+on a stale decision.
+
+**Reaping one by hand.** On the host named in the subject:
+
+1. Run `lv health` and read the evidence. `row_host` and `row_owner_epoch` say
+   which host and generation the deleted record last named. A `row_owner_epoch`
+   below `marker_epoch` means the delete was decided against an older copy of
+   the workload, not the one still running.
+2. Decide whether the workload is still wanted. If its deletion was intended
+   (`lv compose down`, `lv rm`, `lv ct rm`), reap it. If the record was lost
+   by accident, keep the runtime and copy its disks out before you do anything
+   else (`virsh domblklist <vm>` lists them). litevirt has no command that
+   re-adopts a running runtime into a new record, so the way back is a fresh VM
+   from those disks, for example with `lv import`.
+3. VM: `virsh destroy <vm>`, then `virsh undefine --nvram <vm>`. Undefine
+   leaves the disks in place; delete the files `domblklist` listed once you are
+   sure.
+   Container: `lxc-stop -n <name>`, then `lxc-destroy -n <name>`, then remove
+   `<data_dir>/containers/<name>/owner_epoch`.
+4. The next reconcile pass resolves the condition.
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

@@ -1604,3 +1604,45 @@ func OwnerEpochBackfillComplete(ctx context.Context, c *Client, hostName string)
 	}
 	return true, nil
 }
+
+// WorkloadRowTrace is what a workload's row says about it, whatever its state —
+// including a tombstone. It is the evidence behind an orphan-runtime report
+// (internal/health/orphan_runtime.go): which host and generation the row last
+// named, and when it was deleted.
+type WorkloadRowTrace struct {
+	HostName   string
+	OwnerEpoch int64
+	DeletedAt  string // "" while the row is live
+	UpdatedAt  string
+}
+
+// LookupVMRowAnyState reads vms row `name`, live or tombstoned. nil when the
+// name has no row at all.
+func LookupVMRowAnyState(ctx context.Context, c *Client, name string) (*WorkloadRowTrace, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, vm_owner_epoch, COALESCE(deleted_at, '') AS deleted_at, updated_at
+		 FROM vms WHERE name = ?`, name)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	r := rows[0]
+	return &WorkloadRowTrace{HostName: r.String("host_name"), OwnerEpoch: r.Int64("vm_owner_epoch"),
+		DeletedAt: r.String("deleted_at"), UpdatedAt: r.String("updated_at")}, nil
+}
+
+// LookupContainerRowsAnyState reads every containers row named `name`, on any
+// host, live or tombstoned, newest first.
+func LookupContainerRowsAnyState(ctx context.Context, c *Client, name string) ([]WorkloadRowTrace, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, owner_epoch, COALESCE(deleted_at, '') AS deleted_at, updated_at
+		 FROM containers WHERE name = ? ORDER BY updated_at DESC`, name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WorkloadRowTrace, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, WorkloadRowTrace{HostName: r.String("host_name"), OwnerEpoch: r.Int64("owner_epoch"),
+			DeletedAt: r.String("deleted_at"), UpdatedAt: r.String("updated_at")})
+	}
+	return out, nil
+}

@@ -137,7 +137,7 @@ func (r *Reconciler) assertRuntimeOwnership(ctx context.Context) {
 		}
 		vm, gerr := corrosion.GetVM(ctx, r.db, domName)
 		if gerr != nil || vm == nil {
-			continue // external/manual domain — not cluster-managed
+			continue // no live row: nothing to claim (a litevirt one is reportOrphanRuntimes')
 		}
 		if vm.HostName == r.hostName {
 			continue // already ours

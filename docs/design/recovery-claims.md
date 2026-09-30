@@ -1700,3 +1700,42 @@ where it described the mechanism; this list records what changed and why.
 30. **The abstention check behind `ha.voter.unavailable` is cached for 30 s**,
     so the leader's health tick does not issue a claim RPC to every voter on
     every pass.
+31. **A forced row never replaces an ordinary row a node has adopted** (§4.6).
+    The anti-entropy merge lets a forced generation replace an ordinary row
+    for the same generation only on a node that has not adopted that
+    generation. A node that has adopted the ordinary row was told by a
+    majority of the previous generation that it was decided; replacing it by
+    a merge would switch its electorate without the forced row's checks or the
+    import, and two electorates would each decide that generation. It keeps
+    the row it adopted, the conflict stays flagged as an unresolved tie, and
+    `ha.voter.forced` reports the refusal. Such a node is one the forced
+    change named lost, or one that must be removed (`lv host rm --dead`) and
+    reseeded; the design has no way to reconcile the two generations, so the
+    node does not try.
+32. **A proof's certificate is replaced only by one that verifies on this
+    node** (§3.9), on the write path and in the anti-entropy merge alike:
+    signatures and a majority of a generation this node has adopted that no
+    adopted forced generation replaced. A verifying certificate replaces one
+    that does not verify here, or one at an earlier generation. The merge
+    picks the copy that replaces the other, else the one that verifies here,
+    else the greater encoding, so nodes that have adopted the same generations
+    and CRL choose the same copy; a node behind on adoption can choose
+    differently until it adopts, and the rows still differing is what makes
+    the next pass merge them again.
+33. **Proofs minted before enforcement are claimed, not grandfathered.** A
+    pending reschedule or relocation without a certificate, minted before
+    enforcement turned on, is claimed by the lease holder for its own value at
+    attempt 0, with the old owner its proof-grade fence binding (fence_epoch)
+    names as the source; a decided claim attaches the certificate, and a claim
+    another value won is handled as `recovery_claim_lost`. While it waits,
+    `ha.claim.uncertified` names it. The source is never inferred from
+    timestamps or from whichever host is fenced now, so a proof that binds no
+    proof-grade fence cannot be claimed; the condition says to stand claims
+    down until it has run.
+34. **An interrupted owner probe is not cached** (item 9). A probe whose
+    caller's context ended mid-dial reads as reached and is not stored, so the
+    next Accept naming the source probes again.
+35. **A supersede's prior certificate obeys the destination's generation
+    rule** (§3.12): at a generation this voter has adopted and not one a
+    forced change replaced. The coordinator re-decides the previous attempt
+    under the current generation first, which certifies the same value again.

@@ -7,6 +7,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
@@ -114,13 +115,25 @@ type fakeReseedSource struct {
 	sensitiveUnimpl bool              // answer GetSensitiveStateDigest with Unimplemented
 	ping            *pb.PingResponse
 	pingErr         error
+	// unfresh counts digest requests that did not ask for a fresh scan.
+	unfresh int
 }
 
-func (f *fakeReseedSource) GetStateDigest(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.StateDigestResponse, error) {
+// noteFresh records whether a digest request asked the source to scan now.
+func (f *fakeReseedSource) noteFresh(ctx context.Context) {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	if !corrosion.FreshDigestRequested(metadata.NewIncomingContext(context.Background(), md)) {
+		f.unfresh++
+	}
+}
+
+func (f *fakeReseedSource) GetStateDigest(ctx context.Context, _ *emptypb.Empty, _ ...grpc.CallOption) (*pb.StateDigestResponse, error) {
+	f.noteFresh(ctx)
 	return &pb.StateDigestResponse{Tables: digestList(f.tables)}, nil
 }
 
-func (f *fakeReseedSource) GetSensitiveStateDigest(context.Context, *pb.SensitiveStateRequest, ...grpc.CallOption) (*pb.StateDigestResponse, error) {
+func (f *fakeReseedSource) GetSensitiveStateDigest(ctx context.Context, _ *pb.SensitiveStateRequest, _ ...grpc.CallOption) (*pb.StateDigestResponse, error) {
+	f.noteFresh(ctx)
 	if f.sensitiveUnimpl {
 		return nil, status.Error(codes.Unimplemented, "older build")
 	}
@@ -390,5 +403,18 @@ func TestReseedHost_RefusesAnUnfitSourceWithoutDiscarding(t *testing.T) {
 	if vm == nil {
 		t.Fatal("the reseed discarded this node's state before finding out its source was " +
 			"unfit — the node is now worse off than before it asked")
+	}
+}
+
+// A reseed's convergence check compares the source's digests as of now: it
+// asks for a fresh scan on both lanes, never the source's cache.
+func TestReseedRemoteDigests_AsksForFreshDigests(t *testing.T) {
+	s := testServer(t)
+	peer := &fakeReseedSource{tables: map[string]string{"vms": "aaa"}, sensitive: map[string]string{"user_2fa": "bbb"}}
+	if _, err := s.reseedRemoteDigests(context.Background(), peer); err != nil {
+		t.Fatal(err)
+	}
+	if peer.unfresh != 0 {
+		t.Fatalf("%d of the reseed's digest requests read the source's cache", peer.unfresh)
 	}
 }

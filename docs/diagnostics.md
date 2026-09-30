@@ -802,6 +802,20 @@ converge the row, so the two paths can never disagree.
   a param-bound `crl_versions` rewrite). A brief rate during a rolling upgrade is expected; a
   **continuing** rate means an old emitter is still writing or a relay is retaining pre-upgrade
   WAL — investigate that peer/relay.
+- `litevirt_antientropy_digest_tables_total{result}` — tables a state digest took
+  from the digest cache (`cached`) or scanned (`computed`), counted for every digest a
+  pass computes and every one a peer asks for. On a quiet cluster `cached` dominates;
+  a node where `computed` tracks the total has its cache off
+  (`anti_entropy_legacy_repair: true`) or a table written every pass.
+- `litevirt_antientropy_pull_rows_total{scope}` — rows a repair pull received:
+  `bucket` for a table narrowed to the buckets whose digests disagreed, `table` for one
+  pulled whole (a peer on an older build, a table that is not bucketed, or the
+  stand-down). A steady `table` rate against current peers is worth a look.
+- `litevirt_antientropy_digest_seconds`, `litevirt_antientropy_dump_bytes`,
+  `litevirt_antientropy_rows_merged_total`, `litevirt_antientropy_rows_skipped_total` —
+  the wall time of one digest (cached tables cost almost nothing), the compressed size
+  of one repair pull, and the rows a merge applied or kept local
+  ([design/ae-incremental.md](design/ae-incremental.md)).
 
 ### Alerts
 

@@ -616,6 +616,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// default inside NewAntiEntropy. (P2-2)
 	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
 	ae.SetRelayConfig(relayCfg)
+	ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
 	go ae.Start(ctx)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the

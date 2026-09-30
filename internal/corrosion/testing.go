@@ -52,17 +52,20 @@ func NewTestClient() (*Client, error) {
 	// contention into spurious test-only refusals.
 	dsn := fmt.Sprintf("file:testdb%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", id)
 
-	db, err := sql.Open("sqlite", dsn)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
 		return nil, err
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, err
 	}
 
 	return &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
 		hostName:         "test-node",
 		clock:            hlc.NewClock("test-node"),
 		replicatorNotify: make(chan struct{}, 1),
@@ -88,22 +91,40 @@ func testLeaseTermLedgerOpen() bool { return true }
 // Test-only. The returned client is not started (no replicator, no gossip).
 func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&_pragma=busy_timeout(5000)", dsnSuffix)
-	db, err := sql.Open("sqlite", dsn)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
 		return nil, err
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, err
 	}
 	return &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
 		hostName:         hostName,
 		clock:            hlc.NewClock(hostName),
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
 		leaseTermLedger:  testLeaseTermLedgerOpen,
 	}, nil
+}
+
+// ExecOutOfProcessForTest runs one statement on this client's database
+// through a handle of its own that carries no pre-update hook — the write
+// another process makes, which this client's digest cache cannot see.
+func (c *Client) ExecOutOfProcessForTest(q string, args ...interface{}) error {
+	db, err := sql.Open("sqlite", c.dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, err = db.Exec(q, args...)
+	return err
 }
 
 // SetDataDirForTest points a test client at a data directory, so the node-local

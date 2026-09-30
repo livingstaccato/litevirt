@@ -440,6 +440,8 @@ func (m *recordingSyncMetrics) reasons() []string {
 
 func (m *recordingSyncMetrics) ObserveDump(time.Duration, int)              {}
 func (m *recordingSyncMetrics) ObserveDigest(time.Duration)                 {}
+func (m *recordingSyncMetrics) ObserveDigestTables(int, int)                {}
+func (m *recordingSyncMetrics) ObservePullRows(string, int)                 {}
 func (m *recordingSyncMetrics) ObserveMerge(time.Duration, int, int)        {}
 func (m *recordingSyncMetrics) ObserveLegacyTransformed(string)             {}
 func (m *recordingSyncMetrics) ObserveTieBreak(string, string, string)      {}

@@ -43,6 +43,14 @@ rest_port: 7446
 # faster drift detection is worth the extra digest traffic.
 anti_entropy_interval_sec: 0
 
+# Stand-down for incremental anti-entropy. A pass normally takes unchanged
+# tables' digests from a cache and, for a table that disagrees with a peer, asks
+# the peer which of its 256 buckets differ and pulls only those, a bounded page
+# at a time (docs/design/ae-incremental.md). true makes this node pull whole
+# tables as one blob and scan every digest, as older releases did; it still
+# answers its peers' bucket and paged requests. Leave false unless you suspect the incremental path.
+anti_entropy_legacy_repair: false
+
 # Cluster membership port (used for peer discovery).
 gossip_port: 7946
 

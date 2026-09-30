@@ -1157,7 +1157,7 @@ func (s *Server) gatherTableDigests(ctx context.Context, peers []string, tables 
 				answers[i].err = derr
 				return
 			}
-			resp, rerr := client.GetStateDigest(pctx, &emptypb.Empty{})
+			resp, rerr := client.GetStateDigest(corrosion.WithFreshDigest(pctx), &emptypb.Empty{})
 			closeConn()
 			if rerr != nil {
 				answers[i].err = rerr

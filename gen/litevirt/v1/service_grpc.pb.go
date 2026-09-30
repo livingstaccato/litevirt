@@ -229,6 +229,9 @@ const (
 	LiteVirt_StreamTableDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamTableDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
 	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
+	LiteVirt_GetTableBucketDigests_FullMethodName      = "/litevirt.v1.LiteVirt/GetTableBucketDigests"
+	LiteVirt_StreamTableRows_FullMethodName            = "/litevirt.v1.LiteVirt/StreamTableRows"
+	LiteVirt_StreamSensitiveTableRows_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveTableRows"
 	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
 	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
 	LiteVirt_PrepareRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
@@ -610,6 +613,21 @@ type LiteVirtClient interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
+	// GetTableBucketDigests returns per-bucket digests of the named tables so
+	// anti-entropy pulls only the buckets of a mismatched table that disagree
+	// (docs/design/ae-incremental.md). Peer-only (sender must match the host
+	// certificate). An older build answers Unimplemented and the caller pulls
+	// whole tables.
+	GetTableBucketDigests(ctx context.Context, in *BucketDigestRequest, opts ...grpc.CallOption) (*BucketDigestResponse, error)
+	// StreamTableRows is StreamTableDump as bounded pages instead of one blob:
+	// the server reads each table a page at a time and the client merges each
+	// page as it arrives (docs/design/ae-incremental.md). Peer-only, like
+	// StreamTableDump. An older build answers Unimplemented and the caller
+	// falls back to StreamTableDump.
+	StreamTableRows(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error)
+	// StreamSensitiveTableRows is the sensitive lane's paged pull; the sender
+	// must match the host certificate, as for StreamSensitiveStateDump.
+	StreamSensitiveTableRows(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error)
 	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
 	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
 	TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error)
@@ -3116,6 +3134,54 @@ func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *Sensi
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
+func (c *liteVirtClient) GetTableBucketDigests(ctx context.Context, in *BucketDigestRequest, opts ...grpc.CallOption) (*BucketDigestResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BucketDigestResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetTableBucketDigests_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) StreamTableRows(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[TableDumpRequest, TableRowsPage]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamTableRowsClient = grpc.ServerStreamingClient[TableRowsPage]
+
+func (c *liteVirtClient) StreamSensitiveTableRows(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[SensitiveStateRequest, TableRowsPage]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamSensitiveTableRowsClient = grpc.ServerStreamingClient[TableRowsPage]
+
 func (c *liteVirtClient) TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(TriggerAntiEntropyResponse)
@@ -3168,7 +3234,7 @@ func (c *liteVirtClient) GetRecoveryClaim(ctx context.Context, in *GetRecoveryCl
 
 func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3377,7 +3443,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3506,7 +3572,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3999,6 +4065,21 @@ type LiteVirtServer interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(context.Context, *SensitiveStateRequest) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error
+	// GetTableBucketDigests returns per-bucket digests of the named tables so
+	// anti-entropy pulls only the buckets of a mismatched table that disagree
+	// (docs/design/ae-incremental.md). Peer-only (sender must match the host
+	// certificate). An older build answers Unimplemented and the caller pulls
+	// whole tables.
+	GetTableBucketDigests(context.Context, *BucketDigestRequest) (*BucketDigestResponse, error)
+	// StreamTableRows is StreamTableDump as bounded pages instead of one blob:
+	// the server reads each table a page at a time and the client merges each
+	// page as it arrives (docs/design/ae-incremental.md). Peer-only, like
+	// StreamTableDump. An older build answers Unimplemented and the caller
+	// falls back to StreamTableDump.
+	StreamTableRows(*TableDumpRequest, grpc.ServerStreamingServer[TableRowsPage]) error
+	// StreamSensitiveTableRows is the sensitive lane's paged pull; the sender
+	// must match the host certificate, as for StreamSensitiveStateDump.
+	StreamSensitiveTableRows(*SensitiveStateRequest, grpc.ServerStreamingServer[TableRowsPage]) error
 	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
 	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
 	TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error)
@@ -4804,6 +4885,15 @@ func (UnimplementedLiteVirtServer) GetSensitiveStateDigest(context.Context, *Sen
 }
 func (UnimplementedLiteVirtServer) StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error {
 	return status.Error(codes.Unimplemented, "method StreamSensitiveStateDump not implemented")
+}
+func (UnimplementedLiteVirtServer) GetTableBucketDigests(context.Context, *BucketDigestRequest) (*BucketDigestResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTableBucketDigests not implemented")
+}
+func (UnimplementedLiteVirtServer) StreamTableRows(*TableDumpRequest, grpc.ServerStreamingServer[TableRowsPage]) error {
+	return status.Error(codes.Unimplemented, "method StreamTableRows not implemented")
+}
+func (UnimplementedLiteVirtServer) StreamSensitiveTableRows(*SensitiveStateRequest, grpc.ServerStreamingServer[TableRowsPage]) error {
+	return status.Error(codes.Unimplemented, "method StreamSensitiveTableRows not implemented")
 }
 func (UnimplementedLiteVirtServer) TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method TriggerAntiEntropy not implemented")
@@ -8476,6 +8566,46 @@ func _LiteVirt_StreamSensitiveStateDump_Handler(srv interface{}, stream grpc.Ser
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
 
+func _LiteVirt_GetTableBucketDigests_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BucketDigestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetTableBucketDigests(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetTableBucketDigests_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetTableBucketDigests(ctx, req.(*BucketDigestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_StreamTableRows_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(TableDumpRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).StreamTableRows(m, &grpc.GenericServerStream[TableDumpRequest, TableRowsPage]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamTableRowsServer = grpc.ServerStreamingServer[TableRowsPage]
+
+func _LiteVirt_StreamSensitiveTableRows_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(SensitiveStateRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(LiteVirtServer).StreamSensitiveTableRows(m, &grpc.GenericServerStream[SensitiveStateRequest, TableRowsPage]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_StreamSensitiveTableRowsServer = grpc.ServerStreamingServer[TableRowsPage]
+
 func _LiteVirt_TriggerAntiEntropy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(TriggerAntiEntropyRequest)
 	if err := dec(in); err != nil {
@@ -10121,6 +10251,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _LiteVirt_GetSensitiveStateDigest_Handler,
 		},
 		{
+			MethodName: "GetTableBucketDigests",
+			Handler:    _LiteVirt_GetTableBucketDigests_Handler,
+		},
+		{
 			MethodName: "TriggerAntiEntropy",
 			Handler:    _LiteVirt_TriggerAntiEntropy_Handler,
 		},
@@ -10488,6 +10622,16 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "StreamSensitiveStateDump",
 			Handler:       _LiteVirt_StreamSensitiveStateDump_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamTableRows",
+			Handler:       _LiteVirt_StreamTableRows_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "StreamSensitiveTableRows",
+			Handler:       _LiteVirt_StreamSensitiveTableRows_Handler,
 			ServerStreams: true,
 		},
 		{

@@ -167,6 +167,9 @@ func (s *Server) UnaryAuthInterceptor(
 	if err != nil {
 		return nil, err
 	}
+	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
+		return nil, err
+	}
 	return handler(ctx, req)
 }
 
@@ -189,6 +192,9 @@ func (s *Server) StreamAuthInterceptor(
 	}
 	ctx, err := s.authenticate(ss.Context())
 	if err != nil {
+		return err
+	}
+	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
 		return err
 	}
 	return handler(srv, &wrappedStream{ss, ctx})

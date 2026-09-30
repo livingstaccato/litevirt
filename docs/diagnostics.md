@@ -1171,6 +1171,33 @@ restart.
 A host that stays `replica not caught up` is not completing anti-entropy with
 anyone: check that it sees gossip peers and can reach them over gRPC.
 
+### Workload commands refused after a restart or rejoin
+
+The same catch-up gates the commands that act on an existing workload through
+the host its record names: start, stop, restart, delete, rebuild, update,
+migrate, hotplug, resize, snapshot, backup and restore of VMs and containers,
+and `lv compose up` / `lv compose down`. Until the serving host's replica has
+caught up, they fail with `Unavailable` and nothing is touched:
+
+```
+DeleteVM refused on node-1: this node's replica has not caught up with the cluster yet (...), so it cannot tell which host owns the workload now. Retry in a minute, or run the command against another node
+```
+
+Served from a stale record, such a command acts on the wrong copy and writes
+the stale owner back. Observed on a lab: a VM rescheduled from node-1 to node-4
+while node-1 was down; node-1 came back and served `lv compose down` three
+seconds before its first anti-entropy exchange. It destroyed its own shut-off
+leftover and tombstoned the record naming itself, and that tombstone replaced
+the owner's record everywhere — the VM kept running on node-4 with no record.
+Retry after the `replica caught up` journal line, or run the command on any
+other host. A single-node cluster is not gated.
+
+A host whose peers are all down cannot catch up, so it refuses these commands
+until one of them answers. That is deliberate: it cannot know whether another
+host took the workload over while it was away. If those peers are gone for
+good, fence them and remove them with `lv host rm --dead <host>`; a host left
+as the only member is a single-node cluster and is no longer gated.
+
 ### Gossip isolation (`gossip_isolated`)
 
 A node that has lost every gossip peer, and whose re-join attempts reach none

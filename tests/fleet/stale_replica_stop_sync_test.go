@@ -64,6 +64,9 @@ func TestFleet_StaleReplica_RejoinedNodeDoesNotStompTheOwner(t *testing.T) {
 		stale.Virt.SetState(name, libvirtfake.StateShutdown)
 		stale.Virt.SetStateReason(name, "destroyed")
 	}
+	// The harness starts every replica caught up; the reboot is what opens
+	// the gap, exactly as a fresh process does.
+	stale.DB.MarkReplicaStale("process restarted (fleet: modelled reboot)")
 	r := health.NewReconciler(stale.Name, t.TempDir(), stale.DB, stale.Virt)
 	r.SetReplicaFreshness(stale.DB.ReplicaCaughtUp)
 

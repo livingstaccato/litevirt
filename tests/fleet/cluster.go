@@ -496,6 +496,11 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)
 	}
+	// The fleet bootstraps as a cluster that has already converged, so each
+	// replica starts caught up; without this every workload mutation would be
+	// refused by the stale-replica gate (grpcapi/replica_gate.go). A scenario
+	// modelling a rejoin calls n.DB.MarkReplicaStale itself.
+	db.MarkReplicaCaughtUpForTests("fleet-bootstrap")
 	n.DB = db
 }
 

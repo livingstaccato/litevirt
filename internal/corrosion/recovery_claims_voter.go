@@ -478,6 +478,31 @@ var transferStates = map[string]bool{"pending": true, "starting": true, "migrati
 // cross-check). A row at another epoch, mid-transfer, or absent is not
 // settled and says nothing about this key.
 func (c *Client) settledOwner(ctx context.Context, key ClaimKey) (string, bool, error) {
+	r, ok, err := c.claimTargetRow(ctx, key)
+	if err != nil || !ok {
+		return "", false, err
+	}
+	if r.Int64("epoch") != key.OwnerEpoch || transferStates[r.String("state")] || r.String("pending") != "" {
+		return "", false, nil
+	}
+	return r.String("host_name"), true, nil
+}
+
+// ClaimProbeHint is the host this voter's own row for the target names at
+// key.OwnerEpoch, settled or not, or "" when there is none: the source an
+// Accept for key will most likely name, so a Prepare can start the owner probe
+// before the Accept arrives (§3.5.1, §10 item 36). It is a hint and decides
+// nothing: the Accept probes the source its value names, whatever this said.
+func (c *Client) ClaimProbeHint(ctx context.Context, key ClaimKey) (string, error) {
+	r, ok, err := c.claimTargetRow(ctx, key)
+	if err != nil || !ok || r.Int64("epoch") != key.OwnerEpoch {
+		return "", err
+	}
+	return r.String("host_name"), nil
+}
+
+// claimTargetRow reads the live vms / containers row a workload key names.
+func (c *Client) claimTargetRow(ctx context.Context, key ClaimKey) (Row, bool, error) {
 	var q string
 	switch key.TargetKind {
 	case ClaimKindVM:
@@ -487,17 +512,13 @@ func (c *Client) settledOwner(ctx context.Context, key ClaimKey) (string, bool, 
 		q = `SELECT host_name, state, owner_epoch AS epoch, '' AS pending FROM containers
 			WHERE name = ? AND deleted_at IS NULL`
 	default:
-		return "", false, nil
+		return Row{}, false, nil
 	}
 	rows, err := c.Query(ctx, q, key.TargetName)
 	if err != nil || len(rows) != 1 {
-		return "", false, err
+		return Row{}, false, err
 	}
-	r := rows[0]
-	if r.Int64("epoch") != key.OwnerEpoch || transferStates[r.String("state")] || r.String("pending") != "" {
-		return "", false, nil
-	}
-	return r.String("host_name"), true, nil
+	return rows[0], true, nil
 }
 
 // ClaimState reads this voter's state for key; found=false when it has none.

@@ -46,7 +46,7 @@ func (s *Server) forcedProbe(ctx context.Context, host string) (bool, string) {
 	if host == s.hostName {
 		return true, "this host"
 	}
-	return s.probeOnce(ctx, host)
+	return s.probeOnce(ctx, s.claims.probe.dial, host)
 }
 
 // ForceReconfigureVoters is the operator RPC.

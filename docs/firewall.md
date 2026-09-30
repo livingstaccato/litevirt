@@ -180,6 +180,53 @@ reconciler picks them up on its next poll (or immediately via
 rules, host-tier rules, ipsets, and default-deny policy are also persisted in
 cluster state and loaded by the reconciler's `CorrosionPlanLoader`.
 
+## Audit trail
+
+Every firewall-policy change made through the daemon lands in the signed
+audit log (`lv audit ls`, see [audit-log.md](audit-log.md)). That covers the
+CLI, the REST API and the web UI alike, because all three reach the same gRPC
+handlers. The web UI's security-group pages have no gRPC equivalent, so they
+write the row themselves, naming the user the session belongs to.
+
+| Action | Target | Recorded by |
+|---|---|---|
+| `firewall.default-deny` | the scope (`cluster` or a host name) | `lv firewall default-deny`, UI default-policy toggle |
+| `firewall.cluster-rule.add` / `.rm` | rule id | `lv firewall cluster-rule add/rm`, UI |
+| `firewall.host-rule.add` / `.rm` | rule id | `lv firewall host-rule add/rm`, UI |
+| `firewall.ipset.add` / `.rm` | set name (add) / set id (rm) | `lv firewall ipset add/rm`, UI |
+| `sg.bind` | VM name | `lv sg bind`, `POST /api/v1/vms/bind-sgs` |
+| `sg.add` / `sg.rm` | group name (add) / group id (rm) | UI |
+| `sg.rule.add` / `sg.rule.rm` | group id (add) / rule id (rm) | UI |
+
+The row's user is the authenticated caller. Its detail records the policy
+before and after the change, in the form `before=<state> after=<state>`:
+
+```
+firewall.default-deny      cluster   before=deny after=accept
+firewall.cluster-rule.rm   9f2c…     before={ingress tcp port=22 cidr=10.0.0.0/8 accept priority=100} after=none
+sg.bind                    web-1     network=lan before=[isolate] after=[web,ssh]
+```
+
+The before-state matters most on a removal. A removed rule is tombstoned, so
+after that the audit row is the only record of which port the removal opened.
+A state is one of:
+
+- `{…}`: the rule, ip set or group, with every field that decides what it
+  matches or does. A removed group lists the rules that went with it.
+- `none`: a read that succeeded found no such row.
+- `unset`: no default policy for the scope, so it inherits (cluster: accept).
+- `unknown(<error>)`: the read failed, so the row claims nothing about what
+  was there. A failed read is never recorded as `none`.
+
+`lv sg create`, `lv sg rm`, `lv sg rule-add` and `lv sg rule-rm` are the
+exception. They write the host's Corrosion database directly rather than going
+through the daemon, so they leave **no audit row**. Writing one from the CLI
+process would break the chain rather than extend it. The daemon holds each
+host's sub-chain tail and its signing key, so a row appended by a second
+process would fork that tail and arrive unsigned. `lv audit verify` would then
+report tampering. Use the web UI's security-group pages when you need the
+change on the record.
+
 ## Default-deny rollout
 
 Switching a running cluster to default-deny is risky if a rule is

@@ -869,13 +869,22 @@ func CountVMsByNetwork(ctx context.Context, c *Client) (map[string]int, error) {
 	return m, nil
 }
 
+// The VM state writers' statements. Their WHERE is the name (and, for the
+// epoch form, the ownership generation) and nothing else — that is their wire
+// shape, and a receiver on the previous release recognises no other. What makes
+// them tombstone-safe is their ledger disposition, DispLiveRowUpdate: the origin
+// and every receiver apply them through the `AND deleted_at IS NULL` form (see
+// live_row_update.go).
+const (
+	vmStateUpdateSQL  = `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`
+	vmStateAtEpochSQL = `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`
+	vmHostStateSQL    = `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`
+)
+
 // UpdateVMState changes a VM's state.
 func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
-		state, detail, now, name,
-	)
+	return c.Execute(ctx, vmStateUpdateSQL, state, detail, now, name)
 }
 
 // UpdateVMStateAtEpoch is UpdateVMState carrying the ownership generation the
@@ -891,10 +900,7 @@ func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) e
 // own view, and its row is at the old generation); it simply cannot travel.
 func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail string, expectedEpoch int64) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
-		state, detail, now, name, expectedEpoch,
-	)
+	return c.Execute(ctx, vmStateAtEpochSQL, state, detail, now, name, expectedEpoch)
 }
 
 // UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
@@ -903,10 +909,7 @@ func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail st
 // handoff) so a vanished/renamed VM row cannot be mistaken for a completed write.
 func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRowsStrict(ctx,
-		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
-		state, detail, now, name,
-	)
+	n, err := c.ExecuteRowsStrict(ctx, vmStateUpdateSQL, state, detail, now, name)
 	if err != nil {
 		return err
 	}
@@ -919,10 +922,7 @@ func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail str
 // UpdateVMHost moves a VM's host assignment and state after migration.
 func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
-		hostName, state, now, name,
-	)
+	return c.Execute(ctx, vmHostStateSQL, hostName, state, now, name)
 }
 
 // TransferVMOwner is the Phase 4 ownership-transition primitive: one guarded
@@ -1392,7 +1392,7 @@ func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostN
 func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string, expected []DiskRecord) (bool, error) {
 	now := c.NowTS()
 	stmts := []Statement{{
-		SQL:    `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
+		SQL:    vmHostStateSQL,
 		Params: []interface{}{targetHost, finalState, now, vmName},
 	}}
 	for _, d := range expected {
@@ -1405,7 +1405,10 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 
 	guard := func(tx *sql.Tx) (bool, error) {
 		var vmHost string
-		switch err := tx.QueryRowContext(ctx, `SELECT host_name FROM vms WHERE name = ?`, vmName).Scan(&vmHost); {
+		// A tombstone is a vanished VM: the parent statement would change nothing
+		// there (DispLiveRowUpdate), so committing the disk moves would report an
+		// ownership handoff that never happened.
+		switch err := tx.QueryRowContext(ctx, `SELECT host_name FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).Scan(&vmHost); {
 		case errors.Is(err, sql.ErrNoRows):
 			return false, nil // VM vanished mid-migration → decline
 		case err != nil:

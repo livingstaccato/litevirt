@@ -68,6 +68,10 @@ const (
 	// for rows whose owner/generation axes are still both zero. The old wire
 	// shape cannot prove authority, so it must never cross into a v44 identity.
 	DispLegacyWorkloadDelete Disposition = "legacy_workload_delete"
+	// DispLiveRowUpdate is a full-PK LWW update that must never modify a
+	// tombstone: it is applied through its `AND deleted_at IS NULL` form, on the
+	// receiver AND on the origin (live_row_update.go).
+	DispLiveRowUpdate Disposition = "live_row_update"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.

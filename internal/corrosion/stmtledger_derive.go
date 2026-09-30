@@ -176,6 +176,12 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: legacyVMDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerDeleteSQL, Disposition: DispLegacyWorkloadDelete},
 	{SQL: legacyContainerStrictDeleteSQL, Disposition: DispLegacyWorkloadDelete},
+	// The VM state writers: applied through their tombstone-guarded form on the
+	// origin and every receiver, so a state write never modifies a deleted row.
+	// The wire shape is unchanged (live_row_update.go explains why).
+	{SQL: vmStateUpdateSQL, Disposition: DispLiveRowUpdate},
+	{SQL: vmStateAtEpochSQL, Disposition: DispLiveRowUpdate},
+	{SQL: vmHostStateSQL, Disposition: DispLiveRowUpdate},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes), and
 	// applied through the signature-guarded form on the receiver.
 	//

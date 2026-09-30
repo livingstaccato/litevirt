@@ -72,12 +72,13 @@ import (
 // replication stream. Unlike SetLeaseTermLedgerGate the test constructors
 // leave it CLOSED: most tests assert on the pre-latch columns, and a test that
 // wants the split opens it itself.
-func (c *Client) SetCredentialsSplitGate(fn func() bool) { c.credentialsSplit = fn }
+func (c *Client) SetCredentialsSplitGate(fn func() bool) { c.credentialsSplit.Store(&fn) }
 
 // MayWriteCredentialTables reports whether this node may write the credential
 // tables (nil-safe, fail closed).
 func (c *Client) MayWriteCredentialTables() bool {
-	return c.credentialsSplit != nil && c.credentialsSplit()
+	fn := c.credentialsSplit.Load()
+	return fn != nil && *fn != nil && (*fn)()
 }
 
 // resolveCredential picks the secret a reader returns: the live credential

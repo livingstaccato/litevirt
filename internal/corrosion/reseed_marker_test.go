@@ -24,14 +24,15 @@ func openFileClient(t *testing.T, dir string) *Client {
 	if err := db.Ping(); err != nil {
 		t.Fatalf("ping sqlite: %v", err)
 	}
-	return &Client{
+	c := &Client{
 		db:               db,
 		hostName:         "test-node",
 		clock:            hlc.NewClock("test-node"),
 		replicatorNotify: make(chan struct{}, 1),
 		membershipNotify: make(chan struct{}, 1),
-		leaseTermLedger:  testLeaseTermLedgerOpen,
 	}
+	c.SetLeaseTermLedgerGate(testLeaseTermLedgerOpen)
+	return c
 }
 
 // The marker's entire job is to outlive the process that set it. A reseed that

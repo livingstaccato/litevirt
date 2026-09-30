@@ -344,7 +344,8 @@ type Client struct {
 	// DurablyLatched(LeaseTermLedgerV1). Nil or false means the lease is still
 	// taken but no term is minted — see SetLeaseTermLedgerGate for why this one
 	// predicate fails CLOSED when unset.
-	leaseTermLedger func() bool
+	// Atomic: read on replication goroutines that may already run when set.
+	leaseTermLedger atomic.Pointer[func() bool]
 
 	// credentialsSplit, when non-nil and returning true, permits WRITING the
 	// sensitive credential tables (host_fence_credentials, user_credentials,
@@ -352,7 +353,8 @@ type Client struct {
 	// DurablyLatched(CredentialsSplitV1). Fails CLOSED when unset, for the
 	// leaseTermLedger reason: those tables' shapes back-pressure a
 	// previous-release peer. See credentials_split.go.
-	credentialsSplit func() bool
+	// Atomic: read on replication goroutines that may already run when set.
+	credentialsSplit atomic.Pointer[func() bool]
 
 	// hostMembershipGate, when non-nil and returning true, permits WRITING
 	// host_membership. Injected via SetHostMembershipGate, wired to the durable
@@ -548,7 +550,7 @@ func (c *Client) digestV2On() bool { return c.digestV2Enabled != nil && c.digest
 //
 // The test constructors wire it open: a test cluster is single-version by
 // construction, and this gate answers a rolling-upgrade question.
-func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger = fn }
+func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger.Store(&fn) }
 
 // MayMintLeaseTerm reports whether this node may write a term row (nil-safe,
 // fail closed).
@@ -557,7 +559,8 @@ func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger = fn
 // that mints no term must not advertise readiness to enforce on one. Reading the
 // gate itself keeps that from becoming a second, drifting copy of the predicate.
 func (c *Client) MayMintLeaseTerm() bool {
-	return c.leaseTermLedger != nil && c.leaseTermLedger()
+	fn := c.leaseTermLedger.Load()
+	return fn != nil && *fn != nil && (*fn)()
 }
 
 // MayEmitTermCarryingProof reports whether this node may put the WIDENED

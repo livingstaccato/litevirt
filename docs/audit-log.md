@@ -93,7 +93,10 @@ username; `--since` takes an RFC3339 timestamp (entries at/after it).
 Use cases:
 - Who started VM `web-1`? — `lv audit ls --target vms/web-1 --action vm.start`
 - What did `alice` do today? — `lv audit ls --user alice --limit 200`
-- What touched the firewall recently? — `lv audit ls --action 'sg.*' --since 2026-06-01T00:00:00Z`
+- What touched the firewall recently? — `lv audit ls --action 'firewall.*' --since 2026-06-01T00:00:00Z`,
+  then again with `--action 'sg.*'` for security groups. Each row records the
+  policy before and after the change; the actions and the detail format are in
+  [firewall.md](firewall.md#audit-trail).
 
 ## Verifying
 

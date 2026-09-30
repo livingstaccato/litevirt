@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // AuditRecord is a single entry in the audit log.
@@ -144,6 +146,14 @@ func stampAfter(now time.Time, ceiling string) string {
 // replication), the INSERT is silently skipped — the replicator's
 // LWW guard does the right thing for the replicated path.
 func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
+	// id is the primary key and the insert is INSERT OR IGNORE, so a caller
+	// that left it empty got one row ever: every later id-less row was dropped
+	// silently, and the tail below advanced anyway, leaving the next row linked
+	// to a row that does not exist -- a sequence gap and a hash mismatch that
+	// `lv audit verify` reads as tampering. An id is not the caller's to forget.
+	if r.ID == "" {
+		r.ID = randid.New()
+	}
 	generated := r.Timestamp == ""
 	c.auditChain.mu.Lock()
 	defer c.auditChain.mu.Unlock()

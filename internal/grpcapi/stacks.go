@@ -1149,15 +1149,27 @@ func (s *Server) fanoutDeleteVM(ctx context.Context, vmName string, keepDisks bo
 // The username is deliberately a distinguishable system principal rather than a real
 // user, so the audit trail attributes the deletion to stack cleanup instead of
 // implying an operator did it.
+//
+// It enters DeleteVM below the RPC interceptors, so it applies the stale-replica
+// gate itself: a node back from a fence may still list a stack as "deleting"
+// with members that were rescheduled away, and must not act on them until its
+// replica has caught up (replica_gate.go). The reconciler retries.
 func (s *Server) DeleteVMForStackCleanup(ctx context.Context, req *pb.DeleteVMRequest) (*emptypb.Empty, error) {
+	if err := s.requireReplicaCaughtUp(ctx, "stack cleanup of VM "+req.GetName()); err != nil {
+		return nil, err
+	}
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	return s.DeleteVM(authCtx, req)
 }
 
 // DeleteContainerForStackCleanup is DeleteVMForStackCleanup for a stack's
-// container: DeleteContainer under the reconciler's system principal.
+// container: DeleteContainer under the reconciler's system principal, behind
+// the same stale-replica gate.
 func (s *Server) DeleteContainerForStackCleanup(ctx context.Context, req *pb.DeleteContainerRequest) (*emptypb.Empty, error) {
+	if err := s.requireReplicaCaughtUp(ctx, "stack cleanup of container "+req.GetName()); err != nil {
+		return nil, err
+	}
 	authCtx := context.WithValue(ctx, ctxKeyRole, "admin")
 	authCtx = context.WithValue(authCtx, ctxKeyUsername, "system:stack-reconciler")
 	return s.DeleteContainer(authCtx, req)

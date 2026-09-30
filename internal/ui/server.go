@@ -21,6 +21,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 //go:embed templates/*
@@ -134,7 +135,7 @@ func (s *Server) auditUIWrite(r *http.Request, action, target, detail string) {
 		return
 	}
 	if err := corrosion.InsertAuditLog(context.WithoutCancel(ctx), s.db, corrosion.AuditRecord{
-		Username: user, HostName: s.cluster, Action: action, Target: target,
+		ID: randid.New(), Username: user, HostName: s.cluster, Action: action, Target: target,
 		Detail: detail, Result: "ok",
 	}); err != nil {
 		slog.Error("ui: could not write the audit row for a mutation that already landed",

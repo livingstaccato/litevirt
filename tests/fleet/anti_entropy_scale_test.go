@@ -14,7 +14,8 @@ package fleet
 //
 // "legacy" is the pass as it was before #262: every member contacted, and a
 // mismatch answered with the full dump. It is reproduced exactly by running
-// the full-sweep pass (RunOnce) with every node answering StreamTableDump as
+// the full-sweep pass (RunOnce) with every node answering StreamTableDump, the
+// paged StreamTableRows and GetTableBucketDigests as
 // Unimplemented, which is what the pull's fallback does against an older peer.
 // "sampled" is the scheduled pass as the loop now runs it.
 //
@@ -88,7 +89,7 @@ func logAEStats(t *testing.T, label string, nodes int, stats map[string]AEMethod
 }
 
 func dumpCalls(s map[string]AEMethodStats) (full, table int) {
-	return s["StreamStateDump"].Calls + s["GetStateDump"].Calls, s["StreamTableDump"].Calls
+	return s["StreamStateDump"].Calls + s["GetStateDump"].Calls, s["StreamTableDump"].Calls + s["StreamTableRows"].Calls
 }
 
 // seedDrift writes a stacks row on n that no other node has and no push will
@@ -157,6 +158,8 @@ func TestFleet_AntiEntropyScale_PassCost(t *testing.T) {
 	// ── legacy: every member, full dump ──
 	for _, n := range c.Nodes {
 		defer n.DoNotImplement("StreamTableDump")()
+		defer n.DoNotImplement("StreamTableRows")()
+		defer n.DoNotImplement("StreamSensitiveTableRows")()
 		defer n.DoNotImplement("GetTableBucketDigests")()
 	}
 	c.ResetAEStats()

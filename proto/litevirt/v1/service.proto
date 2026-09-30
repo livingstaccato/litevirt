@@ -2276,6 +2276,20 @@ message SensitiveStateRequest {
     uint32 bucket_scheme = 4;
 }
 
+// TableRowsPage is one page of a streamed repair pull (StreamTableRows,
+// StreamSensitiveTableRows): at most a bounded number of rows of ONE table,
+// gzipped JSON rows in `columns` order. Tables arrive in merge-dependency order
+// (workload and operation parents first) and each table's pages contiguously,
+// so the receiver can merge page by page and hold only the parent tier whole.
+// The last message has final=true and may carry no rows.
+message TableRowsPage {
+    string table            = 1;
+    repeated string columns = 2;
+    bytes  rows             = 3; // gzipped JSON array of rows
+    int32  row_count        = 4;
+    bool   final            = 5;
+}
+
 // BucketDigestRequest asks for the bucket digests of the named tables, public
 // or sensitive, under bucket scheme `scheme`. sender must match the caller's
 // host certificate, as on the sensitive lane.
@@ -2878,6 +2892,15 @@ service LiteVirt {
     // certificate). An older build answers Unimplemented and the caller pulls
     // whole tables.
     rpc GetTableBucketDigests(BucketDigestRequest) returns (BucketDigestResponse);
+    // StreamTableRows is StreamTableDump as bounded pages instead of one blob:
+    // the server reads each table a page at a time and the client merges each
+    // page as it arrives (docs/design/ae-incremental.md). Peer-only, like
+    // StreamTableDump. An older build answers Unimplemented and the caller
+    // falls back to StreamTableDump.
+    rpc StreamTableRows(TableDumpRequest) returns (stream TableRowsPage);
+    // StreamSensitiveTableRows is the sensitive lane's paged pull; the sender
+    // must match the host certificate, as for StreamSensitiveStateDump.
+    rpc StreamSensitiveTableRows(SensitiveStateRequest) returns (stream TableRowsPage);
     // TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
     // fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
     rpc TriggerAntiEntropy(TriggerAntiEntropyRequest) returns (TriggerAntiEntropyResponse);

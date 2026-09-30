@@ -1,7 +1,6 @@
 # Incremental anti-entropy: bucketed digests and streamed repair
 
-Status: **in progress** — bucketed digests and the digest cache first, then
-streaming. This is the last part of colonelpanik/litevirt#262,
+Status: **implemented.** This is the last part of colonelpanik/litevirt#262,
 "Repair and probe traffic is not O(N)". The probe plan, observation repair,
 table-scoped dumps and settled N-way ties landed first (see
 [operating-model.md](../operating-model.md#replication)). What they left:
@@ -168,6 +167,13 @@ kept, so its settled-tie proof can read it. So memory is bounded by one page
 plus the parent tier of the pull — which, bucketed, is only the parent rows in
 the pulled buckets.
 
+Paging walks the primary key with a row-value comparison. A table with no
+known key, or a page that ends on a NULL key cell (a TEXT primary key may hold
+NULL, and `NULL > x` never holds), switches to OFFSET paging for the rest of
+that table, so no row is stranded behind the cursor. A peer that answers
+`StreamTableRows` with `Unimplemented` (the release before paging) gets the blob
+`StreamTableDump`, and one before that the full dump, as before.
+
 A page is not a snapshot of its table, and it never was: the whole-table dump
 already read each table under its own lock. The merge converges per row, so a
 row written between pages is either in a later page or caught by the next pass.
@@ -184,3 +190,30 @@ row written between pages is either in a later page or caught by the next pass.
   `dump_bytes` is the compressed size of one repair pull, now a bucketed or
   paged one; `rows_merged_total` and `rows_skipped_total` count as before.
 - `anti_entropy_legacy_repair` (default `false`).
+
+## Measured
+
+- **Bytes and rows per repair.** One drifted row in a 4,000-row table
+  (`TestFleet_AntiEntropy_Buckets_OneDriftedRowPullsOneBucket`): the bucketed,
+  paged pass moved about 8 KB (1.7 KB of rows, 6.3 KB of bucket digests) and
+  merged 21 rows; the whole-table pull of the same drift moved 180 KB and
+  merged 4,002. The bucket digests are now most of the cost of a small repair.
+- **Digest cost.** Over a 50-node cluster's rows with one `host_health` row
+  rewritten between digests, the cached digest takes 11 ms and 2.4 MB against
+  29 ms and 6.8 MB for a full scan on the same machine
+  (`BenchmarkStateDigestCached_50Nodes`, `BenchmarkStateDigest_50Nodes`).
+  `host_health` is most of those rows and is rescanned; the rest is not.
+- **Memory of one pull.** A whole-table repair of 20,000 rows
+  (`BenchmarkRepairPull`): the largest decoded unit the receiver holds is
+  2.3 MB for the blob and 118 KB (one page) for the paged pull. Total
+  allocation is about the same; what changes is that it is no longer all live
+  at once, on either side.
+
+## Left for later
+
+- Per-bucket invalidation. The cache is per table, so a table written every
+  pass (`host_health`, `audit_log`) is rescanned every pass. The pre-update
+  hook sees the row, so it could mark the one bucket instead.
+- Smaller bucket digests. Hashes travel as 16 hex characters in each of up to
+  256 buckets; raw bytes, or a second level of buckets for large tables, would
+  shrink the exchange that now dominates a small repair.

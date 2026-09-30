@@ -457,7 +457,10 @@ The secret-bearing tables (`StreamSensitiveStateDump`, `GetSensitiveStateDigest`
 are narrower still: peer only, and the certificate must name the sender.
 `GetTableBucketDigests`, which returns per-bucket counts and hashes for public
 and sensitive tables alike so anti-entropy can pull only the buckets that
-differ, has the same rule.
+differ, has the same rule, as does `StreamSensitiveTableRows`, the paged form
+of the sensitive dump. `StreamTableRows`, the paged form of
+`StreamTableDump`, is peer-only and refuses a sensitive table exactly as that
+RPC does.
 
 Operators see convergence without row contents. `GetStateDigest` and
 `GetClusterStateDigest` return per-table counts and hashes to an `operator`

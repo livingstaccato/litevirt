@@ -120,9 +120,8 @@ func (c *Client) tiesStillTracked(ties map[string][2]string) bool {
 // A table pulled narrowed to some buckets (scope) is proven over those
 // buckets, and every other bucket must digest equal to the peer's bucket
 // digest the pass read: residualIsTrackedTies checks both from one scan.
-func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []string, dump []byte, remote map[string]*pb.TableDigest, scope *pullScope) {
+func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []string, payload *syncPayload, remote map[string]*pb.TableDigest, scope *pullScope) {
 	tracked := c.UnresolvedTieTables()
-	var payload *syncPayload
 	for _, t := range tables {
 		key := settledKey(peer, t)
 		r, rok := remote[t]
@@ -131,12 +130,8 @@ func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []st
 			continue
 		}
 		if payload == nil {
-			p, err := decompressPayload(dump)
-			if err != nil {
-				c.dropSettled(key)
-				continue
-			}
-			payload = p
+			c.dropSettled(key)
+			continue
 		}
 		var st *syncTable
 		for i := range payload.Tables {

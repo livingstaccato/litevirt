@@ -145,36 +145,26 @@ func (ae *AntiEntropy) bucketScope(ctx context.Context, client pb.LiteVirtClient
 	return scope
 }
 
-// mergeRepairPull merges one repair pull, counting its rows by scope first:
-// "bucket" for a table the pull narrowed (a co-bucketed parent included),
-// "table" for one sent whole. sensitive selects the lane's allowlist.
-func (c *Client) mergeRepairPull(data []byte, pull []string, scope *pullScope, sensitive bool) error {
+// mergeRepairPull merges one blob repair pull, counting its rows by scope
+// first (observePulledRows), and returns the decoded payload for the
+// settled-tie proof. sensitive selects the lane's allowlist.
+func (c *Client) mergeRepairPull(data []byte, pull []string, scope *pullScope, sensitive bool) (*syncPayload, error) {
 	if len(data) == 0 {
-		return nil
+		return &syncPayload{}, nil
 	}
 	payload, err := decompressPayload(data)
 	if err != nil {
 		slog.Error("sync: decompress", "error", err)
-		return err
+		return nil, err
 	}
-	var narrowedTo dumpScope
-	var buckets map[string][]int
-	if scope != nil {
-		buckets = scope.buckets
+	rows := make(map[string]int, len(payload.Tables))
+	for _, t := range payload.Tables {
+		rows[t.Name] += len(t.Rows)
 	}
+	c.observePulledRows(rows, pull, scope, sensitive)
 	allowed := replicatedTableSet
 	if sensitive {
 		allowed = sensitiveTableSet
-		_, narrowedTo = resolveSensitiveDumpScope(pull, buckets)
-	} else if _, sc, rerr := resolveTableDumpScope(pull, buckets); rerr == nil {
-		narrowedTo = sc
 	}
-	for _, t := range payload.Tables {
-		label := "table"
-		if narrowedTo[t.Name] != nil {
-			label = "bucket"
-		}
-		c.observePullRows(label, len(t.Rows))
-	}
-	return c.mergeStatePayloadLWWWithAllowlist(payload, allowed)
+	return payload, c.mergeStatePayloadLWWWithAllowlist(payload, allowed)
 }

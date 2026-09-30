@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -261,6 +262,37 @@ func (s *Server) StreamTableDump(req *pb.TableDumpRequest, stream grpc.ServerStr
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return streamStateDump(data, stream.Send)
+}
+
+// StreamTableRows pages the same tables StreamTableDump would send, a bounded
+// page at a time, so neither side holds a whole table (corrosion/table_rows.go).
+//
+// Peer-only, for the same reason as StreamTableDump; a sensitive-lane table
+// is refused the same way.
+func (s *Server) StreamTableRows(req *pb.TableDumpRequest, stream grpc.ServerStreamingServer[pb.TableRowsPage]) error {
+	if err := s.requirePeerCert(stream.Context()); err != nil {
+		return err
+	}
+	err := s.db.StreamTableRowsScoped(stream.Context(), req.GetTables(),
+		requestedBuckets(req.GetBucketScheme(), req.GetBuckets()), stream.Send)
+	if errors.Is(err, corrosion.ErrTableDumpEmpty) || errors.Is(err, corrosion.ErrTableDumpSensitive) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return err
+}
+
+// StreamSensitiveTableRows is the sensitive lane's paged pull. The sender
+// must match the peer certificate, as for StreamSensitiveStateDump; no tables
+// named is the whole lane.
+func (s *Server) StreamSensitiveTableRows(req *pb.SensitiveStateRequest, stream grpc.ServerStreamingServer[pb.TableRowsPage]) error {
+	if req.GetSender() == "" {
+		return status.Error(codes.InvalidArgument, "sender required")
+	}
+	if err := requireReplicationPeer(stream.Context(), req.GetSender()); err != nil {
+		return err
+	}
+	return s.db.StreamSensitiveTableRowsScoped(stream.Context(), req.GetTables(),
+		requestedBuckets(req.GetBucketScheme(), req.GetBuckets()), stream.Send)
 }
 
 // requestedBuckets turns a dump request's bucket narrowing into the form the

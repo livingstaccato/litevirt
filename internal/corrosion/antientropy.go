@@ -312,18 +312,18 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		// row made every repair cost the whole cluster's state (#262). And of
 		// those, only the buckets that differ, where the peer can say which.
 		scope := ae.bucketScope(ctx, client, peerName, pull)
-		data, err := fetchTableDumpScoped(ctx, client, pull, scope)
-		if err != nil {
-			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
+		kept, pullErr, mergeErr := ae.pullAndMerge(ctx, client, pull, scope, nil)
+		if pullErr != nil {
+			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", pullErr)
 			completed = false
-		} else if mergeErr := ae.client.mergeRepairPull(data, pull, scope, false); mergeErr != nil {
+		} else if mergeErr != nil {
 			// Operational/commit failure during merge: this cycle's convergence is incomplete.
 			// The merge is per-row-idempotent and non-destructive, so the next cycle retries.
 			slog.Warn("anti-entropy: merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
 			completed = false
 		} else {
-			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
-			ae.client.recordSettledTies(ctx, peerName, pull, data, remoteMap, scope)
+			slog.Info("anti-entropy: merge complete", "peer", peerName, "tables", pull)
+			ae.client.recordSettledTies(ctx, peerName, pull, kept, remoteMap, scope)
 			if obsDue {
 				ae.client.markObservationsRepaired(now)
 			}
@@ -415,20 +415,20 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		scope = ae.bucketScope(ctx, client, peerName, mismatched)
 		req = &pb.SensitiveStateRequest{Sender: req.GetSender(), Tables: mismatched, Buckets: scope.wire(), BucketScheme: BucketScheme}
 	}
-	data, err := fetchSensitiveStateDump(ctx, client, req)
-	if err != nil {
-		if status.Code(err) == codes.Unimplemented {
+	_, pullErr, mergeErr := ae.pullAndMerge(ctx, client, mismatched, scope, req)
+	if pullErr != nil {
+		if status.Code(pullErr) == codes.Unimplemented {
 			slog.Debug("anti-entropy: peer has no sensitive state dump RPC", "peer", peerName)
 			return
 		}
-		slog.Warn("anti-entropy: sensitive dump RPC error", "peer", peerName, "error", err)
+		slog.Warn("anti-entropy: sensitive dump RPC error", "peer", peerName, "error", pullErr)
 		return
 	}
-	if mergeErr := ae.client.mergeRepairPull(data, mismatched, scope, true); mergeErr != nil {
+	if mergeErr != nil {
 		slog.Warn("anti-entropy: sensitive merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
 		return
 	}
-	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "bytes", len(data))
+	slog.Info("anti-entropy: sensitive merge complete", "peer", peerName, "tables", mismatched)
 }
 
 // fetchStateDump pulls a peer's full state dump, preferring the chunked

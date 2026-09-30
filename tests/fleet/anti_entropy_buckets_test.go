@@ -154,10 +154,10 @@ func TestFleet_AntiEntropy_Buckets_OneDriftedRowPullsOneBucket(t *testing.T) {
 		t.Errorf("the stand-down still asked for bucket digests: %+v", whole)
 	}
 
-	bb := bucketed["StreamTableDump"].Bytes + bucketed["GetTableBucketDigests"].Bytes
+	bb := bucketed["StreamTableRows"].Bytes + bucketed["GetTableBucketDigests"].Bytes
 	wb := whole["StreamTableDump"].Bytes
 	t.Logf("one drifted row in %d: bucketed pass moved %d bytes (dump %d + bucket digests %d), rows %d; whole-table pass %d bytes, rows %d",
-		rows, bb, bucketed["StreamTableDump"].Bytes, bucketed["GetTableBucketDigests"].Bytes, pulled["bucket"], wb, legacyPulled["table"])
+		rows, bb, bucketed["StreamTableRows"].Bytes, bucketed["GetTableBucketDigests"].Bytes, pulled["bucket"], wb, legacyPulled["table"])
 	if bb*10 > wb {
 		t.Errorf("bucketed pass moved %d bytes, the whole-table pass %d: want at least a 10x drop", bb, wb)
 	}
@@ -261,6 +261,8 @@ func TestFleet_AntiEntropy_Buckets_MixedVersionPair(t *testing.T) {
 
 	t.Run("new pulls from old", func(t *testing.T) {
 		defer a.DoNotImplement("GetTableBucketDigests")()
+		defer a.DoNotImplement("StreamTableRows")()
+		defer a.DoNotImplement("StreamSensitiveTableRows")()
 		execBeneath(t, a, `UPDATE stacks SET state = 'old-peer', updated_at = '2026-02-01T00:00:00Z' WHERE name = 'bulk-00011'`)
 		c.ResetAEStats()
 		runFullPass(t, b, false)

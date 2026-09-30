@@ -87,7 +87,10 @@ of acting — it says nothing about whether the resulting rows have replicated.
   the pass asks the peer for the table's 256 bucket digests
   (`GetTableBucketDigests`) and pulls only the buckets that differ, a child
   table's parent narrowed to the same buckets; a peer without that RPC gets the
-  whole table. A table's digest is kept between passes until a row of it
+  whole table. The pull itself is paged (`StreamTableRows`: at most 1,000 rows
+  or 1 MiB of rows a message, merged as each arrives), with the blob
+  `StreamTableDump` as the fallback for a peer without it. A table's digest is
+  kept between passes until a row of it
   changes (at most 10 minutes), so a pass rescans only the tables written since
   the last one ([design/ae-incremental.md](design/ae-incremental.md)). Observation tables
   (`host_health`, `health_evaluator_status`, `host_capacity_observations`),

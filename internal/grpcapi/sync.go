@@ -143,6 +143,8 @@ func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*
 				return
 			}
 			defer conn.Close()
+			// Verification: the peer's digest as of now, not its cache.
+			pctx = corrosion.WithFreshDigest(pctx)
 			pub, err := client.GetStateDigest(pctx, &emptypb.Empty{})
 			if err != nil {
 				results[i] = result{host: host, err: err, unsup: status.Code(err) == codes.Unimplemented}
@@ -180,8 +182,13 @@ func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.Stat
 	}
 
 	// The per-pass hot path: every peer's pass asks, so it is served from the
-	// digest cache (corrosion/digest_cache.go) where that is still valid.
-	digests, err := s.db.StateDigestCached(ctx)
+	// digest cache (corrosion/digest_cache.go) where that is still valid —
+	// unless the caller is verifying and asked for a scan now.
+	digest := s.db.StateDigestCached
+	if corrosion.FreshDigestRequested(ctx) {
+		digest = s.db.StateDigest
+	}
+	digests, err := digest(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -374,7 +381,11 @@ func (s *Server) GetSensitiveStateDigest(ctx context.Context, req *pb.SensitiveS
 		return nil, err
 	}
 
-	digests, err := s.db.SensitiveStateDigestCached(ctx)
+	digest := s.db.SensitiveStateDigestCached
+	if corrosion.FreshDigestRequested(ctx) {
+		digest = s.db.SensitiveStateDigest
+	}
+	digests, err := digest(ctx)
 	if err != nil {
 		return nil, err
 	}

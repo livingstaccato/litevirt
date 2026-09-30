@@ -5,12 +5,35 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/grpc/metadata"
 	"modernc.org/sqlite"
 )
+
+// digestFreshKey is the request metadata that asks GetStateDigest and
+// GetSensitiveStateDigest for a digest scanned now, not one from the cache.
+// A verification — `lv cluster converge`, the reseed convergence check, the
+// NetBox corroboration, the operator's full pass — must compare what both
+// sides hold NOW. An older server has no cache, so it ignores the key and
+// scans anyway.
+const digestFreshKey = "x-litevirt-digest-fresh"
+
+// WithFreshDigest marks an outgoing digest request as needing a fresh scan.
+func WithFreshDigest(ctx context.Context) context.Context {
+	return metadata.AppendToOutgoingContext(ctx, digestFreshKey, "1")
+}
+
+// FreshDigestRequested reports whether an incoming digest request asked for a
+// fresh scan.
+func FreshDigestRequested(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	return ok && len(md.Get(digestFreshKey)) > 0
+}
 
 // The anti-entropy digest cache (colonelpanik/litevirt#262,
 // docs/design/ae-incremental.md).
@@ -30,9 +53,13 @@ import (
 // What the hook cannot see is bounded rather than trusted:
 //   - DDL fires no row hook, so PRAGMA schema_version is part of the key;
 //   - digest_v2 changes every encoding, so its flag is part of the key;
-//   - a write by another PROCESS (NewLocalClient) or a writer that commits
-//     outside Client.mu is covered by digestCacheMaxAge: no entry is served
-//     past it. The generation is read under the same read lock the scan
+//   - a write by another PROCESS fires no hook here. The one such writer
+//     litevirt has, NewLocalClient (`lv user reset-admin`), touches
+//     <data_dir>/digest-invalidate on Close when it wrote, and an entry older
+//     than that file's mtime is not served. What escapes both — a tool that
+//     died before Close, a writer outside litevirt, one committing outside
+//     Client.mu — is bounded by digestCacheMaxAge: no entry is served past
+//     it. The generation is read under the same read lock the scan
 //     holds, and every in-package writer holds the write lock across its
 //     commit, so for them the hook and the scan cannot interleave;
 //   - the operator's full pass computes its own digests fresh.
@@ -54,6 +81,49 @@ type tableGenerations struct {
 	// then cannot vouch for that connection's writes, and nothing is cached.
 	broken atomic.Bool
 	refs   int // guarded by generationRegistry.mu
+}
+
+// changed reports whether any row change has been seen.
+func (g *tableGenerations) changed() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, n := range g.gen {
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// digestMarkerFile is touched in the data directory by an out-of-process
+// writer (NewLocalClient) so the daemon's digest cache drops what it cannot
+// otherwise know is stale.
+const digestMarkerFile = "digest-invalidate"
+
+func touchDigestMarker(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+	p := filepath.Join(dataDir, digestMarkerFile)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	f.Close()
+	now := time.Now()
+	return os.Chtimes(p, now, now)
+}
+
+// externalWriteMark is the digest marker's mtime, zero when there is none.
+func (c *Client) externalWriteMark() time.Time {
+	if c.dataDir == "" {
+		return time.Time{}
+	}
+	fi, err := os.Stat(filepath.Join(c.dataDir, digestMarkerFile))
+	if err != nil {
+		return time.Time{}
+	}
+	return fi.ModTime()
 }
 
 func (g *tableGenerations) bump(table string) {
@@ -168,7 +238,7 @@ func (c *Client) SetDigestCacheEnabled(on bool) {
 	}
 }
 
-func (c *Client) cachedDigest(table string, schema int64, v2 bool, now time.Time) (tableDigestSet, bool) {
+func (c *Client) cachedDigest(table string, schema int64, v2 bool, mark, now time.Time) (tableDigestSet, bool) {
 	if c.digests.off.Load() {
 		return tableDigestSet{}, false
 	}
@@ -179,7 +249,8 @@ func (c *Client) cachedDigest(table string, schema int64, v2 bool, now time.Time
 	c.digests.mu.Lock()
 	e, ok := c.digests.entries[table]
 	c.digests.mu.Unlock()
-	if !ok || e.gen != gen || e.schema != schema || e.v2 != v2 || now.Sub(e.at) >= digestCacheMaxAge || now.Before(e.at) {
+	if !ok || e.gen != gen || e.schema != schema || e.v2 != v2 || now.Sub(e.at) >= digestCacheMaxAge || now.Before(e.at) ||
+		(!mark.IsZero() && !mark.Before(e.at)) {
 		return tableDigestSet{}, false
 	}
 	return e.set, true

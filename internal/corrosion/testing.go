@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync/atomic"
 
@@ -109,6 +110,21 @@ func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 		membershipNotify: make(chan struct{}, 1),
 		leaseTermLedger:  testLeaseTermLedgerOpen,
 	}, nil
+}
+
+// ExecOutOfProcessForTest runs one statement on this client's database
+// through a handle of its own that carries no pre-update hook — the write
+// another process makes, which this client's digest cache cannot see.
+func (c *Client) ExecOutOfProcessForTest(q string, args ...interface{}) error {
+	db, err := sql.Open("sqlite", c.dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	_, err = db.Exec(q, args...)
+	return err
 }
 
 // SetDataDirForTest points a test client at a data directory, so the node-local

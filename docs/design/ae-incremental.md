@@ -56,12 +56,23 @@ still not the only defence:
 - `PRAGMA schema_version` is part of the cache key, so DDL (which fires no row
   hook) drops everything;
 - the `digest_v2` flag is part of the key;
+- a write by another process fires no hook in the daemon. litevirt's one such
+  writer, `NewLocalClient` (`lv user reset-admin`), touches
+  `<data_dir>/digest-invalidate` when it closes after writing, and no entry
+  older than that file's mtime is served;
 - an entry is never trusted past `digestCacheMaxAge` (10 minutes). That bounds
-  what the hook cannot see: a write by another process (`NewLocalClient`) and a
-  writer that commits outside `Client.mu` (none today; the generation is read
-  under the same read lock the scan holds, and every in-package writer holds
-  the write lock across its commit);
-- `lv cluster converge` (`RunOnce`) recomputes its own digests from a scan.
+  what the rest cannot see: a tool that died before closing, a writer outside
+  litevirt, and a writer that commits outside `Client.mu` (none today; the
+  generation is read under the same read lock the scan holds, and every
+  in-package writer holds the write lock across its commit);
+- verification never reads a cache, on either side. A caller that is checking
+  convergence sends `x-litevirt-digest-fresh` request metadata, and
+  `GetStateDigest` and `GetSensitiveStateDigest` then scan instead of serving
+  the cache. `lv cluster converge` sets it on both halves: its full pass
+  (`RunOnce`) scans locally and asks every peer for a scan, and its
+  cross-host report (`GetClusterStateDigest`) does the same. So do the reseed
+  convergence check and the NetBox inventory corroboration. An older server has
+  no cache, so it scans whatever the metadata says.
 
 A single-row incremental update of the bucket hash was considered and left
 out: the pre-update hook fires before the transaction commits, so a rolled-back

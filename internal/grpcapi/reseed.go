@@ -463,6 +463,8 @@ func (s *Server) reseedLocalDigests(ctx context.Context) ([]corrosion.TableDiges
 // logged, because it means the sensitive half went unverified.
 func (s *Server) reseedRemoteDigests(ctx context.Context, peer pb.LiteVirtClient) (map[string]string, error) {
 	remote := map[string]string{}
+	// A convergence check: the source's digests as of now, not its cache.
+	ctx = corrosion.WithFreshDigest(ctx)
 	resp, err := peer.GetStateDigest(ctx, &emptypb.Empty{})
 	if err != nil {
 		return nil, err

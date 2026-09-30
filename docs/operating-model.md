@@ -90,7 +90,8 @@ of acting — it says nothing about whether the resulting rows have replicated.
   whole table. The pull itself is paged (`StreamTableRows`: at most 1,000 rows
   or 1 MiB of rows a message, merged as each arrives), with the blob
   `StreamTableDump` as the fallback for a peer without it. A table's digest is
-  kept between passes until a row of it
+  kept between passes (never for `lv cluster converge`, which has every host
+  scan) until a row of it
   changes (at most 10 minutes), so a pass rescans only the tables written since
   the last one ([design/ae-incremental.md](design/ae-incremental.md)). Observation tables
   (`host_health`, `health_evaluator_status`, `host_capacity_observations`),

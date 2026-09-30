@@ -242,11 +242,12 @@ func (c *Client) tableDigestSets(ctx context.Context, tables []string, fresh boo
 	start := time.Now()
 	schema, schemaOK := c.schemaVersion(ctx)
 	v2 := c.digestV2On()
+	mark := c.externalWriteMark()
 	out := make([]tableDigestSet, 0, len(tables))
 	cached, computed := 0, 0
 	for _, table := range tables {
 		if !fresh && schemaOK {
-			if set, ok := c.cachedDigest(table, schema, v2, time.Now()); ok {
+			if set, ok := c.cachedDigest(table, schema, v2, mark, time.Now()); ok {
 				out = append(out, set)
 				cached++
 				continue

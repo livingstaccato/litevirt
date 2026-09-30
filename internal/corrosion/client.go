@@ -112,7 +112,10 @@ type Client struct {
 	dsn       string
 	tableGens *tableGenerations
 	digests   digestCache
-	list      *memberlist.Memberlist
+	// outOfProcess marks a client opened beside the daemon (NewLocalClient):
+	// on Close, if it wrote, it touches the digest marker (digest_cache.go).
+	outOfProcess bool
+	list         *memberlist.Memberlist
 	// gossipMode is the stage memberlist was created with, and gossipKeyring the
 	// keyring it encrypts with (nil when off). The keyring changes live through
 	// SetGossipKeys, serialised by gossipKeyMu; the stage never changes.
@@ -1013,16 +1016,21 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 // get picked up by the running daemon's replicator and broadcast to peers.
 func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 	dbPath := filepath.Join(dataDir, "state.db")
-	db, err := sql.Open("sqlite", sqliteDSN(dbPath))
+	dsn := sqliteDSN(dbPath)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 	c := &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
+		outOfProcess:     true,
 		dataDir:          dataDir,
 		replicatorNotify: make(chan struct{}),
 		membershipNotify: make(chan struct{}, 1),
@@ -1051,6 +1059,14 @@ func (c *Client) Close() error {
 	if c.db != nil {
 		err := c.db.Close()
 		if c.tableGens != nil {
+			// A client beside the daemon (NewLocalClient) that wrote tells
+			// the daemon's digest cache, which its hook cannot see.
+			if c.outOfProcess && c.tableGens.changed() {
+				if terr := touchDigestMarker(c.dataDir); terr != nil {
+					slog.Warn("digest cache: could not mark an out-of-process write; the daemon's cached digests catch up within 10 minutes",
+						"error", terr)
+				}
+			}
 			releaseGenerations(c.dsn)
 		}
 		return err

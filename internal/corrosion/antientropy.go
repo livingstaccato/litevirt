@@ -269,6 +269,10 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	defer conn.Close()
 
 	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
+	if full {
+		// The operator's pass compares what the peer holds now.
+		dctx = WithFreshDigest(dctx)
+	}
 	resp, err := client.GetStateDigest(dctx, &emptypb.Empty{})
 	dcancel()
 	if err != nil {
@@ -330,7 +334,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		}
 	}
 
-	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap)
+	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full)
 	return completed
 }
 
@@ -384,12 +388,15 @@ func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string
 	return out
 }
 
-func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest) {
+func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full bool) {
 	if len(localMap) == 0 {
 		return
 	}
 	req := &pb.SensitiveStateRequest{Sender: ae.client.HostName()}
 	dctx, dcancel := context.WithTimeout(ctx, antiEntropyDigestTimeout)
+	if full {
+		dctx = WithFreshDigest(dctx)
+	}
 	resp, err := client.GetSensitiveStateDigest(dctx, req)
 	dcancel()
 	if err != nil {

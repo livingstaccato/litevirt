@@ -142,7 +142,7 @@ references a top-level `ipsets:` entry — useful for big admin lists.
 The CLI lives at `lv sg …` and `lv firewall …`:
 
 ```
-# Per-NIC tier: CRUD on security groups (mutates Corrosion state directly)
+# Per-NIC tier: CRUD on security groups (through the daemon; audited, needs sg.write)
 lv sg create web
 lv sg ls
 lv sg rule-add <sg-id> --direction ingress --proto tcp --port 80 --action accept
@@ -185,8 +185,9 @@ cluster state and loaded by the reconciler's `CorrosionPlanLoader`.
 Every firewall-policy change made through the daemon lands in the signed
 audit log (`lv audit ls`, see [audit-log.md](audit-log.md)). That covers the
 CLI, the REST API and the web UI alike, because all three reach the same gRPC
-handlers. The web UI's security-group pages have no gRPC equivalent, so they
-write the row themselves, naming the user the session belongs to.
+handlers. The web UI's security-group pages still write in-process rather than
+through those RPCs, so they write the same row themselves, naming the user the
+session belongs to.
 
 | Action | Target | Recorded by |
 |---|---|---|
@@ -195,8 +196,8 @@ write the row themselves, naming the user the session belongs to.
 | `firewall.host-rule.add` / `.rm` | rule id | `lv firewall host-rule add/rm`, UI |
 | `firewall.ipset.add` / `.rm` | set name (add) / set id (rm) | `lv firewall ipset add/rm`, UI |
 | `sg.bind` | VM name | `lv sg bind`, `POST /api/v1/vms/bind-sgs` |
-| `sg.add` / `sg.rm` | group name (add) / group id (rm) | UI |
-| `sg.rule.add` / `sg.rule.rm` | group id (add) / rule id (rm) | UI |
+| `sg.add` / `sg.rm` | group name (add) / group id (rm) | `lv sg create/rm`, UI |
+| `sg.rule.add` / `sg.rule.rm` | group id (add) / rule id (rm) | `lv sg rule-add/rule-rm`, UI |
 
 The row's user is the authenticated caller. Its detail records the policy
 before and after the change, in the form `before=<state> after=<state>`:
@@ -218,14 +219,17 @@ A state is one of:
 - `unknown(<error>)`: the read failed, so the row claims nothing about what
   was there. A failed read is never recorded as `none`.
 
-`lv sg create`, `lv sg rm`, `lv sg rule-add` and `lv sg rule-rm` are the
-exception. They write the host's Corrosion database directly rather than going
-through the daemon, so they leave **no audit row**. Writing one from the CLI
-process would break the chain rather than extend it. The daemon holds each
-host's sub-chain tail and its signing key, so a row appended by a second
-process would fork that tail and arrive unsigned. `lv audit verify` would then
-report tampering. Use the web UI's security-group pages when you need the
-change on the record.
+`lv sg create`, `lv sg rm`, `lv sg rule-add` and `lv sg rule-rm` go through
+the daemon's `CreateSecurityGroup`, `DeleteSecurityGroup`,
+`AddSecurityGroupRule` and `RemoveSecurityGroupRule` RPCs. Before that they
+wrote the host's Corrosion database straight from the CLI process, which
+skipped authorization and left no audit row. Each RPC checks the `sg.write`
+verb at `/` (Admin and NetworkAdmin hold it; Operator holds only `sg.read`; a
+cluster with no role bindings falls back to the operator role), and re-renders
+the connected host's ruleset at once, as the other tiers do. Against a daemon
+older than these RPCs the four commands fail with an error saying to upgrade
+litevirtd; they do not fall back to writing the database. `lv sg ls` and
+`lv sg rule-ls` are reads and still query the local database.
 
 ## Default-deny rollout
 

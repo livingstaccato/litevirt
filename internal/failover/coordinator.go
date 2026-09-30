@@ -752,6 +752,9 @@ func (c *Coordinator) run(ctx context.Context) {
 	// Re-certify, at the current generation, proofs whose certificate a forced
 	// voter reconfiguration replaced: their destinations refuse them until then.
 	c.recertifyReplaced(ctx)
+	// Claim, for their own value, proofs minted without a certificate before
+	// recovery claims were enforced: their destinations refuse them until then.
+	c.certifyUncertified(ctx)
 
 	// Settle any relocate-restore markers left by an indeterminate restore or a
 	// coordinator crash mid-restore. This runs every cycle, independent of the

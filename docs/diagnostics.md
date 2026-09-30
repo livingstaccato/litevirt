@@ -1117,6 +1117,27 @@ CRL has reached them it refuses with `recovery_claim_supersede_unproven`, and
 the next lease-holder tick retries. See
 [design/recovery-claims.md](design/recovery-claims.md) §3.12.
 
+### A recovery minted before recovery claims were enforced (`ha.claim.uncertified`)
+
+Evaluator `recovery_claim`, subject `cluster/claims`, severity warning. Written
+by the leader-lease holder while recovery claims are enforced. A reschedule or
+container relocation minted without a certificate just before enforcement
+turned on (the `recovery_claim_v1` latch forming, genesis, or
+`lv cluster voter init` after a reset) is refused by its destination with
+`recovery_claim_unproven`, because nothing is grandfathered. The lease holder
+claims each such proof for its own value on its next tick, naming as the source
+the old owner its proof-grade fence binding records, and attaches the
+certificate; the destination then runs it and the condition resolves. If
+another recovery was decided for the workload instead, that one is written in
+its place. The evidence names each workload, its destination and proof, and
+where a refusal shows (`lv cluster claim vm/<name>`).
+
+A proof that binds no proof-grade fence of its old owner (a best-effort fence)
+names no owner for the voters to probe, so it cannot be claimed and will not run
+while recovery claims are enforced; the evidence says so. Set
+`enforcement.recovery_claim: false` on every host until it has run, then turn it
+back on.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

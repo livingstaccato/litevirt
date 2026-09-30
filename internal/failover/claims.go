@@ -466,6 +466,67 @@ func (c *Coordinator) recertifyReplaced(ctx context.Context) {
 	}
 }
 
+// certifyUncertified claims, for its OWN value, every pending proof minted
+// without a certificate before recovery claims were enforced
+// (corrosion.UncertifiedPendingProofs). The claim is the one a coordinator
+// would have run before minting it: key (workload, the proof's owner epoch,
+// attempt 0), the proof as the value, and its fenced old owner
+// (corrosion.UncertifiedProofSource) as the source every voter probes. When
+// it decides this proof, the certificate is attached the way a
+// re-certification is (SetProofClaimCertificate), and the destination runs it
+// on its next pass. When another value was decided for the key it is handled
+// as recovery_claim_lost: a decided reschedule is written in its place, and
+// this proof never executes. A refusal writes nothing and is retried next
+// tick. Nothing is grandfathered: without a certificate a proof does not run.
+func (c *Coordinator) certifyUncertified(ctx context.Context) {
+	if !c.claimsEnforced(ctx) || c.Claimer == nil {
+		return
+	}
+	pending, err := corrosion.UncertifiedPendingProofs(ctx, c.db)
+	if err != nil {
+		return
+	}
+	for _, pr := range pending {
+		source, ok := corrosion.UncertifiedProofSource(pr.ActionProof)
+		if !ok {
+			continue // reported by ha.claim.uncertified; nothing to probe
+		}
+		action := ActionReschedule
+		if pr.Action == corrosion.ActionRelocate {
+			action = ActionRelocate
+		}
+		key, err := corrosion.ClaimKeyForProof(pr.ActionProof, 0)
+		if err != nil {
+			continue
+		}
+		cl, _, err := c.claimAttempt(ctx, key, pr.ActionProof, source, nil)
+		if err != nil {
+			c.noteClaimRefused(ctx, action, pr.TargetKind, pr.TargetName, source, err)
+			continue
+		}
+		if cl.Proof.ID != pr.ID || !corrosion.ProofBindingEqual(cl.Proof, pr.ActionProof) {
+			c.noteClaimLost(action, pr.TargetKind, pr.TargetName, source, cl.Proof)
+			if pr.TargetKind == "vm" && cl.Proof.Action == corrosion.ActionReschedule {
+				if err := corrosion.WriteVMRescheduleProof(ctx, c.db, cl.Proof, pr.TargetName, cl.Proof.DestHost); err != nil &&
+					!errors.Is(err, corrosion.ErrNoRowsAffected) {
+					slog.Warn("failover: write the decided reschedule in place of an uncertified one", "vm", pr.TargetName,
+						"proof", cl.Proof.ID, "error", err)
+				}
+			}
+			continue
+		}
+		re := pr.ActionProof
+		re.ClaimCertificate = cl.Proof.ClaimCertificate
+		if err := corrosion.SetProofClaimCertificate(ctx, c.db, re); err != nil && !errors.Is(err, corrosion.ErrNoRowsAffected) {
+			slog.Warn("failover: record the certificate of a proof minted before recovery claims were enforced",
+				"proof", pr.ID, "error", err)
+			continue
+		}
+		slog.Info("failover: certified a recovery minted before recovery claims were enforced", "proof", pr.ID,
+			"kind", pr.TargetKind, "name", pr.TargetName, "dest", pr.DestHost, "source", source)
+	}
+}
+
 // retryClaimsFor marks host's recovery to be re-run on the next tick.
 func (c *Coordinator) retryClaimsFor(host string) {
 	if c.claimRetry == nil {

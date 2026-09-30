@@ -349,3 +349,45 @@ func (c *Client) updateProofClaimCertificateLocal(tx *sql.Tx, tableName string, 
 	}
 	return nil
 }
+
+// UncertifiedPendingProofs lists the pending ownership-transfer proofs that
+// carry no recovery-claim certificate: reschedules and relocations minted
+// before recovery claims were enforced (the latch forming, genesis, or
+// `lv cluster voter init` after a reset). Under enforcement a destination
+// refuses every one (recovery_claim_unproven), so the lease holder claims each
+// for its own value (failover's certifyUncertified) and reports it while it
+// waits (ha.claim.uncertified). One query, so the two read one set.
+func UncertifiedPendingProofs(ctx context.Context, c *Client) ([]ProofRecord, error) {
+	rows, err := c.Query(ctx, `SELECT id FROM runtime_action_proofs
+		WHERE deleted_at IS NULL AND status = 'prepared' AND claim_certificate = ''
+		  AND action IN ('reschedule', 'relocate') ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	var out []ProofRecord
+	for _, r := range rows {
+		pr, ok, err := GetActionProof(ctx, c, r.String("id"))
+		if err != nil {
+			return nil, err
+		}
+		if ok && pr.ClaimCertificate == "" {
+			out = append(out, pr)
+		}
+	}
+	return out, nil
+}
+
+// UncertifiedProofSource is the old owner a claim for an uncertified proof
+// names: the host its proof-grade fence binding (fence_epoch) records, the
+// owner the proof was minted to evict. ok=false when the proof carries none;
+// no claim can then name an owner for the voters to probe, so none is made.
+// It is never inferred from timestamps or from whichever host is fenced now:
+// a lagging coordinator could forge "minted before", and a wrong source is a
+// probe of the wrong host.
+func UncertifiedProofSource(p ActionProof) (string, bool) {
+	ref, ok := ParseFenceEpoch(p.FenceEpoch)
+	if !ok || ref.Host == "" {
+		return "", false
+	}
+	return ref.Host, true
+}

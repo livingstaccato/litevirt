@@ -304,8 +304,12 @@ func (s *Server) deadRemovalRefusal(ctx context.Context, h *corrosion.HostRecord
 // ── ha.claim.stranded (§3.12, §5.4) ────────────────────────────────────────
 
 const (
-	claimEvaluator       = "recovery_claim"
-	condClaimStranded    = "ha.claim.stranded"
+	claimEvaluator    = "recovery_claim"
+	condClaimStranded = "ha.claim.stranded"
+	// condClaimUncertified names each pending recovery minted without a
+	// certificate before recovery claims were enforced, which its destination
+	// refuses until the lease holder has claimed it (certifyUncertified).
+	condClaimUncertified = "ha.claim.uncertified"
 	claimConditionSubjct = "claims"
 )
 
@@ -348,6 +352,37 @@ func (s *Server) strandedClaims(ctx context.Context) (map[string]string, error) 
 	return out, nil
 }
 
+// uncertifiedClaims is ha.claim.uncertified's evidence, one line per
+// destination: each pending proof minted without a certificate before
+// recovery claims were enforced. Its destination refuses it
+// (recovery_claim_unproven) until the lease holder has claimed it for its own
+// value; one that binds no proof-grade fence of its old owner names no owner
+// for the voters to probe, so it cannot be claimed and will not run while
+// recovery claims are enforced.
+func (s *Server) uncertifiedClaims(ctx context.Context) (map[string]string, error) {
+	pending, err := corrosion.UncertifiedPendingProofs(ctx, s.db)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, pr := range pending {
+		var line string
+		if src, ok := corrosion.UncertifiedProofSource(pr.ActionProof); ok {
+			line = fmt.Sprintf("%s/%s's %s to %s (proof %s) has no recovery-claim certificate; the lease holder "+
+				"claims it for its old owner %s on its next tick (a refusal shows in `lv cluster claim %s/%s`).",
+				pr.TargetKind, pr.TargetName, pr.Action, pr.DestHost, pr.ID, src, pr.TargetKind, pr.TargetName)
+		} else {
+			line = fmt.Sprintf("%s/%s's %s to %s (proof %s) has no recovery-claim certificate and binds no "+
+				"proof-grade fence of its old owner, so no claim can name the owner for the voters to probe; it will "+
+				"not run while recovery claims are enforced. Set enforcement.recovery_claim false on every host "+
+				"until it has run, then turn it back on.",
+				pr.TargetKind, pr.TargetName, pr.Action, pr.DestHost, pr.ID)
+		}
+		out[pr.DestHost] = strings.TrimSpace(out[pr.DestHost] + " " + line)
+	}
+	return out, nil
+}
+
 // RecoveryClaimHealthTick is the lease holder's pass over the recovery-claim
 // health conditions, run each tick it holds the failover lease (like
 // VoterGenesisTick): ha.claim.stranded names every workload decided for a
@@ -360,7 +395,18 @@ func (s *Server) RecoveryClaimHealthTick(ctx context.Context) {
 	s.applyVoterUnavailable(ctx)
 	if !s.RecoveryClaimEnforced(ctx) {
 		s.applyClusterCondition(ctx, claimEvaluator, condClaimStranded, claimConditionSubjct, nil, nil, "")
+		s.applyClusterCondition(ctx, claimEvaluator, condClaimUncertified, claimConditionSubjct, nil, nil, "")
 		return
+	}
+	if waiting, err := s.uncertifiedClaims(ctx); err != nil {
+		slog.Warn("recovery claims: evaluate uncertified proofs", "error", err)
+	} else {
+		var dests []string
+		for h := range waiting {
+			dests = append(dests, h)
+		}
+		s.applyClusterCondition(ctx, claimEvaluator, condClaimUncertified, claimConditionSubjct, waiting, dests,
+			"recoveries minted before recovery claims were enforced, refused by their destinations until claimed: ")
 	}
 	stranded, err := s.strandedClaims(ctx)
 	if err != nil {

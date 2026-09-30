@@ -320,6 +320,64 @@ func TestClaimMetrics_Superseded(t *testing.T) {
 	}
 }
 
+// uncertifiedReschedule writes, as a coordinator did before recovery claims
+// were enforced, a reschedule of vm1 (owner epoch 4) to live with no
+// certificate; fenceEpoch is its fence binding.
+func uncertifiedReschedule(t *testing.T, db *corrosion.Client, fenceEpoch string) corrosion.ActionProof {
+	t.Helper()
+	p := corrosion.ActionProof{ID: "pre-latch", Action: corrosion.ActionReschedule, TargetKind: "vm", TargetName: "vm1",
+		DestHost: "live", Coordinator: "coord", OwnerEpoch: "4", FenceEpoch: fenceEpoch}
+	if err := corrosion.WriteVMRescheduleProof(context.Background(), db, p, "vm1", "live"); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// TestCertifyUncertified_LostKeepsTheDecidedValue: a proof minted before
+// recovery claims were enforced is claimed for its own value; when another
+// value was already decided for the key, that value is written in its place
+// (recovery_claim_lost) and the uncertified proof never gains a certificate.
+//
+// Mutation: drop the WriteVMRescheduleProof in certifyUncertified's lost
+// branch — vm1 still points at the proof nothing will ever execute.
+func TestCertifyUncertified_LostKeepsTheDecidedValue(t *testing.T) {
+	ctx := context.Background()
+	cl := &fakeClaimer{decide: decideTheirs(corrosion.ActionReschedule, "other")}
+	db, c := claimFixture(t, cl)
+	p := uncertifiedReschedule(t, db, "host=dead;fence_id=f1;ts=2026-01-01T00:00:00Z")
+	c.certifyUncertified(ctx)
+	if len(cl.calls) != 1 || cl.calls[0].Attempt != 0 || cl.calls[0].OwnerEpoch != 4 {
+		t.Fatalf("want one claim at attempt 0 for owner epoch 4, got %v", cl.calls)
+	}
+	if vm := mustVM(t, db, "vm1"); vm.PendingActionID != "their-proof" || vm.HostName != "other" {
+		t.Fatalf("the decided value was not written in place of the uncertified one: %+v", vm)
+	}
+	if got, _, _ := corrosion.GetActionProof(ctx, db, p.ID); got.ClaimCertificate != "" {
+		t.Fatal("the losing uncertified proof gained a certificate")
+	}
+}
+
+// TestCertifyUncertified_NoFenceBindingNoClaim: a proof that binds no
+// proof-grade fence names no old owner for the voters to probe, so no claim
+// is made for it — its source is never guessed — and it stays uncertified
+// (ha.claim.uncertified reports it).
+//
+// Mutation: claim with an empty source when the proof binds no fence — the
+// claimer is called.
+func TestCertifyUncertified_NoFenceBindingNoClaim(t *testing.T) {
+	ctx := context.Background()
+	cl := &fakeClaimer{decide: decideOurs}
+	db, c := claimFixture(t, cl)
+	p := uncertifiedReschedule(t, db, "")
+	c.certifyUncertified(ctx)
+	if len(cl.calls) != 0 {
+		t.Fatalf("a claim was made for a proof with no fenced old owner: %v", cl.calls)
+	}
+	if got, _, _ := corrosion.GetActionProof(ctx, db, p.ID); got.ClaimCertificate != "" {
+		t.Fatal("a proof with no source gained a certificate")
+	}
+}
+
 func mustVM(t *testing.T, db *corrosion.Client, name string) *corrosion.VMRecord {
 	t.Helper()
 	vm, err := corrosion.GetVM(context.Background(), db, name)

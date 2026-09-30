@@ -180,3 +180,35 @@ func GetSGRule(ctx context.Context, c *Client, id string) (*SGRule, error) {
 		Priority:  r.Int("priority"),
 	}, nil
 }
+
+// SGRuleAuditState is the audit state of one security-group rule, from the
+// result of GetSGRule: the rule, none when a read that succeeded found no such
+// rule, or unknown when the read failed. A failed read is never recorded as
+// absence.
+func SGRuleAuditState(rule *SGRule, err error) string {
+	switch {
+	case err != nil:
+		return AuditUnknown(err)
+	case rule == nil:
+		return AuditStateNone
+	}
+	return rule.AuditText()
+}
+
+// SecurityGroupAuditState reads one security group, with its rules, and
+// renders it as an audit state. The web UI and the gRPC handlers both call it,
+// so a group removed either way leaves the same record.
+func SecurityGroupAuditState(ctx context.Context, c *Client, id string) string {
+	sg, err := GetSecurityGroup(ctx, c, id)
+	if err != nil {
+		return AuditUnknown(err)
+	}
+	if sg == nil {
+		return AuditStateNone
+	}
+	rules, err := ListSGRules(ctx, c, id)
+	if err != nil {
+		return AuditUnknown(err)
+	}
+	return sg.AuditText(rules)
+}

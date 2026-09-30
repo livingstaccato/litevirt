@@ -122,6 +122,12 @@ func (c *Client) tiesStillTracked(ties map[string][2]string) bool {
 // digest the pass read: residualIsTrackedTies checks both from one scan.
 func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []string, payload *syncPayload, remote map[string]*pb.TableDigest, scope *pullScope) {
 	tracked := c.UnresolvedTieTables()
+	var pulled dumpScope
+	if scope != nil {
+		if _, sc, err := resolveTableDumpScope(tables, scope.buckets); err == nil {
+			pulled = sc
+		}
+	}
 	for _, t := range tables {
 		key := settledKey(peer, t)
 		r, rok := remote[t]
@@ -144,14 +150,18 @@ func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []st
 			c.dropSettled(key)
 			continue
 		}
-		var inPull map[int]bool
+		// The buckets the pull actually carried for t: its own, widened by
+		// any co-bucketed child pulled with it (dump_scope.go), not merely the
+		// ones t's own digests asked for.
+		inPull := pulled[t]
 		var remoteBuckets map[int]BucketDigest
-		if scope.narrowed(t) {
-			inPull = make(map[int]bool, len(scope.buckets[t]))
-			for _, b := range scope.buckets[t] {
-				inPull[b] = true
+		if inPull != nil {
+			if remoteBuckets = scope.remote[t]; remoteBuckets == nil {
+				// Narrowed only by a child's widening: nothing vouches for
+				// the buckets it did not carry.
+				c.dropSettled(key)
+				continue
 			}
-			remoteBuckets = scope.remote[t]
 		}
 		local, ties, ok := c.residualIsTrackedTies(ctx, *st, inPull, remoteBuckets)
 		if !ok {

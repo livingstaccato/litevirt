@@ -275,3 +275,24 @@ func TestClaimProbeBudget(t *testing.T) {
 		t.Errorf("claimProbeTimeout %s exceeds claimProbeRefreshAge %s", claimProbeTimeout, claimProbeRefreshAge)
 	}
 }
+
+// TestForcedProbe_InterruptedByTheOperatorReadsAsReached: a forced
+// reconfiguration's fresh check runs under the operator's context. When that
+// context ends before the dial does, nothing learned the host is gone, so the
+// check must not read as "not reached" — a lost voter is named only on a
+// probe that finished.
+//
+// Mutation: drop the ctx.Err() check in forcedProbe — the cancelled dial's
+// error reads as not reached.
+func TestForcedProbe_InterruptedByTheOperatorReadsAsReached(t *testing.T) {
+	s := testServer(t)
+	var dials atomic.Int32
+	s.claims.probe.dial = unreachableAfter(200*time.Millisecond, &dials, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	reached, detail := s.forcedProbe(ctx, "victim")
+	if !reached || !strings.Contains(detail, "interrupted") {
+		t.Fatalf("an interrupted forced probe read as %v %q; want reached, interrupted", reached, detail)
+	}
+}

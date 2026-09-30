@@ -37,7 +37,7 @@ func TestResidualIsTrackedTies(t *testing.T) {
 	}
 
 	st := peerLeaseTerms(t, b)
-	local, ties, ok := a.residualIsTrackedTies(ctx, st)
+	local, ties, ok := a.residualIsTrackedTies(ctx, st, nil, nil)
 	if !ok || len(ties) != 1 {
 		t.Fatalf("a table differing only by the tracked tie was not proven settled: ok=%v ties=%v", ok, ties)
 	}
@@ -50,14 +50,14 @@ func TestResidualIsTrackedTies(t *testing.T) {
 		// Same PK, different facts, never merged: the register knows nothing.
 		putLeaseTerm(t, b, "failover", 1, "host-b", ts, ts)
 		defer putLeaseTerm(t, b, "failover", 1, "host-a", ts, ts)
-		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); ok {
+		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b), nil, nil); ok {
 			t.Fatal("proven settled with a differing row the register does not hold")
 		}
 	})
 	t.Run("the tie row with a different version than the one tracked", func(t *testing.T) {
 		putLeaseTerm(t, b, "dual_run_detector", 2, "host-c", ts, ts)
 		defer putLeaseTerm(t, b, "dual_run_detector", 2, "host-b", ts, ts)
-		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); ok {
+		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b), nil, nil); ok {
 			t.Fatal("proven settled against a version of the tied row the register never saw")
 		}
 	})
@@ -68,7 +68,7 @@ func TestResidualIsTrackedTies(t *testing.T) {
 				t.Fatal(err)
 			}
 		}()
-		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); ok {
+		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b), nil, nil); ok {
 			t.Fatal("proven settled although the peer holds a row this node lacks")
 		}
 	})
@@ -79,7 +79,7 @@ func TestResidualIsTrackedTies(t *testing.T) {
 				t.Fatal(err)
 			}
 		}()
-		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); ok {
+		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b), nil, nil); ok {
 			t.Fatal("proven settled although this node holds a row the peer lacks")
 		}
 	})
@@ -90,7 +90,7 @@ func TestResidualIsTrackedTies(t *testing.T) {
 			}
 		}()
 		a.clearUnresolved("leader_lease_terms", pkKey([]interface{}{"dual_run_detector", int64(2)}))
-		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); ok {
+		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b), nil, nil); ok {
 			t.Fatal("proven settled on a tie the register no longer holds")
 		}
 		if a.tiesStillTracked(ties) {
@@ -115,7 +115,7 @@ func TestResidualIsTrackedTies(t *testing.T) {
 	})
 
 	// Back where it started: settled again.
-	if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); !ok {
+	if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b), nil, nil); !ok {
 		t.Fatal("the subtests did not restore the settled state")
 	}
 }
@@ -141,7 +141,7 @@ func TestResidualIsTrackedTies_NWay(t *testing.T) {
 		t.Fatalf("precondition: a tracks %d ties, want the one contested row", got)
 	}
 	for name, peer := range map[string]*Client{"b": b, "c": c} {
-		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, peer)); !ok {
+		if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, peer), nil, nil); !ok {
 			t.Errorf("against %s: a three-way tie a has met every version of was not proven settled", name)
 		}
 	}
@@ -157,7 +157,7 @@ func TestResidualIsTrackedTies_NWay(t *testing.T) {
 
 	// A fourth version, never merged, is still unexplained.
 	putLeaseTerm(t, b, "dual_run_detector", 2, "host-d", ts, ts)
-	if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b)); ok {
+	if _, _, ok := a.residualIsTrackedTies(ctx, peerLeaseTerms(t, b), nil, nil); ok {
 		t.Error("proven settled against a version of the tied row no merge has seen")
 	}
 }

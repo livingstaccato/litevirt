@@ -157,6 +157,7 @@ func TestFleet_AntiEntropyScale_PassCost(t *testing.T) {
 	// ── legacy: every member, full dump ──
 	for _, n := range c.Nodes {
 		defer n.DoNotImplement("StreamTableDump")()
+		defer n.DoNotImplement("GetTableBucketDigests")()
 	}
 	c.ResetAEStats()
 	runAEPass(t, c, false)

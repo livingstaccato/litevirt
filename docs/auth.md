@@ -455,6 +455,9 @@ a session, and the `lv-cli` client certificate are all refused with
 of the sensitive lane below; naming one is refused with `InvalidArgument`.
 The secret-bearing tables (`StreamSensitiveStateDump`, `GetSensitiveStateDigest`)
 are narrower still: peer only, and the certificate must name the sender.
+`GetTableBucketDigests`, which returns per-bucket counts and hashes for public
+and sensitive tables alike so anti-entropy can pull only the buckets that
+differ, has the same rule.
 
 Operators see convergence without row contents. `GetStateDigest` and
 `GetClusterStateDigest` return per-table counts and hashes to an `operator`

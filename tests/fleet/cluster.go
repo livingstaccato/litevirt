@@ -729,6 +729,7 @@ var partitionedMethods = map[string]bool{
 	"StreamTableDump":          true,
 	"GetSensitiveStateDigest":  true,
 	"StreamSensitiveStateDump": true,
+	"GetTableBucketDigests":    true,
 	"ReserveProjectCapacity":   true,
 	"ReleaseProjectCapacity":   true,
 	// The lease-term barrier's quorum read is peer traffic over the same link,

@@ -83,7 +83,13 @@ of acting — it says nothing about whether the resulting rows have replicated.
   tables whose digests disagreed (`StreamTableDump`, which adds the parent rows a
   child table's merge checks against), and falls back to the full
   `StreamStateDump` against a peer too old to serve it; eligible secret-bearing config
-  uses a separate peer-mTLS-only sensitive dump. Observation tables
+  uses a separate peer-mTLS-only sensitive dump. Within a table that disagrees,
+  the pass asks the peer for the table's 256 bucket digests
+  (`GetTableBucketDigests`) and pulls only the buckets that differ, a child
+  table's parent narrowed to the same buckets; a peer without that RPC gets the
+  whole table. A table's digest is kept between passes until a row of it
+  changes (at most 10 minutes), so a pass rescans only the tables written since
+  the last one ([design/ae-incremental.md](design/ae-incremental.md)). Observation tables
   (`host_health`, `health_evaluator_status`, `host_capacity_observations`),
   whose writers re-publish them every few seconds to a minute, are pulled by a
   scheduled pass at most once per 5 minutes per node; control-state drift in
@@ -994,8 +1000,14 @@ leadership churn or a partition.
   smaller than the cluster; until then the probe mesh is still N·(N−1).
 - **Digest cost.** One full public digest over a 50-node cluster's worth of
   rows (a full `host_health` mesh and 2,000 VMs) takes about 55 ms and
-  allocates 5.7 MB (`BenchmarkStateDigest_50Nodes`), once per pass and once per
-  peer that asks. It is recomputed from a full scan every time.
+  allocates 5.7 MB (`BenchmarkStateDigest_50Nodes`). A pass and every peer
+  that asks take unchanged tables from the digest cache instead
+  (`BenchmarkStateDigestCached_50Nodes`), so the scan cost falls to the tables
+  written since the last pass: with a `host_health` row rewritten between
+  digests (that table is most of the rows, and is rescanned), 11 ms and 2.4 MB
+  against 29 ms and 6.8 MB for a full scan on the same machine. One drifted row in a 4,000-row table costs a
+  bucketed pass about 8 KB and 21 rows, against 180 KB and the whole table for
+  the pull before buckets (`TestFleet_AntiEntropy_Buckets_OneDriftedRowPullsOneBucket`).
 
 ### Network
 - **Inter-host RTT < 10 ms**: comfortable. Default replicator and

@@ -116,7 +116,11 @@ func (c *Client) tiesStillTracked(ties map[string][2]string) bool {
 // between, the dump is newer than the digest recorded, and the next pass sees
 // a different peer digest and pulls again: the race costs a pull, never a
 // skipped difference.
-func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []string, dump []byte, remote map[string]*pb.TableDigest) {
+//
+// A table pulled narrowed to some buckets (scope) is proven over those
+// buckets, and every other bucket must digest equal to the peer's bucket
+// digest the pass read: residualIsTrackedTies checks both from one scan.
+func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []string, dump []byte, remote map[string]*pb.TableDigest, scope *pullScope) {
 	tracked := c.UnresolvedTieTables()
 	var payload *syncPayload
 	for _, t := range tables {
@@ -145,7 +149,16 @@ func (c *Client) recordSettledTies(ctx context.Context, peer string, tables []st
 			c.dropSettled(key)
 			continue
 		}
-		local, ties, ok := c.residualIsTrackedTies(ctx, *st)
+		var inPull map[int]bool
+		var remoteBuckets map[int]BucketDigest
+		if scope.narrowed(t) {
+			inPull = make(map[int]bool, len(scope.buckets[t]))
+			for _, b := range scope.buckets[t] {
+				inPull[b] = true
+			}
+			remoteBuckets = scope.remote[t]
+		}
+		local, ties, ok := c.residualIsTrackedTies(ctx, *st, inPull, remoteBuckets)
 		if !ok {
 			c.dropSettled(key)
 			continue
@@ -174,7 +187,11 @@ func (c *Client) dropSettled(key string) {
 // the ties it relied on. Any doubt — a column list that differs, a row on one
 // side only, a differing row whose versions the register has not both seen —
 // answers false, which means "keep pulling".
-func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (TableDigest, map[string][2]string, bool) {
+//
+// inPull, when non-nil, is the buckets the pull carried: only local rows in
+// them are compared with st, and every other bucket's local digest (from the
+// same scan) must agree with remoteBuckets, the peer's digests of them.
+func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable, inPull map[int]bool, remoteBuckets map[int]BucketDigest) (TableDigest, map[string][2]string, bool) {
 	pkCols := tablePrimaryKeys[st.Name]
 	if len(pkCols) == 0 {
 		return TableDigest{}, nil, false
@@ -203,6 +220,15 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (Table
 	var v1Keys, v2Keys []string
 	byPK := make(map[string][]interface{})
 	scanOK := true
+	var keyIdx []int
+	outV1, outV2 := map[int][]string{}, map[int][]string{}
+	if inPull != nil {
+		if keyIdx = columnIndexes(cols, bucketKeyColumns(st.Name)); len(keyIdx) == 0 {
+			rows.Close()
+			c.mu.RUnlock()
+			return TableDigest{}, nil, false
+		}
+	}
 	for rows.Next() {
 		vals := make([]interface{}, len(cols))
 		ptrs := make([]interface{}, len(cols))
@@ -214,14 +240,30 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (Table
 			scanOK = false
 			continue
 		}
-		// Digest exactly as digestTableRows does, from the raw cells.
-		v1Keys = append(v1Keys, encodeRowCells(vals))
+		// Digest exactly as scanTableDigest does, from the raw cells.
+		v1 := encodeRowCells(vals)
+		v1Keys = append(v1Keys, v1)
+		var v2 string
 		if v2ok {
 			ek, eerr := encodeRowCellsV2(cols, vals)
 			if eerr != nil {
 				v2ok, v2Keys = false, nil
 			} else {
+				v2 = ek
 				v2Keys = append(v2Keys, ek)
+			}
+		}
+		if inPull != nil {
+			b, bok := rowBucket(vals, keyIdx)
+			if !bok {
+				scanOK = false
+				continue
+			}
+			if !inPull[b] {
+				// Not pulled: vouched for by its bucket digest below.
+				outV1[b] = append(outV1[b], v1)
+				outV2[b] = append(outV2[b], v2)
+				continue
 			}
 		}
 		// Compare as the merge does: []byte → string, then a JSON round trip
@@ -242,6 +284,24 @@ func (c *Client) residualIsTrackedTies(ctx context.Context, st syncTable) (Table
 	c.mu.RUnlock()
 	if !scanOK || rowsErr != nil || len(byPK) != len(st.Rows) {
 		return TableDigest{}, nil, false
+	}
+	if inPull != nil {
+		// Every bucket the pull did not carry must agree with the peer's.
+		for b := range remoteBuckets {
+			if _, ok := outV1[b]; !ok && !inPull[b] {
+				return TableDigest{}, nil, false // the peer holds rows here; this node holds none
+			}
+		}
+		for b, keys := range outV1 {
+			local := BucketDigest{Index: b, Count: len(keys), Hash: hashRowKeys(keys)}
+			if v2ok {
+				local.HashV2 = hashRowKeys(outV2[b])
+			}
+			r, ok := remoteBuckets[b]
+			if !ok || !bucketsAgree(local, r) {
+				return TableDigest{}, nil, false
+			}
+		}
 	}
 
 	ties := make(map[string][2]string)

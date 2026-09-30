@@ -467,6 +467,13 @@ var (
 // dumpStateForTables serializes the selected allowlist as gzipped JSON for
 // push/pull sync.
 func (c *Client) dumpStateForTables(tables []string) []byte {
+	return c.dumpStateForScope(tables, nil)
+}
+
+// dumpStateForScope is dumpStateForTables with each table narrowed to its
+// buckets in scope (dump_scope.go); a table scope does not name, or names with
+// a nil set, is dumped whole.
+func (c *Client) dumpStateForScope(tables []string, scope dumpScope) []byte {
 	start := time.Now()
 
 	// Read each table under its OWN brief read lock (released between tables), and
@@ -477,7 +484,11 @@ func (c *Client) dumpStateForTables(tables []string) []byte {
 	// converges per-row by updated_at regardless of the relative timing of tables.
 	var payload syncPayload
 	for _, table := range tables {
-		if st, ok := c.dumpTable(table); ok && len(st.Rows) > 0 {
+		st, ok := c.dumpTable(table)
+		if ok && scope != nil {
+			st = narrowToBuckets(st, scope[table])
+		}
+		if ok && len(st.Rows) > 0 {
 			payload.Tables = append(payload.Tables, st)
 		}
 	}
@@ -1987,35 +1998,6 @@ type TableDigest struct {
 	HashV2 string `json:"hash_v2,omitempty"`
 }
 
-// StateDigest returns a lightweight fingerprint of each replicated table.
-// Two nodes with identical digests are in sync; mismatched tables indicate drift.
-func (c *Client) stateDigestForTables(ctx context.Context, tables []string) ([]TableDigest, error) {
-	start := time.Now()
-
-	// Per-cycle hot path: anti-entropy calls this every tick before deciding
-	// whether to dump/merge. Read each table's row encodings under a brief read
-	// lock, then sort + hash OUTSIDE the lock — a large table's hash must not hold
-	// the lock against writers (incl. the health path).
-	var digests []TableDigest
-	for _, table := range tables {
-		rowKeys, v2Keys, v2ok, ok := c.digestTableRows(ctx, table)
-		if !ok {
-			continue // table may not exist yet
-		}
-		td := TableDigest{
-			Name:  table,
-			Count: len(rowKeys),
-			Hash:  hashRowKeys(rowKeys),
-		}
-		if v2ok {
-			td.HashV2 = hashRowKeys(v2Keys) // order-invariant; sort makes row order irrelevant
-		}
-		digests = append(digests, td)
-	}
-	c.observeDigest(time.Since(start))
-	return digests, nil
-}
-
 // hashRowKeys sorts the per-row encodings (row-order invariance) and length-prefix-hashes
 // them to a truncated SHA-256 — the shared table-hash step for both v1 and v2.
 func hashRowKeys(rowKeys []string) string {
@@ -2025,62 +2007,6 @@ func hashRowKeys(rowKeys []string) string {
 		h.Write([]byte(strconv.Itoa(len(rk)) + ":" + rk))
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
-}
-
-// digestTableRows reads one table's length-prefixed row encodings into memory
-// under a brief read lock (released on return), so the caller can sort + hash
-// outside the lock.
-//
-// Content digest: it encodes the table's row VALUES (the declared columns —
-// SELECT * never returns the rowid). The old digest hashed GROUP_CONCAT(rowid),
-// which is node-local: identical content inserted in a different order (or after
-// INSERT-OR-REPLACE churn) produced different digests — so anti-entropy re-synced
-// already-converged peers forever — while two nodes with equal row counts but
-// contiguous rowids hashed identically regardless of content, hiding real drift.
-// Hashing content fixes both.
-// digestTableRows returns the per-row v1 (positional) encodings and, when digest_v2 is
-// enabled locally, the per-row v2 (order-invariant) encodings. v2ok is false when v2 is
-// disabled OR any row fails v2 encoding (dup-name / unexpected type) — the table then
-// falls back to a v1-only digest. The v2 keys come from the SAME scan (cols already read),
-// so it's near-free.
-func (c *Client) digestTableRows(ctx context.Context, table string) (v1Keys, v2Keys []string, v2ok, ok bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	rows, err := c.db.QueryContext(ctx, "SELECT * FROM "+table)
-	if err != nil {
-		return nil, nil, false, false // table may not exist yet
-	}
-	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, nil, false, false
-	}
-	wantV2 := c.digestV2On()
-	v2ok = wantV2
-	for rows.Next() {
-		vals := make([]interface{}, len(cols))
-		ptrs := make([]interface{}, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			continue
-		}
-		v1Keys = append(v1Keys, encodeRowCells(vals))
-		if v2ok {
-			ek, eerr := encodeRowCellsV2(cols, vals)
-			if eerr != nil {
-				slog.Error("digest_v2: row encode failed — falling back to v1 for this table",
-					"table", table, "error", eerr)
-				v2ok = false
-				v2Keys = nil
-				continue
-			}
-			v2Keys = append(v2Keys, ek)
-		}
-	}
-	return v1Keys, v2Keys, v2ok, true
 }
 
 // encodeRowCells produces the canonical, unambiguous encoding of a row's cells —

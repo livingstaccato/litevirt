@@ -28,6 +28,12 @@ import (
 type SyncMetrics interface {
 	ObserveDump(d time.Duration, bytes int)
 	ObserveDigest(d time.Duration)
+	// ObserveDigestTables records, for one digest, how many tables came from
+	// the digest cache and how many were scanned (digest_cache.go).
+	ObserveDigestTables(cached, computed int)
+	// ObservePullRows records the rows one repair pull received for tables of
+	// one scope: "bucket" (only the buckets that disagreed) or "table" (whole).
+	ObservePullRows(scope string, rows int)
 	ObserveMerge(d time.Duration, merged, skipped int)
 	// ObserveMergeRejected records a replicated row/statement the apply path rejected but did
 	// NOT apply — path ∈ {ae, wal}; reason ∈ {constraint, …}. Bounded labels only (never SQL
@@ -97,9 +103,16 @@ type Config struct {
 
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
-	db   *sql.DB
-	mu   sync.RWMutex
-	list *memberlist.Memberlist
+	db *sql.DB
+	mu sync.RWMutex
+	// dsn is what db was opened with; tableGens counts the row changes every
+	// connection of that database reports (digest_cache.go), and digests is
+	// the anti-entropy digest cache they invalidate. tableGens is nil for a
+	// database opened without the hook, which caches nothing.
+	dsn       string
+	tableGens *tableGenerations
+	digests   digestCache
+	list      *memberlist.Memberlist
 	// gossipMode is the stage memberlist was created with, and gossipKeyring the
 	// keyring it encrypts with (nil when off). The keyring changes live through
 	// SetGossipKeys, serialised by gossipKeyMu; the stage never changes.
@@ -596,6 +609,18 @@ func (c *Client) observeDigest(d time.Duration) {
 	}
 }
 
+func (c *Client) observePullRows(scope string, rows int) {
+	if c.syncMetrics != nil && rows > 0 {
+		c.syncMetrics.ObservePullRows(scope, rows)
+	}
+}
+
+func (c *Client) observeDigestTables(cached, computed int) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveDigestTables(cached, computed)
+	}
+}
+
 func (c *Client) observeMerge(d time.Duration, merged, skipped int) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveMerge(d, merged, skipped)
@@ -887,19 +912,23 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 
 	// Open SQLite with WAL mode
 	dbPath := filepath.Join(cfg.DataDir, "state.db")
-	db, err := sql.Open("sqlite", sqliteDSN(dbPath))
+	dsn := sqliteDSN(dbPath)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 
 	c := &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
 		hostName:         cfg.HostName,
 		clock:            clock,
 		dataDir:          cfg.DataDir,
@@ -1020,7 +1049,11 @@ func (c *Client) Close() error {
 		c.list.Shutdown()
 	}
 	if c.db != nil {
-		return c.db.Close()
+		err := c.db.Close()
+		if c.tableGens != nil {
+			releaseGenerations(c.dsn)
+		}
+		return err
 	}
 	return nil
 }

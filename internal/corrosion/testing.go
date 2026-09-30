@@ -2,7 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"sync/atomic"
 
@@ -52,17 +51,20 @@ func NewTestClient() (*Client, error) {
 	// contention into spurious test-only refusals.
 	dsn := fmt.Sprintf("file:testdb%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", id)
 
-	db, err := sql.Open("sqlite", dsn)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
 		return nil, err
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, err
 	}
 
 	return &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
 		hostName:         "test-node",
 		clock:            hlc.NewClock("test-node"),
 		replicatorNotify: make(chan struct{}, 1),
@@ -88,16 +90,19 @@ func testLeaseTermLedgerOpen() bool { return true }
 // Test-only. The returned client is not started (no replicator, no gossip).
 func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&_pragma=busy_timeout(5000)", dsnSuffix)
-	db, err := sql.Open("sqlite", dsn)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
 		return nil, err
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, err
 	}
 	return &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
 		hostName:         hostName,
 		clock:            hlc.NewClock(hostName),
 		replicatorNotify: make(chan struct{}, 1),

@@ -221,3 +221,32 @@ func TestReplicationRPCsRequirePeerMTLS(t *testing.T) {
 		t.Fatalf("AckMutations with matching peer CN: %v", err)
 	}
 }
+
+// GetTableBucketDigests answers for sensitive tables too, so it takes the
+// sensitive lane's rule: a host certificate that names the sender.
+func TestGetTableBucketDigests_PeerOnlyAndScheme(t *testing.T) {
+	s := testServer(t)
+	req := &pb.BucketDigestRequest{Sender: "node-a", Tables: []string{"stacks", "registry_credentials"}, Scheme: corrosion.BucketScheme}
+	for name, ctx := range map[string]context.Context{
+		"unauthenticated": context.Background(),
+		"operator":        adminCtx(),
+		"mismatched CN":   replicationPeerCtx("node-b"),
+	} {
+		if _, err := s.GetTableBucketDigests(ctx, req); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("%s: code = %v, want PermissionDenied (err=%v)", name, status.Code(err), err)
+		}
+	}
+	resp, err := s.GetTableBucketDigests(replicationPeerCtx("node-a"), req)
+	if err != nil {
+		t.Fatalf("matching peer: %v", err)
+	}
+	if resp.GetScheme() != corrosion.BucketScheme || resp.GetBucketCount() != corrosion.BucketCount || len(resp.GetTables()) != 2 {
+		t.Fatalf("response = %+v, want this build's scheme and both tables", resp)
+	}
+	// Another scheme: this build's scheme back, and nothing to compare.
+	other := &pb.BucketDigestRequest{Sender: "node-a", Tables: []string{"stacks"}, Scheme: corrosion.BucketScheme + 1}
+	resp, err = s.GetTableBucketDigests(replicationPeerCtx("node-a"), other)
+	if err != nil || resp.GetScheme() != corrosion.BucketScheme || len(resp.GetTables()) != 0 {
+		t.Fatalf("other scheme: resp=%+v err=%v, want this scheme and no tables", resp, err)
+	}
+}

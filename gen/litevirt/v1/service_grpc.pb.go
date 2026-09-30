@@ -225,6 +225,7 @@ const (
 	LiteVirt_StreamTableDump_FullMethodName            = "/litevirt.v1.LiteVirt/StreamTableDump"
 	LiteVirt_GetSensitiveStateDigest_FullMethodName    = "/litevirt.v1.LiteVirt/GetSensitiveStateDigest"
 	LiteVirt_StreamSensitiveStateDump_FullMethodName   = "/litevirt.v1.LiteVirt/StreamSensitiveStateDump"
+	LiteVirt_GetTableBucketDigests_FullMethodName      = "/litevirt.v1.LiteVirt/GetTableBucketDigests"
 	LiteVirt_TriggerAntiEntropy_FullMethodName         = "/litevirt.v1.LiteVirt/TriggerAntiEntropy"
 	LiteVirt_GetClusterStateDigest_FullMethodName      = "/litevirt.v1.LiteVirt/GetClusterStateDigest"
 	LiteVirt_PrepareRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/PrepareRecoveryClaim"
@@ -601,6 +602,12 @@ type LiteVirtClient interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error)
+	// GetTableBucketDigests returns per-bucket digests of the named tables so
+	// anti-entropy pulls only the buckets of a mismatched table that disagree
+	// (docs/design/ae-incremental.md). Peer-only (sender must match the host
+	// certificate). An older build answers Unimplemented and the caller pulls
+	// whole tables.
+	GetTableBucketDigests(ctx context.Context, in *BucketDigestRequest, opts ...grpc.CallOption) (*BucketDigestResponse, error)
 	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
 	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
 	TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error)
@@ -3067,6 +3074,16 @@ func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *Sensi
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
+func (c *liteVirtClient) GetTableBucketDigests(ctx context.Context, in *BucketDigestRequest, opts ...grpc.CallOption) (*BucketDigestResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BucketDigestResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GetTableBucketDigests_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) TriggerAntiEntropy(ctx context.Context, in *TriggerAntiEntropyRequest, opts ...grpc.CallOption) (*TriggerAntiEntropyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(TriggerAntiEntropyResponse)
@@ -3945,6 +3962,12 @@ type LiteVirtServer interface {
 	// operator or REST surface.
 	GetSensitiveStateDigest(context.Context, *SensitiveStateRequest) (*StateDigestResponse, error)
 	StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error
+	// GetTableBucketDigests returns per-bucket digests of the named tables so
+	// anti-entropy pulls only the buckets of a mismatched table that disagree
+	// (docs/design/ae-incremental.md). Peer-only (sender must match the host
+	// certificate). An older build answers Unimplemented and the caller pulls
+	// whole tables.
+	GetTableBucketDigests(context.Context, *BucketDigestRequest) (*BucketDigestResponse, error)
 	// TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
 	// fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
 	TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error)
@@ -4738,6 +4761,9 @@ func (UnimplementedLiteVirtServer) GetSensitiveStateDigest(context.Context, *Sen
 }
 func (UnimplementedLiteVirtServer) StreamSensitiveStateDump(*SensitiveStateRequest, grpc.ServerStreamingServer[StateDumpChunk]) error {
 	return status.Error(codes.Unimplemented, "method StreamSensitiveStateDump not implemented")
+}
+func (UnimplementedLiteVirtServer) GetTableBucketDigests(context.Context, *BucketDigestRequest) (*BucketDigestResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetTableBucketDigests not implemented")
 }
 func (UnimplementedLiteVirtServer) TriggerAntiEntropy(context.Context, *TriggerAntiEntropyRequest) (*TriggerAntiEntropyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method TriggerAntiEntropy not implemented")
@@ -8338,6 +8364,24 @@ func _LiteVirt_StreamSensitiveStateDump_Handler(srv interface{}, stream grpc.Ser
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_StreamSensitiveStateDumpServer = grpc.ServerStreamingServer[StateDumpChunk]
 
+func _LiteVirt_GetTableBucketDigests_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BucketDigestRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GetTableBucketDigests(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GetTableBucketDigests_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GetTableBucketDigests(ctx, req.(*BucketDigestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_TriggerAntiEntropy_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(TriggerAntiEntropyRequest)
 	if err := dec(in); err != nil {
@@ -9965,6 +10009,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSensitiveStateDigest",
 			Handler:    _LiteVirt_GetSensitiveStateDigest_Handler,
+		},
+		{
+			MethodName: "GetTableBucketDigests",
+			Handler:    _LiteVirt_GetTableBucketDigests_Handler,
 		},
 		{
 			MethodName: "TriggerAntiEntropy",

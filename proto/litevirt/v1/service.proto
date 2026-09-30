@@ -2243,14 +2243,72 @@ message StateDumpChunk {
 // authority its merge checks against), refuses a sensitive-lane table, and
 // ignores a name it does not replicate. An empty list is refused rather than
 // read as "everything"; the full dump is StreamStateDump.
+//
+// buckets narrows a table to the named buckets of bucket_scheme
+// (GetTableBucketDigests): only rows whose bucket key falls in one of them are
+// sent, and a child table's authority parent is narrowed to the SAME buckets,
+// which is where every parent row those children name lives. A table absent
+// from the map, a map entry with no buckets, or a bucket_scheme the server does
+// not speak is sent whole. An older server ignores both fields and sends whole
+// tables — a superset the merge handles.
 message TableDumpRequest {
     repeated string tables = 1;
+    map<string, BucketSet> buckets = 2;
+    uint32 bucket_scheme = 3;
+}
+
+// BucketSet is a list of bucket indexes.
+message BucketSet {
+    repeated uint32 buckets = 1;
 }
 
 // SensitiveStateRequest identifies the peer requesting the secret-bearing
 // anti-entropy lane. The server verifies sender against the peer certificate CN.
+//
+// On StreamSensitiveStateDump, tables (when non-empty) narrows the dump to the
+// named sensitive tables, and buckets / bucket_scheme narrow those as on
+// TableDumpRequest. An empty tables list is the whole sensitive lane, which is
+// also what an older server sends whatever these fields say.
 message SensitiveStateRequest {
     string sender = 1;
+    repeated string tables = 2;
+    map<string, BucketSet> buckets = 3;
+    uint32 bucket_scheme = 4;
+}
+
+// BucketDigestRequest asks for the bucket digests of the named tables, public
+// or sensitive, under bucket scheme `scheme`. sender must match the caller's
+// host certificate, as on the sensitive lane.
+message BucketDigestRequest {
+    string sender = 1;
+    repeated string tables = 2;
+    uint32 scheme = 3;
+}
+
+// BucketDigest is one non-empty bucket's row count and hashes, built exactly
+// like TableDigest's over the bucket's rows. hash_v2 is set only when the
+// sender's table digest carries one.
+message BucketDigest {
+    uint32 index   = 1;
+    int32  count   = 2;
+    string hash    = 3;
+    string hash_v2 = 4;
+}
+
+// TableBucketDigests is one table's non-empty buckets. bucketed=false means
+// the table cannot be bucketed on this host and must be pulled whole.
+message TableBucketDigests {
+    string name                  = 1;
+    bool   bucketed              = 2;
+    repeated BucketDigest buckets = 3;
+}
+
+// BucketDigestResponse answers in the server's own scheme. A caller that sees
+// a scheme or bucket_count other than its own must not compare the buckets.
+message BucketDigestResponse {
+    uint32 scheme                      = 1;
+    uint32 bucket_count                = 2;
+    repeated TableBucketDigests tables = 3;
 }
 
 // ── Divergence scanner (Phase 0, read-only) ──
@@ -2814,6 +2872,12 @@ service LiteVirt {
     // operator or REST surface.
     rpc GetSensitiveStateDigest(SensitiveStateRequest) returns (StateDigestResponse);
     rpc StreamSensitiveStateDump(SensitiveStateRequest) returns (stream StateDumpChunk);
+    // GetTableBucketDigests returns per-bucket digests of the named tables so
+    // anti-entropy pulls only the buckets of a mismatched table that disagree
+    // (docs/design/ae-incremental.md). Peer-only (sender must match the host
+    // certificate). An older build answers Unimplemented and the caller pulls
+    // whole tables.
+    rpc GetTableBucketDigests(BucketDigestRequest) returns (BucketDigestResponse);
     // TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
     // fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
     rpc TriggerAntiEntropy(TriggerAntiEntropyRequest) returns (TriggerAntiEntropyResponse);

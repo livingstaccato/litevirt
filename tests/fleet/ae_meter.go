@@ -32,6 +32,7 @@ var aeMeteredMethods = map[string]bool{
 	"StreamStateDump":          true,
 	"StreamTableDump":          true,
 	"StreamSensitiveStateDump": true,
+	"GetTableBucketDigests":    true,
 }
 
 // AEMethodStats is what one method cost, summed over every node.

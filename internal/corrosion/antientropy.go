@@ -47,6 +47,9 @@ type AntiEntropy struct {
 	// that are not the relays replication actually flows through; the zero
 	// value takes the same defaults the daemon's replicator is built with.
 	relayCfg RelayConfig
+	// legacyRepair is the stand-down (anti_entropy_legacy_repair): pull whole
+	// tables, never ask a peer for bucket digests.
+	legacyRepair bool
 }
 
 // NewAntiEntropy creates an anti-entropy checker.
@@ -65,6 +68,15 @@ func NewAntiEntropy(client *Client, pkiDir string, interval time.Duration) *Anti
 // SetRelayConfig sets the relay election a scheduled pass uses to find this
 // node's relays. Pass the replicator's configuration; call before Start.
 func (ae *AntiEntropy) SetRelayConfig(cfg RelayConfig) { ae.relayCfg = cfg }
+
+// SetLegacyRepair makes this node repair the way it did before bucketed
+// digests (docs/design/ae-incremental.md): whole mismatched tables, no bucket
+// exchange, no digest cache. It still serves the new RPCs to its peers. Call
+// before Start.
+func (ae *AntiEntropy) SetLegacyRepair(on bool) {
+	ae.legacyRepair = on
+	ae.client.SetDigestCacheEnabled(!on)
+}
 
 // Start runs the anti-entropy loop until ctx is cancelled.
 func (ae *AntiEntropy) Start(ctx context.Context) {
@@ -187,8 +199,13 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 		}
 	}
 
-	// Get local digest.
-	localDigests, err := ae.client.StateDigest(ctx)
+	// Get local digest. A scheduled pass takes it from the digest cache where
+	// that is still valid (digest_cache.go); the operator's full pass scans.
+	digest, sensitiveDigest := ae.client.StateDigestCached, ae.client.SensitiveStateDigestCached
+	if full {
+		digest, sensitiveDigest = ae.client.StateDigest, ae.client.SensitiveStateDigest
+	}
+	localDigests, err := digest(ctx)
 	if err != nil {
 		slog.Warn("anti-entropy: local digest error", "error", err)
 		return
@@ -197,7 +214,7 @@ func (ae *AntiEntropy) checkPeerSet(ctx context.Context, choose func([]PeerInfo)
 	for _, d := range localDigests {
 		localMap[d.Name] = d
 	}
-	sensitiveDigests, err := ae.client.SensitiveStateDigest(ctx)
+	sensitiveDigests, err := sensitiveDigest(ctx)
 	if err != nil {
 		slog.Warn("anti-entropy: local sensitive digest error", "error", err)
 	}
@@ -292,19 +309,21 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	if len(pull) > 0 {
 		slog.Info("anti-entropy: syncing from peer", "peer", peerName, "tables", pull)
 		// Only the mismatched tables: pulling the full dump for one drifted
-		// row made every repair cost the whole cluster's state (#262).
-		data, err := fetchTableDump(ctx, client, pull)
+		// row made every repair cost the whole cluster's state (#262). And of
+		// those, only the buckets that differ, where the peer can say which.
+		scope := ae.bucketScope(ctx, client, peerName, pull)
+		data, err := fetchTableDumpScoped(ctx, client, pull, scope)
 		if err != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", err)
 			completed = false
-		} else if mergeErr := ae.client.MergeStateBytesLWW(data); mergeErr != nil {
+		} else if mergeErr := ae.client.mergeRepairPull(data, pull, scope, false); mergeErr != nil {
 			// Operational/commit failure during merge: this cycle's convergence is incomplete.
 			// The merge is per-row-idempotent and non-destructive, so the next cycle retries.
 			slog.Warn("anti-entropy: merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
 			completed = false
 		} else {
 			slog.Info("anti-entropy: merge complete", "peer", peerName, "bytes", len(data))
-			ae.client.recordSettledTies(ctx, peerName, pull, data, remoteMap)
+			ae.client.recordSettledTies(ctx, peerName, pull, data, remoteMap, scope)
 			if obsDue {
 				ae.client.markObservationsRepaired(now)
 			}
@@ -388,6 +407,14 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 	}
 
 	slog.Info("anti-entropy: syncing sensitive state from peer", "peer", peerName, "tables", mismatched)
+	// Only the mismatched sensitive tables, and of those the differing
+	// buckets. An older server ignores both and sends the whole lane, as it
+	// always did. The stand-down asks for the whole lane.
+	var scope *pullScope
+	if !ae.legacyRepair {
+		scope = ae.bucketScope(ctx, client, peerName, mismatched)
+		req = &pb.SensitiveStateRequest{Sender: req.GetSender(), Tables: mismatched, Buckets: scope.wire(), BucketScheme: BucketScheme}
+	}
 	data, err := fetchSensitiveStateDump(ctx, client, req)
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
@@ -397,7 +424,7 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		slog.Warn("anti-entropy: sensitive dump RPC error", "peer", peerName, "error", err)
 		return
 	}
-	if mergeErr := ae.client.MergeSensitiveStateBytesLWW(data); mergeErr != nil {
+	if mergeErr := ae.client.mergeRepairPull(data, mismatched, scope, true); mergeErr != nil {
 		slog.Warn("anti-entropy: sensitive merge error (will retry next cycle)", "peer", peerName, "error", mergeErr)
 		return
 	}
@@ -447,7 +474,17 @@ func fetchStateDump(ctx context.Context, client pb.LiteVirtClient) ([]byte, erro
 // costlier — so a mixed-version cluster keeps repairing. Any other error is
 // this exchange failing and propagates.
 func fetchTableDump(ctx context.Context, client pb.LiteVirtClient, tables []string) ([]byte, error) {
-	stream, err := client.StreamTableDump(ctx, &pb.TableDumpRequest{Tables: tables})
+	return fetchTableDumpScoped(ctx, client, tables, nil)
+}
+
+// fetchTableDumpScoped is fetchTableDump narrowed to scope's buckets (nil: whole
+// tables). An older server ignores the narrowing and sends whole tables.
+func fetchTableDumpScoped(ctx context.Context, client pb.LiteVirtClient, tables []string, scope *pullScope) ([]byte, error) {
+	req := &pb.TableDumpRequest{Tables: tables}
+	if b := scope.wire(); b != nil {
+		req.Buckets, req.BucketScheme = b, BucketScheme
+	}
+	stream, err := client.StreamTableDump(ctx, req)
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {
 			return fetchStateDump(ctx, client)

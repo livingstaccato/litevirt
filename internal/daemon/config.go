@@ -54,6 +54,12 @@ type Config struct {
 	// worth the extra digest traffic. (P2-2)
 	AntiEntropyIntervalSec int `yaml:"anti_entropy_interval_sec"`
 
+	// AntiEntropyLegacyRepair is the stand-down for incremental anti-entropy
+	// (docs/design/ae-incremental.md): when true this node pulls whole
+	// mismatched tables, asks no peer for bucket digests and caches no digest,
+	// as before #262. It still serves the new RPCs to peers. Default false.
+	AntiEntropyLegacyRepair bool `yaml:"anti_entropy_legacy_repair"`
+
 	// PCI device management
 	PCI PCIConfig `yaml:"pci"`
 

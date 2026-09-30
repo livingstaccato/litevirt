@@ -178,7 +178,9 @@ func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.Stat
 		return nil, err
 	}
 
-	digests, err := s.db.StateDigest(ctx)
+	// The per-pass hot path: every peer's pass asks, so it is served from the
+	// digest cache (corrosion/digest_cache.go) where that is still valid.
+	digests, err := s.db.StateDigestCached(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -254,11 +256,58 @@ func (s *Server) StreamTableDump(req *pb.TableDumpRequest, stream grpc.ServerStr
 	if err := s.requirePeerCert(stream.Context()); err != nil {
 		return err
 	}
-	data, err := s.db.DumpTablesBytes(req.GetTables())
+	data, err := s.db.DumpTablesScopedBytes(req.GetTables(), requestedBuckets(req.GetBucketScheme(), req.GetBuckets()))
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
 	return streamStateDump(data, stream.Send)
+}
+
+// requestedBuckets turns a dump request's bucket narrowing into the form the
+// corrosion dump takes. A scheme this build does not speak narrows nothing:
+// every table is sent whole, which the merge handles.
+func requestedBuckets(scheme uint32, in map[string]*pb.BucketSet) map[string][]int {
+	if scheme != corrosion.BucketScheme || len(in) == 0 {
+		return nil
+	}
+	out := make(map[string][]int, len(in))
+	for table, set := range in {
+		for _, b := range set.GetBuckets() {
+			out[table] = append(out[table], int(b))
+		}
+	}
+	return out
+}
+
+// GetTableBucketDigests returns the per-bucket digests of the named tables, so
+// anti-entropy pulls only the buckets of a mismatched table that disagree
+// (docs/design/ae-incremental.md).
+//
+// Peer-only, with the sender pinned to the host certificate as on the
+// sensitive lane, because it answers for sensitive tables too. A request in
+// another scheme gets this build's scheme and no tables back, which the caller
+// reads as "pull whole".
+func (s *Server) GetTableBucketDigests(ctx context.Context, req *pb.BucketDigestRequest) (*pb.BucketDigestResponse, error) {
+	if req.GetSender() == "" {
+		return nil, status.Error(codes.InvalidArgument, "sender required")
+	}
+	if err := requireReplicationPeer(ctx, req.GetSender()); err != nil {
+		return nil, err
+	}
+	resp := &pb.BucketDigestResponse{Scheme: corrosion.BucketScheme, BucketCount: corrosion.BucketCount}
+	if req.GetScheme() != corrosion.BucketScheme {
+		return resp, nil
+	}
+	for _, tb := range s.db.TableBucketDigests(ctx, req.GetTables()) {
+		out := &pb.TableBucketDigests{Name: tb.Name, Bucketed: tb.Bucketed}
+		for _, b := range tb.Buckets {
+			out.Buckets = append(out.Buckets, &pb.BucketDigest{
+				Index: uint32(b.Index), Count: int32(b.Count), Hash: b.Hash, HashV2: b.HashV2,
+			})
+		}
+		resp.Tables = append(resp.Tables, out)
+	}
+	return resp, nil
 }
 
 func streamStateDump(data []byte, send func(*pb.StateDumpChunk) error) error {
@@ -293,7 +342,7 @@ func (s *Server) GetSensitiveStateDigest(ctx context.Context, req *pb.SensitiveS
 		return nil, err
 	}
 
-	digests, err := s.db.SensitiveStateDigest(ctx)
+	digests, err := s.db.SensitiveStateDigestCached(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -309,7 +358,11 @@ func (s *Server) StreamSensitiveStateDump(req *pb.SensitiveStateRequest, stream 
 	if err := requireReplicationPeer(stream.Context(), req.GetSender()); err != nil {
 		return err
 	}
-	return streamStateDump(s.db.DumpSensitiveStateBytes(), stream.Send)
+	if len(req.GetTables()) == 0 {
+		return streamStateDump(s.db.DumpSensitiveStateBytes(), stream.Send)
+	}
+	return streamStateDump(s.db.DumpSensitiveTablesScopedBytes(req.GetTables(),
+		requestedBuckets(req.GetBucketScheme(), req.GetBuckets())), stream.Send)
 }
 
 // PushMutations receives mutation entries from a peer and applies them locally

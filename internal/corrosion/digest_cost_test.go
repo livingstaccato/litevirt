@@ -15,6 +15,45 @@ import (
 //
 //	go test ./internal/corrosion/ -run '^$' -bench BenchmarkStateDigest_50Nodes -benchtime 20x
 func BenchmarkStateDigest_50Nodes(b *testing.B) {
+	c := seedDigestCost50(b)
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := c.StateDigest(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkStateDigestCached_50Nodes is the same digest as a pass now takes
+// it (StateDigestCached) over the same rows, with one host_health row written
+// between digests — the steady state, where a pass rescans only the tables
+// written since the last one (digest_cache.go).
+//
+//	go test ./internal/corrosion/ -run '^$' -bench 'BenchmarkStateDigest(Cached)?_50Nodes' -benchtime 20x
+func BenchmarkStateDigestCached_50Nodes(b *testing.B) {
+	c := seedDigestCost50(b)
+	ctx := context.Background()
+	if _, err := c.StateDigestCached(ctx); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		c.mu.Lock()
+		_, err := c.db.Exec(`UPDATE host_health SET consecutive_failures = ? WHERE observer = 'node-00' AND target = 'node-01'`, i)
+		c.mu.Unlock()
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.StartTimer()
+		if _, err := c.StateDigestCached(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func seedDigestCost50(b *testing.B) *Client {
 	c := NewTestClientT(b)
 	ctx := context.Background()
 	if err := InitSchema(ctx, c); err != nil {
@@ -49,11 +88,5 @@ func BenchmarkStateDigest_50Nodes(b *testing.B) {
 		b.Fatal(err)
 	}
 	c.mu.Unlock()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if _, err := c.StateDigest(ctx); err != nil {
-			b.Fatal(err)
-		}
-	}
+	return c
 }

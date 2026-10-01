@@ -203,3 +203,16 @@ Reference it from a VM via the compose device spec:
 Mappings are CRDT-replicated (the `resource_mappings` table), so every daemon and the
 `/resource-mappings` UI page see a consistent view. Placement/migration eligibility
 checks that a candidate host has a device registered under each mapping the VM needs.
+
+Every mapping change goes through the daemon, which checks `resourcemap.write` at
+`/` and writes one signed audit row naming the caller, the mapping, and the state
+before and after:
+
+```
+resourcemap.device.add   gpu-a100   before=none after={host=kvm-01 address=0000:41:00.0 vendor="10de" device="A100"}
+resourcemap.device.rm    gpu-a100   before={host=kvm-01 address=0000:41:00.0 vendor="10de" device="A100"} after=none
+```
+
+`lv mapping rm` and `lv mapping rm-device` fail with not found when the mapping or
+device is not there, rather than reporting a removal that changed nothing. The
+actions are listed in [audit-log.md](audit-log.md#reading).

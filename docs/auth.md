@@ -353,6 +353,50 @@ root-obtained *node* identity. What this model closes is that a **distributable*
 credential (the shared CLI client cert) does not equal admin: hand someone CLI
 reach and they still need to `lv login` to act.
 
+### Recovering the admin account (`lv user reset-admin`)
+
+`lv user reset-admin` is for the cluster nobody can log in to, so it takes no
+credential. It runs as root on a node and gives the existing `admin` account a
+new random password, written to `/etc/litevirt/admin-password` (mode 0600). It
+never creates an admin: on a node with no live admin it refuses, because a
+joining node's credential replicates in and a deleted admin stays deleted.
+
+Every reset is audited as `user.reset-admin`, attributed to `root@<host>`, with
+target `admin` and a detail of `via=<channel> os_user=<who>`. `os_user` is
+`SUDO_USER` when set, otherwise the login name. The CLI reports it and the daemon
+records it as a claim, not as an authenticated identity. No password and no hash
+is ever written to the row. The CLI mints the password, keeps it, and sends only
+its bcrypt hash.
+
+**With the daemon running**, the command calls the `ResetAdminPassword` RPC over
+the host's local root channel. It dials `127.0.0.1` on the daemon's gRPC port and
+presents this host's own certificate from `pki_dir`, with no bearer. It ignores
+`LV_HOST`, `LV_TOKEN`, a stored `lv login` session and a CLI client bundle, since
+any of those would make the call arrive as someone else. The daemon accepts the
+call only from a **local-root** principal whose certificate CN is its own host
+name. A peer's certificate (even over loopback), an admin session, an API token
+and the distributable `lv-cli` certificate are all refused with
+`PermissionDenied`. Holding a session is not the same as being root on the node.
+The daemon also refuses a hash that is not bcrypt or is below the cluster's cost.
+It writes the reset and the audit row itself, as `via=local-root`.
+
+**With the daemon down**, the command falls back to writing the reset straight
+into the local database. It records the audit entry in the host-local
+pending-audit journal (`<data_dir>/pending-audit/`), and the daemon folds the
+entry into the audit log once it is running. The row is signed and carries the
+time the reset actually happened, with `via=journal`. The journal entry is
+written before the reset and updated with the outcome after, all under the
+journal's lock. A reset that cannot be journalled is not made. A command that
+died in between leaves the result `interrupted`. The mechanism is described in
+[audit-log.md](audit-log.md#actions-taken-while-the-daemon-is-down).
+
+The fallback is taken only when the daemon cannot be reached (`Unavailable`) or
+is too old to have the RPC (`Unimplemented`). Any other answer, a refusal
+included, is returned as it is. A timeout is returned too, not retried locally,
+because the daemon may already have applied the reset and a second one would
+leave the password file and the database disagreeing. Why the CLI may not simply
+write its own audit row is in [audit-log.md](audit-log.md#actions-taken-while-the-daemon-is-down).
+
 ### Enforcement (`auth.strict_mtls_identity`)
 
 Denial of bearerless `client` certs is off by default and gated by both the

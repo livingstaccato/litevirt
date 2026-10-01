@@ -57,7 +57,8 @@ still not the only defence:
   hook) drops everything;
 - the `digest_v2` flag is part of the key;
 - a write by another process fires no hook in the daemon. litevirt's one such
-  writer, `NewLocalClient` (`lv user reset-admin`), touches
+  writer, `NewLocalClient` (`lv user reset-admin` when it cannot reach the
+  daemon), touches
   `<data_dir>/digest-invalidate` when it closes after writing, and no entry
   older than that file's mtime is served;
 - an entry is never trusted past `digestCacheMaxAge` (10 minutes). That bounds

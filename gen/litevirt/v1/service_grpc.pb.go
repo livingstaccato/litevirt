@@ -129,6 +129,7 @@ const (
 	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
 	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
 	LiteVirt_ChangePassword_FullMethodName             = "/litevirt.v1.LiteVirt/ChangePassword"
+	LiteVirt_ResetAdminPassword_FullMethodName         = "/litevirt.v1.LiteVirt/ResetAdminPassword"
 	LiteVirt_ListTwoFactors_FullMethodName             = "/litevirt.v1.LiteVirt/ListTwoFactors"
 	LiteVirt_EnrollTOTP_FullMethodName                 = "/litevirt.v1.LiteVirt/EnrollTOTP"
 	LiteVirt_DisableTwoFactor_FullMethodName           = "/litevirt.v1.LiteVirt/DisableTwoFactor"
@@ -465,6 +466,10 @@ type LiteVirtClient interface {
 	// ChangePassword updates the caller's (or, for admins, a target's) local-realm
 	// password after verifying the old one.
 	ChangePassword(ctx context.Context, in *ChangePasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ResetAdminPassword replaces the local admin's password hash and records a
+	// `user.reset-admin` audit row. Local root only: loopback, this host's own
+	// certificate, no bearer. It resets an existing admin and never creates one.
+	ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	ListTwoFactors(ctx context.Context, in *ListTwoFactorsRequest, opts ...grpc.CallOption) (*ListTwoFactorsResponse, error)
 	EnrollTOTP(ctx context.Context, in *EnrollTOTPRequest, opts ...grpc.CallOption) (*EnrollTOTPResponse, error)
 	DisableTwoFactor(ctx context.Context, in *DisableTwoFactorRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2029,6 +2034,16 @@ func (c *liteVirtClient) ChangePassword(ctx context.Context, in *ChangePasswordR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, LiteVirt_ChangePassword_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) ResetAdminPassword(ctx context.Context, in *ResetAdminPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, LiteVirt_ResetAdminPassword_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3917,6 +3932,10 @@ type LiteVirtServer interface {
 	// ChangePassword updates the caller's (or, for admins, a target's) local-realm
 	// password after verifying the old one.
 	ChangePassword(context.Context, *ChangePasswordRequest) (*emptypb.Empty, error)
+	// ResetAdminPassword replaces the local admin's password hash and records a
+	// `user.reset-admin` audit row. Local root only: loopback, this host's own
+	// certificate, no bearer. It resets an existing admin and never creates one.
+	ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*emptypb.Empty, error)
 	ListTwoFactors(context.Context, *ListTwoFactorsRequest) (*ListTwoFactorsResponse, error)
 	EnrollTOTP(context.Context, *EnrollTOTPRequest) (*EnrollTOTPResponse, error)
 	DisableTwoFactor(context.Context, *DisableTwoFactorRequest) (*emptypb.Empty, error)
@@ -4585,6 +4604,9 @@ func (UnimplementedLiteVirtServer) Whoami(context.Context, *emptypb.Empty) (*Who
 }
 func (UnimplementedLiteVirtServer) ChangePassword(context.Context, *ChangePasswordRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ChangePassword not implemented")
+}
+func (UnimplementedLiteVirtServer) ResetAdminPassword(context.Context, *ResetAdminPasswordRequest) (*emptypb.Empty, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResetAdminPassword not implemented")
 }
 func (UnimplementedLiteVirtServer) ListTwoFactors(context.Context, *ListTwoFactorsRequest) (*ListTwoFactorsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListTwoFactors not implemented")
@@ -6865,6 +6887,24 @@ func _LiteVirt_ChangePassword_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ChangePassword(ctx, req.(*ChangePasswordRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ResetAdminPassword_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResetAdminPasswordRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ResetAdminPassword(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ResetAdminPassword_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ResetAdminPassword(ctx, req.(*ResetAdminPasswordRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -9901,6 +9941,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ChangePassword",
 			Handler:    _LiteVirt_ChangePassword_Handler,
+		},
+		{
+			MethodName: "ResetAdminPassword",
+			Handler:    _LiteVirt_ResetAdminPassword_Handler,
 		},
 		{
 			MethodName: "ListTwoFactors",

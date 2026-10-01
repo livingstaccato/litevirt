@@ -603,6 +603,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// node the moment anti-entropy delivered it.
 	go d.finishAuditKeyLifecycle(ctx)
 
+	// Fold what `lv user reset-admin` journalled while this daemon could not be
+	// reached, signed and at the time it happened (corrosion/pending_audit.go).
+	go d.runPendingAuditFold(ctx)
+
 	// Move the secret columns onto the sensitive lane once credentials_split_v1
 	// has durably latched. Inert until then; see corrosion.SplitCredentials.
 	go d.runCredentialsSplit(ctx)

@@ -17,6 +17,48 @@ import (
 // row per node per interval — cheap next to the audit rows themselves.
 const auditHeadInterval = 5 * time.Minute
 
+// wireAuditKeyring gives the daemon's client the keyring every audit row it
+// writes is signed with — or, on a host configured not to sign, the verify-only
+// keyring that still checks everyone else's chain.
+//
+// Every audit write path in the daemon goes through corrosion.InsertAuditLog on
+// d.db, and InsertAuditLog signs with whatever keyring that client holds. So
+// this one call is what decides whether the RPC handlers, the failover
+// coordinator, the health owner-asserts and the pending-audit fold write signed
+// rows; none of them can opt out, and none needs to opt in. It must run before
+// any of them starts, which is why Run calls it before building them.
+//
+// Signing is on unless enforcement.audit_signature is explicitly false (see
+// LoadConfig). The signing key IS the host's cluster key: already CA-signed with
+// this host's name as its CN, already present on every node, and already the
+// credential that says "I am this host". Minting a separate one would need the
+// CA private key, which lives only on whichever node ran `lv host init`, so a
+// fresh node could not sign its own log at all.
+//
+// Wire the keyring NOW — rows get written during startup and must be signed —
+// but do NOT record any lifecycle fact yet. Adoption boundaries and retirement
+// boundaries are sequence numbers, and this runs long before the replicator
+// starts, so a node restored from a snapshot would read a local tail far behind
+// its real replicated history and pin a boundary there permanently. See
+// finishAuditKeyLifecycle, called once replication is up.
+func (d *Daemon) wireAuditKeyring(ctx context.Context) {
+	if !d.cfg.Enforcement.AuditSignature {
+		// A non-signing node still needs the cluster CA: a keyring is what
+		// verifies a lifecycle record, so a node without one ignores every
+		// adoption and retirement in the cluster and reports peers' rolled-back
+		// hosts as tampering while every signing node calls the same log clean.
+		d.installAuditVerifier()
+		return
+	}
+	if err := d.setupAuditSigning(ctx); err != nil {
+		// Non-fatal: refusing to start would turn a PKI problem into an outage.
+		// The node keeps running with unsigned rows, which `lv audit verify`
+		// reports — as evidence, since the certificate is published regardless.
+		slog.Error("audit signing could not be enabled; rows will be written unsigned",
+			"error", err)
+	}
+}
+
 // setupAuditSigning loads this host's signing identity, publishes its
 // verification certificate, and starts signing.
 //

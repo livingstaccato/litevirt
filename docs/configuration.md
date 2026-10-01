@@ -294,7 +294,8 @@ enforcement:
                               # fleet-wide — a peer still deciding locally would bypass the
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
-  audit_signature: false      # sign every audit row this host writes with its cluster key
+  audit_signature: true       # DEFAULT ON — unset means on; the only enforcement flag that
+                              # is. Sign every audit row this host writes with its cluster key
                               # (the same host.key that identifies it on the wire, under a
                               # separate signing domain). An unsigned chain is an UNKEYED
                               # hash: anyone who can write the database can edit a row,
@@ -302,23 +303,29 @@ enforcement:
                               # back clean. A signature makes that require the host's private
                               # key instead of just the algorithm, and any OTHER node can
                               # check it — a compromised host cannot certify its own
-                              # rewritten history. Setting this flag turns SIGNING on by
-                              # itself (signed rows are backward-compatible; old peers
-                              # replicate the new columns untouched). The token is advertised
-                              # only while the flag is on, and once it latches fleet-wide a
-                              # write this node cannot sign is logged as an error and still
-                              # RECORDED — dropping the row would lose the record of an
-                              # operation that happened, which is the outcome an attacker
-                              # would pick. It is caught instead by the verifier: while a
-                              # host's published signing certificate stands, an unsigned row
-                              # from it is reported as tampering on every node.
-                              # Turning the flag back OFF is a real rollback, not a silent
-                              # one: on the next start the daemon signs a retirement of its
-                              # own key at the sequence its chain had reached, so rows after
-                              # it are unsigned and expected. A host that cannot sign that
+                              # rewritten history. Signing follows this flag alone (signed
+                              # rows are backward-compatible; old peers replicate the new
+                              # columns untouched), and no node relies on a peer signing,
+                              # so a mixed fleet is safe: a host on an older build or with
+                              # the flag off is just a host that is not signing yet, which
+                              # `lv audit verify` names under "not signing now". Builds
+                              # before this default needed `audit_signature: true` set
+                              # explicitly; see docs/audit-log.md "Turning signing on".
+                              # The token is advertised only while the flag is on, and once
+                              # it latches fleet-wide a write this node cannot sign is
+                              # logged as an error and still RECORDED — dropping the row
+                              # would lose the record of an operation that happened, which
+                              # is the outcome an attacker would pick. It is caught instead
+                              # by the verifier: while a host's published signing
+                              # certificate stands, an unsigned row from it is reported as
+                              # tampering on every node.
+                              # Setting it to false is a real rollback, not a silent one: on
+                              # the next start the daemon signs a retirement of its own key
+                              # at the sequence its chain had reached, so rows after it are
+                              # unsigned and expected. A host that cannot sign that
                               # retirement keeps its contract — that is the case it exists
                               # for — and `lv host retire-audit-key` closes it out from the
-                              # machine holding the cluster CA. Enable fleet-uniformly.
+                              # machine holding the cluster CA.
   owner_epoch: false          # activate the ownership-generation regime on this host
                               # (owner_epoch_v1). With the flag on, the health sweeps
                               # backfill every workload this host owns from the pre-epoch 0

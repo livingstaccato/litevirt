@@ -54,7 +54,8 @@ func FreshDigestRequested(ctx context.Context) bool {
 //   - DDL fires no row hook, so PRAGMA schema_version is part of the key;
 //   - digest_v2 changes every encoding, so its flag is part of the key;
 //   - a write by another PROCESS fires no hook here. The one such writer
-//     litevirt has, NewLocalClient (`lv user reset-admin`), touches
+//     litevirt has, NewLocalClient (`lv user reset-admin` when it cannot reach
+//     the daemon), touches
 //     <data_dir>/digest-invalidate on Close when it wrote, and an entry older
 //     than that file's mtime is not served. What escapes both — a tool that
 //     died before Close, a writer outside litevirt, one committing outside

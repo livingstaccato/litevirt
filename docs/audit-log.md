@@ -485,6 +485,54 @@ WORM target, periodic rsync to glacier) for a tamper-evident regulator
 trail. Operators in regulated environments typically export daily and
 sign the resulting JSON with a separate signing key.
 
+## Actions taken while the daemon is down
+
+Only a host's daemon writes that host's audit rows, and that rule has no
+exceptions. The daemon keeps its sub-chain's tail in memory. A row appended by
+any other process (a CLI holding the database open, a script) links correctly
+to what is on disk, but the daemon's next row then links to the tail it
+remembers and reuses the sequence number the other process took. That is a
+fork. `verify` reports a broken link and a sequence gap for it, on every node.
+The other process also has no signing key wired, so under a signing contract its
+row is reported as an unsigned row from a host that promised to sign. Both read
+as tampering on a log nobody touched. `TestAudit_SecondProcessRowForksTheChain`
+pins this behaviour.
+
+A few actions still have to work with the daemon stopped, so a process other
+than the daemon records them in a **pending-audit journal** instead. The journal
+is a host-local directory, `<data_dir>/pending-audit/`, mode 0700, and is never
+replicated. The daemon folds it into the chain at start and every 30 seconds
+after that. The timer covers a daemon that is running but not yet serving gRPC,
+which is when a caller falls back to the journal. Each entry is one `<id>.json`
+file, written atomically and fsynced. Folding it:
+
+- appends one row through the daemon's own `InsertAuditLog`, so the row is
+  **signed** and takes the next place in the host's sub-chain;
+- stamps the row with the entry's own timestamp, the time the action happened,
+  not the time of the fold. `seq` still records where the row entered the
+  chain, so in `lv audit ls` the row sits at the time of the action while
+  `verify` walks it in fold order. A caller-supplied stamp is stored as given,
+  and it does not move the clamp ceiling for later rows;
+- attributes the row to `root@<host>` whatever the entry says, because only root
+  on this host can write the journal, and appends `recorded_by=pending-audit-journal`
+  to the detail;
+- removes the file only after the row is in. A daemon that crashes between the
+  two finds the row by id on the next fold and only removes the file, so an
+  entry is folded exactly once. A blind re-insert would be ignored by id and
+  still advance the cached tail, which breaks the next row's link.
+
+A writer holds the journal's lock (`flock`) for the whole action it records. It
+journals the intent, acts, then rewrites the entry with the outcome. A fold that
+finds the lock held skips the pass rather than folding the intent as the
+outcome, and waits for the next tick. The kernel releases the lock if the writer
+dies, and the entry then keeps its last word, `interrupted`.
+
+The journal is not a side door into the log. The daemon folds only a closed set
+of actions, today just `user.reset-admin` (see
+[auth.md](auth.md#recovering-the-admin-account-lv-user-reset-admin)). An entry
+for any other action, or one that does not parse, is renamed to `<id>.rejected`,
+left beside the journal for whoever investigates, and logged at error level.
+
 ## Operational notes
 
 - **The rows are per-cluster; the hash chain is per-host.** Audit rows

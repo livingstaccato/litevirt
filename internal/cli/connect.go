@@ -184,6 +184,28 @@ func connectLocal(cfg *ClusterConfig) (pb.LiteVirtClient, func(), error) {
 	return client, closer, nil
 }
 
+// ConnectLocalRoot dials this node's own daemon over loopback, presenting the
+// HOST certificate from pkiDir and no bearer token. That is the host's local
+// root channel: the daemon classifies such a caller as local-root, which only
+// root on this machine can be, because only root can read host.key.
+//
+// It deliberately ignores LV_HOST, LV_TOKEN, a stored `lv login` session and a
+// CLI client bundle, all of which Connect honours. Any of them would make the
+// call arrive as someone other than local root — a remote node, a user, the
+// distributable lv-cli certificate — and a local-root-only RPC would refuse it.
+func ConnectLocalRoot(pkiDir string, grpcPort int) (pb.LiteVirtClient, func(), error) {
+	tlsCfg, err := pki.PeerTLSConfig(pkiDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load this host's certificate from %s: %w", pkiDir, err)
+	}
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(grpcPort))
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg)))
+	if err != nil {
+		return nil, nil, fmt.Errorf("gRPC dial %s: %w", addr, err)
+	}
+	return pb.NewLiteVirtClient(conn), func() { conn.Close() }, nil
+}
+
 func cliPKIBundleExists(dir string) bool {
 	if !regularFile(filepath.Join(dir, "ca.crt")) {
 		return false

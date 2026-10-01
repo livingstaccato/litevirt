@@ -824,6 +824,13 @@ message WhoamiResponse     { string username = 1; string role = 2; string realm 
 // ChangePasswordRequest: username empty = the caller themselves; a non-empty
 // username requires admin. old_password is verified for self-service changes.
 message ChangePasswordRequest { string username = 1; string old_password = 2; string new_password = 3; }
+// ResetAdminPasswordRequest is `lv user reset-admin` over the host's local root
+// channel: loopback mTLS presenting THIS host's own certificate, and no bearer.
+// The CLI mints the password and sends only its bcrypt hash, so the plaintext
+// never leaves the process that writes the password file. os_user is the
+// invoking account as the CLI reports it (SUDO_USER when set); it is recorded
+// in the audit row as a claim, not as an authenticated identity.
+message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; }
 message CreateTokenRequest {
     string username = 1;
     string name     = 2;
@@ -2745,6 +2752,10 @@ service LiteVirt {
     // ChangePassword updates the caller's (or, for admins, a target's) local-realm
     // password after verifying the old one.
     rpc ChangePassword(ChangePasswordRequest) returns (google.protobuf.Empty);
+    // ResetAdminPassword replaces the local admin's password hash and records a
+    // `user.reset-admin` audit row. Local root only: loopback, this host's own
+    // certificate, no bearer. It resets an existing admin and never creates one.
+    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (google.protobuf.Empty);
     rpc ListTwoFactors(ListTwoFactorsRequest) returns (ListTwoFactorsResponse);
     rpc EnrollTOTP(EnrollTOTPRequest)         returns (EnrollTOTPResponse);
     rpc DisableTwoFactor(DisableTwoFactorRequest) returns (google.protobuf.Empty);

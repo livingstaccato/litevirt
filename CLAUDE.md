@@ -120,7 +120,12 @@ finally failed.
 Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
-- each has an `enforcement.*` config flag, default **false**
+- each has an `enforcement.*` config flag, default **false**. The one
+  exception is `enforcement.audit_signature`, which defaults **true**: each
+  host signs only its own rows, so no node relies on a peer, and a key that
+  fails to load leaves the daemon running and reports its unsigned rows as
+  evidence (docs/audit-log.md, "Turning signing on"). An explicit `false`
+  is its kill switch
 - **advertising is not enforcing.** Most tokens are advertised on the strength
   of the BUILD, whatever the local flag says, so the cluster can latch them —
   the node's own flag then decides whether it acts. A latched token therefore

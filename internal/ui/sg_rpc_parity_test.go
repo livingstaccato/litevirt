@@ -8,6 +8,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/auth"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/grpcapi"
 )
 
 // The web UI's security-group pages and the `lv sg` RPCs are two surfaces for
@@ -22,6 +23,13 @@ import (
 // shape an external-realm user is shadowed as, so only the binding can grant
 // anything.
 func newUIBoundTo(t *testing.T, user, boundRole string) (*Server, *corrosion.Client) {
+	t.Helper()
+	s, db, _ := newUIBoundToSvc(t, user, boundRole)
+	return s, db
+}
+
+// newUIBoundToSvc is newUIBoundTo that also returns the daemon.
+func newUIBoundToSvc(t *testing.T, user, boundRole string) (*Server, *corrosion.Client, *grpcapi.Server) {
 	t.Helper()
 	s, db, svc := newUIOverRealDaemonSvc(t, user, "viewer")
 	ctx := context.Background()
@@ -38,7 +46,7 @@ func newUIBoundTo(t *testing.T, user, boundRole string) (*Server, *corrosion.Cli
 		t.Fatalf("Reload: %v", err)
 	}
 	svc.SetAuthEngine(engine)
-	return s, db
+	return s, db, svc
 }
 
 type rpcAuditRow struct{ user, host, target, detail, result string }

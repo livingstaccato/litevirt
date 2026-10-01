@@ -977,6 +977,72 @@ message RestoreFromBackupProgress {
     string error         = 6;
 }
 
+// ── Backup repository maintenance ──
+//
+// Verify, garbage-collect, prune and sync act on a repo the DAEMON you call
+// holds. `repo` (and SyncBackupRepoRequest.destination) is a registered repo
+// name — daemon config `backup_repos:` or a cluster-registered compose repo — or
+// an absolute path, which only an admin may pass (resolveBackupRepoPath). Each
+// RPC is checked at `/` with its own backup.* verb and writes one audit row.
+
+message VerifyBackupRepoRequest {
+    string repo = 1;
+}
+message VerifyBackupRepoResponse {
+    int64           chunks_checked = 1;
+    repeated string mismatched     = 2;  // chunk ids whose content disagrees with their id
+    repeated string missing        = 3;  // chunk ids a manifest references that are absent
+}
+
+message GarbageCollectBackupRepoRequest {
+    string repo = 1;
+}
+message GarbageCollectBackupRepoResponse {
+    int64 manifests_scanned     = 1;
+    int64 chunks_referenced     = 2;
+    int64 chunks_on_disk        = 3;
+    int64 chunks_deleted        = 4;
+    int64 chunks_retained_young = 5;  // unreferenced, but inside the grace window
+    int64 manifests_invalid     = 6;  // their chunks are retained
+    int64 bytes_reclaimed       = 7;
+}
+
+// BackupRepoSnapshot is one manifest as a prune plan names it.
+message BackupRepoSnapshot {
+    string timestamp  = 1;
+    string vm_name    = 2;
+    string disk_name  = 3;
+    int64  total_size = 4;
+}
+
+message PruneBackupRepoRequest {
+    string repo         = 1;
+    int32  keep_last    = 2;
+    int32  keep_daily   = 3;
+    int32  keep_weekly  = 4;
+    int32  keep_monthly = 5;
+    int32  keep_yearly  = 6;
+    // false (the default) only plans: nothing is deleted and no audit row is
+    // written. true deletes the manifests the plan drops.
+    bool   apply        = 7;
+}
+message PruneBackupRepoResponse {
+    repeated BackupRepoSnapshot keep    = 1;
+    repeated BackupRepoSnapshot delete  = 2;
+    bool                        applied = 3;
+}
+
+message SyncBackupRepoRequest {
+    string source      = 1;
+    string destination = 2;
+}
+message SyncBackupRepoResponse {
+    int64 manifests_copied = 1;
+    int64 chunks_copied    = 2;
+    int64 chunks_skipped   = 3;  // already present at the destination
+    int64 bytes_copied     = 4;
+}
+
 // ── Containers ──
 
 message Container {
@@ -2796,6 +2862,16 @@ service LiteVirt {
     // chunks (sub-chunk framed) then the manifest LAST.
     rpc HasChunks(HasChunksRequest)   returns (HasChunksResponse);
     rpc PushBackup(stream PushBackupFrame) returns (PushBackupResponse);
+
+    // ── Backup repository maintenance ──
+    // What `lv backup repo verify|gc|prune|sync` do to a local path, done by the
+    // daemon to a repo it holds, under RBAC and on the audit record. The web
+    // UI's /backups actions call these. Verbs: backup.verify, backup.gc,
+    // backup.prune, backup.sync, all at `/`, legacy floor operator.
+    rpc VerifyBackupRepo(VerifyBackupRepoRequest)                 returns (VerifyBackupRepoResponse);
+    rpc GarbageCollectBackupRepo(GarbageCollectBackupRepoRequest) returns (GarbageCollectBackupRepoResponse);
+    rpc PruneBackupRepo(PruneBackupRepoRequest)                   returns (PruneBackupRepoResponse);
+    rpc SyncBackupRepo(SyncBackupRepoRequest)                     returns (SyncBackupRepoResponse);
 
     // ── Containers ──
     rpc CreateContainer(CreateContainerRequest) returns (Container);

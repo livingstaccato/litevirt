@@ -5,25 +5,21 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/litevirt/litevirt/internal/pbsstore"
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
-// Repo maintenance actions for /backups. These call internal/pbsstore directly
-// (in-process, same as the inventory page) rather than via gRPC, so they do NOT
-// pass through the daemon's RBAC interceptor. They are reachable only by an
-// authenticated UI session; treat repo mutation as an operator-level action and
-// see docs/ui.md for the follow-up to expose these as RBAC-gated RPCs.
+// Repo maintenance actions for /backups. Each calls the daemon's RPC with the
+// session's bearer — VerifyBackupRepo, GarbageCollectBackupRepo,
+// PruneBackupRepo, SyncBackupRepo — so the daemon checks backup.verify /
+// backup.gc / backup.prune / backup.sync against the caller's own credential
+// and writes the audit row, exactly as for any other caller of those RPCs.
+// They used to run internal/pbsstore in-process behind nothing but a session
+// with some role, so a Viewer could prune or garbage-collect a repo. The repo
+// is passed by the name in ?repo=; the daemon resolves it, and refuses a custom
+// absolute path to anyone but an admin.
 
-// openNamedRepo resolves a ?repo=<name> query param to an open repo.
-func (s *Server) openNamedRepo(r *http.Request) (*pbsstore.Repo, string, error) {
-	name := r.URL.Query().Get("repo")
-	if name == "" {
-		return nil, "", fmt.Errorf("repo required")
-	}
-	path := s.resolveRepoPath(name)
-	repo, err := pbsstore.Open(path)
-	return repo, name, err
-}
+// repoParam is the ?repo= the /backups page puts on every action.
+func repoParam(r *http.Request) string { return strings.TrimSpace(r.URL.Query().Get("repo")) }
 
 // backupInFlight reports whether a backup to the named repo is currently
 // running — GC must not race a push to the same repo (a just-written chunk
@@ -42,46 +38,48 @@ func (s *Server) backupInFlight(repoName string) bool {
 }
 
 func (s *Server) handleRepoVerify(w http.ResponseWriter, r *http.Request) {
-	repo, name, err := s.openNamedRepo(r)
-	if err != nil {
-		sendToast(w, "Verify failed: "+err.Error(), "error")
+	name := repoParam(r)
+	if name == "" {
+		sendToast(w, "Verify failed: repo required", "error")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	stats, err := pbsstore.Verify(r.Context(), repo)
+	resp, err := s.grpc.VerifyBackupRepo(s.uiBearerCtx(r), &pb.VerifyBackupRepoRequest{Repo: name})
 	if err != nil {
 		sendToast(w, "Verify failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
-	bad := len(stats.Mismatches) + len(stats.Missing)
-	if bad > 0 {
-		sendToast(w, fmt.Sprintf("Repo %s: %d chunks checked, %d mismatched, %d missing", name, stats.ChunksChecked, len(stats.Mismatches), len(stats.Missing)), "error")
+	mismatched, missing := len(resp.GetMismatched()), len(resp.GetMissing())
+	if mismatched+missing > 0 {
+		sendToast(w, fmt.Sprintf("Repo %s: %d chunks checked, %d mismatched, %d missing", name, resp.GetChunksChecked(), mismatched, missing), "error")
 	} else {
-		sendToast(w, fmt.Sprintf("Repo %s verified: %d chunks OK", name, stats.ChunksChecked), "success")
+		sendToast(w, fmt.Sprintf("Repo %s verified: %d chunks OK", name, resp.GetChunksChecked()), "success")
 	}
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleRepoGC(w http.ResponseWriter, r *http.Request) {
-	repo, name, err := s.openNamedRepo(r)
-	if err != nil {
-		sendToast(w, "GC failed: "+err.Error(), "error")
+	name := repoParam(r)
+	if name == "" {
+		sendToast(w, "GC failed: repo required", "error")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+	// A courtesy for backups this page started. The RPC's chunk grace period is
+	// what keeps a sweep off an in-flight push from any source.
 	if s.backupInFlight(name) {
 		sendToast(w, "A backup to this repo is in progress — try GC again when it finishes", "error")
 		w.WriteHeader(http.StatusConflict)
 		return
 	}
-	stats, err := pbsstore.GC(r.Context(), repo)
+	resp, err := s.grpc.GarbageCollectBackupRepo(s.uiBearerCtx(r), &pb.GarbageCollectBackupRepoRequest{Repo: name})
 	if err != nil {
 		sendToast(w, "GC failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
-	sendToast(w, fmt.Sprintf("GC on %s: removed %d chunks, reclaimed %s", name, stats.ChunksDeleted, formatBytes(stats.BytesReclaimed)), "success")
+	sendToast(w, fmt.Sprintf("GC on %s: removed %d chunks, reclaimed %s", name, resp.GetChunksDeleted(), formatBytes(resp.GetBytesReclaimed())), "success")
 	w.Header().Set("HX-Refresh", "true")
 	w.WriteHeader(http.StatusOK)
 }
@@ -102,27 +100,21 @@ func (s *Server) handleRepoSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	src, srcName, err := s.openNamedRepo(r)
-	if err != nil {
-		sendToast(w, "Sync failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+	srcName := repoParam(r)
 	dstName := strings.TrimSpace(r.FormValue("dest"))
-	dst, err := pbsstore.Open(s.resolveRepoPath(dstName))
-	if err != nil {
-		sendToast(w, "Sync failed: open dest: "+err.Error(), "error")
+	if srcName == "" || dstName == "" {
+		sendToast(w, "Sync failed: source and destination repo required", "error")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	stats, err := pbsstore.SyncRepo(r.Context(), src, dst)
+	resp, err := s.grpc.SyncBackupRepo(s.uiBearerCtx(r), &pb.SyncBackupRepoRequest{Source: srcName, Destination: dstName})
 	if err != nil {
 		sendToast(w, "Sync failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, fmt.Sprintf("Synced %s → %s: %d manifests, %d chunks (%s), %d already present",
-		srcName, dstName, stats.ManifestsCopied, stats.ChunksCopied, formatBytes(stats.BytesCopied), stats.ChunksSkipped), "success")
+		srcName, dstName, resp.GetManifestsCopied(), resp.GetChunksCopied(), formatBytes(resp.GetBytesCopied()), resp.GetChunksSkipped()), "success")
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -131,43 +123,41 @@ func (s *Server) handleRepoPruneModal(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleRepoPrune previews (apply=0) or applies (apply=1) a retention prune.
+// Both go through PruneBackupRepo, so the preview needs backup.prune too.
 func (s *Server) handleRepoPrune(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	repo, name, err := s.openNamedRepo(r)
-	if err != nil {
-		sendToast(w, "Prune failed: "+err.Error(), "error")
+	name := repoParam(r)
+	if name == "" {
+		sendToast(w, "Prune failed: repo required", "error")
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	policy := pbsstore.RetentionPolicy{
-		KeepLast:    int(atoi32(r.FormValue("keep_last"))),
-		KeepDaily:   int(atoi32(r.FormValue("keep_daily"))),
-		KeepWeekly:  int(atoi32(r.FormValue("keep_weekly"))),
-		KeepMonthly: int(atoi32(r.FormValue("keep_monthly"))),
-		KeepYearly:  int(atoi32(r.FormValue("keep_yearly"))),
-	}
-	plan, err := pbsstore.PlanPrune(repo, policy)
+	apply := r.FormValue("apply") == "1"
+	resp, err := s.grpc.PruneBackupRepo(s.uiBearerCtx(r), &pb.PruneBackupRepoRequest{
+		Repo:        name,
+		KeepLast:    atoi32(r.FormValue("keep_last")),
+		KeepDaily:   atoi32(r.FormValue("keep_daily")),
+		KeepWeekly:  atoi32(r.FormValue("keep_weekly")),
+		KeepMonthly: atoi32(r.FormValue("keep_monthly")),
+		KeepYearly:  atoi32(r.FormValue("keep_yearly")),
+		Apply:       apply,
+	})
 	if err != nil {
-		sendToast(w, "Prune plan failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		sendToast(w, "Prune failed: "+err.Error(), "error")
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
-	if r.FormValue("apply") != "1" {
+	if !apply {
 		// Preview: render the plan for confirmation.
 		s.renderFragment(w, "repo_prune_preview.html", map[string]any{
-			"Repo": name, "Keep": plan.Keep, "Delete": plan.Delete, "Policy": r.Form,
+			"Repo": name, "Keep": resp.GetKeep(), "Delete": resp.GetDelete(), "Policy": r.Form,
 		})
 		return
 	}
-	if err := pbsstore.ApplyPrune(repo, plan); err != nil {
-		sendToast(w, "Prune failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	sendToast(w, fmt.Sprintf("Pruned %s: kept %d, deleted %d manifests (run GC to reclaim space)", name, len(plan.Keep), len(plan.Delete)), "success")
+	sendToast(w, fmt.Sprintf("Pruned %s: kept %d, deleted %d manifests (run GC to reclaim space)", name, len(resp.GetKeep()), len(resp.GetDelete())), "success")
 	w.Header().Set("HX-Refresh", "true")
 	w.WriteHeader(http.StatusOK)
 }

@@ -6,7 +6,7 @@
   {{range .Delete}}
     <tr>
       <td class="mono" style="font-size:11px">{{.Timestamp}}</td>
-      <td>{{.VMName}}</td>
+      <td>{{.VmName}}</td>
       <td>{{if .DiskName}}{{.DiskName}}{{else}}root{{end}}</td>
       <td>{{formatBytes .TotalSize}}</td>
     </tr>

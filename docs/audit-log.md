@@ -97,6 +97,16 @@ Use cases:
   then again with `--action 'sg.*'` for security groups. Each row records the
   policy before and after the change; the actions and the detail format are in
   [firewall.md](firewall.md#audit-trail).
+- Who pruned or garbage-collected a backup repo? —
+  `lv audit ls --action 'backup.repo.*'`. The actions are
+  `backup.repo.verify`, `backup.repo.gc`, `backup.repo.prune` and
+  `backup.repo.sync`. Each row names the repo, or `src -> dst` for a sync, and
+  its detail holds what the operation counted: chunks deleted and bytes
+  reclaimed for a GC, the `keep_*` policy and the kept and deleted counts for a
+  prune. A refused attempt is recorded as `denied`. The full format is in
+  [backups.md](backups.md#repo-maintenance-rpcs). The local
+  `lv backup repo …` commands write no row (see
+  [below](#actions-taken-while-the-daemon-is-down)).
 
 ## Verifying
 

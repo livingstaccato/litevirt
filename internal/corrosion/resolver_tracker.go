@@ -127,6 +127,11 @@ type unresolvedTie struct {
 	// it (the rows still disagree), but it stops driving decisions — the
 	// owner-epoch latch, the tie counts and the gauge all skip it.
 	acknowledged bool
+	// versions is the (local, incoming) version fingerprint pair of the
+	// observation, when the producer had both rows (trackUnresolved). Empty for
+	// a producer that supplies only a precomputed pair (identity faults), which
+	// an acknowledgement can then cover by exact pair only.
+	versions [2]string
 }
 
 // Tie categories: what a tie is ABOUT. A consumer decides which of these
@@ -218,7 +223,8 @@ func immutableTieCategory(table string) string {
 // logs an alert ONCE per distinct (table,PK,content-pair); re-observing the same
 // divergence is a no-op (bounded). Safe to call with c.mu held (uses its own lock).
 func (c *Client) trackUnresolved(table, pk string, local, incoming []interface{}, path resolveTiePath, category string) {
-	c.trackUnresolvedPair(table, pk, contentPair(local, incoming), path, category)
+	c.trackUnresolvedObserved(table, pk, contentPair(local, incoming),
+		[2]string{versionFingerprint(local), versionFingerprint(incoming)}, path, category)
 	c.noteTieVersions(unresolvedKey(table, pk), local, incoming)
 }
 
@@ -274,6 +280,25 @@ func (c *Client) tieVersionsKnownLocked(key string, versions ...string) bool {
 // full row but the incoming may be a subset/reordered statement) can supply a stable one instead
 // of the positional (local,incoming) pair.
 func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath, category string) {
+	c.trackUnresolvedObserved(table, pk, pair, [2]string{}, path, category)
+}
+
+// ackCoversLocked reports whether an operator's acknowledgement answers the
+// observation (pair, versions) of key: its exact pair was acknowledged, or both
+// of its versions were among those the node had met when the row was
+// acknowledged. pair is the digested fingerprint. Caller holds tieMu.
+func (c *Client) ackCoversLocked(key, pair string, versions [2]string) bool {
+	if c.acknowledgedTies[key][pair] {
+		return true
+	}
+	set := c.acknowledgedVersions[key]
+	return versions[0] != "" && versions[1] != "" && set[versions[0]] && set[versions[1]]
+}
+
+// trackUnresolvedObserved is the register update behind trackUnresolved and
+// trackUnresolvedPair. pair is raw content (digested here); versions may be
+// empty when the producer has only the pair.
+func (c *Client) trackUnresolvedObserved(table, pk, pair string, versions [2]string, path resolveTiePath, category string) {
 	key := unresolvedKey(table, pk)
 	pair = pairFingerprint(pair)
 
@@ -304,7 +329,12 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 	// stale acknowledgement is inert — it cannot mask the live divergence. And
 	// if the acknowledged pair is ever observed again, the operator did
 	// acknowledge precisely that, so staying quiet is the answer they gave.
-	acknowledged := c.acknowledgedTies[key][pair]
+	//
+	// An observation is answered by its exact pair OR by the row's
+	// acknowledged version set (acknowledgedTieVersionsDDL): the operator
+	// acknowledges a row, and in an N-way contest the one pair the register
+	// held named only the last peer met.
+	acknowledged := c.ackCoversLocked(key, pair, versions)
 
 	// An acknowledged tie is still TRACKED, marked. It is not deleted and not
 	// skipped, because "is this row currently divergent" and "should this
@@ -351,7 +381,7 @@ func (c *Client) trackUnresolvedPair(table, pk, pair string, path resolveTiePath
 
 	livenessMoved := !existed
 	if !supersededByAck && (isNew || prev.acknowledged != acknowledged) {
-		c.unresolvedTies[key] = unresolvedTie{pair: pair, category: category, acknowledged: acknowledged}
+		c.unresolvedTies[key] = unresolvedTie{pair: pair, category: category, acknowledged: acknowledged, versions: versions}
 		livenessMoved = livenessMoved || (existed && prev.acknowledged != acknowledged)
 	}
 	if !existed {
@@ -502,11 +532,36 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 
 	c.tieMu.Lock()
 	t, ok := c.unresolvedTies[key]
+	// The versions the acknowledgement answers for: every version of this row
+	// the node has met as a party to its tie (tieVersions), which in an N-way
+	// contest is more than the one pair the register holds. Only the ones not
+	// already answered need writing.
+	var newVersions []string
+	if ok {
+		seen := make(map[string]struct{}, len(c.tieVersions[key])+2)
+		for v := range c.tieVersions[key] {
+			seen[v] = struct{}{}
+		}
+		for _, v := range t.versions {
+			if v != "" {
+				seen[v] = struct{}{}
+			}
+		}
+		for v := range seen {
+			if !c.acknowledgedVersions[key][v] {
+				newVersions = append(newVersions, v)
+			}
+		}
+		sort.Strings(newVersions)
+	}
 	c.tieMu.Unlock()
 	if !ok {
 		return false, nil
 	}
-	if t.acknowledged {
+	// An entry already answered by its exact pair, from a build that recorded
+	// only pairs, still has its versions to record: that is what keeps it
+	// answered when the peers are next met in a different order.
+	if t.acknowledged && len(newVersions) == 0 {
 		// Already acknowledged. The entry is RETAINED rather than deleted (see
 		// unresolvedTie.acknowledged), so unlike the earlier delete-on-clear
 		// version a retry finds it right here — and must not re-record it,
@@ -525,18 +580,32 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 	// like it worked and silently come back on the next restart — the exact
 	// failure this table exists to prevent, made harder to notice.
 	//
-	// execLocal: local-only, never replicated. See acknowledgedTiesDDL.
-	if err := c.execLocal(ctx,
-		// DO NOTHING, not DO UPDATE. The conflict target is now the full key
-		// including content_pair, so a conflict means THIS pair was already
-		// answered — and the original acknowledged_at/acknowledged_by must
-		// stand rather than be rewritten by a later operator. Sibling pairs on
-		// the same row are separate rows and are never touched; the previous
-		// statement overwrote them, which is what made an N-way tie unanswerable.
-		`INSERT INTO acknowledged_ties (table_name, pk, content_pair, acknowledged_at, acknowledged_by)
+	// execBatchLocal: local-only, never replicated, and one transaction, so
+	// the pair and the versions it answers for land together or not at all.
+	// See acknowledgedTiesDDL and acknowledgedTieVersionsDDL.
+	//
+	// DO NOTHING, not DO UPDATE, in both. The conflict target is the full key,
+	// so a conflict means THIS pair (or version) was already answered — and the
+	// original acknowledged_at/acknowledged_by must stand rather than be
+	// rewritten by a later operator. Sibling pairs on the same row are separate
+	// rows and are never touched; the previous statement overwrote them, which
+	// is what made an N-way tie unanswerable.
+	at := time.Now().UTC().Format(time.RFC3339)
+	stmts := []Statement{{
+		SQL: `INSERT INTO acknowledged_ties (table_name, pk, content_pair, acknowledged_at, acknowledged_by)
 		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(table_name, pk, content_pair) DO NOTHING`,
-		table, pk, t.pair, time.Now().UTC().Format(time.RFC3339), by); err != nil {
+		Params: []interface{}{table, pk, t.pair, at, by},
+	}}
+	for _, v := range newVersions {
+		stmts = append(stmts, Statement{
+			SQL: `INSERT INTO acknowledged_tie_versions (table_name, pk, version, acknowledged_at, acknowledged_by)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON CONFLICT(table_name, pk, version) DO NOTHING`,
+			Params: []interface{}{table, pk, v, at, by},
+		})
+	}
+	if err := c.execBatchLocal(ctx, stmts); err != nil {
 		return false, fmt.Errorf("persist acknowledgement of %s/%s: %w", table, pk, err)
 	}
 	if ackPersistedHook != nil {
@@ -552,6 +621,17 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 		c.acknowledgedTies[key] = make(map[string]bool, 1)
 	}
 	c.acknowledgedTies[key][t.pair] = true
+	if len(newVersions) > 0 {
+		if c.acknowledgedVersions == nil {
+			c.acknowledgedVersions = make(map[string]map[string]bool, 1)
+		}
+		if c.acknowledgedVersions[key] == nil {
+			c.acknowledgedVersions[key] = make(map[string]bool, len(newVersions))
+		}
+		for _, v := range newVersions {
+			c.acknowledgedVersions[key][v] = true
+		}
+	}
 
 	// Re-compare the PAIR before clearing anything, not just the key's
 	// presence. tieMu was released for the durable write, and a merge in that
@@ -564,8 +644,12 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 	// An entry that has vanished entirely is the other outcome and needs no
 	// action: a concurrent clearUnresolved (a real repair) removed it, and an
 	// acknowledgement of a pair that is no longer tracked is inert.
+	//
+	// A replacement whose two versions were both among those just recorded is
+	// not "a different divergence": the operator acknowledged the row with
+	// both of those claims in it, so it is marked like the pair they saw.
 	cur, still := c.unresolvedTies[key]
-	if still && cur.pair != t.pair {
+	if still && cur.pair != t.pair && !c.ackCoversLocked(key, cur.pair, cur.versions) {
 		slog.Warn("a different divergence appeared on this row while the acknowledgement was "+
 			"being recorded; the acknowledgement stands for the pair the operator saw and the "+
 			"new conflict stays tracked",
@@ -573,7 +657,7 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 			"acknowledged_fingerprint", t.pair, "tracked_fingerprint", cur.pair)
 		return true, nil
 	}
-	if still {
+	if still && !cur.acknowledged {
 		// MARKED, not deleted. The row is still divergent, so the digest's
 		// attribution must keep seeing it; what the acknowledgement stops is
 		// its effect on decisions. See unresolvedTie.acknowledged.
@@ -595,7 +679,8 @@ func (c *Client) AcknowledgeUnresolvedTie(ctx context.Context, table, pk, by str
 func (c *Client) TieAcknowledged(table, pk string) bool {
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
-	return len(c.acknowledgedTies[unresolvedKey(table, pk)]) > 0
+	key := unresolvedKey(table, pk)
+	return len(c.acknowledgedTies[key]) > 0 || len(c.acknowledgedVersions[key]) > 0
 }
 
 // LeaseTermTieAcknowledged is TieAcknowledged for a contested lease term, with
@@ -612,6 +697,12 @@ func (c *Client) loadAcknowledgedTies(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Both reads before tieMu: a merge holds c.mu and then takes tieMu, so
+	// reading under tieMu would invert that order.
+	vrows, err := c.Query(ctx, `SELECT table_name, pk, version FROM acknowledged_tie_versions`)
+	if err != nil {
+		return err
+	}
 	c.tieMu.Lock()
 	defer c.tieMu.Unlock()
 	if c.acknowledgedTies == nil {
@@ -623,6 +714,16 @@ func (c *Client) loadAcknowledgedTies(ctx context.Context) error {
 			c.acknowledgedTies[key] = make(map[string]bool, 1)
 		}
 		c.acknowledgedTies[key][r.String("content_pair")] = true
+	}
+	if c.acknowledgedVersions == nil {
+		c.acknowledgedVersions = make(map[string]map[string]bool, len(vrows))
+	}
+	for _, r := range vrows {
+		key := unresolvedKey(r.String("table_name"), r.String("pk"))
+		if c.acknowledgedVersions[key] == nil {
+			c.acknowledgedVersions[key] = make(map[string]bool, 1)
+		}
+		c.acknowledgedVersions[key][r.String("version")] = true
 	}
 	return nil
 }

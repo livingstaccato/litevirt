@@ -91,6 +91,12 @@ func (s *Server) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTerm
 // restart empties it and the next anti-entropy sweep re-registers the same tie
 // within seconds.
 //
+// The acknowledgement is durable (acknowledged_ties, acknowledged_tie_versions)
+// and covers the ROW as this node has seen it: every claim for the term it has
+// met, however many peers made one and in whatever order anti-entropy meets
+// them after a restart. A claim first met afterwards is not covered and raises
+// the condition again.
+//
 // It clears EVIDENCE TRACKING, not the conflict. Both claims stay in the ledger,
 // and this handler writes an audit row naming the principal, the key and the
 // term — the durable record that replaces the in-memory one. Nothing here picks

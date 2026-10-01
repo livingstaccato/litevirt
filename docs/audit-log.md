@@ -99,6 +99,18 @@ Use cases:
   then again with `--action 'sg.*'` for security groups. Each row records the
   policy before and after the change; the actions and the detail format are in
   [firewall.md](firewall.md#audit-trail).
+- Who repointed a resource mapping? — `lv audit ls --action 'resourcemap.*'`.
+  The actions are `resourcemap.add` (`lv mapping create`), `resourcemap.rm`
+  (`lv mapping rm`), `resourcemap.device.add` (`lv mapping add-device`) and
+  `resourcemap.device.rm` (`lv mapping rm-device`), from the CLI and the
+  `/resource-mappings` UI page alike. The target is the mapping name; the
+  detail is `before=<state> after=<state>`, in the firewall's state words, with
+  the device as `{host=… address=… vendor="…" device="…"}` or the whole mapping
+  with its devices. A removal that names nothing live is refused as not found
+  and recorded as `error`; a failed write is `error` with an after-state of
+  `unknown(<error>)`; a caller without `resourcemap.write` is recorded as
+  `denied`, with what they asked for. See
+  [pci-passthrough.md](pci-passthrough.md#resource-mappings).
 - Who pruned or garbage-collected a backup repo? —
   `lv audit ls --action 'backup.repo.*'`. The actions are
   `backup.repo.verify`, `backup.repo.gc`, `backup.repo.prune` and

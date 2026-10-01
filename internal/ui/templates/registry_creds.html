@@ -46,7 +46,7 @@
   {{if .Global}}
   <table class="table">
     <thead>
-      <tr><th>Registry</th><th>Username</th><th>Updated</th>{{if .IsOperator}}<th></th>{{end}}</tr>
+      <tr><th>Registry</th><th>Username</th><th>Updated</th>{{if .CanManageGlobal}}<th></th>{{end}}</tr>
     </thead>
     <tbody>
     {{range .Global}}
@@ -54,7 +54,7 @@
         <td class="mono">{{.Registry}}</td>
         <td>{{.Username}}</td>
         <td class="muted">{{.UpdatedAt}}</td>
-        {{if $.IsOperator}}
+        {{if $.CanManageGlobal}}
         <td style="text-align:right">
           <button class="btn btn-sm btn-danger"
                   hx-delete="/ui/registry-creds?registry={{.Registry}}&global=true"
@@ -66,7 +66,7 @@
     </tbody>
   </table>
   {{else}}
-  <div class="empty-state">No global registry credentials.{{if .IsOperator}} Add one above and tick “Global”.{{end}}</div>
+  <div class="empty-state">No global registry credentials.{{if .CanManageGlobal}} Add one above and tick “Global”.{{end}}</div>
   {{end}}
 </div>
 {{end}}

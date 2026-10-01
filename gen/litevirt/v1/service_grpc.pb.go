@@ -128,6 +128,7 @@ const (
 	LiteVirt_CreateToken_FullMethodName                = "/litevirt.v1.LiteVirt/CreateToken"
 	LiteVirt_RevokeToken_FullMethodName                = "/litevirt.v1.LiteVirt/RevokeToken"
 	LiteVirt_Whoami_FullMethodName                     = "/litevirt.v1.LiteVirt/Whoami"
+	LiteVirt_CheckPermissions_FullMethodName           = "/litevirt.v1.LiteVirt/CheckPermissions"
 	LiteVirt_ChangePassword_FullMethodName             = "/litevirt.v1.LiteVirt/ChangePassword"
 	LiteVirt_ResetAdminPassword_FullMethodName         = "/litevirt.v1.LiteVirt/ResetAdminPassword"
 	LiteVirt_ListTwoFactors_FullMethodName             = "/litevirt.v1.LiteVirt/ListTwoFactors"
@@ -467,6 +468,12 @@ type LiteVirtClient interface {
 	// skipAuth), so a stale/expired/revoked session bearer yields Unauthenticated
 	// — the UI uses it to validate the session cookie and redirect to /login.
 	Whoami(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*WhoamiResponse, error)
+	// CheckPermissions reports, for the CALLER only, whether each named
+	// permission gate would admit it — the same RequirePerm question (path,
+	// verb, legacy fallback role) the gated RPC asks. Display only: the UI uses
+	// it to decide which controls to show, and every gated RPC still runs its
+	// own check. An unknown gate name is InvalidArgument.
+	CheckPermissions(ctx context.Context, in *CheckPermissionsRequest, opts ...grpc.CallOption) (*CheckPermissionsResponse, error)
 	// ChangePassword updates the caller's (or, for admins, a target's) local-realm
 	// password after verifying the old one.
 	ChangePassword(ctx context.Context, in *ChangePasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2037,6 +2044,16 @@ func (c *liteVirtClient) Whoami(ctx context.Context, in *emptypb.Empty, opts ...
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(WhoamiResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_Whoami_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) CheckPermissions(ctx context.Context, in *CheckPermissionsRequest, opts ...grpc.CallOption) (*CheckPermissionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CheckPermissionsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_CheckPermissions_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3982,6 +3999,12 @@ type LiteVirtServer interface {
 	// skipAuth), so a stale/expired/revoked session bearer yields Unauthenticated
 	// — the UI uses it to validate the session cookie and redirect to /login.
 	Whoami(context.Context, *emptypb.Empty) (*WhoamiResponse, error)
+	// CheckPermissions reports, for the CALLER only, whether each named
+	// permission gate would admit it — the same RequirePerm question (path,
+	// verb, legacy fallback role) the gated RPC asks. Display only: the UI uses
+	// it to decide which controls to show, and every gated RPC still runs its
+	// own check. An unknown gate name is InvalidArgument.
+	CheckPermissions(context.Context, *CheckPermissionsRequest) (*CheckPermissionsResponse, error)
 	// ChangePassword updates the caller's (or, for admins, a target's) local-realm
 	// password after verifying the old one.
 	ChangePassword(context.Context, *ChangePasswordRequest) (*emptypb.Empty, error)
@@ -4663,6 +4686,9 @@ func (UnimplementedLiteVirtServer) RevokeToken(context.Context, *RevokeTokenRequ
 }
 func (UnimplementedLiteVirtServer) Whoami(context.Context, *emptypb.Empty) (*WhoamiResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Whoami not implemented")
+}
+func (UnimplementedLiteVirtServer) CheckPermissions(context.Context, *CheckPermissionsRequest) (*CheckPermissionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CheckPermissions not implemented")
 }
 func (UnimplementedLiteVirtServer) ChangePassword(context.Context, *ChangePasswordRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method ChangePassword not implemented")
@@ -6943,6 +6969,24 @@ func _LiteVirt_Whoami_Handler(srv interface{}, ctx context.Context, dec func(int
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).Whoami(ctx, req.(*emptypb.Empty))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_CheckPermissions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CheckPermissionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).CheckPermissions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_CheckPermissions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).CheckPermissions(ctx, req.(*CheckPermissionsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -10083,6 +10127,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Whoami",
 			Handler:    _LiteVirt_Whoami_Handler,
+		},
+		{
+			MethodName: "CheckPermissions",
+			Handler:    _LiteVirt_CheckPermissions_Handler,
 		},
 		{
 			MethodName: "ChangePassword",

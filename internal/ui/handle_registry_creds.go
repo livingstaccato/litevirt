@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
@@ -18,7 +17,7 @@ import (
 func (s *Server) handleAccountRegistry(w http.ResponseWriter, r *http.Request) {
 	ctx := s.uiBearerCtx(r)
 	data := s.pageData("Account · Registry Credentials", "registry")
-	data["IsOperator"] = s.callerIsOperator(r)
+	data["CanManageGlobal"] = s.callerCanManageGlobalRegistry(r)
 	resp, err := s.grpc.ListRegistryCredentials(ctx, &pb.ListRegistryCredentialsRequest{})
 	if err != nil {
 		data["Error"] = err.Error()
@@ -40,7 +39,7 @@ func (s *Server) handleAccountRegistry(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRegistryCredModal(w http.ResponseWriter, r *http.Request) {
 	s.renderFragment(w, "registry_cred_modal.html", map[string]any{
-		"IsOperator": s.callerIsOperator(r),
+		"CanManageGlobal": s.callerCanManageGlobalRegistry(r),
 	})
 }
 
@@ -90,14 +89,18 @@ func (s *Server) handleDeleteRegistryCredential(w http.ResponseWriter, r *http.R
 	w.WriteHeader(http.StatusOK)
 }
 
-// callerIsOperator reports whether the session user is operator or admin, used
-// to reveal the global-credential controls. Fails closed (false) on error.
-func (s *Server) callerIsOperator(r *http.Request) bool {
-	who, err := s.grpc.Whoami(s.uiBearerCtx(r), &emptypb.Empty{})
-	if err != nil {
-		return false
-	}
-	return who.Role == "operator" || who.Role == "admin"
+// gateRegistryCredGlobal is grpcapi.GateRegistryCredGlobal: the gate on
+// global registry-credential CRUD.
+const gateRegistryCredGlobal = "registry.cred.global"
+
+// uiRegistryGates are the gates the registry-credentials page asks about.
+var uiRegistryGates = []string{gateRegistryCredGlobal}
+
+// callerCanManageGlobalRegistry reports whether the global-credential controls
+// should be shown: the RPCs' own registry.cred.global gate, asked of the RBAC
+// engine, not the caller's legacy role. Display only — the RPC decides.
+func (s *Server) callerCanManageGlobalRegistry(r *http.Request) bool {
+	return s.callerAllowed(r, uiRegistryGates...)[gateRegistryCredGlobal]
 }
 
 // grpcMsg unwraps a gRPC status to its bare message for a cleaner toast.

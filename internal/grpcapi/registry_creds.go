@@ -38,7 +38,7 @@ func toPbRegistryCredential(rc corrosion.RegistryCredential) *pb.RegistryCredent
 func (s *Server) SetRegistryCredential(ctx context.Context, req *pb.SetRegistryCredentialRequest) (*pb.RegistryCredential, error) {
 	scope, owner := corrosion.RegistryScopeUser, callerUsername(ctx)
 	if req.Global {
-		if err := s.RequirePerm(ctx, "/", "registry.cred.global", "operator"); err != nil {
+		if err := s.requireGate(ctx, GateRegistryCredGlobal); err != nil {
 			return nil, err
 		}
 		scope, owner = corrosion.RegistryScopeGlobal, ""
@@ -77,7 +77,7 @@ func (s *Server) ListRegistryCredentials(ctx context.Context, req *pb.ListRegist
 	)
 	switch {
 	case req.All:
-		if err := s.RequirePerm(ctx, "/", "registry.cred.global", "operator"); err != nil {
+		if err := s.requireGate(ctx, GateRegistryCredGlobal); err != nil {
 			return nil, err
 		}
 		rows, err = corrosion.ListAllRegistryCredentials(ctx, s.db)
@@ -102,7 +102,7 @@ func (s *Server) ListRegistryCredentials(ctx context.Context, req *pb.ListRegist
 func (s *Server) DeleteRegistryCredential(ctx context.Context, req *pb.DeleteRegistryCredentialRequest) (*emptypb.Empty, error) {
 	scope, owner := corrosion.RegistryScopeUser, callerUsername(ctx)
 	if req.Global {
-		if err := s.RequirePerm(ctx, "/", "registry.cred.global", "operator"); err != nil {
+		if err := s.requireGate(ctx, GateRegistryCredGlobal); err != nil {
 			return nil, err
 		}
 		scope, owner = corrosion.RegistryScopeGlobal, ""

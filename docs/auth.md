@@ -134,6 +134,15 @@ binding can:
   cluster-global, bound to NICs by name, and checked at `/`. Admin and
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
   a NIC (`lv sg bind`) is `network.update` on the VM's own path.
+- **Backup repository maintenance** (`backup.verify`, `backup.gc`,
+  `backup.prune`, `backup.sync`) is checked at `/`. These are the
+  `VerifyBackupRepo`, `GarbageCollectBackupRepo`, `PruneBackupRepo` and
+  `SyncBackupRepo` RPCs, which the web UI's `/backups` actions call. A repo holds
+  every project's backups, so a project-scoped grant cannot reach it. Operator
+  and BackupOperator hold all four through `backup.*`. Viewer holds none:
+  `backup.verify` is deliberately not a `*.read` verb, because a verify re-reads
+  every chunk in the repo. Without bindings the floor is `operator`. See
+  [backups.md](backups.md#repo-maintenance-rpcs).
 - **Networks** (`network.create`, `network.delete`) and **resource mappings**
   (`resourcemap.*`, PCI/device pools) are cluster-global, checked at `/`.
 - **Acknowledging a contested leader-lease term**

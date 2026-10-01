@@ -150,6 +150,10 @@ const (
 	LiteVirt_RestoreFromBackup_FullMethodName          = "/litevirt.v1.LiteVirt/RestoreFromBackup"
 	LiteVirt_HasChunks_FullMethodName                  = "/litevirt.v1.LiteVirt/HasChunks"
 	LiteVirt_PushBackup_FullMethodName                 = "/litevirt.v1.LiteVirt/PushBackup"
+	LiteVirt_VerifyBackupRepo_FullMethodName           = "/litevirt.v1.LiteVirt/VerifyBackupRepo"
+	LiteVirt_GarbageCollectBackupRepo_FullMethodName   = "/litevirt.v1.LiteVirt/GarbageCollectBackupRepo"
+	LiteVirt_PruneBackupRepo_FullMethodName            = "/litevirt.v1.LiteVirt/PruneBackupRepo"
+	LiteVirt_SyncBackupRepo_FullMethodName             = "/litevirt.v1.LiteVirt/SyncBackupRepo"
 	LiteVirt_CreateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/CreateContainer"
 	LiteVirt_StartContainer_FullMethodName             = "/litevirt.v1.LiteVirt/StartContainer"
 	LiteVirt_StopContainer_FullMethodName              = "/litevirt.v1.LiteVirt/StopContainer"
@@ -497,6 +501,15 @@ type LiteVirtClient interface {
 	// chunks (sub-chunk framed) then the manifest LAST.
 	HasChunks(ctx context.Context, in *HasChunksRequest, opts ...grpc.CallOption) (*HasChunksResponse, error)
 	PushBackup(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushBackupFrame, PushBackupResponse], error)
+	// ── Backup repository maintenance ──
+	// What `lv backup repo verify|gc|prune|sync` do to a local path, done by the
+	// daemon to a repo it holds, under RBAC and on the audit record. The web
+	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
+	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	VerifyBackupRepo(ctx context.Context, in *VerifyBackupRepoRequest, opts ...grpc.CallOption) (*VerifyBackupRepoResponse, error)
+	GarbageCollectBackupRepo(ctx context.Context, in *GarbageCollectBackupRepoRequest, opts ...grpc.CallOption) (*GarbageCollectBackupRepoResponse, error)
+	PruneBackupRepo(ctx context.Context, in *PruneBackupRepoRequest, opts ...grpc.CallOption) (*PruneBackupRepoResponse, error)
+	SyncBackupRepo(ctx context.Context, in *SyncBackupRepoRequest, opts ...grpc.CallOption) (*SyncBackupRepoResponse, error)
 	// ── Containers ──
 	CreateContainer(ctx context.Context, in *CreateContainerRequest, opts ...grpc.CallOption) (*Container, error)
 	StartContainer(ctx context.Context, in *StartContainerRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2280,6 +2293,46 @@ func (c *liteVirtClient) PushBackup(ctx context.Context, opts ...grpc.CallOption
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PushBackupClient = grpc.ClientStreamingClient[PushBackupFrame, PushBackupResponse]
 
+func (c *liteVirtClient) VerifyBackupRepo(ctx context.Context, in *VerifyBackupRepoRequest, opts ...grpc.CallOption) (*VerifyBackupRepoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VerifyBackupRepoResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_VerifyBackupRepo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) GarbageCollectBackupRepo(ctx context.Context, in *GarbageCollectBackupRepoRequest, opts ...grpc.CallOption) (*GarbageCollectBackupRepoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GarbageCollectBackupRepoResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_GarbageCollectBackupRepo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PruneBackupRepo(ctx context.Context, in *PruneBackupRepoRequest, opts ...grpc.CallOption) (*PruneBackupRepoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneBackupRepoResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PruneBackupRepo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SyncBackupRepo(ctx context.Context, in *SyncBackupRepoRequest, opts ...grpc.CallOption) (*SyncBackupRepoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SyncBackupRepoResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_SyncBackupRepo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CreateContainer(ctx context.Context, in *CreateContainerRequest, opts ...grpc.CallOption) (*Container, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Container)
@@ -3963,6 +4016,15 @@ type LiteVirtServer interface {
 	// chunks (sub-chunk framed) then the manifest LAST.
 	HasChunks(context.Context, *HasChunksRequest) (*HasChunksResponse, error)
 	PushBackup(grpc.ClientStreamingServer[PushBackupFrame, PushBackupResponse]) error
+	// ── Backup repository maintenance ──
+	// What `lv backup repo verify|gc|prune|sync` do to a local path, done by the
+	// daemon to a repo it holds, under RBAC and on the audit record. The web
+	// UI's /backups actions call these. Verbs: backup.verify, backup.gc,
+	// backup.prune, backup.sync, all at `/`, legacy floor operator.
+	VerifyBackupRepo(context.Context, *VerifyBackupRepoRequest) (*VerifyBackupRepoResponse, error)
+	GarbageCollectBackupRepo(context.Context, *GarbageCollectBackupRepoRequest) (*GarbageCollectBackupRepoResponse, error)
+	PruneBackupRepo(context.Context, *PruneBackupRepoRequest) (*PruneBackupRepoResponse, error)
+	SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error)
 	// ── Containers ──
 	CreateContainer(context.Context, *CreateContainerRequest) (*Container, error)
 	StartContainer(context.Context, *StartContainerRequest) (*emptypb.Empty, error)
@@ -4667,6 +4729,18 @@ func (UnimplementedLiteVirtServer) HasChunks(context.Context, *HasChunksRequest)
 }
 func (UnimplementedLiteVirtServer) PushBackup(grpc.ClientStreamingServer[PushBackupFrame, PushBackupResponse]) error {
 	return status.Error(codes.Unimplemented, "method PushBackup not implemented")
+}
+func (UnimplementedLiteVirtServer) VerifyBackupRepo(context.Context, *VerifyBackupRepoRequest) (*VerifyBackupRepoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method VerifyBackupRepo not implemented")
+}
+func (UnimplementedLiteVirtServer) GarbageCollectBackupRepo(context.Context, *GarbageCollectBackupRepoRequest) (*GarbageCollectBackupRepoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GarbageCollectBackupRepo not implemented")
+}
+func (UnimplementedLiteVirtServer) PruneBackupRepo(context.Context, *PruneBackupRepoRequest) (*PruneBackupRepoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneBackupRepo not implemented")
+}
+func (UnimplementedLiteVirtServer) SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SyncBackupRepo not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateContainer(context.Context, *CreateContainerRequest) (*Container, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateContainer not implemented")
@@ -7236,6 +7310,78 @@ func _LiteVirt_PushBackup_Handler(srv interface{}, stream grpc.ServerStream) err
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PushBackupServer = grpc.ClientStreamingServer[PushBackupFrame, PushBackupResponse]
+
+func _LiteVirt_VerifyBackupRepo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VerifyBackupRepoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).VerifyBackupRepo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_VerifyBackupRepo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).VerifyBackupRepo(ctx, req.(*VerifyBackupRepoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_GarbageCollectBackupRepo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GarbageCollectBackupRepoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).GarbageCollectBackupRepo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_GarbageCollectBackupRepo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).GarbageCollectBackupRepo(ctx, req.(*GarbageCollectBackupRepoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PruneBackupRepo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneBackupRepoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PruneBackupRepo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PruneBackupRepo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PruneBackupRepo(ctx, req.(*PruneBackupRepoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SyncBackupRepo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SyncBackupRepoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SyncBackupRepo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SyncBackupRepo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SyncBackupRepo(ctx, req.(*SyncBackupRepoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _LiteVirt_CreateContainer_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateContainerRequest)
@@ -10009,6 +10155,22 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "HasChunks",
 			Handler:    _LiteVirt_HasChunks_Handler,
+		},
+		{
+			MethodName: "VerifyBackupRepo",
+			Handler:    _LiteVirt_VerifyBackupRepo_Handler,
+		},
+		{
+			MethodName: "GarbageCollectBackupRepo",
+			Handler:    _LiteVirt_GarbageCollectBackupRepo_Handler,
+		},
+		{
+			MethodName: "PruneBackupRepo",
+			Handler:    _LiteVirt_PruneBackupRepo_Handler,
+		},
+		{
+			MethodName: "SyncBackupRepo",
+			Handler:    _LiteVirt_SyncBackupRepo_Handler,
 		},
 		{
 			MethodName: "CreateContainer",

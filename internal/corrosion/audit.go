@@ -394,9 +394,21 @@ type AuditVerifyResult struct {
 	// BrokenAt is the first row whose content hash does not match a
 	// recomputation. Empty when every chain links correctly.
 	BrokenAt string
-	// Unsigned counts rows carrying no signature: written before v45, or while
-	// enforcement.audit_signature was off. They are chain-checked only.
+	// Unsigned counts rows carrying no signature: written by a host that was not
+	// signing at the time — before it adopted a key, after it retired one, or on
+	// a build older than signing. They are chain-checked only. It includes the
+	// rows listed in UnsignedAfterSigned, which are the ones that ARE evidence.
 	Unsigned int
+	// NotSigning lists, as "host: N unsigned rows", every host whose most recent
+	// row is unsigned and which holds no signing contract — the hosts that are
+	// not signing NOW. It is what turns a bare Unsigned count into an answer: a
+	// cluster where every host is listed has signing switched off, while one
+	// where none is has only history from before it was switched on.
+	//
+	// Not a finding. A host under a contract never appears (its unsigned rows
+	// are UnsignedAfterSigned), and neither does one already reported as
+	// NeverAdopted.
+	NotSigning []string
 	// UnsignedAfterSigned lists unsigned rows written by a host that is under a
 	// signing contract — it has a published certificate and no signed
 	// retirement. Those are not old, they are anomalous: the contract says the
@@ -572,9 +584,16 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				"is tamper-evident (a key that cannot be read cannot sign the adoption either)",
 			u.host, u.keyID, u.publishedAt))
 	}
-	prevByHost := map[string]string{} // per-host running tail
-	seqByHost := map[string]int64{}   // per-host last seq seen
-	hashedByHost := map[string]bool{} // has this host produced a hashed row yet?
+	unadoptedHost := map[string]bool{}
+	for _, u := range unadopted {
+		unadoptedHost[u.host] = true
+	}
+	var hostOrder []string             // hosts in walk order, for NotSigning
+	unsignedByHost := map[string]int{} // per-host unsigned row count
+	lastUnsigned := map[string]bool{}  // is the host's latest row unsigned?
+	prevByHost := map[string]string{}  // per-host running tail
+	seqByHost := map[string]int64{}    // per-host last seq seen
+	hashedByHost := map[string]bool{}  // has this host produced a hashed row yet?
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
@@ -645,8 +664,14 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			seqByHost[host] = seq
 		}
 
+		if _, seen := unsignedByHost[host]; !seen {
+			hostOrder = append(hostOrder, host)
+			unsignedByHost[host] = 0
+		}
+		lastUnsigned[host] = sig == ""
 		if sig == "" {
 			res.Unsigned++
+			unsignedByHost[host]++
 			// A host under a signing contract has no legitimate way to produce an
 			// unsigned row: it published a certificate saying its rows are signed
 			// from that point, and nothing but a signed retirement takes that
@@ -702,6 +727,13 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				res.BadSignature = append(res.BadSignature, rec.ID+": "+err.Error())
 			}
 		}
+	}
+
+	for _, host := range hostOrder {
+		if _, underContract := contracted[host]; underContract || unadoptedHost[host] || !lastUnsigned[host] {
+			continue
+		}
+		res.NotSigning = append(res.NotSigning, fmt.Sprintf("%s: %d unsigned rows", host, unsignedByHost[host]))
 	}
 
 	if err := verifyChainHeads(ctx, c, keyring, seqByHost, retired, &res); err != nil {

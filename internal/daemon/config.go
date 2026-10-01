@@ -76,7 +76,8 @@ type Config struct {
 	// capability tokens. Each is the enforcement AND kill switch: enforcement is
 	// this flag AND the token's cluster-wide capability latch, so false disables
 	// the behavior regardless of any durable latch marker (flag=false + restart is
-	// the only stand-down — never delete marker files). All default false; the
+	// the only stand-down — never delete marker files). All default false except
+	// audit_signature (see EnforcementConfig.AuditSignature for why); the
 	// build still ADVERTISES the tokens (capabilities.supported) so the cluster can
 	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
@@ -394,7 +395,8 @@ type AuthConfig struct {
 // EnforcementConfig holds the per-node kill-switches for the split-brain-family
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
-// behavior regardless of the durable latch. All default false.
+// behavior regardless of the durable latch. All default false except
+// AuditSignature, which LoadConfig defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -493,12 +495,24 @@ type EnforcementConfig struct {
 	// AuditSignature: sign every audit row this node writes with the host's cluster
 	// key (capabilities.AuditSignatureV1). Signing follows this flag ALONE — a signed
 	// row is backward-compatible, so there is nothing to wait for. The cluster-wide
-	// latch gates only the refusal: with the flag set AND the token latched, an audit
-	// write this node cannot sign FAILS instead of landing unsigned, which is what
-	// stops an attacker with database write access from appending unsigned history and
-	// still passing `lv audit verify`. Enable fleet-uniformly (a node with the flag off
-	// keeps emitting unsigned rows, so the token is advertised only while it is on).
-	// Default false; reversible kill switch.
+	// latch only raises an audit write this node cannot sign to an error-level log;
+	// the row is still written, and the verifier reports it as evidence.
+	//
+	// DEFAULT TRUE, the one enforcement flag that is on unless switched off
+	// (LoadConfig sets it before parsing; an explicit `audit_signature: false`
+	// wins). It used to default false like the rest, and every cluster that had
+	// not found the flag wrote its whole audit log unsigned — the kvm003-f3 lab
+	// verified 212 rows, none signed, on a build that could sign all of them. The
+	// usual reason for an opt-in does not apply here. No node relies on a PEER
+	// signing: each host's obligation is its own published, adopted certificate,
+	// so a host still on an older build, or one with the flag off, is simply a
+	// host that is not signing yet and nothing it writes is reported. Rolling a
+	// signing host back is a signed retirement on its next start (flag false, or
+	// any build that predates this default), not a silent stop.
+	//
+	// The token is still advertised only while the flag is on, so a latched
+	// audit_signature_v1 keeps meaning every node is configured to sign.
+	// Reversible kill switch.
 	AuditSignature bool `yaml:"audit_signature,omitempty"`
 	// OwnerEpoch: activate the Phase 4 ownership-generation regime on this host
 	// (capabilities.OwnerEpochV1). With the flag on, the health sweeps backfill
@@ -645,6 +659,10 @@ func LoadConfig() (*Config, error) {
 		QuorumLossDemoteAfterSec: 12,
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
+
+		// The one enforcement flag that defaults ON — see EnforcementConfig.
+		// AuditSignature. An explicit `audit_signature: false` still wins.
+		Enforcement: EnforcementConfig{AuditSignature: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

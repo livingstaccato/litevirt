@@ -336,33 +336,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
-	// Audit signing identity. The signing key IS the host's cluster key: it is
-	// already CA-signed with this host's name as its CN, already present on
-	// every node, and already the credential that says "I am this host".
-	// Minting a separate one would need the CA private key, which lives only on
-	// whichever node ran `lv host init`, so a fresh node could not sign its own
-	// log at all.
-	// Wire the keyring NOW — rows get written during startup and must be signed —
-	// but do NOT record any lifecycle fact yet. Adoption boundaries and retirement
-	// boundaries are sequence numbers, and this runs long before the replicator
-	// starts, so a node restored from a snapshot would read a local tail far
-	// behind its real replicated history and pin a boundary there permanently.
-	// See finishAuditKeyLifecycle, called once replication is up.
-	if d.cfg.Enforcement.AuditSignature {
-		if err := d.setupAuditSigning(ctx); err != nil {
-			// Non-fatal: refusing to start would turn a PKI problem into an
-			// outage. The node keeps running with unsigned rows, which
-			// `lv audit verify` reports as unsigned — visible, not silent.
-			slog.Error("audit signing could not be enabled; rows will be written unsigned",
-				"error", err)
-		}
-	} else {
-		// A non-signing node still needs the cluster CA: a keyring is what
-		// verifies a lifecycle record, so a node without one ignores every
-		// adoption and retirement in the cluster and reports peers' rolled-back
-		// hosts as tampering while every signing node calls the same log clean.
-		d.installAuditVerifier()
-	}
+	// Before anything that writes an audit row is built: every writer signs with
+	// the keyring this installs on d.db.
+	d.wireAuditKeyring(ctx)
 
 	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
 	// still entirely unsigned.
@@ -398,7 +374,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// peer-mTLS identity — any local user on such a node could impersonate it to
 	// the cluster. The push path is fixed, but nobody re-provisions an existing
 	// cluster, so a repair at start is the only thing that reaches one. It used
-	// to hang off enforcement.audit_signature, which defaults to false, so an
+	// to hang off enforcement.audit_signature, which then defaulted to false, so an
 	// operator who upgraded specifically for this fix got neither the repair nor
 	// a warning.
 	if err := pki.TightenPrivateKeys(d.cfg.PKIDir); err != nil {

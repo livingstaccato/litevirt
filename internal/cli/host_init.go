@@ -961,7 +961,8 @@ func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) 
 		// advertised only while a host's enforcement.* flag is on, so a host
 		// added with a config missing the block silently weakens the cluster.
 		// A re-admitted signer with no enforcement.audit_signature wrote
-		// unsigned audit rows reported as tampering cluster-wide (2026-08-01).
+		// unsigned audit rows reported as tampering cluster-wide (2026-08-01),
+		// back when the flag defaulted off; it still carries an explicit false.
 		// Base64: the remote path joins this env into one shell command line,
 		// so a multi-line YAML block must travel as a single token.
 		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcement)),

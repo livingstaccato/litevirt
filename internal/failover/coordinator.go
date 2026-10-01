@@ -1196,13 +1196,8 @@ func (c *Coordinator) noteLeaseTermRefusal(ctx context.Context, kind, name, from
 	slog.Error("failover: refusing to stamp an action proof — this coordinator's lease term is "+
 		"unusable, so the workload is ABANDONED (a fenced host is processed only once)",
 		kind, name, "from", from, "term", c.LeaseTerm(), "coordinator", c.hostName)
-	_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-		ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName,
-		Action: "failover.skip", Target: name,
-		Detail: "refused to stamp an action proof: this coordinator's lease term is unusable " +
-			"(never acquired, cleared on a loss path, or superseded by a newer holder)",
-		Result: "refused",
-	})
+	c.audit(ctx, "failover.skip", name, "refused to stamp an action proof: this coordinator's lease term is unusable "+
+		"(never acquired, cleared on a loss path, or superseded by a newer holder)", "refused")
 }
 
 func (c *Coordinator) leaseStamp(ctx context.Context) (holder, expiresAt string, term int64, key string, ok bool) {
@@ -1998,10 +1993,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		if vmUsesFirmwareState(vm) {
 			slog.Warn("failover: skipping Secure Boot / vTPM VM — firmware state was host-local and died with the host; restore from backup",
 				"vm", vm.Name, "host", h.Name)
-			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-				ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
-				Target: vm.Name, Detail: "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with " + h.Name + ")", Result: "skipped",
-			})
+			c.audit(ctx, "failover.skip", vm.Name, "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with "+h.Name+")", "skipped")
 			c.mVM(ActionReschedule, ResultSkipped, ErrFirmwareState)
 			continue
 		}
@@ -2024,10 +2016,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				"vm", vm.Name, "condition", code)
 			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
 			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
-			_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-				ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
-				Target: vm.Name, Detail: "active ownership condition " + code + " — automated recovery refused", Result: "refused",
-			})
+			c.audit(ctx, "failover.skip", vm.Name, "active ownership condition "+code+" — automated recovery refused", "refused")
 			continue
 		}
 
@@ -2111,10 +2100,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				slog.Info("failover: VM recovered via replica promotion", "vm", vm.Name)
 				c.fenceRelocated[h.Name] = true
 				c.mVM(ActionPromote, ResultSuccess, errClassNone)
-				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-					ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.promote",
-					Target: vm.Name, Detail: "promoted replica after fencing " + h.Name, Result: "ok",
-				})
+				c.audit(ctx, "failover.promote", vm.Name, "promoted replica after fencing "+h.Name, "ok")
 				continue
 			}
 		}
@@ -2184,10 +2170,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			for i := range plans {
 				if plans[i].needsPlacement {
 					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
-					_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-						ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
-						Target: plans[i].vm.Name, Detail: "batch placement failed after fencing " + h.Name + ": " + err.Error(), Result: "error",
-					})
+					c.audit(ctx, "failover.skip", plans[i].vm.Name, "batch placement failed after fencing "+h.Name+": "+err.Error(), "error")
 				}
 			}
 			plans = plans[:0]
@@ -2212,10 +2195,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
 					"vm", vm.Name, "from", h.Name, "reason", result.Err)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
-				_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-					ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName, Action: "failover.skip",
-					Target: vm.Name, Detail: detail, Result: "skipped",
-				})
+				c.audit(ctx, "failover.skip", vm.Name, detail, "skipped")
 				continue
 			}
 			p.targetName = result.Host
@@ -2324,15 +2304,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.fenceRelocated[h.Name] = true
 		c.mVM(ActionReschedule, ResultSuccess, errClassNone)
 
-		_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
-			ID:       randid.New(),
-			Username: "failover-coordinator",
-			HostName: c.hostName,
-			Action:   "failover",
-			Target:   vm.Name,
-			Detail:   "rescheduled from " + h.Name + " to " + targetName,
-			Result:   "ok",
-		})
+		c.audit(ctx, "failover", vm.Name, "rescheduled from "+h.Name+" to "+targetName, "ok")
 	}
 
 	// Step 6: Relocate containers on the fenced host (B5). Unlike VMs, a
@@ -2566,14 +2538,14 @@ func (c *Coordinator) completeRestore(ctx context.Context, h *corrosion.HostReco
 		slog.Warn("failover: source row tombstone failed after restore — will retry next sweep",
 			"container", ct.Name, "from", h.Name, "to", target, "error", err)
 		c.mCt(ActionRelocate, ResultPartial, ErrDBError)
-		c.auditRelocate(ctx, "ct.relocate.restored", ct.Name,
+		c.audit(ctx, "ct.relocate.restored", ct.Name,
 			"restored to "+target+" but the source row on "+h.Name+" is still live (tombstone failed; retrying)", "error")
 		return
 	}
 	c.fenceRelocated[h.Name] = true
 	c.mCt(ActionRelocate, ResultSuccess, errClassNone)
 	slog.Info("failover: container relocated via restore-from-backup", "container", ct.Name, "from", h.Name, "to", target)
-	c.auditRelocate(ctx, "ct.relocate.restored", ct.Name, "restored from backup to "+target+" after fencing "+h.Name, "ok")
+	c.audit(ctx, "ct.relocate.restored", ct.Name, "restored from backup to "+target+" after fencing "+h.Name, "ok")
 }
 
 // imageRecreateOrSkip is the tier-1 path: recreate from a re-pullable image, else
@@ -2595,7 +2567,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 		}
 		slog.Warn("failover: container not relocatable (no re-pullable image, no usable backup) — skipping",
 			"container", ct.Name, "image", ct.Image, "host", h.Name)
-		c.auditRelocate(ctx, "ct.relocate.skipped", ct.Name,
+		c.audit(ctx, "ct.relocate.skipped", ct.Name,
 			"no re-pullable image and no usable backup after fencing "+h.Name+" (left for operator recovery)", "skipped")
 		c.mCt(ActionRelocate, ResultSkipped, ErrNonRepullable)
 		return
@@ -2611,7 +2583,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 		}
 		slog.Warn("failover: no collision-free target for container relocation — skipping",
 			"container", ct.Name, "target", target, "host", h.Name)
-		c.auditRelocate(ctx, "ct.relocate.skipped", ct.Name,
+		c.audit(ctx, "ct.relocate.skipped", ct.Name,
 			"no collision-free relocation target after fencing "+h.Name+" (left for operator recovery)", "skipped")
 		c.mCt(ActionRelocate, ResultSkipped, ErrNoCandidates)
 		return
@@ -2677,7 +2649,7 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 	c.fenceRelocated[h.Name] = true
 	c.mCt(ActionRelocate, ResultSuccess, errClassNone)
 	slog.Info("failover: relocating container (image-recreate)", "container", ct.Name, "from", h.Name, "to", target)
-	c.auditRelocate(ctx, "ct.relocate.recreate", ct.Name,
+	c.audit(ctx, "ct.relocate.recreate", ct.Name,
 		"relocated from "+h.Name+" to "+target+" (recreate from image)", "ok")
 }
 
@@ -2751,7 +2723,14 @@ func (c *Coordinator) markerFresh(ct corrosion.ContainerRecord) bool {
 	return c.now().Sub(t) < to
 }
 
-func (c *Coordinator) auditRelocate(ctx context.Context, action, target, detail, result string) {
+// audit records one coordinator action on this host's audit chain.
+//
+// It is the coordinator's only audit write, and it writes through c.db, which is
+// the daemon's client: that client carries the host's signing keyring, so every
+// row lands signed when signing is on. Keep it the only one —
+// TestAuditWriters_EveryCallSiteIsCovered fails on a new InsertAuditLog call
+// site until it is listed there with a test proving its rows are signed.
+func (c *Coordinator) audit(ctx context.Context, action, target, detail, result string) {
 	_ = corrosion.InsertAuditLog(ctx, c.db, corrosion.AuditRecord{
 		ID: randid.New(), Username: "failover-coordinator", HostName: c.hostName,
 		Action: action, Target: target, Detail: detail, Result: result,

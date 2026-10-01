@@ -4,11 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
+	"path/filepath"
 	"sync/atomic"
 
 	_ "modernc.org/sqlite"
 
 	"github.com/litevirt/litevirt/internal/hlc"
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 var testDBCounter atomic.Int64
@@ -37,6 +40,72 @@ func NewTestClientT(t TestingT) *Client {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	return c
+}
+
+// TempDirT is TestingT plus a temp dir, for helpers that write files.
+type TempDirT interface {
+	TestingT
+	TempDir() string
+}
+
+// SignAuditRowsForTest puts c in the state a daemon with audit signing on leaves
+// its client in: a fresh cluster CA and a host certificate for hostName, the
+// host's keyring wired onto c (so InsertAuditLog signs), and the key adopted
+// (so the host is under a signing contract). Returns the PKI dir.
+//
+// For a test that has to prove some audit writer's rows come out SIGNED. The
+// signing itself happens in InsertAuditLog, so what such a test really pins is
+// that the writer goes through InsertAuditLog on the client it was given —
+// see TestAuditWriters_EveryCallSiteIsCovered.
+func SignAuditRowsForTest(t TempDirT, c *Client, hostName string) string {
+	t.Helper()
+	dir := t.TempDir()
+	caCert, caKey := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")
+	if err := pki.GenerateCA(caCert, caKey); err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	if err := pki.GenerateHostCert(caCert, caKey,
+		filepath.Join(dir, "host.crt"), filepath.Join(dir, "host.key"),
+		hostName, net.IPv4(127, 0, 0, 1)); err != nil {
+		t.Fatalf("GenerateHostCert: %v", err)
+	}
+	kr, err := LoadAuditKeyring(dir, hostName)
+	if err != nil {
+		t.Fatalf("LoadAuditKeyring: %v", err)
+	}
+	c.SetAuditKeyring(kr)
+	if _, err := AdoptAuditKey(context.Background(), c, kr, hostName); err != nil {
+		t.Fatalf("AdoptAuditKey: %v", err)
+	}
+	return dir
+}
+
+// AssertAuditRowsSignedForTest fails t unless c's audit log holds at least
+// minRows rows, every one signed, and verify counts them all as signed with no
+// finding and no host listed as not signing.
+func AssertAuditRowsSignedForTest(t TestingT, c *Client, minRows int) {
+	t.Helper()
+	ctx := context.Background()
+	rows, err := c.Query(ctx, `SELECT id, action, signature FROM audit_log`)
+	if err != nil {
+		t.Fatalf("query audit_log: %v", err)
+	}
+	if len(rows) < minRows {
+		t.Fatalf("audit_log holds %d rows, want at least %d", len(rows), minRows)
+	}
+	for _, r := range rows {
+		if r.String("signature") == "" {
+			t.Fatalf("audit row %s (%s) is unsigned on a client that signs", r.String("id"), r.String("action"))
+		}
+	}
+	res, err := VerifyAuditChain(ctx, c)
+	if err != nil {
+		t.Fatalf("VerifyAuditChain: %v", err)
+	}
+	if res.RowsChecked != len(rows) || res.Unsigned != 0 || res.Unverifiable != 0 ||
+		res.Tampered() || res.Unverified() || len(res.NotSigning) != 0 {
+		t.Fatalf("verify does not count every row as signed: %+v", res)
+	}
 }
 
 // NewTestClient creates an in-memory SQLite client with no gossip.

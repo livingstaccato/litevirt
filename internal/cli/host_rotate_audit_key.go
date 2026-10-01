@@ -153,19 +153,23 @@ func reportRemoteSigningState(sc *ssh.Client, hostName string) {
 	//
 	// grep exits 0 when it matches, 1 when it does not, and 2 on an error it
 	// could not read past. Only the first two are answers.
+	//
+	// It looks for an explicit FALSE. Signing is on by default, so a config that
+	// does not mention the flag signs; matching `true` reported every such host
+	// as not signing.
 	out, err := sc.RunOutput(
-		`grep -qE '^[[:space:]]+audit_signature:[[:space:]]*true' /etc/litevirt/config.yaml; echo $?`)
+		`grep -qE '^[[:space:]]+audit_signature:[[:space:]]*false' /etc/litevirt/config.yaml; echo $?`)
 	switch code := strings.TrimSpace(string(out)); {
 	case err != nil:
 		fmt.Printf("  could not read enforcement.audit_signature on %s (%v); check by hand "+
 			"whether rows written there are being signed\n", hostName, err)
-	case code == "0":
-		fmt.Println("  enforcement.audit_signature is on, so rows written from here are signed with")
-		fmt.Println("  the new key")
 	case code == "1":
-		fmt.Println("  NOTE: enforcement.audit_signature is OFF on this host, so new rows are still")
-		fmt.Println("  written UNSIGNED. The rotation sealed what the old key wrote, but the new key")
-		fmt.Println("  is not protecting anything yet — enable the flag fleet-wide to change that")
+		fmt.Println("  enforcement.audit_signature is on (the default), so rows written from here")
+		fmt.Println("  are signed with the new key")
+	case code == "0":
+		fmt.Println("  NOTE: enforcement.audit_signature is set to false on this host, so new rows")
+		fmt.Println("  are still written UNSIGNED. The rotation sealed what the old key wrote, but")
+		fmt.Println("  the new key is not protecting anything yet — remove the setting to change that")
 	default:
 		fmt.Printf("  could not read enforcement.audit_signature on %s (grep exit %q); check by "+
 			"hand whether rows written there are being signed\n", hostName, code)

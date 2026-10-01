@@ -79,7 +79,7 @@ const auditRetireDomain = "litevirt-audit-retire-v1"
 //
 // A nil *AuditKeyring is usable and means "unsigned": Sign returns empty and
 // the verifier reports rows as unsigned rather than broken. That is the state
-// of every cluster before enforcement.audit_signature is turned on.
+// of a client the daemon has not wired a keyring onto.
 type AuditKeyring struct {
 	hostName string
 	keyID    string
@@ -187,7 +187,7 @@ func fileExists(path string) bool {
 //
 // The primitive lives in internal/pki and runs unconditionally at daemon start
 // (pki.TightenPrivateKeys) — reaching it only from here meant reaching it only
-// when enforcement.audit_signature was on, a flag that defaults to false, so the
+// when enforcement.audit_signature was on, a flag that then defaulted to false, so the
 // world-readable host.key that `lv host init` shipped went unrepaired on exactly
 // the clusters that had not opted in. This call stays because loading a key is
 // the last moment before it is used.

@@ -3456,6 +3456,13 @@ message VerifyAuditChainResponse {
     // verdict field that means "not a pass" has to travel with the verdict field
     // that means "not tampering".
     bool unverified = 17;
+    // Hosts that are not signing NOW, as "host: N unsigned rows": the host's
+    // most recent row is unsigned and it holds no signing contract. Not a
+    // finding. It is what tells an operator whether unsigned_rows is history
+    // from before signing was switched on (no host listed) or a host that is
+    // still not signing (enforcement.audit_signature off, or an older build).
+    // An older daemon never sets it, so an empty list says nothing on its own.
+    repeated string not_signing_hosts = 18;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.

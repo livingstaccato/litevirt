@@ -138,9 +138,14 @@ func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	case resp.UnsignedRows > 0:
 		// Deliberately "success", not a warning: unsigned rows are what every
 		// cluster looks like before signing was switched on, and colouring that
-		// red teaches operators that a red audit toast means nothing.
-		sendToast(w, fmt.Sprintf("Audit chain intact: %d rows verified (%d predate tamper-evidence, chain-checked only)",
-			resp.RowsChecked, resp.UnsignedRows), "success")
+		// red teaches operators that a red audit toast means nothing. It must
+		// still not call them old: hosts that are not signing NOW are named.
+		msg := fmt.Sprintf("Audit chain intact: %d rows verified (%d unsigned, chain-checked only)",
+			resp.RowsChecked, resp.UnsignedRows)
+		if n := len(resp.NotSigningHosts); n > 0 {
+			msg += fmt.Sprintf("; %d host(s) not signing now — run `lv audit verify` to see which", n)
+		}
+		sendToast(w, msg, "success")
 	default:
 		sendToast(w, fmt.Sprintf("Audit chain intact: %d rows verified, all signed", resp.RowsChecked), "success")
 	}

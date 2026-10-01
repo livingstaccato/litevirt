@@ -20,7 +20,7 @@ import (
 // Fixing the push path only helps nodes provisioned afterwards, and nobody
 // re-provisions a running cluster. The repair was reachable only through
 // LoadAuditKeyring, which the daemon calls solely when
-// enforcement.audit_signature is on — a flag that defaults to false. So an
+// enforcement.audit_signature is on — a flag that then defaulted to false. So an
 // operator who upgraded specifically to pick up this fix, and left the default,
 // got no repair and no warning: the key stayed 0644 on every node.
 

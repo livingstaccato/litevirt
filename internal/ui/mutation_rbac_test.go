@@ -108,23 +108,3 @@ func TestUIMutation_SelfServiceSurvivesAViewerRole(t *testing.T) {
 			"authority beyond the session that already authenticated")
 	}
 }
-
-// TestUIMutation_SecurityGroupWriteFailsClosedWithoutAnAuthorizer pins the
-// direction of the SG fallback.
-//
-// Security groups have no gRPC twin, so the handler calls the daemon's
-// authorizer directly. If that is not wired, the write must be REFUSED — an
-// unauthorized cluster-wide firewall change is worse than an unavailable page,
-// and a nil authorizer means the one component that can answer is absent.
-func TestUIMutation_SecurityGroupWriteFailsClosedWithoutAnAuthorizer(t *testing.T) {
-	mock := newDefaultMock() // admin
-	s := newTestUIServer(t, mock)
-	s.SetAuthorizer(nil) // simulate a build/wiring where it is absent
-	s.SetCorrosionDB(newCorrosionForUITest(t))
-
-	w := serveRequest(s, authReq(t, "POST", "/ui/security-groups", url.Values{"name": {"web"}}))
-
-	if w.Code == http.StatusOK {
-		t.Fatal("a security-group write landed with no authorizer wired; it must fail closed")
-	}
-}

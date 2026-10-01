@@ -25,6 +25,14 @@ const fwAuditSessionToken = "fedcba9876543210fedcba9876543210fedcba9876543210fed
 // name is decided by the interceptor from the session's bearer token.
 func newUIOverRealDaemon(t *testing.T, user, role string) (*Server, *corrosion.Client) {
 	t.Helper()
+	s, db, _ := newUIOverRealDaemonSvc(t, user, role)
+	return s, db
+}
+
+// newUIOverRealDaemonSvc is newUIOverRealDaemon that also returns the daemon,
+// for a test that has to wire an RBAC engine into it.
+func newUIOverRealDaemonSvc(t *testing.T, user, role string) (*Server, *corrosion.Client, *grpcapi.Server) {
+	t.Helper()
 	ctx := context.Background()
 	db := newCorrosionForUITest(t)
 	hash, err := bcrypt.GenerateFromPassword([]byte(fwAuditSessionToken), bcrypt.MinCost)
@@ -63,7 +71,7 @@ func newUIOverRealDaemon(t *testing.T, user, role string) (*Server, *corrosion.C
 		t.Fatalf("NewServer: %v", err)
 	}
 	s.SetCorrosionDB(db)
-	return s, db
+	return s, db, service
 }
 
 func uiSessionReq(t *testing.T, method, path string, form url.Values) *http.Request {
@@ -139,46 +147,45 @@ func TestUIFirewallMutation_AuditsTheSessionUserBeforeAndAfter(t *testing.T) {
 	wantUIAudit(t, db, "firewall.cluster-rule.rm", "carol", rules[0].ID, "before="+rule+" after=none")
 }
 
-// Security groups have no gRPC twin, so the UI audits them itself. Removing a
-// group or a rule has to record what was removed: both are tombstoned, and the
-// audit row is then the only record of what traffic they governed.
+// The security-group pages go through the same RPCs as `lv sg`, which audit.
+// Removing a group or a rule has to record what was removed: both are
+// tombstoned, and the audit row is then the only record of what traffic they
+// governed.
 func TestUISecurityGroupMutation_AuditsBeforeAndAfter(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
-	db := newCorrosionForUITest(t)
-	s.SetCorrosionDB(db)
+	s, db := newUIOverRealDaemon(t, "carol", "admin")
 	ctx := context.Background()
 
-	w := serveRequest(s, authReq(t, "POST", "/ui/security-groups", url.Values{"name": {"isolate"}}))
+	w := serveRequest(s, uiSessionReq(t, "POST", "/ui/security-groups", url.Values{"name": {"isolate"}}))
 	assertStatus(t, w, http.StatusOK)
-	wantUIAudit(t, db, "sg.add", "admin", "isolate", "before=none after={name=isolate rules=[]}")
+	wantUIAudit(t, db, "sg.add", "carol", "isolate", "before=none after={name=isolate rules=[]}")
 	sgs, err := corrosion.ListSecurityGroups(ctx, db, "")
 	if err != nil || len(sgs) != 1 {
 		t.Fatalf("security groups = %v (err %v)", sgs, err)
 	}
 	sgID := sgs[0].ID
 
-	w = serveRequest(s, authReq(t, "POST", "/ui/security-groups/"+sgID+"/rules", url.Values{
+	w = serveRequest(s, uiSessionReq(t, "POST", "/ui/security-groups/"+sgID+"/rules", url.Values{
 		"direction": {"ingress"}, "port_range": {"22"}, "cidr": {"10.0.0.0/8"},
 	}))
 	assertStatus(t, w, http.StatusOK)
 	rule := "{sg=" + sgID + " ingress all port=22 cidr=10.0.0.0/8 accept priority=100}"
-	wantUIAudit(t, db, "sg.rule.add", "admin", sgID, "before=none after="+rule)
+	wantUIAudit(t, db, "sg.rule.add", "carol", sgID, "before=none after="+rule)
 
 	rules, err := corrosion.ListSGRules(ctx, db, sgID)
 	if err != nil || len(rules) != 1 {
 		t.Fatalf("rules = %v (err %v)", rules, err)
 	}
-	w = serveRequest(s, authReq(t, "DELETE", "/ui/security-groups/rules/"+rules[0].ID, nil))
+	w = serveRequest(s, uiSessionReq(t, "DELETE", "/ui/security-groups/rules/"+rules[0].ID, nil))
 	assertStatus(t, w, http.StatusOK)
-	wantUIAudit(t, db, "sg.rule.rm", "admin", rules[0].ID, "before="+rule+" after=none")
+	wantUIAudit(t, db, "sg.rule.rm", "carol", rules[0].ID, "before="+rule+" after=none")
 
 	// A second rule, so the group's removal has something of its own to record.
-	w = serveRequest(s, authReq(t, "POST", "/ui/security-groups/"+sgID+"/rules", url.Values{
+	w = serveRequest(s, uiSessionReq(t, "POST", "/ui/security-groups/"+sgID+"/rules", url.Values{
 		"direction": {"egress"}, "proto": {"udp"}, "port_range": {"53"}, "action": {"drop"}, "priority": {"5"},
 	}))
 	assertStatus(t, w, http.StatusOK)
-	w = serveRequest(s, authReq(t, "DELETE", "/ui/security-groups/"+sgID, nil))
+	w = serveRequest(s, uiSessionReq(t, "DELETE", "/ui/security-groups/"+sgID, nil))
 	assertStatus(t, w, http.StatusOK)
-	wantUIAudit(t, db, "sg.rm", "admin", sgID,
+	wantUIAudit(t, db, "sg.rm", "carol", sgID,
 		"before={name=isolate rules=[{sg="+sgID+" egress udp port=53 cidr=any drop priority=5}]} after=none")
 }

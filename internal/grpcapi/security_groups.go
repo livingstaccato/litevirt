@@ -18,10 +18,11 @@ import (
 // in the CLI process and write it there. That skipped the daemon's
 // authorization entirely, and it left no audit row, because only the daemon
 // holds the host's audit sub-chain tail and signing key. These RPCs are what
-// the CLI calls now. Each checks sg.write at the cluster root (security groups
-// are cluster-global, bound to NICs by name) and records the same row the web
-// UI's security-group pages record: who, what, and the group or rule before
-// and after.
+// the CLI calls now, and the web UI's security-group pages call them too, with
+// the session's bearer, so the two surfaces cannot authorize the same change
+// differently. Each checks sg.write at the cluster root (security groups are
+// cluster-global, bound to NICs by name) and records who, what, and the group
+// or rule before and after.
 //
 // sg.write is held by Admin (`*`) and NetworkAdmin (`sg.*`); Operator holds
 // sg.read only. A cluster with no role bindings falls back to the legacy

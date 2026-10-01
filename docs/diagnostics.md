@@ -196,7 +196,12 @@ table.
      v2 digest now matches; they clear on the next daemon restart. The one
      exception is `leader_lease_terms`, whose rows are immutable: a restart
      empties the register but the next anti-entropy pass re-registers the same
-     tie, so that one needs `lv cluster acknowledge-lease-term` — see
+     tie, so that one needs `lv cluster acknowledge-lease-term` on each host.
+     The acknowledgement is durable: after a restart the tie is re-registered
+     as acknowledged. Once every host has acknowledged it and nothing else in
+     the table differs, `lv cluster converge` lists the table as
+     `ACKNOWLEDGED` and counts it as converged. A new, unacknowledged claim
+     for the term makes it a `SAFETY-FAULT` again — see
      [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
 Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to

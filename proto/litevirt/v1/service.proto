@@ -2215,6 +2215,17 @@ message TableDigest {
     // has digest_v2 enabled; compared only when BOTH peers supply it (pairwise negotiation),
     // else the peers fall back to the positional `hash`.
     string hash_v2 = 5;
+    // acknowledged_ties is the subset of unresolved_ties an operator has acknowledged on
+    // this host (`lv cluster acknowledge-lease-term`). Those rows still differ by design;
+    // they no longer drive ha.lww.unresolved. Zero from an older build.
+    int32  acknowledged_ties = 6;
+    // acknowledged_residual is this host's digest of the table with every
+    // acknowledged-tie row replaced by a marker naming only its primary key. Emitted
+    // only when every tie this host tracks in the table is acknowledged, and only on a
+    // fresh (verification) digest. Equal residuals on every host mean the table
+    // differs only by acknowledged ties, which the convergence report counts as
+    // converged. Empty means this host cannot vouch for that.
+    string acknowledged_residual = 7;
 }
 
 message StateDigestResponse {

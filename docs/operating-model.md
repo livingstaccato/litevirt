@@ -811,8 +811,9 @@ Because a contested term is never resolved into a winner, there is no
 remediating write for the `ha.lww.unresolved` condition to wait for.
 `leader_lease_terms` rows are immutable, the two rows disagree forever, and the
 condition therefore stays dirty forever. Waiting it out does not work, and
-neither does a restart: the register is in memory, so a restart empties it and
-the next anti-entropy pass re-registers the same tie within seconds.
+neither does a restart on its own: the tie register is in memory, so a restart
+empties it and the next anti-entropy pass re-registers the same tie within
+seconds.
 
 What clears it is a human saying they have seen it:
 
@@ -820,17 +821,48 @@ What clears it is a human saying they have seen it:
 lv cluster acknowledge-lease-term --key failover --term 7
 ```
 
-Three things about that command:
+Five things about that command:
 
 - **It clears evidence tracking, not the conflict.** Both claims stay in the
   ledger, no winner is elected, and the acknowledgement is written to the audit
   log with your principal, the key and the term.
+- **It is durable.** The acknowledgement is kept in two local-only tables,
+  `acknowledged_ties` and `acknowledged_tie_versions`, and reloaded at start.
+  When a restarted daemon's first pass re-registers the tie, it is registered
+  as acknowledged: `ha.lww.unresolved` stays clear and nothing re-alerts.
+- **It covers the term as this host has seen it.** You name a lease and a term,
+  so the acknowledgement covers every claim for that term the host has met, not
+  only the one peer it met last. A term that five nodes claimed needs one
+  acknowledgement per host, and later passes can meet the peers in any order.
+  A claim the host meets for the first time *after* you acknowledged is new
+  evidence. It is not covered: the condition comes back and `converge` reports
+  a SAFETY-FAULT again. Investigate it, then acknowledge again on that host.
+  Running the command again with nothing new to cover changes nothing and
+  prints "No tracked tie".
 - **It is node-local.** The register belongs to one daemon, and the RPC refuses
   peer certificates so that no node can silence its own split-brain evidence.
-  Point `LV_HOST` at each host `lv health` names and run it there; verify with
-  `lv cluster digest`.
+  The acknowledgement is not replicated either, for the same reason: one
+  node's word would silence the evidence on hosts whose register nobody
+  checked. Point `LV_HOST` at each host `lv health` names and run it there;
+  verify with `lv cluster converge`.
 - **It needs the `cluster.lww.acknowledge` verb**, held by Operator and Admin.
   That verb grants this and nothing else.
+
+The two rows still differ on each host after the acknowledgement, so the table
+never digests equal. `lv cluster converge` lists it as `ACKNOWLEDGED`, with the
+number of acknowledged ties, and counts it as converged, but only when all of
+the following hold on every host that reports the table:
+
+- every tie the host tracks in the table is acknowledged;
+- the host's *residual* digest agrees with every other host's. The residual is
+  the table hashed with each acknowledged row replaced by its primary key, so
+  two residuals agree only when nothing but the acknowledged rows differs.
+
+If one tie on any host is unacknowledged, the table is a `SAFETY-FAULT`, with
+the unacknowledged and acknowledged counts. It is also a `SAFETY-FAULT` if a
+host cannot vouch for a residual (it tracks no tie there yet, or runs an older
+build), or if the residuals disagree, because another row differs as well.
+`lv cluster digest` shows the acknowledged count in its `TIES` column.
 
 Investigate before acknowledging. Two nodes recording the same term means the
 fencing token did its job — enforcement will refuse proofs from the losing

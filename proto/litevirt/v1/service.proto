@@ -821,6 +821,11 @@ message CreateUserRequest  { string username = 1; string password = 2; string ro
 message ListUsersResponse  { repeated User users = 1; }
 message DeleteUserRequest  { string username = 1; }
 message WhoamiResponse     { string username = 1; string role = 2; string realm = 3; string expires_at = 4; }
+// CheckPermissionsRequest names permission gates (see grpcapi permGates), not
+// raw verbs, so the question cannot drift from the one the RPC asks.
+message CheckPermissionsRequest  { repeated string gates = 1; }
+// allowed maps every requested gate name to whether it admits the caller.
+message CheckPermissionsResponse { map<string, bool> allowed = 1; }
 // ChangePasswordRequest: username empty = the caller themselves; a non-empty
 // username requires admin. old_password is verified for self-service changes.
 message ChangePasswordRequest { string username = 1; string old_password = 2; string new_password = 3; }
@@ -2826,6 +2831,12 @@ service LiteVirt {
     // skipAuth), so a stale/expired/revoked session bearer yields Unauthenticated
     // — the UI uses it to validate the session cookie and redirect to /login.
     rpc Whoami(google.protobuf.Empty)    returns (WhoamiResponse);
+    // CheckPermissions reports, for the CALLER only, whether each named
+    // permission gate would admit it — the same RequirePerm question (path,
+    // verb, legacy fallback role) the gated RPC asks. Display only: the UI uses
+    // it to decide which controls to show, and every gated RPC still runs its
+    // own check. An unknown gate name is InvalidArgument.
+    rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
     // ChangePassword updates the caller's (or, for admins, a target's) local-realm
     // password after verifying the old one.
     rpc ChangePassword(ChangePasswordRequest) returns (google.protobuf.Empty);

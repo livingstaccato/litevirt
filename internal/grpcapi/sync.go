@@ -112,13 +112,12 @@ func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*
 	resp := &pb.ClusterStateDigestResponse{}
 
 	// Self: merge public + sensitive, annotated with per-table unresolved-tie counts.
-	ties := s.db.UnresolvedTieTables()
 	self := &pb.StateDigestResponse{HostName: s.hostName}
 	if pub, err := s.db.StateDigest(ctx); err == nil {
-		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, pub, ties).Tables...)
+		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, pub, s.digestTieView(ctx, pub, true)).Tables...)
 	}
 	if sens, err := s.db.SensitiveStateDigest(ctx); err == nil {
-		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, sens, ties).Tables...)
+		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, sens, s.digestTieView(ctx, sens, true)).Tables...)
 	}
 	resp.Hosts = append(resp.Hosts, self)
 
@@ -192,18 +191,46 @@ func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.Stat
 	if err != nil {
 		return nil, err
 	}
-	return stateDigestResponse(s.hostName, digests, s.db.UnresolvedTieTables()), nil
+	return stateDigestResponse(s.hostName, digests, s.digestTieView(ctx, digests, corrosion.FreshDigestRequested(ctx))), nil
 }
 
-func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties map[string]int) *pb.StateDigestResponse {
+// digestTies is what a digest response says about this host's tracked ties:
+// every tracked tie per table, the acknowledged subset, and — on a
+// verification digest only — the acknowledged residuals.
+type digestTies struct {
+	tracked, acknowledged map[string]int
+	residual              map[string]string
+}
+
+// digestTieView reads the register for a digest over digests. The residual
+// scans only tables whose every tracked tie is acknowledged, which is normally
+// none; it is still kept off the per-pass anti-entropy path (the cached
+// digest), because nothing there reads it. A verification — `lv cluster
+// converge`, which asks every peer with WithFreshDigest — does.
+func (s *Server) digestTieView(ctx context.Context, digests []corrosion.TableDigest, withResidual bool) digestTies {
+	tracked, acked := s.db.TieTableCounts()
+	v := digestTies{tracked: tracked, acknowledged: acked}
+	if withResidual && len(acked) > 0 {
+		names := make([]string, 0, len(digests))
+		for _, d := range digests {
+			names = append(names, d.Name)
+		}
+		v.residual = s.db.AcknowledgedResiduals(ctx, names)
+	}
+	return v
+}
+
+func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties digestTies) *pb.StateDigestResponse {
 	resp := &pb.StateDigestResponse{HostName: hostName}
 	for _, d := range digests {
 		resp.Tables = append(resp.Tables, &pb.TableDigest{
-			Name:           d.Name,
-			Count:          int32(d.Count),
-			Hash:           d.Hash,
-			HashV2:         d.HashV2, // empty unless digest_v2 is enabled locally
-			UnresolvedTies: int32(ties[d.Name]),
+			Name:                 d.Name,
+			Count:                int32(d.Count),
+			Hash:                 d.Hash,
+			HashV2:               d.HashV2, // empty unless digest_v2 is enabled locally
+			UnresolvedTies:       int32(ties.tracked[d.Name]),
+			AcknowledgedTies:     int32(ties.acknowledged[d.Name]),
+			AcknowledgedResidual: ties.residual[d.Name],
 		})
 	}
 	return resp
@@ -389,7 +416,8 @@ func (s *Server) GetSensitiveStateDigest(ctx context.Context, req *pb.SensitiveS
 	if err != nil {
 		return nil, err
 	}
-	return stateDigestResponse(s.hostName, digests, s.db.UnresolvedTieTables()), nil
+	return stateDigestResponse(s.hostName, digests,
+		s.digestTieView(ctx, digests, corrosion.FreshDigestRequested(ctx))), nil
 }
 
 // StreamSensitiveStateDump streams the peer-only sensitive repair dump. It must

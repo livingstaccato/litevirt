@@ -207,6 +207,9 @@ func newClusterDigestCmd() *cobra.Command {
 						ties := ""
 						if t.GetUnresolvedTies() > 0 {
 							ties = fmt.Sprintf("%d", t.GetUnresolvedTies())
+							if a := t.GetAcknowledgedTies(); a > 0 {
+								ties = fmt.Sprintf("%d (%d acknowledged)", t.GetUnresolvedTies(), a)
+							}
 						}
 						fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n",
 							h.GetHostName(), t.GetName(), t.GetCount(), ver.label(t.GetName()), ver.hash(t.GetName(), t), ties)
@@ -236,7 +239,11 @@ state by itself.
 
 Divergence caused by a deliberate safety fault — unresolved equal-timestamp LWW ties, which
 anti-entropy will NOT auto-merge — is labelled as such; resolve those with
-'lv doctor repair-owner', not by re-running this. For a row-level scan use 'lv doctor divergence'.`,
+'lv doctor repair-owner', not by re-running this. For a row-level scan use 'lv doctor divergence'.
+
+A table held apart only by ties that every host has acknowledged ('lv cluster
+acknowledge-lease-term'), with nothing else different, is listed as ACKNOWLEDGED and
+counts as converged. One unacknowledged tie on any host keeps it a SAFETY-FAULT.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.CalledAs() == "sync" {
 				fmt.Fprintln(os.Stderr, "note: `lv cluster sync` is deprecated — use `lv cluster converge`")
@@ -328,17 +335,35 @@ var convergenceRepairTables = map[string]bool{"vms": true}
 // not listed. Comparison is version-aware (see digestVersions): v2 iff every host emits it.
 func printConvergence(dig *pb.ClusterStateDigestResponse) {
 	ver := digestVersions(dig)
-	tables := map[string]map[string]string{} // table -> host -> version-appropriate hash
-	ties := map[string]int32{}               // table -> total unresolved ties across hosts
+	tables := map[string]map[string]string{}  // table -> host -> version-appropriate hash
+	ties := map[string]int32{}                // table -> total unresolved ties across hosts
+	acked := map[string]int32{}               // table -> the acknowledged subset of ties
+	residuals := map[string]map[string]bool{} // table -> distinct acknowledged residuals
+	unproven := map[string]bool{}             // table -> some host cannot vouch for a residual
 	var order []string
 	for _, h := range dig.GetHosts() {
 		for _, t := range h.GetTables() {
-			if _, ok := tables[t.GetName()]; !ok {
-				tables[t.GetName()] = map[string]string{}
-				order = append(order, t.GetName())
+			name := t.GetName()
+			if _, ok := tables[name]; !ok {
+				tables[name] = map[string]string{}
+				residuals[name] = map[string]bool{}
+				order = append(order, name)
 			}
-			tables[t.GetName()][h.GetHostName()] = ver.hash(t.GetName(), t)
-			ties[t.GetName()] += t.GetUnresolvedTies()
+			tables[name][h.GetHostName()] = ver.hash(name, t)
+			ties[name] += t.GetUnresolvedTies()
+			a := t.GetAcknowledgedTies()
+			if a > t.GetUnresolvedTies() {
+				a = t.GetUnresolvedTies()
+			}
+			acked[name] += a
+			// Every host must vouch: hold ties here, all of them acknowledged,
+			// and a residual. A host that tracks nothing for the table cannot
+			// say its difference is the acknowledged rows.
+			if t.GetUnresolvedTies() == 0 || a != t.GetUnresolvedTies() || t.GetAcknowledgedResidual() == "" {
+				unproven[name] = true
+			} else {
+				residuals[name][t.GetAcknowledgedResidual()] = true
+			}
 		}
 	}
 	sort.Strings(order)
@@ -352,15 +377,36 @@ func printConvergence(dig *pb.ClusterStateDigestResponse) {
 		for _, h := range hosts {
 			hashes[h] = true
 		}
+		live := ties[name] - acked[name]
 		switch {
 		case len(hashes) <= 1:
 			converged++
+		case live == 0 && acked[name] > 0 && !unproven[name] && len(residuals[name]) == 1:
+			// Held apart only by ties every host has acknowledged, and every
+			// host's residual (the table with those rows masked) agrees, so
+			// nothing else differs. Converged, and listed, because the two
+			// claims are still there and still evidence.
+			converged++
+			fmt.Fprintf(w, "%s\t%s\tACKNOWLEDGED\t%d acknowledged tie(s) — both claims kept; nothing else differs\n",
+				name, ver.label(name), acked[name])
 		case ties[name] > 0:
 			remedy := "run `lv doctor divergence` and apply the table-specific remediation"
 			if convergenceRepairTables[name] {
 				remedy = "run `lv doctor repair-owner`"
 			}
-			fmt.Fprintf(w, "%s\t%s\tSAFETY-FAULT\t%d unresolved tie(s) — deliberate; %s\n", name, ver.label(name), ties[name], remedy)
+			var detail string
+			switch {
+			case acked[name] == 0:
+				detail = fmt.Sprintf("%d unresolved tie(s) — deliberate", ties[name])
+			case live > 0:
+				detail = fmt.Sprintf("%d unacknowledged tie(s) and %d acknowledged — deliberate", live, acked[name])
+			default:
+				// Every tie acknowledged, but some host could not vouch that
+				// nothing else differs, or the hosts disagree on what else is
+				// there. Not converged: that is where drift would hide.
+				detail = fmt.Sprintf("%d acknowledged tie(s), but the rest of the table is not proven equal on every host", acked[name])
+			}
+			fmt.Fprintf(w, "%s\t%s\tSAFETY-FAULT\t%s; %s\n", name, ver.label(name), detail, remedy)
 		default:
 			fmt.Fprintf(w, "%s\t%s\tDIVERGENT\thashes differ across %d hosts (drift)\n", name, ver.label(name), len(hosts))
 		}

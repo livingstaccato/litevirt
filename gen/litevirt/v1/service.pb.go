@@ -22368,9 +22368,20 @@ type TableDigest struct {
 	// hash_v2 is the order-invariant digest_v2 table hash. Emitted only when the sender
 	// has digest_v2 enabled; compared only when BOTH peers supply it (pairwise negotiation),
 	// else the peers fall back to the positional `hash`.
-	HashV2        string `protobuf:"bytes,5,opt,name=hash_v2,json=hashV2,proto3" json:"hash_v2,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	HashV2 string `protobuf:"bytes,5,opt,name=hash_v2,json=hashV2,proto3" json:"hash_v2,omitempty"`
+	// acknowledged_ties is the subset of unresolved_ties an operator has acknowledged on
+	// this host (`lv cluster acknowledge-lease-term`). Those rows still differ by design;
+	// they no longer drive ha.lww.unresolved. Zero from an older build.
+	AcknowledgedTies int32 `protobuf:"varint,6,opt,name=acknowledged_ties,json=acknowledgedTies,proto3" json:"acknowledged_ties,omitempty"`
+	// acknowledged_residual is this host's digest of the table with every
+	// acknowledged-tie row replaced by a marker naming only its primary key. Emitted
+	// only when every tie this host tracks in the table is acknowledged, and only on a
+	// fresh (verification) digest. Equal residuals on every host mean the table
+	// differs only by acknowledged ties, which the convergence report counts as
+	// converged. Empty means this host cannot vouch for that.
+	AcknowledgedResidual string `protobuf:"bytes,7,opt,name=acknowledged_residual,json=acknowledgedResidual,proto3" json:"acknowledged_residual,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *TableDigest) Reset() {
@@ -22434,6 +22445,20 @@ func (x *TableDigest) GetUnresolvedTies() int32 {
 func (x *TableDigest) GetHashV2() string {
 	if x != nil {
 		return x.HashV2
+	}
+	return ""
+}
+
+func (x *TableDigest) GetAcknowledgedTies() int32 {
+	if x != nil {
+		return x.AcknowledgedTies
+	}
+	return 0
+}
+
+func (x *TableDigest) GetAcknowledgedResidual() string {
+	if x != nil {
+		return x.AcknowledgedResidual
 	}
 	return ""
 }
@@ -31525,13 +31550,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x03vni\x18\x01 \x01(\x05R\x03vni\x12\x10\n" +
 	"\x03mac\x18\x02 \x01(\tR\x03mac\x12\x1e\n" +
 	"\vold_vtep_ip\x18\x03 \x01(\tR\toldVtepIp\x12\x1e\n" +
-	"\vnew_vtep_ip\x18\x04 \x01(\tR\tnewVtepIp\"\x8d\x01\n" +
+	"\vnew_vtep_ip\x18\x04 \x01(\tR\tnewVtepIp\"\xef\x01\n" +
 	"\vTableDigest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05count\x18\x02 \x01(\x05R\x05count\x12\x12\n" +
 	"\x04hash\x18\x03 \x01(\tR\x04hash\x12'\n" +
 	"\x0funresolved_ties\x18\x04 \x01(\x05R\x0eunresolvedTies\x12\x17\n" +
-	"\ahash_v2\x18\x05 \x01(\tR\x06hashV2\"d\n" +
+	"\ahash_v2\x18\x05 \x01(\tR\x06hashV2\x12+\n" +
+	"\x11acknowledged_ties\x18\x06 \x01(\x05R\x10acknowledgedTies\x123\n" +
+	"\x15acknowledged_residual\x18\a \x01(\tR\x14acknowledgedResidual\"d\n" +
 	"\x13StateDigestResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x120\n" +
 	"\x06tables\x18\x02 \x03(\v2\x18.litevirt.v1.TableDigestR\x06tables\"-\n" +

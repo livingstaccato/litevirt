@@ -535,6 +535,34 @@ const acknowledgedTiesDDL = `CREATE TABLE IF NOT EXISTS acknowledged_ties (
 	PRIMARY KEY (table_name, pk, content_pair)
 )`
 
+// acknowledgedTieVersionsDDL records, per acknowledged row, the fingerprint of
+// every version of that row the node had met when the operator acknowledged
+// it. A later observation is answered when BOTH of its versions are here (or
+// its exact pair is in acknowledged_ties, the older and narrower record, which
+// stays authoritative for what it holds).
+//
+// Why the pair alone was not enough: the register keeps one pair per row, and
+// in an N-way contest that pair names whichever peer anti-entropy met last. An
+// acknowledgement of it left every other peer's claim unanswered, so the next
+// pass against any of them re-raised the tie, and after a restart the peers
+// are met in whatever order the pass happens to take. The lab's five-way
+// dual_run_detector term 2 took four acknowledgements per node before it
+// stayed quiet. The operator names a ROW (a lease and a term), so the answer
+// covers the row as it was seen — and nothing else: a version first met after
+// the acknowledgement is not here, so the tie it forms is raised as usual.
+//
+// Local-only, framework-created and outside the migration ledger, for the
+// reasons given on acknowledgedTiesDDL. Fingerprints only (versionFingerprint),
+// never row content.
+const acknowledgedTieVersionsDDL = `CREATE TABLE IF NOT EXISTS acknowledged_tie_versions (
+	table_name      TEXT NOT NULL,
+	pk              TEXT NOT NULL,
+	version         TEXT NOT NULL,
+	acknowledged_at TEXT NOT NULL,
+	acknowledged_by TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (table_name, pk, version)
+)`
+
 // migrateAcknowledgedTiesPK widens an existing table's primary key to include
 // content_pair. SQLite cannot ALTER a primary key, so the table is rebuilt.
 //
@@ -636,6 +664,9 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// anti-entropy sweep can land well before the first operator query.
 	if err := c.execLocal(ctx, acknowledgedTiesDDL); err != nil {
 		return fmt.Errorf("create acknowledged_ties: %w", err)
+	}
+	if err := c.execLocal(ctx, acknowledgedTieVersionsDDL); err != nil {
+		return fmt.Errorf("create acknowledged_tie_versions: %w", err)
 	}
 	if err := c.execLocal(ctx, reseedInProgressDDL); err != nil {
 		return fmt.Errorf("create reseed_in_progress: %w", err)

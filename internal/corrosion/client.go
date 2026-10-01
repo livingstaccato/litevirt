@@ -291,6 +291,13 @@ type Client struct {
 	// pair went stale is trackUnresolvedPair, which runs with c.mu held, so the
 	// delete deadlocked the merge. See the comment there.
 	acknowledgedTies map[string]map[string]bool
+	// acknowledgedVersions records, per (table,PK), the version fingerprints an
+	// operator's acknowledgement covered: every version of the row this node
+	// had met when they acknowledged it. An observation whose two versions are
+	// both here is answered, whatever pair the register happened to hold; one
+	// with a version first met later is not. Mirrors
+	// acknowledged_tie_versions; guarded by tieMu.
+	acknowledgedVersions map[string]map[string]bool
 	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
 	// clear-on-write hooks (which run on every applied/local row) skip the lock
 	// entirely when nothing is tracked — the overwhelmingly common case.

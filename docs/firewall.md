@@ -185,9 +185,10 @@ cluster state and loaded by the reconciler's `CorrosionPlanLoader`.
 Every firewall-policy change made through the daemon lands in the signed
 audit log (`lv audit ls`, see [audit-log.md](audit-log.md)). That covers the
 CLI, the REST API and the web UI alike, because all three reach the same gRPC
-handlers. The web UI's security-group pages still write in-process rather than
-through those RPCs, so they write the same row themselves, naming the user the
-session belongs to.
+handlers with the caller's own credential. The same handler therefore decides
+who may make a change and records it: security-group edits need `sg.write` at
+`/` (Admin or NetworkAdmin) whether they come from `lv sg` or the web UI, and
+the row names the user the session belongs to.
 
 | Action | Target | Recorded by |
 |---|---|---|

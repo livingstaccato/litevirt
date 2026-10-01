@@ -1138,11 +1138,6 @@ func newTestUIServer(t *testing.T, mock *mockGRPC) *Server {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	// The write paths with no gRPC twin call the daemon's authorizer, which
-	// fails CLOSED when absent. Tests get one that applies the same role rule
-	// the daemon would, driven by the mock's whoamiRole — so a viewer is still
-	// refused and the assertions keep their meaning.
-	s.SetAuthorizer(mockAuthorizer{mock})
 	return s
 }
 
@@ -1562,12 +1557,4 @@ func (m *mockGRPC) DeleteIpSet(_ context.Context, _ *pb.DeleteIpSetRequest, _ ..
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
-}
-
-// mockAuthorizer stands in for the daemon's AuthorizeInProcess in UI tests. It
-// applies the same operator bar the real one falls back to.
-type mockAuthorizer struct{ m *mockGRPC }
-
-func (a mockAuthorizer) AuthorizeInProcess(_ context.Context, _, _, _ string) error {
-	return a.m.requireOperator()
 }

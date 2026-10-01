@@ -107,7 +107,6 @@ func TestUIDrain_AnswersBeforeTheFirstMigrationFinishes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewServer: %v", err)
 			}
-			s.SetAuthorizer(mockAuthorizer{m.mockGRPC})
 
 			done := make(chan *httptest.ResponseRecorder, 1)
 			go func() { done <- serveRequest(s, withAuth(tc.req())) }()

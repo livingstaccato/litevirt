@@ -25,7 +25,13 @@ func TestAuditWriter_RPCRowsAreSigned(t *testing.T) {
 	if _, err := s.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: "web"}); err != nil {
 		t.Fatalf("CreateSecurityGroup: %v", err)
 	}
+	if _, err := s.CreateResourceMapping(ctx, &pb.CreateResourceMappingRequest{Name: "gpu"}); err != nil {
+		t.Fatalf("CreateResourceMapping: %v", err)
+	}
+	if _, err := s.AddMappingDevice(ctx, &pb.AddMappingDeviceRequest{Mapping: "gpu", Host: "h1", Address: "0000:01:00.0"}); err != nil {
+		t.Fatalf("AddMappingDevice: %v", err)
+	}
 	s.auditAs(ctx, "alice", "vm.create", "web-1", "", "ok")
 
-	corrosion.AssertAuditRowsSignedForTest(t, s.db, 3)
+	corrosion.AssertAuditRowsSignedForTest(t, s.db, 5)
 }

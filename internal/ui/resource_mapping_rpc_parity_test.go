@@ -50,7 +50,7 @@ func TestUIResourceMappings_ViewerRefused(t *testing.T) {
 }
 
 // An Operator holds resourcemap.write, so the page must keep working for one —
-// and the create is audited against the session user by the RPC.
+// and each action is audited against the session user by the RPC.
 func TestUIResourceMappings_OperatorAllowedAndAudited(t *testing.T) {
 	s, db := newUIBoundTo(t, "olga", "Operator")
 	ctx := context.Background()
@@ -59,7 +59,7 @@ func TestUIResourceMappings_OperatorAllowedAndAudited(t *testing.T) {
 		"name": {"gpu"}, "description": {"a100s"},
 	}))
 	assertStatus(t, w, http.StatusOK)
-	wantRPCAudit(t, db, "resourcemap.add", "olga", "gpu", "a100s")
+	wantRPCAudit(t, db, "resourcemap.add", "olga", "gpu", `before=none after={name=gpu description="a100s" devices=[]}`)
 
 	w = serveRequest(s, uiSessionReq(t, "POST", "/ui/resource-mappings/gpu/devices", url.Values{
 		"host": {"h1"}, "address": {"0000:01:00.0"},
@@ -69,10 +69,12 @@ func TestUIResourceMappings_OperatorAllowedAndAudited(t *testing.T) {
 	if err != nil || m == nil || len(m.Devices) != 1 {
 		t.Fatalf("mapping = %+v (err %v), want one device", m, err)
 	}
+	wantRPCAudit(t, db, "resourcemap.device.add", "olga", "gpu", "before=none after={host=h1 address=0000:01:00.0}")
 
 	w = serveRequest(s, uiSessionReq(t, "DELETE", "/ui/resource-mappings/gpu/devices?host=h1&address=0000:01:00.0", nil))
 	assertStatus(t, w, http.StatusOK)
 	if m, _ := corrosion.GetResourceMapping(ctx, db, "gpu"); m == nil || len(m.Devices) != 0 {
 		t.Fatalf("mapping = %+v, want the device removed", m)
 	}
+	wantRPCAudit(t, db, "resourcemap.device.rm", "olga", "gpu", "before={host=h1 address=0000:01:00.0} after=none")
 }

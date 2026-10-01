@@ -120,15 +120,16 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		case resp.Unverified:
 			fmt.Fprintf(w, "audit chain NOT FULLY VERIFIED: %d rows checked", resp.RowsChecked)
 			if resp.UnsignedRows > 0 {
-				fmt.Fprintf(w, " (%d predate tamper-evidence and are chain-checked only)", resp.UnsignedRows)
+				fmt.Fprintf(w, " (%d unsigned, chain-checked only)", resp.UnsignedRows)
 			}
 			fmt.Fprintln(w)
 		case resp.UnsignedRows > 0:
-			fmt.Fprintf(w, "audit chain intact: %d rows verified (%d predate tamper-evidence and are chain-checked only)\n",
+			fmt.Fprintf(w, "audit chain intact: %d rows verified (%d unsigned, chain-checked only)\n",
 				resp.RowsChecked, resp.UnsignedRows)
 		default:
 			fmt.Fprintf(w, "audit chain intact: %d rows verified, all signed\n", resp.RowsChecked)
 		}
+		reportNotSigning(w, resp)
 		// A row that never carried a host belongs to no sub-chain and cannot be
 		// checked — but nothing writes one any more and every cluster with history
 		// has some, so it is a note rather than a failure.
@@ -195,13 +196,36 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 	// above rather than as findings of their own.
 	if resp.UnsignedRows > 0 || resp.UnverifiableRows > 0 || resp.UnattributedRows > 0 ||
 		len(resp.NeverAdopted) > 0 {
-		fmt.Fprintf(w, "\nnot tampering, for context: %d unsigned (predate tamper-evidence), %d unverifiable (no keyring), %d unattributed (no host)\n",
+		fmt.Fprintf(w, "\nnot tampering, for context: %d unsigned (any that are evidence are listed above), %d unverifiable (no keyring), %d unattributed (no host)\n",
 			resp.UnsignedRows, resp.UnverifiableRows, resp.UnattributedRows)
+		reportNotSigning(w, resp)
 		for _, h := range resp.NeverAdopted {
 			fmt.Fprintf(w, "  could not be verified either way (any peer can publish this row): %s\n", h)
 		}
 	}
 	return fmt.Errorf("audit chain verification failed: the log shows evidence of tampering")
+}
+
+// reportNotSigning names the hosts that are not signing NOW.
+//
+// An unsigned row is chain-checked only, and the count alone does not say
+// whether that is history or the present. This line used to call every one of
+// them "predate tamper-evidence", which on the kvm003-f3 lab described 212 rows
+// — some written minutes earlier by a build that could sign — as old: no host
+// had signing switched on, and nothing on screen said so. A host is listed when
+// its latest row is unsigned and it holds no signing contract; an older daemon
+// sends no list, so silence here proves nothing either way.
+func reportNotSigning(w io.Writer, resp *pb.VerifyAuditChainResponse) {
+	if len(resp.NotSigningHosts) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "  note: %d host(s) not signing now — their rows carry no signature and are not tamper-evident:\n",
+		len(resp.NotSigningHosts))
+	for _, h := range resp.NotSigningHosts {
+		fmt.Fprintf(w, "    %s\n", h)
+	}
+	fmt.Fprintln(w, "  signing is on by default; a host listed here has enforcement.audit_signature: false,")
+	fmt.Fprintln(w, "  runs a build older than that default, or retired its key. See docs/audit-log.md.")
 }
 
 func newAuditExportCmd() *cobra.Command {

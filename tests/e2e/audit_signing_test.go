@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -70,8 +71,8 @@ func thisHost(t *testing.T) string {
 // shipped loose: ca.key can mint an identity for any host in the cluster, and
 // audit-signing.key is what a rotation installs precisely because the key it
 // replaced was exposed. The repair runs at every daemon start regardless of
-// enforcement.audit_signature — it used to hang off that flag, which defaults to
-// false, so an operator who upgraded specifically for this fix and left the
+// enforcement.audit_signature — it used to hang off that flag, which then
+// defaulted to false, so an operator who upgraded specifically for this fix and left the
 // default got no repair at all. Only a live node can show that, because a file
 // mode is invisible to a harness that mints its own PKI in a temp dir.
 func TestAuditSigningKeyIsNotReadableByOthers(t *testing.T) {
@@ -128,8 +129,8 @@ func TestAuditVerifyReportsSigningState(t *testing.T) {
 //
 // It performs an action rather than reading old rows, because the log is full
 // of rows written before signing was enabled and finding one of those proves
-// nothing. If signing is off on this node the test skips — that is a
-// configuration choice, not a defect.
+// nothing. Signing is on by default; if this node's config sets it false the
+// test skips — that is a configuration choice, not a defect.
 func TestAuditRowsAreSignedWhenEnforcementIsOn(t *testing.T) {
 	requireLocalNode(t)
 	if !auditSigningEnabled(t) {
@@ -182,14 +183,17 @@ func TestAuditChainHeadIsPublished(t *testing.T) {
 	}
 }
 
-// auditSigningEnabled reports whether this node's config turns signing on.
+// auditSigningEnabled reports whether this node's config leaves signing on.
+// Signing is the default, so only an explicit `audit_signature: false` turns it
+// off — matching on `true` skipped these tests on every default-configured node,
+// which is how a lab with signing never switched on went unnoticed.
 func auditSigningEnabled(t *testing.T) bool {
 	t.Helper()
 	data, err := os.ReadFile("/etc/litevirt/config.yaml")
 	if err != nil {
 		t.Skipf("cannot read the daemon config: %v", err)
 	}
-	return strings.Contains(string(data), "audit_signature: true")
+	return !regexp.MustCompile(`(?m)^\s+audit_signature:\s*false\b`).Match(data)
 }
 
 // auditQuery reads a single scalar out of the node's state database.

@@ -23,8 +23,10 @@ export` plus the matching gRPC + REST RPCs.
 **Signatures, not just hashes.** A hash chain proves nothing against an attacker:
 `HashAuditRow` is deterministic and takes no secret, so anyone who can write the
 table can edit a row and recompute every hash after it. Each row therefore also
-carries an ECDSA signature by the authoring host's key. Three replicated tables
-hold the evidence the verifier reasons over, and every row in all three is signed:
+carries an ECDSA signature by the authoring host's key. Signing is **on by
+default** (`enforcement.audit_signature`, unset means on — see
+[Turning signing on](#turning-signing-on)). Three replicated tables hold the
+evidence the verifier reasons over, and every row in all three is signed:
 
 | Table | Holds |
 |---|---|
@@ -152,10 +154,29 @@ a row any peer can write rather than from something only a key holder could
 produce. The distinction is not pedantry: a verdict anyone can manufacture, and
 that an operator cannot clear, is what teaches people to stop reading the output.
 
-**Unsigned rows on their own are not tampering.** Rows written before signing was
-switched on carry no signature; they are chain-checked, reported as a count on the
-clean line, and exit 0. Flagging them would put a permanent tamper verdict on
+**Unsigned rows on their own are not tampering.** Rows written while their host
+was not signing carry no signature; they are chain-checked, reported as a count on
+the clean line, and exit 0. Flagging them would put a permanent tamper verdict on
 every cluster with any history, which is how a check gets ignored.
+
+The count alone does not say whether those rows are history or the present, so
+`verify` also names every host that is **not signing now** — its most recent row
+is unsigned and it holds no signing contract:
+
+```
+audit chain intact: 212 rows verified (212 unsigned, chain-checked only)
+  note: 5 host(s) not signing now — their rows carry no signature and are not tamper-evident:
+    node-1: 73 unsigned rows
+    ...
+```
+
+No host listed means every unsigned row predates its host's signing contract.
+A listed host has `enforcement.audit_signature: false`, runs a build older than
+signing by default, or retired its key. It is a note, not a finding, and it is
+the line to read after an upgrade: once every host has restarted on a signing
+build, it disappears. (A daemon older than this list sends nothing, so on a
+mixed fleet its absence proves nothing.) The REST route carries it as
+`not_signing_hosts`.
 
 Rows this daemon had no keyring to check and rows carrying no host name are
 neither a finding nor a pass: both mean part of the log went unchecked, not that
@@ -256,7 +277,7 @@ scheme can, and claiming otherwise would be worse than saying so.
 
 All of it happens **whether or not `enforcement.audit_signature` is on.** The flag
 decides whether new rows get signed, not whether a rotation completes — a rotation
-that quietly did nothing on a default-configured host would leave the leaked key
+that quietly did nothing on a host configured not to sign would leave the leaked key
 as the only published identity while the command reported the incident closed. The
 command reads the flag off the target and tells you which of the two states the
 host is in.
@@ -314,6 +335,49 @@ lv host retire-audit-key <host>
 ever considered. That is deliberately the *only* way: making the certificate row
 deletable would hand the same peer who planted it a way to suppress a genuine
 finding instead, so the remedy is one only the CA holder can perform.
+
+## Turning signing on
+
+There is nothing to turn on. Since signing became the default, a host signs
+unless its config says `enforcement.audit_signature: false`. On builds before
+that, the flag defaulted to **false**, and a cluster that never set it signed
+nothing: the kvm003-f3 lab verified 212 rows, none signed, including a
+`user.reset-admin` row written minutes earlier. Nothing was broken; nothing had
+been switched on.
+
+**An existing cluster** starts signing as each host restarts on a build with
+the default. There is no fleet-wide step and no ordering to follow:
+
+- No node relies on a peer signing. A host's obligation is its own published,
+  adopted certificate, so a host that is not signing yet — still on an older
+  build, or configured off — is reported under "not signing now" and nothing it
+  writes is a finding.
+- Each host publishes its certificate at start, starts signing at once, and
+  records its adoption about a minute later (once replication has caught up),
+  at the sequence its chain had reached. Its earlier, unsigned rows sit below
+  that boundary and stay ordinary history.
+- Older peers verify the new rows: a non-signing build from 2026-07-29 onward
+  carries the cluster CA as a verify-only keyring. One older than that counts
+  them as unverifiable, which is a note and not a failure.
+
+After the rollout, `lv audit verify` on any node should list no host under "not
+signing now". The rows written before it stay unsigned forever. That cannot be
+repaired, and verify does not treat it as tampering: they are counted, and
+chain-checked only. An unsigned row from a host *after* its adoption is still
+reported as `unsigned after signed`.
+
+**To keep a host unsigned**, set `enforcement.audit_signature: false` before it
+restarts on the new build. A host that has already started signing and is then
+set to false retires its key, as below.
+
+**Rolling a signing host back** to a build from before the default is the same
+as setting the flag false: the older build reads no flag, does not sign, and
+signs a retirement of the key on its next start, so its later rows are not
+evidence. That holds for any build with signed retirement (2026-07-29 onward).
+For about a minute after that start, until the retirement is recorded, its new
+unsigned rows read as `unsigned after signed`; they clear once it lands. A build
+older than signed retirement cannot do this, and the host needs
+`lv host retire-audit-key` from the CA holder.
 
 ## Turning signing back off
 
@@ -517,7 +581,8 @@ which is when a caller falls back to the journal. Each entry is one `<id>.json`
 file, written atomically and fsynced. Folding it:
 
 - appends one row through the daemon's own `InsertAuditLog`, so the row is
-  **signed** and takes the next place in the host's sub-chain;
+  **signed** whenever the host signs (the default) and takes the next place in
+  the host's sub-chain;
 - stamps the row with the entry's own timestamp, the time the action happened,
   not the time of the fold. `seq` still records where the row entered the
   chain, so in `lv audit ls` the row sits at the time of the action while

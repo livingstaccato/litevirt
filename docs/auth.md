@@ -392,7 +392,8 @@ It writes the reset and the audit row itself, as `via=local-root`.
 **With the daemon down**, the command falls back to writing the reset straight
 into the local database. It records the audit entry in the host-local
 pending-audit journal (`<data_dir>/pending-audit/`), and the daemon folds the
-entry into the audit log once it is running. The row is signed and carries the
+entry into the audit log once it is running. The row is signed (whenever the
+host signs, which is the default) and carries the
 time the reset actually happened, with `via=journal`. The journal entry is
 written before the reset and updated with the outcome after, all under the
 journal's lock. A reset that cannot be journalled is not made. A command that

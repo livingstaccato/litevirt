@@ -58,6 +58,21 @@ type ClaimKey struct {
 	Incarnation string `json:"incarnation,omitempty"`
 }
 
+// UnstampedIncarnation is the incarnation of a workload row whose created_at
+// is empty (IncarnationOf). No writer leaves one empty — both columns are NOT
+// NULL and every insert stamps them — but a claim's key format must not
+// depend on a row's contents, so an unstamped row is scoped like any other
+// rather than falling back to the legacy key (§10 item 37).
+const UnstampedIncarnation = "unstamped"
+
+// IncarnationOf is the claim incarnation of a workload row with created_at.
+func IncarnationOf(createdAt string) string {
+	if createdAt == "" {
+		return UnstampedIncarnation
+	}
+	return createdAt
+}
+
 // Legacy is k without its incarnation: the key a coordinator claimed this
 // decision under before claim_incarnation_v1 latched.
 func (k ClaimKey) Legacy() ClaimKey {

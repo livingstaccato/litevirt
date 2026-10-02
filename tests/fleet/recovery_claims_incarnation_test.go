@@ -197,6 +197,7 @@ func TestFleet_RecoveryClaim_ARecreatedContainerGetsAFreshClaim(t *testing.T) {
 		t.Fatalf("the first relocation carries no token: %v %+v", err, moved)
 	}
 	firstToken := moved.RelocateToken
+	recreatedOn(t, c, dest1, name, alive)
 
 	if err := corrosion.DeleteContainer(ctx, a.DB, dest1.Name, name); err != nil {
 		t.Fatalf("delete the first incarnation: %v", err)
@@ -244,6 +245,33 @@ func TestFleet_RecoveryClaim_ARecreatedContainerGetsAFreshClaim(t *testing.T) {
 		t.Fatalf("read the relocation proof: ok=%v err=%v", ok, err)
 	}
 	assertFreshIncarnationClaim(t, a, pr.ActionProof, ct.CreatedAt)
+	recreatedOn(t, c, c.Node(hosts[0]), name, alive)
+}
+
+// recreatedOn runs dest's container checker, wired as the daemon wires it
+// (claimContainerChecker), and requires it to have claimed the relocation
+// proof under its certificate and recreated the container: a relocation the
+// destination refuses leaves the row pending forever, its source already
+// tombstoned.
+func recreatedOn(t *testing.T, c *Cluster, dest *Node, name string, alive []*Node) {
+	t.Helper()
+	ctx := context.Background()
+	var refused []string
+	cc := claimContainerChecker(t, dest)
+	cc.SetGateRefusedObserver(func(_, reason string) { refused = append(refused, reason) })
+	cc.SweepOnce(ctx)
+	c.WaitConverged(t, convergeTimeout, alive...)
+	row, err := corrosion.GetContainer(ctx, dest.DB, dest.Name, name)
+	if err != nil || row == nil {
+		t.Fatalf("%s: read %s: %v", dest.Name, name, err)
+	}
+	if !dest.CT.Exists(name) || row.StateDetail == corrosion.ContainerRelocateRecreateDetail {
+		t.Fatalf("%s did not recreate %s from its relocation (refusals %v): row %+v", dest.Name, name, refused, row)
+	}
+	pr, ok, err := corrosion.GetActionProofByToken(ctx, dest.DB, row.RelocateToken)
+	if err != nil || !ok || pr.ExecutorHost != dest.Name {
+		t.Fatalf("%s: the relocation proof was not claimed here: ok=%v err=%v %+v", dest.Name, ok, err, pr)
+	}
 }
 
 // assertFreshIncarnationClaim checks that the certificate on p decides p's
@@ -447,5 +475,54 @@ func TestFleet_RecoveryClaim_APreviousIncarnationsLegacyDecisionIsLeftBehind(t *
 	if scopedDest != vm.HostName || legacyDest != dest1.Name {
 		t.Fatalf("lv cluster claim shows the scoped key decided for %q and the legacy key for %q, want %s and %s",
 			scopedDest, legacyDest, vm.HostName, dest1.Name)
+	}
+}
+
+// TestFleet_RecoveryClaim_ACompletedLegacyDecisionIsReAdopted: a recovery
+// decided at the legacy key before claim_incarnation_v1 latched has run and
+// completed. A coordinator that still reads the epoch it left claims the
+// scoped key after the latch. It must learn the completed decision — a no-op,
+// its proof spent — and never decide a second value for the same epoch of the
+// same incarnation, whose only remaining guard would be the destination's
+// owner-epoch check.
+//
+// Mutation: reject a legacy value whose proof is completed (the pre-review
+// legacyValueMayRun) — the lagging claim decides its own value.
+func TestFleet_RecoveryClaim_ACompletedLegacyDecisionIsReAdopted(t *testing.T) {
+	ctx := context.Background()
+	c, a, b, _, d := probeFleet(t, 2565, "vm-done")
+	latchIncarnation(c, false)
+	c.Kill(d)
+	cs := probeCoordinator(c, NewVirtualClock(time.Now().UTC()), a)
+	cs.Tick(ctx, a)
+	vm := vmOn(t, a, "vm-done")
+	if vm.PendingActionID == "" || vm.HostName == d.Name {
+		t.Fatalf("the legacy claim did not decide: %+v", vm)
+	}
+	decided := vm.PendingActionID
+	dest := c.Node(vm.HostName)
+	alive := []*Node{a, b, c.Nodes[2]}
+	c.WaitConverged(t, convergeTimeout, alive...)
+	claimReconciler(t, dest).ReconcileOnce(ctx)
+	c.WaitConverged(t, convergeTimeout, alive...)
+	if pr, ok, _ := corrosion.GetActionProof(ctx, a.DB, decided); !ok || pr.Status != corrosion.ProofCompleted {
+		t.Fatalf("the legacy decision did not complete: %+v", pr)
+	}
+
+	// After the latch, a claim at the epoch the VM has already left.
+	latchIncarnation(c, true)
+	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "vm-done", OwnerEpoch: 0,
+		Incarnation: vmOn(t, a, "vm-done").CreatedAt}
+	w := corrosion.ActionProof{ID: "lagging-second-value", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm-done", DestHost: b.Name, Coordinator: a.Name, OwnerEpoch: "0"}
+	if dest == b {
+		w.DestHost = a.Name
+	}
+	out, err := a.Server.DecideRecoveryClaim(ctx, key, corrosion.ClaimValue{Proof: &w, SourceHost: d.Name}, 50, nil)
+	if err != nil {
+		t.Fatalf("the lagging scoped claim: %v", err)
+	}
+	if out.Ours || out.Value.Proof == nil || out.Value.Proof.ID != decided {
+		t.Fatalf("the lagging claim decided %+v (ours=%v), want the completed legacy decision %s", out.Value.Proof, out.Ours, decided)
 	}
 }

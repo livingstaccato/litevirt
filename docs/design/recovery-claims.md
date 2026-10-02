@@ -183,8 +183,9 @@ claim key = (target_kind, target_name, incarnation, owner_epoch, attempt)
 - `target_kind` / `target_name` are `vm` / `container` and the workload name.
   These are the same fields as `ActionProof.TargetKind` / `TargetName`.
 - `incarnation` is the workload row's `created_at`, which names one
-  incarnation of the name: every path that moves a row keeps it, and every
-  path that brings a name back to life stamps a fresh one. It is `""` (a
+  incarnation of the name: every path that moves a row keeps it (a container
+  relocation too, since §10 item 37), and every path that brings a name back
+  to life stamps a fresh one. It is `""` (a
   *legacy* key) until `claim_incarnation_v1` latches, and always for
   `voter_config`. §10 item 37 says why it was added.
 - `owner_epoch` is the generation being *left*: `vms.vm_owner_epoch` or
@@ -1823,10 +1824,26 @@ where it described the mechanism; this list records what changed and why.
     node that re-creates it cannot know the epoch a previous incarnation
     reached. The incarnation is the row's `created_at`, the identity the
     anti-entropy merge already decides live-against-tombstone from: every path
-    that moves a row preserves it, and every path that brings a name back to
-    life stamps a fresh one at nanosecond precision. The VM UUID in the spec
-    was the other candidate; a container has none, and the claim must cover
-    both.
+    that brings a name back to life stamps a fresh one at nanosecond
+    precision, and every path that moves a row preserves it. That last was
+    not true of one path until this item: a container image-recreate
+    relocation (`RelocateContainerWithToken`) stamped its target row afresh,
+    so a relocation decided at the source's incarnation refused at its
+    destination for good, the source row already tombstoned, and the
+    container's next recovery would have had a fresh key past a stranded
+    decision. It now keeps the source's `created_at`, as the runtime re-key
+    already did (`RekeyContainerOwnerGuarded`). The pre-epoch upsert shape
+    still keeps the created_at of a stale same-name tombstone on the target
+    (its conflict arm cannot change without a new statement shape), so the
+    destination also accepts the row that carries the decision's relocation
+    token: the token is random per decision and digested into the certified
+    value, so that row was written by this decision and nothing else. The VM
+    UUID in the spec was the other candidate; a container has none, and the
+    claim must cover both. A row with an empty `created_at` cannot occur
+    through any writer (both columns are `NOT NULL`, and every writer stamps
+    one), but an unstamped row is given the fixed incarnation `unstamped`
+    (`corrosion.IncarnationOf`) rather than falling back to the legacy key,
+    so the key format never depends on a row's contents.
     - **Key, certificate, voter state.** `ClaimKey.Incarnation`
       (`RecoveryClaimKey.incarnation`, field 5) is the row's `created_at`.
       A voter keeps incarnation-scoped keys in `local_incarnation_claims`
@@ -1883,14 +1900,26 @@ where it described the mechanism; this list records what changed and why.
       highest-ballot legacy value (`claims.Spec.AdoptLegacy`), and a voter
       that accepted it at the legacy key re-accepts it without probing again
       (§3.15), though still cross-checking its source against its row of this
-      incarnation. The coordinator adopts a legacy value only if it names the
-      owner this incarnation is leaving, since one incarnation has one owner
-      at one epoch, and only if its proof can still run: one this replica
-      holds completed, failed or tombstoned is spent, and either it ran or it
-      was a previous incarnation's (`Server.legacyValueMayRun`). A proof the
-      replica has not seen is adopted, which is what the legacy key would have
-      done. A recovery decided across the upgrade is completed, not decided
-      twice; the lab's stale value is left behind.
+      incarnation. The coordinator adopts a legacy value only if it is this
+      incarnation's decision. It must name the owner this incarnation is
+      leaving, since one incarnation has one owner at one epoch, and its proof
+      must not have been minted before this incarnation existed
+      (`Server.legacyValueIsThisIncarnation`): a proof minted more than the
+      tolerated clock skew (`hlc.MaxSkewMS`) before the row's `created_at`
+      was a previous incarnation's, run or still pending, and is left behind.
+      Anything else is adopted whatever its status, which is the legacy key's
+      own rule: this incarnation's completed decision is re-adopted, so a
+      coordinator still reading the epoch it left completes a no-op and never
+      decides a second value. A proof the replica has not seen is adopted for
+      the same reason. The skew margin is spent on the safe side: misreading
+      this incarnation's decision as a previous one's would decide a second
+      value, while misreading a previous one's still-pending decision as this
+      one's re-decides it for this incarnation, as the legacy key did. Pending
+      proofs are not retired when their workload is deleted: retiring needs a
+      new replicated statement shape, and it could not mark the proofs minted
+      before the upgrade that the bridge exists for. A recovery decided across
+      the upgrade is completed, not decided twice; the lab's stale value is
+      left behind.
     - **Schema bump: yes, v63**, one additive node-local table. No
       replicated statement shape changes: the certificate column is the same
       TEXT, and the ledger is untouched.

@@ -616,7 +616,7 @@ func (c *Client) settledOwner(ctx context.Context, key ClaimKey) (string, bool, 
 // incarnation the certificate names (VerifyClaimCertificate), which is where
 // the binding is enforced (§10 item 37).
 func rowIsIncarnation(r Row, key ClaimKey) bool {
-	return key.Incarnation == "" || r.String("created_at") == key.Incarnation
+	return key.Incarnation == "" || IncarnationOf(r.String("created_at")) == key.Incarnation
 }
 
 // ClaimProbeHint is the host this voter's own row for the target names at

@@ -88,6 +88,18 @@ func claimReconciler(t *testing.T, n *Node) *health.Reconciler {
 	return rec
 }
 
+// claimContainerChecker is the destination's container checker as the daemon
+// wires it (daemon.go): the execution gate and the recovery-claim certificate
+// check, so a relocate-recreate is claimed and recreated only on a certificate
+// that verifies here.
+func claimContainerChecker(t *testing.T, n *Node) *health.ContainerChecker {
+	t.Helper()
+	cc := health.NewContainerChecker(n.Name, n.DB, n.CT.LXC())
+	cc.SetGate(epochGate{})
+	cc.SetRecoveryClaimGate(n.Server.RecoveryClaimGateForPendingProof)
+	return cc
+}
+
 // proofsNaming lists the ownership-transfer proofs n's replica holds for target
 // whose destination is dest.
 func proofsNaming(t *testing.T, n *Node, target, dest string) []string {

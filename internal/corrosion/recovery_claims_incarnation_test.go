@@ -323,3 +323,32 @@ func TestClaimCertificateReplaces_LegacyUpgradesToItsIncarnation(t *testing.T) {
 		t.Error("one incarnation's certificate replaced another's")
 	}
 }
+
+// TestWorkloadIncarnation_UnstampedRow: a live row with an empty created_at
+// is incarnation UnstampedIncarnation, at the coordinator, the voter's
+// cross-check and the destination alike, rather than "no incarnation" — which
+// would leave its claims on the legacy key after the latch.
+//
+// Mutation: return ok=false for an empty created_at in WorkloadIncarnation —
+// the unstamped row reads as having no incarnation.
+func TestWorkloadIncarnation_UnstampedRow(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	if err := InsertVM(ctx, c, VMRecord{Name: "vm-1", HostName: "h", Spec: `{}`, State: "running"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Execute(ctx, `UPDATE vms SET created_at = '' WHERE name = 'vm-1'`); err != nil {
+		t.Fatal(err)
+	}
+	inc, ok, err := WorkloadIncarnation(ctx, c, ClaimKindVM, "vm-1")
+	if err != nil || !ok || inc != UnstampedIncarnation {
+		t.Fatalf("WorkloadIncarnation of an unstamped row = %q %v %v, want %q", inc, ok, err, UnstampedIncarnation)
+	}
+	r, found, err := c.claimTargetRow(ctx, scopedKey(UnstampedIncarnation))
+	if err != nil || !found || !rowIsIncarnation(r, scopedKey(UnstampedIncarnation)) {
+		t.Fatalf("the voter does not read the unstamped row as its incarnation: %v %v", found, err)
+	}
+	if _, ok, _ := WorkloadIncarnation(ctx, c, ClaimKindVM, "no-such-vm"); ok {
+		t.Fatal("a name with no live row has an incarnation")
+	}
+}

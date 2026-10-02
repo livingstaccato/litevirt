@@ -111,7 +111,7 @@ func VerifyClaimCertificate(ctx context.Context, c *Client, v *ClaimVerifier, p 
 	if err != nil {
 		return cert, err
 	}
-	if err := certificateIncarnationIsLive(ctx, c, cert.Key); err != nil {
+	if err := certificateIncarnationIsLive(ctx, c, cert.Key, p); err != nil {
 		return cert, err
 	}
 	adopted, err := AdoptedVoterGeneration(ctx, c)
@@ -143,10 +143,10 @@ func VerifyClaimCertificate(ctx context.Context, c *Client, v *ClaimVerifier, p 
 }
 
 // WorkloadIncarnation is the incarnation of the live workload row for
-// (kind, name) in c's replica — its created_at (§10 item 37). ok is false
-// when there is no live row, or when live rows of the name disagree about
-// their incarnation (two containers' rows mid-heal), since then no single
-// incarnation can be named.
+// (kind, name) in c's replica — IncarnationOf its created_at (§10 item 37).
+// ok is false when there is no live row, or when live rows of the name
+// disagree about their incarnation (two containers' rows mid-heal), since
+// then no single incarnation can be named.
 func WorkloadIncarnation(ctx context.Context, c *Client, kind, name string) (string, bool, error) {
 	var q string
 	switch kind {
@@ -158,10 +158,21 @@ func WorkloadIncarnation(ctx context.Context, c *Client, kind, name string) (str
 		return "", false, fmt.Errorf("no workload rows for target kind %q", kind)
 	}
 	rows, err := c.Query(ctx, q, name)
-	if err != nil || len(rows) != 1 || rows[0].String("created_at") == "" {
+	if err != nil || len(rows) != 1 {
 		return "", false, err
 	}
-	return rows[0].String("created_at"), true, nil
+	return IncarnationOf(rows[0].String("created_at")), true, nil
+}
+
+// ProofMintedMs is when this replica's row of proof id was minted, in Unix
+// milliseconds, whether its created_at is a wall stamp or an HLC one (the
+// stamp NowTS writes). ok is false when the replica holds no row of it.
+func ProofMintedMs(ctx context.Context, c *Client, id string) (int64, bool, error) {
+	rows, err := c.Query(ctx, `SELECT `+tsMsSQL("created_at")+` AS minted_ms FROM runtime_action_proofs WHERE id = ?`, id)
+	if err != nil || len(rows) == 0 {
+		return 0, false, err
+	}
+	return rows[0].Int64("minted_ms"), true, nil
 }
 
 // certificateIncarnationIsLive is the destination's half of the incarnation
@@ -174,9 +185,28 @@ func WorkloadIncarnation(ctx context.Context, c *Client, kind, name string) (str
 // A legacy key names no incarnation and is accepted as before: it is what
 // every certificate minted before claim_incarnation_v1 latched carries, and
 // refusing them would strand every recovery decided across the upgrade.
-func certificateIncarnationIsLive(ctx context.Context, c *Client, key ClaimKey) error {
+//
+// A container relocation is also bound by its token. Its target row is the
+// one the relocation wrote, carrying p's relocation token, and that row keeps
+// the source's created_at (RelocateContainerWithToken) except where the
+// pre-epoch upsert met a stale tombstone of the same name on the target,
+// whose created_at the upsert's conflict arm keeps. The token is random per
+// decision and is digested into the value the certificate certifies, so the
+// row that carries it was written by this decision and by nothing else: it is
+// this decision's incarnation whatever its created_at says.
+func certificateIncarnationIsLive(ctx context.Context, c *Client, key ClaimKey, p ActionProof) error {
 	if key.Incarnation == "" {
 		return nil
+	}
+	if p.Action == ActionRelocate && p.TargetKind == ClaimKindContainer && p.RelocationToken != "" {
+		rows, err := c.Query(ctx, `SELECT 1 AS one FROM containers
+			WHERE name = ? AND relocate_token = ? AND deleted_at IS NULL LIMIT 1`, p.TargetName, p.RelocationToken)
+		if err != nil {
+			return fmt.Errorf("read the relocated row of %s/%s: %w", key.TargetKind, key.TargetName, err)
+		}
+		if len(rows) > 0 {
+			return nil
+		}
 	}
 	inc, ok, err := WorkloadIncarnation(ctx, c, key.TargetKind, key.TargetName)
 	if err != nil {

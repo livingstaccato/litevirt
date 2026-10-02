@@ -48,11 +48,14 @@ func (s *Server) InspectRecoveryClaim(ctx context.Context, req *pb.InspectRecove
 	// The live row's incarnation, which the key carries once
 	// claim_incarnation_v1 has latched (§10 item 37). A name with no live row
 	// is inspected at its legacy key.
-	incarnation, _, err := corrosion.WorkloadIncarnation(ctx, s.db, kind, name)
+	incarnation, live, err := corrosion.WorkloadIncarnation(ctx, s.db, kind, name)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read the incarnation of %s/%s: %v", kind, name, err)
 	}
-	base := s.ClaimKeyFor(ctx, kind, name, epoch, incarnation)
+	base := corrosion.ClaimKey{TargetKind: kind, TargetName: name, OwnerEpoch: epoch}
+	if live {
+		base = s.ClaimKeyFor(ctx, kind, name, epoch, incarnation)
+	}
 	cfg, err := corrosion.AdoptedVoterConfig(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "%v", err)

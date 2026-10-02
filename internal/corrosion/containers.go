@@ -819,7 +819,19 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	rec.State = "pending"
 	rec.StateDetail = ContainerRelocateRecreateDetail
 	rec.RelocateToken = token
-	rec.CreatedAt = "" // fresh row on the target
+	// created_at is PRESERVED, as RekeyContainerOwnerGuarded preserves it: a
+	// relocation moves one incarnation of the container, it does not make a
+	// new one. A recovery claim is keyed by created_at
+	// (docs/design/recovery-claims.md §10 item 37), and a relocation decided
+	// at the source's incarnation is executed by the target against its row:
+	// a fresh stamp here made every certified relocate-recreate refuse at its
+	// destination, and moved the next recovery of the container to a fresh
+	// claim key, past the decision a stranded relocation still holds. A
+	// source row with no created_at (pre-v35) keeps the old behaviour and is
+	// stamped afresh.
+	if rec.CreatedAt == "" {
+		rec.CreatedAt = nowRFC3339Nano()
+	}
 	// Mirror the RekeyContainerOwner duality: a pre-epoch source (all lifecycle
 	// fields zero) keeps the retained wire-compatible upsert, so older receivers
 	// in a rolling upgrade never see a shape they don't know. A source carrying
@@ -850,7 +862,7 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 			rec.RestartPolicy, rec.StateDetail, rec.Project, boolToInt(rec.IsTemplate),
 			rec.OnHostFailure, rec.CreateSpec, rec.RelocateToken,
 			old.OwnerEpoch, old.SpecGeneration, old.ActiveOperationID,
-			nowRFC3339(), c.NowTS(),
+			rec.CreatedAt, c.NowTS(),
 		}}
 	}
 

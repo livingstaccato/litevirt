@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
+
+	lv "github.com/litevirt/litevirt/internal/libvirt"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -55,22 +58,61 @@ type localCopyID struct {
 }
 
 // localVMIdentity reads the local copy's identity from host-local evidence.
+// The pause record counts only while the domain is still the one it paused —
+// paused, and the same domain UUID — since a record can outlive what it
+// described. The incarnation is the record's or the managed stamp's (both
+// known and different is no answer at all); the epoch is the HIGHEST any
+// source reports, so a stale source can never make the local copy look older
+// than it is.
 func (r *Reconciler) localVMIdentity(name string) localCopyID {
-	if rec, ok, err := ReadPauseRecord(r.dataDir, PauseKindVM, name); err == nil && ok && rec.Incarnation != "" {
-		return localCopyID{Incarnation: rec.Incarnation, Epoch: rec.OwnerEpoch, EpochKnown: true, Source: "partition-pause record"}
-	}
 	var id localCopyID
-	if inc, ok, err := r.virt.GetDomainManagedIncarnation(name); err == nil && ok {
-		id.Incarnation, id.Source = inc, "managed stamp"
+	var sources []string
+	if rec, ok, err := ReadPauseRecord(r.dataDir, PauseKindVM, name); err == nil && ok && rec.Incarnation != "" && r.recordStillDescribes(rec) {
+		id.Incarnation, id.Epoch, id.EpochKnown = rec.Incarnation, rec.OwnerEpoch, true
+		sources = append(sources, "partition-pause record")
+	}
+	if inc, ok, err := r.virt.GetDomainManagedIncarnation(name); err == nil && ok && inc != "" {
+		if id.Incarnation != "" && id.Incarnation != inc {
+			return localCopyID{Source: "the pause record and the managed stamp disagree about the incarnation"}
+		}
+		id.Incarnation = inc
+		sources = append(sources, "managed stamp")
+	}
+	note := func(e int64) {
+		if !id.EpochKnown || e > id.Epoch {
+			id.Epoch = e
+		}
+		id.EpochKnown = true
 	}
 	if e, ok, err := r.virt.GetDomainOwnerEpoch(name); err == nil && ok {
-		id.Epoch, id.EpochKnown = e, true
-	} else if r.dataDir != "" {
+		note(e)
+		sources = append(sources, "owner-epoch metadata")
+	}
+	if r.dataDir != "" {
 		if e, ok, err := ReadVMOwnerEpochMarker(r.dataDir, name); err == nil && ok {
-			id.Epoch, id.EpochKnown = e, true
+			note(e)
+			sources = append(sources, "owner-epoch marker")
 		}
 	}
+	id.Source = strings.Join(sources, "+")
 	return id
+}
+
+// recordStillDescribes reports whether rec is still about the local domain:
+// paused, and the same domain UUID when the record carries one.
+func (r *Reconciler) recordStillDescribes(rec PauseRecord) bool {
+	st, err := r.virt.DomainStateReason(rec.Name)
+	if err != nil || st.Reason != "paused" {
+		return false
+	}
+	if rec.DomainUUID == "" {
+		return true
+	}
+	xml, err := r.virt.DumpXMLInactive(rec.Name)
+	if err != nil {
+		return false
+	}
+	return lv.UUIDFromXML(xml) == rec.DomainUUID
 }
 
 // settleDecide is the decision of §6, separate so every clause is testable.

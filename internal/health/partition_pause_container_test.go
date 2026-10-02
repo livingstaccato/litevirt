@@ -119,8 +119,7 @@ func TestPartitionPause_FreezesAndUnfreezesARecoverableContainer(t *testing.T) {
 	if recs := f.records(); len(recs) != 1 || recs[0].Key() != "ct/ct-ha" {
 		t.Fatalf("records = %+v, want ct/ct-ha", recs)
 	}
-	f.set(QuorumYes)
-	f.tick()
+	f.regain()
 	if st := rt.get("ct-ha"); st != "running" {
 		t.Fatalf("ct-ha is %s after the majority confirmed it", st)
 	}
@@ -142,8 +141,7 @@ func TestPartitionPause_LeavesAFrozenContainerAlone(t *testing.T) {
 	if c, ok := f.condition(corrosion.CondPartitionPauseFailed); ok && c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("the pauser tried to freeze a container someone else froze: %s", c.Evidence)
 	}
-	f.set(QuorumYes)
-	f.tick()
+	f.regain()
 	if st := rt.get("ct-ha"); st != "frozen" {
 		t.Fatalf("a container frozen by someone else is %s after the majority returned", st)
 	}
@@ -199,8 +197,7 @@ func TestPartitionPause_SettlesARelocatedContainer(t *testing.T) {
 			f.p.SetSettleVerifier(func(context.Context, corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
 				return cert, tc.certErr
 			})
-			f.set(QuorumYes)
-			f.tick()
+			f.regain()
 			if st := rt.get("ct-ha"); st != tc.want {
 				t.Fatalf("ct-ha is %s, want %s", st, tc.want)
 			}

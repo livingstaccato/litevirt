@@ -48,7 +48,9 @@ func newSettleFixture(t *testing.T) *settleFixture {
 	}
 	f.row = row
 	inc := corrosion.IncarnationOf(row.CreatedAt)
+	// The local copy is one this host's partition pause suspended.
 	f.virt.SetState("vm-a", libvirtfake.StateRunning)
+	f.virt.SetPaused("vm-a")
 	f.proof = corrosion.ProofRecord{ActionProof: corrosion.ActionProof{ID: "proof-1", Action: corrosion.ActionReschedule,
 		TargetKind: corrosion.ClaimKindVM, TargetName: "vm-a", DestHost: "node-b", OwnerEpoch: "3",
 		ClaimCertificate: "{}"}, Status: corrosion.ProofCompleted, ExecutorHost: "node-b"}
@@ -112,12 +114,34 @@ func TestSettle_StopsACopyACertifiedClaimGaveAway(t *testing.T) {
 	}
 }
 
-// A paused copy (this host's partition pause) settles the same way.
-func TestSettle_StopsAPausedCopy(t *testing.T) {
+// A pause record is evidence only while it still describes the domain: one
+// left behind after the domain was resumed by hand says nothing about what
+// runs now (and would offer a stale epoch), so without other evidence there is
+// no proof.
+//
+// Mutation: trust the record whatever the domain's state — the copy stops and
+// this goes red.
+func TestSettle_AStaleRecordIsNotEvidence(t *testing.T) {
 	f := newSettleFixture(t)
-	f.virt.SetPaused("vm-a")
-	if st := f.run(); st != libvirtfake.StateShutdown {
-		t.Fatalf("paused vm-a is %s after a verified claim gave it away", st)
+	f.virt.SetState("vm-a", libvirtfake.StateRunning) // resumed by someone else
+	if st := f.run(); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-a is %s; a record of a pause that no longer holds was taken as proof", st)
+	}
+}
+
+// The local copy's epoch is the HIGHEST any host-local source reports: a pause
+// record at 3 beside owner-epoch metadata at 5 is a copy at 5, which a
+// certificate for epoch 3 does not supersede.
+//
+// Mutation: prefer the record's epoch over the others — the copy stops and
+// this goes red.
+func TestSettle_TheLocalEpochIsTheHighestEvidence(t *testing.T) {
+	f := newSettleFixture(t)
+	if err := f.virt.SetDomainOwnerEpoch("vm-a", 5, true); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.run(); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-a is %s; a certificate for epoch 3 stopped a copy whose metadata says 5", st)
 	}
 }
 
@@ -189,7 +213,7 @@ func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSettleFixture(t)
 			tc.edit(f)
-			if st := f.run(); st != libvirtfake.StateRunning {
+			if st := f.run(); st == libvirtfake.StateShutdown {
 				t.Fatalf("vm-a is %s; without positive proof the non-destruction guard must stand", st)
 			}
 		})
@@ -206,6 +230,7 @@ func TestSettle_DomainMetadataIsEvidenceToo(t *testing.T) {
 	if err := RemovePauseRecord(f.dataDir, PauseKindVM, "vm-a"); err != nil {
 		t.Fatal(err)
 	}
+	f.virt.SetState("vm-a", libvirtfake.StateRunning) // a running copy: the host never paused
 	if err := f.virt.SetDomainManagedIncarnation("vm-a", corrosion.IncarnationOf(f.row.CreatedAt), true); err != nil {
 		t.Fatal(err)
 	}

@@ -42,8 +42,11 @@ type PauseRecord struct {
 	Host        string `json:"host"`
 	OwnerEpoch  int64  `json:"owner_epoch"`
 	Incarnation string `json:"incarnation"` // the row's created_at at the pause (corrosion.IncarnationOf)
-	PausedAt    string `json:"paused_at"`   // RFC3339, for operators; nothing decides on it
-	Reason      string `json:"reason"`
+	// DomainUUID is the paused domain's UUID (VMs), so the record is trusted
+	// only for that domain and never for a later one of the same name.
+	DomainUUID string `json:"domain_uuid,omitempty"`
+	PausedAt   string `json:"paused_at"` // RFC3339, for operators; nothing decides on it
+	Reason     string `json:"reason"`
 }
 
 // Key identifies a record: kind/name.

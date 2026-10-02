@@ -82,6 +82,16 @@ func (f *pauseFixture) advance(d time.Duration) {
 }
 func (f *pauseFixture) tick() { f.p.Evaluate(context.Background()) }
 
+// regain holds the quorum at Yes for the partitionRegainTicks readings a heal
+// takes.
+func (f *pauseFixture) regain() {
+	f.set(QuorumYes)
+	for i := 0; i < partitionRegainTicks; i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+}
+
 func (f *pauseFixture) raw(name string) libvirtfake.State {
 	f.t.Helper()
 	st, ok := f.virt.RawState(name)
@@ -161,9 +171,7 @@ func TestPartitionPause_BlipShorterThanTPausePausesNothing(t *testing.T) {
 	f := newPauseFixture(t)
 	for i := 0; i < 3; i++ {
 		f.loseFor(QuorumNo, PartitionPauseAfter-3*time.Second)
-		f.set(QuorumYes)
-		f.tick()
-		f.advance(time.Second)
+		f.regain()
 	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		t.Fatalf("vm-ha is %s after three blips each shorter than T_pause", st)
@@ -244,8 +252,7 @@ func TestPartitionPause_FlagOffPausesNothingButStillResumes(t *testing.T) {
 		t.Fatalf("setup: vm-ha is %s", st)
 	}
 	on = false
-	f.set(QuorumYes)
-	f.tick()
+	f.regain()
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		t.Fatalf("vm-ha is %s after the majority returned with the flag off; a paused workload was stranded", st)
 	}
@@ -354,14 +361,13 @@ func TestPartitionPause_ResumesOnlyOnConfirmation(t *testing.T) {
 		}
 		return out
 	}
-	f.set(QuorumYes)
-	f.tick()
+	f.regain()
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
 		t.Fatalf("vm-ha is %s although the majority did not confirm it", st)
 	}
 	held = false
 	f.advance(partitionResumeRecheck)
-	f.tick()
+	f.regain()
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		t.Fatalf("vm-ha is %s after the majority confirmed it", st)
 	}
@@ -436,7 +442,9 @@ func TestPartitionPause_RecordSurvivesARestart(t *testing.T) {
 		}
 		return out
 	})
-	restarted.Evaluate(context.Background())
+	for i := 0; i < partitionRegainTicks; i++ {
+		restarted.Evaluate(context.Background())
+	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		t.Fatalf("vm-ha is %s after a restarted pauser regained the majority", st)
 	}
@@ -650,5 +658,121 @@ func TestInQuorumRegainGrace_ARegionMajorityWithoutTheClusterFences(t *testing.T
 	}
 	if !c.InQuorumRegainGraceFor(QuorumScopeCluster) {
 		t.Fatal("the cluster-wide scope, which is lost, reads as not in grace")
+	}
+}
+
+// A lossy link: the quorum reads No for two ticks and Yes for one, over and
+// over. No Yes run is a heal (partitionRegainTicks), and the loss covers two
+// thirds of the window, so the host pauses — while a continuous clock, reset
+// by every Yes, never would, though the voters, which need only five
+// consecutive failures each, may well fence it.
+//
+// Mutation: reset the window on any single Yes — nothing pauses and this goes
+// red.
+func TestPartitionPause_ALossyLinkStillPauses(t *testing.T) {
+	f := newPauseFixture(t)
+	for i := 0; i < 15; i++ {
+		f.loseFor(QuorumNo, time.Second) // two readings lost
+		f.set(QuorumYes)
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s after 30 s of a link losing the majority two readings in three", st)
+	}
+}
+
+// A record that no longer describes a paused domain is dropped when the
+// majority is back, and partition_paused resolves: a held record must not
+// keep the condition open forever, nor offer a stale epoch later.
+//
+// Mutation: keep such records — the record and the condition remain and this
+// goes red.
+func TestPartitionPause_DropsARecordWhoseDomainIsNoLongerPaused(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	if len(f.records()) != 1 {
+		t.Fatalf("setup: records %+v", f.records())
+	}
+	f.virt.SetState("vm-ha", libvirtfake.StateRunning) // an operator resumed it
+	f.p.SetResumeConfirmer(nil)                        // and nothing would ever confirm it
+	f.regain()
+	if recs := f.records(); len(recs) != 0 {
+		t.Fatalf("records = %+v after the domain stopped being paused", recs)
+	}
+	if c, ok := f.condition(corrosion.CondPartitionPaused); !ok || c.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("partition_paused is not resolved (ok=%v %+v)", ok, c)
+	}
+}
+
+// Every workload the pass cannot account for is a failed pause: a domain whose
+// state cannot be read is not known to be stopped.
+//
+// Mutation: skip an unreadable domain silently — no condition, and this goes
+// red.
+func TestPartitionPause_AnUnreadableDomainIsAFailedPause(t *testing.T) {
+	f := newPauseFixture(t)
+	f.virt.FailDomainStateReason = func(name string) error {
+		if name == "vm-ha" {
+			return errors.New("injected: libvirtd not answering")
+		}
+		return nil
+	}
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	if failed, _ := corrosion.HostPartitionPauseFailed(context.Background(), f.db, "node-a"); !failed {
+		t.Fatal("an unreadable domain did not raise partition_pause_failed; the majority would count it paused")
+	}
+}
+
+// A suspend that hangs is abandoned at the call timeout — the pass ends in its
+// budget — and is never issued a second time while it is still running.
+//
+// Mutations: no in-flight guard — the second pass calls suspend again and
+// this goes red; no call timeout — the pass blocks past its budget and this
+// goes red.
+func TestPartitionPause_AHungSuspendIsBoundedAndNotRepeated(t *testing.T) {
+	f := newPauseFixture(t)
+	release := make(chan struct{})
+	defer close(release)
+	var calls sync.Mutex
+	n := 0
+	f.virt.FailSuspendDomain = func(string) error {
+		calls.Lock()
+		n++
+		calls.Unlock()
+		<-release
+		return nil
+	}
+	f.loseFor(QuorumNo, PartitionPauseAfter-time.Second)
+	start := time.Now()
+	f.tick() // the pass that pauses
+	if d := time.Since(start); d > PartitionPauseExecBudget {
+		t.Fatalf("a pass with a hung suspend took %v, past the %v budget", d, PartitionPauseExecBudget)
+	}
+	f.advance(time.Second)
+	f.tick() // the next pass, with the first suspend still hung
+	calls.Lock()
+	got := n
+	calls.Unlock()
+	if got != 1 {
+		t.Fatalf("suspend was called %d times while the first call was still running", got)
+	}
+	if failed, _ := corrosion.HostPartitionPauseFailed(context.Background(), f.db, "node-a"); !failed {
+		t.Fatal("a hung suspend did not raise partition_pause_failed")
+	}
+}
+
+// A VM being live-migrated is not paused: its target takes over.
+//
+// Mutation: drop the migrating exclusion — the VM is suspended and this goes
+// red.
+func TestPartitionPause_LeavesAMigratingVMAlone(t *testing.T) {
+	f := newPauseFixture(t)
+	if err := corrosion.UpdateVMState(context.Background(), f.db, "vm-ha", "migrating", ""); err != nil {
+		t.Fatal(err)
+	}
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("a migrating VM is %s", st)
 	}
 }

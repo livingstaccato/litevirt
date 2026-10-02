@@ -2499,6 +2499,12 @@ func (d *Daemon) wireRecoveryClaimGate() {
 	d.db.SetRecoveryClaimGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.RecoveryClaimV1)
 	})
+	// claim_incarnation_v1 (docs/design/recovery-claims.md §10 item 37):
+	// lets a pre-epoch container relocation take the guarded row shape, which
+	// keeps the source's created_at over a stale tombstone on the target.
+	d.db.SetClaimIncarnationGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.ClaimIncarnationV1)
+	})
 }
 
 // voterAdoptionInterval is how often the daemon adopts newly replicated voter

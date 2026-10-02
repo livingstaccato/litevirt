@@ -1157,6 +1157,26 @@ while recovery claims are enforced; the evidence says so. Set
 `enforcement.recovery_claim: false` on every host until it has run, then turn it
 back on.
 
+### A recovery held by a decision made before the claim key changed (`ha.claim.legacy_held`)
+
+Evaluator `recovery_claim`, subject `cluster/claims`, severity warning. Written
+by the leader-lease holder while recovery claims are enforced. After
+`claim_incarnation_v1` latches, a recovery claim names the workload's
+incarnation. A decision some voter accepted at the old, unscoped key for the
+same name and owner epoch may belong to this workload or to an earlier one
+deleted and re-created under its name. Unless the decision's destination shows,
+from its own database, that it is not this workload's and will never run (it
+signs a foreign abandonment), or that destination has been removed for good,
+the claim re-proposes the old decision rather than deciding a second one beside
+it. If the voters then refuse it, for example because it names an earlier
+workload's owner, the recovery waits and this condition names the workload, the
+decision's proof, destination and source, and why it could not be excluded.
+
+While the destination answers, it decides on the next tick. If the destination
+is gone for good, `lv host rm --dead <host>` (after a proof-grade fence)
+releases the decision. See
+[design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external

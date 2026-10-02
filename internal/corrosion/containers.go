@@ -841,8 +841,18 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	// relocation proof carries that epoch and the executor compares it before
 	// recreating, so a target row at 0 (or an eager +1) wedges a legitimate
 	// relocation forever. The +1 mints only at completion.
+	//
+	// Once claim_incarnation_v1 has latched, a pre-epoch source takes the
+	// guarded shape too. The retained upsert's conflict arm revives a stale
+	// same-name tombstone on the target IN PLACE and keeps ITS created_at, so
+	// the relocated container would carry a long-gone container's
+	// incarnation and its next recovery could meet that incarnation's claim
+	// (docs/design/recovery-claims.md §10 item 37). The guarded INSERT OR
+	// REPLACE writes the whole row, created_at included. The token is
+	// replication-gated, so every receiver knows that shape (v44+).
 	var target Statement
-	if old.OwnerEpoch == 0 && old.SpecGeneration == 0 && old.ActiveOperationID == "" {
+	preEpoch := old.OwnerEpoch == 0 && old.SpecGeneration == 0 && old.ActiveOperationID == ""
+	if preEpoch && !c.ClaimIncarnationLatched() {
 		ts, terr := upsertContainerStmt(c, rec)
 		if terr != nil {
 			return terr

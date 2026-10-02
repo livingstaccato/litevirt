@@ -70,9 +70,11 @@ type Spec struct {
 	// everything the legacy key can ever decide. When no promise reports a
 	// value at the scoped key itself, the highest-ballot legacy value is
 	// re-proposed — a recovery decided across the upgrade is completed, not
-	// decided twice — provided AdoptLegacy says its proof can still run. One
-	// that cannot (a spent proof: it ran, or it was a previous incarnation's)
-	// is left behind, and Propose builds a fresh value. Nil adopts nothing.
+	// decided twice — unless AdoptLegacy returns false, which it may do only
+	// for a value PROVEN to be another incarnation's and never to run (the
+	// server asks the value's destination; grpcapi
+	// Server.legacyValueExcluded). Then Propose builds a fresh value. Nil
+	// adopts nothing.
 	AdoptLegacy func(v corrosion.ClaimValue) bool
 }
 

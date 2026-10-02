@@ -13,6 +13,7 @@ package fleet
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -327,12 +328,19 @@ func (preIncarnationGate) DurablyLatched(tok string) bool { return preIncarnatio
 // latched (false) or after (true).
 func latchIncarnation(c *Cluster, latched bool) {
 	for _, n := range c.Nodes {
-		if latched {
-			n.Server.SetGate(claimsGate{})
-		} else {
-			n.Server.SetGate(preIncarnationGate{})
-		}
+		latchIncarnationOn(n, latched)
 	}
+}
+
+// latchIncarnationOn is latchIncarnation for one node: its server's gate, and
+// the corrosion gate the daemon wires to the same durable latch.
+func latchIncarnationOn(n *Node, latched bool) {
+	if latched {
+		n.Server.SetGate(claimsGate{})
+	} else {
+		n.Server.SetGate(preIncarnationGate{})
+	}
+	n.DB.SetClaimIncarnationGate(func() bool { return latched })
 }
 
 // TestFleet_RecoveryClaim_ALegacyDecisionIsCompletedAcrossTheLatch: a
@@ -391,18 +399,41 @@ func TestFleet_RecoveryClaim_ALegacyDecisionIsCompletedAcrossTheLatch(t *testing
 // the lab case across an upgrade. The first VM's recovery was decided at the
 // legacy key before claim_incarnation_v1 latched; the VM was deleted before it
 // ran, re-created on another host at the same epoch, and that host died after
-// the latch. The bridge reports the old decision, which names the first VM's
-// owner, and leaves it behind: the new VM is recovered through a fresh claim.
+// the latch. The bridge reports the old decision; its destination shows from
+// its own database that the proof never started and the new VM is not
+// pending on it, and abandons it; the new VM is recovered through a fresh
+// claim, and the old proof never runs.
 //
-// Mutation: drop the SourceHost condition from AdoptLegacy in
-// DecideRecoveryClaim — the old value is re-proposed, every voter whose row of
-// the new incarnation names its real owner refuses it, and the VM is never
-// recovered.
+// The "exclusion-unavailable" run is the same with the destination unable to
+// answer the exclusion (an older build): ambiguity costs liveness, never a
+// second decision — the old value is re-proposed, the voters refuse it,
+// nothing is minted, and ha.claim.legacy_held names the workload. Once the
+// destination answers, the next tick recovers it.
+//
+// Mutations: make legacyValueExcluded return false — the old value is
+// re-proposed, refused, and the VM is never recovered; make it return true
+// without the destination's word — the blocked run decides a fresh value
+// beside a decision nobody excluded.
 func TestFleet_RecoveryClaim_APreviousIncarnationsLegacyDecisionIsLeftBehind(t *testing.T) {
+	for _, blocked := range []bool{false, true} {
+		t.Run(map[bool]string{false: "excluded", true: "exclusion-unavailable"}[blocked], func(t *testing.T) {
+			runPreviousIncarnationLeftBehind(t, blocked)
+		})
+	}
+}
+
+func runPreviousIncarnationLeftBehind(t *testing.T, blocked bool) {
 	ctx := context.Background()
 	const name = "claimvm"
 	c, cs, clock := incarnationFleet(t, 2564, func(_ *Cluster, a, victim *Node) {
 		insertVM(t, a, name, victim.Name)
+		// a's capacity is full, so no placement picks the coordinator itself:
+		// the decision's destination is a peer, whose exclusion goes over the
+		// wire (and can be refused as an older build would).
+		if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{Name: "full-" + a.Name, HostName: a.Name,
+			Spec: `{}`, State: "running", CPUActual: 64, MemActual: 262144}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
 	})
 	latchIncarnation(c, false)
 	a := c.Nodes[0]
@@ -438,6 +469,24 @@ func TestFleet_RecoveryClaim_APreviousIncarnationsLegacyDecisionIsLeftBehind(t *
 
 	latchIncarnation(c, true)
 	failHost(t, c, clock, dead, second)
+	if blocked {
+		if dest1 == a {
+			t.Fatalf("the scenario needs the first decision's destination to be a peer of the coordinator, got %s", dest1.Name)
+		}
+		restore := dest1.DoNotImplement("AbandonRecoveryProof")
+		clock.Advance(contentionPoll)
+		cs.Tick(ctx, a)
+		if v := vmOn(t, a, name); v.HostName != second.Name || v.PendingActionID != "" {
+			t.Fatalf("a fresh value was decided beside a legacy decision nobody excluded: %+v", v)
+		}
+		a.Server.RecoveryClaimHealthTick(ctx)
+		row, found, err := corrosion.GetHealthCondition(ctx, a.DB, "recovery_claim", "ha.claim.legacy_held", "cluster", "claims")
+		if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved ||
+			!strings.Contains(row.Evidence, name) || !strings.Contains(row.Evidence, firstProof) {
+			t.Fatalf("ha.claim.legacy_held does not name %s and proof %s: found=%v err=%v %+v", name, firstProof, found, err, row)
+		}
+		restore()
+	}
 	clock.Advance(contentionPoll)
 	cs.Tick(ctx, a)
 	vm = vmOn(t, a, name)
@@ -449,6 +498,9 @@ func TestFleet_RecoveryClaim_APreviousIncarnationsLegacyDecisionIsLeftBehind(t *
 		t.Fatalf("read the new proof: ok=%v err=%v", ok, err)
 	}
 	assertFreshIncarnationClaim(t, a, pr.ActionProof, vm.CreatedAt)
+	if ok, _ := dest1.DB.ProofAbandoned(ctx, firstProof); !ok {
+		t.Fatalf("%s decided a fresh value, but %s never abandoned the first decision %s", a.Name, dest1.Name, firstProof)
+	}
 
 	// `lv cluster claim vm/claimvm` tells the two keys apart: the scoped key
 	// decided for the new destination, and the legacy key still holding the
@@ -486,8 +538,10 @@ func TestFleet_RecoveryClaim_APreviousIncarnationsLegacyDecisionIsLeftBehind(t *
 // same incarnation, whose only remaining guard would be the destination's
 // owner-epoch check.
 //
-// Mutation: reject a legacy value whose proof is completed (the pre-review
-// legacyValueMayRun) — the lagging claim decides its own value.
+// Mutations: drop the epoch check from AbandonForeignProof — the destination
+// excludes this incarnation's own completed decision and the lagging claim
+// decides its own value; exclude every legacy value without the
+// destination's word — the same.
 func TestFleet_RecoveryClaim_ACompletedLegacyDecisionIsReAdopted(t *testing.T) {
 	ctx := context.Background()
 	c, a, b, _, d := probeFleet(t, 2565, "vm-done")
@@ -524,5 +578,70 @@ func TestFleet_RecoveryClaim_ACompletedLegacyDecisionIsReAdopted(t *testing.T) {
 	}
 	if out.Ours || out.Value.Proof == nil || out.Value.Proof.ID != decided {
 		t.Fatalf("the lagging claim decided %+v (ours=%v), want the completed legacy decision %s", out.Value.Proof, out.Ours, decided)
+	}
+}
+
+// TestFleet_RecoveryClaim_ASpentDecisionOfAPreviousIncarnationDoesNotWedge:
+// incarnation A was recovered under a legacy claim, and its proof ran and
+// completed. A is deleted and B re-created at once, on the same host, at the
+// same epoch, and that host fails after the latch. The legacy key still holds
+// A's spent decision, and its source is B's owner too, so neither time nor
+// source tells them apart. The destination that ran it does: B is still at
+// the epoch there, so the completion did not move B. It excludes the
+// decision, and B's claim decides afresh instead of re-adopting a proof that
+// can never run again.
+//
+// Mutation: make AbandonForeignProof refuse every completed proof — the
+// spent decision is adopted, and B waits behind it for good.
+func TestFleet_RecoveryClaim_ASpentDecisionOfAPreviousIncarnationDoesNotWedge(t *testing.T) {
+	ctx := context.Background()
+	c, a, b, cc, d := probeFleet(t, 2566, "vm-spent")
+	latchIncarnation(c, false)
+	c.Kill(d)
+	cs := probeCoordinator(c, NewVirtualClock(time.Now().UTC()), a)
+	cs.Tick(ctx, a)
+	vm := vmOn(t, a, "vm-spent")
+	if vm.PendingActionID == "" || vm.HostName == d.Name {
+		t.Fatalf("the legacy claim did not decide: %+v", vm)
+	}
+	spent := vm.PendingActionID
+	dest := c.Node(vm.HostName)
+	alive := []*Node{a, b, cc}
+	c.WaitConverged(t, convergeTimeout, alive...)
+	claimReconciler(t, dest).ReconcileOnce(ctx)
+	c.WaitConverged(t, convergeTimeout, alive...)
+	if pr, ok, _ := corrosion.GetActionProof(ctx, a.DB, spent); !ok || pr.Status != corrosion.ProofCompleted {
+		t.Fatalf("A's decision did not complete: %+v", pr)
+	}
+
+	// A deleted; B re-created on d — dead, as it is about to be again — at
+	// epoch 0.
+	mustDeleteVM(t, dest, "vm-spent")
+	c.WaitConverged(t, convergeTimeout, alive...)
+	insertVM(t, a, "vm-spent", d.Name)
+	c.WaitConverged(t, convergeTimeout, alive...)
+	bRow := vmOn(t, a, "vm-spent")
+	if bRow.OwnerEpoch != 0 {
+		t.Fatalf("B starts at epoch %d; the scenario needs the collision at 0", bRow.OwnerEpoch)
+	}
+
+	latchIncarnation(c, true)
+	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "vm-spent", OwnerEpoch: 0,
+		Incarnation: bRow.CreatedAt}
+	other := a
+	if dest == a {
+		other = b
+	}
+	w := corrosion.ActionProof{ID: "b-recovery", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm-spent", DestHost: other.Name, Coordinator: a.Name, OwnerEpoch: "0"}
+	out, err := a.Server.DecideRecoveryClaim(ctx, key, corrosion.ClaimValue{Proof: &w, SourceHost: d.Name}, 60, nil)
+	if err != nil {
+		t.Fatalf("B's claim: %v", err)
+	}
+	if !out.Ours || out.Value.Proof == nil || out.Value.Proof.ID != w.ID {
+		t.Fatalf("B's claim decided %+v (ours=%v), not a fresh value: A's spent decision wedges it", out.Value.Proof, out.Ours)
+	}
+	if ok, _ := dest.DB.ProofAbandoned(ctx, spent); !ok {
+		t.Fatalf("%s did not record that A's decision %s is excluded", dest.Name, spent)
 	}
 }

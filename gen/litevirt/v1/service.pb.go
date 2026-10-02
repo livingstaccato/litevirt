@@ -19771,10 +19771,16 @@ func (x *RecoveryClaimSupersede) GetAbandonment() string {
 // AbandonRecoveryProofRequest asks a recovery destination to sign that it has
 // not executed, and never will, the proof a decided claim named (§3.12).
 type AbandonRecoveryProofRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           *RecoveryClaimKey      `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	ProofId       string                 `protobuf:"bytes,2,opt,name=proof_id,json=proofId,proto3" json:"proof_id,omitempty"`
-	Reason        string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Key     *RecoveryClaimKey      `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	ProofId string                 `protobuf:"bytes,2,opt,name=proof_id,json=proofId,proto3" json:"proof_id,omitempty"`
+	Reason  string                 `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	// foreign_only: abandon only a proof this destination can show is NOT the
+	// decision of the incarnation key names — the legacy-key bridge's
+	// exclusion (docs/design/recovery-claims.md §10 item 37). Refused
+	// otherwise, so a decision of this incarnation that may still run, or
+	// has run, is never abandoned by it.
+	ForeignOnly   bool `protobuf:"varint,4,opt,name=foreign_only,json=foreignOnly,proto3" json:"foreign_only,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -19828,6 +19834,13 @@ func (x *AbandonRecoveryProofRequest) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *AbandonRecoveryProofRequest) GetForeignOnly() bool {
+	if x != nil {
+		return x.ForeignOnly
+	}
+	return false
 }
 
 type AbandonRecoveryProofResponse struct {
@@ -32112,11 +32125,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x11prior_certificate\x18\x01 \x01(\tR\x10priorCertificate\x12@\n" +
 	"\vprior_value\x18\x02 \x01(\v2\x1f.litevirt.v1.RecoveryClaimValueR\n" +
 	"priorValue\x12 \n" +
-	"\vabandonment\x18\x03 \x01(\tR\vabandonment\"\x81\x01\n" +
+	"\vabandonment\x18\x03 \x01(\tR\vabandonment\"\xa4\x01\n" +
 	"\x1bAbandonRecoveryProofRequest\x12/\n" +
 	"\x03key\x18\x01 \x01(\v2\x1d.litevirt.v1.RecoveryClaimKeyR\x03key\x12\x19\n" +
 	"\bproof_id\x18\x02 \x01(\tR\aproofId\x12\x16\n" +
-	"\x06reason\x18\x03 \x01(\tR\x06reason\"@\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12!\n" +
+	"\fforeign_only\x18\x04 \x01(\bR\vforeignOnly\"@\n" +
 	"\x1cAbandonRecoveryProofResponse\x12 \n" +
 	"\vabandonment\x18\x01 \x01(\tR\vabandonment\"0\n" +
 	"\x1aPlanDeadHostRemovalRequest\x12\x12\n" +

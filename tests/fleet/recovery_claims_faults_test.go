@@ -83,13 +83,8 @@ func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, s
 	vm := fmt.Sprintf("vm-cf-%s-%d", kind, seed)
 	clock := NewVirtualClock(time.Now().UTC())
 	c, a, b, victim := claimFleet(t, clock, seed, vm)
-	for n, latched := range map[*Node]bool{a: latchA, b: latchB} {
-		if latched {
-			n.Server.SetGate(claimsGate{})
-		} else {
-			n.Server.SetGate(preIncarnationGate{})
-		}
-	}
+	latchIncarnationOn(a, latchA)
+	latchIncarnationOn(b, latchB)
 	ledger := watchClaims(t, c)
 
 	// The decision window: no replication between the coordinators, and

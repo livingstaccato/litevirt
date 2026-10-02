@@ -1832,12 +1832,16 @@ where it described the mechanism; this list records what changed and why.
     destination for good, the source row already tombstoned, and the
     container's next recovery would have had a fresh key past a stranded
     decision. It now keeps the source's `created_at`, as the runtime re-key
-    already did (`RekeyContainerOwnerGuarded`). The pre-epoch upsert shape
-    still keeps the created_at of a stale same-name tombstone on the target
-    (its conflict arm cannot change without a new statement shape), so the
-    destination also accepts the row that carries the decision's relocation
-    token: the token is random per decision and digested into the certified
-    value, so that row was written by this decision and nothing else. The VM
+    already did (`RekeyContainerOwnerGuarded`). Before the latch a pre-epoch
+    source still takes the retained upsert, whose conflict arm revives a
+    stale same-name tombstone on the target and keeps ITS created_at; after
+    the latch it takes the guarded `INSERT OR REPLACE` shape, which writes the
+    source's (both shapes predate this item, and the latch is
+    replication-gated, so every receiver knows it). The destination also
+    accepts the row that carries the decision's relocation token, which covers
+    a relocation made before the latch: the token is random per decision and
+    digested into the certified value, so that row was written by this
+    decision and nothing else. The VM
     UUID in the spec was the other candidate; a container has none, and the
     claim must cover both. A row with an empty `created_at` cannot occur
     through any writer (both columns are `NOT NULL`, and every writer stamps
@@ -1900,26 +1904,43 @@ where it described the mechanism; this list records what changed and why.
       highest-ballot legacy value (`claims.Spec.AdoptLegacy`), and a voter
       that accepted it at the legacy key re-accepts it without probing again
       (§3.15), though still cross-checking its source against its row of this
-      incarnation. The coordinator adopts a legacy value only if it is this
-      incarnation's decision. It must name the owner this incarnation is
-      leaving, since one incarnation has one owner at one epoch, and its proof
-      must not have been minted before this incarnation existed
-      (`Server.legacyValueIsThisIncarnation`): a proof minted more than the
-      tolerated clock skew (`hlc.MaxSkewMS`) before the row's `created_at`
-      was a previous incarnation's, run or still pending, and is left behind.
-      Anything else is adopted whatever its status, which is the legacy key's
-      own rule: this incarnation's completed decision is re-adopted, so a
-      coordinator still reading the epoch it left completes a no-op and never
-      decides a second value. A proof the replica has not seen is adopted for
-      the same reason. The skew margin is spent on the safe side: misreading
-      this incarnation's decision as a previous one's would decide a second
-      value, while misreading a previous one's still-pending decision as this
-      one's re-decides it for this incarnation, as the legacy key did. Pending
-      proofs are not retired when their workload is deleted: retiring needs a
-      new replicated statement shape, and it could not mark the proofs minted
-      before the upgrade that the bridge exists for. A recovery decided across
-      the upgrade is completed, not decided twice; the lab's stale value is
-      left behind.
+      incarnation. The proposer re-proposes the legacy value unless it is
+      PROVEN to be another incarnation's and never to run
+      (`Server.legacyValueExcluded`), and it is never decided beside one that
+      is not. Proof comes from the one host that could execute the value, its
+      destination, reading its own database
+      (`corrosion.AbandonForeignProof`, asked for over `AbandonRecoveryProof`
+      with `foreign_only`): it ran or failed the proof while this incarnation
+      stayed at the epoch (a VM proof completes in one local batch with its
+      row's epoch bump, and a relocated container's row carries the token
+      its relocation wrote), or the proof never started and this
+      incarnation is not pending on it. It then records the proof as
+      abandoned and signs, and never runs it. A destination removed for good
+      (`lv host rm --dead`) counts too: it can run nothing. Neither wall
+      clocks nor sources take part. An earlier revision attributed a legacy
+      value by its proof's mint time against the row's `created_at`, with a
+      clock-skew margin, and by its source; both failed unsafe. A creator
+      clock more than the margin ahead made this incarnation's own decision
+      look like a previous one's, so a second value was decided beside a
+      legacy certificate that still verified. A stranded decision names its
+      dead destination, not the owner the next claim leaves, so a mismatched
+      source is no proof either. Whatever the destination cannot show — it
+      is unreachable, an older build, or holds no row of the proof — the
+      value is adopted, as the legacy key itself did: ambiguity costs
+      liveness, never a second decision. If its voters then refuse it, the
+      recovery waits, and `ha.claim.legacy_held` names the workload, the
+      decision and why it could not be excluded. While the destination
+      answers, the next tick decides; if it is gone for good,
+      `lv host rm --dead` releases it. This incarnation's completed decision
+      is never excluded (its row is past the epoch at its destination), so a
+      coordinator still reading the epoch it left completes a no-op. A
+      previous incarnation's spent decision is excluded rather than adopted,
+      so it cannot hold the new workload's recovery for good. Pending proofs
+      are not retired when their workload is deleted: retiring needs a new
+      replicated statement shape, and could not mark the proofs minted before
+      the upgrade that the bridge exists for. The exclusion does that work
+      when it is needed. A recovery decided across the upgrade is completed,
+      not decided twice; the lab's stale value is left behind.
     - **Schema bump: yes, v63**, one additive node-local table. No
       replicated statement shape changes: the certificate column is the same
       TEXT, and the ledger is untouched.

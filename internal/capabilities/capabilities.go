@@ -251,8 +251,9 @@ const (
 	// Crossing the latch is safe for a recovery claimed on both sides of it:
 	// a voter's promise at the incarnation-scoped key reports what it accepted
 	// at the legacy key and seals that key against every later legacy
-	// Prepare and Accept, and the proposer re-proposes a legacy value whose
-	// proof can still run (claims.Spec.AdoptLegacy).
+	// Prepare and Accept, and the proposer re-proposes a legacy value unless
+	// its destination proves it is another incarnation's and will never run
+	// (claims.Spec.AdoptLegacy, grpcapi Server.legacyValueExcluded).
 	ClaimIncarnationV1 = "claim_incarnation_v1"
 
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims

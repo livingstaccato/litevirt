@@ -34,6 +34,17 @@ func (c *Client) MayEmitClaimCertificate() bool {
 	return fn != nil && *fn != nil && (*fn)()
 }
 
+// SetClaimIncarnationGate injects the predicate that claim_incarnation_v1
+// has durably latched here, wired at daemon start. Unset, it reads false.
+func (c *Client) SetClaimIncarnationGate(fn func() bool) { c.claimIncarnationGate.Store(&fn) }
+
+// ClaimIncarnationLatched reports whether claim_incarnation_v1 has durably
+// latched on this node (SetClaimIncarnationGate).
+func (c *Client) ClaimIncarnationLatched() bool {
+	fn := c.claimIncarnationGate.Load()
+	return fn != nil && *fn != nil && (*fn)()
+}
+
 // ErrClaimCertificateNotEmittable means a proof carries a certificate this
 // node may not yet write (recovery_claim_v1 has not latched here). Retryable:
 // the latch forms from the same peer set the coordinator's did.
@@ -162,17 +173,6 @@ func WorkloadIncarnation(ctx context.Context, c *Client, kind, name string) (str
 		return "", false, err
 	}
 	return IncarnationOf(rows[0].String("created_at")), true, nil
-}
-
-// ProofMintedMs is when this replica's row of proof id was minted, in Unix
-// milliseconds, whether its created_at is a wall stamp or an HLC one (the
-// stamp NowTS writes). ok is false when the replica holds no row of it.
-func ProofMintedMs(ctx context.Context, c *Client, id string) (int64, bool, error) {
-	rows, err := c.Query(ctx, `SELECT `+tsMsSQL("created_at")+` AS minted_ms FROM runtime_action_proofs WHERE id = ?`, id)
-	if err != nil || len(rows) == 0 {
-		return 0, false, err
-	}
-	return rows[0].Int64("minted_ms"), true, nil
 }
 
 // certificateIncarnationIsLive is the destination's half of the incarnation

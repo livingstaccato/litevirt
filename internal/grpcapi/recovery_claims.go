@@ -16,7 +16,6 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // Recovery-claim voter RPCs and the proposer's transport
@@ -41,7 +40,9 @@ type claimRuntime struct {
 	proposer *claims.Proposer
 
 	refusals map[corrosion.ClaimKey][2]string
-	probe    ownerProbeCache
+	// legacyHeld is ha.claim.legacy_held's source (noteLegacyHeld).
+	legacyHeld map[corrosion.ClaimKey][2]string // line, destination
+	probe      ownerProbeCache
 	// observer sees every vote this voter casts (SetClaimVoteObserverForTest).
 	observer func(ClaimVote)
 }
@@ -605,16 +606,58 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 		Supersede:  ev,
 	}
 	if key.Incarnation != "" {
-		// A legacy value is this incarnation's only if it names the owner
-		// this proposal is leaving: one incarnation has one owner at one
-		// epoch. A value naming another source is a previous incarnation's
-		// decision at the same (name, epoch), the collision the scoped key
-		// leaves behind.
 		spec.AdoptLegacy = func(v corrosion.ClaimValue) bool {
-			return v.SourceHost == proposal.SourceHost && s.legacyValueIsThisIncarnation(ctx, v, key.Incarnation)
+			excluded, why := s.legacyValueExcluded(ctx, key, v)
+			if !excluded {
+				s.noteLegacyHeld(key, v, why)
+			}
+			return !excluded
 		}
 	}
-	return s.claimProposer().Decide(ctx, spec)
+	out, err := s.claimProposer().Decide(ctx, spec)
+	if err == nil {
+		s.clearLegacyHeld(key)
+	}
+	return out, err
+}
+
+// noteLegacyHeld records that key's claim re-proposed a legacy value it could
+// not exclude (legacyValueExcluded), for ha.claim.legacy_held. Cleared when the
+// key decides.
+func (s *Server) noteLegacyHeld(key corrosion.ClaimKey, v corrosion.ClaimValue, why string) {
+	c := &s.claims
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.legacyHeld == nil {
+		c.legacyHeld = map[corrosion.ClaimKey][2]string{}
+	}
+	c.legacyHeld[key] = [2]string{fmt.Sprintf("%s/%s: its claim %s carries a decision made before claim_incarnation_v1 latched "+
+		"(proof %s, %s to %s, source %s) that cannot be shown to be another incarnation's (%s). If %s is gone for good, "+
+		"`lv host rm --dead %s` releases it; while %s answers, it decides.", key.TargetKind, key.TargetName, key,
+		v.Proof.ID, v.Proof.Action, v.Proof.DestHost, v.SourceHost, why, v.Proof.DestHost, v.Proof.DestHost, v.Proof.DestHost),
+		v.Proof.DestHost}
+}
+
+func (s *Server) clearLegacyHeld(key corrosion.ClaimKey) {
+	c := &s.claims
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.legacyHeld, key)
+}
+
+// legacyHeldLines is ha.claim.legacy_held's text, one line per workload, and
+// the destinations of the decisions that hold them.
+func (s *Server) legacyHeldLines() (map[string]string, []string) {
+	c := &s.claims
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := map[string]string{}
+	var dests []string
+	for k, held := range c.legacyHeld {
+		out[k.TargetKind+"/"+k.TargetName] = held[0]
+		dests = append(dests, held[1])
+	}
+	return out, dests
 }
 
 // IncarnationScopedClaims reports whether workload claims are keyed by
@@ -637,34 +680,56 @@ func (s *Server) ClaimKeyFor(ctx context.Context, kind, name string, epoch int64
 	return key
 }
 
-// legacyValueIsThisIncarnation is the bridge's attribution of a value a voter
-// accepted at the LEGACY form of an incarnation-scoped key
-// (claims.Spec.AdoptLegacy, §10 item 37): is it this incarnation's decision?
-// The proof binds no incarnation, so it is attributed by when it was minted.
-// A proof minted before this incarnation's created_at, by more than the clock
-// skew the cluster tolerates (hlc.MaxSkewMS), decided for a previous
-// incarnation of the name and is left behind, run or not. Anything else is
-// this incarnation's and is adopted WHATEVER its status — the legacy key's
-// own rule: a completed one is re-adopted, so a coordinator still reading the
-// epoch it left completes a no-op instead of deciding a second value. A proof
-// this replica has not seen yet is adopted for the same reason.
+// claimExclusionTimeout bounds the bridge's request for a destination's
+// foreign abandonment (legacyValueExcluded).
+const claimExclusionTimeout = 2 * time.Second
+
+// legacyValueExcluded is the bridge's test for a value a voter accepted at the
+// LEGACY form of an incarnation-scoped key (claims.Spec.AdoptLegacy, §10
+// item 37): is it PROVEN that this value will never execute and is not this
+// incarnation's decision? Only then may the proposer decide a fresh value
+// beside it. Proof comes from the value's destination, the one host that can
+// execute it:
 //
-// The skew margin is spent on the side that fails safe. Taking this
-// incarnation's decision for a previous one's would decide a second value for
-// one recovery; taking a previous incarnation's for this one's re-decides,
-// for this incarnation, a recovery that has not run — what the legacy key
-// itself did.
-func (s *Server) legacyValueIsThisIncarnation(ctx context.Context, v corrosion.ClaimValue, incarnation string) bool {
-	if v.Proof == nil || v.Proof.ID == "" {
-		return false
+//   - it signs a foreign abandonment (corrosion.AbandonForeignProof), shown
+//     from its own database: it ran or failed the proof while this
+//     incarnation stayed at the epoch, or the proof never started and this
+//     incarnation is not pending on it; or
+//   - it has been removed for good (corrosion.RemovedHostEvidence): fenced
+//     proof-grade, no live hosts row, revoked, so it can execute nothing.
+//
+// Anything short of that — the destination unreachable, refusing, or unable
+// to show it — and the value is ADOPTED, as the legacy key itself would have
+// done: ambiguity costs liveness, never a second decision. Wall clocks play no
+// part. A value adopted this way that its voters then refuse is reported by
+// ha.claim.legacy_held, naming the workload, the decision and the way out.
+func (s *Server) legacyValueExcluded(ctx context.Context, key corrosion.ClaimKey, v corrosion.ClaimValue) (bool, string) {
+	if v.Proof == nil || v.Proof.ID == "" || v.Proof.DestHost == "" {
+		return false, "the legacy value names no proof or destination"
 	}
-	created, err := time.Parse(time.RFC3339Nano, incarnation)
+	dest := v.Proof.DestHost
+	if err := corrosion.RemovedHostEvidence(ctx, s.db, s.pkiDir, dest); err == nil {
+		return true, ""
+	}
+	// Bounded: it runs inside the claim's phase 1, whose deadline is the
+	// whole claim's.
+	ctx, cancel := context.WithTimeout(ctx, claimExclusionTimeout)
+	defer cancel()
+	enc, err := s.requestAbandonment(ctx, dest, key, v.Proof.ID,
+		"a decision at the legacy key that is not "+key.String()+"'s (claim_incarnation_v1 bridge)", true)
 	if err != nil {
-		return true // cannot tell: adopt, as the legacy key would have
+		return false, fmt.Sprintf("%s did not show proof %s is not this incarnation's: %v", dest, v.Proof.ID, err)
 	}
-	minted, ok, err := corrosion.ProofMintedMs(ctx, s.db, v.Proof.ID)
-	if err != nil || !ok {
-		return true
+	ab, err := corrosion.DecodeClaimAbandonment(enc)
+	if err != nil {
+		return false, err.Error()
 	}
-	return minted >= created.UnixMilli()-hlc.MaxSkewMS
+	_, verifier, err := s.claimIdentity()
+	if err != nil {
+		return false, err.Error()
+	}
+	if err := verifier.VerifyAbandonment(ab, dest, v.Proof.ID, key); err != nil {
+		return false, fmt.Sprintf("%s's exclusion of proof %s does not verify: %v", dest, v.Proof.ID, err)
+	}
+	return true, ""
 }

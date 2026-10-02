@@ -94,3 +94,49 @@ func TestVerifyClaimCertificate_ARelocatedContainerIsBoundByItsToken(t *testing.
 		t.Fatalf("the row this relocation wrote refused its certificate: %v", err)
 	}
 }
+
+// TestRelocateContainerWithToken_OverAStaleTombstone: a pre-epoch relocation
+// onto a target that holds a stale tombstone of the same name. The retained
+// upsert revives that tombstone in place and keeps ITS created_at — another
+// container's incarnation. Once claim_incarnation_v1 has latched the
+// relocation takes the guarded shape, which writes the source's.
+//
+// Mutation: keep the retained upsert after the latch (drop the
+// ClaimIncarnationLatched condition) — the relocated row carries the
+// tombstone's incarnation.
+func TestRelocateContainerWithToken_OverAStaleTombstone(t *testing.T) {
+	ctx := context.Background()
+	for _, latched := range []bool{false, true} {
+		c := newTestDB(t)
+		c.SetClaimIncarnationGate(func() bool { return latched })
+		// A different container of the same name lived on host-b, and was
+		// deleted, AFTER this one was created.
+		seedRelocatableContainer(t, c, "host-a", "web", false)
+		src, _ := GetContainer(ctx, c, "host-a", "web")
+		if err := UpsertContainer(ctx, c, ContainerRecord{HostName: "host-b", Name: "web", State: "running",
+			Image: "alpine", CreatedAt: "2099-01-01T00:00:00Z"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := DeleteContainer(ctx, c, "host-b", "web"); err != nil {
+			t.Fatal(err)
+		}
+		if err := RelocateContainerWithToken(ctx, c, "host-a", "web", "host-b", "tok"); err != nil {
+			t.Fatal(err)
+		}
+		dst, err := GetContainer(ctx, c, "host-b", "web")
+		if err != nil || dst == nil {
+			t.Fatalf("latched=%v: target: %v %+v", latched, err, dst)
+		}
+		switch {
+		case latched && dst.CreatedAt != src.CreatedAt:
+			t.Errorf("after the latch the relocated row is incarnation %q, the source was %q", dst.CreatedAt, src.CreatedAt)
+		case !latched && dst.CreatedAt != "2099-01-01T00:00:00Z":
+			// Before the latch the retained shape is kept for older
+			// receivers; the relocation token binds its destination.
+			t.Errorf("before the latch the retained upsert changed behaviour: %q", dst.CreatedAt)
+		}
+		if dst.RelocateToken != "tok" || dst.State != "pending" {
+			t.Errorf("latched=%v: the relocated row is %+v", latched, dst)
+		}
+	}
+}

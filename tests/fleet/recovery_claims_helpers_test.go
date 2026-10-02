@@ -56,6 +56,7 @@ func enableRecoveryClaims(t *testing.T, c *Cluster, nodes ...*Node) {
 	}
 	for _, n := range nodes {
 		n.DB.SetRecoveryClaimGate(func() bool { return true })
+		n.DB.SetClaimIncarnationGate(func() bool { return true })
 		n.Server.SetRecoveryClaimEnforce(true)
 		n.Server.SetGate(claimsGate{})
 		if !n.Server.RecoveryClaimEnforced(context.Background()) {

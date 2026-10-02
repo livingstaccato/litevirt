@@ -1883,6 +1883,12 @@ message AbandonRecoveryProofRequest {
     RecoveryClaimKey key = 1;
     string proof_id      = 2;
     string reason        = 3;
+    // foreign_only: abandon only a proof this destination can show is NOT the
+    // decision of the incarnation key names — the legacy-key bridge's
+    // exclusion (docs/design/recovery-claims.md §10 item 37). Refused
+    // otherwise, so a decision of this incarnation that may still run, or
+    // has run, is never abandoned by it.
+    bool foreign_only    = 4;
 }
 message AbandonRecoveryProofResponse {
     string abandonment = 1;  // JSON corrosion.ClaimAbandonment

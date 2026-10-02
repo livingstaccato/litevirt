@@ -140,20 +140,22 @@ func AutoPromoteEnrolled(ctx context.Context, c *Client) (map[string]bool, error
 	return out, nil
 }
 
-// CertifiedTransferProofs lists the live ownership-transfer proofs (reschedule,
+// CertifiedTransferProofs lists the ownership-transfer proofs (reschedule,
 // promote, relocate) for (kind, name) that carry a recovery-claim certificate,
-// in id order. It verifies nothing: Layer 3 of partition pause verifies each
+// in id order — TOMBSTONED ones included: ReapSpentProofs tombstones a spent
+// proof after a day, and its certificate still proves what a majority decided,
+// which is all Layer 3 reads it for. It verifies nothing: Layer 3 verifies each
 // certificate before it acts on one (docs/design/partition-pause.md §6).
 func CertifiedTransferProofs(ctx context.Context, c *Client, kind, name string) ([]ProofRecord, error) {
 	rows, err := c.Query(ctx, `SELECT id FROM runtime_action_proofs
-		WHERE deleted_at IS NULL AND target_kind = ? AND target_name = ? AND claim_certificate != ''
+		WHERE target_kind = ? AND target_name = ? AND claim_certificate != ''
 		ORDER BY id`, kind, name)
 	if err != nil {
 		return nil, err
 	}
 	var out []ProofRecord
 	for _, r := range rows {
-		pr, ok, err := GetActionProof(ctx, c, r.String("id"))
+		pr, ok, err := getActionProof(ctx, c, r.String("id"), true)
 		if err != nil {
 			return nil, err
 		}

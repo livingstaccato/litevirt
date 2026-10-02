@@ -22,6 +22,8 @@ type settleFixture struct {
 	proof   corrosion.ProofRecord
 	cert    corrosion.ClaimCertificate
 	certErr error
+	// destState is what the destination reports for vm-a in its own libvirt.
+	destState string
 }
 
 func newSettleFixture(t *testing.T) *settleFixture {
@@ -49,7 +51,7 @@ func newSettleFixture(t *testing.T) *settleFixture {
 	f.virt.SetState("vm-a", libvirtfake.StateRunning)
 	f.proof = corrosion.ProofRecord{ActionProof: corrosion.ActionProof{ID: "proof-1", Action: corrosion.ActionReschedule,
 		TargetKind: corrosion.ClaimKindVM, TargetName: "vm-a", DestHost: "node-b", OwnerEpoch: "3",
-		ClaimCertificate: "{}"}}
+		ClaimCertificate: "{}"}, Status: corrosion.ProofCompleted, ExecutorHost: "node-b"}
 	f.cert = corrosion.ClaimCertificate{Key: corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: "vm-a",
 		OwnerEpoch: 3, Incarnation: inc}, ConfigGeneration: 1}
 	// The local copy, as this host's pause recorded it.
@@ -61,6 +63,13 @@ func newSettleFixture(t *testing.T) *settleFixture {
 	f.r.settleProofs = func(context.Context, *corrosion.Client, string, string) ([]corrosion.ProofRecord, error) {
 		return []corrosion.ProofRecord{f.proof}, nil
 	}
+	f.destState = RuntimeRunning
+	f.r.SetPeerRuntimeChecker(func(_ context.Context, host, name string) (string, error) {
+		if host != "node-b" || name != "vm-a" {
+			return RuntimeAbsent, nil
+		}
+		return f.destState, nil
+	})
 	f.r.SetSettleVerifier(func(_ context.Context, p corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
 		// A real verifier returns the decoded certificate with its error.
 		return f.cert, f.certErr
@@ -162,6 +171,20 @@ func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 			}
 		}},
 		{"proof for a third host", func(f *settleFixture) { f.proof.DestHost = "node-c" }},
+		// A decided claim is not a running replacement: the proof may still be
+		// prepared (the destination has not started it), have failed, or have
+		// been executed by someone other than its destination. Settling then
+		// would stop the ONLY running copy.
+		{"proof prepared, not executed", func(f *settleFixture) { f.proof.Status = corrosion.ProofPrepared; f.proof.ExecutorHost = "" }},
+		{"proof failed", func(f *settleFixture) { f.proof.Status = corrosion.ProofFailed }},
+		{"proof executed by another host", func(f *settleFixture) { f.proof.ExecutorHost = "node-c" }},
+		{"destination does not run it", func(f *settleFixture) { f.destState = RuntimeDefinedStopped }},
+		{"destination unreachable", func(f *settleFixture) {
+			f.r.SetPeerRuntimeChecker(func(context.Context, string, string) (string, error) {
+				return "", errors.New("unreachable")
+			})
+		}},
+		{"no destination runtime check wired", func(f *settleFixture) { f.r.SetPeerRuntimeChecker(nil) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSettleFixture(t)

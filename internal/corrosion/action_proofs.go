@@ -460,12 +460,22 @@ func proofInsertParams(p ActionProof, now string) []interface{} {
 
 // GetActionProof reads a proof by id. ok=false if absent.
 func GetActionProof(ctx context.Context, c *Client, id string) (ProofRecord, bool, error) {
+	return getActionProof(ctx, c, id, false)
+}
+
+// getActionProof is GetActionProof that, with tombstoned, also reads a proof
+// ReapSpentProofs has tombstoned.
+func getActionProof(ctx context.Context, c *Client, id string, tombstoned bool) (ProofRecord, bool, error) {
+	live := " AND deleted_at IS NULL"
+	if tombstoned {
+		live = ""
+	}
 	rows, err := c.Query(ctx,
 		`SELECT id, action, target_kind, target_name, dest_host, coordinator,
 		        lease_holder, lease_expires_at, quorum_live, quorum_needed,
 		        owner_epoch, fence_epoch, relocation_token, lease_term, lease_key, claim_certificate,
 		        status, step_state, result_code, result_detail, executor_host
-		   FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NULL`, id)
+		   FROM runtime_action_proofs WHERE id = ?`+live, id)
 	if err != nil {
 		return ProofRecord{}, false, err
 	}

@@ -77,7 +77,8 @@ func (r *Reconciler) localVMIdentity(name string) localCopyID {
 // It returns the proof and certificate that authorise stopping the local copy,
 // or why there is none.
 func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proofs []corrosion.ProofRecord,
-	verify func(corrosion.ActionProof) (corrosion.ClaimCertificate, error)) (corrosion.ProofRecord, corrosion.ClaimCertificate, string) {
+	verify func(corrosion.ActionProof) (corrosion.ClaimCertificate, error),
+	destRuns func(dest string) (bool, string)) (corrosion.ProofRecord, corrosion.ClaimCertificate, string) {
 	none := corrosion.ProofRecord{}
 	switch {
 	case row == nil || row.HostName == "" || row.HostName == self:
@@ -90,10 +91,19 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 		return none, corrosion.ClaimCertificate{}, "the row is another incarnation of the name"
 	case verify == nil:
 		return none, corrosion.ClaimCertificate{}, "no certificate verifier"
+	case destRuns == nil:
+		return none, corrosion.ClaimCertificate{}, "no destination runtime check"
 	}
 	why := fmt.Sprintf("no verified recovery-claim certificate gives this incarnation to %s at owner epoch >= %d", row.HostName, local.Epoch)
 	for _, p := range proofs {
 		if p.TargetKind != corrosion.ClaimKindVM || p.TargetName != row.Name || p.DestHost != row.HostName || p.DestHost == self {
+			continue
+		}
+		// A decided claim is not yet a running replacement: the proof must
+		// have been EXECUTED, by its destination. A prepared or failed one
+		// leaves the local copy the only one running.
+		if why2, ok := proofExecutedByDest(p); !ok {
+			why = why2
 			continue
 		}
 		cert, err := verify(p.ActionProof)
@@ -113,9 +123,49 @@ func settleDecide(self string, row *corrosion.VMRecord, local localCopyID, proof
 				p.ID, cert.Key.OwnerEpoch, local.Epoch)
 			continue
 		}
+		// And the replacement must be running there NOW, by the destination's
+		// own runtime, not by any row: the last line before stopping what may
+		// otherwise be the only copy.
+		if ok, rwhy := destRuns(p.DestHost); !ok {
+			why = "proof " + p.ID + ": " + rwhy
+			continue
+		}
 		return p, cert, ""
 	}
 	return none, corrosion.ClaimCertificate{}, why
+}
+
+// proofExecutedByDest reports whether p completed, executed by its own
+// destination.
+func proofExecutedByDest(p corrosion.ProofRecord) (string, bool) {
+	if p.Status != corrosion.ProofCompleted {
+		return fmt.Sprintf("proof %s is %s, not completed: no replacement is known to run", p.ID, p.Status), false
+	}
+	if p.ExecutorHost != p.DestHost {
+		return fmt.Sprintf("proof %s was executed by %q, not its destination %s", p.ID, p.ExecutorHost, p.DestHost), false
+	}
+	return "", true
+}
+
+// destRunsVia asks dest's own runtime whether it runs name, through check
+// (the peer runtime inventory). nil, an error or any answer but running is
+// "no".
+func destRunsVia(ctx context.Context, check func(ctx context.Context, host, name string) (string, error), name string) func(string) (bool, string) {
+	if check == nil {
+		return nil
+	}
+	return func(dest string) (bool, string) {
+		pctx, cancel := context.WithTimeout(ctx, peerRuntimeProbeTimeout)
+		defer cancel()
+		state, err := check(pctx, dest, name)
+		if err != nil {
+			return false, "destination " + dest + " unreachable: " + err.Error()
+		}
+		if state != RuntimeRunning {
+			return false, "destination " + dest + " reports it " + state + ", not running"
+		}
+		return true, ""
+	}
 }
 
 // settleCertifiedMove stops domName's local copy when a certified claim gave
@@ -135,7 +185,7 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	}
 	p, cert, why := settleDecide(r.hostName, vm, local, proofs, func(ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
 		return r.settleVerify(ctx, ap)
-	})
+	}, destRunsVia(ctx, r.checkPeerRuntime, domName))
 	if why != "" {
 		return false, why
 	}
@@ -217,7 +267,7 @@ func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) 
 	}
 	pr, cert, why := settleDecideContainer(p.host, dest, rec, proofs, func(ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
 		return p.settle(ctx, ap)
-	})
+	}, destRunsVia(ctx, p.peerRuntime, rec.Name))
 	if why != "" {
 		return false, why
 	}
@@ -255,10 +305,18 @@ func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) 
 // settleDecideContainer is settleDecide for a container: the record is the
 // local copy's identity.
 func settleDecideContainer(self, dest string, rec PauseRecord, proofs []corrosion.ProofRecord,
-	verify func(corrosion.ActionProof) (corrosion.ClaimCertificate, error)) (corrosion.ProofRecord, corrosion.ClaimCertificate, string) {
+	verify func(corrosion.ActionProof) (corrosion.ClaimCertificate, error),
+	destRuns func(dest string) (bool, string)) (corrosion.ProofRecord, corrosion.ClaimCertificate, string) {
+	if destRuns == nil {
+		return corrosion.ProofRecord{}, corrosion.ClaimCertificate{}, "no destination runtime check"
+	}
 	why := fmt.Sprintf("no verified recovery-claim certificate relocates this incarnation to %s at owner epoch >= %d", dest, rec.OwnerEpoch)
 	for _, pr := range proofs {
 		if pr.TargetKind != corrosion.ClaimKindContainer || pr.TargetName != rec.Name || pr.DestHost != dest || dest == self {
+			continue
+		}
+		if why2, ok := proofExecutedByDest(pr); !ok {
+			why = why2
 			continue
 		}
 		cert, err := verify(pr.ActionProof)
@@ -275,6 +333,10 @@ func settleDecideContainer(self, dest string, rec PauseRecord, proofs []corrosio
 		}
 		if cert.Key.OwnerEpoch < rec.OwnerEpoch {
 			why = fmt.Sprintf("proof %s's certificate decides owner epoch %d, older than the local copy's %d", pr.ID, cert.Key.OwnerEpoch, rec.OwnerEpoch)
+			continue
+		}
+		if ok, rwhy := destRuns(pr.DestHost); !ok {
+			why = "proof " + pr.ID + ": " + rwhy
 			continue
 		}
 		return pr, cert, ""

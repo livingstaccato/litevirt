@@ -186,6 +186,9 @@ type PartitionPauser struct {
 	cts     lxc.Runtime
 	confirm ResumeConfirmer
 	settle  SettleVerifier
+	// peerRuntime asks a peer's own LXC runtime about a container
+	// (grpcapi.Server.CheckPeerContainerRuntime), for container settle.
+	peerRuntime func(ctx context.Context, host, name string) (string, error)
 	// settleProofs replaces corrosion.CertifiedTransferProofs (tests).
 	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	armed        func() bool
@@ -241,6 +244,13 @@ func (p *PartitionPauser) SetResumeConfirmer(fn ResumeConfirmer) { p.confirm = f
 // a container this host paused — whose record holds the incarnation and epoch
 // — can be settled. nil settles nothing.
 func (p *PartitionPauser) SetSettleVerifier(fn SettleVerifier) { p.settle = fn }
+
+// SetPeerRuntimeChecker wires the peer runtime check container settle needs:
+// the destination must itself report the container running before the local
+// copy is stopped. nil settles nothing.
+func (p *PartitionPauser) SetPeerRuntimeChecker(fn func(ctx context.Context, host, name string) (string, error)) {
+	p.peerRuntime = fn
+}
 
 // SetSelfFence wires the watchdog backstop for a pause that fails: armed
 // reports a VERIFIED hardware watchdog, fence trips it. Either nil disables it.

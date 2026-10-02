@@ -161,10 +161,12 @@ func TestPartitionPause_SettlesARelocatedContainer(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		certErr error
+		status  string
 		want    string
 	}{
-		{"verified", nil, "stopped"},
-		{"unverified", errors.New("too few valid accepts"), "frozen"},
+		{"verified", nil, "", "stopped"},
+		{"unverified", errors.New("too few valid accepts"), "", "frozen"},
+		{"prepared proof", nil, corrosion.ProofPrepared, "frozen"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, rt := newContainerPauseFixture(t)
@@ -179,7 +181,16 @@ func TestPartitionPause_SettlesARelocatedContainer(t *testing.T) {
 			}
 			proof := corrosion.ProofRecord{ActionProof: corrosion.ActionProof{ID: "reloc-1", Action: corrosion.ActionRelocate,
 				TargetKind: corrosion.ClaimKindContainer, TargetName: "ct-ha", DestHost: "node-b", OwnerEpoch: "0",
-				ClaimCertificate: "{}"}}
+				ClaimCertificate: "{}"}, Status: corrosion.ProofCompleted, ExecutorHost: "node-b"}
+			if tc.status != "" {
+				proof.Status = tc.status
+			}
+			f.p.SetPeerRuntimeChecker(func(_ context.Context, host, name string) (string, error) {
+				if host == "node-b" && name == "ct-ha" {
+					return RuntimeRunning, nil
+				}
+				return RuntimeAbsent, nil
+			})
 			cert := corrosion.ClaimCertificate{Key: corrosion.ClaimKey{TargetKind: corrosion.ClaimKindContainer,
 				TargetName: "ct-ha", OwnerEpoch: recs[0].OwnerEpoch, Incarnation: recs[0].Incarnation}, ConfigGeneration: 1}
 			f.p.settleProofs = func(context.Context, *corrosion.Client, string, string) ([]corrosion.ProofRecord, error) {

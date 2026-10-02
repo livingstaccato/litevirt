@@ -1173,16 +1173,43 @@ signs a foreign abandonment), or that destination has been removed for good,
 the claim re-proposes the old decision rather than deciding a second one beside
 it. If the voters then refuse it, for example because it names an earlier
 workload's owner, the recovery waits and this condition names the workload, the
-decision's proof, destination and source, and why it could not be excluded.
+decision's proof, destination and source, and why it could not be excluded. It
+is not raised when the old decision is visibly this workload's own pending one
+(its row points at the proof) and the destination was only slow to answer.
 
 The condition stays raised even when the old decision is decided at the new
 key: a decision whose proof has already run or failed can never run again, so
 the coordinator does not point the workload at it, and asks the destination
-again on the next tick. While the destination answers, the next tick moves the
-claim on. If the destination is gone for good, `lv host rm --dead <host>`
-(after a proof-grade fence) releases the decision. If its proof is stuck in
-flight on a live destination, set `enforcement.recovery_claim: false` on every
-host until the workload has recovered, then turn it back on. See
+again on the next tick. Each of those ticks also re-asserts this condition, so it
+reappears if its first write failed. While the destination answers, the next
+tick moves the claim on. If the destination is gone for good,
+`lv host rm --dead <host>` (after a proof-grade fence) releases the decision.
+
+If its proof is stuck in flight on a live destination, release that one
+workload with `lv cluster claim-release vm/<name>` (or `container/<name>`;
+admin). The destination does the release: under the workload's own locks it
+confirms that nothing there runs the proof (no start or operation holds the
+workload, and no live domain or container of its name exists), then records and
+signs that it will never run it. After that no runner can take the proof, the
+destination's own resume included: every executor records a start checkpoint
+before it lays anything down or starts it, and the database lets either that
+checkpoint or the release land, never both. The next recovery tick then decides
+the workload afresh. The command refuses, and changes nothing, when the
+destination finds anything that might run the proof, when the proof has reached
+its start checkpoint, when the destination runs a build that predates the
+command (upgrade it), and when the destination cannot be reached: only the
+destination can confirm that the proof is not running, so for one that is gone
+the way out is `lv host fence-confirm <host>` and `lv host rm --dead <host>`.
+If the request reached the destination but no verified answer came back (a
+timeout, a dropped connection), the outcome is unknown, not refused: the
+destination may have recorded the release. Run the command again (a release
+already recorded is signed again, so it answers either way) or check
+`lv cluster claim vm/<name>`. Every call writes a `recovery_claim.release` audit
+row with result `ok`, `refused` or `unknown`;
+the destination also writes its own `recovery_claim.abandon`. Only if the
+destination keeps refusing is the cluster-wide stand-down left:
+`enforcement.recovery_claim: false` on every host until the workload has
+recovered, then back on. See
 [design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
 
 ### Deferred out-of-band stop sync after a restart or rejoin

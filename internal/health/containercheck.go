@@ -552,6 +552,21 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 				if !ok {
 					return // proof missing/mismatched/terminal — refuse (already logged/metered)
 				}
+				// The start checkpoint, appended only if this host has not
+				// abandoned the proof (docs/design/recovery-claims.md §3.12):
+				// the database, not the sweep's lock alone, decides between a
+				// recreate and an operator release (`lv cluster claim-release`).
+				if err := corrosion.AppendProofStepUnlessAbandoned(ctx, c.db, id, "start_attempted"); err != nil {
+					if errors.Is(err, corrosion.ErrProofAbandoned) {
+						slog.Warn("containercheck: this host abandoned the relocation proof and will never execute it",
+							"container", ct.Name, "proof", id)
+						c.noteGateRefused(corrosion.ActionRelocate, ReasonClaimLost)
+						return
+					}
+					slog.Warn("containercheck: record the relocation's start checkpoint failed, retrying",
+						"container", ct.Name, "proof", id, "error", err)
+					return
+				}
 				proofID = id
 			}
 		}

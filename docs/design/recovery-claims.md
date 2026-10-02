@@ -1246,6 +1246,9 @@ The kill switch follows the reversible `configFlag && latch` model described in
 - **Partial stand-down is the hazard in §5.2.** Nodes with the flag off become
   the uncertified second owner. `not_enforcing` shows them. If recovery is
   stalled on claims, first try the unblocks in §6, which keep the guarantee.
+  One workload held by `ha.claim.legacy_held` behind a proof stuck in flight
+  on a live destination is released on its own with
+  `lv cluster claim-release <kind>/<name>` (§10 item 37), not by a stand-down.
 - **The voter config is not part of the stand-down.** It is a fact the cluster
   agreed on, and `VoterSet` reads it whatever the flag says (§4.5, §9, Q4). The
   fence quorum and recovery quorum keep counting the explicit set. A voter set
@@ -1938,9 +1941,60 @@ where it described the mechanism; this list records what changed and why.
       per-workload row, written by the deciding node and resolved only by the
       lease holder once the workload's own rows show it has moved on, so it
       neither clears because the key decided nor lives in one node's memory.
-      A proof left in flight on a live destination cannot be excluded; the
-      condition names the cluster-wide stand-down
-      (`enforcement.recovery_claim: false`) for it. While the destination
+      It is raised only for a value that is genuinely ambiguous: one the
+      deciding node's own replica shows to be this incarnation's pending
+      decision (its row, at the key's epoch, points at the live proof —
+      `corrosion.ProofIsPendingDecisionOf`) is the value the key should
+      re-propose anyway, and a destination that is merely slow to say so
+      within `claimExclusionTimeout` raises nothing. That check only
+      withholds a warning; adoption does not depend on it. Once the scoped
+      key has decided an adopted spent value the bridge never runs again for
+      it, so the coordinator re-asserts the condition on every tick it
+      refuses that value (`NoteLegacyHeld`): a raise whose write failed is
+      retried there, and a row already open for the same decision is not
+      rewritten.
+      A proof left in flight on a live destination cannot be excluded by the
+      bridge, which must not abandon what may be running. Its escape is
+      scoped to the one workload: `lv cluster claim-release <kind>/<name>`
+      (admin, `ReleaseLegacyHeldClaim`), which the condition names. It reads
+      the decision from the open condition and asks its destination for the
+      same foreign abandonment with `operator_release` set. That flag
+      overrides exactly one of `AbandonForeignProof`'s refusals — a proof the
+      destination itself claimed and left in progress, with no start
+      checkpoint (`corrosion.AbandonForeignProofInFlight`) — and only after the
+      destination has confirmed, from its own state, that nothing runs it
+      (`Server.holdWorkloadIdle`): it takes the holds a runner takes (for a
+      VM the operation lock and the per-VM start lease; for a container the
+      operation lock) and under them finds no active domain or running
+      container of the name. Those holds are not the safety argument,
+      though: a runner can claim a proof before it takes them (a backup
+      restore claims its carried proof, then opens the repo, then takes the
+      container lock), and the start lease expires under a start that runs
+      past `vmLockTTL`. What decides is the database. Every executor of an
+      ownership move — promote, reschedule start, restore relocation, the
+      sweep's relocate-recreate — records the start checkpoint
+      `start_attempted` through `AppendProofStepUnlessAbandoned` before it
+      defines, lays down or starts anything. That append and the release's
+      record read the same node-local table in their own transactions, so
+      exactly one wins: a release recorded first makes the executor refuse at
+      its checkpoint (terminally — a reschedule fails its proof, so the row
+      leaves pending instead of retrying), and a checkpoint recorded first
+      makes the release refuse the proof. The abandonment also refuses every
+      later claim of the proof, the destination's own resume included; the
+      bridge's next ask is then answered from that row and the claim decides
+      afresh. A destination that is never reached confirms nothing, and the
+      command refuses and names `lv host rm --dead`. A request that reached
+      the destination but brought back no verified answer (a timeout, a
+      dropped connection, an abandonment that does not verify) may have been
+      recorded, so it is reported as an unknown outcome, never as nothing
+      released; running the command again answers, since a recorded release
+      is signed again. A destination on a build that predates the release
+      ignores `operator_release` and refuses the proof as in flight on it,
+      and that refusal is named as needing an upgrade. Every call writes a
+      `recovery_claim.release` audit row — `ok`, `refused` or `unknown` —
+      with a context detached from the caller's. The cluster-wide stand-down
+      (`enforcement.recovery_claim: false`) remains the last resort for a
+      destination that keeps refusing. While the destination
       answers, the next tick decides; if it is gone for good,
       `lv host rm --dead` releases it. This incarnation's completed decision
       is never excluded (its row is past the epoch at its destination), so a

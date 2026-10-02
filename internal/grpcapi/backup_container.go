@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -655,6 +656,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofConflict)
 		return cpErr
 	}
+	if h := s.restoreClaimedHook; h != nil && restoreProofID != "" {
+		h(req.Name)
+	}
 	if req.Proof == nil && s.gateActive(ctx) && s.requirePeerCert(ctx) == nil {
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofMissing)
 		return status.Error(codes.FailedPrecondition, "restore refused: coordinator restore requires a proof under enforcement")
@@ -801,6 +805,24 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// never by re-importing blindly or adopting an unmarked/foreign artifact: a host-local
 	// marker (written right after import, before the row) records which proof produced it.
 	skipImport := false
+	// The start checkpoint, under the container lock and before anything is laid
+	// down or started: appended only if this host has not abandoned the proof,
+	// decided in one transaction (docs/design/recovery-claims.md §3.12, §10 item
+	// 37). The proof was claimed before this handler took the lock, and an
+	// operator release (`lv cluster claim-release`) landing in between finds the
+	// lock free and no container yet, so it can record the abandonment; the
+	// database then refuses the restore here. A release after this point refuses
+	// the proof for the recorded step. A retry of the same proof appends nothing.
+	if restoreProofID != "" {
+		if err := corrosion.AppendProofStepUnlessAbandoned(ctx, s.db, restoreProofID, "start_attempted"); err != nil {
+			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				s.noteGateRefused(corrosion.ActionRelocate, health.ReasonClaimLost)
+				return status.Errorf(codes.FailedPrecondition,
+					"restore of %s refused: this host abandoned relocation proof %s and will never execute it", req.Name, restoreProofID)
+			}
+			return status.Errorf(codes.Unavailable, "record the start checkpoint of proof %s: %v", restoreProofID, err)
+		}
+	}
 	if restoreProofID != "" {
 		exists, xerr := s.containerRuntime.ContainerExists(ctx, req.Name)
 		if xerr != nil {

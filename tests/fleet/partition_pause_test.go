@@ -137,6 +137,12 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 
 		pn := &ppNode{n: n, chk: chk, pauser: p, coord: coord, rec: rec}
 		s.nodes = append(s.nodes, pn)
+		// Reconcilers tick fast. Coordinators tick at about a second, each at
+		// its own phase: every node holds the lease in its own replica until
+		// the lease row converges, and coordinators polling in lock-step every
+		// few hundred ms duel each other's claim ballots indefinitely under
+		// -race (production polls every 5 s).
+		phase := time.Duration(len(s.nodes)) * 190 * time.Millisecond
 		go func() {
 			tk := time.NewTicker(300 * time.Millisecond)
 			defer tk.Stop()
@@ -145,8 +151,24 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 				case <-ctx.Done():
 					return
 				case <-tk.C:
-					pn.coord.RunOnce(ctx)
 					pn.rec.ReconcileOnce(ctx)
+				}
+			}
+		}()
+		go func() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(phase):
+			}
+			tk := time.NewTicker(time.Second)
+			defer tk.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tk.C:
+					pn.coord.RunOnce(ctx)
 				}
 			}
 		}()
@@ -436,14 +458,14 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 	})
 
 	c.SplitGossip(c.Nodes[:1], c.Nodes[1:])
-	eventually(t, 60*time.Second, "the dual run: pp-dual running on the owner AND a recovery destination", func() bool {
+	eventually(t, 120*time.Second, "the dual run: pp-dual running on the owner AND a recovery destination", func() bool {
 		return len(runningOn(c, "pp-dual")) == 2
 	})
 	_ = s
 
 	c.HealGossip()
 	c.WaitGossip(t, remergeBound, "the halves to merge", c.GossipConverged)
-	eventually(t, 60*time.Second, "the dual run to settle to one copy", func() bool {
+	eventually(t, 120*time.Second, "the dual run to settle to one copy", func() bool {
 		got := runningOn(c, "pp-dual")
 		return len(got) == 1 && got[0] != owner.Name
 	})

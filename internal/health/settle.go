@@ -148,10 +148,7 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"vm", domName, "host", r.hostName, "dest", p.DestHost, "proof", p.ID,
 		"claim_epoch", cert.Key.OwnerEpoch, "local_epoch", local.Epoch, "evidence", local.Source)
-	_ = corrosion.InsertAuditLog(ctx, r.db, corrosion.AuditRecord{
-		ID: randid.New(), Username: "system", HostName: r.hostName,
-		Action: "partition.settle", Target: domName, Detail: detail, Result: "ok",
-	})
+	auditSettle(ctx, r.db, r.hostName, domName, detail)
 	r.raiseSettled(ctx, domName, p, cert, local)
 	if err := RemovePauseRecord(r.dataDir, PauseKindVM, domName); err != nil {
 		slog.Warn("partition-settle: could not drop the pause record", "vm", domName, "error", err)
@@ -235,10 +232,7 @@ func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) 
 		cert.ConfigGeneration, cert.Key.OwnerEpoch)
 	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
 		"ct", rec.Name, "host", p.host, "dest", dest, "proof", pr.ID, "claim_epoch", cert.Key.OwnerEpoch, "local_epoch", rec.OwnerEpoch)
-	_ = corrosion.InsertAuditLog(ctx, p.db, corrosion.AuditRecord{
-		ID: randid.New(), Username: "system", HostName: p.host,
-		Action: "partition.settle", Target: "container/" + rec.Name, Detail: detail, Result: "ok",
-	})
+	auditSettle(ctx, p.db, p.host, "container/"+rec.Name, detail)
 	ts := p.now().UTC().Format(time.RFC3339)
 	b, _ := json.Marshal(settledEvidence{Proof: pr.ID, Dest: dest, Key: cert.Key, ConfigGeneration: cert.ConfigGeneration,
 		Local:  map[string]any{"incarnation": rec.Incarnation, "owner_epoch": rec.OwnerEpoch, "evidence": "partition-pause record"},
@@ -286,4 +280,14 @@ func settleDecideContainer(self, dest string, rec PauseRecord, proofs []corrosio
 		return pr, cert, ""
 	}
 	return corrosion.ProofRecord{}, corrosion.ClaimCertificate{}, why
+}
+
+// auditSettle writes the partition.settle audit row, the one writer both
+// settle paths share (signed like every audit row; see
+// TestAuditWriter_SettleRowsAreSigned).
+func auditSettle(ctx context.Context, db *corrosion.Client, host, target, detail string) {
+	_ = corrosion.InsertAuditLog(ctx, db, corrosion.AuditRecord{
+		ID: randid.New(), Username: "system", HostName: host,
+		Action: "partition.settle", Target: target, Detail: detail, Result: "ok",
+	})
 }

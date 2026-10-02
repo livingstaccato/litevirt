@@ -26,3 +26,16 @@ func TestAuditWriter_OwnerAssertRowsAreSigned(t *testing.T) {
 
 	corrosion.AssertAuditRowsSignedForTest(t, db, 2)
 }
+
+// The partition.settle audit row (settle.go) is signed like every other.
+func TestAuditWriter_SettleRowsAreSigned(t *testing.T) {
+	ctx := context.Background()
+	const host = "node-0"
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	corrosion.SignAuditRowsForTest(t, db, host)
+	auditSettle(ctx, db, host, "vm-a", "stopped the local copy")
+	corrosion.AssertAuditRowsSignedForTest(t, db, 1)
+}

@@ -1938,6 +1938,18 @@ where it described the mechanism; this list records what changed and why.
       per-workload row, written by the deciding node and resolved only by the
       lease holder once the workload's own rows show it has moved on, so it
       neither clears because the key decided nor lives in one node's memory.
+      It is raised only for a value that is genuinely ambiguous: one the
+      deciding node's own replica shows to be this incarnation's pending
+      decision (its row, at the key's epoch, points at the live proof —
+      `corrosion.ProofIsPendingDecisionOf`) is the value the key should
+      re-propose anyway, and a destination that is merely slow to say so
+      within `claimExclusionTimeout` raises nothing. That check only
+      withholds a warning; adoption does not depend on it. Once the scoped
+      key has decided an adopted spent value the bridge never runs again for
+      it, so the coordinator re-asserts the condition on every tick it
+      refuses that value (`NoteLegacyHeld`): a raise whose write failed is
+      retried there, and a row already open for the same decision is not
+      rewritten.
       A proof left in flight on a live destination cannot be excluded; the
       condition names the cluster-wide stand-down
       (`enforcement.recovery_claim: false`) for it. While the destination

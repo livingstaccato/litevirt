@@ -323,6 +323,58 @@ func proofForeignToTx(ctx context.Context, tx *LocalTx, key ClaimKey, proofID, t
 	return false, "unknown target kind", nil
 }
 
+// ProofIsPendingDecisionOf reports whether this replica shows proofID as the
+// PENDING decision of the incarnation key names: the proof is live and not
+// spent, and that incarnation's live row, at key's owner epoch, points at it —
+// a VM's pending_action_id, a container row's relocate_token. It is the
+// pending link AbandonForeignProof refuses to give up, read from this node.
+//
+// The legacy-key bridge asks it of a value it could not exclude, so that a
+// decision which is this incarnation's own, waiting on a slow destination,
+// does not raise ha.claim.legacy_held (docs/design/recovery-claims.md §10
+// item 37). It only ever withholds a warning; nothing is decided by it. A
+// legacy key names no incarnation, so it is never one.
+func ProofIsPendingDecisionOf(ctx context.Context, c *Client, key ClaimKey, proofID string) (bool, error) {
+	if proofID == "" || !key.IsWorkload() || key.Incarnation == "" {
+		return false, nil
+	}
+	pr, ok, err := GetActionProof(ctx, c, proofID)
+	if err != nil || !ok {
+		return false, err
+	}
+	if pr.TargetKind != key.TargetKind || pr.TargetName != key.TargetName ||
+		(pr.Status != ProofPrepared && pr.Status != ProofInProgress) {
+		return false, nil
+	}
+	switch key.TargetKind {
+	case ClaimKindVM:
+		rows, err := c.Query(ctx, `SELECT COALESCE(created_at, '') AS created_at, vm_owner_epoch AS epoch,
+				COALESCE(pending_action_id, '') AS pending FROM vms WHERE name = ? AND deleted_at IS NULL`, key.TargetName)
+		if err != nil || len(rows) != 1 {
+			return false, err
+		}
+		r := rows[0]
+		return IncarnationOf(r.String("created_at")) == key.Incarnation && r.Int64("epoch") == key.OwnerEpoch &&
+			r.String("pending") == proofID, nil
+	case ClaimKindContainer:
+		if pr.RelocationToken == "" {
+			return false, nil
+		}
+		rows, err := c.Query(ctx, `SELECT COALESCE(created_at, '') AS created_at, owner_epoch AS epoch,
+				COALESCE(relocate_token, '') AS token FROM containers WHERE name = ? AND deleted_at IS NULL`, key.TargetName)
+		if err != nil {
+			return false, err
+		}
+		for _, r := range rows {
+			if IncarnationOf(r.String("created_at")) == key.Incarnation && r.Int64("epoch") == key.OwnerEpoch &&
+				r.String("token") == pr.RelocationToken {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
 // ProofAbandoned reports whether this node abandoned proofID.
 func (c *Client) ProofAbandoned(ctx context.Context, proofID string) (bool, error) {
 	rows, err := c.Query(ctx, `SELECT 1 AS one FROM local_abandoned_proofs WHERE proof_id = ?`, proofID)

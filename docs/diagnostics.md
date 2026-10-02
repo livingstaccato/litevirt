@@ -1173,12 +1173,15 @@ signs a foreign abandonment), or that destination has been removed for good,
 the claim re-proposes the old decision rather than deciding a second one beside
 it. If the voters then refuse it, for example because it names an earlier
 workload's owner, the recovery waits and this condition names the workload, the
-decision's proof, destination and source, and why it could not be excluded.
+decision's proof, destination and source, and why it could not be excluded. It
+is not raised when the old decision is visibly this workload's own pending one
+(its row points at the proof) and the destination was only slow to answer.
 
 The condition stays raised even when the old decision is decided at the new
 key: a decision whose proof has already run or failed can never run again, so
 the coordinator does not point the workload at it, and asks the destination
-again on the next tick. While the destination answers, the next tick moves the
+again on the next tick. Each of those ticks also re-asserts this condition, so it
+reappears if its first write failed. While the destination answers, the next tick moves the
 claim on. If the destination is gone for good, `lv host rm --dead <host>`
 (after a proof-grade fence) releases the decision. If its proof is stuck in
 flight on a live destination, set `enforcement.recovery_claim: false` on every

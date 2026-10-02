@@ -628,6 +628,17 @@ type legacyHeldEvidence struct {
 	Source string             `json:"source"`
 }
 
+// NoteLegacyHeld is noteLegacyHeld for the failover coordinator, which calls
+// it every tick it refuses an adopted decision whose proof is already spent
+// (failover.claimRecovery). The bridge raises the condition only while it
+// re-proposes the legacy value; once the scoped key has decided that value it
+// never runs again for the key, so without this a raise whose write failed
+// would never be retried and the refusal loop would run silently. It writes
+// nothing while the row is already open for the same decision.
+func (s *Server) NoteLegacyHeld(ctx context.Context, key corrosion.ClaimKey, v corrosion.ClaimValue, why string) {
+	s.noteLegacyHeld(ctx, key, v, why)
+}
+
 // noteLegacyHeld raises ha.claim.legacy_held for key's workload: its claim
 // re-proposed a decision made at the legacy key that its destination could
 // not show to be another incarnation's (legacyValueExcluded). The condition
@@ -635,8 +646,22 @@ type legacyHeldEvidence struct {
 // restart and a lease hand-off — and resolved only by the lease holder's
 // tick, from the workload's own rows (resolveLegacyHeld), never because the
 // key decided: a decided legacy value can be a proof that never runs.
+//
+// It is raised only for a value that is genuinely ambiguous. One this
+// replica shows to be the incarnation's own pending decision — its row, at
+// the key's epoch, points at the live proof (corrosion.ProofIsPendingDecisionOf)
+// — is not: re-proposing it is what the key should do anyway, and its
+// destination was merely slow to say so within claimExclusionTimeout. The
+// check only withholds a warning; adoption is unchanged either way.
+//
+// It is idempotent: a row already open for the same key, proof and source is
+// left as it is, so a re-assert every tick (NoteLegacyHeld) does not
+// replicate a write per tick.
 func (s *Server) noteLegacyHeld(ctx context.Context, key corrosion.ClaimKey, v corrosion.ClaimValue, why string) {
 	if v.Proof == nil {
+		return
+	}
+	if own, err := corrosion.ProofIsPendingDecisionOf(ctx, s.db, key, v.Proof.ID); err == nil && own {
 		return
 	}
 	dest := v.Proof.DestHost
@@ -656,7 +681,7 @@ func (s *Server) noteLegacyHeld(ctx context.Context, key corrosion.ClaimKey, v c
 		slog.Warn("health condition: read", "code", condClaimLegacyHeld, "error", err)
 		return
 	}
-	if found && row.Lifecycle != corrosion.ConditionResolved && row.Evidence == string(ev) {
+	if found && row.Lifecycle != corrosion.ConditionResolved && sameLegacyHeldDecision(row.Evidence, key, v) {
 		return // already raised for this decision
 	}
 	if !found || row.Lifecycle == corrosion.ConditionResolved {
@@ -672,6 +697,17 @@ func (s *Server) noteLegacyHeld(ctx context.Context, key corrosion.ClaimKey, v c
 	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
 		slog.Warn("health condition: persist", "code", condClaimLegacyHeld, "error", err)
 	}
+}
+
+// sameLegacyHeldDecision reports whether an open ha.claim.legacy_held row's
+// evidence already names this key, proof and source. The detail's reason is
+// left out: it changes from one attempt to the next while the decision does not.
+func sameLegacyHeldDecision(evidence string, key corrosion.ClaimKey, v corrosion.ClaimValue) bool {
+	var ev legacyHeldEvidence
+	if err := json.Unmarshal([]byte(evidence), &ev); err != nil {
+		return false
+	}
+	return ev.Key == key && ev.Proof == v.Proof.ID && ev.Source == v.SourceHost
 }
 
 // resolveLegacyHeld is the lease holder's pass over every open

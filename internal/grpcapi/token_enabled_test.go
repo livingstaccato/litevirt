@@ -41,6 +41,7 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.enfNetBoxMirror = true
 	s.enfLeaseTerm = true
 	s.enfRecoveryClaim = true
+	s.enfPartitionPause = true
 	s.enfVMReplace = true
 	s.hwV2Ready.Store(true)
 

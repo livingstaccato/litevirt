@@ -323,6 +323,10 @@ type Server struct {
 	// recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
 	// reversible kill switch afterwards (recovery_claim_enforce.go).
 	enfRecoveryClaim bool
+	// enfPartitionPause is enforcement.partition_pause (default on): this node
+	// pauses its recoverable workloads on losing the voter majority, so it may
+	// advertise partition_pause_v1 (docs/design/partition-pause.md §5).
+	enfPartitionPause bool
 	// forced records forced voter generations this node refused to adopt
 	// (voter_force.go), for ha.voter.forced.
 	forced forcedConflicts
@@ -920,6 +924,15 @@ func (s *Server) advertisedCapabilities() []string {
 	if !s.enfRecoveryClaim || !s.recoveryClaimAdvertisable() {
 		caps = withoutCapability(caps, capabilities.RecoveryClaimV1)
 	}
+	// partition_pause_v1 is withheld while enforcement.partition_pause is off,
+	// for the same answer to the same question: the guarantee is enforced on
+	// the minority, which pauses, and RELIED ON by the majority, which waits
+	// out that pause and then starts a replacement. A flag-off peer would
+	// still be running the copy. See TestAdvertise_PartitionPauseWithheldWhileOff
+	// and docs/design/partition-pause.md §5.
+	if !s.enfPartitionPause {
+		caps = withoutCapability(caps, capabilities.PartitionPauseV1)
+	}
 	return caps
 }
 
@@ -1286,6 +1299,8 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfLeaseTerm
 	case capabilities.RecoveryClaimV1:
 		return s.enfRecoveryClaim
+	case capabilities.PartitionPauseV1:
+		return s.enfPartitionPause
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch
 	case capabilities.NetBoxIPAMV1:

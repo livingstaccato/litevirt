@@ -3057,41 +3057,12 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 // replication with the default policy of "none" is still recoverable — by
 // promotion rather than reschedule.
 func vmNeedsFailover(vm corrosion.VMRecord, autoPromote bool) bool {
-	// Secure Boot / vTPM state (UEFI NVRAM + swtpm) was host-local and died with
-	// the host. Neither a reschedule nor a disk-only replica promotion
-	// reconstructs it, so this is not work that becomes possible later — recovery
-	// is an operator restore from a backup that carried the firmware.
-	if vmUsesFirmwareState(vm) {
-		return false
-	}
-	if p := vmFailurePolicy(vm); p != "" && p != "none" {
-		return true
-	}
-	return autoPromote
+	return corrosion.VMRecoverableOnHostFailure(vm, autoPromote)
 }
 
 // containerNeedsFailover is the container half of vmNeedsFailover.
 func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
-	if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
-		return false
-	}
-	// Already triaged as unrecoverable on an earlier pass (no re-pullable image
-	// and no usable backup) and left in place on purpose so an operator can see
-	// it. Re-processing it would loop on a decision already made.
-	if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
-		return false
-	}
-	// A relocate-restore marker means this row has an ACTIVE owner, not that it
-	// is stranded: resolvePendingRelocations re-derives every marker cluster-wide
-	// on EVERY cycle, independent of the fence path, and retries until the marker
-	// ages out at defaultRelocateRestoreTimeout. Counting these reports work
-	// somebody is doing — and in the worst case inverts the truth, since a
-	// restore that LANDED but failed to tombstone its source row leaves the
-	// container running on the target with only this row behind.
-	if _, _, ok := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); ok {
-		return false
-	}
-	return true
+	return corrosion.ContainerRecoverableOnHostFailure(ct)
 }
 
 // strandedWorkloads counts workloads still assigned to a host in state 'fenced'
@@ -3194,25 +3165,8 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 }
 
 // vmFailurePolicy extracts on_host_failure from a VM's spec JSON.
-func vmFailurePolicy(vm corrosion.VMRecord) string {
-	var spec struct {
-		OnHostFailure string `json:"on_host_failure"`
-	}
-	if vm.Spec != "" {
-		_ = json.Unmarshal([]byte(vm.Spec), &spec)
-	}
-	return spec.OnHostFailure
-}
+func vmFailurePolicy(vm corrosion.VMRecord) string { return corrosion.VMFailurePolicy(vm) }
 
 // vmUsesFirmwareState reports whether a VM uses Secure Boot or a vTPM — i.e. has
 // host-local firmware state (NVRAM + swtpm) that can't survive its host dying (G1).
-func vmUsesFirmwareState(vm corrosion.VMRecord) bool {
-	var spec struct {
-		SecureBoot bool `json:"secure_boot"`
-		Tpm        bool `json:"tpm"`
-	}
-	if vm.Spec != "" {
-		_ = json.Unmarshal([]byte(vm.Spec), &spec)
-	}
-	return spec.SecureBoot || spec.Tpm
-}
+func vmUsesFirmwareState(vm corrosion.VMRecord) bool { return corrosion.VMUsesFirmwareState(vm) }

@@ -1,0 +1,136 @@
+package corrosion
+
+import (
+	"context"
+	"encoding/json"
+)
+
+// Shared vocabulary for partition pause (docs/design/partition-pause.md): the
+// fence method the majority records when it relies on a minority's pause, the
+// condition identities both sides read, and the one definition of "a workload
+// the majority would recover elsewhere" — which the minority must pause and
+// the majority must recover, so both read it from here.
+
+// FenceMethodSelfPause is the fencing_log method a coordinator records for a
+// best-effort fence that did not reach its host (what would otherwise be
+// "best-effort-ssh", assurance assumed) when it relies on that host's
+// partition pause instead (partition_pause_v1 latched). The SSH detail is
+// kept in the row's detail. FenceAssurance classifies it FenceSelfPaused.
+const FenceMethodSelfPause = "self-pause"
+
+// Health-condition identities for partition pause. One evaluator; every row is
+// written by the host it is about (one writer per row).
+const (
+	PartitionPauseEvaluator = "partition_pause"
+	// CondPartitionPaused: this host holds at least one workload it paused
+	// itself on losing the voter majority. Subject host/<name>.
+	CondPartitionPaused = "partition_paused"
+	// CondPartitionPauseFailed: this host lost the majority and could not
+	// pause a workload it had to. While it is open the majority does NOT rely
+	// on this host's pause (docs/design/partition-pause.md §3.4, §4.3).
+	// Subject host/<name>.
+	CondPartitionPauseFailed = "partition_pause_failed"
+	// CondVMSettled / CondCTSettled: Layer 3 stopped a local copy a verified
+	// claim certificate gave to another host. Subject <name>@<host>.
+	CondVMSettled = "vm_settled"
+	CondCTSettled = "ct_settled"
+)
+
+// HostPartitionPauseFailed reports whether host has an open (not resolved)
+// partition_pause_failed condition in c's replica. A read error is returned,
+// and the caller must then not rely on the pause.
+func HostPartitionPauseFailed(ctx context.Context, c *Client, host string) (bool, error) {
+	row, ok, err := GetHealthCondition(ctx, c, PartitionPauseEvaluator, CondPartitionPauseFailed, "host", host)
+	if err != nil {
+		return false, err
+	}
+	return ok && row.Lifecycle != ConditionResolved, nil
+}
+
+// VMRecoverableOnHostFailure reports whether the failover coordinator would
+// move vm off a failed host. autoPromote says the VM is enrolled in
+// auto-promote replication.
+//
+// Auto-promotion is consulted here, not only in the reschedule loop: that loop
+// reaches AutoPromoteReplica BEFORE it consults on_host_failure, so a VM
+// enrolled in replication with the default policy of "none" is still
+// recoverable — by promotion rather than reschedule.
+func VMRecoverableOnHostFailure(vm VMRecord, autoPromote bool) bool {
+	// Secure Boot / vTPM state (UEFI NVRAM + swtpm) was host-local and died with
+	// the host. Neither a reschedule nor a disk-only replica promotion
+	// reconstructs it, so this is not work that becomes possible later — recovery
+	// is an operator restore from a backup that carried the firmware.
+	if VMUsesFirmwareState(vm) {
+		return false
+	}
+	if p := VMFailurePolicy(vm); p != "" && p != "none" {
+		return true
+	}
+	return autoPromote
+}
+
+// ContainerRecoverableOnHostFailure is the container half of
+// VMRecoverableOnHostFailure.
+func ContainerRecoverableOnHostFailure(ct ContainerRecord) bool {
+	if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
+		return false
+	}
+	// Already triaged as unrecoverable on an earlier pass (no re-pullable image
+	// and no usable backup) and left in place on purpose so an operator can see
+	// it. Re-processing it would loop on a decision already made.
+	if ct.StateDetail == ContainerRelocateSkippedDetail {
+		return false
+	}
+	// A relocate-restore marker means this row has an ACTIVE owner, not that it
+	// is stranded: resolvePendingRelocations re-derives every marker cluster-wide
+	// on EVERY cycle, independent of the fence path, and retries until the marker
+	// ages out. Counting these reports work somebody is doing — and in the worst
+	// case inverts the truth, since a restore that LANDED but failed to tombstone
+	// its source row leaves the container running on the target with only this
+	// row behind.
+	if _, _, ok := RelocateRestoreMarker(ct.State, ct.StateDetail); ok {
+		return false
+	}
+	return true
+}
+
+// VMFailurePolicy extracts on_host_failure from a VM's spec JSON.
+func VMFailurePolicy(vm VMRecord) string {
+	var spec struct {
+		OnHostFailure string `json:"on_host_failure"`
+	}
+	if vm.Spec != "" {
+		_ = json.Unmarshal([]byte(vm.Spec), &spec)
+	}
+	return spec.OnHostFailure
+}
+
+// VMUsesFirmwareState reports whether a VM uses Secure Boot or a vTPM — i.e.
+// has host-local firmware state (NVRAM + swtpm) that can't survive its host
+// dying (G1).
+func VMUsesFirmwareState(vm VMRecord) bool {
+	var spec struct {
+		SecureBoot bool `json:"secure_boot"`
+		Tpm        bool `json:"tpm"`
+	}
+	if vm.Spec != "" {
+		_ = json.Unmarshal([]byte(vm.Spec), &spec)
+	}
+	return spec.SecureBoot || spec.Tpm
+}
+
+// AutoPromoteEnrolled returns the VMs enrolled in auto-promote replication —
+// the set VMRecoverableOnHostFailure's autoPromote argument is read from.
+func AutoPromoteEnrolled(ctx context.Context, c *Client) (map[string]bool, error) {
+	rows, err := ListBackupSchedules(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]bool{}
+	for _, r := range rows {
+		if r.Type == "replication" && r.AutoPromote {
+			out[r.VMName] = true
+		}
+	}
+	return out, nil
+}

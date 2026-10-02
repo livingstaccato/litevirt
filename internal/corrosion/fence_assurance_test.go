@@ -30,6 +30,10 @@ func TestFenceAssurance_ClassifiesEveryWrittenPair(t *testing.T) {
 		// FAILED and lenient mode proceeded anyway: not even the request is known
 		// to have arrived.
 		{"best-effort-ssh", "fenced", FenceAssumed},
+		// self-pause is a best-effort fence whose recovery waited out the
+		// host's partition pause (docs/design/partition-pause.md §4.2).
+		{FenceMethodSelfPause, "fenced", FenceSelfPaused},
+		{FenceMethodSelfPause, "partial", FenceFailed},
 		// A watchdog fence stops the heartbeat; the reboot is a timer nobody
 		// observes firing.
 		{"watchdog", "fenced", FenceRequested},
@@ -65,9 +69,11 @@ func TestFenceProofGrade_IsUnchangedAndAgreesWithAssurance(t *testing.T) {
 		{"ssh", "fenced"}:              false,
 		{"ssh", "partial"}:             false,
 		{"best-effort-ssh", "fenced"}:  false,
-		{"watchdog", "fenced"}:         false,
-		{"watchdog", "partial"}:        false,
-		{"redfish", "fenced"}:          false,
+		// A pause stops execution; it proves nothing about power.
+		{FenceMethodSelfPause, "fenced"}: false,
+		{"watchdog", "fenced"}:           false,
+		{"watchdog", "partial"}:          false,
+		{"redfish", "fenced"}:            false,
 	}
 	for p, want := range proof {
 		if got := FenceProofGrade(p[0], p[1]); got != want {

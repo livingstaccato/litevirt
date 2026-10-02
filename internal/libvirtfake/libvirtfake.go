@@ -108,6 +108,10 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// FailSuspendDomain / FailResumeDomain inject a pause/resume failure
+	// (partition pause, docs/design/partition-pause.md §3.4).
+	FailSuspendDomain func(name string) error
+	FailResumeDomain  func(name string) error
 	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
 	// outage, which marks the host's runtime inventory INCOMPLETE and must
 	// refuse new residency at admission time.
@@ -406,6 +410,61 @@ func (f *Fake) StartDomain(name string) error {
 	f.domains[name] = StateRunning
 	f.record("start", name, "")
 	return nil
+}
+
+// SuspendDomain pauses a RUNNING domain: it stays active (StatePaused) and
+// DomainStateReason reports reason "paused", as libvirt does. Suspending a
+// domain that is not running is an error, as in libvirt.
+func (f *Fake) SuspendDomain(name string) error {
+	if f.FailSuspendDomain != nil {
+		if err := f.FailSuspendDomain(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StateRunning {
+		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)
+	}
+	f.domains[name] = StatePaused
+	f.record("suspend", name, "")
+	return nil
+}
+
+// ResumeDomain resumes a PAUSED domain. Resuming a domain that is not paused
+// is an error, as in libvirt.
+func (f *Fake) ResumeDomain(name string) error {
+	if f.FailResumeDomain != nil {
+		if err := f.FailResumeDomain(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StatePaused {
+		return fmt.Errorf("libvirtfake: domain %q is not paused (%s)", name, st)
+	}
+	f.domains[name] = StateRunning
+	f.record("resume", name, "")
+	return nil
+}
+
+// RawState reports the fake's own state for a domain — running, paused or
+// shutoff — without libvirt's coarse folding. ok=false when undefined.
+// Scenario helper: "is this copy executing right now" is RawState == running.
+func (f *Fake) RawState(name string) (State, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.domains[name]
+	return s, ok
 }
 
 func (f *Fake) BlockPull(domain, disk string) error {

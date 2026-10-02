@@ -344,6 +344,14 @@ still authority an hour later. A fence that no longer stands is logged once, as
 they are. If the host really is down, `lv host undrain <host>` lets the
 coordinator fence it again for the outage in progress.
 
+The `fencing_log` row and the `fenced` state are written as one replicated
+entry, so every peer holds both or neither. A leader on an older release writes
+them separately, and a successor can then hold the row while the host still
+reads `active`. It treats that as "the state has not arrived yet": it neither
+fences the host nor stops looking, and it resumes once the state lands. If that
+older leader died between its two writes, the state never arrives. The host is
+then fenced again once the row is 5 minutes old, as before.
+
 A shared-disk VM is still moved only on a proof-grade fence under 5 minutes old
 (see above). A resume from an older fence moves local-disk VMs and refuses
 shared-disk ones until `lv host fence-confirm` provides a fresh proof.

@@ -21,6 +21,40 @@ import (
 	"github.com/litevirt/litevirt/internal/health"
 )
 
+// fenceSettled holds x's first claim RPC until every voter's replica records
+// x's fence of the dead owner (the fencing_log row and the host's 'fenced'
+// state), so a scenario about what a successor does with a dead leader's
+// recorded fence is not also a race over whether the record got out. The row
+// and the state travel in one entry, so a voter holds both or neither; the
+// wait is for the push, not for an ordering between them.
+type fenceSettled struct {
+	voters []*Node
+	host   string
+	once   sync.Once
+	ok     bool
+}
+
+func (f *fenceSettled) await() {
+	f.once.Do(func() {
+		ctx := context.Background()
+		for deadline := time.Now().Add(convergeTimeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			all := true
+			for _, n := range f.voters {
+				h, err := corrosion.GetHost(ctx, n.DB, f.host)
+				rows, qerr := n.DB.Query(ctx, `SELECT 1 AS one FROM fencing_log WHERE host_name = ? AND result = 'fenced'`, f.host)
+				if err != nil || qerr != nil || h == nil || h.State != "fenced" || len(rows) == 0 {
+					all = false
+					break
+				}
+			}
+			if all {
+				f.ok = true
+				return
+			}
+		}
+	})
+}
+
 // dieAtFirstClaim is x's claim script: hold x's first claim RPC until its fence
 // has settled on every voter, then take x out of the cluster before anything
 // it claims reaches a voter.

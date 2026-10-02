@@ -150,15 +150,11 @@ func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, s
 // staleAccept is the script for TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound.
 type staleAccept struct {
 	x, a, b, cc *Node
-	fenceSeen   fenceSettled
 	mu          sync.Mutex
 	aPrepared   bool
 }
 
 func (s *staleAccept) script(m ClaimMsg) ClaimFate {
-	if m.From == s.x.Name {
-		s.fenceSeen.await()
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
@@ -198,7 +194,7 @@ func TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound(t *testing.T) {
 	voters := []*Node{a, b, cc}
 	ledger := watchClaims(t, c)
 	key := vmKey(vm, 0)
-	s := &staleAccept{x: x, a: a, b: b, cc: cc, fenceSeen: fenceSettled{voters: voters, host: d.Name}}
+	s := &staleAccept{x: x, a: a, b: b, cc: cc}
 	c.SetClaimScript(s.script)
 
 	clock := NewVirtualClock(time.Now().UTC())
@@ -210,9 +206,6 @@ func TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound(t *testing.T) {
 		})
 	}
 	cs.Tick(ctx, x)
-	if !s.fenceSeen.ok {
-		t.Fatalf("x's fence of %s never settled on every voter", d.Name)
-	}
 	if st := c.ClaimStats(x, a); st.Held != 1 {
 		t.Fatalf("x's Accept to a was not held: %+v", st)
 	}
@@ -223,7 +216,10 @@ func TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound(t *testing.T) {
 	// x never ticks again. It is not crashed: replacing its links' faults
 	// would hand the held Accept to a now, before the newer round.
 
-	clock.Advance(time.Minute) // past x's lease; a resumes from x's fence (fenceSettled)
+	// Past x's lease. x's fence row and d's 'fenced' state replicate as one
+	// entry, so a either resumes from them or, if they have not reached it,
+	// fences d itself; the claim below is the same either way.
+	clock.Advance(time.Minute)
 	now := clock.Now()
 	for _, n := range voters {
 		PublishHealth(t, n, d.Name, 5, now)

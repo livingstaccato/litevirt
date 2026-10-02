@@ -717,9 +717,19 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		// Skip if fencing_log shows a recent successful fence — no double-fencing
 		// across coordinator restarts or process race windows.
+		//
+		// The skip is NOT cached in c.fenced. The host is not in a terminal
+		// state here, so the fence on record has not reached this replica's
+		// host state yet: a leader on the previous release writes the row and
+		// the state as separate entries, and a successor can hold the first a
+		// cycle or more before the second. Caching would decide the question
+		// before the state arrived, and the cache is cleared only for hosts
+		// back to 'active', so once the 'fenced' state landed nothing would
+		// reach the resume path above and the workloads would stay on the host.
+		// Re-reading costs one fencing_log read per cycle for at most
+		// recentFenceWindow.
 		if c.recentlyFenced(ctx, target) {
 			slog.Info("failover: host has recent fence record, skipping", "host", target)
-			c.fenced[target] = true
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrRecentlyFenced)
 			continue
 		}
@@ -1828,19 +1838,40 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		c.mAttempt(PhaseFence, ResultSuccess, errClassNone)
 	}
 
-	// Record fence event. Failure to log is a real problem — we are about to
-	// reschedule VMs based on a fence that has no audit trail.
-	if err := corrosion.InsertFenceLog(ctx, c.db, corrosion.FenceLogRecord{
+	// Record the fence, and, for a fence that PROVED the host off, the
+	// 'fenced' state it establishes, in ONE replicated entry
+	// (corrosion.RecordFenceWithState). A verified power-off is a fact about
+	// the host, the same class of thing as the fencing_log row: it is true no
+	// matter who holds the lease a moment later. Both are written BEFORE the
+	// leadership re-check so a handoff mid-fence still leaves the cluster
+	// describing what physically happened, and so the next leader can pick the
+	// recovery up from it (see run's resume path). They are written TOGETHER
+	// because a successor holding the row without the state skipped the host
+	// as recently fenced, and a leader that died between two pushes left it
+	// that way. The "offline" state is an INFERENCE about a fence that could
+	// not prove itself, so recoverFenced writes that one, behind the check,
+	// with the reschedule.
+	//
+	// Failure to log is a real problem — we are about to reschedule VMs based
+	// on a fence that has no audit trail — but intentionally non-blocking: the
+	// fence physically happened, and a lost audit row must not strand the VMs.
+	rec := corrosion.FenceLogRecord{
 		ID:       randid.New(),
 		HostName: h.Name,
 		Method:   fr.Method,
 		Result:   logResult,
 		Detail:   fr.Detail,
-	}); err != nil {
-		slog.Error("failover: write fence_log", "host", h.Name, "error", err)
-		// Observable but intentionally non-blocking: the fence physically
-		// happened; a lost audit row must not strand the VMs (no return here).
-		c.mAttempt(PhaseFence, ResultError, ErrFenceLogWrite)
+	}
+	if fenceProvedOff(h, fr) {
+		if err := corrosion.RecordFenceWithState(ctx, c.db, rec, "fenced"); err != nil {
+			// Fall back to the two writes separately: each is worth more than
+			// neither, and a successor waits for a state that arrives late.
+			slog.Error("failover: write fence_log and host state together", "host", h.Name, "error", err)
+			c.writeFenceLog(ctx, rec)
+			c.markHostState(ctx, h.Name, "fenced")
+		}
+	} else {
+		c.writeFenceLog(ctx, rec)
 	}
 
 	if c.OnFence != nil {
@@ -1854,18 +1885,6 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 		slog.Warn("failover: this fence was not verified — the host may still be running",
 			"host", h.Name, "method", fr.Method, "assurance", a,
 			"fix", "give "+h.Name+" an ipmi fence strategy to make its fences verifiable")
-	}
-
-	// Step 2a: a VERIFIED power-off is a fact about the host, the same class of
-	// thing as the fencing_log row above — it is true no matter who holds the
-	// lease a moment later. Write it BEFORE the leadership re-check so a handoff
-	// mid-fence still leaves the cluster describing what physically happened,
-	// and so the next leader can pick the recovery up from it (see run's resume
-	// path) instead of leaving the workloads on a powered-off host. The
-	// "offline" state is an INFERENCE about a fence that could not prove itself,
-	// so recoverFenced writes that one, behind the check, with the reschedule.
-	if fenceProvedOff(h, fr) {
-		c.markHostState(ctx, h.Name, "fenced")
 	}
 
 	// The fence is recorded; confirm this node is still the leader before acting
@@ -1893,6 +1912,15 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	c.fenceRelocated[h.Name] = false
 
 	c.recoverFenced(ctx, h, fr)
+}
+
+// writeFenceLog records a fence's fencing_log row on its own, surfacing a
+// write failure without aborting (see failover).
+func (c *Coordinator) writeFenceLog(ctx context.Context, rec corrosion.FenceLogRecord) {
+	if err := corrosion.InsertFenceLog(ctx, c.db, rec); err != nil {
+		slog.Error("failover: write fence_log", "host", rec.HostName, "error", err)
+		c.mAttempt(PhaseFence, ResultError, ErrFenceLogWrite)
+	}
 }
 
 // fenceProvedOff reports whether fr is a fence that PROVED the host is off: a

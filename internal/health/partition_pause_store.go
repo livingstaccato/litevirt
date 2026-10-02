@@ -123,7 +123,10 @@ func (s pauseStore) remove(kind, name string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(filepath.Join(s.dir, fn)); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(filepath.Join(s.dir, fn)); err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing recorded, nothing to make durable
+		}
 		return err
 	}
 	return syncDir(s.dir)

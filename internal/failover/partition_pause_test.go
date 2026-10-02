@@ -210,25 +210,38 @@ func TestPartitionPause_WaitScalesWithClusterSize(t *testing.T) {
 }
 
 // partition_one_way: raised when a quorum fails the host while the host's own
-// rows, written after those failure streaks began, mark a majority healthy;
-// NOT raised on a symmetric split, where the host's last healthy rows predate
-// the streaks.
+// rows, written after those failure streaks began, mark a majority healthy and
+// the voters KEPT failing it afterwards; NOT raised on a symmetric split,
+// where the host's last healthy rows predate the streaks, nor on a heal, where
+// the host's new healthy rows are newer than the voters' last failures.
 //
 // Mutations: drop the "after the streak began" test — the symmetric case
+// raises and goes red; drop the "kept failing afterwards" test — the heal case
 // raises and goes red; drop the condition write — the one-way case goes red.
 func TestPartitionPause_OneWayIsMadeVisible(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
-		offset time.Duration // when "down" wrote its healthy rows, relative to now
+		offset time.Duration // when "down" wrote its healthy rows, relative to the observers' last failure
 		want   bool
 	}{
-		{"one-way", 0, true},
-		{"symmetric", -time.Minute, false},
+		{"one-way", -20 * time.Second, true},
+		{"symmetric", -2 * time.Minute, false},
+		{"heal", time.Second, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, db, ctx, _ := pauseCoordinator(t, true)
 			ensureVoter(t, db, "down")
-			at := c.now().Add(tc.offset).UTC().Format(time.RFC3339Nano)
+			// The observers have failed "down" for a minute (30 probes), and
+			// their last failure is now.
+			now := c.now()
+			for _, o := range []string{"coordinator", "alive"} {
+				if err := db.Execute(ctx,
+					`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+					 VALUES (?, 'down', 'suspect', 30, NULL, ?)`, o, now.UTC().Format(time.RFC3339Nano)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			at := now.Add(tc.offset).UTC().Format(time.RFC3339Nano)
 			for _, peer := range []string{"coordinator", "alive"} {
 				if err := db.Execute(ctx,
 					`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)

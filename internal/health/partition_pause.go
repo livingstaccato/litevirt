@@ -294,8 +294,12 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 		p.lostAt = now
 		p.lostLive, p.lostNeeded = live, needed
 		p.mu.Unlock()
-		slog.Info("partition-pause: lost the voter majority; pausing recoverable workloads if it does not return",
-			"host", p.host, "live", live, "needed", needed, "after", p.after)
+		// Unknown (warmup, an unreadable voter set) runs the clock too, but is
+		// not reported as a loss: every daemon start passes through it.
+		if state == QuorumNo {
+			slog.Info("partition-pause: lost the voter majority; pausing recoverable workloads if it does not return",
+				"host", p.host, "live", live, "needed", needed, "after", p.after)
+		}
 		return
 	}
 	lostFor := now.Sub(p.lostAt)

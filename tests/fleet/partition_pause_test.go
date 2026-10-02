@@ -371,6 +371,17 @@ func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing
 	if got := runningOn(c, "pp-vm"); len(got) != 1 || got[0] != dest.Name {
 		t.Fatalf("pp-vm runs on %v after the heal, want only %s", got, dest.Name)
 	}
+	// A symmetric split, healed, is not a one-way partition: the minority's
+	// new healthy rows land while the majority's last failures are still
+	// fresh, which must not raise partition_one_way.
+	for _, n := range c.Nodes {
+		for _, m := range minority {
+			if row, ok, err := corrosion.GetHealthCondition(ctx, n.DB, corrosion.PartitionPauseEvaluator,
+				corrosion.CondPartitionOneWay, "host", m.Name); err != nil || ok {
+				t.Errorf("%s raised partition_one_way for %s on a symmetric split: %+v (%v)", n.Name, m.Name, row, err)
+			}
+		}
+	}
 }
 
 // TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy is drill 1 on a

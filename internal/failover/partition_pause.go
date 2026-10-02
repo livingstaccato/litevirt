@@ -191,6 +191,7 @@ func (c *Coordinator) detectOneWay(ctx context.Context, target string) (failing,
 	}
 	freshCutoff := c.now().Add(-healthFreshness)
 	streakStart := map[string]time.Time{}
+	lastFailed := map[string]time.Time{}
 	type seen struct {
 		peer string
 		at   time.Time
@@ -206,6 +207,7 @@ func (c *Coordinator) detectOneWay(ctx context.Context, target string) (failing,
 			r.String("status") != health.StatusUnready {
 			n := r.Int("consecutive_failures")
 			streakStart[obs] = upd.Add(-time.Duration(n-1) * health.ProbeInterval)
+			lastFailed[obs] = upd
 			continue
 		}
 		if obs == target && tgt != target && voters[tgt] {
@@ -219,9 +221,14 @@ func (c *Coordinator) detectOneWay(ctx context.Context, target string) (failing,
 	if len(failing) < c.scope.quorum(target) {
 		return failing, nil, false
 	}
+	// Both directions at once, not one after the other: target saw the voter
+	// healthy after that voter's streak against it began, AND the voter was
+	// still failing target after that. A heal produces the first alone — the
+	// target's new healthy rows land while the voters' last failing rows are
+	// still fresh — and must not read as one-way.
 	for _, s := range targetSaw {
 		start, ok := streakStart[s.peer]
-		if ok && s.at.After(start.Add(fenceSkewMargin)) {
+		if ok && s.at.After(start.Add(fenceSkewMargin)) && lastFailed[s.peer].After(s.at.Add(fenceSkewMargin)) {
 			healthy = append(healthy, s.peer)
 		}
 	}

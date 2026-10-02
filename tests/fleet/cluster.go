@@ -161,8 +161,10 @@ type Cluster struct {
 	// checker's peer table in-process (no probe loop runs), so without this a
 	// fleet scenario has no way to model a host REJOINING — see Node.Rejoin.
 	reach *reachSet
-	// gossip is the RealGossip firewall (gossip_real.go). Nil otherwise.
-	gossip *gossipCut
+	// gossip is the RealGossip firewall (gossip_real.go), and gossipPort the
+	// one gossip port every RealGossip node binds. Nil and zero otherwise.
+	gossip     *gossipCut
+	gossipPort int
 	// claimScript, when set, decides each claim RPC's fate before the link's
 	// ClaimFault does (claim_faults.go).
 	claimScriptMu sync.Mutex
@@ -287,6 +289,9 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.RealGossip && opts.SharedCRDT {
 		t.Fatal("fleet: RealGossip and SharedCRDT are mutually exclusive")
 	}
+	if opts.RealGossip {
+		skipWithoutRealGossipAddresses(t, opts.Nodes)
+	}
 
 	// The audit-chain tail used to be process-global, so this had to reset it
 	// between tests — and, worse, every node in a cluster shared one tail, so
@@ -306,12 +311,21 @@ func New(t *testing.T, opts Options) *Cluster {
 	if namePrefix == "" {
 		namePrefix = "node-"
 	}
+	if opts.RealGossip {
+		// One gossip port for the whole cluster, as production has: each node
+		// gossips on its own loopback address (see gossip_real.go).
+		c.gossipPort = freeGossipPort(t)
+	}
 	for i := 0; i < opts.Nodes; i++ {
 		name := fmt.Sprintf("%s%d", namePrefix, i)
+		addr := "127.0.0.1"
+		if opts.RealGossip {
+			addr = realGossipAddress(i)
+		}
 		n := &Node{
 			Name:          name,
 			Region:        regionFor(opts.RegionByIndex, i),
-			Address:       "127.0.0.1",
+			Address:       addr,
 			PKIDir:        filepath.Join(c.tmpRoot, name, "pki"),
 			blockedFrom:   make(map[string]bool),
 			unimplemented: make(map[string]bool),
@@ -322,15 +336,15 @@ func New(t *testing.T, opts Options) *Cluster {
 		// Reserve an ephemeral port — close the listener immediately
 		// after; we re-bind once everything is wired. (gRPC servers
 		// need the listener to come from outside their constructor.)
-		l, err := net.Listen("tcp", "127.0.0.1:0")
+		l, err := net.Listen("tcp", net.JoinHostPort(n.Address, "0"))
 		if err != nil {
 			t.Fatalf("reserve port for %s: %v", name, err)
 		}
 		n.Port = l.Addr().(*net.TCPAddr).Port
 		n.Listener = l
 		if opts.RealGossip {
-			n.GossipPort = freeGossipPort(t)
-			c.gossip.byAddr[gossipAddr(n.GossipPort)] = name
+			n.GossipPort = c.gossipPort
+			c.gossip.byAddr[gossipAddr(n)] = name
 		}
 		c.Nodes = append(c.Nodes, n)
 	}
@@ -516,7 +530,7 @@ func (c *Cluster) mintHostCert(n *Node) {
 	certPath := filepath.Join(n.PKIDir, "host.crt")
 	keyPath := filepath.Join(n.PKIDir, "host.key")
 	if err := pki.GenerateHostCert(
-		c.caCert, c.caKey, certPath, keyPath, n.Name, net.ParseIP("127.0.0.1"),
+		c.caCert, c.caKey, certPath, keyPath, n.Name, net.ParseIP(n.Address),
 	); err != nil {
 		c.t.Fatalf("GenerateHostCert %s: %v", n.Name, err)
 	}

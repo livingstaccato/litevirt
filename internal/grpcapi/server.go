@@ -296,6 +296,8 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
+	restoreClaimedHook func(name string)
 	// repairLeaseHook is a test-only seam run while a compose repair holds the
 	// VM's start lease, before it touches the domain.
 	repairLeaseHook func(vmName string)
@@ -1159,6 +1161,12 @@ func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = o
 // cannot fail. Production never calls this; the hook must be set before the
 // operation starts and cleared after.
 func (s *Server) SetCommitFenceHook(h func(op string)) { s.commitFenceHook = h }
+
+// SetRestoreClaimedHook is a test-only seam: RestoreContainer calls h with the
+// container's name right after it has claimed a carried relocation proof, and
+// before it takes the container's lock — the window an operator release of
+// that proof can land in. Production never calls this.
+func (s *Server) SetRestoreClaimedHook(h func(name string)) { s.restoreClaimedHook = h }
 
 // fireCommitFenceHook runs the test hook, if any, naming the operation about to
 // evaluate its commit fence.

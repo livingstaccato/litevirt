@@ -55,6 +55,10 @@ type RecoveryClaimer interface {
 	// never run (corrosion.AbandonForeignProof), returning the encoded
 	// abandonment. It refuses whatever host cannot show.
 	RequestForeignAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string) (string, error)
+	// NoteLegacyHeld (re-)raises ha.claim.legacy_held for key's workload,
+	// held behind the decided value v. Idempotent: it writes nothing while
+	// the condition is already open for that decision.
+	NoteLegacyHeld(ctx context.Context, key corrosion.ClaimKey, v corrosion.ClaimValue, why string)
 }
 
 // maxClaimAttempts bounds how far one claimRecovery walks a key's attempts.
@@ -173,6 +177,11 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 				err := &ClaimRefusedError{Key: key, Reason: health.ReasonClaimLost, Result: ResultLost,
 					Detail: fmt.Sprintf("%s decided proof %s, which has already run or failed; waiting for %s to show it "+
 						"was not this incarnation's (ha.claim.legacy_held)", key, cl.Proof.ID, cl.Proof.DestHost)}
+				// Re-asserted on every refusal: the bridge that raised the
+				// condition never runs again for a key that has decided, so
+				// a raise whose write failed is retried only from here.
+				c.Claimer.NoteLegacyHeld(ctx, key, out.Value, fmt.Sprintf("the claim decided proof %s, which has "+
+					"already run or failed, and %s has not shown it is another incarnation's", cl.Proof.ID, cl.Proof.DestHost))
 				return claimedProof{Key: key}, err
 			}
 			return cl, nil

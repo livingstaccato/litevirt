@@ -245,6 +245,7 @@ const (
 	LiteVirt_GetRecoveryClaim_FullMethodName           = "/litevirt.v1.LiteVirt/GetRecoveryClaim"
 	LiteVirt_ListRecoveryClaims_FullMethodName         = "/litevirt.v1.LiteVirt/ListRecoveryClaims"
 	LiteVirt_AbandonRecoveryProof_FullMethodName       = "/litevirt.v1.LiteVirt/AbandonRecoveryProof"
+	LiteVirt_ReleaseLegacyHeldClaim_FullMethodName     = "/litevirt.v1.LiteVirt/ReleaseLegacyHeldClaim"
 	LiteVirt_PlanDeadHostRemoval_FullMethodName        = "/litevirt.v1.LiteVirt/PlanDeadHostRemoval"
 	LiteVirt_ForceReconfigureVoters_FullMethodName     = "/litevirt.v1.LiteVirt/ForceReconfigureVoters"
 	LiteVirt_SignForcedVoterConfig_FullMethodName      = "/litevirt.v1.LiteVirt/SignForcedVoterConfig"
@@ -675,6 +676,12 @@ type LiteVirtClient interface {
 	// not executed, and never will, a proof a decided claim named — refused if
 	// it may already have (§3.12).
 	AbandonRecoveryProof(ctx context.Context, in *AbandonRecoveryProofRequest, opts ...grpc.CallOption) (*AbandonRecoveryProofResponse, error)
+	// ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
+	// (admin): the decision an open ha.claim.legacy_held names, stuck in
+	// flight on a live destination, is abandoned by that destination once it
+	// has confirmed nothing there runs it. Refused when the destination does
+	// not answer; `lv host rm --dead` is the way out for a dead one.
+	ReleaseLegacyHeldClaim(ctx context.Context, in *ReleaseLegacyHeldClaimRequest, opts ...grpc.CallOption) (*ReleaseLegacyHeldClaimResponse, error)
 	// PlanDeadHostRemoval reports what `lv host rm --dead` would do.
 	PlanDeadHostRemoval(ctx context.Context, in *PlanDeadHostRemovalRequest, opts ...grpc.CallOption) (*PlanDeadHostRemovalResponse, error)
 	// ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):
@@ -3352,6 +3359,16 @@ func (c *liteVirtClient) AbandonRecoveryProof(ctx context.Context, in *AbandonRe
 	return out, nil
 }
 
+func (c *liteVirtClient) ReleaseLegacyHeldClaim(ctx context.Context, in *ReleaseLegacyHeldClaimRequest, opts ...grpc.CallOption) (*ReleaseLegacyHeldClaimResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseLegacyHeldClaimResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ReleaseLegacyHeldClaim_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) PlanDeadHostRemoval(ctx context.Context, in *PlanDeadHostRemovalRequest, opts ...grpc.CallOption) (*PlanDeadHostRemovalResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PlanDeadHostRemovalResponse)
@@ -4221,6 +4238,12 @@ type LiteVirtServer interface {
 	// not executed, and never will, a proof a decided claim named — refused if
 	// it may already have (§3.12).
 	AbandonRecoveryProof(context.Context, *AbandonRecoveryProofRequest) (*AbandonRecoveryProofResponse, error)
+	// ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
+	// (admin): the decision an open ha.claim.legacy_held names, stuck in
+	// flight on a live destination, is abandoned by that destination once it
+	// has confirmed nothing there runs it. Refused when the destination does
+	// not answer; `lv host rm --dead` is the way out for a dead one.
+	ReleaseLegacyHeldClaim(context.Context, *ReleaseLegacyHeldClaimRequest) (*ReleaseLegacyHeldClaimResponse, error)
 	// PlanDeadHostRemoval reports what `lv host rm --dead` would do.
 	PlanDeadHostRemoval(context.Context, *PlanDeadHostRemovalRequest) (*PlanDeadHostRemovalResponse, error)
 	// ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):
@@ -5058,6 +5081,9 @@ func (UnimplementedLiteVirtServer) ListRecoveryClaims(*ListRecoveryClaimsRequest
 }
 func (UnimplementedLiteVirtServer) AbandonRecoveryProof(context.Context, *AbandonRecoveryProofRequest) (*AbandonRecoveryProofResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AbandonRecoveryProof not implemented")
+}
+func (UnimplementedLiteVirtServer) ReleaseLegacyHeldClaim(context.Context, *ReleaseLegacyHeldClaimRequest) (*ReleaseLegacyHeldClaimResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseLegacyHeldClaim not implemented")
 }
 func (UnimplementedLiteVirtServer) PlanDeadHostRemoval(context.Context, *PlanDeadHostRemovalRequest) (*PlanDeadHostRemovalResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PlanDeadHostRemoval not implemented")
@@ -8979,6 +9005,24 @@ func _LiteVirt_AbandonRecoveryProof_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ReleaseLegacyHeldClaim_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseLegacyHeldClaimRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ReleaseLegacyHeldClaim(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ReleaseLegacyHeldClaim_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ReleaseLegacyHeldClaim(ctx, req.(*ReleaseLegacyHeldClaimRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_PlanDeadHostRemoval_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PlanDeadHostRemovalRequest)
 	if err := dec(in); err != nil {
@@ -10573,6 +10617,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "AbandonRecoveryProof",
 			Handler:    _LiteVirt_AbandonRecoveryProof_Handler,
+		},
+		{
+			MethodName: "ReleaseLegacyHeldClaim",
+			Handler:    _LiteVirt_ReleaseLegacyHeldClaim_Handler,
 		},
 		{
 			MethodName: "PlanDeadHostRemoval",

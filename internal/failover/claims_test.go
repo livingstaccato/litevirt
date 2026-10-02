@@ -3,6 +3,7 @@ package failover
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -21,6 +22,18 @@ type fakeClaimer struct {
 	abandon      func(host string, key corrosion.ClaimKey, proofID string) (string, error)
 	// foreign answers RequestForeignAbandonment; nil refuses.
 	foreign func(host string, key corrosion.ClaimKey, proofID string) (string, error)
+	// noted records each NoteLegacyHeld, as key/proof.
+	noted []string
+}
+
+func (f *fakeClaimer) NoteLegacyHeld(_ context.Context, key corrosion.ClaimKey, v corrosion.ClaimValue, _ string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	id := ""
+	if v.Proof != nil {
+		id = v.Proof.ID
+	}
+	f.noted = append(f.noted, key.String()+"/"+id)
 }
 
 var errNoAbandonment = errors.New("the destination refused to abandon")
@@ -210,6 +223,49 @@ func TestReschedule_LoserWritesTheWinnersProof(t *testing.T) {
 	}
 	if vm := mustVM(t, db, "vm1"); vm.HostName != "other" || vm.PendingActionID != "their-proof" {
 		t.Fatalf("the VM is not pending on the decided destination: host=%s pending=%q", vm.HostName, vm.PendingActionID)
+	}
+}
+
+// TestReschedule_AdoptedSpentDecisionReassertsLegacyHeld: a decided value at
+// an incarnation-scoped key whose proof has already run is refused — never
+// written — and every refusal re-asserts ha.claim.legacy_held
+// (RecoveryClaimer.NoteLegacyHeld). The bridge that first raised it never
+// runs again for the key once the key has decided, so a raise whose write
+// failed is retried only from here; without it the refusal loop runs
+// silently.
+//
+// Mutation: drop the NoteLegacyHeld call from claimRecovery's refusal — no
+// tick re-asserts the condition.
+func TestReschedule_AdoptedSpentDecisionReassertsLegacyHeld(t *testing.T) {
+	ctx := context.Background()
+	cl := &fakeClaimer{decide: decideTheirs(corrosion.ActionReschedule, "other")}
+	db, c := claimFixture(t, cl)
+	spent := corrosion.ActionProof{ID: "their-proof", Action: corrosion.ActionReschedule, TargetKind: "vm",
+		TargetName: "vm1", DestHost: "other", Coordinator: "other-coord", OwnerEpoch: "4"}
+	if err := corrosion.WriteActionProof(ctx, db, spent); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.ClaimActionProof(ctx, db, spent.ID, "other"); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.CompleteActionProof(ctx, db, spent.ID, "other"); err != nil {
+		t.Fatal(err)
+	}
+	c.run(ctx)
+	c.run(ctx)
+	if vm := mustVM(t, db, "vm1"); vm.PendingActionID != "" || vm.HostName != "dead" {
+		t.Fatalf("the VM was pointed at a spent decision: host=%s pending=%q", vm.HostName, vm.PendingActionID)
+	}
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	n := 0
+	for _, s := range cl.noted {
+		if strings.HasSuffix(s, "/their-proof") {
+			n++
+		}
+	}
+	if n < 2 {
+		t.Fatalf("ha.claim.legacy_held was re-asserted %d time(s) over two refusing ticks, want one per tick: %v", n, cl.noted)
 	}
 }
 

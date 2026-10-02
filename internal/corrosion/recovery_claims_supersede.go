@@ -230,6 +230,28 @@ var ErrProofNotForeign = errors.New("this node cannot show the proof is not this
 // flight, one another host executed, a promote with a start checkpoint, a
 // legacy key — is refused with ErrProofNotForeign.
 func (c *Client) AbandonForeignProof(ctx context.Context, proofID string, key ClaimKey, reason string) error {
+	return c.abandonForeignProof(ctx, proofID, key, reason, false)
+}
+
+// AbandonForeignProofInFlight is AbandonForeignProof for the operator's
+// release of a legacy-held claim (`lv cluster claim-release`,
+// docs/design/recovery-claims.md §10 item 37). It overrides one refusal
+// only: a proof THIS node claimed and left in progress, with no start
+// checkpoint recorded. Every other refusal stands — a proof another executor
+// holds, a promote past its start checkpoint, a proof that is this
+// incarnation's decision.
+//
+// The caller must first have confirmed, under the workload's local locks,
+// that nothing on this node runs the proof: no start path holds the
+// workload and no live domain or container of its name exists here. Once
+// the abandonment is recorded no claim of the proof succeeds, this node's
+// own resume included (ClaimActionProofFenced reads the same table in its
+// transaction), so no runner can start it again.
+func (c *Client) AbandonForeignProofInFlight(ctx context.Context, proofID string, key ClaimKey, reason string) error {
+	return c.abandonForeignProof(ctx, proofID, key, reason, true)
+}
+
+func (c *Client) abandonForeignProof(ctx context.Context, proofID string, key ClaimKey, reason string, inFlight bool) error {
 	if proofID == "" || !key.IsWorkload() || key.Incarnation == "" {
 		return fmt.Errorf("%w: a foreign abandonment names a proof and an incarnation-scoped workload key", ErrProofNotForeign)
 	}
@@ -254,7 +276,8 @@ func (c *Client) AbandonForeignProof(ctx context.Context, proofID string, key Cl
 		status, executor := p.String("status"), p.String("executor_host")
 		switch {
 		case (status == ProofCompleted || status == ProofFailed) && executor == c.hostName:
-		case status == ProofPrepared && executor == "":
+		case status == ProofPrepared && executor == "",
+			inFlight && status == ProofInProgress && executor == c.hostName:
 			for _, st := range proofStartSteps {
 				if ProofStepDone(p.String("step_state"), st) {
 					return fmt.Errorf("%w: proof %s recorded %q", ErrProofNotForeign, proofID, st)
@@ -321,6 +344,58 @@ func proofForeignToTx(ctx context.Context, tx *LocalTx, key ClaimKey, proofID, t
 		return true, "", nil
 	}
 	return false, "unknown target kind", nil
+}
+
+// ProofIsPendingDecisionOf reports whether this replica shows proofID as the
+// PENDING decision of the incarnation key names: the proof is live and not
+// spent, and that incarnation's live row, at key's owner epoch, points at it —
+// a VM's pending_action_id, a container row's relocate_token. It is the
+// pending link AbandonForeignProof refuses to give up, read from this node.
+//
+// The legacy-key bridge asks it of a value it could not exclude, so that a
+// decision which is this incarnation's own, waiting on a slow destination,
+// does not raise ha.claim.legacy_held (docs/design/recovery-claims.md §10
+// item 37). It only ever withholds a warning; nothing is decided by it. A
+// legacy key names no incarnation, so it is never one.
+func ProofIsPendingDecisionOf(ctx context.Context, c *Client, key ClaimKey, proofID string) (bool, error) {
+	if proofID == "" || !key.IsWorkload() || key.Incarnation == "" {
+		return false, nil
+	}
+	pr, ok, err := GetActionProof(ctx, c, proofID)
+	if err != nil || !ok {
+		return false, err
+	}
+	if pr.TargetKind != key.TargetKind || pr.TargetName != key.TargetName ||
+		(pr.Status != ProofPrepared && pr.Status != ProofInProgress) {
+		return false, nil
+	}
+	switch key.TargetKind {
+	case ClaimKindVM:
+		rows, err := c.Query(ctx, `SELECT COALESCE(created_at, '') AS created_at, vm_owner_epoch AS epoch,
+				COALESCE(pending_action_id, '') AS pending FROM vms WHERE name = ? AND deleted_at IS NULL`, key.TargetName)
+		if err != nil || len(rows) != 1 {
+			return false, err
+		}
+		r := rows[0]
+		return IncarnationOf(r.String("created_at")) == key.Incarnation && r.Int64("epoch") == key.OwnerEpoch &&
+			r.String("pending") == proofID, nil
+	case ClaimKindContainer:
+		if pr.RelocationToken == "" {
+			return false, nil
+		}
+		rows, err := c.Query(ctx, `SELECT COALESCE(created_at, '') AS created_at, owner_epoch AS epoch,
+				COALESCE(relocate_token, '') AS token FROM containers WHERE name = ? AND deleted_at IS NULL`, key.TargetName)
+		if err != nil {
+			return false, err
+		}
+		for _, r := range rows {
+			if IncarnationOf(r.String("created_at")) == key.Incarnation && r.Int64("epoch") == key.OwnerEpoch &&
+				r.String("token") == pr.RelocationToken {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // ProofAbandoned reports whether this node abandoned proofID.

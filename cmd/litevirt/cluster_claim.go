@@ -53,6 +53,55 @@ voter's incarnation matches its entry, and its last refusal with the detail (for
 	return cmd
 }
 
+// lv cluster claim-release <kind>/<name> — release one workload's legacy-held
+// claim (docs/design/recovery-claims.md §10 item 37).
+func newClusterClaimReleaseCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "claim-release <kind>/<name>",
+		Short: "Release a recovery held by a legacy decision stuck in flight on a live destination",
+		Long: `For one workload that ha.claim.legacy_held holds: its recovery claim re-proposed a
+decision made before claim_incarnation_v1 latched, and that decision's proof is stuck
+in flight on a destination that is still up, so the destination cannot show it will
+never run.
+
+The destination does the release, not this command. It is asked to confirm, from
+its own state and under the workload's own locks, that nothing runs the proof — no
+start or operation holds the workload and no live domain or container of its name
+exists there — and only then to sign that it will never run it. Once that is
+recorded no runner can take the proof again, the destination's own included. The
+next recovery tick then decides the workload afresh.
+
+It is refused when the destination does not answer: only the destination can
+confirm the proof is not running. If it is gone for good, use
+` + "`lv host fence-confirm <host>`" + ` once it is powered off, then
+` + "`lv host rm --dead <host>`" + `. It is also refused when the destination finds
+anything that might run the proof. When the request reached the destination but no
+verified answer came back, the outcome is reported as unknown: run the command again
+(a release already recorded is signed again) or check ` + "`lv cluster claim <kind>/<name>`" + `.
+Every call is audited (recovery_claim.release: ok, refused or unknown).
+
+  kind   vm or container
+
+Requires the admin role.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			kind, name, ok := strings.Cut(args[0], "/")
+			if !ok || name == "" {
+				return fmt.Errorf("want <kind>/<name>, for example vm/db-1")
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.ReleaseLegacyHeldClaim(ctx, &pb.ReleaseLegacyHeldClaimRequest{Kind: kind, Name: name})
+				if err != nil {
+					return fmt.Errorf("cluster claim-release: %w", err)
+				}
+				fmt.Printf("released: %s abandoned proof %s at %s\n", resp.GetDestHost(), resp.GetProofId(), resp.GetKey())
+				fmt.Println(resp.GetDetail())
+				return nil
+			})
+		},
+	}
+}
+
 func printClaimInspection(resp *pb.InspectRecoveryClaimResponse) {
 	fmt.Println(resp.GetDetail())
 	for _, a := range resp.GetAttempts() {

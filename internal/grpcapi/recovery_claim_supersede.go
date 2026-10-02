@@ -131,7 +131,8 @@ func (s *Server) AbandonRecoveryProof(ctx context.Context, req *pb.AbandonRecove
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	ab, err := s.abandonRecoveryProof(ctx, keyFromPB(req.GetKey()), req.GetProofId(), req.GetReason(), req.GetForeignOnly())
+	ab, err := s.abandonRecoveryProof(ctx, keyFromPB(req.GetKey()), req.GetProofId(), req.GetReason(), req.GetForeignOnly(),
+		req.GetOperatorRelease())
 	if err != nil {
 		return nil, err
 	}
@@ -142,9 +143,19 @@ func (s *Server) AbandonRecoveryProof(ctx context.Context, req *pb.AbandonRecove
 	return &pb.AbandonRecoveryProofResponse{Abandonment: enc}, nil
 }
 
-func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKey, proofID, reason string, foreignOnly bool) (corrosion.ClaimAbandonment, error) {
+// abandonRecoveryProof is the destination's abandonment. operatorRelease
+// (with foreignOnly only) is `lv cluster claim-release`: the destination first
+// confirms, under the workload's own locks, that nothing here runs the proof
+// (holdWorkloadIdle), and only then may a proof it claimed and left in
+// progress be abandoned (corrosion.AbandonForeignProofInFlight). The holds
+// are kept until the abandonment is recorded, after which no claim of the
+// proof succeeds here.
+func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKey, proofID, reason string, foreignOnly, operatorRelease bool) (corrosion.ClaimAbandonment, error) {
 	if !key.IsWorkload() || proofID == "" {
 		return corrosion.ClaimAbandonment{}, status.Error(codes.InvalidArgument, "an abandonment names a workload claim key and a proof")
+	}
+	if operatorRelease && !foreignOnly {
+		return corrosion.ClaimAbandonment{}, status.Error(codes.InvalidArgument, "an operator release is a foreign abandonment")
 	}
 	signer, _, err := s.claimIdentity()
 	if err != nil {
@@ -153,6 +164,15 @@ func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKe
 	abandon := s.db.AbandonProof
 	if foreignOnly {
 		abandon = s.db.AbandonForeignProof
+	}
+	if operatorRelease {
+		release, err := s.holdWorkloadIdle(ctx, key.TargetKind, key.TargetName)
+		if err != nil {
+			return corrosion.ClaimAbandonment{}, status.Errorf(codes.FailedPrecondition,
+				"%s cannot confirm nothing runs proof %s: %v", s.hostName, proofID, err)
+		}
+		defer release()
+		abandon = s.db.AbandonForeignProofInFlight
 	}
 	if err := abandon(ctx, proofID, key, reason); err != nil {
 		if errors.Is(err, corrosion.ErrProofExecuted) || errors.Is(err, corrosion.ErrProofNotForeign) {
@@ -187,7 +207,7 @@ func (s *Server) RequestForeignAbandonment(ctx context.Context, host string, key
 // legacy-key bridge's exclusion (corrosion.AbandonForeignProof) instead.
 func (s *Server) requestAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string, foreignOnly bool) (string, error) {
 	if host == s.hostName {
-		ab, err := s.abandonRecoveryProof(ctx, key, proofID, reason, foreignOnly)
+		ab, err := s.abandonRecoveryProof(ctx, key, proofID, reason, foreignOnly, false)
 		if err != nil {
 			return "", err
 		}

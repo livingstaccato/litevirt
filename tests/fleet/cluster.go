@@ -289,6 +289,9 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.RealGossip && opts.SharedCRDT {
 		t.Fatal("fleet: RealGossip and SharedCRDT are mutually exclusive")
 	}
+	if opts.RealGossip {
+		skipWithoutRealGossipAddresses(t, opts.Nodes)
+	}
 
 	// The audit-chain tail used to be process-global, so this had to reset it
 	// between tests — and, worse, every node in a cluster shared one tail, so

@@ -16,7 +16,8 @@ package fleet
 // its certificate names — the shape of a real cluster, where every host has its
 // own IP and gossip_port is uniform. That is what lets a bare recorded address
 // be dialled at all: memberlist dials it on its own gossip port. (Linux routes
-// all of 127.0.0.0/8 to lo; this harness mode is Linux-only.)
+// all of 127.0.0.0/8 to lo. Where those addresses cannot be bound — macOS
+// without lo0 aliases — the scenario skips; see skipWithoutRealGossipAddresses.)
 //
 // Its transport is memberlist's own NetTransport wrapped in a cut: SplitGossip
 // drops every packet and refuses every stream from one side to the other, in
@@ -139,6 +140,36 @@ func (t *cutTransport) DialAddressTimeout(a memberlist.Address, timeout time.Dur
 
 // realGossipAddress is node i's own loopback address under RealGossip.
 func realGossipAddress(i int) string { return fmt.Sprintf("127.0.0.%d", 10+i) }
+
+// skipWithoutRealGossipAddresses skips the test unless every RealGossip node
+// address can be bound. Linux routes all of 127.0.0.0/8 to lo; macOS routes only
+// 127.0.0.1 unless an alias is added, and a container can have an unusual
+// loopback too. So this probes the addresses rather than checking GOOS: on a
+// host without them the scenario cannot run at all, and that is a skip, not a
+// failure.
+func skipWithoutRealGossipAddresses(t *testing.T, nodes int) {
+	t.Helper()
+	var missing []string
+	for i := 0; i < nodes; i++ {
+		addr := realGossipAddress(i)
+		l, err := net.Listen("tcp", net.JoinHostPort(addr, "0"))
+		if err != nil {
+			missing = append(missing, addr)
+			continue
+		}
+		l.Close()
+	}
+	if len(missing) == 0 {
+		return
+	}
+	var fix []string
+	for _, a := range missing {
+		fix = append(fix, "sudo ifconfig lo0 alias "+a+" up")
+	}
+	t.Skipf("fleet RealGossip needs a loopback address per node, and %v cannot be bound here "+
+		"(macOS routes only 127.0.0.1 to lo0 by default). To run it:\n  %s",
+		missing, strings.Join(fix, "\n  "))
+}
 
 func gossipAddr(n *Node) string { return net.JoinHostPort(n.Address, strconv.Itoa(n.GossipPort)) }
 

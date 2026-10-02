@@ -226,6 +226,32 @@ func checkClaimSafety(t *testing.T, l *claimLedger, majorityFrom *Node, vm strin
 			t.Errorf("%d different values are certified for %s: %v", len(ds), k, keys(ds))
 		}
 	}
+	// One decision per (kind, name, epoch, attempt) across the key's legacy
+	// and incarnation-scoped forms too (docs/design/recovery-claims.md §10
+	// item 37). The scenarios hold one incarnation of the workload, so a
+	// legacy and a scoped key of one attempt are the same recovery claimed on
+	// either side of the claim_incarnation_v1 latch, and may not disagree.
+	for name, m := range map[string]map[corrosion.ClaimKey]map[string]bool{"chosen": out.Chosen, "certified": out.Certified} {
+		byDecision := map[corrosion.ClaimKey]map[string]bool{}
+		for k, ds := range m {
+			if k.TargetName != vm {
+				continue
+			}
+			d := k.Legacy()
+			if byDecision[d] == nil {
+				byDecision[d] = map[string]bool{}
+			}
+			for dg := range ds {
+				byDecision[d][dg] = true
+			}
+		}
+		for d, ds := range byDecision {
+			if len(ds) > 1 {
+				t.Errorf("%d different values are %s for %s across its legacy and incarnation-scoped keys: %v",
+					len(ds), name, d, keys(ds))
+			}
+		}
+	}
 	for ep, ids := range out.Proofs {
 		if len(ids) > 1 {
 			t.Errorf("%d ownership-transfer proofs were minted for %s at owner epoch %s: %v", len(ids), vm, ep, keys(ids))

@@ -56,20 +56,31 @@ func TestFleet_RecoveryClaimFaults_TwoCoordinatorsAcrossSeeds(t *testing.T) {
 		{"hold", ClaimFault{Hold: 0.5}},
 		{"mixed", ClaimFault{DropRequest: 0.15, DropReply: 0.15, Duplicate: 0.2, Hold: 0.2}},
 	}
-	for _, k := range kinds {
-		for seed := int64(1); seed <= 3; seed++ {
-			t.Run(fmt.Sprintf("%s/seed-%d", k.name, seed), func(t *testing.T) {
-				runTwoCoordinatorClaimFaults(t, k.name, k.fault, 2700+seed*10+int64(len(k.name)))
-			})
+	for _, latch := range claimFormats {
+		for _, k := range kinds {
+			for seed := int64(1); seed <= 3; seed++ {
+				t.Run(fmt.Sprintf("%s/%s/seed-%d", latch.name, k.name, seed), func(t *testing.T) {
+					runTwoCoordinatorClaimFaults(t, k.name, k.fault, 2700+seed*10+int64(len(k.name)), latch.latched)
+				})
+			}
 		}
 	}
 }
 
-func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, seed int64) {
+// claimFormats runs a scenario under both claim key formats: before
+// claim_incarnation_v1 has latched (legacy keys) and after (keys scoped to
+// the workload's incarnation, docs/design/recovery-claims.md §10 item 37).
+var claimFormats = []struct {
+	name    string
+	latched bool
+}{{"legacy-keys", false}, {"incarnation-keys", true}}
+
+func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, seed int64, latched bool) {
 	ctx := context.Background()
 	vm := fmt.Sprintf("vm-cf-%s-%d", kind, seed)
 	clock := NewVirtualClock(time.Now().UTC())
 	c, a, b, victim := claimFleet(t, clock, seed, vm)
+	latchIncarnation(c, latched)
 	ledger := watchClaims(t, c)
 
 	// The decision window: no replication between the coordinators, and
@@ -136,7 +147,10 @@ func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, s
 		claimReconciler(t, n).ReconcileOnce(ctx)
 	}
 	out := checkClaimSafety(t, ledger, a, vm, c.Nodes)
-	key := vmKey(vm, 0)
+	key := vmKey(a, vm, 0)
+	if latched != (key.Incarnation != "") {
+		t.Fatalf("the scenario's key %s does not match the latch (latched=%v)", key, latched)
+	}
 	if len(out.Certified[key]) != 1 {
 		t.Errorf("certified values for %s: %v, want exactly one", key, keys(out.Certified[key]))
 	}
@@ -192,12 +206,19 @@ func (s *staleAccept) script(m ClaimMsg) ClaimFate {
 // refusal in corrosion.ClaimAccept) — a accepts the stale v1 and two values
 // are chosen at one key.
 func TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound(t *testing.T) {
+	for _, latch := range claimFormats {
+		t.Run(latch.name, func(t *testing.T) { runStaleAcceptAfterNewerRound(t, latch.latched) })
+	}
+}
+
+func runStaleAcceptAfterNewerRound(t *testing.T, latched bool) {
 	ctx := context.Background()
 	vm := "vm-cf-stale-accept"
 	c, a, b, cc, x, d := crashFleet(t, 2801, vm)
+	latchIncarnation(c, latched)
 	voters := []*Node{a, b, cc}
 	ledger := watchClaims(t, c)
-	key := vmKey(vm, 0)
+	key := vmKey(a, vm, 0)
 	s := &staleAccept{x: x, a: a, b: b, cc: cc, fenceSeen: fenceSettled{voters: voters, host: d.Name}}
 	c.SetClaimScript(s.script)
 

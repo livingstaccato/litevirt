@@ -57,12 +57,14 @@ func probeCoordinator(c *Cluster, clock *VirtualClock, on *Node) *Coordinators {
 	return cs
 }
 
-// vmKey is the attempt-0 key a recovery of name leaving epoch is claimed
-// under: scoped to the incarnation n's replica holds, as on a cluster where
-// claim_incarnation_v1 has latched (docs/design/recovery-claims.md §10 item 37).
+// vmKey is the attempt-0 key n's coordinator claims a recovery of name
+// leaving epoch under: scoped to the incarnation n's replica holds once
+// claim_incarnation_v1 has latched on n, the legacy key before
+// (docs/design/recovery-claims.md §10 item 37).
 func vmKey(n *Node, name string, epoch int64) corrosion.ClaimKey {
-	inc, _, _ := corrosion.WorkloadIncarnation(context.Background(), n.DB, corrosion.ClaimKindVM, name)
-	return corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: name, OwnerEpoch: epoch, Incarnation: inc}
+	ctx := context.Background()
+	inc, _, _ := corrosion.WorkloadIncarnation(ctx, n.DB, corrosion.ClaimKindVM, name)
+	return n.Server.ClaimKeyFor(ctx, corrosion.ClaimKindVM, name, epoch, inc)
 }
 
 // claimKeyPB is key on the wire.

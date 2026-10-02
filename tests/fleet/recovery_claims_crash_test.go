@@ -148,6 +148,15 @@ func (s *crashAfterAccepts) script(m ClaimMsg) ClaimFate {
 	return ClaimDropReply
 }
 
+// crashFormats is claimFormats plus a run in which claim_incarnation_v1
+// latches while the crashed coordinator is dead: its value sits at the legacy
+// key, and the successor claims the incarnation-scoped key (the bridge,
+// docs/design/recovery-claims.md §10 item 37).
+var crashFormats = []struct {
+	name             string
+	latched, crosses bool
+}{{"legacy-keys", false, false}, {"incarnation-keys", true, false}, {"crosses-latch", false, true}}
+
 func TestFleet_RecoveryClaim_CoordinatorCrashMidCollection(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -163,115 +172,129 @@ func TestFleet_RecoveryClaim_CoordinatorCrashMidCollection(t *testing.T) {
 		{name: "one-of-three-unseen", seed: 2602, reach: []int{1}, lostPrepare: true},
 		{name: "majority-before-certificate", seed: 2603, reach: []int{1, 2}, adopt: true},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			vm := "vm-crash-" + tc.name
-			c, a, b, cc, x, d := crashFleet(t, tc.seed, vm)
-			voters := []*Node{a, b, cc}
-			ledger := watchClaims(t, c)
-			key := vmKey(vm, 0)
+		for _, latch := range crashFormats {
+			t.Run(tc.name+"/"+latch.name, func(t *testing.T) {
+				ctx := context.Background()
+				vm := "vm-crash-" + tc.name
+				c, a, b, cc, x, d := crashFleet(t, tc.seed, vm)
+				latchIncarnation(c, latch.latched)
+				voters := []*Node{a, b, cc}
+				ledger := watchClaims(t, c)
+				key := vmKey(a, vm, 0)
 
-			s := &crashAfterAccepts{c: c, x: x, reach: map[string]bool{},
-				fenceSeen: fenceSettled{voters: voters, host: d.Name}}
-			for _, i := range tc.reach {
-				s.reach[voters[i].Name] = true
-			}
-			if tc.lostPrepare {
-				s.lostPrepare.from, s.lostPrepare.to = a.Name, voters[tc.reach[0]].Name
-			}
-			c.SetClaimScript(s.script)
-
-			clock := NewVirtualClock(time.Now().UTC())
-			cs := c.NewCoordinators(clock)
-			for _, n := range []*Node{a, x} {
-				cs.ByNode[n.Name].Gate = quorateGate{}
-				// A verified power-off. Whether x's fence row replicates before
-				// it dies is a race, and a successor resumes a recovery from a
-				// dead leader's fence only when that fence is proof-grade; a
-				// best-effort one leaves d 'fenced' and its workloads waiting for
-				// `lv host fence-confirm`, which is not what this scenario is
-				// about.
-				cs.ByNode[n.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result {
-					return fence.Result{Method: "ipmi", Success: true}
-				})
-			}
-			cs.Tick(ctx, x)
-			c.Crash(x)
-			if !s.fenceSeen.ok {
-				t.Fatalf("x's fence of %s never settled on every voter", d.Name)
-			}
-
-			// x's value is on exactly the voters it reached, and nowhere is it
-			// certified or minted.
-			var xValue *corrosion.ClaimValue
-			for _, v := range voters {
-				st := voterState(t, v, key)
-				held := st.Value != nil && st.Accepted.Coordinator == x.Name
-				if held != s.reach[v.Name] {
-					t.Fatalf("%s holds x's value = %v, want %v (state %+v)", v.Name, held, s.reach[v.Name], st)
+				s := &crashAfterAccepts{c: c, x: x, reach: map[string]bool{},
+					fenceSeen: fenceSettled{voters: voters, host: d.Name}}
+				for _, i := range tc.reach {
+					s.reach[voters[i].Name] = true
 				}
-				if held {
-					xValue = st.Value
+				if tc.lostPrepare {
+					s.lostPrepare.from, s.lostPrepare.to = a.Name, voters[tc.reach[0]].Name
 				}
-			}
-			if xValue == nil || xValue.Proof == nil {
-				t.Fatal("no voter holds x's value; the crash is vacuous")
-			}
-			for _, n := range c.Nodes {
-				if n != x && n != d {
-					if ids := proofsNaming(t, n, vm, xValue.Proof.DestHost); len(ids) != 0 {
-						t.Fatalf("%s holds a proof minted before x's crash: %v", n.Name, ids)
+				c.SetClaimScript(s.script)
+
+				clock := NewVirtualClock(time.Now().UTC())
+				cs := c.NewCoordinators(clock)
+				for _, n := range []*Node{a, x} {
+					cs.ByNode[n.Name].Gate = quorateGate{}
+					// A verified power-off. Whether x's fence row replicates before
+					// it dies is a race, and a successor resumes a recovery from a
+					// dead leader's fence only when that fence is proof-grade; a
+					// best-effort one leaves d 'fenced' and its workloads waiting for
+					// `lv host fence-confirm`, which is not what this scenario is
+					// about.
+					cs.ByNode[n.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+						return fence.Result{Method: "ipmi", Success: true}
+					})
+				}
+				cs.Tick(ctx, x)
+				c.Crash(x)
+				if !s.fenceSeen.ok {
+					t.Fatalf("x's fence of %s never settled on every voter", d.Name)
+				}
+
+				// x's value is on exactly the voters it reached, and nowhere is it
+				// certified or minted.
+				var xValue *corrosion.ClaimValue
+				for _, v := range voters {
+					st := voterState(t, v, key)
+					held := st.Value != nil && st.Accepted.Coordinator == x.Name
+					if held != s.reach[v.Name] {
+						t.Fatalf("%s holds x's value = %v, want %v (state %+v)", v.Name, held, s.reach[v.Name], st)
+					}
+					if held {
+						xValue = st.Value
 					}
 				}
-			}
-
-			// The second coordinator takes over once x's lease has run out,
-			// inside the window in which it resumes from x's fence.
-			clock.Advance(time.Minute)
-			now := clock.Now()
-			for _, n := range voters {
-				PublishHealth(t, n, d.Name, 5, now)
-			}
-			c.WaitConverged(t, convergeTimeout, voters...)
-			var decided *corrosion.VMRecord
-			for i := 0; i < 4; i++ {
-				cs.Tick(ctx, a)
-				if vmr := vmOn(t, a, vm); vmr.PendingActionID != "" && vmr.HostName != d.Name {
-					decided = vmr
-					break
+				if xValue == nil || xValue.Proof == nil {
+					t.Fatal("no voter holds x's value; the crash is vacuous")
 				}
-				clock.Advance(contentionPoll)
-			}
-			if decided == nil {
-				// What a's coordinator decided from: a stall here has so far
-				// always been the fence/lease path, not the claim.
-				for _, q := range []string{`SELECT * FROM leader_election`, `SELECT * FROM fencing_log`,
-					`SELECT name, state FROM hosts`, `SELECT observer, target, consecutive_failures, updated_at FROM host_health`} {
-					rows, err := a.DB.Query(ctx, q)
-					t.Logf("%s: %v %v", q, rows, err)
+				for _, n := range c.Nodes {
+					if n != x && n != d {
+						if ids := proofsNaming(t, n, vm, xValue.Proof.DestHost); len(ids) != 0 {
+							t.Fatalf("%s holds a proof minted before x's crash: %v", n.Name, ids)
+						}
+					}
 				}
-				t.Logf("clock now %s", clock.Now())
-				t.Fatalf("the second coordinator did not decide: %+v", vmOn(t, a, vm))
-			}
 
-			// The destination executes; every safety property holds.
-			c.WaitConverged(t, convergeTimeout, voters...)
-			claimReconciler(t, c.Node(decided.HostName)).ReconcileOnce(ctx)
-			out := checkClaimSafety(t, ledger, a, vm, c.Nodes)
-			if tc.adopt && decided.PendingActionID != xValue.Proof.ID {
-				t.Errorf("the second coordinator decided proof %s, not the crashed coordinator's %s (Paxos value adoption)",
-					decided.PendingActionID, xValue.Proof.ID)
-			}
-			if !tc.adopt && decided.PendingActionID == xValue.Proof.ID {
-				t.Errorf("the second coordinator completed x's value %s although it never saw it", xValue.Proof.ID)
-			}
-			xDigest, _ := xValue.Digest()
-			if tc.adopt != out.Chosen[key][xDigest] {
-				t.Errorf("x's value chosen = %v, want %v (chosen %v)", out.Chosen[key][xDigest], tc.adopt, keys(out.Chosen[key]))
-			}
-			if len(out.Certified[key]) != 1 {
-				t.Errorf("certified values for %s: %v, want exactly one", key, keys(out.Certified[key]))
-			}
-		})
+				// The second coordinator takes over once x's lease has run out,
+				// inside the window in which it resumes from x's fence.
+				if latch.crosses {
+					// claim_incarnation_v1 latches while x is dead: x's value
+					// sits at the legacy key, and a claims the scoped one.
+					latchIncarnation(c, true)
+				}
+				clock.Advance(time.Minute)
+				now := clock.Now()
+				for _, n := range voters {
+					PublishHealth(t, n, d.Name, 5, now)
+				}
+				c.WaitConverged(t, convergeTimeout, voters...)
+				var decided *corrosion.VMRecord
+				for i := 0; i < 4; i++ {
+					cs.Tick(ctx, a)
+					if vmr := vmOn(t, a, vm); vmr.PendingActionID != "" && vmr.HostName != d.Name {
+						decided = vmr
+						break
+					}
+					clock.Advance(contentionPoll)
+				}
+				if decided == nil {
+					// What a's coordinator decided from: a stall here has so far
+					// always been the fence/lease path, not the claim.
+					for _, q := range []string{`SELECT * FROM leader_election`, `SELECT * FROM fencing_log`,
+						`SELECT name, state FROM hosts`, `SELECT observer, target, consecutive_failures, updated_at FROM host_health`} {
+						rows, err := a.DB.Query(ctx, q)
+						t.Logf("%s: %v %v", q, rows, err)
+					}
+					t.Logf("clock now %s", clock.Now())
+					t.Fatalf("the second coordinator did not decide: %+v", vmOn(t, a, vm))
+				}
+
+				// The destination executes; every safety property holds.
+				c.WaitConverged(t, convergeTimeout, voters...)
+				claimReconciler(t, c.Node(decided.HostName)).ReconcileOnce(ctx)
+				out := checkClaimSafety(t, ledger, a, vm, c.Nodes)
+				if tc.adopt && decided.PendingActionID != xValue.Proof.ID {
+					t.Errorf("the second coordinator decided proof %s, not the crashed coordinator's %s (Paxos value adoption)",
+						decided.PendingActionID, xValue.Proof.ID)
+				}
+				if !tc.adopt && decided.PendingActionID == xValue.Proof.ID {
+					t.Errorf("the second coordinator completed x's value %s although it never saw it", xValue.Proof.ID)
+				}
+				xDigest, _ := xValue.Digest()
+				// The key a decided under: the scoped one once the latch has
+				// formed, whichever key x claimed at.
+				final := vmKey(a, vm, 0)
+				if tc.adopt != out.Chosen[final][xDigest] {
+					t.Errorf("x's value chosen at %s = %v, want %v (chosen %v)", final, out.Chosen[final][xDigest], tc.adopt, keys(out.Chosen[final]))
+				}
+				if len(out.Certified[final]) != 1 {
+					t.Errorf("certified values for %s: %v, want exactly one", final, keys(out.Certified[final]))
+				}
+				if (latch.latched || latch.crosses) != (final.Incarnation != "") || latch.latched != (key.Incarnation != "") {
+					t.Errorf("the scenario's keys %s, %s do not match the latch (%s)", key, final, latch.name)
+				}
+			})
+		}
 	}
 }

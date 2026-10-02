@@ -118,6 +118,10 @@ const (
 	// failed before acting; the workload waits for it to return or be removed
 	// for good (`lv host rm --dead`).
 	ErrClaimStranded = "recovery_claim_stranded"
+	// ErrPartitionPauseWait: a best-effort fence did not reach the host and
+	// the coordinator relies on its partition pause, so recovery waits out
+	// health.PartitionPauseWaitFor (docs/design/partition-pause.md §4).
+	ErrPartitionPauseWait = "partition_pause_wait"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

@@ -288,6 +288,28 @@ type Coordinator struct {
 	// ID, same token — so it can retry at the same round: nothing was
 	// contending, so nothing should have to outrank it (§3.13 step 6).
 	claimRetryProposals map[corrosion.ClaimKey]corrosion.ActionProof
+	// PartitionPauseEnforced is the majority's reliance predicate for partition
+	// pause (docs/design/partition-pause.md §4.3): enforcement.partition_pause
+	// on this node AND partition_pause_v1 latched. When it holds, an assumed
+	// best-effort fence is recorded as self-pause and recovery waits out
+	// PartitionPauseWaitFor. nil (a hand-built coordinator) never relies.
+	PartitionPauseEnforced func(ctx context.Context) bool
+	// PauseWaitFor replaces health.PartitionPauseWaitFor (fleet scenarios,
+	// which cannot wait production seconds). nil in production.
+	PauseWaitFor func(probeTargets int) time.Duration
+	// Mono is the monotonic clock the pause deadline is measured on (default
+	// time.Now). Never Now, which the fleet harness makes virtual.
+	Mono func() time.Time
+	// LastContact reports this node's last successful probe of a host
+	// (health.Checker.LastContact), the second anchor of the pause deadline.
+	// nil anchors on the decision alone.
+	LastContact func(host string) (time.Time, bool)
+	// pauseWaits holds recoveries waiting out a host's partition pause
+	// (partition_pause.go). In memory: a successor re-derives the wait from
+	// the self-pause fence record, anchored at its own first sight of it.
+	pauseWaits map[string]pauseWait
+	// oneWay records the hosts partition_one_way is raised for.
+	oneWay map[string]bool
 }
 
 // FailoverGate is the subset of *health.Checker the coordinator consults at
@@ -632,7 +654,16 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 
 		target := cand.target
+		// One-way partitions are made visible, never acted on differently
+		// (docs/design/partition-pause.md §7 F4).
+		if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
+			c.noteOneWay(ctx, target, failing, healthy, oneWay)
+		}
 		if c.fenced[target] {
+			// A recovery waiting out the host's partition pause continues here.
+			if c.retryPauseWait(ctx, target) {
+				continue
+			}
 			// A recovery claim refused on an earlier tick is retried here: the
 			// host is handled, but its workloads are not all moved.
 			if c.retryClaims(ctx, target) {
@@ -759,6 +790,14 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		c.failover(ctx, h)
 	}
+
+	// A one-way condition raised for a host that is no longer a fence
+	// candidate resolves: the quorum that could not reach it now can.
+	candTargets := make([]string, 0, len(candidates))
+	for _, cand := range candidates {
+		candTargets = append(candTargets, cand.target)
+	}
+	c.resolveOneWayGone(ctx, candTargets)
 
 	// Recovery pass: bring a host the coordinator marked down (offline, or a
 	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
@@ -957,6 +996,7 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 		if h, err := corrosion.GetHost(ctx, c.db, host); err == nil && h != nil && h.State == "active" {
 			delete(c.fenced, host)
 			delete(c.fenceRelocated, host)
+			delete(c.pauseWaits, host)
 		}
 	}
 }
@@ -1926,6 +1966,11 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		IPMIPass:      h.IPMIPass,
 		WatchdogDev:   h.WatchdogDev,
 	})
+	// A best-effort fence that did not reach the host is recorded as
+	// self-pause when this coordinator relies on the host's partition pause
+	// (docs/design/partition-pause.md §4.2): same row shape, assurance
+	// self_paused, and recoverFenced then waits out the pause.
+	fr = c.asSelfPause(ctx, h, fr)
 
 	logResult := "fenced"
 	if !fr.Success {
@@ -2055,7 +2100,7 @@ func fenceProvedOff(h *corrosion.HostRecord, fr fence.Result) bool {
 // under the policy wait for a confirmation it would not have needed live — the
 // safe direction.
 func fenceWasBestEffort(method, ranUnder string) bool {
-	if method == "best-effort-ssh" {
+	if method == "best-effort-ssh" || method == corrosion.FenceMethodSelfPause {
 		return true
 	}
 	if ranUnder != "" {
@@ -2196,6 +2241,14 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			return
 		}
 	}
+
+	// A fence that relied on the host's partition pause starts nothing until
+	// the pause has certainly happened (docs/design/partition-pause.md §4.2);
+	// retryPauseWait finishes it from the fence loop.
+	if fr.Method == corrosion.FenceMethodSelfPause && !c.pauseDeadlinePassed(ctx, h) {
+		return
+	}
+	delete(c.pauseWaits, h.Name)
 
 	// The fence is done and h's state row is written; everything below is
 	// recovery, and every refusal in it is therefore post-fence.

@@ -34,6 +34,11 @@ const (
 	// claim certificate gave to another host. Subject <name>@<host>.
 	CondVMSettled = "vm_settled"
 	CondCTSettled = "ct_settled"
+	// CondPartitionOneWay: the failover coordinator sees a quorum of voters
+	// failing a host while that host's own rows mark a majority healthy — a
+	// one-way partition, in which it may never pause. Visibility only
+	// (docs/design/partition-pause.md §7 F4). Subject host/<name>.
+	CondPartitionOneWay = "partition_one_way"
 )
 
 // HostPartitionPauseFailed reports whether host has an open (not resolved)

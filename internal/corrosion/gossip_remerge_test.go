@@ -3,7 +3,9 @@ package corrosion
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -165,7 +167,10 @@ func TestMissingMembers_ReadsTheHostsTableWithoutRemovedHosts(t *testing.T) {
 	}
 	c.SetMembersForTests(func() []PeerInfo { return []PeerInfo{{Name: "node-2", Addr: "10.0.0.2:7946"}} })
 
-	got := c.missingMembers(ctx, "10.0.0.1")
+	got, err := c.missingMembers(ctx, "10.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if slices.Contains(names(got), "node-3") {
 		t.Fatalf("targets = %v; a removed host must never be dialled back into the cluster", names(got))
@@ -188,38 +193,105 @@ func TestMissingMembers_RemembersGossipAddresses(t *testing.T) {
 	}
 	visible := []PeerInfo{{Name: "node-2", Addr: "127.0.0.1:20002"}}
 	c.SetMembersForTests(func() []PeerInfo { return visible })
-	if got := c.missingMembers(ctx, "127.0.0.1"); len(got) != 0 {
-		t.Fatalf("targets = %v while node-2 is visible", names(got))
+	if got, err := c.missingMembers(ctx, "127.0.0.1"); err != nil || len(got) != 0 {
+		t.Fatalf("targets = %v, err = %v while node-2 is visible", names(got), err)
 	}
 	visible = nil
-	got := c.missingMembers(ctx, "127.0.0.1")
+	got, err := c.missingMembers(ctx, "127.0.0.1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if a := addrOf(got, "node-2"); a != "127.0.0.1:20002" {
 		t.Fatalf("node-2 dialled at %q, want the address gossip last showed (127.0.0.1:20002)", a)
 	}
 }
 
-// remergeFixture is a rejoiner over a scripted view: `missing` is what the
-// hosts table lists that gossip does not show, and a join of a host listed in
-// `answers` makes it visible.
+// The remembered addresses are pruned against the hosts table: a removed host
+// is forgotten, and so is a host's old address once its recorded one changes —
+// a re-admitted host gossips somewhere else, and keeping its old port would
+// outlive every reason to.
+func TestMissingMembers_PrunesRememberedAddresses(t *testing.T) {
+	c := newPruneTestClient(t)
+	c.hostName = "node-1"
+	ctx := context.Background()
+	for _, h := range []HostRecord{
+		remergeHost("node-1", "10.0.0.1"), remergeHost("node-2", "10.0.0.2"), remergeHost("node-3", "10.0.0.3"),
+	} {
+		if err := InsertHost(ctx, c, h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.noteGossipAddr("node-2", "10.0.0.2:17946")
+	c.noteGossipAddr("node-3", "10.0.0.3:17946")
+	c.noteGossipAddr("node-9", "10.0.0.9:17946") // never listed here
+	c.SetMembersForTests(func() []PeerInfo { return nil })
+	if err := DeleteHost(ctx, c, "node-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Execute(ctx, `UPDATE hosts SET address = ?, updated_at = ? WHERE name = ?`,
+		"10.0.0.33", c.NowTS(), "node-3"); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.missingMembers(ctx, "10.0.0.1"); err != nil {
+		t.Fatal(err)
+	}
+	c.gossipAddrMu.Lock()
+	left := maps.Clone(c.gossipAddrs)
+	c.gossipAddrMu.Unlock()
+	if len(left) != 0 {
+		t.Fatalf("remembered %v; a removed host, a re-addressed host's old address and an unlisted name "+
+			"must all be forgotten", left)
+	}
+}
+
+// A failed hosts read is an error, not "nothing is missing": nothing missing
+// would reset every host's backoff and report every dialled host as re-merged.
+func TestMissingMembers_AFailedReadIsAnError(t *testing.T) {
+	c := newPruneTestClient(t)
+	c.hostName = "node-1"
+	c.SetMembersForTests(func() []PeerInfo { return nil })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := c.missingMembers(ctx, "10.0.0.1"); err == nil {
+		t.Fatal("a hosts read that failed returned no error")
+	}
+}
+
+// remergeFixture is a rejoiner over a scripted cluster. `missing` is what the
+// hosts table lists that gossip does not show. Hosts are grouped into sides,
+// and a dial that a host in `answers` takes merges that host's WHOLE side —
+// one push/pull carries the full remote state — unless the host is in
+// `refuses`, which answers the dial but is not admitted.
 type remergeFixture struct {
-	missing map[string]bool
-	answers map[string]bool
-	dials   [][]string
+	missing  map[string]bool
+	answers  map[string]bool
+	refuses  map[string]bool
+	side     map[string]string
+	failRead bool
+	dials    [][]string
+}
+
+var fixtureAddr = map[string]string{
+	"node-3": "10.0.0.3", "node-4": "10.0.0.4", "node-5": "10.0.0.5",
+	"node-6": "10.0.0.6", "node-7": "10.0.0.7", "node-8": "10.0.0.8",
 }
 
 func (f *remergeFixture) rejoiner() *rejoiner {
-	addr := map[string]string{"node-3": "10.0.0.3", "node-4": "10.0.0.4", "node-5": "10.0.0.5", "node-6": "10.0.0.6"}
 	name := map[string]string{}
-	for n, a := range addr {
+	for n, a := range fixtureAddr {
 		name[a] = n
 	}
 	return &rejoiner{
 		peerCount: func() int { return 1 },
 		targets:   func() []string { return []string{"seed-1:7946", "seed-2:7946"} },
-		missing: func() []remergeTarget {
+		missing: func() ([]remergeTarget, error) {
+			if f.failRead {
+				return nil, errors.New("database is locked")
+			}
 			var out []remergeTarget
 			for n := range f.missing {
-				out = append(out, remergeTarget{Name: n, Addr: addr[n]})
+				out = append(out, remergeTarget{Name: n, Addr: fixtureAddr[n]})
 			}
 			slices.SortFunc(out, func(a, b remergeTarget) int {
 				if a.Name < b.Name {
@@ -227,29 +299,61 @@ func (f *remergeFixture) rejoiner() *rejoiner {
 				}
 				return 1
 			})
-			return out
+			return out, nil
 		},
 		join: func(ts []string) (int, error) {
 			f.dials = append(f.dials, slices.Clone(ts))
 			n := 0
 			for _, a := range ts {
-				if f.answers[name[a]] {
-					delete(f.missing, name[a])
-					n++
+				h := name[a]
+				if !f.answers[h] {
+					continue
+				}
+				n++
+				if f.refuses[h] {
+					continue
+				}
+				delete(f.missing, h)
+				if s := f.side[h]; s != "" {
+					for o := range f.missing {
+						if f.side[o] == s {
+							delete(f.missing, o)
+						}
+					}
 				}
 			}
 			if n < len(ts) {
-				return n, errors.New("i/o timeout")
+				return n, errors.New("dial tcp " + ts[0] + ":7946: i/o timeout")
 			}
 			return n, nil
 		},
 	}
 }
 
-// With peers visible, the loop dials the missing hosts — and only them, never
-// the seeds.
-func TestRejoiner_RemergeDialsOnlyTheMissingHosts(t *testing.T) {
-	f := &remergeFixture{missing: map[string]bool{"node-3": true, "node-4": true}, answers: map[string]bool{"node-3": true, "node-4": true}}
+func (f *remergeFixture) dialled() []string {
+	var out []string
+	for _, d := range f.dials {
+		out = append(out, d...)
+	}
+	return out
+}
+
+func set(xs ...string) map[string]bool {
+	m := map[string]bool{}
+	for _, x := range xs {
+		m[x] = true
+	}
+	return m
+}
+
+// With peers visible, the loop dials the missing hosts — never the seeds — one
+// address per dial, and stops at the first that answers: its push/pull carried
+// the whole other side, so dialling the rest of that side is waste.
+func TestRejoiner_RemergeDialsOnlyTheMissingHostsAndStopsAtTheFirstAnswer(t *testing.T) {
+	f := &remergeFixture{
+		missing: set("node-3", "node-4"), answers: set("node-3", "node-4"),
+		side: map[string]string{"node-3": "b", "node-4": "b"},
+	}
 	r := f.rejoiner()
 
 	if attempted, _, _ := r.tick(); attempted {
@@ -257,17 +361,17 @@ func TestRejoiner_RemergeDialsOnlyTheMissingHosts(t *testing.T) {
 	}
 	res := r.remerge()
 
-	if len(f.dials) != 1 {
-		t.Fatalf("dial calls = %v, want one pass", f.dials)
+	if want := []string{"10.0.0.3"}; !slices.Equal(f.dialled(), want) {
+		t.Fatalf("dialled %v, want %v: only missing hosts, never the seeds, and nothing after the first "+
+			"host that answered", f.dialled(), want)
 	}
-	if want := []string{"10.0.0.3", "10.0.0.4"}; !slices.Equal(f.dials[0], want) {
-		t.Fatalf("dialled %v, want only the missing hosts %v — not the seeds", f.dials[0], want)
+	for _, d := range f.dials {
+		if len(d) != 1 {
+			t.Fatalf("one join dialled %v; each host is its own dial, so one dead host cannot hold up the rest", d)
+		}
 	}
 	if want := []string{"node-3", "node-4"}; !slices.Equal(res.recovered, want) {
 		t.Errorf("recovered = %v, want %v", res.recovered, want)
-	}
-	if len(res.missing) != 0 {
-		t.Errorf("still missing = %v, want none", res.missing)
 	}
 }
 
@@ -283,11 +387,88 @@ func TestRejoiner_RemergeDialsNothingWhenNothingIsMissing(t *testing.T) {
 	}
 }
 
+// A pass dials at most remergeMaxDials hosts, so K dead hosts cost one pass at
+// most remergeMaxDials TCP timeouts, not K. The ones left over are not
+// penalised: they are dialled on the next pass.
+func TestRejoiner_RemergeCapsTheDialsInOnePass(t *testing.T) {
+	dead := []string{"node-3", "node-4", "node-5", "node-6", "node-7", "node-8"}
+	f := &remergeFixture{missing: set(dead...), answers: map[string]bool{}}
+	r := f.rejoiner()
+
+	seen := map[string]bool{}
+	for pass := 0; pass < 2; pass++ {
+		before := len(f.dials)
+		r.remerge()
+		if n := len(f.dials) - before; n > remergeMaxDials {
+			t.Fatalf("pass %d dialled %d hosts; the cap is %d", pass, n, remergeMaxDials)
+		}
+		for _, d := range f.dials[before:] {
+			seen[d[0]] = true
+		}
+	}
+	if len(seen) != len(dead) {
+		t.Fatalf("dialled %v in two passes; every one of %d missing hosts must get its turn", seen, len(dead))
+	}
+}
+
+// A host that has just dropped out is dialled BEFORE hosts that have been
+// missing for a while — those are most likely dead, and a host that just went
+// missing is most likely the one that can answer.
+func TestRejoiner_RemergeDialsNewlyMissingHostsFirst(t *testing.T) {
+	f := &remergeFixture{missing: set("node-3", "node-4", "node-5"), answers: map[string]bool{}}
+	r := f.rejoiner()
+	for i := 0; i < 20; i++ {
+		r.remerge() // node-3..5 are long dead
+	}
+	for _, b := range r.backoff {
+		b.wait = 0 // and all due this very pass
+	}
+	f.missing["node-6"] = true
+	f.answers["node-6"] = true
+	f.dials = nil
+
+	res := r.remerge()
+
+	if want := []string{"10.0.0.6"}; !slices.Equal(f.dialled(), want) {
+		t.Fatalf("dialled %v, want %v: the newly missing host first, and nothing after it answered",
+			f.dialled(), want)
+	}
+	if !slices.Contains(res.recovered, "node-6") {
+		t.Errorf("recovered = %v, want node-6", res.recovered)
+	}
+	for _, n := range []string{"node-3", "node-4", "node-5"} {
+		if r.backoff[n].wait != 0 {
+			t.Errorf("%s was not dialled this pass but its backoff moved to %+v", n, *r.backoff[n])
+		}
+	}
+}
+
+// A dead host is skipped once a host behind it answers; a host on a THIRD side,
+// left undialled, is not penalised for it.
+func TestRejoiner_RemergeStopsAtTheFirstAnswerWithoutPenalisingTheRest(t *testing.T) {
+	f := &remergeFixture{
+		missing: set("node-3", "node-4", "node-5"), answers: set("node-4", "node-5"),
+		side: map[string]string{"node-4": "b", "node-5": "c"},
+	}
+	r := f.rejoiner()
+	r.remerge()
+	if want := []string{"10.0.0.3", "10.0.0.4"}; !slices.Equal(f.dialled(), want) {
+		t.Fatalf("dialled %v, want %v", f.dialled(), want)
+	}
+	if b := r.backoff["node-5"]; b == nil || b.wait != 0 || b.failures != 0 {
+		t.Fatalf("node-5 was never dialled but its backoff is %+v", b)
+	}
+	f.dials = nil
+	r.remerge()
+	if !slices.Contains(f.dialled(), "10.0.0.5") {
+		t.Fatalf("dialled %v on the next pass; node-5 was due and undialled", f.dialled())
+	}
+}
+
 // A host that is dead but not removed is dialled on a backoff, capped, so it
-// costs at most one dial every remergeMaxSkip+1 passes — while a host that goes
-// missing later is dialled at once, not held behind the dead one's backoff.
+// costs at most one dial every remergeMaxSkip+1 passes.
 func TestRejoiner_RemergeBacksOffAPermanentlyMissingHost(t *testing.T) {
-	f := &remergeFixture{missing: map[string]bool{"node-5": true}, answers: map[string]bool{}}
+	f := &remergeFixture{missing: set("node-5"), answers: map[string]bool{}}
 	r := f.rejoiner()
 
 	var dialledAt []int
@@ -315,25 +496,12 @@ func TestRejoiner_RemergeBacksOffAPermanentlyMissingHost(t *testing.T) {
 		t.Fatalf("dialled %d times in %d passes (at %v); a dead host must back off to one dial per %d passes",
 			len(dialledAt), passes, dialledAt, remergeMaxSkip+1)
 	}
-
-	// node-6 drops out while node-5 is backed off: it is dialled on the very
-	// next pass, alone if node-5 is not due.
-	f.missing["node-6"] = true
-	f.answers["node-6"] = true
-	before := len(f.dials)
-	res := r.remerge()
-	if len(f.dials) != before+1 || !slices.Contains(f.dials[len(f.dials)-1], "10.0.0.6") {
-		t.Fatalf("a newly missing host was not dialled on the next pass: dials %v", f.dials[before:])
-	}
-	if !slices.Contains(res.recovered, "node-6") {
-		t.Errorf("recovered = %v, want node-6", res.recovered)
-	}
 }
 
 // A host that comes back is forgotten: if it drops out again it is dialled at
 // once, not from where its old backoff left off.
 func TestRejoiner_RemergeBackoffResetsWhenAHostReturns(t *testing.T) {
-	f := &remergeFixture{missing: map[string]bool{"node-5": true}, answers: map[string]bool{}}
+	f := &remergeFixture{missing: set("node-5"), answers: map[string]bool{}}
 	r := f.rejoiner()
 	for i := 0; i < 12; i++ {
 		r.remerge() // deep into node-5's backoff
@@ -352,6 +520,64 @@ func TestRejoiner_RemergeBackoffResetsWhenAHostReturns(t *testing.T) {
 	}
 }
 
+// A failed hosts read skips the pass whole: no dial, every backoff exactly as
+// it was, nothing reported as re-merged.
+func TestRejoiner_RemergeSkipsThePassWhenTheReadFails(t *testing.T) {
+	f := &remergeFixture{missing: set("node-3", "node-5"), answers: map[string]bool{}}
+	r := f.rejoiner()
+	for i := 0; i < 5; i++ {
+		r.remerge()
+	}
+	snapshot := map[string]remergeBackoff{}
+	for n, b := range r.backoff {
+		snapshot[n] = *b
+	}
+	f.failRead = true
+	f.dials = nil
+
+	res := r.remerge()
+
+	if res.err == nil {
+		t.Fatal("a pass whose hosts read failed reported no error")
+	}
+	if len(f.dials) != 0 || len(res.recovered) != 0 {
+		t.Fatalf("dials %v, recovered %v; a pass that cannot read the membership must do nothing", f.dials, res.recovered)
+	}
+	for n, b := range r.backoff {
+		if *b != snapshot[n] {
+			t.Errorf("%s backoff %+v, was %+v before a pass that could not read", n, *b, snapshot[n])
+		}
+	}
+	if len(r.backoff) != len(snapshot) {
+		t.Errorf("backoff %v, was %v", r.backoff, snapshot)
+	}
+}
+
+// Each dialled host's outcome is its own: a host whose dial failed carries ITS
+// error, and a host that answered but is still not a member — refused at
+// admission, or something else answering at that address — is not reported as
+// unreachable, and carries no error it did not have.
+func TestRejoiner_RemergeReportsEachHostsOwnOutcome(t *testing.T) {
+	f := &remergeFixture{missing: set("node-3", "node-4"), answers: set("node-4"), refuses: set("node-4")}
+	r := f.rejoiner()
+
+	res := r.remerge()
+
+	got := map[string]remergeOutcome{}
+	for _, o := range res.outcomes {
+		got[o.Name] = o
+	}
+	if o := got["node-3"]; o.Kind != remergeUnreachable || o.Err == nil || !strings.Contains(o.Err.Error(), "10.0.0.3") {
+		t.Errorf("node-3 outcome = %+v, want unreachable with its own dial error", o)
+	}
+	if o := got["node-4"]; o.Kind != remergeNotAdmitted || o.Err != nil {
+		t.Errorf("node-4 outcome = %+v, want answered-but-not-a-member with no error", o)
+	}
+	if len(res.recovered) != 0 {
+		t.Errorf("recovered = %v, want none", res.recovered)
+	}
+}
+
 // Re-merging is not isolation. A node that sees peers but misses some of the
 // listed hosts must not mark its replica stale or raise gossip_isolated on
 // every pass: a permanently dead, unremoved host would hold every node of the
@@ -359,7 +585,7 @@ func TestRejoiner_RemergeBackoffResetsWhenAHostReturns(t *testing.T) {
 func TestMembershipTick_RemergeIsNotIsolation(t *testing.T) {
 	c := isolationClient(t)
 	c.markReplicaCaughtUp(c.replicaFreshnessGen(), "peer-1")
-	f := &remergeFixture{missing: map[string]bool{"node-5": true}, answers: map[string]bool{}}
+	f := &remergeFixture{missing: set("node-5"), answers: map[string]bool{}}
 	r := f.rejoiner()
 
 	c.membershipTick(context.Background(), r, reporter(c))
@@ -382,7 +608,10 @@ func TestMembershipTick_IsolatedPathDoesNotAlsoRemerge(t *testing.T) {
 	c := isolationClient(t)
 	r := isolatedRejoiner()
 	remerged := 0
-	r.missing = func() []remergeTarget { remerged++; return []remergeTarget{{Name: "node-9", Addr: "10.0.0.9"}} }
+	r.missing = func() ([]remergeTarget, error) {
+		remerged++
+		return []remergeTarget{{Name: "node-9", Addr: "10.0.0.9"}}, nil
+	}
 	c.membershipTick(context.Background(), r, reporter(c))
 	if remerged != 0 {
 		t.Fatal("an isolated pass also ran the re-merge pass; the isolated path already dials every target")

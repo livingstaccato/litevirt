@@ -1001,25 +1001,43 @@ leadership churn or a partition.
     neither side is empty. A host's state does not matter. The majority of a
     partition marks the other side `fenced` or `offline`, and those are exactly
     the hosts that need to merge back and learn it.
-- The second case costs one dial per missing host per pass. A healthy cluster
-  dials nobody, and the pass never re-joins on a timer regardless. A host that
-  stays missing is backed off: it is dialled again after one skipped pass, then
-  three, and from then on every fourth pass (about every 2–3 minutes). So a host
-  that is dead but was never removed costs one bounded dial per few minutes, and
-  a partition of any length re-merges within one capped wait after it heals.
-  Remove dead hosts with `lv host rm --dead <host>` to stop the dials.
+- The second case dials only missing hosts, one at a time. A healthy cluster
+  dials nobody, and the pass never re-joins on a timer regardless. A pass dials
+  hosts that have only just gone missing first, then the ones that have been
+  missing longer. It dials at most three hosts. It stops at the first host that
+  answers, because that one exchange carries the whole other side. A host that
+  is still missing after a dial is backed off: it is dialled again after one
+  skipped pass, then three, and from then on every fourth pass (about every 2–3
+  minutes). A host that is due but not dialled, because of the three-host limit
+  or the early stop, keeps its place for the next pass.
+- So a dead host that was never removed costs one bounded dial every few
+  minutes. A pass blocks for at most three dial timeouts (10 s each), however
+  many hosts are dead. A partition of any length re-merges within one capped
+  wait after it heals. Remove dead hosts with `lv host rm --dead <host>` to stop
+  the dials.
 - A missing host is dialled at the gossip address memberlist last showed for it,
-  if that still matches its recorded address. Otherwise it is dialled at its
-  recorded address on this node's own `gossip_port`, so keep `gossip_port`
-  uniform across the cluster.
+  if that still matches its recorded address. Otherwise, for example after a
+  restart, which forgets these addresses, it is dialled at its recorded address
+  on this node's own `gossip_port`. So keep `gossip_port` uniform across the
+  cluster. A remembered address is dropped when its host is removed or
+  re-addressed.
 - A re-join is memberlist's ordinary join, so it passes the same admission and
   runs under the same gossip key as a first join. A removed host is never
-  dialled, and a host gossip admission would refuse stays refused.
-- A pass that re-merges logs `gossip: re-merged hosts the cluster lists that
-  were missing from membership`. A dialled host that still does not answer logs
-  `gossip: hosts the cluster lists are missing from membership and did not
-  answer a re-join`, once per dial. This is not `gossip_isolated`, and it does
-  not mark the node's replica stale: the node still sees peers.
+  dialled, and a host that gossip admission would refuse stays refused.
+- Each pass logs every host it dialled:
+  - `gossip: re-merged hosts the cluster lists that were missing from
+    membership` names the hosts that are back.
+  - `gossip: a host the cluster lists is missing from membership and its gossip
+    address did not answer` carries that host's own dial error.
+  - `gossip: a host the cluster lists answered a re-join but is still not a
+    member` means something answered at the host's address, but the host was
+    not admitted. Check that it announces the address its `hosts` row records
+    (`advertise_address`).
+  - A pass that cannot read the `hosts` table is skipped, with a warning, and
+    changes no backoff.
+
+  None of this is `gossip_isolated`, and none of it marks the node's replica
+  stale: the node still sees peers.
 
 ### Secret-bearing repair is peer-only
 - Secret-bearing config is **excluded from the operator-readable full-state

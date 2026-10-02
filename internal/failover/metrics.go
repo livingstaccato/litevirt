@@ -80,6 +80,10 @@ const (
 	ErrUpgrading       = "upgrading"
 	ErrRecentlyFenced  = "recently_fenced"
 	ErrRecoveryResumed = "recovery_resumed" // recovery picked up from a fence a previous leader recorded
+	// ErrRefenceFailed: a successor re-fenced a host whose recorded verified
+	// fence was aged or in doubt, the re-fence failed, and the recovery was
+	// left for an operator's `lv host fence-confirm`.
+	ErrRefenceFailed = "refence_failed"
 	// recovery picked up from an operator confirmation of a host whose recovery
 	// was refused for lack of one
 	ErrConfirmationResumed = "confirmation_resumed"

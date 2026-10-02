@@ -67,3 +67,23 @@ func TestPartitionPauseToken_Shape(t *testing.T) {
 		t.Errorf("%s is not in All(); its durable latch would not be pre-loaded at startup", tok)
 	}
 }
+
+// A node that latched partition_pause_v1 and then turned its flag off reports
+// the token in not_enforcing: its peers rely on it pausing, and must not
+// depend on noticing that it stopped advertising (docs/design/partition-pause.md §5).
+//
+// Mutation: drop PartitionPauseV1 from withheldStandDowns — the stood-down node
+// reports nothing and this goes red.
+func TestNotEnforcing_ReportsAPartitionPauseStandDown(t *testing.T) {
+	s := testServer(t)
+	s.SetGate(fakeServerGate{execOK: true, enforcedTok: map[string]bool{capabilities.PartitionPauseV1: true}})
+	s.SetPartitionPause(false)
+	if !slices.Contains(s.notEnforcingTokens(), capabilities.PartitionPauseV1) {
+		t.Fatalf("a node with %s latched and its flag off does not report it: %v",
+			capabilities.PartitionPauseV1, s.notEnforcingTokens())
+	}
+	s.SetPartitionPause(true)
+	if slices.Contains(s.notEnforcingTokens(), capabilities.PartitionPauseV1) {
+		t.Fatalf("a flag-on node reports %s as not enforced", capabilities.PartitionPauseV1)
+	}
+}

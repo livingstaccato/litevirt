@@ -236,7 +236,7 @@ func (s *Server) withheldStandDowns(advertised []string) []string {
 		return nil
 	}
 	var out []string
-	for _, tok := range []string{capabilities.RecoveryClaimV1} {
+	for _, tok := range []string{capabilities.RecoveryClaimV1, capabilities.PartitionPauseV1} {
 		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && s.gate.Latched(tok) {
 			out = append(out, tok)
 		}

@@ -216,3 +216,10 @@ func ReadPauseRecord(dataDir, kind, name string) (PauseRecord, bool, error) {
 func RemovePauseRecord(dataDir, kind, name string) error {
 	return newPauseStore(dataDir).remove(kind, name)
 }
+
+// WritePauseRecordForTests writes rec under dataDir as the pauser would.
+// Test seam for packages that must see a host's partition pause (a refused
+// memory snapshot); production never calls it.
+func WritePauseRecordForTests(dataDir string, rec PauseRecord) error {
+	return newPauseStore(dataDir).put(rec)
+}

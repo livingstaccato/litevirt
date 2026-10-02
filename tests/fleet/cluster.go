@@ -150,6 +150,10 @@ type Cluster struct {
 	// checker's peer table in-process (no probe loop runs), so without this a
 	// fleet scenario has no way to model a host REJOINING — see Node.Rejoin.
 	reach *reachSet
+	// claimScript, when set, decides each claim RPC's fate before the link's
+	// ClaimFault does (claim_faults.go).
+	claimScriptMu sync.Mutex
+	claimScript   ClaimScript
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and

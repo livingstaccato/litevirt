@@ -88,6 +88,10 @@ type LinkFault struct {
 	// seconds later, rather than at once. A caller whose deadline is shorter
 	// sees its own deadline instead.
 	ClaimDelay time.Duration
+	// Claim is what the network does to each Prepare and Accept on the link —
+	// drop the request, lose the reply, duplicate it, or hold it until after
+	// the sender's next claim RPC (claim_faults.go).
+	Claim ClaimFault
 }
 
 // LinkStats counts what the injector did on one directed link.
@@ -115,6 +119,7 @@ type linkState struct {
 	rng   *rand.Rand
 	held  []heldPush
 	stats LinkStats
+	claim *claimLink // the claim-RPC injector's state (claim_faults.go)
 }
 
 // faults is the receiving node's injector: sender name → link state.
@@ -156,6 +161,7 @@ func (c *Cluster) SetLinkFault(from, to *Node, f LinkFault) {
 	ls.fault = f
 	to.faults.mu.Unlock()
 	to.deliverHeld(from.Name, held)
+	to.deliverHeldClaims(from.Name, to.takeHeldClaims(from.Name))
 }
 
 // SetLinkFaultBoth applies f to a→b and b→a.
@@ -293,6 +299,9 @@ func (n *Node) faultUnaryInterceptor(ctx context.Context, req any, info *grpc.Un
 				case <-ctx.Done():
 					return nil, status.FromContextError(ctx.Err()).Err()
 				}
+			}
+			if m := methodName(info.FullMethod); faultedClaimMethods[m] {
+				return n.claimFaultIntercept(ctx, req, from, m, handler)
 			}
 		}
 		return handler(ctx, req)

@@ -547,13 +547,18 @@ func TestFleet_PartitionPause_FleetWideBlipPausesThenResumesEverything(t *testin
 		}
 		return true
 	})
-	for _, n := range c.Nodes {
-		row, ok, err := corrosion.GetHealthCondition(ctx, n.DB, corrosion.PartitionPauseEvaluator,
-			corrosion.CondPartitionPaused, "host", n.Name)
-		if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
-			t.Fatalf("%s has no open partition_paused while its workload is paused: (%+v, %v, %v)", n.Name, row, ok, err)
+	// The condition is written at the end of the pass that paused, just after
+	// the suspend the wait above observed.
+	eventually(t, 30*time.Second, "an open partition_paused on every node while its workload is paused", func() bool {
+		for _, n := range c.Nodes {
+			row, ok, err := corrosion.GetHealthCondition(ctx, n.DB, corrosion.PartitionPauseEvaluator,
+				corrosion.CondPartitionPaused, "host", n.Name)
+			if err != nil || !ok || row.Lifecycle == corrosion.ConditionResolved {
+				return false
+			}
 		}
-	}
+		return true
+	})
 
 	c.HealGossip()
 	eventually(t, 90*time.Second, "every workload to resume after the heal", func() bool {

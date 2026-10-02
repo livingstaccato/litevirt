@@ -241,6 +241,10 @@ type Coordinator struct {
 	// last declined to fence it, so the explanation is logged once per change
 	// rather than once per poll. See noteRegionDeclined.
 	regionDeclined map[string]string
+	// resumeDeclined records, per host, the fence ID resumableFence last found
+	// no longer standing, so the explanation is logged once per fence rather
+	// than once per poll. See noteResumeDeclined.
+	resumeDeclined map[string]string
 	// SelfFenced reports whether THIS node has self-fenced (tripped the watchdog) and is
 	// waiting to reboot. A doomed node must not drive ANY failover decision during that
 	// window, even if quorum transiently returns first. Wired by the daemon from the
@@ -658,11 +662,10 @@ func (c *Coordinator) run(ctx context.Context) {
 			// coordinators: a fence that ends with the lease gone records the
 			// power-off and leaves the reschedule to whoever holds the lease
 			// next (see failover). That host is still here, quorum-down with its
-			// workloads on it, and a plain skip would strand them until the
-			// fence aged out of recentFenceWindow and the host was pointlessly
-			// powered off a second time. Resume from the record instead: it is a
-			// VERIFIED power-off, so the authority to reschedule already exists
-			// and no second fence is needed.
+			// workloads on it, and a plain skip would strand them. Resume from
+			// the record instead: the fence that wrote this state is the
+			// authority to reschedule, for as long as it still stands (see
+			// resumableFence), and no second fence is needed.
 			if rec, ok := c.resumableFence(ctx, h); ok {
 				slog.Info("failover: resuming recovery from a fence a previous leader recorded",
 					"host", target, "fence_id", rec.ID, "method", rec.Method)
@@ -1353,25 +1356,147 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 }
 
 // resumableFence returns the recorded fence a stranded recovery may be resumed
-// from, or ok=false when there is none. It demands all three of:
+// from, or ok=false when there is none. It is the authority a successor takes
+// over from a leader that fenced h and stopped — lost the lease, or died —
+// before recovering its workloads, and it demands all of:
 //
 //   - the host is in 'fenced' state — the cluster's own record that it believes
 //     this host was fenced. An operator who has undrained the host back to
-//     'active' has consumed that fence, and a reschedule on the strength of a
+//     'active' has consumed that fence, and so has the host's own daemon, whose
+//     boot write records it 'active'; a reschedule on the strength of a
 //     superseded record is exactly the split-brain fencing exists to prevent;
-//   - a result="fenced" row, i.e. a fence that actually RAN, not an operator's
-//     "manual-confirmed" attestation (which never produces the 'fenced' state);
-//   - proof-grade and within recentFenceWindow, so the power-off is both
-//     verified and recent enough to still be authority.
+//   - the NEWEST fence attempt on record ran and succeeded (result "fenced"):
+//     not an operator's "manual-confirmed" attestation, which the confirmation
+//     path (resumeFromConfirmation) owns, and not a later failed attempt;
+//   - that fence is one the leader could itself have acted on: fenceProvedOff
+//     for this host as it stands, the rule that wrote the 'fenced' state. A
+//     verified (IPMI) power-off and an SSH or best-effort success both qualify
+//     unless the host carries LabelFenceRequiresConfirmation. The resume
+//     re-enters recoverFenced with the recorded method, so the safe-fence
+//     policy and the label apply to it exactly as they would have to the
+//     leader: the successor gets the dead leader's authority and no more.
+//     Re-fencing instead buys nothing. A second SSH power-off of a host that
+//     is already off cannot connect and reports a FAILED fence, which strands
+//     the workloads behind the split-brain guard;
+//   - the fence still stands (fenceStillStands): it belongs to the outage in
+//     progress, and nobody has seen the host answer since.
+//
+// It is not bounded by recentFenceWindow. A power-off is a fact about the host
+// until the host comes back, and the window only ever measured how long ago
+// the record was written — so a successor that took over six minutes after the
+// fence found nothing to resume, and the workloads waited for
+// `lv host fence-confirm` forever.
 func (c *Coordinator) resumableFence(ctx context.Context, h *corrosion.HostRecord) (fenceRecord, bool) {
 	if h.State != "fenced" {
 		return fenceRecord{}, false
 	}
-	rec, ok := c.newestProofGradeFence(ctx, h.Name)
+	rec, at, ok := c.newestFenceAttempt(ctx, h.Name)
 	if !ok || rec.Result != "fenced" {
 		return fenceRecord{}, false
 	}
+	if !fenceProvedOff(h, fence.Result{Success: true, Method: rec.Method}) {
+		return fenceRecord{}, false
+	}
+	if why, stands := c.fenceStillStands(ctx, h.Name, at); !stands {
+		c.noteResumeDeclined(h.Name, rec, why)
+		return fenceRecord{}, false
+	}
 	return rec, true
+}
+
+// fenceStillStands reports whether a fence of host at `at` is still authority
+// over the outage host is in now, and when it is not, why.
+//
+// Two things must hold, and both fail towards refusing:
+//
+//   - the fence belongs to this outage (attemptIsThisOutage): it is inside
+//     recentFenceWindow, or some observer has watched the host fail without a
+//     break since before it;
+//   - nobody has seen the host answer since: no observer's latest verdict
+//     about it, healthy or unready, is newer than the fence. A host that
+//     answered a probe after a verified power-off was powered on again, and a
+//     host that answered after a best-effort one was never off.
+//
+// The second is checked inside the window too, which is stricter than the
+// window ever was: a host can come back within five minutes. A verdict
+// overwritten since by a failing one is not lost evidence. That failing run
+// began after the fence, which the first check reads once the window passes.
+func (c *Coordinator) fenceStillStands(ctx context.Context, host string, at time.Time) (string, bool) {
+	if !c.attemptIsThisOutage(ctx, host, at) {
+		return "no observer has watched the host stay down since the fence", false
+	}
+	rows, err := c.db.Query(ctx,
+		`SELECT observer, status, consecutive_failures, updated_at FROM host_health WHERE target = ?`, host)
+	if err != nil {
+		slog.Warn("failover: host_health read for a fence resume failed", "host", host, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return "host_health unreadable", false
+	}
+	for _, r := range rows {
+		if r.String("observer") == host {
+			continue
+		}
+		if r.Int("consecutive_failures") != 0 && r.String("status") != health.StatusUnready {
+			continue
+		}
+		upd, ok := corrosion.ParseUpdatedAt(r.String("updated_at"))
+		// fencing_log timestamps carry second precision, truncated: a verdict
+		// inside the fence's own second does not count as after it.
+		if ok && upd.After(at.Add(time.Second)) {
+			return "observer " + r.String("observer") + " saw the host answer after the fence", false
+		}
+	}
+	return "", true
+}
+
+// noteResumeDeclined logs, once per host and fence, that a recorded fence was
+// found and is no longer authority: the one line that explains why a 'fenced'
+// host's workloads are staying where they are.
+func (c *Coordinator) noteResumeDeclined(host string, rec fenceRecord, why string) {
+	if c.resumeDeclined == nil {
+		c.resumeDeclined = map[string]string{}
+	}
+	if c.resumeDeclined[host] == rec.ID {
+		return
+	}
+	c.resumeDeclined[host] = rec.ID
+	slog.Warn("failover: the recorded fence of this host no longer stands, NOT resuming its recovery",
+		"host", host, "fence_id", rec.ID, "method", rec.Method, "fenced_at", rec.TS, "reason", why,
+		"hint", "if the host is down, 'lv host undrain "+host+"' lets the coordinator fence it afresh for this outage")
+}
+
+// newestFenceAttempt returns the newest fence that RAN against host (a
+// fencing_log row with result "fenced" or "partial", of any age) and its time,
+// or ok=false when none exists. Operator confirmations are not attempts.
+// Timestamps are compared in Go on RFC3339, for fenceWithinWindow's reason.
+func (c *Coordinator) newestFenceAttempt(ctx context.Context, host string) (fenceRecord, time.Time, bool) {
+	rows, err := c.db.Query(ctx,
+		`SELECT id, method, result, detail, timestamp FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		slog.Warn("failover: fencing_log read for a fence resume failed", "host", host, "error", err)
+		c.mAttempt(PhaseRecovery, ResultError, ErrDBError)
+		return fenceRecord{}, time.Time{}, false
+	}
+	var best time.Time
+	var out fenceRecord
+	found := false
+	for _, r := range rows {
+		if res := r.String("result"); res != "fenced" && res != "partial" {
+			continue
+		}
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if perr != nil {
+			continue
+		}
+		if !found || ts.After(best) {
+			best, found = ts, true
+			out = fenceRecord{
+				ID: r.String("id"), Method: r.String("method"), Result: r.String("result"),
+				Detail: r.String("detail"), TS: r.String("timestamp"),
+			}
+		}
+	}
+	return out, best, found
 }
 
 // confirmationResume returns the operator confirmation that authorises

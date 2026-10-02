@@ -125,12 +125,9 @@ func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, s
 		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
 	}
 	// leader_lease_terms keeps both contested claims by design
-	// (leader_lease_contest_test.go). health_conditions can be left apart
-	// too, and that is not the claim protocol: both lease holders raise the
-	// same ha.voter.unavailable row in the window, the upsert that applies
-	// the other's copy keeps the local created_at, and the two rows then
-	// differ only in created_at under one updated_at — an LWW tie no merge
-	// settles.
+	// (leader_lease_contest_test.go). health_conditions is NOT excepted: both
+	// lease holders raise the same ha.voter.unavailable row in the window,
+	// and the two raises must converge (health_condition_two_raisers_test.go).
 	c.WaitConvergedExcept(t, convergeTimeout, []string{"leader_lease_terms", "health_conditions"}, a, b)
 	for _, n := range []*Node{a, b} {
 		claimReconciler(t, n).ReconcileOnce(ctx)

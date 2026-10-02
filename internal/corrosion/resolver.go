@@ -463,7 +463,10 @@ var capabilityMap = map[string]tableResolver{
 	// instance at a time (the detector lease holder), and capacity observations
 	// only by the host they describe — single-writer per row, so an exact-instant
 	// tie already means something is wrong; the default chain settles it
-	// deterministically, and the next scan overwrites whatever won.
+	// deterministically, and the next scan overwrites whatever won. Two lease
+	// holders raising one condition do not reach this chain at all: their
+	// rows agree on created_at (healthConditionCreatedAt), so the newer raise
+	// wins outright by LWW.
 	"health_conditions":          {category: "content", chain: contentDefaultChain()},
 	"health_evaluator_status":    {category: "content", chain: contentDefaultChain()},
 	"host_capacity_observations": {category: "content", chain: contentDefaultChain()},

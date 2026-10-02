@@ -68,8 +68,13 @@ func testHealedPartitionRemerges(t *testing.T, key []byte, restarted bool) {
 
 	c.SplitGossip(minority, majority)
 
-	// Each side declares the other dead...
-	c.WaitGossip(t, 30*time.Second, "each side of the split to lose the other", func() bool {
+	// Each side declares the other dead... which can take well over 30 s. A
+	// node whose probes keep failing degrades its own Lifeguard health score,
+	// and memberlist stretches its probe interval and suspicion timeout by up
+	// to 8x: on the two-node side, node-0 has been seen still holding a
+	// majority node alive 30 s in while that node had long dropped node-0.
+	// This bound is how long detection may take, not a claim about it.
+	c.WaitGossip(t, 2*time.Minute, "each side of the split to lose the other", func() bool {
 		for _, a := range minority {
 			for _, b := range majority {
 				if GossipSees(a, b) || GossipSees(b, a) {

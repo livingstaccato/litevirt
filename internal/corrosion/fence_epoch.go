@@ -97,6 +97,8 @@ const (
 	// within T_pause, and the coordinator started nothing until
 	// health.PartitionPauseWait had certainly passed. It says the old copy
 	// stopped EXECUTING, not that the host is off, so it is not proof-grade.
+	// Only FenceAssuranceDetail returns it: the row is a best-effort-ssh row
+	// whose detail carries FencePauseReliance.
 	FenceSelfPaused = "self_paused"
 	// FenceAwaitingConfirmation: a manual fence, waiting for a human. Not a
 	// failure — that is the strategy working as designed.
@@ -131,7 +133,7 @@ func FenceAssurance(method, result string) string {
 		return FenceAwaitingConfirmation
 	case result == "partial":
 		switch method {
-		case "ipmi", "ssh", "watchdog", "best-effort-ssh", FenceMethodSelfPause:
+		case "ipmi", "ssh", "watchdog", "best-effort-ssh":
 			return FenceFailed
 		}
 	case result == "fenced":
@@ -142,8 +144,6 @@ func FenceAssurance(method, result string) string {
 			return FenceRequested
 		case "best-effort-ssh":
 			return FenceAssumed
-		case FenceMethodSelfPause:
-			return FenceSelfPaused
 		}
 	}
 	return FenceUnknown

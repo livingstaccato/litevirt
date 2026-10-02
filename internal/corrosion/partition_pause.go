@@ -3,6 +3,7 @@ package corrosion
 import (
 	"context"
 	"encoding/json"
+	"strings"
 )
 
 // Shared vocabulary for partition pause (docs/design/partition-pause.md): the
@@ -11,12 +12,34 @@ import (
 // the majority would recover elsewhere" — which the minority must pause and
 // the majority must recover, so both read it from here.
 
-// FenceMethodSelfPause is the fencing_log method a coordinator records for a
-// best-effort fence that did not reach its host (what would otherwise be
-// "best-effort-ssh", assurance assumed) when it relies on that host's
-// partition pause instead (partition_pause_v1 latched). The SSH detail is
-// kept in the row's detail. FenceAssurance classifies it FenceSelfPaused.
-const FenceMethodSelfPause = "self-pause"
+// FencePauseReliance prefixes the fencing_log DETAIL of a best-effort fence
+// that did not reach its host when the coordinator relies on that host's
+// partition pause instead (partition_pause_v1 latched). The method stays
+// "best-effort-ssh": a coordinator on an older build reads the row exactly as
+// it always has (an assumed best-effort fence, gated by safe_fence_default),
+// where a new method value would have read to it as a proved power-off. A
+// coordinator on this build waits out the pause when it sees the prefix.
+// FenceAssuranceDetail classifies such a row FenceSelfPaused.
+const FencePauseReliance = "[relies on the host's partition pause] "
+
+// ReliesOnPartitionPause reports whether a fence (method, detail) is one whose
+// recovery waits out the host's partition pause.
+func ReliesOnPartitionPause(method, detail string) bool {
+	return method == "best-effort-ssh" && strings.HasPrefix(detail, FencePauseReliance)
+}
+
+// FenceAssuranceDetail is FenceAssurance that also reads the detail: an
+// assumed best-effort fence whose recovery relied on the host's partition
+// pause is FenceSelfPaused. Operator surfaces use it; the proof-grade and
+// safe-fence rules keep reading FenceAssurance, for which it is still
+// assumed.
+func FenceAssuranceDetail(method, result, detail string) string {
+	a := FenceAssurance(method, result)
+	if a == FenceAssumed && ReliesOnPartitionPause(method, detail) {
+		return FenceSelfPaused
+	}
+	return a
+}
 
 // Health-condition identities for partition pause. One evaluator; every row is
 // written by the host it is about (one writer per row).

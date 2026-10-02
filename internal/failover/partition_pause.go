@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
@@ -51,6 +52,11 @@ func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.Hos
 	if c.PartitionPauseEnforced == nil || !c.PartitionPauseEnforced(ctx) {
 		return false
 	}
+	if c.PeerAdvertised == nil || !c.PeerAdvertised(h.Name, capabilities.PartitionPauseV1) {
+		slog.Warn("failover: the host did not advertise partition_pause_v1 on its last Ping; not relying on its pause",
+			"host", h.Name)
+		return false
+	}
 	failed, err := corrosion.HostPartitionPauseFailed(ctx, c.db, h.Name)
 	if err != nil {
 		slog.Warn("failover: could not read whether the host's partition pause failed; not relying on it",
@@ -71,8 +77,9 @@ func (c *Coordinator) asSelfPause(ctx context.Context, h *corrosion.HostRecord, 
 	if !fr.Success || fr.Method != "best-effort-ssh" || !c.relyOnPartitionPause(ctx, h) {
 		return fr
 	}
-	fr.Method = corrosion.FenceMethodSelfPause
-	fr.Detail = "best-effort fence did not reach the host; relying on its partition pause: " + fr.Detail
+	// The method stays best-effort-ssh, so an older coordinator reads the row
+	// as the assumed fence it always was; the reliance rides in the detail.
+	fr.Detail = corrosion.FencePauseReliance + fr.Detail
 	return fr
 }
 

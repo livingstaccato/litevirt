@@ -294,6 +294,12 @@ type Coordinator struct {
 	// best-effort fence is recorded as self-pause and recovery waits out
 	// PartitionPauseWaitFor. nil (a hand-built coordinator) never relies.
 	PartitionPauseEnforced func(ctx context.Context) bool
+	// PeerAdvertised reports whether a host's last cached Ping advertised a
+	// token (health.Checker.PeerAdvertisedLast). The coordinator relies on a
+	// host's partition pause only if that HOST last advertised
+	// partition_pause_v1, not merely because the cluster latched it: a host
+	// whose flag went off after the latch stops advertising. nil never relies.
+	PeerAdvertised func(peer, token string) bool
 	// PauseWaitFor replaces health.PartitionPauseWaitFor (fleet scenarios,
 	// which cannot wait production seconds). nil in production.
 	PauseWaitFor func(probeTargets int) time.Duration
@@ -2038,7 +2044,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// Say so, at the moment it matters, when the fence proves nothing. The row
 	// above reads "fenced" either way; this is the line an on-call engineer
 	// reading this node's journal during a failover will actually see.
-	if a := corrosion.FenceAssurance(fr.Method, logResult); a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
+	if a := corrosion.FenceAssuranceDetail(fr.Method, logResult, fr.Detail); a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
 		slog.Warn("failover: this fence was not verified — the host may still be running",
 			"host", h.Name, "method", fr.Method, "assurance", a,
 			"fix", "give "+h.Name+" an ipmi fence strategy to make its fences verifiable")
@@ -2115,7 +2121,7 @@ func fenceProvedOff(h *corrosion.HostRecord, fr fence.Result) bool {
 // under the policy wait for a confirmation it would not have needed live — the
 // safe direction.
 func fenceWasBestEffort(method, ranUnder string) bool {
-	if method == "best-effort-ssh" || method == corrosion.FenceMethodSelfPause {
+	if method == "best-effort-ssh" {
 		return true
 	}
 	if ranUnder != "" {
@@ -2260,7 +2266,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// A fence that relied on the host's partition pause starts nothing until
 	// the pause has certainly happened (docs/design/partition-pause.md §4.2);
 	// retryPauseWait finishes it from the fence loop.
-	if fr.Method == corrosion.FenceMethodSelfPause && !c.pauseDeadlinePassed(ctx, h) {
+	if corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.pauseDeadlinePassed(ctx, h) {
 		return
 	}
 	delete(c.pauseWaits, h.Name)

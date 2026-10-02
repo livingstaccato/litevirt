@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -35,16 +36,20 @@ func pauseCoordinator(t *testing.T, latched bool) (*Coordinator, *corrosion.Clie
 	mono := &monoClock{now: time.Unix(1_900_000_000, 0)}
 	c.Mono = mono.Now
 	c.PartitionPauseEnforced = func(context.Context) bool { return latched }
+	c.PeerAdvertised = func(string, string) bool { return true }
 	return c, db, ctx, mono
 }
 
-func newestFence(t *testing.T, db *corrosion.Client, ctx context.Context, host string) (method, result string) {
+// newestAssurance is the assurance an operator surface shows for host's
+// newest fence (FenceAssuranceDetail), and its method.
+func newestAssurance(t *testing.T, db *corrosion.Client, ctx context.Context, host string) (method, assurance string) {
 	t.Helper()
-	rows, err := db.Query(ctx, `SELECT method, result FROM fencing_log WHERE host_name = ? ORDER BY timestamp DESC, rowid DESC LIMIT 1`, host)
+	rows, err := db.Query(ctx, `SELECT method, result, detail FROM fencing_log WHERE host_name = ? ORDER BY timestamp DESC, rowid DESC LIMIT 1`, host)
 	if err != nil || len(rows) == 0 {
 		t.Fatalf("no fencing_log row for %s: %v", host, err)
 	}
-	return rows[0].String("method"), rows[0].String("result")
+	r := rows[0]
+	return r.String("method"), corrosion.FenceAssuranceDetail(r.String("method"), r.String("result"), r.String("detail"))
 }
 
 // Unlatched, nothing changes: an assumed best-effort fence recovers at once
@@ -58,9 +63,8 @@ func TestPartitionPause_UnlatchedRecoversAtOnceAsAssumed(t *testing.T) {
 	if got := vmHost(t, db, ctx); got != "alive" {
 		t.Fatalf("VM on %q after an assumed fence with partition_pause_v1 unlatched; want it recovered at once, as today", got)
 	}
-	m, r := newestFence(t, db, ctx, "down")
-	if a := corrosion.FenceAssurance(m, r); a != corrosion.FenceAssumed {
-		t.Fatalf("fence recorded as %s/%s (assurance %s), want assumed", m, r, a)
+	if m, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceAssumed {
+		t.Fatalf("fence recorded as %s (assurance %s), want assumed", m, a)
 	}
 }
 
@@ -77,9 +81,15 @@ func TestPartitionPause_LatchedWaitsOutThePauseThenRecovers(t *testing.T) {
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Fatalf("VM moved to %q at the fence decision; the minority may not have paused yet", got)
 	}
-	m, r := newestFence(t, db, ctx, "down")
-	if a := corrosion.FenceAssurance(m, r); a != corrosion.FenceSelfPaused {
-		t.Fatalf("fence recorded as %s/%s (assurance %s), want %s", m, r, a, corrosion.FenceSelfPaused)
+	m, a := newestAssurance(t, db, ctx, "down")
+	if a != corrosion.FenceSelfPaused {
+		t.Fatalf("fence recorded as %s (assurance %s), want %s", m, a, corrosion.FenceSelfPaused)
+	}
+	// An older coordinator reads the method alone: it must see the
+	// best-effort fence it always did, never a new method it would take for
+	// a proved power-off.
+	if m != "best-effort-ssh" {
+		t.Fatalf("a relied-on fence is recorded with method %q; an older build would misread it", m)
 	}
 	wait, _ := c.partitionPauseWait(ctx)
 	if wait != health.PartitionPauseWaitFor(2) {
@@ -117,6 +127,7 @@ func TestPartitionPause_ASuccessorWaitsAfresh(t *testing.T) {
 	succ.SetFencer(fencerReturning("best-effort-ssh", true))
 	succ.Mono = mono.Now
 	succ.PartitionPauseEnforced = func(context.Context) bool { return true }
+	succ.PeerAdvertised = func(string, string) bool { return true }
 	mono.Advance(health.PartitionPauseWaitFor(2) - time.Second)
 	succ.run(ctx)
 	if got := vmHost(t, db, ctx); got != "down" {
@@ -166,8 +177,7 @@ func TestPartitionPause_AFailedPauseIsNotReliedOn(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.run(ctx)
-	m, r := newestFence(t, db, ctx, "down")
-	if a := corrosion.FenceAssurance(m, r); a != corrosion.FenceAssumed {
+	if _, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceAssumed {
 		t.Fatalf("fence recorded %s although the host reported its pause failed", a)
 	}
 	if got := vmHost(t, db, ctx); got != "alive" {
@@ -284,5 +294,23 @@ func TestPartitionPause_ARegainedCoordinatorDefersNewFences(t *testing.T) {
 	c.run(ctx)
 	if rows, _ := db.Query(ctx, `SELECT 1 AS one FROM fencing_log WHERE host_name = 'down'`); len(rows) == 0 {
 		t.Fatal("the fence was not decided once the grace had passed")
+	}
+}
+
+// The cluster latch is not enough: the fenced host itself must have
+// advertised partition_pause_v1 on its last Ping. A host whose flag went off
+// after the latch stops advertising, and is recovered as before.
+//
+// Mutation: drop the per-host check — the fence reads self_paused and this
+// goes red.
+func TestPartitionPause_TheTargetMustHaveAdvertisedTheToken(t *testing.T) {
+	c, db, ctx, _ := pauseCoordinator(t, true)
+	c.PeerAdvertised = func(peer, tok string) bool { return !(peer == "down" && tok == capabilities.PartitionPauseV1) }
+	c.run(ctx)
+	if _, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceAssumed {
+		t.Fatalf("fence recorded %s for a host that did not advertise the token", a)
+	}
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Fatalf("VM on %q; without the host's pause to rely on, recovery runs as today", got)
 	}
 }

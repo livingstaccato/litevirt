@@ -146,6 +146,10 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		coord.PartitionPauseEnforced = func(context.Context) bool { return latched }
 		coord.PauseWaitFor = ppWait
 		coord.LastContact = chk.LastContact
+		// The harness runs no capability sweep to fill the checker's Ping
+		// cache; every node in these scenarios runs the flag on.
+		pauseOn := o.pauseOff
+		coord.PeerAdvertised = func(peer, tok string) bool { return tok == capabilities.PartitionPauseV1 && !pauseOn[peer] }
 		coord.QuorumRegain = chk.InQuorumRegainGraceFor
 
 		rec := health.NewReconciler(n.Name, dataDir, n.DB, n.Virt)
@@ -386,12 +390,12 @@ func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing
 		t.Fatalf("pp-vm ran on more than one host at once: %v", overlap)
 	}
 	// The fence was recorded as relying on the pause.
-	rows, err := dest.DB.Query(ctx, `SELECT method, result FROM fencing_log WHERE host_name = ?`, owner.Name)
+	rows, err := dest.DB.Query(ctx, `SELECT method, result, detail FROM fencing_log WHERE host_name = ?`, owner.Name)
 	if err != nil || len(rows) == 0 {
 		t.Fatalf("no fencing_log row for %s on %s: %v", owner.Name, dest.Name, err)
 	}
 	for _, r := range rows {
-		if a := corrosion.FenceAssurance(r.String("method"), r.String("result")); a != corrosion.FenceSelfPaused {
+		if a := corrosion.FenceAssuranceDetail(r.String("method"), r.String("result"), r.String("detail")); a != corrosion.FenceSelfPaused {
 			t.Errorf("fence of %s recorded with assurance %s, want %s", owner.Name, a, corrosion.FenceSelfPaused)
 		}
 	}

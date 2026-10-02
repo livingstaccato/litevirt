@@ -139,3 +139,27 @@ func AutoPromoteEnrolled(ctx context.Context, c *Client) (map[string]bool, error
 	}
 	return out, nil
 }
+
+// CertifiedTransferProofs lists the live ownership-transfer proofs (reschedule,
+// promote, relocate) for (kind, name) that carry a recovery-claim certificate,
+// in id order. It verifies nothing: Layer 3 of partition pause verifies each
+// certificate before it acts on one (docs/design/partition-pause.md §6).
+func CertifiedTransferProofs(ctx context.Context, c *Client, kind, name string) ([]ProofRecord, error) {
+	rows, err := c.Query(ctx, `SELECT id FROM runtime_action_proofs
+		WHERE deleted_at IS NULL AND target_kind = ? AND target_name = ? AND claim_certificate != ''
+		ORDER BY id`, kind, name)
+	if err != nil {
+		return nil, err
+	}
+	var out []ProofRecord
+	for _, r := range rows {
+		pr, ok, err := GetActionProof(ctx, c, r.String("id"))
+		if err != nil {
+			return nil, err
+		}
+		if ok && pr.ClaimCertificate != "" && ClaimGatedAction(pr.Action) {
+			out = append(out, pr)
+		}
+	}
+	return out, nil
+}

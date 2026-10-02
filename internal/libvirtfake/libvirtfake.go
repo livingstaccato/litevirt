@@ -68,6 +68,7 @@ type Fake struct {
 	managedSave            map[string]bool   // domain → has a managed-save (suspend-to-disk) image
 	ownerEpochs            map[string]int64  // domain → Phase 4 owner-epoch metadata marker
 	managed                map[string]bool   // domain → litevirt managed-stamp metadata
+	managedInc             map[string]string // domain → the managed stamp's incarnation attribute
 	events                 []Event
 
 	// eventCB is the domain lifecycle callback registered by
@@ -536,6 +537,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	// domain that reuses the name starts with none.
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
+	delete(f.managedInc, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
 	return nil
 }
@@ -1668,6 +1670,35 @@ func (f *Fake) SetDomainManaged(name string, running bool) error {
 	}
 	f.managed[name] = true
 	return nil
+}
+
+// SetDomainManagedIncarnation writes the managed stamp with its incarnation
+// attribute; GetDomainManagedIncarnation reads it back.
+func (f *Fake) SetDomainManagedIncarnation(name, incarnation string, running bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("domain %q not found", name)
+	}
+	if f.managed == nil {
+		f.managed = make(map[string]bool)
+	}
+	if f.managedInc == nil {
+		f.managedInc = make(map[string]string)
+	}
+	f.managed[name] = true
+	f.managedInc[name] = incarnation
+	return nil
+}
+
+func (f *Fake) GetDomainManagedIncarnation(name string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return "", false, fmt.Errorf("domain %q not found", name)
+	}
+	inc := f.managedInc[name]
+	return inc, inc != "", nil
 }
 
 func (f *Fake) GetDomainManaged(name string) (bool, error) {

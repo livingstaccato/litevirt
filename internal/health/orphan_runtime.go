@@ -439,7 +439,7 @@ func (r *Reconciler) adoptManagedDomains(ctx context.Context) {
 		return
 	}
 	for _, name := range domains {
-		if stamped, err := r.virt.GetDomainManaged(name); err == nil && stamped {
+		if inc, ok, err := r.virt.GetDomainManagedIncarnation(name); err == nil && ok && inc != "" {
 			continue
 		}
 		vm, err := corrosion.GetVM(ctx, r.db, name)
@@ -451,7 +451,11 @@ func (r *Reconciler) adoptManagedDomains(ctx context.Context) {
 		}
 		state, _ := r.virt.DomainState(name)
 		active := state == RuntimeRunning || state == "paused"
-		if err := r.virt.SetDomainManaged(name, active); err != nil {
+		// The stamp carries the incarnation of the row it was adopted from, so
+		// a later settle (settle.go) knows which incarnation this domain is
+		// without trusting a row that may since have moved. A domain stamped
+		// before the attribute existed is re-stamped with it here, once.
+		if err := r.virt.SetDomainManagedIncarnation(name, corrosion.IncarnationOf(vm.CreatedAt), active); err != nil {
 			slog.Warn("orphan-runtime: could not write the managed stamp (retried next pass)",
 				"vm", name, "error", err)
 			continue

@@ -937,6 +937,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// same reason: a reschedule proof is claimed off the replicated row here,
 	// and a relocate-recreate proof by the container checker.
 	reconciler.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
+	// Layer 3 of partition pause (docs/design/partition-pause.md §6): a local
+	// copy whose row a VERIFIED recovery-claim certificate gave to another
+	// host is stopped on that proof, and only on it.
+	reconciler.SetSettleVerifier(svc.VerifySettleProof)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

@@ -122,3 +122,19 @@ func (s *Server) askPartitionResume(ctx context.Context, voter string, recs []he
 	}
 	return a
 }
+
+// VerifySettleProof verifies the recovery-claim certificate on p against this
+// node's adopted voter generation and the cluster CA
+// (corrosion.VerifyClaimCertificate) — the positive proof Layer 3 of
+// partition pause needs before it stops a local copy whose row moved
+// (docs/design/partition-pause.md §6). Injected into the reconciler, which
+// cannot import this package. It checks the certificate whether or not this
+// node enforces recovery claims: it is evidence about what a majority decided,
+// not a gate on this node's own recoveries.
+func (s *Server) VerifySettleProof(ctx context.Context, p corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
+	_, verifier, err := s.claimIdentity()
+	if err != nil {
+		return corrosion.ClaimCertificate{}, fmt.Errorf("no claim verifier on this node: %w", err)
+	}
+	return corrosion.VerifyClaimCertificate(ctx, s.db, verifier, p)
+}

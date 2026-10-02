@@ -57,7 +57,11 @@ func printClaimInspection(resp *pb.InspectRecoveryClaimResponse) {
 	fmt.Println(resp.GetDetail())
 	for _, a := range resp.GetAttempts() {
 		k := a.GetKey()
-		fmt.Printf("\nAttempt %d (key %s/%s@%d#%d)", k.GetAttempt(), k.GetTargetKind(), k.GetTargetName(), k.GetOwnerEpoch(), k.GetAttempt())
+		if inc := k.GetIncarnation(); inc != "" {
+			fmt.Printf("\nAttempt %d (key %s/%s(%s)@%d#%d)", k.GetAttempt(), k.GetTargetKind(), k.GetTargetName(), inc, k.GetOwnerEpoch(), k.GetAttempt())
+		} else {
+			fmt.Printf("\nAttempt %d (key %s/%s@%d#%d)", k.GetAttempt(), k.GetTargetKind(), k.GetTargetName(), k.GetOwnerEpoch(), k.GetAttempt())
+		}
 		if a.GetDecidedDigest() != "" {
 			fmt.Printf(": DECIDED for %s (value %s)\n", a.GetDecidedDest(), shortDigest(a.GetDecidedDigest()))
 		} else {

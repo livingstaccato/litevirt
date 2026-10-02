@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -125,11 +126,12 @@ func (s *Server) claimDurable(ctx context.Context) error {
 
 func keyFromPB(k *pb.RecoveryClaimKey) corrosion.ClaimKey {
 	return corrosion.ClaimKey{TargetKind: k.GetTargetKind(), TargetName: k.GetTargetName(),
-		OwnerEpoch: k.GetOwnerEpoch(), Attempt: k.GetAttempt()}
+		OwnerEpoch: k.GetOwnerEpoch(), Attempt: k.GetAttempt(), Incarnation: k.GetIncarnation()}
 }
 
 func keyToPB(k corrosion.ClaimKey) *pb.RecoveryClaimKey {
-	return &pb.RecoveryClaimKey{TargetKind: k.TargetKind, TargetName: k.TargetName, OwnerEpoch: k.OwnerEpoch, Attempt: k.Attempt}
+	return &pb.RecoveryClaimKey{TargetKind: k.TargetKind, TargetName: k.TargetName, OwnerEpoch: k.OwnerEpoch,
+		Attempt: k.Attempt, Incarnation: k.Incarnation}
 }
 
 func ballotFromPB(b *pb.ClaimBallot) corrosion.Ballot {
@@ -224,11 +226,15 @@ func acceptFromPB(a *pb.ClaimAccept) *corrosion.ClaimAccept {
 }
 
 func prepareToPB(r corrosion.PrepareResult) *pb.PrepareRecoveryClaimResponse {
-	return &pb.PrepareRecoveryClaimResponse{
+	out := &pb.PrepareRecoveryClaimResponse{
 		Promised: r.Promised, PromisedBallot: ballotToPB(r.PromisedBallot),
 		AcceptedBallot: ballotToPB(r.State.Accepted), AcceptedValue: valueToPB(r.State.Value),
 		Voter: r.Voter, VoterIncarnation: r.Incarnation, RefusalReason: r.Refusal, RefusalDetail: r.Detail,
 	}
+	if l := r.Legacy; l != nil {
+		out.LegacyAcceptedBallot, out.LegacyAcceptedValue = ballotToPB(l.Accepted), valueToPB(l.Value)
+	}
+	return out
 }
 
 func prepareFromPB(r *pb.PrepareRecoveryClaimResponse, key corrosion.ClaimKey) corrosion.PrepareResult {
@@ -241,6 +247,13 @@ func prepareFromPB(r *pb.PrepareRecoveryClaimResponse, key corrosion.ClaimKey) c
 	out.State.Value = valueFromPB(r.GetAcceptedValue())
 	if out.State.Value != nil {
 		out.State.ValueDigest, _ = out.State.Value.Digest()
+	}
+	if lv := valueFromPB(r.GetLegacyAcceptedValue()); lv != nil && key.Incarnation != "" {
+		l := corrosion.ClaimVoterState{Key: key.Legacy(), Accepted: ballotFromPB(r.GetLegacyAcceptedBallot()), Value: lv}
+		l.ValueDigest, _ = lv.Digest()
+		if !l.Accepted.IsZero() {
+			out.Legacy = &l
+		}
 	}
 	return out
 }
@@ -541,7 +554,7 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 	}
 	names := cfg.Names()
 	q := corrosion.MajorityOf(len(names))
-	return s.claimProposer().Decide(ctx, claims.Spec{
+	spec := claims.Spec{
 		Key: key, Generation: cfg.Generation, Voters: names, PrepareQuorum: q,
 		Electorate: func(corrosion.ClaimValue) ([]string, int) { return names, q },
 		Propose:    func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return proposal, nil },
@@ -551,5 +564,65 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 		// proposer's per-round binding refuses a different value there.
 		ReuseRound: true,
 		Supersede:  ev,
-	})
+	}
+	if key.Incarnation != "" {
+		// A legacy value is this incarnation's only if it names the owner
+		// this proposal is leaving: one incarnation has one owner at one
+		// epoch. A value naming another source is a previous incarnation's
+		// decision at the same (name, epoch), the collision the scoped key
+		// leaves behind.
+		spec.AdoptLegacy = func(v corrosion.ClaimValue) bool {
+			return v.SourceHost == proposal.SourceHost && s.legacyValueMayRun(ctx, v)
+		}
+	}
+	return s.claimProposer().Decide(ctx, spec)
+}
+
+// IncarnationScopedClaims reports whether workload claims are keyed by
+// incarnation here: claim_incarnation_v1 has latched (§10 item 37). Before
+// then every coordinator claims the legacy key, so a recovery is never
+// claimed under two keys by two coordinators that disagree about the format.
+func (s *Server) IncarnationScopedClaims(ctx context.Context) bool {
+	return s.gate != nil && s.gate.Enforced(ctx, capabilities.ClaimIncarnationV1)
+}
+
+// ClaimKeyFor is the key a recovery of the workload row whose created_at is
+// incarnation, at owner epoch epoch, is claimed under on this node: scoped to
+// the incarnation once IncarnationScopedClaims holds, the legacy key before.
+func (s *Server) ClaimKeyFor(ctx context.Context, kind, name string, epoch int64, incarnation string) corrosion.ClaimKey {
+	key := corrosion.ClaimKey{TargetKind: kind, TargetName: name, OwnerEpoch: epoch}
+	if incarnation != "" && s.IncarnationScopedClaims(ctx) {
+		key.Incarnation = incarnation
+	}
+	return key
+}
+
+// legacyValueMayRun is the bridge's test for a value a voter accepted at the
+// LEGACY form of an incarnation-scoped key (claims.Spec.AdoptLegacy): may its
+// proof still execute? It may unless this replica holds the proof and it is
+// spent — completed or failed, or tombstoned after it was. A spent proof never
+// runs again (single use), so a legacy decision whose proof is spent decides
+// nothing for any incarnation: either it ran, and the incarnation it ran for
+// is past this epoch, or it belonged to a previous incarnation of the name,
+// which is the collision the incarnation-scoped key exists to leave behind. A
+// proof this replica has not seen may be the current incarnation's decision,
+// not yet replicated here, so it is adopted, which is what the legacy key
+// would have done.
+func (s *Server) legacyValueMayRun(ctx context.Context, v corrosion.ClaimValue) bool {
+	if v.Proof == nil || v.Proof.ID == "" {
+		return false
+	}
+	rows, err := s.db.Query(ctx, `SELECT status, COALESCE(deleted_at, '') AS deleted_at FROM runtime_action_proofs WHERE id = ?`, v.Proof.ID)
+	if err != nil {
+		return true // cannot tell: adopt, as the legacy key would have
+	}
+	for _, r := range rows {
+		switch st := r.String("status"); {
+		case st == corrosion.ProofCompleted || st == corrosion.ProofFailed:
+			return false
+		case r.String("deleted_at") != "":
+			return false
+		}
+	}
+	return true
 }

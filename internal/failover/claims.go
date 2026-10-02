@@ -20,7 +20,10 @@ import (
 //
 // Under recovery_claim_v1 a coordinator does not mint an ownership-transfer
 // proof on its own authority. It proposes the proof as the value of a claim
-// keyed by (kind, name, owner_epoch, attempt), and writes a proof only once a
+// keyed by (kind, name, owner_epoch, attempt) — and, once claim_incarnation_v1
+// has latched, by the workload row's incarnation (its created_at), so a
+// workload re-created under the same name never meets the decision of the one
+// before it (docs/design/recovery-claims.md §10 item 37) — and writes a proof only once a
 // majority of the voter set has signed an accept for one value: its own, or —
 // when another coordinator got there first — the other one's, which it
 // re-materializes byte for byte and which names the other destination. The
@@ -42,6 +45,11 @@ type RecoveryClaimer interface {
 	// RequestAbandonment asks host to sign that it has not executed, and never
 	// will, proofID at key, returning the encoded abandonment.
 	RequestAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string) (string, error)
+	// ClaimKeyFor is the attempt-0 key a recovery of the workload row whose
+	// created_at is incarnation, leaving owner epoch epoch, is claimed under
+	// here: scoped to the incarnation once claim_incarnation_v1 has latched,
+	// the legacy key before (§10 item 37).
+	ClaimKeyFor(ctx context.Context, kind, name string, epoch int64, incarnation string) corrosion.ClaimKey
 }
 
 // maxClaimAttempts bounds how far one claimRecovery walks a key's attempts.
@@ -113,7 +121,8 @@ type claimedProof struct {
 }
 
 // claimRecovery runs one claim for proposal, a fully built proof this
-// coordinator would otherwise mint, whose owner being left is source.
+// coordinator would otherwise mint, whose owner being left is source, for the
+// incarnation of the workload row it was built from (that row's created_at).
 //
 // It never falls back to an uncertified proof: without a certificate it
 // returns a *ClaimRefusedError and the caller mints nothing (§3.13 step 6).
@@ -123,13 +132,16 @@ type claimedProof struct {
 // promote that failed before StartDomain, abandoned by its destination, or a
 // value decided for a destination that has since been removed for good. Each
 // step carries the evidence, and every voter checks it before it promises.
-func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.ActionProof, source string) (claimedProof, error) {
+func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.ActionProof, source, incarnation string) (claimedProof, error) {
 	epoch, err := strconv.ParseInt(proposal.OwnerEpoch, 10, 64)
 	if err != nil {
 		return claimedProof{}, fmt.Errorf("proof %s for %s/%s carries owner epoch %q: a claim key needs one",
 			proposal.ID, proposal.TargetKind, proposal.TargetName, proposal.OwnerEpoch)
 	}
 	key := corrosion.ClaimKey{TargetKind: proposal.TargetKind, TargetName: proposal.TargetName, OwnerEpoch: epoch}
+	if c.Claimer != nil {
+		key = c.Claimer.ClaimKeyFor(ctx, proposal.TargetKind, proposal.TargetName, epoch, incarnation)
+	}
 	if c.Claimer == nil {
 		// Enforcement on with nothing to claim through is a wiring fault, and
 		// it fails closed: nothing is minted.
@@ -317,7 +329,7 @@ func (c *Coordinator) noteClaimLost(action, kind, name, host string, decided cor
 // after deciding — this one carries it out itself, as the decided value says:
 // same proof, same token, same destination (§3.13 step 5).
 func (c *Coordinator) claimContainerRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, proposal corrosion.ActionProof) (corrosion.ActionProof, bool) {
-	cl, err := c.claimRecovery(ctx, proposal, h.Name)
+	cl, err := c.claimRecovery(ctx, proposal, h.Name, ct.CreatedAt)
 	if err != nil {
 		c.noteClaimRefused(ctx, ActionRelocate, "container", ct.Name, h.Name, err)
 		return corrosion.ActionProof{}, false
@@ -444,7 +456,19 @@ func (c *Coordinator) recertifyReplaced(ctx context.Context) {
 		}
 		proposal := pr.ActionProof
 		proposal.ClaimCertificate = ""
-		cl, out, err := c.claimAttempt(ctx, cert.Key, proposal, cert.SourceHost, nil)
+		key := cert.Key
+		if key.Incarnation == "" {
+			// Certified at the legacy key before claim_incarnation_v1
+			// latched: re-decide it at its incarnation-scoped key once that is
+			// the format, which re-proposes the same value through the legacy
+			// bridge (§10 item 37).
+			if inc, ok, err := corrosion.WorkloadIncarnation(ctx, c.db, key.TargetKind, key.TargetName); err == nil && ok {
+				scoped := c.Claimer.ClaimKeyFor(ctx, key.TargetKind, key.TargetName, key.OwnerEpoch, inc)
+				scoped.Attempt = key.Attempt
+				key = scoped
+			}
+		}
+		cl, out, err := c.claimAttempt(ctx, key, proposal, cert.SourceHost, nil)
 		if err != nil {
 			slog.Warn("failover: could not re-certify a proof its forced voter generation replaced; retrying next tick",
 				"proof", pr.ID, "key", cert.Key.String(), "error", err)
@@ -498,6 +522,9 @@ func (c *Coordinator) certifyUncertified(ctx context.Context) {
 		key, err := corrosion.ClaimKeyForProof(pr.ActionProof, 0)
 		if err != nil {
 			continue
+		}
+		if inc, ok, err := corrosion.WorkloadIncarnation(ctx, c.db, pr.TargetKind, pr.TargetName); err == nil && ok {
+			key = c.Claimer.ClaimKeyFor(ctx, key.TargetKind, key.TargetName, key.OwnerEpoch, inc)
 		}
 		cl, _, err := c.claimAttempt(ctx, key, pr.ActionProof, source, nil)
 		if err != nil {

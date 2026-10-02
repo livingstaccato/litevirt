@@ -62,6 +62,18 @@ type Spec struct {
 	// Supersede is the evidence, sent with every Prepare, that the value
 	// decided at Key.Attempt-1 will never execute. Required at attempt > 0.
 	Supersede *corrosion.SupersedeEvidence
+	// AdoptLegacy bridges an incarnation-scoped key (Key.Incarnation != "")
+	// to its LEGACY form, which coordinators claimed until
+	// claim_incarnation_v1 latched (docs/design/recovery-claims.md §10 item
+	// 37). Every promise at the scoped key reports what that voter accepted at
+	// the legacy key and seals it there, so a majority of promises holds
+	// everything the legacy key can ever decide. When no promise reports a
+	// value at the scoped key itself, the highest-ballot legacy value is
+	// re-proposed — a recovery decided across the upgrade is completed, not
+	// decided twice — provided AdoptLegacy says its proof can still run. One
+	// that cannot (a spent proof: it ran, or it was a previous incarnation's)
+	// is left behind, and Propose builds a fresh value. Nil adopts nothing.
+	AdoptLegacy func(v corrosion.ClaimValue) bool
 }
 
 // Outcome is a decided value and the certificate that proves it.
@@ -273,6 +285,18 @@ func (p *Proposer) try(ctx context.Context, spec Spec, b corrosion.Ballot, own m
 			best, value = pr.State.Accepted, pr.State.Value
 		}
 	}
+	if value == nil && spec.AdoptLegacy != nil && spec.Key.Incarnation != "" {
+		var legacy *corrosion.ClaimValue
+		var lbest corrosion.Ballot
+		for _, pr := range promises {
+			if l := pr.Legacy; l != nil && l.Value != nil && !l.Accepted.IsZero() && corrosion.CompareBallots(l.Accepted, lbest) > 0 {
+				lbest, legacy = l.Accepted, l.Value
+			}
+		}
+		if legacy != nil && spec.AdoptLegacy(*legacy) {
+			value = legacy
+		}
+	}
 	ours := false
 	if value == nil {
 		if spec.Propose == nil {
@@ -379,7 +403,10 @@ func (p *Proposer) acceptAll(ctx context.Context, spec Spec, b corrosion.Ballot,
 			switch {
 			case err != nil:
 				refusals = append(refusals, refusal{voter: voter, reason: ReasonUnreachable, detail: err.Error()})
-			case res.Accepted && res.Accept != nil && res.Accept.Voter == voter:
+			case res.Accepted && res.Accept != nil && res.Accept.Voter == voter && res.Accept.Key == spec.Key:
+				// An accept counts only for the key it signs. A voter on an
+				// older build drops a key's incarnation and signs the legacy
+				// key, and its accept certifies nothing here.
 				accepts[voter] = *res.Accept
 			default:
 				refusals = append(refusals, refusal{voter: voter, reason: res.Refusal, detail: res.Detail, promised: res.PromisedBallot})

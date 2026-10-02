@@ -39,9 +39,11 @@ func (claimsGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
 	return health.QuorumYes, 2, 2
 }
 
+// claimsLatched includes claim_incarnation_v1: it is mandatory, so a cluster
+// on this build has it latched, and its claims are incarnation-scoped.
 func claimsLatched(tok string) bool {
 	return tok == capabilities.SplitBrainGateV1 || tok == capabilities.RecoveryClaimV1 ||
-		tok == capabilities.VoterConfigV1
+		tok == capabilities.VoterConfigV1 || tok == capabilities.ClaimIncarnationV1
 }
 
 // enableRecoveryClaims turns recovery claims on for every node the way a

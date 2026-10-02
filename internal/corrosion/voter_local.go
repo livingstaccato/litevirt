@@ -23,11 +23,12 @@ import (
 // nodeLocalClaimTables are the tables ExecuteLocal may write. Each is absent
 // from tableNames and sensitiveTableNames (TestNodeLocalClaimTablesAreNotReplicated).
 var nodeLocalClaimTables = map[string]bool{
-	"local_recovery_claims":   true,
-	"local_voter_incarnation": true,
-	"local_voter_adoption":    true,
-	"local_abandoned_proofs":  true,
-	"local_voter_seals":       true,
+	"local_recovery_claims":    true,
+	"local_voter_incarnation":  true,
+	"local_voter_adoption":     true,
+	"local_abandoned_proofs":   true,
+	"local_voter_seals":        true,
+	"local_incarnation_claims": true,
 }
 
 // IsNodeLocalClaimTable reports whether ExecuteLocal may write table. Exported

@@ -87,6 +87,10 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// claim RPCs durably". A flag would let one node count a different
 		// majority from its peers.
 		capabilities.VoterConfigV1: true,
+		// claim_incarnation_v1: "this build keys recovery claims by
+		// incarnation and seals the legacy key". A coordinator relies on every
+		// voter keeping that format.
+		capabilities.ClaimIncarnationV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

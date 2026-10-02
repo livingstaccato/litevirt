@@ -57,8 +57,18 @@ func probeCoordinator(c *Cluster, clock *VirtualClock, on *Node) *Coordinators {
 	return cs
 }
 
-func vmKey(name string, epoch int64) corrosion.ClaimKey {
-	return corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: name, OwnerEpoch: epoch}
+// vmKey is the attempt-0 key a recovery of name leaving epoch is claimed
+// under: scoped to the incarnation n's replica holds, as on a cluster where
+// claim_incarnation_v1 has latched (docs/design/recovery-claims.md §10 item 37).
+func vmKey(n *Node, name string, epoch int64) corrosion.ClaimKey {
+	inc, _, _ := corrosion.WorkloadIncarnation(context.Background(), n.DB, corrosion.ClaimKindVM, name)
+	return corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: name, OwnerEpoch: epoch, Incarnation: inc}
+}
+
+// claimKeyPB is key on the wire.
+func claimKeyPB(key corrosion.ClaimKey) *pb.RecoveryClaimKey {
+	return &pb.RecoveryClaimKey{TargetKind: key.TargetKind, TargetName: key.TargetName, OwnerEpoch: key.OwnerEpoch,
+		Attempt: key.Attempt, Incarnation: key.Incarnation}
 }
 
 // lastRefusal is voter n's most recent refusal for key, as GetRecoveryClaim
@@ -66,7 +76,7 @@ func vmKey(name string, epoch int64) corrosion.ClaimKey {
 func lastRefusal(t *testing.T, c *Cluster, n *Node, key corrosion.ClaimKey) (string, string) {
 	t.Helper()
 	resp, err := c.SelfClient(n).GetRecoveryClaim(context.Background(), &pb.GetRecoveryClaimRequest{
-		Key: &pb.RecoveryClaimKey{TargetKind: key.TargetKind, TargetName: key.TargetName, OwnerEpoch: key.OwnerEpoch, Attempt: key.Attempt}})
+		Key: claimKeyPB(key)})
 	if err != nil {
 		t.Fatalf("%s: GetRecoveryClaim: %v", n.Name, err)
 	}
@@ -104,7 +114,7 @@ func TestFleet_RecoveryClaim_OwnerReachableFromAMajority(t *testing.T) {
 	if !found {
 		t.Fatalf("the coordinator did not record recovery_claim_owner_reachable: %v", refused)
 	}
-	key := vmKey("vm-live", 0)
+	key := vmKey(a, "vm-live", 0)
 	for _, n := range []*Node{b, cc} {
 		reason, detail := lastRefusal(t, c, n, key)
 		want := fmt.Sprintf("%s still reaches %s", n.Name, d.Name)
@@ -163,7 +173,7 @@ func TestFleet_RecoveryClaim_OwnerUpForEveryVoter_RetriesTheSameValue(t *testing
 	clock := NewVirtualClock(time.Now().UTC())
 	cs := probeCoordinator(c, clock, a)
 	cs.Tick(ctx, a)
-	key := vmKey("vm-up", 0)
+	key := vmKey(a, "vm-up", 0)
 	first := voterState(t, b, key).Promised
 	if first.IsZero() {
 		t.Fatal("b never saw the claim; the rest is vacuous")
@@ -201,7 +211,7 @@ func TestFleet_RecoveryClaim_OwnerReachableFromAMinority(t *testing.T) {
 	if err != nil || !ok || pr.ClaimCertificate == "" {
 		t.Fatalf("the reschedule proof carries no certificate: ok=%v err=%v", ok, err)
 	}
-	if reason, _ := lastRefusal(t, c, cc, vmKey("vm-minority", 0)); reason != corrosion.RefusalOwnerReachable {
+	if reason, _ := lastRefusal(t, c, cc, vmKey(a, "vm-minority", 0)); reason != corrosion.RefusalOwnerReachable {
 		t.Errorf("c, which still reaches d, did not refuse: %q", reason)
 	}
 	dest := c.Node(vm.HostName)
@@ -238,7 +248,7 @@ func TestFleet_RecoveryClaim_ProofGradeFenceClearsTheProbe(t *testing.T) {
 	if vm := vmOn(t, a, "vm-fenced"); vm.PendingActionID == "" || vm.HostName == d.Name {
 		t.Fatalf("the claim did not form on the first tick after a proof-grade fence: %+v", vm)
 	}
-	key := vmKey("vm-fenced", 0)
+	key := vmKey(a, "vm-fenced", 0)
 	for _, n := range []*Node{a, b, cc} {
 		if reason, detail := lastRefusal(t, c, n, key); reason == corrosion.RefusalOwnerReachable {
 			t.Errorf("%s recorded an owner-probe refusal after the fence: %s", n.Name, detail)
@@ -319,7 +329,7 @@ func TestFleet_RecoveryClaim_AVoterThatIsTheOldOwner(t *testing.T) {
 	cs := probeCoordinator(c, NewVirtualClock(time.Now().UTC()), a)
 	cs.Tick(ctx, a)
 
-	key := vmKey("vm-own", 0)
+	key := vmKey(a, "vm-own", 0)
 	reason, detail := lastRefusal(t, c, victim, key)
 	if reason != corrosion.RefusalOwnerReachable || !strings.Contains(detail, victim.Name+" is the owner") {
 		t.Fatalf("the old owner's refusal = %q %q, want %s \"%s is the owner\"",
@@ -342,7 +352,7 @@ func rogueAccept(t *testing.T, c *Cluster, rogue, voter *Node, key corrosion.Cla
 func rogueAcceptAt(t *testing.T, c *Cluster, rogue, voter *Node, key corrosion.ClaimKey, source, dest string, gen int64) *pb.AcceptRecoveryClaimResponse {
 	t.Helper()
 	resp, err := c.PeerClient(rogue, voter).AcceptRecoveryClaim(context.Background(), &pb.AcceptRecoveryClaimRequest{
-		Key:              &pb.RecoveryClaimKey{TargetKind: key.TargetKind, TargetName: key.TargetName, OwnerEpoch: key.OwnerEpoch},
+		Key:              claimKeyPB(key),
 		Ballot:           &pb.ClaimBallot{Round: 7, Coordinator: rogue.Name, BootNonce: []byte{9}},
 		ConfigGeneration: gen,
 		Value: &pb.RecoveryClaimValue{Id: "rogue-" + source, Action: corrosion.ActionReschedule, TargetKind: key.TargetKind,
@@ -367,7 +377,7 @@ func TestFleet_RecoveryClaim_ARogueCoordinator(t *testing.T) {
 	c, a, b, cc, d := probeFleet(t, 2506, "vm-rogue")
 	rogue := cc
 
-	live := vmKey("vm-rogue", 0)
+	live := vmKey(a, "vm-rogue", 0)
 	for _, v := range []*Node{a, b} {
 		resp := rogueAccept(t, c, rogue, v, live, d.Name, rogue.Name)
 		if resp.GetAccepted() || resp.GetRefusalReason() != corrosion.RefusalOwnerReachable {
@@ -402,7 +412,7 @@ func TestFleet_RecoveryClaim_OwnerReturnsAfterAValueWasChosen(t *testing.T) {
 	for _, n := range []*Node{a, b} {
 		c.SetLinkFault(n, d, LinkFault{BlockProbe: true})
 	}
-	key := vmKey("vm-return", 0)
+	key := vmKey(a, "vm-return", 0)
 	// The dead proposer: a majority (a, b) accepted its value, nobody wrote it.
 	for _, v := range []*Node{a, b} {
 		if resp := rogueAccept(t, c, cc, v, key, d.Name, b.Name); !resp.GetAccepted() {

@@ -220,6 +220,40 @@ const (
 	// claim must hold of every host this node replicates to, a maintenance
 	// host on the previous build included.
 	VoterConfigV1 = "voter_config_v1"
+	// ClaimIncarnationV1 gates INCARNATION-SCOPED recovery claims
+	// (docs/design/recovery-claims.md §10 item 37, colonelpanik/litevirt#250):
+	// once latched, a coordinator keys every workload claim by the workload
+	// row's created_at as well as (kind, name, owner epoch, attempt), so a
+	// workload deleted and re-created under one name — which starts again at
+	// the same owner epoch — gets a fresh claim instead of the previous
+	// incarnation's decided value. Before it latches, claims are keyed as they
+	// always were.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes the incarnation in a claim key, keeps
+	// incarnation-scoped voter state (local_incarnation_claims, schema v63),
+	// signs and verifies the v2 accept payload, seals a legacy key once it has
+	// answered the incarnation-scoped form of it, and reports its legacy state
+	// in the promise. A coordinator relies on EVERY voter doing all of that:
+	// a voter on an older build would read an incarnation-scoped Prepare as
+	// the legacy key — the very collision this token exists to end — and its
+	// accept would not verify. So the format may change only once no voter
+	// can be an older build. A flag would let one coordinator key by
+	// incarnation while another keys the same recovery the legacy way: two
+	// claims for one decision.
+	//
+	// ReplicationGated: the certificate on a replicated runtime_action_proofs
+	// row is judged by every replica's merge (certificateVerifiesTx), and an
+	// older build cannot verify a v2 accept, so the claim must hold of every
+	// host this node replicates to, a maintenance host on the previous build
+	// included.
+	//
+	// Crossing the latch is safe for a recovery claimed on both sides of it:
+	// a voter's promise at the incarnation-scoped key reports what it accepted
+	// at the legacy key and seals that key against every later legacy
+	// Prepare and Accept, and the proposer re-proposes a legacy value whose
+	// proof can still run (claims.Spec.AdoptLegacy).
+	ClaimIncarnationV1 = "claim_incarnation_v1"
 
 	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
 	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
@@ -690,6 +724,15 @@ const (
 //     stand-down of enforcement.recovery_claim, which is the point: promise
 //     history stays unbroken.
 //
+//   - claim_incarnation_v1 has no flag either: it says what format this
+//     build's voters keep, and a coordinator relies on every voter keeping it.
+//     It changes how a claim is KEYED, not whether anything is enforced, so
+//     enforcement.recovery_claim remains the stand-down for claims as a
+//     whole. A binary rolled back below it after it has latched enters WAL
+//     quarantine, as below every latched token; its legacy claim table is
+//     intact, and the incarnation-scoped one is left unread until it is
+//     upgraded again.
+//
 // recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
 // which is its stand-down: false on every node and a restart returns recovery
 // authorization to the pre-claim behaviour; voters keep answering and keep
@@ -766,6 +809,10 @@ var supported = []string{
 	// grpcapi.VoterConfigReadiness. Readiness is a fact about this node, not a
 	// policy, so it is not a flag either.
 	VoterConfigV1,
+	// ClaimIncarnationV1 is advertised UNCONDITIONALLY: it says "this build
+	// keys claims by incarnation and seals the legacy key", a fact about the
+	// binary.
+	ClaimIncarnationV1,
 	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
 	// on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
 	// ready). Withheld while the flag is off because every flag-on node relies
@@ -790,7 +837,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, RecoveryClaimV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, RecoveryClaimV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -845,6 +892,9 @@ var replicationGated = map[string]bool{
 	// Confirmed against every replication recipient: voter_configs' shapes
 	// must be decodable by every host we stream to.
 	VoterConfigV1: true,
+	// Confirmed against every replication recipient: a v2 accept inside a
+	// replicated certificate must be verifiable by every host we stream to.
+	ClaimIncarnationV1: true,
 	// Confirmed against every replication recipient: the claim_certificate
 	// column's statement shapes on runtime_action_proofs must be decodable by
 	// every host we stream to. Not mandatory: the flag is the opt-in.
@@ -891,6 +941,10 @@ var mandatory = map[string]bool{
 	// different majority from its peers. Its stand-down is the decided
 	// `lv cluster voter reset`; see the KILL SWITCH notes above `supported`.
 	VoterConfigV1: true,
+	// A fact about the binary (it keys claims by incarnation and seals the
+	// legacy key), and a coordinator relies on every voter keeping that
+	// format. See ClaimIncarnationV1.
+	ClaimIncarnationV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

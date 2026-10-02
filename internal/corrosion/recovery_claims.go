@@ -43,6 +43,36 @@ type ClaimKey struct {
 	TargetName string `json:"target_name"`
 	OwnerEpoch int64  `json:"owner_epoch"` // generation being left; config generation for voter_config
 	Attempt    int64  `json:"attempt"`
+	// Incarnation is which incarnation of the name the claim decides for: the
+	// workload row's created_at, which every path that moves a row preserves
+	// and every path that brings a name back to life stamps afresh (the
+	// anti-entropy merge's incarnation identity). A workload deleted and
+	// re-created under the same name starts again at the same owner epoch, so
+	// without it the new incarnation met the old one's decided value at the
+	// same key (docs/design/recovery-claims.md §10 item 37).
+	//
+	// "" is a LEGACY key: what a coordinator claims under until
+	// claim_incarnation_v1 latches, and always for voter_config. Omitted from
+	// the JSON when empty, so a legacy key's certificate encodes exactly as it
+	// did before the field existed.
+	Incarnation string `json:"incarnation,omitempty"`
+}
+
+// Legacy is k without its incarnation: the key a coordinator claimed this
+// decision under before claim_incarnation_v1 latched.
+func (k ClaimKey) Legacy() ClaimKey {
+	k.Incarnation = ""
+	return k
+}
+
+// SameDecision reports whether a and b name the same (kind, name, epoch,
+// attempt), whatever their incarnations.
+func (k ClaimKey) SameDecision(o ClaimKey) bool { return k.Legacy() == o.Legacy() }
+
+// WithIncarnation is k scoped to incarnation inc ("" leaves it legacy).
+func (k ClaimKey) WithIncarnation(inc string) ClaimKey {
+	k.Incarnation = inc
+	return k
 }
 
 // IsVoterConfig reports whether k decides a voter-config generation.
@@ -57,7 +87,7 @@ func (k ClaimKey) IsWorkload() bool {
 func (k ClaimKey) Validate() error {
 	switch {
 	case k.IsVoterConfig():
-		if k.TargetName != "" || k.Attempt != 0 || k.OwnerEpoch < 0 {
+		if k.TargetName != "" || k.Attempt != 0 || k.OwnerEpoch < 0 || k.Incarnation != "" {
 			return fmt.Errorf("a voter_config key is (voter_config, \"\", generation, 0), got %+v", k)
 		}
 	case k.IsWorkload():
@@ -71,6 +101,9 @@ func (k ClaimKey) Validate() error {
 }
 
 func (k ClaimKey) String() string {
+	if k.Incarnation != "" {
+		return fmt.Sprintf("%s/%s(%s)@%d#%d", k.TargetKind, k.TargetName, k.Incarnation, k.OwnerEpoch, k.Attempt)
+	}
 	return fmt.Sprintf("%s/%s@%d#%d", k.TargetKind, k.TargetName, k.OwnerEpoch, k.Attempt)
 }
 
@@ -177,7 +210,11 @@ const (
 	claimValueDomain       = "litevirt-recovery-value-v1"
 	claimConfigValueDomain = "litevirt-voter-config-value-v1"
 	claimAcceptDomain      = "litevirt-recovery-accept-v1"
-	voterMembersDomain     = "litevirt-voter-members-v1"
+	// claimAcceptDomainV2 signs an accept at an incarnation-scoped key. Its
+	// own domain, so no v2 accept is ever the same bytes as a v1 one: a legacy
+	// signature cannot be read as one for some incarnation, nor the reverse.
+	claimAcceptDomainV2 = "litevirt-recovery-accept-v2"
+	voterMembersDomain  = "litevirt-voter-members-v1"
 )
 
 // claimField writes a length-prefixed field. Length-prefixed rather than
@@ -296,9 +333,16 @@ func DecodeClaimCertificate(s string) (ClaimCertificate, error) {
 // signs (§9 Q8).
 func acceptPayload(key ClaimKey, gen int64, b Ballot, digest, voter, incarnation string) []byte {
 	h := sha256.New()
-	claimField(h, claimAcceptDomain)
-	claimField(h, key.TargetKind)
-	claimField(h, key.TargetName)
+	if key.Incarnation == "" {
+		claimField(h, claimAcceptDomain)
+		claimField(h, key.TargetKind)
+		claimField(h, key.TargetName)
+	} else {
+		claimField(h, claimAcceptDomainV2)
+		claimField(h, key.TargetKind)
+		claimField(h, key.TargetName)
+		claimField(h, key.Incarnation)
+	}
 	claimField(h, i64(key.OwnerEpoch))
 	claimField(h, i64(key.Attempt))
 	claimField(h, i64(gen))

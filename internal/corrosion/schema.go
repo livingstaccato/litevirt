@@ -474,7 +474,18 @@ import (
 //	     voter_configs row whose change is force:<lost,...> and whose
 //	     certificate column holds the survivors' unanimous signatures and the
 //	     lost hosts' fence evidence. One new table.
-const CurrentSchemaVersion = 62
+//	v63: incarnation-scoped recovery claims (docs/design/recovery-claims.md
+//	     §10 item 37) — local_incarnation_claims, NODE-LOCAL like
+//	     local_recovery_claims and with the same columns plus the workload
+//	     row's created_at in the primary key, so a workload deleted and
+//	     re-created under one name starts with a fresh claim history instead of
+//	     meeting the previous incarnation's decision at the same (kind, name,
+//	     epoch, attempt). A new table rather than a wider primary key on the old
+//	     one, because migrations are additive-only: legacy keys stay in
+//	     local_recovery_claims, and a row here seals the legacy key of the same
+//	     (kind, name, epoch, attempt) on this voter. Nothing is written to it
+//	     until claim_incarnation_v1 latches. One new table.
+const CurrentSchemaVersion = 63
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -2739,6 +2750,33 @@ var schemaDDL = []string{
 		reason     TEXT    NOT NULL DEFAULT '',
 		sealed_at  TEXT    NOT NULL
 	)`,
+	// NODE-LOCAL (v63). This voter's promises and accepts at INCARNATION-SCOPED
+	// workload keys (docs/design/recovery-claims.md §10 item 37):
+	// local_recovery_claims' columns with the workload row's created_at in the
+	// key, so two incarnations of one name never share a claim. The legacy
+	// table keeps the keys claimed before claim_incarnation_v1 latched, and a
+	// row here for (kind, name, epoch, attempt) seals that legacy key on this
+	// voter. Same rules: written only through ExecuteLocal, committed before
+	// the reply, never deleted or downgraded.
+	`CREATE TABLE IF NOT EXISTS local_incarnation_claims (
+		target_kind       TEXT    NOT NULL,
+		target_name       TEXT    NOT NULL,
+		incarnation       TEXT    NOT NULL,
+		owner_epoch       INTEGER NOT NULL,
+		attempt           INTEGER NOT NULL,
+		promised_round    INTEGER NOT NULL DEFAULT 0,
+		promised_coord    TEXT    NOT NULL DEFAULT '',
+		promised_nonce    BLOB    NOT NULL DEFAULT x'',
+		accepted_round    INTEGER NOT NULL DEFAULT 0,
+		accepted_coord    TEXT    NOT NULL DEFAULT '',
+		accepted_nonce    BLOB    NOT NULL DEFAULT x'',
+		value_json        TEXT    NOT NULL DEFAULT '',
+		value_digest      TEXT    NOT NULL DEFAULT '',
+		accept_json       TEXT    NOT NULL DEFAULT '',
+		config_generation INTEGER NOT NULL,
+		updated_at        TEXT    NOT NULL,
+		PRIMARY KEY (target_kind, target_name, incarnation, owner_epoch, attempt)
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -3301,6 +3339,7 @@ var createTableUnits = []struct {
 	{59, "local_voter_adoption"},
 	{61, "local_abandoned_proofs"},
 	{62, "local_voter_seals"},
+	{63, "local_incarnation_claims"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

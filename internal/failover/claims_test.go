@@ -41,6 +41,12 @@ func (f *fakeClaimer) RequestAbandonment(_ context.Context, host string, key cor
 	return "", errNoAbandonment
 }
 
+// ClaimKeyFor scopes every key to the incarnation, as a node on which
+// claim_incarnation_v1 has latched does.
+func (f *fakeClaimer) ClaimKeyFor(_ context.Context, kind, name string, epoch int64, incarnation string) corrosion.ClaimKey {
+	return corrosion.ClaimKey{TargetKind: kind, TargetName: name, OwnerEpoch: epoch, Incarnation: incarnation}
+}
+
 // decideOurs certifies whatever is proposed.
 func decideOurs(key corrosion.ClaimKey, v corrosion.ClaimValue) (claims.Outcome, error) {
 	d := v.MustDigest()
@@ -124,8 +130,16 @@ func TestReschedule_ClaimsBeforeItMints(t *testing.T) {
 	db, c := claimFixture(t, cl)
 	c.run(context.Background())
 
-	if len(cl.calls) == 0 || cl.calls[0] != (corrosion.ClaimKey{TargetKind: "vm", TargetName: "vm1", OwnerEpoch: 4}) {
-		t.Fatalf("the reschedule was not claimed at (vm, vm1, 4, 0): %v", cl.calls)
+	vm, err := corrosion.GetVM(context.Background(), db, "vm1")
+	if err != nil || vm == nil || vm.CreatedAt == "" {
+		t.Fatalf("read vm1: %v %+v", err, vm)
+	}
+	// Scoped to the row's incarnation (docs/design/recovery-claims.md §10
+	// item 37): the fake claimer stands in for a node where
+	// claim_incarnation_v1 has latched.
+	want := corrosion.ClaimKey{TargetKind: "vm", TargetName: "vm1", OwnerEpoch: 4, Incarnation: vm.CreatedAt}
+	if len(cl.calls) == 0 || cl.calls[0] != want {
+		t.Fatalf("the reschedule was not claimed at %s: %v", want, cl.calls)
 	}
 	ps := vmProofs(t, db)
 	if len(ps) != 1 || ps[0].ClaimCertificate == "" {

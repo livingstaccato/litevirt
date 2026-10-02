@@ -73,15 +73,27 @@ func DecodeClaimAbandonment(s string) (ClaimAbandonment, error) {
 	return a, nil
 }
 
-const claimAbandonDomain = "litevirt-recovery-abandon-v1"
+const (
+	claimAbandonDomain = "litevirt-recovery-abandon-v1"
+	// claimAbandonDomainV2 signs an abandonment at an incarnation-scoped key
+	// (see claimAcceptDomainV2).
+	claimAbandonDomainV2 = "litevirt-recovery-abandon-v2"
+)
 
 func abandonPayload(host, proofID string, key ClaimKey) []byte {
 	h := sha256.New()
-	claimField(h, claimAbandonDomain)
+	if key.Incarnation == "" {
+		claimField(h, claimAbandonDomain)
+	} else {
+		claimField(h, claimAbandonDomainV2)
+	}
 	claimField(h, host)
 	claimField(h, proofID)
 	claimField(h, key.TargetKind)
 	claimField(h, key.TargetName)
+	if key.Incarnation != "" {
+		claimField(h, key.Incarnation)
+	}
 	claimField(h, i64(key.OwnerEpoch))
 	claimField(h, i64(key.Attempt))
 	return h.Sum(nil)

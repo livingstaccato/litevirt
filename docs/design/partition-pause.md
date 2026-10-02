@@ -83,12 +83,22 @@ that matters. It is computed from this daemon's own probe results, never from
 replicated `host_health` rows, which freeze and look fresh during a partition.
 
 A `PartitionPauser` runs on every node and ticks every `partitionPauseTick`
-(1 s). It keeps a loss clock on the local monotonic clock:
+(1 s). It keeps the quorum readings of the last `2·T_pause` on the local
+monotonic clock, and accumulates loss rather than timing it continuously:
 
-- **QuorumYes** clears the clock. If anything is paused, it runs the resume
-  path (§3.5).
-- **Anything else** (No, or Unknown) starts the clock if it is not running.
-  Once the clock has run for `T_pause` without a Yes, it pauses (§3.3).
+- **It pauses** once the readings that are not Yes (No, or Unknown) cover at
+  least `T_pause` of that window (§3.3). Each interval between two readings
+  counts as the later reading's state.
+- **Only `partitionRegainTicks` (3) consecutive Yes readings count as the
+  majority being back.** They clear the window and run the resume path (§3.5).
+  A single Yes on a lossy link is not a heal.
+
+A continuous clock, reset by any single Yes, would never pause a host on a link
+that drops two probes in three, while the voters, which need only five
+consecutive failures each, can still fence it. Accumulating closes that.
+It never pauses later than a continuous clock would: continuous loss covers
+`T_pause` of the window after exactly `T_pause`, so §4.1's bound is
+unchanged.
 
 Unknown counts as loss, unlike in the VIP demoter, which clears its clock on
 Unknown. The demoter can afford to lose time, because its majority reclaims on
@@ -111,6 +121,13 @@ The pauser never pauses anything in these cases:
 - **A witness.** It runs no workloads. Its pauser finds nothing to pause.
 - **The flag is off** (`enforcement.partition_pause: false`, §5).
 
+The maintenance exemption reads this host's own replica (L1). A host an
+operator put into maintenance on the majority side during the partition, which
+the minority never heard about, still pauses; the reverse — a host the minority
+believes is in maintenance while the majority does not — does not pause, and
+the majority may fence and recover it. Maintenance is an operator act; doing it
+across a partition is the residual.
+
 ### 3.2 What is paused
 
 Only a workload that **the majority would recover elsewhere**. The rule is the
@@ -131,6 +148,17 @@ It also has to be:
   belongs to whoever paused it, and the pauser leaves it alone.
 - **Owned by this host in this host's replica.** That means `host_name` is this
   host and the row is live.
+- **Not being live-migrated.** The migration's target takes over, and a
+  suspend would stall the migration itself.
+
+**A workload the pass cannot account for is a failed pause** (§3.4): a domain
+or container whose state cannot be read, or whose row cannot be read, is not
+known to be stopped. Every libvirt and LXC call is bounded
+(`partitionPauseCallTimeout`, 2 s); the pauses run **concurrently**, one
+goroutine each, so the pass ends within one call timeout of its last read,
+however many workloads there are, and stays inside `E` (§4.1). A call that times
+out is abandoned, not cancelled, and blocks any second call for the same
+workload until it returns, so a wedged suspend is never issued twice.
 
 **How it pauses.**
 
@@ -144,7 +172,7 @@ Before it pauses a workload, the pauser writes a record to a host-local file:
 
 ```
 <data_dir>/partition-pause/<kind>-<name>.json
-  {kind, name, owner_epoch, incarnation, host, paused_at, reason}
+  {kind, name, owner_epoch, incarnation, domain_uuid, host, paused_at, reason}
 ```
 
 The file is written through a temp file, `fsync`, `rename` and a directory
@@ -170,8 +198,15 @@ They are what the resume check (§3.5) and Layer 3 (§6) compare against.
 **Resume only what self-fencing paused.** The pauser resumes a workload only
 when a record exists for it. A workload an operator paused (with `virsh
 suspend`, or `lxc-freeze` by hand) has no record, so the pauser never resumes
-it. A recorded workload that is no longer paused is cleaned up: the record is
-dropped and nothing else happens.
+it. A container someone else froze is told apart with `lxc-info`'s raw state
+(`IsFrozen`), since `lxc.Runtime.State` folds frozen into running.
+
+**A record is true only while it describes the domain.** It carries the paused
+domain's UUID. When the majority is back, a VM record whose domain is gone, is
+no longer paused, or is another domain of the name is dropped: it would
+otherwise hold `partition_paused` open forever and offer Layer 3 a stale epoch.
+A memory snapshot, which resumes the guest when it finishes, is refused for a VM
+a record holds, and `CreateLiveSnapshot` refuses any paused domain.
 
 ### 3.4 Pause failure
 
@@ -202,14 +237,25 @@ in this order:
 2. **The local row still names this host** at the recorded `owner_epoch` and
    incarnation (`created_at`).
 3. **A majority of the voter set confirms it.** The pauser asks every other
-   voter it can reach. It needs answers from enough of them that, counting
-   itself, they are a majority. Every answer must say:
-   - this host's state, in that voter's replica, is not `fenced` or `offline`
-     (`ListHosts`);
+   voter it can reach, with one peer-only, read-only RPC,
+   `ConfirmPartitionResume`, answered from that voter's OWN replica and claim
+   tables. It needs answers from enough of them that, counting itself, they
+   are a majority. Every answer must say:
+   - this host's state, in that voter's replica, is not `fenced`, `offline` or
+     absent;
+   - the voter's own **row** for the workload names this host, at the recorded
+     owner epoch and incarnation. This is the check that holds with recovery
+     claims off (the default), after `lv host undrain` has cleared the fenced
+     state while the replacement runs, and when the majority moved the
+     workload to an epoch the minority never saw;
    - that voter has accepted no recovery-claim value for this workload at the
      recorded epoch and incarnation, attempt 0, under either the
-     incarnation-scoped key or the legacy one (`GetRecoveryClaim`). It checks
-     this only while a voter generation is adopted.
+     incarnation-scoped key or the legacy one.
+
+   One objection holds the workload. An unreachable voter, or one on a build
+   without the RPC, is not an answer: during a rolling upgrade a paused
+   workload on an upgraded host resumes once a majority of voters run this
+   build.
 
 **Why a majority of answers, and not this host's own replica.** A healed host's
 replica is stale. In a 2|3 split its first anti-entropy exchange can complete
@@ -342,6 +388,15 @@ max_V b_V + D_M + Δ + T_pause + Δ + E
   clocks' rate error (well under 0.1% over 30 s).
 - **`W` = `T_pause` + margin = 23 s**, measured from `t_d`.
 
+**Accumulated loss changes nothing here** (§3.1). From the moment M's links to
+the quorum observers are continuously broken, M's readings are continuously
+not-Yes after `D_M`, and they cover `T_pause` of the window after exactly
+`T_pause`; earlier lossy readings can only add to that. What accumulation adds
+is a lossy link that never breaks continuously: there the guarantee is
+probabilistic — M pauses once it has lost the majority for half of `2·T_pause`
+— while the observers' five-consecutive-failure rule makes a fence on such a
+link equally a matter of chance.
+
 **Why `t_d` and not the coordinator's own last contact.** The coordinator's own
 last successful probe of M is a LOWER bound on M's last contact with the
 majority. Another voter may have heard from M later, and M keeps its majority
@@ -372,13 +427,17 @@ All of this is in the failover coordinator (`internal/failover`).
 
 1. `failover()` fences as today. If the fence's assurance would be `assumed`
    (best-effort SSH failed and proceeded), and the pause applies (§4.3), it
-   records the fence with method `self-pause` instead of `best-effort-ssh`, with
-   the SSH detail kept in `detail`. `corrosion.FenceAssurance("self-pause",
-   "fenced")` is `self_paused`. It is not proof-grade, and
-   `fenceWasBestEffort` counts it as best-effort, so `safe_fence_default`
-   gates it exactly as before.
+   keeps the method `best-effort-ssh` and prefixes the detail with
+   `corrosion.FencePauseReliance`. A coordinator on an OLDER build reads the
+   row exactly as it always has — an assumed best-effort fence, gated by
+   `safe_fence_default` — where a new method value would have read to it as a
+   proved power-off it could resume from at once. This build waits on the
+   prefix, and operator surfaces (`lv doctor fence`, the coordinator's log)
+   show assurance `self_paused` through `FenceAssuranceDetail`. It is not
+   proof-grade. `litevirt_fences_total` classifies by method and result, so it
+   counts these rows as `assumed`.
 2. `recoverFenced` runs the safe-fence and confirmation checks unchanged. For a
-   `self-pause` fence it then checks the deadline. If the deadline has not
+   fence carrying the reliance prefix it then checks the deadline. If the deadline has not
    passed, it records `pauseWait[host] = anchor + W` in memory and returns
    without recovering anything.
 3. On every later cycle, `run()` revisits a host in `pauseWait` through the
@@ -392,7 +451,7 @@ All of this is in the failover coordinator (`internal/failover`).
    host came back, it will resume itself (§3.5), and `recoverHosts` reactivates
    it.
 4. A successor coordinator, or a restarted one, has no `pauseWait` entry. It
-   resumes from the `self-pause` fence record through `resumeActionFor` →
+   resumes from the relied-on fence record through `resumeActionFor` →
    `recoverFenced`, and starts a fresh wait anchored at its own first sight of
    the record. That is later than the original `t_d`, so it is safe.
 
@@ -404,7 +463,12 @@ never waits.
 
 All three of these must hold:
 
-- `partition_pause_v1` is latched (`Gate.Enforced`). This is §5.
+- `partition_pause_v1` is latched (`Gate.Enforced`), and this coordinator's
+  own flag is on. This is §5.
+- The TARGET host's own last cached Ping advertised `partition_pause_v1`
+  (`Checker.PeerAdvertisedLast`, which makes no RPC: the host has just been
+  found unreachable). The latch alone is not enough: a host whose flag went off
+  after the latch stops advertising.
 - The target host holds no open `partition_pause_failed` condition in the
   coordinator's replica.
 - The fence's assurance would otherwise be `assumed`.
@@ -462,9 +526,12 @@ host it fenced is running a pauser. This is the `recovery_claim_v1` and
 - **Not replication-gated.** It emits no new replicated statement shape:
   - the record is a host-local file;
   - the conditions use `UpsertHealthCondition`'s existing shape;
-  - the fence row uses `InsertFenceLog`'s existing shape, with a new VALUE in
-    `method`;
-  - the resume check reads through existing RPCs.
+  - the fence row uses `InsertFenceLog`'s existing shape and the method every
+    build already knows (`best-effort-ssh`), with the reliance as a prefix of
+    its `detail` (§4.2), so an older coordinator reads the row as it always has;
+  - the resume check is an RPC (`ConfirmPartitionResume`), not a replicated
+    statement; a voter on a build without it answers `Unimplemented`, which is
+    not an answer (§3.5).
 
   `ReplicationGated` is for latches that claim what a peer can DECODE. This one
   claims what a peer will DO, which is exactly what the voting-member latch
@@ -490,11 +557,14 @@ minority stops its copy, and the majority recovers as it always has.
 - **On one host**, it withdraws that host's advertisement, so a latch that has
   not yet formed cannot form.
 - **Once latched**, a host with the flag off reports the token in
-  `PingResponse.not_enforcing`, and its peers raise `ha_degraded`
-  (unsupported_member).
+  `PingResponse.not_enforcing` (`withheldStandDowns`, beside
+  `recovery_claim_v1`), and its peers raise `ha_degraded`
+  (unsupported_member). A coordinator also stops relying on that host's pause
+  the moment its Ping stops advertising the token (§4.3).
 - **Standing down in an incident** is `false` on every host and a restart.
   The coordinator relies on the pause only when its own flag is on AND the
-  token is latched (`flag && Enforced`, the family rule), so a coordinator
+  token is latched (`flag && Enforced`, the family rule) AND the target host
+  advertised it, so a coordinator
   whose flag is off records `assumed` and recovers at once, exactly as today,
   and a host whose flag is off pauses nothing.
 
@@ -526,6 +596,10 @@ with the heal) for which all of these hold:
 
 1. it targets this workload (`vm`, `<name>`), and its `dest_host` is the host
    the row now names, which is not this host;
+1a. it **completed**, executed by its own destination (`status = completed`,
+   `executor_host = dest_host`). A decided claim whose destination has not yet
+   started the workload, or failed to, is not a running replacement, and
+   settling on it would stop the only running copy;
 2. it carries a claim certificate, and `corrosion.VerifyClaimCertificate`
    accepts it. That means:
    - the certificate decides exactly this proof's value;
@@ -535,19 +609,44 @@ with the heal) for which all of these hold:
    - every signature chains to the cluster CA and is unrevoked;
    - the live row is the certificate's incarnation.
 3. the certificate's key is for the **same incarnation as the local copy**, at an
-   owner epoch **≥ the local copy's**.
+   owner epoch **≥ the local copy's**;
+4. the destination's OWN runtime reports the workload running now (the peer
+   runtime inventory, `CheckPeerVMRuntime`). An unreachable destination, or no
+   runtime check wired, is no proof.
+
+Proofs `ReapSpentProofs` has tombstoned are still read: a host that comes back
+more than a day later still needs the certificate.
+
+A legacy-key certificate (one minted before `claim_incarnation_v1` latched)
+names no incarnation. It is accepted only together with clauses 1a and 4 and
+with the current row being the local copy's incarnation, so a legacy
+certificate of an earlier incarnation could settle a copy only if its proof
+completed on a host that now runs a later same-named workload whose row carries
+the local copy's incarnation. That is the bound (L6); the legacy bridge
+(`claims.Spec.AdoptLegacy`) does not record an incarnation attribution to check
+against.
 
 **The local copy's identity** comes from evidence on THIS host, never from the
 row:
 
-- **The pause record (§3.3)**, if there is one. It holds the epoch and the
-  incarnation at the moment of the pause.
-- **Otherwise, the domain's own metadata.** The owner-epoch element
-  (`GetDomainOwnerEpoch`) gives the epoch. The managed stamp, extended to
-  carry `incarnation="<created_at>"` (`SetDomainManagedIncarnation`), gives the
+- **The pause record (§3.3)**, only while it still describes the domain: the
+  domain is paused, with the recorded UUID.
+- **The domain's own metadata.** The managed stamp, extended to carry
+  `incarnation="<created_at>"` (`SetDomainManagedIncarnation`), gives the
   incarnation. The reconciler stamps it from a live row that names this host
   (`adoptManagedDomains`). An older binary's `<managed/>` element without the
-  attribute still parses, as "incarnation unknown".
+  attribute still parses, as "incarnation unknown". A record and a stamp that
+  disagree about the incarnation are no answer.
+- **The epoch is the HIGHEST** of the record's, the owner-epoch element's
+  (`GetDomainOwnerEpoch`) and the host-local owner-epoch marker file's, so a
+  stale source can never make the local copy look older than it is.
+
+A host WITHOUT the token settles from domain metadata alone, which needs both
+the managed stamp's incarnation and an owner-epoch element or marker. The
+owner-epoch element is written only when a VM with a real generation is
+published running, so a VM still at the pre-epoch 0 (`enforcement.owner_epoch`
+off, rows never graduated) has no epoch evidence and is not settled; it stays
+behind the non-destruction guard as before.
 
 If either the epoch or the incarnation is unknown, there is no proof, and the
 guard skips the domain as it does today. That is why the brief says never to
@@ -600,7 +699,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F4 | One-way partition (A→M works, M→A does not) | M can count a majority that cannot count it, so it may not pause while the majority fences it. The coordinator raises `partition_one_way` (evaluator `partition_pause`, subject `host/<M>`, critical) when it sees both views at once: a quorum of voters with at least `F` consecutive failures of M, and M's own rows marking enough voters healthy for a majority, each written AFTER that voter's failure streak against M began, with that voter still failing M after M saw it healthy. The last clause is what a heal lacks: there the host's new healthy rows are newer than the voters' last failures. It does not recover any differently. | Still open. The fix is mutual reachability: a probe answer that states the responder's own view of the caller. Detection is partial, because the checker does not re-stamp a steadily healthy edge. M's "healthy" rows are fresh only after a transition (a restart, or a flap), so a one-way split that starts with every edge already healthy is not seen. |
 | F5 | More than 17 hosts | `D_M` grows by one probe batch per 16 peers. | Closed: `W` is computed from the cluster's size (§4.4). The one gap is a host added inside the minority during the partition. |
 | F6 | A host comes back before the deadline | The deadline check sees fresh healthy observers (`fenceStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
-| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator that lost the cluster-wide quorum within `QuorumRegainGrace` (`StallGrace`, 10 s) therefore decides no new fence (`error_class=quorum_regain`), as one that stalled does not. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `fenceStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
+| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. A remote region's quorum this node never evaluates is never in grace. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `fenceStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
 | F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. |
 
@@ -621,7 +720,7 @@ restore it.
 - **Resume verdict:** every check in §3.5, in order; a missing answer is not a
   yes; too few answers hold.
 - **The timing inequality** (§4.1) against the live constants.
-- **Coordinator:** the `self-pause` method only when latched and assumed; the
+- **Coordinator:** the reliance prefix only when latched, advertised by the target and assumed; the
   wait, scaled by cluster size; the deadline re-check; a host that came back;
   an open `partition_pause_failed` falls back to `assumed`; unlatched
   behaviour is unchanged; `partition_one_way` raised on both views and not
@@ -665,16 +764,14 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
 1. **`QuorumRegainGrace` (§7 F7) was not in the first draft.** Writing the
    fleet-wide blip scenario showed that a coordinator coming back from the
    blip can fence a host on the failure rows the blip left behind, which
-   would leave that host paused behind a fence instead of resuming. The
-   coordinator now defers new fences for `StallGrace` after it last saw the
-   cluster-wide quorum lost, as it already does after a stall of its own. A
-   majority that kept its quorum through a partition is unaffected.
-2. **CLAUDE.md is not edited by this branch.** The brief asked for the
-   default-on exception paragraph to name `enforcement.partition_pause`
-   beside `enforcement.audit_signature`. An agent may not change CLAUDE.md on
-   another agent's say-so, so the proposed paragraph is in the report for the
-   user to apply. `internal/daemon/config.go` and `docs/configuration.md`
-   carry the default and its kill switch.
+   would leave that host paused behind a fence instead of resuming. The first
+   cut stamped the cluster-wide quorum's every No, which stopped
+   region-scoped failover outright (safety review H1); the grace is now per
+   quorum scope and runs from that scope's No→Yes transition.
+2. **CLAUDE.md** names `enforcement.partition_pause` beside
+   `enforcement.audit_signature` as a default-on flag; the user applied that
+   change at `7e690187`. `internal/daemon/config.go` and
+   `docs/configuration.md` carry the default and its kill switch.
 3. **The watchdog premise.** §5 explains why the pauser runs whether or not a
    hardware watchdog is armed. The brief said that an armed watchdog already
    covers a host; it covers only a dead daemon.
@@ -693,6 +790,14 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    one, the frozen copy is stopped (`ct_settled`, a `partition.settle` audit
    row). A container running on a host without the token is not settled; that
    remains open.
+7. **Safety review, applied.** Settle requires a completed proof executed by
+   its destination and the destination's runtime reporting the workload
+   running (H2); the resume check reads the voters' own rows over
+   `ConfirmPartitionResume` (M1); records carry the domain UUID and the local
+   epoch is the highest evidence (M2); a relied-on fence keeps method
+   `best-effort-ssh` (M3); the target must have advertised the token (M4);
+   loss is accumulated with hysteresis (M5); every skip is a failed pause and
+   every call is bounded, with pauses run concurrently (M6).
 6. **Stale-replica resume, tested.** The 2|3 scenario holds replication into
    the healed minority for 12 s while every other RPC flows, so the minority's
    own row still says the workload is its own and only the voters' direct

@@ -601,7 +601,7 @@ checked.
 | `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
 | `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a forced power-off, or its watchdog heartbeat was stopped. Nothing checked it went down. |
 | `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |
-| `self_paused` | `self-pause` + `fenced` | As `assumed`, but with `partition_pause_v1` latched: the coordinator waited out the host's own partition pause before it recovered anything, so the old copy had stopped executing. It says nothing about power. |
+| `self_paused` | `best-effort-ssh` + `fenced`, detail prefixed `[relies on the host's partition pause]` | As `assumed`, but with `partition_pause_v1` latched: the coordinator waited out the host's own partition pause before it recovered anything, so the old copy had stopped executing. It says nothing about power. `litevirt_fences_total` counts it as `assumed`. |
 | `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
 | `failed` | any + `partial` | The fence ran and reported failure. |
 
@@ -1309,9 +1309,10 @@ holder writes.
 - `vm_settled` / `ct_settled` (`<name>@<host>`, warning): a host came back
   holding a copy of a workload that a decided recovery claim, whose
   certificate verifies, gave to another host at the same incarnation and an
-  owner epoch at least its own. The host stopped its copy (a VM is destroyed,
-  which keeps its definition and disks) and wrote a `partition.settle` audit
-  row. The leftover cleanup then handles the shut-off domain as usual.
+  owner epoch at least its own, on a proof its destination completed, while
+  the destination's own runtime reports the workload running. The host
+  stopped its copy (a VM is destroyed, which keeps its definition and disks)
+  and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
 
 ### Observer stalled (`observer_stalled`)
 

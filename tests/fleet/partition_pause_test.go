@@ -339,6 +339,17 @@ func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing
 	rs := sampleRunning(t, c, "pp-vm")
 
 	minority, majority := c.Nodes[:2], c.Nodes[2:]
+	// G6 holds from a healed state: a pre-split blip (a slow probe under
+	// -race) left in the owner's loss window would legitimately bring its
+	// pause forward, and the T_pause lower bound below would not apply.
+	eventually(t, time.Minute, "the owner's pauser to be healed before the split", func() bool {
+		for _, pn := range s.nodes {
+			if pn.n == owner {
+				return pn.pauser.HealedForTests()
+			}
+		}
+		return false
+	})
 	split := time.Now()
 	c.SplitGossip(minority, majority)
 

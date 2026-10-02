@@ -320,6 +320,10 @@ type PartitionPauser struct {
 	// last reading was not Yes. A restart re-earns both, deliberately.
 	samples  []lossSample
 	yesSince time.Time
+	// sawYes / sawNo: whether this run has read the quorum as Yes, or as
+	// No, at all. Unknown readings before the first Yes are the checker's
+	// startup warmup unless a No came with them (§3.1).
+	sawYes, sawNo bool
 	// reads guards the abandoned libvirt reads, one call per kind (callGuard).
 	reads callGuard
 	// inflight marks the workloads whose pause call has not returned yet (a
@@ -350,15 +354,30 @@ type lossSample struct {
 }
 
 // lossCovered is how much of the samples' span the quorum was lost: each
-// interval between two readings is attributed to the later one.
+// interval between two readings is attributed to the EARLIER one, so loss
+// starts at the first reading that saw it. Attributing it to the later one
+// charged the stretch before that reading — up to a tick during which the
+// last reading was a Yes — and paused a blip short of T_pause (G6). §4.1's
+// bound already allows a tick (Δ) for the first lost reading to come.
 func lossCovered(samples []lossSample) time.Duration {
 	var d time.Duration
 	for i := 1; i < len(samples); i++ {
-		if samples[i].lost {
+		if samples[i-1].lost {
 			d += samples[i].at.Sub(samples[i-1].at)
 		}
 	}
 	return d
+}
+
+// HealedForTests reports whether this pauser is in a healed state: its
+// readings have been an unbroken Yes for at least T_pause, so its loss window
+// is clear. G6 — a blip shorter than T_pause pauses nothing — holds from such
+// a state, so a scenario that asserts the pause comes no sooner than T_pause
+// after a split waits for it first (tests/fleet).
+func (p *PartitionPauser) HealedForTests() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.yesSince.IsZero() && p.now().Sub(p.yesSince) >= p.after
 }
 
 // SetQuorum wires the execution quorum (Checker.ExecutionQuorum).
@@ -460,6 +479,18 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 	cut := now.Add(-2 * p.after)
 	for len(p.samples) > 1 && p.samples[0].at.Before(cut) {
 		p.samples = p.samples[1:]
+	}
+	if state == QuorumNo {
+		p.sawNo = true
+	}
+	if !lost && !p.sawYes {
+		p.sawYes = true
+		if !p.sawNo {
+			// Only warmup's Unknowns precede this first Yes: they were never
+			// a loss, and must not shorten the next one. A restart inside a
+			// partition reads No, never Yes, and keeps its readings.
+			p.samples = []lossSample{{at: now}}
+		}
 	}
 	if lost {
 		p.yesSince = time.Time{}

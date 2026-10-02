@@ -60,7 +60,10 @@ and no operator action.
 - G4. A host that comes back holding a copy that a decided, verified claim gave
   to another host stops that copy, on that proof and nothing weaker.
 - G5. No disk, definition or memory image is deleted by either layer.
-- G6. A blip shorter than `T_pause` pauses nothing. A fleet-wide blip pauses
+- G6. A blip shorter than `T_pause` pauses nothing, when it starts from a
+  healed state (`T_pause` of unbroken Yes, §3.1). Loss left in the window by
+  an earlier blip less than a heal ago still counts, by design: that is what
+  pauses a host on a lossy link (§4.1). A fleet-wide blip pauses
   everything and resumes everything, with a condition raised while it lasts.
 
 **Non-goals.**
@@ -88,7 +91,11 @@ monotonic clock, and accumulates loss rather than timing it continuously:
 
 - **It pauses** once the readings that are not Yes (No, or Unknown) cover at
   least `T_pause` of that window (§3.3). Each interval between two readings
-  counts as the later reading's state.
+  counts as the EARLIER reading's state, so a loss starts at the first reading
+  that saw it. Charging it to the later reading counted up to a tick before
+  that reading, while the last reading was still Yes, and paused a blip a tick
+  short of `T_pause`. §4.1 already allows one tick (`Δ`) for the first lost
+  reading to come.
 - **Only an unbroken run of Yes readings lasting `T_pause` (`F·P` = 10 s)
   counts as the majority being back.** It clears the window and runs the
   resume path (§3.5). A single Yes on a lossy link is not a heal, and neither
@@ -109,7 +116,11 @@ Unknown means one of two things:
 
 - **Startup warmup.** It ends with the first full probe cycle, about 2–3 s
   after start. That is far inside `T_pause`, so an ordinary restart pauses
-  nothing.
+  nothing. Once the first Yes arrives, warmup's readings are dropped, unless a
+  No came with them: they were never a loss, and with a heal now taking
+  `T_pause` of Yes they would otherwise shorten a partition that begins soon
+  after start. A restart inside a partition reads No and never Yes, so it
+  keeps them.
 - **An unreadable voter set.** A host that cannot read its own voter set cannot
   claim a majority.
 

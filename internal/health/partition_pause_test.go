@@ -757,6 +757,70 @@ func TestPartitionPause_ALossyLinkStillPauses(t *testing.T) {
 	}
 }
 
+// Loss starts at the first reading that saw it. A host whose last reading was
+// Yes and whose next reads No has been without the majority for T_pause only
+// T_pause after that No — not a tick earlier, as charging the interval before
+// the No would have it (and a blip a tick short of T_pause would pause, G6).
+//
+// Mutation: attribute each interval to the later reading — vm-ha pauses one
+// reading early and this goes red.
+func TestPartitionPause_LossStartsAtTheFirstLostReading(t *testing.T) {
+	f := newPauseFixture(t)
+	f.set(QuorumYes)
+	for i := 0; i < 3; i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	f.set(QuorumNo)
+	for i := 0; i < int(PartitionPauseAfter/time.Second); i++ { // No readings at +0 s … +9 s
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-ha is %s after %v of No readings, short of T_pause", st, PartitionPauseAfter-time.Second)
+	}
+	f.tick() // +10 s
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s a full T_pause after the first No", st)
+	}
+}
+
+// The checker's startup warmup reads Unknown, which counts as loss (§3.1) —
+// but once the first Yes comes, warmup was never a loss, and a partition
+// soon after start gets its full T_pause.
+//
+// Mutation: keep warmup's readings after the first Yes — vm-ha pauses early
+// and this goes red.
+func TestPartitionPause_WarmupIsNotALossOnceTheMajorityAnswers(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumUnknown, 2*time.Second) // warmup: three Unknown readings
+	f.set(QuorumYes)
+	f.tick()
+	f.advance(time.Second)
+	f.set(QuorumNo)
+	for i := 0; i < int(PartitionPauseAfter/time.Second); i++ {
+		f.tick()
+		f.advance(time.Second)
+	}
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-ha is %s: startup warmup shortened the next loss", st)
+	}
+}
+
+// A restart inside a partition reads Unknown then No and never Yes: its
+// readings all count, so it pauses as a host that never restarted would.
+//
+// Mutation: drop warmup's readings on the first No as well — vm-ha pauses
+// late and this goes red.
+func TestPartitionPause_ARestartInsideAPartitionKeepsItsLoss(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumUnknown, 2*time.Second)
+	f.loseFor(QuorumNo, PartitionPauseAfter-3*time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("vm-ha is %s after T_pause of Unknown-then-No since start", st)
+	}
+}
+
 // A heal is an unbroken T_pause of Yes: one reading short of it resumes
 // nothing, and the reading that completes it does.
 //

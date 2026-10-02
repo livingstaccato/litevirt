@@ -1173,6 +1173,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetVMBackend(d.virt)
 	pauser.SetContainerRuntime(lxcRunner)
 	pauser.SetResumeConfirmer(svc.ConfirmPartitionResume)
+	pauser.SetSettleVerifier(svc.VerifySettleProof)
 	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
 	go pauser.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP

@@ -180,16 +180,19 @@ type PartitionPauser struct {
 	db    *corrosion.Client
 	store pauseStore
 
-	quorum    func(context.Context) (QuorumState, int, int)
-	enabled   func() bool
-	vms       PauseVMBackend
-	cts       lxc.Runtime
-	confirm   ResumeConfirmer
-	armed     func() bool
-	selfFence func()
-	now       func() time.Time
-	after     time.Duration
-	tick      time.Duration
+	quorum  func(context.Context) (QuorumState, int, int)
+	enabled func() bool
+	vms     PauseVMBackend
+	cts     lxc.Runtime
+	confirm ResumeConfirmer
+	settle  SettleVerifier
+	// settleProofs replaces corrosion.CertifiedTransferProofs (tests).
+	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	armed        func() bool
+	selfFence    func()
+	now          func() time.Time
+	after        time.Duration
+	tick         time.Duration
 
 	mu sync.Mutex
 	// lostAt is the local monotonic instant the current loss began; zero while
@@ -230,6 +233,14 @@ func (p *PartitionPauser) SetContainerRuntime(r lxc.Runtime) { p.cts = r }
 
 // SetResumeConfirmer wires the majority check. nil confirms nothing.
 func (p *PartitionPauser) SetResumeConfirmer(fn ResumeConfirmer) { p.confirm = fn }
+
+// SetSettleVerifier wires Layer 3 for CONTAINERS (docs/design/partition-pause.md
+// §6). A container relocation tombstones this host's row and writes one at the
+// target, so the VM reconciler's settle, which reads the domain's row, has
+// nothing to read; and a container carries no incarnation of its own, so only
+// a container this host paused — whose record holds the incarnation and epoch
+// — can be settled. nil settles nothing.
+func (p *PartitionPauser) SetSettleVerifier(fn SettleVerifier) { p.settle = fn }
 
 // SetSelfFence wires the watchdog backstop for a pause that fails: armed
 // reports a VERIFIED hardware watchdog, fence trips it. Either nil disables it.
@@ -501,6 +512,13 @@ func (p *PartitionPauser) tryResume(ctx context.Context, now time.Time) {
 	var candidates []PauseRecord
 	for _, rec := range recs {
 		if why := p.localRowMatches(ctx, rec); why != "" {
+			if rec.Kind == PauseKindContainer {
+				if settled, swhy := p.settleContainer(ctx, rec); settled {
+					continue
+				} else if swhy != "" {
+					why += "; " + swhy
+				}
+			}
 			p.hold(rec, why)
 			continue
 		}

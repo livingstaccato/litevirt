@@ -183,3 +183,107 @@ func (r *Reconciler) raiseSettled(ctx context.Context, name string, p corrosion.
 		slog.Warn("partition-settle: could not record vm_settled", "vm", name, "error", err)
 	}
 }
+
+// settleContainer is Layer 3 for a container this host paused: its own row is
+// gone (a relocation tombstones it) and the container's one live row names
+// another host, at the recorded incarnation, with a live relocate proof whose
+// certificate verifies here at an owner epoch at least the recorded one. Then
+// the frozen local copy is stopped (its rootfs kept), with a partition.settle
+// audit row and ct_settled. It reports whether it settled, and if not, why.
+func (p *PartitionPauser) settleContainer(ctx context.Context, rec PauseRecord) (bool, string) {
+	if p.settle == nil || p.cts == nil {
+		return false, ""
+	}
+	rows, err := p.db.Query(ctx, `SELECT host_name FROM containers WHERE name = ? AND deleted_at IS NULL AND host_name != ?`,
+		rec.Name, p.host)
+	if err != nil {
+		return false, "container rows unreadable: " + err.Error()
+	}
+	if len(rows) != 1 {
+		return false, fmt.Sprintf("%d live rows for the container on other hosts, not one", len(rows))
+	}
+	dest := rows[0].String("host_name")
+	row, err := corrosion.GetContainer(ctx, p.db, dest, rec.Name)
+	if err != nil || row == nil {
+		return false, "the destination row is unreadable"
+	}
+	if corrosion.IncarnationOf(row.CreatedAt) != rec.Incarnation {
+		return false, "the live row is another incarnation"
+	}
+	lister := p.settleProofs
+	if lister == nil {
+		lister = corrosion.CertifiedTransferProofs
+	}
+	proofs, err := lister(ctx, p.db, corrosion.ClaimKindContainer, rec.Name)
+	if err != nil {
+		return false, "proofs unreadable: " + err.Error()
+	}
+	pr, cert, why := settleDecideContainer(p.host, dest, rec, proofs, func(ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
+		return p.settle(ctx, ap)
+	})
+	if why != "" {
+		return false, why
+	}
+	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err = p.cts.Stop(sctx, rec.Name, 10)
+	cancel()
+	if err != nil {
+		return false, "stop failed: " + err.Error()
+	}
+	detail := fmt.Sprintf("stopped the frozen local copy (incarnation %s, owner epoch %d): superseded by proof %s for %s, "+
+		"certified at voter generation %d for owner epoch %d; rootfs kept", rec.Incarnation, rec.OwnerEpoch, pr.ID, dest,
+		cert.ConfigGeneration, cert.Key.OwnerEpoch)
+	slog.Warn("partition-settle: stopped a local copy that a certified recovery claim gave to another host",
+		"ct", rec.Name, "host", p.host, "dest", dest, "proof", pr.ID, "claim_epoch", cert.Key.OwnerEpoch, "local_epoch", rec.OwnerEpoch)
+	_ = corrosion.InsertAuditLog(ctx, p.db, corrosion.AuditRecord{
+		ID: randid.New(), Username: "system", HostName: p.host,
+		Action: "partition.settle", Target: "container/" + rec.Name, Detail: detail, Result: "ok",
+	})
+	ts := p.now().UTC().Format(time.RFC3339)
+	b, _ := json.Marshal(settledEvidence{Proof: pr.ID, Dest: dest, Key: cert.Key, ConfigGeneration: cert.ConfigGeneration,
+		Local:  map[string]any{"incarnation": rec.Incarnation, "owner_epoch": rec.OwnerEpoch, "evidence": "partition-pause record"},
+		Detail: "this host came back holding a container a decided recovery claim relocated; it stopped its copy (rootfs kept)"})
+	if err := corrosion.UpsertHealthCondition(ctx, p.db, corrosion.HealthCondition{
+		Evaluator: corrosion.PartitionPauseEvaluator, Code: corrosion.CondCTSettled,
+		SubjectKind: "container", SubjectID: rec.Name + "@" + p.host,
+		Lifecycle: corrosion.ConditionConfirmed, Severity: corrosion.SeverityWarning,
+		Hosts: []string{p.host, dest}, Evidence: string(b), ObserveCount: 1,
+		FirstSeen: ts, LastSeen: ts, ConfirmedAt: ts, Reporter: p.host,
+	}); err != nil {
+		slog.Warn("partition-settle: could not record ct_settled", "ct", rec.Name, "error", err)
+	}
+	if err := p.store.remove(rec.Kind, rec.Name); err != nil {
+		slog.Warn("partition-settle: could not drop the pause record", "ct", rec.Name, "error", err)
+	}
+	return true, ""
+}
+
+// settleDecideContainer is settleDecide for a container: the record is the
+// local copy's identity.
+func settleDecideContainer(self, dest string, rec PauseRecord, proofs []corrosion.ProofRecord,
+	verify func(corrosion.ActionProof) (corrosion.ClaimCertificate, error)) (corrosion.ProofRecord, corrosion.ClaimCertificate, string) {
+	why := fmt.Sprintf("no verified recovery-claim certificate relocates this incarnation to %s at owner epoch >= %d", dest, rec.OwnerEpoch)
+	for _, pr := range proofs {
+		if pr.TargetKind != corrosion.ClaimKindContainer || pr.TargetName != rec.Name || pr.DestHost != dest || dest == self {
+			continue
+		}
+		cert, err := verify(pr.ActionProof)
+		if err != nil {
+			why = "proof " + pr.ID + ": " + err.Error()
+			continue
+		}
+		if cert.Key.TargetKind != corrosion.ClaimKindContainer || cert.Key.TargetName != rec.Name {
+			continue
+		}
+		if cert.Key.Incarnation != "" && cert.Key.Incarnation != rec.Incarnation {
+			why = "proof " + pr.ID + "'s certificate decides another incarnation"
+			continue
+		}
+		if cert.Key.OwnerEpoch < rec.OwnerEpoch {
+			why = fmt.Sprintf("proof %s's certificate decides owner epoch %d, older than the local copy's %d", pr.ID, cert.Key.OwnerEpoch, rec.OwnerEpoch)
+			continue
+		}
+		return pr, cert, ""
+	}
+	return corrosion.ProofRecord{}, corrosion.ClaimCertificate{}, why
+}

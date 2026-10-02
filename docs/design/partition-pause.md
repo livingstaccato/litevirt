@@ -682,3 +682,18 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    host fenced, or that accepted a claim to move the workload, is enough to
    hold it. Waiting for a majority of objections would let a resume race a
    recovery that only one voter has heard of yet.
+5. **Containers settle only when this host paused them.** A container has no
+   managed-stamp incarnation and its owner-epoch marker is written only on a
+   relocation, so the only evidence of a container copy's incarnation and
+   epoch is the pause record. Layer 3 for containers therefore runs in the
+   pauser's resume pass (`PartitionPauser.settleContainer`), not in the
+   ContainerChecker: when a self-paused container's own row is gone and its
+   one live row on another host carries a relocate proof whose certificate
+   verifies for the recorded incarnation at an epoch at least the recorded
+   one, the frozen copy is stopped (`ct_settled`, a `partition.settle` audit
+   row). A container running on a host without the token is not settled; that
+   remains open.
+6. **Stale-replica resume, tested.** The 2|3 scenario holds replication into
+   the healed minority for 12 s while every other RPC flows, so the minority's
+   own row still says the workload is its own and only the voters' direct
+   answers can stop the resume.

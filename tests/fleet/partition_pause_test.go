@@ -269,8 +269,10 @@ func insertVMPolicy(t *testing.T, n *Node, name, host, policy string) {
 // Mutations: start the replacement at the decision (deadline = anchor in
 // pauseDeadlinePassed) — the replacement starts while node-0 still runs and
 // the overlap check goes red; never pause (lostFor < p.after → true) — the
-// overlap check goes red; resume without the majority's confirmation — node-0
-// runs again after the heal and the last check goes red.
+// overlap check goes red; resume without the majority's confirmation — node-0,
+// its replica still stale, runs pp-vm again after the heal and the post-heal
+// check goes red; one-way without its kept-failing clause — the heal raises
+// partition_one_way and the last check goes red.
 func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true})
@@ -352,11 +354,26 @@ func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing
 		t.Errorf("pp-none (on_host_failure=none) is %s on %s; nothing replaces it, so it keeps running", st, owner.Name)
 	}
 
-	// After the heal nothing resumes on the minority.
+	// After the heal nothing resumes on the minority. For the first stretch
+	// the network is back but REPLICATION into and out of the minority is
+	// still held, so node-0's own replica still says pp-vm is its own at the
+	// recorded epoch and incarnation — only the voters it asks directly can
+	// tell it the workload moved. Then replication returns and Layer 3 stops
+	// the paused copy on the certified claim.
 	rs.markNow()
 	c.HealGossip()
+	for _, a := range minority {
+		for _, b := range majority {
+			c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+		}
+	}
 	c.WaitGossip(t, remergeBound, "the halves to merge", c.GossipConverged)
-	time.Sleep(15 * time.Second)
+	time.Sleep(12 * time.Second)
+	if row := vmOn(t, owner, "pp-vm"); row == nil || row.HostName != owner.Name {
+		t.Fatalf("setup: replication reached %s while it was held (row %+v); the stale-replica window is not exercised", owner.Name, row)
+	}
+	c.ClearLinkFaults()
+	time.Sleep(10 * time.Second)
 	rs.mu.Lock()
 	since := rs.since
 	maxRun = rs.max

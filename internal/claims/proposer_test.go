@@ -27,6 +27,7 @@ type memVoter struct {
 }
 
 type acceptEvent struct {
+	key    corrosion.ClaimKey
 	voter  string
 	ballot corrosion.Ballot
 	digest string
@@ -163,7 +164,7 @@ func (m *memTransport) Accept(ctx context.Context, voter string, key corrosion.C
 	res, err := mv.db.ClaimAccept(ctx, key, b, v, gen, mv.signer, probe)
 	if err == nil && res.Accepted {
 		m.mu.Lock()
-		m.accepts = append(m.accepts, acceptEvent{voter: voter, ballot: b, digest: res.Accept.ValueDigest})
+		m.accepts = append(m.accepts, acceptEvent{key: key, voter: voter, ballot: b, digest: res.Accept.ValueDigest})
 		m.mu.Unlock()
 		if ferr := m.fault(voter); ferr != nil {
 			return corrosion.AcceptResult{}, ferr
@@ -207,6 +208,9 @@ func (m *memTransport) chosen(key corrosion.ClaimKey, n int) map[string]bool {
 	defer m.mu.Unlock()
 	byBallot := map[string]map[string]map[string]bool{} // ballot → digest → voters
 	for _, a := range m.accepts {
+		if a.key != key {
+			continue
+		}
 		bk := a.ballot.String()
 		if byBallot[bk] == nil {
 			byBallot[bk] = map[string]map[string]bool{}

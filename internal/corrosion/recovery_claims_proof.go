@@ -34,13 +34,27 @@ func (c *Client) MayEmitClaimCertificate() bool {
 	return fn != nil && *fn != nil && (*fn)()
 }
 
+// SetClaimIncarnationGate injects the predicate that claim_incarnation_v1
+// has durably latched here, wired at daemon start. Unset, it reads false.
+func (c *Client) SetClaimIncarnationGate(fn func() bool) { c.claimIncarnationGate.Store(&fn) }
+
+// ClaimIncarnationLatched reports whether claim_incarnation_v1 has durably
+// latched on this node (SetClaimIncarnationGate).
+func (c *Client) ClaimIncarnationLatched() bool {
+	fn := c.claimIncarnationGate.Load()
+	return fn != nil && *fn != nil && (*fn)()
+}
+
 // ErrClaimCertificateNotEmittable means a proof carries a certificate this
 // node may not yet write (recovery_claim_v1 has not latched here). Retryable:
 // the latch forms from the same peer set the coordinator's did.
 var ErrClaimCertificateNotEmittable = errors.New("proof carries a claim certificate this node cannot yet emit; retry once recovery_claim_v1 latches")
 
 // ClaimKeyForProof is the claim key a proof's certificate must decide, less
-// its attempt, which the certificate itself names (§3.10 step 2).
+// its attempt, which the certificate itself names (§3.10 step 2), and less
+// its incarnation, which a proof does not carry: that is bound against the
+// destination's own workload row (VerifyClaimCertificate). The key it returns
+// is a legacy one; WithIncarnation scopes it.
 func ClaimKeyForProof(p ActionProof, attempt int64) (ClaimKey, error) {
 	epoch, err := strconv.ParseInt(p.OwnerEpoch, 10, 64)
 	if err != nil {
@@ -64,7 +78,7 @@ func CertificateAuthorizesProof(certJSON string, p ActionProof) (ClaimCertificat
 	if err != nil {
 		return cert, err
 	}
-	if cert.Key != want {
+	if !cert.Key.SameDecision(want) {
 		return cert, fmt.Errorf("certificate decides %s, not %s", cert.Key, want)
 	}
 	proof := p
@@ -108,6 +122,9 @@ func VerifyClaimCertificate(ctx context.Context, c *Client, v *ClaimVerifier, p 
 	if err != nil {
 		return cert, err
 	}
+	if err := certificateIncarnationIsLive(ctx, c, cert.Key, p); err != nil {
+		return cert, err
+	}
 	adopted, err := AdoptedVoterGeneration(ctx, c)
 	if err != nil {
 		return cert, fmt.Errorf("read the adopted voter generation: %w", err)
@@ -134,6 +151,76 @@ func VerifyClaimCertificate(ctx context.Context, c *Client, v *ClaimVerifier, p 
 		Electorate: cfg.Members, Quorum: MajorityOf(len(cfg.Members)),
 	})
 	return cert, err
+}
+
+// WorkloadIncarnation is the incarnation of the live workload row for
+// (kind, name) in c's replica — IncarnationOf its created_at (§10 item 37).
+// ok is false when there is no live row, or when live rows of the name
+// disagree about their incarnation (two containers' rows mid-heal), since
+// then no single incarnation can be named.
+func WorkloadIncarnation(ctx context.Context, c *Client, kind, name string) (string, bool, error) {
+	var q string
+	switch kind {
+	case ClaimKindVM:
+		q = `SELECT DISTINCT COALESCE(created_at, '') AS created_at FROM vms WHERE name = ? AND deleted_at IS NULL`
+	case ClaimKindContainer:
+		q = `SELECT DISTINCT COALESCE(created_at, '') AS created_at FROM containers WHERE name = ? AND deleted_at IS NULL`
+	default:
+		return "", false, fmt.Errorf("no workload rows for target kind %q", kind)
+	}
+	rows, err := c.Query(ctx, q, name)
+	if err != nil || len(rows) != 1 {
+		return "", false, err
+	}
+	return IncarnationOf(rows[0].String("created_at")), true, nil
+}
+
+// certificateIncarnationIsLive is the destination's half of the incarnation
+// binding (§10 item 37): a certificate at an incarnation-scoped key authorizes
+// a proof only for the incarnation it names, so this node's own live row for
+// the target must be that incarnation. A re-created workload whose row has
+// replicated here is a different incarnation, and nothing a previous one
+// decided runs for it.
+//
+// A legacy key names no incarnation and is accepted as before: it is what
+// every certificate minted before claim_incarnation_v1 latched carries, and
+// refusing them would strand every recovery decided across the upgrade.
+//
+// A container relocation is also bound by its token. Its target row is the
+// one the relocation wrote, carrying p's relocation token, and that row keeps
+// the source's created_at (RelocateContainerWithToken) except where the
+// pre-epoch upsert met a stale tombstone of the same name on the target,
+// whose created_at the upsert's conflict arm keeps. The token is random per
+// decision and is digested into the value the certificate certifies, so the
+// row that carries it was written by this decision and by nothing else: it is
+// this decision's incarnation whatever its created_at says.
+func certificateIncarnationIsLive(ctx context.Context, c *Client, key ClaimKey, p ActionProof) error {
+	if key.Incarnation == "" {
+		return nil
+	}
+	if p.Action == ActionRelocate && p.TargetKind == ClaimKindContainer && p.RelocationToken != "" {
+		rows, err := c.Query(ctx, `SELECT 1 AS one FROM containers
+			WHERE name = ? AND relocate_token = ? AND deleted_at IS NULL LIMIT 1`, p.TargetName, p.RelocationToken)
+		if err != nil {
+			return fmt.Errorf("read the relocated row of %s/%s: %w", key.TargetKind, key.TargetName, err)
+		}
+		if len(rows) > 0 {
+			return nil
+		}
+	}
+	inc, ok, err := WorkloadIncarnation(ctx, c, key.TargetKind, key.TargetName)
+	if err != nil {
+		return fmt.Errorf("read the incarnation of %s/%s: %w", key.TargetKind, key.TargetName, err)
+	}
+	if !ok {
+		return fmt.Errorf("certificate decides %s, and this node has no single live %s/%s row to bind it to",
+			key, key.TargetKind, key.TargetName)
+	}
+	if inc != key.Incarnation {
+		return fmt.Errorf("certificate decides incarnation %s of %s/%s, but the live row here is incarnation %s",
+			key.Incarnation, key.TargetKind, key.TargetName, inc)
+	}
+	return nil
 }
 
 // ClaimGatedAction reports whether a proof of this action transfers ownership
@@ -231,7 +318,12 @@ func ClaimCertificateReplaces(current, next string, verifies func(string) bool) 
 	if err != nil {
 		return true // a row whose certificate does not even parse certifies nothing
 	}
-	if n.ValueDigest != c.ValueDigest || n.Key != c.Key || !verifies(next) {
+	// The same decision, at the same incarnation — or a legacy certificate
+	// re-certified at its incarnation-scoped key after claim_incarnation_v1
+	// latched (the bridge, §10 item 37). Never the reverse, and never across
+	// incarnations.
+	sameKey := n.Key == c.Key || (c.Key.Incarnation == "" && n.Key.SameDecision(c.Key))
+	if n.ValueDigest != c.ValueDigest || !sameKey || !verifies(next) {
 		return false
 	}
 	return !verifies(current) || n.ConfigGeneration > c.ConfigGeneration

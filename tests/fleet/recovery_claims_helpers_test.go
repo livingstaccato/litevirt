@@ -39,9 +39,11 @@ func (claimsGate) QuorumProof(context.Context) (health.QuorumState, int, int) {
 	return health.QuorumYes, 2, 2
 }
 
+// claimsLatched includes claim_incarnation_v1: it is mandatory, so a cluster
+// on this build has it latched, and its claims are incarnation-scoped.
 func claimsLatched(tok string) bool {
 	return tok == capabilities.SplitBrainGateV1 || tok == capabilities.RecoveryClaimV1 ||
-		tok == capabilities.VoterConfigV1
+		tok == capabilities.VoterConfigV1 || tok == capabilities.ClaimIncarnationV1
 }
 
 // enableRecoveryClaims turns recovery claims on for every node the way a
@@ -54,6 +56,7 @@ func enableRecoveryClaims(t *testing.T, c *Cluster, nodes ...*Node) {
 	}
 	for _, n := range nodes {
 		n.DB.SetRecoveryClaimGate(func() bool { return true })
+		n.DB.SetClaimIncarnationGate(func() bool { return true })
 		n.Server.SetRecoveryClaimEnforce(true)
 		n.Server.SetGate(claimsGate{})
 		if !n.Server.RecoveryClaimEnforced(context.Background()) {
@@ -84,6 +87,18 @@ func claimReconciler(t *testing.T, n *Node) *health.Reconciler {
 	rec.SetGate(epochGate{})
 	rec.SetRecoveryClaimGate(n.Server.RecoveryClaimGateForPendingProof)
 	return rec
+}
+
+// claimContainerChecker is the destination's container checker as the daemon
+// wires it (daemon.go): the execution gate and the recovery-claim certificate
+// check, so a relocate-recreate is claimed and recreated only on a certificate
+// that verifies here.
+func claimContainerChecker(t *testing.T, n *Node) *health.ContainerChecker {
+	t.Helper()
+	cc := health.NewContainerChecker(n.Name, n.DB, n.CT.LXC())
+	cc.SetGate(epochGate{})
+	cc.SetRecoveryClaimGate(n.Server.RecoveryClaimGateForPendingProof)
+	return cc
 }
 
 // proofsNaming lists the ownership-transfer proofs n's replica holds for target

@@ -37,6 +37,15 @@ const (
 	// all of "fenced proof-grade, no longer a member, revoked" in this voter's
 	// own replica. Retryable: replica lag delays a supersede, never admits one.
 	RefusalSupersedeUnproven = "recovery_claim_supersede_unproven"
+	// RefusalLegacyKeySealed: a Prepare or Accept at a LEGACY workload key —
+	// one with no incarnation, from a coordinator that has not latched
+	// claim_incarnation_v1 yet — at a (kind, name, epoch, attempt) this voter
+	// has already answered at an incarnation-scoped key. Its promise there
+	// reported its legacy state and sealed the legacy key, so a value accepted
+	// at the legacy key now could be missed by the incarnation-scoped decision
+	// (§10 item 37). Retryable: the coordinator latches the token and claims
+	// at the incarnation-scoped key.
+	RefusalLegacyKeySealed = "recovery_claim_legacy_key_sealed"
 )
 
 // ClaimVoterState is one voter's recorded state for a key.
@@ -55,10 +64,16 @@ type PrepareResult struct {
 	Promised       bool
 	PromisedBallot Ballot // what this voter has promised after the call
 	State          ClaimVoterState
-	Voter          string
-	Incarnation    string
-	Refusal        string
-	Detail         string
+	// Legacy is, on a promise at an incarnation-scoped key, what this voter
+	// accepted at the same key's LEGACY form, or nil when it accepted nothing
+	// there. The promise is durable before it is reported, and from then on
+	// this voter refuses the legacy key (RefusalLegacyKeySealed), so the
+	// report is final (§10 item 37).
+	Legacy      *ClaimVoterState
+	Voter       string
+	Incarnation string
+	Refusal     string
+	Detail      string
 }
 
 // AcceptResult is a voter's answer to Accept.
@@ -220,9 +235,17 @@ const claimRowCols = `promised_round, promised_coord, promised_nonce, accepted_r
 	accepted_nonce, value_json, value_digest, accept_json, config_generation`
 
 func loadClaimRowTx(ctx context.Context, tx *LocalTx, key ClaimKey) (ClaimVoterState, bool, error) {
-	rows, err := tx.Query(ctx, `SELECT `+claimRowCols+` FROM local_recovery_claims
-		WHERE target_kind = ? AND target_name = ? AND owner_epoch = ? AND attempt = ?`,
-		key.TargetKind, key.TargetName, key.OwnerEpoch, key.Attempt)
+	var rows []Row
+	var err error
+	if key.Incarnation == "" {
+		rows, err = tx.Query(ctx, `SELECT `+claimRowCols+` FROM local_recovery_claims
+			WHERE target_kind = ? AND target_name = ? AND owner_epoch = ? AND attempt = ?`,
+			key.TargetKind, key.TargetName, key.OwnerEpoch, key.Attempt)
+	} else {
+		rows, err = tx.Query(ctx, `SELECT `+claimRowCols+` FROM local_incarnation_claims
+			WHERE target_kind = ? AND target_name = ? AND incarnation = ? AND owner_epoch = ? AND attempt = ?`,
+			key.TargetKind, key.TargetName, key.Incarnation, key.OwnerEpoch, key.Attempt)
+	}
 	if err != nil || len(rows) == 0 {
 		return ClaimVoterState{Key: key}, false, err
 	}
@@ -276,6 +299,40 @@ const upsertClaimRowSQL = `INSERT INTO local_recovery_claims
 	  accept_json = excluded.accept_json, config_generation = excluded.config_generation,
 	  updated_at = excluded.updated_at`
 
+// upsertIncarnationClaimRowSQL is upsertClaimRowSQL for an incarnation-scoped
+// key (§10 item 37).
+const upsertIncarnationClaimRowSQL = `INSERT INTO local_incarnation_claims
+	(target_kind, target_name, incarnation, owner_epoch, attempt, promised_round, promised_coord, promised_nonce,
+	 accepted_round, accepted_coord, accepted_nonce, value_json, value_digest, accept_json,
+	 config_generation, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(target_kind, target_name, incarnation, owner_epoch, attempt) DO UPDATE SET
+	  promised_round = excluded.promised_round, promised_coord = excluded.promised_coord,
+	  promised_nonce = excluded.promised_nonce, accepted_round = excluded.accepted_round,
+	  accepted_coord = excluded.accepted_coord, accepted_nonce = excluded.accepted_nonce,
+	  value_json = excluded.value_json, value_digest = excluded.value_digest,
+	  accept_json = excluded.accept_json, config_generation = excluded.config_generation,
+	  updated_at = excluded.updated_at`
+
+// legacyKeySealedTx reports whether key is a legacy workload key this voter
+// has already answered at an incarnation-scoped form of (§10 item 37). Any
+// incarnation seals it: the promise that wrote the row reported this voter's
+// legacy state as final.
+func legacyKeySealedTx(ctx context.Context, tx *LocalTx, key ClaimKey) (bool, error) {
+	if !key.IsWorkload() || key.Incarnation != "" {
+		return false, nil
+	}
+	rows, err := tx.Query(ctx, `SELECT 1 AS one FROM local_incarnation_claims
+		WHERE target_kind = ? AND target_name = ? AND owner_epoch = ? AND attempt = ? LIMIT 1`,
+		key.TargetKind, key.TargetName, key.OwnerEpoch, key.Attempt)
+	return len(rows) > 0, err
+}
+
+func (c *Client) refuseSealedLegacyKey(key ClaimKey) (string, string) {
+	return RefusalLegacyKeySealed, fmt.Sprintf("%s has answered %s at an incarnation-scoped key, which sealed its "+
+		"legacy form here; claim it with its incarnation once claim_incarnation_v1 latches", c.hostName, key)
+}
+
 func saveClaimRowTx(ctx context.Context, tx *LocalTx, st ClaimVoterState) error {
 	var vj, aj string
 	if st.Value != nil {
@@ -299,11 +356,20 @@ func saveClaimRowTx(ctx context.Context, tx *LocalTx, st ClaimVoterState) error 
 		return b
 	}
 	k := st.Key
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if k.Incarnation != "" {
+		_, err := tx.Exec(ctx, upsertIncarnationClaimRowSQL,
+			k.TargetKind, k.TargetName, k.Incarnation, k.OwnerEpoch, k.Attempt,
+			int64(st.Promised.Round), st.Promised.Coordinator, nonce(st.Promised.Nonce),
+			int64(st.Accepted.Round), st.Accepted.Coordinator, nonce(st.Accepted.Nonce),
+			vj, st.ValueDigest, aj, st.ConfigGeneration, now)
+		return err
+	}
 	_, err := tx.Exec(ctx, upsertClaimRowSQL,
 		k.TargetKind, k.TargetName, k.OwnerEpoch, k.Attempt,
 		int64(st.Promised.Round), st.Promised.Coordinator, nonce(st.Promised.Nonce),
 		int64(st.Accepted.Round), st.Accepted.Coordinator, nonce(st.Accepted.Nonce),
-		vj, st.ValueDigest, aj, st.ConfigGeneration, time.Now().UTC().Format(time.RFC3339Nano))
+		vj, st.ValueDigest, aj, st.ConfigGeneration, now)
 	return err
 }
 
@@ -322,6 +388,12 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 		res.Incarnation = st.incarnation
 		if r, d := st.admit(key, gen, nil); r != "" {
 			res.Refusal, res.Detail = r, d
+			return nil
+		}
+		if sealed, err := legacyKeySealedTx(ctx, tx, key); err != nil {
+			return err
+		} else if sealed {
+			res.Refusal, res.Detail = c.refuseSealedLegacyKey(key)
 			return nil
 		}
 		row, _, err := loadClaimRowTx(ctx, tx, key)
@@ -347,6 +419,18 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 		res.Promised = true
 		res.PromisedBallot = b
 		res.State = row
+		if key.IsWorkload() && key.Incarnation != "" {
+			// The incarnation-scoped row is on disk (written above, or by an
+			// earlier step at this key), so the legacy key is sealed here from
+			// this transaction on and what it holds is final.
+			legacy, found, err := loadClaimRowTx(ctx, tx, key.Legacy())
+			if err != nil {
+				return err
+			}
+			if found && !legacy.Accepted.IsZero() && legacy.Value != nil {
+				res.Legacy = &legacy
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -356,6 +440,10 @@ func (c *Client) ClaimPrepare(ctx context.Context, key ClaimKey, b Ballot, gen i
 }
 
 var errClaimNeedsOwnerCheck = errors.New("claim value needs the owner check")
+
+// errClaimNeedsSourceCheck is the owner check without the probe: for a value
+// this voter already accepted at the legacy form of an incarnation-scoped key.
+var errClaimNeedsSourceCheck = errors.New("claim value needs the source cross-check")
 
 // ClaimAccept is phase 2 at this voter (§3.5, §3.5.1). probe is consulted only
 // for a workload value this voter has not accepted before, and outside the
@@ -387,6 +475,12 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 				res.Refusal, res.Detail = r, d
 				return nil
 			}
+			if sealed, err := legacyKeySealedTx(ctx, tx, key); err != nil {
+				return err
+			} else if sealed {
+				res.Refusal, res.Detail = c.refuseSealedLegacyKey(key)
+				return nil
+			}
 			row, _, err := loadClaimRowTx(ctx, tx, key)
 			if err != nil {
 				return err
@@ -413,7 +507,27 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 				// A value this voter has not accepted before: it checks the
 				// precondition itself first (§3.5.1). A value it already holds
 				// was checked when it first accepted it, and is not re-probed.
-				return errClaimNeedsOwnerCheck
+				//
+				// Nor is one it accepted at the LEGACY form of this key, which
+				// the proposer's bridge re-proposes here after
+				// claim_incarnation_v1 latched (§10 item 37): re-probing it
+				// would stall a value chosen just before the owner came back,
+				// the §3.15 case the rule exists for. Its source is still
+				// cross-checked against this voter's row OF THIS INCARNATION,
+				// which the legacy acceptance could not have been: a value a
+				// previous incarnation decided names that incarnation's owner.
+				legacyHeld := false
+				if key.Incarnation != "" {
+					legacy, found, err := loadClaimRowTx(ctx, tx, key.Legacy())
+					if err != nil {
+						return err
+					}
+					legacyHeld = found && !legacy.Accepted.IsZero() && legacy.ValueDigest == digest
+				}
+				if !legacyHeld {
+					return errClaimNeedsOwnerCheck
+				}
+				return errClaimNeedsSourceCheck
 			}
 			a, err := signer.Sign(key, gen, b, digest, st.incarnation)
 			if err != nil {
@@ -428,8 +542,8 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 			res.Accepted, res.PromisedBallot, res.Accept = true, b, &a
 			return nil
 		})
-		if errors.Is(err, errClaimNeedsOwnerCheck) {
-			if r, d := c.checkClaimOwner(ctx, key, v, probe); r != "" {
+		if errors.Is(err, errClaimNeedsOwnerCheck) || errors.Is(err, errClaimNeedsSourceCheck) {
+			if r, d := c.checkClaimOwner(ctx, key, v, probe, errors.Is(err, errClaimNeedsOwnerCheck)); r != "" {
 				res.Refusal, res.Detail = r, d
 				return res, nil
 			}
@@ -445,8 +559,9 @@ func (c *Client) ClaimAccept(ctx context.Context, key ClaimKey, b Ballot, v Clai
 
 // checkClaimOwner is §3.5.1 for one workload value: the old owner itself
 // refuses outright, a settled row naming a different owner refuses, and
-// otherwise the voter probes the named source and refuses if it reaches it.
-func (c *Client) checkClaimOwner(ctx context.Context, key ClaimKey, v ClaimValue, probe OwnerProbe) (string, string) {
+// otherwise — when probeSource — the voter probes the named source and
+// refuses if it reaches it.
+func (c *Client) checkClaimOwner(ctx context.Context, key ClaimKey, v ClaimValue, probe OwnerProbe, probeSource bool) (string, string) {
 	if v.SourceHost == c.hostName {
 		// If this voter can answer an Accept it is up, and it must not count
 		// toward certifying its own eviction.
@@ -459,6 +574,9 @@ func (c *Client) checkClaimOwner(ctx context.Context, key ClaimKey, v ClaimValue
 	if settled && owner != v.SourceHost {
 		return RefusalSourceMismatch, fmt.Sprintf("%s's settled row for %s/%s at epoch %d names %s, not %s",
 			c.hostName, key.TargetKind, key.TargetName, key.OwnerEpoch, owner, v.SourceHost)
+	}
+	if !probeSource {
+		return "", ""
 	}
 	if probe == nil {
 		return RefusalProbeUnavailable, fmt.Sprintf("%s has no owner probe wired", c.hostName)
@@ -482,10 +600,23 @@ func (c *Client) settledOwner(ctx context.Context, key ClaimKey) (string, bool, 
 	if err != nil || !ok {
 		return "", false, err
 	}
-	if r.Int64("epoch") != key.OwnerEpoch || transferStates[r.String("state")] || r.String("pending") != "" {
+	if r.Int64("epoch") != key.OwnerEpoch || !rowIsIncarnation(r, key) ||
+		transferStates[r.String("state")] || r.String("pending") != "" {
 		return "", false, nil
 	}
 	return r.String("host_name"), true, nil
+}
+
+// rowIsIncarnation reports whether a workload row is the incarnation key
+// names. A legacy key names no incarnation, so any row may be it. A row of
+// ANOTHER incarnation says nothing about key — like a row at another epoch —
+// and this voter neither cross-checks against it nor waits for it: a voter
+// that is behind a re-create must not refuse the new incarnation's recovery,
+// and a destination executes a certificate only against its own row of the
+// incarnation the certificate names (VerifyClaimCertificate), which is where
+// the binding is enforced (§10 item 37).
+func rowIsIncarnation(r Row, key ClaimKey) bool {
+	return key.Incarnation == "" || IncarnationOf(r.String("created_at")) == key.Incarnation
 }
 
 // ClaimProbeHint is the host this voter's own row for the target names at
@@ -495,7 +626,7 @@ func (c *Client) settledOwner(ctx context.Context, key ClaimKey) (string, bool, 
 // nothing: the Accept probes the source its value names, whatever this said.
 func (c *Client) ClaimProbeHint(ctx context.Context, key ClaimKey) (string, error) {
 	r, ok, err := c.claimTargetRow(ctx, key)
-	if err != nil || !ok || r.Int64("epoch") != key.OwnerEpoch {
+	if err != nil || !ok || r.Int64("epoch") != key.OwnerEpoch || !rowIsIncarnation(r, key) {
 		return "", err
 	}
 	return r.String("host_name"), nil
@@ -506,10 +637,12 @@ func (c *Client) claimTargetRow(ctx context.Context, key ClaimKey) (Row, bool, e
 	var q string
 	switch key.TargetKind {
 	case ClaimKindVM:
-		q = `SELECT host_name, state, vm_owner_epoch AS epoch, pending_action_id AS pending FROM vms
+		q = `SELECT host_name, state, vm_owner_epoch AS epoch, pending_action_id AS pending,
+				COALESCE(created_at, '') AS created_at FROM vms
 			WHERE name = ? AND deleted_at IS NULL`
 	case ClaimKindContainer:
-		q = `SELECT host_name, state, owner_epoch AS epoch, '' AS pending FROM containers
+		q = `SELECT host_name, state, owner_epoch AS epoch, '' AS pending,
+				COALESCE(created_at, '') AS created_at FROM containers
 			WHERE name = ? AND deleted_at IS NULL`
 	default:
 		return Row{}, false, nil
@@ -556,15 +689,20 @@ func (c *Client) ClaimStatesForImport(ctx context.Context, gen int64) (ClaimImpo
 		}
 		out.Adopted = st.adopted
 		out.Frozen = st.adopted > gen || (st.adopted == gen && st.sealed)
-		rows, err := tx.Query(ctx, `SELECT target_kind, target_name, owner_epoch, attempt, `+claimRowCols+`
+		// Both tables: an importer must carry the legacy keys and the
+		// incarnation-scoped ones alike (§4.4 rule 2, §10 item 37).
+		rows, err := tx.Query(ctx, `SELECT target_kind, target_name, '' AS incarnation, owner_epoch, attempt, `+claimRowCols+`
 			FROM local_recovery_claims WHERE target_kind IN (?, ?) AND accepted_round > 0
-			ORDER BY target_kind, target_name, owner_epoch, attempt`, ClaimKindVM, ClaimKindContainer)
+			UNION ALL
+			SELECT target_kind, target_name, incarnation, owner_epoch, attempt, `+claimRowCols+`
+			FROM local_incarnation_claims WHERE target_kind IN (?, ?) AND accepted_round > 0
+			ORDER BY 1, 2, 3, 4, 5`, ClaimKindVM, ClaimKindContainer, ClaimKindVM, ClaimKindContainer)
 		if err != nil {
 			return err
 		}
 		for _, r := range rows {
 			k := ClaimKey{TargetKind: r.String("target_kind"), TargetName: r.String("target_name"),
-				OwnerEpoch: r.Int64("owner_epoch"), Attempt: r.Int64("attempt")}
+				OwnerEpoch: r.Int64("owner_epoch"), Attempt: r.Int64("attempt"), Incarnation: r.String("incarnation")}
 			s, err := scanClaimRow(k, r)
 			if err != nil {
 				return err

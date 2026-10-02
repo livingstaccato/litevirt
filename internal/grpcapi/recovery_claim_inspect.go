@@ -45,6 +45,17 @@ func (s *Server) InspectRecoveryClaim(ctx context.Context, req *pb.InspectRecove
 		}
 		epoch = e
 	}
+	// The live row's incarnation, which the key carries once
+	// claim_incarnation_v1 has latched (§10 item 37). A name with no live row
+	// is inspected at its legacy key.
+	incarnation, live, err := corrosion.WorkloadIncarnation(ctx, s.db, kind, name)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the incarnation of %s/%s: %v", kind, name, err)
+	}
+	base := corrosion.ClaimKey{TargetKind: kind, TargetName: name, OwnerEpoch: epoch}
+	if live {
+		base = s.ClaimKeyFor(ctx, kind, name, epoch, incarnation)
+	}
 	cfg, err := corrosion.AdoptedVoterConfig(ctx, s.db)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "%v", err)
@@ -54,7 +65,8 @@ func (s *Server) InspectRecoveryClaim(ctx context.Context, req *pb.InspectRecove
 	}
 	resp := &pb.InspectRecoveryClaimResponse{Generation: cfg.Generation}
 	for attempt := int64(0); attempt < maxInspectAttempts; attempt++ {
-		key := corrosion.ClaimKey{TargetKind: kind, TargetName: name, OwnerEpoch: epoch, Attempt: attempt}
+		key := base
+		key.Attempt = attempt
 		view := s.inspectKey(ctx, cfg, key)
 		held := false
 		for _, v := range view.GetVoters() {
@@ -70,8 +82,33 @@ func (s *Server) InspectRecoveryClaim(ctx context.Context, req *pb.InspectRecove
 			break
 		}
 	}
+	if base.Incarnation != "" {
+		// The legacy key of the same epoch, where it holds anything: a claim
+		// made before claim_incarnation_v1 latched, or a previous
+		// incarnation's decision the scoped key no longer meets. Shown so an
+		// operator can tell the two keys apart (§10 item 37).
+		for attempt := int64(0); attempt < maxInspectAttempts; attempt++ {
+			key := base.Legacy()
+			key.Attempt = attempt
+			view := s.inspectKey(ctx, cfg, key)
+			held := false
+			for _, v := range view.GetVoters() {
+				if v.GetPromised() != "" {
+					held = true
+				}
+			}
+			if !held {
+				break
+			}
+			resp.Attempts = append(resp.Attempts, view)
+		}
+	}
 	resp.Detail = fmt.Sprintf("%s/%s at owner epoch %d, voter generation %d (%s)", kind, name, epoch, cfg.Generation,
 		strings.Join(cfg.Names(), ", "))
+	if base.Incarnation != "" {
+		resp.Detail = fmt.Sprintf("%s/%s, incarnation %s, at owner epoch %d, voter generation %d (%s)", kind, name,
+			base.Incarnation, epoch, cfg.Generation, strings.Join(cfg.Names(), ", "))
+	}
 	return resp, nil
 }
 

@@ -727,7 +727,12 @@ Schema v60 adds `runtime_action_proofs.claim_certificate`, the majority
 certificate that authorizes an ownership-transfer proof; v61 adds
 `local_abandoned_proofs` and v62 `local_voter_seals`, two tables each host
 keeps to itself (a recovery destination's signed abandonments, and the voter
-generations it sealed in a forced reconfiguration). Nothing writes the new
+generations it sealed in a forced reconfiguration). v63 adds
+`local_incarnation_claims`, a third host-local table: once the mandatory,
+replication-gated `claim_incarnation_v1` token latches, a recovery claim is
+keyed by the workload's incarnation (its `created_at`) as well as its name and
+owner epoch, so a workload deleted and re-created under the same name is never
+answered by the previous one's decision. Nothing writes the new
 column until the `recovery_claim_v1` capability token has latched. It is
 replication-gated, so it cannot latch while any host the cluster replicates to
 runs the previous release, and — unlike `voter_config_v1` — it is **not**

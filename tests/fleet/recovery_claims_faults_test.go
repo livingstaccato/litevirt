@@ -56,20 +56,35 @@ func TestFleet_RecoveryClaimFaults_TwoCoordinatorsAcrossSeeds(t *testing.T) {
 		{"hold", ClaimFault{Hold: 0.5}},
 		{"mixed", ClaimFault{DropRequest: 0.15, DropReply: 0.15, Duplicate: 0.2, Hold: 0.2}},
 	}
-	for _, k := range kinds {
-		for seed := int64(1); seed <= 3; seed++ {
-			t.Run(fmt.Sprintf("%s/seed-%d", k.name, seed), func(t *testing.T) {
-				runTwoCoordinatorClaimFaults(t, k.name, k.fault, 2700+seed*10+int64(len(k.name)))
-			})
+	for _, latch := range claimFormats {
+		for _, k := range kinds {
+			for seed := int64(1); seed <= 3; seed++ {
+				t.Run(fmt.Sprintf("%s/%s/seed-%d", latch.name, k.name, seed), func(t *testing.T) {
+					runTwoCoordinatorClaimFaults(t, k.name, k.fault, 2700+seed*10+int64(len(k.name)), latch.a, latch.b)
+				})
+			}
 		}
 	}
 }
 
-func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, seed int64) {
+// claimFormats runs a scenario under both claim key formats — before
+// claim_incarnation_v1 has latched (legacy keys) and after (keys scoped to
+// the workload's incarnation, docs/design/recovery-claims.md §10 item 37) —
+// and with the two coordinators on opposite sides of the latch at once, as
+// a rolling latch leaves them for a few seconds: a claims the scoped key, b
+// the legacy one, for the same recovery.
+var claimFormats = []struct {
+	name string
+	a, b bool
+}{{"legacy-keys", false, false}, {"incarnation-keys", true, true}, {"split-latch", true, false}}
+
+func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, seed int64, latchA, latchB bool) {
 	ctx := context.Background()
 	vm := fmt.Sprintf("vm-cf-%s-%d", kind, seed)
 	clock := NewVirtualClock(time.Now().UTC())
 	c, a, b, victim := claimFleet(t, clock, seed, vm)
+	latchIncarnationOn(a, latchA)
+	latchIncarnationOn(b, latchB)
 	ledger := watchClaims(t, c)
 
 	// The decision window: no replication between the coordinators, and
@@ -133,9 +148,21 @@ func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, s
 		claimReconciler(t, n).ReconcileOnce(ctx)
 	}
 	out := checkClaimSafety(t, ledger, a, vm, c.Nodes)
-	key := vmKey(vm, 0)
-	if len(out.Certified[key]) != 1 {
-		t.Errorf("certified values for %s: %v, want exactly one", key, keys(out.Certified[key]))
+	// One certified value for the recovery, across the key's legacy and
+	// scoped forms (each coordinator claims the form its own latch says).
+	certified := map[string]bool{}
+	for k, ds := range out.Certified {
+		if k.SameDecision(vmKey(a, vm, 0)) {
+			for d := range ds {
+				certified[d] = true
+			}
+		}
+	}
+	if len(certified) != 1 {
+		t.Errorf("certified values for %s across its key forms: %v, want exactly one", vm, keys(certified))
+	}
+	if latchA != (vmKey(a, vm, 0).Incarnation != "") || latchB != (vmKey(b, vm, 0).Incarnation != "") {
+		t.Errorf("the coordinators' keys do not match their latches")
 	}
 	for _, n := range []*Node{a, b} {
 		if v := vmOn(t, n, vm); out.Running != nil && v.HostName != out.Running[0] {
@@ -185,12 +212,21 @@ func (s *staleAccept) script(m ClaimMsg) ClaimFate {
 // refusal in corrosion.ClaimAccept) — a accepts the stale v1 and two values
 // are chosen at one key.
 func TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound(t *testing.T) {
+	for _, latched := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy-keys", true: "incarnation-keys"}[latched], func(t *testing.T) {
+			runStaleAcceptAfterNewerRound(t, latched)
+		})
+	}
+}
+
+func runStaleAcceptAfterNewerRound(t *testing.T, latched bool) {
 	ctx := context.Background()
 	vm := "vm-cf-stale-accept"
 	c, a, b, cc, x, d := crashFleet(t, 2801, vm)
+	latchIncarnation(c, latched)
 	voters := []*Node{a, b, cc}
 	ledger := watchClaims(t, c)
-	key := vmKey(vm, 0)
+	key := vmKey(a, vm, 0)
 	s := &staleAccept{x: x, a: a, b: b, cc: cc}
 	c.SetClaimScript(s.script)
 

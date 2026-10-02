@@ -1811,6 +1811,11 @@ message RecoveryClaimKey {
     string target_name = 2;  // workload name; "" for voter_config
     int64  owner_epoch = 3;  // generation being left; config generation for voter_config
     int64  attempt     = 4;
+    // incarnation is the workload row's created_at: which incarnation of the
+    // name the claim decides for (docs/design/recovery-claims.md §10 item 37).
+    // "" is a legacy key, from a coordinator before claim_incarnation_v1
+    // latched, and always "" for voter_config.
+    string incarnation = 5;
 }
 message ClaimBallot {
     uint64 round       = 1;
@@ -1878,6 +1883,12 @@ message AbandonRecoveryProofRequest {
     RecoveryClaimKey key = 1;
     string proof_id      = 2;
     string reason        = 3;
+    // foreign_only: abandon only a proof this destination can show is NOT the
+    // decision of the incarnation key names — the legacy-key bridge's
+    // exclusion (docs/design/recovery-claims.md §10 item 37). Refused
+    // otherwise, so a decision of this incarnation that may still run, or
+    // has run, is never abandoned by it.
+    bool foreign_only    = 4;
 }
 message AbandonRecoveryProofResponse {
     string abandonment = 1;  // JSON corrosion.ClaimAbandonment
@@ -1976,6 +1987,13 @@ message PrepareRecoveryClaimResponse {
     string      voter_incarnation  = 6;
     string      refusal_reason     = 7;
     string      refusal_detail     = 8;
+    // On a promise at an incarnation-scoped key: what this voter accepted at
+    // the LEGACY key of the same (kind, name, epoch, attempt), if anything.
+    // The promise seals that legacy key here — this voter refuses every later
+    // legacy Prepare and Accept at it — so a majority of these reports is
+    // everything the legacy key can ever have decided (§10 item 37).
+    ClaimBallot legacy_accepted_ballot       = 9;
+    RecoveryClaimValue legacy_accepted_value = 10;
 }
 message AcceptRecoveryClaimRequest {
     RecoveryClaimKey key     = 1;

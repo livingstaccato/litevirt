@@ -93,6 +93,7 @@ func (s *Server) claimPromote(ctx context.Context, vm *corrosion.VMRecord, p *pb
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "claim promote of %s: %v", vm.Name, err)
 	}
+	key = s.ClaimKeyFor(ctx, key.TargetKind, key.TargetName, key.OwnerEpoch, vm.CreatedAt)
 	round := uint64(1)
 	if p.GetLeaseTerm() > 0 {
 		round = uint64(p.GetLeaseTerm())

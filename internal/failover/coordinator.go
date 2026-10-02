@@ -2552,7 +2552,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			// coordinator's, re-materialized with its own ID and destination.
 			// Without a certificate nothing is written.
 			if c.claimsEnforced(ctx) {
-				cl, cerr := c.claimRecovery(ctx, proof, h.Name)
+				cl, cerr := c.claimRecovery(ctx, proof, h.Name, vm.CreatedAt)
 				if cerr != nil {
 					c.noteClaimRefused(ctx, ActionReschedule, "vm", vm.Name, h.Name, cerr)
 					continue

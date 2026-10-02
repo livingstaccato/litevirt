@@ -177,11 +177,17 @@ the proposer. The members of the voter config (§4) are the acceptors. A
 **claim** is keyed by what is being decided:
 
 ```
-claim key = (target_kind, target_name, owner_epoch, attempt)
+claim key = (target_kind, target_name, incarnation, owner_epoch, attempt)
 ```
 
 - `target_kind` / `target_name` are `vm` / `container` and the workload name.
   These are the same fields as `ActionProof.TargetKind` / `TargetName`.
+- `incarnation` is the workload row's `created_at`, which names one
+  incarnation of the name: every path that moves a row keeps it (a container
+  relocation too, since §10 item 37), and every path that brings a name back
+  to life stamps a fresh one. It is `""` (a
+  *legacy* key) until `claim_incarnation_v1` latches, and always for
+  `voter_config`. §10 item 37 says why it was added.
 - `owner_epoch` is the generation being *left*: `vms.vm_owner_epoch` or
   `containers.owner_epoch`, read from the row at the decision boundary exactly
   as `WriteVMRescheduleProof` reads it today.
@@ -459,6 +465,10 @@ CREATE TABLE IF NOT EXISTS local_voter_incarnation (
 );
 ```
 
+Incarnation-scoped keys live in `local_incarnation_claims` (schema v63), which
+has the same columns with `incarnation` in the primary key; legacy keys stay in
+`local_recovery_claims` (§10 item 37).
+
 This is schema v59 (v56 is the credentials split, v57 is `host_membership`,
 colonelpanik/litevirt#267, and v58 is `cluster_policies`,
 colonelpanik/litevirt#265), with the `createTableUnits` markers. The accept is
@@ -525,7 +535,8 @@ signing already uses (`internal/corrosion/audit_sign.go`, `LoadAuditKeyring`),
 with its own domain separator:
 
 ```
-accept payload = "litevirt-recovery-accept-v1"
+accept payload = "litevirt-recovery-accept-v1"            (a legacy key)
+              or "litevirt-recovery-accept-v2" || incarnation  (§10 item 37)
               || canonical(key) || config_generation || canonical(ballot)
               || value_digest || voter || voter_incarnation
 ClaimAccept    = { voter, voter_incarnation, config_generation, ballot, value_digest,
@@ -574,6 +585,8 @@ pending, the same way every other gate refusal does:
 
 1. The certificate is present and parses.
 2. `cert.key` equals `(proof.TargetKind, proof.TargetName, proof.OwnerEpoch, attempt)`,
+   and, when the key names an incarnation, the destination's own live row for
+   the target is that incarnation (§10 item 37),
    and `proof.OwnerEpoch` equals the destination's fresh row epoch. The second
    half is the check `startPendingVM` already makes.
 3. `cert.value_digest == digest(proof binding fields, cert.source_host)`. The
@@ -1061,7 +1074,9 @@ ordinary row for its generation (§4.1).
 
 ### 5.1 The capability tokens
 
-There are two tokens, so that the voter set (colonelpanik/litevirt#251 step 2)
+There were two tokens at first; `claim_incarnation_v1`, the third, changes how
+a workload claim is keyed and is described in §10 item 37. The two are split
+so that the voter set (colonelpanik/litevirt#251 step 2)
 ships and stays in force independently of whether claims are enforced (§4.5,
 §9, Q4).
 
@@ -1241,6 +1256,7 @@ The kill switch follows the reversible `configFlag && latch` model described in
 
 ### 5.7 Schema summary
 
+- Node-local table (v63, with `claim_incarnation_v1`): `local_incarnation_claims`.
 - Node-local tables (v59): `local_recovery_claims`, `local_voter_incarnation`,
   `local_voter_adoption`. `local_abandoned_proofs` (v61) comes with §3.12 and
   `local_voter_seals` (v62) with §4.6.
@@ -1787,3 +1803,155 @@ where it described the mechanism; this list records what changed and why.
     the claim deadline short, is retried on the next coordinator tick, whose
     Prepare refreshes the probe, so it decides in the second.
     `forcedProbe` (§4.6) still probes afresh under the operator's context.
+
+37. **A claim key names the workload's incarnation** (§3.1). On the kvm003
+    lab (2026-10-01) a VM named `claimvm` was recovered under the claim
+    `vm/claimvm@1#0`, deleted, and re-created under the same name on another
+    host. A new VM starts at the owner epoch every VM starts at, so when its
+    host died its claim was `vm/claimvm@1#0` again. The voters still held the
+    first VM's accepted value there, and Paxos obliges a proposer that learns
+    an accepted value to re-propose it: the value named the first VM's owner
+    as its source, its old owner refused it as its own eviction, a voter whose
+    row named the new owner refused it as a source mismatch, and the new VM
+    was never recovered. In the fleet reproduction enough voters held the old
+    value to re-certify it without a check, and the new VM was pointed at the
+    first VM's spent proof instead, which never runs; a re-created container
+    was re-keyed under the first one's proof and relocation token. Promises
+    are kept forever (§9 Q6), so nothing would ever have cleared the key.
+
+    Owner epochs cannot be made to carry the difference: a name's tombstone
+    is purged on re-create and garbage-collected after its retention, so the
+    node that re-creates it cannot know the epoch a previous incarnation
+    reached. The incarnation is the row's `created_at`, the identity the
+    anti-entropy merge already decides live-against-tombstone from: every path
+    that brings a name back to life stamps a fresh one at nanosecond
+    precision, and every path that moves a row preserves it. That last was
+    not true of one path until this item: a container image-recreate
+    relocation (`RelocateContainerWithToken`) stamped its target row afresh,
+    so a relocation decided at the source's incarnation refused at its
+    destination for good, the source row already tombstoned, and the
+    container's next recovery would have had a fresh key past a stranded
+    decision. It now keeps the source's `created_at`, as the runtime re-key
+    already did (`RekeyContainerOwnerGuarded`). Before the latch a pre-epoch
+    source still takes the retained upsert, whose conflict arm revives a
+    stale same-name tombstone on the target and keeps ITS created_at; after
+    the latch it takes the guarded `INSERT OR REPLACE` shape, which writes the
+    source's (both shapes predate this item, and the latch is
+    replication-gated, so every receiver knows it). The destination also
+    accepts the row that carries the decision's relocation token, which covers
+    a relocation made before the latch: the token is random per decision and
+    digested into the certified value, so that row was written by this
+    decision and nothing else. The VM
+    UUID in the spec was the other candidate; a container has none, and the
+    claim must cover both. A row with an empty `created_at` cannot occur
+    through any writer (both columns are `NOT NULL`, and every writer stamps
+    one), but an unstamped row is given the fixed incarnation `unstamped`
+    (`corrosion.IncarnationOf`) rather than falling back to the legacy key,
+    so the key format never depends on a row's contents.
+    - **Key, certificate, voter state.** `ClaimKey.Incarnation`
+      (`RecoveryClaimKey.incarnation`, field 5) is the row's `created_at`.
+      A voter keeps incarnation-scoped keys in `local_incarnation_claims`
+      (schema v63), with `incarnation` in the primary key, and legacy keys in
+      `local_recovery_claims`, so a re-created workload starts with no claim
+      history at all. An accept at a scoped key is signed under its own
+      domain, `litevirt-recovery-accept-v2`, with the incarnation in the
+      payload, so a signature for one incarnation never verifies for another
+      or for the legacy key; an abandonment likewise
+      (`litevirt-recovery-abandon-v2`). A legacy key's bytes are unchanged,
+      so every certificate minted before this release still verifies. The
+      value digest is unchanged too: the incarnation is bound by the key,
+      which the accept signs, and the value it decides is the same proof.
+    - **The destination binds it.** `VerifyClaimCertificate` refuses a
+      scoped certificate unless the destination's own live row for the target
+      is the incarnation it names (`certificateIncarnationIsLive`): a
+      certificate for a deleted VM authorizes nothing for the VM re-created
+      under its name. A legacy certificate binds none, as before.
+    - **Voters do not refuse a mismatched incarnation.** A row of another
+      incarnation says nothing about the key, exactly as a row at another
+      epoch does: the source cross-check reads only the voter's row of the
+      key's incarnation (`rowIsIncarnation`). Refusing would add no safety,
+      since the destination enforces the binding, and would cost liveness: a
+      voter whose replica is behind a re-create would refuse the new
+      workload's recovery until it caught up.
+    - **Old claim rows are left alone.** A previous incarnation's rows are
+      harmless once nothing shares its key, and deleting a voter's promise is
+      the one thing §9 Q6 forbids: a stale coordinator still recovering the
+      deleted workload would find a key with no history and could decide it
+      again. They are bounded by the recoveries a cluster has ever made. A
+      later GC could drop rows whose incarnation's tombstone has itself been
+      purged; nothing in this release needs one.
+    - **Rollout: `claim_incarnation_v1`, mandatory and ReplicationGated.** A
+      voter on an older build drops the key's incarnation, so it would answer
+      an incarnation-scoped Prepare at the legacy key, which is the very
+      collision being fixed, and its accept would not verify. A coordinator
+      may change the format only once no voter can be an older build, which is
+      a latch over every host; it states a fact about the binary, so it has no
+      flag (a flag would let two coordinators claim one recovery under two
+      keys). Until it latches every coordinator claims the legacy key and
+      behaves exactly as before, bug included; once it has, every coordinator
+      claims the scoped key. The proposer also counts only an accept that
+      signs its own key, so a voter that drops the incarnation certifies
+      nothing.
+    - **Crossing the latch: seal and bridge.** Nodes latch a few seconds
+      apart, so one recovery can be claimed at its legacy key by a node that
+      has not latched and at its scoped key by one that has. A voter's
+      promise at a scoped key reports what it accepted at the legacy form of
+      the same (kind, name, epoch, attempt), in the same transaction that
+      writes the scoped row; from then on it refuses that legacy key
+      (`recovery_claim_legacy_key_sealed`). A majority of promises therefore
+      holds everything the legacy key can ever decide. When no promise reports
+      a value at the scoped key itself, the proposer re-proposes the
+      highest-ballot legacy value (`claims.Spec.AdoptLegacy`), and a voter
+      that accepted it at the legacy key re-accepts it without probing again
+      (§3.15), though still cross-checking its source against its row of this
+      incarnation. The proposer re-proposes the legacy value unless it is
+      PROVEN to be another incarnation's and never to run
+      (`Server.legacyValueExcluded`), and it is never decided beside one that
+      is not. Proof comes from the one host that could execute the value, its
+      destination, reading its own database
+      (`corrosion.AbandonForeignProof`, asked for over `AbandonRecoveryProof`
+      with `foreign_only`): it ran or failed the proof while this incarnation
+      stayed at the epoch (a VM proof completes in one local batch with its
+      row's epoch bump, and a relocated container's row carries the token
+      its relocation wrote), or the proof never started and this
+      incarnation is not pending on it. It then records the proof as
+      abandoned and signs, and never runs it. A destination removed for good
+      (`lv host rm --dead`) counts too: it can run nothing. Neither wall
+      clocks nor sources take part. An earlier revision attributed a legacy
+      value by its proof's mint time against the row's `created_at`, with a
+      clock-skew margin, and by its source; both failed unsafe. A creator
+      clock more than the margin ahead made this incarnation's own decision
+      look like a previous one's, so a second value was decided beside a
+      legacy certificate that still verified. A stranded decision names its
+      dead destination, not the owner the next claim leaves, so a mismatched
+      source is no proof either. Whatever the destination cannot show — it
+      is unreachable, an older build, or holds no row of the proof — the
+      value is adopted, as the legacy key itself did: ambiguity costs
+      liveness, never a second decision. If its voters then refuse it, the
+      recovery waits, and `ha.claim.legacy_held` names the workload, the
+      decision and why it could not be excluded. If they accept it, the
+      scoped key decides it; a decided proof that has already run or failed
+      is never written (it would take the workload off its failed host for a
+      proof that never executes), and the coordinator's supersede asks the
+      destination for the same foreign abandonment, which moves the claim to
+      the next attempt (`supersedeEvidence`). The condition is a replicated
+      per-workload row, written by the deciding node and resolved only by the
+      lease holder once the workload's own rows show it has moved on, so it
+      neither clears because the key decided nor lives in one node's memory.
+      A proof left in flight on a live destination cannot be excluded; the
+      condition names the cluster-wide stand-down
+      (`enforcement.recovery_claim: false`) for it. While the destination
+      answers, the next tick decides; if it is gone for good,
+      `lv host rm --dead` releases it. This incarnation's completed decision
+      is never excluded (its row is past the epoch at its destination), so a
+      coordinator still reading the epoch it left completes a no-op. A
+      previous incarnation's spent decision is excluded rather than adopted,
+      so it cannot hold the new workload's recovery for good. Pending proofs
+      are not retired when their workload is deleted: retiring needs a new
+      replicated statement shape, and could not mark the proofs minted before
+      the upgrade that the bridge exists for. The exclusion does that work
+      when it is needed. A recovery decided across the upgrade is completed,
+      not decided twice; the lab's stale value is left behind.
+    - **Schema bump: yes, v63**, one additive node-local table. No
+      replicated statement shape changes: the certificate column is the same
+      TEXT, and the ledger is untouched.

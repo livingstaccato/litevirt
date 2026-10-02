@@ -131,7 +131,7 @@ func (s *Server) AbandonRecoveryProof(ctx context.Context, req *pb.AbandonRecove
 	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
-	ab, err := s.abandonRecoveryProof(ctx, keyFromPB(req.GetKey()), req.GetProofId(), req.GetReason())
+	ab, err := s.abandonRecoveryProof(ctx, keyFromPB(req.GetKey()), req.GetProofId(), req.GetReason(), req.GetForeignOnly())
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +142,7 @@ func (s *Server) AbandonRecoveryProof(ctx context.Context, req *pb.AbandonRecove
 	return &pb.AbandonRecoveryProofResponse{Abandonment: enc}, nil
 }
 
-func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKey, proofID, reason string) (corrosion.ClaimAbandonment, error) {
+func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKey, proofID, reason string, foreignOnly bool) (corrosion.ClaimAbandonment, error) {
 	if !key.IsWorkload() || proofID == "" {
 		return corrosion.ClaimAbandonment{}, status.Error(codes.InvalidArgument, "an abandonment names a workload claim key and a proof")
 	}
@@ -150,8 +150,12 @@ func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKe
 	if err != nil {
 		return corrosion.ClaimAbandonment{}, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
-	if err := s.db.AbandonProof(ctx, proofID, key, reason); err != nil {
-		if errors.Is(err, corrosion.ErrProofExecuted) {
+	abandon := s.db.AbandonProof
+	if foreignOnly {
+		abandon = s.db.AbandonForeignProof
+	}
+	if err := abandon(ctx, proofID, key, reason); err != nil {
+		if errors.Is(err, corrosion.ErrProofExecuted) || errors.Is(err, corrosion.ErrProofNotForeign) {
 			return corrosion.ClaimAbandonment{}, status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		return corrosion.ClaimAbandonment{}, status.Errorf(codes.Unavailable, "record abandonment: %v", err)
@@ -168,8 +172,22 @@ func (s *Server) abandonRecoveryProof(ctx context.Context, key corrosion.ClaimKe
 // failover coordinator calls it when a promote it decided failed before
 // StartDomain and it falls back to a reschedule (§3.12).
 func (s *Server) RequestAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string) (string, error) {
+	return s.requestAbandonment(ctx, host, key, proofID, reason, false)
+}
+
+// RequestForeignAbandonment asks host to sign that proofID is not the
+// decision of the incarnation key names and will never run
+// (corrosion.AbandonForeignProof). The coordinator moves a scoped claim past
+// a spent decided proof on it (§10 item 37).
+func (s *Server) RequestForeignAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string) (string, error) {
+	return s.requestAbandonment(ctx, host, key, proofID, reason, true)
+}
+
+// requestAbandonment is RequestAbandonment, with foreignOnly asking for the
+// legacy-key bridge's exclusion (corrosion.AbandonForeignProof) instead.
+func (s *Server) requestAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string, foreignOnly bool) (string, error) {
 	if host == s.hostName {
-		ab, err := s.abandonRecoveryProof(ctx, key, proofID, reason)
+		ab, err := s.abandonRecoveryProof(ctx, key, proofID, reason, foreignOnly)
 		if err != nil {
 			return "", err
 		}
@@ -182,7 +200,8 @@ func (s *Server) RequestAbandonment(ctx context.Context, host string, key corros
 		return "", err
 	}
 	defer closer()
-	resp, err := cl.AbandonRecoveryProof(cctx, &pb.AbandonRecoveryProofRequest{Key: keyToPB(key), ProofId: proofID, Reason: reason})
+	resp, err := cl.AbandonRecoveryProof(cctx, &pb.AbandonRecoveryProofRequest{Key: keyToPB(key), ProofId: proofID, Reason: reason,
+		ForeignOnly: foreignOnly})
 	if err != nil {
 		return "", err
 	}
@@ -310,6 +329,12 @@ const (
 	// certificate before recovery claims were enforced, which its destination
 	// refuses until the lease holder has claimed it (certifyUncertified).
 	condClaimUncertified = "ha.claim.uncertified"
+	// condClaimLegacyHeld names each workload whose incarnation-scoped claim
+	// re-proposed a decision made at the legacy key before
+	// claim_incarnation_v1 latched, which its destination could not show to be
+	// another incarnation's (Server.legacyValueExcluded,
+	// docs/design/recovery-claims.md §10 item 37).
+	condClaimLegacyHeld  = "ha.claim.legacy_held"
 	claimConditionSubjct = "claims"
 )
 
@@ -396,8 +421,10 @@ func (s *Server) RecoveryClaimHealthTick(ctx context.Context) {
 	if !s.RecoveryClaimEnforced(ctx) {
 		s.applyClusterCondition(ctx, claimEvaluator, condClaimStranded, claimConditionSubjct, nil, nil, "")
 		s.applyClusterCondition(ctx, claimEvaluator, condClaimUncertified, claimConditionSubjct, nil, nil, "")
+		s.resolveLegacyHeld(ctx, true)
 		return
 	}
+	s.resolveLegacyHeld(ctx, false)
 	if waiting, err := s.uncertifiedClaims(ctx); err != nil {
 		slog.Warn("recovery claims: evaluate uncertified proofs", "error", err)
 	} else {

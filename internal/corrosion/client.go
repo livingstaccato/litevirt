@@ -387,6 +387,11 @@ type Client struct {
 	// recovery_claim_v1 latch. Fails CLOSED when unset: those shapes
 	// back-pressure a previous-release peer. See recovery_claims_proof.go.
 	recoveryClaimGate atomic.Pointer[func() bool]
+	// claimIncarnationGate reports whether claim_incarnation_v1 has DURABLY
+	// latched (SetClaimIncarnationGate). It is replication-gated, so every
+	// host this node replicates to runs a build that knows every statement
+	// shape this build emits. Fails CLOSED (false) when unset.
+	claimIncarnationGate atomic.Pointer[func() bool]
 	// claimCertVerifier supplies the verifier a proof's claim certificate is
 	// judged with before it may REPLACE another (SetProofClaimCertificate and
 	// the anti-entropy merge). Unset, or returning nil, nothing verifies and

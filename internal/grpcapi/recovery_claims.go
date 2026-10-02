@@ -2,9 +2,11 @@ package grpcapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
@@ -155,11 +158,12 @@ func (s *Server) claimDurable(ctx context.Context) error {
 
 func keyFromPB(k *pb.RecoveryClaimKey) corrosion.ClaimKey {
 	return corrosion.ClaimKey{TargetKind: k.GetTargetKind(), TargetName: k.GetTargetName(),
-		OwnerEpoch: k.GetOwnerEpoch(), Attempt: k.GetAttempt()}
+		OwnerEpoch: k.GetOwnerEpoch(), Attempt: k.GetAttempt(), Incarnation: k.GetIncarnation()}
 }
 
 func keyToPB(k corrosion.ClaimKey) *pb.RecoveryClaimKey {
-	return &pb.RecoveryClaimKey{TargetKind: k.TargetKind, TargetName: k.TargetName, OwnerEpoch: k.OwnerEpoch, Attempt: k.Attempt}
+	return &pb.RecoveryClaimKey{TargetKind: k.TargetKind, TargetName: k.TargetName, OwnerEpoch: k.OwnerEpoch,
+		Attempt: k.Attempt, Incarnation: k.Incarnation}
 }
 
 func ballotFromPB(b *pb.ClaimBallot) corrosion.Ballot {
@@ -254,11 +258,15 @@ func acceptFromPB(a *pb.ClaimAccept) *corrosion.ClaimAccept {
 }
 
 func prepareToPB(r corrosion.PrepareResult) *pb.PrepareRecoveryClaimResponse {
-	return &pb.PrepareRecoveryClaimResponse{
+	out := &pb.PrepareRecoveryClaimResponse{
 		Promised: r.Promised, PromisedBallot: ballotToPB(r.PromisedBallot),
 		AcceptedBallot: ballotToPB(r.State.Accepted), AcceptedValue: valueToPB(r.State.Value),
 		Voter: r.Voter, VoterIncarnation: r.Incarnation, RefusalReason: r.Refusal, RefusalDetail: r.Detail,
 	}
+	if l := r.Legacy; l != nil {
+		out.LegacyAcceptedBallot, out.LegacyAcceptedValue = ballotToPB(l.Accepted), valueToPB(l.Value)
+	}
+	return out
 }
 
 func prepareFromPB(r *pb.PrepareRecoveryClaimResponse, key corrosion.ClaimKey) corrosion.PrepareResult {
@@ -271,6 +279,13 @@ func prepareFromPB(r *pb.PrepareRecoveryClaimResponse, key corrosion.ClaimKey) c
 	out.State.Value = valueFromPB(r.GetAcceptedValue())
 	if out.State.Value != nil {
 		out.State.ValueDigest, _ = out.State.Value.Digest()
+	}
+	if lv := valueFromPB(r.GetLegacyAcceptedValue()); lv != nil && key.Incarnation != "" {
+		l := corrosion.ClaimVoterState{Key: key.Legacy(), Accepted: ballotFromPB(r.GetLegacyAcceptedBallot()), Value: lv}
+		l.ValueDigest, _ = lv.Digest()
+		if !l.Accepted.IsZero() {
+			out.Legacy = &l
+		}
 	}
 	return out
 }
@@ -579,7 +594,7 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 	}
 	names := cfg.Names()
 	q := corrosion.MajorityOf(len(names))
-	return s.claimProposer().Decide(ctx, claims.Spec{
+	spec := claims.Spec{
 		Key: key, Generation: cfg.Generation, Voters: names, PrepareQuorum: q,
 		Electorate: func(corrosion.ClaimValue) ([]string, int) { return names, q },
 		Propose:    func(map[string]corrosion.PrepareResult) (corrosion.ClaimValue, error) { return proposal, nil },
@@ -589,5 +604,202 @@ func (s *Server) DecideRecoveryClaim(ctx context.Context, key corrosion.ClaimKey
 		// proposer's per-round binding refuses a different value there.
 		ReuseRound: true,
 		Supersede:  ev,
-	})
+	}
+	if key.Incarnation != "" {
+		spec.AdoptLegacy = func(v corrosion.ClaimValue) bool {
+			excluded, why := s.legacyValueExcluded(ctx, key, v)
+			if !excluded {
+				s.noteLegacyHeld(ctx, key, v, why)
+			}
+			return !excluded
+		}
+	}
+	return s.claimProposer().Decide(ctx, spec)
+}
+
+// legacyHeldEvidence is ha.claim.legacy_held's evidence: the shared detail
+// and hosts, plus what the lease holder's tick re-derives the condition from
+// (legacyHeldStill).
+type legacyHeldEvidence struct {
+	Detail string             `json:"detail"`
+	Hosts  []string           `json:"hosts"`
+	Key    corrosion.ClaimKey `json:"key"`
+	Proof  string             `json:"proof"`
+	Source string             `json:"source"`
+}
+
+// noteLegacyHeld raises ha.claim.legacy_held for key's workload: its claim
+// re-proposed a decision made at the legacy key that its destination could
+// not show to be another incarnation's (legacyValueExcluded). The condition
+// is a REPLICATED row, written by whichever node decided — so it survives a
+// restart and a lease hand-off — and resolved only by the lease holder's
+// tick, from the workload's own rows (resolveLegacyHeld), never because the
+// key decided: a decided legacy value can be a proof that never runs.
+func (s *Server) noteLegacyHeld(ctx context.Context, key corrosion.ClaimKey, v corrosion.ClaimValue, why string) {
+	if v.Proof == nil {
+		return
+	}
+	dest := v.Proof.DestHost
+	detail := fmt.Sprintf("%s/%s: its claim %s carries a decision made before claim_incarnation_v1 latched "+
+		"(proof %s, %s to %s, source %s) that cannot be shown to be another incarnation's (%s). While %s answers, the "+
+		"next tick asks it again. If %s is gone for good, `lv host rm --dead %s` releases the decision. If its proof is "+
+		"stuck in flight on a live %s, stand recovery claims down with enforcement.recovery_claim: false on every host "+
+		"until the workload has recovered, then turn it back on.", key.TargetKind, key.TargetName, key,
+		v.Proof.ID, v.Proof.Action, dest, v.SourceHost, why, dest, dest, dest, dest)
+	ev, err := json.Marshal(legacyHeldEvidence{Detail: detail, Hosts: []string{dest}, Key: key, Proof: v.Proof.ID, Source: v.SourceHost})
+	if err != nil {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	row, found, err := corrosion.GetHealthCondition(ctx, s.db, claimEvaluator, condClaimLegacyHeld, key.TargetKind, key.TargetName)
+	if err != nil {
+		slog.Warn("health condition: read", "code", condClaimLegacyHeld, "error", err)
+		return
+	}
+	if found && row.Lifecycle != corrosion.ConditionResolved && row.Evidence == string(ev) {
+		return // already raised for this decision
+	}
+	if !found || row.Lifecycle == corrosion.ConditionResolved {
+		row = corrosion.HealthCondition{Evaluator: claimEvaluator, Code: condClaimLegacyHeld, SubjectKind: key.TargetKind,
+			SubjectID: key.TargetName, Lifecycle: corrosion.ConditionConfirmed, FirstSeen: now, ConfirmedAt: now}
+	}
+	row.ObserveCount++
+	row.CleanCount = 0
+	row.Severity = corrosion.SeverityWarning
+	row.Hosts = []string{dest}
+	row.Evidence = string(ev)
+	row.LastSeen, row.ResolvedAt, row.Reporter = now, "", s.hostName
+	if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+		slog.Warn("health condition: persist", "code", condClaimLegacyHeld, "error", err)
+	}
+}
+
+// resolveLegacyHeld is the lease holder's pass over every open
+// ha.claim.legacy_held row: it resolves one whose workload is no longer held
+// (legacyHeldStill), and leaves the rest. resolveAll resolves every row
+// (recovery claims are not enforced, so nothing is held by one).
+func (s *Server) resolveLegacyHeld(ctx context.Context, resolveAll bool) {
+	rows, err := corrosion.ListHealthConditions(ctx, s.db, false)
+	if err != nil {
+		slog.Warn("recovery claims: list legacy-held conditions", "error", err)
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, row := range rows {
+		if row.Evaluator != claimEvaluator || row.Code != condClaimLegacyHeld {
+			continue
+		}
+		var ev legacyHeldEvidence
+		if !resolveAll {
+			if err := json.Unmarshal([]byte(row.Evidence), &ev); err == nil && s.legacyHeldStill(ctx, ev) {
+				continue
+			}
+		}
+		row.Lifecycle, row.ResolvedAt, row.LastSeen, row.Reporter = corrosion.ConditionResolved, now, now, s.hostName
+		row.ObserveCount, row.CleanCount = 0, row.CleanCount+1
+		if err := corrosion.UpsertHealthCondition(ctx, s.db, row); err != nil {
+			slog.Warn("health condition: resolve", "code", condClaimLegacyHeld, "error", err)
+		}
+	}
+}
+
+// legacyHeldStill reports whether the workload ev names is still held at its
+// key: the live row is that incarnation, at that owner epoch, and has not
+// moved on — a VM pending on nothing but the legacy proof, a container still
+// recorded on the source it is being recovered from.
+func (s *Server) legacyHeldStill(ctx context.Context, ev legacyHeldEvidence) bool {
+	k := ev.Key
+	inc, ok, err := corrosion.WorkloadIncarnation(ctx, s.db, k.TargetKind, k.TargetName)
+	if err != nil {
+		return true // cannot tell: keep it
+	}
+	if !ok || inc != k.Incarnation {
+		return false
+	}
+	switch k.TargetKind {
+	case corrosion.ClaimKindVM:
+		vm, err := corrosion.GetVM(ctx, s.db, k.TargetName)
+		if err != nil || vm == nil {
+			return err != nil
+		}
+		return vm.OwnerEpoch == k.OwnerEpoch && (vm.PendingActionID == "" || vm.PendingActionID == ev.Proof)
+	default:
+		rows, err := s.db.Query(ctx, `SELECT 1 AS one FROM containers
+			WHERE name = ? AND host_name = ? AND owner_epoch = ? AND deleted_at IS NULL`, k.TargetName, ev.Source, k.OwnerEpoch)
+		return err != nil || len(rows) > 0
+	}
+}
+
+// IncarnationScopedClaims reports whether workload claims are keyed by
+// incarnation here: claim_incarnation_v1 has latched (§10 item 37). Before
+// then every coordinator claims the legacy key, so a recovery is never
+// claimed under two keys by two coordinators that disagree about the format.
+func (s *Server) IncarnationScopedClaims(ctx context.Context) bool {
+	return s.gate != nil && s.gate.Enforced(ctx, capabilities.ClaimIncarnationV1)
+}
+
+// ClaimKeyFor is the key a recovery of the workload row whose created_at is
+// createdAt, at owner epoch epoch, is claimed under on this node: scoped to
+// the row's incarnation (corrosion.IncarnationOf, so an unstamped row is
+// scoped too) once IncarnationScopedClaims holds, the legacy key before.
+func (s *Server) ClaimKeyFor(ctx context.Context, kind, name string, epoch int64, createdAt string) corrosion.ClaimKey {
+	key := corrosion.ClaimKey{TargetKind: kind, TargetName: name, OwnerEpoch: epoch}
+	if s.IncarnationScopedClaims(ctx) {
+		key.Incarnation = corrosion.IncarnationOf(createdAt)
+	}
+	return key
+}
+
+// claimExclusionTimeout bounds the bridge's request for a destination's
+// foreign abandonment (legacyValueExcluded).
+const claimExclusionTimeout = 2 * time.Second
+
+// legacyValueExcluded is the bridge's test for a value a voter accepted at the
+// LEGACY form of an incarnation-scoped key (claims.Spec.AdoptLegacy, §10
+// item 37): is it PROVEN that this value will never execute and is not this
+// incarnation's decision? Only then may the proposer decide a fresh value
+// beside it. Proof comes from the value's destination, the one host that can
+// execute it:
+//
+//   - it signs a foreign abandonment (corrosion.AbandonForeignProof), shown
+//     from its own database: it ran or failed the proof while this
+//     incarnation stayed at the epoch, or the proof never started and this
+//     incarnation is not pending on it; or
+//   - it has been removed for good (corrosion.RemovedHostEvidence): fenced
+//     proof-grade, no live hosts row, revoked, so it can execute nothing.
+//
+// Anything short of that — the destination unreachable, refusing, or unable
+// to show it — and the value is ADOPTED, as the legacy key itself would have
+// done: ambiguity costs liveness, never a second decision. Wall clocks play no
+// part. A value adopted this way that its voters then refuse is reported by
+// ha.claim.legacy_held, naming the workload, the decision and the way out.
+func (s *Server) legacyValueExcluded(ctx context.Context, key corrosion.ClaimKey, v corrosion.ClaimValue) (bool, string) {
+	if v.Proof == nil || v.Proof.ID == "" || v.Proof.DestHost == "" {
+		return false, "the legacy value names no proof or destination"
+	}
+	dest := v.Proof.DestHost
+	if err := corrosion.RemovedHostEvidence(ctx, s.db, s.pkiDir, dest); err == nil {
+		return true, ""
+	}
+	// Bounded: it runs inside the claim's phase 1, whose deadline is the
+	// whole claim's.
+	ctx, cancel := context.WithTimeout(ctx, claimExclusionTimeout)
+	defer cancel()
+	enc, err := s.requestAbandonment(ctx, dest, key, v.Proof.ID,
+		"a decision at the legacy key that is not "+key.String()+"'s (claim_incarnation_v1 bridge)", true)
+	if err != nil {
+		return false, fmt.Sprintf("%s did not show proof %s is not this incarnation's: %v", dest, v.Proof.ID, err)
+	}
+	ab, err := corrosion.DecodeClaimAbandonment(enc)
+	if err != nil {
+		return false, err.Error()
+	}
+	_, verifier, err := s.claimIdentity()
+	if err != nil {
+		return false, err.Error()
+	}
+	if err := verifier.VerifyAbandonment(ab, dest, v.Proof.ID, key); err != nil {
+		return false, fmt.Sprintf("%s's exclusion of proof %s does not verify: %v", dest, v.Proof.ID, err)
+	}
+	return true, ""
 }

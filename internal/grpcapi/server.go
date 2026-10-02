@@ -868,6 +868,9 @@ func (s *Server) advertisedCapabilities() []string {
 	// (this binary decodes cluster_policies and honours failover_scope). The
 	// opt-in is the replicated policy row, which cannot be written until the
 	// ReplicationGated latch has formed.
+	// claim_incarnation_v1 is not withheld either: it is the claim format this
+	// binary's voters keep (an incarnation in the key, the v2 accept, the
+	// legacy-key seal), a fact about the build.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -1274,6 +1277,10 @@ func (s *Server) tokenEnabled(token string) bool {
 		// No kill switch: a node with voter_config_v1 off would count a
 		// different majority from its peers. Its stand-down is the decided
 		// `lv cluster voter reset`, which moves every node at one generation.
+		return true
+	case capabilities.ClaimIncarnationV1:
+		// No kill switch: it is the claim format this build's voters keep,
+		// and a coordinator relies on every voter keeping it.
 		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm

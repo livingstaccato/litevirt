@@ -24,13 +24,14 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// decidePromote decides a claim at (vm, 0, 0) for a promote of vm to dest, by
-// coordinator by, the way Server.claimPromote does before relaying.
+// decidePromote decides a claim at (vm, 0, 0), scoped to vm's incarnation, for
+// a promote of vm to dest, by coordinator by, the way Server.claimPromote does
+// before relaying.
 func decidePromote(t *testing.T, by *Node, vm, dest, source string) corrosion.ActionProof {
 	t.Helper()
 	p := corrosion.ActionProof{ID: "promote-" + vm, Action: corrosion.ActionPromote, TargetKind: "vm", TargetName: vm,
 		DestHost: dest, Coordinator: by.Name, OwnerEpoch: "0"}
-	key := corrosion.ClaimKey{TargetKind: "vm", TargetName: vm}
+	key := vmKey(by, vm, 0)
 	out, err := by.Server.DecideRecoveryClaim(context.Background(), key, corrosion.ClaimValue{Proof: &p, SourceHost: source}, 1, nil)
 	if err != nil || !out.Ours {
 		t.Fatalf("decide the promote: ours=%v err=%v", out.Ours, err)
@@ -153,7 +154,7 @@ func deadFleet(t *testing.T, seed int64) (c *Cluster, a, b, e, v, d *Node, cs *C
 
 	// v fails; its recovery is decided for d and written.
 	c.Kill(v)
-	key := corrosion.ClaimKey{TargetKind: "vm", TargetName: "vm-dead"}
+	key := vmKey(a, "vm-dead", 0)
 	p := corrosion.ActionProof{ID: "resched-to-d", Action: corrosion.ActionReschedule, TargetKind: "vm",
 		TargetName: "vm-dead", DestHost: d.Name, Coordinator: a.Name, OwnerEpoch: "0"}
 	out, err := a.Server.DecideRecoveryClaim(ctx, key, corrosion.ClaimValue{Proof: &p, SourceHost: v.Name}, 1, nil)

@@ -121,27 +121,59 @@ func (s *Server) holdWorkloadIdle(ctx context.Context, kind, name string) (func(
 	return nil, fmt.Errorf("unknown workload kind %q", kind)
 }
 
+// releaseUnknownError is a release whose outcome this node cannot know: the
+// request reached the destination, which may have recorded the abandonment,
+// but no verified answer came back (a timeout, a dropped connection, a
+// signature or verification failure after the record). It is audited as
+// "unknown", never as "refused": saying nothing was released could be false.
+type releaseUnknownError struct{ st *status.Status }
+
+func (e *releaseUnknownError) Error() string              { return e.st.Err().Error() }
+func (e *releaseUnknownError) GRPCStatus() *status.Status { return e.st }
+
+func releaseUnknown(kind, name, dest, proofID string, cause error) error {
+	return &releaseUnknownError{st: status.Newf(codes.Unavailable,
+		"the release of proof %s reached %s but its outcome is unknown (%v): %s may have recorded the abandonment. "+
+			"Run `lv cluster claim-release %s/%s` again — a release already recorded is signed again, so it answers "+
+			"either way — or check `lv cluster claim %s/%s`. If %s is gone for good, `lv host fence-confirm %s` once it "+
+			"is powered off, then `lv host rm --dead %s`.",
+		proofID, dest, cause, dest, kind, name, kind, name, dest, dest, dest)}
+}
+
 // ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
-// (admin). Every call writes an audit row, refused or not.
+// (admin). Every call writes an audit row — "ok", "refused" or "unknown" —
+// with a context detached from the caller's, so a caller that hangs up does
+// not cancel the record of what it asked for.
 func (s *Server) ReleaseLegacyHeldClaim(ctx context.Context, req *pb.ReleaseLegacyHeldClaimRequest) (*pb.ReleaseLegacyHeldClaimResponse, error) {
+	kind, name := strings.TrimSpace(req.GetKind()), strings.TrimSpace(req.GetName())
+	target := kind + "/" + name
+	actx := context.WithoutCancel(ctx)
+	resp, err := s.releaseLegacyHeldChecked(ctx, kind, name)
+	if err != nil {
+		result := "refused"
+		var unknown *releaseUnknownError
+		if errors.As(err, &unknown) {
+			result = "unknown"
+		}
+		s.audit(actx, "recovery_claim.release", target, status.Convert(err).Message(), result)
+		return nil, err
+	}
+	s.audit(actx, "recovery_claim.release", target,
+		fmt.Sprintf("%s abandoned proof %s at %s", resp.GetDestHost(), resp.GetProofId(), resp.GetKey()), "ok")
+	return resp, nil
+}
+
+func (s *Server) releaseLegacyHeldChecked(ctx context.Context, kind, name string) (*pb.ReleaseLegacyHeldClaimResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
-	kind, name := strings.TrimSpace(req.GetKind()), strings.TrimSpace(req.GetName())
 	if kind != corrosion.ClaimKindVM && kind != corrosion.ClaimKindContainer {
 		return nil, status.Errorf(codes.InvalidArgument, "a claim is for a vm or a container, not %q", kind)
 	}
 	if name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name the workload: <kind>/<name>")
 	}
-	resp, err := s.releaseLegacyHeld(ctx, kind, name)
-	if err != nil {
-		s.audit(ctx, "recovery_claim.release", kind+"/"+name, status.Convert(err).Message(), "refused")
-		return nil, err
-	}
-	s.audit(ctx, "recovery_claim.release", kind+"/"+name,
-		fmt.Sprintf("%s abandoned proof %s at %s", resp.GetDestHost(), resp.GetProofId(), resp.GetKey()), "ok")
-	return resp, nil
+	return s.releaseLegacyHeld(ctx, kind, name)
 }
 
 func (s *Server) releaseLegacyHeld(ctx context.Context, kind, name string) (*pb.ReleaseLegacyHeldClaimResponse, error) {
@@ -171,22 +203,26 @@ func (s *Server) releaseLegacyHeld(ctx context.Context, kind, name string) (*pb.
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%s has been removed for good, so the next tick excludes proof %s without a release", dest, ev.Proof)
 	}
-	reason := fmt.Sprintf("operator release of a legacy-held claim (lv cluster claim-release %s/%s) by %s",
-		kind, name, callerUsername(ctx))
-	enc, err := s.requestRelease(ctx, dest, ev.Key, ev.Proof, reason)
-	if err != nil {
-		return nil, releaseRefusal(dest, ev.Proof, err)
-	}
-	ab, err := corrosion.DecodeClaimAbandonment(enc)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "%s's abandonment of proof %s: %v", dest, ev.Proof, err)
-	}
+	// The verifier is read before anything is asked, so a node that cannot
+	// verify refuses with nothing released.
 	_, verifier, err := s.claimIdentity()
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
+	reason := fmt.Sprintf("operator release of a legacy-held claim (lv cluster claim-release %s/%s) by %s",
+		kind, name, callerUsername(ctx))
+	enc, sent, err := s.requestRelease(ctx, dest, ev.Key, ev.Proof, reason)
+	if err != nil {
+		return nil, releaseRefusal(kind, name, dest, ev.Proof, sent, err)
+	}
+	// From here the destination has recorded the abandonment; a failure is an
+	// unknown outcome, not a refusal.
+	ab, err := corrosion.DecodeClaimAbandonment(enc)
+	if err != nil {
+		return nil, releaseUnknown(kind, name, dest, ev.Proof, fmt.Errorf("decode its abandonment: %w", err))
+	}
 	if err := verifier.VerifyAbandonment(ab, dest, ev.Proof, ev.Key); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "%s's abandonment of proof %s does not verify: %v", dest, ev.Proof, err)
+		return nil, releaseUnknown(kind, name, dest, ev.Proof, fmt.Errorf("its abandonment does not verify: %w", err))
 	}
 	return &pb.ReleaseLegacyHeldClaimResponse{DestHost: dest, ProofId: ev.Proof, Key: ev.Key.String(),
 		Detail: fmt.Sprintf("%s confirmed nothing runs proof %s and signed that it never will; the next recovery tick "+
@@ -194,47 +230,62 @@ func (s *Server) releaseLegacyHeld(ctx context.Context, kind, name string) (*pb.
 }
 
 // requestRelease asks dest — this node, or a peer — for the operator release
-// of proofID at key.
-func (s *Server) requestRelease(ctx context.Context, dest string, key corrosion.ClaimKey, proofID, reason string) (string, error) {
+// of proofID at key. sent reports whether the request reached the
+// destination's handler (or may have): only an error with sent false is a
+// definite "nothing happened".
+func (s *Server) requestRelease(ctx context.Context, dest string, key corrosion.ClaimKey, proofID, reason string) (string, bool, error) {
 	if dest == s.hostName {
 		ab, err := s.abandonRecoveryProof(ctx, key, proofID, reason, true, true)
 		if err != nil {
-			return "", err
+			return "", true, err
 		}
-		return ab.Encode()
+		enc, err := ab.Encode()
+		return enc, true, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cl, closer, err := s.dialPeer(cctx, dest)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer closer()
 	resp, err := cl.AbandonRecoveryProof(cctx, &pb.AbandonRecoveryProofRequest{Key: keyToPB(key), ProofId: proofID,
 		Reason: reason, ForeignOnly: true, OperatorRelease: true})
 	if err != nil {
-		return "", err
+		return "", true, err
 	}
-	return resp.GetAbandonment(), nil
+	return resp.GetAbandonment(), true, nil
 }
 
-// releaseRefusal names why a release did not happen. A destination that
-// answered and refused says why; one that did not answer cannot confirm that
-// nothing runs the proof, and the way out for a destination that is gone is
-// its removal.
-func releaseRefusal(dest, proofID string, err error) error {
+// releaseRefusal names why a release did not happen, or that its outcome is
+// unknown. A destination's own refusal (FailedPrecondition, InvalidArgument)
+// comes before it records anything. A destination that was never reached
+// cannot have released anything, and cannot confirm that nothing runs the
+// proof; the way out for one that is gone is its removal. Anything else after
+// the request was sent may have followed the record.
+func releaseRefusal(kind, name, dest, proofID string, sent bool, err error) error {
 	st, ok := status.FromError(err)
 	if ok {
 		switch st.Code() {
 		case codes.FailedPrecondition, codes.InvalidArgument:
+			// A build that predates the release ignores operator_release and
+			// answers with the bridge's own refusal of a proof in flight on it:
+			// a current destination never refuses that case for that reason.
+			if strings.Contains(st.Message(), fmt.Sprintf("is %s, executor %q", corrosion.ProofInProgress, dest)) {
+				return status.Errorf(codes.FailedPrecondition,
+					"%s refused to release proof %s as a build that predates `lv cluster claim-release` would "+
+						"(it ignored the release and refused the proof as in flight): upgrade %s and run the release again",
+					dest, proofID, dest)
+			}
 			return status.Errorf(codes.FailedPrecondition, "%s refused to release proof %s: %s", dest, proofID, st.Message())
 		case codes.Unimplemented:
+			// A build with no AbandonRecoveryProof at all.
 			return status.Errorf(codes.FailedPrecondition,
-				"%s cannot release proof %s (an older build); upgrade it and run the release again", dest, proofID)
+				"%s cannot release proof %s (a build without recovery claims); upgrade it and run the release again", dest, proofID)
 		}
 	}
-	if errors.Is(err, context.Canceled) {
-		return status.FromContextError(err).Err()
+	if sent {
+		return releaseUnknown(kind, name, dest, proofID, err)
 	}
 	return status.Errorf(codes.Unavailable,
 		"%s did not answer (%v): only the destination can confirm that nothing runs proof %s, so nothing was released. "+

@@ -84,7 +84,11 @@ type Reconciler struct {
 	// expires between the start and the commit reproducible instead of a
 	// timing race, and lets a test see WHICH context the walk handed down.
 	// Nil in production.
-	startDomainHook  func(context.Context)
+	startDomainHook func(context.Context)
+	// proofClaimedHook runs right after a pending start has claimed its proof.
+	// Test-only seam: it is the window in which a release of that proof can be
+	// recorded, which the start checkpoint has to catch. Nil in production.
+	proofClaimedHook func(context.Context)
 	hostName         string
 	dataDir          string
 	db               *corrosion.Client
@@ -1296,11 +1300,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				r.noteGateRefused(corrosion.ActionReschedule, ReasonProofTerminal)
 				return
 			}
+			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				// Terminal, not transient: this host has promised never to run
+				// the proof, and no later tick can change that. Fail the proof
+				// so the row leaves pending instead of retrying every tick.
+				slog.Warn("reconciler: this host abandoned the pending proof and will never execute it — not starting",
+					"vm", vm.Name, "proof", proofID)
+				r.noteGateRefused(corrosion.ActionReschedule, ReasonClaimLost)
+				r.failPendingStart(ctx, vm.Name, proofID, false, "proof abandoned by this host")
+				return
+			}
 			// Transient (proof row not yet visible / DB error): retry next tick.
 			// The vm_lock is released by defer, so we don't tie it up while waiting.
 			slog.Warn("reconciler: claim pending proof failed (transient), retrying",
 				"vm", vm.Name, "proof", proofID, "error", err)
 			return
+		}
+		if r.proofClaimedHook != nil {
+			r.proofClaimedHook(ctx)
 		}
 	}
 
@@ -1585,6 +1602,29 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, false, fmt.Sprintf("XML gen: %v", err)) // non-retryable (bad config)
 		return
+	}
+
+	// The start checkpoint, before anything is defined or started: appended only
+	// if this host has not abandoned the proof, decided in one transaction
+	// (docs/design/recovery-claims.md §3.12, §10 item 37). The start lease is not
+	// what keeps an operator release (`lv cluster claim-release`) from racing
+	// this start — it can expire under a start that runs past vmLockTTL — the
+	// database is: a release before this point makes it refuse, and one after it
+	// refuses the proof for the recorded step. A re-driven start appends nothing.
+	if proofID != "" {
+		if err := corrosion.AppendProofStepUnlessAbandoned(ctx, r.db, proofID, "start_attempted"); err != nil {
+			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				slog.Warn("reconciler: this host abandoned the pending proof and will never execute it — not starting",
+					"vm", vm.Name, "proof", proofID)
+				r.noteGateRefused(corrosion.ActionReschedule, ReasonClaimLost)
+				r.failPendingStart(ctx, vm.Name, proofID, false, "proof abandoned by this host")
+				return
+			}
+			slog.Warn("reconciler: record the start checkpoint failed (transient), retrying",
+				"vm", vm.Name, "proof", proofID, "error", err)
+			r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start checkpoint: %v", err))
+			return
+		}
 	}
 
 	// Define and start the domain.

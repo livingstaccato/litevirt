@@ -75,7 +75,10 @@ It is refused when the destination does not answer: only the destination can
 confirm the proof is not running. If it is gone for good, use
 ` + "`lv host fence-confirm <host>`" + ` once it is powered off, then
 ` + "`lv host rm --dead <host>`" + `. It is also refused when the destination finds
-anything that might run the proof. Every call is audited (recovery_claim.release).
+anything that might run the proof. When the request reached the destination but no
+verified answer came back, the outcome is reported as unknown: run the command again
+(a release already recorded is signed again) or check ` + "`lv cluster claim <kind>/<name>`" + `.
+Every call is audited (recovery_claim.release: ok, refused or unknown).
 
   kind   vm or container
 

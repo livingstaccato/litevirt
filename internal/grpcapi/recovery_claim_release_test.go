@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -209,14 +210,18 @@ func TestReleaseLegacyHeldClaim_UnreachableDestinationPointsAtRemoval(t *testing
 // TestReleaseLegacyHeldClaim_Scope: admin only, and only for a workload an
 // open ha.claim.legacy_held holds.
 //
-// Mutations: drop the role check — a viewer releases; drop the condition
-// lookup — a workload nothing holds is released.
+// Mutations: drop the role check — a viewer releases; check the role before
+// the audit — the viewer's refusal is not audited; drop the condition lookup
+// — a workload nothing holds is released.
 func TestReleaseLegacyHeldClaim_Scope(t *testing.T) {
 	ctx := context.Background()
 	s, _, _, _ := releaseFixture(t)
 	viewer := context.WithValue(context.Background(), ctxKeyRole, "viewer")
 	if _, err := s.ReleaseLegacyHeldClaim(viewer, &pb.ReleaseLegacyHeldClaimRequest{Kind: "vm", Name: "vm-r"}); status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("a viewer's release: %v, want PermissionDenied", err)
+	}
+	if n := releaseAudits(t, s, "refused"); n != 1 {
+		t.Fatalf("a viewer's refused release wrote %d audit rows, want 1", n)
 	}
 	s.resolveLegacyHeld(ctx, true)
 	if _, err := s.ReleaseLegacyHeldClaim(adminCtx(), &pb.ReleaseLegacyHeldClaimRequest{Kind: "vm", Name: "vm-r"}); status.Code(err) != codes.NotFound {
@@ -258,5 +263,88 @@ func TestHoldWorkloadIdle_Container(t *testing.T) {
 		t.Fatal("the release did not give the container lock back")
 	} else {
 		u()
+	}
+}
+
+// abandonClient is a peer whose AbandonRecoveryProof answers with resp/err.
+type abandonClient struct {
+	pb.LiteVirtClient
+	resp *pb.AbandonRecoveryProofResponse
+	err  error
+}
+
+func (c abandonClient) AbandonRecoveryProof(context.Context, *pb.AbandonRecoveryProofRequest, ...grpc.CallOption) (*pb.AbandonRecoveryProofResponse, error) {
+	return c.resp, c.err
+}
+
+// remoteReleaseFixture is releaseFixture whose held decision names a peer
+// destination, gone-host, answered by cl.
+func remoteReleaseFixture(t *testing.T, cl pb.LiteVirtClient) *Server {
+	t.Helper()
+	ctx := context.Background()
+	s, _, key, v := releaseFixture(t)
+	gone := *v.Proof
+	gone.ID, gone.DestHost = "gone-proof", "gone-host"
+	if err := corrosion.WriteActionProof(ctx, s.db, gone); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(ctx, `DELETE FROM health_conditions WHERE code = ?`, condClaimLegacyHeld); err != nil {
+		t.Fatal(err)
+	}
+	s.noteLegacyHeld(ctx, key, corrosion.ClaimValue{Proof: &gone, SourceHost: "dead"}, "gone-host did not answer")
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return cl, func() {}, nil
+	}
+	return s
+}
+
+// TestReleaseLegacyHeldClaim_OutcomeUnknownAfterTheRequestIsSent: once the
+// request has reached the destination, a timeout, a dropped connection or an
+// answer that does not verify may follow the abandonment's record. None of
+// them is "nothing was released": each is audited as unknown and tells the
+// operator how to find out.
+//
+// Mutations: classify a sent request's transport error as unreachable — it
+// is reported as nothing released; classify a failed decode as a refusal —
+// it is audited as refused.
+func TestReleaseLegacyHeldClaim_OutcomeUnknownAfterTheRequestIsSent(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		cl   abandonClient
+	}{
+		{"the call timed out", abandonClient{err: status.Error(codes.DeadlineExceeded, "context deadline exceeded")}},
+		{"the connection dropped", abandonClient{err: status.Error(codes.Unavailable, "connection reset")}},
+		{"the answer does not decode", abandonClient{resp: &pb.AbandonRecoveryProofResponse{Abandonment: "not json"}}},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			s := remoteReleaseFixture(t, tc.cl)
+			_, err := s.ReleaseLegacyHeldClaim(adminCtx(), &pb.ReleaseLegacyHeldClaimRequest{Kind: "vm", Name: "vm-r"})
+			if err == nil || !strings.Contains(err.Error(), "outcome is unknown") ||
+				!strings.Contains(err.Error(), "lv cluster claim vm/vm-r") {
+				t.Fatalf("%s: %v, want an unknown outcome naming `lv cluster claim vm/vm-r`", tc.what, err)
+			}
+			if n := releaseAudits(t, s, "unknown"); n != 1 {
+				t.Fatalf("%s: %d audit rows with result unknown, want 1 (refused: %d)", tc.what, n, releaseAudits(t, s, "refused"))
+			}
+		})
+	}
+}
+
+// TestReleaseLegacyHeldClaim_NamesAnOlderDestination: a build that predates
+// the release ignores operator_release and refuses the proof as in flight on
+// it; the refusal says to upgrade it rather than echoing the bridge's text.
+//
+// Mutation: drop the older-build detection — the operator is shown the
+// bridge's refusal.
+func TestReleaseLegacyHeldClaim_NamesAnOlderDestination(t *testing.T) {
+	s := remoteReleaseFixture(t, abandonClient{err: status.Error(codes.FailedPrecondition,
+		`this node cannot show the proof is not this incarnation's decision: proof gone-proof is in_progress, executor "gone-host"`)})
+	_, err := s.ReleaseLegacyHeldClaim(adminCtx(), &pb.ReleaseLegacyHeldClaimRequest{Kind: "vm", Name: "vm-r"})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "predates") ||
+		!strings.Contains(err.Error(), "upgrade gone-host") {
+		t.Fatalf("release with an older destination: %v, want a refusal naming the upgrade", err)
+	}
+	if n := releaseAudits(t, s, "refused"); n != 1 {
+		t.Fatalf("%d refused audit rows, want 1", n)
 	}
 }

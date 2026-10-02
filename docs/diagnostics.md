@@ -1191,13 +1191,21 @@ admin). The destination does the release: under the workload's own locks it
 confirms that nothing there runs the proof (no start or operation holds the
 workload, and no live domain or container of its name exists), then records and
 signs that it will never run it. After that no runner can take the proof, the
-destination's own resume included, and the next recovery tick decides the
-workload afresh. The command refuses, and changes nothing, when the destination
-finds anything that might run the proof, when its proof is a promote that has
-reached its start checkpoint, and when the destination does not answer: only the
+destination's own resume included: every executor records a start checkpoint
+before it lays anything down or starts it, and the database lets either that
+checkpoint or the release land, never both. The next recovery tick then decides
+the workload afresh. The command refuses, and changes nothing, when the
+destination finds anything that might run the proof, when the proof has reached
+its start checkpoint, when the destination runs a build that predates the
+command (upgrade it), and when the destination cannot be reached: only the
 destination can confirm that the proof is not running, so for one that is gone
 the way out is `lv host fence-confirm <host>` and `lv host rm --dead <host>`.
-Every call, released or refused, writes a `recovery_claim.release` audit row;
+If the request reached the destination but no verified answer came back (a
+timeout, a dropped connection), the outcome is unknown, not refused: the
+destination may have recorded the release. Run the command again (a release
+already recorded is signed again, so it answers either way) or check
+`lv cluster claim vm/<name>`. Every call writes a `recovery_claim.release` audit
+row with result `ok`, `refused` or `unknown`;
 the destination also writes its own `recovery_claim.abandon`. Only if the
 destination keeps refusing is the cluster-wide stand-down left:
 `enforcement.recovery_claim: false` on every host until the workload has

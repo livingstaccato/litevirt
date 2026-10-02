@@ -1963,27 +1963,38 @@ where it described the mechanism; this list records what changed and why.
       destination itself claimed and left in progress, with no start
       checkpoint (`corrosion.AbandonForeignProofInFlight`) — and only after the
       destination has confirmed, from its own state, that nothing runs it
-      (`Server.holdWorkloadIdle`): it takes the holds every runner takes (for
-      a VM the operation lock and the per-VM start lease the reconciler holds
-      for a whole reschedule start; for a container the operation lock the
-      sweep holds through a relocation's recreate), and under them finds no
-      active domain or running container of the name. A promote holds
-      neither, but it records its start checkpoint through
-      `AppendProofStepUnlessAbandoned`, so the abandonment refuses it there,
-      and a promote past that checkpoint is never released. The abandonment
-      goes into the destination's node-local table, which every claim of the
-      proof reads in its own transaction, so no runner can take it again,
-      the destination's own resume included; the bridge's next ask is then
-      answered from that row and the claim decides afresh. A destination that
-      does not answer confirms nothing, and the command refuses and names
-      `lv host rm --dead`. Every call writes a `recovery_claim.release` audit
-      row, released or refused. The cluster-wide stand-down
+      (`Server.holdWorkloadIdle`): it takes the holds a runner takes (for a
+      VM the operation lock and the per-VM start lease; for a container the
+      operation lock) and under them finds no active domain or running
+      container of the name. Those holds are not the safety argument,
+      though: a runner can claim a proof before it takes them (a backup
+      restore claims its carried proof, then opens the repo, then takes the
+      container lock), and the start lease expires under a start that runs
+      past `vmLockTTL`. What decides is the database. Every executor of an
+      ownership move — promote, reschedule start, restore relocation, the
+      sweep's relocate-recreate — records the start checkpoint
+      `start_attempted` through `AppendProofStepUnlessAbandoned` before it
+      defines, lays down or starts anything. That append and the release's
+      record read the same node-local table in their own transactions, so
+      exactly one wins: a release recorded first makes the executor refuse at
+      its checkpoint (terminally — a reschedule fails its proof, so the row
+      leaves pending instead of retrying), and a checkpoint recorded first
+      makes the release refuse the proof. The abandonment also refuses every
+      later claim of the proof, the destination's own resume included; the
+      bridge's next ask is then answered from that row and the claim decides
+      afresh. A destination that is never reached confirms nothing, and the
+      command refuses and names `lv host rm --dead`. A request that reached
+      the destination but brought back no verified answer (a timeout, a
+      dropped connection, an abandonment that does not verify) may have been
+      recorded, so it is reported as an unknown outcome, never as nothing
+      released; running the command again answers, since a recorded release
+      is signed again. A destination on a build that predates the release
+      ignores `operator_release` and refuses the proof as in flight on it,
+      and that refusal is named as needing an upgrade. Every call writes a
+      `recovery_claim.release` audit row — `ok`, `refused` or `unknown` —
+      with a context detached from the caller's. The cluster-wide stand-down
       (`enforcement.recovery_claim: false`) remains the last resort for a
-      destination that keeps refusing. A residual the release cannot close:
-      the start lease has a TTL (`vmLockTTL`, ten minutes), so a reconciler
-      wedged past it inside a start is no longer seen by the hold; it is
-      still caught by the domain check once it has defined and started a
-      domain, but not in the window before. While the destination
+      destination that keeps refusing. While the destination
       answers, the next tick decides; if it is gone for good,
       `lv host rm --dead` releases it. This incarnation's completed decision
       is never excluded (its row is past the epoch at its destination), so a

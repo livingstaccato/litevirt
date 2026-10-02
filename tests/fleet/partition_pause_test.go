@@ -123,7 +123,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		p.SetQuorum(chk.ExecutionQuorum)
 		p.SetEnabled(func() bool { return on })
 		p.SetVMBackend(n.Virt)
-		p.SetResumeConfirmer(n.Server.ConfirmPartitionResume)
+		p.SetResumeConfirmer(n.Server.CheckPartitionResume)
 		p.SetTimings(ppTPause, 100*time.Millisecond)
 		go p.Start(ctx)
 
@@ -579,5 +579,77 @@ func TestFleet_PartitionPause_FleetWideBlipPausesThenResumesEverything(t *testin
 		if got := runningOn(c, "blip-"+n.Name); len(got) != 1 || got[0] != n.Name {
 			t.Fatalf("blip-%s runs on %v after the blip, want only %s", n.Name, got, n.Name)
 		}
+	}
+}
+
+// TestFleet_PartitionPause_ResumeWithoutClaimsReadsTheVotersRows: recovery
+// claims OFF (the default). The majority recovers pp-vm off a paused node-0;
+// then an operator undrains node-0 (`lv host undrain`) while replication into
+// node-0 is still held. Every voter now reports node-0 active and there is no
+// claim to find, so only the voters' own ROWS — pp-vm on the replacement host
+// — can tell node-0, whose replica still says the VM is its own, not to
+// resume a second copy.
+//
+// Mutation: drop the row comparison in DecideResume — node-0 resumes pp-vm
+// beside the replacement and this goes red.
+func TestFleet_PartitionPause_ResumeWithoutClaimsReadsTheVotersRows(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true})
+	owner := c.Nodes[0]
+	insertVMPolicy(t, owner, "pp-vm", owner.Name, "restart-any")
+	c.WaitConverged(t, convergeTimeout)
+	owner.Virt.SetState("pp-vm", libvirtfake.StateRunning)
+
+	newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{c.Nodes[2].Name: true}})
+	rs := sampleRunning(t, c, "pp-vm")
+	minority, majority := c.Nodes[:2], c.Nodes[2:]
+	c.SplitGossip(minority, majority)
+
+	var dest *Node
+	eventually(t, ppRecoverBound, "the majority to start pp-vm's replacement", func() bool {
+		for _, n := range majority {
+			if st, ok := n.Virt.RawState("pp-vm"); ok && st == libvirtfake.StateRunning {
+				dest = n
+				return true
+			}
+		}
+		return false
+	})
+	if st, _ := owner.Virt.RawState("pp-vm"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: %s's copy is %s, want paused", owner.Name, st)
+	}
+
+	rs.markNow()
+	c.HealGossip()
+	for _, a := range minority {
+		for _, b := range majority {
+			c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+		}
+	}
+	c.WaitGossip(t, remergeBound, "the halves to merge", c.GossipConverged)
+	if err := corrosion.UpdateHostState(ctx, dest.DB, owner.Name, "active"); err != nil {
+		t.Fatalf("undrain %s: %v", owner.Name, err)
+	}
+	eventually(t, 30*time.Second, "the undrain to reach every majority voter", func() bool {
+		for _, n := range majority {
+			if h, err := corrosion.GetHost(ctx, n.DB, owner.Name); err != nil || h == nil || h.State != "active" {
+				return false
+			}
+		}
+		return true
+	})
+	time.Sleep(15 * time.Second)
+	if row := vmOn(t, owner, "pp-vm"); row == nil || row.HostName != owner.Name {
+		t.Fatalf("setup: replication reached %s while it was held (row %+v)", owner.Name, row)
+	}
+	rs.mu.Lock()
+	at, ran := rs.since[owner.Name]
+	rs.mu.Unlock()
+	if ran {
+		t.Fatalf("%s resumed pp-vm at %s beside %s's replacement: its stale replica was trusted over the voters' rows",
+			owner.Name, at.Format("15:04:05.000"), dest.Name)
+	}
+	if st, _ := owner.Virt.RawState("pp-vm"); st != libvirtfake.StatePaused {
+		t.Fatalf("%s's copy is %s, want still paused", owner.Name, st)
 	}
 }

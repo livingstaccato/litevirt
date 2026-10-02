@@ -463,7 +463,17 @@ func TestPartitionPause_NoConfirmerHolds(t *testing.T) {
 // goes red; require fewer answers — "too few" goes red.
 func TestDecideResume(t *testing.T) {
 	rec := PauseRecord{Kind: PauseKindVM, Name: "vm-ha", Host: "node-a", OwnerEpoch: 3, Incarnation: "inc"}
-	ok := func(v string) VoterAnswer { return VoterAnswer{Voter: v, HostState: "active"} }
+	row := RowView{Live: true, Host: "node-a", OwnerEpoch: 3, Incarnation: "inc"}
+	ok := func(v string) VoterAnswer {
+		return VoterAnswer{Voter: v, HostState: "active", Rows: map[string]RowView{rec.Key(): row}}
+	}
+	with := func(v string, edit func(*RowView)) VoterAnswer {
+		a := ok(v)
+		r := row
+		edit(&r)
+		a.Rows = map[string]RowView{rec.Key(): r}
+		return a
+	}
 	for _, tc := range []struct {
 		name    string
 		answers []VoterAnswer
@@ -474,10 +484,17 @@ func TestDecideResume(t *testing.T) {
 		{"too few", []VoterAnswer{ok("b")}, 2, false},
 		{"an error is not an answer", []VoterAnswer{ok("b"), {Voter: "c", Err: errors.New("unreachable")}}, 2, false},
 		{"fenced", []VoterAnswer{ok("b"), {Voter: "c", HostDown: true, HostState: "fenced"}}, 2, false},
-		{"accepted", []VoterAnswer{ok("b"), {Voter: "c", HostState: "active",
+		{"accepted", []VoterAnswer{ok("b"), {Voter: "c", HostState: "active", Rows: ok("c").Rows,
 			Accepted: map[string]string{rec.Key(): "node-c"}}}, 2, false},
-		{"an accept for another workload does not count", []VoterAnswer{ok("b"), {Voter: "c", HostState: "active",
+		{"an accept for another workload does not count", []VoterAnswer{ok("b"), {Voter: "c", HostState: "active", Rows: ok("c").Rows,
 			Accepted: map[string]string{"vm/other": "node-c"}}}, 2, true},
+		// The voter's own ROW must agree: with claims off, after an undrain,
+		// or past an epoch the minority never saw, it is the only witness.
+		{"row moved", []VoterAnswer{ok("b"), with("c", func(r *RowView) { r.Host = "node-c" })}, 2, false},
+		{"row at another epoch", []VoterAnswer{ok("b"), with("c", func(r *RowView) { r.OwnerEpoch = 4 })}, 2, false},
+		{"row another incarnation", []VoterAnswer{ok("b"), with("c", func(r *RowView) { r.Incarnation = "other" })}, 2, false},
+		{"row gone", []VoterAnswer{ok("b"), with("c", func(r *RowView) { r.Live = false })}, 2, false},
+		{"no row view is not an answer", []VoterAnswer{ok("b"), {Voter: "c", HostState: "active"}}, 2, false},
 		{"need zero still needs no objection", []VoterAnswer{{Voter: "b", HostDown: true}}, 0, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

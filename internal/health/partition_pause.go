@@ -139,6 +139,16 @@ type VoterAnswer struct {
 	// Accepted maps a record key to a description of a recovery-claim value
 	// this voter has accepted for it at the recorded epoch and incarnation.
 	Accepted map[string]string
+	// Rows maps a record key to the voter's own row for the workload.
+	Rows map[string]RowView
+}
+
+// RowView is one voter's row for a paused workload.
+type RowView struct {
+	Live        bool
+	Host        string
+	OwnerEpoch  int64
+	Incarnation string
 }
 
 // DecideResume decides one record from the voters' answers: needOthers clean
@@ -160,6 +170,18 @@ func DecideResume(rec PauseRecord, answers []VoterAnswer, needOthers int) Resume
 		if dest, ok := a.Accepted[rec.Key()]; ok {
 			return ResumeVerdict{Reason: fmt.Sprintf("voter %s accepted a recovery claim moving %s to %s at epoch %d",
 				a.Voter, rec.Key(), dest, rec.OwnerEpoch)}
+		}
+		row, ok := a.Rows[rec.Key()]
+		if !ok {
+			errs = append(errs, a.Voter+": no row view")
+			continue
+		}
+		switch {
+		case !row.Live:
+			return ResumeVerdict{Reason: fmt.Sprintf("voter %s has no live row for %s", a.Voter, rec.Key())}
+		case row.Host != rec.Host || row.OwnerEpoch != rec.OwnerEpoch || row.Incarnation != rec.Incarnation:
+			return ResumeVerdict{Reason: fmt.Sprintf("voter %s has %s on %s at epoch %d (incarnation %s); the pause recorded %s at epoch %d",
+				a.Voter, rec.Key(), row.Host, row.OwnerEpoch, row.Incarnation, rec.Host, rec.OwnerEpoch)}
 		}
 		clean++
 	}

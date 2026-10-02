@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
@@ -15,27 +18,30 @@ import (
 // partitionResumeRPCTimeout bounds each voter's answer to the resume check.
 const partitionResumeRPCTimeout = 3 * time.Second
 
-// ConfirmPartitionResume is the majority check a self-paused workload must pass
+// CheckPartitionResume is the majority check a self-paused workload must pass
 // before it resumes (docs/design/partition-pause.md §3.5 step 3), wired as the
 // PartitionPauser's ResumeConfirmer.
 //
 // It asks every OTHER voter of this node's voter set, directly and not through
-// this node's replica, which a healed partition leaves stale:
+// this node's replica — a healed partition leaves that stale, and an
+// anti-entropy exchange with another host of the same minority does not
+// freshen it — for the voter's own view (ConfirmPartitionResume):
 //
-//   - its replica's state of this host (ListHosts). Every recovery is preceded
-//     by a fence that writes this host fenced or offline, which the majority
-//     side holds for at least the pause wait before anything starts;
-//   - while a voter generation is adopted, whether it has accepted any
-//     recovery-claim value for the workload at the recorded epoch and
-//     incarnation, attempt 0, under the incarnation-scoped key or the legacy
-//     one (GetRecoveryClaim). A decided claim needs a majority of accepts, and
-//     this host never accepts its own eviction.
+//   - this host's state: every recovery is preceded by a fence that writes
+//     this host fenced or offline;
+//   - each workload's ROW: its host, owner epoch and incarnation must be what
+//     the pause recorded. This is what holds a resume when recovery claims are
+//     off, or after `lv host undrain` cleared the fenced state while the
+//     replacement still runs, and when the majority moved the workload to an
+//     epoch the minority never saw;
+//   - any recovery-claim value the voter accepted for the workload at the
+//     recorded epoch and incarnation.
 //
 // A workload is confirmed only with clean answers from enough voters that,
 // with this host, they are a majority — any two majorities of one set
 // intersect — and no answer objecting (health.DecideResume). An unreachable
-// voter, or one on an older build, is not an answer.
-func (s *Server) ConfirmPartitionResume(ctx context.Context, recs []health.PauseRecord) map[string]health.ResumeVerdict {
+// voter, or one on a build without the RPC, is not an answer.
+func (s *Server) CheckPartitionResume(ctx context.Context, recs []health.PauseRecord) map[string]health.ResumeVerdict {
 	out := make(map[string]health.ResumeVerdict, len(recs))
 	voters, err := corrosion.VoterSet(ctx, s.db)
 	if err != nil {
@@ -48,7 +54,6 @@ func (s *Server) ConfirmPartitionResume(ctx context.Context, recs []health.Pause
 	if voters[s.hostName] {
 		need--
 	}
-	adopted, _ := corrosion.AdoptedVoterGeneration(ctx, s.db)
 	names := make([]string, 0, len(voters))
 	for v := range voters {
 		if v != s.hostName {
@@ -56,13 +61,18 @@ func (s *Server) ConfirmPartitionResume(ctx context.Context, recs []health.Pause
 		}
 	}
 	sort.Strings(names)
+	req := &pb.ConfirmPartitionResumeRequest{}
+	for _, r := range recs {
+		req.Workloads = append(req.Workloads, &pb.PausedWorkload{Kind: claimKindOf(r.Kind), Name: r.Name,
+			OwnerEpoch: r.OwnerEpoch, Incarnation: r.Incarnation})
+	}
 	answers := make([]health.VoterAnswer, len(names))
 	var wg sync.WaitGroup
 	for i, v := range names {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			answers[i] = s.askPartitionResume(ctx, v, recs, adopted > 0)
+			answers[i] = s.askPartitionResume(ctx, v, req, recs)
 		}()
 	}
 	wg.Wait()
@@ -72,9 +82,16 @@ func (s *Server) ConfirmPartitionResume(ctx context.Context, recs []health.Pause
 	return out
 }
 
+func claimKindOf(pauseKind string) string {
+	if pauseKind == health.PauseKindContainer {
+		return corrosion.ClaimKindContainer
+	}
+	return corrosion.ClaimKindVM
+}
+
 // askPartitionResume collects one voter's answer for every record.
-func (s *Server) askPartitionResume(ctx context.Context, voter string, recs []health.PauseRecord, claims bool) health.VoterAnswer {
-	a := health.VoterAnswer{Voter: voter, Accepted: map[string]string{}}
+func (s *Server) askPartitionResume(ctx context.Context, voter string, req *pb.ConfirmPartitionResumeRequest, recs []health.PauseRecord) health.VoterAnswer {
+	a := health.VoterAnswer{Voter: voter, Accepted: map[string]string{}, Rows: map[string]health.RowView{}}
 	cctx, cancel := context.WithTimeout(ctx, partitionResumeRPCTimeout)
 	defer cancel()
 	client, conn, err := s.peerClient(cctx, voter)
@@ -83,44 +100,88 @@ func (s *Server) askPartitionResume(ctx context.Context, voter string, recs []he
 		return a
 	}
 	defer conn.Close()
-	hosts, err := client.ListHosts(cctx, &pb.ListHostsRequest{})
+	resp, err := client.ConfirmPartitionResume(cctx, req)
 	if err != nil {
-		a.Err = fmt.Errorf("list hosts: %w", err)
+		a.Err = err
 		return a
 	}
-	found := false
-	for _, h := range hosts.GetHosts() {
-		if h.GetName() != s.hostName {
-			continue
-		}
-		found = true
-		a.HostState = h.GetState().String()
-		a.HostDown = h.GetState() == pb.HostState_HOST_OFFLINE
-	}
-	if !found {
-		a.HostDown, a.HostState = true, "absent"
-	}
-	if !claims {
-		return a
+	a.HostState = resp.GetCallerState()
+	a.HostDown = a.HostState == "fenced" || a.HostState == "offline" || a.HostState == "absent"
+	views := map[string]*pb.PausedWorkloadView{}
+	for _, v := range resp.GetViews() {
+		views[v.GetKind()+"/"+v.GetName()] = v
 	}
 	for _, r := range recs {
-		kind := corrosion.ClaimKindVM
-		if r.Kind == health.PauseKindContainer {
-			kind = corrosion.ClaimKindContainer
+		v := views[claimKindOf(r.Kind)+"/"+r.Name]
+		if v == nil {
+			a.Err = fmt.Errorf("no view of %s", r.Key())
+			return a
 		}
-		key := corrosion.ClaimKey{TargetKind: kind, TargetName: r.Name, OwnerEpoch: r.OwnerEpoch, Incarnation: r.Incarnation}
-		for _, k := range []corrosion.ClaimKey{key, key.Legacy()} {
-			resp, err := client.GetRecoveryClaim(cctx, &pb.GetRecoveryClaimRequest{Key: keyToPB(k)})
-			if err != nil {
-				a.Err = fmt.Errorf("recovery claim %s: %w", k, err)
-				return a
-			}
-			if v := resp.GetState().GetAcceptedValue(); v != nil && v.GetDestHost() != "" {
-				a.Accepted[r.Key()] = v.GetDestHost()
-			}
+		a.Rows[r.Key()] = health.RowView{Live: v.GetLive(), Host: v.GetHostName(), OwnerEpoch: v.GetOwnerEpoch(),
+			Incarnation: v.GetIncarnation()}
+		if d := v.GetAcceptedDest(); d != "" {
+			a.Accepted[r.Key()] = d
 		}
 	}
 	return a
+}
+
+// ConfirmPartitionResume answers a paused host's resume check from THIS
+// voter's own replica and claim tables. Peer-only and read-only.
+func (s *Server) ConfirmPartitionResume(ctx context.Context, req *pb.ConfirmPartitionResumeRequest) (*pb.ConfirmPartitionResumeResponse, error) {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
+	caller := callerMTLSCommonName(ctx)
+	if caller == "" {
+		return nil, status.Error(codes.PermissionDenied, "partition resume check: no caller identity")
+	}
+	resp := &pb.ConfirmPartitionResumeResponse{Voter: s.hostName, CallerState: "absent"}
+	h, err := corrosion.GetHost(ctx, s.db, caller)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read host %s: %v", caller, err)
+	}
+	if h != nil {
+		resp.CallerState = h.State
+	}
+	for _, w := range req.GetWorkloads() {
+		v := &pb.PausedWorkloadView{Kind: w.GetKind(), Name: w.GetName()}
+		switch w.GetKind() {
+		case corrosion.ClaimKindVM:
+			vm, err := corrosion.GetVM(ctx, s.db, w.GetName())
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "read vm %s: %v", w.GetName(), err)
+			}
+			if vm != nil {
+				v.Live, v.HostName, v.OwnerEpoch, v.Incarnation = true, vm.HostName, vm.OwnerEpoch, corrosion.IncarnationOf(vm.CreatedAt)
+			}
+		case corrosion.ClaimKindContainer:
+			// Container rows are keyed by (host, name): the caller's own row is
+			// the one it paused, and a relocation tombstones it.
+			ct, err := corrosion.GetContainer(ctx, s.db, caller, w.GetName())
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "read container %s: %v", w.GetName(), err)
+			}
+			if ct != nil {
+				v.Live, v.HostName, v.OwnerEpoch, v.Incarnation = true, ct.HostName, ct.OwnerEpoch, corrosion.IncarnationOf(ct.CreatedAt)
+			}
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "unknown workload kind %q", w.GetKind())
+		}
+		key := corrosion.ClaimKey{TargetKind: w.GetKind(), TargetName: w.GetName(), OwnerEpoch: w.GetOwnerEpoch(),
+			Incarnation: w.GetIncarnation()}
+		for _, k := range []corrosion.ClaimKey{key, key.Legacy()} {
+			st, _, err := s.db.ClaimState(ctx, k)
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "read claim state %s: %v", k, err)
+			}
+			if st.Value != nil && st.Value.Proof != nil && st.Value.Proof.DestHost != "" {
+				v.AcceptedDest = st.Value.Proof.DestHost
+			}
+		}
+		resp.Views = append(resp.Views, v)
+	}
+	return resp, nil
 }
 
 // VerifySettleProof verifies the recovery-claim certificate on p against this

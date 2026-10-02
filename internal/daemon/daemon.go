@@ -1172,7 +1172,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
 	pauser.SetVMBackend(d.virt)
 	pauser.SetContainerRuntime(lxcRunner)
-	pauser.SetResumeConfirmer(svc.ConfirmPartitionResume)
+	pauser.SetResumeConfirmer(svc.CheckPartitionResume)
 	pauser.SetSettleVerifier(svc.VerifySettleProof)
 	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
 	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)

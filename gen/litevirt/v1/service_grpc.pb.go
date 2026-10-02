@@ -249,6 +249,7 @@ const (
 	LiteVirt_ForceReconfigureVoters_FullMethodName     = "/litevirt.v1.LiteVirt/ForceReconfigureVoters"
 	LiteVirt_SignForcedVoterConfig_FullMethodName      = "/litevirt.v1.LiteVirt/SignForcedVoterConfig"
 	LiteVirt_InspectRecoveryClaim_FullMethodName       = "/litevirt.v1.LiteVirt/InspectRecoveryClaim"
+	LiteVirt_ConfirmPartitionResume_FullMethodName     = "/litevirt.v1.LiteVirt/ConfirmPartitionResume"
 	LiteVirt_GetVoterConfig_FullMethodName             = "/litevirt.v1.LiteVirt/GetVoterConfig"
 	LiteVirt_ChangeVoterConfig_FullMethodName          = "/litevirt.v1.LiteVirt/ChangeVoterConfig"
 	LiteVirt_DiagnoseDivergence_FullMethodName         = "/litevirt.v1.LiteVirt/DiagnoseDivergence"
@@ -687,6 +688,11 @@ type LiteVirtClient interface {
 	// InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
 	// member's recorded state for a workload's claim keys, and its last refusal.
 	InspectRecoveryClaim(ctx context.Context, in *InspectRecoveryClaimRequest, opts ...grpc.CallOption) (*InspectRecoveryClaimResponse, error)
+	// ConfirmPartitionResume: peer-only, read-only. A host that paused
+	// workloads on losing the voter majority asks each voter, before it
+	// resumes any, what that voter's OWN replica and claim tables say about
+	// the caller and each workload (docs/design/partition-pause.md §3.5).
+	ConfirmPartitionResume(ctx context.Context, in *ConfirmPartitionResumeRequest, opts ...grpc.CallOption) (*ConfirmPartitionResumeResponse, error)
 	// ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
 	// GetVoterConfig reports the connected host's adopted voter generation and
 	// each member's state (`lv cluster voter ls`).
@@ -3386,6 +3392,16 @@ func (c *liteVirtClient) InspectRecoveryClaim(ctx context.Context, in *InspectRe
 	return out, nil
 }
 
+func (c *liteVirtClient) ConfirmPartitionResume(ctx context.Context, in *ConfirmPartitionResumeRequest, opts ...grpc.CallOption) (*ConfirmPartitionResumeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ConfirmPartitionResumeResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ConfirmPartitionResume_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) GetVoterConfig(ctx context.Context, in *GetVoterConfigRequest, opts ...grpc.CallOption) (*GetVoterConfigResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetVoterConfigResponse)
@@ -4218,6 +4234,11 @@ type LiteVirtServer interface {
 	// InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
 	// member's recorded state for a workload's claim keys, and its last refusal.
 	InspectRecoveryClaim(context.Context, *InspectRecoveryClaimRequest) (*InspectRecoveryClaimResponse, error)
+	// ConfirmPartitionResume: peer-only, read-only. A host that paused
+	// workloads on losing the voter majority asks each voter, before it
+	// resumes any, what that voter's OWN replica and claim tables say about
+	// the caller and each workload (docs/design/partition-pause.md §3.5).
+	ConfirmPartitionResume(context.Context, *ConfirmPartitionResumeRequest) (*ConfirmPartitionResumeResponse, error)
 	// ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
 	// GetVoterConfig reports the connected host's adopted voter generation and
 	// each member's state (`lv cluster voter ls`).
@@ -5049,6 +5070,9 @@ func (UnimplementedLiteVirtServer) SignForcedVoterConfig(context.Context, *SignF
 }
 func (UnimplementedLiteVirtServer) InspectRecoveryClaim(context.Context, *InspectRecoveryClaimRequest) (*InspectRecoveryClaimResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method InspectRecoveryClaim not implemented")
+}
+func (UnimplementedLiteVirtServer) ConfirmPartitionResume(context.Context, *ConfirmPartitionResumeRequest) (*ConfirmPartitionResumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ConfirmPartitionResume not implemented")
 }
 func (UnimplementedLiteVirtServer) GetVoterConfig(context.Context, *GetVoterConfigRequest) (*GetVoterConfigResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetVoterConfig not implemented")
@@ -9027,6 +9051,24 @@ func _LiteVirt_InspectRecoveryClaim_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ConfirmPartitionResume_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConfirmPartitionResumeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ConfirmPartitionResume(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ConfirmPartitionResume_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ConfirmPartitionResume(ctx, req.(*ConfirmPartitionResumeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_GetVoterConfig_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetVoterConfigRequest)
 	if err := dec(in); err != nil {
@@ -10547,6 +10589,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "InspectRecoveryClaim",
 			Handler:    _LiteVirt_InspectRecoveryClaim_Handler,
+		},
+		{
+			MethodName: "ConfirmPartitionResume",
+			Handler:    _LiteVirt_ConfirmPartitionResume_Handler,
 		},
 		{
 			MethodName: "GetVoterConfig",

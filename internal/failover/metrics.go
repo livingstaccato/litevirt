@@ -122,6 +122,9 @@ const (
 	// the coordinator relies on its partition pause, so recovery waits out
 	// health.PartitionPauseWaitFor (docs/design/partition-pause.md §4).
 	ErrPartitionPauseWait = "partition_pause_wait"
+	// ErrQuorumRegain: quorum agreed a host failed, but this coordinator was
+	// itself cut off from the majority within health.QuorumRegainGrace.
+	ErrQuorumRegain = "quorum_regain"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

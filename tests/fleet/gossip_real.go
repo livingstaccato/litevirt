@@ -207,14 +207,24 @@ func (c *Cluster) GossipConverged() bool {
 }
 
 // SplitGossip partitions the cluster into two groups, as a firewall dropping
-// everything between them would: gossip in both directions, and every
-// replication RPC in both directions (the Block link fault).
+// everything between them would: gossip in both directions, and every RPC in
+// both directions — replication (the Block link fault) and everything else,
+// health probes, claim RPCs and client calls included (BlockAll).
 func (c *Cluster) SplitGossip(left, right []*Node) {
 	for _, a := range left {
 		for _, b := range right {
 			c.gossip.set(a.Name, b.Name, true)
 			c.gossip.set(b.Name, a.Name, true)
-			c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+			c.SetLinkFaultBoth(a, b, LinkFault{Block: true, BlockAll: true})
+		}
+	}
+}
+
+// SplitAll cuts every node off from every other, as a fleet-wide blip does.
+func (c *Cluster) SplitAll() {
+	for i, a := range c.Nodes {
+		for _, b := range c.Nodes[i+1:] {
+			c.SplitGossip([]*Node{a}, []*Node{b})
 		}
 	}
 }

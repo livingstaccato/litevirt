@@ -1377,6 +1377,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.cfg.Enforcement.PartitionPause && d.checker.Enforced(ctx, capabilities.PartitionPauseV1)
 	}
 	fc.LastContact = d.checker.LastContact
+	// A coordinator that was itself cut off moments ago decides no new fence
+	// on the failure rows the cut left behind (a fleet-wide blip).
+	fc.QuorumRegain = d.checker.InQuorumRegainGrace
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

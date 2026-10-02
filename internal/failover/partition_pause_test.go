@@ -249,3 +249,27 @@ func TestPartitionPause_OneWayIsMadeVisible(t *testing.T) {
 		})
 	}
 }
+
+// A coordinator that regained the voter majority moments ago decides no new
+// fence: the failure rows it holds were written during its own cut.
+//
+// Mutation: drop the QuorumRegain check in run — the host is fenced and this
+// goes red.
+func TestPartitionPause_ARegainedCoordinatorDefersNewFences(t *testing.T) {
+	c, db, ctx, _ := pauseCoordinator(t, true)
+	regained := true
+	c.QuorumRegain = func() bool { return regained }
+	c.run(ctx)
+	rows, err := db.Query(ctx, `SELECT 1 AS one FROM fencing_log WHERE host_name = 'down'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatal("a coordinator inside its quorum-regain grace fenced a host")
+	}
+	regained = false
+	c.run(ctx)
+	if rows, _ := db.Query(ctx, `SELECT 1 AS one FROM fencing_log WHERE host_name = 'down'`); len(rows) == 0 {
+		t.Fatal("the fence was not decided once the grace had passed")
+	}
+}

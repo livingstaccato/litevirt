@@ -92,6 +92,11 @@ type LinkFault struct {
 	// drop the request, lose the reply, duplicate it, or hold it until after
 	// the sender's next claim RPC (claim_faults.go).
 	Claim ClaimFault
+	// BlockAll refuses EVERY RPC on the link, of any kind — the health
+	// checker's readiness probe, an owner probe's Ping, the claim RPCs, a
+	// client call such as ListHosts — as a firewall dropping all traffic from
+	// one host to another does. SplitGossip sets it.
+	BlockAll bool
 }
 
 // LinkStats counts what the injector did on one directed link.
@@ -217,6 +222,21 @@ func (n *Node) claimBlocked(fullMethod string, caller string) bool {
 	defer n.faults.mu.Unlock()
 	ls := n.faults.links[caller]
 	if ls == nil || (claimMethods[m] && !ls.fault.BlockClaims) || (m == "Ping" && !ls.fault.BlockProbe) {
+		return false
+	}
+	ls.stats.Blocked++
+	return true
+}
+
+// allBlocked reports whether a BlockAll fault refuses every RPC from caller.
+func (n *Node) allBlocked(caller string) bool {
+	if caller == "" {
+		return false
+	}
+	n.faults.mu.Lock()
+	defer n.faults.mu.Unlock()
+	ls := n.faults.links[caller]
+	if ls == nil || !ls.fault.BlockAll {
 		return false
 	}
 	ls.stats.Blocked++

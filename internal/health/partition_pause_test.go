@@ -541,3 +541,42 @@ func TestPartitionPauseWaitCoversTheMinority(t *testing.T) {
 		t.Fatalf("T_pause %v is shorter than the %v the majority needs to build a fence verdict", PartitionPauseAfter, FailuresToFence*checkInterval)
 	}
 }
+
+// InQuorumRegainGrace: true for QuorumRegainGrace after QuorumProof last read
+// No, false for a daemon that never lost the quorum and once the grace has
+// passed. The failover coordinator defers new fences while it is true, so the
+// failure rows a fleet-wide blip leaves behind fence nobody.
+//
+// Mutations: never record the loss — the "just lost" check goes red; compare
+// against the wrong side of the grace — one of the other two goes red.
+func TestInQuorumRegainGrace(t *testing.T) {
+	db := testCheckHostDB(t)
+	for _, h := range []string{"host-a", "host-b", "host-c"} {
+		gateHost(t, db, h, "active", "worker")
+	}
+	c := NewChecker("host-a", "/etc/litevirt/pki", db)
+	warm(c, map[string]bool{"host-b": true, "host-c": true})
+	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumYes {
+		t.Fatalf("setup: quorum %d", st)
+	}
+	if c.InQuorumRegainGrace() {
+		t.Fatal("a daemon that never lost the quorum is in the regain grace")
+	}
+	warm(c, map[string]bool{"host-b": false, "host-c": false})
+	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumNo {
+		t.Fatalf("setup: quorum %d, want No", st)
+	}
+	warm(c, map[string]bool{"host-b": true, "host-c": true})
+	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumYes {
+		t.Fatalf("setup: quorum %d after regaining", st)
+	}
+	if !c.InQuorumRegainGrace() {
+		t.Fatal("a daemon that lost the quorum a moment ago is not in the regain grace")
+	}
+	c.mu.Lock()
+	c.quorumLostAt = time.Now().Add(-QuorumRegainGrace - time.Second)
+	c.mu.Unlock()
+	if c.InQuorumRegainGrace() {
+		t.Fatal("still in the regain grace after it passed")
+	}
+}

@@ -300,6 +300,10 @@ type Coordinator struct {
 	// Mono is the monotonic clock the pause deadline is measured on (default
 	// time.Now). Never Now, which the fleet harness makes virtual.
 	Mono func() time.Time
+	// QuorumRegain reports whether this node lost the cluster-wide quorum within
+	// health.QuorumRegainGrace (health.Checker.InQuorumRegainGrace). While it
+	// does, no new fence is decided. nil never defers.
+	QuorumRegain func() bool
 	// LastContact reports this node's last successful probe of a host
 	// (health.Checker.LastContact), the second anchor of the pause deadline.
 	// nil anchors on the decision alone.
@@ -781,6 +785,15 @@ func (c *Coordinator) run(ctx context.Context) {
 			slog.Warn("failover: quorum reached, but this node was itself not running moments ago — deferring the fence until it has watched for a full grace window",
 				"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target), "grace", health.StallGrace)
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrLocalStall)
+			continue
+		}
+		// Likewise a node that was itself cut off from the majority moments
+		// ago: the failure rows it now holds were written during the cut, and
+		// after a fleet-wide blip they name every host (partition pause, §7 F7).
+		if c.QuorumRegain != nil && c.QuorumRegain() {
+			slog.Warn("failover: quorum reached, but this node regained the voter majority only moments ago — deferring the fence until the observers have re-probed",
+				"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target), "grace", health.QuorumRegainGrace)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrQuorumRegain)
 			continue
 		}
 

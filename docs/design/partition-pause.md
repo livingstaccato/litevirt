@@ -600,7 +600,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F4 | One-way partition (A→M works, M→A does not) | M can count a majority that cannot count it, so it may not pause while the majority fences it. The coordinator raises `partition_one_way` (evaluator `partition_pause`, subject `host/<M>`, critical) when it sees both views at once: a quorum of voters with at least `F` consecutive failures of M, and M's own rows marking enough voters healthy for a majority, each written AFTER that voter's failure streak against M began. It does not recover any differently. | Still open. The fix is mutual reachability: a probe answer that states the responder's own view of the caller. Detection is partial, because the checker does not re-stamp a steadily healthy edge. M's "healthy" rows are fresh only after a transition (a restart, or a flap), so a one-way split that starts with every edge already healthy is not seen. |
 | F5 | More than 17 hosts | `D_M` grows by one probe batch per 16 peers. | Closed: `W` is computed from the cluster's size (§4.4). The one gap is a host added inside the minority during the partition. |
 | F6 | A host comes back before the deadline | The deadline check sees fresh healthy observers (`fenceStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
-| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. |
+| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator that lost the cluster-wide quorum within `QuorumRegainGrace` (`StallGrace`, 10 s) therefore decides no new fence (`error_class=quorum_regain`), as one that stalled does not. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `fenceStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
 | F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. |
 
@@ -662,4 +662,23 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
 
 ## 10. Where the implementation departs from the text above
 
-(Filled in as the code lands.)
+1. **`QuorumRegainGrace` (§7 F7) was not in the first draft.** Writing the
+   fleet-wide blip scenario showed that a coordinator coming back from the
+   blip can fence a host on the failure rows the blip left behind, which
+   would leave that host paused behind a fence instead of resuming. The
+   coordinator now defers new fences for `StallGrace` after it last saw the
+   cluster-wide quorum lost, as it already does after a stall of its own. A
+   majority that kept its quorum through a partition is unaffected.
+2. **CLAUDE.md is not edited by this branch.** The brief asked for the
+   default-on exception paragraph to name `enforcement.partition_pause`
+   beside `enforcement.audit_signature`. An agent may not change CLAUDE.md on
+   another agent's say-so, so the proposed paragraph is in the report for the
+   user to apply. `internal/daemon/config.go` and `docs/configuration.md`
+   carry the default and its kill switch.
+3. **The watchdog premise.** §5 explains why the pauser runs whether or not a
+   hardware watchdog is armed. The brief said that an armed watchdog already
+   covers a host; it covers only a dead daemon.
+4. **`DecideResume` stops at the first objection.** One voter that has this
+   host fenced, or that accepted a claim to move the workload, is enough to
+   hold it. Waiting for a majority of objections would let a resume race a
+   recovery that only one voter has heard of yet.

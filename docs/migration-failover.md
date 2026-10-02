@@ -653,6 +653,7 @@ Scrape `http://<host>:7444/metrics` for:
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
   `db_error`, `fence_log_write_failed`, `recovery_resumed`, `refence_failed`, `confirmation_resumed`, `local_stall`,
   `partition_pause_wait` (recovery waiting out a partitioned host's pause, design/partition-pause.md),
+  `quorum_regain` (a fence deferred because this node itself regained the voter majority moments ago),
   and under region-scoped failover `region_too_small` / `region_scoped` — see
   [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions

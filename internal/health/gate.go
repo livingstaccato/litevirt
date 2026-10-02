@@ -165,7 +165,34 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		// Unknown = "neither proof nor loss" → no action, no loss-clock.
 		return QuorumUnknown, 0, 0
 	}
-	return c.quorumOver(voters)
+	state, live, needed = c.quorumOver(voters)
+	if state == QuorumNo {
+		c.mu.Lock()
+		c.quorumLostAt = c.now()
+		c.mu.Unlock()
+	}
+	return state, live, needed
+}
+
+// QuorumRegainGrace is how long after this daemon last saw the cluster-wide
+// quorum lost its coordinator decides no new fence: StallGrace, the time a
+// fence verdict takes to build. A node that was itself cut off holds failure
+// rows its peers wrote DURING the cut — about every host, after a fleet-wide
+// blip — and replication delivers them in the seconds after the heal, before
+// the observers' first successful probes overwrite them. Deciding on them
+// would fence hosts that are answering (docs/design/partition-pause.md §7 F7).
+const QuorumRegainGrace = StallGrace
+
+// InQuorumRegainGrace reports whether this daemon saw the cluster-wide quorum
+// lost within the last QuorumRegainGrace. The failover coordinator defers a
+// new fence while it is true, as it does for InStallGrace. A daemon that never
+// lost the quorum is never in it, so a majority that kept its quorum through a
+// partition fences as before.
+func (c *Checker) InQuorumRegainGrace() bool {
+	c.mu.Lock()
+	lost := c.quorumLostAt
+	c.mu.Unlock()
+	return !lost.IsZero() && c.now().Sub(lost) < QuorumRegainGrace
 }
 
 // RegionQuorumProof is QuorumProof over one region's voters: the members of

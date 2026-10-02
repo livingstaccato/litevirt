@@ -164,6 +164,9 @@ type Checker struct {
 	// (probe_plan.go); nil until one has run. PeerUp reads it to tell "not
 	// probed by me" from "probed and not healthy".
 	planned map[string]bool
+	// quorumLostAt is the local instant QuorumProof last read No; zero if it
+	// never has in this process. InQuorumRegainGrace reads it. Guarded by mu.
+	quorumLostAt time.Time
 }
 
 // now reads the checker's local clock.

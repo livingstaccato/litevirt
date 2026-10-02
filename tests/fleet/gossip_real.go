@@ -10,12 +10,20 @@ package fleet
 // correctly over a view that memberlist has stopped repairing.
 //
 // With RealGossip each node's store is a real corrosion client with its own
-// memberlist on its own gossip port (freeGossipPort), binding 0.0.0.0 and
-// advertising 127.0.0.1, joined to every other node. Its transport is
-// memberlist's own NetTransport wrapped in a cut: SplitGossip drops every packet
-// and refuses every stream from one side to the other, in both directions, as a
-// firewall DROP between two groups of hosts would. Encryption and admission sit
-// above the transport, so a key (Options.GossipKey) applies to everything that
+// memberlist, joined to every other node. Every node gossips on ONE port
+// (freeGossipPort), each on its own loopback address (127.0.0.10, .11, ...),
+// which is also the address its hosts row records, its gRPC listener binds and
+// its certificate names — the shape of a real cluster, where every host has its
+// own IP and gossip_port is uniform. That is what lets a bare recorded address
+// be dialled at all: memberlist dials it on its own gossip port. (Linux routes
+// all of 127.0.0.0/8 to lo; this harness mode is Linux-only.)
+//
+// Its transport is memberlist's own NetTransport wrapped in a cut: SplitGossip
+// drops every packet and refuses every stream from one side to the other, in
+// both directions, as a firewall DROP between two groups of hosts would. The
+// cut counts the packets it drops, which is how a scenario can see memberlist
+// stop gossiping to members it has reaped. Encryption and admission sit above
+// the transport, so a key (Options.GossipKey) applies to everything that
 // crosses it, re-joins included.
 
 import (
@@ -51,8 +59,11 @@ const gossipRejoinInterval = 200 * time.Millisecond
 // cannot reach each other, and which gossip address belongs to which node.
 type gossipCut struct {
 	mu      sync.Mutex
-	byAddr  map[string]string // "127.0.0.1:port" → node name
+	byAddr  map[string]string // "127.0.0.x:port" → node name
 	blocked map[string]map[string]bool
+	// dropped counts the UDP packets the cut has dropped. Join's push/pull is
+	// a stream, so this is memberlist's own gossip and probing only.
+	dropped int
 }
 
 func (g *gossipCut) cut(from string, addr string) bool {
@@ -60,6 +71,22 @@ func (g *gossipCut) cut(from string, addr string) bool {
 	defer g.mu.Unlock()
 	to, ok := g.byAddr[addr]
 	return ok && g.blocked[from][to]
+}
+
+func (g *gossipCut) drop(from string, addr string) bool {
+	if !g.cut(from, addr) {
+		return false
+	}
+	g.mu.Lock()
+	g.dropped++
+	g.mu.Unlock()
+	return true
+}
+
+func (g *gossipCut) droppedPackets() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.dropped
 }
 
 func (g *gossipCut) set(from, to string, blocked bool) {
@@ -83,14 +110,14 @@ type cutTransport struct {
 var errGossipCut = errors.New("fleet gossip partition: i/o timeout")
 
 func (t *cutTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-	if t.cut.cut(t.self, addr) {
+	if t.cut.drop(t.self, addr) {
 		return time.Now(), nil // a dropped UDP packet: the sender never knows
 	}
 	return t.NodeAwareTransport.WriteTo(b, addr)
 }
 
 func (t *cutTransport) WriteToAddress(b []byte, a memberlist.Address) (time.Time, error) {
-	if t.cut.cut(t.self, a.Addr) {
+	if t.cut.drop(t.self, a.Addr) {
 		return time.Now(), nil
 	}
 	return t.NodeAwareTransport.WriteToAddress(b, a)
@@ -110,28 +137,31 @@ func (t *cutTransport) DialAddressTimeout(a memberlist.Address, timeout time.Dur
 	return t.NodeAwareTransport.DialAddressTimeout(a, timeout)
 }
 
-func gossipAddr(port int) string { return net.JoinHostPort("127.0.0.1", strconv.Itoa(port)) }
+// realGossipAddress is node i's own loopback address under RealGossip.
+func realGossipAddress(i int) string { return fmt.Sprintf("127.0.0.%d", 10+i) }
+
+func gossipAddr(n *Node) string { return net.JoinHostPort(n.Address, strconv.Itoa(n.GossipPort)) }
 
 // openGossipDB opens n's store as a real gossiping corrosion client.
 func (c *Cluster) openGossipDB(n *Node) {
 	var seeds []string
 	for _, o := range c.Nodes {
 		if o != n {
-			seeds = append(seeds, gossipAddr(o.GossipPort))
+			seeds = append(seeds, gossipAddr(o))
 		}
 	}
 	cfg := corrosion.Config{
 		HostName:       n.Name,
 		DataDir:        filepath.Join(c.tmpRoot, n.Name, "corrosion"),
-		BindAddr:       "0.0.0.0",
-		AdvertiseAddr:  "127.0.0.1",
+		BindAddr:       n.Address,
+		AdvertiseAddr:  n.Address,
 		BindPort:       n.GossipPort,
 		JoinPeers:      seeds,
 		RejoinInterval: gossipRejoinInterval,
 		MemberlistForTests: func(ml *memberlist.Config) {
 			ml.GossipToTheDeadTime = gossipDeadTime
 			nt, err := memberlist.NewNetTransport(&memberlist.NetTransportConfig{
-				BindAddrs: []string{"0.0.0.0"},
+				BindAddrs: []string{n.Address},
 				BindPort:  n.GossipPort,
 				Logger:    log.New(ml.LogOutput, "", 0),
 			})
@@ -225,4 +255,51 @@ func (c *Cluster) HealGossip() {
 	c.gossip.blocked = map[string]map[string]bool{}
 	c.gossip.mu.Unlock()
 	c.ClearLinkFaults()
+}
+
+// WaitGossipReaped waits, bounded, until memberlist on both sides of a split
+// has REAPED the other side's members, and fails if it never does.
+//
+// A member declared dead is still gossiped to for GossipToTheDeadTime, and a
+// heal inside that window can let memberlist re-merge by itself: the next
+// broadcast reaches the "dead" member, which refutes its death. Only once the
+// dead are reaped will nothing ever reach them again — the drill's state.
+//
+// memberlist exposes no member count that includes the dead-but-unreaped
+// (Members and NumMembers both skip the dead), and it sends nothing at all
+// while it has nothing to broadcast, so silence on the wire proves nothing
+// either. So each check makes every node broadcast afresh, and the members
+// are reaped when not one of those broadcasts is aimed across the cut.
+func (c *Cluster) WaitGossipReaped(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	// Long enough for a fresh broadcast's retransmissions to go out several
+	// gossip intervals over (200 ms on the LAN profile).
+	const settle = 1500 * time.Millisecond
+	deadline := time.Now().Add(timeout)
+	for {
+		before := c.gossip.droppedPackets()
+		for _, n := range c.Nodes {
+			if err := n.DB.GossipRebroadcastForTests(); err != nil {
+				t.Fatalf("%s: rebroadcast: %v", n.Name, err)
+			}
+		}
+		time.Sleep(settle)
+		aimed := c.gossip.droppedPackets() - before
+		if aimed == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("memberlist still gossiped across the split after %v (%d packets in the last check): "+
+				"the dead were never reaped, so a heal now would prove nothing", timeout, aimed)
+		}
+	}
+}
+
+// ForgetGossipAddresses drops every node's remembered peer gossip addresses —
+// the in-memory state a daemon restart loses — so a re-merge can only dial
+// what the hosts table records.
+func (c *Cluster) ForgetGossipAddresses() {
+	for _, n := range c.Nodes {
+		n.DB.ForgetGossipAddrsForTests()
+	}
 }

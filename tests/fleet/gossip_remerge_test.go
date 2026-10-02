@@ -40,22 +40,27 @@ func TestGossip_HealedPartitionRemergesAndReplicates(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name string
-		key  []byte
+		name      string
+		key       []byte
+		restarted bool
 	}{
-		{"plaintext", nil},
+		{name: "plaintext"},
 		// A re-merge is memberlist's ordinary Join, so under an enforced
 		// keyring it must cross the cut encrypted and be admitted like any
 		// other join — and drop nothing on encryption grounds doing it.
-		{"enforced", key},
+		{name: "enforced", key: key},
+		// Every daemon restarts during the partition, losing the gossip
+		// addresses it remembered: the re-merge has only the hosts table's
+		// recorded addresses to dial, on the cluster's one gossip_port.
+		{name: "restarted", restarted: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			testHealedPartitionRemerges(t, tc.key)
+			testHealedPartitionRemerges(t, tc.key, tc.restarted)
 		})
 	}
 }
 
-func testHealedPartitionRemerges(t *testing.T, key []byte) {
+func testHealedPartitionRemerges(t *testing.T, key []byte, restarted bool) {
 	// Every node a relay, so each side of the split keeps replicating within
 	// itself (with three base relays a leaf can lose every relay it has).
 	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true, GossipKey: key})
@@ -86,9 +91,12 @@ func testHealedPartitionRemerges(t *testing.T, key []byte) {
 	}
 	// ...and then REAPS it: past GossipToTheDeadTime memberlist stops
 	// gossiping to a dead member, which is what leaves nobody to dial it once
-	// the network heals. Reaping runs at the end of a probe round, so wait out
-	// a few of those too.
-	time.Sleep(gossipDeadTime + 4*time.Second)
+	// the network heals. Healing before that would let memberlist re-merge by
+	// itself and prove nothing, so it is observed, not assumed.
+	c.WaitGossipReaped(t, 30*time.Second)
+	if restarted {
+		c.ForgetGossipAddresses()
+	}
 
 	// The majority writes while the minority cannot hear it — the drill's
 	// fence row, moved VM and claim proof stand in as one replicated row.

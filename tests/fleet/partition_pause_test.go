@@ -41,6 +41,15 @@ import (
 // original still runs — which is what makes the wait observable at all.
 const ppTPause = 8 * time.Second
 
+// ppRecoverBound bounds how long a scenario waits for the majority to decide
+// and start a recovery. It is generous on purpose: under -race every node's
+// SQLite transactions slow by an order of magnitude, a voter's promise can run
+// past the proposer's 3 s per-call timeout, and the claim then retries on the
+// next poll (recovery-claims.md §6, duelling and slow voters). That costs
+// liveness, never the property under test, which every scenario asserts on
+// the order of events rather than on how long they took.
+const ppRecoverBound = 4 * time.Minute
+
 // ppWait is the coordinator's wait for a cluster of n hosts under ppTPause.
 func ppWait(targets int) time.Duration { return ppTPause + health.PartitionPauseMarginFor(targets) }
 
@@ -327,7 +336,7 @@ func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing
 	c.SplitGossip(minority, majority)
 
 	var dest *Node
-	eventually(t, 90*time.Second, "the majority to start pp-vm's replacement", func() bool {
+	eventually(t, ppRecoverBound, "the majority to start pp-vm's replacement", func() bool {
 		for _, n := range majority {
 			if st, ok := n.Virt.RawState("pp-vm"); ok && st == libvirtfake.StateRunning {
 				dest = n
@@ -471,14 +480,14 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 	})
 
 	c.SplitGossip(c.Nodes[:1], c.Nodes[1:])
-	eventually(t, 120*time.Second, "the dual run: pp-dual running on the owner AND a recovery destination", func() bool {
+	eventually(t, ppRecoverBound, "the dual run: pp-dual running on the owner AND a recovery destination", func() bool {
 		return len(runningOn(c, "pp-dual")) == 2
 	})
 	_ = s
 
 	c.HealGossip()
 	c.WaitGossip(t, remergeBound, "the halves to merge", c.GossipConverged)
-	eventually(t, 120*time.Second, "the dual run to settle to one copy", func() bool {
+	eventually(t, ppRecoverBound, "the dual run to settle to one copy", func() bool {
 		got := runningOn(c, "pp-dual")
 		return len(got) == 1 && got[0] != owner.Name
 	})
@@ -488,15 +497,17 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 	if _, ok := firstEvent(owner, "destroy", "pp-dual"); !ok {
 		t.Fatalf("%s stopped pp-dual without a destroy", owner.Name)
 	}
-	cond, ok, err := corrosion.GetHealthCondition(ctx, owner.DB, corrosion.PartitionPauseEvaluator,
-		corrosion.CondVMSettled, "vm", "pp-dual@"+owner.Name)
-	if err != nil || !ok || cond.Lifecycle != corrosion.ConditionConfirmed {
-		t.Fatalf("vm_settled on %s = (%+v, %v, %v)", owner.Name, cond, ok, err)
-	}
-	rows, err := owner.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'pp-dual'`)
-	if err != nil || len(rows) == 0 {
-		t.Fatalf("no partition.settle audit row on %s: %v", owner.Name, err)
-	}
+	// The settle writes its audit row and condition just after the destroy
+	// that the wait above observed.
+	eventually(t, 30*time.Second, "vm_settled and the partition.settle audit row on "+owner.Name, func() bool {
+		cond, ok, err := corrosion.GetHealthCondition(ctx, owner.DB, corrosion.PartitionPauseEvaluator,
+			corrosion.CondVMSettled, "vm", "pp-dual@"+owner.Name)
+		if err != nil || !ok || cond.Lifecycle != corrosion.ConditionConfirmed {
+			return false
+		}
+		rows, err := owner.DB.Query(ctx, `SELECT detail FROM audit_log WHERE action = 'partition.settle' AND target = 'pp-dual'`)
+		return err == nil && len(rows) > 0
+	})
 }
 
 // TestFleet_PartitionPause_FleetWideBlipPausesThenResumesEverything: every

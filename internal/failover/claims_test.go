@@ -19,6 +19,8 @@ type fakeClaimer struct {
 	abandonAsked []string
 	decide       func(key corrosion.ClaimKey, proposal corrosion.ClaimValue) (claims.Outcome, error)
 	abandon      func(host string, key corrosion.ClaimKey, proofID string) (string, error)
+	// foreign answers RequestForeignAbandonment; nil refuses.
+	foreign func(host string, key corrosion.ClaimKey, proofID string) (string, error)
 }
 
 var errNoAbandonment = errors.New("the destination refused to abandon")
@@ -37,6 +39,13 @@ func (f *fakeClaimer) RequestAbandonment(_ context.Context, host string, key cor
 	f.abandonAsked = append(f.abandonAsked, host+"/"+proofID)
 	if f.abandon != nil {
 		return f.abandon(host, key, proofID)
+	}
+	return "", errNoAbandonment
+}
+
+func (f *fakeClaimer) RequestForeignAbandonment(_ context.Context, host string, key corrosion.ClaimKey, proofID, _ string) (string, error) {
+	if f.foreign != nil {
+		return f.foreign(host, key, proofID)
 	}
 	return "", errNoAbandonment
 }

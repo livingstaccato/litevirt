@@ -50,6 +50,11 @@ type RecoveryClaimer interface {
 	// here: scoped to the incarnation once claim_incarnation_v1 has latched,
 	// the legacy key before (§10 item 37).
 	ClaimKeyFor(ctx context.Context, kind, name string, epoch int64, incarnation string) corrosion.ClaimKey
+	// RequestForeignAbandonment asks host to sign, from its own database,
+	// that proofID is not the decision of the incarnation key names and will
+	// never run (corrosion.AbandonForeignProof), returning the encoded
+	// abandonment. It refuses whatever host cannot show.
+	RequestForeignAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string) (string, error)
 }
 
 // maxClaimAttempts bounds how far one claimRecovery walks a key's attempts.
@@ -157,6 +162,19 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 		}
 		next := c.supersedeEvidence(ctx, key, out, cl.Proof, proposal)
 		if next == nil {
+			if key.Incarnation != "" && c.proofSpent(ctx, cl.Proof.ID) {
+				// Decided, and its proof can never run again: a decision the
+				// legacy-key bridge adopted because its destination could not
+				// show in time that it was another incarnation's (§10 item
+				// 37). Writing it would point the workload at a proof that
+				// never executes, off its failed host and out of every later
+				// recovery; refuse, and the next tick asks the destination
+				// again.
+				err := &ClaimRefusedError{Key: key, Reason: health.ReasonClaimLost, Result: ResultLost,
+					Detail: fmt.Sprintf("%s decided proof %s, which has already run or failed; waiting for %s to show it "+
+						"was not this incarnation's (ha.claim.legacy_held)", key, cl.Proof.ID, cl.Proof.DestHost)}
+				return claimedProof{Key: key}, err
+			}
 			return cl, nil
 		}
 		slog.Warn("failover: a decided recovery will never execute; moving the claim to the next attempt",
@@ -194,12 +212,34 @@ func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.Claim
 		ev.Abandonment = ab
 		return ev
 	}
+	// A decided proof that is already spent, at an incarnation-scoped key: it
+	// can never run again, and the legacy-key bridge may have adopted it from
+	// a previous incarnation of the name (§10 item 37). The destination that
+	// ran or failed it can show, from its own database, that it did not move
+	// this incarnation; it signs that, and the claim moves on.
+	if key.Incarnation != "" && c.proofSpent(ctx, decided.ID) {
+		ab, err := c.Claimer.RequestForeignAbandonment(ctx, dest, key, decided.ID,
+			"a spent decision that is not "+key.String()+"'s")
+		if err == nil {
+			ev.Abandonment = ab
+			return ev
+		}
+		slog.Warn("failover: the destination of a spent decided proof did not show it is another incarnation's",
+			"key", key.String(), "dest", dest, "proof", decided.ID, "error", err)
+	}
 	// A destination removed for good (`lv host rm --dead`): voters check the
 	// fence, the removal and the revocation in their own replicas.
 	if h, err := corrosion.GetHost(ctx, c.db, dest); err == nil && h == nil {
 		return ev
 	}
 	return nil
+}
+
+// proofSpent reports whether this replica holds proofID completed or failed:
+// single use, so it never executes again.
+func (c *Coordinator) proofSpent(ctx context.Context, proofID string) bool {
+	pr, ok, err := corrosion.GetActionProof(ctx, c.db, proofID)
+	return err == nil && ok && (pr.Status == corrosion.ProofCompleted || pr.Status == corrosion.ProofFailed)
 }
 
 // claimAttempt runs one claim at key (attempt included).

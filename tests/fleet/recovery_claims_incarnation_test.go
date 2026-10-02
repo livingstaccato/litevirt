@@ -468,7 +468,7 @@ func runPreviousIncarnationLeftBehind(t *testing.T, blocked bool) {
 	c.WaitConverged(t, convergeTimeout, alive...)
 
 	latchIncarnation(c, true)
-	failHost(t, c, clock, dead, second)
+	alive = failHost(t, c, clock, dead, second)
 	if blocked {
 		if dest1 == a {
 			t.Fatalf("the scenario needs the first decision's destination to be a peer of the coordinator, got %s", dest1.Name)
@@ -479,11 +479,17 @@ func runPreviousIncarnationLeftBehind(t *testing.T, blocked bool) {
 		if v := vmOn(t, a, name); v.HostName != second.Name || v.PendingActionID != "" {
 			t.Fatalf("a fresh value was decided beside a legacy decision nobody excluded: %+v", v)
 		}
+		// The condition is a replicated row: the lease holder's tick keeps it
+		// while the workload is held, and every replica holds it.
 		a.Server.RecoveryClaimHealthTick(ctx)
-		row, found, err := corrosion.GetHealthCondition(ctx, a.DB, "recovery_claim", "ha.claim.legacy_held", "cluster", "claims")
-		if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved ||
-			!strings.Contains(row.Evidence, name) || !strings.Contains(row.Evidence, firstProof) {
-			t.Fatalf("ha.claim.legacy_held does not name %s and proof %s: found=%v err=%v %+v", name, firstProof, found, err, row)
+		c.WaitConvergedExcept(t, convergeTimeout, []string{"leader_lease_terms"}, alive...)
+		for _, n := range alive {
+			row, found, err := corrosion.GetHealthCondition(ctx, n.DB, "recovery_claim", "ha.claim.legacy_held", "vm", name)
+			if err != nil || !found || row.Lifecycle == corrosion.ConditionResolved ||
+				!strings.Contains(row.Evidence, firstProof) || !strings.Contains(row.Evidence, "enforcement.recovery_claim") {
+				t.Fatalf("%s: ha.claim.legacy_held does not name %s, proof %s and its escape: found=%v err=%v %+v",
+					n.Name, name, firstProof, found, err, row)
+			}
 		}
 		restore()
 	}
@@ -498,6 +504,13 @@ func runPreviousIncarnationLeftBehind(t *testing.T, blocked bool) {
 		t.Fatalf("read the new proof: ok=%v err=%v", ok, err)
 	}
 	assertFreshIncarnationClaim(t, a, pr.ActionProof, vm.CreatedAt)
+	if blocked {
+		a.Server.RecoveryClaimHealthTick(ctx)
+		if row, found, _ := corrosion.GetHealthCondition(ctx, a.DB, "recovery_claim", "ha.claim.legacy_held", "vm", name); !found ||
+			row.Lifecycle != corrosion.ConditionResolved {
+			t.Fatalf("ha.claim.legacy_held did not resolve once the workload was recovered: %+v", row)
+		}
+	}
 	if ok, _ := dest1.DB.ProofAbandoned(ctx, firstProof); !ok {
 		t.Fatalf("%s decided a fresh value, but %s never abandoned the first decision %s", a.Name, dest1.Name, firstProof)
 	}
@@ -643,5 +656,131 @@ func TestFleet_RecoveryClaim_ASpentDecisionOfAPreviousIncarnationDoesNotWedge(t 
 	}
 	if ok, _ := dest.DB.ProofAbandoned(ctx, spent); !ok {
 		t.Fatalf("%s did not record that A's decision %s is excluded", dest.Name, spent)
+	}
+}
+
+// TestFleet_RecoveryClaim_AnAdoptedSpentDecisionMovesOnOnceItsDestinationAnswers
+// is the round-3 review sequence. Before the latch, A's recovery decision V
+// ran and completed on D. A is deleted and B re-created on A's old source
+// host S, at the same epoch. After the latch, S fails while D cannot answer
+// the bridge's exclusion. V is adopted, and its voters re-accept it — same
+// source, no probe — so V is DECIDED at B's scoped key. V can never run
+// again, so:
+//
+//   - the coordinator does not point B at it (B would leave every later
+//     recovery for a proof that never executes), and retries;
+//   - ha.claim.legacy_held stays raised, though the key decided;
+//   - once D answers, the next tick moves the claim to attempt 1 on D's
+//     foreign abandonment, and B is recovered; the condition then resolves.
+//
+// Mutations: write a decided spent proof (drop the proofSpent refusal in
+// claimRecovery) — B is pointed at V and never recovered; drop the spent arm
+// of supersedeEvidence — B waits behind V for good; resolve the condition when
+// the key decides — it clears while B is held.
+func TestFleet_RecoveryClaim_AnAdoptedSpentDecisionMovesOnOnceItsDestinationAnswers(t *testing.T) {
+	ctx := context.Background()
+	const name = "claimvm"
+	c, cs, clock := incarnationFleet(t, 2567, func(_ *Cluster, a, victim *Node) {
+		insertVM(t, a, name, victim.Name)
+		if err := corrosion.InsertVM(ctx, a.DB, corrosion.VMRecord{Name: "full-" + a.Name, HostName: a.Name,
+			Spec: `{}`, State: "running", CPUActual: 64, MemActual: 262144}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	})
+	latchIncarnation(c, false)
+	a, source := c.Nodes[0], c.Nodes[4]
+	dead := map[string]bool{}
+
+	// A: recovered from S under a legacy claim to D, and run there.
+	alive := failHost(t, c, clock, dead, source)
+	cs.Tick(ctx, a)
+	vm := vmOn(t, a, name)
+	if vm.PendingActionID == "" || vm.HostName == source.Name {
+		t.Fatalf("A was not recovered under a legacy claim: %+v", vm)
+	}
+	spent := vm.PendingActionID
+	d := c.Node(vm.HostName)
+	if d == a {
+		t.Fatalf("the scenario needs D to be a peer of the coordinator, got %s", d.Name)
+	}
+	c.WaitConverged(t, convergeTimeout, alive...)
+	claimReconciler(t, d).ReconcileOnce(ctx)
+	c.WaitConverged(t, convergeTimeout, alive...)
+	if pr, ok, _ := corrosion.GetActionProof(ctx, a.DB, spent); !ok || pr.Status != corrosion.ProofCompleted {
+		t.Fatalf("A's decision did not complete: %+v", pr)
+	}
+
+	// A deleted; S back; B re-created on S at the same epoch.
+	mustDeleteVM(t, d, name)
+	c.ClearLinkFaults()
+	delete(dead, source.Name)
+	if err := corrosion.UpdateHostState(ctx, a.DB, source.Name, "active"); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range c.Nodes {
+		PublishHealth(t, n, source.Name, 0, clock.Now())
+	}
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"leader_lease_terms", "health_conditions", "host_health"})
+	insertVM(t, a, name, source.Name)
+	c.WaitConvergedExcept(t, convergeTimeout, []string{"leader_lease_terms", "health_conditions", "host_health"})
+	if got := vmOn(t, a, name).OwnerEpoch; got != 0 {
+		t.Fatalf("B starts at epoch %d; the scenario needs the collision at 0", got)
+	}
+
+	// The latch forms; S fails again while D cannot answer the exclusion.
+	latchIncarnation(c, true)
+	// Past the coordinator's recent-fence window, so S's second failure is a
+	// failure of its own rather than the first one's fence.
+	clock.Advance(6 * time.Minute)
+	alive = failHost(t, c, clock, dead, source)
+	restore := d.DoNotImplement("AbandonRecoveryProof")
+	cs2 := probeCoordinator(c, clock, a)
+	clock.Advance(contentionPoll)
+	cs2.Tick(ctx, a)
+	b := vmOn(t, a, name)
+	if b.HostName != source.Name || b.PendingActionID != "" {
+		t.Fatalf("B was pointed at a decision that can never run: %+v", b)
+	}
+	key := corrosion.ClaimKey{TargetKind: corrosion.ClaimKindVM, TargetName: name, OwnerEpoch: 0, Incarnation: b.CreatedAt}
+	if st := voterState(t, a, key); st.Value == nil || st.Value.Proof.ID != spent {
+		t.Fatalf("the scenario needs V decided at B's scoped key; a holds %+v", st)
+	}
+	a.Server.RecoveryClaimHealthTick(ctx)
+	if row, found, _ := corrosion.GetHealthCondition(ctx, a.DB, "recovery_claim", "ha.claim.legacy_held", "vm", name); !found ||
+		row.Lifecycle == corrosion.ConditionResolved || !strings.Contains(row.Evidence, spent) {
+		t.Fatalf("ha.claim.legacy_held is not raised while B is held behind the decided spent proof: %+v", row)
+	}
+
+	// D answers: the claim moves past V.
+	restore()
+	clock.Advance(contentionPoll)
+	cs2.Tick(ctx, a)
+	b = vmOn(t, a, name)
+	if b.PendingActionID == "" || b.PendingActionID == spent || b.HostName == source.Name {
+		t.Fatalf("B was not recovered once D answered: %+v", b)
+	}
+	pr, ok, err := corrosion.GetActionProof(ctx, a.DB, b.PendingActionID)
+	if err != nil || !ok {
+		t.Fatalf("read B's proof: %v", err)
+	}
+	cert, err := corrosion.DecodeClaimCertificate(pr.ClaimCertificate)
+	if err != nil || cert.Key.Attempt != 1 || cert.Key.Incarnation != b.CreatedAt {
+		t.Fatalf("B's certificate decides %s (%v), want attempt 1 of its incarnation", cert.Key, err)
+	}
+	a.Server.RecoveryClaimHealthTick(ctx)
+	if row, found, _ := corrosion.GetHealthCondition(ctx, a.DB, "recovery_claim", "ha.claim.legacy_held", "vm", name); !found ||
+		row.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("ha.claim.legacy_held did not resolve once B was recovered: %+v", row)
+	}
+	c.WaitConverged(t, convergeTimeout, alive...)
+	claimReconciler(t, c.Node(b.HostName)).ReconcileOnce(ctx)
+	owners := 0
+	for _, n := range alive {
+		if st, _ := n.Virt.DomainState(name); st == string(libvirtfake.StateRunning) {
+			owners++
+		}
+	}
+	if owners != 1 {
+		t.Fatalf("%d owners of B after its recovery, want 1", owners)
 	}
 }

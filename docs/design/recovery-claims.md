@@ -1929,7 +1929,18 @@ where it described the mechanism; this list records what changed and why.
       value is adopted, as the legacy key itself did: ambiguity costs
       liveness, never a second decision. If its voters then refuse it, the
       recovery waits, and `ha.claim.legacy_held` names the workload, the
-      decision and why it could not be excluded. While the destination
+      decision and why it could not be excluded. If they accept it, the
+      scoped key decides it; a decided proof that has already run or failed
+      is never written (it would take the workload off its failed host for a
+      proof that never executes), and the coordinator's supersede asks the
+      destination for the same foreign abandonment, which moves the claim to
+      the next attempt (`supersedeEvidence`). The condition is a replicated
+      per-workload row, written by the deciding node and resolved only by the
+      lease holder once the workload's own rows show it has moved on, so it
+      neither clears because the key decided nor lives in one node's memory.
+      A proof left in flight on a live destination cannot be excluded; the
+      condition names the cluster-wide stand-down
+      (`enforcement.recovery_claim: false`) for it. While the destination
       answers, the next tick decides; if it is gone for good,
       `lv host rm --dead` releases it. This incarnation's completed decision
       is never excluded (its row is past the epoch at its destination), so a

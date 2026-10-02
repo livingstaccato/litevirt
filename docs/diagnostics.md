@@ -1159,8 +1159,11 @@ back on.
 
 ### A recovery held by a decision made before the claim key changed (`ha.claim.legacy_held`)
 
-Evaluator `recovery_claim`, subject `cluster/claims`, severity warning. Written
-by the leader-lease holder while recovery claims are enforced. After
+Evaluator `recovery_claim`, subject `vm/<name>` or `container/<name>`, severity
+warning. Written by the node whose claim re-proposed the decision, as a
+replicated row, so a restart or a lease hand-off keeps it; resolved by the
+leader-lease holder once the workload has moved on (a fresh decision, a later
+owner epoch, or the workload deleted). After
 `claim_incarnation_v1` latches, a recovery claim names the workload's
 incarnation. A decision some voter accepted at the old, unscoped key for the
 same name and owner epoch may belong to this workload or to an earlier one
@@ -1172,9 +1175,14 @@ it. If the voters then refuse it, for example because it names an earlier
 workload's owner, the recovery waits and this condition names the workload, the
 decision's proof, destination and source, and why it could not be excluded.
 
-While the destination answers, it decides on the next tick. If the destination
-is gone for good, `lv host rm --dead <host>` (after a proof-grade fence)
-releases the decision. See
+The condition stays raised even when the old decision is decided at the new
+key: a decision whose proof has already run or failed can never run again, so
+the coordinator does not point the workload at it, and asks the destination
+again on the next tick. While the destination answers, the next tick moves the
+claim on. If the destination is gone for good, `lv host rm --dead <host>`
+(after a proof-grade fence) releases the decision. If its proof is stuck in
+flight on a live destination, set `enforcement.recovery_claim: false` on every
+host until the workload has recovered, then turn it back on. See
 [design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
 
 ### Deferred out-of-band stop sync after a restart or rejoin

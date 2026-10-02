@@ -175,6 +175,14 @@ func (s *Server) RequestAbandonment(ctx context.Context, host string, key corros
 	return s.requestAbandonment(ctx, host, key, proofID, reason, false)
 }
 
+// RequestForeignAbandonment asks host to sign that proofID is not the
+// decision of the incarnation key names and will never run
+// (corrosion.AbandonForeignProof). The coordinator moves a scoped claim past
+// a spent decided proof on it (§10 item 37).
+func (s *Server) RequestForeignAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string) (string, error) {
+	return s.requestAbandonment(ctx, host, key, proofID, reason, true)
+}
+
 // requestAbandonment is RequestAbandonment, with foreignOnly asking for the
 // legacy-key bridge's exclusion (corrosion.AbandonForeignProof) instead.
 func (s *Server) requestAbandonment(ctx context.Context, host string, key corrosion.ClaimKey, proofID, reason string, foreignOnly bool) (string, error) {
@@ -413,12 +421,10 @@ func (s *Server) RecoveryClaimHealthTick(ctx context.Context) {
 	if !s.RecoveryClaimEnforced(ctx) {
 		s.applyClusterCondition(ctx, claimEvaluator, condClaimStranded, claimConditionSubjct, nil, nil, "")
 		s.applyClusterCondition(ctx, claimEvaluator, condClaimUncertified, claimConditionSubjct, nil, nil, "")
-		s.applyClusterCondition(ctx, claimEvaluator, condClaimLegacyHeld, claimConditionSubjct, nil, nil, "")
+		s.resolveLegacyHeld(ctx, true)
 		return
 	}
-	held, heldDests := s.legacyHeldLines()
-	s.applyClusterCondition(ctx, claimEvaluator, condClaimLegacyHeld, claimConditionSubjct, held, heldDests,
-		"recoveries held by a decision made before claim_incarnation_v1 latched: ")
+	s.resolveLegacyHeld(ctx, false)
 	if waiting, err := s.uncertifiedClaims(ctx); err != nil {
 		slog.Warn("recovery claims: evaluate uncertified proofs", "error", err)
 	} else {

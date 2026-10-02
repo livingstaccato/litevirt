@@ -7,6 +7,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // seedLease writes the failover lease with an explicit holder and expiry.
@@ -444,8 +445,12 @@ func TestRun_OriginalLeaderResumesItsOwnUnfinishedRecovery(t *testing.T) {
 	ctx := context.Background()
 
 	// The successor never runs; the lease simply expires back to whoever asks.
+	// The observers have kept probing "bad" and failing since before the fence,
+	// so their runs have grown with the clock: without that the fence would not
+	// still stand, and the coordinator would re-fence rather than resume.
 	*now = now.Add(leaseDuration + time.Second)
-	if err := db.Execute(ctx, `UPDATE host_health SET updated_at = ?`, now.Format(time.RFC3339)); err != nil {
+	if err := db.Execute(ctx, `UPDATE host_health SET updated_at = ?, consecutive_failures = ?`,
+		now.Format(time.RFC3339), int((leaseDuration+time.Minute)/health.ProbeInterval)); err != nil {
 		t.Fatalf("refresh health: %v", err)
 	}
 	first.RunOnce(ctx)

@@ -328,7 +328,9 @@ func TestFleet_PartitionPause_MinorityPausesBeforeTheMajorityRecovers(t *testing
 	genesisByTick(t, c, c.Nodes[2])
 	enableRecoveryClaims(t, c)
 
-	s := newPPStack(t, c, ppOpts{latched: true})
+	// One coordinator decides, as one lease holder did in drill 1 (see
+	// ppOpts.coordinators); the blip scenario runs one on every node.
+	s := newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{c.Nodes[2].Name: true}})
 	rs := sampleRunning(t, c, "pp-vm")
 
 	minority, majority := c.Nodes[:2], c.Nodes[2:]

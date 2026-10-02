@@ -22,9 +22,10 @@ func TestHostDTO_DiskUsedAndTotalShareABasis(t *testing.T) {
 	const gib = int64(1024 * 1024 * 1024)
 
 	h := &pb.Host{
-		Name:         "node1",
-		DiskTotalGib: 100,
-		DiskUsedGib:  98, // allocated: three thin 32 GiB disks
+		Name:             "node1",
+		DiskTotalGib:     100,
+		DiskUsedGib:      27,
+		DiskAllocatedGib: 98, // three thin 32 GiB disks
 		StoragePools: []*pb.StoragePool{
 			{Name: "default", Target: "/var/lib/litevirt", TotalBytes: 100 * gib, UsedBytes: 27 * gib},
 		},
@@ -41,7 +42,8 @@ func TestHostDTO_DiskUsedAndTotalShareABasis(t *testing.T) {
 		t.Errorf("disk_total_gib = %d, want 100", out.DiskTotalGiB)
 	}
 	if out.DiskAllocatedGiB != 98 {
-		t.Errorf("disk_allocated_gib = %d, want 98 — allocation must stay reported, under its own name",
+		t.Errorf("disk_allocated_gib = %d, want 98 — allocation must stay reported, under its own name, "+
+			"read from pb.Host.disk_allocated_gib (disk_used_gib is statfs usage since colonelpanik/litevirt#142)",
 			out.DiskAllocatedGiB)
 	}
 }
@@ -70,7 +72,7 @@ func TestHostDTO_PoolsSharingATargetCountOnce(t *testing.T) {
 // invite a divide-by-zero or a false "0% used". It falls back to the host
 // record's registration figure, which is the same statfs basis.
 func TestHostDTO_NoPoolsFallsBackToTheRegisteredTotal(t *testing.T) {
-	h := &pb.Host{Name: "node1", DiskTotalGib: 100, DiskUsedGib: 98}
+	h := &pb.Host{Name: "node1", DiskTotalGib: 100, DiskAllocatedGib: 98}
 
 	out := hostDTO(h)
 	if out.DiskTotalGiB != 100 {

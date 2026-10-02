@@ -338,6 +338,10 @@ the host again. The resume requires:
    has probed the host and failed without a break since before it. In both cases
    no observer may have seen the host answer (healthy or unready) since the fence.
 
+The safe-fence policy is decided by the recorded fence, not by the host's
+current strategy: an `ssh` fence on record is treated as best-effort under the
+policy, even if the host has since been switched to `ipmi`.
+
 There is no age limit beyond that. A power-off that nothing has contradicted is
 still authority an hour later. A fence that no longer stands is logged once, as
 "the recorded fence of this host no longer stands", and the workloads stay where

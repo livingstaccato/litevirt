@@ -670,7 +670,7 @@ func (c *Coordinator) run(ctx context.Context) {
 				slog.Info("failover: resuming recovery from a fence a previous leader recorded",
 					"host", target, "fence_id", rec.ID, "method", rec.Method)
 				c.mAttempt(PhaseRecovery, ResultOK, ErrRecoveryResumed)
-				c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail})
+				c.recoverFenced(ctx, h, fence.Result{Success: true, Method: rec.Method, Detail: rec.Detail}, "")
 				continue
 			}
 			// The other way a stranded recovery can be resumed: a refusal for
@@ -1911,7 +1911,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) {
 	// recoverHosts reads as manual-undrain-only. See recoverHosts.
 	c.fenceRelocated[h.Name] = false
 
-	c.recoverFenced(ctx, h, fr)
+	c.recoverFenced(ctx, h, fr, h.FenceStrategy)
 }
 
 // writeFenceLog records a fence's fencing_log row on its own, surfacing a
@@ -1938,6 +1938,32 @@ func fenceProvedOff(h *corrosion.HostRecord, fr fence.Result) bool {
 		return fr.Success && corrosion.FenceProofGrade(fr.Method, "fenced")
 	}
 	return fr.Success && fr.Method != "manual"
+}
+
+// fenceWasBestEffort reports whether a fence reporting method, run under
+// strategy ranUnder, was a best-effort one — the class the safe-fence policy
+// gates.
+//
+// It is keyed on the fence, never on the host's current strategy. A resumed
+// recovery acts on a fence recorded earlier, and an operator can have changed
+// the host's strategy since: keyed on the strategy, a best-effort fence
+// followed by a switch to ipmi skipped the safe-fence confirmation entirely.
+//
+// The method alone cannot always tell: best-effort's proceed-after-failure
+// reports "best-effort-ssh", but its lenient success reports "ssh", exactly
+// like the ssh strategy's. So when the strategy the fence ran under is known
+// (a live fence) it decides; when it is not (a resume, ranUnder ""), an "ssh"
+// fence is taken to be best-effort. That makes a resumed ssh-strategy recovery
+// under the policy wait for a confirmation it would not have needed live — the
+// safe direction.
+func fenceWasBestEffort(method, ranUnder string) bool {
+	if method == "best-effort-ssh" {
+		return true
+	}
+	if ranUnder != "" {
+		return fence.ResolveStrategy(ranUnder) == "best-effort"
+	}
+	return method == "ssh"
 }
 
 // requiresFenceConfirmation reports whether h has opted into "an unverified
@@ -1975,8 +2001,11 @@ func (c *Coordinator) markHostState(ctx context.Context, host, state string) {
 //
 // fr is the fence this recovery acts on: the live result when called straight
 // from failover, or one reconstructed from the recorded fence when resuming.
+// ranUnder is the fence strategy fr ran under: the host's strategy at the
+// moment of a live fence, or "" when resuming, because the host's strategy
+// NOW says nothing about the fence on record (see fenceWasBestEffort).
 // The caller must hold the failover lease.
-func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord, fr fence.Result) {
+func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord, fr fence.Result, ranUnder string) {
 	// Mark the host handled for this down-episode before any early return, so a
 	// resumed recovery does not re-enter on every cycle. Note that
 	// c.fenceRelocated is deliberately NOT seeded here: it means "THIS
@@ -2002,7 +2031,7 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 	// is treated like "manual": reschedule only with an operator fence-confirm,
 	// unless the host explicitly opts into legacy proceed-anyway. Pre-flip (token
 	// not enforced) this is a no-op, so a mixed-version roll keeps today's behavior.
-	if fence.ResolveStrategy(h.FenceStrategy) == "best-effort" && c.safeFenceRequiresProof(ctx, h) {
+	if fenceWasBestEffort(fr.Method, ranUnder) && c.safeFenceRequiresProof(ctx, h) {
 		if !c.manualFenceConfirmed(ctx, h.Name) {
 			slog.Error("failover: best-effort fence unconfirmed under safe-fence policy, NOT rescheduling",
 				"host", h.Name, "detail", fr.Detail,

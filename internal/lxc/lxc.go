@@ -581,6 +581,17 @@ func (r *LxcRunner) Freeze(ctx context.Context, name string) error {
 	return nil
 }
 
+// IsFrozen reports whether a container is FROZEN, which State folds into
+// running. The partition pauser uses it to leave a container someone else
+// froze alone (docs/design/partition-pause.md §3.3).
+func (r *LxcRunner) IsFrozen(ctx context.Context, name string) (bool, error) {
+	out, _, err := r.run(ctx, "lxc-info", "-n", name, "-s", "-H")
+	if err != nil {
+		return false, err
+	}
+	return strings.EqualFold(strings.TrimSpace(string(out)), "frozen"), nil
+}
+
 // Unfreeze resumes a frozen container (lxc-unfreeze).
 func (r *LxcRunner) Unfreeze(ctx context.Context, name string) error {
 	if _, stderr, err := r.run(ctx, "lxc-unfreeze", "-n", name); err != nil {

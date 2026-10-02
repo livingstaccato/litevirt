@@ -924,6 +924,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (split_brain_gate_v1 latched, able to vote durably), enforced only with
 	// the flag AND the latch AND an adopted voter generation.
 	svc.SetRecoveryClaimEnforce(d.cfg.Enforcement.RecoveryClaim)
+	// partition_pause_v1: advertised only with enforcement.partition_pause on
+	// (default on), because the majority relies on this node pausing.
+	svc.SetPartitionPause(d.cfg.Enforcement.PartitionPause)
 	// The reconciler is the SECOND executor boundary for this regime: a VM
 	// reschedule proof never travels over an RPC, so it is claimed off the
 	// replicated row there rather than in claimCarriedProof. The judgment is
@@ -1153,6 +1156,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// raise ha_degraded against it.
 	svc.SetWALQuarantined(func() bool { return len(d.rolledBackTokens) > 0 })
 	go vipDemoter.Start(ctx)
+	// Partition pause (docs/design/partition-pause.md): on losing the execution
+	// quorum for T_pause, suspend/freeze every workload the majority would
+	// recover elsewhere, recorded under <data_dir>/partition-pause; resume on a
+	// majority's confirmation. Runs on the flag alone — a node advertises
+	// partition_pause_v1 only while it already acts on it — and whether or not
+	// a watchdog is armed; a verified watchdog is only the backstop for a
+	// pause that fails.
+	pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
+	pauser.SetQuorum(d.checker.ExecutionQuorum)
+	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
+	pauser.SetVMBackend(d.virt)
+	pauser.SetContainerRuntime(lxcRunner)
+	pauser.SetResumeConfirmer(svc.ConfirmPartitionResume)
+	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
+	go pauser.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
 	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
@@ -1348,6 +1366,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// The recovery-claim health conditions (ha.claim.stranded,
 	// ha.voter.unavailable) are the lease holder's to write, like genesis.
 	fc.ClaimHealth = svc.RecoveryClaimHealthTick
+	// Partition pause, the majority side: rely on a host's pause only with this
+	// node's flag on AND partition_pause_v1 latched (every voter pauses), and
+	// anchor the deadline on the later of the decision and the last contact.
+	fc.PartitionPauseEnforced = func(ctx context.Context) bool {
+		return d.cfg.Enforcement.PartitionPause && d.checker.Enforced(ctx, capabilities.PartitionPauseV1)
+	}
+	fc.LastContact = d.checker.LastContact
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is

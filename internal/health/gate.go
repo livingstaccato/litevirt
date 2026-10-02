@@ -369,3 +369,35 @@ func (c *Checker) decisionGate(ctx context.Context, quorum func() QuorumState) G
 	}
 	return gateOK()
 }
+
+// ExecutionQuorum is executionQuorum with the live/needed counts: the quorum
+// that may fence this host and recover its workloads — cluster-wide, or this
+// host's region's under region-scoped failover. The partition pauser runs on
+// it (docs/design/partition-pause.md §3.1).
+func (c *Checker) ExecutionQuorum(ctx context.Context) (QuorumState, int, int) {
+	scope, err := corrosion.GetFailoverScope(ctx, c.db)
+	if err != nil {
+		return QuorumNo, 0, 0
+	}
+	if !scope.Region() {
+		return c.QuorumProof(ctx)
+	}
+	vr, err := corrosion.VoterRegions(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown, 0, 0
+	}
+	return c.quorumOver(vr.In(vr.Region(c.hostName)))
+}
+
+// LastContact reports when this daemon last probed host healthy, on its local
+// monotonic clock (false: not this run). The failover coordinator anchors a
+// partition-pause deadline on the later of this and its decision.
+func (c *Checker) LastContact(host string) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ps, ok := c.peers[host]
+	if !ok || ps.lastHealthyAt.IsZero() {
+		return time.Time{}, false
+	}
+	return ps.lastHealthyAt, true
+}

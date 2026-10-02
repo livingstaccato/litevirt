@@ -289,11 +289,17 @@ partition-pause: workload stays paused kind=vm name=d1a reason="voter node-4 has
 
 **Minority detection, `D_M`.** Let `b` be the moment the link from the
 minority host M to a majority voter V breaks. M's first probe of V that starts
-after `b` starts within one cycle. Three consecutive failures complete at most
-`k·C + τ` later, which here is `3·3 + 3 = 12 s`. At that point V is no longer
-`healthy` in M's view. That holds for up to `probeConcurrency` (16) peers. A
-voter set larger than 17 multiplies `C` by the number of probe batches; §7 F5
-covers this.
+after `b` starts within one cycle, and each later cycle starts within one
+cycle of the last. The third consecutive failure therefore completes by the end
+of its own cycle: at most `(k+1)·C` after `b`, which here is `4·3 = 12 s`. At
+that point V is no longer `healthy` in M's view.
+
+`C` grows with the number of peers M probes. A cycle waits for its slowest
+probe, with at most `probeConcurrency` (16) in flight, so with `n` probe
+targets a cycle lasts at most `C(n) = max(P, ⌈n/16⌉·τ)`. A voter probes every
+non-maintenance host (`probePlan`), so `n` is the number of non-maintenance
+hosts minus one, not just the voters minus one. §4.1's numbers are for
+`n ≤ 16`. §4.4 scales them.
 
 A stall of M's checker does not lengthen `D_M`. `quorumOver` refuses to count a
 peer last seen healthy before the stall (stall.go), so a stall makes the quorum
@@ -347,17 +353,18 @@ coordinator probed M healthy after the quorum formed, and taking the max keeps
 that case safe too. "Measured from the last successful contact" therefore
 means: from the latest instant the majority can prove M was still in contact.
 
-**What it costs.** On the lab, quorum came 23 s after the partition and d1a
-started 10 s later. With Layer 2 latched it starts no earlier than
-`t_d + 23 s`, so about 33 s after the partition instead of 10.
+**What it costs.** On the lab, quorum came 23 s after the partition
+(`t_d` ≈ +23 s) and d1a started 10 s after that, at about +33 s. With Layer 2
+latched it starts no earlier than `t_d + W` = `t_d + 23 s`, so at about +46 s
+after the partition instead of +33 s.
 
 All of these values are constants in `internal/health/partition_pause.go`.
 `TestPartitionPauseWaitCoversTheMinority` pins the inequality
-`W ≥ max(0, D_M − (F−1)·P) + 2Δ + E + T_pause` against the live constants, so
-retuning a probe constant cannot silently break it. None of them is a config
-key. The majority computes `W` from the same constants the minority runs on,
-and a per-node knob would break that contract on the first node set
-differently.
+`W(n) ≥ max(0, D_M(n) − (F−1)·P) + 2Δ + E + T_pause + slack` against the live
+constants, for 5, 17, 18 and 40 hosts, so retuning a probe constant cannot
+silently break it. None of them is a config key. The majority computes `W` from
+the same constants the minority runs on, and a per-node knob would break that
+contract on the first node set differently.
 
 ### 4.2 Where the wait sits
 
@@ -404,6 +411,39 @@ All three of these must hold:
 
 Otherwise the coordinator does exactly what it does today, and records
 `assumed`.
+
+### 4.4 More than 17 hosts
+
+The coordinator computes `W` for the cluster it is deciding about, not for a
+fixed size (`health.PartitionPauseWaitFor(n)`):
+
+```
+C(n)   = max(P, ⌈n/16⌉·τ)
+D_M(n) = (k+1)·C(n)
+W(n)   = T_pause + max(0, D_M(n) − (F−1)·P) + 2Δ + E + slack
+```
+
+| Hosts | Probe targets `n` | `C(n)` | `D_M(n)` | `W(n)` |
+|---|---|---|---|---|
+| 5 | 4 | 3 s | 12 s | 23 s |
+| 17 | 16 | 3 s | 12 s | 23 s |
+| 18 | 17 | 6 s | 24 s | 35 s |
+| 40 | 39 | 9 s | 36 s | 47 s |
+
+**Which `n`.** The minority's probe count is what matters, and the coordinator
+cannot read it. It takes the largest count either side could be running with,
+`n = max(G_adopted, G_latest, H) − 1`:
+
+- `G_adopted` is the adopted voter generation's size, which is identical on
+  every node that adopted it.
+- `G_latest` is the newest generation in `voter_configs`, adopted or not, so a
+  generation mid-change counts at whichever size is larger.
+- `H` is the number of non-maintenance hosts in the coordinator's replica,
+  because a voter probes all of them.
+
+A host that was added inside the minority during the partition is not in the
+coordinator's replica and is not counted. That is the one gap. Adding a host
+is an operator act, and doing it inside a partition is a second fault.
 
 ## 5. Capability: `partition_pause_v1`
 
@@ -557,8 +597,8 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F1 | The minority's daemon is dead (crash, OOM, hung) | Nothing pauses. The majority still waits `W` and then recovers. | A dual run, as today. A hardware watchdog closes it, because daemon death trips it. Layer 3 settles it when the daemon returns. |
 | F2 | A suspend fails inside a full partition | The minority raises `partition_pause_failed`, retries every tick, and self-fences if a verified watchdog is armed. | Without a watchdog, the majority cannot learn of the failure until the heal, so it counts a pause that did not happen. Layer 3 settles it on return. |
 | F3 | The daemon restarts during the partition | Its loss clock starts at its own start, so it pauses at most `T_pause` + warmup after the restart. | If the restart lands after the majority's decision, the pause can miss the deadline by up to the restart's length. Layer 3 settles it. |
-| F4 | One-way partition (A→M works, M→A does not) | M can count a majority that cannot count it. | Out of scope. Mutual reachability (a probe answer that states the responder's own view of the caller) is the fix. Recorded as open. |
-| F5 | More than 17 voters | `D_M` grows by one probe batch per 16 peers. | `W` is derived for ≤ 17 voters. The pinned test fails if `probeConcurrency` changes. Larger fleets need `W` scaled; recorded as open. |
+| F4 | One-way partition (A→M works, M→A does not) | M can count a majority that cannot count it, so it may not pause while the majority fences it. The coordinator raises `partition_one_way` (evaluator `partition_pause`, subject `host/<M>`, critical) when it sees both views at once: a quorum of voters with at least `F` consecutive failures of M, and M's own rows marking enough voters healthy for a majority, each written AFTER that voter's failure streak against M began. It does not recover any differently. | Still open. The fix is mutual reachability: a probe answer that states the responder's own view of the caller. Detection is partial, because the checker does not re-stamp a steadily healthy edge. M's "healthy" rows are fresh only after a transition (a restart, or a flap), so a one-way split that starts with every edge already healthy is not seen. |
+| F5 | More than 17 hosts | `D_M` grows by one probe batch per 16 peers. | Closed: `W` is computed from the cluster's size (§4.4). The one gap is a host added inside the minority during the partition. |
 | F6 | A host comes back before the deadline | The deadline check sees fresh healthy observers (`fenceStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
 | F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
@@ -582,9 +622,10 @@ restore it.
   yes; too few answers hold.
 - **The timing inequality** (§4.1) against the live constants.
 - **Coordinator:** the `self-pause` method only when latched and assumed; the
-  wait; the deadline re-check; a host that came back; an open
-  `partition_pause_failed` falls back to `assumed`; unlatched behaviour is
-  unchanged.
+  wait, scaled by cluster size; the deadline re-check; a host that came back;
+  an open `partition_pause_failed` falls back to `assumed`; unlatched
+  behaviour is unchanged; `partition_one_way` raised on both views and not
+  on a symmetric split.
 - **Capability:** withheld while off; not mandatory; not replication-gated;
   `tokenEnabled`.
 - **Settle decision:** certificate present and verified; same incarnation;

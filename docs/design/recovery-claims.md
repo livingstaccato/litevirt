@@ -1246,6 +1246,9 @@ The kill switch follows the reversible `configFlag && latch` model described in
 - **Partial stand-down is the hazard in §5.2.** Nodes with the flag off become
   the uncertified second owner. `not_enforcing` shows them. If recovery is
   stalled on claims, first try the unblocks in §6, which keep the guarantee.
+  One workload held by `ha.claim.legacy_held` behind a proof stuck in flight
+  on a live destination is released on its own with
+  `lv cluster claim-release <kind>/<name>` (§10 item 37), not by a stand-down.
 - **The voter config is not part of the stand-down.** It is a fact the cluster
   agreed on, and `VoterSet` reads it whatever the flag says (§4.5, §9, Q4). The
   fence quorum and recovery quorum keep counting the explicit set. A voter set
@@ -1950,9 +1953,37 @@ where it described the mechanism; this list records what changed and why.
       refuses that value (`NoteLegacyHeld`): a raise whose write failed is
       retried there, and a row already open for the same decision is not
       rewritten.
-      A proof left in flight on a live destination cannot be excluded; the
-      condition names the cluster-wide stand-down
-      (`enforcement.recovery_claim: false`) for it. While the destination
+      A proof left in flight on a live destination cannot be excluded by the
+      bridge, which must not abandon what may be running. Its escape is
+      scoped to the one workload: `lv cluster claim-release <kind>/<name>`
+      (admin, `ReleaseLegacyHeldClaim`), which the condition names. It reads
+      the decision from the open condition and asks its destination for the
+      same foreign abandonment with `operator_release` set. That flag
+      overrides exactly one of `AbandonForeignProof`'s refusals — a proof the
+      destination itself claimed and left in progress, with no start
+      checkpoint (`corrosion.AbandonForeignProofInFlight`) — and only after the
+      destination has confirmed, from its own state, that nothing runs it
+      (`Server.holdWorkloadIdle`): it takes the holds every runner takes (for
+      a VM the operation lock and the per-VM start lease the reconciler holds
+      for a whole reschedule start; for a container the operation lock the
+      sweep holds through a relocation's recreate), and under them finds no
+      active domain or running container of the name. A promote holds
+      neither, but it records its start checkpoint through
+      `AppendProofStepUnlessAbandoned`, so the abandonment refuses it there,
+      and a promote past that checkpoint is never released. The abandonment
+      goes into the destination's node-local table, which every claim of the
+      proof reads in its own transaction, so no runner can take it again,
+      the destination's own resume included; the bridge's next ask is then
+      answered from that row and the claim decides afresh. A destination that
+      does not answer confirms nothing, and the command refuses and names
+      `lv host rm --dead`. Every call writes a `recovery_claim.release` audit
+      row, released or refused. The cluster-wide stand-down
+      (`enforcement.recovery_claim: false`) remains the last resort for a
+      destination that keeps refusing. A residual the release cannot close:
+      the start lease has a TTL (`vmLockTTL`, ten minutes), so a reconciler
+      wedged past it inside a start is no longer seen by the hold; it is
+      still caught by the domain check once it has defined and started a
+      domain, but not in the window before. While the destination
       answers, the next tick decides; if it is gone for good,
       `lv host rm --dead` releases it. This incarnation's completed decision
       is never excluded (its row is past the epoch at its destination), so a

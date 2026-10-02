@@ -1889,6 +1889,27 @@ message AbandonRecoveryProofRequest {
     // otherwise, so a decision of this incarnation that may still run, or
     // has run, is never abandoned by it.
     bool foreign_only    = 4;
+    // operator_release: the operator's `lv cluster claim-release` of a
+    // legacy-held claim. With foreign_only, it lets the destination abandon a
+    // proof it claimed and left in progress — the one refusal it overrides —
+    // after confirming from its own state that nothing runs it: no start path
+    // holds the workload and no live domain or container of its name exists
+    // here. Every other refusal stands.
+    bool operator_release = 5;
+}
+// ReleaseLegacyHeldClaimRequest is `lv cluster claim-release <kind>/<name>`:
+// release the decision an open ha.claim.legacy_held names for one workload,
+// stuck in flight on a live destination (docs/design/recovery-claims.md §10
+// item 37).
+message ReleaseLegacyHeldClaimRequest {
+    string kind = 1;   // vm | container
+    string name = 2;
+}
+message ReleaseLegacyHeldClaimResponse {
+    string dest_host = 1;   // the destination that signed the abandonment
+    string proof_id  = 2;   // the proof it will never run
+    string key       = 3;   // the claim key, rendered
+    string detail    = 4;
 }
 message AbandonRecoveryProofResponse {
     string abandonment = 1;  // JSON corrosion.ClaimAbandonment
@@ -3074,6 +3095,12 @@ service LiteVirt {
     // not executed, and never will, a proof a decided claim named — refused if
     // it may already have (§3.12).
     rpc AbandonRecoveryProof(AbandonRecoveryProofRequest) returns (AbandonRecoveryProofResponse);
+    // ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
+    // (admin): the decision an open ha.claim.legacy_held names, stuck in
+    // flight on a live destination, is abandoned by that destination once it
+    // has confirmed nothing there runs it. Refused when the destination does
+    // not answer; `lv host rm --dead` is the way out for a dead one.
+    rpc ReleaseLegacyHeldClaim(ReleaseLegacyHeldClaimRequest) returns (ReleaseLegacyHeldClaimResponse);
     // PlanDeadHostRemoval reports what `lv host rm --dead` would do.
     rpc PlanDeadHostRemoval(PlanDeadHostRemovalRequest) returns (PlanDeadHostRemovalResponse);
     // ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):

@@ -61,6 +61,9 @@ lv cluster voter force-reconfigure --lost a,b [--dry-run] [--yes]
                                    #   is reachable; audited, raises ha.voter.forced (§4.6 of the design)
 lv cluster claim <kind>/<name> [--epoch N]   # Every voter's recorded state for a vm/container recovery
                                    #   claim: ballots, value, destination, source, last refusal
+lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.legacy_held holds behind a
+                                   #   legacy proof stuck in flight on a live destination; the
+                                   #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 ```
 

@@ -668,9 +668,10 @@ func (s *Server) noteLegacyHeld(ctx context.Context, key corrosion.ClaimKey, v c
 	detail := fmt.Sprintf("%s/%s: its claim %s carries a decision made before claim_incarnation_v1 latched "+
 		"(proof %s, %s to %s, source %s) that cannot be shown to be another incarnation's (%s). While %s answers, the "+
 		"next tick asks it again. If %s is gone for good, `lv host rm --dead %s` releases the decision. If its proof is "+
-		"stuck in flight on a live %s, stand recovery claims down with enforcement.recovery_claim: false on every host "+
-		"until the workload has recovered, then turn it back on.", key.TargetKind, key.TargetName, key,
-		v.Proof.ID, v.Proof.Action, dest, v.SourceHost, why, dest, dest, dest, dest)
+		"stuck in flight on a live %s, `lv cluster claim-release %s/%s` has %s confirm that nothing runs it and release it; "+
+		"if %s refuses, the last resort is enforcement.recovery_claim: false on every host until the workload has "+
+		"recovered.", key.TargetKind, key.TargetName, key,
+		v.Proof.ID, v.Proof.Action, dest, v.SourceHost, why, dest, dest, dest, dest, key.TargetKind, key.TargetName, dest, dest)
 	ev, err := json.Marshal(legacyHeldEvidence{Detail: detail, Hosts: []string{dest}, Key: key, Proof: v.Proof.ID, Source: v.SourceHost})
 	if err != nil {
 		return

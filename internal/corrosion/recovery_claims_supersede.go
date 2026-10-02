@@ -230,6 +230,28 @@ var ErrProofNotForeign = errors.New("this node cannot show the proof is not this
 // flight, one another host executed, a promote with a start checkpoint, a
 // legacy key — is refused with ErrProofNotForeign.
 func (c *Client) AbandonForeignProof(ctx context.Context, proofID string, key ClaimKey, reason string) error {
+	return c.abandonForeignProof(ctx, proofID, key, reason, false)
+}
+
+// AbandonForeignProofInFlight is AbandonForeignProof for the operator's
+// release of a legacy-held claim (`lv cluster claim-release`,
+// docs/design/recovery-claims.md §10 item 37). It overrides one refusal
+// only: a proof THIS node claimed and left in progress, with no start
+// checkpoint recorded. Every other refusal stands — a proof another executor
+// holds, a promote past its start checkpoint, a proof that is this
+// incarnation's decision.
+//
+// The caller must first have confirmed, under the workload's local locks,
+// that nothing on this node runs the proof: no start path holds the
+// workload and no live domain or container of its name exists here. Once
+// the abandonment is recorded no claim of the proof succeeds, this node's
+// own resume included (ClaimActionProofFenced reads the same table in its
+// transaction), so no runner can start it again.
+func (c *Client) AbandonForeignProofInFlight(ctx context.Context, proofID string, key ClaimKey, reason string) error {
+	return c.abandonForeignProof(ctx, proofID, key, reason, true)
+}
+
+func (c *Client) abandonForeignProof(ctx context.Context, proofID string, key ClaimKey, reason string, inFlight bool) error {
 	if proofID == "" || !key.IsWorkload() || key.Incarnation == "" {
 		return fmt.Errorf("%w: a foreign abandonment names a proof and an incarnation-scoped workload key", ErrProofNotForeign)
 	}
@@ -254,7 +276,8 @@ func (c *Client) AbandonForeignProof(ctx context.Context, proofID string, key Cl
 		status, executor := p.String("status"), p.String("executor_host")
 		switch {
 		case (status == ProofCompleted || status == ProofFailed) && executor == c.hostName:
-		case status == ProofPrepared && executor == "":
+		case status == ProofPrepared && executor == "",
+			inFlight && status == ProofInProgress && executor == c.hostName:
 			for _, st := range proofStartSteps {
 				if ProofStepDone(p.String("step_state"), st) {
 					return fmt.Errorf("%w: proof %s recorded %q", ErrProofNotForeign, proofID, st)

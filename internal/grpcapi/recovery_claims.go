@@ -41,6 +41,36 @@ type claimRuntime struct {
 
 	refusals map[corrosion.ClaimKey][2]string
 	probe    ownerProbeCache
+	// observer sees every vote this voter casts (SetClaimVoteObserverForTest).
+	observer func(ClaimVote)
+}
+
+// ClaimVote is one promise or accept this voter answered, after it was
+// committed. It is what a fleet scenario needs to check Paxos's acceptor-side
+// invariants across every voter, the local path included, which no network
+// interceptor sees (SetClaimVoteObserverForTest).
+type ClaimVote struct {
+	Voter      string
+	Phase      string // "prepare" | "accept"
+	Key        corrosion.ClaimKey
+	Ballot     corrosion.Ballot
+	Generation int64
+	// Digest is the accepted value's digest (accept only).
+	Digest string
+	// AcceptedBallot / AcceptedDigest are what a promise reported as already
+	// accepted (prepare only; zero when nothing was).
+	AcceptedBallot corrosion.Ballot
+	AcceptedDigest string
+}
+
+func (s *Server) observeClaimVote(v ClaimVote) {
+	c := &s.claims
+	c.mu.Lock()
+	fn := c.observer
+	c.mu.Unlock()
+	if fn != nil {
+		fn(v)
+	}
 }
 
 // claimIdentityRetry bounds how often a failed identity load is retried.
@@ -312,6 +342,10 @@ func (s *Server) localPrepare(ctx context.Context, key corrosion.ClaimKey, b cor
 		return corrosion.PrepareResult{}, status.Errorf(codes.Unavailable, "record promise: %v", err)
 	}
 	s.noteClaimRefusal(key, res.Refusal, res.Detail)
+	if res.Promised {
+		s.observeClaimVote(ClaimVote{Voter: s.hostName, Phase: "prepare", Key: key, Ballot: b, Generation: gen,
+			AcceptedBallot: res.State.Accepted, AcceptedDigest: res.State.ValueDigest})
+	}
 	return res, nil
 }
 
@@ -344,6 +378,10 @@ func (s *Server) localAccept(ctx context.Context, key corrosion.ClaimKey, b corr
 		return corrosion.AcceptResult{}, status.Errorf(codes.Unavailable, "record accept: %v", err)
 	}
 	s.noteClaimRefusal(key, res.Refusal, res.Detail)
+	if res.Accepted && res.Accept != nil {
+		s.observeClaimVote(ClaimVote{Voter: s.hostName, Phase: "accept", Key: key, Ballot: b, Generation: gen,
+			Digest: res.Accept.ValueDigest})
+	}
 	return res, nil
 }
 

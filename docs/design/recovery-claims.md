@@ -1705,6 +1705,14 @@ where it described the mechanism; this list records what changed and why.
 26. **A forced row replaces an ordinary one only through the anti-entropy
     merge**, not through WAL apply. The WAL path keeps the ordinary
     first-writer rule; the forced row reaches every node by the next AE pass.
+    On WAL apply `voter_configs` is `INSERT OR IGNORE`: a node with no row for
+    the generation takes the forced row from the push alone and adopts it
+    after its own checks, and a node already holding an unadopted ordinary row
+    keeps it and drops the forced one without flagging a conflict (the WAL
+    path reads a held row as a re-delivery; only the merge flags the pair).
+    Such a node votes under neither row until the next AE pass replaces the
+    ordinary one, so the cost is one AE interval of liveness, not safety.
+    `TestFleet_VoterForcedRowOverTheWALPushPath` pins both.
 27. **Import for a forced generation comes from every survivor plus every
     verified certificate in `runtime_action_proofs`**, and the coordinator runs
     a re-certification pass (`recertifyReplaced`) that re-decides each value

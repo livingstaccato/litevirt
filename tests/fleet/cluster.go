@@ -39,7 +39,8 @@
 //     replica, reading one VirtualClock; Tick runs a poll on the nodes named.
 //     See replicas.go.
 //
-// Membership is seeded, not gossiped (seedGossipMembership), in every mode.
+// Membership is seeded, not gossiped (seedGossipMembership), in every mode —
+// unless Options.RealGossip gives every node a real memberlist (gossip_real.go).
 package fleet
 
 import (
@@ -127,6 +128,16 @@ type Options struct {
 	// relay and still wants each side to converge sets this to Nodes, which
 	// makes every node a relay and the mesh full.
 	Relays int
+	// RealGossip replaces the seeded Members() view with a real memberlist per
+	// node, on its own gossip port, behind a firewall SplitGossip can cut (see
+	// gossip_real.go). It is for scenarios about how a node comes to SEE its
+	// peers — a partition that heals, a re-join — which a seeded view cannot
+	// reach. Incompatible with SharedCRDT.
+	RealGossip bool
+	// GossipKey, with RealGossip, runs every node at
+	// enforcement.gossip_encryption enforced under this one key. Nil is
+	// plaintext gossip.
+	GossipKey []byte
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -150,6 +161,8 @@ type Cluster struct {
 	// checker's peer table in-process (no probe loop runs), so without this a
 	// fleet scenario has no way to model a host REJOINING — see Node.Rejoin.
 	reach *reachSet
+	// gossip is the RealGossip firewall (gossip_real.go). Nil otherwise.
+	gossip *gossipCut
 	// claimScript, when set, decides each claim RPC's fate before the link's
 	// ClaimFault does (claim_faults.go).
 	claimScriptMu sync.Mutex
@@ -218,6 +231,10 @@ type Node struct {
 	// replStarted records that repl's push loop was started (IndependentReplicas),
 	// so Stop stops it before the database closes under it.
 	replStarted bool
+
+	// GossipPort is the node's memberlist port under Options.RealGossip, and
+	// zero otherwise.
+	GossipPort int
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -267,12 +284,18 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.IndependentReplicas && opts.SharedCRDT {
 		t.Fatal("fleet: IndependentReplicas and SharedCRDT are mutually exclusive")
 	}
+	if opts.RealGossip && opts.SharedCRDT {
+		t.Fatal("fleet: RealGossip and SharedCRDT are mutually exclusive")
+	}
 
 	// The audit-chain tail used to be process-global, so this had to reset it
 	// between tests — and, worse, every node in a cluster shared one tail, so
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
 	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet()}
+	if opts.RealGossip {
+		c.gossip = &gossipCut{byAddr: map[string]string{}, blocked: map[string]map[string]bool{}}
+	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.mintCA()
 
@@ -305,11 +328,19 @@ func New(t *testing.T, opts Options) *Cluster {
 		}
 		n.Port = l.Addr().(*net.TCPAddr).Port
 		n.Listener = l
+		if opts.RealGossip {
+			n.GossipPort = freeGossipPort(t)
+			c.gossip.byAddr[gossipAddr(n.GossipPort)] = name
+		}
 		c.Nodes = append(c.Nodes, n)
 	}
 
 	// Step 2 — open DBs and seed schema. Each node's DB is independent.
 	for _, n := range c.Nodes {
+		if opts.RealGossip {
+			c.openGossipDB(n)
+			continue
+		}
 		c.openDB(n, opts.SharedCRDT)
 	}
 
@@ -319,8 +350,10 @@ func New(t *testing.T, opts Options) *Cluster {
 	c.crossRegisterHosts()
 
 	// Step 3b — gossip membership, which every node in a real cluster has and
-	// this harness did not.
-	c.seedGossipMembership()
+	// this harness did not. RealGossip nodes have the real thing.
+	if !opts.RealGossip {
+		c.seedGossipMembership()
+	}
 
 	// Step 4 — build grpcapi.Server per node, attach replicator,
 	// start gRPC server on the pre-allocated listener.
@@ -334,6 +367,11 @@ func New(t *testing.T, opts Options) *Cluster {
 	}
 
 	t.Cleanup(c.Stop)
+	if opts.RealGossip {
+		// Nodes opened early dialled seeds that were not up yet; the later
+		// joins and the membership loop close the mesh.
+		c.WaitGossip(t, 20*time.Second, "the gossip mesh to form", c.GossipConverged)
+	}
 	return c
 }
 

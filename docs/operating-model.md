@@ -984,6 +984,43 @@ leadership churn or a partition.
   rotate the key after removing a host you no longer trust, and keep the port
   firewalled regardless.
 
+### Gossip membership heals itself after a partition
+- memberlist does not re-merge two live clusters by itself. When a partition
+  splits the cluster, each side declares the other's hosts dead, stops
+  gossiping to them 30 s later, and never dials them again. Replication and
+  anti-entropy take their peers from gossip membership, so a side that cannot
+  see a host neither pushes to it nor repairs against it.
+- Every node therefore runs a membership pass every 30–45 s (jittered). It
+  re-joins in two cases:
+  - **It sees no peer at all.** It dials every `join_peers` seed and every host
+    in its `hosts` table, and reports `gossip_isolated` if none answers (see
+    [Diagnostics](diagnostics.md#gossip-isolation-gossip_isolated)).
+  - **It sees peers, but a host the cluster still lists is missing.** It dials
+    those hosts only: the hosts in its `hosts` table that are not removed, other
+    than itself, that gossip does not show. This is a healed partition, where
+    neither side is empty. A host's state does not matter. The majority of a
+    partition marks the other side `fenced` or `offline`, and those are exactly
+    the hosts that need to merge back and learn it.
+- The second case costs one dial per missing host per pass. A healthy cluster
+  dials nobody, and the pass never re-joins on a timer regardless. A host that
+  stays missing is backed off: it is dialled again after one skipped pass, then
+  three, and from then on every fourth pass (about every 2–3 minutes). So a host
+  that is dead but was never removed costs one bounded dial per few minutes, and
+  a partition of any length re-merges within one capped wait after it heals.
+  Remove dead hosts with `lv host rm --dead <host>` to stop the dials.
+- A missing host is dialled at the gossip address memberlist last showed for it,
+  if that still matches its recorded address. Otherwise it is dialled at its
+  recorded address on this node's own `gossip_port`, so keep `gossip_port`
+  uniform across the cluster.
+- A re-join is memberlist's ordinary join, so it passes the same admission and
+  runs under the same gossip key as a first join. A removed host is never
+  dialled, and a host gossip admission would refuse stays refused.
+- A pass that re-merges logs `gossip: re-merged hosts the cluster lists that
+  were missing from membership`. A dialled host that still does not answer logs
+  `gossip: hosts the cluster lists are missing from membership and did not
+  answer a re-join`, once per dial. This is not `gossip_isolated`, and it does
+  not mark the node's replica stale: the node still sees peers.
+
 ### Secret-bearing repair is peer-only
 - Secret-bearing config is **excluded from the operator-readable full-state
   dump**. `GetStateDump` (and the `lv cluster converge` digest report, which shows

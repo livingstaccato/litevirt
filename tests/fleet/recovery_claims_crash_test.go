@@ -243,6 +243,8 @@ func TestFleet_RecoveryClaim_CoordinatorCrashMidCollection(t *testing.T) {
 				clock.Advance(contentionPoll)
 			}
 			if decided == nil {
+				// What a's coordinator decided from: a stall here has so far
+				// always been the fence/lease path, not the claim.
 				for _, q := range []string{`SELECT * FROM leader_election`, `SELECT * FROM fencing_log`,
 					`SELECT name, state FROM hosts`, `SELECT observer, target, consecutive_failures, updated_at FROM host_health`} {
 					rows, err := a.DB.Query(ctx, q)

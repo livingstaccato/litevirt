@@ -911,11 +911,44 @@ type FenceLogRecord struct {
 // InsertFenceLog records a fencing attempt.
 func InsertFenceLog(ctx context.Context, c *Client, r FenceLogRecord) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	return c.Execute(ctx,
-		`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		r.ID, r.HostName, r.Method, r.Result, now, r.Detail,
-	)
+	return c.Execute(ctx, insertFenceLogSQL, r.ID, r.HostName, r.Method, r.Result, now, r.Detail)
+}
+
+const insertFenceLogSQL = `INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail)
+		 VALUES (?, ?, ?, ?, ?, ?)`
+
+// RecordFenceWithState records a fence AND the host state it establishes in ONE
+// replicated entry: the fencing_log row, and the state write UpdateHostState
+// makes (hosts.state, plus host_membership once this node is live), each in
+// its existing statement shape.
+//
+// Written as two entries, the row and the state reached peers separately. A
+// successor could hold the row while the host was still 'active' in its
+// replica, and when the leader died between its two pushes the state never
+// came at all. An entry is applied in one transaction, so a peer now sees
+// both or neither. The shapes are the ones every supported release already
+// accepts, so a receiver on the previous release applies the entry as it
+// stands. No ledger change and no token.
+func RecordFenceWithState(ctx context.Context, c *Client, r FenceLogRecord, state string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		if !live {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: insertFenceLogSQL, Params: []interface{}{r.ID, r.HostName, r.Method, r.Result, now, r.Detail}},
+				{SQL: updateHostStateSQL, Params: []interface{}{state, uts, r.HostName}},
+			})
+		}
+		epoch, reason, err := currentIsolation(ctx, c, r.HostName)
+		if err != nil {
+			return err
+		}
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: insertFenceLogSQL, Params: []interface{}{r.ID, r.HostName, r.Method, r.Result, now, r.Detail}},
+			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, r.HostName}},
+			{SQL: hostMembershipStateSQL, Params: []interface{}{r.HostName, state, epoch, reason, uts}},
+		})
+	})
 }
 
 // HostManualFenceConfirmed reports whether an operator has written a "manual-confirmed"

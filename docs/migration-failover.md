@@ -317,6 +317,45 @@ the binary out before relying on it.
 `lv host fence-confirm <host>`. The coordinator resumes the recovery on its next
 cycle — see [Resuming a recovery from a confirmation](#resuming-a-recovery-from-a-confirmation).
 
+### Resuming a recovery from a recorded fence
+
+A leader can fence a host and then stop before it moves the host's workloads:
+its lease runs out mid-fence, or it dies. The fence is already recorded — a
+`fencing_log` row and the host's `fenced` state — and whichever coordinator
+holds the lease next resumes the recovery from that record. It does not fence
+the host again. The resume requires:
+
+1. **The host is still recorded `fenced`.** `lv host undrain`, and the host's
+   own daemon starting up again, both record it `active`, which ends the fence's
+   authority.
+2. **The newest fence attempt succeeded**, and is one the leader could itself
+   have rescheduled on. That covers a verified `ipmi` power-off and an `ssh` or
+   `best-effort` success, unless the host is labelled
+   `litevirt.fence_requires_confirmation`. The resumed recovery applies the same
+   safe-fence policy and the same label as the leader would have, so a host whose
+   recovery needs `lv host fence-confirm` still needs it.
+3. **The fence still stands.** It is either under 5 minutes old, or some observer
+   has probed the host and failed without a break since before it. In both cases
+   no observer may have seen the host answer (healthy or unready) since the fence.
+
+There is no age limit beyond that. A power-off that nothing has contradicted is
+still authority an hour later. A fence that no longer stands is logged once, as
+"the recorded fence of this host no longer stands", and the workloads stay where
+they are. If the host really is down, `lv host undrain <host>` lets the
+coordinator fence it again for the outage in progress.
+
+The `fencing_log` row and the `fenced` state are written as one replicated
+entry, so every peer holds both or neither. A leader on an older release writes
+them separately, and a successor can then hold the row while the host still
+reads `active`. It treats that as "the state has not arrived yet": it neither
+fences the host nor stops looking, and it resumes once the state lands. If that
+older leader died between its two writes, the state never arrives. The host is
+then fenced again once the row is 5 minutes old, as before.
+
+A shared-disk VM is still moved only on a proof-grade fence under 5 minutes old
+(see above). A resume from an older fence moves local-disk VMs and refuses
+shared-disk ones until `lv host fence-confirm` provides a fresh proof.
+
 ### Resuming a recovery from a confirmation
 
 A recovery refused for want of a confirmation — a `manual` fence, a

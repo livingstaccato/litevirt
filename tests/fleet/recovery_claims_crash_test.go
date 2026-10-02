@@ -69,42 +69,6 @@ func crashFleet(t *testing.T, seed int64, vm string) (c *Cluster, a, b, cc, x, d
 	return c, a, b, cc, x, d
 }
 
-// fenceSettled holds x's first claim RPC until every voter's replica records
-// x's fence of the dead owner — the fencing_log row and the host's 'fenced'
-// state — so a successor finds a verified power-off a previous leader recorded
-// and resumes from it. Without it, how much of the fence replicates before x
-// dies is a race, and the successor's path differs with it: fence anew,
-// resume, or — the fencing_log row alone with the host still 'active' — skip
-// the host as recently fenced for recentFenceWindow (5 min). A resume is
-// itself bounded by that window, so no single clock step suits all three.
-type fenceSettled struct {
-	voters []*Node
-	host   string
-	once   sync.Once
-	ok     bool
-}
-
-func (f *fenceSettled) await() {
-	f.once.Do(func() {
-		ctx := context.Background()
-		for deadline := time.Now().Add(convergeTimeout); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-			all := true
-			for _, n := range f.voters {
-				h, err := corrosion.GetHost(ctx, n.DB, f.host)
-				rows, qerr := n.DB.Query(ctx, `SELECT 1 AS one FROM fencing_log WHERE host_name = ? AND result = 'fenced'`, f.host)
-				if err != nil || qerr != nil || h == nil || h.State != "fenced" || len(rows) == 0 {
-					all = false
-					break
-				}
-			}
-			if all {
-				f.ok = true
-				return
-			}
-		}
-	})
-}
-
 // crashAfterAccepts is the claim script for x's crash: x's Accept reaches
 // exactly the voters in reach, each commits it, and x dies — every link to and
 // from it fails — at the last of them, before any reply is read. Its Accept to
@@ -116,19 +80,12 @@ type crashAfterAccepts struct {
 	reach       map[string]bool
 	lostPrepare struct{ from, to string }
 
-	// fenceSeen is x's fence: settled on every voter before x's first claim
-	// RPC is answered (fenceSettled).
-	fenceSeen fenceSettled
-
 	mu        sync.Mutex
 	delivered int
 	dropped   bool
 }
 
 func (s *crashAfterAccepts) script(m ClaimMsg) ClaimFate {
-	if m.From == s.x.Name {
-		s.fenceSeen.await()
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if m.From == s.lostPrepare.from && m.To == s.lostPrepare.to && m.Method == "PrepareRecoveryClaim" && !s.dropped {
@@ -148,9 +105,10 @@ func (s *crashAfterAccepts) script(m ClaimMsg) ClaimFate {
 	return ClaimDropReply
 }
 
-// crashFormats is claimFormats plus a run in which claim_incarnation_v1
-// latches while the crashed coordinator is dead: its value sits at the legacy
-// key, and the successor claims the incarnation-scoped key (the bridge,
+// crashFormats runs the scenario before claim_incarnation_v1 has latched
+// (legacy keys), after (incarnation-scoped keys), and across the latch: it
+// forms while the crashed coordinator is dead, so its value sits at the
+// legacy key and the successor claims the scoped one (the bridge,
 // docs/design/recovery-claims.md §10 item 37).
 var crashFormats = []struct {
 	name             string
@@ -182,8 +140,7 @@ func TestFleet_RecoveryClaim_CoordinatorCrashMidCollection(t *testing.T) {
 				ledger := watchClaims(t, c)
 				key := vmKey(a, vm, 0)
 
-				s := &crashAfterAccepts{c: c, x: x, reach: map[string]bool{},
-					fenceSeen: fenceSettled{voters: voters, host: d.Name}}
+				s := &crashAfterAccepts{c: c, x: x, reach: map[string]bool{}}
 				for _, i := range tc.reach {
 					s.reach[voters[i].Name] = true
 				}
@@ -196,21 +153,17 @@ func TestFleet_RecoveryClaim_CoordinatorCrashMidCollection(t *testing.T) {
 				cs := c.NewCoordinators(clock)
 				for _, n := range []*Node{a, x} {
 					cs.ByNode[n.Name].Gate = quorateGate{}
-					// A verified power-off. Whether x's fence row replicates before
-					// it dies is a race, and a successor resumes a recovery from a
-					// dead leader's fence only when that fence is proof-grade; a
-					// best-effort one leaves d 'fenced' and its workloads waiting for
-					// `lv host fence-confirm`, which is not what this scenario is
-					// about.
+					// A verified power-off. Whether x's fence reaches a voter before
+					// x dies is a race, and either way is fine: the fence row and
+					// d's 'fenced' state travel in one entry, so a's replica holds
+					// both — and a resumes from them — or neither, and a fences d
+					// itself. Either path recovers vm exactly once.
 					cs.ByNode[n.Name].SetFencer(func(context.Context, fence.HostConfig) fence.Result {
 						return fence.Result{Method: "ipmi", Success: true}
 					})
 				}
 				cs.Tick(ctx, x)
 				c.Crash(x)
-				if !s.fenceSeen.ok {
-					t.Fatalf("x's fence of %s never settled on every voter", d.Name)
-				}
 
 				// x's value is on exactly the voters it reached, and nowhere is it
 				// certified or minted.
@@ -239,8 +192,7 @@ func TestFleet_RecoveryClaim_CoordinatorCrashMidCollection(t *testing.T) {
 				// The second coordinator takes over once x's lease has run out,
 				// inside the window in which it resumes from x's fence.
 				if latch.crosses {
-					// claim_incarnation_v1 latches while x is dead: x's value
-					// sits at the legacy key, and a claims the scoped one.
+					// claim_incarnation_v1 latches while x is dead.
 					latchIncarnation(c, true)
 				}
 				clock.Advance(time.Minute)

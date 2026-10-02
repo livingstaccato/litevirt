@@ -60,27 +60,36 @@ func TestFleet_RecoveryClaimFaults_TwoCoordinatorsAcrossSeeds(t *testing.T) {
 		for _, k := range kinds {
 			for seed := int64(1); seed <= 3; seed++ {
 				t.Run(fmt.Sprintf("%s/%s/seed-%d", latch.name, k.name, seed), func(t *testing.T) {
-					runTwoCoordinatorClaimFaults(t, k.name, k.fault, 2700+seed*10+int64(len(k.name)), latch.latched)
+					runTwoCoordinatorClaimFaults(t, k.name, k.fault, 2700+seed*10+int64(len(k.name)), latch.a, latch.b)
 				})
 			}
 		}
 	}
 }
 
-// claimFormats runs a scenario under both claim key formats: before
+// claimFormats runs a scenario under both claim key formats — before
 // claim_incarnation_v1 has latched (legacy keys) and after (keys scoped to
-// the workload's incarnation, docs/design/recovery-claims.md §10 item 37).
+// the workload's incarnation, docs/design/recovery-claims.md §10 item 37) —
+// and with the two coordinators on opposite sides of the latch at once, as
+// a rolling latch leaves them for a few seconds: a claims the scoped key, b
+// the legacy one, for the same recovery.
 var claimFormats = []struct {
-	name    string
-	latched bool
-}{{"legacy-keys", false}, {"incarnation-keys", true}}
+	name string
+	a, b bool
+}{{"legacy-keys", false, false}, {"incarnation-keys", true, true}, {"split-latch", true, false}}
 
-func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, seed int64, latched bool) {
+func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, seed int64, latchA, latchB bool) {
 	ctx := context.Background()
 	vm := fmt.Sprintf("vm-cf-%s-%d", kind, seed)
 	clock := NewVirtualClock(time.Now().UTC())
 	c, a, b, victim := claimFleet(t, clock, seed, vm)
-	latchIncarnation(c, latched)
+	for n, latched := range map[*Node]bool{a: latchA, b: latchB} {
+		if latched {
+			n.Server.SetGate(claimsGate{})
+		} else {
+			n.Server.SetGate(preIncarnationGate{})
+		}
+	}
 	ledger := watchClaims(t, c)
 
 	// The decision window: no replication between the coordinators, and
@@ -136,23 +145,29 @@ func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, s
 		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
 	}
 	// leader_lease_terms keeps both contested claims by design
-	// (leader_lease_contest_test.go). health_conditions can be left apart
-	// too, and that is not the claim protocol: both lease holders raise the
-	// same ha.voter.unavailable row in the window, the upsert that applies
-	// the other's copy keeps the local created_at, and the two rows then
-	// differ only in created_at under one updated_at — an LWW tie no merge
-	// settles.
+	// (leader_lease_contest_test.go). health_conditions is NOT excepted: both
+	// lease holders raise the same ha.voter.unavailable row in the window,
+	// and the two raises must converge (health_condition_two_raisers_test.go).
 	c.WaitConvergedExcept(t, convergeTimeout, []string{"leader_lease_terms", "health_conditions"}, a, b)
 	for _, n := range []*Node{a, b} {
 		claimReconciler(t, n).ReconcileOnce(ctx)
 	}
 	out := checkClaimSafety(t, ledger, a, vm, c.Nodes)
-	key := vmKey(a, vm, 0)
-	if latched != (key.Incarnation != "") {
-		t.Fatalf("the scenario's key %s does not match the latch (latched=%v)", key, latched)
+	// One certified value for the recovery, across the key's legacy and
+	// scoped forms (each coordinator claims the form its own latch says).
+	certified := map[string]bool{}
+	for k, ds := range out.Certified {
+		if k.SameDecision(vmKey(a, vm, 0)) {
+			for d := range ds {
+				certified[d] = true
+			}
+		}
 	}
-	if len(out.Certified[key]) != 1 {
-		t.Errorf("certified values for %s: %v, want exactly one", key, keys(out.Certified[key]))
+	if len(certified) != 1 {
+		t.Errorf("certified values for %s across its key forms: %v, want exactly one", vm, keys(certified))
+	}
+	if latchA != (vmKey(a, vm, 0).Incarnation != "") || latchB != (vmKey(b, vm, 0).Incarnation != "") {
+		t.Errorf("the coordinators' keys do not match their latches")
 	}
 	for _, n := range []*Node{a, b} {
 		if v := vmOn(t, n, vm); out.Running != nil && v.HostName != out.Running[0] {
@@ -164,15 +179,11 @@ func runTwoCoordinatorClaimFaults(t *testing.T, kind string, fault ClaimFault, s
 // staleAccept is the script for TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound.
 type staleAccept struct {
 	x, a, b, cc *Node
-	fenceSeen   fenceSettled
 	mu          sync.Mutex
 	aPrepared   bool
 }
 
 func (s *staleAccept) script(m ClaimMsg) ClaimFate {
-	if m.From == s.x.Name {
-		s.fenceSeen.await()
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
@@ -206,8 +217,10 @@ func (s *staleAccept) script(m ClaimMsg) ClaimFate {
 // refusal in corrosion.ClaimAccept) — a accepts the stale v1 and two values
 // are chosen at one key.
 func TestFleet_RecoveryClaimFaults_StaleAcceptAfterNewerRound(t *testing.T) {
-	for _, latch := range claimFormats {
-		t.Run(latch.name, func(t *testing.T) { runStaleAcceptAfterNewerRound(t, latch.latched) })
+	for _, latched := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy-keys", true: "incarnation-keys"}[latched], func(t *testing.T) {
+			runStaleAcceptAfterNewerRound(t, latched)
+		})
 	}
 }
 
@@ -219,7 +232,7 @@ func runStaleAcceptAfterNewerRound(t *testing.T, latched bool) {
 	voters := []*Node{a, b, cc}
 	ledger := watchClaims(t, c)
 	key := vmKey(a, vm, 0)
-	s := &staleAccept{x: x, a: a, b: b, cc: cc, fenceSeen: fenceSettled{voters: voters, host: d.Name}}
+	s := &staleAccept{x: x, a: a, b: b, cc: cc}
 	c.SetClaimScript(s.script)
 
 	clock := NewVirtualClock(time.Now().UTC())
@@ -231,9 +244,6 @@ func runStaleAcceptAfterNewerRound(t *testing.T, latched bool) {
 		})
 	}
 	cs.Tick(ctx, x)
-	if !s.fenceSeen.ok {
-		t.Fatalf("x's fence of %s never settled on every voter", d.Name)
-	}
 	if st := c.ClaimStats(x, a); st.Held != 1 {
 		t.Fatalf("x's Accept to a was not held: %+v", st)
 	}
@@ -244,7 +254,10 @@ func runStaleAcceptAfterNewerRound(t *testing.T, latched bool) {
 	// x never ticks again. It is not crashed: replacing its links' faults
 	// would hand the held Accept to a now, before the newer round.
 
-	clock.Advance(time.Minute) // past x's lease; a resumes from x's fence (fenceSettled)
+	// Past x's lease. x's fence row and d's 'fenced' state replicate as one
+	// entry, so a either resumes from them or, if they have not reached it,
+	// fences d itself; the claim below is the same either way.
+	clock.Advance(time.Minute)
 	now := clock.Now()
 	for _, n := range voters {
 		PublishHealth(t, n, d.Name, 5, now)

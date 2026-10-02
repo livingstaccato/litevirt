@@ -955,9 +955,17 @@ func TestCoordinator_ManualFenceWithConfirmation_Reschedules(t *testing.T) {
 	// (it's treated as already fenced). The VM is *not* rescheduled by this
 	// cycle alone; the operator-side flow is expected to also update the host
 	// state to 'fenced' or 'offline'. So we assert the safe behavior:
-	// recentlyFenced suppresses re-processing.
-	if !c.fenced["manual-host"] {
-		t.Error("expected coordinator to mark manual-host as already-fenced via recentlyFenced")
+	// recentlyFenced suppresses the fence and moves nothing. It does not
+	// CACHE the skip (c.fenced): the state write may simply not have arrived
+	// yet, and a cached skip would never read it (run's recently-fenced skip).
+	if n := fenceLogCount(t, db, "manual-host"); n != 1 {
+		t.Errorf("fencing_log rows for manual-host = %d, want 1: recentlyFenced must suppress the fence", n)
+	}
+	if vm, err := corrosion.GetVM(ctx, db, "vm-pending"); err != nil || vm == nil || vm.HostName != "manual-host" {
+		t.Errorf("vm-pending moved on a confirmation alone, with the host still 'active' (vm=%+v err=%v)", vm, err)
+	}
+	if c.fenced["manual-host"] {
+		t.Error("the recently-fenced skip was cached; a 'fenced' state arriving next cycle would never be read")
 	}
 }
 

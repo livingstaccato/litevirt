@@ -229,9 +229,12 @@ of acting — it says nothing about whether the resulting rows have replicated.
   bounded by the lease that authorises it, and the leader re-checks the lease
   before rescheduling anything. If it lost the lease meanwhile it stops there —
   but the verified power-off is already recorded, in `fencing_log` and in the
-  host's `fenced` state, so the next leader resumes the reschedule from that
+  host's `fenced` state, written together as one replicated entry so no peer
+  holds one without the other, so the next leader resumes the reschedule from that
   record instead of powering the host off a second time. The resumed pass is
-  counted as `phase=recovery, error_class=recovery_resumed`.
+  counted as `phase=recovery, error_class=recovery_resumed`. The record is
+  authority for as long as it still stands, not for a fixed 5 minutes — see
+  [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence).
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.
   Operator must intervene.

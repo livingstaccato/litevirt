@@ -87,6 +87,15 @@ type ppOpts struct {
 	// latched: the coordinators rely on the pause (partition_pause_v1
 	// latched). False models a cluster where it has not latched.
 	latched bool
+	// coordinators, when set, names the only nodes that run a failover
+	// coordinator. Every node runs one in production; a scenario whose
+	// subject is not the lease contest names one, because coordinators that
+	// each hold the lease in their own replica and all claim the moment they
+	// fence duel each other's ballots for minutes under -race (each
+	// voter's promise is a local transaction, and the proposer's per-call
+	// timeout is 3 s), which is recovery-claims.md §6's duelling-proposer
+	// liveness case, not what the scenario tests.
+	coordinators map[string]bool
 }
 
 func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
@@ -155,6 +164,9 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 				}
 			}
 		}()
+		if o.coordinators != nil && !o.coordinators[n.Name] {
+			continue
+		}
 		go func() {
 			select {
 			case <-ctx.Done():
@@ -449,7 +461,8 @@ func TestFleet_PartitionSettle_DualRunSettlesToTheCertifiedCopy(t *testing.T) {
 	genesisByTick(t, c, c.Nodes[2])
 	enableRecoveryClaims(t, c)
 
-	s := newPPStack(t, c, ppOpts{latched: false, pauseOff: map[string]bool{owner.Name: true}})
+	s := newPPStack(t, c, ppOpts{latched: false, pauseOff: map[string]bool{owner.Name: true},
+		coordinators: map[string]bool{c.Nodes[2].Name: true}})
 	// The owner's reconciler stamps the domain with its row's incarnation while
 	// the row still names it — the evidence Layer 3 settles on.
 	eventually(t, 10*time.Second, "pp-dual's managed stamp to carry its incarnation", func() bool {

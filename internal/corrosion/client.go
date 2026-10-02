@@ -99,6 +99,16 @@ type Config struct {
 	// pushPullInterval overrides memberlist's periodic full-state exchange.
 	// Test-only: zero keeps the LAN default.
 	pushPullInterval time.Duration
+
+	// RejoinInterval is the membership loop's base pass interval (see
+	// maintainMembership); each pass waits a jittered 1–1.5x of it. Zero is
+	// the production default, 30 s. Set only by tests: the daemon never does.
+	RejoinInterval time.Duration
+	// MemberlistForTests, when set, edits the memberlist configuration last,
+	// just before memberlist is created — a test seam for what no daemon
+	// config reaches: a transport that can be partitioned, or failure-detector
+	// timings short enough for a test. The daemon never sets it.
+	MemberlistForTests func(*memberlist.Config)
 }
 
 // Client is the embedded state store with WAL-based replication.
@@ -144,6 +154,11 @@ type Client struct {
 	// what lets a node that knows no other host trust what its seeds introduce.
 	// See gossip_admission.go.
 	gossipSeeded bool
+	// gossipAddrs is the gossip address ("ip:port") memberlist last showed for
+	// each peer, so the re-merge pass can dial a host that has dropped out at
+	// the port it gossips on (gossip_rejoin.go). Guarded by gossipAddrMu.
+	gossipAddrMu sync.Mutex
+	gossipAddrs  map[string]string
 	// admission is the last gossip-admission snapshot read successfully.
 	admission atomic.Pointer[gossipAdmission]
 	// freshness records whether this node's replica has been reconciled
@@ -993,6 +1008,9 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	// EventDelegate wakes the replicator's discovery loop on membership changes
 	// (separate from Delegate, which carries gossip metadata) — set before Create.
 	mlCfg.Events = &membershipEvents{client: c}
+	if cfg.MemberlistForTests != nil {
+		cfg.MemberlistForTests(mlCfg)
+	}
 
 	list, err := memberlist.Create(mlCfg)
 	if err != nil {
@@ -1013,13 +1031,14 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 
 	// This join is not the last one. An isolated node -- seeds down at boot, or
 	// a membership that aged out across a long partition -- otherwise keeps an
-	// empty peer set for the life of the process, and anti-entropy cannot repair
+	// empty peer set for the life of the process, and the two halves of a
+	// healed partition otherwise never merge again; anti-entropy cannot repair
 	// against a peer it never discovers. See maintainMembership.
 	mctx, stop := context.WithCancel(context.Background())
 	c.stopMembership, c.membershipDone = stop, make(chan struct{})
 	go func() {
 		defer close(c.membershipDone)
-		c.maintainMembership(mctx, cfg.JoinPeers, cfg.AdvertiseAddr)
+		c.maintainMembership(mctx, cfg.JoinPeers, cfg.AdvertiseAddr, cfg.RejoinInterval)
 	}()
 
 	return c, nil

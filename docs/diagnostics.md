@@ -1267,6 +1267,13 @@ is its connectivity edges going `suspect`.
 A single-node cluster with no seeds is never reported: it has nobody to be
 isolated from.
 
+A node that sees **some** peers is not isolated, even when hosts it lists are
+missing from gossip, as on either side of a partition. The same pass dials those
+missing hosts, on a per-host backoff, so the two sides merge again once the
+network heals. It logs what came back and what did not, but raises no condition.
+See [Gossip membership heals itself after a
+partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

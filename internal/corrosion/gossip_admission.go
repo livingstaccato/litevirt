@@ -42,7 +42,9 @@ import (
 // to some existing node is refused THERE, and admitted by the first gossip
 // exchange that carries it after the row arrives: memberlist's periodic
 // push/pull (30s on the LAN profile, scaled up past 32 members), or the next
-// re-join if it sees nobody at all (maintainMembership).
+// pass of maintainMembership, which dials a listed host that gossip does not
+// show (and every target when it sees nobody at all). Those re-joins are
+// ordinary Joins and pass this same predicate.
 //
 // This is admission, not authentication. Without a keyring a host on the
 // segment can still claim a real host's name from that host's own address, or

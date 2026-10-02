@@ -32,6 +32,7 @@ func (e *membershipEvents) NotifyJoin(n *memberlist.Node) {
 		}
 		e.peers[n.Name] = struct{}{}
 		e.mu.Unlock()
+		e.client.noteGossipAddr(n.Name, n.Address())
 	}
 	e.client.kickMembership()
 }

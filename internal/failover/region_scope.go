@@ -64,6 +64,16 @@ func (q quorumView) voters(target string) map[string]bool {
 // quorum is a majority of voters(target).
 func (q quorumView) quorum(target string) int { return len(q.voters(target))/2 + 1 }
 
+// graceScope is the quorum scope a fence of target rests on, for the
+// quorum-regain grace: the cluster-wide quorum, or target's region's under
+// region scope.
+func (q quorumView) graceScope(target string) string {
+	if !q.region {
+		return health.QuorumScopeCluster
+	}
+	return health.RegionQuorumScope(q.vr.Region(target))
+}
+
 // regionOf is target's region.
 func (q quorumView) regionOf(target string) string { return q.vr.Region(target) }
 

@@ -542,14 +542,17 @@ func TestPartitionPauseWaitCoversTheMinority(t *testing.T) {
 	}
 }
 
-// InQuorumRegainGrace: true for QuorumRegainGrace after QuorumProof last read
-// No, false for a daemon that never lost the quorum and once the grace has
+// InQuorumRegainGraceFor(QuorumScopeCluster): true while the cluster-wide
+// quorum is lost and for QuorumRegainGrace after it is regained (its No→Yes
+// transition), false for a daemon that never lost it and once the grace has
 // passed. The failover coordinator defers new fences while it is true, so the
 // failure rows a fleet-wide blip leaves behind fence nobody.
 //
-// Mutations: never record the loss — the "just lost" check goes red; compare
-// against the wrong side of the grace — one of the other two goes red.
-func TestInQuorumRegainGrace(t *testing.T) {
+// Mutations: never record the loss — the "lost" checks go red; measure the
+// grace from the last No instead of the transition (re-arm on every No) — the
+// region test below goes red; compare against the wrong side of the grace —
+// the "after the grace" check goes red.
+func TestInQuorumRegainGrace_Cluster(t *testing.T) {
 	db := testCheckHostDB(t)
 	for _, h := range []string{"host-a", "host-b", "host-c"} {
 		gateHost(t, db, h, "active", "worker")
@@ -559,24 +562,76 @@ func TestInQuorumRegainGrace(t *testing.T) {
 	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumYes {
 		t.Fatalf("setup: quorum %d", st)
 	}
-	if c.InQuorumRegainGrace() {
+	if c.InQuorumRegainGraceFor(QuorumScopeCluster) {
 		t.Fatal("a daemon that never lost the quorum is in the regain grace")
 	}
 	warm(c, map[string]bool{"host-b": false, "host-c": false})
 	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumNo {
 		t.Fatalf("setup: quorum %d, want No", st)
 	}
+	if !c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+		t.Fatal("a daemon without the quorum is not held back from fencing")
+	}
 	warm(c, map[string]bool{"host-b": true, "host-c": true})
 	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumYes {
 		t.Fatalf("setup: quorum %d after regaining", st)
 	}
-	if !c.InQuorumRegainGrace() {
-		t.Fatal("a daemon that lost the quorum a moment ago is not in the regain grace")
+	if !c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+		t.Fatal("a daemon that regained the quorum a moment ago is not in the regain grace")
 	}
 	c.mu.Lock()
-	c.quorumLostAt = time.Now().Add(-QuorumRegainGrace - time.Second)
+	c.quorumRegainedAt[QuorumScopeCluster] = time.Now().Add(-QuorumRegainGrace - time.Second)
 	c.mu.Unlock()
-	if c.InQuorumRegainGrace() {
+	if c.InQuorumRegainGraceFor(QuorumScopeCluster) {
 		t.Fatal("still in the regain grace after it passed")
+	}
+}
+
+// Under region-scoped failover a region majority WITHOUT a cluster majority is
+// exactly the side that fences (docs/design/region-scoped-failover.md). Other
+// consumers keep reading the cluster-wide quorum — the VIP demoter, the
+// dual-run detector, the lease-term barrier — and it keeps reading No; that
+// must not hold the region's fences back. The grace is per scope and runs from
+// that scope's own No→Yes transition.
+//
+// Mutation: key every scope to the cluster-wide quorum — the region grace reads
+// true and this goes red.
+func TestInQuorumRegainGrace_ARegionMajorityWithoutTheClusterFences(t *testing.T) {
+	ctx := context.Background()
+	db := testCheckHostDB(t)
+	for _, h := range []string{"e1", "e2", "e3", "w1", "w2", "w3", "w4"} {
+		gateHost(t, db, h, "active", "worker")
+	}
+	for _, h := range []string{"e1", "e2", "e3"} {
+		if err := corrosion.UpdateHostRegion(ctx, db, h, "east"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, h := range []string{"w1", "w2", "w3", "w4"} {
+		if err := corrosion.UpdateHostRegion(ctx, db, h, "west"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.SetFailoverScope(ctx, db, corrosion.FailoverScopeRegion, "test"); err != nil {
+		t.Fatal(err)
+	}
+	c := NewChecker("e1", "/etc/litevirt/pki", db)
+	// e1 reaches its own region and nothing west: 3 of 7 cluster-wide (No),
+	// 3 of 3 in east (Yes).
+	warm(c, map[string]bool{"e2": true, "e3": true, "w1": false, "w2": false, "w3": false, "w4": false})
+	for i := 0; i < 5; i++ {
+		if st, _, _ := c.QuorumProof(ctx); st != QuorumNo {
+			t.Fatalf("setup: cluster quorum %d, want No", st)
+		}
+		if st, _, _ := c.ExecutionQuorum(ctx); st != QuorumYes {
+			t.Fatalf("setup: east execution quorum %d, want Yes", st)
+		}
+	}
+	if c.InQuorumRegainGraceFor(RegionQuorumScope("east")) {
+		t.Fatal("east's majority is held back from fencing by the cluster-wide quorum it does not decide on")
+	}
+	if !c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+		t.Fatal("the cluster-wide scope, which is lost, reads as not in grace")
 	}
 }

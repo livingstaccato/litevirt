@@ -146,7 +146,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		coord.PartitionPauseEnforced = func(context.Context) bool { return latched }
 		coord.PauseWaitFor = ppWait
 		coord.LastContact = chk.LastContact
-		coord.QuorumRegain = chk.InQuorumRegainGrace
+		coord.QuorumRegain = chk.InQuorumRegainGraceFor
 
 		rec := health.NewReconciler(n.Name, dataDir, n.DB, n.Virt)
 		rec.SetGate(epochGate{})

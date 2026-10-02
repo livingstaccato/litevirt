@@ -322,31 +322,61 @@ cycle — see [Resuming a recovery from a confirmation](#resuming-a-recovery-fro
 A leader can fence a host and then stop before it moves the host's workloads:
 its lease runs out mid-fence, or it dies. The fence is already recorded — a
 `fencing_log` row and the host's `fenced` state — and whichever coordinator
-holds the lease next resumes the recovery from that record. It does not fence
-the host again. The resume requires:
+holds the lease next takes the recovery over from that record. It needs:
 
-1. **The host is still recorded `fenced`.** `lv host undrain`, and the host's
-   own daemon starting up again, both record it `active`, which ends the fence's
-   authority.
+1. **The host is still recorded `fenced`.** `lv host undrain` records it
+   `active`, which ends the fence's authority. So does the host's own daemon
+   starting up again, but that write can be lost (a failed startup write, or a
+   last-writer-wins loss under clock skew), so nothing below relies on it.
 2. **The newest fence attempt succeeded**, and is one the leader could itself
    have rescheduled on. That covers a verified `ipmi` power-off and an `ssh` or
    `best-effort` success, unless the host is labelled
-   `litevirt.fence_requires_confirmation`. The resumed recovery applies the same
-   safe-fence policy and the same label as the leader would have, so a host whose
-   recovery needs `lv host fence-confirm` still needs it.
-3. **The fence still stands.** It is either under 5 minutes old, or some observer
-   has probed the host and failed without a break since before it. In both cases
-   no observer may have seen the host answer (healthy or unready) since the fence.
+   `litevirt.fence_requires_confirmation`.
 
-The safe-fence policy is decided by the recorded fence, not by the host's
-current strategy: an `ssh` fence on record is treated as best-effort under the
-policy, even if the host has since been switched to `ipmi`.
+What happens next depends on the fence:
 
-There is no age limit beyond that. A power-off that nothing has contradicted is
-still authority an hour later. A fence that no longer stands is logged once, as
-"the recorded fence of this host no longer stands", and the workloads stay where
-they are. If the host really is down, `lv host undrain <host>` lets the
-coordinator fence it again for the outage in progress.
+- **A verified (`ipmi`) fence** is resumed from directly only while it is under
+  5 minutes old **and** still stands (below). Otherwise the successor powers the
+  host off again with the recorded method first. A verified power-off of a host
+  that is already off is harmless, and a fresh one is authority on its own,
+  whatever happened to the host in between. The recovery then proceeds on the
+  fresh fence, and a shared-disk VM is bound to it. If the re-fence fails,
+  nothing is recovered. The failed attempt is now the newest on record, so the
+  host is not re-fenced every cycle; it is left `offline` for an operator,
+  counted as `phase=recovery, error_class=refence_failed`. Confirm it is off and
+  run `lv host fence-confirm <host>`, and the recovery resumes from the
+  confirmation.
+- **An unverified (`ssh`, `best-effort`) fence** is resumed from directly while
+  it still stands, and never re-fenced: an SSH power-off of a host that is
+  already off cannot connect and reports a failed fence. A fence that no longer
+  stands is logged once, as "the recorded fence of this host no longer stands",
+  and the workloads stay where they are. If the host really is down,
+  `lv host undrain <host>` lets the coordinator fence it again for the outage in
+  progress.
+
+**A fence still stands** when some observer has probed the host and failed
+without a break since before the fence, and no observer's latest verdict shows
+the host answering (healthy or unready) since. The first holds however recent
+the fence is. A genuine fence follows a quorum of failing runs, so it always has
+one. A host that answered after its fence and then failed again has had the
+verdict that it answered overwritten, and only the failing runs' start shows the
+return.
+
+**Clock skew.** The fence's time is the leader's clock and each observation is
+its observer's, so both comparisons give 5 seconds, the clock-skew alert
+threshold, to the safe side. A failing run must have begun at least 5 seconds
+before the fence, and an answer counts from 5 seconds before it. Greater skew
+makes the checks refuse more, except in one direction: an observer whose clock
+runs more than 5 seconds **behind** the leader's can make a run look older than
+it is. Keep `litevirt_cluster_clock_skew_seconds` under 5 (see
+[Time](operating-model.md#time)). For a verified fence the margin matters less,
+because the successor re-fences whenever there is doubt.
+
+The resumed recovery applies the same safe-fence policy and the same label as
+the leader would have, so a host whose recovery needs `lv host fence-confirm`
+still needs it. The safe-fence policy is decided by the recorded fence, not by
+the host's current strategy: an `ssh` fence on record is treated as best-effort
+under the policy, even if the host has since been switched to `ipmi`.
 
 The `fencing_log` row and the `fenced` state are written as one replicated
 entry, so every peer holds both or neither. A leader on an older release writes
@@ -357,8 +387,8 @@ older leader died between its two writes, the state never arrives. The host is
 then fenced again once the row is 5 minutes old, as before.
 
 A shared-disk VM is still moved only on a proof-grade fence under 5 minutes old
-(see above). A resume from an older fence moves local-disk VMs and refuses
-shared-disk ones until `lv host fence-confirm` provides a fresh proof.
+(see above), which a resume from a verified fence always has: a fresh one when
+the recorded one was older.
 
 ### Resuming a recovery from a confirmation
 
@@ -621,7 +651,7 @@ Scrape `http://<host>:7444/metrics` for:
   `owner_reachable`, `source_mismatch` and `superseded`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`, `local_stall`,
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `refence_failed`, `confirmation_resumed`, `local_stall`,
   and under region-scoped failover `region_too_small` / `region_scoped` — see
   [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions

@@ -8,6 +8,7 @@ import (
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // TestResume_SafeFenceKeysOnTheRecordedFence: a best-effort host is fenced by
@@ -72,5 +73,56 @@ func TestResume_SafeFenceKeysOnTheRecordedFence(t *testing.T) {
 	}
 	if got := fm.attempts[foKey(PhaseSplitBrain, ResultRefused, ErrManualUnconfirmed)]; got != 1 {
 		t.Errorf("safe-fence refusals = %d, want 1 (attempts %v)", got, fm.attempts)
+	}
+}
+
+// TestFenceStillStands_SkewMargin: a fence's timestamp is the leader's clock and
+// an observer's row is the observer's, so the comparisons give fenceSkewMargin
+// to the safe side. A failing run that began only 3s before the fence by the
+// observer's clock may have begun AFTER it by the leader's, and a verdict that
+// the host answered 3s before the fence may have been after it.
+//
+// Mutation: set fenceSkewMargin to 0 (the run arm goes red), or compare the
+// answered verdict against `at` itself (the answered arm goes red).
+func TestFenceStillStands_SkewMargin(t *testing.T) {
+	ctx := context.Background()
+	at := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
+	now := at.Add(60 * time.Second)
+	upd := now.Add(-time.Second) // fresh
+	ts := func(t time.Time) string { return t.Format(time.RFC3339) }
+
+	for _, tc := range []struct {
+		name     string
+		runStart time.Duration // relative to at
+		answered time.Duration // relative to at; 0 = no answered row
+		want     bool
+	}{
+		{name: "run-began-well-before", runStart: -7 * time.Second, want: true},
+		{name: "run-began-inside-the-margin", runStart: -3 * time.Second, want: false},
+		{name: "answered-inside-the-margin", runStart: -7 * time.Second, answered: -3 * time.Second, want: false},
+		{name: "answered-well-before", runStart: -7 * time.Second, answered: -20 * time.Second, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := newTestDB(t)
+			n := int(upd.Sub(at.Add(tc.runStart))/health.ProbeInterval) + 1
+			if err := db.Execute(ctx,
+				`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+				 VALUES ('o1', 'bad', 'suspect', ?, NULL, ?)`, n, ts(upd)); err != nil {
+				t.Fatal(err)
+			}
+			if tc.answered != 0 {
+				if err := db.Execute(ctx,
+					`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+					 VALUES ('o2', 'bad', 'healthy', 0, NULL, ?)`, ts(at.Add(tc.answered))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c := NewCoordinator("me", db)
+			c.Now = func() time.Time { return now }
+			why, got := c.fenceStillStands(ctx, "bad", at)
+			if got != tc.want {
+				t.Errorf("fenceStillStands = %v (%s), want %v", got, why, tc.want)
+			}
+		})
 	}
 }

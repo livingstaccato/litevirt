@@ -224,16 +224,19 @@ of acting — it says nothing about whether the resulting rows have replicated.
   — it resyncs by anti-entropy, not log replay.
 - **No double-fencing.** Once a successful fence is recorded in `fencing_log`
   (or operator confirmation under manual strategy), no coordinator will
-  re-fence the same host within a 5-minute window.
+  re-fence the same host within a 5-minute window, except to renew a verified
+  power-off that a successor is taking over and cannot show still holds (below).
 - **A fence and its recovery can land on different coordinators.** The fence is
   bounded by the lease that authorises it, and the leader re-checks the lease
   before rescheduling anything. If it lost the lease meanwhile it stops there —
   but the verified power-off is already recorded, in `fencing_log` and in the
   host's `fenced` state, written together as one replicated entry so no peer
   holds one without the other, so the next leader resumes the reschedule from that
-  record instead of powering the host off a second time. The resumed pass is
-  counted as `phase=recovery, error_class=recovery_resumed`. The record is
-  authority for as long as it still stands, not for a fixed 5 minutes — see
+  record. The resumed pass is counted as
+  `phase=recovery, error_class=recovery_resumed`. A verified fence that is over
+  5 minutes old, or in any doubt, is renewed with a fresh verified power-off
+  first; an unverified one is resumed only while it still stands, and never
+  re-fenced — see
   [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence).
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.

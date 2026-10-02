@@ -281,7 +281,7 @@ func TestPartitionPause_OneWayIsMadeVisible(t *testing.T) {
 func TestPartitionPause_ARegainedCoordinatorDefersNewFences(t *testing.T) {
 	c, db, ctx, _ := pauseCoordinator(t, true)
 	regained := true
-	c.QuorumRegain = func(string) bool { return regained }
+	c.QuorumRegain = func(context.Context, string) bool { return regained }
 	c.run(ctx)
 	rows, err := db.Query(ctx, `SELECT 1 AS one FROM fencing_log WHERE host_name = 'down'`)
 	if err != nil {

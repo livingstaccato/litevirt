@@ -89,9 +89,10 @@ monotonic clock, and accumulates loss rather than timing it continuously:
 - **It pauses** once the readings that are not Yes (No, or Unknown) cover at
   least `T_pause` of that window (§3.3). Each interval between two readings
   counts as the later reading's state.
-- **Only `partitionRegainTicks` (3) consecutive Yes readings count as the
-  majority being back.** They clear the window and run the resume path (§3.5).
-  A single Yes on a lossy link is not a heal.
+- **Only an unbroken run of Yes readings lasting `T_pause` (`F·P` = 10 s)
+  counts as the majority being back.** It clears the window and runs the
+  resume path (§3.5). A single Yes on a lossy link is not a heal, and neither
+  is a short run of them (§4.1).
 
 A continuous clock, reset by any single Yes, would never pause a host on a link
 that drops two probes in three, while the voters, which need only five
@@ -156,9 +157,16 @@ or container whose state cannot be read, or whose row cannot be read, is not
 known to be stopped. Every libvirt and LXC call is bounded
 (`partitionPauseCallTimeout`, 2 s); the pauses run **concurrently**, one
 goroutine each, so the pass ends within one call timeout of its last read,
-however many workloads there are, and stays inside `E` (§4.1). A call that times
-out is abandoned, not cancelled, and blocks any second call for the same
-workload until it returns, so a wedged suspend is never issued twice.
+however many workloads there are. The reads themselves are bounded as a whole:
+VMs and containers are read at once under one pass budget, every read ends by
+`E − partitionPauseCallTimeout` after the pass starts (its timeout is cut to
+what is left), and a workload left unread when the budget runs out is a failed
+pause. So the pass stays inside `E` (§4.1) against a libvirtd or LXC that is
+merely slow, too. A call that times out is abandoned, not cancelled. A pause
+call blocks any second call for the same workload until it returns, so a
+wedged suspend is never issued twice; a read blocks any second read of the
+same kind (list, state, XML), so a wedged libvirtd holds at most one
+abandoned goroutine per kind rather than one per tick per domain.
 
 **How it pauses.**
 
@@ -396,6 +404,22 @@ is a lossy link that never breaks continuously: there the guarantee is
 probabilistic — M pauses once it has lost the majority for half of `2·T_pause`
 — while the observers' five-consecutive-failure rule makes a fence on such a
 link equally a matter of chance.
+
+**What a heal must last.** On a lossy link M can read an intermittent Yes
+while the voters build a verdict against it. M's Yes needs only SOME majority
+to answer its own probes, and each voter's failure run is its own, so a
+majority of voters can each count `F` consecutive failures across a stretch in
+which M's readings alternate. A heal that clears the window must therefore not
+fit inside a verdict's build time. A run of three Yes readings did: on a link
+that loses seven seconds in ten, every three-second Yes run cleared the
+window, the loss never reached `T_pause`, and M never paused while the voters
+fenced it. A heal is now an unbroken `T_pause` = `F·P` of Yes readings: as
+long as any voter's `F`-failure run, so no clear can land inside the stretch a
+verdict is built from without M having held a majority for that whole
+stretch. `TestPartitionPause_ALossyLinkStillPauses` pins both the two-in-three
+and the seven-in-ten patterns; `TestPartitionPause_AHealIsASustainedYesOfTPause`
+pins the length. The cost is resume latency: a healed host resumes `T_pause`
+after its first Yes instead of 3 s.
 
 **Why `t_d` and not the coordinator's own last contact.** The coordinator's own
 last successful probe of M is a LOWER bound on M's last contact with the
@@ -699,7 +723,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F4 | One-way partition (A→M works, M→A does not) | M can count a majority that cannot count it, so it may not pause while the majority fences it. The coordinator raises `partition_one_way` (evaluator `partition_pause`, subject `host/<M>`, critical) when it sees both views at once: a quorum of voters with at least `F` consecutive failures of M, and M's own rows marking enough voters healthy for a majority, each written AFTER that voter's failure streak against M began, with that voter still failing M after M saw it healthy. The last clause is what a heal lacks: there the host's new healthy rows are newer than the voters' last failures. It does not recover any differently. | Still open. The fix is mutual reachability: a probe answer that states the responder's own view of the caller. Detection is partial, because the checker does not re-stamp a steadily healthy edge. M's "healthy" rows are fresh only after a transition (a restart, or a flap), so a one-way split that starts with every edge already healthy is not seen. |
 | F5 | More than 17 hosts | `D_M` grows by one probe batch per 16 peers. | Closed: `W` is computed from the cluster's size (§4.4). The one gap is a host added inside the minority during the partition. |
 | F6 | A host comes back before the deadline | The deadline check sees fresh healthy observers (`fenceStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
-| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. A remote region's quorum this node never evaluates is never in grace. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `fenceStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
+| F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. "Lost" is read fresh inside the grace check, never taken from the last recorded reading: a remote region's quorum is read only by a fence decision about one of its hosts, which the grace runs ahead of, so a recorded No would otherwise defer that region's fences for as long as nothing re-read it. A fresh Yes is the No→Yes transition and opens the grace from that moment. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `fenceStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
 | F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. |
 
@@ -796,7 +820,8 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    `ConfirmPartitionResume` (M1); records carry the domain UUID and the local
    epoch is the highest evidence (M2); a relied-on fence keeps method
    `best-effort-ssh` (M3); the target must have advertised the token (M4);
-   loss is accumulated with hysteresis (M5); every skip is a failed pause and
+   loss is accumulated with hysteresis, and a heal is an unbroken `T_pause`
+   of Yes (M5); every skip is a failed pause and
    every call is bounded, with pauses run concurrently (M6).
 6. **Stale-replica resume, tested.** The 2|3 scenario holds replication into
    the healed minority for 12 s while every other RPC flows, so the minority's

@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -83,11 +84,10 @@ func (f *pauseFixture) advance(d time.Duration) {
 }
 func (f *pauseFixture) tick() { f.p.Evaluate(context.Background()) }
 
-// regain holds the quorum at Yes for the partitionRegainTicks readings a heal
-// takes.
+// regain holds the quorum at Yes for the unbroken T_pause a heal takes.
 func (f *pauseFixture) regain() {
 	f.set(QuorumYes)
-	for i := 0; i < partitionRegainTicks; i++ {
+	for i := 0; i <= int(PartitionPauseAfter/time.Second); i++ {
 		f.tick()
 		f.advance(time.Second)
 	}
@@ -443,8 +443,9 @@ func TestPartitionPause_RecordSurvivesARestart(t *testing.T) {
 		}
 		return out
 	})
-	for i := 0; i < partitionRegainTicks; i++ {
+	for i := 0; i <= int(PartitionPauseAfter/time.Second); i++ {
 		restarted.Evaluate(context.Background())
+		f.advance(time.Second)
 	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		t.Fatalf("vm-ha is %s after a restarted pauser regained the majority", st)
@@ -588,27 +589,27 @@ func TestInQuorumRegainGrace_Cluster(t *testing.T) {
 	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumYes {
 		t.Fatalf("setup: quorum %d", st)
 	}
-	if c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+	if c.InQuorumRegainGraceFor(context.Background(), QuorumScopeCluster) {
 		t.Fatal("a daemon that never lost the quorum is in the regain grace")
 	}
 	warm(c, map[string]bool{"host-b": false, "host-c": false})
 	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumNo {
 		t.Fatalf("setup: quorum %d, want No", st)
 	}
-	if !c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+	if !c.InQuorumRegainGraceFor(context.Background(), QuorumScopeCluster) {
 		t.Fatal("a daemon without the quorum is not held back from fencing")
 	}
 	warm(c, map[string]bool{"host-b": true, "host-c": true})
 	if st, _, _ := c.QuorumProof(context.Background()); st != QuorumYes {
 		t.Fatalf("setup: quorum %d after regaining", st)
 	}
-	if !c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+	if !c.InQuorumRegainGraceFor(context.Background(), QuorumScopeCluster) {
 		t.Fatal("a daemon that regained the quorum a moment ago is not in the regain grace")
 	}
 	c.mu.Lock()
 	c.quorumRegainedAt[QuorumScopeCluster] = time.Now().Add(-QuorumRegainGrace - time.Second)
 	c.mu.Unlock()
-	if c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+	if c.InQuorumRegainGraceFor(context.Background(), QuorumScopeCluster) {
 		t.Fatal("still in the regain grace after it passed")
 	}
 }
@@ -654,32 +655,130 @@ func TestInQuorumRegainGrace_ARegionMajorityWithoutTheClusterFences(t *testing.T
 			t.Fatalf("setup: east execution quorum %d, want Yes", st)
 		}
 	}
-	if c.InQuorumRegainGraceFor(RegionQuorumScope("east")) {
+	if c.InQuorumRegainGraceFor(context.Background(), RegionQuorumScope("east")) {
 		t.Fatal("east's majority is held back from fencing by the cluster-wide quorum it does not decide on")
 	}
-	if !c.InQuorumRegainGraceFor(QuorumScopeCluster) {
+	if !c.InQuorumRegainGraceFor(context.Background(), QuorumScopeCluster) {
 		t.Fatal("the cluster-wide scope, which is lost, reads as not in grace")
 	}
 }
 
-// A lossy link: the quorum reads No for two ticks and Yes for one, over and
-// over. No Yes run is a heal (partitionRegainTicks), and the loss covers two
-// thirds of the window, so the host pauses — while a continuous clock, reset
-// by every Yes, never would, though the voters, which need only five
-// consecutive failures each, may well fence it.
+// A coordinator outside region west reads west's quorum as No once — a
+// decision about a west host while west was out of reach — and west then
+// heals. Nothing on this daemon re-reads west's quorum on a schedule: only a
+// fence decision about a west host does, and the regain grace runs ahead of
+// it. A grace that trusted the recorded No would defer every later west fence
+// for good. It re-reads instead: the heal opens the grace from the moment it
+// is seen, and once that has passed a west host that fails is fenced.
 //
-// Mutation: reset the window on any single Yes — nothing pauses and this goes
-// red.
+// Mutation: drop the fresh read (trust quorumLost) — the "after the grace"
+// check goes red, the scope stays in grace forever.
+func TestInQuorumRegainGrace_ARemoteRegionHealsAndItsHostsFenceAgain(t *testing.T) {
+	ctx := context.Background()
+	db := testCheckHostDB(t)
+	for _, h := range []string{"e1", "e2", "e3", "w1", "w2", "w3", "w4"} {
+		gateHost(t, db, h, "active", "worker")
+	}
+	for _, h := range []string{"e1", "e2", "e3"} {
+		if err := corrosion.UpdateHostRegion(ctx, db, h, "east"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, h := range []string{"w1", "w2", "w3", "w4"} {
+		if err := corrosion.UpdateHostRegion(ctx, db, h, "west"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.SetClusterPolicyGate(func() bool { return true })
+	if err := corrosion.SetFailoverScope(ctx, db, corrosion.FailoverScopeRegion, "test"); err != nil {
+		t.Fatal(err)
+	}
+	c := NewChecker("e1", "/etc/litevirt/pki", db)
+	now := time.Now()
+	c.clock = func() time.Time { return now }
+	west := RegionQuorumScope("west")
+
+	warm(c, map[string]bool{"e2": true, "e3": true, "w1": false, "w2": false, "w3": false, "w4": false})
+	if st, _, _ := c.RegionQuorumProof(ctx, "west"); st != QuorumNo {
+		t.Fatalf("setup: west quorum %d, want No", st)
+	}
+	if !c.InQuorumRegainGraceFor(ctx, west) {
+		t.Fatal("west, out of reach, is not held back")
+	}
+
+	// West heals; then w1 fails. 3 of 4 west voters answer: still a majority.
+	warm(c, map[string]bool{"e2": true, "e3": true, "w1": false, "w2": true, "w3": true, "w4": true})
+	if !c.InQuorumRegainGraceFor(ctx, west) {
+		t.Fatal("the heal, seen a moment ago, does not open the regain grace")
+	}
+	now = now.Add(QuorumRegainGrace + time.Second)
+	if c.InQuorumRegainGraceFor(ctx, west) {
+		t.Fatal("west's fences are still deferred a full grace after its quorum came back")
+	}
+}
+
+// A lossy link: the quorum reads lost for a stretch and Yes for a shorter one,
+// over and over. No Yes run lasts T_pause, so none is a heal, and the loss
+// covers most of the window, so the host pauses — while a continuous clock,
+// reset by every Yes, never would.
+//
+// The second pattern: seven seconds lost, three Yes. This host's Yes needs
+// only SOME majority of the voters to answer its probes, and each voter's
+// failure run is its own, not lined up with this host's readings, so a
+// majority of voters can each count five consecutive failures across a
+// stretch in which this host reads an intermittent Yes. A three-reading heal
+// cleared the window on every Yes run, so the loss never reached T_pause and
+// the host never paused, while the voters fenced it and waited out a pause
+// that never came.
+//
+// Mutations: reset the window on any single Yes — the first pattern stays
+// running and this goes red; count three Yes readings as a heal — the second
+// pattern stays running and this goes red.
 func TestPartitionPause_ALossyLinkStillPauses(t *testing.T) {
+	for _, pat := range []struct {
+		name      string
+		lost, yes int
+	}{{"two lost, one yes", 2, 1}, {"seven lost, three yes", 7, 3}} {
+		t.Run(pat.name, func(t *testing.T) {
+			f := newPauseFixture(t)
+			for i := 0; i < 40/(pat.lost+pat.yes); i++ {
+				f.loseFor(QuorumNo, time.Duration(pat.lost-1)*time.Second) // pat.lost readings lost
+				f.set(QuorumYes)
+				for j := 0; j < pat.yes; j++ {
+					f.tick()
+					f.advance(time.Second)
+				}
+			}
+			if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+				t.Fatalf("vm-ha is %s after 40 s of a link losing the majority %d readings in %d",
+					st, pat.lost, pat.lost+pat.yes)
+			}
+		})
+	}
+}
+
+// A heal is an unbroken T_pause of Yes: one reading short of it resumes
+// nothing, and the reading that completes it does.
+//
+// Mutation: count a heal before T_pause — vm-ha resumes early and this goes
+// red; never count one — vm-ha stays paused and this goes red.
+func TestPartitionPause_AHealIsASustainedYesOfTPause(t *testing.T) {
 	f := newPauseFixture(t)
-	for i := 0; i < 15; i++ {
-		f.loseFor(QuorumNo, time.Second) // two readings lost
-		f.set(QuorumYes)
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+		t.Fatalf("setup: vm-ha is %s", st)
+	}
+	f.set(QuorumYes)
+	for i := 0; i < int(PartitionPauseAfter/time.Second); i++ {
 		f.tick()
 		f.advance(time.Second)
 	}
 	if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
-		t.Fatalf("vm-ha is %s after 30 s of a link losing the majority two readings in three", st)
+		t.Fatalf("vm-ha is %s after %v of Yes, short of the T_pause a heal takes", st, PartitionPauseAfter-time.Second)
+	}
+	f.tick()
+	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
+		t.Fatalf("vm-ha is %s after an unbroken T_pause of Yes", st)
 	}
 }
 
@@ -703,6 +802,92 @@ func TestPartitionPause_DropsARecordWhoseDomainIsNoLongerPaused(t *testing.T) {
 	}
 	if c, ok := f.condition(corrosion.CondPartitionPaused); !ok || c.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("partition_paused is not resolved (ok=%v %+v)", ok, c)
+	}
+}
+
+// A record whose domain has been undefined since describes nothing: the
+// domain lookup now fails not-found, and the record is dropped so
+// partition_paused resolves. (Real libvirt reports an undefined domain as a
+// lookup error, not as a state.)
+//
+// Mutation: keep a record whose lookup fails not-found — the record and the
+// condition remain and this goes red.
+func TestPartitionPause_DropsARecordWhoseDomainIsUndefined(t *testing.T) {
+	f := newPauseFixture(t)
+	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+	if len(f.records()) != 1 {
+		t.Fatalf("setup: records %+v", f.records())
+	}
+	f.virt.FailDomainStateReason = func(name string) error {
+		if name == "vm-ha" {
+			return fmt.Errorf("lookup domain %s: Domain not found: no domain with matching name '%s'", name, name)
+		}
+		return nil
+	}
+	f.p.SetResumeConfirmer(nil)
+	f.regain()
+	if recs := f.records(); len(recs) != 0 {
+		t.Fatalf("records = %+v after the domain was undefined", recs)
+	}
+	if c, ok := f.condition(corrosion.CondPartitionPaused); !ok || c.Lifecycle != corrosion.ConditionResolved {
+		t.Fatalf("partition_paused is not resolved (ok=%v %+v)", ok, c)
+	}
+}
+
+// A libvirtd that wedges holds at most one abandoned goroutine per read kind:
+// while a DomainStateReason has not returned, later ones fail at once instead
+// of each leaving another goroutine behind, and every one of them is a failed
+// pause. Once it returns, reads run again.
+//
+// Mutation: drop the guard — every tick issues another call and this goes red.
+func TestPartitionPause_AWedgedReadLeaksOneGoroutinePerKind(t *testing.T) {
+	f := newPauseFixture(t)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	f.virt.FailDomainStateReason = func(name string) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		<-release
+		return nil
+	}
+	f.loseFor(QuorumNo, PartitionPauseAfter+5*time.Second)
+	mu.Lock()
+	n := calls
+	mu.Unlock()
+	close(release)
+	if n != 1 {
+		t.Fatalf("%d DomainStateReason calls were issued against a wedged libvirtd; the guard admits one", n)
+	}
+	if failed, _ := corrosion.HostPartitionPauseFailed(context.Background(), f.db, "node-a"); !failed {
+		t.Fatal("reads refused by the guard did not raise partition_pause_failed")
+	}
+}
+
+// A slow libvirtd — every read answers, each just under the call timeout —
+// cannot stretch the pass past E: reads stop at the pass budget and every
+// domain left unread is a failed pause, not a wait.
+//
+// Mutation: give each read the full call timeout whatever is left of the
+// pass — the pass takes about 8 s and this goes red.
+func TestPartitionPause_ASlowLibvirtdCannotStretchThePassPastE(t *testing.T) {
+	f := newPauseFixture(t)
+	for _, n := range []string{"vm-x1", "vm-x2", "vm-x3", "vm-x4", "vm-x5", "vm-x6"} {
+		f.virt.SetState(n, libvirtfake.StateRunning)
+	}
+	f.loseFor(QuorumNo, PartitionPauseAfter-time.Second) // one reading short of pausing
+	f.virt.FailDomainStateReason = func(string) error {
+		time.Sleep(partitionPauseCallTimeout * 3 / 4)
+		return nil
+	}
+	start := time.Now()
+	f.tick()
+	if took := time.Since(start); took > PartitionPauseExecBudget+time.Second {
+		t.Fatalf("the pause pass took %v against a slow libvirtd; E is %v", took, PartitionPauseExecBudget)
+	}
+	if failed, _ := corrosion.HostPartitionPauseFailed(context.Background(), f.db, "node-a"); !failed {
+		t.Fatal("domains the pass had no budget to read were not reported as a failed pause")
 	}
 }
 

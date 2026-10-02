@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/lxc"
 )
 
@@ -213,5 +214,44 @@ func TestPartitionPause_SettlesARelocatedContainer(t *testing.T) {
 				t.Fatalf("ct_settled = (%+v, %v, %v)", c, ok, err)
 			}
 		})
+	}
+}
+
+// slowCT answers every List and State, slowly.
+type slowCT struct {
+	*fakeCT
+	delay time.Duration
+}
+
+func (s slowCT) List(ctx context.Context) ([]string, error) {
+	time.Sleep(s.delay)
+	return s.fakeCT.List(ctx)
+}
+
+func (s slowCT) State(ctx context.Context, name string) (lxc.State, error) {
+	time.Sleep(s.delay)
+	return s.fakeCT.State(ctx, name)
+}
+
+// VMs and containers share ONE pass budget and run at once: a host with both,
+// against a slow libvirtd and a slow LXC, still ends its pass within E. Run
+// one after the other, each with its own budget, they take about twice that.
+//
+// Mutation: pause the containers after the VMs, under a fresh budget — the
+// pass takes about 6 s and this goes red.
+func TestPartitionPause_VMsAndContainersShareThePassBudget(t *testing.T) {
+	f, rt := newContainerPauseFixture(t)
+	f.p.SetVMBackend(f.virt)
+	for _, n := range []string{"vm-x1", "vm-x2", "vm-x3"} {
+		f.virt.SetState(n, libvirtfake.StateRunning)
+	}
+	delay := partitionPauseCallTimeout * 3 / 4
+	f.p.SetContainerRuntime(slowCT{rt, delay})
+	f.loseFor(QuorumNo, PartitionPauseAfter-time.Second) // one reading short of pausing
+	f.virt.FailDomainStateReason = func(string) error { time.Sleep(delay); return nil }
+	start := time.Now()
+	f.tick()
+	if took := time.Since(start); took > PartitionPauseExecBudget+time.Second/2 {
+		t.Fatalf("the pause pass took %v with VMs and containers; E is %v", took, PartitionPauseExecBudget)
 	}
 }

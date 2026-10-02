@@ -99,14 +99,16 @@ func (r *Reconciler) localVMIdentity(name string) localCopyID {
 }
 
 // recordStillDescribes reports whether rec is still about the local domain:
-// paused, and the same domain UUID when the record carries one.
+// paused, and the same domain UUID. A record without a UUID (its DumpXML read
+// failed at pause time) cannot show it is about THIS domain rather than one
+// defined under the same name since, so it is not evidence.
 func (r *Reconciler) recordStillDescribes(rec PauseRecord) bool {
 	st, err := r.virt.DomainStateReason(rec.Name)
 	if err != nil || st.Reason != "paused" {
 		return false
 	}
 	if rec.DomainUUID == "" {
-		return true
+		return false
 	}
 	xml, err := r.virt.DumpXMLInactive(rec.Name)
 	if err != nil {

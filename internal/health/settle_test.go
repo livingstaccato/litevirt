@@ -51,6 +51,7 @@ func newSettleFixture(t *testing.T) *settleFixture {
 	// The local copy is one this host's partition pause suspended.
 	f.virt.SetState("vm-a", libvirtfake.StateRunning)
 	f.virt.SetPaused("vm-a")
+	f.virt.SetInactiveXML("vm-a", settleDomainXML)
 	f.proof = corrosion.ProofRecord{ActionProof: corrosion.ActionProof{ID: "proof-1", Action: corrosion.ActionReschedule,
 		TargetKind: corrosion.ClaimKindVM, TargetName: "vm-a", DestHost: "node-b", OwnerEpoch: "3",
 		ClaimCertificate: "{}"}, Status: corrosion.ProofCompleted, ExecutorHost: "node-b"}
@@ -58,7 +59,7 @@ func newSettleFixture(t *testing.T) *settleFixture {
 		OwnerEpoch: 3, Incarnation: inc}, ConfigGeneration: 1}
 	// The local copy, as this host's pause recorded it.
 	if err := newPauseStore(f.dataDir).put(PauseRecord{Kind: PauseKindVM, Name: "vm-a", Host: "node-a",
-		OwnerEpoch: 3, Incarnation: inc}); err != nil {
+		OwnerEpoch: 3, Incarnation: inc, DomainUUID: settleDomainUUID}); err != nil {
 		t.Fatal(err)
 	}
 	f.r = NewReconciler("node-a", f.dataDir, f.db, f.virt)
@@ -129,6 +130,41 @@ func TestSettle_AStaleRecordIsNotEvidence(t *testing.T) {
 	}
 }
 
+// The local copy's domain, by UUID: the pause record names it.
+const (
+	settleDomainUUID = "6f1c2a3e-0000-4000-8000-00000000000a"
+	settleDomainXML  = `<domain type='kvm'><name>vm-a</name><uuid>` + settleDomainUUID +
+		`</uuid><memory unit='MiB'>1024</memory><vcpu>1</vcpu><devices></devices></domain>`
+)
+
+// A record without a domain UUID — its DumpXML read failed at pause time —
+// cannot show it is about THIS domain rather than one defined under the same
+// name since, so it is not evidence; nor is one naming another domain.
+//
+// Mutations: accept a record without a UUID — the first case stops the copy
+// and this goes red; skip the UUID comparison — the second does.
+func TestSettle_ARecordMustNameTheDomainByUUID(t *testing.T) {
+	for _, tc := range []struct{ name, uuid string }{
+		{"no uuid", ""},
+		{"another domain's uuid", "6f1c2a3e-0000-4000-8000-0000000000ff"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSettleFixture(t)
+			rec, ok, err := ReadPauseRecord(f.dataDir, PauseKindVM, "vm-a")
+			if err != nil || !ok {
+				t.Fatalf("setup: record %v %v", ok, err)
+			}
+			rec.DomainUUID = tc.uuid
+			if err := newPauseStore(f.dataDir).put(rec); err != nil {
+				t.Fatal(err)
+			}
+			if st := f.run(); st == libvirtfake.StateShutdown {
+				t.Fatalf("vm-a is %s; a record that does not name this domain was taken as proof", st)
+			}
+		})
+	}
+}
+
 // The local copy's epoch is the HIGHEST any host-local source reports: a pause
 // record at 3 beside owner-epoch metadata at 5 is a copy at 5, which a
 // certificate for epoch 3 does not supersede.
@@ -172,7 +208,7 @@ func TestSettle_NeverWithoutPositiveProof(t *testing.T) {
 				f.t.Fatal(err)
 			}
 			if err := newPauseStore(f.dataDir).put(PauseRecord{Kind: PauseKindVM, Name: "vm-a", Host: "node-a",
-				OwnerEpoch: 3, Incarnation: "1999-01-01T00:00:00Z"}); err != nil {
+				OwnerEpoch: 3, Incarnation: "1999-01-01T00:00:00Z", DomainUUID: settleDomainUUID}); err != nil {
 				f.t.Fatal(err)
 			}
 			f.cert.Key.Incarnation = "" // a legacy key: only the row binds the incarnation

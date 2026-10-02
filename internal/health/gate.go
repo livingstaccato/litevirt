@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -188,7 +189,9 @@ const QuorumRegainGrace = StallGrace
 const QuorumScopeCluster = "cluster"
 
 // RegionQuorumScope is the regain-grace scope of region's voters.
-func RegionQuorumScope(region string) string { return "region:" + region }
+func RegionQuorumScope(region string) string { return regionScopePrefix + region }
+
+const regionScopePrefix = "region:"
 
 // noteQuorum records one reading of scope's quorum: a No marks it lost, and the
 // first Yes after that is its No→Yes transition. Unknown changes nothing. The
@@ -219,11 +222,26 @@ func (c *Checker) noteQuorum(scope string, st QuorumState) {
 // a new fence decided on scope's quorum: that quorum is lost now (this node is
 // on the minority side of it), or it was regained within QuorumRegainGrace. A
 // scope this daemon never saw lost is never in it, so a majority that kept its
-// quorum through a partition fences as before. A region whose quorum this
-// daemon never evaluates (a remote region under region scope) is never in it
-// either; the daemon's own region is evaluated every tick by the partition
-// pauser's ExecutionQuorum.
-func (c *Checker) InQuorumRegainGraceFor(scope string) bool {
+// quorum through a partition fences as before.
+//
+// "Lost now" is read fresh, never taken from the last recorded reading. The
+// daemon's own scope is re-read every tick by the partition pauser, but a
+// remote region's quorum is read only by a fence decision about one of its
+// hosts — which this grace runs ahead of. Trusting the recorded No would defer
+// that region's fences for as long as nothing else re-read it: forever. So a
+// scope recorded lost is re-evaluated here; a Yes is its No→Yes transition and
+// opens the grace from now, a No or an unreadable quorum keeps it closed.
+func (c *Checker) InQuorumRegainGraceFor(ctx context.Context, scope string) bool {
+	c.mu.Lock()
+	lost := c.quorumLost[scope]
+	c.mu.Unlock()
+	if lost {
+		if region, ok := strings.CutPrefix(scope, regionScopePrefix); ok {
+			c.RegionQuorumProof(ctx, region)
+		} else {
+			c.QuorumProof(ctx)
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.quorumLost[scope] {

@@ -3,6 +3,7 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -53,10 +54,6 @@ const (
 		2*partitionPauseTick + PartitionPauseExecBudget + partitionPauseSlack
 	// PartitionPauseWait is W for a cluster of up to probeConcurrency+1 hosts.
 	PartitionPauseWait = PartitionPauseAfter + PartitionPauseMargin
-	// partitionRegainTicks is how many consecutive Yes readings count as the
-	// majority being BACK: they clear the accumulated loss and allow a resume.
-	// A single Yes on a lossy link is not a heal.
-	partitionRegainTicks = 3
 	// partitionResumeRecheck spaces the majority confirmation while a resume
 	// is held, so a host left fenced does not fan out to every voter each tick.
 	partitionResumeRecheck = 5 * time.Second
@@ -114,12 +111,56 @@ type PauseVMBackend interface {
 	ResumeDomain(name string) error
 }
 
-// boundedCall runs fn with a deadline: a libvirt or LXC call can hang (a
-// wedged qemu monitor, a stuck lxc-info) and the majority's wait assumes the
-// pause pass ends within PartitionPauseExecBudget. On timeout the call is
-// abandoned, still running; the caller must not issue a second one for the
-// same workload until it returns (inflight).
-func boundedCall[T any](timeout time.Duration, fn func() (T, error)) (T, error) {
+// Read kinds the pauser's abandoned-call guard tracks (callGuard).
+const (
+	readListDomains = "ListDomains"
+	readDomainState = "DomainStateReason"
+	readDomainXML   = "DumpXMLInactive"
+)
+
+// callGuard admits one call of each kind at a time. A libvirt call can hang
+// (a wedged qemu monitor or libvirtd), and the majority's wait assumes the
+// pause pass ends within PartitionPauseExecBudget, so guardedCall abandons a
+// call that times out, still running in its own goroutine. Against a wedged
+// libvirtd every later pass would abandon another, one per tick per domain,
+// for as long as the partition lasts. Under the guard a kind whose last call
+// has not returned fails at once instead, so a wedged libvirtd holds at most
+// one goroutine per kind.
+type callGuard struct {
+	mu   sync.Mutex
+	busy map[string]bool
+}
+
+func (g *callGuard) acquire(kind string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.busy[kind] {
+		return false
+	}
+	if g.busy == nil {
+		g.busy = map[string]bool{}
+	}
+	g.busy[kind] = true
+	return true
+}
+
+func (g *callGuard) release(kind string) {
+	g.mu.Lock()
+	delete(g.busy, kind)
+	g.mu.Unlock()
+}
+
+// guardedCall runs fn with a deadline under g: a call of kind is refused while
+// an earlier one has not returned. A nil g guards nothing. A timeout of zero
+// or less (no pass budget left) refuses the call outright.
+func guardedCall[T any](g *callGuard, kind string, timeout time.Duration, fn func() (T, error)) (T, error) {
+	var zero T
+	if timeout <= 0 {
+		return zero, errPassBudget
+	}
+	if g != nil && !g.acquire(kind) {
+		return zero, fmt.Errorf("an earlier %s call has not returned yet", kind)
+	}
 	type res struct {
 		v   T
 		err error
@@ -127,15 +168,37 @@ func boundedCall[T any](timeout time.Duration, fn func() (T, error)) (T, error) 
 	ch := make(chan res, 1)
 	go func() {
 		v, err := fn()
+		if g != nil {
+			g.release(kind) // before the result: the caller's next call must find it free
+		}
 		ch <- res{v, err}
 	}()
 	select {
 	case r := <-ch:
 		return r.v, r.err
 	case <-time.After(timeout):
-		var zero T
 		return zero, fmt.Errorf("did not return within %v", timeout)
 	}
+}
+
+// errPassBudget is a read the pause pass had no budget left for.
+var errPassBudget = errors.New("the pause pass ran out of its budget before this read")
+
+// passBudget bounds the reads of one pause pass. Reads end by readsBy, so
+// that the pause calls they lead to — each bounded by
+// partitionPauseCallTimeout, all running at once — end within
+// PartitionPauseExecBudget (E) of the pass's start, however many workloads
+// there are and however slowly libvirt or LXC answers.
+type passBudget struct{ readsBy time.Time }
+
+func newPassBudget() passBudget {
+	return passBudget{readsBy: time.Now().Add(PartitionPauseExecBudget - partitionPauseCallTimeout)}
+}
+
+// timeout is the bound for the next read: the per-call timeout, cut to what
+// is left of the pass. Zero or less means no budget is left.
+func (b passBudget) timeout() time.Duration {
+	return min(partitionPauseCallTimeout, time.Until(b.readsBy))
 }
 
 // frozenStater is the optional container-runtime capability to tell a FROZEN
@@ -252,10 +315,13 @@ type PartitionPauser struct {
 
 	mu sync.Mutex
 	// samples are this pass's and earlier passes' quorum readings inside the
-	// last 2·T_pause, on the local monotonic clock; yesStreak counts the
-	// consecutive Yes readings. A restart re-earns both, deliberately.
-	samples   []lossSample
-	yesStreak int
+	// last 2·T_pause, on the local monotonic clock; yesSince is the first
+	// reading of the current unbroken run of Yes readings, zero while the
+	// last reading was not Yes. A restart re-earns both, deliberately.
+	samples  []lossSample
+	yesSince time.Time
+	// reads guards the abandoned libvirt reads, one call per kind (callGuard).
+	reads callGuard
 	// inflight marks the workloads whose pause call has not returned yet (a
 	// timed-out call is abandoned, not cancelled): no second call is issued.
 	inflight    map[string]bool
@@ -369,8 +435,11 @@ func (p *PartitionPauser) Start(ctx context.Context) {
 // window — accumulated, not continuous, so a lossy link whose occasional Yes
 // would reset a continuous clock still pauses while the voters, which need
 // only five consecutive failures each, fence it (docs/design/partition-pause.md
-// §4.1). Only partitionRegainTicks consecutive Yes readings count as the
-// majority being back: they clear the window and run the resume checks.
+// §4.1). Only an unbroken run of Yes readings lasting T_pause (FailuresToFence
+// probe intervals, the time a fence verdict takes to build) counts as the
+// majority being back: it clears the window and runs the resume checks. A
+// shorter run could clear the window inside the very stretch the voters are
+// building a verdict from, and the pause would then never come.
 func (p *PartitionPauser) Evaluate(ctx context.Context) {
 	if p.quorum == nil {
 		return
@@ -393,11 +462,11 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 		p.samples = p.samples[1:]
 	}
 	if lost {
-		p.yesStreak = 0
-	} else {
-		p.yesStreak++
+		p.yesSince = time.Time{}
+	} else if p.yesSince.IsZero() {
+		p.yesSince = now
 	}
-	regained := p.yesStreak >= partitionRegainTicks
+	regained := !lost && now.Sub(p.yesSince) >= p.after
 	if regained {
 		if hadLoss {
 			p.lastConfirm = time.Time{} // first resume check after a heal runs at once
@@ -469,12 +538,23 @@ func (p *PartitionPauser) noteExempt(why string) {
 // pauseAll pauses every recoverable workload still running here.
 func (p *PartitionPauser) pauseAll(ctx context.Context, now time.Time, reason string) {
 	deadline := now.Add(PartitionPauseExecBudget)
-	failures := map[string]string{}
+	budget := newPassBudget()
+	// VMs and containers at once, each under the same read budget, so the
+	// pass as a whole ends within E rather than each half of it.
+	vmFail, ctFail := map[string]string{}, map[string]string{}
+	var wg sync.WaitGroup
 	if p.vms != nil {
-		p.pauseVMs(ctx, reason, failures)
+		wg.Add(1)
+		go func() { defer wg.Done(); p.pauseVMs(ctx, budget, reason, vmFail) }()
 	}
 	if p.cts != nil {
-		p.pauseContainers(ctx, reason, failures)
+		wg.Add(1)
+		go func() { defer wg.Done(); p.pauseContainers(ctx, budget, reason, ctFail) }()
+	}
+	wg.Wait()
+	failures := vmFail
+	for k, v := range ctFail {
+		failures[k] = v
 	}
 	if over := p.now().Sub(deadline); over > 0 {
 		slog.Warn("partition-pause: pausing took longer than its budget; the majority's wait assumes it does not",
@@ -496,8 +576,8 @@ func (p *PartitionPauser) pauseAll(ctx context.Context, now time.Time, reason st
 	p.syncPausedCondition(ctx, reason)
 }
 
-func (p *PartitionPauser) pauseVMs(ctx context.Context, reason string, failures map[string]string) {
-	names, err := boundedCall(partitionPauseCallTimeout, p.vms.ListDomains)
+func (p *PartitionPauser) pauseVMs(ctx context.Context, budget passBudget, reason string, failures map[string]string) {
+	names, err := guardedCall(&p.reads, readListDomains, budget.timeout(), p.vms.ListDomains)
 	if err != nil {
 		failures["vm/*"] = "list domains: " + err.Error()
 		return
@@ -509,7 +589,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, reason string, failures 
 	var wg sync.WaitGroup
 	for _, name := range names {
 		key := PauseKindVM + "/" + name
-		st, err := boundedCall(partitionPauseCallTimeout, func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(name) })
+		st, err := guardedCall(&p.reads, readDomainState, budget.timeout(), func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(name) })
 		if err != nil {
 			// Not knowing whether it runs is not knowing it is stopped.
 			fail(key, "domain state unreadable: "+err.Error())
@@ -539,7 +619,7 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, reason string, failures 
 		if !corrosion.VMRecoverableOnHostFailure(*vm, enrolled[vm.Name]) {
 			continue
 		}
-		xml, _ := boundedCall(partitionPauseCallTimeout, func() (string, error) { return p.vms.DumpXMLInactive(name) })
+		xml, _ := guardedCall(&p.reads, readDomainXML, budget.timeout(), func() (string, error) { return p.vms.DumpXMLInactive(name) })
 		rec := PauseRecord{Kind: PauseKindVM, Name: name, Host: p.host, OwnerEpoch: vm.OwnerEpoch,
 			Incarnation: corrosion.IncarnationOf(vm.CreatedAt), DomainUUID: lv.UUIDFromXML(xml),
 			PausedAt: p.now().UTC().Format(time.RFC3339), Reason: reason}
@@ -556,8 +636,12 @@ func (p *PartitionPauser) pauseVMs(ctx context.Context, reason string, failures 
 	wg.Wait()
 }
 
-func (p *PartitionPauser) pauseContainers(ctx context.Context, reason string, failures map[string]string) {
-	lctx, cancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
+func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget, reason string, failures map[string]string) {
+	if budget.timeout() <= 0 {
+		failures["ct/*"] = "list containers: " + errPassBudget.Error()
+		return
+	}
+	lctx, cancel := context.WithTimeout(ctx, budget.timeout())
 	names, err := p.cts.List(lctx)
 	cancel()
 	if err != nil {
@@ -584,7 +668,11 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, reason string, fa
 		if !ok || !corrosion.ContainerRecoverableOnHostFailure(row) {
 			continue
 		}
-		sctx, scancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
+		if budget.timeout() <= 0 {
+			fail(key, "container state unreadable: "+errPassBudget.Error())
+			continue
+		}
+		sctx, scancel := context.WithTimeout(ctx, budget.timeout())
 		st, err := p.cts.State(sctx, name)
 		scancel()
 		if err != nil {
@@ -599,8 +687,8 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, reason string, fa
 		// to resume. Without it a container we recorded is assumed frozen (a
 		// second freeze is at best a no-op), and one we did not is frozen.
 		_, recorded, _ := p.store.get(PauseKindContainer, name)
-		if fs != nil {
-			fctx, fcancel := context.WithTimeout(ctx, partitionPauseCallTimeout)
+		if fs != nil && budget.timeout() > 0 {
+			fctx, fcancel := context.WithTimeout(ctx, budget.timeout())
 			frozen, ferr := fs.IsFrozen(fctx, name)
 			fcancel()
 			if ferr == nil && frozen {
@@ -677,7 +765,12 @@ func (p *PartitionPauser) stillPausedByUs(rec PauseRecord) (bool, string) {
 	if rec.Kind != PauseKindVM || p.vms == nil {
 		return true, ""
 	}
-	st, err := boundedCall(partitionPauseCallTimeout, func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
+	st, err := guardedCall(&p.reads, readDomainState, partitionPauseCallTimeout, func() (lv.DomainStatus, error) { return p.vms.DomainStateReason(rec.Name) })
+	if lv.IsNotFound(err) {
+		// Undefined since: there is nothing left to resume, and a kept record
+		// would hold partition_paused open for good.
+		return false, "the domain is no longer defined"
+	}
 	if err != nil {
 		return true, "" // unreadable now: keep the record, decide next pass
 	}
@@ -685,7 +778,7 @@ func (p *PartitionPauser) stillPausedByUs(rec PauseRecord) (bool, string) {
 		return false, "the domain is " + st.State + "/" + st.Reason + ", no longer paused"
 	}
 	if rec.DomainUUID != "" {
-		if xml, err := boundedCall(partitionPauseCallTimeout, func() (string, error) { return p.vms.DumpXMLInactive(rec.Name) }); err == nil {
+		if xml, err := guardedCall(&p.reads, readDomainXML, partitionPauseCallTimeout, func() (string, error) { return p.vms.DumpXMLInactive(rec.Name) }); err == nil {
 			if u := lv.UUIDFromXML(xml); u != "" && u != rec.DomainUUID {
 				return false, "the domain is another one (uuid " + u + ")"
 			}

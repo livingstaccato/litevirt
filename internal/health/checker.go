@@ -348,9 +348,27 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 	// otherwise stand forever, and HealthyPeers would keep offering it as
 	// proven live. Maintenance hosts are not candidates and keep their entry,
 	// exactly as before the plan existed.
+	//
+	// So does a peer that left the host table: removed (`lv host rm`), it is
+	// no candidate at all, and the loop above never sees it. Its entry used to
+	// stay, failure count and all, keyed by a name the cluster can give a new
+	// machine (`lv host add` after `lv host rm --dead`). The first probe of that
+	// machine then published the old count plus one — past the fence threshold
+	// on a host this observer had never probed — and the coordinator fenced it
+	// mid-setup (kvm003 drill 6, main-8d1e56dc). A host back in the table starts
+	// from nothing, as after a restart of this checker.
+	listed := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		listed[h.Name] = true
+	}
 	c.mu.Lock()
 	for _, name := range names {
 		if !plan[name] {
+			delete(c.peers, name)
+		}
+	}
+	for name := range c.peers {
+		if !listed[name] {
 			delete(c.peers, name)
 		}
 	}

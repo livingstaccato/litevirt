@@ -234,6 +234,21 @@ lv host config host-b \
   --ipmi-pass <secret>
 ```
 
+An empty `--ipmi-*` flag leaves the setting alone. To remove a host's IPMI
+address, user and password, use `--clear-ipmi`; a host that fences by `ipmi`
+needs another strategy in the same command, since it would have nothing to
+authenticate with:
+
+```bash
+lv host config host-b --fence-strategy ssh --clear-ipmi
+```
+
+The clear writes both copies of the password, the `host_fence_credentials`
+row and the old `hosts.ipmi_pass` column, so it is refused until
+`credentials_split_v1` has latched on the node that takes it. A server that
+predates the flag ignores it; the CLI reports an error when the host it gets
+back still has an IPMI address.
+
 ### Manual fence confirmation flow
 
 Under `manual` strategy, the failover coordinator records the failure but

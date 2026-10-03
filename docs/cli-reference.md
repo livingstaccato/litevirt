@@ -111,6 +111,7 @@ lv host label ls <host>                   # List labels on a host
 lv host config <host>                     # Configure host settings
   [--fence-strategy ssh|ipmi|watchdog]
   [--ipmi-address <addr>] [--ipmi-user <u>] [--ipmi-pass <p>]
+  [--clear-ipmi]                          # Remove the IPMI address, user and password
   [--watchdog-dev <path>]
   [--role worker|witness]                 # witness = vote-only tiebreaker
   [--region <name>]                       # Region label (federation)

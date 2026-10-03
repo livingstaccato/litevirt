@@ -147,6 +147,13 @@ message ConfigureHostRequest {
     optional double mem_overcommit = 10;
     optional int32 cpu_reserve = 11;
     optional int32 mem_reserve_mib = 12;
+    // Clear the host's IPMI address, user and password. An empty ipmi_* field
+    // means "leave alone", so this is the only way to remove them. Refused
+    // together with any ipmi_* field, and while the host would be left fencing
+    // by "ipmi" (pass another fence_strategy with it). A server that predates
+    // the field ignores it: alone it answers "no fields to update", and a
+    // client must check the returned host's ipmi_address is empty.
+    bool clear_ipmi = 13;
 }
 
 // ── VMs ──

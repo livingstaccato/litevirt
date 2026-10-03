@@ -1123,7 +1123,24 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
 		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
 	}
-	err := corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
+	// A name whose removed machine still has workloads recorded on it is not
+	// given to a new machine: those rows are the old machine's, recovered by
+	// the claim path only while the name stays removed, and the new machine
+	// would take them over (corrosion.WorkloadsOnRemovedHost).
+	left, err := corrosion.WorkloadsOnRemovedHost(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the workloads recorded on %s: %v", req.Name, err)
+	}
+	if len(left) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"host %q was removed with %d workload(s) still recorded on it (%s). They belong to the machine "+
+				"removed under that name, and a new machine admitted under it would take them over. The "+
+				"failover coordinator recovers them onto live hosts once the removal and the CRL have "+
+				"replicated (`lv health` shows ha.claim.stranded for any it cannot); wait for them to move, "+
+				"or remove them (`lv rm <vm>`, `lv ct rm <name>`), then add the host again",
+			req.Name, len(left), strings.Join(left, ", "))
+	}
+	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
 		Name:       req.Name,
 		Address:    req.Address,
 		SSHUser:    "root",

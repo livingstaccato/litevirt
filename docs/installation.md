@@ -112,6 +112,13 @@ machine's wiring before its first `lv host network apply`. Its host-tier
 firewall rules (`lv firewall host-rule`) are kept: they are policy for guest
 traffic through the host of that name, not a property of the hardware.
 
+Nor does it inherit the old machine's workloads. `lv host add` refuses a name
+while VMs or containers are still recorded on the host removed under it, and
+names them. They are recovered onto live hosts by the claim path for a host
+removed for good, which needs the name to stay removed; wait until they have
+moved (`lv health` shows `ha.claim.stranded` for any that cannot), or remove
+them, and add the host again.
+
 3. Edit `/etc/litevirt/config.yaml` on the new host to set the join address:
 
 ```yaml

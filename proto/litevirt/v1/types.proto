@@ -17,6 +17,11 @@ enum VMState {
     VM_MIGRATING = 5;
     VM_ERROR     = 6;
     VM_UNKNOWN   = 7;
+    // VM_PAUSED: the domain is active but not executing, its RAM kept —
+    // suspended by the partition pauser or an operator. libvirt reports it
+    // "stopped", the same as shut off; the server reads the reason. A client
+    // built before it shows the number 8.
+    VM_PAUSED    = 8;
 }
 
 enum HostState {

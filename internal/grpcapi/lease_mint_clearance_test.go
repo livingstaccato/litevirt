@@ -79,10 +79,30 @@ func TestLeaseMintClearance_WithheldAtOrBelowThePeerHighWater(t *testing.T) {
 	} {
 		s := barrierNode(t, 4, 2, "node-c")
 		insertTestHost(t, ctx, s.db, "node-c", "active") // not a cluster of one
+		s.db.MarkReplicaCaughtUpForTests("node-c")
 		s.peerClientOverride = fakePeers(map[string]int64{"node-c": tc.peerTerm})
 		if ok, why := s.LeaseMintClearance(ctx, mintReq(corrosion.LeaseKeyFailover, tc.next, false)); ok != tc.want {
 			t.Errorf("peer at %d, minting %d: cleared=%v (%q), want %v", tc.peerTerm, tc.next, ok, why, tc.want)
 		}
+	}
+}
+
+// A replica that has not caught up is withheld whatever its quorum read says.
+// On a fresh database the read is over a voter set and a peer list taken from
+// that same replica, so a low answer proves nothing (drill 6 on main-b3368d7c:
+// a reinstalled node minted terms the cluster had minted weeks before). The
+// same node clears once an exchange has completed.
+func TestLeaseMintClearance_WithheldUntilTheReplicaHasCaughtUp(t *testing.T) {
+	ctx := context.Background()
+	s := barrierNode(t, 0, 2, "node-c")
+	insertTestHost(t, ctx, s.db, "node-c", "active")
+	s.peerClientOverride = fakePeers(map[string]int64{"node-c": 0})
+	if ok, why := s.LeaseMintClearance(ctx, mintReq(corrosion.LeaseKeyFailover, 1, true)); ok || !strings.Contains(why, "caught up") {
+		t.Fatalf("not caught up: cleared=%v (%q), want withheld naming the catch-up", ok, why)
+	}
+	s.db.MarkReplicaCaughtUpForTests("node-c")
+	if ok, why := s.LeaseMintClearance(ctx, mintReq(corrosion.LeaseKeyFailover, 1, true)); !ok {
+		t.Fatalf("caught up, every answer below the term: cleared=false (%q), want true", why)
 	}
 }
 
@@ -109,6 +129,7 @@ func TestLeaseMintClearance_ATakeoverWaitsForAPeerThatSeesTheLeaseLive(t *testin
 		t.Run(tc.name, func(t *testing.T) {
 			s := barrierNode(t, 4, 2, "node-c")
 			insertTestHost(t, ctx, s.db, "node-c", "active")
+			s.db.MarkReplicaCaughtUpForTests("node-c")
 			s.peerClientOverride = func(_ context.Context, host string) (pb.LiteVirtClient, func(), error) {
 				if host != "node-c" {
 					return nil, nil, context.DeadlineExceeded

@@ -50,6 +50,19 @@ func (s *Server) LeaseMintClearance(ctx context.Context, req corrosion.LeaseMint
 	if alone {
 		return true, ""
 	}
+	// A replica that has not caught up cannot vouch for its own quorum read.
+	// The read counts over the voter set and asks the healthy peers in this
+	// replica, and on a fresh database both come from a hosts table that may
+	// name only this node: the quorum is itself, nobody is asked, and the high
+	// water is its own empty ledger. That is how a reinstalled node-5 recorded
+	// failover and dual_run_detector term 1 a minute after `lv host add`, both
+	// already minted in 2026-09 (drill 6 on main-b3368d7c). An anti-entropy
+	// exchange carries leader_lease_terms, so once it completes the ledger
+	// holds the cluster's history and the read below is over the real fleet.
+	if ok, why := s.db.ReplicaCaughtUp(); !ok {
+		return false, "this node's replica has not caught up with the cluster yet (" + why +
+			"), so its lease ledger and voter set may be missing the cluster's history"
+	}
 	if cached, ok := s.cachedLeaseThreshold(key); ok && cached >= next {
 		return false, fmt.Sprintf("a peer has already recorded term %d; waiting for replication to deliver it", cached)
 	}

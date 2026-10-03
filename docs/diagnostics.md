@@ -601,6 +601,7 @@ checked.
 | `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
 | `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a forced power-off, or its watchdog heartbeat was stopped. Nothing checked it went down. |
 | `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |
+| `self_paused` | `best-effort-ssh` + `fenced`, detail prefixed `[relies on the host's partition pause]` | As `assumed`, but with `partition_pause_v1` latched: the coordinator waited out the host's own partition pause before it recovered anything, so the old copy had stopped executing. It says nothing about power. `litevirt_fences_total` counts it as `assumed`. |
 | `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
 | `failed` | any + `partial` | The fence ran and reported failure. |
 
@@ -1300,6 +1301,45 @@ missing hosts, on a per-host backoff, so the two sides merge again once the
 network heals. It logs what came back and what did not, but raises no condition.
 See [Gossip membership heals itself after a
 partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
+
+### Partition pause (`partition_paused`, `partition_pause_failed`, `partition_one_way`, `vm_settled`)
+
+Evaluator `partition_pause` (design/partition-pause.md). Every row is written by
+the host it is about, except `partition_one_way`, which the failover lease
+holder writes.
+
+- `partition_paused` (host, warning): this host lost the voter majority for
+  10 s and paused its recoverable workloads itself. The evidence lists them.
+  It resolves when the last one resumes. Each workload resumes on its own once
+  the majority is back, its row still names this host at the same owner epoch
+  and incarnation, and a majority of voters confirms that this host is not
+  fenced and that no recovery claim moved it. One that stays paused is logged
+  with the reason:
+  ```
+  partition-pause: paused workload       kind=vm name=<vm> reason="lost the voter majority for 10s (…)"
+  partition-pause: resumed workload      kind=vm name=<vm> reason="majority regained; …"
+  partition-pause: workload stays paused kind=vm name=<vm> reason="voter node-4 has node-1 HOST_OFFLINE"
+  ```
+  A host the majority fenced while it was paused stays paused until
+  `lv host undrain` (or until failover returns it to active, when its fence
+  moved nothing). A workload that a certified claim moved is stopped by the
+  settle step below, not resumed.
+- `partition_pause_failed` (host, critical): this host lost the majority and
+  could not pause a workload it had to. While it is open, the majority does
+  not rely on this host's pause and recovers on an `assumed` fence as before.
+  With a verified hardware watchdog armed the host also self-fences. It
+  resolves once every pause succeeds or the majority returns.
+- `partition_one_way` (host, critical): a quorum of voters cannot reach the
+  host while the host's own rows, written after those failures began, still
+  mark a majority healthy. That is a one-way partition, in which the host may
+  never pause. Nothing is recovered differently; find the asymmetric link.
+- `vm_settled` / `ct_settled` (`<name>@<host>`, warning): a host came back
+  holding a copy of a workload that a decided recovery claim, whose
+  certificate verifies, gave to another host at the same incarnation and an
+  owner epoch at least its own, on a proof its destination completed, while
+  the destination's own runtime reports the workload running. The host
+  stopped its copy (a VM is destroyed, which keeps its definition and disks)
+  and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
 
 ### Observer stalled (`observer_stalled`)
 

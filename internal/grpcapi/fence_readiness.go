@@ -125,7 +125,7 @@ func (s *Server) GetFenceReadiness(ctx context.Context, _ *emptypb.Empty) (*pb.F
 	for _, f := range recent {
 		resp.RecentFences = append(resp.RecentFences, &pb.FenceEvent{
 			Host: f.HostName, Method: f.Method, Result: f.Result,
-			Assurance: corrosion.FenceAssurance(f.Method, f.Result),
+			Assurance: corrosion.FenceAssuranceDetail(f.Method, f.Result, f.Detail),
 			Timestamp: f.Timestamp, Detail: f.Detail,
 		})
 	}

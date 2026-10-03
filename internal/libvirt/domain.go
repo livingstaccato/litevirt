@@ -56,6 +56,32 @@ func (c *Client) DestroyDomain(name string) error {
 	return nil
 }
 
+// SuspendDomain pauses a running domain's vCPUs (virDomainSuspend). RAM stays
+// resident and the domain stays active, so ResumeDomain continues the guest
+// where it stopped. Used by partition pause (docs/design/partition-pause.md).
+func (c *Client) SuspendDomain(name string) error {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	if err := c.virt.DomainSuspend(dom); err != nil {
+		return fmt.Errorf("suspend domain %s: %w", name, err)
+	}
+	return nil
+}
+
+// ResumeDomain resumes a domain SuspendDomain paused (virDomainResume).
+func (c *Client) ResumeDomain(name string) error {
+	dom, err := c.virt.DomainLookupByName(name)
+	if err != nil {
+		return fmt.Errorf("lookup domain %s: %w", name, err)
+	}
+	if err := c.virt.DomainResume(dom); err != nil {
+		return fmt.Errorf("resume domain %s: %w", name, err)
+	}
+	return nil
+}
+
 // UndefineDomain removes a domain definition. If removeStorage is true,
 // also removes associated storage.
 func (c *Client) UndefineDomain(name string, removeStorage bool) error {

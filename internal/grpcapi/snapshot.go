@@ -13,6 +13,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 )
 
@@ -70,6 +71,14 @@ func (s *Server) CreateSnapshot(ctx context.Context, req *pb.CreateSnapshotReque
 		}
 		if !validRestoreName(req.Name) {
 			return nil, status.Errorf(codes.InvalidArgument, "invalid snapshot name %q", req.Name)
+		}
+		// A memory snapshot suspends the guest and resumes it when done. A VM
+		// this host's partition pause is holding must stay stopped: resuming
+		// it would run a copy the majority may already be replacing
+		// (docs/design/partition-pause.md §3.3).
+		if _, held, perr := health.ReadPauseRecord(s.dataDir, health.PauseKindVM, req.VmName); perr != nil || held {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"%s is paused by this host's partition pause (it lost the voter majority); a memory snapshot would resume it — retry once it has resumed", req.VmName)
 		}
 		if st, _ := s.virt.DomainState(req.VmName); st != "running" {
 			withMemory = false

@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -165,7 +166,89 @@ func (c *Checker) QuorumProof(ctx context.Context) (state QuorumState, live, nee
 		// Unknown = "neither proof nor loss" → no action, no loss-clock.
 		return QuorumUnknown, 0, 0
 	}
-	return c.quorumOver(voters)
+	state, live, needed = c.quorumOver(voters)
+	c.noteQuorum(QuorumScopeCluster, state)
+	return state, live, needed
+}
+
+// QuorumRegainGrace is how long after this daemon regained a quorum its
+// coordinator decides no new fence on that quorum: StallGrace, the time a
+// fence verdict takes to build. A node that was itself cut off holds failure
+// rows its peers wrote DURING the cut — about every host, after a fleet-wide
+// blip — and replication delivers them in the seconds after the heal, before
+// the observers' first successful probes overwrite them. Deciding on them
+// would fence hosts that are answering (docs/design/partition-pause.md §7 F7).
+const QuorumRegainGrace = StallGrace
+
+// Quorum scopes the regain grace is tracked per. The grace for a decision is
+// the grace of the quorum that decision rests on: the cluster-wide one under
+// the cluster scope, the region's under region-scoped failover — never the
+// cluster-wide quorum for a regional decision, which a region majority cut off
+// from the rest of the cluster legitimately lacks for as long as the cut
+// lasts.
+const QuorumScopeCluster = "cluster"
+
+// RegionQuorumScope is the regain-grace scope of region's voters.
+func RegionQuorumScope(region string) string { return regionScopePrefix + region }
+
+const regionScopePrefix = "region:"
+
+// noteQuorum records one reading of scope's quorum: a No marks it lost, and the
+// first Yes after that is its No→Yes transition. Unknown changes nothing. The
+// grace runs from the TRANSITION, not from the last No, so a consumer that
+// keeps re-reading a quorum that stays lost does not keep re-arming it.
+func (c *Checker) noteQuorum(scope string, st QuorumState) {
+	if st == QuorumUnknown {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.quorumLost == nil {
+		c.quorumLost = map[string]bool{}
+		c.quorumRegainedAt = map[string]time.Time{}
+	}
+	switch st {
+	case QuorumNo:
+		c.quorumLost[scope] = true
+	case QuorumYes:
+		if c.quorumLost[scope] {
+			c.quorumLost[scope] = false
+			c.quorumRegainedAt[scope] = c.now()
+		}
+	}
+}
+
+// InQuorumRegainGraceFor reports whether the failover coordinator should defer
+// a new fence decided on scope's quorum: that quorum is lost now (this node is
+// on the minority side of it), or it was regained within QuorumRegainGrace. A
+// scope this daemon never saw lost is never in it, so a majority that kept its
+// quorum through a partition fences as before.
+//
+// "Lost now" is read fresh, never taken from the last recorded reading. The
+// daemon's own scope is re-read every tick by the partition pauser, but a
+// remote region's quorum is read only by a fence decision about one of its
+// hosts — which this grace runs ahead of. Trusting the recorded No would defer
+// that region's fences for as long as nothing else re-read it: forever. So a
+// scope recorded lost is re-evaluated here; a Yes is its No→Yes transition and
+// opens the grace from now, a No or an unreadable quorum keeps it closed.
+func (c *Checker) InQuorumRegainGraceFor(ctx context.Context, scope string) bool {
+	c.mu.Lock()
+	lost := c.quorumLost[scope]
+	c.mu.Unlock()
+	if lost {
+		if region, ok := strings.CutPrefix(scope, regionScopePrefix); ok {
+			c.RegionQuorumProof(ctx, region)
+		} else {
+			c.QuorumProof(ctx)
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.quorumLost[scope] {
+		return true
+	}
+	at, ok := c.quorumRegainedAt[scope]
+	return ok && c.now().Sub(at) < QuorumRegainGrace
 }
 
 // RegionQuorumProof is QuorumProof over one region's voters: the members of
@@ -177,7 +260,9 @@ func (c *Checker) RegionQuorumProof(ctx context.Context, region string) (state Q
 	if err != nil {
 		return QuorumUnknown, 0, 0
 	}
-	return c.quorumOver(vr.In(region))
+	state, live, needed = c.quorumOver(vr.In(region))
+	c.noteQuorum(RegionQuorumScope(region), state)
+	return state, live, needed
 }
 
 // quorumOver counts this daemon's fresh probe results over voters: live is
@@ -368,4 +453,61 @@ func (c *Checker) decisionGate(ctx context.Context, quorum func() QuorumState) G
 		return gateNo(ReasonMissingWitness)
 	}
 	return gateOK()
+}
+
+// ExecutionQuorum is executionQuorum with the live/needed counts: the quorum
+// that may fence this host and recover its workloads — cluster-wide, or this
+// host's region's under region-scoped failover. The partition pauser runs on
+// it (docs/design/partition-pause.md §3.1).
+func (c *Checker) ExecutionQuorum(ctx context.Context) (QuorumState, int, int) {
+	scope, err := corrosion.GetFailoverScope(ctx, c.db)
+	if err != nil {
+		return QuorumNo, 0, 0
+	}
+	if !scope.Region() {
+		return c.QuorumProof(ctx)
+	}
+	vr, err := corrosion.VoterRegions(ctx, c.db)
+	if err != nil {
+		return QuorumUnknown, 0, 0
+	}
+	region := vr.Region(c.hostName)
+	st, live, needed := c.quorumOver(vr.In(region))
+	c.noteQuorum(RegionQuorumScope(region), st)
+	return st, live, needed
+}
+
+// SeedPeersForTests sets this checker's probe results as one completed probe
+// cycle would — healthy[peer] true for a peer probed healthy now, false for one
+// probed failing — and ends its warmup. Test seam for scenarios (tests/fleet)
+// that need a real Checker's quorum arithmetic without running its probe loop;
+// production never calls it.
+func (c *Checker) SeedPeersForTests(healthy map[string]bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.probedOnce = true
+	c.startedAt = time.Now().Add(-time.Hour)
+	mono := c.now()
+	for name, ok := range healthy {
+		ps := &peerState{}
+		if ok {
+			ps.status, ps.lastHealthyAt = "healthy", mono
+		} else {
+			ps.status, ps.lastFailureAt = "suspect", mono
+		}
+		c.peers[name] = ps
+	}
+}
+
+// LastContact reports when this daemon last probed host healthy, on its local
+// monotonic clock (false: not this run). The failover coordinator anchors a
+// partition-pause deadline on the later of this and its decision.
+func (c *Checker) LastContact(host string) (time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ps, ok := c.peers[host]
+	if !ok || ps.lastHealthyAt.IsZero() {
+		return time.Time{}, false
+	}
+	return ps.lastHealthyAt, true
 }

@@ -288,6 +288,40 @@ type Coordinator struct {
 	// ID, same token — so it can retry at the same round: nothing was
 	// contending, so nothing should have to outrank it (§3.13 step 6).
 	claimRetryProposals map[corrosion.ClaimKey]corrosion.ActionProof
+	// PartitionPauseEnforced is the majority's reliance predicate for partition
+	// pause (docs/design/partition-pause.md §4.3): enforcement.partition_pause
+	// on this node AND partition_pause_v1 latched. When it holds, an assumed
+	// best-effort fence is recorded as self-pause and recovery waits out
+	// PartitionPauseWaitFor. nil (a hand-built coordinator) never relies.
+	PartitionPauseEnforced func(ctx context.Context) bool
+	// PeerAdvertised reports whether a host's last cached Ping advertised a
+	// token (health.Checker.PeerAdvertisedLast). The coordinator relies on a
+	// host's partition pause only if that HOST last advertised
+	// partition_pause_v1, not merely because the cluster latched it: a host
+	// whose flag went off after the latch stops advertising. nil never relies.
+	PeerAdvertised func(peer, token string) bool
+	// PauseWaitFor replaces health.PartitionPauseWaitFor (fleet scenarios,
+	// which cannot wait production seconds). nil in production.
+	PauseWaitFor func(probeTargets int) time.Duration
+	// Mono is the monotonic clock the pause deadline is measured on (default
+	// time.Now). Never Now, which the fleet harness makes virtual.
+	Mono func() time.Time
+	// QuorumRegain reports, for a quorum scope (health.QuorumScopeCluster or
+	// health.RegionQuorumScope), whether that quorum is lost now or was
+	// regained within health.QuorumRegainGrace
+	// (health.Checker.InQuorumRegainGraceFor). While it does, no new fence
+	// that rests on that quorum is decided. nil never defers.
+	QuorumRegain func(ctx context.Context, scope string) bool
+	// LastContact reports this node's last successful probe of a host
+	// (health.Checker.LastContact), the second anchor of the pause deadline.
+	// nil anchors on the decision alone.
+	LastContact func(host string) (time.Time, bool)
+	// pauseWaits holds recoveries waiting out a host's partition pause
+	// (partition_pause.go). In memory: a successor re-derives the wait from
+	// the self-pause fence record, anchored at its own first sight of it.
+	pauseWaits map[string]pauseWait
+	// oneWay records the hosts partition_one_way is raised for.
+	oneWay map[string]bool
 }
 
 // FailoverGate is the subset of *health.Checker the coordinator consults at
@@ -632,7 +666,16 @@ func (c *Coordinator) run(ctx context.Context) {
 		}
 
 		target := cand.target
+		// One-way partitions are made visible, never acted on differently
+		// (docs/design/partition-pause.md §7 F4).
+		if failing, healthy, oneWay := c.detectOneWay(ctx, target); oneWay || c.oneWay[target] {
+			c.noteOneWay(ctx, target, failing, healthy, oneWay)
+		}
 		if c.fenced[target] {
+			// A recovery waiting out the host's partition pause continues here.
+			if c.retryPauseWait(ctx, target) {
+				continue
+			}
 			// A recovery claim refused on an earlier tick is retried here: the
 			// host is handled, but its workloads are not all moved.
 			if c.retryClaims(ctx, target) {
@@ -752,6 +795,15 @@ func (c *Coordinator) run(ctx context.Context) {
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrLocalStall)
 			continue
 		}
+		// Likewise a node that was itself cut off from the majority moments
+		// ago: the failure rows it now holds were written during the cut, and
+		// after a fleet-wide blip they name every host (partition pause, §7 F7).
+		if c.QuorumRegain != nil && c.QuorumRegain(ctx, c.scope.graceScope(target)) {
+			slog.Warn("failover: quorum reached, but this node regained the voter majority only moments ago — deferring the fence until the observers have re-probed",
+				"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target), "grace", health.QuorumRegainGrace)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrQuorumRegain)
+			continue
+		}
 
 		slog.Warn("failover: quorum reached — host exceeded failure threshold",
 			"host", target, "observers", cand.observers, "quorum", c.scope.quorum(target),
@@ -759,6 +811,14 @@ func (c *Coordinator) run(ctx context.Context) {
 
 		c.failover(ctx, h)
 	}
+
+	// A one-way condition raised for a host that is no longer a fence
+	// candidate resolves: the quorum that could not reach it now can.
+	candTargets := make([]string, 0, len(candidates))
+	for _, cand := range candidates {
+		candTargets = append(candTargets, cand.target)
+	}
+	c.resolveOneWayGone(ctx, candTargets)
 
 	// Recovery pass: bring a host the coordinator marked down (offline, or a
 	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
@@ -957,6 +1017,7 @@ func (c *Coordinator) clearRecoveredFromFenced(ctx context.Context) {
 		if h, err := corrosion.GetHost(ctx, c.db, host); err == nil && h != nil && h.State == "active" {
 			delete(c.fenced, host)
 			delete(c.fenceRelocated, host)
+			delete(c.pauseWaits, host)
 		}
 	}
 }
@@ -1926,6 +1987,11 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 		IPMIPass:      h.IPMIPass,
 		WatchdogDev:   h.WatchdogDev,
 	})
+	// A best-effort fence that did not reach the host is recorded as
+	// self-pause when this coordinator relies on the host's partition pause
+	// (docs/design/partition-pause.md §4.2): same row shape, assurance
+	// self_paused, and recoverFenced then waits out the pause.
+	fr = c.asSelfPause(ctx, h, fr)
 
 	logResult := "fenced"
 	if !fr.Success {
@@ -1978,7 +2044,7 @@ func (c *Coordinator) failover(ctx context.Context, h *corrosion.HostRecord) (fe
 	// Say so, at the moment it matters, when the fence proves nothing. The row
 	// above reads "fenced" either way; this is the line an on-call engineer
 	// reading this node's journal during a failover will actually see.
-	if a := corrosion.FenceAssurance(fr.Method, logResult); a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
+	if a := corrosion.FenceAssuranceDetail(fr.Method, logResult, fr.Detail); a == corrosion.FenceRequested || a == corrosion.FenceAssumed {
 		slog.Warn("failover: this fence was not verified — the host may still be running",
 			"host", h.Name, "method", fr.Method, "assurance", a,
 			"fix", "give "+h.Name+" an ipmi fence strategy to make its fences verifiable")
@@ -2196,6 +2262,14 @@ func (c *Coordinator) recoverFenced(ctx context.Context, h *corrosion.HostRecord
 			return
 		}
 	}
+
+	// A fence that relied on the host's partition pause starts nothing until
+	// the pause has certainly happened (docs/design/partition-pause.md §4.2);
+	// retryPauseWait finishes it from the fence loop.
+	if corrosion.ReliesOnPartitionPause(fr.Method, fr.Detail) && !c.pauseDeadlinePassed(ctx, h) {
+		return
+	}
+	delete(c.pauseWaits, h.Name)
 
 	// The fence is done and h's state row is written; everything below is
 	// recovery, and every refusal in it is therefore post-fence.
@@ -3057,41 +3131,12 @@ func (c *Coordinator) healthyHosts(ctx context.Context, excludeHost string) ([]c
 // replication with the default policy of "none" is still recoverable — by
 // promotion rather than reschedule.
 func vmNeedsFailover(vm corrosion.VMRecord, autoPromote bool) bool {
-	// Secure Boot / vTPM state (UEFI NVRAM + swtpm) was host-local and died with
-	// the host. Neither a reschedule nor a disk-only replica promotion
-	// reconstructs it, so this is not work that becomes possible later — recovery
-	// is an operator restore from a backup that carried the firmware.
-	if vmUsesFirmwareState(vm) {
-		return false
-	}
-	if p := vmFailurePolicy(vm); p != "" && p != "none" {
-		return true
-	}
-	return autoPromote
+	return corrosion.VMRecoverableOnHostFailure(vm, autoPromote)
 }
 
 // containerNeedsFailover is the container half of vmNeedsFailover.
 func containerNeedsFailover(ct corrosion.ContainerRecord) bool {
-	if ct.OnHostFailure == "" || ct.OnHostFailure == "none" {
-		return false
-	}
-	// Already triaged as unrecoverable on an earlier pass (no re-pullable image
-	// and no usable backup) and left in place on purpose so an operator can see
-	// it. Re-processing it would loop on a decision already made.
-	if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
-		return false
-	}
-	// A relocate-restore marker means this row has an ACTIVE owner, not that it
-	// is stranded: resolvePendingRelocations re-derives every marker cluster-wide
-	// on EVERY cycle, independent of the fence path, and retries until the marker
-	// ages out at defaultRelocateRestoreTimeout. Counting these reports work
-	// somebody is doing — and in the worst case inverts the truth, since a
-	// restore that LANDED but failed to tombstone its source row leaves the
-	// container running on the target with only this row behind.
-	if _, _, ok := corrosion.RelocateRestoreMarker(ct.State, ct.StateDetail); ok {
-		return false
-	}
-	return true
+	return corrosion.ContainerRecoverableOnHostFailure(ct)
 }
 
 // strandedWorkloads counts workloads still assigned to a host in state 'fenced'
@@ -3194,25 +3239,8 @@ func (c *Coordinator) strandedWorkloads(ctx context.Context) (int, error) {
 }
 
 // vmFailurePolicy extracts on_host_failure from a VM's spec JSON.
-func vmFailurePolicy(vm corrosion.VMRecord) string {
-	var spec struct {
-		OnHostFailure string `json:"on_host_failure"`
-	}
-	if vm.Spec != "" {
-		_ = json.Unmarshal([]byte(vm.Spec), &spec)
-	}
-	return spec.OnHostFailure
-}
+func vmFailurePolicy(vm corrosion.VMRecord) string { return corrosion.VMFailurePolicy(vm) }
 
 // vmUsesFirmwareState reports whether a VM uses Secure Boot or a vTPM — i.e. has
 // host-local firmware state (NVRAM + swtpm) that can't survive its host dying (G1).
-func vmUsesFirmwareState(vm corrosion.VMRecord) bool {
-	var spec struct {
-		SecureBoot bool `json:"secure_boot"`
-		Tpm        bool `json:"tpm"`
-	}
-	if vm.Spec != "" {
-		_ = json.Unmarshal([]byte(vm.Spec), &spec)
-	}
-	return spec.SecureBoot || spec.Tpm
-}
+func vmUsesFirmwareState(vm corrosion.VMRecord) bool { return corrosion.VMUsesFirmwareState(vm) }

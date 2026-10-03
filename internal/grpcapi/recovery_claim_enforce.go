@@ -213,3 +213,12 @@ func (s *Server) RecoveryClaimEnforced(ctx context.Context) bool {
 	}
 	return cfg.Explicit()
 }
+
+// SetPartitionPause records enforcement.partition_pause (default on): whether
+// this node pauses its recoverable workloads on losing the voter majority, and
+// so whether it may advertise partition_pause_v1
+// (docs/design/partition-pause.md §5).
+func (s *Server) SetPartitionPause(on bool) { s.enfPartitionPause = on }
+
+// PartitionPauseOn reports enforcement.partition_pause as wired.
+func (s *Server) PartitionPauseOn() bool { return s.enfPartitionPause }

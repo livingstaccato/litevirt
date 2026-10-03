@@ -1292,6 +1292,16 @@ stalls and how the operator unblocks it without giving up G1.
 | **Voter-config hand-off in progress** | Claims pause while `g+1` members import. | Completes when a majority of `g+1` has imported. A member that cannot import is removed like a dead voter. |
 | **`synchronous` below FULL** | Neither token is advertised, so neither latches. | Fix the DSN or build. Never force the latch. |
 
+Claims decide ONE new owner; they do not stop the OLD one. A best-effort
+fence that cannot reach a partitioned host records `assumed`, and that host
+keeps running the copy the claim replaced (lab drill 1, 2026-10-02). The
+companion design [partition-pause.md](partition-pause.md) closes that gap in
+two layers: a host that cannot see a majority of this voter set pauses its
+recoverable workloads, and the majority waits out that pause before it
+recovers (`partition_pause_v1`, assurance `self_paused`); a host that comes
+back holding a copy a certified claim gave away stops it, on the certificate
+and nothing weaker.
+
 ---
 
 ## 7. Testing plan

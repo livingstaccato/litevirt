@@ -68,6 +68,7 @@ type Fake struct {
 	managedSave            map[string]bool   // domain → has a managed-save (suspend-to-disk) image
 	ownerEpochs            map[string]int64  // domain → Phase 4 owner-epoch metadata marker
 	managed                map[string]bool   // domain → litevirt managed-stamp metadata
+	managedInc             map[string]string // domain → the managed stamp's incarnation attribute
 	events                 []Event
 
 	// eventCB is the domain lifecycle callback registered by
@@ -108,6 +109,10 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// FailSuspendDomain / FailResumeDomain inject a pause/resume failure
+	// (partition pause, docs/design/partition-pause.md §3.4).
+	FailSuspendDomain func(name string) error
+	FailResumeDomain  func(name string) error
 	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
 	// outage, which marks the host's runtime inventory INCOMPLETE and must
 	// refuse new residency at admission time.
@@ -408,6 +413,61 @@ func (f *Fake) StartDomain(name string) error {
 	return nil
 }
 
+// SuspendDomain pauses a RUNNING domain: it stays active (StatePaused) and
+// DomainStateReason reports reason "paused", as libvirt does. Suspending a
+// domain that is not running is an error, as in libvirt.
+func (f *Fake) SuspendDomain(name string) error {
+	if f.FailSuspendDomain != nil {
+		if err := f.FailSuspendDomain(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StateRunning {
+		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)
+	}
+	f.domains[name] = StatePaused
+	f.record("suspend", name, "")
+	return nil
+}
+
+// ResumeDomain resumes a PAUSED domain. Resuming a domain that is not paused
+// is an error, as in libvirt.
+func (f *Fake) ResumeDomain(name string) error {
+	if f.FailResumeDomain != nil {
+		if err := f.FailResumeDomain(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StatePaused {
+		return fmt.Errorf("libvirtfake: domain %q is not paused (%s)", name, st)
+	}
+	f.domains[name] = StateRunning
+	f.record("resume", name, "")
+	return nil
+}
+
+// RawState reports the fake's own state for a domain — running, paused or
+// shutoff — without libvirt's coarse folding. ok=false when undefined.
+// Scenario helper: "is this copy executing right now" is RawState == running.
+func (f *Fake) RawState(name string) (State, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.domains[name]
+	return s, ok
+}
+
 func (f *Fake) BlockPull(domain, disk string) error {
 	if f.FailBlockPull != nil {
 		if err := f.FailBlockPull(domain, disk); err != nil {
@@ -477,6 +537,7 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	// domain that reuses the name starts with none.
 	delete(f.ownerEpochs, name)
 	delete(f.managed, name)
+	delete(f.managedInc, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
 	return nil
 }
@@ -1609,6 +1670,35 @@ func (f *Fake) SetDomainManaged(name string, running bool) error {
 	}
 	f.managed[name] = true
 	return nil
+}
+
+// SetDomainManagedIncarnation writes the managed stamp with its incarnation
+// attribute; GetDomainManagedIncarnation reads it back.
+func (f *Fake) SetDomainManagedIncarnation(name, incarnation string, running bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("domain %q not found", name)
+	}
+	if f.managed == nil {
+		f.managed = make(map[string]bool)
+	}
+	if f.managedInc == nil {
+		f.managedInc = make(map[string]string)
+	}
+	f.managed[name] = true
+	f.managedInc[name] = incarnation
+	return nil
+}
+
+func (f *Fake) GetDomainManagedIncarnation(name string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return "", false, fmt.Errorf("domain %q not found", name)
+	}
+	inc := f.managedInc[name]
+	return inc, inc != "", nil
 }
 
 func (f *Fake) GetDomainManaged(name string) (bool, error) {

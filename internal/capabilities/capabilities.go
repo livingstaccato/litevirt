@@ -290,6 +290,37 @@ const (
 	// AND an adopted voter generation with members.
 	RecoveryClaimV1 = "recovery_claim_v1"
 
+	// PartitionPauseV1 gates the MAJORITY's reliance on a minority's partition
+	// pause (docs/design/partition-pause.md, colonelpanik/litevirt#250 / #253):
+	// a host that cannot see a majority of the voter set for T_pause suspends
+	// (VM) or freezes (container) every workload the majority would recover
+	// elsewhere. Once this token is latched, a coordinator whose best-effort
+	// fence could not reach a host (assurance assumed) starts nothing for that
+	// host until health.PartitionPauseWait has passed since the decision, and
+	// records the fence as self_paused.
+	//
+	// Config-gated (enforcement.partition_pause) and advertised CONDITIONALLY
+	// on that flag, for the recovery_claim_v1 reason: the guarantee is
+	// enforced on the minority and RELIED ON by the majority, so a flag-off
+	// peer is the copy still running when the replacement starts — not merely
+	// permissive. The latch has to mean config uniformity.
+	// TestAdvertise_PartitionPauseWithheldWhileOff pins it.
+	//
+	// The pause itself runs on the flag alone, before any latch: each node
+	// latches on its own schedule, so a node that waited for its own latch
+	// could be relied on by a peer that latched first. A node advertises the
+	// token only while it already acts on it.
+	//
+	// DEFAULT ON (LoadConfig), the second exception to the default-false rule
+	// beside audit_signature_v1. An explicit false is the kill switch.
+	//
+	// Not mandatory: it states a policy (availability against a duplicate
+	// copy), and a policy needs a flag. Not ReplicationGated: it emits no new
+	// statement shape — the pause record is a host-local file, and the fence
+	// row and the conditions use existing shapes — so its latch is a claim
+	// about what voting members DO, which is what an ordinary latch measures.
+	PartitionPauseV1 = "partition_pause_v1"
+
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
 	// minted it, and an executor refuses a proof whose term is below the
@@ -820,6 +851,11 @@ var supported = []string{
 	// on every peer honouring it — see RecoveryClaimV1 and
 	// grpcapi.RecoveryClaimReadiness.
 	RecoveryClaimV1,
+	// PartitionPauseV1 is advertised CONDITIONALLY on
+	// enforcement.partition_pause (default on): every flag-on coordinator
+	// relies on the host it fences pausing, so the latch must mean every
+	// voter has the flag on. See PartitionPauseV1.
+	PartitionPauseV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
 	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
@@ -838,7 +874,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, RecoveryClaimV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {

@@ -1956,6 +1956,35 @@ message SignForcedVoterConfigResponse {
     string cert_pem    = 3;
     bytes  signature   = 4;
 }
+// A workload a host paused itself, as its pause record holds it.
+message PausedWorkload {
+    string kind        = 1;  // vm | container
+    string name        = 2;
+    int64  owner_epoch = 3;
+    string incarnation = 4;  // the row's created_at at the pause
+}
+message ConfirmPartitionResumeRequest {
+    repeated PausedWorkload workloads = 1;
+}
+// One voter's view of one paused workload, from its own replica and claim tables.
+message PausedWorkloadView {
+    string kind          = 1;
+    string name          = 2;
+    bool   live          = 3;  // a live row exists (for a container: on the caller)
+    string host_name     = 4;
+    int64  owner_epoch   = 5;
+    string incarnation   = 6;
+    // accepted_dest names the destination of a recovery-claim value this voter
+    // has accepted for the workload at the paused epoch and incarnation
+    // (either key form); "" when none.
+    string accepted_dest = 7;
+}
+message ConfirmPartitionResumeResponse {
+    string voter        = 1;
+    string caller_state = 2;  // the caller's hosts.state in this voter's replica; "absent" when none
+    repeated PausedWorkloadView views = 3;
+}
+
 message InspectRecoveryClaimRequest {
     string kind        = 1;   // vm | container
     string name        = 2;
@@ -3114,6 +3143,11 @@ service LiteVirt {
     // InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
     // member's recorded state for a workload's claim keys, and its last refusal.
     rpc InspectRecoveryClaim(InspectRecoveryClaimRequest) returns (InspectRecoveryClaimResponse);
+    // ConfirmPartitionResume: peer-only, read-only. A host that paused
+    // workloads on losing the voter majority asks each voter, before it
+    // resumes any, what that voter's OWN replica and claim tables say about
+    // the caller and each workload (docs/design/partition-pause.md §3.5).
+    rpc ConfirmPartitionResume(ConfirmPartitionResumeRequest) returns (ConfirmPartitionResumeResponse);
 
     // ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
     // GetVoterConfig reports the connected host's adopted voter generation and

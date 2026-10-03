@@ -79,3 +79,33 @@ func TestFenceProofGrade_IsUnchangedAndAgreesWithAssurance(t *testing.T) {
 		}
 	}
 }
+
+// A best-effort fence whose recovery relied on the host's partition pause is
+// still a best-effort-ssh row — an older coordinator reads it as assumed — and
+// only FenceAssuranceDetail, reading the detail, calls it self_paused.
+//
+// Mutation: classify by method alone — the relied-on row reads assumed and
+// this goes red; drop the method check — an ipmi row with the prefix reads
+// self_paused and this goes red.
+func TestFenceAssuranceDetail_SelfPaused(t *testing.T) {
+	relied := FencePauseReliance + "SSH failed (no route), proceeding anyway"
+	if got := FenceAssuranceDetail("best-effort-ssh", "fenced", relied); got != FenceSelfPaused {
+		t.Fatalf("relied-on best-effort row = %s, want %s", got, FenceSelfPaused)
+	}
+	if got := FenceAssurance("best-effort-ssh", "fenced"); got != FenceAssumed {
+		t.Fatalf("the method/result classification moved: %s", got)
+	}
+	if got := FenceAssuranceDetail("best-effort-ssh", "fenced", "SSH failed"); got != FenceAssumed {
+		t.Fatalf("a best-effort row without the prefix = %s, want assumed", got)
+	}
+	if got := FenceAssuranceDetail("ipmi", "fenced", relied); got != FenceVerified {
+		t.Fatalf("an ipmi row with the prefix = %s, want verified", got)
+	}
+	if FenceProofGrade("best-effort-ssh", "fenced") {
+		t.Fatal("a relied-on pause became proof-grade")
+	}
+	// The coordinator waits only for a best-effort fence that relied on it.
+	if ReliesOnPartitionPause("ipmi", relied) {
+		t.Fatal("a verified fence carrying the prefix reads as relying on the pause")
+	}
+}

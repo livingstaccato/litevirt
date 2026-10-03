@@ -396,7 +396,7 @@ type AuthConfig struct {
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
 // behavior regardless of the durable latch. All default false except
-// AuditSignature, which LoadConfig defaults to true.
+// AuditSignature and PartitionPause, which LoadConfig defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -557,6 +557,28 @@ type EnforcementConfig struct {
 	// hazard, not a degraded mode: those hosts report the token in
 	// PingResponse.not_enforcing and their peers raise ha_degraded.
 	RecoveryClaim bool `yaml:"recovery_claim,omitempty"`
+	// PartitionPause: on losing the voter majority for T_pause (10 s), suspend
+	// every VM and freeze every container the failover coordinator would
+	// recover elsewhere, and resume them only once a majority of voters
+	// confirms nothing moved them (capabilities.PartitionPauseV1,
+	// docs/design/partition-pause.md). The token is advertised only while this
+	// flag is on, so once it latches every voter pauses, and a coordinator
+	// whose best-effort fence could not reach a host waits out that host's
+	// pause before recovering it, recording the fence as self_paused.
+	//
+	// DEFAULT TRUE, the second enforcement flag that is on unless switched off
+	// (LoadConfig sets it before parsing; an explicit `partition_pause: false`
+	// wins). The cost it guards against — one workload running twice through a
+	// partition — is the one the user chose never to accept, and a pause keeps
+	// RAM, so a fleet-wide blip costs execution time, not state. It runs whether
+	// or not a hardware watchdog is armed: the watchdog fires only when the
+	// daemon dies, never for a live daemon on the wrong side of a partition.
+	//
+	// An explicit false is the kill switch: that host pauses nothing and stops
+	// advertising the token, and its coordinator recovers an assumed fence at
+	// once, exactly as before. False on only SOME hosts after the latch is the
+	// hazard, reported in PingResponse.not_enforcing.
+	PartitionPause bool `yaml:"partition_pause,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched
 	// cluster-wide, this node REFUSES replication from any host recorded with a
@@ -660,9 +682,9 @@ func LoadConfig() (*Config, error) {
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
 
-		// The one enforcement flag that defaults ON — see EnforcementConfig.
-		// AuditSignature. An explicit `audit_signature: false` still wins.
-		Enforcement: EnforcementConfig{AuditSignature: true},
+		// The two enforcement flags that default ON — see EnforcementConfig.
+		// AuditSignature and PartitionPause. An explicit false still wins.
+		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

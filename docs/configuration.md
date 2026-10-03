@@ -375,6 +375,25 @@ enforcement:
                               # their history. Off on only some hosts is the hazard, not a
                               # degraded mode — such a host reports recovery_claim_v1 in
                               # PingResponse.not_enforcing and its peers raise ha_degraded.
+  partition_pause: true       # DEFAULT ON. A host that cannot see a majority of the voter
+                              # set for 10 s suspends every VM (RAM kept) and freezes every
+                              # container that failover would recover elsewhere; a workload
+                              # with on_host_failure: none keeps running. Each pause is
+                              # recorded under <data_dir>/partition-pause, so only what this
+                              # host paused is resumed, and only once a majority of voters
+                              # confirms nothing moved it. Advertises partition_pause_v1
+                              # only while on; once that latches, a coordinator whose
+                              # best-effort fence cannot reach a host waits out that host's
+                              # pause (23 s after its decision on up to 17 hosts, longer on
+                              # larger clusters) before recovering, and records the fence as
+                              # self_paused. Runs whether or not a hardware watchdog is armed
+                              # (the watchdog fires only when the daemon dies); a verified
+                              # watchdog is the backstop when a pause fails. A blip shorter
+                              # than the pause time pauses nothing; a fleet-wide blip pauses
+                              # everything and resumes everything on heal. An explicit false
+                              # is the kill switch: that host pauses nothing and recovers an
+                              # assumed fence at once, as before. See
+                              # design/partition-pause.md.
   gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
                               # with the cluster key in <pki_dir>/gossip.key. false is
                               # plaintext; true is encrypted-only (anything unencrypted or

@@ -93,6 +93,10 @@ type Reconciler struct {
 	dataDir          string
 	db               *corrosion.Client
 	virt             LibvirtBackend
+	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
+	// the certificate check and the proof source. nil verifier settles nothing.
+	settleVerify     SettleVerifier
+	settleProofs     func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
 	vmStartObserver  VMStartObserver                                   // optional: told of every guest start (start grace)
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
@@ -973,6 +977,18 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			why := ""
 			if serr == nil && !cleanable && unknownShutoff(st) {
 				cleanable, why = r.provenOwnerLeftover(ctx, domName, vm.HostName, unreachable)
+			}
+			// Layer 3 of partition pause (settle.go): a LIVE copy — running, or
+			// paused by this host's partition pause — whose row a VERIFIED
+			// recovery-claim certificate gave to another host is stopped on that
+			// positive proof, never on host_name. The leftover cleanup above
+			// takes the shut-off domain on a later pass.
+			if serr == nil && !cleanable && (st.State == RuntimeRunning || st.Reason == "paused") {
+				settled, swhy := r.settleCertifiedMove(ctx, domName, vm)
+				if settled {
+					continue
+				}
+				why = swhy
 			}
 			if !cleanable {
 				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",

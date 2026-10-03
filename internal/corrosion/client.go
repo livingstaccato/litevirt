@@ -159,6 +159,9 @@ type Client struct {
 	// the port it gossips on (gossip_rejoin.go). Guarded by gossipAddrMu.
 	gossipAddrMu sync.Mutex
 	gossipAddrs  map[string]string
+	// mlEvents is memberlist's event delegate, which also holds every live
+	// member's address (Members reads it; see membershipEvents.addrs).
+	mlEvents *membershipEvents
 	// admission is the last gossip-admission snapshot read successfully.
 	admission atomic.Pointer[gossipAdmission]
 	// freshness records whether this node's replica has been reconciled
@@ -1007,7 +1010,8 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	mlCfg.Merge = adm
 	// EventDelegate wakes the replicator's discovery loop on membership changes
 	// (separate from Delegate, which carries gossip metadata) — set before Create.
-	mlCfg.Events = &membershipEvents{client: c}
+	c.mlEvents = &membershipEvents{client: c}
+	mlCfg.Events = c.mlEvents
 	if cfg.MemberlistForTests != nil {
 		cfg.MemberlistForTests(mlCfg)
 	}
@@ -1678,8 +1682,17 @@ func (c *Client) Members() []PeerInfo {
 		if c.list == nil {
 			return nil
 		}
+		// Names from memberlist (a node's name never changes), addresses
+		// from the event delegate's copy: see membershipEvents.addrs.
 		for _, m := range c.list.Members() {
-			raw = append(raw, PeerInfo{Name: m.Name, Addr: m.Address()})
+			addr, ok := "", false
+			if c.mlEvents != nil {
+				addr, ok = c.mlEvents.addr(m.Name)
+			}
+			if !ok {
+				continue // not yet announced by an event; the next read has it
+			}
+			raw = append(raw, PeerInfo{Name: m.Name, Addr: addr})
 		}
 	}
 	peers := make([]PeerInfo, 0, len(raw))

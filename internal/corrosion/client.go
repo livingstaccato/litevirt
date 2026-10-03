@@ -1299,7 +1299,7 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 			}
 			// A live-row update runs here through the same guarded form every
 			// receiver uses; what is logged is the wire form (live_row_update.go).
-			res, err := tx.ExecContext(ctx, liveRowGuarded(s).SQL, s.Params...)
+			res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
 			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
@@ -1341,6 +1341,13 @@ func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.T
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
 	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
+	// A host this node re-admits takes no fence credential from the machine
+	// removed under its name; every receiver retires it too (host_readmit.go).
+	if err := retireReadmittedCredentials(ctx, tx, mutated); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return false, err
@@ -1456,7 +1463,7 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	for _, s := range stmts {
 		// A live-row update runs here through the same guarded form every
 		// receiver uses; what is logged is the wire form (live_row_update.go).
-		res, err := tx.ExecContext(ctx, liveRowGuarded(s).SQL, s.Params...)
+		res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
@@ -1497,6 +1504,13 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	// Likewise a state or isolation write this node makes to hosts alone
 	// updates the membership row it holds (host_membership.go).
 	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
+	// A host this node re-admits takes no fence credential from the machine
+	// removed under its name; every receiver retires it too (host_readmit.go).
+	if err := retireReadmittedCredentials(ctx, tx, mutated); err != nil {
 		tx.Rollback()
 		c.mu.Unlock()
 		return 0, err

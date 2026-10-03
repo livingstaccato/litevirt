@@ -72,6 +72,12 @@ const (
 	// tombstone: it is applied through its `AND deleted_at IS NULL` form, on the
 	// receiver AND on the origin (live_row_update.go).
 	DispLiveRowUpdate Disposition = "live_row_update"
+	// DispHostReadmit is the re-admission of a host over its tombstone
+	// (AdmitHost). A full-PK LWW update applied through its RESET form, which
+	// also returns every per-host setting column to its default, on the origin
+	// and every receiver; it retires the host's fence credential row with it
+	// (host_readmit.go).
+	DispHostReadmit Disposition = "host_readmit"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.

@@ -226,7 +226,7 @@ func (c *Client) parkableUpdate(s Statement) (StmtShape, []string, []interface{}
 	if entry.RequiresCapability != "" && entry.DispositionAfter != "" && c.capabilityActive(entry.RequiresCapability) {
 		disp = entry.DispositionAfter
 	}
-	if disp != DispFullPKUpdate && disp != DispLiveRowUpdate {
+	if disp != DispFullPKUpdate && disp != DispLiveRowUpdate && disp != DispHostReadmit {
 		return StmtShape{}, nil, nil, false
 	}
 	pk, ok := pkValuesFromShape(sh, s)
@@ -326,7 +326,7 @@ func (r *Replicator) replayParked(ctx context.Context, tx *sql.Tx, s Statement) 
 		// arrived — the pre-park outcome, for anti-entropy to finish.
 		// A live-row update replays through its guarded form, as it would
 		// have applied had the row been here (live_row_update.go).
-		if err := r.applyLWWGated(ctx, tx, liveRowGuarded(u.stmt), u.shape, u.table, u.pkCols, u.hlc); err != nil {
+		if err := r.applyLWWGated(ctx, tx, appliedForm(u.stmt), u.shape, u.table, u.pkCols, u.hlc); err != nil {
 			slog.Warn("corrosion: dropped a parked update that failed to replay",
 				"table", u.table, "error", err)
 		}

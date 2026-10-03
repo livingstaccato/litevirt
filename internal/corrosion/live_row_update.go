@@ -26,7 +26,7 @@ import "sync"
 // So the statements keep their shape, and the guard travels with the
 // FINGERPRINT instead of the SQL text. Their ledger entry carries
 // DispLiveRowUpdate. Every node that recognises the fingerprint as that
-// disposition applies the statement through its guarded form (liveRowGuarded):
+// disposition applies the statement through its guarded form (appliedForm):
 // the origin in its own write path, and each receiver on the WAL lane,
 // including the replay of a parked update. DispAuditReseal set the precedent of
 // a receiver applying a statement through a stricter form than the one it
@@ -103,16 +103,18 @@ func buildLiveRowGuarded() map[string]string {
 	return m
 }
 
-// liveRowGuardCache memoises liveRowGuarded by SQL text. Replicated statements
-// are finite static SQL (stmtshapecheck refuses anything else), so the cache
-// is bounded by the number of builders.
-var liveRowGuardCache sync.Map // string → string ("" = not a live-row update)
+// appliedFormCache memoises appliedForm by SQL text. Replicated statements are
+// finite static SQL (stmtshapecheck refuses anything else), so the cache is
+// bounded by the number of builders.
+var appliedFormCache sync.Map // string → string ("" = applied as sent)
 
-// liveRowGuarded returns s with its SQL replaced by the guarded form when s is
-// a registered live-row update, and s unchanged otherwise. Parameters are
-// never touched.
-func liveRowGuarded(s Statement) Statement {
-	if v, ok := liveRowGuardCache.Load(s.SQL); ok {
+// appliedForm returns s with its SQL replaced by the form this node applies it
+// through when its fingerprint carries one — the guarded form of a live-row
+// update, or the reset form of a host re-admission (host_readmit.go) — and s
+// unchanged otherwise. Parameters are never touched: each form binds exactly
+// the parameters of the wire form it stands for.
+func appliedForm(s Statement) Statement {
+	if v, ok := appliedFormCache.Load(s.SQL); ok {
 		if g := v.(string); g != "" {
 			s.SQL = g
 		}
@@ -121,8 +123,11 @@ func liveRowGuarded(s Statement) Statement {
 	g := ""
 	if fp, err := FingerprintSQL(s.SQL); err == nil {
 		g = liveRowGuardedByFP[fp]
+		if fp == readmitFingerprint {
+			g = readmitResetSQL
+		}
 	}
-	liveRowGuardCache.Store(s.SQL, g)
+	appliedFormCache.Store(s.SQL, g)
 	if g != "" {
 		s.SQL = g
 	}

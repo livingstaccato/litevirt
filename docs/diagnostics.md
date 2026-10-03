@@ -1072,7 +1072,11 @@ Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised
 after `lv cluster voter force-reconfigure` until every host it named lost has
 been removed and revoked with `lv host rm --dead`: a lost host may hold an
 ordinary generation its majority decided that nobody saw, so it must not come
-back as it left. The evidence names each lost host still to remove. It is also
+back as it left. A lost host is the voter entry, name and incarnation, so a
+machine rebuilt under its name after `lv host rm --dead` counts it gone once
+it answers as a new incarnation; a name with a fenced row, or one that cannot
+say which incarnation it is, keeps the condition raised. The evidence names each
+lost host still to remove. It is also
 raised by a node that REFUSED a forced generation — because it can reach a host
 the generation names lost, or because it is itself named lost and running —
 with the reason: valid signatures do not make a false claim of loss true.

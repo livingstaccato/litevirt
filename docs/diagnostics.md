@@ -1302,7 +1302,7 @@ network heals. It logs what came back and what did not, but raises no condition.
 See [Gossip membership heals itself after a
 partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
 
-### Partition pause (`partition_paused`, `partition_pause_failed`, `partition_one_way`, `vm_settled`)
+### Partition pause (`partition_paused`, `partition_pause_failed`, `partition_one_way`, `vm_settled`, `vm_settle_declined`)
 
 Evaluator `partition_pause` (design/partition-pause.md). Every row is written by
 the host it is about, except `partition_one_way`, which the failover lease
@@ -1340,6 +1340,24 @@ holder writes.
   the destination's own runtime reports the workload running. The host
   stopped its copy (a VM is destroyed, which keeps its definition and disks)
   and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
+- `vm_settle_declined` (`<name>@<host>`, warning): the host runs a copy of a
+  VM whose row names another host, and settle declined to stop it for two
+  passes in a row. The evidence carries the `reason` (the clause of the proof
+  that is missing), what the host knows of its copy (`local`: incarnation,
+  owner epoch, and where it read them), and a `remedy`. The same is logged,
+  once per reason and again every 10 minutes while it lasts:
+  ```
+  partition-settle: declined to stop a local copy whose row names another host vm=<vm> row_host=<dest> reason="…" remedy="…"
+  ```
+  A common reason is `the local copy's incarnation is unknown`: an older
+  build defined the domain, so it carries no incarnation stamp. Settle does
+  not fall back to the domain UUID, because a live restore or a renamed
+  promote gives a new incarnation an earlier one's UUID. If the row's host
+  runs the VM, the local copy is a superseded duplicate: stop it on this host
+  with `virsh destroy <vm>` (the definition and disks are kept, and the
+  leftover cleanup undefines it). If that host does not run it, leave the
+  local copy running. The condition resolves once the copy is no longer
+  declined.
 
 ### Observer stalled (`observer_stalled`)
 

@@ -95,8 +95,10 @@ type Reconciler struct {
 	virt             LibvirtBackend
 	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
 	// the certificate check and the proof source. nil verifier settles nothing.
-	settleVerify     SettleVerifier
-	settleProofs     func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	settleVerify SettleVerifier
+	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	// settleDeclines rate-limits the decline report (settle_declined.go).
+	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
 	vmStartObserver  VMStartObserver                                   // optional: told of every guest start (start grace)
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
@@ -941,8 +943,18 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 	// leftover, so a fence-and-return with many leftovers and an unreachable
 	// owner costs one probe timeout rather than one per VM.
 	unreachable := map[string]string{}
+	// Live copies Layer 3 declined to settle this pass, reported once the pass
+	// is over (settle_declined.go). incomplete: a row this pass could not read,
+	// so a copy missing from declines may only have been skipped, and nothing
+	// is resolved on its strength.
+	var declines []settleDecline
+	incomplete := false
+	defer func() { r.reportSettleDeclines(ctx, declines, incomplete) }()
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
+		if err != nil {
+			incomplete = true
+		}
 		if err != nil || vm == nil {
 			// Domain exists locally but not in corrosion — might be external/manual.
 			// A litevirt-stamped one is reported by reportOrphanRuntimes, never here.
@@ -984,11 +996,13 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// positive proof, never on host_name. The leftover cleanup above
 			// takes the shut-off domain on a later pass.
 			if serr == nil && !cleanable && (st.State == RuntimeRunning || st.Reason == "paused") {
-				settled, swhy := r.settleCertifiedMove(ctx, domName, vm)
+				settled, swhy, local := r.settleCertifiedMove(ctx, domName, vm)
 				if settled {
 					continue
 				}
 				why = swhy
+				declines = append(declines, settleDecline{Name: domName, RowHost: vm.HostName,
+					Reason: swhy, Local: local, RuntimeState: st.State, RuntimeReason: st.Reason})
 			}
 			if !cleanable {
 				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",

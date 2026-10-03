@@ -57,6 +57,12 @@ const (
 	// claim certificate gave to another host. Subject <name>@<host>.
 	CondVMSettled = "vm_settled"
 	CondCTSettled = "ct_settled"
+	// CondVMSettleDeclined: this host runs a copy of a VM whose row names
+	// another host, and Layer 3 declined to stop it. The evidence carries the
+	// reason and what an operator can do. It resolves once the copy is no
+	// longer declined (settled, stopped, gone, or the row names this host).
+	// Subject <name>@<host>.
+	CondVMSettleDeclined = "vm_settle_declined"
 	// CondPartitionOneWay: the failover coordinator sees a quorum of voters
 	// failing a host while that host's own rows mark a majority healthy — a
 	// one-way partition, in which it may never pause. Visibility only

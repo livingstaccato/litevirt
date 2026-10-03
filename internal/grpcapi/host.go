@@ -1069,6 +1069,12 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 // AdmitHost records the CA-authorized identity produced by `lv host add`.
 // Running it on an existing member breaks the tombstone/authentication deadlock
 // when a removed machine is deliberately re-added with a fresh certificate.
+//
+// The host is admitted 'joining', not 'active': `lv host add` admits it before
+// its setup runs, and its daemon records it 'active' when it first boots. An
+// 'active' row for a machine with no daemon yet was a fence candidate as soon
+// as the observers' probes found nothing listening, and the coordinator
+// powered the machine off part-way through its setup (kvm003 drill 6).
 func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*emptypb.Empty, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -1082,7 +1088,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 		SSHUser:    "root",
 		SSHPort:    22,
 		GRPCPort:   7443,
-		State:      "active",
+		State:      corrosion.HostStateJoining,
 		CertSerial: req.CertSerial,
 	})
 	if err != nil {

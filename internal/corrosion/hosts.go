@@ -266,6 +266,17 @@ func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
 	return hosts, nil
 }
 
+// HostStateJoining is the state `lv host add` admits a host in (AdmitHost):
+// its identity is recorded, its daemon has not yet started. The daemon's boot
+// write (UpdateHostStartup) records it 'active'. Until then it is not a fence
+// candidate, so a coordinator does not power off a machine part-way through its
+// setup, and like every state but 'active' it is no placement target.
+//
+// It is deliberately left VotingEligible, as the 'active' it replaces was: a
+// node on the previous release, which does not know the state, counts it as a
+// voter, and the voter set must not depend on which build counts it.
+const HostStateJoining = "joining"
+
 // VotingEligible is the one definition of a voting member's state: a host
 // votes iff its state is not offline, maintenance or fenced. Witnesses vote;
 // draining and upgrading hosts vote. health.VotingEligible and the failover

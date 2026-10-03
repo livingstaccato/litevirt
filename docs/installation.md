@@ -95,6 +95,14 @@ scp bin/litevirt root@10.0.50.11:/usr/local/bin/
 lv host add root@10.0.50.11 --name host-b
 ```
 
+The host is admitted in state `joining` (`HOST_OFFLINE` in `lv host ls`) and
+becomes `active` when its daemon first starts. Until then nothing is placed on
+it and the failover coordinator never fences it, however long its setup takes:
+it is down to every peer by construction, and runs nothing. A host removed
+with `lv host rm` and added back under the same name starts with no failure
+history; every peer forgets the old machine's failed probes when it leaves the
+host table.
+
 3. Edit `/etc/litevirt/config.yaml` on the new host to set the join address:
 
 ```yaml

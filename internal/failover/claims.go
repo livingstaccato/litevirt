@@ -13,6 +13,7 @@ import (
 	"github.com/litevirt/litevirt/internal/claims"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
+	"github.com/litevirt/litevirt/internal/placement"
 )
 
 // Recovery claims at the mint sites (docs/design/recovery-claims.md §3.13,
@@ -142,6 +143,14 @@ type claimedProof struct {
 // value decided for a destination that has since been removed for good. Each
 // step carries the evidence, and every voter checks it before it promises.
 func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.ActionProof, source, incarnation string) (claimedProof, error) {
+	return c.claimRecoveryFor(ctx, proposal, source, incarnation, nil)
+}
+
+// claimRecoveryFor is claimRecovery with fits, the site's own placement check
+// of a destination this coordinator did not pick (nil: none beyond the host
+// checks every site gets). See adoptedDestProblem.
+func (c *Coordinator) claimRecoveryFor(ctx context.Context, proposal corrosion.ActionProof, source, incarnation string,
+	fits func(corrosion.HostRecord) string) (claimedProof, error) {
 	epoch, err := strconv.ParseInt(proposal.OwnerEpoch, 10, 64)
 	if err != nil {
 		return claimedProof{}, fmt.Errorf("proof %s for %s/%s carries owner epoch %q: a claim key needs one",
@@ -184,7 +193,39 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 					"already run or failed, and %s has not shown it is another incarnation's", cl.Proof.ID, cl.Proof.DestHost))
 				return claimedProof{Key: key}, err
 			}
-			return cl, nil
+			problem, perr := c.adoptedDestProblem(ctx, cl, proposal, source, fits)
+			if perr != nil {
+				return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimLost, Result: ResultLost,
+					Detail: fmt.Sprintf("%s decided %s for %s, which could not be checked: %v", key, cl.Proof.ID, cl.Proof.DestHost, perr),
+					Err:    perr}
+			}
+			if problem == "" {
+				return cl, nil
+			}
+			// The decided value stands at this key and cannot be swapped
+			// (§3.16), and writing it would send the workload where it cannot
+			// go. Its destination's signed abandonment moves the claim on
+			// (§3.12): that host records it before signing, so the proof can
+			// never run there, and only that host could run it.
+			dest := cl.Proof.DestHost
+			ab, aerr := c.Claimer.RequestAbandonment(ctx, dest, key, cl.Proof.ID,
+				"the decided destination cannot take the workload: "+problem)
+			if aerr != nil {
+				return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimLost, Result: ResultLost,
+					Detail: fmt.Sprintf("%s decided %s for %s, which %s; %s has not abandoned it (%v)",
+						key, cl.Proof.ID, dest, problem, dest, aerr), Err: aerr}
+			}
+			if next = c.priorEvidence(out); next == nil {
+				return claimedProof{Key: key}, &ClaimRefusedError{Key: key, Reason: health.ReasonClaimLost, Result: ResultLost,
+					Detail: fmt.Sprintf("%s decided %s for %s: its certificate does not encode", key, cl.Proof.ID, dest)}
+			}
+			next.Abandonment = ab
+			slog.Warn("failover: a decided recovery names a destination that cannot take the workload; it abandoned the "+
+				"proof, moving the claim to the next attempt", "key", key.String(), "decided_dest", dest,
+				"decided_proof", cl.Proof.ID, "problem", problem, "own_pick", proposal.DestHost)
+			c.mAttempt(PhaseClaim, ResultSuperseded, "")
+			ev = next
+			continue
 		}
 		slog.Warn("failover: a decided recovery will never execute; moving the claim to the next attempt",
 			"key", key.String(), "decided_dest", cl.Proof.DestHost, "decided_proof", cl.Proof.ID,
@@ -199,12 +240,10 @@ func (c *Coordinator) claimRecovery(ctx context.Context, proposal corrosion.Acti
 // supersedeEvidence is the evidence that the value decided at key will never
 // execute, or nil when there is none and the decided value stands (§3.12).
 func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.ClaimKey, out claims.Outcome, decided corrosion.ActionProof, proposal corrosion.ActionProof) *corrosion.SupersedeEvidence {
-	cert, err := out.Certificate.Encode()
-	if err != nil {
+	ev := c.priorEvidence(out)
+	if ev == nil {
 		return nil
 	}
-	value := out.Value
-	ev := &corrosion.SupersedeEvidence{PriorCertificate: cert, PriorValue: &value}
 	dest := decided.DestHost
 	// This coordinator's own promote, and it is not promoting now: the promote
 	// failed and it fell back. Only the destination can say it never started,
@@ -242,6 +281,94 @@ func (c *Coordinator) supersedeEvidence(ctx context.Context, key corrosion.Claim
 		return ev
 	}
 	return nil
+}
+
+// priorEvidence is the half of supersede evidence every kind shares: the
+// certificate that decided out's attempt and the value it decided. nil when
+// the certificate does not encode.
+func (c *Coordinator) priorEvidence(out claims.Outcome) *corrosion.SupersedeEvidence {
+	cert, err := out.Certificate.Encode()
+	if err != nil {
+		return nil
+	}
+	value := out.Value
+	return &corrosion.SupersedeEvidence{PriorCertificate: cert, PriorValue: &value}
+}
+
+// adoptedDestProblem says why the destination of a decided value this
+// coordinator did NOT propose cannot take the workload now, or "" when it can.
+// The coordinator's own pick passed placement and the gate checks before it
+// was proposed; an adopted value -- another coordinator's, or one a voter
+// accepted in an earlier attempt that never formed a certificate and that a
+// forced reconfiguration imported -- passed them, if ever, against another
+// moment's cluster. On the lab such a value named a host removed for good,
+// and the machine re-added under its name was still joining when the value
+// was adopted and minted for it (drill 6 on main-b3368d7c).
+//
+// The value names its destination by host name only, so the checks are the
+// ones a fresh pick of that name gets now: an active host row, the split-brain
+// gate advertised, and fits, the site's own placement check. A value decided
+// for the source itself is not judged here (noteClaimStranded), and neither
+// is a host with no row (supersedeEvidence moves past a removed one) or a
+// value for another action (the site defers to it).
+func (c *Coordinator) adoptedDestProblem(ctx context.Context, cl claimedProof, proposal corrosion.ActionProof, source string,
+	fits func(corrosion.HostRecord) string) (string, error) {
+	d := cl.Proof
+	if cl.Ours || d.Action != proposal.Action || d.DestHost == "" || d.DestHost == source || d.DestHost == proposal.DestHost {
+		return "", nil
+	}
+	h, err := corrosion.GetHost(ctx, c.db, d.DestHost)
+	if err != nil {
+		return "", err
+	}
+	if h == nil {
+		return "", nil
+	}
+	if h.State != "active" {
+		return fmt.Sprintf("is %s, not active", h.State), nil
+	}
+	if !c.destAdvertisesGate(ctx, h.Name) {
+		return "does not advertise the split-brain gate", nil
+	}
+	if fits != nil {
+		if p := fits(*h); p != "" {
+			return p, nil
+		}
+	}
+	return "", nil
+}
+
+// vmFitsOn is the reschedule site's placement check of one destination for
+// vm, recovered off failed: the same request and inputs the batch placement
+// of the coordinator's own pick uses, against that host alone. A pin is not
+// applied: the destination is the one decided, not one being chosen.
+func (c *Coordinator) vmFitsOn(ctx context.Context, vm corrosion.VMRecord, failed string, h corrosion.HostRecord) string {
+	req := buildFailoverPlacementRequest(vm, failed, c.capacity, func(string) bool { return true })
+	req.RequireRegion = c.vmRecoveryRegion(failed, vm)
+	allVMs, err := corrosion.ListVMs(ctx, c.db, "", "")
+	if err != nil {
+		return "its placement could not be checked: " + err.Error()
+	}
+	ctMem, err := corrosion.SumContainerMemoryByHost(ctx, c.db)
+	if err != nil {
+		ctMem = nil
+	}
+	observations, err := corrosion.ListHostCapacityObservations(ctx, c.db)
+	if err != nil {
+		observations = nil
+	}
+	res, err := placement.SelectBatch([]corrosion.HostRecord{h}, allVMs, nil, ctMem, observations, c.now(),
+		[]placement.Request{req})
+	if err != nil {
+		return "fails placement: " + err.Error()
+	}
+	if r := res[vm.Name]; r.Host != h.Name {
+		if r.Err != nil {
+			return "fails placement: " + r.Err.Error()
+		}
+		return "fails placement"
+	}
+	return ""
 }
 
 // proofSpent reports whether this replica holds proofID completed or failed:

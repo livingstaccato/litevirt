@@ -874,6 +874,7 @@ func (c *Coordinator) run(ctx context.Context) {
 		candTargets = append(candTargets, cand.target)
 	}
 	c.resolveOneWayGone(ctx, candTargets)
+	c.resolveRefenceSettled(ctx)
 
 	// Recovery pass: bring a host the coordinator marked down (offline, or a
 	// spurious no-VMs-moved fence) back to 'active' once a fresh quorum agrees
@@ -1656,6 +1657,7 @@ func (c *Coordinator) refence(ctx context.Context, h *corrosion.HostRecord, rec 
 			"host", h.Name, "fence_id", rec.ID, "method", fr.Method, "detail", fr.Detail,
 			"hint", "confirm "+h.Name+" is powered off, then run 'lv host fence-confirm "+h.Name+"'; the recovery resumes from it")
 		c.mAttempt(PhaseRecovery, ResultRefused, ErrRefenceFailed)
+		c.noteRefenceFailed(ctx, h.Name, rec, fr)
 	}
 	return true
 }

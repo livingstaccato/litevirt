@@ -1082,6 +1082,18 @@ the generation names lost, or because it is itself named lost and running —
 with the reason: valid signatures do not make a false claim of loss true.
 `lv cluster voter ls` on each host shows which generation it adopted.
 
+### A failed re-fence (`refence_failed`)
+
+Evaluator `failover`, subject the host, severity critical, written by the
+failover lease holder. A successor that found a verified fence of the host aged
+or in doubt fenced it again before resuming its recovery, and that re-fence
+failed, so nothing was recovered and the host is not re-fenced every cycle
+(migration-failover.md). The evidence names the recorded fence and the failure.
+Confirm the host is powered off, then run `lv host fence-confirm <host>`: the
+recovery resumes from it. The condition resolves once a later fence of the host
+succeeds or an operator confirms it off, or the host is back `active` or
+removed.
+
 ### Recovery-claim refusals (`recovery_claim_*`)
 
 With recovery claims enforced (`enforcement.recovery_claim`), a recovery that

@@ -179,8 +179,10 @@ func convergeByAntiEntropy(t *testing.T, c *Cluster, timeout time.Duration) {
 //
 // Mutations: (1) apply the re-admission without its reset form — a, b and o
 // keep the old IPMI user and settings, and the hosts row stays apart from d's
-// under one updated_at; (2) skip retiring the credential row — every node,
-// d included once anti-entropy reaches it, serves the old password.
+// under one updated_at; (2) skip retiring the credential row on removal and
+// on re-admission — every node, d included once anti-entropy reaches it,
+// serves the old password; (3) skip resetting the host's other rows — every
+// node keeps its host_networks and netbox_host_config rows live.
 func TestFleet_ReaddedHostInheritsNoSettings(t *testing.T) {
 	ctx := context.Background()
 	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 3302})
@@ -198,6 +200,20 @@ func TestFleet_ReaddedHostInheritsNoSettings(t *testing.T) {
 		WatchdogDev: "/dev/watchdog0", CpuOvercommit: &ratio,
 	}); err != nil {
 		t.Fatalf("configure IPMI on %s: %v", d.Name, err)
+	}
+	// The old machine's wiring intent, confirmed applied, and its NetBox
+	// publication: both reset by the re-admission (host_readmit.go).
+	if err := corrosion.UpsertHostNetwork(ctx, a.DB, corrosion.HostNetworkRecord{
+		HostName: d.Name, Name: "vmbr0", Kind: "bridge", Members: []string{"enp3s0f0"},
+		Addressing: `{"addresses":["10.77.10.15/24"]}`,
+	}); err != nil {
+		t.Fatalf("host network intent for %s: %v", d.Name, err)
+	}
+	if err := corrosion.MarkHostNetworkApplied(ctx, a.DB, d.Name, "vmbr0"); err != nil {
+		t.Fatalf("mark %s's intent applied: %v", d.Name, err)
+	}
+	if err := corrosion.PublishNetBoxHostConfig(ctx, a.DB, d.Name, "dc1-cluster"); err != nil {
+		t.Fatalf("NetBox publication for %s: %v", d.Name, err)
 	}
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
@@ -256,6 +272,18 @@ func TestFleet_ReaddedHostInheritsNoSettings(t *testing.T) {
 		fs := fenceSettingsOf(t, n, d.Name)
 		if fs.addr != "" || fs.user != "" || fs.pass != "" || fs.hasCredRow || fs.strategy == "ipmi" {
 			t.Errorf("%s would fence the rebuilt %s as the machine removed before it: %+v", n.Name, d.Name, fs)
+		}
+	}
+	for _, n := range c.Nodes {
+		for _, tbl := range []string{"host_networks", "netbox_host_config"} {
+			live, err := n.DB.Query(ctx, `SELECT 1 FROM `+tbl+` WHERE host_name = ? AND deleted_at IS NULL`, d.Name)
+			if err != nil {
+				t.Fatalf("%s: read %s: %v", n.Name, tbl, err)
+			}
+			if len(live) != 0 {
+				t.Errorf("%s still holds %d live %s row(s) of the machine removed before the rebuilt %s",
+					n.Name, len(live), tbl, d.Name)
+			}
 		}
 	}
 	rows, err := a.DB.Query(ctx, `SELECT watchdog_dev, cpu_overcommit FROM hosts WHERE name = ?`, d.Name)

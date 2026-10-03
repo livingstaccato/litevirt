@@ -162,6 +162,11 @@ func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statem
 		switch {
 		case isReadmit(s):
 			host, ts, ok = readmitParams(s)
+			if ok {
+				if err := retireHostOwnedRows(ctx, tx, host, ts); err != nil {
+					return fmt.Errorf("reset %s's per-host rows on re-admission: %w", host, err)
+				}
+			}
 		case isHostDelete(s):
 			host, ts, ok = deleteParams(s)
 		}
@@ -197,4 +202,72 @@ func retireFenceCredential(ctx context.Context, tx *sql.Tx, host, updatedAt stri
 		`UPDATE host_fence_credentials SET ipmi_pass = '', deleted_at = ?, updated_at = ? WHERE host_name = ?`,
 		updatedAt, updatedAt, host)
 	return err
+}
+
+// THE HOST'S OTHER ROWS. Three more tables are keyed by the host's name, and a
+// re-admission decides each one, as it decides each hosts column:
+//
+//   - host_networks is RESET. Its rows are wiring confirmed on the old
+//     machine's NICs: member interface names, static addresses, and a state
+//     of `applied` with a generation. For the new machine `lv host network
+//     ls` would report wiring it does not have, and its next `lv host network
+//     apply` would render every one of them, old NIC names and the old
+//     machine's addresses included, onto hardware they were never planned
+//     for; the apply's self-cutoff check guards only the cluster-LAN
+//     interface. ("A host that lost its DB re-learns its intent from peers"
+//     is about a host that keeps its identity; `lv host rm` ends it.)
+//   - netbox_host_config is RESET. It is the host's own publication of the
+//     NetBox cluster name its daemon resolves, and the mirror refuses to run
+//     while a live host has published none (netbox_cluster_uniformity.go).
+//     The old machine's row would stand in for a new machine that never
+//     publishes (NetBox disabled there), which is exactly the host that check
+//     exists to catch. A new machine that does publish writes after its
+//     admission, so its row is newer and stands.
+//   - host_firewall_rules is KEPT. They are the host_overrides tier of the
+//     FORWARD chain: the operator's policy for guest traffic through the
+//     host of that name, not a fact about its hardware, and never the host's
+//     own ingress, so they cannot cut the new machine off. Dropping them
+//     would silently relax that policy for every guest placed there, and a
+//     row with a stack_name belongs to its stack, not to the machine.
+//
+// Each reset row becomes a tombstone the way the credential row does: locally
+// and never logged, stamped with the admission's own updated_at as deleted_at
+// and updated_at, and only over a row older than that.
+var readmitResetTables = []struct{ table, key string }{
+	{"host_networks", "host_name"},
+	{"netbox_host_config", "host_name"},
+}
+
+func retireHostOwnedRows(ctx context.Context, tx *sql.Tx, host, updatedAt string) error {
+	for _, t := range readmitResetTables {
+		rows, err := tx.QueryContext(ctx,
+			`SELECT rowid, updated_at FROM `+t.table+` WHERE `+t.key+` = ? AND deleted_at IS NULL`, host)
+		if err != nil {
+			return fmt.Errorf("%s: %w", t.table, err)
+		}
+		var older []int64
+		for rows.Next() {
+			var id int64
+			var cur string
+			if err := rows.Scan(&id, &cur); err != nil {
+				rows.Close()
+				return fmt.Errorf("%s: %w", t.table, err)
+			}
+			if lwwOrder(cur, updatedAt) < 0 {
+				older = append(older, id)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("%s: %w", t.table, err)
+		}
+		for _, id := range older {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE `+t.table+` SET deleted_at = ?, updated_at = ? WHERE rowid = ?`,
+				updatedAt, updatedAt, id); err != nil {
+				return fmt.Errorf("%s: %w", t.table, err)
+			}
+		}
+	}
+	return nil
 }

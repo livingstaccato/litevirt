@@ -103,6 +103,15 @@ with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
 
+Such a host is a new machine to the cluster and inherits nothing the old one
+was configured with: its fencing and IPMI settings, labels, role, region and
+capacity overrides return to their defaults, and its IPMI password is retired
+(already at `lv host rm`). Its `lv host network` intents are dropped too,
+since they name the old machine's NICs and addresses: record the new
+machine's wiring before its first `lv host network apply`. Its host-tier
+firewall rules (`lv firewall host-rule`) are kept: they are policy for guest
+traffic through the host of that name, not a property of the hardware.
+
 3. Edit `/etc/litevirt/config.yaml` on the new host to set the join address:
 
 ```yaml

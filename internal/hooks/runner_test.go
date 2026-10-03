@@ -144,6 +144,7 @@ func TestVMStateString(t *testing.T) {
 		{pb.VMState_VM_STOPPING, "stopping"},
 		{pb.VMState_VM_MIGRATING, "migrating"},
 		{pb.VMState_VM_ERROR, "error"},
+		{pb.VMState_VM_PAUSED, "paused"},
 		{pb.VMState_VM_UNKNOWN, "unknown"},
 	}
 	for _, tt := range tests {

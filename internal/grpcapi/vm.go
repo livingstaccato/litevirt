@@ -1111,7 +1111,7 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		// Reconcile DB state with libvirt for local VMs.
 		state := vm.State
 		if vm.HostName == s.hostName && s.virt != nil {
-			if liveState, err := s.virt.DomainState(vm.Name); err == nil {
+			if liveState, err := s.liveVMState(vm.Name); err == nil {
 				switch {
 				case vm.State == "stopped" && liveState == "running":
 					// Graceful shutdown in progress — trust DB
@@ -2210,7 +2210,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// graceful shutdown where libvirt still reports "running" briefly.
 	state := vm.State
 	if vm.HostName == s.hostName && s.virt != nil {
-		if liveState, err := s.virt.DomainState(name); err == nil {
+		if liveState, err := s.liveVMState(name); err == nil {
 			// Trust libvirt for running detection (catches unexpected starts/crashes),
 			// but trust DB for operator-initiated stops/starts.
 			switch {
@@ -2452,6 +2452,22 @@ func formatDiskSizeBytes(n int64) string {
 	}
 }
 
+// liveVMState is libvirt's coarse state for a local domain, except that a
+// PAUSED domain — active, RAM kept, suspended by the partition pauser or an
+// operator — is "paused" rather than the "stopped" coarse state folds it into.
+// A display state only: nothing writes "paused" into a vms row, and the list's
+// drift heal for a running row whose domain is stopped never sees a paused one.
+func (s *Server) liveVMState(name string) (string, error) {
+	st, err := s.virt.DomainState(name)
+	if err != nil || st != "stopped" {
+		return st, err
+	}
+	if r, rerr := s.virt.DomainStateReason(name); rerr == nil && r.State == "stopped" && r.Reason == "paused" {
+		return "paused", nil
+	}
+	return st, nil
+}
+
 func vmStateToPB(s string) pb.VMState {
 	switch s {
 	case "creating":
@@ -2468,6 +2484,8 @@ func vmStateToPB(s string) pb.VMState {
 		return pb.VMState_VM_MIGRATING
 	case "error":
 		return pb.VMState_VM_ERROR
+	case "paused":
+		return pb.VMState_VM_PAUSED
 	default:
 		return pb.VMState_VM_UNKNOWN
 	}

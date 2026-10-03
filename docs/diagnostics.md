@@ -1072,11 +1072,30 @@ Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised
 after `lv cluster voter force-reconfigure` until every host it named lost has
 been removed and revoked with `lv host rm --dead`: a lost host may hold an
 ordinary generation its majority decided that nobody saw, so it must not come
-back as it left. The evidence names each lost host still to remove. It is also
+back as it left. A lost host is the voter entry, name and incarnation, so a
+machine rebuilt under its name after `lv host rm --dead` counts it gone once
+it answers as a new incarnation, or once the adopted generation lists it as a
+voter under one. A name with a fenced row keeps the condition raised with the
+`lv host rm --dead` step. A host in service under the name that cannot say
+which incarnation it is keeps it raised too, but the evidence only asks for it
+to be reached: removal is never advised for a host in service or a current
+voter. The evidence names each lost host still to settle. It is also
 raised by a node that REFUSED a forced generation — because it can reach a host
 the generation names lost, or because it is itself named lost and running —
 with the reason: valid signatures do not make a false claim of loss true.
 `lv cluster voter ls` on each host shows which generation it adopted.
+
+### A failed re-fence (`refence_failed`)
+
+Evaluator `failover`, subject the host, severity critical, written by the
+failover lease holder. A successor that found a verified fence of the host aged
+or in doubt fenced it again before resuming its recovery, and that re-fence
+failed, so nothing was recovered and the host is not re-fenced every cycle
+(migration-failover.md). The evidence names the recorded fence and the failure.
+Confirm the host is powered off, then run `lv host fence-confirm <host>`: the
+recovery resumes from it. The condition resolves once a later fence of the host
+succeeds or an operator confirms it off, or the host is back `active` or
+removed.
 
 ### Recovery-claim refusals (`recovery_claim_*`)
 
@@ -1105,7 +1124,11 @@ logged with every refusing voter's detail:
 diagnosed: per attempt and per voter it prints the promised and accepted
 ballot, the accepted value's digest, proof, destination and source, whether the
 voter's incarnation matches its entry, and its last refusal with the detail. A
-voter keeps its last refusal in memory only.
+voter keeps its last refusal in memory only, so the column is `-` after that
+voter restarts. That is by design (design/recovery-claims.md §3.3): a refusal
+writes nothing, and a refusal from before a restart describes a probe or a
+ballot that no longer holds. Re-run the recovery, or wait for the
+coordinator's next attempt, to see a current one.
 
 ### Recovery stranded on a dead destination (`ha.claim.stranded`)
 

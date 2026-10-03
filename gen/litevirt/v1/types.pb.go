@@ -34,6 +34,11 @@ const (
 	VMState_VM_MIGRATING VMState = 5
 	VMState_VM_ERROR     VMState = 6
 	VMState_VM_UNKNOWN   VMState = 7
+	// VM_PAUSED: the domain is active but not executing, its RAM kept —
+	// suspended by the partition pauser or an operator. libvirt reports it
+	// "stopped", the same as shut off; the server reads the reason. A client
+	// built before it shows the number 8.
+	VMState_VM_PAUSED VMState = 8
 )
 
 // Enum value maps for VMState.
@@ -47,6 +52,7 @@ var (
 		5: "VM_MIGRATING",
 		6: "VM_ERROR",
 		7: "VM_UNKNOWN",
+		8: "VM_PAUSED",
 	}
 	VMState_value = map[string]int32{
 		"VM_CREATING":  0,
@@ -57,6 +63,7 @@ var (
 		"VM_MIGRATING": 5,
 		"VM_ERROR":     6,
 		"VM_UNKNOWN":   7,
+		"VM_PAUSED":    8,
 	}
 )
 
@@ -6230,7 +6237,7 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\n" +
 	"used_bytes\x18\n" +
 	" \x01(\x03R\tusedBytes\x12\x18\n" +
-	"\aproject\x18\v \x01(\tR\aproject*\x8c\x01\n" +
+	"\aproject\x18\v \x01(\tR\aproject*\x9b\x01\n" +
 	"\aVMState\x12\x0f\n" +
 	"\vVM_CREATING\x10\x00\x12\x0f\n" +
 	"\vVM_STARTING\x10\x01\x12\x0e\n" +
@@ -6242,7 +6249,8 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\fVM_MIGRATING\x10\x05\x12\f\n" +
 	"\bVM_ERROR\x10\x06\x12\x0e\n" +
 	"\n" +
-	"VM_UNKNOWN\x10\a*i\n" +
+	"VM_UNKNOWN\x10\a\x12\r\n" +
+	"\tVM_PAUSED\x10\b*i\n" +
 	"\tHostState\x12\x0f\n" +
 	"\vHOST_ACTIVE\x10\x00\x12\x11\n" +
 	"\rHOST_DRAINING\x10\x01\x12\x14\n" +

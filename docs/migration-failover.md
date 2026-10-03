@@ -343,8 +343,9 @@ What happens next depends on the fence:
   fresh fence, and a shared-disk VM is bound to it. If the re-fence fails,
   nothing is recovered. The failed attempt is now the newest on record, so the
   host is not re-fenced every cycle; it is left `offline` for an operator,
-  counted as `phase=recovery, error_class=refence_failed`. Confirm it is off and
-  run `lv host fence-confirm <host>`, and the recovery resumes from the
+  counted as `phase=recovery, error_class=refence_failed` and raised as the
+  `refence_failed` health condition. Confirm it is off and run
+  `lv host fence-confirm <host>`, and the recovery resumes from the
   confirmation.
 - **An unverified (`ssh`, `best-effort`) fence** is resumed from directly while
   it still stands, and never re-fenced: an SSH power-off of a host that is

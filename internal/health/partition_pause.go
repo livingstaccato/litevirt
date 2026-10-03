@@ -526,9 +526,16 @@ func (p *PartitionPauser) Evaluate(ctx context.Context) {
 	}
 	// Unknown (warmup, an unreadable voter set) counts as loss, but is not
 	// reported as one: every daemon start passes through it.
+	// With the flag off nothing is paused (docs/design/partition-pause.md §5),
+	// so the line must not say otherwise.
 	if !hadLoss && state == QuorumNo {
-		slog.Info("partition-pause: lost the voter majority; pausing recoverable workloads if it does not return",
-			"host", p.host, "live", live, "needed", needed, "after", p.after)
+		if p.enabled != nil && p.enabled() {
+			slog.Info("partition-pause: lost the voter majority; pausing recoverable workloads if it does not return",
+				"host", p.host, "live", live, "needed", needed, "after", p.after)
+		} else {
+			slog.Info("partition-pause: lost the voter majority; enforcement.partition_pause is off, so this host pauses nothing",
+				"host", p.host, "live", live, "needed", needed)
+		}
 	}
 	if covered < p.after {
 		return

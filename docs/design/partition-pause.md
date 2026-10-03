@@ -327,6 +327,12 @@ While this host holds any self-paused workload, it holds a
 and it is resolved when the last record goes. A fleet-wide blip therefore
 leaves one resolved condition per host in the history.
 
+`lv ls` and `lv inspect` on the paused host show each paused VM as
+`VM_PAUSED`, not `VM_STOPPED`: libvirt's coarse state folds a paused domain in
+with a shut-off one, so the server reads the domain's reason. The state is for
+display only; the VM's replicated row keeps `running`. A CLI built before
+`VM_PAUSED` existed prints the number `8`.
+
 The daemon logs every pause, resume and hold with the workload's kind and name
 and a reason. The lab check greps these lines:
 

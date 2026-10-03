@@ -614,6 +614,8 @@ func vmStateBadge(state pb.VMState) template.HTML {
 		return `<span class="badge badge-red">error</span>`
 	case pb.VMState_VM_MIGRATING:
 		return `<span class="badge badge-blue">migrating</span>`
+	case pb.VMState_VM_PAUSED:
+		return `<span class="badge badge-yellow">paused</span>`
 	default:
 		return `<span class="badge badge-gray">unknown</span>`
 	}

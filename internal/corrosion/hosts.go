@@ -507,14 +507,17 @@ func UpdateHostRegion(ctx context.Context, c *Client, name, region string) error
 func DeleteHost(ctx context.Context, c *Client, name string) error {
 	now := time.Now().UTC().Format(time.RFC3339) // deleted_at marker (bare)
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-			Params: []interface{}{now, c.NowTS(), name}},
+		{SQL: deleteHostSQL, Params: []interface{}{now, c.NowTS(), name}},
 		{SQL: `UPDATE host_health SET deleted_at = ?, updated_at = ? WHERE observer = ? OR target = ?`,
 			Params: []interface{}{now, c.NowTS(), name, name}},
 		{SQL: `UPDATE network_vteps SET deleted_at = ?, updated_at = ? WHERE host_name = ?`,
 			Params: []interface{}{now, c.NowTS(), name}},
 	})
 }
+
+// deleteHostSQL tombstones a host row. Every node that applies it, the origin
+// included, also retires the host's fence credential row (host_readmit.go).
+const deleteHostSQL = `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`
 
 // UpdateHostVersion updates a host's reported version.
 func UpdateHostVersion(ctx context.Context, c *Client, name, version string) error {

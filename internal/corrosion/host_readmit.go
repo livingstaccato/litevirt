@@ -120,19 +120,56 @@ func readmitParams(s Statement) (host, ts string, ok bool) {
 	return host, ts, tok && hok && host != "" && ts != ""
 }
 
+// deleteFingerprint is the wire fingerprint of the host removal (DeleteHost).
+var deleteFingerprint = mustStatementFingerprint(deleteHostSQL)
+
+// isHostDelete reports whether s is a host removal, by fingerprint.
+func isHostDelete(s Statement) bool {
+	if !strings.Contains(s.SQL, "hosts") {
+		return false
+	}
+	fp, err := FingerprintSQL(s.SQL)
+	return err == nil && fp == deleteFingerprint
+}
+
+// deleteParams are the host name and updated_at a removal binds:
+// deleted_at, updated_at, name — deleteHostSQL's order.
+func deleteParams(s Statement) (host, ts string, ok bool) {
+	if len(s.Params) != 3 {
+		return "", "", false
+	}
+	ts, tok := s.Params[1].(string)
+	host, hok := s.Params[2].(string)
+	return host, ts, tok && hok && host != "" && ts != ""
+}
+
 // retireReadmittedCredentials retires the fence credential row of every host
-// the statements re-admit. See THE CREDENTIAL ROW above.
+// the statements re-admit or remove. See THE CREDENTIAL ROW above.
+//
+// A removal retires it as a re-admission does, for the same reason and in the
+// same way. `lv host rm` used to leave the row live: the removed machine's BMC
+// password went on being served for the name on every node, and stayed on the
+// sensitive lane until a re-admission retired it, and only on the nodes that
+// applied one. The removal keeps its wire shape and its DispFullPKUpdate
+// disposition. The retirement is local and never logged, stamped with the
+// removal's own updated_at so every node derives the same tombstone, and only
+// over a row older than that, so a credential set for a machine admitted under
+// the name since stands.
 func retireReadmittedCredentials(ctx context.Context, tx *sql.Tx, stmts []Statement) error {
 	for _, s := range stmts {
-		if !isReadmit(s) {
-			continue
+		var host, ts string
+		var ok bool
+		switch {
+		case isReadmit(s):
+			host, ts, ok = readmitParams(s)
+		case isHostDelete(s):
+			host, ts, ok = deleteParams(s)
 		}
-		host, ts, ok := readmitParams(s)
 		if !ok {
 			continue
 		}
 		if err := retireFenceCredential(ctx, tx, host, ts); err != nil {
-			return fmt.Errorf("retire %s's fence credential on re-admission: %w", host, err)
+			return fmt.Errorf("retire %s's fence credential: %w", host, err)
 		}
 	}
 	return nil

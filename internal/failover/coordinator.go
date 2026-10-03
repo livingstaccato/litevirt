@@ -401,10 +401,31 @@ func (c *Coordinator) SetFencer(f Fencer) { c.fencer = f }
 // SetCapacityPolicy wires the cluster-wide capacity policy.
 func (c *Coordinator) SetCapacityPolicy(p corrosion.CapacityPolicy) { c.capacity = p }
 
+// vmSpecPin returns the host vm's stored spec pins it to, or "".
+func vmSpecPin(vm corrosion.VMRecord) string {
+	spec := &pb.VMSpec{}
+	if vm.Spec == "" || json.Unmarshal([]byte(vm.Spec), spec) != nil || spec.Placement == nil {
+		return ""
+	}
+	return spec.Placement.Host
+}
+
 // buildFailoverPlacementRequest constructs a placement request for a VM being
 // rescheduled off failedHost, honoring the constraints in its stored spec.
 // A spec pin to the failed host itself is dropped — the whole point is to leave.
-func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, capacity corrosion.CapacityPolicy) placement.Request {
+//
+// So is a pin to any other host that is down (pinDown): not in the host table,
+// or not 'active'. The pin is the operator's "run it there", and while there is
+// down it cannot be honoured whichever way the recovery goes; the choice is
+// between running the VM elsewhere and not running it at all, which is the
+// choice a pin to the failed host has always been resolved for. It arises
+// whenever a recovery has already moved a pinned VM off its pin: kvm003 drill 6
+// recovered pp4 off node-4, its pin, and when pp4's new host failed with node-4
+// still down, the pin stranded it. Nothing about the stored spec changes: the
+// pin is ignored for this recovery only, and honoured again by the next one
+// once its host is back. A pin to a host that is up but cannot take the VM — a
+// witness, or one without room — is still a hard constraint, and strands it.
+func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, capacity corrosion.CapacityPolicy, pinDown func(string) bool) placement.Request {
 	req := placement.Request{
 		VMName:       vm.Name,
 		CPUNeeded:    vm.CPUActual,
@@ -419,7 +440,7 @@ func buildFailoverPlacementRequest(vm corrosion.VMRecord, failedHost string, cap
 		return req
 	}
 	p := spec.Placement
-	if p.Host != "" && p.Host != failedHost {
+	if p.Host != "" && p.Host != failedHost && !pinDown(p.Host) {
 		req.PinHost = p.Host
 	}
 	req.AntiAffinity = p.AntiAffinity
@@ -2423,6 +2444,24 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		c.mAttempt(PhaseFence, ResultRefused, ErrNoCandidates)
 		return
 	}
+	// A spec pin to a host that is down is ignored for this recovery
+	// (buildFailoverPlacementRequest). Every live host is listed, not only the
+	// candidates: a pin to a host that is up but cannot take the VM, a
+	// witness say, still holds and strands it.
+	allHosts, err := corrosion.ListHosts(ctx, c.db)
+	if err != nil {
+		slog.Error("failover: list hosts", "host", h.Name, "error", err)
+		c.mAttempt(PhaseFence, ResultError, ErrDBError)
+		return
+	}
+	hostState := make(map[string]string, len(allHosts))
+	for _, ah := range allHosts {
+		hostState[ah.Name] = ah.State
+	}
+	pinDown := func(host string) bool {
+		st, ok := hostState[host]
+		return !ok || st != "active"
+	}
 
 	// Step 5: Reschedule VMs using placement engine for proper resource-aware scheduling.
 	type failoverPlan struct {
@@ -2571,7 +2610,11 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		}
 
 		if targetName == "" {
-			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity)
+			req := buildFailoverPlacementRequest(vm, h.Name, c.capacity, pinDown)
+			if pin := vmSpecPin(vm); pin != "" && pin != h.Name && req.PinHost == "" {
+				slog.Warn("failover: the VM's pinned host is down; recovering it elsewhere for this outage, its pin unchanged",
+					"vm", vm.Name, "pinned_host", pin, "pinned_host_state", hostState[pin], "from", h.Name)
+			}
 			// Region scope keeps the recovery in the fenced host's region, as a
 			// hard constraint: a VM no host there can hold stays put, loudly,
 			// like any other unsatisfiable constraint.

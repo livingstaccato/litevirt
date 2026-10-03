@@ -39,15 +39,21 @@ func failoverSkips(t *testing.T, n *Node, vm string) []string {
 }
 
 // TestFleet_FailoverPlacesWhatItCanAroundAnUnplaceablePin: d fails holding
-// "free" (no constraints) and "pinned", whose spec pins it to p. p cannot take
-// it. "free" must be recovered, and "pinned" left on d with a failover.skip
-// audit row naming it and the pin — once, not on every tick.
+// "free" (no constraints) and "pinned", whose spec pins it to p.
 //
-//   - pin-to-witness: p is a witness, which never hosts workloads.
-//   - pin-to-down-host: p is fenced (the drill's case: node-4 was down).
+//   - pin-to-witness: p is a witness, which never hosts workloads, so the pin
+//     cannot be honoured and is not a down host's either. "free" must be
+//     recovered, and "pinned" left on d with a failover.skip audit row naming
+//     it and the pin.
+//   - pin-to-down-host: p is fenced (the drill's case: node-4 was down). A pin
+//     to a down host is ignored for the recovery, as a pin to the failed host
+//     always was, so both are recovered, neither onto p, and nothing is
+//     reported unplaceable.
 //
-// Mutation: restore the batch abort for a bad pin in placement.SelectBatch —
-// both arms go red: "free" stays on d.
+// Mutations: (1) restore the batch abort for a bad pin in
+// placement.SelectBatch — pin-to-witness goes red: "free" stays on d; (2)
+// honour a pin to a down host (pinDown always false) — pin-to-down-host goes
+// red: "pinned" stays on d.
 func TestFleet_FailoverPlacesWhatItCanAroundAnUnplaceablePin(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -94,15 +100,25 @@ func TestFleet_FailoverPlacesWhatItCanAroundAnUnplaceablePin(t *testing.T) {
 			if got := vmOn(t, a, "free").HostName; got == d.Name {
 				t.Fatalf("\"free\" is still on %s: one VM's unplaceable pin stranded every VM of the failed host", d.Name)
 			}
-			if got := vmOn(t, a, "pinned").HostName; got != d.Name {
-				t.Fatalf("\"pinned\" moved to %s, a host its pin to %s does not allow", got, p.Name)
-			}
-			skips := failoverSkips(t, a, "pinned")
-			if len(skips) != 1 || !strings.Contains(skips[0], p.Name) {
-				t.Fatalf("want exactly one failover.skip for \"pinned\" naming its pin %s, got %q", p.Name, skips)
-			}
 			if skips := failoverSkips(t, a, "free"); len(skips) != 0 {
 				t.Fatalf("\"free\" was reported unplaceable: %q", skips)
+			}
+			pinned := vmOn(t, a, "pinned").HostName
+			skips := failoverSkips(t, a, "pinned")
+			if tc.downPin {
+				if pinned == d.Name || pinned == p.Name {
+					t.Fatalf("\"pinned\" is on %s: a pin to the down host %s stranded it", pinned, p.Name)
+				}
+				if len(skips) != 0 {
+					t.Fatalf("\"pinned\" was recovered but reported unplaceable: %q", skips)
+				}
+				return
+			}
+			if pinned != d.Name {
+				t.Fatalf("\"pinned\" moved to %s, a host its pin to %s does not allow", pinned, p.Name)
+			}
+			if len(skips) != 1 || !strings.Contains(skips[0], p.Name) {
+				t.Fatalf("want one failover.skip for \"pinned\" naming its pin %s, got %q", p.Name, skips)
 			}
 		})
 	}

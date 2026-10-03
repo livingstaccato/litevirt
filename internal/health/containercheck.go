@@ -570,6 +570,10 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 				proofID = id
 			}
 		}
+		if c.hostLacksContainerRuntime(ctx) {
+			c.failRelocationWithoutRuntime(ctx, ct, proofID)
+			return
+		}
 		c.recreateRelocated(ctx, ct)
 		// If materialized (marker cleared), mark the proof terminal (single-use).
 		if proofID != "" {

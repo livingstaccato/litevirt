@@ -481,7 +481,10 @@ option available:
 
 A relocation target must have a container runtime: placement never picks a host
 whose daemon recorded `litevirt.lxc=false` (it probes for `lxc-create` at every
-start), for any container placement.
+start), for any container placement. A relocation that reached such a host
+anyway, for example one decided before the host recorded the label, fails there
+for good. The container goes to `error` with the cause, its relocation proof is
+failed, and the host stops retrying the rebuild.
 
 Restore-from-backup requires a backup repo reachable from the survivor (a
 registered repo name / shared NFS). `container_restore_timeout_sec`

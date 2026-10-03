@@ -578,6 +578,14 @@ Set in compose `migrate` section:
 | `restart-same` | Wait for original host to recover |
 | `none` | Do not reschedule |
 
+A VM with a local disk that is restarted on another host does not get its disk
+back, because the disk stayed on the failed host. The new host rebuilds the disk
+from the VM's image at the disk's recorded size. The new host might still have
+an old copy of the disk from an earlier stay there. The restart never boots that
+copy. It renames the copy to `<disk path>.superseded-<time>` next to the new
+disk. Nothing removes the renamed file. Delete it when you no longer need
+anything in it.
+
 ## Load-balancer VIP split-brain safety
 
 Load-balancer VIPs (keepalived/VRRP) are protected against split-brain by the same core

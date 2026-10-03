@@ -129,6 +129,9 @@ type Reconciler struct {
 	pullMu sync.Mutex
 	pulls  map[string]*imagePullFlight
 
+	// transferDisks: disks a pending transfer rebuilt here (superseded_disk.go).
+	transferDisks transferDisks
+
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
 	// in-flight ownership move isn't reclaimed before its marker lands.
@@ -1155,6 +1158,10 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// by a coordinator that held the lease + quorum, so we MUST validate + claim it
 	// single-use — AND run the local ExecutionGate — regardless of local activation.
 	proofID := fresh.PendingActionID
+	// An ownership transfer onto this host (the coordinator's pending row, or
+	// its proof after a crash or re-arm), as opposed to a local start: it never
+	// finds the VM's current host-local disk here (superseded_disk.go).
+	transfer := fresh.State == "pending" || proofID != ""
 
 	// A proof MARKER present with NO gate wired fails CLOSED: we can't verify quorum,
 	// and a marker implies enforcement was active when it was stamped. (Production
@@ -1450,6 +1457,13 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	var diskConfigs []lv.DiskConfig
 	for _, d := range diskRecords {
+		if transfer {
+			if _, err := r.setAsideSupersededDisk(vm.Name, proofID, d); err != nil {
+				r.failPendingStart(ctx, vm.Name, proofID, true,
+					fmt.Sprintf("set aside the old copy of disk %s found at %s: %v", d.DiskName, d.Path, err))
+				return
+			}
+		}
 		// Verify disk file exists on this host.
 		if _, err := os.Stat(d.Path); err != nil {
 			// If disk has a backing image, try auto-pulling it and recreating the overlay.
@@ -1492,6 +1506,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 					return
 				}
 				d.Path = newPath
+				r.transferDisks.note(newPath, proofID)
 				slog.Info("reconciler: recreated overlay disk", "vm", vm.Name, "disk", d.DiskName, "path", newPath)
 			} else {
 				slog.Error("reconciler: disk not found", "vm", vm.Name, "disk", d.DiskName, "path", d.Path)

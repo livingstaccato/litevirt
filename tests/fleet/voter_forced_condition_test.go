@@ -102,8 +102,27 @@ func TestFleet_VoterForced_ConditionClearsWhenALostHostIsRebuilt(t *testing.T) {
 	if !raised || !strings.Contains(ev, n3.Name) || strings.Contains(ev, n4.Name+"'s vote") {
 		t.Fatalf("ha.voter.forced must name only %s, which cannot say which machine it is: raised=%v %q", n3.Name, raised, ev)
 	}
+	if strings.Contains(ev, "rm --dead "+n3.Name) {
+		t.Fatalf("ha.voter.forced advises removing %s, a host in service that merely did not answer: %q", n3.Name, ev)
+	}
 	c.SetLinkFault(n0, n3, LinkFault{})
 	if raised, ev := forcedCondition(t, n0); raised {
 		t.Fatalf("ha.voter.forced is still raised once %s answers as a new machine: %q", n3.Name, ev)
+	}
+
+	// The lab's N8 sequence ends with the rebuilt hosts voted back in. Once
+	// the adopted generation lists a name under a new incarnation, that is the
+	// answer, whether or not the host can be asked this tick: the condition
+	// stays clear, and never tells the operator to remove a current voter.
+	voterAdd(t, c, n0, n4, 3)
+	adoptRebuilt(t, n4, 3)
+	adoptAll(t, c, 3, n0, n1, n4)
+	voterAdd(t, c, n0, n3, 4)
+	adoptRebuilt(t, n3, 4)
+	adoptAll(t, c, 4, n0, n1, n3, n4)
+	c.SetLinkFault(n0, n3, LinkFault{BlockClaims: true})
+	c.SetLinkFault(n0, n4, LinkFault{BlockClaims: true})
+	if raised, ev := forcedCondition(t, n0); raised {
+		t.Fatalf("ha.voter.forced is raised for rebuilt hosts that are voters again: %q", ev)
 	}
 }

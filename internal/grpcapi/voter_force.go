@@ -543,36 +543,65 @@ func (s *Server) noteForcedConflict(gen int64, detail string) {
 	s.forced.byGe[gen] = detail
 }
 
-// lostVoterGone reports nil once the lost voter l of prev, the generation a
-// forced one replaced, is gone for good: removed and revoked
-// (RemovedHostEvidence), or the name now answers as another incarnation. The
-// lost voter is the member ENTRY, name and incarnation (§10 item 38), so a
-// machine rebuilt under l's name after `lv host rm --dead` — a live hosts row
-// again, the old serial gone with the tombstone AdmitHost replaced — is a
-// later machine whose empty state.db never voted, not the lost voter come
-// back. A name that cannot say which incarnation it is keeps it raised.
-func (s *Server) lostVoterGone(ctx context.Context, prev *corrosion.VoterConfig, l string) error {
+// lostVoterStill returns "" once the lost voter l of prev, the generation the
+// forced generation gen replaced, is gone for good, and otherwise the line
+// ha.voter.forced carries for it. Gone is any of: removed and revoked
+// (RemovedHostEvidence); replaced in current, the adopted generation, by an
+// entry under l's name with another incarnation; or the name answering as
+// another incarnation. The lost voter is the member ENTRY, name and
+// incarnation (§10 item 38), so a machine rebuilt under l's name after
+// `lv host rm --dead` — a live hosts row again, the old serial gone with the
+// tombstone AdmitHost replaced — is a later machine whose empty state.db
+// never voted, not the lost voter come back.
+//
+// `lv host rm --dead` is advised only for a host that is not a live, unfenced
+// member: never for one in service that merely did not answer, nor for a
+// current voter.
+func (s *Server) lostVoterStill(ctx context.Context, gen int64, prev, current *corrosion.VoterConfig, l string) string {
 	removed := corrosion.RemovedHostEvidence(ctx, s.db, s.pkiDir, l)
 	if removed == nil {
-		return nil
+		return ""
 	}
+	advise := fmt.Sprintf("forced generation %d dropped %s's vote; until %s is removed and revoked "+
+		"(`lv host rm --dead %s`) it must not come back as it left: %v", gen, l, l, l, removed)
 	lost, ok := prev.Member(l)
 	if !ok || lost.Incarnation == "" {
-		return removed
+		return advise
+	}
+	cur, isVoter := current.Member(l)
+	if isVoter && cur.Incarnation != lost.Incarnation {
+		return ""
 	}
 	// A fenced row is the lost machine's own, never removed: nothing to ask,
 	// and a dead host is not dialled on every tick.
-	if h, err := corrosion.GetHost(ctx, s.db, l); err != nil || h == nil || h.State == "fenced" {
-		return removed
+	h, err := corrosion.GetHost(ctx, s.db, l)
+	if err != nil || h == nil || h.State == "fenced" {
+		return advise
 	}
 	inc, err := s.remoteIncarnation(ctx, l, prev.Generation)
-	if err != nil {
-		return fmt.Errorf("%w; it did not say which incarnation it is: %v", removed, err)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("forced generation %d dropped %s's vote, and the %s in service now did not say which "+
+			"incarnation it is (%v), so it is not yet known to be a new machine rather than the lost voter "+
+			"(incarnation %s) come back; check it can be reached", gen, l, l, err, shortInc(lost.Incarnation))
+	case inc != lost.Incarnation:
+		return ""
+	case isVoter:
+		return fmt.Sprintf("forced generation %d dropped %s's vote, and %s is a voter again as the same "+
+			"incarnation %s, holding the claim state the force gave up: it came back as it left. Do not remove "+
+			"it while it votes; see docs/design/recovery-claims.md §4.6", gen, l, l, shortInc(inc))
+	default:
+		return fmt.Sprintf("forced generation %d dropped %s's vote, and %s answers as the same incarnation %s: "+
+			"the lost voter came back as it left. Keep it out of the voter set; rebuild it, or remove it with "+
+			"`lv host rm --dead %s`", gen, l, l, shortInc(inc), l)
 	}
-	if inc == lost.Incarnation {
-		return removed
+}
+
+func shortInc(s string) string {
+	if len(s) > 8 {
+		return s[:8]
 	}
-	return nil
+	return s
 }
 
 // applyVoterConditions raises ha.voter.forced (§4.6 step 5) while any lost
@@ -582,6 +611,10 @@ func (s *Server) applyVoterConditions(ctx context.Context) {
 	lines := map[string]string{}
 	var hosts []string
 	adopted, err := corrosion.AdoptedVoterGeneration(ctx, s.db)
+	if err != nil {
+		return
+	}
+	current, err := corrosion.AdoptedVoterConfig(ctx, s.db)
 	if err != nil {
 		return
 	}
@@ -595,9 +628,8 @@ func (s *Server) applyVoterConditions(ctx context.Context) {
 		}
 		prev, _ := corrosion.GetVoterConfig(ctx, s.db, r.Generation-1)
 		for _, l := range corrosion.ForcedLost(r.Change) {
-			if err := s.lostVoterGone(ctx, prev, l); err != nil {
-				lines[l] = fmt.Sprintf("forced generation %d dropped %s's vote; until %s is removed and revoked "+
-					"(`lv host rm --dead %s`) it must not come back as it left: %v", r.Generation, l, l, l, err)
+			if line := s.lostVoterStill(ctx, r.Generation, prev, current, l); line != "" {
+				lines[l] = line
 				hosts = append(hosts, l)
 			}
 		}

@@ -1074,9 +1074,12 @@ been removed and revoked with `lv host rm --dead`: a lost host may hold an
 ordinary generation its majority decided that nobody saw, so it must not come
 back as it left. A lost host is the voter entry, name and incarnation, so a
 machine rebuilt under its name after `lv host rm --dead` counts it gone once
-it answers as a new incarnation; a name with a fenced row, or one that cannot
-say which incarnation it is, keeps the condition raised. The evidence names each
-lost host still to remove. It is also
+it answers as a new incarnation, or once the adopted generation lists it as a
+voter under one. A name with a fenced row keeps the condition raised with the
+`lv host rm --dead` step. A host in service under the name that cannot say
+which incarnation it is keeps it raised too, but the evidence only asks for it
+to be reached: removal is never advised for a host in service or a current
+voter. The evidence names each lost host still to settle. It is also
 raised by a node that REFUSED a forced generation — because it can reach a host
 the generation names lost, or because it is itself named lost and running —
 with the reason: valid signatures do not make a false claim of loss true.

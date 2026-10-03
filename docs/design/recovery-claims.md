@@ -848,6 +848,56 @@ adopted. A `force:` row is verified by the rule in §4.6 instead, and it is the
 one exception to keep-local: a verified forced row replaces an ordinary row for
 the same generation.
 
+**History and revocation.** A node that was there all along verifies each
+generation when it is decided, against its CRL at that moment. A node that
+joins later adopts the whole chain from generation 1. By then the signers of
+early generations may have been removed and revoked: `lv host rm --dead` after
+a forced reconfiguration revokes a majority of genesis's signers. That is the
+ordinary end of a voter's life, not evidence against what it signed while it
+was a voter. So the joining node verifies the chain from an **anchor**, not
+against today's CRL at every step:
+
+- The anchor is the newest generation whose certificate verifies against the
+  node's *current* CRL, where every generation from the node's adopted one up
+  to it links to the one before it: a permitted change, members hash, the
+  right electorate and quorum, and authentic signatures (CA chain, CN, member
+  incarnation, payload). Linking ignores revocation. A forced row links by
+  its shape and its survivors' signatures; its probes come at adoption.
+- A generation at or below the anchor is adopted with revocations since
+  disregarded (`ClaimVerifier.Historical`). Nothing else is relaxed.
+- Above the anchor, every certificate must verify against the current CRL,
+  exactly as before. A revoked key still decides nothing new: not a generation
+  above the anchor, not a workload certificate (§3.10 step 5 is unchanged),
+  and not a generation being decided now.
+
+Why the anchor vouches for the history below it. A voter accepts a value at
+key `("voter_config", "", g, 0)` only once it has adopted `g` (§3.5), and it
+adopted `g` only after `g` verified on that voter, against its CRL at that
+time. The anchor's quorum of unrevoked signatures therefore says that a
+majority of the generation before it verified that generation when it counted.
+And each generation's members are pinned by the change of the generation after
+it, one member at a time (§4.3). A chain written by a holder of revoked keys
+alone never links to a generation that verifies today: the step into the
+anchor's electorate would need a majority of keys that are not revoked. A
+reset or genesis boundary pins nothing below it, and nothing below it governs
+anything any more. Judging each signature "as of the time it was signed" by
+timestamps instead would trust a `created_at` that the signers themselves
+chose.
+
+If no generation above the adopted one verifies today, there is no anchor,
+and the node adopts nothing whose certificate leans on a revoked key. One
+case is left: the newest generation was decided with a since-revoked signer
+in its bare quorum, for example `voter rm b` from `{a,b}` signed by `a` and
+`b`, followed by `lv host rm b`. A node joining after that stops one
+generation short until the next voter change is decided. The next change is
+signed by current members and becomes the anchor.
+
+Membership in a generation means the node's name **and** its incarnation.
+An entry under its name with another incarnation is an earlier machine. A node
+in that position abstains in that generation (§3.11), so it imports nothing
+for it. Trying to would mean asking that generation's sealed majority, which
+after a rebuild may no longer exist (§10 item 38).
+
 Node-local: `local_voter_adoption(generation PRIMARY KEY,
 imported_from TEXT, adopted_at TEXT)`. It records which generation this node has
 adopted and from which sealed majority it imported claim state (§4.4).
@@ -1049,6 +1099,14 @@ signatures do not make a false claim of loss true, so a single compromised
 survivor key cannot seize the voter set by naming live voters as lost. A named
 lost host that receives the row adopts it without probing. Adopting only removes
 its own vote.
+
+A lost host is a member *entry* of `g`: the name, with the incarnation it was
+admitted as. A probe that reaches the name asks which incarnation answered. A
+host that answers with a different incarnation is a later machine, rebuilt
+and re-added after `lv host rm --dead`. Its fresh `state.db` never voted
+under `g`, so it is not the lost voter coming back, and the receiver goes on.
+A host that is reached but cannot name its incarnation counts as the lost
+voter. The receiver's own name is treated the same way (§10 items 24, 38).
 
 **What safety is given up.** An ordinary change keeps every `g+1` majority
 intersecting the sealed `g` majority it imported from (§4.4). A forced change
@@ -1725,7 +1783,9 @@ where it described the mechanism; this list records what changed and why.
 24. **A forced receiver named lost refuses** (§4.6). Adopting a forced
     generation that names this node lost, while it is running, would let one
     compromised signing key seize the voter set; the node raises
-    `ha.voter.forced` with the reason and departs instead.
+    `ha.voter.forced` with the reason and departs instead. "This node" means
+    the lost member entry's incarnation. A machine rebuilt under the name has
+    another incarnation, and it adopts the row (item 38).
 25. **The seal is durable** (`local_voter_seals`, schema v62): a survivor that
     signed a forced change never again accepts at the replaced generation,
     across restarts.
@@ -2032,3 +2092,36 @@ where it described the mechanism; this list records what changed and why.
     - **Schema bump: yes, v63**, one additive node-local table. No
       replicated statement shape changes: the certificate column is the same
       TEXT, and the ledger is untouched.
+38. **A host that joins later adopts the voter chain from an anchor** (§4.1
+    "History and revocation"). On the kvm003 lab (2026-10-03, drill 6) the
+    chain was genesis on five, `rm:node-5`, `add:node-5`, then a forced
+    generation 4 = {node-1, node-2}, with node-3, node-4 and node-5 removed
+    by `lv host rm --dead`. They were rebuilt under the same names, and
+    generations 5 and 6 added node-5 and node-4 back. Neither of them ever
+    adopted anything. Each walked the chain from genesis and checked it
+    against today's CRL. Genesis then carried 2 valid accepts of the 5 it
+    needs, so the whole chain was refused. Generation 6 needed 3 of 4 with
+    only node-1 and node-2 able to vote, and nothing could be decided again:
+    no claim, no `voter add`, `rm` or `reset`. Three faults lay one behind
+    the other in that chain, and each is fixed here:
+    - **Revocation checked against history.** Fixed by the anchor rule in
+      §4.1.
+    - **A forced row naming the receiver's name.** A rebuilt node-4 is not
+      the node-4 that generation 4 named lost (item 24). It was refused
+      outright, and its probes reached the rebuilt node-3 and node-5 and
+      refused again. The lost voter is now the member entry, name and
+      incarnation, and a host answering with another incarnation is not it
+      (§4.6).
+    - **Membership by name.** The rebuilt node-5 read itself as a member of
+      generation 3 (`add:node-5`, the old machine). So it tried to import
+      from a sealed majority of generation 2 = {node-1..node-4}, of which
+      only node-1 and node-2 still had that generation's state. Membership
+      now requires the incarnation as well. A node abstains in a generation
+      that lists its name under another incarnation, so it has nothing to
+      import there.
+
+    No schema, statement shape, protobuf or capability change: the rule is
+    local to adoption. A node on this build adopts a chain that an older
+    node refuses, and it never adopts one that an older node accepts
+    differently. Older nodes that were there all along have already adopted
+    the same rows.

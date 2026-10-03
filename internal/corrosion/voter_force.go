@@ -12,8 +12,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // Forced reconfiguration (docs/design/recovery-claims.md §4.6): the
@@ -234,7 +232,7 @@ func (v *ClaimVerifier) verifySigned(certPEM, name string, payload, sig []byte) 
 	if c.Subject.CommonName != name {
 		return fmt.Errorf("signed with %q's certificate", c.Subject.CommonName)
 	}
-	if pki.IsCertRevoked(v.pkiDir, c.SerialNumber) {
+	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
 	}
 	pub, ok := c.PublicKey.(*ecdsa.PublicKey)

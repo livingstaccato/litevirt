@@ -8,6 +8,17 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// runsContainers labels hosts litevirt.lxc=true, as each one's daemon does
+// when it finds a container runtime; placement puts a container nowhere else.
+func runsContainers(t *testing.T, db *corrosion.Client, hosts ...string) {
+	t.Helper()
+	for _, h := range hosts {
+		if err := corrosion.SetHostLabel(context.Background(), db, h, corrosion.LabelLXCCapable, "true"); err != nil {
+			t.Fatalf("label %s litevirt.lxc=true: %v", h, err)
+		}
+	}
+}
+
 // TestRelocateContainers: on a fenced host, containers with a re-pullable image
 // and an image-recreate policy are re-keyed to a healthy host (pending +
 // relocate-recreate); policy=none and non-re-pullable containers are left in
@@ -21,6 +32,7 @@ func TestRelocateContainers(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	runsContainers(t, db, "live")
 	mk := func(name, image, policy string) {
 		if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
 			HostName: "dead", Name: name, State: "running", Image: image,
@@ -68,18 +80,23 @@ func TestRelocateContainers(t *testing.T) {
 // audited as such — rather than re-keyed onto a host that retries
 // "lxc-create not found" forever (drill D3, main-8d1e56dc: blct on node-3).
 //
+// A survivor with no litevirt.lxc label at all is no LXC survivor either:
+// placement is strict (corrosion.HostRunsContainers).
+//
 // Mutations: drop the placement engine's container-runtime filter — the
 // "one LXC survivor" subtest relocates to nolxc and goes red; drop the skip
 // on ErrNoContainerRuntime — the "no LXC survivor" subtest leaves the row
-// unmarked and goes red.
+// unmarked and goes red; restore the lenient rule (refuse only "false") —
+// "unlabelled survivor" relocates onto it and goes red.
 func TestRelocateContainers_OnlyToAHostWithAContainerRuntime(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
-		lxcLabel string // litevirt.lxc on the "lxc" host
+		lxcLabel string // litevirt.lxc on the "lxc" host; "" leaves it unlabelled
 		want     string // host owning web afterwards
 	}{
 		{"one LXC survivor", "true", "lxc"},
 		{"no LXC survivor", "false", "dead"},
+		{"unlabelled survivor", "", "dead"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			db := newTestDB(t)
@@ -94,6 +111,9 @@ func TestRelocateContainers_OnlyToAHostWithAContainerRuntime(t *testing.T) {
 					State: "active", CPUTotal: 8, MemTotal: h.mem,
 				}); err != nil {
 					t.Fatal(err)
+				}
+				if h.label == "" {
+					continue
 				}
 				if err := corrosion.SetHostLabel(ctx, db, h.name, corrosion.LabelLXCCapable, h.label); err != nil {
 					t.Fatal(err)
@@ -145,6 +165,7 @@ func TestRelocateContainers_ChargesMemoryOnly(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	runsContainers(t, db, "live")
 	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
 		HostName: "dead", Name: "web", State: "running", Image: "alpine:3.19",
 		CPULimit: 8, MemMiB: 3000, Project: "p1", OnHostFailure: "image-recreate",

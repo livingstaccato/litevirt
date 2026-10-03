@@ -39,8 +39,8 @@ const (
 	// association the deploy planner (current-state diff) and teardown use.
 	LabelStack = "litevirt.stack"
 	// LabelLXCCapable is the HOST label the daemon sets to advertise that the
-	// container (LXC) runtime is available. Compose requires it when placing
-	// container workloads so they never land on a non-LXC host.
+	// container (LXC) runtime is available ("true") or not ("false"). Only a
+	// host labelled exactly "true" runs a container — see HostRunsContainers.
 	LabelLXCCapable = "litevirt.lxc"
 	// LabelTPMCapable / LabelSecureBootCapable are HOST labels advertising vTPM
 	// (swtpm) and Secure Boot (secboot/MS OVMF) support (G1). Independent because
@@ -1255,4 +1255,13 @@ func decodeContainerLabels(raw string) map[string]string {
 		return nil
 	}
 	return out
+}
+
+// HostRunsContainers reports whether a container may be placed on h: its
+// daemon recorded litevirt.lxc (LabelLXCCapable) as exactly "true". The rule is
+// strict — a host with no label, or any other value, runs no container — so a
+// host is trusted with one only once its daemon has probed for the runtime and
+// said so. Every decision about whether a host can run a container uses it.
+func HostRunsContainers(h HostRecord) bool {
+	return h.Labels[LabelLXCCapable] == "true"
 }

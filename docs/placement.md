@@ -423,7 +423,12 @@ A VM is charged its vCPUs and its guest memory plus one qemu overhead, against
 the host's allocatable capacity net of what already runs there. A **container**
 is charged its memory limit only: no qemu overhead, and no vCPU — its `cpu` is a
 cap in cores, not a vCPU reservation, which is also how running containers
-are counted against a host and how host admission charges a new one.
+are counted against a host and how host admission charges a new one. A container
+is placed only on a host labelled `litevirt.lxc=true`, which its daemon writes
+when it finds `lxc-create`. A host with no label is refused like one labelled
+`false`, with `no container runtime (litevirt.lxc unset)`. When no active host
+qualifies, the refusal says `no active host has a container runtime`
+([containers](containers.md#host-loss-relocation)).
 
 An **update** of a workload is placed as a replacement of what it holds now:
 its current cpu and memory are released on its host while the updated request

@@ -50,6 +50,7 @@ func relocateSetup(t *testing.T, image string, survivorSchema int) (*corrosion.C
 	}); err != nil {
 		t.Fatalf("InsertHost surv: %v", err)
 	}
+	runsContainers(t, db, "surv")
 	// UpdateHostStartup stamps schema_version = CurrentSchemaVersion. Only call it
 	// when we want the survivor schema-compatible; otherwise it stays 0 (< current).
 	if survivorSchema >= corrosion.CurrentSchemaVersion {

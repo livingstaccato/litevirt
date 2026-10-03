@@ -624,6 +624,7 @@ func TestCoordinator_MixedVMContainerPoliciesWithPlacementConstraints(t *testing
 			t.Fatalf("SetHostLabel %s: %v", host, err)
 		}
 	}
+	runsContainers(t, db, "node-a", "node-b", "wrong-zone")
 	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
 		Name: "db", HostName: "node-a", State: "running", CPUActual: 1, MemActual: 1024,
 	}, nil, nil); err != nil {

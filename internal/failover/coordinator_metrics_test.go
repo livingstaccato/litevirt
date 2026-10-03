@@ -214,6 +214,7 @@ func TestFailoverMetrics_Relocate(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	runsContainers(t, db, "live")
 	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
 		HostName: "dead", Name: "web", State: "running", Image: "alpine:3.19",
 		CPULimit: 1, MemMiB: 128, Project: "p1", OnHostFailure: "image-recreate",

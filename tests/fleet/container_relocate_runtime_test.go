@@ -17,17 +17,23 @@ import (
 // the other, so the runtime filter is the only thing keeping the container off
 // it.
 //
+// A survivor whose record carries no litevirt.lxc label at all is no LXC
+// survivor either: placement is strict (corrosion.HostRunsContainers).
+//
 // Mutations: drop the placement engine's container-runtime filter — "one LXC
 // survivor" re-homes onto node-0 and goes red; drop the coordinator's skip on
-// ErrNoContainerRuntime — "no LXC survivor" leaves the row unmarked and goes red.
+// ErrNoContainerRuntime — "no LXC survivor" leaves the row unmarked and goes
+// red; restore the lenient rule (refuse only "false") — "unlabelled survivor"
+// re-homes onto node-1 and goes red.
 func TestContainerRelocate_OnlyOntoAHostWithAContainerRuntime(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
-		bRuntime string // litevirt.lxc on node-1
+		bRuntime string // litevirt.lxc on node-1; "" removes the label
 		wantHost int    // index of the node owning ct afterwards
 	}{
 		{"one LXC survivor", "true", 1},
 		{"no LXC survivor", "false", 2},
+		{"unlabelled survivor", "", 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := New(t, Options{Nodes: 3, SharedCRDT: true})
@@ -37,6 +43,19 @@ func TestContainerRelocate_OnlyOntoAHostWithAContainerRuntime(t *testing.T) {
 				n *Node
 				v string
 			}{{a, "false"}, {b, tc.bRuntime}, {victim, "true"}} {
+				if l.v == "" {
+					// The harness labels every node; take node-1's away.
+					if err := a.DB.Execute(ctx, `UPDATE hosts SET labels = json_remove(labels, '$."`+
+						corrosion.LabelLXCCapable+`"') WHERE name = ?`, l.n.Name); err != nil {
+						t.Fatalf("unlabel %s: %v", l.n.Name, err)
+					}
+					if h, err := corrosion.GetHost(ctx, a.DB, l.n.Name); err != nil || h == nil {
+						t.Fatalf("read %s back: %v", l.n.Name, err)
+					} else if _, ok := h.Labels[corrosion.LabelLXCCapable]; ok {
+						t.Fatalf("%s still carries %s: %v", l.n.Name, corrosion.LabelLXCCapable, h.Labels)
+					}
+					continue
+				}
 				if err := corrosion.SetHostLabel(ctx, a.DB, l.n.Name, corrosion.LabelLXCCapable, l.v); err != nil {
 					t.Fatalf("label %s: %v", l.n.Name, err)
 				}

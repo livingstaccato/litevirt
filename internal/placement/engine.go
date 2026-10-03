@@ -234,6 +234,14 @@ func (e *NoEligibleHostError) Error() string {
 
 func (e *NoEligibleHostError) Unwrap() error { return ErrNoEligibleHost }
 
+// lxcLabelState renders a host's litevirt.lxc label for a refusal reason.
+func lxcLabelState(h corrosion.HostRecord) string {
+	if v, ok := h.Labels[corrosion.LabelLXCCapable]; ok {
+		return corrosion.LabelLXCCapable + "=" + v
+	}
+	return corrosion.LabelLXCCapable + " unset"
+}
+
 // hostCandidate is an evaluated host during selection.
 type hostCandidate struct {
 	host    corrosion.HostRecord
@@ -476,15 +484,15 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		}
 
 		// Hard: a container needs a container runtime. Every daemon records
-		// whether its host has one in the litevirt.lxc label when it starts
-		// (lxc.Available); "false" is a host that cannot run a container, and a
-		// container placed there retries "lxc-create not found" forever. A
-		// host with no label at all (a build that predates it) is not refused
-		// on it. A request that already requires the label names it above.
+		// whether its host has one in the litevirt.lxc label (lxc.Available),
+		// and a container placed on a host without one retries "lxc-create not
+		// found" forever. Strict (corrosion.HostRunsContainers): only "true"
+		// qualifies, and a host with no label is refused like "false". A
+		// request that already requires the label names it above.
 		if req.Container {
-			if h.Labels[corrosion.LabelLXCCapable] == "false" {
+			if !corrosion.HostRunsContainers(h) {
 				if _, required := req.RequireLabels[corrosion.LabelLXCCapable]; !required {
-					failed = append(failed, "no container runtime ("+corrosion.LabelLXCCapable+"=false)")
+					failed = append(failed, "no container runtime ("+lxcLabelState(h)+")")
 				}
 			} else {
 				anyContainerRuntime = true

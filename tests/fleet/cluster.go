@@ -631,6 +631,13 @@ func (c *Cluster) crossRegisterHosts() {
 				// "UNIQUE constraint" is fine — already registered.
 				continue
 			}
+			// Every node runs a container runtime (n.CT), so each advertises
+			// litevirt.lxc=true as its daemon does on finding one; placement
+			// puts a container on no other host. A scenario about a host
+			// without a runtime overrides the label.
+			if err := corrosion.SetHostLabel(ctx, target.DB, hostNode.Name, corrosion.LabelLXCCapable, "true"); err != nil {
+				c.t.Fatalf("label %s litevirt.lxc=true on %s: %v", hostNode.Name, target.Name, err)
+			}
 			// InsertHost doesn't take region (the production path
 			// uses ConfigureHost post-hoc). Apply it as a separate
 			// UPDATE so the host_record carries the harness-assigned

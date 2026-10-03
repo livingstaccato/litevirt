@@ -7,13 +7,14 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// hostLacksContainerRuntime reports whether this host recorded that it has no
-// container runtime (corrosion.LabelLXCCapable = "false", written by its daemon
-// at every start from lxc.Available). A host with no label at all — a daemon
-// from before the label — is not taken to lack one, as in placement.
+// hostLacksContainerRuntime reports whether this host's record does not say it
+// runs containers: corrosion.HostRunsContainers, the rule placement applies, so
+// only litevirt.lxc=true (written by the daemon from lxc.Available) qualifies
+// and a host with no label lacks a runtime. A read that fails, or finds no host
+// row, decides nothing: the failure this gates is terminal.
 func (c *ContainerChecker) hostLacksContainerRuntime(ctx context.Context) bool {
 	h, err := corrosion.GetHost(ctx, c.db, c.hostName)
-	return err == nil && h != nil && h.Labels[corrosion.LabelLXCCapable] == "false"
+	return err == nil && h != nil && !corrosion.HostRunsContainers(*h)
 }
 
 // failRelocationWithoutRuntime ends a relocation onto this host that can never
@@ -24,7 +25,7 @@ func (c *ContainerChecker) hostLacksContainerRuntime(ctx context.Context) bool {
 // failed VM start uses — and the row leaves the relocate-recreate marker for
 // "error" with the cause, left visible for operator recovery.
 func (c *ContainerChecker) failRelocationWithoutRuntime(ctx context.Context, ct corrosion.ContainerRecord, proofID string) {
-	const detail = "relocation failed: this host has no container runtime (" + corrosion.LabelLXCCapable + "=false)"
+	const detail = "relocation failed: this host has no container runtime (" + corrosion.LabelLXCCapable + " is not true)"
 	if proofID != "" {
 		if err := corrosion.FailActionProof(ctx, c.db, proofID, "", "no_container_runtime", detail); err != nil {
 			slog.Warn("containercheck: fail the relocation proof", "container", ct.Name, "proof", proofID, "error", err)

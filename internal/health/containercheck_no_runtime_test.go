@@ -14,13 +14,24 @@ import (
 // relocate-recreate marker, so the sweep stops retrying "lxc-create not found"
 // (drill D3: blct on node-3).
 //
-// The host is known to have no runtime from the litevirt.lxc=false label its
-// daemon writes at every start; placement already refuses such a host, so this
-// is a relocation decided before the label said so.
+// The host is taken to have no runtime unless its daemon labelled it
+// litevirt.lxc=true (corrosion.HostRunsContainers): "false", written at every
+// start where lxc-create is missing, and no label at all both count. Placement
+// already refuses such a host, so this is a relocation decided before the
+// label said so.
 //
-// Mutation: drop the no-runtime check — the fake runtime "recreates" the
-// container and the proof completes, and the test goes red.
+// Mutations: drop the no-runtime check — the fake runtime "recreates" the
+// container and the proof completes, and both subtests go red; restore the
+// lenient rule (only "false" lacks a runtime) — the unlabelled subtest goes red.
 func TestContainerCheck_RelocateRecreate_NoRuntimeFailsTheProof(t *testing.T) {
+	for _, label := range []string{"false", ""} {
+		t.Run("litevirt.lxc="+label, func(t *testing.T) {
+			testRelocateRecreateNoRuntime(t, label)
+		})
+	}
+}
+
+func testRelocateRecreateNoRuntime(t *testing.T, label string) {
 	db := testLogicDB(t)
 	ctx := context.Background()
 	rt := newFakeCtRuntime()
@@ -29,8 +40,10 @@ func TestContainerCheck_RelocateRecreate_NoRuntimeFailsTheProof(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.SetHostLabel(ctx, db, "node1", corrosion.LabelLXCCapable, "false"); err != nil {
-		t.Fatal(err)
+	if label != "" {
+		if err := corrosion.SetHostLabel(ctx, db, "node1", corrosion.LabelLXCCapable, label); err != nil {
+			t.Fatal(err)
+		}
 	}
 	insertCt(t, db, corrosion.ContainerRecord{
 		HostName: "node1", Name: "blct", State: "pending",
@@ -67,18 +80,21 @@ func TestContainerCheck_RelocateRecreate_NoRuntimeFailsTheProof(t *testing.T) {
 	}
 }
 
-// A host with no label at all (a daemon from before the label) is not taken
-// to lack a runtime: the relocation proceeds as before.
+// A host its daemon labelled litevirt.lxc=true recreates the relocated
+// container as before: the control for the refusal above.
 //
-// Mutation: read a missing label as "no runtime" (!= "true") — the container
-// is not recreated and the test goes red.
-func TestContainerCheck_RelocateRecreate_UnlabelledHostStillRecreates(t *testing.T) {
+// Mutation: read every host as lacking a runtime — ct1 is not recreated and
+// this goes red.
+func TestContainerCheck_RelocateRecreate_LabelledHostRecreates(t *testing.T) {
 	db := testLogicDB(t)
 	ctx := context.Background()
 	rt := newFakeCtRuntime()
 	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
 		Name: "node1", Address: "10.0.0.1", SSHUser: "root", GRPCPort: 7443, State: "active",
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.SetHostLabel(ctx, db, "node1", corrosion.LabelLXCCapable, "true"); err != nil {
 		t.Fatal(err)
 	}
 	insertCt(t, db, corrosion.ContainerRecord{
@@ -88,6 +104,6 @@ func TestContainerCheck_RelocateRecreate_UnlabelledHostStillRecreates(t *testing
 	c := NewContainerChecker("node1", db, rt)
 	c.checkContainer(ctx, mustGetCt(t, db, "ct1"), time.Now())
 	if rt.startCount("ct1") != 1 {
-		t.Fatalf("ct1 started %d times on an unlabelled host, want 1", rt.startCount("ct1"))
+		t.Fatalf("ct1 started %d times on a host labelled litevirt.lxc=true, want 1", rt.startCount("ct1"))
 	}
 }

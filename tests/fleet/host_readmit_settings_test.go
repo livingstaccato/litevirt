@@ -97,8 +97,12 @@ func rebuildWithEmptyDB(t *testing.T, c *Cluster, n, peer *Node) string {
 		}
 	}
 	n.repl.SetProofReplicaGate(func(context.Context, string) bool { return true })
-	n.repl.Start(c.ctx)
-	n.replStarted = true
+	// A scenario-steered cluster moves every write itself (pumpMutations);
+	// only IndependentReplicas runs the push loop.
+	if c.opts.IndependentReplicas {
+		n.repl.Start(c.ctx)
+		n.replStarted = true
+	}
 	return serial
 }
 

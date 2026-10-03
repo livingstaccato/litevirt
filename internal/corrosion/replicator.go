@@ -3260,6 +3260,17 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 			return nil
 		}
 	}
+	// A write to a removed host's tombstone, other than its removal or its
+	// re-admission, changes nothing here (host_tombstone_guard.go).
+	if tableName == "hosts" {
+		refused, rErr := hostsTombstoneRefuses(ctx, tx, s, sh)
+		if rErr != nil {
+			return rErr
+		}
+		if refused {
+			return nil
+		}
+	}
 	skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)
 	if err != nil {
 		return err

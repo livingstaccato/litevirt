@@ -134,6 +134,15 @@ func (s *Server) checkHostSafety(ctx context.Context, host, workloadKind, worklo
 // problem placement's own filter already surfaces.
 const remoteObservationMaxAge = 5 * time.Minute
 
+// runtimeLoad is runtimeExtras as a value, for passing a reading taken outside
+// admissionMu into the verify that runs inside it.
+type runtimeLoad struct{ cpu, memMiB int }
+
+func (s *Server) runtimeLoad(ctx context.Context, host string) runtimeLoad {
+	cpu, mem := s.runtimeExtras(ctx, host)
+	return runtimeLoad{cpu: cpu, memMiB: mem}
+}
+
 // runtimeExtras returns host's FINITE runtime-only load — consumption the
 // database does not account for (rogue-but-bounded workloads, a runtime grown
 // past its recorded spec) — so the final admission arithmetic can subtract it

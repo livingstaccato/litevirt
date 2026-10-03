@@ -213,28 +213,29 @@ func destRunsVia(ctx context.Context, check func(ctx context.Context, host, name
 }
 
 // settleCertifiedMove stops domName's local copy when a certified claim gave
-// it away (the decision above). It reports whether it did.
-func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm *corrosion.VMRecord) (bool, string) {
-	if r.settleVerify == nil {
-		return false, "no certificate verifier wired"
-	}
+// it away (the decision above). It reports whether it did, and if not, why and
+// what this host knows of its copy (for the decline report, settle_declined.go).
+func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm *corrosion.VMRecord) (bool, string, localCopyID) {
 	local := r.localVMIdentity(domName)
+	if r.settleVerify == nil {
+		return false, "no certificate verifier wired", local
+	}
 	lister := r.settleProofs
 	if lister == nil {
 		lister = corrosion.CertifiedTransferProofs
 	}
 	proofs, err := lister(ctx, r.db, corrosion.ClaimKindVM, domName)
 	if err != nil {
-		return false, "proofs unreadable: " + err.Error()
+		return false, "proofs unreadable: " + err.Error(), local
 	}
 	p, cert, why := settleDecide(r.hostName, vm, local, proofs, func(ap corrosion.ActionProof) (corrosion.ClaimCertificate, error) {
 		return r.settleVerify(ctx, ap)
 	}, destRunsVia(ctx, r.checkPeerRuntime, domName))
 	if why != "" {
-		return false, why
+		return false, why, local
 	}
 	if err := r.virt.DestroyDomain(domName); err != nil {
-		return false, "destroy failed: " + err.Error()
+		return false, "destroy failed: " + err.Error(), local
 	}
 	detail := fmt.Sprintf("stopped the local copy (%s: incarnation %s, owner epoch %d): superseded by proof %s for %s, "+
 		"certified at voter generation %d for owner epoch %d; definition and disks kept",
@@ -247,7 +248,7 @@ func (r *Reconciler) settleCertifiedMove(ctx context.Context, domName string, vm
 	if err := RemovePauseRecord(r.dataDir, PauseKindVM, domName); err != nil {
 		slog.Warn("partition-settle: could not drop the pause record", "vm", domName, "error", err)
 	}
-	return true, ""
+	return true, "", local
 }
 
 type settledEvidence struct {

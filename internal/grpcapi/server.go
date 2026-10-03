@@ -554,6 +554,15 @@ type Server struct {
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
 
+	// admissionMu makes this node a single serialization point for its
+	// reserve-then-verify decisions: it is held from a provisional claim's
+	// reserve through its verify to its admitted marker (decideReservation),
+	// so no other local admission can verify inside that gap. Never held across
+	// a peer call. admissionVerifiedHook is a test-only seam run inside it,
+	// after verify passes and before the marker is written.
+	admissionMu           sync.Mutex
+	admissionVerifiedHook func(opID string)
+
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
 	// the reconciler tell a genuinely-in-flight backup apart from a

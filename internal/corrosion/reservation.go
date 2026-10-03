@@ -56,6 +56,18 @@ type ReservationVector struct {
 	WantMemMiB   int    `json:"want_mem_mib,omitempty"`
 	WantDiskGiB  int    `json:"want_disk_gib,omitempty"`
 	WantNIC      int    `json:"want_nic,omitempty"`
+
+	// Provisional marks a claim that is still being DECIDED by reserve-then-verify:
+	// it was published so concurrent deciders can see it, and it holds capacity
+	// against a LATER-arriving claimant only once an OpStepAdmitted step says its
+	// own verify passed. Until then a claimant with an earlier id ignores it (the
+	// tie-break), exactly as before.
+	//
+	// The default — false — is the safe one: a claim that is not provisional
+	// (an --allow-overcommit draw, a reservation an older build wrote, a
+	// spec-backed operation) is a decided fact and counts against every other
+	// claimant whatever its id. See reservationCounts.
+	Provisional bool `json:"provisional,omitempty"`
 }
 
 // ProjectAmount is the project-quota half of the vector as a QuotaAmount.
@@ -193,7 +205,7 @@ func reservationStepFacts(facts *ReservationFacts, project string) (string, erro
 // reduced state is NOT terminal — the in-flight capacity claims admission must
 // count on top of committed running-VM actuals.
 func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVector, error) {
-	byID, err := nonterminalReservationsByID(ctx, c)
+	byID, _, err := nonterminalReservationsByID(ctx, c)
 	if err != nil {
 		return nil, err
 	}
@@ -211,16 +223,19 @@ func nonterminalReservations(ctx context.Context, c *Client) ([]ReservationVecto
 // used to sit beside this, so ReservedBefore counted claims that HostReserved had
 // already fenced as stale, and admission could disagree with itself about the same
 // reservation depending on which aggregate asked.
-func nonterminalReservationsByID(ctx context.Context, c *Client) (map[string]ReservationVector, error) {
+//
+// admitted is the set of operation ids carrying an OpStepAdmitted marker, at any
+// owner epoch: the marker is about the claim, not about an epoch's progress.
+func nonterminalReservationsByID(ctx context.Context, c *Client) (byID map[string]ReservationVector, admitted map[string]bool, err error) {
 	orows, err := c.Query(ctx,
 		`SELECT id, project, resource_kind, resource_id, operation_kind,
 		        reservation_json, desired_ref, vm_owner_epoch
 		 FROM operations WHERE deleted_at IS NULL AND reservation_json != ''`)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if len(orows) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Bulk-load steps once, grouped by operation id + the immutable header's
@@ -230,12 +245,16 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (map[string]Res
 		`SELECT operation_id, owner_epoch, step_name, facts
 		 FROM operation_steps WHERE deleted_at IS NULL`)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	stepsByOpEpoch := make(map[string][]string, len(orows))
 	reservationFactsByOpEpoch := make(map[string]string, len(orows))
+	admitted = make(map[string]bool)
 	for _, r := range srows {
 		id := r.String("operation_id")
+		if r.String("step_name") == OpStepAdmitted {
+			admitted[id] = true
+		}
 		key := fmt.Sprintf("%s\x00%d", id, r.Int64("owner_epoch"))
 		stepsByOpEpoch[key] = append(stepsByOpEpoch[key], r.String("step_name"))
 		if r.String("step_name") == OpStepReserved {
@@ -252,7 +271,7 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (map[string]Res
 				id, r.String("resource_kind"), r.String("resource_id"),
 				r.String("desired_ref"), r.Int64("vm_owner_epoch"))
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if !current {
 				// The immutable header remains journal-visible, but a superseded
@@ -268,21 +287,21 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (map[string]Res
 		}
 		rv, err := DecodeReservation(r.String("reservation_json"))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if operationProject := r.String("project"); operationProject != "" && rv != (ReservationVector{}) {
 			if rv.Project != operationProject {
-				return nil, fmt.Errorf(
+				return nil, nil, fmt.Errorf(
 					"reservation %s project %q does not match operation project %q",
 					id, rv.Project, operationProject)
 			}
 			if err := validateReservationProject(r.String("reservation_json"), operationProject); err != nil {
-				return nil, fmt.Errorf("reservation %s has invalid project binding: %w", id, err)
+				return nil, nil, fmt.Errorf("reservation %s has invalid project binding: %w", id, err)
 			}
 		}
 		authority, ok, err := CurrentProjectAuthority(ctx, c, r.String("project"))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if ok {
 			rawFacts := reservationFactsByOpEpoch[key]
@@ -294,22 +313,22 @@ func nonterminalReservationsByID(ctx context.Context, c *Client) (map[string]Res
 			}
 			var facts ReservationFacts
 			if err := json.Unmarshal([]byte(rawFacts), &facts); err != nil {
-				return nil, fmt.Errorf("reservation %s has malformed authority facts: %w", id, err)
+				return nil, nil, fmt.Errorf("reservation %s has malformed authority facts: %w", id, err)
 			}
 			if facts.Project == "" || facts.AuthorityEpoch <= 0 || facts.AuthorityHost == "" {
-				return nil, fmt.Errorf("reservation %s has malformed authority facts", id)
+				return nil, nil, fmt.Errorf("reservation %s has malformed authority facts", id)
 			}
 			if facts.AuthorityEpoch != authority.Epoch {
 				continue // reservation minted by a fenced/stale authority
 			}
 			if projectOrDefault(facts.Project) != authority.Project ||
 				facts.AuthorityHost != authority.Holder {
-				return nil, fmt.Errorf("reservation %s has invalid current-authority facts", id)
+				return nil, nil, fmt.Errorf("reservation %s has invalid current-authority facts", id)
 			}
 		}
 		out[id] = rv
 	}
-	return out, nil
+	return out, admitted, nil
 }
 
 func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, resourceKind, resourceID, desiredRef string, ownerEpoch int64) (bool, error) {
@@ -342,8 +361,9 @@ func operationOwnsCurrentWorkload(ctx context.Context, c *Client, operationID, r
 	return len(rows) != 0, nil
 }
 
-// ReservedBefore sums the NONTERMINAL reservation deltas of operations whose id
-// sorts strictly BEFORE opID — the claimants this admission must yield to.
+// ReservedBefore sums the NONTERMINAL reservation deltas this admission must yield
+// to: every claim sorting strictly BEFORE opID, and every DECIDED claim sorting
+// after it (see reservationCounts).
 //
 // Operation ids are globally unique, so ordering them lexically is a TOTAL order
 // every node computes identically. Reserve-then-verify counts only these: our own
@@ -369,13 +389,13 @@ func ProjectReservedBefore(ctx context.Context, c *Client, project, opID string)
 }
 
 func reservedBefore(ctx context.Context, c *Client, host, project, opID string) (hostCPU, hostMem int, proj QuotaAmount, err error) {
-	rvs, err := nonterminalReservationsByID(ctx, c)
+	rvs, admitted, err := nonterminalReservationsByID(ctx, c)
 	if err != nil {
 		return 0, 0, QuotaAmount{}, err
 	}
 	for id, rv := range rvs {
-		if id >= opID {
-			continue // ourselves, or a LATER claimant that yields to us
+		if !reservationCounts(id, opID, rv, admitted[id]) {
+			continue // ourselves, or a LATER claimant still deciding, which yields to us
 		}
 		if host != "" && rv.TargetHost == host {
 			hostCPU += rv.TargetCPU
@@ -386,6 +406,52 @@ func reservedBefore(ctx context.Context, c *Client, host, project, opID string) 
 		}
 	}
 	return hostCPU, hostMem, proj, nil
+}
+
+// reservationCounts is THE rule for which other claim a reserve-then-verify
+// admission (opID) must subtract from its headroom.
+//
+//   - Never its own: comparing a request against headroom that already subtracted
+//     it double-counts.
+//   - Every claim sorting BEFORE it, decided or not: the deterministic tie-break.
+//     Two claimants that can see each other agree on one winner, the earlier id.
+//   - A claim sorting AFTER it only once that claim is DECIDED — admitted by its
+//     own verify (OpStepAdmitted), or never provisional at all.
+//
+// The last clause fixes an over-admission the earlier-only rule allowed. Ids are
+// random, so the order they sort in says nothing about the order claimants ARRIVE
+// in. With room for two: c (the highest id) reserves and verifies while nobody
+// else exists and is admitted; a then verifies, ignores c as "later", and is
+// admitted; b counts only a and is admitted. Three on a host with room for two,
+// each step correct by the earlier-only rule. A later id yields to us only while
+// it is still racing us; once it has WON it is a decided fact, like a committed
+// workload, and its id is irrelevant (ProjectReservedSettlingAmount makes the same
+// point about released leases).
+//
+// What this rule alone cannot close is the gap between a claim's verify and its
+// marker: a later-id claim verified but not yet marked is invisible to an earlier
+// id that reserves inside that gap, and neither counted the other. Within one node
+// the decider holds its admission lock across reserve, verify and mark
+// (grpcapi.Server.admissionMu), so no admission's verify falls inside another's
+// gap. Across nodes it is the eventual-consistency limit reserve-then-verify has
+// always stated, which a single decider per host (its owner) and per project (the
+// authority holder) is what removes.
+func reservationCounts(id, opID string, rv ReservationVector, admitted bool) bool {
+	if id == opID {
+		return false
+	}
+	if id < opID {
+		return true
+	}
+	return !rv.Provisional || admitted
+}
+
+// MarkReservationAdmitted records that the provisional claim opID passed its
+// verify, so it now holds capacity against every later-arriving claimant whatever
+// its id (reservationCounts). The caller writes it BEFORE it releases its
+// admission lock; a claim that fails verify is released instead, never marked.
+func MarkReservationAdmitted(ctx context.Context, c *Client, opID string) error {
+	return AppendOperationStep(ctx, c, OperationStepRecord{OperationID: opID, StepName: OpStepAdmitted})
 }
 
 // HostReserved sums the target-host reservation deltas of all NONTERMINAL operations

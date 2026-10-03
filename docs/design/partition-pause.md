@@ -688,6 +688,17 @@ guard skips the domain as it does today. That is why the brief says never to
 act on `host_name` alone. A converged-wrong `host_name` is not a certificate,
 and it cannot make one.
 
+The domain UUID is not incarnation evidence either, for a domain an older
+build defined without the incarnation stamp. A non-firmware live restore and a
+renamed promote both write a new row (a new incarnation) carrying the source
+VM's spec uuid, and a later spec-driven define gives the new domain that uuid.
+A stale copy of the old incarnation would then match the new row.
+
+A skipped copy is reported, not skipped silently: the reason is logged once
+per kind of reason (and again every 10 minutes), and after two passes it is raised as
+`vm_settle_declined` (evaluator `partition_pause`, subject `<name>@<host>`)
+with the reason, the local identity and a remedy. See docs/diagnostics.md.
+
 **The action.**
 
 - **VM.** `DestroyDomain`. This stops the qemu process and keeps the definition,

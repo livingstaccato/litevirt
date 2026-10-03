@@ -614,6 +614,59 @@ func TestVerifyClaimCertificate(t *testing.T) {
 	})
 }
 
+// TestClaimVerifier_HistoricalRelaxesOnlyRevocation: the verifier a node uses
+// for a voter generation below its anchor (§4.1 "History and revocation")
+// still counts an accept whose certificate has been revoked since, and
+// refuses everything else Verify refuses. The node's own verifier is not
+// changed by deriving it.
+//
+// Mutations: make revoked() ignore historical (the revoked accept is refused
+// by the historical verifier too); make Historical skip the CA chain check as
+// well (the self-minted accept counts); make Historical mutate its receiver
+// (the plain verifier stops refusing the revoked accept).
+func TestClaimVerifier_HistoricalRelaxesOnlyRevocation(t *testing.T) {
+	f := newCertFixture(t)
+	dir := f.ca.pkiDir(t, "verifier-history")
+	serial, err := pki.CertSerial(filepath.Join(f.voters[0].pki, "host.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pki.AppendToCRL(f.ca.cert, f.ca.key, filepath.Join(dir, "crl.pem"), serial); err != nil {
+		t.Fatal(err)
+	}
+	now, err := LoadClaimVerifier(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist := now.Historical()
+	if err := hist.Verify(f.cert, f.want); err != nil {
+		t.Fatalf("history signed by a voter revoked since was refused: %v", err)
+	}
+	if err := now.Verify(f.cert, f.want); err == nil || !strings.Contains(err.Error(), "revoked") {
+		t.Fatalf("deriving the historical verifier relaxed the node's own: %v", err)
+	}
+
+	rogue := newClaimTestVoter(t, newClaimTestCA(t), "c")
+	c := f.cert
+	sig, err := signRaw(rogue.signer, acceptPayload(f.key, 1, c.Ballot, c.ValueDigest, "c", f.voters[2].inc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Accepts = []ClaimAccept{c.Accepts[1], {Voter: "c", VoterIncarnation: f.voters[2].inc, ConfigGeneration: 1,
+		Key: f.key, Ballot: c.Ballot, ValueDigest: c.ValueDigest, CertPEM: rogue.signer.certPEM, Signature: sig}}
+	if err := hist.Verify(c, f.want); err == nil || !strings.Contains(err.Error(), "cluster CA") {
+		t.Fatalf("the historical verifier counted a certificate the cluster CA never issued: %v", err)
+	}
+	forged := f.cert
+	forged.Accepts = append([]ClaimAccept(nil), f.cert.Accepts...)
+	bad := append([]byte(nil), forged.Accepts[0].Signature...)
+	bad[len(bad)-1] ^= 0xff
+	forged.Accepts[0].Signature = bad
+	if err := hist.Verify(forged, f.want); err == nil || !strings.Contains(err.Error(), "signature") {
+		t.Fatalf("the historical verifier counted a forged signature: %v", err)
+	}
+}
+
 // ── voter-config values ─────────────────────────────────────────────────────
 
 func TestValidateVoterChange(t *testing.T) {

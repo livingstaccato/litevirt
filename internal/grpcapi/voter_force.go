@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -82,7 +81,7 @@ func (s *Server) ForceReconfigureVoters(ctx context.Context, req *pb.ForceReconf
 	// ownership row any reachable host holds.
 	s.convergeSurvivors(fctx, value.Members)
 	if row, err := corrosion.GetVoterConfig(fctx, s.db, value.Generation); err == nil && row != nil &&
-		!corrosion.IsForcedChange(row.Change) && s.verifyVoterConfigRow(prev, row) == nil {
+		!corrosion.IsForcedChange(row.Change) && s.verifyVoterConfigRowNow(prev, row) == nil {
 		_, _ = s.AdoptVoterConfigs(ctx)
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"an ordinary generation %d (%s by %s) has arrived that this node never saw, decided by generation %d's "+
@@ -443,10 +442,18 @@ func valueMember(v corrosion.VoterConfigValue, name string) (corrosion.VoterMemb
 
 // verifyForcedRow is a receiver's check before it adopts a forced generation
 // (§4.6 "Adopting a forced row"): the evidence verifies against the
-// generation it replaces, and the receiver itself reaches none of the named
-// lost hosts. A receiver that is itself named lost refuses outright: it is
-// running, so it is not lost (§10 records why this departs from the text).
-func (s *Server) verifyForcedRow(ctx context.Context, prev, row *corrosion.VoterConfig) error {
+// generation it replaces, with v (Historical at or below the anchor), and the
+// receiver itself reaches none of the named lost voters. A receiver that is
+// itself named lost refuses outright: it is running, so it is not lost (§10
+// records why this departs from the text).
+//
+// A lost voter is a member ENTRY of prev: a name with the incarnation it was
+// admitted as. A host answering under that name with another incarnation is
+// a later machine, rebuilt after `lv host rm --dead`, whose empty state.db
+// never voted under prev — not the lost voter come back (§10 item 38). A host
+// that is reached but cannot say which incarnation it is counts as the lost
+// voter.
+func (s *Server) verifyForcedRow(ctx context.Context, v *corrosion.ClaimVerifier, prev, row *corrosion.VoterConfig) error {
 	ev, err := corrosion.DecodeForcedVoterEvidence(row.Certificate)
 	if err != nil {
 		return err
@@ -454,22 +461,35 @@ func (s *Server) verifyForcedRow(ctx context.Context, prev, row *corrosion.Voter
 	if row.MembersHash != corrosion.MembersHash(row.Members) {
 		return fmt.Errorf("members_hash does not match members_json")
 	}
-	_, verifier, err := s.claimIdentity()
+	if err := v.ValidateForcedChange(prev, row.VoterConfigValue, ev); err != nil {
+		return err
+	}
+	mine, err := s.db.VoterIncarnation(ctx)
 	if err != nil {
 		return err
 	}
-	if err := verifier.ValidateForcedChange(prev, row.VoterConfigValue, ev); err != nil {
-		return err
-	}
-	if slices.Contains(ev.Lost, s.hostName) {
-		return fmt.Errorf("forced generation %d names %s lost, and %s is running: a host that can adopt it is not lost",
-			row.Generation, s.hostName, s.hostName)
-	}
 	for _, l := range ev.Lost {
-		if r, d := s.forcedProbe(ctx, l); r {
-			return fmt.Errorf("forced generation %d names %s lost, but %s reaches it (%s): valid signatures do not make "+
-				"a false claim of loss true", row.Generation, l, s.hostName, d)
+		lost, _ := prev.Member(l)
+		if l == s.hostName {
+			if lost.Incarnation == mine {
+				return fmt.Errorf("forced generation %d names %s lost, and %s is running: a host that can adopt it is not lost",
+					row.Generation, s.hostName, s.hostName)
+			}
+			continue
 		}
+		r, d := s.forcedProbe(ctx, l)
+		if !r {
+			continue
+		}
+		inc, err := s.remoteIncarnation(ctx, l, prev.Generation)
+		if err == nil && inc != lost.Incarnation {
+			continue
+		}
+		if err != nil {
+			d = fmt.Sprintf("%s, and it did not say which incarnation it is: %v", d, err)
+		}
+		return fmt.Errorf("forced generation %d names %s lost, but %s reaches it (%s): valid signatures do not make "+
+			"a false claim of loss true", row.Generation, l, s.hostName, d)
 	}
 	return nil
 }

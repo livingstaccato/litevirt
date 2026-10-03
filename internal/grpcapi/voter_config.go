@@ -89,8 +89,9 @@ const voterConfigTimeout = 15 * time.Second
 
 // verifyVoterConfigRow checks row against the generation it replaces: a
 // permitted change, the members hash, and a certificate from the right
-// electorate.
-func (s *Server) verifyVoterConfigRow(prev, row *corrosion.VoterConfig) error {
+// electorate, verified by v (this node's verifier, or its Historical form for
+// a generation at or below the anchor — voterAnchor).
+func verifyVoterConfigRow(v *corrosion.ClaimVerifier, prev, row *corrosion.VoterConfig) error {
 	if err := corrosion.ValidateVoterChange(prev, row.VoterConfigValue); err != nil {
 		return err
 	}
@@ -105,11 +106,84 @@ func (s *Server) verifyVoterConfigRow(prev, row *corrosion.VoterConfig) error {
 	if err != nil {
 		return err
 	}
+	return v.Verify(cert, want)
+}
+
+// verifyVoterConfigRowNow checks row with this node's verifier as it stands
+// now: for a generation being decided, never for history.
+func (s *Server) verifyVoterConfigRowNow(prev, row *corrosion.VoterConfig) error {
 	_, verifier, err := s.claimIdentity()
 	if err != nil {
 		return err
 	}
-	return verifier.Verify(cert, want)
+	return verifyVoterConfigRow(verifier, prev, row)
+}
+
+// verifyRowSignatures is everything about row that needs no network: the
+// ordinary checks above, or a forced row's shape and its survivors'
+// signatures (the probes are verifyForcedRow's).
+func verifyRowSignatures(v *corrosion.ClaimVerifier, prev, row *corrosion.VoterConfig) error {
+	if !corrosion.IsForcedChange(row.Change) {
+		return verifyVoterConfigRow(v, prev, row)
+	}
+	ev, err := corrosion.DecodeForcedVoterEvidence(row.Certificate)
+	if err != nil {
+		return err
+	}
+	if row.MembersHash != corrosion.MembersHash(row.Members) {
+		return fmt.Errorf("members_hash does not match members_json")
+	}
+	return v.ValidateForcedChange(prev, row.VoterConfigValue, ev)
+}
+
+// voterAnchor is the generation a node judges the voter chain above adopted
+// from (docs/design/recovery-claims.md §4.1 "History and revocation"): the
+// newest generation whose certificate verifies against this node's CURRENT
+// CRL, such that every generation from adopted+1 up to it links to the one
+// before it with authentic signatures. Zero when there is none.
+//
+// A generation at or below the anchor is adopted even if signers of its
+// certificate have been revoked since. The anchor's quorum could only have
+// signed the anchor after adopting the generation before it (a voter answers
+// a voter_config key only at its adopted generation), and each generation's
+// membership is fixed by the change of the one after it, one member at a time:
+// a chain that a holder of revoked keys alone could write never links up to a
+// generation that verifies today. Above the anchor nothing is relaxed, so a
+// revoked key still decides nothing new.
+func voterAnchor(ctx context.Context, db *corrosion.Client, v *corrosion.ClaimVerifier, adopted *corrosion.VoterConfig) (int64, error) {
+	rows, err := corrosion.ListVoterConfigs(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	hist := v.Historical()
+	prev, anchor := adopted, int64(0)
+	for _, row := range rows {
+		var prevGen int64
+		if prev != nil {
+			prevGen = prev.Generation
+		}
+		if row.Generation <= prevGen {
+			continue
+		}
+		if row.Generation != prevGen+1 || verifyRowSignatures(hist, prev, row) != nil {
+			break
+		}
+		if verifyRowSignatures(v, prev, row) == nil {
+			anchor = row.Generation
+		}
+		prev = row
+	}
+	return anchor, nil
+}
+
+// memberAs reports whether this node is a member of cfg as the voter it is
+// now: its name with ITS incarnation. An entry under this node's name with
+// another incarnation is an earlier machine — removed and rebuilt under the
+// name, or one whose state.db was lost — and this node abstains in that
+// generation (§3.11), so it has no claim state to import for it.
+func memberAs(cfg *corrosion.VoterConfig, name, incarnation string) bool {
+	m, ok := cfg.Member(name)
+	return ok && m.Incarnation == incarnation
 }
 
 // AdoptVoterConfigs adopts every voter_configs generation above this node's
@@ -118,7 +192,16 @@ func (s *Server) verifyVoterConfigRow(prev, row *corrosion.VoterConfig) error {
 // majority of the old one first; if it cannot reach one it stops there and the
 // next pass retries. A row that does not verify is never adopted — it is
 // reported, and nothing above it is considered.
+//
+// Generations up to the anchor (voterAnchor) are history, verified without
+// regard to revocations since; above it every certificate must verify against
+// today's CRL.
 func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
+	var (
+		verifier *corrosion.ClaimVerifier
+		inc      string
+		anchor   int64
+	)
 	for {
 		prev, err := corrosion.AdoptedVoterConfig(ctx, s.db)
 		if err != nil {
@@ -135,18 +218,35 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 		if row == nil {
 			return adopted, nil
 		}
+		if verifier == nil {
+			// Once per pass, and only when there is something to adopt.
+			if _, verifier, err = s.claimIdentity(); err != nil {
+				return adopted, err
+			}
+			if inc, err = s.db.VoterIncarnation(ctx); err != nil {
+				return adopted, err
+			}
+			if anchor, err = voterAnchor(ctx, s.db, verifier, prev); err != nil {
+				return adopted, err
+			}
+		}
+		v := verifier
+		if row.Generation <= anchor {
+			v = verifier.Historical()
+		}
+		member := memberAs(row, s.hostName, inc)
 		if corrosion.IsForcedChange(row.Change) {
 			// A forced generation (§4.6) is checked by its own rule — the
 			// survivors' unanimous signatures, the lost hosts' fences, and this
 			// node's own probes of the lost hosts — and a member imports from
 			// every survivor rather than from a sealed majority.
-			if err := s.verifyForcedRow(ctx, prev, row); err != nil {
+			if err := s.verifyForcedRow(ctx, v, prev, row); err != nil {
 				slog.Error("voter set: refusing to adopt a FORCED voter generation", "generation", row.Generation,
 					"change", row.Change, "created_by", row.CreatedBy, "error", err)
 				s.noteForcedConflict(row.Generation, err.Error())
 				return adopted, fmt.Errorf("forced generation %d: %w", row.Generation, err)
 			}
-			if _, member := row.Member(s.hostName); member {
+			if member {
 				n, from, err := s.importForForced(ctx, prev, row)
 				if err != nil {
 					return adopted, fmt.Errorf("adopt forced generation %d: %w", row.Generation, err)
@@ -162,12 +262,11 @@ func (s *Server) AdoptVoterConfigs(ctx context.Context) (int64, error) {
 			}
 			continue
 		}
-		if err := s.verifyVoterConfigRow(prev, row); err != nil {
+		if err := verifyVoterConfigRow(v, prev, row); err != nil {
 			slog.Error("voter set: refusing to adopt a voter generation whose certificate does not verify",
 				"generation", row.Generation, "change", row.Change, "created_by", row.CreatedBy, "error", err)
 			return adopted, fmt.Errorf("generation %d does not verify: %w", row.Generation, err)
 		}
-		_, member := row.Member(s.hostName)
 		if member && prev.Explicit() {
 			n, from, err := s.importFromSealedMajority(ctx, prev, row.Generation)
 			if err != nil {

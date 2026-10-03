@@ -441,6 +441,9 @@ func (s *ClaimSigner) Sign(key ClaimKey, gen int64, b Ballot, digest, incarnatio
 type ClaimVerifier struct {
 	roots  *x509.CertPool
 	pkiDir string
+	// historical is set on the copy Historical returns: a certificate
+	// revoked since still counts. Nothing else is relaxed.
+	historical bool
 }
 
 // LoadClaimVerifier loads the cluster CA from pkiDir. Revocation is read from
@@ -456,6 +459,29 @@ func LoadClaimVerifier(pkiDir string) (*ClaimVerifier, error) {
 		return nil, fmt.Errorf("cluster CA at %s contains no usable certificate", pkiDir)
 	}
 	return &ClaimVerifier{roots: roots, pkiDir: pkiDir}, nil
+}
+
+// Historical returns a verifier for a voter generation that a later
+// generation, verified against today's CRL, already vouches for
+// (docs/design/recovery-claims.md §4.1 "History and revocation"). It checks
+// every signature exactly as v does — CA chain, name, incarnation, payload —
+// except that a certificate revoked SINCE still counts: revocation is the end
+// of a voter's life, not evidence against what it signed while it voted.
+//
+// Never use it for anything new: a workload certificate, a generation being
+// decided, or the generation the history is judged from. Those are v's.
+func (v *ClaimVerifier) Historical() *ClaimVerifier {
+	if v == nil {
+		return nil
+	}
+	h := *v
+	h.historical = true
+	return &h
+}
+
+// revoked reports whether c's certificate counts as revoked for this verifier.
+func (v *ClaimVerifier) revoked(c *x509.Certificate) bool {
+	return !v.historical && pki.IsCertRevoked(v.pkiDir, c.SerialNumber)
 }
 
 // CertExpectation is what a certificate must certify, and who may certify it.
@@ -536,7 +562,7 @@ func (v *ClaimVerifier) verifyAccept(cert ClaimCertificate, a ClaimAccept, elect
 	if c.Subject.CommonName != a.Voter {
 		return fmt.Errorf("signed with %q's certificate", c.Subject.CommonName)
 	}
-	if pki.IsCertRevoked(v.pkiDir, c.SerialNumber) {
+	if v.revoked(c) {
 		return fmt.Errorf("certificate %s is revoked", c.SerialNumber.Text(16))
 	}
 	pub, ok := c.PublicKey.(*ecdsa.PublicKey)

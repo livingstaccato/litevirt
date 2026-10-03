@@ -10,7 +10,61 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
+
+// TestAdmit_AWedgedInventoryDoesNotHoldTheAdmissionLock: a host admission
+// whose runtime-inventory read is stuck in libvirt (no deadline on a cache
+// miss) must not be holding admissionMu while it waits, or every other
+// admission on the node — here a project-quota decision this node makes as
+// holder, which needs no inventory at all — waits behind it.
+//
+// Mutation: read runtimeExtras inside checkHostCapacityBefore (under the lock)
+// again — this goes red.
+func TestAdmit_AWedgedInventoryDoesNotHoldTheAdmissionLock(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+	admissionHost(t, s)
+	fake := libvirtfake.New()
+	s.virt = fake
+	wedged := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	fake.FailListDomains = func() error {
+		once.Do(func() { close(wedged) })
+		<-release
+		return nil
+	}
+	defer close(release)
+
+	go func() {
+		l, err := s.admitWithReservation(context.WithoutCancel(ctx), "CreateVM", "test-host", "_default", "vm:stuck",
+			1, 1024, corrosion.QuotaAmount{VCPU: 1, MemMiB: 1024}, intentResourceGrow)
+		if err == nil {
+			l.release(ctx)
+		}
+	}()
+	select {
+	case <-wedged:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the host admission never reached the runtime inventory")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.admitProjectLocal(context.WithoutCancel(ctx), "CreateVM", "other-project", "u@r", "vm:free",
+			quotaSubject{}, corrosion.QuotaAmount{VCPU: 1})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("project admission: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a project admission waited on a host admission wedged in libvirt: the inventory read is under admissionMu")
+	}
+}
 
 // Arrival order is not id order. Ids are random, so the claimant with the
 // LARGER id can arrive and win first; every claimant arriving after it must

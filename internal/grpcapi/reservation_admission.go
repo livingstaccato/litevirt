@@ -469,8 +469,9 @@ func (s *Server) admitReserved(
 	// headroom that already subtracted it double-counts), every earlier
 	// claimant, and every later one already admitted — not a later one still
 	// deciding (it yields to us). See corrosion.reservationCounts.
+	extra := s.runtimeLoad(ctx, host) // outside admissionMu: see checkHostCapacityBefore
 	lease, err := s.decideReservation(ctx, op, project, "reserve capacity", func(id string) error {
-		if err := s.checkHostCapacityBefore(ctx, host, cpuDelta, hostMemDelta, id); err != nil {
+		if err := s.checkHostCapacityBefore(ctx, host, cpuDelta, hostMemDelta, id, extra); err != nil {
 			return err
 		}
 		if withQuota && !delegated {
@@ -513,6 +514,18 @@ func (s *Server) admitReserved(
 // node, the single decider for its own host capacity and, as holder, for a
 // project's quota.
 //
+// Only local database work runs under the lock: the insert, the stamp, verify's
+// reads and the marker. Anything that can stall — the runtime inventory
+// (libvirt, no deadline on a cache miss), any peer call — is done by the caller
+// before or after it, so one wedged dependency cannot stall every admission on
+// the node. verify must keep to that.
+//
+// The insert and stamp could run before the lock without breaking safety
+// (verify and marker are what must be atomic against other verifies), but a
+// claim published while it waits for the lock would be counted by every
+// larger-id claimant verifying meanwhile, refusing them for a claim that may
+// itself be refused. They are local writes, so they stay inside.
+//
 // what names the reservation in an insert-failure error.
 func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRecord, project, what string,
 	verify func(opID string) error) (*reservationLease, error) {
@@ -552,12 +565,18 @@ func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRe
 // reservations; it knows nothing about a bounded rogue the runtime inventory can
 // see, so without the subtraction the authoritative host admits against memory
 // something it has already observed is using (see runtimeExtras).
-func (s *Server) checkHostCapacityBefore(ctx context.Context, host string, cpuDelta, memDelta int, opID string) error {
+//
+// extra is runtimeExtras(host), read by the CALLER before it takes admissionMu:
+// on a cache miss it lists libvirt domains with no deadline, and a wedged libvirt
+// must not hold the lock every admission on this node — including project-quota
+// decisions for other hosts — waits on. It is a cached (localInventoryTTL)
+// observation either way, so reading it a moment earlier changes nothing.
+func (s *Server) checkHostCapacityBefore(ctx context.Context, host string, cpuDelta, memDelta int, opID string, extra runtimeLoad) error {
 	freeCPU, freeMem, ok, err := corrosion.HostFreeCapacityBefore(ctx, s.db, host, s.capacity, opID)
 	if err != nil {
 		return status.Errorf(codes.Internal, "check host capacity: %v", err)
 	}
-	extraCPU, extraMem := s.runtimeExtras(ctx, host)
+	extraCPU, extraMem := extra.cpu, extra.memMiB
 	if ok && (cpuDelta > freeCPU-extraCPU || memDelta > freeMem-extraMem) {
 		suffix := ""
 		if extraCPU > 0 || extraMem > 0 {

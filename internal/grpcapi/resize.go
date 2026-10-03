@@ -313,8 +313,9 @@ func (s *Server) admitResizeReservation(
 		OperationKind:   string(corrosion.OpResourceUpdateRunning),
 		ReservationJSON: resJSON,
 	}
+	extra := s.runtimeLoad(ctx, vm.HostName) // outside admissionMu: see checkHostCapacityBefore
 	lease, err := s.decideReservation(ctx, op, vm.Project, "reserve capacity", func(id string) error {
-		if err := s.checkHostCapacityBefore(ctx, vm.HostName, cpuDelta, memDelta, id); err != nil {
+		if err := s.checkHostCapacityBefore(ctx, vm.HostName, cpuDelta, memDelta, id, extra); err != nil {
 			return err
 		}
 		if !delegated {

@@ -2276,6 +2276,14 @@ message DiskStub {
     int64  size_bytes  = 2;  // size hint for pre-creation (0 = create empty sparse file)
 }
 
+// EnsureDisksResponse names the stubs this call created. A path that already
+// held a file is skipped and not named, so the cleanup after a failed
+// migration removes only these. It replaced google.protobuf.Empty, which has
+// no fields: an older target's reply decodes as "created none".
+message EnsureDisksResponse {
+    repeated string created_paths = 1;
+}
+
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
 // (UEFI NVRAM + swtpm tar) to a cold-migration target so libvirt can define the
 // domain there with its BitLocker-binding state intact (G1).
@@ -3048,7 +3056,7 @@ service LiteVirt {
 
     // ── Internal: Migration helpers ──
     rpc EnsureCloudInit(EnsureCloudInitRequest)    returns (google.protobuf.Empty);
-    rpc EnsureDisks(EnsureDisksRequest)            returns (google.protobuf.Empty);
+    rpc EnsureDisks(EnsureDisksRequest)            returns (EnsureDisksResponse);
     rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (google.protobuf.Empty);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);

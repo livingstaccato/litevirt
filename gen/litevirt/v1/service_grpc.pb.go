@@ -603,7 +603,7 @@ type LiteVirtClient interface {
 	UpdateFDB(ctx context.Context, in *UpdateFDBRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// ── Internal: Migration helpers ──
 	EnsureCloudInit(ctx context.Context, in *EnsureCloudInitRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	EnsureDisks(ctx context.Context, in *EnsureDisksRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	EnsureDisks(ctx context.Context, in *EnsureDisksRequest, opts ...grpc.CallOption) (*EnsureDisksResponse, error)
 	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
@@ -3085,9 +3085,9 @@ func (c *liteVirtClient) EnsureCloudInit(ctx context.Context, in *EnsureCloudIni
 	return out, nil
 }
 
-func (c *liteVirtClient) EnsureDisks(ctx context.Context, in *EnsureDisksRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *liteVirtClient) EnsureDisks(ctx context.Context, in *EnsureDisksRequest, opts ...grpc.CallOption) (*EnsureDisksResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(EnsureDisksResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_EnsureDisks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -4165,7 +4165,7 @@ type LiteVirtServer interface {
 	UpdateFDB(context.Context, *UpdateFDBRequest) (*emptypb.Empty, error)
 	// ── Internal: Migration helpers ──
 	EnsureCloudInit(context.Context, *EnsureCloudInitRequest) (*emptypb.Empty, error)
-	EnsureDisks(context.Context, *EnsureDisksRequest) (*emptypb.Empty, error)
+	EnsureDisks(context.Context, *EnsureDisksRequest) (*EnsureDisksResponse, error)
 	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*emptypb.Empty, error)
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
 	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
@@ -5016,7 +5016,7 @@ func (UnimplementedLiteVirtServer) UpdateFDB(context.Context, *UpdateFDBRequest)
 func (UnimplementedLiteVirtServer) EnsureCloudInit(context.Context, *EnsureCloudInitRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnsureCloudInit not implemented")
 }
-func (UnimplementedLiteVirtServer) EnsureDisks(context.Context, *EnsureDisksRequest) (*emptypb.Empty, error) {
+func (UnimplementedLiteVirtServer) EnsureDisks(context.Context, *EnsureDisksRequest) (*EnsureDisksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnsureDisks not implemented")
 }
 func (UnimplementedLiteVirtServer) EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*emptypb.Empty, error) {

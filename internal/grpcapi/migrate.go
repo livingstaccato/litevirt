@@ -394,8 +394,11 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 
 	// Ensure disk files exist on target before --with-storage migration.
 	// libvirt validates all file paths in the domain XML before block copy starts.
+	// createdStubs is what THIS attempt created there — all a failed attempt
+	// may remove.
+	var createdStubs []string
 	if withStorage {
-		s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name)
+		createdStubs = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name)
 	}
 
 	// Firmware-state travel (G1): a Secure-Boot/vTPM VM is migrated cold from a
@@ -558,6 +561,7 @@ poll:
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
 				withStorage, disks, done, unlock, migrationFinish{
 					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+					createdStubs: createdStubs,
 				})
 			return status.Errorf(codes.DeadlineExceeded,
 				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
@@ -584,7 +588,7 @@ poll:
 						s.noteStateWriteFail(corrosion.OpVMState, werr)
 					}
 				}
-				s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, withStorage)
+				s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, createdStubs)
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
@@ -712,7 +716,7 @@ func (s *Server) adoptAbandonedMigration(
 			}); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
-			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, withStorage)
+			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, finish.createdStubs)
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
 			return
@@ -942,10 +946,14 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 // EnsureDisks creates empty qcow2 images at the requested paths so that
 // libvirt's domain XML validation passes before block copy starts.
 // Called by the source host before --with-storage migration.
-func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*emptypb.Empty, error) {
+//
+// It reports the stubs it created. A path that already holds a file is skipped
+// and not reported: it is not this migration's to remove if the copy fails.
+func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*pb.EnsureDisksResponse, error) {
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
+	resp := &pb.EnsureDisksResponse{}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
 		// file-backed pool dir) — never an arbitrary path under the data dir such
@@ -969,9 +977,10 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		if err := qcow2.Create(stub.Path, sizeBytes, nil); err != nil {
 			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
 		}
+		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
 	}
-	return &emptypb.Empty{}, nil
+	return resp, nil
 }
 
 // EnsureFirmwareState materializes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -1298,10 +1307,11 @@ func diskVirtualSize(_ context.Context, path string) (int64, error) {
 // ensureDisksOnTarget creates empty stub files on the target host for each
 // local disk so libvirt accepts the domain XML before block copy starts.
 // Reads actual virtual size from source disk files to ensure exact match.
-func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string) {
+// It returns the paths the target reports it created, nil on any failure.
+func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string) []string {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
 	if err != nil || len(disks) == 0 {
-		return
+		return nil
 	}
 
 	req := &pb.EnsureDisksRequest{VmName: vmName}
@@ -1326,19 +1336,22 @@ func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName str
 		})
 	}
 	if len(req.Disks) == 0 {
-		return
+		return nil
 	}
 
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
 		slog.Warn("ensureDisksOnTarget: cannot reach host", "host", targetHost, "error", err)
-		return
+		return nil
 	}
 	defer conn.Close()
 
-	if _, err := client.EnsureDisks(ctx, req); err != nil {
+	resp, err := client.EnsureDisks(ctx, req)
+	if err != nil {
 		slog.Warn("ensureDisksOnTarget: failed", "host", targetHost, "vm", vmName, "error", err)
+		return nil
 	}
+	return resp.GetCreatedPaths()
 }
 
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
@@ -1425,6 +1438,9 @@ type migrationFinish struct {
 	detachedVFs []corrosion.PCIDeviceRecord
 	pbVM        *pb.VM
 	hspec       *pb.HooksSpec
+	// createdStubs are the disk stubs this attempt created on the target
+	// (EnsureDisks), the only disk files a failed attempt removes there.
+	createdStubs []string
 }
 
 // adoptedMigrationCeiling bounds how long an adopted migration may run before
@@ -1512,17 +1528,12 @@ func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRe
 // are orphaned and would otherwise leak space and shadow a retry. Detached
 // context: the request context may itself be the cause of the failure. Shared
 // by the watched failure and an adopted one, which used to skip it.
-func (s *Server) cleanupFailedMigrationTarget(ctx context.Context, vmName, target string, withStorage bool) {
-	var stubPaths []string
-	if withStorage {
-		if ds, derr := corrosion.GetVMDisks(ctx, s.db, vmName); derr == nil {
-			for _, d := range ds {
-				if d.Path != "" {
-					stubPaths = append(stubPaths, d.Path)
-				}
-			}
-		}
-	}
+//
+// stubPaths is only what EnsureDisks reported CREATING for this attempt. A path
+// it skipped already held a file — a disk partition settle kept there, say —
+// and removing every disk path by name deleted it (drill D1). A target too old
+// to report what it created reports nothing, and its stub is left in place.
+func (s *Server) cleanupFailedMigrationTarget(ctx context.Context, vmName, target string, stubPaths []string) {
 	// (Firmware VMs never reach this runtime-migration path — they take the
 	// stopped cold-move in coldMigrateFirmwareVM — so no firmware cleanup is
 	// needed here.)

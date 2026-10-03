@@ -476,8 +476,12 @@ option available:
    container is re-keyed and the target's reconciler rebuilds it from its
    re-pullable image, reconstructing managed NICs from the persisted create spec.
 3. **Skip** (`ct.relocate.skipped`) — when neither is possible (e.g. a hand-built
-   rootfs with no re-pullable image and no backup). Loudly audited so an operator
-   knows to recover it manually.
+   rootfs with no re-pullable image and no backup), or when no active host has a
+   container runtime. Loudly audited so an operator knows to recover it manually.
+
+A relocation target must have a container runtime: placement never picks a host
+whose daemon recorded `litevirt.lxc=false` (it probes for `lxc-create` at every
+start), for any container placement.
 
 Restore-from-backup requires a backup repo reachable from the survivor (a
 registered repo name / shared NFS). `container_restore_timeout_sec`

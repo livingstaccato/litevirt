@@ -277,3 +277,34 @@ func TestSettle_DomainMetadataIsEvidenceToo(t *testing.T) {
 		t.Fatalf("vm-a is %s; its domain metadata identifies the copy the certificate superseded", st)
 	}
 }
+
+// A domain an older build defined carries no incarnation stamp. Its UUID
+// equalling the row's spec uuid is NOT evidence of the incarnation, so settle
+// must still decline: a non-firmware live restore (resolveRestoreSpec in
+// restore_live_autostart.go) and a renamed promote (promote.go) both write a
+// NEW row — a new created_at, so a new incarnation — carrying the source VM's
+// spec uuid, and any later spec-driven define gives the new domain that uuid.
+// A stale copy of the old incarnation then matches the new row by UUID, and a
+// UUID rule would stop it on a certificate that decided the other one.
+//
+// The control is the same domain WITH its stamp, which settles (above).
+//
+// Mutation: accept a domain UUID equal to the row's spec uuid as the row's
+// incarnation in settleCertifiedMove — this goes red.
+func TestSettle_AMatchingUUIDIsNotIncarnationEvidence(t *testing.T) {
+	f := newSettleFixture(t)
+	if err := RemovePauseRecord(f.dataDir, PauseKindVM, "vm-a"); err != nil {
+		t.Fatal(err)
+	}
+	f.virt.SetState("vm-a", libvirtfake.StateRunning)
+	if err := f.virt.SetDomainOwnerEpoch("vm-a", 3, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.Execute(context.Background(), `UPDATE vms SET spec = ? WHERE name = ?`,
+		`{"on_host_failure":"restart-any","uuid":"`+settleDomainUUID+`"}`, "vm-a"); err != nil {
+		t.Fatal(err)
+	}
+	if st := f.run(); st == libvirtfake.StateShutdown {
+		t.Fatalf("vm-a is %s: a matching UUID settled a copy whose incarnation is unknown", st)
+	}
+}

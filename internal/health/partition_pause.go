@@ -300,8 +300,12 @@ type PartitionPauser struct {
 	enabled func() bool
 	vms     PauseVMBackend
 	cts     lxc.Runtime
-	confirm ResumeConfirmer
-	settle  SettleVerifier
+	// ctCapable reports whether this host has a container runtime at all. The
+	// adapter is wired everywhere, so on a host without the lxc-* tooling every
+	// list fails at the binary lookup — and that host has nothing to freeze.
+	ctCapable func() bool
+	confirm   ResumeConfirmer
+	settle    SettleVerifier
 	// peerRuntime asks a peer's own LXC runtime about a container
 	// (grpcapi.Server.CheckPeerContainerRuntime), for container settle.
 	peerRuntime func(ctx context.Context, host, name string) (string, error)
@@ -342,7 +346,7 @@ type PartitionPauser struct {
 func NewPartitionPauser(host, dataDir string, db *corrosion.Client) *PartitionPauser {
 	return &PartitionPauser{
 		host: host, db: db, store: newPauseStore(dataDir),
-		now: time.Now, after: PartitionPauseAfter, tick: partitionPauseTick,
+		now: time.Now, after: PartitionPauseAfter, tick: partitionPauseTick, ctCapable: lxc.Available,
 		failed: map[string]string{}, heldWhy: map[string]string{}, inflight: map[string]bool{},
 	}
 }
@@ -392,6 +396,11 @@ func (p *PartitionPauser) SetVMBackend(b PauseVMBackend) { p.vms = b }
 
 // SetContainerRuntime wires the LXC runtime (nil: no containers).
 func (p *PartitionPauser) SetContainerRuntime(r lxc.Runtime) { p.cts = r }
+
+// SetContainerCapable replaces the probe for whether this host has a container
+// runtime at all (default lxc.Available, the probe behind the litevirt.lxc
+// host label).
+func (p *PartitionPauser) SetContainerCapable(fn func() bool) { p.ctCapable = fn }
 
 // SetResumeConfirmer wires the majority check. nil confirms nothing.
 func (p *PartitionPauser) SetResumeConfirmer(fn ResumeConfirmer) { p.confirm = fn }
@@ -676,6 +685,12 @@ func (p *PartitionPauser) pauseContainers(ctx context.Context, budget passBudget
 	names, err := p.cts.List(lctx)
 	cancel()
 	if err != nil {
+		// A host with no container runtime runs no containers: nothing to
+		// freeze is success, not a failed pause. Asked only after a failed
+		// list, so a listing that works is always acted on.
+		if capable := p.ctCapable; capable != nil && !capable() {
+			return
+		}
 		failures["ct/*"] = "list containers: " + err.Error()
 		return
 	}

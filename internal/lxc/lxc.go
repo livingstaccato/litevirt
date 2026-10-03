@@ -234,6 +234,16 @@ type LxcRunner struct {
 // NewLxcRunner returns a Runtime configured to talk to /var/lib/lxc.
 func NewLxcRunner() *LxcRunner { return &LxcRunner{} }
 
+// Available reports whether this host has the lxc-* tooling needed to run
+// containers. It is the one probe behind the litevirt.lxc host label
+// (corrosion.LabelLXCCapable): the runtime is wired on every host, so where the
+// tooling is absent every call fails at the binary lookup, and that host has
+// no containers to list, pause or miss.
+func Available() bool {
+	_, err := exec.LookPath("lxc-create")
+	return err == nil
+}
+
 // withLxcpath prepends -P <path> if a non-default lxcpath is set —
 // every lxc-* binary accepts the same flag.
 func (r *LxcRunner) withLxcpath(args []string) []string {

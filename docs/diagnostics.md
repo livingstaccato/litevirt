@@ -1344,20 +1344,28 @@ holder writes.
   VM whose row names another host, and settle declined to stop it for two
   passes in a row. The evidence carries the `reason` (the clause of the proof
   that is missing), what the host knows of its copy (`local`: incarnation,
-  owner epoch, and where it read them), and a `remedy`. The same is logged,
-  once per reason and again every 10 minutes while it lasts:
+  owner epoch, and where it read them), and a `remedy`. The same is logged
+  once per kind of reason (`reason_class`, for example
+  `incarnation_unknown` or `destination_unreachable`) and again every 10
+  minutes while it lasts:
   ```
-  partition-settle: declined to stop a local copy whose row names another host vm=<vm> row_host=<dest> reason="…" remedy="…"
+  partition-settle: declined to stop a local copy whose row names another host vm=<vm> row_host=<dest> reason_class=<class> reason="…" remedy="…"
   ```
   A common reason is `the local copy's incarnation is unknown`: an older
   build defined the domain, so it carries no incarnation stamp. Settle does
   not fall back to the domain UUID, because a live restore or a renamed
-  promote gives a new incarnation an earlier one's UUID. If the row's host
-  runs the VM, the local copy is a superseded duplicate: stop it on this host
-  with `virsh destroy <vm>` (the definition and disks are kept, and the
-  leftover cleanup undefines it). If that host does not run it, leave the
-  local copy running. The condition resolves once the copy is no longer
-  declined.
+  promote gives a new incarnation an earlier one's UUID.
+
+  The row naming another host is not proof on its own: a converged-wrong
+  `host_name` looks exactly the same. Before stopping anything, confirm which
+  copy is current. `lv cluster claim vm/<vm>` shows the decided claim and its
+  destination, and `virsh domstate <vm>` on that destination shows whether it
+  runs there. Only if the claim gave the VM to that host and it runs it there
+  is the local copy a superseded duplicate. Stop it on this host with
+  `virsh destroy <vm>`. Its disks are kept, but its definition and NVRAM are
+  removed on the next reconcile pass, because the leftover cleanup undefines
+  a destroyed domain whose row moved. Otherwise leave the local copy running.
+  The condition resolves once the copy is no longer declined.
 
 ### Observer stalled (`observer_stalled`)
 

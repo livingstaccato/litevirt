@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -116,9 +118,21 @@ func TestSettle_ADeclineSaysWhyAndWhatToDo(t *testing.T) {
 	if !ok || c.Lifecycle != corrosion.ConditionConfirmed {
 		t.Fatalf("vm_settle_declined = (%+v, %v), want confirmed", c, ok)
 	}
-	if !strings.Contains(ev.Reason, "incarnation is unknown") || ev.RowHost != "node-b" ||
-		!strings.Contains(ev.Remedy, "virsh destroy vm-a") || ev.Local["owner_epoch"] != float64(3) {
+	if !strings.Contains(ev.Reason, "incarnation is unknown") || ev.ReasonClass != "incarnation_unknown" ||
+		ev.RowHost != "node-b" || !strings.Contains(ev.Remedy, "virsh destroy vm-a") || ev.Local["owner_epoch"] != float64(3) {
 		t.Fatalf("evidence does not say why or what to do: %+v", ev)
+	}
+	// The remedy must make the operator confirm which copy is current first
+	// (a converged-wrong host_name looks the same), and must not promise the
+	// definition survives: the leftover cleanup undefines it, NVRAM included.
+	for _, want := range []string{"lv cluster claim vm/vm-a", "virsh domstate vm-a", "converged-wrong host_name",
+		"definition and NVRAM are removed"} {
+		if !strings.Contains(ev.Remedy, want) {
+			t.Fatalf("remedy lacks %q: %s", want, ev.Remedy)
+		}
+	}
+	if strings.Contains(ev.Remedy, "definition and disks are kept") {
+		t.Fatalf("remedy still claims the definition is kept: %s", ev.Remedy)
 	}
 
 	// Past the interval the same reason is logged again.
@@ -153,24 +167,130 @@ func TestSettle_ADeclineSaysWhyAndWhatToDo(t *testing.T) {
 	}
 }
 
-// A pass that could not read every row proves nothing by a copy's absence from
-// its declines: a transient read error must not resolve an open decline.
+// A pass that could not EXAMINE a copy proves nothing by its absence from the
+// declines: the copy's runtime state was unreadable, or its row says it is
+// migrating. The open decline must stay as it is — resolving it only re-raises
+// it a pass later, which is the flapping an operator would see. A complete pass
+// without the copy then resolves it.
 //
-// Mutation: ignore incomplete in reportSettleDeclines — this goes red.
-func TestSettle_AnIncompletePassResolvesNoDecline(t *testing.T) {
+// Mutations: drop the keep mark for an unreadable state, or for a migrating
+// row, or ignore keep in reportSettleDeclines — each goes red.
+func TestSettle_AnUnexaminedCopyKeepsItsDecline(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		blind func(f *settleFixture)
+		see   func(f *settleFixture)
+	}{
+		{"runtime state unreadable",
+			func(f *settleFixture) {
+				f.virt.FailDomainStateReason = func(string) error { return errors.New("libvirt: connection reset") }
+			},
+			func(f *settleFixture) { f.virt.FailDomainStateReason = nil }},
+		{"row migrating",
+			func(f *settleFixture) {
+				if err := f.db.Execute(ctx, `UPDATE vms SET state = 'migrating' WHERE name = 'vm-a'`); err != nil {
+					f.t.Fatal(err)
+				}
+			},
+			func(f *settleFixture) {
+				if err := f.db.Execute(ctx, `UPDATE vms SET state = 'running' WHERE name = 'vm-a'`); err != nil {
+					f.t.Fatal(err)
+				}
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSettleFixture(t)
+			olderBuildCopy(f)
+			f.run()
+			f.run()
+			if c, _, ok := settleDeclinedCondition(t, f); !ok || c.Lifecycle != corrosion.ConditionConfirmed {
+				t.Fatalf("vm_settle_declined = (%+v, %v), want confirmed", c, ok)
+			}
+			tc.blind(f)
+			f.run()
+			if c, _, _ := settleDeclinedCondition(t, f); c.Lifecycle != corrosion.ConditionConfirmed {
+				t.Fatalf("a pass that could not examine the copy resolved its decline: %+v", c)
+			}
+			tc.see(f)
+			// Settle can now examine it and still declines: confirmed throughout.
+			f.run()
+			if c, _, _ := settleDeclinedCondition(t, f); c.Lifecycle != corrosion.ConditionConfirmed {
+				t.Fatalf("decline after the blind pass is %s, want confirmed", c.Lifecycle)
+			}
+			// A complete pass without the copy resolves it.
+			f.r.reportSettleDeclines(ctx, nil, nil)
+			if c, _, _ := settleDeclinedCondition(t, f); c.Lifecycle != corrosion.ConditionResolved {
+				t.Fatalf("a complete pass without the copy left the decline %s, want resolved", c.Lifecycle)
+			}
+		})
+	}
+}
+
+// The raw reason can change every pass for one cause — an unreachable
+// destination's gRPC error text varies. The rate limit is on the reason's
+// CLASS, so a stream of different error strings logs once, not every pass, and
+// rewrites the condition only on the log's cadence.
+//
+// Mutation: rate-limit on the raw reason again — this goes red.
+func TestSettle_TheRateLimitIsOnTheReasonClass(t *testing.T) {
 	f := newSettleFixture(t)
 	olderBuildCopy(f)
-	f.run()
-	f.run()
-	if c, _, ok := settleDeclinedCondition(t, f); !ok || c.Lifecycle != corrosion.ConditionConfirmed {
-		t.Fatalf("vm_settle_declined = (%+v, %v), want confirmed", c, ok)
+	if err := f.virt.SetDomainManagedIncarnation("vm-a", corrosion.IncarnationOf(f.row.CreatedAt), true); err != nil {
+		t.Fatal(err)
 	}
-	f.r.reportSettleDeclines(context.Background(), nil, true)
-	if c, _, _ := settleDeclinedCondition(t, f); c.Lifecycle != corrosion.ConditionConfirmed {
-		t.Fatalf("an incomplete pass resolved the decline: %+v", c)
+	n := 0
+	f.r.SetPeerRuntimeChecker(func(context.Context, string, string) (string, error) {
+		n++
+		return "", fmt.Errorf("rpc error: code = Unavailable desc = connection attempt %d refused", n)
+	})
+	clock := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	f.r.Now = func() time.Time { return clock }
+	lines := captureSettleLogs(t)
+	for i := 0; i < 5; i++ {
+		f.run()
+		clock = clock.Add(15 * time.Second)
 	}
-	f.r.reportSettleDeclines(context.Background(), nil, false)
-	if c, _, _ := settleDeclinedCondition(t, f); c.Lifecycle != corrosion.ConditionResolved {
-		t.Fatalf("a complete pass without the copy left the decline %s, want resolved", c.Lifecycle)
+	if got := len(lines()); got != 1 {
+		t.Fatalf("five passes of one cause with changing error text logged %d lines, want 1", got)
+	}
+	if !strings.Contains(lines()[0], "reason_class=destination_unreachable") {
+		t.Fatalf("log line lacks the reason class: %s", lines()[0])
+	}
+	c, ev, ok := settleDeclinedCondition(t, f)
+	if !ok || ev.ReasonClass != "destination_unreachable" {
+		t.Fatalf("condition evidence class = %q (ok=%v), want destination_unreachable", ev.ReasonClass, ok)
+	}
+	// Raised once (second pass), then not rewritten for every new error string.
+	if c.ObserveCount != 1 {
+		t.Fatalf("condition written %d times over five passes of one cause, want 1", c.ObserveCount)
+	}
+}
+
+// settleReasonClass must give every reason settle produces a stable class, so
+// none falls to "other" (where every such reason would share one class).
+func TestSettleReasonClass_EveryReasonHasAClass(t *testing.T) {
+	for reason, want := range map[string]string{
+		"the row does not name another host":                                                          "row_not_elsewhere",
+		"the local copy's incarnation is unknown (no pause record, no managed-stamp incarnation)":     "incarnation_unknown",
+		"the local copy's owner epoch is unknown (no pause record, no owner-epoch marker)":            "epoch_unknown",
+		"the row is another incarnation of the name":                                                  "row_other_incarnation",
+		"no certificate verifier":                                                                     "not_wired",
+		"no certificate verifier wired":                                                               "not_wired",
+		"no destination runtime check":                                                                "not_wired",
+		"proofs unreadable: disk I/O error":                                                           "proofs_unreadable",
+		"destroy failed: domain is locked":                                                            "destroy_failed",
+		"no verified recovery-claim certificate gives this incarnation to node-b at owner epoch >= 3": "no_certificate",
+		"proof p1 is prepared, not completed: no replacement is known to run":                         "proof_not_completed",
+		`proof p1 was executed by "node-c", not its destination node-b`:                               "proof_executed_elsewhere",
+		"proof p1: destination node-b unreachable: rpc error: code = Unavailable":                     "destination_unreachable",
+		"proof p1: destination node-b reports it defined_stopped, not running":                        "destination_not_running",
+		"proof p1's certificate decides another incarnation":                                          "certificate_other_incarnation",
+		"proof p1's certificate decides owner epoch 2, older than the local copy's 3":                 "certificate_older_epoch",
+		"proof p1: too few valid accepts":                                                             "certificate_invalid",
+	} {
+		if got := settleReasonClass(reason); got != want {
+			t.Errorf("settleReasonClass(%q) = %q, want %q", reason, got, want)
+		}
 	}
 }

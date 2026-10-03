@@ -944,16 +944,17 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 	// owner costs one probe timeout rather than one per VM.
 	unreachable := map[string]string{}
 	// Live copies Layer 3 declined to settle this pass, reported once the pass
-	// is over (settle_declined.go). incomplete: a row this pass could not read,
-	// so a copy missing from declines may only have been skipped, and nothing
-	// is resolved on its strength.
+	// is over (settle_declined.go). keep: copies this pass could not examine
+	// (row unreadable, migrating, runtime state unreadable). Their absence from
+	// declines says nothing, so an open decline for one is kept, not resolved
+	// and re-raised a pass later.
 	var declines []settleDecline
-	incomplete := false
-	defer func() { r.reportSettleDeclines(ctx, declines, incomplete) }()
+	keep := map[string]bool{}
+	defer func() { r.reportSettleDeclines(ctx, declines, keep) }()
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
 		if err != nil {
-			incomplete = true
+			keep[domName] = true // unread: its decline status is unknown, not over
 		}
 		if err != nil || vm == nil {
 			// Domain exists locally but not in corrosion — might be external/manual.
@@ -964,6 +965,7 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 		// If the VM is mid-migration, a transient domain will appear on the
 		// target host before corrosion is updated — don't destroy it.
 		if vm.State == "migrating" {
+			keep[domName] = true // not examined this pass
 			continue
 		}
 
@@ -985,6 +987,9 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// Reason "unknown" is the one exception, and it needs MORE proof, not
 			// less: see provenOwnerLeftover.
 			st, serr := r.virt.DomainStateReason(domName)
+			if serr != nil {
+				keep[domName] = true // state unreadable: settle not examined this pass
+			}
 			cleanable := serr == nil && cleanableLeftover(st)
 			why := ""
 			if serr == nil && !cleanable && unknownShutoff(st) {

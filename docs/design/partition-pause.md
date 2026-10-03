@@ -695,7 +695,7 @@ VM's spec uuid, and a later spec-driven define gives the new domain that uuid.
 A stale copy of the old incarnation would then match the new row.
 
 A skipped copy is reported, not skipped silently: the reason is logged once
-per reason (and again every 10 minutes), and after two passes it is raised as
+per kind of reason (and again every 10 minutes), and after two passes it is raised as
 `vm_settle_declined` (evaluator `partition_pause`, subject `<name>@<host>`)
 with the reason, the local identity and a remedy. See docs/diagnostics.md.
 

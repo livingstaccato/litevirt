@@ -307,4 +307,15 @@ func TestSettle_AMatchingUUIDIsNotIncarnationEvidence(t *testing.T) {
 	if st := f.run(); st == libvirtfake.StateShutdown {
 		t.Fatalf("vm-a is %s: a matching UUID settled a copy whose incarnation is unknown", st)
 	}
+	// And it declines for the RIGHT reason: the incarnation is unknown, not some
+	// later clause that happened to fail.
+	vm, err := corrosion.GetVM(context.Background(), f.db, "vm-a")
+	if err != nil || vm == nil {
+		t.Fatalf("GetVM: %v", err)
+	}
+	settled, why, local := f.r.settleCertifiedMove(context.Background(), "vm-a", vm)
+	if settled || settleReasonClass(why) != "incarnation_unknown" || local.Incarnation != "" {
+		t.Fatalf("settle = (%v, %q, incarnation %q), want a decline because the incarnation is unknown",
+			settled, why, local.Incarnation)
+	}
 }

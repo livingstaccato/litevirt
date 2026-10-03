@@ -22,7 +22,7 @@ import (
 // and owner-assert's "SPLIT-BRAIN … manual intervention required", with no
 // hint of which proof was missing or what to do.
 //
-// A decline is therefore logged with its reason and remedy — once per reason,
+// A decline is therefore logged with its reason and remedy — once per kind of reason (settleReasonClass),
 // and again every settleDeclineLogEvery while it lasts — and, once it has
 // lasted two passes, raised as vm_settle_declined with the same content.
 
@@ -51,6 +51,7 @@ type settleDecline struct {
 // timestamps, so an unchanged decline rewrites nothing.
 type settleDeclinedEvidence struct {
 	Detail        string         `json:"detail"`
+	ReasonClass   string         `json:"reason_class"`
 	Reason        string         `json:"reason"`
 	RowHost       string         `json:"row_host"`
 	RuntimeState  string         `json:"runtime_state"`
@@ -61,7 +62,7 @@ type settleDeclinedEvidence struct {
 
 // settleDeclineState is what the last passes saw of one declined copy.
 type settleDeclineState struct {
-	reason    string
+	reason    string // the reason CLASS last logged (settleReasonClass)
 	loggedAt  time.Time
 	sightings int
 }
@@ -81,18 +82,71 @@ func settleRemedy(d settleDecline, self string) string {
 			"new incarnation an earlier one's UUID. ")
 	}
 	fmt.Fprintf(&b, "Settle stops a copy only on a completed recovery-claim proof for %[2]s whose certificate verifies "+
-		"here for this incarnation, while %[2]s's own runtime reports the VM running. Check %[2]s: if it runs %[1]s, "+
-		"the copy on %[3]s is a superseded duplicate; stop it there with `virsh destroy %[1]s` (definition and disks "+
-		"are kept, and the leftover cleanup undefines it on a later pass). If %[2]s does not run it, the copy on %[3]s "+
-		"may be the only one: leave it running, and owner-assert reclaims the row once every peer reports the VM absent.",
+		"here for this incarnation, while %[2]s's own runtime reports the VM running. The row naming %[2]s is NOT "+
+		"proof by itself: a converged-wrong host_name looks exactly like this. Before stopping anything, confirm "+
+		"which copy is current: `lv cluster claim vm/%[1]s` shows the decided claim and its destination, and "+
+		"`virsh domstate %[1]s` on %[2]s shows whether it runs there. Only if the claim gave %[1]s to %[2]s and %[2]s "+
+		"runs it is the copy on %[3]s a superseded duplicate; stop it on %[3]s with `virsh destroy %[1]s`. Its disks "+
+		"are kept; its definition and NVRAM are removed on the next reconcile pass (the leftover cleanup undefines "+
+		"a destroyed domain whose row moved). Otherwise the copy on %[3]s may be the only one: leave it running, and "+
+		"owner-assert reclaims the row once every peer reports the VM absent.",
 		d.Name, d.RowHost, self)
 	return b.String()
 }
 
+// settleReasonClass reduces a decline reason to its KIND. The raw reason can
+// carry text that changes every pass for the same cause (a gRPC error string,
+// a proof id), and rate-limiting on it would re-log and rewrite the condition
+// every pass; the class changes only when the cause does. The strings matched
+// are settleDecide's and settleCertifiedMove's own.
+func settleReasonClass(reason string) string {
+	switch {
+	case reason == "":
+		return ""
+	case strings.Contains(reason, "incarnation is unknown"):
+		return "incarnation_unknown"
+	case strings.Contains(reason, "owner epoch is unknown"):
+		return "epoch_unknown"
+	case strings.Contains(reason, "row is another incarnation"):
+		return "row_other_incarnation"
+	case strings.Contains(reason, "does not name another host"):
+		return "row_not_elsewhere"
+	case strings.HasPrefix(reason, "no certificate verifier"), strings.HasPrefix(reason, "no destination runtime check"):
+		return "not_wired"
+	case strings.HasPrefix(reason, "proofs unreadable"):
+		return "proofs_unreadable"
+	case strings.HasPrefix(reason, "destroy failed"):
+		return "destroy_failed"
+	case strings.HasPrefix(reason, "no verified recovery-claim certificate"):
+		return "no_certificate"
+	case strings.Contains(reason, "not completed: no replacement is known to run"):
+		return "proof_not_completed"
+	case strings.Contains(reason, "was executed by"):
+		return "proof_executed_elsewhere"
+	case strings.Contains(reason, "' unreachable: "), strings.Contains(reason, " unreachable: "):
+		return "destination_unreachable"
+	case strings.Contains(reason, " reports it "):
+		return "destination_not_running"
+	case strings.Contains(reason, "certificate decides another incarnation"):
+		return "certificate_other_incarnation"
+	case strings.Contains(reason, "older than the local copy's"):
+		return "certificate_older_epoch"
+	case strings.HasPrefix(reason, "proof "):
+		return "certificate_invalid"
+	default:
+		return "other"
+	}
+}
+
 // reportSettleDeclines logs and raises this pass's declines and resolves the
-// conditions of copies no longer declined. incomplete says the pass could not
-// read every row, so an absence proves nothing and nothing is resolved.
-func (r *Reconciler) reportSettleDeclines(ctx context.Context, declines []settleDecline, incomplete bool) {
+// conditions of copies no longer declined.
+//
+// keep names copies whose decline status this pass could not determine — their
+// row was unreadable, the row says it is migrating, or the runtime state could
+// not be read. A copy absent from declines for one of those reasons has not
+// stopped being declined; resolving it would only re-raise it a pass later. So
+// a kept copy's tracker entry and open condition are left exactly as they are.
+func (r *Reconciler) reportSettleDeclines(ctx context.Context, declines []settleDecline, keep map[string]bool) {
 	now := r.now()
 	t := &r.settleDeclines
 	t.mu.Lock()
@@ -100,32 +154,38 @@ func (r *Reconciler) reportSettleDeclines(ctx context.Context, declines []settle
 		t.seen = map[string]*settleDeclineState{}
 	}
 	declined := make(map[string]bool, len(declines))
-	var raise []settleDecline
+	type raised struct {
+		d       settleDecline
+		class   string
+		refresh bool
+	}
+	var raise []raised
 	for _, d := range declines {
 		declined[d.Name] = true
+		class := settleReasonClass(d.Reason)
 		st := t.seen[d.Name]
 		if st == nil {
 			st = &settleDeclineState{}
 			t.seen[d.Name] = st
 		}
 		st.sightings++
-		if st.reason != d.Reason || now.Sub(st.loggedAt) >= settleDeclineLogEvery {
-			st.reason, st.loggedAt = d.Reason, now
+		refresh := st.reason != class || now.Sub(st.loggedAt) >= settleDeclineLogEvery
+		if refresh {
+			st.reason, st.loggedAt = class, now
 			slog.Warn(settleDeclinedLogMsg,
-				"vm", d.Name, "host", r.hostName, "row_host", d.RowHost, "reason", d.Reason,
+				"vm", d.Name, "host", r.hostName, "row_host", d.RowHost,
+				"reason_class", class, "reason", d.Reason,
 				"local_incarnation", d.Local.Incarnation, "local_epoch", d.Local.Epoch,
 				"local_epoch_known", d.Local.EpochKnown, "evidence", d.Local.Source,
 				"remedy", settleRemedy(d, r.hostName))
 		}
 		if st.sightings >= settleDeclineSightingsToReport {
-			raise = append(raise, d)
+			raise = append(raise, raised{d: d, class: class, refresh: refresh})
 		}
 	}
-	if !incomplete {
-		for name := range t.seen {
-			if !declined[name] {
-				delete(t.seen, name)
-			}
+	for name := range t.seen {
+		if !declined[name] && !keep[name] {
+			delete(t.seen, name)
 		}
 	}
 	t.mu.Unlock()
@@ -144,7 +204,16 @@ func (r *Reconciler) reportSettleDeclines(ctx context.Context, declines []settle
 		}
 	}
 	ts := now.UTC().Format(time.RFC3339)
-	for _, d := range raise {
+	for _, rd := range raise {
+		d := rd.d
+		subject := d.Name + suffix
+		row, had := open[subject]
+		// Written when first raised, and then on the log's cadence: a class
+		// change or the interval. The raw reason riding along may differ pass to
+		// pass for the same cause, and is refreshed only then.
+		if had && !rd.refresh {
+			continue
+		}
 		local := map[string]any{"incarnation": d.Local.Incarnation, "evidence": d.Local.Source}
 		if d.Local.EpochKnown {
 			local["owner_epoch"] = d.Local.Epoch
@@ -152,16 +221,15 @@ func (r *Reconciler) reportSettleDeclines(ctx context.Context, declines []settle
 		b, err := json.Marshal(settleDeclinedEvidence{
 			Detail: "a copy of this VM runs on " + r.hostName + " while its row names " + d.RowHost +
 				", and partition settle declined to stop it",
-			Reason: d.Reason, RowHost: d.RowHost, RuntimeState: d.RuntimeState, RuntimeReason: d.RuntimeReason,
+			ReasonClass: rd.class, Reason: d.Reason, RowHost: d.RowHost,
+			RuntimeState: d.RuntimeState, RuntimeReason: d.RuntimeReason,
 			Local: local, Remedy: settleRemedy(d, r.hostName),
 		})
 		if err != nil {
 			continue
 		}
-		subject := d.Name + suffix
-		row, had := open[subject]
 		if had && row.Evidence == string(b) {
-			continue // unchanged: write on transitions only
+			continue // unchanged
 		}
 		if !had {
 			row = corrosion.HealthCondition{
@@ -182,11 +250,9 @@ func (r *Reconciler) reportSettleDeclines(ctx context.Context, declines []settle
 			slog.Warn("partition-settle: could not record vm_settle_declined", "vm", d.Name, "error", err)
 		}
 	}
-	if incomplete {
-		return
-	}
 	for subject, row := range open {
-		if declined[strings.TrimSuffix(subject, suffix)] {
+		name := strings.TrimSuffix(subject, suffix)
+		if declined[name] || keep[name] {
 			continue
 		}
 		row.Lifecycle = corrosion.ConditionResolved

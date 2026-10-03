@@ -65,7 +65,9 @@ func observedFailures(n *Node, target string) (int, time.Time, bool) {
 // Mutations: (1) probe a joining host again — the first verdict after the
 // boot write carries the count from the join and d is fenced at once; (2) skip
 // the 'joining' check in the coordinator together with (1), or (3) admit the
-// host 'active' — d is fenced while it joins.
+// host 'active' — d is fenced while it joins; (4) let a fence row from before
+// d last turned active count (fenceRowCutoff) — the old machine's
+// confirmation, a minute old, has the new one skipped as recently fenced.
 func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -96,14 +98,16 @@ func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 		return true
 	})
 
-	// Confirmed off and removed for good. The confirmation is the drill's,
-	// twelve minutes before the add: one under five minutes old would, quite
-	// separately, have the coordinator skip the new machine as recently
-	// fenced. Written in fence-confirm's statement shape, so it replicates.
+	// Confirmed off and removed for good. The confirmation is a minute old
+	// when the machine is added again, well inside the five-minute window in
+	// which the coordinator skips a host as recently fenced: it is the OLD
+	// machine's, and must not hold back a fence of the new one once it is
+	// active (failover.fenceRowCutoff). Written in fence-confirm's statement
+	// shape, so it replicates.
 	if err := a.DB.Execute(ctx,
 		`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
 		"confirm-"+d.Name, d.Name, "manual", "manual-confirmed",
-		time.Now().Add(-12*time.Minute).UTC().Format(time.RFC3339), "operator confirmation"); err != nil {
+		time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), "operator confirmation"); err != nil {
 		t.Fatalf("fence-confirm %s: %v", d.Name, err)
 	}
 	if err := corrosion.UpdateHostState(ctx, a.DB, d.Name, "fenced"); err != nil {

@@ -1484,6 +1484,7 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 		return false
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
+	life, lifeKnown := c.fenceRowCutoff(ctx, host)
 	for _, r := range rows {
 		switch result := r.String("result"); {
 		case manualOnly && result != "manual-confirmed":
@@ -1494,6 +1495,9 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
 		if perr != nil {
 			continue
+		}
+		if lifeKnown && ts.Before(life) {
+			continue // an earlier life of the host (fenceRowCutoff)
 		}
 		if ts.After(cutoff) {
 			return true
@@ -2016,6 +2020,7 @@ func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (f
 		return fenceRecord{}, false
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
+	life, lifeKnown := c.fenceRowCutoff(ctx, host)
 	var best time.Time
 	var out fenceRecord
 	found := false
@@ -2024,7 +2029,7 @@ func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (f
 			continue
 		}
 		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
-		if perr != nil || !ts.After(cutoff) {
+		if perr != nil || !ts.After(cutoff) || (lifeKnown && ts.Before(life)) {
 			continue
 		}
 		if !found || ts.After(best) {

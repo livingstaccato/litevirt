@@ -406,6 +406,19 @@ A shared-disk VM is still moved only on a proof-grade fence under 5 minutes old
 (see above), which a resume from a verified fence always has: a fresh one when
 the recorded one was older.
 
+**A fence row belongs to the host's life it was written in.** A `fencing_log`
+row older than the moment the host last turned `active` (its own boot write,
+or a recovery) is about an earlier life: the machine removed under the name
+before `lv host add` gave it to a new one, or the same machine before it booted
+again. Such a row does not make the host "recently fenced", does not confirm
+it off, and is not the proof-grade fence a shared-disk VM is moved on. A host
+that fails again after coming back is fenced anew, without waiting out the
+5 minutes. A row newer than the host's last activation still counts, which is
+the race the window exists for. Likewise, a health observation older than the
+moment a host turned active does not count toward fencing it: a host that just
+turned active is counted down afresh, and a host `lv host add` admitted is not
+probed at all until its daemon's first boot records it `active`.
+
 ### Resuming a recovery from a confirmation
 
 A recovery refused for want of a confirmation — a `manual` fence, a

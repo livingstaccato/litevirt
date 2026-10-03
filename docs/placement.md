@@ -400,6 +400,12 @@ incomplete or stale`, `vcpu`, `memory`, `anti-affinity`, `max-per-node`,
 it on `lv compose up`; a VM that failover cannot place records it in the
 `failover.skip` audit row.
 
+A `host:` pin naming a host that is missing, not active, or a witness is a
+failure of that VM alone, like any other hard constraint. Failover leaves that
+VM on the failed host with a `failover.skip` row naming the pin, and still
+places every other VM of the host. A compose plan is all or nothing, so
+`lv compose up` refuses the whole plan, as before.
+
 A VM is charged its vCPUs and its guest memory plus one qemu overhead, against
 the host's allocatable capacity net of what already runs there. A **container**
 is charged its memory limit only: no qemu overhead, and no vCPU — its `cpu` is a

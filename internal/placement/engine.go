@@ -662,7 +662,13 @@ func SelectBatch(
 		if req.PinHost != "" {
 			h, ok := snap.Hosts[req.PinHost]
 			if !ok || h.State != "active" || h.IsWitness() {
-				return nil, fmt.Errorf("pinned host %q not found, not active, or is a witness for VM %q", req.PinHost, req.VMName)
+				// Per VM, like any other unsatisfiable hard constraint: a pin
+				// to a host that cannot take the VM strands that VM, not the
+				// batch. Failover recovers the rest of a failed host around
+				// it; compose re-raises it as the hard error a plan needs.
+				results[req.VMName] = BatchResult{Err: fmt.Errorf("%w: pinned host %q not found, not active, or is a witness for VM %q",
+					ErrNoEligibleHost, req.PinHost, req.VMName)}
+				continue
 			}
 			// Shallow-copy the snapshot and restrict only its stable candidate
 			// slice. The resource, replica, affinity, and device maps stay shared
@@ -686,8 +692,9 @@ func SelectBatch(
 			// One infeasible VM must not fail the WHOLE batch: failover needs
 			// per-VM isolation (strand the one VM nothing can hold, recover the
 			// rest), and compose re-checks per-VM below. An empty-Host result is
-			// the per-VM "no eligible host" signal; structural errors (a bad
-			// pin) still abort everything.
+			// the per-VM "no eligible host" signal, as is a pin to a host
+			// that cannot take the VM (above). Anything else still aborts
+			// everything.
 			if errors.Is(err, ErrNoEligibleHost) {
 				results[req.VMName] = BatchResult{Err: err}
 				continue

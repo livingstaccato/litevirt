@@ -1124,7 +1124,11 @@ logged with every refusing voter's detail:
 diagnosed: per attempt and per voter it prints the promised and accepted
 ballot, the accepted value's digest, proof, destination and source, whether the
 voter's incarnation matches its entry, and its last refusal with the detail. A
-voter keeps its last refusal in memory only.
+voter keeps its last refusal in memory only, so the column is `-` after that
+voter restarts. That is by design (design/recovery-claims.md §3.3): a refusal
+writes nothing, and a refusal from before a restart describes a probe or a
+ballot that no longer holds. Re-run the recovery, or wait for the
+coordinator's next attempt, to see a current one.
 
 ### Recovery stranded on a dead destination (`ha.claim.stranded`)
 

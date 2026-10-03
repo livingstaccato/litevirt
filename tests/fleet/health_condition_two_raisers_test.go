@@ -67,6 +67,80 @@ func TestFleet_HealthCondition_TwoRaisersConverge(t *testing.T) {
 	}
 }
 
+// TestFleet_HealthEvaluatorStatus_TwoScannersConverge is the same race on
+// health_evaluator_status: two nodes that both hold the detector lease each
+// record their own scan, and after the heal the WAL push alone must leave them
+// with one row. UpsertHealthEvaluatorStatus had the mistake
+// UpsertHealthCondition had: a wall-clock created_at on each INSERT, which the
+// conflict path never copies.
+//
+// Mutation: bind nowRFC3339Nano() as created_at in UpsertHealthEvaluatorStatus
+// again — the replicas stay apart on health_evaluator_status.
+func TestFleet_HealthEvaluatorStatus_TwoScannersConverge(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 1})
+	a, b := c.Nodes[0], c.Nodes[1]
+	c.WaitConverged(t, convergeTimeout)
+
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+	scan := func(n *Node) {
+		t.Helper()
+		if err := corrosion.UpsertHealthEvaluatorStatus(ctx, n.DB, corrosion.HealthEvaluatorStatus{
+			Evaluator: "dual_run", LastScan: time.Now().UTC().Format(time.RFC3339), Coverage: "complete",
+			Reporter: n.Name,
+		}); err != nil {
+			t.Fatalf("%s: record scan: %v", n.Name, err)
+		}
+	}
+	scan(a)
+	time.Sleep(5 * time.Millisecond)
+	scan(b)
+
+	c.ClearLinkFaults()
+	c.WaitConverged(t, convergeTimeout, a, b)
+	for _, n := range []*Node{a, b} {
+		sts, err := corrosion.ListHealthEvaluatorStatus(ctx, n.DB)
+		if err != nil || len(sts) != 1 || sts[0].Reporter != b.Name {
+			t.Errorf("%s: converged on %+v (%v), want the later scanner %s", n.Name, sts, err, b.Name)
+		}
+	}
+}
+
+// TestFleet_HostCapacityObservation_TwoWritersConverge: a capacity row has one
+// writer at a time, the host it describes, but not one writer ever. A machine
+// rebuilt under a removed host's name starts from an empty state.db, and its
+// first sample INSERTs a row the peers already hold from the old machine,
+// before anti-entropy has given it theirs. Modelled here as the same row
+// written on both sides of a cut link. With a wall-clock created_at the WAL
+// push cannot converge them.
+//
+// Mutation: bind nowRFC3339Nano() as created_at in
+// UpsertHostCapacityObservation again — the replicas stay apart on
+// host_capacity_observations.
+func TestFleet_HostCapacityObservation_TwoWritersConverge(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 2, IndependentReplicas: true, FaultSeed: 1})
+	a, b := c.Nodes[0], c.Nodes[1]
+	c.WaitConverged(t, convergeTimeout)
+
+	c.SetLinkFaultBoth(a, b, LinkFault{Block: true})
+	sample := func(n *Node, cpu int) {
+		t.Helper()
+		if err := corrosion.UpsertHostCapacityObservation(ctx, n.DB, corrosion.HostCapacityObservation{
+			HostName: b.Name, DBCPU: cpu, EffectiveCPU: cpu, Complete: true,
+			SampledAt: time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
+			t.Fatalf("%s: sample: %v", n.Name, err)
+		}
+	}
+	sample(a, 4) // the old machine's row, as a peer holds it
+	time.Sleep(5 * time.Millisecond)
+	sample(b, 8) // the rebuilt machine's first sample
+
+	c.ClearLinkFaults()
+	c.WaitConverged(t, convergeTimeout, a, b)
+}
+
 func reporter(t *testing.T, n *Node) string {
 	t.Helper()
 	h, ok, err := corrosion.GetHealthCondition(context.Background(), n.DB,

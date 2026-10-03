@@ -232,7 +232,11 @@ type HealthEvaluatorStatus struct {
 	Detail    string
 }
 
-// UpsertHealthEvaluatorStatus records an evaluator's completed scan.
+// UpsertHealthEvaluatorStatus records an evaluator's completed scan. Its rows
+// are written by the detector lease holder, so two holders in a partition
+// race exactly as two raisers of one condition do, and its INSERT binds
+// healthConditionCreatedAt for the same reason (read that). Nothing reads
+// health_evaluator_status.created_at; last_scan is the scan's time.
 func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvaluatorStatus) error {
 	if st.Evaluator == "" {
 		return fmt.Errorf("corrosion: evaluator status requires an evaluator name")
@@ -250,7 +254,7 @@ func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvalua
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		st.Evaluator, st.LastScan, st.Coverage, st.Reporter, st.Detail,
-		nowRFC3339Nano(), now)
+		healthConditionCreatedAt, now)
 }
 
 // ListHealthEvaluatorStatus returns every evaluator's latest scan record.
@@ -292,7 +296,12 @@ type HostCapacityObservation struct {
 }
 
 // UpsertHostCapacityObservation writes a host's latest sample. Only the
-// observed host itself calls this — host_name is the ownership.
+// observed host itself calls this — host_name is the ownership. One writer at
+// a time is not one writer ever: a machine rebuilt under a removed host's name
+// inserts the row afresh from an empty state.db while its peers hold the old
+// machine's, so the INSERT binds healthConditionCreatedAt (read that).
+// Nothing reads host_capacity_observations.created_at; sampled_at is the
+// sample's time.
 func UpsertHostCapacityObservation(ctx context.Context, c *Client, o HostCapacityObservation) error {
 	if o.HostName == "" {
 		return fmt.Errorf("corrosion: capacity observation requires a host name")
@@ -321,7 +330,7 @@ func UpsertHostCapacityObservation(ctx context.Context, c *Client, o HostCapacit
 		   deleted_at = NULL`,
 		o.HostName, o.DBCPU, o.DBMemMiB, o.ExtraCPU, o.ExtraMemMiB,
 		o.EffectiveCPU, o.EffectiveMemMiB, complete, o.Detail, o.SampledAt,
-		nowRFC3339Nano(), now)
+		healthConditionCreatedAt, now)
 }
 
 // GetHostCapacityObservation reads one host's sample; ok=false when the host

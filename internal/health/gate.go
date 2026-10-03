@@ -372,9 +372,10 @@ func (c *Checker) ExecutionGate(ctx context.Context) GateResult {
 
 // DecisionGate is the coordinator gate: quorum held AND this host is
 // coordinator-eligible (fully in service to initiate failover — active, warmed;
-// witnesses allowed). For a TWO-worker cluster with no live witness, HA decisions are
-// blocked (a 1-1 split can't be safely arbitrated — each side is 1-of-2, neither a
-// majority). Callers must also hold the failover lease.
+// witnesses allowed). For a TWO-worker cluster with no live witness and no adopted
+// voter generation, HA decisions are blocked (a 1-1 split can't be safely arbitrated
+// over a voter set derived from host state). With a generation adopted the voter
+// majority governs. Callers must also hold the failover lease.
 func (c *Checker) DecisionGate(ctx context.Context) GateResult {
 	return c.decisionGate(ctx, func() QuorumState {
 		st, _, _ := c.QuorumProof(ctx)
@@ -450,7 +451,19 @@ func (c *Checker) decisionGate(ctx context.Context, quorum func() QuorumState) G
 		}
 	}
 	if workers == 2 && witnesses == 0 {
-		return gateNo(ReasonMissingWitness)
+		// The rule stands in for a fixed denominator. A voter set DERIVED
+		// from replicated host state can shrink on one side of a split, so
+		// two workers are refused outright. An ADOPTED generation changes only
+		// by a decided change or a forced one, and the quorum read above
+		// already counted its majority: a 1-1 split of two voters is 1 of 2
+		// on each side and refused there. So with a generation adopted, the
+		// voter majority governs. Drill 6 on main-b3368d7c forced {node-1,
+		// node-2} after the other three were lost and fence-confirmed, and
+		// nothing they held could be recovered until a third host joined.
+		cfg, err := corrosion.AdoptedVoterConfig(ctx, c.db)
+		if err != nil || !cfg.Explicit() {
+			return gateNo(ReasonMissingWitness)
+		}
 	}
 	return gateOK()
 }

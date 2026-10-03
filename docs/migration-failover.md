@@ -546,6 +546,16 @@ Witnesses participate in failover quorum but never run workloads. The
 placement engine refuses to schedule any VM onto them. See
 [operating-model.md](operating-model.md) for sizing guidance.
 
+Without a witness, a cluster left with exactly two voting-eligible workers
+refuses every failover decision with `missing_witness`, **unless a voter
+generation is adopted** (`lv cluster voter ls`). Without one, the voter set is
+derived from host state, which one side of a split can shrink, so neither side
+may decide. With one, the generation's majority decides. Two voters each see
+one of two on either side of a split, which is below a majority, so both sides
+are refused `no_quorum`. So a three-voter cluster that has lost and fenced one
+host recovers its workloads, and so do the two survivors of
+`lv cluster voter force-reconfigure`.
+
 ### VM failure policies
 
 Set in compose `migrate` section:

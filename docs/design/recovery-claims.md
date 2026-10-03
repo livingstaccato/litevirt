@@ -1088,7 +1088,13 @@ an ordinary fence applies (docs/migration-failover.md, "A confirmation before
 any fence of this outage fences the host afresh"). The confirmation authorises
 the fence, not the recovery. Before this, nothing fenced them, and the recovery
 waited for `lv host undrain` and a fresh fence five minutes later (drill 6 on
-main-8d1e56dc).
+main-8d1e56dc). With two survivors and no witness, the decision gate's
+two-worker rule (`missing_witness`) then refused every recovery until a third
+host joined (drill 6 on main-b3368d7c). The rule stands in for a fixed
+denominator: a voter set derived from host state can shrink on one side of a
+split. It no longer applies once a generation is adopted, because the gate's
+quorum is then a majority of a decided member list, and each side of a 1-1
+split of two voters sees one of two and is refused `no_quorum`.
 
 **Adopting a forced row.** A receiver adopts a `force:` row only if the
 survivors' signatures are unanimous over its members, members plus lost hosts

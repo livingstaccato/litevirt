@@ -30,6 +30,11 @@ enum HostState {
     HOST_MAINTENANCE = 2;
     HOST_SUSPECT     = 3;
     HOST_OFFLINE     = 4;
+    // Admitted by `lv host add`, its daemon not yet started: down to every
+    // observer by construction, never fenced, no placement target. A server
+    // on a release before this value reports such a host HOST_OFFLINE; a
+    // client before it shows the number 5.
+    HOST_JOINING     = 5;
 }
 
 enum MigrateStrategy {

@@ -112,6 +112,8 @@ func hostStateShort(s pb.HostState) string {
 		return "susp"
 	case pb.HostState_HOST_OFFLINE:
 		return "OFFLN"
+	case pb.HostState_HOST_JOINING:
+		return "join"
 	default:
 		return "?"
 	}

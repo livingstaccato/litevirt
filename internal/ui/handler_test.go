@@ -1458,6 +1458,7 @@ func TestHostStateBadge(t *testing.T) {
 		{pb.HostState_HOST_ACTIVE, "active"},
 		{pb.HostState_HOST_DRAINING, "draining"},
 		{pb.HostState_HOST_SUSPECT, "suspect"},
+		{pb.HostState_HOST_JOINING, ">joining<"},
 	}
 	for _, tt := range tests {
 		badge := hostStateBadge(tt.state)

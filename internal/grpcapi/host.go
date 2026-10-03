@@ -1197,6 +1197,10 @@ func hostStateToPB(s string) pb.HostState {
 		return pb.HostState_HOST_SUSPECT
 	case "offline", "fenced":
 		return pb.HostState_HOST_OFFLINE
+	case corrosion.HostStateJoining:
+		// Admitted by `lv host add`, its daemon not yet started. Not OFFLINE:
+		// nothing has failed, and the coordinator never fences it.
+		return pb.HostState_HOST_JOINING
 	default:
 		return pb.HostState_HOST_OFFLINE
 	}

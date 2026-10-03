@@ -1231,6 +1231,7 @@ func TestHostStateShort(t *testing.T) {
 		{pb.HostState_HOST_MAINTENANCE, "maint"},
 		{pb.HostState_HOST_SUSPECT, "susp"},
 		{pb.HostState_HOST_OFFLINE, "OFFLN"},
+		{pb.HostState_HOST_JOINING, "join"},
 		{pb.HostState(999), "?"},
 	}
 	for _, tc := range cases {

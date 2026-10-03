@@ -25,6 +25,7 @@ func TestHostStateToPB_NeverMasqueradesAsActive(t *testing.T) {
 		{"maintenance", pb.HostState_HOST_MAINTENANCE},
 		{"suspect", pb.HostState_HOST_SUSPECT},
 		{"offline", pb.HostState_HOST_OFFLINE},
+		{"joining", pb.HostState_HOST_JOINING},           // admitted, daemon not started: not offline
 		{"fenced", pb.HostState_HOST_OFFLINE},            // fenced ⇒ down, not active
 		{"upgrading", pb.HostState_HOST_DRAINING},        // transient, not steady-active
 		{"some-future-state", pb.HostState_HOST_OFFLINE}, // fail safe: unknown ≠ active

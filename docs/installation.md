@@ -95,7 +95,9 @@ scp bin/litevirt root@10.0.50.11:/usr/local/bin/
 lv host add root@10.0.50.11 --name host-b
 ```
 
-The host is admitted in state `joining` (`HOST_OFFLINE` in `lv host ls`) and
+The host is admitted in state `joining` (`HOST_JOINING` in `lv host ls`; a
+server on an older release reports it `HOST_OFFLINE`, and an older `lv` shows
+the number `5`) and
 becomes `active` when its daemon first starts. Until then nothing is placed on
 it and the failover coordinator never fences it, however long its setup takes:
 it is down to every peer by construction, and runs nothing. A host removed

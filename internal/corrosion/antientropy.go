@@ -50,6 +50,9 @@ type AntiEntropy struct {
 	// legacyRepair is the stand-down (anti_entropy_legacy_repair): pull whole
 	// tables, never ask a peer for bucket digests.
 	legacyRepair bool
+	// drift rate-limits the drift-detected line for a drift that has not
+	// changed (antientropy_driftlog.go).
+	drift driftLog
 }
 
 // NewAntiEntropy creates an anti-entropy checker.
@@ -281,7 +284,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	}
 
 	completed := true
-	mismatched := digestMismatches(peerName, resp.Tables, localMap)
+	mismatched := ae.drift.mismatches(peerName, resp.Tables, localMap)
 	// Observation tables are repaired on their own, slower schedule; control
 	// state is repaired now (observation_tables.go). Observations are always
 	// due on a replica that is not caught up, so deferring them never holds
@@ -365,27 +368,11 @@ func localAndRemoteHash(local TableDigest, remote *pb.TableDigest) (string, stri
 	return local.Hash, remote.GetHash()
 }
 
-// digestMismatches returns the tables whose digest differs from the peer.
+// digestMismatches returns the tables whose digest differs from the peer,
+// logging every one. A pass uses ae.drift, which logs a drift that has not
+// changed only once per driftRepeatInterval.
 func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string]TableDigest) []string {
-	var out []string
-	for _, r := range remote {
-		local, exists := localMap[r.Name]
-		if !exists {
-			slog.Info("anti-entropy: drift detected", "peer", peer, "table", r.Name, "local_hash", "", "remote_hash", r.Hash)
-			out = append(out, r.Name)
-			continue
-		}
-		if TableDigestsAgree(local, r) {
-			continue // in sync
-		}
-		lh, rh := localAndRemoteHash(local, r)
-		useV2 := local.HashV2 != "" && r.GetHashV2() != ""
-		slog.Info("anti-entropy: drift detected",
-			"peer", peer, "table", r.Name, "digest", map[bool]string{true: "v2", false: "v1"}[useV2],
-			"local_hash", lh, "remote_hash", rh)
-		out = append(out, r.Name)
-	}
-	return out
+	return (*driftLog)(nil).mismatches(peer, remote, localMap)
 }
 
 func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full bool) {
@@ -408,7 +395,7 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 		return
 	}
 
-	mismatched := digestMismatches(peerName, resp.Tables, localMap)
+	mismatched := ae.drift.mismatches(peerName, resp.Tables, localMap)
 	if len(mismatched) == 0 {
 		return
 	}

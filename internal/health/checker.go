@@ -308,6 +308,17 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 		if host.State == "maintenance" {
 			continue
 		}
+		// Nor a host `lv host add` admitted whose daemon has not started:
+		// nothing listens there yet, by construction, and the coordinator does
+		// not fence it. Counting its failures anyway built a count past the
+		// fence threshold over a long setup, and the boot write that recorded
+		// it 'active' then met a fence quorum at once (kvm003 drill 6,
+		// main-b3368d7c: node-4 fenced 2 s after `lv host add` returned). Its
+		// count starts from zero once it is active, as for a host this checker
+		// has never probed.
+		if host.State == corrosion.HostStateJoining {
+			continue
+		}
 
 		// Detect CRL version mismatch (#49).
 		if localCRLVersion > 0 {
@@ -357,9 +368,13 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 	// on a host this observer had never probed — and the coordinator fenced it
 	// mid-setup (kvm003 drill 6, main-8d1e56dc). A host back in the table starts
 	// from nothing, as after a restart of this checker.
+	// A joining host's entry goes the same way (see above): whatever this
+	// checker held for the name, it is not a count against this machine.
 	listed := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
-		listed[h.Name] = true
+		if h.State != corrosion.HostStateJoining {
+			listed[h.Name] = true
+		}
 	}
 	c.mu.Lock()
 	for _, name := range names {

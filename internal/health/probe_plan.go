@@ -85,7 +85,7 @@ func probePlan(self string, candidates []string, voters map[string]bool, sample 
 func planCandidates(observer string, hosts []corrosion.HostRecord) []string {
 	out := make([]string, 0, len(hosts))
 	for _, h := range hosts {
-		if h.Name != observer && h.State != "maintenance" {
+		if h.Name != observer && h.State != "maintenance" && h.State != corrosion.HostStateJoining {
 			out = append(out, h.Name)
 		}
 	}

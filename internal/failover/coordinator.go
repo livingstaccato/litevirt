@@ -621,6 +621,14 @@ func (c *Coordinator) run(ctx context.Context) {
 	// the skew lasts; host recovery (recoverHosts) deliberately keeps the
 	// one-sided test, since readmitting a host is not the irreversible act.
 	futureCutoff := c.now().Add(healthFreshness)
+	// An observation older than the moment its target turned active is about
+	// the host before (joining, offline, fenced), not the one active now, so
+	// a host that just turned active is counted down afresh. Unreadable: judged
+	// as before.
+	activeSince, aerr := corrosion.HostsActiveSince(ctx, c.db)
+	if aerr != nil {
+		slog.Warn("failover: read when hosts turned active", "error", aerr)
+	}
 	freshObservers := map[string]map[string]struct{}{}
 	// clusterObservers is the cluster-wide count, kept under region scope only
 	// to report a host it would have fenced and the region count does not.
@@ -637,6 +645,9 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 		t, o := r.String("target"), r.String("observer")
+		if since, ok := activeSince[t]; ok && inst.Before(since) {
+			continue
+		}
 		if c.scope.region && countsAsVote(voters, o, t) {
 			if clusterObservers[t] == nil {
 				clusterObservers[t] = map[string]struct{}{}

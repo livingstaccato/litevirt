@@ -186,6 +186,11 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	// origin's Go guard reads the live row, but a receiver has only the SQL.
 	{SQL: vmOperationBeginSQL, Disposition: DispLiveRowUpdate},
 	{SQL: vmOperationClearSQL, Disposition: DispLiveRowUpdate},
+	// Host re-admission over a tombstone: applied through its reset form on
+	// the origin and every receiver, so the new machine inherits no per-host
+	// setting of the one removed under its name. The wire shape is unchanged
+	// (host_readmit.go explains why).
+	{SQL: readmitHostSQL, Disposition: DispHostReadmit},
 	// audit_log hash-chain reseal: idempotent (recomputes the same hashes), and
 	// applied through the signature-guarded form on the receiver.
 	//

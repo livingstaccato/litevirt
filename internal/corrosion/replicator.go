@@ -1374,6 +1374,14 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)
 			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
+		// A host re-admitted over its tombstone takes no fence credential
+		// from the machine removed under its name (host_readmit.go).
+		if err := retireReadmittedCredentials(ctx, tx, stmts); err != nil {
+			_ = tx.Rollback()
+			slog.Error("replicator: retiring a re-admitted host's credential failed — back-pressuring replication",
+				"origin", entry.Origin, "seq", entry.Seq, "error", err)
+			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
 		// A state or isolation write to hosts from a node that was not writing
 		// host_membership yet is absorbed into it here, locally
 		// (host_membership.go). Back-pressured on failure, like the secret
@@ -1740,7 +1748,20 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		// Exactly DispFullPKUpdate, through the tombstone-guarded form: a state
 		// write that reaches a deleted row here changes nothing, whichever
 		// release sent it (live_row_update.go). An absent row still parks.
-		if err := r.applyLWWGated(ctx, tx, liveRowGuarded(s), sh, tableName, pkCols, incomingHLC); err != nil {
+		if err := r.applyLWWGated(ctx, tx, appliedForm(s), sh, tableName, pkCols, incomingHLC); err != nil {
+			return err
+		}
+		if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {
+			r.client.deferAfterCommit(tx, park)
+		}
+		return nil
+
+	case DispHostReadmit:
+		// Exactly DispFullPKUpdate, through the reset form: the re-admitted
+		// row starts with no per-host setting of the machine removed under
+		// its name, whichever release sent it (host_readmit.go). The
+		// credential row is retired once per entry, beside the secret absorb.
+		if err := r.applyLWWGated(ctx, tx, appliedForm(s), sh, tableName, pkCols, incomingHLC); err != nil {
 			return err
 		}
 		if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {

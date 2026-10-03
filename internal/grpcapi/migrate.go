@@ -776,6 +776,8 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 			// migration's: a row left `migrating` on the source is one nothing
 			// heals (owner-assert skips `migrating`), and the cluster would go on
 			// naming a host that no longer runs the guest.
+			//runningcheck:allow ownership handoff after cutover, as CommitMigrationOwnership above: the source's
+			// domain is gone, and the destination's convergence marks its own runtime.
 			moved, rerr := corrosion.RepointMigratedVM(fctx, s.db, vm.Name, s.hostName, targetHost, "running")
 			switch {
 			case rerr != nil:

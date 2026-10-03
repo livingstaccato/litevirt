@@ -111,8 +111,13 @@ var nonMinting = map[string]int{
 	// VMRecord; it does not, and -1 made it unconditionally exempt.
 	"UpdateVMHost":             4,
 	"CommitMigrationOwnership": 5,
-	"InsertVM":                 stateInVMRecord,
-	"InsertVMWithHardware":     stateInVMRecord,
+	// RescheduleVMHost(ctx, c, name, hostName, state) and
+	// RepointMigratedVM(ctx, c, vm, source, target, finalState): UpdateVMHost's
+	// statement, with the VM's disk rows or a guard on the migrating row.
+	"RescheduleVMHost":     4,
+	"RepointMigratedVM":    5,
+	"InsertVM":             stateInVMRecord,
+	"InsertVMWithHardware": stateInVMRecord,
 }
 
 // clientMethods are writers invoked as methods on the corrosion client
@@ -130,9 +135,10 @@ var clientMethods = map[string]int{
 // parameter, or -1 for a writer that always publishes running and so can never
 // be exempted by a literal.
 var minting = map[string]int{
-	"TransferVMOwner":      4,
-	"TransferVMOwnerFresh": 4,
-	"CompleteVMStartProof": alwaysRunning,
+	"TransferVMOwner":          4,
+	"TransferVMOwnerFresh":     4,
+	"TransferVMOwnerWithDisks": 4,
+	"CompleteVMStartProof":     alwaysRunning,
 	// ReplaceVM installs a cutover's replacement with the state copied from the
 	// source row it re-reads at commit time, not taken as an argument, so no
 	// literal can ever exempt a call — and, unlike the entries above, the state
@@ -576,15 +582,15 @@ var stateWritingStatements = []stateStatement{
 	},
 	{
 		sql:     `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
-		writers: []string{"UpdateVMHost", "CommitMigrationOwnership"},
-		note:    "both nonMinting (state at arg 4 and arg 5) - identical SQL, different guards in Go",
+		writers: []string{"UpdateVMHost", "CommitMigrationOwnership", "RescheduleVMHost", "RepointMigratedVM"},
+		note:    "all nonMinting (state at arg 4, 5, 4 and 5) - identical SQL, different guards and companions in Go",
 	},
 	{
 		sql: `UPDATE vms
 	  SET host_name = ?, state = ?, state_detail = '',
 	      vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
 	  WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
-		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh"},
+		writers: []string{"TransferVMOwner", "TransferVMOwnerFresh", "TransferVMOwnerWithDisks"},
 		note:    "MINTING: the statement advances the generation, so the correct marker value does not exist until it commits",
 	},
 	{

@@ -784,7 +784,24 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 		}
 		if !ok {
 			// Preconditions no longer hold (VM/disks changed during migration) —
-			// a hard abort, never silent success.
+			// a hard abort, never silent success. The guest is on the target all
+			// the same, so the VM row is moved there if it is still this
+			// migration's: a row left `migrating` on the source is one nothing
+			// heals (owner-assert skips `migrating`), and the cluster would go on
+			// naming a host that no longer runs the guest.
+			//runningcheck:allow ownership handoff after cutover, as CommitMigrationOwnership above: the source's
+			// domain is gone, and the destination's convergence marks its own runtime.
+			moved, rerr := corrosion.RepointMigratedVM(fctx, s.db, vm.Name, s.hostName, targetHost, "running")
+			switch {
+			case rerr != nil:
+				return fmt.Errorf("ownership commit precondition failed: VM %q or its disks changed during migration, "+
+					"and the VM row could not be moved to %s: %v", vm.Name, targetHost, rerr)
+			case moved:
+				slog.Error("post-migration: disk rows changed during migration; moved the VM row to the target "+
+					"and left the disk rows as they are", "vm", vm.Name, "to", targetHost)
+				return fmt.Errorf("ownership commit precondition failed: VM %q's disks changed during migration; "+
+					"the VM row now names %s, where it runs, and its disk rows were left unchanged", vm.Name, targetHost)
+			}
 			return fmt.Errorf("ownership commit precondition failed: VM %q or its disks changed during migration", vm.Name)
 		}
 		committed = true

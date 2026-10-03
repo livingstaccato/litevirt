@@ -190,6 +190,62 @@ func TestDecisionGate_MissingWitness(t *testing.T) {
 	}
 }
 
+// With an adopted voter generation the voter majority governs, not the
+// two-worker heuristic. drill 6 on main-b3368d7c forced generation 10 = {node-1,
+// node-2} after node-3..5 were lost for good and fence-confirmed, and every
+// recovery of their workloads was then refused missing_witness until a third
+// host was added; a 3-voter generation with one member fenced is blocked the
+// same way. The heuristic stood in for a fixed denominator: a set derived from
+// replicated host state can shrink on one side of a split. An adopted set
+// changes only by a decided generation, so its majority is a real majority.
+//
+// The two-node split the heuristic prevents stays prevented: each side of a
+// split sees one of two voters, below the majority of two, and is refused
+// no_quorum. (Under recovery claims a side also cannot form a certificate,
+// which needs both accepts.)
+//
+// Mutation: drop the adopted-generation exemption — the "adopted, both up"
+// cases are refused missing_witness. Make it skip the quorum read — the split
+// cases pass.
+func TestDecisionGate_AnAdoptedVoterGenerationGovernsTwoWorkers(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		voters  []string // adopted generation; nil = derived
+		fenced  []string // hosts recorded fenced
+		healthy map[string]bool
+		want    string // "" = OK
+	}{
+		{"derived, both up", nil, nil, map[string]bool{"host-b": true}, ReasonMissingWitness},
+		{"adopted pair, both up", []string{"host-a", "host-b"}, nil, map[string]bool{"host-b": true}, ""},
+		{"adopted pair, split", []string{"host-a", "host-b"}, nil, map[string]bool{"host-b": false}, ReasonNoQuorum},
+		{"adopted three, one fenced, both up", []string{"host-a", "host-b", "host-c"}, []string{"host-c"},
+			map[string]bool{"host-b": true}, ""},
+		{"adopted three, one fenced, split", []string{"host-a", "host-b", "host-c"}, []string{"host-c"},
+			map[string]bool{"host-b": false}, ReasonNoQuorum},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, self := range []string{"host-a", "host-b"} {
+				db := testCheckHostDB(t)
+				gateHost(t, db, "host-a", "active", "worker")
+				gateHost(t, db, "host-b", "active", "worker")
+				for _, f := range tc.fenced {
+					gateHost(t, db, f, "fenced", "worker")
+				}
+				if tc.voters != nil {
+					adoptVoters(t, db, tc.voters...)
+				}
+				peer := map[string]string{"host-a": "host-b", "host-b": "host-a"}[self]
+				c := NewChecker(self, "/etc/litevirt/pki", db)
+				warm(c, map[string]bool{peer: tc.healthy["host-b"]})
+				r := c.DecisionGate(context.Background())
+				if (tc.want == "") != r.OK || (tc.want != "" && r.Reason != tc.want) {
+					t.Fatalf("%s: DecisionGate OK=%v reason=%q; want %q", self, r.OK, r.Reason, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // A self-fenced node fails BOTH gates closed regardless of otherwise-perfect quorum/role —
 // a doomed node must take no runtime-ownership decide/execute while it waits to reboot.
 func TestGates_SelfFencedFailClosed(t *testing.T) {

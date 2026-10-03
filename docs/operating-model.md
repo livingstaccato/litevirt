@@ -722,11 +722,19 @@ is.
 
 What a node waits for, concretely:
 
-- **After a daemon start: one health-probe cycle.** Until the checker's first
-  cycle completes, quorum reads as unknown, so no new term is claimed. In the
-  fleet harness that is about 2 s from start. A peer's newer term then holds
-  the claim back until replication delivers the row, which took about 1 s in
-  the fleet harness once the links healed.
+- **After a daemon start: the replica's first catch-up.** No new term is
+  claimed until an anti-entropy exchange with a peer has completed since the
+  process started, or since the node last lost every gossip peer. That is the
+  signal the workload commands also wait on, and on a real daemon it takes
+  about a minute. The quorum read alone cannot vouch for a replica that has
+  not caught up: on a host reinstalled with an empty database, the voter set
+  and the peer list it reads come from a `hosts` table that may name only the
+  node itself, so the "quorum" is the node and nobody is asked. A rebuilt
+  host did exactly that on the lab and claimed terms the cluster had claimed
+  weeks earlier. Then one health-probe cycle: until the checker's first cycle
+  completes, quorum reads as unknown. A peer's newer term then holds the claim
+  back until replication delivers the row, which took about 1 s in the fleet
+  harness once the links healed.
 - **In the common case, nothing measurable.** A takeover mint costs one RPC per
   healthy peer: about 7 ms in the fleet harness, against under 1 ms without the
   read, on a lease with a TTL of tens of seconds. A renewal claims no term and

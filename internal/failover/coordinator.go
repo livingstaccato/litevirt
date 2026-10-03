@@ -2779,7 +2779,9 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			// coordinator's, re-materialized with its own ID and destination.
 			// Without a certificate nothing is written.
 			if c.claimsEnforced(ctx) {
-				cl, cerr := c.claimRecovery(ctx, proof, h.Name, vm.CreatedAt)
+				cl, cerr := c.claimRecoveryFor(ctx, proof, h.Name, vm.CreatedAt, func(d corrosion.HostRecord) string {
+					return c.vmFitsOn(ctx, vm, h.Name, d)
+				})
 				if cerr != nil {
 					c.noteClaimRefused(ctx, ActionReschedule, "vm", vm.Name, h.Name, cerr)
 					continue
@@ -2802,7 +2804,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				c.mVM(ActionReschedule, ResultError, ErrDBError)
 				continue
 			}
-		} else if err := corrosion.UpdateVMHost(ctx, c.db, vm.Name, targetName, "pending"); err != nil {
+		} else if err := corrosion.RescheduleVMHost(ctx, c.db, vm.Name, targetName, "pending"); err != nil {
 			// Legacy (pre-activation) path — unchanged.
 			slog.Error("failover: update VM host", "vm", vm.Name, "error", err)
 			c.mVM(ActionReschedule, ResultError, ErrDBError)

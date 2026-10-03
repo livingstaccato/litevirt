@@ -884,7 +884,17 @@ local (never picks an owner by value) and defers to runtime repair.
   the segmented case, or to force a specific owner the operator knows is correct.
 
 Either way the fresh timestamp wins everywhere by ordinary LWW and clears the
-unresolved tracking.
+unresolved tracking. Both also move the VM's `vm_disks` rows to the host that
+runs it, in the same write. Failover moves them with the VM too. Builds before
+that re-keyed only the `vms` row, so a VM recovered by one of them can still
+have disk rows naming the host it left. Running `lv doctor repair-owner <vm>
+<host-that-runs-it>` once realigns them. A migration also commits over such a
+row, as long as the row has not changed since the migration began.
+
+A migration whose ownership commit is refused after the cutover (a disk row
+changed while it ran) moves the `vms` row to the target, where the guest now
+runs, and reports the refusal. It no longer leaves the row `migrating` on the
+source, where nothing would repair it.
 
 ### Container ownership — automatic runtime re-key
 

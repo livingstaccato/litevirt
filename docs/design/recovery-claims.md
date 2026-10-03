@@ -1088,7 +1088,13 @@ an ordinary fence applies (docs/migration-failover.md, "A confirmation before
 any fence of this outage fences the host afresh"). The confirmation authorises
 the fence, not the recovery. Before this, nothing fenced them, and the recovery
 waited for `lv host undrain` and a fresh fence five minutes later (drill 6 on
-main-8d1e56dc).
+main-8d1e56dc). With two survivors and no witness, the decision gate's
+two-worker rule (`missing_witness`) then refused every recovery until a third
+host joined (drill 6 on main-b3368d7c). The rule stands in for a fixed
+denominator: a voter set derived from host state can shrink on one side of a
+split. It no longer applies once a generation is adopted, because the gate's
+quorum is then a majority of a decided member list, and each side of a 1-1
+split of two voters sees one of two and is refused `no_quorum`.
 
 **Adopting a forced row.** A receiver adopts a `force:` row only if the
 survivors' signatures are unanimous over its members, members plus lost hosts
@@ -2125,3 +2131,25 @@ where it described the mechanism; this list records what changed and why.
     node refuses, and it never adopts one that an older node accepts
     differently. Older nodes that were there all along have already adopted
     the same rows.
+39. **An adopted value's destination is checked like a fresh pick** (§3.13
+    step 5). The text writes a decided value whatever its destination. On
+    the kvm003 lab (main-b3368d7c), drill 4 left node-2 holding an accepted
+    value for o4 at owner epoch 4, destination node-5, that formed no
+    certificate (the other voters still reached the owner). Drill 6's forced
+    reconfiguration imported it, as §4.6 requires. node-5 was then removed
+    for good and a rebuilt machine added under its name, and the moment it
+    was admitted, still `joining`, the next claim for o4 adopted the value,
+    certified it, and wrote the proof for the new node-5, while the
+    coordinator's own pick was node-2. The coordinator now checks a decided
+    value it did not propose before writing it: the destination's host row
+    is `active`, it advertises the split-brain gate, and, at the reschedule
+    site, the VM passes placement on that host alone (constraints, region,
+    capacity). The value names its destination by host name only, so these
+    are the checks a fresh pick of that name gets now. A destination that
+    fails them is asked for its signed abandonment of the proof, and the
+    claim moves to the next attempt on it (§3.12), where the coordinator's
+    own pick is proposed. Until that host signs, nothing is written and the
+    next tick retries. The value at the decided attempt is never replaced, so
+    §3.16 holds unchanged. A value decided for the failed host itself keeps
+    the stranded path, and one whose destination has no host row keeps the
+    removal path.

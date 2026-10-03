@@ -52,10 +52,14 @@ func (s *Server) repairActor(ctx context.Context) string {
 //   - it is FORWARDED to the named host and applied ONLY when that host
 //     positively confirms via its own libvirt that the VM is running locally —
 //     so ownership can never be pointed at a host that doesn't run the VM;
-//   - it writes only the VM's DB row (UpdateVMHost): host_name + state="running"
-//   - cleared state_detail + fresh updated_at. It never touches the running
-//     domain, so even a misdirected call can't destroy or move a workload, and
-//     is recoverable by re-running against the correct host. Clearing
+//   - it writes only the VM's DB rows (TransferVMOwnerWithDisks): host_name +
+//     state="running" + cleared state_detail + fresh updated_at, and the disk
+//     rows' host_name, since the proven host is the one using the disks (a
+//     failover before disk rows moved with the VM left them on the failed
+//     host, and the next migration's ownership commit refused them). It
+//     never touches the running domain, so even a misdirected call can't
+//     destroy or move a workload, and is recoverable by re-running against
+//     the correct host. Clearing
 //     state_detail is intentional: the host has just proven the VM is running,
 //     so any stale fence/migration marker is no longer true.
 //
@@ -115,7 +119,7 @@ func (s *Server) RepairVMOwner(ctx context.Context, req *pb.RepairVMOwnerRequest
 	// just read; a concurrent transition loses the CAS and the operator
 	// re-runs against fresh state instead of silently overwriting it.
 	if err := s.publishRunningMinted(ctx, req.GetName(), func(ctx context.Context) error {
-		return corrosion.TransferVMOwner(ctx, s.db, req.GetName(), s.hostName, "running", vm.OwnerEpoch)
+		return corrosion.TransferVMOwnerWithDisks(ctx, s.db, req.GetName(), s.hostName, "running", vm.OwnerEpoch)
 	}); err != nil {
 		if errors.Is(err, corrosion.ErrNoRowsAffected) {
 			return nil, status.Errorf(codes.Aborted,

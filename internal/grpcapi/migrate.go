@@ -273,6 +273,14 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition,
 			"VM %q has a local disk — use --with-storage for live migration or --strategy=cold", req.VmName)
 	}
+	// The disks the copy needs on the target, checked against their records
+	// here, before any work on the target.
+	var diskStubs []*pb.DiskStub
+	if withStorage {
+		if diskStubs, err = s.storageMigrationStubs(ctx, req.VmName); err != nil {
+			return err
+		}
+	}
 
 	// NUMA topology pre-flight: warn if source and target have different NUMA
 	// layouts when the VM has CPU pinning configured (#55).
@@ -398,7 +406,12 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// may remove.
 	var createdStubs []string
 	if withStorage {
-		createdStubs = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name)
+		if createdStubs, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, diskStubs); err != nil {
+			// EnsureDisks removed whatever it had created; the cloud-init ISO
+			// pre-created above is the only leftover.
+			s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, nil)
+			return err
+		}
 	}
 
 	// Firmware-state travel (G1): a Secure-Boot/vTPM VM is migrated cold from a
@@ -947,13 +960,23 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 // libvirt's domain XML validation passes before block copy starts.
 // Called by the source host before --with-storage migration.
 //
-// It reports the stubs it created. A path that already holds a file is skipped
-// and not reported: it is not this migration's to remove if the copy fails.
+// It reports the stubs it created and records them (migrationStubs). The copy
+// mirrors each source disk into the file at its path here, and a failed attempt
+// removes what was created, so a file this host did not create for this VM
+// takes part in neither. Such a file is refused, not skipped: it may be the
+// VM's disk from an earlier stay here — drill D1's was a copy partition settle
+// kept — and the mirror overwrites it whenever the sizes match. Refused rather
+// than overwritten on an operator's say-so, because only someone looking at
+// the file on this host can tell whether it is still needed, and once they
+// have, moving it aside is the whole remedy. A stub this host created for the
+// VM in an earlier attempt is its own and is reused.
+//
+// Every path is checked before any is created, and a failure part-way removes
+// the stubs this call created, so a refused or failed call leaves nothing.
 func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*pb.EnsureDisksResponse, error) {
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
-	resp := &pb.EnsureDisksResponse{}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
 		// file-backed pool dir) — never an arbitrary path under the data dir such
@@ -961,22 +984,62 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		if !s.withinDiskArtifactRoot(stub.Path) {
 			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is not in a disk-artifact root", stub.Path)
 		}
-		if _, err := os.Stat(stub.Path); err == nil {
-			continue // already exists
+		if _, err := os.Lstat(stub.Path); err == nil {
+			if !s.migrationStubs.owns(req.VmName, stub.Path) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"disk %s of VM %q already exists on %s, and this migration did not create it. "+
+						"It may be the VM's disk from an earlier stay on %s (a copy partition settle kept, say), "+
+						"and copying the disk there would overwrite it. Check whether it is still needed, "+
+						"move it aside or remove it on %s, then migrate again",
+					stub.Path, req.VmName, s.hostName, s.hostName, s.hostName)
+			}
+		} else if !os.IsNotExist(err) {
+			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
 		}
-		dir := filepath.Dir(stub.Path)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
+	}
+	resp := &pb.EnsureDisksResponse{}
+	var made []string // created by this call: removed again if a later one fails
+	undo := func() {
+		for _, p := range made {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				slog.Warn("disk stub: remove after a failed EnsureDisks", "vm", req.VmName, "path", p, "error", err)
+			}
+			s.migrationStubs.forget(p)
 		}
+	}
+	for _, stub := range req.Disks {
 		// Create a valid qcow2 image — QEMU validates the format header
 		// before block copy starts. Use a minimal size; migration overwrites it.
 		sizeBytes := uint64(1024 * 1024 * 1024) // 1G default
 		if stub.SizeBytes > 0 {
 			sizeBytes = uint64(stub.SizeBytes)
 		}
+		if _, err := os.Lstat(stub.Path); err == nil {
+			// This host's own stub from an earlier attempt for this VM (checked
+			// above). Reuse it at the size asked for now: the mirror needs the
+			// sizes to agree, and a stub holds nothing worth keeping.
+			if info, ierr := qcow2.Info(stub.Path); ierr == nil && info.VirtualSize == sizeBytes {
+				resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
+				slog.Info("disk stub reused for migration", "vm", req.VmName, "path", stub.Path)
+				continue
+			}
+			if err := os.Remove(stub.Path); err != nil {
+				undo()
+				return nil, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)
+			}
+			s.migrationStubs.forget(stub.Path)
+		}
+		dir := filepath.Dir(stub.Path)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			undo()
+			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
+		}
 		if err := qcow2.Create(stub.Path, sizeBytes, nil); err != nil {
+			undo()
 			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
 		}
+		made = append(made, stub.Path)
+		s.migrationStubs.add(req.VmName, stub.Path)
 		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
 	}
@@ -1216,7 +1279,8 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	// VM record intact (the source still owns it); only when the VM has truly
 	// vanished do we fall back to admin (orphan cleanup), so a binding-holder
 	// can't drive this RPC against a VM they don't control.
-	if vm, _ := corrosion.GetVM(ctx, s.db, req.VmName); vm != nil {
+	vm, _ := corrosion.GetVM(ctx, s.db, req.VmName)
+	if vm != nil {
 		if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.migrate", "operator"); err != nil {
 			return nil, err
 		}
@@ -1224,6 +1288,11 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		return nil, status.Error(codes.PermissionDenied,
 			"cleaning up artifacts of a vanished VM requires the admin role")
 	}
+	// A VM that lives here — its row names this host, or its domain is defined
+	// here — has its real disks at these paths; a failed migration TO this host
+	// never got that far.
+	vmLivesHere := (vm != nil && vm.HostName == s.hostName) ||
+		(s.virt != nil && s.virt.DomainExists(req.VmName))
 	for _, p := range req.DiskPaths {
 		if p == "" {
 			continue
@@ -1235,9 +1304,20 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 			slog.Warn("cleanup migration artifacts: refusing to remove path outside a disk-artifact root", "vm", req.VmName, "path", p)
 			continue
 		}
+		// Only a stub THIS host created for the VM (EnsureDisks). The source's
+		// list is not trusted for it: a source built before EnsureDisks reported
+		// what it created names every disk path, including a disk that was here
+		// already, and removing that by name deleted it (drill D1).
+		if vmLivesHere || !s.migrationStubs.owns(req.VmName, p) {
+			slog.Warn("cleanup migration artifacts: leaving a disk file this host did not create as a migration stub",
+				"vm", req.VmName, "path", p, "vm_lives_here", vmLivesHere)
+			continue
+		}
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			slog.Warn("cleanup migration artifacts: remove disk stub", "vm", req.VmName, "path", p, "error", err)
+			continue
 		}
+		s.migrationStubs.forget(p)
 	}
 	if req.RemoveCloudInit {
 		if iso, perr := lv.SafeCloudInitISOPath(s.dataDir, req.VmName); perr != nil {
@@ -1304,54 +1384,78 @@ func diskVirtualSize(_ context.Context, path string) (int64, error) {
 	return int64(info.VirtualSize), nil
 }
 
-// ensureDisksOnTarget creates empty stub files on the target host for each
-// local disk so libvirt accepts the domain XML before block copy starts.
-// Reads actual virtual size from source disk files to ensure exact match.
-// It returns the paths the target reports it created, nil on any failure.
-func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string) []string {
+// storageMigrationStubs is the source-side preflight of a --with-storage
+// migration: the stub each of the VM's disk files needs on the target, sized at
+// the source disk's virtual size, which the block mirror requires the target
+// image to match.
+//
+// It refuses a disk whose virtual size differs from its recorded size. The
+// record is what placement, quota and the target's own rebuilds go by, so a
+// disk that disagrees with it is a fault to repair, not to carry to another
+// host — and when the target already holds a file of the recorded size, the
+// copy fails deep in drive-mirror with "Source and target image have different
+// sizes" (drill D1: an overlay rebuilt at its 112 MiB backing size for a disk
+// recorded at 20 GiB). A disk with no recorded size, or whose size cannot be
+// read here (not a qcow2), is sent at what can be known, as before.
+//
+// Disks on a storage driver that is not a host-local file (nfs, ceph, a volume
+// manager) are not stubbed: there is no per-host file to create.
+func (s *Server) storageMigrationStubs(ctx context.Context, vmName string) ([]*pb.DiskStub, error) {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
-	if err != nil || len(disks) == 0 {
-		return nil
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read the disks of VM %q: %v", vmName, err)
 	}
-
-	req := &pb.EnsureDisksRequest{VmName: vmName}
+	var stubs []*pb.DiskStub
 	for _, d := range disks {
-		if d.Path == "" {
+		if d.Path == "" || (d.StorageType != "" && !isHostLocalDiskDriver(d.StorageType)) {
 			continue
 		}
-		// Get the actual virtual size from the source disk file,
-		// not the DB — they can differ (e.g. backing image size).
 		size, err := diskVirtualSize(ctx, d.Path)
 		if err != nil {
-			slog.Warn("ensureDisksOnTarget: cannot read virtual size, using DB value",
-				"path", d.Path, "db_size", d.SizeBytes, "error", err)
+			slog.Warn("storage migration: cannot read the disk's virtual size, using the recorded size",
+				"vm", vmName, "path", d.Path, "db_size", d.SizeBytes, "error", err)
 			size = d.SizeBytes
-		} else {
-			slog.Info("ensureDisksOnTarget: read virtual size from source",
-				"path", d.Path, "virtual_size", size, "db_size", d.SizeBytes)
+		} else if d.SizeBytes > 0 && size != d.SizeBytes {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q is %d bytes on %s, but its record says %d bytes; a storage migration "+
+					"would carry that disagreement to the target, or fail in the copy with \"Source and target "+
+					"image have different sizes\". Grow the disk to its recorded size or correct the record, "+
+					"then migrate again",
+				d.DiskName, vmName, size, s.hostName, d.SizeBytes)
 		}
-		req.Disks = append(req.Disks, &pb.DiskStub{
-			Path:      d.Path,
-			SizeBytes: size,
-		})
+		stubs = append(stubs, &pb.DiskStub{Path: d.Path, SizeBytes: size})
 	}
-	if len(req.Disks) == 0 {
-		return nil
-	}
+	return stubs, nil
+}
 
+// ensureDisksOnTarget has the target create the stub files the copy needs, so
+// libvirt accepts the domain XML before block copy starts, and returns the
+// paths the target reports it created — all a failed attempt may remove there.
+//
+// A failure stops the migration. It used to be logged and the migration went
+// ahead, against a target missing disks libvirt would then trip over — or
+// holding a file the copy would overwrite (EnsureDisks refuses that).
+func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub) ([]string, error) {
+	if len(stubs) == 0 {
+		return nil, nil
+	}
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
-		slog.Warn("ensureDisksOnTarget: cannot reach host", "host", targetHost, "error", err)
-		return nil
+		return nil, status.Errorf(codes.Unavailable,
+			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
 	defer conn.Close()
 
-	resp, err := client.EnsureDisks(ctx, req)
+	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vmName, Disks: stubs})
 	if err != nil {
-		slog.Warn("ensureDisksOnTarget: failed", "host", targetHost, "vm", vmName, "error", err)
-		return nil
+		code := status.Code(err)
+		if code == codes.Unknown {
+			code = codes.Internal
+		}
+		return nil, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
+			vmName, targetHost, status.Convert(err).Message())
 	}
-	return resp.GetCreatedPaths()
+	return resp.GetCreatedPaths(), nil
 }
 
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO

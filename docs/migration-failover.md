@@ -67,6 +67,23 @@ lv migrate my-vm host-b --with-storage
 
 The disk is streamed to the target over libvirt's block-copy / NBD channel
 while the VM keeps running; the source is undefined after a successful cutover.
+
+Before the copy, the source checks each disk against its record and the target
+creates an empty file for each disk to be copied into. The migration is refused,
+before anything is copied, when:
+
+- a disk's size differs from its recorded size. Make the disk and its record
+  agree first.
+- the target already has a file at a disk's path that this migration did not
+  create, for example a copy of the VM's disk left from an earlier stay on that
+  host. Copying onto it would overwrite it. The error names the file and the
+  host. Check whether the file is still needed, move it aside or remove it, then
+  migrate again.
+- the target cannot create the files at all.
+
+If a copy fails, the target removes only the files it created for that attempt.
+It decides that from its own record, whatever the source asks it to remove.
+
 You can also set it as a per-VM default in compose:
 
 ```yaml
@@ -561,6 +578,14 @@ Set in compose `migrate` section:
 | `restart-any` | Restart on any available healthy host |
 | `restart-same` | Wait for original host to recover |
 | `none` | Do not reschedule |
+
+A VM with a local disk that is restarted on another host does not get its disk
+back, because the disk stayed on the failed host. The new host rebuilds the disk
+from the VM's image at the disk's recorded size. The new host might still have
+an old copy of the disk from an earlier stay there. The restart never boots that
+copy. It renames the copy to `<disk path>.superseded-<time>` next to the new
+disk. Nothing removes the renamed file. Delete it when you no longer need
+anything in it.
 
 ## Load-balancer VIP split-brain safety
 

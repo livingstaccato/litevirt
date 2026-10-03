@@ -2884,7 +2884,7 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 // startRelocation relocates one not-yet-marked container: restore-from-backup if
 // possible, else image-recreate, else skip.
 func (c *Coordinator) startRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) {
-	target := c.pickContainerTarget(ctx, ct, candidates)
+	target, _ := c.pickContainerTarget(ctx, ct, candidates)
 	if target == "" {
 		slog.Warn("failover: no target for container relocation", "container", ct.Name)
 		return
@@ -3024,8 +3024,14 @@ func (c *Coordinator) resumeRestoreRelocation(ctx context.Context, h *corrosion.
 			claimed, target = &p, p.DestHost
 		}
 	}
+	if claimed == nil {
+		c.failAbandonedRestoreProof(ctx, ct, token)
+	}
 	if target == "" {
-		target = c.pickContainerTarget(ctx, ct, candidates)
+		var skipped bool
+		if target, skipped = c.pickContainerTarget(ctx, ct, candidates); skipped {
+			return // marked relocate-skipped, and audited, by the placement refusal
+		}
 	}
 	c.imageRecreateOrSkip(ctx, h, ct, target, claimed)
 }
@@ -3164,8 +3170,9 @@ func (c *Coordinator) imageRecreateOrSkip(ctx context.Context, h *corrosion.Host
 // to round-robin over the candidate list. It skips any host that already runs a
 // LIVE container of the same name (names aren't cluster-unique), so relocation
 // never collides with / clobbers an unrelated container. Returns "" if no
-// collision-free target exists.
-func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) string {
+// collision-free target exists, with skipped=true when that refusal already
+// marked the container relocate-skipped (no host has a container runtime).
+func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.ContainerRecord, candidates []corrosion.HostRecord) (target string, skipped bool) {
 	// The single-VM Select path carries the full capacity model (observations,
 	// reserves, incomplete-host exclusion). There is deliberately NO
 	// round-robin fallback on its failure: the old one walked the raw healthy
@@ -3183,20 +3190,20 @@ func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.Cont
 	})
 	if err != nil {
 		if c.skippedNoContainerRuntime(ctx, ct, err) {
-			return ""
+			return "", true
 		}
 		slog.Warn("failover: container placement failed — left for operator recovery, NOT round-robined",
 			"container", ct.Name, "error", err)
-		return ""
+		return "", false
 	}
 	if c.targetHasLiveContainer(ctx, target, ct.Name) {
 		// The chosen host already runs an unrelated container of this name
 		// (names are per-host). Rare; skip rather than blind-pick elsewhere.
 		slog.Warn("failover: container relocation target holds a same-name container — left for operator recovery",
 			"container", ct.Name, "target", target)
-		return ""
+		return "", false
 	}
-	return target
+	return target, false
 }
 
 // targetHasLiveContainer reports whether host already runs a live (non-deleted)

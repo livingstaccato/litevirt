@@ -48,8 +48,10 @@ func migrateWithStorageAt(t *testing.T, c *Cluster, at *Node, vmName, targetHost
 // A failed storage migration removes the stub it created on the target, and
 // never a disk file the target already had.
 //
-// Mutation: hand the cleanup every disk path again (not only the created
-// ones) — the "existing disk" subtest goes red with the file deleted. Drop
+// The "existing disk" attempt now stops earlier — EnsureDisks refuses a file
+// it did not create (migrate_storage_target_test.go), and the target decides
+// the cleanup by its own record whatever the source names — so it stays here
+// as an end-to-end guard that the file survives either way. Mutation: drop
 // the cleanup altogether — the "stub" subtest goes red with the stub left.
 func TestFleet_FailedStorageMigrationRemovesOnlyTheStubsItCreated(t *testing.T) {
 	for _, tc := range []struct {

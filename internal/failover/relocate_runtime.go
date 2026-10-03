@@ -30,3 +30,28 @@ func (c *Coordinator) skippedNoContainerRuntime(ctx context.Context, ct corrosio
 	c.mCt(ActionRelocate, ResultSkipped, ErrNoCandidates)
 	return true
 }
+
+// failAbandonedRestoreProof fails the proof of the restore a stale
+// relocate-restore marker named, when the fallback does not carry that proof
+// forward: the fallback image-recreate mints its own, so nothing will ever
+// complete or fail the restore's, and it sat prepared — or in_progress, once
+// the target had claimed it — forever. Failed, it is terminal, and a restore
+// that arrives after the coordinator gave up can no longer claim it.
+//
+// Not under recovery claims: there the marker's proof is either carried
+// forward (it holds a certificate) or re-claimed, and the claim may learn that
+// very proof as the decided value, which it must find live.
+func (c *Coordinator) failAbandonedRestoreProof(ctx context.Context, ct corrosion.ContainerRecord, token string) {
+	if token == "" || c.claimsEnforced(ctx) {
+		return
+	}
+	pr, ok, err := corrosion.GetActionProofByToken(ctx, c.db, token)
+	if err != nil || !ok || pr.Terminal() ||
+		pr.Action != corrosion.ActionRelocate || pr.TargetKind != "container" || pr.TargetName != ct.Name {
+		return
+	}
+	if err := corrosion.FailActionProof(ctx, c.db, pr.ID, "", "restore_abandoned",
+		"relocate-restore marker went stale; falling back to image-recreate"); err != nil {
+		slog.Warn("failover: fail the abandoned restore's proof", "container", ct.Name, "proof", pr.ID, "error", err)
+	}
+}

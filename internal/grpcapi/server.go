@@ -549,6 +549,11 @@ type Server struct {
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
 
+	// migrationStubs is what EnsureDisks created on this host as a migration
+	// target: the only disk files this host hands to a mirror or removes after
+	// a failed attempt (migrate_stubs.go). Zero value ready.
+	migrationStubs migrationStubLedger
+
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
 	vmLocksMu sync.Mutex

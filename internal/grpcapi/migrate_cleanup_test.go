@@ -16,19 +16,20 @@ func TestCleanupMigrationArtifacts_RefusesStateDB(t *testing.T) {
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	ctx := adminCtx()
-	insertTestVM(t, ctx, s.db, "mig", s.hostName, "running")
+	// The VM runs on another host and this one is its migration target.
+	insertTestVM(t, ctx, s.db, "mig", "src-host", "running")
 
 	stateDB := filepath.Join(s.dataDir, "state.db")
 	if err := os.WriteFile(stateDB, []byte("critical"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	disksDir := filepath.Join(s.dataDir, "disks")
-	if err := os.MkdirAll(disksDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	diskFile := filepath.Join(disksDir, "mig-root.qcow2")
-	if err := os.WriteFile(diskFile, []byte("disk"), 0o600); err != nil {
-		t.Fatal(err)
+	// A stub this host created for the migration — the only kind of disk file
+	// the cleanup removes (see TestCleanupMigrationArtifacts_LeavesFilesItDidNotCreate).
+	diskFile := filepath.Join(s.dataDir, "disks", "mig-root.qcow2")
+	if _, err := s.EnsureDisks(ctx, &pb.EnsureDisksRequest{
+		VmName: "mig", Disks: []*pb.DiskStub{{Path: diskFile, SizeBytes: 1 << 20}},
+	}); err != nil {
+		t.Fatalf("EnsureDisks: %v", err)
 	}
 
 	if _, err := s.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{

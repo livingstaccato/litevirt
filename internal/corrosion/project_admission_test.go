@@ -14,9 +14,11 @@ func insertProjectLease(t *testing.T, db *Client, id, project, resourceKind stri
 
 // insertProjectLeaseFor is insertProjectLease naming the resource the admission is
 // about to create, which is how a settled lease knows when to stop counting.
+// The lease is provisional with no admitted marker: an admission still
+// deciding, which is what the tie-break orders.
 func insertProjectLeaseFor(t *testing.T, db *Client, id, project, resourceKind, resourceID string, cpu, mem int) {
 	t.Helper()
-	rv := ReservationVector{Project: project, ProjectCPU: cpu, ProjectMemMiB: mem}
+	rv := ReservationVector{Project: project, ProjectCPU: cpu, ProjectMemMiB: mem, Provisional: true}
 	enc, err := rv.Encode()
 	if err != nil {
 		t.Fatalf("encode: %v", err)
@@ -49,8 +51,10 @@ func settleLease(t *testing.T, db *Client, id string, ago time.Duration) {
 }
 
 // TestProjectReservedSettling_YieldsToEarlierClaimantsOnly pins the tie-break the
-// whole scheme rests on: an admission counts claims that sort BEFORE it and ignores
-// later ones, so exactly one racer proceeds instead of both refusing.
+// whole scheme rests on: among claims still DECIDING, an admission counts those
+// that sort BEFORE it and ignores later ones, so exactly one racer proceeds
+// instead of both refusing. (A later claim that has already been admitted counts
+// too: TestReservedBefore_LaterClaimCountsOnceDecided.)
 func TestProjectReservedSettling_YieldsToEarlierClaimantsOnly(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()

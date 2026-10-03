@@ -87,7 +87,8 @@ func subjectForCreate(resourceID, host string, delta corrosion.QuotaAmount) quot
 //
 //	reserve — persist a nonterminal operation carrying this admission's deltas
 //	verify  — re-read headroom, which nets out EVERY nonterminal reservation,
-//	          adding back our own and any LATER claimant's
+//	          adding back our own and any LATER claimant's still deciding
+//	mark    — record that the claim was admitted, so it holds against everyone
 //	release — free the provisional reservation, whatever the outcome
 //
 // Adding our own back is what keeps the comparison honest: headroom already
@@ -97,10 +98,19 @@ func subjectForCreate(resourceID, host string, delta corrosion.QuotaAmount) quot
 // Deterministic tie-break. If both racers simply refused, the cluster would be safe
 // but nobody would get in; the useful property is that exactly ONE proceeds.
 // Reservations are ordered by operation id — globally unique, so the order is total
-// and every node derives the same winner — and an admission yields only to
-// reservations that sort BEFORE it. The earliest claimant wins; later ones see their
-// own reservation excluded, find the earlier one still consuming headroom, and
-// stand down.
+// and every node derives the same winner — and among claims still DECIDING an
+// admission yields only to those that sort BEFORE it. The earliest claimant wins;
+// later ones see their own reservation excluded, find the earlier one still
+// consuming headroom, and stand down.
+//
+// The tie-break orders RACERS, not arrivals. Ids are random, so a claim with a
+// larger id can arrive first and win; once it has, it counts against every later
+// arrival whatever its id. So a lease is published Provisional, marked admitted
+// (corrosion.OpStepAdmitted) when its verify passes, and counted by a smaller id
+// once marked (corrosion.reservationCounts). The earlier-only rule this replaced
+// admitted three claimants onto room for two when they arrived largest id first.
+// decideReservation holds admissionMu from reserve to marker, so on one node no
+// verify falls between another's verify and its marker.
 //
 // KNOWN LIMIT, stated rather than papered over: this closes the race whenever both
 // reservations are VISIBLE to both deciders. Corrosion is eventually consistent, so
@@ -424,6 +434,7 @@ func (s *Server) admitReserved(
 	rv := corrosion.ReservationVector{
 		Project:    project,
 		TargetHost: host, TargetCPU: cpuDelta, TargetMemMiB: hostMemDelta,
+		Provisional: true,
 	}
 	if withQuota && !delegated {
 		// Only a quota-charging admission reserves against the PROJECT. A start
@@ -453,36 +464,28 @@ func (s *Server) admitReserved(
 		OperationKind:   string(corrosion.OpResourceUpdateRunning),
 		ReservationJSON: resJSON,
 	}
-	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
-		return nil, status.Errorf(codes.Internal, "reserve capacity: %v", err)
-	}
-	lease := &reservationLease{s: s, id: op.ID}
-	// Attribute the reservation to the project's CURRENT authority. Capacity
-	// aggregation refuses to count a reservation it cannot attribute once an epoch
-	// exists, so skipping this would make the lease consume nothing — the same
-	// headroom handed to the next admission while this one is still holding it.
-	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
-		lease.release(ctx)
-		return nil, err
-	}
-
-	// Verify against headroom that counts ONLY earlier claimants: not our own
-	// provisional reservation (comparing our request against headroom that already
-	// subtracted it double-counts) and not later racers (they yield to us).
-	if err := s.checkHostCapacityBefore(ctx, host, cpuDelta, hostMemDelta, op.ID); err != nil {
-		lease.release(ctx)
-		return nil, err
-	}
-	if withQuota {
-		if !delegated {
-			if err := s.checkProjectQuotaBefore(ctx, project, quota, op.ID); err != nil {
-				lease.release(ctx)
-				return nil, err
-			}
-			return lease, nil
+	// Verify against headroom that counts the claims this one must yield to:
+	// not our own provisional reservation (comparing our request against
+	// headroom that already subtracted it double-counts), every earlier
+	// claimant, and every later one already admitted — not a later one still
+	// deciding (it yields to us). See corrosion.reservationCounts.
+	lease, err := s.decideReservation(ctx, op, project, "reserve capacity", func(id string) error {
+		if err := s.checkHostCapacityBefore(ctx, host, cpuDelta, hostMemDelta, id); err != nil {
+			return err
 		}
+		if withQuota && !delegated {
+			return s.checkProjectQuotaBefore(ctx, project, quota, id)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if withQuota && delegated {
 		// Host capacity is settled first because it is the cheap, local half: an
 		// admission that cannot fit the host never needs to bother the holder.
+		// Outside admissionMu: the holder may be this node, and its decision
+		// takes the same lock.
 		holder, quotaLease, epoch, qerr := s.admitProjectQuota(ctx, method, project, resourceID, subject, quota)
 		if qerr != nil {
 			lease.release(ctx)
@@ -494,8 +497,57 @@ func (s *Server) admitReserved(
 	return lease, nil
 }
 
+// decideReservation is the reserve-then-verify decision for one PROVISIONAL
+// claim: publish op (its reservation_json carries Provisional), attribute it to
+// the project's current authority, verify it, and mark it admitted — all under
+// admissionMu, so this node decides one claim at a time. A claim whose verify
+// fails, or whose marker cannot be written, is released before the lock is
+// dropped, so no other admission ever counts a refused claim as live.
+//
+// Why the lock, when the reservation already orders claimants: a claim that has
+// WON counts against every later arrival whatever its id, but only once its
+// admitted marker is visible. Between its verify and its marker it looks like a
+// racer still deciding, so a smaller id that reserved and verified in that gap
+// would ignore it — and it never counted the newcomer, which did not exist when
+// it verified. Holding the lock across verify and mark removes the gap on this
+// node, the single decider for its own host capacity and, as holder, for a
+// project's quota.
+//
+// what names the reservation in an insert-failure error.
+func (s *Server) decideReservation(ctx context.Context, op corrosion.OperationRecord, project, what string,
+	verify func(opID string) error) (*reservationLease, error) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
+		return nil, status.Errorf(codes.Internal, "%s: %v", what, err)
+	}
+	lease := &reservationLease{s: s, id: op.ID}
+	// Attribute the reservation to the project's CURRENT authority. Capacity
+	// aggregation refuses to count a reservation it cannot attribute once an epoch
+	// exists, so skipping this would make the lease consume nothing — the same
+	// headroom handed to the next admission while this one is still holding it.
+	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+	if err := verify(op.ID); err != nil {
+		lease.release(ctx)
+		return nil, err
+	}
+	if h := s.admissionVerifiedHook; h != nil {
+		h(op.ID)
+	}
+	if err := corrosion.MarkReservationAdmitted(ctx, s.db, op.ID); err != nil {
+		// Unmarked, the claim would hold nothing against a smaller id arriving
+		// later. Refuse rather than admit on a claim the others cannot see won.
+		lease.release(ctx)
+		return nil, status.Errorf(codes.Internal, "record capacity admission: %v", err)
+	}
+	return lease, nil
+}
+
 // checkHostCapacityBefore is checkHostCapacity against headroom that counts only
-// reservations from operations sorting before opID — MINUS the host's finite
+// the reservations opID must yield to (corrosion.ReservedBefore) — MINUS the host's finite
 // runtime-only load. The DB-derived free figure knows recorded workloads and
 // reservations; it knows nothing about a bounded rogue the runtime inventory can
 // see, so without the subtraction the authoritative host admits against memory
@@ -518,8 +570,8 @@ func (s *Server) checkHostCapacityBefore(ctx context.Context, host string, cpuDe
 	return nil
 }
 
-// checkProjectQuotaBefore is checkProjectQuota counting only reservations from
-// operations sorting before opID.
+// checkProjectQuotaBefore is checkProjectQuota counting only the reservations
+// opID must yield to (corrosion.ProjectReservedBefore).
 func (s *Server) checkProjectQuotaBefore(ctx context.Context, project string, delta corrosion.QuotaAmount, opID string) error {
 	q, err := corrosion.GetProjectQuota(ctx, s.db, project)
 	if err != nil {
@@ -630,6 +682,7 @@ func (s *Server) admitQuotaWithReservation(
 		Workload: name, WorkloadKind: kind, WorkloadHost: host,
 		WantCPU: want.VCPU, WantMemMiB: want.MemMiB,
 		WantDiskGiB: want.DiskGiB, WantNIC: want.NIC,
+		Provisional: true,
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -645,17 +698,7 @@ func (s *Server) admitQuotaWithReservation(
 		OperationKind:   string(corrosion.OpResourceUpdateRunning),
 		ReservationJSON: resJSON,
 	}
-	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
-		return nil, status.Errorf(codes.Internal, "reserve project quota: %v", err)
-	}
-	lease := &reservationLease{s: s, id: op.ID}
-	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
-		lease.release(ctx)
-		return nil, err
-	}
-	if err := s.checkProjectQuotaBefore(ctx, project, delta, op.ID); err != nil {
-		lease.release(ctx)
-		return nil, err
-	}
-	return lease, nil
+	return s.decideReservation(ctx, op, project, "reserve project quota", func(id string) error {
+		return s.checkProjectQuotaBefore(ctx, project, delta, id)
+	})
 }

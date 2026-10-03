@@ -60,6 +60,12 @@ const (
 	OpStepFailed            = "failed"
 	OpStepCancelled         = "cancelled"
 	OpStepSuperseded        = "superseded" // an older owner epoch was taken over; never terminates the CURRENT epoch
+
+	// OpStepAdmitted is a MARKER, not progress: a provisional capacity claim's
+	// reserve-then-verify passed (MarkReservationAdmitted). It is deliberately
+	// in no happy path, so it never changes the state an operation reduces to;
+	// capacity aggregation reads it directly (reservationCounts).
+	OpStepAdmitted = "admitted"
 )
 
 // opHappyPath is the ordered happy-path (non-terminal) step sequence per kind.

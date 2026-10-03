@@ -291,6 +291,7 @@ func (s *Server) admitResizeReservation(
 	rv := corrosion.ReservationVector{
 		Project:    vm.Project,
 		TargetHost: vm.HostName, TargetCPU: cpuDelta, TargetMemMiB: memDelta,
+		Provisional: true,
 	}
 	if !delegated {
 		rv.ProjectCPU, rv.ProjectMemMiB = cpuDelta, memDelta
@@ -312,25 +313,19 @@ func (s *Server) admitResizeReservation(
 		OperationKind:   string(corrosion.OpResourceUpdateRunning),
 		ReservationJSON: resJSON,
 	}
-	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
-		return nil, status.Errorf(codes.Internal, "reserve capacity: %v", err)
-	}
-	lease := &reservationLease{s: s, id: op.ID}
-	if err := s.stampReservationAuthority(ctx, op.ID, vm.Project); err != nil {
-		lease.release(ctx)
-		return nil, err
-	}
-
-	if err := s.checkHostCapacityBefore(ctx, vm.HostName, cpuDelta, memDelta, op.ID); err != nil {
-		lease.release(ctx)
-		return nil, err
-	}
-
-	if !delegated {
-		if err := s.checkProjectQuotaBefore(ctx, vm.Project, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, op.ID); err != nil {
-			lease.release(ctx)
-			return nil, err
+	lease, err := s.decideReservation(ctx, op, vm.Project, "reserve capacity", func(id string) error {
+		if err := s.checkHostCapacityBefore(ctx, vm.HostName, cpuDelta, memDelta, id); err != nil {
+			return err
 		}
+		if !delegated {
+			return s.checkProjectQuotaBefore(ctx, vm.Project, corrosion.QuotaAmount{VCPU: cpuDelta, MemMiB: memDelta}, id)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !delegated {
 		return lease, nil
 	}
 

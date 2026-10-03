@@ -579,8 +579,8 @@ roll, a host is still on the previous release — most often one in
 
 ### Host state moves to its own row after the roll
 
-A host's state (`active`, `draining`, `maintenance`, `upgrading`, `offline`,
-`fenced`) and its isolation epoch used to live only in the `hosts` row, beside
+A host's state (`joining`, `active`, `draining`, `maintenance`, `upgrading`,
+`offline`, `fenced`) and its isolation epoch used to live only in the `hosts` row, beside
 the version, schema and resources the host reports about itself. That row has
 one `updated_at`, and replication applies a write only if it is newer than the
 row, so a state change and a concurrent version report could lose each other:

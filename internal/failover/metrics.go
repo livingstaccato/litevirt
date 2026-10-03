@@ -129,6 +129,9 @@ const (
 	// in progress and no fence had run for it, so the coordinator fenced it
 	// afresh rather than leaving it terminal with nothing to fence it.
 	ErrConfirmationFence = "confirmation_fence"
+	// ErrJoining: quorum agreed a host failed, but it is a host `lv host add`
+	// admitted whose daemon has not started yet, so it is not fenced.
+	ErrJoining = "joining"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

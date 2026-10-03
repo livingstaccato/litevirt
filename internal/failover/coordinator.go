@@ -733,6 +733,19 @@ func (c *Coordinator) run(ctx context.Context) {
 		if h == nil {
 			continue // unknown host (e.g. raced delete) — quiet skip
 		}
+		// A host `lv host add` has admitted and whose daemon has not yet
+		// started is down to every observer by construction: nothing listens
+		// there until its setup finishes. It runs nothing and holds nothing
+		// (no placement targets it), so there is nothing to fence it for, and
+		// fencing it powers the machine off part-way through its setup — the
+		// add then hangs (kvm003 drill 6, finding B6). Its first boot records
+		// it 'active', and from then on it is fenced like any host. Not cached:
+		// the boot write can land on any cycle.
+		if h.State == corrosion.HostStateJoining {
+			slog.Info("failover: target is still joining (its daemon has not started), skipping fence", "host", target)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
+			continue
+		}
 		if !afresh && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host is normally finished with — the fence ran and its
 			// recovery ran with it. But the two halves can land on different

@@ -165,6 +165,9 @@ type Coordinator struct {
 	// one that moved VMs (value=true) must wait for a manual `undrain` to avoid
 	// split-brain. Absent key ⇒ we can't prove it's safe ⇒ stays manual.
 	fenceRelocated map[string]bool
+	// skipAudited is the failover.skip state last audited per host and
+	// workload (auditSkip).
+	skipAudited map[string]string
 	// confirmResumed records, per host, the operator confirmation a recovery
 	// was already resumed from in this process, so one confirmation resumes one
 	// recovery rather than one per cycle. Losing it on restart costs at most one
@@ -2512,7 +2515,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		if vmUsesFirmwareState(vm) {
 			slog.Warn("failover: skipping Secure Boot / vTPM VM — firmware state was host-local and died with the host; restore from backup",
 				"vm", vm.Name, "host", h.Name)
-			c.audit(ctx, "failover.skip", vm.Name, "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with "+h.Name+")", "skipped")
+			c.auditSkip(ctx, h.Name, vm.Name, "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with "+h.Name+")", "skipped")
 			c.mVM(ActionReschedule, ResultSkipped, ErrFirmwareState)
 			continue
 		}
@@ -2535,7 +2538,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				"vm", vm.Name, "condition", code)
 			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
 			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
-			c.audit(ctx, "failover.skip", vm.Name, "active ownership condition "+code+" — automated recovery refused", "refused")
+			c.auditSkip(ctx, h.Name, vm.Name, "active ownership condition "+code+" — automated recovery refused", "refused")
 			continue
 		}
 
@@ -2693,7 +2696,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			for i := range plans {
 				if plans[i].needsPlacement {
 					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
-					c.audit(ctx, "failover.skip", plans[i].vm.Name, "batch placement failed after fencing "+h.Name+": "+err.Error(), "error")
+					c.auditSkip(ctx, h.Name, plans[i].vm.Name, "batch placement failed after fencing "+h.Name+": "+err.Error(), "error")
 				}
 			}
 			plans = plans[:0]
@@ -2718,7 +2721,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
 					"vm", vm.Name, "from", h.Name, "reason", result.Err)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
-				c.audit(ctx, "failover.skip", vm.Name, detail, "skipped")
+				c.auditSkip(ctx, h.Name, vm.Name, detail, "skipped")
 				continue
 			}
 			p.targetName = result.Host

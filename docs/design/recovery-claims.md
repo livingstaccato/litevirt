@@ -1027,6 +1027,19 @@ It runs against one survivor, which drives the rest.
 Before running, it prints the plan: survivors, lost hosts, their fence evidence,
 and the number of keys it will import. The operator confirms it.
 
+**Recovering the lost hosts' workloads.** Precondition 1 can usually be met
+only by `lv host fence-confirm`, run before anything has fenced the lost hosts
+for this outage: no fence quorum can form while a majority of `g` is gone.
+That confirmation records each host `fenced`, and a host recorded terminal is
+never a fence candidate. Once `g+1` is adopted, the survivors' coordinator
+therefore fences each lost host afresh, on the strength of a confirmation made
+during the outage it is still in, and recovers from that fence under every gate
+an ordinary fence applies (docs/migration-failover.md, "A confirmation before
+any fence of this outage fences the host afresh"). The confirmation authorises
+the fence, not the recovery. Before this, nothing fenced them, and the recovery
+waited for `lv host undrain` and a fresh fence five minutes later (drill 6 on
+main-8d1e56dc).
+
 **Adopting a forced row.** A receiver adopts a `force:` row only if the
 survivors' signatures are unanimous over its members, members plus lost hosts
 equal `g`, the members are fewer than a majority of `g`, and the receiver itself

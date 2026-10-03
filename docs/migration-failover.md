@@ -422,11 +422,37 @@ confirmation, and resumes once you confirm again.
 hostname could otherwise authorise a recovery. With all three required, a
 mistype can only reach a host the cluster already fenced and still sees down.
 
-**Confirm after the fence, not before.** A confirmation written before the
-coordinator has fenced the host is not newer than any fence, so it resumes
-nothing — and while it is under 5 minutes old it also makes the coordinator
-treat the host as already fenced. Wait for the refusal in the coordinator log,
-then confirm.
+**A confirmation before any fence of this outage fences the host afresh.**
+`fence-confirm` records the host `fenced`, and a host recorded terminal is not
+fenced by the coordinator. A confirmation written before the cluster fenced
+the host for the outage in progress therefore used to leave it where nothing
+would ever fence or recover it. That order is not a mistake you can always
+avoid: `lv cluster voter force-reconfigure` requires a confirmation of every
+lost host, and with a majority of the voters gone no fence quorum can form to
+fence them first. Now, when all of these hold:
+
+- the host is `fenced` or `offline` (never `maintenance`) and a fresh quorum
+  observes it down;
+- no fence attempt is at or after the confirmation, and no earlier attempt
+  belongs to this outage;
+- the confirmation belongs to this outage: some observer has probed the host
+  and failed without a break since at least 5 seconds before it,
+
+the coordinator fences the host itself, as it would an `active` one, and logs
+"an operator confirmed this host off during the outage in progress, and no
+fence has run for it; fencing it afresh" (`phase=recovery,
+error_class=confirmation_fence`). The confirmation authorises that fence, not
+the recovery: the recovery follows from the fresh fence under every gate a
+fence applies, and where one of them needs a confirmation (`manual`,
+`best-effort` under the safe-fence policy, the confirmation label) it accepts
+one under 5 minutes old. An older one leaves the host `offline` after the fence
+with the usual refusal in the log; confirm again and the recovery resumes from
+it. A confirmation older than the outage, of a host that has answered since,
+still authorises nothing, and the coordinator logs "the newest fence attempt
+and the confirmation both predate this outage".
+
+Outside that flow, **confirm after the fence, not before**: wait for the refusal
+in the coordinator log, then confirm.
 
 **The failover leader resumes it.** Every coordinator reads the same
 `fencing_log`, but only the one holding the failover lease acts on it. The check
@@ -651,7 +677,8 @@ Scrape `http://<host>:7444/metrics` for:
   `owner_reachable`, `source_mismatch` and `superseded`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `refence_failed`, `confirmation_resumed`, `local_stall`,
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `refence_failed`, `confirmation_resumed`,
+  `confirmation_fence` (a host confirmed off during this outage, fenced afresh), `local_stall`,
   `partition_pause_wait` (recovery waiting out a partitioned host's pause, design/partition-pause.md),
   `quorum_regain` (a fence deferred because this node itself regained the voter majority moments ago),
   and under region-scoped failover `region_too_small` / `region_scoped` — see

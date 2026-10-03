@@ -125,6 +125,10 @@ const (
 	// ErrQuorumRegain: quorum agreed a host failed, but this coordinator was
 	// itself cut off from the majority within health.QuorumRegainGrace.
 	ErrQuorumRegain = "quorum_regain"
+	// ErrConfirmationFence: an operator confirmed a host off during the outage
+	// in progress and no fence had run for it, so the coordinator fenced it
+	// afresh rather than leaving it terminal with nothing to fence it.
+	ErrConfirmationFence = "confirmation_fence"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.

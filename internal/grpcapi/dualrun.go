@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -55,10 +55,7 @@ const dualRunPeerTimeout = 5 * time.Second
 // container list would fail "lxc-ls: executable not found"; that is NOT a coverage blind
 // spot (containers can't run here), so the detector skips the CT probe entirely rather
 // than marking the snapshot partial. It's a var so tests can stub it.
-var lxcCapable = func() bool {
-	_, err := exec.LookPath("lxc-create")
-	return err == nil
-}
+var lxcCapable = lxc.Available
 
 // migrationStates are DB workload states in which the DB owner legitimately differs from
 // the sole runtime holder — the OWNER-MISMATCH cutover-lag window (the DB row is mid-move

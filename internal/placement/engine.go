@@ -202,10 +202,26 @@ type HostRejection struct {
 type NoEligibleHostError struct {
 	VMName     string
 	Rejections []HostRejection
+	// NoContainerRuntime: the request is a container and no active host has
+	// a container runtime at all, so no amount of capacity would place it.
+	NoContainerRuntime bool
+}
+
+// ErrNoContainerRuntime marks a container placement refused because no active
+// host has a container runtime — a NoEligibleHostError a caller can tell apart
+// from a capacity shortfall, which may clear on its own.
+var ErrNoContainerRuntime = errors.New("no active host has a container runtime")
+
+// Is reports ErrNoContainerRuntime for a refusal that was for that reason.
+func (e *NoEligibleHostError) Is(target error) bool {
+	return target == ErrNoContainerRuntime && e.NoContainerRuntime
 }
 
 func (e *NoEligibleHostError) Error() string {
 	msg := fmt.Sprintf("no eligible host for VM %q", e.VMName)
+	if e.NoContainerRuntime {
+		msg = fmt.Sprintf("no eligible host for container %q: %v", e.VMName, ErrNoContainerRuntime)
+	}
 	if len(e.Rejections) == 0 {
 		return msg
 	}
@@ -379,6 +395,9 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 
 	var candidates []hostCandidate
 	var rejections []HostRejection
+	// anyContainerRuntime: some active host could run a container, whatever
+	// else refused it.
+	anyContainerRuntime := false
 	for _, h := range snap.HostsBy {
 		// A host that cannot take workloads at all gets that one reason: the
 		// resource figures of a draining host or a witness are beside the point.
@@ -454,6 +473,22 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 		// Hard: required labels.
 		if len(req.RequireLabels) > 0 && !labelsMatch(h.Labels, req.RequireLabels) {
 			failed = append(failed, "labels (needs "+missingLabels(h.Labels, req.RequireLabels)+")")
+		}
+
+		// Hard: a container needs a container runtime. Every daemon records
+		// whether its host has one in the litevirt.lxc label when it starts
+		// (lxc.Available); "false" is a host that cannot run a container, and a
+		// container placed there retries "lxc-create not found" forever. A
+		// host with no label at all (a build that predates it) is not refused
+		// on it. A request that already requires the label names it above.
+		if req.Container {
+			if h.Labels[corrosion.LabelLXCCapable] == "false" {
+				if _, required := req.RequireLabels[corrosion.LabelLXCCapable]; !required {
+					failed = append(failed, "no container runtime ("+corrosion.LabelLXCCapable+"=false)")
+				}
+			} else {
+				anyContainerRuntime = true
+			}
 		}
 
 		// Hard: device requirements.
@@ -532,7 +567,8 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 	}
 
 	if len(candidates) == 0 {
-		return nil, &NoEligibleHostError{VMName: req.VMName, Rejections: rejections}
+		return nil, &NoEligibleHostError{VMName: req.VMName, Rejections: rejections,
+			NoContainerRuntime: req.Container && !anyContainerRuntime}
 	}
 
 	// Sort by score descending; ties by fewest VMs then name (stable).

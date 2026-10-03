@@ -1239,7 +1239,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// probe for lxc-create. SetHostLabel is a no-op when unchanged, so this is
 	// cheap to re-assert every start.
 	lxcCapable := "false"
-	if _, lerr := exec.LookPath("lxc-create"); lerr == nil {
+	if lxc.Available() {
 		lxcCapable = "true"
 	}
 	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelLXCCapable, lxcCapable); err != nil {

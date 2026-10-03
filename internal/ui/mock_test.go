@@ -1014,8 +1014,8 @@ func (m *mockGRPC) RemoveLB(context.Context, *pb.RemoveLBRequest, ...grpc.CallOp
 func (m *mockGRPC) EnsureCloudInit(context.Context, *pb.EnsureCloudInitRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
-func (m *mockGRPC) EnsureDisks(context.Context, *pb.EnsureDisksRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
-	return &emptypb.Empty{}, nil
+func (m *mockGRPC) EnsureDisks(context.Context, *pb.EnsureDisksRequest, ...grpc.CallOption) (*pb.EnsureDisksResponse, error) {
+	return &pb.EnsureDisksResponse{}, nil
 }
 func (m *mockGRPC) CleanupMigrationArtifacts(context.Context, *pb.CleanupMigrationArtifactsRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil

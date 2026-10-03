@@ -1475,9 +1475,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 						fmt.Sprintf("disk %s not found and image auto-pull failed: %v", d.DiskName, pullErr))
 					return
 				}
-				// Recreate overlay disk from pulled image.
+				// Recreate overlay disk from pulled image, at the disk's
+				// recorded size: left empty, the overlay inherits the backing
+				// image's virtual size (a 20 GiB root came back at 112 MiB).
+				// A row with no recorded size still inherits it.
 				imgStore := image.NewStore(r.dataDir)
-				newPath, createErr := imgStore.CreateOverlayDisk(vm.Name, d.DiskName, d.BackingImage, "")
+				size := ""
+				if d.SizeBytes > 0 {
+					size = strconv.FormatInt(d.SizeBytes, 10)
+				}
+				newPath, createErr := imgStore.CreateOverlayDisk(vm.Name, d.DiskName, d.BackingImage, size)
 				if createErr != nil {
 					slog.Error("reconciler: recreate overlay failed", "vm", vm.Name, "error", createErr)
 					r.failPendingStart(ctx, vm.Name, proofID, true, // transient: retry the overlay build

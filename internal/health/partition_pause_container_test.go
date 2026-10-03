@@ -3,6 +3,8 @@ package health
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os/exec"
 	"sort"
 	"sync"
 	"testing"
@@ -253,5 +255,58 @@ func TestPartitionPause_VMsAndContainersShareThePassBudget(t *testing.T) {
 	f.tick()
 	if took := time.Since(start); took > PartitionPauseExecBudget+time.Second/2 {
 		t.Fatalf("the pause pass took %v with VMs and containers; E is %v", took, PartitionPauseExecBudget)
+	}
+}
+
+// noLXC is the runtime the daemon wires on a host without the lxc-* tooling:
+// the adapter is always wired, and every list fails at the binary lookup.
+type noLXC struct{ lxc.Runtime }
+
+func (noLXC) List(context.Context) ([]string, error) {
+	return nil, fmt.Errorf("lxc-ls: %w", &exec.Error{Name: "lxc-ls", Err: exec.ErrNotFound})
+}
+
+// A host with no container runtime has no containers to pause, so a pass that
+// paused its VMs succeeded: no partition_pause_failed, and no self-fence with a
+// verified watchdog armed. On an LXC-capable host the same listing failure is
+// still a failed pass, and an armed watchdog still fences (drills D1 and blip
+// on main-8d1e56dc: every pass on node-1/2/3/5 failed on "lxc-ls not found").
+//
+// Mutations: drop the capability check (count every list failure) — the
+// "no LXC" subtest goes red on the condition and the fence; skip a list
+// failure whatever the capability — the "LXC capable" subtest goes red.
+func TestPartitionPause_HostWithoutLXCPausesItsVMsCleanly(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		capable   bool
+		wantFail  bool
+		wantFence bool
+	}{
+		{"no LXC", false, false, false},
+		{"LXC capable", true, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPauseFixture(t)
+			f.p.SetContainerRuntime(noLXC{})
+			capable := tc.capable
+			f.p.SetContainerCapable(func() bool { return capable })
+			f.p.SetSelfFence(func() bool { return true }, func() { f.mu.Lock(); f.fenced++; f.mu.Unlock() })
+			f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
+
+			if st := f.raw("vm-ha"); st != libvirtfake.StatePaused {
+				t.Fatalf("vm-ha is %v after T_pause of lost quorum, want paused", st)
+			}
+			c, ok := f.condition(corrosion.CondPartitionPauseFailed)
+			failed := ok && c.Lifecycle != corrosion.ConditionResolved
+			if failed != tc.wantFail {
+				t.Fatalf("partition_pause_failed open = %v, want %v (evidence %q)", failed, tc.wantFail, c.Evidence)
+			}
+			f.mu.Lock()
+			fenced := f.fenced > 0
+			f.mu.Unlock()
+			if fenced != tc.wantFence {
+				t.Fatalf("self-fenced = %v, want %v", fenced, tc.wantFence)
+			}
+		})
 	}
 }

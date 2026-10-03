@@ -3029,6 +3029,9 @@ func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.Cont
 		RequireRegion: c.containerRecoveryRegion(ct.HostName),
 	})
 	if err != nil {
+		if c.skippedNoContainerRuntime(ctx, ct, err) {
+			return ""
+		}
 		slog.Warn("failover: container placement failed — left for operator recovery, NOT round-robined",
 			"container", ct.Name, "error", err)
 		return ""

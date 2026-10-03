@@ -543,6 +543,38 @@ func (s *Server) noteForcedConflict(gen int64, detail string) {
 	s.forced.byGe[gen] = detail
 }
 
+// lostVoterGone reports nil once the lost voter l of prev, the generation a
+// forced one replaced, is gone for good: removed and revoked
+// (RemovedHostEvidence), or the name now answers as another incarnation. The
+// lost voter is the member ENTRY, name and incarnation (§10 item 38), so a
+// machine rebuilt under l's name after `lv host rm --dead` — a live hosts row
+// again, the old serial gone with the tombstone AdmitHost replaced — is a
+// later machine whose empty state.db never voted, not the lost voter come
+// back. A name that cannot say which incarnation it is keeps it raised.
+func (s *Server) lostVoterGone(ctx context.Context, prev *corrosion.VoterConfig, l string) error {
+	removed := corrosion.RemovedHostEvidence(ctx, s.db, s.pkiDir, l)
+	if removed == nil {
+		return nil
+	}
+	lost, ok := prev.Member(l)
+	if !ok || lost.Incarnation == "" {
+		return removed
+	}
+	// A fenced row is the lost machine's own, never removed: nothing to ask,
+	// and a dead host is not dialled on every tick.
+	if h, err := corrosion.GetHost(ctx, s.db, l); err != nil || h == nil || h.State == "fenced" {
+		return removed
+	}
+	inc, err := s.remoteIncarnation(ctx, l, prev.Generation)
+	if err != nil {
+		return fmt.Errorf("%w; it did not say which incarnation it is: %v", removed, err)
+	}
+	if inc == lost.Incarnation {
+		return removed
+	}
+	return nil
+}
+
 // applyVoterConditions raises ha.voter.forced (§4.6 step 5) while any lost
 // host of an adopted forced generation is still a member host or not yet
 // revoked, and for any forced generation this node refused to adopt.
@@ -561,8 +593,9 @@ func (s *Server) applyVoterConditions(ctx context.Context) {
 		if r.Generation > adopted || !corrosion.IsForcedChange(r.Change) {
 			continue
 		}
+		prev, _ := corrosion.GetVoterConfig(ctx, s.db, r.Generation-1)
 		for _, l := range corrosion.ForcedLost(r.Change) {
-			if err := corrosion.RemovedHostEvidence(ctx, s.db, s.pkiDir, l); err != nil {
+			if err := s.lostVoterGone(ctx, prev, l); err != nil {
 				lines[l] = fmt.Sprintf("forced generation %d dropped %s's vote; until %s is removed and revoked "+
 					"(`lv host rm --dead %s`) it must not come back as it left: %v", r.Generation, l, l, l, err)
 				hosts = append(hosts, l)

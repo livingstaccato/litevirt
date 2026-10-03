@@ -168,3 +168,102 @@ func TestCommitMigrationOwnership_Idempotent(t *testing.T) {
 		t.Error("idempotent retry returned committed=false; want true (already on target)")
 	}
 }
+
+// TestFinalizeMigrationOwnership_DeclinedCommitMovesTheVMRow: the cutover has
+// happened and the commit declines on disk drift. The guest runs on the
+// target, so the VM row must say so; a row left `migrating` on the source is
+// one nothing heals (owner-assert skips `migrating`). The drifted disk row is
+// left as it is and the error still surfaces.
+//
+// Mutation: drop the RepointMigratedVM fallback — the row stays on the source,
+// `migrating`.
+func TestFinalizeMigrationOwnership_DeclinedCommitMovesTheVMRow(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	const vmName = "mig-declined"
+	insertTestVM(t, ctx, s.db, vmName, s.hostName, "migrating")
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: vmName, DiskName: "root", HostName: s.hostName, Path: "/pool/a.qcow2", StorageType: "nfs",
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, vmName)
+	if err := s.db.Execute(ctx,
+		`UPDATE vm_disks SET path = '/pool/b.qcow2' WHERE vm_name = ? AND disk_name = 'root'`, vmName); err != nil {
+		t.Fatalf("mutate disk: %v", err)
+	}
+	vm, _ := corrosion.GetVM(ctx, s.db, vmName)
+
+	if err := s.finalizeMigrationOwnership(ctx, vm, "target-host", false, disks); err == nil {
+		t.Fatal("finalizeMigrationOwnership returned nil on a declined commit; want the failure surfaced")
+	}
+	got, _ := corrosion.GetVM(ctx, s.db, vmName)
+	if got.HostName != "target-host" || got.State != "running" {
+		t.Fatalf("after a declined commit the VM row is %s/%s; want target-host/running, where the guest runs",
+			got.HostName, got.State)
+	}
+	if after, _ := corrosion.GetVMDisks(ctx, s.db, vmName); len(after) != 1 || after[0].HostName != s.hostName {
+		t.Fatalf("the drifted disk row was rewritten: %+v", after)
+	}
+}
+
+// TestFinalizeMigrationOwnership_DeclinedCommitLeavesAMovedRowAlone: the
+// fallback moves only a row still on the source in `migrating`. One that has
+// moved since (to a third host) is not overwritten.
+func TestFinalizeMigrationOwnership_DeclinedCommitLeavesAMovedRowAlone(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	const vmName = "mig-moved"
+	insertTestVM(t, ctx, s.db, vmName, s.hostName, "migrating")
+	vm, _ := corrosion.GetVM(ctx, s.db, vmName)
+	if err := corrosion.UpdateVMHost(ctx, s.db, vmName, "third-host", "running"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.finalizeMigrationOwnership(ctx, vm, "target-host", false, nil); err == nil {
+		t.Fatal("want the declined commit surfaced")
+	}
+	if got, _ := corrosion.GetVM(ctx, s.db, vmName); got.HostName != "third-host" {
+		t.Fatalf("the fallback overwrote a row that had moved to third-host: %+v", got)
+	}
+}
+
+// TestCommitMigrationOwnership_ADiskRowLeftOnAnotherHostCommits: a disk row
+// still naming a host the VM left (failover before disk rows moved with it)
+// is not drift when it is unchanged since the snapshot. It commits, and moves.
+// One that moved to yet another host after the snapshot is still drift.
+//
+// Mutation: restore the source-or-target-only host check — the unchanged row
+// declines.
+func TestCommitMigrationOwnership_ADiskRowLeftOnAnotherHostCommits(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	const vmName = "mig-stale-disk"
+	insertTestVM(t, ctx, s.db, vmName, s.hostName, "running")
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: vmName, DiskName: "root", HostName: "failed-host", Path: "/pool/a.qcow2", StorageType: "nfs",
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, vmName)
+
+	if err := s.db.Execute(ctx,
+		`UPDATE vm_disks SET host_name = 'elsewhere' WHERE vm_name = ? AND disk_name = 'root'`, vmName); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := corrosion.CommitMigrationOwnership(ctx, s.db, vmName, s.hostName, "target-host", "running", disks); err != nil || ok {
+		t.Fatalf("a disk row moved since the snapshot: ok=%v err=%v, want a decline", ok, err)
+	}
+	if err := s.db.Execute(ctx,
+		`UPDATE vm_disks SET host_name = 'failed-host' WHERE vm_name = ? AND disk_name = 'root'`, vmName); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := corrosion.CommitMigrationOwnership(ctx, s.db, vmName, s.hostName, "target-host", "running", disks); err != nil || !ok {
+		t.Fatalf("a disk row unchanged since the snapshot: ok=%v err=%v, want a commit", ok, err)
+	}
+	if after, _ := corrosion.GetVMDisks(ctx, s.db, vmName); len(after) != 1 || after[0].HostName != "target-host" {
+		t.Fatalf("disk row not moved to the target: %+v", after)
+	}
+}

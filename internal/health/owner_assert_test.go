@@ -78,6 +78,30 @@ func TestOwnerAssert_AllAbsentReclaims(t *testing.T) {
 	}
 }
 
+// The reclaim moves the VM's disk rows with it: this host is the one using
+// them. Mutation: route the re-key back through TransferVMOwner — the disk
+// row still names node-b.
+func TestOwnerAssert_ReclaimMovesTheDiskRows(t *testing.T) {
+	ctx := context.Background()
+	r, db, _, clock, _ := ownerAssertFixture(t)
+	if err := corrosion.InsertDisk(ctx, db, corrosion.DiskRecord{
+		VMName: "vm1", DiskName: "root", HostName: "node-b", Path: "/pool/vm1.qcow2", StorageType: "nfs",
+	}); err != nil {
+		t.Fatalf("InsertDisk: %v", err)
+	}
+	r.SetPeerRuntimeChecker(func(_ context.Context, _, _ string) (string, error) { return RuntimeAbsent, nil })
+	r.assertRuntimeOwnership(ctx)
+	*clock = clock.Add(ownershipAssertDebounce + time.Minute)
+	r.assertRuntimeOwnership(ctx)
+	if ownerOf(t, db, "vm1") != "node-a" {
+		t.Fatalf("must reclaim ownership to node-a, got %s", ownerOf(t, db, "vm1"))
+	}
+	disks, err := corrosion.GetVMDisks(ctx, db, "vm1")
+	if err != nil || len(disks) != 1 || disks[0].HostName != "node-a" {
+		t.Fatalf("after the reclaim the disk rows are %+v (%v); want them on node-a", disks, err)
+	}
+}
+
 // Another host reports RUNNING → true split-brain → never reclaim; alert only.
 func TestOwnerAssert_SplitBrainRefuses(t *testing.T) {
 	ctx := context.Background()

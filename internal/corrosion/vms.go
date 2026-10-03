@@ -967,6 +967,53 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 	return nil
 }
 
+// TransferVMOwnerWithDisks is TransferVMOwner that moves the VM's disk rows to
+// hostName in the same guarded batch. It is for the repairs that re-key a VM
+// to the host proven to run it (repair-owner, owner-assert): that host uses the
+// disks, so a disk row naming any other host is stale.
+func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64) error {
+	disks, err := GetVMDisks(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	stmts := []Statement{{
+		SQL: `UPDATE vms
+		      SET host_name = ?, state = ?, state_detail = '',
+		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{hostName, state, now, name, expectedEpoch},
+	}}
+	for _, d := range disks {
+		if d.HostName == hostName {
+			continue
+		}
+		stmts = append(stmts, Statement{
+			SQL:    vmDiskHostMoveSQL,
+			Params: []interface{}{hostName, now, name, d.DiskName},
+		})
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var epoch int64
+		if err := tx.QueryRow(
+			`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name,
+		).Scan(&epoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		return epoch == expectedEpoch, nil
+	}, stmts)
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
 // TransferVMOwnerFresh is TransferVMOwner for completion-style sites that do
 // not carry a decision-time epoch: it reads the row and CASes on what it just
 // read. The CAS still matters — between the read and the write a concurrent
@@ -1401,8 +1448,7 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 	}}
 	for _, d := range expected {
 		stmts = append(stmts, Statement{
-			SQL: `UPDATE vm_disks SET host_name = ?, updated_at = ?
-			      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+			SQL:    vmDiskHostMoveSQL,
 			Params: []interface{}{targetHost, now, vmName, d.DiskName},
 		})
 	}
@@ -1432,9 +1478,17 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 			case err != nil:
 				return false, err
 			}
-			// host is allowed to be source (normal) or target (half-committed retry);
+			// host is allowed to be source (normal), target (half-committed
+			// retry), or the host the row named when the snapshot was taken.
+			// The last is a row left behind by a move that re-keyed only the
+			// VM: failover before it moved disk rows, or repair-owner. pp3 on
+			// the kvm003 lab (main-b3368d7c) still named its failed host, so
+			// this guard refused the commit AFTER the irreversible cutover and
+			// left the guest on the target with its row `migrating` on the
+			// source. A row unchanged since the snapshot is not drift; one
+			// that moved anywhere else since is, and is still refused.
 			// path/type/volume must be exactly what we captured before cutover.
-			if (host != sourceHost && host != targetHost) ||
+			if (host != sourceHost && host != targetHost && host != d.HostName) ||
 				path != d.Path || stype != d.StorageType || svol != d.StorageVolume {
 				return false, nil // drift → decline
 			}
@@ -1451,6 +1505,60 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 	}
 
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// vmDiskHostMoveSQL repoints one disk row at a host. Every site that moves a
+// VM between hosts emits it for each of the VM's disks in the same batch as
+// the VM row: a disk row naming a host the VM left breaks the next migration's
+// ownership commit and the per-host disk accounting.
+const vmDiskHostMoveSQL = `UPDATE vm_disks SET host_name = ?, updated_at = ?
+			      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`
+
+// RepointMigratedVM moves the VM row of a migration that has cut over to
+// targetHost when CommitMigrationOwnership declined: the guest runs on the
+// target whatever the disk rows say, and a row left `migrating` on the source
+// is one nothing heals (owner-assert skips `migrating`). It writes only while
+// the row is still on sourceHost in state `migrating`, so it never overrides a
+// move made since. The disk rows are left as they are; the caller reports
+// them. committed=false when the row is no longer the migration's.
+func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string) (bool, error) {
+	now := c.NowTS()
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var host, state string
+		switch err := tx.QueryRowContext(ctx, `SELECT host_name, state FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).
+			Scan(&host, &state); {
+		case errors.Is(err, sql.ErrNoRows):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+		return host == sourceHost && state == "migrating", nil
+	}, []Statement{{
+		SQL:    vmHostStateSQL,
+		Params: []interface{}{targetHost, finalState, now, vmName},
+	}})
+}
+
+// RescheduleVMHost re-keys a VM to hostName in state, with its disk rows, in
+// one batch. It is the failover coordinator's reschedule write before
+// split_brain_gate_v1 is enforced (WriteVMRescheduleProof is the gated one).
+func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
+	disks, err := GetVMDisks(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{hostName, state, now, name}}}
+	for _, d := range disks {
+		if d.HostName == hostName {
+			continue
+		}
+		stmts = append(stmts, Statement{
+			SQL:    vmDiskHostMoveSQL,
+			Params: []interface{}{hostName, now, name, d.DiskName},
+		})
+	}
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // UpdateDiskSize updates the size_bytes for a disk.

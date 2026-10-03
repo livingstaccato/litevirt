@@ -109,11 +109,35 @@ func (p ProofRecord) Terminal() bool {
 // pending transition (host_name, state='pending', pending_action_id) in ONE
 // batch, so the proof is linked to that exact pending transition — never matched
 // by a weak tuple. Used by the failover coordinator at the decide site.
+//
+// The VM's disk rows move to destHost in the same batch. Failover used to
+// re-key only the VM row, so a recovered VM's disks went on naming the failed
+// host, and the next migration of that VM cut over and then failed its
+// ownership commit (pp3 on the kvm003 lab, main-b3368d7c).
 func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost string) error {
 	if err := proofStampEmittable(c, p); err != nil {
 		return err
 	}
+	disks, err := GetVMDisks(ctx, c, vmName)
+	if err != nil {
+		return err
+	}
 	now := c.NowTS()
+	stmts := []Statement{
+		proofInsertStmt(c, p, now),
+		{SQL: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
+		        WHERE name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{destHost, p.ID, now, vmName}},
+	}
+	for _, d := range disks {
+		if d.HostName == destHost {
+			continue
+		}
+		stmts = append(stmts, Statement{
+			SQL:    vmDiskHostMoveSQL,
+			Params: []interface{}{destHost, now, vmName, d.DiskName},
+		})
+	}
 	// Guard: only mint the proof + stamp the pending link if the VM row still
 	// exists (not deleted) AND no DIFFERENT proof already carries this id — so
 	// we never leave an orphan proof for a vanished VM or (astronomically) point
@@ -160,12 +184,7 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 			return false, err
 		}
 		return ProofBindingEqual(existing, p) && existing.DestHost == destHost, nil
-	}, []Statement{
-		proofInsertStmt(c, p, now),
-		{SQL: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
-		        WHERE name = ? AND deleted_at IS NULL`,
-			Params: []interface{}{destHost, p.ID, now, vmName}},
-	})
+	}, stmts)
 	if err != nil {
 		return err
 	}

@@ -162,8 +162,10 @@ func httpStatusFor(err error) int {
 // rpcWriteFailed reports a refused or failed RPC to the browser: a toast
 // naming what failed and why, and the status httpStatusFor derives from the
 // gRPC code. Handlers use it instead of a hard-coded 500, so a Viewer's refused
-// delete arrives as 403 and a bad form as 400, not as a server fault
-// (TestNoUIHandlerAnswersRPCErrorWith500 holds every handler to this).
+// delete arrives as 403 and a bad form as 400, not as a server fault or a 200
+// (TestNoUIHandlerAnswersRPCErrorWith500 and ...With200 hold every handler to
+// this). htmx fires the HX-Trigger toast whatever the status, and does not swap
+// a 4xx/5xx body into the target, so the reason still reaches the user.
 func rpcWriteFailed(w http.ResponseWriter, what string, err error) {
 	sendToast(w, what+" failed: "+err.Error(), "error")
 	w.WriteHeader(httpStatusFor(err))

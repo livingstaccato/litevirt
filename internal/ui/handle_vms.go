@@ -372,8 +372,7 @@ func (s *Server) handleDeleteVM(w http.ResponseWriter, r *http.Request) {
 		// e.g. the linked-clone refcount guard or an RBAC denial — surface it
 		// instead of falsely reporting success and redirecting away.
 		slog.Error("UI: delete VM failed", "name", name, "error", err)
-		sendToast(w, "Delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusOK)
+		rpcWriteFailed(w, "Delete", err)
 		return
 	}
 	sendToast(w, "VM '"+name+"' deleted", "success")

@@ -34,7 +34,7 @@ var namedModes = map[string]struct {
 	"ha-critical": {
 		Policy: "spread-strict",
 		Rebalance: RebalanceDef{
-			Mode:      "on-demand",
+			Mode:      "dry-run",
 			Threshold: 10,
 			Cooldown:  "30m",
 		},
@@ -116,11 +116,8 @@ func ValidatePlacement(p *PlacementDef) (warnings, errors []string) {
 	default:
 		errors = append(errors, "placement.policy must be one of: balance, bin-pack, spread-strict, cost-aware")
 	}
-	switch mode {
-	case "", "off", "dry-run", "on-demand", "auto":
-		// ok
-	default:
-		errors = append(errors, "placement.rebalance.mode must be one of: off, dry-run, on-demand, auto")
+	if msg := rebalanceModeProblem(mode); msg != "" {
+		errors = append(errors, msg)
 	}
 	if policy == "bin-pack" && mode == "auto" {
 		warnings = append(warnings,
@@ -131,6 +128,24 @@ func ValidatePlacement(p *PlacementDef) (warnings, errors []string) {
 			"placement.mode "+p.Mode+" is not a known named mode (try: performance, savings, ha-critical, spot-cheap)")
 	}
 	return warnings, errors
+}
+
+// rebalanceModeProblem returns the user-facing error for an invalid
+// placement.rebalance.mode, or "" when mode is valid (empty inherits).
+//
+// on-demand was removed because it behaved exactly like dry-run: both only
+// record proposals that wait for `lv rebalance approve`. It is rejected by
+// name, with the replacement, rather than aliased. Stored specs that still
+// carry it are read as dry-run by the rebalancer (scheduler.Mode handling).
+func rebalanceModeProblem(mode string) string {
+	switch mode {
+	case "", "off", "dry-run", "auto":
+		return ""
+	case "on-demand":
+		return "placement.rebalance.mode on-demand was removed; use dry-run, which behaves identically (proposals wait for lv rebalance approve)"
+	default:
+		return "placement.rebalance.mode must be one of: off, dry-run, auto"
+	}
 }
 
 // ResolveClusterPlacementDefault returns the cluster-wide placement default

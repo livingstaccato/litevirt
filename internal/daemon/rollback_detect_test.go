@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // A node that latched a capability token and is then rolled back to a binary
@@ -90,6 +91,35 @@ func TestPreflightCapabilityRollback_OverrideLetsAnOperatorRecover(t *testing.T)
 
 	if got := preflightCapabilityRollback(dir); len(got) != 0 {
 		t.Fatalf("preflightCapabilityRollback = %v with the override set", got)
+	}
+}
+
+// TestPreflightCapabilityRollback_RetiredTokenIsNotARollback: canonical_registry_v1
+// shipped in v1.4.0 behind enforcement.canonical_registry and was retired on
+// 2026-10-04, before anything wrote the shape it gated. A cluster that opted in
+// still holds its durable marker. This build no longer advertises, latches or
+// enforces the token, but it must still RECOGNISE the marker: an unknown marker
+// reads as "a newer binary ran here", so a node upgrading onto this build would
+// start in WAL quarantine and emit nothing — an upgrade mistaken for a rollback.
+//
+// The literal is deliberate. The test pins the on-disk name an older binary
+// wrote, which renaming a Go identifier must not change.
+func TestPreflightCapabilityRollback_RetiredTokenIsNotARollback(t *testing.T) {
+	dir := t.TempDir()
+	const retired = "canonical_registry_v1"
+	if err := os.WriteFile(health.ActivationMarkerPath(dir, retired), []byte("1\n"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	if got := preflightCapabilityRollback(dir); len(got) != 0 {
+		t.Fatalf("preflightCapabilityRollback = %v on a node holding the durable marker of the "+
+			"retired %s; it would start in WAL quarantine on an UPGRADE", got, retired)
+	}
+
+	// A retired marker must not hide a genuine rollback beside it.
+	writeMarker(t, dir, "some_future_token_v9")
+	if got := preflightCapabilityRollback(dir); len(got) != 1 || got[0] != "some_future_token_v9" {
+		t.Fatalf("preflightCapabilityRollback = %v, want [some_future_token_v9]", got)
 	}
 }
 

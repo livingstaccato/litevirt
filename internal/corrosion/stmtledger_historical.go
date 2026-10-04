@@ -62,6 +62,7 @@ var historicalLedger = map[string]LedgerEntry{
 	"stmtshape/v1:4eae5e4cf6690e05819507f1b64856e4dfb0caac7821b84b78217e96313006a0": {Fingerprint: "stmtshape/v1:4eae5e4cf6690e05819507f1b64856e4dfb0caac7821b84b78217e96313006a0", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:505dfea7fd731f049377a2c62b40ccf87773d18e4cfb6d4420c31822297754da": {Fingerprint: "stmtshape/v1:505dfea7fd731f049377a2c62b40ccf87773d18e4cfb6d4420c31822297754da", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:5238bdef0b907dbfa8e37d158556c7c25ebbf36b978ba2065445163d5fe6142f": {Fingerprint: "stmtshape/v1:5238bdef0b907dbfa8e37d158556c7c25ebbf36b978ba2065445163d5fe6142f", Kind: "update", Table: "quota_reservations", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
+	"stmtshape/v1:539724cbc75799ed794e9e453c79f569487de8ea611f5198bcc7f42b196446a9": {Fingerprint: "stmtshape/v1:539724cbc75799ed794e9e453c79f569487de8ea611f5198bcc7f42b196446a9", Kind: "update", Table: "registry_credentials", Disposition: DispFullPKUpdate, FirstEmitter: "v1.4.0 (builder present, never called)", LastEmitter: "v1.9.0 (builder present, never called)", RemovalHorizon: "any time: no build emits it (the removal still needs ALLOW_LEDGER_REMOVAL)"},
 	"stmtshape/v1:53af9dbd3525909a35f27b04408c53b8a0164e50d517bd43d2926e3f9ab150b3": {Fingerprint: "stmtshape/v1:53af9dbd3525909a35f27b04408c53b8a0164e50d517bd43d2926e3f9ab150b3", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:53eabf6e17e45e78b35f044fe18a4b4cd1e1d0bb62f5d0319d69998286c48450": {Fingerprint: "stmtshape/v1:53eabf6e17e45e78b35f044fe18a4b4cd1e1d0bb62f5d0319d69998286c48450", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:54166c9bd4296eb61d28a2f4591c1bb9a00f7b2035a1f3a25c6484e08e4d2bfc": {Fingerprint: "stmtshape/v1:54166c9bd4296eb61d28a2f4591c1bb9a00f7b2035a1f3a25c6484e08e4d2bfc", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
@@ -165,6 +166,7 @@ var historicalLedger = map[string]LedgerEntry{
 	"stmtshape/v1:f978f6e5de7f85be71c99383dd2f25e67c561144a862c36e637fe29a223a70e1": {Fingerprint: "stmtshape/v1:f978f6e5de7f85be71c99383dd2f25e67c561144a862c36e637fe29a223a70e1", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:fa67b4da1d3b3ab0b971b71f24abbe62c5ab6aa8e586ce95b790e04d8b2076d4": {Fingerprint: "stmtshape/v1:fa67b4da1d3b3ab0b971b71f24abbe62c5ab6aa8e586ce95b790e04d8b2076d4", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
 	"stmtshape/v1:faf25314fac39e362b0c752d587f19202f7097c47f8ae5fd5cc5149d6a572d45": {Fingerprint: "stmtshape/v1:faf25314fac39e362b0c752d587f19202f7097c47f8ae5fd5cc5149d6a572d45", Kind: "update", Table: "hosts", Disposition: DispFullPKUpdate, FirstEmitter: "v1.3.0", RemovalHorizon: "after v1.3.0 unsupported"},
+	"stmtshape/v1:ff423050ee813fc45fc5db8b07752c32c16dedd32d78727fdefdedabe162da19": {Fingerprint: "stmtshape/v1:ff423050ee813fc45fc5db8b07752c32c16dedd32d78727fdefdedabe162da19", Kind: "insert", Table: "registry_credentials", Disposition: DispReject, FirstEmitter: "v1.4.0 (builder present, never called)", LastEmitter: "v1.9.0 (builder present, never called)", RemovalHorizon: "any time: no build emits it (the removal still needs ALLOW_LEDGER_REMOVAL)"},
 }
 
 // historicalPolicies groups each historical shape family's expansion fingerprints, so the
@@ -175,6 +177,10 @@ var historicalPolicies = map[string][]string{
 	},
 	"audit_reseal_v44": {
 		"stmtshape/v1:7d83b774cb13f512920e194c425c39a108dc1b294fcaaacd02ea7529c47813a9",
+	},
+	"canonical_registry_v1_retired": {
+		"stmtshape/v1:539724cbc75799ed794e9e453c79f569487de8ea611f5198bcc7f42b196446a9",
+		"stmtshape/v1:ff423050ee813fc45fc5db8b07752c32c16dedd32d78727fdefdedabe162da19",
 	},
 	"claim_project_authority_v41": {
 		"stmtshape/v1:7078dfa31836fa1fa8de4c700c1455ff672795b298374877fb8232bfb4641262",

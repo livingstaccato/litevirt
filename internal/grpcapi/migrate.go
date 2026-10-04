@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -1140,7 +1141,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 // EnsureFirmwareState materializes a Secure-Boot/vTPM VM's firmware-state bundle
 // (NVRAM + swtpm) pushed by a cold-migration source, so libvirt can define the
 // domain here with its BitLocker-binding state intact (G1). Mirrors EnsureDisks.
-func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmwareStateRequest) (*emptypb.Empty, error) {
+func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmwareStateRequest) (*pb.EnsureFirmwareStateResponse, error) {
 	if req.VmName == "" || len(req.Bundle) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "vm_name and a non-empty firmware bundle are required")
 	}
@@ -1164,6 +1165,10 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 	if !validRestoreName(req.VmName) || (req.Uuid != "" && !validRestoreName(req.Uuid)) {
 		return nil, status.Error(codes.InvalidArgument, "invalid vm_name or uuid")
 	}
+	// Held until the domain is defined and recorded, so a concurrent
+	// RollbackFirmwareState cannot wipe the firmware materialized below.
+	s.firmwareTargets.op.Lock()
+	defer s.firmwareTargets.op.Unlock()
 	if s.virt != nil && s.virt.DomainExists(req.VmName) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"refusing to materialize firmware over already-defined domain %q", req.VmName)
@@ -1176,6 +1181,7 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 	// reassigned-stopped VM is otherwise undefined on this host, and StartDomain /
 	// the reconciler won't rebuild it). DefineDomain does NOT start it — the VM
 	// stays stopped as intended (G1).
+	resp := &pb.EnsureFirmwareStateResponse{}
 	if req.DomainXml != "" && s.virt != nil {
 		// The XML embeds the SOURCE's absolute firmware paths (loader / VARS
 		// template / NVRAM). It's only portable to a host with an identical layout,
@@ -1198,9 +1204,15 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 			lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
 			return nil, status.Errorf(codes.Internal, "define migrated domain %q: %v", req.VmName, err)
 		}
+		// This call materialized the firmware and defined the domain: record
+		// them as the attempt's, the only thing its rollback may remove, and
+		// say so to the source.
+		s.firmwareTargets.add(req.VmName, req.AttemptId, req.Uuid)
+		resp.DomainDefined = true
 	}
-	slog.Info("firmware state received for migration", "vm", req.VmName, "bytes", len(req.Bundle), "defined", req.DomainXml != "")
-	return &emptypb.Empty{}, nil
+	slog.Info("firmware state received for migration", "vm", req.VmName, "bytes", len(req.Bundle),
+		"defined", resp.DomainDefined, "attempt", req.AttemptId)
+	return resp, nil
 }
 
 // ensureFirmwareStateOnTarget captures this host's firmware-state bundle for a
@@ -1208,33 +1220,44 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 // libvirt migrate, so the target defines the domain with the BitLocker-binding
 // state present. Unlike disks, this is NOT best-effort — a firmware VM that
 // migrates without its state would boot a fresh TPM, so a failure aborts (G1).
-func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML string) error {
+//
+// It reports what the call left on the target, for the rollback of a failure
+// before the handoff commits (abandonFirmwareTarget). attempt names this
+// migration attempt to the target, which records the domain it defines under it.
+func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vmName string, fs firmwareSpec, domainXML, attempt string) (firmwareTargetOutcome, error) {
 	// Per-component preflight: never push a PARTIAL bundle (WriteFirmwareBundle
 	// alone would accept NVRAM-only or swtpm-only) — that restores a fresh TPM.
 	if err := s.firmwarePresent(vmName, fs); err != nil {
-		return err
+		return fwTargetUntouched, err
 	}
 	var buf bytes.Buffer
 	has, err := lv.WriteFirmwareBundle(s.dataDir, vmName, fs.UUID, &buf)
 	if err != nil {
-		return status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
+		return fwTargetUntouched, status.Errorf(codes.Internal, "capture firmware state for %q: %v", vmName, err)
 	}
 	if !has {
-		return status.Errorf(codes.FailedPrecondition,
+		return fwTargetUntouched, status.Errorf(codes.FailedPrecondition,
 			"firmware state for %q is not present on this host; cannot migrate it consistently", vmName)
 	}
-	client, conn, err := s.peerClient(ctx, targetHost)
+	client, closeConn, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
-		return status.Errorf(codes.Unavailable, "cannot reach target host %s to push firmware: %v", targetHost, err)
+		return fwTargetUntouched, status.Errorf(codes.Unavailable, "cannot reach target host %s to push firmware: %v", targetHost, err)
 	}
-	defer conn.Close()
-	if _, err := client.EnsureFirmwareState(ctx, &pb.EnsureFirmwareStateRequest{
+	defer closeConn()
+	resp, err := client.EnsureFirmwareState(ctx, &pb.EnsureFirmwareStateRequest{
 		VmName: vmName, Uuid: fs.UUID, Bundle: buf.Bytes(), DomainXml: domainXML,
 		SourceFirmwareFingerprint: s.firmwareLayoutFingerprint(),
-	}); err != nil {
-		return status.Errorf(codes.Internal, "push firmware state to %s: %v", targetHost, err)
+		AttemptId:                 attempt,
+	})
+	if err != nil {
+		// The target may have defined the domain before the call failed: a
+		// cancelled request loses the answer, not the define.
+		return fwTargetUnknown, status.Errorf(codes.Internal, "push firmware state to %s: %v", targetHost, err)
 	}
-	return nil
+	if !resp.GetDomainDefined() {
+		return fwTargetUnreported, nil
+	}
+	return fwTargetDefined, nil
 }
 
 // coldMigrateFirmwareVM moves a STOPPED Secure-Boot/vTPM VM to targetHost WITHOUT
@@ -1284,12 +1307,19 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 	// Push the quiescent firmware to the target AND define the domain there (the
 	// handler materializes firmware then DefineDomain — shut off, not started).
 	// Per-component preflight is inside. Source is untouched on failure.
-	if err := s.ensureFirmwareStateOnTarget(ctx, targetHost.Name, vm.Name, fwSpec, domXML); err != nil {
-		return err
+	//
+	// Any failure from here until the handoff commits — a cancelled request
+	// included — rolls back what THIS attempt created on the target, and only
+	// that: the target records the domain it defines under attempt, and
+	// leaves a domain it found there (abandonFirmwareTarget).
+	attempt := uuid.NewString()
+	outcome, err := s.ensureFirmwareStateOnTarget(ctx, targetHost.Name, vm.Name, fwSpec, domXML, attempt)
+	if err != nil {
+		return s.abandonFirmwareTarget(ctx, targetHost.Name, vm.Name, fwSpec.UUID, attempt, outcome, err)
 	}
 
-	if err := s.handOffColdFirmwareVM(ctx, vm, targetHost, fwSpec); err != nil {
-		return err
+	if err := s.handOffColdFirmwareVM(ctx, vm, targetHost); err != nil {
+		return s.abandonFirmwareTarget(ctx, targetHost.Name, vm.Name, fwSpec.UUID, attempt, outcome, err)
 	}
 	// The handoff is committed: the target owns the VM. What follows is cleanup
 	// and bookkeeping for a migration that has happened, so it must not die with
@@ -1333,8 +1363,8 @@ const coldFirmwareHandoffTimeout = 30 * time.Second
 // the VM and every one of its disk records move to targetHost in ONE guarded
 // transaction (corrosion.TransferVMOwnerWithDisks), which CASes on the VM's
 // owner epoch, advances it once, and keeps the VM's (stopped) state. On failure
-// the target's firmware and domain are torn down and the source still owns the
-// VM and all of its disks.
+// the source still owns the VM and all of its disks, and the caller rolls back
+// what the attempt created on the target (abandonFirmwareTarget).
 //
 // It used to commit each disk record, then the VM row, as separate writes,
 // rolling them back one by one on the request context. A client that went away
@@ -1347,9 +1377,8 @@ const coldFirmwareHandoffTimeout = 30 * time.Second
 // coldFirmwareHandoffTimeout: once it starts, it and the cleanup that follows
 // it are one unit, not something a disconnecting client can cut in half. A
 // request already cancelled before that point aborts instead.
-func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMRecord, targetHost *corrosion.HostRecord, fwSpec firmwareSpec) error {
+func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMRecord, targetHost *corrosion.HostRecord) error {
 	if err := ctx.Err(); err != nil {
-		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
 		return status.FromContextError(err).Err()
 	}
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldFirmwareHandoffTimeout)
@@ -1368,29 +1397,9 @@ func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 		err = corrosion.TransferVMOwnerWithDisks(cctx, s.db, vm.Name, targetHost.Name, vm.State, cur.OwnerEpoch)
 	}
 	if err != nil {
-		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
 		return status.Errorf(codes.Internal, "reassign VM %q and its disks to %s: %v", vm.Name, targetHost.Name, err)
 	}
 	return nil
-}
-
-// rollbackFirmwareTarget best-effort tears down the firmware + defined domain a
-// failed cold firmware migration left on the target (undefine + wipe), so the
-// target isn't left with an orphan and a retry is clean (G1).
-func (s *Server) rollbackFirmwareTarget(targetHost, vmName, uuid string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	client, conn, err := s.peerClient(ctx, targetHost)
-	if err != nil {
-		slog.Warn("rollbackFirmwareTarget: cannot reach target", "host", targetHost, "vm", vmName, "error", err)
-		return
-	}
-	defer conn.Close()
-	if _, err := client.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
-		VmName: vmName, FirmwareUuid: uuid, UndefineDomain: true,
-	}); err != nil {
-		slog.Warn("rollbackFirmwareTarget: cleanup failed", "host", targetHost, "vm", vmName, "error", err)
-	}
 }
 
 // CleanupMigrationArtifacts removes the stub disks + cloud-init ISO that this

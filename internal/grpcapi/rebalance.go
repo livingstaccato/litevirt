@@ -127,12 +127,17 @@ func proposalFromRow(r corrosion.Row) *pb.RebalanceProposal {
 // RunRebalance triggers a single rebalance evaluation cycle. Without this
 // RPC the rebalancer only fires every PollInterval; this lets operators
 // (and the UI) request immediate evaluation.
+//
+// dry_run records every proposal as pending whatever each VM's mode is. It
+// used to be ignored, so a dry run auto-approved mode=auto VMs and the
+// rebalance executor then live-migrated them.
 func (s *Server) RunRebalance(ctx context.Context, req *pb.RunRebalanceRequest) (*pb.RunRebalanceResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
 	r := scheduler.NewRebalancer(s.hostName, s.db)
 	r.SetCapacityPolicy(s.capacity)
+	r.ForceDryRun = req.GetDryRun()
 	before := s.countProposals(ctx)
 	if err := r.RunOnce(ctx); err != nil {
 		return nil, status.Errorf(codes.Internal, "run rebalance: %v", err)

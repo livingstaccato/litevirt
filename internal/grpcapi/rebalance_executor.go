@@ -21,7 +21,7 @@ import (
 //
 // Safe by construction:
 //   - Acts ONLY on `approved` rows. Auto-approval stays opt-in per VM policy
-//     (placement.rebalance.mode=auto); dry-run/on-demand proposals require an
+//     (placement.rebalance.mode=auto); dry-run proposals require an
 //     explicit operator `lv rebalance approve`.
 //   - Leader-gated on the SAME lease as the proposing loop, so exactly one node
 //     executes.

@@ -86,3 +86,35 @@ func TestNetBoxMirrorV1Registered(t *testing.T) {
 		t.Fatalf("All() = %v, want it to contain %q", All(), NetBoxMirrorV1)
 	}
 }
+
+// TestCanonicalRegistryV1Retired pins the retirement of the first canonical
+// registry-credential token. It is neither advertised (Supported) nor known as a
+// live token (All, which the checker walks to load latches), so no node latches
+// or enforces it again. It IS retired, so the rollback preflight still
+// recognises the marker a cluster that latched it holds.
+func TestCanonicalRegistryV1Retired(t *testing.T) {
+	const tok = "canonical_registry_v1"
+	if RetiredCanonicalRegistryV1 != tok {
+		t.Fatalf("RetiredCanonicalRegistryV1 = %q, want %q: the on-disk marker name is frozen",
+			RetiredCanonicalRegistryV1, tok)
+	}
+	if slices.Contains(Supported(), tok) {
+		t.Errorf("Supported() advertises the retired %s", tok)
+	}
+	if slices.Contains(All(), tok) {
+		t.Errorf("All() lists the retired %s, so the checker would load its marker as a live latch", tok)
+	}
+	if !Retired(tok) || !slices.Contains(RetiredTokens(), tok) {
+		t.Errorf("%s is not retired, so its marker would WAL-quarantine an upgraded node", tok)
+	}
+}
+
+// TestRetiredTokensAreDisjointFromAll: a token is live or retired, never both.
+// One in both sets would be loaded as a latch AND reported as ignored.
+func TestRetiredTokensAreDisjointFromAll(t *testing.T) {
+	for _, tok := range RetiredTokens() {
+		if slices.Contains(All(), tok) {
+			t.Errorf("%s is both retired and in All()", tok)
+		}
+	}
+}

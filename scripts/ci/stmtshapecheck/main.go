@@ -232,7 +232,6 @@ var dispIdent = map[corrosion.Disposition]string{
 	corrosion.DispWorkloadDelete:       "DispWorkloadDelete",
 	corrosion.DispLegacyWorkloadDelete: "DispLegacyWorkloadDelete",
 	corrosion.DispReject:               "DispReject",
-	corrosion.DispCanonicalRegistry:    "DispCanonicalRegistry",
 	corrosion.DispGuardedReplace:       "DispGuardedReplace",
 	corrosion.DispLiveRowUpdate:        "DispLiveRowUpdate",
 	corrosion.DispHostReadmit:          "DispHostReadmit",

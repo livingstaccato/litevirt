@@ -288,13 +288,6 @@ type Server struct {
 	// identity resolution mutates shared state, so it requires config uniformity, not
 	// just a uniform build.
 	enfCanonicalIdentity bool
-	// enfCanonicalRegistry gates ADVERTISEMENT of canonical_registry_v1 (Part H2): the token is
-	// advertised only while this flag is set (like operation_protocol), so it can latch only once
-	// every node has opted in (config uniformity — accepting canonical writes mutates shared state).
-	// It is advertisement-only: acceptance keys off the DURABLE latch, not this flag, and there is no
-	// migration controller or post-latch acceptance switch. Flag-off stops advertising; it does not
-	// revoke an already-formed latch.
-	enfCanonicalRegistry bool
 	// enfVMReplace gates ADVERTISEMENT of vm_replace_v1 and, with the latch, whether
 	// `lv cutover` may run at all. The guarded replace transition installs receiver
 	// semantics an older peer does not have, so the latch must require CONFIG
@@ -570,6 +563,12 @@ type Server struct {
 	// a failed attempt (migrate_stubs.go). Zero value ready.
 	migrationStubs migrationStubLedger
 
+	// firmwareTargets is what EnsureFirmwareState defined on this host as a
+	// cold firmware migration target, by attempt: the only domains
+	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value
+	// ready.
+	firmwareTargets firmwareTargetLedger
+
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
 	vmLocksMu sync.Mutex
@@ -836,9 +835,6 @@ func (s *Server) advertisedCapabilities() []string {
 	// flag is off keeps the cluster from latching until every node has opted in.
 	if !s.enfCanonicalIdentity {
 		caps = withoutCapability(caps, capabilities.CanonicalIdentityV1)
-	}
-	if !s.enfCanonicalRegistry {
-		caps = withoutCapability(caps, capabilities.CanonicalRegistryV1)
 	}
 	// vm_replace_v1 is likewise conditional on its flag. The guarded replace batch
 	// carries a protocol an un-upgraded receiver cannot evaluate, so emitting it to a
@@ -1199,11 +1195,6 @@ func (s *Server) migrationTLSReady() bool {
 // CanonicalIdentityV1 cluster-wide latch; advertisement is withheld while it is off.
 func (s *Server) SetCanonicalIdentityEnforce(on bool) { s.enfCanonicalIdentity = on }
 
-// SetCanonicalRegistryEnforce sets this node's kill-switch for the canonical registry-credential
-// model (enforcement.canonical_registry). Advertisement is withheld while it is off, so the latch
-// (and thus acceptance of canonical writes) can't happen until every node has opted in.
-func (s *Server) SetCanonicalRegistryEnforce(on bool) { s.enfCanonicalRegistry = on }
-
 // SetProjectAuthorityEnforce sets this node's kill-switch for delegated project-quota
 // admission (enforcement.project_authority). Enforcement is this flag AND the
 // ProjectAuthorityV1 cluster-wide latch; advertisement is withheld while it is off.
@@ -1327,8 +1318,6 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfLiveResize
 	case capabilities.CanonicalIdentityV1:
 		return s.enfCanonicalIdentity
-	case capabilities.CanonicalRegistryV1:
-		return s.enfCanonicalRegistry
 	case capabilities.ProjectAuthorityV1:
 		return s.enfProjectAuthority
 	case capabilities.AuditSignatureV1:

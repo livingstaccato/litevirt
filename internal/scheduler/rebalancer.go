@@ -39,11 +39,17 @@ const (
 type Mode string
 
 const (
-	ModeOff      Mode = "off"
-	ModeDryRun   Mode = "dry-run"
-	ModeOnDemand Mode = "on-demand"
-	ModeAuto     Mode = "auto"
+	ModeOff Mode = "off"
+	// ModeDryRun records proposals that wait for `lv rebalance approve`.
+	ModeDryRun Mode = "dry-run"
+	ModeAuto   Mode = "auto"
 )
+
+// legacyModeOnDemand is a removed mode that behaved exactly like dry-run.
+// Compose rejects it, but a vms.spec written before the removal, or by an
+// older node during a rolling upgrade (its ha-critical preset still expands
+// to it), can carry it. It is read as ModeDryRun. Not an accepted input.
+const legacyModeOnDemand Mode = "on-demand"
 
 // vmPolicy is the rebalancer's view of one VM's resolved placement+rebalance.
 // We extract this once per cycle (parsing JSON from vms.spec) and use it for
@@ -88,6 +94,13 @@ type Rebalancer struct {
 
 	// Lease handle: rebalancer must hold this lease to act.
 	LeaseKey string
+
+	// ForceDryRun records every proposal as pending, whatever each VM's
+	// resolved mode is: a VM in mode=auto is proposed but not approved, so the
+	// rebalance executor has nothing to move. It is what `lv rebalance run
+	// --dry-run` and the UI's Dry-run button ask for (RunRebalanceRequest.
+	// dry_run). It only withholds approval; a VM in mode=off is still skipped.
+	ForceDryRun bool
 
 	// leaseTerm is the fencing term of the lease incarnation this rebalancer
 	// LAST OBSERVED itself holding, 0 when it held none. Phase 1 records it;
@@ -178,7 +191,7 @@ func (r *Rebalancer) RunOnce(ctx context.Context) error {
 			slog.Warn("rebalancer: record proposal", "vm", p.VMName, "error", err)
 			continue
 		}
-		if p.Mode == ModeAuto {
+		if r.autoApproves(p) {
 			// Auto-mode is a placeholder for the actual migration trigger.
 			// We mark the row "approved" so the migration controller picks
 			// it up; budget gating inside that controller does the real work.
@@ -188,6 +201,12 @@ func (r *Rebalancer) RunOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// autoApproves reports whether p is approved as it is recorded, rather than
+// left pending for `lv rebalance approve`. A forced dry run approves nothing.
+func (r *Rebalancer) autoApproves(p Proposal) bool {
+	return p.Mode == ModeAuto && !r.ForceDryRun
 }
 
 // Proposal is one suggested live-migration produced by RunOnce.
@@ -486,7 +505,9 @@ func resolveVMPolicyFromSpec(spec *pb.VMSpec) vmPolicy {
 		}
 		pol.NoMigrate = p.NoMigrate
 		if rb := p.Rebalance; rb != nil {
-			if m := Mode(rb.Mode); m != "" {
+			if m := Mode(rb.Mode); m == legacyModeOnDemand {
+				pol.Mode = ModeDryRun
+			} else if m != "" {
 				pol.Mode = m
 			}
 			if rb.Threshold > 0 {

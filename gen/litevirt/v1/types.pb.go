@@ -1148,7 +1148,7 @@ func (x *PlacementSpec) GetNoMigrate() bool {
 // RebalanceSpec: day-2 reconciliation policy. See docs/placement.md.
 type RebalanceSpec struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Mode          string                 `protobuf:"bytes,1,opt,name=mode,proto3" json:"mode,omitempty"`            // off | dry-run | on-demand | auto
+	Mode          string                 `protobuf:"bytes,1,opt,name=mode,proto3" json:"mode,omitempty"`            // off | dry-run | auto
 	Threshold     int32                  `protobuf:"varint,2,opt,name=threshold,proto3" json:"threshold,omitempty"` // min imbalance % to trigger a proposal (default 15)
 	Cooldown      string                 `protobuf:"bytes,3,opt,name=cooldown,proto3" json:"cooldown,omitempty"`    // "5m" — min interval per VM
 	Budget        *RebalanceBudget       `protobuf:"bytes,4,opt,name=budget,proto3" json:"budget,omitempty"`

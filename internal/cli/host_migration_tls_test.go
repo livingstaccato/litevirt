@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -112,5 +115,72 @@ func TestInstallMigrationTLS_RefusesASecondMigrationCA(t *testing.T) {
 		[]MigrationTLSHost{held, &fakeMigrationHost{name: "node-2", address: "10.0.0.2"}}, false, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "node-1") {
 		t.Fatalf("err = %v; want a refusal naming node-1, which already holds credentials", err)
+	}
+}
+
+// writeRotation lays out an operator machine mid-rotation in pkiDir.
+func writeRotation(t *testing.T, pkiDir, phase string, noOverlap bool) (oldFP, newFP string) {
+	t.Helper()
+	if err := pki.GenerateMigrationCA(filepath.Join(pkiDir, pki.MigrationCACertName), filepath.Join(pkiDir, pki.MigrationCAKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := pki.GenerateMigrationCA(filepath.Join(pkiDir, nextCACertName), filepath.Join(pkiDir, nextCAKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	oldPEM, _ := os.ReadFile(filepath.Join(pkiDir, pki.MigrationCACertName))
+	newPEM, _ := os.ReadFile(filepath.Join(pkiDir, nextCACertName))
+	if err := os.WriteFile(filepath.Join(pkiDir, bundleCACertName), append(oldPEM, newPEM...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldFP, _ = pki.CAFileFingerprint(filepath.Join(pkiDir, pki.MigrationCACertName))
+	newFP, _ = pki.CAFileFingerprint(filepath.Join(pkiDir, nextCACertName))
+	if err := (&migrationRotation{Phase: phase, NoOverlap: noOverlap, NewCAFingerprint: newFP}).save(pkiDir); err != nil {
+		t.Fatal(err)
+	}
+	return oldFP, newFP
+}
+
+// A host added mid-rotation is never left on the old CA.
+//
+// Mutation: make migrationIssuingCA ignore the rotation — the certificate
+// comes from the old CA.
+func TestIssueMigrationCredentials_MidRotationIssuesFromTheNewCA(t *testing.T) {
+	for _, tc := range []struct {
+		phase     string
+		noOverlap bool
+		trusts    int
+	}{{phaseTrustBoth, false, 2}, {phaseReissue, false, 2}, {phaseDropOld, false, 1}, {phaseCutover, true, 1}} {
+		t.Run(tc.phase, func(t *testing.T) {
+			pkiDir := t.TempDir()
+			_, newFP := writeRotation(t, pkiDir, tc.phase, tc.noOverlap)
+			files, err := issueMigrationCredentials(pkiDir, "node-9", net.ParseIP("10.0.0.9"), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hostDir := filepath.Join(t.TempDir(), "pki")
+			for _, f := range files {
+				data, _ := os.ReadFile(f.local)
+				dst := filepath.Join(pki.MigrationDir(hostDir), filepath.Base(f.remote))
+				os.MkdirAll(filepath.Dir(dst), 0o700)
+				os.WriteFile(dst, data, f.mode)
+			}
+			info, err := pki.InspectMigrationTLS(hostDir, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.CertIssuerFingerprint != newFP || len(info.TrustedCAs) != tc.trusts || info.ValidationError != "" {
+				t.Fatalf("info = %+v; want issuer %s, %d trusted CAs, valid", info, newFP, tc.trusts)
+			}
+		})
+	}
+}
+
+// Mutation: drop the in-progress check — the reissue mints from the old CA.
+func TestInstallMigrationTLS_RefusesDuringARotation(t *testing.T) {
+	pkiDir := t.TempDir()
+	writeRotation(t, pkiDir, phaseReissue, false)
+	err := InstallMigrationTLS(context.Background(), pkiDir, nil, true, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "rotate-migration-ca") {
+		t.Fatalf("err = %v; want a refusal naming rotate-migration-ca", err)
 	}
 }

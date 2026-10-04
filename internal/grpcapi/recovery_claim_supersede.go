@@ -303,6 +303,8 @@ func (s *Server) PlanDeadHostRemoval(ctx context.Context, req *pb.PlanDeadHostRe
 	} else if ok {
 		resp.Fenced = true
 		resp.FenceDetail = fmt.Sprintf("%s %s at %s (fencing_log %s)", fr.Method, fr.Result, fr.Timestamp, fr.ID)
+	} else {
+		resp.FenceDetail = s.fenceLifeNote(ctx, name)
 	}
 	if h.State == "active" {
 		// A host the cluster believes is up is not dead, whatever an old fence
@@ -333,11 +335,37 @@ func (s *Server) deadRemovalRefusal(ctx context.Context, h *corrosion.HostRecord
 	if _, ok, err := corrosion.HostProofGradeFence(ctx, s.db, h.Name); err != nil {
 		return status.Errorf(codes.Unavailable, "read fencing_log: %v", err)
 	} else if !ok {
+		note := ""
+		if n := s.fenceLifeNote(ctx, h.Name); n != "" {
+			note = "; " + n
+		}
 		return status.Errorf(codes.FailedPrecondition,
-			"%s has no proof-grade fence (an IPMI power-off, or `lv host fence-confirm %s` once it is powered off); "+
-				"--dead removes only a host proven off", h.Name, h.Name)
+			"%s has no proof-grade fence (an IPMI power-off, or `lv host fence-confirm %s` once it is powered off)%s; "+
+				"--dead removes only a host proven off", h.Name, h.Name, note)
 	}
 	return nil
+}
+
+// fenceLifeNote says why a proof-grade fence on record does not count for
+// host: it is older than the host's current life (corrosion.HostFenceLife).
+// "" when there is no such fence.
+func (s *Server) fenceLifeNote(ctx context.Context, host string) string {
+	since, state, ok, err := corrosion.HostFenceLife(ctx, s.db, host)
+	if err != nil || !ok {
+		return ""
+	}
+	rows, err := s.db.Query(ctx, `SELECT method, result FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		return ""
+	}
+	for _, r := range rows {
+		if corrosion.FenceProofGrade(r.String("method"), r.String("result")) {
+			return fmt.Sprintf("its fence on record predates its current life (recorded %s since about %s), so it is about "+
+				"an earlier life of %s, such as a machine removed under its name, and does not count",
+				state, since.Format(time.RFC3339), host)
+		}
+	}
+	return ""
 }
 
 // ── ha.claim.stranded (§3.12, §5.4) ────────────────────────────────────────

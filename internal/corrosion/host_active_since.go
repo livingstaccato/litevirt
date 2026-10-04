@@ -58,3 +58,51 @@ func activeSince(r membershipRow) (time.Time, bool) {
 	}
 	return ParseUpdatedAt(r.memTS)
 }
+
+// fenceLifeSkew is how much older than the host's last membership change a
+// proof-grade fence row may be and still count (HostFenceLife). The row is
+// stamped with the fencer's wall clock to the second; the membership change
+// with the writer's HLC, which runs ahead of its wall clock by as much as the
+// furthest-ahead peer it has heard from. A fence and the state write beside it
+// are one event (`lv host fence` writes 'offline' and then the row), so
+// without a margin a peer a fraction of a second ahead could put the state
+// write in the next second and disown the fence. Five seconds is the skew the
+// upgrade preflight already refuses to call normal; any earlier life of the
+// host ended at least a removal and an admission, or a boot, before it.
+const fenceLifeSkew = 5 * time.Second
+
+// HostFenceLife is the instant before which a fencing_log row of host says
+// nothing about the host as it is now, with the membership state that sets
+// it. ok=false when there is none to judge by — no live hosts row, no
+// membership row, a node not reading host_membership yet, or a host recorded
+// 'fenced' — and every row then counts, as before.
+//
+// host_membership.updated_at moves only with a state or isolation write, so it
+// is when the host was last recorded as it is now: admitted under its name
+// ('joining'), booted ('active'), lost without a proof ('offline'), drained.
+// A fence row older than that is about an earlier life of the host — on the
+// kvm003 lab (drill 6) the old node-5's confirmation, still in fencing_log
+// when `lv host add` gave the name to a new machine, would have let
+// `lv host rm --dead` remove the new one as proven off.
+//
+// A host recorded 'fenced' is exempt: that write IS a fence of the host as it
+// is now (RecordFenceWithState, `lv host fence-confirm`), and its row stands
+// beside it whatever the two clocks say.
+func HostFenceLife(ctx context.Context, c *Client, host string) (since time.Time, state string, ok bool, err error) {
+	if !c.HostMembershipLive() {
+		return time.Time{}, "", false, nil
+	}
+	rows, err := scanMembership(ctx, c, ` WHERE h.name = ? AND h.deleted_at IS NULL`, host)
+	if err != nil || len(rows) == 0 {
+		return time.Time{}, "", false, err
+	}
+	r := rows[0]
+	if !r.memPresent || r.mem.State == "fenced" {
+		return time.Time{}, "", false, nil
+	}
+	at, ok := ParseUpdatedAt(r.memTS)
+	if !ok {
+		return time.Time{}, "", false, nil
+	}
+	return at.Add(-fenceLifeSkew).Truncate(time.Second), r.mem.State, true, nil
+}

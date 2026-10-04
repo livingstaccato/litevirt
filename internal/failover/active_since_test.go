@@ -53,3 +53,38 @@ func TestHostJustActiveIsCountedAfresh(t *testing.T) {
 		t.Fatalf("the host, counted down after it turned active, was fenced %d times, want 1", fences)
 	}
 }
+
+// A boot write that lands after a cycle counted a joining host's observers,
+// and before it read the host's state, must not let that count fence the host
+// now active: the cycle's snapshot of when hosts turned active does not have
+// it, so it waits for the next cycle.
+//
+// Mutation: return false from turnedActiveThisCycle — the first case passes
+// the host through.
+func TestTurnedActiveThisCycle(t *testing.T) {
+	db, ctx := seedDownHost(t, "ssh", nil)
+	liveMembership(t, db)
+	c := newTestCoordinator("coordinator", db)
+
+	if err := corrosion.UpdateHostState(ctx, db, "down", corrosion.HostStateJoining); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := corrosion.HostsActiveSince(ctx, db) // the cycle's read: down is joining
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.UpdateHostStartup(ctx, db, "down", "active", "", 0, 0, 0, false); err != nil {
+		t.Fatal(err) // the boot write lands mid-cycle
+	}
+	if !c.turnedActiveThisCycle(ctx, "down", snapshot) {
+		t.Error("a host that turned active after the cycle counted its observers was let through")
+	}
+
+	snapshot, err = corrosion.HostsActiveSince(ctx, db) // next cycle
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.turnedActiveThisCycle(ctx, "down", snapshot) {
+		t.Error("a host active since before the cycle's snapshot was held back")
+	}
+}

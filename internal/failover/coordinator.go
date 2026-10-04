@@ -760,6 +760,10 @@ func (c *Coordinator) run(ctx context.Context) {
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
 			continue
 		}
+		if aerr == nil && c.turnedActiveThisCycle(ctx, target, activeSince) {
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
+			continue
+		}
 		if !afresh && (h.State == "offline" || h.State == "maintenance" || h.State == "fenced") {
 			// A 'fenced' host is normally finished with — the fence ran and its
 			// recovery ran with it. But the two halves can land on different

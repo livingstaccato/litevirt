@@ -8,6 +8,23 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
+// turnedActiveThisCycle reports whether target turned active after this cycle
+// read when each host last turned active (snapshot), and so after it counted
+// target's observers. The fence quorum read the snapshot, then the host's state
+// is read again per candidate; a boot write landing between the two showed a
+// joining host's quorum, counted while it joined, against a host now active
+// (TestFleet_ReaddedHostIsNotFencedWhileItJoins under -race: fenced 23 ms
+// after its boot write). Such a host is judged again next cycle, on its
+// observations since.
+func (c *Coordinator) turnedActiveThisCycle(ctx context.Context, target string, snapshot map[string]time.Time) bool {
+	since, ok, err := corrosion.HostActiveSince(ctx, c.db, target)
+	if err != nil || !ok {
+		return false
+	}
+	prev, had := snapshot[target]
+	return !had || !prev.Equal(since)
+}
+
 // fenceRowCutoff is the instant before which a fencing_log row of host is
 // about an earlier life of the host: the moment it last turned active
 // (corrosion.HostActiveSince). ok=false when there is none to judge by — the

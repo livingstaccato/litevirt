@@ -80,6 +80,18 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "E2E: LITEVIRT_E2E=1 but LV_BIN is not set — point LV_BIN at the binary under test (e.g. ./bin/litevirt) so e2e never runs a stale system lv")
 		os.Exit(1)
 	}
+	// Lab mode drives the nested lab from the machine hosting it
+	// (lab_harness_test.go): LV_BIN names the binary on the NODES and every CLI
+	// call goes over SSH, so neither a local lv nor LV_HOST applies.
+	if labMode {
+		for _, f := range []string{"lab.sh", "cluster_key"} {
+			if _, err := os.Stat(labDir + "/" + f); err != nil {
+				fmt.Fprintf(os.Stderr, "E2E: E2E_LAB_DIR=%s has no %s\n", labDir, f)
+				os.Exit(1)
+			}
+		}
+		os.Exit(m.Run())
+	}
 	// Ensure the lv binary is available.
 	if _, err := exec.LookPath(lvBin); err != nil {
 		fmt.Fprintf(os.Stderr, "E2E: %s binary not found in PATH, skipping e2e tests\n", lvBin)
@@ -105,9 +117,19 @@ func lvEnv() []string {
 	return env
 }
 
+// requireNotLabMode skips a test that drives a local lv: in lab mode
+// (E2E_LAB_DIR) only the drills run, through lab_harness_test.go.
+func requireNotLabMode(t *testing.T) {
+	t.Helper()
+	if labMode {
+		t.Skip("lab mode (E2E_LAB_DIR) runs only the TestDrill* partition drills; unset it to run this test via LV_HOST or on a node")
+	}
+}
+
 // lv runs the CLI and returns stdout. Fails the test on non-zero exit.
 func lv(t *testing.T, args ...string) string {
 	t.Helper()
+	requireNotLabMode(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, lvBin, args...)
@@ -124,6 +146,7 @@ func lv(t *testing.T, args ...string) string {
 // lvErr runs the CLI and returns stdout + error. Does NOT fail on non-zero exit.
 func lvErr(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	requireNotLabMode(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, lvBin, args...)
@@ -141,6 +164,7 @@ func lvErr(t *testing.T, args ...string) (string, error) {
 // lvStdin runs the CLI with stdin piped. Fails on non-zero exit.
 func lvStdin(t *testing.T, stdin string, args ...string) string {
 	t.Helper()
+	requireNotLabMode(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, lvBin, args...)
@@ -158,6 +182,7 @@ func lvStdin(t *testing.T, stdin string, args ...string) string {
 // lvStdinErr runs the CLI with stdin piped. Does NOT fail on non-zero exit.
 func lvStdinErr(t *testing.T, stdin string, args ...string) (string, error) {
 	t.Helper()
+	requireNotLabMode(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, lvBin, args...)

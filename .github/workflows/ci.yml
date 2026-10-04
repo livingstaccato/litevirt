@@ -32,11 +32,21 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      # Unit tests + the in-process fleet integration suite. The tests/e2e and
-      # tests/cluster suites are intentionally excluded: they require a live
-      # multi-host cluster with PKI under /etc/litevirt and root privileges.
+      # Unit tests. The tests/e2e and tests/cluster suites are intentionally
+      # excluded: they require a live multi-host cluster with PKI under
+      # /etc/litevirt and root privileges.
       - name: Test
-        run: go test ./internal/... ./cmd/... ./tests/fleet/
+        run: go test ./internal/... ./cmd/...
+
+      # The in-process fleet integration suite, in its own step with its own
+      # budget. It outgrew Go's default 10-minute per-package timeout: a full
+      # run took 729s on a laptop (2026-10-04), and on the CI runner it was
+      # killed at 600s on every push to main, which made every run red and hid
+      # real failures behind a "panic: test timed out". 40m is the measured
+      # time with room for a slower runner. When it times out again, measure
+      # before raising it (CLAUDE.md).
+      - name: Fleet tests
+        run: go test -timeout 40m ./tests/fleet/
 
   # CI guardrails (see docs/upgrades.md → CI guardrails). Runs the `ci-guards`
   # make target rather than re-listing its steps here: this job previously

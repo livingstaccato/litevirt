@@ -115,3 +115,105 @@ func TestFleet_ReaddWaitsForTheRemovedHostsWorkloads(t *testing.T) {
 		t.Fatalf("admit %s once its workloads have moved: %v", d.Name, err)
 	}
 }
+
+// TestFleet_ReaddOfTheOnlyContainerHostIsNotADeadlock: d is the only host that
+// runs containers, and dies holding ct blct. It is confirmed off and removed
+// for good; the removed-host pass finds no host with a container runtime and
+// leaves blct recorded on d, relocate-skipped. `lv host add` of d's name is
+// refused, as for any workload still recorded on a removed host, and the
+// refusal names the way out that keeps the container: bring up a host that
+// can run it. One appears (e gains a container runtime: in the lab, the
+// rebuilt machine added under another name). The removed-host pass recovers
+// blct onto it by claim, e recreates it from its certified relocation proof,
+// it runs on exactly one host, and the name d can then be added back.
+//
+// On kvm003 (drill 6, main-e004c250) node-4 was the only LXC host. blct was
+// skipped for good, the refusal could never clear, and its only exit was to
+// delete the container.
+//
+// Mutation: keep a relocate-skipped container on a removed host terminal, as
+// it was (relocateContainers' skip) — blct is never recovered once e can
+// take it, stays recorded on d, and d's name stays refused.
+func TestFleet_ReaddOfTheOnlyContainerHostIsNotADeadlock(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 2607})
+	a, b, e, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
+	for _, n := range []*Node{a, b, e} {
+		if err := corrosion.SetHostLabel(ctx, a.DB, n.Name, corrosion.LabelLXCCapable, "false"); err != nil {
+			t.Fatalf("label %s: %v", n.Name, err)
+		}
+	}
+	putContainer(t, d, "blct", "docker.io/library/alpine:3.19", "image-recreate")
+	c.WaitConverged(t, convergeTimeout)
+	genesisByTick(t, c, a)
+	enableRecoveryClaims(t, c)
+
+	// d dies, is confirmed off and removed for good.
+	survivors := []*Node{a, b, e}
+	removeForGood(t, c, a, d, survivors...)
+
+	// No survivor runs containers: blct stays on d, relocate-skipped.
+	clock := NewVirtualClock(time.Now().UTC())
+	cs := c.NewCoordinators(clock)
+	cs.ByNode[a.Name].Gate = quorateGate{}
+	cs.Tick(ctx, a)
+	c.WaitConverged(t, convergeTimeout, survivors...)
+	if hosts := liveContainerHosts(t, a, "blct"); len(hosts) != 1 || hosts[0] != d.Name {
+		t.Fatalf("blct is live on %v with no container runtime left, want only %s", hosts, d.Name)
+	}
+	if ct, _ := corrosion.GetContainer(ctx, a.DB, d.Name, "blct"); ct == nil || ct.StateDetail != corrosion.ContainerRelocateSkippedDetail {
+		t.Fatalf("blct on %s: %+v, want it %s", d.Name, ct, corrosion.ContainerRelocateSkippedDetail)
+	}
+
+	// The add is refused while blct is recorded on d, and the refusal names
+	// the way out that keeps it.
+	admit := func() error {
+		_, err := c.SelfClient(a).AdmitHost(ctx, &pb.AdmitHostRequest{
+			Name: d.Name, Address: d.Address, CertSerial: "0a0b0c0d0e0f",
+		})
+		return err
+	}
+	err := admit()
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "ct/blct") ||
+		!strings.Contains(err.Error(), "a host that can take") {
+		t.Fatalf("admitting %s while blct is recorded on it: %v, want FailedPrecondition naming ct/blct and a host that can take it", d.Name, err)
+	}
+
+	// A host that can run containers comes up. The next removed-host pass
+	// recovers blct onto it by claim.
+	if err := corrosion.SetHostLabel(ctx, a.DB, e.Name, corrosion.LabelLXCCapable, "true"); err != nil {
+		t.Fatalf("label %s: %v", e.Name, err)
+	}
+	c.WaitConverged(t, convergeTimeout, survivors...)
+	cs.Tick(ctx, a)
+	c.WaitConverged(t, convergeTimeout, survivors...)
+	if hosts := liveContainerHosts(t, a, "blct"); len(hosts) != 1 || hosts[0] != e.Name {
+		t.Fatalf("blct is live on %v once %s can run it, want only %s", hosts, e.Name, e.Name)
+	}
+	moved, err := corrosion.GetContainer(ctx, a.DB, e.Name, "blct")
+	if err != nil || moved == nil || moved.RelocateToken == "" {
+		t.Fatalf("blct's row on %s: %+v %v, want a relocation under a token", e.Name, moved, err)
+	}
+	pr, ok, err := corrosion.GetActionProofByToken(ctx, a.DB, moved.RelocateToken)
+	if err != nil || !ok || pr.ClaimCertificate == "" {
+		t.Fatalf("blct's relocation proof: ok=%v err=%v %+v, want one carrying a claim certificate", ok, err, pr)
+	}
+	recreatedOn(t, c, e, "blct", survivors)
+	running := 0
+	for _, n := range survivors {
+		if n.CT.Exists("blct") {
+			running++
+			if st := n.CT.State("blct"); st != "running" {
+				t.Fatalf("blct on %s is %q, want running", n.Name, st)
+			}
+		}
+	}
+	if running != 1 {
+		t.Fatalf("blct exists on %d hosts after its recovery, want 1", running)
+	}
+
+	// Nothing of the old machine's is left on the name: the add goes through.
+	if err := admit(); err != nil {
+		t.Fatalf("admit %s once blct has moved: %v", d.Name, err)
+	}
+}

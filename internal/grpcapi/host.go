@@ -1135,9 +1135,11 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"host %q was removed with %d workload(s) still recorded on it (%s). They belong to the machine "+
 				"removed under that name, and a new machine admitted under it would take them over. The "+
-				"failover coordinator recovers them onto live hosts once the removal and the CRL have "+
-				"replicated (`lv health` shows ha.claim.stranded for any it cannot); wait for them to move, "+
-				"or remove them (`lv rm <vm>`, `lv ct rm <name>`), then add the host again",
+				"failover coordinator recovers them by claim onto a live host once the removal and the CRL "+
+				"have replicated (`lv health` shows ha.claim.stranded for any it cannot). One that no live "+
+				"host can take, such as a container when no other host runs containers, moves as soon as "+
+				"a host that can take it is up: add one (this machine under another name will do), or "+
+				"remove the workload (`lv rm <vm>`, `lv ct rm <name>`). Then add the host again",
 			req.Name, len(left), strings.Join(left, ", "))
 	}
 	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{

@@ -285,6 +285,10 @@ type Coordinator struct {
 	// decision has stood unexecuted for RelocateRestoreTimeout (claimed
 	// container relocations, coordinator.go).
 	relocDeferred map[string]time.Time
+	// skipRetried records, per container on a removed host, the target its
+	// relocate-skipped retry last tried with no image to re-pull
+	// (relocate_skipped_retry.go).
+	skipRetried map[string]string
 	// claimRetryProposals holds, per claim key, the proposal the voters last
 	// refused because the recorded owner was still reachable (or its settled
 	// row named another). The next tick re-proposes THAT value — same proof
@@ -2878,8 +2882,11 @@ func (c *Coordinator) relocateContainers(ctx context.Context, h *corrosion.HostR
 			continue
 		}
 		// Already triaged to skipped in a prior pass — left visible for operator
-		// recovery; don't re-process (and don't loop on it).
-		if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail {
+		// recovery; don't re-process (and don't loop on it). On a host removed
+		// for good it is retried once a host can take it: nothing else ever
+		// moves it, and the name cannot be re-admitted while it is recorded
+		// there (retrySkippedOnRemovedHost).
+		if ct.StateDetail == corrosion.ContainerRelocateSkippedDetail && !c.retrySkippedOnRemovedHost(ctx, h, ct) {
 			continue
 		}
 		// Same ownership-dispute refusal as the VM loop: the other holder of the
@@ -3206,14 +3213,7 @@ func (c *Coordinator) pickContainerTarget(ctx context.Context, ct corrosion.Cont
 	// — so a container that genuinely fit nowhere was relocated somewhere it
 	// did not fit. "" tells the caller to skip loudly and leave the row for
 	// operator recovery instead.
-	target, err := placement.Select(ctx, c.db, placement.Request{
-		// A container holds memory only: its cpu_limit is no vCPU reservation
-		// and it carries no qemu overhead.
-		VMName: ct.Name, Container: true, MemMiBNeeded: ct.MemMiB,
-		Capacity: c.capacity,
-		// Region scope keeps a relocation in the source host's region.
-		RequireRegion: c.containerRecoveryRegion(ct.HostName),
-	})
+	target, err := placement.Select(ctx, c.db, c.containerPlacementRequest(ct))
 	if err != nil {
 		if c.skippedNoContainerRuntime(ctx, ct, err) {
 			return "", true

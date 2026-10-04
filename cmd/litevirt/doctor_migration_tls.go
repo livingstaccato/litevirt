@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/cli"
@@ -40,11 +41,12 @@ peers while no 'lv host rotate-migration-ca' is running from this machine.`, // 
 				sort.Slice(rows, func(i, j int) bool { return rows[i].GetHost() < rows[j].GetHost() })
 				now := time.Now()
 				if asJSON {
-					enc := json.NewEncoder(os.Stdout)
-					enc.SetIndent("", "  ")
-					if err := enc.Encode(rows); err != nil {
+					b, err := migrationTLSRowsJSON(rows)
+					if err != nil {
 						return err
 					}
+					os.Stdout.Write(b)
+					os.Stdout.Write([]byte("\n"))
 				} else {
 					printMigrationTLSRows(rows, now)
 				}
@@ -61,6 +63,25 @@ peers while no 'lv host rotate-migration-ca' is running from this machine.`, // 
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print the rows as JSON")
 	return cmd
+}
+
+// migrationTLSRowsJSON encodes rows as a JSON array, marshaling each row with
+// protojson (UseProtoNames, so fields read e.g. cert_not_after) instead of
+// plain encoding/json: a google.protobuf.Timestamp field encodes as an RFC
+// 3339 string under protojson, where encoding/json would instead print its
+// internal {"seconds":...,"nanos":...} representation — useless for a command
+// whose whole point is showing operators when a credential expires.
+func migrationTLSRowsJSON(rows []*pb.MigrationTLSHostStatus) ([]byte, error) {
+	opts := protojson.MarshalOptions{UseProtoNames: true}
+	raws := make([]json.RawMessage, len(rows))
+	for i, r := range rows {
+		b, err := opts.Marshal(r)
+		if err != nil {
+			return nil, fmt.Errorf("encode %s: %w", r.GetHost(), err)
+		}
+		raws[i] = b
+	}
+	return json.MarshalIndent(raws, "", "  ")
 }
 
 func shortFP(fp string) string {

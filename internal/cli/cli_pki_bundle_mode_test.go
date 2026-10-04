@@ -29,16 +29,19 @@ func TestInstallCLIClientBundle_DoesNotChownFilesByPathname(t *testing.T) {
 		}
 	}
 
-	var chowned []string
+	// Two seams, observed separately. Pooling them would let the directory
+	// chown drift back to chownPath (a pathname chown root resolves through a
+	// symlink) and still pass, because both record the same path.
+	var byPath, byDescriptor []string
 	orig := chownPath
-	chownPath = func(p string, uid, gid int) error { chowned = append(chowned, p); return nil }
+	chownPath = func(p string, uid, gid int) error { byPath = append(byPath, p); return nil }
 	t.Cleanup(func() { chownPath = orig })
 	// The DIRECTORY chown goes through chownDirNoFollow now — it opens the
 	// directory with O_NOFOLLOW|O_DIRECTORY and chowns the descriptor, so the
 	// pathname is never re-resolved. It still has to be observed here, or this
 	// test would silently stop covering the one chown that does happen.
 	origDir := chownDirNoFollow
-	chownDirNoFollow = func(p string, uid, gid int) error { chowned = append(chowned, p); return nil }
+	chownDirNoFollow = func(p string, uid, gid int) error { byDescriptor = append(byDescriptor, p); return nil }
 	t.Cleanup(func() { chownDirNoFollow = origDir })
 
 	// The CALLER's own uid/gid. Any process may "change" ownership to what it
@@ -50,16 +53,14 @@ func TestInstallCLIClientBundle_DoesNotChownFilesByPathname(t *testing.T) {
 		t.Fatalf("installCLIClientBundle: %v", err)
 	}
 
-	for _, p := range chowned {
-		if p != dst {
-			t.Errorf("chowned a file by pathname: %s\n"+
-				"root chowning a path inside a directory the target user controls can be "+
-				"redirected with a symlink; ownership belongs on the descriptor", p)
-		}
+	for _, p := range byPath {
+		t.Errorf("chowned by pathname: %s\n"+
+			"root chowning a path inside a directory the target user controls can be "+
+			"redirected with a symlink; ownership belongs on the descriptor", p)
 	}
-	if len(chowned) == 0 {
-		t.Error("the PKI directory itself was never chowned; the bundle would be unreadable " +
-			"by the user it was installed for")
+	if len(byDescriptor) != 1 || byDescriptor[0] != dst {
+		t.Errorf("descriptor chowns = %q, want exactly the PKI directory %q; "+
+			"without it the bundle is unreadable by the user it was installed for", byDescriptor, dst)
 	}
 }
 

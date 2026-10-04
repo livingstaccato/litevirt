@@ -3,6 +3,7 @@ package pki
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -11,6 +12,29 @@ func TestInspectMigrationTLS_UnprovisionedHostIsNotAnError(t *testing.T) {
 	info, err := InspectMigrationTLS(t.TempDir(), time.Now())
 	if err != nil || info.Provisioned {
 		t.Fatalf("info=%+v err=%v; want unprovisioned, no error", info, err)
+	}
+}
+
+// Two of the three files is an incomplete set, not an unprovisioned host: the
+// doctor and the rotation's preflight must say which file is missing.
+//
+// Mutation: restore the early return on the first missing file — the host
+// reads as unprovisioned.
+func TestInspectMigrationTLS_PartialSetIsIncompleteNotUnprovisioned(t *testing.T) {
+	pkiDir := t.TempDir()
+	provisionMigration(t, pkiDir)
+	if err := os.Remove(filepath.Join(MigrationDir(pkiDir), MigrationHostKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := InspectMigrationTLS(pkiDir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Provisioned || !strings.Contains(info.ValidationError, MigrationHostKeyName) {
+		t.Fatalf("info = %+v; want provisioned with a validation error naming %s", info, MigrationHostKeyName)
+	}
+	if len(info.TrustedCAs) != 1 || info.CertIssuerFingerprint == "" {
+		t.Errorf("info = %+v; want the files that are there still reported", info)
 	}
 }
 

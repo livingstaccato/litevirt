@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -64,27 +65,38 @@ func readCABundleFile(path string) ([]*x509.Certificate, error) {
 }
 
 // InspectMigrationTLS reports pkiDir's migration credentials. A host with none
-// is not an error: Provisioned is false.
+// of the three files is not an error: Provisioned is false. A host with some
+// but not all of them is Provisioned, with a ValidationError naming the
+// missing ones, so it reads as an incomplete set rather than as unprovisioned.
 func InspectMigrationTLS(pkiDir string, now time.Time) (MigrationTLSInfo, error) {
 	var info MigrationTLSInfo
 	dir := MigrationDir(pkiDir)
 	var ca, cert, key []byte
+	var missing []string
 	for _, f := range []struct {
 		name string
 		dst  *[]byte
 	}{{MigrationCAName, &ca}, {MigrationHostCertName, &cert}, {MigrationHostKeyName, &key}} {
 		data, err := os.ReadFile(filepath.Join(dir, f.name))
 		if errors.Is(err, fs.ErrNotExist) {
-			return info, nil
+			missing = append(missing, f.name)
+			continue
 		}
 		if err != nil {
 			return info, fmt.Errorf("read migration credential %s: %w", f.name, err)
 		}
 		*f.dst = data
 	}
+	if len(missing) == 3 {
+		return info, nil
+	}
 	info.Provisioned = true
 
-	cas, caErr := parseCABundle(ca)
+	var cas []*x509.Certificate
+	var caErr error
+	if ca != nil {
+		cas, caErr = parseCABundle(ca)
+	}
 	for _, c := range cas {
 		info.TrustedCAs = append(info.TrustedCAs, MigrationCAInfo{Fingerprint: CertFingerprint(c), NotAfter: c.NotAfter})
 	}
@@ -99,10 +111,16 @@ func InspectMigrationTLS(pkiDir string, now time.Time) (MigrationTLSInfo, error)
 			}
 		}
 	}
-	if caErr != nil {
+	switch {
+	case len(missing) > 0:
+		info.ValidationError = fmt.Sprintf("incomplete set: %s missing from %s",
+			strings.Join(missing, ", "), dir)
+	case caErr != nil:
 		info.ValidationError = caErr.Error()
-	} else if _, _, err := ValidateMigrationCredentials(ca, cert, key, now); err != nil {
-		info.ValidationError = err.Error()
+	default:
+		if _, _, err := ValidateMigrationCredentials(ca, cert, key, now); err != nil {
+			info.ValidationError = err.Error()
+		}
 	}
 	return info, nil
 }

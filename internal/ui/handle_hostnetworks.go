@@ -22,8 +22,7 @@ func (s *Server) handleHostNetworkModal(w http.ResponseWriter, r *http.Request) 
 	if iface := r.URL.Query().Get("iface"); iface != "" {
 		resp, err := s.grpc.ListHostNetworks(s.uiBearerCtx(r), &pb.ListHostNetworksRequest{HostName: host})
 		if err != nil {
-			sendToast(w, "Load intent failed: "+err.Error(), "error")
-			w.WriteHeader(http.StatusInternalServerError)
+			rpcWriteFailed(w, "Load intent", err)
 			return
 		}
 		for _, n := range resp.GetNetworks() {
@@ -110,8 +109,7 @@ func (s *Server) handleHostNetworkDelete(w http.ResponseWriter, r *http.Request)
 		HostName: host, Name: iface,
 	})
 	if err != nil {
-		sendToast(w, "Remove intent failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Remove intent", err)
 		return
 	}
 	sendToast(w, "Removed "+iface+" — takes effect on the next apply", "success")
@@ -123,8 +121,7 @@ func (s *Server) handleHostNetworkPlanModal(w http.ResponseWriter, r *http.Reque
 	host := r.PathValue("name")
 	plan, err := s.grpc.PlanHostNetwork(s.uiBearerCtx(r), &pb.PlanHostNetworkRequest{HostName: host})
 	if err != nil {
-		sendToast(w, "Plan failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Plan", err)
 		return
 	}
 	s.renderFragment(w, "host_network_plan_modal.html", map[string]any{

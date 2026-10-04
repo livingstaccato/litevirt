@@ -139,8 +139,7 @@ func (s *Server) handleCreateLB(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("UI: create LB failed", "error", err)
-		sendToast(w, "Create LB failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Create LB", err)
 		return
 	}
 	sendToast(w, "Load balancer '"+name+"' created", "success")
@@ -195,8 +194,7 @@ func (s *Server) handleUpdateLB(w http.ResponseWriter, r *http.Request) {
 	_, err := s.grpc.UpdateLoadBalancer(s.uiBearerCtx(r), req)
 	if err != nil {
 		slog.Error("UI: update LB failed", "error", err)
-		sendToast(w, "Update LB failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Update LB", err)
 		return
 	}
 	sendToast(w, "Load balancer '"+name+"' updated", "success")
@@ -212,8 +210,7 @@ func (s *Server) handleLBEnableBackend(w http.ResponseWriter, r *http.Request) {
 		Backend: backend,
 	})
 	if err != nil {
-		sendToast(w, "Enable failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Enable", err)
 		return
 	}
 	sendToast(w, "Backend '"+backend+"' enabled", "success")
@@ -229,8 +226,7 @@ func (s *Server) handleLBDisableBackend(w http.ResponseWriter, r *http.Request) 
 		Backend: backend,
 	})
 	if err != nil {
-		sendToast(w, "Disable failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Disable", err)
 		return
 	}
 	sendToast(w, "Backend '"+backend+"' disabled", "success")

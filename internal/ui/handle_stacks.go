@@ -70,7 +70,7 @@ func (s *Server) handleStackExport(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	resp, err := s.grpc.ExportStack(s.uiBearerCtx(r), &pb.ExportStackRequest{Name: name})
 	if err != nil {
-		http.Error(w, "Export failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Export failed: "+err.Error(), httpStatusFor(err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/x-yaml")
@@ -97,16 +97,21 @@ func (s *Server) handleDeployStack(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("UI: deploy stack failed", "error", err)
-		sendToast(w, "Deploy failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Deploy", err)
 		return
 	}
 
 	// Consume the stream to completion so the deployment actually runs.
+	// A refusal arrives on the first Recv, so only io.EOF means it ran.
 	var lastErr string
 	for {
 		p, err := stream.Recv()
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				slog.Error("UI: deploy stream failed", "error", err)
+				rpcWriteFailed(w, "Deploy", err)
+				return
+			}
 			break
 		}
 		if p.Error != "" {
@@ -141,7 +146,7 @@ func (s *Server) handlePlanPreview(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.grpc.DiffStack(s.uiBearerCtx(r), &pb.DiffStackRequest{ComposeYaml: yaml})
 	if err != nil {
 		slog.Error("UI: plan preview failed", "error", err)
-		http.Error(w, "Plan failed: "+err.Error(), 500)
+		http.Error(w, "Plan failed: "+err.Error(), httpStatusFor(err))
 		return
 	}
 
@@ -190,8 +195,7 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 	stream, err := s.grpc.DeleteStack(opCtx, &pb.DeleteStackRequest{Name: name})
 	if err != nil {
 		slog.Error("UI: destroy stack failed", "error", err)
-		sendToast(w, "Destroy failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Destroy", err)
 		return
 	}
 
@@ -225,7 +229,7 @@ func (s *Server) handleDestroyStack(w http.ResponseWriter, r *http.Request) {
 	if streamErr != nil {
 		slog.Error("UI: destroy stack stream failed", "stack", name, "error", streamErr)
 		sendToast(w, "Destroy of stack '"+name+"' did not complete: "+streamErr.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(streamErr))
 		return
 	}
 	if len(failed) > 0 {
@@ -317,8 +321,7 @@ func (s *Server) handleMigrateStackVolumes(w http.ResponseWriter, r *http.Reques
 	})
 	if err != nil {
 		slog.Error("UI: migrate stack volumes failed", "error", err)
-		sendToast(w, "Migration failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Migration", err)
 		return
 	}
 

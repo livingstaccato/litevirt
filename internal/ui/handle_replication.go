@@ -46,8 +46,7 @@ func (s *Server) handlePromoteReplica(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, err := s.grpc.PromoteReplica(s.uiBearerCtx(r), req)
 	if err != nil {
-		sendToast(w, "Promote failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Promote", err)
 		return
 	}
 	for {
@@ -56,8 +55,7 @@ func (s *Server) handlePromoteReplica(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if rerr != nil {
-			sendToast(w, "Promote failed: "+rerr.Error(), "error")
-			w.WriteHeader(http.StatusInternalServerError)
+			rpcWriteFailed(w, "Promote", rerr)
 			return
 		}
 	}

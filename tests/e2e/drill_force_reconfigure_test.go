@@ -66,7 +66,8 @@ func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
 	// whatever the drill did not get to.
 	t.Cleanup(d.finish)
 
-	test := l.createVMs(q, "d6", lost[0])[lost[0]]
+	target := l.leastLoaded(q, lost)
+	test := l.createVMs(q, "d6", target)[target]
 	key := "vm/" + test
 	lostKeys := l.relocatableOn(q, b, lost...)
 	survivorKeys := l.recoverableOn(q, survivors...)
@@ -81,7 +82,7 @@ func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
 
 	since := l.nodeNow(q)
 	s := l.startSampler()
-	waitAllAt(t, s, []string{key}, lost[0])
+	waitAllAt(t, s, []string{key}, target)
 
 	// ── 1. lose three hosts; confirm the fences during the outage ──────────
 	off := l.powerOff(lost...)
@@ -341,4 +342,33 @@ func (d *d6) recreateStranded() {
 		}
 		l.mark("drill6: re-created stranded container %s on %s", name, c.Host)
 	}
+}
+
+// leastLoaded returns the host among hosts with the least memory in use, per
+// `lv host ls` (MEMORY "used/total MiB"): after the earlier drills have moved
+// workloads around, a fixed choice can be full.
+func (l *lab) leastLoaded(via string, hosts []string) string {
+	l.t.Helper()
+	best, bestUsed := "", -1
+	for _, line := range strings.Split(l.mustLV(via, "host", "ls"), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || !contains(hosts, f[0]) {
+			continue
+		}
+		used, _, ok := strings.Cut(f[4], "/")
+		if !ok {
+			continue
+		}
+		var n int
+		if _, err := fmt.Sscan(used, &n); err != nil {
+			continue
+		}
+		if bestUsed < 0 || n < bestUsed {
+			best, bestUsed = f[0], n
+		}
+	}
+	if best == "" {
+		l.t.Fatalf("no memory figures for %v in host ls", hosts)
+	}
+	return best
 }

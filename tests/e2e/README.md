@@ -175,12 +175,14 @@ destination minted on re-add). Drills 1, 2, 3 and 5 each end with a
 `disk rows follow the replacement` subtest that skips for N7 (failover leaves
 `vm_disks` naming the old host).
 
-Drill 4 also fails, without a skip, on finding P1: after the owner's
+Drill 4 can also fail, without a skip, on finding P1: after the owner's
 `enforcement.partition_pause` goes off, the coordinator still relies on its
 pause, because it reads the owner's LAST cached Ping
 (`Checker.PeerAdvertisedLast`, no age bound) and in steady state only proof
 replication refreshes that cache. It then waits for a pause that never
-happens instead of claiming. The drill asserts that the coordinator does not
+happens instead of claiming. Whether it bites depends on recent proof
+traffic: on main-07196394 it failed drill 4 twice and passed it once. The
+drill asserts that the coordinator does not
 rely on it; `E2E_DRILL4_REFRESH_PEERS=1` empties the caches with a rolling
 restart so the veto can still be exercised until P1 is fixed.
 

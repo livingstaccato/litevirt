@@ -35,8 +35,6 @@ import (
 //	LV_BIN             in lab mode, the lv binary ON THE NODES
 //	                   (e.g. /usr/local/bin/litevirt).
 //	E2E_EVIDENCE_DIR   where each drill writes its samples and timeline.
-//	E2E_FIXED          comma-separated finding IDs whose fix is deployed
-//	                   (N3,N4,N7); a drill that hits an open one skips.
 //	LITEVIRT_E2E_DESTRUCTIVE=1  also run drill 6 (destroys and rebuilds hosts).
 
 var (
@@ -107,40 +105,6 @@ func checkDesignTimings(t *testing.T, hosts int) {
 	recomputed := tPause + max(0, minorityDetect-decisionHeadStart) + 2*pauserTick + health.PartitionPauseExecBudget + 2*time.Second
 	if hosts <= 17 && recomputed != pauseWait(hosts) {
 		t.Fatalf("W recomputed from the restated constants = %v, internal/health says %v", recomputed, pauseWait(hosts))
-	}
-}
-
-// ─── Findings that are open on the deployed build ───────────────────────────
-
-// knownFindings names the open product bugs a drill can run into. A drill that
-// hits one is written to the CORRECT behaviour and skips until the fix is
-// deployed and named in E2E_FIXED.
-var knownFindings = map[string]string{
-	"N3": "N3: recovery after a forced reconfiguration to 2 survivors is refused by the decision gate (missing_witness, internal/health/gate.go)",
-	"N4": "N4: a claim decided by an earlier, vetoed attempt can mint to a stale destination (coordinator adopts cl.Proof.DestHost without the eligibility checks)",
-	"N7": "N7: failover leaves vm_disks rows naming the old host (a later migrate fails CommitMigrationOwnership)",
-}
-
-func findingFixed(id string) bool {
-	for _, f := range strings.Split(os.Getenv("E2E_FIXED"), ",") {
-		if strings.EqualFold(strings.TrimSpace(f), id) {
-			return true
-		}
-	}
-	return false
-}
-
-// skipUnlessFixed skips t while any of the named findings is still open.
-func skipUnlessFixed(t *testing.T, ids ...string) {
-	t.Helper()
-	var open []string
-	for _, id := range ids {
-		if !findingFixed(id) {
-			open = append(open, knownFindings[id])
-		}
-	}
-	if len(open) > 0 {
-		t.Skipf("open on the deployed build (set E2E_FIXED once the fix is deployed):\n  %s", strings.Join(open, "\n  "))
 	}
 }
 

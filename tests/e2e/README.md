@@ -146,9 +146,7 @@ drive a local `lv`).
 | `E2E_LAB_PORT_BASE` | `2230` | node N's SSH is `127.0.0.1:(base+N)` |
 | `E2E_EVIDENCE_DIR` | (none) | per drill: `samples.log` (every sample), `timeline.txt`, extra evidence |
 | `E2E_DRILL_IMAGE` / `E2E_DRILL_MEMORY` | `cirros` / `128M` | the drills' own test VMs |
-| `E2E_FIXED` | (none) | comma-separated finding IDs whose fix is deployed (`N3,N4,N7`) |
 | `LITEVIRT_E2E_DESTRUCTIVE` | (none) | `1` also runs drill 6, which destroys and rebuilds hosts |
-| `E2E_DRILL4_REFRESH_PEERS` | (none) | `1` works around finding P1 in drill 4 (rolling restart of the other daemons after the owner's flag flip) so the claim veto itself is exercised |
 
 ### The drills
 
@@ -165,32 +163,22 @@ probe constants drift from them.
 | `TestDrill3_VoterRemovedAfterAFence` | a fenced host is `lv cluster voter rm`ed, then a second host fails: its workloads recover by claims decided in the reduced generation, accepted only by its members; the voter is added back | ~8 min |
 | `TestDrill4_OwnerReachableVetoesTheClaim` | the coordinator reaches its fence quorum for a host the other voters still reach: they refuse with `recovery_claim_owner_reachable`, no proof is minted, the workload never moves (owner runs `partition_pause: false`, restored after) | ~7 min |
 | `TestDrill5_LegacyRecoveryWithClaimsOff` | `recovery_claim: false` on every host (rolling restarts): a powered-off host's workloads recover once, by a proof without a claim certificate; the flag is restored | ~12 min |
-| `TestDrill6_ForceReconfigureAndRebuild` | destructive: three of five hosts lost, fences confirmed, `lv cluster voter force-reconfigure` to the two survivors, recovery with no workaround, `lv host rm --dead`, rebuild with `lab.sh destroy/create/up`, `lv host add`, `lv cluster voter add` back to five | ~35 min |
+| `TestDrill6_ForceReconfigureAndRebuild` | destructive: three of five hosts lost, fences confirmed, `lv cluster voter force-reconfigure` to the two survivors, recovery with no workaround, `lv host rm --dead`, the workloads still recorded on the removed hosts recovered or removed, rebuild with `lab.sh destroy/create/up`, `lv host add` (a host fenced during its join fails the drill), `lv cluster voter add` back to five, the removed lab workloads put back | ~40 min |
 
-Open findings: a drill that runs into a known open product bug is written to
-the correct behaviour and skips, naming the finding, until `E2E_FIXED` says
-the fix is deployed. Drill 6 skips for N3 (no recovery on a forced 2-voter
-generation: `missing_witness`) and N4 (a vetoed attempt's stale claim
-destination minted on re-add). Drills 1, 2, 3 and 5 each end with a
-`disk rows follow the replacement` subtest that skips for N7 (failover leaves
-`vm_disks` naming the old host).
+Findings the drills used to skip or work around are fixed on main, and the
+drills now assert them directly: N3 (recovery on a forced 2-voter generation)
+and N4 (a stale claim destination) in drill 6, N7 (disk rows follow the VM)
+in drills 1, 2, 3 and 5, P1 (the coordinator relies on an owner's partition
+pause only on its latest probe answer) in drill 4, and R1 (a rebuilt host
+fenced during its join) in drill 6.
 
-Run past its skip (`E2E_FIXED=N3,N4`) on main-07196394, drill 6 goes red
-for N3 (every reschedule refused with `missing_witness` until a third host
-joins) and can also go red for R1: a coordinator SSH-fences a rebuilt host
-seconds after its `lv host add`, powering it off. Its restore powers such a
-host back on and carries on.
-
-Drill 4 can also fail, without a skip, on finding P1: after the owner's
-`enforcement.partition_pause` goes off, the coordinator still relies on its
-pause, because it reads the owner's LAST cached Ping
-(`Checker.PeerAdvertisedLast`, no age bound) and in steady state only proof
-replication refreshes that cache. It then waits for a pause that never
-happens instead of claiming. Whether it bites depends on recent proof
-traffic: on main-07196394 it failed drill 4 twice and passed it once. The
-drill asserts that the coordinator does not
-rely on it; `E2E_DRILL4_REFRESH_PEERS=1` empties the caches with a rolling
-restart so the veto can still be exercised until P1 is fixed.
+Drill 6 cannot add a rebuilt host back while workloads are still recorded on
+its removed name: `lv host add` refuses it (R4). After `lv host rm --dead` it
+waits for the coordinator to recover what it can, then removes what is left
+(a policy-none VM, a container no survivor can run, a VM the survivors have no
+room for) with `lv rm --force` and `lv ct rm`. Once the hosts are back it
+brings the removed VMs' stacks up again from their `lv compose export` (the
+plan must create only) and re-creates the containers from their create spec.
 
 ### Leaving the lab as it was found
 

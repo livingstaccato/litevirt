@@ -13,9 +13,13 @@ import (
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
-// Notification targets and routes are READ in-process against the host-local
-// Corrosion handle; every action on them, the test send included, goes through
-// the daemon's notification RPCs with the session's bearer.
+// Notification routes are READ in-process against the host-local Corrosion
+// handle. Targets are not: a target's config IS its credential (a webhook or
+// Slack URL is a bearer secret), and ListNotificationTargets redacts it below
+// the operator floor. Reading the table here rendered every URL to a viewer, so
+// the page lists targets through that RPC with the session's bearer and the
+// redaction rule stays in one place. Every action, the test send included,
+// goes through the daemon's notification RPCs too.
 
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Notifications", "notifications")
@@ -24,12 +28,13 @@ func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 		s.renderPage(w, "notifications.html", data)
 		return
 	}
-	targets, err := corrosion.ListNotificationTargets(r.Context(), s.db)
+	resp, err := s.grpc.ListNotificationTargets(s.uiBearerCtx(r), &pb.ListNotificationTargetsRequest{})
 	if err != nil {
-		data["Error"] = err.Error()
+		data["Error"] = grpcMsg(err)
 		s.renderPage(w, "notifications.html", data)
 		return
 	}
+	targets := resp.GetTargets()
 	routes, _ := corrosion.ListNotificationRoutes(r.Context(), s.db)
 	data["Targets"] = targets
 	data["Routes"] = routes
@@ -121,7 +126,12 @@ func (s *Server) handleTestNotifyTarget(w http.ResponseWriter, r *http.Request) 
 }
 
 func (s *Server) handleNotifyRouteModal(w http.ResponseWriter, r *http.Request) {
-	targets, _ := corrosion.ListNotificationTargets(r.Context(), s.db)
+	// Through the RPC like the page: the modal names targets only, and the
+	// secret-bearing config should not reach a template for a viewer at all.
+	var targets []*pb.NotificationTarget
+	if resp, err := s.grpc.ListNotificationTargets(s.uiBearerCtx(r), &pb.ListNotificationTargetsRequest{}); err == nil {
+		targets = resp.GetTargets()
+	}
 	s.renderFragment(w, "notify_route_modal.html", map[string]any{"Targets": targets})
 }
 

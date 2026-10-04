@@ -228,12 +228,13 @@ type Client struct {
 	// legacy RFC3339 emission.
 	hlcEmit func() bool
 
-	// digestV2Enabled, when non-nil and returning true, makes the state digest + the
-	// divergence scanner ALSO emit the order-invariant digest_v2 hashes (TableDigest.HashV2
-	// / RowMeta.RowHashV2). Gated on `enforcement.digest_v2` alone (injected via
-	// SetDigestV2Enabled) — no cluster latch: v2 is negotiated PAIRWISE by field presence,
-	// so a node only emits v2 when locally enabled and comparison uses v2 only when both
-	// peers emitted it. Cheap in-memory read. Nil/false = v1-only emission (unchanged).
+	// digestV2Enabled, unless it returns false, makes the state digest + the divergence
+	// scanner ALSO emit the order-invariant digest_v2 hashes (TableDigest.HashV2 /
+	// RowMeta.RowHashV2). Gated on `enforcement.digest_v2` alone (injected via
+	// SetDigestV2Enabled, default on) — no cluster latch: v2 is negotiated PAIRWISE by
+	// field presence, so a node only emits v2 when locally enabled and comparison uses v2
+	// only when both peers emitted it. Cheap in-memory read. Nil = on, like the config
+	// default; false = v1-only emission (the kill switch).
 	digestV2Enabled func() bool
 
 	// leaseTermLedger, when non-nil and returning true, permits a WRITE to
@@ -373,11 +374,24 @@ func (c *Client) SetHLCEmit(fn func() bool) { c.hlcEmit = fn }
 
 // SetDigestV2Enabled injects the predicate that makes the digest + scanner emit the
 // order-invariant digest_v2 hashes. Wired at daemon start to `enforcement.digest_v2`.
-// Nil-safe: an unset predicate keeps v1-only emission.
+// An unset predicate emits v2, matching that flag's default.
 func (c *Client) SetDigestV2Enabled(fn func() bool) { c.digestV2Enabled = fn }
 
-// digestV2On reports whether digest_v2 emission is enabled on this node (nil-safe).
-func (c *Client) digestV2On() bool { return c.digestV2Enabled != nil && c.digestV2Enabled() }
+// digestV2On reports whether digest_v2 emission is enabled on this node: on unless a
+// predicate says otherwise.
+//
+// On by default because the positional v1 digest cannot agree across replicas founded
+// at different schema versions: an ALTER appends a column after deleted_at, a fresh
+// CREATE TABLE declares it earlier, and SELECT * hashes identical rows differently, on
+// every pass, for good (TestStateDigest_OlderFoundedReplicaAgreesByDefault). No CREATE
+// order fits every founding version, so only a name-ordered digest fixes it.
+//
+// Turning it on needs no capability token. Every comparison picks v2 only when BOTH
+// sides sent it (localAndRemoteHash, digestVersions, sameHash), so a peer that does
+// not emit v2 — an older build, or this flag off — is compared on v1 exactly as
+// before, and nothing ever compares a v1 hash with a v2 one. The guarantee is enforced
+// at each comparison; no node relies on a peer doing anything.
+func (c *Client) digestV2On() bool { return c.digestV2Enabled == nil || c.digestV2Enabled() }
 
 // SetLeaseTermLedgerGate injects the predicate that permits WRITING to
 // leader_lease_terms. Wired at daemon start to

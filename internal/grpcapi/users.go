@@ -383,8 +383,9 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 		}
 		if !other {
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"user %q is the cluster's last admin account; promote another user to "+
-					"admin before deleting it, or the cluster is left with no administrator",
+				"user %q is the cluster's last admin account; create another admin first "+
+					"(`lv user create <username> --role admin`), or the cluster is left with no "+
+					"administrator",
 				req.Username)
 		}
 	}
@@ -398,11 +399,15 @@ func (s *Server) DeleteUser(ctx context.Context, req *pb.DeleteUserRequest) (*em
 	// both checks see the other admin alive, both pass, both tombstones
 	// replicate, and the cluster has no administrator and no way back in.
 	//
-	// So the invariant is repaired rather than defended. Every node that
-	// applies a delete re-reads, and one that sees zero live admins undoes the
-	// most recent admin tombstone -- deterministically, so two racing nodes
-	// pick the same row. context.WithoutCancel: the delete has already
-	// happened, and a cancelled request must not leave the cluster admin-less.
+	// So the invariant is repaired rather than defended. This check, right
+	// after the local delete, only catches a peer's tombstone that already
+	// arrived; in the race above it has not, and this sees the other admin
+	// alive. The repair that covers the race is the daemon's periodic admin
+	// floor check (corrosion/admin_floor.go), which every node runs against
+	// its own replica once the tombstones have crossed, and which picks the
+	// same account on every replica. context.WithoutCancel: the delete has
+	// already happened, and a cancelled request must not leave the cluster
+	// admin-less.
 	if reinstated, rerr := corrosion.ReinstateAdminIfNoneRemain(
 		context.WithoutCancel(ctx), s.db); rerr != nil {
 		slog.Error("could not verify an admin survived the delete", "deleted", req.Username, "error", rerr)

@@ -5,6 +5,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"slices"
 	"sync"
 	"time"
 
@@ -284,6 +285,9 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 	}
 
 	completed := true
+	// usersUnjudged: this peer's users rows differ from ours and the pull that
+	// would have judged them did not complete. See checkSensitivePeer.
+	usersUnjudged := false
 	mismatched := ae.drift.mismatches(peerName, resp.Tables, localMap)
 	// Observation tables are repaired on their own, slower schedule; control
 	// state is repaired now (observation_tables.go). Observations are always
@@ -320,6 +324,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		// those, only the buckets that differ, where the peer can say which.
 		scope := ae.bucketScope(ctx, client, peerName, pull)
 		kept, pullErr, mergeErr := ae.pullAndMerge(ctx, client, pull, scope, nil)
+		usersUnjudged = (pullErr != nil || mergeErr != nil) && slices.Contains(pull, "users")
 		if pullErr != nil {
 			slog.Warn("anti-entropy: dump RPC error", "peer", peerName, "error", pullErr)
 			completed = false
@@ -337,7 +342,7 @@ func (ae *AntiEntropy) checkPeer(ctx context.Context, peerName string, localMap,
 		}
 	}
 
-	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full)
+	ae.checkSensitivePeer(ctx, client, peerName, sensitiveMap, full, usersUnjudged)
 	return completed
 }
 
@@ -375,7 +380,13 @@ func digestMismatches(peer string, remote []*pb.TableDigest, localMap map[string
 	return (*driftLog)(nil).mismatches(peer, remote, localMap)
 }
 
-func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full bool) {
+// usersUnjudged withholds user_credentials from the pull. A peer's credential
+// row belongs to the account the peer holds under that name, and whether that
+// is OUR account is decided on the public lane, where a re-minted admin's users
+// row is refused and its hash remembered (users_admin_guard.go). When that pull
+// did not complete this cycle, nothing may have judged the peer's accounts
+// since this process started, so its credentials wait for a cycle that has.
+func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVirtClient, peerName string, localMap map[string]TableDigest, full, usersUnjudged bool) {
 	if len(localMap) == 0 {
 		return
 	}
@@ -396,6 +407,11 @@ func (ae *AntiEntropy) checkSensitivePeer(ctx context.Context, client pb.LiteVir
 	}
 
 	mismatched := ae.drift.mismatches(peerName, resp.Tables, localMap)
+	if usersUnjudged && slices.Contains(mismatched, "user_credentials") {
+		mismatched = slices.DeleteFunc(mismatched, func(t string) bool { return t == "user_credentials" })
+		slog.Warn("anti-entropy: not repairing user_credentials from a peer whose users rows were not judged this cycle",
+			"peer", peerName)
+	}
 	if len(mismatched) == 0 {
 		return
 	}

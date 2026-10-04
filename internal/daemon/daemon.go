@@ -595,6 +595,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// has durably latched. Inert until then; see corrosion.SplitHostMembership.
 	go d.runHostMembershipSplit(ctx)
 
+	// Restore "at least one live admin" after racing deletes on two nodes
+	// (corrosion/admin_floor.go).
+	go d.runAdminFloor(ctx)
+
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
 	// default inside NewAntiEntropy. (P2-2)

@@ -1346,7 +1346,21 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 		// rolls back the whole batch and stalls the watermark so nothing is dropped or
 		// recorded as seen. A permanent fault surfaces via replication backlog; the sender
 		// retries. Logs carry s.SQL (never s.Params, which hold row data).
+		//
+		// A users row the admin re-mint floor refuses takes its credential
+		// statement in this entry with it (users_admin_guard.go). Decided
+		// before anything applies, against the rows the entry found.
+		refusedRemints, err := r.refusedRemintsInEntry(ctx, tx, stmts)
+		if err != nil {
+			_ = tx.Rollback()
+			r.client.observeMergeRejected("users", "wal", walRejectReason(err))
+			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
 		for _, s := range stmts {
+			if remintCredentialStatement(s, refusedRemints) {
+				r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
+				continue
+			}
 			if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 				_ = tx.Rollback()
 				r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", walRejectReason(err))
@@ -1367,8 +1381,9 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 		}
 		// A secret written by a node that had not latched credentials_split_v1
 		// reaches this node in its old column only; absorb it into the
-		// credential row readers use (credentials_absorb.go).
-		if err := absorbUnlatchedSecretWrite(ctx, tx, stmts, r.client.MayWriteCredentialTables()); err != nil {
+		// credential row readers use (credentials_absorb.go). A users row the
+		// re-mint floor refused did not apply here, so it has nothing to absorb.
+		if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(stmts, refusedRemints), r.client.MayWriteCredentialTables()); err != nil {
 			_ = tx.Rollback()
 			slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
 				"origin", entry.Origin, "seq", entry.Seq, "error", err)

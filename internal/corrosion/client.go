@@ -122,6 +122,12 @@ type Client struct {
 	dsn       string
 	tableGens *tableGenerations
 	digests   digestCache
+	// remints remembers the credentials of admin re-mints this node refused,
+	// so anti-entropy's sensitive lane refuses the credential row that belongs
+	// to a refused users row (users_admin_guard.go).
+	remints refusedRemints
+	// adminFloor is the periodic last-admin repair's state (admin_floor.go).
+	adminFloor adminFloor
 	// outOfProcess marks a client opened beside the daemon (NewLocalClient):
 	// on Close, if it wrote, it touches the digest marker (digest_cache.go).
 	outOfProcess bool

@@ -397,6 +397,34 @@ func TestSeedAdminUser_SeedingConsumesTheFounderMarker(t *testing.T) {
 	}
 }
 
+// A marker does not outrank evidence of earlier membership.
+//
+// Capability latches (data_dir/split_brain_activated.<token>) are written only
+// after a daemon has run as a member, and they survive a state.db loss. A node
+// holding one is not founding anything, whatever marker it carries: the docs tell
+// an operator to create the marker by hand on a genuine founder, and one created
+// on a former member must not mint a second admin over the cluster's.
+func TestSeedAdminUser_CapabilityLatchesOutrankTheMarker(t *testing.T) {
+	ctx := context.Background()
+	db := newHostTestClient(t)
+
+	d := founderDaemon(t, db, filepath.Join(t.TempDir(), "admin-password"))
+	latch := filepath.Join(d.cfg.DataDir, "split_brain_activated.voter_config_v1")
+	if err := os.WriteFile(latch, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.seedAdminUser(ctx); err != nil {
+		t.Fatalf("seedAdminUser on a former member: %v", err)
+	}
+	users, err := corrosion.ListUsers(ctx, db)
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	if len(users) != 0 {
+		t.Errorf("a node holding capability latches minted %v despite having run as a member", users)
+	}
+}
+
 // A stale marker does not outrank join_peers.
 //
 // A node can carry a marker it never consumed: `lv host init`, then — before the

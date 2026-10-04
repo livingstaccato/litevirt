@@ -60,6 +60,23 @@ func TestGenesisMarker_ReInitialisingANodeWithAStateDBDoesNotWriteIt(t *testing.
 	}
 }
 
+// A founder whose state.db was LOST is not a fresh node. Its capability latches
+// (data_dir/split_brain_activated.<token>) survive the loss, and every daemon
+// that has run long enough to latch a mandatory token has them. Re-running
+// `lv host init` there — with --force, or while the cluster is unreachable so the
+// membership check cannot answer — must not arm a mint of a second admin.
+func TestGenesisMarker_ANodeWithCapabilityLatchesIsNotFresh(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "split_brain_activated.voter_config_v1"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	runGenesisSnippet(t, dir, foundingSetupEnv)
+	if markerExists(t, dir) {
+		t.Fatal("`lv host init` wrote a founder marker on a node holding capability latches; " +
+			"it has run as a cluster member before, and minting there replaces the cluster's admin")
+	}
+}
+
 // Every non-founding setup clears a marker left behind, e.g. by a `host init`
 // whose daemon never started before the node was `host add`ed elsewhere.
 func TestGenesisMarker_NonFoundingSetupClearsAStaleOne(t *testing.T) {

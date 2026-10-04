@@ -485,7 +485,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// wired later via SetPeerPinger; until then PeerSupports fails closed, so proof
 	// WAL entries defer rather than leak — never a schema-version guess.)
 	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
-	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, "split_brain_activated"))
+	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, activationMarkerBaseName))
 	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
 	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
@@ -1831,6 +1831,13 @@ const adminPasswordFile = "/etc/litevirt/admin-password"
 // while it exists, and deletes it once that credential is written.
 const genesisMarkerName = "genesis-pending"
 
+// activationMarkerBaseName prefixes the persisted capability latches in
+// data_dir (<base>.<token>). They are written only after a daemon has run as a
+// member and survive a state.db loss, so seedAdminUser treats any of them as
+// proof this node is not founding a cluster. The setup script's
+// genesisMarkerScript matches the same name.
+const activationMarkerBaseName = "split_brain_activated"
+
 // seedAdminUser creates a default admin user with a random password if this node
 // is founding a cluster and no users exist. The password is written to
 // adminPasswordPath (adminPasswordFile by default) with mode 0600.
@@ -1908,6 +1915,23 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 			"NEW cluster that was set up without `lv host init`: create the marker by hand "+
 			"and restart the daemon",
 			"marker", marker)
+		return nil
+	}
+
+	// A marker does not outrank evidence of earlier membership. Capability
+	// latches exist only once a daemon has run as a member, and survive a
+	// state.db loss; a marker beside one was written by hand or by a setup that
+	// could not see the latch, and minting here replaces the cluster's admin.
+	latches, err := filepath.Glob(filepath.Join(d.cfg.DataDir, activationMarkerBaseName+".*"))
+	if err != nil {
+		return fmt.Errorf("check for capability latches: %w", err)
+	}
+	if len(latches) > 0 {
+		slog.Warn("a founder marker is present but this node holds capability latches, so it "+
+			"has run as a cluster member before; no admin account is created. Its credential "+
+			"replicates in from the cluster. A brand-new cluster has to start from an empty "+
+			"data_dir",
+			"marker", marker, "latches", len(latches))
 		return nil
 	}
 

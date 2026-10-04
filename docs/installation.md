@@ -86,7 +86,9 @@ lv status
 The cluster's admin account is created exactly once, by the node that founds it.
 `lv host init` (remote or `--local`) writes a founder marker,
 `/var/lib/litevirt/genesis-pending`, but only while that data directory holds no
-`state.db`. On its first start the daemon creates the `admin` account, writes the
+`state.db` and no capability latches (`split_brain_activated.*`, which a daemon
+writes once it has run as a member and which survive losing `state.db`). On its
+first start the daemon creates the `admin` account, writes the
 password to `/etc/litevirt/admin-password` (mode 0600) on that node only, and
 deletes the marker.
 
@@ -103,8 +105,8 @@ touch /var/lib/litevirt/genesis-pending
 systemctl restart litevirt
 ```
 
-The daemon still refuses if `join_peers` is set or any user account has ever
-existed. Do not use `lv user reset-admin` for this: it resets an existing admin
+The daemon still refuses if `join_peers` is set, any user account has ever
+existed, or the data directory holds capability latches from an earlier run. Do not use `lv user reset-admin` for this: it resets an existing admin
 and never creates one.
 
 ## Add hosts to the cluster

@@ -704,14 +704,20 @@ const foundingSetupEnv = "LITEVIRT_GENESIS=1"
 // genesisMarkerScript writes or clears the founder marker in the data dir. The
 // daemon mints the cluster's first admin credential only while the marker
 // exists, and deletes it once it has. It is written only when founding AND the
-// data dir has never held a database: re-running `lv host init` against a live
-// member must not re-arm a mint for the day its state.db is lost. Every other
-// setup clears a marker left by a `host init` whose daemon never started.
+// data dir shows no sign of earlier membership: no state.db, so re-running
+// `lv host init` against a live member does not re-arm a mint for the day its
+// state.db is lost; and no capability latch (split_brain_activated.<token>),
+// which survives that loss, so a former member re-initialised with --force or
+// while its cluster is unreachable does not mint a second admin either. Every
+// other setup clears a marker left by a `host init` whose daemon never started.
 // LV_DATA_DIR exists for tests; the daemon's data_dir is /var/lib/litevirt.
 const genesisMarkerScript = `
 # Founder marker: licenses this node's daemon to mint the cluster's first admin.
 LV_DATA_DIR="${LV_DATA_DIR:-/var/lib/litevirt}"
-if [ "${LITEVIRT_GENESIS:-}" = "1" ] && [ ! -e "${LV_DATA_DIR}/state.db" ]; then
+# Capability latches survive a state.db loss: a node holding one has run as a
+# member and is not founding anything.
+if [ "${LITEVIRT_GENESIS:-}" = "1" ] && [ ! -e "${LV_DATA_DIR}/state.db" ] && \
+   ! compgen -G "${LV_DATA_DIR}/split_brain_activated.*" > /dev/null; then
     touch "${LV_DATA_DIR}/genesis-pending"
 else
     rm -f "${LV_DATA_DIR}/genesis-pending"

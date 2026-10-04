@@ -212,7 +212,6 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 	assertNoDualRun(t, l, q, since, healed)
 
 	t.Run("disk rows follow the replacement", func(t *testing.T) {
-		skipUnlessFixed(t, "N7")
 		assertDiskRowsFollow(t, l, q, s.last(), keys)
 	})
 }
@@ -482,7 +481,8 @@ func assertNoDualRun(t *testing.T, l *lab, via, since string, after time.Time) {
 }
 
 // assertDiskRowsFollow requires every VM's disk rows to name the host it now
-// executes on (finding N7: failover leaves them naming the old host).
+// executes on (finding N7, fixed in 386206a3: failover used to leave them
+// naming the old host).
 func assertDiskRowsFollow(t *testing.T, l *lab, via string, r round, keys []string) {
 	t.Helper()
 	for _, k := range keys {

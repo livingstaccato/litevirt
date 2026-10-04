@@ -15,6 +15,15 @@ type MigrateParams struct {
 	MaxDowntimeMS int64    // max downtime in ms during cutover (0 = libvirt default)
 	TargetAddress string   // target host IP/hostname for explicit migrate_uri (non-tunnelled)
 	DiskTargets   []string // disk target devices to migrate (e.g. "vda"); empty = all
+	// TLS encrypts QEMU's own migration stream and the NBD disk copy
+	// (VIR_MIGRATE_TLS), using the migration credentials both hosts installed in
+	// /etc/pki/qemu. It is what makes a WithStorage migration safe on an
+	// untrusted network; a tunnelled migration is already inside libvirt's TLS.
+	TLS bool
+	// TLSDestination is the name the target's migration certificate is checked
+	// against (libvirt's tls.destination). Set it to the target address when the
+	// migrate_uri uses an IP, which the certificate carries as a SAN.
+	TLSDestination string
 }
 
 // MigrateToTarget performs a live (or cold) P2P migration of a domain to
@@ -43,10 +52,15 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		// QEMU doesn't support tunnelled + non-shared disk together.
 		// Without tunnelling, QEMU opens a direct connection to the target for
 		// the migration stream and the NBD block copy (migration port range,
-		// default 49152-49215). Nothing here sets MigrateTLS, so both carry RAM
-		// and disk blocks UNENCRYPTED; MigrateVM refuses this path unless the
-		// source's migration.allow_unencrypted_storage is set.
+		// default 49152-49215). Without p.TLS both carry RAM and disk blocks
+		// UNENCRYPTED; MigrateVM sends that only when the source's
+		// migration.allow_unencrypted_storage is set.
 		flags |= golibvirt.MigrateNonSharedDisk
+		if p.TLS {
+			// Encrypts the migration stream AND the NBD disk copy, with the
+			// migration-CA credentials QEMU reads from /etc/pki/qemu.
+			flags |= golibvirt.MigrateTLS
+		}
 		// libvirt's qemuMigrationSrcIsSafe rejects a non-shared-storage
 		// migration ("Migration without shared storage is unsafe") whenever a
 		// disk's cache mode isn't none/directsync — and our generated domains
@@ -80,6 +94,13 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		params = append(params, golibvirt.TypedParam{
 			Field: golibvirt.MigrateParamURI,
 			Value: *golibvirt.NewTypedParamValueString(fmt.Sprintf("tcp://%s", p.TargetAddress)),
+		})
+	}
+
+	if p.WithStorage && p.TLS && p.TLSDestination != "" {
+		params = append(params, golibvirt.TypedParam{
+			Field: golibvirt.MigrateParamTLSDestination,
+			Value: *golibvirt.NewTypedParamValueString(p.TLSDestination),
 		})
 	}
 

@@ -64,7 +64,7 @@ func newMigrateCmd() *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&cold, "cold", false, "Cold migration (VM must be stopped)")
-	cmd.Flags().BoolVar(&withStorage, "with-storage", false, "Copy storage to target host during migration (unencrypted; the source must set migration.allow_unencrypted_storage)")
+	cmd.Flags().BoolVar(&withStorage, "with-storage", false, "Copy storage to target host during migration (encrypted when both hosts have migration TLS: lv host install-migration-tls)")
 	return cmd
 }
 

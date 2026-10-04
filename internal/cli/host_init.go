@@ -136,6 +136,15 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
 		}
 	}
+	// Migration-TLS credentials from the separate migration CA, so storage
+	// migrations to and from this host are encrypted.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip)
+	if err != nil {
+		return err
+	}
+	if err := pushMigrationCredentials(sc, migFiles); err != nil {
+		return err
+	}
 
 	// Push litevirtd binary
 	binPath, err := findDaemonBinary()
@@ -283,6 +292,16 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 		if err := sc.CopyFileMode(gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0600); err != nil {
 			return fmt.Errorf("push %s: %w", pki.GossipKeyName, err)
 		}
+	}
+	// Migration-TLS credentials from the cluster's migration CA (minted here if
+	// this machine has none yet), so storage migrations with this host are
+	// encrypted.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip)
+	if err != nil {
+		return err
+	}
+	if err := pushMigrationCredentials(sc, migFiles); err != nil {
+		return err
 	}
 
 	// Push litevirtd binary
@@ -534,6 +553,26 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 		// fresh 0600 file over it instead, and never widens an operator's mode.
 		if err := secretfile.Write(dst, data, 0600); err != nil {
 			return fmt.Errorf("write %s: %w", filepath.Base(dst), err)
+		}
+	}
+
+	// Migration-TLS credentials from the separate migration CA. The daemon
+	// installs them for QEMU, so storage migrations with this host are
+	// encrypted once a peer is provisioned too.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, net.ParseIP(advertiseAddr))
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(remoteMigrationDir, 0o700); err != nil {
+		return fmt.Errorf("create %s: %w", remoteMigrationDir, err)
+	}
+	for _, f := range migFiles {
+		data, err := os.ReadFile(f.local)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", filepath.Base(f.local), err)
+		}
+		if err := secretfile.Write(f.remote, data, f.mode); err != nil {
+			return fmt.Errorf("write %s: %w", f.remote, err)
 		}
 	}
 

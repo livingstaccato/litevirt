@@ -277,6 +277,10 @@ type Server struct {
 	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
 	// one unless the operator set this. Default false.
 	allowPlaintextStorageMigration bool
+	// migrationTLS installs this host's migration-TLS credentials for QEMU
+	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
+	// place. nil means never: a storage copy then falls to the plaintext guard.
+	migrationTLS func() (bool, error)
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like
@@ -1168,6 +1172,27 @@ func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
 // whether this node, as a migration source, may send a storage copy in
 // plaintext.
 func (s *Server) SetAllowUnencryptedStorageMigration(on bool) { s.allowPlaintextStorageMigration = on }
+
+// SetMigrationTLS sets the hook that installs this host's migration-TLS
+// credentials for QEMU and reports whether they are ready. It runs on the
+// source before a storage copy and on the target in EnsureDisks.
+func (s *Server) SetMigrationTLS(fn func() (bool, error)) { s.migrationTLS = fn }
+
+// migrationTLSReady runs the hook. An error means not ready; it is logged, not
+// returned, because the caller decides between refusing and the plaintext
+// fallback.
+func (s *Server) migrationTLSReady() bool {
+	if s.migrationTLS == nil {
+		return false
+	}
+	ok, err := s.migrationTLS()
+	if err != nil {
+		slog.Warn("migration TLS is not available on this host; storage migrations "+
+			"from or to it cannot be encrypted", "error", err)
+		return false
+	}
+	return ok
+}
 
 // SetCanonicalIdentityEnforce sets this node's kill-switch for natural-key identity
 // resolution (enforcement.canonical_identity). Enforcement is this flag AND the

@@ -93,6 +93,9 @@ lv host publish-crl                       # Re-publish this machine's crl.pem if
 lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
   [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
                                           #   gossip stage. See auth.md "Gossip encryption"
+lv host install-migration-tls             # Issue every host the migration-TLS credentials that
+  [--reissue] [--ssh-user root]           #   encrypt storage migrations (mints the migration CA if
+                                          #   none). See migration-failover.md "Migration with local disks"
 lv host rotate-gossip-key                 # Replace the gossip key everywhere, live, in three
   [--grace 30s] [--timeout 2m]            #   barriered phases; re-run to settle an interrupted one
   [--ssh-user root]

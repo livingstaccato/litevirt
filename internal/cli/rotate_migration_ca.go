@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -11,7 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -40,6 +45,17 @@ func RotateMigrationCA(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 	if _, err := os.Stat(filepath.Join(pkiDir, pki.MigrationCAKeyName)); err != nil {
 		return fmt.Errorf("%s has no %s, so this is not the machine holding the migration CA; "+
 			"run this where `lv host init` ran: %w", pkiDir, pki.MigrationCAKeyName, err)
+	}
+	prior, err := loadMigrationRotation(pkiDir)
+	if err != nil {
+		return err
+	}
+	if !prior.inProgress() {
+		// A fresh start only: a resumed rotation already changed hosts, so
+		// they legitimately disagree with this check.
+		if err := preflightRotation(ctx, pkiDir, hosts, status, opts.Force); err != nil {
+			return err
+		}
 	}
 	r, err := startOrResumeRotation(pkiDir, opts.NoOverlap)
 	if err != nil {
@@ -94,6 +110,70 @@ func RotateMigrationCA(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 	for _, h := range slices.Sorted(maps.Keys(r.Skipped)) {
 		fmt.Fprintf(out, "%s was skipped and still holds the old CA's credentials; once it is back, "+
 			"run `lv host install-migration-tls --reissue`\n", h)
+	}
+	return nil
+}
+
+// preflightRotation refuses, before anything is minted or pushed, a rotation
+// that could not finish: one whose status call fails outright (for
+// Unimplemented, the daemon the CLI talks to predates MigrationTLSStatus), a
+// host without a complete, valid, installable set, or a host that does not
+// trust this machine's current migration CA — which, on every host, means this
+// machine's CA is not the cluster's. A host that cannot answer refuses too,
+// unless force says to leave it behind, as the push path then does.
+func preflightRotation(ctx context.Context, pkiDir string, hosts []MigrationTLSHost,
+	status MigrationTLSStatusFunc, force bool) error {
+	curFP, err := pki.CAFileFingerprint(filepath.Join(pkiDir, pki.MigrationCACertName))
+	if err != nil {
+		return fmt.Errorf("read this machine's migration CA: %w", err)
+	}
+	rows, err := status(ctx)
+	if grpcstatus.Code(err) == codes.Unimplemented {
+		return fmt.Errorf("the daemon this command talks to predates migration-TLS status, so the "+
+			"rotation cannot check any host; point the CLI at an upgraded node and re-run: %w", err)
+	}
+	if err != nil {
+		return fmt.Errorf("check hosts before rotating: %w", err)
+	}
+	byHost := map[string]*pb.MigrationTLSHostStatus{}
+	for _, row := range rows {
+		byHost[row.GetHost()] = row
+	}
+	var problems, wrongCA []string
+	for _, h := range hosts {
+		name, row := h.Name(), byHost[h.Name()]
+		switch {
+		case row == nil || row.GetError() != "":
+			if force {
+				continue
+			}
+			why := "did not answer the status check"
+			if row != nil {
+				why = row.GetError()
+			}
+			problems = append(problems, fmt.Sprintf("%s: %s; bring it back, or pass --force to leave it behind", name, why))
+		case !row.GetProvisioned():
+			problems = append(problems, fmt.Sprintf("%s: has no migration credentials; provision it with "+
+				"`lv host install-migration-tls` first", name))
+		case !slices.ContainsFunc(row.GetTrustedCas(), func(ca *pb.MigrationTLSCA) bool { return ca.GetFingerprint() == curFP }):
+			wrongCA = append(wrongCA, name)
+		case row.GetValidationError() != "":
+			problems = append(problems, fmt.Sprintf("%s: its migration credentials are invalid (%s); "+
+				"replace them with `lv host install-migration-tls --reissue` first", name, row.GetValidationError()))
+		case row.GetInstallError() != "":
+			problems = append(problems, fmt.Sprintf("%s: its daemon cannot install migration credentials (%s); "+
+				"fix that first", name, row.GetInstallError()))
+		}
+	}
+	if len(wrongCA) > 0 {
+		problems = append(problems, fmt.Sprintf("%s: does not trust this machine's migration CA %s. If no host "+
+			"trusts it, this machine's migration CA is not the one the cluster uses: run this where "+
+			"`lv host init` ran. A host left behind by an earlier rotation needs "+
+			"`lv host install-migration-tls --reissue` first", strings.Join(wrongCA, ", "), curFP))
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("not starting a migration-CA rotation; nothing was changed:\n  %s",
+			strings.Join(problems, "\n  "))
 	}
 	return nil
 }
@@ -225,6 +305,9 @@ func phaseUnmet(phase, newFP string, row *pb.MigrationTLSHostStatus) string {
 	if row.GetError() != "" {
 		return row.GetError()
 	}
+	if ie := row.GetInstallError(); ie != "" {
+		return "its daemon cannot install migration credentials: " + ie
+	}
 	var trusts []string
 	for _, ca := range row.GetTrustedCas() {
 		trusts = append(trusts, ca.GetFingerprint())
@@ -233,6 +316,9 @@ func phaseUnmet(phase, newFP string, row *pb.MigrationTLSHostStatus) string {
 	case phaseTrustBoth:
 		if !slices.Contains(trusts, newFP) {
 			return "its daemon does not yet trust the new CA"
+		}
+		if ve := row.GetValidationError(); ve != "" {
+			return "its migration credentials fail validation: " + ve
 		}
 	case phaseReissue:
 		if row.GetCertIssuerFingerprint() != newFP || row.GetValidationError() != "" {
@@ -254,13 +340,18 @@ func finalizeMigrationRotation(pkiDir string, r *migrationRotation, now time.Tim
 	cur, curKey := filepath.Join(pkiDir, pki.MigrationCACertName), filepath.Join(pkiDir, pki.MigrationCAKeyName)
 	next, nextKey := filepath.Join(pkiDir, nextCACertName), filepath.Join(pkiDir, nextCAKeyName)
 	if fp, err := pki.CAFileFingerprint(cur); err == nil && fp != r.NewCAFingerprint {
-		retired := filepath.Join(pkiDir, "migration-ca.retired-"+now.Format("20060102")+".crt")
 		data, err := os.ReadFile(cur)
 		if err != nil {
 			return err
 		}
-		if err := secretfile.Write(retired, data, 0o644); err != nil {
+		retired, written, err := retiredCAPath(pkiDir, now, data)
+		if err != nil {
 			return err
+		}
+		if !written {
+			if err := secretfile.Write(retired, data, 0o644); err != nil {
+				return err
+			}
 		}
 	}
 	for _, mv := range [][2]string{{next, cur}, {nextKey, curKey}} {
@@ -272,4 +363,31 @@ func finalizeMigrationRotation(pkiDir string, r *migrationRotation, now time.Tim
 		return err
 	}
 	return nil
+}
+
+// retiredCAPath picks where the retired CA certificate data goes:
+// migration-ca.retired-<YYYYMMDD>.crt, or -2, -3, ... when a rotation earlier
+// that day already retired a different certificate there. A retired
+// certificate is never overwritten. written is true when one of those files
+// already holds data, as after a re-run of an interrupted finalize, so no
+// duplicate is written.
+func retiredCAPath(pkiDir string, now time.Time, data []byte) (path string, written bool, err error) {
+	base := "migration-ca.retired-" + now.Format("20060102")
+	for n := 1; ; n++ {
+		name := base + ".crt"
+		if n > 1 {
+			name = fmt.Sprintf("%s-%d.crt", base, n)
+		}
+		path = filepath.Join(pkiDir, name)
+		have, err := os.ReadFile(path)
+		if errors.Is(err, fs.ErrNotExist) {
+			return path, false, nil
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if bytes.Equal(have, data) {
+			return path, true, nil
+		}
+	}
 }

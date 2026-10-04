@@ -220,7 +220,7 @@ type MigrationTLSHost interface {
 func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTLSHost, reissue bool, out io.Writer) error {
 	if MigrationRotationInProgress(pkiDir) {
 		return fmt.Errorf("a migration-CA rotation is in progress (%s); finish it with "+
-			"`lv host rotate-migration-ca` before reissuing", filepath.Join(pkiDir, rotationFileName))
+			"`lv host rotate-migration-ca` before provisioning or reissuing", filepath.Join(pkiDir, rotationFileName))
 	}
 	provisioned := make(map[string]bool, len(hosts))
 	for _, h := range hosts {

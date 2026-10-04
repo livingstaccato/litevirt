@@ -37,6 +37,27 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		return fmt.Errorf("lookup domain %q: %w", name, err)
 	}
 
+	// Set max downtime before starting migration.
+	if p.MaxDowntimeMS > 0 {
+		_ = c.virt.DomainMigrateSetMaxDowntime(dom, uint64(p.MaxDowntimeMS), 0)
+	}
+
+	flags, params := migrationFlagsAndParams(p)
+	_, err = c.virt.DomainMigratePerform3Params(
+		dom,
+		[]string{dconnuri}, // OptString
+		params,
+		nil, // cookieIn
+		flags,
+	)
+	return err
+}
+
+// migrationFlagsAndParams builds the flags and typed parameters MigrateToTarget
+// hands DomainMigratePerform3Params. It is pure so the security-relevant bits —
+// VIR_MIGRATE_TLS and tls.destination on an untunnelled storage copy — can be
+// asserted without a libvirt connection.
+func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []golibvirt.TypedParam) {
 	flags := golibvirt.MigratePeer2peer |
 		golibvirt.MigratePersistDest |
 		golibvirt.MigrateUndefineSource
@@ -74,11 +95,6 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		flags |= golibvirt.MigrateTunnelled
 	}
 
-	// Set max downtime before starting migration.
-	if p.MaxDowntimeMS > 0 {
-		_ = c.virt.DomainMigrateSetMaxDowntime(dom, uint64(p.MaxDowntimeMS), 0)
-	}
-
 	var params []golibvirt.TypedParam
 	if p.BandwidthMiB > 0 {
 		params = append(params, golibvirt.TypedParam{
@@ -113,14 +129,7 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		})
 	}
 
-	_, err = c.virt.DomainMigratePerform3Params(
-		dom,
-		[]string{dconnuri}, // OptString
-		params,
-		nil, // cookieIn
-		flags,
-	)
-	return err
+	return flags, params
 }
 
 // DomainJobProgress returns the memory and disk migration progress (0–100)

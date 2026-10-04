@@ -781,6 +781,11 @@ func RelocateContainer(ctx context.Context, c *Client, oldHost, name, newHost st
 	return RelocateContainerWithToken(ctx, c, oldHost, name, newHost, "")
 }
 
+// relocateTargetLookup is the read RelocateContainerWithToken makes of the
+// target host before writing. A variable only so tests can make that read fail
+// or go stale; production never reassigns it.
+var relocateTargetLookup = GetContainer
+
 // RelocateContainerWithToken is RelocateContainer that also stamps a relocation
 // token on the re-keyed row. When the split-brain gate is enforced, the
 // coordinator mints a runtime_action_proofs row bound to this token and the
@@ -798,7 +803,11 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	// re-key onto a target that already holds a LIVE container of the same name —
 	// the UpsertContainer below would otherwise clobber an unrelated container.
 	// Fail BEFORE deleting the source so nothing is lost.
-	if existing, _ := GetContainer(ctx, c, newHost, name); existing != nil {
+	existing, err := relocateTargetLookup(ctx, c, newHost, name)
+	if err != nil {
+		return fmt.Errorf("check target host %q for a live container %q: %w", newHost, name, err)
+	}
+	if existing != nil {
 		return fmt.Errorf("target host %q already has a live container %q; refusing to clobber", newHost, name)
 	}
 	rec := *old
@@ -858,7 +867,23 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	}
 	now := c.NowTS()
 	wall := nowRFC3339()
+	// The target check is repeated inside the transaction. The read above runs
+	// before it, so a same-name container that lands on the target in between
+	// (replication, a concurrent create) would otherwise be overwritten by the
+	// target write's INSERT OR REPLACE. This is a local precondition like the
+	// guard itself; it adds no statement and changes no replicated shape.
+	targetTaken := false
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var live int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(1) FROM containers WHERE host_name = ? AND name = ? AND deleted_at IS NULL`,
+			newHost, name).Scan(&live); err != nil {
+			return false, fmt.Errorf("check target host %q for a live container %q: %w", newHost, name, err)
+		}
+		if live > 0 {
+			targetTaken = true
+			return false, nil
+		}
 		return c.mutationGuardMatches(ctx, tx, guard)
 	}, []Statement{
 		// Fence the source's managed interfaces while its parent row is still
@@ -873,6 +898,9 @@ func RelocateContainerWithToken(ctx context.Context, c *Client, oldHost, name, n
 	})
 	if err != nil {
 		return err
+	}
+	if targetTaken {
+		return fmt.Errorf("target host %q already has a live container %q; refusing to clobber", newHost, name)
 	}
 	if !applied {
 		return fmt.Errorf("container %q on %q moved underneath the relocation; retry", name, oldHost)

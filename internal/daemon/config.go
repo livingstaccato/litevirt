@@ -402,7 +402,8 @@ type AuthConfig struct {
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
 // behavior regardless of the durable latch. All default false except
-// AuditSignature and PartitionPause, which LoadConfig defaults to true.
+// AuditSignature and PartitionPause, which LoadConfig defaults to true. DigestV2
+// (not a capability token) also defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -456,7 +457,8 @@ type EnforcementConfig struct {
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
 	// presence (no cluster latch): a node emits v2 only when this is on, and two peers
 	// compare v2 only when both emitted it — so a non-uniform rollout is safe. Default
-	// false; reversible kill switch.
+	// TRUE (LoadConfig presets it): with it off, replicas founded at different schema
+	// versions disagree about identical rows forever. Explicit false is the kill switch.
 	DigestV2 bool `yaml:"digest_v2,omitempty"`
 	// CanonicalIdentity: resolve the natural-key identity tables (snapshots,
 	// container_snapshots) by their UNIQUE natural key instead of the minted random id
@@ -690,9 +692,9 @@ func LoadConfig() (*Config, error) {
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
 
-		// The two enforcement flags that default ON — see EnforcementConfig.
-		// AuditSignature and PartitionPause. An explicit false still wins.
-		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true},
+		// The enforcement flags that default ON — see EnforcementConfig.
+		// AuditSignature, PartitionPause and DigestV2. An explicit false still wins.
+		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, DigestV2: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

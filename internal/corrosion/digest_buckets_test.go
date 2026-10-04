@@ -179,7 +179,9 @@ func TestTableDigest_UnchangedByBuckets(t *testing.T) {
 	want := TableDigest{Name: "stacks", Count: len(keys), Hash: hashRowKeys(keys)}
 
 	ds, _ := c.StateDigest(context.Background())
-	if got := digestOf(t, ds, "stacks"); got != want {
+	got := digestOf(t, ds, "stacks")
+	got.HashV2 = "" // the v1 construction is what an older peer compares
+	if got != want {
 		t.Fatalf("stacks digest = %+v, want the pre-bucket construction %+v", got, want)
 	}
 	tb := bucketsOf(t, c, "stacks")
@@ -366,6 +368,7 @@ func TestDigestCache_BoundedByAgeFlagAndStandDown(t *testing.T) {
 		c := testClient(t)
 		f := withMetrics(c)
 		seedStacks(t, c, 3)
+		c.SetDigestV2Enabled(func() bool { return false })
 		before, _ := c.StateDigestCached(ctx)
 		c.SetDigestV2Enabled(func() bool { return true })
 		after, _ := c.StateDigestCached(ctx)

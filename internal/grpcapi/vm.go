@@ -2801,15 +2801,8 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// firmware state — it was the only destructive VM-lifecycle RPC in this file
 	// without the lock, so it could run straight through a concurrent start,
 	// resize or migrate of the same VM. Same placement as DeleteVM.
-	unlock := s.lockVM(req.Name)
-	unlocked := false
-	releaseLock := func() {
-		if !unlocked {
-			unlocked = true
-			unlock()
-		}
-	}
-	defer releaseLock()
+	unlock := releaseOnce(s.lockVM(req.Name))
+	defer unlock()
 
 	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
 	if err != nil || vm == nil {
@@ -2824,8 +2817,8 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		// other owns the VM (an in-flight migration, a stale host_name) would
 		// otherwise forward to each other while each holds its own per-VM
 		// lock, and both block until the gRPC deadlines fire, with every other
-		// operation on that VM queued behind them on both hosts.
-		releaseLock()
+		// operation on that VM queued behind them on both hosts. See releaseOnce.
+		unlock()
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)
@@ -2959,21 +2952,19 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// accepted in between would be silently undone by the handoff starting the VM
 	// from a stale snapshot — leaving the runtime running and the database
 	// recording an operator stop. Locked in name order, since two locks are held.
-	var unlocks []func()
+	// Both releases are captured, because the forward below has to drop BOTH
+	// before calling a peer — not just whichever one happened to be last.
+	var releases []func()
 	for _, n := range sortedPair(req.VmName, nextName) {
-		unlocks = append(unlocks, s.lockVM(n))
+		unlock := releaseOnce(s.lockVM(n))
+		releases = append(releases, unlock)
+		defer unlock()
 	}
-	unlocked := false
-	releaseLocks := func() {
-		if unlocked {
-			return
-		}
-		unlocked = true
-		for i := len(unlocks) - 1; i >= 0; i-- {
-			unlocks[i]()
+	unlock := func() {
+		for _, r := range releases {
+			r()
 		}
 	}
-	defer releaseLocks()
 	nextVM, err := corrosion.GetVM(ctx, s.db, nextName)
 	if err != nil || nextVM == nil {
 		return nil, status.Errorf(codes.NotFound, "no pending cutover — VM %q not found", nextName)
@@ -2991,7 +2982,9 @@ func (s *Server) CutoverVM(ctx context.Context, req *pb.CutoverVMRequest) (*pb.V
 	// never renamed on the real host, so it would come up with mismatched
 	// firmware (G1). The forwarded call runs locally on the owning host.
 	if nextVM.HostName != s.hostName {
-		releaseLocks() // never hold a process lock across a peer RPC
+		// Released BEFORE the forward: the lock must not be held across a peer
+		// RPC. See releaseOnce.
+		unlock()
 		client, conn, err := s.peerClient(ctx, nextVM.HostName)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable,

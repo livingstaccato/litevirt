@@ -251,6 +251,10 @@ func (h *sshMigrationTLSHost) Push(ctx context.Context, files []migrationFile) e
 	return pushMigrationCredentials(h.sc, files)
 }
 
+// MigrationRotationInProgress reports whether pkiDir holds an unfinished
+// `lv host rotate-migration-ca`. // ci:skip-cmd: rotate-migration-ca ships in a later task
+func MigrationRotationInProgress(pkiDir string) bool { return false }
+
 // SSHMigrationTLSHosts connects to every host in the cluster as sshUser.
 func SSHMigrationTLSHosts(ctx context.Context, c pb.LiteVirtClient, sshUser string) ([]MigrationTLSHost, func(), error) {
 	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})

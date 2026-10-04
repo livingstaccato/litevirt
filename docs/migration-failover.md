@@ -96,6 +96,14 @@ plaintext, and the source refuses it unless its config sets
 between hosts is trusted. Migrations of VMs on shared storage are tunnelled over
 libvirt's TLS and need neither.
 
+**Checking migration credentials.** `lv doctor migration-tls [--json]` asks
+every host which migration CA(s) it trusts, which CA issued its certificate,
+and when each expires — read-only, and non-zero on an unreachable host, an
+install-blocking problem, an expiring credential, a plaintext fallback, or a
+CA-set split across hosts with no rotation running from the operator machine.
+Each host also warns in its own log 90 days before a migration credential
+expires, whether or not anyone runs the doctor command.
+
 Only the host-local disks (`local` and `dir` pools) are copied. A disk on
 shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on
 the target, so it stays where it is; copying it would mirror the disk onto

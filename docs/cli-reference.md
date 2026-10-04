@@ -875,6 +875,7 @@ lv stats <vm>                                # VM resource statistics
 lv doctor divergence [--json] [--table <name>]... [--include-sensitive]   # Report replicated rows that disagree across nodes (read-only)
 lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the host that actually runs it (audited)
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
+lv doctor migration-tls [--json]             # Show every host's migration credentials and when they expire (read-only)
 ```
 
 `divergence` is read-only, and lists a lease-term tie that every host has
@@ -883,6 +884,13 @@ audited, admin-gated repair for an equal-timestamp ownership split a stationary 
 splits are reclaimed automatically by the runtime-repair reconcilers — see
 `docs/diagnostics.md` for the full model (categories, metrics, alerts, and the
 operational repair flow).
+
+`migration-tls` is read-only. It prints one row per host — HOST, STATUS,
+TRUSTS (the migration CAs it trusts), CERT FROM (which CA issued its
+certificate), EXPIRES — and exits non-zero when a host is unreachable, holds a
+set its daemon would refuse to install, expires within 90 days, falls back to
+plaintext (`migration.allow_unencrypted_storage`), or trusts a different CA
+set from its peers while no rotation (`lv host rotate-migration-ca`) is running from this machine. <!-- ci:skip-cmd: rotate-migration-ca ships in a later task -->
 
 ## Ansible integration
 

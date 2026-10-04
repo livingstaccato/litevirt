@@ -35,6 +35,16 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		return nil, status.Errorf(codes.InvalidArgument,
 			"invalid target name %q: only letters, digits, '_', '.', '-' are allowed", req.Target)
 	}
+	// Path-independent precheck BEFORE the source is resolved. The real
+	// per-path check is below, once the source's project is known -- but
+	// resolving first and authorizing second turns the handler into an
+	// existence oracle: NotFound means the name is free, PermissionDenied
+	// means another tenant owns a VM by that name, and VM names routinely
+	// encode customer and service identity. Same shape as CloneContainer and
+	// the other fetch-then-authorize handlers.
+	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
+		return nil, err
+	}
 	src, err := corrosion.GetVM(ctx, s.db, req.Source)
 	if err != nil || src == nil {
 		return nil, status.Errorf(codes.NotFound, "source %q not found", req.Source)

@@ -202,14 +202,22 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 		})
 	}
 
+	// The disk rows carry their bus from creation, so the startup hardware
+	// backfill has nothing to fill for a VM this build created: a row it does
+	// not write is a row it cannot write from a stale replica. They use
+	// InsertDisk's whole-row shape (diskRowSQL) because the plain create INSERT
+	// has no bus column, and a new shape would stall this node's stream to every
+	// peer on the previous release. The other v42 columns get exactly what the
+	// plain INSERT left them: the column defaults (device_kind 'disk',
+	// delete_with_vm 1) and NULL. Tombstoned rows of the name were purged above,
+	// so OR REPLACE can meet only a live row with no live VM above it.
 	for _, disk := range disks {
 		stmts = append(stmts, Statement{
-			SQL: `INSERT INTO vm_disks (vm_name, disk_name, host_name, path, size_bytes,
-				backing_image, storage_type, storage_volume, target_dev, backing_disk, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			SQL: diskRowSQL,
 			Params: []interface{}{
 				disk.VMName, disk.DiskName, disk.HostName, disk.Path, disk.SizeBytes,
-				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk), uts,
+				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk),
+				nullIfEmpty(disk.Bus), "disk", 1, nil, uts,
 			},
 		})
 	}
@@ -1357,22 +1365,93 @@ func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip
 	)
 }
 
-// InsertDisk adds a single disk record (used by hot-plug attach).
-func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
-	now := c.NowTS()
+// diskRowSQL writes one whole vm_disks row. It is InsertDisk's statement, and
+// the shape InsertVMWithHardware and BackfillDiskBus reuse so that neither
+// mints a fingerprint a receiver on the previous release does not know.
+const diskRowSQL = `INSERT OR REPLACE INTO vm_disks
+		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
+		  storage_type, storage_volume, target_dev, backing_disk,
+		  bus, device_kind, delete_with_vm, controller_model, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+
+// diskRowParams binds d to diskRowSQL at updated_at = now.
+func diskRowParams(d DiskRecord, now string) []interface{} {
 	deviceKind := d.DeviceKind
 	if deviceKind == "" {
 		deviceKind = "disk" // matches the vm_disks.device_kind column default
 	}
-	return c.Execute(ctx,
-		`INSERT OR REPLACE INTO vm_disks
-		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
-		  storage_type, storage_volume, target_dev, backing_disk,
-		  bus, device_kind, delete_with_vm, controller_model, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+	return []interface{}{
 		d.VMName, d.DiskName, d.HostName, d.Path, d.SizeBytes, d.BackingImage,
 		d.StorageType, d.StorageVolume, d.TargetDev, d.BackingDisk,
-		nullIfEmpty(d.Bus), deviceKind, boolToInt(d.DeleteWithVM), nullIfEmpty(d.ControllerModel), now)
+		nullIfEmpty(d.Bus), deviceKind, boolToInt(d.DeleteWithVM), nullIfEmpty(d.ControllerModel), now,
+	}
+}
+
+// InsertDisk adds a single disk record (used by hot-plug attach).
+func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
+	return c.Execute(ctx, diskRowSQL, diskRowParams(d, c.NowTS())...)
+}
+
+// BackfillDiskBus fills the empty bus of the disk row read as `read`, for the
+// startup hardware backfill run by owner. It writes only while, in the same
+// transaction, the live row is still exactly `read` — every column — with no
+// bus, and still names owner; applied=false means it did not.
+//
+// The write can therefore never MOVE the row. What it publishes is the row as
+// this node holds it, plus the bus, and the guard proves this node still holds
+// the row as it read it, as its own. A row that moved since the read, or that
+// names another host, is left alone. (On the kvm003 lab the backfill published
+// a row naming the host its VM had failed over from — drills 2 and 3 on
+// main-e004c250.)
+//
+// The guard is only as good as the local replica, which is why the caller
+// also waits for it to catch up (BackfillHardwareTables): on a replica that has
+// not, the row still names the old owner and nothing local can tell.
+//
+// The statement is InsertDisk's whole-row shape, not an UPDATE of the bus
+// column guarded by host_name on the wire. Such an UPDATE is a new
+// fingerprint; a receiver on the previous release back-pressures an unknown
+// shape, so this node's whole stream to it would stall for the rest of a
+// rolling upgrade, and every node emits this for its VMs as it is upgraded.
+// Nor would the wire predicate protect anything the local one does not:
+// anti-entropy merges whole rows, so a newer local row reaches every peer
+// whatever its statement said.
+func BackfillDiskBus(ctx context.Context, c *Client, read DiskRecord, bus, owner string) (bool, error) {
+	if bus == "" || read.Bus != "" || read.HostName != owner {
+		return false, nil
+	}
+	d := read
+	d.Bus = bus
+	readKind := read.DeviceKind
+	if readKind == "" {
+		readKind = "disk"
+	}
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var (
+			host, path, backingImage, storageType, storageVolume, targetDev string
+			backingDisk, curBus, deviceKind, controllerModel                string
+			sizeBytes, deleteWithVM                                         int64
+		)
+		err := tx.QueryRowContext(ctx,
+			`SELECT host_name, path, size_bytes, backing_image, storage_type, storage_volume,
+			        COALESCE(target_dev, ''), COALESCE(backing_disk, ''), COALESCE(bus, ''),
+			        COALESCE(device_kind, 'disk'), COALESCE(delete_with_vm, 1), COALESCE(controller_model, '')
+			 FROM vm_disks WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+			read.VMName, read.DiskName).Scan(&host, &path, &sizeBytes, &backingImage, &storageType,
+			&storageVolume, &targetDev, &backingDisk, &curBus, &deviceKind, &deleteWithVM, &controllerModel)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return host == owner && curBus == "" &&
+			path == read.Path && sizeBytes == read.SizeBytes && backingImage == read.BackingImage &&
+			storageType == read.StorageType && storageVolume == read.StorageVolume &&
+			targetDev == read.TargetDev && backingDisk == read.BackingDisk &&
+			deviceKind == readKind && (deleteWithVM == 1) == read.DeleteWithVM &&
+			controllerModel == read.ControllerModel, nil
+	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
 }
 
 // UpdateDiskHostAndPath updates the host and path for a disk after migration.

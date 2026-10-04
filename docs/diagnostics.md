@@ -47,7 +47,11 @@ its own once both conditions hold on every voting-eligible host —
    withholds `hardware_v2` from the capabilities it advertises until that pass
    completes. A node that advertised earlier could let the fleet latch — and stop
    maintaining the legacy spec mirror — while its own tables were still empty, so
-   a peer would read hardware that isn't there.
+   a peer would read hardware that isn't there. The audit itself waits for the
+   node's replica to catch up with the cluster (its first completed anti-entropy
+   exchange, logged as `replica caught up`): it writes rows for the VMs the node
+   believes it owns, and a node back from a fence still believes it owns the VMs
+   failover moved away. Until then the log says `hardware backfill deferred`.
 
 One node still working through its backfill therefore holds the entire cluster
 at pre-latch behavior. That is intended. Like the rest of the family the latch is

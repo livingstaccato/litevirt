@@ -202,6 +202,15 @@ func HistoricalShapes() []HistoricalShape {
 		  storage_type, storage_volume, target_dev, backing_disk, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "vm_disks_insert_v130")
 
+	// InsertVMWithHardware (v1.3.0..): the create's vm_disks INSERT, with no bus column. The
+	// current tree creates disk rows with InsertDisk's wider shape so the bus is recorded from
+	// creation, and the startup hardware backfill has nothing to fill for a VM it created.
+	// Supported peers still create VMs with the narrow shape, so it stays registered for the
+	// rolling-upgrade horizon.
+	add(`INSERT INTO vm_disks (vm_name, disk_name, host_name, path, size_bytes,
+				backing_image, storage_type, storage_volume, target_dev, backing_disk, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "vm_disks_create_insert_v130")
+
 	// ReleasePCIDevicesByVM (pre-branch): cluster-wide clear of a VM's PCI ownership by
 	// vm_name. The current tree releases per-device host+owner-scoped (ReleasePCIDevice) so a
 	// whole-VM teardown never clears a remote host's ownership without unbinding there.

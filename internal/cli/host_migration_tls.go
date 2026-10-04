@@ -2,8 +2,10 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -131,12 +133,42 @@ type migrationFile struct {
 	mode          os.FileMode
 }
 
+// migrationIssuingCA is the CA host certificates are issued from right now and
+// the trust bundle each host's ca.crt gets. Mid-rotation that is the NEW CA,
+// so a host added during a rotation is never left on the old one.
+func migrationIssuingCA(pkiDir string) (caCert, caKey, trustBundle string, err error) {
+	cur := filepath.Join(pkiDir, pki.MigrationCACertName)
+	r, err := loadMigrationRotation(pkiDir)
+	if err != nil {
+		return "", "", "", err
+	}
+	if !r.inProgress() {
+		return cur, filepath.Join(pkiDir, pki.MigrationCAKeyName), cur, nil
+	}
+	next, nextKey := filepath.Join(pkiDir, nextCACertName), filepath.Join(pkiDir, nextCAKeyName)
+	if _, err := os.Stat(next); errors.Is(err, fs.ErrNotExist) {
+		// Finalize already made the new CA current; only "done" is unsaved.
+		return cur, filepath.Join(pkiDir, pki.MigrationCAKeyName), cur, nil
+	}
+	switch r.Phase {
+	case phaseTrustBoth, phaseReissue:
+		return next, nextKey, filepath.Join(pkiDir, bundleCACertName), nil
+	default: // drop-old, cutover
+		return next, nextKey, next, nil
+	}
+}
+
 // issueMigrationCredentials mints the migration CA if needed (and existing
 // allows; see ensureLocalMigrationCA) and issues hostName's migration
 // certificate for ip. It returns the three files to put in the host's
-// migration directory: the CA, the certificate, and the key (0600).
+// migration directory: the trust bundle (ca.crt), the certificate, and the
+// key (0600). Mid-rotation the certificate is issued from the rotation's new
+// CA and the trust bundle reflects the rotation's phase (migrationIssuingCA).
 func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
-	caCert, caKey, _, err := ensureLocalMigrationCA(pkiDir, existing)
+	if _, _, _, err := ensureLocalMigrationCA(pkiDir, existing); err != nil {
+		return nil, err
+	}
+	caCert, caKey, trust, err := migrationIssuingCA(pkiDir)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +178,7 @@ func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migr
 		return nil, fmt.Errorf("issue %s's migration certificate: %w", hostName, err)
 	}
 	return []migrationFile{
-		{caCert, filepath.Join(remoteMigrationDir, pki.MigrationCAName), 0o644},
+		{trust, filepath.Join(remoteMigrationDir, pki.MigrationCAName), 0o644},
 		{cert, filepath.Join(remoteMigrationDir, pki.MigrationHostCertName), 0o644},
 		// 0600 and root's: the daemon copies it to QEMU's TLS directory owned by
 		// the QEMU user. Nothing else on the host needs to read it.
@@ -186,6 +218,10 @@ type MigrationTLSHost interface {
 // those came from another machine's CA, and certificates from a second CA would
 // not verify against them.
 func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTLSHost, reissue bool, out io.Writer) error {
+	if MigrationRotationInProgress(pkiDir) {
+		return fmt.Errorf("a migration-CA rotation is in progress (%s); finish it with "+
+			"`lv host rotate-migration-ca` before reissuing", filepath.Join(pkiDir, rotationFileName)) // ci:skip-cmd: rotate-migration-ca ships in a later task
+	}
 	provisioned := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
 		p, err := h.Provisioned(ctx)

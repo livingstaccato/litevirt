@@ -173,7 +173,7 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 	// QEMU parses these only when a migration opens its TLS channel, so a set
 	// it cannot use failed mid-copy with a generic error. Check it here, before
 	// anything is written, and report the host not ready.
-	if err := validateMigrationCredentials(ca, cert, key); err != nil {
+	if _, _, err := ValidateMigrationCredentials(ca, cert, key, time.Now()); err != nil {
 		return false, err
 	}
 
@@ -207,23 +207,27 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 	return true, nil
 }
 
-// validateMigrationCredentials checks a migration-credential set the way QEMU
-// will use it: the CA is a CA certificate, the host certificate was issued by
-// it, and the key is the certificate's. Any failure is
-// ErrInvalidMigrationCredentials.
-func validateMigrationCredentials(caPEM, certPEM, keyPEM []byte) error {
+// ValidateMigrationCredentials checks a migration-credential set the way QEMU
+// will use it at now: the CA file holds only CA certificates, the host
+// certificate was issued by one of them (an old and a new CA during a
+// rotation), both are within their validity, the certificate may serve and
+// dial TLS, and the key is the certificate's. A push copies the files one at a
+// time, so a set read mid-push fails here instead of at QEMU's handshake. It
+// returns the host certificate and the CAs it parsed, as far as it got; any
+// failure is ErrInvalidMigrationCredentials.
+func ValidateMigrationCredentials(caPEM, certPEM, keyPEM []byte, now time.Time) (*x509.Certificate, []*x509.Certificate, error) {
 	cas, err := parsePEMCertificates(caPEM)
 	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationCAName, err)
+		return nil, nil, fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationCAName, err)
 	}
 	for _, ca := range cas {
 		if !ca.IsCA {
-			return fmt.Errorf("%w: %s holds a certificate that is not a CA (%s)", ErrInvalidMigrationCredentials, MigrationCAName, ca.Subject)
+			return nil, cas, fmt.Errorf("%w: %s holds a certificate that is not a CA (%s)", ErrInvalidMigrationCredentials, MigrationCAName, ca.Subject)
 		}
 	}
 	cert, err := parsePEMCertificate(certPEM)
 	if err != nil {
-		return fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationHostCertName, err)
+		return nil, cas, fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationHostCertName, err)
 	}
 	// Any CA of the bundle (an old and a new one during a rotation).
 	var issuer *x509.Certificate
@@ -235,25 +239,30 @@ func validateMigrationCredentials(caPEM, certPEM, keyPEM []byte) error {
 		}
 	}
 	if issuer == nil {
-		return fmt.Errorf("%w: %s was not issued by a migration CA in %s: %v",
+		return cert, cas, fmt.Errorf("%w: %s was not issued by a CA in %s: %v",
 			ErrInvalidMigrationCredentials, MigrationHostCertName, MigrationCAName, sigErr)
 	}
-	now := time.Now()
 	for _, c := range []struct {
 		name string
 		cert *x509.Certificate
 	}{{MigrationHostCertName, cert}, {MigrationCAName, issuer}} {
 		if now.Before(c.cert.NotBefore) {
-			return fmt.Errorf("%w: %s is not valid until %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotBefore.UTC().Format(time.RFC3339))
+			return cert, cas, fmt.Errorf("%w: %s is not valid until %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotBefore.UTC().Format(time.RFC3339))
 		}
 		if now.After(c.cert.NotAfter) {
-			return fmt.Errorf("%w: %s expired at %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotAfter.UTC().Format(time.RFC3339))
+			return cert, cas, fmt.Errorf("%w: %s expired at %s", ErrInvalidMigrationCredentials, c.name, c.cert.NotAfter.UTC().Format(time.RFC3339))
 		}
 	}
-	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
-		return fmt.Errorf("%w: %s does not match %s: %v", ErrInvalidMigrationCredentials, MigrationHostKeyName, MigrationHostCertName, err)
+	// QEMU presents this one certificate as both the server and the client of
+	// the migration stream.
+	if len(cert.ExtKeyUsage) > 0 && (!hasUsage(cert, x509.ExtKeyUsageServerAuth) || !hasUsage(cert, x509.ExtKeyUsageClientAuth)) {
+		return cert, cas, fmt.Errorf("%w: %s is not usable for both TLS server and client authentication", ErrInvalidMigrationCredentials, MigrationHostCertName)
 	}
-	return nil
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return cert, cas, fmt.Errorf("%w: %s does not match %s (a credential push may be in progress): %v",
+			ErrInvalidMigrationCredentials, MigrationHostKeyName, MigrationHostCertName, err)
+	}
+	return cert, cas, nil
 }
 
 // parsePEMCertificates parses every PEM CERTIFICATE block of data; there must

@@ -1774,10 +1774,14 @@ func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName s
 // the target's own view, and the source's leftovers. Shared by the watched
 // path and an adopted migration, which used to commit ownership and stop.
 func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRecord, f migrationFinish) {
+	// All of it runs DETACHED from the request: ownership has been committed,
+	// nothing retries this finish, and the watched path passes the request
+	// context, which a client that went away after the cutover has cancelled.
+	// Not a timeout context cancelled on return: the target-notify goroutine
+	// below outlives this call and uses it.
+	ctx = context.WithoutCancel(ctx)
 	target := f.target.Name
-	// Queued on a DETACHED context, like the rest of the post-commit work — the
-	// request context may already be cancelled by the time the cutover finishes.
-	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
+	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
 	if len(f.detachedVFs) > 0 {

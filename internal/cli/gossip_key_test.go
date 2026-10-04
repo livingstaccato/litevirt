@@ -63,6 +63,11 @@ type fakeKeyHost struct {
 	fileDirty    bool
 	unreachable  bool
 	writes       [][]string // key IDs of every file written, in order
+	// memberlistOrder loads a file the way the daemon's memberlist keyring
+	// does — keys it lacks are appended, the primary moved to the front,
+	// keys the file dropped removed — so the live secondary order can differ
+	// from the file's. Off, the fake loads the file's order verbatim.
+	memberlistOrder bool
 }
 
 func (h *fakeKeyHost) liveMode() bool { return h.mode != "" && h.mode != "off" && len(h.live) > 0 }
@@ -102,6 +107,21 @@ func (h *fakeKeyHost) maybeLoadLocked() {
 	keys, err := pki.ParseGossipKeyring(h.file)
 	if err != nil {
 		return
+	}
+	if h.memberlistOrder && len(h.live) > 0 && len(keys) > 0 {
+		next := append([][]byte(nil), h.live...)
+		for _, k := range keys {
+			if !containsKey(next, k) {
+				next = append(next, k)
+			}
+		}
+		ordered := [][]byte{keys[0]}
+		for _, k := range next {
+			if !bytes.Equal(k, keys[0]) && containsKey(keys, k) {
+				ordered = append(ordered, k)
+			}
+		}
+		keys = ordered
 	}
 	h.live, h.fileDirty = keys, false
 	h.world.checkLocked()
@@ -271,6 +291,31 @@ func TestRotateGossipKey_SettlesAnInterruptedRotation(t *testing.T) {
 				t.Fatalf("output does not tell the operator the rotation itself still needs a run:\n%s", out.String())
 			}
 		})
+	}
+}
+
+// TestRotateGossipKey_BarrierAcceptsReorderedSecondaries: a daemon live on
+// [A,B] that loads a file reading [A,C,B] reports [A,B,C] — memberlist appends
+// a key it adds. That is the file's keyring (same primary, same keys), so the
+// barrier must pass; comparing in order waited out the timeout on a host that
+// had loaded everything.
+//
+// Mutation: compare the barrier's IDs in order — RotateGossipKey times out at
+// the resync barrier and this goes red.
+func TestRotateGossipKey_BarrierAcceptsReorderedSecondaries(t *testing.T) {
+	a, b, c := testKey(t), testKey(t), testKey(t)
+	local := writeLocal(t, [][]byte{a, c, b})
+	w, hosts := newKeyWorld(t, "enforced", [][]byte{a, b}, 0, 1)
+	for _, h := range w.hosts {
+		h.memberlistOrder = true
+	}
+	opt := fastOpts()
+	opt.Timeout = 300 * time.Millisecond
+	if err := RotateGossipKey(context.Background(), local, hosts, opt); err != nil {
+		t.Fatalf("a host on the file's keyring, secondaries in memberlist's order, failed the barrier: %v", err)
+	}
+	if len(w.violations) > 0 {
+		t.Fatalf("rotation split the cluster: %v", w.violations)
 	}
 }
 

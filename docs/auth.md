@@ -583,7 +583,9 @@ rejected=0
 ```
 
 `primary` is the keyring's first key, and `keys` every key it decrypts with,
-primary first. `primary` is set at every stage but `false` — `install` too, where
+primary first. The order of the keys after the primary is the daemon's, not
+the file's, and means nothing: a host whose `primary` and set of `keys` match
+the file has loaded it. `primary` is set at every stage but `false` — `install` too, where
 the host holds the key but still **sends plaintext** — so it says which key the
 host encrypts with *once its stage sends encrypted*, not that it is encrypting;
 `mode` says that. `lv host install-gossip-key` reports each host from both:

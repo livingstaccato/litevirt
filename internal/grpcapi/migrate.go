@@ -94,7 +94,14 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 
 	// Per-VM lock prevents concurrent snapshot/migrate/delete (#27).
 	unlock := s.lockVM(req.VmName)
-	defer unlock()
+	unlocked := false
+	releaseLock := func() {
+		if !unlocked {
+			unlocked = true
+			unlock()
+		}
+	}
+	defer releaseLock()
 
 	send := func(phase pb.MigratePhase, memPct, diskPct float32) error {
 		return stream.Send(&pb.MigrateProgress{
@@ -118,6 +125,14 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return err
 	}
 	if vm.HostName != s.hostName {
+		// This node does not own the VM, so its local per-VM lock protects
+		// nothing here -- and this forward STREAMS, so holding it would pin the
+		// lock for the entire remote migration. Two nodes with a contradictory
+		// view of the owner would each lock and forward to the other, and both
+		// block until the deadlines fire with every operation on that VM queued
+		// behind them. The lock is taken again, for real, by the handler on the
+		// node that actually owns it.
+		releaseLock()
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "cannot reach host %s: %v", vm.HostName, err)

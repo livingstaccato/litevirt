@@ -3289,7 +3289,7 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 		if rerr != nil {
 			return rerr
 		}
-		applied = rewritten
+		applied = replacedObservationApply(tableName, sh, rewritten)
 	}
 	res, err := tx.ExecContext(ctx, applied, s.Params...)
 	if err == nil && rowsChanged(res) {

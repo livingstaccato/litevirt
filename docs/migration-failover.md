@@ -68,6 +68,14 @@ lv migrate my-vm host-b --with-storage
 The disk is streamed to the target over libvirt's block-copy / NBD channel
 while the VM keeps running; the source is undefined after a successful cutover.
 
+**This copy is not encrypted.** It cannot be tunnelled through libvirt's TLS
+connection, so the guest's memory and disk blocks cross the network in
+plaintext. A source host therefore refuses it unless its config sets
+`migration.allow_unencrypted_storage: true` (see
+[configuration](configuration.md#migration)). Set that only where the network
+between hosts is trusted. Migrations of VMs on shared storage are tunnelled over
+TLS and need no setting.
+
 Only the host-local disks (`local` and `dir` pools) are copied. A disk on
 shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on
 the target, so it stays where it is; copying it would mirror the disk onto

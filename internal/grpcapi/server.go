@@ -272,6 +272,11 @@ type Server struct {
 	// enfLiveResize is this node's kill-switch for TRUE live CPU/balloon resize
 	// (setting max_cpu); gated by this flag AND the LiveResizeV1 latch.
 	enfLiveResize bool
+	// allowPlaintextStorageMigration is this node's
+	// migration.allow_unencrypted_storage. A storage-copying migration sends RAM
+	// and disk blocks over a direct, unencrypted QEMU stream, so MigrateVM refuses
+	// one unless the operator set this. Default false.
+	allowPlaintextStorageMigration bool
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like
@@ -1158,6 +1163,11 @@ func (s *Server) hardwareV2Ready() bool {
 
 // SetLiveResize sets this node's kill-switch for TRUE live CPU/balloon resize.
 func (s *Server) SetLiveResize(on bool) { s.enfLiveResize = on }
+
+// SetAllowUnencryptedStorageMigration sets migration.allow_unencrypted_storage:
+// whether this node, as a migration source, may send a storage copy in
+// plaintext.
+func (s *Server) SetAllowUnencryptedStorageMigration(on bool) { s.allowPlaintextStorageMigration = on }
 
 // SetCanonicalIdentityEnforce sets this node's kill-switch for natural-key identity
 // resolution (enforcement.canonical_identity). Enforcement is this flag AND the

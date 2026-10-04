@@ -288,6 +288,22 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			withStorage = false
 		}
 	}
+	// A storage copy cannot be tunnelled through libvirt's TLS connection: QEMU
+	// opens a direct tcp:// migration stream and an NBD channel to the target,
+	// and both carry the guest's RAM and disk blocks unencrypted. Refuse before
+	// any work unless this node's operator has declared the path trusted.
+	// Encrypting it needs a migration-only CA whose key QEMU may read; reusing
+	// the host's cluster key there would hand it to any guest that escapes into
+	// its QEMU process.
+	if withStorage && !s.allowPlaintextStorageMigration {
+		return status.Errorf(codes.FailedPrecondition,
+			"refusing to migrate VM %q with a storage copy: litevirt cannot encrypt that "+
+				"transfer yet, so the guest's memory and disk contents would cross the network "+
+				"between %s and %s in plaintext. If that network is trusted, set "+
+				"`migration.allow_unencrypted_storage: true` in %s's config.yaml and restart "+
+				"its daemon; otherwise move the VM's disks to shared storage first",
+			req.VmName, s.hostName, req.TargetHost, s.hostName)
+	}
 	// The disks the copy needs on the target, checked against their records
 	// here, before any work on the target.
 	var diskStubs []*pb.DiskStub

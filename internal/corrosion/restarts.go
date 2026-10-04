@@ -36,6 +36,11 @@ func GetRestartState(ctx context.Context, c *Client, vmName string) (*RestartSta
 }
 
 // IncrementRestart records a restart attempt for a VM.
+//
+// updated_at is the row's LWW key and comes from c.NowTS(), not the wall
+// second the other columns carry: the health check resets an expired window
+// and records the restart in the same pass, and a peer drops a write whose
+// updated_at ties the row it lands on. The same holds for every writer below.
 func IncrementRestart(ctx context.Context, c *Client, vmName string) error {
 	now := time.Now().UTC().Format(time.RFC3339)
 	return c.Execute(ctx,
@@ -45,7 +50,7 @@ func IncrementRestart(ctx context.Context, c *Client, vmName string) error {
 		   attempt_count = vm_restarts.attempt_count + 1,
 		   last_restart = excluded.last_restart,
 		   updated_at = excluded.updated_at`,
-		vmName, now, now, now,
+		vmName, now, now, c.NowTS(),
 	)
 }
 
@@ -60,7 +65,7 @@ func ResetRestartState(ctx context.Context, c *Client, vmName string) error {
 		   window_start = excluded.window_start,
 		   last_restart = NULL,
 		   updated_at = excluded.updated_at`,
-		vmName, now, now,
+		vmName, now, c.NowTS(),
 	)
 }
 
@@ -115,7 +120,7 @@ func IncrementContainerRestart(ctx context.Context, c *Client, hostName, name st
 		   attempt_count = container_restarts.attempt_count + 1,
 		   last_restart = excluded.last_restart,
 		   updated_at = excluded.updated_at`,
-		hostName, name, now, now, now,
+		hostName, name, now, now, c.NowTS(),
 	)
 }
 
@@ -130,7 +135,7 @@ func ResetContainerRestartState(ctx context.Context, c *Client, hostName, name s
 		   window_start = excluded.window_start,
 		   last_restart = NULL,
 		   updated_at = excluded.updated_at`,
-		hostName, name, now, now,
+		hostName, name, now, c.NowTS(),
 	)
 }
 

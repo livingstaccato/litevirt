@@ -165,6 +165,13 @@ Hardening features are gated on cluster-wide capability tokens
 - the latch is monotone and durable: once formed it survives a restart and does
   not re-open when a peer becomes unreachable (a partition fails **closed**)
 - enabling on one node changes nothing
+- **Retiring a token** (`capabilities.retired`): a later build can stop advertising,
+  latching and enforcing a token, but never by just deleting its name. Move it from
+  `All()` into the retired set in the same change: the rollback preflight
+  WAL-quarantines a node holding a marker for a name its binary does not know, so a
+  plain deletion quarantines every cluster that latched it on UPGRADE. A retired name
+  is never reused; its successor gets a new one (`canonical_registry_v1` → planned
+  `canonical_registry_v2`, docs/design/canonical-registry-credentials.md).
 
 There are exceptions, of two different kinds, and neither is "the one":
 

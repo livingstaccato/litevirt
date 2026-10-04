@@ -53,6 +53,22 @@ func TestMigrationTLSProblems_FlagsEachCondition(t *testing.T) {
 	}
 }
 
+// A host whose daemon cannot install a valid set is a problem, and its STATUS
+// reads invalid.
+//
+// Mutation: drop the install_error check — no line names the refusal.
+func TestMigrationTLSProblems_FlagsAnInstallRefusal(t *testing.T) {
+	now := time.Now()
+	far := now.Add(365 * 24 * time.Hour)
+	refused := row("b", "x", far, "x")
+	refused.InstallError = "cannot tell which user QEMU runs as"
+	rows := []*pb.MigrationTLSHostStatus{row("a", "x", far, "x"), refused}
+	got := strings.Join(migrationTLSProblems(rows, false, now), "\n")
+	if !strings.Contains(got, "b: its daemon cannot install migration credentials: cannot tell which user QEMU runs as") {
+		t.Errorf("problems do not name the install refusal:\n%s", got)
+	}
+}
+
 // Review focus 5: run away from the operator machine mid-rotation, a CA-set
 // mismatch is reported, with the hint that a rotation may be running.
 // Mid-rotation on the operator machine (rotating=true), it is not a problem.

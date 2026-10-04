@@ -114,7 +114,10 @@ type Config struct {
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
 	db *sql.DB
-	mu sync.RWMutex
+	// memKeeper holds a test client's in-memory database open while the
+	// pool above reaps idle connections (openTestDB). Nil outside tests.
+	memKeeper *sql.DB
+	mu        sync.RWMutex
 	// dsn is what db was opened with; tableGens counts the row changes every
 	// connection of that database reports (digest_cache.go), and digests is
 	// the anti-entropy digest cache they invalidate. tableGens is nil for a
@@ -1101,6 +1104,9 @@ func (c *Client) Close() error {
 	}
 	if c.db != nil {
 		err := c.db.Close()
+		if c.memKeeper != nil {
+			_ = c.memKeeper.Close()
+		}
 		if c.tableGens != nil {
 			// A client beside the daemon (NewLocalClient) that wrote tells
 			// the daemon's digest cache, which its hook cannot see.

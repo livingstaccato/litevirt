@@ -121,18 +121,14 @@ func NewTestClient() (*Client, error) {
 	// contention into spurious test-only refusals.
 	dsn := fmt.Sprintf("file:testdb%d?mode=memory&cache=shared&_pragma=busy_timeout(5000)", id)
 
-	db, gens, err := openHookedDB(dsn)
+	db, gens, keeper, err := openTestDB(dsn)
 	if err != nil {
-		return nil, err
-	}
-	if err := db.Ping(); err != nil {
-		db.Close()
-		releaseGenerations(dsn)
 		return nil, err
 	}
 
 	c := &Client{
 		db:               db,
+		memKeeper:        keeper,
 		dsn:              dsn,
 		tableGens:        gens,
 		hostName:         "test-node",
@@ -142,6 +138,44 @@ func NewTestClient() (*Client, error) {
 	}
 	c.SetLeaseTermLedgerGate(testLeaseTermLedgerOpen)
 	return c, nil
+}
+
+// openTestDB opens a shared-cache in-memory database for a test client, plus
+// a keeper: a second handle to the same database that holds one connection
+// open for as long as the client is (Close releases it).
+//
+// A shared-cache in-memory database exists only while some connection to it
+// is open, and the client's pool closes a connection nobody has used for
+// maxConnIdleTime. A test that sits idle that long — waiting out a daemon
+// loop's first delay, say — would otherwise lose every connection and the
+// database with them, and its next statement would open a fresh, empty one
+// ("no such table"). The keeper is a separate handle rather than a connection
+// pinned out of the client's own pool, so that pool's sizing and its Stats
+// stay what production sees. It sets neither an idle time nor a lifetime, so
+// database/sql never closes the connection Ping leaves in it.
+func openTestDB(dsn string) (*sql.DB, *tableGenerations, *sql.DB, error) {
+	db, gens, err := openHookedDB(dsn)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	fail := func(err error) (*sql.DB, *tableGenerations, *sql.DB, error) {
+		db.Close()
+		releaseGenerations(dsn)
+		return nil, nil, nil, err
+	}
+	if err := db.Ping(); err != nil {
+		return fail(err)
+	}
+	keeper, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return fail(err)
+	}
+	keeper.SetMaxIdleConns(1)
+	if err := keeper.Ping(); err != nil {
+		keeper.Close()
+		return fail(err)
+	}
+	return db, gens, keeper, nil
 }
 
 // testLeaseTermLedgerOpen is what the test constructors wire into
@@ -161,17 +195,13 @@ func testLeaseTermLedgerOpen() bool { return true }
 // Test-only. The returned client is not started (no replicator, no gossip).
 func NewSharedTestClient(dsnSuffix, hostName string) (*Client, error) {
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared&_pragma=busy_timeout(5000)", dsnSuffix)
-	db, gens, err := openHookedDB(dsn)
+	db, gens, keeper, err := openTestDB(dsn)
 	if err != nil {
-		return nil, err
-	}
-	if err := db.Ping(); err != nil {
-		db.Close()
-		releaseGenerations(dsn)
 		return nil, err
 	}
 	c := &Client{
 		db:               db,
+		memKeeper:        keeper,
 		dsn:              dsn,
 		tableGens:        gens,
 		hostName:         hostName,

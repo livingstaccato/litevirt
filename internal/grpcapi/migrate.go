@@ -654,14 +654,20 @@ poll:
 				// Migration failed — VM is still on the source host.
 				// Check if the domain is still alive; if so, restore to "running"
 				// instead of leaving it in "error" (#21).
+				//
+				// Bounded and detached from the request: a client that goes
+				// away now must not drop the restore and strand the row
+				// `migrating`, which nothing else heals.
+				fctx, fcancel := detachedMigrateCleanupCtx(ctx)
+				defer fcancel()
 				// The VFs go back before the row says running: the guest stayed.
-				s.reattachVFsOnSource(context.WithoutCancel(ctx), vm.Name, detachedVFs)
-				if s.restoreSourceStateAfterFailedMigration(ctx, vm.Name,
+				s.reattachVFsOnSource(fctx, vm.Name, detachedVFs)
+				if s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
 					fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
 					slog.Warn("migration failed but VM still running on source",
 						"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
 				}
-				s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, createdStubs)
+				s.cleanupFailedMigrationTarget(fctx, vm.Name, req.TargetHost, createdStubs)
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)

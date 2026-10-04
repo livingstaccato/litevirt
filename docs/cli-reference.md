@@ -1647,6 +1647,7 @@ lv doctor firmware-move <vm> --confirm-target-nvram --accept-nvram-hash=<sha256>
 lv doctor firmware-move <vm> --push-source-nvram [--acknowledge-rollback] [--stop-target]
 lv doctor firmware-move <vm> --resolve unverified|quarantine
                                              # Resolve a parked live firmware move (admin, vm.firmware-move; audited)
+lv doctor migration-tls [--json]             # Show every host's migration credentials and when they expire (read-only)
 ```
 
 `divergence` is read-only, and lists a lease-term tie that every host has
@@ -1662,6 +1663,13 @@ the host whose record it acts on, by the move's state: see
 for which action takes which state. It refuses an action the state has no row
 for. `--acknowledge-rollback` is required where the source's copy may be older
 than the target's.
+
+`migration-tls` is read-only. It prints one row per host — HOST, STATUS,
+TRUSTS (the migration CAs it trusts), CERT FROM (which CA issued its
+certificate), EXPIRES — and exits non-zero when a host is unreachable, holds a
+set its daemon would refuse to install, expires within 90 days, falls back to
+plaintext (`migration.allow_unencrypted_storage`), or trusts a different CA
+set from its peers while no rotation (`lv host rotate-migration-ca`) is running from this machine. <!-- ci:skip-cmd: rotate-migration-ca ships in a later task -->
 
 ## Ansible integration
 

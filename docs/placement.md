@@ -56,7 +56,11 @@ Default weights (tunable via `Request.Weights`):
 | Network bandwidth | 10 | label-declared capacity + sampled usage |
 | NUMA fit | 10 | label-driven |
 | Host generation | 5 | label-driven |
-| Power / thermal | 5 | placeholder (needs IPMI) |
+
+There is no power or thermal dimension. One was registered with no telemetry
+behind it, so it never affected placement; it was removed on 2026-10-04.
+[design/placement-power-dimension.md](design/placement-power-dimension.md)
+records what it needs before it returns.
 
 A dimension with **capacity ≤ 0 contributes nothing** (it is skipped, not treated
 as infinite headroom) — so the cluster scores cleanly on CPU+RAM even before the

@@ -13,7 +13,6 @@ type DimensionWeights struct {
 	NetBW    float64
 	NUMA     float64
 	HostGen  float64
-	Power    float64
 }
 
 // DefaultWeights are the baseline weights from the design.
@@ -25,7 +24,6 @@ func DefaultWeights() DimensionWeights {
 		NetBW:    10,
 		NUMA:     10,
 		HostGen:  5,
-		Power:    5,
 	}
 }
 
@@ -33,9 +31,13 @@ func DefaultWeights() DimensionWeights {
 // DefaultWeights() unless a test is exercising a specific weight ratio.
 //
 // CPU/RAM are always wired; NUMA/HostGen and DiskIOPS/NetBW are label-driven
-// (a host without the relevant label reports Capacity=0). Power has no telemetry
-// yet. A dimension with Capacity<=0 is skipped by scoreDimension, so the list is
-// always safe — unconfigured dimensions simply don't contribute.
+// (a host without the relevant label reports Capacity=0). A dimension with
+// Capacity<=0 is skipped by scoreDimension, so the list is always safe —
+// unconfigured dimensions simply don't contribute.
+//
+// There is no power/thermal dimension: it was registered with no telemetry
+// behind it and was removed. docs/design/placement-power-dimension.md says
+// what it needs before it returns.
 func AllDimensions(w DimensionWeights) []Dimension {
 	return []Dimension{
 		cpuDim{w: w.CPU},
@@ -44,7 +46,6 @@ func AllDimensions(w DimensionWeights) []Dimension {
 		netBWDim{w: w.NetBW},
 		numaDim{w: w.NUMA},
 		hostGenDim{w: w.HostGen},
-		powerDim{w: w.Power},
 	}
 }
 
@@ -197,13 +198,3 @@ func (d hostGenDim) Capacity(s *ClusterSnapshot, host string) float64 {
 	return gen / 10
 }
 func (d hostGenDim) Demand(req *Request) float64 { return 0 }
-
-// ───────── Power / thermal (placeholder) ─────────
-
-type powerDim struct{ w float64 }
-
-func (d powerDim) Name() string                                     { return "power" }
-func (d powerDim) Weight() float64                                  { return d.w }
-func (d powerDim) Used(s *ClusterSnapshot, host string) float64     { return 0 }
-func (d powerDim) Capacity(s *ClusterSnapshot, host string) float64 { return 0 }
-func (d powerDim) Demand(req *Request) float64                      { return 0 }

@@ -182,6 +182,15 @@ func TestFleet_HostMembership_ARollKeepsFencingAndTheVoterSet(t *testing.T) {
 	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 2671})
 	a, b, victim := c.Nodes[0], c.Nodes[1], c.Nodes[2]
 	insertVM(t, a, "vm-victim", victim.Name)
+	// Every node's own registration of every host must arrive before stage 1
+	// writes one column of the victim's row. The harness inserts each hosts
+	// row on every node, each with its own second-precision created_at; a
+	// state write that reaches a node before a peer's insert has it skip that
+	// insert as older, and the nodes then hold the row at one updated_at with
+	// different created_at — apart for good, since this harness runs no
+	// anti-entropy on a timer. Under full-suite load (-p 16) the inserts
+	// straddle a second often enough to fail the wait below.
+	c.WaitConverged(t, convergeTimeout)
 
 	// Stage 1.
 	if err := corrosion.UpdateHostState(ctx, b.DB, victim.Name, "draining"); err != nil {

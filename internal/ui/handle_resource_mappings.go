@@ -72,9 +72,12 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	if err := corrosion.DeleteResourceMapping(r.Context(), s.db, r.PathValue("name")); err != nil {
+	// Through the twin, like create: it checks resourcemap.write against the
+	// session's own credential, exactly as for the CLI.
+	if _, err := s.grpc.DeleteResourceMapping(s.uiBearerCtx(r),
+		&pb.DeleteResourceMappingRequest{Name: r.PathValue("name")}); err != nil {
 		sendToast(w, "Delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Resource mapping deleted", "success")

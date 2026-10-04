@@ -48,6 +48,11 @@ import (
 //     apply users statements — so it needs a ReplicationGated capability token,
 //     the way lease_term_ledger_v1 got one, rather than an edit to a map.
 //     Refusing at the apply sites leaves every disposition untouched.
+//   - It does not cover what the refused account does AFTERWARDS. Every other
+//     auth table is keyed by username alone, so a factor enrolled, or a password
+//     changed, on the node that kept its own admin replicates as the cluster
+//     admin's. That is an accepted residual; binding those rows to the account
+//     is written up in docs/design/auth-rows-account-identity.md.
 //
 // The refusal is asymmetric during a rolling upgrade: an old node still takes
 // the row, a new node keeps its own. That is the point — #224 asks for a

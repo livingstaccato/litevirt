@@ -679,6 +679,17 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 	prevByHost := map[string]string{} // per-host running tail
 	seqByHost := map[string]int64{}   // per-host last seq seen
 	hashedByHost := map[string]bool{} // has this host produced a hashed row yet?
+	// Unsigned seq-0 rows of a contracted host, held until the chain says where
+	// they sit. See "seq 0 under a contract" below.
+	legacy := map[string]*legacyRun{}
+	var legacyOrder []string
+	flagLegacy := func(host string) {
+		for _, id := range legacy[host].ids {
+			res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
+				"%s: row %s carries no signature and no sequence, and does not link into the "+
+					"history before this host's signing contract", host, id))
+		}
+	}
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
@@ -721,8 +732,12 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			Result:    r.String("result"),
 			PrevHash:  prevByHost[host],
 		}
-		if expect := HashAuditRow(rec); !strings.EqualFold(expect, stored) && res.BrokenAt == "" {
+		linked := strings.EqualFold(HashAuditRow(rec), stored)
+		if !linked && res.BrokenAt == "" {
 			res.BrokenAt = rec.ID
+		}
+		if run := legacy[host]; run != nil && !linked {
+			run.broken = true
 		}
 		// A row with a NUL in a hashed field can share its hash — and so its
 		// signature — with a different row (auditCanonical). Checked whether or
@@ -751,6 +766,14 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		// hundreds of them on the first verify after an upgrade, under a heading
 		// that says rows were deleted. Skipped rather than compared.
 		if seq > 0 {
+			// The host's first numbered row closes its seq-0 region: its stored
+			// hash commits to everything before it.
+			if run := legacy[host]; run != nil && !run.resolved {
+				run.resolved = true
+				if run.broken {
+					flagLegacy(host)
+				}
+			}
 			if last, seen := seqByHost[host]; seen && seq != last+1 {
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
@@ -776,16 +799,62 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			// report a whole cluster's pre-enforcement history as tampering the
 			// day signing is switched on.
 			//
-			// A row with NO sequence is placed by where it sits in the chain
-			// instead. seq 0 is what every pre-v45 row carries, so an attacker
-			// appending one would otherwise sit below any contract start and be
-			// excused for free — and to place it below the start honestly they
-			// would have to link it into the legacy region, which breaks the hash
-			// of every row after it.
-			// seq 0 is not a numbering. InsertAuditLog assigns seq >= 1 to
-			// every row it writes, so a row carrying 0 was not written by a
-			// daemon at all — it was inserted straight into the table.
-			if contract, underContract := contracted[host]; underContract && (seq == 0 || seq > contract.startSeq) {
+			// seq 0 under a contract. seq 0 is not a position: it is the column
+			// default the v45 migration gave every row written before it, and a
+			// legacy host adopts at startSeq 0. Reading it as "after the start"
+			// (the old `seq == 0 ||`) reported an upgraded cluster's whole
+			// history as tampering the day signing came on, which is the false
+			// alarm the contract start exists to prevent.
+			//
+			// It cannot simply be excused either. Since v45 InsertAuditLog
+			// assigns seq = tail+1 >= 1 to every row it writes, so no daemon
+			// writes a seq-0 row after the upgrade — but anyone who can write
+			// the table can, and an unconditional excuse would make seq 0 the
+			// free way to forge an unsigned row under a contract.
+			//
+			// So a seq-0 row is placed by the chain instead. The walk orders by
+			// seq, so a host's seq-0 rows form one region ahead of all its
+			// numbered rows, and the host's first numbered row was chained onto
+			// the tail of that region when it was written. Its stored hash
+			// therefore commits to every seq-0 row before it. The region is
+			// excused only if every row in it, and that first numbered row,
+			// link: a row spliced in anywhere — appended after the legacy tail,
+			// or chained onto a post-upgrade row and sorted back by its seq of 0
+			// — breaks a link the real history committed to, and the whole
+			// region is reported, since the verifier cannot tell which of its
+			// rows is the stranger.
+			//
+			// A host with no numbered row yet (upgraded and adopted, idle since)
+			// has nothing committing to its region, and it is excused if it is
+			// internally linked. That is deliberate. With no post-upgrade anchor
+			// the region is unsigned, unanchored history that anyone able to
+			// write the table could already rewrite and re-hash undetected; an
+			// appended row is no more than that. Flagging the region instead
+			// says "tampered" for every honest idle host and for an attacked one
+			// alike, which distinguishes nothing. Once the host writes, its first
+			// row is chained onto the tail it holds, and a row appended after
+			// that tail was loaded breaks the link and is reported here.
+			contract, underContract := contracted[host]
+			if underContract && seq == 0 {
+				run := legacy[host]
+				if run == nil {
+					run = &legacyRun{}
+					legacy[host] = run
+					legacyOrder = append(legacyOrder, host)
+				}
+				if run.resolved {
+					// Cannot happen in seq order; never excuse what cannot be placed.
+					res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
+						"%s: row %s carries no signature and no sequence", host, rec.ID))
+					continue
+				}
+				run.ids = append(run.ids, rec.ID)
+				if !linked {
+					run.broken = true
+				}
+				continue
+			}
+			if underContract && seq > contract.startSeq {
 				res.UnsignedAfterSigned = append(res.UnsignedAfterSigned, fmt.Sprintf(
 					"%s: row %s carries no signature, but this host has a published signing "+
 						"certificate and no retirement", host, rec.ID))
@@ -817,10 +886,26 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		}
 	}
 
+	// Regions no numbered row closed: excused when internally linked (see "seq 0
+	// under a contract"), reported when not.
+	for _, host := range legacyOrder {
+		if run := legacy[host]; !run.resolved && run.broken {
+			flagLegacy(host)
+		}
+	}
+
 	if err := verifyChainHeads(ctx, c, keyring, seqByHost, retired, &res); err != nil {
 		return res, err
 	}
 	return res, nil
+}
+
+// legacyRun is one contracted host's unsigned seq-0 rows, pending until the
+// chain places them (VerifyAuditChain, "seq 0 under a contract").
+type legacyRun struct {
+	ids      []string
+	broken   bool // a row in the region, or the row closing it, failed to link
+	resolved bool // the host's first numbered row has been reached
 }
 
 // isUnknownKeyErr separates "we could not obtain a trustworthy public key" from

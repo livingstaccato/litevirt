@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // A node joining an existing cluster must not mint an admin credential.
@@ -409,7 +410,8 @@ func TestSeedAdminUser_CapabilityLatchesOutrankTheMarker(t *testing.T) {
 	db := newHostTestClient(t)
 
 	d := founderDaemon(t, db, filepath.Join(t.TempDir(), "admin-password"))
-	latch := filepath.Join(d.cfg.DataDir, "split_brain_activated.voter_config_v1")
+	// Where the checker writes it, so the test follows the scheme if it changes.
+	latch := health.ActivationMarkerPath(d.cfg.DataDir, "voter_config_v1")
 	if err := os.WriteFile(latch, nil, 0600); err != nil {
 		t.Fatal(err)
 	}

@@ -902,6 +902,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
 	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
+	migrationTLS := d.migrationTLSInstaller()
+	svc.SetMigrationTLS(migrationTLS)
+	// Install once at start so the operator sees the state in the log; it runs
+	// again before each storage migration.
+	if ok, err := migrationTLS(); err != nil {
+		slog.Warn("migration TLS: not installed; storage migrations from or to this host "+
+			"cannot be encrypted", "error", err)
+	} else if ok {
+		slog.Info("migration TLS: credentials installed for QEMU", "dir", pki.QemuTLSDir)
+	} else {
+		slog.Info("migration TLS: this host has no migration credentials; provision them with " +
+			"`lv host install-migration-tls`")
+	}
 	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
 	// overrides live on the host record and win where set.
 	svc.SetCapacityPolicy(capacity)

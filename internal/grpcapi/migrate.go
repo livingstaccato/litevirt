@@ -289,20 +289,18 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		}
 	}
 	// A storage copy cannot be tunnelled through libvirt's TLS connection: QEMU
-	// opens a direct tcp:// migration stream and an NBD channel to the target,
-	// and both carry the guest's RAM and disk blocks unencrypted. Refuse before
-	// any work unless this node's operator has declared the path trusted.
-	// Encrypting it needs a migration-only CA whose key QEMU may read; reusing
-	// the host's cluster key there would hand it to any guest that escapes into
-	// its QEMU process.
-	if withStorage && !s.allowPlaintextStorageMigration {
-		return status.Errorf(codes.FailedPrecondition,
-			"refusing to migrate VM %q with a storage copy: litevirt cannot encrypt that "+
-				"transfer yet, so the guest's memory and disk contents would cross the network "+
-				"between %s and %s in plaintext. If that network is trusted, set "+
-				"`migration.allow_unencrypted_storage: true` in %s's config.yaml and restart "+
-				"its daemon; otherwise move the VM's disks to shared storage first",
-			req.VmName, s.hostName, req.TargetHost, s.hostName)
+	// opens its own migration stream and NBD channel to the target. They are
+	// encrypted (VIR_MIGRATE_TLS) only when BOTH hosts have migration-TLS
+	// credentials installed for QEMU, from the migration CA, never the cluster
+	// CA, whose key a guest escaping into QEMU would otherwise hold. This host's
+	// side is settled here, before any work; the target's comes back from
+	// EnsureDisks.
+	srcTLS := false
+	if withStorage {
+		srcTLS = s.migrationTLSReady()
+		if !srcTLS && !s.allowPlaintextStorageMigration {
+			return plaintextStorageRefusal(req.VmName, s.hostName, req.TargetHost, s.hostName)
+		}
 	}
 	// The disks the copy needs on the target, checked against their records
 	// here, before any work on the target.
@@ -436,12 +434,26 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// createdStubs is what THIS attempt created there — all a failed attempt
 	// may remove.
 	var createdStubs []string
+	useTLS := false
 	if withStorage {
-		if createdStubs, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, diskStubs); err != nil {
+		var dstTLS bool
+		if createdStubs, dstTLS, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS); err != nil {
 			// EnsureDisks removed whatever it had created; the cloud-init ISO
 			// pre-created above is the only leftover.
 			s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, nil)
 			return err
+		}
+		useTLS = srcTLS && dstTLS
+		if !useTLS && !s.allowPlaintextStorageMigration {
+			// This host could encrypt; the target cannot (no credentials, or an
+			// older build that never answers). Undo the stubs and refuse.
+			s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, createdStubs)
+			return plaintextStorageRefusal(req.VmName, s.hostName, req.TargetHost, req.TargetHost)
+		}
+		if !useTLS {
+			slog.Warn("storage migration is NOT encrypted: a host has no migration TLS and "+
+				"migration.allow_unencrypted_storage is set", "vm", req.VmName,
+				"source_tls", srcTLS, "target_tls", dstTLS, "target", req.TargetHost)
 		}
 	}
 
@@ -574,6 +586,11 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			// into a tcp:// migrate_uri authority but must not import corrosion.
 			TargetAddress: corrosion.URIHost(targetHost.Address),
 			DiskTargets:   diskTargets,
+			// The target's migration certificate carries its address as an IP
+			// SAN (`lv host init`/`add` issue it for the same address peers
+			// dial), and the migrate_uri names that address.
+			TLS:            useTLS,
+			TLSDestination: targetHost.Address,
 		})
 	}()
 
@@ -1080,6 +1097,11 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
 	}
+	if req.WantMigrationTls {
+		// The source can encrypt the copy; tell it whether this host's QEMU can
+		// take the other end.
+		resp.MigrationTlsReady = s.migrationTLSReady()
+	}
 	return resp, nil
 }
 
@@ -1421,6 +1443,19 @@ func diskVirtualSize(_ context.Context, path string) (int64, error) {
 	return int64(info.VirtualSize), nil
 }
 
+// plaintextStorageRefusal is the error for a storage copy that cannot be
+// encrypted (lacking names the host without migration TLS) while the source does
+// not allow plaintext. It names both ways out.
+func plaintextStorageRefusal(vmName, source, target, lacking string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"refusing to migrate VM %q with a storage copy: %s has no migration-TLS credentials, "+
+			"so the guest's memory and disk contents would cross the network between %s and %s "+
+			"in plaintext. Provision them with `lv host install-migration-tls` (run where the "+
+			"cluster CA lives), or, if the network between them is trusted, set "+
+			"`migration.allow_unencrypted_storage: true` in %s's config.yaml and restart its daemon",
+		vmName, lacking, source, target, source)
+}
+
 // storageMigrationStubs is the source-side preflight of a --with-storage
 // migration: the stub each of the VM's disk files needs on the target, sized at
 // the source disk's virtual size, which the block mirror requires the target
@@ -1501,27 +1536,31 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // A failure stops the migration. It used to be logged and the migration went
 // ahead, against a target missing disks libvirt would then trip over — or
 // holding a file the copy would overwrite (EnsureDisks refuses that).
-func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub) ([]string, error) {
-	if len(stubs) == 0 {
-		return nil, nil
+//
+// With wantTLS it also has the target install its migration-TLS credentials
+// for QEMU and returns whether it could. An older target never answers that,
+// which reads as false.
+func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS bool) ([]string, bool, error) {
+	if len(stubs) == 0 && !wantTLS {
+		return nil, false, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable,
+		return nil, false, status.Errorf(codes.Unavailable,
 			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
 	defer conn.Close()
 
-	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vmName, Disks: stubs})
+	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS})
 	if err != nil {
 		code := status.Code(err)
 		if code == codes.Unknown {
 			code = codes.Internal
 		}
-		return nil, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
+		return nil, false, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
 			vmName, targetHost, status.Convert(err).Message())
 	}
-	return resp.GetCreatedPaths(), nil
+	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), nil
 }
 
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO

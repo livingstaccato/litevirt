@@ -796,14 +796,16 @@ migration:
 ```
 
 `allow_unencrypted_storage` decides whether this node may **send** a migration
-that copies disks: `lv migrate --with-storage`, or a compose VM with
-`migrate.with-storage`. Such a copy cannot be tunnelled through libvirt's TLS
-connection, so QEMU sends the guest's memory and every copied disk block to the
-target over plain TCP. Anyone on the network path between the two hosts can read
-them.
+that copies disks in **plaintext**. That covers `lv migrate --with-storage` and
+compose VMs with `migrate.with-storage`. Such a copy is encrypted when both hosts
+hold migration-TLS credentials, which `lv host init`, `lv host add` and
+`lv host install-migration-tls` issue (see
+[migration](migration-failover.md#migration-with-local-disks)). When either host
+lacks them, QEMU would send the guest's memory and every copied disk block over
+plain TCP, readable by anyone on the network path between the two hosts.
 
-With the default, `false`, a storage-copying migration is refused before any
-work starts, and the error names this setting. Set it to `true` only where the
+With the default, `false`, that plaintext copy is refused, and the error names
+the host without credentials and this setting. Set it to `true` only where the
 network between hosts is trusted, for example a dedicated, isolated migration
 VLAN. It is read on the source host, and only at daemon start.
 

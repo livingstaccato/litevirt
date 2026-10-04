@@ -23130,11 +23130,15 @@ func (x *EnsureCloudInitRequest) GetNetworkconfig() string {
 }
 
 type EnsureDisksRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	Disks         []*DiskStub            `protobuf:"bytes,2,rep,name=disks,proto3" json:"disks,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	VmName string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	Disks  []*DiskStub            `protobuf:"bytes,2,rep,name=disks,proto3" json:"disks,omitempty"`
+	// want_migration_tls asks the target to install its migration-TLS
+	// credentials into QEMU's TLS directory before the copy, and to report in
+	// migration_tls_ready whether it could.
+	WantMigrationTls bool `protobuf:"varint,3,opt,name=want_migration_tls,json=wantMigrationTls,proto3" json:"want_migration_tls,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *EnsureDisksRequest) Reset() {
@@ -23179,6 +23183,13 @@ func (x *EnsureDisksRequest) GetDisks() []*DiskStub {
 		return x.Disks
 	}
 	return nil
+}
+
+func (x *EnsureDisksRequest) GetWantMigrationTls() bool {
+	if x != nil {
+		return x.WantMigrationTls
+	}
+	return false
 }
 
 type DiskStub struct {
@@ -23238,10 +23249,14 @@ func (x *DiskStub) GetSizeBytes() int64 {
 // migration removes only these. It replaced google.protobuf.Empty, which has
 // no fields: an older target's reply decodes as "created none".
 type EnsureDisksResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	CreatedPaths  []string               `protobuf:"bytes,1,rep,name=created_paths,json=createdPaths,proto3" json:"created_paths,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	CreatedPaths []string               `protobuf:"bytes,1,rep,name=created_paths,json=createdPaths,proto3" json:"created_paths,omitempty"`
+	// migration_tls_ready: the target has migration-TLS credentials installed
+	// for QEMU, so the copy can be encrypted. An older target never sets it,
+	// which reads as "not ready" and falls back to the plaintext guard.
+	MigrationTlsReady bool `protobuf:"varint,2,opt,name=migration_tls_ready,json=migrationTlsReady,proto3" json:"migration_tls_ready,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *EnsureDisksResponse) Reset() {
@@ -23279,6 +23294,13 @@ func (x *EnsureDisksResponse) GetCreatedPaths() []string {
 		return x.CreatedPaths
 	}
 	return nil
+}
+
+func (x *EnsureDisksResponse) GetMigrationTlsReady() bool {
+	if x != nil {
+		return x.MigrationTlsReady
+	}
+	return false
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -33156,16 +33178,18 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x16EnsureCloudInitRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1a\n" +
 	"\buserdata\x18\x02 \x01(\tR\buserdata\x12$\n" +
-	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"Z\n" +
+	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\x88\x01\n" +
 	"\x12EnsureDisksRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12+\n" +
-	"\x05disks\x18\x02 \x03(\v2\x15.litevirt.v1.DiskStubR\x05disks\"=\n" +
+	"\x05disks\x18\x02 \x03(\v2\x15.litevirt.v1.DiskStubR\x05disks\x12,\n" +
+	"\x12want_migration_tls\x18\x03 \x01(\bR\x10wantMigrationTls\"=\n" +
 	"\bDiskStub\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\":\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"j\n" +
 	"\x13EnsureDisksResponse\x12#\n" +
-	"\rcreated_paths\x18\x01 \x03(\tR\fcreatedPaths\"\xc0\x01\n" +
+	"\rcreated_paths\x18\x01 \x03(\tR\fcreatedPaths\x12.\n" +
+	"\x13migration_tls_ready\x18\x02 \x01(\bR\x11migrationTlsReady\"\xc0\x01\n" +
 	"\x1aEnsureFirmwareStateRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x12\n" +
 	"\x04uuid\x18\x02 \x01(\tR\x04uuid\x12\x16\n" +

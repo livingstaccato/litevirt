@@ -68,13 +68,27 @@ lv migrate my-vm host-b --with-storage
 The disk is streamed to the target over libvirt's block-copy / NBD channel
 while the VM keeps running; the source is undefined after a successful cutover.
 
-**This copy is not encrypted.** It cannot be tunnelled through libvirt's TLS
-connection, so the guest's memory and disk blocks cross the network in
-plaintext. A source host therefore refuses it unless its config sets
+**Encryption.** This copy cannot be tunnelled through libvirt's TLS connection,
+because QEMU opens its own migration stream and disk copy to the target. litevirt
+encrypts those (libvirt's `VIR_MIGRATE_TLS`) when **both** hosts hold
+migration-TLS credentials:
+
+- They come from a **separate migration CA**, never the cluster CA. QEMU reads
+  them inside its own unprivileged process, and a guest that escapes into QEMU
+  must not get the node's cluster identity.
+- `lv host init` and `lv host add` issue them. On an older cluster, run
+  `lv host install-migration-tls` once from the machine that holds the cluster CA.
+- Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
+  readable only by the QEMU user, at start and again before each storage
+  migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if
+  that directory already holds files litevirt did not put there.
+
+If either host has no credentials, the copy would cross the network in
+plaintext, and the source refuses it unless its config sets
 `migration.allow_unencrypted_storage: true` (see
 [configuration](configuration.md#migration)). Set that only where the network
 between hosts is trusted. Migrations of VMs on shared storage are tunnelled over
-TLS and need no setting.
+libvirt's TLS and need neither.
 
 Only the host-local disks (`local` and `dir` pools) are copied. A disk on
 shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on

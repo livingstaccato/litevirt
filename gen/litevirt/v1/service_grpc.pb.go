@@ -47,6 +47,7 @@ const (
 	LiteVirt_FetchBinary_FullMethodName                = "/litevirt.v1.LiteVirt/FetchBinary"
 	LiteVirt_UninstallHost_FullMethodName              = "/litevirt.v1.LiteVirt/UninstallHost"
 	LiteVirt_ConfigureHost_FullMethodName              = "/litevirt.v1.LiteVirt/ConfigureHost"
+	LiteVirt_MigrationTLSStatus_FullMethodName         = "/litevirt.v1.LiteVirt/MigrationTLSStatus"
 	LiteVirt_CreateVM_FullMethodName                   = "/litevirt.v1.LiteVirt/CreateVM"
 	LiteVirt_ListVMs_FullMethodName                    = "/litevirt.v1.LiteVirt/ListVMs"
 	LiteVirt_InspectVM_FullMethodName                  = "/litevirt.v1.LiteVirt/InspectVM"
@@ -355,6 +356,12 @@ type LiteVirtClient interface {
 	FetchBinary(ctx context.Context, in *FetchBinaryRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[FetchBinaryChunk], error)
 	UninstallHost(ctx context.Context, in *UninstallHostRequest, opts ...grpc.CallOption) (*UninstallHostResponse, error)
 	ConfigureHost(ctx context.Context, in *ConfigureHostRequest, opts ...grpc.CallOption) (*Host, error)
+	// MigrationTLSStatus reports each host's migration-TLS credentials: the
+	// CAs it trusts, which CA issued its certificate, and when they expire.
+	// The called daemon answers for itself and asks every other host with
+	// local_only set. Read-only; `lv doctor migration-tls` and
+	// `lv host rotate-migration-ca` use it.
+	MigrationTLSStatus(ctx context.Context, in *MigrationTLSStatusRequest, opts ...grpc.CallOption) (*MigrationTLSStatusResponse, error)
 	// ── VMs ──
 	CreateVM(ctx context.Context, in *CreateVMRequest, opts ...grpc.CallOption) (*VM, error)
 	ListVMs(ctx context.Context, in *ListVMsRequest, opts ...grpc.CallOption) (*ListVMsResponse, error)
@@ -1152,6 +1159,16 @@ func (c *liteVirtClient) ConfigureHost(ctx context.Context, in *ConfigureHostReq
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Host)
 	err := c.cc.Invoke(ctx, LiteVirt_ConfigureHost_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) MigrationTLSStatus(ctx context.Context, in *MigrationTLSStatusRequest, opts ...grpc.CallOption) (*MigrationTLSStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationTLSStatusResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_MigrationTLSStatus_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3954,6 +3971,12 @@ type LiteVirtServer interface {
 	FetchBinary(*FetchBinaryRequest, grpc.ServerStreamingServer[FetchBinaryChunk]) error
 	UninstallHost(context.Context, *UninstallHostRequest) (*UninstallHostResponse, error)
 	ConfigureHost(context.Context, *ConfigureHostRequest) (*Host, error)
+	// MigrationTLSStatus reports each host's migration-TLS credentials: the
+	// CAs it trusts, which CA issued its certificate, and when they expire.
+	// The called daemon answers for itself and asks every other host with
+	// local_only set. Read-only; `lv doctor migration-tls` and
+	// `lv host rotate-migration-ca` use it.
+	MigrationTLSStatus(context.Context, *MigrationTLSStatusRequest) (*MigrationTLSStatusResponse, error)
 	// ── VMs ──
 	CreateVM(context.Context, *CreateVMRequest) (*VM, error)
 	ListVMs(context.Context, *ListVMsRequest) (*ListVMsResponse, error)
@@ -4534,6 +4557,9 @@ func (UnimplementedLiteVirtServer) UninstallHost(context.Context, *UninstallHost
 }
 func (UnimplementedLiteVirtServer) ConfigureHost(context.Context, *ConfigureHostRequest) (*Host, error) {
 	return nil, status.Error(codes.Unimplemented, "method ConfigureHost not implemented")
+}
+func (UnimplementedLiteVirtServer) MigrationTLSStatus(context.Context, *MigrationTLSStatusRequest) (*MigrationTLSStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method MigrationTLSStatus not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateVM(context.Context, *CreateVMRequest) (*VM, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateVM not implemented")
@@ -5742,6 +5768,24 @@ func _LiteVirt_ConfigureHost_Handler(srv interface{}, ctx context.Context, dec f
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ConfigureHost(ctx, req.(*ConfigureHostRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_MigrationTLSStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MigrationTLSStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).MigrationTLSStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_MigrationTLSStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).MigrationTLSStatus(ctx, req.(*MigrationTLSStatusRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -10059,6 +10103,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ConfigureHost",
 			Handler:    _LiteVirt_ConfigureHost_Handler,
+		},
+		{
+			MethodName: "MigrationTLSStatus",
+			Handler:    _LiteVirt_MigrationTLSStatus_Handler,
 		},
 		{
 			MethodName: "CreateVM",

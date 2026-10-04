@@ -111,7 +111,7 @@ func migrationTLSStatusRow(info pki.MigrationTLSInfo, err error) *pb.MigrationTL
 // pki.MigrationExpiryWarning: Warn before, Error after.
 func logMigrationExpiry(log *slog.Logger, info pki.MigrationTLSInfo, now time.Time) {
 	for _, e := range info.Expiring(now) {
-		fix := "`lv host install-migration-tls --reissue`" // ci:skip-cmd: install-migration-tls exists
+		fix := "`lv host install-migration-tls --reissue`"
 		if strings.HasPrefix(e.What, "CA ") {
 			fix = "`lv host rotate-migration-ca`" // ci:skip-cmd: ships in a later task
 		}

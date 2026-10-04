@@ -252,16 +252,9 @@ enforcement:
                               # activates only when the flag is set AND the token has latched
                               # fleet-wide. Enable fleet-uniformly; the flag is the reversible kill
                               # switch.
-  canonical_registry: false   # PREPARATORY infrastructure for the canonical registry-credential
-                              # model (a deterministic-id row per (scope,owner,registry)). Setting
-                              # this only ADVERTISES canonical_registry_v1 so the cluster can latch
-                              # it; once durably latched, replicated CANONICAL upserts are accepted on
-                              # apply (permanently — the writer-activation contract emits them). It
-                              # does NOT switch the writer or run consolidation: new API writes still
-                              # use the legacy writer, so the concurrent-login collision remains open
-                              # until the deferred operator-run contract (see docs/diagnostics.md).
-                              # The flag gates advertisement/opt-in only; it does not revoke an
-                              # already-formed latch. Advertised only while on; enable fleet-uniformly.
+                              # (canonical_registry was removed on 2026-10-04: it only advertised a
+                              # token for a writer that never shipped. A config that still sets it
+                              # is ignored. See docs/design/canonical-registry-credentials.md.)
   vm_replace: false           # allow `lv cutover` to give a replacement VM the name a replaced VM
                               # still holds. The replaced VM is soft-deleted, so its tombstone still
                               # occupies that PRIMARY KEY, and no pre-existing replicated statement

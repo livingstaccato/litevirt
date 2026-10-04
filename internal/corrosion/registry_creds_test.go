@@ -2,8 +2,6 @@ package corrosion
 
 import (
 	"context"
-	"encoding/json"
-	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -63,97 +61,7 @@ func liveRegistryRows(t *testing.T, c *Client, scope, owner, registry string) []
 	return rows
 }
 
-// TestUpsertRegistryCredentialCanonical_CreateRotateRevive: create, rotate, revoke, and revive all
-// funnel through the SAME deterministic-id row — one physical row throughout.
-func TestUpsertRegistryCredentialCanonical_CreateRotateRevive(t *testing.T) {
-	c := mustTestClient(t)
-	ctx := context.Background()
-	rc := RegistryCredential{Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s1"}
-	wantID := RegistryCredentialID("user", "alice", "ghcr.io")
-
-	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(rows) != 1 || rows[0].String("id") != wantID || rows[0].String("secret") != "s1" {
-		t.Fatalf("create: want one row id=%s secret=s1, got %v", wantID, rows)
-	}
-
-	// Rotate: new secret, SAME row.
-	rc.Secret = "s2"
-	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
-		t.Fatalf("rotate: %v", err)
-	}
-	rows = liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(rows) != 1 || rows[0].String("id") != wantID || rows[0].String("secret") != "s2" {
-		t.Fatalf("rotate: want one row id=%s secret=s2, got %v", wantID, rows)
-	}
-
-	// Revoke by triple (id-agnostic), then revive via the canonical upsert → same id, no live row lost.
-	if _, err := DeleteRegistryCredential(ctx, c, "user", "alice", "ghcr.io"); err != nil {
-		t.Fatalf("revoke: %v", err)
-	}
-	if rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io"); len(rows) != 0 {
-		t.Fatalf("revoke: expected no live row, got %v", rows)
-	}
-	rc.Secret = "s3"
-	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
-		t.Fatalf("revive: %v", err)
-	}
-	rows = liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(rows) != 1 || rows[0].String("id") != wantID || rows[0].String("secret") != "s3" {
-		t.Fatalf("revive: want one row id=%s secret=s3, got %v", wantID, rows)
-	}
-	// And exactly ONE physical row total (deterministic id, revived in place — never a second row).
-	all, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE scope=? AND owner=? AND registry=?", "user", "alice", "ghcr.io")
-	if len(all) != 1 {
-		t.Fatalf("expected a single physical row across the lifecycle, got %d", len(all))
-	}
-}
-
-// TestRegistryCredentialCanonical_ConcurrentConverges is the core H2 win: two nodes creating the
-// SAME credential produce the SAME deterministic id, so the replicated write resolves by normal
-// LWW on that PK — one row, newer wins — instead of two random ids colliding on the partial
-// UNIQUE and back-pressuring (the legacy failure this replaces).
-func TestRegistryCredentialCanonical_ConcurrentConverges(t *testing.T) {
-	ctx := context.Background()
-	c := mustTestClient(t)
-	c.SetCanonicalRegistryAccept(func() bool { return true })
-
-	// This node's own login (older).
-	rc := RegistryCredential{Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "local"}
-	if err := UpsertRegistryCredentialCanonical(ctx, c, rc); err != nil {
-		t.Fatalf("local login: %v", err)
-	}
-	id := RegistryCredentialID("user", "alice", "ghcr.io")
-
-	// A peer's concurrent login for the SAME triple arrives via replication (WAL apply) — same id,
-	// strictly-newer HLC. It must LWW-win on the PK, not collide.
-	r := NewReplicator(c, "", RelayConfig{})
-	newer := "9000000000000-0000-peer"
-	s := Statement{
-		SQL:    registryCanonicalUpsertSQL,
-		Params: []interface{}{id, "user", "alice", "ghcr.io", "alice", "peer", "2020-01-01T00:00:00Z", newer},
-	}
-	tx, err := c.db.Begin()
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	if aerr := r.applyStatementLWW(ctx, tx, s, newer); aerr != nil {
-		tx.Rollback()
-		t.Fatalf("replicated canonical upsert must apply (not back-pressure): %v", aerr)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("commit: %v", err)
-	}
-
-	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(rows) != 1 || rows[0].String("id") != id || rows[0].String("secret") != "peer" {
-		t.Fatalf("concurrent logins must converge to one row (newer wins), got %v", rows)
-	}
-}
-
-// canonicalUpsertStmt builds the exact statement the canonical writer emits (ledger-registered).
+// canonicalUpsertStmt builds the canonical upsert of the retired design (registryCanonicalUpsertSQL).
 func canonicalUpsertStmt(id, scope, owner, registry, username, secret, createdAt, updatedAt string) Statement {
 	return Statement{
 		SQL:    registryCanonicalUpsertSQL,
@@ -181,333 +89,204 @@ func applyRegistryWAL(t *testing.T, c *Client, s Statement) error {
 	return nil
 }
 
-func fullRegistryRow(t *testing.T, c *Client, id string) string {
+// seedRegistryRow writes one credential row with an exact id and updated_at, as a node that
+// already holds it would. The id is whatever the caller says: a random legacy id, or the
+// deterministic one a canonical write would have produced.
+func seedRegistryRow(t *testing.T, c *Client, id, secret, updatedAt string) {
 	t.Helper()
-	rows, err := c.Query(context.Background(),
-		"SELECT id, scope, owner, registry, username, secret, created_at, updated_at, deleted_at FROM registry_credentials WHERE id = ?", id)
+	if err := c.Execute(context.Background(),
+		`INSERT INTO registry_credentials (id, scope, owner, registry, username, secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, "user", "alice", "ghcr.io", "alice", secret, "2020-01-01T00:00:00Z", updatedAt); err != nil {
+		t.Fatalf("seed %s: %v", id, err)
+	}
+}
+
+// TestRegistryCanonicalUpsert_AlwaysRejected: the canonical upsert of the retired design is
+// registered as plain DispReject — no capability can make it acceptable — and a receiver refuses it
+// on apply, applying nothing. Before the retirement a durable canonical_registry_v1 latch turned it
+// into an applied upsert; nothing on this build has that switch any more.
+func TestRegistryCanonicalUpsert_AlwaysRejected(t *testing.T) {
+	le, err := LedgerEntryFor(registryCanonicalUpsertSQL)
 	if err != nil {
-		t.Fatalf("query: %v", err)
+		t.Fatalf("derive: %v", err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("want one row for id %s, got %d", id, len(rows))
+	entry, ok := LedgerLookup(le.Fingerprint)
+	if !ok {
+		t.Fatal("the canonical upsert must stay registered, so the shape is known and refused")
 	}
-	r := rows[0]
-	return strings.Join([]string{
-		r.String("id"), r.String("scope"), r.String("owner"), r.String("registry"),
-		r.String("username"), r.String("secret"), r.String("created_at"), r.String("updated_at"), r.String("deleted_at"),
-	}, "|")
-}
-
-// TestRegistryCanonical_TwoClientConverges (finding 1): two nodes independently create the same
-// deterministic id with DIFFERENT created_at; after bidirectional replication both nodes hold the
-// IDENTICAL full row (the newer write's, created_at included) — no permanent created_at divergence.
-func TestRegistryCanonical_TwoClientConverges(t *testing.T) {
-	id := RegistryCredentialID("user", "alice", "ghcr.io")
-	a := mustTestClient(t)
-	a.SetCanonicalRegistryAccept(func() bool { return true })
-	b := mustTestClient(t)
-	b.SetCanonicalRegistryAccept(func() bool { return true })
-
-	stmtA := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sa", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
-	stmtB := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sb", "2020-06-01T00:00:00Z", "2000000000000-0000-b") // newer
-
-	// Each node's own create, then exchange both ways.
-	if err := applyRegistryWAL(t, a, stmtA); err != nil {
-		t.Fatalf("a local: %v", err)
-	}
-	if err := applyRegistryWAL(t, b, stmtB); err != nil {
-		t.Fatalf("b local: %v", err)
-	}
-	if err := applyRegistryWAL(t, a, stmtB); err != nil {
-		t.Fatalf("a<-b: %v", err)
-	}
-	if err := applyRegistryWAL(t, b, stmtA); err != nil {
-		t.Fatalf("b<-a: %v", err)
+	if entry.Disposition != DispReject || entry.RequiresCapability != "" || entry.DispositionAfter != "" {
+		t.Fatalf("ledger entry = %+v, want plain DispReject with no capability gate", entry)
 	}
 
-	rowA, rowB := fullRegistryRow(t, a, id), fullRegistryRow(t, b, id)
-	if rowA != rowB {
-		t.Fatalf("nodes must converge to an identical full row:\n A=%q\n B=%q", rowA, rowB)
-	}
-	// The winner is the newer write — created_at converged to it, not each node's local value.
-	if want := id + "|user|alice|ghcr.io|alice|sb|2020-06-01T00:00:00Z|2000000000000-0000-b|"; rowA != want {
-		t.Fatalf("converged row = %q, want %q (newer write, created_at propagated)", rowA, want)
-	}
-}
-
-// TestRegistryCanonical_RejectedBeforeActivation (finding 2): a canonical upsert applied on a
-// receiver where canonical_registry_v1 is NOT active fails closed (back-pressure) — a prematurely-
-// enabled peer can't inject canonical rows while legacy writers still run.
-func TestRegistryCanonical_RejectedBeforeActivation(t *testing.T) {
-	c := mustTestClient(t) // gate OFF
+	c := mustTestClient(t)
 	id := RegistryCredentialID("user", "alice", "ghcr.io")
 	s := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "s", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
 	if err := applyRegistryWAL(t, c, s); err == nil {
-		t.Fatal("canonical upsert must be rejected before activation")
+		t.Fatal("the canonical upsert must be rejected")
 	}
 	if rows, _ := c.Query(context.Background(), "SELECT id FROM registry_credentials"); len(rows) != 0 {
-		t.Fatalf("nothing must be applied before activation, got %d rows", len(rows))
+		t.Fatalf("a rejected canonical upsert applied %d row(s)", len(rows))
 	}
 }
 
-// TestRegistryCanonical_MismatchedIDRejected (finding 3): even with the capability active, a
-// canonical upsert whose id does NOT equal RegistryCredentialID(scope,owner,registry) fails closed
-// — it can't insert a noncanonical row or (via ON CONFLICT) hijack an unrelated credential's row.
-func TestRegistryCanonical_MismatchedIDRejected(t *testing.T) {
-	c := mustTestClient(t)
-	c.SetCanonicalRegistryAccept(func() bool { return true })
-	s := canonicalUpsertStmt("00000000-0000-8000-8000-000000000000", "user", "alice", "ghcr.io", "alice", "s", "2020-01-01T00:00:00Z", "1000000000000-0000-a")
-	if err := applyRegistryWAL(t, c, s); err == nil {
-		t.Fatal("a canonical upsert whose id != RegistryCredentialID(triple) must be rejected")
-	}
-	if rows, _ := c.Query(context.Background(), "SELECT id FROM registry_credentials"); len(rows) != 0 {
-		t.Fatalf("a mismatched-id upsert must apply nothing, got %d rows", len(rows))
-	}
-}
-
-// TestConsolidateRegistryCredentials_MigratesLegacyLive: a legacy random-id live credential is
-// rewritten to its canonical deterministic-id row (content + created_at preserved), the legacy row
-// is tombstoned, and a second run is a no-op (idempotent).
-func TestConsolidateRegistryCredentials_MigratesLegacyLive(t *testing.T) {
-	c := mustTestClient(t)
-	c.SetCanonicalRegistryAccept(func() bool { return true })
-	ctx := context.Background()
-	// Two legacy logins ⇒ a tombstone (rand-1) + a live row (rand-2).
-	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-1", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s1"}); err != nil {
-		t.Fatalf("seed 1: %v", err)
-	}
-	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-2", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s2"}); err != nil {
-		t.Fatalf("seed 2: %v", err)
-	}
-	detID := RegistryCredentialID("user", "alice", "ghcr.io")
-	// capture the legacy live row's created_at to assert preservation.
-	pre, _ := c.Query(ctx, "SELECT created_at FROM registry_credentials WHERE id = 'rand-2'")
-	legacyCreated := pre[0].String("created_at")
-
-	if !mustNotComplete(t, c) { // not canonical yet
-		t.Fatal("precondition: should be locally incomplete before consolidation")
-	}
-
-	migrated, err := ConsolidateRegistryCredentials(ctx, c)
-	if err != nil || migrated != 1 {
-		t.Fatalf("consolidate: migrated=%d err=%v (want 1/nil)", migrated, err)
-	}
-	live := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(live) != 1 || live[0].String("id") != detID || live[0].String("secret") != "s2" {
-		t.Fatalf("want one canonical live row secret=s2, got %v", live)
-	}
-	// created_at preserved from the legacy live row.
-	got, _ := c.Query(ctx, "SELECT created_at FROM registry_credentials WHERE id = ?", detID)
-	if got[0].String("created_at") != legacyCreated {
-		t.Errorf("created_at not preserved: got %q want %q", got[0].String("created_at"), legacyCreated)
-	}
-	// legacy live row is tombstoned.
-	if gone, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-2' AND deleted_at IS NULL"); len(gone) != 0 {
-		t.Error("legacy live row must be tombstoned")
-	}
-	// idempotent + now locally complete.
-	if m2, _ := ConsolidateRegistryCredentials(ctx, c); m2 != 0 {
-		t.Errorf("second run must be a no-op, migrated=%d", m2)
-	}
-	if complete, _ := RegistryWriterReady(ctx, c); !complete {
-		t.Error("must be locally complete after consolidation")
-	}
-}
-
-func mustNotComplete(t *testing.T, c *Client) bool {
-	t.Helper()
-	complete, err := RegistryWriterReady(context.Background(), c)
-	if err != nil {
-		t.Fatalf("completeness: %v", err)
-	}
-	return !complete
-}
-
-// TestRegistryCanonical_EqualTSKeepsLocal: an equal-timestamp / different-content canonical
-// conflict (two nodes wrote the same triple at the same HLC) is NOT silently overwritten — the
-// exact-tie apply keeps local, so the divergence is surfaced (by anti-entropy's content resolver)
-// rather than one write clobbering the other. This is where the equal-ts fault the local
-// consolidation cannot see is fail-closed.
-func TestRegistryCanonical_EqualTSKeepsLocal(t *testing.T) {
-	c := mustTestClient(t)
-	c.SetCanonicalRegistryAccept(func() bool { return true })
-	id := RegistryCredentialID("user", "alice", "ghcr.io")
-	const tie = "5000000000000-0000-tie"
-
-	if err := applyRegistryWAL(t, c, canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sa", "2020-01-01T00:00:00Z", tie)); err != nil {
-		t.Fatalf("first apply: %v", err)
-	}
-	// A conflicting write at the SAME updated_at with different content — must keep local.
-	if err := applyRegistryWAL(t, c, canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "sb", "2020-01-01T00:00:00Z", tie)); err != nil {
-		t.Fatalf("second apply: %v", err)
-	}
-	rows := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(rows) != 1 || rows[0].String("secret") != "sa" {
-		t.Fatalf("an equal-timestamp conflict must keep local (sa), not overwrite: got %v", rows)
-	}
-}
-
-// TestConsolidate_ReplicatedMigrationKeepsCanonicalLive (finding 1): when a peer's migration
-// entries (a by-id tombstone of the legacy row + the canonical upsert) arrive at a node that has
-// ALREADY consolidated, the canonical live row must survive — the by-id tombstone targets the
-// legacy id, not the canonical id (the old by-triple tombstone would have deleted it).
-func TestConsolidate_ReplicatedMigrationKeepsCanonicalLive(t *testing.T) {
-	c := mustTestClient(t)
-	c.SetCanonicalRegistryAccept(func() bool { return true })
+// TestRegistryCanonicalRows_StayValidForTheLegacyPaths covers a cluster that latched the retired
+// token and applied a canonical row before upgrading. The row is an ordinary registry_credentials
+// row whose id happens to be RegistryCredentialID(triple): the pull-time resolver and the list
+// return it, the legacy writer replaces it (tombstoning it by triple, as it would any live row),
+// revoke removes it, and a replicated legacy login converges over it. Nothing needs migrating.
+func TestRegistryCanonicalRows_StayValidForTheLegacyPaths(t *testing.T) {
 	ctx := context.Background()
 	detID := RegistryCredentialID("user", "alice", "ghcr.io")
-	const legacyTS = "2000000000000-0000-legacy"
-	if err := c.Execute(ctx,
-		`INSERT INTO registry_credentials (id, scope, owner, registry, username, secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		"rand-legacy", "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", legacyTS); err != nil {
-		t.Fatalf("seed: %v", err)
+
+	c := mustTestClient(t)
+	seedRegistryRow(t, c, detID, "canonical", "1000000000000-0000-a")
+
+	got, err := ResolveRegistryCredential(ctx, c, "alice", "ghcr.io")
+	if err != nil || got == nil || got.ID != detID || got.Secret != "canonical" {
+		t.Fatalf("resolve = %+v, %v; want the canonical row", got, err)
 	}
-	if _, err := ConsolidateRegistryCredentials(ctx, c); err != nil {
-		t.Fatalf("consolidate: %v", err)
+	if list, err := ListRegistryCredentials(ctx, c, "alice", false); err != nil || len(list) != 1 || list[0].ID != detID {
+		t.Fatalf("list = %+v, %v; want the canonical row", list, err)
 	}
-	if live := liveRegistryRows(t, c, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != detID {
-		t.Fatalf("precondition: expected canonical live, got %v", live)
+
+	// The legacy writer rotates it: the canonical row is tombstoned, a random-id row is live.
+	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-1", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "rotated"}); err != nil {
+		t.Fatalf("legacy rotate over a canonical row: %v", err)
 	}
-	// Peer's migration entries (it consolidated the same converged legacy row) — full-content CAS.
-	if err := applyRegistryWAL(t, c, Statement{SQL: registryTombstoneByIDSQL,
-		Params: []interface{}{"2020-06-01T00:00:00Z", "9000000000000-0000-peer", "rand-legacy",
-			"user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", legacyTS}}); err != nil {
-		t.Fatalf("apply peer tombstone: %v", err)
+	if live := liveRegistryRows(t, c, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != "rand-1" || live[0].String("secret") != "rotated" {
+		t.Fatalf("after rotate, live = %v; want only rand-1", live)
 	}
-	if err := applyRegistryWAL(t, c, canonicalUpsertStmt(detID, "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", legacyTS)); err != nil {
-		t.Fatalf("apply peer canonical: %v", err)
+	if found, err := DeleteRegistryCredential(ctx, c, "user", "alice", "ghcr.io"); err != nil || !found {
+		t.Fatalf("revoke = %v, %v", found, err)
 	}
-	live := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(live) != 1 || live[0].String("id") != detID {
-		t.Fatalf("exchanging migration entries must retain the canonical live row, got %v", live)
+	if live := liveRegistryRows(t, c, "user", "alice", "ghcr.io"); len(live) != 0 {
+		t.Fatalf("after revoke, live = %v", live)
+	}
+
+	// A peer's newer legacy login arrives over a node still holding the canonical row live.
+	p := mustTestClient(t)
+	seedRegistryRow(t, p, detID, "canonical", "1000000000000-0000-a")
+	const newer = "2000000000000-0000-peer"
+	for _, s := range []Statement{
+		{SQL: registryTombstoneByTripleSQL, Params: []interface{}{"2020-06-01T00:00:00Z", newer, "user", "alice", "ghcr.io"}},
+		{SQL: registryLegacyInsertSQL, Params: []interface{}{"rand-peer", "user", "alice", "ghcr.io", "alice", "peer", "2020-06-01T00:00:00Z", newer}},
+	} {
+		if err := applyRegistryWAL(t, p, s); err != nil {
+			t.Fatalf("replicated legacy login over a canonical row must apply: %v", err)
+		}
+	}
+	if live := liveRegistryRows(t, p, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != "rand-peer" {
+		t.Fatalf("live = %v; want the peer's login", live)
 	}
 }
 
-// TestRegistryContractReady_vs_WriterReady (finding 4): after consolidation the writer is ready (no
-// legacy LIVE rows) but the CONTRACT is NOT — the legacy tombstone remains, and a non-partial
-// UNIQUE(scope,owner,registry) would reject it. Contract readiness needs the watermark-safe GC to
-// reclaim the tombstones first.
-func TestRegistryContractReady_vs_WriterReady(t *testing.T) {
-	c := mustTestClient(t)
-	c.SetCanonicalRegistryAccept(func() bool { return true })
+// TestRegistryLegacyConcurrentLogin_StallsUntilSensitiveAE reproduces the collision the planned
+// canonical model exists to remove (docs/design/canonical-registry-credentials.md). Nodes A and B
+// each log in to the same (scope, owner, registry) before either's entry reaches the other, so
+// each mints its own random id. B's login is newer.
+//
+//   - B's entry at A applies: its by-triple tombstone wins LWW over A's older row, and B's row
+//     becomes the one live credential. The NEWER login wins.
+//   - A's entry at B does not: its tombstone loses LWW to B's newer row, so B's row stays live and
+//     A's INSERT collides with it on the partial UNIQUE index. The whole entry rolls back and the
+//     watermark does not advance, so A's stream into B is held at that entry.
+//   - The sensitive anti-entropy lane then carries A's row for rand-a — tombstoned by B's login —
+//     to B. Now B holds rand-a at a NEWER updated_at than A's entry, so the retried entry's
+//     INSERT is an LWW no-op, the entry applies, and the stream resumes.
+//
+// So the stall lasts one sensitive-AE cycle between the pair, not until the entry ages out of
+// the log. The final mutation-verified step is that last one: without the AE merge, the retry
+// back-pressures again.
+func TestRegistryLegacyConcurrentLogin_StallsUntilSensitiveAE(t *testing.T) {
 	ctx := context.Background()
+	const older, newer = "1000000000000-0000-a", "2000000000000-0000-b"
+	login := func(id, secret, hlc string) []*pb.MutationEntry {
+		origin := map[string]string{older: "node-a", newer: "node-b"}[hlc]
+		return replayEntry(t, origin, hlc,
+			Statement{SQL: registryTombstoneByTripleSQL, Params: []interface{}{"2020-06-01T00:00:00Z", hlc, "user", "alice", "ghcr.io"}},
+			Statement{SQL: registryLegacyInsertSQL, Params: []interface{}{id, "user", "alice", "ghcr.io", "alice", secret, "2020-01-01T00:00:00Z", hlc}})
+	}
+	loginA, loginB := login("rand-a", "from-a", older), login("rand-b", "from-b", newer)
+
+	// Each node has applied its own login.
+	a, b := mustTestClient(t), mustTestClient(t)
+	seedRegistryRow(t, a, "rand-a", "from-a", older)
+	seedRegistryRow(t, b, "rand-b", "from-b", newer)
+	ra, rb := NewReplicator(a, "", RelayConfig{}), NewReplicator(b, "", RelayConfig{})
+
+	// B's newer login reaches A and converges it.
+	if _, err := ra.ApplyRemoteMutations(ctx, loginB); err != nil {
+		t.Fatalf("the newer login must apply at the older node: %v", err)
+	}
+	if live := liveRegistryRows(t, a, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != "rand-b" {
+		t.Fatalf("A live = %v; want B's newer login", live)
+	}
+
+	// A's older login reaches B and is held.
+	if _, err := rb.ApplyRemoteMutations(ctx, loginA); err == nil {
+		t.Fatal("the older login's entry must back-pressure at the newer node")
+	}
+	assertNotSeen(t, b, "node-a")
+	if live := liveRegistryRows(t, b, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != "rand-b" {
+		t.Fatalf("B live = %v; want its own newer login untouched", live)
+	}
+
+	// One sensitive anti-entropy cycle: B merges A's peer-only dump.
+	if err := b.MergeSensitiveStateBytesLWW(a.DumpSensitiveStateBytes()); err != nil {
+		t.Fatalf("sensitive merge: %v", err)
+	}
+	if _, err := rb.ApplyRemoteMutations(ctx, loginA); err != nil {
+		t.Fatalf("the held entry must apply once sensitive AE has carried rand-a's tombstone: %v", err)
+	}
+	if live := liveRegistryRows(t, b, "user", "alice", "ghcr.io"); len(live) != 1 || live[0].String("id") != "rand-b" {
+		t.Fatalf("B live = %v; the newer login must still be the one live credential", live)
+	}
+}
+
+// TestRegistryReadiness_WriterThenContract: the two latch-free readiness reads. A legacy live row
+// makes neither ready. Once only the canonical row is live the writer is ready but the contract is
+// not — the legacy tombstone left behind would violate a non-partial UNIQUE(scope,owner,registry).
+// Once that tombstone is reclaimed, both are ready.
+func TestRegistryReadiness_WriterThenContract(t *testing.T) {
+	ctx := context.Background()
+	c := mustTestClient(t)
 	if err := UpsertRegistryCredential(ctx, c, RegistryCredential{ID: "rand-1", Scope: "user", Owner: "alice", Registry: "ghcr.io", Username: "alice", Secret: "s1"}); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if _, err := ConsolidateRegistryCredentials(ctx, c); err != nil {
-		t.Fatalf("consolidate: %v", err)
+	if wr, _ := RegistryWriterReady(ctx, c); wr {
+		t.Fatal("writer-ready with a legacy live row")
 	}
+
+	if _, err := DeleteRegistryCredential(ctx, c, "user", "alice", "ghcr.io"); err != nil {
+		t.Fatalf("tombstone legacy: %v", err)
+	}
+	seedRegistryRow(t, c, RegistryCredentialID("user", "alice", "ghcr.io"), "s1", "9000000000000-0000-a")
 	if wr, _ := RegistryWriterReady(ctx, c); !wr {
-		t.Fatal("writer-ready must be true after consolidation (no legacy live rows)")
+		t.Fatal("writer-ready must be true once only the canonical row is live")
 	}
 	if cr, _ := RegistryContractReady(ctx, c); cr {
-		t.Fatal("contract-ready must be FALSE while a legacy tombstone remains")
+		t.Fatal("contract-ready must be false while a legacy tombstone remains")
 	}
-	// Simulate the watermark-safe GC reclaiming the tombstone.
+
 	if err := c.Execute(ctx, "DELETE FROM registry_credentials WHERE id = 'rand-1'"); err != nil {
 		t.Fatalf("gc: %v", err)
 	}
 	if cr, _ := RegistryContractReady(ctx, c); !cr {
-		t.Fatal("contract-ready must be true once no non-canonical physical rows remain")
-	}
-}
-
-// TestConsolidate_RequiresLatch (finding 5): consolidation refuses to run before the accept-latch,
-// since its canonical writes would be rejected by peers.
-func TestConsolidate_RequiresLatch(t *testing.T) {
-	c := mustTestClient(t) // latch NOT set
-	if _, err := ConsolidateRegistryCredentials(context.Background(), c); err == nil {
-		t.Fatal("consolidation must require canonical_registry_v1 latched")
-	}
-}
-
-// TestConsolidate_EqualTSDiffContentBackPressures (finding): two nodes hold the SAME legacy id and
-// updated_at but DIFFERENT content. When the sender's consolidation entry (a full-content-CAS
-// tombstone + the canonical upsert) is applied on the receiver, the tombstone matches ZERO rows
-// (content mismatch), so the canonical insert collides with the still-live legacy row on the partial
-// UNIQUE and the WHOLE mutation entry rolls back / back-pressures — the migration fails closed
-// instead of silently retiring the receiver's differing credential.
-func TestConsolidate_EqualTSDiffContentBackPressures(t *testing.T) {
-	c := mustTestClient(t)
-	c.SetCanonicalRegistryAccept(func() bool { return true })
-	ctx := context.Background()
-	r := NewReplicator(c, "", RelayConfig{})
-	const id, ts, created = "rand-X", "2000000000000-0000-legacy", "2020-01-01T00:00:00Z"
-	detID := RegistryCredentialID("user", "alice", "ghcr.io")
-
-	// Receiver holds the legacy row with its OWN (different) secret.
-	if err := c.Execute(ctx,
-		`INSERT INTO registry_credentials (id, scope, owner, registry, username, secret, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, "user", "alice", "ghcr.io", "alice", "receiver-secret", created, ts); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	// Sender's consolidation entry: tombstone (sender's content) + canonical upsert (sender's content).
-	stmts, _ := json.Marshal([]Statement{
-		{SQL: registryTombstoneByIDSQL, Params: []interface{}{"2020-06-01T00:00:00Z", "9000000000000-0000-peer", id,
-			"user", "alice", "ghcr.io", "alice", "sender-secret", created, ts}},
-		{SQL: registryCanonicalUpsertSQL, Params: []interface{}{detID, "user", "alice", "ghcr.io", "alice", "sender-secret", created, ts}},
-	})
-	entries := []*pb.MutationEntry{{Seq: 1, Hlc: "9000000000000-0000-peer", Origin: "sender-node", Stmts: string(stmts)}}
-
-	if _, err := r.ApplyRemoteMutations(ctx, entries); err == nil {
-		t.Fatal("equal-timestamp/different-content consolidation must back-pressure (fail closed)")
-	}
-	assertNotSeen(t, c, "sender-node") // watermark not advanced
-
-	// The receiver's differing legacy credential must remain LIVE (nothing was retired).
-	live := liveRegistryRows(t, c, "user", "alice", "ghcr.io")
-	if len(live) != 1 || live[0].String("id") != id || live[0].String("secret") != "receiver-secret" {
-		t.Fatalf("receiver's differing legacy credential must remain live, got %v", live)
+		t.Fatal("contract-ready must be true once no non-canonical physical row remains")
 	}
 }
 
 // TestRegistryLegacyInsert_AlwaysApplies: the legacy mint-new-id INSERT auto-derives to a plain
-// insert and is accepted on apply whether or not the canonical accept gate is on — rejecting the
-// legacy shape is part of the deferred operator-run contract, not this reversible core.
+// insert and is accepted on apply. Rejecting it is a step of the planned activation, not of
+// anything shipped.
 func TestRegistryLegacyInsert_AlwaysApplies(t *testing.T) {
-	legacyInsert := func(id string) Statement {
-		return Statement{SQL: registryLegacyInsertSQL,
-			Params: []interface{}{id, "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"}}
+	c := mustTestClient(t)
+	s := Statement{SQL: registryLegacyInsertSQL,
+		Params: []interface{}{"rand-1", "user", "alice", "ghcr.io", "alice", "s1", "2020-01-01T00:00:00Z", "1000000000000-0000-n1"}}
+	if err := applyRegistryWAL(t, c, s); err != nil {
+		t.Fatalf("legacy INSERT must apply: %v", err)
 	}
-	ctx := context.Background()
-	for _, accept := range []bool{false, true} {
-		c := mustTestClient(t)
-		on := accept
-		c.SetCanonicalRegistryAccept(func() bool { return on })
-		if err := applyRegistryWAL(t, c, legacyInsert("rand-1")); err != nil {
-			t.Fatalf("accept=%v: legacy INSERT must apply: %v", accept, err)
-		}
-		if rows, _ := c.Query(ctx, "SELECT id FROM registry_credentials WHERE id='rand-1'"); len(rows) != 1 {
-			t.Fatalf("accept=%v: legacy row must exist", accept)
-		}
-	}
-}
-
-// TestCanonicalRegistryAccept_Gate: a replicated canonical upsert is rejected on apply until the
-// canonical_registry_v1 accept gate is on, then applied. This is the ONLY runtime effect of the
-// Part H2 preparatory infrastructure (the writer is never switched here).
-func TestCanonicalRegistryAccept_Gate(t *testing.T) {
-	ctx := context.Background()
-	id := RegistryCredentialID("user", "alice", "ghcr.io")
-	stmt := canonicalUpsertStmt(id, "user", "alice", "ghcr.io", "alice", "s", "2020-01-01T00:00:00Z", "1000000000000-0000-n1")
-
-	// Gate OFF ⇒ rejected (back-pressure), nothing applied.
-	off := mustTestClient(t)
-	if err := applyRegistryWAL(t, off, stmt); err == nil {
-		t.Fatal("canonical upsert must be rejected while the accept gate is off")
-	}
-	if rows, _ := off.Query(ctx, "SELECT id FROM registry_credentials WHERE id=?", id); len(rows) != 0 {
-		t.Fatal("nothing must be applied while the accept gate is off")
-	}
-
-	// Gate ON ⇒ applied.
-	on := mustTestClient(t)
-	on.SetCanonicalRegistryAccept(func() bool { return true })
-	if err := applyRegistryWAL(t, on, stmt); err != nil {
-		t.Fatalf("canonical upsert must apply once the accept gate is on: %v", err)
-	}
-	if rows, _ := on.Query(ctx, "SELECT id FROM registry_credentials WHERE id=? AND deleted_at IS NULL", id); len(rows) != 1 {
-		t.Fatal("canonical row must land once the accept gate is on")
+	if rows, _ := c.Query(context.Background(), "SELECT id FROM registry_credentials WHERE id='rand-1'"); len(rows) != 1 {
+		t.Fatal("legacy row must exist")
 	}
 }

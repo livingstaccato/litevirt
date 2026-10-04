@@ -296,7 +296,7 @@ func (s *Server) driveCapabilityActivation(ctx context.Context) bool {
 // RETRIES a marker write that hasn't yet persisted, and that retry must not stop
 // just because the operator disabled the flag after the token latched.
 // Otherwise a token latched in memory but not on disk would never become
-// DurablyLatched, and a durable-gated contract (canonical registry acceptance,
+// DurablyLatched, and a durable-gated contract (vm_replace_v1 acceptance,
 // the lease-term mint) would fail closed forever.
 func (s *Server) retryLatchedMarkers(ctx context.Context) {
 	for _, tok := range capabilities.Supported() {

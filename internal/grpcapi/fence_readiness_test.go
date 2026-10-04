@@ -220,7 +220,6 @@ func TestPing_WithholdsPostureFromANonHostCertificate(t *testing.T) {
 func enforceEveryToken(s *Server) {
 	s.enfAuditSignature = true
 	s.enfCanonicalIdentity = true
-	s.enfCanonicalRegistry = true
 	s.enfHLCLww = true
 	s.enfIsolationEpoch = true
 	s.enfLiveResize = true

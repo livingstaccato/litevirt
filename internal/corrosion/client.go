@@ -453,15 +453,6 @@ type Client struct {
 	// merge batch.
 	canonicalIdentity func() bool
 
-	// canonicalRegistryAccept, when non-nil and returning true, means canonical_registry_v1 is
-	// DURABLY LATCHED cluster-wide, so a replicated canonical registry-credential upsert
-	// (DispCanonicalRegistry) may be applied. This is the ONLY runtime effect of Part H2's
-	// preparatory infrastructure — the local writer is NEVER switched (see registry_creds.go). It
-	// reads the durable latch, NOT the reversible config flag: once latched, acceptance of an
-	// already-emitted canonical wire shape must never be revoked (turning the flag off would
-	// otherwise stall replication on an in-flight canonical entry). Nil/false ⇒ reject (pre-H2).
-	canonicalRegistryAccept func() bool
-
 	// vmReplaceAccept, when non-nil and returning true, means vm_replace_v1 is DURABLY
 	// LATCHED cluster-wide, so a replicated guarded VM-name replacement may be applied.
 	// It reads the DURABLE latch, not the reversible config flag: once a replace batch
@@ -530,16 +521,6 @@ func (c *Client) canonicalIdentityOn() bool {
 	return c.canonicalIdentity != nil && c.canonicalIdentity()
 }
 
-// SetCanonicalRegistryAccept injects the predicate reporting canonical_registry_v1 DURABLY LATCHED
-// (wired to checker.Latched, NOT the reversible config flag — see the field comment). Nil-safe:
-// unset ⇒ reject the canonical shape.
-func (c *Client) SetCanonicalRegistryAccept(fn func() bool) { c.canonicalRegistryAccept = fn }
-
-// canonicalRegistryAcceptOn reports whether a replicated canonical registry upsert may be applied.
-func (c *Client) canonicalRegistryAcceptOn() bool {
-	return c.canonicalRegistryAccept != nil && c.canonicalRegistryAccept()
-}
-
 // SetVMReplaceAccept injects the predicate reporting vm_replace_v1 DURABLY LATCHED
 // (wired to checker.DurablyLatched, NOT the reversible config flag — see the field
 // comment). Nil-safe: unset ⇒ reject the guarded replace shape.
@@ -551,13 +532,12 @@ func (c *Client) vmReplaceAcceptOn() bool {
 }
 
 // capabilityActive reports whether a ledger-named capability (RequiresCapability) is active on THIS
-// receiver, so the apply path can resolve a capability-gated shape's effective disposition.
-// canonical_registry_v1 = the durable accept gate (apply a replicated canonical upsert). An unknown
-// capability returns false (fail closed — a gated shape stays rejected).
+// receiver, so the apply path can resolve a capability-gated shape's effective disposition. An
+// unknown capability returns false (fail closed — a gated shape stays rejected), which is also
+// how a RETIRED token reads: the canonical registry upsert carries no capability any more and is
+// rejected outright (registry_creds.go).
 func (c *Client) capabilityActive(name string) bool {
 	switch name {
-	case capabilities.CanonicalRegistryV1:
-		return c.canonicalRegistryAcceptOn()
 	case capabilities.CanonicalIdentityV1:
 		return c.canonicalIdentityOn()
 	case capabilities.VMReplaceV1:

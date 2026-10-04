@@ -471,15 +471,6 @@ type EnforcementConfig struct {
 	// cluster-wide (identity resolution mutates shared state, so it must be fleet-uniform, not
 	// pairwise). Default false; reversible kill switch.
 	CanonicalIdentity bool `yaml:"canonical_identity,omitempty"`
-	// CanonicalRegistry: opt into the Part H2 canonical registry-credential model
-	// (capabilities.CanonicalRegistryV1). This flag ONLY controls ADVERTISEMENT of the token so
-	// the cluster can latch it with config uniformity; once DURABLY latched, replicated canonical
-	// upserts are accepted on apply (permanently — flag-off does not revoke it). It does NOT switch
-	// the writer or run consolidation: there is no migration controller, and new API writes stay on
-	// the legacy writer, so the concurrent-login collision remains open until the deferred
-	// operator-run activation contract (see docs/diagnostics.md). Default false; the flag is a
-	// reversible advertisement opt-in only.
-	CanonicalRegistry bool `yaml:"canonical_registry,omitempty"`
 	// VMReplace: allow `lv cutover` to give a replacement VM the name a replaced VM
 	// still holds (capabilities.VMReplaceV1). The transition needs a receiver-side
 	// guarantee the pre-existing statement shapes cannot express — one decision for

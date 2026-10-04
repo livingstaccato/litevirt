@@ -447,68 +447,44 @@ voting-eligible member advertises the token. Kill switch: set it `false` and res
 cutover goes back to refusing. Acceptance of an already-emitted batch is NOT revoked by the flag — it reads the
 durable latch, because a batch in flight must not become unacceptable across a restart.
 
-### `canonical_registry` — registry-credential migration
+### Registry credentials: a concurrent-login collision
 
 Registry logins mint a **new random `id` per login** and write via a tombstone+insert
-batch, so two nodes logging into the same registry concurrently produce two live rows that
-collide on the partial `UNIQUE(scope,owner,registry)`. The **canonical model** fixes this by
-deriving a **deterministic id** from `(scope,owner,registry)` — both nodes target the same
-primary key and a conflict resolves by normal LWW.
+batch. When the same `(scope, owner, registry)` credential is written on two nodes before
+either write reaches the other, there are two live ids for one triple, and they collide on
+the partial `UNIQUE(scope,owner,registry)`. The **newer** login wins: its entry applies on
+the older node. The **older** login's entry cannot apply on the newer node. Its by-triple
+tombstone loses LWW, and its INSERT then hits the newer live row. The entry back-pressures
+fail-closed, which holds that sender's stream to that peer. There is no corruption and
+nothing is silently picked.
 
-**What ships today is preparatory infrastructure, not the fix.** The concurrent-login
-collision described above is **still open** — the writer is **not** switched. Every API
-write still uses the legacy random-id writer, so two concurrent logins still mint different
-ids; a replicated legacy batch can lose LWW on its by-triple tombstone and its INSERT then
-back-pressures fail-closed against the peer's live row (safe — no corruption — but it stalls
-that sender's stream to the peer until the conflicting state is remediated and the blocked
-entry successfully retries; a later WAL entry cannot supersede an ordered entry stuck ahead
-of it). The reversible core below does not
-resolve it.
+The stall normally clears by itself. The peer-only (sensitive) anti-entropy lane carries
+the older node's copy of its own row, already tombstoned by the newer login, to the newer
+node. Once that copy has arrived, the retried entry's INSERT is a last-writer-wins no-op,
+and the stream resumes. One anti-entropy cycle is enough (`anti_entropy_interval_sec`, 60s
+by default). `TestRegistryLegacyConcurrentLogin_StallsUntilSensitiveAE` reproduces both the
+stall and the recovery at the merge level. It has not yet been reproduced on a fleet.
 
-The one runtime behavior that ships is the **accept gate**: once `canonical_registry_v1` is
-**durably latched** cluster-wide, replicated **canonical** upserts are accepted on apply
-(before the latch they fail closed). The building blocks — the deterministic id, the
-canonical writer primitive (no production caller yet), the idempotent consolidation routine,
-and the `RegistryWriterReady` / `RegistryContractReady` readiness checks (computed
-on-demand, never cached) — are in place for the future operator transition, but nothing
-runs a background consolidation loop and nothing switches the writer.
+The fix is a deterministic id per triple. It is **planned, not implemented**:
+[design/canonical-registry-credentials.md](design/canonical-registry-credentials.md). An
+earlier opt-in, `enforcement.canonical_registry`, was removed on 2026-10-04. It only
+advertised a token for a writer that never shipped. A config that still sets it is ignored.
+A node that latched its `canonical_registry_v1` token keeps the marker. This build
+recognises the marker as a retired token and does not quarantine the node.
 
-- **`enforcement.canonical_registry`** (config flag) gates only **advertisement** of the
-  token, so a fleet opts in and the latch forms with config uniformity. It is a reversible
-  opt-in *before* the token latches.
-- **Acceptance is permanent once latched.** The accept gate reads the *durably* latched
-  marker (in memory AND persisted), not the flag — so turning the flag off after latching does
-  **not** revoke acceptance (which would strand an in-flight canonical wire shape and stall
-  replication), and it survives a restart. Flag-off only stops **advertisement** (further
-  opt-in); it does not stop `ConsolidateRegistryCredentials`, which the future operator
-  transition can still call because it gates on the durable accept latch, not the flag.
+**Operator runbook.**
 
-**Deferred: the writer-activation contract.** Switching writes to the canonical writer is a
-distributed-contract transition, done as ONE atomic operator-run operation: run
-consolidation while writes are quiesced; prove a durable replication-sequence **barrier**
-consumed by every admitted peer's watermark; prove registry-credential **convergence**;
-apply **node admission / reseed** rules for a node returning pre-barrier; **reject the legacy
-shape** after activation; and eventually the index contract (partial → non-partial
-`UNIQUE(scope,owner,registry)`). None of that is a config boolean — it is intentionally NOT
-shipped here, and readiness for it must be recomputed synchronously at that time, not read
-from a cached flag.
-
-**Operator runbook — a concurrent-login collision.** A rare race (the same
-`(scope, owner, registry)` credential written on two nodes within the replication window)
-leaves two different live credential ids for one triple. This is **fail-closed — no
-corruption, no silent pick** — but it does not auto-resolve.
-
-- **Detect:** `litevirt_merge_apply_rejected_total{table="registry_credentials",reason="unique"}`
-  climbs, and `lv doctor divergence` reports a **stable** `registry_credentials` divergence
-  (one triple, different live ids per node). The WAL stream between the two nodes may also
-  stall (rising `litevirt_replication_peer_pending_entries` for that peer) — the colliding
-  entry sits at the head of the stream and back-pressures the batch until it ages out at
-  `MaxLogRetention` (24h). Anti-entropy keeps every other table converged in the meantime.
-- **Remediate:** soft-delete (tombstone) the divergent live credential for that triple on the
-  affected node(s) — a single `deleted_at` write per node — then have the user re-establish the
-  login, which writes one fresh credential that converges. No data is lost; the credential is
-  simply re-created. (Equivalently, once the stalled entry prunes, a fresh login converges on
-  its own.) The permanent fix is the deferred writer-activation contract above.
+- **Detect:** the replicator logs `apply failed — back-pressuring replication` with a
+  `UNIQUE constraint failed: registry_credentials.scope, …` error, and
+  `litevirt_replication_peer_pending_entries` rises for that origin→peer pair. It should
+  fall again within an anti-entropy interval or two.
+- **If it persists:** the sensitive anti-entropy lane between those two nodes is not
+  completing. Check the anti-entropy logs on the stalled receiver. Until the lane completes,
+  the entry stays at the head of the stream until it ages out at `MaxLogRetention` (24h).
+  Other tables still converge over the public anti-entropy lane in the meantime. To clear it
+  by hand, soft-delete (tombstone) the live credential for that triple on the affected
+  node(s), a single `deleted_at` write per node. Then have the user re-establish the login
+  with `lv registry add`. No data is lost; the credential is simply re-created.
 
 ### The sensitive lane
 

@@ -1563,9 +1563,6 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 	}
 
 	switch disp {
-	case DispCanonicalRegistry:
-		return r.applyCanonicalRegistry(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
-
 	case DispAppendOnly:
 		// Immutable append-only INSERT (fencing_log/audit_log/mutation_log/vm_events):
 		// INSERT OR IGNORE, so it only creates the row when absent and never overwrites.
@@ -3212,39 +3209,6 @@ func isClaimedCreateCleanup(s Statement, sh StmtShape) (bool, error) {
 		}
 	}
 	return true, nil
-}
-
-// applyCanonicalRegistry applies the Part H2 canonical registry-credential upsert AFTER verifying
-// the deterministic-ID contract: the statement's id parameter MUST equal
-// RegistryCredentialID(scope, owner, registry) computed from the SAME statement's params. An
-// approved shape whose id is inconsistent with its triple (a builder bug / malformed entry) could
-// otherwise insert a noncanonical row or, via ON CONFLICT(id), update an UNRELATED credential's
-// secret while leaving its triple unchanged — so a mismatch fails closed. On success it applies as
-// an explicit upsert under LWW (identical to DispExplicitUpsert).
-func (r *Replicator) applyCanonicalRegistry(ctx context.Context, tx *sql.Tx, s Statement, sh StmtShape, tableName string, pkCols []string, incomingHLC string) error {
-	cols, vals, ok := insertRowFromShape(sh, s)
-	if !ok {
-		return invalidf("canonical registry upsert on %s: cannot resolve row image", tableName)
-	}
-	field := func(name string) (string, bool) {
-		for i, c := range cols {
-			if strings.EqualFold(c, name) {
-				return coerceString(vals[i]), true
-			}
-		}
-		return "", false
-	}
-	id, ok1 := field("id")
-	scope, ok2 := field("scope")
-	owner, ok3 := field("owner")
-	registry, ok4 := field("registry")
-	if !ok1 || !ok2 || !ok3 || !ok4 {
-		return invalidf("canonical registry upsert on %s: missing id/scope/owner/registry", tableName)
-	}
-	if want := RegistryCredentialID(scope, owner, registry); id != want {
-		return invalidf("canonical registry upsert on %s: id does not match its (scope,owner,registry) — rejecting", tableName)
-	}
-	return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 }
 
 // applyLWWGated applies a full-PK INSERT/upsert or full-PK UPDATE under last-writer-wins: it

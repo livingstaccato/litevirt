@@ -220,8 +220,8 @@ func TestEnforced_Latches(t *testing.T) {
 	}
 }
 
-// TestDurablyLatched_PersistRetryAndReload covers the durable-latch contract (canonical registry
-// acceptance): an in-memory latch is NOT durable until its marker persists, a failed marker write is
+// TestDurablyLatched_PersistRetryAndReload covers the durable-latch contract (vm_replace_v1
+// acceptance, the lease-term mint): an in-memory latch is NOT durable until its marker persists, a failed marker write is
 // retried once the path is repaired, and a restart reloads the marker and stays durable. This is the
 // lifecycle a durable-gated wire-shape acceptance must survive so a reboot can't revert to rejecting
 // an in-flight entry.
@@ -240,7 +240,7 @@ func TestDurablyLatched_PersistRetryAndReload(t *testing.T) {
 	c.SetPeerPinger(func(_ context.Context, _ string) ([]string, time.Time, error) { return []string{tok}, time.Time{}, nil })
 
 	// Activate: latches in memory, but the marker write fails → NOT durable, so a durable-gated
-	// contract (canonical registry acceptance) stays fail-closed.
+	// contract (vm_replace_v1 acceptance) stays fail-closed.
 	if !c.Enforced(ctx, tok) {
 		t.Fatal("all members advertise the token → Enforced true (in-memory latch)")
 	}

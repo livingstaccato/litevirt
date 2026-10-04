@@ -483,20 +483,6 @@ const (
 	// latch (and thus any node collapsing rows) cannot happen until every node has opted in.
 	// Enforcement = the flag AND the latch; default-off + reversible.
 	CanonicalIdentityV1 = "canonical_identity_v1"
-	// CanonicalRegistryV1 gates the Part H2 canonical registry-credential model: one stable
-	// deterministic-id row per (scope,owner,registry) written by a single PK-keyed upsert, instead
-	// of the legacy mint-new-id tombstone+insert whose concurrent logins collide on the partial
-	// UNIQUE index. Its activation is a COORDINATED online contract (expand → converge → contract),
-	// not just a latch: latching only ACCEPTS replicated canonical writes (so the one-time
-	// legacy-row consolidation may run); the canonical WRITER is enabled — and the index contracted
-	// — only once legacy rows are consolidated to their deterministic ids, so the two writers never
-	// produce two live rows for one triple. Advertised CONDITIONALLY on enforcement.canonical_registry
-	// (like operation_protocol) so the latch requires config uniformity, not just a uniform build.
-	// The WRITER switch, drain/barrier proof, node admission/reseed, legacy-shape rejection, and the
-	// index contract are NOT part of this capability — they are a single future operator-run contract
-	// transition, not an auto-latch (deferred; see docs/diagnostics.md). Until then, local API writes
-	// stay on the legacy writer and this gate only makes consolidation's canonical writes acceptable.
-	CanonicalRegistryV1 = "canonical_registry_v1"
 	// HardwareV2 gates the source-of-truth cutover for VM hardware management (the VM
 	// Hardware Foundation effort): once enforced cluster-wide, hardware reads/writes
 	// move off the legacy representation onto the new one. This registration is the
@@ -797,7 +783,6 @@ var supported = []string{
 	CapacityAdmissionV1,
 	LiveResizeV1,
 	CanonicalIdentityV1,
-	CanonicalRegistryV1,
 	HardwareV2,
 	ProjectAuthorityV1,
 	AuditSignatureV1,
@@ -874,7 +859,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -993,6 +978,49 @@ func Mandatory(token string) bool {
 func MandatoryTokens() []string {
 	out := make([]string, 0, len(mandatory))
 	for tok := range mandatory {
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// RetiredCanonicalRegistryV1 is the token of the first, unfinished canonical
+// registry-credential design. v1.4.0 shipped it advertised behind
+// enforcement.canonical_registry, and its only effect once latched was that a
+// receiver ACCEPTED a replicated canonical upsert. Nothing in production ever
+// wrote that shape. It was retired on 2026-10-04 so a durable one-way latch was
+// not spent on a design whose writer had not shipped. The feature is planned in
+// docs/design/canonical-registry-credentials.md, and ships under a NEW token:
+// this name is never reused, because a cluster that latched it holds a marker
+// that would otherwise read as having latched the new contract.
+const RetiredCanonicalRegistryV1 = "canonical_registry_v1"
+
+// retired is every token an earlier build could latch that this build neither
+// advertises, latches nor enforces. It is not in All(), so the checker does not
+// load its marker and nothing reads it as latched.
+//
+// It exists for one reader: the capability-rollback preflight, which treats an
+// activation marker for a token this build does not know as proof that a newer
+// binary ran here, and quarantines the node. A retired token's marker is the
+// opposite — proof that an OLDER binary ran here — so without this set, upgrading
+// a node that had latched the token would WAL-quarantine it.
+//
+// Removing a token from All() therefore means adding it here, in the same
+// change. An entry is never removed: a marker outlives every binary that wrote it.
+var retired = map[string]bool{
+	RetiredCanonicalRegistryV1: true,
+}
+
+// Retired reports whether token is a retired token: one an earlier build could
+// latch, which this build recognises and ignores.
+func Retired(token string) bool {
+	return retired[token]
+}
+
+// RetiredTokens lists the retired tokens, sorted for stable output.
+func RetiredTokens() []string {
+	out := make([]string, 0, len(retired))
+	for tok := range retired {
 		out = append(out, tok)
 	}
 	sort.Strings(out)

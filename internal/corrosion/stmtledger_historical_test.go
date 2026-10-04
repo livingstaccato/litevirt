@@ -113,7 +113,16 @@ import (
 // vm_disks_create_insert_v130 family, receive-only, for peers that still create
 // VMs with it. An ADDITION; no previously accepted historical identity was
 // removed or changed.
-const compatibilityDigest = "d9c4360a0a7542b61354f249c2a53c5f84ec26e8d814cb463282ba6422ab9742"
+// Updated again when canonical_registry_v1 was retired: its two builders (the
+// canonical upsert and consolidation's by-id tombstone) were removed, so both
+// shapes moved from the current ledger to the canonical_registry_v1_retired
+// family with the dispositions they already had there — but the upsert's entry
+// LOST its capability gate (RequiresCapability canonical_registry_v1 →
+// DispCanonicalRegistry): it is plain DispReject now. That is the deliberate
+// change, and the digest does not see it (it hashes Disposition, which was and is
+// DispReject). Otherwise an ADDITION; no previously accepted historical identity
+// was removed or changed.
+const compatibilityDigest = "52fbd3f25cecb551bb2153f630298ae17495827110991236374af59bbb70c4e3"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -182,6 +191,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"upsert_binding_pre_tombstone_guard":    1,   // UpsertBinding before `AND deleted_at IS NULL` stopped it resurrecting a released prefix
 	"claim_proof_fenced_not_exists_fork":    1,   // fenced claim with its fence as a receiver-evaluated NOT EXISTS (fork 39c75474..a0037a7e)
 	"credentials_split_clear_v56":           2,   // first credentials_split_v1 build's users/tokens old-column clears, before the split went dual-write
+	"canonical_registry_v1_retired":         2,   // retired canonical registry design: the canonical upsert (DispReject) + consolidation's by-id tombstone; never emitted
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

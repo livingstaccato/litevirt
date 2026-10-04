@@ -28,7 +28,10 @@ import (
 // actually expressible: in the shape of the code.
 func TestNoHandlerHoldsAVMLockAcrossAPeerForward(t *testing.T) {
 	funcRe := regexp.MustCompile(`\nfunc \(s \*Server\) (\w+)\(`)
-	lockRe := regexp.MustCompile(`unlock\s*:=\s*s\.lock(VM|Container)\(`)
+	// releaseOnce(...) wraps the lock in the handlers that release before a
+	// forward; without the optional group this scan never saw them lock at all,
+	// and passed them whatever they did afterwards.
+	lockRe := regexp.MustCompile(`unlock\s*:=\s*(releaseOnce\()?s\.lock(VM|Container)\(`)
 	// One or two tabs: a STATEMENT-level release. The closure that defines
 	// releaseLock contains `unlock()` three tabs deep, and matching that would
 	// let a handler pass by merely declaring the helper it never calls.
@@ -141,17 +144,27 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 			// releases nothing while that forward is in flight. Counting it was
 			// the bug in the first version of this scan, and it made the whole
 			// test pass against code that was plainly holding the lock.
+			//
+			// Nor do calls inside a function LITERAL: the closure that defines an
+			// idempotent releaseLock contains `unlock()`, and counting that call
+			// at the closure's position let a handler pass by declaring a
+			// release it never makes. The named release helpers count where they
+			// are CALLED instead.
 			var unlockPositions []token.Pos
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				if _, isDefer := n.(*ast.DeferStmt); isDefer {
+				switch n.(type) {
+				case *ast.DeferStmt, *ast.FuncLit:
 					return false
 				}
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
 					return true
 				}
-				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "unlock" {
-					unlockPositions = append(unlockPositions, call.Pos())
+				if id, ok := call.Fun.(*ast.Ident); ok {
+					switch id.Name {
+					case "unlock", "releaseLock", "releaseLocks":
+						unlockPositions = append(unlockPositions, call.Pos())
+					}
 				}
 				return true
 			})

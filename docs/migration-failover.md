@@ -436,6 +436,16 @@ moment a host turned active does not count toward fencing it: a host that just
 turned active is counted down afresh, and a host `lv host add` admitted is not
 probed at all until its daemon's first boot records it `active`.
 
+The same holds for the proof-grade fence `lv host rm --dead` rests on, which
+counts at any age, and for the one a lost voter's removal and a superseded
+claim rest on. A proof-grade row from before the host was last recorded as it
+is now — admitted (`joining`), booted (`active`), lost unfenced (`offline`),
+drained — is about an earlier life and does not count, so a machine `lv host
+add` put under a removed host's name is not removed on the old machine's
+confirmation: `lv host fence-confirm` it once it is powered off. A host
+recorded `fenced` is exempt, since that write is itself its fence. Rows within
+5 seconds of the state write still count, for the clock between them.
+
 ### Resuming a recovery from a confirmation
 
 A recovery refused for want of a confirmation — a `manual` fence, a

@@ -454,11 +454,19 @@ type SupersedeEvidence struct {
 }
 
 // HostProofGradeFence returns the newest proof-grade fencing_log row for host
-// (an IPMI power-off or an operator's `lv host fence-confirm`), whatever its
-// age: the supersede evidence and `lv host rm --dead` ask whether the host
-// was ever proven off, alongside its removal and revocation.
+// (an IPMI power-off or an operator's `lv host fence-confirm`) of the host as
+// it is now, however old: the supersede evidence and `lv host rm --dead` ask
+// whether the host was proven off, alongside its removal and revocation. A row
+// from before the host was last recorded as it is now (HostFenceLife) is about
+// an earlier life of it — the machine removed under its name before `lv host
+// add` gave the name to a new one, or the same machine before it came back —
+// and does not count.
 func HostProofGradeFence(ctx context.Context, c *Client, host string) (FenceLogRecord, bool, error) {
 	rows, err := c.Query(ctx, `SELECT id, host_name, method, result, timestamp, detail FROM fencing_log WHERE host_name = ?`, host)
+	if err != nil {
+		return FenceLogRecord{}, false, err
+	}
+	life, _, lifeKnown, err := HostFenceLife(ctx, c, host)
 	if err != nil {
 		return FenceLogRecord{}, false, err
 	}
@@ -469,7 +477,10 @@ func HostProofGradeFence(ctx context.Context, c *Client, host string) (FenceLogR
 		if !FenceProofGrade(r.String("method"), r.String("result")) {
 			continue
 		}
-		ts, _ := time.Parse(time.RFC3339, r.String("timestamp"))
+		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
+		if lifeKnown && (perr != nil || ts.Before(life)) {
+			continue // an earlier life of the host (HostFenceLife)
+		}
 		if !found || ts.After(bestTS) {
 			found, bestTS = true, ts
 			best = FenceLogRecord{ID: r.String("id"), HostName: host, Method: r.String("method"),

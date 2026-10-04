@@ -51,6 +51,21 @@ type aeMeter struct {
 	// it — how often a pass pulled THAT table, which the per-method tally
 	// cannot say when one pass pulls several.
 	tablePulls map[string]int
+	// bucketAsks counts, per table, the GetTableBucketDigests requests that
+	// named it. A pass asks for a table's buckets only after its digest
+	// disagreed, so this is where a disagreement shows before any pull.
+	bucketAsks map[string]int
+}
+
+func (m *aeMeter) addBucketAsks(tables []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.bucketAsks == nil {
+		m.bucketAsks = make(map[string]int)
+	}
+	for _, t := range tables {
+		m.bucketAsks[t]++
+	}
 }
 
 func (m *aeMeter) addTablePulls(tables []string) {
@@ -88,6 +103,9 @@ func (n *Node) aeMeterUnaryInterceptor(ctx context.Context, req any, info *grpc.
 			size = int64(proto.Size(msg))
 		}
 		n.aeMeter.add(name, 1, size)
+		if r, ok := req.(*pb.BucketDigestRequest); ok {
+			n.aeMeter.addBucketAsks(r.GetTables())
+		}
 	}
 	return resp, err
 }
@@ -157,12 +175,26 @@ func (c *Cluster) AETablePulls(table string) int {
 	return total
 }
 
+// AETableRepairs is how many anti-entropy requests, across every node, named
+// table since the last ResetAEStats: bucket-digest asks plus dumps. Nonzero
+// means some pass found the table's digest disagreeing.
+func (c *Cluster) AETableRepairs(table string) int {
+	total := c.AETablePulls(table)
+	for _, n := range c.Nodes {
+		n.aeMeter.mu.Lock()
+		total += n.aeMeter.bucketAsks[table]
+		n.aeMeter.mu.Unlock()
+	}
+	return total
+}
+
 // ResetAEStats zeroes every node's anti-entropy tally.
 func (c *Cluster) ResetAEStats() {
 	for _, n := range c.Nodes {
 		n.aeMeter.mu.Lock()
 		n.aeMeter.methods = nil
 		n.aeMeter.tablePulls = nil
+		n.aeMeter.bucketAsks = nil
 		n.aeMeter.mu.Unlock()
 	}
 }

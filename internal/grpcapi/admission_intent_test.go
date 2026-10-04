@@ -150,6 +150,10 @@ func TestCreateContainer_BoundedResidency_NoQEMUOverhead(t *testing.T) {
 	s := testServer(t)
 	admissionHost(t, s) // allocatable: exactly 1536 MiB
 	s.SetContainerRuntime(&fakeCTRuntime{})
+	// A host runs a container only once its daemon says so (refuseNoContainerRuntime).
+	if err := corrosion.SetHostLabel(context.Background(), s.db, "test-host", corrosion.LabelLXCCapable, "true"); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := s.CreateContainer(adminCtx(), &pb.CreateContainerRequest{
 		Name: "snug", Template: "download", Distro: "alpine", Release: "3.19",

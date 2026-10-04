@@ -1,11 +1,14 @@
 package daemon
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,5 +84,28 @@ func TestMigrationTLSStatusRow_CarriesTheInspection(t *testing.T) {
 	}
 	if e := migrationTLSStatusRow(pki.MigrationTLSInfo{}, errors.New("eperm")); e.GetError() == "" {
 		t.Fatal("a read error did not become the row's error")
+	}
+}
+
+// Mutation: log every finding at Warn — the expired one is not an Error.
+func TestLogMigrationExpiry_WarnsSoonAndErrorsOnceExpired(t *testing.T) {
+	now := time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)
+	day := 24 * time.Hour
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	logMigrationExpiry(log, pki.MigrationTLSInfo{Provisioned: true, CertNotAfter: now.Add(91 * day)}, now)
+	if buf.Len() != 0 {
+		t.Fatalf("logged at 91 days: %s", buf.String())
+	}
+	logMigrationExpiry(log, pki.MigrationTLSInfo{Provisioned: true, CertNotAfter: now.Add(89 * day)}, now)
+	if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "install-migration-tls --reissue") {
+		t.Fatalf("89 days: %s; want a Warn naming the reissue", buf.String())
+	}
+	buf.Reset()
+	logMigrationExpiry(log, pki.MigrationTLSInfo{Provisioned: true,
+		TrustedCAs: []pki.MigrationCAInfo{{Fingerprint: "aa", NotAfter: now.Add(-day)}}}, now)
+	if !strings.Contains(buf.String(), "level=ERROR") || !strings.Contains(buf.String(), "rotate-migration-ca") {
+		t.Fatalf("expired CA: %s; want an Error naming the rotation", buf.String())
 	}
 }

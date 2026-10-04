@@ -2,13 +2,16 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/user"
 	"strconv"
 	"strings"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -102,4 +105,43 @@ func migrationTLSStatusRow(info pki.MigrationTLSInfo, err error) *pb.MigrationTL
 		row.TrustedCas = append(row.TrustedCas, &pb.MigrationTLSCA{Fingerprint: c.Fingerprint, NotAfter: timestamppb.New(c.NotAfter)})
 	}
 	return row
+}
+
+// logMigrationExpiry logs each migration credential that expires within
+// pki.MigrationExpiryWarning: Warn before, Error after.
+func logMigrationExpiry(log *slog.Logger, info pki.MigrationTLSInfo, now time.Time) {
+	for _, e := range info.Expiring(now) {
+		fix := "`lv host install-migration-tls --reissue`" // ci:skip-cmd: install-migration-tls exists
+		if strings.HasPrefix(e.What, "CA ") {
+			fix = "`lv host rotate-migration-ca`" // ci:skip-cmd: ships in a later task
+		}
+		level, verb := slog.LevelWarn, "expires"
+		if e.Expired {
+			level, verb = slog.LevelError, "expired"
+		}
+		log.Log(context.Background(), level, fmt.Sprintf("migration TLS: the %s %s %s; storage "+
+			"migrations with this host will be refused after that. Fix: %s",
+			e.What, verb, e.NotAfter.Format("2006-01-02"), fix))
+	}
+}
+
+// runMigrationExpiryWatch checks at start and every 24 hours.
+func runMigrationExpiryWatch(ctx context.Context, pkiDir string) {
+	check := func() {
+		info, err := pki.InspectMigrationTLS(pkiDir, time.Now())
+		if err == nil && info.Provisioned {
+			logMigrationExpiry(slog.Default(), info, time.Now())
+		}
+	}
+	check()
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			check()
+		}
+	}
 }

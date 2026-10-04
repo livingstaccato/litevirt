@@ -154,3 +154,78 @@ func TestReseedHost_ARefusedPreflightLeavesNoMarker(t *testing.T) {
 			"which needlessly refuses every login on a healthy node")
 	}
 }
+
+// The positive half of the same property: a reseed that discards the
+// secret-bearing tables must put the SOURCE's rows back. The tests above pin
+// what happens when the restore fails; this one pins that it happens at all.
+// Without it, dropping the sensitive fetch-and-merge from ReseedHost leaves a
+// node with user_2fa empty and only a failed-merge test to notice, and that
+// test reads a missing merge as a merge that did not fail.
+func TestReseedHost_RestoresTheSourcesSecrets(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+
+	for _, h := range []corrosion.HostRecord{
+		{Name: "test-host", Address: "10.0.0.1", State: "active"},
+		{Name: "peer1", Address: "10.0.0.2", State: "active"},
+	} {
+		if err := corrosion.InsertHost(ctx, s.db, h); err != nil {
+			t.Fatalf("InsertHost %s: %v", h.Name, err)
+		}
+	}
+	if err := corrosion.IsolateHost(ctx, s.db, "peer1", "test-host", "schema_forward"); err != nil {
+		t.Fatalf("IsolateHost: %v", err)
+	}
+	// What the quarantine holds: a factor only this node has.
+	if err := corrosion.InsertUser2FA(ctx, s.db, corrosion.User2FARecord{
+		Username: "mallory", Method: "totp", Secret: "quarantined", Label: "q",
+	}); err != nil {
+		t.Fatalf("InsertUser2FA mallory: %v", err)
+	}
+
+	// The source's secret-bearing state: carol is enrolled there.
+	src := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, src); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if err := corrosion.InsertUser2FA(ctx, src, corrosion.User2FARecord{
+		Username: "carol", Method: "totp", Secret: "enrolled", Label: "phone",
+	}); err != nil {
+		t.Fatalf("InsertUser2FA carol: %v", err)
+	}
+
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return &dumpServingSource{
+			fakeReseedSource: &fakeReseedSource{
+				ping: &pb.PingResponse{SchemaVersion: int32(corrosion.CurrentSchemaVersion)},
+			},
+			sensitiveChunks: [][]byte{src.DumpSensitiveStateBytes()},
+		}, func() {}, nil
+	}
+
+	// The double reports no digests, so convergence is not certified and the
+	// call returns an error. The restore happens before that point, which is
+	// what is asserted here.
+	_, _ = s.ReseedHost(ctx, &pb.ReseedHostRequest{
+		Name: "test-host", Source: "peer1", DrivenByPeer: "peer1",
+	})
+
+	carol, err := corrosion.ListUser2FA(ctx, s.db, "carol")
+	if err != nil {
+		t.Fatalf("ListUser2FA carol: %v", err)
+	}
+	if len(carol) == 0 {
+		t.Fatal("the reseed discarded user_2fa and did not restore the source's rows: carol is " +
+			"enrolled on the source and reads as having no second factor here")
+	}
+	mallory, err := corrosion.ListUser2FA(ctx, s.db, "mallory")
+	if err != nil {
+		t.Fatalf("ListUser2FA mallory: %v", err)
+	}
+	if len(mallory) != 0 {
+		t.Error("a factor that existed only in the quarantine survived the reseed")
+	}
+	if incomplete, _, _ := s.db.ReseedIncomplete(ctx); incomplete {
+		t.Error("the sensitive merge landed but the login gate is still closed")
+	}
+}

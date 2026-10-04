@@ -326,3 +326,51 @@ func SSHMigrationTLSHosts(ctx context.Context, c pb.LiteVirtClient, sshUser stri
 	}
 	return hosts, closeAll, nil
 }
+
+// unreachableMigrationHost is a cluster host SSH could not reach. Its Push
+// returns the connect error, so the rotation stops on it, or skips it under
+// --force, instead of refusing to start.
+type unreachableMigrationHost struct {
+	name, address string
+	err           error
+}
+
+func (h *unreachableMigrationHost) Name() string                              { return h.name }
+func (h *unreachableMigrationHost) Address() string                           { return h.address }
+func (h *unreachableMigrationHost) Provisioned(context.Context) (bool, error) { return false, h.err }
+func (h *unreachableMigrationHost) Push(context.Context, []migrationFile) error {
+	return fmt.Errorf("SSH to %s: %w", h.address, h.err)
+}
+
+// SSHMigrationTLSHostsLenient is SSHMigrationTLSHosts for the rotation: a host
+// SSH cannot reach is returned as unreachable rather than failing the list.
+func SSHMigrationTLSHostsLenient(ctx context.Context, c pb.LiteVirtClient, sshUser string) ([]MigrationTLSHost, func(), error) {
+	resp, err := c.ListHosts(ctx, &pb.ListHostsRequest{})
+	if err != nil {
+		return nil, nil, fmt.Errorf("list hosts: %w", err)
+	}
+	if sshUser == "" {
+		sshUser = "root"
+	}
+	var hosts []MigrationTLSHost
+	var conns []*ssh.Client
+	closeAll := func() {
+		for _, sc := range conns {
+			sc.Close()
+		}
+	}
+	for _, h := range resp.Hosts {
+		if h.Address == "" {
+			hosts = append(hosts, &unreachableMigrationHost{h.Name, "", errors.New("no recorded address")})
+			continue
+		}
+		sc, err := ssh.NewClient(sshUser + "@" + h.Address)
+		if err != nil {
+			hosts = append(hosts, &unreachableMigrationHost{h.Name, h.Address, err})
+			continue
+		}
+		conns = append(conns, sc)
+		hosts = append(hosts, &sshMigrationTLSHost{name: h.Name, address: h.Address, sc: sc})
+	}
+	return hosts, closeAll, nil
+}

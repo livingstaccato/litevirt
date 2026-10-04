@@ -160,7 +160,7 @@ func (s *Server) ApproveRebalanceProposal(ctx context.Context, req *pb.ApproveRe
 	if err := s.db.Execute(ctx,
 		`UPDATE rebalance_proposals
 		 SET status = 'approved', updated_at = ?
-		 WHERE id = ? AND status = 'pending'`, s.db.NowTS(), req.Id); err != nil {
+		 WHERE id = ? AND status = 'pending'`, s.db.NowWallTS(), req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "approve: %v", err)
 	}
 	return s.fetchProposal(ctx, req.Id)
@@ -179,7 +179,7 @@ func (s *Server) RejectRebalanceProposal(ctx context.Context, req *pb.RejectReba
 	if err := s.db.Execute(ctx,
 		`UPDATE rebalance_proposals
 		 SET status = 'rejected', detail = ?, updated_at = ?
-		 WHERE id = ? AND status = 'pending'`, detail, s.db.NowTS(), req.Id); err != nil {
+		 WHERE id = ? AND status = 'pending'`, detail, s.db.NowWallTS(), req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "reject: %v", err)
 	}
 	return s.fetchProposal(ctx, req.Id)

@@ -11,6 +11,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
 )
@@ -25,6 +28,12 @@ type fakeRotHost struct {
 	// clearAfterFail makes failPush one-shot: the host comes back right after
 	// its first failed push, so a later phase would reach it.
 	clearAfterFail bool
+	// answersStatus keeps the host's daemon answering MigrationTLSStatus while
+	// failPush is set: SSH to it fails, gRPC does not. The rotation's preflight
+	// then passes, and the failure is met mid-run.
+	answersStatus bool
+	// installErr is what its daemon's install hook reports.
+	installErr string
 }
 
 func (h *fakeRotHost) Name() string    { return h.name }
@@ -71,7 +80,7 @@ func fakeStatus(hosts []*fakeRotHost) MigrationTLSStatusFunc {
 	return func(context.Context) ([]*pb.MigrationTLSHostStatus, error) {
 		var rows []*pb.MigrationTLSHostStatus
 		for _, h := range hosts {
-			if h.failPush != nil {
+			if h.failPush != nil && !h.answersStatus {
 				rows = append(rows, &pb.MigrationTLSHostStatus{Host: h.name, Error: "unreachable"})
 				continue
 			}
@@ -80,7 +89,8 @@ func fakeStatus(hosts []*fakeRotHost) MigrationTLSStatusFunc {
 				return nil, err
 			}
 			row := &pb.MigrationTLSHostStatus{Host: h.name, Provisioned: info.Provisioned,
-				ValidationError: info.ValidationError, CertIssuerFingerprint: info.CertIssuerFingerprint}
+				ValidationError: info.ValidationError, CertIssuerFingerprint: info.CertIssuerFingerprint,
+				InstallError: h.installErr}
 			for _, c := range info.TrustedCAs {
 				row.TrustedCas = append(row.TrustedCas, &pb.MigrationTLSCA{Fingerprint: c.Fingerprint})
 			}
@@ -165,7 +175,7 @@ func TestRotateMigrationCA_OverlapEndsEveryHostOnTheNewCAAlone(t *testing.T) {
 func TestRotateMigrationCA_TrustBothDoesNotTouchCertificates(t *testing.T) {
 	op, hosts := provisionedCluster(t, 2)
 	oldFP, _ := pki.CAFileFingerprint(filepath.Join(op, pki.MigrationCACertName))
-	hosts[1].failPush = errors.New("down")
+	hosts[1].failPush, hosts[1].answersStatus = errors.New("down"), true
 	_ = rotate(t, op, hosts, RotateMigrationCAOptions{}) // stops at node-2's trust-both push
 	info, _ := pki.InspectMigrationTLS(hosts[0].pkiDir, time.Now())
 	if len(info.TrustedCAs) != 2 || info.CertIssuerFingerprint != oldFP {
@@ -179,7 +189,7 @@ func TestRotateMigrationCA_TrustBothDoesNotTouchCertificates(t *testing.T) {
 // Mutation: do not save after each host — the re-run pushes to node-1 again.
 func TestRotateMigrationCA_UnreachableHostStopsAndResumes(t *testing.T) {
 	op, hosts := provisionedCluster(t, 3)
-	hosts[2].failPush = errors.New("connection refused")
+	hosts[2].failPush, hosts[2].answersStatus = errors.New("connection refused"), true
 	err := rotate(t, op, hosts, RotateMigrationCAOptions{})
 	if err == nil || !strings.Contains(err.Error(), "node-3") {
 		t.Fatalf("err = %v; want a stop naming node-3", err)
@@ -300,7 +310,7 @@ func TestRotateMigrationCA_NoOverlapIsOnePassToTheNewCAAlone(t *testing.T) {
 // silently continues in overlap mode.
 func TestRotateMigrationCA_RefusesToSwitchModeMidRotation(t *testing.T) {
 	op, hosts := provisionedCluster(t, 2)
-	hosts[1].failPush = errors.New("down")
+	hosts[1].failPush, hosts[1].answersStatus = errors.New("down"), true
 	_ = rotate(t, op, hosts, RotateMigrationCAOptions{})
 	hosts[1].failPush = nil
 	err := rotate(t, op, hosts, RotateMigrationCAOptions{NoOverlap: true})
@@ -530,5 +540,197 @@ func TestRotateMigrationCA_DropOldResumesAfterFinalize(t *testing.T) {
 	}
 	if MigrationRotationInProgress(op) {
 		t.Error("rotation still in progress after the resume")
+	}
+}
+
+// nothingMinted fails t if the rotation left any trace on the operator machine.
+func nothingMinted(t *testing.T, op string) {
+	t.Helper()
+	for _, f := range []string{nextCACertName, nextCAKeyName, bundleCACertName, rotationFileName} {
+		if _, err := os.Stat(filepath.Join(op, f)); !os.IsNotExist(err) {
+			t.Errorf("%s exists after a refused start", f)
+		}
+	}
+}
+
+// A host with no migration credentials is refused before anything is minted,
+// naming the command that provisions it — which works only while no rotation
+// is in progress.
+//
+// Mutation: skip the preflight — the run mints next.crt and stalls at the
+// trust-both gate instead.
+func TestRotateMigrationCA_PreflightRefusesAnUnprovisionedHost(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	if err := os.RemoveAll(pki.MigrationDir(hosts[1].pkiDir)); err != nil {
+		t.Fatal(err)
+	}
+	err := rotate(t, op, hosts, RotateMigrationCAOptions{})
+	if err == nil || !strings.Contains(err.Error(), "node-2") || !strings.Contains(err.Error(), "install-migration-tls`") {
+		t.Fatalf("err = %v; want a refusal naming node-2 and install-migration-tls", err)
+	}
+	nothingMinted(t, op)
+	if hosts[0].pushes != 0 {
+		t.Errorf("node-1 was pushed %d time(s) before the refusal", hosts[0].pushes)
+	}
+}
+
+// A host whose set is missing one file is refused as incomplete, with the
+// --reissue remedy, not as unprovisioned.
+//
+// Mutation: skip the preflight — the run mints next.crt.
+func TestRotateMigrationCA_PreflightRefusesAnIncompleteSet(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	if err := os.Remove(filepath.Join(pki.MigrationDir(hosts[1].pkiDir), pki.MigrationHostKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	err := rotate(t, op, hosts, RotateMigrationCAOptions{})
+	if err == nil || !strings.Contains(err.Error(), "incomplete set") || !strings.Contains(err.Error(), "--reissue") {
+		t.Fatalf("err = %v; want node-2 refused as an incomplete set, remedy --reissue", err)
+	}
+	nothingMinted(t, op)
+}
+
+// Run on a machine whose migration CA is not the cluster's, the rotation is
+// refused before it mints or pushes: trust-both would otherwise push a bundle
+// of the wrong old CA and the new one, which every host's certificate fails.
+//
+// Mutation: drop the fingerprint check — the run mints and pushes.
+func TestRotateMigrationCA_PreflightRefusesAMachineWithAnotherCA(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	if err := pki.GenerateMigrationCA(filepath.Join(op, pki.MigrationCACertName), filepath.Join(op, pki.MigrationCAKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	err := rotate(t, op, hosts, RotateMigrationCAOptions{})
+	if err == nil || !strings.Contains(err.Error(), "node-1, node-2") || !strings.Contains(err.Error(), "`lv host init` ran") {
+		t.Fatalf("err = %v; want a refusal naming both hosts and where to run it", err)
+	}
+	nothingMinted(t, op)
+	for _, h := range hosts {
+		if h.pushes != 0 {
+			t.Errorf("%s was pushed %d time(s)", h.name, h.pushes)
+		}
+	}
+}
+
+// A daemon too old to answer MigrationTLSStatus is found before anything is
+// pushed, not after every host was.
+//
+// Mutation: drop the Unimplemented check — the error carries no upgrade hint.
+func TestRotateMigrationCA_PreflightRefusesAnOldDaemon(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	old := func(context.Context) ([]*pb.MigrationTLSHostStatus, error) {
+		return nil, grpcstatus.Error(codes.Unimplemented, "unknown method MigrationTLSStatus")
+	}
+	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), old, RotateMigrationCAOptions{Force: true}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "upgraded node") {
+		t.Fatalf("err = %v; want a refusal pointing the CLI at an upgraded node", err)
+	}
+	nothingMinted(t, op)
+	if hosts[0].pushes != 0 {
+		t.Errorf("node-1 was pushed %d time(s)", hosts[0].pushes)
+	}
+}
+
+// A host that cannot answer refuses the start without --force; with it, the
+// rotation proceeds and leaves that host behind.
+//
+// Mutation: ignore force on an error row — the --force run is refused too.
+func TestRotateMigrationCA_PreflightErrorRowNeedsForce(t *testing.T) {
+	op, hosts := provisionedCluster(t, 3)
+	hosts[2].failPush = errors.New("powered off")
+	err := rotate(t, op, hosts, RotateMigrationCAOptions{})
+	if err == nil || !strings.Contains(err.Error(), "node-3") || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("err = %v; want a refusal naming node-3 and --force", err)
+	}
+	nothingMinted(t, op)
+	if err := rotate(t, op, hosts, RotateMigrationCAOptions{Force: true}); err != nil {
+		t.Fatalf("--force: %v", err)
+	}
+}
+
+// The trust-both gate holds a host whose set fails validation even though it
+// trusts the new CA: the daemon would refuse to install it.
+//
+// Mutation: drop the ValidationError clause from trust-both — the run passes
+// the gate and reaches reissue.
+func TestRotateMigrationCA_TrustBothGateHoldsAFailedValidation(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	status := func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error) {
+		rows, err := fakeStatus(hosts)(ctx)
+		if r, _ := loadMigrationRotation(op); err == nil && r != nil {
+			rows[1].ValidationError = "certificate signed by unknown authority"
+		}
+		return rows, err
+	}
+	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), status, RotateMigrationCAOptions{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "node-2") || !strings.Contains(err.Error(), "unknown authority") {
+		t.Fatalf("err = %v; want the trust-both gate to stop on node-2's validation error", err)
+	}
+	if r, _ := loadMigrationRotation(op); r.Phase != phaseTrustBoth {
+		t.Fatalf("phase = %s; want still trust-both", r.Phase)
+	}
+}
+
+// Every gate holds a host whose daemon cannot install its set.
+//
+// Mutation: drop the InstallError check from phaseUnmet — the run finishes.
+func TestRotateMigrationCA_GateHoldsAnInstallRefusal(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	status := func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error) {
+		if r, _ := loadMigrationRotation(op); r != nil {
+			hosts[1].installErr = "/etc/pki/qemu holds files litevirt did not put there"
+		}
+		return fakeStatus(hosts)(ctx)
+	}
+	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), status, RotateMigrationCAOptions{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "node-2") || !strings.Contains(err.Error(), "/etc/pki/qemu") {
+		t.Fatalf("err = %v; want the gate to stop on node-2's install refusal", err)
+	}
+}
+
+// Two rotations on one day keep both retired certificates: the second goes to
+// -2 instead of overwriting the first.
+//
+// Mutation: always use the base name — the first retired CA is overwritten.
+func TestRotateMigrationCA_TwoRotationsInOneDayKeepBothRetiredCAs(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	day := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	opts := RotateMigrationCAOptions{Now: func() time.Time { return day }}
+	first, _ := os.ReadFile(filepath.Join(op, pki.MigrationCACertName))
+	if err := rotate(t, op, hosts, opts); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := os.ReadFile(filepath.Join(op, pki.MigrationCACertName))
+	if err := rotate(t, op, hosts, opts); err != nil {
+		t.Fatalf("second rotation: %v", err)
+	}
+	a, errA := os.ReadFile(filepath.Join(op, "migration-ca.retired-20261004.crt"))
+	b, errB := os.ReadFile(filepath.Join(op, "migration-ca.retired-20261004-2.crt"))
+	if errA != nil || errB != nil {
+		t.Fatalf("retired certificates: %v, %v; want both", errA, errB)
+	}
+	if !bytes.Equal(a, first) || !bytes.Equal(b, second) || bytes.Equal(a, b) {
+		t.Error("the retired certificates are not the two CAs rotated out, in order")
+	}
+}
+
+// A finalize re-run after it already retired the CA reuses that file rather
+// than writing a second copy under -2.
+//
+// Mutation: skip the same-bytes check — the re-run writes -2.
+func TestFinalizeMigrationRotation_RerunDoesNotDuplicateTheRetiredCA(t *testing.T) {
+	op := t.TempDir()
+	writeRotation(t, op, phaseDropOld, false)
+	r, _ := loadMigrationRotation(op)
+	day := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	cur, _ := os.ReadFile(filepath.Join(op, pki.MigrationCACertName))
+	if err := os.WriteFile(filepath.Join(op, "migration-ca.retired-20261004.crt"), cur, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalizeMigrationRotation(op, r, day); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := filepath.Glob(filepath.Join(op, "migration-ca.retired-*.crt")); len(got) != 1 {
+		t.Errorf("retired certificates = %v; want the one already written", got)
 	}
 }

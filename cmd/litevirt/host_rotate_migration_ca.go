@@ -25,6 +25,10 @@ By default it runs three phases, checking every host's daemon between them:
   3. drop-old    every host trusts the new CA alone; this machine retires the old one
 Storage migrations keep working throughout. No restart is needed.
 
+Before it starts, it asks every host's daemon for its migration credentials and
+refuses, changing nothing, unless each holds a complete, valid set its daemon
+can install, trusting this machine's migration CA.
+
 If it stops (a host is unreachable), progress is saved; run it again to continue.
 
   --no-overlap  For a compromised CA key. One pass straight to the new CA alone:

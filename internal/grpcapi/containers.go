@@ -178,7 +178,7 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	// after safety passes.
 	var ctLease *reservationLease
 	{
-		lease, aerr := s.admitHostWithReservation(ctx, "CreateContainer", s.hostName, req.Project, "ct:"+req.Name, 0, int(req.MemoryMib), intentContainerResident)
+		lease, aerr := s.admitHostWithReservation(ctx, "CreateContainer", s.hostName, tenancy.NormalizeProject(req.Project), "ct:"+req.Name, 0, int(req.MemoryMib), intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}
@@ -357,7 +357,7 @@ func (s *Server) StartContainer(ctx context.Context, req *pb.StartContainerReque
 	// Reserved, not just checked, so the memory stays accounted for across the
 	// runtime start and the "running" state write below.
 	if rec.State != "running" {
-		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, rec.Project, "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
+		lease, aerr := s.admitHostWithReservation(ctx, "StartContainer", s.hostName, tenancy.NormalizeProject(rec.Project), "ct:"+req.Name, 0, rec.MemMiB, intentContainerResident)
 		if aerr != nil {
 			return nil, aerr
 		}

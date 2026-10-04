@@ -824,6 +824,13 @@ func drillMemory() string { return envOr("E2E_DRILL_MEMORY", "128M") }
 // the stack in cleanup. It returns host → VM name.
 func (l *lab) createVMs(via, prefix string, hosts ...string) map[string]string {
 	l.t.Helper()
+	return l.createStack(via, prefix, false, hosts...)
+}
+
+// createStack is createVMs; with roomOnly, a placement refused for want of
+// room returns nil instead of failing the test.
+func (l *lab) createStack(via, prefix string, roomOnly bool, hosts ...string) map[string]string {
+	l.t.Helper()
 	stack := uniqueName(prefix)
 	names := map[string]string{}
 	var b strings.Builder
@@ -838,6 +845,10 @@ func (l *lab) createVMs(via, prefix string, hosts ...string) map[string]string {
 	l.mustSSH(via, 30*time.Second, "echo "+enc+" | base64 -d > "+file)
 	l.onRestore(func() { l.deleteVMs(stack, names) })
 	if out, err := l.lv(via, "compose", "up", "-f", file, "-y"); err != nil {
+		if errOut := err.Error() + out; roomOnly && strings.Contains(errOut, "no eligible host") {
+			l.mark("workloads: no room for a test VM on %v: %s", hosts, strings.TrimSpace(errOut))
+			return nil
+		}
 		l.t.Fatalf("compose up %s: %v\n%s", stack, err, out)
 	}
 	for h, n := range names {
@@ -847,6 +858,21 @@ func (l *lab) createVMs(via, prefix string, hosts ...string) map[string]string {
 	}
 	l.mark("workloads: created %v", names)
 	return names
+}
+
+// createVMsWhereRoom is createVMs with one stack per host, skipping a host the
+// planner has no memory for: after earlier drills have moved workloads around,
+// a fixed host can be full. It returns host → VM name for the hosts that took
+// one.
+func (l *lab) createVMsWhereRoom(via, prefix string, hosts ...string) map[string]string {
+	l.t.Helper()
+	all := map[string]string{}
+	for _, h := range hosts {
+		for hh, n := range l.createStack(via, prefix, true, h) {
+			all[hh] = n
+		}
+	}
+	return all
 }
 
 // deleteVMs removes a test stack and anything it left on any node: a domain a

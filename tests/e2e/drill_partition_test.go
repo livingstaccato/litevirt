@@ -66,8 +66,11 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 
 	minority, majority := l.hosts[:2], l.hosts[2:]
 	q := majority[0] // the CLI side that keeps a quorum
-	test := l.createVMs(q, "d1", minority...)
+	test := l.createVMsWhereRoom(q, "d1", minority...)
 	keys := l.recoverableOn(q, minority...)
+	if len(keys) == 0 {
+		t.Fatalf("no recoverable workload on the minority %v, and no room there for a test VM", minority)
+	}
 	home := map[string]string{}
 	disks := map[string]vmInfo{}
 	for _, v := range l.vms(q) {
@@ -230,13 +233,17 @@ func TestDrillBlip_FleetWide(t *testing.T) {
 	q := l.hosts[0]
 
 	var lxcHost, plainHost string
+	var plain []string
 	for _, h := range l.hosts {
 		if b.lxcHosts[h] && lxcHost == "" {
 			lxcHost = h
 		}
-		if !b.lxcHosts[h] && plainHost == "" {
-			plainHost = h
+		if !b.lxcHosts[h] {
+			plain = append(plain, h)
 		}
+	}
+	if len(plain) > 0 {
+		plainHost = l.leastLoaded(q, plain) // earlier drills can leave a fixed host full
 	}
 	if lxcHost == "" || plainHost == "" {
 		t.Fatalf("the blip needs a host with LXC and one without (litevirt.lxc labels: %v)", b.lxcHosts)

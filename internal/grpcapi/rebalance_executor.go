@@ -130,7 +130,7 @@ func (e *RebalanceExecutor) RunOnce(ctx context.Context) {
 			e.markFailed(ctx, p.ID, "proposal expired before execution")
 			continue
 		}
-		if !e.claim(ctx, p.ID, e.db.NowTS()) {
+		if !e.claim(ctx, p.ID, e.db.NowWallTS()) {
 			continue
 		}
 		if reason := e.validate(ctx, p); reason != "" {
@@ -146,8 +146,9 @@ func (e *RebalanceExecutor) RunOnce(ctx context.Context) {
 // claim atomically transitions a row approved→applying. It stamps a unique
 // updated_at and re-reads to confirm THIS loop won the row (Execute reports no
 // rows-affected, so we verify by marker). The marker is the row's LWW key, so
-// it must come from the replicated clock (db.NowTS): a wall-second stamp ties
-// the approval that landed in the same second, and the peer drops the claim.
+// it must come from the replicated clock (db.NowWallTS): a wall-second stamp
+// ties the approval that landed in the same second, and the peer drops the
+// claim. Wall, not HLC: see recordProposal.
 func (e *RebalanceExecutor) claim(ctx context.Context, id, marker string) bool {
 	if err := e.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='applying', updated_at=?
@@ -236,7 +237,7 @@ func (e *RebalanceExecutor) markApplied(ctx context.Context, id string) {
 	now := e.now().UTC().Format(time.RFC3339)
 	if err := e.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='applied', applied_at=?, updated_at=?
-		 WHERE id=? AND status='applying'`, now, e.db.NowTS(), id); err != nil {
+		 WHERE id=? AND status='applying'`, now, e.db.NowWallTS(), id); err != nil {
 		slog.Warn("rebalance executor: mark applied", "id", id, "error", err)
 	}
 }
@@ -244,7 +245,7 @@ func (e *RebalanceExecutor) markApplied(ctx context.Context, id string) {
 func (e *RebalanceExecutor) markFailed(ctx context.Context, id, reason string) {
 	if err := e.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='failed', detail=?, updated_at=? WHERE id=?`,
-		reason, e.db.NowTS(), id); err != nil {
+		reason, e.db.NowWallTS(), id); err != nil {
 		slog.Warn("rebalance executor: mark failed", "id", id, "error", err)
 	}
 }

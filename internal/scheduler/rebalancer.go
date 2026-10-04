@@ -598,12 +598,17 @@ func vmBaseName(name string) string {
 // recordProposal writes a pending proposal to the rebalance_proposals table.
 //
 // updated_at is the row's LWW key and comes from the replicated clock
-// (db.NowTS), never from r.now(): a cycle inserts a proposal and approves it
-// within the same second, and a peer drops a partial UPDATE whose updated_at
-// ties the row it lands on. A whole-second wall stamp left the peer pending
-// forever. The wall columns (proposed_at, expires_at) stay on r.now(), the
-// virtual clock fleet scenarios drive. NowTS may emit HLC, so any age read of
-// updated_at goes through corrosion.TsMsSQL (see the executor's reapStale).
+// (db.NowWallTS), never from r.now(): a cycle inserts a proposal and approves
+// it within the same second, and a peer drops a partial UPDATE whose
+// updated_at ties the row it lands on. A whole-second wall stamp left the peer
+// pending forever. The wall columns (proposed_at, expires_at) stay on r.now(),
+// the virtual clock fleet scenarios drive.
+//
+// NowWallTS rather than NowTS, which emits HLC once hlc_lww is latched: an
+// older release mid-roll reads this updated_at lexically (its reaper, its
+// prune, the receiver-side bulk reap), and an HLC "17…" key sorts below every
+// RFC3339 cutoff there. Readers in this tree still go through
+// corrosion.TsMsSQL (see the executor's reapStale), which reads either form.
 func (r *Rebalancer) recordProposal(ctx context.Context, p Proposal) error {
 	rNow := r.now()
 	now := rNow.UTC().Format(time.RFC3339)
@@ -614,7 +619,7 @@ func (r *Rebalancer) recordProposal(ctx context.Context, p Proposal) error {
 			 proposed_at, expires_at, detail, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
 		p.ID, p.VMName, p.Src, p.Dst, string(p.Policy), p.ExpectedGain,
-		now, expires, p.Detail, r.db.NowTS(),
+		now, expires, p.Detail, r.db.NowWallTS(),
 	)
 }
 
@@ -624,7 +629,7 @@ func (r *Rebalancer) recordProposal(ctx context.Context, p Proposal) error {
 func (r *Rebalancer) markApproved(ctx context.Context, id string) error {
 	return r.db.Execute(ctx,
 		`UPDATE rebalance_proposals SET status='approved', updated_at=? WHERE id=? AND status='pending'`,
-		r.db.NowTS(), id,
+		r.db.NowWallTS(), id,
 	)
 }
 
@@ -670,7 +675,7 @@ func (r *Rebalancer) expireOldProposals(ctx context.Context) error {
 		`UPDATE rebalance_proposals
 		 SET status = 'expired', updated_at = ?
 		 WHERE status = 'pending' AND expires_at < ?`,
-		r.db.NowTS(), now,
+		r.db.NowWallTS(), now,
 	)
 }
 

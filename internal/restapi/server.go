@@ -555,18 +555,32 @@ func (s *Server) handleVM(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		first, err := stream.Recv()
+		recv := func() (proto.Message, error) {
+			if stream == nil {
+				return nil, io.EOF
+			}
+			return stream.Recv()
+		}
+		first, err, timedOut, rest := firstOrDetach(recv)
+		if timedOut {
+			// The migration is running; it just has not reached its first
+			// progress message (MigrateVM cannot send MIGRATE_VALIDATING until
+			// it holds the per-VM lock, and a backup can hold that for
+			// minutes). Acknowledge rather than hold the connection past the
+			// gateway's WriteTimeout, which the client reads as a dead socket
+			// and retries -- each retry adding a goroutine and a lock waiter.
+			ackAndDetach("migrate vm "+name, opCancel, rest)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"status":"accepted","detail":"migration started; no progress reported yet"}`))
+			return
+		}
 		if err != nil {
 			opCancel()
 			grpcHTTPError(w, http.StatusInternalServerError, err)
 			return
 		}
-		ackAndDetach("migrate vm "+name, opCancel, func() (proto.Message, error) {
-			if stream == nil {
-				return nil, io.EOF
-			}
-			return stream.Recv()
-		})
+		ackAndDetach("migrate vm "+name, opCancel, rest)
 		jsonProto(w, first)
 
 	case action == "stats" && r.Method == http.MethodGet:

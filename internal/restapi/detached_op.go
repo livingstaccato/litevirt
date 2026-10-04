@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -63,6 +64,67 @@ func ackAndDetach(op string, cancel context.CancelFunc, recv func() (proto.Messa
 	}()
 }
 
+// ackTimeout bounds how long the gateway will wait for a streaming operation's
+// FIRST message before acknowledging it anyway.
+//
+// It must stay well under the server's WriteTimeout (120s), or the client sees
+// a dead connection instead of an answer and retries — and every retry adds
+// another blocked goroutine, another gRPC stream and another queued lock
+// waiter, none of which the disconnected client can cancel.
+const ackTimeout = 30 * time.Second
+
+// ackTimeoutForTest is the budget firstOrDetach actually uses. A var so a test
+// can shrink it; nothing in production reassigns it.
+var ackTimeoutForTest = ackTimeout
+
+// firstOrDetach waits up to ackTimeout for the first message of a
+// server-streaming RPC.
+//
+// The operation itself runs on a detached, six-hour context, which is right:
+// once acknowledged it must outlive the request. But the ACKNOWLEDGEMENT was
+// waiting on that same context, so a first message that cannot be produced —
+// MigrateVM cannot send MIGRATE_VALIDATING until it holds the per-VM lock, and
+// a nightly backup can hold that for minutes — blocked the handler far past
+// the point the client gave up.
+//
+// On timeout the stream is handed on exactly as a normal ack would hand it on,
+// and the caller reports 202 Accepted. The in-flight Recv is NOT abandoned: its
+// result is delivered to the detached reader first, so no message is dropped.
+func firstOrDetach(recv func() (proto.Message, error)) (first proto.Message, err error, timedOut bool, rest func() (proto.Message, error)) {
+	type result struct {
+		m   proto.Message
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		m, e := recv()
+		ch <- result{m, e}
+	}()
+
+	select {
+	case r := <-ch:
+		return r.m, r.err, false, recv
+	case <-time.After(ackTimeoutForTest):
+		// The goroutine above still owns the first Recv. The detached reader
+		// takes its result before reading anything further, or the first
+		// message would be lost.
+		var once sync.Once
+		var pending result
+		var got bool
+		return nil, nil, true, func() (proto.Message, error) {
+			once.Do(func() {
+				pending = <-ch
+				got = true
+			})
+			if got {
+				got = false
+				return pending.m, pending.err
+			}
+			return recv()
+		}
+	}
+}
+
 // opContext is the context a handler opens a server-streaming RPC on: the
 // request's own for SSE, which ends when the client stops listening, and a
 // detached one otherwise, because the non-SSE answer is an acknowledgement and
@@ -78,13 +140,25 @@ func (s *Server) opContext(r *http.Request) (context.Context, context.CancelFunc
 // ackFirstAndDetach answers a non-SSE call with the stream's first frame and
 // keeps the operation running behind it (ackAndDetach). A stream that fails
 // before its first frame is reported, and its context released.
+//
+// The first frame is awaited through firstOrDetach, so an operation that is
+// slow to report (it is queued behind a per-resource lock) is acknowledged
+// with 202 Accepted after ackTimeout rather than holding the handler past the
+// server's WriteTimeout.
 func ackFirstAndDetach(w http.ResponseWriter, op string, cancel context.CancelFunc, recv func() (proto.Message, error)) {
-	first, err := recv()
+	first, err, timedOut, rest := firstOrDetach(recv)
+	if timedOut {
+		ackAndDetach(op, cancel, rest)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"status":"accepted","detail":"operation started; no progress reported yet"}`))
+		return
+	}
 	if err != nil {
 		cancel()
 		grpcHTTPError(w, http.StatusInternalServerError, err)
 		return
 	}
-	ackAndDetach(op, cancel, recv)
+	ackAndDetach(op, cancel, rest)
 	jsonProto(w, first)
 }

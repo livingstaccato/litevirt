@@ -138,6 +138,25 @@ type Options struct {
 	// enforcement.gossip_encryption enforced under this one key. Nil is
 	// plaintext gossip.
 	GossipKey []byte
+	// Joiners, with RealGossip, starts the LAST Joiners nodes as hosts that
+	// `lv host add` has just brought up on a fresh database: each one holds
+	// only its own hosts row, while every other node holds every row, because
+	// the admitting side writes a newcomer's row before its daemon starts. The
+	// established nodes' mutation history is pruned before replication starts,
+	// as a long-running cluster's is, so an established host's own row reaches
+	// a joiner by anti-entropy and by nothing else. New does not wait for the
+	// gossip mesh to form; whether it does is the scenario's question.
+	Joiners int
+}
+
+// isJoiner reports whether n is one of Options.Joiners.
+func (c *Cluster) isJoiner(n *Node) bool {
+	for i, o := range c.Nodes {
+		if o == n {
+			return i >= len(c.Nodes)-c.opts.Joiners
+		}
+	}
+	return false
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -289,6 +308,9 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.RealGossip && opts.SharedCRDT {
 		t.Fatal("fleet: RealGossip and SharedCRDT are mutually exclusive")
 	}
+	if opts.Joiners > 0 && (!opts.RealGossip || !opts.IndependentReplicas || opts.Joiners >= opts.Nodes) {
+		t.Fatal("fleet: Joiners needs RealGossip, IndependentReplicas and at least one established node")
+	}
 	if opts.RealGossip {
 		skipWithoutRealGossipAddresses(t, opts.Nodes)
 	}
@@ -336,7 +358,18 @@ func New(t *testing.T, opts Options) *Cluster {
 		// Reserve an ephemeral port — close the listener immediately
 		// after; we re-bind once everything is wired. (gRPC servers
 		// need the listener to come from outside their constructor.)
-		l, err := net.Listen("tcp", net.JoinHostPort(n.Address, "0"))
+		port := "0"
+		if opts.Joiners > 0 {
+			// A joiner holds no row for its peers, so it dials them at the
+			// gossip address on the default gRPC port, as a real newcomer does
+			// (corrosion.ResolvePeerTarget). Every node therefore listens
+			// where production does: its own address, port 7443.
+			port = "7443"
+		}
+		l, err := net.Listen("tcp", net.JoinHostPort(n.Address, port))
+		if err != nil && opts.Joiners > 0 {
+			t.Skipf("fleet Joiners needs %s:7443 free, as a real host has it: %v", n.Address, err)
+		}
 		if err != nil {
 			t.Fatalf("reserve port for %s: %v", name, err)
 		}
@@ -376,12 +409,15 @@ func New(t *testing.T, opts Options) *Cluster {
 	}
 
 	// Step 5 — independent replicas run the production push loop.
+	if opts.Joiners > 0 {
+		c.pruneEstablishedHistory()
+	}
 	if opts.IndependentReplicas {
 		c.startReplicators()
 	}
 
 	t.Cleanup(c.Stop)
-	if opts.RealGossip {
+	if opts.RealGossip && opts.Joiners == 0 {
 		// Nodes opened early dialled seeds that were not up yet; the later
 		// joins and the membership loop close the mesh.
 		c.WaitGossip(t, 20*time.Second, "the gossip mesh to form", c.GossipConverged)
@@ -607,6 +643,9 @@ func (c *Cluster) crossRegisterHosts() {
 	ctx := context.Background()
 	for _, target := range c.Nodes {
 		for _, hostNode := range c.Nodes {
+			if c.isJoiner(target) && hostNode != target {
+				continue // a fresh database knows only its own host (Options.Joiners)
+			}
 			serial, err := pki.CertSerial(filepath.Join(hostNode.PKIDir, "host.crt"))
 			if err != nil {
 				c.t.Fatalf("read certificate serial for %s: %v", hostNode.Name, err)

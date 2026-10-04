@@ -344,3 +344,19 @@ func (c *Cluster) ForgetGossipAddresses() {
 		n.DB.ForgetGossipAddrsForTests()
 	}
 }
+
+// pruneEstablishedHistory empties every established node's mutation_log, as
+// the replicator's own pruning does to a long-running cluster's history
+// (Options.Joiners). What it removes is what a joiner can no longer be
+// pushed: the established hosts' own rows, written long ago, which then reach
+// a joiner by anti-entropy or not at all.
+func (c *Cluster) pruneEstablishedHistory() {
+	for _, n := range c.Nodes {
+		if c.isJoiner(n) {
+			continue
+		}
+		if _, err := n.DB.DB().Exec(`DELETE FROM mutation_log`); err != nil {
+			c.t.Fatalf("prune %s's mutation history: %v", n.Name, err)
+		}
+	}
+}

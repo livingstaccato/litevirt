@@ -22600,6 +22600,15 @@ type ReadyResponse struct {
 	// — no decision path may read it, and it is served only to a caller holding a
 	// host certificate, because it carries local error text.
 	NotReadyReason string `protobuf:"bytes,3,opt,name=not_ready_reason,json=notReadyReason,proto3" json:"not_ready_reason,omitempty"`
+	// partition_pause is enforcement.partition_pause as THIS run of the daemon
+	// holds it: whether it pauses its recoverable workloads on losing the voter
+	// majority. A failover coordinator relies on a host's pause only if the
+	// host's latest answer to this probe said so (docs/design/partition-pause.md
+	// §4.3). It rides on the health probe, not on Ping, because the probe runs
+	// every probe interval and the flag changes only with a restart, so the
+	// latest answer always comes from the run a coordinator last reached. False
+	// from a build that predates the field, which therefore is not relied on.
+	PartitionPause bool `protobuf:"varint,4,opt,name=partition_pause,json=partitionPause,proto3" json:"partition_pause,omitempty"`
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -22653,6 +22662,13 @@ func (x *ReadyResponse) GetNotReadyReason() string {
 		return x.NotReadyReason
 	}
 	return ""
+}
+
+func (x *ReadyResponse) GetPartitionPause() bool {
+	if x != nil {
+		return x.PartitionPause
+	}
+	return false
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -32837,11 +32853,12 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0fwal_quarantined\x18\x06 \x01(\bR\x0ewalQuarantined\x12#\n" +
 	"\rnot_enforcing\x18\a \x03(\tR\fnotEnforcing\x12)\n" +
 	"\x10posture_reported\x18\b \x01(\bR\x0fpostureReported\"\x0e\n" +
-	"\fReadyRequest\"l\n" +
+	"\fReadyRequest\"\x95\x01\n" +
 	"\rReadyResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x14\n" +
 	"\x05ready\x18\x02 \x01(\bR\x05ready\x12(\n" +
-	"\x10not_ready_reason\x18\x03 \x01(\tR\x0enotReadyReason\"\x14\n" +
+	"\x10not_ready_reason\x18\x03 \x01(\tR\x0enotReadyReason\x12'\n" +
+	"\x0fpartition_pause\x18\x04 \x01(\bR\x0epartitionPause\"\x14\n" +
 	"\x12FetchBinaryRequest\"\x85\x01\n" +
 	"\x10FetchBinaryChunk\x12\x14\n" +
 	"\x05chunk\x18\x01 \x01(\fR\x05chunk\x12\x1a\n" +

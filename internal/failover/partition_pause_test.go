@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/health"
 )
@@ -36,7 +35,7 @@ func pauseCoordinator(t *testing.T, latched bool) (*Coordinator, *corrosion.Clie
 	mono := &monoClock{now: time.Unix(1_900_000_000, 0)}
 	c.Mono = mono.Now
 	c.PartitionPauseEnforced = func(context.Context) bool { return latched }
-	c.PeerAdvertised = func(string, string) bool { return true }
+	c.PeerPausesOnLoss = func(string) bool { return true }
 	return c, db, ctx, mono
 }
 
@@ -127,7 +126,7 @@ func TestPartitionPause_ASuccessorWaitsAfresh(t *testing.T) {
 	succ.SetFencer(fencerReturning("best-effort-ssh", true))
 	succ.Mono = mono.Now
 	succ.PartitionPauseEnforced = func(context.Context) bool { return true }
-	succ.PeerAdvertised = func(string, string) bool { return true }
+	succ.PeerPausesOnLoss = func(string) bool { return true }
 	mono.Advance(health.PartitionPauseWaitFor(2) - time.Second)
 	succ.run(ctx)
 	if got := vmHost(t, db, ctx); got != "down" {
@@ -297,15 +296,15 @@ func TestPartitionPause_ARegainedCoordinatorDefersNewFences(t *testing.T) {
 	}
 }
 
-// The cluster latch is not enough: the fenced host itself must have
-// advertised partition_pause_v1 on its last Ping. A host whose flag went off
-// after the latch stops advertising, and is recovered as before.
+// The cluster latch is not enough: the fenced host itself must have said, on
+// its latest probe answer, that it pauses. A host whose flag went off after
+// the latch says otherwise, and is recovered as before.
 //
 // Mutation: drop the per-host check — the fence reads self_paused and this
 // goes red.
 func TestPartitionPause_TheTargetMustHaveAdvertisedTheToken(t *testing.T) {
 	c, db, ctx, _ := pauseCoordinator(t, true)
-	c.PeerAdvertised = func(peer, tok string) bool { return !(peer == "down" && tok == capabilities.PartitionPauseV1) }
+	c.PeerPausesOnLoss = func(peer string) bool { return peer != "down" }
 	c.run(ctx)
 	if _, a := newestAssurance(t, db, ctx, "down"); a != corrosion.FenceAssumed {
 		t.Fatalf("fence recorded %s for a host that did not advertise the token", a)

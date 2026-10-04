@@ -1378,7 +1378,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return d.cfg.Enforcement.PartitionPause && d.checker.Enforced(ctx, capabilities.PartitionPauseV1)
 	}
 	fc.LastContact = d.checker.LastContact
-	fc.PeerAdvertised = d.checker.PeerAdvertisedLast
+	fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
 	// A coordinator that was itself cut off moments ago decides no new fence
 	// on the failure rows the cut left behind (a fleet-wide blip).
 	fc.QuorumRegain = d.checker.InQuorumRegainGraceFor

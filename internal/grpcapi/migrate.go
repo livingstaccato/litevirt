@@ -654,14 +654,20 @@ poll:
 				// Migration failed — VM is still on the source host.
 				// Check if the domain is still alive; if so, restore to "running"
 				// instead of leaving it in "error" (#21).
+				//
+				// Bounded and detached from the request: a client that goes
+				// away now must not drop the restore and strand the row
+				// `migrating`, which nothing else heals.
+				fctx, fcancel := detachedMigrateCleanupCtx(ctx)
+				defer fcancel()
 				// The VFs go back before the row says running: the guest stayed.
-				s.reattachVFsOnSource(context.WithoutCancel(ctx), vm.Name, detachedVFs)
-				if s.restoreSourceStateAfterFailedMigration(ctx, vm.Name,
+				s.reattachVFsOnSource(fctx, vm.Name, detachedVFs)
+				if s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
 					fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
 					slog.Warn("migration failed but VM still running on source",
 						"vm", vm.Name, "target", req.TargetHost, "error", migrateErr)
 				}
-				s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, createdStubs)
+				s.cleanupFailedMigrationTarget(fctx, vm.Name, req.TargetHost, createdStubs)
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
@@ -1768,10 +1774,14 @@ func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName s
 // the target's own view, and the source's leftovers. Shared by the watched
 // path and an adopted migration, which used to commit ownership and stop.
 func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRecord, f migrationFinish) {
+	// All of it runs DETACHED from the request: ownership has been committed,
+	// nothing retries this finish, and the watched path passes the request
+	// context, which a client that went away after the cutover has cancelled.
+	// Not a timeout context cancelled on return: the target-notify goroutine
+	// below outlives this call and uses it.
+	ctx = context.WithoutCancel(ctx)
 	target := f.target.Name
-	// Queued on a DETACHED context, like the rest of the post-commit work — the
-	// request context may already be cancelled by the time the cutover finishes.
-	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
+	s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
 
 	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
 	if len(f.detachedVFs) > 0 {

@@ -56,6 +56,26 @@ Two columns join the audit row to the chain:
 | `prev_hash` | TEXT (SHA-256 hex) | every new row — the previous **same-host** row's `content_hash` |
 | `content_hash` | TEXT (SHA-256 hex) | every new row — `SHA256(prev_hash || canonical(row))` |
 
+`canonical(row)` is each field name and value, NUL-separated:
+`prev_hash NUL id NUL <id> NUL timestamp NUL <timestamp> NUL … result NUL <result> NUL`.
+That encoding is collision-free **only while no value contains a NUL byte** —
+with one, a value can forge a field boundary (target `a\0detail\0b` with detail
+`c` hashes the same as target `a` with detail `b\0detail\0c`), and since a
+signature covers the content hash and `seq` and nothing else, it would verify
+either row. Without NULs the encoding parses back one way only, so the daemon
+keeps every row it writes NUL-free rather than changing the format:
+
+- `username`, `target` and `detail` carry request text — a login records the
+  submitted username before anything has checked it — so a NUL there is replaced
+  with `␀` (U+2400) and the row is written. Refusing it would let whoever chose
+  the input leave no audit row at all.
+- `id`, `timestamp`, `host_name`, `action` and `result` are set by the daemon
+  and matched by exact value, so a NUL in one is a bug and the row is refused.
+
+`verify` reports any row that does carry a NUL — written by an older build or
+straight into the table — as **ambiguous** (see [Verifying](#verifying)). Rows
+without one hash exactly as they always have.
+
 The first row of each host's sub-chain has `prev_hash = NULL`. Rows with a NULL
 `content_hash` (written before the chain columns existed) **and** rows with no
 host identity (background-context writes such as the failover coordinator's, from
@@ -159,11 +179,14 @@ grouped by what it means:
 
 Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
 
-There is a **third outcome** between intact and tampered, currently holding one
-finding — `never adopted`, below. It exits non-zero and prints `PART OF THIS LOG
-COULD NOT BE VERIFIED`, but it does not say tampered, because it is inferred from
-a row any peer can write rather than from something only a key holder could
-produce. The distinction is not pedantry: a verdict anyone can manufacture, and
+There is a **third outcome** between intact and tampered, currently holding two
+findings — `never adopted`, below, and **ambiguous**: a row with a NUL byte in
+a hashed field, whose hash and signature would verify a different row equally
+well (see the encoding above). It exits non-zero and prints `PART OF THIS LOG
+COULD NOT BE VERIFIED`, but it does not say tampered: `never adopted` is inferred
+from a row any peer can write rather than from something only a key holder could
+produce, and an ambiguous row may have been written verbatim by an older build.
+The distinction is not pedantry: a verdict anyone can manufacture, and
 that an operator cannot clear, is what teaches people to stop reading the output.
 
 **Unsigned rows on their own are not tampering.** Rows written while their host

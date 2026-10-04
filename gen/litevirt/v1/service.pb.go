@@ -29402,8 +29402,14 @@ type VerifyAuditChainResponse struct {
 	// still not signing (enforcement.audit_signature off, or an older build).
 	// An older daemon never sets it, so an empty list says nothing on its own.
 	NotSigningHosts []string `protobuf:"bytes,18,rep,name=not_signing_hosts,json=notSigningHosts,proto3" json:"not_signing_hosts,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Rows with a NUL byte in a hashed field, as "rowid: host: reason". The
+	// content hash is injective only over NUL-free rows, so such a row's hash
+	// and signature do not determine its content: a different row verifies
+	// the same. A current daemon never writes one. Feeds `unverified`, not
+	// `tampered` — an older build may have written the row verbatim.
+	AmbiguousRows []string `protobuf:"bytes,19,rep,name=ambiguous_rows,json=ambiguousRows,proto3" json:"ambiguous_rows,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VerifyAuditChainResponse) Reset() {
@@ -29558,6 +29564,13 @@ func (x *VerifyAuditChainResponse) GetUnverified() bool {
 func (x *VerifyAuditChainResponse) GetNotSigningHosts() []string {
 	if x != nil {
 		return x.NotSigningHosts
+	}
+	return nil
+}
+
+func (x *VerifyAuditChainResponse) GetAmbiguousRows() []string {
+	if x != nil {
+		return x.AmbiguousRows
 	}
 	return nil
 }
@@ -33626,7 +33639,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xaf\x05\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xd6\x05\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
@@ -33649,7 +33662,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"unverified\x18\x11 \x01(\bR\n" +
 	"unverified\x12*\n" +
-	"\x11not_signing_hosts\x18\x12 \x03(\tR\x0fnotSigningHosts\"\x8b\x02\n" +
+	"\x11not_signing_hosts\x18\x12 \x03(\tR\x0fnotSigningHosts\x12%\n" +
+	"\x0eambiguous_rows\x18\x13 \x03(\tR\rambiguousRows\"\x8b\x02\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +

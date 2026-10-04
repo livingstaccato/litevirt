@@ -86,6 +86,9 @@ type Config struct {
 	// VM holds cluster-wide defaults for newly created VMs.
 	VM VMDefaultsConfig `yaml:"vm"`
 
+	// Migration governs migrations this node sends.
+	Migration MigrationConfig `yaml:"migration"`
+
 	// Capacity is the cluster-wide default for how much of a host may be handed
 	// to workloads. Per-host overrides live on the host record (`lv host config`)
 	// and win where set.
@@ -910,6 +913,17 @@ type VMDefaultsConfig struct {
 	// QEMU's qemu64 — no SSE4.2, no AVX, no AVX2. Per-VM, `lv run --cpu-mode`
 	// still wins over this.
 	DefaultCPUMode string `yaml:"default_cpu_mode,omitempty"`
+}
+
+// MigrationConfig governs migrations this node sends.
+type MigrationConfig struct {
+	// AllowUnencryptedStorage lets this node send a storage-copying migration
+	// (`lv migrate --with-storage`, or a compose `migrate.with-storage`). That
+	// copy cannot be tunnelled through libvirt's TLS connection: QEMU sends the
+	// guest's RAM and disk blocks to the target over plain TCP. Default false, so
+	// such a migration is refused; set true only where the network between hosts
+	// is trusted.
+	AllowUnencryptedStorage bool `yaml:"allow_unencrypted_storage,omitempty"`
 }
 
 type CapacityConfig struct {

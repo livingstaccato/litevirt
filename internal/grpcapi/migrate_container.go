@@ -71,6 +71,9 @@ func (s *Server) MigrateContainer(req *pb.MigrateContainerRequest, stream grpc.S
 		return status.Errorf(codes.AlreadyExists,
 			"container %q already exists on target host %q", req.Name, req.TargetHost)
 	}
+	if err := s.refuseNoContainerRuntime(ctx, req.TargetHost); err != nil {
+		return err
+	}
 
 	// Capacity admission on the TARGET, MEMORY only — a container's cpu_limit is a
 	// cap in cores, not a vCPU reservation, so only its memory cap is comparable

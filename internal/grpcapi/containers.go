@@ -119,6 +119,9 @@ func (s *Server) CreateContainer(ctx context.Context, req *pb.CreateContainerReq
 	if s.containerRuntime == nil {
 		return nil, status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
+	if err := s.refuseNoContainerRuntime(ctx, s.hostName); err != nil {
+		return nil, err
+	}
 
 	// Serialize same-name creates on this host, and reject a duplicate BEFORE
 	// allocating any IPAM lease. Without this, a duplicate / concurrent create that

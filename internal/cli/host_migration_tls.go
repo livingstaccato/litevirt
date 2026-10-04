@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
@@ -23,15 +24,40 @@ import (
 // remoteMigrationDir is a host's migration-credential directory.
 var remoteMigrationDir = pki.MigrationDir("/etc/litevirt/pki")
 
+// migrationCredentialHolder names an existing cluster host that already holds
+// migration credentials, or "" when none does. It is asked only when this
+// machine has no migration CA and is about to mint one. A nil one means there
+// is nobody to ask: `lv host init` founding a cluster.
+type migrationCredentialHolder func() (holder string, err error)
+
 // ensureLocalMigrationCA returns the migration CA beside the cluster CA in
 // pkiDir, minting it the first time.
-func ensureLocalMigrationCA(pkiDir string) (certPath, keyPath string, minted bool, err error) {
+//
+// It refuses to mint while a cluster host already holds migration credentials
+// (existing names one): those came from a CA on another machine, and a second
+// CA issues certificates they cannot verify. The new host would advertise
+// migration TLS ready and every storage migration with it would then fail the
+// QEMU TLS handshake. `lv host install-migration-tls` refuses the same way.
+func ensureLocalMigrationCA(pkiDir string, existing migrationCredentialHolder) (certPath, keyPath string, minted bool, err error) {
 	certPath = filepath.Join(pkiDir, pki.MigrationCACertName)
 	keyPath = filepath.Join(pkiDir, pki.MigrationCAKeyName)
 	if _, err := os.Stat(certPath); err == nil {
 		return certPath, keyPath, false, nil
 	} else if !os.IsNotExist(err) {
 		return "", "", false, err
+	}
+	if existing != nil {
+		holder, err := existing()
+		if err != nil {
+			return "", "", false, fmt.Errorf("%s has no migration CA, and whether the cluster "+
+				"already has one could not be checked: %w. Minting a second one would break storage "+
+				"migrations with every host provisioned from the first; copy %s and %s here (the key "+
+				"mode 0600) from the machine that holds them, or retry once a cluster host is reachable",
+				pkiDir, err, pki.MigrationCACertName, pki.MigrationCAKeyName)
+		}
+		if holder != "" {
+			return "", "", false, secondMigrationCAError(pkiDir, holder)
+		}
 	}
 	if err := pki.GenerateMigrationCA(certPath, keyPath); err != nil {
 		return "", "", false, fmt.Errorf("generate migration CA: %w", err)
@@ -40,17 +66,77 @@ func ensureLocalMigrationCA(pkiDir string) (certPath, keyPath string, minted boo
 	return certPath, keyPath, true, nil
 }
 
+// secondMigrationCAError is the refusal to mint a migration CA while holder
+// already has credentials from the cluster's existing one.
+func secondMigrationCAError(pkiDir, holder string) error {
+	return fmt.Errorf("%s has no migration CA, but %s already holds migration credentials, "+
+		"so this cluster has one elsewhere. Run this from the machine that ran `lv host init`, "+
+		"or copy its %s and %s here (the key mode 0600)",
+		pkiDir, holder, pki.MigrationCACertName, pki.MigrationCAKeyName)
+}
+
+// peerMigrationHolder asks the join peers, over SSH as sshUser, whether any
+// already holds migration credentials. The first that does is the answer. A
+// peer that cannot be reached is skipped, but when none can be, absence is
+// not proven and that is an error.
+func peerMigrationHolder(sshUser string, joinPeers []string) migrationCredentialHolder {
+	return func() (string, error) {
+		var why []string
+		answered := 0
+		for _, p := range joinPeers {
+			target := sshTargetForPeer(sshUser, p)
+			held, err := peerHoldsMigrationCredentials(target)
+			if err != nil {
+				why = append(why, fmt.Sprintf("%s: %v", target, err))
+				continue
+			}
+			if held {
+				return target, nil
+			}
+			answered++
+		}
+		if answered == 0 {
+			return "", fmt.Errorf("no cluster host could be asked (%s)", strings.Join(why, "; "))
+		}
+		return "", nil
+	}
+}
+
+// migrationCredsProbe is the remote command that answers "yes" when a host
+// already holds migration credentials and "no" when it does not.
+func migrationCredsProbe() string {
+	path := filepath.Join(remoteMigrationDir, pki.MigrationHostCertName)
+	return fmt.Sprintf("if [ -e %s ]; then echo yes; else echo no; fi", ssh.ShellQuote(path))
+}
+
+// peerHoldsMigrationCredentials reports over SSH whether a cluster host
+// already holds migration credentials. A seam so the add path can be tested
+// without a node to SSH into.
+var peerHoldsMigrationCredentials = func(sshTarget string) (bool, error) {
+	sc, err := ssh.NewClient(sshTarget)
+	if err != nil {
+		return false, fmt.Errorf("SSH connect: %w", err)
+	}
+	defer sc.Close()
+	out, err := sc.RunOutput(migrationCredsProbe())
+	if err != nil {
+		return false, err
+	}
+	return string(out) == "yes\n", nil
+}
+
 // migrationFile is one file of a host's migration-credential set.
 type migrationFile struct {
 	local, remote string
 	mode          os.FileMode
 }
 
-// issueMigrationCredentials mints the migration CA if needed and issues
-// hostName's migration certificate for ip. It returns the three files to put in
-// the host's migration directory: the CA, the certificate, and the key (0600).
-func issueMigrationCredentials(pkiDir, hostName string, ip net.IP) ([]migrationFile, error) {
-	caCert, caKey, _, err := ensureLocalMigrationCA(pkiDir)
+// issueMigrationCredentials mints the migration CA if needed (and existing
+// allows; see ensureLocalMigrationCA) and issues hostName's migration
+// certificate for ip. It returns the three files to put in the host's
+// migration directory: the CA, the certificate, and the key (0600).
+func issueMigrationCredentials(pkiDir, hostName string, ip net.IP, existing migrationCredentialHolder) ([]migrationFile, error) {
+	caCert, caKey, _, err := ensureLocalMigrationCA(pkiDir, existing)
 	if err != nil {
 		return nil, err
 	}
@@ -111,10 +197,7 @@ func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTL
 	if _, err := os.Stat(filepath.Join(pkiDir, pki.MigrationCACertName)); os.IsNotExist(err) {
 		for _, h := range hosts {
 			if provisioned[h.Name()] {
-				return fmt.Errorf("%s has no migration CA, but %s already holds migration credentials, "+
-					"so this cluster has one elsewhere. Run this from the machine that ran `lv host init`, "+
-					"or copy its %s and %s here (the key mode 0600)",
-					pkiDir, h.Name(), pki.MigrationCACertName, pki.MigrationCAKeyName)
+				return secondMigrationCAError(pkiDir, h.Name())
 			}
 		}
 	} else if err != nil {
@@ -132,7 +215,8 @@ func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTL
 			return fmt.Errorf("%s's recorded address %q is not an IPv4 address; its migration "+
 				"certificate is issued for the address peers dial", h.Name(), h.Address())
 		}
-		files, err := issueMigrationCredentials(pkiDir, h.Name(), ip)
+		// nil: every host was asked above, before anything was issued.
+		files, err := issueMigrationCredentials(pkiDir, h.Name(), ip, nil)
 		if err != nil {
 			return err
 		}
@@ -156,8 +240,7 @@ func (h *sshMigrationTLSHost) Name() string    { return h.name }
 func (h *sshMigrationTLSHost) Address() string { return h.address }
 
 func (h *sshMigrationTLSHost) Provisioned(ctx context.Context) (bool, error) {
-	path := filepath.Join(remoteMigrationDir, pki.MigrationHostCertName)
-	out, err := h.sc.RunOutput(fmt.Sprintf("if [ -e %s ]; then echo yes; else echo no; fi", ssh.ShellQuote(path)))
+	out, err := h.sc.RunOutput(migrationCredsProbe())
 	if err != nil {
 		return false, err
 	}

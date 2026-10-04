@@ -137,8 +137,9 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 		}
 	}
 	// Migration-TLS credentials from the separate migration CA, so storage
-	// migrations to and from this host are encrypted.
-	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip)
+	// migrations to and from this host are encrypted. nil: init founds a
+	// cluster, so there is no host holding another CA's credentials to ask.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip, nil)
 	if err != nil {
 		return err
 	}
@@ -238,6 +239,12 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return err
 	}
+	// The migration CA, likewise decided before anything is pushed: minted here
+	// only when no join peer already holds credentials from one elsewhere.
+	migHolder := peerMigrationHolder(sshUser, joinPeers)
+	if _, _, _, err := ensureLocalMigrationCA(pkiDir, migHolder); err != nil {
+		return err
+	}
 
 	// Generate CLI client certificate if it doesn't exist
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
@@ -293,10 +300,9 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 			return fmt.Errorf("push %s: %w", pki.GossipKeyName, err)
 		}
 	}
-	// Migration-TLS credentials from the cluster's migration CA (minted here if
-	// this machine has none yet), so storage migrations with this host are
-	// encrypted.
-	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip)
+	// Migration-TLS credentials from the cluster's migration CA, decided above,
+	// so storage migrations with this host are encrypted.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip, migHolder)
 	if err != nil {
 		return err
 	}
@@ -559,7 +565,9 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	// Migration-TLS credentials from the separate migration CA. The daemon
 	// installs them for QEMU, so storage migrations with this host are
 	// encrypted once a peer is provisioned too.
-	migFiles, err := issueMigrationCredentials(pkiDir, hostName, net.ParseIP(advertiseAddr))
+	// nil: init founds a cluster, so there is no host holding another CA's
+	// credentials to ask about.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, net.ParseIP(advertiseAddr), nil)
 	if err != nil {
 		return err
 	}
@@ -990,29 +998,30 @@ var readPeerConfig = func(sshTarget string) (cfg string, ok bool, err error) {
 // config and fall back to nothing, so an add run from a workstation (which has
 // no daemon config) silently provisioned a host with no enforcement block.
 //
+// "The cluster" is the one joinPeers came from: the daemon the CLI is talking
+// to, which LV_HOST can point at a cluster this machine is not a node of. So
+// this machine's own config is an answer only when it provably belongs to that
+// cluster. Copied from a node of another cluster, it gave the new host that
+// cluster's flags (gossip encryption off, say, so no gossip key was pushed
+// either), and `add` reported success for a host that could never join.
+//
 // In order:
-//   - this machine's own daemon config, when it has one: it is a cluster node;
+//   - this machine's own daemon config, when its advertise_address is one of
+//     joinPeers: it is a node of that cluster;
 //   - otherwise each join peer's config over SSH, as sshUser (the user the
 //     target is being reached as), first answer wins;
 //   - otherwise a refusal. Guessing is what the old fallback did.
 func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
-	raw, err := os.ReadFile(daemonConfigPath)
-	if err == nil {
-		return enforcementBlockOf(string(raw)), nil
-	}
 	var why []string
-	if !errors.Is(err, os.ErrNotExist) {
-		why = append(why, fmt.Sprintf("this machine's %s: %v", daemonConfigPath, err))
+	block, ok, reason := localEnforcementForPeers(joinPeers)
+	if ok {
+		return block, nil
+	}
+	if reason != "" {
+		why = append(why, reason)
 	}
 	for _, p := range joinPeers {
-		host := p
-		if h, _, serr := net.SplitHostPort(p); serr == nil {
-			host = h
-		}
-		target := host
-		if sshUser != "" {
-			target = sshUser + "@" + host
-		}
+		target := sshTargetForPeer(sshUser, p)
 		cfg, ok, rerr := readPeerConfig(target)
 		switch {
 		case rerr != nil:
@@ -1026,6 +1035,56 @@ func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
 	return "", fmt.Errorf("could not read the cluster's enforcement block, which the new host "+
 		"must boot with so its flags match its peers': %s. Run `lv host add` on a cluster node, "+
 		"or from a machine that can SSH to one as %q", strings.Join(why, "; "), sshUser)
+}
+
+// sshTargetForPeer is the SSH target for a join peer ("host:port"), reached as
+// sshUser when one is given.
+func sshTargetForPeer(sshUser, peer string) string {
+	host := peer
+	if h, _, err := net.SplitHostPort(peer); err == nil {
+		host = h
+	}
+	if sshUser == "" {
+		return host
+	}
+	return sshUser + "@" + host
+}
+
+// localEnforcementForPeers returns this machine's enforcement block when its
+// daemon config belongs to the cluster joinPeers name (ok), and otherwise why
+// it was not used — empty when there is simply no config, as on a workstation.
+// A config without advertise_address proves nothing: its address is
+// auto-detected and cannot be matched against the peers.
+func localEnforcementForPeers(joinPeers []string) (block string, ok bool, why string) {
+	raw, err := os.ReadFile(daemonConfigPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, ""
+	}
+	if err != nil {
+		return "", false, fmt.Sprintf("this machine's %s: %v", daemonConfigPath, err)
+	}
+	var cfg struct {
+		AdvertiseAddress string `yaml:"advertise_address"`
+	}
+	if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		return "", false, fmt.Sprintf("this machine's %s could not be parsed: %v", daemonConfigPath, err)
+	}
+	addr := strings.TrimSpace(cfg.AdvertiseAddress)
+	if addr == "" {
+		return "", false, fmt.Sprintf("this machine's %s sets no advertise_address, so it "+
+			"cannot be shown to belong to the cluster being joined", daemonConfigPath)
+	}
+	for _, p := range joinPeers {
+		host := p
+		if h, _, serr := net.SplitHostPort(p); serr == nil {
+			host = h
+		}
+		if host == addr {
+			return enforcementBlockOf(string(raw)), true, ""
+		}
+	}
+	return "", false, fmt.Sprintf("this machine (advertise_address %s) is not one of the "+
+		"cluster's hosts, so its %s is another cluster's", addr, daemonConfigPath)
 }
 
 // setupScriptEnvWith is setupScriptEnv with the enforcement block decided by

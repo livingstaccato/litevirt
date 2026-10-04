@@ -149,7 +149,13 @@ func pushRotationPhase(ctx context.Context, pkiDir, phase string, h MigrationTLS
 	case phaseTrustBoth:
 		return h.Push(ctx, []migrationFile{caFile(filepath.Join(pkiDir, bundleCACertName))})
 	case phaseDropOld:
-		return h.Push(ctx, []migrationFile{caFile(filepath.Join(pkiDir, nextCACertName))})
+		// The new CA alone: next.crt, or the current CA once finalize has
+		// renamed next.crt over it and only "done" went unsaved.
+		_, _, trust, err := migrationIssuingCA(pkiDir)
+		if err != nil {
+			return err
+		}
+		return h.Push(ctx, []migrationFile{caFile(trust)})
 	}
 	ip := net.ParseIP(h.Address())
 	if ip == nil || ip.To4() == nil {

@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
@@ -14,34 +13,37 @@ import (
 // and the default-deny policy (v21). The per-NIC tier (security groups) has its
 // own page at /security-groups.
 //
-// READS use the host-local Corrosion handle directly, which is cheap and needs
-// no RPC. WRITES go through the gRPC twin, because that is where authorization
-// lives: RequirePerm consults the token's scope paths and the caller's RBAC
-// bindings, neither of which is visible from the coarse role string the HTTP
-// session gate can see. Writing corrosion rows from this process left
-// cluster-wide firewall state with no authorization in front of it.
+// READS and WRITES both go through the gRPC twins with the session's bearer,
+// because that is where authorization lives: the daemon consults the token's
+// scope paths and the caller's role, neither of which the HTTP session gate
+// applies. Writing corrosion rows from this process left cluster-wide firewall
+// state with no authorization in front of it; reading them rendered the
+// cluster's policy to a session whose bearer is a scoped token, which the list
+// RPCs refuse.
 
 func (s *Server) handleFirewall(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Firewall", "firewall")
-	if s.db == nil {
-		data["Error"] = "corrosion DB not wired into UI server (build mismatch)"
-		s.renderPage(w, "firewall.html", data)
-		return
-	}
-	clusterRules, err := corrosion.ListClusterFirewallRules(r.Context(), s.db)
+	ctx := s.uiBearerCtx(r)
+	clusterRules, err := s.grpc.ListClusterFirewallRules(ctx, &pb.ListClusterFirewallRulesRequest{})
 	if err != nil {
-		data["Error"] = err.Error()
-		s.renderPage(w, "firewall.html", data)
+		s.renderPageRPCFailed(w, "firewall.html", data, err)
 		return
 	}
-	hostRules, _ := corrosion.ListHostFirewallRules(r.Context(), s.db, "")
-	ipsets, _ := corrosion.ListIPSets(r.Context(), s.db)
-	clusterDefault, _ := corrosion.GetFirewallDefault(r.Context(), s.db, "cluster")
+	hostRules, _ := s.grpc.ListHostFirewallRules(ctx, &pb.ListHostFirewallRulesRequest{})
+	ipsets, _ := s.grpc.ListIpSets(ctx, &pb.ListIpSetsRequest{})
+	defaultDeny := false
+	if defaults, err := s.grpc.ListFirewallDefaults(ctx, &pb.ListFirewallDefaultsRequest{}); err == nil {
+		for _, d := range defaults.GetDefaults() {
+			if d.GetScope() == "cluster" {
+				defaultDeny = d.GetDefaultDeny()
+			}
+		}
+	}
 
-	data["ClusterRules"] = clusterRules
-	data["HostRules"] = hostRules
-	data["IPSets"] = ipsets
-	data["DefaultDeny"] = clusterDefault != nil && clusterDefault.DefaultDeny
+	data["ClusterRules"] = clusterRules.GetRules()
+	data["HostRules"] = hostRules.GetRules()
+	data["IPSets"] = ipsets.GetIpsets()
+	data["DefaultDeny"] = defaultDeny
 	s.renderPage(w, "firewall.html", data)
 }
 

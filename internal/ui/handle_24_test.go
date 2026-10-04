@@ -10,17 +10,9 @@ import (
 )
 
 func TestHandleRBAC_RendersTree(t *testing.T) {
-	mock := newDefaultMock()
-	s := newTestUIServer(t, mock)
-	// Wire a real Corrosion DB so the handler has data to render.
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if err := corrosion.InitSchema(context.Background(), db); err != nil {
-		t.Fatalf("InitSchema: %v", err)
-	}
+	// The page lists bindings through ListRoleBindings, so an admin session
+	// over the real daemon is what sees every one of them.
+	s, db := newUIOverRealDaemon(t, "ada", "admin")
 	for _, b := range []corrosion.RoleBindingRecord{
 		{ID: "1", Path: "/projects/_default", Role: "admin", Principal: "user:alice", Propagate: true},
 		{ID: "2", Path: "/projects/_default/vms/web-1", Role: "viewer", Principal: "group:devs@oidc"},
@@ -29,10 +21,7 @@ func TestHandleRBAC_RendersTree(t *testing.T) {
 			t.Fatalf("InsertRoleBinding: %v", err)
 		}
 	}
-	s.SetCorrosionDB(db)
-
-	r := withAuth(httptest.NewRequest(http.MethodGet, "/rbac", nil))
-	w := serveRequest(s, r)
+	w := serveRequest(s, uiSessionReq(t, http.MethodGet, "/rbac", nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}

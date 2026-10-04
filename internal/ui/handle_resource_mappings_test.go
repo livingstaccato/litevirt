@@ -10,15 +10,9 @@ import (
 )
 
 func TestHandleResourceMappings_RendersWithDevices(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
-	db, err := corrosion.NewTestClient()
-	if err != nil {
-		t.Fatalf("NewTestClient: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	if err := corrosion.InitSchema(context.Background(), db); err != nil {
-		t.Fatalf("InitSchema: %v", err)
-	}
+	// The page lists mappings through ListResourceMappings, so the rows have to
+	// reach it through the real daemon.
+	s, db := newUIOverRealDaemon(t, "ada", "admin")
 	ctx := context.Background()
 	if err := corrosion.CreateResourceMapping(ctx, db, "gpu-a100", "A100 pool"); err != nil {
 		t.Fatalf("CreateResourceMapping: %v", err)
@@ -26,10 +20,7 @@ func TestHandleResourceMappings_RendersWithDevices(t *testing.T) {
 	if err := corrosion.AddMappingDevice(ctx, db, "gpu-a100", "kvm-01", "0000:41:00.0", "10de", "A100"); err != nil {
 		t.Fatalf("AddMappingDevice: %v", err)
 	}
-	s.SetCorrosionDB(db)
-
-	r := withAuth(httptest.NewRequest(http.MethodGet, "/resource-mappings", nil))
-	w := serveRequest(s, r)
+	w := serveRequest(s, uiSessionReq(t, http.MethodGet, "/resource-mappings", nil))
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}

@@ -39,9 +39,9 @@
           <span class="badge {{if .Enabled}}badge-green{{else}}badge-gray{{end}}">{{if .Enabled}}on{{else}}off{{end}}</span>
           <span class="mono">{{.EventPattern}}</span>
           <span>→</span>
-          <span class="mono muted">{{.TargetID}}</span>
+          <span class="mono muted">{{.TargetId}}</span>
           <span class="badge badge-purple">≥ {{.MinSeverity}}</span>
-          <button class="btn btn-sm btn-ghost" style="margin-left:auto" hx-delete="/ui/notifications/routes/{{.ID}}" hx-confirm="Delete this route?">{{icon "delete"}}</button>
+          <button class="btn btn-sm btn-ghost" style="margin-left:auto" hx-delete="/ui/notifications/routes/{{.Id}}" hx-confirm="Delete this route?">{{icon "delete"}}</button>
         </div>
       {{end}}
     </div>

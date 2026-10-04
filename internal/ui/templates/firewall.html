@@ -46,14 +46,14 @@
         <div class="rule-line">
           <span class="badge {{if eq .Direction "ingress"}}badge-blue{{else}}badge-purple{{end}}">{{.Direction}}</span>
           <span class="badge badge-gray">{{.Proto}}</span>
-          {{if .PortRange}}<span class="mono">:{{.PortRange}}</span>{{end}}
-          <span class="mono muted">{{if .CIDR}}{{.CIDR}}{{else}}any{{end}}</span>
+          {{if .Port}}<span class="mono">:{{.Port}}</span>{{end}}
+          <span class="mono muted">{{if .Cidr}}{{.Cidr}}{{else}}any{{end}}</span>
           <span>→</span>
           <span class="badge {{if eq .Action "accept"}}badge-green{{else}}badge-red{{end}}">{{.Action}}</span>
           {{if .Comment}}<span class="muted" style="font-size:11px">{{.Comment}}</span>{{end}}
           {{if .StackName}}<span class="badge badge-gray" title="from compose stack">stack {{.StackName}}</span>{{end}}
           <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove rule"
-                  hx-delete="/ui/firewall/cluster-rules/{{.ID}}" hx-confirm="Remove this cluster rule?">{{icon "delete"}}</button>
+                  hx-delete="/ui/firewall/cluster-rules/{{.Id}}" hx-confirm="Remove this cluster rule?">{{icon "delete"}}</button>
         </div>
       {{end}}
     </div>
@@ -74,13 +74,13 @@
           <span class="badge badge-gray" title="host">{{.HostName}}</span>
           <span class="badge {{if eq .Direction "ingress"}}badge-blue{{else}}badge-purple{{end}}">{{.Direction}}</span>
           <span class="badge badge-gray">{{.Proto}}</span>
-          {{if .PortRange}}<span class="mono">:{{.PortRange}}</span>{{end}}
-          <span class="mono muted">{{if .CIDR}}{{.CIDR}}{{else}}any{{end}}</span>
+          {{if .Port}}<span class="mono">:{{.Port}}</span>{{end}}
+          <span class="mono muted">{{if .Cidr}}{{.Cidr}}{{else}}any{{end}}</span>
           <span>→</span>
           <span class="badge {{if eq .Action "accept"}}badge-green{{else}}badge-red{{end}}">{{.Action}}</span>
           {{if .Comment}}<span class="muted" style="font-size:11px">{{.Comment}}</span>{{end}}
           <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove rule"
-                  hx-delete="/ui/firewall/host-rules/{{.ID}}" hx-confirm="Remove this host rule?">{{icon "delete"}}</button>
+                  hx-delete="/ui/firewall/host-rules/{{.Id}}" hx-confirm="Remove this host rule?">{{icon "delete"}}</button>
         </div>
       {{end}}
     </div>
@@ -99,10 +99,10 @@
       {{range .IPSets}}
         <div class="rule-line">
           <span class="mono">@{{.Name}}</span>
-          <span class="mono muted">{{range $i, $c := .CIDRs}}{{if $i}}, {{end}}{{$c}}{{end}}</span>
+          <span class="mono muted">{{range $i, $c := .Cidrs}}{{if $i}}, {{end}}{{$c}}{{end}}</span>
           {{if .StackName}}<span class="badge badge-gray" title="from compose stack">stack {{.StackName}}</span>{{end}}
           <button class="btn btn-sm btn-ghost" style="margin-left:auto" title="Remove ip set"
-                  hx-delete="/ui/firewall/ipsets/{{.ID}}" hx-confirm="Remove ip set {{.Name}}?">{{icon "delete"}}</button>
+                  hx-delete="/ui/firewall/ipsets/{{.Id}}" hx-confirm="Remove ip set {{.Name}}?">{{icon "delete"}}</button>
         </div>
       {{end}}
     </div>

@@ -12,7 +12,7 @@
         <span class="mono">{{.Principal}}</span>
         {{if .Propagate}}<span class="muted">(propagate)</span>{{end}}
         <button class="btn btn-sm btn-ghost" title="Revoke"
-                hx-delete="/ui/rbac/bindings/{{.ID}}" hx-confirm="Revoke {{.Role}} for {{.Principal}} on {{.Path}}?">{{icon "delete"}}</button>
+                hx-delete="/ui/rbac/bindings/{{.Id}}" hx-confirm="Revoke {{.Role}} for {{.Principal}} on {{.Path}}?">{{icon "delete"}}</button>
       </li>
       {{end}}
     </ul>

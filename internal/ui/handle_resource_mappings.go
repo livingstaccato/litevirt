@@ -5,30 +5,24 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// Resource mappings are READ in-process against the host-local Corrosion
-// handle; every mutation goes through the daemon's resource-mapping RPCs with
-// the session's bearer, so the page is held to the same resourcemap.write check
-// as any other caller of those RPCs.
+// Resource mappings are read through ListResourceMappings and changed through
+// the daemon's resource-mapping RPCs, all with the session's bearer, so the page
+// is held to the same resourcemap.read and resourcemap.write checks at `/` as
+// any other caller. A mapping names passthrough devices on every host, so a
+// grant scoped to one project does not reach it.
 
 // handleResourceMappings renders /resource-mappings: each mapping with its
 // per-host devices, plus create / add-device / delete actions (#14).
 func (s *Server) handleResourceMappings(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Resource Mappings", "resource-mappings")
-	if s.db == nil {
-		data["Error"] = "corrosion DB not wired into UI server (build mismatch)"
-		s.renderPage(w, "resource_mappings.html", data)
-		return
-	}
-	mappings, err := corrosion.ListResourceMappings(r.Context(), s.db)
+	resp, err := s.grpc.ListResourceMappings(s.uiBearerCtx(r), &pb.ListResourceMappingsRequest{})
 	if err != nil {
-		data["Error"] = err.Error()
-		s.renderPage(w, "resource_mappings.html", data)
+		s.renderPageRPCFailed(w, "resource_mappings.html", data, err)
 		return
 	}
-	data["Mappings"] = mappings
+	data["Mappings"] = resp.GetMappings()
 	s.renderPage(w, "resource_mappings.html", data)
 }
 

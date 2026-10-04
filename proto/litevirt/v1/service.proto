@@ -3693,6 +3693,12 @@ message VerifyAuditChainResponse {
     // still not signing (enforcement.audit_signature off, or an older build).
     // An older daemon never sets it, so an empty list says nothing on its own.
     repeated string not_signing_hosts = 18;
+    // Rows with a NUL byte in a hashed field, as "rowid: host: reason". The
+    // content hash is injective only over NUL-free rows, so such a row's hash
+    // and signature do not determine its content: a different row verifies
+    // the same. A current daemon never writes one. Feeds `unverified`, not
+    // `tampered` — an older build may have written the row verbatim.
+    repeated string ambiguous_rows = 19;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.

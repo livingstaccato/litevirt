@@ -197,6 +197,9 @@ func auditUnverifiedSummary(resp *pb.VerifyAuditChainResponse) string {
 	if n := len(resp.NeverAdopted); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d host(s) declaring signed rows they cannot sign", n))
 	}
+	if n := len(resp.AmbiguousRows); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d row(s) whose hash does not determine their content (NUL byte in a field)", n))
+	}
 	if resp.UnverifiableRows > 0 {
 		parts = append(parts, fmt.Sprintf("%d signed row(s) this daemon has no keyring to check", resp.UnverifiableRows))
 	}

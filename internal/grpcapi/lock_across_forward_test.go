@@ -65,6 +65,10 @@ func TestNoHandlerHoldsAVMLockAcrossAPeerForward(t *testing.T) {
 				if lock < 0 && lockRe.MatchString(l) {
 					lock = n
 				}
+				// lockVM used in a loop (CutoverVM) appends instead.
+				if lock < 0 && strings.Contains(l, "s.lockVM(") && strings.Contains(l, "append(") {
+					lock = n
+				}
 				if lock >= 0 && release < 0 && releaseRe.MatchString(l) {
 					release = n
 				}

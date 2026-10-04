@@ -41,8 +41,11 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 
 	if p.WithStorage {
 		// QEMU doesn't support tunnelled + non-shared disk together.
-		// Without tunnelling, QEMU opens a direct TLS connection to the
-		// target for block copy (uses migration port range, default 49152-49215).
+		// Without tunnelling, QEMU opens a direct connection to the target for
+		// the migration stream and the NBD block copy (migration port range,
+		// default 49152-49215). Nothing here sets MigrateTLS, so both carry RAM
+		// and disk blocks UNENCRYPTED; MigrateVM refuses this path unless the
+		// source's migration.allow_unencrypted_storage is set.
 		flags |= golibvirt.MigrateNonSharedDisk
 		// libvirt's qemuMigrationSrcIsSafe rejects a non-shared-storage
 		// migration ("Migration without shared storage is unsafe") whenever a

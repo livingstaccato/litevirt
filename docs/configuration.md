@@ -788,6 +788,28 @@ A VM with an empty `cpu_mode` (one created before this default existed) keeps
 it, and the default does not change how it renders. List them with `lv doctor cpu-mode` and move one
 forward, while it is stopped, with `lv update <vm> --cpu-mode host-model`.
 
+## Migration
+
+```yaml
+migration:
+  allow_unencrypted_storage: false   # default false
+```
+
+`allow_unencrypted_storage` decides whether this node may **send** a migration
+that copies disks: `lv migrate --with-storage`, or a compose VM with
+`migrate.with-storage`. Such a copy cannot be tunnelled through libvirt's TLS
+connection, so QEMU sends the guest's memory and every copied disk block to the
+target over plain TCP. Anyone on the network path between the two hosts can read
+them.
+
+With the default, `false`, a storage-copying migration is refused before any
+work starts, and the error names this setting. Set it to `true` only where the
+network between hosts is trusted, for example a dedicated, isolated migration
+VLAN. It is read on the source host, and only at daemon start.
+
+Migrations of VMs on shared storage copy no disks. litevirt tunnels them through
+libvirt's TLS connection, and this setting does not affect them.
+
 ## Capacity and overcommit
 
 How much of a host litevirt is willing to hand to workloads. Cluster-wide

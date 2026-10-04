@@ -901,6 +901,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetOperationProtocol(d.cfg.Enforcement.OperationProtocol)
 	svc.SetDefaultCPUMode(d.cfg.VM.DefaultCPUMode)
 	svc.SetLiveResize(d.cfg.Enforcement.LiveResize)
+	svc.SetAllowUnencryptedStorageMigration(d.cfg.Migration.AllowUnencryptedStorage)
 	// Cluster-wide capacity policy (overcommit ratios + host reserves). Per-host
 	// overrides live on the host record and win where set.
 	svc.SetCapacityPolicy(capacity)

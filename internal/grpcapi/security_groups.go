@@ -14,14 +14,19 @@ import (
 
 // Security-group CRUD, the per-NIC firewall tier (colonelpanik/litevirt#182).
 //
-// `lv sg create/rm/rule-add/rule-rm` used to open the host's Corrosion database
-// in the CLI process and write it there. That skipped the daemon's
-// authorization entirely, and it left no audit row, because only the daemon
-// holds the host's audit sub-chain tail and signing key. These RPCs are what
-// the CLI calls now. Each checks sg.write at the cluster root (security groups
-// are cluster-global, bound to NICs by name) and records the same row the web
-// UI's security-group pages record: who, what, and the group or rule before
-// and after.
+// The web UI's security-group pages call these with the session's bearer, so
+// the daemon's own interceptor decides who the caller is and RequirePerm
+// decides what they may do, exactly as for any other RPC. The pages used to
+// write in-process behind an in-process authorizer that resolved the caller
+// from incoming gRPC metadata the UI never has, so it authorized every session
+// as the bearerless admin. Each RPC checks sg.write at the cluster root
+// (security groups are cluster-global, bound to NICs by name) and records who,
+// what, and the group or rule before and after. Only the daemon can write that
+// row, because only it holds the host's audit sub-chain tail and signing key.
+//
+// `lv sg create/rm/rule-add/rule-rm` still write the host's Corrosion database
+// from the CLI process on this branch; moving them onto these RPCs is separate
+// work.
 //
 // sg.write is held by Admin (`*`) and NetworkAdmin (`sg.*`); Operator holds
 // sg.read only. A cluster with no role bindings falls back to the legacy
@@ -44,7 +49,7 @@ func toPbSGRule(r corrosion.SGRule) *pb.SecurityGroupRule {
 	}
 }
 
-// CreateSecurityGroup creates an empty security group. `lv sg create`.
+// CreateSecurityGroup creates an empty security group.
 func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurityGroupRequest) (*pb.SecurityGroup, error) {
 	if err := s.requireSGWrite(ctx); err != nil {
 		return nil, err
@@ -66,7 +71,6 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 }
 
 // DeleteSecurityGroup tombstones a security group and every rule in it.
-// `lv sg rm`.
 func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurityGroupRequest) (*emptypb.Empty, error) {
 	if err := s.requireSGWrite(ctx); err != nil {
 		return nil, err
@@ -92,7 +96,7 @@ func (s *Server) DeleteSecurityGroup(ctx context.Context, req *pb.DeleteSecurity
 	return &emptypb.Empty{}, nil
 }
 
-// AddSecurityGroupRule appends a rule to a security group. `lv sg rule-add`.
+// AddSecurityGroupRule appends a rule to a security group.
 func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGroupRuleRequest) (*pb.SecurityGroupRule, error) {
 	if err := s.requireSGWrite(ctx); err != nil {
 		return nil, err
@@ -120,7 +124,7 @@ func (s *Server) AddSecurityGroupRule(ctx context.Context, req *pb.AddSecurityGr
 	return toPbSGRule(row), nil
 }
 
-// RemoveSecurityGroupRule tombstones one rule, by the RULE id. `lv sg rule-rm`.
+// RemoveSecurityGroupRule tombstones one rule, by the RULE id.
 func (s *Server) RemoveSecurityGroupRule(ctx context.Context, req *pb.RemoveSecurityGroupRuleRequest) (*emptypb.Empty, error) {
 	if err := s.requireSGWrite(ctx); err != nil {
 		return nil, err

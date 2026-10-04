@@ -16807,9 +16807,8 @@ func (x *ListFirewallDefaultsResponse) GetDefaults() []*FirewallDefault {
 }
 
 // ── Security groups: the per-NIC tier ──
-// `lv sg create/rm/rule-add/rule-rm`. These used to write the host's database
-// straight from the CLI process, which skipped the daemon's authorization and
-// left no audit row (colonelpanik/litevirt#182).
+// The web UI's security-group writes go through these, so the daemon authorizes
+// and audits them as the session's own user (colonelpanik/litevirt#182).
 type CreateSecurityGroupRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`

@@ -1518,9 +1518,8 @@ message ListFirewallDefaultsRequest      {}
 message ListFirewallDefaultsResponse     { repeated FirewallDefault defaults = 1; }
 
 // ── Security groups: the per-NIC tier ──
-// `lv sg create/rm/rule-add/rule-rm`. These used to write the host's database
-// straight from the CLI process, which skipped the daemon's authorization and
-// left no audit row (colonelpanik/litevirt#182).
+// The web UI's security-group writes go through these, so the daemon authorizes
+// and audits them as the session's own user (colonelpanik/litevirt#182).
 message CreateSecurityGroupRequest     { string name = 1; string stack_name = 2; }
 message DeleteSecurityGroupRequest     { string id = 1; }  // tombstones the group and its rules
 message AddSecurityGroupRuleRequest    { SecurityGroupRule rule = 1; }  // rule.id is ignored

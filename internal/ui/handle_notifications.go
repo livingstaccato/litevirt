@@ -1,11 +1,12 @@
 package ui
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
-	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -13,8 +14,9 @@ import (
 	"github.com/litevirt/litevirt/internal/randid"
 )
 
-// Notification CRUD runs in-process against the host-local Corrosion handle
-// (same as `lv notify`), CRDT-replicated cluster-wide. Behind the UI session.
+// Notification targets and routes are READ in-process against the host-local
+// Corrosion handle; every action on them, the test send included, goes through
+// the daemon's notification RPCs with the session's bearer.
 
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Notifications", "notifications")
@@ -99,34 +101,22 @@ func (s *Server) handleTestNotifyTarget(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	id := r.PathValue("id")
-	targets, _ := corrosion.ListNotificationTargets(r.Context(), s.db)
-	for _, t := range targets {
-		if t.ID != id {
-			continue
-		}
-		target, err := notify.NewTarget(t.Name, t.Type, t.Config)
-		if err != nil {
-			sendToast(w, "bad target: "+err.Error(), "error")
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
-		defer cancel()
-		if err := target.Send(ctx, notify.Notification{
-			Kind: "test.notification", Severity: notify.SevInfo, Subject: t.Name,
-			Detail: "litevirt test notification", Cluster: s.cluster, Timestamp: time.Now().UTC(),
-		}); err != nil {
-			sendToast(w, "send failed: "+err.Error(), "error")
+	// Through the twin, like the CRUD above. Sending in-process let any session
+	// with a role, a Viewer included, make the daemon load a target's stored
+	// credentials and fire at its endpoint; the RPC requires operator.
+	if _, err := s.grpc.TestNotificationTarget(s.uiBearerCtx(r),
+		&pb.TestNotificationTargetRequest{Id: r.PathValue("id")}); err != nil {
+		sendToast(w, "send failed: "+grpcMsg(err), "error")
+		if status.Code(err) == codes.Unavailable {
+			// The target refused or timed out: the page worked, the endpoint did not.
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		sendToast(w, "Test notification sent to "+t.Name, "success")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
-	sendToast(w, "target not found", "error")
-	w.WriteHeader(http.StatusNotFound)
+	sendToast(w, "Test notification sent", "success")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleNotifyRouteModal(w http.ResponseWriter, r *http.Request) {

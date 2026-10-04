@@ -111,8 +111,8 @@ func SGRuleAuditState(rule *SGRule, err error) string {
 }
 
 // SecurityGroupAuditState reads one security group, with its rules, and
-// renders it as an audit state. The web UI and the gRPC handlers both call it,
-// so a group removed either way leaves the same record.
+// renders it as an audit state. DeleteSecurityGroup records it as the "before"
+// of a removal.
 func SecurityGroupAuditState(ctx context.Context, c *Client, id string) string {
 	sg, err := GetSecurityGroup(ctx, c, id)
 	if err != nil {

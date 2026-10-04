@@ -224,7 +224,8 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	// cleared once the sensitive merge has committed — not after convergence,
 	// because by then the window is already shut and holding it longer would
 	// refuse logins on a node whose secrets are fully restored.
-	if err := s.db.BeginReseed(ctx, source); err != nil {
+	reseedGeneration, err := s.db.BeginReseed(ctx, source)
+	if err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal,
 			"could not mark this node as mid-reseed, so the reseed was not started "+
@@ -250,7 +251,7 @@ func (s *Server) ReseedHost(ctx context.Context, req *pb.ReseedHostRequest) (*pb
 	}
 
 	// The window is shut: user_2fa is restored, so the login gate may lift.
-	if err := s.db.FinishReseed(ctx); err != nil {
+	if err := s.db.FinishReseed(ctx, reseedGeneration); err != nil {
 		s.audit(ctx, "host.reseed", s.hostName, "source="+source, "error")
 		return nil, status.Errorf(codes.Internal,
 			"state was restored from %s but this node could not clear its reseed marker, so it "+

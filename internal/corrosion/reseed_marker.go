@@ -48,27 +48,71 @@ const reseedInProgressDDL = `CREATE TABLE IF NOT EXISTS reseed_in_progress (
 // path out of an interrupted one, so it has to be callable while the marker is
 // already set, and it must leave behind the source it is actually pulling from
 // rather than the one that failed.
-func (c *Client) BeginReseed(ctx context.Context, source string) error {
-	if err := c.execLocal(ctx,
+func (c *Client) BeginReseed(ctx context.Context, source string) (int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// ONE transaction. The two writes were separate execLocal calls, and the
+	// fence's safety then rested entirely on their ORDER: a reader that saw the
+	// generation already bumped while the marker was not yet set would be
+	// admitted and stamped with the post-reseed value, and the mint would later
+	// compare equal against a cleared marker. That ordering was stated nowhere
+	// and pinned by nothing — exactly the "argument that has to be re-derived
+	// whenever either side moves" that the single-statement read was meant to
+	// eliminate. A transaction removes the dependency instead of documenting it.
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin reseed: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO reseed_in_progress (id, started_at, source) VALUES (1, ?, ?)`,
 		c.NowTS(), source); err != nil {
-		return fmt.Errorf("mark reseed in progress: %w", err)
+		return 0, fmt.Errorf("mark reseed in progress: %w", err)
 	}
 	// Bumped for every reseed that STARTS, including a repeat of one that failed,
 	// and never reset: a caller holding the old value must be able to see that
 	// something happened even if the reseed has since finished.
-	if err := c.execLocal(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO reseed_generation (id, generation) VALUES (1, 1)
 		 ON CONFLICT(id) DO UPDATE SET generation = reseed_generation.generation + 1`); err != nil {
-		return fmt.Errorf("bump reseed generation: %w", err)
+		return 0, fmt.Errorf("bump reseed generation: %w", err)
 	}
-	return nil
+	var generation int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT generation FROM reseed_generation WHERE id = 1`).Scan(&generation); err != nil {
+		return 0, fmt.Errorf("read the minted reseed generation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit reseed start: %w", err)
+	}
+	// Returned so the caller can name the reseed it started. FinishReseed clears
+	// the marker only for that one.
+	return generation, nil
 }
 
-// FinishReseed clears the marker. Only a reseed whose sensitive merge has
-// committed may call it.
-func (c *Client) FinishReseed(ctx context.Context) error {
-	if err := c.execLocal(ctx, `DELETE FROM reseed_in_progress`); err != nil {
+// FinishReseed clears the marker for the reseed that minted `generation`, and
+// only for that one.
+//
+// The unconditional DELETE it used to be is unsafe once two reseeds can
+// overlap: the FIRST to finish cleared the marker while the second still had
+// the credential tables mid-discard, so the login gate lifted over an
+// incomplete node and an enrolled account could be served a password-only
+// session — the whole condition the marker exists to signal.
+func (c *Client) FinishReseed(ctx context.Context, generation int64) error {
+	// Conditional on the marker still belonging to THIS reseed. One statement,
+	// so the check and the delete cannot be separated: a later reseed starting
+	// between a read and an unconditional delete would have its marker removed
+	// by the read's verdict.
+	//
+	// A generation that has been overtaken deletes nothing, which is success —
+	// the node is still mid-reseed and the marker naming the newer one is
+	// exactly what should remain.
+	if err := c.execLocal(ctx,
+		`DELETE FROM reseed_in_progress
+		 WHERE id = 1
+		   AND (SELECT generation FROM reseed_generation WHERE id = 1) = ?`,
+		generation); err != nil {
 		return fmt.Errorf("clear reseed marker: %w", err)
 	}
 	return nil
@@ -114,20 +158,38 @@ const reseedGenerationDDL = `CREATE TABLE IF NOT EXISTS reseed_generation (
 // ReseedFence reports whether a reseed is currently incomplete, the source it
 // was pulling from, and the monotone count of reseeds started on this node.
 //
+// ONE statement, deliberately. The two values are read in a single SELECT so
+// they describe the same instant: SQLite evaluates a statement against one
+// snapshot, so no reseed can land between them.
+//
+// It read twice before — ReseedIncomplete, then a separate SELECT — and that
+// was the whole bug, one layer below where it was first looked for. A reseed
+// beginning between the two reads set the marker and bumped the generation
+// after the marker had already been read as clear, so the value stamped on the
+// admitted request was the POST-reseed generation; when the reseed then also
+// finished, the mint compared equal generations against a cleared marker and
+// concluded nothing had happened. A 2FA-enrolled account got a password-only
+// session, which is the exact race the generation was introduced to close.
+// TestReseedFence_IsASingleRead pins the shape; ordering the reads
+// generation-first would also be sound, but only by an argument that has to be
+// re-derived whenever either side moves.
+//
 // A read failure is reported rather than folded into "no reseed pending": the
 // caller is a credential gate, and an unreadable fence must not read as
 // permission to serve.
 func (c *Client) ReseedFence(ctx context.Context) (incomplete bool, source string, generation int64, err error) {
-	incomplete, source, err = c.ReseedIncomplete(ctx)
-	if err != nil {
-		return false, "", 0, err
-	}
-	rows, qerr := c.Query(ctx, `SELECT generation FROM reseed_generation WHERE id = 1`)
+	rows, qerr := c.Query(ctx, `SELECT
+		(SELECT COUNT(*) FROM reseed_in_progress WHERE id = 1)                 AS incomplete,
+		COALESCE((SELECT source FROM reseed_in_progress WHERE id = 1), '')     AS source,
+		COALESCE((SELECT generation FROM reseed_generation WHERE id = 1), 0)   AS generation`)
 	if qerr != nil {
-		return false, "", 0, fmt.Errorf("read reseed generation: %w", qerr)
+		return false, "", 0, fmt.Errorf("read reseed fence: %w", qerr)
 	}
 	if len(rows) == 0 {
-		return incomplete, source, 0, nil
+		// A scalar-subquery SELECT with no FROM always yields exactly one row;
+		// no rows means the read did not happen as written, which a credential
+		// gate must not read as "no reseed pending".
+		return false, "", 0, fmt.Errorf("read reseed fence: no row")
 	}
-	return incomplete, source, rows[0].Int64("generation"), nil
+	return rows[0].Int64("incomplete") > 0, rows[0].String("source"), rows[0].Int64("generation"), nil
 }

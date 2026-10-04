@@ -37,6 +37,13 @@ const (
 	// ClassStuckDifferent is a different_updated_at that survived resampling after
 	// watermark catch-up — a converged-wrong or lost-write split.
 	ClassStuckDifferent DivergenceClass = "stuck_different"
+	// ClassAcknowledgedTie: a differing row of a table that every host holding
+	// it has acknowledged ('lv cluster acknowledge-lease-term'), with nothing
+	// else in the table different — the verdict `lv cluster converge` reports
+	// as ACKNOWLEDGED (TieAckVerdict). Both claims are kept, so the row stays
+	// listed, but it is not an unresolved divergence. Assigned by the
+	// orchestrator from the hosts' verification digests, never by ClassifyTable.
+	ClassAcknowledgedTie DivergenceClass = "acknowledged_tie"
 	// ClassMissingRow: the PK exists on some nodes, absent on others.
 	ClassMissingRow DivergenceClass = "missing_row"
 	// ClassTombstoneVsLive: some nodes have the row tombstoned (deleted_at set),

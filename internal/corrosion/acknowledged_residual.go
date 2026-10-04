@@ -3,6 +3,8 @@ package corrosion
 import (
 	"context"
 	"strings"
+
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 )
 
 // Acknowledged ties in the convergence report.
@@ -149,4 +151,76 @@ func (c *Client) acknowledgedResidual(ctx context.Context, table string, ackedPK
 		return "", false
 	}
 	return "v2:" + hashRowKeys(keys), true
+}
+
+// TieAckVerdict is what every host's verification digest says about one
+// table's tracked ties. It is the one place that decides whether a table is
+// held apart only by acknowledged ties: `lv cluster converge` lists such a
+// table ACKNOWLEDGED, and `lv doctor divergence` classes its rows
+// acknowledged_tie, so the two commands cannot disagree.
+type TieAckVerdict struct {
+	// Ties is every tracked tie in the table, summed across reporting hosts.
+	Ties int32
+	// Acknowledged is the acknowledged subset, clipped per host to that
+	// host's tracked count.
+	Acknowledged int32
+	// Vouching lists the hosts that can vouch for the table: they track at
+	// least one tie in it, every one acknowledged, and supplied a residual.
+	// A host that tracks nothing here cannot say its difference is the
+	// acknowledged rows; a rebuilt host with an empty register is one.
+	Vouching []string
+	// NotVouching lists the other hosts that reported the table.
+	NotVouching []string
+	residuals   map[string]bool
+}
+
+// Live is the number of tracked ties no operator has acknowledged.
+func (v *TieAckVerdict) Live() int32 { return v.Ties - v.Acknowledged }
+
+// VouchedBy reports whether host vouched for the table.
+func (v *TieAckVerdict) VouchedBy(host string) bool {
+	for _, h := range v.Vouching {
+		if h == host {
+			return true
+		}
+	}
+	return false
+}
+
+// AcknowledgedOnly reports whether the table is held apart only by ties every
+// reporting host has acknowledged, and every host's residual (the table with
+// those rows masked) agrees, so nothing else differs.
+func (v *TieAckVerdict) AcknowledgedOnly() bool {
+	return v.Live() == 0 && v.Acknowledged > 0 && len(v.NotVouching) == 0 && len(v.residuals) == 1
+}
+
+// TieAckVerdicts reads every host's verification digest, per table. Hosts are
+// listed in the order the digests name them.
+func TieAckVerdicts(hosts []*pb.StateDigestResponse) map[string]*TieAckVerdict {
+	out := map[string]*TieAckVerdict{}
+	for _, h := range hosts {
+		for _, t := range h.GetTables() {
+			v := out[t.GetName()]
+			if v == nil {
+				v = &TieAckVerdict{residuals: map[string]bool{}}
+				out[t.GetName()] = v
+			}
+			tracked := t.GetUnresolvedTies()
+			a := t.GetAcknowledgedTies()
+			if a > tracked {
+				a = tracked
+			}
+			v.Ties += tracked
+			v.Acknowledged += a
+			// Every host must vouch: hold ties here, all of them
+			// acknowledged, and a residual.
+			if tracked == 0 || a != tracked || t.GetAcknowledgedResidual() == "" {
+				v.NotVouching = append(v.NotVouching, h.GetHostName())
+			} else {
+				v.Vouching = append(v.Vouching, h.GetHostName())
+				v.residuals[t.GetAcknowledgedResidual()] = true
+			}
+		}
+	}
+	return out
 }

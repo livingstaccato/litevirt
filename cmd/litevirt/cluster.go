@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func newClusterCmd() *cobra.Command {
@@ -336,35 +337,18 @@ var convergenceRepairTables = map[string]bool{"vms": true}
 // not listed. Comparison is version-aware (see digestVersions): v2 iff every host emits it.
 func printConvergence(dig *pb.ClusterStateDigestResponse) {
 	ver := digestVersions(dig)
-	tables := map[string]map[string]string{}  // table -> host -> version-appropriate hash
-	ties := map[string]int32{}                // table -> total unresolved ties across hosts
-	acked := map[string]int32{}               // table -> the acknowledged subset of ties
-	residuals := map[string]map[string]bool{} // table -> distinct acknowledged residuals
-	unproven := map[string]bool{}             // table -> some host cannot vouch for a residual
+	tables := map[string]map[string]string{} // table -> host -> version-appropriate hash
+	// The acknowledged-tie verdict is shared with `lv doctor divergence`.
+	verdicts := corrosion.TieAckVerdicts(dig.GetHosts())
 	var order []string
 	for _, h := range dig.GetHosts() {
 		for _, t := range h.GetTables() {
 			name := t.GetName()
 			if _, ok := tables[name]; !ok {
 				tables[name] = map[string]string{}
-				residuals[name] = map[string]bool{}
 				order = append(order, name)
 			}
 			tables[name][h.GetHostName()] = ver.hash(name, t)
-			ties[name] += t.GetUnresolvedTies()
-			a := t.GetAcknowledgedTies()
-			if a > t.GetUnresolvedTies() {
-				a = t.GetUnresolvedTies()
-			}
-			acked[name] += a
-			// Every host must vouch: hold ties here, all of them acknowledged,
-			// and a residual. A host that tracks nothing for the table cannot
-			// say its difference is the acknowledged rows.
-			if t.GetUnresolvedTies() == 0 || a != t.GetUnresolvedTies() || t.GetAcknowledgedResidual() == "" {
-				unproven[name] = true
-			} else {
-				residuals[name][t.GetAcknowledgedResidual()] = true
-			}
 		}
 	}
 	sort.Strings(order)
@@ -378,34 +362,35 @@ func printConvergence(dig *pb.ClusterStateDigestResponse) {
 		for _, h := range hosts {
 			hashes[h] = true
 		}
-		live := ties[name] - acked[name]
+		v := verdicts[name]
+		ties, acked, live := v.Ties, v.Acknowledged, v.Live()
 		switch {
 		case len(hashes) <= 1:
 			converged++
-		case live == 0 && acked[name] > 0 && !unproven[name] && len(residuals[name]) == 1:
+		case v.AcknowledgedOnly():
 			// Held apart only by ties every host has acknowledged, and every
 			// host's residual (the table with those rows masked) agrees, so
 			// nothing else differs. Converged, and listed, because the two
 			// claims are still there and still evidence.
 			converged++
 			fmt.Fprintf(w, "%s\t%s\tACKNOWLEDGED\t%d acknowledged tie(s) — both claims kept; nothing else differs\n",
-				name, ver.label(name), acked[name])
-		case ties[name] > 0:
+				name, ver.label(name), acked)
+		case ties > 0:
 			remedy := "run `lv doctor divergence` and apply the table-specific remediation"
 			if convergenceRepairTables[name] {
 				remedy = "run `lv doctor repair-owner`"
 			}
 			var detail string
 			switch {
-			case acked[name] == 0:
-				detail = fmt.Sprintf("%d unresolved tie(s) — deliberate", ties[name])
+			case acked == 0:
+				detail = fmt.Sprintf("%d unresolved tie(s) — deliberate", ties)
 			case live > 0:
-				detail = fmt.Sprintf("%d unacknowledged tie(s) and %d acknowledged — deliberate", live, acked[name])
+				detail = fmt.Sprintf("%d unacknowledged tie(s) and %d acknowledged — deliberate", live, acked)
 			default:
 				// Every tie acknowledged, but some host could not vouch that
 				// nothing else differs, or the hosts disagree on what else is
 				// there. Not converged: that is where drift would hide.
-				detail = fmt.Sprintf("%d acknowledged tie(s), but the rest of the table is not proven equal on every host", acked[name])
+				detail = fmt.Sprintf("%d acknowledged tie(s), but the rest of the table is not proven equal on every host", acked)
 			}
 			fmt.Fprintf(w, "%s\t%s\tSAFETY-FAULT\t%s; %s\n", name, ver.label(name), detail, remedy)
 		default:

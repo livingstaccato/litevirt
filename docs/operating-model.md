@@ -878,6 +878,12 @@ host cannot vouch for a residual (it tracks no tie there yet, or runs an older
 build), or if the residuals disagree, because another row differs as well.
 `lv cluster digest` shows the acknowledged count in its `TIES` column.
 
+`lv doctor divergence` applies the same rule row by row. A row of an
+`ACKNOWLEDGED` table is listed as `acknowledged_tie`, apart from the diverging
+rows, and does not stop the scan reading clean. Any other row in a table where
+some host acknowledged a tie stays a divergence and names the hosts that have
+not acknowledged it ([diagnostics.md](diagnostics.md#lv-doctor-divergence)).
+
 Investigate before acknowledging. Two nodes recording the same term means the
 fencing token did its job — enforcement will refuse proofs from the losing
 tenure — but something upstream let both nodes believe they held the lease.

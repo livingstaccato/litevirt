@@ -122,7 +122,14 @@ import (
 // change, and the digest does not see it (it hashes Disposition, which was and is
 // DispReject). Otherwise an ADDITION; no previously accepted historical identity
 // was removed or changed.
-const compatibilityDigest = "52fbd3f25cecb551bb2153f630298ae17495827110991236374af59bbb70c4e3"
+// Updated again when rebalance_proposals.updated_at became the LWW key: the
+// executor's bulk stale reap (`WHERE status='applying' AND updated_at < ?`,
+// a lexical cutoff that misreads HLC) moved from the current ledger to the
+// rebalance_reap_stale_bulk_v130 family, receive-only, with the per-row-LWW
+// disposition it already had. The current tree reaps by primary key with
+// markFailed's shape. An ADDITION; no previously accepted historical identity
+// was removed or changed.
+const compatibilityDigest = "920564cce0fccf220f94cb26f381453c801fa20497980f5bc19b3c6b22cc8a34"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -192,6 +199,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"claim_proof_fenced_not_exists_fork":    1,   // fenced claim with its fence as a receiver-evaluated NOT EXISTS (fork 39c75474..a0037a7e)
 	"credentials_split_clear_v56":           2,   // first credentials_split_v1 build's users/tokens old-column clears, before the split went dual-write
 	"canonical_registry_v1_retired":         2,   // retired canonical registry design: the canonical upsert (DispReject) + consolidation's by-id tombstone; never emitted
+	"rebalance_reap_stale_bulk_v130":        1,   // executor's bulk stale reap with a lexical updated_at cutoff, before updated_at became the LWW key
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

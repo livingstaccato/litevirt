@@ -108,7 +108,12 @@ import (
 // instead). They moved from the current ledger to the credentials_split_clear_v56
 // family, receive-only, for a host still on that build. An ADDITION; no
 // previously accepted historical identity was removed or changed.
-const compatibilityDigest = "c8abf56a441c911f48746510f6086bf444bdc18d396a12db42329fd957b10ac3"
+// Updated again when VM create started recording each disk's bus: the create's
+// narrow vm_disks INSERT moved from the current ledger to the
+// vm_disks_create_insert_v130 family, receive-only, for peers that still create
+// VMs with it. An ADDITION; no previously accepted historical identity was
+// removed or changed.
+const compatibilityDigest = "d9c4360a0a7542b61354f249c2a53c5f84ec26e8d814cb463282ba6422ab9742"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -153,6 +158,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"vm_rename_v130":                        3,   // vm_interfaces / vm_disks / ip_allocations
 	"network_rename_v130":                   3,   // network_vteps / ip_allocations / vm_interfaces
 	"vm_disks_insert_v130":                  1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
+	"vm_disks_create_insert_v130":           1,   // VM create's vm_disks insert before it recorded the bus
 	"insert_host_v130":                      1,   // pre-capacity-policy hosts insert (narrower column list)
 	"insert_host_v43":                       1,   // capacity overrides present, before v44 capacity-policy fingerprint
 	"configure_host_fixed_v130":             1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)

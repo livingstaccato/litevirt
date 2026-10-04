@@ -22,8 +22,12 @@ const (
 
 // ProbeInterval is the cadence at which an observer probes each peer. A probe
 // is started at most once per tick, so N consecutive failed probes from one
-// observer span at least (N-1) × ProbeInterval — the lower bound failover uses
-// to tell whether a peer has been down without a break since some instant.
+// observer span at least (N-1) × ProbeInterval. That is only a LOWER bound: a
+// probe of a powered-off host runs out its dial timeout, and the next starts
+// when the batch drains, so on the kvm003 lab such a run advanced one count
+// every ~2.85 s. Failover therefore reads when a run began from the verdict
+// itself (a failing verdict's last_seen, see checkHost) and falls back to this
+// bound only for a verdict from an older build, which never overstates a run.
 const ProbeInterval = checkInterval
 
 // unreadyFailures is the consecutive_failures an 'unready' row carries, for
@@ -81,6 +85,11 @@ type peerState struct {
 	// silence count restarts after one, because an answer is not silence; it
 	// must not restart on every silent probe that follows.
 	answeredUnready bool
+	// runStart is when the first probe of the current run of unanswered probes
+	// was observed (local wall clock; zero when the last probe was answered).
+	// It restarts wherever `failures` restarts at 1, so it is the start of
+	// exactly the run the published count describes.
+	runStart time.Time
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -597,6 +606,13 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		}
 	}
 
+	switch {
+	case result != probeUnreachable:
+		prev.runStart = time.Time{} // an answer, healthy or unready, ends the run
+	case newFailures == 1 || prev.runStart.IsZero():
+		prev.runStart = observedAt
+	}
+
 	// An unchanged unready verdict is not a change. Its count is pinned, so it
 	// is kept fresh by the HeartbeatInterval re-publish in shouldPersistHealth
 	// rather than by a replicated write on every probe.
@@ -619,6 +635,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		sinceWrite = HeartbeatInterval // never written: the first probe publishes
 	}
 	write := shouldPersistHealth(changed, healthy, result == probeNotReady, recoveryPending(host.State), sinceWrite)
+	runStart := prev.runStart
 	c.mu.Unlock()
 
 	if !write {
@@ -644,7 +661,21 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 			err = c.db.ExecuteDeferred(ctx, healthyVerdictSQL, args...)
 		}
 	} else {
-		args := []interface{}{c.hostName, host.Name, newStatus, newFailures, nil, now}
+		// A failing verdict's last_seen is when this run of unanswered probes
+		// began: the observer last saw the host answer before then, and has
+		// seen nothing since. Failover reads it as the start of the outage
+		// this observer is watching (observerStreakSpans), where the count
+		// alone only bounds it — the count advances once per probe, and a
+		// probe of a dead host takes longer than ProbeInterval. Same wall
+		// format as the healthy arm; sub-second, since a fence and a
+		// confirmation are compared against it. An answered-unready verdict
+		// keeps NULL. The statement is unchanged: this has always been a
+		// bound parameter, NULL until now.
+		var lastSeen interface{}
+		if !runStart.IsZero() {
+			lastSeen = runStart.UTC().Format(time.RFC3339Nano)
+		}
+		args := []interface{}{c.hostName, host.Name, newStatus, newFailures, lastSeen, now}
 		if c.writeFn != nil {
 			err = c.writeFn(ctx, unhealthyVerdictSQL, args...)
 		} else {

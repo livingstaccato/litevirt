@@ -725,6 +725,7 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 			SizeBytes:   int64(d.CapacityBytes),
 			StorageType: "local",
 			TargetDev:   lv.DiskDevName(d.Bus, di),
+			Bus:         d.Bus,
 		})
 		di++
 	}

@@ -1926,14 +1926,26 @@ func (c *Coordinator) attemptIsThisOutage(ctx context.Context, host string, atte
 
 // observerStreakSpans reports whether some observer has watched host fail
 // without a break since before `at`. Its fresh row's consecutive_failures is
-// that unbroken run, and a run of N probes spans at least (N-1) ×
-// health.ProbeInterval, so updated_at minus that is no earlier than the run's
-// start. The start must be at least fenceSkewMargin before `at` — the two are
-// read off different hosts' clocks — and an 'unready' row is an answer, not
-// silence, so it never counts as a run.
+// that unbroken run, and the run's start is the row's last_seen, which a
+// failing verdict carries as the time of the run's first failed probe. The
+// start must be at least fenceSkewMargin before `at` — the two are read off
+// different hosts' clocks — and an 'unready' row is an answer, not silence, so
+// it never counts as a run.
+//
+// A row from an older build carries no start (last_seen NULL). Its run is then
+// taken to span (N-1) × health.ProbeInterval back from updated_at, a lower
+// bound on its length that never counts an earlier outage's fence or
+// confirmation as this one's. It is only a bound: a probe of a powered-off host
+// runs out its dial timeout, so on the kvm003 lab a run advanced one count
+// every ~2.85 s and the estimated start drifted later the longer the outage
+// went on, until a fence or confirmation made minutes into it read as older
+// than the outage (drills 3 and 6 on main-e004c250). Erring the other way has
+// no bound to offer — a host refusing connections fails each probe at once —
+// so the older build's rows keep the estimate, and the first observer on this
+// build is enough: one spanning row answers the question.
 func (c *Coordinator) observerStreakSpans(ctx context.Context, host string, at time.Time) bool {
 	rows, err := c.db.Query(ctx,
-		`SELECT consecutive_failures, updated_at FROM host_health
+		`SELECT consecutive_failures, last_seen, updated_at FROM host_health
 		 WHERE target = ? AND status != ?`, host, health.StatusUnready)
 	if err != nil {
 		slog.Warn("failover: host_health read for a fence's outage failed", "host", host, "error", err)
@@ -1951,6 +1963,9 @@ func (c *Coordinator) observerStreakSpans(ctx context.Context, host string, at t
 			continue
 		}
 		runStart := upd.Add(-time.Duration(n-1) * health.ProbeInterval)
+		if started, ok := corrosion.ParseUpdatedAt(r.String("last_seen")); ok && !started.After(upd) {
+			runStart = started
+		}
 		if !runStart.After(at.Add(-fenceSkewMargin)) {
 			return true
 		}

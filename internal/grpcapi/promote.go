@@ -960,7 +960,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	diskRecords := []corrosion.DiskRecord{{
 		VMName: targetName, DiskName: src.DiskName, HostName: s.hostName,
 		Path: livePath, SizeBytes: src.SizeBytes, StorageType: poolRef.Driver,
-		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0),
+		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0), Bus: promBus,
 	}}
 
 	var netCfg []lv.NetworkConfig

@@ -401,6 +401,15 @@ one. A host that answered after its fence and then failed again has had the
 verdict that it answered overwritten, and only the failing runs' start shows the
 return.
 
+**When a failing run started** is read from the verdict: an observer's failing
+`host_health` row carries the time of its run's first failed probe in
+`last_seen`. A verdict from an older build carries none, and its run is taken to
+span one probe interval (2 s) per failure, a lower bound: a probe of a
+powered-off host runs out its dial timeout, so its runs advance more slowly, and
+the bound puts their start later than it was. It never counts an earlier outage
+as this one, but it can refuse a fence or confirmation made minutes into a long
+outage until an observer on the current build reports the host.
+
 **Clock skew.** The fence's time is the leader's clock and each observation is
 its observer's, so both comparisons give 5 seconds, the clock-skew alert
 threshold, to the safe side. A failing run must have begun at least 5 seconds

@@ -117,14 +117,22 @@ type CredentialSplitReport struct {
 }
 
 // The pass reads each parent together with its credential row, including
-// tombstoned parents: a deleted user's hash and a revoked token's hash are
-// still secrets, and a deleted admin can be reinstated with its hash.
+// tombstoned users and tokens: a deleted user's hash and a revoked token's hash
+// are still secrets, and a deleted admin can be reinstated with its hash.
+//
+// Removed HOSTS are the exception. `lv host rm` leaves hosts.ipmi_pass in place
+// (the old column is what a previous-release node reads) and retires the
+// credential row to a tombstone (retireFenceCredential). A tombstone is not a
+// live row, so needsCopy() would copy the old column straight back with
+// deleted_at = NULL, and the next pass would replicate the removed machine's BMC
+// password cluster-wide. Nothing reinstates a removed host's password: a
+// re-admission under the name resets ipmi_pass to NULL.
 const (
 	hostCredentialSplitScanSQL = `SELECT h.name AS pk, h.ipmi_pass AS old_val, h.updated_at AS src_ts,
 		       c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
 		       c.deleted_at AS cred_deleted
 		  FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name
-		 WHERE h.ipmi_pass IS NOT NULL AND h.ipmi_pass != ''`
+		 WHERE h.deleted_at IS NULL AND h.ipmi_pass IS NOT NULL AND h.ipmi_pass != ''`
 	userCredentialSplitScanSQL = `SELECT u.username AS pk, u.password_hash AS old_val, u.updated_at AS src_ts,
 		       c.username AS cred_key, c.password_hash AS cred_val, c.updated_at AS cred_ts,
 		       c.deleted_at AS cred_deleted

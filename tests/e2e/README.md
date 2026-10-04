@@ -175,6 +175,12 @@ destination minted on re-add). Drills 1, 2, 3 and 5 each end with a
 `disk rows follow the replacement` subtest that skips for N7 (failover leaves
 `vm_disks` naming the old host).
 
+Run past its skip (`E2E_FIXED=N3,N4`) on main-07196394, drill 6 goes red
+for N3 (every reschedule refused with `missing_witness` until a third host
+joins) and can also go red for R1: a coordinator SSH-fences a rebuilt host
+seconds after its `lv host add`, powering it off. Its restore powers such a
+host back on and carries on.
+
 Drill 4 can also fail, without a skip, on finding P1: after the owner's
 `enforcement.partition_pause` goes off, the coordinator still relies on its
 pause, because it reads the owner's LAST cached Ping

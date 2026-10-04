@@ -280,6 +280,21 @@ func (d *d6) addBack() bool {
 		if d.added[h] {
 			continue
 		}
+		if !l.isUp(h) { // a cleanup resuming after R1 powered it off
+			if _, err := l.labsh(2*time.Minute, nil, "up", l.nums([]string{h})[0]); err != nil {
+				l.t.Errorf("power on %s: %v", h, err)
+			}
+			l.closeMaster(h)
+		}
+		if out, _ := l.ssh(d.via, 2*time.Minute, shellQuote(l.lvPath)+" host ls"); strings.Contains(out, h+" ") {
+			// Added already (an earlier attempt got that far): just wait for it.
+			if err := l.waitDaemon(h, 5*time.Minute); err != nil {
+				l.t.Errorf("%v", err)
+				return false
+			}
+			d.added[h] = true
+			continue
+		}
 		ip := l.ip[h]
 		l.ssh(d.via, 20*time.Second, "ssh-keygen -R "+ip+" >/dev/null 2>&1; true")
 		out, err := l.ssh(d.via, 15*time.Minute, shellQuote(l.lvPath)+" host add root@"+ip+" --name "+h)
@@ -287,6 +302,17 @@ func (d *d6) addBack() bool {
 		if err != nil {
 			l.t.Errorf("host add %s: %v", h, err)
 			return false
+		}
+		// Watch the join: finding R1 is a coordinator SSH-fencing a host in the
+		// seconds after its add (the probe failures it counted while the host
+		// was being installed carry over), which powers the rebuilt node off.
+		time.Sleep(30 * time.Second)
+		if !l.isUp(h) {
+			l.t.Errorf("R1: %s was powered off right after `lv host add` (fenced during its join; see the coordinators' fencing_log)", h)
+			if err := l.powerOn(h); err != nil {
+				l.t.Errorf("power %s back on: %v", h, err)
+				return false
+			}
 		}
 		if err := l.waitDaemon(h, 5*time.Minute); err != nil {
 			l.t.Errorf("host add %s: %v", h, err)

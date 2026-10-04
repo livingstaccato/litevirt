@@ -124,8 +124,7 @@ func TestColdFirmwareHandoff_CancelMidHandoffKeepsVMAndDisksTogether(t *testing.
 		t.Fatalf("create trigger: %v", err)
 	}
 
-	err := s.handOffColdFirmwareVM(ctx, vm, &corrosion.HostRecord{Name: "t1"},
-		firmwareSpec{SecureBoot: true, Firmware: "uefi", UUID: "u1"})
+	err := s.handOffColdFirmwareVM(ctx, vm, &corrosion.HostRecord{Name: "t1"})
 	if err == nil {
 		t.Fatal("the handoff reported success although it was cancelled mid-write")
 	}
@@ -155,8 +154,7 @@ func TestColdFirmwareHandoff_InterruptedHandoffKeepsVMAndDisksTogether(t *testin
 		}
 	}
 
-	err := s.handOffColdFirmwareVM(adminCtx(), vm, &corrosion.HostRecord{Name: "t1"},
-		firmwareSpec{SecureBoot: true, Firmware: "uefi", UUID: "u1"})
+	err := s.handOffColdFirmwareVM(adminCtx(), vm, &corrosion.HostRecord{Name: "t1"})
 	if err == nil {
 		t.Fatal("the handoff reported success although the VM row never moved")
 	}
@@ -168,8 +166,7 @@ func TestColdFirmwareHandoff_InterruptedHandoffKeepsVMAndDisksTogether(t *testin
 // epoch exactly once.
 func TestColdFirmwareHandoff_MovesVMAndDisksTogether(t *testing.T) {
 	s, vm, disks := coldFirmwareHandoffFixture(t)
-	if err := s.handOffColdFirmwareVM(adminCtx(), vm, &corrosion.HostRecord{Name: "t1"},
-		firmwareSpec{SecureBoot: true, Firmware: "uefi", UUID: "u1"}); err != nil {
+	if err := s.handOffColdFirmwareVM(adminCtx(), vm, &corrosion.HostRecord{Name: "t1"}); err != nil {
 		t.Fatalf("handoff: %v", err)
 	}
 	ctx := context.Background()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -182,5 +183,13 @@ func TestInstallMigrationTLS_RefusesDuringARotation(t *testing.T) {
 	err := InstallMigrationTLS(context.Background(), pkiDir, nil, true, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "rotate-migration-ca") {
 		t.Fatalf("err = %v; want a refusal naming rotate-migration-ca", err)
+	}
+}
+
+// Mutation: make Push return nil — the rotation would mark it done.
+func TestUnreachableMigrationHost_PushFailsWithTheCause(t *testing.T) {
+	h := &unreachableMigrationHost{"node-3", "10.0.0.3", errors.New("no route")}
+	if err := h.Push(context.Background(), nil); err == nil || !strings.Contains(err.Error(), "no route") {
+		t.Fatalf("err = %v", err)
 	}
 }

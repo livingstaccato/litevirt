@@ -1045,10 +1045,24 @@ message GarbageCollectBackupRepoResponse {
 
 // BackupRepoSnapshot is one manifest as a prune plan names it.
 message BackupRepoSnapshot {
-    string timestamp  = 1;
-    string vm_name    = 2;
-    string disk_name  = 3;
-    int64  total_size = 4;
+    string timestamp   = 1;
+    string vm_name     = 2;
+    string disk_name   = 3;
+    int64  total_size  = 4;
+    int32  chunk_count = 5;  // set by ListBackupRepoSnapshots
+    string based_on    = 6;  // incremental parent timestamp; empty for a full snapshot
+}
+
+// ListBackupRepoSnapshots lists the snapshots in a repo the daemon holds. A
+// repo holds every project's backups, so it is checked at `/` (verb
+// backup.read, legacy floor viewer), and `repo` resolves exactly as for the
+// maintenance RPCs: a registered name, or an absolute path only for an admin.
+message ListBackupRepoSnapshotsRequest {
+    string repo = 1;
+}
+message ListBackupRepoSnapshotsResponse {
+    string                      encryption = 1;
+    repeated BackupRepoSnapshot snapshots  = 2;
 }
 
 message PruneBackupRepoRequest {
@@ -3023,6 +3037,9 @@ service LiteVirt {
     rpc GarbageCollectBackupRepo(GarbageCollectBackupRepoRequest) returns (GarbageCollectBackupRepoResponse);
     rpc PruneBackupRepo(PruneBackupRepoRequest)                   returns (PruneBackupRepoResponse);
     rpc SyncBackupRepo(SyncBackupRepoRequest)                     returns (SyncBackupRepoResponse);
+    // The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
+    // a read, so not audited.
+    rpc ListBackupRepoSnapshots(ListBackupRepoSnapshotsRequest)   returns (ListBackupRepoSnapshotsResponse);
 
     // ── Containers ──
     rpc CreateContainer(CreateContainerRequest) returns (Container);

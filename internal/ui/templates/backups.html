@@ -29,7 +29,7 @@
         <div class="alert alert-error" style="margin-top:10px">{{.Error}}</div>
       {{else}}
         <div class="actions" style="margin-top:12px;flex-wrap:wrap">
-          <a class="btn btn-sm" href="/backups?repo={{.Path}}">Browse</a>
+          <a class="btn btn-sm" href="/backups?repo={{.Name}}">Browse</a>
           <button class="btn btn-sm" hx-post="/ui/backups/verify?repo={{.Name}}">Verify</button>
           <button class="btn btn-sm" hx-post="/ui/backups/gc?repo={{.Name}}" hx-confirm="Garbage-collect unreferenced chunks in {{.Name}}?">GC</button>
           <button class="btn btn-sm" hx-get="/ui/backups/prune-modal?repo={{.Name}}" hx-target="body" hx-swap="beforeend">Prune</button>
@@ -55,14 +55,14 @@
       {{range .Manifests}}
         <tr>
           <td class="mono" style="font-size:11px">{{.Timestamp}}</td>
-          <td>{{.VMName}}</td>
+          <td>{{.VmName}}</td>
           <td>{{if .DiskName}}{{.DiskName}}{{else}}root{{end}}</td>
           <td>{{formatBytes .TotalSize}}</td>
-          <td>{{len .Chunks}}</td>
+          <td>{{.ChunkCount}}</td>
           <td>{{if .BasedOn}}<span class="badge badge-blue">incremental</span>{{else}}<span class="badge badge-gray">full</span>{{end}}</td>
           <td class="actions">
-            <button class="btn btn-sm" hx-get="/ui/backups/restore-from-modal?repo={{$.RepoPath}}&vm={{.VMName}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">{{icon "restore"}} Restore</button>
-            <button class="btn btn-sm" hx-get="/ui/backups/restore-live-modal?repo={{$.RepoPath}}&vm={{.VMName}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">Live</button>
+            <button class="btn btn-sm" hx-get="/ui/backups/restore-from-modal?repo={{$.RepoPath}}&vm={{.VmName}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">{{icon "restore"}} Restore</button>
+            <button class="btn btn-sm" hx-get="/ui/backups/restore-live-modal?repo={{$.RepoPath}}&vm={{.VmName}}&disk={{.DiskName}}&ts={{.Timestamp}}" hx-target="body" hx-swap="beforeend">Live</button>
           </td>
         </tr>
       {{end}}

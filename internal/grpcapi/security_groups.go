@@ -28,7 +28,10 @@ import (
 // sg.read only. A cluster with no role bindings falls back to the legacy
 // operator role.
 
-const sgWriteVerb = "sg.write"
+const (
+	sgWriteVerb = "sg.write"
+	sgReadVerb  = "sg.read"
+)
 
 func (s *Server) requireSGWrite(ctx context.Context) error {
 	return s.RequirePerm(ctx, "/", sgWriteVerb, "operator")
@@ -144,4 +147,38 @@ func (s *Server) RemoveSecurityGroupRule(ctx context.Context, req *pb.RemoveSecu
 	s.audit(ctx, "sg.rule.rm", req.Id, corrosion.AuditChange(before, corrosion.AuditStateNone), "ok")
 	s.reconcileLocal(ctx)
 	return &emptypb.Empty{}, nil
+}
+
+// ListSecurityGroups lists security groups and, with include_rules, every rule
+// of the groups it lists. It checks sg.read at the cluster root, the path the
+// writes check sg.write at: every built-in role holding *.read or sg.read
+// passes, and a token scoped below "/" does not, since a group is
+// cluster-global and its rules name addresses and ports anywhere in the
+// cluster. The web UI's security-group page and Add-NIC modal read through
+// this with the session's bearer.
+func (s *Server) ListSecurityGroups(ctx context.Context, req *pb.ListSecurityGroupsRequest) (*pb.ListSecurityGroupsResponse, error) {
+	if err := s.RequirePerm(ctx, "/", sgReadVerb, "viewer"); err != nil {
+		return nil, err
+	}
+	groups, err := corrosion.ListSecurityGroups(ctx, s.db, req.GetStackName())
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list security groups: %v", err)
+	}
+	resp := &pb.ListSecurityGroupsResponse{Groups: make([]*pb.SecurityGroup, 0, len(groups))}
+	for _, g := range groups {
+		resp.Groups = append(resp.Groups, toPbSecurityGroup(g))
+		if !req.GetIncludeRules() {
+			continue
+		}
+		rules, err := corrosion.ListSGRules(ctx, s.db, g.ID)
+		if err != nil {
+			// A page that showed the group with no rules would read as "this
+			// group allows nothing", which is not what the host enforces.
+			return nil, status.Errorf(codes.Internal, "list rules of security group %s: %v", g.ID, err)
+		}
+		for _, r := range rules {
+			resp.Rules = append(resp.Rules, toPbSGRule(r))
+		}
+	}
+	return resp, nil
 }

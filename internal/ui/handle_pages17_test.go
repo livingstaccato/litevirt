@@ -14,13 +14,11 @@ import (
 	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
-// TestHandleSecurityGroups_Empty renders the page with no SGs in the
-// DB — the empty-state CTA should appear so brand-new clusters have a
-// hint instead of a blank table.
+// TestHandleSecurityGroups_Empty renders the page with no SGs — the
+// empty-state CTA should appear so brand-new clusters have a hint instead of a
+// blank table.
 func TestHandleSecurityGroups_Empty(t *testing.T) {
 	s := newTestUIServer(t, newDefaultMock())
-	db := newCorrosionForUITest(t)
-	s.SetCorrosionDB(db)
 
 	r := withAuth(httptest.NewRequest(http.MethodGet, "/security-groups", nil))
 	w := serveRequest(s, r)
@@ -30,25 +28,27 @@ func TestHandleSecurityGroups_Empty(t *testing.T) {
 	mustContain(t, w.Body.String(), "No security groups defined", "Create group")
 }
 
-// TestHandleSecurityGroups_RendersRows seeds two SGs with rules and
-// asserts both appear with their rule lines.
+// TestHandleSecurityGroups_RendersRows lists two SGs and their rules from
+// ListSecurityGroups and asserts each rule lands under its own group.
 func TestHandleSecurityGroups_RendersRows(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
-	db := newCorrosionForUITest(t)
-	s.SetCorrosionDB(db)
-	ctx := context.Background()
-	if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg-web", Name: "web"}); err != nil {
-		t.Fatalf("InsertSecurityGroup: %v", err)
+	m := newDefaultMock()
+	m.listSGsResp = &pb.ListSecurityGroupsResponse{
+		Groups: []*pb.SecurityGroup{{Id: "sg-web", Name: "web"}, {Id: "sg-db", Name: "db", StackName: "shop"}},
+		Rules: []*pb.SecurityGroupRule{
+			{Id: "r1", SgId: "sg-web", Direction: "ingress", Proto: "tcp", Port: "443", Action: "accept"},
+			{Id: "r2", SgId: "sg-db", Direction: "egress", Proto: "udp", Port: "53", Cidr: "10.0.0.0/8", Action: "drop"},
+		},
 	}
-	if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{
-		ID: "r1", SGID: "sg-web", Direction: "ingress", Proto: "tcp", PortRange: "443", Action: "accept",
-	}); err != nil {
-		t.Fatalf("InsertSGRule: %v", err)
-	}
+	s := newTestUIServer(t, m)
 
 	r := withAuth(httptest.NewRequest(http.MethodGet, "/security-groups", nil))
-	w := serveRequest(s, r)
-	mustContain(t, w.Body.String(), "web", "ingress", "tcp", "443", "accept")
+	body := serveRequest(s, r).Body.String()
+	mustContain(t, body, "web", "ingress", "tcp", ":443", "accept", "stack shop", ":53", "10.0.0.0/8", "drop")
+	web, db := strings.Index(body, "sg-web"), strings.Index(body, "sg-db")
+	r1, r2 := strings.Index(body, "rules/r1"), strings.Index(body, "rules/r2")
+	if web < 0 || db < 0 || r1 < 0 || r2 < 0 || !(web < r1 && r1 < db && db < r2) {
+		t.Errorf("rules not rendered under their own groups (sg-web@%d r1@%d sg-db@%d r2@%d)", web, r1, db, r2)
+	}
 }
 
 // TestHandleContainers_Empty exercises the empty-state branch via the

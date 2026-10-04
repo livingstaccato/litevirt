@@ -1654,6 +1654,18 @@ message CreateSecurityGroupRequest     { string name = 1; string stack_name = 2;
 message DeleteSecurityGroupRequest     { string id = 1; }  // tombstones the group and its rules
 message AddSecurityGroupRuleRequest    { SecurityGroupRule rule = 1; }  // rule.id is ignored
 message RemoveSecurityGroupRuleRequest { string id = 1; }  // the RULE id
+// ListSecurityGroups is the read twin of the four above: sg.read at the cluster
+// root, the same path they check sg.write at. The web UI's security-group pages
+// read through it with the session's bearer, so a scoped token or a session
+// without sg.read gets the daemon's refusal rather than every group and rule.
+message ListSecurityGroupsRequest {
+    string stack_name    = 1;  // empty = every group
+    bool   include_rules = 2;  // also return every rule of the listed groups
+}
+message ListSecurityGroupsResponse {
+    repeated SecurityGroup     groups = 1;
+    repeated SecurityGroupRule rules  = 2;  // only with include_rules; each names its group in sg_id
+}
 
 // ── Storage ──
 message ListStoragePoolsRequest {}
@@ -3151,6 +3163,7 @@ service LiteVirt {
     rpc DeleteSecurityGroup(DeleteSecurityGroupRequest)             returns (google.protobuf.Empty);
     rpc AddSecurityGroupRule(AddSecurityGroupRuleRequest)           returns (SecurityGroupRule);
     rpc RemoveSecurityGroupRule(RemoveSecurityGroupRuleRequest)     returns (google.protobuf.Empty);
+    rpc ListSecurityGroups(ListSecurityGroupsRequest)               returns (ListSecurityGroupsResponse);
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);

@@ -232,6 +232,13 @@ older than these RPCs the four commands fail with an error saying to upgrade
 litevirtd; they do not fall back to writing the database. `lv sg ls` and
 `lv sg rule-ls` are reads and still query the local database.
 
+The web UI reads security groups through the `ListSecurityGroups` RPC with the
+session's bearer, never from its local database. It checks the `sg.read` verb
+at `/` (every built-in role with `*.read` or `sg.read` holds it; with no role
+bindings, any viewer), so a token scoped to a project, or a grant below the
+cluster root, gets a 403 on `/security-groups` and no group names in the
+Add-NIC dialog.
+
 ## Default-deny rollout
 
 Switching a running cluster to default-deny is risky if a rule is

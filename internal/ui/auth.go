@@ -86,6 +86,14 @@ func (s *Server) sessionValid(w http.ResponseWriter, r *http.Request) bool {
 		// that trade is deliberate. Letting a WRITE through means the one
 		// component that knows the caller's role is unreachable and the write
 		// lands anyway, which is not a trade — it is the check being optional.
+		//
+		// The read trade is safe only because no read handler serves data the
+		// daemon did not hand THIS session: every read is an RPC called with
+		// the session's bearer, so a revoked or expired session gets the RPC's
+		// refusal, not the data. TestNoUIHandlerReadsReplicatedStateAroundItsRPC
+		// keeps in-process reads out, and
+		// TestUIReads_DuringAWhoamiOutageADeadSessionGetsNoData drives every GET
+		// route through this branch with a dead session.
 		if mutating {
 			slog.Warn("ui: refusing a mutation because the caller's role could not be verified",
 				"method", r.Method, "path", r.URL.Path, "error", err)

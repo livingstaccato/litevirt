@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"context"
 	"html/template"
 	"net/http"
 	"net/url"
@@ -9,7 +8,6 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // ── Cluster ──────────────────────────────────────────────────────────────────
@@ -834,13 +832,9 @@ func newHardwareTestServer(t *testing.T) (*Server, *mockGRPC) {
 	t.Helper()
 	mock := newDefaultMock()
 	s := newTestUIServer(t, mock)
-	db := newCorrosionForUITest(t)
-	s.SetCorrosionDB(db)
-	for _, name := range []string{"web", "ssh"} {
-		if err := corrosion.InsertSecurityGroup(context.Background(), db, corrosion.SecurityGroup{ID: name, Name: name}); err != nil {
-			t.Fatalf("InsertSecurityGroup(%s): %v", name, err)
-		}
-	}
+	mock.listSGsResp = &pb.ListSecurityGroupsResponse{Groups: []*pb.SecurityGroup{
+		{Id: "web", Name: "web"}, {Id: "ssh", Name: "ssh"},
+	}}
 	return s, mock
 }
 

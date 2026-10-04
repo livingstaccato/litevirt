@@ -21,7 +21,7 @@ import (
 // MigrationTLSStatusFunc asks the cluster for every host's migration-TLS view.
 type MigrationTLSStatusFunc func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error)
 
-// RotateMigrationCAOptions are `lv host rotate-migration-ca`'s flags. // ci:skip-cmd: rotate-migration-ca ships in a later task
+// RotateMigrationCAOptions are `lv host rotate-migration-ca`'s flags.
 type RotateMigrationCAOptions struct {
 	NoOverlap bool
 	Force     bool
@@ -173,7 +173,7 @@ func pushRotationPhase(ctx context.Context, pkiDir, phase string, h MigrationTLS
 
 func skipOrStop(pkiDir string, r *migrationRotation, host string, cause error, force bool) error {
 	if !force {
-		return fmt.Errorf("%s: %w. Progress is saved; re-run `lv host rotate-migration-ca` once it "+ // ci:skip-cmd: rotate-migration-ca ships in a later task
+		return fmt.Errorf("%s: %w. Progress is saved; re-run `lv host rotate-migration-ca` once it "+
 			"is reachable, or pass --force to leave it behind", host, cause)
 	}
 	if r.Skipped == nil {

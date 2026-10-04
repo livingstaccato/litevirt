@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -67,5 +68,43 @@ func TestMigrationTLSProblems_CASetMismatchDuringARotation(t *testing.T) {
 	got := strings.Join(migrationTLSProblems(rows, false, now), "\n")
 	if !strings.Contains(got, "rotate-migration-ca") {
 		t.Errorf("not rotating: %q does not mention that a rotation may be running", got)
+	}
+}
+
+// TestMigrationTLSRowsJSON_TimestampsAreRFC3339 pins the protojson fix: --json
+// must render a google.protobuf.Timestamp as a readable RFC 3339 string, not
+// plain encoding/json's {"seconds":...,"nanos":...} — expiry dates are the
+// whole point of the command.
+//
+// Mutation: switch migrationTLSRowsJSON back to plain encoding/json (e.g.
+// json.Marshal(r) instead of opts.Marshal(r)) — cert_not_after then decodes as
+// a map, not a string, and this test goes red.
+func TestMigrationTLSRowsJSON_TimestampsAreRFC3339(t *testing.T) {
+	when := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	rows := []*pb.MigrationTLSHostStatus{row("a", "x", when, "x")}
+
+	b, err := migrationTLSRowsJSON(rows)
+	if err != nil {
+		t.Fatalf("migrationTLSRowsJSON: %v", err)
+	}
+
+	var arr []map[string]any
+	if err := json.Unmarshal(b, &arr); err != nil {
+		t.Fatalf("output does not parse as a JSON array: %v\n%s", err, b)
+	}
+	if len(arr) != 1 {
+		t.Fatalf("got %d row(s); want 1", len(arr))
+	}
+
+	got, ok := arr[0]["cert_not_after"].(string)
+	if !ok {
+		t.Fatalf("cert_not_after = %#v, want an RFC 3339 string", arr[0]["cert_not_after"])
+	}
+	parsed, err := time.Parse(time.RFC3339, got)
+	if err != nil {
+		t.Fatalf("cert_not_after %q is not RFC 3339: %v", got, err)
+	}
+	if !parsed.Equal(when) {
+		t.Errorf("cert_not_after = %v, want %v", parsed, when)
 	}
 }

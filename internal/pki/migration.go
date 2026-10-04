@@ -1,6 +1,7 @@
 package pki
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -13,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/secretfile"
@@ -153,6 +155,25 @@ func GenerateMigrationCA(certPath, keyPath string) error {
 	return writePEM(keyPath, "EC PRIVATE KEY", keyDER)
 }
 
+// upToDate reports whether path already holds data with mode and, when uid is
+// not -1, that owner. The installer runs before every storage migration;
+// rewriting unchanged files would let two concurrent runs tear each other's
+// pair.
+func upToDate(path string, data []byte, mode os.FileMode, uid, gid int) bool {
+	st, err := os.Stat(path)
+	if err != nil || st.Mode().Perm() != mode {
+		return false
+	}
+	if uid >= 0 {
+		sys, ok := st.Sys().(*syscall.Stat_t)
+		if !ok || int(sys.Uid) != uid || int(sys.Gid) != gid {
+			return false
+		}
+	}
+	have, err := os.ReadFile(path)
+	return err == nil && bytes.Equal(have, data)
+}
+
 // InstallQemuMigrationTLS copies this host's migration credentials from
 // pkiDir/migration into qemuDir under the names libvirt reads for migration TLS.
 // The keys are written 0400 and, when keyUID >= 0, owned by keyUID:keyGID (the
@@ -205,6 +226,9 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 			// Owned by the QEMU user before it is renamed into place, so the key
 			// is never readable by anyone else, even briefly.
 			uid, gid = keyUID, keyGID
+		}
+		if upToDate(path, f.data, f.mode, uid, gid) {
+			continue
 		}
 		if err := secretfile.WriteOwned(path, f.data, f.mode, uid, gid); err != nil {
 			return false, fmt.Errorf("install %s: %w", path, err)

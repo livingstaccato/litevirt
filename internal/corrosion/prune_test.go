@@ -8,6 +8,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/litevirt/litevirt/internal/hlc"
 )
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -353,6 +355,28 @@ func TestPruneRebalanceProposals(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("after prune: %v remain, want %v", got, want)
 		}
+	}
+}
+
+// updated_at is the LWW key, an HLC string once hlc_lww is on. Retention must
+// read it as an instant: lexically every HLC "17…" stamp sorts below an RFC3339
+// cutoff, so a proposal that went terminal a minute ago would be deleted at once.
+func TestPruneRebalanceProposals_ReadsHLCStampsAsInstants(t *testing.T) {
+	defer func(orig time.Duration) { RebalanceProposalRetention = orig }(RebalanceProposalRetention)
+	RebalanceProposalRetention = 7 * 24 * time.Hour
+
+	c := newPruneTestClient(t)
+	stamp := func(ago time.Duration) string {
+		return hlc.Timestamp{PhysicalMS: time.Now().Add(-ago).UnixMilli(), NodeID: "n1"}.String()
+	}
+	insertProposal(t, c, "hlc-new-applied", "applied", stamp(time.Minute))     // terminal + fresh → keep
+	insertProposal(t, c, "hlc-old-applied", "applied", stamp(30*24*time.Hour)) // terminal + old → drop
+
+	NewReplicator(c, "", RelayConfig{}).pruneRebalanceProposals(context.Background())
+
+	got := proposalIDs(t, c)
+	if len(got) != 1 || got[0] != "hlc-new-applied" {
+		t.Fatalf("after prune: %v remain, want [hlc-new-applied]", got)
 	}
 }
 

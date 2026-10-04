@@ -147,3 +147,58 @@ func TestStore_DiskInfo_NotFound(t *testing.T) {
 		t.Error("expected error for non-existent file")
 	}
 }
+
+// Everything deleted must be something the candidate list named.
+//
+// DeleteVMDisksIn used to finish with os.RemoveAll of the legacy per-VM
+// directory: a recursive delete no candidate list contained and no reference
+// check ever saw, sitting under a comment promising that one listing drove both
+// the protection and the deletion. A legacy disk another VM still referenced
+// was destroyed by a call whose keep set said to spare it.
+func TestStore_LegacyDirectoryContentsGoThroughTheKeepSet(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir)
+	s.Init()
+
+	legacyDir := filepath.Join(dir, "disks", "test-vm")
+	if err := os.MkdirAll(legacyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	protected := filepath.Join(legacyDir, "root.qcow2")
+	debris := filepath.Join(legacyDir, "scratch.qcow2")
+	for _, p := range []string{protected, debris} {
+		if err := os.WriteFile(p, []byte("disk"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	candidates, err := s.VMDiskCandidates("test-vm")
+	if err != nil {
+		t.Fatalf("VMDiskCandidates: %v", err)
+	}
+	named := map[string]bool{}
+	for _, c := range candidates {
+		named[c] = true
+	}
+	if !named[protected] || !named[debris] {
+		t.Fatalf("the candidate list does not name the legacy directory's files (%v); anything "+
+			"the delete removes that this list omits is removed unprotected", candidates)
+	}
+
+	if err := s.DeleteVMDisksIn("test-vm", candidates, map[string]bool{protected: true}); err != nil {
+		t.Fatalf("DeleteVMDisksIn: %v", err)
+	}
+
+	if _, err := os.Stat(protected); err != nil {
+		t.Errorf("a legacy disk the keep set protected was deleted anyway (%v) — another VM may "+
+			"still name it as a backing file", err)
+	}
+	if _, err := os.Stat(debris); !os.IsNotExist(err) {
+		t.Errorf("unprotected legacy debris survived (%v); the sweep did nothing, so this test "+
+			"proves nothing about what it spares", err)
+	}
+	// The directory stays while something protected is still inside it.
+	if _, err := os.Stat(legacyDir); err != nil {
+		t.Errorf("the legacy directory was removed while a protected disk was still in it: %v", err)
+	}
+}

@@ -227,6 +227,7 @@ const (
 	LiteVirt_EnsureCloudInit_FullMethodName            = "/litevirt.v1.LiteVirt/EnsureCloudInit"
 	LiteVirt_EnsureDisks_FullMethodName                = "/litevirt.v1.LiteVirt/EnsureDisks"
 	LiteVirt_EnsureFirmwareState_FullMethodName        = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
+	LiteVirt_RollbackFirmwareState_FullMethodName      = "/litevirt.v1.LiteVirt/RollbackFirmwareState"
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
 	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
@@ -612,7 +613,8 @@ type LiteVirtClient interface {
 	// ── Internal: Migration helpers ──
 	EnsureCloudInit(ctx context.Context, in *EnsureCloudInitRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	EnsureDisks(ctx context.Context, in *EnsureDisksRequest, opts ...grpc.CallOption) (*EnsureDisksResponse, error)
-	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*EnsureFirmwareStateResponse, error)
+	RollbackFirmwareState(ctx context.Context, in *RollbackFirmwareStateRequest, opts ...grpc.CallOption) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
@@ -3123,10 +3125,20 @@ func (c *liteVirtClient) EnsureDisks(ctx context.Context, in *EnsureDisksRequest
 	return out, nil
 }
 
-func (c *liteVirtClient) EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *liteVirtClient) EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*EnsureFirmwareStateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(EnsureFirmwareStateResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_EnsureFirmwareState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) RollbackFirmwareState(ctx context.Context, in *RollbackFirmwareStateRequest, opts ...grpc.CallOption) (*RollbackFirmwareStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RollbackFirmwareStateResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_RollbackFirmwareState_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4200,7 +4212,8 @@ type LiteVirtServer interface {
 	// ── Internal: Migration helpers ──
 	EnsureCloudInit(context.Context, *EnsureCloudInitRequest) (*emptypb.Empty, error)
 	EnsureDisks(context.Context, *EnsureDisksRequest) (*EnsureDisksResponse, error)
-	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*emptypb.Empty, error)
+	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*EnsureFirmwareStateResponse, error)
+	RollbackFirmwareState(context.Context, *RollbackFirmwareStateRequest) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
 	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
@@ -5059,8 +5072,11 @@ func (UnimplementedLiteVirtServer) EnsureCloudInit(context.Context, *EnsureCloud
 func (UnimplementedLiteVirtServer) EnsureDisks(context.Context, *EnsureDisksRequest) (*EnsureDisksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnsureDisks not implemented")
 }
-func (UnimplementedLiteVirtServer) EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*emptypb.Empty, error) {
+func (UnimplementedLiteVirtServer) EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*EnsureFirmwareStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method EnsureFirmwareState not implemented")
+}
+func (UnimplementedLiteVirtServer) RollbackFirmwareState(context.Context, *RollbackFirmwareStateRequest) (*RollbackFirmwareStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RollbackFirmwareState not implemented")
 }
 func (UnimplementedLiteVirtServer) CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CleanupMigrationArtifacts not implemented")
@@ -8763,6 +8779,24 @@ func _LiteVirt_EnsureFirmwareState_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_RollbackFirmwareState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RollbackFirmwareStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).RollbackFirmwareState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_RollbackFirmwareState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).RollbackFirmwareState(ctx, req.(*RollbackFirmwareStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_CleanupMigrationArtifacts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CleanupMigrationArtifactsRequest)
 	if err := dec(in); err != nil {
@@ -10645,6 +10679,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "EnsureFirmwareState",
 			Handler:    _LiteVirt_EnsureFirmwareState_Handler,
+		},
+		{
+			MethodName: "RollbackFirmwareState",
+			Handler:    _LiteVirt_RollbackFirmwareState_Handler,
 		},
 		{
 			MethodName: "CleanupMigrationArtifacts",

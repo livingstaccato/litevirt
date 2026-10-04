@@ -2355,6 +2355,39 @@ message EnsureFirmwareStateRequest {
     bytes  bundle     = 3;  // firmware-state bundle (same format as the backup/snapshot sidecar)
     string domain_xml = 4;  // if set, DEFINE (shut off) the domain on the target after materializing firmware, so it's startable (G1)
     string source_firmware_fingerprint = 5;  // source's dataDir + OVMF path layout; the verbatim domain_xml is only portable if it matches the target's (G1)
+    // attempt_id names this migration attempt. The target records it against
+    // the domain and firmware it creates, and RollbackFirmwareState removes
+    // them only for the same attempt_id. An older target ignores it.
+    string attempt_id = 6;
+}
+
+// EnsureFirmwareStateResponse says what the call created on the target. It
+// replaced google.protobuf.Empty, which has no fields: an older target's reply
+// decodes as "defined nothing", and the source then leaves the target alone
+// and names the domain it may have left there.
+message EnsureFirmwareStateResponse {
+    // domain_defined: this call materialized the firmware state AND defined
+    // the domain, and recorded both under the request's attempt_id.
+    bool domain_defined = 1;
+}
+
+// RollbackFirmwareStateRequest asks a cold firmware migration's target to
+// undefine the domain and wipe the firmware state that EnsureFirmwareState
+// created for attempt_id, after that attempt failed before its handoff
+// committed. The target removes only what it recorded for that attempt: a
+// domain it found already defined, or one a different attempt created, is
+// left alone. An older target does not implement it, and the caller treats
+// Unimplemented as "nothing removed".
+message RollbackFirmwareStateRequest {
+    string vm_name    = 1;
+    string uuid       = 2;  // the VM's recorded firmware uuid (fwSpec.UUID)
+    string attempt_id = 3;  // the attempt_id the source sent to EnsureFirmwareState
+}
+
+message RollbackFirmwareStateResponse {
+    // removed: the target held this attempt's domain and firmware and
+    // removed both. False when it holds nothing of this attempt's.
+    bool removed = 1;
 }
 
 // CleanupMigrationArtifactsRequest removes the stub disks + cloud-init ISO that
@@ -3138,7 +3171,8 @@ service LiteVirt {
     // ── Internal: Migration helpers ──
     rpc EnsureCloudInit(EnsureCloudInitRequest)    returns (google.protobuf.Empty);
     rpc EnsureDisks(EnsureDisksRequest)            returns (EnsureDisksResponse);
-    rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (google.protobuf.Empty);
+    rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (EnsureFirmwareStateResponse);
+    rpc RollbackFirmwareState(RollbackFirmwareStateRequest) returns (RollbackFirmwareStateResponse);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
 

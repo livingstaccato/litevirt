@@ -570,6 +570,12 @@ type Server struct {
 	// a failed attempt (migrate_stubs.go). Zero value ready.
 	migrationStubs migrationStubLedger
 
+	// firmwareTargets is what EnsureFirmwareState defined on this host as a
+	// cold firmware migration target, by attempt: the only domains
+	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value
+	// ready.
+	firmwareTargets firmwareTargetLedger
+
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
 	vmLocksMu sync.Mutex

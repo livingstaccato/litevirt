@@ -5,9 +5,81 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
+
+// TestNoHandlerHoldsAVMLockAcrossAPeerForward is a source-level guard, and the
+// line-level twin of the AST scan below.
+//
+// A handler that takes the per-VM (or per-container) process lock and then
+// forwards to the owning host still holds that lock for the whole round trip.
+// Two nodes with a contradictory view of who owns a VM -- an in-flight
+// migration, a stale host_name -- each lock it and forward to the other, and
+// both block until the gRPC deadlines fire, with every other operation on that
+// VM queued behind them on both hosts.
+//
+// The AST scan tolerates a forward made under a BOUNDED context, so it passes
+// DeleteVM whether or not DeleteVM releases first. This scan does not, and is
+// the one that keeps DeleteVM's release in place.
+func TestNoHandlerHoldsAVMLockAcrossAPeerForward(t *testing.T) {
+	funcRe := regexp.MustCompile(`\nfunc \(s \*Server\) (\w+)\(`)
+	// releaseOnce(...) wraps the lock in the handlers that release before a
+	// forward; without the optional group this scan never saw them lock at all,
+	// and passed them whatever they did afterwards.
+	lockRe := regexp.MustCompile(`unlock\s*:=\s*(releaseOnce\()?s\.lock(VM|Container)\(`)
+	// One or two tabs: a STATEMENT-level release. The closure that defines
+	// releaseLock contains `unlock()` three tabs deep, and matching that would
+	// let a handler pass by merely declaring the helper it never calls.
+	// A trailing comment is allowed, because call sites carry one.
+	releaseRe := regexp.MustCompile("^\t{1,2}(releaseLock|releaseLocks|unlock)\\(\\)(\\s*//.*)?$")
+
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Clean(name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		text := string(src)
+		locs := funcRe.FindAllStringSubmatchIndex(text, -1)
+		for i, loc := range locs {
+			end := len(text)
+			if i+1 < len(locs) {
+				end = locs[i+1][0]
+			}
+			body := text[loc[0]:end]
+			fname := text[loc[2]:loc[3]]
+
+			lines := strings.Split(body, "\n")
+			lock, forward, release := -1, -1, -1
+			for n, l := range lines {
+				if lock < 0 && lockRe.MatchString(l) {
+					lock = n
+				}
+				if lock >= 0 && release < 0 && releaseRe.MatchString(l) {
+					release = n
+				}
+				if lock >= 0 && forward < 0 && strings.Contains(l, "s.peerClient(") {
+					forward = n
+				}
+			}
+			if lock >= 0 && forward > lock && (release < 0 || release > forward) {
+				t.Errorf("%s: %s takes a per-VM lock and forwards to a peer while still "+
+					"holding it; release before the forward, as the snapshot handlers do",
+					name, fname)
+			}
+		}
+	}
+}
 
 // A per-VM lock must never be held across a peer RPC.
 //
@@ -66,17 +138,27 @@ func TestNoPerVMLockIsHeldAcrossAPeerForward(t *testing.T) {
 			// releases nothing while that forward is in flight. Counting it was
 			// the bug in the first version of this scan, and it made the whole
 			// test pass against code that was plainly holding the lock.
+			//
+			// Nor do calls inside a function LITERAL: the closure that defines an
+			// idempotent releaseLock contains `unlock()`, and counting that call
+			// at the closure's position let a handler pass by declaring a
+			// release it never makes. The named release helpers count where they
+			// are CALLED instead.
 			var unlockPositions []token.Pos
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				if _, isDefer := n.(*ast.DeferStmt); isDefer {
+				switch n.(type) {
+				case *ast.DeferStmt, *ast.FuncLit:
 					return false
 				}
 				call, ok := n.(*ast.CallExpr)
 				if !ok {
 					return true
 				}
-				if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "unlock" {
-					unlockPositions = append(unlockPositions, call.Pos())
+				if id, ok := call.Fun.(*ast.Ident); ok {
+					switch id.Name {
+					case "unlock", "releaseLock", "releaseLocks":
+						unlockPositions = append(unlockPositions, call.Pos())
+					}
 				}
 				return true
 			})

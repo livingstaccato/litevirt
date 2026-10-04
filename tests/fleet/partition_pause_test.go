@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -68,11 +69,21 @@ func (g ppGate) Enforced(_ context.Context, tok string) bool {
 func (g ppGate) PeerSupportsFresh(context.Context, string, string) bool { return true }
 
 type ppNode struct {
-	n      *Node
-	chk    *health.Checker
-	pauser *health.PartitionPauser
-	coord  *failover.Coordinator
-	rec    *health.Reconciler
+	n       *Node
+	chk     *health.Checker
+	pauser  *health.PartitionPauser
+	coord   *failover.Coordinator
+	rec     *health.Reconciler
+	pauseOn *atomic.Bool
+}
+
+// setPartitionPause is an operator changing enforcement.partition_pause on
+// this node and restarting its daemon (the flag is read at startup; nothing
+// reloads it). What the restart changes, the scenario changes: the gRPC
+// server answers with the new flag and the pauser runs or does not.
+func (pn *ppNode) setPartitionPause(on bool) {
+	pn.pauseOn.Store(on)
+	pn.n.Server.SetPartitionPause(on)
 }
 
 type ppFence struct {
@@ -118,10 +129,12 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		chk.SetPeerReadiness(n.Server.PeerReady)
 		go chk.Start(ctx)
 
-		on := !o.pauseOff[n.Name]
+		on := &atomic.Bool{}
+		on.Store(!o.pauseOff[n.Name])
+		n.Server.SetPartitionPause(on.Load())
 		p := health.NewPartitionPauser(n.Name, dataDir, n.DB)
 		p.SetQuorum(chk.ExecutionQuorum)
-		p.SetEnabled(func() bool { return on })
+		p.SetEnabled(on.Load)
 		p.SetVMBackend(n.Virt)
 		p.SetResumeConfirmer(n.Server.CheckPartitionResume)
 		p.SetTimings(ppTPause, 100*time.Millisecond)
@@ -146,10 +159,11 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		coord.PartitionPauseEnforced = func(context.Context) bool { return latched }
 		coord.PauseWaitFor = ppWait
 		coord.LastContact = chk.LastContact
-		// The harness runs no capability sweep to fill the checker's Ping
-		// cache; every node in these scenarios runs the flag on.
-		pauseOn := o.pauseOff
-		coord.PeerAdvertised = func(peer, tok string) bool { return tok == capabilities.PartitionPauseV1 && !pauseOn[peer] }
+		// As the daemon wires them: the checker's probes ask each peer's
+		// Ready, whose answer carries the peer's own flag, and the pinger
+		// fills the Ping cache that nothing here may rely on.
+		chk.SetPeerPinger(n.Server.PeerCapabilities)
+		coord.PeerPausesOnLoss = n.Server.PeerPausesOnLoss
 		coord.QuorumRegain = chk.InQuorumRegainGraceFor
 
 		rec := health.NewReconciler(n.Name, dataDir, n.DB, n.Virt)
@@ -158,7 +172,7 @@ func newPPStack(t *testing.T, c *Cluster, o ppOpts) *ppStack {
 		rec.SetSettleVerifier(n.Server.VerifySettleProof)
 		rec.SetPeerRuntimeChecker(n.Server.CheckPeerVMRuntime)
 
-		pn := &ppNode{n: n, chk: chk, pauser: p, coord: coord, rec: rec}
+		pn := &ppNode{n: n, chk: chk, pauser: p, coord: coord, rec: rec, pauseOn: on}
 		s.nodes = append(s.nodes, pn)
 		// Reconcilers tick fast. Coordinators tick at about a second, each at
 		// its own phase: every node holds the lease in its own replica until
@@ -671,5 +685,83 @@ func TestFleet_PartitionPause_ResumeWithoutClaimsReadsTheVotersRows(t *testing.T
 	}
 	if st, _ := owner.Virt.RawState("pp-vm"); st != libvirtfake.StatePaused {
 		t.Fatalf("%s's copy is %s, want still paused", owner.Name, st)
+	}
+}
+
+// TestFleet_PartitionPause_FlagTurnedOffIsNotReliedOn is lab finding P1
+// (kvm003 drill 4, 2026-10-03): node-5 advertised partition_pause_v1, its
+// operator turned enforcement.partition_pause off and restarted it, and two
+// minutes later the coordinator on node-3 still logged "relying on the host's
+// partition pause … host=node-5". It read the host's last CACHED Ping, which
+// only proof replication refreshed, so the advertisement predated the restart.
+// Had node-5 been partitioned, the majority would have waited out a pause that
+// never came and then started a second copy beside the one node-5 still ran.
+//
+// Here the owner says it pauses, and the coordinator's Ping cache holds the
+// advertisement too (the scenario reads it through PeerSupports, as proof
+// replication does). The owner's flag then goes off with a restart, the
+// checkers go on probing it as they always do, and then the owner is cut off.
+// The coordinator must record its fence as the assumed fence it is, not as
+// one that relies on a pause.
+//
+// Mutations (each red on the assurance check, fence recorded self_paused):
+// rely on the cached Ping again (the old wiring, Checker.PeerAdvertisedLast,
+// was red here before the fix); keep a peer's first probe answer instead of
+// its latest (peerPauseAnswers.record never overwrites); report the flag
+// from build support instead of this run's config (Ready's partition_pause
+// always true).
+func TestFleet_PartitionPause_FlagTurnedOffIsNotReliedOn(t *testing.T) {
+	ctx := context.Background()
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, Relays: 5, RealGossip: true})
+	owner, decider := c.Nodes[0], c.Nodes[2]
+	insertVMPolicy(t, owner, "pp-off", owner.Name, "restart-any")
+	c.WaitConverged(t, convergeTimeout)
+	owner.Virt.SetState("pp-off", libvirtfake.StateRunning)
+	genesisByTick(t, c, decider)
+	enableRecoveryClaims(t, c)
+
+	s := newPPStack(t, c, ppOpts{latched: true, coordinators: map[string]bool{decider.Name: true}})
+	var target, coord *ppNode
+	for _, pn := range s.nodes {
+		switch pn.n {
+		case owner:
+			target = pn
+		case decider:
+			coord = pn
+		}
+	}
+
+	// The owner advertises the pause, and the coordinator would rely on it.
+	if !coord.chk.PeerSupports(ctx, owner.Name, capabilities.PartitionPauseV1) {
+		t.Fatalf("setup: %s does not advertise partition_pause_v1 with its flag on", owner.Name)
+	}
+	eventually(t, 10*time.Second, decider.Name+" to see "+owner.Name+"'s pause", func() bool {
+		return coord.coord.PeerPausesOnLoss(owner.Name)
+	})
+
+	// The operator turns the owner's flag off and restarts it. Its peers go
+	// on probing it, as they do every probe interval, for several cycles.
+	target.setPartitionPause(false)
+	time.Sleep(3 * health.ProbeInterval)
+
+	c.SplitGossip(c.Nodes[:1], c.Nodes[1:])
+	eventually(t, ppRecoverBound, "a fence of "+owner.Name+" in "+decider.Name+"'s fencing_log", func() bool {
+		rows, err := decider.DB.Query(ctx, `SELECT 1 FROM fencing_log WHERE host_name = ?`, owner.Name)
+		return err == nil && len(rows) > 0
+	})
+	rows, err := decider.DB.Query(ctx, `SELECT method, result, detail FROM fencing_log WHERE host_name = ?`, owner.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rows {
+		if a := corrosion.FenceAssuranceDetail(r.String("method"), r.String("result"), r.String("detail")); a != corrosion.FenceAssumed {
+			t.Errorf("%s recorded its fence of %s with assurance %s, want %s: it relied on a pause %s turned off before the partition",
+				decider.Name, owner.Name, a, corrosion.FenceAssumed, owner.Name)
+		}
+	}
+	// The owner's flag is off, so it pauses nothing: the copy the coordinator
+	// would have waited on is still running.
+	if _, ok := firstEvent(owner, "suspend", "pp-off"); ok {
+		t.Errorf("%s suspended pp-off with enforcement.partition_pause off", owner.Name)
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
@@ -1024,27 +1023,5 @@ func TestPartitionPause_LeavesAMigratingVMAlone(t *testing.T) {
 	f.loseFor(QuorumNo, PartitionPauseAfter+time.Second)
 	if st := f.raw("vm-ha"); st != libvirtfake.StateRunning {
 		t.Fatalf("a migrating VM is %s", st)
-	}
-}
-
-// PeerAdvertisedLast reads the last cached Ping, however old, and never
-// pings: the coordinator asks it about a host it has just found unreachable.
-//
-// Mutation: honour the cache TTL — the stale entry reads false and this goes
-// red; ignore the entry's tokens — the second check goes red.
-func TestPeerAdvertisedLast(t *testing.T) {
-	c := NewChecker("host-a", "/etc/litevirt/pki", testCheckHostDB(t))
-	if c.PeerAdvertisedLast("host-b", capabilities.PartitionPauseV1) {
-		t.Fatal("a peer never pinged reads as advertising")
-	}
-	c.mu.Lock()
-	c.peerCaps["host-b"] = peerCapEntry{caps: []string{capabilities.PartitionPauseV1}, fetchedAt: time.Now().Add(-time.Hour)}
-	c.peerCaps["host-c"] = peerCapEntry{caps: []string{capabilities.SplitBrainGateV1}, fetchedAt: time.Now()}
-	c.mu.Unlock()
-	if !c.PeerAdvertisedLast("host-b", capabilities.PartitionPauseV1) {
-		t.Fatal("an hour-old Ping that advertised the token reads false")
-	}
-	if c.PeerAdvertisedLast("host-c", capabilities.PartitionPauseV1) {
-		t.Fatal("a Ping without the token reads true")
 	}
 }

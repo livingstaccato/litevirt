@@ -506,16 +506,93 @@ All three of these must hold:
 
 - `partition_pause_v1` is latched (`Gate.Enforced`), and this coordinator's
   own flag is on. This is §5.
-- The TARGET host's own last cached Ping advertised `partition_pause_v1`
-  (`Checker.PeerAdvertisedLast`, which makes no RPC: the host has just been
+- The TARGET host's latest answer to this coordinator's health probe said it
+  pauses (`ReadyResponse.partition_pause`, read through
+  `grpcapi.Server.PeerPausesOnLoss`, which makes no RPC: the host has just been
   found unreachable). The latch alone is not enough: a host whose flag went off
-  after the latch stops advertising.
+  after the latch says so on its next probe.
 - The target host holds no open `partition_pause_failed` condition in the
   coordinator's replica.
 - The fence's assurance would otherwise be `assumed`.
 
 Otherwise the coordinator does exactly what it does today, and records
 `assumed`.
+
+**Why the latest probe answer, and not a cached Ping.** The first cut read
+the host's last cached Ping (`Checker.PeerAdvertisedLast`), which had no age
+bound. In steady state, only proof replication refreshed that cache
+(`PeerSupports`, in the replication gate), so it could be minutes older than
+the host's current config. On kvm003 (drill 4, 2026-10-03, finding P1), node-3
+logged "relying on the host's partition pause … host=node-5" two minutes after
+node-5's flag had gone off. Had node-5 been cut off, the majority would have
+recorded `self_paused` for a host that pauses nothing. The rule is sound only
+if the fact it relies on is the host's CURRENT config.
+
+What can change that config is narrow. `enforcement.partition_pause` is read
+once at startup, and nothing reloads it (there is no SIGHUP or reload path for
+`config.yaml`), so a change is always a restart. A restart is a new run of the
+daemon, and the question is whether the coordinator can have learned of the
+new run's flag before it relies on it. Three options:
+
+- **(a) Bound the advertisement's age by the last contact.** Rely only if the
+  cached Ping is no older than the coordinator's last successful probe of the
+  host. Sound only if something refreshes the cache on every contact, which is
+  (c) by another name. A fixed age bound alone (say 30 s) does not work: the
+  restart, the probe that reaches the new run and the partition can all land
+  inside it.
+- **(b) Replicate the flag.** The host writes its flag into a replicated row
+  and the coordinator reads its replica. Replication is exactly what is slow or
+  stalled around a partition, and the coordinator cannot tell a replica that
+  missed the host's last write from one that has it. It would also add a
+  statement shape and a schema change. It fails toward relying.
+- **(c) Carry the flag on every health probe.** Chosen. Every observer already
+  sends the host a `Ready` every probe interval (2 s), so the answer travels
+  on the RPC that defines contact itself, at no extra round trip. The
+  coordinator keeps each peer's LATEST answer, and its rule is "the host's
+  latest answer said it pauses". `Ready` reports the flag directly
+  (`enforcement.partition_pause` as this run holds it), not the whole
+  capability list, which is costlier to compute and is posture `Ping`
+  discloses separately.
+
+How (c) fails, case by case:
+
+- **Flag off and restart, then any contact, then the partition.** The first
+  probe that reaches the new run records `false`. The coordinator does not
+  rely. This is the lab case. `TestFleet_PartitionPause_FlagTurnedOffIsNotReliedOn`
+  pins it.
+- **The probe errors.** A call that never arrived says nothing about the
+  host, so the last answer stands. That is what reliance needs: the host was
+  last reached with the pause on, and is now unreachable.
+- **An older build answers.** It returns `Unimplemented`, or a response
+  without the field. Either reads as "does not pause". This costs the reliance
+  during a rolling upgrade, which is the pre-partition-pause behaviour.
+- **The answer names another host.** That is not this host's answer, and
+  reads as "does not pause".
+- **The coordinator restarts.** It has no answers until its first probe, so it
+  relies on nothing until then.
+- **The coordinator does not probe the target.** A non-voter coordinator
+  probes only the voters and a sample of non-voters (`probePlan`). For a
+  non-voter target outside that sample, it has no answer and does not rely.
+- **Two probes of one host are in flight.** For example, the checker's probe
+  and a `PeerUp`. The answer to the probe SENT later wins, whichever returns
+  first.
+
+**What the coordinator cannot know.** Suppose the flag is turned off, the
+daemon restarts, and the partition begins before any probe from the
+coordinator reaches the new run. Then the coordinator's latest answer comes
+from the old run, which said it pauses. No coordinator-side rule can close
+this: nothing about the new run reached the coordinator. The window runs from
+the old daemon stopping to the coordinator's next successful probe of the new
+one, at most one probe cycle after the new daemon starts serving.
+
+This window is F3 (§7) with the flag off. While the daemon is down nothing
+pauses, whichever flag it comes back with, and the majority waits `W` and
+recovers, as it does for a dead daemon (F1). A hardware watchdog does not
+close it, because the new daemon pets the watchdog. Layer 3 settles the
+duplicate when the host returns. The operator side of it is in §5: the
+documented stand-down is the flag off on EVERY host. A coordinator whose own
+flag is off relies on nothing, so this window exists only for a single host
+turned off while its peers keep theirs on.
 
 ### 4.4 More than 17 hosts
 
@@ -601,7 +678,8 @@ minority stops its copy, and the majority recovers as it always has.
   `PingResponse.not_enforcing` (`withheldStandDowns`, beside
   `recovery_claim_v1`), and its peers raise `ha_degraded`
   (unsupported_member). A coordinator also stops relying on that host's pause
-  the moment its Ping stops advertising the token (§4.3).
+  as soon as one of its health probes reaches the restarted host, which answers
+  that it does not pause (§4.3).
 - **Standing down in an incident** is `false` on every host and a restart.
   The coordinator relies on the pause only when its own flag is on AND the
   token is latched (`flag && Enforced`, the family rule) AND the target host
@@ -753,6 +831,7 @@ container (`split_brain`), so a certified relocation can only lead to a stop.
 | F6 | A host comes back before the deadline | The deadline check sees fresh healthy observers (`fenceStillStands` fails), and recovers nothing. The host's resume check passes once `recoverHosts` reactivates it. | If the lease moved in between, `recoverHosts` leaves the host `fenced` until `lv host undrain`, and its workloads stay paused until then, with `partition_paused` saying why. |
 | F7 | A fleet-wide blip | Everything pauses, then everything resumes. `partition_paused` is raised on every host and resolved. After the heal, every coordinator holds failure rows its peers wrote during the blip, about every host, and replication delivers them before the observers' first successful probes overwrite them. A coordinator therefore decides no new fence while the quorum its fence rests on is lost, or within `QuorumRegainGrace` (`StallGrace`, 10 s) of that quorum's own No→Yes transition (`error_class=quorum_regain`), as after a stall of its own. The scope is the quorum the decision rests on — the cluster-wide one, or under region scope the target's region's — never the cluster-wide quorum for a regional decision: a region majority cut off from the rest of the cluster lacks the cluster-wide quorum for as long as the cut lasts, and is exactly the side that must fence. "Lost" is read fresh inside the grace check, never taken from the last recorded reading: a remote region's quorum is read only by a fence decision about one of its hosts, which the grace runs ahead of, so a recorded No would otherwise defer that region's fences for as long as nothing re-read it. A fresh Yes is the No→Yes transition and opens the grace from that moment. | Workloads lose execution time for the blip plus about one probe cycle. Accepted by the user. A fence decided anyway (a grace too short for a slow re-probe) waits out the pause and is then refused by `fenceStillStands`, and the host stays paused until `recoverHosts` reactivates it (F6). |
 | F8 | A resume answer is missing | The workload stays paused and is retried every tick. | An unreachable minority of voters delays the resume. It never makes the pauser resume wrongly. |
+| F10 | One host's flag is turned off (a restart) while its peers keep theirs on | The first health probe that reaches the restarted daemon records that it does not pause, and from then on no coordinator relies on its pause. It is fenced `assumed` and recovered as before partition pause (§4.3). | If the partition begins before any probe reaches the new run, the coordinator still holds the old run's answer, relies, waits `W` and recovers while the host keeps running. This is F3 with the flag off: the window is at most one probe cycle after the new daemon starts serving. Layer 3 settles it on return. |
 | F9 | Recovery claims off | Resume relies on the fence-state check alone (§3.5). | Without claims, two coordinators can still each recover (recovery-claims.md §1). Layer 3 needs a certificate, so it does nothing without claims. |
 
 ## 8. Testing
@@ -792,6 +871,9 @@ restore it.
   the token) settles to one running copy.
 - **Blip.** Every node partitioned from every other: everything pauses, and
   after the heal everything resumes, with the condition raised and resolved.
+- **Flag turned off.** The owner says it pauses and its Ping is cached. Its
+  flag then goes off, as after a restart, the probes go on, and then it is cut
+  off. The fence is recorded `assumed`, not `self_paused` (finding P1, §4.3).
 
 **Lab (after merge, not in this branch).** nftables drops all traffic on all 5
 nodes at once, then heals. Grep for `partition-pause: paused` and
@@ -855,3 +937,10 @@ nodes at once, then heals. Grep for `partition-pause: paused` and
    the healed minority for 12 s while every other RPC flows, so the minority's
    own row still says the workload is its own and only the voters' direct
    answers can stop the resume.
+8. **The target's word comes from the health probe, not a cached Ping.** M4
+   was first met by reading the target's last cached Ping, which had no age
+   bound and which only proof replication refreshed. The lab showed a
+   coordinator relying on a host two minutes after that host's flag went off
+   (finding P1). `ReadyResponse.partition_pause` now carries the flag on every
+   health probe, and the coordinator reads the latest answer (§4.3).
+   `Checker.PeerAdvertisedLast` is gone.

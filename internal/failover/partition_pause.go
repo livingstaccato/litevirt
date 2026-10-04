@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
@@ -52,8 +51,11 @@ func (c *Coordinator) relyOnPartitionPause(ctx context.Context, h *corrosion.Hos
 	if c.PartitionPauseEnforced == nil || !c.PartitionPauseEnforced(ctx) {
 		return false
 	}
-	if c.PeerAdvertised == nil || !c.PeerAdvertised(h.Name, capabilities.PartitionPauseV1) {
-		slog.Warn("failover: the host did not advertise partition_pause_v1 on its last Ping; not relying on its pause",
+	// The host's own word, from the latest probe that reached it: the flag
+	// changes only with a restart, and the probe reaches each run within a
+	// probe interval, which a cached Ping does not (§4.3).
+	if c.PeerPausesOnLoss == nil || !c.PeerPausesOnLoss(h.Name) {
+		slog.Warn("failover: the host's latest probe answer did not say it pauses on losing the majority; not relying on its pause",
 			"host", h.Name)
 		return false
 	}

@@ -112,6 +112,12 @@ type Daemon struct {
 	// start before the server exists. See wireLeaseMintClearance.
 	mintClearance atomic.Pointer[grpcapi.Server]
 
+	// migrationTLSMu serializes the migration-TLS install hook. Storage
+	// migrations, the start-up install and MigrationTLSStatus all run it, and
+	// two installs interleaving their per-file skip/write could leave QEMU a
+	// certificate from one set and a key from the other.
+	migrationTLSMu sync.Mutex
+
 	// authEngine is wired into the gRPC server below; kept on the daemon
 	// struct so the backstop reload loop (runAuthEngineReload) can refresh it.
 	authEngine *auth.Engine

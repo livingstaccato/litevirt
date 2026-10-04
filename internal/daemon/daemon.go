@@ -2072,14 +2072,14 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if len(d.cfg.JoinPeers) > 0 {
 		// Says what did NOT happen and where the credential is instead. Naming a
 		// password file here would send the operator looking for one this branch
-		// never writes, and from there to `lv user reset-admin`, which on a node
-		// that has not converged yet mints and publishes a fresh credential — the
-		// very thing this guard exists to prevent.
+		// never writes, and from there to `lv user reset-admin` — which only resets
+		// a live admin, so on a node that has not converged yet it refuses with "no
+		// live admin account" and reads as a second failure.
 		slog.Info("this node is joining an existing cluster (join peers are configured and "+
 			"no admin user has replicated in yet), so no admin account is created and no "+
 			"password file is written here; the credential replicates in from the cluster. "+
-			"Running `lv user reset-admin` on this node before it converges mints a NEW "+
-			"credential and replaces the cluster's",
+			"`lv user reset-admin` resets an existing account and creates none, so it "+
+			"refuses on this node until the credential has replicated in",
 			"join_peers", len(d.cfg.JoinPeers))
 		return nil
 	}

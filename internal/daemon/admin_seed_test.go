@@ -162,10 +162,11 @@ func TestSeedAdminUser_ASoleFounderDoesNotReMintOnRestart(t *testing.T) {
 // This is the trigger for the worse bug next door. A joiner now writes no
 // /etc/litevirt/admin-password; if the log still names that path, the operator
 // greps for it, finds nothing, and escalates to the one documented recovery —
-// `lv user reset-admin` (docs/cli-reference.md) — which on a node that has not
-// converged yet mints and replicates a fresh admin row, which is #186 again by
-// another route. So the message is load-bearing, not cosmetic: it has to say
-// that no file is written here and that the credential arrives by replication.
+// `lv user reset-admin` (docs/cli-reference.md). That once minted a fresh admin
+// row on a node that had not converged, which was #186 again by another route;
+// it now only resets a live admin and refuses there, which reads as a second
+// failure. So the message is load-bearing, not cosmetic: it has to say that no
+// file is written here and that the credential arrives by replication.
 func TestSeedAdminUser_TheSkipLogDoesNotNameAFileItNeverWrote(t *testing.T) {
 	ctx := context.Background()
 	db := newHostTestClient(t)
@@ -190,7 +191,7 @@ func TestSeedAdminUser_TheSkipLogDoesNotNameAFileItNeverWrote(t *testing.T) {
 	if strings.Contains(logged, adminPasswordFile) {
 		t.Errorf("the skip log names %s, which this branch never writes:\n\t%s\n"+
 			"the operator greps for that file, finds nothing, and reaches for "+
-			"`lv user reset-admin` — which re-mints and republishes the credential",
+			"`lv user reset-admin`, which refuses on a node with no live admin",
 			adminPasswordFile, strings.TrimSpace(logged))
 	}
 	if !strings.Contains(logged, "replicat") {

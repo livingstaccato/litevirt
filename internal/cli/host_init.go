@@ -553,7 +553,7 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	// local user to pre-create and no write-then-execute window.
 	cmd := execCommand("bash", "-s")
 	cmd.Stdin = strings.NewReader(setupScript)
-	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, localInitJoinPeers)...)
+	cmd.Env = append(os.Environ(), localInitSetupEnv(hostName, advertiseAddr)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -843,6 +843,41 @@ func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
 	return out, false, nil
 }
 
+// foundingSetupEnv tells the setup script this node is founding a cluster, so it
+// may write the founder marker (genesisMarkerScript). Only `lv host init` sets
+// it. It is deliberately NOT in setupScriptEnv, which `lv host add` also uses:
+// an added node carrying it would mint its own admin credential and replace the
+// cluster's (colonelpanik/litevirt#186).
+const foundingSetupEnv = "LITEVIRT_GENESIS=1"
+
+// genesisMarkerScript writes or clears the founder marker in the data dir. The
+// daemon mints the cluster's first admin credential only while the marker
+// exists, and deletes it once it has. It is written only when founding AND the
+// data dir shows no sign of earlier membership: no state.db, so re-running
+// `lv host init` against a live member does not re-arm a mint for the day its
+// state.db is lost; and no capability latch (split_brain_activated.<token>),
+// which survives that loss, so a former member re-initialised with --force or
+// while its cluster is unreachable does not mint a second admin either. Every other
+// setup clears a marker left by a `host init` whose daemon never started.
+// LV_DATA_DIR exists for tests; the daemon's data_dir is /var/lib/litevirt.
+const genesisMarkerScript = `
+# Founder marker: licenses this node's daemon to mint the cluster's first admin.
+LV_DATA_DIR="${LV_DATA_DIR:-/var/lib/litevirt}"
+# Capability latches survive a state.db loss: a node holding one has run as a
+# member and is not founding anything.
+if [ "${LITEVIRT_GENESIS:-}" = "1" ] && [ ! -e "${LV_DATA_DIR}/state.db" ] && \
+   ! compgen -G "${LV_DATA_DIR}/split_brain_activated.*" > /dev/null; then
+    touch "${LV_DATA_DIR}/genesis-pending"
+else
+    rm -f "${LV_DATA_DIR}/genesis-pending"
+fi
+`
+
+// localInitSetupEnv is the setup environment for `lv host init --local`.
+func localInitSetupEnv(hostName, advertiseAddr string) []string {
+	return append(setupScriptEnv(hostName, advertiseAddr, localInitJoinPeers), foundingSetupEnv)
+}
+
 // setupScriptEnv is the environment the setup script reads to write the daemon
 // config. One place, so the local and remote paths cannot disagree about it —
 // they already had, which is how the local path shipped with no advertise_address.
@@ -874,7 +909,11 @@ func remoteInitSetupCommand(hostName, hostAddr, targetCfg string) string {
 	if block == "" {
 		block = newClusterEnforcement
 	}
-	return shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block)) + " bash -s"
+	// foundingSetupEnv: `lv host init` founds a cluster, so the script may write
+	// the founder marker. setupScriptEnvWith is shared with `lv host add`, which
+	// must never carry it.
+	env := append(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block), foundingSetupEnv)
+	return shellEnvPrefix(env) + " bash -s"
 }
 
 // readPeerConfig reads an existing cluster node's daemon config over SSH. It
@@ -1116,7 +1155,7 @@ echo "Enabled libvirtd TLS (port 16514)"
 # Create litevirt directories
 mkdir -p /var/lib/litevirt/{images,disks,cloudinit}
 mkdir -p /etc/litevirt
-
+` + genesisMarkerScript + `
 # Libvirt storage pools are auto-created by litevirtd on startup
 # (from storage_pools config or a default local pool).
 

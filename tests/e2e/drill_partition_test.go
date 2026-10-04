@@ -66,8 +66,11 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 
 	minority, majority := l.hosts[:2], l.hosts[2:]
 	q := majority[0] // the CLI side that keeps a quorum
-	test := l.createVMs(q, "d1", minority...)
+	test := l.createVMsWhereRoom(q, "d1", minority...)
 	keys := l.recoverableOn(q, minority...)
+	if len(keys) == 0 {
+		t.Fatalf("no recoverable workload on the minority %v, and no room there for a test VM", minority)
+	}
 	home := map[string]string{}
 	disks := map[string]vmInfo{}
 	for _, v := range l.vms(q) {
@@ -212,7 +215,6 @@ func TestDrill1_SplitTwoThree(t *testing.T) {
 	assertNoDualRun(t, l, q, since, healed)
 
 	t.Run("disk rows follow the replacement", func(t *testing.T) {
-		skipUnlessFixed(t, "N7")
 		assertDiskRowsFollow(t, l, q, s.last(), keys)
 	})
 }
@@ -231,13 +233,17 @@ func TestDrillBlip_FleetWide(t *testing.T) {
 	q := l.hosts[0]
 
 	var lxcHost, plainHost string
+	var plain []string
 	for _, h := range l.hosts {
 		if b.lxcHosts[h] && lxcHost == "" {
 			lxcHost = h
 		}
-		if !b.lxcHosts[h] && plainHost == "" {
-			plainHost = h
+		if !b.lxcHosts[h] {
+			plain = append(plain, h)
 		}
+	}
+	if len(plain) > 0 {
+		plainHost = l.leastLoaded(q, plain) // earlier drills can leave a fixed host full
 	}
 	if lxcHost == "" || plainHost == "" {
 		t.Fatalf("the blip needs a host with LXC and one without (litevirt.lxc labels: %v)", b.lxcHosts)
@@ -482,7 +488,8 @@ func assertNoDualRun(t *testing.T, l *lab, via, since string, after time.Time) {
 }
 
 // assertDiskRowsFollow requires every VM's disk rows to name the host it now
-// executes on (finding N7: failover leaves them naming the old host).
+// executes on (finding N7, fixed in 386206a3: failover used to leave them
+// naming the old host).
 func assertDiskRowsFollow(t *testing.T, l *lab, via string, r round, keys []string) {
 	t.Helper()
 	for _, k := range keys {

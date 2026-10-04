@@ -35,8 +35,6 @@ import (
 //	LV_BIN             in lab mode, the lv binary ON THE NODES
 //	                   (e.g. /usr/local/bin/litevirt).
 //	E2E_EVIDENCE_DIR   where each drill writes its samples and timeline.
-//	E2E_FIXED          comma-separated finding IDs whose fix is deployed
-//	                   (N3,N4,N7); a drill that hits an open one skips.
 //	LITEVIRT_E2E_DESTRUCTIVE=1  also run drill 6 (destroys and rebuilds hosts).
 
 var (
@@ -107,40 +105,6 @@ func checkDesignTimings(t *testing.T, hosts int) {
 	recomputed := tPause + max(0, minorityDetect-decisionHeadStart) + 2*pauserTick + health.PartitionPauseExecBudget + 2*time.Second
 	if hosts <= 17 && recomputed != pauseWait(hosts) {
 		t.Fatalf("W recomputed from the restated constants = %v, internal/health says %v", recomputed, pauseWait(hosts))
-	}
-}
-
-// ─── Findings that are open on the deployed build ───────────────────────────
-
-// knownFindings names the open product bugs a drill can run into. A drill that
-// hits one is written to the CORRECT behaviour and skips until the fix is
-// deployed and named in E2E_FIXED.
-var knownFindings = map[string]string{
-	"N3": "N3: recovery after a forced reconfiguration to 2 survivors is refused by the decision gate (missing_witness, internal/health/gate.go)",
-	"N4": "N4: a claim decided by an earlier, vetoed attempt can mint to a stale destination (coordinator adopts cl.Proof.DestHost without the eligibility checks)",
-	"N7": "N7: failover leaves vm_disks rows naming the old host (a later migrate fails CommitMigrationOwnership)",
-}
-
-func findingFixed(id string) bool {
-	for _, f := range strings.Split(os.Getenv("E2E_FIXED"), ",") {
-		if strings.EqualFold(strings.TrimSpace(f), id) {
-			return true
-		}
-	}
-	return false
-}
-
-// skipUnlessFixed skips t while any of the named findings is still open.
-func skipUnlessFixed(t *testing.T, ids ...string) {
-	t.Helper()
-	var open []string
-	for _, id := range ids {
-		if !findingFixed(id) {
-			open = append(open, knownFindings[id])
-		}
-	}
-	if len(open) > 0 {
-		t.Skipf("open on the deployed build (set E2E_FIXED once the fix is deployed):\n  %s", strings.Join(open, "\n  "))
 	}
 }
 
@@ -860,6 +824,13 @@ func drillMemory() string { return envOr("E2E_DRILL_MEMORY", "128M") }
 // the stack in cleanup. It returns host → VM name.
 func (l *lab) createVMs(via, prefix string, hosts ...string) map[string]string {
 	l.t.Helper()
+	return l.createStack(via, prefix, false, hosts...)
+}
+
+// createStack is createVMs; with roomOnly, a placement refused for want of
+// room returns nil instead of failing the test.
+func (l *lab) createStack(via, prefix string, roomOnly bool, hosts ...string) map[string]string {
+	l.t.Helper()
 	stack := uniqueName(prefix)
 	names := map[string]string{}
 	var b strings.Builder
@@ -874,6 +845,10 @@ func (l *lab) createVMs(via, prefix string, hosts ...string) map[string]string {
 	l.mustSSH(via, 30*time.Second, "echo "+enc+" | base64 -d > "+file)
 	l.onRestore(func() { l.deleteVMs(stack, names) })
 	if out, err := l.lv(via, "compose", "up", "-f", file, "-y"); err != nil {
+		if errOut := err.Error() + out; roomOnly && strings.Contains(errOut, "no eligible host") {
+			l.mark("workloads: no room for a test VM on %v: %s", hosts, strings.TrimSpace(errOut))
+			return nil
+		}
 		l.t.Fatalf("compose up %s: %v\n%s", stack, err, out)
 	}
 	for h, n := range names {
@@ -883,6 +858,21 @@ func (l *lab) createVMs(via, prefix string, hosts ...string) map[string]string {
 	}
 	l.mark("workloads: created %v", names)
 	return names
+}
+
+// createVMsWhereRoom is createVMs with one stack per host, skipping a host the
+// planner has no memory for: after earlier drills have moved workloads around,
+// a fixed host can be full. It returns host → VM name for the hosts that took
+// one.
+func (l *lab) createVMsWhereRoom(via, prefix string, hosts ...string) map[string]string {
+	l.t.Helper()
+	all := map[string]string{}
+	for _, h := range hosts {
+		for hh, n := range l.createStack(via, prefix, true, h) {
+			all[hh] = n
+		}
+	}
+	return all
 }
 
 // deleteVMs removes a test stack and anything it left on any node: a domain a
@@ -901,11 +891,24 @@ func (l *lab) deleteVMs(stack string, names map[string]string) {
 	// refused while a just-restarted node's replica catches up, and a row left
 	// behind makes that node's reconciler recreate the VM ("marked running but
 	// not in libvirt"). Only then is anything left on a node's disk an orphan.
+	//
+	// Only a host whose replica can be read is asked. A machine that is up but
+	// has no sqlite3 or no state.db (a rebuilt node before its add, or before
+	// the drill installs sqlite3 on it) holds no replica the harness can read,
+	// and counting it as unknown would spin here for the whole deadline.
 	deadline := time.Now().Add(5 * time.Minute)
+	unreadable := map[string]bool{}
 	for {
 		l.lv(via, "compose", "down", "--name", stack, "-y")
 		left := map[string]bool{}
 		for _, h := range l.upHosts() {
+			if !l.replicaReadable(h) {
+				if !unreadable[h] {
+					unreadable[h] = true
+					l.mark("cleanup: %s has no readable replica (no sqlite3 or no state.db); not asked for test VM rows", h)
+				}
+				continue
+			}
 			rows, err := l.sql(h, "SELECT name FROM vms WHERE deleted_at IS NULL AND name IN ('"+strings.Join(list, "','")+"')")
 			if err != nil {
 				left[h+":?"] = true
@@ -935,6 +938,18 @@ func (l *lab) deleteVMs(stack string, names map[string]string) {
 		}
 	}
 	l.mark("cleanup: test VMs %v deleted", list)
+}
+
+// replicaReadable reports whether host answers SSH and has both sqlite3 and a
+// state.db to read. An SSH failure is not "unreadable": the host may answer on
+// the next try, so callers keep asking it.
+func (l *lab) replicaReadable(host string) bool {
+	out, err := l.ssh(host, 20*time.Second,
+		"if command -v sqlite3 >/dev/null && test -s /var/lib/litevirt/state.db; then echo READABLE; else echo UNREADABLE; fi")
+	if err != nil {
+		return true
+	}
+	return !strings.Contains(out, "UNREADABLE")
 }
 
 // createContainer creates and starts a recoverable (image-recreate) container

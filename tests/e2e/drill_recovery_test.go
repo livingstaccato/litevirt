@@ -1,7 +1,6 @@
 package e2e
 
 import (
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -29,9 +28,11 @@ var (
 	// hostDownBy bounds the majority marking a powered-off host not active:
 	// F failures plus a fence and a coordinator poll, with lab slack.
 	hostDownBy = 2 * time.Minute
-	// capRefreshWait lets every peer's cached Ping of a just-restarted host
-	// catch up with its new advertisement (4 × health.peerCapTTL).
-	capRefreshWait = 4 * 30 * time.Second
+	// capRefreshWait lets every observer's probe reach a just-restarted host:
+	// the coordinator relies on a host's partition pause only on that host's
+	// LATEST probe answer (ReadyResponse.partition_pause), and every observer
+	// probes each peer every P, so a few probe intervals suffice.
+	capRefreshWait = 5 * probeInterval
 	// returnWatch is how long a drill keeps sampling after powering a host back
 	// on: a returning host is when a stale copy would restart.
 	returnWatch = 90 * time.Second
@@ -51,7 +52,7 @@ func TestDrill2_FrozenLeaseHolderWhileAHostFails(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	holder := l.leaseHolder(l.hosts[0], "failover")
-	victim := l.pick(func(h string) bool { return h != holder }, true)
+	victim := l.leastLoaded(l.hosts[0], l.except(holder))
 	q := l.pick(func(h string) bool { return h != holder && h != victim }, false)
 	test := l.createVMs(q, "d2", victim)[victim]
 	keys := l.relocatableOn(q, b, victim)
@@ -125,7 +126,6 @@ func TestDrill2_FrozenLeaseHolderWhileAHostFails(t *testing.T) {
 	assertNeverTwice(t, s.snapshot())
 
 	t.Run("disk rows follow the replacement", func(t *testing.T) {
-		skipUnlessFixed(t, "N7")
 		assertDiskRowsFollow(t, l, q, s.last(), keys)
 	})
 }
@@ -140,8 +140,9 @@ func TestDrill3_VoterRemovedAfterAFence(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	n := len(l.hosts)
-	first, second := l.hosts[n-1], l.hosts[n-2]
 	q := l.hosts[0]
+	second := l.leastLoaded(q, l.except(q))
+	first := l.pick(func(h string) bool { return h != q && h != second }, true)
 	test := l.createVMs(q, "d3", second)[second]
 	keys := l.relocatableOn(q, b, second)
 	gen0, _, err := l.voterSet(q)
@@ -225,7 +226,6 @@ func TestDrill3_VoterRemovedAfterAFence(t *testing.T) {
 	assertNeverTwice(t, s.snapshot())
 
 	t.Run("disk rows follow the replacement", func(t *testing.T) {
-		skipUnlessFixed(t, "N7")
 		assertDiskRowsFollow(t, l, q, s.last(), keys)
 	})
 }
@@ -246,7 +246,7 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	coord := l.leaseHolder(l.hosts[0], "failover")
-	owner := l.pick(func(h string) bool { return h != coord }, true)
+	owner := l.leastLoaded(l.hosts[0], l.except(coord))
 	keep := l.pick(func(h string) bool { return h != coord && h != owner }, true)
 	q := l.pick(func(h string) bool { return h != owner && h != keep }, false)
 	var cut []string
@@ -260,30 +260,12 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	if err := l.setEnforcement(owner, "partition_pause", "false"); err != nil {
 		t.Fatalf("partition_pause off on %s: %v", owner, err)
 	}
-	// Let the peers' cached Pings see the owner stop advertising the token. The
-	// coordinator reads its LAST cached Ping (PeerAdvertisedLast, no RPC, no
-	// age bound); the cache is refreshed by other callers at most every
-	// peerCapTTL (30 s), so allow several.
+	// Let every observer's probe see the owner's new run: the coordinator
+	// relies on the owner's pause only on the owner's latest probe answer, which
+	// now says it does not pause (finding P1, fixed in 6201d7c4: it used to
+	// read the owner's last cached Ping, of any age).
 	time.Sleep(capRefreshWait)
-	// Finding P1: nothing refreshes that cache in steady state (only proof
-	// replication does, through PeerSupports), so the coordinator keeps relying
-	// on the pause the owner just turned off. The assertion below reports it.
-	// E2E_DRILL4_REFRESH_PEERS=1 works around it, to exercise the veto itself:
-	// a rolling restart empties every other host's cache, and an empty cache
-	// is "not advertised".
-	if os.Getenv("E2E_DRILL4_REFRESH_PEERS") == "1" {
-		for _, h := range l.hosts {
-			if h == owner {
-				continue
-			}
-			time.Sleep(daemonRestartSpacing)
-			if err := l.restartDaemon(h); err != nil {
-				t.Fatalf("refresh peers: %v", err)
-			}
-		}
-		time.Sleep(daemonRestartSpacing)
-		coord = l.leaseHolder(q, "failover")
-	}
+	coord = l.leaseHolder(q, "failover")
 	l.mark("drill4: coordinator %s, owner %s (partition_pause off), owner keeps only %s in phase 1", coord, owner, keep)
 
 	since := l.nodeNow(q)
@@ -310,7 +292,7 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	phase2 := l.mark("drill4: phase 2, %s (quorum for %s) is the only host cut off from it", decider, owner)
 	time.Sleep(time.Until(phase2.Add(claimWatch)))
 	if j := l.journalSince(decider, since, "relying on the host's partition pause.*host="+owner); j != "" {
-		t.Errorf("coordinator %s relied on %s's partition pause although %s runs partition_pause=false: it decided on a capability advertisement cached before the flag went off, so it waited for a pause that would never happen instead of claiming:\n%s", decider, owner, owner, j)
+		t.Errorf("coordinator %s relied on %s's partition pause although %s runs partition_pause=false: it decided on an answer from before the flag went off (P1), so it waited for a pause that would never happen instead of claiming:\n%s", decider, owner, owner, j)
 	}
 
 	// Every voter that reaches the owner refused; no certificate.
@@ -363,8 +345,8 @@ func TestDrill5_LegacyRecoveryWithClaimsOff(t *testing.T) {
 	b := l.requireBaseline()
 	l.restoreOnCleanup(b)
 
-	victim := l.hosts[len(l.hosts)-1]
 	q := l.hosts[0]
+	victim := l.leastLoaded(q, l.except(q))
 	test := l.createVMs(q, "d5", victim)[victim]
 	keys := l.relocatableOn(q, b, victim)
 	for i, h := range l.hosts {
@@ -407,12 +389,22 @@ func TestDrill5_LegacyRecoveryWithClaimsOff(t *testing.T) {
 	assertNeverTwice(t, s.snapshot())
 
 	t.Run("disk rows follow the replacement", func(t *testing.T) {
-		skipUnlessFixed(t, "N7")
 		assertDiskRowsFollow(t, l, q, s.last(), keys)
 	})
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+// except returns every host but the named ones.
+func (l *lab) except(skip ...string) []string {
+	var hs []string
+	for _, h := range l.hosts {
+		if !contains(skip, h) {
+			hs = append(hs, h)
+		}
+	}
+	return hs
+}
 
 // pick returns the first host (or, with fromEnd, the last) that ok accepts.
 func (l *lab) pick(ok func(string) bool, fromEnd bool) string {

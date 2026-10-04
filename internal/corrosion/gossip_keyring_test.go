@@ -637,3 +637,44 @@ func TestWatchGossipKeyFile_OffReportsOffAndLoadsNothing(t *testing.T) {
 		t.Fatal("an off node loaded the key file")
 	}
 }
+
+// TestWatchGossipKeyFile_ReorderedSecondariesSettle: memberlist keeps its own
+// secondary order — AddKey appends — so a node live on [A,B] that loads a file
+// reading [A,C,B] ends up on [A,B,C]. Secondary order is not semantics (every
+// installed key is tried on receipt; only the primary encrypts), so the watcher
+// must treat that as loaded. Comparing in order re-applied the file and logged
+// "gossip keyring reloaded" on every tick, forever.
+//
+// Mutation: compare the ID lists in order (the old sameKeyIDs) — the reload
+// count climbs with every tick and this goes red.
+func TestWatchGossipKeyFile_ReorderedSecondariesSettle(t *testing.T) {
+	buf := &syncBuf{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dir := t.TempDir()
+	keyPath, statePath := filepath.Join(dir, pki.GossipKeyName), filepath.Join(dir, pki.GossipKeyringStateName)
+	a, b, c3 := newTestGossipKey(t), newTestGossipKey(t), newTestGossipKey(t)
+	if err := pki.WriteGossipKeyring(keyPath, [][]byte{a, b}); err != nil {
+		t.Fatal(err)
+	}
+	c := keyedGossipNode(t, "node-a", GossipEncryptionStaged, GossipKeys{a, b}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.WatchGossipKeyFile(ctx, keyPath, statePath, 10*time.Millisecond)
+	waitState(t, statePath, "the initial state", func(s pki.GossipKeyringState) bool { return len(s.Keys) == 2 })
+
+	if err := pki.WriteGossipKeyring(keyPath, [][]byte{a, c3, b}); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, statePath, "the third key", func(s pki.GossipKeyringState) bool { return len(s.Keys) == 3 })
+	time.Sleep(300 * time.Millisecond) // ~30 ticks
+	if n := buf.count("gossip keyring reloaded"); n != 1 {
+		t.Fatalf("the watcher reloaded %d times for one file change; live %v never matches the file's order",
+			n, c.GossipKeyring().Keys)
+	}
+	if got := c.GossipKeyring(); got.Primary != pki.GossipKeyID(a) || len(got.Keys) != 3 {
+		t.Fatalf("live keyring %+v, want primary %s and three keys", got, pki.GossipKeyID(a))
+	}
+}

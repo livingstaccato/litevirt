@@ -8,7 +8,9 @@
 // memberlist auto-detection cannot produce the configured answer by accident —
 // with each node's daemon-side key watcher running. A "restart" is what the
 // daemon does: close the client and open a new one on the same port and data
-// dir with the new stage, reading the key from the PKI dir.
+// dir with the new stage, reading the key from the PKI dir — and then cutting
+// the closed incarnation off the network, the part of a process exit that
+// closing a client does not do (exitedTransport).
 //
 // The failure mode is multi-node by construction: a stage change or a key
 // change is only safe relative to what every OTHER node is doing at that
@@ -17,7 +19,9 @@ package fleet
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -27,6 +31,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/memberlist"
 
 	"github.com/litevirt/litevirt/internal/cli"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -41,8 +47,59 @@ type gossipNode struct {
 
 	mu         sync.Mutex
 	c          *corrosion.Client
+	transport  *exitedTransport
 	stopWatch  context.CancelFunc
 	restarting atomic.Bool
+}
+
+// exitedTransport is one incarnation's memberlist transport, cut off once that
+// incarnation has "exited".
+//
+// A daemon restart ends the process, and every goroutine of the old memberlist
+// with it. Closing a client in a process that goes on running does not:
+// memberlist's Shutdown closes the listeners and stops the probe ticker, but
+// does not cancel a probe already in flight (probeNode, memberlist v0.5.4
+// state.go). That probe waits out its ack timeout and then falls back to a TCP
+// ping over a FRESH dial, which closed listeners do not stop, encoded in the
+// closed incarnation's stage. These scenarios restart a node every ~100 ms, so
+// a whole stage can roll past inside one probe: under load an "install" ghost
+// of gk-4 was caught sending a plaintext TCP ping to gk-1 after gk-1 had come
+// back "enforced", and gk-1 counted the rejection. No daemon can do that — its
+// old process is gone — so refusing every send and dial after stop is what
+// makes the in-process restart a restart.
+type exitedTransport struct {
+	memberlist.NodeAwareTransport
+	exited atomic.Bool
+}
+
+var errIncarnationExited = errors.New("fleet: this gossip incarnation's process has exited")
+
+func (t *exitedTransport) WriteTo(b []byte, addr string) (time.Time, error) {
+	if t.exited.Load() {
+		return time.Time{}, errIncarnationExited
+	}
+	return t.NodeAwareTransport.WriteTo(b, addr)
+}
+
+func (t *exitedTransport) WriteToAddress(b []byte, a memberlist.Address) (time.Time, error) {
+	if t.exited.Load() {
+		return time.Time{}, errIncarnationExited
+	}
+	return t.NodeAwareTransport.WriteToAddress(b, a)
+}
+
+func (t *exitedTransport) DialTimeout(addr string, timeout time.Duration) (net.Conn, error) {
+	if t.exited.Load() {
+		return nil, errIncarnationExited
+	}
+	return t.NodeAwareTransport.DialTimeout(addr, timeout)
+}
+
+func (t *exitedTransport) DialAddressTimeout(a memberlist.Address, timeout time.Duration) (net.Conn, error) {
+	if t.exited.Load() {
+		return nil, errIncarnationExited
+	}
+	return t.NodeAwareTransport.DialAddressTimeout(a, timeout)
 }
 
 func (n *gossipNode) client() *corrosion.Client {
@@ -101,14 +158,35 @@ func (f *gossipFleet) start(nd *gossipNode, mode corrosion.GossipEncryption) {
 		keys = ring
 	}
 	var c *corrosion.Client
+	var tr *exitedTransport
 	var err error
 	// A just-closed node's port can linger for a moment; the daemon would be
 	// restarted by systemd into the same port, so retry rather than move.
 	for i := 0; i < 50; i++ {
+		tr = nil
 		c, err = corrosion.NewClient(corrosion.Config{
 			HostName: nd.name, DataDir: nd.dataDir, BindAddr: "0.0.0.0", AdvertiseAddr: "127.0.0.1",
 			BindPort: nd.port, JoinPeers: f.seeds(nd), GossipEncryption: mode, GossipKeys: keys,
+			// memberlist's own NetTransport on the same bind, wrapped so stop
+			// can cut it. On a bind error tr stays nil, memberlist builds its
+			// own transport and fails the same way, and the loop retries.
+			MemberlistForTests: func(mc *memberlist.Config) {
+				nt, terr := memberlist.NewNetTransport(&memberlist.NetTransportConfig{
+					BindAddrs: []string{mc.BindAddr}, BindPort: mc.BindPort,
+					Logger: log.New(mc.LogOutput, "", 0),
+				})
+				if terr == nil {
+					tr = &exitedTransport{NodeAwareTransport: nt}
+					mc.Transport = tr
+				}
+			},
 		}, hlc.NewClock(nd.name))
+		if err == nil && tr == nil {
+			// The port freed between the two binds and memberlist bound an
+			// unwrapped transport, which stop could not cut. Go round again.
+			c.Close()
+			err = errors.New("address already in use (memberlist bound an unwrapped transport)")
+		}
 		if err == nil || !strings.Contains(err.Error(), "address already in use") {
 			break
 		}
@@ -137,20 +215,25 @@ func (f *gossipFleet) start(nd *gossipNode, mode corrosion.GossipEncryption) {
 		filepath.Join(nd.pkiDir, pki.GossipKeyName),
 		filepath.Join(nd.pkiDir, pki.GossipKeyringStateName), nd.reload)
 	nd.mu.Lock()
-	nd.c, nd.stopWatch = c, cancel
+	nd.c, nd.transport, nd.stopWatch = c, tr, cancel
 	nd.mu.Unlock()
 }
 
+// stop is the daemon's SIGTERM: close the client (Leave included), and then
+// the process is gone, so nothing of this incarnation reaches the wire again.
 func (f *gossipFleet) stop(nd *gossipNode) {
 	nd.mu.Lock()
-	c, cancel := nd.c, nd.stopWatch
-	nd.c, nd.stopWatch = nil, nil
+	c, tr, cancel := nd.c, nd.transport, nd.stopWatch
+	nd.c, nd.transport, nd.stopWatch = nil, nil, nil
 	nd.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	if c != nil {
 		c.Close()
+	}
+	if tr != nil {
+		tr.exited.Store(true)
 	}
 }
 

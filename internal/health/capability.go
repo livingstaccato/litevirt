@@ -4,6 +4,9 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
@@ -79,9 +82,55 @@ func (c *Checker) SetActivationMarker(base string) {
 	c.mu.Unlock()
 }
 
+// ActivationMarkerPrefix is the basename prefix of the durable per-token
+// activation markers in a node's data directory: <data_dir>/<prefix>.<token>.
+// It is the ONE definition of that scheme. The checker writes the markers
+// under the base the daemon hands SetActivationMarker; the rollback preflight,
+// the on-disk split gates and the founder-marker check read them back. A
+// reader whose idea of the path drifted would see no latch and fail open —
+// a rolled-back binary would leave WAL quarantine — so every reader goes
+// through ActivationMarkerBase, ActivationMarkerPath or ActivationMarkersOnDisk.
+// (The setup script's genesisMarkerScript, in bash, spells the same name.)
+const ActivationMarkerPrefix = "split_brain_activated"
+
+// activationMarkerSep joins the base and the token.
+const activationMarkerSep = "."
+
+// ActivationMarkerBase is the marker base for a data directory, the value the
+// daemon hands SetActivationMarker.
+func ActivationMarkerBase(dataDir string) string {
+	return filepath.Join(dataDir, ActivationMarkerPrefix)
+}
+
+// ActivationMarkerPath is token's durable activation marker in dataDir — the
+// file the checker writes when token latches.
+func ActivationMarkerPath(dataDir, token string) string {
+	return markerPathFor(ActivationMarkerBase(dataDir), token)
+}
+
+// ActivationMarkersOnDisk lists, sorted, every token with an activation marker
+// in dataDir, including tokens this build has never heard of: it reads the
+// directory, not the token list.
+func ActivationMarkersOnDisk(dataDir string) ([]string, error) {
+	base := ActivationMarkerBase(dataDir)
+	matches, err := filepath.Glob(markerPathFor(base, "*"))
+	if err != nil {
+		return nil, err
+	}
+	prefix := filepath.Base(markerPathFor(base, ""))
+	var toks []string
+	for _, path := range matches {
+		if tok := strings.TrimPrefix(filepath.Base(path), prefix); tok != "" {
+			toks = append(toks, tok)
+		}
+	}
+	sort.Strings(toks)
+	return toks, nil
+}
+
 // markerPathFor derives a token's durable activation marker path from the base.
 func markerPathFor(base, token string) string {
-	return base + "." + token
+	return base + activationMarkerSep + token
 }
 
 // Enforced reports whether a fail-closed check for `token` must be enforced NOW.

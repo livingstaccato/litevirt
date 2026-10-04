@@ -69,6 +69,36 @@ func GossipKeyIDs(keys [][]byte) []string {
 	return ids
 }
 
+// SameGossipKeyring reports whether two keyrings, as key IDs primary first,
+// are the same keyring: the same primary and the same set of secondaries.
+// Secondary ORDER is not part of a keyring's meaning — memberlist tries every
+// installed key on receipt and encrypts with the primary only — and memberlist
+// keeps its own order (AddKey appends), so a live keyring loaded from a file
+// can list its secondaries differently from the file. Comparing in order would
+// make that keyring never "match" its file.
+func SameGossipKeyring(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	if a[0] != b[0] {
+		return false
+	}
+	seen := make(map[string]int, len(a))
+	for _, id := range a[1:] {
+		seen[id]++
+	}
+	for _, id := range b[1:] {
+		if seen[id] == 0 {
+			return false
+		}
+		seen[id]--
+	}
+	return true
+}
+
 const gossipKeyringHeader = `# litevirt cluster gossip keyring. One base64 AES-256 key per line.
 # The FIRST key encrypts; every key decrypts. Distributed by lv host init / add /
 # install-gossip-key / rotate-gossip-key; edit by hand only if you have read

@@ -136,6 +136,39 @@ func (s *Server) GarbageCollectBackupRepo(ctx context.Context, req *pb.GarbageCo
 	}, nil
 }
 
+// ListBackupRepoSnapshots lists a repo's snapshots for the /backups page, which
+// used to open whatever ?repo= named in-process: any session could probe the
+// host's filesystem by absolute path and read every project's snapshot list.
+//
+// Checked at `/` like the maintenance RPCs — a repo holds every project's
+// backups — but with backup.read, so a cluster-wide Viewer can still browse.
+// The repo resolves through resolveBackupRepoPath, which refuses a custom
+// absolute path to anyone but an admin. A read, so not audited: the page asks
+// once per configured repo on every load.
+func (s *Server) ListBackupRepoSnapshots(ctx context.Context, req *pb.ListBackupRepoSnapshotsRequest) (*pb.ListBackupRepoSnapshotsResponse, error) {
+	if err := s.RequirePerm(ctx, backupRepoRBACPath, "backup.read", "viewer"); err != nil {
+		return nil, err
+	}
+	path, err := s.resolveBackupRepoPath(ctx, req.GetRepo())
+	if err != nil {
+		return nil, err
+	}
+	repo, err := pbsstore.Open(path)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "open repo %q: %v", req.GetRepo(), err)
+	}
+	ms, err := repo.ListManifests()
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list snapshots in %q: %v", req.GetRepo(), err)
+	}
+	snaps := toPbBackupRepoSnapshots(ms)
+	for i := range ms {
+		snaps[i].ChunkCount = int32(len(ms[i].Chunks))
+		snaps[i].BasedOn = ms[i].BasedOn
+	}
+	return &pb.ListBackupRepoSnapshotsResponse{Encryption: repo.Meta().Encryption, Snapshots: snaps}, nil
+}
+
 func toPbBackupRepoSnapshots(ms []pbsstore.Manifest) []*pb.BackupRepoSnapshot {
 	out := make([]*pb.BackupRepoSnapshot, 0, len(ms))
 	for _, m := range ms {

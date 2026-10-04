@@ -482,9 +482,13 @@ Restore destinations are a pool-relative filename by default; a custom absolute
 - **WebUI `/backups`** — manifest list. With `backup_repos:`
   configured, lists every configured repo and its snapshot count +
   total size. Click through to drill into one repo's manifests.
-  The page's repo actions call the RPCs below with the session's
-  credential, so the daemon authorizes and audits them as it would any
-  other caller.
+  The page lists each repo through `ListBackupRepoSnapshots`, and its
+  repo actions call the RPCs below, all with the session's credential,
+  so the daemon authorizes and audits them as it would any other caller.
+  Listing is checked at `/` with `backup.read` (legacy floor `viewer`):
+  a cluster-wide Viewer can browse, a project-scoped grant or token
+  cannot, and `?repo=` takes a registered repo name — a custom absolute
+  path needs the **admin** role. Listing is a read and is not audited.
 
 ### Repo maintenance RPCs
 

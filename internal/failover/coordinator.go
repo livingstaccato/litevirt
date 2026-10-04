@@ -1962,15 +1962,25 @@ func (c *Coordinator) observerStreakSpans(ctx context.Context, host string, at t
 		if !ok || !upd.After(freshCutoff) {
 			continue
 		}
-		runStart := upd.Add(-time.Duration(n-1) * health.ProbeInterval)
-		if started, ok := corrosion.ParseUpdatedAt(r.String("last_seen")); ok && !started.After(upd) {
-			runStart = started
-		}
-		if !runStart.After(at.Add(-fenceSkewMargin)) {
+		if !observerRunStart(n, r.String("last_seen"), upd).After(at.Add(-fenceSkewMargin)) {
 			return true
 		}
 	}
 	return false
+}
+
+// observerRunStart is when an observer's unbroken run of n failed probes
+// against its target began, from that host_health row: its last_seen, which a
+// failing verdict carries as the run's first failed probe, or, on a row from an
+// older build with none, (n-1) × health.ProbeInterval back from updated_at —
+// a lower bound on the run's length (see observerStreakSpans for why). The
+// fence path and the one-way detector both read a run's start through here, so
+// they cannot disagree on when one began.
+func observerRunStart(n int, lastSeen string, updatedAt time.Time) time.Time {
+	if started, ok := corrosion.ParseUpdatedAt(lastSeen); ok && !started.After(updatedAt) {
+		return started
+	}
+	return updatedAt.Add(-time.Duration(n-1) * health.ProbeInterval)
 }
 
 // resumeFromConfirmation resumes the recovery of target if an operator has

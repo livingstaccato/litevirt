@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -89,11 +90,12 @@ func TestHandleBackups_NoRepoQuery(t *testing.T) {
 }
 
 // TestHandleBackups_ConfiguredRepos init-s two real pbsstore repos,
-// hands them to the UI server via SetBackupRepos, then renders /backups
-// (no query string) and asserts BOTH appear in the configured-repos
-// table with their snapshot counts.
+// hands them to the UI server and the daemon via SetBackupRepos, then renders
+// /backups (no query string) and asserts BOTH appear in the configured-repos
+// table with their snapshot counts. The page lists through the daemon's
+// ListBackupRepoSnapshots, so it runs over a real one.
 func TestHandleBackups_ConfiguredRepos(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
+	s, _, svc := newUIOverRealDaemonSvc(t, "ada", "admin")
 	mainDir := filepath.Join(t.TempDir(), "main")
 	dr2Dir := filepath.Join(t.TempDir(), "dr")
 	mainRepo, err := pbsstore.Init(mainDir)
@@ -110,22 +112,23 @@ func TestHandleBackups_ConfiguredRepos(t *testing.T) {
 		t.Fatalf("PutManifest: %v", err)
 	}
 	s.SetBackupRepos(map[string]string{"main": mainDir, "dr": dr2Dir})
+	svc.SetBackupRepos(map[string]string{"main": mainDir, "dr": dr2Dir})
 
-	r := withAuth(httptest.NewRequest(http.MethodGet, "/backups", nil))
+	r := uiSessionReq(t, http.MethodGet, "/backups", nil)
 	w := serveRequest(s, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
 	body := w.Body.String()
 	// Repos now render as cards (name + path + snapshot count) rather than a table.
-	mustContain(t, body, "main", "dr", mainDir, dr2Dir, "Snapshots")
+	mustContain(t, body, "main", "dr", mainDir, dr2Dir, "<dt>Snapshots</dt><dd>1</dd>")
 }
 
 // TestHandleBackups_RealRepo init-s a real pbsstore, pushes one
-// snapshot, then renders /backups?repo=… and asserts the manifest
-// row appears.
+// snapshot, then renders /backups?repo=… as an admin (a custom absolute path
+// is admin-only) and asserts the manifest row appears.
 func TestHandleBackups_RealRepo(t *testing.T) {
-	s := newTestUIServer(t, newDefaultMock())
+	s, _, _ := newUIOverRealDaemonSvc(t, "ada", "admin")
 	repoDir := filepath.Join(t.TempDir(), "repo")
 	repo, err := pbsstore.Init(repoDir)
 	if err != nil {
@@ -139,7 +142,7 @@ func TestHandleBackups_RealRepo(t *testing.T) {
 		t.Fatalf("PutManifest: %v", err)
 	}
 
-	r := withAuth(httptest.NewRequest(http.MethodGet, "/backups?repo="+repoDir, nil))
+	r := uiSessionReq(t, http.MethodGet, "/backups?repo="+url.QueryEscape(repoDir), nil)
 	w := serveRequest(s, r)
 	mustContain(t, w.Body.String(), "vm1", "root", "2026-05-10T01:23:45Z")
 }

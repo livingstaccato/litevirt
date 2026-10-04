@@ -156,9 +156,32 @@ func (s *Store) CreateEmptyDisk(vmName, diskName, size string) (string, error) {
 // gets DELETED cannot drift apart — a guard computed against a different list
 // than the glob walks is a guard with a hole in it.
 func (s *Store) VMDiskCandidates(vmName string) ([]string, error) {
-	matches, err := filepath.Glob(filepath.Join(s.diskDir, vmName+"-*.qcow2"))
+	globbed, err := filepath.Glob(filepath.Join(s.diskDir, vmName+"-*.qcow2"))
 	if err != nil {
 		return nil, err
+	}
+	// Only names this VM can be the ONLY owner of. The glob also matches every
+	// disk of a VM whose name extends this one with a dash: web-*.qcow2 matches
+	// web-1-root.qcow2, which is VM "web-1"'s root disk. The keep set protects
+	// only paths a live row names, so a disk web-1's operator kept with
+	// --keep-disks (no row left) was swept whenever "web" was created, deleted
+	// or rebuilt.
+	//
+	// The flat name cannot say which split is meant — disk names may contain a
+	// dash too, so web-1-root is equally "web" + "1-root". Every file of
+	// another VM that this glob can match has a dash after "web-", and a file
+	// with none can belong to no other VM, so the rule is: a remainder with a
+	// dash is ambiguous and is NOT a candidate. The cost is that this VM's own
+	// dashed-name debris is left on disk; a recorded disk of that shape is still
+	// freed by its row (deleteRecordedVMDiskVolumes), and leaking a file is
+	// recoverable where deleting someone else's is not.
+	matches := make([]string, 0, len(globbed))
+	for _, m := range globbed {
+		rest := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(m), vmName+"-"), ".qcow2")
+		if strings.Contains(rest, "-") {
+			continue
+		}
+		matches = append(matches, m)
 	}
 	// The LEGACY per-VM subdirectory's contents too, because DeleteVMDisksIn
 	// used to remove that whole tree with os.RemoveAll — a recursive delete no

@@ -180,6 +180,20 @@ room for) with `lv rm --force` and `lv ct rm`. Once the hosts are back it
 brings the removed VMs' stacks up again from their `lv compose export` (the
 plan must create only) and re-creates the containers from their create spec.
 
+On main-e004c250 drill 6 fails at that clearing step, and the restore cannot
+finish: `lv rm` and `lv ct rm` forward to the workload's recorded host, and a
+removed host resolves neither from cluster state nor from gossip ("cannot
+reach host node-3: look up host ... not found in cluster state or gossip"),
+so a policy-none VM or a relocate-skipped container recorded on a removed
+host can be neither recovered nor removed, and its name cannot be added back.
+It also fails earlier on recovery: nothing recovers on the forced 2-voter
+generation until `lv host rm --dead`, because the coordinator judges the
+operator's confirmation to predate the outage (observer streaks are measured
+as `consecutive_failures × P`, and a powered-off host fails a probe about
+every 3 s, not every P = 2 s). Drills 2 and 3 fail `disk rows follow the
+replacement` on a returning host whose startup hardware backfill re-writes
+the disk row from its stale replica.
+
 ### Leaving the lab as it was found
 
 Each drill registers a restore before it injects anything: clear the drill

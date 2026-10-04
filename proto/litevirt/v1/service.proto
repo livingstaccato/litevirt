@@ -2271,6 +2271,15 @@ message ReadyResponse {
   // — no decision path may read it, and it is served only to a caller holding a
   // host certificate, because it carries local error text.
   string not_ready_reason = 3;
+  // partition_pause is enforcement.partition_pause as THIS run of the daemon
+  // holds it: whether it pauses its recoverable workloads on losing the voter
+  // majority. A failover coordinator relies on a host's pause only if the
+  // host's latest answer to this probe said so (docs/design/partition-pause.md
+  // §4.3). It rides on the health probe, not on Ping, because the probe runs
+  // every probe interval and the flag changes only with a restart, so the
+  // latest answer always comes from the run a coordinator last reached. False
+  // from a build that predates the field, which therefore is not relied on.
+  bool partition_pause = 4;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.

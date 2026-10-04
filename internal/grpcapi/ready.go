@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -46,7 +47,10 @@ func (s *Server) Ready(ctx context.Context, _ *pb.ReadyRequest) (*pb.ReadyRespon
 	rctx, cancel := context.WithTimeout(ctx, readyReadTimeout)
 	defer cancel()
 
-	resp := &pb.ReadyResponse{HostName: s.hostName, Ready: true}
+	// partition_pause is not posture worth withholding from an operator
+	// certificate: Ping's capabilities already say the same thing to the same
+	// callers, by withholding partition_pause_v1 while the flag is off.
+	resp := &pb.ReadyResponse{HostName: s.hostName, Ready: true, PartitionPause: s.enfPartitionPause.Load()}
 	reason := ""
 	rows, finished, err := s.boundedReadyQuery(rctx)
 	switch {
@@ -85,7 +89,17 @@ func (s *Server) PeerReady(ctx context.Context, host, addr string) (bool, string
 		return false, "", err
 	}
 	defer closeConn()
+	asked := time.Now()
 	resp, err := c.Ready(ctx, &pb.ReadyRequest{})
+	// Any answer is a contact with the run of the daemon that is up now, so
+	// its partition-pause flag replaces whatever this node knew before. An
+	// Unimplemented answer is a build that predates the field and pauses
+	// nothing a coordinator may rely on; an answer from another host than the
+	// one dialled says nothing about this one. Only a call that did not
+	// arrive leaves the last answer standing.
+	if err == nil || status.Code(err) == codes.Unimplemented {
+		s.peerPause.record(host, asked, err == nil && resp.GetHostName() == host && resp.GetPartitionPause())
+	}
 	if err != nil {
 		// Unimplemented means the RPC ARRIVED at a build that predates it. The
 		// peer is reachable and has said nothing about its readiness, which is
@@ -170,6 +184,54 @@ type readyFlight struct {
 	done    chan struct{}
 	rows    []corrosion.Row
 	err     error
+}
+
+// peerPauseAnswers is each peer's latest answer to the health probe about its
+// own partition pause (ReadyResponse.partition_pause).
+type peerPauseAnswers struct {
+	mu sync.Mutex
+	m  map[string]peerPauseAnswer
+}
+
+type peerPauseAnswer struct {
+	asked time.Time // when the probe that carried it was sent
+	pause bool
+}
+
+// record keeps on as host's answer unless a probe sent later has already
+// answered: two probes of one host can be in flight at once (the checker's,
+// and PeerUp's on demand), and the one sent last is the one that may have
+// reached a restarted daemon.
+func (a *peerPauseAnswers) record(host string, asked time.Time, on bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if prev, ok := a.m[host]; ok && prev.asked.After(asked) {
+		return
+	}
+	if a.m == nil {
+		a.m = map[string]peerPauseAnswer{}
+	}
+	a.m[host] = peerPauseAnswer{asked: asked, pause: on}
+}
+
+// PeerPausesOnLoss reports whether host's LATEST answer to this node's health
+// probe said it pauses its recoverable workloads on losing the voter majority.
+// It makes no RPC: the failover coordinator asks it about a host it has just
+// found unreachable.
+//
+// It is what the coordinator relies on (docs/design/partition-pause.md §4.3),
+// and not a cached Ping, because of how the flag changes: only with a restart.
+// The probe runs every probe interval, so the latest answer comes from the run
+// of the daemon this node last reached, whatever happened before it; a cached
+// Ping could be minutes older than that run, and was what a coordinator relied
+// on two minutes after the host's flag went off (lab finding P1). A host never
+// answered this run, or one whose build predates the answer, does not pause
+// as far as this reports. That is the side to fail on: it costs the reliance,
+// and the fence is recorded assumed as it was before partition pause existed.
+func (s *Server) PeerPausesOnLoss(host string) bool {
+	s.peerPause.mu.Lock()
+	defer s.peerPause.mu.Unlock()
+	return s.peerPause.m[host].pause
 }
 
 // dialReadyTarget reaches the peer at the address the health checker already

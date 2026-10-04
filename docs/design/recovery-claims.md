@@ -2246,3 +2246,33 @@ where it described the mechanism; this list records what changed and why.
       decided by a certificate about its real source. Revisit this if a
       destination's identity ever starts to carry meaning, for example
       host-pinned storage or a per-machine secret in the value.
+42. **A container skipped on a host removed for good is retried once a host
+    can take it** (§3.12, item 40, item 41 mitigation 1). On the kvm003 lab
+    (drill 6, main-e004c250) node-4 was the only host with a container
+    runtime, and was removed with `lv host rm --dead` holding blct. The
+    removed-host pass found no host for it and marked it `relocate-skipped`,
+    which the relocate loop never revisits. Re-admission refuses the name
+    while blct is recorded there, so node-4 could not come back, and the
+    refusal's only exit was to delete the container.
+    - **Why the name cannot simply take it back.** Re-admitting the name and
+      handing blct to the new machine by claim cannot work. A claim recovers a
+      workload FROM a source host, and every voter refuses the accept while it
+      reaches that host by name (§3.5.1). Once the name is live again the new
+      machine answers for it, so no certificate forms. Re-admitting and letting
+      the new machine start blct from its row is the uncertified start that
+      f9f33583 closed (N5). Taking the name back needs a value that names the
+      source machine rather than the name, the change item 41 describes.
+    - **The rule.** The refusal stands. On a host removed for good, and only
+      there, a `relocate-skipped` container is relocated again once placement
+      finds a host for it, through the same claimed relocation as at the
+      failure (`retrySkippedOnRemovedHost`). The refusal names this way out:
+      bring up a host that can take the workload, which can be the rebuilt
+      machine under another name. The name is free once the container has
+      moved. On a fenced host the skip stays terminal, because that host may
+      come back with the container's rootfs.
+    - **Cost.** While no host can take it, the retry writes and audits
+      nothing. A container with no image to re-pull comes back only from a
+      backup, so its restore is retried once per target.
+    - No schema, statement shape, protobuf or capability change. An older
+      coordinator leaves the skip terminal, as before. A newer one retries it
+      under a claim that every build's voters already decide.

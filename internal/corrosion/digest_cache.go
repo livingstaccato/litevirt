@@ -208,7 +208,32 @@ func openHookedDB(dsn string) (*sql.DB, *tableGenerations, error) {
 		return nil, nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	gens := acquireGenerations(dsn)
-	return sql.OpenDB(hookedConnector{Connector: base, gens: gens}), gens, nil
+	db := sql.OpenDB(hookedConnector{Connector: base, gens: gens})
+	sizeConnPool(db)
+	return db, gens, nil
+}
+
+// maxIdleConns is how many connections the pool keeps between uses, and
+// maxConnIdleTime how long it keeps one nobody uses.
+//
+// database/sql keeps two by default. Readers share c.mu's read side, so a
+// busy node runs many at once (checker, coordinator, reconciler, replicator
+// per peer, gRPC handlers), and with two idle slots every burst closed the
+// rest on release and reopened them on the next. A fresh SQLite connection
+// runs the DSN's PRAGMAs and parses the whole schema before its first
+// statement — while its reader holds c.mu, so every writer queued behind it
+// waits too. That stalled recovery-claim voters past the proposer's per-call
+// timeout under load (TestConnPool_ConcurrentReadersKeepTheirConnections).
+// The idle limit bounds what a burst leaves open: each connection carries its
+// own page cache, which the idle time returns once the burst is over.
+const (
+	maxIdleConns    = 16
+	maxConnIdleTime = 2 * time.Minute
+)
+
+func sizeConnPool(db *sql.DB) {
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxIdleTime(maxConnIdleTime)
 }
 
 // cachedTableDigest is one table's digest set as of generation gen.

@@ -394,7 +394,7 @@ options (VNC via noVNC; SPICE-in-browser is on the roadmap).
 
       # ── Day-2 reconciliation ──
       rebalance:
-        mode: dry-run               # off | dry-run | on-demand | auto
+        mode: dry-run               # off | dry-run | auto
         threshold: 15               # min % score gain to trigger a proposal (default 15)
         cooldown: 5m                # min interval per VM (default 5m)
         budget:
@@ -419,8 +419,7 @@ litevirt's placement engine has two orthogonal axes (see
 
 2. **Rebalancer mode** — day-2 reconciliation:
    - `off`: never propose moves.
-   - `dry-run` (cluster default): write proposals; operator reviews via `lv rebalance list`.
-   - `on-demand`: write proposals; require `lv rebalance approve <id>` before migration.
+   - `dry-run` (cluster default): write proposals; nothing moves until an operator reviews them via `lv rebalance list` and runs `lv rebalance approve <id>`.
    - `auto`: write proposals + immediately approve (subject to budget).
 
 The two compose freely; the rebalancer evaluates each VM under **its own** resolved policy, so a single cluster can mix bin-pack batch jobs with spread-strict prod VMs without one's policy influencing the other.
@@ -433,10 +432,14 @@ For the 80% case, named modes expand at parse time:
 |---|---|
 | `performance` | `policy: balance` + `rebalance.mode: dry-run` |
 | `savings` | `policy: bin-pack` + `rebalance.mode: auto` (off-hours window, generous budget) |
-| `ha-critical` | `policy: spread-strict` + `rebalance.mode: on-demand` |
+| `ha-critical` | `policy: spread-strict` + `rebalance.mode: dry-run` |
 | `spot-cheap` | `policy: cost-aware` + `rebalance.mode: auto` |
 
 Explicit `policy:` or `rebalance:` fields on the same `placement` block override the alias defaults.
+
+`rebalance.mode: on-demand` was removed: it behaved exactly like `dry-run`. A
+compose file that still names it fails validation and names `dry-run` as the
+replacement.
 
 ### Hard constraints
 

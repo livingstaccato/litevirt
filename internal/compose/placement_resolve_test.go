@@ -94,7 +94,7 @@ func TestMergePlacement_ChildOverridesParent(t *testing.T) {
 func TestMergePlacement_ChainResolves(t *testing.T) {
 	cluster := ResolveClusterPlacementDefault()
 	stack := &PlacementDef{
-		Mode: "ha-critical", // spread-strict + on-demand
+		Mode: "ha-critical", // spread-strict + dry-run
 	}
 	vm := &PlacementDef{
 		AntiAffinity: []string{"web-1"},
@@ -104,8 +104,8 @@ func TestMergePlacement_ChainResolves(t *testing.T) {
 	if final.Policy != "spread-strict" {
 		t.Errorf("final.Policy = %q, want spread-strict", final.Policy)
 	}
-	if final.Rebalance.Mode != "on-demand" {
-		t.Errorf("final.Rebalance.Mode = %q, want on-demand", final.Rebalance.Mode)
+	if final.Rebalance.Mode != "dry-run" {
+		t.Errorf("final.Rebalance.Mode = %q, want dry-run", final.Rebalance.Mode)
 	}
 	if len(final.AntiAffinity) != 1 || final.AntiAffinity[0] != "web-1" {
 		t.Errorf("final.AntiAffinity = %v, want [web-1]", final.AntiAffinity)

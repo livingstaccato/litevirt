@@ -4,7 +4,7 @@
   <div style="display:flex;gap:8px">
     <button class="btn" hx-post="/ui/rebalance/run?dry_run=true" hx-swap="none">Dry-run</button>
     <button class="btn btn-primary" hx-post="/ui/rebalance/run" hx-swap="none"
-            hx-confirm="Run a rebalance cycle now? Proposals still respect each VM's mode (off/on-demand are skipped).">Run now</button>
+            hx-confirm="Run a rebalance cycle now? Proposals still respect each VM's mode (mode=off is skipped).">Run now</button>
   </div>
 </div>
 <p class="muted" style="margin:0 0 12px;font-size:12px">

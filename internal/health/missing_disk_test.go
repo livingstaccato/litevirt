@@ -113,6 +113,18 @@ func TestStartLocalVM_DiskMissingResolves(t *testing.T) {
 	if err := corrosion.UpdateVMState(ctx, db, "vm-n5", "stopped", "operator"); err != nil {
 		t.Fatal(err)
 	}
+
+	// Not while the replica is catching up (with a peer to catch up from): the
+	// row it reads may not be the cluster's yet.
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{Name: "host-b", Address: "10.0.0.2", SSHUser: "root", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	r.SetReplicaFreshness(func() (bool, string) { return false, "catching up" })
+	r.reconcile(ctx)
+	if c, _, _ := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskMissing, "vm", "vm-n5@host-a"); c.Lifecycle == corrosion.ConditionResolved {
+		t.Fatal("resolved from a replica that has not caught up")
+	}
+	r.SetReplicaFreshness(nil)
 	r.reconcile(ctx)
 
 	c, ok, err := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskMissing, "vm", "vm-n5@host-a")

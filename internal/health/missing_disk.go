@@ -98,8 +98,13 @@ func (r *Reconciler) refuseLocalStartWithoutDisk(ctx context.Context, vmName str
 
 // resolveDiskMissing resolves this host's vm_disk_missing rows whose VM has
 // left the refused state here: it is gone, on another host, or no longer in
-// error (restored and started, rebuilt, or stopped by an operator).
+// error (restored and started, rebuilt, or stopped by an operator). Not
+// while the replica is catching up: a row it has not received yet would
+// resolve the condition early.
 func (r *Reconciler) resolveDiskMissing(ctx context.Context) {
+	if ok, _ := r.replicaTrusted(ctx); !ok {
+		return
+	}
 	open, err := corrosion.ListHealthConditions(ctx, r.db, false)
 	if err != nil {
 		return

@@ -119,7 +119,19 @@ while VMs or containers are still recorded on the host removed under it, and
 names them. They are recovered onto live hosts by the claim path for a host
 removed for good, which needs the name to stay removed; wait until they have
 moved (`lv health` shows `ha.claim.stranded` for any that cannot), or remove
-them, and add the host again.
+them, and add the host again. `lv rm <vm>` and `lv ct rm <name>` work on a
+workload recorded on a removed host without contacting it: they delete its
+cluster rows and audit the delete as one on a removed host. Nothing on the
+removed machine is touched, and disks on shared storage are kept.
+
+A workload that no live host can take waits until one can. The usual case is a
+container whose host was the only one with a container runtime: it is left on
+the removed host, marked `relocate-skipped`, and the name stays refused. Bring
+up a host that can run it (this machine, added under another name, will do)
+and the coordinator relocates the container onto it by claim, as it would
+have at the failure. The old name is then free to add again. The name itself
+cannot take the container back, because a claim is refused while the host it
+recovers from answers under that name, and a re-added machine does.
 
 3. Edit `/etc/litevirt/config.yaml` on the new host to set the join address:
 

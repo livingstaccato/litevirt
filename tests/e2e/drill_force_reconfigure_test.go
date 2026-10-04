@@ -185,21 +185,32 @@ func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
 		hs := r.executing(k)
 		return len(hs) == 1 && contains(survivors, hs[0])
 	})
-	if _, ok := recovered[key]; !ok {
-		t.Errorf("%s was not recovered on a survivor within %v of the power-off (N3: missing_witness?)\n  %s", key, recoverBy, s.last())
-		t.Logf("coordinator decisions:\n%s%s", l.journalSince(survivors[0], since, "decision gate|no eligible host|rescheduling"),
-			l.journalSince(survivors[1], since, "decision gate|no eligible host|rescheduling"))
-	}
+	var onSurvivor []string
 	for _, k := range lostKeys {
-		if k == key {
-			continue
-		}
-		if hs := s.last().executing(k); len(hs) == 0 {
+		if hs := s.last().executing(k); len(hs) == 1 && contains(survivors, hs[0]) {
+			onSurvivor = append(onSurvivor, k)
+		} else if k != key {
 			l.mark("drill6: note %s not recovered (two survivors may lack the memory)", k)
 		}
 	}
+	if _, ok := recovered[key]; !ok {
+		// Two survivors cannot hold three hosts' guests, and the coordinator
+		// places host by host, so the test VM can find them full. That is not
+		// the drill's failure when the coordinator said so and recovered others
+		// on the forced generation; anything else is (N3: missing_witness).
+		full := regexp.MustCompile(`no eligible host for VM.*vm=` + regexp.QuoteMeta(test) + `\b|batch placement failed.*host=` + regexp.QuoteMeta(target) + `\b`)
+		decisions := l.journalSince(survivors[0], since, "decision gate|no eligible host|batch placement failed|rescheduling") +
+			l.journalSince(survivors[1], since, "decision gate|no eligible host|batch placement failed|rescheduling")
+		l.saveEvidence("coordinator-decisions.txt", decisions)
+		if full.MatchString(decisions) && len(onSurvivor) > 0 {
+			l.mark("drill6: %s not recovered: the survivors are full (coordinator said so); recovered on the forced generation: %v", key, onSurvivor)
+		} else {
+			t.Errorf("%s was not recovered on a survivor within %v of the power-off (N3: missing_witness?); recovered: %v\n  %s", key, recoverBy, onSurvivor, s.last())
+			t.Logf("coordinator decisions:\n%s", decisions)
+		}
+	}
 
-	// ── 4. remove, clear, rebuild, re-add, re-vote, put back ────────────────
+	// ── 4. remove, rebuild, clear, re-add, re-vote, put back ────────────────
 	if !d.run() {
 		t.FailNow()
 	}
@@ -241,9 +252,12 @@ func (d *d6) finish() {
 }
 
 // run takes the rebuild from wherever it stands to the end, stopping at the
-// first step that fails.
+// first step that fails. The lost machines are destroyed straight after their
+// removal, before anything that can fail: a removed machine booted again by a
+// restore would come back with its old replica, which still names it the owner
+// of its workloads.
 func (d *d6) run() bool {
-	return d.removeDead() && d.clearRemoved() && d.rebuild() && d.addBack() && d.voteBack() && d.putBack()
+	return d.removeDead() && d.rebuild() && d.clearRemoved() && d.addBack() && d.voteBack() && d.putBack()
 }
 
 // removeDead runs `lv host rm --dead` for every lost host still present.

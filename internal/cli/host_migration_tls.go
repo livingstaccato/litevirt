@@ -220,7 +220,7 @@ type MigrationTLSHost interface {
 func InstallMigrationTLS(ctx context.Context, pkiDir string, hosts []MigrationTLSHost, reissue bool, out io.Writer) error {
 	if MigrationRotationInProgress(pkiDir) {
 		return fmt.Errorf("a migration-CA rotation is in progress (%s); finish it with "+
-			"`lv host rotate-migration-ca` before reissuing", filepath.Join(pkiDir, rotationFileName)) // ci:skip-cmd: rotate-migration-ca ships in a later task
+			"`lv host rotate-migration-ca` before reissuing", filepath.Join(pkiDir, rotationFileName))
 	}
 	provisioned := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
@@ -288,7 +288,7 @@ func (h *sshMigrationTLSHost) Push(ctx context.Context, files []migrationFile) e
 }
 
 // MigrationRotationInProgress reports whether pkiDir holds an unfinished
-// `lv host rotate-migration-ca`. An unreadable state file counts as in // ci:skip-cmd: rotate-migration-ca ships in a later task
+// `lv host rotate-migration-ca`. An unreadable state file counts as in
 // progress: guessing "no" would let a reissue mint from the wrong CA.
 func MigrationRotationInProgress(pkiDir string) bool {
 	r, err := loadMigrationRotation(pkiDir)

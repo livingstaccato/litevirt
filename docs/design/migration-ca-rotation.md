@@ -68,7 +68,7 @@ It sits beside `install-migration-tls` and reaches hosts the same way
 |---|---|
 | `migration-ca.crt` / `.key` | the current CA |
 | `migration-ca.next.crt` / `.key` | the new CA; exists only mid-rotation (key 0600) |
-| `migration-rotation.json` | `phase` (`trust-both`, `reissued`, `drop-old`, `done`), `no_overlap`, the new CA's fingerprint, and per host which phases completed or were `skipped` |
+| `migration-rotation.json` | `phase` (`trust-both`, `reissue`, `drop-old`, `cutover` (`--no-overlap`'s single pass), `done`), `no_overlap`, the new CA's fingerprint, and per host which phases completed or were `skipped` |
 | `migration-ca.retired-<YYYYMMDD>.crt` | the old CA certificate, kept for audit after a rotation; its key is deleted |
 
 Re-running the command reads `migration-rotation.json` and continues from where

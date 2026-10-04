@@ -13,7 +13,7 @@ import (
 )
 
 // A migration-CA rotation's progress, kept beside the CA on the machine that
-// runs `lv host rotate-migration-ca`, so a re-run continues where it stopped. // ci:skip-cmd: rotate-migration-ca ships in a later task
+// runs `lv host rotate-migration-ca`, so a re-run continues where it stopped.
 const (
 	rotationFileName = "migration-rotation.json"
 	nextCACertName   = "migration-ca.next.crt"

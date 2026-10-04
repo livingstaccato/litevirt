@@ -104,6 +104,49 @@ CA-set split across hosts with no rotation running from the operator machine.
 Each host also warns in its own log 90 days before a migration credential
 expires, whether or not anyone runs the doctor command.
 
+**Rotating the migration CA.** `lv host rotate-migration-ca [--no-overlap]
+[--force] [--ssh-user root]` replaces the migration CA on every host, run from
+the machine that holds it. By default it walks three phases, checking every
+host's daemon between them:
+
+1. **trust-both** — every host trusts the old CA and the new one.
+2. **reissue** — every host gets a certificate from the new CA.
+3. **drop-old** — every host trusts the new CA alone; the operator machine
+   retires the old one.
+
+Storage migrations keep working throughout, and no host needs a restart. If
+the command stops partway (a host is unreachable), its progress is saved
+beside the CA; running it again resumes from where it left off rather than
+starting over. That progress — and the new CA while a rotation is in
+progress — lives in `pki_dir` alongside the current CA, in five files:
+`migration-ca.next.crt` / `migration-ca.next.key` (the new CA, key mode 0600),
+`migration-ca.bundle.crt` (the two-certificate trust bundle pushed during
+trust-both), `migration-rotation.json` (phase and per-host progress), and,
+once the rotation finishes, `migration-ca.retired-YYYYMMDD.crt` (the old CA
+certificate, kept for audit; its key is deleted).
+
+`--no-overlap` skips the overlap window entirely: it cuts every host straight
+to the new CA alone in one pass. Use it only when the migration CA key is
+compromised — there is no window where both CAs are trusted, so migrations
+between a host already rotated and one not yet rotated are refused until every
+host is done (falling back to plaintext only if that host set
+`migration.allow_unencrypted_storage`). `--force` leaves an unreachable host
+behind instead of stopping the whole run; it keeps the old CA's credentials,
+so migrations with it are refused until you run
+`lv host install-migration-tls --reissue` once it is back.
+
+While a rotation is in progress, `lv host add` issues the new node's migration
+credentials from the rotation's new CA, and `lv host install-migration-tls`
+refuses to run at all (reissuing from the old CA would hand out credentials
+the rotation is retiring).
+
+*If the migration CA key is compromised:*
+
+1. `lv host rotate-migration-ca --no-overlap`
+2. `lv doctor migration-tls` until it exits 0
+3. For any host the rotation skipped, `lv host install-migration-tls
+   --reissue` once it is back.
+
 Only the host-local disks (`local` and `dir` pools) are copied. A disk on
 shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on
 the target, so it stays where it is; copying it would mirror the disk onto

@@ -113,7 +113,7 @@ func logMigrationExpiry(log *slog.Logger, info pki.MigrationTLSInfo, now time.Ti
 	for _, e := range info.Expiring(now) {
 		fix := "`lv host install-migration-tls --reissue`"
 		if strings.HasPrefix(e.What, "CA ") {
-			fix = "`lv host rotate-migration-ca`" // ci:skip-cmd: ships in a later task
+			fix = "`lv host rotate-migration-ca`"
 		}
 		level, verb := slog.LevelWarn, "expires"
 		if e.Expired {

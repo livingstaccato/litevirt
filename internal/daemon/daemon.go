@@ -1066,17 +1066,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables
 	// (vm_nics, vm_disks.bus, vm_pci_intent) and record each owned VM's adoption
-	// verdict, THEN mark this node hardware_v2-advertise-ready. Runs SYNCHRONOUSLY
-	// here — AFTER the schema is applied (InitSchema, above) and the
-	// operation-protocol config/latch is wired (hardware mutations depend on the
-	// crash-safe operation journal), and BEFORE the gRPC server begins serving Ping
-	// (below) — so no peer can read this node's advertised capabilities until the
-	// backfill has set the readiness flag advertisedCapabilities gates hardware_v2
-	// on. A backfill error DEGRADES (logged; the node simply keeps withholding
-	// hardware_v2 until a later attempt succeeds) rather than crashing the daemon.
-	if err := svc.BackfillHardwareTables(ctx); err != nil {
-		slog.Error("hardware backfill failed; node will not advertise hardware_v2 until it succeeds", "error", err)
-	}
+	// verdict, THEN mark this node hardware_v2-advertise-ready. Started here —
+	// AFTER the schema is applied (InitSchema, above) and the operation-protocol
+	// config/latch is wired (hardware mutations depend on the crash-safe
+	// operation journal) — but run in the BACKGROUND, because the pass waits for
+	// this node's replica to catch up: it publishes rows for the VMs the local
+	// replica says this host owns, and a replica back from a fence still names
+	// VMs failover has moved away (RunHardwareBackfill). Until it succeeds the
+	// readiness flag advertisedCapabilities gates hardware_v2 on stays false, so
+	// no peer reads hardware_v2 from this node early. A failed pass DEGRADES
+	// (logged and retried) rather than crashing the daemon.
+	go svc.RunHardwareBackfill(ctx)
 	// Continuous legacy→vm_nics bridge: mirrors vm_interfaces writes an OLD peer
 	// makes during the rolling-upgrade window into vm_nics (one-directional; old
 	// peers ignore vm_nics), converging the read overlay toward vm_nics completeness.

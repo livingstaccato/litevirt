@@ -209,7 +209,7 @@ func (s *Server) autoDefineRestoredVM(
 	diskRecords := []corrosion.DiskRecord{{
 		VMName: targetName, DiskName: "root", HostName: s.hostName,
 		Path: overlayPath, SizeBytes: manifest.TotalSize, StorageType: "local",
-		TargetDev: rootDev,
+		TargetDev: rootDev, Bus: rootBus,
 	}}
 
 	// Networks from the spec. On a rename we regenerate MACs so the

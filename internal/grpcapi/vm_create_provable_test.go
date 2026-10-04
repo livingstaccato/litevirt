@@ -335,3 +335,42 @@ func TestAssignOwnerEpochAtCreate_SurvivesACancelledRPCContext(t *testing.T) {
 		t.Errorf("file marker = (%d,%v,%v), want (1,true,nil)", epoch, ok, err)
 	}
 }
+
+// TestCreateVM_DiskRowsCarryTheirBus: CreateVM records each disk's bus in its
+// vm_disks row, the defaulted one included, so the startup hardware backfill
+// has nothing to fill for a VM this build created. A backfill write is the one
+// a restarted node made from a stale replica on the kvm003 lab (main-e004c250,
+// drills 2 and 3), reverting a failover's disk move.
+//
+// Mutation: drop the bus from InsertVMWithHardware's disk statement (bind NULL)
+// — both rows come back bus-less.
+func TestCreateVM_DiskRowsCarryTheirBus(t *testing.T) {
+	s, _ := provableCreateServer(t)
+	ctx := adminCtx()
+
+	req := disklessCreateRequest("vm1")
+	req.Spec.Disks = []*pb.DiskSpec{
+		{Name: "root", Size: "1G"}, // bus defaulted to virtio by CreateVM
+		{Name: "data", Size: "1G", Bus: "scsi"},
+	}
+	if _, err := s.CreateVM(ctx, req); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	disks, err := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"root": "virtio", "data": "scsi"}
+	if len(disks) != len(want) {
+		t.Fatalf("want %d disk rows, have %+v", len(want), disks)
+	}
+	for _, d := range disks {
+		if d.Bus != want[d.DiskName] {
+			t.Errorf("disk %s: bus = %q, want %q", d.DiskName, d.Bus, want[d.DiskName])
+		}
+		if d.DeviceKind != "disk" || !d.DeleteWithVM {
+			t.Errorf("disk %s: device_kind=%q delete_with_vm=%v, want the column defaults (disk, true)",
+				d.DiskName, d.DeviceKind, d.DeleteWithVM)
+		}
+	}
+}

@@ -458,6 +458,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			StorageType:   storageType,
 			StorageVolume: d.Storage,
 			TargetDev:     lv.DiskDevName(d.Bus, i),
+			Bus:           d.Bus,
 		})
 	}
 
@@ -483,6 +484,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			BackingImage: spec.Image,
 			StorageType:  "local",
 			TargetDev:    lv.DiskDevName("virtio", 0),
+			Bus:          "virtio",
 		})
 	}
 

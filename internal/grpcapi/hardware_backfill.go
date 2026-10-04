@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -36,9 +37,24 @@ const hardwareBridgeInterval = 30 * time.Second
 // definition, malformed blob, ambiguous device grouping) is recorded as
 // hardware_adoption_blocked and the pass CONTINUES to the next VM. Backfill
 // returns a non-nil error ONLY for a failure that prevents the pass from
-// running at all (e.g. the initial owned-VM listing) — never because some VMs
-// blocked.
+// running at all (e.g. the initial owned-VM listing, or a replica that has not
+// caught up) — never because some VMs blocked.
+//
+// It REFUSES, with ErrBackfillReplicaNotCaughtUp, until this node's replica has
+// caught up with the cluster (corrosion.ReplicaTrusted). "The VMs this host
+// owns" is read from the local replica, and every write below publishes a row
+// stamped now. A node back from a fence still lists the VMs failover moved
+// away while it was down; on the kvm003 lab (main-e004c250, drills 2 and 3)
+// node-1 filled vm_disks.bus for such a VM ~2 minutes after its disk rows had
+// moved to node-2, and its newer row carried host_name=node-1 back over the
+// owner's on every node. No guard on the write can do the job of this one: on
+// a stale replica every local witness agrees the VM is still ours.
 func (s *Server) BackfillHardwareTables(ctx context.Context) error {
+	if s.db != nil {
+		if ok, why := corrosion.ReplicaTrusted(ctx, s.db, s.hostName, s.db.ReplicaCaughtUp); !ok {
+			return fmt.Errorf("%w: %s", ErrBackfillReplicaNotCaughtUp, why)
+		}
+	}
 	vms, err := corrosion.ListVMs(ctx, s.db, "", s.hostName)
 	if err != nil {
 		return fmt.Errorf("hardware backfill: list owned VMs: %w", err)
@@ -68,6 +84,51 @@ func (s *Server) BackfillHardwareTables(ctx context.Context) error {
 	// keep the whole node from reading the tables it did populate.
 	s.hwV2Ready.Store(true)
 	return nil
+}
+
+// ErrBackfillReplicaNotCaughtUp is BackfillHardwareTables declining to run
+// because this node's replica has not caught up with the cluster yet.
+var ErrBackfillReplicaNotCaughtUp = errors.New("hardware backfill deferred: this node's replica has not caught up with the cluster")
+
+// hardwareBackfillRetry is how often RunHardwareBackfill re-tries a pass that
+// was deferred or failed. A deferral ends with the first completed
+// anti-entropy exchange, so a short poll is what keeps hardware_v2 readiness
+// from lagging the catch-up.
+const hardwareBackfillRetry = 2 * time.Second
+
+// RunHardwareBackfill runs BackfillHardwareTables once it can succeed: it
+// retries while the replica has not caught up (or a pass fails outright), and
+// returns after the first successful pass or when ctx is cancelled.
+//
+// The daemon starts it in the background. Until it succeeds hwV2Ready stays
+// false, so the node withholds hardware_v2 — the direction CONTRACT h already
+// takes for a failed pass. Running it synchronously would hold the daemon's
+// startup on a catch-up that can take as long as the cluster is unreachable.
+func (s *Server) RunHardwareBackfill(ctx context.Context) {
+	deferredLogged := false
+	for {
+		err := s.BackfillHardwareTables(ctx)
+		switch {
+		case err == nil:
+			if deferredLogged {
+				slog.Info("hardware backfill ran now that this node's replica has caught up")
+			}
+			return
+		case errors.Is(err, ErrBackfillReplicaNotCaughtUp):
+			if !deferredLogged {
+				slog.Info("hardware backfill deferred until this node's replica catches up; hardware_v2 is withheld until it runs",
+					"detail", err.Error())
+				deferredLogged = true
+			}
+		default:
+			slog.Error("hardware backfill failed; node will not advertise hardware_v2 until it succeeds", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(hardwareBackfillRetry):
+		}
+	}
 }
 
 // RunHardwareBridge is the continuous legacy→vm_nics bridge (CONTRACT: transition
@@ -158,8 +219,10 @@ func encodeSecurityGroups(sgs []string) string {
 // (matched by disk name); a legacy row lacking spec data falls back to the same
 // target-dev heuristic resolveDiskBus applies elsewhere (sdX → scsi, else
 // virtio). Idempotent: a disk whose bus is already set is skipped, so a rerun
-// never rewrites it. The full DiskRecord is re-upserted (INSERT OR REPLACE),
-// reusing the existing vm_disks insert shape — no new statement shape.
+// never rewrites it. A disk row naming another host is skipped too, and the
+// write lands only while the row is still exactly as read and still this
+// host's (corrosion.BackfillDiskBus): the backfill fills a column, it never
+// moves a row.
 func (s *Server) backfillVMDiskBuses(ctx context.Context, vm *corrosion.VMRecord) error {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
@@ -167,15 +230,20 @@ func (s *Server) backfillVMDiskBuses(ctx context.Context, vm *corrosion.VMRecord
 	}
 	specBuses := diskBusesFromSpec(vm.Spec)
 	for _, d := range disks {
-		if d.Bus != "" {
-			continue // already populated — idempotent skip
+		if d.Bus != "" || d.HostName != s.hostName {
+			continue // already populated, or not this host's disk
 		}
-		d.Bus = resolveDiskBus("", specBuses[d.DiskName], d.TargetDev)
-		if d.Bus == "" {
+		bus := resolveDiskBus("", specBuses[d.DiskName], d.TargetDev)
+		if bus == "" {
 			continue // resolveDiskBus always yields a bus, but stay defensive
 		}
-		if err := corrosion.InsertDisk(ctx, s.db, d); err != nil {
+		applied, err := corrosion.BackfillDiskBus(ctx, s.db, d, bus, s.hostName)
+		if err != nil {
 			return err
+		}
+		if !applied {
+			slog.Info("hardware backfill: disk row changed under the backfill, left as it is",
+				"vm", vm.Name, "disk", d.DiskName)
 		}
 	}
 	return nil

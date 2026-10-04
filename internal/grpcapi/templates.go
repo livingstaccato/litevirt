@@ -197,7 +197,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		diskRecords = append(diskRecords, corrosion.DiskRecord{
 			VMName: req.Target, DiskName: d.DiskName, HostName: s.hostName, Path: clonePath,
 			SizeBytes: d.SizeBytes, StorageType: d.StorageType, BackingDisk: backing,
-			TargetDev: lv.DiskDevName(bus, len(diskRecords)),
+			TargetDev: lv.DiskDevName(bus, len(diskRecords)), Bus: bus,
 		})
 	}
 

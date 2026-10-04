@@ -593,9 +593,27 @@ func (c *Client) NowTS() string {
 	if c.hlcEmit != nil && c.clock != nil && c.hlcEmit() {
 		return c.clock.Now().String()
 	}
+	return c.NowWallTS()
+}
+
+// NowWallTS is NowTS without the HLC branch: a strictly-monotonic, fixed-width
+// RFC3339Nano LWW key, persisted ahead exactly as NowTS's, and floored strictly
+// above the HLC physical high-water so it orders after any HLC key this node has
+// emitted or adopted. NowTS's own RFC3339 path IS this function.
+//
+// It is for the updated_at of a table whose stamp an older release may still
+// read as wall time — vm_restarts and container_restarts. Mid-roll, an HLC
+// "17…" key sorts below every RFC3339 cutoff an older lexical reader compares
+// it against. What those writers need is sub-second resolution, so a reset and
+// the restart recorded right after it do not tie on a peer, and a single writer
+// does nearly all of it; HLC adds nothing there. A reader
+// of either form still compares by instant (lwwOrder, TsMsSQL), and an older
+// lexical reader is off by under a second on an RFC3339Nano key.
+func (c *Client) NowWallTS() string {
 	// Bridge floor from the HLC physical high-water — read BEFORE taking tsMu (lock
-	// order: persistHLCCeiling takes tsMu while holding the clock lock, so NowTS must
-	// never acquire the clock lock while holding tsMu). After HLC emission or a
+	// order: persistHLCCeiling takes tsMu while holding the clock lock, so NowTS and
+	// this, its RFC3339 path, must never acquire the clock lock while holding tsMu).
+	// After HLC emission or a
 	// skewed-peer HLC adoption, the HLC physical can be AHEAD of wall; a rollback to
 	// RFC3339 must not emit below it, or a fresh RFC key would sort older than existing
 	// HLC rows and silently lose LWW. Zero when there's no clock.

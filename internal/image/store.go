@@ -149,9 +149,16 @@ func (s *Store) CreateEmptyDisk(vmName, diskName, size string) (string, error) {
 // overlay names it in backing_disk, the file is swept anyway, and every chain
 // built on it is destroyed. Callers pass the set of paths still referenced;
 // nil means "nothing is referenced", which the caller has to mean.
+// VMDiskCandidates returns exactly the files DeleteVMDisks would consider for
+// this VM name. Both go through it so the set a caller PROTECTS and the set that
+// gets DELETED cannot drift apart — a guard computed against a different list
+// than the glob walks is a guard with a hole in it.
+func (s *Store) VMDiskCandidates(vmName string) ([]string, error) {
+	return filepath.Glob(filepath.Join(s.diskDir, vmName+"-*.qcow2"))
+}
+
 func (s *Store) DeleteVMDisks(vmName string, keep map[string]bool) error {
-	pattern := filepath.Join(s.diskDir, vmName+"-*.qcow2")
-	matches, err := filepath.Glob(pattern)
+	matches, err := s.VMDiskCandidates(vmName)
 	if err != nil {
 		return err
 	}

@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -158,11 +157,10 @@ func (s *Server) ApproveRebalanceProposal(ctx context.Context, req *pb.ApproveRe
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
 	if err := s.db.Execute(ctx,
 		`UPDATE rebalance_proposals
 		 SET status = 'approved', updated_at = ?
-		 WHERE id = ? AND status = 'pending'`, now, req.Id); err != nil {
+		 WHERE id = ? AND status = 'pending'`, s.db.NowTS(), req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "approve: %v", err)
 	}
 	return s.fetchProposal(ctx, req.Id)
@@ -174,7 +172,6 @@ func (s *Server) RejectRebalanceProposal(ctx context.Context, req *pb.RejectReba
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
 	detail := "rejected by operator"
 	if req.Reason != "" {
 		detail = "rejected: " + req.Reason
@@ -182,7 +179,7 @@ func (s *Server) RejectRebalanceProposal(ctx context.Context, req *pb.RejectReba
 	if err := s.db.Execute(ctx,
 		`UPDATE rebalance_proposals
 		 SET status = 'rejected', detail = ?, updated_at = ?
-		 WHERE id = ? AND status = 'pending'`, detail, now, req.Id); err != nil {
+		 WHERE id = ? AND status = 'pending'`, detail, s.db.NowTS(), req.Id); err != nil {
 		return nil, status.Errorf(codes.Internal, "reject: %v", err)
 	}
 	return s.fetchProposal(ctx, req.Id)

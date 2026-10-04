@@ -1071,14 +1071,16 @@ func (r *Replicator) pruneClockSkew(ctx context.Context) {
 //
 // Age is measured on updated_at, which every transition sets (see
 // scheduler.rebalancer and grpcapi.rebalanceExecutor), so it is the time the
-// proposal went terminal rather than the time it was proposed.
+// proposal went terminal rather than the time it was proposed. updated_at is
+// the LWW key (NowTS), so it may be HLC: the age is read through tsMsSQL, never
+// as a lexical compare that would sort every HLC stamp below the cutoff.
 //
 // Like the other prune helpers this is a LOCAL delete (raw ExecContext, not
 // the mutation_log path), so it is not replicated: every node prunes its own
 // copy on the same age threshold, which converges without spending
 // replication bandwidth on deletions of dead rows.
 func (r *Replicator) pruneRebalanceProposals(ctx context.Context) {
-	cutoff := time.Now().Add(-RebalanceProposalRetention).UTC().Format(time.RFC3339)
+	cutoff := time.Now().Add(-RebalanceProposalRetention).UnixMilli()
 
 	r.client.mu.Lock()
 	defer r.client.mu.Unlock()
@@ -1086,7 +1088,7 @@ func (r *Replicator) pruneRebalanceProposals(ctx context.Context) {
 	result, err := r.client.db.ExecContext(ctx,
 		`DELETE FROM rebalance_proposals
 		 WHERE status IN ('applied', 'failed', 'rejected', 'expired')
-		   AND updated_at < ?`, cutoff)
+		   AND `+tsMsSQL("updated_at")+` < ?`, cutoff)
 	if err != nil {
 		slog.Warn("replicator: prune rebalance_proposals error", "error", err)
 		return

@@ -112,8 +112,9 @@ func TestFleet_RebalanceDryRunApprovesNothing(t *testing.T) {
 }
 
 // The same cluster shape without --dry-run: auto-mode proposals are approved.
-// Behaviour outside a dry run is unchanged. Asserted on the node that ran the
-// cycle, which is where the executor reads them.
+// Behaviour outside a dry run is unchanged. Asserted on every node: the
+// approval must reach the peer too, or a peer that later takes the rebalancer
+// lease finds the proposals pending and never executes them.
 func TestFleet_RebalanceRealRunStillAutoApproves(t *testing.T) {
 	c := New(t, Options{Nodes: 2})
 	ctx := context.Background()
@@ -131,4 +132,5 @@ func TestFleet_RebalanceRealRunStillAutoApproves(t *testing.T) {
 	if got := proposalStatusCounts(t, loaded.DB); got["approved"] != emitted {
 		t.Fatalf("proposal statuses %v; want all %d auto-mode proposals approved", got, emitted)
 	}
+	assertProposalsAgree(t, c, loaded, proposalStatuses(t, loaded.DB))
 }

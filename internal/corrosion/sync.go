@@ -1021,6 +1021,10 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			if keepLocal {
 				skipped++
 				pk := pkKeyAt(row, pkIdx)
+				// Remembered at once, not after commit: the sensitive lane must
+				// refuse this account's credential even if this chunk rolls back.
+				idx := columnIndexMap(table.Columns)
+				c.remints.note(cellStr(row, idx, "username"), cellStr(row, idx, "password_hash"))
 				c.deferAfterCommit(tx, func() {
 					c.noteAdminRemintRefused(pathAE)
 					slog.Warn("anti-entropy: kept the local credential row",
@@ -1028,6 +1032,13 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				})
 				continue
 			}
+		}
+		// ...and the credential that belongs to a refused re-mint, which this
+		// lane carries apart from its users row (users_admin_guard.go).
+		if table.Name == "user_credentials" && c.userCredentialOfRefusedRemint(table, row) {
+			skipped++
+			c.deferAfterCommit(tx, func() { c.noteRemintCredentialRefused(pathAE) })
+			continue
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
 		// natural key (deterministic winner over the group), not the minted random id, so two

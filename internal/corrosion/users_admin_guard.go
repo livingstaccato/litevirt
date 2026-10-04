@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"sync"
 )
 
 // The receiver-side half of the joining-node credential hazard (#186/#224).
@@ -141,7 +142,181 @@ func (r *Replicator) usersInsertRemintsALiveAdmin(ctx context.Context, tx *sql.T
 	if err != nil {
 		return false, err // unreadable is not "no live admin"
 	}
-	return adminRemintRefused(role, deletedAt.String, createdAt, incomingCreatedAt), nil
+	if !adminRemintRefused(role, deletedAt.String, createdAt, incomingCreatedAt) {
+		return false, nil
+	}
+	if hash, ok := insertParamString(s, sh, "password_hash"); ok {
+		r.client.remints.note(username, hash)
+	}
+	return true, nil
+}
+
+// The credential that comes with a refused re-mint (#224, after the
+// credentials split).
+//
+// Refusing the users row protects nothing on its own. Readers take the
+// user_credentials row whenever one exists (resolveCredential), so the
+// re-minted account's credential replaces the cluster's admin password unless
+// it is refused too. It reaches a receiver three ways, and each is closed where
+// it arrives:
+//
+//   - A latched sender's InsertUser puts the users INSERT and the
+//     user_credentials upsert in ONE entry. The WAL lane decides the entry's
+//     users rows first (refusedRemintsInEntry) and skips a credential
+//     statement for a refused username (remintCredentialStatement).
+//   - An unlatched sender's InsertUser is the users INSERT alone, and
+//     absorbUnlatchedSecretWrite would copy its hash into user_credentials. The
+//     WAL lane hands the absorb the entry WITHOUT the refused statements
+//     (withoutRefusedRemints). The origin test stays the entry's: a refused
+//     row is simply not part of what the entry wrote here.
+//   - Anti-entropy carries the users row on the public lane and its
+//     credential on the sensitive lane, in separate pulls with nothing to pair
+//     them by entry. Every writer puts the same hash in users.password_hash
+//     and user_credentials (dual-write; the old column is never cleared), so a
+//     refused users row names the credential that belongs to it by VALUE. The
+//     refusal is remembered (refusedRemints) and the sensitive lane refuses a
+//     user_credentials row carrying a remembered hash. A rotation of the SAME
+//     account has the same created_at, is never refused, and keeps repairing.
+//     The memory is per process: checkPeer pulls the public lane first, and
+//     withholds user_credentials from the sensitive pull when the public pull
+//     that should have judged the peer's users rows did not complete.
+//
+// Nothing here reads a parent row's updated_at.
+
+// refusedRemints remembers, per username, the password hashes of re-minted
+// admin rows this node refused. Bounded: a peer that keeps re-minting cannot
+// grow it without limit, and the newest refusals are the ones still offered.
+type refusedRemints struct {
+	mu     sync.Mutex
+	hashes map[string][]string
+}
+
+const refusedRemintsPerUser = 16
+
+func (m *refusedRemints) note(username, hash string) {
+	if username == "" || hash == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.hashes == nil {
+		m.hashes = map[string][]string{}
+	}
+	for _, h := range m.hashes[username] {
+		if h == hash {
+			return
+		}
+	}
+	l := append(m.hashes[username], hash)
+	if len(l) > refusedRemintsPerUser {
+		l = l[len(l)-refusedRemintsPerUser:]
+	}
+	m.hashes[username] = l
+}
+
+func (m *refusedRemints) refused(username, hash string) bool {
+	if username == "" || hash == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, h := range m.hashes[username] {
+		if h == hash {
+			return true
+		}
+	}
+	return false
+}
+
+// refusedRemintsInEntry returns the usernames whose users INSERT in this entry
+// the floor refuses, judged against the local rows before the entry applies.
+func (r *Replicator) refusedRemintsInEntry(ctx context.Context, tx *sql.Tx, stmts []Statement) (map[string]bool, error) {
+	var out map[string]bool
+	for _, s := range stmts {
+		sh, ok := statementOnTable(s, "users")
+		if !ok {
+			continue
+		}
+		refused, err := r.usersInsertRemintsALiveAdmin(ctx, tx, s, sh)
+		if err != nil {
+			return nil, err
+		}
+		if !refused {
+			continue
+		}
+		if username, ok := insertParamString(s, sh, "username"); ok {
+			if out == nil {
+				out = map[string]bool{}
+			}
+			out[username] = true
+		}
+	}
+	return out, nil
+}
+
+// statementOnTable parses s structurally and reports its shape when it writes
+// table. A statement that does not parse is not judged here: applyStatementLWW
+// rejects it, and the entry with it.
+func statementOnTable(s Statement, table string) (StmtShape, bool) {
+	if !entryWritesTable([]Statement{s}, table) {
+		return StmtShape{}, false
+	}
+	sh, _, err := parseResolved(s.SQL)
+	return sh, err == nil
+}
+
+// remintCredentialStatement reports whether s writes the credential of a
+// username whose users row this entry re-mints and the floor refused. A
+// credential statement whose key cannot be read is treated as paired: it sits
+// in an entry that re-mints an admin, and failing open there is the bypass.
+func remintCredentialStatement(s Statement, refused map[string]bool) bool {
+	if len(refused) == 0 {
+		return false
+	}
+	sh, ok := statementOnTable(s, "user_credentials")
+	if !ok {
+		return false
+	}
+	username, ok := insertParamString(s, sh, "username")
+	return !ok || refused[username]
+}
+
+// withoutRefusedRemints is the entry as it applied here: the refused users
+// INSERTs and their paired credential statements removed.
+func withoutRefusedRemints(stmts []Statement, refused map[string]bool) []Statement {
+	if len(refused) == 0 {
+		return stmts
+	}
+	out := make([]Statement, 0, len(stmts))
+	for _, s := range stmts {
+		if remintCredentialStatement(s, refused) {
+			continue
+		}
+		if sh, ok := statementOnTable(s, "users"); ok && sh.Kind == KindInsert {
+			if username, ok := insertParamString(s, sh, "username"); ok && refused[username] {
+				continue
+			}
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// userCredentialOfRefusedRemint is the sensitive lane's check: the incoming
+// user_credentials row carries the hash of a re-minted users row this node
+// refused.
+func (c *Client) userCredentialOfRefusedRemint(table syncTable, row []interface{}) bool {
+	idx := columnIndexMap(table.Columns)
+	return c.remints.refused(cellStr(row, idx, "username"), cellStr(row, idx, "password_hash"))
+}
+
+// noteRemintCredentialRefused records a refused credential on the shared merge
+// counters, beside the users refusal it belongs to.
+func (c *Client) noteRemintCredentialRefused(path resolveTiePath) {
+	c.observeMergeRejected("user_credentials", string(path), "admin_remint")
+	slog.Warn("refused the credential of a re-minted admin account: the users row it belongs "+
+		"to was refused as a DIFFERENT account under the same name. "+adminRemintAdvice,
+		"table", "user_credentials", "reason", "admin_remint", "path", string(path))
 }
 
 // insertParamString returns the bound parameter an INSERT binds to col. It

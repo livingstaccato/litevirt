@@ -1,11 +1,15 @@
 package daemon
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 func TestQemuConfUser(t *testing.T) {
@@ -57,5 +61,25 @@ func TestQemuOwner(t *testing.T) {
 	}
 	if _, _, err := qemuOwner(conf, lookup); err == nil {
 		t.Error("qemu.conf names a user that does not exist, and qemuOwner picked another")
+	}
+}
+
+// Mutation: drop the ValidationError copy — an invalid set reports valid.
+func TestMigrationTLSStatusRow_CarriesTheInspection(t *testing.T) {
+	now := time.Now()
+	row := migrationTLSStatusRow(pki.MigrationTLSInfo{
+		Provisioned:           true,
+		ValidationError:       "torn",
+		TrustedCAs:            []pki.MigrationCAInfo{{Fingerprint: "aa", NotAfter: now}},
+		CertIssuerFingerprint: "aa",
+		CertNotAfter:          now,
+	}, nil)
+	if !row.GetProvisioned() || row.GetValidationError() != "torn" ||
+		len(row.GetTrustedCas()) != 1 || row.GetCertIssuerFingerprint() != "aa" ||
+		!row.GetCertNotAfter().AsTime().Equal(now) {
+		t.Fatalf("row = %v", row)
+	}
+	if e := migrationTLSStatusRow(pki.MigrationTLSInfo{}, errors.New("eperm")); e.GetError() == "" {
+		t.Fatal("a read error did not become the row's error")
 	}
 }

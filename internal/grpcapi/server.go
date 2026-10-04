@@ -411,6 +411,9 @@ type Server struct {
 	// installer_iso_resolved does (no map), for tests of a new source against
 	// a main target.
 	isoResolvedWithheld bool
+	// migrationTLSStatus reports this host's migration credentials for
+	// MigrationTLSStatus. nil: this host cannot report them.
+	migrationTLSStatus func() *pb.MigrationTLSHostStatus
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like

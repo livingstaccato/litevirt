@@ -10,7 +10,9 @@ import (
 	"strconv"
 	"strings"
 
+	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/pki"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // qemuConfPath is where libvirt's QEMU driver reads the user QEMU runs as.
@@ -80,4 +82,24 @@ func (d *Daemon) migrationTLSInstaller() func() (bool, error) {
 		}
 		return pki.InstallQemuMigrationTLS(d.cfg.PKIDir, pki.QemuTLSDir, uid, gid)
 	}
+}
+
+// migrationTLSStatusRow is this host's MigrationTLSStatus answer. The server
+// fills in the host name and the plaintext flag.
+func migrationTLSStatusRow(info pki.MigrationTLSInfo, err error) *pb.MigrationTLSHostStatus {
+	if err != nil {
+		return &pb.MigrationTLSHostStatus{Error: err.Error()}
+	}
+	row := &pb.MigrationTLSHostStatus{
+		Provisioned:           info.Provisioned,
+		ValidationError:       info.ValidationError,
+		CertIssuerFingerprint: info.CertIssuerFingerprint,
+	}
+	if !info.CertNotAfter.IsZero() {
+		row.CertNotAfter = timestamppb.New(info.CertNotAfter)
+	}
+	for _, c := range info.TrustedCAs {
+		row.TrustedCas = append(row.TrustedCas, &pb.MigrationTLSCA{Fingerprint: c.Fingerprint, NotAfter: timestamppb.New(c.NotAfter)})
+	}
+	return row
 }

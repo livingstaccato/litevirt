@@ -1259,6 +1259,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	migrationTLS := d.migrationTLSInstaller()
 	svc.SetMigrationTLS(migrationTLS)
 	svc.SetMigrationCAFingerprint(func() (string, error) { return pki.MigrationCAFingerprint(d.cfg.PKIDir) })
+	svc.SetMigrationTLSStatus(func() *pb.MigrationTLSHostStatus {
+		return migrationTLSStatusRow(pki.InspectMigrationTLS(d.cfg.PKIDir, time.Now()))
+	})
 	// Install once at start so the operator sees the state in the log; it runs
 	// again before each storage migration.
 	if ok, err := migrationTLS(); err != nil {

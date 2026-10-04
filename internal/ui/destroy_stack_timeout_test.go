@@ -93,7 +93,6 @@ func serveUIWithWriteTimeout(t *testing.T, m *slowDeleteGRPC, wt time.Duration) 
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	s.SetAuthorizer(mockAuthorizer{m.mockGRPC})
 	ts := httptest.NewUnstartedServer(s.Handler())
 	ts.Config.WriteTimeout = wt
 	ts.Start()

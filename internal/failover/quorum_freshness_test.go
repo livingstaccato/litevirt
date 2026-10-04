@@ -41,6 +41,7 @@ func TestCoordinator_QuorumExcludesStaleObservers(t *testing.T) {
 	// Past the 30s freshness window — must NOT count.
 	stale := time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339)
 	for _, obs := range []string{"coordinator", "good"} {
+		ensureVoter(t, db, obs)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -94,6 +95,7 @@ func TestCoordinator_QuorumExcludesFutureDatedObservations(t *testing.T) {
 			}
 			at := time.Now().Add(tc.offset).UTC().Format(time.RFC3339)
 			for _, obs := range []string{"coordinator", "good"} {
+				ensureVoter(t, db, obs)
 				if err := db.Execute(ctx,
 					`INSERT OR REPLACE INTO host_health
 					 (observer, target, status, consecutive_failures, last_seen, updated_at)

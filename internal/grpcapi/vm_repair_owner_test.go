@@ -27,6 +27,34 @@ func auditActor(t *testing.T, s *Server, action, result string) string {
 	return rows[0].String("username")
 }
 
+// TestRepairVMOwner_MovesTheDiskRows: the proven host uses the VM's disks, so
+// repair-owner moves their rows with the VM row. o4 and pp5 on the kvm003 lab
+// (main-b3368d7c) run on one host with disk rows naming the host failover took
+// them from; this is the operator's repair for them.
+//
+// Mutation: route repair-owner back through TransferVMOwner — the disk row
+// still names the failed host.
+func TestRepairVMOwner_MovesTheDiskRows(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	fake := libvirtfake.New()
+	s.virt = fake
+	ctx := context.Background()
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "o4", HostName: "host-a", State: "running", Spec: "{}"}, nil,
+		[]corrosion.DiskRecord{{VMName: "o4", DiskName: "root", HostName: "failed-host", Path: "/pool/o4.qcow2", StorageType: "nfs"}}); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	fake.SetState("o4", libvirtfake.StateRunning)
+	if _, err := s.RepairVMOwner(adminCtx(), &pb.RepairVMOwnerRequest{Name: "o4", Host: "host-a"}); err != nil {
+		t.Fatalf("RepairVMOwner: %v", err)
+	}
+	disks, err := corrosion.GetVMDisks(ctx, s.db, "o4")
+	if err != nil || len(disks) != 1 || disks[0].HostName != "host-a" {
+		t.Fatalf("after repair-owner the disk rows are %+v (%v); want them on host-a", disks, err)
+	}
+}
+
 func TestRepairVMOwner(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "host-a"

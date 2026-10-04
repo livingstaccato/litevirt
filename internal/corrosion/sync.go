@@ -68,6 +68,90 @@ var customMergeTables = map[string]customMergeFn{
 	// claimants to the lease layer, which lets exactly one of them keep acting
 	// (leader_lease_contest.go).
 	"leader_lease_terms": (*Client).immutableMergeKeepLocalRow,
+	// v59 voter_configs: one immutable row per generation. Keep-local on both
+	// paths, like leader_lease_terms, but the certificate column is EVIDENCE
+	// rather than a fact of the row: two proposers that each completed the one
+	// decided value hold different, equally valid certificates for it. See
+	// voterConfigMergeKeepLocalRow.
+	"voter_configs": (*Client).voterConfigMergeKeepLocalRow,
+}
+
+// voterConfigMergeKeepLocalRow merges a voter_configs row.
+//
+// The decided value — every column but the certificate — is immutable: the
+// local row is kept. Two rows for one generation that differ in it cannot both
+// carry valid certificates (docs/design/recovery-claims.md §3.16), so the pair
+// is flagged on the ha.lww.unresolved path as ledger evidence and never
+// coin-flipped. Replication never decides which generation a node counts
+// anyway: a node adopts one only once its OWN copy's certificate verifies.
+//
+// The certificate is evidence, not a fact of the row. A proposer that learned
+// the decided value in phase 1 re-certifies it at its own ballot, so two nodes
+// can hold different, equally valid certificates for one decision. They
+// converge deterministically — the greater (certificate, updated_at) wins, whole — so the table's
+// digest settles instead of mismatching on every anti-entropy pass. The WAL
+// path applies the insert as INSERT OR IGNORE (DispCustomMerge), and this merge
+// then settles the certificate on the next anti-entropy pass.
+func (c *Client) voterConfigMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []interface{}, pkCols []string, pkIdx []int, updatedAtIdx int) (bool, error) {
+	localRow, found, err := fetchLocalRowCells(tx, table.Name, table.Columns, pkCols, pkIdx, row)
+	if err != nil || !found {
+		return false, err
+	}
+	delIdx := indexOf(table.Columns, "deleted_at")
+	certIdx := indexOf(table.Columns, "certificate")
+	if rowFactsEqual(table.Columns, localRow, row, updatedAtIdx, delIdx, certIdx) {
+		if certIdx < 0 {
+			return true, nil
+		}
+		// The greater (certificate, updated_at) wins whole, so two writers of
+		// one decision, each with its own certificate and updated_at, settle
+		// on one row.
+		lc, ic := fmt.Sprint(localRow[certIdx]), fmt.Sprint(row[certIdx])
+		if lc != ic {
+			return lc > ic, nil
+		}
+		if updatedAtIdx < 0 {
+			return true, nil
+		}
+		return fmt.Sprint(localRow[updatedAtIdx]) >= fmt.Sprint(row[updatedAtIdx]), nil
+	}
+	// A forced generation replaces an ordinary row for the same generation
+	// (docs/design/recovery-claims.md §4.1, §4.6): an ordinary g+1 the
+	// survivors never saw was decided by a majority that is now lost, and a
+	// node adopts neither row on the strength of the merge — only its own copy
+	// verifying does. Settled deterministically, so the digest converges.
+	//
+	// Except on a node that has already ADOPTED the ordinary row. A majority
+	// of the previous generation told it that row was decided; replacing it
+	// here would switch the electorate it counts under without the forced
+	// row's checks or the import, and two electorates would each decide that
+	// generation. It keeps its row, the conflict stays flagged, and
+	// ha.voter.forced reports the refusal: such a node is one the forced
+	// change named lost, or one that must be removed and reseeded
+	// (§10 item 31).
+	if changeIdx := indexOf(table.Columns, "change"); changeIdx >= 0 {
+		lf := IsForcedChange(fmt.Sprint(localRow[changeIdx]))
+		inf := IsForcedChange(fmt.Sprint(row[changeIdx]))
+		if lf != inf {
+			if inf {
+				gen, _ := strconv.ParseInt(fmt.Sprint(row[indexOf(table.Columns, "generation")]), 10, 64)
+				var adopted int64
+				if err := tx.QueryRow(`SELECT COALESCE(MAX(generation), 0) FROM local_voter_adoption`).Scan(&adopted); err != nil {
+					return true, err
+				}
+				if gen > 0 && adopted >= gen {
+					c.noteRefusedForced(gen, fmt.Sprintf("this node adopted the ordinary generation %d (%s) before "+
+						"forced generation %d (%s) reached it; it keeps the one it adopted",
+						gen, fmt.Sprint(localRow[changeIdx]), gen, fmt.Sprint(row[changeIdx])))
+					c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
+					return true, nil
+				}
+			}
+			return lf, nil
+		}
+	}
+	c.trackUnresolved(table.Name, pkKeyAt(row, pkIdx), localRow, row, pathAE, TieCategoryImmutableLedger)
+	return true, nil
 }
 
 // proofRank orders the runtime_action_proofs lifecycle so a terminal state can
@@ -248,9 +332,16 @@ type syncTable struct {
 	authority *mergeAuthorityManifest
 }
 
-// tableNames are the operator-safe tables carried by the public full-state
-// dump. Secret-bearing tables intentionally stay out of this list because
-// GetStateDump/StreamStateDump are operator-callable.
+// tableNames are the tables carried by the public full-state dump. Wholly
+// secret-bearing tables stay out of this list (see sensitiveTableNames). Three
+// tables here still have a secret COLUMN — hosts.ipmi_pass,
+// users.password_hash, tokens.token_hash. Once credentials_split_v1 has latched
+// the value also lives in a sensitive credential table, but this release keeps
+// writing the old column too so a host rolled back one release can still read
+// it; clearing it is a later release's step (credentials_split.go,
+// docs/design/credentials-clear.md). So the dump still carries them
+// unredacted, because it is the repair representation, which is one reason
+// GetStateDump/StreamStateDump are peer-only (host certificate).
 var tableNames = []string{
 	"cluster", "hosts", "host_labels", "host_health",
 	"health_conditions", "health_evaluator_status", "host_capacity_observations",
@@ -302,6 +393,23 @@ var tableNames = []string{
 	// must re-learn its peers' published values rather than conclude they
 	// published nothing. Host-owned (host_name PK, only that host writes it).
 	"netbox_host_config",
+	// v57 host membership — state and isolation on a row of their own, so they
+	// stop sharing the hosts row's clock. The voting roster and the isolation
+	// regime are read from it, so a node that missed a write must be repaired
+	// here like any other cluster fact. Nothing secret. Written only once
+	// host_membership_split_v1 has latched (host_membership.go).
+	"host_membership",
+	// v58 cluster-wide policy (failover_scope). An operator decision every
+	// coordinator must read the same way, so a node that missed the write is
+	// repaired here like any cluster fact. Nothing secret. Written only once
+	// failover_scope_v1 has latched (cluster_policy.go).
+	"cluster_policies",
+	// v59 voter set — one immutable row per decided generation. A node that
+	// missed one cannot adopt any later generation, so it must be repaired here
+	// like any other cluster fact. Nothing secret: host names, incarnations and
+	// signed accepts whose certificates are public. Written only once
+	// voter_config_v1 has latched (voter_config.go).
+	"voter_configs",
 }
 
 // sensitiveTableNames are secret-bearing tables repaired only by the peer-mTLS
@@ -336,6 +444,11 @@ var sensitiveTableNames = []string{
 	// cluster-wide. The pull applier is always a v38 node (it runs this code), so no
 	// LWW-only node ever merges a proof.
 	"runtime_action_proofs",
+	// v56 credentials: the secret halves of hosts, users and tokens. Written
+	// only once credentials_split_v1 has latched (credentials_split.go).
+	"host_fence_credentials",
+	"user_credentials",
+	"token_credentials",
 }
 
 func tableSet(tables []string) map[string]bool {
@@ -354,6 +467,13 @@ var (
 // dumpStateForTables serializes the selected allowlist as gzipped JSON for
 // push/pull sync.
 func (c *Client) dumpStateForTables(tables []string) []byte {
+	return c.dumpStateForScope(tables, nil)
+}
+
+// dumpStateForScope is dumpStateForTables with each table narrowed to its
+// buckets in scope (dump_scope.go); a table scope does not name, or names with
+// a nil set, is dumped whole.
+func (c *Client) dumpStateForScope(tables []string, scope dumpScope) []byte {
 	start := time.Now()
 
 	// Read each table under its OWN brief read lock (released between tables), and
@@ -364,7 +484,11 @@ func (c *Client) dumpStateForTables(tables []string) []byte {
 	// converges per-row by updated_at regardless of the relative timing of tables.
 	var payload syncPayload
 	for _, table := range tables {
-		if st, ok := c.dumpTable(table); ok && len(st.Rows) > 0 {
+		st, ok := c.dumpTable(table)
+		if ok && scope != nil {
+			st = narrowToBuckets(st, scope[table])
+		}
+		if ok && len(st.Rows) > 0 {
 			payload.Tables = append(payload.Tables, st)
 		}
 	}
@@ -425,7 +549,8 @@ func (c *Client) dumpTable(table string) (syncTable, bool) {
 	return st, true
 }
 
-// dumpState serializes all operator-safe replicated tables.
+// dumpState serializes the tableNames replicated tables, secret columns
+// included — peer-only; see tableNames.
 func (c *Client) dumpState() []byte {
 	return c.dumpStateForTables(tableNames)
 }
@@ -896,6 +1021,10 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 			if keepLocal {
 				skipped++
 				pk := pkKeyAt(row, pkIdx)
+				// Remembered at once, not after commit: the sensitive lane must
+				// refuse this account's credential even if this chunk rolls back.
+				idx := columnIndexMap(table.Columns)
+				c.remints.note(cellStr(row, idx, "username"), cellStr(row, idx, "password_hash"))
 				c.deferAfterCommit(tx, func() {
 					c.noteAdminRemintRefused(pathAE)
 					slog.Warn("anti-entropy: kept the local credential row",
@@ -903,6 +1032,13 @@ func (c *Client) mergeChunk(table syncTable, rows [][]interface{}, insertSQL str
 				})
 				continue
 			}
+		}
+		// ...and the credential that belongs to a refused re-mint, which this
+		// lane carries apart from its users row (users_admin_guard.go).
+		if table.Name == "user_credentials" && c.userCredentialOfRefusedRemint(table, row) {
+			skipped++
+			c.deferAfterCommit(tx, func() { c.noteRemintCredentialRefused(pathAE) })
+			continue
 		}
 		// Natural-key identity resolution: for an identity table, resolve by the UNIQUE
 		// natural key (deterministic winner over the group), not the minted random id, so two
@@ -1223,6 +1359,19 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 	}
 
 	keepLocal := proofMergeKeepLocal(localStatus, localTS, incomingStatus, incomingTS)
+	// Two copies of ONE proof — the same binding, at the same status and the
+	// same updated_at — that differ elsewhere converge on the greater encoding
+	// rather than each keeping its own. That is the shape a recovery claim
+	// produces on purpose: a coordinator that loses a claim re-materializes the
+	// winner's proof (docs/design/recovery-claims.md §3.13 step 5) with its own
+	// created_at and without the winner's evidence fields, and the winner's
+	// lifecycle UPDATEs then stamp both copies with one updated_at. Keeping
+	// local on that exact tie left the two replicas' digests apart forever. A
+	// copy that binds something ELSE is never taken this way.
+	if localStatus == incomingStatus && lwwOrder(localTS, incomingTS) == 0 &&
+		proofBindingCellsEqual(table.Columns, localRow, row) {
+		keepLocal = proofRowEncoding(localRow) >= proofRowEncoding(row)
+	}
 	// Forward-only step_state in BOTH directions: whichever row wins, the merge must
 	// not drop a checkpoint the other side already recorded — losing "started" would
 	// let a promote resume destroy a running domain.
@@ -1244,7 +1393,55 @@ func (c *Client) proofMergeKeepLocalRow(tx *sql.Tx, table syncTable, row []inter
 			}
 		}
 	}
+	// The claim certificate is evidence, merged like step_state: whichever row
+	// wins the lifecycle merge carries the better of the two certificates
+	// (betterClaimCertificate), so a row that gained one — or a
+	// re-certification — is never lost to a copy without it, and two replicas
+	// holding different certificates for one decision converge on one.
+	if certIdx := indexOf(table.Columns, "claim_certificate"); certIdx >= 0 {
+		lc, _ := localRow[certIdx].(string)
+		ic, _ := row[certIdx].(string)
+		best := betterClaimCertificate(lc, ic, func(raw string) bool { return c.certificateVerifiesTx(tx, raw) })
+		if !keepLocal {
+			row[certIdx] = best
+		} else if best != lc {
+			if err := c.updateProofClaimCertificateLocal(tx, table.Name, pkCols, pkIdx, row, best); err != nil {
+				return false, err
+			}
+		}
+	}
 	return keepLocal, nil
+}
+
+// proofBindingColumns are the runtime_action_proofs columns ProofBindingEqual
+// compares.
+var proofBindingColumns = []string{"action", "target_kind", "target_name", "dest_host", "coordinator",
+	"relocation_token", "fence_epoch", "owner_epoch", "lease_term", "lease_key"}
+
+// proofBindingCellsEqual is ProofBindingEqual over two dumped rows. A binding
+// column one side lacks compares as unequal: an incomplete dump cannot prove
+// two rows are one proof.
+func proofBindingCellsEqual(cols []string, a, b []interface{}) bool {
+	for _, name := range proofBindingColumns {
+		i := indexOf(cols, name)
+		if i < 0 || i >= len(a) || i >= len(b) {
+			return false
+		}
+		if fmt.Sprint(a[i]) != fmt.Sprint(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// proofRowEncoding is a total order over dumped rows for the tie-break above.
+func proofRowEncoding(row []interface{}) string {
+	var sb strings.Builder
+	for _, v := range row {
+		sb.WriteString(fmt.Sprint(v))
+		sb.WriteByte(0)
+	}
+	return sb.String()
 }
 
 // updateProofStepState folds a unioned step_state back into the surviving local row
@@ -1812,35 +2009,6 @@ type TableDigest struct {
 	HashV2 string `json:"hash_v2,omitempty"`
 }
 
-// StateDigest returns a lightweight fingerprint of each replicated table.
-// Two nodes with identical digests are in sync; mismatched tables indicate drift.
-func (c *Client) stateDigestForTables(ctx context.Context, tables []string) ([]TableDigest, error) {
-	start := time.Now()
-
-	// Per-cycle hot path: anti-entropy calls this every tick before deciding
-	// whether to dump/merge. Read each table's row encodings under a brief read
-	// lock, then sort + hash OUTSIDE the lock — a large table's hash must not hold
-	// the lock against writers (incl. the health path).
-	var digests []TableDigest
-	for _, table := range tables {
-		rowKeys, v2Keys, v2ok, ok := c.digestTableRows(ctx, table)
-		if !ok {
-			continue // table may not exist yet
-		}
-		td := TableDigest{
-			Name:  table,
-			Count: len(rowKeys),
-			Hash:  hashRowKeys(rowKeys),
-		}
-		if v2ok {
-			td.HashV2 = hashRowKeys(v2Keys) // order-invariant; sort makes row order irrelevant
-		}
-		digests = append(digests, td)
-	}
-	c.observeDigest(time.Since(start))
-	return digests, nil
-}
-
 // hashRowKeys sorts the per-row encodings (row-order invariance) and length-prefix-hashes
 // them to a truncated SHA-256 — the shared table-hash step for both v1 and v2.
 func hashRowKeys(rowKeys []string) string {
@@ -1850,62 +2018,6 @@ func hashRowKeys(rowKeys []string) string {
 		h.Write([]byte(strconv.Itoa(len(rk)) + ":" + rk))
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
-}
-
-// digestTableRows reads one table's length-prefixed row encodings into memory
-// under a brief read lock (released on return), so the caller can sort + hash
-// outside the lock.
-//
-// Content digest: it encodes the table's row VALUES (the declared columns —
-// SELECT * never returns the rowid). The old digest hashed GROUP_CONCAT(rowid),
-// which is node-local: identical content inserted in a different order (or after
-// INSERT-OR-REPLACE churn) produced different digests — so anti-entropy re-synced
-// already-converged peers forever — while two nodes with equal row counts but
-// contiguous rowids hashed identically regardless of content, hiding real drift.
-// Hashing content fixes both.
-// digestTableRows returns the per-row v1 (positional) encodings and, when digest_v2 is
-// enabled locally, the per-row v2 (order-invariant) encodings. v2ok is false when v2 is
-// disabled OR any row fails v2 encoding (dup-name / unexpected type) — the table then
-// falls back to a v1-only digest. The v2 keys come from the SAME scan (cols already read),
-// so it's near-free.
-func (c *Client) digestTableRows(ctx context.Context, table string) (v1Keys, v2Keys []string, v2ok, ok bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	rows, err := c.db.QueryContext(ctx, "SELECT * FROM "+table)
-	if err != nil {
-		return nil, nil, false, false // table may not exist yet
-	}
-	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, nil, false, false
-	}
-	wantV2 := c.digestV2On()
-	v2ok = wantV2
-	for rows.Next() {
-		vals := make([]interface{}, len(cols))
-		ptrs := make([]interface{}, len(cols))
-		for i := range vals {
-			ptrs[i] = &vals[i]
-		}
-		if err := rows.Scan(ptrs...); err != nil {
-			continue
-		}
-		v1Keys = append(v1Keys, encodeRowCells(vals))
-		if v2ok {
-			ek, eerr := encodeRowCellsV2(cols, vals)
-			if eerr != nil {
-				slog.Error("digest_v2: row encode failed — falling back to v1 for this table",
-					"table", table, "error", eerr)
-				v2ok = false
-				v2Keys = nil
-				continue
-			}
-			v2Keys = append(v2Keys, ek)
-		}
-	}
-	return v1Keys, v2Keys, v2ok, true
 }
 
 // encodeRowCells produces the canonical, unambiguous encoding of a row's cells —

@@ -17,3 +17,9 @@ func (c *Checker) ProbeAllForTest(ctx context.Context) bool { return c.checkAllP
 // BeatForTest is one beat of the liveness heartbeat Start runs, at the
 // checker's current clock.
 func BeatForTest(c *Checker) { c.beat(c.now()) }
+
+// SetVoterSetForTest replaces the voter set the probe plan reads (nil restores
+// corrosion.VoterSet). It does not touch QuorumProof or the coordinator.
+func (c *Checker) SetVoterSetForTest(fn func(context.Context) (map[string]bool, error)) {
+	c.voterSet = fn
+}

@@ -27,7 +27,7 @@ surface:
 | `lv backup restore-live` | live restore: serve manifest over NBD while the VM boots against a qcow2 overlay |
 | `lv backup schedule …` | cron-driven backups, scoped per-VM, per-pool, per-project, or cluster-wide |
 | compose `backup:` block | deploy-time hook that reconciles a `backup_schedules` row from the stack |
-| `/backups` UI page | read-only manifest list per configured repo |
+| `/backups` UI page | manifest list per configured repo, plus verify / GC / prune / sync through the daemon's repo RPCs |
 
 ## Repository
 
@@ -307,12 +307,16 @@ incremental) replica of a VM that was running — is a torn copy rather than a
 crash-consistent one, as above. Enable only where a small lag window is
 acceptable, and prefer `--incremental` on any schedule with `--auto-promote`.
 
-Automatic promotion **refuses a replica older than 48 hours** (or one whose
-filename carries no readable timestamp) and falls back to a plain reschedule —
-the same outcome as having no replica. Without a bound, a schedule that had been
-failing for days left a replica as promotable as a fresh one, and failover would
-replace a VM running on current data with a week-old disk. 48 hours leaves room
-for a daily schedule plus one missed run. **Manual** `lv replication promote` is
+Automatic promotion **refuses a replica older than two of the schedule's
+longest intervals plus an hour** (or one whose filename carries no readable
+timestamp) and falls back to a plain reschedule — the same outcome as having no
+replica. Without a bound, a schedule that had been failing for days left a
+replica as promotable as a fresh one, and failover would replace a VM running on
+current data with a week-old disk. Two intervals tolerate one missed run; the
+longest interval, not the typical one, so a weekday schedule's replica is not
+refused on a Monday. An hourly schedule is bounded at 3 hours, a weekly one at
+two weeks and an hour. When the schedule cannot be read the bound is 48 hours.
+**Manual** `lv replication promote` is
 not bounded: an operator who has seen the age and chosen it anyway is making a
 different decision.
 
@@ -475,9 +479,60 @@ Restore destinations are a pool-relative filename by default; a custom absolute
   over peer mTLS (see *Peer streaming* below). A direct absolute
   `repo_path` stays local-only — remote streaming needs a configured
   logical repo name the sink can resolve.
-- **WebUI `/backups`** — read-only manifest list. With `backup_repos:`
+- **WebUI `/backups`** — manifest list. With `backup_repos:`
   configured, lists every configured repo and its snapshot count +
   total size. Click through to drill into one repo's manifests.
+  The page's repo actions call the RPCs below with the session's
+  credential, so the daemon authorizes and audits them as it would any
+  other caller.
+
+### Repo maintenance RPCs
+
+The daemon verifies, garbage-collects, prunes and syncs a repo it holds
+through four RPCs. Each is checked at `/` with its own verb. A repo holds
+every project's backups, so a project-scoped grant or token cannot reach
+it. Each RPC writes one audit row: the caller, the repo, the outcome, and
+what the operation counted.
+
+| RPC | Verb | Audit action | Detail |
+|---|---|---|---|
+| `VerifyBackupRepo` | `backup.verify` | `backup.repo.verify` | `chunks_checked mismatched missing` |
+| `GarbageCollectBackupRepo` | `backup.gc` | `backup.repo.gc` | `manifests_scanned chunks_deleted bytes_reclaimed retained_young manifests_invalid` |
+| `PruneBackupRepo` | `backup.prune` | `backup.repo.prune` | the `keep_*` policy, `kept`, `deleted` |
+| `SyncBackupRepo` | `backup.sync` | `backup.repo.sync` (target `src -> dst`) | `manifests_copied chunks_copied chunks_skipped bytes_copied` |
+
+All four sit in `backup.*`, which Operator and BackupOperator hold and
+Viewer's `*.read` does not. Without RBAC bindings the floor is the
+legacy `operator` role.
+
+- **Prune** deletes manifests, and a manifest is what makes a set of
+  chunks restorable. **GC** then deletes the chunks no manifest
+  references, which makes a mistaken prune permanent. An operator can
+  already make the scheduler prune through a schedule's `keep_*` policy,
+  so neither needs more than operator.
+- **Sync** writes into the destination and copies every project's
+  snapshots out of the source.
+- **Verify** changes nothing. It still reads and re-hashes every chunk in
+  the repo, which is unbounded disk I/O started on request, so it is not
+  a `*.read` verb and a Viewer cannot start one.
+
+`repo` is a registered repo name; a custom absolute path requires the
+**admin** role, as for `BackupSnapshot`. `PruneBackupRepo` without
+`apply` only returns the plan. It is still checked against
+`backup.prune`, because it previews a prune, and only an applied prune is
+audited. GC always uses the default 24-hour chunk grace period, the
+guard against sweeping a concurrent push's chunks. Only the local
+`lv backup repo gc --grace` can lower it.
+
+A refused call is audited as `denied`, and a failed one as `error`.
+
+`lv backup repo …` does not use these RPCs. It acts on a local path
+directly, with the invoking OS user's rights over that directory and no
+daemon involved, so it can run on a backup host without litevirtd. It
+writes no audit row, because only the daemon may extend its host's audit
+chain (see [audit-log.md](audit-log.md#actions-taken-while-the-daemon-is-down)).
+Holding write access to the repo directory already means being able to
+delete it.
 
 ## What's still in flight
 

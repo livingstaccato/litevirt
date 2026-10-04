@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -231,6 +232,49 @@ func TestRestoreLive_AutoStart_IsBornProvable(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// TestRestoreLive_AutoStart_StartedMeansTheRowIsRunning.
+//
+// STARTED is the phase a client acts on: the CLI reports the VM started and an
+// operator's next `lv vm ls` expects to see it running. It used to be sent the
+// moment the domain started, before the commit fence and before the row was
+// even inserted, so a client could read no row or a "creating" one — and if
+// the fence then refused the commit, the VM it had just been told was started
+// was torn down. The commit-fence hook widens that window deterministically.
+func TestRestoreLive_AutoStart_StartedMeansTheRowIsRunning(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	s.virt = libvirtfake.New()
+	s.commitFenceHook = func(op string) {
+		if op == "RestoreLive" {
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+
+	specJSON, err := json.Marshal(&pb.VMSpec{
+		Name: "vm1", Cpu: 2, MemoryMib: 2048,
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+	repoDir, ts := seedLiveRepo(t, make([]byte, pbsstore.ChunkSize), string(specJSON))
+
+	_, cancel, done := runRestoreLiveUntil(t, s, &pb.RestoreLiveRequest{
+		RepoPath: repoDir, VmName: "vm1", DiskName: "root", Timestamp: ts,
+		TargetPath: filepath.Join(t.TempDir(), "live.qcow2"), AutoStart: true,
+	}, pb.RestoreLiveProgress_STARTED)
+	defer func() { cancel(); <-done }()
+
+	row, gerr := corrosion.GetVM(context.Background(), s.db, "vm1")
+	if gerr != nil || row == nil {
+		t.Fatalf("at STARTED, GetVM = (%v, %v); want the row already committed", row, gerr)
+	}
+	if row.State != "running" {
+		t.Fatalf("at STARTED, state = %q; want running", row.State)
+	}
 }
 
 // TestImportVM_StartedImportIsProvable.

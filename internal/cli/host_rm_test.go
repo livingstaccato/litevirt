@@ -18,6 +18,15 @@ type hostRemoveTestClient struct {
 	pb.LiteVirtClient
 	publishErr error
 	calls      []string
+	voters     []string // members of the adopted voter generation
+}
+
+func (c *hostRemoveTestClient) GetVoterConfig(context.Context, *pb.GetVoterConfigRequest, ...grpc.CallOption) (*pb.GetVoterConfigResponse, error) {
+	resp := &pb.GetVoterConfigResponse{AdoptedGeneration: 4, Explicit: len(c.voters) > 0}
+	for _, v := range c.voters {
+		resp.Members = append(resp.Members, &pb.VoterMemberStatus{Name: v})
+	}
+	return resp, nil
 }
 
 func (c *hostRemoveTestClient) ListHosts(context.Context, *pb.ListHostsRequest, ...grpc.CallOption) (*pb.ListHostsResponse, error) {
@@ -238,5 +247,34 @@ func TestHostRemove_AuditRetirementFailureDoesNotBlockRemoval(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("removal did not proceed after a retirement failure")
+	}
+}
+
+// TestHostRemove_RefusesAVoterBeforeRevoking: `lv host rm` of a current voter
+// is refused, naming `lv cluster voter rm` — and refused BEFORE the
+// certificate is revoked, because the daemon's own refusal would come after a
+// revocation nothing undoes, leaving a voter that can no longer sign.
+//
+// Mutation: drop the refuseVoterRemoval call — the CRL is published first.
+func TestHostRemove_RefusesAVoterBeforeRevoking(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("LV_CONFIG_DIR", configDir)
+	pkiDir := filepath.Join(configDir, "pki")
+	if err := os.MkdirAll(pkiDir, 0o700); err != nil {
+		t.Fatalf("mkdir pki: %v", err)
+	}
+	if err := pki.GenerateCA(filepath.Join(pkiDir, "ca.crt"), filepath.Join(pkiDir, "ca.key")); err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	client := &hostRemoveTestClient{voters: []string{"node-1", "node-9"}}
+	err := HostRemove(context.Background(), client, "node-9", false)
+	if err == nil || !strings.Contains(err.Error(), "lv cluster voter rm node-9") {
+		t.Fatalf("removing a voter was not refused with the way forward: %v", err)
+	}
+	if len(client.calls) != 0 {
+		t.Fatalf("calls = %v; nothing may run before the voter check", client.calls)
+	}
+	if _, err := os.Stat(filepath.Join(pkiDir, "crl.pem")); err == nil {
+		t.Fatal("the voter's certificate was revoked before the refusal")
 	}
 }

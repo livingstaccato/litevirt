@@ -458,6 +458,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			StorageType:   storageType,
 			StorageVolume: d.Storage,
 			TargetDev:     lv.DiskDevName(d.Bus, i),
+			Bus:           d.Bus,
 		})
 	}
 
@@ -483,6 +484,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			BackingImage: spec.Image,
 			StorageType:  "local",
 			TargetDev:    lv.DiskDevName("virtio", 0),
+			Bus:          "virtio",
 		})
 	}
 
@@ -911,13 +913,15 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Serialize spec to JSON for storage
 	specJSON, _ := json.Marshal(spec)
 
-	// Write to corrosion
+	// Write to corrosion. Inserted "creating", not "running": the row lands at the
+	// vm_owner_epoch default of 0, and assignOwnerEpochAtCreate publishes it
+	// running only once it holds a positive epoch and a marker names it.
 	vmRecord := corrosion.VMRecord{
 		Name:      spec.Name,
 		StackName: spec.StackName,
 		HostName:  s.hostName,
 		Spec:      string(specJSON),
-		State:     "running",
+		State:     "creating",
 		CPUActual: int(spec.Cpu),
 		MemActual: int(spec.MemoryMib),
 		Project:   project, // tenancy label
@@ -968,10 +972,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		slog.Error("failed to write VM to corrosion", "error", err)
 		// VM is running, but state may not be synced — log and continue
 	} else {
-		// Guarded on the insert having landed: with no row the graduation is a
-		// replicated no-op and a misleading log line. The invariant it maintains
-		// lives on assignOwnerEpochAtCreate; do not restate it here, or the two
-		// copies drift.
+		// Guarded on the insert having landed: with no row there is nothing to
+		// graduate or publish. The invariant it maintains lives on
+		// assignOwnerEpochAtCreate; do not restate it here, or the two copies drift.
 		s.assignOwnerEpochAtCreate(ctx, spec.Name, true)
 	}
 
@@ -994,83 +997,42 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	return s.vmToProto(ctx, spec.Name)
 }
 
-// assignOwnerEpochAtCreate moves a freshly inserted VM row off the pre-epoch
-// default and stamps both runtime markers at the generation it assigned, so the
-// VM is provable before CreateVM returns instead of at the reconciler's next
-// sweep.
+// assignOwnerEpochAtCreate finishes a freshly inserted VM row: it assigns the
+// first ownership generation and, for a VM whose runtime is up, stamps both
+// runtime markers at that generation and only then publishes the row running.
+// Every create path shares it, so no new VM is ever published running at the
+// pre-epoch default (colonelpanik/litevirt#157).
 //
-// Split out of the create path so the graduation failure is reachable in a test
-// without also failing the insert: the two share one *corrosion.Client, and a
-// test that breaks the client to fail the graduation breaks the insert too,
-// which skips this whole block and proves nothing.
+// running=true requires the row to have been inserted as "creating": the flip
+// to "running" belongs to this function and happens after the markers, through
+// health.PublishNewbornVMRunning. running=false graduates a row inserted at its
+// real, non-running state and stamps nothing — a marker asserts that a
+// generation owns a runtime, and a stopped VM has none.
 //
-// Nothing here is fatal. The VM is already running, and every outcome is one an
-// existing repair path handles — which is the whole reason for the ordering.
+// Nothing here is fatal and nothing here tears the VM down. A failure leaves the
+// row "creating" — unpublished, never running at epoch 0 — and the owner's
+// reconciler finishes it on its next sweep through the same health function.
 func (s *Server) assignOwnerEpochAtCreate(ctx context.Context, name string, running bool) {
 	// Detached from the RPC context. The row is already committed and the guest is
 	// already running by the time this runs, so a client ^C or an RPC deadline that
 	// expired during the preceding image and disk work must not decide whether the
-	// VM is provable. With the failure path below correctly stamping nothing, an
-	// inherited cancellation would reliably leave a running VM at epoch 0 with no
-	// marker and no backstop unless enforcement.owner_epoch happens to be on. The
-	// same function already detaches its post-commit LB work for this reason.
+	// VM is published. The same function already detaches its post-commit LB work
+	// for this reason.
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, name); gerr != nil {
-		// Leave the row pre-epoch AND unmarked. That is exactly the state a create
-		// left behind before any of this existed, and the only one the repair paths
-		// can act on: convergeOwnerEpochMarker returns early for an epoch-0 row, so
-		// stamping a marker here would produce marker-1 against row-0 — a mismatch
-		// nothing converges, which assertRuntimeOwnership reads as
-		// marker_epoch_mismatch and which would refuse this VM's legitimate
-		// sole-holder re-key for good. It would also hold the row at 0, so
-		// OwnerEpochBackfillComplete keeps reporting this host unready and the
-		// fleet's owner_epoch_v1 latch never closes. The backfill sweep is the
-		// backstop, though only where enforcement.owner_epoch is on.
-		slog.Warn("vm create: could not assign the first owner epoch — leaving the VM "+
-			"unmarked for the backfill rather than stamping a marker the row cannot match",
-			"name", name, "error", gerr)
-		return
-	}
-	// The RUNTIME markers are only for a runtime that exists. A VM created
-	// stopped still needs its row graduated — nothing on the start path does it,
-	// so it would otherwise become running at epoch 0, which is the state this
-	// function exists to prevent — but stamping a marker for it would assert a
-	// generation owns a runtime that is not there.
 	if !running {
+		// A VM created stopped still needs its row graduated — nothing on the start
+		// path does it, so it would otherwise become running at epoch 0.
+		if gerr := corrosion.GraduateVMOwnerEpoch(ctx, s.db, name); gerr != nil {
+			slog.Warn("vm create: could not assign the first owner epoch to a stopped VM — "+
+				"the backfill graduates it", "name", name, "error", gerr)
+		}
 		return
 	}
-
-	// Stamp both runtime markers now, at the epoch just assigned.
-	//
-	// A marker failure is not fatal. The row is already at a positive epoch, which
-	// is the precondition convergeOwnerEpochMarker needs, and its call site fires
-	// for any confirmed-running VM regardless of the enforcement flag — so the
-	// reconciler repairs a missing marker on its next sweep. That is also why the
-	// epoch is assigned BEFORE these writes and not after: the reverse order fails
-	// into marker-present against an epoch-0 row, which convergence returns early
-	// on and never repairs.
-	//
-	// The literal 1 rather than a re-read: the guarded UPDATE just applied to a row
-	// inserted at the column default, and a fresh read here would race the backfill
-	// for no gain.
-	if merr := s.virt.SetDomainOwnerEpoch(name, 1, true); merr != nil {
-		slog.Warn("vm create: owner-epoch domain marker not stamped — convergence will retry",
-			"name", name, "error", merr)
-	}
-	// Skipped rather than written to a relative path when dataDir is unset:
-	// readVMMarker treats an empty dataDir as MarkerMissing, so writing anyway
-	// would create a marker tree under the daemon's cwd that no reader in this
-	// package will ever look at — a marker on disk while the inventory reports
-	// none.
-	if s.dataDir == "" {
-		slog.Warn("vm create: no data directory, so no owner-epoch file marker",
-			"name", name)
-		return
-	}
-	if merr := health.WriteVMOwnerEpochMarker(s.dataDir, name, 1); merr != nil {
-		slog.Warn("vm create: owner-epoch file marker not written — convergence will retry",
-			"name", name, "error", merr)
+	if err := health.PublishNewbornVMRunning(ctx, s.virt, s.db, s.dataDir, s.hostName, name); err != nil {
+		slog.Warn("vm create: the new VM is not provable yet, so it stays \"creating\" "+
+			"for the reconciler to finish instead of being published running",
+			"name", name, "error", err)
 	}
 }
 
@@ -1151,7 +1113,7 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		// Reconcile DB state with libvirt for local VMs.
 		state := vm.State
 		if vm.HostName == s.hostName && s.virt != nil {
-			if liveState, err := s.virt.DomainState(vm.Name); err == nil {
+			if liveState, err := s.liveVMState(vm.Name); err == nil {
 				switch {
 				case vm.State == "stopped" && liveState == "running":
 					// Graceful shutdown in progress — trust DB
@@ -1877,6 +1839,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 
 	if !localOnly && vm.HostName != s.hostName {
+		// A removed host is not dialled: its rows are deleted here
+		// (removed_host_delete.go).
+		if removed, err := s.workloadHostRemoved(ctx, vm.HostName); err != nil {
+			return nil, err
+		} else if removed {
+			return s.deleteVMOnRemovedHost(ctx, vm)
+		}
 		releaseLock() // never hold a process lock across a peer RPC
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {
@@ -2250,7 +2219,7 @@ func (s *Server) vmToProto(ctx context.Context, name string) (*pb.VM, error) {
 	// graceful shutdown where libvirt still reports "running" briefly.
 	state := vm.State
 	if vm.HostName == s.hostName && s.virt != nil {
-		if liveState, err := s.virt.DomainState(name); err == nil {
+		if liveState, err := s.liveVMState(name); err == nil {
 			// Trust libvirt for running detection (catches unexpected starts/crashes),
 			// but trust DB for operator-initiated stops/starts.
 			switch {
@@ -2492,6 +2461,22 @@ func formatDiskSizeBytes(n int64) string {
 	}
 }
 
+// liveVMState is libvirt's coarse state for a local domain, except that a
+// PAUSED domain — active, RAM kept, suspended by the partition pauser or an
+// operator — is "paused" rather than the "stopped" coarse state folds it into.
+// A display state only: nothing writes "paused" into a vms row, and the list's
+// drift heal for a running row whose domain is stopped never sees a paused one.
+func (s *Server) liveVMState(name string) (string, error) {
+	st, err := s.virt.DomainState(name)
+	if err != nil || st != "stopped" {
+		return st, err
+	}
+	if r, rerr := s.virt.DomainStateReason(name); rerr == nil && r.State == "stopped" && r.Reason == "paused" {
+		return "paused", nil
+	}
+	return st, nil
+}
+
 func vmStateToPB(s string) pb.VMState {
 	switch s {
 	case "creating":
@@ -2508,6 +2493,8 @@ func vmStateToPB(s string) pb.VMState {
 		return pb.VMState_VM_MIGRATING
 	case "error":
 		return pb.VMState_VM_ERROR
+	case "paused":
+		return pb.VMState_VM_PAUSED
 	default:
 		return pb.VMState_VM_UNKNOWN
 	}

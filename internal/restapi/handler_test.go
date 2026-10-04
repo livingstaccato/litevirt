@@ -644,8 +644,8 @@ func (m *mockGRPC) LBStats(_ context.Context, in *pb.LBStatsRequest, _ ...grpc.C
 func (m *mockGRPC) EnsureCloudInit(context.Context, *pb.EnsureCloudInitRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
-func (m *mockGRPC) EnsureDisks(context.Context, *pb.EnsureDisksRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
-	return &emptypb.Empty{}, nil
+func (m *mockGRPC) EnsureDisks(context.Context, *pb.EnsureDisksRequest, ...grpc.CallOption) (*pb.EnsureDisksResponse, error) {
+	return &pb.EnsureDisksResponse{}, nil
 }
 func (m *mockGRPC) CleanupMigrationArtifacts(context.Context, *pb.CleanupMigrationArtifactsRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
@@ -791,6 +791,20 @@ func TestListHosts_Success(t *testing.T) {
 	}
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+// A host `lv host add` admitted whose daemon has not started is listed as
+// joining, by name, not as offline.
+func TestListHosts_ShowsAJoiningHost(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.listHostsResp = &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-5", State: pb.HostState_HOST_JOINING}}}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/hosts", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"HOST_JOINING"`) {
+		t.Errorf("GET /api/v1/hosts = %d %s, want the host's state as \"HOST_JOINING\"", rec.Code, rec.Body.String())
 	}
 }
 

@@ -22,9 +22,37 @@ type membershipEvents struct {
 
 	mu    sync.Mutex
 	peers map[string]struct{}
+	// addrs is every live member's gossip address, copied while memberlist
+	// holds its node lock. Members() reads addresses from here and never from
+	// the *Node memberlist hands back: memberlist rewrites a node's Addr and
+	// Port in place when it re-learns it (aliveNode), so reading Address() on
+	// a returned *Node after memberlist's lock is released is a data race —
+	// one the re-merge loop, which reads Members() while a healed partition
+	// re-addresses every peer, hits under -race.
+	addrs map[string]string
+}
+
+// addr returns name's gossip address as last delivered by an event.
+func (e *membershipEvents) addr(name string) (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	a, ok := e.addrs[name]
+	return a, ok
+}
+
+func (e *membershipEvents) setAddr(n *memberlist.Node) {
+	e.mu.Lock()
+	if e.addrs == nil {
+		e.addrs = make(map[string]string)
+	}
+	e.addrs[n.Name] = n.Address()
+	e.mu.Unlock()
 }
 
 func (e *membershipEvents) NotifyJoin(n *memberlist.Node) {
+	if n != nil {
+		e.setAddr(n)
+	}
 	if n != nil && n.Name != e.client.hostName {
 		e.mu.Lock()
 		if e.peers == nil {
@@ -32,6 +60,7 @@ func (e *membershipEvents) NotifyJoin(n *memberlist.Node) {
 		}
 		e.peers[n.Name] = struct{}{}
 		e.mu.Unlock()
+		e.client.noteGossipAddr(n.Name, n.Address())
 	}
 	e.client.kickMembership()
 }
@@ -41,6 +70,7 @@ func (e *membershipEvents) NotifyLeave(n *memberlist.Node) {
 		e.mu.Lock()
 		_, had := e.peers[n.Name]
 		delete(e.peers, n.Name)
+		delete(e.addrs, n.Name)
 		lastGone := had && len(e.peers) == 0
 		e.mu.Unlock()
 		if lastGone {
@@ -50,7 +80,12 @@ func (e *membershipEvents) NotifyLeave(n *memberlist.Node) {
 	e.client.kickMembership()
 }
 
-func (e *membershipEvents) NotifyUpdate(*memberlist.Node) { e.client.kickMembership() }
+func (e *membershipEvents) NotifyUpdate(n *memberlist.Node) {
+	if n != nil {
+		e.setAddr(n)
+	}
+	e.client.kickMembership()
+}
 
 // delegate implements memberlist.Delegate for the Client.
 // Memberlist is used for membership detection only — no application data

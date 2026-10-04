@@ -20,7 +20,7 @@ func TestCheckHost_ReachableButNotReadyIsNotHealthy(t *testing.T) {
 	ctx := context.Background()
 	addr, port := healthyPeer(t)
 	c := probingChecker(t, db)
-	c.SetPeerReadiness(func(context.Context, string) (bool, string, error) {
+	c.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) {
 		return false, "database read timed out", nil
 	})
 
@@ -53,7 +53,7 @@ func TestCheckHost_UnreachableIsSuspectNeverUnready(t *testing.T) {
 	db := testCheckHostDB(t)
 	ctx := context.Background()
 	c := probingChecker(t, db)
-	c.SetPeerReadiness(func(context.Context, string) (bool, string, error) {
+	c.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) {
 		return false, "", errors.New("dial tcp: connection refused")
 	})
 
@@ -82,7 +82,7 @@ func TestCheckHost_ReadyPeerStaysHealthy(t *testing.T) {
 	ctx := context.Background()
 	addr, port := healthyPeer(t)
 	c := probingChecker(t, db)
-	c.SetPeerReadiness(func(context.Context, string) (bool, string, error) {
+	c.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) {
 		return true, "", nil
 	})
 
@@ -114,7 +114,7 @@ func TestCheckHost_ReadinessIsAskedAboutTheProbedPeer(t *testing.T) {
 	addr, port := healthyPeer(t)
 	c := probingChecker(t, db)
 	var asked []string
-	c.SetPeerReadiness(func(_ context.Context, host string) (bool, string, error) {
+	c.SetPeerReadiness(func(_ context.Context, host, _ string) (bool, string, error) {
 		asked = append(asked, host)
 		return true, "", nil
 	})
@@ -142,7 +142,7 @@ func TestCheckHost_UnreadyAnswersDoNotCountTowardSuspect(t *testing.T) {
 	answer := func(context.Context, string) (bool, string, error) {
 		return false, "database read timed out", nil
 	}
-	c.SetPeerReadiness(func(ctx context.Context, h string) (bool, string, error) { return answer(ctx, h) })
+	c.SetPeerReadiness(func(ctx context.Context, h, _ string) (bool, string, error) { return answer(ctx, h) })
 	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
 
 	for i := 0; i < 20; i++ {
@@ -179,20 +179,15 @@ func TestCheckHost_UnreadyAnswersDoNotCountTowardSuspect(t *testing.T) {
 // off a host that is answering. The only way no build's query can count them
 // is for the row never to carry the count.
 //
-// The row is still rewritten on every unready probe, as it was while the count
-// climbed, so its updated_at stays as fresh as a failing row's.
+// How often the unchanged row is re-published is pinned separately, by
+// TestCheckHost_UnreadyRewritesAreRateLimited.
 func TestCheckHost_AnUnreadyStreakNeverReachesTheFenceThreshold(t *testing.T) {
 	db := testCheckHostDB(t)
 	ctx := context.Background()
 	c := probingChecker(t, db)
-	c.SetPeerReadiness(func(context.Context, string) (bool, string, error) {
+	c.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) {
 		return false, "database read timed out", nil
 	})
-	writes := 0
-	c.writeFn = func(ctx context.Context, q string, args ...interface{}) error {
-		writes++
-		return db.Execute(ctx, q, args...)
-	}
 	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
 
 	const probes = 4 * FailuresToFence
@@ -213,7 +208,70 @@ func TestCheckHost_AnUnreadyStreakNeverReachesTheFenceThreshold(t *testing.T) {
 				i+1, got, FailuresToFence)
 		}
 	}
-	if writes != probes {
-		t.Errorf("%d writes over %d unready probes, want one per probe — the row went stale", writes, probes)
+}
+
+// A peer that goes silent after being unready is not promoted to healthy.
+//
+// Restarting the silence count at one is right — the unready answers were not
+// silence — but the sub-threshold branch then published "healthy", which
+// QuorumProof counts. A peer that had been excluded as unready and then
+// stopped answering altogether was counted as live for the probes until it
+// reached suspect. Until the silence is long enough to call it suspect, it
+// stays what it last said it was.
+func TestCheckHost_ASilentPeerAfterUnreadyIsNotHealthy(t *testing.T) {
+	db := testCheckHostDB(t)
+	ctx := context.Background()
+	c := probingChecker(t, db)
+	answer := func(context.Context, string) (bool, string, error) {
+		return false, "database read timed out", nil
+	}
+	c.SetPeerReadiness(func(ctx context.Context, h, _ string) (bool, string, error) { return answer(ctx, h) })
+	host := corrosion.HostRecord{Name: "host-b", Address: "127.0.0.1", GRPCPort: 1}
+	c.checkHost(ctx, host)
+
+	answer = func(context.Context, string) (bool, string, error) {
+		return false, "", errors.New("context deadline exceeded")
+	}
+	status := func() string {
+		rows, err := db.Query(ctx, `SELECT status FROM host_health WHERE observer = ? AND target = ?`, "host-a", "host-b")
+		if err != nil || len(rows) != 1 {
+			t.Fatalf("query: rows=%d err=%v", len(rows), err)
+		}
+		return rows[0].String("status")
+	}
+	for i := 1; i < suspectThreshold; i++ {
+		c.checkHost(ctx, host)
+		if got := status(); got == "healthy" {
+			t.Fatalf("after %d unanswered probe(s) following unready, status = healthy; a silent peer is not live", i)
+		}
+	}
+	c.checkHost(ctx, host)
+	if got := status(); got != "suspect" {
+		t.Errorf("after %d unanswered probes, status = %q, want suspect", suspectThreshold, got)
+	}
+}
+
+// The readiness probe dials the address checkHost already resolved.
+//
+// It used to hand over only the NAME, and the prober re-resolved it through the
+// hosts table — a read of the OBSERVER's own store, under its own lock, every
+// probe. An observer whose store stalled for longer than checkTimeout then
+// failed every probe before sending any RPC, and built suspect counts against
+// every healthy peer: the unready/unreachable conflation this probe exists to
+// end, caused by the observer rather than the peer.
+func TestProbeHost_PassesTheResolvedAddress(t *testing.T) {
+	db := testCheckHostDB(t)
+	c := probingChecker(t, db)
+	var got string
+	c.SetPeerReadiness(func(_ context.Context, _, addr string) (bool, string, error) {
+		got = addr
+		return true, "", nil
+	})
+	host := corrosion.HostRecord{Name: "host-b", Address: "10.0.0.9", GRPCPort: 7443}
+
+	c.checkHost(context.Background(), host)
+
+	if want := corrosion.PeerTarget(host.Address, host.GRPCPort); got != want {
+		t.Errorf("readiness probe got addr %q, want the resolved %q", got, want)
 	}
 }

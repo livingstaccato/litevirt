@@ -142,7 +142,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 				// still records. Retire it: mint above it, atomically with the
 				// renewal, so the term we act under is one no replica attributes to
 				// anyone else and the contested one falls below every threshold.
-				held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, newest.Term)
+				held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, newest.Term, false)
 				if err != nil {
 					return false, 0, err
 				}
@@ -215,6 +215,14 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 			// and reseedKeepTables stops a reseed from deleting it.
 		}
 
+		// Not ours, and live: a peer holds it. The guarded upsert below would
+		// decline, and returning here first is not only cheaper — it keeps a
+		// non-holder, which polls every few seconds, from running the mint
+		// clearance's peer read on every poll for a lease it cannot take.
+		if !ourTenure && curHolder != "" && curHolder != holder && curExpires >= nowRFC {
+			return false, 0, nil
+		}
+
 		// Not ours. An expired lease whose row names someone other than the
 		// ledger's current incarnation is not ours to take yet — its real holder
 		// may be renewing over it right now. See deferTakeover.
@@ -232,7 +240,7 @@ func AcquireLeaseWithTerm(ctx context.Context, c *Client, key, holder string, tt
 		if ourTenure && newest.Term > 0 && newest.Holder == holder && c.termBelongsToEarlierTenure(key, newest.Term) {
 			supersede = newest.Term
 		}
-		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, supersede)
+		held, term, err := takeLeaseAndMintTerm(ctx, c, key, holder, expires, nowRFC, cur, supersede, !ourTenure)
 		if err != nil {
 			return false, 0, err
 		}
@@ -499,12 +507,24 @@ func renewLease(ctx context.Context, c *Client, key, holder, expires, nowRFC str
 //
 // supersede is the term naming us that this acquisition mints above although
 // our own lease is live (0 for an ordinary acquisition); see leaseAcquirableTx.
-func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, supersede int64) (bool, int64, error) {
+// takeover is true when our own replica shows no live tenure of ours: the
+// clearance must then also confirm that no peer sees the lease live (see
+// leader_lease_clearance.go).
+func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, nowRFC string, now time.Time, supersede int64, takeover bool) (bool, int64, error) {
 	acquiredAt := now.UTC().Format(time.RFC3339)
 
 	next, err := nextLeaseTerm(ctx, c, key)
 	if err != nil {
 		return false, 0, err
+	}
+	// Confirm the cluster has not already minted `next` before claiming it from
+	// this replica's view. Withheld is "not held", never contended: retrying
+	// inside this call would ask the same peers the same question. See
+	// leader_lease_clearance.go.
+	if !c.clearLeaseMint(ctx, LeaseMintRequest{
+		Key: key, Term: next, Holder: holder, Takeover: takeover, Now: nowRFC,
+	}) {
+		return false, 0, nil
 	}
 
 	applied, err := c.ExecuteBatchGuarded(ctx,
@@ -550,6 +570,14 @@ func takeLeaseAndMintTerm(ctx context.Context, c *Client, key, holder, expires, 
 		return false, 0, nil
 	}
 	return false, leaseContended, nil
+}
+
+// ReadLeaseRow reads this replica's leader_election row for key: the holder it
+// names and its expiry (RFC3339 UTC), both "" when the row is absent. A raw
+// read with no judgement of liveness, for a peer reporting what its own row
+// says (grpcapi's GetLeaseTermHighWater).
+func ReadLeaseRow(ctx context.Context, c *Client, key string) (holder, expiresAt string, err error) {
+	return leaseRow(ctx, c, key)
 }
 
 // leaseRow reads key's current holder and expiry. holder is "" when the row is

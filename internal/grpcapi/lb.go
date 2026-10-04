@@ -1342,13 +1342,35 @@ func (s *Server) manualFenceConfirmedVIP(ctx context.Context, host string) bool 
 	if s.db == nil || s.gate == nil {
 		return false
 	}
-	for _, h := range s.gate.HealthyPeers(ctx) {
-		if h == host {
-			return false // up + participating → live state governs, not a past confirm
-		}
+	if s.peerUp(ctx, host) {
+		return false // up + participating → live state governs, not a past confirm
 	}
 	ok, err := corrosion.HostManualFenceConfirmed(ctx, s.db, host, time.Now(), vipManualFenceWindow)
 	return err == nil && ok
+}
+
+// peerLiveness is the gate's answer to "is this host up NOW", for the readers
+// that act on down. *health.Checker implements it.
+type peerLiveness interface {
+	PeerUp(ctx context.Context, host string) bool
+}
+
+// peerUp reports whether host is up as far as this node can tell. It asks the
+// gate's PeerUp, which probes a peer outside this node's probe plan instead of
+// reading its absence from HealthyPeers as down: a non-voter samples the other
+// non-voters (health/probe_plan.go), so a live host it does not watch is
+// absent from its HealthyPeers. A gate without PeerUp keeps the HealthyPeers
+// reading, which is exact for a gate that probes everyone.
+func (s *Server) peerUp(ctx context.Context, host string) bool {
+	if pl, ok := s.gate.(peerLiveness); ok {
+		return pl.PeerUp(ctx, host)
+	}
+	for _, h := range s.gate.HealthyPeers(ctx) {
+		if h == host {
+			return true
+		}
+	}
+	return false
 }
 
 // relayedVIPNoClaims reports whether a quorum-visible reachable RELAY peer definitively says

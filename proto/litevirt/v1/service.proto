@@ -35,7 +35,12 @@ message FenceHostRequest   {
     // guard before VMs are rescheduled when fence_strategy = "manual".
     bool confirm_manual_only = 3;
 }
-message RemoveHostRequest  { string name = 1; bool force = 2; }
+// dead removes a host that is fenced proof-grade and gone for good
+// (`lv host rm --dead`, docs/design/recovery-claims.md §3.12): the daemon
+// re-checks the fence and that the host is no longer a voter, and does not
+// require its workloads to be drained — they are the stranded ones, and their
+// rows stay for the recovery claims to supersede.
+message RemoveHostRequest  { string name = 1; bool force = 2; bool dead = 3; }
 message PublishCRLRequest  { string crl_pem = 1; }
 // version is the published CRL's number, echoed back because the daemon has
 // verified it by then and the caller has not. Whether the answering node had to
@@ -117,6 +122,30 @@ message RescanHostResponse { int32 added = 1; int32 removed = 2;
     int32 total = 3; repeated PCIDevice devices = 4; }
 message ListHostDevicesRequest  { string name = 1; string type_filter = 2; }
 message ListHostDevicesResponse { repeated PCIDevice devices = 1; }
+
+// SupersededDisksRequest is `lv host superseded-disks <host>`: the disk copies
+// a failover start set aside on that host (<path>.superseded-<time>), and, with
+// purge (admin), the removal of every one not held.
+message SupersededDisksRequest {
+    string host           = 1;  // "" = the host answering
+    bool   purge          = 2;  // remove every copy that is not held
+    int64  older_than_sec = 3;  // purge only copies set aside at least this long ago
+}
+message SupersededDisk {
+    string path         = 1;  // the copy
+    string disk_path    = 2;  // the disk path it was set aside from
+    string set_aside_at = 3;  // RFC3339
+    int64  size_bytes   = 4;
+    string vm_name      = 5;  // the VM whose disk is at disk_path now; "" when none
+    string vm_state     = 6;
+    string held         = 7;  // why it is kept whatever its age; "" when not held
+    bool   removed      = 8;  // removed by this request
+}
+message SupersededDisksResponse {
+    string                  host           = 1;
+    repeated SupersededDisk disks          = 2;
+    int32                   retention_days = 3;  // superseded_disk_retention_days there; 0 = kept until removed
+}
 message ConfigureHostRequest {
     string name = 1;
     string fence_strategy = 2;  // ssh | ipmi | watchdog
@@ -142,6 +171,13 @@ message ConfigureHostRequest {
     optional double mem_overcommit = 10;
     optional int32 cpu_reserve = 11;
     optional int32 mem_reserve_mib = 12;
+    // Clear the host's IPMI address, user and password. An empty ipmi_* field
+    // means "leave alone", so this is the only way to remove them. Refused
+    // together with any ipmi_* field, and while the host would be left fencing
+    // by "ipmi" (pass another fence_strategy with it). A server that predates
+    // the field ignores it: alone it answers "no fields to update", and a
+    // client must check the returned host's ipmi_address is empty.
+    bool clear_ipmi = 13;
 }
 
 // ── VMs ──
@@ -816,9 +852,21 @@ message CreateUserRequest  { string username = 1; string password = 2; string ro
 message ListUsersResponse  { repeated User users = 1; }
 message DeleteUserRequest  { string username = 1; }
 message WhoamiResponse     { string username = 1; string role = 2; string realm = 3; string expires_at = 4; }
+// CheckPermissionsRequest names permission gates (see grpcapi permGates), not
+// raw verbs, so the question cannot drift from the one the RPC asks.
+message CheckPermissionsRequest  { repeated string gates = 1; }
+// allowed maps every requested gate name to whether it admits the caller.
+message CheckPermissionsResponse { map<string, bool> allowed = 1; }
 // ChangePasswordRequest: username empty = the caller themselves; a non-empty
 // username requires admin. old_password is verified for self-service changes.
 message ChangePasswordRequest { string username = 1; string old_password = 2; string new_password = 3; }
+// ResetAdminPasswordRequest is `lv user reset-admin` over the host's local root
+// channel: loopback mTLS presenting THIS host's own certificate, and no bearer.
+// The CLI mints the password and sends only its bcrypt hash, so the plaintext
+// never leaves the process that writes the password file. os_user is the
+// invoking account as the CLI reports it (SUDO_USER when set); it is recorded
+// in the audit row as a claim, not as an authenticated identity.
+message ResetAdminPasswordRequest { string password_hash = 1; string os_user = 2; }
 message CreateTokenRequest {
     string username = 1;
     string name     = 2;
@@ -963,6 +1011,72 @@ message RestoreFromBackupProgress {
     int32  chunks_total  = 4;
     string status        = 5;
     string error         = 6;
+}
+
+// ── Backup repository maintenance ──
+//
+// Verify, garbage-collect, prune and sync act on a repo the DAEMON you call
+// holds. `repo` (and SyncBackupRepoRequest.destination) is a registered repo
+// name — daemon config `backup_repos:` or a cluster-registered compose repo — or
+// an absolute path, which only an admin may pass (resolveBackupRepoPath). Each
+// RPC is checked at `/` with its own backup.* verb and writes one audit row.
+
+message VerifyBackupRepoRequest {
+    string repo = 1;
+}
+message VerifyBackupRepoResponse {
+    int64           chunks_checked = 1;
+    repeated string mismatched     = 2;  // chunk ids whose content disagrees with their id
+    repeated string missing        = 3;  // chunk ids a manifest references that are absent
+}
+
+message GarbageCollectBackupRepoRequest {
+    string repo = 1;
+}
+message GarbageCollectBackupRepoResponse {
+    int64 manifests_scanned     = 1;
+    int64 chunks_referenced     = 2;
+    int64 chunks_on_disk        = 3;
+    int64 chunks_deleted        = 4;
+    int64 chunks_retained_young = 5;  // unreferenced, but inside the grace window
+    int64 manifests_invalid     = 6;  // their chunks are retained
+    int64 bytes_reclaimed       = 7;
+}
+
+// BackupRepoSnapshot is one manifest as a prune plan names it.
+message BackupRepoSnapshot {
+    string timestamp  = 1;
+    string vm_name    = 2;
+    string disk_name  = 3;
+    int64  total_size = 4;
+}
+
+message PruneBackupRepoRequest {
+    string repo         = 1;
+    int32  keep_last    = 2;
+    int32  keep_daily   = 3;
+    int32  keep_weekly  = 4;
+    int32  keep_monthly = 5;
+    int32  keep_yearly  = 6;
+    // false (the default) only plans: nothing is deleted and no audit row is
+    // written. true deletes the manifests the plan drops.
+    bool   apply        = 7;
+}
+message PruneBackupRepoResponse {
+    repeated BackupRepoSnapshot keep    = 1;
+    repeated BackupRepoSnapshot delete  = 2;
+    bool                        applied = 3;
+}
+
+message SyncBackupRepoRequest {
+    string source      = 1;
+    string destination = 2;
+}
+message SyncBackupRepoResponse {
+    int64 manifests_copied = 1;
+    int64 chunks_copied    = 2;
+    int64 chunks_skipped   = 3;  // already present at the destination
+    int64 bytes_copied     = 4;
 }
 
 // ── Containers ──
@@ -1518,6 +1632,15 @@ message SetFirewallDefaultRequest        { string scope = 1; bool default_deny =
 message ListFirewallDefaultsRequest      {}
 message ListFirewallDefaultsResponse     { repeated FirewallDefault defaults = 1; }
 
+// ── Security groups: the per-NIC tier ──
+// `lv sg create/rm/rule-add/rule-rm`. These used to write the host's database
+// straight from the CLI process, which skipped the daemon's authorization and
+// left no audit row (colonelpanik/litevirt#182).
+message CreateSecurityGroupRequest     { string name = 1; string stack_name = 2; }
+message DeleteSecurityGroupRequest     { string id = 1; }  // tombstones the group and its rules
+message AddSecurityGroupRuleRequest    { SecurityGroupRule rule = 1; }  // rule.id is ignored
+message RemoveSecurityGroupRuleRequest { string id = 1; }  // the RULE id
+
 // ── Storage ──
 message ListStoragePoolsRequest {}
 message ListStoragePoolsResponse { repeated StoragePool pools = 1; }
@@ -1662,6 +1785,14 @@ message RuntimeActionProof {
     // replicated ROW rather than a carried proof, so the row cannot be trusted
     // on the strength of some other node having checked it.
     string lease_key        = 15;
+    // claim_certificate is the recovery-claim certificate that authorizes an
+    // ownership-transfer proof (docs/design/recovery-claims.md §3.9): the JSON
+    // corrosion.ClaimCertificate, a majority of voters' signed accepts for
+    // exactly this binding. Evidence, not a binding field — the executor
+    // verifies it offline against the voter set and the cluster CA before it
+    // claims the proof, once recovery_claim_v1 is enforced. "" = none.
+    // Additive/wire-compatible.
+    string claim_certificate = 16;
 }
 
 message AcknowledgeLeaseTermTieRequest {
@@ -1693,6 +1824,331 @@ message GetLeaseTermHighWaterResponse {
     int64 term = 2;
     // holder is the holder recorded at that term; "" when term == 0.
     string holder = 3;
+    // lease_holder and lease_expires_at are this node's leader_election row
+    // for key (expires_at as RFC3339 UTC); both "" when it has none. A node
+    // about to take a lease over reads them as refusal evidence: a peer whose
+    // row shows the lease live has seen a renewal the caller has not, because
+    // renewals travel only in leader_election, which anti-entropy does not
+    // carry. A peer on an older build leaves them empty, which proves nothing
+    // either way and is treated as no evidence.
+    string lease_holder     = 4;
+    string lease_expires_at = 5;
+}
+
+// ── Recovery claims and the voter set (docs/design/recovery-claims.md) ──
+
+message RecoveryClaimKey {
+    string target_kind = 1;  // vm | container | voter_config
+    string target_name = 2;  // workload name; "" for voter_config
+    int64  owner_epoch = 3;  // generation being left; config generation for voter_config
+    int64  attempt     = 4;
+    // incarnation is the workload row's created_at: which incarnation of the
+    // name the claim decides for (docs/design/recovery-claims.md §10 item 37).
+    // "" is a legacy key, from a coordinator before claim_incarnation_v1
+    // latched, and always "" for voter_config.
+    string incarnation = 5;
+}
+message ClaimBallot {
+    uint64 round       = 1;
+    string coordinator = 2;
+    bytes  boot_nonce  = 3;
+}
+message ClaimVoterMember {
+    string name        = 1;
+    string incarnation = 2;
+}
+// VoterConfigValue is a voter_configs row without its certificate: what a
+// voter_config claim decides.
+message VoterConfigValue {
+    int64  generation = 1;
+    repeated ClaimVoterMember members = 2;
+    string change     = 3;  // genesis | add:<host> | rm:<host> | reset
+    string created_by = 4;
+    string created_at = 5;
+}
+// RecoveryClaimValue is what a claim decides: the ActionProof binding fields
+// plus the source host for a workload key, or a voter config.
+message RecoveryClaimValue {
+    string id               = 1;
+    string action           = 2;
+    string target_kind      = 3;
+    string target_name      = 4;
+    string dest_host        = 5;
+    string coordinator      = 6;
+    string relocation_token = 7;
+    string fence_epoch      = 8;
+    string owner_epoch      = 9;
+    int64  lease_term       = 10;
+    string lease_key        = 11;
+    string source_host      = 12;
+    VoterConfigValue voter_config = 13;
+}
+// ClaimAccept is one voter's signed accept.
+message ClaimAccept {
+    string voter             = 1;
+    string voter_incarnation = 2;
+    int64  config_generation = 3;
+    ClaimBallot ballot       = 4;
+    string value_digest      = 5;
+    string cert_pem          = 6;
+    bytes  signature         = 7;
+    RecoveryClaimKey key     = 8;
+}
+message PrepareRecoveryClaimRequest {
+    RecoveryClaimKey key    = 1;
+    ClaimBallot ballot      = 2;
+    int64 config_generation = 3;
+    // supersede is required at attempt > 0 (§3.12): the evidence that the
+    // value decided at attempt-1 will never execute.
+    RecoveryClaimSupersede supersede = 4;
+}
+// RecoveryClaimSupersede is the evidence a Prepare at attempt n+1 carries.
+message RecoveryClaimSupersede {
+    string prior_certificate        = 1;  // JSON certificate that decided attempt n
+    RecoveryClaimValue prior_value  = 2;  // the value it decided
+    string abandonment              = 3;  // JSON signed abandonment by that value's destination; "" = it was removed
+}
+// AbandonRecoveryProofRequest asks a recovery destination to sign that it has
+// not executed, and never will, the proof a decided claim named (§3.12).
+message AbandonRecoveryProofRequest {
+    RecoveryClaimKey key = 1;
+    string proof_id      = 2;
+    string reason        = 3;
+    // foreign_only: abandon only a proof this destination can show is NOT the
+    // decision of the incarnation key names — the legacy-key bridge's
+    // exclusion (docs/design/recovery-claims.md §10 item 37). Refused
+    // otherwise, so a decision of this incarnation that may still run, or
+    // has run, is never abandoned by it.
+    bool foreign_only    = 4;
+    // operator_release: the operator's `lv cluster claim-release` of a
+    // legacy-held claim. With foreign_only, it lets the destination abandon a
+    // proof it claimed and left in progress — the one refusal it overrides —
+    // after confirming from its own state that nothing runs it: no start path
+    // holds the workload and no live domain or container of its name exists
+    // here. Every other refusal stands.
+    bool operator_release = 5;
+}
+// ReleaseLegacyHeldClaimRequest is `lv cluster claim-release <kind>/<name>`:
+// release the decision an open ha.claim.legacy_held names for one workload,
+// stuck in flight on a live destination (docs/design/recovery-claims.md §10
+// item 37).
+message ReleaseLegacyHeldClaimRequest {
+    string kind = 1;   // vm | container
+    string name = 2;
+}
+message ReleaseLegacyHeldClaimResponse {
+    string dest_host = 1;   // the destination that signed the abandonment
+    string proof_id  = 2;   // the proof it will never run
+    string key       = 3;   // the claim key, rendered
+    string detail    = 4;
+}
+message AbandonRecoveryProofResponse {
+    string abandonment = 1;  // JSON corrosion.ClaimAbandonment
+}
+// PlanDeadHostRemovalRequest is `lv host rm --dead`'s plan (also its
+// --dry-run): what the removal would do, and the recoveries it unblocks.
+message PlanDeadHostRemovalRequest { string name = 1; }
+message StrandedRecovery {
+    string kind         = 1;  // vm | container
+    string name         = 2;
+    string detail       = 3;  // what is stranded and why
+    int64  next_attempt = 4;  // the claim attempt its recovery moves to
+}
+message ForceReconfigureVotersRequest {
+    repeated string lost = 1;   // the members of the adopted generation lost for good
+    bool   dry_run       = 2;   // run every check and print the plan, change nothing
+}
+message ForcedFenceEvidence {
+    string host      = 1;
+    string fence_id  = 2;
+    string method    = 3;
+    string result    = 4;
+    string timestamp = 5;
+}
+message ForceReconfigureVotersResponse {
+    int64  from_generation = 1;
+    int64  generation      = 2;   // the forced generation (0 on a dry run)
+    repeated string survivors = 3;
+    repeated string lost      = 4;
+    repeated ForcedFenceEvidence fences = 5;
+    int64  import_keys     = 6;   // claim keys the survivors will import
+    bool   applied         = 7;
+    string detail          = 8;
+}
+message SignForcedVoterConfigRequest {
+    int64  from_generation   = 1;
+    VoterConfigValue value   = 2;
+    repeated string lost     = 3;
+    repeated ForcedFenceEvidence fences = 4;
+}
+message SignForcedVoterConfigResponse {
+    string voter       = 1;
+    string incarnation = 2;
+    string cert_pem    = 3;
+    bytes  signature   = 4;
+}
+// A workload a host paused itself, as its pause record holds it.
+message PausedWorkload {
+    string kind        = 1;  // vm | container
+    string name        = 2;
+    int64  owner_epoch = 3;
+    string incarnation = 4;  // the row's created_at at the pause
+}
+message ConfirmPartitionResumeRequest {
+    repeated PausedWorkload workloads = 1;
+}
+// One voter's view of one paused workload, from its own replica and claim tables.
+message PausedWorkloadView {
+    string kind          = 1;
+    string name          = 2;
+    bool   live          = 3;  // a live row exists (for a container: on the caller)
+    string host_name     = 4;
+    int64  owner_epoch   = 5;
+    string incarnation   = 6;
+    // accepted_dest names the destination of a recovery-claim value this voter
+    // has accepted for the workload at the paused epoch and incarnation
+    // (either key form); "" when none.
+    string accepted_dest = 7;
+}
+message ConfirmPartitionResumeResponse {
+    string voter        = 1;
+    string caller_state = 2;  // the caller's hosts.state in this voter's replica; "absent" when none
+    repeated PausedWorkloadView views = 3;
+}
+
+message InspectRecoveryClaimRequest {
+    string kind        = 1;   // vm | container
+    string name        = 2;
+    int64  owner_epoch = 3;   // -1 (default when unset by the CLI) = the row's current epoch
+    bool   epoch_set   = 4;
+}
+message RecoveryClaimVoterView {
+    string voter              = 1;
+    bool   reachable          = 2;
+    string error              = 3;
+    string promised           = 4;   // ballot, rendered
+    string accepted           = 5;
+    string value_digest       = 6;
+    string proof_id           = 7;
+    string dest_host          = 8;
+    string source_host        = 9;
+    string incarnation        = 10;
+    bool   incarnation_ok     = 11;
+    string last_refusal       = 12;
+    string last_refusal_detail = 13;
+    int64  adopted_generation = 14;
+}
+message RecoveryClaimAttemptView {
+    RecoveryClaimKey key = 1;
+    repeated RecoveryClaimVoterView voters = 2;
+    string decided_digest = 3;   // a digest a majority of members accepted, "" = none
+    string decided_dest   = 4;
+}
+message InspectRecoveryClaimResponse {
+    int64  generation = 1;
+    repeated RecoveryClaimAttemptView attempts = 2;
+    string detail     = 3;
+}
+message PlanDeadHostRemovalResponse {
+    string host              = 1;
+    bool   fenced            = 2;  // a proof-grade fence is recorded
+    string fence_detail      = 3;
+    string fence_command     = 4;  // what to run when it is not
+    bool   voter             = 5;  // a member of the adopted voter generation
+    int64  voter_generation  = 6;
+    repeated StrandedRecovery stranded = 7;
+    string host_state        = 8;
+}
+message PrepareRecoveryClaimResponse {
+    bool        promised           = 1;
+    ClaimBallot promised_ballot    = 2;  // on refusal: what this voter has promised
+    ClaimBallot accepted_ballot    = 3;  // unset if nothing accepted
+    RecoveryClaimValue accepted_value = 4;
+    string      voter              = 5;
+    string      voter_incarnation  = 6;
+    string      refusal_reason     = 7;
+    string      refusal_detail     = 8;
+    // On a promise at an incarnation-scoped key: what this voter accepted at
+    // the LEGACY key of the same (kind, name, epoch, attempt), if anything.
+    // The promise seals that legacy key here — this voter refuses every later
+    // legacy Prepare and Accept at it — so a majority of these reports is
+    // everything the legacy key can ever have decided (§10 item 37).
+    ClaimBallot legacy_accepted_ballot       = 9;
+    RecoveryClaimValue legacy_accepted_value = 10;
+}
+message AcceptRecoveryClaimRequest {
+    RecoveryClaimKey key     = 1;
+    ClaimBallot ballot       = 2;
+    RecoveryClaimValue value = 3;
+    int64 config_generation  = 4;
+}
+message AcceptRecoveryClaimResponse {
+    bool        accepted        = 1;
+    ClaimBallot promised_ballot = 2;
+    ClaimAccept accept          = 3;
+    string      voter           = 4;
+    string      refusal_reason  = 5;  // e.g. recovery_claim_owner_reachable
+    string      refusal_detail  = 6;  // e.g. "node-3 still reaches node-2 (Ping answered in 4ms)"
+}
+message GetRecoveryClaimRequest {
+    RecoveryClaimKey key = 1;
+}
+message GetRecoveryClaimResponse {
+    PrepareRecoveryClaimResponse state = 1;  // promised/accepted ballot and value, voter, incarnation
+    ClaimAccept accept                 = 2;
+    string last_refusal_reason         = 3;  // this voter's most recent refusal for the key (memory only)
+    string last_refusal_detail         = 4;
+    int64  adopted_generation          = 5;
+}
+message ListRecoveryClaimsRequest {
+    int64 config_generation = 1;  // the generation the importer is leaving
+}
+message RecoveryClaimState {
+    bool   header             = 1;  // the first message: voter, frozen, adopted_generation
+    string voter              = 2;
+    bool   frozen             = 3;  // the asked-for generation is sealed or left behind here
+    int64  adopted_generation = 4;
+    RecoveryClaimKey key      = 5;
+    ClaimBallot promised      = 6;
+    ClaimBallot accepted      = 7;
+    RecoveryClaimValue value  = 8;
+    string value_digest       = 9;
+}
+
+message GetVoterConfigRequest {}
+message VoterMemberStatus {
+    string name        = 1;
+    string incarnation = 2;  // the incarnation it was admitted with
+    string host_state  = 3;  // hosts.state, or "removed"
+    bool   reachable   = 4;
+    bool   abstaining  = 5;  // its local incarnation does not match its entry
+    string detail      = 6;
+}
+message GetVoterConfigResponse {
+    string reporting_host      = 1;
+    int64  adopted_generation  = 2;  // 0 = none adopted yet
+    int64  latest_generation   = 3;  // highest voter_configs row on this host
+    bool   explicit            = 4;  // false = the voter set is derived from host state
+    string change              = 5;
+    string created_by          = 6;
+    string created_at          = 7;
+    repeated VoterMemberStatus members = 8;
+    repeated string derived_voters     = 9;  // the derived set, shown when not explicit
+    bool   gate_open           = 10; // voter_config_v1 has durably latched here
+    string genesis_pending     = 11; // why automatic genesis has not written generation 1
+}
+message ChangeVoterConfigRequest {
+    string op      = 1;  // init | add | rm | reset
+    string host    = 2;  // add, rm
+    repeated string members = 3;  // init: explicit member list (default: the derived set)
+    bool   dry_run = 4;  // report the value that would be proposed, change nothing
+}
+message ChangeVoterConfigResponse {
+    int64  generation = 1;
+    repeated ClaimVoterMember members = 2;
+    string change     = 3;
+    bool   applied    = 4;  // false for a dry run
+    string detail     = 5;
 }
 
 message PromoteReplicaRequest {
@@ -1815,6 +2271,15 @@ message ReadyResponse {
   // — no decision path may read it, and it is served only to a caller holding a
   // host certificate, because it carries local error text.
   string not_ready_reason = 3;
+  // partition_pause is enforcement.partition_pause as THIS run of the daemon
+  // holds it: whether it pauses its recoverable workloads on losing the voter
+  // majority. A failover coordinator relies on a host's pause only if the
+  // host's latest answer to this probe said so (docs/design/partition-pause.md
+  // §4.3). It rides on the health probe, not on Ping, because the probe runs
+  // every probe interval and the flag changes only with a restart, so the
+  // latest answer always comes from the run a coordinator last reached. False
+  // from a build that predates the field, which therefore is not relied on.
+  bool partition_pause = 4;
 }
 
 // FetchBinary: pull this daemon's binary for peer self-upgrade.
@@ -1849,6 +2314,14 @@ message EnsureDisksRequest {
 message DiskStub {
     string path       = 1;  // absolute path on target (e.g. /var/lib/litevirt/disks/web-1-root.qcow2)
     int64  size_bytes  = 2;  // size hint for pre-creation (0 = create empty sparse file)
+}
+
+// EnsureDisksResponse names the stubs this call created. A path that already
+// held a file is skipped and not named, so the cleanup after a failed
+// migration removes only these. It replaced google.protobuf.Empty, which has
+// no fields: an older target's reply decodes as "created none".
+message EnsureDisksResponse {
+    repeated string created_paths = 1;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -1936,6 +2409,17 @@ message TableDigest {
     // has digest_v2 enabled; compared only when BOTH peers supply it (pairwise negotiation),
     // else the peers fall back to the positional `hash`.
     string hash_v2 = 5;
+    // acknowledged_ties is the subset of unresolved_ties an operator has acknowledged on
+    // this host (`lv cluster acknowledge-lease-term`). Those rows still differ by design;
+    // they no longer drive ha.lww.unresolved. Zero from an older build.
+    int32  acknowledged_ties = 6;
+    // acknowledged_residual is this host's digest of the table with every
+    // acknowledged-tie row replaced by a marker naming only its primary key. Emitted
+    // only when every tie this host tracks in the table is acknowledged, and only on a
+    // fresh (verification) digest. Equal residuals on every host mean the table
+    // differs only by acknowledged ties, which the convergence report counts as
+    // converged. Empty means this host cannot vouch for that.
+    string acknowledged_residual = 7;
 }
 
 message StateDigestResponse {
@@ -1976,10 +2460,92 @@ message StateDumpChunk {
     bool  final = 2; // true on the last chunk
 }
 
+// TableDumpRequest names the public replicated tables a StreamTableDump should
+// carry — the tables whose digests disagreed. The server adds any table a
+// requested one needs to merge (a child table's parent, whose rows are the
+// authority its merge checks against), refuses a sensitive-lane table, and
+// ignores a name it does not replicate. An empty list is refused rather than
+// read as "everything"; the full dump is StreamStateDump.
+//
+// buckets narrows a table to the named buckets of bucket_scheme
+// (GetTableBucketDigests): only rows whose bucket key falls in one of them are
+// sent, and a child table's authority parent is narrowed to the SAME buckets,
+// which is where every parent row those children name lives. A table absent
+// from the map, a map entry with no buckets, or a bucket_scheme the server does
+// not speak is sent whole. An older server ignores both fields and sends whole
+// tables — a superset the merge handles.
+message TableDumpRequest {
+    repeated string tables = 1;
+    map<string, BucketSet> buckets = 2;
+    uint32 bucket_scheme = 3;
+}
+
+// BucketSet is a list of bucket indexes.
+message BucketSet {
+    repeated uint32 buckets = 1;
+}
+
 // SensitiveStateRequest identifies the peer requesting the secret-bearing
 // anti-entropy lane. The server verifies sender against the peer certificate CN.
+//
+// On StreamSensitiveStateDump, tables (when non-empty) narrows the dump to the
+// named sensitive tables, and buckets / bucket_scheme narrow those as on
+// TableDumpRequest. An empty tables list is the whole sensitive lane, which is
+// also what an older server sends whatever these fields say.
 message SensitiveStateRequest {
     string sender = 1;
+    repeated string tables = 2;
+    map<string, BucketSet> buckets = 3;
+    uint32 bucket_scheme = 4;
+}
+
+// TableRowsPage is one page of a streamed repair pull (StreamTableRows,
+// StreamSensitiveTableRows): at most a bounded number of rows of ONE table,
+// gzipped JSON rows in `columns` order. Tables arrive in merge-dependency order
+// (workload and operation parents first) and each table's pages contiguously,
+// so the receiver can merge page by page and hold only the parent tier whole.
+// The last message has final=true and may carry no rows.
+message TableRowsPage {
+    string table            = 1;
+    repeated string columns = 2;
+    bytes  rows             = 3; // gzipped JSON array of rows
+    int32  row_count        = 4;
+    bool   final            = 5;
+}
+
+// BucketDigestRequest asks for the bucket digests of the named tables, public
+// or sensitive, under bucket scheme `scheme`. sender must match the caller's
+// host certificate, as on the sensitive lane.
+message BucketDigestRequest {
+    string sender = 1;
+    repeated string tables = 2;
+    uint32 scheme = 3;
+}
+
+// BucketDigest is one non-empty bucket's row count and hashes, built exactly
+// like TableDigest's over the bucket's rows. hash_v2 is set only when the
+// sender's table digest carries one.
+message BucketDigest {
+    uint32 index   = 1;
+    int32  count   = 2;
+    string hash    = 3;
+    string hash_v2 = 4;
+}
+
+// TableBucketDigests is one table's non-empty buckets. bucketed=false means
+// the table cannot be bucketed on this host and must be pulled whole.
+message TableBucketDigests {
+    string name                  = 1;
+    bool   bucketed              = 2;
+    repeated BucketDigest buckets = 3;
+}
+
+// BucketDigestResponse answers in the server's own scheme. A caller that sees
+// a scheme or bucket_count other than its own must not compare the buckets.
+message BucketDigestResponse {
+    uint32 scheme                      = 1;
+    uint32 bucket_count                = 2;
+    repeated TableBucketDigests tables = 3;
 }
 
 // ── Divergence scanner (Phase 0, read-only) ──
@@ -2005,6 +2571,19 @@ message DivergenceRow {
     string               pk       = 2; // plaintext PK, or HMAC label for sensitive tables
     string               class    = 3; // DivergenceClass
     repeated NodeRowMeta per_node = 4;
+    // tie_acknowledged_on / tie_unacknowledged_on are set only on a row of a
+    // table in which some host holds an operator-acknowledged LWW tie ('lv
+    // cluster acknowledge-lease-term'). They split the row's hosts by whether
+    // that host's verification digest vouches for the table: every tie it
+    // tracks there is acknowledged and it supplied an acknowledged residual,
+    // the per-host test `lv cluster converge` applies. Table-granular: a host
+    // that vouches has acknowledged every tie it tracks in the table.
+    // A row is classed acknowledged_tie only when every one of its hosts
+    // vouches and every reporting host's residual agrees (so nothing but the
+    // acknowledged rows differs); otherwise it keeps its class, and
+    // tie_unacknowledged_on names the hosts still to acknowledge.
+    repeated string tie_acknowledged_on   = 5;
+    repeated string tie_unacknowledged_on = 6;
 }
 message SemanticViolationPB {
     string          kind   = 1;
@@ -2237,6 +2816,9 @@ service LiteVirt {
     rpc PublishCRL(PublishCRLRequest)          returns (PublishCRLResponse);
     rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
     rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
+    // SupersededDisks lists the disk copies a failover start set aside on a
+    // host, and with purge (admin) removes the ones not held.
+    rpc SupersededDisks(SupersededDisksRequest) returns (SupersededDisksResponse);
     rpc UpgradeHost(stream UpgradeHostRequest) returns (UpgradeHostResponse);
     // PreStageUpgrade stages the new binary and forward-migrates the local
     // state.db schema WITHOUT swapping/re-execing. Run on every node before the
@@ -2381,9 +2963,19 @@ service LiteVirt {
     // skipAuth), so a stale/expired/revoked session bearer yields Unauthenticated
     // — the UI uses it to validate the session cookie and redirect to /login.
     rpc Whoami(google.protobuf.Empty)    returns (WhoamiResponse);
+    // CheckPermissions reports, for the CALLER only, whether each named
+    // permission gate would admit it — the same RequirePerm question (path,
+    // verb, legacy fallback role) the gated RPC asks. Display only: the UI uses
+    // it to decide which controls to show, and every gated RPC still runs its
+    // own check. An unknown gate name is InvalidArgument.
+    rpc CheckPermissions(CheckPermissionsRequest) returns (CheckPermissionsResponse);
     // ChangePassword updates the caller's (or, for admins, a target's) local-realm
     // password after verifying the old one.
     rpc ChangePassword(ChangePasswordRequest) returns (google.protobuf.Empty);
+    // ResetAdminPassword replaces the local admin's password hash and records a
+    // `user.reset-admin` audit row. Local root only: loopback, this host's own
+    // certificate, no bearer. It resets an existing admin and never creates one.
+    rpc ResetAdminPassword(ResetAdminPasswordRequest) returns (google.protobuf.Empty);
     rpc ListTwoFactors(ListTwoFactorsRequest) returns (ListTwoFactorsResponse);
     rpc EnrollTOTP(EnrollTOTPRequest)         returns (EnrollTOTPResponse);
     rpc DisableTwoFactor(DisableTwoFactorRequest) returns (google.protobuf.Empty);
@@ -2413,6 +3005,16 @@ service LiteVirt {
     // chunks (sub-chunk framed) then the manifest LAST.
     rpc HasChunks(HasChunksRequest)   returns (HasChunksResponse);
     rpc PushBackup(stream PushBackupFrame) returns (PushBackupResponse);
+
+    // ── Backup repository maintenance ──
+    // What `lv backup repo verify|gc|prune|sync` do to a local path, done by the
+    // daemon to a repo it holds, under RBAC and on the audit record. The web
+    // UI's /backups actions call these. Verbs: backup.verify, backup.gc,
+    // backup.prune, backup.sync, all at `/`, legacy floor operator.
+    rpc VerifyBackupRepo(VerifyBackupRepoRequest)                 returns (VerifyBackupRepoResponse);
+    rpc GarbageCollectBackupRepo(GarbageCollectBackupRepoRequest) returns (GarbageCollectBackupRepoResponse);
+    rpc PruneBackupRepo(PruneBackupRepoRequest)                   returns (PruneBackupRepoResponse);
+    rpc SyncBackupRepo(SyncBackupRepoRequest)                     returns (SyncBackupRepoResponse);
 
     // ── Containers ──
     rpc CreateContainer(CreateContainerRequest) returns (Container);
@@ -2485,6 +3087,12 @@ service LiteVirt {
     rpc DeleteIpSet(DeleteIpSetRequest)                             returns (google.protobuf.Empty);
     rpc SetFirewallDefault(SetFirewallDefaultRequest)               returns (google.protobuf.Empty);
     rpc ListFirewallDefaults(ListFirewallDefaultsRequest)           returns (ListFirewallDefaultsResponse);
+
+    // ── Security groups: the per-NIC tier ──
+    rpc CreateSecurityGroup(CreateSecurityGroupRequest)             returns (SecurityGroup);
+    rpc DeleteSecurityGroup(DeleteSecurityGroupRequest)             returns (google.protobuf.Empty);
+    rpc AddSecurityGroupRule(AddSecurityGroupRuleRequest)           returns (SecurityGroupRule);
+    rpc RemoveSecurityGroupRule(RemoveSecurityGroupRuleRequest)     returns (google.protobuf.Empty);
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);
@@ -2504,7 +3112,7 @@ service LiteVirt {
 
     // ── Internal: Migration helpers ──
     rpc EnsureCloudInit(EnsureCloudInitRequest)    returns (google.protobuf.Empty);
-    rpc EnsureDisks(EnsureDisksRequest)            returns (google.protobuf.Empty);
+    rpc EnsureDisks(EnsureDisksRequest)            returns (EnsureDisksResponse);
     rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (google.protobuf.Empty);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
@@ -2533,15 +3141,85 @@ service LiteVirt {
     // is retained for mixed-version clusters — a new client falls back to it
     // when a peer doesn't implement the stream.
     rpc StreamStateDump(google.protobuf.Empty)      returns (stream StateDumpChunk);
+    // StreamTableDump is StreamStateDump restricted to the named public tables,
+    // so anti-entropy repairs a mismatched table without pulling every other
+    // one. Peer-only, like StreamStateDump. A caller falls back to
+    // StreamStateDump when a peer answers Unimplemented (an older build).
+    rpc StreamTableDump(TableDumpRequest)           returns (stream StateDumpChunk);
     // Sensitive state sync is peer-mTLS only. It carries secret-bearing tables
     // intentionally excluded from GetStateDump/StreamStateDump and is not an
     // operator or REST surface.
     rpc GetSensitiveStateDigest(SensitiveStateRequest) returns (StateDigestResponse);
     rpc StreamSensitiveStateDump(SensitiveStateRequest) returns (stream StateDumpChunk);
+    // GetTableBucketDigests returns per-bucket digests of the named tables so
+    // anti-entropy pulls only the buckets of a mismatched table that disagree
+    // (docs/design/ae-incremental.md). Peer-only (sender must match the host
+    // certificate). An older build answers Unimplemented and the caller pulls
+    // whole tables.
+    rpc GetTableBucketDigests(BucketDigestRequest) returns (BucketDigestResponse);
+    // StreamTableRows is StreamTableDump as bounded pages instead of one blob:
+    // the server reads each table a page at a time and the client merges each
+    // page as it arrives (docs/design/ae-incremental.md). Peer-only, like
+    // StreamTableDump. An older build answers Unimplemented and the caller
+    // falls back to StreamTableDump.
+    rpc StreamTableRows(TableDumpRequest) returns (stream TableRowsPage);
+    // StreamSensitiveTableRows is the sensitive lane's paged pull; the sender
+    // must match the host certificate, as for StreamSensitiveStateDump.
+    rpc StreamSensitiveTableRows(SensitiveStateRequest) returns (stream TableRowsPage);
     // TriggerAntiEntropy kicks an immediate (debounced) anti-entropy pass; GetClusterStateDigest
     // fans digests out to all active hosts. Both back `lv cluster converge` (accelerate + verify).
     rpc TriggerAntiEntropy(TriggerAntiEntropyRequest) returns (TriggerAntiEntropyResponse);
     rpc GetClusterStateDigest(google.protobuf.Empty) returns (ClusterStateDigestResponse);
+
+    // ── Internal: recovery claims (docs/design/recovery-claims.md §3) ──
+    // Single-decree Paxos per claim key. Peer-only: the caller must present a
+    // known host certificate, and a ballot must name its sender. A voter
+    // replies only after the state its reply depends on is committed.
+    rpc PrepareRecoveryClaim(PrepareRecoveryClaimRequest) returns (PrepareRecoveryClaimResponse);
+    rpc AcceptRecoveryClaim(AcceptRecoveryClaimRequest) returns (AcceptRecoveryClaimResponse);
+    // Read-only: a voter's recorded state for one key, its incarnation and
+    // its last refusal. Peer- or operator-callable; it changes nothing.
+    rpc GetRecoveryClaim(GetRecoveryClaimRequest) returns (GetRecoveryClaimResponse);
+    // The bulk form of GetRecoveryClaim a member of a new voter generation
+    // imports from (§4.4). Peer-only. The first message is a header saying
+    // whether the asked-for generation is frozen on this voter.
+    rpc ListRecoveryClaims(ListRecoveryClaimsRequest) returns (stream RecoveryClaimState);
+    // AbandonRecoveryProof: peer-only. A recovery destination signs that it has
+    // not executed, and never will, a proof a decided claim named — refused if
+    // it may already have (§3.12).
+    rpc AbandonRecoveryProof(AbandonRecoveryProofRequest) returns (AbandonRecoveryProofResponse);
+    // ReleaseLegacyHeldClaim is `lv cluster claim-release <kind>/<name>`
+    // (admin): the decision an open ha.claim.legacy_held names, stuck in
+    // flight on a live destination, is abandoned by that destination once it
+    // has confirmed nothing there runs it. Refused when the destination does
+    // not answer; `lv host rm --dead` is the way out for a dead one.
+    rpc ReleaseLegacyHeldClaim(ReleaseLegacyHeldClaimRequest) returns (ReleaseLegacyHeldClaimResponse);
+    // PlanDeadHostRemoval reports what `lv host rm --dead` would do.
+    rpc PlanDeadHostRemoval(PlanDeadHostRemovalRequest) returns (PlanDeadHostRemovalResponse);
+    // ForceReconfigureVoters is `lv cluster voter force-reconfigure` (§4.6):
+    // the audited break-glass for a voter generation whose majority is gone for
+    // good. Run against one survivor, which drives the rest; refused while a
+    // majority is actually reachable.
+    rpc ForceReconfigureVoters(ForceReconfigureVotersRequest) returns (ForceReconfigureVotersResponse);
+    // SignForcedVoterConfig: peer-only. A survivor checks the forced
+    // generation for itself, seals the generation it replaces, and signs.
+    rpc SignForcedVoterConfig(SignForcedVoterConfigRequest) returns (SignForcedVoterConfigResponse);
+    // InspectRecoveryClaim is `lv cluster claim <kind>/<name>` (§5.4): every
+    // member's recorded state for a workload's claim keys, and its last refusal.
+    rpc InspectRecoveryClaim(InspectRecoveryClaimRequest) returns (InspectRecoveryClaimResponse);
+    // ConfirmPartitionResume: peer-only, read-only. A host that paused
+    // workloads on losing the voter majority asks each voter, before it
+    // resumes any, what that voter's OWN replica and claim tables say about
+    // the caller and each workload (docs/design/partition-pause.md §3.5).
+    rpc ConfirmPartitionResume(ConfirmPartitionResumeRequest) returns (ConfirmPartitionResumeResponse);
+
+    // ── Voter set (colonelpanik/litevirt#251 step 2, §4) ──
+    // GetVoterConfig reports the connected host's adopted voter generation and
+    // each member's state (`lv cluster voter ls`).
+    rpc GetVoterConfig(GetVoterConfigRequest) returns (GetVoterConfigResponse);
+    // ChangeVoterConfig decides the next generation: init, add, rm or reset,
+    // one member per generation (`lv cluster voter init|add|rm|reset`).
+    rpc ChangeVoterConfig(ChangeVoterConfigRequest) returns (ChangeVoterConfigResponse);
 
     // ── Divergence scanner (Phase 0) ──
     // DiagnoseDivergence: operator/admin entrypoint; the called daemon fans out
@@ -2576,6 +3254,16 @@ service LiteVirt {
     rpc ListRegions(ListRegionsRequest)                returns (ListRegionsResponse);
     rpc RegionStatus(RegionStatusRequest)              returns (RegionStatusResponse);
     rpc CrossRegionMigrate(CrossRegionMigrateRequest)  returns (stream MigrateProgress);
+
+    // GetFailoverScope reports the cluster-wide failover_scope policy as the
+    // answering host's replica holds it, with every region's voting strength.
+    // SetFailoverScope changes it (admin). With scope "region" a host is
+    // fenced and recovered only by a quorum of its own region's voters, and
+    // recovery stays in its region (docs/design/region-scoped-failover.md).
+    // SetFailoverScope refuses until failover_scope_v1 has durably latched
+    // and while any voter is unreachable from the answering host.
+    rpc GetFailoverScope(google.protobuf.Empty)       returns (FailoverScopeStatus);
+    rpc SetFailoverScope(SetFailoverScopeRequest)     returns (FailoverScopeStatus);
 
     // ── anycast services ──
     // service_endpoints map a logical name (e.g. "api.litevirt.local")
@@ -2761,6 +3449,36 @@ message RegionStatus {
     int32  active_hosts   = 3;
     int32  vm_count       = 4;
     string last_updated   = 5;  // RFC3339, max(updated_at) across hosts in the region
+}
+
+// FailoverScopeStatus is the failover_scope policy and every region's voting
+// strength, as the answering host sees them.
+message FailoverScopeStatus {
+    string scope      = 1;  // "cluster" (default) | "region"
+    string set_by     = 2;  // principal of the last change; "" when never set
+    string updated_at = 3;  // "" when never set
+    // settable is false until failover_scope_v1 has durably latched on the
+    // answering host; SetFailoverScope refuses until then.
+    bool   settable   = 4;
+    repeated FailoverScopeRegion regions = 5;
+}
+
+// FailoverScopeRegion is one region's voting strength.
+message FailoverScopeRegion {
+    string name             = 1;
+    int32  hosts            = 2;  // every host in the region, whatever its state
+    int32  workers          = 3;  // hosts that can hold workloads (not witnesses)
+    int32  voters           = 4;  // the region's members of the voter set
+    int32  voting_witnesses = 5;
+    int32  quorum           = 6;  // floor(voters/2)+1
+    // can_fence_own is false for a region with fewer than three voters: under
+    // region scope it cannot fence one of its own hosts, so they have no
+    // automatic failover.
+    bool   can_fence_own    = 7;
+}
+
+message SetFailoverScopeRequest {
+    string scope = 1;  // "cluster" | "region"
 }
 
 // CrossRegionMigrate refuses when source/target hosts are in the
@@ -2968,6 +3686,19 @@ message VerifyAuditChainResponse {
     // verdict field that means "not a pass" has to travel with the verdict field
     // that means "not tampering".
     bool unverified = 17;
+    // Hosts that are not signing NOW, as "host: N unsigned rows": the host's
+    // most recent row is unsigned and it holds no signing contract. Not a
+    // finding. It is what tells an operator whether unsigned_rows is history
+    // from before signing was switched on (no host listed) or a host that is
+    // still not signing (enforcement.audit_signature off, or an older build).
+    // An older daemon never sets it, so an empty list says nothing on its own.
+    repeated string not_signing_hosts = 18;
+    // Rows with a NUL byte in a hashed field, as "rowid: host: reason". The
+    // content hash is injective only over NUL-free rows, so such a row's hash
+    // and signature do not determine its content: a different row verifies
+    // the same. A current daemon never writes one. Feeds `unverified`, not
+    // `tampered` — an older build may have written the row verbatim.
+    repeated string ambiguous_rows = 19;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.

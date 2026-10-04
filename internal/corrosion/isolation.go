@@ -59,11 +59,46 @@ func IsolateHost(ctx context.Context, c *Client, observer, host, reason string) 
 	if !isolationReasons[reason] {
 		return invalidf("isolation reason %q: want rolled_back_latch|manual|schema_forward", reason)
 	}
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		return isolateHost(ctx, c, host, reason, live)
+	})
+}
+
+func isolateHost(ctx context.Context, c *Client, host, reason string, live bool) error {
 	next, err := nextIsolationEpoch(ctx, c)
 	if err != nil {
 		return err
 	}
 	now := c.NowTS()
+	if live {
+		// After the membership split the epoch lives in host_membership, under
+		// the same guard, and the concurrent-isolation reasoning below holds
+		// unchanged: host_membership is a plain LWW table too. The resolved view is checked first: a late write to
+		// hosts.isolation_epoch the pass carried across already isolates the
+		// host, and re-isolating is a no-op here too.
+		//
+		// Both homes are written, in one guarded batch under one updated_at:
+		// hosts in its previous-release shape, so a node rolled back one
+		// release still refuses the isolated host's replication.
+		cur, err := hostMembershipOf(ctx, c, host)
+		if err != nil {
+			return err
+		}
+		if cur == nil || cur.Epoch != 0 {
+			return ErrIsolationNotMonotone
+		}
+		ok, err := c.ExecuteBatchGuarded(ctx, membershipEpochIs(ctx, host, 0), []Statement{
+			{SQL: isolateHostSQL, Params: []interface{}{next, reason, now, host}},
+			{SQL: hostMembershipIsolateSQL, Params: []interface{}{next, reason, now, host}},
+		})
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrIsolationNotMonotone
+		}
+		return nil
+	}
 	// On the local-guard question raised by the project-authority review (#126,
 	// finding 1): the guard below is a LOCAL transaction, so two healthy peers
 	// observing the same quarantined node concurrently can both pass it and
@@ -89,10 +124,7 @@ func IsolateHost(ctx context.Context, c *Client, observer, host, reason string) 
 	// out from under a reseed that pinned it, so a verified reseed could never
 	// clear anything. Two peers racing to isolate the same node converge for
 	// the same reason: the first write wins, the second is a no-op.
-	n, err := c.ExecuteRows(ctx,
-		`UPDATE hosts SET isolation_epoch = ?, isolation_reason = ?, updated_at = ?
-		 WHERE name = ? AND deleted_at IS NULL AND isolation_epoch = 0`,
-		next, reason, now, host)
+	n, err := c.ExecuteRowsStrict(ctx, isolateHostSQL, next, reason, now, host)
 	if err != nil {
 		return err
 	}
@@ -102,9 +134,23 @@ func IsolateHost(ctx context.Context, c *Client, observer, host, reason string) 
 	return nil
 }
 
+const (
+	isolateHostSQL = `UPDATE hosts SET isolation_epoch = ?, isolation_reason = ?, updated_at = ?
+		 WHERE name = ? AND deleted_at IS NULL AND isolation_epoch = 0`
+	clearHostIsolationSQL = `UPDATE hosts SET isolation_epoch = 0, isolation_reason = '', updated_at = ?
+		 WHERE name = ? AND deleted_at IS NULL AND isolation_epoch = ?`
+)
+
 // nextIsolationEpoch reads the cluster-wide maximum and returns max+1.
+//
+// The maximum is over BOTH homes of the epoch, hosts and host_membership. Any
+// value above everything recorded anywhere keeps the order, so the read needs
+// no gate: before the split host_membership is empty, and after it every
+// write lands in both.
 func nextIsolationEpoch(ctx context.Context, c *Client) (int64, error) {
-	rows, err := c.Query(ctx, `SELECT COALESCE(MAX(isolation_epoch), 0) AS m FROM hosts`)
+	rows, err := c.Query(ctx, `SELECT COALESCE(MAX(e), 0) AS m FROM (
+		SELECT isolation_epoch AS e FROM hosts
+		UNION ALL SELECT isolation_epoch AS e FROM host_membership)`)
 	if err != nil {
 		return 0, err
 	}
@@ -123,18 +169,33 @@ func ClearHostIsolation(ctx context.Context, c *Client, host string, expectedEpo
 	if host == "" || expectedEpoch <= 0 {
 		return invalidf("clearing isolation requires a host and the epoch being cleared")
 	}
-	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
-		`UPDATE hosts SET isolation_epoch = 0, isolation_reason = '', updated_at = ?
-		 WHERE name = ? AND deleted_at IS NULL AND isolation_epoch = ?`,
-		now, host, expectedEpoch)
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNoRowsAffected
-	}
-	return nil
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		now := c.NowTS()
+		if live {
+			// Both homes, guarded on the membership row's epoch. The hosts
+			// half keeps its own guard, so a copy that already moved on is
+			// left alone there.
+			ok, err := c.ExecuteBatchGuarded(ctx, membershipEpochIs(ctx, host, expectedEpoch), []Statement{
+				{SQL: clearHostIsolationSQL, Params: []interface{}{now, host, expectedEpoch}},
+				{SQL: hostMembershipClearIsolationSQL, Params: []interface{}{now, host, expectedEpoch}},
+			})
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return ErrNoRowsAffected
+			}
+			return nil
+		}
+		n, err := c.ExecuteRowsStrict(ctx, clearHostIsolationSQL, now, host, expectedEpoch)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNoRowsAffected
+		}
+		return nil
+	})
 }
 
 // reseedKeepTables are NOT discarded by a reseed. Everything else in the
@@ -344,15 +405,13 @@ func (c *Client) retireOutboundBacklog(ctx context.Context) error {
 // reports NOT isolated: absence is an unknown host (a fresh peer, a removed
 // one), which the mTLS/admission layers judge on their own terms — inventing
 // an isolation here would refuse legitimate first contact.
+//
+// The isolation is the resolved one (host_membership.go): after the split it is
+// read from host_membership.
 func HostIsolation(ctx context.Context, c *Client, host string) (epoch int64, reason string, err error) {
-	rows, err := c.Query(ctx,
-		`SELECT isolation_epoch AS e, COALESCE(isolation_reason, '') AS r
-		 FROM hosts WHERE name = ? AND deleted_at IS NULL`, host)
-	if err != nil {
+	cur, err := hostMembershipOf(ctx, c, host)
+	if err != nil || cur == nil {
 		return 0, "", err
 	}
-	if len(rows) == 0 {
-		return 0, "", nil
-	}
-	return rows[0].Int64("e"), rows[0].String("r"), nil
+	return cur.Epoch, cur.Reason, nil
 }

@@ -39,6 +39,7 @@ func seedDownHost(t *testing.T, strategy string, labels map[string]string) (*cor
 		t.Fatalf("InsertVM: %v", err)
 	}
 	for _, o := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, o)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, 'down', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
@@ -158,7 +159,7 @@ func TestFenceRequiresConfirmation_TheGateAcceptsAnOperatorConfirmation(t *testi
 		t.Fatal("precondition: acquire the lease")
 	}
 
-	c.recoverFenced(ctx, h, fence.Result{Method: "ssh", Success: true})
+	c.recoverFenced(ctx, h, fence.Result{Method: "ssh", Success: true}, h.FenceStrategy)
 
 	if got := vmHost(t, db, ctx); got != "alive" {
 		t.Errorf("VM on %q; an operator confirmation satisfies the label", got)

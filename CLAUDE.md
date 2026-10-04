@@ -42,6 +42,14 @@ runtime to look like the detector found something. It did not — the same packa
 passes at 90m in 4091s with no warnings. Anything under ~70m on grpcapi is a
 budget failure.
 
+**`internal/health` needs one too.** It takes about 20 minutes under `-race`
+in full, so a 15m budget dies with `panic: test timed out` — the budget, not a
+race:
+
+```bash
+go test -race -timeout 45m ./internal/health/
+```
+
 Do not pipe a race run through `tail -N`. That discards the `panic: test timed
 out` header and leaves only a goroutine dump, which is exactly the evidence you
 need to tell the two apart. Redirect to a file and grep it.
@@ -112,7 +120,18 @@ finally failed.
 Hardening features are gated on cluster-wide capability tokens
 (`internal/capabilities`). The pattern is uniform:
 
-- each has an `enforcement.*` config flag, default **false**
+- each has an `enforcement.*` config flag, default **false**. There are two
+  exceptions, which default **true**, and an explicit `false` is the kill
+  switch of each:
+  - `enforcement.audit_signature`: each host signs only its own rows, so no
+    node relies on a peer, and a key that fails to load leaves the daemon
+    running and reports its unsigned rows as evidence (docs/audit-log.md,
+    "Turning signing on").
+  - `enforcement.partition_pause`: a host that loses the voter majority
+    pauses its recoverable workloads, and once `partition_pause_v1` latches,
+    the majority waits out that pause before recovering. The majority relies
+    on the peer, so the token is withheld while the flag is off
+    (docs/design/partition-pause.md §5).
 - **advertising is not enforcing.** Most tokens are advertised on the strength
   of the BUILD, whatever the local flag says, so the cluster can latch them —
   the node's own flag then decides whether it acts. A latched token therefore
@@ -123,7 +142,11 @@ Hardening features are gated on cluster-wide capability tokens
   honouring it — where a flag-off peer would corrupt rather than merely be
   permissive. `advertisedCapabilities` is the authority on the list
   (operation_protocol_v1, isolation_epoch_v1, owner_epoch_v1 and the others
-  named there); for those, a latched token DOES mean config uniformity.
+  named there, `recovery_claim_v1` among them); for those, a latched token
+  DOES mean config uniformity. `recovery_claim_v1` is also withheld until the
+  node is ready (`grpcapi.RecoveryClaimReadiness`), and nothing enforces it
+  until the flag, the latch AND an adopted voter generation all hold
+  (docs/design/recovery-claims.md §5).
   **Ask where the guarantee is enforced before adding one.** A guarantee
   enforced at the point a dangerous action is CREATED does not need the peer
   to enforce anything, so withholding buys no safety and costs a great deal
@@ -135,9 +158,10 @@ Hardening features are gated on cluster-wide capability tokens
   cost of withholding is concrete: `internal/health/capability.go` has no role
   filter, so a **witness** with the flag off (its operator has no reason to set
   it) would hold the fence off fleet-wide forever; every node mid-rollout would
-  stop enforcing; and a config-on token that cannot latch consumes
-  `driveCapabilityActivation`'s one-token-per-cycle budget permanently, starving
-  every later token in `Supported()`
+  stop enforcing; and a config-on token that cannot latch costs
+  `driveCapabilityActivation` one Ping sweep of its one-token-per-cycle budget
+  on every rotation (`activateOneUnlatched` rotates its starting token, so later
+  tokens in `Supported()` still get their turn)
 - the latch is monotone and durable: once formed it survives a restart and does
   not re-open when a peer becomes unreachable (a partition fails **closed**)
 - enabling on one node changes nothing
@@ -148,19 +172,55 @@ There are exceptions, of two different kinds, and neither is "the one":
   so they latch on every cluster with no operator opt-in. The set is declared in
   one place, `capabilities.mandatory` (read it; prose copies of it have gone
   stale twice). They are reserved for a token stating a *fact about the binary*
-  rather than a policy: `split_brain_gate_v1` and `lease_term_ledger_v1`.
-  A mandatory token has no flag to turn off in an incident — see the
-  per-token stand-down notes beside that declaration.
+  rather than a policy — at the time of writing `split_brain_gate_v1`,
+  `lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
+  `failover_scope_v1` and `voter_config_v1`, but trust the declaration, not
+  this list. A mandatory token has no flag to turn off in an incident — see
+  the per-token stand-down notes beside that declaration.
+  `credentials_split_v1` has none at all. Once latched, hosts dual-write the
+  credential tables and the old secret columns and never clear the old ones.
+  A rollback below it is still not clean: the rolled-back binary enters WAL
+  quarantine (`preflightCapabilityRollback`) and emits no replicated writes
+  until upgraded again or reseeded. What the two copies buy is that its
+  old-column reader still validates tokens, checks passwords and fences, where
+  a cleared column lost all three, and that upgrading again loses nothing.
+  Clearing the old columns is a later release's step behind a second token
+  (docs/design/credentials-clear.md). Do not add a clear to this one.
+  `host_membership_split_v1` follows the same shape for `hosts.state` and the
+  isolation pair: both copies written, nothing cleared, readers take the
+  `host_membership` row when it exists
+  (docs/design/host-membership-retire-old-columns.md).
+  **Neither split may compare a copy against its parent row's `updated_at`.**
+  Unrelated writes bump it (a version report bumps `hosts`), so a replica that
+  refused one half of a dual write holds a stale value on a newer row, and a
+  newer-row-wins rule brings a rotated-out password, or `active` over
+  `fenced`, back cluster-wide. A write from a node that has not latched is
+  recognised by its ENTRY instead — the old column is set with no new-table
+  statement beside it (`internal/corrosion/unlatched_origin.go`) — and
+  absorbed locally on apply and on the local write path.
+  `failover_scope_v1` has no flag either: the replicated `cluster_policies`
+  row is the opt-in, and `lv cluster failover-scope cluster` is the stand-down
+  (docs/design/region-scoped-failover.md).
+  `voter_config_v1` is mandatory but advertised only once the node can vote
+  durably (`grpcapi.VoterConfigReadiness`: `synchronous=FULL`, host signing key
+  loads). A flag would let one node count a different majority from its peers,
+  so its stand-down is the decided `lv cluster voter reset`, which moves every
+  node back to the derived voter set at one generation. Once a generation is
+  adopted, `corrosion.VoterSet` returns its members whatever host state or any
+  flag says (docs/design/recovery-claims.md §4).
 - **Conditionally advertised** — `hardware_v2` has no flag of its own either,
   but it is gated differently: each node's startup hardware audit plus a latched
   `operation_protocol_v1` decide whether it is advertised at all.
 
-One mandatory token, `lease_term_ledger_v1`, is additionally
-`capabilities.ReplicationGated`: its latch is a claim about which wire shapes
-peers can *decode*, so it is confirmed against every host still receiving
-replication — memberlist membership — and not merely against voting-eligible
-members. A host parked in `maintenance` on an older build therefore holds that
-latch off, which is the intended invariant and not a bug.
+Some mandatory tokens are additionally `capabilities.ReplicationGated`
+(`lease_term_ledger_v1`, `credentials_split_v1`, `host_membership_split_v1`,
+`failover_scope_v1`, `voter_config_v1`, plus the flag-gated `recovery_claim_v1`,
+the one member that is not mandatory; the set is
+`capabilities.replicationGated`): the latch is a claim about what every host
+still receiving replication can *decode* or *read*, so it is confirmed against
+admitted memberlist membership — not merely against voting-eligible members. A
+host parked in `maintenance` on an older build therefore holds that latch off,
+which is the intended invariant and not a bug.
 
 **`enforcement.operation_protocol` is required for all hotplug.** Disk, NIC, and
 concrete-address PCI attach/detach are journaled and have no un-journaled path,

@@ -48,6 +48,17 @@ func (s *Server) PeerClientForTests(ctx context.Context, hostName string) (pb.Li
 	return s.peerClient(ctx, hostName)
 }
 
+// SetClaimVoteObserverForTest registers fn to see every promise and accept
+// this voter commits, from a peer's RPC or from its own proposer alike. The
+// fleet harness uses it to check, across every voter, that no voter accepts two
+// values at one ballot and that at most one value is ever chosen per claim key.
+// nil removes it.
+func (s *Server) SetClaimVoteObserverForTest(fn func(ClaimVote)) {
+	s.claims.mu.Lock()
+	s.claims.observer = fn
+	s.claims.mu.Unlock()
+}
+
 // NewServerForTests is the in-process-fleet construction entry point.
 // Identical to NewServer except virt and images stay nil — VM
 // lifecycle RPCs will NPE if called, which is intentional: scenarios
@@ -64,7 +75,7 @@ func NewServerForTests(opts TestServerOpts) *Server {
 	// opts.DataDir/images before calling the relevant RPC.
 	imgs := image.NewStore(opts.DataDir)
 	_ = imgs.Init()
-	return &Server{
+	s := &Server{
 		hostName:       opts.HostName,
 		dataDir:        opts.DataDir,
 		pkiDir:         opts.PKIDir,
@@ -78,6 +89,8 @@ func NewServerForTests(opts TestServerOpts) *Server {
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
+	s.wireCertificateVerifier()
+	return s
 }
 
 // RecordSelfReportedIsolationForTest drives one §A self-reported-quarantine

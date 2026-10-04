@@ -106,6 +106,8 @@ func vmStateString(s pb.VMState) string {
 		return "migrating"
 	case pb.VMState_VM_ERROR:
 		return "error"
+	case pb.VMState_VM_PAUSED:
+		return "paused"
 	default:
 		return "unknown"
 	}

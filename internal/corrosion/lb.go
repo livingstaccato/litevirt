@@ -93,7 +93,7 @@ func ListLBConfigs(ctx context.Context, c *Client) ([]LBConfigRecord, error) {
 // proven participant BEFORE calling this, rather than relying on the write to
 // arbitrate a contested holder.
 func ClaimLBHolderIfUnowned(ctx context.Context, c *Client, name, hostsJSON string) (bool, error) {
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE lb_configs SET hosts = ?, updated_at = ?
 		 WHERE name = ? AND deleted_at IS NULL AND (hosts IS NULL OR hosts IN ('', '[]', 'null'))`,
 		hostsJSON, c.NowTS(), name)

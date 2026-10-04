@@ -1,19 +1,25 @@
 package ui
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
-	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
-// Notification CRUD runs in-process against the host-local Corrosion handle
-// (same as `lv notify`), CRDT-replicated cluster-wide. Behind the UI session.
+// Notification routes are READ in-process against the host-local Corrosion
+// handle. Targets are not: a target's config IS its credential (a webhook or
+// Slack URL is a bearer secret), and ListNotificationTargets redacts it below
+// the operator floor. Reading the table here rendered every URL to a viewer, so
+// the page lists targets through that RPC with the session's bearer and the
+// redaction rule stays in one place. Every action, the test send included,
+// goes through the daemon's notification RPCs too.
 
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Notifications", "notifications")
@@ -22,12 +28,13 @@ func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 		s.renderPage(w, "notifications.html", data)
 		return
 	}
-	targets, err := corrosion.ListNotificationTargets(r.Context(), s.db)
+	resp, err := s.grpc.ListNotificationTargets(s.uiBearerCtx(r), &pb.ListNotificationTargetsRequest{})
 	if err != nil {
-		data["Error"] = err.Error()
+		data["Error"] = grpcMsg(err)
 		s.renderPage(w, "notifications.html", data)
 		return
 	}
+	targets := resp.GetTargets()
 	routes, _ := corrosion.ListNotificationRoutes(r.Context(), s.db)
 	data["Targets"] = targets
 	data["Routes"] = routes
@@ -100,38 +107,31 @@ func (s *Server) handleTestNotifyTarget(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	id := r.PathValue("id")
-	targets, _ := corrosion.ListNotificationTargets(r.Context(), s.db)
-	for _, t := range targets {
-		if t.ID != id {
-			continue
-		}
-		target, err := notify.NewTarget(t.Name, t.Type, t.Config)
-		if err != nil {
-			sendToast(w, "bad target: "+err.Error(), "error")
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
-		defer cancel()
-		if err := target.Send(ctx, notify.Notification{
-			Kind: "test.notification", Severity: notify.SevInfo, Subject: t.Name,
-			Detail: "litevirt test notification", Cluster: s.cluster, Timestamp: time.Now().UTC(),
-		}); err != nil {
-			sendToast(w, "send failed: "+err.Error(), "error")
+	// Through the twin, like the CRUD above. Sending in-process let any session
+	// with a role, a Viewer included, make the daemon load a target's stored
+	// credentials and fire at its endpoint; the RPC requires operator.
+	if _, err := s.grpc.TestNotificationTarget(s.uiBearerCtx(r),
+		&pb.TestNotificationTargetRequest{Id: r.PathValue("id")}); err != nil {
+		sendToast(w, "send failed: "+grpcMsg(err), "error")
+		if status.Code(err) == codes.Unavailable {
+			// The target refused or timed out: the page worked, the endpoint did not.
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		sendToast(w, "Test notification sent to "+t.Name, "success")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
-	sendToast(w, "target not found", "error")
-	w.WriteHeader(http.StatusNotFound)
+	sendToast(w, "Test notification sent", "success")
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleNotifyRouteModal(w http.ResponseWriter, r *http.Request) {
-	targets, _ := corrosion.ListNotificationTargets(r.Context(), s.db)
+	// Through the RPC like the page: the modal names targets only, and the
+	// secret-bearing config should not reach a template for a viewer at all.
+	var targets []*pb.NotificationTarget
+	if resp, err := s.grpc.ListNotificationTargets(s.uiBearerCtx(r), &pb.ListNotificationTargetsRequest{}); err == nil {
+		targets = resp.GetTargets()
+	}
 	s.renderFragment(w, "notify_route_modal.html", map[string]any{"Targets": targets})
 }
 

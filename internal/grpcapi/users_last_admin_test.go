@@ -47,6 +47,23 @@ func TestDeleteUser_RefusesTheLastLiveAdmin(t *testing.T) {
 	}
 }
 
+// The refusal is the operator's only guidance at that moment, so the command
+// it names has to exist. There is no promote command — `--role` applies only at
+// create — so the way to a second admin is `lv user create <name> --role admin`.
+func TestDeleteUser_TheRefusalNamesACommandThatExists(t *testing.T) {
+	s := testServer(t)
+	seedAdminRow(t, s, "admin", "admin")
+
+	_, err := s.DeleteUser(adminCtx(), &pb.DeleteUserRequest{Username: "admin"})
+	msg := status.Convert(err).Message()
+	if strings.Contains(msg, "promote") {
+		t.Errorf("the refusal tells the operator to promote a user, and no command does that: %q", msg)
+	}
+	if !strings.Contains(msg, "lv user create <username> --role admin") {
+		t.Errorf("the refusal does not name the command that makes another admin: %q", msg)
+	}
+}
+
 func TestDeleteUser_AllowsAnAdminWhileAnotherRemains(t *testing.T) {
 	s := testServer(t)
 	seedAdminRow(t, s, "admin", "admin")

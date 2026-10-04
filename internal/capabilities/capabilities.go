@@ -82,6 +82,245 @@ const (
 	// audit fact before anything decides on one (docs/operating-model.md).
 	LeaseTermLedgerV1 = "lease_term_ledger_v1"
 
+	// CredentialsSplitV1 gates moving the three secret COLUMNS of public
+	// inventory tables — hosts.ipmi_pass, users.password_hash and
+	// tokens.token_hash — into their own sensitive-lane tables
+	// (host_fence_credentials, user_credentials, token_credentials).
+	//
+	// This release DUAL-WRITES: once latched, every writer writes the credential
+	// table and the old column in one batch, and nothing clears an old column.
+	// Readers take the credential row whenever one exists and the old column
+	// only when none does; they never date a secret by the PARENT row's
+	// updated_at, which unrelated writes bump (the #267 race). A secret written
+	// by a node that has not latched yet is recognised by its entry carrying no
+	// credential statement, and absorbed into the credential row where it is
+	// applied (corrosion/credentials_absorb.go). A rollback below the latch is
+	// still not clean: the rolled-back binary enters WAL quarantine
+	// (preflightCapabilityRollback) and emits no replicated writes until it is
+	// upgraded again or reseeded. What the two copies buy is that its
+	// old-column reader still validates tokens, checks passwords and fences,
+	// where a cleared column lost all three, and that upgrading again loses
+	// nothing. Clearing the old columns, which is what finally
+	// takes the secrets out of the operator-safe state dump, arrives in a later
+	// release behind a second mandatory, ReplicationGated token
+	// (docs/design/credentials-clear.md).
+	//
+	// It states two facts about the BINARY, which is why it is mandatory and has
+	// no config flag:
+	//
+	//   - it can DECODE the credential tables' statement shapes. They are the
+	//     first replicated shapes those tables ever had, and an unregistered shape
+	//     back-pressures a previous-release peer rather than degrading: its apply
+	//     fails closed, the batch rolls back and its watermark stalls. So nothing
+	//     writes to the credential tables until this token has latched.
+	//   - it READS a credential from the credential table, falling back to the
+	//     old column only where no credential row exists. A previous-release
+	//     node reads only the old column, which is why this release keeps
+	//     writing it.
+	//
+	// The first fact must hold of every host this node REPLICATES TO, not
+	// merely of every host that votes, so the token is in replicationGated. A
+	// host parked in `maintenance` on the old build still receives every
+	// statement; a latch computed over voting members alone would stall its
+	// stream on the first credential-table write.
+	//
+	// A flag would be worse than useless: driveCapabilityLatches skips an
+	// unlatched token whose flag is off, so a flag-gated split would never latch,
+	// the later release's clear (which needs the credential tables populated)
+	// could never follow, and the secrets would stay in the public dump forever.
+	// There is nothing an
+	// operator could correctly decline — the split changes where a secret is
+	// stored, not a policy.
+	CredentialsSplitV1 = "credentials_split_v1"
+
+	// HostMembershipSplitV1 gates moving a host's coordinator-owned membership
+	// facts — hosts.state and hosts.isolation_epoch/isolation_reason — out of
+	// the shared `hosts` row into host_membership, a row of their own with its
+	// own LWW clock (colonelpanik/litevirt#267). While they shared the hosts
+	// row, a coordinator marking a host fenced and that host's daemon
+	// reporting its version were two writes under ONE updated_at, so whichever
+	// a replica applied second could be refused as older and lost.
+	//
+	// It states two facts about the BINARY, which is why it is mandatory and has
+	// no config flag:
+	//
+	//   - it can DECODE host_membership's statement shapes. They are the first
+	//     replicated shapes that table ever had, and an unregistered shape
+	//     back-pressures a previous-release peer: its apply fails closed, the
+	//     batch rolls back and its watermark stalls. So nothing writes
+	//     host_membership until this token has latched.
+	//   - it READS state and isolation from host_membership first. Once
+	//     latched, every state and isolation change is written to BOTH
+	//     host_membership and the old hosts columns, in one batch — the old
+	//     columns in their previous-release shapes, so a host rolled back one
+	//     release still reads every change. Nothing clears them in this
+	//     release; that is a later release's step behind a second token.
+	//
+	// The decode claim must hold of every host this node REPLICATES TO, not
+	// merely of every host that votes, so the token is in replicationGated. A
+	// host parked in `maintenance` on the old build does not vote, but it still
+	// receives every statement, and a host_membership statement stalls its
+	// stream.
+	//
+	// A flag would be worse than useless, for the credentials_split_v1 reason:
+	// driveCapabilityLatches skips an unlatched token whose flag is off, so a
+	// flag-gated split would never latch and the lost updates would stay. The
+	// split changes where a fact is stored, not a policy.
+	HostMembershipSplitV1 = "host_membership_split_v1"
+
+	// FailoverScopeV1 gates the cluster-wide failover_scope policy
+	// (cluster_policies, schema v58; docs/design/region-scoped-failover.md).
+	// With the policy set to `region`, a host is fenced and its workloads
+	// recovered only by a quorum of its own region's voters, and recovery
+	// targets stay in that region (colonelpanik/litevirt#265).
+	//
+	// It states two facts about the BINARY, which is why it is mandatory and
+	// has no config flag:
+	//
+	//   - it can DECODE cluster_policies' statement shapes. They are the first
+	//     replicated shapes that table ever had, and an unregistered shape
+	//     back-pressures a previous-release peer: its apply fails closed and its
+	//     stream stalls. So nothing writes cluster_policies until this token
+	//     has latched.
+	//   - it HONOURS failover_scope: its coordinator counts region quorums and
+	//     keeps recovery in region, and its ExecutionGate counts its own
+	//     region. The guarantee is enforced where the fence is decided, and
+	//     that is whichever node holds the failover lease — any node. A
+	//     coordinator that did not read the policy would fence across regions
+	//     while every other node believed it would not, so the policy may not
+	//     be set until every node runs a build that honours it.
+	//
+	// The decode claim must hold of every host this node REPLICATES TO, so the
+	// token is in replicationGated. The row itself is the opt-in and it is
+	// replicated, so its uniformity comes from replication, not from matching
+	// config; a flag would only keep a mandatory token from latching. Standing
+	// down in an incident is `lv cluster failover-scope cluster`.
+	FailoverScopeV1 = "failover_scope_v1"
+	// VoterConfigV1 gates the explicit voter set (colonelpanik/litevirt#251
+	// step 2) and the voter side of recovery claims
+	// (docs/design/recovery-claims.md §3–§5.1): the voter_configs table, the
+	// claim RPCs, the node-local grant tables and the voter incarnation.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes voter_configs' statement shapes and
+	// answers Prepare / Accept / GetRecoveryClaim durably. Latching it starts
+	// automatic genesis; until generation 1 is adopted, VoterSet is derived
+	// exactly as before. A flag would be worse than none: a node with it off
+	// would count a different majority from its peers, which is the split the
+	// voter set exists to prevent.
+	//
+	// It is advertised only once this node is READY
+	// (grpcapi.VoterConfigReadiness): PRAGMA synchronous is FULL, so a promise
+	// is on disk before the reply that depends on it, and the host signing key
+	// loads, so this voter can sign an accept. A node that cannot vote durably
+	// must not let the fleet latch across it.
+	//
+	// ReplicationGated: latching it permits emitting voter_configs statements,
+	// whose shapes a previous-release peer has no ledger entry for, so the
+	// claim must hold of every host this node replicates to, a maintenance
+	// host on the previous build included.
+	VoterConfigV1 = "voter_config_v1"
+	// ClaimIncarnationV1 gates INCARNATION-SCOPED recovery claims
+	// (docs/design/recovery-claims.md §10 item 37, colonelpanik/litevirt#250):
+	// once latched, a coordinator keys every workload claim by the workload
+	// row's created_at as well as (kind, name, owner epoch, attempt), so a
+	// workload deleted and re-created under one name — which starts again at
+	// the same owner epoch — gets a fresh claim instead of the previous
+	// incarnation's decided value. Before it latches, claims are keyed as they
+	// always were.
+	//
+	// It states a fact about the BINARY, which is why it is mandatory and has
+	// no config flag: this build decodes the incarnation in a claim key, keeps
+	// incarnation-scoped voter state (local_incarnation_claims, schema v63),
+	// signs and verifies the v2 accept payload, seals a legacy key once it has
+	// answered the incarnation-scoped form of it, and reports its legacy state
+	// in the promise. A coordinator relies on EVERY voter doing all of that:
+	// a voter on an older build would read an incarnation-scoped Prepare as
+	// the legacy key — the very collision this token exists to end — and its
+	// accept would not verify. So the format may change only once no voter
+	// can be an older build. A flag would let one coordinator key by
+	// incarnation while another keys the same recovery the legacy way: two
+	// claims for one decision.
+	//
+	// ReplicationGated: the certificate on a replicated runtime_action_proofs
+	// row is judged by every replica's merge (certificateVerifiesTx), and an
+	// older build cannot verify a v2 accept, so the claim must hold of every
+	// host this node replicates to, a maintenance host on the previous build
+	// included.
+	//
+	// Crossing the latch is safe for a recovery claimed on both sides of it:
+	// a voter's promise at the incarnation-scoped key reports what it accepted
+	// at the legacy key and seals that key against every later legacy
+	// Prepare and Accept, and the proposer re-proposes a legacy value unless
+	// its destination proves it is another incarnation's and will never run
+	// (claims.Spec.AdoptLegacy, grpcapi Server.legacyValueExcluded).
+	ClaimIncarnationV1 = "claim_incarnation_v1"
+
+	// RecoveryClaimV1 gates ENFORCEMENT of single-winner recovery claims
+	// (docs/design/recovery-claims.md §3, §5.1–§5.2,
+	// colonelpanik/litevirt#250): a failover coordinator collects a majority
+	// certificate from the voter set before it mints a reschedule, promote or
+	// relocate proof, and a destination verifies that certificate before it
+	// executes one. The voter side — answering Prepare / Accept — is
+	// voter_config_v1's and runs whatever this token says.
+	//
+	// Config-gated (enforcement.recovery_claim) and advertised CONDITIONALLY on
+	// that flag, like operation_protocol_v1, and the reason is where the
+	// guarantee is enforced. It is enforced at EXECUTION: a coordinator cannot
+	// stop another coordinator from creating a transfer, so every flag-on node
+	// relies on every peer claiming before it mints and verifying before it
+	// executes. A flag-off coordinator mints an uncertified proof and a
+	// flag-off destination starts one — either way it is the second owner the
+	// flag-on nodes did everything right to prevent. So the latch must mean
+	// CONFIG uniformity, not just a uniform build, which is the opposite of
+	// shared_storage_fence_v1 (enforced where a transfer is CREATED, so no node
+	// relies on a peer). TestAdvertise_RecoveryClaimWithheldWhileOff pins it.
+	//
+	// It is advertised only when the flag is on AND this node is READY
+	// (grpcapi.RecoveryClaimReadiness, local reads only): split_brain_gate_v1
+	// has latched — the certificate rides on a runtime-action proof — and this
+	// node can vote durably (voter_config_v1 readiness).
+	//
+	// ReplicationGated: latching it permits emitting the new statement shapes
+	// of runtime_action_proofs.claim_certificate (schema v60), which a
+	// previous-release peer has no ledger entry for.
+	//
+	// Not mandatory: it states a policy, and a policy needs a flag to turn off
+	// in an incident. Enforcement is the flag AND Enforced(recovery_claim_v1)
+	// AND an adopted voter generation with members.
+	RecoveryClaimV1 = "recovery_claim_v1"
+
+	// PartitionPauseV1 gates the MAJORITY's reliance on a minority's partition
+	// pause (docs/design/partition-pause.md, colonelpanik/litevirt#250 / #253):
+	// a host that cannot see a majority of the voter set for T_pause suspends
+	// (VM) or freezes (container) every workload the majority would recover
+	// elsewhere. Once this token is latched, a coordinator whose best-effort
+	// fence could not reach a host (assurance assumed) starts nothing for that
+	// host until health.PartitionPauseWait has passed since the decision, and
+	// records the fence as self_paused.
+	//
+	// Config-gated (enforcement.partition_pause) and advertised CONDITIONALLY
+	// on that flag, for the recovery_claim_v1 reason: the guarantee is
+	// enforced on the minority and RELIED ON by the majority, so a flag-off
+	// peer is the copy still running when the replacement starts — not merely
+	// permissive. The latch has to mean config uniformity.
+	// TestAdvertise_PartitionPauseWithheldWhileOff pins it.
+	//
+	// The pause itself runs on the flag alone, before any latch: each node
+	// latches on its own schedule, so a node that waited for its own latch
+	// could be relied on by a peer that latched first. A node advertises the
+	// token only while it already acts on it.
+	//
+	// DEFAULT ON (LoadConfig), the second exception to the default-false rule
+	// beside audit_signature_v1. An explicit false is the kill switch.
+	//
+	// Not mandatory: it states a policy (availability against a duplicate
+	// copy), and a policy needs a flag. Not ReplicationGated: it emits no new
+	// statement shape — the pause record is a host-local file, and the fence
+	// row and the conditions use existing shapes — so its latch is a claim
+	// about what voting members DO, which is what an ordinary latch measures.
+	PartitionPauseV1 = "partition_pause_v1"
+
 	// LeaseTermV1 gates leader-lease term enforcement: once active, a
 	// runtime-action proof must carry the lease term of the incarnation that
 	// minted it, and an executor refuses a proof whose term is below the
@@ -448,7 +687,7 @@ const (
 // not state a policy an operator chooses; it states a FACT about this binary,
 // and letting an operator misreport that fact is how a cluster corrupts itself.
 //
-// Standing one down therefore differs per token and neither has a config flag
+// Standing one down therefore differs per token and none has a config flag
 // to turn off:
 //
 //   - split_brain_gate_v1 flips via `supported` alone, so marker deletion
@@ -475,6 +714,65 @@ const (
 //     enforcement and recovery both. Terms are additive audit facts that
 //     nothing reads until it is on, so that is the lever an incident wants.
 //     TestDurablyLatchedIsMonotone pins the behaviour this paragraph describes.
+//
+//   - credentials_split_v1 has no stand-down either. A binary rolled back
+//     below it enters WAL quarantine and emits no replicated writes until it
+//     is upgraded again or reseeded, and it cannot decode the credential
+//     tables' shapes latched peers keep sending. This release dual-writes, so
+//     every old column still holds the current value: the rolled-back reader
+//     still validates tokens, checks passwords and fences, and upgrading
+//     again loses nothing. The irreversible step —
+//     clearing the old columns — is deliberately NOT in this release; it
+//     comes with a second token in a later one
+//     (docs/design/credentials-clear.md).
+//
+//   - host_membership_split_v1 has no stand-down either, and the same
+//     rollback shape as credentials_split_v1: a binary rolled back below it
+//     enters WAL quarantine, and cannot decode the host_membership statements
+//     latched peers keep sending. Because this release dual-writes state and
+//     isolation to host_membership AND the old hosts columns, the rolled-back
+//     reader still reads the current state, voter set and isolation, and
+//     upgrading again loses nothing. Retiring the old columns is a later
+//     release's step (docs/design/host-membership-retire-old-columns.md).
+//
+//   - failover_scope_v1 has no stand-down of its own: the policy it licenses
+//     does. `lv cluster failover-scope cluster` returns every coordinator to
+//     the cluster-wide quorum without touching the token. A binary rolled
+//     back below it enters WAL quarantine, as below every latched token.
+//
+//   - voter_config_v1 has no flag, by design, and needs none: turning it off
+//     on one node would make that node count a different majority from its
+//     peers. The incident tools are decided changes, so every node moves at the
+//     same generation: `lv cluster voter rm` / `add` to repair the membership,
+//     `lv host rm --dead` for a voter that is fenced and gone for good,
+//     `lv cluster voter force-reconfigure` when a majority is gone for good,
+//     and `lv cluster voter reset` to return the whole cluster to the derived
+//     set (docs/design/recovery-claims.md §3.12, §4.2, §4.3, §4.6). A binary
+//     rolled back below it after it has latched enters WAL quarantine, as
+//     below every latched token, whether or not a voter generation exists —
+//     reset is not a rollback tool. Deleting its marker does nothing lasting:
+//     the HA monitor re-establishes the latch the moment the fleet is
+//     uniform. The claim tables and the adopted generation survive a
+//     stand-down of enforcement.recovery_claim, which is the point: promise
+//     history stays unbroken.
+//
+//   - claim_incarnation_v1 has no flag either: it says what format this
+//     build's voters keep, and a coordinator relies on every voter keeping it.
+//     It changes how a claim is KEYED, not whether anything is enforced, so
+//     enforcement.recovery_claim remains the stand-down for claims as a
+//     whole. A binary rolled back below it after it has latched enters WAL
+//     quarantine, as below every latched token; its legacy claim table is
+//     intact, and the incarnation-scoped one is left unread until it is
+//     upgraded again.
+//
+// recovery_claim_v1 is NOT mandatory and HAS a flag, enforcement.recovery_claim,
+// which is its stand-down: false on every node and a restart returns recovery
+// authorization to the pre-claim behaviour; voters keep answering and keep
+// their tables. A PARTIAL stand-down is the hazard the token is withheld to
+// prevent (a flag-off node is the uncertified second owner). A node that has
+// latched the token and turned its flag off reports it in
+// PingResponse.not_enforcing, and its enforcing peers raise ha_degraded
+// (unsupported_member) because it no longer advertises the token.
 var supported = []string{
 	SplitBrainGateV1,
 	// Advertised so the cluster can latch these; enforcement stays inert until the
@@ -524,6 +822,40 @@ var supported = []string{
 	// ledger's statement shapes". Withholding it on a flag would keep the latch
 	// from forming on a fleet that is fully rolled.
 	LeaseTermLedgerV1,
+	// CredentialsSplitV1 is advertised UNCONDITIONALLY, for the same reason as
+	// LeaseTermLedgerV1: it says "this build decodes the credential tables'
+	// statement shapes and reads a credential from them", a fact no flag should
+	// be able to misreport, and a flag would keep the latch from forming on a
+	// fully rolled fleet.
+	CredentialsSplitV1,
+	// HostMembershipSplitV1 is advertised UNCONDITIONALLY, for the same reason:
+	// it says "this build decodes host_membership's statement shapes and reads
+	// state and isolation from it", a fact about the binary.
+	HostMembershipSplitV1,
+	// FailoverScopeV1 is advertised UNCONDITIONALLY: it says "this build
+	// decodes cluster_policies and honours failover_scope", a fact about the
+	// binary. The policy is the row, not a flag.
+	FailoverScopeV1,
+	// VoterConfigV1 is mandatory but advertised only when READY — this node
+	// commits a promise durably (synchronous=FULL) and can sign an accept. See
+	// grpcapi.VoterConfigReadiness. Readiness is a fact about this node, not a
+	// policy, so it is not a flag either.
+	VoterConfigV1,
+	// ClaimIncarnationV1 is advertised UNCONDITIONALLY: it says "this build
+	// keys claims by incarnation and seals the legacy key", a fact about the
+	// binary.
+	ClaimIncarnationV1,
+	// RecoveryClaimV1 is advertised CONDITIONALLY: enforcement.recovery_claim
+	// on AND this node ready (split_brain_gate_v1 latched, voter_config_v1
+	// ready). Withheld while the flag is off because every flag-on node relies
+	// on every peer honouring it — see RecoveryClaimV1 and
+	// grpcapi.RecoveryClaimReadiness.
+	RecoveryClaimV1,
+	// PartitionPauseV1 is advertised CONDITIONALLY on
+	// enforcement.partition_pause (default on): every flag-on coordinator
+	// relies on the host it fences pausing, so the latch must mean every
+	// voter has the flag on. See PartitionPauseV1.
+	PartitionPauseV1,
 	// LeaseTermV1 is advertised CONDITIONALLY: enforcement.lease_term on AND
 	// this node ready (>= 3 voting-eligible hosts, readable ledger,
 	// SplitBrainGateV1 latched, LeaseTermLedgerV1 durably latched — a node that
@@ -542,7 +874,7 @@ var supported = []string{
 // all is every capability token litevirt knows about (across phases), regardless
 // of whether THIS build advertises it. Used to pre-load per-token durable
 // activation latches at startup.
-var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, LeaseTermV1, VMReplaceV1}
+var all = []string{SplitBrainGateV1, VIPDemoteV1, VIPReleaseProbeV1, FenceEpochV1, OwnerEpochV1, SafeFenceDefaultV1, LWWSkewGuardV1, HLCLwwV1, StrictMTLSIdentityV1, ForwardedIdentityV1, SharedStorageFenceV1, RBACRealmV1, OperationProtocolV1, CapacityAdmissionV1, LiveResizeV1, CanonicalIdentityV1, CanonicalRegistryV1, HardwareV2, ProjectAuthorityV1, AuditSignatureV1, IsolationEpochV1, NetBoxIPAMV1, NetBoxMirrorV1, LeaseTermLedgerV1, CredentialsSplitV1, HostMembershipSplitV1, FailoverScopeV1, VoterConfigV1, ClaimIncarnationV1, RecoveryClaimV1, PartitionPauseV1, LeaseTermV1, VMReplaceV1}
 
 // All returns a copy of every known capability token (all phases).
 func All() []string {
@@ -582,6 +914,28 @@ func Supported() []string {
 // availability of the feature, not of the cluster.
 var replicationGated = map[string]bool{
 	LeaseTermLedgerV1: true,
+	// Confirmed against every replication recipient: the
+	// credential tables' shapes must be decodable by every host we stream to —
+	// a maintenance host on the previous build still receives every statement.
+	// (The old-column clear that also needs this is a later release's token.)
+	CredentialsSplitV1: true,
+	// Confirmed against every replication recipient: host_membership's shapes
+	// must be decodable by every host we stream to, a maintenance host on the
+	// previous build included.
+	HostMembershipSplitV1: true,
+	// Confirmed against every replication recipient: cluster_policies' shapes
+	// must be decodable by every host we stream to.
+	FailoverScopeV1: true,
+	// Confirmed against every replication recipient: voter_configs' shapes
+	// must be decodable by every host we stream to.
+	VoterConfigV1: true,
+	// Confirmed against every replication recipient: a v2 accept inside a
+	// replicated certificate must be verifiable by every host we stream to.
+	ClaimIncarnationV1: true,
+	// Confirmed against every replication recipient: the claim_certificate
+	// column's statement shapes on runtime_action_proofs must be decodable by
+	// every host we stream to. Not mandatory: the flag is the opt-in.
+	RecoveryClaimV1: true,
 }
 
 // ReplicationGated reports whether token's latch must be confirmed by every
@@ -609,6 +963,25 @@ func ReplicationGated(token string) bool {
 var mandatory = map[string]bool{
 	SplitBrainGateV1:  true,
 	LeaseTermLedgerV1: true,
+	// A fact about the binary (it decodes and reads the credential tables),
+	// not a policy. See CredentialsSplitV1 for why a flag would leave the
+	// secrets in the public dump forever.
+	CredentialsSplitV1: true,
+	// A fact about the binary (it decodes and reads host_membership), not a
+	// policy. See HostMembershipSplitV1.
+	HostMembershipSplitV1: true,
+	// A fact about the binary (it decodes cluster_policies and honours
+	// failover_scope). The policy is the replicated row. See FailoverScopeV1.
+	FailoverScopeV1: true,
+	// A fact about the binary (it decodes voter_configs and answers the claim
+	// RPCs durably), not a policy — and a flag would let one node count a
+	// different majority from its peers. Its stand-down is the decided
+	// `lv cluster voter reset`; see the KILL SWITCH notes above `supported`.
+	VoterConfigV1: true,
+	// A fact about the binary (it keys claims by incarnation and seals the
+	// legacy key), and a coordinator relies on every voter keeping that
+	// format. See ClaimIncarnationV1.
+	ClaimIncarnationV1: true,
 }
 
 // Mandatory reports whether token is enforced with no config kill switch.

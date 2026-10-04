@@ -28,6 +28,12 @@ import (
 type SyncMetrics interface {
 	ObserveDump(d time.Duration, bytes int)
 	ObserveDigest(d time.Duration)
+	// ObserveDigestTables records, for one digest, how many tables came from
+	// the digest cache and how many were scanned (digest_cache.go).
+	ObserveDigestTables(cached, computed int)
+	// ObservePullRows records the rows one repair pull received for tables of
+	// one scope: "bucket" (only the buckets that disagreed) or "table" (whole).
+	ObservePullRows(scope string, rows int)
 	ObserveMerge(d time.Duration, merged, skipped int)
 	// ObserveMergeRejected records a replicated row/statement the apply path rejected but did
 	// NOT apply — path ∈ {ae, wal}; reason ∈ {constraint, …}. Bounded labels only (never SQL
@@ -82,13 +88,61 @@ type Config struct {
 	AdvertiseAddr string
 	BindPort      int      // gossip port (default 7946)
 	JoinPeers     []string // initial peers to join
+
+	// GossipEncryption is this node's enforcement.gossip_encryption stage and
+	// GossipKeys the keyring it starts with, primary first (see
+	// gossip_keyring.go). Every stage but off requires at least one key.
+	// GossipKeys formats as key IDs only, so a logged Config leaks nothing.
+	GossipEncryption GossipEncryption
+	GossipKeys       GossipKeys
+
+	// pushPullInterval overrides memberlist's periodic full-state exchange.
+	// Test-only: zero keeps the LAN default.
+	pushPullInterval time.Duration
+
+	// RejoinInterval is the membership loop's base pass interval (see
+	// maintainMembership); each pass waits a jittered 1–1.5x of it. Zero is
+	// the production default, 30 s. Set only by tests: the daemon never does.
+	RejoinInterval time.Duration
+	// MemberlistForTests, when set, edits the memberlist configuration last,
+	// just before memberlist is created — a test seam for what no daemon
+	// config reaches: a transport that can be partitioned, or failure-detector
+	// timings short enough for a test. The daemon never sets it.
+	MemberlistForTests func(*memberlist.Config)
 }
 
 // Client is the embedded state store with WAL-based replication.
 type Client struct {
-	db   *sql.DB
-	mu   sync.RWMutex
-	list *memberlist.Memberlist
+	db *sql.DB
+	// memKeeper holds a test client's in-memory database open while the
+	// pool above reaps idle connections (openTestDB). Nil outside tests.
+	memKeeper *sql.DB
+	mu        sync.RWMutex
+	// dsn is what db was opened with; tableGens counts the row changes every
+	// connection of that database reports (digest_cache.go), and digests is
+	// the anti-entropy digest cache they invalidate. tableGens is nil for a
+	// database opened without the hook, which caches nothing.
+	dsn       string
+	tableGens *tableGenerations
+	digests   digestCache
+	// remints remembers the credentials of admin re-mints this node refused,
+	// so anti-entropy's sensitive lane refuses the credential row that belongs
+	// to a refused users row (users_admin_guard.go).
+	remints refusedRemints
+	// adminFloor is the periodic last-admin repair's state (admin_floor.go).
+	adminFloor adminFloor
+	// outOfProcess marks a client opened beside the daemon (NewLocalClient):
+	// on Close, if it wrote, it touches the digest marker (digest_cache.go).
+	outOfProcess bool
+	list         *memberlist.Memberlist
+	// gossipMode is the stage memberlist was created with, and gossipKeyring the
+	// keyring it encrypts with (nil when off). The keyring changes live through
+	// SetGossipKeys, serialised by gossipKeyMu; the stage never changes.
+	// gossipRejected counts gossip memberlist dropped on encryption grounds.
+	gossipMode     GossipEncryption
+	gossipKeyring  *memberlist.Keyring
+	gossipKeyMu    sync.Mutex
+	gossipRejected atomic.Uint64
 	// stopMembership ends the gossip re-join loop and membershipDone closes
 	// once it has returned. Close waits on it before closing the database: the
 	// loop reads the hosts table and stamps the isolation condition, and a loop
@@ -102,13 +156,41 @@ type Client struct {
 	// has not replicated yet — the bootstrap case — and it had no test at all,
 	// because a harness without a real memberlist can never reach that branch.
 	membersForTests func() []PeerInfo
+	// gossipForTests overrides the RAW memberlist view that Members() filters
+	// through admission. See SetGossipForTests.
+	gossipForTests func() []PeerInfo
+	// gossipSeeded records that this node was started with join_peers, which is
+	// what lets a node that knows no other host trust what its seeds introduce.
+	// See gossip_admission.go.
+	gossipSeeded bool
+	// gossipSeedIPs is the IP of every configured join seed. Admission trusts
+	// an unknown name at one of them until this node holds a hosts row for
+	// that address. See gossip_admission.go.
+	gossipSeedIPs map[string]bool
+	// gossipAddrs is the gossip address ("ip:port") memberlist last showed for
+	// each peer, so the re-merge pass can dial a host that has dropped out at
+	// the port it gossips on (gossip_rejoin.go). Guarded by gossipAddrMu.
+	gossipAddrMu sync.Mutex
+	gossipAddrs  map[string]string
+	// mlEvents is memberlist's event delegate, which also holds every live
+	// member's address (Members reads it; see membershipEvents.addrs).
+	mlEvents *membershipEvents
+	// admission is the last gossip-admission snapshot read successfully.
+	admission atomic.Pointer[gossipAdmission]
 	// freshness records whether this node's replica has been reconciled
 	// against a peer since it last had reason to believe it is stale. See
 	// ReplicaCaughtUp.
 	freshness replicaFreshness
-	hostName  string
-	clock     *hlc.Clock
-	version   string // local litevirtd binary version, for skew checks
+	// obsRepair records when anti-entropy last repaired the observation
+	// tables (observation_tables.go).
+	obsRepair observationRepair
+	// settled records, per (peer, table), a digest pair a pull proved differs
+	// only by ties this node already tracks (settled_ties.go).
+	settled settledTies
+
+	hostName string
+	clock    *hlc.Clock
+	version  string // local litevirtd binary version, for skew checks
 
 	// dataDir is where the durable monotonic-clock high-water lives
 	// (<dataDir>/nowts.hwm). Empty ⇒ no persistence (in-memory monotonic only:
@@ -184,6 +266,14 @@ type Client struct {
 	// leader-lease term. See leader_lease_contest.go: it is what lets a
 	// contested lease converge while the contested ledger row is kept.
 	leaseContests leaseContestRegister
+	// leaseMintClearance, when set, is asked before this node records a NEW
+	// leader-lease term. See SetLeaseMintClearance and leader_lease_clearance.go.
+	leaseMintClearance LeaseMintClearanceFunc
+	// mintWithheld is, per lease key, why the last mint was withheld ("" or
+	// absent when it was not), so a node polling every few seconds logs the
+	// withholding once rather than every tick. Guarded by its own mutex.
+	mintWithheldMu sync.Mutex
+	mintWithheld   map[string]string
 	// unresolvedTies records, per (table,PK), the last classified-unresolved tie:
 	// its sorted content-hash pair and its CATEGORY. The pair makes
 	// lww_tie_unresolved count DISTINCT rows (re-observing the same divergence is
@@ -196,6 +286,13 @@ type Client struct {
 	// schema. It used to be passed in and dropped, which is what forced
 	// internal/grpcapi to maintain one.
 	unresolvedTies map[string]unresolvedTie
+	// tieVersions records, per tracked (table,PK), the fingerprint of EVERY
+	// version of the row seen as a party to its unresolved tie — this node's
+	// own and each peer's. unresolvedTies holds one pair per row, which for an
+	// N-way contest describes only the last peer met; anti-entropy's settled
+	// proof needs the whole set (settled_ties.go). Guarded by tieMu, cleared
+	// with the register entry. Fingerprints only: no row content is kept.
+	tieVersions map[string]map[string]struct{}
 	// acknowledgedTies records, per (table,PK), the content pair an operator has
 	// stated they have seen. A re-observation of the SAME pair is then not
 	// tracked at all.
@@ -225,6 +322,13 @@ type Client struct {
 	// pair went stale is trackUnresolvedPair, which runs with c.mu held, so the
 	// delete deadlocked the merge. See the comment there.
 	acknowledgedTies map[string]map[string]bool
+	// acknowledgedVersions records, per (table,PK), the version fingerprints an
+	// operator's acknowledgement covered: every version of the row this node
+	// had met when they acknowledged it. An observation whose two versions are
+	// both here is answered, whatever pair the register happened to hold; one
+	// with a version first met later is not. Mirrors
+	// acknowledged_tie_versions; guarded by tieMu.
+	acknowledgedVersions map[string]map[string]bool
 	// unresolvedLen mirrors len(unresolvedTies) for a lock-free fast path: the
 	// clear-on-write hooks (which run on every applied/local row) skip the lock
 	// entirely when nothing is tracked — the overwhelmingly common case.
@@ -237,6 +341,11 @@ type Client struct {
 	// runs (runDeferredEffects) or drops (dropDeferredEffects) its tx's effects. See deferAfterCommit.
 	txEffectsMu sync.Mutex
 	txEffects   map[*sql.Tx][]func()
+
+	// parked holds LWW updates that met no row because the row had not
+	// arrived yet, for the WAL apply path to replay when it does. See
+	// parked_updates.go.
+	parked parkedUpdates
 
 	// hlcSkewGuard, when non-nil and returning true, enables LWW skew quarantine:
 	// an incoming row whose updated_at is beyond hlc.MaxSkewMS into the
@@ -260,12 +369,13 @@ type Client struct {
 	// legacy RFC3339 emission.
 	hlcEmit func() bool
 
-	// digestV2Enabled, when non-nil and returning true, makes the state digest + the
-	// divergence scanner ALSO emit the order-invariant digest_v2 hashes (TableDigest.HashV2
-	// / RowMeta.RowHashV2). Gated on `enforcement.digest_v2` alone (injected via
-	// SetDigestV2Enabled) — no cluster latch: v2 is negotiated PAIRWISE by field presence,
-	// so a node only emits v2 when locally enabled and comparison uses v2 only when both
-	// peers emitted it. Cheap in-memory read. Nil/false = v1-only emission (unchanged).
+	// digestV2Enabled, unless it returns false, makes the state digest + the divergence
+	// scanner ALSO emit the order-invariant digest_v2 hashes (TableDigest.HashV2 /
+	// RowMeta.RowHashV2). Gated on `enforcement.digest_v2` alone (injected via
+	// SetDigestV2Enabled, default on) — no cluster latch: v2 is negotiated PAIRWISE by
+	// field presence, so a node only emits v2 when locally enabled and comparison uses v2
+	// only when both peers emitted it. Cheap in-memory read. Nil = on, like the config
+	// default; false = v1-only emission (the kill switch).
 	digestV2Enabled func() bool
 
 	// leaseTermLedger, when non-nil and returning true, permits a WRITE to
@@ -273,7 +383,66 @@ type Client struct {
 	// DurablyLatched(LeaseTermLedgerV1). Nil or false means the lease is still
 	// taken but no term is minted — see SetLeaseTermLedgerGate for why this one
 	// predicate fails CLOSED when unset.
-	leaseTermLedger func() bool
+	// Atomic: read on replication goroutines that may already run when set.
+	leaseTermLedger atomic.Pointer[func() bool]
+
+	// credentialsSplit, when non-nil and returning true, permits WRITING the
+	// sensitive credential tables (host_fence_credentials, user_credentials,
+	// token_credentials). Injected via SetCredentialsSplitGate, wired to
+	// DurablyLatched(CredentialsSplitV1). Fails CLOSED when unset, for the
+	// leaseTermLedger reason: those tables' shapes back-pressure a
+	// previous-release peer. See credentials_split.go.
+	// Atomic: read on replication goroutines that may already run when set.
+	credentialsSplit atomic.Pointer[func() bool]
+
+	// hostMembershipGate, when non-nil and returning true, permits WRITING
+	// host_membership. Injected via SetHostMembershipGate, wired to the durable
+	// host_membership_split_v1 latch. Fails CLOSED when unset, for the
+	// leaseTermLedger reason: that table's shapes back-pressure a
+	// previous-release peer. See host_membership.go.
+	// Atomic because the WAL apply path reads it (absorbUnlatchedMembershipWrite)
+	// on replication goroutines that may already be running when it is set.
+	hostMembershipGate atomic.Pointer[func() bool]
+	// clusterPolicyGate, when non-nil and returning true, permits WRITING
+	// cluster_policies. Injected via SetClusterPolicyGate, wired to the durable
+	// failover_scope_v1 latch. Fails CLOSED when unset: the table's shapes
+	// back-pressure a previous-release peer. See cluster_policy.go.
+	clusterPolicyGate atomic.Pointer[func() bool]
+	// voterConfigGate, when set and returning true, permits WRITING
+	// voter_configs. Injected via SetVoterConfigGate, wired to the durable
+	// voter_config_v1 latch. Fails CLOSED when unset: that table's shapes
+	// back-pressure a previous-release peer. See voter_config.go.
+	voterConfigGate atomic.Pointer[func() bool]
+	// recoveryClaimGate, when set and returning true, permits emitting the
+	// claim_certificate column's statement shapes on runtime_action_proofs.
+	// Injected via SetRecoveryClaimGate, wired to the durable
+	// recovery_claim_v1 latch. Fails CLOSED when unset: those shapes
+	// back-pressure a previous-release peer. See recovery_claims_proof.go.
+	recoveryClaimGate atomic.Pointer[func() bool]
+	// claimIncarnationGate reports whether claim_incarnation_v1 has DURABLY
+	// latched (SetClaimIncarnationGate). It is replication-gated, so every
+	// host this node replicates to runs a build that knows every statement
+	// shape this build emits. Fails CLOSED (false) when unset.
+	claimIncarnationGate atomic.Pointer[func() bool]
+	// claimCertVerifier supplies the verifier a proof's claim certificate is
+	// judged with before it may REPLACE another (SetProofClaimCertificate and
+	// the anti-entropy merge). Unset, or returning nil, nothing verifies and
+	// a non-empty certificate is never replaced. See recovery_claims_proof.go.
+	claimCertVerifier atomic.Pointer[func() *ClaimVerifier]
+	// forcedRefused is each forced voter generation the anti-entropy merge
+	// refused because this node had already adopted an ordinary row for that
+	// generation (voterConfigMergeKeepLocalRow), for ha.voter.forced.
+	forcedRefusedMu sync.Mutex
+	forcedRefused   map[int64]string
+	// hostMembershipLive is set once a SplitHostMembership pass has completed
+	// with the gate open (also persisted under dataDir); from then on writers
+	// write host_membership and readers read it.
+	hostMembershipLive atomic.Bool
+	// hostMembershipLiveChecked records that the persisted marker was read.
+	hostMembershipLiveChecked atomic.Bool
+	// hostMembershipMu serializes the split pass with the membership writers,
+	// so a writer's read-modify-write sees what the pass just absorbed.
+	hostMembershipMu sync.Mutex
 
 	// canonicalIdentity, when non-nil and returning true, makes the merge paths resolve the
 	// natural-key-identity tables (tableIdentityKeys) by their natural key instead of the
@@ -405,11 +574,24 @@ func (c *Client) SetHLCEmit(fn func() bool) { c.hlcEmit = fn }
 
 // SetDigestV2Enabled injects the predicate that makes the digest + scanner emit the
 // order-invariant digest_v2 hashes. Wired at daemon start to `enforcement.digest_v2`.
-// Nil-safe: an unset predicate keeps v1-only emission.
+// An unset predicate emits v2, matching that flag's default.
 func (c *Client) SetDigestV2Enabled(fn func() bool) { c.digestV2Enabled = fn }
 
-// digestV2On reports whether digest_v2 emission is enabled on this node (nil-safe).
-func (c *Client) digestV2On() bool { return c.digestV2Enabled != nil && c.digestV2Enabled() }
+// digestV2On reports whether digest_v2 emission is enabled on this node: on unless a
+// predicate says otherwise.
+//
+// On by default because the positional v1 digest cannot agree across replicas founded
+// at different schema versions: an ALTER appends a column after deleted_at, a fresh
+// CREATE TABLE declares it earlier, and SELECT * hashes identical rows differently, on
+// every pass, for good (TestStateDigest_OlderFoundedReplicaAgreesByDefault). No CREATE
+// order fits every founding version, so only a name-ordered digest fixes it.
+//
+// Turning it on needs no capability token. Every comparison picks v2 only when BOTH
+// sides sent it (localAndRemoteHash, bucketsAgree, digestVersions, sameHash), so a peer
+// that does not emit v2 — an older build, or this flag off — is compared on v1 exactly
+// as before, and nothing ever compares a v1 hash with a v2 one. The guarantee is
+// enforced at each comparison; no node relies on a peer doing anything.
+func (c *Client) digestV2On() bool { return c.digestV2Enabled == nil || c.digestV2Enabled() }
 
 // SetLeaseTermLedgerGate injects the predicate that permits WRITING to
 // leader_lease_terms. Wired at daemon start to
@@ -425,7 +607,7 @@ func (c *Client) digestV2On() bool { return c.digestV2Enabled != nil && c.digest
 //
 // The test constructors wire it open: a test cluster is single-version by
 // construction, and this gate answers a rolling-upgrade question.
-func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger = fn }
+func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger.Store(&fn) }
 
 // MayMintLeaseTerm reports whether this node may write a term row (nil-safe,
 // fail closed).
@@ -434,7 +616,8 @@ func (c *Client) SetLeaseTermLedgerGate(fn func() bool) { c.leaseTermLedger = fn
 // that mints no term must not advertise readiness to enforce on one. Reading the
 // gate itself keeps that from becoming a second, drifting copy of the predicate.
 func (c *Client) MayMintLeaseTerm() bool {
-	return c.leaseTermLedger != nil && c.leaseTermLedger()
+	fn := c.leaseTermLedger.Load()
+	return fn != nil && *fn != nil && (*fn)()
 }
 
 // MayEmitTermCarryingProof reports whether this node may put the WIDENED
@@ -486,6 +669,18 @@ func (c *Client) observeDump(d time.Duration, bytes int) {
 func (c *Client) observeDigest(d time.Duration) {
 	if c.syncMetrics != nil {
 		c.syncMetrics.ObserveDigest(d)
+	}
+}
+
+func (c *Client) observePullRows(scope string, rows int) {
+	if c.syncMetrics != nil && rows > 0 {
+		c.syncMetrics.ObservePullRows(scope, rows)
+	}
+}
+
+func (c *Client) observeDigestTables(cached, computed int) {
+	if c.syncMetrics != nil {
+		c.syncMetrics.ObserveDigestTables(cached, computed)
 	}
 }
 
@@ -755,9 +950,17 @@ func (c *Client) SetLocalVersion(v string) { c.version = v }
 // NOTE: auto_vacuum only takes effect on a freshly-created database. An
 // existing DB adopts it only after a one-time VACUUM (see the upgrade/
 // maintenance runbook).
+//
+// synchronous(full) is set explicitly rather than inherited from the driver's
+// compiled default. A recovery-claim voter replies "promised" or "accepted" only
+// after its transaction commits, and that reply is only safe if the commit is on
+// disk: with FULL a WAL commit is fsynced before COMMIT returns. It is a no-op
+// where the default is already FULL; the voter_config_v1 readiness probe reads
+// PRAGMA synchronous and withholds the token below FULL
+// (docs/design/recovery-claims.md §3.7).
 func sqliteDSN(path string) string {
 	return fmt.Sprintf(
-		"file:%s?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_pragma=auto_vacuum(incremental)",
+		"file:%s?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_pragma=auto_vacuum(incremental)&_pragma=synchronous(full)",
 		path)
 }
 
@@ -772,19 +975,23 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 
 	// Open SQLite with WAL mode
 	dbPath := filepath.Join(cfg.DataDir, "state.db")
-	db, err := sql.Open("sqlite", sqliteDSN(dbPath))
+	dsn := sqliteDSN(dbPath)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
 
 	// Verify connection
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 
 	c := &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
 		hostName:         cfg.HostName,
 		clock:            clock,
 		dataDir:          cfg.DataDir,
@@ -805,13 +1012,37 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	// Empty leaves memberlist's auto-detection in place (see Config.AdvertiseAddr
 	// for why that is only safe on an unambiguously single-homed host).
 	mlCfg.AdvertiseAddr = cfg.AdvertiseAddr
-	mlCfg.LogOutput = &slogWriter{}
+	mlCfg.LogOutput = &slogWriter{client: c}
+	ring, err := configureGossipEncryption(mlCfg, cfg.GossipEncryption, cfg.GossipKeys)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	c.gossipMode, c.gossipKeyring = cfg.GossipEncryption, ring
+
+	if cfg.pushPullInterval > 0 {
+		mlCfg.PushPullInterval = cfg.pushPullInterval
+	}
 
 	del := &delegate{client: c}
 	mlCfg.Delegate = del
+	// Admission: only hosts in this cluster's hosts table become members (see
+	// gossip_admission.go). Both delegates are needed — memberlist notes that a
+	// merge delegate alone misses passive merging — and the first snapshot is
+	// taken now, before memberlist exists, so the delegate always has one.
+	c.gossipSeeded = len(cfg.JoinPeers) > 0
+	c.gossipSeedIPs = seedIPs(cfg.JoinPeers)
+	c.loadAdmission()
+	adm := &admissionDelegate{client: c}
+	mlCfg.Alive = adm
+	mlCfg.Merge = adm
 	// EventDelegate wakes the replicator's discovery loop on membership changes
 	// (separate from Delegate, which carries gossip metadata) — set before Create.
-	mlCfg.Events = &membershipEvents{client: c}
+	c.mlEvents = &membershipEvents{client: c}
+	mlCfg.Events = c.mlEvents
+	if cfg.MemberlistForTests != nil {
+		cfg.MemberlistForTests(mlCfg)
+	}
 
 	list, err := memberlist.Create(mlCfg)
 	if err != nil {
@@ -832,13 +1063,14 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 
 	// This join is not the last one. An isolated node -- seeds down at boot, or
 	// a membership that aged out across a long partition -- otherwise keeps an
-	// empty peer set for the life of the process, and anti-entropy cannot repair
+	// empty peer set for the life of the process, and the two halves of a
+	// healed partition otherwise never merge again; anti-entropy cannot repair
 	// against a peer it never discovers. See maintainMembership.
 	mctx, stop := context.WithCancel(context.Background())
 	c.stopMembership, c.membershipDone = stop, make(chan struct{})
 	go func() {
 		defer close(c.membershipDone)
-		c.maintainMembership(mctx, cfg.JoinPeers, cfg.AdvertiseAddr)
+		c.maintainMembership(mctx, cfg.JoinPeers, cfg.AdvertiseAddr, cfg.RejoinInterval)
 	}()
 
 	return c, nil
@@ -850,16 +1082,21 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 // get picked up by the running daemon's replicator and broadcast to peers.
 func NewLocalClient(dataDir string, hostName ...string) (*Client, error) {
 	dbPath := filepath.Join(dataDir, "state.db")
-	db, err := sql.Open("sqlite", sqliteDSN(dbPath))
+	dsn := sqliteDSN(dbPath)
+	db, gens, err := openHookedDB(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
+		return nil, err
 	}
 	if err := db.Ping(); err != nil {
 		db.Close()
+		releaseGenerations(dsn)
 		return nil, fmt.Errorf("ping sqlite: %w", err)
 	}
 	c := &Client{
 		db:               db,
+		dsn:              dsn,
+		tableGens:        gens,
+		outOfProcess:     true,
 		dataDir:          dataDir,
 		replicatorNotify: make(chan struct{}),
 		membershipNotify: make(chan struct{}, 1),
@@ -886,7 +1123,22 @@ func (c *Client) Close() error {
 		c.list.Shutdown()
 	}
 	if c.db != nil {
-		return c.db.Close()
+		err := c.db.Close()
+		if c.memKeeper != nil {
+			_ = c.memKeeper.Close()
+		}
+		if c.tableGens != nil {
+			// A client beside the daemon (NewLocalClient) that wrote tells
+			// the daemon's digest cache, which its hook cannot see.
+			if c.outOfProcess && c.tableGens.changed() {
+				if terr := touchDigestMarker(c.dataDir); terr != nil {
+					slog.Warn("digest cache: could not mark an out-of-process write; the daemon's cached digests catch up within 10 minutes",
+						"error", terr)
+				}
+			}
+			releaseGenerations(c.dsn)
+		}
+		return err
 	}
 	return nil
 }
@@ -954,16 +1206,41 @@ func (c *Client) Query(ctx context.Context, sqlStr string, params ...interface{}
 // Execute runs a mutation, logs it to mutation_log, and immediately notifies
 // the replicator to push it to peers.
 func (c *Client) Execute(ctx context.Context, sqlStr string, params ...interface{}) error {
-	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true)
+	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true, false)
 	return err
 }
 
 // ExecuteRows is Execute that also reports how many rows the application
-// statement changed. Use it when a no-op UPDATE must be distinguished from a
-// real one — e.g. consuming a single-use token, where a guarded WHERE matching
-// zero rows means "not consumed" and the caller must NOT treat it as success.
+// statement changed — for a caller that counts (a retention sweep, a bulk
+// hand-off whose completeness it checks separately).
+//
+// A zero-row result from ExecuteRows is still RELAYED (and, for a full-PK LWW
+// update whose row is absent, parked), exactly as from Execute. That is right
+// for a caller that only counts. A caller that treats zero rows as "did not
+// happen" wants ExecuteRowsStrict.
 func (c *Client) ExecuteRows(ctx context.Context, sqlStr string, params ...interface{}) (int64, error) {
-	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true)
+	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true, false)
+}
+
+// ExecuteRowsStrict is ExecuteRows for a write whose zero-row result is a
+// REFUSAL: a strict helper that returns ErrNoRowsAffected (or applied=false),
+// a CAS, a claim, a single-use consume. A statement that changed no row here is
+// neither written to mutation_log nor parked for its row's arrival.
+//
+// Both halves matter. mutation_log carries statements, so a relayed no-op is
+// REPLAYED by every peer: one that holds the row — or holds it at a state this
+// node's guard has already moved past — applies the change the caller was just
+// told failed, and LWW then carries it cluster-wide. Parking closes the loop on
+// the origin: an update that met no row here is applied here once the row
+// arrives. For a failed UpdateDiskPlacement the two together moved a disk's
+// recorded placement on every node, including the one that reported the move
+// as failed.
+//
+// A statement that did change a row is relayed exactly as ExecuteRows relays it.
+// The statement shape is unchanged, so the ledger and stmtshapecheck see it as
+// they see ExecuteRows.
+func (c *Client) ExecuteRowsStrict(ctx context.Context, sqlStr string, params ...interface{}) (int64, error) {
+	return c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, true, true)
 }
 
 // ExecuteDeferred runs a mutation and logs it to mutation_log, but does NOT
@@ -971,14 +1248,14 @@ func (c *Client) ExecuteRows(ctx context.Context, sqlStr string, params ...inter
 // periodic replication tick (~10s). Use this for high-frequency, low-priority
 // writes like health checks that don't need instant replication.
 func (c *Client) ExecuteDeferred(ctx context.Context, sqlStr string, params ...interface{}) error {
-	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, false)
+	_, err := c.executeBatchInternal(ctx, []Statement{{SQL: sqlStr, Params: params}}, false, false)
 	return err
 }
 
 // ExecuteBatch runs multiple mutations in a transaction, atomically writing
 // them to the mutation_log for replication to peers.
 func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
-	_, err := c.executeBatchInternal(ctx, stmts, true)
+	_, err := c.executeBatchInternal(ctx, stmts, true, false)
 	return err
 }
 
@@ -989,6 +1266,29 @@ func (c *Client) ExecuteBatch(ctx context.Context, stmts []Statement) error {
 // the writes. Returns applied=false (no error) when the guard declines, so the
 // caller treats that as "preconditions no longer hold — skip and retry later".
 func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), stmts []Statement) (bool, error) {
+	return c.ExecuteEntriesGuarded(ctx, guard, [][]Statement{stmts})
+}
+
+// ExecuteEntriesGuarded is ExecuteBatchGuarded for a write that is ONE local
+// transaction but MORE THAN ONE replicated entry: every statement of every
+// entry commits (or none does) behind the one guard, and each non-empty entry
+// becomes its own mutation_log row, in order, with its own HLC.
+//
+// It exists because local atomicity and the wire's entry shapes are different
+// constraints, and one entry cannot always satisfy both. A receiver judges each
+// entry on its own (validateGuardedMutationEntry): a guarded workload
+// transition or delete must be the unique final statement of its entry, and
+// every statement beside it must carry the same guard. A write that tombstones
+// one workload and creates another — a container relocation — has two such
+// halves, and packing them into one entry produced a shape every receiver
+// refused, stalling the sender's whole stream behind it. Here the sender keeps
+// the halves atomic locally and ships each as the shape receivers already
+// accept.
+//
+// Receivers may apply the entries in separate transactions (a push can split
+// between them), so a peer can briefly hold the state after the first entry.
+// Callers order entries so that intermediate is the safe one.
+func (c *Client) ExecuteEntriesGuarded(ctx context.Context, guard func(tx *sql.Tx) (bool, error), entries [][]Statement) (bool, error) {
 	if reason := c.quarantineReason(); reason != "" {
 		return false, errQuarantined(reason)
 	}
@@ -1010,52 +1310,93 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		return false, nil
 	}
 	var mutated []Statement
-	relay := make([]Statement, 0, len(stmts))
-	for _, s := range stmts {
-		if s.Guard != nil {
-			matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
+	var parks []func() // see executeBatchInternal
+	relays := make([][]Statement, 0, len(entries))
+	for _, stmts := range entries {
+		relay := make([]Statement, 0, len(stmts))
+		for _, s := range stmts {
+			if s.Guard != nil {
+				matches, err := c.mutationGuardMatches(ctx, tx, s.Guard)
+				if err != nil {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, fmt.Errorf("statement guard: %w", err)
+				}
+				if !matches {
+					tx.Rollback()
+					c.mu.Unlock()
+					return false, nil
+				}
+			}
+			// A live-row update runs here through the same guarded form every
+			// receiver uses; what is logged is the wire form (live_row_update.go).
+			res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
 			if err != nil {
 				tx.Rollback()
 				c.mu.Unlock()
-				return false, fmt.Errorf("statement guard: %w", err)
+				return false, fmt.Errorf("exec guarded batch: %w", err)
 			}
-			if !matches {
+			if isGuardedTransitionSQL(s.SQL) && !rowsChanged(res) {
 				tx.Rollback()
 				c.mu.Unlock()
-				return false, nil
+				return false, invalidf("guarded workload transition matched authority but changed no row")
+			}
+			changed := false
+			if n, e := res.RowsAffected(); e == nil && n > 0 {
+				changed = true
+				mutated = append(mutated, s)
+			}
+			if !changed {
+				if park := c.parkIfRowAbsent(ctx, tx, s, ""); park != nil {
+					parks = append(parks, park)
+				}
+			}
+			if relayStatement(s, changed) {
+				relay = append(relay, s)
 			}
 		}
-		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
-		if err != nil {
-			tx.Rollback()
-			c.mu.Unlock()
-			return false, fmt.Errorf("exec guarded batch: %w", err)
-		}
-		if isGuardedTransitionSQL(s.SQL) && !rowsChanged(res) {
-			tx.Rollback()
-			c.mu.Unlock()
-			return false, invalidf("guarded workload transition matched authority but changed no row")
-		}
-		changed := false
-		if n, e := res.RowsAffected(); e == nil && n > 0 {
-			changed = true
-			mutated = append(mutated, s)
-		}
-		if relayStatement(s, changed) {
-			relay = append(relay, s)
-		}
+		relays = append(relays, relay)
 	}
 	// `relay`, not `stmts` — see relayStatement. This is the site the
 	// seed-then-compare proof validation was written to work around: it seeds a
 	// row from an untrusted proof and compares inside one transaction, because
 	// the seeding INSERT OR IGNORE reached every peer even when it changed
 	// nothing locally.
-	if c.clock != nil && len(relay) > 0 {
+	// A secret this node writes without its credential statement (its gate is
+	// closed) also refreshes the credential row it holds (credentials_absorb.go).
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
+	// Likewise a state or isolation write this node makes to hosts alone
+	// updates the membership row it holds (host_membership.go).
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
+	// A host this node re-admits takes no fence credential from the machine
+	// removed under its name; every receiver retires it too (host_readmit.go).
+	if err := retireReadmittedCredentials(ctx, tx, mutated); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return false, err
+	}
+	for _, relay := range relays {
+		if c.clock == nil || len(relay) == 0 {
+			continue
+		}
 		stmtsJSON, err := json.Marshal(relay)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
 			return false, fmt.Errorf("marshal stmts: %w", err)
+		}
+		if err := refuseUnapplicableEntry(relay, stmtsJSON); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return false, err
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		if _, err := tx.ExecContext(ctx,
@@ -1072,6 +1413,9 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 		return false, fmt.Errorf("commit: %w", err)
 	}
 	c.mu.Unlock()
+	for _, park := range parks {
+		park()
+	}
 
 	if c.anyUnresolved() {
 		for _, s := range mutated {
@@ -1080,6 +1424,40 @@ func (c *Client) ExecuteBatchGuarded(ctx context.Context, guard func(tx *sql.Tx)
 	}
 	c.notifyReplicator()
 	return true, nil
+}
+
+// refuseUnapplicableEntry runs the receiver's structural check for guarded
+// workload entries (validateGuardedMutationEntry) on the entry this node is
+// about to log, in the form a peer will decode it, and refuses the local write
+// when a peer would refuse the entry.
+//
+// Refusing here is strictly better than committing. A receiver rejects such an
+// entry with an error that back-pressures, not one it acknowledges, so a
+// committed bad entry does not cost one row: the sender's whole stream stops
+// at it, for every peer, until it ages out of the log. The local write
+// surfaces as an error instead, before anything reaches the wire.
+//
+// Only an entry carrying a mutation guard can fail the check, so an ordinary
+// write pays for a scan of its statements and nothing more.
+func refuseUnapplicableEntry(relay []Statement, stmtsJSON []byte) error {
+	guarded := false
+	for _, s := range relay {
+		if s.Guard != nil {
+			guarded = true
+			break
+		}
+	}
+	if !guarded {
+		return nil
+	}
+	var wire []Statement
+	if err := json.Unmarshal(stmtsJSON, &wire); err != nil {
+		return fmt.Errorf("decode own mutation entry: %w", err)
+	}
+	if err := validateGuardedMutationEntry(wire); err != nil {
+		return fmt.Errorf("refusing a write every peer would reject: %w", err)
+	}
+	return nil
 }
 
 func isGuardedTransitionSQL(sql string) bool {
@@ -1095,7 +1473,10 @@ func isGuardedTransitionSQL(sql string) bool {
 		fp == mustStatementFingerprint(containerDeleteSQL)
 }
 
-func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify bool) (int64, error) {
+// executeBatchInternal commits stmts in one transaction and logs what peers
+// must replay. strict makes a statement that changed no row a refusal: it is
+// neither relayed nor parked (see ExecuteRowsStrict).
+func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, notify, strict bool) (int64, error) {
 	if reason := c.quarantineReason(); reason != "" {
 		return 0, errQuarantined(reason)
 	}
@@ -1108,9 +1489,12 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 
 	var affected int64
 	var mutated []Statement // statements that changed ≥1 row (for unresolved-clear)
+	var parks []func()      // updates that met no row because it has not arrived yet
 	relay := make([]Statement, 0, len(stmts))
 	for _, s := range stmts {
-		res, err := tx.ExecContext(ctx, s.SQL, s.Params...)
+		// A live-row update runs here through the same guarded form every
+		// receiver uses; what is logged is the wire form (live_row_update.go).
+		res, err := tx.ExecContext(ctx, appliedForm(s).SQL, s.Params...)
 		if err != nil {
 			tx.Rollback()
 			c.mu.Unlock()
@@ -1124,6 +1508,14 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 				mutated = append(mutated, s)
 			}
 		}
+		if !changed && strict {
+			continue // a refusal: nothing for a peer to replay, nothing to wait for
+		}
+		if !changed {
+			if park := c.parkIfRowAbsent(ctx, tx, s, ""); park != nil {
+				parks = append(parks, park)
+			}
+		}
 		if relayStatement(s, changed) {
 			relay = append(relay, s)
 		}
@@ -1133,6 +1525,27 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 	//
 	// `relay`, not `stmts`: a create-only statement that changed nothing here
 	// must not be replayed by a peer. See relayStatement.
+	// A secret this node writes without its credential statement (its gate is
+	// closed) also refreshes the credential row it holds (credentials_absorb.go).
+	if err := absorbUnlatchedSecretWrite(ctx, tx, mutated, c.MayWriteCredentialTables()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
+	// Likewise a state or isolation write this node makes to hosts alone
+	// updates the membership row it holds (host_membership.go).
+	if err := absorbUnlatchedMembershipWrite(ctx, tx, mutated, c.MayWriteHostMembership()); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
+	// A host this node re-admits takes no fence credential from the machine
+	// removed under its name; every receiver retires it too (host_readmit.go).
+	if err := retireReadmittedCredentials(ctx, tx, mutated); err != nil {
+		tx.Rollback()
+		c.mu.Unlock()
+		return 0, err
+	}
 	if c.clock != nil && len(relay) > 0 {
 		hlcTS := c.clock.Now()
 		stmtsJSON, err := json.Marshal(relay)
@@ -1140,6 +1553,11 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 			tx.Rollback()
 			c.mu.Unlock()
 			return 0, fmt.Errorf("marshal stmts: %w", err)
+		}
+		if err := refuseUnapplicableEntry(relay, stmtsJSON); err != nil {
+			tx.Rollback()
+			c.mu.Unlock()
+			return 0, err
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
 		if _, err := tx.ExecContext(ctx,
@@ -1157,6 +1575,9 @@ func (c *Client) executeBatchInternal(ctx context.Context, stmts []Statement, no
 		return 0, fmt.Errorf("commit: %w", err)
 	}
 	c.mu.Unlock()
+	for _, park := range parks {
+		park()
+	}
 
 	// A local write that actually CHANGED a row clears any stale unresolved-tie
 	// tracking for that PK — the remediation path (e.g. repair-owner's
@@ -1268,7 +1689,6 @@ func (c *Client) HostName() string {
 	return c.hostName
 }
 
-// Members returns the current memberlist members (for peer discovery).
 // kickMembership wakes the replicator's peer-discovery loop after a gossip
 // membership change. Non-blocking and coalescing: a kick already pending covers
 // this one, so it's safe to call from memberlist's event goroutines.
@@ -1286,26 +1706,59 @@ func (c *Client) MembershipChanged() <-chan struct{} {
 	return c.membershipNotify
 }
 
+// Members returns this node's ADMITTED gossip peers, self excluded: memberlist
+// members that pass the gossip admission predicate (see gossip_admission.go).
+//
+// Everything that counts or dials membership reads it — relay election's N and
+// R, the replicator's targets, anti-entropy, the re-join loop's "do I see
+// anyone", capability activation — so the filter is here, once, and not in each
+// of them. The memberlist delegates already refuse a non-admitted member at the
+// door; this second pass drops one admitted earlier whose standing has since
+// changed — bootstrap-trusted before this node learned the cluster, tombstoned
+// by a removal, or re-addressed by a re-admission.
 func (c *Client) Members() []PeerInfo {
 	if fn := c.membersForTests; fn != nil {
 		return fn()
 	}
-	if c.list == nil {
-		return nil
-	}
-	var peers []PeerInfo
-	for _, m := range c.list.Members() {
-		if m.Name == c.hostName {
-			continue
+	var raw []PeerInfo
+	if fn := c.gossipForTests; fn != nil {
+		raw = fn()
+	} else {
+		if c.list == nil {
+			return nil
 		}
-		peers = append(peers, PeerInfo{Name: m.Name, Addr: m.Address()})
+		// Names from memberlist (a node's name never changes), addresses
+		// from the event delegate's copy: see membershipEvents.addrs.
+		for _, m := range c.list.Members() {
+			addr, ok := "", false
+			if c.mlEvents != nil {
+				addr, ok = c.mlEvents.addr(m.Name)
+			}
+			if !ok {
+				continue // not yet announced by an event; the next read has it
+			}
+			raw = append(raw, PeerInfo{Name: m.Name, Addr: addr})
+		}
 	}
-	return peers
+	peers := make([]PeerInfo, 0, len(raw))
+	for _, p := range raw {
+		if p.Name != c.hostName {
+			peers = append(peers, p)
+		}
+	}
+	return c.admittedOnly(peers)
 }
 
-// SetMembersForTests injects gossip membership. Test-only; production membership
-// comes from memberlist.
+// SetMembersForTests injects the ADMITTED membership view directly, bypassing
+// admission — for tests that model what a node has already let in. Test-only;
+// production membership comes from memberlist.
 func (c *Client) SetMembersForTests(fn func() []PeerInfo) { c.membersForTests = fn }
+
+// SetGossipForTests injects RAW memberlist membership, which Members() then
+// filters through gossip admission exactly as it filters memberlist's. Use it to
+// model what an unauthenticated gossip segment can put in front of a node.
+// Test-only.
+func (c *Client) SetGossipForTests(fn func() []PeerInfo) { c.gossipForTests = fn }
 
 // PeerInfo holds basic peer identity from memberlist.
 type PeerInfo struct {
@@ -1399,6 +1852,19 @@ func (r Row) Int64(col string) int64 {
 	}
 }
 
+// Bytes reads a BLOB column. Query hands BLOBs back as strings, so both forms
+// are accepted; absent/NULL reads as nil.
+func (r Row) Bytes(col string) []byte {
+	switch v := r.get(col).(type) {
+	case []byte:
+		return append([]byte(nil), v...)
+	case string:
+		return []byte(v)
+	default:
+		return nil
+	}
+}
+
 func (r Row) get(col string) interface{} {
 	for i, c := range r.Columns {
 		if c == col && i < len(r.Values) {
@@ -1409,9 +1875,15 @@ func (r Row) get(col string) interface{} {
 }
 
 // slogWriter adapts slog for memberlist's io.Writer log output.
-type slogWriter struct{}
+type slogWriter struct {
+	// client, when set, counts the encryption rejections memberlist logs.
+	client *Client
+}
 
 func (w *slogWriter) Write(p []byte) (int, error) {
+	if w.client != nil {
+		w.client.observeGossipLog(string(p))
+	}
 	slog.Debug(string(p))
 	return len(p), nil
 }

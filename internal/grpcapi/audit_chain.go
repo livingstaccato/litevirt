@@ -54,6 +54,8 @@ func (s *Server) VerifyAuditChain(ctx context.Context, _ *emptypb.Empty) (*pb.Ve
 
 		UnsignedAfterSigned: res.UnsignedAfterSigned,
 		NeverAdopted:        res.NeverAdopted,
+		NotSigningHosts:     res.NotSigning,
+		AmbiguousRows:       res.Ambiguous,
 
 		Tampered:   res.Tampered(),
 		Unverified: res.Unverified(),

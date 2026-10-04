@@ -165,8 +165,9 @@ workloads:
 ```
 
 Containers are full compose citizens: `lv compose up` creates **and starts** each
-container on an LXC-capable host (placement is capability-aware, so a container
-never lands on a node without the runtime); re-apply is idempotent (unchanged
+container on an LXC-capable host (placement is capability-aware: a container
+lands only on a host labelled `litevirt.lxc=true`, see
+[Host-loss relocation](#host-loss-relocation)); re-apply is idempotent (unchanged
 containers are left alone, a changed spec recreates); and `lv compose down`
 removes them and every trace they created (rootfs, the stack's network bridge +
 dnsmasq, and any load balancer processes). The legacy `vms:` map is accepted —
@@ -476,8 +477,23 @@ option available:
    container is re-keyed and the target's reconciler rebuilds it from its
    re-pullable image, reconstructing managed NICs from the persisted create spec.
 3. **Skip** (`ct.relocate.skipped`) — when neither is possible (e.g. a hand-built
-   rootfs with no re-pullable image and no backup). Loudly audited so an operator
-   knows to recover it manually.
+   rootfs with no re-pullable image and no backup), or when no active host has a
+   container runtime. Loudly audited so an operator knows to recover it manually.
+
+A relocation target must have a container runtime. Each daemon records whether
+its host has one in the `litevirt.lxc` host label: it probes for `lxc-create`
+at start and re-checks every minute, writing `true` or `false`. The rule is
+strict: every container placement (compose, failover relocation, restore) uses
+only a host labelled exactly `litevirt.lxc=true`. A host labelled `false`, or
+with no label at all, never gets a container. A relocation that reached such a
+host anyway, for example one decided before the host recorded the label, fails
+there for good. The container goes to `error` with the cause, its relocation
+proof is failed, and the host stops retrying the rebuild.
+
+If a host that has LXC installed refuses containers with `no container runtime
+(litevirt.lxc unset)`, its daemon has not written the label yet. The daemon logs
+`set LXC capability host label failed` and retries every minute. `lv host label
+ls <host>` shows the label.
 
 Restore-from-backup requires a backup repo reachable from the survivor (a
 registered repo name / shared NFS). `container_restore_timeout_sec`

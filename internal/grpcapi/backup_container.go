@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -88,6 +89,18 @@ func migrateFromMD(ctx context.Context) string {
 	return ""
 }
 
+// ownerDrivenRelocation reports whether a carried relocate proof is its
+// workload's own move: minted by the peer-verified migrate source, which this
+// node's replica records as the container's current owner.
+func (s *Server) ownerDrivenRelocation(ctx context.Context, p *pb.RuntimeActionProof, name string) bool {
+	src := s.migrateSourceFromPeer(ctx)
+	if p == nil || src == "" || p.GetCoordinator() != src {
+		return false
+	}
+	ct, err := corrosion.GetContainer(ctx, s.db, src, name)
+	return err == nil && ct != nil
+}
+
 // migrateSourceFromPeer returns the migrate source host ONLY when the marker is
 // backed by peer mTLS whose certificate CN matches the claimed source (a known
 // cluster host). RestoreContainer is operator-facing, so an operator/bearer caller
@@ -145,8 +158,8 @@ func (s *Server) BackupContainer(req *pb.BackupContainerRequest, stream grpc.Ser
 	if err := s.requireSinkPeer(ctx, req.SinkHost); err != nil {
 		return err
 	}
-	project := s.containerProject(ctx, req.HostName, req.Name)
-	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Name), "backup.create", "operator"); err != nil {
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name), "backup.create", "operator", containerWhat(req.Name)); err != nil {
 		s.audit(ctx, "ct.backup", req.Name, "project="+project, "denied")
 		return err
 	}
@@ -632,10 +645,19 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// gossip). claimCarriedProof enforces action/target/dest==self + exact durable
 	// binding; the execute-side ExecutionGate above enforces local quorum. A
 	// proofless restore under enforcement is refused.
-	restoreProofID, cpErr := s.claimCarriedProof(ctx, req.Proof, corrosion.ActionRelocate, "container", req.Name)
+	// A restore its OWNER drives — a cold migration from the live source,
+	// peer-verified as the caller and still the recorded owner — is not a
+	// recovery and carries no claim certificate (docs/design/recovery-claims.md
+	// §2). A failover restore-relocation never looks like one: its coordinator
+	// is a survivor, never the fenced owner.
+	restoreProofID, cpErr := s.claimCarriedProofOwned(ctx, req.Proof, corrosion.ActionRelocate, "container", req.Name,
+		s.ownerDrivenRelocation(ctx, req.Proof, req.Name))
 	if cpErr != nil {
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofConflict)
 		return cpErr
+	}
+	if h := s.restoreClaimedHook; h != nil && restoreProofID != "" {
+		h(req.Name)
 	}
 	if req.Proof == nil && s.gateActive(ctx) && s.requirePeerCert(ctx) == nil {
 		s.noteGateRefused(corrosion.ActionRelocate, health.ReasonProofMissing)
@@ -783,6 +805,24 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// never by re-importing blindly or adopting an unmarked/foreign artifact: a host-local
 	// marker (written right after import, before the row) records which proof produced it.
 	skipImport := false
+	// The start checkpoint, under the container lock and before anything is laid
+	// down or started: appended only if this host has not abandoned the proof,
+	// decided in one transaction (docs/design/recovery-claims.md §3.12, §10 item
+	// 37). The proof was claimed before this handler took the lock, and an
+	// operator release (`lv cluster claim-release`) landing in between finds the
+	// lock free and no container yet, so it can record the abandonment; the
+	// database then refuses the restore here. A release after this point refuses
+	// the proof for the recorded step. A retry of the same proof appends nothing.
+	if restoreProofID != "" {
+		if err := corrosion.AppendProofStepUnlessAbandoned(ctx, s.db, restoreProofID, "start_attempted"); err != nil {
+			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				s.noteGateRefused(corrosion.ActionRelocate, health.ReasonClaimLost)
+				return status.Errorf(codes.FailedPrecondition,
+					"restore of %s refused: this host abandoned relocation proof %s and will never execute it", req.Name, restoreProofID)
+			}
+			return status.Errorf(codes.Unavailable, "record the start checkpoint of proof %s: %v", restoreProofID, err)
+		}
+	}
 	if restoreProofID != "" {
 		exists, xerr := s.containerRuntime.ContainerExists(ctx, req.Name)
 		if xerr != nil {

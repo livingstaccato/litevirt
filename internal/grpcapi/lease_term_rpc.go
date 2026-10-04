@@ -66,7 +66,18 @@ func (s *Server) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTerm
 			holder = h
 		}
 	}
-	return &pb.GetLeaseTermHighWaterResponse{Key: key, Term: term, Holder: holder}, nil
+	// This node's leader_election row, raw, for a peer about to take the lease
+	// over (LeaseMintClearance): renewals travel only in that table, so a row
+	// here can be newer than the asker's. Unreadable is Unavailable like the
+	// ledger, never an empty row — an empty row reads as "nothing to report".
+	leaseHolder, leaseExpires, err := corrosion.ReadLeaseRow(ctx, s.db, key)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read lease row for %q: %v", key, err)
+	}
+	return &pb.GetLeaseTermHighWaterResponse{
+		Key: key, Term: term, Holder: holder,
+		LeaseHolder: leaseHolder, LeaseExpiresAt: leaseExpires,
+	}, nil
 }
 
 // AcknowledgeLeaseTermTie clears a contested lease term from THIS node's
@@ -79,6 +90,12 @@ func (s *Server) GetLeaseTermHighWater(ctx context.Context, req *pb.GetLeaseTerm
 // and a daemon restart is not a way out either: the register is in-memory, so a
 // restart empties it and the next anti-entropy sweep re-registers the same tie
 // within seconds.
+//
+// The acknowledgement is durable (acknowledged_ties, acknowledged_tie_versions)
+// and covers the ROW as this node has seen it: every claim for the term it has
+// met, however many peers made one and in whatever order anti-entropy meets
+// them after a restart. A claim first met afterwards is not covered and raises
+// the condition again.
 //
 // It clears EVIDENCE TRACKING, not the conflict. Both claims stay in the ledger,
 // and this handler writes an audit row naming the principal, the key and the

@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"time"
 )
@@ -43,9 +44,10 @@ type stampedStep struct {
 // ProjectReservedSettling sums the project-quota reservation deltas this admission
 // must yield to:
 //
-//   - NONTERMINAL reservations from operations sorting strictly BEFORE opID — earlier
-//     claimants, exactly as ReservedBefore counts them (later ones yield to us, and
-//     our own must not be subtracted from the headroom we compare against).
+//   - NONTERMINAL reservations exactly as ReservedBefore counts them
+//     (reservationCounts): earlier claimants, plus later ones already admitted.
+//     A later one still deciding yields to us, and our own must not be
+//     subtracted from the headroom we compare against.
 //   - CAPACITY leases that reached a terminal step within `grace` AND whose admitted
 //     resource is not yet visible here, at ANY id — winners that are committing right
 //     now. Id order is irrelevant for these: they are no longer racing us, they are a
@@ -110,7 +112,9 @@ func ProjectReservedSettlingAmount(ctx context.Context, c *Client, project, opID
 		state, _ := ReduceOperationState(OperationKind(r.String("operation_kind")), names)
 
 		if !IsOperationTerminal(state) {
-			if id < opID { // an earlier claimant; later ones yield to us
+			// An earlier claimant, or a later one that has already WON; a later
+			// one still deciding yields to us (reservationCounts).
+			if reservationCounts(id, opID, rv, slices.Contains(names, OpStepAdmitted)) {
 				total = total.Add(rv.ProjectAmount())
 			}
 			continue

@@ -30,4 +30,14 @@ type LibvirtBackend interface {
 	// an error, never epoch 0.
 	SetDomainOwnerEpoch(name string, epoch int64, running bool) error
 	GetDomainOwnerEpoch(name string) (int64, bool, error)
+	// The managed stamp (internal/libvirt/managed_stamp.go): "litevirt manages
+	// this domain", no generation. Get returns (false,nil) when absent.
+	SetDomainManaged(name string, running bool) error
+	GetDomainManaged(name string) (bool, error)
+	// The managed stamp's incarnation attribute (the row's created_at it was
+	// adopted from): which incarnation of the name this domain is. Layer 3 of
+	// partition pause settles a copy only of a known incarnation
+	// (settle.go). Get returns ok=false for a stamp without one.
+	SetDomainManagedIncarnation(name, incarnation string, running bool) error
+	GetDomainManagedIncarnation(name string) (string, bool, error)
 }

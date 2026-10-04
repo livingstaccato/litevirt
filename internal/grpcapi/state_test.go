@@ -19,6 +19,7 @@ func TestVmStateToPB(t *testing.T) {
 		{"stopped", pb.VMState_VM_STOPPED},
 		{"migrating", pb.VMState_VM_MIGRATING},
 		{"error", pb.VMState_VM_ERROR},
+		{"paused", pb.VMState_VM_PAUSED},
 		{"unknown", pb.VMState_VM_UNKNOWN},
 		{"", pb.VMState_VM_UNKNOWN},
 		{"garbage", pb.VMState_VM_UNKNOWN},

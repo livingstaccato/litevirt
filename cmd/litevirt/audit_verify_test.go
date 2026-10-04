@@ -49,7 +49,7 @@ func TestAuditVerifyCleanOutputNeverSaysTampered(t *testing.T) {
 			t.Fatalf("clean result returned error: %v", err)
 		}
 		got := out.String()
-		if strings.Contains(strings.ToLower(got), "tamper") && !strings.Contains(got, "predate tamper-evidence") {
+		if strings.Contains(strings.ToLower(got), "tamper") {
 			t.Errorf("clean output mentions tampering: %q", got)
 		}
 		if !strings.Contains(got, "audit chain intact") {
@@ -60,7 +60,7 @@ func TestAuditVerifyCleanOutputNeverSaysTampered(t *testing.T) {
 	// "12 rows verified" alone reads as "12 rows are tamper-evident".
 	var out strings.Builder
 	_ = reportAuditVerify(&out, &pb.VerifyAuditChainResponse{RowsChecked: 12, UnsignedRows: 12})
-	if !strings.Contains(out.String(), "12 predate tamper-evidence") {
+	if !strings.Contains(out.String(), "12 unsigned") {
 		t.Errorf("unsigned count not reported: %q", out.String())
 	}
 }
@@ -161,7 +161,7 @@ func TestAuditVerifyUnverifiedHeadlineDoesNotSayIntact(t *testing.T) {
 		t.Errorf("the headline does not state the outcome: %q", first)
 	}
 	// The unsigned count still has to be visible — it is the context for the rest.
-	if !strings.Contains(out.String(), "12 predate tamper-evidence") {
+	if !strings.Contains(out.String(), "12 unsigned") {
 		t.Errorf("the unsigned count was dropped from the unverified path: %q", out.String())
 	}
 }
@@ -177,5 +177,73 @@ func TestAuditVerifyConsumesTheDaemonUnverifiedVerdict(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "NOT FULLY VERIFIED") {
 		t.Fatalf("CLI did not report the daemon's verdict: %q", out.String())
+	}
+}
+
+// The lab case, kvm003-f3 on 2026-10-01: five hosts, signing never switched on,
+// and `lv audit verify` said "212 predate tamper-evidence" — which reads as
+// "old history, nothing to do" about rows written minutes earlier by a build
+// that could have signed every one. The output has to say which hosts are not
+// signing NOW and why that happens, and must not call their rows old.
+func TestAuditVerifyNamesHostsThatAreNotSigning(t *testing.T) {
+	var out strings.Builder
+	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+		RowsChecked:  212,
+		UnsignedRows: 212,
+		NotSigningHosts: []string{
+			"node-1: 73 unsigned rows", "node-2: 41 unsigned rows", "node-3: 34 unsigned rows",
+			"node-4: 44 unsigned rows", "node-5: 20 unsigned rows",
+		},
+	})
+	if err != nil {
+		t.Fatalf("hosts that are not signing are not tampering, but the run failed: %v", err)
+	}
+	got := out.String()
+	if strings.Contains(got, "predate") {
+		t.Errorf("rows from hosts that are not signing now are described as old: %q", got)
+	}
+	for _, want := range []string{
+		"audit chain intact", "212 unsigned", "not signing now",
+		"node-1: 73 unsigned rows", "node-5: 20 unsigned rows", "enforcement.audit_signature",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q:\n%s", want, got)
+		}
+	}
+
+	// No host listed: every unsigned row is history from before its host began
+	// signing — or the daemon is too old to say. Either way, no host is named and
+	// no remedy is suggested.
+	out.Reset()
+	if err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{RowsChecked: 12, UnsignedRows: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "not signing now") {
+		t.Errorf("a host is reported as not signing when none was: %q", out.String())
+	}
+}
+
+// A row with a NUL in a hashed field has a hash that does not determine its
+// content, so it must fail the run. It is not tampering — an older build wrote
+// such rows verbatim — so it must not say TAMPERED, and the row has to be named.
+func TestAuditVerifyAmbiguousRowsFailWithoutClaimingTampering(t *testing.T) {
+	var out strings.Builder
+	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+		RowsChecked:   3,
+		Unverified:    true,
+		AmbiguousRows: []string{"row-7: node-1: field target contains a NUL byte"},
+	})
+	if err == nil {
+		t.Fatal("an ambiguous row exited 0")
+	}
+	got := out.String()
+	if strings.Contains(got, "TAMPERED") {
+		t.Errorf("an ambiguous row is reported as tampering: %q", got)
+	}
+	if !strings.Contains(got, "row-7") {
+		t.Errorf("the ambiguous row is not named: %q", got)
+	}
+	if strings.Contains(got, "inspect its logs") {
+		t.Errorf("a named finding fell through to the unspecified message: %q", got)
 	}
 }

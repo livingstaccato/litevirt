@@ -167,6 +167,9 @@ func (s *Server) UnaryAuthInterceptor(
 	if err != nil {
 		return nil, err
 	}
+	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
+		return nil, err
+	}
 	return handler(ctx, req)
 }
 
@@ -189,6 +192,9 @@ func (s *Server) StreamAuthInterceptor(
 	}
 	ctx, err := s.authenticate(ss.Context())
 	if err != nil {
+		return err
+	}
+	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
 		return err
 	}
 	return handler(srv, &wrappedStream{ss, ctx})
@@ -566,8 +572,10 @@ func callerPrincipalKind(ctx context.Context) string {
 }
 
 // requirePeerOrRole gates a dual-use RPC that BOTH cluster peers (host cert) and
-// operator bearers legitimately invoke — e.g. the anti-entropy state RPCs, which
-// the UI diagnostics page and `lv cluster sync` also call with a bearer. A
+// operator bearers legitimately invoke — e.g. the anti-entropy digest RPCs, which
+// the UI diagnostics page and `lv cluster converge` also call with a bearer. It
+// is only for RPCs that return no row contents: the state dump is peer-only
+// (requirePeerCert), because it carries secret columns. A
 // trusted peer passes; otherwise the caller must hold at least minRole. A pure
 // requirePeerCert here would break the bearer (UI/CLI) path.
 func (s *Server) requirePeerOrRole(ctx context.Context, minRole string) error {
@@ -719,28 +727,6 @@ func scopesIncludeRoot(scopes []string) bool {
 	return false
 }
 
-// AuthorizeInProcess resolves the credential carried in ctx exactly as the
-// gRPC interceptor does, then applies RequirePerm to it.
-//
-// It exists for the web UI, whose write handlers reach the replicated DB
-// IN-PROCESS instead of through gRPC, so nothing authorizes them. The UI used
-// to re-derive its own answer from the coarse role string in WhoamiResponse,
-// which was wrong in both directions at once: it ignored token scope paths, so
-// a token deliberately scoped to /projects/acme could flip the CLUSTER default
-// firewall policy; and it ignored RBAC bindings, so every external-realm user
-// -- shadowed locally as "viewer" -- was refused every mutation even when
-// bound to Admin.
-//
-// Both follow from having two authorization implementations. This gives the UI
-// the daemon's own, so there is one.
-func (s *Server) AuthorizeInProcess(ctx context.Context, path, verb, fallbackRole string) error {
-	authed, err := s.authenticate(ctx)
-	if err != nil {
-		return err
-	}
-	return s.RequirePerm(authed, path, verb, fallbackRole)
-}
-
 // RequirePerm checks whether the caller may perform `verb` at `path` in
 // the path-based RBAC model. transitional contract:
 //
@@ -784,6 +770,56 @@ func (s *Server) RequirePerm(ctx context.Context, path, verb, fallbackRole strin
 	// re-checking it path-blind here would refuse a token acting inside its own
 	// scope.
 	return requireRoleLevel(ctx, fallbackRole)
+}
+
+// requirePermResolved is RequirePerm for a resource whose project comes from
+// its local row. known reports whether that row was found. When it was, path —
+// built from the row's project — decides, exactly as RequirePerm does.
+//
+// When it was not, the project cannot be named here: the row has not reached
+// this node yet, or the resource does not exist. Guessing _default was an
+// authorization bypass — a caller whose only grant was on _default passed for a
+// resource in any other project, through any node its row had not reached,
+// and the action then ran on the owner (a forward) or relayed a write every
+// node holding the row applied. An unresolved project therefore never
+// authorizes on the guess. The outcomes, in order:
+//
+//   - a cluster-root grant (or the legacy no-bindings role fallback, which is
+//     cluster-wide anyway) proceeds: it covers every project, so an admin's
+//     idempotent re-issue of a delete keeps working;
+//   - a caller the old guess (guessPath, the _default path) would have admitted
+//     gets a retryable NotFound — the answer they already got for a name that
+//     exists nowhere, so this adds no oracle, and it does not act;
+//   - anyone else gets PermissionDenied.
+//
+// Every PermissionDenied from here — known project or not — carries ONE
+// message, naming only what the caller asked for. RequirePerm's own message
+// names the resolved path (and so the project), and differing messages would
+// let a caller with no rights on a name learn whether it exists on this node
+// (TestResolvedAuthz_AnOutOfScopeCallerCannotTellWhetherANameExists).
+func (s *Server) requirePermResolved(ctx context.Context, known bool, path, guessPath, verb, fallbackRole, what string) error {
+	denied := func(err error) error {
+		if status.Code(err) == codes.PermissionDenied {
+			return status.Errorf(codes.PermissionDenied,
+				"permission denied on %s (if it was just created its project may not be established on this node yet; retry, or target its owner)", what)
+		}
+		return err
+	}
+	if known {
+		return denied(s.RequirePerm(ctx, path, verb, fallbackRole))
+	}
+	rootErr := s.RequirePerm(ctx, "/", verb, fallbackRole)
+	if rootErr == nil {
+		return nil
+	}
+	if status.Code(rootErr) != codes.PermissionDenied {
+		return rootErr
+	}
+	if s.RequirePerm(ctx, guessPath, verb, fallbackRole) == nil {
+		return status.Errorf(codes.NotFound,
+			"%s not found on this node (if it was just created it may still be replicating; retry)", what)
+	}
+	return denied(rootErr)
 }
 
 // requirePermPrecheck is a path-independent gate used by handlers that must

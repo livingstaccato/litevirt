@@ -84,11 +84,21 @@ type Reconciler struct {
 	// expires between the start and the commit reproducible instead of a
 	// timing race, and lets a test see WHICH context the walk handed down.
 	// Nil in production.
-	startDomainHook  func(context.Context)
+	startDomainHook func(context.Context)
+	// proofClaimedHook runs right after a pending start has claimed its proof.
+	// Test-only seam: it is the window in which a release of that proof can be
+	// recorded, which the start checkpoint has to catch. Nil in production.
+	proofClaimedHook func(context.Context)
 	hostName         string
 	dataDir          string
 	db               *corrosion.Client
 	virt             LibvirtBackend
+	// settleVerify / settleProofs are Layer 3 of partition pause (settle.go):
+	// the certificate check and the proof source. nil verifier settles nothing.
+	settleVerify SettleVerifier
+	settleProofs func(ctx context.Context, c *corrosion.Client, kind, name string) ([]corrosion.ProofRecord, error)
+	// settleDeclines rate-limits the decline report (settle_declined.go).
+	settleDeclines   settleDeclineTracker
 	onVMStarted      func(ctx context.Context, stackName string)       // optional: called after VM starts (LB refresh)
 	vmStartObserver  VMStartObserver                                   // optional: told of every guest start (start grace)
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
@@ -118,6 +128,12 @@ type Reconciler struct {
 	// one transfer rather than opening another stream. See pullBackingImage.
 	pullMu sync.Mutex
 	pulls  map[string]*imagePullFlight
+
+	// transferDisks: disks a pending transfer rebuilt here (superseded_disk.go).
+	transferDisks transferDisks
+	// deferredTransfers: proof-less transfers parked in "starting" while their
+	// backing image transfers (missing_disk.go).
+	deferredTransfers deferredTransfers
 
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
@@ -149,6 +165,9 @@ type Reconciler struct {
 
 	// leaseTermGate judges a pending proof's lease term. See SetLeaseTermGate.
 	leaseTermGate LeaseTermGate
+	// recoveryClaimGate verifies a pending proof's recovery-claim certificate.
+	// See SetRecoveryClaimGate.
+	recoveryClaimGate RecoveryClaimGate
 	// sharedStorageFenceEnforce is the config kill-switch for the shared-disk
 	// ownership-transfer fence gate (enforcement.shared_storage_fence). With it AND
 	// SharedStorageFenceV1 latched, an ownership-transfer start of a VM with a
@@ -180,6 +199,11 @@ type Reconciler struct {
 	// exactly as before. nil in tests / when unwired → treated as a no-op. The returned
 	// release func is invoked ONLY if the subsequent StartDomain fails.
 	prepareHardwareForStart func(ctx context.Context, vm *corrosion.VMRecord) (func(), error)
+
+	// orphans / onOrphans: the orphan-runtime report (orphan_runtime.go) — the
+	// sighting counts between passes, and the metric observer (nil-safe).
+	orphans   orphanReporter
+	onOrphans func(kind string, orphans []OrphanRuntime)
 }
 
 // SetHardwareStartPreparer wires the hardware_v2 pre-start hook (adoption gate + PCI
@@ -203,6 +227,13 @@ func (r *Reconciler) hwPrepareStart(ctx context.Context, vm *corrosion.VMRecord)
 // fence its claim must carry (nil = unfenced), or a countable refusal reason
 // and an error. Implemented by grpcapi.
 type LeaseTermGate func(ctx context.Context, pr corrosion.ProofRecord) (*corrosion.TermFence, string, error)
+
+// RecoveryClaimGate verifies the recovery-claim certificate on a proof read off
+// the replicated row (docs/design/recovery-claims.md §3.10) and returns a
+// countable refusal reason with an error, or "" and nil to proceed.
+// Implemented by grpcapi (RecoveryClaimGateForPendingProof), which answers
+// "proceed" whenever recovery claims are not enforced.
+type RecoveryClaimGate func(ctx context.Context, pr corrosion.ProofRecord) (string, error)
 
 type runtimeGate interface {
 	ExecutionGate(ctx context.Context) GateResult
@@ -235,6 +266,13 @@ func (r *Reconciler) SetGate(g runtimeGate) { r.gate = g }
 // verdict rather than a compile error. nil leaves the path exactly as it was
 // before Phase 2.
 func (r *Reconciler) SetLeaseTermGate(fn LeaseTermGate) { r.leaseTermGate = fn }
+
+// SetRecoveryClaimGate injects the executor-side certificate check for a
+// pending proof (grpcapi's RecoveryClaimGateForPendingProof), for the
+// SetLeaseTermGate reason: it lives with the verifier and the voter set in
+// internal/grpcapi, which imports this package. nil leaves the path as it was
+// before recovery claims.
+func (r *Reconciler) SetRecoveryClaimGate(fn RecoveryClaimGate) { r.recoveryClaimGate = fn }
 
 // SetOwnerEpochBackfill enables the Phase 4 backfill pass in each sweep
 // (enforcement.owner_epoch; the daemon wires it).
@@ -359,6 +397,11 @@ func (r *Reconciler) reconcilePass(ctx context.Context) {
 
 	r.selfFence(ctx)
 	r.assertRuntimeOwnership(ctx)
+	// Both sweeps above skip a domain with no live row. Stamp every domain that
+	// has one here, so it stays recognisable once its row is gone; then report
+	// the ones litevirt created that have none. Neither touches the runtime.
+	r.adoptManagedDomains(ctx)
+	r.reportOrphanRuntimes(ctx)
 }
 
 // Start begins the reconcile loop. Blocks until ctx is cancelled.
@@ -528,10 +571,15 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 		return
 	}
 
+	r.resolveDiskMissing(ctx)
+
 	for _, vm := range vms {
 		switch vm.State {
 		case "pending":
 			r.startPendingVM(ctx, vm)
+
+		case "creating":
+			r.finishNewbornVM(ctx, vm.Name)
 
 		case "starting":
 			// "starting" is an INTERMEDIATE state written only by startPendingVM (just
@@ -903,16 +951,29 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 	// leftover, so a fence-and-return with many leftovers and an unreachable
 	// owner costs one probe timeout rather than one per VM.
 	unreachable := map[string]string{}
+	// Live copies Layer 3 declined to settle this pass, reported once the pass
+	// is over (settle_declined.go). keep: copies this pass could not examine
+	// (row unreadable, migrating, runtime state unreadable). Their absence from
+	// declines says nothing, so an open decline for one is kept, not resolved
+	// and re-raised a pass later.
+	var declines []settleDecline
+	keep := map[string]bool{}
+	defer func() { r.reportSettleDeclines(ctx, declines, keep) }()
 	for _, domName := range localDomains {
 		vm, err := corrosion.GetVM(ctx, r.db, domName)
+		if err != nil {
+			keep[domName] = true // unread: its decline status is unknown, not over
+		}
 		if err != nil || vm == nil {
 			// Domain exists locally but not in corrosion — might be external/manual.
+			// A litevirt-stamped one is reported by reportOrphanRuntimes, never here.
 			continue
 		}
 
 		// If the VM is mid-migration, a transient domain will appear on the
 		// target host before corrosion is updated — don't destroy it.
 		if vm.State == "migrating" {
+			keep[domName] = true // not examined this pass
 			continue
 		}
 
@@ -934,10 +995,27 @@ func (r *Reconciler) selfFence(ctx context.Context) {
 			// Reason "unknown" is the one exception, and it needs MORE proof, not
 			// less: see provenOwnerLeftover.
 			st, serr := r.virt.DomainStateReason(domName)
+			if serr != nil {
+				keep[domName] = true // state unreadable: settle not examined this pass
+			}
 			cleanable := serr == nil && cleanableLeftover(st)
 			why := ""
 			if serr == nil && !cleanable && unknownShutoff(st) {
 				cleanable, why = r.provenOwnerLeftover(ctx, domName, vm.HostName, unreachable)
+			}
+			// Layer 3 of partition pause (settle.go): a LIVE copy — running, or
+			// paused by this host's partition pause — whose row a VERIFIED
+			// recovery-claim certificate gave to another host is stopped on that
+			// positive proof, never on host_name. The leftover cleanup above
+			// takes the shut-off domain on a later pass.
+			if serr == nil && !cleanable && (st.State == RuntimeRunning || st.Reason == "paused") {
+				settled, swhy, local := r.settleCertifiedMove(ctx, domName, vm)
+				if settled {
+					continue
+				}
+				why = swhy
+				declines = append(declines, settleDecline{Name: domName, RowHost: vm.HostName,
+					Reason: swhy, Local: local, RuntimeState: st.State, RuntimeReason: st.Reason})
 			}
 			if !cleanable {
 				slog.Warn("reconciler: NOT destroying a local domain whose DB row points elsewhere — not a clearly-dead leftover; deferring to runtime ownership repair",
@@ -1085,6 +1163,13 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// by a coordinator that held the lease + quorum, so we MUST validate + claim it
 	// single-use — AND run the local ExecutionGate — regardless of local activation.
 	proofID := fresh.PendingActionID
+	// An ownership transfer onto this host (the coordinator's pending row, or
+	// its proof after a crash or re-arm), as opposed to a local start: it never
+	// finds the VM's current host-local disk here (superseded_disk.go).
+	// A proof-less transfer whose image pull outlived the walk is parked in
+	// "starting" (deferPendingStart) and is still that transfer.
+	transfer := fresh.State == "pending" || proofID != "" ||
+		(fresh.State == "starting" && r.deferredTransfers.has(vm.Name))
 
 	// A proof MARKER present with NO gate wired fails CLOSED: we can't verify quorum,
 	// and a marker implies enforcement was active when it was stamped. (Production
@@ -1230,6 +1315,23 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			termFence = fence
 		}
 
+		// Recovery claims, EXECUTE side (docs/design/recovery-claims.md §3.10):
+		// after the exact-match and owner-epoch checks above and BEFORE the
+		// claim. This is the check that makes two coordinators' reschedules
+		// safe: each can write a well-formed proof into its own replica, and
+		// only the one a majority of voters certified verifies here. A refusal
+		// leaves the row pending, like every other gate refusal, so a
+		// certificate whose voter generation or CRL has not replicated yet
+		// verifies on a later tick.
+		if r.recoveryClaimGate != nil {
+			if reason, cerr := r.recoveryClaimGate(ctx, pr); cerr != nil {
+				slog.Warn("reconciler: pending proof refused — no recovery-claim certificate verifies",
+					"vm", vm.Name, "proof", proofID, "reason", reason, "error", cerr)
+				r.noteGateRefused(corrosion.ActionReschedule, reason)
+				return
+			}
+		}
+
 		if err := corrosion.ClaimActionProofFenced(ctx, r.db, proofID, r.hostName, termFence); err != nil {
 			if errors.Is(err, corrosion.ErrTermClaimantConflict) {
 				// This host already acted at this (key, term) for a different
@@ -1248,11 +1350,24 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 				r.noteGateRefused(corrosion.ActionReschedule, ReasonProofTerminal)
 				return
 			}
+			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				// Terminal, not transient: this host has promised never to run
+				// the proof, and no later tick can change that. Fail the proof
+				// so the row leaves pending instead of retrying every tick.
+				slog.Warn("reconciler: this host abandoned the pending proof and will never execute it — not starting",
+					"vm", vm.Name, "proof", proofID)
+				r.noteGateRefused(corrosion.ActionReschedule, ReasonClaimLost)
+				r.failPendingStart(ctx, vm.Name, proofID, false, "proof abandoned by this host")
+				return
+			}
 			// Transient (proof row not yet visible / DB error): retry next tick.
 			// The vm_lock is released by defer, so we don't tie it up while waiting.
 			slog.Warn("reconciler: claim pending proof failed (transient), retrying",
 				"vm", vm.Name, "proof", proofID, "error", err)
 			return
+		}
+		if r.proofClaimedHook != nil {
+			r.proofClaimedHook(ctx)
 		}
 	}
 
@@ -1350,8 +1465,21 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	var diskConfigs []lv.DiskConfig
 	for _, d := range diskRecords {
+		if transfer {
+			if _, err := r.setAsideSupersededDisk(vm.Name, proofID, d); err != nil {
+				r.failPendingStart(ctx, vm.Name, proofID, true,
+					fmt.Sprintf("set aside the old copy of disk %s found at %s: %v", d.DiskName, d.Path, err))
+				return
+			}
+		}
 		// Verify disk file exists on this host.
 		if _, err := os.Stat(d.Path); err != nil {
+			if !transfer {
+				// A local start of a VM whose disk is gone: never rebuilt
+				// blank (missing_disk.go).
+				r.refuseLocalStartWithoutDisk(ctx, vm.Name, d)
+				return
+			}
 			// If disk has a backing image, try auto-pulling it and recreating the overlay.
 			if d.BackingImage != "" && r.autoPullImage != nil {
 				slog.Info("reconciler: disk missing, attempting auto-pull of backing image",
@@ -1366,6 +1494,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 						// parked in error for a transfer that is going fine.
 						slog.Info("reconciler: backing image still transferring; the start resumes on a later pass",
 							"vm", vm.Name, "disk", d.DiskName, "image", d.BackingImage)
+						if proofID == "" {
+							r.deferredTransfers.add(vm.Name)
+						}
 						r.deferPendingStart(ctx, vm.Name, proofID,
 							fmt.Sprintf("waiting for backing image %s to finish transferring", d.BackingImage))
 						return
@@ -1375,9 +1506,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 						fmt.Sprintf("disk %s not found and image auto-pull failed: %v", d.DiskName, pullErr))
 					return
 				}
-				// Recreate overlay disk from pulled image.
+				// Recreate overlay disk from pulled image, at the disk's
+				// recorded size: left empty, the overlay inherits the backing
+				// image's virtual size (a 20 GiB root came back at 112 MiB).
+				// A row with no recorded size still inherits it.
 				imgStore := image.NewStore(r.dataDir)
-				newPath, createErr := imgStore.CreateOverlayDisk(vm.Name, d.DiskName, d.BackingImage, "")
+				size := ""
+				if d.SizeBytes > 0 {
+					size = strconv.FormatInt(d.SizeBytes, 10)
+				}
+				newPath, createErr := imgStore.CreateOverlayDisk(vm.Name, d.DiskName, d.BackingImage, size)
 				if createErr != nil {
 					slog.Error("reconciler: recreate overlay failed", "vm", vm.Name, "error", createErr)
 					r.failPendingStart(ctx, vm.Name, proofID, true, // transient: retry the overlay build
@@ -1385,6 +1523,7 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 					return
 				}
 				d.Path = newPath
+				r.transferDisks.note(newPath, proofID)
 				slog.Info("reconciler: recreated overlay disk", "vm", vm.Name, "disk", d.DiskName, "path", newPath)
 			} else {
 				slog.Error("reconciler: disk not found", "vm", vm.Name, "disk", d.DiskName, "path", d.Path)
@@ -1408,6 +1547,8 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			Bus:  bus,
 		})
 	}
+	// Every disk is in place: a parked transfer has done its rebuilding.
+	r.deferredTransfers.drop(vm.Name)
 
 	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
 	// peer-replicated) row, so build the ISO path through the validated builder
@@ -1537,6 +1678,29 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		slog.Error("reconciler: generate domain XML", "vm", vm.Name, "error", err)
 		r.failPendingStart(ctx, vm.Name, proofID, false, fmt.Sprintf("XML gen: %v", err)) // non-retryable (bad config)
 		return
+	}
+
+	// The start checkpoint, before anything is defined or started: appended only
+	// if this host has not abandoned the proof, decided in one transaction
+	// (docs/design/recovery-claims.md §3.12, §10 item 37). The start lease is not
+	// what keeps an operator release (`lv cluster claim-release`) from racing
+	// this start — it can expire under a start that runs past vmLockTTL — the
+	// database is: a release before this point makes it refuse, and one after it
+	// refuses the proof for the recorded step. A re-driven start appends nothing.
+	if proofID != "" {
+		if err := corrosion.AppendProofStepUnlessAbandoned(ctx, r.db, proofID, "start_attempted"); err != nil {
+			if errors.Is(err, corrosion.ErrProofAbandoned) {
+				slog.Warn("reconciler: this host abandoned the pending proof and will never execute it — not starting",
+					"vm", vm.Name, "proof", proofID)
+				r.noteGateRefused(corrosion.ActionReschedule, ReasonClaimLost)
+				r.failPendingStart(ctx, vm.Name, proofID, false, "proof abandoned by this host")
+				return
+			}
+			slog.Warn("reconciler: record the start checkpoint failed (transient), retrying",
+				"vm", vm.Name, "proof", proofID, "error", err)
+			r.failPendingStart(ctx, vm.Name, proofID, true, fmt.Sprintf("start checkpoint: %v", err))
+			return
+		}
 	}
 
 	// Define and start the domain.
@@ -1879,6 +2043,53 @@ func ReleaseVMStartLease(ctx context.Context, db *corrosion.Client, holder, vmNa
 		`DELETE FROM vm_locks WHERE vm_name = ? AND holder = ?`,
 		vmName, hostName); err != nil {
 		slog.Debug("vm_lock release failed", "vm", vmName, "holder", hostName, "error", err)
+	}
+}
+
+// finishNewbornVM completes a create that stopped short of publishing its VM
+// running: the row is "creating", the guest already runs here, and the create
+// path's graduate → mark → publish did not finish (a store fault on the
+// graduation, no marker landing, a failed flip). It runs the same
+// PublishNewbornVMRunning the create path does, so a retry can only take the
+// row through the same ordering, never to running at epoch 0.
+//
+// "creating" is not only a stranded newborn, so the finish is keyed narrowly:
+//
+//   - the domain runs on THIS host — a create still defining or starting its
+//     domain (an import starts it after the insert) is not stranded, and a row
+//     with no runtime here has nothing to publish;
+//   - no active_operation_id — the journaled create protocol holds its
+//     provisional row "creating" under that barrier and commits it itself;
+//   - no pending_action_id — a proof-gated action owns the transition;
+//   - no live vm_locks lease — an operation holds the VM.
+//
+// The create path can reach the same row at the same moment; that race is
+// benign, because every step is idempotent — the graduation is guarded on
+// epoch 0, the markers name the one epoch the row holds, and the flip is
+// guarded on that epoch.
+func (r *Reconciler) finishNewbornVM(ctx context.Context, name string) {
+	if r.virt == nil {
+		return
+	}
+	if st, err := r.virt.DomainState(name); err != nil || st != "running" {
+		return
+	}
+	row, err := corrosion.GetVM(ctx, r.db, name)
+	if err != nil || row == nil || row.State != "creating" || row.HostName != r.hostName {
+		return
+	}
+	if row.ActiveOperationID != "" || row.PendingActionID != "" {
+		return
+	}
+	if r.activeVMLock(ctx, name) {
+		return
+	}
+	slog.Info("reconciler: finishing a created VM that was never published running",
+		"vm", name, "epoch", row.OwnerEpoch)
+	if err := PublishNewbornVMRunning(ctx, r.virt, r.db, r.dataDir, r.hostName, name); err != nil {
+		slog.Warn("reconciler: could not finish a created VM — it stays \"creating\" and is retried next sweep",
+			"vm", name, "error", err)
+		r.noteStateWriteFail(corrosion.OpVMState, err)
 	}
 }
 

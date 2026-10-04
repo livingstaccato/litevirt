@@ -2,7 +2,7 @@ package grpcapi
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -108,16 +108,23 @@ func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*
 	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	return s.clusterStateDigest(ctx), nil
+}
+
+// clusterStateDigest is GetClusterStateDigest without the caller check: every
+// active host's verification digest, residuals included. `lv doctor
+// divergence` reads it too, so it decides acknowledged ties from exactly what
+// `lv cluster converge` sees.
+func (s *Server) clusterStateDigest(ctx context.Context) *pb.ClusterStateDigestResponse {
 	resp := &pb.ClusterStateDigestResponse{}
 
 	// Self: merge public + sensitive, annotated with per-table unresolved-tie counts.
-	ties := s.db.UnresolvedTieTables()
 	self := &pb.StateDigestResponse{HostName: s.hostName}
 	if pub, err := s.db.StateDigest(ctx); err == nil {
-		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, pub, ties).Tables...)
+		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, pub, s.digestTieView(ctx, pub, true)).Tables...)
 	}
 	if sens, err := s.db.SensitiveStateDigest(ctx); err == nil {
-		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, sens, ties).Tables...)
+		self.Tables = append(self.Tables, stateDigestResponse(s.hostName, sens, s.digestTieView(ctx, sens, true)).Tables...)
 	}
 	resp.Hosts = append(resp.Hosts, self)
 
@@ -142,6 +149,8 @@ func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*
 				return
 			}
 			defer conn.Close()
+			// Verification: the peer's digest as of now, not its cache.
+			pctx = corrosion.WithFreshDigest(pctx)
 			pub, err := client.GetStateDigest(pctx, &emptypb.Empty{})
 			if err != nil {
 				results[i] = result{host: host, err: err, unsup: status.Code(err) == codes.Unimplemented}
@@ -166,7 +175,7 @@ func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*
 			resp.Unreachable = append(resp.Unreachable, x.host)
 		}
 	}
-	return resp, nil
+	return resp
 }
 
 // GetStateDigest returns a lightweight fingerprint of each replicated table
@@ -178,32 +187,76 @@ func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.Stat
 		return nil, err
 	}
 
-	digests, err := s.db.StateDigest(ctx)
+	// The per-pass hot path: every peer's pass asks, so it is served from the
+	// digest cache (corrosion/digest_cache.go) where that is still valid —
+	// unless the caller is verifying and asked for a scan now.
+	digest := s.db.StateDigestCached
+	if corrosion.FreshDigestRequested(ctx) {
+		digest = s.db.StateDigest
+	}
+	digests, err := digest(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return stateDigestResponse(s.hostName, digests, s.db.UnresolvedTieTables()), nil
+	return stateDigestResponse(s.hostName, digests, s.digestTieView(ctx, digests, corrosion.FreshDigestRequested(ctx))), nil
 }
 
-func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties map[string]int) *pb.StateDigestResponse {
+// digestTies is what a digest response says about this host's tracked ties:
+// every tracked tie per table, the acknowledged subset, and — on a
+// verification digest only — the acknowledged residuals.
+type digestTies struct {
+	tracked, acknowledged map[string]int
+	residual              map[string]string
+}
+
+// digestTieView reads the register for a digest over digests. The residual
+// scans only tables whose every tracked tie is acknowledged, which is normally
+// none; it is still kept off the per-pass anti-entropy path (the cached
+// digest), because nothing there reads it. A verification — `lv cluster
+// converge`, which asks every peer with WithFreshDigest — does.
+func (s *Server) digestTieView(ctx context.Context, digests []corrosion.TableDigest, withResidual bool) digestTies {
+	tracked, acked := s.db.TieTableCounts()
+	v := digestTies{tracked: tracked, acknowledged: acked}
+	if withResidual && len(acked) > 0 {
+		names := make([]string, 0, len(digests))
+		for _, d := range digests {
+			names = append(names, d.Name)
+		}
+		v.residual = s.db.AcknowledgedResiduals(ctx, names)
+	}
+	return v
+}
+
+func stateDigestResponse(hostName string, digests []corrosion.TableDigest, ties digestTies) *pb.StateDigestResponse {
 	resp := &pb.StateDigestResponse{HostName: hostName}
 	for _, d := range digests {
 		resp.Tables = append(resp.Tables, &pb.TableDigest{
-			Name:           d.Name,
-			Count:          int32(d.Count),
-			Hash:           d.Hash,
-			HashV2:         d.HashV2, // empty unless digest_v2 is enabled locally
-			UnresolvedTies: int32(ties[d.Name]),
+			Name:                 d.Name,
+			Count:                int32(d.Count),
+			Hash:                 d.Hash,
+			HashV2:               d.HashV2, // empty unless digest_v2 is enabled locally
+			UnresolvedTies:       int32(ties.tracked[d.Name]),
+			AcknowledgedTies:     int32(ties.acknowledged[d.Name]),
+			AcknowledgedResidual: ties.residual[d.Name],
 		})
 	}
 	return resp
 }
 
 // GetStateDump returns a full gzipped state dump that can be merged into
-// another node's database. Used by `lv cluster sync` to force convergence.
+// another node's database: the legacy unary form of the anti-entropy repair
+// pull.
+//
+// Peer-only. The dump is the unredacted repair representation, so it carries
+// secret-bearing columns of replicated tables (hosts.ipmi_pass,
+// users.password_hash, tokens.token_hash). credentials_split_v1 also puts them
+// on the sensitive lane, but this release still dual-writes the old columns;
+// a later release clears them (docs/design/credentials-clear.md). Only a cluster host certificate may
+// read it; an operator or admin bearer and the lv-cli client certificate are
+// refused. Operators see convergence through the digest RPCs, which carry
+// hashes, never row contents.
 func (s *Server) GetStateDump(ctx context.Context, _ *emptypb.Empty) (*pb.StateDumpResponse, error) {
-	// Dual-use: anti-entropy peers (host cert) OR an operator bearer.
-	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
+	if err := s.requirePeerCert(ctx); err != nil {
 		return nil, err
 	}
 
@@ -223,12 +276,111 @@ var stateDumpChunkSize = 1 << 20 // 1 MiB
 // convergence at scale). The chunks are contiguous slices of the exact blob
 // GetStateDump returns, so the client reassembles and merges them identically.
 // GetStateDump is kept for old peers; see the StreamStateDump RPC comment.
+//
+// Peer-only, for the same reason as GetStateDump.
 func (s *Server) StreamStateDump(_ *emptypb.Empty, stream grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
-	// Dual-use: anti-entropy peers (host cert) OR an operator bearer.
-	if err := s.requirePeerOrRole(stream.Context(), "operator"); err != nil {
+	if err := s.requirePeerCert(stream.Context()); err != nil {
 		return err
 	}
 	return streamStateDump(s.db.DumpStateBytes(), stream.Send)
+}
+
+// StreamTableDump streams the same gzipped dump as StreamStateDump restricted
+// to the named public tables (plus the parents their merge reads authority
+// from; see corrosion.ResolveTableDump), so anti-entropy repairs a mismatched
+// table without transferring and merging every other one (#262).
+//
+// Peer-only, for the same reason as StreamStateDump: a public table's dump
+// carries its secret columns. The sensitive lane keeps its own RPC — naming one
+// of its tables here is refused, since this RPC does not make the sender-CN
+// check StreamSensitiveStateDump does.
+func (s *Server) StreamTableDump(req *pb.TableDumpRequest, stream grpc.ServerStreamingServer[pb.StateDumpChunk]) error {
+	if err := s.requirePeerCert(stream.Context()); err != nil {
+		return err
+	}
+	data, err := s.db.DumpTablesScopedBytes(req.GetTables(), requestedBuckets(req.GetBucketScheme(), req.GetBuckets()))
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return streamStateDump(data, stream.Send)
+}
+
+// StreamTableRows pages the same tables StreamTableDump would send, a bounded
+// page at a time, so neither side holds a whole table (corrosion/table_rows.go).
+//
+// Peer-only, for the same reason as StreamTableDump; a sensitive-lane table
+// is refused the same way.
+func (s *Server) StreamTableRows(req *pb.TableDumpRequest, stream grpc.ServerStreamingServer[pb.TableRowsPage]) error {
+	if err := s.requirePeerCert(stream.Context()); err != nil {
+		return err
+	}
+	err := s.db.StreamTableRowsScoped(stream.Context(), req.GetTables(),
+		requestedBuckets(req.GetBucketScheme(), req.GetBuckets()), stream.Send)
+	if errors.Is(err, corrosion.ErrTableDumpEmpty) || errors.Is(err, corrosion.ErrTableDumpSensitive) {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	return err
+}
+
+// StreamSensitiveTableRows is the sensitive lane's paged pull. The sender
+// must match the peer certificate, as for StreamSensitiveStateDump; no tables
+// named is the whole lane.
+func (s *Server) StreamSensitiveTableRows(req *pb.SensitiveStateRequest, stream grpc.ServerStreamingServer[pb.TableRowsPage]) error {
+	if req.GetSender() == "" {
+		return status.Error(codes.InvalidArgument, "sender required")
+	}
+	if err := requireReplicationPeer(stream.Context(), req.GetSender()); err != nil {
+		return err
+	}
+	return s.db.StreamSensitiveTableRowsScoped(stream.Context(), req.GetTables(),
+		requestedBuckets(req.GetBucketScheme(), req.GetBuckets()), stream.Send)
+}
+
+// requestedBuckets turns a dump request's bucket narrowing into the form the
+// corrosion dump takes. A scheme this build does not speak narrows nothing:
+// every table is sent whole, which the merge handles.
+func requestedBuckets(scheme uint32, in map[string]*pb.BucketSet) map[string][]int {
+	if scheme != corrosion.BucketScheme || len(in) == 0 {
+		return nil
+	}
+	out := make(map[string][]int, len(in))
+	for table, set := range in {
+		for _, b := range set.GetBuckets() {
+			out[table] = append(out[table], int(b))
+		}
+	}
+	return out
+}
+
+// GetTableBucketDigests returns the per-bucket digests of the named tables, so
+// anti-entropy pulls only the buckets of a mismatched table that disagree
+// (docs/design/ae-incremental.md).
+//
+// Peer-only, with the sender pinned to the host certificate as on the
+// sensitive lane, because it answers for sensitive tables too. A request in
+// another scheme gets this build's scheme and no tables back, which the caller
+// reads as "pull whole".
+func (s *Server) GetTableBucketDigests(ctx context.Context, req *pb.BucketDigestRequest) (*pb.BucketDigestResponse, error) {
+	if req.GetSender() == "" {
+		return nil, status.Error(codes.InvalidArgument, "sender required")
+	}
+	if err := requireReplicationPeer(ctx, req.GetSender()); err != nil {
+		return nil, err
+	}
+	resp := &pb.BucketDigestResponse{Scheme: corrosion.BucketScheme, BucketCount: corrosion.BucketCount}
+	if req.GetScheme() != corrosion.BucketScheme {
+		return resp, nil
+	}
+	for _, tb := range s.db.TableBucketDigests(ctx, req.GetTables()) {
+		out := &pb.TableBucketDigests{Name: tb.Name, Bucketed: tb.Bucketed}
+		for _, b := range tb.Buckets {
+			out.Buckets = append(out.Buckets, &pb.BucketDigest{
+				Index: uint32(b.Index), Count: int32(b.Count), Hash: b.Hash, HashV2: b.HashV2,
+			})
+		}
+		resp.Tables = append(resp.Tables, out)
+	}
+	return resp, nil
 }
 
 func streamStateDump(data []byte, send func(*pb.StateDumpChunk) error) error {
@@ -263,11 +415,16 @@ func (s *Server) GetSensitiveStateDigest(ctx context.Context, req *pb.SensitiveS
 		return nil, err
 	}
 
-	digests, err := s.db.SensitiveStateDigest(ctx)
+	digest := s.db.SensitiveStateDigestCached
+	if corrosion.FreshDigestRequested(ctx) {
+		digest = s.db.SensitiveStateDigest
+	}
+	digests, err := digest(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return stateDigestResponse(s.hostName, digests, s.db.UnresolvedTieTables()), nil
+	return stateDigestResponse(s.hostName, digests,
+		s.digestTieView(ctx, digests, corrosion.FreshDigestRequested(ctx))), nil
 }
 
 // StreamSensitiveStateDump streams the peer-only sensitive repair dump. It must
@@ -279,7 +436,11 @@ func (s *Server) StreamSensitiveStateDump(req *pb.SensitiveStateRequest, stream 
 	if err := requireReplicationPeer(stream.Context(), req.GetSender()); err != nil {
 		return err
 	}
-	return streamStateDump(s.db.DumpSensitiveStateBytes(), stream.Send)
+	if len(req.GetTables()) == 0 {
+		return streamStateDump(s.db.DumpSensitiveStateBytes(), stream.Send)
+	}
+	return streamStateDump(s.db.DumpSensitiveTablesScopedBytes(req.GetTables(),
+		requestedBuckets(req.GetBucketScheme(), req.GetBuckets())), stream.Send)
 }
 
 // PushMutations receives mutation entries from a peer and applies them locally
@@ -357,8 +518,15 @@ func (s *Server) PushMutations(ctx context.Context, req *pb.ReplicateRequest) (*
 	return &pb.ReplicateResponse{AppliedUpTo: lastSeq}, nil
 }
 
-// AckMutations records that a peer has acknowledged processing mutations
-// up to a given sequence number. This updates the replication_watermarks table.
+// AckMutations is retired and refuses every call. No litevirt release has
+// ever called it: the replicator advances a peer's watermark itself, from the
+// AppliedUpTo of each push it makes (Replicator.replicateOnce). As a second
+// writer of that row it let an authenticated peer move this node's push cursor
+// for it past entries it never received, so they were never sent, or re-ack a
+// low sequence to keep its watermark fresh and hold back log compaction until
+// the retention ceiling (#218). The method stays in the service definition so
+// the wire contract is unchanged; the peer check still runs first, so a
+// non-peer gets the same PermissionDenied as before.
 func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb.Empty, error) {
 	if req.Sender == "" {
 		return nil, status.Error(codes.InvalidArgument, "sender required")
@@ -366,23 +534,8 @@ func (s *Server) AckMutations(ctx context.Context, req *pb.AckRequest) (*emptypb
 	if err := requireReplicationPeer(ctx, req.Sender); err != nil {
 		return nil, err
 	}
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	db := s.db.DB()
-	mu := s.db.Mu()
-
-	mu.Lock()
-	_, err := db.ExecContext(ctx,
-		`INSERT INTO replication_watermarks (peer_name, last_seq, updated_at) VALUES (?, ?, ?)
-		 ON CONFLICT(peer_name) DO UPDATE SET last_seq = excluded.last_seq, updated_at = excluded.updated_at`,
-		req.Sender, req.AckedSeq, now)
-	mu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("update watermark: %w", err)
-	}
-
-	slog.Debug("ackMutations", "sender", req.Sender, "acked_seq", req.AckedSeq)
-	return &emptypb.Empty{}, nil
+	return nil, status.Error(codes.Unimplemented,
+		"AckMutations is retired: the replicator records a peer's watermark from its own pushes")
 }
 
 func requireReplicationPeer(ctx context.Context, sender string) error {

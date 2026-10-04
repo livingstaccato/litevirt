@@ -68,6 +68,13 @@ lv host init root@10.0.50.10 --name host-a
 
 This generates the cluster PKI (CA + host certificate), creates `/etc/litevirt/config.yaml`, and installs a systemd unit.
 
+`lv host init` is for the first host only. It refuses a target that is already a
+member: one whose `join_peers` lists peers, or one whose address the cluster this
+CLI is configured for lists beside other hosts. The second check is what catches
+the first host itself, whose `join_peers` stays empty when later hosts are added
+from a workstation. A member that lost its disk is removed with `lv host rm` and
+added back with `lv host add`.
+
 3. SSH into the host and start the daemon:
 
 ```bash
@@ -80,6 +87,33 @@ systemctl enable --now litevirt
 ```bash
 lv status
 ```
+
+### The first admin password
+
+The cluster's admin account is created exactly once, by the node that founds it.
+`lv host init` (remote or `--local`) writes a founder marker,
+`/var/lib/litevirt/genesis-pending`, but only while that data directory holds no
+`state.db` and no capability latches (`split_brain_activated.*`, which a daemon
+writes once it has run as a member and which survive losing `state.db`). On its first start the daemon creates the `admin` account, writes the
+password to `/etc/litevirt/admin-password` (mode 0600) on that node only, and
+deletes the marker.
+
+No other node creates an admin. A node added with `lv host add` gets the account
+by replication, and has no password file. A node re-initialised with
+`lv host init` after its daemon has run gets no marker, so losing its `state.db`
+later cannot mint a second credential over the cluster's.
+
+If you founded a cluster without `lv host init`, the daemon logs that no admin
+was created. On that founding node only, create the marker and restart:
+
+```bash
+touch /var/lib/litevirt/genesis-pending
+systemctl restart litevirt
+```
+
+The daemon still refuses if `join_peers` is set, any user account has ever
+existed, or the data directory holds capability latches from an earlier run. Do not use `lv user reset-admin` for this: it resets an existing admin
+and never creates one.
 
 ## Add hosts to the cluster
 
@@ -94,6 +128,44 @@ scp bin/litevirt root@10.0.50.11:/usr/local/bin/
 ```bash
 lv host add root@10.0.50.11 --name host-b
 ```
+
+The host is admitted in state `joining` (`HOST_JOINING` in `lv host ls`; a
+server on an older release reports it `HOST_OFFLINE`, and an older `lv` shows
+the number `5`) and
+becomes `active` when its daemon first starts. Until then nothing is placed on
+it and the failover coordinator never fences it, however long its setup takes:
+it is down to every peer by construction, and runs nothing. A host removed
+with `lv host rm` and added back under the same name starts with no failure
+history; every peer forgets the old machine's failed probes when it leaves the
+host table.
+
+Such a host is a new machine to the cluster and inherits nothing the old one
+was configured with: its fencing and IPMI settings, labels, role, region and
+capacity overrides return to their defaults, and its IPMI password is retired
+(already at `lv host rm`). Its `lv host network` intents are dropped too,
+since they name the old machine's NICs and addresses: record the new
+machine's wiring before its first `lv host network apply`. Its host-tier
+firewall rules (`lv firewall host-rule`) are kept: they are policy for guest
+traffic through the host of that name, not a property of the hardware.
+
+Nor does it inherit the old machine's workloads. `lv host add` refuses a name
+while VMs or containers are still recorded on the host removed under it, and
+names them. They are recovered onto live hosts by the claim path for a host
+removed for good, which needs the name to stay removed; wait until they have
+moved (`lv health` shows `ha.claim.stranded` for any that cannot), or remove
+them, and add the host again. `lv rm <vm>` and `lv ct rm <name>` work on a
+workload recorded on a removed host without contacting it: they delete its
+cluster rows and audit the delete as one on a removed host. Nothing on the
+removed machine is touched, and disks on shared storage are kept.
+
+A workload that no live host can take waits until one can. The usual case is a
+container whose host was the only one with a container runtime: it is left on
+the removed host, marked `relocate-skipped`, and the name stays refused. Bring
+up a host that can run it (this machine, added under another name, will do)
+and the coordinator relocates the container onto it by claim, as it would
+have at the failure. The old name is then free to add again. The name itself
+cannot take the container back, because a claim is refused while the host it
+recovers from answers under that name, and a re-added machine does.
 
 3. Edit `/etc/litevirt/config.yaml` on the new host to set the join address:
 

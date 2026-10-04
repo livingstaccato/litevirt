@@ -95,7 +95,7 @@ func TestImageRecreateProofCarriesOwnerEpoch(t *testing.T) {
 		supports: map[string]bool{"live": true},
 		enforced: map[string]bool{capabilities.SplitBrainGateV1: true},
 	}
-	c.imageRecreateOrSkip(ctx, &corrosion.HostRecord{Name: "dead"}, *ct, "live")
+	c.imageRecreateOrSkip(ctx, &corrosion.HostRecord{Name: "dead"}, *ct, "live", nil)
 
 	rows, err := db.Query(ctx, `SELECT owner_epoch, relocation_token FROM runtime_action_proofs WHERE target_name = 'ct1'`)
 	if err != nil || len(rows) != 1 {

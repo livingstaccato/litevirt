@@ -23,6 +23,30 @@ func ensureObserverHost(t *testing.T, db *corrosion.Client, name string) {
 	}
 }
 
+// ensureVoter makes name a voting member unless a live host row of that name
+// already exists. Only a voter's host_health row counts toward quorum
+// (corrosion.VoterSet), and many fixtures vote as "coordinator" — which in a
+// real cluster is always a host. It is added as a WITNESS so it votes but is
+// never a placement candidate, leaving each fixture's reschedule target as it
+// was.
+func ensureVoter(t *testing.T, db *corrosion.Client, name string) {
+	t.Helper()
+	ctx := context.Background()
+	h, err := corrosion.GetHost(ctx, db, name)
+	if err != nil {
+		t.Fatalf("GetHost %s: %v", name, err)
+	}
+	if h != nil {
+		return
+	}
+	if err := corrosion.InsertHost(ctx, db, corrosion.HostRecord{
+		Name: name, Address: "10.0.9.250", SSHUser: "root", SSHPort: 22,
+		GRPCPort: 7443, State: "active", FenceStrategy: "manual", Role: "witness",
+	}); err != nil {
+		t.Fatalf("InsertHost %s: %v", name, err)
+	}
+}
+
 func newTestDB(t *testing.T) *corrosion.Client {
 	t.Helper()
 	c := corrosion.NewTestClientT(t)
@@ -89,13 +113,15 @@ func TestCoordinator_FailedHost_MarkedOffline(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 
-	// Simulate health check failures exceeding the threshold.
-	for i := 0; i < offlineThreshold; i++ {
+	// Simulate health check failures exceeding the threshold, from both of
+	// the other voters.
+	for _, o := range []string{"coordinator", "witness"} {
+		ensureVoter(t, db, o)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-			"coordinator", "bad-host", offlineThreshold,
+			o, "bad-host", offlineThreshold,
 		); err != nil {
 			t.Fatalf("insert health row: %v", err)
 		}
@@ -331,6 +357,7 @@ func TestCoordinator_VMsRescheduled(t *testing.T) {
 
 	// Trigger health failure threshold — need quorum (2 observers for 2 active hosts).
 	for _, observer := range []string{"coordinator", "good"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -356,6 +383,10 @@ func TestCoordinator_VMsRescheduled(t *testing.T) {
 	}
 }
 
+// A VM whose on_host_failure is "none" stays on its host when that host is
+// fenced. The fence has to really happen for that to mean anything: a fixture
+// that never reaches quorum leaves every VM where it was whatever its policy
+// says, so this asserts the fence fired before it asserts the VM did not move.
 func TestCoordinator_VMWithNonePolicy_NotRescheduled(t *testing.T) {
 	db := newTestDB(t)
 	ctx := context.Background()
@@ -382,25 +413,43 @@ func TestCoordinator_VMWithNonePolicy_NotRescheduled(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	if err := db.Execute(ctx,
-		`INSERT OR REPLACE INTO host_health
-		 (observer, target, status, consecutive_failures, last_seen, updated_at)
-		 VALUES ('coordinator', 'dying', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-		offlineThreshold,
-	); err != nil {
-		t.Fatalf("insert health: %v", err)
+	// Three voters (dying, alive, and the coordinator as a witness), so the
+	// quorum is 2 and the two other voters reach it.
+	for _, observer := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, observer)
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health
+			 (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, 'dying', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+			observer, offlineThreshold,
+		); err != nil {
+			t.Fatalf("insert health: %v", err)
+		}
 	}
 
-	c := NewCoordinator("coordinator", db)
+	// A succeeding fencer, so the split-brain guard lets recovery run and the
+	// policy is the only thing left to keep the VM in place.
+	c := newTestCoordinator("coordinator", db)
+	var fencedHosts []string
+	c.OnFence = func(host, _, _, _ string) { fencedHosts = append(fencedHosts, host) }
 	c.run(ctx)
+
+	if len(fencedHosts) != 1 || fencedHosts[0] != "dying" {
+		t.Fatalf("expected exactly one fence of 'dying', got %v", fencedHosts)
+	}
+	if h, _ := corrosion.GetHost(ctx, db, "dying"); h == nil || h.State != "fenced" {
+		t.Fatalf("expected 'dying' to be fenced, got %+v", h)
+	}
 
 	vm, _ := corrosion.GetVM(ctx, db, "sticky-vm")
 	if vm == nil {
 		t.Fatal("VM disappeared")
 	}
-	// Should still be on the original host (not rescheduled).
 	if vm.HostName != "dying" {
-		t.Errorf("VM should not have been rescheduled, but moved to %q", vm.HostName)
+		t.Errorf("VM with on_host_failure=none must not be rescheduled, but moved to %q", vm.HostName)
+	}
+	if vm.State != "running" {
+		t.Errorf("VM with on_host_failure=none must be left as it was, got state %q", vm.State)
 	}
 }
 
@@ -436,6 +485,7 @@ func TestCoordinator_FencingFailureBlocksReschedule(t *testing.T) {
 
 	// Quorum of observers report failure.
 	for _, observer := range []string{"coordinator", "healthy"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -479,13 +529,16 @@ func TestCoordinator_NoDoubleFailover(t *testing.T) {
 		t.Fatalf("InsertHost: %v", err)
 	}
 
-	if err := db.Execute(ctx,
-		`INSERT OR REPLACE INTO host_health
-		 (observer, target, status, consecutive_failures, last_seen, updated_at)
-		 VALUES ('coordinator', 'flaky', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-		offlineThreshold,
-	); err != nil {
-		t.Fatalf("insert health: %v", err)
+	for _, o := range []string{"coordinator", "witness"} {
+		ensureVoter(t, db, o)
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health
+			 (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, 'flaky', 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
+			o, offlineThreshold,
+		); err != nil {
+			t.Fatalf("insert health: %v", err)
+		}
 	}
 
 	c := NewCoordinator("coordinator", db)
@@ -571,6 +624,7 @@ func TestCoordinator_MixedVMContainerPoliciesWithPlacementConstraints(t *testing
 			t.Fatalf("SetHostLabel %s: %v", host, err)
 		}
 	}
+	runsContainers(t, db, "node-a", "node-b", "wrong-zone")
 	if err := corrosion.InsertVM(ctx, db, corrosion.VMRecord{
 		Name: "db", HostName: "node-a", State: "running", CPUActual: 1, MemActual: 1024,
 	}, nil, nil); err != nil {
@@ -672,6 +726,7 @@ func TestCoordinator_NoEligibleHost_SkipsInsteadOfRoundRobin(t *testing.T) {
 
 	// Quorum failure for "bad".
 	for _, observer := range []string{"coordinator", "tiny"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -815,6 +870,7 @@ func TestCoordinator_ManualFenceWithoutConfirmation_BlocksReschedule(t *testing.
 		t.Fatalf("InsertVM: %v", err)
 	}
 	for _, observer := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -871,6 +927,7 @@ func TestCoordinator_ManualFenceWithConfirmation_Reschedules(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	for _, observer := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, observer)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health
 			 (observer, target, status, consecutive_failures, last_seen, updated_at)
@@ -899,9 +956,17 @@ func TestCoordinator_ManualFenceWithConfirmation_Reschedules(t *testing.T) {
 	// (it's treated as already fenced). The VM is *not* rescheduled by this
 	// cycle alone; the operator-side flow is expected to also update the host
 	// state to 'fenced' or 'offline'. So we assert the safe behavior:
-	// recentlyFenced suppresses re-processing.
-	if !c.fenced["manual-host"] {
-		t.Error("expected coordinator to mark manual-host as already-fenced via recentlyFenced")
+	// recentlyFenced suppresses the fence and moves nothing. It does not
+	// CACHE the skip (c.fenced): the state write may simply not have arrived
+	// yet, and a cached skip would never read it (run's recently-fenced skip).
+	if n := fenceLogCount(t, db, "manual-host"); n != 1 {
+		t.Errorf("fencing_log rows for manual-host = %d, want 1: recentlyFenced must suppress the fence", n)
+	}
+	if vm, err := corrosion.GetVM(ctx, db, "vm-pending"); err != nil || vm == nil || vm.HostName != "manual-host" {
+		t.Errorf("vm-pending moved on a confirmation alone, with the host still 'active' (vm=%+v err=%v)", vm, err)
+	}
+	if c.fenced["manual-host"] {
+		t.Error("the recently-fenced skip was cached; a 'fenced' state arriving next cycle would never be read")
 	}
 }
 

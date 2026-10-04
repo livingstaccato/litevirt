@@ -47,30 +47,11 @@ func (r *Reconciler) stopSyncAllowed(ctx context.Context, name string) bool {
 
 // replicaTrusted reports whether decisions read from this node's replica may be
 // published. Unwired (nil) means trusted, for tests that do not exercise it; the
-// daemon always wires it.
-//
-// A cluster of one is trusted without a catch-up: there is no peer to catch up
-// with and no other host that could own the workload. "Of one" is read from the
-// local hosts table — any other admitted host, reachable or not, means another
-// owner is possible and the gate holds.
+// daemon always wires it. The policy, including the cluster-of-one exemption,
+// is corrosion.ReplicaTrusted — shared with grpcapi's gate on client-facing
+// workload mutations.
 func (r *Reconciler) replicaTrusted(ctx context.Context) (bool, string) {
-	if r.replicaCaughtUp == nil {
-		return true, ""
-	}
-	ok, why := r.replicaCaughtUp()
-	if ok {
-		return true, ""
-	}
-	hosts, err := corrosion.ListHosts(ctx, r.db)
-	if err != nil {
-		return false, why + " (and the hosts table could not be read to rule out a single-node cluster: " + err.Error() + ")"
-	}
-	for _, h := range hosts {
-		if h.Name != r.hostName {
-			return false, why
-		}
-	}
-	return true, ""
+	return corrosion.ReplicaTrusted(ctx, r.db, r.hostName, r.replicaCaughtUp)
 }
 
 // noteStopSyncDeferred logs a deferral the first time it happens for this VM

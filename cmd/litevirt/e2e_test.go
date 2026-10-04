@@ -129,6 +129,11 @@ func newMockClient() *mockClient {
 
 // ── Host RPCs ──
 
+// GetVoterConfig: no voter generation, so `lv host rm` proceeds.
+func (m *mockClient) GetVoterConfig(_ context.Context, _ *pb.GetVoterConfigRequest, _ ...grpc.CallOption) (*pb.GetVoterConfigResponse, error) {
+	return &pb.GetVoterConfigResponse{}, nil
+}
+
 func (m *mockClient) ListHosts(_ context.Context, _ *pb.ListHostsRequest, _ ...grpc.CallOption) (*pb.ListHostsResponse, error) {
 	return &pb.ListHostsResponse{Hosts: m.hosts}, nil
 }
@@ -597,8 +602,8 @@ func (m *mockClient) LBStats(_ context.Context, _ *pb.LBStatsRequest, _ ...grpc.
 func (m *mockClient) EnsureCloudInit(_ context.Context, _ *pb.EnsureCloudInitRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
-func (m *mockClient) EnsureDisks(_ context.Context, _ *pb.EnsureDisksRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
-	return &emptypb.Empty{}, nil
+func (m *mockClient) EnsureDisks(_ context.Context, _ *pb.EnsureDisksRequest, _ ...grpc.CallOption) (*pb.EnsureDisksResponse, error) {
+	return &pb.EnsureDisksResponse{}, nil
 }
 func (m *mockClient) CleanupMigrationArtifacts(_ context.Context, _ *pb.CleanupMigrationArtifactsRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil

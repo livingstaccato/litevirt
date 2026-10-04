@@ -67,6 +67,8 @@ type Fake struct {
 	reasons                map[string]string // domain → injected DomainStateReason.Reason
 	managedSave            map[string]bool   // domain → has a managed-save (suspend-to-disk) image
 	ownerEpochs            map[string]int64  // domain → Phase 4 owner-epoch metadata marker
+	managed                map[string]bool   // domain → litevirt managed-stamp metadata
+	managedInc             map[string]string // domain → the managed stamp's incarnation attribute
 	events                 []Event
 
 	// eventCB is the domain lifecycle callback registered by
@@ -107,6 +109,10 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// FailSuspendDomain / FailResumeDomain inject a pause/resume failure
+	// (partition pause, docs/design/partition-pause.md §3.4).
+	FailSuspendDomain func(name string) error
+	FailResumeDomain  func(name string) error
 	// FailListDomains makes domain enumeration fail — the shape of a libvirtd
 	// outage, which marks the host's runtime inventory INCOMPLETE and must
 	// refuse new residency at admission time.
@@ -207,6 +213,10 @@ type Fake struct {
 	pendingUnplug map[string][]func()
 	// unplugRequests counts detach requests per domain, for HonorUnplugOnRequest.
 	unplugRequests map[string]int
+
+	// OnAbortMigration runs on every AbortMigration, after it is recorded.
+	OnAbortMigration  func(name string)
+	abortedMigrations map[string]int
 }
 
 // New returns a Fake ready to use. Safe for concurrent use.
@@ -403,6 +413,61 @@ func (f *Fake) StartDomain(name string) error {
 	return nil
 }
 
+// SuspendDomain pauses a RUNNING domain: it stays active (StatePaused) and
+// DomainStateReason reports reason "paused", as libvirt does. Suspending a
+// domain that is not running is an error, as in libvirt.
+func (f *Fake) SuspendDomain(name string) error {
+	if f.FailSuspendDomain != nil {
+		if err := f.FailSuspendDomain(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StateRunning {
+		return fmt.Errorf("libvirtfake: domain %q is not running (%s)", name, st)
+	}
+	f.domains[name] = StatePaused
+	f.record("suspend", name, "")
+	return nil
+}
+
+// ResumeDomain resumes a PAUSED domain. Resuming a domain that is not paused
+// is an error, as in libvirt.
+func (f *Fake) ResumeDomain(name string) error {
+	if f.FailResumeDomain != nil {
+		if err := f.FailResumeDomain(name); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[name]
+	if !ok {
+		return fmt.Errorf("libvirtfake: domain %q not defined", name)
+	}
+	if st != StatePaused {
+		return fmt.Errorf("libvirtfake: domain %q is not paused (%s)", name, st)
+	}
+	f.domains[name] = StateRunning
+	f.record("resume", name, "")
+	return nil
+}
+
+// RawState reports the fake's own state for a domain — running, paused or
+// shutoff — without libvirt's coarse folding. ok=false when undefined.
+// Scenario helper: "is this copy executing right now" is RawState == running.
+func (f *Fake) RawState(name string) (State, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.domains[name]
+	return s, ok
+}
+
 func (f *Fake) BlockPull(domain, disk string) error {
 	if f.FailBlockPull != nil {
 		if err := f.FailBlockPull(domain, disk); err != nil {
@@ -468,6 +533,11 @@ func (f *Fake) UndefineDomain(name string, removeStorage bool) error {
 	delete(f.snapshots, name)
 	delete(f.stats, name)
 	delete(f.managedSave, name)
+	// Domain metadata lives and dies with the definition, as in libvirt: a later
+	// domain that reuses the name starts with none.
+	delete(f.ownerEpochs, name)
+	delete(f.managed, name)
+	delete(f.managedInc, name)
 	f.record("undefine", name, fmt.Sprintf("remove_storage=%v", removeStorage))
 	return nil
 }
@@ -499,6 +569,8 @@ func (f *Fake) UndefineDomainPreservingState(name string) error {
 	delete(f.activeXML, name)
 	delete(f.snapshots, name)
 	delete(f.stats, name)
+	delete(f.ownerEpochs, name)
+	delete(f.managed, name)
 	f.record("undefine", name, "keep_state=true")
 	return nil
 }
@@ -1205,7 +1277,10 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.record("migrate", name, "to="+dconnuri)
+	// The parameters a test asserts on: whether the disks were copied, and
+	// which ones (libvirt's migrate_disks; empty means every writable disk).
+	f.record("migrate", name, fmt.Sprintf("to=%s with_storage=%t disks=%s",
+		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ",")))
 	return nil
 }
 
@@ -1582,4 +1657,82 @@ func (f *Fake) GetDomainOwnerEpoch(name string) (int64, bool, error) {
 	}
 	e, ok := f.ownerEpochs[name]
 	return e, ok, nil
+}
+
+// SetDomainManaged / GetDomainManaged mirror the managed-stamp metadata
+// element (internal/libvirt/managed_stamp.go). It dies with the domain on
+// undefine, as the real metadata does.
+func (f *Fake) SetDomainManaged(name string, running bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("domain %q not found", name)
+	}
+	if f.managed == nil {
+		f.managed = make(map[string]bool)
+	}
+	f.managed[name] = true
+	return nil
+}
+
+// SetDomainManagedIncarnation writes the managed stamp with its incarnation
+// attribute; GetDomainManagedIncarnation reads it back.
+func (f *Fake) SetDomainManagedIncarnation(name, incarnation string, running bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return fmt.Errorf("domain %q not found", name)
+	}
+	if f.managed == nil {
+		f.managed = make(map[string]bool)
+	}
+	if f.managedInc == nil {
+		f.managedInc = make(map[string]string)
+	}
+	f.managed[name] = true
+	f.managedInc[name] = incarnation
+	return nil
+}
+
+func (f *Fake) GetDomainManagedIncarnation(name string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return "", false, fmt.Errorf("domain %q not found", name)
+	}
+	inc := f.managedInc[name]
+	return inc, inc != "", nil
+}
+
+func (f *Fake) GetDomainManaged(name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.domains[name]; !ok {
+		return false, fmt.Errorf("domain %q not found", name)
+	}
+	return f.managed[name], nil
+}
+
+// AbortMigration records an abort of name's migration job and runs
+// OnAbortMigration, which a scenario uses to make its blocked MigrateToTarget
+// return the way a real abort makes it return.
+func (f *Fake) AbortMigration(name string) error {
+	f.mu.Lock()
+	if f.abortedMigrations == nil {
+		f.abortedMigrations = map[string]int{}
+	}
+	f.abortedMigrations[name]++
+	hook := f.OnAbortMigration
+	f.mu.Unlock()
+	if hook != nil {
+		hook(name)
+	}
+	return nil
+}
+
+// AbortedMigrations is how many times AbortMigration was called for name.
+func (f *Fake) AbortedMigrations(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.abortedMigrations[name]
 }

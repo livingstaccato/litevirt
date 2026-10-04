@@ -96,7 +96,24 @@ import (
 // upsert_binding_pre_tombstone_guard family. It is an ADDITION — a shape this
 // tree stopped emitting but a supported peer still sends — and no previously
 // accepted historical identity was removed or changed.
-const compatibilityDigest = "29a8bdab50aaf373dcb84f26d10267a3325d7d391b9006d9b0d28684f7272acc"
+// Updated again for claimProofFencedSQL: ClaimActionProofFenced stopped
+// relaying it at 431c3a92, but its entry stayed in the generated ledger only
+// because nobody regenerated, since stmtshapecheck reads call sites and keeping
+// the const kept nothing. It was ADDED as claim_proof_fenced_not_exists_fork,
+// whose emitters are unreleased fork builds that may have run on the lab. No
+// previously accepted historical identity was removed or changed.
+// Updated again for the credentials split going two-release: the first
+// credentials_split_v1 build cleared users.password_hash and tokens.token_hash
+// after the latch, and this tree stopped emitting those clears (it dual-writes
+// instead). They moved from the current ledger to the credentials_split_clear_v56
+// family, receive-only, for a host still on that build. An ADDITION; no
+// previously accepted historical identity was removed or changed.
+// Updated again when VM create started recording each disk's bus: the create's
+// narrow vm_disks INSERT moved from the current ledger to the
+// vm_disks_create_insert_v130 family, receive-only, for peers that still create
+// VMs with it. An ADDITION; no previously accepted historical identity was
+// removed or changed.
+const compatibilityDigest = "d9c4360a0a7542b61354f249c2a53c5f84ec26e8d814cb463282ba6422ab9742"
 
 // computeCompatibilityDigest hashes the sorted identity tuples of the historical shapes and
 // legacy transformers.
@@ -141,6 +158,7 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"vm_rename_v130":                        3,   // vm_interfaces / vm_disks / ip_allocations
 	"network_rename_v130":                   3,   // network_vteps / ip_allocations / vm_interfaces
 	"vm_disks_insert_v130":                  1,   // pre-hardware-foundation vm_disks upsert (narrower column list)
+	"vm_disks_create_insert_v130":           1,   // VM create's vm_disks insert before it recorded the bus
 	"insert_host_v130":                      1,   // pre-capacity-policy hosts insert (narrower column list)
 	"insert_host_v43":                       1,   // capacity overrides present, before v44 capacity-policy fingerprint
 	"configure_host_fixed_v130":             1,   // pre-capacity-policy fixed ConfigureHost UPDATE (7 COALESCE columns)
@@ -162,6 +180,8 @@ var supportedReleaseFamilyManifest = map[string]int{
 	"proof_insert_pre_lease_term_v51":       1,   // proof insert before the fencing term column (v51 and earlier)
 	"proof_insert_pre_lease_key_v52":        1,   // proof insert with lease_term but before lease_key (v52)
 	"upsert_binding_pre_tombstone_guard":    1,   // UpsertBinding before `AND deleted_at IS NULL` stopped it resurrecting a released prefix
+	"claim_proof_fenced_not_exists_fork":    1,   // fenced claim with its fence as a receiver-evaluated NOT EXISTS (fork 39c75474..a0037a7e)
+	"credentials_split_clear_v56":           2,   // first credentials_split_v1 build's users/tokens old-column clears, before the split went dual-write
 }
 
 // supportedLegacyTransformerIDs pins the legacy transformers frozen for legacyTransformerHorizon.

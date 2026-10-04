@@ -23,6 +23,25 @@ type fakeSyncMetrics struct {
 	legacyTransformed       []string // "transformer"
 	identityOrphan          []string // "table"
 	unresolvedCurrent       int      // last current-unresolved gauge value
+	digestCached            int      // tables served from the digest cache
+	digestComputed          int      // tables scanned for a digest
+	pullRows                map[string]int
+}
+
+func (f *fakeSyncMetrics) ObserveDigestTables(cached, computed int) {
+	f.mu.Lock()
+	f.digestCached += cached
+	f.digestComputed += computed
+	f.mu.Unlock()
+}
+
+func (f *fakeSyncMetrics) ObservePullRows(scope string, rows int) {
+	f.mu.Lock()
+	if f.pullRows == nil {
+		f.pullRows = map[string]int{}
+	}
+	f.pullRows[scope] += rows
+	f.mu.Unlock()
 }
 
 func (f *fakeSyncMetrics) ObserveDump(time.Duration, int) { f.mu.Lock(); f.dumps++; f.mu.Unlock() }

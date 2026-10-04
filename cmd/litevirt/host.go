@@ -35,11 +35,14 @@ func newHostCmd() *cobra.Command {
 		newHostConfigCmd(),
 		newHostRescanCmd(),
 		newHostDevicesCmd(),
+		newHostSupersededDisksCmd(),
 		newHostUpgradeCmd(),
 		newHostPreflightUpgradeCmd(),
 		newHostStatsCmd(),
 		newHostCephCmd(),
 		newHostRotateAuditKeyCmd(),
+		newHostInstallGossipKeyCmd(),
+		newHostRotateGossipKeyCmd(),
 		newHostRetireAuditKeyCmd(),
 		newHostPublishCRLCmd(),
 		newHostNetworkCmd(),
@@ -71,7 +74,9 @@ advertise_address.
 
 init refuses a target that is already a cluster member, because it rewrites the
 whole config.yaml and would reset join_peers to []. Use "lv host add" to add a
-node to an existing cluster; --force re-initialises a member anyway.`,
+node to an existing cluster; --force re-initialises a member anyway. A founder's
+own join_peers is empty, so init also asks the cluster this CLI is configured for,
+and refuses an address that cluster lists beside other hosts.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if local {
@@ -79,6 +84,11 @@ node to an existing cluster; --force re-initialises a member anyway.`,
 			}
 			if len(args) == 0 {
 				return fmt.Errorf("SSH target required (or use --local for standalone setup)")
+			}
+			// A founder's own join_peers is empty, so the target-side check
+			// cannot tell it from a half-finished first node; the cluster can.
+			if err := cli.RefuseInitOfAClusterMember(cmd.Context(), args[0], force); err != nil {
+				return err
 			}
 			return cli.HostInit(cmd.Context(), args[0], name, force)
 		},
@@ -324,18 +334,36 @@ the cluster has published.`,
 }
 
 func newHostRmCmd() *cobra.Command {
-	var force bool
+	var force, dead, dryRun bool
 	cmd := &cobra.Command{
 		Use:   "rm <host>",
 		Short: "Remove host from cluster",
-		Args:  cobra.ExactArgs(1),
+		Long: `Removes a host: revokes its certificate, publishes the CRL, and deletes its row.
+
+--dead removes a host that is fenced proof-grade and gone for good, so the
+recoveries decided for it can move on (recovery claims, docs/design/recovery-claims.md
+§3.12). It refuses unless the host has an IPMI power-off or an operator
+'lv host fence-confirm' recorded; removes it from the voter set first if it is a
+member; revokes and publishes as 'lv host rm' does; and reports how many
+stranded recoveries will retry. Its workloads need no --force: they are the
+stranded ones. --dry-run runs every check and prints the plan without changing
+anything.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if dryRun && !dead {
+				return fmt.Errorf("--dry-run applies to --dead")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if dead {
+					return cli.HostRemoveDead(ctx, c, args[0], dryRun)
+				}
 				return cli.HostRemove(ctx, c, args[0], force)
 			})
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "Force removal even if VMs exist")
+	cmd.Flags().BoolVar(&dead, "dead", false, "Remove a host that is fenced proof-grade and gone for good, unblocking recoveries decided for it")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "With --dead: run every check and print the plan, changing nothing")
 	return cmd
 }
 
@@ -514,6 +542,7 @@ func newHostConfigCmd() *cobra.Command {
 	var fenceStrategy, ipmiAddr, ipmiUser, ipmiPass, watchdogDev, role, region string
 	var cpuOvercommit, memOvercommit float64
 	var cpuReserve, memReserveMiB int
+	var clearIPMI bool
 
 	cmd := &cobra.Command{
 		Use:   "config <host>",
@@ -530,6 +559,7 @@ func newHostConfigCmd() *cobra.Command {
 					WatchdogDev:   watchdogDev,
 					Role:          role,
 					Region:        region,
+					ClearIpmi:     clearIPMI,
 				}
 				// Send capacity overrides only when the operator actually passed the
 				// flag: an omitted numeric flag is 0, which for a reserve is a REAL
@@ -551,6 +581,11 @@ func newHostConfigCmd() *cobra.Command {
 				h, err := c.ConfigureHost(ctx, out)
 				if err != nil {
 					return fmt.Errorf("configure host: %w", err)
+				}
+				if clearIPMI {
+					if err := checkIPMICleared(h); err != nil {
+						return err
+					}
 				}
 				fmt.Printf("Host %s configured.\n", h.Name)
 				return nil
@@ -576,8 +611,25 @@ func newHostConfigCmd() *cobra.Command {
 		"vCPUs held back for the host itself (negative = inherit the cluster default).")
 	cmd.Flags().IntVar(&memReserveMiB, "mem-reserve", 0,
 		"MiB held back for the host itself (negative = inherit). 0 means hand guests every last MiB — the host gets no headroom.")
+	cmd.Flags().BoolVar(&clearIPMI, "clear-ipmi", false,
+		"Remove the host's IPMI address, user and password (an empty --ipmi-* flag leaves them alone). A host that fences by ipmi needs another --fence-strategy with it.")
+	for _, f := range []string{"ipmi-address", "ipmi-user", "ipmi-pass"} {
+		cmd.MarkFlagsMutuallyExclusive("clear-ipmi", f)
+	}
 
 	return cmd
+}
+
+// checkIPMICleared confirms a --clear-ipmi took effect. A server that predates
+// clear_ipmi ignores the field: alone it refuses ("no fields to update"), but
+// beside another setting it applies that one and returns the host with its
+// IPMI settings intact.
+func checkIPMICleared(h *pb.Host) error {
+	if h.GetIpmiAddress() != "" {
+		return fmt.Errorf("host %s still has IPMI address %s: the server did not clear it (it may predate "+
+			"--clear-ipmi; retry once every host is upgraded)", h.GetName(), h.GetIpmiAddress())
+	}
+	return nil
 }
 
 func newHostRescanCmd() *cobra.Command {

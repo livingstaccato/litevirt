@@ -18,6 +18,8 @@ type fakeMetrics struct {
 	// different assertion from its value: a read failure must leave the last
 	// measured value in place rather than publish a number nobody measured.
 	strandedSets int
+	// regionsWithoutQuorum is the last RegionsWithoutQuorum value.
+	regionsWithoutQuorum int
 }
 
 func newFakeMetrics() *fakeMetrics {
@@ -30,6 +32,7 @@ func (f *fakeMetrics) Attempt(p, r, e string)         { f.attempts[foKey(p, r, e
 func (f *fakeMetrics) VMAction(a, r, e string)        { f.vm[foKey(a, r, e)]++ }
 func (f *fakeMetrics) ContainerAction(a, r, e string) { f.ct[foKey(a, r, e)]++ }
 func (f *fakeMetrics) StrandedWorkloads(n int)        { f.stranded = n; f.strandedSets++ }
+func (f *fakeMetrics) RegionsWithoutQuorum(n int)     { f.regionsWithoutQuorum = n }
 
 // TestFailoverMetrics_SkipUpgrading: a recently-'upgrading' host is skipped, and
 // that skip is observable.
@@ -145,13 +148,17 @@ func TestFailoverMetrics_NoCandidates(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	// Single observer "coordinator" (not a host row), so "bad" is the only host →
-	// no healthy candidate after fencing it.
-	for i := 0; i < offlineThreshold; i++ {
+	// The other two voters are draining — they vote, but are not 'active' —
+	// so there is no healthy candidate after fencing "bad".
+	for _, o := range []string{"coordinator", "witness"} {
+		ensureVoter(t, db, o)
+		if err := corrosion.UpdateHostState(ctx, db, o, "draining"); err != nil {
+			t.Fatal(err)
+		}
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, ?, 'suspect', ?, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`,
-			"coordinator", "bad", offlineThreshold); err != nil {
+			o, "bad", offlineThreshold); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -207,6 +214,7 @@ func TestFailoverMetrics_Relocate(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	runsContainers(t, db, "live")
 	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
 		HostName: "dead", Name: "web", State: "running", Image: "alpine:3.19",
 		CPULimit: 1, MemMiB: 128, Project: "p1", OnHostFailure: "image-recreate",
@@ -279,7 +287,7 @@ func TestFailoverMetrics_RecoveryQuorumQueryErrorObservable(t *testing.T) {
 	c := newTestCoordinator("coordinator", db)
 	fm := newFakeMetrics()
 	c.Metrics = fm
-	c.recoverHosts(ctx, 1)
+	c.recoverHosts(ctx, quorumView{vr: corrosion.VoterRegionSets{Voters: map[string]bool{"coordinator": true}}})
 
 	if got := fm.attempts[foKey(PhaseRecovery, ResultError, ErrDBError)]; got != 1 {
 		t.Errorf("recovery-query-error counter = %d, want 1 (attempts=%v)", got, fm.attempts)

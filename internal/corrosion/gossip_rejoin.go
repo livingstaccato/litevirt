@@ -3,24 +3,54 @@ package corrosion
 import (
 	"context"
 	"log/slog"
-	"math/rand"
+	"maps"
+	"net"
 	"slices"
+	"strings"
 	"time"
 )
 
-// rejoinInterval is how often an ISOLATED node retries the cluster. Jittered so
-// N nodes coming back from the same partition do not dial in lockstep.
+// rejoinInterval is how often the membership loop runs a pass: an ISOLATED node
+// retries the cluster, and a node missing some listed hosts dials those.
+// Jittered so N nodes coming back from the same partition do not dial in
+// lockstep.
 const rejoinInterval = 30 * time.Second
 
-// rejoiner re-joins the gossip cluster when this node can no longer see anyone.
+// remergeMaxSkip caps the per-host backoff of the re-merge pass: a host that
+// stays missing is dialled at most once every remergeMaxSkip+1 passes (about
+// 2–3 minutes at the default interval). It is a cap, not an exponential without
+// end, because the same backoff is what a healed partition waits out: a
+// partition that lasted an hour must still re-merge within one capped wait.
+const remergeMaxSkip = 3
+
+// remergeMaxDials caps the hosts one re-merge pass dials. Each dial to a dead
+// host can wait out memberlist's TCP timeout (10 s on the LAN profile), so a
+// pass over K dead hosts would otherwise block the loop for K×10 s; capped, it
+// blocks for at most remergeMaxDials of them, and the rest are next pass's.
+const remergeMaxDials = 3
+
+// rejoiner keeps this node's gossip view joined to the cluster the hosts table
+// describes.
 //
 // list.Join runs once, at startup, and a failure is logged and stepped over.
 // Peer discovery for replication and anti-entropy both derive from Members(),
 // so a node whose seeds were unavailable at boot -- or whose membership aged out
-// across a long partition -- has an empty peer set for as long as the process
+// across a long partition -- would keep that view for as long as the process
 // lives. Anti-entropy cannot repair against a peer it never discovers, and the
 // only known cure was a rolling daemon restart, because a restart was the only
-// thing that ever called Join again.
+// thing that ever called Join again. There are two triggers:
+//
+// ISOLATED — this node can see no one. It dials every seed and every admitted
+// host (tick).
+//
+// MISSING — this node sees peers, but a host the cluster still lists as a
+// member is absent from gossip. It dials those hosts only (remerge). This is
+// the healed partition: in a 2|3 split neither side is empty, and memberlist
+// does not re-merge two live clusters by itself — each side declares the other
+// dead, reaps it after GossipToTheDeadTime, and nobody dials it again. The
+// kvm003 drill of 2026-10-02 left the halves apart for more than eight minutes
+// after the heal, the minority never receiving the majority's fence row, moved
+// VM or claim proof, until a daemon restart called Join.
 //
 // The seams are fields so the policy is testable without a real memberlist: the
 // interesting behaviour is WHEN it dials and WHAT it dials, neither of which
@@ -29,14 +59,65 @@ type rejoiner struct {
 	peerCount func() int
 	targets   func() []string
 	join      func([]string) (int, error)
+	// missing lists the hosts the cluster lists as members that this node's
+	// gossip view does not show. Nil disables the re-merge pass.
+	missing func() ([]remergeTarget, error)
+	// backoff is the re-merge pass's per-host state, keyed by host name. Only
+	// hosts currently missing have an entry.
+	backoff map[string]*remergeBackoff
+}
+
+// remergeTarget is one listed host absent from gossip, and where to dial it.
+type remergeTarget struct {
+	Name string
+	Addr string
+}
+
+// remergeBackoff is one missing host's place in the re-merge backoff.
+type remergeBackoff struct {
+	failures int // consecutive dials after which it was still missing
+	wait     int // passes still to skip before dialling it again
+}
+
+// remergeKind is what became of one dialled host.
+type remergeKind int
+
+const (
+	// remergeRecovered: gossip shows the host after the dial.
+	remergeRecovered remergeKind = iota
+	// remergeUnreachable: the dial itself failed — nothing answered there.
+	remergeUnreachable
+	// remergeNotAdmitted: something answered the dial, but the host is still
+	// not a member — refused by gossip admission on one end, a different host
+	// answering at that address, or a member not yet re-admitted after
+	// refuting its own death.
+	remergeNotAdmitted
+)
+
+// remergeOutcome is one dialled host and what became of it.
+type remergeOutcome struct {
+	Name, Addr string
+	Kind       remergeKind
+	Err        error // the host's own dial error; nil unless remergeUnreachable
+	// Wait is how many passes it will be skipped before the next dial.
+	Wait int
+}
+
+// remergeResult is what one re-merge pass did.
+type remergeResult struct {
+	outcomes  []remergeOutcome // every host dialled this pass, in dial order
+	recovered []string         // hosts gossip shows after the pass, dialled or not
+	// err is a failed membership read: the pass was skipped, or stopped
+	// without judging the dial it had just made.
+	err error
 }
 
 // tick performs at most one re-join attempt.
 //
-// It dials only when the visible peer set is EMPTY. A node that can already see
-// peers has nothing to rediscover, and re-joining on a timer regardless would
-// add exactly the O(N) periodic chatter that makes the fleet's sizing claim
-// hard to defend.
+// It dials only when the visible peer set is EMPTY; a node that can see peers is
+// remerge's business, which dials the missing hosts and nothing else.
+// Re-joining every seed on a timer regardless would add exactly the O(N)
+// periodic chatter that makes the fleet's sizing claim hard to defend.
 func (r *rejoiner) tick() (attempted bool, joined int, err error) {
 	if r.peerCount() > 0 {
 		return false, 0, nil
@@ -81,8 +162,229 @@ func rejoinTargets(seeds []string, hosts []HostRecord, selfName, selfAddr string
 	return out
 }
 
+// remerge performs at most one re-merge pass: dial the listed hosts gossip does
+// not show, each on its own backoff.
+//
+// The cost is O(missing), not O(N): a healthy cluster dials nobody. A host that
+// is dead but was never removed is backed off to one dial every
+// remergeMaxSkip+1 passes, so it costs a bounded dial per interval for as long
+// as it stays listed; one that comes back, by our dial or the other side's, is
+// forgotten.
+//
+// Each host is its own dial, so one dead host cannot hold up the rest or lend
+// them its error. Hosts due this pass are dialled newest-missing first — a host
+// that has only just dropped out is the likeliest to answer, and must not wait
+// behind hosts that have been dead for an hour — and at most remergeMaxDials of
+// them. The pass stops at the first host that ANSWERS: that join's push/pull
+// exchanged full state with the whole other side, so the rest of it merges too,
+// and dialling more of it would only add timeouts. A host left undialled by the
+// cap or the early stop keeps its place: it is due again next pass.
+//
+// The dial is memberlist's ordinary Join, so a re-merge passes the same gossip
+// admission (NotifyMerge and NotifyAlive, on both ends) under the same keyring
+// as a first join: nothing here can admit a host a normal join would refuse.
+func (r *rejoiner) remerge() remergeResult {
+	if r.missing == nil {
+		return remergeResult{}
+	}
+	if r.backoff == nil {
+		r.backoff = map[string]*remergeBackoff{}
+	}
+	missing, err := r.missing()
+	if err != nil {
+		// Not "nothing is missing": that would forget every backoff and call
+		// every host re-merged. Skip the pass and change nothing.
+		return remergeResult{err: err}
+	}
+	listed := make(map[string]bool, len(missing))
+	var due []remergeTarget
+	for _, m := range missing {
+		listed[m.Name] = true
+		b := r.backoff[m.Name]
+		if b == nil {
+			b = &remergeBackoff{}
+			r.backoff[m.Name] = b
+		}
+		if b.wait > 0 {
+			b.wait--
+			continue
+		}
+		due = append(due, m)
+	}
+	for name := range r.backoff {
+		if !listed[name] {
+			delete(r.backoff, name) // visible again, or no longer listed
+		}
+	}
+	slices.SortStableFunc(due, func(a, b remergeTarget) int {
+		if d := r.backoff[a.Name].failures - r.backoff[b.Name].failures; d != 0 {
+			return d
+		}
+		return strings.Compare(a.Name, b.Name)
+	})
+	if len(due) > remergeMaxDials {
+		due = due[:remergeMaxDials]
+	}
+
+	var res remergeResult
+	for _, m := range due {
+		n, joinErr := r.join([]string{m.Addr})
+
+		// Judged by what gossip shows AFTER the dial, not by Join's count:
+		// Join says whether the address answered, not whether the host is now
+		// a member.
+		now, err := r.missing()
+		if err != nil {
+			res.err = err
+			return res // cannot judge this dial; leave its backoff alone
+		}
+		still := make(map[string]bool, len(now))
+		for _, o := range now {
+			still[o.Name] = true
+		}
+		for _, o := range missing {
+			if !still[o.Name] && !slices.Contains(res.recovered, o.Name) {
+				res.recovered = append(res.recovered, o.Name)
+				delete(r.backoff, o.Name)
+			}
+		}
+		out := remergeOutcome{Name: m.Name, Addr: m.Addr}
+		switch {
+		case !still[m.Name]:
+			out.Kind = remergeRecovered
+		default:
+			out.Kind = remergeNotAdmitted
+			if joinErr != nil && n == 0 {
+				out.Kind, out.Err = remergeUnreachable, joinErr
+			}
+			b := r.backoff[m.Name]
+			b.failures++
+			// 1, 3, then the cap: dialled at passes 0, 2, 6, 10, 14, ...
+			b.wait = min(1<<min(b.failures, 8)-1, remergeMaxSkip)
+			out.Wait = b.wait
+		}
+		res.outcomes = append(res.outcomes, out)
+		if n > 0 {
+			break // it answered: the exchange reached that whole side
+		}
+	}
+	slices.Sort(res.recovered)
+	return res
+}
+
+// remergeTargets is the set of hosts the cluster lists as members that gossip
+// does not show, each with the address to dial.
+//
+// hosts is ListHosts' output, so a REMOVED host is already absent: membership
+// is the replicated hosts table with tombstones filtered — the set gossip
+// admission admits from. Removal is also what revokes a host's certificate, so
+// a revoked host is a tombstoned one. Host STATE is deliberately not a filter.
+// The majority of a partition fences, or marks offline, exactly the hosts on
+// the other side; a state filter would exclude the very hosts that need
+// re-merging, and the minority would never receive the fence row that tells it
+// so. A host in maintenance still runs its daemon and still receives
+// replication, and while it reboots the backoff bounds what it costs.
+//
+// The address is the one memberlist last showed for the host while that still
+// names the recorded IP — it carries the gossip port, which the recorded
+// address does not — and otherwise the recorded address, which memberlist
+// dials on this node's own gossip port. A bare address equal to ours would
+// dial ourselves and is skipped.
+func remergeTargets(hosts []HostRecord, visible []PeerInfo, lastAddr map[string]string, selfName, selfAddr string) []remergeTarget {
+	seen := make(map[string]bool, len(visible))
+	for _, p := range visible {
+		seen[p.Name] = true
+	}
+	var out []remergeTarget
+	for _, h := range hosts {
+		if h.Name == selfName || h.Address == "" || seen[h.Name] {
+			continue
+		}
+		addr := h.Address
+		if last := lastAddr[h.Name]; last != "" {
+			if ip, row := gossipIP(last), net.ParseIP(h.Address); ip != nil && row != nil && ip.Equal(row) {
+				addr = last
+			}
+		}
+		if addr == selfAddr {
+			continue
+		}
+		out = append(out, remergeTarget{Name: h.Name, Addr: addr})
+	}
+	return out
+}
+
+// noteGossipAddr remembers the gossip address memberlist showed for a peer, so
+// the re-merge pass can dial it — port included — after it drops out.
+func (c *Client) noteGossipAddr(name, addr string) {
+	if name == "" || addr == "" || name == c.hostName {
+		return
+	}
+	c.gossipAddrMu.Lock()
+	if c.gossipAddrs == nil {
+		c.gossipAddrs = map[string]string{}
+	}
+	c.gossipAddrs[name] = addr
+	c.gossipAddrMu.Unlock()
+}
+
+// GossipRebroadcastForTests makes memberlist broadcast this node's own alive
+// state afresh. memberlist gossips only while it has broadcasts queued, and it
+// gossips them to dead members until they are reaped, so a scenario uses this
+// to tell a reaped member from one merely gone quiet. Test seam only.
+func (c *Client) GossipRebroadcastForTests() error {
+	if c.list == nil {
+		return nil
+	}
+	return c.list.UpdateNode(time.Second)
+}
+
+// ForgetGossipAddrsForTests drops the remembered peer gossip addresses, as a
+// daemon restart does. Test seam only.
+func (c *Client) ForgetGossipAddrsForTests() {
+	c.gossipAddrMu.Lock()
+	c.gossipAddrs = nil
+	c.gossipAddrMu.Unlock()
+}
+
+// missingMembers is remergeTargets over this node's hosts table, its current
+// gossip view, and the gossip addresses it has seen.
+//
+// It also prunes those addresses against the table: a host no longer listed is
+// forgotten, and so is a remembered address whose IP is no longer the host's
+// recorded one — a re-admitted host gossips somewhere else now, and the next
+// time gossip shows it, it is remembered there.
+func (c *Client) missingMembers(ctx context.Context, selfAddr string) ([]remergeTarget, error) {
+	visible := c.Members()
+	for _, p := range visible {
+		c.noteGossipAddr(p.Name, p.Addr)
+	}
+	hosts, err := ListHosts(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	recorded := make(map[string]net.IP, len(hosts))
+	for _, h := range hosts {
+		recorded[h.Name] = net.ParseIP(h.Address)
+	}
+	c.gossipAddrMu.Lock()
+	for name, addr := range c.gossipAddrs {
+		if ip, ok := recorded[name]; !ok || ip == nil || !ip.Equal(gossipIP(addr)) {
+			delete(c.gossipAddrs, name)
+		}
+	}
+	last := maps.Clone(c.gossipAddrs)
+	c.gossipAddrMu.Unlock()
+	return remergeTargets(hosts, visible, last, c.hostName, selfAddr), nil
+}
+
 // maintainMembership runs the re-join loop until ctx ends.
-func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAddr string) {
+//
+// interval is the base pass interval; zero is rejoinInterval.
+func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAddr string, interval time.Duration) {
+	if interval <= 0 {
+		interval = rejoinInterval
+	}
 	r := &rejoiner{
 		peerCount: func() int { return len(c.Members()) },
 		targets: func() []string {
@@ -102,12 +404,15 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 			}
 			return c.list.Join(ts)
 		}),
+		missing: func() ([]remergeTarget, error) { return c.missingMembers(ctx, selfAddr) },
 	}
 
 	rep := &isolationReporter{c: c, host: c.hostName, now: time.Now}
 	for {
 		// Jittered so nodes recovering from one partition do not dial together.
-		d := rejoinInterval + time.Duration(rand.Int63n(int64(rejoinInterval/2)))
+		// 30–45 s: the package's symmetric jitter, centred so the range is the
+		// one this loop has always had.
+		d := jittered(interval+interval/4, 0.2)
 		select {
 		case <-ctx.Done():
 			return
@@ -118,7 +423,8 @@ func (c *Client) maintainMembership(ctx context.Context, seeds []string, selfAdd
 }
 
 // membershipTick is one pass of the re-join loop: attempt a re-join if this
-// node sees nobody, log the outcome, and keep the isolation condition current.
+// node sees nobody, or re-merge the listed hosts it is missing if it sees some;
+// log the outcome, and keep the isolation condition current.
 func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolationReporter) {
 	attempted, joined, err := r.tick()
 	if ctx.Err() != nil {
@@ -137,9 +443,19 @@ func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolation
 	isolated := attempted && r.peerCount() == 0
 	rep.report(ctx, isolated, err)
 	if !attempted {
+		// Seeing peers is not seeing the cluster. A re-merge is not isolation
+		// either: it neither raises gossip_isolated nor marks the replica
+		// stale, or one dead, unremoved host would hold every node stale.
+		if r.peerCount() > 0 {
+			res := r.remerge()
+			if ctx.Err() != nil {
+				return // Close cancelled the dial; its outcome means nothing
+			}
+			c.logRemerge(res)
+		}
 		return
 	}
-	// A pass only attempts when this node sees no peer at all, so whatever it
+	// The isolated path only attempts when this node sees no peer at all, so whatever it
 	// held as caught up no longer covers what the cluster may be deciding
 	// without it. Backstop for the leave event, which is the primary reset.
 	c.MarkReplicaStale("sees no gossip peers (re-join loop)")
@@ -159,6 +475,32 @@ func (c *Client) membershipTick(ctx context.Context, r *rejoiner, rep *isolation
 		return
 	}
 	slog.Info("gossip: re-joined after losing every peer", "peers", joined)
+}
+
+// logRemerge reports a re-merge pass, host by host. A host the cluster lists
+// that gossip cannot reach is a finding, and the backoff and the per-pass cap
+// already bound how often each line repeats.
+func (c *Client) logRemerge(res remergeResult) {
+	if res.err != nil {
+		slog.Warn("gossip: re-merge could not read the hosts table or its gossip view; pass skipped",
+			"error", res.err)
+	}
+	if len(res.recovered) > 0 {
+		slog.Info("gossip: re-merged hosts the cluster lists that were missing from membership",
+			"hosts", res.recovered)
+	}
+	for _, o := range res.outcomes {
+		switch o.Kind {
+		case remergeUnreachable:
+			slog.Warn("gossip: a host the cluster lists is missing from membership and its gossip address did not answer",
+				"host", o.Name, "addr", o.Addr, "error", o.Err, "skip_passes", o.Wait)
+		case remergeNotAdmitted:
+			slog.Warn("gossip: a host the cluster lists answered a re-join but is still not a member; "+
+				"gossip admission may be refusing it (its announced address must match its hosts row), "+
+				"or another host answered at that address",
+				"host", o.Name, "addr", o.Addr, "skip_passes", o.Wait)
+		}
+	}
 }
 
 // cancellableJoin wraps a join so the loop can stop waiting for it.

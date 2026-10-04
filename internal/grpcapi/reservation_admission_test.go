@@ -26,12 +26,14 @@ import (
 // refusals.
 
 // plantReservation inserts a nonterminal operation holding a capacity reservation
-// under a chosen id, standing in for a concurrent admission on another node.
+// under a chosen id, standing in for a concurrent admission on another node that
+// is still DECIDING: provisional, with no admitted marker yet.
 func plantReservation(t *testing.T, s *Server, id, host, project string, cpu, mem int) {
 	t.Helper()
 	rv := corrosion.ReservationVector{
 		Project: project, ProjectCPU: cpu, ProjectMemMiB: mem,
 		TargetHost: host, TargetCPU: cpu, TargetMemMiB: mem,
+		Provisional: true,
 	}
 	enc, err := rv.Encode()
 	if err != nil {

@@ -400,7 +400,92 @@ import (
 //	     deliberately PLAIN rather than partial on deleted_at: the guard counts
 //	     tombstones too, so a `WHERE deleted_at IS NULL` index would not serve
 //	     the query and the scan would grow with every proof ever written.
-const CurrentSchemaVersion = 55
+//	v56: secret columns move to the sensitive lane — host_fence_credentials
+//	     (host_name PK, ipmi_pass), user_credentials (username PK,
+//	     password_hash) and token_credentials (token_id PK, token_hash), all
+//	     in sensitiveTableNames so the operator-safe state dump never carries
+//	     them. hosts.ipmi_pass, users.password_hash and tokens.token_hash stay
+//	     (migrations are additive-only), and a previous-release node still
+//	     reads them, so nothing is written to the new tables until
+//	     credentials_split_v1 latches — a latch that cannot form while any
+//	     replication recipient is on the previous build. Once it has, each
+//	     node copies the old columns across and clears them. No created_at:
+//	     every node backfills the same row, and a per-node creation instant
+//	     would turn identical rows into a permanent equal-timestamp content
+//	     tie. Three new tables.
+//	v57: host membership gets its own clock — host_membership (host_name PK,
+//	     state, isolation_epoch, isolation_reason). Those columns were written
+//	     by the coordinator, operators and isolation detectors into the same
+//	     `hosts` row the daemon writes its version and resources into, under
+//	     one updated_at, so a replica could refuse one of two concurrent writes
+//	     to different columns as older and lose it (colonelpanik/litevirt#267).
+//	     A previous-release node cannot decode the new table's statements and
+//	     reads state only from hosts.state, so nothing touches host_membership
+//	     until host_membership_split_v1 latches (ReplicationGated). From then
+//	     on state and isolation are written to BOTH, in one batch, and read
+//	     from host_membership; the hosts columns stay current for a node
+//	     rolled back one release and are never cleared in this version. No
+//	     created_at, for the v56 reason: every node backfills the same row.
+//	     One new table.
+//	v58: cluster-wide replicated policy — cluster_policies (key PK, value,
+//	     set_by). Its one key today is failover_scope (cluster | region, no row
+//	     = cluster): whether a host is fenced and recovered by a quorum of the
+//	     whole cluster or of its own region (colonelpanik/litevirt#265,
+//	     docs/design/region-scoped-failover.md). A previous-release node cannot
+//	     decode the table's statements, so nothing writes it until
+//	     failover_scope_v1 latches (ReplicationGated). One new table.
+//	v59: an explicit voter set and the voter side of single-decree recovery
+//	     claims (colonelpanik/litevirt#251 step 2; docs/design/recovery-claims.md
+//	     §3–§4). voter_configs (generation PK) is replicated and IMMUTABLE per
+//	     generation, merged by keep-local like leader_lease_terms; a node
+//	     adopts a generation only once its claim certificate verifies against
+//	     the generation before it. Nothing writes it until voter_config_v1 has
+//	     durably latched (ReplicationGated), so a previous-release peer never
+//	     sees a statement it cannot decode. Three NODE-LOCAL tables, never in
+//	     tableNames and written only through ExecuteLocal:
+//	     local_recovery_claims (this voter's promises and accepts, kept
+//	     forever), local_voter_incarnation (the identity of this state.db's
+//	     claim state, minted once when the table is first created) and
+//	     local_voter_adoption (which generations this node has adopted and
+//	     which sealed majority it imported claim state from). Four new tables.
+//	v60: recovery claims are enforced (recovery_claim_v1,
+//	     colonelpanik/litevirt#250) — runtime_action_proofs gains
+//	     claim_certificate, the majority certificate that authorizes an
+//	     ownership-transfer proof (reschedule, promote, failover relocate). It
+//	     is evidence, not a binding field: ProofBindingEqual ignores it, and a
+//	     row may gain one or have it replaced by a re-certification of the same
+//	     value. The column's statement shapes are emitted only once
+//	     recovery_claim_v1 has latched (ReplicationGated), so a
+//	     previous-release peer never sees one. One additive column, appended
+//	     LAST for the v53 digest reason.
+//	v61: a recovery destination's abandonments (docs/design/recovery-claims.md
+//	     §3.12) — local_abandoned_proofs, NODE-LOCAL like local_term_bindings:
+//	     never in tableNames, written only through ExecuteLocal. It records the
+//	     proofs this node signed it will never execute, which is the supersede
+//	     evidence a claim needs to move to attempt+1 after a decided promote
+//	     failed before StartDomain; every later claim of such a proof, and a
+//	     promote's start checkpoint, is refused in the same transaction that
+//	     reads it. One new table.
+//	v62: forced reconfiguration of the voter set
+//	     (docs/design/recovery-claims.md §4.6) — local_voter_seals, NODE-LOCAL:
+//	     the generations this node sealed as a survivor of a lost majority, so
+//	     it answers no workload claim under them again and the other survivors
+//	     can import its state. The forced generation itself is an ordinary
+//	     voter_configs row whose change is force:<lost,...> and whose
+//	     certificate column holds the survivors' unanimous signatures and the
+//	     lost hosts' fence evidence. One new table.
+//	v63: incarnation-scoped recovery claims (docs/design/recovery-claims.md
+//	     §10 item 37) — local_incarnation_claims, NODE-LOCAL like
+//	     local_recovery_claims and with the same columns plus the workload
+//	     row's created_at in the primary key, so a workload deleted and
+//	     re-created under one name starts with a fresh claim history instead of
+//	     meeting the previous incarnation's decision at the same (kind, name,
+//	     epoch, attempt). A new table rather than a wider primary key on the old
+//	     one, because migrations are additive-only: legacy keys stay in
+//	     local_recovery_claims, and a row here seals the legacy key of the same
+//	     (kind, name, epoch, attempt) on this voter. Nothing is written to it
+//	     until claim_incarnation_v1 latches. One new table.
+const CurrentSchemaVersion = 63
 
 // appliedMigrationsDDL is the per-migration ledger. It is created by the
 // framework itself (not part of schemaDDL) so it doesn't trip the CI growth
@@ -459,6 +544,34 @@ const acknowledgedTiesDDL = `CREATE TABLE IF NOT EXISTS acknowledged_ties (
 	acknowledged_at TEXT NOT NULL,
 	acknowledged_by TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (table_name, pk, content_pair)
+)`
+
+// acknowledgedTieVersionsDDL records, per acknowledged row, the fingerprint of
+// every version of that row the node had met when the operator acknowledged
+// it. A later observation is answered when BOTH of its versions are here (or
+// its exact pair is in acknowledged_ties, the older and narrower record, which
+// stays authoritative for what it holds).
+//
+// Why the pair alone was not enough: the register keeps one pair per row, and
+// in an N-way contest that pair names whichever peer anti-entropy met last. An
+// acknowledgement of it left every other peer's claim unanswered, so the next
+// pass against any of them re-raised the tie, and after a restart the peers
+// are met in whatever order the pass happens to take. The lab's five-way
+// dual_run_detector term 2 took four acknowledgements per node before it
+// stayed quiet. The operator names a ROW (a lease and a term), so the answer
+// covers the row as it was seen — and nothing else: a version first met after
+// the acknowledgement is not here, so the tie it forms is raised as usual.
+//
+// Local-only, framework-created and outside the migration ledger, for the
+// reasons given on acknowledgedTiesDDL. Fingerprints only (versionFingerprint),
+// never row content.
+const acknowledgedTieVersionsDDL = `CREATE TABLE IF NOT EXISTS acknowledged_tie_versions (
+	table_name      TEXT NOT NULL,
+	pk              TEXT NOT NULL,
+	version         TEXT NOT NULL,
+	acknowledged_at TEXT NOT NULL,
+	acknowledged_by TEXT NOT NULL DEFAULT '',
+	PRIMARY KEY (table_name, pk, version)
 )`
 
 // migrateAcknowledgedTiesPK widens an existing table's primary key to include
@@ -545,6 +658,13 @@ func InitSchema(ctx context.Context, c *Client) error {
 		}
 	}
 
+	// The voter incarnation is minted once, when its row is first absent
+	// (voter_local.go). Here, straight after the DDL, so no claim handler can
+	// ever run on a database without one.
+	if err := c.mintVoterIncarnation(ctx); err != nil {
+		return fmt.Errorf("schema init: %w", err)
+	}
+
 	// The ledger meta-table itself.
 	if err := c.execLocal(ctx, appliedMigrationsDDL); err != nil {
 		return fmt.Errorf("create applied_migrations: %w", err)
@@ -555,6 +675,9 @@ func InitSchema(ctx context.Context, c *Client) error {
 	// anti-entropy sweep can land well before the first operator query.
 	if err := c.execLocal(ctx, acknowledgedTiesDDL); err != nil {
 		return fmt.Errorf("create acknowledged_ties: %w", err)
+	}
+	if err := c.execLocal(ctx, acknowledgedTieVersionsDDL); err != nil {
+		return fmt.Errorf("create acknowledged_tie_versions: %w", err)
 	}
 	if err := c.execLocal(ctx, reseedInProgressDDL); err != nil {
 		return fmt.Errorf("create reseed_in_progress: %w", err)
@@ -1167,7 +1290,8 @@ var schemaDDL = []string{
 		-- about this table's digest forever with identical rows, wherever
 		-- digest_v2 is off. Put every future additive column here, not above.
 		lease_term        INTEGER NOT NULL DEFAULT 0, -- lease incarnation term (v52); 0 = proof minted without one
-		lease_key         TEXT NOT NULL DEFAULT '' -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
+		lease_key         TEXT NOT NULL DEFAULT '', -- WHICH lease's ledger lease_term belongs to (v54); '' = minted without one
+		claim_certificate TEXT NOT NULL DEFAULT '' -- recovery-claim certificate authorizing this proof (v60); '' = none
 	)`,
 
 	// operations / operation_steps / project_authority_epochs (v41, F1 operation
@@ -2492,6 +2616,167 @@ var schemaDDL = []string{
 		updated_at     TEXT NOT NULL,
 		deleted_at     TEXT
 	)`,
+	// v56 credential tables — the secret halves of hosts, users and tokens,
+	// carried only by the peer-only sensitive lane (sensitiveTableNames). The
+	// public rows keep their old secret column, dual-written after
+	// credentials_split_v1 latches and cleared only by a later release; see
+	// credentials_split.go. Keyed on the
+	// parent's primary key, one row per parent. updated_at is the LWW key and,
+	// for a row the backfill wrote, it is the PARENT row's updated_at, so every
+	// node that backfills the same parent writes the same row.
+	`CREATE TABLE IF NOT EXISTS host_fence_credentials (
+		host_name  TEXT PRIMARY KEY,
+		ipmi_pass  TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+	`CREATE TABLE IF NOT EXISTS user_credentials (
+		username      TEXT PRIMARY KEY,
+		password_hash TEXT NOT NULL DEFAULT '',
+		updated_at    TEXT NOT NULL,
+		deleted_at    TEXT
+	)`,
+	`CREATE TABLE IF NOT EXISTS token_credentials (
+		token_id   TEXT PRIMARY KEY,
+		token_hash TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+	// v57 host membership — the coordinator-owned facts about a host, on a row
+	// with its own LWW clock so they no longer share one with the daemon's
+	// self-reported columns on `hosts` (which keep a dual-written copy). Written only once
+	// host_membership_split_v1 latches; see host_membership.go. A row the
+	// backfill wrote carries the hosts row's updated_at, so every node that
+	// backfills the same host writes the same row.
+	`CREATE TABLE IF NOT EXISTS host_membership (
+		host_name        TEXT PRIMARY KEY,
+		state            TEXT NOT NULL DEFAULT 'active',
+		isolation_epoch  INTEGER NOT NULL DEFAULT 0,
+		isolation_reason TEXT NOT NULL DEFAULT '',
+		updated_at       TEXT NOT NULL,
+		deleted_at       TEXT
+	)`,
+	// v58 cluster-wide policy — one row per key, operator-written through a
+	// gRPC handler, last-writer-wins like any cluster fact. Written only once
+	// failover_scope_v1 latches; see cluster_policy.go.
+	`CREATE TABLE IF NOT EXISTS cluster_policies (
+		key        TEXT PRIMARY KEY,
+		value      TEXT NOT NULL,
+		set_by     TEXT NOT NULL DEFAULT '',
+		updated_at TEXT NOT NULL,
+		deleted_at TEXT
+	)`,
+	// v59 voter set — one IMMUTABLE row per generation (voter_config.go). The
+	// row is the decided value of the claim at key ("voter_config", "",
+	// generation-1, 0) plus the certificate that decided it, so every column
+	// but certificate is identical on every node that writes the same
+	// decision. Merged keep-local (customMergeTables). Written only once
+	// voter_config_v1 has durably latched.
+	`CREATE TABLE IF NOT EXISTS voter_configs (
+		generation   INTEGER PRIMARY KEY,
+		members_json TEXT NOT NULL,
+		members_hash TEXT NOT NULL,
+		change       TEXT NOT NULL,
+		certificate  TEXT NOT NULL,
+		created_by   TEXT NOT NULL,
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		deleted_at   TEXT
+	)`,
+	// NODE-LOCAL. Never in tableNames, never relayed, never anti-entropy
+	// repaired: a grant is a statement about what THIS voter promised, and a
+	// promise a peer could write is not a promise (§3.8). Written only through
+	// ExecuteLocal, one transaction per voter step, committed before the reply
+	// is built. Rows are never deleted or downgraded.
+	`CREATE TABLE IF NOT EXISTS local_recovery_claims (
+		target_kind       TEXT    NOT NULL,
+		target_name       TEXT    NOT NULL,
+		owner_epoch       INTEGER NOT NULL,
+		attempt           INTEGER NOT NULL,
+		promised_round    INTEGER NOT NULL DEFAULT 0,
+		promised_coord    TEXT    NOT NULL DEFAULT '',
+		promised_nonce    BLOB    NOT NULL DEFAULT x'',
+		accepted_round    INTEGER NOT NULL DEFAULT 0,
+		accepted_coord    TEXT    NOT NULL DEFAULT '',
+		accepted_nonce    BLOB    NOT NULL DEFAULT x'',
+		value_json        TEXT    NOT NULL DEFAULT '',
+		value_digest      TEXT    NOT NULL DEFAULT '',
+		accept_json       TEXT    NOT NULL DEFAULT '',
+		config_generation INTEGER NOT NULL,
+		updated_at        TEXT    NOT NULL,
+		PRIMARY KEY (target_kind, target_name, owner_epoch, attempt)
+	)`,
+	// NODE-LOCAL. The identity of this state.db's claim state (§3.11). Minted
+	// once, by InitSchema, when the row is absent — so it disappears in exactly
+	// the cases the claim state does (a re-imaged host, a restored or reseeded
+	// state.db), and a voter whose incarnation no longer matches its member
+	// entry abstains.
+	`CREATE TABLE IF NOT EXISTS local_voter_incarnation (
+		id          INTEGER PRIMARY KEY CHECK (id = 1),
+		incarnation TEXT NOT NULL,
+		created_at  TEXT NOT NULL
+	)`,
+	// NODE-LOCAL. Which voter_configs generations this node has adopted, and
+	// the sealed majority it imported claim state from before it voted under
+	// the generation (§4.4). The highest row is this node's current generation.
+	`CREATE TABLE IF NOT EXISTS local_voter_adoption (
+		generation    INTEGER PRIMARY KEY,
+		imported_from TEXT NOT NULL DEFAULT '',
+		adopted_at    TEXT NOT NULL
+	)`,
+	// NODE-LOCAL (v61). The proofs this node, as a recovery destination, has
+	// signed that it will never execute (docs/design/recovery-claims.md
+	// §3.12). Written only through ExecuteLocal (AbandonProof), in the same
+	// transaction that checks the proof has not started here; every later
+	// claim of the proof, and a promote's start checkpoint, is refused in the
+	// same transaction that reads this table. Rows are never deleted: an
+	// abandonment is a promise, and a promise a peer could erase is not one.
+	`CREATE TABLE IF NOT EXISTS local_abandoned_proofs (
+		proof_id     TEXT    PRIMARY KEY,
+		target_kind  TEXT    NOT NULL,
+		target_name  TEXT    NOT NULL,
+		owner_epoch  INTEGER NOT NULL,
+		attempt      INTEGER NOT NULL,
+		reason       TEXT    NOT NULL DEFAULT '',
+		abandoned_at TEXT    NOT NULL
+	)`,
+	// NODE-LOCAL (v62). The voter generations this node sealed for a forced
+	// reconfiguration (docs/design/recovery-claims.md §4.6): once sealed it no
+	// longer answers Prepare or Accept for workload keys under the generation,
+	// which is what lets the other survivors import its state. Durable, so a
+	// survivor that restarts mid-procedure stays sealed. Never deleted.
+	`CREATE TABLE IF NOT EXISTS local_voter_seals (
+		generation INTEGER PRIMARY KEY,
+		reason     TEXT    NOT NULL DEFAULT '',
+		sealed_at  TEXT    NOT NULL
+	)`,
+	// NODE-LOCAL (v63). This voter's promises and accepts at INCARNATION-SCOPED
+	// workload keys (docs/design/recovery-claims.md §10 item 37):
+	// local_recovery_claims' columns with the workload row's created_at in the
+	// key, so two incarnations of one name never share a claim. The legacy
+	// table keeps the keys claimed before claim_incarnation_v1 latched, and a
+	// row here for (kind, name, epoch, attempt) seals that legacy key on this
+	// voter. Same rules: written only through ExecuteLocal, committed before
+	// the reply, never deleted or downgraded.
+	`CREATE TABLE IF NOT EXISTS local_incarnation_claims (
+		target_kind       TEXT    NOT NULL,
+		target_name       TEXT    NOT NULL,
+		incarnation       TEXT    NOT NULL,
+		owner_epoch       INTEGER NOT NULL,
+		attempt           INTEGER NOT NULL,
+		promised_round    INTEGER NOT NULL DEFAULT 0,
+		promised_coord    TEXT    NOT NULL DEFAULT '',
+		promised_nonce    BLOB    NOT NULL DEFAULT x'',
+		accepted_round    INTEGER NOT NULL DEFAULT 0,
+		accepted_coord    TEXT    NOT NULL DEFAULT '',
+		accepted_nonce    BLOB    NOT NULL DEFAULT x'',
+		value_json        TEXT    NOT NULL DEFAULT '',
+		value_digest      TEXT    NOT NULL DEFAULT '',
+		accept_json       TEXT    NOT NULL DEFAULT '',
+		config_generation INTEGER NOT NULL,
+		updated_at        TEXT    NOT NULL,
+		PRIMARY KEY (target_kind, target_name, incarnation, owner_epoch, attempt)
+	)`,
 }
 
 // schemaIndexes are CREATE INDEX IF NOT EXISTS statements added after table creation.
@@ -2675,6 +2960,12 @@ var tablePrimaryKeys = map[string][]string{
 	"netbox_objects":          {"litevirt_kind", "litevirt_key"},
 	"netbox_sync_queue":       {"id"},
 	"netbox_host_config":      {"host_name"},
+	"host_fence_credentials":  {"host_name"},
+	"user_credentials":        {"username"},
+	"token_credentials":       {"token_id"},
+	"host_membership":         {"host_name"},
+	"cluster_policies":        {"key"},
+	"voter_configs":           {"generation"},
 }
 
 // schemaMigrations contains ALTER TABLE statements for upgrading existing databases.
@@ -2911,6 +3202,11 @@ var schemaMigrations = []string{
 	// by design — so a term is only interpretable together with its key.
 	// Additive with a '' default, which pairs with lease_term 0.
 	`ALTER TABLE runtime_action_proofs ADD COLUMN lease_key TEXT NOT NULL DEFAULT ''`,
+	// v60: the recovery-claim certificate authorizing an ownership-transfer
+	// proof (docs/design/recovery-claims.md §3.9). Evidence, not a binding
+	// field: '' reads as "no certificate", which a destination enforcing
+	// recovery_claim_v1 refuses.
+	`ALTER TABLE runtime_action_proofs ADD COLUMN claim_certificate TEXT NOT NULL DEFAULT ''`,
 }
 
 // ───────────────────────── per-migration ledger ─────────────────────────
@@ -3002,6 +3298,7 @@ var alterVersions = []int{
 	51, // netbox_bindings.netbox_cluster
 	53, // runtime_action_proofs.lease_term
 	54, // runtime_action_proofs.lease_key
+	60, // runtime_action_proofs.claim_certificate
 }
 
 // createTableUnits cover the table-only versions (no ALTER) so every schema
@@ -3035,6 +3332,14 @@ var createTableUnits = []struct {
 	{51, "netbox_host_config"},
 	{52, "leader_lease_terms"},
 	{55, "local_term_bindings"},
+	{56, "host_fence_credentials"}, {56, "user_credentials"}, {56, "token_credentials"},
+	{57, "host_membership"},
+	{58, "cluster_policies"},
+	{59, "voter_configs"}, {59, "local_recovery_claims"}, {59, "local_voter_incarnation"},
+	{59, "local_voter_adoption"},
+	{61, "local_abandoned_proofs"},
+	{62, "local_voter_seals"},
+	{63, "local_incarnation_claims"},
 }
 
 // schemaMigrationLedger is built once at init from schemaMigrations (addColumn

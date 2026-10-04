@@ -20,7 +20,9 @@ import (
 // one evaluator instance at a time (the detector lease holder), so last-writer-
 // wins converges every replica to the newest scan; capacity rows are written
 // only by the host they describe (host_name is the ownership, the same rule
-// host_networks uses).
+// host_networks uses). "One at a time" is not "one ever": two nodes that both
+// believe they hold the lease raise the same row independently, which is why
+// a condition's created_at is healthConditionCreatedAt and not a clock reading.
 
 // Condition lifecycle states.
 const (
@@ -69,6 +71,32 @@ type HealthCondition struct {
 	Reporter    string // host that wrote the latest transition
 }
 
+// healthConditionCreatedAt is the created_at every health_conditions INSERT
+// binds. It is deliberately not a creation time.
+//
+// The upsert's conflict path copies every column except created_at, so a row's
+// created_at is whatever the INSERT that first created it on THIS replica
+// bound. When two nodes raise one condition independently — two lease holders
+// in a partition, both raising ha.voter.unavailable — each inserts its own row,
+// and the later raiser's statement then overwrites the earlier one's content
+// and updated_at by LWW but leaves its created_at. A wall-clock created_at left
+// the two replicas as one updated_at over two created_at values: an exact tie
+// the WAL path cannot settle (the upsert is not a full row image, so a tied
+// receiver keeps local), repaired only by an anti-entropy pull. A value every
+// writer binds identically makes the two inserts agree, so the newer raise
+// alone converges both replicas.
+//
+// Nothing reads health_conditions.created_at; first_seen is the condition's
+// time. Carrying created_at in the conflict path instead would change the
+// statement's shape, which a peer on the previous release cannot resolve —
+// it back-pressures the shape and stalls its whole replication stream.
+//
+// A row an older binary created keeps its wall-clock created_at (the conflict
+// path never rewrites it), and an old and a new raiser racing still diverge
+// exactly as before, until anti-entropy settles them by the table's content-max
+// chain. Changing this value is a convergence break for the same reason.
+const healthConditionCreatedAt = "1970-01-01T00:00:00Z"
+
 // UpsertHealthCondition writes a condition's full current state. The caller (the
 // evaluator) has already decided the lifecycle transition; this persists it.
 func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) error {
@@ -108,7 +136,7 @@ func UpsertHealthCondition(ctx context.Context, c *Client, h HealthCondition) er
 		h.Evaluator, h.Code, h.SubjectKind, h.SubjectID,
 		h.Lifecycle, h.Severity, hosts, h.Evidence, h.ObserveCount, h.CleanCount,
 		h.FirstSeen, h.LastSeen, nullIfEmpty(h.ConfirmedAt), nullIfEmpty(h.ResolvedAt), h.Reporter,
-		nowRFC3339Nano(), now)
+		healthConditionCreatedAt, now)
 }
 
 // GetHealthCondition reads one condition by identity; ok=false when absent.
@@ -204,7 +232,11 @@ type HealthEvaluatorStatus struct {
 	Detail    string
 }
 
-// UpsertHealthEvaluatorStatus records an evaluator's completed scan.
+// UpsertHealthEvaluatorStatus records an evaluator's completed scan. Its rows
+// are written by the detector lease holder, so two holders in a partition
+// race exactly as two raisers of one condition do, and its INSERT binds
+// healthConditionCreatedAt for the same reason (read that). Nothing reads
+// health_evaluator_status.created_at; last_scan is the scan's time.
 func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvaluatorStatus) error {
 	if st.Evaluator == "" {
 		return fmt.Errorf("corrosion: evaluator status requires an evaluator name")
@@ -222,7 +254,7 @@ func UpsertHealthEvaluatorStatus(ctx context.Context, c *Client, st HealthEvalua
 		   updated_at = excluded.updated_at,
 		   deleted_at = NULL`,
 		st.Evaluator, st.LastScan, st.Coverage, st.Reporter, st.Detail,
-		nowRFC3339Nano(), now)
+		healthConditionCreatedAt, now)
 }
 
 // ListHealthEvaluatorStatus returns every evaluator's latest scan record.
@@ -264,7 +296,12 @@ type HostCapacityObservation struct {
 }
 
 // UpsertHostCapacityObservation writes a host's latest sample. Only the
-// observed host itself calls this — host_name is the ownership.
+// observed host itself calls this — host_name is the ownership. One writer at
+// a time is not one writer ever: a machine rebuilt under a removed host's name
+// inserts the row afresh from an empty state.db while its peers hold the old
+// machine's, so the INSERT binds healthConditionCreatedAt (read that).
+// Nothing reads host_capacity_observations.created_at; sampled_at is the
+// sample's time.
 func UpsertHostCapacityObservation(ctx context.Context, c *Client, o HostCapacityObservation) error {
 	if o.HostName == "" {
 		return fmt.Errorf("corrosion: capacity observation requires a host name")
@@ -293,7 +330,7 @@ func UpsertHostCapacityObservation(ctx context.Context, c *Client, o HostCapacit
 		   deleted_at = NULL`,
 		o.HostName, o.DBCPU, o.DBMemMiB, o.ExtraCPU, o.ExtraMemMiB,
 		o.EffectiveCPU, o.EffectiveMemMiB, complete, o.Detail, o.SampledAt,
-		nowRFC3339Nano(), now)
+		healthConditionCreatedAt, now)
 }
 
 // GetHostCapacityObservation reads one host's sample; ok=false when the host

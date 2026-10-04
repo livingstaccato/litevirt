@@ -9,6 +9,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // GetClusterHealth is THE health read. It aggregates the durable condition
@@ -54,6 +55,21 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			maintenance[h.Name] = true
 		}
 	}
+	// The same holds for an edge outside its observer's probe plan: a non-voter
+	// probes only a sample of the other non-voters (health.ObserverPlan), so an
+	// edge it dropped from that sample is frozen too. An unreadable voter set
+	// excludes nothing — every edge keeps its vote, as before the plan.
+	var plans map[string]map[string]bool
+	if voters, verr := corrosion.VoterSet(ctx, s.db); verr == nil {
+		plans = make(map[string]map[string]bool, len(hosts))
+		for _, h := range hosts {
+			plans[h.Name] = health.ObserverPlan(h.Name, hosts, voters)
+		}
+	}
+	notProbed := func(observer, target string) bool {
+		plan, known := plans[observer]
+		return known && !plan[target]
+	}
 
 	// Parse the mesh once: the same edges feed both the response body and the
 	// roll-up, which counts a link that is not proven good as a coverage gap.
@@ -67,6 +83,7 @@ func (s *Server) GetClusterHealth(ctx context.Context, req *pb.GetClusterHealthR
 			ConsecutiveFailures: r.Int("consecutive_failures"),
 			LastSeen:            r.String("last_seen"),
 			TargetInMaintenance: maintenance[target],
+			NotProbed:           notProbed(r.String("observer"), target),
 		})
 	}
 
@@ -171,6 +188,9 @@ type connectivityEdge struct {
 	// TargetInMaintenance marks an edge whose target the checker has stopped
 	// probing. Reported in the body unchanged; excluded from the roll-up.
 	TargetInMaintenance bool
+	// NotProbed marks an edge outside its observer's probe plan
+	// (health.ObserverPlan). Reported unchanged; excluded from the roll-up.
+	NotProbed bool
 }
 
 // connectivityDegrades reports whether an edge's status means the link is not
@@ -182,7 +202,9 @@ type connectivityEdge struct {
 // would turn any new status value the checker starts writing into an immediate
 // cluster-wide DEGRADED on every node that has not been upgraded yet.
 func connectivityDegrades(status string) bool {
-	return status == "failing" || status == "suspect"
+	// unready is the peer's own answer that it cannot serve: it degrades the
+	// cluster as much as a suspect edge, though it licenses no fence.
+	return status == "failing" || status == "suspect" || status == health.StatusUnready
 }
 
 // Overall cluster-health states.
@@ -303,7 +325,7 @@ func overallHealth(conditions []corrosion.HealthCondition, evaluators []corrosio
 		// it would latch the cluster DEGRADED for as long as the host stays in
 		// maintenance — a light stuck on, with no link left to fix. The edge is
 		// still reported in the body; it just stops voting.
-		if e.TargetInMaintenance {
+		if e.TargetInMaintenance || e.NotProbed {
 			continue
 		}
 		if connectivityDegrades(e.Status) {

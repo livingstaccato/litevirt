@@ -321,7 +321,14 @@ func (c *Client) CreateLiveSnapshot(domainName, snapshotName, vmstatePath string
 		return 0, 0, fmt.Errorf("lookup domain %q: %w", domainName, err)
 	}
 	state, _, _ := c.virt.DomainGetState(dom, 0)
-	if state != int32(golibvirt.DomainRunning) && state != int32(golibvirt.DomainPaused) {
+	if state == int32(golibvirt.DomainPaused) {
+		// The capture ends by resuming the guest. A paused domain is paused by
+		// someone — an operator, or this host's partition pause, which must
+		// keep it stopped — so a memory snapshot of it is refused rather than
+		// resuming it behind their back (docs/design/partition-pause.md §3.3).
+		return 0, 0, fmt.Errorf("domain %q is paused — a memory snapshot would resume it; resume it first", domainName)
+	}
+	if state != int32(golibvirt.DomainRunning) {
 		return 0, 0, fmt.Errorf("domain %q is not running — memory snapshot requires a running VM", domainName)
 	}
 

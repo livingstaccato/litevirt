@@ -1192,8 +1192,9 @@ func (s *Server) hasFreshPowerOffProof(ctx context.Context, host string) (bool, 
 	return s.freshFenceConfirmation(ctx, host)
 }
 
-// hostIsReachable reads the SAME live signal manualFenceConfirmedVIP consults:
-// a peer this node currently counts toward quorum. Self is always reachable.
+// hostIsReachable reads the SAME live signal manualFenceConfirmedVIP consults,
+// peerUp: a peer this node has probed healthy, or, outside its probe plan, one
+// that answers a probe now. Self is always reachable.
 //
 // With no gate wired nothing is reachable, which is the safe direction: an
 // unreachable host is merely a candidate for exclusion, and exclusion still
@@ -1205,12 +1206,7 @@ func (s *Server) hostIsReachable(ctx context.Context, host string) bool {
 	if s.gate == nil {
 		return false
 	}
-	for _, h := range s.gate.HealthyPeers(ctx) {
-		if h == host {
-			return true
-		}
-	}
-	return false
+	return s.peerUp(ctx, host)
 }
 
 // freshFenceConfirmation reads the operator's `lv host fence-confirm`

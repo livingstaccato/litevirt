@@ -274,7 +274,10 @@ func hostDTO(h *pb.Host) hostOut {
 	// diverge without limit (98 GiB allocated on a filesystem 27% used).
 	//
 	// Allocation is what admission actually spends, so it is still reported —
-	// under disk_allocated_gib, a name that cannot be mistaken for usage.
+	// under disk_allocated_gib, a name that cannot be mistaken for usage. It
+	// comes from pb.Host.disk_allocated_gib: since colonelpanik/litevirt#142
+	// the server's disk_used_gib is statfs usage too, so reading allocation
+	// from it would report usage twice.
 	actualUsed, actualTotal := sumPoolActualBytes(h.GetStoragePools())
 	const gib = int64(1024 * 1024 * 1024)
 	totalGiB := actualTotal / gib
@@ -288,7 +291,7 @@ func hostDTO(h *pb.Host) hostOut {
 	return hostOut{
 		Name: h.GetName(), Address: h.GetAddress(), State: h.GetState().String(), Region: h.GetRegion(), Version: h.GetVersion(),
 		CPUTotal: h.GetCpuTotal(), CPUUsed: h.GetCpuUsed(), MemTotalMiB: h.GetMemTotalMib(), MemUsedMiB: h.GetMemUsedMib(),
-		DiskTotalGiB: totalGiB, DiskUsedGiB: actualUsed / gib, DiskAllocatedGiB: h.GetDiskUsedGib(),
+		DiskTotalGiB: totalGiB, DiskUsedGiB: actualUsed / gib, DiskAllocatedGiB: h.GetDiskAllocatedGib(),
 		VMCount: h.GetVmCount(), Labels: h.GetLabels(),
 		Pools: pools, UpdatedAt: ts(h.GetUpdatedAt()),
 	}

@@ -125,6 +125,53 @@ var firstShapeAcks = map[string]string{
 		"Pre-latch the lease still transfers through the bare leader_election upsert, whose " +
 		"shape predates this release, so nothing but the term waits on the roll. A subsequent " +
 		"downgrade below the latch is the isolation-epoch case (schema v49), not this guard's",
+	"host_fence_credentials": "every writer (grpcapi ConfigureHost and corrosion.SplitCredentials) checks " +
+		"Client.MayWriteCredentialTables first and writes only the parent row, in its previous-release " +
+		"shape, while it is false. The gate is DurablyLatched(credentials_split_v1) — mandatory, so " +
+		"advertised by every build carrying these tables and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
+		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
+		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
+	"user_credentials": "every writer (InsertUser, UpdateUserPassword, ReinstateAdminIfNoneRemain " +
+		"and corrosion.SplitCredentials) checks " +
+		"Client.MayWriteCredentialTables first and writes only the parent row, in its previous-release " +
+		"shape, while it is false. The gate is DurablyLatched(credentials_split_v1) — mandatory, so " +
+		"advertised by every build carrying these tables and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
+		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
+		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
+	"token_credentials": "every writer (InsertToken and corrosion.SplitCredentials) checks " +
+		"Client.MayWriteCredentialTables first and writes only the parent row, in its previous-release " +
+		"shape, while it is false. The gate is DurablyLatched(credentials_split_v1) — mandatory, so " +
+		"advertised by every build carrying these tables and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
+		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
+		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
+	"cluster_policies": "the only writer is corrosion.SetFailoverScope, which returns " +
+		"ErrClusterPolicyGateClosed unless Client.MayWriteClusterPolicy. The daemon wires that gate to " +
+		"DurablyLatched(failover_scope_v1) — mandatory, so advertised by every build carrying this table and " +
+		"by none that does not, and in capabilities.replicationGated, so it is confirmed against every " +
+		"memberlist recipient rather than the voting members only. It fails CLOSED when unwired, so the " +
+		"latch cannot form, and nothing is written, while a previous-release peer is listening. Its one " +
+		"caller is the operator's SetFailoverScope RPC, which refuses on the same latch first",
+	"voter_configs": "the only writer is corrosion.WriteVoterConfig, which returns ErrVoterConfigGateClosed " +
+		"without touching the table unless Client.MayWriteVoterConfigs — the durable voter_config_v1 marker, " +
+		"wired by the daemon and failing CLOSED when unwired. voter_config_v1 is mandatory, so advertised by " +
+		"every build carrying this table (once its readiness probe passes) and by none that does not, and it " +
+		"is in capabilities.replicationGated, so the latch is confirmed against every memberlist recipient, a " +
+		"maintenance host on the previous build included, rather than the voting members only. The writers " +
+		"above it (automatic genesis and `lv cluster voter init|add|rm|reset`) refuse before the latch too",
+	"host_membership": "every writer (UpdateHostState, UpdateHostStartup, InsertHost, AdmitHost, IsolateHost, " +
+		"ClearHostIsolation and corrosion.SplitHostMembership) goes through Client.withMembershipWrite or " +
+		"checks Client.MayWriteHostMembership, and writes only the hosts columns, in their previous-release " +
+		"shapes, while it is false. The gate is the durable host_membership_split_v1 marker — mandatory, so " +
+		"advertised by every build carrying this table and by none that does not, and in " +
+		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather than " +
+		"the voting members only. It fails CLOSED when unwired, so the latch cannot form while a " +
+		"previous-release peer is listening. After the latch the hosts columns are still written, in their " +
+		"previous-release shapes, in the same batch — so no new hosts shape exists at all. The apply path's " +
+		"absorbUnlatchedMembershipWrite updates host_membership inside the WAL apply transaction and never " +
+		"logs a statement for it",
 }
 
 // tableShape is one builder statement reduced to what this guard decides on.

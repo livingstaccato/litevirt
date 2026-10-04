@@ -142,7 +142,7 @@ references a top-level `ipsets:` entry — useful for big admin lists.
 The CLI lives at `lv sg …` and `lv firewall …`:
 
 ```
-# Per-NIC tier: CRUD on security groups (mutates Corrosion state directly)
+# Per-NIC tier: CRUD on security groups (through the daemon; audited, needs sg.write)
 lv sg create web
 lv sg ls
 lv sg rule-add <sg-id> --direction ingress --proto tcp --port 80 --action accept
@@ -179,6 +179,58 @@ reconciler picks them up on its next poll (or immediately via
 `network[].security-groups` or `lv sg bind --network`; the cluster-tier
 rules, host-tier rules, ipsets, and default-deny policy are also persisted in
 cluster state and loaded by the reconciler's `CorrosionPlanLoader`.
+
+## Audit trail
+
+Every firewall-policy change made through the daemon lands in the signed
+audit log (`lv audit ls`, see [audit-log.md](audit-log.md)). That covers the
+CLI, the REST API and the web UI alike, because all three reach the same gRPC
+handlers with the caller's own credential. The same handler therefore decides
+who may make a change and records it: security-group edits need `sg.write` at
+`/` (Admin or NetworkAdmin) whether they come from `lv sg` or the web UI, and
+the row names the user the session belongs to.
+
+| Action | Target | Recorded by |
+|---|---|---|
+| `firewall.default-deny` | the scope (`cluster` or a host name) | `lv firewall default-deny`, UI default-policy toggle |
+| `firewall.cluster-rule.add` / `.rm` | rule id | `lv firewall cluster-rule add/rm`, UI |
+| `firewall.host-rule.add` / `.rm` | rule id | `lv firewall host-rule add/rm`, UI |
+| `firewall.ipset.add` / `.rm` | set name (add) / set id (rm) | `lv firewall ipset add/rm`, UI |
+| `sg.bind` | VM name | `lv sg bind`, `POST /api/v1/vms/bind-sgs` |
+| `sg.add` / `sg.rm` | group name (add) / group id (rm) | `lv sg create/rm`, UI |
+| `sg.rule.add` / `sg.rule.rm` | group id (add) / rule id (rm) | `lv sg rule-add/rule-rm`, UI |
+
+The row's user is the authenticated caller. Its detail records the policy
+before and after the change, in the form `before=<state> after=<state>`:
+
+```
+firewall.default-deny      cluster   before=deny after=accept
+firewall.cluster-rule.rm   9f2c…     before={ingress tcp port=22 cidr=10.0.0.0/8 accept priority=100} after=none
+sg.bind                    web-1     network=lan before=[isolate] after=[web,ssh]
+```
+
+The before-state matters most on a removal. A removed rule is tombstoned, so
+after that the audit row is the only record of which port the removal opened.
+A state is one of:
+
+- `{…}`: the rule, ip set or group, with every field that decides what it
+  matches or does. A removed group lists the rules that went with it.
+- `none`: a read that succeeded found no such row.
+- `unset`: no default policy for the scope, so it inherits (cluster: accept).
+- `unknown(<error>)`: the read failed, so the row claims nothing about what
+  was there. A failed read is never recorded as `none`.
+
+`lv sg create`, `lv sg rm`, `lv sg rule-add` and `lv sg rule-rm` go through
+the daemon's `CreateSecurityGroup`, `DeleteSecurityGroup`,
+`AddSecurityGroupRule` and `RemoveSecurityGroupRule` RPCs. Before that they
+wrote the host's Corrosion database straight from the CLI process, which
+skipped authorization and left no audit row. Each RPC checks the `sg.write`
+verb at `/` (Admin and NetworkAdmin hold it; Operator holds only `sg.read`; a
+cluster with no role bindings falls back to the operator role), and re-renders
+the connected host's ruleset at once, as the other tiers do. Against a daemon
+older than these RPCs the four commands fail with an error saying to upgrade
+litevirtd; they do not fall back to writing the database. `lv sg ls` and
+`lv sg rule-ls` are reads and still query the local database.
 
 ## Default-deny rollout
 

@@ -22,8 +22,12 @@ const (
 
 // ProbeInterval is the cadence at which an observer probes each peer. A probe
 // is started at most once per tick, so N consecutive failed probes from one
-// observer span at least (N-1) × ProbeInterval — the lower bound failover uses
-// to tell whether a peer has been down without a break since some instant.
+// observer span at least (N-1) × ProbeInterval. That is only a LOWER bound: a
+// probe of a powered-off host runs out its dial timeout, and the next starts
+// when the batch drains, so on the kvm003 lab such a run advanced one count
+// every ~2.85 s. Failover therefore reads when a run began from the verdict
+// itself (a failing verdict's last_seen, see checkHost) and falls back to this
+// bound only for a verdict from an older build, which never overstates a run.
 const ProbeInterval = checkInterval
 
 // unreadyFailures is the consecutive_failures an 'unready' row carries, for
@@ -77,6 +81,15 @@ type peerState struct {
 	// observer stopped, and the probe that straddled the stop, are not the same
 	// run of evidence as failures observed after it.
 	stallEpoch uint64
+	// answeredUnready is whether the last probe got an unready ANSWER. The
+	// silence count restarts after one, because an answer is not silence; it
+	// must not restart on every silent probe that follows.
+	answeredUnready bool
+	// runStart is when the first probe of the current run of unanswered probes
+	// was observed (local wall clock; zero when the last probe was answered).
+	// It restarts wherever `failures` restarts at 1, so it is the start of
+	// exactly the run the published count describes.
+	runStart time.Time
 }
 
 // Checker performs periodic health checks on peer hosts.
@@ -152,6 +165,20 @@ type Checker struct {
 	// observed across, or shortly after, a gap in this process's own execution
 	// are not evidence against the peer.
 	stall stallState
+
+	// voterSet replaces corrosion.VoterSet for the probe plan in tests. Nil in
+	// production.
+	voterSet func(context.Context) (map[string]bool, error)
+	// planned is the set of peers the last completed cycle's plan probed
+	// (probe_plan.go); nil until one has run. PeerUp reads it to tell "not
+	// probed by me" from "probed and not healthy".
+	planned map[string]bool
+	// quorumLost / quorumRegainedAt track, per quorum SCOPE
+	// (QuorumScopeCluster, RegionQuorumScope(r)), whether that quorum is
+	// currently lost and when it last went from No to Yes.
+	// InQuorumRegainGraceFor reads them. Guarded by mu.
+	quorumLost       map[string]bool
+	quorumRegainedAt map[string]time.Time
 }
 
 // now reads the checker's local clock.
@@ -249,8 +276,8 @@ func (c *Checker) Start(ctx context.Context) {
 	}
 }
 
-// checkAllPeers probes every peer once. It returns true only when it actually
-// ENUMERATED the host list — a ListHosts error probes nobody and returns false, so the
+// checkAllPeers probes every peer in this node's probe plan (probe_plan.go)
+// once. It returns true only when it actually ENUMERATED the host list — a ListHosts error probes nobody and returns false, so the
 // caller must not treat that tick as a completed warmup cycle (else Unknown collapses to
 // No with an empty c.peers on a single transient DB error).
 func (c *Checker) checkAllPeers(ctx context.Context) bool {
@@ -290,6 +317,17 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 		if host.State == "maintenance" {
 			continue
 		}
+		// Nor a host `lv host add` admitted whose daemon has not started:
+		// nothing listens there yet, by construction, and the coordinator does
+		// not fence it. Counting its failures anyway built a count past the
+		// fence threshold over a long setup, and the boot write that recorded
+		// it 'active' then met a fence quorum at once (kvm003 drill 6,
+		// main-b3368d7c: node-4 fenced 2 s after `lv host add` returned). Its
+		// count starts from zero once it is active, as for a host this checker
+		// has never probed.
+		if host.State == corrosion.HostStateJoining {
+			continue
+		}
 
 		// Detect CRL version mismatch (#49).
 		if localCRLVersion > 0 {
@@ -309,6 +347,58 @@ func (c *Checker) checkAllPeers(ctx context.Context) bool {
 
 		targets = append(targets, host)
 	}
+
+	// All-pairs among voters, sampled for non-voters (probe_plan.go). A voter
+	// set that cannot be read leaves the full mesh: the plan only ever drops
+	// edges no quorum counts, and without the voter set it cannot tell which.
+	names := planCandidates(c.hostName, hosts)
+	voters, verr := c.voters(ctx)
+	if verr != nil {
+		slog.Warn("health check: voter set unreadable; probing every peer this cycle", "error", verr)
+		voters = nil
+	}
+	plan := probePlan(c.hostName, names, voters, nonVoterProbeSample)
+	planned := targets[:0:0]
+	for _, h := range targets {
+		if plan[h.Name] {
+			planned = append(planned, h)
+		}
+	}
+	// A peer that left the plan leaves c.peers with it. Its last verdict would
+	// otherwise stand forever, and HealthyPeers would keep offering it as
+	// proven live. Maintenance hosts are not candidates and keep their entry,
+	// exactly as before the plan existed.
+	//
+	// So does a peer that left the host table: removed (`lv host rm`), it is
+	// no candidate at all, and the loop above never sees it. Its entry used to
+	// stay, failure count and all, keyed by a name the cluster can give a new
+	// machine (`lv host add` after `lv host rm --dead`). The first probe of that
+	// machine then published the old count plus one — past the fence threshold
+	// on a host this observer had never probed — and the coordinator fenced it
+	// mid-setup (kvm003 drill 6, main-8d1e56dc). A host back in the table starts
+	// from nothing, as after a restart of this checker.
+	// A joining host's entry goes the same way (see above): whatever this
+	// checker held for the name, it is not a count against this machine.
+	listed := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		if h.State != corrosion.HostStateJoining {
+			listed[h.Name] = true
+		}
+	}
+	c.mu.Lock()
+	for _, name := range names {
+		if !plan[name] {
+			delete(c.peers, name)
+		}
+	}
+	for name := range c.peers {
+		if !listed[name] {
+			delete(c.peers, name)
+		}
+	}
+	c.planned = plan
+	c.mu.Unlock()
+	targets = planned
 
 	// Probe peers with bounded concurrency and wait for the batch. Previously
 	// this fired one goroutine per host per tick with no bound — a probe that
@@ -382,12 +472,33 @@ func recoveryPending(state string) bool {
 //
 // That asymmetry — failing rows self-refresh, healthy ones do not — is why the
 // bug only ever showed up on the recovery path.
-func shouldPersistHealth(changed, healthy, recoveryPending bool, sinceLastWrite time.Duration) bool {
+//
+// An unready ANSWER gets the same heartbeat, whatever the host's state. Its
+// stored count is pinned (see checkHost), so an unready run changes nothing
+// after its first probe and would otherwise be written once and go stale. It
+// used to be rewritten on every probe instead — ~1,800 replicated writes per
+// observer per hour while a peer's store stayed wedged. Nothing reads
+// unready-row freshness more tightly than HeartbeatInterval: the fence and
+// confirmation quorums exclude unready rows outright, and the dual-run
+// detector's last-alive evidence tolerates deadHostSkewMargin (minutes).
+func shouldPersistHealth(changed, healthy, answeredUnready, recoveryPending bool, sinceLastWrite time.Duration) bool {
 	if changed {
 		return true
 	}
-	return healthy && recoveryPending && HeartbeatInterval > 0 && sinceLastWrite >= HeartbeatInterval
+	if HeartbeatInterval <= 0 || sinceLastWrite < HeartbeatInterval {
+		return false
+	}
+	return answeredUnready || (healthy && recoveryPending)
 }
+
+// The two host_health verdict shapes checkHost publishes. Every release since
+// v1.3.0 emits both, unchanged.
+const (
+	healthyVerdictSQL = `INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, ?, 0, ?, ?)`
+	unhealthyVerdictSQL = `INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?)`
+)
 
 func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	// net.JoinHostPort (not Sprintf): host.Address is a bare host and may be an
@@ -453,7 +564,7 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 		newFailures = 0
 	} else {
 		newFailures = prev.failures + 1
-		if result == probeUnreachable && prev.status == StatusUnready {
+		if result == probeUnreachable && prev.answeredUnready {
 			// Every unready probe before this one reached the peer and got an
 			// answer, so none of them is silence. The silence count starts
 			// here, and "suspect" — what fencing quorum counts — has to be
@@ -485,15 +596,28 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 			newFailures = unreadyFailures
 		case newFailures >= suspectThreshold:
 			newStatus = "suspect"
+		case prev.status == StatusUnready:
+			// Silent, but not yet long enough to call suspect. It stays what
+			// it last said it was: publishing "healthy" here would have
+			// QuorumProof count a peer that is neither answering nor ready.
+			newStatus = StatusUnready
 		default:
 			newStatus = "healthy"
 		}
 	}
 
-	// An unready verdict is republished on every probe, as it was while its
-	// count still climbed: the count is pinned now, and without this the row
-	// would be written once and go stale while the peer kept answering.
-	changed := !exists || newStatus != prev.status || newFailures != prev.failures || newStatus == StatusUnready
+	switch {
+	case result != probeUnreachable:
+		prev.runStart = time.Time{} // an answer, healthy or unready, ends the run
+	case newFailures == 1 || prev.runStart.IsZero():
+		prev.runStart = observedAt
+	}
+
+	// An unchanged unready verdict is not a change. Its count is pinned, so it
+	// is kept fresh by the HeartbeatInterval re-publish in shouldPersistHealth
+	// rather than by a replicated write on every probe.
+	changed := !exists || newStatus != prev.status || newFailures != prev.failures
+	prev.answeredUnready = result == probeNotReady
 	prev.status = newStatus
 	prev.failures = newFailures
 	// Local monotonic anchors updated every probe (not just on change) so Phase 2/5
@@ -510,7 +634,8 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	} else {
 		sinceWrite = HeartbeatInterval // never written: the first probe publishes
 	}
-	write := shouldPersistHealth(changed, healthy, recoveryPending(host.State), sinceWrite)
+	write := shouldPersistHealth(changed, healthy, result == probeNotReady, recoveryPending(host.State), sinceWrite)
+	runStart := prev.runStart
 	c.mu.Unlock()
 
 	if !write {
@@ -518,25 +643,44 @@ func (c *Checker) checkHost(ctx context.Context, host corrosion.HostRecord) {
 	}
 
 	now := c.db.NowTS()
-	exec := c.db.ExecuteDeferred
-	if c.writeFn != nil {
-		exec = c.writeFn
-	}
+	// Each arm CALLS the corrosion client directly. Do not fold the two into a
+	// func value (exec := c.db.ExecuteDeferred): stmtshapecheck finds replicated
+	// statements at their call sites, so a write through a func value is
+	// invisible to it. That happened once — both verdict shapes vanished from
+	// the scan, their ledger entries survived only until the next
+	// -emit-ledger, and after that every peer would have refused this
+	// observer's verdicts.
 	var err error
 	if healthy {
 		// last_seen is a wall/display column (read as wall time via parseTimestamp), so
 		// it must use NowWall, NOT NowTS — NowTS is the LWW key and becomes an HLC string.
-		err = exec(ctx,
-			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, ?, ?, 0, ?, ?)`,
-			c.hostName, host.Name, "healthy", c.db.NowWall(), now,
-		)
+		args := []interface{}{c.hostName, host.Name, "healthy", c.db.NowWall(), now}
+		if c.writeFn != nil {
+			err = c.writeFn(ctx, healthyVerdictSQL, args...)
+		} else {
+			err = c.db.ExecuteDeferred(ctx, healthyVerdictSQL, args...)
+		}
 	} else {
-		err = exec(ctx,
-			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-			c.hostName, host.Name, newStatus, newFailures, nil, now,
-		)
+		// A failing verdict's last_seen is when this run of unanswered probes
+		// began: the observer last saw the host answer before then, and has
+		// seen nothing since. Failover reads it as the start of the outage
+		// this observer is watching (observerStreakSpans), where the count
+		// alone only bounds it — the count advances once per probe, and a
+		// probe of a dead host takes longer than ProbeInterval. Same wall
+		// format as the healthy arm; sub-second, since a fence and a
+		// confirmation are compared against it. An answered-unready verdict
+		// keeps NULL. The statement is unchanged: this has always been a
+		// bound parameter, NULL until now.
+		var lastSeen interface{}
+		if !runStart.IsZero() {
+			lastSeen = runStart.UTC().Format(time.RFC3339Nano)
+		}
+		args := []interface{}{c.hostName, host.Name, newStatus, newFailures, lastSeen, now}
+		if c.writeFn != nil {
+			err = c.writeFn(ctx, unhealthyVerdictSQL, args...)
+		} else {
+			err = c.db.ExecuteDeferred(ctx, unhealthyVerdictSQL, args...)
+		}
 	}
 	if err != nil {
 		// Do NOT advance lastWriteAt. It records when a verdict was PUBLISHED,

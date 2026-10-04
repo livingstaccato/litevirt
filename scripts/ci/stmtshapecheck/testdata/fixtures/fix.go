@@ -52,6 +52,18 @@ func Guarded(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, er
 	})
 }
 
+func GuardedEntries(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, error)) {
+	tail := corrosion.Statement{SQL: "UPDATE t SET a = ? WHERE id = ?"}
+	_, _ = c.ExecuteEntriesGuarded(ctx, g, [][]corrosion.Statement{ // want: resolved (every entry)
+		{{SQL: "INSERT INTO t (a) VALUES (?)"}},
+		{tail},
+	})
+}
+
+func OpaqueEntries(c *corrosion.Client, ctx context.Context, g func(*sql.Tx) (bool, error), es [][]corrosion.Statement) {
+	_, _ = c.ExecuteEntriesGuarded(ctx, g, es) // want: unresolved (a parameter)
+}
+
 // Shadowed: the call uses the PARAMETER stmts; a shadowing inner `stmts :=` is a different
 // object and must NOT make it appear resolved.
 func Shadowed(c *corrosion.Client, ctx context.Context, stmts []corrosion.Statement) {
@@ -146,6 +158,22 @@ func HelperMutation(c *corrosion.Client, ctx context.Context) {
 	stmts := []corrosion.Statement{{SQL: "INSERT INTO t (a) VALUES (?)"}}
 	mutateStmts(stmts)
 	_ = c.ExecuteBatch(ctx, stmts) // want: unresolved (slice escapes to unknown helper)
+}
+
+// MethodValue takes a replicating method as a func value so a test can swap it; the SQL it
+// is later called with never reaches a call-site scan.
+func MethodValue(c *corrosion.Client, ctx context.Context, swap func(context.Context, string, ...interface{}) error) {
+	exec := c.ExecuteDeferred // want: method value
+	if swap != nil {
+		exec = swap
+	}
+	_ = exec(ctx, "INSERT INTO t (a, updated_at) VALUES (?, ?)", 1, 2)
+}
+
+// MethodExpr is the same escape through a method expression.
+func MethodExpr(c *corrosion.Client, ctx context.Context) {
+	f := (*corrosion.Client).Execute // want: method value
+	_ = f(c, ctx, "INSERT INTO t (a, updated_at) VALUES (?, ?)", 1, 2)
 }
 
 // UnrelatedExecute uses text/template.Execute — a different Execute; must NOT be flagged.

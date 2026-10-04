@@ -58,8 +58,10 @@ import (
 //     over exactly one TTL later than usual. See deferTakeover.
 //
 // The register is in memory. After a restart it refills from the next
-// anti-entropy exchange, because the two rows still disagree and the merge
-// re-compares them every sweep — the same property that makes an unresolved tie
+// anti-entropy exchange, because the two rows still disagree and a restarted
+// node's first pass against each peer pulls and re-compares them (later passes
+// skip a table settled by that pull — settled_ties.go — whose record is in
+// memory too, so a restart never skips the re-compare) — the same property that makes an unresolved tie
 // re-appear after a restart (see acknowledgedTies). It is deliberately NOT the
 // unresolved-tie register: an operator acknowledging a tie clears evidence
 // tracking, and must never be what lets a losing claimant resume acting.

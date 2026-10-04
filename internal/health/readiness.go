@@ -37,7 +37,7 @@ const StatusUnready = "unready"
 // verdict from (false, reason), which means reachable and answering and not
 // able to serve. Injected from the daemon (grpcapi.Server.PeerReady); nil
 // leaves the old TLS-only probe in place.
-type PeerReadiness func(ctx context.Context, host string) (ready bool, reason string, err error)
+type PeerReadiness func(ctx context.Context, host, addr string) (ready bool, reason string, err error)
 
 // SetPeerReadiness injects the application-level readiness prober.
 func (c *Checker) SetPeerReadiness(fn PeerReadiness) {
@@ -85,7 +85,7 @@ func (c *Checker) probeHost(ctx context.Context, name, addr string) probeResult 
 	}
 	rctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
-	ok, reason, err := ready(rctx, name)
+	ok, reason, err := ready(rctx, name, addr)
 	if err != nil {
 		return probeUnreachable
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os/exec"
 	"sort"
 	"strings"
 	"sync"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/lxc"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
@@ -55,10 +55,7 @@ const dualRunPeerTimeout = 5 * time.Second
 // container list would fail "lxc-ls: executable not found"; that is NOT a coverage blind
 // spot (containers can't run here), so the detector skips the CT probe entirely rather
 // than marking the snapshot partial. It's a var so tests can stub it.
-var lxcCapable = func() bool {
-	_, err := exec.LookPath("lxc-create")
-	return err == nil
-}
+var lxcCapable = lxc.Available
 
 // migrationStates are DB workload states in which the DB owner legitimately differs from
 // the sole runtime holder — the OWNER-MISMATCH cutover-lag window (the DB row is mid-move
@@ -539,20 +536,15 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 			if mi.status == MarkerValid && mi.epoch == vmEpoch[vm] {
 				continue
 			}
-			// A PRE-EPOCH row awaiting the owner's backfill. A fresh create is
-			// born at vm_owner_epoch 0 and graduates on the reconciler's next
-			// sweep — which also writes its first marker — so a running VM with
-			// DB epoch 0 and NO marker is the expected newborn state, not a
-			// regime violation. Paging it made every fresh `lv run` flash a
-			// critical for up to a sweep interval (lab, 2026-08-05). Scoped
-			// tightly: a PRESENT marker against an epoch-0 row still pages (the
-			// runtime claims a generation the DB does not know), a missing
-			// marker on a GRADUATED row remains the violation it always was,
-			// AND the exception is time-bounded — a VM still ungraduated past
-			// newbornEpochGrace is a WEDGED backfill, not a newborn, and pages.
-			if vmEpoch[vm] == 0 && mi.status == MarkerMissing && withinNewbornGrace(vmCreated[vm]) {
-				continue
-			}
+			// No newborn exception. Every create publishes a VM running only
+			// after it holds a positive epoch and a marker names it
+			// (colonelpanik/litevirt#157), so a runtime on its owner at epoch 0
+			// with no marker is not a create in progress: it is a create whose
+			// finish failed and has not been completed by the owner's
+			// reconciler, or a row nothing graduated, and it pages like any
+			// other runtime that cannot prove its generation. The debounce
+			// already absorbs the few calls between a create's insert and its
+			// publish.
 			add(kindEpochMismatch, vm, fmt.Sprintf(
 				"VM %q on its DB owner %q carries an owner-epoch marker that is %s (marker %d, DB epoch %d) — "+
 					"the runtime cannot prove it belongs to the current ownership generation.",
@@ -735,62 +727,6 @@ type dbVMView struct {
 	updated    map[string]string
 	epoch      map[string]int64
 	tombstoned map[string]string // name -> last known host_name
-}
-
-// newbornEpochGrace bounds how long a VM may sit at the pre-epoch generation 0
-// with no runtime marker before the owner-epoch detector stops treating it as a
-// just-created newborn and pages it. A fresh create graduates on the
-// reconciler's next sweep (seconds to a minute); this window is generous enough
-// to cover several sweeps and cross-host clock skew, so a VM still ungraduated
-// past it is a genuinely WEDGED backfill that must surface, not newborn noise.
-// (Only reachable under owner_epoch_v1 enforcement, which readiness gates on the
-// backfill already being complete — so any epoch-0 row seen here was created
-// AFTER the latch and legitimately carries a recent created_at.)
-const newbornEpochGrace = 5 * time.Minute
-
-// withinNewbornGrace reports whether an epoch-0 VM created at createdAt is still
-// inside its backfill grace. An unparseable or empty timestamp is treated as
-// OUTSIDE the grace: a row we cannot age is not given the newborn exception, so
-// the detector fails toward paging rather than silently suppressing.
-//
-// The window is bounded in BOTH directions, which a bare "younger than the
-// grace" test is not: time.Since is NEGATIVE for a created_at in the future and
-// every negative duration is less than the grace, so a row stamped in the year
-// 9999 would sit in the exception forever and permanently lose owner-epoch
-// protection without ever paging. That is reachable without an attacker (a
-// creator whose clock is badly wrong) and with one (created_at is a replicated
-// column, and corrosion is last-writer-wins, so any peer can write it) — a
-// detector must not have an input that switches it off indefinitely.
-//
-// A modest future stamp is honest clock skew between the creator and whichever
-// host is evaluating, and still earns the exception; the same grace bounds it on
-// that side, so any ONE stamp buys at most two grace windows of suppression.
-//
-// Be precise about what that does and does not buy. It bounds a stamp that is
-// wrong ONCE — a bad creator clock, a wedged backfill, a row forged and left
-// alone. It does NOT bound a peer that REWRITES created_at before each pass:
-// this is re-evaluated against freshly-read DB state every sweep, so a renewed
-// stamp keeps the exception open indefinitely. That is not a property this
-// predicate can recover on its own.
-//
-// It used to be worse. The same writer could suppress the whole epoch check
-// more cheaply — and WITHOUT renewing — by setting state to a migrationState,
-// setting deleted_at (ListVMs filters it), or pointing host_name at a host
-// that is never probed. Those three are no longer silent: each is now
-// corroborated against runtime evidence this leader gathered itself, and a row
-// that says "do not look" while the runtime says the workload is running
-// raises kindEpochSuppressed. See the three SUPPRESSION blocks in
-// detectDualRunPass.
-//
-// That narrows the boundary; it does not close it. The detector still judges
-// replicated state using replicated state, and a writer who ALSO stops the
-// workload, or who owns the host doing the probing, is not caught by any of
-// this. Closing it properly means either detector-owned durable state the
-// peers cannot reset, or assigning a positive epoch and writing markers BEFORE
-// a VM is published as running, which removes the newborn window instead of
-// bounding it. Both are tracked separately.
-func withinNewbornGrace(createdAt string) bool {
-	return withinGrace(createdAt, newbornEpochGrace)
 }
 
 // withinGrace is the shared both-direction age test. An unparseable or empty

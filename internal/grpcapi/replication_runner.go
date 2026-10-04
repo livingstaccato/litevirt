@@ -631,10 +631,17 @@ var syncPath = func(path string) error {
 
 func publishReplica(ctx context.Context, dst string, write func(tmp string) error) error {
 	_ = ctx
-	tmp := filepath.Join(filepath.Dir(dst), "."+filepath.Base(dst)+".partial")
-	// A leftover from an earlier interrupted run would otherwise be appended to
-	// or confuse the converter.
-	_ = os.Remove(tmp)
+	// A ".repl-*.tmp" name in the destination directory: the rename stays on
+	// one filesystem, isReplicaOf cannot match it, and a copy a crash left
+	// half-written is collected by sweepStaleStagingTemps. The earlier
+	// ".<name>.partial" matched no sweep pattern, and the next run's new
+	// timestamp never reused it, so each crash leaked a full-size image.
+	f, err := os.CreateTemp(filepath.Dir(dst), ".repl-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create replica temp: %w", err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
 	if err := write(tmp); err != nil {
 		_ = os.Remove(tmp)
 		return err

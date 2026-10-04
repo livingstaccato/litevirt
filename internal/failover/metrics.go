@@ -24,6 +24,11 @@ type Metrics interface {
 	// a human, and what they should do depends on WHY the host is down — see
 	// strandedWorkloads.
 	StrandedWorkloads(n int)
+	// RegionsWithoutQuorum reports how many regions hold at least one worker
+	// but have fewer than corrosion.MinRegionVoters voters, so cannot fence
+	// one of their own hosts while failover is region-scoped. A GAUGE, the
+	// lease holder's view like StrandedWorkloads; 0 under the cluster scope.
+	RegionsWithoutQuorum(n int)
 }
 
 // Phases, results, actions, and error classes are a CLOSED vocabulary kept as
@@ -37,6 +42,11 @@ const (
 	PhaseFence      = "fence"
 	PhaseSplitBrain = "split-brain-guard"
 	PhaseRecovery   = "recovery"
+	// PhaseClaim is a recovery claim (docs/design/recovery-claims.md §5.4):
+	// the certificate a reschedule, promote or relocate needs before it is
+	// minted. Its results are ok, lost, no_majority, owner_reachable,
+	// source_mismatch and superseded.
+	PhaseClaim = "claim"
 
 	ResultOK        = "ok"
 	ResultSkipped   = "skipped"
@@ -45,6 +55,12 @@ const (
 	ResultRefused   = "refused"
 	ResultError     = "error"
 	ResultRecovered = "recovered"
+	// Claim results (PhaseClaim).
+	ResultLost           = "lost"            // another value was decided for the key
+	ResultNoMajority     = "no_majority"     // no majority promised or accepted
+	ResultOwnerReachable = "owner_reachable" // voters reached the recorded owner and refused
+	ResultSourceMismatch = "source_mismatch" // voters' settled row names another owner
+	ResultSuperseded     = "superseded"      // the key moved to attempt+1 on supersede evidence
 
 	ActionPromote    = "promote"
 	ActionReschedule = "reschedule"
@@ -64,6 +80,10 @@ const (
 	ErrUpgrading       = "upgrading"
 	ErrRecentlyFenced  = "recently_fenced"
 	ErrRecoveryResumed = "recovery_resumed" // recovery picked up from a fence a previous leader recorded
+	// ErrRefenceFailed: a successor re-fenced a host whose recorded verified
+	// fence was aged or in doubt, the re-fence failed, and the recovery was
+	// left for an operator's `lv host fence-confirm`.
+	ErrRefenceFailed = "refence_failed"
 	// recovery picked up from an operator confirmation of a host whose recovery
 	// was refused for lack of one
 	ErrConfirmationResumed = "confirmation_resumed"
@@ -86,6 +106,32 @@ const (
 	// ErrLocalStall: quorum agreed a host failed, but this coordinator itself
 	// stopped running within health.StallGrace, so the fence is deferred.
 	ErrLocalStall = "local_stall"
+	// ErrRegionTooSmall: under region-scoped failover, a host the cluster-wide
+	// count would fence was not, because its region has too few voters to
+	// fence one of its own.
+	ErrRegionTooSmall = "region_too_small"
+	// ErrRegionScoped: under region-scoped failover, a host the cluster-wide
+	// count would fence was not, because the observations came from voters
+	// outside its region. A site partition looks like this.
+	ErrRegionScoped = "region_scoped"
+	// ErrClaimStranded: a recovery claim decided a destination that has since
+	// failed before acting; the workload waits for it to return or be removed
+	// for good (`lv host rm --dead`).
+	ErrClaimStranded = "recovery_claim_stranded"
+	// ErrPartitionPauseWait: a best-effort fence did not reach the host and
+	// the coordinator relies on its partition pause, so recovery waits out
+	// health.PartitionPauseWaitFor (docs/design/partition-pause.md §4).
+	ErrPartitionPauseWait = "partition_pause_wait"
+	// ErrQuorumRegain: quorum agreed a host failed, but this coordinator was
+	// itself cut off from the majority within health.QuorumRegainGrace.
+	ErrQuorumRegain = "quorum_regain"
+	// ErrConfirmationFence: an operator confirmed a host off during the outage
+	// in progress and no fence had run for it, so the coordinator fenced it
+	// afresh rather than leaving it terminal with nothing to fence it.
+	ErrConfirmationFence = "confirmation_fence"
+	// ErrJoining: quorum agreed a host failed, but it is a host `lv host add`
+	// admitted whose daemon has not started yet, so it is not fenced.
+	ErrJoining = "joining"
 )
 
 // nil-safe wrappers so the coordinator can increment unconditionally.
@@ -111,5 +157,12 @@ func (c *Coordinator) mCt(action, result, errClass string) {
 func (c *Coordinator) mStranded(n int) {
 	if c.Metrics != nil {
 		c.Metrics.StrandedWorkloads(n)
+	}
+}
+
+// mRegionsWithoutQuorum reports the regions-without-quorum gauge (nil-safe).
+func (c *Coordinator) mRegionsWithoutQuorum(n int) {
+	if c.Metrics != nil {
+		c.Metrics.RegionsWithoutQuorum(n)
 	}
 }

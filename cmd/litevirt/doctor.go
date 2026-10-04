@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // newDoctorCmd groups read-only cluster-health diagnostics.
@@ -73,6 +74,12 @@ Divergences are reported only when they persist across two samples (an in-flight
 replication delta is filtered out). --include-sensitive also scans secret-bearing
 tables over the peer-mTLS lane, reporting only keyed HMAC labels (never plaintext).
 
+A contested row that every host holding it has acknowledged ('lv cluster
+acknowledge-lease-term'), in a table where nothing else differs, is listed under
+"Acknowledged ties" as acknowledged_tie and is not counted as a divergence: the
+rule 'lv cluster converge' uses for ACKNOWLEDGED. A tie acknowledged on only some
+hosts stays a divergence, and its line names the hosts still to acknowledge it.
+
 Run this BEFORE any remediation that changes merge behavior — convergence
 destroys the per-node evidence.`,
 		Args: cobra.NoArgs,
@@ -114,28 +121,30 @@ func renderDivergenceReport(rep *pb.DivergenceReport) {
 		fmt.Println("WARNING: cluster was not quiescent across the scan — a stuck_different may be replication backlog; re-run when settled.")
 	}
 
-	if len(rep.GetRows()) == 0 && len(rep.GetViolations()) == 0 {
-		fmt.Println("\nno divergence detected.")
-		return
+	// An acknowledged tie (every host holding it has acknowledged it, and
+	// nothing else in its table differs: what `lv cluster converge` lists as
+	// ACKNOWLEDGED) is listed, since both claims are kept, but it is not a
+	// divergence and does not keep the scan from reading clean.
+	var diverging, acknowledged []*pb.DivergenceRow
+	for _, r := range rep.GetRows() {
+		if r.GetClass() == ackTieClass {
+			acknowledged = append(acknowledged, r)
+		} else {
+			diverging = append(diverging, r)
+		}
 	}
 
-	if rows := rep.GetRows(); len(rows) > 0 {
-		fmt.Printf("\nDiverging rows (%d):\n", len(rows))
-		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(w, "TABLE\tPK\tCLASS\tPER-NODE (host=updated_at/hash)")
-		for _, r := range rows {
-			parts := make([]string, 0, len(r.GetPerNode()))
-			for _, m := range r.GetPerNode() {
-				h := shortHash(m.GetRowHash())
-				marker := ""
-				if m.GetDeleted() {
-					marker = " (deleted)"
-				}
-				parts = append(parts, fmt.Sprintf("%s=%s/%s%s", m.GetHost(), m.GetUpdatedAt(), h, marker))
-			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.GetTable(), r.GetPk(), r.GetClass(), strings.Join(parts, "  "))
-		}
-		_ = w.Flush()
+	if len(diverging) == 0 && len(rep.GetViolations()) == 0 {
+		fmt.Println("\nno divergence detected.")
+	}
+
+	if len(diverging) > 0 {
+		fmt.Printf("\nDiverging rows (%d):\n", len(diverging))
+		printDivergenceRows(diverging)
+	}
+	if len(acknowledged) > 0 {
+		fmt.Printf("\nAcknowledged ties (%d) — both claims kept; not counted as divergence:\n", len(acknowledged))
+		printDivergenceRows(acknowledged)
 	}
 
 	if vs := rep.GetViolations(); len(vs) > 0 {
@@ -147,6 +156,37 @@ func renderDivergenceReport(rep *pb.DivergenceReport) {
 		}
 		_ = w.Flush()
 	}
+}
+
+// ackTieClass is corrosion.ClassAcknowledgedTie, spelled here so the CLI
+// matches the class the server assigns.
+const ackTieClass = string(corrosion.ClassAcknowledgedTie)
+
+func printDivergenceRows(rows []*pb.DivergenceRow) {
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(w, "TABLE\tPK\tCLASS\tPER-NODE (host=updated_at/hash)")
+	for _, r := range rows {
+		parts := make([]string, 0, len(r.GetPerNode()))
+		for _, m := range r.GetPerNode() {
+			h := shortHash(m.GetRowHash())
+			marker := ""
+			if m.GetDeleted() {
+				marker = " (deleted)"
+			}
+			parts = append(parts, fmt.Sprintf("%s=%s/%s%s", m.GetHost(), m.GetUpdatedAt(), h, marker))
+		}
+		// A row in a table where some host acknowledged a tie, that is not
+		// itself acknowledged_tie: say who is still to acknowledge, or that
+		// everyone has and something else in the table differs.
+		switch off := r.GetTieUnacknowledgedOn(); {
+		case len(off) > 0:
+			parts = append(parts, fmt.Sprintf("(tie not acknowledged on %s)", strings.Join(off, ",")))
+		case len(r.GetTieAcknowledgedOn()) > 0 && r.GetClass() != ackTieClass:
+			parts = append(parts, "(tie acknowledged on every host, but the table differs elsewhere)")
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", r.GetTable(), r.GetPk(), r.GetClass(), strings.Join(parts, "  "))
+	}
+	_ = w.Flush()
 }
 
 func shortHash(h string) string {

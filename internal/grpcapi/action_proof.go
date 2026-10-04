@@ -22,7 +22,7 @@ func proofFromPB(p *pb.RuntimeActionProof) corrosion.ActionProof {
 		QuorumLive: int(p.GetQuorumLive()), QuorumNeeded: int(p.GetQuorumNeeded()),
 		RelocationToken: p.GetRelocationToken(), FenceEpoch: p.GetFenceEpoch(),
 		OwnerEpoch: p.GetOwnerEpoch(), LeaseTerm: p.GetLeaseTerm(),
-		LeaseKey: p.GetLeaseKey(),
+		LeaseKey: p.GetLeaseKey(), ClaimCertificate: p.GetClaimCertificate(),
 	}
 }
 
@@ -48,7 +48,7 @@ func proofToPB(p corrosion.ActionProof) *pb.RuntimeActionProof {
 		QuorumLive: int32(p.QuorumLive), QuorumNeeded: int32(p.QuorumNeeded),
 		RelocationToken: p.RelocationToken, FenceEpoch: p.FenceEpoch,
 		OwnerEpoch: p.OwnerEpoch, LeaseTerm: p.LeaseTerm,
-		LeaseKey: p.LeaseKey,
+		LeaseKey: p.LeaseKey, ClaimCertificate: p.ClaimCertificate,
 	}
 }
 
@@ -141,6 +141,14 @@ func validateProofTermStamp(p *pb.RuntimeActionProof) error {
 // replication); (3) claims it (single-holder). A terminal/held proof → refuse
 // (no double-execution). Returns (id, nil) so the caller can complete/fail it.
 func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof, action, targetKind, targetName string) (string, error) {
+	return s.claimCarriedProofOwned(ctx, p, action, targetKind, targetName, false)
+}
+
+// claimCarriedProofOwned is claimCarriedProof with ownerMove: true for a
+// relocate the workload's own, live owner drives (container cold migration),
+// which is exempt from the recovery-claim certificate (see
+// verifyRecoveryClaim). Every other caller passes false.
+func (s *Server) claimCarriedProofOwned(ctx context.Context, p *pb.RuntimeActionProof, action, targetKind, targetName string, ownerMove bool) (string, error) {
 	if p == nil {
 		return "", nil // no proof carried — caller proceeds ungated (legacy, pre-flip)
 	}
@@ -221,6 +229,18 @@ func (s *Server) claimCarriedProof(ctx context.Context, p *pb.RuntimeActionProof
 		if err := s.checkProofLeaseTerm(ctx, p, action, targetName); err != nil {
 			return "", err
 		}
+	}
+	// The recovery-claim certificate (docs/design/recovery-claims.md §3.10),
+	// after the persisted-row and owner-epoch checks and BEFORE the claim: a
+	// destination starts a recovered workload only with a verifiable majority
+	// certificate for exactly this proof. It reads the persisted row, whose
+	// certificate WriteActionProofValidated above has just reconciled with the
+	// carried one, so a certificate that arrived by replication counts too.
+	if pr, ok, err := corrosion.GetActionProof(ctx, s.db, p.GetId()); err != nil || !ok {
+		return "", status.Errorf(codes.Unavailable, "read proof %s after persisting it: found=%v err=%v", p.GetId(), ok, err)
+	} else if reason, verr := s.verifyRecoveryClaim(ctx, pr.ActionProof, ownerMove); verr != nil {
+		s.noteGateRefused(action, reason)
+		return "", verr
 	}
 	if err := corrosion.ClaimActionProofFenced(ctx, s.db, p.GetId(), s.hostName,
 		s.leaseTermFenceFor(ctx, p)); err != nil {

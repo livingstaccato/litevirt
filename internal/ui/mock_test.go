@@ -39,6 +39,11 @@ type mockGRPC struct {
 	// authorization gate rather than only its happy path.
 	whoamiRole string
 	whoamiErr  error
+	// stateDumpCalls counts GetStateDump calls: the UI must never make one (the
+	// dump is peer-only and carries secret columns). lastTriggerAntiEntropy
+	// records the Force Sync button's request.
+	stateDumpCalls         int
+	lastTriggerAntiEntropy *pb.TriggerAntiEntropyRequest
 	// Response fields
 	listHostsResp          *pb.ListHostsResponse
 	listHostNetworksResp   *pb.ListHostNetworksResponse
@@ -971,7 +976,16 @@ func (m *mockGRPC) GetStateDigest(context.Context, *emptypb.Empty, ...grpc.CallO
 	return &pb.StateDigestResponse{}, nil
 }
 func (m *mockGRPC) GetStateDump(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.StateDumpResponse, error) {
+	m.mu.Lock()
+	m.stateDumpCalls++
+	m.mu.Unlock()
 	return &pb.StateDumpResponse{}, nil
+}
+func (m *mockGRPC) TriggerAntiEntropy(_ context.Context, req *pb.TriggerAntiEntropyRequest, _ ...grpc.CallOption) (*pb.TriggerAntiEntropyResponse, error) {
+	m.mu.Lock()
+	m.lastTriggerAntiEntropy = req
+	m.mu.Unlock()
+	return &pb.TriggerAntiEntropyResponse{Triggered: []string{"host1"}}, nil
 }
 func (m *mockGRPC) PushMutations(context.Context, *pb.ReplicateRequest, ...grpc.CallOption) (*pb.ReplicateResponse, error) {
 	return &pb.ReplicateResponse{}, nil
@@ -1000,8 +1014,8 @@ func (m *mockGRPC) RemoveLB(context.Context, *pb.RemoveLBRequest, ...grpc.CallOp
 func (m *mockGRPC) EnsureCloudInit(context.Context, *pb.EnsureCloudInitRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
 }
-func (m *mockGRPC) EnsureDisks(context.Context, *pb.EnsureDisksRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
-	return &emptypb.Empty{}, nil
+func (m *mockGRPC) EnsureDisks(context.Context, *pb.EnsureDisksRequest, ...grpc.CallOption) (*pb.EnsureDisksResponse, error) {
+	return &pb.EnsureDisksResponse{}, nil
 }
 func (m *mockGRPC) CleanupMigrationArtifacts(context.Context, *pb.CleanupMigrationArtifactsRequest, ...grpc.CallOption) (*emptypb.Empty, error) {
 	return &emptypb.Empty{}, nil
@@ -1124,11 +1138,6 @@ func newTestUIServer(t *testing.T, mock *mockGRPC) *Server {
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	// The write paths with no gRPC twin call the daemon's authorizer, which
-	// fails CLOSED when absent. Tests get one that applies the same role rule
-	// the daemon would, driven by the mock's whoamiRole — so a viewer is still
-	// refused and the assertions keep their meaning.
-	s.SetAuthorizer(mockAuthorizer{mock})
 	return s
 }
 
@@ -1548,12 +1557,4 @@ func (m *mockGRPC) DeleteIpSet(_ context.Context, _ *pb.DeleteIpSetRequest, _ ..
 		return nil, err
 	}
 	return &emptypb.Empty{}, nil
-}
-
-// mockAuthorizer stands in for the daemon's AuthorizeInProcess in UI tests. It
-// applies the same operator bar the real one falls back to.
-type mockAuthorizer struct{ m *mockGRPC }
-
-func (a mockAuthorizer) AuthorizeInProcess(_ context.Context, _, _, _ string) error {
-	return a.m.requireOperator()
 }

@@ -25,6 +25,8 @@ type AntiEntropyMetrics struct {
 	mergeRejected        *prometheus.CounterVec
 	legacyTransformed    *prometheus.CounterVec
 	identityOrphan       *prometheus.CounterVec
+	digestTables         *prometheus.CounterVec
+	pullRows             *prometheus.CounterVec
 }
 
 // NewAntiEntropyMetrics registers the anti-entropy timing metrics on the default
@@ -72,6 +74,14 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Name: "litevirt_identity_collapse_orphaned_total",
 			Help: "Natural-key identity collapses whose losing physical row referenced a different host/artifact, potentially leaving that host's snapshot file unreferenced, by table. NOT auto-deleted; the losing id/host/path is logged (WARN) for operator cleanup. Alert on rate.",
 		}, []string{"table"}),
+		digestTables: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_antientropy_digest_tables_total",
+			Help: "Tables a state digest took from the digest cache (result=cached) or scanned (result=computed), counted per digest a pass computes or a peer asks for.",
+		}, []string{"result"}),
+		pullRows: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "litevirt_antientropy_pull_rows_total",
+			Help: "Rows an anti-entropy repair pull received, by scope: bucket (only the buckets whose digests disagreed) or table (the whole table).",
+		}, []string{"scope"}),
 		tieBreaks: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "litevirt_lww_tie_break_total",
 			Help: "Exact-timestamp ties a resolver converged, by table, resolver rule, and winner (local/incoming).",
@@ -89,7 +99,7 @@ func newAntiEntropyMetrics(reg prometheus.Registerer) *AntiEntropyMetrics {
 			Help: "Distinct unresolved ties this node is CURRENTLY tracking (a gauge — drops to 0 when repaired). Alert on this for 'something is divergent now'; the _total counter is monotonic and would page forever.",
 		}),
 	}
-	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected, m.legacyTransformed, m.identityOrphan)
+	reg.MustRegister(m.dumpSeconds, m.digestSeconds, m.mergeSeconds, m.dumpBytes, m.rowsMerged, m.rowsSkipped, m.tieBreaks, m.tieUnresolved, m.tombstoneTies, m.tieUnresolvedCurrent, m.mergeRejected, m.legacyTransformed, m.identityOrphan, m.digestTables, m.pullRows)
 	return m
 }
 
@@ -104,6 +114,25 @@ func (m *AntiEntropyMetrics) ObserveDump(d time.Duration, bytes int) {
 // ObserveDigest records a state-digest computation.
 func (m *AntiEntropyMetrics) ObserveDigest(d time.Duration) {
 	m.digestSeconds.Observe(d.Seconds())
+}
+
+// ObserveDigestTables records how many tables one digest took from the cache
+// and how many it scanned. (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObserveDigestTables(cached, computed int) {
+	if cached > 0 {
+		m.digestTables.WithLabelValues("cached").Add(float64(cached))
+	}
+	if computed > 0 {
+		m.digestTables.WithLabelValues("computed").Add(float64(computed))
+	}
+}
+
+// ObservePullRows records the rows a repair pull received for one scope.
+// (Satisfies corrosion.SyncMetrics.)
+func (m *AntiEntropyMetrics) ObservePullRows(scope string, rows int) {
+	if rows > 0 {
+		m.pullRows.WithLabelValues(scope).Add(float64(rows))
+	}
 }
 
 // ObserveMerge records a full-state merge and the rows it applied/skipped.

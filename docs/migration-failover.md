@@ -67,6 +67,29 @@ lv migrate my-vm host-b --with-storage
 
 The disk is streamed to the target over libvirt's block-copy / NBD channel
 while the VM keeps running; the source is undefined after a successful cutover.
+
+Only the host-local disks (`local` and `dir` pools) are copied. A disk on
+shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on
+the target, so it stays where it is; copying it would mirror the disk onto
+itself. A VM with no host-local disk is migrated without a storage copy, even
+with `--with-storage`.
+
+Before the copy, the source checks each disk against its record and the target
+creates an empty file for each disk to be copied into. The migration is refused,
+before anything is copied, when:
+
+- a disk's size differs from its recorded size. Make the disk and its record
+  agree first.
+- the target already has a file at a disk's path that this migration did not
+  create, for example a copy of the VM's disk left from an earlier stay on that
+  host. Copying onto it would overwrite it. The error names the file and the
+  host. Check whether the file is still needed, move it aside or remove it, then
+  migrate again.
+- the target cannot create the files at all.
+
+If a copy fails, the target removes only the files it created for that attempt.
+It decides that from its own record, whatever the source asks it to remove.
+
 You can also set it as a per-VM default in compose:
 
 ```yaml
@@ -101,7 +124,15 @@ lv host undrain host-a
 
 ### Host health
 
-Every host probes every other host via TLS connection to the gRPC port (7443) every 2 seconds. Results are stored in the `host_health` table.
+Hosts probe each other via TLS connection to the gRPC port (7443) every 2 seconds. Results are stored in the `host_health` table.
+
+A voter probes every host that is not in `maintenance`. A non-voter probes
+every voter plus three other non-voters (its successors in name order), so
+every host is observed by every voter, which is whose rows the fence and
+recovery quorums count. A non-voter's view of a peer it does not probe is
+taken by probing it on demand wherever a decision reads "is this host down".
+With today's voter set every host that is not `offline`, `maintenance` or
+`fenced` votes, so the probe mesh is still full.
 
 A host transitions to `suspect` after 3 consecutive probe failures. The failover coordinator takes action after quorum confirmation.
 
@@ -200,10 +231,11 @@ VMs with a `healthcheck` defined in their compose spec are periodically checked:
 
 When a host goes offline, the failover coordinator:
 
-1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1). Only fresh observations count: a `host_health` row older than 30s, or dated more than 30s ahead of the coordinator's own clock (a skewed observer), is not evidence
-2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery".
+1. **Detects failure** — quorum of observers must agree the host is unreachable (floor(n/2) + 1). Only fresh observations count: a `host_health` row older than 30s, or dated more than 30s ahead of the coordinator's own clock (a skewed observer), is not evidence. Both halves of that count come from one **voter set**. Until the cluster has a voter generation it is derived: every host not removed from the cluster whose state is not `offline`, `maintenance` or `fenced` (witnesses, `draining` and `upgrading` hosts vote). Once automatic genesis has run it is the adopted generation's members, whatever their state — a fenced member keeps counting until `lv cluster voter rm` removes it (see [Operating model](operating-model.md) → "The voter set is explicit once genesis has run"). n is the size of that set, and an observation counts only if its observer is in it and is not the host being judged — a fenced host that is still running, a removed host whose daemon was never stopped, or a name no host carries cannot supply a vote. Bringing a host back to `active` counts the same way. It is the same set `DecisionGate` counts its locally-probed quorum over, and if the coordinator cannot read it, it does not fence
+2. **Acquires leader lease** — suppresses concurrent coordinators (45s TTL lease; a fence needs 30s of it still to run before it may begin). Best-effort, not exclusive: a CRDT lease can be held on both sides of a partition, so the decide site also requires a locally-probed quorum (`DecisionGate`) and the minority side fails closed there. See [Operating model](operating-model.md) → "Leader-gated recovery". A node taking over the lease first confirms with a quorum of peers that none of them has already recorded the term it is about to claim, so a node that has just restarted or reconnected waits until replication catches it up (one health-probe cycle after a start, then until any newer term row arrives) instead of claiming from its stale view. See [Operating model](operating-model.md) → "A node that was away does not claim a term from a stale ledger".
 3. **Fences the failed host** — prevents split-brain by ensuring the failed host cannot access shared resources
-4. **Reschedules VMs** — based on each VM's `on-host-failure` policy
+4. **Claims the recovery** — with `enforcement.recovery_claim` on every host (see *Recovery claims* below), a majority of the voter set certifies one destination per workload before any proof is minted, so two coordinators that both believe they lead cannot both recover it
+5. **Reschedules VMs** — based on each VM's `on-host-failure` policy
 
 ### Fencing methods
 
@@ -224,6 +256,21 @@ lv host config host-b \
   --ipmi-user admin \
   --ipmi-pass <secret>
 ```
+
+An empty `--ipmi-*` flag leaves the setting alone. To remove a host's IPMI
+address, user and password, use `--clear-ipmi`; a host that fences by `ipmi`
+needs another strategy in the same command, since it would have nothing to
+authenticate with:
+
+```bash
+lv host config host-b --fence-strategy ssh --clear-ipmi
+```
+
+The clear writes both copies of the password, the `host_fence_credentials`
+row and the old `hosts.ipmi_pass` column, so it is refused until
+`credentials_split_v1` has latched on the node that takes it. A server that
+predates the flag ignores it; the CLI reports an error when the host it gets
+back still has an IPMI address.
 
 ### Manual fence confirmation flow
 
@@ -308,6 +355,112 @@ the binary out before relying on it.
 `lv host fence-confirm <host>`. The coordinator resumes the recovery on its next
 cycle — see [Resuming a recovery from a confirmation](#resuming-a-recovery-from-a-confirmation).
 
+### Resuming a recovery from a recorded fence
+
+A leader can fence a host and then stop before it moves the host's workloads:
+its lease runs out mid-fence, or it dies. The fence is already recorded — a
+`fencing_log` row and the host's `fenced` state — and whichever coordinator
+holds the lease next takes the recovery over from that record. It needs:
+
+1. **The host is still recorded `fenced`.** `lv host undrain` records it
+   `active`, which ends the fence's authority. So does the host's own daemon
+   starting up again, but that write can be lost (a failed startup write, or a
+   last-writer-wins loss under clock skew), so nothing below relies on it.
+2. **The newest fence attempt succeeded**, and is one the leader could itself
+   have rescheduled on. That covers a verified `ipmi` power-off and an `ssh` or
+   `best-effort` success, unless the host is labelled
+   `litevirt.fence_requires_confirmation`.
+
+What happens next depends on the fence:
+
+- **A verified (`ipmi`) fence** is resumed from directly only while it is under
+  5 minutes old **and** still stands (below). Otherwise the successor powers the
+  host off again with the recorded method first. A verified power-off of a host
+  that is already off is harmless, and a fresh one is authority on its own,
+  whatever happened to the host in between. The recovery then proceeds on the
+  fresh fence, and a shared-disk VM is bound to it. If the re-fence fails,
+  nothing is recovered. The failed attempt is now the newest on record, so the
+  host is not re-fenced every cycle; it is left `offline` for an operator,
+  counted as `phase=recovery, error_class=refence_failed` and raised as the
+  `refence_failed` health condition. Confirm it is off and run
+  `lv host fence-confirm <host>`, and the recovery resumes from the
+  confirmation.
+- **An unverified (`ssh`, `best-effort`) fence** is resumed from directly while
+  it still stands, and never re-fenced: an SSH power-off of a host that is
+  already off cannot connect and reports a failed fence. A fence that no longer
+  stands is logged once, as "the recorded fence of this host no longer stands",
+  and the workloads stay where they are. If the host really is down,
+  `lv host undrain <host>` lets the coordinator fence it again for the outage in
+  progress.
+
+**A fence still stands** when some observer has probed the host and failed
+without a break since before the fence, and no observer's latest verdict shows
+the host answering (healthy or unready) since. The first holds however recent
+the fence is. A genuine fence follows a quorum of failing runs, so it always has
+one. A host that answered after its fence and then failed again has had the
+verdict that it answered overwritten, and only the failing runs' start shows the
+return.
+
+**When a failing run started** is read from the verdict: an observer's failing
+`host_health` row carries the time of its run's first failed probe in
+`last_seen`. A verdict from an older build carries none, and its run is taken to
+span one probe interval (2 s) per failure, a lower bound: a probe of a
+powered-off host runs out its dial timeout, so its runs advance more slowly, and
+the bound puts their start later than it was. It never counts an earlier outage
+as this one, but it can refuse a fence or confirmation made minutes into a long
+outage until an observer on the current build reports the host.
+
+**Clock skew.** The fence's time is the leader's clock and each observation is
+its observer's, so both comparisons give 5 seconds, the clock-skew alert
+threshold, to the safe side. A failing run must have begun at least 5 seconds
+before the fence, and an answer counts from 5 seconds before it. Greater skew
+makes the checks refuse more, except in one direction: an observer whose clock
+runs more than 5 seconds **behind** the leader's can make a run look older than
+it is. Keep `litevirt_cluster_clock_skew_seconds` under 5 (see
+[Time](operating-model.md#time)). For a verified fence the margin matters less,
+because the successor re-fences whenever there is doubt.
+
+The resumed recovery applies the same safe-fence policy and the same label as
+the leader would have, so a host whose recovery needs `lv host fence-confirm`
+still needs it. The safe-fence policy is decided by the recorded fence, not by
+the host's current strategy: an `ssh` fence on record is treated as best-effort
+under the policy, even if the host has since been switched to `ipmi`.
+
+The `fencing_log` row and the `fenced` state are written as one replicated
+entry, so every peer holds both or neither. A leader on an older release writes
+them separately, and a successor can then hold the row while the host still
+reads `active`. It treats that as "the state has not arrived yet": it neither
+fences the host nor stops looking, and it resumes once the state lands. If that
+older leader died between its two writes, the state never arrives. The host is
+then fenced again once the row is 5 minutes old, as before.
+
+A shared-disk VM is still moved only on a proof-grade fence under 5 minutes old
+(see above), which a resume from a verified fence always has: a fresh one when
+the recorded one was older.
+
+**A fence row belongs to the host's life it was written in.** A `fencing_log`
+row older than the moment the host last turned `active` (its own boot write,
+or a recovery) is about an earlier life: the machine removed under the name
+before `lv host add` gave it to a new one, or the same machine before it booted
+again. Such a row does not make the host "recently fenced", does not confirm
+it off, and is not the proof-grade fence a shared-disk VM is moved on. A host
+that fails again after coming back is fenced anew, without waiting out the
+5 minutes. A row newer than the host's last activation still counts, which is
+the race the window exists for. Likewise, a health observation older than the
+moment a host turned active does not count toward fencing it: a host that just
+turned active is counted down afresh, and a host `lv host add` admitted is not
+probed at all until its daemon's first boot records it `active`.
+
+The same holds for the proof-grade fence `lv host rm --dead` rests on, which
+counts at any age, and for the one a lost voter's removal and a superseded
+claim rest on. A proof-grade row from before the host was last recorded as it
+is now — admitted (`joining`), booted (`active`), lost unfenced (`offline`),
+drained — is about an earlier life and does not count, so a machine `lv host
+add` put under a removed host's name is not removed on the old machine's
+confirmation: `lv host fence-confirm` it once it is powered off. A host
+recorded `fenced` is exempt, since that write is itself its fence. Rows within
+5 seconds of the state write still count, for the clock between them.
+
 ### Resuming a recovery from a confirmation
 
 A recovery refused for want of a confirmation — a `manual` fence, a
@@ -340,11 +493,37 @@ confirmation, and resumes once you confirm again.
 hostname could otherwise authorise a recovery. With all three required, a
 mistype can only reach a host the cluster already fenced and still sees down.
 
-**Confirm after the fence, not before.** A confirmation written before the
-coordinator has fenced the host is not newer than any fence, so it resumes
-nothing — and while it is under 5 minutes old it also makes the coordinator
-treat the host as already fenced. Wait for the refusal in the coordinator log,
-then confirm.
+**A confirmation before any fence of this outage fences the host afresh.**
+`fence-confirm` records the host `fenced`, and a host recorded terminal is not
+fenced by the coordinator. A confirmation written before the cluster fenced
+the host for the outage in progress therefore used to leave it where nothing
+would ever fence or recover it. That order is not a mistake you can always
+avoid: `lv cluster voter force-reconfigure` requires a confirmation of every
+lost host, and with a majority of the voters gone no fence quorum can form to
+fence them first. Now, when all of these hold:
+
+- the host is `fenced` or `offline` (never `maintenance`) and a fresh quorum
+  observes it down;
+- no fence attempt is at or after the confirmation, and no earlier attempt
+  belongs to this outage;
+- the confirmation belongs to this outage: some observer has probed the host
+  and failed without a break since at least 5 seconds before it,
+
+the coordinator fences the host itself, as it would an `active` one, and logs
+"an operator confirmed this host off during the outage in progress, and no
+fence has run for it; fencing it afresh" (`phase=recovery,
+error_class=confirmation_fence`). The confirmation authorises that fence, not
+the recovery: the recovery follows from the fresh fence under every gate a
+fence applies, and where one of them needs a confirmation (`manual`,
+`best-effort` under the safe-fence policy, the confirmation label) it accepts
+one under 5 minutes old. An older one leaves the host `offline` after the fence
+with the usual refusal in the log; confirm again and the recovery resumes from
+it. A confirmation older than the outage, of a host that has answered since,
+still authorises nothing, and the coordinator logs "the newest fence attempt
+and the confirmation both predate this outage".
+
+Outside that flow, **confirm after the fence, not before**: wait for the refusal
+in the coordinator log, then confirm.
 
 **The failover leader resumes it.** Every coordinator reads the same
 `fencing_log`, but only the one holding the failover lease acts on it. The check
@@ -375,6 +554,56 @@ or expect to run `lv host fence-confirm` for their failover.
 Local-disk VMs are unaffected: their transfers keep the existing quorum/proof gate
 (a `best-effort` fence is sufficient — no shared-write hazard).
 
+### Recovery claims (single-winner recovery)
+
+The leader lease cannot stop two coordinators that both believe they hold it,
+and each could otherwise mint a valid proof for its own destination: two
+writable owners of one VM (colonelpanik/litevirt#250). With
+`enforcement.recovery_claim: true` on **every** host (witnesses included) and
+the `recovery_claim_v1` token latched, a recovery is a claim decided by the
+explicit voter set before anything is minted
+([design/recovery-claims.md](design/recovery-claims.md)):
+
+- **Claim before mint.** After the fence, the coordinator proposes the
+  reschedule, promote or container-relocate proof it would mint as the value of
+  a claim keyed by the workload, its owner epoch and an attempt number, and
+  writes a proof only once a majority of voters has signed an accept for one
+  value — its own, or another coordinator's, which it writes instead, with the
+  other destination. A claim that forms no certificate mints nothing and is
+  retried on the next tick. A promote is claimed once the replica's host is
+  known; a container relocation takes one decision for both the restore and
+  its image-recreate fallback.
+- **Verify before execute.** The destination starts a recovered workload only
+  with a certificate that verifies against its own adopted voter set and the
+  cluster CA; otherwise it refuses with `recovery_claim_unproven` and the row
+  stays pending. It asks no voter to decide.
+- **The owner probe.** Each voter probes the workload's recorded owner itself
+  before it accepts, and refuses with `recovery_claim_owner_reachable` if it can
+  reach it; a voter whose settled row names a different owner refuses with
+  `recovery_claim_source_mismatch`. A host most voters can still reach is never
+  certified evicted, whatever the coordinator's own health view says. The
+  coordinator retries such a claim at the same round.
+- **A destination that dies before it acts** strands the recovery: no other
+  destination may be authorized while it might come back and execute its
+  certificate. `ha.claim.stranded` names the workload and the command. If the
+  destination is gone for good, fence it proof-grade and run
+  `lv host rm --dead <host>` (try `--dry-run` first): the voters then accept
+  "fenced, removed and revoked" as evidence and the recovery retries at the
+  next attempt. A promote that fails before `StartDomain` is abandoned by its
+  destination, which signs that it never started it, and the coordinator's
+  fallback reschedule moves on with that evidence.
+- **Diagnosis.** `lv cluster claim vm/<name>` shows every voter's promised and
+  accepted ballot, the value's destination and source, and its last refusal.
+
+Enforcement needs the flag, the latch **and** an adopted voter generation
+(`lv cluster voter ls`). The token is advertised only while the flag is on, so a
+latched token means every host opted in. Standing down is the flag off on every
+host and a restart; a host with the flag off while others enforce is the
+uncertified second owner the claims exist to prevent — it reports
+`recovery_claim_v1` in `PingResponse.not_enforcing`, and its peers raise
+`ha_degraded`. See [Operating model](operating-model.md) → "Recovery is a
+decided claim when recovery claims are enforced".
+
 ### Witness hosts (even-N quorum)
 
 For 2-node or 4-node deployments, add a vote-only witness host to break
@@ -387,6 +616,16 @@ lv host config witness-1 --role witness
 Witnesses participate in failover quorum but never run workloads. The
 placement engine refuses to schedule any VM onto them. See
 [operating-model.md](operating-model.md) for sizing guidance.
+
+Without a witness, a cluster left with exactly two voting-eligible workers
+refuses every failover decision with `missing_witness`, **unless a voter
+generation is adopted** (`lv cluster voter ls`). Without one, the voter set is
+derived from host state, which one side of a split can shrink, so neither side
+may decide. With one, the generation's majority decides. Two voters each see
+one of two on either side of a split, which is below a majority, so both sides
+are refused `no_quorum`. So a three-voter cluster that has lost and fenced one
+host recovers its workloads, and so do the two survivors of
+`lv cluster voter force-reconfigure`.
 
 ### VM failure policies
 
@@ -402,6 +641,32 @@ Set in compose `migrate` section:
 | `restart-any` | Restart on any available healthy host |
 | `restart-same` | Wait for original host to recover |
 | `none` | Do not reschedule |
+
+A VM with a local disk that is restarted on another host does not get its disk
+back, because the disk stayed on the failed host. The new host rebuilds the disk
+from the VM's image at the disk's recorded size. The new host might still have
+an old copy of the disk from an earlier stay there. The restart never boots that
+copy. It renames the copy to `<disk path>.superseded-<time>` next to the new
+disk. Each failover rebuilds the disk from the image, so each copy holds its
+own data and not an older version of the current disk.
+
+A host removes a renamed copy once it is older than
+`superseded_disk_retention_days` (default 7 days; `0` keeps every copy). It
+checks hourly. The age comes from the time in the file name. While the VM the
+copy came from is in `error`, `pending` or `starting`, the copy is held, whatever
+its age: a restart that failed may need it put back. The host removes it on
+the first check after the VM leaves that state.
+
+To see the copies on a host, with the VM each came from, when it was set aside
+and whether it is held, run `lv host superseded-disks <host>`. Add `--purge`
+to remove every copy that is not held now, whatever its age, and
+`--older-than <duration>` to remove only older ones. Purging needs the admin
+role and is audited (`host.superseded_disks.purge`). To keep a copy, move it
+somewhere else. The check finds copies next to the disk paths the cluster
+records and in the data directory's `disks/` folder.
+
+The restart of a VM on its own host never rebuilds a missing disk. That case
+is `vm_disk_missing` in [diagnostics](diagnostics.md).
 
 ## Load-balancer VIP split-brain safety
 
@@ -514,10 +779,18 @@ Scrape `http://<host>:7444/metrics` for:
 - `litevirt_fence_failures_total` — cumulative non-success rows in `fencing_log`; pages should fire on any non-zero increase
 - `litevirt_failover_leader` — `1` on the host currently holding the failover lease, `0` elsewhere
 - `litevirt_failover_attempts_total{phase,result,error_class}` — failover decision points, counted by
-  `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`),
+  `phase` (`lease`, `quorum`, `health-query`, `skip`, `fence`, `split-brain-guard`, `recovery`,
+  and `claim` for a recovery claim, whose results are `ok`, `lost`, `no_majority`,
+  `owner_reachable`, `source_mismatch` and `superseded`),
   `result` (`ok`/`skipped`/`success`/`partial`/`refused`/`error`/`recovered`), and a bounded
   `error_class` (e.g. `no_quorum`, `upgrading`, `already_fenced`, `no_candidates`, `manual_unconfirmed`,
-  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `confirmation_resumed`, `local_stall`). A skip is `result=skipped` with the reason in `error_class`
+  `db_error`, `fence_log_write_failed`, `recovery_resumed`, `refence_failed`, `confirmation_resumed`,
+  `confirmation_fence` (a host confirmed off during this outage, fenced afresh), `local_stall`,
+  `joining` (a host `lv host add` admitted whose daemon has not started, never fenced),
+  `partition_pause_wait` (recovery waiting out a partitioned host's pause, design/partition-pause.md),
+  `quorum_regain` (a fence deferred because this node itself regained the voter majority moments ago),
+  and under region-scoped failover `region_too_small` / `region_scoped` — see
+  [federation.md](federation.md#region-scoped-failover)). A skip is `result=skipped` with the reason in `error_class`
 - `litevirt_failover_vm_actions_total{action,result,error_class}` — per-VM failover actions
   (`action` = `promote`/`reschedule`)
 - `litevirt_failover_container_actions_total{action,result,error_class}` — per-container failover actions
@@ -527,6 +800,10 @@ Scrape `http://<host>:7444/metrics` for:
   unless the node holds the failover lease — alert on `max()` across instances, never `avg()`.
   Zero is normal; the remedy for a sustained non-zero depends on why the host is down (see
   [operating-model.md](operating-model.md))
+- `litevirt_failover_regions_without_quorum` — GAUGE: under region-scoped failover
+  (`lv cluster failover-scope region`), the regions that hold at least one worker but have fewer
+  than three voters, so cannot fence one of their own hosts. The lease holder's view, like the
+  gauge above; always `0` under the default cluster scope
 - `litevirt_peer_healthy` — `1` if a peer host is reachable, `0` otherwise (one series per peer)
 - `litevirt_hlc_rejected_total` — count of remote HLC timestamps clamped due to clock skew
 - `litevirt_replication_min_watermark_seq` — minimum `last_seq` across recently-acked peers; a value that stops advancing means some peer has stopped acknowledging. It is not the compaction floor: the prune additionally skips peers whose pushes are currently failing, so it can reclaim past a seq this gauge still sits on

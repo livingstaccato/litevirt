@@ -32,6 +32,13 @@ type Request struct {
 	PinHost       string            // exact host name, empty = any
 	RequireLabels map[string]string // host must have all these label k/v pairs
 	AntiAffinity  []string          // VM names that must NOT be on the same host
+	// RequireRegion restricts candidates to hosts whose region is this one.
+	// Empty = any region. Set only by region-scoped failover
+	// (docs/design/region-scoped-failover.md): recovery of a workload whose
+	// host was fenced by region R's quorum stays in R. A region is a host
+	// column (hosts.region, "default" when unset), not a label, so
+	// RequireLabels cannot express it.
+	RequireRegion string
 
 	// Soft preferences — violation = lower score but not excluded
 	PreferLabels map[string]string
@@ -195,10 +202,26 @@ type HostRejection struct {
 type NoEligibleHostError struct {
 	VMName     string
 	Rejections []HostRejection
+	// NoContainerRuntime: the request is a container and no active host has
+	// a container runtime at all, so no amount of capacity would place it.
+	NoContainerRuntime bool
+}
+
+// ErrNoContainerRuntime marks a container placement refused because no active
+// host has a container runtime — a NoEligibleHostError a caller can tell apart
+// from a capacity shortfall, which may clear on its own.
+var ErrNoContainerRuntime = errors.New("no active host has a container runtime")
+
+// Is reports ErrNoContainerRuntime for a refusal that was for that reason.
+func (e *NoEligibleHostError) Is(target error) bool {
+	return target == ErrNoContainerRuntime && e.NoContainerRuntime
 }
 
 func (e *NoEligibleHostError) Error() string {
 	msg := fmt.Sprintf("no eligible host for VM %q", e.VMName)
+	if e.NoContainerRuntime {
+		msg = fmt.Sprintf("no eligible host for container %q: %v", e.VMName, ErrNoContainerRuntime)
+	}
 	if len(e.Rejections) == 0 {
 		return msg
 	}
@@ -210,6 +233,14 @@ func (e *NoEligibleHostError) Error() string {
 }
 
 func (e *NoEligibleHostError) Unwrap() error { return ErrNoEligibleHost }
+
+// lxcLabelState renders a host's litevirt.lxc label for a refusal reason.
+func lxcLabelState(h corrosion.HostRecord) string {
+	if v, ok := h.Labels[corrosion.LabelLXCCapable]; ok {
+		return corrosion.LabelLXCCapable + "=" + v
+	}
+	return corrosion.LabelLXCCapable + " unset"
+}
 
 // hostCandidate is an evaluated host during selection.
 type hostCandidate struct {
@@ -372,6 +403,9 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 
 	var candidates []hostCandidate
 	var rejections []HostRejection
+	// anyContainerRuntime: some active host could run a container, whatever
+	// else refused it.
+	anyContainerRuntime := false
 	for _, h := range snap.HostsBy {
 		// A host that cannot take workloads at all gets that one reason: the
 		// resource figures of a draining host or a witness are beside the point.
@@ -439,9 +473,30 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 			}
 		}
 
+		// Hard: region (region-scoped failover keeps recovery in region).
+		if req.RequireRegion != "" && hostRegion(h) != req.RequireRegion {
+			failed = append(failed, "region (host in "+hostRegion(h)+", recovery stays in "+req.RequireRegion+")")
+		}
+
 		// Hard: required labels.
 		if len(req.RequireLabels) > 0 && !labelsMatch(h.Labels, req.RequireLabels) {
 			failed = append(failed, "labels (needs "+missingLabels(h.Labels, req.RequireLabels)+")")
+		}
+
+		// Hard: a container needs a container runtime. Every daemon records
+		// whether its host has one in the litevirt.lxc label (lxc.Available),
+		// and a container placed on a host without one retries "lxc-create not
+		// found" forever. Strict (corrosion.HostRunsContainers): only "true"
+		// qualifies, and a host with no label is refused like "false". A
+		// request that already requires the label names it above.
+		if req.Container {
+			if !corrosion.HostRunsContainers(h) {
+				if _, required := req.RequireLabels[corrosion.LabelLXCCapable]; !required {
+					failed = append(failed, "no container runtime ("+lxcLabelState(h)+")")
+				}
+			} else {
+				anyContainerRuntime = true
+			}
 		}
 
 		// Hard: device requirements.
@@ -520,7 +575,8 @@ func scoreCandidates(snap *ClusterSnapshot, req *Request, fromBatch bool) ([]hos
 	}
 
 	if len(candidates) == 0 {
-		return nil, &NoEligibleHostError{VMName: req.VMName, Rejections: rejections}
+		return nil, &NoEligibleHostError{VMName: req.VMName, Rejections: rejections,
+			NoContainerRuntime: req.Container && !anyContainerRuntime}
 	}
 
 	// Sort by score descending; ties by fewest VMs then name (stable).
@@ -650,7 +706,13 @@ func SelectBatch(
 		if req.PinHost != "" {
 			h, ok := snap.Hosts[req.PinHost]
 			if !ok || h.State != "active" || h.IsWitness() {
-				return nil, fmt.Errorf("pinned host %q not found, not active, or is a witness for VM %q", req.PinHost, req.VMName)
+				// Per VM, like any other unsatisfiable hard constraint: a pin
+				// to a host that cannot take the VM strands that VM, not the
+				// batch. Failover recovers the rest of a failed host around
+				// it; compose re-raises it as the hard error a plan needs.
+				results[req.VMName] = BatchResult{Err: fmt.Errorf("%w: pinned host %q not found, not active, or is a witness for VM %q",
+					ErrNoEligibleHost, req.PinHost, req.VMName)}
+				continue
 			}
 			// Shallow-copy the snapshot and restrict only its stable candidate
 			// slice. The resource, replica, affinity, and device maps stay shared
@@ -674,8 +736,9 @@ func SelectBatch(
 			// One infeasible VM must not fail the WHOLE batch: failover needs
 			// per-VM isolation (strand the one VM nothing can hold, recover the
 			// rest), and compose re-checks per-VM below. An empty-Host result is
-			// the per-VM "no eligible host" signal; structural errors (a bad
-			// pin) still abort everything.
+			// the per-VM "no eligible host" signal, as is a pin to a host
+			// that cannot take the VM (above). Anything else still aborts
+			// everything.
 			if errors.Is(err, ErrNoEligibleHost) {
 				results[req.VMName] = BatchResult{Err: err}
 				continue
@@ -810,6 +873,15 @@ func missingLabels(hostLabels, required map[string]string) string {
 	}
 	sort.Strings(out)
 	return strings.Join(out, ", ")
+}
+
+// hostRegion is h's region with the same default the host reader applies, so
+// a record built without one (tests, a pre-v6 row) compares as "default".
+func hostRegion(h corrosion.HostRecord) string {
+	if h.Region == "" {
+		return "default"
+	}
+	return h.Region
 }
 
 func labelsMatch(hostLabels, required map[string]string) bool {

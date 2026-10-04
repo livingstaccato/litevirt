@@ -100,25 +100,35 @@ func InsertHost(ctx context.Context, c *Client, h HostRecord) error {
 	if role == "" {
 		role = "worker"
 	}
-	return c.Execute(ctx,
-		`INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		params := []interface{}{
+			h.Name, h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial,
+			h.CPUTotal, h.MemTotal, h.DiskTotal, h.FenceStrategy, h.Version, role,
+			h.CPUOvercommit, h.MemOvercommit, optIntValue(h.CPUReserve), optIntValue(h.MemReserveMiB),
+			h.CapacityPolicyHash,
+			now, uts,
+		}
+		if !live {
+			return c.Execute(ctx, insertHostSQL, params...)
+		}
+		// After the split the new host's membership row is written with it,
+		// under the same updated_at. The hosts row still carries the initial
+		// state: it is created whole, so there is no other column to lose.
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: insertHostSQL, Params: params},
+			{SQL: hostMembershipUpsertSQL, Params: []interface{}{h.Name, h.State, int64(0), "", uts}},
+		})
+	})
+}
+
+const insertHostSQL = `INSERT INTO hosts (name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
 			cpu_total, mem_total, disk_total, fence_strategy, version, role,
 			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
 			capacity_policy_hash,
 			created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		h.Name, h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial,
-		h.CPUTotal, h.MemTotal, h.DiskTotal, h.FenceStrategy, h.Version, role,
-		h.CPUOvercommit, h.MemOvercommit, optIntValue(h.CPUReserve), optIntValue(h.MemReserveMiB),
-		h.CapacityPolicyHash,
-		now, c.NowTS(),
-	)
-}
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-// AdmitHost creates a host row or replaces a tombstone after an operator has
-// issued a different certificate for the same name. A daemon cannot use its old
-// certificate to resurrect itself: the old serial is retained in the tombstone
-// and an equal serial is refused.
 // ValidHostAddress reports whether s is a bare IPv4 literal, which is the only
 // thing hosts.address is allowed to be.
 //
@@ -137,6 +147,10 @@ func ValidHostAddress(s string) bool {
 	return ip != nil && ip.To4() != nil
 }
 
+// AdmitHost creates a host row or replaces a tombstone after an operator has
+// issued a different certificate for the same name. A daemon cannot use its old
+// certificate to resurrect itself: the old serial is retained in the tombstone
+// and an equal serial is refused.
 func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 	if h.Name == "" || h.Address == "" || h.CertSerial == "" || h.CertSerial == "unknown" {
 		return fmt.Errorf("host admission requires name, address, and certificate serial")
@@ -163,13 +177,30 @@ func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 	if strings.EqualFold(rows[0].String("cert_serial"), h.CertSerial) {
 		return fmt.Errorf("host %q cannot be re-admitted with its removed certificate", h.Name)
 	}
-	return c.Execute(ctx,
-		`UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?, grpc_port = ?,
-			state = ?, cert_serial = ?, deleted_at = NULL, updated_at = ?
-		 WHERE name = ? AND deleted_at IS NOT NULL AND lower(cert_serial) <> lower(?)`,
-		h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial, c.NowTS(),
-		h.Name, h.CertSerial)
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		params := []interface{}{h.Address, h.SSHUser, h.SSHPort, h.GRPCPort, h.State, h.CertSerial, uts,
+			h.Name, h.CertSerial}
+		if !live {
+			return c.Execute(ctx, readmitHostSQL, params...)
+		}
+		// Re-admission rewrites the identity row whole, state included, and
+		// the membership state goes with it under the same updated_at. The
+		// host's isolation is kept, as it is on hosts.
+		epoch, reason, err := currentIsolation(ctx, c, h.Name)
+		if err != nil {
+			return err
+		}
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: readmitHostSQL, Params: params},
+			{SQL: hostMembershipStateSQL, Params: []interface{}{h.Name, h.State, epoch, reason, uts}},
+		})
+	})
 }
+
+const readmitHostSQL = `UPDATE hosts SET address = ?, ssh_user = ?, ssh_port = ?, grpc_port = ?,
+			state = ?, cert_serial = ?, deleted_at = NULL, updated_at = ?
+		 WHERE name = ? AND deleted_at IS NOT NULL AND lower(cert_serial) <> lower(?)`
 
 // RegisterHost is the daemon startup form of host admission. Ordinary restarts
 // are idempotent. A re-added machine may clear its local tombstone only when the
@@ -222,55 +253,129 @@ func RegisterHost(ctx context.Context, c *Client, h HostRecord) error {
 
 // ListHosts returns all active hosts.
 func ListHosts(ctx context.Context, c *Client) ([]HostRecord, error) {
-	rows, err := c.Query(ctx,
-		`SELECT name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
-			cpu_total, mem_total, disk_total, fence_strategy,
-			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
-			labels, version, schema_version, role, region,
-			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
-			capacity_policy_hash,
-			created_at, updated_at
-		 FROM hosts WHERE deleted_at IS NULL`)
+	rows, err := c.Query(ctx, hostSelectSQL+` WHERE h.deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
 
+	live := c.HostMembershipLive()
 	hosts := make([]HostRecord, len(rows))
 	for i, r := range rows {
-		hosts[i] = scanHost(r)
+		hosts[i] = scanHost(r, live)
 	}
 	return hosts, nil
 }
 
+// HostStateJoining is the state `lv host add` admits a host in (AdmitHost):
+// its identity is recorded, its daemon has not yet started. The daemon's boot
+// write (UpdateHostStartup) records it 'active'. Until then it is not a fence
+// candidate, so a coordinator does not power off a machine part-way through its
+// setup, and like every state but 'active' it is no placement target.
+//
+// It is deliberately left VotingEligible, as the 'active' it replaces was: a
+// node on the previous release, which does not know the state, counts it as a
+// voter, and the voter set must not depend on which build counts it.
+const HostStateJoining = "joining"
+
+// VotingEligible is the one definition of a voting member's state: a host
+// votes iff its state is not offline, maintenance or fenced. Witnesses vote;
+// draining and upgrading hosts vote. health.VotingEligible and the failover
+// coordinator's quorum both come from here, so the self-count, the quorum
+// denominator and the set of observers whose rows count cannot drift apart.
+func VotingEligible(state string) bool {
+	switch state {
+	case "offline", "maintenance", "fenced":
+		return false
+	}
+	return true
+}
+
+// VoterSet returns the names of the cluster's voting members: hosts that are
+// not deleted and whose state is VotingEligible. It is both halves of every
+// quorum count: its size is the denominator, and an observation counts toward
+// the numerator only if its observer is a member (colonelpanik/litevirt#251).
+// A read error is returned as-is; callers fail closed on it.
+//
+// The state is the resolved one (host_membership.go), so the voter set a node
+// counts is the one its failover coordinator and health gate both read.
+//
+// Once this node has adopted a voter generation with members (voter_config.go,
+// colonelpanik/litevirt#251 step 2), the set is THAT generation's members and
+// nothing else: it no longer filters on host state, so a fenced, offline or
+// maintenance member still counts in the denominator until an operator removes
+// it with `lv cluster voter rm`. No flag changes this — the voter set is a fact
+// the cluster decided, not a policy (docs/design/recovery-claims.md §4.5). A
+// reset generation has no members, and the set is derived again.
+func VoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
+	cfg, err := AdoptedVoterConfig(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Explicit() {
+		voters := make(map[string]bool, len(cfg.Members))
+		for _, m := range cfg.Members {
+			voters[m.Name] = true
+		}
+		return voters, nil
+	}
+	return DerivedVoterSet(ctx, c)
+}
+
+// DerivedVoterSet is the voter set as it was before any explicit generation:
+// every non-deleted host whose state is VotingEligible. Automatic genesis
+// proposes it as generation 1's members.
+func DerivedVoterSet(ctx context.Context, c *Client) (map[string]bool, error) {
+	states, err := resolvedHostStates(ctx, c)
+	if err != nil {
+		return nil, err
+	}
+	voters := make(map[string]bool, len(states))
+	for name, state := range states {
+		if VotingEligible(state) {
+			voters[name] = true
+		}
+	}
+	return voters, nil
+}
+
 // GetHost returns a single host by name.
 func GetHost(ctx context.Context, c *Client, name string) (*HostRecord, error) {
-	rows, err := c.Query(ctx,
-		`SELECT name, address, ssh_user, ssh_port, grpc_port, state, cert_serial,
-			cpu_total, mem_total, disk_total, fence_strategy,
-			ipmi_address, ipmi_user, ipmi_pass, watchdog_dev,
-			labels, version, schema_version, role, region,
-			cpu_overcommit, mem_overcommit, cpu_reserve, mem_reserve_mib,
-			capacity_policy_hash,
-			created_at, updated_at
-		 FROM hosts WHERE name = ? AND deleted_at IS NULL`, name)
+	rows, err := c.Query(ctx, hostSelectSQL+` WHERE h.name = ? AND h.deleted_at IS NULL`, name)
 	if err != nil {
 		return nil, err
 	}
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	h := scanHost(rows[0])
+	h := scanHost(rows[0], c.HostMembershipLive())
 	return &h, nil
 }
 
-func scanHost(r Row) HostRecord {
+// hostSelectSQL is the column list scanHost reads, joined to the host's fence
+// credential so IPMIPass is resolved new-first (credentials_split.go), and to
+// its membership row so State is too (host_membership.go). Columns the tables
+// share are qualified; SQLite names a qualified result column by its bare name,
+// which is what scanHost looks up.
+const hostSelectSQL = `SELECT h.name, h.address, h.ssh_user, h.ssh_port, h.grpc_port, h.state, h.cert_serial,
+			h.cpu_total, h.mem_total, h.disk_total, h.fence_strategy,
+			h.ipmi_address, h.ipmi_user, h.ipmi_pass, h.watchdog_dev,
+			h.labels, h.version, h.schema_version, h.role, h.region,
+			h.cpu_overcommit, h.mem_overcommit, h.cpu_reserve, h.mem_reserve_mib,
+			h.capacity_policy_hash,
+			h.created_at, h.updated_at,
+			c.host_name AS cred_key, c.ipmi_pass AS cred_val, c.updated_at AS cred_ts,
+			` + membershipCols + `
+		 FROM hosts h LEFT JOIN host_fence_credentials c ON c.host_name = h.name AND c.deleted_at IS NULL` + membershipJoins
+
+func scanHost(r Row, membershipLive bool) HostRecord {
+	name := r.String("name")
 	return HostRecord{
-		Name:               r.String("name"),
+		Name:               name,
 		Address:            r.String("address"),
 		SSHUser:            r.String("ssh_user"),
 		SSHPort:            r.Int("ssh_port"),
 		GRPCPort:           r.Int("grpc_port"),
-		State:              r.String("state"),
+		State:              membershipRowFrom(r, name).resolve(membershipLive).State,
 		CertSerial:         r.String("cert_serial"),
 		CPUTotal:           r.Int("cpu_total"),
 		MemTotal:           r.Int("mem_total"),
@@ -278,7 +383,7 @@ func scanHost(r Row) HostRecord {
 		FenceStrategy:      r.String("fence_strategy"),
 		IPMIAddress:        r.String("ipmi_address"),
 		IPMIUser:           r.String("ipmi_user"),
-		IPMIPass:           r.String("ipmi_pass"),
+		IPMIPass:           resolveCredential(r.String("cred_key") != "", r.String("cred_val"), r.String("ipmi_pass")),
 		WatchdogDev:        r.String("watchdog_dev"),
 		Labels:             decodeLabels(r.String("labels")),
 		Version:            r.String("version"),
@@ -346,13 +451,29 @@ func decodeLabels(raw string) map[string]string {
 	return m
 }
 
-// UpdateHostState changes a host's state.
+// UpdateHostState changes a host's state: hosts.state before the membership
+// split, and after it hosts.state AND host_membership.state in one batch under
+// one updated_at (host_membership.go). The hosts half keeps a node rolled back
+// one release reading the right state; the membership half is the copy that no
+// longer shares a clock with the host's own reports.
 func UpdateHostState(ctx context.Context, c *Client, name, state string) error {
-	return c.Execute(ctx,
-		`UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`,
-		state, c.NowTS(), name,
-	)
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		if !live {
+			return c.Execute(ctx, updateHostStateSQL, state, uts, name)
+		}
+		epoch, reason, err := currentIsolation(ctx, c, name)
+		if err != nil {
+			return err
+		}
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, name}},
+			{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
+		})
+	})
 }
+
+const updateHostStateSQL = `UPDATE hosts SET state = ?, updated_at = ? WHERE name = ?`
 
 // UpdateHostRole flips a host between "worker" and "witness". Use this to
 // promote a worker to tiebreaker (must drain VMs first) or to demote a
@@ -386,14 +507,17 @@ func UpdateHostRegion(ctx context.Context, c *Client, name, region string) error
 func DeleteHost(ctx context.Context, c *Client, name string) error {
 	now := time.Now().UTC().Format(time.RFC3339) // deleted_at marker (bare)
 	return c.ExecuteBatch(ctx, []Statement{
-		{SQL: `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`,
-			Params: []interface{}{now, c.NowTS(), name}},
+		{SQL: deleteHostSQL, Params: []interface{}{now, c.NowTS(), name}},
 		{SQL: `UPDATE host_health SET deleted_at = ?, updated_at = ? WHERE observer = ? OR target = ?`,
 			Params: []interface{}{now, c.NowTS(), name, name}},
 		{SQL: `UPDATE network_vteps SET deleted_at = ?, updated_at = ? WHERE host_name = ?`,
 			Params: []interface{}{now, c.NowTS(), name}},
 	})
 }
+
+// deleteHostSQL tombstones a host row. Every node that applies it, the origin
+// included, also retires the host's fence credential row (host_readmit.go).
+const deleteHostSQL = `UPDATE hosts SET deleted_at = ?, updated_at = ? WHERE name = ?`
 
 // UpdateHostVersion updates a host's reported version.
 func UpdateHostVersion(ctx context.Context, c *Client, name, version string) error {
@@ -417,17 +541,32 @@ func UpdateHostStartup(ctx context.Context, c *Client, name, state, version stri
 	// schema_version is this running binary's supported schema (CurrentSchemaVersion),
 	// matching what Ping advertises — the self-upgrade watcher reads it from here.
 	sv := CurrentSchemaVersion
-	if hasResources {
-		return c.Execute(ctx,
-			`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?,
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		var hostsStmt Statement
+		if hasResources {
+			hostsStmt = Statement{SQL: `UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?,
 				cpu_total = ?, mem_total = ?, disk_total = ?, updated_at = ? WHERE name = ?`,
-			state, version, sv, cpu, mem, disk, uts, name,
-		)
-	}
-	return c.Execute(ctx,
-		`UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?, updated_at = ? WHERE name = ?`,
-		state, version, sv, uts, name,
-	)
+				Params: []interface{}{state, version, sv, cpu, mem, disk, uts, name}}
+		} else {
+			hostsStmt = Statement{SQL: `UPDATE hosts SET state = ?, version = COALESCE(NULLIF(?, ''), version), schema_version = ?, updated_at = ? WHERE name = ?`,
+				Params: []interface{}{state, version, sv, uts, name}}
+		}
+		if !live {
+			return c.ExecuteBatch(ctx, []Statement{hostsStmt})
+		}
+		// After the split the boot state is also written to host_membership,
+		// in the same batch under the same updated_at: the hosts statement is
+		// the previous release's, unchanged, so a node rolled back one release
+		// still reads it.
+		epoch, reason, err := currentIsolation(ctx, c, name)
+		if err != nil {
+			return err
+		}
+		return c.ExecuteBatch(ctx, []Statement{
+			hostsStmt,
+			{SQL: hostMembershipStateSQL, Params: []interface{}{name, state, epoch, reason, uts}},
+		})
+	})
 }
 
 // UpdateHostResources updates a host's resource counts.

@@ -1299,7 +1299,7 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 				"origin", entry.Origin, "seq", entry.Seq)
 			return 0, fmt.Errorf("mutation entry has no statements (origin=%s seq=%d)", entry.Origin, entry.Seq)
 		}
-		if err := validateGuardedMutationEntry(stmts); err != nil {
+		if err := validateReceivedMutationEntry(stmts); err != nil {
 			_ = tx.Rollback()
 			r.client.observeMergeRejected("unknown", "wal", "guard")
 			return 0, fmt.Errorf("validate guarded mutation entry (origin=%s seq=%d): %w",
@@ -1346,7 +1346,21 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 		// rolls back the whole batch and stalls the watermark so nothing is dropped or
 		// recorded as seen. A permanent fault surfaces via replication backlog; the sender
 		// retries. Logs carry s.SQL (never s.Params, which hold row data).
+		//
+		// A users row the admin re-mint floor refuses takes its credential
+		// statement in this entry with it (users_admin_guard.go). Decided
+		// before anything applies, against the rows the entry found.
+		refusedRemints, err := r.refusedRemintsInEntry(ctx, tx, stmts)
+		if err != nil {
+			_ = tx.Rollback()
+			r.client.observeMergeRejected("users", "wal", walRejectReason(err))
+			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
 		for _, s := range stmts {
+			if remintCredentialStatement(s, refusedRemints) {
+				r.client.deferAfterCommit(tx, func() { r.client.noteRemintCredentialRefused(pathWAL) })
+				continue
+			}
 			if err := r.applyStatementLWW(ctx, tx, s, entry.Hlc); err != nil {
 				_ = tx.Rollback()
 				r.client.observeMergeRejected(structuralTableLabel(s.SQL), "wal", walRejectReason(err))
@@ -1360,6 +1374,38 @@ func (r *Replicator) ApplyRemoteMutationsFrom(ctx context.Context, entries []*pb
 					"sql", s.SQL, "origin", entry.Origin, "seq", entry.Seq, "error", err)
 				return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 			}
+			// A row this statement created may be one an earlier update
+			// is parked on. Replayed here, inside the batch, so the rest of
+			// the batch applies on top of it. See parked_updates.go.
+			r.replayParked(ctx, tx, s)
+		}
+		// A secret written by a node that had not latched credentials_split_v1
+		// reaches this node in its old column only; absorb it into the
+		// credential row readers use (credentials_absorb.go). A users row the
+		// re-mint floor refused did not apply here, so it has nothing to absorb.
+		if err := absorbUnlatchedSecretWrite(ctx, tx, withoutRefusedRemints(stmts, refusedRemints), r.client.MayWriteCredentialTables()); err != nil {
+			_ = tx.Rollback()
+			slog.Error("replicator: absorbing an unlatched secret write failed — back-pressuring replication",
+				"origin", entry.Origin, "seq", entry.Seq, "error", err)
+			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
+		// A host re-admitted over its tombstone takes no fence credential
+		// from the machine removed under its name (host_readmit.go).
+		if err := retireReadmittedCredentials(ctx, tx, stmts); err != nil {
+			_ = tx.Rollback()
+			slog.Error("replicator: retiring a re-admitted host's credential failed — back-pressuring replication",
+				"origin", entry.Origin, "seq", entry.Seq, "error", err)
+			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
+		}
+		// A state or isolation write to hosts from a node that was not writing
+		// host_membership yet is absorbed into it here, locally
+		// (host_membership.go). Back-pressured on failure, like the secret
+		// absorb: swallowed, it would lose a fence on this node.
+		if err := absorbUnlatchedMembershipWrite(ctx, tx, stmts, r.client.MayWriteHostMembership()); err != nil {
+			_ = tx.Rollback()
+			slog.Error("replicator: absorbing an unlatched membership write failed — back-pressuring replication",
+				"origin", entry.Origin, "seq", entry.Seq, "error", err)
+			return 0, fmt.Errorf("apply mutation (origin=%s seq=%d): %w", entry.Origin, entry.Seq, err)
 		}
 
 	}
@@ -1713,7 +1759,43 @@ func (r *Replicator) applyStatementLWW(ctx context.Context, tx *sql.Tx, s Statem
 		}
 		return execErr
 
-	case DispPlainInsert, DispExplicitUpsert, DispFullPKUpdate:
+	case DispLiveRowUpdate:
+		// Exactly DispFullPKUpdate, through the tombstone-guarded form: a state
+		// write that reaches a deleted row here changes nothing, whichever
+		// release sent it (live_row_update.go). An absent row still parks.
+		if err := r.applyLWWGated(ctx, tx, appliedForm(s), sh, tableName, pkCols, incomingHLC); err != nil {
+			return err
+		}
+		if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {
+			r.client.deferAfterCommit(tx, park)
+		}
+		return nil
+
+	case DispHostReadmit:
+		// Exactly DispFullPKUpdate, through the reset form: the re-admitted
+		// row starts with no per-host setting of the machine removed under
+		// its name, whichever release sent it (host_readmit.go). The
+		// credential row is retired once per entry, beside the secret absorb.
+		if err := r.applyLWWGated(ctx, tx, appliedForm(s), sh, tableName, pkCols, incomingHLC); err != nil {
+			return err
+		}
+		if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {
+			r.client.deferAfterCommit(tx, park)
+		}
+		return nil
+
+	case DispFullPKUpdate:
+		if err := r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC); err != nil {
+			return err
+		}
+		// An update that reached this node ahead of its row: hold it for the
+		// row's INSERT rather than let it be marked seen and lost here.
+		if park := r.client.parkIfRowAbsent(ctx, tx, s, incomingHLC); park != nil {
+			r.client.deferAfterCommit(tx, park)
+		}
+		return nil
+
+	case DispPlainInsert, DispExplicitUpsert:
 		return r.applyLWWGated(ctx, tx, s, sh, tableName, pkCols, incomingHLC)
 	}
 	return invalidf("unhandled disposition %q for %s", disp, tableName)
@@ -2065,6 +2147,83 @@ func legacyContainerRekeySafe(
 		targetSpec == coerceString(p[11]) &&
 		targetToken == coerceString(p[12]) &&
 		targetCreated == coerceString(p[13]), nil
+}
+
+// validateReceivedMutationEntry is the receiver's structural check:
+// validateGuardedMutationEntry, plus ONE exact historical shape it must still
+// admit so a stream already stalled on it can drain.
+//
+// Builds from e062efe1 up to the fix that split it logged a container
+// relocation as a single entry — [the source's guarded interface cleanup, its
+// guarded tombstone, the unguarded target row] — which the strict rule refuses
+// because the tombstone is not the entry's unique final statement. The refusal
+// back-pressures, so the relocating node's whole stream stopped at it for
+// every peer, and it cannot be taken out of that node's log without losing
+// everything behind it. New writers can no longer produce it: the local write
+// path runs the STRICT check and refuses (refuseUnapplicableEntry).
+//
+// Why admitting it is safe. The rule has two jobs. (1) Every guarded statement
+// must re-evaluate the SAME guard against a still-live source and reach the
+// same answer, which is why the tombstone that ends the source must come last;
+// here the guarded prefix is [cleanup, tombstone] exactly, the barrier IS its
+// last statement, and the prefix is re-checked under the strict rule on its
+// own. (2) Nothing unguarded may ride inside a guarded entry on the guard's
+// authority; the trailing statement here carries no guard and is applied on
+// its own merits (plain LWW, no guard evaluated), exactly as the standalone
+// entry the relocation wrote before e062efe1 — and writes again now — is
+// applied. So the admitted entry means, statement for statement and in the
+// same order, the two entries a fixed sender logs, applied in one receiver
+// transaction; a receiver learns nothing from it that the split form would not
+// tell it. The trailing statement is pinned to the two relocation target
+// shapes, to the containers row of the SAME name on a DIFFERENT host than the
+// one tombstoned, so the exception cannot admit anything else.
+func validateReceivedMutationEntry(stmts []Statement) error {
+	err := validateGuardedMutationEntry(stmts)
+	if err == nil {
+		return nil
+	}
+	if prefix, ok := legacyAtomicRelocationEntry(stmts); ok {
+		return validateGuardedMutationEntry(prefix)
+	}
+	return err
+}
+
+// legacyAtomicRelocationEntry recognises the single-entry container
+// relocation (see validateReceivedMutationEntry) and returns its guarded
+// prefix.
+func legacyAtomicRelocationEntry(stmts []Statement) ([]Statement, bool) {
+	if len(stmts) != 3 || stmts[0].Guard == nil || stmts[1].Guard == nil || stmts[2].Guard != nil {
+		return nil, false
+	}
+	fp := func(s Statement) string {
+		sh, _, err := parseResolved(s.SQL)
+		if err != nil {
+			return ""
+		}
+		return stmtFingerprint(sh)
+	}
+	if fp(stmts[0]) != mustStatementFingerprint(containerCreateCleanupSQL) ||
+		fp(stmts[1]) != mustStatementFingerprint(containerDeleteSQL) {
+		return nil, false
+	}
+	switch fp(stmts[2]) {
+	case mustStatementFingerprint(containerUpsertSQL),
+		mustStatementFingerprint(containerRelocatePendingInsertSQL):
+	default:
+		return nil, false
+	}
+	// containerDeleteSQL: (deleted_at, updated_at, host_name, name, epoch, gen);
+	// both target shapes open with (host_name, name).
+	del, tgt := stmts[1].Params, stmts[2].Params
+	if len(del) < 4 || len(tgt) < 2 {
+		return nil, false
+	}
+	srcHost, srcName := coerceString(del[2]), coerceString(del[3])
+	dstHost, dstName := coerceString(tgt[0]), coerceString(tgt[1])
+	if srcName == "" || dstName != srcName || dstHost == "" || dstHost == srcHost {
+		return nil, false
+	}
+	return stmts[:2], true
 }
 
 func validateGuardedMutationEntry(stmts []Statement) error {
@@ -3116,6 +3275,17 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 			return nil
 		}
 	}
+	// A write to a removed host's tombstone, other than its removal or its
+	// re-admission, changes nothing here (host_tombstone_guard.go).
+	if tableName == "hosts" {
+		refused, rErr := hostsTombstoneRefuses(ctx, tx, s, sh)
+		if rErr != nil {
+			return rErr
+		}
+		if refused {
+			return nil
+		}
+	}
 	skip, err := r.shouldSkipLWW(ctx, tx, tableName, pkCols, s, sh, incomingHLC)
 	if err != nil {
 		return err
@@ -3134,7 +3304,7 @@ func (r *Replicator) applyLWWGated(ctx context.Context, tx *sql.Tx, s Statement,
 		if rerr != nil {
 			return rerr
 		}
-		applied = rewritten
+		applied = replacedObservationApply(tableName, sh, rewritten)
 	}
 	res, err := tx.ExecContext(ctx, applied, s.Params...)
 	if err == nil && rowsChanged(res) {

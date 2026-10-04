@@ -96,7 +96,7 @@ func TestQuorumProof_PeersMustBeReprovenAfterAStall(t *testing.T) {
 	c.clock = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	advance := func(d time.Duration) { mu.Lock(); now = now.Add(d); mu.Unlock() }
 	var stallDuringProbe atomic.Bool
-	c.SetPeerReadiness(func(context.Context, string) (bool, string, error) {
+	c.SetPeerReadiness(func(context.Context, string, string) (bool, string, error) {
 		if stallDuringProbe.Load() {
 			advance(5 * time.Second)
 		}

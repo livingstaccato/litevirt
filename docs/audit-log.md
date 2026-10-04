@@ -23,8 +23,10 @@ export` plus the matching gRPC + REST RPCs.
 **Signatures, not just hashes.** A hash chain proves nothing against an attacker:
 `HashAuditRow` is deterministic and takes no secret, so anyone who can write the
 table can edit a row and recompute every hash after it. Each row therefore also
-carries an ECDSA signature by the authoring host's key. Three replicated tables
-hold the evidence the verifier reasons over, and every row in all three is signed:
+carries an ECDSA signature by the authoring host's key. Signing is **on by
+default** (`enforcement.audit_signature`, unset means on — see
+[Turning signing on](#turning-signing-on)). Three replicated tables hold the
+evidence the verifier reasons over, and every row in all three is signed:
 
 | Table | Holds |
 |---|---|
@@ -53,6 +55,26 @@ Two columns join the audit row to the chain:
 | `host_name` | TEXT | the host that authored the row — the sub-chain key |
 | `prev_hash` | TEXT (SHA-256 hex) | every new row — the previous **same-host** row's `content_hash` |
 | `content_hash` | TEXT (SHA-256 hex) | every new row — `SHA256(prev_hash || canonical(row))` |
+
+`canonical(row)` is each field name and value, NUL-separated:
+`prev_hash NUL id NUL <id> NUL timestamp NUL <timestamp> NUL … result NUL <result> NUL`.
+That encoding is collision-free **only while no value contains a NUL byte** —
+with one, a value can forge a field boundary (target `a\0detail\0b` with detail
+`c` hashes the same as target `a` with detail `b\0detail\0c`), and since a
+signature covers the content hash and `seq` and nothing else, it would verify
+either row. Without NULs the encoding parses back one way only, so the daemon
+keeps every row it writes NUL-free rather than changing the format:
+
+- `username`, `target` and `detail` carry request text — a login records the
+  submitted username before anything has checked it — so a NUL there is replaced
+  with `␀` (U+2400) and the row is written. Refusing it would let whoever chose
+  the input leave no audit row at all.
+- `id`, `timestamp`, `host_name`, `action` and `result` are set by the daemon
+  and matched by exact value, so a NUL in one is a bug and the row is refused.
+
+`verify` reports any row that does carry a NUL — written by an older build or
+straight into the table — as **ambiguous** (see [Verifying](#verifying)). Rows
+without one hash exactly as they always have.
 
 The first row of each host's sub-chain has `prev_hash = NULL`. Rows with a NULL
 `content_hash` (written before the chain columns existed) **and** rows with no
@@ -93,7 +115,32 @@ username; `--since` takes an RFC3339 timestamp (entries at/after it).
 Use cases:
 - Who started VM `web-1`? — `lv audit ls --target vms/web-1 --action vm.start`
 - What did `alice` do today? — `lv audit ls --user alice --limit 200`
-- What touched the firewall recently? — `lv audit ls --action 'sg.*' --since 2026-06-01T00:00:00Z`
+- What touched the firewall recently? — `lv audit ls --action 'firewall.*' --since 2026-06-01T00:00:00Z`,
+  then again with `--action 'sg.*'` for security groups. Each row records the
+  policy before and after the change; the actions and the detail format are in
+  [firewall.md](firewall.md#audit-trail).
+- Who repointed a resource mapping? — `lv audit ls --action 'resourcemap.*'`.
+  The actions are `resourcemap.add` (`lv mapping create`), `resourcemap.rm`
+  (`lv mapping rm`), `resourcemap.device.add` (`lv mapping add-device`) and
+  `resourcemap.device.rm` (`lv mapping rm-device`), from the CLI and the
+  `/resource-mappings` UI page alike. The target is the mapping name; the
+  detail is `before=<state> after=<state>`, in the firewall's state words, with
+  the device as `{host=… address=… vendor="…" device="…"}` or the whole mapping
+  with its devices. A removal that names nothing live is refused as not found
+  and recorded as `error`; a failed write is `error` with an after-state of
+  `unknown(<error>)`; a caller without `resourcemap.write` is recorded as
+  `denied`, with what they asked for. See
+  [pci-passthrough.md](pci-passthrough.md#resource-mappings).
+- Who pruned or garbage-collected a backup repo? —
+  `lv audit ls --action 'backup.repo.*'`. The actions are
+  `backup.repo.verify`, `backup.repo.gc`, `backup.repo.prune` and
+  `backup.repo.sync`. Each row names the repo, or `src -> dst` for a sync, and
+  its detail holds what the operation counted: chunks deleted and bytes
+  reclaimed for a GC, the `keep_*` policy and the kept and deleted counts for a
+  prune. A refused attempt is recorded as `denied`. The full format is in
+  [backups.md](backups.md#repo-maintenance-rpcs). The local
+  `lv backup repo …` commands write no row (see
+  [below](#actions-taken-while-the-daemon-is-down)).
 
 ## Verifying
 
@@ -132,17 +179,39 @@ grouped by what it means:
 
 Any of those exits non-zero and prints `AUDIT CHAIN TAMPERED`.
 
-There is a **third outcome** between intact and tampered, currently holding one
-finding — `never adopted`, below. It exits non-zero and prints `PART OF THIS LOG
-COULD NOT BE VERIFIED`, but it does not say tampered, because it is inferred from
-a row any peer can write rather than from something only a key holder could
-produce. The distinction is not pedantry: a verdict anyone can manufacture, and
+There is a **third outcome** between intact and tampered, currently holding two
+findings — `never adopted`, below, and **ambiguous**: a row with a NUL byte in
+a hashed field, whose hash and signature would verify a different row equally
+well (see the encoding above). It exits non-zero and prints `PART OF THIS LOG
+COULD NOT BE VERIFIED`, but it does not say tampered: `never adopted` is inferred
+from a row any peer can write rather than from something only a key holder could
+produce, and an ambiguous row may have been written verbatim by an older build.
+The distinction is not pedantry: a verdict anyone can manufacture, and
 that an operator cannot clear, is what teaches people to stop reading the output.
 
-**Unsigned rows on their own are not tampering.** Rows written before signing was
-switched on carry no signature; they are chain-checked, reported as a count on the
-clean line, and exit 0. Flagging them would put a permanent tamper verdict on
+**Unsigned rows on their own are not tampering.** Rows written while their host
+was not signing carry no signature; they are chain-checked, reported as a count on
+the clean line, and exit 0. Flagging them would put a permanent tamper verdict on
 every cluster with any history, which is how a check gets ignored.
+
+The count alone does not say whether those rows are history or the present, so
+`verify` also names every host that is **not signing now** — its most recent row
+is unsigned and it holds no signing contract:
+
+```
+audit chain intact: 212 rows verified (212 unsigned, chain-checked only)
+  note: 5 host(s) not signing now — their rows carry no signature and are not tamper-evident:
+    node-1: 73 unsigned rows
+    ...
+```
+
+No host listed means every unsigned row predates its host's signing contract.
+A listed host has `enforcement.audit_signature: false`, runs a build older than
+signing by default, or retired its key. It is a note, not a finding, and it is
+the line to read after an upgrade: once every host has restarted on a signing
+build, it disappears. (A daemon older than this list sends nothing, so on a
+mixed fleet its absence proves nothing.) The REST route carries it as
+`not_signing_hosts`.
 
 Rows this daemon had no keyring to check and rows carrying no host name are
 neither a finding nor a pass: both mean part of the log went unchecked, not that
@@ -243,7 +312,7 @@ scheme can, and claiming otherwise would be worse than saying so.
 
 All of it happens **whether or not `enforcement.audit_signature` is on.** The flag
 decides whether new rows get signed, not whether a rotation completes — a rotation
-that quietly did nothing on a default-configured host would leave the leaked key
+that quietly did nothing on a host configured not to sign would leave the leaked key
 as the only published identity while the command reported the incident closed. The
 command reads the flag off the target and tells you which of the two states the
 host is in.
@@ -301,6 +370,49 @@ lv host retire-audit-key <host>
 ever considered. That is deliberately the *only* way: making the certificate row
 deletable would hand the same peer who planted it a way to suppress a genuine
 finding instead, so the remedy is one only the CA holder can perform.
+
+## Turning signing on
+
+There is nothing to turn on. Since signing became the default, a host signs
+unless its config says `enforcement.audit_signature: false`. On builds before
+that, the flag defaulted to **false**, and a cluster that never set it signed
+nothing: the kvm003-f3 lab verified 212 rows, none signed, including a
+`user.reset-admin` row written minutes earlier. Nothing was broken; nothing had
+been switched on.
+
+**An existing cluster** starts signing as each host restarts on a build with
+the default. There is no fleet-wide step and no ordering to follow:
+
+- No node relies on a peer signing. A host's obligation is its own published,
+  adopted certificate, so a host that is not signing yet — still on an older
+  build, or configured off — is reported under "not signing now" and nothing it
+  writes is a finding.
+- Each host publishes its certificate at start, starts signing at once, and
+  records its adoption about a minute later (once replication has caught up),
+  at the sequence its chain had reached. Its earlier, unsigned rows sit below
+  that boundary and stay ordinary history.
+- Older peers verify the new rows: a non-signing build from 2026-07-29 onward
+  carries the cluster CA as a verify-only keyring. One older than that counts
+  them as unverifiable, which is a note and not a failure.
+
+After the rollout, `lv audit verify` on any node should list no host under "not
+signing now". The rows written before it stay unsigned forever. That cannot be
+repaired, and verify does not treat it as tampering: they are counted, and
+chain-checked only. An unsigned row from a host *after* its adoption is still
+reported as `unsigned after signed`.
+
+**To keep a host unsigned**, set `enforcement.audit_signature: false` before it
+restarts on the new build. A host that has already started signing and is then
+set to false retires its key, as below.
+
+**Rolling a signing host back** to a build from before the default is the same
+as setting the flag false: the older build reads no flag, does not sign, and
+signs a retirement of the key on its next start, so its later rows are not
+evidence. That holds for any build with signed retirement (2026-07-29 onward).
+For about a minute after that start, until the retirement is recorded, its new
+unsigned rows read as `unsigned after signed`; they clear once it lands. A build
+older than signed retirement cannot do this, and the host needs
+`lv host retire-audit-key` from the CA holder.
 
 ## Turning signing back off
 
@@ -481,6 +593,55 @@ Pair with the cluster's storage offload (Ceph snapshot, ZFS send to a
 WORM target, periodic rsync to glacier) for a tamper-evident regulator
 trail. Operators in regulated environments typically export daily and
 sign the resulting JSON with a separate signing key.
+
+## Actions taken while the daemon is down
+
+Only a host's daemon writes that host's audit rows, and that rule has no
+exceptions. The daemon keeps its sub-chain's tail in memory. A row appended by
+any other process (a CLI holding the database open, a script) links correctly
+to what is on disk, but the daemon's next row then links to the tail it
+remembers and reuses the sequence number the other process took. That is a
+fork. `verify` reports a broken link and a sequence gap for it, on every node.
+The other process also has no signing key wired, so under a signing contract its
+row is reported as an unsigned row from a host that promised to sign. Both read
+as tampering on a log nobody touched. `TestAudit_SecondProcessRowForksTheChain`
+pins this behaviour.
+
+A few actions still have to work with the daemon stopped, so a process other
+than the daemon records them in a **pending-audit journal** instead. The journal
+is a host-local directory, `<data_dir>/pending-audit/`, mode 0700, and is never
+replicated. The daemon folds it into the chain at start and every 30 seconds
+after that. The timer covers a daemon that is running but not yet serving gRPC,
+which is when a caller falls back to the journal. Each entry is one `<id>.json`
+file, written atomically and fsynced. Folding it:
+
+- appends one row through the daemon's own `InsertAuditLog`, so the row is
+  **signed** whenever the host signs (the default) and takes the next place in
+  the host's sub-chain;
+- stamps the row with the entry's own timestamp, the time the action happened,
+  not the time of the fold. `seq` still records where the row entered the
+  chain, so in `lv audit ls` the row sits at the time of the action while
+  `verify` walks it in fold order. A caller-supplied stamp is stored as given,
+  and it does not move the clamp ceiling for later rows;
+- attributes the row to `root@<host>` whatever the entry says, because only root
+  on this host can write the journal, and appends `recorded_by=pending-audit-journal`
+  to the detail;
+- removes the file only after the row is in. A daemon that crashes between the
+  two finds the row by id on the next fold and only removes the file, so an
+  entry is folded exactly once. A blind re-insert would be ignored by id and
+  still advance the cached tail, which breaks the next row's link.
+
+A writer holds the journal's lock (`flock`) for the whole action it records. It
+journals the intent, acts, then rewrites the entry with the outcome. A fold that
+finds the lock held skips the pass rather than folding the intent as the
+outcome, and waits for the next tick. The kernel releases the lock if the writer
+dies, and the entry then keeps its last word, `interrupted`.
+
+The journal is not a side door into the log. The daemon folds only a closed set
+of actions, today just `user.reset-admin` (see
+[auth.md](auth.md#recovering-the-admin-account-lv-user-reset-admin)). An entry
+for any other action, or one that does not parse, is renamed to `<id>.rejected`,
+left beside the journal for whoever investigates, and logged at error level.
 
 ## Operational notes
 

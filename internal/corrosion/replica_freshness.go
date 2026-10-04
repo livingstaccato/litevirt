@@ -1,6 +1,7 @@
 package corrosion
 
 import (
+	"context"
 	"log/slog"
 	"sync"
 	"time"
@@ -19,8 +20,9 @@ import (
 // the real owner's row.
 //
 // WHAT MARKS IT CAUGHT UP: one anti-entropy exchange with a peer that
-// COMPLETED — the digests compared equal, or the peer's full state dump was
-// merged without error. After either, the local replica holds everything that
+// COMPLETED — the digests compared equal, or the peer's dump of every table
+// whose digest differed was merged without error. After either, the local
+// replica holds everything that
 // peer held when the exchange began (LWW keeps whichever side is newer), so
 // anything the cluster decided while this node was away and that peer knew is
 // now here. The replicator's push path may deliver the same rows sooner; it
@@ -109,4 +111,45 @@ func (c *Client) MarkReplicaStale(reason string) {
 	f.caughtUp, f.staleReason = false, reason
 	slog.Warn("replica no longer trusted as caught up — waiting for the next anti-entropy exchange",
 		"reason", reason, "last_caught_up_peer", f.peer, "last_caught_up_at", f.at.UTC().Format(time.RFC3339))
+}
+
+// MarkReplicaCaughtUpForTests records a completed catch-up without running an
+// exchange. Test seam only: an in-process harness whose nodes are bootstrapped
+// together (tests/fleet) starts them as a cluster that has already converged,
+// which a real daemon only reaches through an anti-entropy pass. A scenario
+// modelling a rejoin calls MarkReplicaStale afterwards.
+func (c *Client) MarkReplicaCaughtUpForTests(peer string) {
+	c.markReplicaCaughtUp(c.replicaFreshnessGen(), peer)
+}
+
+// ReplicaTrusted reports whether decisions read from c may be acted on and
+// published by host self: caughtUp (normally c.ReplicaCaughtUp) says so, or
+// the cluster is a cluster of one. A single node is trusted without a catch-up
+// — there is no peer to catch up with and no other host that could own the
+// workload. "Of one" is read from the local hosts table: any other admitted
+// host, reachable or not, means another owner is possible and the gate holds.
+// An unreadable hosts table fails closed. A nil caughtUp is unwired and
+// trusted, for tests that do not exercise the gate.
+//
+// It is the one policy behind both consumers: the reconciler's out-of-band
+// stop sync and the client-facing workload mutations (grpcapi's
+// staleReplicaGated).
+func ReplicaTrusted(ctx context.Context, c *Client, self string, caughtUp func() (bool, string)) (bool, string) {
+	if caughtUp == nil {
+		return true, ""
+	}
+	ok, why := caughtUp()
+	if ok {
+		return true, ""
+	}
+	hosts, err := ListHosts(ctx, c)
+	if err != nil {
+		return false, why + " (and the hosts table could not be read to rule out a single-node cluster: " + err.Error() + ")"
+	}
+	for _, h := range hosts {
+		if h.Name != self {
+			return false, why
+		}
+	}
+	return true, ""
 }

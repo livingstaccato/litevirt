@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"github.com/litevirt/litevirt/internal/secretfile"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -69,6 +71,11 @@ type Daemon struct {
 	checker *health.Checker
 	metrics *metrics.Server
 
+	// mintClearance is the gRPC server the lease-mint clearance asks, published
+	// once its gate is wired. Atomic because lease holders (the rebalancer)
+	// start before the server exists. See wireLeaseMintClearance.
+	mintClearance atomic.Pointer[grpcapi.Server]
+
 	// authEngine is wired into the gRPC server below; kept on the daemon
 	// struct so the backstop reload loop (runAuthEngineReload) can refresh it.
 	authEngine *auth.Engine
@@ -114,6 +121,10 @@ type Daemon struct {
 	// to /etc — and must not silently pass on a machine where that write fails.
 	adminPasswordPath string
 
+	// pciScanOverride replaces pci.Scan in runPCIScan. Nil in production;
+	// tests have no sysfs to scan.
+	pciScanOverride func() ([]pci.Device, error)
+
 	// flushTelemetry flushes OTLP telemetry with a bounded timeout. Assigned
 	// once in Run, BEFORE the upgrade watchdog is armed — the watchdog
 	// goroutine can call exit() before obs.Setup completes, and this field
@@ -136,13 +147,23 @@ func New(cfg *Config) (*Daemon, error) {
 	// Create HLC clock for this node
 	clock := hlc.NewClock(cfg.HostName)
 
+	// The gossip key is loaded before gossip starts: every stage but off refuses
+	// to come up without one rather than join plaintext under a flag that says
+	// otherwise.
+	gossipKeys, err := gossipKeysFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	// Open embedded state store and join gossip cluster
 	db, err := corrosion.NewClient(corrosion.Config{
-		HostName:      cfg.HostName,
-		DataDir:       cfg.DataDir,
-		BindPort:      cfg.GossipPort,
-		AdvertiseAddr: cfg.AdvertiseAddress,
-		JoinPeers:     cfg.JoinPeers,
+		HostName:         cfg.HostName,
+		DataDir:          cfg.DataDir,
+		BindPort:         cfg.GossipPort,
+		AdvertiseAddr:    cfg.AdvertiseAddress,
+		JoinPeers:        cfg.JoinPeers,
+		GossipEncryption: cfg.Enforcement.GossipEncryption,
+		GossipKeys:       gossipKeys,
 	}, clock)
 	if err != nil {
 		return nil, fmt.Errorf("state store: %w", err)
@@ -321,33 +342,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
-	// Audit signing identity. The signing key IS the host's cluster key: it is
-	// already CA-signed with this host's name as its CN, already present on
-	// every node, and already the credential that says "I am this host".
-	// Minting a separate one would need the CA private key, which lives only on
-	// whichever node ran `lv host init`, so a fresh node could not sign its own
-	// log at all.
-	// Wire the keyring NOW — rows get written during startup and must be signed —
-	// but do NOT record any lifecycle fact yet. Adoption boundaries and retirement
-	// boundaries are sequence numbers, and this runs long before the replicator
-	// starts, so a node restored from a snapshot would read a local tail far
-	// behind its real replicated history and pin a boundary there permanently.
-	// See finishAuditKeyLifecycle, called once replication is up.
-	if d.cfg.Enforcement.AuditSignature {
-		if err := d.setupAuditSigning(ctx); err != nil {
-			// Non-fatal: refusing to start would turn a PKI problem into an
-			// outage. The node keeps running with unsigned rows, which
-			// `lv audit verify` reports as unsigned — visible, not silent.
-			slog.Error("audit signing could not be enabled; rows will be written unsigned",
-				"error", err)
-		}
-	} else {
-		// A non-signing node still needs the cluster CA: a keyring is what
-		// verifies a lifecycle record, so a node without one ignores every
-		// adoption and retirement in the cluster and reports peers' rolled-back
-		// hosts as tampering while every signing node calls the same log clean.
-		d.installAuditVerifier()
-	}
+	// Before anything that writes an audit row is built: every writer signs with
+	// the keyring this installs on d.db.
+	d.wireAuditKeyring(ctx)
 
 	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
 	// still entirely unsigned.
@@ -383,7 +380,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// peer-mTLS identity — any local user on such a node could impersonate it to
 	// the cluster. The push path is fixed, but nobody re-provisions an existing
 	// cluster, so a repair at start is the only thing that reaches one. It used
-	// to hang off enforcement.audit_signature, which defaults to false, so an
+	// to hang off enforcement.audit_signature, which then defaulted to false, so an
 	// operator who upgraded specifically for this fix got neither the repair nor
 	// a warning.
 	if err := pki.TightenPrivateKeys(d.cfg.PKIDir); err != nil {
@@ -434,6 +431,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("auth realms ready", "realms", names)
 	}
 
+	// The membership split gate goes in BEFORE this host's first write. The
+	// boot state below is a state write, and on a node that has already split
+	// it must reach host_membership too. Written to hosts.state alone, this
+	// node's own host_membership row would miss it until anti-entropy.
+	d.wireHostMembershipGate()
+
 	// Register this host in corrosion
 	if err := d.registerHost(ctx); err != nil {
 		slog.Warn("failed to register host", "error", err)
@@ -452,7 +455,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	cpus, memMiB, niErr := d.virt.NodeInfo()
 	diskGiB := 0
 	if niErr == nil {
-		diskGiB = d.sumPoolDiskTotalGiB()
+		diskGiB = d.sumPoolDiskTotalGiB(ctx)
 	} else {
 		slog.Warn("NodeInfo failed at startup; writing host state without resources", "error", niErr)
 	}
@@ -492,16 +495,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// wired later via SetPeerPinger; until then PeerSupports fails closed, so proof
 	// WAL entries defer rather than leak — never a schema-version guess.)
 	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
-	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, "split_brain_activated"))
+	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, activationMarkerBaseName))
 	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
 	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
 	// Start WAL-based replicator with Crescent relay protocol.
-	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, corrosion.RelayConfig{
+	// One relay election for both the replicator and anti-entropy, whose
+	// scheduled pass always contacts this node's relays.
+	relayCfg := corrosion.RelayConfig{
 		BaseRelays:      3,
 		NodesPerRelay:   50,
 		FallbackTimeout: 15 * time.Second,
-	})
+	}
+	repl := corrosion.NewReplicator(d.db, d.cfg.PKIDir, relayCfg)
 	// Token-based (fresh-Ping-cached) gate for proof-table WAL replication, wired
 	// BEFORE Start: only send runtime_action_proofs mutations to a peer that
 	// advertises the gate. Fail-closed until SetPeerPinger (below) — proofs defer.
@@ -528,8 +534,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetHLCEmit(func() bool {
 		return d.cfg.Enforcement.HLCLww && d.checker.Latched(capabilities.HLCLwwV1)
 	})
-	// Emit the order-invariant digest_v2 hashes once enforcement.digest_v2 is set. No
-	// capability latch: v2 is negotiated PAIRWISE by wire-field presence (each node emits
+	// Emit the order-invariant digest_v2 hashes unless enforcement.digest_v2 is
+	// explicitly off (it defaults on). No capability latch: v2 is negotiated PAIRWISE by wire-field presence (each node emits
 	// v2 only when locally enabled; two peers compare v2 only when both emitted it), so a
 	// non-uniform rollout only affects which node initiates a pull, never a decision.
 	d.db.SetDigestV2Enabled(func() bool { return d.cfg.Enforcement.DigestV2 })
@@ -553,6 +559,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	})
 
 	d.wireLeaseTermLedgerGate()
+	d.wireLeaseMintClearance()
+	d.wireCredentialsSplitGate()
+	d.wireClusterPolicyGate()
+	d.wireVoterConfigGate()
+	d.wireRecoveryClaimGate()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
 	// LATCHED. Durable, not Latched or the config flag, for the same reason as
@@ -574,10 +585,28 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// node the moment anti-entropy delivered it.
 	go d.finishAuditKeyLifecycle(ctx)
 
+	// Fold what `lv user reset-admin` journalled while this daemon could not be
+	// reached, signed and at the time it happened (corrosion/pending_audit.go).
+	go d.runPendingAuditFold(ctx)
+
+	// Move the secret columns onto the sensitive lane once credentials_split_v1
+	// has durably latched. Inert until then; see corrosion.SplitCredentials.
+	go d.runCredentialsSplit(ctx)
+
+	// Give host state and isolation their own row once host_membership_split_v1
+	// has durably latched. Inert until then; see corrosion.SplitHostMembership.
+	go d.runHostMembershipSplit(ctx)
+
+	// Restore "at least one live admin" after racing deletes on two nodes
+	// (corrosion/admin_floor.go).
+	go d.runAdminFloor(ctx)
+
 	// Start anti-entropy (periodic digest comparison + full sync as safety net).
 	// Interval is operator-configurable (anti_entropy_interval_sec); 0 → 60s
 	// default inside NewAntiEntropy. (P2-2)
 	ae := corrosion.NewAntiEntropy(d.db, d.cfg.PKIDir, time.Duration(d.cfg.AntiEntropyIntervalSec)*time.Second)
+	ae.SetRelayConfig(relayCfg)
+	ae.SetLegacyRepair(d.cfg.AntiEntropyLegacyRepair)
 	go ae.Start(ctx)
 
 	// Start metrics server. Create the LXC runner ONCE here and share it with the
@@ -664,6 +693,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// churn). Local-only deterministic deletes — runs on every node.
 	go d.runSupersededGC(ctx, metrics.NewGCMetrics())
 
+	// Hourly removal of the disk copies a failover start set aside here, once
+	// past superseded_disk_retention_days (health/superseded_retention.go).
+	go d.runSupersededDiskSweep(ctx)
+
 	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
 	// placement engine's DiskIOPS/NetBW dimensions.
 	go d.runRuntimeUsageSampler(ctx)
@@ -677,6 +710,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// certificate, and a revocation that never arrives is a decommissioned node
 	// still holding a working peer credential.
 	go d.runCRLSync(ctx)
+
+	// Keep the live gossip keyring in step with pki_dir/gossip.key, and report
+	// what it is using to pki_dir/gossip-keyring.state — the barrier
+	// `lv host rotate-gossip-key` waits on between phases. Runs when gossip
+	// encryption is off too, so the rotate and install commands can tell an
+	// off node from one that never started.
+	go d.db.WatchGossipKeyFile(ctx,
+		filepath.Join(d.cfg.PKIDir, pki.GossipKeyName),
+		filepath.Join(d.cfg.PKIDir, pki.GossipKeyringStateName),
+		gossipKeyReloadInterval)
 
 	// Publish this host's signed audit chain head periodically and at shutdown.
 	// Nothing else can detect a truncated tail: the hash chain links backward,
@@ -745,6 +788,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
+	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
 
 	// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
 	// down every deleted one. dnsmasq is a child process that dies when the
@@ -757,6 +801,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wire the split-brain gate onto the gRPC server BEFORE ReconcileLBs (below)
 	// re-applies VIPs, so an isolated/latched restart can't bring up a VIP ungated.
 	svc.SetGate(d.checker)
+	// The server can answer the lease-mint clearance from here on: it has the
+	// gate whose quorum and healthy-peer set its high-water read uses.
+	d.mintClearance.Store(svc)
 	svc.SetGateRefusedObserver(gateMetrics.Refused)
 	svc.SetLeaseBarrierIncompleteObserver(gateMetrics.LeaseBarrierIncomplete)
 	svc.SetStateWriteFailObserver(stateWriteMetrics.Failed)
@@ -888,12 +935,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// latched, and a cluster large enough that the quorum barrier does not break
 	// failover.
 	svc.SetLeaseTermEnforce(d.cfg.Enforcement.LeaseTerm)
+	// recovery_claim_v1: advertised only with the flag on and this node ready
+	// (split_brain_gate_v1 latched, able to vote durably), enforced only with
+	// the flag AND the latch AND an adopted voter generation.
+	svc.SetRecoveryClaimEnforce(d.cfg.Enforcement.RecoveryClaim)
+	// partition_pause_v1: advertised only with enforcement.partition_pause on
+	// (default on), because the majority relies on this node pausing.
+	svc.SetPartitionPause(d.cfg.Enforcement.PartitionPause)
 	// The reconciler is the SECOND executor boundary for this regime: a VM
 	// reschedule proof never travels over an RPC, so it is claimed off the
 	// replicated row there rather than in claimCarriedProof. The judgment is
 	// injected because internal/grpcapi imports internal/health and cannot be
 	// imported back — one implementation, wired to both callers.
 	reconciler.SetLeaseTermGate(svc.LeaseTermGateForPendingProof)
+	// The recovery-claim certificate is checked at the same boundary, for the
+	// same reason: a reschedule proof is claimed off the replicated row here,
+	// and a relocate-recreate proof by the container checker.
+	reconciler.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
+	// Layer 3 of partition pause (docs/design/partition-pause.md §6): a local
+	// copy whose row a VERIFIED recovery-claim certificate gave to another
+	// host is stopped on that proof, and only on it.
+	reconciler.SetSettleVerifier(svc.VerifySettleProof)
 	svc.SetLeaseTermReady(func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -962,6 +1024,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// outcomes → litevirt_runtime_owner_assert_total.
 	runtimeRepairMetrics := metrics.NewRuntimeRepairMetrics()
 	reconciler.SetOwnerAssertObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("vm", result) })
+	// Orphaned runtimes: litevirt domains/containers with no live record, reported
+	// (never reaped) as vm_orphan_runtime / ct_orphan_runtime and this gauge.
+	orphanMetrics := metrics.NewOrphanRuntimeMetrics()
+	observeOrphans := func(kind string, found []health.OrphanRuntime) {
+		samples := make([]metrics.OrphanRuntimeSample, 0, len(found))
+		for _, o := range found {
+			samples = append(samples, metrics.OrphanRuntimeSample{Name: o.Name, Row: o.Row})
+		}
+		orphanMetrics.Set(kind, d.cfg.HostName, samples)
+	}
+	reconciler.SetOrphanRuntimeObserver(observeOrphans)
 
 	// F1 startup recovery barrier: reduce the host-local operation journal against
 	// replicated state BEFORE any runtime loop or API mutation runs — DB +
@@ -1003,17 +1076,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// v42 hardware foundation (CONTRACT h): backfill the typed-hardware tables
 	// (vm_nics, vm_disks.bus, vm_pci_intent) and record each owned VM's adoption
-	// verdict, THEN mark this node hardware_v2-advertise-ready. Runs SYNCHRONOUSLY
-	// here — AFTER the schema is applied (InitSchema, above) and the
-	// operation-protocol config/latch is wired (hardware mutations depend on the
-	// crash-safe operation journal), and BEFORE the gRPC server begins serving Ping
-	// (below) — so no peer can read this node's advertised capabilities until the
-	// backfill has set the readiness flag advertisedCapabilities gates hardware_v2
-	// on. A backfill error DEGRADES (logged; the node simply keeps withholding
-	// hardware_v2 until a later attempt succeeds) rather than crashing the daemon.
-	if err := svc.BackfillHardwareTables(ctx); err != nil {
-		slog.Error("hardware backfill failed; node will not advertise hardware_v2 until it succeeds", "error", err)
-	}
+	// verdict, THEN mark this node hardware_v2-advertise-ready. Started here —
+	// AFTER the schema is applied (InitSchema, above) and the operation-protocol
+	// config/latch is wired (hardware mutations depend on the crash-safe
+	// operation journal) — but run in the BACKGROUND, because the pass waits for
+	// this node's replica to catch up: it publishes rows for the VMs the local
+	// replica says this host owns, and a replica back from a fence still names
+	// VMs failover has moved away (RunHardwareBackfill). Until it succeeds the
+	// readiness flag advertisedCapabilities gates hardware_v2 on stays false, so
+	// no peer reads hardware_v2 from this node early. A failed pass DEGRADES
+	// (logged and retried) rather than crashing the daemon.
+	go svc.RunHardwareBackfill(ctx)
 	// Continuous legacy→vm_nics bridge: mirrors vm_interfaces writes an OLD peer
 	// makes during the rolling-upgrade window into vm_nics (one-directional; old
 	// peers ignore vm_nics), converging the read overlay toward vm_nics completeness.
@@ -1102,6 +1175,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// raise ha_degraded against it.
 	svc.SetWALQuarantined(func() bool { return len(d.rolledBackTokens) > 0 })
 	go vipDemoter.Start(ctx)
+	// Partition pause (docs/design/partition-pause.md): on losing the execution
+	// quorum for T_pause, suspend/freeze every workload the majority would
+	// recover elsewhere, recorded under <data_dir>/partition-pause; resume on a
+	// majority's confirmation. Runs on the flag alone — a node advertises
+	// partition_pause_v1 only while it already acts on it — and whether or not
+	// a watchdog is armed; a verified watchdog is only the backstop for a
+	// pause that fails.
+	pauser := health.NewPartitionPauser(d.cfg.HostName, d.cfg.DataDir, d.db)
+	pauser.SetQuorum(d.checker.ExecutionQuorum)
+	pauser.SetEnabled(func() bool { return d.cfg.Enforcement.PartitionPause })
+	pauser.SetVMBackend(d.virt)
+	pauser.SetContainerRuntime(lxcRunner)
+	pauser.SetResumeConfirmer(svc.CheckPartitionResume)
+	pauser.SetSettleVerifier(svc.VerifySettleProof)
+	pauser.SetPeerRuntimeChecker(svc.CheckPeerContainerRuntime)
+	pauser.SetSelfFence(watchdogCtrl.Armed, watchdogCtrl.SelfFence)
+	go pauser.Start(ctx)
 	// Persistent HA-degraded surface (unsupported member / unfenced demotion failure / VIP
 	// with no holder) — a durable alertable status + transition events.
 	go svc.RunHAHealthMonitor(ctx, 15*time.Second)
@@ -1158,18 +1248,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// root the container checker converges them into.
 	svc.SetContainersRoot(filepath.Join(d.cfg.DataDir, "containers"))
 
-	// Advertise LXC capability as a host label so the compose planner places
-	// container (kind=lxc/oci) workloads only on hosts that can actually run
-	// them. The runtime is always wired, but the lxc-* binaries may be absent —
-	// probe for lxc-create. SetHostLabel is a no-op when unchanged, so this is
-	// cheap to re-assert every start.
-	lxcCapable := "false"
-	if _, lerr := exec.LookPath("lxc-create"); lerr == nil {
-		lxcCapable = "true"
+	// Advertise LXC capability as a host label so placement puts a container
+	// only on a host that can run it (strict: litevirt.lxc=true, see
+	// corrosion.HostRunsContainers). The runtime is always wired, but the lxc-*
+	// binaries may be absent — probe for lxc-create. Asserted now, before the
+	// container checker starts, and re-asserted every lxcLabelInterval so a
+	// write that did not land does not leave a capable host refusing
+	// containers until its next restart.
+	if capable, err := assertLXCLabel(ctx, d.db, d.cfg.HostName, lxc.Available); err != nil {
+		slog.Warn("set LXC capability host label failed; retrying in the background", "capable", capable, "error", err)
 	}
-	if err := corrosion.SetHostLabel(ctx, d.db, d.cfg.HostName, corrosion.LabelLXCCapable, lxcCapable); err != nil {
-		slog.Warn("set LXC capability host label failed", "capable", lxcCapable, "error", err)
-	}
+	go keepLXCLabel(ctx, d.db, d.cfg.HostName, lxc.Available, lxcLabelInterval)
 
 	// Advertise vTPM + Secure Boot capability (G1) so placement only lands such VMs
 	// on hosts that can run them. TPM needs swtpm; Secure Boot needs the secboot/MS
@@ -1215,9 +1304,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.checker.Latched(capabilities.CapacityAdmissionV1)
 	})
 	ctChecker.SetContainerRekeyObserver(func(_, result string) { runtimeRepairMetrics.OwnerAssert("ct", result) })
+	ctChecker.SetOrphanRuntimeObserver(observeOrphans)
+	ctChecker.SetReplicaFreshness(d.db.ReplicaCaughtUp)
 	// Split-brain safety gate (Phase 1): a container re-key needs local quorum once
 	// enforced — wired before the container reconcile loop starts.
 	ctChecker.SetGate(d.checker)
+	ctChecker.SetRecoveryClaimGate(svc.RecoveryClaimGateForPendingProof)
 	ctChecker.SetGateRefusedObserver(gateMetrics.Refused)
 	ctChecker.SetStateWriteFailObserver(stateWriteMetrics.Failed)
 	// The sweep holds the same per-container lock as this host's container
@@ -1284,6 +1376,27 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// executor half, and both read this one flag so the source and the enforcer
 	// can never disagree about whether enforcement is on.
 	fc.LeaseTermEnforce = d.cfg.Enforcement.LeaseTerm
+	// Recovery claims (docs/design/recovery-claims.md §3.13): the coordinator
+	// claims through the server's proposer before it mints a reschedule or
+	// relocate proof (the server claims a promote itself, once it knows the
+	// replica's host), and reads the server's enforcement predicate, so the
+	// mint side and the executor side on this node read one answer.
+	fc.Claimer = svc
+	fc.RecoveryClaimEnforced = svc.RecoveryClaimEnforced
+	// The recovery-claim health conditions (ha.claim.stranded,
+	// ha.voter.unavailable) are the lease holder's to write, like genesis.
+	fc.ClaimHealth = svc.RecoveryClaimHealthTick
+	// Partition pause, the majority side: rely on a host's pause only with this
+	// node's flag on AND partition_pause_v1 latched (every voter pauses), and
+	// anchor the deadline on the later of the decision and the last contact.
+	fc.PartitionPauseEnforced = func(ctx context.Context) bool {
+		return d.cfg.Enforcement.PartitionPause && d.checker.Enforced(ctx, capabilities.PartitionPauseV1)
+	}
+	fc.LastContact = d.checker.LastContact
+	fc.PeerPausesOnLoss = svc.PeerPausesOnLoss
+	// A coordinator that was itself cut off moments ago decides no new fence
+	// on the failure rows the cut left behind (a fleet-wide blip).
+	fc.QuorumRegain = d.checker.InQuorumRegainGraceFor
 	// Split-brain safety gate (Phase 1): the coordinator gates the reschedule
 	// decide site + writes a durable proof; the reconciler validates/claims it
 	// before start. Both are enforced only once split_brain_gate_v1 is
@@ -1295,7 +1408,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// A coordinator that was itself suspended or starved a moment ago decides no
 	// fence until it has watched for a full grace window (health/stall.go).
 	fc.LocalStall = d.checker.InStallGrace
+	// Automatic voter genesis runs on the leader-lease holder's tick
+	// (docs/design/recovery-claims.md §4.2). Inert until voter_config_v1 has
+	// durably latched, and once any voter generation exists.
+	fc.VoterGenesis = svc.VoterGenesisTick
 	go fc.Start(ctx)
+	// Adopt each decided voter generation once its certificate verifies,
+	// importing claim state first where this node is a member of it (§4.4).
+	go d.runVoterAdoption(ctx, svc)
 
 	// Peer self-upgrade: a daemon that comes back on an old binary (e.g. it was
 	// down during a cluster upgrade) pulls the newer binary from a healthy peer
@@ -1412,9 +1532,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// pages (security-groups, etc.) can query cluster state without
 		// adding a dedicated gRPC RPC for every list view.
 		uiSrv.SetCorrosionDB(d.db)
-		// The authorizer for the write paths with no gRPC twin (security
-		// groups). Without it those writes fail closed.
-		uiSrv.SetAuthorizer(d.svc)
 		uiSrv.SetBackupRepos(d.cfg.BackupRepos)
 		uiSrv.SetWSOriginPatterns(d.cfg.UIAllowedOrigins)
 		// ACME (#13): when enabled, terminate UI TLS via autocert (step-ca / LE)
@@ -1545,7 +1662,7 @@ func (d *Daemon) registerHost(ctx context.Context) error {
 	}
 
 	// Get disk total summed across all configured storage pools.
-	diskTotalGiB := d.sumPoolDiskTotalGiB()
+	diskTotalGiB := d.sumPoolDiskTotalGiB(ctx)
 
 	// Get cert serial
 	serial, err := pki.CertSerial(d.cfg.PKIDir + "/host.crt")
@@ -1630,33 +1747,71 @@ func (d *Daemon) reconcileHostAddress(ctx context.Context) error {
 		want, d.db.NowTS(), d.cfg.HostName)
 }
 
-// localDiskTotalGiB returns the total disk capacity in GiB for the filesystem
-// containing the given path (typically the litevirt data directory).
-func localDiskTotalGiB(path string) int {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(path, &st); err != nil {
-		return 0
-	}
-	return int(st.Blocks * uint64(st.Bsize) / (1024 * 1024 * 1024))
-}
+// statfsFn is syscall.Statfs, held in a variable so a test can give distinct
+// paths distinct filesystems — every temp dir a test can make sits on one.
+var statfsFn = syscall.Statfs
 
-// sumPoolDiskTotalGiB returns the total disk capacity in GiB summed across all
-// configured storage pool targets. Falls back to localDiskTotalGiB if no pools.
-func (d *Daemon) sumPoolDiskTotalGiB() int {
-	pools := d.cfg.StoragePools
-	if len(pools) == 0 {
-		return localDiskTotalGiB(d.cfg.DataDir)
+// sumPoolDiskTotalGiB returns this host's disk capacity in GiB: the statfs
+// total of every filesystem holding one of its storage pools, each filesystem
+// counted once. It is the hosts.disk_total recorded at startup, and the
+// fallback pb.Host reports before any pool row carries capacity.
+//
+// The pools are the config pools (or the data directory when config names
+// none, as registerStoragePools does) PLUS this host's file-based rows in the
+// replicated storage_pools table. Walking config alone left out every pool
+// created through the API, which never appears in config.yaml: a host with a
+// 7 TiB API pool reported its 438 GiB root filesystem as its whole capacity
+// (colonelpanik/litevirt#142).
+//
+// A config pool also has a row of its own, and two pools on different paths
+// can share one filesystem, so targets are deduplicated by the filesystem
+// statfs reports (fsid), not by path. A filesystem reporting no fsid falls
+// back to its cleaned path, so missing identities never collapse distinct
+// paths into one.
+func (d *Daemon) sumPoolDiskTotalGiB(ctx context.Context) int {
+	var targets []string
+	if len(d.cfg.StoragePools) == 0 {
+		targets = append(targets, d.cfg.DataDir)
 	}
-	seen := make(map[string]bool)
-	total := 0
-	for _, p := range pools {
-		if p.Target == "" || seen[p.Target] {
+	for _, p := range d.cfg.StoragePools {
+		if p.Target != "" {
+			targets = append(targets, p.Target)
+		}
+	}
+	if d.db != nil {
+		rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+		if err != nil {
+			slog.Warn("host disk total: list storage pools; counting config pools only", "error", err)
+		}
+		for _, p := range rows {
+			if fileBasedPoolDriver(p.Driver) && p.Target != "" {
+				targets = append(targets, p.Target)
+			}
+		}
+	}
+
+	type fsKey struct {
+		fsid syscall.Fsid
+		path string
+	}
+	seen := make(map[fsKey]bool)
+	var totalBytes uint64
+	for _, t := range targets {
+		var st syscall.Statfs_t
+		if err := statfsFn(t, &st); err != nil {
 			continue
 		}
-		seen[p.Target] = true
-		total += localDiskTotalGiB(p.Target)
+		key := fsKey{fsid: st.Fsid}
+		if st.Fsid == (syscall.Fsid{}) {
+			key = fsKey{path: filepath.Clean(t)}
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		totalBytes += st.Blocks * uint64(st.Bsize)
 	}
-	return total
+	return int(totalBytes / (1024 * 1024 * 1024))
 }
 
 // registerStoragePools upserts all configured storage pools into the cluster DB
@@ -1794,7 +1949,11 @@ func getOutboundIP() string {
 
 // runPCIScan performs the initial PCI device scan and stores results in the DB.
 func (d *Daemon) runPCIScan(ctx context.Context) {
-	devices, err := pci.Scan()
+	scan := pci.Scan
+	if d.pciScanOverride != nil {
+		scan = d.pciScanOverride
+	}
+	devices, err := scan()
 	if err != nil {
 		slog.Warn("PCI scan failed", "error", err)
 		return
@@ -1825,6 +1984,18 @@ func (d *Daemon) runPCIScan(ctx context.Context) {
 		}
 	}
 	slog.Info("PCI startup scan complete", "interesting_devices", len(interesting), "total_scanned", len(devices))
+
+	// The observe loop above revives a tombstoned row with its vm_name intact
+	// (deliberately: a transient scan drop must not free in-use hardware), so
+	// after a reboot a device whose VM was deleted meanwhile comes back still
+	// assigned to it. Reclaim those here, as RescanHost does, rather than
+	// leaving them stranded until an operator runs `lv host rescan` (#218).
+	if freed, err := corrosion.SweepStrandedPCIOwnership(ctx, d.db, d.cfg.HostName,
+		corrosion.DefaultPCIOwnershipSweepAge); err != nil {
+		slog.Warn("PCI scan: stranded-ownership sweep failed", "error", err)
+	} else if len(freed) > 0 {
+		slog.Info("PCI scan: reclaimed devices whose owning VM no longer exists", "addresses", freed)
+	}
 
 	// NVMe namespace discovery (informational log for now).
 	namespaces, err := pci.ScanNVMeNamespaces()
@@ -1865,6 +2036,19 @@ func parseDurationOr(s string, fallback time.Duration) time.Duration {
 }
 
 const adminPasswordFile = "/etc/litevirt/admin-password"
+
+// genesisMarkerName is the founder marker in data_dir. `lv host init` writes it,
+// and only while the data dir holds no state.db; every other provisioning path
+// removes it. seedAdminUser mints the cluster's first admin credential only
+// while it exists, and deletes it once that credential is written.
+const genesisMarkerName = "genesis-pending"
+
+// activationMarkerBaseName prefixes the persisted capability latches in
+// data_dir (<base>.<token>). They are written only after a daemon has run as a
+// member and survive a state.db loss, so seedAdminUser treats any of them as
+// proof this node is not founding a cluster. The setup script's
+// genesisMarkerScript matches the same name.
+const activationMarkerBaseName = "split_brain_activated"
 
 // seedAdminUser creates a default admin user with a random password if this node
 // is founding a cluster and no users exist. The password is written to
@@ -1912,15 +2096,54 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if len(d.cfg.JoinPeers) > 0 {
 		// Says what did NOT happen and where the credential is instead. Naming a
 		// password file here would send the operator looking for one this branch
-		// never writes, and from there to `lv user reset-admin`, which on a node
-		// that has not converged yet mints and publishes a fresh credential — the
-		// very thing this guard exists to prevent.
+		// never writes, and from there to `lv user reset-admin` — which only resets
+		// a live admin, so on a node that has not converged yet it refuses with "no
+		// live admin account" and reads as a second failure.
 		slog.Info("this node is joining an existing cluster (join peers are configured and "+
 			"no admin user has replicated in yet), so no admin account is created and no "+
 			"password file is written here; the credential replicates in from the cluster. "+
-			"Running `lv user reset-admin` on this node before it converges mints a NEW "+
-			"credential and replaces the cluster's",
+			"`lv user reset-admin` resets an existing account and creates none, so it "+
+			"refuses on this node until the credential has replicated in",
 			"join_peers", len(d.cfg.JoinPeers))
+		return nil
+	}
+
+	// An empty join_peers is an absence, and absences are not proof of founding.
+	// A founder driven from a workstation keeps join_peers [] for life, so losing
+	// its state.db put it straight back on the mint path; so did re-running
+	// `lv host init` against a member, or restoring a config from a template.
+	// Founding is a positive fact instead: `lv host init` writes the marker, and
+	// only while the data dir holds no state.db.
+	marker := filepath.Join(d.cfg.DataDir, genesisMarkerName)
+	if _, err := os.Stat(marker); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("check founder marker %s: %w", marker, err)
+		}
+		slog.Warn("no admin account exists and this node was not founded by `lv host init` "+
+			"(no founder marker in data_dir), so no admin account is created and no password "+
+			"file is written here. If this node belongs to a cluster, the credential "+
+			"replicates in once it converges; do not run `lv user reset-admin` here, it "+
+			"resets an existing account and creates none. Only if this node is founding a "+
+			"NEW cluster that was set up without `lv host init`: create the marker by hand "+
+			"and restart the daemon",
+			"marker", marker)
+		return nil
+	}
+
+	// A marker does not outrank evidence of earlier membership. Capability
+	// latches exist only once a daemon has run as a member, and survive a
+	// state.db loss; a marker beside one was written by hand or by a setup that
+	// could not see the latch, and minting here replaces the cluster's admin.
+	latches, err := filepath.Glob(filepath.Join(d.cfg.DataDir, activationMarkerBaseName+".*"))
+	if err != nil {
+		return fmt.Errorf("check for capability latches: %w", err)
+	}
+	if len(latches) > 0 {
+		slog.Warn("a founder marker is present but this node holds capability latches, so it "+
+			"has run as a cluster member before; no admin account is created. Its credential "+
+			"replicates in from the cluster. A brand-new cluster has to start from an empty "+
+			"data_dir",
+			"marker", marker, "latches", len(latches))
 		return nil
 	}
 
@@ -1936,6 +2159,16 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 
 	if err := corrosion.InsertUser(ctx, d.db, "admin", "admin", string(hash)); err != nil {
 		return fmt.Errorf("insert admin: %w", err)
+	}
+
+	// The marker licenses exactly one mint, and that mint has now happened: the
+	// row exists, so a restart returns at the ever-existed check. Consume it
+	// before the password file, so a failed file write cannot leave the licence
+	// behind for the day this state.db is lost.
+	if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("could not remove the founder marker after seeding the admin account; "+
+			"delete it by hand, or a later state.db rebuild on this node mints a new "+
+			"credential over the cluster's", "marker", marker, "error", err)
 	}
 
 	pwFile := d.adminPasswordPath
@@ -2147,6 +2380,40 @@ func (d *Daemon) runAuthEngineReload(ctx context.Context) {
 	}
 }
 
+// runSupersededDiskSweep removes, hourly, the disk copies a failover start set
+// aside on this host (<path>.superseded-<time>) once they are older than
+// superseded_disk_retention_days, except while their VM is in a failed or
+// unfinished start (health.PurgeSupersededDisks). 0 keeps every copy.
+func (d *Daemon) runSupersededDiskSweep(ctx context.Context) {
+	days := d.cfg.SupersededDiskRetentionDays
+	if days <= 0 {
+		slog.Info("superseded disk copies are kept until removed by hand (superseded_disk_retention_days: 0)")
+		return
+	}
+	retention := time.Duration(days) * 24 * time.Hour
+	sweep := func() {
+		if _, err := health.PurgeSupersededDisks(ctx, d.db, d.cfg.DataDir, retention, time.Now()); err != nil {
+			slog.Warn("superseded disk sweep", "error", err)
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(5 * time.Minute):
+		sweep()
+	}
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
 // runSupersededGC periodically hard-deletes provably-inert superseded/orphaned
 // auth + LB rows (local-only, deterministic per node — see
 // corrosion.GCSupersededRows). Hourly, with an initial delay after startup.
@@ -2275,6 +2542,196 @@ func (d *Daemon) metricsAddrForBanner() string {
 // mid-roll — the same signature as a starved latch. Deleting this call left the
 // corrosion, grpcapi and daemon suites all green, because every test injects the
 // gate directly and the test constructors hardcode it open.
+// wireCredentialsSplitGate lets corrosion write the sensitive credential
+// tables only once credentials_split_v1 is DURABLY latched.
+//
+// Their statement shapes are the first those tables ever had, so a write
+// before the latch back-pressures a previous-release peer's replication
+// stream. No config flag: the split begins on its own once the roll completes.
+// Unwired, the gate fails closed and every secret stays in its old column,
+// which is the previous release's behaviour.
+func (d *Daemon) wireCredentialsSplitGate() {
+	d.db.SetCredentialsSplitGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.CredentialsSplitV1)
+	})
+}
+
+// CredentialsSplitLatchedOnDisk is the credentials_split_v1 gate for a process
+// that is NOT the daemon — `lv user reset-admin` opens the local database
+// directly and has no health checker to ask. It reads the same durable
+// activation marker Checker.DurablyLatched is backed by, so the CLI writes the
+// credential table exactly when the daemon on that node would.
+func CredentialsSplitLatchedOnDisk(dataDir string) func() bool {
+	path := filepath.Join(dataDir, activationMarkerPrefix+"."+capabilities.CredentialsSplitV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+}
+
+// credentialsSplitInterval is how often the daemon re-runs the credentials
+// split. Each pass is a few indexed reads when there is nothing to do.
+const credentialsSplitInterval = time.Minute
+
+// runCredentialsSplit runs corrosion.SplitCredentials at start and then every
+// credentialsSplitInterval. Every pass is a no-op until the gate opens, and
+// idempotent after.
+func (d *Daemon) runCredentialsSplit(ctx context.Context) {
+	t := time.NewTicker(credentialsSplitInterval)
+	defer t.Stop()
+	for {
+		if rep, err := d.db.SplitCredentials(ctx); err != nil {
+			slog.Warn("credentials split: pass failed", "error", err)
+		} else if rep.Copied > 0 {
+			slog.Info("credentials split: copied secrets onto the sensitive lane", "copied", rep.Copied)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// wireHostMembershipGate lets corrosion write host_membership only once
+// host_membership_split_v1 is DURABLY latched.
+//
+// It reads the durable activation marker on disk rather than asking the health
+// checker, because it must be wired before the checker exists: the daemon
+// writes this host's boot state first. The marker is exactly what
+// Checker.DurablyLatched is backed by. No config flag: the split begins on its
+// own once the roll completes. Unwired, the gate fails closed and every state
+// change goes to hosts.state, the previous release's behaviour.
+func (d *Daemon) wireHostMembershipGate() {
+	d.db.SetHostMembershipGate(HostMembershipLatchedOnDisk(d.cfg.DataDir))
+}
+
+// HostMembershipLatchedOnDisk reports whether host_membership_split_v1 has
+// durably latched on the node whose data directory is dataDir.
+func HostMembershipLatchedOnDisk(dataDir string) func() bool {
+	path := filepath.Join(dataDir, activationMarkerPrefix+"."+capabilities.HostMembershipSplitV1)
+	return func() bool {
+		_, err := os.Stat(path)
+		return err == nil
+	}
+}
+
+// hostMembershipSplitInterval is how often the daemon re-runs the membership
+// split. Shorter than the credentials split's minute: until a node's first
+// pass its readers read hosts, not host_membership. Each pass is one join over
+// the hosts table when there is nothing to do.
+const hostMembershipSplitInterval = 10 * time.Second
+
+// runHostMembershipSplit runs corrosion.SplitHostMembership at start and then
+// every hostMembershipSplitInterval. A no-op until the gate opens, idempotent
+// after.
+func (d *Daemon) runHostMembershipSplit(ctx context.Context) {
+	t := time.NewTicker(hostMembershipSplitInterval)
+	defer t.Stop()
+	for {
+		if rep, err := d.db.SplitHostMembership(ctx); err != nil {
+			slog.Warn("host membership split: pass failed", "error", err)
+		} else if rep.Copied > 0 {
+			slog.Info("host membership split: moved host state onto its own row",
+				"copied", rep.Copied)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// wireClusterPolicyGate lets corrosion write cluster_policies (the
+// failover_scope policy) only once failover_scope_v1 is DURABLY latched: the
+// table's statements stall a previous-release peer's stream, and the policy
+// means nothing to a coordinator that does not honour it. Unwired, the gate
+// fails closed and `lv cluster failover-scope` refuses to change anything.
+func (d *Daemon) wireClusterPolicyGate() {
+	d.db.SetClusterPolicyGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.FailoverScopeV1)
+	})
+}
+
+// wireLeaseMintClearance makes every new lease term wait for the quorum
+// high-water read (grpcapi.Server.LeaseMintClearance): a node must not mint
+// term N+1 from its own replica while a peer already holds N+1, which is what a
+// restarted or reconnected node's stale ledger otherwise does — nor take over a
+// lease a peer still sees live, which is what a stale leader_election row
+// otherwise does.
+//
+// Wired BEFORE any lease holder starts, and answering "not yet" until the gRPC
+// server and its gate exist. The rebalancer starts ahead of the server, and a
+// daemon's first seconds are exactly when its ledger is stalest, so an unwired
+// window here would be the bug itself.
+func (d *Daemon) wireLeaseMintClearance() {
+	d.db.SetLeaseMintClearance(func(ctx context.Context, req corrosion.LeaseMintRequest) (bool, string) {
+		svc := d.mintClearance.Load()
+		if svc == nil {
+			return false, "daemon starting: the lease-term quorum read is not wired yet"
+		}
+		return svc.LeaseMintClearance(ctx, req)
+	})
+}
+
+// wireVoterConfigGate lets corrosion write voter_configs only once
+// voter_config_v1 is DURABLY latched. Its statement shapes are the first that
+// table ever had, so a write before the latch back-pressures a
+// previous-release peer's replication stream. Mandatory, no config flag;
+// unwired, the gate fails closed and no voter generation is ever written, which
+// is the previous release's behaviour.
+func (d *Daemon) wireVoterConfigGate() {
+	d.db.SetVoterConfigGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.VoterConfigV1)
+	})
+}
+
+// wireRecoveryClaimGate lets corrosion emit the claim_certificate column's
+// statement shapes (schema v60) only once recovery_claim_v1 is DURABLY
+// latched. The token is replication-gated, so the latch proves every host
+// this one replicates to decodes them; unwired, the gate fails closed and a
+// certified proof is refused as not yet emittable — which, under
+// enforcement, refuses the recovery rather than shipping a shape a peer
+// cannot resolve.
+func (d *Daemon) wireRecoveryClaimGate() {
+	d.db.SetRecoveryClaimGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.RecoveryClaimV1)
+	})
+	// claim_incarnation_v1 (docs/design/recovery-claims.md §10 item 37):
+	// lets a pre-epoch container relocation take the guarded row shape, which
+	// keeps the source's created_at over a stale tombstone on the target.
+	d.db.SetClaimIncarnationGate(func() bool {
+		return d.checker.DurablyLatched(capabilities.ClaimIncarnationV1)
+	})
+}
+
+// voterAdoptionInterval is how often the daemon adopts newly replicated voter
+// generations. A pass with nothing new is one indexed read.
+const voterAdoptionInterval = 5 * time.Second
+
+// runVoterAdoption adopts decided voter generations as they replicate in.
+func (d *Daemon) runVoterAdoption(ctx context.Context, svc *grpcapi.Server) {
+	t := time.NewTicker(voterAdoptionInterval)
+	defer t.Stop()
+	var lastErr string
+	for {
+		if _, err := svc.AdoptVoterConfigs(ctx); err != nil {
+			if err.Error() != lastErr {
+				slog.Warn("voter set: adoption pass did not complete", "error", err)
+			}
+			lastErr = err.Error()
+		} else {
+			lastErr = ""
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 func (d *Daemon) wireLeaseTermLedgerGate() {
 	d.db.SetLeaseTermLedgerGate(func() bool {
 		return d.checker.DurablyLatched(capabilities.LeaseTermLedgerV1)

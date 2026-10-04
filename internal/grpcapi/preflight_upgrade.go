@@ -143,11 +143,15 @@ func (s *Server) PreflightUpgrade(ctx context.Context, req *pb.PreflightUpgradeR
 	// 6. Witness role — losing the witness during a partition kills quorum.
 	h, err := corrosion.GetHost(ctx, s.db, s.hostName)
 	if err == nil && h != nil && h.IsWitness() {
-		// Count current cluster size.
-		if rows, err := s.db.Query(ctx,
-			`SELECT COUNT(*) AS n FROM hosts
-			 WHERE state IN ('active','upgrading') AND deleted_at IS NULL AND role = 'worker'`); err == nil && len(rows) > 0 {
-			n := rows[0].Int("n")
+		// Count current cluster size, by each host's resolved state (ListHosts
+		// reads host_membership once the membership split has latched).
+		if hosts, err := corrosion.ListHosts(ctx, s.db); err == nil {
+			n := 0
+			for _, w := range hosts {
+				if (w.State == "active" || w.State == "upgrading") && w.Role == "worker" {
+					n++
+				}
+			}
 			if n%2 == 0 {
 				// Even worker count + this witness = the witness IS the
 				// tiebreaker. Restarting it during a partition is fatal.

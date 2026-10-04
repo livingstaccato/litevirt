@@ -90,6 +90,16 @@ const (
 	// FenceAssumed: the request itself is not known to have arrived. Only the
 	// lenient best-effort path produces it — SSH failed and it proceeded.
 	FenceAssumed = "assumed"
+	// FenceSelfPaused: the request is not known to have arrived either, but
+	// the recovery it authorises waited out the host's own partition pause
+	// (docs/design/partition-pause.md §4): with partition_pause_v1 latched, a
+	// host cut off from the voter majority suspends its recoverable workloads
+	// within T_pause, and the coordinator started nothing until
+	// health.PartitionPauseWait had certainly passed. It says the old copy
+	// stopped EXECUTING, not that the host is off, so it is not proof-grade.
+	// Only FenceAssuranceDetail returns it: the row is a best-effort-ssh row
+	// whose detail carries FencePauseReliance.
+	FenceSelfPaused = "self_paused"
 	// FenceAwaitingConfirmation: a manual fence, waiting for a human. Not a
 	// failure — that is the strategy working as designed.
 	FenceAwaitingConfirmation = "awaiting-confirmation"

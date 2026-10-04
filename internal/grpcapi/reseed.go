@@ -461,14 +461,16 @@ func (s *Server) reseedLocalDigests(ctx context.Context) ([]corrosion.TableDiges
 // That is not fatal — reseedDigestsConverged skips any table the source does
 // not report, which is the existing rule for a version difference — but it is
 // logged, because it means the sensitive half went unverified.
-func (s *Server) reseedRemoteDigests(ctx context.Context, peer pb.LiteVirtClient) (map[string]string, error) {
-	remote := map[string]string{}
+func (s *Server) reseedRemoteDigests(ctx context.Context, peer pb.LiteVirtClient) (map[string]*pb.TableDigest, error) {
+	remote := map[string]*pb.TableDigest{}
+	// A convergence check: the source's digests as of now, not its cache.
+	ctx = corrosion.WithFreshDigest(ctx)
 	resp, err := peer.GetStateDigest(ctx, &emptypb.Empty{})
 	if err != nil {
 		return nil, err
 	}
 	for _, t := range resp.GetTables() {
-		remote[t.GetName()] = t.GetHash()
+		remote[t.GetName()] = t
 	}
 	sens, err := peer.GetSensitiveStateDigest(ctx, &pb.SensitiveStateRequest{Sender: s.hostName})
 	if err != nil {
@@ -487,7 +489,7 @@ func (s *Server) reseedRemoteDigests(ctx context.Context, peer pb.LiteVirtClient
 		return nil, fmt.Errorf("sensitive digest from source: %w", err)
 	}
 	for _, t := range sens.GetTables() {
-		remote[t.GetName()] = t.GetHash()
+		remote[t.GetName()] = t
 	}
 	return remote, nil
 }
@@ -526,7 +528,7 @@ func (s *Server) verifyReseedConvergence(ctx context.Context, source string, pee
 // reseedDigestsConverged is the convergence DECISION, split from the RPC so the
 // rule that guards an epoch clear is directly testable: it decides whether a
 // reseed earned the right to end a quarantine.
-func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]string) (int, string) {
+func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]*pb.TableDigest) (int, string) {
 	verified := 0
 	for _, t := range local {
 		// Skip what the reseed deliberately KEPT (derived from corrosion's keep
@@ -541,7 +543,11 @@ func reseedDigestsConverged(local []corrosion.TableDigest, remote map[string]str
 			// than block a reseed on a benign version difference.
 			continue
 		}
-		if r != t.Hash {
+		// Asked the way anti-entropy asks it: v2 when both sides sent one. A
+		// reseed refills rows but keeps this node's schema, so a node founded at
+		// an older schema holds them in another column order than a freshly
+		// founded source, and a v1-only comparison refused every epoch clear.
+		if !corrosion.TableDigestsAgree(t, r) {
 			return 0, fmt.Sprintf("table %s still differs", t.Name)
 		}
 		verified++

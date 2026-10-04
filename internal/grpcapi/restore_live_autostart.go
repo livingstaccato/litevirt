@@ -209,7 +209,7 @@ func (s *Server) autoDefineRestoredVM(
 	diskRecords := []corrosion.DiskRecord{{
 		VMName: targetName, DiskName: "root", HostName: s.hostName,
 		Path: overlayPath, SizeBytes: manifest.TotalSize, StorageType: "local",
-		TargetDev: rootDev,
+		TargetDev: rootDev, Bus: rootBus,
 	}}
 
 	// Networks from the spec. On a rename we regenerate MACs so the
@@ -302,10 +302,8 @@ func (s *Server) autoDefineRestoredVM(
 		_ = s.virt.UndefineDomain(targetName, false)
 		return "", "", status.Errorf(codes.Internal, "start domain: %v", err)
 	}
-	_ = send(&pb.RestoreLiveProgress{
-		Phase: pb.RestoreLiveProgress_STARTED, VmName: targetName,
-		TargetPath: overlayPath, Status: "VM started off overlay",
-	})
+	// STARTED is sent further down, once the row is committed and published: a
+	// client acts on it, and the fence below can still tear this domain down.
 
 	// FENCE, immediately before the durable write (see allowCommit). Firmware
 	// materialisation, define, hardware prepare, and the start off the overlay
@@ -336,9 +334,11 @@ func (s *Server) autoDefineRestoredVM(
 	// moves — the same guest-ABI hazard create/import/promote/clone pin against.
 	s.pinMachineFromDomain(spec)
 	specJSON, _ := json.Marshal(spec)
+	// Inserted "creating": assignOwnerEpochAtCreate publishes it running only
+	// once it holds a positive epoch and a marker names it.
 	vmRecord := corrosion.VMRecord{
 		Name: targetName, HostName: s.hostName, Spec: string(specJSON),
-		State: "running", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
+		State: "creating", CPUActual: int(spec.Cpu), MemActual: int(spec.MemoryMib),
 		Project: project,
 	}
 	// PCI intents: NONE. The restored domain built above (GenerateDomainXML)
@@ -361,15 +361,21 @@ func (s *Server) autoDefineRestoredVM(
 		}
 		slog.Error("live-restore: failed to write VM to corrosion", "vm", targetName, "error", err)
 	} else {
-		// Born running at the column default of 0, exactly like CreateVM was
-		// before the create path graduated. Nothing else does it: convergence
-		// early-returns on a zero epoch, and the backfill that would graduate it
-		// is gated behind enforcement.owner_epoch, which is off by default.
+		// Graduates, marks, and only then publishes running; a failure leaves the
+		// row "creating" for the reconciler to finish.
 		//
 		// In the else on purpose: a non-firmware insert failure is NOT fatal on
-		// this path, so an unguarded call would graduate a row that does not exist.
+		// this path, so an unguarded call would act on a row that does not exist.
 		s.assignOwnerEpochAtCreate(ctx, targetName, true)
 	}
+	// Only now: the fence has passed and the row is in the cluster, published
+	// running unless assignOwnerEpochAtCreate left it "creating" for the
+	// reconciler. Sent earlier, a client could read no row at all, or be told
+	// a VM had started that the fence then destroyed.
+	_ = send(&pb.RestoreLiveProgress{
+		Phase: pb.RestoreLiveProgress_STARTED, VmName: targetName,
+		TargetPath: overlayPath, Status: "VM started off overlay",
+	})
 	restoreOK = true
 	s.recordVMEvent(ctx, targetName, "vm.created", "ok", "host="+s.hostName+" (live-restore)")
 	return targetName, rootDev, nil

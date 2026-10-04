@@ -8,18 +8,21 @@ import (
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/daemon"
-	"github.com/litevirt/litevirt/internal/randid"
 )
 
-// newSGCmd groups security-group subcommands. These mutate the cluster
-// state via Corrosion directly (matching the pattern used by other
-// host-local maintenance commands like backup-repo). The reconciler on
-// each host watches the same tables and re-applies its firewall plan
-// when rules change — see internal/firewall/reconciler.go.
+// newSGCmd groups security-group subcommands. Every write goes through the
+// daemon (CreateSecurityGroup, DeleteSecurityGroup, AddSecurityGroupRule,
+// RemoveSecurityGroupRule, BindSecurityGroups), which authorizes it and records
+// it in the signed audit log (colonelpanik/litevirt#182). The listings still
+// read the local Corrosion database. The reconciler on each host watches the
+// same tables and re-applies its firewall plan when rules change — see
+// internal/firewall/reconciler.go.
 func newSGCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "sg",
@@ -66,8 +69,8 @@ func newSGBindCmd() *cobra.Command {
 	return cmd
 }
 
-// openClusterDB opens the local Corrosion database. Used by every sg
-// subcommand because they all just CRUD into Corrosion.
+// openClusterDB opens the local Corrosion database, read-only use: the
+// listings. Writes must go through the daemon (see sgRPCError).
 func openClusterDB() (*corrosion.Client, error) {
 	cfg, err := daemon.LoadConfig()
 	if err != nil {
@@ -83,23 +86,30 @@ func newSGCreateCmd() *cobra.Command {
 		Short: "Create a security group",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := openClusterDB()
-			if err != nil {
-				return err
-			}
-			defer db.Close()
-			id := randid.New()
-			if err := corrosion.InsertSecurityGroup(cmd.Context(), db, corrosion.SecurityGroup{
-				ID: id, Name: args[0], StackName: stack,
-			}); err != nil {
-				return err
-			}
-			fmt.Printf("Created security group %q (id=%s)\n", args[0], id)
-			return nil
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				sg, err := c.CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: args[0], StackName: stack})
+				if err != nil {
+					return sgRPCError("create", err)
+				}
+				fmt.Printf("Created security group %q (id=%s)\n", args[0], sg.Id)
+				return nil
+			})
 		},
 	}
 	cmd.Flags().StringVar(&stack, "stack", "", "Limit the SG to one stack (default: cluster-wide)")
 	return cmd
+}
+
+// sgRPCError explains an Unimplemented reply. A daemon older than the
+// security-group RPCs answers every one of them that way, and the CLI must not
+// fall back to writing the database itself: that path skipped authorization
+// and left no audit row.
+func sgRPCError(sub string, err error) error {
+	if status.Code(err) == codes.Unimplemented {
+		return fmt.Errorf("lv sg %s: the daemon does not support security-group changes over its API "+
+			"(it predates them); upgrade litevirtd on the host you are connected to and retry: %w", sub, err)
+	}
+	return err
 }
 
 func newSGListCmd() *cobra.Command {
@@ -135,19 +145,13 @@ func newSGDeleteCmd() *cobra.Command {
 		Short: "Delete a security group (and its rules)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := openClusterDB()
-			if err != nil {
-				return err
-			}
-			defer db.Close()
-			if err := corrosion.DeleteSGRules(cmd.Context(), db, args[0]); err != nil {
-				return err
-			}
-			if err := corrosion.DeleteSecurityGroup(cmd.Context(), db, args[0]); err != nil {
-				return err
-			}
-			fmt.Printf("Deleted security group %s\n", args[0])
-			return nil
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.DeleteSecurityGroup(ctx, &pb.DeleteSecurityGroupRequest{Id: args[0]}); err != nil {
+					return sgRPCError("rm", err)
+				}
+				fmt.Printf("Deleted security group %s\n", args[0])
+				return nil
+			})
 		},
 	}
 }
@@ -160,21 +164,17 @@ func newSGRuleAddCmd() *cobra.Command {
 		Short: "Add a rule to a security group",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := openClusterDB()
-			if err != nil {
-				return err
-			}
-			defer db.Close()
-			id := randid.New()
-			if err := corrosion.InsertSGRule(cmd.Context(), db, corrosion.SGRule{
-				ID: id, SGID: args[0],
-				Direction: direction, Proto: proto, PortRange: port,
-				CIDR: cidr, Action: action, Priority: priority,
-			}); err != nil {
-				return err
-			}
-			fmt.Printf("Added rule %s\n", id)
-			return nil
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				rule, err := c.AddSecurityGroupRule(ctx, &pb.AddSecurityGroupRuleRequest{Rule: &pb.SecurityGroupRule{
+					SgId: args[0], Direction: direction, Proto: proto, Port: port,
+					Cidr: cidr, Action: action, Priority: int32(priority),
+				}})
+				if err != nil {
+					return sgRPCError("rule-add", err)
+				}
+				fmt.Printf("Added rule %s\n", rule.Id)
+				return nil
+			})
 		},
 	}
 	cmd.Flags().StringVar(&direction, "direction", "ingress", "ingress | egress")
@@ -218,16 +218,13 @@ func newSGRuleRemoveCmd() *cobra.Command {
 		Short: "Remove a single rule from a security group (id from `sg rule-ls`)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			db, err := openClusterDB()
-			if err != nil {
-				return err
-			}
-			defer db.Close()
-			if err := corrosion.DeleteSGRule(cmd.Context(), db, args[0]); err != nil {
-				return err
-			}
-			fmt.Printf("Removed rule %s\n", args[0])
-			return nil
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				if _, err := c.RemoveSecurityGroupRule(ctx, &pb.RemoveSecurityGroupRuleRequest{Id: args[0]}); err != nil {
+					return sgRPCError("rule-rm", err)
+				}
+				fmt.Printf("Removed rule %s\n", args[0])
+				return nil
+			})
 		},
 	}
 }

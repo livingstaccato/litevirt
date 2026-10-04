@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // AuditRecord is a single entry in the audit log.
@@ -144,6 +146,14 @@ func stampAfter(now time.Time, ceiling string) string {
 // replication), the INSERT is silently skipped — the replicator's
 // LWW guard does the right thing for the replicated path.
 func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
+	// id is the primary key and the insert is INSERT OR IGNORE, so a caller
+	// that left it empty got one row ever: every later id-less row was dropped
+	// silently, and the tail below advanced anyway, leaving the next row linked
+	// to a row that does not exist -- a sequence gap and a hash mismatch that
+	// `lv audit verify` reads as tampering. An id is not the caller's to forget.
+	if r.ID == "" {
+		r.ID = randid.New()
+	}
 	generated := r.Timestamp == ""
 	c.auditChain.mu.Lock()
 	defer c.auditChain.mu.Unlock()
@@ -163,6 +173,13 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	}
 	r.PrevHash = tail.hash
 	r.Seq = tail.seq + 1
+	// After every hashed input is final, prev_hash included, and before the
+	// hash: this is the one place every audit row passes through
+	// (TestAuditWriters_EveryCallSiteIsCovered holds it so).
+	if err := guardAuditNUL(&r); err != nil {
+		slog.Error("audit row refused", "action", r.Action, "host", r.HostName, "error", err)
+		return err
+	}
 	r.ContentHash = HashAuditRow(r)
 
 	// Sign before writing, and fail the insert if signing itself errors.
@@ -215,6 +232,47 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	// host's timeline.
 	if generated && raisesStampCeiling(r.Timestamp, tail.ts) {
 		tail.ts = r.Timestamp
+	}
+	return nil
+}
+
+// auditNULReplacement stands in for a NUL byte in a free-text audit field. It is
+// U+2400 SYMBOL FOR NULL: visible in `lv audit ls`, and not a byte the encoding
+// treats as a separator.
+const auditNULReplacement = "␀"
+
+// guardAuditNUL keeps every row InsertAuditLog writes inside the domain on
+// which the content hash is injective (no NUL in any hashed field; see
+// auditCanonical). It decides per field whether to escape or refuse.
+//
+// username, target and detail are ESCAPED. They carry text that callers take
+// from requests — a login writes the submitted username into target and
+// username verbatim, before anything has authenticated it — so a NUL there is
+// attacker-chosen. Refusing would hand that attacker an unaudited action:
+// every caller discards InsertAuditLog's error, so a refused row is a silent
+// gap, and a failed login that leaves no trace is worse than one recorded with
+// a visible stand-in. The escape is lossy (a literal U+2400 in the input reads
+// the same), which costs nothing here: the log records what was attempted, and
+// the hash only needs the STORED value to be NUL-free.
+//
+// id, timestamp, host_name, action and result are REFUSED. The daemon sets
+// them; none is free text from a request. Each is also load-bearing as an
+// exact value — id is the primary key every replica dedups on, host_name keys
+// the sub-chain, a timestamp is parsed and ordered, action and result are
+// matched by equality — so rewriting one would silently change what the row
+// means. A NUL in one is a bug, and the row is refused loudly.
+//
+// prev_hash is refused for the same reason: it is this host's own previous
+// content hash, hex by construction, and a NUL there means the table under
+// this node was edited.
+func guardAuditNUL(r *AuditRecord) error {
+	for _, f := range []*string{&r.Username, &r.Target, &r.Detail} {
+		if strings.IndexByte(*f, 0) >= 0 {
+			*f = strings.ReplaceAll(*f, "\x00", auditNULReplacement)
+		}
+	}
+	if f := auditRecordNULField(*r); f != "" {
+		return fmt.Errorf("audit row %q: field %s contains a NUL byte, which would make its content hash ambiguous", r.ID, f)
 	}
 	return nil
 }
@@ -334,31 +392,75 @@ func HostHasSignedAuditRows(ctx context.Context, c *Client, hostName string) (bo
 	return len(rows) > 0, nil
 }
 
+// auditFieldNames are the row fields HashAuditRow covers, in hash order.
+var auditFieldNames = [...]string{
+	"id", "timestamp", "username", "host_name", "action", "target", "detail", "result",
+}
+
+// auditFieldValues returns r's hashed fields in auditFieldNames order.
+func auditFieldValues(r AuditRecord) [len(auditFieldNames)]string {
+	return [...]string{r.ID, r.Timestamp, r.Username, r.HostName, r.Action, r.Target, r.Detail, r.Result}
+}
+
+// auditCanonical is the v1 encoding HashAuditRow hashes:
+//
+//	prev_hash NUL ("id" NUL id NUL) ("timestamp" NUL timestamp NUL) ... ("result" NUL result NUL)
+//
+// It is injective ONLY over records with no NUL in any value, prev_hash
+// included. Under that condition the encoding holds exactly 17 NULs, so it
+// parses back one way only: prev_hash runs to the first NUL, and each following
+// pair is a field name — a fixed NUL-free constant, which the parse checks
+// rather than trusts — then a value running to the next NUL. An empty value is
+// two adjacent NULs and parses back as empty. Equal encodings therefore parse
+// to equal records.
+//
+// With a NUL inside a value the argument fails — the separators and field names
+// on their own do not stop a value from forging a field boundary. It fails
+// usefully, though: equal encodings have equal NUL counts, so any colliding pair
+// carries a NUL in a value on BOTH sides. Refusing or escaping NUL at the one
+// write path (InsertAuditLog) and flagging any NUL row on read
+// (VerifyAuditChain) closes collisions without changing a byte of the encoding
+// for any row that has none, so every hash and signature already written stays
+// valid and no peer on an older build disagrees about a hash.
+func auditCanonical(r AuditRecord) []byte {
+	b := make([]byte, 0, 256)
+	b = append(b, r.PrevHash...)
+	b = append(b, 0)
+	vals := auditFieldValues(r)
+	for i, k := range auditFieldNames {
+		b = append(b, k...)
+		b = append(b, 0)
+		b = append(b, vals[i]...)
+		b = append(b, 0)
+	}
+	return b
+}
+
+// auditRecordNULField names the first hashed input of r — prev_hash included —
+// that contains a NUL byte, or "" when none does. A record for which this is
+// non-empty lies outside the domain on which auditCanonical is injective.
+func auditRecordNULField(r AuditRecord) string {
+	if strings.IndexByte(r.PrevHash, 0) >= 0 {
+		return "prev_hash"
+	}
+	vals := auditFieldValues(r)
+	for i, k := range auditFieldNames {
+		if strings.IndexByte(vals[i], 0) >= 0 {
+			return k
+		}
+	}
+	return ""
+}
+
 // HashAuditRow returns the canonical SHA-256 of one audit row, mixed
 // with its prev_hash. Format-stable across versions — operators can
 // re-verify chains lifted from any future schema rev.
+//
+// It is collision-free only over rows with no NUL in any field; see
+// auditCanonical for why, and for where that is enforced.
 func HashAuditRow(r AuditRecord) string {
-	h := sha256.New()
-	h.Write([]byte(r.PrevHash))
-	h.Write([]byte{0})
-	// Use a NUL separator + field name so a field reorganisation
-	// (or an injected NUL byte in any field) can't forge a chain.
-	for _, kv := range []struct{ k, v string }{
-		{"id", r.ID},
-		{"timestamp", r.Timestamp},
-		{"username", r.Username},
-		{"host_name", r.HostName},
-		{"action", r.Action},
-		{"target", r.Target},
-		{"detail", r.Detail},
-		{"result", r.Result},
-	} {
-		h.Write([]byte(kv.k))
-		h.Write([]byte{0})
-		h.Write([]byte(kv.v))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	sum := sha256.Sum256(auditCanonical(r))
+	return hex.EncodeToString(sum[:])
 }
 
 // VerifyAuditChain validates every host's audit sub-chain independently
@@ -384,9 +486,21 @@ type AuditVerifyResult struct {
 	// BrokenAt is the first row whose content hash does not match a
 	// recomputation. Empty when every chain links correctly.
 	BrokenAt string
-	// Unsigned counts rows carrying no signature: written before v45, or while
-	// enforcement.audit_signature was off. They are chain-checked only.
+	// Unsigned counts rows carrying no signature: written by a host that was not
+	// signing at the time — before it adopted a key, after it retired one, or on
+	// a build older than signing. They are chain-checked only. It includes the
+	// rows listed in UnsignedAfterSigned, which are the ones that ARE evidence.
 	Unsigned int
+	// NotSigning lists, as "host: N unsigned rows", every host whose most recent
+	// row is unsigned and which holds no signing contract — the hosts that are
+	// not signing NOW. It is what turns a bare Unsigned count into an answer: a
+	// cluster where every host is listed has signing switched off, while one
+	// where none is has only history from before it was switched on.
+	//
+	// Not a finding. A host under a contract never appears (its unsigned rows
+	// are UnsignedAfterSigned), and neither does one already reported as
+	// NeverAdopted.
+	NotSigning []string
 	// UnsignedAfterSigned lists unsigned rows written by a host that is under a
 	// signing contract — it has a published certificate and no signed
 	// retirement. Those are not old, they are anomalous: the contract says the
@@ -447,6 +561,18 @@ type AuditVerifyResult struct {
 	// signature verifies, the sequence numbers are untouched, and only the head
 	// — signed by the successor key they do not have — disagrees.
 	HeadMismatch []string
+	// Ambiguous lists rows with a NUL byte in a hashed field. The content hash
+	// is injective only over NUL-free rows (see auditCanonical), so such a row's
+	// hash — and the signature over it — does not pin down which content it
+	// covers: a different row with the same hash verifies just as well. A daemon
+	// that guards NUL at write time never produces one; it comes from an older
+	// build or from a direct write to the table.
+	//
+	// Not tamper evidence: the row may have been written verbatim by an older
+	// build, and the verifier cannot tell that from a substitution. It fails
+	// verification as Unverified instead, because the row's content is exactly
+	// what could not be verified.
+	Ambiguous []string
 }
 
 // Tampered reports whether anything found is evidence of deliberate
@@ -518,7 +644,7 @@ func (r AuditVerifyResult) Tampered() bool {
 // not simply made deletable — that would hand the same attacker a way to suppress
 // a GENUINE finding.
 func (r AuditVerifyResult) Unverified() bool {
-	return len(r.NeverAdopted) > 0
+	return len(r.NeverAdopted) > 0 || len(r.Ambiguous) > 0
 }
 
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.
@@ -562,9 +688,16 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				"is tamper-evident (a key that cannot be read cannot sign the adoption either)",
 			u.host, u.keyID, u.publishedAt))
 	}
-	prevByHost := map[string]string{} // per-host running tail
-	seqByHost := map[string]int64{}   // per-host last seq seen
-	hashedByHost := map[string]bool{} // has this host produced a hashed row yet?
+	unadoptedHost := map[string]bool{}
+	for _, u := range unadopted {
+		unadoptedHost[u.host] = true
+	}
+	var hostOrder []string             // hosts in walk order, for NotSigning
+	unsignedByHost := map[string]int{} // per-host unsigned row count
+	lastUnsigned := map[string]bool{}  // is the host's latest row unsigned?
+	prevByHost := map[string]string{}  // per-host running tail
+	seqByHost := map[string]int64{}    // per-host last seq seen
+	hashedByHost := map[string]bool{}  // has this host produced a hashed row yet?
 	for _, r := range rows {
 		host := r.String("host_name")
 		stored := r.String("content_hash")
@@ -610,6 +743,15 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		if expect := HashAuditRow(rec); !strings.EqualFold(expect, stored) && res.BrokenAt == "" {
 			res.BrokenAt = rec.ID
 		}
+		// A row with a NUL in a hashed field can share its hash — and so its
+		// signature — with a different row (auditCanonical). Checked whether or
+		// not the hash matched: a matching hash is exactly the case in which
+		// the content it covers is in doubt.
+		if f := auditRecordNULField(rec); f != "" {
+			res.Ambiguous = append(res.Ambiguous, fmt.Sprintf(
+				"%s: %s: field %s contains a NUL byte, so its hash and signature do not determine "+
+					"its content — a different row would verify the same", rec.ID, host, f))
+		}
 		hashedByHost[host] = true
 		prevByHost[host] = stored
 
@@ -635,8 +777,14 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			seqByHost[host] = seq
 		}
 
+		if _, seen := unsignedByHost[host]; !seen {
+			hostOrder = append(hostOrder, host)
+			unsignedByHost[host] = 0
+		}
+		lastUnsigned[host] = sig == ""
 		if sig == "" {
 			res.Unsigned++
+			unsignedByHost[host]++
 			// A host under a signing contract has no legitimate way to produce an
 			// unsigned row: it published a certificate saying its rows are signed
 			// from that point, and nothing but a signed retirement takes that
@@ -692,6 +840,13 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 				res.BadSignature = append(res.BadSignature, rec.ID+": "+err.Error())
 			}
 		}
+	}
+
+	for _, host := range hostOrder {
+		if _, underContract := contracted[host]; underContract || unadoptedHost[host] || !lastUnsigned[host] {
+			continue
+		}
+		res.NotSigning = append(res.NotSigning, fmt.Sprintf("%s: %d unsigned rows", host, unsignedByHost[host]))
 	}
 
 	if err := verifyChainHeads(ctx, c, keyring, seqByHost, retired, &res); err != nil {
@@ -869,11 +1024,44 @@ type FenceLogRecord struct {
 // InsertFenceLog records a fencing attempt.
 func InsertFenceLog(ctx context.Context, c *Client, r FenceLogRecord) error {
 	now := time.Now().UTC().Format(time.RFC3339)
-	return c.Execute(ctx,
-		`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		r.ID, r.HostName, r.Method, r.Result, now, r.Detail,
-	)
+	return c.Execute(ctx, insertFenceLogSQL, r.ID, r.HostName, r.Method, r.Result, now, r.Detail)
+}
+
+const insertFenceLogSQL = `INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail)
+		 VALUES (?, ?, ?, ?, ?, ?)`
+
+// RecordFenceWithState records a fence AND the host state it establishes in ONE
+// replicated entry: the fencing_log row, and the state write UpdateHostState
+// makes (hosts.state, plus host_membership once this node is live), each in
+// its existing statement shape.
+//
+// Written as two entries, the row and the state reached peers separately. A
+// successor could hold the row while the host was still 'active' in its
+// replica, and when the leader died between its two pushes the state never
+// came at all. An entry is applied in one transaction, so a peer now sees
+// both or neither. The shapes are the ones every supported release already
+// accepts, so a receiver on the previous release applies the entry as it
+// stands. No ledger change and no token.
+func RecordFenceWithState(ctx context.Context, c *Client, r FenceLogRecord, state string) error {
+	now := time.Now().UTC().Format(time.RFC3339)
+	return c.withMembershipWrite(ctx, func(live bool) error {
+		uts := c.NowTS()
+		if !live {
+			return c.ExecuteBatch(ctx, []Statement{
+				{SQL: insertFenceLogSQL, Params: []interface{}{r.ID, r.HostName, r.Method, r.Result, now, r.Detail}},
+				{SQL: updateHostStateSQL, Params: []interface{}{state, uts, r.HostName}},
+			})
+		}
+		epoch, reason, err := currentIsolation(ctx, c, r.HostName)
+		if err != nil {
+			return err
+		}
+		return c.ExecuteBatch(ctx, []Statement{
+			{SQL: insertFenceLogSQL, Params: []interface{}{r.ID, r.HostName, r.Method, r.Result, now, r.Detail}},
+			{SQL: updateHostStateSQL, Params: []interface{}{state, uts, r.HostName}},
+			{SQL: hostMembershipStateSQL, Params: []interface{}{r.HostName, state, epoch, reason, uts}},
+		})
+	})
 }
 
 // HostManualFenceConfirmed reports whether an operator has written a "manual-confirmed"

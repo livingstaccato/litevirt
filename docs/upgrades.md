@@ -482,6 +482,285 @@ lv host upgrade <host> --binary <new> --force --yes
 Only force after confirming the finding is a false positive (e.g. a fence
 record from minutes ago for a host that's actually healthy).
 
+### Secrets move to the sensitive lane after the roll
+
+Three secrets used to live only in columns of public inventory tables:
+`hosts.ipmi_pass`, `users.password_hash` and `tokens.token_hash`. Schema v56
+adds three tables that only the peer-only sensitive lane carries —
+`host_fence_credentials`, `user_credentials` and `token_credentials` — and the
+secrets move into them **on their own, after the last host has upgraded**. No
+flag starts it; the `credentials_split_v1` capability token does.
+
+The ordering is fixed by what a host still on the previous release can do. It
+cannot decode a statement on a credential table (the apply fails closed and its
+replication stream stalls), and it reads a secret from the old column and
+nowhere else. So while any host the cluster replicates to — including one
+parked in `maintenance` — runs the previous release:
+
+- nothing is written to the credential tables;
+- every password change, token and IPMI password is written to the old column,
+  exactly as before, so every host fences, logs in and validates tokens the way
+  it did.
+
+`credentials_split_v1` is mandatory and replication-gated: it latches only once
+every memberlist member advertises it. From then on, on each host:
+
+- every writer writes the secret to **both** places, in one batch under one
+  `updated_at`: the credential table and the old column;
+- a pass that runs at start and every minute copies an old-column secret into
+  the credential table only where the credential table has **no row** for it.
+  It **never clears the old column**;
+- readers take the credential row whenever one exists, and the old column only
+  when none does.
+
+Readers and the pass never compare the credential row's `updated_at` with the
+public row's. The public row's `updated_at` moves on every unrelated write to
+it, such as a host's version report or a user's role change. When one of those
+reaches a host ahead of a password rotation, that host's last-writer-wins check
+refuses the rotation's public-row half, so it holds the OLD password on a NEWER
+public row. A rule that preferred the newer row would serve the rotated-out
+password, and the pass would copy it over the credential row.
+
+This is the dual-write step of a column move, and the release stops there.
+Every old column still holds the current secret, so the public rows, and the
+operator-safe state dump built from them, **still carry the secrets in this
+release**. Clearing the old columns is a later release's step, behind a second
+mandatory, replication-gated token (see
+[design/credentials-clear.md](design/credentials-clear.md)).
+
+Latches form per host, so for a few seconds after one host latches its
+neighbour may not have yet. A password or IPMI change made through that
+neighbour in that window goes to the old column only. Such a write is
+recognisable from the write itself: a latched host always writes the
+credential row in the same replicated batch, so a batch that sets a secret
+with no credential-table statement came from a host that had not latched. Every
+host that applies such a batch absorbs the secret into its credential row,
+locally, under the batch's own `updated_at` and only if that is newer. A latched
+host may create the row; a host that has not latched only updates a row it
+already holds, which includes the host the change was made through. A rotated
+password therefore stops working everywhere the rotation has reached, with no
+pass-interval delay. A host that missed the batch (for example, it repaired the
+public row from anti-entropy instead) picks up the absorbed credential row
+through sensitive-lane anti-entropy, because every host that applied the batch
+wrote the same row.
+
+**What the two copies buy on a rollback.** A rollback below a latched token
+is still not clean. A binary rolled back below a capability token this host
+already latched enters **WAL quarantine** at startup (the capability-rollback
+preflight; its log line says "entering WAL quarantine"). It keeps running, but
+it emits no replicated writes until it is upgraded again or reseeded. It also
+cannot decode the credential tables' statements that latched peers keep
+sending. What dual-writing changes is narrower:
+
+- a host on the previous release, whether it has not upgraded yet or was
+  rolled back, reads only the old columns, and they are current. It still
+  validates API tokens, checks passwords and fences with the current IPMI
+  password, including for secrets set or rotated after the latch. Under
+  quarantine a password login still cannot complete, because minting the
+  session is a replicated write. With the old columns cleared, as the first
+  `credentials_split_v1` build did, that host lost all three;
+- upgrading that host again loses nothing. The credential tables and the old
+  columns both hold every secret.
+
+A host that ran the **pre-release build that cleared the old columns** (the
+first `credentials_split_v1` build) holds empty old columns. This release
+reads its credential rows, so nothing is lost while it stays on this release or
+later. Until each secret is written again it gets none of the rollback benefit
+above: rolled back, its old-column reader finds nothing. A
+password change, or an IPMI password set again with
+`lv host config <host> --ipmi-pass`, puts the value back in the old column. An
+API token's hash cannot be rewritten; replace the token with a new one and
+revoke the old.
+
+Until the token latches, `litevirt_ha_degraded{reason="capability_rollout_pending"}`
+is set, as it is for every mandatory token mid-roll. If it stays set after the
+roll, a host is still on the previous release — most often one in
+`maintenance`.
+
+### Host state moves to its own row after the roll
+
+A host's state (`joining`, `active`, `draining`, `maintenance`, `upgrading`,
+`offline`, `fenced`) and its isolation epoch used to live only in the `hosts` row, beside
+the version, schema and resources the host reports about itself. That row has
+one `updated_at`, and replication applies a write only if it is newer than the
+row, so a state change and a concurrent version report could lose each other:
+the host that applied the newer one first refused the older one. Schema v57
+adds `host_membership`, one row per host with its own `updated_at`. State and
+isolation are copied into it **on their own, after the last host has
+upgraded**. No flag starts it; the `host_membership_split_v1` capability token
+does.
+
+The ordering is fixed the same way as for secrets. A host on the previous
+release cannot decode a statement on `host_membership`, and it reads state
+only from `hosts.state`. So while any host the cluster replicates to —
+including one parked in `maintenance` — runs the previous release:
+
+- nothing is written to `host_membership`;
+- every drain, fence, maintenance, boot and isolation is written to `hosts`,
+  exactly as before.
+
+`host_membership_split_v1` is mandatory and replication-gated. Once it has
+latched on a host, that host:
+
+- runs a pass at start and every 10 seconds that gives every host a
+  `host_membership` row, stamped with the `hosts` row's `updated_at` so every
+  host's copy is identical. The pass copies; it never clears or changes the
+  `hosts` columns;
+- after its first complete pass, writes every state and isolation change to
+  **both** `host_membership` and the `hosts` columns, in one batch with one
+  `updated_at`. The `hosts` half uses the previous release's statements, so a
+  host rolled back one release still reads every change;
+- reads state and isolation — for `lv host ls`, the voter set, fencing, relay
+  election and replication refusal alike — from `host_membership`, falling
+  back to `hosts` for a host that has no row yet. Before its first pass it
+  reads `hosts`, as before.
+
+A reader never compares the two copies. The `hosts` copy still shares its
+row's clock with the host's own reports, so on a host that refused the `hosts`
+half of a fence because a version report was newer, the `hosts` row is the
+newer one and its state is the stale one. Readers take `host_membership`, and
+nothing moves a `hosts` value into it merely because that value differs or
+its row is newer.
+
+Latches form per host, so for a few seconds after one host latches its
+neighbour may not have yet. A drain or fence made through that neighbour in
+that window goes to `hosts` only, as does any write from a host rolled back
+one release. Such a write is recognised by where it came from: a latched
+host's writes always carry their `host_membership` statement in the same
+replicated batch, so a batch that writes `hosts` state or isolation without
+one came from a host that was not writing `host_membership` yet. A latched
+host applying such a batch writes the change into its own `host_membership` row in
+the same transaction, with the write's own `updated_at`, if that is newer than
+the row, creating the row if it has none. It does not replicate that change:
+every host that sees the batch computes the same row from it, and anti-entropy
+carries the row to one that did not.
+
+A host that has not latched yet does the same to a `host_membership` row it
+already holds — one a latched peer wrote — but never creates one. That includes
+its own writes: the host that fences another through the old columns alone
+updates its own copy of that host's row in the same transaction, so when it
+latches it reads the fence at once rather than a latched peer's older copy.
+
+Two changes still wait for anti-entropy, typically a minute or two. One is a
+change that reached a host before that host held any `host_membership` row for
+the host concerned; a peer's older copy arriving later is then what it serves.
+The other is a change that reached a latched host only through anti-entropy
+repair of the `hosts` row (which moves rows, not batches). If no latched host
+received the batch itself, that second change is not absorbed anywhere and is
+lost, exactly as it could be before v57.
+
+An absorb that fails fails its write: a replicated batch is rolled back and
+back-pressured, and a local write returns the error. It never commits the
+`hosts` half without the `host_membership` half.
+
+**What the two copies buy on a rollback.** The `hosts` columns stay current,
+so a host on the previous release reads the right state, voter set and
+isolation. As for `credentials_split_v1`, a binary rolled back below the
+latched token still enters WAL quarantine at startup and emits no replicated
+writes until it is upgraded again or reseeded, and it cannot decode the
+`host_membership` statements that latched peers keep sending. Upgrading it
+again loses nothing. Roll forward.
+
+Retiring the `hosts` copy is a later release's step, behind a second token; see
+[design/host-membership-retire-old-columns.md](design/host-membership-retire-old-columns.md).
+
+### Gossip encryption is a separate roll, after the upgrade
+
+The upgrade itself changes nothing on the gossip wire: `enforcement.gossip_encryption`
+defaults to `false`, and an existing cluster has no `gossip.key` until
+`lv host install-gossip-key` puts one on every host. Turning it on is three more
+rolling restarts, one per stage (`install`, `staged`, `true`), and it must not
+start until **every** host runs a build with the flag — a host on an older build
+stays plaintext and the `staged` roll cuts it off. Rolling a binary back below
+this release on a host whose stage is `staged` or `true` does the same, so walk
+the stage back to `install` fleet-wide first. The sequence, and why no stage may
+be skipped, is in [auth.md](auth.md#turning-it-on-in-an-existing-cluster).
+
+### Region-scoped failover needs every host upgraded
+
+Schema v58 adds `cluster_policies`, a replicated table holding the
+cluster-wide failover scope (`lv cluster failover-scope`). A host on the
+previous release cannot decode a statement on it, and its failover
+coordinator would not honour the policy if it held the lease. So
+`lv cluster failover-scope region` refuses until the `failover_scope_v1`
+capability token has latched, which it does on its own once every host the
+cluster replicates to — including one parked in `maintenance` — runs this
+release. Nothing is written to the table before then, and the scope stays
+`cluster`, exactly as before.
+
+`failover_scope_v1` is mandatory and replication-gated, like
+`host_membership_split_v1`. It has no flag: the policy row is the opt-in, and
+`lv cluster failover-scope cluster` is the stand-down. A binary rolled back
+below the latched token enters WAL quarantine, as below every latched token.
+Roll forward.
+
+### The voter set becomes explicit after the roll
+
+Schema v59 adds `voter_configs`, one immutable row per generation of an
+explicit voter set, and three tables every host keeps to itself: its promises
+and accepts (`local_recovery_claims`), the identity of that state
+(`local_voter_incarnation`) and which generations it has adopted
+(`local_voter_adoption`). Nothing writes `voter_configs` until the
+`voter_config_v1` capability token has latched. It is mandatory and
+replication-gated, so it cannot latch while any host the cluster replicates to
+— one parked in `maintenance` included — runs the previous release. A host
+advertises it only once it can vote durably: its `state.db` is at
+`synchronous=FULL` (the daemon now opens it that way) and its host signing key
+loads.
+
+Once it has latched and every host is voting-eligible and reachable, the
+leader-lease holder decides generation 1 from the hosts that vote today, and
+every host adopts it. From then on the voter set changes only through
+`lv cluster voter add`, `lv cluster voter rm` and `lv cluster voter reset`; see
+[Operating model](operating-model.md) → "The voter set is explicit once genesis
+has run". While genesis waits, `ha.voter.genesis_pending` says why.
+
+There is no flag to turn it off: a host with it off would count a different
+majority from its peers. `lv cluster voter reset` is the decided exit back to
+the derived set. It is not a rollback tool: a binary rolled back below the
+latched token enters WAL quarantine at startup, as below every latched token,
+whether or not a voter generation exists.
+
+### Recovery claims are opt-in after the roll
+
+Schema v60 adds `runtime_action_proofs.claim_certificate`, the majority
+certificate that authorizes an ownership-transfer proof; v61 adds
+`local_abandoned_proofs` and v62 `local_voter_seals`, two tables each host
+keeps to itself (a recovery destination's signed abandonments, and the voter
+generations it sealed in a forced reconfiguration). v63 adds
+`local_incarnation_claims`, a third host-local table: once the mandatory,
+replication-gated `claim_incarnation_v1` token latches, a recovery claim is
+keyed by the workload's incarnation (its `created_at`) as well as its name and
+owner epoch, so a workload deleted and re-created under the same name is never
+answered by the previous one's decision. Nothing writes the new
+column until the `recovery_claim_v1` capability token has latched. It is
+replication-gated, so it cannot latch while any host the cluster replicates to
+runs the previous release, and — unlike `voter_config_v1` — it is **not**
+mandatory: it latches only once every host has opted in.
+
+To turn recovery claims on:
+
+1. Finish the roll and let `voter_config_v1` latch and genesis complete
+   (`lv cluster voter ls` shows generation 1). A cluster can stop here.
+2. Set `enforcement.recovery_claim: true` on **every** host, witnesses
+   included, and restart them one at a time. A host advertises the token only
+   with the flag on, `split_brain_gate_v1` latched and the ability to vote
+   durably.
+3. Wait for `recovery_claim_v1` to latch. Until it does, a host with the
+   flag on reports `litevirt_ha_degraded{reason="unsupported_member"}`; once
+   that clears everywhere and `not_enforcing` is empty, the next failover is
+   claim-gated.
+4. Validate with a partition drill before relying on it.
+
+To stand down, set the flag off on **every** host and restart: coordinators
+mint uncertified proofs and destinations accept them, exactly the pre-claim
+behaviour; voters keep answering and keep their history, and the voter set does
+not move. A flag off on only some hosts is not a degraded mode but the hazard
+the token exists to prevent — such a host reports `recovery_claim_v1` in
+`PingResponse.not_enforcing` and its peers raise `ha_degraded`. A binary rolled
+back below the latched token enters WAL quarantine, as below every latched
+token.
+
 ## Schema upgrades: `litevirt schema-migrate`
 
 The daemon refuses to start when its `CurrentSchemaVersion` is OLDER

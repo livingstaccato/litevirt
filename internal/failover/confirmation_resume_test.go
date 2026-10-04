@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/fence"
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -95,17 +96,98 @@ func TestConfirmationResume_UnlocksTheFenceRequiresConfirmationLabel(t *testing.
 // mistyped hostname would forge the whole admission proof. The resume
 // therefore demands the cluster's own fence attempt as well, and a confirmation
 // alone is not one.
+//
+// A confirmation written before any fence of this outage — the order a forced
+// voter reconfiguration requires — therefore does not resume anything. It puts
+// the host back on the fence path (confirmationFencesAfresh), and what happens
+// next is the fresh fence's business: here an IPMI fence that fails, so nothing
+// moves, exactly as for a host nobody confirmed.
 func TestConfirmationResume_AConfirmationAloneIsNotEnough(t *testing.T) {
-	db, ctx := seedDownHost(t, "manual", nil)
-	operatorConfirms(t, db, ctx, "down") // before any fence: no attempt row exists
+	db, ctx := seedDownHost(t, "ipmi", nil)
+	lengthenStreak(t, db, ctx, 2*time.Minute)
+	confirmAgo(t, db, ctx, 30*time.Second) // before any fence: no attempt row exists
 	c := newTestCoordinator("coordinator", db)
-	c.SetFencer(manualFencer())
+	fences := 0
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return fence.Result{Method: "ipmi", Detail: "BMC unreachable", Success: false}
+	})
 
 	c.run(ctx)
 	c.run(ctx)
 
+	if fences != 1 {
+		t.Errorf("the coordinator ran %d fences of a host confirmed during this outage, want 1 fresh fence", fences)
+	}
 	if got := vmHost(t, db, ctx); got != "down" {
-		t.Errorf("VM moved to %q on a confirmation of a host the cluster never fenced", got)
+		t.Errorf("VM moved to %q on a confirmation of a host whose own fence failed", got)
+	}
+}
+
+// The positive half of the above: a manual-strategy host confirmed during this
+// outage, before anything fenced it, is fenced afresh — the cluster's own
+// attempt — and the manual fence's gate accepts that same recent confirmation.
+func TestConfirmationResume_AConfirmationBeforeAnyFenceFencesAfresh(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil)
+	lengthenStreak(t, db, ctx, 2*time.Minute)
+	confirmAgo(t, db, ctx, 30*time.Second)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(func(ctx context.Context, h fence.HostConfig) fence.Result {
+		fences++
+		return manualFencer()(ctx, h)
+	})
+
+	c.run(ctx)
+	c.run(ctx)
+
+	if fences != 1 {
+		t.Errorf("the coordinator ran %d fences, want exactly 1 fresh fence", fences)
+	}
+	if got := vmHost(t, db, ctx); got != "alive" {
+		t.Errorf("VM still on %q after a confirmation of this outage and a fresh fence", got)
+	}
+}
+
+// A confirmation older than the outage — the host answered after it, and its
+// failing run began later — fences nothing and moves nothing.
+func TestConfirmationResume_AConfirmationBeforeTheOutageFencesNothing(t *testing.T) {
+	db, ctx := seedDownHost(t, "manual", nil) // a run of five probes: eight seconds
+	confirmAgo(t, db, ctx, 10*time.Minute)
+	c := newTestCoordinator("coordinator", db)
+	fences := 0
+	c.SetFencer(func(ctx context.Context, h fence.HostConfig) fence.Result {
+		fences++
+		return manualFencer()(ctx, h)
+	})
+
+	c.run(ctx)
+	c.run(ctx)
+
+	if fences != 0 {
+		t.Errorf("the coordinator fenced on a confirmation from before the outage (%d fences)", fences)
+	}
+	if got := vmHost(t, db, ctx); got != "down" {
+		t.Errorf("VM moved to %q on a confirmation from before the outage", got)
+	}
+}
+
+// confirmAgo is `lv host fence-confirm down` run ago: the host marked fenced
+// and a manual-confirmed row stamped then.
+func confirmAgo(t *testing.T, db *corrosion.Client, ctx context.Context, ago time.Duration) {
+	t.Helper()
+	if err := corrosion.UpdateHostState(ctx, db, "down", "fenced"); err != nil {
+		t.Fatalf("UpdateHostState: %v", err)
+	}
+	seedFenceRow(t, db, ctx, "operator-down", "manual-confirmed", ago)
+}
+
+// lengthenStreak makes every observer's failing run of 'down' span d.
+func lengthenStreak(t *testing.T, db *corrosion.Client, ctx context.Context, d time.Duration) {
+	t.Helper()
+	if err := db.Execute(ctx, `UPDATE host_health SET consecutive_failures = ? WHERE target = 'down'`,
+		int(d/health.ProbeInterval)+offlineThreshold); err != nil {
+		t.Fatalf("lengthen streak: %v", err)
 	}
 }
 
@@ -141,6 +223,7 @@ func TestConfirmationResume_AHostThatCameBackIsNotResumed(t *testing.T) {
 
 	operatorConfirms(t, db, ctx, "down")
 	for _, o := range []string{"coordinator", "alive"} {
+		ensureVoter(t, db, o)
 		if err := db.Execute(ctx,
 			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
 			 VALUES (?, 'down', 'healthy', 0, NULL, strftime('%Y-%m-%dT%H:%M:%SZ','now'))`, o); err != nil {
@@ -350,17 +433,27 @@ func TestConfirmationResume_AnEarlierOutagesConfirmationDoesNotCount(t *testing.
 
 // The same holds for a FRESH confirmation of an old attempt: `lv host
 // fence-confirm` runs no fence, so an operator confirming today does not turn
-// a fence from two days ago into one for this outage.
+// a fence from two days ago into one for this outage. The confirmation is of
+// this outage, so the coordinator fences afresh, and the recovery rests on THAT
+// attempt: an IPMI fence that fails moves nothing.
 func TestConfirmationResume_AFreshConfirmationOfAnOldAttemptDoesNotCount(t *testing.T) {
-	db, ctx := seedDownHost(t, "manual", nil)
+	db, ctx := seedDownHost(t, "ipmi", nil)
+	lengthenStreak(t, db, ctx, 2*time.Minute)
 	seedFenceRow(t, db, ctx, "old-attempt", "partial", 48*time.Hour)
-	operatorConfirms(t, db, ctx, "down")
+	confirmAgo(t, db, ctx, 30*time.Second)
 	c := newTestCoordinator("coordinator", db)
-	c.SetFencer(manualFencer())
+	fences := 0
+	c.SetFencer(func(context.Context, fence.HostConfig) fence.Result {
+		fences++
+		return fence.Result{Method: "ipmi", Detail: "BMC unreachable", Success: false}
+	})
 
 	c.run(ctx)
 	c.run(ctx)
 
+	if fences != 1 {
+		t.Errorf("the coordinator ran %d fences, want 1 fresh fence for this outage", fences)
+	}
 	if got := vmHost(t, db, ctx); got != "down" {
 		t.Errorf("VM moved to %q on today's confirmation of a two-day-old fence attempt", got)
 	}

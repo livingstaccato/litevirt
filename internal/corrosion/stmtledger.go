@@ -68,6 +68,16 @@ const (
 	// for rows whose owner/generation axes are still both zero. The old wire
 	// shape cannot prove authority, so it must never cross into a v44 identity.
 	DispLegacyWorkloadDelete Disposition = "legacy_workload_delete"
+	// DispLiveRowUpdate is a full-PK LWW update that must never modify a
+	// tombstone: it is applied through its `AND deleted_at IS NULL` form, on the
+	// receiver AND on the origin (live_row_update.go).
+	DispLiveRowUpdate Disposition = "live_row_update"
+	// DispHostReadmit is the re-admission of a host over its tombstone
+	// (AdmitHost). A full-PK LWW update applied through its RESET form, which
+	// also returns every per-host setting column to its default, on the origin
+	// and every receiver; it retires the host's fence credential row with it
+	// (host_readmit.go).
+	DispHostReadmit Disposition = "host_readmit"
 	// DispReject always back-pressures. Used as the BEFORE-activation disposition of a
 	// capability-gated shape (RequiresCapability + DispositionAfter): the shape is not authorized
 	// until its capability is active on this receiver, so a prematurely-emitted write fails closed.
@@ -176,9 +186,17 @@ func CurrentLedgerHas(fp string) bool {
 // Scoped deliberately to create-only shapes. A zero-row UPDATE or DELETE is
 // still relayed: those dispositions are LWW-gated or per-category, so the
 // receiver decides for itself, and the row the statement targets may be one
-// this node simply does not hold. An UNCLASSIFIED shape is relayed too —
+// this node simply does not hold. When it is a plain LWW full-PK update and
+// that row is absent, this node also parks it for the row's arrival, so the
+// origin does not end up behind the peers that applied it (parked_updates.go).
+// An UNCLASSIFIED shape is relayed too —
 // unknown means "not known to be create-only", and silently withholding a
 // statement whose semantics we cannot name is the more dangerous default.
+//
+// That is the default for a shape. A CALLER that treats its own zero-row
+// result as a refusal overrides it by writing through ExecuteRowsStrict, which
+// never reaches this function for a statement that changed nothing: the
+// statement is then neither relayed nor parked, whatever its shape.
 func relayStatement(s Statement, changed bool) bool {
 	if changed {
 		return true

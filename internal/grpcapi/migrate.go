@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -272,6 +273,29 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition,
 			"VM %q has a local disk — use --with-storage for live migration or --strategy=cold", req.VmName)
 	}
+	// The disks the copy mirrors: the host-local ones, never a shared one,
+	// which is the same file on the target and would be mirrored onto itself.
+	var diskTargets []string
+	if withStorage {
+		if diskTargets, err = storageMigrationTargets(req.VmName, disks); err != nil {
+			return err
+		}
+		if len(diskTargets) == 0 {
+			// Nothing to copy: an empty migrate_disks would make libvirt copy
+			// EVERY writable disk, the shared ones included.
+			slog.Info("migrate: --with-storage requested but the VM has no host-local disk; migrating without a storage copy",
+				"vm", req.VmName)
+			withStorage = false
+		}
+	}
+	// The disks the copy needs on the target, checked against their records
+	// here, before any work on the target.
+	var diskStubs []*pb.DiskStub
+	if withStorage {
+		if diskStubs, err = s.storageMigrationStubs(ctx, req.VmName); err != nil {
+			return err
+		}
+	}
 
 	// NUMA topology pre-flight: warn if source and target have different NUMA
 	// layouts when the VM has CPU pinning configured (#55).
@@ -393,8 +417,16 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 
 	// Ensure disk files exist on target before --with-storage migration.
 	// libvirt validates all file paths in the domain XML before block copy starts.
+	// createdStubs is what THIS attempt created there — all a failed attempt
+	// may remove.
+	var createdStubs []string
 	if withStorage {
-		s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name)
+		if createdStubs, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, diskStubs); err != nil {
+			// EnsureDisks removed whatever it had created; the cloud-init ISO
+			// pre-created above is the only leftover.
+			s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, nil)
+			return err
+		}
 	}
 
 	// Firmware-state travel (G1): a Secure-Boot/vTPM VM is migrated cold from a
@@ -513,17 +545,6 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		defer cancel()
 	}
 
-	// Build the list of writable disk targets to migrate (exclude CDROMs).
-	var diskTargets []string
-	if withStorage {
-		disks, _ := corrosion.GetVMDisks(ctx, s.db, vm.Name)
-		for _, d := range disks {
-			if d.TargetDev != "" {
-				diskTargets = append(diskTargets, d.TargetDev)
-			}
-		}
-	}
-
 	// Run migration in background; poll progress.
 	done := make(chan error, 1)
 	go func() {
@@ -547,6 +568,7 @@ poll:
 	for {
 		select {
 		case <-migrateCtx.Done():
+			s.abortOnMigrateTimeout(ctx, migrateCtx, vm.Name)
 			// libvirt is still migrating. MigrateToTarget takes no context, so
 			// cancelling this request does not stop the guest moving — it only
 			// stops us watching. Returning bare here left the VM at
@@ -554,7 +576,10 @@ poll:
 			// the reconciler skips `migrating`, so nothing ever healed it.
 			adopted = true
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
-				withStorage, disks, done, unlock)
+				withStorage, disks, done, unlock, migrationFinish{
+					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+					createdStubs: createdStubs,
+				})
 			return status.Errorf(codes.DeadlineExceeded,
 				"stopped waiting for the migration of %q to %s (%v); it is still running in "+
 					"libvirt and will be completed in the background — watch `lv events %s`",
@@ -580,27 +605,7 @@ poll:
 						s.noteStateWriteFail(corrosion.OpVMState, werr)
 					}
 				}
-				// Remove the disk stubs + cloud-init ISO we pre-created on the
-				// target — the VM never got defined there, so they're orphaned
-				// and would otherwise leak space and shadow a retry. Detached
-				// context: the request ctx may itself be the cause of failure.
-				var stubPaths []string
-				if withStorage {
-					if ds, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name); derr == nil {
-						for _, d := range ds {
-							if d.Path != "" {
-								stubPaths = append(stubPaths, d.Path)
-							}
-						}
-					}
-				}
-				// (Firmware VMs never reach this runtime-migration path — they take
-				// the stopped cold-move in coldMigrateFirmwareVM — so no firmware
-				// cleanup is needed here.)
-				cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), 15*time.Second)
-				s.cleanupMigrationArtifactsOnTarget(cleanupCtx, req.TargetHost, vm.Name, stubPaths, "")
-				cancelCleanup()
-
+				s.cleanupFailedMigrationTarget(ctx, vm.Name, req.TargetHost, createdStubs)
 				send(pb.MigratePhase_MIGRATE_FAILED, 0, 0) //nolint:errcheck
 				s.recordMigrationMetrics(strategyLabel, "failure", time.Since(migrationStart), 0, 0)
 				return status.Errorf(codes.Internal, "migration failed: %v", migrateErr)
@@ -632,12 +637,6 @@ poll:
 			"VM %q cut over to %s but committing ownership failed: %v", vm.Name, req.TargetHost, err)
 	}
 
-	// The host link is what the mirror now has to catch up on: the VM's NetBox
-	// object still points at the source's device. Queued on a DETACHED context,
-	// like the rest of the post-commit work — the request context may already be
-	// cancelled by the time the cutover finishes.
-	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
-
 	downtimeMs := float64(time.Since(cutoverStart).Milliseconds())
 	s.recordMigrationMetrics(strategyLabel, "success", time.Since(migrationStart), downtimeMs, 0)
 	slog.Info("migration complete", "vm", vm.Name, "from", s.hostName, "to", req.TargetHost)
@@ -646,52 +645,9 @@ poll:
 
 	// (Firmware-state cleanup is handled in coldMigrateFirmwareVM, which firmware
 	// VMs take instead of this runtime-migration path — see the early return above.)
-
-	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
-	if len(detachedVFs) > 0 {
-		s.reattachVFsOnTarget(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name, detachedVFs)
-	}
-
-	// Send gratuitous ARP for each VM interface to update switch MAC tables.
-	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
-	for _, iface := range ifaces {
-		if iface.IP != "" {
-			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
-		}
-	}
-
-	// Update DNS records so VM names resolve correctly after migration.
-	if s.dnsDomain != "" {
-		for _, iface := range ifaces {
-			if iface.IP != "" {
-				dnsName := dns.VMRecordName(vm.Name, vm.StackName, s.dnsDomain)
-				if err := dns.UpsertRecord(ctx, s.db, dnsName, iface.IP); err != nil {
-					slog.Warn("post-migration DNS update failed", "vm", vm.Name, "name", dnsName, "error", err)
-				}
-				break // one A record per VM
-			}
-		}
-	}
-
-	// Refresh LB backends so traffic routes to the new host.
-	go s.refreshLBForStack(context.Background(), vm.StackName)
-
-	// Update FDB entries: VM MACs now live on target host's VTEP.
-	for _, iface := range ifaces {
-		s.updateFDBForMigration(ctx, iface, s.hostName, req.TargetHost)
-	}
-
-	// post_migrate hook (notify with new host)
-	pbVM.HostName = req.TargetHost
-	pbVM.State = pb.VMState_VM_RUNNING
-	hooks.Run(ctx, hooks.PostMigrate, pbVM, hspec)
-
-	// Dial target host to re-establish gRPC so it can load TLS creds.
-	go s.notifyTargetHostOfVM(ctx, req.TargetHost, targetHost.Address, targetHost.GRPCPort, vm.Name)
-
-	// Clean up orphaned files on the source host (cloud-init ISO, and disk
-	// files for --with-storage migrations where copies now live on target).
-	go s.cleanupPostMigration(vm.Name)
+	s.finishMigrationOnTarget(ctx, vm, migrationFinish{
+		target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,
+	})
 
 	return send(pb.MigratePhase_MIGRATE_DONE, 100, 0)
 }
@@ -733,6 +689,7 @@ func (s *Server) adoptAbandonedMigration(
 	disks []corrosion.DiskRecord,
 	done <-chan error,
 	unlock func(),
+	finish migrationFinish,
 ) {
 	go func() {
 		defer unlock()
@@ -742,7 +699,22 @@ func (s *Server) adoptAbandonedMigration(
 			}
 		}()
 
-		err := <-done
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(adoptedMigrationCeiling):
+			// MigrateToTarget takes no context, so a migration that will not
+			// converge runs for as long as libvirt lets it — with this VM's lock
+			// held, blocking every later operation on it. Past the ceiling it is
+			// aborted; libvirt then returns an error and the guest stays on the
+			// source, which the failure branch below records.
+			slog.Warn("migrate: adopted migration exceeded its ceiling; aborting it",
+				"vm", vm.Name, "target", targetHost, "ceiling", adoptedMigrationCeiling)
+			if aerr := s.virt.AbortMigration(vm.Name); aerr != nil {
+				slog.Error("migrate: could not abort the adopted migration", "vm", vm.Name, "error", aerr)
+			}
+			err = <-done
+		}
 		if err != nil {
 			// The migration failed after we stopped watching; the guest is still
 			// on the source. Anything but `migrating` — that is the state nothing
@@ -761,6 +733,7 @@ func (s *Server) adoptAbandonedMigration(
 			}); werr != nil {
 				s.noteStateWriteFail(corrosion.OpVMState, werr)
 			}
+			s.cleanupFailedMigrationTarget(ctx, vm.Name, targetHost, finish.createdStubs)
 			slog.Warn("migrate: adopted migration failed", "vm", vm.Name, "target", targetHost, "error", err)
 			s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", "abandoned request; migration failed: "+err.Error())
 			return
@@ -780,7 +753,15 @@ func (s *Server) adoptAbandonedMigration(
 		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
 		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok",
 			"abandoned request; completed to "+targetHost)
-		s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+		// The same finish a watched migration gets. Committing ownership and
+		// stopping here left the guest without its SR-IOV VFs, its FDB entries
+		// on the old VTEP, its LB backends and DNS stale, and the source's files
+		// orphaned.
+		if finish.target != nil {
+			s.finishMigrationOnTarget(ctx, vm, finish)
+		} else {
+			s.enqueueMirrorSync(ctx, vm.Name, mirrorOpUpsert)
+		}
 	}()
 }
 
@@ -807,7 +788,24 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 		}
 		if !ok {
 			// Preconditions no longer hold (VM/disks changed during migration) —
-			// a hard abort, never silent success.
+			// a hard abort, never silent success. The guest is on the target all
+			// the same, so the VM row is moved there if it is still this
+			// migration's: a row left `migrating` on the source is one nothing
+			// heals (owner-assert skips `migrating`), and the cluster would go on
+			// naming a host that no longer runs the guest.
+			//runningcheck:allow ownership handoff after cutover, as CommitMigrationOwnership above: the source's
+			// domain is gone, and the destination's convergence marks its own runtime.
+			moved, rerr := corrosion.RepointMigratedVM(fctx, s.db, vm.Name, s.hostName, targetHost, "running")
+			switch {
+			case rerr != nil:
+				return fmt.Errorf("ownership commit precondition failed: VM %q or its disks changed during migration, "+
+					"and the VM row could not be moved to %s: %v", vm.Name, targetHost, rerr)
+			case moved:
+				slog.Error("post-migration: disk rows changed during migration; moved the VM row to the target "+
+					"and left the disk rows as they are", "vm", vm.Name, "to", targetHost)
+				return fmt.Errorf("ownership commit precondition failed: VM %q's disks changed during migration; "+
+					"the VM row now names %s, where it runs, and its disk rows were left unchanged", vm.Name, targetHost)
+			}
 			return fmt.Errorf("ownership commit precondition failed: VM %q or its disks changed during migration", vm.Name)
 		}
 		committed = true
@@ -982,7 +980,21 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 // EnsureDisks creates empty qcow2 images at the requested paths so that
 // libvirt's domain XML validation passes before block copy starts.
 // Called by the source host before --with-storage migration.
-func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*emptypb.Empty, error) {
+//
+// It reports the stubs it created and records them (migrationStubs). The copy
+// mirrors each source disk into the file at its path here, and a failed attempt
+// removes what was created, so a file this host did not create for this VM
+// takes part in neither. Such a file is refused, not skipped: it may be the
+// VM's disk from an earlier stay here — drill D1's was a copy partition settle
+// kept — and the mirror overwrites it whenever the sizes match. Refused rather
+// than overwritten on an operator's say-so, because only someone looking at
+// the file on this host can tell whether it is still needed, and once they
+// have, moving it aside is the whole remedy. A stub this host created for the
+// VM in an earlier attempt is its own and is reused.
+//
+// Every path is checked before any is created, and a failure part-way removes
+// the stubs this call created, so a refused or failed call leaves nothing.
+func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*pb.EnsureDisksResponse, error) {
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
@@ -993,25 +1005,66 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 		if !s.withinDiskArtifactRoot(stub.Path) {
 			return nil, status.Errorf(codes.InvalidArgument, "disk stub path %q is not in a disk-artifact root", stub.Path)
 		}
-		if _, err := os.Stat(stub.Path); err == nil {
-			continue // already exists
+		if _, err := os.Lstat(stub.Path); err == nil {
+			if !s.migrationStubs.owns(req.VmName, stub.Path) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"disk %s of VM %q already exists on %s, and this migration did not create it. "+
+						"It may be the VM's disk from an earlier stay on %s (a copy partition settle kept, say), "+
+						"and copying the disk there would overwrite it. Check whether it is still needed, "+
+						"move it aside or remove it on %s, then migrate again",
+					stub.Path, req.VmName, s.hostName, s.hostName, s.hostName)
+			}
+		} else if !os.IsNotExist(err) {
+			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
 		}
-		dir := filepath.Dir(stub.Path)
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
+	}
+	resp := &pb.EnsureDisksResponse{}
+	var made []string // created by this call: removed again if a later one fails
+	undo := func() {
+		for _, p := range made {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				slog.Warn("disk stub: remove after a failed EnsureDisks", "vm", req.VmName, "path", p, "error", err)
+			}
+			s.migrationStubs.forget(p)
 		}
+	}
+	for _, stub := range req.Disks {
 		// Create a valid qcow2 image — QEMU validates the format header
 		// before block copy starts. Use a minimal size; migration overwrites it.
 		sizeBytes := uint64(1024 * 1024 * 1024) // 1G default
 		if stub.SizeBytes > 0 {
 			sizeBytes = uint64(stub.SizeBytes)
 		}
+		if _, err := os.Lstat(stub.Path); err == nil {
+			// This host's own stub from an earlier attempt for this VM (checked
+			// above). Reuse it at the size asked for now: the mirror needs the
+			// sizes to agree, and a stub holds nothing worth keeping.
+			if info, ierr := qcow2.Info(stub.Path); ierr == nil && info.VirtualSize == sizeBytes {
+				resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
+				slog.Info("disk stub reused for migration", "vm", req.VmName, "path", stub.Path)
+				continue
+			}
+			if err := os.Remove(stub.Path); err != nil {
+				undo()
+				return nil, status.Errorf(codes.Internal, "replace stub %s: %v", stub.Path, err)
+			}
+			s.migrationStubs.forget(stub.Path)
+		}
+		dir := filepath.Dir(stub.Path)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			undo()
+			return nil, status.Errorf(codes.Internal, "create disk dir %s: %v", dir, err)
+		}
 		if err := qcow2.Create(stub.Path, sizeBytes, nil); err != nil {
+			undo()
 			return nil, status.Errorf(codes.Internal, "create stub %s: %v", stub.Path, err)
 		}
+		made = append(made, stub.Path)
+		s.migrationStubs.add(req.VmName, stub.Path)
+		resp.CreatedPaths = append(resp.CreatedPaths, stub.Path)
 		slog.Info("disk stub created for migration", "vm", req.VmName, "path", stub.Path, "size_bytes", stub.SizeBytes)
 	}
-	return &emptypb.Empty{}, nil
+	return resp, nil
 }
 
 // EnsureFirmwareState materializes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -1247,7 +1300,8 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	// VM record intact (the source still owns it); only when the VM has truly
 	// vanished do we fall back to admin (orphan cleanup), so a binding-holder
 	// can't drive this RPC against a VM they don't control.
-	if vm, _ := corrosion.GetVM(ctx, s.db, req.VmName); vm != nil {
+	vm, _ := corrosion.GetVM(ctx, s.db, req.VmName)
+	if vm != nil {
 		if err := s.RequirePerm(ctx, vmRBACPath(vm), "vm.migrate", "operator"); err != nil {
 			return nil, err
 		}
@@ -1255,6 +1309,11 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		return nil, status.Error(codes.PermissionDenied,
 			"cleaning up artifacts of a vanished VM requires the admin role")
 	}
+	// A VM that lives here — its row names this host, or its domain is defined
+	// here — has its real disks at these paths; a failed migration TO this host
+	// never got that far.
+	vmLivesHere := (vm != nil && vm.HostName == s.hostName) ||
+		(s.virt != nil && s.virt.DomainExists(req.VmName))
 	for _, p := range req.DiskPaths {
 		if p == "" {
 			continue
@@ -1266,9 +1325,20 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 			slog.Warn("cleanup migration artifacts: refusing to remove path outside a disk-artifact root", "vm", req.VmName, "path", p)
 			continue
 		}
+		// Only a stub THIS host created for the VM (EnsureDisks). The source's
+		// list is not trusted for it: a source built before EnsureDisks reported
+		// what it created names every disk path, including a disk that was here
+		// already, and removing that by name deleted it (drill D1).
+		if vmLivesHere || !s.migrationStubs.owns(req.VmName, p) {
+			slog.Warn("cleanup migration artifacts: leaving a disk file this host did not create as a migration stub",
+				"vm", req.VmName, "path", p, "vm_lives_here", vmLivesHere)
+			continue
+		}
 		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
 			slog.Warn("cleanup migration artifacts: remove disk stub", "vm", req.VmName, "path", p, "error", err)
+			continue
 		}
+		s.migrationStubs.forget(p)
 	}
 	if req.RemoveCloudInit {
 		if iso, perr := lv.SafeCloudInitISOPath(s.dataDir, req.VmName); perr != nil {
@@ -1300,12 +1370,12 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 // cleanupMigrationArtifactsOnTarget best-effort removes the stubs + ISO the
 // target pre-created, after a failed migration. Never blocks/fails the caller.
 func (s *Server) cleanupMigrationArtifactsOnTarget(ctx context.Context, targetHost, vmName string, diskPaths []string, firmwareUUID string) {
-	client, conn, err := s.peerClient(ctx, targetHost)
+	client, closeConn, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
 		slog.Warn("cleanupMigrationArtifactsOnTarget: cannot reach host", "host", targetHost, "error", err)
 		return
 	}
-	defer conn.Close()
+	defer closeConn()
 	if _, err := client.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
 		VmName:          vmName,
 		DiskPaths:       diskPaths,
@@ -1335,50 +1405,107 @@ func diskVirtualSize(_ context.Context, path string) (int64, error) {
 	return int64(info.VirtualSize), nil
 }
 
-// ensureDisksOnTarget creates empty stub files on the target host for each
-// local disk so libvirt accepts the domain XML before block copy starts.
-// Reads actual virtual size from source disk files to ensure exact match.
-func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string) {
+// storageMigrationStubs is the source-side preflight of a --with-storage
+// migration: the stub each of the VM's disk files needs on the target, sized at
+// the source disk's virtual size, which the block mirror requires the target
+// image to match.
+//
+// It refuses a disk whose virtual size differs from its recorded size. The
+// record is what placement, quota and the target's own rebuilds go by, so a
+// disk that disagrees with it is a fault to repair, not to carry to another
+// host — and when the target already holds a file of the recorded size, the
+// copy fails deep in drive-mirror with "Source and target image have different
+// sizes" (drill D1: an overlay rebuilt at its 112 MiB backing size for a disk
+// recorded at 20 GiB). A disk with no recorded size, or whose size cannot be
+// read here (not a qcow2), is sent at what can be known, as before.
+//
+// Disks on a storage driver that is not a host-local file (nfs, ceph, a volume
+// manager) are not stubbed: there is no per-host file to create.
+func (s *Server) storageMigrationStubs(ctx context.Context, vmName string) ([]*pb.DiskStub, error) {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vmName)
-	if err != nil || len(disks) == 0 {
-		return
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "read the disks of VM %q: %v", vmName, err)
 	}
-
-	req := &pb.EnsureDisksRequest{VmName: vmName}
+	var stubs []*pb.DiskStub
 	for _, d := range disks {
-		if d.Path == "" {
+		if !copiedByStorageMigration(d) {
 			continue
 		}
-		// Get the actual virtual size from the source disk file,
-		// not the DB — they can differ (e.g. backing image size).
 		size, err := diskVirtualSize(ctx, d.Path)
 		if err != nil {
-			slog.Warn("ensureDisksOnTarget: cannot read virtual size, using DB value",
-				"path", d.Path, "db_size", d.SizeBytes, "error", err)
+			slog.Warn("storage migration: cannot read the disk's virtual size, using the recorded size",
+				"vm", vmName, "path", d.Path, "db_size", d.SizeBytes, "error", err)
 			size = d.SizeBytes
-		} else {
-			slog.Info("ensureDisksOnTarget: read virtual size from source",
-				"path", d.Path, "virtual_size", size, "db_size", d.SizeBytes)
+		} else if d.SizeBytes > 0 && size != d.SizeBytes {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q is %d bytes on %s, but its record says %d bytes; a storage migration "+
+					"would carry that disagreement to the target, or fail in the copy with \"Source and target "+
+					"image have different sizes\". Grow the disk to its recorded size or correct the record, "+
+					"then migrate again",
+				d.DiskName, vmName, size, s.hostName, d.SizeBytes)
 		}
-		req.Disks = append(req.Disks, &pb.DiskStub{
-			Path:      d.Path,
-			SizeBytes: size,
-		})
+		stubs = append(stubs, &pb.DiskStub{Path: d.Path, SizeBytes: size})
 	}
-	if len(req.Disks) == 0 {
-		return
-	}
+	return stubs, nil
+}
 
+// copiedByStorageMigration reports whether a --with-storage migration copies
+// this disk: a host-local file (a row with no storage type is taken as one, as
+// it always was). A shared disk (nfs, ceph, iscsi, a volume manager) is the same
+// disk on the target already, and copying it would mirror it onto itself.
+func copiedByStorageMigration(d corrosion.DiskRecord) bool {
+	return d.Path != "" && (d.StorageType == "" || isHostLocalDiskDriver(d.StorageType))
+}
+
+// storageMigrationTargets is the migrate_disks list of a --with-storage
+// migration: the target device of every disk it copies, and nothing else.
+// libvirt reads an EMPTY list as "copy every writable disk", so a copied disk
+// with no recorded target device is refused rather than left out, which would
+// leave it behind, or the list emptied, which would copy the shared disks too.
+func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]string, error) {
+	var targets []string
+	for _, d := range disks {
+		if !copiedByStorageMigration(d) {
+			continue
+		}
+		if d.TargetDev == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q has no recorded target device, so a storage migration cannot name it to libvirt; "+
+					"migrate it cold (--strategy=cold) or repair its record", d.DiskName, vmName)
+		}
+		targets = append(targets, d.TargetDev)
+	}
+	return targets, nil
+}
+
+// ensureDisksOnTarget has the target create the stub files the copy needs, so
+// libvirt accepts the domain XML before block copy starts, and returns the
+// paths the target reports it created — all a failed attempt may remove there.
+//
+// A failure stops the migration. It used to be logged and the migration went
+// ahead, against a target missing disks libvirt would then trip over — or
+// holding a file the copy would overwrite (EnsureDisks refuses that).
+func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub) ([]string, error) {
+	if len(stubs) == 0 {
+		return nil, nil
+	}
 	client, conn, err := s.peerClient(ctx, targetHost)
 	if err != nil {
-		slog.Warn("ensureDisksOnTarget: cannot reach host", "host", targetHost, "error", err)
-		return
+		return nil, status.Errorf(codes.Unavailable,
+			"cannot reach %s to prepare the disks of VM %q for the copy: %v", targetHost, vmName, err)
 	}
 	defer conn.Close()
 
-	if _, err := client.EnsureDisks(ctx, req); err != nil {
-		slog.Warn("ensureDisksOnTarget: failed", "host", targetHost, "vm", vmName, "error", err)
+	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vmName, Disks: stubs})
+	if err != nil {
+		code := status.Code(err)
+		if code == codes.Unknown {
+			code = codes.Internal
+		}
+		return nil, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
+			vmName, targetHost, status.Convert(err).Message())
 	}
+	return resp.GetCreatedPaths(), nil
 }
 
 // ensureCloudInitOnTarget calls the target host to generate the cloud-init ISO
@@ -1457,4 +1584,114 @@ func (s *Server) notifyTargetHostOfVM(ctx context.Context, targetHostName, addr 
 		return
 	}
 	slog.Info("migrate: target acknowledged VM", "host", targetHostName, "vm", vmName)
+}
+
+// migrationFinish is what the post-cutover work needs beyond the VM itself.
+type migrationFinish struct {
+	target      *corrosion.HostRecord
+	detachedVFs []corrosion.PCIDeviceRecord
+	pbVM        *pb.VM
+	hspec       *pb.HooksSpec
+	// createdStubs are the disk stubs this attempt created on the target
+	// (EnsureDisks), the only disk files a failed attempt removes there.
+	createdStubs []string
+}
+
+// adoptedMigrationCeiling bounds how long an adopted migration may run before
+// it is aborted. A var so tests can shorten it.
+var adoptedMigrationCeiling = time.Hour
+
+// abortOnMigrateTimeout aborts the libvirt job when the MIGRATE TIMEOUT is what
+// ended the wait. timeout_sec is a policy on the operation — give up after N —
+// and MigrateToTarget ignores contexts, so without the abort a migration that
+// would not converge kept running, adopted, with the VM's lock held. A client
+// that merely stopped listening (ctx itself done) is not a policy: that
+// migration is adopted and allowed to finish.
+func (s *Server) abortOnMigrateTimeout(ctx, migrateCtx context.Context, vmName string) {
+	if ctx.Err() != nil || !errors.Is(migrateCtx.Err(), context.DeadlineExceeded) {
+		return
+	}
+	slog.Warn("migrate: timeout reached; aborting the libvirt migration job", "vm", vmName)
+	if err := s.virt.AbortMigration(vmName); err != nil {
+		slog.Error("migrate: could not abort the timed-out migration", "vm", vmName, "error", err)
+	}
+}
+
+// finishMigrationOnTarget is everything after a committed cut-over that makes
+// the rest of the cluster agree the guest has moved: the NetBox mirror, SR-IOV
+// VFs, switch MAC tables, DNS, LB backends, VXLAN FDB, the post_migrate hook,
+// the target's own view, and the source's leftovers. Shared by the watched
+// path and an adopted migration, which used to commit ownership and stop.
+func (s *Server) finishMigrationOnTarget(ctx context.Context, vm *corrosion.VMRecord, f migrationFinish) {
+	target := f.target.Name
+	// Queued on a DETACHED context, like the rest of the post-commit work — the
+	// request context may already be cancelled by the time the cutover finishes.
+	s.enqueueMirrorSync(context.WithoutCancel(ctx), vm.Name, mirrorOpUpsert)
+
+	// Re-attach equivalent VFs on the target host for any VFs detached pre-migration.
+	if len(f.detachedVFs) > 0 {
+		s.reattachVFsOnTarget(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name, f.detachedVFs)
+	}
+
+	// Send gratuitous ARP for each VM interface to update switch MAC tables.
+	ifaces, _ := corrosion.GetVMInterfaces(ctx, s.db, vm.Name)
+	for _, iface := range ifaces {
+		if iface.IP != "" {
+			go network.SendGARPBestEffort(iface.NetworkName, iface.IP)
+		}
+	}
+
+	// Update DNS records so VM names resolve correctly after migration.
+	if s.dnsDomain != "" {
+		for _, iface := range ifaces {
+			if iface.IP != "" {
+				dnsName := dns.VMRecordName(vm.Name, vm.StackName, s.dnsDomain)
+				if err := dns.UpsertRecord(ctx, s.db, dnsName, iface.IP); err != nil {
+					slog.Warn("post-migration DNS update failed", "vm", vm.Name, "name", dnsName, "error", err)
+				}
+				break // one A record per VM
+			}
+		}
+	}
+
+	// Refresh LB backends so traffic routes to the new host.
+	go s.refreshLBForStack(context.Background(), vm.StackName)
+
+	// Update FDB entries: VM MACs now live on target host's VTEP.
+	for _, iface := range ifaces {
+		s.updateFDBForMigration(ctx, iface, s.hostName, target)
+	}
+
+	// post_migrate hook (notify with new host)
+	if f.pbVM != nil {
+		f.pbVM.HostName = target
+		f.pbVM.State = pb.VMState_VM_RUNNING
+		hooks.Run(ctx, hooks.PostMigrate, f.pbVM, f.hspec)
+	}
+
+	// Dial target host to re-establish gRPC so it can load TLS creds.
+	go s.notifyTargetHostOfVM(ctx, target, f.target.Address, f.target.GRPCPort, vm.Name)
+
+	// Clean up orphaned files on the source host (cloud-init ISO, and disk
+	// files for --with-storage migrations where copies now live on target).
+	go s.cleanupPostMigration(vm.Name)
+}
+
+// cleanupFailedMigrationTarget removes the disk stubs and cloud-init ISO a
+// migration pre-created on the target. The VM never got defined there, so they
+// are orphaned and would otherwise leak space and shadow a retry. Detached
+// context: the request context may itself be the cause of the failure. Shared
+// by the watched failure and an adopted one, which used to skip it.
+//
+// stubPaths is only what EnsureDisks reported CREATING for this attempt. A path
+// it skipped already held a file — a disk partition settle kept there, say —
+// and removing every disk path by name deleted it (drill D1). A target too old
+// to report what it created reports nothing, and its stub is left in place.
+func (s *Server) cleanupFailedMigrationTarget(ctx context.Context, vmName, target string, stubPaths []string) {
+	// (Firmware VMs never reach this runtime-migration path — they take the
+	// stopped cold-move in coldMigrateFirmwareVM — so no firmware cleanup is
+	// needed here.)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	s.cleanupMigrationArtifactsOnTarget(cleanupCtx, target, vmName, stubPaths, "")
 }

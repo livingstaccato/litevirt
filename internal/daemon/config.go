@@ -54,6 +54,12 @@ type Config struct {
 	// worth the extra digest traffic. (P2-2)
 	AntiEntropyIntervalSec int `yaml:"anti_entropy_interval_sec"`
 
+	// AntiEntropyLegacyRepair is the stand-down for incremental anti-entropy
+	// (docs/design/ae-incremental.md): when true this node pulls whole
+	// mismatched tables, asks no peer for bucket digests and caches no digest,
+	// as before #262. It still serves the new RPCs to peers. Default false.
+	AntiEntropyLegacyRepair bool `yaml:"anti_entropy_legacy_repair"`
+
 	// PCI device management
 	PCI PCIConfig `yaml:"pci"`
 
@@ -70,7 +76,8 @@ type Config struct {
 	// capability tokens. Each is the enforcement AND kill switch: enforcement is
 	// this flag AND the token's cluster-wide capability latch, so false disables
 	// the behavior regardless of any durable latch marker (flag=false + restart is
-	// the only stand-down — never delete marker files). All default false; the
+	// the only stand-down — never delete marker files). All default false except
+	// audit_signature (see EnforcementConfig.AuditSignature for why); the
 	// build still ADVERTISES the tokens (capabilities.supported) so the cluster can
 	// latch, but nothing enforces until the operator opts in. (The strict-mTLS /
 	// forwarded-identity switches live under Auth for historical reasons.)
@@ -120,6 +127,12 @@ type Config struct {
 	VMEventErrorRetentionDays int `yaml:"vm_event_error_retention_days"`
 	VMEventMaxPerVM           int `yaml:"vm_event_max_per_vm"`
 	VMEventPruneHours         int `yaml:"vm_event_prune_hours"`
+
+	// SupersededDiskRetentionDays: how long a disk copy a failover start set
+	// aside (<path>.superseded-<time>) is kept before this host removes it. A
+	// copy is kept whatever its age while its VM is in error, pending or
+	// starting. 0 keeps every copy until removed by hand. Default 7.
+	SupersededDiskRetentionDays int `yaml:"superseded_disk_retention_days"`
 
 	// Superseded-row GC retention. The core retention applies to provably-inert
 	// rows (superseded recovery-code sets / stale LB generations); the longer
@@ -388,7 +401,9 @@ type AuthConfig struct {
 // EnforcementConfig holds the per-node kill-switches for the split-brain-family
 // capability tokens. Each is `flag && capability` (the strict-mTLS pattern): the
 // flag is authoritative for enforcement AND recovery, so false disables the
-// behavior regardless of the durable latch. All default false.
+// behavior regardless of the durable latch. All default false except
+// AuditSignature and PartitionPause, which LoadConfig defaults to true. DigestV2
+// (not a capability token) also defaults to true.
 type EnforcementConfig struct {
 	// SafeFenceDefault: a best-effort (unconfirmable) fence must carry an operator
 	// proof-of-power-off before the coordinator reschedules/promotes off the host
@@ -442,7 +457,8 @@ type EnforcementConfig struct {
 	// row-content divergence + perpetual no-op merges. Negotiated PAIRWISE by wire-field
 	// presence (no cluster latch): a node emits v2 only when this is on, and two peers
 	// compare v2 only when both emitted it — so a non-uniform rollout is safe. Default
-	// false; reversible kill switch.
+	// TRUE (LoadConfig presets it): with it off, replicas founded at different schema
+	// versions disagree about identical rows forever. Explicit false is the kill switch.
 	DigestV2 bool `yaml:"digest_v2,omitempty"`
 	// CanonicalIdentity: resolve the natural-key identity tables (snapshots,
 	// container_snapshots) by their UNIQUE natural key instead of the minted random id
@@ -487,12 +503,24 @@ type EnforcementConfig struct {
 	// AuditSignature: sign every audit row this node writes with the host's cluster
 	// key (capabilities.AuditSignatureV1). Signing follows this flag ALONE — a signed
 	// row is backward-compatible, so there is nothing to wait for. The cluster-wide
-	// latch gates only the refusal: with the flag set AND the token latched, an audit
-	// write this node cannot sign FAILS instead of landing unsigned, which is what
-	// stops an attacker with database write access from appending unsigned history and
-	// still passing `lv audit verify`. Enable fleet-uniformly (a node with the flag off
-	// keeps emitting unsigned rows, so the token is advertised only while it is on).
-	// Default false; reversible kill switch.
+	// latch only raises an audit write this node cannot sign to an error-level log;
+	// the row is still written, and the verifier reports it as evidence.
+	//
+	// DEFAULT TRUE, the one enforcement flag that is on unless switched off
+	// (LoadConfig sets it before parsing; an explicit `audit_signature: false`
+	// wins). It used to default false like the rest, and every cluster that had
+	// not found the flag wrote its whole audit log unsigned — the kvm003-f3 lab
+	// verified 212 rows, none signed, on a build that could sign all of them. The
+	// usual reason for an opt-in does not apply here. No node relies on a PEER
+	// signing: each host's obligation is its own published, adopted certificate,
+	// so a host still on an older build, or one with the flag off, is simply a
+	// host that is not signing yet and nothing it writes is reported. Rolling a
+	// signing host back is a signed retirement on its next start (flag false, or
+	// any build that predates this default), not a silent stop.
+	//
+	// The token is still advertised only while the flag is on, so a latched
+	// audit_signature_v1 keeps meaning every node is configured to sign.
+	// Reversible kill switch.
 	AuditSignature bool `yaml:"audit_signature,omitempty"`
 	// OwnerEpoch: activate the Phase 4 ownership-generation regime on this host
 	// (capabilities.OwnerEpochV1). With the flag on, the health sweeps backfill
@@ -520,6 +548,45 @@ type EnforcementConfig struct {
 	// Plan the rollback path accordingly: it is a per-node config-and-restart
 	// roll, not a switch.
 	LeaseTerm bool `yaml:"lease_term,omitempty"`
+	// RecoveryClaim opts this node into single-winner recovery claims
+	// (capabilities.RecoveryClaimV1, docs/design/recovery-claims.md): its
+	// failover coordinator collects a majority certificate from the voter set
+	// before it mints a reschedule, promote or relocate proof, and its
+	// executors verify that certificate before they act on one. Enforcement is
+	// this flag AND the recovery_claim_v1 latch AND an adopted voter
+	// generation with members.
+	//
+	// The token is advertised only while this flag is on, so the latch means
+	// CONFIG uniformity: a flag-off node would mint an uncertified proof or
+	// start one, which is the second owner the others are protecting against.
+	// Enable on every host, witnesses included. Turning it off everywhere and
+	// restarting returns recovery to the pre-claim behaviour; voters keep
+	// answering and keep their history either way. Off on SOME hosts is the
+	// hazard, not a degraded mode: those hosts report the token in
+	// PingResponse.not_enforcing and their peers raise ha_degraded.
+	RecoveryClaim bool `yaml:"recovery_claim,omitempty"`
+	// PartitionPause: on losing the voter majority for T_pause (10 s), suspend
+	// every VM and freeze every container the failover coordinator would
+	// recover elsewhere, and resume them only once a majority of voters
+	// confirms nothing moved them (capabilities.PartitionPauseV1,
+	// docs/design/partition-pause.md). The token is advertised only while this
+	// flag is on, so once it latches every voter pauses, and a coordinator
+	// whose best-effort fence could not reach a host waits out that host's
+	// pause before recovering it, recording the fence as self_paused.
+	//
+	// DEFAULT TRUE, the second enforcement flag that is on unless switched off
+	// (LoadConfig sets it before parsing; an explicit `partition_pause: false`
+	// wins). The cost it guards against — one workload running twice through a
+	// partition — is the one the user chose never to accept, and a pause keeps
+	// RAM, so a fleet-wide blip costs execution time, not state. It runs whether
+	// or not a hardware watchdog is armed: the watchdog fires only when the
+	// daemon dies, never for a live daemon on the wrong side of a partition.
+	//
+	// An explicit false is the kill switch: that host pauses nothing and stops
+	// advertising the token, and its coordinator recovers an assumed fence at
+	// once, exactly as before. False on only SOME hosts after the latch is the
+	// hazard, reported in PingResponse.not_enforcing.
+	PartitionPause bool `yaml:"partition_pause,omitempty"`
 	// IsolationEpoch: activate the §A isolation regime on this host
 	// (capabilities.IsolationEpochV1). With the flag on and the token latched
 	// cluster-wide, this node REFUSES replication from any host recorded with a
@@ -529,6 +596,21 @@ type EnforcementConfig struct {
 	// refused until `lv host reseed` verifies convergence. Pre-latch clusters
 	// behave exactly as today. Enable fleet-uniformly; reversible kill switch.
 	IsolationEpoch bool `yaml:"isolation_epoch,omitempty"`
+	// GossipEncryption: encrypt and authenticate gossip (memberlist, port 7946)
+	// with the cluster key in pki_dir/gossip.key. false (the default) is today's
+	// plaintext; true is the full guarantee — encrypted out, and anything
+	// unencrypted or under another key dropped. Between them are the two
+	// rolling-restart stages an existing cluster walks through, one fleet-wide
+	// roll each: install (key loaded, still sending plaintext) and staged
+	// (sending encrypted, still accepting plaintext). Nodes one stage apart
+	// always interoperate; two apart do not. See corrosion/gossip_keyring.go
+	// and docs/auth.md "Gossip encryption".
+	//
+	// No capability token: the receiver enforces this locally, no peer relies on
+	// another honouring it, and a mis-staged pair loses gossip between them —
+	// availability, never data. Every stage but false refuses to start without a
+	// usable gossip.key. Read once at startup; the KEYS reload live.
+	GossipEncryption corrosion.GossipEncryption `yaml:"gossip_encryption,omitempty"`
 }
 
 // StoragePoolConfig defines a libvirt storage pool to create on daemon startup.
@@ -599,6 +681,8 @@ func LoadConfig() (*Config, error) {
 		VMEventMaxPerVM:           1000,
 		VMEventPruneHours:         24,
 
+		SupersededDiskRetentionDays: 7,
+
 		UpgradeWatchdogEnabled:   true,
 		UpgradeHealthDeadlineSec: 120,
 
@@ -607,6 +691,10 @@ func LoadConfig() (*Config, error) {
 		QuorumLossDemoteAfterSec: 12,
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
+
+		// The enforcement flags that default ON — see EnforcementConfig.
+		// AuditSignature, PartitionPause and DigestV2. An explicit false still wins.
+		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, DigestV2: true},
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {

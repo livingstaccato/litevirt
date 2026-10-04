@@ -202,14 +202,22 @@ func InsertVMWithHardware(ctx context.Context, c *Client, vm VMRecord, ifaces []
 		})
 	}
 
+	// The disk rows carry their bus from creation, so the startup hardware
+	// backfill has nothing to fill for a VM this build created: a row it does
+	// not write is a row it cannot write from a stale replica. They use
+	// InsertDisk's whole-row shape (diskRowSQL) because the plain create INSERT
+	// has no bus column, and a new shape would stall this node's stream to every
+	// peer on the previous release. The other v42 columns get exactly what the
+	// plain INSERT left them: the column defaults (device_kind 'disk',
+	// delete_with_vm 1) and NULL. Tombstoned rows of the name were purged above,
+	// so OR REPLACE can meet only a live row with no live VM above it.
 	for _, disk := range disks {
 		stmts = append(stmts, Statement{
-			SQL: `INSERT INTO vm_disks (vm_name, disk_name, host_name, path, size_bytes,
-				backing_image, storage_type, storage_volume, target_dev, backing_disk, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			SQL: diskRowSQL,
 			Params: []interface{}{
 				disk.VMName, disk.DiskName, disk.HostName, disk.Path, disk.SizeBytes,
-				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk), uts,
+				disk.BackingImage, disk.StorageType, disk.StorageVolume, disk.TargetDev, nullIfEmpty(disk.BackingDisk),
+				nullIfEmpty(disk.Bus), "disk", 1, nil, uts,
 			},
 		})
 	}
@@ -749,9 +757,13 @@ func CountVMsByHost(ctx context.Context, c *Client) (map[string]int, error) {
 
 // HostResourceUsage holds aggregated CPU, memory, and disk allocated to VMs on a host.
 type HostResourceUsage struct {
-	CpuUsed     int
-	MemUsedMiB  int
-	DiskUsedGiB int
+	CpuUsed    int
+	MemUsedMiB int
+	// DiskAllocatedGiB is the DECLARED size of every disk of every VM on the
+	// host, stopped VMs included — what has been promised, not what is on disk.
+	// Thin provisioning lets it exceed the host's capacity, so it is never a
+	// numerator for a statfs total (colonelpanik/litevirt#142).
+	DiskAllocatedGiB int
 	// VMCount is how many RUNNING VMs the host carries. Capacity policy charges
 	// a per-VM qemu overhead on top of configured guest memory, so the count is
 	// part of usage, not a display detail.
@@ -784,7 +796,7 @@ func SumVMResourcesByHost(ctx context.Context, c *Client) (map[string]HostResour
 		for _, r := range diskRows {
 			host := r.String("host_name")
 			usage := m[host]
-			usage.DiskUsedGiB = r.Int("disk_bytes") / (1024 * 1024 * 1024)
+			usage.DiskAllocatedGiB = r.Int("disk_bytes") / (1024 * 1024 * 1024)
 			m[host] = usage
 		}
 	}
@@ -869,13 +881,22 @@ func CountVMsByNetwork(ctx context.Context, c *Client) (map[string]int, error) {
 	return m, nil
 }
 
+// The VM state writers' statements. Their WHERE is the name (and, for the
+// epoch form, the ownership generation) and nothing else — that is their wire
+// shape, and a receiver on the previous release recognises no other. What makes
+// them tombstone-safe is their ledger disposition, DispLiveRowUpdate: the origin
+// and every receiver apply them through the `AND deleted_at IS NULL` form (see
+// live_row_update.go).
+const (
+	vmStateUpdateSQL  = `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`
+	vmStateAtEpochSQL = `UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`
+	vmHostStateSQL    = `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`
+)
+
 // UpdateVMState changes a VM's state.
 func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
-		state, detail, now, name,
-	)
+	return c.Execute(ctx, vmStateUpdateSQL, state, detail, now, name)
 }
 
 // UpdateVMStateAtEpoch is UpdateVMState carrying the ownership generation the
@@ -891,10 +912,7 @@ func UpdateVMState(ctx context.Context, c *Client, name, state, detail string) e
 // own view, and its row is at the old generation); it simply cannot travel.
 func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail string, expectedEpoch int64) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ? AND vm_owner_epoch = ?`,
-		state, detail, now, name, expectedEpoch,
-	)
+	return c.Execute(ctx, vmStateAtEpochSQL, state, detail, now, name, expectedEpoch)
 }
 
 // UpdateVMStateStrict is UpdateVMState that reports a zero-row update as
@@ -903,10 +921,7 @@ func UpdateVMStateAtEpoch(ctx context.Context, c *Client, name, state, detail st
 // handoff) so a vanished/renamed VM row cannot be mistaken for a completed write.
 func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
-		`UPDATE vms SET state = ?, state_detail = ?, updated_at = ? WHERE name = ?`,
-		state, detail, now, name,
-	)
+	n, err := c.ExecuteRowsStrict(ctx, vmStateUpdateSQL, state, detail, now, name)
 	if err != nil {
 		return err
 	}
@@ -919,10 +934,7 @@ func UpdateVMStateStrict(ctx context.Context, c *Client, name, state, detail str
 // UpdateVMHost moves a VM's host assignment and state after migration.
 func UpdateVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
 	now := c.NowTS()
-	return c.Execute(ctx,
-		`UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
-		hostName, state, now, name,
-	)
+	return c.Execute(ctx, vmHostStateSQL, hostName, state, now, name)
 }
 
 // TransferVMOwner is the Phase 4 ownership-transition primitive: one guarded
@@ -954,6 +966,53 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
 		Params: []interface{}{hostName, state, now, name, expectedEpoch},
 	}})
+	if err != nil {
+		return err
+	}
+	if !applied {
+		return ErrNoRowsAffected
+	}
+	return nil
+}
+
+// TransferVMOwnerWithDisks is TransferVMOwner that moves the VM's disk rows to
+// hostName in the same guarded batch. It is for the repairs that re-key a VM
+// to the host proven to run it (repair-owner, owner-assert): that host uses the
+// disks, so a disk row naming any other host is stale.
+func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64) error {
+	disks, err := GetVMDisks(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	stmts := []Statement{{
+		SQL: `UPDATE vms
+		      SET host_name = ?, state = ?, state_detail = '',
+		          vm_owner_epoch = vm_owner_epoch + 1, updated_at = ?
+		      WHERE name = ? AND deleted_at IS NULL AND vm_owner_epoch = ?`,
+		Params: []interface{}{hostName, state, now, name, expectedEpoch},
+	}}
+	for _, d := range disks {
+		if d.HostName == hostName {
+			continue
+		}
+		stmts = append(stmts, Statement{
+			SQL:    vmDiskHostMoveSQL,
+			Params: []interface{}{hostName, now, name, d.DiskName},
+		})
+	}
+	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var epoch int64
+		if err := tx.QueryRow(
+			`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, name,
+		).Scan(&epoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, nil
+			}
+			return false, err
+		}
+		return epoch == expectedEpoch, nil
+	}, stmts)
 	if err != nil {
 		return err
 	}
@@ -1306,22 +1365,93 @@ func UpdateVMInterfaceIP(ctx context.Context, c *Client, vmName, networkName, ip
 	)
 }
 
-// InsertDisk adds a single disk record (used by hot-plug attach).
-func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
-	now := c.NowTS()
+// diskRowSQL writes one whole vm_disks row. It is InsertDisk's statement, and
+// the shape InsertVMWithHardware and BackfillDiskBus reuse so that neither
+// mints a fingerprint a receiver on the previous release does not know.
+const diskRowSQL = `INSERT OR REPLACE INTO vm_disks
+		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
+		  storage_type, storage_volume, target_dev, backing_disk,
+		  bus, device_kind, delete_with_vm, controller_model, updated_at, deleted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`
+
+// diskRowParams binds d to diskRowSQL at updated_at = now.
+func diskRowParams(d DiskRecord, now string) []interface{} {
 	deviceKind := d.DeviceKind
 	if deviceKind == "" {
 		deviceKind = "disk" // matches the vm_disks.device_kind column default
 	}
-	return c.Execute(ctx,
-		`INSERT OR REPLACE INTO vm_disks
-		 (vm_name, disk_name, host_name, path, size_bytes, backing_image,
-		  storage_type, storage_volume, target_dev, backing_disk,
-		  bus, device_kind, delete_with_vm, controller_model, updated_at, deleted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+	return []interface{}{
 		d.VMName, d.DiskName, d.HostName, d.Path, d.SizeBytes, d.BackingImage,
 		d.StorageType, d.StorageVolume, d.TargetDev, d.BackingDisk,
-		nullIfEmpty(d.Bus), deviceKind, boolToInt(d.DeleteWithVM), nullIfEmpty(d.ControllerModel), now)
+		nullIfEmpty(d.Bus), deviceKind, boolToInt(d.DeleteWithVM), nullIfEmpty(d.ControllerModel), now,
+	}
+}
+
+// InsertDisk adds a single disk record (used by hot-plug attach).
+func InsertDisk(ctx context.Context, c *Client, d DiskRecord) error {
+	return c.Execute(ctx, diskRowSQL, diskRowParams(d, c.NowTS())...)
+}
+
+// BackfillDiskBus fills the empty bus of the disk row read as `read`, for the
+// startup hardware backfill run by owner. It writes only while, in the same
+// transaction, the live row is still exactly `read` — every column — with no
+// bus, and still names owner; applied=false means it did not.
+//
+// The write can therefore never MOVE the row. What it publishes is the row as
+// this node holds it, plus the bus, and the guard proves this node still holds
+// the row as it read it, as its own. A row that moved since the read, or that
+// names another host, is left alone. (On the kvm003 lab the backfill published
+// a row naming the host its VM had failed over from — drills 2 and 3 on
+// main-e004c250.)
+//
+// The guard is only as good as the local replica, which is why the caller
+// also waits for it to catch up (BackfillHardwareTables): on a replica that has
+// not, the row still names the old owner and nothing local can tell.
+//
+// The statement is InsertDisk's whole-row shape, not an UPDATE of the bus
+// column guarded by host_name on the wire. Such an UPDATE is a new
+// fingerprint; a receiver on the previous release back-pressures an unknown
+// shape, so this node's whole stream to it would stall for the rest of a
+// rolling upgrade, and every node emits this for its VMs as it is upgraded.
+// Nor would the wire predicate protect anything the local one does not:
+// anti-entropy merges whole rows, so a newer local row reaches every peer
+// whatever its statement said.
+func BackfillDiskBus(ctx context.Context, c *Client, read DiskRecord, bus, owner string) (bool, error) {
+	if bus == "" || read.Bus != "" || read.HostName != owner {
+		return false, nil
+	}
+	d := read
+	d.Bus = bus
+	readKind := read.DeviceKind
+	if readKind == "" {
+		readKind = "disk"
+	}
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var (
+			host, path, backingImage, storageType, storageVolume, targetDev string
+			backingDisk, curBus, deviceKind, controllerModel                string
+			sizeBytes, deleteWithVM                                         int64
+		)
+		err := tx.QueryRowContext(ctx,
+			`SELECT host_name, path, size_bytes, backing_image, storage_type, storage_volume,
+			        COALESCE(target_dev, ''), COALESCE(backing_disk, ''), COALESCE(bus, ''),
+			        COALESCE(device_kind, 'disk'), COALESCE(delete_with_vm, 1), COALESCE(controller_model, '')
+			 FROM vm_disks WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+			read.VMName, read.DiskName).Scan(&host, &path, &sizeBytes, &backingImage, &storageType,
+			&storageVolume, &targetDev, &backingDisk, &curBus, &deviceKind, &deleteWithVM, &controllerModel)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return host == owner && curBus == "" &&
+			path == read.Path && sizeBytes == read.SizeBytes && backingImage == read.BackingImage &&
+			storageType == read.StorageType && storageVolume == read.StorageVolume &&
+			targetDev == read.TargetDev && backingDisk == read.BackingDisk &&
+			deviceKind == readKind && (deleteWithVM == 1) == read.DeleteWithVM &&
+			controllerModel == read.ControllerModel, nil
+	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
 }
 
 // UpdateDiskHostAndPath updates the host and path for a disk after migration.
@@ -1354,7 +1484,7 @@ func UpdateDiskStorage(ctx context.Context, c *Client, vmName, diskName, storage
 // at the move sites (those remain for migration / snapshot reconcile).
 func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostName, path, storageType, storageVolume string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE vm_disks SET host_name = ?, path = ?, storage_type = ?, storage_volume = ?, updated_at = ?
 		 WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
 		hostName, path, storageType, storageVolume, now, vmName, diskName)
@@ -1392,20 +1522,22 @@ func UpdateDiskPlacement(ctx context.Context, c *Client, vmName, diskName, hostN
 func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string, expected []DiskRecord) (bool, error) {
 	now := c.NowTS()
 	stmts := []Statement{{
-		SQL:    `UPDATE vms SET host_name = ?, state = ?, state_detail = '', updated_at = ? WHERE name = ?`,
+		SQL:    vmHostStateSQL,
 		Params: []interface{}{targetHost, finalState, now, vmName},
 	}}
 	for _, d := range expected {
 		stmts = append(stmts, Statement{
-			SQL: `UPDATE vm_disks SET host_name = ?, updated_at = ?
-			      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+			SQL:    vmDiskHostMoveSQL,
 			Params: []interface{}{targetHost, now, vmName, d.DiskName},
 		})
 	}
 
 	guard := func(tx *sql.Tx) (bool, error) {
 		var vmHost string
-		switch err := tx.QueryRowContext(ctx, `SELECT host_name FROM vms WHERE name = ?`, vmName).Scan(&vmHost); {
+		// A tombstone is a vanished VM: the parent statement would change nothing
+		// there (DispLiveRowUpdate), so committing the disk moves would report an
+		// ownership handoff that never happened.
+		switch err := tx.QueryRowContext(ctx, `SELECT host_name FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).Scan(&vmHost); {
 		case errors.Is(err, sql.ErrNoRows):
 			return false, nil // VM vanished mid-migration → decline
 		case err != nil:
@@ -1425,9 +1557,17 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 			case err != nil:
 				return false, err
 			}
-			// host is allowed to be source (normal) or target (half-committed retry);
+			// host is allowed to be source (normal), target (half-committed
+			// retry), or the host the row named when the snapshot was taken.
+			// The last is a row left behind by a move that re-keyed only the
+			// VM: failover before it moved disk rows, or repair-owner. pp3 on
+			// the kvm003 lab (main-b3368d7c) still named its failed host, so
+			// this guard refused the commit AFTER the irreversible cutover and
+			// left the guest on the target with its row `migrating` on the
+			// source. A row unchanged since the snapshot is not drift; one
+			// that moved anywhere else since is, and is still refused.
 			// path/type/volume must be exactly what we captured before cutover.
-			if (host != sourceHost && host != targetHost) ||
+			if (host != sourceHost && host != targetHost && host != d.HostName) ||
 				path != d.Path || stype != d.StorageType || svol != d.StorageVolume {
 				return false, nil // drift → decline
 			}
@@ -1444,6 +1584,60 @@ func CommitMigrationOwnership(ctx context.Context, c *Client, vmName, sourceHost
 	}
 
 	return c.ExecuteBatchGuarded(ctx, guard, stmts)
+}
+
+// vmDiskHostMoveSQL repoints one disk row at a host. Every site that moves a
+// VM between hosts emits it for each of the VM's disks in the same batch as
+// the VM row: a disk row naming a host the VM left breaks the next migration's
+// ownership commit and the per-host disk accounting.
+const vmDiskHostMoveSQL = `UPDATE vm_disks SET host_name = ?, updated_at = ?
+			      WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`
+
+// RepointMigratedVM moves the VM row of a migration that has cut over to
+// targetHost when CommitMigrationOwnership declined: the guest runs on the
+// target whatever the disk rows say, and a row left `migrating` on the source
+// is one nothing heals (owner-assert skips `migrating`). It writes only while
+// the row is still on sourceHost in state `migrating`, so it never overrides a
+// move made since. The disk rows are left as they are; the caller reports
+// them. committed=false when the row is no longer the migration's.
+func RepointMigratedVM(ctx context.Context, c *Client, vmName, sourceHost, targetHost, finalState string) (bool, error) {
+	now := c.NowTS()
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var host, state string
+		switch err := tx.QueryRowContext(ctx, `SELECT host_name, state FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).
+			Scan(&host, &state); {
+		case errors.Is(err, sql.ErrNoRows):
+			return false, nil
+		case err != nil:
+			return false, err
+		}
+		return host == sourceHost && state == "migrating", nil
+	}, []Statement{{
+		SQL:    vmHostStateSQL,
+		Params: []interface{}{targetHost, finalState, now, vmName},
+	}})
+}
+
+// RescheduleVMHost re-keys a VM to hostName in state, with its disk rows, in
+// one batch. It is the failover coordinator's reschedule write before
+// split_brain_gate_v1 is enforced (WriteVMRescheduleProof is the gated one).
+func RescheduleVMHost(ctx context.Context, c *Client, name, hostName, state string) error {
+	disks, err := GetVMDisks(ctx, c, name)
+	if err != nil {
+		return err
+	}
+	now := c.NowTS()
+	stmts := []Statement{{SQL: vmHostStateSQL, Params: []interface{}{hostName, state, now, name}}}
+	for _, d := range disks {
+		if d.HostName == hostName {
+			continue
+		}
+		stmts = append(stmts, Statement{
+			SQL:    vmDiskHostMoveSQL,
+			Params: []interface{}{hostName, now, name, d.DiskName},
+		})
+	}
+	return c.ExecuteBatch(ctx, stmts)
 }
 
 // UpdateDiskSize updates the size_bytes for a disk.
@@ -1533,7 +1727,7 @@ const graduateVMOwnerEpochSQL = `UPDATE vms SET vm_owner_epoch = ?, updated_at =
 // predicate across many rows, and a row a concurrent graduation already moved
 // is a success for it, not a fault.
 func GraduateVMOwnerEpoch(ctx context.Context, c *Client, name string) error {
-	n, err := c.ExecuteRows(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
+	n, err := c.ExecuteRowsStrict(ctx, graduateVMOwnerEpochSQL, int64(1), c.NowTS(), name)
 	if err != nil {
 		return err
 	}
@@ -1600,4 +1794,46 @@ func OwnerEpochBackfillComplete(ctx context.Context, c *Client, hostName string)
 		}
 	}
 	return true, nil
+}
+
+// WorkloadRowTrace is what a workload's row says about it, whatever its state —
+// including a tombstone. It is the evidence behind an orphan-runtime report
+// (internal/health/orphan_runtime.go): which host and generation the row last
+// named, and when it was deleted.
+type WorkloadRowTrace struct {
+	HostName   string
+	OwnerEpoch int64
+	DeletedAt  string // "" while the row is live
+	UpdatedAt  string
+}
+
+// LookupVMRowAnyState reads vms row `name`, live or tombstoned. nil when the
+// name has no row at all.
+func LookupVMRowAnyState(ctx context.Context, c *Client, name string) (*WorkloadRowTrace, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, vm_owner_epoch, COALESCE(deleted_at, '') AS deleted_at, updated_at
+		 FROM vms WHERE name = ?`, name)
+	if err != nil || len(rows) == 0 {
+		return nil, err
+	}
+	r := rows[0]
+	return &WorkloadRowTrace{HostName: r.String("host_name"), OwnerEpoch: r.Int64("vm_owner_epoch"),
+		DeletedAt: r.String("deleted_at"), UpdatedAt: r.String("updated_at")}, nil
+}
+
+// LookupContainerRowsAnyState reads every containers row named `name`, on any
+// host, live or tombstoned, newest first.
+func LookupContainerRowsAnyState(ctx context.Context, c *Client, name string) ([]WorkloadRowTrace, error) {
+	rows, err := c.Query(ctx,
+		`SELECT host_name, owner_epoch, COALESCE(deleted_at, '') AS deleted_at, updated_at
+		 FROM containers WHERE name = ? ORDER BY updated_at DESC`, name)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]WorkloadRowTrace, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, WorkloadRowTrace{HostName: r.String("host_name"), OwnerEpoch: r.Int64("owner_epoch"),
+			DeletedAt: r.String("deleted_at"), UpdatedAt: r.String("updated_at")})
+	}
+	return out, nil
 }

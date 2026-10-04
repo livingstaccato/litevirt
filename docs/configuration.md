@@ -43,6 +43,14 @@ rest_port: 7446
 # faster drift detection is worth the extra digest traffic.
 anti_entropy_interval_sec: 0
 
+# Stand-down for incremental anti-entropy. A pass normally takes unchanged
+# tables' digests from a cache and, for a table that disagrees with a peer, asks
+# the peer which of its 256 buckets differ and pulls only those, a bounded page
+# at a time (docs/design/ae-incremental.md). true makes this node pull whole
+# tables as one blob and scan every digest, as older releases did; it still
+# answers its peers' bucket and paged requests. Leave false unless you suspect the incremental path.
+anti_entropy_legacy_repair: false
+
 # Cluster membership port (used for peer discovery).
 gossip_port: 7946
 
@@ -222,14 +230,13 @@ enforcement:
                               # (an old peer could drop max_cpu from a spec it rewrites), after which
                               # `lv update --cpu` grows a running VM's vCPUs live up to its ceiling.
                               # Enable fleet-uniformly; the flag is the reversible kill switch.
-  digest_v2: false            # emit the order-invariant anti-entropy row digest (digest_v2), which
+  digest_v2: true             # emit the order-invariant anti-entropy row digest (digest_v2), which
                               # pairs each value with its column NAME instead of hashing values in
                               # physical column order — so a fresh-CREATE vs ALTER-upgraded node stop
-                              # showing a permanent column-order divergence. Negotiated PAIRWISE by
-                              # field presence (no latch): two peers compare v2 only when both emit it,
-                              # else both compare v1, so a mixed fleet is always safe. Enable
-                              # fleet-uniformly then run `lv cluster converge --all`. See
-                              # docs/diagnostics.md → "digest_v2".
+                              # showing a permanent column-order divergence. DEFAULT ON. Negotiated
+                              # PAIRWISE by field presence (no latch): two peers compare v2 only when
+                              # both emit it, else both compare v1, so a mixed fleet is always safe.
+                              # Explicit false is the kill switch. See docs/diagnostics.md → "digest_v2".
   canonical_identity: false   # resolve the natural-key identity tables (snapshots,
                               # container_snapshots) by their UNIQUE natural key instead of the
                               # minted random id. Two nodes can independently create DIFFERENT ids
@@ -286,7 +293,8 @@ enforcement:
                               # fleet-wide — a peer still deciding locally would bypass the
                               # single decider entirely. Enable fleet-uniformly; the flag is the
                               # reversible kill switch.
-  audit_signature: false      # sign every audit row this host writes with its cluster key
+  audit_signature: true       # DEFAULT ON — unset means on; the only enforcement flag that
+                              # is. Sign every audit row this host writes with its cluster key
                               # (the same host.key that identifies it on the wire, under a
                               # separate signing domain). An unsigned chain is an UNKEYED
                               # hash: anyone who can write the database can edit a row,
@@ -294,35 +302,40 @@ enforcement:
                               # back clean. A signature makes that require the host's private
                               # key instead of just the algorithm, and any OTHER node can
                               # check it — a compromised host cannot certify its own
-                              # rewritten history. Setting this flag turns SIGNING on by
-                              # itself (signed rows are backward-compatible; old peers
-                              # replicate the new columns untouched). The token is advertised
-                              # only while the flag is on, and once it latches fleet-wide a
-                              # write this node cannot sign is logged as an error and still
-                              # RECORDED — dropping the row would lose the record of an
-                              # operation that happened, which is the outcome an attacker
-                              # would pick. It is caught instead by the verifier: while a
-                              # host's published signing certificate stands, an unsigned row
-                              # from it is reported as tampering on every node.
-                              # Turning the flag back OFF is a real rollback, not a silent
-                              # one: on the next start the daemon signs a retirement of its
-                              # own key at the sequence its chain had reached, so rows after
-                              # it are unsigned and expected. A host that cannot sign that
+                              # rewritten history. Signing follows this flag alone (signed
+                              # rows are backward-compatible; old peers replicate the new
+                              # columns untouched), and no node relies on a peer signing,
+                              # so a mixed fleet is safe: a host on an older build or with
+                              # the flag off is just a host that is not signing yet, which
+                              # `lv audit verify` names under "not signing now". Builds
+                              # before this default needed `audit_signature: true` set
+                              # explicitly; see docs/audit-log.md "Turning signing on".
+                              # The token is advertised only while the flag is on, and once
+                              # it latches fleet-wide a write this node cannot sign is
+                              # logged as an error and still RECORDED — dropping the row
+                              # would lose the record of an operation that happened, which
+                              # is the outcome an attacker would pick. It is caught instead
+                              # by the verifier: while a host's published signing
+                              # certificate stands, an unsigned row from it is reported as
+                              # tampering on every node.
+                              # Setting it to false is a real rollback, not a silent one: on
+                              # the next start the daemon signs a retirement of its own key
+                              # at the sequence its chain had reached, so rows after it are
+                              # unsigned and expected. A host that cannot sign that
                               # retirement keeps its contract — that is the case it exists
                               # for — and `lv host retire-audit-key` closes it out from the
-                              # machine holding the cluster CA. Enable fleet-uniformly.
+                              # machine holding the cluster CA.
   owner_epoch: false          # activate the ownership-generation regime on this host
                               # (owner_epoch_v1). With the flag on, the health sweeps
                               # backfill every workload this host owns from the pre-epoch 0
                               # to a real generation, stamping its runtime marker (libvirt
                               # domain metadata / the container marker file) in the same
-                              # pass. A VM created through CreateVM does not normally need
-                              # that sweep: it is assigned the first generation and both its
-                              # markers are stamped before the call returns, REGARDLESS of
-                              # this flag. Nothing else is: a VM created by template
-                              # instantiation, import, restore or promote still lands at
-                              # epoch 0, as does every container and any VM whose graduation
-                              # failed, so this sweep remains what graduates them.
+                              # pass. A new VM does not need that sweep: every create path
+                              # assigns the first generation and stamps both markers before
+                              # publishing it running, REGARDLESS of this flag, and the
+                              # owner's reconciler finishes one whose create stopped short.
+                              # Containers still land at epoch 0, so this sweep remains what
+                              # graduates them.
                               # The token is advertised only once this node is READY —
                               # flag on and no owned workload left at epoch 0 — so the fleet
                               # can never latch across a node whose workloads are still
@@ -344,6 +357,53 @@ enforcement:
                               # Deliberately not a version check — mixed-version rolling
                               # upgrades keep working. Pre-latch clusters behave exactly as
                               # before. Enable fleet-uniformly; reversible kill switch.
+  recovery_claim: false       # single-winner recovery claims (recovery_claim_v1,
+                              # design/recovery-claims.md). The failover coordinator
+                              # collects a majority certificate from the explicit voter set
+                              # before it mints a reschedule, promote or container-relocate
+                              # proof, and the destination verifies it before it executes
+                              # (refusing with recovery_claim_unproven otherwise), so two
+                              # coordinators that both think they lead can never both start
+                              # one workload. Enforced only with this flag AND the latch AND
+                              # an adopted voter generation (`lv cluster voter ls`).
+                              # Advertised only while the flag is on and the node is ready
+                              # (split_brain_gate_v1 latched, able to vote durably), so the
+                              # latch means every host opted in. Set it on EVERY host,
+                              # witnesses included. Off everywhere + restart is the full
+                              # stand-down: recovery is authorized as before, and voters keep
+                              # their history. Off on only some hosts is the hazard, not a
+                              # degraded mode — such a host reports recovery_claim_v1 in
+                              # PingResponse.not_enforcing and its peers raise ha_degraded.
+  partition_pause: true       # DEFAULT ON. A host that cannot see a majority of the voter
+                              # set for 10 s suspends every VM (RAM kept) and freezes every
+                              # container that failover would recover elsewhere; a workload
+                              # with on_host_failure: none keeps running. Each pause is
+                              # recorded under <data_dir>/partition-pause, so only what this
+                              # host paused is resumed, and only once a majority of voters
+                              # confirms nothing moved it. Advertises partition_pause_v1
+                              # only while on; once that latches, a coordinator whose
+                              # best-effort fence cannot reach a host waits out that host's
+                              # pause (23 s after its decision on up to 17 hosts, longer on
+                              # larger clusters) before recovering, and records the fence as
+                              # self_paused. Runs whether or not a hardware watchdog is armed
+                              # (the watchdog fires only when the daemon dies); a verified
+                              # watchdog is the backstop when a pause fails. A blip shorter
+                              # than the pause time pauses nothing; a fleet-wide blip pauses
+                              # everything and resumes everything on heal. An explicit false
+                              # is the kill switch: that host pauses nothing and recovers an
+                              # assumed fence at once, as before. See
+                              # design/partition-pause.md.
+  gossip_encryption: false    # encrypt and authenticate gossip (memberlist, gossip_port)
+                              # with the cluster key in <pki_dir>/gossip.key. false is
+                              # plaintext; true is encrypted-only (anything unencrypted or
+                              # under another key is dropped). An EXISTING cluster walks
+                              # there in three rolling restarts, each finished on every host
+                              # first: install (key loaded, still sends plaintext), staged
+                              # (sends encrypted, still accepts plaintext), true. Nodes one
+                              # stage apart interoperate; two apart cannot gossip. Every
+                              # value but false refuses to start without a usable gossip.key.
+                              # `lv host init` writes true for a new cluster. No capability
+                              # token. See auth.md "Gossip encryption".
 
 # External NetBox IPAM integration. Disabled by default; when disabled no
 # NetBox client is constructed and no behaviour changes (no HTTP, no goroutine).
@@ -538,6 +598,12 @@ vm_event_retention_days: 30
 vm_event_error_retention_days: 90
 vm_event_max_per_vm: 1000
 vm_event_prune_hours: 24
+
+# Disk copies a failover start set aside (<disk path>.superseded-<time>, see
+# migration-failover.md "VM failure policies") are removed by their host once
+# older than this, except while their VM is in error, pending or starting.
+# 0 keeps every copy until removed with `lv host superseded-disks --purge`.
+superseded_disk_retention_days: 7
 
 # Post-upgrade health watchdog. After a self-upgrade re-exec, verify the NEW
 # binary's local gRPC becomes pingable within the deadline; if not, roll back to
@@ -898,10 +964,10 @@ difference rather than a judgement that this endpoint carries less.
 | `metrics_port` | 7444 | HTTP | **no** | **all** | Prometheus `/metrics` — see above |
 | `ui_port` | 7445 | HTTP | session cookie | `127.0.0.1` | Web dashboard |
 | `rest_port` | 7446 | HTTP | bearer token | `127.0.0.1` | REST API gateway |
-| `gossip_port` | 7946 | TCP+UDP | **no** — no memberlist `SecretKey` | **all** | Cluster membership |
+| `gossip_port` | 7946 | TCP+UDP | only with `enforcement.gossip_encryption: true` — AES-256-GCM under `gossip.key` ([details](auth.md#gossip-encryption)); members are also admitted only if they are in the `hosts` table ([details](operating-model.md#gossip-admits-only-known-hosts-and-is-authenticated-only-when-encrypted)) | **all** | Cluster membership |
 | `dns_port` | 5354 | UDP | **no** | **all** | VM name DNS |
 
-Three of these are unauthenticated, not one. `rest_port` and `ui_port` are
+Three of these are unauthenticated, not one (two once `enforcement.gossip_encryption` is `true` on every host). `rest_port` and `ui_port` are
 protected by *binding to loopback* rather than by their credential, which is the
 same mechanism `metrics_bind` offers and the reason the bind column is here.
 Restricting `gossip_port` and `dns_port` is out of scope for this setting — they

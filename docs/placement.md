@@ -400,11 +400,35 @@ incomplete or stale`, `vcpu`, `memory`, `anti-affinity`, `max-per-node`,
 it on `lv compose up`; a VM that failover cannot place records it in the
 `failover.skip` audit row.
 
+A `host:` pin naming a host that is missing, not active, or a witness is a
+failure of that VM alone, like any other hard constraint. Failover leaves that
+VM on the failed host with a `failover.skip` row naming the pin, and still
+places every other VM of the host. A compose plan is all or nothing, so
+`lv compose up` refuses the whole plan, as before.
+
+**Failover and pins.** Failover ignores a pin to a host that is **down** — the
+failed host itself, or any host that is missing or not `active` — for that one
+recovery. While the pinned host is down the pin cannot be honoured either way,
+and the choice is between running the VM elsewhere and not running it at all.
+It matters once a recovery has already moved a pinned VM off its pin: when the
+VM's new host fails while its pinned host is still down, it is recovered again
+rather than stranded, and the coordinator logs "the VM's pinned host is down;
+recovering it elsewhere for this outage, its pin unchanged". The spec is not
+rewritten: the pin still says where the VM belongs, and the next recovery
+honours it once that host is back. A pin to a host that is up but cannot take
+the VM — a witness, or one without room — still strands it, with a
+`failover.skip` row.
+
 A VM is charged its vCPUs and its guest memory plus one qemu overhead, against
 the host's allocatable capacity net of what already runs there. A **container**
 is charged its memory limit only: no qemu overhead, and no vCPU — its `cpu` is a
 cap in cores, not a vCPU reservation, which is also how running containers
-are counted against a host and how host admission charges a new one.
+are counted against a host and how host admission charges a new one. A container
+is placed only on a host labelled `litevirt.lxc=true`, which its daemon writes
+when it finds `lxc-create`. A host with no label is refused like one labelled
+`false`, with `no container runtime (litevirt.lxc unset)`. When no active host
+qualifies, the refusal says `no active host has a container runtime`
+([containers](containers.md#host-loss-relocation)).
 
 An **update** of a workload is placed as a replacement of what it holds now:
 its current cpu and memory are released on its host while the updated request

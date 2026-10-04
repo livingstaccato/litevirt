@@ -18,6 +18,29 @@
 // IS injected per node, so VM-lifecycle RPCs run against it; deeper scenarios
 // operate at the Corrosion / replicator layer and observe behaviour through DB
 // state changes.
+//
+// # Replication modes
+//
+// A scenario picks how state moves between nodes:
+//
+//   - SharedCRDT: every node reads and writes ONE database. Right for handler
+//     and state-transition coverage; it structurally removes independent
+//     histories, so it cannot reach a race between two nodes' decisions.
+//   - Default: each node has its own database and nothing moves until the
+//     scenario moves it — pumpMutations over the real PushMutations RPC, or an
+//     anti-entropy exchange. Delivery is exact and scenario-steered.
+//   - IndependentReplicas: each node has its own database and runs the
+//     production Replicator push loop, so writes travel on their own, over the
+//     seeded Members() view and the real RPC. Cluster.SetLinkFault then shapes
+//     each directed link — Block, Delay/Jitter, Drop, Duplicate, Reorder — from
+//     a PRNG seeded by Options.FaultSeed; Isolate cuts a node off entirely.
+//     WaitConverged waits, bounded, for every node's state digest to agree.
+//     NewCoordinators puts a failover coordinator on every node, over its own
+//     replica, reading one VirtualClock; Tick runs a poll on the nodes named.
+//     See replicas.go.
+//
+// Membership is seeded, not gossiped (seedGossipMembership), in every mode —
+// unless Options.RealGossip gives every node a real memberlist (gossip_real.go).
 package fleet
 
 import (
@@ -58,7 +81,8 @@ type Options struct {
 	// about the replication path (the rebalancer scenario, for
 	// example, already exercises shared state via NewSharedTestClient
 	// in tests/cluster/). When false (default), each node has its
-	// own DB and mutations must travel via the real Replicator.
+	// own DB and mutations must travel via the real Replicator —
+	// steered by the scenario unless IndependentReplicas starts its loop.
 	SharedCRDT bool
 	// RegionByIndex assigns regions to nodes 0..N-1. Empty → all "default".
 	RegionByIndex []string
@@ -86,6 +110,53 @@ type Options struct {
 	// VM. Empty (the default) leaves every existing scenario resolving the
 	// `cluster` row's name, exactly as before.
 	NetBoxClusterName string
+	// IndependentReplicas gives every node its own database AND starts the
+	// production Replicator push loop on it, so writes travel between nodes
+	// the way they do in production — over the seeded Members() view and the
+	// real PushMutations RPC — instead of being pumped by the scenario. It is
+	// what lets a scenario hold two coordinators' histories apart; combine it
+	// with SetLinkFault to delay, drop, duplicate, reorder or block that
+	// traffic per directed link. See replicas.go. Incompatible with SharedCRDT.
+	IndependentReplicas bool
+	// FaultSeed seeds every link's fault PRNG (see LinkFault). The zero value
+	// is a fixed seed like any other, so runs are reproducible by default.
+	FaultSeed int64
+	// Relays sets each replicator's minimum relay count
+	// (corrosion.RelayConfig.BaseRelays). Zero is the production default of
+	// three, under which a cluster of more than three nodes has LEAVES that
+	// push only to relays. A scenario that partitions leaves away from every
+	// relay and still wants each side to converge sets this to Nodes, which
+	// makes every node a relay and the mesh full.
+	Relays int
+	// RealGossip replaces the seeded Members() view with a real memberlist per
+	// node, on its own gossip port, behind a firewall SplitGossip can cut (see
+	// gossip_real.go). It is for scenarios about how a node comes to SEE its
+	// peers — a partition that heals, a re-join — which a seeded view cannot
+	// reach. Incompatible with SharedCRDT.
+	RealGossip bool
+	// GossipKey, with RealGossip, runs every node at
+	// enforcement.gossip_encryption enforced under this one key. Nil is
+	// plaintext gossip.
+	GossipKey []byte
+	// Joiners, with RealGossip, starts the LAST Joiners nodes as hosts that
+	// `lv host add` has just brought up on a fresh database: each one holds
+	// only its own hosts row, while every other node holds every row, because
+	// the admitting side writes a newcomer's row before its daemon starts. The
+	// established nodes' mutation history is pruned before replication starts,
+	// as a long-running cluster's is, so an established host's own row reaches
+	// a joiner by anti-entropy and by nothing else. New does not wait for the
+	// gossip mesh to form; whether it does is the scenario's question.
+	Joiners int
+}
+
+// isJoiner reports whether n is one of Options.Joiners.
+func (c *Cluster) isJoiner(n *Node) bool {
+	for i, o := range c.Nodes {
+		if o == n {
+			return i >= len(c.Nodes)-c.opts.Joiners
+		}
+	}
+	return false
 }
 
 // Cluster is the assembled fleet. Use Stop in a t.Cleanup; nothing
@@ -109,6 +180,14 @@ type Cluster struct {
 	// checker's peer table in-process (no probe loop runs), so without this a
 	// fleet scenario has no way to model a host REJOINING — see Node.Rejoin.
 	reach *reachSet
+	// gossip is the RealGossip firewall (gossip_real.go), and gossipPort the
+	// one gossip port every RealGossip node binds. Nil and zero otherwise.
+	gossip     *gossipCut
+	gossipPort int
+	// claimScript, when set, decides each claim RPC's fate before the link's
+	// ClaimFault does (claim_faults.go).
+	claimScriptMu sync.Mutex
+	claimScript   ClaimScript
 }
 
 // Node wraps one daemon — its DB, gRPC server, replicator, and
@@ -164,6 +243,19 @@ type Node struct {
 	// streamWatches are armed by WatchStream, keyed by method name, and
 	// consumed by the next call to that stream method. Guarded by partMu.
 	streamWatches map[string][]*StreamWatch
+
+	// faults is the per-link replication fault injector for pushes INTO this
+	// node (see LinkFault). Inert until a scenario sets a fault.
+	faults faults
+	// aeMeter counts the anti-entropy RPCs this node served (see ae_meter.go).
+	aeMeter aeMeter
+	// replStarted records that repl's push loop was started (IndependentReplicas),
+	// so Stop stops it before the database closes under it.
+	replStarted bool
+
+	// GossipPort is the node's memberlist port under Options.RealGossip, and
+	// zero otherwise.
+	GossipPort int
 }
 
 // StreamWatch observes one server-side streaming handler on a node: Started
@@ -210,12 +302,27 @@ func New(t *testing.T, opts Options) *Cluster {
 	if opts.Nodes <= 0 {
 		opts.Nodes = 3
 	}
+	if opts.IndependentReplicas && opts.SharedCRDT {
+		t.Fatal("fleet: IndependentReplicas and SharedCRDT are mutually exclusive")
+	}
+	if opts.RealGossip && opts.SharedCRDT {
+		t.Fatal("fleet: RealGossip and SharedCRDT are mutually exclusive")
+	}
+	if opts.Joiners > 0 && (!opts.RealGossip || !opts.IndependentReplicas || opts.Joiners >= opts.Nodes) {
+		t.Fatal("fleet: Joiners needs RealGossip, IndependentReplicas and at least one established node")
+	}
+	if opts.RealGossip {
+		skipWithoutRealGossipAddresses(t, opts.Nodes)
+	}
 
 	// The audit-chain tail used to be process-global, so this had to reset it
 	// between tests — and, worse, every node in a cluster shared one tail, so
 	// node B's first audit row linked to node A's. The state now hangs off each
 	// Client and is keyed by host_name, which is correct by construction here.
 	c := &Cluster{t: t, tmpRoot: t.TempDir(), opts: opts, reach: newReachSet()}
+	if opts.RealGossip {
+		c.gossip = &gossipCut{byAddr: map[string]string{}, blocked: map[string]map[string]bool{}}
+	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.mintCA()
 
@@ -226,12 +333,21 @@ func New(t *testing.T, opts Options) *Cluster {
 	if namePrefix == "" {
 		namePrefix = "node-"
 	}
+	if opts.RealGossip {
+		// One gossip port for the whole cluster, as production has: each node
+		// gossips on its own loopback address (see gossip_real.go).
+		c.gossipPort = freeGossipPort(t)
+	}
 	for i := 0; i < opts.Nodes; i++ {
 		name := fmt.Sprintf("%s%d", namePrefix, i)
+		addr := "127.0.0.1"
+		if opts.RealGossip {
+			addr = realGossipAddress(i)
+		}
 		n := &Node{
 			Name:          name,
 			Region:        regionFor(opts.RegionByIndex, i),
-			Address:       "127.0.0.1",
+			Address:       addr,
 			PKIDir:        filepath.Join(c.tmpRoot, name, "pki"),
 			blockedFrom:   make(map[string]bool),
 			unimplemented: make(map[string]bool),
@@ -242,17 +358,36 @@ func New(t *testing.T, opts Options) *Cluster {
 		// Reserve an ephemeral port — close the listener immediately
 		// after; we re-bind once everything is wired. (gRPC servers
 		// need the listener to come from outside their constructor.)
-		l, err := net.Listen("tcp", "127.0.0.1:0")
+		port := "0"
+		if opts.Joiners > 0 {
+			// A joiner holds no row for its peers, so it dials them at the
+			// gossip address on the default gRPC port, as a real newcomer does
+			// (corrosion.ResolvePeerTarget). Every node therefore listens
+			// where production does: its own address, port 7443.
+			port = "7443"
+		}
+		l, err := net.Listen("tcp", net.JoinHostPort(n.Address, port))
+		if err != nil && opts.Joiners > 0 {
+			t.Skipf("fleet Joiners needs %s:7443 free, as a real host has it: %v", n.Address, err)
+		}
 		if err != nil {
 			t.Fatalf("reserve port for %s: %v", name, err)
 		}
 		n.Port = l.Addr().(*net.TCPAddr).Port
 		n.Listener = l
+		if opts.RealGossip {
+			n.GossipPort = c.gossipPort
+			c.gossip.byAddr[gossipAddr(n)] = name
+		}
 		c.Nodes = append(c.Nodes, n)
 	}
 
 	// Step 2 — open DBs and seed schema. Each node's DB is independent.
 	for _, n := range c.Nodes {
+		if opts.RealGossip {
+			c.openGossipDB(n)
+			continue
+		}
 		c.openDB(n, opts.SharedCRDT)
 	}
 
@@ -262,8 +397,10 @@ func New(t *testing.T, opts Options) *Cluster {
 	c.crossRegisterHosts()
 
 	// Step 3b — gossip membership, which every node in a real cluster has and
-	// this harness did not.
-	c.seedGossipMembership()
+	// this harness did not. RealGossip nodes have the real thing.
+	if !opts.RealGossip {
+		c.seedGossipMembership()
+	}
 
 	// Step 4 — build grpcapi.Server per node, attach replicator,
 	// start gRPC server on the pre-allocated listener.
@@ -271,7 +408,20 @@ func New(t *testing.T, opts Options) *Cluster {
 		c.buildServer(n)
 	}
 
+	// Step 5 — independent replicas run the production push loop.
+	if opts.Joiners > 0 {
+		c.pruneEstablishedHistory()
+	}
+	if opts.IndependentReplicas {
+		c.startReplicators()
+	}
+
 	t.Cleanup(c.Stop)
+	if opts.RealGossip && opts.Joiners == 0 {
+		// Nodes opened early dialled seeds that were not up yet; the later
+		// joins and the membership loop close the mesh.
+		c.WaitGossip(t, 20*time.Second, "the gossip mesh to form", c.GossipConverged)
+	}
 	return c
 }
 
@@ -279,6 +429,13 @@ func New(t *testing.T, opts Options) *Cluster {
 func (c *Cluster) Stop() {
 	if c.cancel != nil {
 		c.cancel()
+	}
+	// Push loops first: they write watermarks into the databases closed below.
+	for _, n := range c.Nodes {
+		if n.replStarted {
+			n.repl.Stop()
+			n.replStarted = false
+		}
 	}
 	for _, n := range c.Nodes {
 		if n.selfConn != nil {
@@ -409,7 +566,7 @@ func (c *Cluster) mintHostCert(n *Node) {
 	certPath := filepath.Join(n.PKIDir, "host.crt")
 	keyPath := filepath.Join(n.PKIDir, "host.key")
 	if err := pki.GenerateHostCert(
-		c.caCert, c.caKey, certPath, keyPath, n.Name, net.ParseIP("127.0.0.1"),
+		c.caCert, c.caKey, certPath, keyPath, n.Name, net.ParseIP(n.Address),
 	); err != nil {
 		c.t.Fatalf("GenerateHostCert %s: %v", n.Name, err)
 	}
@@ -431,6 +588,11 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 	if err := corrosion.InitSchema(context.Background(), db); err != nil {
 		c.t.Fatalf("InitSchema for %s: %v", n.Name, err)
 	}
+	// The fleet bootstraps as a cluster that has already converged, so each
+	// replica starts caught up; without this every workload mutation would be
+	// refused by the stale-replica gate (grpcapi/replica_gate.go). A scenario
+	// modelling a rejoin calls n.DB.MarkReplicaStale itself.
+	db.MarkReplicaCaughtUpForTests("fleet-bootstrap")
 	n.DB = db
 }
 
@@ -481,6 +643,9 @@ func (c *Cluster) crossRegisterHosts() {
 	ctx := context.Background()
 	for _, target := range c.Nodes {
 		for _, hostNode := range c.Nodes {
+			if c.isJoiner(target) && hostNode != target {
+				continue // a fresh database knows only its own host (Options.Joiners)
+			}
 			serial, err := pki.CertSerial(filepath.Join(hostNode.PKIDir, "host.crt"))
 			if err != nil {
 				c.t.Fatalf("read certificate serial for %s: %v", hostNode.Name, err)
@@ -504,6 +669,13 @@ func (c *Cluster) crossRegisterHosts() {
 			if err := corrosion.InsertHost(ctx, target.DB, rec); err != nil {
 				// "UNIQUE constraint" is fine — already registered.
 				continue
+			}
+			// Every node runs a container runtime (n.CT), so each advertises
+			// litevirt.lxc=true as its daemon does on finding one; placement
+			// puts a container on no other host. A scenario about a host
+			// without a runtime overrides the label.
+			if err := corrosion.SetHostLabel(ctx, target.DB, hostNode.Name, corrosion.LabelLXCCapable, "true"); err != nil {
+				c.t.Fatalf("label %s litevirt.lxc=true on %s: %v", hostNode.Name, target.Name, err)
 			}
 			// InsertHost doesn't take region (the production path
 			// uses ConfigureHost post-hoc). Apply it as a separate
@@ -598,14 +770,14 @@ func (c *Cluster) buildServer(n *Node) {
 	n.netboxMirror = n.Server.StartNetBoxMirror(c.ctx, 0)
 
 	// Wire a real Replicator so the server's PushMutations handler + write-notify
-	// path are exercised. Its background push loop is deliberately NOT started: it
-	// discovers peers via memberlist (corrosion.Client.Members()), and the
-	// in-process fleet doesn't join a gossip mesh, so Members() is empty here and a
-	// started loop would be a no-op. Cross-node convergence is instead driven
-	// deterministically over the REAL anti-entropy repair RPC (StreamStateDump →
-	// MergeStateBytesLWW — the exact production path; see partition_test.go),
-	// rather than the gossip-timed ticker.
-	n.repl = corrosion.NewReplicator(n.DB, n.PKIDir, corrosion.RelayConfig{})
+	// path are exercised. By default its background push loop is NOT started, so
+	// cross-node convergence is driven deterministically by the scenario — over
+	// the REAL anti-entropy repair RPC (StreamStateDump → MergeStateBytesLWW; see
+	// partition_test.go) or the real PushMutations RPC (pumpMutations) — rather
+	// than on the loop's own timing. Options.IndependentReplicas starts the loop
+	// (see startReplicators): it discovers its peers from the seeded Members()
+	// view and dials them through the `hosts` table.
+	n.repl = corrosion.NewReplicator(n.DB, n.PKIDir, corrosion.RelayConfig{BaseRelays: c.opts.Relays})
 	n.Server.SetReplicator(n.repl)
 
 	// Start the gRPC server on n.Listener.
@@ -625,8 +797,8 @@ func (c *Cluster) buildServer(n *Node) {
 	// never hit a unary interceptor.
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.Server.UnaryAuthInterceptor),
-		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.Server.StreamAuthInterceptor),
+		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor),
+		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor),
 	)
 	pb.RegisterLiteVirtServer(srv, n.Server)
 	n.GRPCSrv = srv
@@ -656,8 +828,12 @@ var partitionedMethods = map[string]bool{
 	"GetStateDigest":           true,
 	"GetStateDump":             true,
 	"StreamStateDump":          true,
+	"StreamTableDump":          true,
 	"GetSensitiveStateDigest":  true,
 	"StreamSensitiveStateDump": true,
+	"GetTableBucketDigests":    true,
+	"StreamTableRows":          true,
+	"StreamSensitiveTableRows": true,
 	"ReserveProjectCapacity":   true,
 	"ReleaseProjectCapacity":   true,
 	// The lease-term barrier's quorum read is peer traffic over the same link,
@@ -695,6 +871,12 @@ func peerCertCN(ctx context.Context) string {
 // blocked reports whether a peer RPC from the given caller is currently
 // partitioned away from this node.
 func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
+	if n.allBlocked(peerCertCN(ctx)) {
+		return true
+	}
+	if n.claimBlocked(fullMethod, peerCertCN(ctx)) {
+		return true
+	}
 	if !partitionedMethods[methodName(fullMethod)] {
 		return false
 	}
@@ -703,8 +885,9 @@ func (n *Node) blocked(fullMethod string, ctx context.Context) bool {
 		return false
 	}
 	n.partMu.Lock()
-	defer n.partMu.Unlock()
-	return n.blockedFrom[caller]
+	partitioned := n.blockedFrom[caller]
+	n.partMu.Unlock()
+	return partitioned || n.linkBlocked(caller)
 }
 
 func (n *Node) partitionUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
@@ -742,6 +925,9 @@ func (n *Node) DoNotImplement(method string) func() {
 func (n *Node) partitionStreamInterceptor(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 	if n.blocked(info.FullMethod, ss.Context()) {
 		return status.Errorf(codes.Unavailable, "fleet partition: %s refused by %s", methodName(info.FullMethod), n.Name)
+	}
+	if n.answersUnimplemented(info.FullMethod) {
+		return status.Errorf(codes.Unimplemented, "unknown method %s", methodName(info.FullMethod))
 	}
 	watches := n.takeStreamWatches(methodName(info.FullMethod))
 	for _, w := range watches {

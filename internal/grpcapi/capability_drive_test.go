@@ -72,6 +72,25 @@ func TestDriveCapabilityActivation_FlagAwareBoundedDriver(t *testing.T) {
 		// which no operator should be able to misreport. See its comment in
 		// internal/capabilities.
 		capabilities.LeaseTermLedgerV1: true,
+		// credentials_split_v1 is flag-less for the same reason: "this build
+		// decodes the credential tables and reads a secret from them". A flag
+		// would keep it from ever being driven, and the secrets would stay in
+		// the public dump.
+		capabilities.CredentialsSplitV1: true,
+		// host_membership_split_v1 likewise: "this build decodes
+		// host_membership and reads state from it".
+		capabilities.HostMembershipSplitV1: true,
+		// failover_scope_v1 likewise: "this build decodes cluster_policies
+		// and honours failover_scope".
+		capabilities.FailoverScopeV1: true,
+		// voter_config_v1: "this build decodes voter_configs and answers the
+		// claim RPCs durably". A flag would let one node count a different
+		// majority from its peers.
+		capabilities.VoterConfigV1: true,
+		// claim_incarnation_v1: "this build keys recovery claims by
+		// incarnation and seals the legacy key". A coordinator relies on every
+		// voter keeping that format.
+		capabilities.ClaimIncarnationV1: true,
 	}
 
 	// Cross-check the hand-written list against the ONE declaration, so adding a

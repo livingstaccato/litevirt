@@ -166,8 +166,8 @@ func TestDeferredEffects_NoClosureWritesDB(t *testing.T) {
 	}
 	dbWriteMethods := map[string]bool{
 		"Exec": true, "ExecContext": true, "Query": true, "QueryContext": true,
-		"QueryRow": true, "QueryRowContext": true, "Execute": true, "ExecuteRows": true,
-		"ExecuteBatch": true, "ExecuteDeferred": true, "ExecuteBatchGuarded": true,
+		"QueryRow": true, "QueryRowContext": true, "Execute": true, "ExecuteRows": true, "ExecuteRowsStrict": true,
+		"ExecuteBatch": true, "ExecuteDeferred": true, "ExecuteBatchGuarded": true, "ExecuteEntriesGuarded": true,
 		"Prepare": true, "PrepareContext": true, "Begin": true, "BeginTx": true,
 	}
 	checked := 0

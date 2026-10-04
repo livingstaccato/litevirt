@@ -59,7 +59,7 @@ func MutateDesiredSpec(ctx context.Context, c *Client, name string, fn func(oldS
 		// CAS: apply only if the generation is still specGen AND no operation has
 		// since claimed the barrier. A miss means a concurrent writer moved the row;
 		// re-read and retry (bounded).
-		n, uerr := c.ExecuteRows(ctx,
+		n, uerr := c.ExecuteRowsStrict(ctx,
 			`UPDATE vms SET spec = ?, spec_generation = spec_generation + 1, updated_at = ?
 			 WHERE name = ? AND spec_generation = ? AND active_operation_id = '' AND deleted_at IS NULL`,
 			newSpec, c.NowTS(), name, specGen)
@@ -96,16 +96,16 @@ func UpdateObservedActuals(ctx context.Context, c *Client, name string, cpu, mem
 	ts := c.NowTS()
 	switch {
 	case expectedOwnerEpoch >= 0 && expectedSpecGen >= 0:
-		n, err := c.ExecuteRows(ctx, epochGen, cpu, mem, ts, name, expectedOwnerEpoch, expectedSpecGen)
+		n, err := c.ExecuteRowsStrict(ctx, epochGen, cpu, mem, ts, name, expectedOwnerEpoch, expectedSpecGen)
 		return n > 0, err
 	case expectedOwnerEpoch >= 0:
-		n, err := c.ExecuteRows(ctx, epoch, cpu, mem, ts, name, expectedOwnerEpoch)
+		n, err := c.ExecuteRowsStrict(ctx, epoch, cpu, mem, ts, name, expectedOwnerEpoch)
 		return n > 0, err
 	case expectedSpecGen >= 0:
-		n, err := c.ExecuteRows(ctx, gen, cpu, mem, ts, name, expectedSpecGen)
+		n, err := c.ExecuteRowsStrict(ctx, gen, cpu, mem, ts, name, expectedSpecGen)
 		return n > 0, err
 	default:
-		n, err := c.ExecuteRows(ctx, base, cpu, mem, ts, name)
+		n, err := c.ExecuteRowsStrict(ctx, base, cpu, mem, ts, name)
 		return n > 0, err
 	}
 }

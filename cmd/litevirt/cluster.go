@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 func newClusterCmd() *cobra.Command {
@@ -23,8 +25,92 @@ func newClusterCmd() *cobra.Command {
 		newClusterDigestCmd(),
 		newClusterConvergeCmd(),
 		newClusterAckLeaseTermCmd(),
+		newClusterFailoverScopeCmd(),
+		newClusterVoterCmd(),
+		newClusterClaimCmd(),
+		newClusterClaimReleaseCmd(),
 	)
 	return cmd
+}
+
+// lv cluster failover-scope [cluster|region] — show or change the cluster-wide
+// failover_scope policy (docs/design/region-scoped-failover.md).
+func newClusterFailoverScopeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "failover-scope [cluster|region]",
+		Short: "Show or set whether failover quorum is cluster-wide or per region",
+		Long: `With no argument, show the failover scope and every region's voting strength.
+
+  cluster  (the default) one quorum over every voter: a host is fenced when a
+           majority of the whole cluster reports it down, and its workloads may
+           be recovered onto any active host, in any region.
+  region   a host is fenced, and its workloads recovered, only by a majority of
+           its OWN region's voters, and recovery stays in that region. A site
+           partition then leaves the far site's workloads alone instead of
+           letting the majority site fence them over the WAN.
+
+A region with fewer than three voters cannot fence one of its own hosts, so
+under region scope its hosts have no automatic failover. It is never widened to
+the cluster-wide count; the table marks it, and the
+litevirt_failover_regions_without_quorum gauge counts it. A witness counts as a
+voter of its own region.
+
+The policy is replicated and cluster-wide. Changing it needs the admin role,
+refuses until every host runs a release that honours it (failover_scope_v1),
+and refuses while any voter is unreachable from the host you are connected to,
+because a change made from one side of a partition reaches only that side.`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				var st *pb.FailoverScopeStatus
+				var err error
+				if len(args) == 1 {
+					st, err = c.SetFailoverScope(ctx, &pb.SetFailoverScopeRequest{Scope: args[0]})
+					if err != nil {
+						return fmt.Errorf("set failover scope: %w", err)
+					}
+				} else {
+					st, err = c.GetFailoverScope(ctx, &emptypb.Empty{})
+					if err != nil {
+						return fmt.Errorf("get failover scope: %w", err)
+					}
+				}
+				printFailoverScope(os.Stdout, st)
+				return nil
+			})
+		},
+	}
+}
+
+func printFailoverScope(out io.Writer, st *pb.FailoverScopeStatus) {
+	fmt.Fprintf(out, "Failover scope: %s\n", st.GetScope())
+	if st.GetSetBy() != "" {
+		fmt.Fprintf(out, "Set by:         %s at %s\n", st.GetSetBy(), st.GetUpdatedAt())
+	}
+	if !st.GetSettable() {
+		fmt.Fprintln(out, "Changeable:     no — failover_scope_v1 has not latched on every host yet")
+	}
+	fmt.Fprintln(out)
+	w := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "REGION\tHOSTS\tWORKERS\tVOTERS\tWITNESSES\tQUORUM\tOWN FENCING\n")
+	small := 0
+	for _, r := range st.GetRegions() {
+		own := "yes"
+		if !r.GetCanFenceOwn() {
+			own = "cannot fence its own hosts"
+			if r.GetWorkers() > 0 {
+				small++
+			}
+		}
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n", r.GetName(), r.GetHosts(), r.GetWorkers(),
+			r.GetVoters(), r.GetVotingWitnesses(), r.GetQuorum(), own)
+	}
+	w.Flush()
+	if st.GetScope() == "region" && small > 0 {
+		fmt.Fprintf(out, "\n%d region(s) above hold workloads but have fewer than three voters. Their hosts are NOT\n"+
+			"automatically fenced or recovered under region scope. Add voters (a witness counts), or\n"+
+			"run 'lv cluster failover-scope cluster'.\n", small)
+	}
 }
 
 // lv cluster acknowledge-lease-term — clear a contested lease term from the CONNECTED
@@ -123,6 +209,9 @@ func newClusterDigestCmd() *cobra.Command {
 						ties := ""
 						if t.GetUnresolvedTies() > 0 {
 							ties = fmt.Sprintf("%d", t.GetUnresolvedTies())
+							if a := t.GetAcknowledgedTies(); a > 0 {
+								ties = fmt.Sprintf("%d (%d acknowledged)", t.GetUnresolvedTies(), a)
+							}
 						}
 						fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n",
 							h.GetHostName(), t.GetName(), t.GetCount(), ver.label(t.GetName()), ver.hash(t.GetName(), t), ties)
@@ -152,7 +241,11 @@ state by itself.
 
 Divergence caused by a deliberate safety fault — unresolved equal-timestamp LWW ties, which
 anti-entropy will NOT auto-merge — is labelled as such; resolve those with
-'lv doctor repair-owner', not by re-running this. For a row-level scan use 'lv doctor divergence'.`,
+'lv doctor repair-owner', not by re-running this. For a row-level scan use 'lv doctor divergence'.
+
+A table held apart only by ties that every host has acknowledged ('lv cluster
+acknowledge-lease-term'), with nothing else different, is listed as ACKNOWLEDGED and
+counts as converged. One unacknowledged tie on any host keeps it a SAFETY-FAULT.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.CalledAs() == "sync" {
 				fmt.Fprintln(os.Stderr, "note: `lv cluster sync` is deprecated — use `lv cluster converge`")
@@ -245,16 +338,17 @@ var convergenceRepairTables = map[string]bool{"vms": true}
 func printConvergence(dig *pb.ClusterStateDigestResponse) {
 	ver := digestVersions(dig)
 	tables := map[string]map[string]string{} // table -> host -> version-appropriate hash
-	ties := map[string]int32{}               // table -> total unresolved ties across hosts
+	// The acknowledged-tie verdict is shared with `lv doctor divergence`.
+	verdicts := corrosion.TieAckVerdicts(dig.GetHosts())
 	var order []string
 	for _, h := range dig.GetHosts() {
 		for _, t := range h.GetTables() {
-			if _, ok := tables[t.GetName()]; !ok {
-				tables[t.GetName()] = map[string]string{}
-				order = append(order, t.GetName())
+			name := t.GetName()
+			if _, ok := tables[name]; !ok {
+				tables[name] = map[string]string{}
+				order = append(order, name)
 			}
-			tables[t.GetName()][h.GetHostName()] = ver.hash(t.GetName(), t)
-			ties[t.GetName()] += t.GetUnresolvedTies()
+			tables[name][h.GetHostName()] = ver.hash(name, t)
 		}
 	}
 	sort.Strings(order)
@@ -268,15 +362,37 @@ func printConvergence(dig *pb.ClusterStateDigestResponse) {
 		for _, h := range hosts {
 			hashes[h] = true
 		}
+		v := verdicts[name]
+		ties, acked, live := v.Ties, v.Acknowledged, v.Live()
 		switch {
 		case len(hashes) <= 1:
 			converged++
-		case ties[name] > 0:
+		case v.AcknowledgedOnly():
+			// Held apart only by ties every host has acknowledged, and every
+			// host's residual (the table with those rows masked) agrees, so
+			// nothing else differs. Converged, and listed, because the two
+			// claims are still there and still evidence.
+			converged++
+			fmt.Fprintf(w, "%s\t%s\tACKNOWLEDGED\t%d acknowledged tie(s) — both claims kept; nothing else differs\n",
+				name, ver.label(name), acked)
+		case ties > 0:
 			remedy := "run `lv doctor divergence` and apply the table-specific remediation"
 			if convergenceRepairTables[name] {
 				remedy = "run `lv doctor repair-owner`"
 			}
-			fmt.Fprintf(w, "%s\t%s\tSAFETY-FAULT\t%d unresolved tie(s) — deliberate; %s\n", name, ver.label(name), ties[name], remedy)
+			var detail string
+			switch {
+			case acked == 0:
+				detail = fmt.Sprintf("%d unresolved tie(s) — deliberate", ties)
+			case live > 0:
+				detail = fmt.Sprintf("%d unacknowledged tie(s) and %d acknowledged — deliberate", live, acked)
+			default:
+				// Every tie acknowledged, but some host could not vouch that
+				// nothing else differs, or the hosts disagree on what else is
+				// there. Not converged: that is where drift would hide.
+				detail = fmt.Sprintf("%d acknowledged tie(s), but the rest of the table is not proven equal on every host", acked)
+			}
+			fmt.Fprintf(w, "%s\t%s\tSAFETY-FAULT\t%s; %s\n", name, ver.label(name), detail, remedy)
 		default:
 			fmt.Fprintf(w, "%s\t%s\tDIVERGENT\thashes differ across %d hosts (drift)\n", name, ver.label(name), len(hosts))
 		}

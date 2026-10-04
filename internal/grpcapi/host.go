@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -40,23 +42,25 @@ func (s *Server) ListHosts(ctx context.Context, req *pb.ListHostsRequest) (*pb.L
 	for _, h := range hosts {
 		usage := resUsage[h.Name]
 		pools := s.storagePoolsForHost(ctx, h.Name)
+		diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
 		host := &pb.Host{
-			Name:         h.Name,
-			Address:      h.Address,
-			State:        hostStateToPB(h.State),
-			CpuTotal:     int32(h.CPUTotal),
-			MemTotalMib:  int32(h.MemTotal),
-			DiskTotalGib: int64(h.DiskTotal),
-			CpuUsed:      int32(usage.CpuUsed),
-			MemUsedMib:   int32(usage.MemUsedMiB),
-			DiskUsedGib:  int64(usage.DiskUsedGiB),
-			VmCount:      int32(vmCounts[h.Name]),
-			Version:      h.Version,
-			StoragePools: pools,
-			Region:       h.Region,
-			CertSerial:   h.CertSerial,
-			CreatedAt:    parseTimestamp(h.CreatedAt),
-			UpdatedAt:    parseTimestamp(h.UpdatedAt),
+			Name:             h.Name,
+			Address:          h.Address,
+			State:            hostStateToPB(h.State),
+			CpuTotal:         int32(h.CPUTotal),
+			MemTotalMib:      int32(h.MemTotal),
+			DiskTotalGib:     diskTotal,
+			CpuUsed:          int32(usage.CpuUsed),
+			MemUsedMib:       int32(usage.MemUsedMiB),
+			DiskUsedGib:      diskUsed,
+			DiskAllocatedGib: int64(usage.DiskAllocatedGiB),
+			VmCount:          int32(vmCounts[h.Name]),
+			Version:          h.Version,
+			StoragePools:     pools,
+			Region:           h.Region,
+			CertSerial:       h.CertSerial,
+			CreatedAt:        parseTimestamp(h.CreatedAt),
+			UpdatedAt:        parseTimestamp(h.UpdatedAt),
 		}
 		resp.Hosts = append(resp.Hosts, host)
 	}
@@ -78,30 +82,33 @@ func (s *Server) InspectHost(ctx context.Context, req *pb.InspectHostRequest) (*
 
 	vms, _ := corrosion.ListVMs(ctx, s.db, "", h.Name)
 
-	// Sum allocated CPU/memory/disk from VMs on this host.
-	cpuUsed, memUsed, diskUsed := s.hostAllocatedResources(ctx, h.Name)
+	// Sum allocated CPU/memory and declared disk size from VMs on this host.
+	cpuUsed, memUsed, diskAllocated := s.hostAllocatedResources(ctx, h.Name)
+	pools := s.storagePoolsForHost(ctx, h.Name)
+	diskUsed, diskTotal := hostDiskFromPools(pools, int64(h.DiskTotal))
 
 	return &pb.Host{
-		Name:          h.Name,
-		Address:       h.Address,
-		State:         hostStateToPB(h.State),
-		CpuTotal:      int32(h.CPUTotal),
-		MemTotalMib:   int32(h.MemTotal),
-		DiskTotalGib:  int64(h.DiskTotal),
-		CpuUsed:       cpuUsed,
-		MemUsedMib:    memUsed,
-		DiskUsedGib:   diskUsed,
-		VmCount:       int32(len(vms)),
-		Labels:        h.Labels,
-		Version:       h.Version,
-		StoragePools:  s.storagePoolsForHost(ctx, h.Name),
-		FenceStrategy: h.FenceStrategy,
-		IpmiAddress:   h.IPMIAddress,
-		WatchdogDev:   h.WatchdogDev,
-		Region:        h.Region,
-		CertSerial:    h.CertSerial,
-		CreatedAt:     parseTimestamp(h.CreatedAt),
-		UpdatedAt:     parseTimestamp(h.UpdatedAt),
+		Name:             h.Name,
+		Address:          h.Address,
+		State:            hostStateToPB(h.State),
+		CpuTotal:         int32(h.CPUTotal),
+		MemTotalMib:      int32(h.MemTotal),
+		DiskTotalGib:     diskTotal,
+		CpuUsed:          cpuUsed,
+		MemUsedMib:       memUsed,
+		DiskUsedGib:      diskUsed,
+		DiskAllocatedGib: diskAllocated,
+		VmCount:          int32(len(vms)),
+		Labels:           h.Labels,
+		Version:          h.Version,
+		StoragePools:     pools,
+		FenceStrategy:    h.FenceStrategy,
+		IpmiAddress:      h.IPMIAddress,
+		WatchdogDev:      h.WatchdogDev,
+		Region:           h.Region,
+		CertSerial:       h.CertSerial,
+		CreatedAt:        parseTimestamp(h.CreatedAt),
+		UpdatedAt:        parseTimestamp(h.UpdatedAt),
 	}, nil
 }
 
@@ -156,7 +163,7 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 		// The other self-report: tokens advertised above but NOT acted on,
 		// because their kill-switch is off here. DIAGNOSTIC ONLY — see
 		// PingResponse.not_enforcing and notEnforcingTokens.
-		NotEnforcing: notEnforcingIf(disclosePosture, advertised, s.tokenEnabled),
+		NotEnforcing: s.notEnforcingIf(disclosePosture, advertised),
 		// True on this binary for a caller allowed to see posture, so an empty
 		// NotEnforcing above reads as "nothing unenforced" rather than "too old
 		// to say". FALSE for a caller that is not, which lands in the same
@@ -201,7 +208,53 @@ func (s *Server) Ping(ctx context.Context, _ *pb.PingRequest) (*pb.PingResponse,
 // decisions it actually gates — so every supported token with no kill-switch
 // case (hardware_v2 today) would be reported unenforced on every node forever.
 func (s *Server) notEnforcingTokens() []string {
-	return notEnforcingFrom(s.advertisedCapabilities(), s.tokenEnabled)
+	return s.notEnforcingWith(s.advertisedCapabilities())
+}
+
+// notEnforcingWith is notEnforcingFrom plus the one report it cannot make: a
+// token this node has LATCHED but withholds because its flag is off.
+//
+// A conditionally-advertised token drops out of `advertised` the moment its
+// flag goes off, which is what keeps a fresh latch from forming across the
+// node — so notEnforcingFrom, scoped to what is advertised, never sees it. For
+// recovery_claim_v1 that silence is the dangerous case: the node has latched
+// the protocol with its peers, stopped claiming and verifying, and is now the
+// uncertified second owner a partial stand-down produces
+// (docs/design/recovery-claims.md §5.2, §5.6). Its enforcing peers raise
+// ha_degraded because it no longer advertises; this is the self-report beside
+// it, so the posture reads the same from either end.
+func (s *Server) notEnforcingWith(advertised []string) []string {
+	out := notEnforcingFrom(advertised, s.tokenEnabled)
+	return append(out, s.withheldStandDowns(advertised)...)
+}
+
+// withheldStandDowns lists latched tokens this node withholds because its own
+// flag is off. Only tokens whose stand-down a peer must be told about are
+// considered.
+func (s *Server) withheldStandDowns(advertised []string) []string {
+	if s.gate == nil {
+		return nil
+	}
+	var out []string
+	for _, tok := range []string{capabilities.RecoveryClaimV1, capabilities.PartitionPauseV1} {
+		if !s.tokenEnabled(tok) && !slices.Contains(advertised, tok) && s.gate.Latched(tok) {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// notEnforcingIf is the disclosure gate, taking the same decision that sets
+// PingResponse.posture_reported so the two cannot drift apart. Populating the
+// list while reporting posture_reported=false would be worse than either
+// consistent answer: postureFromPing reads the flag first and would discard a
+// list it had already been handed, so the disclosure would happen with none of
+// the benefit.
+func (s *Server) notEnforcingIf(disclose bool, advertised []string) []string {
+	if !disclose {
+		return nil
+	}
+	return s.notEnforcingWith(advertised)
 }
 
 // tokensWithoutKillSwitch have no enforcement.* flag at all, so tokenEnabled
@@ -213,19 +266,6 @@ func (s *Server) notEnforcingTokens() []string {
 // (docs/diagnostics.md); token_enabled_test.go pins the same gap.
 var tokensWithoutKillSwitch = map[string]bool{
 	capabilities.HardwareV2: true,
-}
-
-// notEnforcingIf is the disclosure gate, taking the same decision that sets
-// PingResponse.posture_reported so the two cannot drift apart. Populating the
-// list while reporting posture_reported=false would be worse than either
-// consistent answer: postureFromPing reads the flag first and would discard a
-// list it had already been handed, so the disclosure would happen with none of
-// the benefit.
-func notEnforcingIf(disclose bool, advertised []string, enabled func(string) bool) []string {
-	if !disclose {
-		return nil
-	}
-	return notEnforcingFrom(advertised, enabled)
 }
 
 // notEnforcingFrom is the pure half of notEnforcingTokens, taking the advertised
@@ -841,6 +881,36 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		}
 	}
 
+	// clear_ipmi removes the IPMI address, user and password, which an empty
+	// field cannot: empty means "leave alone". It is refused with any ipmi_*
+	// value beside it (set or clear, not both), and when it would leave the
+	// host fencing by "ipmi" with nothing to authenticate with — every fence
+	// would fail. And it needs this node's credentials_split_v1 gate open:
+	// readers take the live credential row whenever one exists, a closed gate
+	// cannot write it, and an empty old column is never absorbed into one
+	// (credentials_absorb.go), so a latched peer would go on serving the
+	// password this was meant to remove.
+	if req.ClearIpmi {
+		if req.IpmiAddress != "" || req.IpmiUser != "" || req.IpmiPass != "" {
+			return nil, status.Error(codes.InvalidArgument,
+				"clear_ipmi cannot be combined with ipmi_address, ipmi_user or ipmi_pass")
+		}
+		strategy := h.FenceStrategy
+		if req.FenceStrategy != "" {
+			strategy = req.FenceStrategy
+		}
+		if strategy == "ipmi" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %q fences by ipmi; clearing its IPMI settings would fail every fence. "+
+					"Set another fence strategy in the same request", req.Name)
+		}
+		if !s.db.MayWriteCredentialTables() {
+			return nil, status.Error(codes.FailedPrecondition,
+				"IPMI settings cannot be cleared until credentials_split_v1 has latched on this node "+
+					"(a peer's credential row would keep the password); retry once the upgrade completes")
+		}
+	}
+
 	// Validate role if provided (side-effecting: refuse witness promotion with VMs).
 	if req.Role != "" {
 		switch req.Role {
@@ -862,6 +932,31 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		}
 	}
 
+	// Under region-scoped failover a host's region decides whose votes may fence
+	// it, so relabelling one is a change to two regions' voter sets. Made from
+	// one side of a partition, it would let that side count hosts on the other
+	// as its own and fence them. Same precondition as changing the policy: every
+	// voter reachable. A policy that cannot be read refuses.
+	if req.Region != "" && req.Region != h.Region {
+		scope, err := corrosion.GetFailoverScope(ctx, s.db)
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"cannot read the failover scope, so a region change cannot be shown safe: %v", err)
+		}
+		if scope.Region() {
+			missing, err := s.unreachableVoters(ctx)
+			if err != nil {
+				return nil, status.Errorf(codes.Unavailable, "check voters are reachable: %v", err)
+			}
+			if len(missing) > 0 {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"failover is region-scoped, so a host's region decides who may fence it, and a region "+
+						"can only be changed while every voter is reachable; %s cannot reach %s",
+					s.hostName, strings.Join(missing, ", "))
+			}
+		}
+	}
+
 	// One CONSTANT statement (compile-time visible to the ledger / replication apply path)
 	// instead of a dynamically-assembled SET list: each field is COALESCE(?, col), so an
 	// unspecified field (NULL param) keeps its current value and is never clobbered, while a
@@ -873,7 +968,15 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	}
 	args := make([]interface{}, 0, len(fields)+2)
 	provided := 0
-	for _, f := range fields {
+	for i, f := range fields {
+		// A clear binds '' to the three IPMI columns, which COALESCE keeps:
+		// the statement's shape is unchanged, and every reader treats an
+		// empty value as "not configured".
+		if req.ClearIpmi && i >= 1 && i <= 3 {
+			args = append(args, "")
+			provided++
+			continue
+		}
 		if f == "" {
 			args = append(args, nil)
 			continue
@@ -910,9 +1013,29 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	if provided == 0 {
 		return nil, status.Error(codes.InvalidArgument, "no fields to update")
 	}
-	args = append(args, s.db.NowTS(), req.Name)
+	now := s.db.NowTS()
+	args = append(args, now, req.Name)
 
-	if err := s.db.Execute(ctx, configureHostSQL, args...); err != nil {
+	// Once credentials_split_v1 has latched, a supplied IPMI password is ALSO
+	// written to the host's sensitive-lane credential row, in the same batch
+	// and under the same updated_at. hosts.ipmi_pass keeps it too: a host
+	// rolled back one release reads that column and nothing else, and clearing
+	// it is a later release's step (docs/design/credentials-clear.md). Before
+	// the latch no node may write the credential table (a previous-release
+	// peer cannot decode it), so the password goes to hosts.ipmi_pass alone.
+	// err is reused from the host lookup above.
+	// A clear writes an empty password to the credential row the same way
+	// (checked above that the gate is open): a live row with no secret, which
+	// readers serve as "none".
+	if (req.IpmiPass != "" || req.ClearIpmi) && s.db.MayWriteCredentialTables() {
+		err = s.db.ExecuteBatch(ctx, []corrosion.Statement{
+			{SQL: configureHostSQL, Params: args},
+			{SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}},
+		})
+	} else {
+		err = s.db.Execute(ctx, configureHostSQL, args...)
+	}
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "update host config: %v", err)
 	}
 
@@ -950,12 +1073,27 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 	if err != nil || h == nil {
 		return nil, status.Errorf(codes.NotFound, "host %q not found", req.Name)
 	}
+	// A current voter keeps its vote whatever its hosts row says, so deleting
+	// the row must not look like removing the voter (recovery-claims.md §4.3).
+	if err := s.voterRemovalRefusal(ctx, req.Name); err != nil {
+		return nil, err
+	}
 
-	// Check for VMs on this host.
-	vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
-	if len(vms) > 0 && !req.Force {
-		return nil, status.Errorf(codes.FailedPrecondition,
-			"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
+	// `lv host rm --dead` (recovery-claims.md §3.12): a host fenced proof-grade
+	// and gone for good. Its workloads are not drained first — they are the
+	// stranded ones, and their rows stay in place for the recovery claims to
+	// supersede once this removal and the CRL have replicated.
+	if req.Dead {
+		if err := s.deadRemovalRefusal(ctx, h); err != nil {
+			return nil, err
+		}
+	} else {
+		// Check for VMs on this host.
+		vms, _ := corrosion.ListVMs(ctx, s.db, "", req.Name)
+		if len(vms) > 0 && !req.Force {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %q has %d VMs — drain first or use --force", req.Name, len(vms))
+		}
 	}
 
 	// Soft-delete the host and clean up related records.
@@ -972,6 +1110,12 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 // AdmitHost records the CA-authorized identity produced by `lv host add`.
 // Running it on an existing member breaks the tombstone/authentication deadlock
 // when a removed machine is deliberately re-added with a fresh certificate.
+//
+// The host is admitted 'joining', not 'active': `lv host add` admits it before
+// its setup runs, and its daemon records it 'active' when it first boots. An
+// 'active' row for a machine with no daemon yet was a fence candidate as soon
+// as the observers' probes found nothing listening, and the coordinator
+// powered the machine off part-way through its setup (kvm003 drill 6).
 func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*emptypb.Empty, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -979,13 +1123,32 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
 		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
 	}
-	err := corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
+	// A name whose removed machine still has workloads recorded on it is not
+	// given to a new machine: those rows are the old machine's, recovered by
+	// the claim path only while the name stays removed, and the new machine
+	// would take them over (corrosion.WorkloadsOnRemovedHost).
+	left, err := corrosion.WorkloadsOnRemovedHost(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the workloads recorded on %s: %v", req.Name, err)
+	}
+	if len(left) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"host %q was removed with %d workload(s) still recorded on it (%s). They belong to the machine "+
+				"removed under that name, and a new machine admitted under it would take them over. The "+
+				"failover coordinator recovers them by claim onto a live host once the removal and the CRL "+
+				"have replicated (`lv health` shows ha.claim.stranded for any it cannot). One that no live "+
+				"host can take, such as a container when no other host runs containers, moves as soon as "+
+				"a host that can take it is up: add one (this machine under another name will do), or "+
+				"remove the workload (`lv rm <vm>`, `lv ct rm <name>`). Then add the host again",
+			req.Name, len(left), strings.Join(left, ", "))
+	}
+	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
 		Name:       req.Name,
 		Address:    req.Address,
 		SSHUser:    "root",
 		SSHPort:    22,
 		GRPCPort:   7443,
-		State:      "active",
+		State:      corrosion.HostStateJoining,
 		CertSerial: req.CertSerial,
 	})
 	if err != nil {
@@ -995,7 +1158,10 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 	return &emptypb.Empty{}, nil
 }
 
-func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (cpuUsed, memUsed int32, diskUsedGiB int64) {
+// hostAllocatedResources returns running-VM CPU and memory, and the DECLARED
+// disk size of every VM on the host (stopped VMs included). The disk figure is
+// allocation, not usage — hostDiskFromPools is the usage pb.Host reports.
+func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (cpuUsed, memUsed int32, diskAllocatedGiB int64) {
 	vms, _ := corrosion.ListVMs(ctx, s.db, "", hostName)
 	for _, vm := range vms {
 		if vm.State == "running" {
@@ -1008,7 +1174,7 @@ func (s *Server) hostAllocatedResources(ctx context.Context, hostName string) (c
 		`SELECT COALESCE(SUM(size_bytes),0) as disk_bytes FROM vm_disks WHERE host_name = ? AND deleted_at IS NULL`,
 		hostName)
 	if err == nil && len(rows) > 0 {
-		diskUsedGiB = int64(rows[0].Int("disk_bytes")) / (1024 * 1024 * 1024)
+		diskAllocatedGiB = int64(rows[0].Int("disk_bytes")) / (1024 * 1024 * 1024)
 	}
 	return
 }
@@ -1033,6 +1199,10 @@ func hostStateToPB(s string) pb.HostState {
 		return pb.HostState_HOST_SUSPECT
 	case "offline", "fenced":
 		return pb.HostState_HOST_OFFLINE
+	case corrosion.HostStateJoining:
+		// Admitted by `lv host add`, its daemon not yet started. Not OFFLINE:
+		// nothing has failed, and the coordinator never fences it.
+		return pb.HostState_HOST_JOINING
 	default:
 		return pb.HostState_HOST_OFFLINE
 	}

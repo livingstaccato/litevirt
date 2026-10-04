@@ -108,6 +108,13 @@ func (s *Server) DiagnoseDivergence(ctx context.Context, req *pb.DiagnoseDiverge
 		d2 := classifyLanes(opTables, sensTables, commonOp, commonSens, s2.snaps)
 		report.Rows = reconcileSamples(d1, d2)
 	}
+	// Acknowledged ties: decided from every host's verification digest, by
+	// the verdict `lv cluster converge` uses, so the two commands agree. Read
+	// only when there is a row to mark; a host whose digest is missing cannot
+	// vouch, so its rows stay divergences.
+	if len(report.Rows) > 0 {
+		annotateAcknowledgedTies(report.Rows, corrosion.TieAckVerdicts(s.clusterStateDigest(ctx).GetHosts()))
+	}
 
 	// stable: the cluster was QUIESCENT across the scan — identical per-lane node
 	// sets in both samples AND no scanned table's content changed between them.
@@ -456,6 +463,39 @@ func reconcileSamples(d1, d2 map[string]corrosion.RowDivergence) []*pb.Divergenc
 		out = append(out, rowDivergenceToPB(r2, class))
 	}
 	return out
+}
+
+// annotateAcknowledgedTies marks the rows of every table in which some host
+// holds an acknowledged tie, from the hosts' verification digests, using the
+// verdict `lv cluster converge` uses (corrosion.TieAckVerdicts).
+//
+// A row becomes acknowledged_tie only when every host holding it vouches for
+// the table AND the table is acknowledged-only cluster-wide: every reporting
+// host vouches and their residuals agree. The residual hashes the table with
+// the acknowledged rows masked by primary key, so agreement proves those are
+// the only rows that differ, and this row is one of them. Anything short of
+// that keeps the row's class; the row then names the hosts that have not
+// acknowledged (tie_unacknowledged_on) — on the lab, rebuilt hosts with empty
+// acknowledgement tables.
+func annotateAcknowledgedTies(rows []*pb.DivergenceRow, verdicts map[string]*corrosion.TieAckVerdict) {
+	for _, r := range rows {
+		v := verdicts[r.GetTable()]
+		if v == nil || v.Acknowledged == 0 {
+			continue // nobody acknowledged anything in this table
+		}
+		var on, off []string
+		for _, m := range r.GetPerNode() {
+			if v.VouchedBy(m.GetHost()) {
+				on = append(on, m.GetHost())
+			} else {
+				off = append(off, m.GetHost())
+			}
+		}
+		r.TieAcknowledgedOn, r.TieUnacknowledgedOn = on, off
+		if len(off) == 0 && v.AcknowledgedOnly() {
+			r.Class = string(corrosion.ClassAcknowledgedTie)
+		}
+	}
 }
 
 func samePerNodeHashes(a, b map[string]corrosion.RowMeta) bool {

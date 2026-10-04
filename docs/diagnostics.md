@@ -47,7 +47,11 @@ its own once both conditions hold on every voting-eligible host —
    withholds `hardware_v2` from the capabilities it advertises until that pass
    completes. A node that advertised earlier could let the fleet latch — and stop
    maintaining the legacy spec mirror — while its own tables were still empty, so
-   a peer would read hardware that isn't there.
+   a peer would read hardware that isn't there. The audit itself waits for the
+   node's replica to catch up with the cluster (its first completed anti-entropy
+   exchange, logged as `replica caught up`): it writes rows for the VMs the node
+   believes it owns, and a node back from a fence still believes it owns the VMs
+   failover moved away. Until then the log says `hardware backfill deferred`.
 
 One node still working through its backfill therefore holds the entire cluster
 at pre-latch behavior. That is intended. Like the rest of the family the latch is
@@ -102,6 +106,31 @@ compares per-row metadata, and returns a classified report.
 | `tombstone_vs_live` | Tombstoned (soft-deleted) on some nodes, live on others. |
 | `terminal_vs_live` | A workload terminal (stopped/error) on some nodes, running on others. |
 | `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` does not trip this. |
+| `acknowledged_tie` | **Not a divergence.** A contested row that every host holding it has acknowledged (`lv cluster acknowledge-lease-term`), in a table where nothing else differs. Listed separately, under *Acknowledged ties*, because both claims are kept as evidence; a scan that finds only these reads `no divergence detected.` |
+
+**Acknowledged ties.** A `leader_lease_terms` row is immutable, so a contested
+term never stops differing, even after an operator has acknowledged it. The
+scan decides whether a row is an acknowledged tie from every host's
+verification digest, by the same rule as `lv cluster converge` uses for
+`ACKNOWLEDGED` (see
+[operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it)):
+every host acknowledged every tie it tracks in the table, and every host's
+residual digest agrees. Anything short of that keeps the row's class:
+
+- acknowledged on **some** hosts only: the row stays a divergence, and its line
+  ends `(tie not acknowledged on <hosts>)`, naming the hosts still to
+  acknowledge. A host that cannot vouch for the table is named here too: one
+  that tracks no tie in it at all (a rebuilt host with an empty acknowledgement
+  table), one that supplied no residual digest, or one whose digest could not
+  be read;
+- acknowledged on **every** host, but the residuals disagree: the row stays a
+  divergence and its line ends `(tie acknowledged on every host, but the table
+  differs elsewhere)`, because another row of the table differs as well.
+
+The evidence is per host and per table, not per row: a host "has acknowledged"
+when every tie it tracks in that table is acknowledged. In `--json`, the
+`tie_acknowledged_on` and `tie_unacknowledged_on` fields of a row carry the
+split; both are empty on a row of a table where no host acknowledged anything.
 
 A divergence is reported **only when it persists across two samples** with
 unchanged per-node content hashes — an in-flight replication delta changes between
@@ -152,15 +181,22 @@ operation on the offending node:
 
 > A pure column-order skew classifies as
 > row-content divergence when the positional (v1) digest is in force. The
-> order-invariant **digest_v2** (below) makes that skew hash identically across
-> nodes, preventing the recurrence entirely — enable it fleet-wide instead of
-> repeatedly running the data remediation above for a column-order-only skew.
+> order-invariant **digest_v2** (below, on by default) makes that skew hash
+> identically across nodes, preventing the recurrence entirely — leave it on
+> fleet-wide instead of repeatedly running the data remediation above for a
+> column-order-only skew.
 
 ### `digest_v2` — the order-invariant table/row digest
 
-The default (v1) content digest hashes each row's cell **values in physical column
+The positional (v1) content digest hashes each row's cell **values in physical column
 order**, so a fresh `CREATE TABLE` node and an `ALTER ADD COLUMN`-upgraded node
-compute different table/row hashes for logically identical data. The merge is
+compute different table/row hashes for logically identical data. That is not a
+corner case: a node founded at an older schema holds every later ALTER's column
+after `deleted_at`, while a fresh node holds it where `CREATE TABLE` declares it,
+and no single `CREATE TABLE` order matches every founding version. `hosts`, `vms`,
+`vm_interfaces`, `snapshots`, `lb_configs`, `users`, `tokens`, `ip_allocations`,
+`containers`, `host_pci_devices` and (for a database created by an early v51
+build) `netbox_bindings` all depend on the founding version. The merge is
 column-**name**-safe, so this never corrupts data — but the hashes stay different
 every cycle, causing perpetual no-op anti-entropy pulls and a standing
 `lv doctor divergence` / `lv cluster digest` mismatch on the reordered tables.
@@ -168,22 +204,25 @@ every cycle, causing perpetual no-op anti-entropy pulls and a standing
 **digest_v2** pairs each value with its column name, sorts by name, and hashes a
 canonical, order-invariant encoding — so column order stops mattering. It is
 negotiated **pairwise by field presence**: a node emits the v2 hash only when its
-own `enforcement.digest_v2` flag is on, and any two peers compare v2 **only when
-both supply it**, otherwise both compare v1. There is no capability latch — the
-digest only *detects*, and each node compares independently, so a non-uniform
-rollout only affects which node pulls, never data. `lv cluster digest` /
+own `enforcement.digest_v2` flag is on (the default), and any two peers compare v2
+**only when both supply it**, otherwise both compare v1. There is no capability
+latch — the digest only *detects*, and each node compares independently, so a
+non-uniform rollout only affects which node pulls, never data. The same rule
+governs every place a digest is compared: anti-entropy and its bucket digests,
+`lv cluster converge`, `lv doctor divergence`, and a reseed's convergence check. `lv cluster digest` /
 `lv cluster converge` print a `VER` column showing which version was compared per
 table.
 
-**Activation (do it fleet-uniformly, after every node runs a build that supports it):**
+**Rollout.** It is on by default, so upgrading is the activation: each upgraded
+node emits v2, and each pair of upgraded nodes compares v2. While some nodes still
+run an older build (which emits v1 only, since the flag defaulted off there), every
+comparison involving one of them stays v1 — exactly the behavior before the
+upgrade, so a column-order-only table may still read `DIVERGENT` (`VER v1`) in `lv
+cluster converge` until the last node is upgraded. Then:
 
-1. **Ship** the supporting binary to every node with `enforcement.digest_v2: false`
-   (the default). Flag off ⇒ v1-only emission; behavior is unchanged.
-2. **Converge** — confirm every node is upgraded (`lv host ls`).
-3. **Activate** — set `enforcement.digest_v2: true` in each node's config and
-   rolling-restart the fleet (the same procedure as any other `enforcement.*`
-   flag). Nodes now emit and compare v2 pairwise.
-4. **Controlled resync** — `lv cluster converge --all` (one anti-entropy pass).
+1. **Confirm** every node is upgraded (`lv host ls`) and none sets
+   `enforcement.digest_v2: false`.
+2. **Controlled resync** — `lv cluster converge --all` (one anti-entropy pass).
    Precise outcome:
    - Column-order-only tables **stop pulling** and read converged (`VER v2`).
    - Strictly-newer LWW drift **may** heal (normal LWW), as always.
@@ -196,7 +235,13 @@ table.
      v2 digest now matches; they clear on the next daemon restart. The one
      exception is `leader_lease_terms`, whose rows are immutable: a restart
      empties the register but the next anti-entropy pass re-registers the same
-     tie, so that one needs `lv cluster acknowledge-lease-term` — see
+     tie, so that one needs `lv cluster acknowledge-lease-term` on each host.
+     The acknowledgement is durable: after a restart the tie is re-registered
+     as acknowledged. Once every host has acknowledged it and nothing else in
+     the table differs, `lv cluster converge` lists the table as
+     `ACKNOWLEDGED` and counts it as converged, and `lv doctor divergence`
+     lists its rows as `acknowledged_tie` rather than as divergences. A new, unacknowledged claim
+     for the term makes it a `SAFETY-FAULT` again — see
      [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
 Kill switch: set `enforcement.digest_v2: false` and restart to revert a node to
@@ -258,8 +303,8 @@ tables by their natural key too, so a still-converging group shows as **one**
 content divergence instead of two phantom `missing_row`s; a converged group reads
 clean. The lane engages only when the scanning node has latched (uniform fleet).
 
-**Activation** mirrors `digest_v2`: ship the supporting binary everywhere (flag
-off, behavior-neutral), confirm every node is upgraded, then set
+**Activation**: ship the supporting binary everywhere (flag off,
+behavior-neutral), confirm every node is upgraded, then set
 `enforcement.canonical_identity: true` and rolling-restart. Existing divergent
 pairs consolidate on the next anti-entropy pass (`lv cluster converge --all`) — no
 separate data migration. Kill switch: set it `false` and restart (the node reverts
@@ -498,6 +543,11 @@ Human-readable table by default; `--json` for the full structured report (node
 lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
 and violations). `--table` restricts the scan to specific tables.
 
+The human-readable summary reads `no divergence detected.` when there are no
+diverging rows and no violations; acknowledged ties do not count. In `--json`,
+acknowledged ties are still in `rows`, so a script deciding "clean" must skip
+rows whose `class` is `acknowledged_tie`.
+
 ## `lv doctor machine-types`
 
 Read-only. Lists VMs whose **persisted spec** carries an unversioned machine
@@ -596,6 +646,7 @@ checked.
 | `operator-confirmed` | `lv host fence-confirm` | A person attested the host is down. |
 | `requested` | `ssh` or `watchdog` + `fenced` | The host accepted a forced power-off, or its watchdog heartbeat was stopped. Nothing checked it went down. |
 | `assumed` | `best-effort-ssh` + `fenced` | SSH itself failed and the best-effort strategy proceeded anyway. Not even the request is known to have arrived. |
+| `self_paused` | `best-effort-ssh` + `fenced`, detail prefixed `[relies on the host's partition pause]` | As `assumed`, but with `partition_pause_v1` latched: the coordinator waited out the host's own partition pause before it recovered anything, so the old copy had stopped executing. It says nothing about power. `litevirt_fences_total` counts it as `assumed`. |
 | `awaiting-confirmation` | `manual` + `partial` | A manual fence waiting for a person. Not a failure. |
 | `failed` | any + `partial` | The fence ran and reported failure. |
 
@@ -802,6 +853,20 @@ converge the row, so the two paths can never disagree.
   a param-bound `crl_versions` rewrite). A brief rate during a rolling upgrade is expected; a
   **continuing** rate means an old emitter is still writing or a relay is retaining pre-upgrade
   WAL — investigate that peer/relay.
+- `litevirt_antientropy_digest_tables_total{result}` — tables a state digest took
+  from the digest cache (`cached`) or scanned (`computed`), counted for every digest a
+  pass computes and every one a peer asks for. On a quiet cluster `cached` dominates;
+  a node where `computed` tracks the total has its cache off
+  (`anti_entropy_legacy_repair: true`) or a table written every pass.
+- `litevirt_antientropy_pull_rows_total{scope}` — rows a repair pull received:
+  `bucket` for a table narrowed to the buckets whose digests disagreed, `table` for one
+  pulled whole (a peer on an older build, a table that is not bucketed, or the
+  stand-down). A steady `table` rate against current peers is worth a look.
+- `litevirt_antientropy_digest_seconds`, `litevirt_antientropy_dump_bytes`,
+  `litevirt_antientropy_rows_merged_total`, `litevirt_antientropy_rows_skipped_total` —
+  the wall time of one digest (cached tables cost almost nothing), the compressed size
+  of one repair pull, and the rows a merge applied or kept local
+  ([design/ae-incremental.md](design/ae-incremental.md)).
 
 ### Alerts
 
@@ -827,10 +892,18 @@ rate(litevirt_merge_apply_rejected_total[15m]) > 0
 The **signal** is bounded — `lww_tie_unresolved_total` counts a row once and the
 alert fires once per distinct divergence, not per cycle. The **divergence itself
 is not suppressed**: while a row remains unresolved its table's digest stays
-mismatched, so anti-entropy may continue to re-pull that table each cycle until
-the row is repaired (a row-proofed suppression that re-pulls only when an
-unrelated row also diverges is a future optimization). In practice this cost is
-paid only by genuinely-stuck rows awaiting repair.
+mismatched, and the tie stays in the register, the `ha.lww.unresolved`
+condition, `lv doctor divergence` and `litevirt_lww_tie_unresolved_current`.
+What anti-entropy stops doing is re-pulling it. After a pull, the node checks
+the pulled rows against its own: when every row that still differs is a tie it
+already tracks and both versions — its own and the peer's — are among those it
+has met for that row (a lease term contested by every node has one version per
+node, and each peer's is recognised), the table is settled against
+that peer, and scheduled passes skip it until either side's digest moves. Any
+write to the table on either side — a new row, a repair — moves a digest and the
+next pass pulls it. A table that also holds a difference the register does not
+explain is pulled every pass, as before. A replica that is not caught up, a
+restarted daemon's first pass, and `lv cluster converge` pull regardless.
 
 Resolve an unresolved row by making one side authoritative with a fresh write —
 which clears the tracking and lets the table converge.
@@ -856,7 +929,17 @@ local (never picks an owner by value) and defers to runtime repair.
   the segmented case, or to force a specific owner the operator knows is correct.
 
 Either way the fresh timestamp wins everywhere by ordinary LWW and clears the
-unresolved tracking.
+unresolved tracking. Both also move the VM's `vm_disks` rows to the host that
+runs it, in the same write. Failover moves them with the VM too. Builds before
+that re-keyed only the `vms` row, so a VM recovered by one of them can still
+have disk rows naming the host it left. Running `lv doctor repair-owner <vm>
+<host-that-runs-it>` once realigns them. A migration also commits over such a
+row, as long as the row has not changed since the migration began.
+
+A migration whose ownership commit is refused after the cutover (a disk row
+changed while it ran) moves the `vms` row to the target, where the guest now
+runs, and reports the refusal. It no longer leaves the row `migrating` on the
+source, where nothing would repair it.
 
 ### Container ownership — automatic runtime re-key
 
@@ -1009,6 +1092,205 @@ conflicting holder, no in-flight migration/operation/lock/failover, and quorum
 or explicit fencing authorization. The evidence and decision must be durable
 before any stop is issued.
 
+### Voter genesis pending (`ha.voter.genesis_pending`)
+
+Evaluator `voter_config`, subject `cluster/voters`, severity warning. Written by
+the leader-lease holder while `voter_config_v1` has latched but automatic
+genesis cannot write generation 1 of the explicit voter set: a host is in
+`maintenance`, `offline` or `fenced`, or did not sign. Genesis waits for a clean
+cluster so it never freezes a host out of the voter set because it happened to
+be away when the token latched. The evidence names each host, its state and
+what clears it; the condition resolves on the tick genesis succeeds.
+
+For a cluster that cannot become clean — a host that is dead for good and has
+not been removed — `lv cluster voter init --members <hosts>` proposes the
+generation by hand. Every listed member must sign. `lv cluster voter ls` shows
+the adopted generation once one exists.
+
+### Voters that cannot vote (`ha.voter.unavailable`)
+
+Evaluator `voter_config`, subject `cluster/voters`, severity warning. Written by
+the leader-lease holder. Every member of the adopted voter generation counts in
+every quorum's denominator whatever its state — there is no automatic shrink —
+so a member that is `fenced`, `offline`, in `maintenance`, removed, or
+abstaining (its claim state is a different incarnation from the one it was
+admitted with: re-imaged or reseeded) is fault tolerance the cluster does not
+have. A three-voter cluster with one fenced member needs both survivors. The
+evidence names each such member and the command that clears it:
+`lv host rm --dead <host>` for one gone for good, `lv cluster voter rm <host>`
+for one that should stay a host but stop voting, and `lv cluster voter rm`
+then `lv cluster voter add` for an abstaining one.
+
+### A forced voter reconfiguration (`ha.voter.forced`)
+
+Evaluator `voter_config`, subject `cluster/voters`, severity warning. Raised
+after `lv cluster voter force-reconfigure` until every host it named lost has
+been removed and revoked with `lv host rm --dead`: a lost host may hold an
+ordinary generation its majority decided that nobody saw, so it must not come
+back as it left. A lost host is the voter entry, name and incarnation, so a
+machine rebuilt under its name after `lv host rm --dead` counts it gone once
+it answers as a new incarnation, or once the adopted generation lists it as a
+voter under one. A name with a fenced row keeps the condition raised with the
+`lv host rm --dead` step. A host in service under the name that cannot say
+which incarnation it is keeps it raised too, but the evidence only asks for it
+to be reached: removal is never advised for a host in service or a current
+voter. The evidence names each lost host still to settle. It is also
+raised by a node that REFUSED a forced generation — because it can reach a host
+the generation names lost, or because it is itself named lost and running —
+with the reason: valid signatures do not make a false claim of loss true.
+`lv cluster voter ls` on each host shows which generation it adopted.
+
+### A failed re-fence (`refence_failed`)
+
+Evaluator `failover`, subject the host, severity critical, written by the
+failover lease holder. A successor that found a verified fence of the host aged
+or in doubt fenced it again before resuming its recovery, and that re-fence
+failed, so nothing was recovered and the host is not re-fenced every cycle
+(migration-failover.md). The evidence names the recorded fence and the failure.
+Confirm the host is powered off, then run `lv host fence-confirm <host>`: the
+recovery resumes from it. The condition resolves once a later fence of the host
+succeeds or an operator confirms it off, or the host is back `active` or
+removed.
+
+### Recovery-claim refusals (`recovery_claim_*`)
+
+With recovery claims enforced (`enforcement.recovery_claim`), a recovery that
+did not happen is counted in `litevirt_runtime_action_refused_total{reason}` and
+logged with every refusing voter's detail:
+
+- `recovery_claim_owner_reachable` — voters could still reach the workload's
+  recorded owner and refused to certify its eviction, for example
+  `node-3 still reaches node-2 (Ping answered in 4ms)`. The owner is up for
+  most of the cluster: find out why the coordinator judged it failed. If it
+  must not keep its workloads, fence it proof-grade; the probe then fails and
+  the next tick's claim proceeds (at the same round).
+- `recovery_claim_source_mismatch` — a voter's settled row names a different
+  owner than the one the coordinator named.
+- `recovery_claim_no_majority` — no majority of the voter generation answered:
+  restore connectivity, or remove voters gone for good.
+- `recovery_claim_lost` — another coordinator's recovery was decided; this one
+  wrote that proof (or deferred to it) and nothing of its own.
+- `recovery_claim_unproven` — a destination refused a proof whose certificate
+  does not verify here: usually `voter_configs` or `cluster_crl` replication
+  lag, which clears on a later reconcile; compare `lv cluster voter ls` across
+  hosts if it persists.
+
+`lv cluster claim vm/<name>` (or `container/<name>`) is where a stuck claim is
+diagnosed: per attempt and per voter it prints the promised and accepted
+ballot, the accepted value's digest, proof, destination and source, whether the
+voter's incarnation matches its entry, and its last refusal with the detail. A
+voter keeps its last refusal in memory only, so the column is `-` after that
+voter restarts. That is by design (design/recovery-claims.md §3.3): a refusal
+writes nothing, and a refusal from before a restart describes a probe or a
+ballot that no longer holds. Re-run the recovery, or wait for the
+coordinator's next attempt, to see a current one.
+
+### Recovery stranded on a dead destination (`ha.claim.stranded`)
+
+Evaluator `recovery_claim`, subject `cluster/claims`, severity warning. Written
+by the leader-lease holder while recovery claims are enforced
+(`enforcement.recovery_claim`). A recovery claim decided a destination for a
+workload, and that destination then failed before it started it: the workload
+stays pending on a host that is fenced or offline. This is deliberate. No
+abandonment can be obtained from a dead host, and it might come back and
+execute the certificate it holds, so no other destination may be authorized
+until it is proven gone. The evidence names each workload, the destination and
+its state, and the exact command:
+
+```
+vm/db-1 is decided for node-4, which is fenced and cannot run it; if node-4 is gone for good,
+`lv host rm --dead node-4` (try --dry-run first) lets it retry at attempt 1.
+```
+
+If the destination comes back it executes the recovery (or, having failed
+before starting, abandons it) and the condition resolves. If it is gone for
+good, `lv host rm --dead <host> --dry-run` shows the plan: the proof-grade
+fence it rests on (run `lv host fence-confirm <host>` first if there is none),
+whether the host is removed from the voter set first, and each stranded
+recovery. The real run removes the host from the voter set if it votes,
+revokes its certificate, publishes the CRL and removes it. Every voter then
+checks, in its own replica, that the destination is fenced proof-grade, no
+longer a member and revoked before it promises at the next attempt; until the
+CRL has reached them it refuses with `recovery_claim_supersede_unproven`, and
+the next lease-holder tick retries. See
+[design/recovery-claims.md](design/recovery-claims.md) §3.12.
+
+### A recovery minted before recovery claims were enforced (`ha.claim.uncertified`)
+
+Evaluator `recovery_claim`, subject `cluster/claims`, severity warning. Written
+by the leader-lease holder while recovery claims are enforced. A reschedule or
+container relocation minted without a certificate just before enforcement
+turned on (the `recovery_claim_v1` latch forming, genesis, or
+`lv cluster voter init` after a reset) is refused by its destination with
+`recovery_claim_unproven`, because nothing is grandfathered. The lease holder
+claims each such proof for its own value on its next tick, naming as the source
+the old owner its proof-grade fence binding records, and attaches the
+certificate; the destination then runs it and the condition resolves. If
+another recovery was decided for the workload instead, that one is written in
+its place. The evidence names each workload, its destination and proof, and
+where a refusal shows (`lv cluster claim vm/<name>`).
+
+A proof that binds no proof-grade fence of its old owner (a best-effort fence)
+names no owner for the voters to probe, so it cannot be claimed and will not run
+while recovery claims are enforced; the evidence says so. Set
+`enforcement.recovery_claim: false` on every host until it has run, then turn it
+back on.
+
+### A recovery held by a decision made before the claim key changed (`ha.claim.legacy_held`)
+
+Evaluator `recovery_claim`, subject `vm/<name>` or `container/<name>`, severity
+warning. Written by the node whose claim re-proposed the decision, as a
+replicated row, so a restart or a lease hand-off keeps it; resolved by the
+leader-lease holder once the workload has moved on (a fresh decision, a later
+owner epoch, or the workload deleted). After
+`claim_incarnation_v1` latches, a recovery claim names the workload's
+incarnation. A decision some voter accepted at the old, unscoped key for the
+same name and owner epoch may belong to this workload or to an earlier one
+deleted and re-created under its name. Unless the decision's destination shows,
+from its own database, that it is not this workload's and will never run (it
+signs a foreign abandonment), or that destination has been removed for good,
+the claim re-proposes the old decision rather than deciding a second one beside
+it. If the voters then refuse it, for example because it names an earlier
+workload's owner, the recovery waits and this condition names the workload, the
+decision's proof, destination and source, and why it could not be excluded. It
+is not raised when the old decision is visibly this workload's own pending one
+(its row points at the proof) and the destination was only slow to answer.
+
+The condition stays raised even when the old decision is decided at the new
+key: a decision whose proof has already run or failed can never run again, so
+the coordinator does not point the workload at it, and asks the destination
+again on the next tick. Each of those ticks also re-asserts this condition, so it
+reappears if its first write failed. While the destination answers, the next
+tick moves the claim on. If the destination is gone for good,
+`lv host rm --dead <host>` (after a proof-grade fence) releases the decision.
+
+If its proof is stuck in flight on a live destination, release that one
+workload with `lv cluster claim-release vm/<name>` (or `container/<name>`;
+admin). The destination does the release: under the workload's own locks it
+confirms that nothing there runs the proof (no start or operation holds the
+workload, and no live domain or container of its name exists), then records and
+signs that it will never run it. After that no runner can take the proof, the
+destination's own resume included: every executor records a start checkpoint
+before it lays anything down or starts it, and the database lets either that
+checkpoint or the release land, never both. The next recovery tick then decides
+the workload afresh. The command refuses, and changes nothing, when the
+destination finds anything that might run the proof, when the proof has reached
+its start checkpoint, when the destination runs a build that predates the
+command (upgrade it), and when the destination cannot be reached: only the
+destination can confirm that the proof is not running, so for one that is gone
+the way out is `lv host fence-confirm <host>` and `lv host rm --dead <host>`.
+If the request reached the destination but no verified answer came back (a
+timeout, a dropped connection), the outcome is unknown, not refused: the
+destination may have recorded the release. Run the command again (a release
+already recorded is signed again, so it answers either way) or check
+`lv cluster claim vm/<name>`. Every call writes a `recovery_claim.release` audit
+row with result `ok`, `refused` or `unknown`;
+the destination also writes its own `recovery_claim.abandon`. Only if the
+destination keeps refusing is the cluster-wide stand-down left:
+`enforcement.recovery_claim: false` on every host until the workload has
+recovered, then back on. See
+[design/recovery-claims.md](design/recovery-claims.md) §10 item 37.
+
 ### Deferred out-of-band stop sync after a restart or rejoin
 
 When a VM's domain is found shut off out of band (a crash, an external
@@ -1042,6 +1324,33 @@ restart.
 A host that stays `replica not caught up` is not completing anti-entropy with
 anyone: check that it sees gossip peers and can reach them over gRPC.
 
+### Workload commands refused after a restart or rejoin
+
+The same catch-up gates the commands that act on an existing workload through
+the host its record names: start, stop, restart, delete, rebuild, update,
+migrate, hotplug, resize, snapshot, backup and restore of VMs and containers,
+and `lv compose up` / `lv compose down`. Until the serving host's replica has
+caught up, they fail with `Unavailable` and nothing is touched:
+
+```
+DeleteVM refused on node-1: this node's replica has not caught up with the cluster yet (...), so it cannot tell which host owns the workload now. Retry in a minute, or run the command against another node
+```
+
+Served from a stale record, such a command acts on the wrong copy and writes
+the stale owner back. Observed on a lab: a VM rescheduled from node-1 to node-4
+while node-1 was down; node-1 came back and served `lv compose down` three
+seconds before its first anti-entropy exchange. It destroyed its own shut-off
+leftover and tombstoned the record naming itself, and that tombstone replaced
+the owner's record everywhere — the VM kept running on node-4 with no record.
+Retry after the `replica caught up` journal line, or run the command on any
+other host. A single-node cluster is not gated.
+
+A host whose peers are all down cannot catch up, so it refuses these commands
+until one of them answers. That is deliberate: it cannot know whether another
+host took the workload over while it was away. If those peers are gone for
+good, fence them and remove them with `lv host rm --dead <host>`; a host left
+as the only member is a single-node cluster and is no longer gated.
+
 ### Gossip isolation (`gossip_isolated`)
 
 A node that has lost every gossip peer, and whose re-join attempts reach none
@@ -1063,6 +1372,78 @@ is its connectivity edges going `suspect`.
 
 A single-node cluster with no seeds is never reported: it has nobody to be
 isolated from.
+
+A node that sees **some** peers is not isolated, even when hosts it lists are
+missing from gossip, as on either side of a partition. The same pass dials those
+missing hosts, on a per-host backoff, so the two sides merge again once the
+network heals. It logs what came back and what did not, but raises no condition.
+See [Gossip membership heals itself after a
+partition](operating-model.md#gossip-membership-heals-itself-after-a-partition).
+
+### Partition pause (`partition_paused`, `partition_pause_failed`, `partition_one_way`, `vm_settled`, `vm_settle_declined`)
+
+Evaluator `partition_pause` (design/partition-pause.md). Every row is written by
+the host it is about, except `partition_one_way`, which the failover lease
+holder writes.
+
+- `partition_paused` (host, warning): this host lost the voter majority for
+  10 s and paused its recoverable workloads itself. The evidence lists them.
+  It resolves when the last one resumes. Each workload resumes on its own once
+  the majority is back, its row still names this host at the same owner epoch
+  and incarnation, and a majority of voters confirms that this host is not
+  fenced and that no recovery claim moved it. One that stays paused is logged
+  with the reason:
+  ```
+  partition-pause: paused workload       kind=vm name=<vm> reason="lost the voter majority for 10s (…)"
+  partition-pause: resumed workload      kind=vm name=<vm> reason="majority regained; …"
+  partition-pause: workload stays paused kind=vm name=<vm> reason="voter node-4 has node-1 HOST_OFFLINE"
+  ```
+  A host the majority fenced while it was paused stays paused until
+  `lv host undrain` (or until failover returns it to active, when its fence
+  moved nothing). A workload that a certified claim moved is stopped by the
+  settle step below, not resumed.
+- `partition_pause_failed` (host, critical): this host lost the majority and
+  could not pause a workload it had to. While it is open, the majority does
+  not rely on this host's pause and recovers on an `assumed` fence as before.
+  With a verified hardware watchdog armed the host also self-fences. It
+  resolves once every pause succeeds or the majority returns.
+- `partition_one_way` (host, critical): a quorum of voters cannot reach the
+  host while the host's own rows, written after those failures began, still
+  mark a majority healthy. That is a one-way partition, in which the host may
+  never pause. Nothing is recovered differently; find the asymmetric link.
+- `vm_settled` / `ct_settled` (`<name>@<host>`, warning): a host came back
+  holding a copy of a workload that a decided recovery claim, whose
+  certificate verifies, gave to another host at the same incarnation and an
+  owner epoch at least its own, on a proof its destination completed, while
+  the destination's own runtime reports the workload running. The host
+  stopped its copy (a VM is destroyed, which keeps its definition and disks)
+  and wrote a `partition.settle` audit row. The leftover cleanup then handles the shut-off domain as usual.
+- `vm_settle_declined` (`<name>@<host>`, warning): the host runs a copy of a
+  VM whose row names another host, and settle declined to stop it for two
+  passes in a row. The evidence carries the `reason` (the clause of the proof
+  that is missing), what the host knows of its copy (`local`: incarnation,
+  owner epoch, and where it read them), and a `remedy`. The same is logged
+  once per kind of reason (`reason_class`, for example
+  `incarnation_unknown` or `destination_unreachable`) and again every 10
+  minutes while it lasts:
+  ```
+  partition-settle: declined to stop a local copy whose row names another host vm=<vm> row_host=<dest> reason_class=<class> reason="…" remedy="…"
+  ```
+  A common reason is `the local copy's incarnation is unknown`: an older
+  build defined the domain, so it carries no incarnation stamp. Settle does
+  not fall back to the domain UUID, because a live restore or a renamed
+  promote gives a new incarnation an earlier one's UUID.
+
+  The row naming another host is not proof on its own: a converged-wrong
+  `host_name` looks exactly the same. Before stopping anything, confirm which
+  copy is current. `lv cluster claim vm/<vm>` shows the decided claim and its
+  destination, and `virsh domstate <vm>` on that destination shows whether it
+  runs there. Only if the claim gave the VM to that host and it runs it there
+  is the local copy a superseded duplicate. Stop it on this host with
+  `virsh destroy <vm>`. Its disks are kept, but its definition and NVRAM are
+  removed on the next reconcile pass, because the leftover cleanup undefines
+  a destroyed domain whose row moved. Otherwise leave the local copy running.
+  The condition resolves once the copy is no longer declined.
 
 ### Observer stalled (`observer_stalled`)
 
@@ -1173,6 +1554,146 @@ domain may still hold state that can be resumed.
    managed-save image (`virsh dominfo <vm>` reports `Managed save: no`). Then
    run `virsh undefine --nvram <vm>` on that host. Use `--keep-nvram` instead
    if you want to keep the firmware variables.
+
+### Orphaned runtimes (`vm_orphan_runtime`, `ct_orphan_runtime`)
+
+Each host reports the workloads **litevirt created** that are still present on
+it while their record is gone: no live row on the host's replica, either missing
+or tombstoned. The subject is the workload **and** the host (`vm/<name>@<host>`,
+`container/<name>@<host>`, evaluator `orphan_runtime`), so each row has exactly
+one writer. The condition is replicated, so `lv health` on any node shows it.
+
+This is the gap the reconciler's self-fence and owner-assert leave by design:
+both decide from a workload's row, so a domain with no row gives them nothing to
+decide from. The lab case that motivated it was a stale delete that tombstoned a
+VM's row on every replica while the VM kept running on its real owner. Nothing
+else reported it.
+
+**What counts as litevirt's.** Only a runtime carrying litevirt's own stamp,
+never one guessed from a name:
+
+- a domain whose metadata holds the owner-epoch element
+  (`https://litevirt.dev/xmlns/owner-epoch/1`; check with
+  `virsh metadata <vm> https://litevirt.dev/xmlns/owner-epoch/1`)
+- a domain whose metadata holds the managed stamp
+  (`https://litevirt.dev/xmlns/managed/1`; check with
+  `virsh metadata <vm> https://litevirt.dev/xmlns/managed/1`)
+- a container with an owner-epoch marker at `<data_dir>/containers/<name>/owner_epoch`
+- a container with the managed stamp at `<lxcpath>/<name>/litevirt-managed`
+  (`/var/lib/lxc/<name>/litevirt-managed` by default)
+
+The evidence's `recognised_by` says which (`owner_epoch` or `managed_stamp`).
+
+**The managed stamp** is written by litevirt itself. On every reconcile pass
+(every container sweep, for containers) each host stamps every runtime it
+holds that has a **live row naming that host**, and nothing else. The stamp
+says only "litevirt manages this". It carries no ownership generation and
+gates nothing. It covers the runtimes the owner-epoch markers miss:
+
+- VMs created before owner-epoch markers existed
+- VMs whose row is still at the pre-epoch generation 0, because
+  `enforcement.owner_epoch` is off (the default)
+- shut-off VMs
+- containers (the owner-epoch marker is written only on relocation)
+
+A live row naming the host is the proof. It is what litevirt already manages
+the runtime by. The stamp then outlives the row, and that is when this report
+needs it. Stamping waits for a caught-up replica, as the report does. Both
+stamps are part of the runtime and go when it goes: undefining a domain drops
+its metadata, and `lxc-destroy` removes the container directory.
+
+Nothing older litevirt wrote proves more than this. The domain XML generator
+never emitted metadata, a title or a description. A name, or a disk path under
+`<data_dir>/disks/`, is a string anyone can reuse.
+
+A domain or container you created by hand is never stamped, because it never
+had a live row on that host. So it is never reported, even when it reuses a
+deleted VM's name and litevirt's disk paths. What stays unrecognised:
+
+- a litevirt runtime whose row was already gone before this release first ran
+  on its host
+- a runtime whose stamp is unreadable
+- a runtime on a container backend without stamp support
+
+A copy of a litevirt domain's XML (`virsh dumpxml` then `virsh define` under
+another name) carries its stamps with it. It is reported like the original.
+
+| Raised when | Clears when |
+|---|---|
+| Two consecutive reconcile passes (15 s apart) see a recognised runtime whose name has no live row: `row` is `missing` (no row at all) or `tombstoned`. A single sighting is never reported, because a delete in flight removes the runtime a moment before or after its tombstone lands. **Warning** severity while the runtime is running, **info** otherwise. The evidence carries `runtime_state`, `marker_epoch`, `row`, and for a tombstone the `row_host`, `row_owner_epoch` and `row_deleted_at` it last had. | The first pass that no longer sees it: the runtime is gone, or its name has a live row again. |
+
+Nothing is reported, and nothing is resolved, while the host's replica has not
+caught up after a restart or rejoin. Until then it cannot tell a row that is gone
+from one it has not received yet. See
+[Deferred out-of-band stop sync](#deferred-out-of-band-stop-sync-after-a-restart-or-rejoin).
+It is not an ownership condition and never blocks admission.
+
+The same runtimes are exported as `litevirt_orphan_runtime{kind,host,name,row}`,
+a gauge of 1 per orphan while it is reported:
+
+```promql
+# A workload litevirt created is running with no record.
+max by (host, name) (litevirt_orphan_runtime{row="tombstoned"}) > 0
+max by (host, name) (litevirt_orphan_runtime{row="missing"}) > 0
+```
+
+**Nothing reaps an orphan automatically.** The only tombstone that could prove a
+running workload is unwanted is one naming this host at the runtime's own owner
+epoch. The delete paths remove the runtime before they write that tombstone, so
+such a pair only appears after a crash or a replication anomaly, which is
+exactly when an automatic destroy is least trustworthy. The lab tombstone named
+a different host at an older epoch: it was decided against a runtime that no
+longer existed. Destroying the running VM on the strength of it would have acted
+on a stale decision.
+
+**Reaping one by hand.** On the host named in the subject:
+
+1. Run `lv health` and read the evidence. `row_host` and `row_owner_epoch` say
+   which host and generation the deleted record last named. A `row_owner_epoch`
+   below `marker_epoch` means the delete was decided against an older copy of
+   the workload, not the one still running. A runtime recognised by the managed
+   stamp has no marker epoch (`marker_epoch` is 0), so there is no generation
+   to compare. Judge it by `row_host` and `row_deleted_at`.
+2. Decide whether the workload is still wanted. If its deletion was intended
+   (`lv compose down`, `lv rm`, `lv ct rm`), reap it. If the record was lost
+   by accident, keep the runtime and copy its disks out before you do anything
+   else (`virsh domblklist <vm>` lists them). litevirt has no command that
+   re-adopts a running runtime into a new record, so the way back is a fresh VM
+   from those disks, for example with `lv import`.
+3. VM: `virsh destroy <vm>`, then `virsh undefine --nvram <vm>`. Undefine
+   leaves the disks in place; delete the files `domblklist` listed once you are
+   sure.
+   Container: `lxc-stop -n <name>`, then `lxc-destroy -n <name>` (which takes
+   the managed stamp with the container directory), then remove
+   `<data_dir>/containers/<name>/owner_epoch` if it exists.
+4. The next reconcile pass resolves the condition.
+
+### A VM's disk is missing on its own host (`vm_disk_missing`)
+
+A start on the VM's own host never boots it from a blank disk. This covers the
+onboot autostart, the restart of a VM the database says is running that is not
+in libvirt, and a start interrupted by a daemon restart. If the file at a
+disk's path is missing, the start refuses and the VM goes to `error`. The
+reconciler raises `vm_disk_missing` (evaluator `vm_disk`, subject
+`vm/<name>@<host>`, critical). It does not rebuild the disk from the VM's image,
+which would start the VM with its data silently reset. The evidence names the
+disk, its path and its backing image.
+
+Only an ownership transfer onto a host rebuilds a missing disk from its image:
+a VM rescheduled off a failed host, whose host-local disk stayed behind there
+(see [VM failure policies](migration-failover.md#vm-failure-policies)).
+
+| Raised when | Clears when |
+|---|---|
+| A start that is not an ownership transfer finds a disk's file missing. | The VM has left `error` on this host: it was started or stopped, rebuilt, deleted, or moved to another host. |
+
+To recover, do one of these:
+
+- If the disk still exists somewhere, for example on another host, in a
+  backup, or as a `.superseded-*` copy next to its path, put it back at the
+  path in the evidence and run `lv start <vm>`.
+- If its data is lost for good, run `lv rebuild <vm>`. It recreates the VM from
+  its spec with blank disks and keeps its IP and MAC addresses.
 
 ## NetBox IPAM: metrics and health findings
 

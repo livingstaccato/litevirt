@@ -179,6 +179,7 @@ func (s *Server) admitProjectLocal(ctx context.Context, method, project, princip
 		Workload: subject.Name, WorkloadKind: subject.Kind, WorkloadHost: subject.Host,
 		WantCPU: subject.Want.VCPU, WantMemMiB: subject.Want.MemMiB,
 		WantDiskGiB: subject.Want.DiskGiB, WantNIC: subject.Want.NIC,
+		Provisional: true,
 	}
 	resJSON, err := rv.Encode()
 	if err != nil {
@@ -194,18 +195,13 @@ func (s *Server) admitProjectLocal(ctx context.Context, method, project, princip
 		OperationKind:   string(corrosion.OpResourceUpdateRunning),
 		ReservationJSON: resJSON,
 	}
-	if err := corrosion.InsertOperation(ctx, s.db, op); err != nil {
-		return "", status.Errorf(codes.Internal, "reserve project capacity: %v", err)
-	}
-	if err := s.stampReservationAuthority(ctx, op.ID, project); err != nil {
-		s.releaseLocalLease(ctx, op.ID)
+	lease, err := s.decideReservation(ctx, op, project, "reserve project capacity", func(id string) error {
+		return s.checkProjectQuotaSettling(ctx, project, delta, id)
+	})
+	if err != nil {
 		return "", err
 	}
-	if err := s.checkProjectQuotaSettling(ctx, project, delta, op.ID); err != nil {
-		s.releaseLocalLease(ctx, op.ID)
-		return "", err
-	}
-	return op.ID, nil
+	return lease.id, nil
 }
 
 // checkProjectQuotaSettling is the quota check the AUTHORITY HOLDER makes: committed

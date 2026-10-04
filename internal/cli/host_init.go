@@ -93,6 +93,13 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 		}
 	}
 
+	// The cluster gossip key, minted beside the CA the first time and reused
+	// after. The new-cluster enforcement block enforces it from the start.
+	gossipKeyPath, _, err := ensureLocalGossipKey(pkiDir)
+	if err != nil {
+		return fmt.Errorf("gossip key: %w", err)
+	}
+
 	// 3. Generate host certificate
 	slog.Info("generating host certificate", "host", hostName, "address", hostAddr)
 	hostCertPath := filepath.Join(pkiDir, hostName+".crt")
@@ -122,6 +129,8 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 		{caPath, filepath.Join(remotePKIDir, "ca.crt"), 0644},
 		{hostCertPath, filepath.Join(remotePKIDir, "host.crt"), 0644},
 		{hostKeyPath, filepath.Join(remotePKIDir, "host.key"), 0600},
+		// 0600 for the same reason as host.key: whoever reads it speaks gossip.
+		{gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0600},
 	} {
 		if err := sc.CopyFileMode(f.local, f.remote, f.mode); err != nil {
 			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
@@ -214,6 +223,12 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return err
 	}
+	// The gossip key goes with ca.crt. A keyed cluster with no key here is a
+	// refusal now, before anything is minted or pushed.
+	gossipKeyPath, pushGossipKey, err := gossipKeyToPush(pkiDir, enforcement)
+	if err != nil {
+		return err
+	}
 
 	// Generate CLI client certificate if it doesn't exist
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
@@ -264,6 +279,11 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 			return fmt.Errorf("push %s: %w", filepath.Base(f.local), err)
 		}
 	}
+	if pushGossipKey {
+		if err := sc.CopyFileMode(gossipKeyPath, filepath.Join(remotePKIDir, pki.GossipKeyName), 0600); err != nil {
+			return fmt.Errorf("push %s: %w", pki.GossipKeyName, err)
+		}
+	}
 
 	// Push litevirtd binary
 	binPath, err := findDaemonBinary()
@@ -305,8 +325,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	// local database still contains its tombstone; starting it first lets its boot
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
-	if err := sc.RunWithInput(fmt.Sprintf("%s bash -s",
-		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement))), []byte(setupScript)); err != nil {
+	if err := sc.RunWithInput(remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
@@ -496,10 +515,15 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	if err := os.MkdirAll(remotePKIDir, 0700); err != nil {
 		return fmt.Errorf("create system PKI dir: %w", err)
 	}
+	gossipKeyPath, _, err := ensureLocalGossipKey(pkiDir)
+	if err != nil {
+		return fmt.Errorf("gossip key: %w", err)
+	}
 	for src, dst := range map[string]string{
-		caPath:       filepath.Join(remotePKIDir, "ca.crt"),
-		hostCertPath: filepath.Join(remotePKIDir, "host.crt"),
-		hostKeyPath:  filepath.Join(remotePKIDir, "host.key"),
+		caPath:        filepath.Join(remotePKIDir, "ca.crt"),
+		hostCertPath:  filepath.Join(remotePKIDir, "host.crt"),
+		hostKeyPath:   filepath.Join(remotePKIDir, "host.key"),
+		gossipKeyPath: filepath.Join(remotePKIDir, pki.GossipKeyName),
 	} {
 		data, err := os.ReadFile(src)
 		if err != nil {
@@ -528,7 +552,7 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	// local user to pre-create and no write-then-execute window.
 	cmd := execCommand("bash", "-s")
 	cmd.Stdin = strings.NewReader(setupScript)
-	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, localInitJoinPeers)...)
+	cmd.Env = append(os.Environ(), localInitSetupEnv(hostName, advertiseAddr)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -818,6 +842,41 @@ func classifyRemoteConfig(out string, runErr error) (string, bool, error) {
 	return out, false, nil
 }
 
+// foundingSetupEnv tells the setup script this node is founding a cluster, so it
+// may write the founder marker (genesisMarkerScript). Only `lv host init` sets
+// it. It is deliberately NOT in setupScriptEnv, which `lv host add` also uses:
+// an added node carrying it would mint its own admin credential and replace the
+// cluster's (colonelpanik/litevirt#186).
+const foundingSetupEnv = "LITEVIRT_GENESIS=1"
+
+// genesisMarkerScript writes or clears the founder marker in the data dir. The
+// daemon mints the cluster's first admin credential only while the marker
+// exists, and deletes it once it has. It is written only when founding AND the
+// data dir shows no sign of earlier membership: no state.db, so re-running
+// `lv host init` against a live member does not re-arm a mint for the day its
+// state.db is lost; and no capability latch (split_brain_activated.<token>),
+// which survives that loss, so a former member re-initialised with --force or
+// while its cluster is unreachable does not mint a second admin either. Every other
+// setup clears a marker left by a `host init` whose daemon never started.
+// LV_DATA_DIR exists for tests; the daemon's data_dir is /var/lib/litevirt.
+const genesisMarkerScript = `
+# Founder marker: licenses this node's daemon to mint the cluster's first admin.
+LV_DATA_DIR="${LV_DATA_DIR:-/var/lib/litevirt}"
+# Capability latches survive a state.db loss: a node holding one has run as a
+# member and is not founding anything.
+if [ "${LITEVIRT_GENESIS:-}" = "1" ] && [ ! -e "${LV_DATA_DIR}/state.db" ] && \
+   ! compgen -G "${LV_DATA_DIR}/split_brain_activated.*" > /dev/null; then
+    touch "${LV_DATA_DIR}/genesis-pending"
+else
+    rm -f "${LV_DATA_DIR}/genesis-pending"
+fi
+`
+
+// localInitSetupEnv is the setup environment for `lv host init --local`.
+func localInitSetupEnv(hostName, advertiseAddr string) []string {
+	return append(setupScriptEnv(hostName, advertiseAddr, localInitJoinPeers), foundingSetupEnv)
+}
+
 // setupScriptEnv is the environment the setup script reads to write the daemon
 // config. One place, so the local and remote paths cannot disagree about it —
 // they already had, which is how the local path shipped with no advertise_address.
@@ -849,7 +908,21 @@ func remoteInitSetupCommand(hostName, hostAddr, targetCfg string) string {
 	if block == "" {
 		block = newClusterEnforcement
 	}
-	return shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block)) + " bash -s"
+	// foundingSetupEnv: `lv host init` founds a cluster, so the script may write
+	// the founder marker. setupScriptEnvWith is shared with `lv host add`, which
+	// must never carry it.
+	env := append(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block), foundingSetupEnv)
+	return shellEnvPrefix(env) + " bash -s"
+}
+
+// remoteAddSetupCommand is the command line `lv host add` runs the setup script
+// under. peersYAML is built from hosts.address, a replicated, peer-writable
+// column, and sshd runs this line through the login shell, so every value MUST
+// go through shellEnvPrefix. It is a function of its own so a test can run the
+// exact line HostAdd sends through a real shell.
+func remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement string) string {
+	return fmt.Sprintf("%s bash -s",
+		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)))
 }
 
 // readPeerConfig reads an existing cluster node's daemon config over SSH. It
@@ -936,7 +1009,8 @@ func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) 
 		// advertised only while a host's enforcement.* flag is on, so a host
 		// added with a config missing the block silently weakens the cluster.
 		// A re-admitted signer with no enforcement.audit_signature wrote
-		// unsigned audit rows reported as tampering cluster-wide (2026-08-01).
+		// unsigned audit rows reported as tampering cluster-wide (2026-08-01),
+		// back when the flag defaulted off; it still carries an explicit false.
 		// Base64: the remote path joins this env into one shell command line,
 		// so a multi-line YAML block must travel as a single token.
 		"ENFORCEMENT_B64=" + base64.StdEncoding.EncodeToString([]byte(enforcement)),
@@ -944,8 +1018,15 @@ func setupScriptEnvWith(hostName, advertiseAddr, joinPeers, enforcement string) 
 }
 
 // newClusterEnforcement is the enforcement block a brand-new cluster starts
-// with. Only the two shared-storage protections: every other flag stays at its
-// documented default here, because this is a safety floor, not a policy.
+// with. The two shared-storage protections, and gossip encryption: every other
+// flag stays at its documented default here, because this is a safety floor,
+// not a policy.
+//
+// Gossip encryption is on the floor for the same reason as the fences: an
+// existing cluster has to walk it on in three rolling restarts because nodes
+// two stages apart cannot gossip, but a new cluster has no plaintext node to
+// stay compatible with. `lv host init` mints the key and `lv host add` pushes it
+// with this block, so every host starts enforced together.
 //
 // Default-off is the right design for an EXISTING cluster — a flag flip must
 // never change behaviour mid-roll, which is what the monotone latch buys. It is
@@ -964,6 +1045,8 @@ const newClusterEnforcement = `enforcement:
                               # proof (` + "`lv host fence-confirm`" + `) before reschedule/promote
   shared_storage_fence: true  # an ownership transfer of a writable shared disk needs a
                               # proof-grade fence of the source host
+  gossip_encryption: true     # gossip is encrypted with pki_dir/gossip.key, and anything
+                              # unencrypted or under another key is dropped
 `
 
 // enforcementYAML decides what enforcement block a host being initialised
@@ -1081,7 +1164,7 @@ echo "Enabled libvirtd TLS (port 16514)"
 # Create litevirt directories
 mkdir -p /var/lib/litevirt/{images,disks,cloudinit}
 mkdir -p /etc/litevirt
-
+` + genesisMarkerScript + `
 # Libvirt storage pools are auto-created by litevirtd on startup
 # (from storage_pools config or a default local pool).
 

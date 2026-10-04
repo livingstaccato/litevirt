@@ -161,12 +161,13 @@ func TestContainerRelocate_DoesNotClobberASameNameContainerOnTheSurvivor(t *test
 	ctx := context.Background()
 	const name = "ct-samename"
 
-	// Three nodes are needed for a fencing quorum (liveHosts/2+1), but the
-	// scenario needs exactly ONE relocation candidate — otherwise the coordinator
-	// simply picks the uncontended host and the collision is never reached. Parking
-	// the spare out of "active" keeps it counting as an observer while removing it
-	// from healthyHosts.
-	if err := corrosion.UpdateHostState(ctx, a.DB, spare.Name, "maintenance"); err != nil {
+	// Three nodes are needed for a fencing quorum (voters/2+1), but the scenario
+	// needs exactly ONE relocation candidate — otherwise the coordinator simply
+	// picks the uncontended host and the collision is never reached. Draining the
+	// spare keeps it a voter (a draining host still votes) while removing it from
+	// healthyHosts, which takes only active hosts. A host in maintenance would not
+	// do: it is not a voter, so its observation no longer counts toward quorum.
+	if err := corrosion.UpdateHostState(ctx, a.DB, spare.Name, "draining"); err != nil {
 		t.Fatalf("park the spare host: %v", err)
 	}
 

@@ -1458,6 +1458,7 @@ func TestHostStateBadge(t *testing.T) {
 		{pb.HostState_HOST_ACTIVE, "active"},
 		{pb.HostState_HOST_DRAINING, "draining"},
 		{pb.HostState_HOST_SUSPECT, "suspect"},
+		{pb.HostState_HOST_JOINING, ">joining<"},
 	}
 	for _, tt := range tests {
 		badge := hostStateBadge(tt.state)
@@ -1504,9 +1505,9 @@ func TestClusterStats(t *testing.T) {
 	const giB = int64(1024 * 1024 * 1024)
 	hosts := []*pb.Host{
 		{State: pb.HostState_HOST_ACTIVE, CpuTotal: 16, CpuUsed: 8, MemTotalMib: 32768, MemUsedMib: 16384,
-			// Allocated (DiskUsedGib) is intentionally large to prove the
+			// Allocated (DiskAllocatedGib) is intentionally large to prove the
 			// aggregate uses actual statfs usage, not allocation.
-			DiskUsedGib: 9999,
+			DiskAllocatedGib: 9999,
 			StoragePools: []*pb.StoragePool{
 				{Target: "/data", UsedBytes: 100 * giB, TotalBytes: 400 * giB},
 			}},

@@ -130,6 +130,19 @@ binding can:
   calls (an entry-node forward, cross-host replication, auto-promote) authenticate as a
   cluster host cert and bypass this tenant check — a deliberate peer-trust boundary:
   any known cluster host cert can reach pool contents via these RPCs.
+- **Security groups** (`sg.write`: `lv sg create/rm/rule-add/rule-rm`) are
+  cluster-global, bound to NICs by name, and checked at `/`. Admin and
+  NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to
+  a NIC (`lv sg bind`) is `network.update` on the VM's own path.
+- **Backup repository maintenance** (`backup.verify`, `backup.gc`,
+  `backup.prune`, `backup.sync`) is checked at `/`. These are the
+  `VerifyBackupRepo`, `GarbageCollectBackupRepo`, `PruneBackupRepo` and
+  `SyncBackupRepo` RPCs, which the web UI's `/backups` actions call. A repo holds
+  every project's backups, so a project-scoped grant cannot reach it. Operator
+  and BackupOperator hold all four through `backup.*`. Viewer holds none:
+  `backup.verify` is deliberately not a `*.read` verb, because a verify re-reads
+  every chunk in the repo. Without bindings the floor is `operator`. See
+  [backups.md](backups.md#repo-maintenance-rpcs).
 - **Networks** (`network.create`, `network.delete`) and **resource mappings**
   (`resourcemap.*`, PCI/device pools) are cluster-global, checked at `/`.
 - **Acknowledging a contested leader-lease term**
@@ -349,6 +362,51 @@ root-obtained *node* identity. What this model closes is that a **distributable*
 credential (the shared CLI client cert) does not equal admin: hand someone CLI
 reach and they still need to `lv login` to act.
 
+### Recovering the admin account (`lv user reset-admin`)
+
+`lv user reset-admin` is for the cluster nobody can log in to, so it takes no
+credential. It runs as root on a node and gives the existing `admin` account a
+new random password, written to `/etc/litevirt/admin-password` (mode 0600). It
+never creates an admin: on a node with no live admin it refuses, because a
+joining node's credential replicates in and a deleted admin stays deleted.
+
+Every reset is audited as `user.reset-admin`, attributed to `root@<host>`, with
+target `admin` and a detail of `via=<channel> os_user=<who>`. `os_user` is
+`SUDO_USER` when set, otherwise the login name. The CLI reports it and the daemon
+records it as a claim, not as an authenticated identity. No password and no hash
+is ever written to the row. The CLI mints the password, keeps it, and sends only
+its bcrypt hash.
+
+**With the daemon running**, the command calls the `ResetAdminPassword` RPC over
+the host's local root channel. It dials `127.0.0.1` on the daemon's gRPC port and
+presents this host's own certificate from `pki_dir`, with no bearer. It ignores
+`LV_HOST`, `LV_TOKEN`, a stored `lv login` session and a CLI client bundle, since
+any of those would make the call arrive as someone else. The daemon accepts the
+call only from a **local-root** principal whose certificate CN is its own host
+name. A peer's certificate (even over loopback), an admin session, an API token
+and the distributable `lv-cli` certificate are all refused with
+`PermissionDenied`. Holding a session is not the same as being root on the node.
+The daemon also refuses a hash that is not bcrypt or is below the cluster's cost.
+It writes the reset and the audit row itself, as `via=local-root`.
+
+**With the daemon down**, the command falls back to writing the reset straight
+into the local database. It records the audit entry in the host-local
+pending-audit journal (`<data_dir>/pending-audit/`), and the daemon folds the
+entry into the audit log once it is running. The row is signed (whenever the
+host signs, which is the default) and carries the
+time the reset actually happened, with `via=journal`. The journal entry is
+written before the reset and updated with the outcome after, all under the
+journal's lock. A reset that cannot be journalled is not made. A command that
+died in between leaves the result `interrupted`. The mechanism is described in
+[audit-log.md](audit-log.md#actions-taken-while-the-daemon-is-down).
+
+The fallback is taken only when the daemon cannot be reached (`Unavailable`) or
+is too old to have the RPC (`Unimplemented`). Any other answer, a refusal
+included, is returned as it is. A timeout is returned too, not retried locally,
+because the daemon may already have applied the reset and a second one would
+leave the password file and the database disagreeing. Why the CLI may not simply
+write its own audit row is in [audit-log.md](audit-log.md#actions-taken-while-the-daemon-is-down).
+
 ### Enforcement (`auth.strict_mtls_identity`)
 
 Denial of bearerless `client` certs is off by default and gated by both the
@@ -430,3 +488,220 @@ it to impersonate a user.
 > `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
 > peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
 > `PushReplicaIncrement`. Not enforced today.
+
+### Who can read the state dump
+
+`GetStateDump` and `StreamStateDump` return the full replication dump, the
+representation anti-entropy repair merges, and `StreamTableDump` returns the
+same representation restricted to named tables. It is unredacted, so it carries
+the secret columns of replicated tables: `hosts.ipmi_pass`,
+`users.password_hash` and `tokens.token_hash`. Once every host runs a build
+carrying the `credentials_split_v1` capability, each host also writes those
+secrets to `host_fence_credentials`, `user_credentials` and
+`token_credentials`, which only the sensitive lane below carries. This release
+keeps writing the three old columns too, so a host still reading only those
+columns (one on the previous release, including one rolled back and under WAL
+quarantine) reads current secrets. The state dump therefore **still carries
+the secrets**. Clearing the old columns, after which the dump carries none, is a
+later release's step (see
+[upgrades.md](upgrades.md#secrets-move-to-the-sensitive-lane-after-the-roll) and
+[design/credentials-clear.md](design/credentials-clear.md)).
+All three RPCs stay peer-only regardless: only a **peer** or **local-root**
+caller (a cluster host certificate) can read them. An operator or admin bearer,
+a session, and the `lv-cli` client certificate are all refused with
+`PermissionDenied`, whatever their role. `StreamTableDump` never serves a table
+of the sensitive lane below; naming one is refused with `InvalidArgument`.
+The secret-bearing tables (`StreamSensitiveStateDump`, `GetSensitiveStateDigest`)
+are narrower still: peer only, and the certificate must name the sender.
+`GetTableBucketDigests`, which returns per-bucket counts and hashes for public
+and sensitive tables alike so anti-entropy can pull only the buckets that
+differ, has the same rule, as does `StreamSensitiveTableRows`, the paged form
+of the sensitive dump. `StreamTableRows`, the paged form of
+`StreamTableDump`, is peer-only and refuses a sensitive table exactly as that
+RPC does.
+
+Operators see convergence without row contents. `GetStateDigest` and
+`GetClusterStateDigest` return per-table counts and hashes to an `operator`
+bearer; `lv cluster converge` and the UI's **Force Sync** button call
+`TriggerAntiEntropy`, which schedules a repair pass between the peers and returns
+no state. `lv doctor divergence` (admin) has the connected node fetch each peer's
+dump with its own host certificate, and returns only table names, primary keys
+and row hashes — keyed HMAC labels for the secret-bearing tables.
+
+## Gossip encryption
+
+Everything above rides mTLS gRPC. Gossip does not: memberlist (`gossip_port`,
+7946, TCP and UDP) speaks its own protocol, and it carries the membership that
+relay election, replication targets, anti-entropy and capability activation all
+count. [Admission](operating-model.md#gossip-admits-only-known-hosts-and-is-authenticated-only-when-encrypted)
+refuses names that are not in the `hosts` table, but names and addresses are not
+secrets. What authenticates gossip is a cluster-wide AES-256 key:
+memberlist encrypts every packet and stream with it (AES-GCM), and a node that
+enforces it drops anything unencrypted or under a key it does not hold.
+
+**An unauthenticated gossip segment is not supported.** Until every host runs
+`enforcement.gossip_encryption: true`, anyone who can reach `gossip_port` can
+read the membership, announce a real host's name from its address, or disturb
+failure detection. Keep the port on a network only cluster hosts can reach until
+the rollout below is finished, and firewalled after it: the key is one shared
+secret, so every host holding it can speak for any member, and a removed host
+keeps what it knew until the key is rotated.
+
+### The key file
+
+`/etc/litevirt/pki/gossip.key` (`<pki_dir>/gossip.key`) on every host, mode
+0600, beside `ca.crt`. One base64 32-byte key per line; the **first** encrypts,
+**every** key decrypts; `#` lines are comments. The daemon refuses a file that
+group or other can read, a key that is not 32 bytes, and a duplicate.
+
+It is distributed exactly as the CA certificate is — pushed over SSH from the
+machine that holds the CA, which keeps the canonical copy in its CLI PKI
+directory (`~/.config/litevirt/pki/gossip.key`):
+
+- `lv host init` mints it next to the CA and pushes it; `lv host add` pushes it
+  alongside `ca.crt`, and refuses to add a host to a cluster whose enforcement
+  block keys gossip when this machine has no key to give it;
+- `lv host install-gossip-key` gives an existing cluster one;
+- `lv host rotate-gossip-key` replaces it.
+
+The key is never written to `config.yaml`, the replicated database (and so never
+to a state dump) or a log. Logs, the CLI and the state file below name keys by a
+16-hex-digit ID, a truncated domain-separated SHA-256 that cannot be reversed.
+If the CA machine loses its copy, copy any host's `gossip.key` back, mode 0600.
+
+The daemon re-reads `gossip.key` every 5 seconds and applies a changed keyring
+**without a restart**. A missing, loose or unparseable file is logged and
+ignored — the keys in use are kept, because an empty keyring would mean
+plaintext. It reports what it is USING to
+`/etc/litevirt/pki/gossip-keyring.state`:
+
+```
+mode=enforced
+primary=3f1c9e0a7b2d4c61
+keys=3f1c9e0a7b2d4c61
+rejected=0
+```
+
+`primary` is the keyring's first key, and `keys` every key it decrypts with,
+primary first. `primary` is set at every stage but `false` — `install` too, where
+the host holds the key but still **sends plaintext** — so it says which key the
+host encrypts with *once its stage sends encrypted*, not that it is encrypting;
+`mode` says that. `lv host install-gossip-key` reports each host from both:
+
+| `mode` | Reported as |
+|---|---|
+| `off` | `off (gossip plaintext; key file ignored)` |
+| `install` | `install, sending plaintext, accepting plaintext and <keys>` |
+| `staged` | `staged, encrypting with <primary>, accepting plaintext and <keys>` |
+| `enforced` | `enforced, encrypting with <primary>, accepting only <keys>` |
+
+`rejected` counts gossip this node dropped since it started for being
+unencrypted or under a key it does not hold. It should stay flat through every
+step below; a rising count is a peer this node cannot hear.
+
+### The flag
+
+`enforcement.gossip_encryption` defaults to `false`. Its values are four stages:
+
+| Stage | Keyring | Sends | Accepts |
+|---|---|---|---|
+| `false` | none (the file is not read) | plaintext | plaintext |
+| `install` | loaded | plaintext | plaintext and encrypted |
+| `staged` | loaded | encrypted | plaintext and encrypted |
+| `true` | loaded | encrypted | encrypted only |
+
+Two nodes gossip with each other exactly when their stages are **adjacent** in
+this table. Two apart cannot: a `staged` node is unreadable to a `false` one, and
+a `true` node is deaf to an `install` one. That is the whole rollout rule — each
+rolling restart moves every host one stage, and each finishes on **every** host
+before the next begins. `install` is the stage it is tempting to skip; skipping
+it makes the first `staged` host unreadable to every host with no keyring yet.
+
+Every value but `false` refuses to start without a usable `gossip.key`, rather
+than come up in plaintext under a flag that says otherwise. The stage is read
+once at startup (memberlist fixes it for the life of the process); the keys are
+not. A new cluster's enforcement block from `lv host init` sets it to `true`:
+there is no plaintext host to stay compatible with.
+
+There is no capability token for this flag, deliberately. The guarantee is
+enforced by the **receiver**, locally: a `true` node drops what it cannot
+authenticate, whatever its peers believe, so no node relies on a peer honouring
+anything. A mis-staged pair loses gossip between the two of them — an
+availability problem, visible in `rejected` and in membership — never a data
+problem, since replication rides mTLS gRPC. A latch could not drive the rollout
+either: memberlist cannot change stage under a running process, so it would take
+effect at the next restart, which is the rolling restart the sequence already is.
+
+### Turning it on in an existing cluster
+
+Every host must first run a build that has this flag: a host on an older build
+ignores the key and stays plaintext, so the `staged` roll would cut it off.
+
+1. From the machine that holds the CA, install the key everywhere. Nothing
+   changes on the wire yet:
+
+   ```bash
+   lv host install-gossip-key
+   ```
+
+2. On each host in turn, set the stage and restart, waiting for the host to be
+   back before moving on:
+
+   ```bash
+   # /etc/litevirt/config.yaml
+   enforcement:
+     gossip_encryption: install
+   ```
+
+   ```bash
+   systemctl restart litevirt
+   lv host ls                            # the host is back and active
+   cat /etc/litevirt/pki/gossip-keyring.state   # mode=install
+   ```
+
+   When **every** host is done, `lv host install-gossip-key` again: it writes
+   nothing and lists every host's stage. All must read `install`.
+
+3. The same roll with `gossip_encryption: staged`. All must read `staged`, and
+   `rejected` must be flat on every host.
+
+4. The same roll with `gossip_encryption: true`. All must read `enforced`, with
+   `rejected` still flat. Gossip is now authenticated.
+
+Do not add hosts in the middle of a roll: `lv host add` copies the enforcement
+block of the node it reads, and a host more than one stage from any peer cannot
+gossip with it. Rolling back is the same walk in reverse — `staged`, then
+`install`, then `false`, each on every host — never a jump of two.
+
+### Rotation
+
+```bash
+lv host rotate-gossip-key               # --grace 30s --timeout 2m
+```
+
+Run from the machine that holds the cluster's gossip key, with every host
+reachable over SSH and its daemon running. No restart. memberlist encrypts with
+the primary and decrypts with any installed key, so a new key must be on every
+host before any host encrypts with it, and every host must stop encrypting with
+the old one before any host drops it. The command does it in three phases, and
+each waits for every host's state file to report the phase **loaded** — not just
+the file written — before the next:
+
+1. `[old, new]` — the new key is accepted everywhere; the old one still encrypts;
+2. `[new, old]` — the new key encrypts; the old one is still accepted, for `--grace`;
+3. `[new]` — the old key is removed.
+
+"Add the new key as primary, then remove the old" in two steps is the tempting
+shortcut, and it cuts off every host that has not loaded the new key yet for as
+long as that takes.
+
+If the rotation stops part-way — a host down, a phase that times out, Ctrl-C —
+the cluster is safe as it stands, and the error names the host. Fix it and run
+the command again: finding hosts on different keyrings, it puts them all back on
+this machine's copy and then settles on that copy's primary alone (the new key
+if phase 2 had started, the old one otherwise), and stops. Run it once more to
+rotate. A host that is `false` takes the new file without being waited on; it
+loads whatever is current when its stage changes.
+
+Rotate after removing a host you no longer trust, after any suspected exposure
+of a `gossip.key`, and periodically.

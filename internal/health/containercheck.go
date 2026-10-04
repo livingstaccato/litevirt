@@ -57,6 +57,9 @@ type ContainerChecker struct {
 	// SetGate. onGateRefused feeds the refusal metric (nil-safe).
 	gate          runtimeGate
 	onGateRefused func(action, reason string)
+	// recoveryClaimGate verifies a relocation proof's recovery-claim
+	// certificate before it is claimed. See SetRecoveryClaimGate.
+	recoveryClaimGate RecoveryClaimGate
 	// onStateWriteFail observes an authoritative state write that failed (nil-safe);
 	// wired to the litevirt_state_write_failures_total counter by the daemon.
 	onStateWriteFail func(op, class string)
@@ -77,6 +80,12 @@ type ContainerChecker struct {
 	// (<root>/<name>/owner_epoch). Empty disables marker writes (fixture
 	// checkers that predate markers); the daemon wires the real path.
 	containersRoot string
+
+	// replicaCaughtUp, orphans and onOrphans serve the orphan-runtime report
+	// (orphan_runtime.go). A nil replicaCaughtUp is unwired and trusted.
+	replicaCaughtUp func() (bool, string)
+	orphans         orphanReporter
+	onOrphans       func(kind string, orphans []OrphanRuntime)
 }
 
 // NewContainerChecker creates a container reconciler/restart engine for the
@@ -99,6 +108,13 @@ func (c *ContainerChecker) SetGuardedContainerRekeyActive(fn func() bool) {
 
 // SetGate injects the split-brain safety gate (the health.Checker).
 func (c *ContainerChecker) SetGate(g runtimeGate) { c.gate = g }
+
+// SetRecoveryClaimGate injects the executor-side certificate check for a
+// relocate-recreate proof (grpcapi's RecoveryClaimGateForPendingProof). A
+// relocate-recreate row is only ever written by the failover coordinator, so
+// under enforcement its proof always needs a certificate. nil leaves the path
+// as it was before recovery claims.
+func (c *ContainerChecker) SetRecoveryClaimGate(fn RecoveryClaimGate) { c.recoveryClaimGate = fn }
 
 // SetGateRefusedObserver wires the refusal metric hook (nil-safe).
 func (c *ContainerChecker) SetGateRefusedObserver(fn func(action, reason string)) {
@@ -202,6 +218,10 @@ func (c *ContainerChecker) sweep(ctx context.Context) {
 	// a re-key (which transfers the container's leases to us) isn't racing a GC of
 	// those same leases.
 	c.assertContainerOwnership(ctx)
+	// Stamp every local container with a live row here, then report litevirt
+	// containers with no live row anywhere. Neither touches the runtime.
+	c.adoptManagedContainers(ctx, cts)
+	c.reportOrphanContainers(ctx)
 
 	// GC IPAM leases stranded by a crash between allocating a lease and persisting
 	// the container row (an orphan lease — owner with no live container row). The
@@ -413,6 +433,15 @@ func (c *ContainerChecker) claimRelocationProof(ctx context.Context, ct corrosio
 		c.noteGateRefused(corrosion.ActionRelocate, ReasonStaleEpoch)
 		return "", false
 	}
+	// Recovery claims (docs/design/recovery-claims.md §3.10): before the claim.
+	if c.recoveryClaimGate != nil {
+		if reason, cerr := c.recoveryClaimGate(ctx, pr); cerr != nil {
+			slog.Warn("containercheck: relocation proof refused — no recovery-claim certificate verifies",
+				"container", ct.Name, "proof", pr.ID, "reason", reason, "error", cerr)
+			c.noteGateRefused(corrosion.ActionRelocate, reason)
+			return "", false
+		}
+	}
 	if err := corrosion.ClaimActionProof(ctx, c.db, pr.ID, c.hostName); err != nil {
 		reason := ReasonProofTerminal
 		if !errors.Is(err, corrosion.ErrProofSpent) {
@@ -523,8 +552,27 @@ func (c *ContainerChecker) checkContainer(ctx context.Context, ct corrosion.Cont
 				if !ok {
 					return // proof missing/mismatched/terminal — refuse (already logged/metered)
 				}
+				// The start checkpoint, appended only if this host has not
+				// abandoned the proof (docs/design/recovery-claims.md §3.12):
+				// the database, not the sweep's lock alone, decides between a
+				// recreate and an operator release (`lv cluster claim-release`).
+				if err := corrosion.AppendProofStepUnlessAbandoned(ctx, c.db, id, "start_attempted"); err != nil {
+					if errors.Is(err, corrosion.ErrProofAbandoned) {
+						slog.Warn("containercheck: this host abandoned the relocation proof and will never execute it",
+							"container", ct.Name, "proof", id)
+						c.noteGateRefused(corrosion.ActionRelocate, ReasonClaimLost)
+						return
+					}
+					slog.Warn("containercheck: record the relocation's start checkpoint failed, retrying",
+						"container", ct.Name, "proof", id, "error", err)
+					return
+				}
 				proofID = id
 			}
+		}
+		if c.hostLacksContainerRuntime(ctx) {
+			c.failRelocationWithoutRuntime(ctx, ct, proofID)
+			return
 		}
 		c.recreateRelocated(ctx, ct)
 		// If materialized (marker cleared), mark the proof terminal (single-use).

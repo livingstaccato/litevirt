@@ -74,18 +74,125 @@ of acting — it says nothing about whether the resulting rows have replicated.
   advancing past the write, or `lv cluster converge` reporting matching digests
   — rather than assuming a healthy cluster implies it did.
 - **Anti-entropy** (`internal/corrosion/antientropy.go`) runs every 60 s
-  and is the safety net for divergence the WAL replicator missed. Public,
-  operator-readable state uses `StreamStateDump`; eligible secret-bearing config
-  uses a separate peer-mTLS-only sensitive dump. The older unary `GetStateDump`
+  and is the safety net for divergence the WAL replicator missed. A scheduled
+  pass does not contact every peer: it contacts this node's relays (a leaf's
+  assigned pair, or a relay's fellow relays) plus two other peers, taken in
+  turn from a random ordering of the rest. With M non-relay peers every peer
+  is reached within any 2·⌈M/2⌉−1 consecutive passes. Public,
+  operator-readable state is repaired table by table: a pass pulls only the
+  tables whose digests disagreed (`StreamTableDump`, which adds the parent rows a
+  child table's merge checks against), and falls back to the full
+  `StreamStateDump` against a peer too old to serve it; eligible secret-bearing config
+  uses a separate peer-mTLS-only sensitive dump. Within a table that disagrees,
+  the pass asks the peer for the table's 256 bucket digests
+  (`GetTableBucketDigests`) and pulls only the buckets that differ, a child
+  table's parent narrowed to the same buckets; a peer without that RPC gets the
+  whole table. The pull itself is paged (`StreamTableRows`: at most 1,000 rows
+  or 1 MiB of rows a message, merged as each arrives), with the blob
+  `StreamTableDump` as the fallback for a peer without it. A table's digest is
+  kept between passes (never for `lv cluster converge`, which has every host
+  scan) until a row of it
+  changes (at most 10 minutes), so a pass rescans only the tables written since
+  the last one ([design/ae-incremental.md](design/ae-incremental.md)). Observation tables
+  (`host_health`, `health_evaluator_status`, `host_capacity_observations`),
+  whose writers re-publish them every few seconds to a minute, are pulled by a
+  scheduled pass at most once per 5 minutes per node; control-state drift in
+  the same exchange is pulled at once. A table held apart from a peer only by
+  unresolved ties this node already tracks, proven by the pull before, is not
+  pulled again until either side's digest moves. A node whose replica is not caught up,
+  and `lv cluster converge`, pull everything that disagrees. The older unary `GetStateDump`
   is retained as a fallback for mixed-version clusters. Convergence is automatic;
   `lv cluster converge` only *accelerates* it (kicks an immediate anti-entropy
-  pass) and *verifies* it (cross-host digest report) — it never exports or merges
+  pass, which contacts every peer rather than a sample) and *verifies* it (cross-host digest report) — it never exports or merges
   redacted state itself.
+
+- **A host's state has its own clock.** Replication applies a write only if it
+  is newer than the row it lands on, so two writes to different columns of one
+  row are not independent: the host that applies the newer one first refuses
+  the older one. A host's state and isolation epoch are decided by the
+  coordinator, by operators and by the peers that isolate it, and they are
+  read from `host_membership`, one row per host with its own `updated_at`,
+  apart from the version, schema and resources the host reports about itself
+  in `hosts`. A fence and a concurrent version report therefore both land on
+  every host. The `hosts` row keeps a copy of state and isolation, written in
+  the same batch, for a host rolled back one release; that copy can still lose
+  a concurrent write, exactly as before, and no reader ever takes it over the
+  `host_membership` row. A state change made through a host that is not yet
+  writing `host_membership` (mid-roll, or rolled back one release) is absorbed
+  into it by every host that applies that change, the writer included, and
+  reaches any host that missed it by anti-entropy. State and isolation share their row
+  with each other, and a host's operator-set configuration (fence strategy,
+  role, region) shares the `hosts` row with its self-reports. On a cluster that
+  has not finished rolling to a build carrying `host_membership_split_v1`,
+  state is read from `hosts.state` and a state change can lose to a concurrent
+  report — see
+  [upgrades.md](upgrades.md#host-state-moves-to-its-own-row-after-the-roll).
 
 ### HA / Failover
 - **Quorum-gated fencing.** A host is fenced only after `floor(N/2)+1` fresh
-  observers report `consecutive_failures ≥ 5` for it (where N is non-offline
-  active hosts). Stale observer rows (older than 30 s) are excluded.
+  observers report `consecutive_failures ≥ 5` for it, where N is the voter
+  set (see *The voter set is explicit once genesis has run*, below). Stale
+  observer rows (older than 30 s) are excluded. Under region-scoped failover
+  (`lv cluster failover-scope region`) N and the observers are the members of
+  the voter set in the host's own region instead; see "A site partition" below.
+- **The voter set is explicit once genesis has run.** Every quorum — the fence
+  quorum, the recovery quorum and `DecisionGate`'s quorum proof — counts over
+  one voter set. Until the cluster has a voter generation, that set is derived
+  from host state: every host not `offline`, `maintenance` or `fenced`,
+  witnesses included, in every region. A derived set is only as agreed as
+  replication, so two coordinators can count different denominators
+  (colonelpanik/litevirt#251). Once `voter_config_v1` has latched and every
+  host is voting-eligible and reachable, the leader-lease holder decides
+  **generation 1** of an explicit set, unanimously; each host adopts it once
+  its certificate — a signed accept from every member — verifies. From then on
+  the voter set is that generation's members and nothing else: a member that
+  goes `offline`, into `maintenance` or is fenced still counts in every
+  denominator until it is removed. It changes only through a decided change —
+  `lv cluster voter add` / `rm`, one member per generation, decided by a
+  majority of the current generation, or `lv cluster voter reset`, which
+  returns every host to the derived set at one generation. No flag changes it.
+  `lv host rm` of a current voter is refused; `lv host rm --dead <host>` removes
+  a voter that is fenced proof-grade and gone for good, taking it out of the
+  voter set first. While genesis cannot run, the
+  `ha.voter.genesis_pending` health condition names each host holding it back;
+  `lv cluster voter init --members` is the fallback for a cluster that cannot
+  become clean. A voter whose state database was recreated (re-imaged or
+  reseeded) abstains from every decision until it is removed and re-added:
+  `lv cluster voter ls` shows it. `ha.voter.unavailable` names every member
+  that is fenced, offline, removed or abstaining, with the command that removes
+  it — there is no automatic shrink, so each one is fault tolerance the cluster
+  does not have. Once a majority of the voters is gone for good no decided
+  change can succeed, and `lv cluster voter force-reconfigure --lost <hosts>` is
+  the audited break-glass: every named host must be fenced proof-grade, it is
+  refused while a majority is actually reachable, and `ha.voter.forced` stays
+  raised until each lost host is removed with `lv host rm --dead`. Capability
+  latches still count voting-eligible hosts by state, so a fenced member cannot
+  hold every future latch off. Design:
+  [design/recovery-claims.md](design/recovery-claims.md) §4.
+- **Recovery is a decided claim when recovery claims are enforced.** The lease
+  and `DecisionGate` cannot stop two coordinators that each believe they lead
+  from each authorizing a destination for the same workload. With
+  `enforcement.recovery_claim: true` on every host, `recovery_claim_v1`
+  latched and a voter generation adopted, a reschedule, promote or container
+  relocation is minted only once a majority of the voter set has certified it —
+  a single-decree Paxos decision per (workload, owner epoch, attempt) — and the
+  destination verifies that certificate against its own replica and the
+  cluster CA before it executes (`recovery_claim_unproven` otherwise). Each
+  voter probes the recorded owner before it accepts and refuses while it can
+  reach it (`recovery_claim_owner_reachable`), so a host most voters can reach
+  is never recovered, whatever the coordinator's health view. The loser of a
+  duel writes the winner's proof and nothing naming itself. A recovery decided
+  for a destination that then died is stranded (`ha.claim.stranded`) until the
+  destination returns or is removed with `lv host rm --dead`; the claim then
+  moves to the next attempt. `lv cluster claim <kind>/<name>` shows every
+  voter's state for a stuck claim. **A partial stand-down is the hazard, not a
+  degraded mode:** a host with the flag off mints and executes uncertified
+  proofs. The token is advertised only while the flag is on, so a stood-down
+  host drops it from its capabilities — its enforcing peers raise
+  `ha_degraded` (unsupported member) — and, having latched it, reports it in
+  `PingResponse.not_enforcing`. The full stand-down is the flag off on every
+  host and a restart; the voter set and the voters' history are unchanged.
+  Design: [design/recovery-claims.md](design/recovery-claims.md).
 - **Leader-gated recovery — best-effort, not exclusive.** The lease is a CRDT
   row with a 45 s TTL, re-validated before every destructive action. A CRDT row
   store cannot offer linearisable compare-and-swap across a partition, so the
@@ -117,28 +224,36 @@ of acting — it says nothing about whether the resulting rows have replicated.
   — it resyncs by anti-entropy, not log replay.
 - **No double-fencing.** Once a successful fence is recorded in `fencing_log`
   (or operator confirmation under manual strategy), no coordinator will
-  re-fence the same host within a 5-minute window.
+  re-fence the same host within a 5-minute window, except to renew a verified
+  power-off that a successor is taking over and cannot show still holds (below).
 - **A fence and its recovery can land on different coordinators.** The fence is
   bounded by the lease that authorises it, and the leader re-checks the lease
   before rescheduling anything. If it lost the lease meanwhile it stops there —
   but the verified power-off is already recorded, in `fencing_log` and in the
-  host's `fenced` state, so the next leader resumes the reschedule from that
-  record instead of powering the host off a second time. The resumed pass is
-  counted as `phase=recovery, error_class=recovery_resumed`.
+  host's `fenced` state, written together as one replicated entry so no peer
+  holds one without the other, so the next leader resumes the reschedule from that
+  record. The resumed pass is counted as
+  `phase=recovery, error_class=recovery_resumed`. A verified fence that is over
+  5 minutes old, or in any doubt, is renewed with a fresh verified power-off
+  first; an unverified one is resumed only while it still stands, and never
+  re-fenced — see
+  [Resuming a recovery from a recorded fence](migration-failover.md#resuming-a-recovery-from-a-recorded-fence).
 - **Split-brain refusal.** If a fence fails (and the strategy is not
   `best-effort`), the coordinator refuses to reschedule the host's VMs.
   Operator must intervene.
-- **A VM created through `CreateVM` is normally provable immediately.** It is
-  assigned its first ownership generation and both runtime markers (libvirt
-  domain metadata and the host-local marker file) are stamped before the call
-  returns.
-  **This narrows the window in which a running VM cannot prove its generation;
-  it does not close it**, and it covers only that one path. The row is still published as `running` before the markers are
-  written, so a crash or a failure in between still leaves a running VM that
-  cannot prove its generation — for the width of a few calls inside one RPC. The dual-run detector's newborn grace remains
-  the backstop for that residue, and closing it needs the create path reordered
-  to record the row before the runtime exists. Containers do not take this path:
-  they graduate on the backfill sweep.
+- **A new VM is never published `running` before it can prove its
+  generation.** Every path that creates a VM row — `CreateVM`, template
+  instantiation, import, live-restore autostart and a renamed replica
+  promotion — records it as `creating`, assigns its first ownership generation,
+  stamps both runtime markers (libvirt domain metadata and the host-local marker
+  file), and only then flips it to `running`. When any step fails the VM keeps
+  running and its row stays `creating`: it is neither published at generation 0
+  nor torn down. The owning host's reconciler finishes such a row on its next
+  sweep — when the domain is running there and no create operation, pending
+  start proof or VM lock holds the row. The dual-run detector therefore has no
+  newborn grace: a VM running on its owner at generation 0 with no marker pages
+  as an owner-epoch mismatch, however recently it was created. Containers do not
+  take this path: they graduate on the backfill sweep.
 - **A VM published as `running` is marked at the same time, on the host that
   runs it.** Every local transition that sets a VM to `running` — start,
   snapshot restore, import, a failed migration healing back, the reconciler's
@@ -550,7 +665,7 @@ they protect. So the coordinator reports the condition instead of retrying it.
 Automatic recovery was built, reviewed and withdrawn, and the reason is worth
 knowing before anyone proposes it again. Acting unattended requires proving the
 host was POWERED OFF, and nothing available to a coordinator proves that.
-`hosts.state` records only that somebody decided it — `lv host fence-confirm`
+A host's recorded state records only that somebody decided it — `lv host fence-confirm`
 writes `fenced` on any host with no precondition, so a mistyped hostname marks a
 live one. Health quorum proves unreachability, which is equally true of a
 partitioned host still running its VMs. Evacuating on either gives you two hosts
@@ -583,6 +698,84 @@ would destroy the losing claim and hand a future enforcement path a confident
 answer to a question the cluster never agreed on. Instead both claims persist on
 their own nodes and the conflict is flagged, which is why the alert above is the
 access path rather than a query.
+
+#### A node that was away does not claim a term from a stale ledger
+
+A new tenure's term is one above the highest term in the claiming node's own
+replica. That is only unique if the replica already holds every term the
+cluster has minted, and a node that was away does not. A restarted daemon, or
+a node reconnecting after a partition, comes back holding the ledger as it was
+when it left. Its own expired lease then looks free, and it would claim the
+term a peer took while it was gone: two claimants for one term, which is the
+permanent conflict described above.
+
+So before recording a **new** term, a node asks its peers for their newest term
+for that key. This is the same quorum read the lease-term barrier makes for
+executors (`GetLeaseTermHighWater`, sent to every healthy peer, with a quorum of
+answers required). The node records the term only when no answer has reached
+it. Otherwise the claim is withheld and the lease reported not held. Replication
+then delivers the row the node was missing, and on its next poll the node sees
+the real holder: it defers to a live holder, or takes over a dead holder's lease
+at the term after the one it was missing. The check keys on the ledger rather
+than on uptime, so a long partition healing is covered the same way a restart
+is.
+
+What a node waits for, concretely:
+
+- **After a daemon start: the replica's first catch-up.** No new term is
+  claimed until an anti-entropy exchange with a peer has completed since the
+  process started, or since the node last lost every gossip peer. That is the
+  signal the workload commands also wait on, and on a real daemon it takes
+  about a minute. The quorum read alone cannot vouch for a replica that has
+  not caught up: on a host reinstalled with an empty database, the voter set
+  and the peer list it reads come from a `hosts` table that may name only the
+  node itself, so the "quorum" is the node and nobody is asked. A rebuilt
+  host did exactly that on the lab and claimed terms the cluster had claimed
+  weeks earlier. Then one health-probe cycle: until the checker's first cycle
+  completes, quorum reads as unknown. A peer's newer term then holds the claim
+  back until replication delivers the row, which took about 1 s in the fleet
+  harness once the links healed.
+- **In the common case, nothing measurable.** A takeover mint costs one RPC per
+  healthy peer: about 7 ms in the fleet harness, against under 1 ms without the
+  read, on a lease with a TTL of tens of seconds. A renewal claims no term and
+  asks nothing, so a holder keeps its lease exactly as before, and a node that
+  sees a peer's live lease never gets as far as asking.
+- **A cluster of one does not wait at all.** A node with no other host in its
+  `hosts` table and no gossip member has nobody to ask and nobody who could hold
+  a higher term. It claims at once, including during the checker's warm-up.
+- **A node that has peers but reaches no quorum of them does not claim.** It
+  cannot tell whether a peer already took the term. This withholds a number,
+  not an action: everything the lease authorises (a fence, a reschedule) needs
+  quorum anyway. It claims as soon as a quorum answers. A holder that loses its
+  peers keeps renewing the term it already has.
+
+While a claim is withheld the daemon logs `leader lease: not claiming a new term
+yet` once per key, with the reason, and logs `new-term claim cleared` when the
+claim goes through.
+
+#### A node whose lease row is behind does not depose a live holder
+
+A current ledger is not enough on its own. Whether the lease is *live* is read
+from the node's own `leader_election` row, and that row can lag the ledger:
+renewals write only `leader_election`, and anti-entropy does not carry that
+table. So a node can hold every term row and still have the holder's expiry
+from several renewals ago, or no row at all (a node that got its ledger from
+anti-entropy or a reseed). Such a node reads a live lease as lapsed. The term
+check passes, because nobody has minted the term it would claim. Minting that
+term would depose the live holder. The holder would fail closed on its next
+renewal once the term arrived, and until then both nodes would act as leader.
+
+So when a node **takes over** a lease (its own replica shows no live tenure of
+its own), the same quorum read also returns each peer's own `leader_election`
+row. The takeover is withheld while any answering peer shows the lease live for
+another holder. The holder itself answers too if it is reachable. The node
+waits until the renewal reaches it, and then defers to the holder. If the
+holder is really gone, it waits until every expiry a peer reported has passed,
+which is one TTL after the last renewal that reached anyone, as with an ordinary
+expiry. A mint over the node's own live lease (retiring a contested term) is not
+a takeover and is not held to this. A peer on an older build reports no row, so
+against that peer a takeover is judged on the term alone, as before. The
+withholding reason names the peer and the holder it reported live.
 
 #### A contested lease still converges
 
@@ -618,8 +811,10 @@ the moment the peer's mint arrives, or on the next anti-entropy pass:
   TTL after the lease has converged.
 
 Which claims a node knows about lives in memory. After a restart it is rebuilt
-by the next anti-entropy pass, because the two rows still disagree and the
-merge re-compares them every pass; until then a restarted claimant may renew a
+by the next anti-entropy pass, because the two rows still disagree and a
+restarted daemon's first pass against each peer pulls and re-compares them
+(later passes skip a table whose only difference is a tie already tracked);
+until then a restarted claimant may renew a
 contested term it had already stood down from. A contested term that is not a
 key's *newest* term — history below the current tenure — needs nothing: it is
 already below every threshold, and only its tie condition remains.
@@ -630,8 +825,9 @@ Because a contested term is never resolved into a winner, there is no
 remediating write for the `ha.lww.unresolved` condition to wait for.
 `leader_lease_terms` rows are immutable, the two rows disagree forever, and the
 condition therefore stays dirty forever. Waiting it out does not work, and
-neither does a restart: the register is in memory, so a restart empties it and
-the next anti-entropy pass re-registers the same tie within seconds.
+neither does a restart on its own: the tie register is in memory, so a restart
+empties it and the next anti-entropy pass re-registers the same tie within
+seconds.
 
 What clears it is a human saying they have seen it:
 
@@ -639,24 +835,64 @@ What clears it is a human saying they have seen it:
 lv cluster acknowledge-lease-term --key failover --term 7
 ```
 
-Three things about that command:
+Five things about that command:
 
 - **It clears evidence tracking, not the conflict.** Both claims stay in the
   ledger, no winner is elected, and the acknowledgement is written to the audit
   log with your principal, the key and the term.
+- **It is durable.** The acknowledgement is kept in two local-only tables,
+  `acknowledged_ties` and `acknowledged_tie_versions`, and reloaded at start.
+  When a restarted daemon's first pass re-registers the tie, it is registered
+  as acknowledged: `ha.lww.unresolved` stays clear and nothing re-alerts.
+- **It covers the term as this host has seen it.** You name a lease and a term,
+  so the acknowledgement covers every claim for that term the host has met, not
+  only the one peer it met last. A term that five nodes claimed needs one
+  acknowledgement per host, and later passes can meet the peers in any order.
+  A claim the host meets for the first time *after* you acknowledged is new
+  evidence. It is not covered: the condition comes back and `converge` reports
+  a SAFETY-FAULT again. Investigate it, then acknowledge again on that host.
+  Running the command again with nothing new to cover changes nothing and
+  prints "No tracked tie".
 - **It is node-local.** The register belongs to one daemon, and the RPC refuses
   peer certificates so that no node can silence its own split-brain evidence.
-  Point `LV_HOST` at each host `lv health` names and run it there; verify with
-  `lv cluster digest`.
+  The acknowledgement is not replicated either, for the same reason: one
+  node's word would silence the evidence on hosts whose register nobody
+  checked. Point `LV_HOST` at each host `lv health` names and run it there;
+  verify with `lv cluster converge`.
 - **It needs the `cluster.lww.acknowledge` verb**, held by Operator and Admin.
   That verb grants this and nothing else.
+
+The two rows still differ on each host after the acknowledgement, so the table
+never digests equal. `lv cluster converge` lists it as `ACKNOWLEDGED`, with the
+number of acknowledged ties, and counts it as converged, but only when all of
+the following hold on every host that reports the table:
+
+- every tie the host tracks in the table is acknowledged;
+- the host's *residual* digest agrees with every other host's. The residual is
+  the table hashed with each acknowledged row replaced by its primary key, so
+  two residuals agree only when nothing but the acknowledged rows differs.
+
+If one tie on any host is unacknowledged, the table is a `SAFETY-FAULT`, with
+the unacknowledged and acknowledged counts. It is also a `SAFETY-FAULT` if a
+host cannot vouch for a residual (it tracks no tie there yet, or runs an older
+build), or if the residuals disagree, because another row differs as well.
+`lv cluster digest` shows the acknowledged count in its `TIES` column.
+
+`lv doctor divergence` applies the same rule row by row. A row of an
+`ACKNOWLEDGED` table is listed as `acknowledged_tie`, apart from the diverging
+rows, and does not stop the scan reading clean. Any other row in a table where
+some host acknowledged a tie stays a divergence and names the hosts that have
+not acknowledged it ([diagnostics.md](diagnostics.md#lv-doctor-divergence)).
 
 Investigate before acknowledging. Two nodes recording the same term means the
 fencing token did its job — enforcement will refuse proofs from the losing
 tenure — but something upstream let both nodes believe they held the lease.
 Usually that is only two survivors of a leader death claiming it within one
 replication round, which converges on its own as described above; a contested
-term whose claimants were cut off from each other is a partition.
+term whose claimants were cut off from each other is a partition. A term claimed
+a few seconds after its claimant's daemon started, minutes after the other
+claim, is the stale-ledger claim described above, made by a build that did not
+yet wait for the quorum read.
 `litevirt_leader_lease_term` around the event tells you whether this was
 leadership churn or a partition.
 
@@ -669,6 +905,40 @@ leadership churn or a partition.
   ```
   lv host config witness-1 --role witness
   ```
+
+### A site partition is a majority/minority split of one cluster (by default)
+- Under the default failover scope (`cluster`), region is a placement label,
+  not an HA boundary. Quorum, gossip and health probes span every region, and
+  failover picks its targets from every `active` host in the cluster. So when the link between two sites fails, the site
+  holding a majority of voters fences the other site's hosts and reschedules
+  their workloads onto itself, across the WAN, even though the other site may
+  be alive. The minority site stalls. It fences and reschedules nothing, and
+  its runtime-ownership actions refuse without quorum. Its running workloads
+  keep running.
+- What protects you on the majority side is the fence strategy.
+  `ipmi` over a management path that survives the partition powers the
+  minority off first. `ssh` and `manual`, and `ipmi` with an unreachable BMC,
+  all fail closed and move nothing. `best-effort` does not: without
+  `enforcement.safe_fence_default`, it reschedules VMs that are still running
+  on the other side.
+- Under cluster scope, keep an odd number of voting sites, or put a witness in
+  a third site, and pin workloads that must not cross with `placement.require`
+  on a per-site host label.
+- **Region-scoped failover** is the opt-in alternative:
+  `lv cluster failover-scope region`. A host is then fenced, re-admitted and
+  recovered only on a majority of its own region's voters; its host's
+  execution gate counts its own region; and recovery targets stay in its
+  region. A site partition fences nothing on either side and the minority
+  site's workloads keep running where they are. A host that really dies is
+  still fenced and recovered by its own region, **if that region has at least
+  three voters** — a region with fewer has no automatic failover while the
+  policy is on, reported by `lv cluster failover-scope` and
+  `litevirt_failover_regions_without_quorum`. VIP self-demotion and the
+  lease-term barrier still count the whole cluster. The change is refused
+  mid-roll and while any voter is unreachable. See
+  [Federation](federation.md) → "Regions and failure" for the full contract
+  and [design/region-scoped-failover.md](design/region-scoped-failover.md) for
+  the reasoning.
 
 ### NTP is required
 - All hosts must run NTP (chrony / systemd-timesyncd / ntpd). HLC tolerates
@@ -686,6 +956,111 @@ leadership churn or a partition.
   a healthy LAN cluster, longer over WAN. Code that needs "this write is
   visible everywhere before I act" should use a confirmation read on the
   target peer, not assume convergence.
+
+### Gossip admits only known hosts, and is authenticated only when encrypted
+- Gossip membership (memberlist, `gossip_port`) admits a member only when its
+  name is a `hosts` row this node holds that is not removed, and it announces
+  the address that row records. A name with no row, a removed host, and a real
+  host's name announced from another address are all refused, and none of them
+  counts anywhere membership is counted: relay election, replication and
+  anti-entropy targets, and the recipients a replication-gated capability such
+  as `lease_term_ledger_v1` must confirm.
+- A host that joins before its `hosts` row has replicated to some existing node
+  is refused by that node until the row arrives, then admitted by the next
+  gossip exchange that mentions it — memberlist's periodic full-state exchange,
+  30 s on the LAN profile and longer past 32 members. `lv host add` writes the
+  row on the node it talks to before it starts the new daemon, so that node
+  admits the newcomer at once, and the rest follow within replication time plus
+  that interval.
+- A node that holds no `hosts` row but its own, live or removed, and was given
+  `join_peers`, admits what its seeds introduce, because that is the only way a
+  newly added host can find the peers it learns the hosts table from. That
+  window closes at the first replicated row. A founder with no `join_peers`
+  never opens it.
+- A host gossiping from one of this node's `join_peers` addresses is admitted
+  under any name until this node holds a `hosts` row, live or removed, for that
+  address. From then on the row decides. This matters when several hosts are
+  added on fresh databases at once. Each pushes its own row to the others, so
+  a newcomer can learn another newcomer before any established host. The
+  established hosts' rows are old enough to be pruned from every push backlog,
+  so they reach a newcomer only by anti-entropy, and anti-entropy dials only
+  admitted members. Without this rule the newcomers replicate only among
+  themselves.
+- A host whose gossip address differs from its recorded address is refused and
+  logged with both addresses. On a multi-homed host, set `advertise_address` to
+  the address the host was added with.
+- Admission checks names and addresses, and neither is a secret. What makes
+  gossip authenticated is the cluster gossip key (`<pki_dir>/gossip.key`) with
+  `enforcement.gossip_encryption: true` on every host: each packet and stream is
+  AES-256-GCM under that key, and a node drops anything unencrypted or under a
+  key it does not hold — before admission even sees it. See
+  [Gossip encryption](auth.md#gossip-encryption) for the key, the rollout and
+  rotation.
+- **An unauthenticated gossip segment is not supported.** Until every host runs
+  `gossip_encryption: true`, gossip is plaintext (or accepts plaintext, in the
+  `install` and `staged` rollout stages): a machine on the segment can announce
+  a real host's name from that host's own address, read the membership, or
+  disturb failure detection. Keep `gossip_port` on a network only cluster hosts
+  can reach until the rollout is finished. Even encrypted, the key is one shared
+  secret: every host holding it can speak for any member, a removed host keeps
+  what it knew, and encryption does not hide that gossip traffic exists — so
+  rotate the key after removing a host you no longer trust, and keep the port
+  firewalled regardless.
+
+### Gossip membership heals itself after a partition
+- memberlist does not re-merge two live clusters by itself. When a partition
+  splits the cluster, each side declares the other's hosts dead, stops
+  gossiping to them 30 s later, and never dials them again. Replication and
+  anti-entropy take their peers from gossip membership, so a side that cannot
+  see a host neither pushes to it nor repairs against it.
+- Every node therefore runs a membership pass every 30–45 s (jittered). It
+  re-joins in two cases:
+  - **It sees no peer at all.** It dials every `join_peers` seed and every host
+    in its `hosts` table, and reports `gossip_isolated` if none answers (see
+    [Diagnostics](diagnostics.md#gossip-isolation-gossip_isolated)).
+  - **It sees peers, but a host the cluster still lists is missing.** It dials
+    those hosts only: the hosts in its `hosts` table that are not removed, other
+    than itself, that gossip does not show. This is a healed partition, where
+    neither side is empty. A host's state does not matter. The majority of a
+    partition marks the other side `fenced` or `offline`, and those are exactly
+    the hosts that need to merge back and learn it.
+- The second case dials only missing hosts, one at a time. A healthy cluster
+  dials nobody, and the pass never re-joins on a timer regardless. A pass dials
+  hosts that have only just gone missing first, then the ones that have been
+  missing longer. It dials at most three hosts. It stops at the first host that
+  answers, because that one exchange carries the whole other side. A host that
+  is still missing after a dial is backed off: it is dialled again after one
+  skipped pass, then three, and from then on every fourth pass (about every 2–3
+  minutes). A host that is due but not dialled, because of the three-host limit
+  or the early stop, keeps its place for the next pass.
+- So a dead host that was never removed costs one bounded dial every few
+  minutes. A pass blocks for at most three dial timeouts (10 s each), however
+  many hosts are dead. A partition of any length re-merges within one capped
+  wait after it heals. Remove dead hosts with `lv host rm --dead <host>` to stop
+  the dials.
+- A missing host is dialled at the gossip address memberlist last showed for it,
+  if that still matches its recorded address. Otherwise, for example after a
+  restart, which forgets these addresses, it is dialled at its recorded address
+  on this node's own `gossip_port`. So keep `gossip_port` uniform across the
+  cluster. A remembered address is dropped when its host is removed or
+  re-addressed.
+- A re-join is memberlist's ordinary join, so it passes the same admission and
+  runs under the same gossip key as a first join. A removed host is never
+  dialled, and a host that gossip admission would refuse stays refused.
+- Each pass logs every host it dialled:
+  - `gossip: re-merged hosts the cluster lists that were missing from
+    membership` names the hosts that are back.
+  - `gossip: a host the cluster lists is missing from membership and its gossip
+    address did not answer` carries that host's own dial error.
+  - `gossip: a host the cluster lists answered a re-join but is still not a
+    member` means something answered at the host's address, but the host was
+    not admitted. Check that it announces the address its `hosts` row records
+    (`advertise_address`).
+  - A pass that cannot read the `hosts` table is skipped, with a warning, and
+    changes no backoff.
+
+  None of this is `gossip_isolated`, and none of it marks the node's replica
+  stale: the node still sees peers.
 
 ### Secret-bearing repair is peer-only
 - Secret-bearing config is **excluded from the operator-readable full-state
@@ -742,11 +1117,41 @@ leadership churn or a partition.
 - **5 nodes**: recommended. 2-node failure tolerated.
 - **Even N**: only with a witness. 2-node with witness is fine for homelab.
 - **Beyond ~5 nodes**: no size is load-tested. The largest automated cluster in
-  this repo is 3 nodes (`tests/fleet/`) and the largest by hand is the 4-node
-  lab. The relay-quorum protocol scales O(n) by design and there is no known
+  this repo that runs workload scenarios is 3 nodes (`tests/fleet/`), the only
+  larger one measures anti-entropy alone (below), and the largest by hand is
+  the 4-node lab. The relay-quorum protocol scales O(n) by design and there is no known
   ceiling, but a figure like "tested and supported at ~50 nodes" is not
   backed by a sustained load test and should not be planned
   against. Larger clusters will likely need the anti-entropy interval tuned.
+- **Anti-entropy pass cost, measured at 50 nodes.** `TestFleet_AntiEntropyScale_PassCost`
+  in `tests/fleet/` runs 50 daemons in one process, each with its own replica
+  and real gRPC/mTLS, holding 200 VMs of state; `LITEVIRT_FLEET_AE_NODES=50`
+  selects that size. One scheduled pass on every node costs 408 anti-entropy
+  RPCs and 0.53 MB of responses when the replicas agree (8.2 RPCs per node),
+  where a pass contacting every member costs 4,900 RPCs and 6.3 MB. With one
+  row drifted on one node the pass pulls 730 bytes of table dumps, where
+  answering every mismatch with the full dump pulls 7.9 MB, and the row reaches
+  all 50 replicas within 3 passes. That is the cost of one pass in one
+  process, not a sustained load test.
+- **Health-probe cost.** Voters probe every peer; a non-voter probes every
+  voter plus three other non-voters, so every host is still observed by every
+  voter and fence and recovery quorums see the same rows as a full mesh.
+  `TestProbesPerCycle_Scale` in `internal/health/` counts real probe cycles,
+  per 2 s cycle: with every host voting (today's voter set, where every host
+  not `offline`, `maintenance` or `fenced` votes) the cost is unchanged at 20,
+  380 and 2,450 probes for 5, 20 and 50 nodes (2,450 is 1,225 probes/s).
+  With 3, 5 and 5 voters it is 20, 215 and 605. The saving needs a voter set
+  smaller than the cluster; until then the probe mesh is still N·(N−1).
+- **Digest cost.** One full public digest over a 50-node cluster's worth of
+  rows (a full `host_health` mesh and 2,000 VMs) takes about 55 ms and
+  allocates 5.7 MB (`BenchmarkStateDigest_50Nodes`). A pass and every peer
+  that asks take unchanged tables from the digest cache instead
+  (`BenchmarkStateDigestCached_50Nodes`), so the scan cost falls to the tables
+  written since the last pass: with a `host_health` row rewritten between
+  digests (that table is most of the rows, and is rescanned), 11 ms and 2.4 MB
+  against 29 ms and 6.8 MB for a full scan on the same machine. One drifted row in a 4,000-row table costs a
+  bucketed pass about 8 KB and 21 rows, against 180 KB and the whole table for
+  the pull before buckets (`TestFleet_AntiEntropy_Buckets_OneDriftedRowPullsOneBucket`).
 
 ### Network
 - **Inter-host RTT < 10 ms**: comfortable. Default replicator and
@@ -755,8 +1160,10 @@ leadership churn or a partition.
   `healthFreshness`, and `leaseDuration` proportionally to avoid lease
   thrash.
 - **Multi-DC (RTT > 100 ms)**: supported in principle; tune intervals up
-  significantly. The federation API on the roadmap is the recommended
-  approach for cross-DC clusters once it ships.
+  significantly. Under the default failover scope a multi-DC cluster is still
+  one failure domain: a site partition fences and reschedules across the WAN.
+  `lv cluster failover-scope region` makes each site its own failure domain
+  (see "A site partition is a majority/minority split of one cluster" above).
 
 ### Fencing strategy
 - **Production with shared storage**: `ipmi` (mandatory). SSH and watchdog
@@ -786,6 +1193,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_fence_failures_total` | rate > 0 over 5 min |
 | `litevirt_failover_leader` | sum across cluster != 1 sustained |
 | `litevirt_failover_attempts_total{result="error"}` | rate > 0 over 5 min (a failover decision hit a store/fence error) |
+| `litevirt_failover_regions_without_quorum` | `max() > 0` under region-scoped failover (a region holding workloads cannot fence its own hosts) |
 | `litevirt_mutation_log_rows` | rapidly growing (replication backlog) |
 | `litevirt_replication_min_watermark_seq` | not advancing for > 5 min |
 | `litevirt_replication_backlog_age_seconds` | > 300 s sustained |
@@ -807,6 +1215,9 @@ The web UI at port 7445 surfaces the most critical of these on the
 | HLC rejected counter rising on one peer | Check NTP on that peer; expect to fence it |
 | Replication backlog growing | Identify slow peer via watermarks; consider `lv host drain` |
 | Disk full on one host | Drain → repair disk → re-add as fresh peer |
+| A voter is gone for good | `lv cluster voter rm <host>`, then `lv host rm <host>` |
+| `lv cluster voter ls` shows a member ABSTAINING | `lv cluster voter rm <host>` then `lv cluster voter add <host>` |
+| `ha.voter.genesis_pending` persists | Clear what it names, or `lv cluster voter init --members <hosts>` |
 
 ---
 

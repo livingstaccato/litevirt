@@ -46,6 +46,24 @@ lv version                         # Print version
 lv cluster digest                  # Per-table state digest for every host (fanned out server-side)
 lv cluster converge [--all]        # Kick an immediate anti-entropy pass + report cross-host convergence
                                    #   (`lv cluster sync` is a deprecated alias)
+lv cluster failover-scope [cluster|region]  # Show or set whether failover quorum is cluster-wide or
+                                   #   per region (see federation.md → Regions and failure)
+lv cluster acknowledge-lease-term --key <k> --term <n>   # Acknowledge a contested lease term on the connected host
+lv cluster voter ls                # Adopted voter generation; per member: host state, reachable, abstaining
+lv cluster voter init [--members a,b,c] [--yes]   # Start a voter generation by hand (unanimous); for a
+                                   #   cluster that cannot become clean, or after a reset
+lv cluster voter add <host>        # Add one voter (decided by a majority of the current generation)
+lv cluster voter rm <host>         # Remove one voter; allowed while it is unreachable
+lv cluster voter reset [--yes]     # Decided exit to the voter set derived from host state (sticky)
+lv cluster voter force-reconfigure --lost a,b [--dry-run] [--yes]
+                                   # Break-glass for a generation whose majority is gone for good:
+                                   #   every named member fenced proof-grade, refused while a majority
+                                   #   is reachable; audited, raises ha.voter.forced (§4.6 of the design)
+lv cluster claim <kind>/<name> [--epoch N]   # Every voter's recorded state for a vm/container recovery
+                                   #   claim: ballots, value, destination, source, last refusal
+lv cluster claim-release <kind>/<name>       # Release one workload ha.claim.legacy_held holds behind a
+                                   #   legacy proof stuck in flight on a live destination; the
+                                   #   destination confirms nothing runs it, then abandons it (admin)
 lv health [--resolved]             # Cluster health: overall + conditions + coverage (exit 0/1/2)
 ```
 
@@ -67,11 +85,23 @@ lv host drain <host> [--parallel 2]       # Evacuate VMs off host
 lv host shutdown-workloads <host>         # Stop VMs in reverse startup-order (honors stop-delay)
 lv host undrain <host>                    # Return host to scheduling
 lv host rm <host> [--force]               # Remove host (--force with running VMs); revokes its cert
+lv host rm --dead <host> [--dry-run]      # Remove a host fenced proof-grade and gone for good: checks the
+                                          #   fence, `voter rm` if it votes, revokes + publishes the CRL,
+                                          #   removes it, and reports the stranded recoveries that now retry
+                                          #   at the next claim attempt. --dry-run changes nothing
 lv host publish-crl                       # Re-publish this machine's crl.pem if `host rm` could not
+lv host install-gossip-key                # Put the cluster gossip key on every host (mints it if
+  [--ssh-user root]                       #   none); never replaces one. Re-run to see each host's
+                                          #   gossip stage. See auth.md "Gossip encryption"
+lv host rotate-gossip-key                 # Replace the gossip key everywhere, live, in three
+  [--grace 30s] [--timeout 2m]            #   barriered phases; re-run to settle an interrupted one
+  [--ssh-user root]
 lv host fence <host> --confirmed          # Manually fence a host (real fence)
 lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence host
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
+lv host superseded-disks <host>           # List the old disk copies a failover set aside
+  [--purge] [--older-than 72h]            #   and remove the ones not held (admin)
 lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)
@@ -83,6 +113,7 @@ lv host label ls <host>                   # List labels on a host
 lv host config <host>                     # Configure host settings
   [--fence-strategy ssh|ipmi|watchdog]
   [--ipmi-address <addr>] [--ipmi-user <u>] [--ipmi-pass <p>]
+  [--clear-ipmi]                          # Remove the IPMI address, user and password
   [--watchdog-dev <path>]
   [--role worker|witness]                 # witness = vote-only tiebreaker
   [--region <name>]                       # Region label (federation)
@@ -738,7 +769,7 @@ lv user passwd [username]           # Change your own password (or, as admin, an
 lv user token-create <username> <token-name> [--expires <RFC3339>]
   [--scope-path <path>] ...        # Repeatable; intersect with role bindings
 lv user token-revoke <token-id>
-lv user reset-admin                # Reset the EXISTING admin password (does not create one)
+lv user reset-admin                # As root on a node: reset the EXISTING admin password (does not create one); audited as user.reset-admin
 ```
 
 ## Roles (path-based RBAC)
@@ -781,6 +812,8 @@ lv sg rule-rm <rule-id>       # Takes the RULE id from rule-ls, not the group id
 lv sg bind <vm> --network <name> --sg <name> [--sg <name>...]   # Bind SGs to a VM NIC
   # --network matches the compose network name on the NIC; --sg is repeatable
   # (an empty --sg list clears the bindings).
+  # create/rm/rule-add/rule-rm go through the daemon: they need sg.write and
+  # each leaves an sg.* audit row (see docs/firewall.md#audit-trail).
 
 lv firewall show              # Render the live nft ruleset for this host
 lv firewall reload            # Force the reconciler to re-read state and apply now
@@ -840,8 +873,9 @@ lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the hos
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
 ```
 
-`divergence` is read-only; `repair-owner` is an audited, admin-gated repair for an
-equal-timestamp ownership split a stationary VM can't self-heal. Most ownership
+`divergence` is read-only, and lists a lease-term tie that every host has
+acknowledged as `acknowledged_tie`, not as a divergence. `repair-owner` is an
+audited, admin-gated repair for an equal-timestamp ownership split a stationary VM can't self-heal. Most ownership
 splits are reclaimed automatically by the runtime-repair reconcilers — see
 `docs/diagnostics.md` for the full model (categories, metrics, alerts, and the
 operational repair flow).

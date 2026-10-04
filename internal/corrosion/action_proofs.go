@@ -80,6 +80,14 @@ type ActionProof struct {
 	// judged against anything. "" means the proof was minted without a lease,
 	// and pairs with LeaseTerm 0.
 	LeaseKey string
+	// ClaimCertificate is the encoded recovery-claim certificate that
+	// authorizes this proof (docs/design/recovery-claims.md §3.9): a majority
+	// of voters' signed accepts for this exact binding. EVIDENCE, not a
+	// binding field — ProofBindingEqual ignores it, a row may gain one, and a
+	// re-certification of the same value may replace it — so it is never what
+	// makes two proofs the same proof. "" means none. Written only once
+	// recovery_claim_v1 has latched (MayEmitClaimCertificate).
+	ClaimCertificate string
 }
 
 // ProofRecord is a read-back proof row including lifecycle state.
@@ -101,15 +109,48 @@ func (p ProofRecord) Terminal() bool {
 // pending transition (host_name, state='pending', pending_action_id) in ONE
 // batch, so the proof is linked to that exact pending transition — never matched
 // by a weak tuple. Used by the failover coordinator at the decide site.
+//
+// The VM's disk rows move to destHost in the same batch. Failover used to
+// re-key only the VM row, so a recovered VM's disks went on naming the failed
+// host, and the next migration of that VM cut over and then failed its
+// ownership commit (pp3 on the kvm003 lab, main-b3368d7c).
 func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmName, destHost string) error {
 	if err := proofStampEmittable(c, p); err != nil {
 		return err
 	}
+	disks, err := GetVMDisks(ctx, c, vmName)
+	if err != nil {
+		return err
+	}
 	now := c.NowTS()
+	stmts := []Statement{
+		proofInsertStmt(c, p, now),
+		{SQL: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
+		        WHERE name = ? AND deleted_at IS NULL`,
+			Params: []interface{}{destHost, p.ID, now, vmName}},
+	}
+	for _, d := range disks {
+		if d.HostName == destHost {
+			continue
+		}
+		stmts = append(stmts, Statement{
+			SQL:    vmDiskHostMoveSQL,
+			Params: []interface{}{destHost, now, vmName, d.DiskName},
+		})
+	}
 	// Guard: only mint the proof + stamp the pending link if the VM row still
-	// exists (not deleted) AND no proof already carries this id — so we never
-	// leave an orphan proof for a vanished VM or (astronomically) point a VM at a
-	// pre-existing proof on an id collision. applied=false → ErrNoRowsAffected.
+	// exists (not deleted) AND no DIFFERENT proof already carries this id — so
+	// we never leave an orphan proof for a vanished VM or (astronomically) point
+	// a VM at a pre-existing proof on an id collision. applied=false →
+	// ErrNoRowsAffected.
+	//
+	// A row that already carries this id with the SAME binding is not a
+	// collision, it is the same proof: a coordinator re-materializing a
+	// recovery claim another coordinator decided (docs/design/recovery-claims.md
+	// §3.4, §3.13 step 5) writes the identical proof, and has to be able to
+	// point its replica's VM row at it even when the proof row itself arrived by
+	// replication first. The insert is then a no-op and only the pending link
+	// is written.
 	applied, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var currentOwnerEpoch int64
 		if err := tx.QueryRow(`SELECT vm_owner_epoch FROM vms WHERE name = ? AND deleted_at IS NULL`, vmName).Scan(&currentOwnerEpoch); err != nil {
@@ -127,17 +168,23 @@ func WriteVMRescheduleProof(ctx context.Context, c *Client, p ActionProof, vmNam
 				return false, nil
 			}
 		}
-		var existing int
-		if err := tx.QueryRow(`SELECT COUNT(1) FROM runtime_action_proofs WHERE id = ?`, p.ID).Scan(&existing); err != nil {
+		var existing ActionProof
+		err := tx.QueryRow(
+			`SELECT action, target_kind, target_name, dest_host, coordinator,
+			        relocation_token, fence_epoch, owner_epoch, lease_term, lease_key
+			   FROM runtime_action_proofs WHERE id = ?`, p.ID).
+			Scan(&existing.Action, &existing.TargetKind, &existing.TargetName,
+				&existing.DestHost, &existing.Coordinator, &existing.RelocationToken,
+				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm,
+				&existing.LeaseKey)
+		if errors.Is(err, sql.ErrNoRows) {
+			return true, nil
+		}
+		if err != nil {
 			return false, err
 		}
-		return existing == 0, nil
-	}, []Statement{
-		proofInsertStmt(c, p, now),
-		{SQL: `UPDATE vms SET host_name = ?, state = 'pending', pending_action_id = ?, updated_at = ?
-		        WHERE name = ? AND deleted_at IS NULL`,
-			Params: []interface{}{destHost, p.ID, now, vmName}},
-	})
+		return ProofBindingEqual(existing, p) && existing.DestHost == destHost, nil
+	}, stmts)
 	if err != nil {
 		return err
 	}
@@ -162,6 +209,9 @@ func WriteActionProof(ctx context.Context, c *Client, p ActionProof) error {
 		return err
 	}
 	now := c.NowTS()
+	if c.MayEmitClaimCertificate() {
+		return c.Execute(ctx, insertProofClaimSQL, proofInsertParamsClaim(p, now)...)
+	}
 	if c.MayEmitTermCarryingProof() {
 		return c.Execute(ctx, insertProofSQL, proofInsertParams(p, now)...)
 	}
@@ -239,17 +289,26 @@ func ProofBindingEqual(a, b ActionProof) bool {
 // must match a live one; whether a SPENT proof may be re-used is
 // ClaimActionProof's question, and it has its own deleted_at filter.
 func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) error {
+	// A presented certificate is checked against the proof it arrives with
+	// before anything is written: it is evidence FOR this binding, and one that
+	// certifies some other value is a forgery or a bug either way (§3.9).
+	if p.ClaimCertificate != "" {
+		if _, err := CertificateAuthorizesProof(p.ClaimCertificate, p); err != nil {
+			return fmt.Errorf("%w: %v", ErrProofDiverges, err)
+		}
+	}
 	now := c.NowTS()
+	var existingCert string
 	_, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
 		var existing ActionProof
 		err := tx.QueryRow(
 			`SELECT action, target_kind, target_name, dest_host, coordinator,
-			        relocation_token, fence_epoch, owner_epoch, lease_term, lease_key
+			        relocation_token, fence_epoch, owner_epoch, lease_term, lease_key, claim_certificate
 			   FROM runtime_action_proofs WHERE id = ?`, p.ID).
 			Scan(&existing.Action, &existing.TargetKind, &existing.TargetName,
 				&existing.DestHost, &existing.Coordinator, &existing.RelocationToken,
 				&existing.FenceEpoch, &existing.OwnerEpoch, &existing.LeaseTerm,
-				&existing.LeaseKey)
+				&existing.LeaseKey, &existingCert)
 		if errors.Is(err, sql.ErrNoRows) {
 			// Only the SEED emits a statement, so only the seed is bound by
 			// what this node may put on the wire. Checked here rather than
@@ -271,7 +330,19 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 	}, []Statement{
 		proofInsertStmt(c, p, now),
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	// The binding matched a row already here. A presented certificate the row
+	// lacks, or a re-certification of the same value at a later generation, is
+	// recorded on it; anything else about the certificate leaves the row as it
+	// is (SetProofClaimCertificate decides, under its own guard).
+	if p.ClaimCertificate != "" && p.ClaimCertificate != existingCert {
+		if err := SetProofClaimCertificate(ctx, c, p); err != nil && !errors.Is(err, ErrNoRowsAffected) {
+			return err
+		}
+	}
+	return nil
 }
 
 // proofStampEmittable refuses to persist a proof whose lease-term stamp this
@@ -296,10 +367,15 @@ func WriteActionProofValidated(ctx context.Context, c *Client, p ActionProof) er
 // An unstamped proof (term 0, empty key) is exactly what the released shape
 // carries, so it passes whatever the latch says.
 func proofStampEmittable(c *Client, p ActionProof) error {
+	if p.ClaimCertificate != "" && !c.MayEmitClaimCertificate() {
+		return fmt.Errorf("%w (proof %s)", ErrClaimCertificateNotEmittable, p.ID)
+	}
 	if p.LeaseTerm == 0 && p.LeaseKey == "" {
 		return nil
 	}
-	if c.MayEmitTermCarryingProof() {
+	// The claim-carrying shape carries the term columns too, so either latch
+	// lets a stamp reach the wire intact.
+	if c.MayEmitTermCarryingProof() || c.MayEmitClaimCertificate() {
 		return nil
 	}
 	return fmt.Errorf("%w (proof %s, term %d, key %q)", ErrTermStampNotEmittable, p.ID, p.LeaseTerm, p.LeaseKey)
@@ -353,6 +429,9 @@ const insertProofPreTermSQL = `INSERT OR IGNORE INTO runtime_action_proofs
 // writer refuses it first through proofStampEmittable, because writing it in
 // that shape would strip its authorization fields rather than degrade it.
 func proofInsertStmt(c *Client, p ActionProof, now string) Statement {
+	if c.MayEmitClaimCertificate() {
+		return Statement{SQL: insertProofClaimSQL, Params: proofInsertParamsClaim(p, now)}
+	}
 	if c.MayEmitTermCarryingProof() {
 		return Statement{SQL: insertProofSQL, Params: proofInsertParams(p, now)}
 	}
@@ -369,6 +448,27 @@ func proofInsertParamsPreTerm(p ActionProof, now string) []interface{} {
 	}
 }
 
+// insertProofClaimSQL is insertProofSQL with claim_certificate (v60): the
+// shape this node emits once recovery_claim_v1 has durably latched, which is
+// the proof that every peer it replicates to can resolve it. Before then the
+// column is never written, so every proof goes out in one of the two older
+// shapes and a previous-release peer never meets this one.
+const insertProofClaimSQL = `INSERT OR IGNORE INTO runtime_action_proofs
+	(id, action, target_kind, target_name, dest_host, coordinator, lease_holder, lease_expires_at,
+	 quorum_live, quorum_needed, owner_epoch, fence_epoch, relocation_token, lease_term, lease_key,
+	 claim_certificate, status, step_state, result_code, result_detail, started_at, completed_at,
+	 executor_host, created_at, updated_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', '', '', '', '', '', '', ?, ?)`
+
+func proofInsertParamsClaim(p ActionProof, now string) []interface{} {
+	return []interface{}{
+		p.ID, p.Action, p.TargetKind, p.TargetName, p.DestHost, p.Coordinator,
+		p.LeaseHolder, p.LeaseExpiresAt, p.QuorumLive, p.QuorumNeeded,
+		p.OwnerEpoch, p.FenceEpoch, p.RelocationToken, p.LeaseTerm, p.LeaseKey,
+		p.ClaimCertificate, now, now,
+	}
+}
+
 func proofInsertParams(p ActionProof, now string) []interface{} {
 	return []interface{}{
 		p.ID, p.Action, p.TargetKind, p.TargetName, p.DestHost, p.Coordinator,
@@ -379,12 +479,22 @@ func proofInsertParams(p ActionProof, now string) []interface{} {
 
 // GetActionProof reads a proof by id. ok=false if absent.
 func GetActionProof(ctx context.Context, c *Client, id string) (ProofRecord, bool, error) {
+	return getActionProof(ctx, c, id, false)
+}
+
+// getActionProof is GetActionProof that, with tombstoned, also reads a proof
+// ReapSpentProofs has tombstoned.
+func getActionProof(ctx context.Context, c *Client, id string, tombstoned bool) (ProofRecord, bool, error) {
+	live := " AND deleted_at IS NULL"
+	if tombstoned {
+		live = ""
+	}
 	rows, err := c.Query(ctx,
 		`SELECT id, action, target_kind, target_name, dest_host, coordinator,
 		        lease_holder, lease_expires_at, quorum_live, quorum_needed,
-		        owner_epoch, fence_epoch, relocation_token, lease_term, lease_key,
+		        owner_epoch, fence_epoch, relocation_token, lease_term, lease_key, claim_certificate,
 		        status, step_state, result_code, result_detail, executor_host
-		   FROM runtime_action_proofs WHERE id = ? AND deleted_at IS NULL`, id)
+		   FROM runtime_action_proofs WHERE id = ?`+live, id)
 	if err != nil {
 		return ProofRecord{}, false, err
 	}
@@ -401,6 +511,7 @@ func GetActionProof(ctx context.Context, c *Client, id string) (ProofRecord, boo
 			QuorumNeeded: r.Int("quorum_needed"), OwnerEpoch: r.String("owner_epoch"),
 			FenceEpoch: r.String("fence_epoch"), RelocationToken: r.String("relocation_token"),
 			LeaseTerm: r.Int64("lease_term"), LeaseKey: r.String("lease_key"),
+			ClaimCertificate: r.String("claim_certificate"),
 		},
 		Status: r.String("status"), StepState: r.String("step_state"),
 		ResultCode: r.String("result_code"), ResultDetail: r.String("result_detail"),
@@ -522,11 +633,36 @@ type TermFence struct {
 func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string, fence *TermFence) error {
 	now := c.NowTS()
 	if fence == nil {
-		n, err := c.ExecuteRows(ctx, claimProofSQL, executor, now, now, id, executor)
+		// A proof this node abandoned (docs/design/recovery-claims.md §3.12) is
+		// never claimed here, decided in the same transaction as the claim. The
+		// relayed statement is the plain claim either way.
+		abandoned := false
+		ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+			a, err := proofAbandonedTx(ctx, tx, id)
+			if err != nil {
+				return false, err
+			}
+			if a {
+				abandoned = true
+				return false, nil
+			}
+			var claimable int
+			if err := tx.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM runtime_action_proofs
+				  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')
+				    AND (executor_host = '' OR executor_host = ?)`,
+				id, executor).Scan(&claimable); err != nil {
+				return false, err
+			}
+			return claimable > 0, nil
+		}, []Statement{{SQL: claimProofSQL, Params: []interface{}{executor, now, now, id, executor}}})
 		if err != nil {
 			return err
 		}
-		if n == 0 {
+		if abandoned {
+			return ErrProofAbandoned
+		}
+		if !ok {
 			return ErrProofSpent // terminal, missing, or held by another executor
 		}
 		return nil
@@ -552,8 +688,14 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 	// ErrTermClaimantConflict. The guard runs in the same transaction as the
 	// UPDATE, so "claimable" cannot go stale between the two — which is what
 	// lets the relayed statement be the plain claim and still be exact.
-	var fenced bool
+	var fenced, abandoned bool
 	ok, err := c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		if a, err := proofAbandonedTx(ctx, tx, id); err != nil {
+			return false, err
+		} else if a {
+			abandoned = true
+			return false, nil
+		}
 		var claimable int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM runtime_action_proofs
@@ -624,6 +766,9 @@ func ClaimActionProofFenced(ctx context.Context, c *Client, id, executor string,
 	if ok {
 		return nil
 	}
+	if abandoned {
+		return ErrProofAbandoned
+	}
 	if fenced {
 		return ErrTermClaimantConflict
 	}
@@ -676,10 +821,11 @@ const claimProofSQL = `UPDATE runtime_action_proofs
 // because ReapSpentProofs never hard-deletes.
 // RETAINED, NOT EXECUTED. ClaimActionProofFenced no longer runs this shape —
 // its fence is a local guard now, because a NOT EXISTS over other rows is
-// re-evaluated on whichever node the statement reaches. The const stays so its
-// fingerprint stays in the ledger: a peer on a previous release still RELAYS
-// this shape, and this node has to keep resolving what arrives. Deleting it
-// would drop the entry and stall the stream from that peer.
+// re-evaluated on whichever node the statement reaches. The const stays because
+// stmthistorical.go registers it (claim_proof_fenced_not_exists_fork): a fork
+// build from before the local guard relays this shape, and this node has to
+// keep resolving what arrives. Keeping the const alone does NOT keep the entry
+// — stmtshapecheck reads call sites, and nothing calls this.
 const claimProofFencedSQL = `UPDATE runtime_action_proofs
 	    SET status = 'in_progress',
 	        executor_host = ?,
@@ -751,7 +897,7 @@ func CompleteVMStartProof(ctx context.Context, c *Client, id, vmName, executor s
 // ErrNoRowsAffected.
 func CompleteActionProof(ctx context.Context, c *Client, id, executor string) error {
 	now := c.NowTS()
-	n, err := c.ExecuteRows(ctx,
+	n, err := c.ExecuteRowsStrict(ctx,
 		`UPDATE runtime_action_proofs
 		    SET status = 'completed', executor_host = ?, completed_at = ?, updated_at = ?
 		  WHERE id = ? AND deleted_at IS NULL AND status IN ('prepared','in_progress')`,

@@ -16,6 +16,18 @@ import "strings"
 
 const emitterV130 = "v1.3.0"
 
+// Emitters that are fork BUILDS, not releases. A shape whose only emitters are commits that no
+// release tag contains still needs an entry if a build of that range may have run on a cluster
+// (the lab) — its peers relayed the shape, and their retained WAL still holds it. Named by the
+// first and last commit that emitted the shape, so the entry says exactly what to check before
+// it is removed.
+const (
+	emitterFork39c75474 = "fork 39c75474 (unreleased)"
+	emitterForkA0037a7e = "fork a0037a7e (unreleased)"
+	emitterForkB1c95566 = "fork b1c95566 (unreleased)"
+	emitterFork53341a75 = "fork 53341a75 (unreleased)"
+)
+
 // HistoricalShape is one expanded historical statement plus its provenance.
 type HistoricalShape struct {
 	SQL          string
@@ -190,6 +202,15 @@ func HistoricalShapes() []HistoricalShape {
 		  storage_type, storage_volume, target_dev, backing_disk, updated_at, deleted_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, "vm_disks_insert_v130")
 
+	// InsertVMWithHardware (v1.3.0..): the create's vm_disks INSERT, with no bus column. The
+	// current tree creates disk rows with InsertDisk's wider shape so the bus is recorded from
+	// creation, and the startup hardware backfill has nothing to fill for a VM it created.
+	// Supported peers still create VMs with the narrow shape, so it stays registered for the
+	// rolling-upgrade horizon.
+	add(`INSERT INTO vm_disks (vm_name, disk_name, host_name, path, size_bytes,
+				backing_image, storage_type, storage_volume, target_dev, backing_disk, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "vm_disks_create_insert_v130")
+
 	// ReleasePCIDevicesByVM (pre-branch): cluster-wide clear of a VM's PCI ownership by
 	// vm_name. The current tree releases per-device host+owner-scoped (ReleasePCIDevice) so a
 	// whole-VM teardown never clears a remote host's ownership without unbinding there.
@@ -313,6 +334,45 @@ func HistoricalShapes() []HistoricalShape {
 		   updated_at = ?,
 		   deleted_at = NULL
 		 WHERE prefix_id = ?`, "upsert_binding_pre_tombstone_guard")
+
+	// ClaimActionProofFenced with its fence as a NOT EXISTS subquery
+	// (claimProofFencedSQL). 39c75474 introduced this form (dropping the
+	// subquery's deleted_at filter); 431c3a92 moved the fence into a local
+	// guard, so a0037a7e is the last commit that emits it. No release tag
+	// contains that range without 431c3a92 — v1.8.1 predates it, v1.9.0 already
+	// has the local guard — so no released peer ever sent it. It is kept
+	// anyway: fork builds from that range may have run on the lab, and a
+	// receiver that stopped recognising it would back-pressure such a peer and
+	// any WAL it retained. Its disposition is the DispCustomMerge it always had.
+	out = append(out, HistoricalShape{
+		SQL:          claimProofFencedSQL,
+		Family:       "claim_proof_fenced_not_exists_fork",
+		FirstEmitter: emitterFork39c75474,
+		LastEmitter:  emitterForkA0037a7e,
+		Removal:      "once no node runs a build from 39c75474..a0037a7e and no retained WAL predates 431c3a92",
+	})
+
+	// The old-column clears of the first credentials_split_v1 build (fork
+	// b1c95566 through 53341a75, unreleased), which emptied
+	// users.password_hash and tokens.token_hash once the split had latched. The
+	// current tree dual-writes instead and never clears in this release
+	// (docs/design/credentials-clear.md). A host still on that build — the lab
+	// ran it — emits these during the roll onto this one, and dropping them
+	// would back-pressure its stream; they are receive-only here and LWW-gated
+	// like any full-PK update. (The hosts.ipmi_pass clear is the same shape as
+	// configure_host_v130's ipmi_pass-only variant, already above.)
+	for _, sql := range []string{
+		`UPDATE users SET password_hash = ?, updated_at = ? WHERE username = ?`,
+		`UPDATE tokens SET token_hash = ?, updated_at = ? WHERE id = ?`,
+	} {
+		out = append(out, HistoricalShape{
+			SQL:          sql,
+			Family:       "credentials_split_clear_v56",
+			FirstEmitter: emitterForkB1c95566,
+			LastEmitter:  emitterFork53341a75,
+			Removal:      "once no node runs a build from b1c95566..53341a75 and no retained WAL predates the dual-write fix",
+		})
+	}
 
 	return out
 }

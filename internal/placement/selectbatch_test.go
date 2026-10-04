@@ -1,6 +1,8 @@
 package placement
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -175,25 +177,64 @@ func TestSelectBatch_PinnedHost(t *testing.T) {
 	}
 }
 
+// A pin to a host that cannot take the VM is that VM's infeasibility, reported
+// in its result like any other unsatisfiable hard constraint.
+func assertPinRefused(t *testing.T, results map[string]BatchResult, err error, vm, pin string) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("a bad pin failed the whole batch: %v", err)
+	}
+	r := results[vm]
+	if r.Host != "" || !errors.Is(r.Err, ErrNoEligibleHost) || !strings.Contains(r.Err.Error(), pin) {
+		t.Fatalf("%s: got %+v, want no host and a no-eligible-host error naming %q", vm, r, pin)
+	}
+}
+
 func TestSelectBatch_PinnedHost_NotFound(t *testing.T) {
 	hosts := makeHosts("node1")
-	_, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
 		{VMName: "vm1", PinHost: "missing"},
 	})
-	if err == nil {
-		t.Fatal("expected error for missing pinned host")
-	}
+	assertPinRefused(t, results, err, "vm1", "missing")
 }
 
 func TestSelectBatch_PinnedHost_Inactive(t *testing.T) {
 	hosts := []corrosion.HostRecord{
 		{Name: "drain", State: "draining", CPUTotal: 32, MemTotal: 65536},
 	}
-	_, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
 		{VMName: "vm1", PinHost: "drain"},
 	})
-	if err == nil {
-		t.Fatal("expected error for inactive pinned host")
+	assertPinRefused(t, results, err, "vm1", "drain")
+}
+
+// One VM's bad pin does not take the batch down with it (kvm003 drill 6: pp4,
+// pinned to a down host, stranded every other VM of the failed host). The rest
+// are still placed batch-aware: the refused VM commits nothing, and what is
+// committed before and after it still counts against anti-affinity and
+// capacity.
+func TestSelectBatch_BadPinStrandsOnlyItsVM(t *testing.T) {
+	hosts := []corrosion.HostRecord{
+		{Name: "node1", State: "active", CPUTotal: 32, MemTotal: 4096},
+		{Name: "node2", State: "active", CPUTotal: 32, MemTotal: 4096},
+		{Name: "down", State: "fenced", CPUTotal: 32, MemTotal: 65536},
+	}
+	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
+		{VMName: "web-1", MemMiBNeeded: 1500},
+		{VMName: "pinned", MemMiBNeeded: 1500, PinHost: "down"},
+		{VMName: "web-2", MemMiBNeeded: 1500, AntiAffinity: []string{"web-1"}},
+		{VMName: "big", MemMiBNeeded: 1400},
+	})
+	assertPinRefused(t, results, err, "pinned", "down")
+	w1, w2 := results["web-1"].Host, results["web-2"].Host
+	if w1 == "" || w2 == "" || w1 == w2 {
+		t.Fatalf("web-1 on %q, web-2 on %q: want both placed, apart", w1, w2)
+	}
+	// Allocatable is 3072 MiB a host (the 1024 default reserve). web-1 and
+	// web-2 hold 1628 each with qemu overhead, leaving 1444: "big" needs 1528
+	// and fits only if the batch forgot what it committed.
+	if r := results["big"]; r.Host != "" || !errors.Is(r.Err, ErrNoEligibleHost) {
+		t.Fatalf("big: got %+v, want refused for capacity the batch already committed", r)
 	}
 }
 

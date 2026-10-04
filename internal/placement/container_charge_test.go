@@ -35,9 +35,22 @@ func TestContainerAllocation_MatchesTheSnapshotCountingRule(t *testing.T) {
 	}
 }
 
+// withLXC labels every host as able to run a container (litevirt.lxc=true),
+// which placement requires of a container's host.
+func withLXC(hosts []corrosion.HostRecord) []corrosion.HostRecord {
+	for i := range hosts {
+		labels := map[string]string{corrosion.LabelLXCCapable: "true"}
+		for k, v := range hosts[i].Labels {
+			labels[k] = v
+		}
+		hosts[i].Labels = labels
+	}
+	return hosts
+}
+
 // 1947 MiB allocatable: a 1900 MiB container fits (a VM would need 2028).
 func TestSelectBatch_ContainerChargesNoQemuOverhead(t *testing.T) {
-	results, err := SelectBatch(labHosts()[1:2], nil, nil, nil, nil, time.Time{}, []Request{{
+	results, err := SelectBatch(withLXC(labHosts()[1:2]), nil, nil, nil, nil, time.Time{}, []Request{{
 		VMName: "c", Container: true, MemMiBNeeded: 1900,
 	}})
 	if err != nil {
@@ -51,7 +64,7 @@ func TestSelectBatch_ContainerChargesNoQemuOverhead(t *testing.T) {
 // A container's cpu figure is not a vCPU reservation: 15 allocatable vCPU on
 // node-2, a container asking for 64 still places.
 func TestSelectBatch_ContainerChargesNoVCPU(t *testing.T) {
-	results, err := SelectBatch(labHosts()[1:2], nil, nil, nil, nil, time.Time{}, []Request{{
+	results, err := SelectBatch(withLXC(labHosts()[1:2]), nil, nil, nil, nil, time.Time{}, []Request{{
 		VMName: "c", Container: true, CPUNeeded: 64, MemMiBNeeded: 256,
 	}})
 	if err != nil {
@@ -65,7 +78,7 @@ func TestSelectBatch_ContainerChargesNoVCPU(t *testing.T) {
 // A container placed earlier in a batch holds its memory and nothing else: no
 // VMCount slot (so no overhead charged to it) and no vCPU.
 func TestSelectBatch_CommittedContainerHoldsMemoryOnly(t *testing.T) {
-	hosts := labHosts()[1:2]
+	hosts := withLXC(labHosts()[1:2])
 	hosts[0].CPUTotal = 1 // 4×1 − 1 = 3 allocatable vCPU
 	results, err := SelectBatch(hosts, nil, nil, nil, nil, time.Time{}, []Request{
 		{VMName: "c", Container: true, CPUNeeded: 3, MemMiBNeeded: 1000},
@@ -85,7 +98,7 @@ func TestSelectBatch_CommittedContainerHoldsMemoryOnly(t *testing.T) {
 func TestSelectBatch_ContainerUpdateReplacesItsMemory(t *testing.T) {
 	ct := corrosion.ContainerRecord{HostName: "node-2", Name: "c", State: "running", MemMiB: 1500}
 	ctMem := corrosion.ContainerMemoryByHost([]corrosion.ContainerRecord{ct})
-	results, err := SelectBatch(labHosts()[1:2], nil, nil, ctMem, nil, time.Time{}, []Request{{
+	results, err := SelectBatch(withLXC(labHosts()[1:2]), nil, nil, ctMem, nil, time.Time{}, []Request{{
 		VMName: "c", Container: true, MemMiBNeeded: 1600, PinHost: "node-2", Replaces: ContainerAllocation(ct),
 	}})
 	if err != nil {
@@ -98,7 +111,7 @@ func TestSelectBatch_ContainerUpdateReplacesItsMemory(t *testing.T) {
 
 // A container's memory shortfall is reported without an overhead it does not pay.
 func TestSelectBatch_ContainerRejectionHasNoOverhead(t *testing.T) {
-	results, err := SelectBatch(labHosts()[1:2], nil, nil, nil, nil, time.Time{}, []Request{{
+	results, err := SelectBatch(withLXC(labHosts()[1:2]), nil, nil, nil, nil, time.Time{}, []Request{{
 		VMName: "c", Container: true, MemMiBNeeded: 2000,
 	}})
 	if err != nil {

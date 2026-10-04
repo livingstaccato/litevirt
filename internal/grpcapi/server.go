@@ -45,6 +45,9 @@ type Server struct {
 	// runtime-inventory collector can read markers. Empty disables marker reads
 	// (they report missing).
 	containersRoot string
+	// supersededRetentionDays is superseded_disk_retention_days, reported by
+	// SupersededDisks (superseded_disks.go).
+	supersededRetentionDays int
 
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
@@ -296,6 +299,8 @@ type Server struct {
 	enfProjectAuthority bool
 	// commitFenceHook is a test-only seam; see SetCommitFenceHook.
 	commitFenceHook func(op string)
+	// restoreClaimedHook is a test-only seam; see SetRestoreClaimedHook.
+	restoreClaimedHook func(name string)
 	// repairLeaseHook is a test-only seam run while a compose repair holds the
 	// VM's start lease, before it touches the domain.
 	repairLeaseHook func(vmName string)
@@ -319,10 +324,38 @@ type Server struct {
 	// cluster is big enough that enforcing does not break failover".
 	enfLeaseTerm   bool
 	leaseTermReady func() bool
+	// enfRecoveryClaim is enforcement.recovery_claim: the opt-in that lets
+	// recovery_claim_v1 be advertised (with RecoveryClaimReadiness) and the
+	// reversible kill switch afterwards (recovery_claim_enforce.go).
+	enfRecoveryClaim bool
+	// enfPartitionPause is enforcement.partition_pause (default on): this node
+	// pauses its recoverable workloads on losing the voter majority, so it may
+	// advertise partition_pause_v1 (docs/design/partition-pause.md §5).
+	// Atomic because Ready reports it on every health probe.
+	enfPartitionPause atomic.Bool
+	// peerPause holds each peer's latest answer to the health probe about its
+	// own partition pause (ready.go), which a failover coordinator relies on.
+	peerPause peerPauseAnswers
+	// forced records forced voter generations this node refused to adopt
+	// (voter_force.go), for ha.voter.forced.
+	forced forcedConflicts
+	// abstain caches each voter's abstention check for ha.voter.unavailable
+	// (recovery_claim_inspect.go).
+	abstain abstainCache
 	// enfIsolationEpoch gates isolation_epoch_v1 advertisement (§A): with it on
 	// and the token latched, this node refuses replication from an isolated host.
 	enfIsolationEpoch bool
 	ownerEpochReady   func() bool
+
+	// claims is the per-process recovery-claim state: signing identity,
+	// verifier, proposer, owner-probe cache and last refusals
+	// (recovery_claims.go). voterConfigReady caches a positive
+	// VoterConfigReadiness, which cannot regress within a process.
+	claims           claimRuntime
+	voterConfigReady atomic.Bool
+	// voterChangeMu serializes automatic genesis with `lv cluster voter`
+	// changes on this node, so one process proposes one change at a time.
+	voterChangeMu sync.Mutex
 
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
@@ -523,10 +556,24 @@ type Server struct {
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
 
+	// migrationStubs is what EnsureDisks created on this host as a migration
+	// target: the only disk files this host hands to a mirror or removes after
+	// a failed attempt (migrate_stubs.go). Zero value ready.
+	migrationStubs migrationStubLedger
+
 	// vmLocks provides per-VM mutual exclusion for operations that must not
 	// run concurrently (e.g. snapshot + migration, backup + delete).
 	vmLocksMu sync.Mutex
 	vmLocks   map[string]*sync.Mutex
+
+	// admissionMu makes this node a single serialization point for its
+	// reserve-then-verify decisions: it is held from a provisional claim's
+	// reserve through its verify to its admitted marker (decideReservation),
+	// so no other local admission can verify inside that gap. Never held across
+	// a peer call. admissionVerifiedHook is a test-only seam run inside it,
+	// after verify passes and before the marker is written.
+	admissionMu           sync.Mutex
+	admissionVerifiedHook func(opID string)
 
 	// activeBackups tracks VMs this daemon is *currently* backing up. It's
 	// in-memory, so it's empty after a restart — which is exactly what lets
@@ -831,6 +878,26 @@ func (s *Server) advertisedCapabilities() []string {
 	// The gap withholding WOULD close — a latched token proving config uniformity
 	// — is reported directly by `lv doctor fence` instead, which asks each host
 	// for its own posture. See TestAdvertise_SharedStorageFenceIsUnconditional.
+	// credentials_split_v1 is deliberately NOT withheld here either. It is a
+	// fact about the build — this binary decodes the credential tables and
+	// reads a secret from them first — so there is nothing a flag could
+	// truthfully withhold, and the guarantee it licenses (clearing the old
+	// columns) is enforced by the latch itself, which is ReplicationGated and so
+	// cannot form while any replication recipient is on a build that reads the
+	// old columns only.
+	// host_membership_split_v1 is not withheld either, for the same reason: it
+	// is a fact about the build (this binary decodes host_membership and reads
+	// state and isolation from it), and the guarantee it licenses — emitting
+	// host_membership statements — is enforced by the latch itself, which is
+	// ReplicationGated and so cannot form while any replication recipient
+	// cannot decode them.
+	// failover_scope_v1 is not withheld either: it is a fact about the build
+	// (this binary decodes cluster_policies and honours failover_scope). The
+	// opt-in is the replicated policy row, which cannot be written until the
+	// ReplicationGated latch has formed.
+	// claim_incarnation_v1 is not withheld either: it is the claim format this
+	// binary's voters keep (an incarnation in the key, the v2 accept, the
+	// legacy-key seal), a fact about the build.
 	// hardware_v2 (CONTRACT h) is advertised only once this node is READY: its
 	// backfill audit pass has populated the typed-hardware tables (hwV2Ready) AND
 	// operation_protocol_v1 is active (the crash-safe operation journal is a hard
@@ -857,6 +924,37 @@ func (s *Server) advertisedCapabilities() []string {
 	// across a node that never proved it could honour it.
 	if !s.enfLeaseTerm || s.leaseTermReady == nil || !s.leaseTermReady() {
 		caps = withoutCapability(caps, capabilities.LeaseTermV1)
+	}
+	// voter_config_v1 is MANDATORY — no flag, because a node with one off would
+	// count a different majority from its peers — but it is advertised only
+	// once this node can vote durably: synchronous=FULL and a loadable signing
+	// key (VoterConfigReadiness, local reads only). Latching it across a node
+	// that cannot keep a promise would put that node's forgotten promises under
+	// every decision it takes part in.
+	if !s.voterConfigAdvertisable() {
+		caps = withoutCapability(caps, capabilities.VoterConfigV1)
+	}
+	// recovery_claim_v1 is withheld while enforcement.recovery_claim is off,
+	// and the reason is the question CLAUDE.md asks of every token: where is
+	// the guarantee enforced? At EXECUTION. A coordinator cannot stop another
+	// coordinator from minting, so every flag-on node relies on every peer
+	// claiming before it mints and verifying before it executes, and a
+	// flag-off peer is the uncertified second owner — not merely permissive.
+	// The latch has to mean config uniformity. Readiness is local reads only
+	// (this runs inside the Ping handler). See
+	// TestAdvertise_RecoveryClaimWithheldWhileOff and, for the opposite answer
+	// to the same question, TestAdvertise_SharedStorageFenceIsUnconditional.
+	if !s.enfRecoveryClaim || !s.recoveryClaimAdvertisable() {
+		caps = withoutCapability(caps, capabilities.RecoveryClaimV1)
+	}
+	// partition_pause_v1 is withheld while enforcement.partition_pause is off,
+	// for the same answer to the same question: the guarantee is enforced on
+	// the minority, which pauses, and RELIED ON by the majority, which waits
+	// out that pause and then starts a replacement. A flag-off peer would
+	// still be running the copy. See TestAdvertise_PartitionPauseWithheldWhileOff
+	// and docs/design/partition-pause.md §5.
+	if !s.enfPartitionPause.Load() {
+		caps = withoutCapability(caps, capabilities.PartitionPauseV1)
 	}
 	return caps
 }
@@ -1085,6 +1183,12 @@ func (s *Server) SetProjectAuthorityEnforce(on bool) { s.enfProjectAuthority = o
 // operation starts and cleared after.
 func (s *Server) SetCommitFenceHook(h func(op string)) { s.commitFenceHook = h }
 
+// SetRestoreClaimedHook is a test-only seam: RestoreContainer calls h with the
+// container's name right after it has claimed a carried relocation proof, and
+// before it takes the container's lock — the window an operator release of
+// that proof can land in. Production never calls this.
+func (s *Server) SetRestoreClaimedHook(h func(name string)) { s.restoreClaimedHook = h }
+
 // fireCommitFenceHook runs the test hook, if any, naming the operation about to
 // evaluate its commit fence.
 func (s *Server) fireCommitFenceHook(op string) {
@@ -1196,8 +1300,36 @@ func (s *Server) tokenEnabled(token string) bool {
 		return s.enfAuditSignature
 	case capabilities.OwnerEpochV1:
 		return s.enfOwnerEpoch
+	case capabilities.CredentialsSplitV1:
+		// No kill switch, for the lease_term_ledger_v1 reason: the token says
+		// this build decodes the credential tables' shapes and reads a secret
+		// from them — a fact about the binary. A flag-gated token would never be
+		// driven, never latch, and leave the secrets in the public dump.
+		return true
+	case capabilities.HostMembershipSplitV1:
+		// No kill switch, for the credentials_split_v1 reason: the token says
+		// this build decodes host_membership and reads state from it — a fact
+		// about the binary. A flag-gated token would never latch.
+		return true
+	case capabilities.FailoverScopeV1:
+		// No kill switch: the token says this build decodes cluster_policies
+		// and honours failover_scope. The opt-in is the replicated policy row.
+		return true
+	case capabilities.VoterConfigV1:
+		// No kill switch: a node with voter_config_v1 off would count a
+		// different majority from its peers. Its stand-down is the decided
+		// `lv cluster voter reset`, which moves every node at one generation.
+		return true
+	case capabilities.ClaimIncarnationV1:
+		// No kill switch: it is the claim format this build's voters keep,
+		// and a coordinator relies on every voter keeping it.
+		return true
 	case capabilities.LeaseTermV1:
 		return s.enfLeaseTerm
+	case capabilities.RecoveryClaimV1:
+		return s.enfRecoveryClaim
+	case capabilities.PartitionPauseV1:
+		return s.enfPartitionPause.Load()
 	case capabilities.IsolationEpochV1:
 		return s.enfIsolationEpoch
 	case capabilities.NetBoxIPAMV1:
@@ -1582,7 +1714,7 @@ type StoragePoolRef struct {
 
 // NewServer creates a new gRPC service handler.
 func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt LibvirtBackend, images *image.Store) *Server {
-	return &Server{
+	s := &Server{
 		hostName:       hostName,
 		dataDir:        dataDir,
 		pkiDir:         pkiDir,
@@ -1597,6 +1729,27 @@ func NewServer(hostName, dataDir, pkiDir string, db *corrosion.Client, virt Libv
 		fetchBinarySem: make(chan struct{}, fetchBinaryMaxConcurrent),
 		pushBackupSem:  make(chan struct{}, pushBackupMaxConcurrent),
 	}
+	s.wireCertificateVerifier()
+	return s
+}
+
+// wireCertificateVerifier makes a proof's claim certificate replaceable only
+// by one that verifies on this node, on the write path and in the
+// anti-entropy merge alike (corrosion.ClaimCertificateReplaces).
+func (s *Server) wireCertificateVerifier() {
+	if s.db != nil {
+		s.db.SetClaimCertificateVerifier(s.certificateVerifier)
+	}
+}
+
+// certificateVerifier is this node's claim verifier, nil while the cluster CA
+// cannot be loaded (nothing then verifies, and no certificate is replaced).
+func (s *Server) certificateVerifier() *corrosion.ClaimVerifier {
+	_, v, err := s.claimIdentity()
+	if err != nil {
+		return nil
+	}
+	return v
 }
 
 // SetAuthEngine wires the path-based RBAC engine. Called by the daemon

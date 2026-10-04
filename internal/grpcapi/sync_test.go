@@ -109,7 +109,7 @@ func TestStreamStateDump_MatchesUnaryAndMerges(t *testing.T) {
 	defer func(orig int) { stateDumpChunkSize = orig }(stateDumpChunkSize)
 	stateDumpChunkSize = 16
 
-	stream := &fakeDumpStream{ctx: adminCtx()}
+	stream := &fakeDumpStream{ctx: unrowedPeerCtx()}
 	if err := s.StreamStateDump(&emptypb.Empty{}, stream); err != nil {
 		t.Fatalf("StreamStateDump: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestStreamStateDump_EmptyDump(t *testing.T) {
 	if data := s.db.DumpStateBytes(); len(data) != 0 {
 		t.Skipf("test DB is not empty (%d bytes); empty-dump path not exercised", len(data))
 	}
-	stream := &fakeDumpStream{ctx: adminCtx()}
+	stream := &fakeDumpStream{ctx: unrowedPeerCtx()}
 	if err := s.StreamStateDump(&emptypb.Empty{}, stream); err != nil {
 		t.Fatalf("StreamStateDump: %v", err)
 	}
@@ -149,8 +149,9 @@ func TestStreamStateDump_EmptyDump(t *testing.T) {
 	}
 }
 
-// Non-operators are rejected, same as the unary GetStateDump.
-func TestStreamStateDump_RequiresOperator(t *testing.T) {
+// An unauthenticated caller is rejected, same as the unary GetStateDump. The
+// full peer-only matrix is TestStateDump_PeerOnly.
+func TestStreamStateDump_RequiresPeer(t *testing.T) {
 	s := testServer(t)
 	stream := &fakeDumpStream{ctx: context.Background()} // no principal
 	if err := s.StreamStateDump(&emptypb.Empty{}, stream); err == nil {
@@ -216,7 +217,102 @@ func TestReplicationRPCsRequirePeerMTLS(t *testing.T) {
 	if _, err := s.PushMutations(replicationPeerCtx("node-a"), &pb.ReplicateRequest{Sender: "node-a", AfterSeq: 7}); err != nil {
 		t.Fatalf("PushMutations with matching peer CN: %v", err)
 	}
-	if _, err := s.AckMutations(replicationPeerCtx("node-a"), &pb.AckRequest{Sender: "node-a", AckedSeq: 7}); err != nil {
-		t.Fatalf("AckMutations with matching peer CN: %v", err)
+}
+
+// AckMutations has never had a caller: the replicator advances a peer's
+// watermark itself, from the AppliedUpTo of each push it makes. The RPC was a
+// second, unsolicited writer of that same row. Through it, an authenticated
+// peer could move this node's push cursor for it past entries it never
+// received (they would never be sent), or keep re-acking a low sequence to
+// keep its watermark fresh and hold back log compaction until the retention
+// ceiling (#218). It now refuses, and writes nothing.
+//
+// Mutation: restore the watermark upsert — the call succeeds and the row
+// reads 1000.
+func TestAckMutations_RefusesAndWritesNoWatermark(t *testing.T) {
+	s := testServer(t)
+	_, err := s.AckMutations(replicationPeerCtx("node-a"), &pb.AckRequest{Sender: "node-a", AckedSeq: 1000})
+	if status.Code(err) != codes.Unimplemented {
+		t.Fatalf("AckMutations from a matching peer: code = %v, want Unimplemented (err=%v)", status.Code(err), err)
+	}
+	rows, qErr := s.db.Query(adminCtx(), `SELECT last_seq FROM replication_watermarks WHERE peer_name = ?`, "node-a")
+	if qErr != nil {
+		t.Fatalf("read watermark: %v", qErr)
+	}
+	if len(rows) != 0 {
+		t.Errorf("AckMutations wrote a watermark (last_seq=%s); the replicator alone owns that row",
+			rows[0].String("last_seq"))
+	}
+}
+
+// GetTableBucketDigests answers for sensitive tables too, so it takes the
+// sensitive lane's rule: a host certificate that names the sender.
+func TestGetTableBucketDigests_PeerOnlyAndScheme(t *testing.T) {
+	s := testServer(t)
+	req := &pb.BucketDigestRequest{Sender: "node-a", Tables: []string{"stacks", "registry_credentials"}, Scheme: corrosion.BucketScheme}
+	for name, ctx := range map[string]context.Context{
+		"unauthenticated": context.Background(),
+		"operator":        adminCtx(),
+		"mismatched CN":   replicationPeerCtx("node-b"),
+	} {
+		if _, err := s.GetTableBucketDigests(ctx, req); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("%s: code = %v, want PermissionDenied (err=%v)", name, status.Code(err), err)
+		}
+	}
+	resp, err := s.GetTableBucketDigests(replicationPeerCtx("node-a"), req)
+	if err != nil {
+		t.Fatalf("matching peer: %v", err)
+	}
+	if resp.GetScheme() != corrosion.BucketScheme || resp.GetBucketCount() != corrosion.BucketCount || len(resp.GetTables()) != 2 {
+		t.Fatalf("response = %+v, want this build's scheme and both tables", resp)
+	}
+	// Another scheme: this build's scheme back, and nothing to compare.
+	other := &pb.BucketDigestRequest{Sender: "node-a", Tables: []string{"stacks"}, Scheme: corrosion.BucketScheme + 1}
+	resp, err = s.GetTableBucketDigests(replicationPeerCtx("node-a"), other)
+	if err != nil || resp.GetScheme() != corrosion.BucketScheme || len(resp.GetTables()) != 0 {
+		t.Fatalf("other scheme: resp=%+v err=%v, want this scheme and no tables", resp, err)
+	}
+}
+
+type fakePageStream struct {
+	grpc.ServerStreamingServer[pb.TableRowsPage]
+	ctx   context.Context
+	pages []*pb.TableRowsPage
+}
+
+func (f *fakePageStream) Context() context.Context { return f.ctx }
+func (f *fakePageStream) Send(p *pb.TableRowsPage) error {
+	f.pages = append(f.pages, p)
+	return nil
+}
+
+// The paged pulls keep their blob counterparts' rules: the public one is
+// peer-only and refuses a sensitive table, the sensitive one pins the sender.
+func TestStreamTableRows_PeerOnly(t *testing.T) {
+	s := testServer(t)
+	req := &pb.TableDumpRequest{Tables: []string{"stacks"}}
+	for name, ctx := range map[string]context.Context{"unauthenticated": context.Background(), "operator": adminCtx(), "client cert": lvCLICertCtx("lv-cli")} {
+		if err := s.StreamTableRows(req, &fakePageStream{ctx: ctx}); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("StreamTableRows %s: code = %v, want PermissionDenied", name, status.Code(err))
+		}
+	}
+	peer := peerCtxFor(t, s, "peer-1")
+	ok := &fakePageStream{ctx: peer}
+	if err := s.StreamTableRows(req, ok); err != nil || len(ok.pages) == 0 || !ok.pages[len(ok.pages)-1].GetFinal() {
+		t.Fatalf("peer StreamTableRows: err=%v pages=%d", err, len(ok.pages))
+	}
+	sens := &pb.TableDumpRequest{Tables: []string{"user_credentials"}}
+	if err := s.StreamTableRows(sens, &fakePageStream{ctx: peer}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a sensitive table on the public paged pull: code = %v, want InvalidArgument", status.Code(err))
+	}
+
+	sreq := &pb.SensitiveStateRequest{Sender: "node-a"}
+	for name, ctx := range map[string]context.Context{"operator": adminCtx(), "mismatched CN": replicationPeerCtx("node-b")} {
+		if err := s.StreamSensitiveTableRows(sreq, &fakePageStream{ctx: ctx}); status.Code(err) != codes.PermissionDenied {
+			t.Errorf("StreamSensitiveTableRows %s: code = %v, want PermissionDenied", name, status.Code(err))
+		}
+	}
+	if err := s.StreamSensitiveTableRows(sreq, &fakePageStream{ctx: replicationPeerCtx("node-a")}); err != nil {
+		t.Fatalf("matching peer StreamSensitiveTableRows: %v", err)
 	}
 }

@@ -131,6 +131,9 @@ type Reconciler struct {
 
 	// transferDisks: disks a pending transfer rebuilt here (superseded_disk.go).
 	transferDisks transferDisks
+	// deferredTransfers: proof-less transfers parked in "starting" while their
+	// backing image transfers (missing_disk.go).
+	deferredTransfers deferredTransfers
 
 	// ownerMu guards ownershipFirstSeen, the debounce map recording when each VM
 	// was first observed running-locally-but-owned-elsewhere, so a transient
@@ -567,6 +570,8 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 		slog.Error("reconciler: list VMs", "error", err)
 		return
 	}
+
+	r.resolveDiskMissing(ctx)
 
 	for _, vm := range vms {
 		switch vm.State {
@@ -1161,7 +1166,10 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 	// An ownership transfer onto this host (the coordinator's pending row, or
 	// its proof after a crash or re-arm), as opposed to a local start: it never
 	// finds the VM's current host-local disk here (superseded_disk.go).
-	transfer := fresh.State == "pending" || proofID != ""
+	// A proof-less transfer whose image pull outlived the walk is parked in
+	// "starting" (deferPendingStart) and is still that transfer.
+	transfer := fresh.State == "pending" || proofID != "" ||
+		(fresh.State == "starting" && r.deferredTransfers.has(vm.Name))
 
 	// A proof MARKER present with NO gate wired fails CLOSED: we can't verify quorum,
 	// and a marker implies enforcement was active when it was stamped. (Production
@@ -1466,6 +1474,12 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		}
 		// Verify disk file exists on this host.
 		if _, err := os.Stat(d.Path); err != nil {
+			if !transfer {
+				// A local start of a VM whose disk is gone: never rebuilt
+				// blank (missing_disk.go).
+				r.refuseLocalStartWithoutDisk(ctx, vm.Name, d)
+				return
+			}
 			// If disk has a backing image, try auto-pulling it and recreating the overlay.
 			if d.BackingImage != "" && r.autoPullImage != nil {
 				slog.Info("reconciler: disk missing, attempting auto-pull of backing image",
@@ -1480,6 +1494,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 						// parked in error for a transfer that is going fine.
 						slog.Info("reconciler: backing image still transferring; the start resumes on a later pass",
 							"vm", vm.Name, "disk", d.DiskName, "image", d.BackingImage)
+						if proofID == "" {
+							r.deferredTransfers.add(vm.Name)
+						}
 						r.deferPendingStart(ctx, vm.Name, proofID,
 							fmt.Sprintf("waiting for backing image %s to finish transferring", d.BackingImage))
 						return
@@ -1530,6 +1547,8 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 			Bus:  bus,
 		})
 	}
+	// Every disk is in place: a parked transfer has done its rebuilding.
+	r.deferredTransfers.drop(vm.Name)
 
 	// Check for cloud-init ISO. The reconciler acts on a stored (possibly
 	// peer-replicated) row, so build the ISO path through the validated builder

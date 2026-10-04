@@ -24,8 +24,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		Role:     r.FormValue("role"),
 	})
 	if err != nil {
-		sendToast(w, "Create user failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Create user", err)
 		return
 	}
 	sendToast(w, "User "+r.FormValue("username")+" created", "success")
@@ -37,8 +36,7 @@ func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	_, err := s.grpc.DeleteUser(s.uiBearerCtx(r), &pb.DeleteUserRequest{Username: name})
 	if err != nil {
-		sendToast(w, "Delete user failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Delete user", err)
 		return
 	}
 	sendToast(w, "User "+name+" deleted", "success")
@@ -59,8 +57,7 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		ScopePaths: scopes,
 	})
 	if err != nil {
-		sendToast(w, "Create token failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Create token", err)
 		return
 	}
 	sendToast(w, "Token created: "+token.Token, "success")
@@ -89,8 +86,7 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	_, err := s.grpc.RevokeToken(s.uiBearerCtx(r), &pb.RevokeTokenRequest{Id: id})
 	if err != nil {
-		sendToast(w, "Revoke token failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Revoke token", err)
 		return
 	}
 	sendToast(w, "Token revoked", "success")

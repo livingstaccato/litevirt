@@ -61,7 +61,7 @@ func (s *Server) handleAddRegistryCredential(w http.ResponseWriter, r *http.Requ
 		Global: global, Registry: registry, Username: username, Password: password,
 	}); err != nil {
 		sendToast(w, "save failed: "+grpcMsg(err), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Credential for "+registry+" saved", "success")
@@ -81,7 +81,7 @@ func (s *Server) handleDeleteRegistryCredential(w http.ResponseWriter, r *http.R
 		Global: global, Registry: registry,
 	}); err != nil {
 		sendToast(w, "delete failed: "+grpcMsg(err), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		w.WriteHeader(httpStatusFor(err))
 		return
 	}
 	sendToast(w, "Credential removed", "success")

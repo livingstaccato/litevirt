@@ -85,8 +85,7 @@ func (s *Server) handleCreateReplSchedule(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if _, err := s.grpc.CreateReplicationSchedule(s.uiBearerCtx(r), req); err != nil {
-		sendToast(w, "Add replication schedule failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Add replication schedule", err)
 		return
 	}
 	sendToast(w, "Replication schedule added", "success")
@@ -109,8 +108,7 @@ func (s *Server) handleDeleteReplSchedule(w http.ResponseWriter, r *http.Request
 		TargetPool:  q.Get("target"),
 	}
 	if _, err := s.grpc.DeleteReplicationSchedule(s.uiBearerCtx(r), req); err != nil {
-		sendToast(w, "Delete replication schedule failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Delete replication schedule", err)
 		return
 	}
 	sendToast(w, "Replication schedule removed", "success")
@@ -210,8 +208,7 @@ func (s *Server) handleCreateSchedule(w http.ResponseWriter, r *http.Request) {
 		Enabled:     r.FormValue("enabled") == "on",
 	}
 	if _, err := s.grpc.CreateBackupSchedule(s.uiBearerCtx(r), req); err != nil {
-		sendToast(w, "Add schedule failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Add schedule", err)
 		return
 	}
 	sendToast(w, "Backup schedule added", "success")
@@ -236,8 +233,7 @@ func (s *Server) handleDeleteSchedule(w http.ResponseWriter, r *http.Request) {
 		Repo:        q.Get("repo"),
 	}
 	if _, err := s.grpc.DeleteBackupSchedule(s.uiBearerCtx(r), req); err != nil {
-		sendToast(w, "Delete schedule failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Delete schedule", err)
 		return
 	}
 	sendToast(w, "Backup schedule removed", "success")

@@ -75,8 +75,7 @@ func (s *Server) handleCreateNotifyTarget(w http.ResponseWriter, r *http.Request
 	if _, err := s.grpc.CreateNotificationTarget(s.uiBearerCtx(r), &pb.CreateNotificationTargetRequest{
 		Name: name, Type: typ, Config: string(cfg), Enabled: true,
 	}); err != nil {
-		sendToast(w, "create failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "create", err)
 		return
 	}
 	sendToast(w, "Target "+name+" created", "success")
@@ -92,8 +91,7 @@ func (s *Server) handleDeleteNotifyTarget(w http.ResponseWriter, r *http.Request
 	}
 	if _, err := s.grpc.DeleteNotificationTarget(s.uiBearerCtx(r),
 		&pb.DeleteNotificationTargetRequest{Id: r.PathValue("id")}); err != nil {
-		sendToast(w, "delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "delete", err)
 		return
 	}
 	sendToast(w, "Target deleted", "success")
@@ -162,8 +160,7 @@ func (s *Server) handleCreateNotifyRoute(w http.ResponseWriter, r *http.Request)
 	if _, err := s.grpc.CreateNotificationRoute(s.uiBearerCtx(r), &pb.CreateNotificationRouteRequest{
 		EventPattern: pattern, TargetId: target, MinSeverity: minSev, Enabled: true,
 	}); err != nil {
-		sendToast(w, "create failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "create", err)
 		return
 	}
 	sendToast(w, "Route created", "success")

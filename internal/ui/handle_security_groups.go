@@ -62,14 +62,6 @@ func (s *Server) handleSGCreateModal(w http.ResponseWriter, r *http.Request) {
 	s.renderFragment(w, "sg_create_modal.html", nil)
 }
 
-// sgWriteFailed reports a refused or failed security-group RPC. The status
-// comes from the gRPC code, so the daemon's PermissionDenied reaches the
-// browser as 403 rather than as a server fault.
-func sgWriteFailed(w http.ResponseWriter, what string, err error) {
-	sendToast(w, what+" failed: "+err.Error(), "error")
-	w.WriteHeader(httpStatusFor(err))
-}
-
 // handleCreateSG creates a security group. `lv sg create`, through the same RPC.
 func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -85,7 +77,7 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.grpc.CreateSecurityGroup(s.uiBearerCtx(r), &pb.CreateSecurityGroupRequest{
 		Name: name, StackName: strings.TrimSpace(r.FormValue("stack")),
 	}); err != nil {
-		sgWriteFailed(w, "Create", err)
+		rpcWriteFailed(w, "Create", err)
 		return
 	}
 	sendToast(w, "Security group "+name+" created", "success")
@@ -98,7 +90,7 @@ func (s *Server) handleCreateSG(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteSG(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.grpc.DeleteSecurityGroup(s.uiBearerCtx(r),
 		&pb.DeleteSecurityGroupRequest{Id: r.PathValue("id")}); err != nil {
-		sgWriteFailed(w, "Delete", err)
+		rpcWriteFailed(w, "Delete", err)
 		return
 	}
 	sendToast(w, "Security group deleted", "success")
@@ -135,7 +127,7 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 			Priority:  int32(priority),
 		},
 	}); err != nil {
-		sgWriteFailed(w, "Add rule", err)
+		rpcWriteFailed(w, "Add rule", err)
 		return
 	}
 	sendToast(w, "Rule added", "success")
@@ -148,7 +140,7 @@ func (s *Server) handleAddSGRule(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteSGRule(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.grpc.RemoveSecurityGroupRule(s.uiBearerCtx(r),
 		&pb.RemoveSecurityGroupRuleRequest{Id: r.PathValue("rule")}); err != nil {
-		sgWriteFailed(w, "Delete rule", err)
+		rpcWriteFailed(w, "Delete rule", err)
 		return
 	}
 	sendToast(w, "Rule removed", "success")

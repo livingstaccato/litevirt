@@ -159,6 +159,16 @@ func httpStatusFor(err error) int {
 	return http.StatusInternalServerError
 }
 
+// rpcWriteFailed reports a refused or failed RPC to the browser: a toast
+// naming what failed and why, and the status httpStatusFor derives from the
+// gRPC code. Handlers use it instead of a hard-coded 500, so a Viewer's refused
+// delete arrives as 403 and a bad form as 400, not as a server fault
+// (TestNoUIHandlerAnswersRPCErrorWith500 holds every handler to this).
+func rpcWriteFailed(w http.ResponseWriter, what string, err error) {
+	sendToast(w, what+" failed: "+err.Error(), "error")
+	w.WriteHeader(httpStatusFor(err))
+}
+
 // uiRoleLevels mirrors the daemon's admin > operator > viewer ordering. It is a
 // local copy because internal/grpcapi does not export one; the two must agree,
 // and the UI is deliberately the more permissive of the pair only in that it

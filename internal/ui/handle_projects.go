@@ -72,8 +72,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 		ParentName: r.FormValue("parent"),
 	})
 	if err != nil {
-		sendToast(w, "Create project failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Create project", err)
 		return
 	}
 	sendToast(w, "Project '"+name+"' created", "success")
@@ -86,8 +85,7 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	name := r.URL.Query().Get("name")
 	if _, err := s.grpc.DeleteProject(s.uiBearerCtx(r), &pb.DeleteProjectRequest{Name: name}); err != nil {
-		sendToast(w, "Delete project failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Delete project", err)
 		return
 	}
 	sendToast(w, "Project '"+name+"' removed", "success")
@@ -101,8 +99,7 @@ func (s *Server) handleProjectQuotaModal(w http.ResponseWriter, r *http.Request)
 	name := r.URL.Query().Get("name")
 	q, err := s.grpc.GetProjectQuota(s.uiBearerCtx(r), &pb.GetProjectQuotaRequest{ProjectName: name})
 	if err != nil {
-		sendToast(w, "Load quota failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Load quota", err)
 		return
 	}
 	s.renderFragment(w, "project_quota_modal.html", map[string]any{"Name": name, "Quota": q})
@@ -130,8 +127,7 @@ func (s *Server) handleSetProjectQuota(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	if err != nil {
-		sendToast(w, "Set quota failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Set quota", err)
 		return
 	}
 	sendToast(w, "Quota updated for '"+name+"'", "success")

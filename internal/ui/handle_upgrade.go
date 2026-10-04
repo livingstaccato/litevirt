@@ -42,7 +42,7 @@ func (s *Server) handleUpgradeHost(w http.ResponseWriter, r *http.Request) {
 
 	stream, err := s.grpc.UpgradeHost(s.uiBearerCtx(r))
 	if err != nil {
-		http.Error(w, "Upgrade failed: "+err.Error(), 500)
+		http.Error(w, "Upgrade failed: "+err.Error(), httpStatusFor(err))
 		return
 	}
 
@@ -62,8 +62,7 @@ func (s *Server) handleUpgradeHost(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := stream.Send(req); err != nil {
 			slog.Error("upgrade stream send error", "error", err)
-			sendToast(w, "Upgrade failed: "+err.Error(), "error")
-			w.WriteHeader(500)
+			rpcWriteFailed(w, "Upgrade", err)
 			return
 		}
 	}
@@ -71,8 +70,7 @@ func (s *Server) handleUpgradeHost(w http.ResponseWriter, r *http.Request) {
 	resp, err := stream.CloseAndRecv()
 	if err != nil {
 		slog.Error("upgrade close error", "error", err)
-		sendToast(w, "Upgrade failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Upgrade", err)
 		return
 	}
 

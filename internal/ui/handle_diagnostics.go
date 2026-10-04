@@ -36,8 +36,7 @@ func (s *Server) handleForceSync(w http.ResponseWriter, r *http.Request) {
 	// secret columns — so the UI never pulls it.
 	_, err := s.grpc.TriggerAntiEntropy(s.uiBearerCtx(r), &pb.TriggerAntiEntropyRequest{})
 	if err != nil {
-		sendToast(w, "Sync failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Sync", err)
 		return
 	}
 	sendToast(w, "State sync triggered", "success")

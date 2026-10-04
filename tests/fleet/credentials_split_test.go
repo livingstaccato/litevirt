@@ -377,6 +377,9 @@ func TestFleet_CredentialsSplit_APreviousReleaseReaderAuthenticatesAfterTheLatch
 	}); err != nil {
 		t.Fatalf("CreateUser after the latch: %v", err)
 	}
+	// grace is minted on a and her token on b, so b must hold her row first;
+	// without this the token write races replication and answers NotFound.
+	c.WaitConverged(t, convergeTimeout)
 	if _, err := c.SelfClient(b).ChangePassword(ctx, &pb.ChangePasswordRequest{
 		Username: "frank", NewPassword: "fr4nk-after",
 	}); err != nil {

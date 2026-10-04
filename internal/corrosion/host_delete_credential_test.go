@@ -121,3 +121,29 @@ func TestDeleteHost_KeepsItsWireShape(t *testing.T) {
 		t.Errorf("disposition %s, want %s", e.Disposition, DispFullPKUpdate)
 	}
 }
+
+// The split pass must not undo the removal. DeleteHost tombstones the hosts row
+// and leaves ipmi_pass in the old column (a previous-release node reads it
+// there), and the retirement makes the credential row a tombstone — which is
+// exactly what needsCopy() reads as "no live row, copy the old column in". The
+// pass runs every minute, so within one cycle the removed machine's BMC password
+// was live again on every node, upserted with deleted_at = NULL and replicated.
+func TestSplitCredentials_DoesNotReviveARemovedHostsCredential(t *testing.T) {
+	ctx := context.Background()
+	c := newTestDB(t)
+	configuredHost(t, c)
+	if err := DeleteHost(ctx, c, "host-x"); err != nil {
+		t.Fatalf("DeleteHost: %v", err)
+	}
+	rep, err := c.SplitCredentials(ctx)
+	if err != nil {
+		t.Fatalf("SplitCredentials: %v", err)
+	}
+	if pass, ok := liveCredential(t, c); ok {
+		t.Fatalf("the split pass revived the removed host's credential row (ipmi_pass %q, report %+v)",
+			pass, rep)
+	}
+	if rep.Copied != 0 {
+		t.Errorf("the split pass copied %d secrets after the removal, want 0", rep.Copied)
+	}
+}

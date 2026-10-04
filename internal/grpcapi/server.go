@@ -281,6 +281,9 @@ type Server struct {
 	// (internal/pki InstallQemuMigrationTLS) and reports whether they are in
 	// place. nil means never: a storage copy then falls to the plaintext guard.
 	migrationTLS func() (bool, error)
+	// migrationTLSStatus reports this host's migration credentials for
+	// MigrationTLSStatus. nil: this host cannot report them.
+	migrationTLSStatus func() *pb.MigrationTLSHostStatus
 	// enfCanonicalIdentity is this node's kill-switch for natural-key identity
 	// resolution (snapshots/container_snapshots); gated by this flag AND the
 	// CanonicalIdentityV1 latch. Advertised CONDITIONALLY on this flag (like

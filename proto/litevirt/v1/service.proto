@@ -2887,6 +2887,12 @@ service LiteVirt {
     rpc FetchBinary(FetchBinaryRequest) returns (stream FetchBinaryChunk);
     rpc UninstallHost(UninstallHostRequest)    returns (UninstallHostResponse);
     rpc ConfigureHost(ConfigureHostRequest)    returns (Host);
+    // MigrationTLSStatus reports each host's migration-TLS credentials: the
+    // CAs it trusts, which CA issued its certificate, and when they expire.
+    // The called daemon answers for itself and asks every other host with
+    // local_only set. Read-only; `lv doctor migration-tls` and
+    // `lv host rotate-migration-ca` use it.
+    rpc MigrationTLSStatus(MigrationTLSStatusRequest) returns (MigrationTLSStatusResponse);
 
     // ── VMs ──
     rpc CreateVM(CreateVMRequest)     returns (VM);
@@ -4071,4 +4077,33 @@ message FenceEvent {
     string assurance = 4;
     string timestamp = 5;  // RFC3339
     string detail = 6;
+}
+
+message MigrationTLSStatusRequest {
+  // local_only answers for the called host alone. The fan-out sets it.
+  bool local_only = 1;
+}
+
+message MigrationTLSStatusResponse {
+  repeated MigrationTLSHostStatus hosts = 1;
+}
+
+message MigrationTLSCA {
+  // fingerprint is the lowercase hex SHA-256 of the CA certificate's DER.
+  string fingerprint = 1;
+  google.protobuf.Timestamp not_after = 2;
+}
+
+message MigrationTLSHostStatus {
+  string host = 1;
+  // error is set when the host could not answer; nothing else is then.
+  string error = 2;
+  bool provisioned = 3;
+  // validation_error is why the installer would refuse this set, or empty.
+  string validation_error = 4;
+  repeated MigrationTLSCA trusted_cas = 5;
+  string cert_issuer_fingerprint = 6;
+  google.protobuf.Timestamp cert_not_after = 7;
+  // allow_unencrypted_storage: this host falls back to plaintext.
+  bool allow_unencrypted_storage = 8;
 }

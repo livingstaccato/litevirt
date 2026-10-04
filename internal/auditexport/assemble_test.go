@@ -293,3 +293,101 @@ func TestAssemble_RefusesAReportedSeqGap(t *testing.T) {
 		t.Fatal("a reported seq gap was assembled into a document that looks whole")
 	}
 }
+
+// The size refusal must name a remedy that works. It used to send the
+// operator to plain `lv audit export`, which assembled through this same
+// function and failed the same way; the CLI now spools with Write, and only
+// `--out <file>` or stdout from the CLI reaches it.
+//
+// Mutation: restore the old message — this goes red.
+func TestAssemble_TheSizeRefusalNamesAWorkingRemedy(t *testing.T) {
+	prev := MaxAssembledBytes
+	MaxAssembledBytes = 1 << 10
+	t.Cleanup(func() { MaxAssembledBytes = prev })
+	big := strings.Repeat("x", 2<<10)
+	_, _, err := Assemble(context.Background(), func(_ context.Context, _ string) (*pb.ExportAuditChainResponse, error) {
+		return &pb.ExportAuditChainResponse{Json: `{"rows":[{"id":"` + big + `"}]}`, RowCount: 1}, nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "lv audit export --out") {
+		t.Fatalf("size refusal = %v; it must name `lv audit export --out`, the path with no cap", err)
+	}
+}
+
+// gappedPages is a two-page chain with a reported gap on each page.
+func gappedPages() *pager {
+	return &pager{pages: []*pb.ExportAuditChainResponse{
+		{Json: `{"rows":[{"id":"a","host_name":"kvm001","seq":"1"},{"id":"c","host_name":"kvm001","seq":"3"}],
+		        "signing_keys":[],
+		        "seq_gaps":[{"host_name":"kvm001","missing_from":"2","missing_to":"2"}]}`,
+			RowCount: 2, NextCursor: "1"},
+		{Json: `{"rows":[{"id":"f","host_name":"kvm001","seq":"6"}],
+		        "seq_gaps":[{"host_name":"kvm001","missing_from":"4","missing_to":"5"}]}`,
+			RowCount: 1},
+	}}
+}
+
+// TestWrite_AllowGapsExportsTheChainWithEveryGapListed: a gap that persists is
+// rows missing from a host's chain — deletion, the case an investigator most
+// needs the export for. The default refuses it, and that refusal must name the
+// way through; --allow-gaps writes the chain with EVERY page's gaps listed (a
+// later page's gaps used to be dropped behind page one's), so the document
+// cannot read as whole.
+//
+// Mutations, each red: ignore AllowGaps — the export is refused; keep only
+// the first page's seq_gaps — one gap is listed, not two; drop the remedy from
+// the refusal — the default case goes red.
+func TestWrite_AllowGapsExportsTheChainWithEveryGapListed(t *testing.T) {
+	var buf strings.Builder
+	_, err := Write(context.Background(), gappedPages().fetch, &buf, Options{})
+	if err == nil || !strings.Contains(err.Error(), "--allow-gaps") {
+		t.Fatalf("default export of a gapped chain = %v; want a refusal naming --allow-gaps", err)
+	}
+
+	buf.Reset()
+	total, err := Write(context.Background(), gappedPages().fetch, &buf, Options{AllowGaps: true})
+	if err != nil {
+		t.Fatalf("Write with AllowGaps: %v", err)
+	}
+	var doc struct {
+		Rows []map[string]string `json:"rows"`
+		Gaps []map[string]string `json:"seq_gaps"`
+	}
+	if err := json.Unmarshal([]byte(buf.String()), &doc); err != nil {
+		t.Fatalf("not one JSON document: %v\n%s", err, buf.String())
+	}
+	if total != 3 || len(doc.Rows) != 3 {
+		t.Fatalf("exported %d rows (total %d), want 3", len(doc.Rows), total)
+	}
+	var got []string
+	for _, g := range doc.Gaps {
+		got = append(got, g["missing_from"]+".."+g["missing_to"])
+	}
+	if strings.Join(got, ",") != "2..2,4..5" {
+		t.Fatalf("seq_gaps = %v, want every page's gaps: 2..2,4..5", got)
+	}
+}
+
+// Write and Assemble are one walk: Assemble's document is Write's.
+func TestWrite_MatchesAssemble(t *testing.T) {
+	pages := func() *pager {
+		return &pager{pages: []*pb.ExportAuditChainResponse{
+			{Json: `{"rows":[{"id":"a"}],"chain_heads":[{"h":"x"}],"ca_pem":"PEM"}`, RowCount: 1, NextCursor: "1"},
+			page("", `{"id":"b"}`),
+		}}
+	}
+	body, total, err := Assemble(context.Background(), pages().fetch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	wtotal, err := Write(context.Background(), pages().fetch, &buf, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if buf.String() != string(body) || wtotal != total {
+		t.Fatalf("Write = %s (%d), Assemble = %s (%d)", buf.String(), wtotal, body, total)
+	}
+	if !json.Valid(body) || !strings.Contains(string(body), `"ca_pem":"PEM"`) {
+		t.Fatalf("assembled document lost page-one evidence or is not JSON: %s", body)
+	}
+}

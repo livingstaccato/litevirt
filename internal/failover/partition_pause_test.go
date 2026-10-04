@@ -272,6 +272,49 @@ func TestPartitionPause_OneWayIsMadeVisible(t *testing.T) {
 	}
 }
 
+// An observer's failure streak starts where its row's last_seen says, as it
+// does for the fence path (observerStreakSpans): when a probe runs out its dial
+// timeout, a run advances one count every few seconds, not every
+// ProbeInterval, so (N-1) × ProbeInterval puts the start far too late. Here the
+// observers have failed "down" for three minutes on slow probes — 8 counts —
+// and "down" saw them healthy a minute ago, still well inside that run: a
+// one-way partition. Estimating from the count put the streak's start 14 s ago,
+// after "down"'s healthy rows, and the condition was never raised.
+//
+// Mutation: estimate the start from the count when last_seen is present (the
+// old detectOneWay) — partition_one_way is not raised and this goes red.
+func TestPartitionPause_OneWayReadsTheStreakStartFromLastSeen(t *testing.T) {
+	c, db, ctx, _ := pauseCoordinator(t, true)
+	ensureVoter(t, db, "down")
+	now := c.now()
+	started := now.Add(-3 * time.Minute).UTC().Format(time.RFC3339Nano)
+	for _, o := range []string{"coordinator", "alive"} {
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES (?, 'down', 'suspect', 8, ?, ?)`, o, started, now.UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	at := now.Add(-time.Minute).UTC().Format(time.RFC3339Nano)
+	for _, peer := range []string{"coordinator", "alive"} {
+		if err := db.Execute(ctx,
+			`INSERT OR REPLACE INTO host_health (observer, target, status, consecutive_failures, last_seen, updated_at)
+			 VALUES ('down', ?, 'healthy', 0, NULL, ?)`, peer, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.run(ctx)
+	row, ok, err := corrosion.GetHealthCondition(ctx, db, corrosion.PartitionPauseEvaluator,
+		corrosion.CondPartitionOneWay, "host", "down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || row.Lifecycle == corrosion.ConditionResolved {
+		t.Fatalf("partition_one_way not raised for a one-way partition whose streaks began (last_seen) "+
+			"before the host's healthy rows (%+v)", row)
+	}
+}
+
 // A coordinator that regained the voter majority moments ago decides no new
 // fence: the failure rows it holds were written during its own cut.
 //

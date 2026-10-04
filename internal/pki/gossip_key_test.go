@@ -191,3 +191,29 @@ func TestGossipKeyringState_RoundTrip(t *testing.T) {
 		t.Fatalf("off state: %+v %v", off, err)
 	}
 }
+
+// A keyring is its primary plus a set of secondaries: secondary order does not
+// change it, a different primary or a different key does.
+//
+// Mutations, each red: compare in order (the reorder case fails); drop the
+// primary check (the swapped case passes); compare lengths only (the
+// different-key case passes).
+func TestSameGossipKeyring_PrimaryAndSetOfSecondaries(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		a, b []string
+		want bool
+	}{
+		{"identical", []string{"A", "B", "C"}, []string{"A", "B", "C"}, true},
+		{"secondaries reordered", []string{"A", "C", "B"}, []string{"A", "B", "C"}, true},
+		{"empty", nil, nil, true},
+		{"primary swapped", []string{"A", "B"}, []string{"B", "A"}, false},
+		{"different secondary", []string{"A", "B", "C"}, []string{"A", "B", "D"}, false},
+		{"repeated secondary", []string{"A", "B", "B"}, []string{"A", "B", "C"}, false},
+		{"extra key", []string{"A", "B"}, []string{"A", "B", "C"}, false},
+	} {
+		if got := SameGossipKeyring(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: SameGossipKeyring(%v, %v) = %v, want %v", tc.name, tc.a, tc.b, got, tc.want)
+		}
+	}
+}

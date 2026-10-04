@@ -338,3 +338,64 @@ func TestExportAuditChain_NoGapsOnACompleteChain(t *testing.T) {
 		t.Fatalf("a contiguous chain reported gaps: %#v", g)
 	}
 }
+
+// TestExportAuditChain_AWindowIsNotAGap: --since/--until bound the export by
+// timestamp, but a host's sub-chain is walked by seq, and a host's stamps are
+// not monotone in seq (a clock stepped back). A row the window leaves out is
+// still in the table; reporting it as a seq gap tells the operator rows were
+// deleted, and Assemble then refuses the export outright. Only a seq that is
+// absent from the table, not merely outside the window, is a gap — and one of
+// those is still reported, window or not.
+//
+// Mutation: report every seq missing from the page (the old check) — the
+// "outside the window" case reports 2..2 and goes red; drop the gap report
+// altogether — the "really missing" case goes red.
+func TestExportAuditChain_AWindowIsNotAGap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seqs map[int64]string // seq -> timestamp; a seq not listed is absent
+		want []string         // "from..to" of each reported gap
+	}{
+		{"outside the window", map[int64]string{
+			1: "2026-09-22T00:00:01Z", 2: "2026-09-22T00:00:09Z", 3: "2026-09-22T00:00:03Z",
+		}, nil},
+		{"really missing", map[int64]string{
+			1: "2026-09-22T00:00:01Z", 2: "2026-09-22T00:00:09Z", 4: "2026-09-22T00:00:04Z",
+		}, []string{"3..3"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := testServerR2(t)
+			ctx := adminCtx()
+			for seq, ts := range tc.seqs {
+				if err := s.db.Execute(ctx,
+					`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+					 result, prev_hash, content_hash, key_id, signature, seq)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					fmt.Sprintf("w-%d", seq), ts, "u", "kvm003", "vm.start", "vm-z", "", "ok",
+					"ph", "ch", "k", "sig", seq); err != nil {
+					t.Fatalf("insert seq %d: %v", seq, err)
+				}
+			}
+			// seq 2's stamp is past the window; seq 3, where present, is inside.
+			resp, err := s.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{
+				Until: "2026-09-22T00:00:05Z", Limit: 50,
+			})
+			if err != nil {
+				t.Fatalf("ExportAuditChain: %v", err)
+			}
+			var doc struct {
+				Gaps []map[string]string `json:"seq_gaps"`
+			}
+			if err := json.Unmarshal([]byte(resp.Json), &doc); err != nil {
+				t.Fatalf("unmarshal export: %v", err)
+			}
+			var got []string
+			for _, g := range doc.Gaps {
+				got = append(got, g["missing_from"]+".."+g["missing_to"])
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Fatalf("seq_gaps = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

@@ -171,6 +171,14 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 	// Once the cursor passes 5, seq 3 is below it and is never exported at all.
 	// The rows that ARE here are still worth shipping, so the page carries them
 	// and says what is missing instead of pretending the chain is whole.
+	//
+	// A window is not a gap. --since/--until filter by timestamp while the walk
+	// is by seq, and a host's stamps are not monotone in seq (its clock can step
+	// back), so a window can leave out a row in the middle of a run it keeps.
+	// That row is in the table; calling it missing tells the operator rows were
+	// deleted. Under a window, only the seqs not in the table outside it are
+	// reported.
+	windowed := req.Since != "" || req.Until != ""
 	var gaps []map[string]string
 	prevHost, prevSeq := after.Host, after.Seq
 	for _, r := range rows {
@@ -179,13 +187,21 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 		// written before it existed, and those are reported as not
 		// tamper-evident by the verifier anyway.
 		if host == prevHost && prevSeq > 0 && seq > prevSeq+1 {
-			gaps = append(gaps, map[string]string{
-				"host_name":    host,
-				"after_seq":    strconv.FormatInt(prevSeq, 10),
-				"before_seq":   strconv.FormatInt(seq, 10),
-				"missing_from": strconv.FormatInt(prevSeq+1, 10),
-				"missing_to":   strconv.FormatInt(seq-1, 10),
-			})
+			missing := [][2]int64{{prevSeq + 1, seq - 1}}
+			if windowed {
+				if missing, err = s.seqsAbsentOutsideWindow(ctx, host, prevSeq+1, seq-1, req.Since, req.Until); err != nil {
+					return nil, err
+				}
+			}
+			for _, m := range missing {
+				gaps = append(gaps, map[string]string{
+					"host_name":    host,
+					"after_seq":    strconv.FormatInt(m[0]-1, 10),
+					"before_seq":   strconv.FormatInt(m[1]+1, 10),
+					"missing_from": strconv.FormatInt(m[0], 10),
+					"missing_to":   strconv.FormatInt(m[1], 10),
+				})
+			}
 		}
 		prevHost, prevSeq = host, seq
 	}
@@ -234,6 +250,36 @@ func (s *Server) ExportAuditChain(ctx context.Context, req *pb.ExportAuditChainR
 		resp.NextCursor = last.encode()
 	}
 	return resp, nil
+}
+
+// seqsAbsentOutsideWindow returns, as inclusive ranges, the seqs in [from, to]
+// that host has no row for OUTSIDE the since/until window — the part of a
+// windowed export's hole that is a real gap rather than rows the window left
+// out.
+func (s *Server) seqsAbsentOutsideWindow(ctx context.Context, host string, from, to int64, since, until string) ([][2]int64, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT seq FROM audit_log
+		 WHERE host_name = ? AND seq BETWEEN ? AND ?
+		   AND NOT ((? = '' OR timestamp >= ?) AND (? = '' OR timestamp <= ?))
+		 ORDER BY seq ASC`,
+		host, from, to, since, since, until, until)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "list audit_log outside the window: %v", err)
+	}
+	var out [][2]int64
+	next := from
+	for _, r := range rows {
+		if seq := r.Int64("seq"); seq > next {
+			out = append(out, [2]int64{next, seq - 1})
+			next = seq + 1
+		} else if seq == next {
+			next++
+		}
+	}
+	if next <= to {
+		out = append(out, [2]int64{next, to})
+	}
+	return out, nil
 }
 
 // addExportEvidence attaches the state VerifyAuditChain reasons over. It rides

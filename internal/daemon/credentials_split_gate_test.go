@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -34,7 +33,7 @@ func TestWireCredentialsSplitGate_TracksTheDurableLatch(t *testing.T) {
 
 	dataDir := t.TempDir()
 	checker := health.NewChecker("host-a", "/etc/litevirt/pki", db)
-	checker.SetActivationMarker(filepath.Join(dataDir, activationMarkerPrefix))
+	checker.SetActivationMarker(health.ActivationMarkerBase(dataDir))
 	checker.SetPeerPinger(func(context.Context, string) ([]string, time.Time, error) {
 		return capabilities.Supported(), time.Time{}, nil
 	})

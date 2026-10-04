@@ -313,7 +313,7 @@ func (c *Client) WatchGossipKeyFile(ctx context.Context, keyPath, statePath stri
 					slog.Warn("gossip keyring: the key file cannot be used; keeping the keys in use",
 						"path", keyPath, "error", err, "in_use", c.GossipKeyring().Keys)
 				}
-			case !sameKeyIDs(pki.GossipKeyIDs(keys), c.GossipKeyring().Keys):
+			case !pki.SameGossipKeyring(pki.GossipKeyIDs(keys), c.GossipKeyring().Keys):
 				lastErr = ""
 				if err := c.SetGossipKeys(keys); err != nil {
 					slog.Warn("gossip keyring: could not apply the key file; keeping the keys in use",
@@ -347,16 +347,4 @@ func (c *Client) WatchGossipKeyFile(ctx context.Context, keyPath, statePath stri
 			tick()
 		}
 	}
-}
-
-func sameKeyIDs(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }

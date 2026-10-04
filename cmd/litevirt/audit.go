@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -253,38 +255,83 @@ func reportNotSigning(w io.Writer, resp *pb.VerifyAuditChainResponse) {
 
 func newAuditExportCmd() *cobra.Command {
 	var since, until, outPath string
+	var allowGaps bool
 	cmd := &cobra.Command{
 		Use:   "export",
 		Short: "Export the audit log as a WORM-suitable JSON blob",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
-				// The server pages, so the whole chain is assembled into one
-				// document before anything is written. A per-page file would be
-				// useless for the job the docs give this command: a verifier needs
-				// one artifact whose rows are contiguous, and a chain split across
-				// files can only be checked by reassembling it anyway.
-				body, total, err := auditexport.Assemble(ctx, func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
+				return writeAuditExport(ctx, func(ctx context.Context, cursor string) (*pb.ExportAuditChainResponse, error) {
 					return c.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{
 						Since: since, Until: until, Cursor: cursor,
 					})
-				})
-				if err != nil {
-					return err
-				}
-				if outPath == "" || outPath == "-" {
-					fmt.Println(string(body))
-				} else {
-					if err := os.WriteFile(outPath, body, 0o600); err != nil {
-						return fmt.Errorf("write %s: %w", outPath, err)
-					}
-					fmt.Fprintf(os.Stderr, "wrote %d rows to %s\n", total, outPath)
-				}
-				return nil
+				}, outPath, allowGaps, os.Stdout, os.Stderr)
 			})
 		},
 	}
 	cmd.Flags().StringVar(&since, "since", "", "filter from this RFC3339 timestamp (inclusive)")
 	cmd.Flags().StringVar(&until, "until", "", "filter up to this RFC3339 timestamp (inclusive)")
 	cmd.Flags().StringVar(&outPath, "out", "", "write to file (default: stdout)")
+	cmd.Flags().BoolVar(&allowGaps, "allow-gaps", false,
+		"export a chain with seq gaps (rows missing from a host's chain), listing them under seq_gaps, instead of refusing; for investigation, not attestation")
 	return cmd
+}
+
+// writeAuditExport walks the export and writes the one document to outPath, or
+// to stdout when outPath is empty or "-".
+//
+// The server pages, and a per-page file would be useless for the job the docs
+// give this command: a verifier needs one artifact whose rows are contiguous,
+// and a chain split across files can only be checked by reassembling it anyway.
+// The pages are therefore written to a spool file as they arrive — the chain
+// has no size bound, so it is never held in memory — and the spool becomes the
+// output only once the whole walk has succeeded. A refused export leaves no
+// file at outPath and writes nothing to stdout.
+func writeAuditExport(ctx context.Context, fetch auditexport.FetchPage, outPath string, allowGaps bool, stdout, stderr io.Writer) error {
+	toStdout := outPath == "" || outPath == "-"
+	dir, pattern := "", "lv-audit-export-*.json"
+	if !toStdout {
+		// Beside the target, so the final rename stays on one filesystem.
+		dir, pattern = filepath.Dir(outPath), "."+filepath.Base(outPath)+".partial-*"
+	}
+	spool, err := os.CreateTemp(dir, pattern) // mode 0600
+	if err != nil {
+		return fmt.Errorf("create export spool: %w", err)
+	}
+	keep := false
+	defer func() {
+		_ = spool.Close()
+		if !keep {
+			_ = os.Remove(spool.Name())
+		}
+	}()
+
+	bw := bufio.NewWriter(spool)
+	total, err := auditexport.Write(ctx, fetch, bw, auditexport.Options{AllowGaps: allowGaps})
+	if err != nil {
+		return err
+	}
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("write export spool: %w", err)
+	}
+
+	if toStdout {
+		if _, err := spool.Seek(0, io.SeekStart); err != nil {
+			return fmt.Errorf("read export spool: %w", err)
+		}
+		if _, err := io.Copy(stdout, spool); err != nil {
+			return fmt.Errorf("write export: %w", err)
+		}
+		_, err := fmt.Fprintln(stdout)
+		return err
+	}
+	if err := spool.Sync(); err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
+	}
+	if err := os.Rename(spool.Name(), outPath); err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
+	}
+	keep = true
+	fmt.Fprintf(stderr, "wrote %d rows to %s\n", total, outPath)
+	return nil
 }

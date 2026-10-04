@@ -192,7 +192,7 @@ type oneWayEvidence struct {
 func (c *Coordinator) detectOneWay(ctx context.Context, target string) (failing, healthy []string, oneWay bool) {
 	voters := c.scope.voters(target)
 	rows, err := c.db.Query(ctx,
-		`SELECT observer, target, status, consecutive_failures, updated_at FROM host_health
+		`SELECT observer, target, status, consecutive_failures, last_seen, updated_at FROM host_health
 		 WHERE (target = ? AND consecutive_failures >= ?) OR (observer = ? AND consecutive_failures = 0)`,
 		target, offlineThreshold, target)
 	if err != nil {
@@ -215,7 +215,7 @@ func (c *Coordinator) detectOneWay(ctx context.Context, target string) (failing,
 		if tgt == target && obs != target && countsAsVote(voters, obs, target) && upd.After(freshCutoff) &&
 			r.String("status") != health.StatusUnready {
 			n := r.Int("consecutive_failures")
-			streakStart[obs] = upd.Add(-time.Duration(n-1) * health.ProbeInterval)
+			streakStart[obs] = observerRunStart(n, r.String("last_seen"), upd)
 			lastFailed[obs] = upd
 			continue
 		}

@@ -270,7 +270,7 @@ func RotateGossipKey(ctx context.Context, localPath string, hosts []GossipKeyHos
 	// rotation. Safe because every live host holds local[0].
 	interrupted := len(local) > 1
 	for _, s := range st {
-		if !s.present || !sameRing(s.file, local) || (isLive(s.live, s.hasLive) && !sameIDs(s.live.Keys, pki.GossipKeyIDs(local))) {
+		if !s.present || !sameRing(s.file, local) || (isLive(s.live, s.hasLive) && !pki.SameGossipKeyring(s.live.Keys, pki.GossipKeyIDs(local))) {
 			interrupted = true
 		}
 	}
@@ -358,8 +358,9 @@ func pushPhase(ctx context.Context, st []surveyed, ring [][]byte, what string, o
 	return waitLive(ctx, st, ring, what, opt)
 }
 
-// waitLive is the barrier: every live host must report ring, primary first, as
-// the keyring it is USING.
+// waitLive is the barrier: every live host must report ring as the keyring it
+// is USING — the same primary and the same keys. Secondary order is the
+// daemon's (memberlist's), not the file's, so it is not compared.
 func waitLive(ctx context.Context, st []surveyed, ring [][]byte, what string, opt GossipKeyOptions) error {
 	want := pki.GossipKeyIDs(ring)
 	deadline := time.Now().Add(opt.Timeout)
@@ -368,7 +369,7 @@ func waitLive(ctx context.Context, st []surveyed, ring [][]byte, what string, op
 			s, present, err := st[i].host.LiveKeyring(ctx)
 			if err == nil {
 				st[i].live, st[i].hasLive = s, present
-				if !isLive(s, present) || sameIDs(s.Keys, want) {
+				if !isLive(s, present) || pki.SameGossipKeyring(s.Keys, want) {
 					break
 				}
 			}
@@ -400,18 +401,6 @@ func containsID(ids []string, id string) bool {
 		}
 	}
 	return false
-}
-
-func sameIDs(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func idList(ring [][]byte) string { return "[" + strings.Join(pki.GossipKeyIDs(ring), ",") + "]" }

@@ -2571,6 +2571,19 @@ message DivergenceRow {
     string               pk       = 2; // plaintext PK, or HMAC label for sensitive tables
     string               class    = 3; // DivergenceClass
     repeated NodeRowMeta per_node = 4;
+    // tie_acknowledged_on / tie_unacknowledged_on are set only on a row of a
+    // table in which some host holds an operator-acknowledged LWW tie ('lv
+    // cluster acknowledge-lease-term'). They split the row's hosts by whether
+    // that host's verification digest vouches for the table: every tie it
+    // tracks there is acknowledged and it supplied an acknowledged residual,
+    // the per-host test `lv cluster converge` applies. Table-granular: a host
+    // that vouches has acknowledged every tie it tracks in the table.
+    // A row is classed acknowledged_tie only when every one of its hosts
+    // vouches and every reporting host's residual agrees (so nothing but the
+    // acknowledged rows differs); otherwise it keeps its class, and
+    // tie_unacknowledged_on names the hosts still to acknowledge.
+    repeated string tie_acknowledged_on   = 5;
+    repeated string tie_unacknowledged_on = 6;
 }
 message SemanticViolationPB {
     string          kind   = 1;

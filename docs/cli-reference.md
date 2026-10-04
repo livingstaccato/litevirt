@@ -873,8 +873,9 @@ lv doctor repair-owner <vm> <host>           # Re-assert a VM's owner on the hos
 lv doctor fence                              # Report whether a shared-disk VM's cross-host transfer would be fenced (read-only)
 ```
 
-`divergence` is read-only; `repair-owner` is an audited, admin-gated repair for an
-equal-timestamp ownership split a stationary VM can't self-heal. Most ownership
+`divergence` is read-only, and lists a lease-term tie that every host has
+acknowledged as `acknowledged_tie`, not as a divergence. `repair-owner` is an
+audited, admin-gated repair for an equal-timestamp ownership split a stationary VM can't self-heal. Most ownership
 splits are reclaimed automatically by the runtime-repair reconcilers — see
 `docs/diagnostics.md` for the full model (categories, metrics, alerts, and the
 operational repair flow).

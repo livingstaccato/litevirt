@@ -109,6 +109,14 @@ func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*
 	if err := s.requirePeerOrRole(ctx, "operator"); err != nil {
 		return nil, err
 	}
+	return s.clusterStateDigest(ctx), nil
+}
+
+// clusterStateDigest is GetClusterStateDigest without the caller check: every
+// active host's verification digest, residuals included. `lv doctor
+// divergence` reads it too, so it decides acknowledged ties from exactly what
+// `lv cluster converge` sees.
+func (s *Server) clusterStateDigest(ctx context.Context) *pb.ClusterStateDigestResponse {
 	resp := &pb.ClusterStateDigestResponse{}
 
 	// Self: merge public + sensitive, annotated with per-table unresolved-tie counts.
@@ -168,7 +176,7 @@ func (s *Server) GetClusterStateDigest(ctx context.Context, _ *emptypb.Empty) (*
 			resp.Unreachable = append(resp.Unreachable, x.host)
 		}
 	}
-	return resp, nil
+	return resp
 }
 
 // GetStateDigest returns a lightweight fingerprint of each replicated table

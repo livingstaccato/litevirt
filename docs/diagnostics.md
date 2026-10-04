@@ -106,6 +106,31 @@ compares per-row metadata, and returns a classified report.
 | `tombstone_vs_live` | Tombstoned (soft-deleted) on some nodes, live on others. |
 | `terminal_vs_live` | A workload terminal (stopped/error) on some nodes, running on others. |
 | `schema_shape_mismatch` | The table's column **set** differs across nodes (a missing or extra column). Column *order* alone is ignored — a fresh `CREATE TABLE` vs an upgraded `ALTER ADD COLUMN` does not trip this. |
+| `acknowledged_tie` | **Not a divergence.** A contested row that every host holding it has acknowledged (`lv cluster acknowledge-lease-term`), in a table where nothing else differs. Listed separately, under *Acknowledged ties*, because both claims are kept as evidence; a scan that finds only these reads `no divergence detected.` |
+
+**Acknowledged ties.** A `leader_lease_terms` row is immutable, so a contested
+term never stops differing, even after an operator has acknowledged it. The
+scan decides whether a row is an acknowledged tie from every host's
+verification digest, by the same rule as `lv cluster converge` uses for
+`ACKNOWLEDGED` (see
+[operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it)):
+every host acknowledged every tie it tracks in the table, and every host's
+residual digest agrees. Anything short of that keeps the row's class:
+
+- acknowledged on **some** hosts only: the row stays a divergence, and its line
+  ends `(tie not acknowledged on <hosts>)`, naming the hosts still to
+  acknowledge. A host that cannot vouch for the table is named here too: one
+  that tracks no tie in it at all (a rebuilt host with an empty acknowledgement
+  table), one that supplied no residual digest, or one whose digest could not
+  be read;
+- acknowledged on **every** host, but the residuals disagree: the row stays a
+  divergence and its line ends `(tie acknowledged on every host, but the table
+  differs elsewhere)`, because another row of the table differs as well.
+
+The evidence is per host and per table, not per row: a host "has acknowledged"
+when every tie it tracks in that table is acknowledged. In `--json`, the
+`tie_acknowledged_on` and `tie_unacknowledged_on` fields of a row carry the
+split; both are empty on a row of a table where no host acknowledged anything.
 
 A divergence is reported **only when it persists across two samples** with
 unchanged per-node content hashes — an in-flight replication delta changes between
@@ -204,7 +229,8 @@ table.
      The acknowledgement is durable: after a restart the tie is re-registered
      as acknowledged. Once every host has acknowledged it and nothing else in
      the table differs, `lv cluster converge` lists the table as
-     `ACKNOWLEDGED` and counts it as converged. A new, unacknowledged claim
+     `ACKNOWLEDGED` and counts it as converged, and `lv doctor divergence`
+     lists its rows as `acknowledged_tie` rather than as divergences. A new, unacknowledged claim
      for the term makes it a `SAFETY-FAULT` again — see
      [operating-model.md](operating-model.md#clearing-the-condition-once-you-have-seen-it).
 
@@ -506,6 +532,11 @@ outright rather than scanning nothing.
 Human-readable table by default; `--json` for the full structured report (node
 lists incl. `sensitive_unreachable`, per-row per-node `updated_at`/hash, `stable`,
 and violations). `--table` restricts the scan to specific tables.
+
+The human-readable summary reads `no divergence detected.` when there are no
+diverging rows and no violations; acknowledged ties do not count. In `--json`,
+acknowledged ties are still in `rows`, so a script deciding "clean" must skip
+rows whose `class` is `acknowledged_tie`.
 
 ## `lv doctor machine-types`
 

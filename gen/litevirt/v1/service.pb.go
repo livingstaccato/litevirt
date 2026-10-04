@@ -24949,13 +24949,26 @@ func (x *NodeRowMeta) GetState() string {
 }
 
 type DivergenceRow struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Table         string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
-	Pk            string                 `protobuf:"bytes,2,opt,name=pk,proto3" json:"pk,omitempty"`       // plaintext PK, or HMAC label for sensitive tables
-	Class         string                 `protobuf:"bytes,3,opt,name=class,proto3" json:"class,omitempty"` // DivergenceClass
-	PerNode       []*NodeRowMeta         `protobuf:"bytes,4,rep,name=per_node,json=perNode,proto3" json:"per_node,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Table   string                 `protobuf:"bytes,1,opt,name=table,proto3" json:"table,omitempty"`
+	Pk      string                 `protobuf:"bytes,2,opt,name=pk,proto3" json:"pk,omitempty"`       // plaintext PK, or HMAC label for sensitive tables
+	Class   string                 `protobuf:"bytes,3,opt,name=class,proto3" json:"class,omitempty"` // DivergenceClass
+	PerNode []*NodeRowMeta         `protobuf:"bytes,4,rep,name=per_node,json=perNode,proto3" json:"per_node,omitempty"`
+	// tie_acknowledged_on / tie_unacknowledged_on are set only on a row of a
+	// table in which some host holds an operator-acknowledged LWW tie ('lv
+	// cluster acknowledge-lease-term'). They split the row's hosts by whether
+	// that host's verification digest vouches for the table: every tie it
+	// tracks there is acknowledged and it supplied an acknowledged residual,
+	// the per-host test `lv cluster converge` applies. Table-granular: a host
+	// that vouches has acknowledged every tie it tracks in the table.
+	// A row is classed acknowledged_tie only when every one of its hosts
+	// vouches and every reporting host's residual agrees (so nothing but the
+	// acknowledged rows differs); otherwise it keeps its class, and
+	// tie_unacknowledged_on names the hosts still to acknowledge.
+	TieAcknowledgedOn   []string `protobuf:"bytes,5,rep,name=tie_acknowledged_on,json=tieAcknowledgedOn,proto3" json:"tie_acknowledged_on,omitempty"`
+	TieUnacknowledgedOn []string `protobuf:"bytes,6,rep,name=tie_unacknowledged_on,json=tieUnacknowledgedOn,proto3" json:"tie_unacknowledged_on,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *DivergenceRow) Reset() {
@@ -25012,6 +25025,20 @@ func (x *DivergenceRow) GetClass() string {
 func (x *DivergenceRow) GetPerNode() []*NodeRowMeta {
 	if x != nil {
 		return x.PerNode
+	}
+	return nil
+}
+
+func (x *DivergenceRow) GetTieAcknowledgedOn() []string {
+	if x != nil {
+		return x.TieAcknowledgedOn
+	}
+	return nil
+}
+
+func (x *DivergenceRow) GetTieUnacknowledgedOn() []string {
+	if x != nil {
+		return x.TieUnacknowledgedOn
 	}
 	return nil
 }
@@ -33243,12 +33270,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"updated_at\x18\x02 \x01(\tR\tupdatedAt\x12\x19\n" +
 	"\brow_hash\x18\x03 \x01(\tR\arowHash\x12\x18\n" +
 	"\adeleted\x18\x04 \x01(\bR\adeleted\x12\x14\n" +
-	"\x05state\x18\x05 \x01(\tR\x05state\"\x80\x01\n" +
+	"\x05state\x18\x05 \x01(\tR\x05state\"\xe4\x01\n" +
 	"\rDivergenceRow\x12\x14\n" +
 	"\x05table\x18\x01 \x01(\tR\x05table\x12\x0e\n" +
 	"\x02pk\x18\x02 \x01(\tR\x02pk\x12\x14\n" +
 	"\x05class\x18\x03 \x01(\tR\x05class\x123\n" +
-	"\bper_node\x18\x04 \x03(\v2\x18.litevirt.v1.NodeRowMetaR\aperNode\"i\n" +
+	"\bper_node\x18\x04 \x03(\v2\x18.litevirt.v1.NodeRowMetaR\aperNode\x12.\n" +
+	"\x13tie_acknowledged_on\x18\x05 \x03(\tR\x11tieAcknowledgedOn\x122\n" +
+	"\x15tie_unacknowledged_on\x18\x06 \x03(\tR\x13tieUnacknowledgedOn\"i\n" +
 	"\x13SemanticViolationPB\x12\x12\n" +
 	"\x04kind\x18\x01 \x01(\tR\x04kind\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\tR\x03key\x12\x16\n" +

@@ -3,17 +3,10 @@ package daemon
 import (
 	"log/slog"
 	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
+	"github.com/litevirt/litevirt/internal/health"
 )
-
-// activationMarkerPrefix is the basename prefix of the durable per-token
-// capability activation markers. It must match the base handed to
-// Checker.SetActivationMarker, which appends "." + token to it.
-const activationMarkerPrefix = "split_brain_activated"
 
 // preflightCapabilityRollback reports the capability tokens this node has already
 // latched that THIS BINARY has never heard of — that is, evidence that a newer
@@ -48,7 +41,7 @@ func preflightCapabilityRollback(dataDir string) []string {
 	if dataDir == "" {
 		return nil
 	}
-	matches, err := filepath.Glob(filepath.Join(dataDir, activationMarkerPrefix+".*"))
+	latched, err := health.ActivationMarkersOnDisk(dataDir)
 	if err != nil {
 		// The only error Glob returns is a malformed pattern, which ours is not.
 		// Log rather than fail: an unreadable data dir is its own problem and the
@@ -61,13 +54,10 @@ func preflightCapabilityRollback(dataDir string) []string {
 		known[tok] = true
 	}
 	var unknown []string
-	for _, path := range matches {
-		token := strings.TrimPrefix(filepath.Base(path), activationMarkerPrefix+".")
-		if token == "" || known[token] {
-			continue
+	for _, token := range latched {
+		if !known[token] {
+			unknown = append(unknown, token)
 		}
-		unknown = append(unknown, token)
 	}
-	sort.Strings(unknown)
 	return unknown
 }

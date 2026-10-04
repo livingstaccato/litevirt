@@ -495,7 +495,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// wired later via SetPeerPinger; until then PeerSupports fails closed, so proof
 	// WAL entries defer rather than leak — never a schema-version guess.)
 	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
-	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, activationMarkerBaseName))
+	d.wireActivationMarker()
 	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
 	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
@@ -2057,12 +2057,15 @@ const adminPasswordFile = "/etc/litevirt/admin-password"
 // while it exists, and deletes it once that credential is written.
 const genesisMarkerName = "genesis-pending"
 
-// activationMarkerBaseName prefixes the persisted capability latches in
-// data_dir (<base>.<token>). They are written only after a daemon has run as a
-// member and survive a state.db loss, so seedAdminUser treats any of them as
-// proof this node is not founding a cluster. The setup script's
-// genesisMarkerScript matches the same name.
-const activationMarkerBaseName = "split_brain_activated"
+// wireActivationMarker points the health checker at this node's durable
+// capability latches (health.ActivationMarkerBase), loading any already there.
+// They are written only after a daemon has run as a member and survive a
+// state.db loss, so seedAdminUser treats any of them as proof this node is not
+// founding a cluster. The setup script's genesisMarkerScript matches the same
+// name.
+func (d *Daemon) wireActivationMarker() {
+	d.checker.SetActivationMarker(health.ActivationMarkerBase(d.cfg.DataDir))
+}
 
 // seedAdminUser creates a default admin user with a random password if this node
 // is founding a cluster and no users exist. The password is written to
@@ -2148,7 +2151,7 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	// latches exist only once a daemon has run as a member, and survive a
 	// state.db loss; a marker beside one was written by hand or by a setup that
 	// could not see the latch, and minting here replaces the cluster's admin.
-	latches, err := filepath.Glob(filepath.Join(d.cfg.DataDir, activationMarkerBaseName+".*"))
+	latches, err := health.ActivationMarkersOnDisk(d.cfg.DataDir)
 	if err != nil {
 		return fmt.Errorf("check for capability latches: %w", err)
 	}
@@ -2576,7 +2579,7 @@ func (d *Daemon) wireCredentialsSplitGate() {
 // activation marker Checker.DurablyLatched is backed by, so the CLI writes the
 // credential table exactly when the daemon on that node would.
 func CredentialsSplitLatchedOnDisk(dataDir string) func() bool {
-	path := filepath.Join(dataDir, activationMarkerPrefix+"."+capabilities.CredentialsSplitV1)
+	path := health.ActivationMarkerPath(dataDir, capabilities.CredentialsSplitV1)
 	return func() bool {
 		_, err := os.Stat(path)
 		return err == nil
@@ -2623,7 +2626,7 @@ func (d *Daemon) wireHostMembershipGate() {
 // HostMembershipLatchedOnDisk reports whether host_membership_split_v1 has
 // durably latched on the node whose data directory is dataDir.
 func HostMembershipLatchedOnDisk(dataDir string) func() bool {
-	path := filepath.Join(dataDir, activationMarkerPrefix+"."+capabilities.HostMembershipSplitV1)
+	path := health.ActivationMarkerPath(dataDir, capabilities.HostMembershipSplitV1)
 	return func() bool {
 		_, err := os.Stat(path)
 		return err == nil

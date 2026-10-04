@@ -27,9 +27,12 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
-// migrateWithStorageAt is migrateAt with --with-storage.
+// migrateWithStorageAt is migrateAt with --with-storage. It opts `at` (the
+// source) into migration.allow_unencrypted_storage, which a storage copy needs;
+// the refusal without it is TestFleet_StorageMigrationIsRefusedUnlessPlaintextIsAllowed.
 func migrateWithStorageAt(t *testing.T, c *Cluster, at *Node, vmName, targetHost string) error {
 	t.Helper()
+	at.Server.SetAllowUnencryptedStorageMigration(true)
 	st, err := c.SelfClient(at).MigrateVM(context.Background(), &pb.MigrateVMRequest{
 		VmName: vmName, TargetHost: targetHost, Strategy: pb.MigrateStrategy_MIGRATE_LIVE, WithStorage: true,
 	})

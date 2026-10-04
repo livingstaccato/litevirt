@@ -61,9 +61,10 @@ func TestDeleteVM_KeepsADiskThatStillBacksALinkedClone(t *testing.T) {
 	// the disk-removal half directly: this is about what the glob does once the
 	// caller has decided to proceed.
 	s.deleteRecordedVMDiskVolumes(adminCtx(), "base")
-	if err := func() error { s.sweepVMDiskDebris(adminCtx(), "base"); return nil }(); err != nil {
-		t.Fatalf("DeleteVMDisks: %v", err)
-	}
+	// sweepVMDiskDebris reports failures by logging them, so there is no error
+	// to check here — wrapping it in a closure that can only return nil made the
+	// branch unreachable and named a function the line no longer calls.
+	s.sweepVMDiskDebris(adminCtx(), "base")
 
 	if !exists(basePath) {
 		t.Fatalf("%s still backs clone1 and was deleted by the default-dir glob; "+
@@ -83,9 +84,10 @@ func TestDeleteVM_StillSweepsUnreferencedDebris(t *testing.T) {
 	debris := filepath.Join(s.images.DiskDir(""), "base-scratch.qcow2")
 	mustWrite(t, debris)
 
-	if err := func() error { s.sweepVMDiskDebris(adminCtx(), "base"); return nil }(); err != nil {
-		t.Fatalf("DeleteVMDisks: %v", err)
-	}
+	// sweepVMDiskDebris reports failures by logging them, so there is no error
+	// to check here — wrapping it in a closure that can only return nil made the
+	// branch unreachable and named a function the line no longer calls.
+	s.sweepVMDiskDebris(adminCtx(), "base")
 	if exists(debris) {
 		t.Error("unreferenced debris survived; the glob stopped working")
 	}

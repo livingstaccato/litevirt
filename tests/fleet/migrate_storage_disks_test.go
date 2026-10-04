@@ -87,9 +87,11 @@ func TestFleet_StorageMigrationCopiesOnlyHostLocalDisks(t *testing.T) {
 				t.Fatalf("migrate --with-storage: %v", err)
 			}
 			note := migrateNote(t, src)
-			want := fmt.Sprintf("with_storage=%t %s", tc.wantWithStorage, tc.wantDisks)
-			if !strings.HasSuffix(note, " "+want) {
-				t.Fatalf("libvirt migration = %q, want it to end %q", note, want)
+			// The disk list is followed by the TLS fields; the trailing space pins
+			// where it ends, so "disks=vda" cannot pass as "disks=vda,vdb".
+			want := fmt.Sprintf("with_storage=%t %s ", tc.wantWithStorage, tc.wantDisks)
+			if !strings.Contains(note, " "+want) {
+				t.Fatalf("libvirt migration = %q, want it to contain %q", note, want)
 			}
 		})
 	}

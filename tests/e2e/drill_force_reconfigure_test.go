@@ -482,8 +482,11 @@ func (d *d6) recorded() (map[string]string, error) {
 // left workloads on, R4). The coordinator's removed-host pass recovers what it
 // can; the drill waits for that, then removes what is left (a policy-none VM,
 // a container no survivor can run, a VM the survivors have no room for) the
-// way the refusal says: `lv rm`, `lv ct rm`. Lab workloads removed here are
-// put back by putBack.
+// way the refusal says: `lv rm <vm>` and `lv ct rm <ct> --host <removed>`,
+// which delete the rows of a workload on a removed host without dialling it.
+// No --force: there is nothing on a removed machine to stop. Nothing here
+// edits a database or removes and re-adds a host to get past the refusal.
+// Lab workloads removed here are put back by putBack.
 func (d *d6) clearRemoved() bool {
 	if d.cleared {
 		return true
@@ -550,8 +553,8 @@ func (d *d6) clearRemoved() bool {
 					l.saveEvidence("stack-"+stack+".yaml", y)
 				}
 			}
-			if out, err := l.lv(d.via, "rm", "--force", name); err != nil {
-				l.t.Errorf("R4: %s is recorded on removed %s and `lv rm --force %s` fails, so %s cannot be added back: %v\n%s", k, h, name, h, err, out)
+			if out, err := l.lv(d.via, "rm", name); err != nil {
+				l.t.Errorf("R4: %s is recorded on removed %s and `lv rm %s` fails, so %s cannot be added back: %v\n%s", k, h, name, h, err, out)
 				return false
 			}
 		} else {

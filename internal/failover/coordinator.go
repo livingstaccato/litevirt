@@ -297,12 +297,13 @@ type Coordinator struct {
 	// best-effort fence is recorded as self-pause and recovery waits out
 	// PartitionPauseWaitFor. nil (a hand-built coordinator) never relies.
 	PartitionPauseEnforced func(ctx context.Context) bool
-	// PeerAdvertised reports whether a host's last cached Ping advertised a
-	// token (health.Checker.PeerAdvertisedLast). The coordinator relies on a
-	// host's partition pause only if that HOST last advertised
-	// partition_pause_v1, not merely because the cluster latched it: a host
-	// whose flag went off after the latch stops advertising. nil never relies.
-	PeerAdvertised func(peer, token string) bool
+	// PeerPausesOnLoss reports whether a host's latest answer to this node's
+	// health probe said it pauses on losing the majority
+	// (grpcapi.Server.PeerPausesOnLoss). The coordinator relies on a host's
+	// partition pause only if that HOST said so, not merely because the
+	// cluster latched it: a host whose flag went off after the latch says
+	// otherwise on its next probe. nil never relies.
+	PeerPausesOnLoss func(peer string) bool
 	// PauseWaitFor replaces health.PartitionPauseWaitFor (fleet scenarios,
 	// which cannot wait production seconds). nil in production.
 	PauseWaitFor func(probeTargets int) time.Duration

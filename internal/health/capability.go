@@ -364,14 +364,3 @@ func (c *Checker) cacheNeg(token, reason string) (bool, string) {
 	c.mu.Unlock()
 	return false, reason
 }
-
-// PeerAdvertisedLast reports whether peer's LAST Ping this daemon cached
-// advertised token, however old the cache entry. It makes no RPC: the failover
-// coordinator asks it about a host it has just fenced as unreachable, so a
-// fresh Ping is exactly what cannot succeed. A peer never pinged reports false.
-func (c *Checker) PeerAdvertisedLast(peer, token string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.peerCaps[peer]
-	return ok && capabilities.Has(e.caps, token)
-}

@@ -372,7 +372,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Clean up any orphaned disk files / cloud-init ISO left from a previous
 	// incomplete delete, even if the libvirt domain is already gone.
-	s.images.DeleteVMDisks(spec.Name, s.protectedDiskPaths(ctx, spec.Name))
+	s.sweepVMDiskDebris(ctx, spec.Name)
 	os.Remove(lv.CloudInitISOPath(s.dataDir, spec.Name))
 
 	// Auto-pull image from a peer if not available locally.
@@ -1970,7 +1970,7 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// BEFORE the corrosion tombstone, then glob the default dir for any debris.
 	if !req.KeepDisks {
 		s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-		s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
+		s.sweepVMDiskDebris(ctx, req.Name)
 		// Remove cloud-init ISO
 		os.Remove(lv.CloudInitISOPath(s.dataDir, req.Name))
 		// Firmware state (G1): wipe nvram (name-keyed) + swtpm (uuid-keyed). With
@@ -2893,7 +2893,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// so a rebuilt VM doesn't leak its old non-default-pool backing volume),
 	// then glob the default dir. Must run before the tombstone below.
 	s.deleteRecordedVMDiskVolumes(ctx, req.Name)
-	s.images.DeleteVMDisks(req.Name, s.protectedDiskPaths(ctx, req.Name))
+	s.sweepVMDiskDebris(ctx, req.Name)
 	// Wipe the old firmware state — rebuild recreates with a FRESH identity, so the
 	// old name-keyed NVRAM + old-UUID swtpm tree would otherwise be orphaned (G1).
 	lv.WipeFirmwareState(s.dataDir, req.Name, spec.Uuid)

@@ -89,6 +89,13 @@ type Rebalancer struct {
 	// Lease handle: rebalancer must hold this lease to act.
 	LeaseKey string
 
+	// ForceDryRun records every proposal as pending, whatever each VM's
+	// resolved mode is: a VM in mode=auto is proposed but not approved, so the
+	// rebalance executor has nothing to move. It is what `lv rebalance run
+	// --dry-run` and the UI's Dry-run button ask for (RunRebalanceRequest.
+	// dry_run). It only withholds approval; a VM in mode=off is still skipped.
+	ForceDryRun bool
+
 	// leaseTerm is the fencing term of the lease incarnation this rebalancer
 	// LAST OBSERVED itself holding, 0 when it held none. Phase 1 records it;
 	// nothing enforces on it yet.
@@ -178,7 +185,7 @@ func (r *Rebalancer) RunOnce(ctx context.Context) error {
 			slog.Warn("rebalancer: record proposal", "vm", p.VMName, "error", err)
 			continue
 		}
-		if p.Mode == ModeAuto {
+		if r.autoApproves(p) {
 			// Auto-mode is a placeholder for the actual migration trigger.
 			// We mark the row "approved" so the migration controller picks
 			// it up; budget gating inside that controller does the real work.
@@ -188,6 +195,12 @@ func (r *Rebalancer) RunOnce(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// autoApproves reports whether p is approved as it is recorded, rather than
+// left pending for `lv rebalance approve`. A forced dry run approves nothing.
+func (r *Rebalancer) autoApproves(p Proposal) bool {
+	return p.Mode == ModeAuto && !r.ForceDryRun
 }
 
 // Proposal is one suggested live-migration produced by RunOnce.

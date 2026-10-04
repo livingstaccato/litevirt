@@ -738,10 +738,10 @@ func TestHandler_AddDiskModal_PrefillsNextName(t *testing.T) {
 	}
 }
 
-// TestHandler_AddDiskModal_NilDB_NoPanic verifies handleAddDiskModal guards
-// s.db before resolving the VM's host via corrosion.GetVM — corrosion.Client.Query
-// panics on a nil receiver, so a server with no Corrosion DB wired in (s.db ==
-// nil) must still render the modal instead of crashing the request.
+// TestHandler_AddDiskModal_NilDB_NoPanic verifies the Add-disk modal renders on
+// a server with no Corrosion DB wired in (s.db == nil). It resolves the VM's
+// host through InspectVM now, but an in-process read put back here would panic
+// on the nil client, and this is the test that says so.
 func TestHandler_AddDiskModal_NilDB_NoPanic(t *testing.T) {
 	mock := newDefaultMock()
 	s := newTestUIServer(t, mock) // no SetCorrosionDB call — s.db stays nil
@@ -844,18 +844,6 @@ func newHardwareTestServer(t *testing.T) (*Server, *mockGRPC) {
 	return s, mock
 }
 
-// seedVM inserts a minimal VM row into the test corrosion DB so
-// corrosion.GetVM(ctx, s.db, name) resolves a HostName for handlers (like the
-// Add-PCI modal) that need to scope a host-local lookup to the VM's host.
-func seedVM(t *testing.T, db *corrosion.Client, name, host string) {
-	t.Helper()
-	if err := corrosion.InsertVM(context.Background(), db, corrosion.VMRecord{
-		Name: name, HostName: host, Spec: "{}", State: "running",
-	}, nil, nil); err != nil {
-		t.Fatalf("seedVM(%s, %s): %v", name, host, err)
-	}
-}
-
 // TestHandler_AddNICModal_RelabelsNetwork verifies the Add-NIC modal offers a
 // managed-network / custom-bridge toggle, labels the managed field "Network"
 // (never "Bridge" — the field can point at any managed network, not just an
@@ -950,12 +938,12 @@ func TestHandler_DetachPCI(t *testing.T) {
 }
 
 // TestHandler_AddPCIModal_GroupsUnownedByType verifies the Add-PCI modal scans
-// the VM's host (resolved via corrosion.GetVM) for host devices, groups the
+// the VM's host (resolved via InspectVM) for host devices, groups the
 // UNASSIGNED ones by class (GPU/NIC/NVMe/Other) into optgroups, and excludes
 // any device already assigned to another VM from the picker entirely.
 func TestHandler_AddPCIModal_GroupsUnownedByType(t *testing.T) {
 	s, m := newHardwareTestServer(t)
-	seedVM(t, s.db, "vm-a", "host-1") // insert a VM row so GetVM(host)="host-1"
+	m.inspectVMResp = &pb.VM{Name: "vm-a", HostName: "host-1"} // InspectVM resolves the host
 	m.listHostDevicesResp = &pb.ListHostDevicesResponse{Devices: []*pb.PCIDevice{
 		{Address: "0000:41:00.0", Type: "gpu", VendorName: "NVIDIA", DeviceName: "L40S", IommuGroup: 34, VmName: ""},
 		{Address: "0000:31:00.1", Type: "network", VendorName: "Intel", DeviceName: "E810", IommuGroup: 18, VmName: "vm-b"}, // owned → excluded
@@ -978,7 +966,7 @@ func TestHandler_AddPCIModal_GroupsUnownedByType(t *testing.T) {
 // empty <select> the operator could submit with nothing chosen (spec §5).
 func TestHandler_AddPCIModal_NoDevices_EmptyState(t *testing.T) {
 	s, m := newHardwareTestServer(t)
-	seedVM(t, s.db, "vm-a", "host-1")
+	m.inspectVMResp = &pb.VM{Name: "vm-a", HostName: "host-1"}
 	m.listHostDevicesResp = &pb.ListHostDevicesResponse{} // no scanned devices at all
 	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
 	if !strings.Contains(body, "No unassigned passthrough devices on this host.") {
@@ -991,8 +979,8 @@ func TestHandler_AddPCIModal_NoDevices_EmptyState(t *testing.T) {
 // disabled so an operator can't select an option with nothing behind it
 // (spec §5: shown/enabled only when mappings exist; scanned stays default).
 func TestHandler_AddPCIModal_NoMappings_RadioDisabled(t *testing.T) {
-	s, _ := newHardwareTestServer(t)
-	seedVM(t, s.db, "vm-a", "host-1") // ListResourceMappings mock default is empty
+	s, m := newHardwareTestServer(t)
+	m.inspectVMResp = &pb.VM{Name: "vm-a", HostName: "host-1"} // ListResourceMappings mock default is empty
 	body := doGET(t, s, "/ui/vms/vm-a/add-pci-modal")
 	if !strings.Contains(body, `value="mapping" onclick="pciMode()" disabled`) {
 		t.Error(`the "Resource mapping" radio must be disabled when no mappings exist`)

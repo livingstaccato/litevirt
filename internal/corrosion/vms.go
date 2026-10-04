@@ -978,7 +978,9 @@ func TransferVMOwner(ctx context.Context, c *Client, name, hostName, state strin
 // TransferVMOwnerWithDisks is TransferVMOwner that moves the VM's disk rows to
 // hostName in the same guarded batch. It is for the repairs that re-key a VM
 // to the host proven to run it (repair-owner, owner-assert): that host uses the
-// disks, so a disk row naming any other host is stale.
+// disks, so a disk row naming any other host is stale. A cold firmware
+// migration commits its handoff through it too: its disks are on shared
+// storage, so only their host moves, together with the VM, in one transaction.
 func TransferVMOwnerWithDisks(ctx context.Context, c *Client, name, hostName, state string, expectedEpoch int64) error {
 	disks, err := GetVMDisks(ctx, c, name)
 	if err != nil {

@@ -323,12 +323,12 @@ The full set of routes mounted by `internal/ui/server.go`:
 | `/security-groups` | Security-group definitions + NIC bindings |
 | `/firewall` | Cluster/host-tier firewall rules, ipsets, and default-deny policy |
 | `/notifications` | Alerting targets (webhook/Slack) + routes |
-| `/resource-mappings` | Cluster-wide passthrough-device alias management |
+| `/resource-mappings` | Cluster-wide passthrough-device alias management (needs `resourcemap.read` at `/`, so a project-scoped grant gets 403) |
 | `/containers` | Cluster-wide LXC/OCI containers + lifecycle |
 | `/backups` | Backup repos and snapshot manifests |
 | `/schedules` | Backup **and replication** schedules |
 | `/rebalance` | Pending rebalance proposals (approve / reject) |
-| `/rbac` | Path-rooted role-binding tree |
+| `/rbac` | Path-rooted role-binding tree. An admin sees every binding; anyone else sees only the bindings that name them, as with `lv role ls` |
 | `/projects` | Tenancy: project tree, quotas, and usage |
 | `/dashboards` | Bundled Grafana JSON dashboards (download links) |
 | `/metrics-viewer` | Embedded Prometheus scrape, grouped by metric family |

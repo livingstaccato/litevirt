@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
 // rbacNode is a path-prefix tree node assembled from role_bindings.
@@ -16,7 +15,7 @@ import (
 type rbacNode struct {
 	Segment  string // last path segment, e.g. "vms" or "vm-1"
 	Path     string // full path, e.g. "/projects/_default/vms"
-	Bindings []corrosion.RoleBindingRecord
+	Bindings []*pb.RoleBinding
 	Children []*rbacNode
 }
 
@@ -70,25 +69,25 @@ func (s *Server) handleRevokeRole(w http.ResponseWriter, r *http.Request) {
 
 // handleRBAC renders /rbac — the path-rooted role-binding tree, with
 // add-binding and revoke actions.
+//
+// The bindings come from ListRoleBindings with the session's bearer, never
+// from the table: the RPC shows a non-admin only the bindings that name them,
+// and the whole set is the cluster's privilege map — every principal, role,
+// path and project name, across tenants.
 func (s *Server) handleRBAC(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("RBAC", "rbac")
-	if s.db == nil {
-		data["Error"] = "Corrosion DB not wired into UI server."
-		s.renderPage(w, "rbac.html", data)
-		return
-	}
-	bindings, err := corrosion.ListRoleBindings(r.Context(), s.db)
+	resp, err := s.grpc.ListRoleBindings(s.uiBearerCtx(r), &pb.ListRoleBindingsRequest{})
 	if err != nil {
-		data["Error"] = err.Error()
-		s.renderPage(w, "rbac.html", data)
+		s.renderPageRPCFailed(w, "rbac.html", data, err)
 		return
 	}
+	bindings := resp.GetBindings()
 	data["Tree"] = buildRBACTree(bindings)
 	data["BindingCount"] = len(bindings)
 	s.renderPage(w, "rbac.html", data)
 }
 
-func buildRBACTree(bindings []corrosion.RoleBindingRecord) *rbacNode {
+func buildRBACTree(bindings []*pb.RoleBinding) *rbacNode {
 	root := &rbacNode{Path: "/", Segment: "/"}
 	nodeByPath := map[string]*rbacNode{"/": root}
 

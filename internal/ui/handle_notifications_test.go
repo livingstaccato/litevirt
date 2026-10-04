@@ -21,7 +21,7 @@ func TestHandleNotifications_RendersAndModals(t *testing.T) {
 		t.Fatalf("status=%d", w.Code)
 	}
 	mustContain(t, w.Body.String(), "ops-slack", "slack", "backup.*", "warn",
-		"/ui/notifications/targets/t1/test")
+		"/ui/notifications/targets/t1/test", `hx-delete="/ui/notifications/routes/r1"`)
 
 	for _, p := range []string{"/ui/notifications/target-modal", "/ui/notifications/route-modal"} {
 		if w := serveRequest(s, uiSessionReq(t, http.MethodGet, p, nil)); w.Code != http.StatusOK {

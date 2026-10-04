@@ -9,35 +9,33 @@ import (
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/notify"
 )
 
-// Notification routes are READ in-process against the host-local Corrosion
-// handle. Targets are not: a target's config IS its credential (a webhook or
-// Slack URL is a bearer secret), and ListNotificationTargets redacts it below
-// the operator floor. Reading the table here rendered every URL to a viewer, so
-// the page lists targets through that RPC with the session's bearer and the
-// redaction rule stays in one place. Every action, the test send included,
-// goes through the daemon's notification RPCs too.
+// The page lists targets and routes through their RPCs with the session's
+// bearer, never from the tables. A target's config IS its credential (a webhook
+// or Slack URL is a bearer secret), and ListNotificationTargets redacts it below
+// the operator floor; reading the table here once rendered every URL to a
+// viewer. Every action, the test send included, goes through the daemon's
+// notification RPCs too.
 
 func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Notifications", "notifications")
-	if s.db == nil {
-		data["Error"] = "corrosion DB not wired into UI server (build mismatch)"
-		s.renderPage(w, "notifications.html", data)
-		return
-	}
-	resp, err := s.grpc.ListNotificationTargets(s.uiBearerCtx(r), &pb.ListNotificationTargetsRequest{})
+	ctx := s.uiBearerCtx(r)
+	resp, err := s.grpc.ListNotificationTargets(ctx, &pb.ListNotificationTargetsRequest{})
 	if err != nil {
 		data["Error"] = grpcMsg(err)
 		s.renderPage(w, "notifications.html", data)
 		return
 	}
-	targets := resp.GetTargets()
-	routes, _ := corrosion.ListNotificationRoutes(r.Context(), s.db)
-	data["Targets"] = targets
-	data["Routes"] = routes
+	routes, err := s.grpc.ListNotificationRoutes(ctx, &pb.ListNotificationRoutesRequest{})
+	if err != nil {
+		data["Error"] = grpcMsg(err)
+		s.renderPage(w, "notifications.html", data)
+		return
+	}
+	data["Targets"] = resp.GetTargets()
+	data["Routes"] = routes.GetRoutes()
 	s.renderPage(w, "notifications.html", data)
 }
 

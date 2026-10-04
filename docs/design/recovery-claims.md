@@ -2153,3 +2153,96 @@ where it described the mechanism; this list records what changed and why.
     §3.16 holds unchanged. A value decided for the failed host itself keeps
     the stranded path, and one whose destination has no host row keeps the
     removal path.
+40. **A container relocation's skip leaves its decided proof live, except
+    where the destination could take a different value** (§3.12, §3.16).
+    `imageRecreateOrSkip` has three ways out that relocate nothing, and under
+    claims each can hold a certified relocation proof: the one decided by its
+    own claim, the restore's it fell back from, or another coordinator's.
+    Outside claims 5a1a76e8 fails an abandoned restore's proof; under claims
+    the rule is different:
+    - **The decided destination already runs a container of the same name.**
+      It can never take this one: the re-key refuses to clobber it. The
+      relocation claim now checks an adopted destination for that, as item
+      39 checks a VM's, so the destination abandons the proof and the claim
+      moves to the next attempt with the coordinator's own pick, which
+      `pickContainerTarget` has already checked for the name. Before this,
+      the value was written, and once carried out the collision check turned
+      it away without marking the container. Every tick then re-claimed,
+      learned the same value and was turned away again, while the certified
+      proof stayed live for a host it could never run on.
+    - **No re-pullable image and no usable backup**, or a destination that
+      took a same-name container after the decision. The container is marked
+      `relocate-skipped` for operator recovery, and the decided proof stays
+      live. That is the claim semantics, not an oversight. The value decided
+      at its key stands until its destination abandons it or is removed for
+      good (§3.12). Nothing in a skip can execute it. The destination runs a
+      relocation proof only off a row re-keyed with its token, or off the
+      restore the decision itself started, and both carry out that same
+      decision. A later recovery of the same incarnation at the same owner
+      epoch learns the value and completes it, or moves past it on the
+      destination's abandonment. Failing the proof from the coordinator, as
+      the unclaimed path does, would not stop anything the claim allows. It
+      would also cost liveness: at a legacy key the next recovery would
+      re-key the container onto a proof that never runs, and at a scoped key
+      it would need the destination's foreign abandonment before moving on.
+      With no image and no backup, asking the destination for an abandonment
+      at skip time gains nothing, because no other destination can do better.
+      A same-name container that appears on the destination after the
+      decision is a race the next recovery of the key handles through the
+      check above. It is left for the operator here, as the unclaimed path
+      leaves it.
+41. **Known limitation: a value names its destination by host name, not by
+    machine** (finding N4, the half item 39 leaves). A value decided for one
+    machine can be executed by another machine later admitted under the same
+    name. Item 39 checks that the host now holding the name is active, on the
+    current build and placeable. It does not check that this is the machine
+    the decision was made for.
+    - **Why it is not fixed by an optional field.** The natural identity is
+      the destination's certificate serial (`hosts.cert_serial`). A
+      re-admission must present a new one (`corrosion.AdmitHost` refuses the
+      removed serial), and the old one is in the CRL. To mean anything, the
+      field has to be inside `value_digest`: the accept signs the digest, and
+      a field outside it can be stripped or rewritten in any replicated proof
+      row. Inside the digest, it cannot be optional. A voter on an older
+      build decodes the value field by field (`valueFromPB`) and drops one it
+      does not know. It then digests, stores and reports a different value
+      from its peers: its accept signs a digest a new proposer and a new
+      destination never compute, and its promise reports a value without the
+      field. The destination also verifies against the proof row, so the
+      field must be a new `runtime_action_proofs` column. That changes the
+      replicated statement shape, which needs a ledger entry and a schema
+      bump. So binding the destination machine is the same kind of change as
+      item 37: a mandatory, ReplicationGated token, a `-v2` value domain used
+      only after it latches, a protobuf field, a proof column and a check in
+      `VerifyClaimCertificate`. It is not a field old nodes can ignore.
+    - **What it would buy.** The certificate's meaning concerns the source:
+      a majority of voters could not reach the owner being left (§3.5.1).
+      Voters never judge the destination, so the name does not weaken that.
+      Single ownership does not rest on the destination's identity either.
+      The proof is single use, bound to the key's owner epoch and incarnation,
+      and a name has one live `hosts` row at a time. A machine removed with
+      `lv host rm --dead` is revoked, so it cannot authenticate to a peer or
+      pass the `ExecutionGate` quorum. At most one machine can run the value.
+      What the name loses is the coordinator's reason for picking that
+      destination, and item 39 re-checks that against the machine there now.
+    - **Mitigations in place.**
+      1. Re-admission waits for the removed machine's workloads (f9f33583).
+         `AdmitHost` refuses a name while live VM or container rows are still
+         recorded on it. A reschedule decided for the old machine points its
+         row there (`WriteVMRescheduleProof`), so it is recovered at the next
+         attempt on the removal evidence before the name can return.
+      2. An adopted value's destination is checked like a fresh pick (item
+         39). A host that is joining, behind, unplaceable or (for a container)
+         already running the name abandons the proof, and the claim moves on.
+      3. The old machine cannot act on the value: it is revoked, and a
+         destination needs quorum through peers before it starts anything.
+    - **What remains exposed.** A value that no row points at the old
+      destination for. Two kinds exist: a container relocation decided but not
+      yet re-keyed (the source row keeps the name of the failed host), and an
+      accepted but uncertified value that a forced reconfiguration imported
+      (§4.6), as in the drill-4/drill-6 case. Either can be executed by the
+      new machine under the name once that machine is active, current and
+      placeable. The workload then recovers onto one fit host with one owner,
+      decided by a certificate about its real source. Revisit this if a
+      destination's identity ever starts to carry meaning, for example
+      host-pinned storage or a per-machine secret in the value.

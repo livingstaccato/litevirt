@@ -45,6 +45,9 @@ type Server struct {
 	// runtime-inventory collector can read markers. Empty disables marker reads
 	// (they report missing).
 	containersRoot string
+	// supersededRetentionDays is superseded_disk_retention_days, reported by
+	// SupersededDisks (superseded_disks.go).
+	supersededRetentionDays int
 
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex

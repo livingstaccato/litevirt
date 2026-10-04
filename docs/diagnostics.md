@@ -1623,6 +1623,33 @@ on a stale decision.
    `<data_dir>/containers/<name>/owner_epoch` if it exists.
 4. The next reconcile pass resolves the condition.
 
+### A VM's disk is missing on its own host (`vm_disk_missing`)
+
+A start on the VM's own host never boots it from a blank disk. This covers the
+onboot autostart, the restart of a VM the database says is running that is not
+in libvirt, and a start interrupted by a daemon restart. If the file at a
+disk's path is missing, the start refuses and the VM goes to `error`. The
+reconciler raises `vm_disk_missing` (evaluator `vm_disk`, subject
+`vm/<name>@<host>`, critical). It does not rebuild the disk from the VM's image,
+which would start the VM with its data silently reset. The evidence names the
+disk, its path and its backing image.
+
+Only an ownership transfer onto a host rebuilds a missing disk from its image:
+a VM rescheduled off a failed host, whose host-local disk stayed behind there
+(see [VM failure policies](migration-failover.md#vm-failure-policies)).
+
+| Raised when | Clears when |
+|---|---|
+| A start that is not an ownership transfer finds a disk's file missing. | The VM has left `error` on this host: it was started or stopped, rebuilt, deleted, or moved to another host. |
+
+To recover, do one of these:
+
+- If the disk still exists somewhere, for example on another host, in a
+  backup, or as a `.superseded-*` copy next to its path, put it back at the
+  path in the evidence and run `lv start <vm>`.
+- If its data is lost for good, run `lv rebuild <vm>`. It recreates the VM from
+  its spec with blank disks and keeps its IP and MAC addresses.
+
 ## NetBox IPAM: metrics and health findings
 
 Every counter below is registered on the same `/metrics` endpoint as the rest,

@@ -1,7 +1,6 @@
 package health
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -22,8 +21,9 @@ import (
 // size (drills 2 and 3 on main-b3368d7c: pp5 and pp2 came up on 112 MiB disks
 // instead of their 20 GiB ones).
 //
-// So on a transfer the file is set aside (renamed, never deleted: it may hold
-// the only copy of data an operator wants back) and the start treats the disk
+// So on a transfer the file is set aside (renamed, not deleted: it may hold
+// the only copy of data an operator wants back; superseded_retention.go says
+// when it goes) and the start treats the disk
 // as missing — rebuilding the overlay at its recorded size, or failing if
 // there is nothing to rebuild from. The one file a transfer keeps is a disk it
 // rebuilt itself, for this same proof, on an earlier attempt that then failed
@@ -88,12 +88,12 @@ func (r *Reconciler) setAsideSupersededDisk(vmName, proofID string, d corrosion.
 	if r.transferDisks.builtFor(d.Path, proofID) {
 		return "", nil
 	}
-	aside := fmt.Sprintf("%s.superseded-%s", d.Path, time.Now().UTC().Format("20060102T150405.000000000Z"))
+	aside := supersededName(d.Path, time.Now())
 	if err := os.Rename(d.Path, aside); err != nil {
 		return "", err
 	}
 	slog.Warn("reconciler: a failover onto this host found an old copy of the VM's disk; set it aside and will not boot it",
 		"vm", vmName, "disk", d.DiskName, "path", d.Path, "set_aside_to", aside,
-		"fix", "remove "+aside+" once nothing in it is needed")
+		"retention", "removed once past superseded_disk_retention_days; lv host superseded-disks lists it")
 	return aside, nil
 }

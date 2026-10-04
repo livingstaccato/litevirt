@@ -41,6 +41,7 @@ const (
 	LiteVirt_PublishCRL_FullMethodName                 = "/litevirt.v1.LiteVirt/PublishCRL"
 	LiteVirt_RescanHost_FullMethodName                 = "/litevirt.v1.LiteVirt/RescanHost"
 	LiteVirt_ListHostDevices_FullMethodName            = "/litevirt.v1.LiteVirt/ListHostDevices"
+	LiteVirt_SupersededDisks_FullMethodName            = "/litevirt.v1.LiteVirt/SupersededDisks"
 	LiteVirt_UpgradeHost_FullMethodName                = "/litevirt.v1.LiteVirt/UpgradeHost"
 	LiteVirt_PreStageUpgrade_FullMethodName            = "/litevirt.v1.LiteVirt/PreStageUpgrade"
 	LiteVirt_FetchBinary_FullMethodName                = "/litevirt.v1.LiteVirt/FetchBinary"
@@ -336,6 +337,9 @@ type LiteVirtClient interface {
 	PublishCRL(ctx context.Context, in *PublishCRLRequest, opts ...grpc.CallOption) (*PublishCRLResponse, error)
 	RescanHost(ctx context.Context, in *RescanHostRequest, opts ...grpc.CallOption) (*RescanHostResponse, error)
 	ListHostDevices(ctx context.Context, in *ListHostDevicesRequest, opts ...grpc.CallOption) (*ListHostDevicesResponse, error)
+	// SupersededDisks lists the disk copies a failover start set aside on a
+	// host, and with purge (admin) removes the ones not held.
+	SupersededDisks(ctx context.Context, in *SupersededDisksRequest, opts ...grpc.CallOption) (*SupersededDisksResponse, error)
 	UpgradeHost(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[UpgradeHostRequest, UpgradeHostResponse], error)
 	// PreStageUpgrade stages the new binary and forward-migrates the local
 	// state.db schema WITHOUT swapping/re-execing. Run on every node before the
@@ -1067,6 +1071,16 @@ func (c *liteVirtClient) ListHostDevices(ctx context.Context, in *ListHostDevice
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListHostDevicesResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_ListHostDevices_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) SupersededDisks(ctx context.Context, in *SupersededDisksRequest, opts ...grpc.CallOption) (*SupersededDisksResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SupersededDisksResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_SupersededDisks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3898,6 +3912,9 @@ type LiteVirtServer interface {
 	PublishCRL(context.Context, *PublishCRLRequest) (*PublishCRLResponse, error)
 	RescanHost(context.Context, *RescanHostRequest) (*RescanHostResponse, error)
 	ListHostDevices(context.Context, *ListHostDevicesRequest) (*ListHostDevicesResponse, error)
+	// SupersededDisks lists the disk copies a failover start set aside on a
+	// host, and with purge (admin) removes the ones not held.
+	SupersededDisks(context.Context, *SupersededDisksRequest) (*SupersededDisksResponse, error)
 	UpgradeHost(grpc.ClientStreamingServer[UpgradeHostRequest, UpgradeHostResponse]) error
 	// PreStageUpgrade stages the new binary and forward-migrates the local
 	// state.db schema WITHOUT swapping/re-execing. Run on every node before the
@@ -4469,6 +4486,9 @@ func (UnimplementedLiteVirtServer) RescanHost(context.Context, *RescanHostReques
 }
 func (UnimplementedLiteVirtServer) ListHostDevices(context.Context, *ListHostDevicesRequest) (*ListHostDevicesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListHostDevices not implemented")
+}
+func (UnimplementedLiteVirtServer) SupersededDisks(context.Context, *SupersededDisksRequest) (*SupersededDisksResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SupersededDisks not implemented")
 }
 func (UnimplementedLiteVirtServer) UpgradeHost(grpc.ClientStreamingServer[UpgradeHostRequest, UpgradeHostResponse]) error {
 	return status.Error(codes.Unimplemented, "method UpgradeHost not implemented")
@@ -5607,6 +5627,24 @@ func _LiteVirt_ListHostDevices_Handler(srv interface{}, ctx context.Context, dec
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).ListHostDevices(ctx, req.(*ListHostDevicesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_SupersededDisks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SupersededDisksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).SupersededDisks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_SupersededDisks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).SupersededDisks(ctx, req.(*SupersededDisksRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -9937,6 +9975,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListHostDevices",
 			Handler:    _LiteVirt_ListHostDevices_Handler,
+		},
+		{
+			MethodName: "SupersededDisks",
+			Handler:    _LiteVirt_SupersededDisks_Handler,
 		},
 		{
 			MethodName: "UninstallHost",

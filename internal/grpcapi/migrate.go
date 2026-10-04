@@ -273,6 +273,21 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		return status.Errorf(codes.FailedPrecondition,
 			"VM %q has a local disk — use --with-storage for live migration or --strategy=cold", req.VmName)
 	}
+	// The disks the copy mirrors: the host-local ones, never a shared one,
+	// which is the same file on the target and would be mirrored onto itself.
+	var diskTargets []string
+	if withStorage {
+		if diskTargets, err = storageMigrationTargets(req.VmName, disks); err != nil {
+			return err
+		}
+		if len(diskTargets) == 0 {
+			// Nothing to copy: an empty migrate_disks would make libvirt copy
+			// EVERY writable disk, the shared ones included.
+			slog.Info("migrate: --with-storage requested but the VM has no host-local disk; migrating without a storage copy",
+				"vm", req.VmName)
+			withStorage = false
+		}
+	}
 	// The disks the copy needs on the target, checked against their records
 	// here, before any work on the target.
 	var diskStubs []*pb.DiskStub
@@ -528,17 +543,6 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 		var cancel context.CancelFunc
 		migrateCtx, cancel = context.WithTimeout(ctx, time.Duration(migratePolicy.GetTimeoutSec())*time.Second)
 		defer cancel()
-	}
-
-	// Build the list of writable disk targets to migrate (exclude CDROMs).
-	var diskTargets []string
-	if withStorage {
-		disks, _ := corrosion.GetVMDisks(ctx, s.db, vm.Name)
-		for _, d := range disks {
-			if d.TargetDev != "" {
-				diskTargets = append(diskTargets, d.TargetDev)
-			}
-		}
 	}
 
 	// Run migration in background; poll progress.
@@ -1424,7 +1428,7 @@ func (s *Server) storageMigrationStubs(ctx context.Context, vmName string) ([]*p
 	}
 	var stubs []*pb.DiskStub
 	for _, d := range disks {
-		if d.Path == "" || (d.StorageType != "" && !isHostLocalDiskDriver(d.StorageType)) {
+		if !copiedByStorageMigration(d) {
 			continue
 		}
 		size, err := diskVirtualSize(ctx, d.Path)
@@ -1443,6 +1447,35 @@ func (s *Server) storageMigrationStubs(ctx context.Context, vmName string) ([]*p
 		stubs = append(stubs, &pb.DiskStub{Path: d.Path, SizeBytes: size})
 	}
 	return stubs, nil
+}
+
+// copiedByStorageMigration reports whether a --with-storage migration copies
+// this disk: a host-local file (a row with no storage type is taken as one, as
+// it always was). A shared disk (nfs, ceph, iscsi, a volume manager) is the same
+// disk on the target already, and copying it would mirror it onto itself.
+func copiedByStorageMigration(d corrosion.DiskRecord) bool {
+	return d.Path != "" && (d.StorageType == "" || isHostLocalDiskDriver(d.StorageType))
+}
+
+// storageMigrationTargets is the migrate_disks list of a --with-storage
+// migration: the target device of every disk it copies, and nothing else.
+// libvirt reads an EMPTY list as "copy every writable disk", so a copied disk
+// with no recorded target device is refused rather than left out, which would
+// leave it behind, or the list emptied, which would copy the shared disks too.
+func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]string, error) {
+	var targets []string
+	for _, d := range disks {
+		if !copiedByStorageMigration(d) {
+			continue
+		}
+		if d.TargetDev == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q has no recorded target device, so a storage migration cannot name it to libvirt; "+
+					"migrate it cold (--strategy=cold) or repair its record", d.DiskName, vmName)
+		}
+		targets = append(targets, d.TargetDev)
+	}
+	return targets, nil
 }
 
 // ensureDisksOnTarget has the target create the stub files the copy needs, so

@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"github.com/litevirt/litevirt/internal/secretfile"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -489,7 +491,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// wired later via SetPeerPinger; until then PeerSupports fails closed, so proof
 	// WAL entries defer rather than leak — never a schema-version guess.)
 	d.checker = health.NewChecker(d.cfg.HostName, d.cfg.PKIDir, d.db)
-	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, "split_brain_activated"))
+	d.checker.SetActivationMarker(filepath.Join(d.cfg.DataDir, activationMarkerBaseName))
 	gateMetrics := metrics.NewRuntimeGateMetrics()      // shared by all gate observers
 	stateWriteMetrics := metrics.NewStateWriteMetrics() // shared by all state-write observers
 
@@ -2011,6 +2013,19 @@ func parseDurationOr(s string, fallback time.Duration) time.Duration {
 
 const adminPasswordFile = "/etc/litevirt/admin-password"
 
+// genesisMarkerName is the founder marker in data_dir. `lv host init` writes it,
+// and only while the data dir holds no state.db; every other provisioning path
+// removes it. seedAdminUser mints the cluster's first admin credential only
+// while it exists, and deletes it once that credential is written.
+const genesisMarkerName = "genesis-pending"
+
+// activationMarkerBaseName prefixes the persisted capability latches in
+// data_dir (<base>.<token>). They are written only after a daemon has run as a
+// member and survive a state.db loss, so seedAdminUser treats any of them as
+// proof this node is not founding a cluster. The setup script's
+// genesisMarkerScript matches the same name.
+const activationMarkerBaseName = "split_brain_activated"
+
 // seedAdminUser creates a default admin user with a random password if this node
 // is founding a cluster and no users exist. The password is written to
 // adminPasswordPath (adminPasswordFile by default) with mode 0600.
@@ -2057,15 +2072,54 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 	if len(d.cfg.JoinPeers) > 0 {
 		// Says what did NOT happen and where the credential is instead. Naming a
 		// password file here would send the operator looking for one this branch
-		// never writes, and from there to `lv user reset-admin`, which on a node
-		// that has not converged yet mints and publishes a fresh credential — the
-		// very thing this guard exists to prevent.
+		// never writes, and from there to `lv user reset-admin` — which only resets
+		// a live admin, so on a node that has not converged yet it refuses with "no
+		// live admin account" and reads as a second failure.
 		slog.Info("this node is joining an existing cluster (join peers are configured and "+
 			"no admin user has replicated in yet), so no admin account is created and no "+
 			"password file is written here; the credential replicates in from the cluster. "+
-			"Running `lv user reset-admin` on this node before it converges mints a NEW "+
-			"credential and replaces the cluster's",
+			"`lv user reset-admin` resets an existing account and creates none, so it "+
+			"refuses on this node until the credential has replicated in",
 			"join_peers", len(d.cfg.JoinPeers))
+		return nil
+	}
+
+	// An empty join_peers is an absence, and absences are not proof of founding.
+	// A founder driven from a workstation keeps join_peers [] for life, so losing
+	// its state.db put it straight back on the mint path; so did re-running
+	// `lv host init` against a member, or restoring a config from a template.
+	// Founding is a positive fact instead: `lv host init` writes the marker, and
+	// only while the data dir holds no state.db.
+	marker := filepath.Join(d.cfg.DataDir, genesisMarkerName)
+	if _, err := os.Stat(marker); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("check founder marker %s: %w", marker, err)
+		}
+		slog.Warn("no admin account exists and this node was not founded by `lv host init` "+
+			"(no founder marker in data_dir), so no admin account is created and no password "+
+			"file is written here. If this node belongs to a cluster, the credential "+
+			"replicates in once it converges; do not run `lv user reset-admin` here, it "+
+			"resets an existing account and creates none. Only if this node is founding a "+
+			"NEW cluster that was set up without `lv host init`: create the marker by hand "+
+			"and restart the daemon",
+			"marker", marker)
+		return nil
+	}
+
+	// A marker does not outrank evidence of earlier membership. Capability
+	// latches exist only once a daemon has run as a member, and survive a
+	// state.db loss; a marker beside one was written by hand or by a setup that
+	// could not see the latch, and minting here replaces the cluster's admin.
+	latches, err := filepath.Glob(filepath.Join(d.cfg.DataDir, activationMarkerBaseName+".*"))
+	if err != nil {
+		return fmt.Errorf("check for capability latches: %w", err)
+	}
+	if len(latches) > 0 {
+		slog.Warn("a founder marker is present but this node holds capability latches, so it "+
+			"has run as a cluster member before; no admin account is created. Its credential "+
+			"replicates in from the cluster. A brand-new cluster has to start from an empty "+
+			"data_dir",
+			"marker", marker, "latches", len(latches))
 		return nil
 	}
 
@@ -2081,6 +2135,16 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 
 	if err := corrosion.InsertUser(ctx, d.db, "admin", "admin", string(hash)); err != nil {
 		return fmt.Errorf("insert admin: %w", err)
+	}
+
+	// The marker licenses exactly one mint, and that mint has now happened: the
+	// row exists, so a restart returns at the ever-existed check. Consume it
+	// before the password file, so a failed file write cannot leave the licence
+	// behind for the day this state.db is lost.
+	if err := os.Remove(marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		slog.Warn("could not remove the founder marker after seeding the admin account; "+
+			"delete it by hand, or a later state.db rebuild on this node mints a new "+
+			"credential over the cluster's", "marker", marker, "error", err)
 	}
 
 	pwFile := d.adminPasswordPath

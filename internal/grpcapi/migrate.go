@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -1112,8 +1113,18 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 	if req.VmName == "" || len(req.Bundle) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "vm_name and a non-empty firmware bundle are required")
 	}
-	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
+	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
+	if err != nil {
 		return nil, err
+	}
+	// The uuid keys the swtpm tree this restores into (and wipes on a refusal
+	// below), and the permission was checked on vm_name alone: it must be this
+	// VM's own recorded uuid — what the source sends (fwSpec.UUID) — or
+	// vm.migrate on one VM would overwrite or erase another VM's TPM.
+	if req.Uuid != "" && (!lv.ValidFirmwareUUID(req.Uuid) ||
+		!strings.EqualFold(parseFirmwareSpec(vm.Spec).UUID, req.Uuid)) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"firmware uuid %q is not the recorded uuid of VM %q", req.Uuid, req.VmName)
 	}
 	// vm_name + uuid index into on-disk firmware paths, so validate them to a safe
 	// charset (no path traversal). And refuse to materialize state under a domain
@@ -1347,11 +1358,26 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		return nil, status.Error(codes.PermissionDenied,
 			"cleaning up artifacts of a vanished VM requires the admin role")
 	}
+	// The firmware UUID keys a RemoveAll under the swtpm root, and the
+	// permission above was checked on VmName alone. So it must be a real UUID
+	// (".." would name /var/lib/libvirt) and it must be THIS VM's own, as the
+	// replicated row records it — the value the source sends (fwSpec.UUID) —
+	// or vm.migrate on one VM would wipe another VM's TPM. A vanished VM has
+	// no row to bind against, so its swtpm tree is not wiped through here.
+	if req.FirmwareUuid != "" {
+		if !lv.ValidFirmwareUUID(req.FirmwareUuid) {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid firmware uuid %q", req.FirmwareUuid)
+		}
+		if vm == nil || !strings.EqualFold(parseFirmwareSpec(vm.Spec).UUID, req.FirmwareUuid) {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"firmware uuid %q is not the recorded uuid of VM %q", req.FirmwareUuid, req.VmName)
+		}
+	}
 	// A VM that lives here — its row names this host, or its domain is defined
 	// here — has its real disks at these paths; a failed migration TO this host
 	// never got that far.
-	vmLivesHere := (vm != nil && vm.HostName == s.hostName) ||
-		(s.virt != nil && s.virt.DomainExists(req.VmName))
+	rowNamesHere := vm != nil && vm.HostName == s.hostName
+	vmLivesHere := rowNamesHere || (s.virt != nil && s.virt.DomainExists(req.VmName))
 	for _, p := range req.DiskPaths {
 		if p == "" {
 			continue
@@ -1390,7 +1416,12 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	// defined domain). If the undefine FAILS, keep the firmware as a recoverable
 	// fallback and surface the error rather than stranding a defined domain whose
 	// firmware we erased (G1).
-	if req.UndefineDomain && req.VmName != "" && s.virt != nil && s.virt.DomainExists(req.VmName) {
+	// A VM whose row names this host owns the domain here; it is never a
+	// migration leftover, so neither it nor its firmware is touched.
+	if req.UndefineDomain && rowNamesHere {
+		slog.Warn("cleanup migration artifacts: VM lives on this host; leaving its domain and firmware",
+			"vm", req.VmName)
+	} else if req.UndefineDomain && req.VmName != "" && s.virt != nil && s.virt.DomainExists(req.VmName) {
 		if err := s.virt.UndefineDomainPreservingState(req.VmName); err != nil {
 			slog.Warn("cleanup migration artifacts: undefine pre-defined domain", "vm", req.VmName, "error", err)
 			return nil, status.Errorf(codes.Internal,
@@ -1399,8 +1430,16 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	}
 	// Wipe firmware state we pushed to this (failed) target so it can't be
 	// adopted by a retry / orphan the swtpm tree (G1).
+	// Never the firmware of a VM that lives here — an adopted or live workload,
+	// judged the same way as the disk stubs above but AFTER the undefine, so a
+	// domain this host pre-defined for the failed migration no longer counts.
 	if req.FirmwareUuid != "" {
-		lv.WipeFirmwareState(s.dataDir, req.VmName, req.FirmwareUuid)
+		if rowNamesHere || (s.virt != nil && s.virt.DomainExists(req.VmName)) {
+			slog.Warn("cleanup migration artifacts: VM lives on this host; leaving its firmware state",
+				"vm", req.VmName, "row_names_here", rowNamesHere)
+		} else {
+			lv.WipeFirmwareState(s.dataDir, req.VmName, req.FirmwareUuid)
+		}
 	}
 	return &emptypb.Empty{}, nil
 }

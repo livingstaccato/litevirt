@@ -41,8 +41,7 @@ func (s *Server) handleCreateNetwork(w http.ResponseWriter, r *http.Request) {
 		Pf:     r.FormValue("pf"),
 	}
 	if _, err := s.grpc.CreateNetwork(s.uiBearerCtx(r), req); err != nil {
-		sendToast(w, "Create network failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Create network", err)
 		return
 	}
 	sendToast(w, "Network '"+name+"' created", "success")
@@ -54,8 +53,7 @@ func (s *Server) handleDeleteNetwork(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	force := r.URL.Query().Get("force") == "true"
 	if _, err := s.grpc.DeleteNetwork(s.uiBearerCtx(r), &pb.DeleteNetworkRequest{Name: name, Force: force}); err != nil {
-		sendToast(w, "Delete network failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Delete network", err)
 		return
 	}
 	sendToast(w, "Network '"+name+"' deleted", "success")

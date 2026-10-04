@@ -322,8 +322,7 @@ func (s *Server) handleCreateVM(w http.ResponseWriter, r *http.Request) {
 	_, err := s.grpc.CreateVM(s.uiBearerCtx(r), &pb.CreateVMRequest{Spec: spec})
 	if err != nil {
 		slog.Error("UI: create VM failed", "name", spec.Name, "error", err)
-		sendToast(w, "Create VM failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Create VM", err)
 		return
 	}
 	sendToast(w, "VM '"+spec.Name+"' created", "success")
@@ -391,8 +390,7 @@ func (s *Server) handleSetVMMemoryUI(w http.ResponseWriter, r *http.Request) {
 	}
 	target, _ := strconv.Atoi(r.FormValue("target_mib"))
 	if _, err := s.grpc.SetVMMemory(s.uiBearerCtx(r), &pb.SetVMMemoryRequest{Name: name, TargetMib: int32(target)}); err != nil {
-		sendToast(w, "Set memory failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Set memory", err)
 		return
 	}
 	sendToast(w, "Memory balloon target set to "+strconv.Itoa(target)+" MiB", "success")
@@ -420,8 +418,7 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 		WithMemory: r.FormValue("with_memory") == "true",
 	})
 	if err != nil {
-		sendToast(w, "Snapshot failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Snapshot", err)
 		return
 	}
 	sendToast(w, "Snapshot '"+snapName+"' created", "success")
@@ -473,8 +470,7 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 		VmName: vmName, SnapshotName: snapName,
 	})
 	if err != nil {
-		sendToast(w, "Delete snapshot failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Delete snapshot", err)
 		return
 	}
 	sendToast(w, "Snapshot '"+snapName+"' deleted", "success")
@@ -716,8 +712,7 @@ func (s *Server) handleUpdateVMSpec(w http.ResponseWriter, r *http.Request) {
 
 	_, err := s.grpc.UpdateVM(s.uiBearerCtx(r), req)
 	if err != nil {
-		sendToast(w, "Update failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Update", err)
 		return
 	}
 	sendToast(w, "VM '"+name+"' updated", "success")
@@ -758,8 +753,7 @@ func (s *Server) handleUpdateVMLifecycle(w http.ResponseWriter, r *http.Request)
 	}
 
 	if _, err := s.grpc.UpdateVM(s.uiBearerCtx(r), req); err != nil {
-		sendToast(w, "Update failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Update", err)
 		return
 	}
 	sendToast(w, "VM '"+name+"' lifecycle updated", "success")
@@ -781,8 +775,7 @@ func (s *Server) handleSetBootOrder(w http.ResponseWriter, r *http.Request) {
 		BootOrder: bootOrder,
 	})
 	if err != nil {
-		sendToast(w, "Set boot order failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Set boot order", err)
 		return
 	}
 	sendToast(w, "Boot order set to '"+bootOrder+"'", "success")
@@ -806,8 +799,7 @@ func (s *Server) handleAttachDisk(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	if err != nil {
-		sendToast(w, "Attach disk failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Attach disk", err)
 		return
 	}
 	sendToast(w, "Disk attached", "success")
@@ -1150,8 +1142,7 @@ func (s *Server) handleResizeDisk(w http.ResponseWriter, r *http.Request) {
 		Size:     fmt.Sprintf("%dG", sizeGiB),
 	})
 	if err != nil {
-		sendToast(w, "Resize disk failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Resize disk", err)
 		return
 	}
 	sendToast(w, "Disk resized to "+fmt.Sprintf("%dG", sizeGiB), "success")
@@ -1169,8 +1160,7 @@ func (s *Server) handleDetachDisk(w http.ResponseWriter, r *http.Request) {
 		DiskName: r.FormValue("disk_name"),
 	})
 	if err != nil {
-		sendToast(w, "Detach disk failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Detach disk", err)
 		return
 	}
 	sendToast(w, "Disk detached", "success")
@@ -1219,8 +1209,7 @@ func (s *Server) handleAttachNIC(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 	if err != nil {
-		sendToast(w, "Attach NIC failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Attach NIC", err)
 		return
 	}
 	sendToast(w, "NIC attached", "success")
@@ -1238,8 +1227,7 @@ func (s *Server) handleDetachNIC(w http.ResponseWriter, r *http.Request) {
 		NicMac: r.FormValue("nic_mac"),
 	})
 	if err != nil {
-		sendToast(w, "Detach NIC failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Detach NIC", err)
 		return
 	}
 	sendToast(w, "NIC detached", "success")
@@ -1308,8 +1296,7 @@ func (s *Server) handleAttachPCI(w http.ResponseWriter, r *http.Request) {
 		PciDevice: spec,
 	})
 	if err != nil {
-		sendToast(w, "Attach PCI failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Attach PCI", err)
 		return
 	}
 	sendToast(w, "PCI device attached", "success")
@@ -1327,8 +1314,7 @@ func (s *Server) handleDetachPCI(w http.ResponseWriter, r *http.Request) {
 		PciAddress: r.FormValue("pci_address"),
 	})
 	if err != nil {
-		sendToast(w, "Detach PCI failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Detach PCI", err)
 		return
 	}
 	sendToast(w, "PCI device detached", "success")
@@ -1441,7 +1427,7 @@ func (s *Server) handleAvailableDevicesJSON(w http.ResponseWriter, r *http.Reque
 		TypeFilter: typeFilter,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), httpStatusFor(err))
 		return
 	}
 	var free []*pb.PCIDevice

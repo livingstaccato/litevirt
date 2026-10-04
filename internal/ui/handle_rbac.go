@@ -48,8 +48,7 @@ func (s *Server) handleGrantRole(w http.ResponseWriter, r *http.Request) {
 		Path: path, Role: role, Principal: principal, Propagate: r.FormValue("propagate") == "on",
 	})
 	if err != nil {
-		sendToast(w, "Grant failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Grant", err)
 		return
 	}
 	sendToast(w, "Granted "+role+" on "+path+" to "+principal, "success")
@@ -61,8 +60,7 @@ func (s *Server) handleGrantRole(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRevokeRole(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if _, err := s.grpc.RevokeRole(s.uiBearerCtx(r), &pb.RevokeRoleRequest{Id: id}); err != nil {
-		sendToast(w, "Revoke failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Revoke", err)
 		return
 	}
 	sendToast(w, "Role binding revoked", "success")

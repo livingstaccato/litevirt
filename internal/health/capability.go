@@ -38,6 +38,11 @@ type PeerPinger func(ctx context.Context, host string) ([]string, time.Time, err
 // capActivationTimeout bounds the fan-out of fresh Pings for one activation check.
 const capActivationTimeout = 4 * time.Second
 
+// The three capability caches (capActiveNegTTL, capActivePosTTL, peerCapTTL) stamp
+// and compare on c.now(), the Checker's injectable clock, never on time.Now /
+// time.Since: their expiry is otherwise untestable short of sleeping for the TTL
+// (TestCapabilityCaches_ExpireOnTheCheckersClock).
+//
 // capActiveNegTTL caches a NEGATIVE CapabilityActive result this long, so pre-latch
 // Enforced() on hot paths doesn't re-fan-out every call. Short enough that a just-healed
 // cluster activates promptly; only negatives are cached (a positive clears it + latches).
@@ -219,7 +224,7 @@ func (c *Checker) persistActivationMarker(base, token string) {
 // must catch. Mint sites use PeerSupportsFresh (uncached) instead.
 func (c *Checker) PeerSupports(ctx context.Context, peer, token string) bool {
 	c.mu.Lock()
-	if e, ok := c.peerCaps[peer]; ok && time.Since(e.fetchedAt) < peerCapTTL {
+	if e, ok := c.peerCaps[peer]; ok && c.now().Sub(e.fetchedAt) < peerCapTTL {
 		c.mu.Unlock()
 		return capabilities.Has(e.caps, token)
 	}
@@ -278,7 +283,7 @@ func (c *Checker) PeerSupportsFresh(ctx context.Context, peer, token string) boo
 	}
 	c.checkClockSkew(ctx, peer, peerWall, reqStart, reqEnd)
 	c.mu.Lock()
-	c.peerCaps[peer] = peerCapEntry{caps: caps, fetchedAt: time.Now()}
+	c.peerCaps[peer] = peerCapEntry{caps: caps, fetchedAt: c.now()}
 	c.mu.Unlock()
 	return capabilities.Has(caps, token)
 }
@@ -291,7 +296,7 @@ func (c *Checker) PeerSupportsFresh(ctx context.Context, peer, token string) boo
 func (c *Checker) CapabilityActive(ctx context.Context, token string) (bool, string) {
 	c.mu.Lock()
 	pinger := c.peerPinger
-	if e, ok := c.capActiveNeg[token]; ok && time.Since(e.at) < capActiveNegTTL {
+	if e, ok := c.capActiveNeg[token]; ok && c.now().Sub(e.at) < capActiveNegTTL {
 		c.mu.Unlock()
 		return false, e.reason // recent negative → skip the fresh-Ping fan-out (fail closed)
 	}
@@ -391,7 +396,7 @@ func (c *Checker) activationTargets(hosts []corrosion.HostRecord, token string) 
 // regression still surfaces within the TTL.
 func (c *Checker) CapabilityActiveForHealth(ctx context.Context, token string) (bool, string) {
 	c.mu.Lock()
-	if at, ok := c.capActivePos[token]; ok && time.Since(at) < capActivePosTTL {
+	if at, ok := c.capActivePos[token]; ok && c.now().Sub(at) < capActivePosTTL {
 		c.mu.Unlock()
 		return true, "" // recent positive → skip the fan-out (a regression still surfaces within capActivePosTTL)
 	}
@@ -399,7 +404,7 @@ func (c *Checker) CapabilityActiveForHealth(ctx context.Context, token string) (
 	ok, reason := c.CapabilityActive(ctx, token)
 	if ok {
 		c.mu.Lock()
-		c.capActivePos[token] = time.Now()
+		c.capActivePos[token] = c.now()
 		c.mu.Unlock()
 	}
 	return ok, reason
@@ -408,7 +413,7 @@ func (c *Checker) CapabilityActiveForHealth(ctx context.Context, token string) (
 // cacheNeg records a negative CapabilityActive result for capActiveNegTTL and returns it.
 func (c *Checker) cacheNeg(token, reason string) (bool, string) {
 	c.mu.Lock()
-	c.capActiveNeg[token] = capNegEntry{reason: reason, at: time.Now()}
+	c.capActiveNeg[token] = capNegEntry{reason: reason, at: c.now()}
 	delete(c.capActivePos, token) // a negative invalidates any cached positive (fail-closed)
 	c.mu.Unlock()
 	return false, reason

@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 
@@ -43,8 +45,7 @@ func (s *Server) handlePullImageModal(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteImage(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, err := s.grpc.DeleteImage(s.uiBearerCtx(r), &pb.DeleteImageRequest{Name: name}); err != nil {
-		sendToast(w, "Delete image failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Delete image", err)
 		return
 	}
 	sendToast(w, "Image '"+name+"' deleted", "success")
@@ -68,13 +69,16 @@ func (s *Server) handlePullImage(w http.ResponseWriter, r *http.Request) {
 		SourceUrl: url,
 	})
 	if err != nil {
-		sendToast(w, "Pull failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Pull", err)
 		return
 	}
 	// Read first progress message to confirm pull started, then let it
 	// continue in the background (server detaches on client disconnect).
-	stream.Recv()
+	// A refusal arrives here, on the first Recv, not from PullImage itself.
+	if _, err := stream.Recv(); err != nil && !errors.Is(err, io.EOF) {
+		rpcWriteFailed(w, "Pull", err)
+		return
+	}
 	sendToast(w, "Pulling image '"+name+"'", "success")
 	w.Header().Set("HX-Redirect", "/images")
 	w.WriteHeader(http.StatusOK)
@@ -106,8 +110,7 @@ func (s *Server) handleBuildImage(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("UI: build image failed", "error", err)
-		sendToast(w, "Build image failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Build image", err)
 		return
 	}
 	sendToast(w, "Image '"+imageName+"' built from VM '"+vmName+"'", "success")
@@ -143,15 +146,20 @@ func (s *Server) handlePushImage(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		slog.Error("UI: push image failed", "error", err)
-		sendToast(w, "Push failed: "+err.Error(), "error")
-		w.WriteHeader(500)
+		rpcWriteFailed(w, "Push", err)
 		return
 	}
 	// Consume progress stream to completion.
+	// A refusal arrives on the first Recv, so only io.EOF means it ran.
 	var lastErr string
 	for {
 		p, err := stream.Recv()
 		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				slog.Error("UI: push image stream failed", "error", err)
+				rpcWriteFailed(w, "Push", err)
+				return
+			}
 			break
 		}
 		if p.Error != "" {

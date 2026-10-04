@@ -83,8 +83,7 @@ func (s *Server) handleCreateContainer(w http.ResponseWriter, r *http.Request) {
 	slog.Info("UI: creating container", "name", req.Name, "host", req.HostName, "distro", req.Distro, "release", req.Release)
 	if _, err := s.grpc.CreateContainer(s.uiBearerCtx(r), req); err != nil {
 		slog.Error("UI: create container failed", "name", req.Name, "error", err)
-		sendToast(w, "Create container failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Create container", err)
 		return
 	}
 	sendToast(w, "Container '"+req.Name+"' created", "success")

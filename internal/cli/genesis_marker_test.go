@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // The founder marker is the only licence a daemon has to mint the cluster's first
@@ -65,15 +67,32 @@ func TestGenesisMarker_ReInitialisingANodeWithAStateDBDoesNotWriteIt(t *testing.
 // that has run long enough to latch a mandatory token has them. Re-running
 // `lv host init` there — with --force, or while the cluster is unreachable so the
 // membership check cannot answer — must not arm a mint of a second admin.
+//
+// The latch is created where the CHECKER writes it (health.ActivationMarkerPath),
+// so if that scheme ever changes and the script's literal does not, the script
+// stops seeing the latch and this test goes red.
 func TestGenesisMarker_ANodeWithCapabilityLatchesIsNotFresh(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "split_brain_activated.voter_config_v1"), nil, 0600); err != nil {
+	if err := os.WriteFile(health.ActivationMarkerPath(dir, "voter_config_v1"), nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	runGenesisSnippet(t, dir, foundingSetupEnv)
 	if markerExists(t, dir) {
 		t.Fatal("`lv host init` wrote a founder marker on a node holding capability latches; " +
 			"it has run as a cluster member before, and minting there replaces the cluster's admin")
+	}
+}
+
+// The setup script is a reader of the activation markers too, in bash, so it
+// cannot call internal/health. Its glob must be exactly the checker's path
+// scheme with the token wildcarded, joined the way ActivationMarkersOnDisk joins
+// it. A drifted literal sees no latch, fails open, and lets `lv host init` arm
+// an admin mint on a former member.
+func TestGenesisMarker_ScriptGlobsTheCheckersMarkerPath(t *testing.T) {
+	want := `"${LV_DATA_DIR}/` + filepath.Base(health.ActivationMarkerPath("/data", "*")) + `"`
+	if !strings.Contains(genesisMarkerScript, want) {
+		t.Fatalf("genesisMarkerScript does not glob %s, the path health writes activation "+
+			"markers at; it would miss every latch and let `lv host init` arm a second admin mint", want)
 	}
 }
 

@@ -78,8 +78,7 @@ func (s *Server) handleDeleteMapping(w http.ResponseWriter, r *http.Request) {
 	// anything -- which is worse than no audit log, because it reads as proof.
 	if _, err := s.grpc.DeleteResourceMapping(s.uiBearerCtx(r),
 		&pb.DeleteResourceMappingRequest{Name: r.PathValue("name")}); err != nil {
-		sendToast(w, "Delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Delete", err)
 		return
 	}
 	sendToast(w, "Resource mapping deleted", "success")

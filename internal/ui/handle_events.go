@@ -116,8 +116,7 @@ func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAuditVerify(w http.ResponseWriter, r *http.Request) {
 	resp, err := s.grpc.VerifyAuditChain(s.uiBearerCtx(r), &emptypb.Empty{})
 	if err != nil {
-		sendToast(w, "Verify failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Verify", err)
 		return
 	}
 	switch {
@@ -226,7 +225,7 @@ func (s *Server) handleAuditExport(w http.ResponseWriter, r *http.Request) {
 		})
 	})
 	if err != nil {
-		http.Error(w, "Export failed: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "Export failed: "+err.Error(), httpStatusFor(err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

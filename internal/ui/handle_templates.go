@@ -40,8 +40,7 @@ func (s *Server) handleCloneVM(w http.ResponseWriter, r *http.Request) {
 		Start:  r.FormValue("start") == "on",
 	})
 	if err != nil {
-		sendToast(w, "Clone failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Clone", err)
 		return
 	}
 	sendToast(w, "Cloned "+source+" → "+vm.Name, "success")
@@ -60,8 +59,7 @@ func (s *Server) handleConvertTemplate(w http.ResponseWriter, r *http.Request) {
 		Revert: revert,
 	})
 	if err != nil {
-		sendToast(w, "Operation failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Operation", err)
 		return
 	}
 	if revert {

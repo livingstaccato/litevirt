@@ -91,8 +91,7 @@ func (s *Server) handleCreatePool(w http.ResponseWriter, r *http.Request) {
 		Options: opts,
 	}
 	if _, err := s.grpc.CreateStoragePool(s.uiBearerCtx(r), req); err != nil {
-		sendToast(w, "Create pool failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Create pool", err)
 		return
 	}
 	sendToast(w, "Pool '"+name+"' created", "success")
@@ -106,8 +105,7 @@ func (s *Server) handleDeletePool(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	host := r.URL.Query().Get("host")
 	if _, err := s.grpc.DeleteStoragePool(s.uiBearerCtx(r), &pb.DeleteStoragePoolRequest{Name: name, Host: host}); err != nil {
-		sendToast(w, "Delete pool failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Delete pool", err)
 		return
 	}
 	sendToast(w, "Pool '"+name+"' deleted", "success")

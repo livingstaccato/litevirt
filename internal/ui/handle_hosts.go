@@ -129,15 +129,13 @@ func (s *Server) handleDrainHost(w http.ResponseWriter, r *http.Request) {
 	stream, err := s.grpc.DrainHost(ctx, &pb.DrainHostRequest{Name: name})
 	if err != nil {
 		cancel()
-		sendToast(w, "Drain failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Drain", err)
 		return
 	}
 	err, timedOut, rest := firstOrDetach(func() error { _, rerr := stream.Recv(); return rerr }, drainAckTimeout)
 	if err != nil && !errors.Is(err, io.EOF) {
 		cancel()
-		sendToast(w, "Drain failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Drain", err)
 		return
 	}
 	if err == nil {
@@ -157,8 +155,7 @@ func (s *Server) handleUndrainHost(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	_, err := s.grpc.UndrainHost(s.uiBearerCtx(r), &pb.UndrainHostRequest{Name: name})
 	if err != nil {
-		sendToast(w, "Undrain failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Undrain", err)
 		return
 	}
 	sendToast(w, name+" returned to active", "success")
@@ -169,8 +166,7 @@ func (s *Server) handleFenceHost(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	result, err := s.grpc.FenceHost(s.uiBearerCtx(r), &pb.FenceHostRequest{Name: name, Confirmed: true})
 	if err != nil {
-		sendToast(w, "Fence failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Fence", err)
 		return
 	}
 	sendToast(w, name+" fenced via "+result.Method+": "+result.Result, "warning")
@@ -181,8 +177,7 @@ func (s *Server) handleRemoveHost(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	_, err := s.grpc.RemoveHost(s.uiBearerCtx(r), &pb.RemoveHostRequest{Name: name, Force: false})
 	if err != nil {
-		sendToast(w, "Remove failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Remove", err)
 		return
 	}
 	sendToast(w, name+" removed from cluster", "success")
@@ -225,8 +220,7 @@ func (s *Server) handleHostLabelsUpdate(w http.ResponseWriter, r *http.Request) 
 		Remove: remove,
 	})
 	if err != nil {
-		sendToast(w, "Label update failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Label update", err)
 		return
 	}
 	sendToast(w, "Labels updated for "+name, "success")
@@ -236,8 +230,7 @@ func (s *Server) handleHostLabelsUpdate(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleHostHealthMatrix(w http.ResponseWriter, r *http.Request) {
 	health, err := s.grpc.GetClusterHealth(s.uiBearerCtx(r), &pb.GetClusterHealthRequest{})
 	if err != nil {
-		sendToast(w, "Health check failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Health check", err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -257,8 +250,7 @@ func (s *Server) handleConfigureHost(w http.ResponseWriter, r *http.Request) {
 		WatchdogDev:   r.FormValue("watchdog_dev"),
 	})
 	if err != nil {
-		sendToast(w, "Configure failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Configure", err)
 		return
 	}
 	sendToast(w, name+" configured", "success")

@@ -809,14 +809,15 @@ func (r *LxcRunner) cloneFreshIdentity(name string) error {
 		return fmt.Errorf("rewrite clone config %s: %w", cfg, err)
 	}
 	// Best-effort in-guest identity reset (so systemd regenerates machine-id and
-	// the hostname matches the clone). Missing files are fine.
+	// the hostname matches the clone). Missing files are fine. The rootfs is
+	// guest-controlled, so every write is confined to it (writeGuestFile): a
+	// guest symlink at or above these paths must never steer a root write onto
+	// the host.
 	rootfs := filepath.Join(r.lxcpath(), name, "rootfs")
-	_ = os.WriteFile(filepath.Join(rootfs, "etc", "hostname"), []byte(name+"\n"), 0o644)
+	_ = writeGuestFile(rootfs, "etc/hostname", []byte(name+"\n"), 0o644, false)
 	for _, mid := range []string{"etc/machine-id", "var/lib/dbus/machine-id"} {
-		p := filepath.Join(rootfs, mid)
-		if _, err := os.Stat(p); err == nil {
-			_ = os.WriteFile(p, nil, 0o644) // truncate → regenerated on first boot
-		}
+		// empty → regenerated on first boot
+		_ = writeGuestFile(rootfs, mid, nil, 0o444, true)
 	}
 	return nil
 }
@@ -1026,8 +1027,13 @@ func configureGuestStaticIP(rootfs string, nics []NetworkAttach) error {
 	if !anyStatic {
 		return nil
 	}
-	netDir := filepath.Join(rootfs, "etc", "network")
-	if err := os.MkdirAll(netDir, 0o755); err != nil {
+	// The rootfs may come from a pulled image, so resolve every write inside it.
+	root, err := os.OpenRoot(rootfs)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := root.MkdirAll("etc/network", 0o755); err != nil {
 		return err
 	}
 	var b strings.Builder
@@ -1050,7 +1056,7 @@ func configureGuestStaticIP(rootfs string, nics []NetworkAttach) error {
 		}
 		b.WriteString("\n")
 	}
-	return os.WriteFile(filepath.Join(netDir, "interfaces"), []byte(b.String()), 0o644)
+	return writeRootFile(root, "etc/network/interfaces", []byte(b.String()), 0o644, false)
 }
 
 // splitCIDR turns "10.0.3.5/24" into ("10.0.3.5", "255.255.255.0") for

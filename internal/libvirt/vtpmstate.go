@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/litevirt/litevirt/internal/safename"
@@ -26,10 +27,41 @@ const (
 	fwBundleSwtpm = "swtpm/" // tar entry prefix: the swtpm state tree
 )
 
+// SetSwtpmBaseForTest redirects the swtpm state root (the real one is
+// root-owned) and returns a func restoring it. Tests only.
+func SetSwtpmBaseForTest(dir string) (restore func()) {
+	old := libvirtSwtpmBase
+	libvirtSwtpmBase = dir
+	return func() { libvirtSwtpmBase = old }
+}
+
+// firmwareUUIDRe is the canonical 8-4-4-4-12 form libvirt prints and
+// uuid.NewString mints.
+var firmwareUUIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// ValidFirmwareUUID reports whether uuid is a canonical domain UUID — the
+// strict check for a UUID that arrives over an RPC before it keys any path.
+func ValidFirmwareUUID(uuid string) bool { return firmwareUUIDRe.MatchString(uuid) }
+
 // LibvirtSwtpmDir is libvirt's default per-domain swtpm state directory, keyed by
 // the (stable) domain UUID — the AppArmor-permitted location.
+//
+// It is a plain path builder: anything that reads, writes or removes the tree
+// goes through swtpmDir, which refuses a key that is not exactly one path
+// component below the base.
 func LibvirtSwtpmDir(uuid string) string {
 	return filepath.Join(libvirtSwtpmBase, uuid)
+}
+
+// swtpmDir is LibvirtSwtpmDir for a key that is confined to one directory under
+// the base: "", ".", "..", and anything holding a separator are refused, so a
+// UUID that arrived over an RPC can never name the base itself, its parent, or
+// any path outside it.
+func swtpmDir(uuid string) (string, bool) {
+	if safename.ValidateName(uuid) != nil {
+		return "", false
+	}
+	return LibvirtSwtpmDir(uuid), true
 }
 
 // SnapshotFirmwareBundlePath is the sidecar tar holding a snapshot's captured
@@ -56,10 +88,11 @@ func SafeSnapshotFirmwareBundlePath(dataDir, vmName, snapName string) (string, e
 
 // HasTPMState reports whether the (UUID-keyed) swtpm state exists.
 func HasTPMState(uuid string) bool {
-	if uuid == "" {
+	dir, ok := swtpmDir(uuid)
+	if !ok {
 		return false
 	}
-	ents, err := os.ReadDir(LibvirtSwtpmDir(uuid))
+	ents, err := os.ReadDir(dir)
 	return err == nil && len(ents) > 0
 }
 
@@ -78,7 +111,8 @@ func WriteFirmwareBundle(dataDir, vmName, uuid string, w io.Writer) (bool, error
 		}
 	}
 	if hasTPM {
-		if err := tarTree(tw, LibvirtSwtpmDir(uuid), fwBundleSwtpm); err != nil {
+		dir, _ := swtpmDir(uuid) // hasTPM implies a confined key
+		if err := tarTree(tw, dir, fwBundleSwtpm); err != nil {
 			return false, err
 		}
 	}
@@ -97,6 +131,11 @@ func WriteFirmwareBundle(dataDir, vmName, uuid string, w io.Writer) (bool, error
 // backup-repo bundle is untrusted); restored modes are clamped (files 0600, dirs
 // 0700), never trusting tar header modes.
 func ReadFirmwareBundle(r io.Reader, dataDir, vmName, uuid string) error {
+	if uuid != "" {
+		if _, ok := swtpmDir(uuid); !ok {
+			return fmt.Errorf("firmware bundle: invalid swtpm uuid %q", uuid)
+		}
+	}
 	swtpmRoot := LibvirtSwtpmDir(uuid)
 	var (
 		nvramBytes []byte
@@ -279,8 +318,8 @@ func WipeNameKeyedFirmwareState(dataDir, vmName string) {
 // WipeFirmwareStateByUUID removes the swtpm tree, which is keyed by the VM's
 // UUID and therefore cannot belong to anything else.
 func WipeFirmwareStateByUUID(uuid string) {
-	if uuid != "" {
-		_ = os.RemoveAll(LibvirtSwtpmDir(uuid))
+	if dir, ok := swtpmDir(uuid); ok {
+		_ = os.RemoveAll(dir)
 	}
 }
 

@@ -53,8 +53,7 @@ func (s *Server) handleRebalanceRun(w http.ResponseWriter, r *http.Request) {
 	dryRun := r.URL.Query().Get("dry_run") == "true"
 	resp, err := s.grpc.RunRebalance(s.uiBearerCtx(r), &pb.RunRebalanceRequest{DryRun: dryRun})
 	if err != nil {
-		sendToast(w, "Run failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Run", err)
 		return
 	}
 	sendToast(w, fmt.Sprintf("Emitted %d new proposal(s)", resp.ProposalsEmitted), "success")
@@ -68,8 +67,7 @@ func (s *Server) handleRebalanceApprove(w http.ResponseWriter, r *http.Request) 
 	id := r.PathValue("id")
 	p, err := s.grpc.ApproveRebalanceProposal(s.uiBearerCtx(r), &pb.ApproveRebalanceProposalRequest{Id: id})
 	if err != nil {
-		sendToast(w, "Approve failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Approve", err)
 		return
 	}
 	sendToast(w, fmt.Sprintf("Proposal approved (%s → %s for %s)", p.SrcHost, p.DstHost, p.VmName), "success")
@@ -83,8 +81,7 @@ func (s *Server) handleRebalanceReject(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	reason := r.Header.Get("HX-Prompt")
 	if _, err := s.grpc.RejectRebalanceProposal(s.uiBearerCtx(r), &pb.RejectRebalanceProposalRequest{Id: id, Reason: reason}); err != nil {
-		sendToast(w, "Reject failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusInternalServerError)
+		rpcWriteFailed(w, "Reject", err)
 		return
 	}
 	sendToast(w, "Proposal "+id+" rejected", "success")

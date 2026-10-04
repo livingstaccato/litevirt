@@ -154,6 +154,10 @@ type Client struct {
 	// what lets a node that knows no other host trust what its seeds introduce.
 	// See gossip_admission.go.
 	gossipSeeded bool
+	// gossipSeedIPs is the IP of every configured join seed. Admission trusts
+	// an unknown name at one of them until this node holds a hosts row for
+	// that address. See gossip_admission.go.
+	gossipSeedIPs map[string]bool
 	// gossipAddrs is the gossip address ("ip:port") memberlist last showed for
 	// each peer, so the re-merge pass can dial a host that has dropped out at
 	// the port it gossips on (gossip_rejoin.go). Guarded by gossipAddrMu.
@@ -1004,6 +1008,7 @@ func NewClient(cfg Config, clock *hlc.Clock) (*Client, error) {
 	// merge delegate alone misses passive merging — and the first snapshot is
 	// taken now, before memberlist exists, so the delegate always has one.
 	c.gossipSeeded = len(cfg.JoinPeers) > 0
+	c.gossipSeedIPs = seedIPs(cfg.JoinPeers)
 	c.loadAdmission()
 	adm := &admissionDelegate{client: c}
 	mlCfg.Alive = adm

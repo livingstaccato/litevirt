@@ -129,10 +129,6 @@ const insertHostSQL = `INSERT INTO hosts (name, address, ssh_user, ssh_port, grp
 			created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-// AdmitHost creates a host row or replaces a tombstone after an operator has
-// issued a different certificate for the same name. A daemon cannot use its old
-// certificate to resurrect itself: the old serial is retained in the tombstone
-// and an equal serial is refused.
 // ValidHostAddress reports whether s is a bare IPv4 literal, which is the only
 // thing hosts.address is allowed to be.
 //
@@ -151,6 +147,10 @@ func ValidHostAddress(s string) bool {
 	return ip != nil && ip.To4() != nil
 }
 
+// AdmitHost creates a host row or replaces a tombstone after an operator has
+// issued a different certificate for the same name. A daemon cannot use its old
+// certificate to resurrect itself: the old serial is retained in the tombstone
+// and an equal serial is refused.
 func AdmitHost(ctx context.Context, c *Client, h HostRecord) error {
 	if h.Name == "" || h.Address == "" || h.CertSerial == "" || h.CertSerial == "unknown" {
 		return fmt.Errorf("host admission requires name, address, and certificate serial")

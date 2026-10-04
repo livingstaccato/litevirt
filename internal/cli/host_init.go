@@ -325,8 +325,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	// local database still contains its tombstone; starting it first lets its boot
 	// state update put a fresh timestamp on that tombstone and race the admission
 	// back out to the cluster.
-	if err := sc.RunWithInput(fmt.Sprintf("%s bash -s",
-		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement))), []byte(setupScript)); err != nil {
+	if err := sc.RunWithInput(remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement), []byte(setupScript)); err != nil {
 		return fmt.Errorf("run setup script after admitting the host identity: %w", err)
 	}
 
@@ -914,6 +913,16 @@ func remoteInitSetupCommand(hostName, hostAddr, targetCfg string) string {
 	// must never carry it.
 	env := append(setupScriptEnvWith(hostName, hostAddr, localInitJoinPeers, block), foundingSetupEnv)
 	return shellEnvPrefix(env) + " bash -s"
+}
+
+// remoteAddSetupCommand is the command line `lv host add` runs the setup script
+// under. peersYAML is built from hosts.address, a replicated, peer-writable
+// column, and sshd runs this line through the login shell, so every value MUST
+// go through shellEnvPrefix. It is a function of its own so a test can run the
+// exact line HostAdd sends through a real shell.
+func remoteAddSetupCommand(hostName, hostAddr, peersYAML, enforcement string) string {
+	return fmt.Sprintf("%s bash -s",
+		shellEnvPrefix(setupScriptEnvWith(hostName, hostAddr, peersYAML, enforcement)))
 }
 
 // readPeerConfig reads an existing cluster node's daemon config over SSH. It

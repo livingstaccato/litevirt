@@ -505,7 +505,16 @@ func (c *Coordinator) noteClaimLost(action, kind, name, host string, decided cor
 // after deciding — this one carries it out itself, as the decided value says:
 // same proof, same token, same destination (§3.13 step 5).
 func (c *Coordinator) claimContainerRelocation(ctx context.Context, h *corrosion.HostRecord, ct corrosion.ContainerRecord, proposal corrosion.ActionProof) (corrosion.ActionProof, bool) {
-	cl, err := c.claimRecovery(ctx, proposal, h.Name, ct.CreatedAt)
+	// An adopted destination that already runs a container of this name can
+	// never take it (the relocation refuses to clobber one, and skips): its
+	// decided proof is abandoned there and the claim moves on, rather than
+	// being written and left live for a host it will never run on.
+	cl, err := c.claimRecoveryFor(ctx, proposal, h.Name, ct.CreatedAt, func(hr corrosion.HostRecord) string {
+		if c.targetHasLiveContainer(ctx, hr.Name, ct.Name) {
+			return "already runs a container named " + ct.Name
+		}
+		return ""
+	})
 	if err != nil {
 		c.noteClaimRefused(ctx, ActionRelocate, "container", ct.Name, h.Name, err)
 		return corrosion.ActionProof{}, false

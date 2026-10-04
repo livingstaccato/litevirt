@@ -2153,3 +2153,41 @@ where it described the mechanism; this list records what changed and why.
     §3.16 holds unchanged. A value decided for the failed host itself keeps
     the stranded path, and one whose destination has no host row keeps the
     removal path.
+40. **A container relocation's skip leaves its decided proof live, except
+    where the destination could take a different value** (§3.12, §3.16).
+    `imageRecreateOrSkip` has three ways out that relocate nothing, and under
+    claims each can hold a certified relocation proof: the one decided by its
+    own claim, the restore's it fell back from, or another coordinator's.
+    Outside claims 5a1a76e8 fails an abandoned restore's proof; under claims
+    the rule is different:
+    - **The decided destination already runs a container of the same name.**
+      It can never take this one: the re-key refuses to clobber it. The
+      relocation claim now checks an adopted destination for that, as item
+      39 checks a VM's, so the destination abandons the proof and the claim
+      moves to the next attempt with the coordinator's own pick, which
+      `pickContainerTarget` has already checked for the name. Before this,
+      the value was written, and once carried out the collision check turned
+      it away without marking the container. Every tick then re-claimed,
+      learned the same value and was turned away again, while the certified
+      proof stayed live for a host it could never run on.
+    - **No re-pullable image and no usable backup**, or a destination that
+      took a same-name container after the decision. The container is marked
+      `relocate-skipped` for operator recovery, and the decided proof stays
+      live. That is the claim semantics, not an oversight. The value decided
+      at its key stands until its destination abandons it or is removed for
+      good (§3.12). Nothing in a skip can execute it. The destination runs a
+      relocation proof only off a row re-keyed with its token, or off the
+      restore the decision itself started, and both carry out that same
+      decision. A later recovery of the same incarnation at the same owner
+      epoch learns the value and completes it, or moves past it on the
+      destination's abandonment. Failing the proof from the coordinator, as
+      the unclaimed path does, would not stop anything the claim allows. It
+      would also cost liveness: at a legacy key the next recovery would
+      re-key the container onto a proof that never runs, and at a scoped key
+      it would need the destination's foreign abandonment before moving on.
+      With no image and no backup, asking the destination for an abandonment
+      at skip time gains nothing, because no other destination can do better.
+      A same-name container that appears on the destination after the
+      decision is a race the next recovery of the key handles through the
+      check above. It is left for the operator here, as the unclaimed path
+      leaves it.

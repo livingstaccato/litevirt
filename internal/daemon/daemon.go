@@ -683,6 +683,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// churn). Local-only deterministic deletes — runs on every node.
 	go d.runSupersededGC(ctx, metrics.NewGCMetrics())
 
+	// Hourly removal of the disk copies a failover start set aside here, once
+	// past superseded_disk_retention_days (health/superseded_retention.go).
+	go d.runSupersededDiskSweep(ctx)
+
 	// Sample this host's aggregate disk/net rates into host_runtime_usage for the
 	// placement engine's DiskIOPS/NetBW dimensions.
 	go d.runRuntimeUsageSampler(ctx)
@@ -774,6 +778,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	svc := grpcapi.NewServer(d.cfg.HostName, d.cfg.DataDir, d.cfg.PKIDir, d.db, d.virt, d.images)
 	d.svc = svc
+	svc.SetSupersededDiskRetentionDays(d.cfg.SupersededDiskRetentionDays)
 
 	// Re-provision every network (bridge, gateway, DHCP, NAT, VXLAN) and tear
 	// down every deleted one. dnsmasq is a child process that dies when the
@@ -2283,6 +2288,40 @@ func (d *Daemon) runAuthEngineReload(ctx context.Context) {
 			if err := d.authEngine.Reload(ctx); err != nil {
 				slog.Warn("auth engine periodic reload failed; retaining prior snapshot", "error", err)
 			}
+		}
+	}
+}
+
+// runSupersededDiskSweep removes, hourly, the disk copies a failover start set
+// aside on this host (<path>.superseded-<time>) once they are older than
+// superseded_disk_retention_days, except while their VM is in a failed or
+// unfinished start (health.PurgeSupersededDisks). 0 keeps every copy.
+func (d *Daemon) runSupersededDiskSweep(ctx context.Context) {
+	days := d.cfg.SupersededDiskRetentionDays
+	if days <= 0 {
+		slog.Info("superseded disk copies are kept until removed by hand (superseded_disk_retention_days: 0)")
+		return
+	}
+	retention := time.Duration(days) * 24 * time.Hour
+	sweep := func() {
+		if _, err := health.PurgeSupersededDisks(ctx, d.db, d.cfg.DataDir, retention, time.Now()); err != nil {
+			slog.Warn("superseded disk sweep", "error", err)
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(5 * time.Minute):
+		sweep()
+	}
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
 		}
 	}
 }

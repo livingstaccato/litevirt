@@ -100,6 +100,8 @@ lv host fence <host> --confirmed          # Manually fence a host (real fence)
 lv host fence-confirm <host>              # Confirm an already-powered-off manual-fence host
 lv host rescan [host]                     # Rescan PCI devices
 lv host devices <host> [--type gpu|network|nvme|infiniband]   # List PCI devices
+lv host superseded-disks <host>           # List the old disk copies a failover set aside
+  [--purge] [--older-than 72h]            #   and remove the ones not held (admin)
 lv host upgrade --binary <path> [host...] # Rolling upgrade of litevirt
   [--yes]                                 # Skip confirmation prompt
   [--force]                               # Skip preflight blocks (warnings still printed)

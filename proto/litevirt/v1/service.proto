@@ -122,6 +122,30 @@ message RescanHostResponse { int32 added = 1; int32 removed = 2;
     int32 total = 3; repeated PCIDevice devices = 4; }
 message ListHostDevicesRequest  { string name = 1; string type_filter = 2; }
 message ListHostDevicesResponse { repeated PCIDevice devices = 1; }
+
+// SupersededDisksRequest is `lv host superseded-disks <host>`: the disk copies
+// a failover start set aside on that host (<path>.superseded-<time>), and, with
+// purge (admin), the removal of every one not held.
+message SupersededDisksRequest {
+    string host           = 1;  // "" = the host answering
+    bool   purge          = 2;  // remove every copy that is not held
+    int64  older_than_sec = 3;  // purge only copies set aside at least this long ago
+}
+message SupersededDisk {
+    string path         = 1;  // the copy
+    string disk_path    = 2;  // the disk path it was set aside from
+    string set_aside_at = 3;  // RFC3339
+    int64  size_bytes   = 4;
+    string vm_name      = 5;  // the VM whose disk is at disk_path now; "" when none
+    string vm_state     = 6;
+    string held         = 7;  // why it is kept whatever its age; "" when not held
+    bool   removed      = 8;  // removed by this request
+}
+message SupersededDisksResponse {
+    string                  host           = 1;
+    repeated SupersededDisk disks          = 2;
+    int32                   retention_days = 3;  // superseded_disk_retention_days there; 0 = kept until removed
+}
 message ConfigureHostRequest {
     string name = 1;
     string fence_strategy = 2;  // ssh | ipmi | watchdog
@@ -2770,6 +2794,9 @@ service LiteVirt {
     rpc PublishCRL(PublishCRLRequest)          returns (PublishCRLResponse);
     rpc RescanHost(RescanHostRequest)          returns (RescanHostResponse);
     rpc ListHostDevices(ListHostDevicesRequest) returns (ListHostDevicesResponse);
+    // SupersededDisks lists the disk copies a failover start set aside on a
+    // host, and with purge (admin) removes the ones not held.
+    rpc SupersededDisks(SupersededDisksRequest) returns (SupersededDisksResponse);
     rpc UpgradeHost(stream UpgradeHostRequest) returns (UpgradeHostResponse);
     // PreStageUpgrade stages the new binary and forward-migrates the local
     // state.db schema WITHOUT swapping/re-execing. Run on every node before the

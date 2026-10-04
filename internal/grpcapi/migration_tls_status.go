@@ -28,6 +28,15 @@ func (s *Server) localMigrationTLSStatus() *pb.MigrationTLSHostStatus {
 	if s.migrationTLSStatus != nil {
 		row = s.migrationTLSStatus()
 	}
+	// Run the install hook too, so the row says what this daemon would
+	// install, not only what its files hold: a refused /etc/pki/qemu or an
+	// unresolvable QEMU user must hold a rotation's gate. The hook is
+	// change-only and serialized, so a healthy host rewrites nothing.
+	if row.GetError() == "" && s.migrationTLS != nil {
+		if _, err := s.migrationTLS(); err != nil {
+			row.InstallError = err.Error()
+		}
+	}
 	row.Host = s.hostName
 	row.AllowUnencryptedStorage = s.allowPlaintextStorageMigration
 	return row

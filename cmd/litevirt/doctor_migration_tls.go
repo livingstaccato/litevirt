@@ -101,7 +101,7 @@ func printMigrationTLSRows(rows []*pb.MigrationTLSHostStatus, now time.Time) {
 			state, expires = "error", r.GetError()
 		case !r.GetProvisioned():
 			state = "none"
-		case r.GetValidationError() != "":
+		case r.GetValidationError() != "", r.GetInstallError() != "":
 			state = "invalid"
 		}
 		if len(r.GetTrustedCas()) > 0 {
@@ -148,6 +148,12 @@ func migrationTLSProblems(rows []*pb.MigrationTLSHostStatus, rotating bool, now 
 		}
 		if r.GetValidationError() != "" {
 			out = append(out, fmt.Sprintf("%s: %s", h, r.GetValidationError()))
+		}
+		// The installer validates first, so its refusal of an invalid set
+		// repeats the validation error; report it only when it says more.
+		if ie := r.GetInstallError(); ie != "" &&
+			(r.GetValidationError() == "" || !strings.Contains(ie, r.GetValidationError())) {
+			out = append(out, fmt.Sprintf("%s: its daemon cannot install migration credentials: %s", h, ie))
 		}
 		deadline := now.Add(pki.MigrationExpiryWarning)
 		if t := r.GetCertNotAfter(); t != nil && t.AsTime().Before(deadline) {

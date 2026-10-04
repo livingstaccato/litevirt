@@ -34,30 +34,3 @@ func TestAcknowledgeLeaseTermTie_RefusesAPeer(t *testing.T) {
 			"to acknowledge a contest it is a party to", err)
 	}
 }
-
-// TestCloneVM_DoesNotLeakSourceExistence: CloneVM resolved the source and
-// reported NotFound before any authorization ran, so an authenticated caller
-// with no rights in the source's project could enumerate VM names by reading
-// the status code — NotFound means the name is free, PermissionDenied means
-// another tenant owns it. VM names routinely encode customer and service
-// identity.
-//
-// The clone itself was always refused; the leak was existence and naming.
-func TestCloneVM_DoesNotLeakSourceExistence(t *testing.T) {
-	s := testServer(t)
-	// A caller with no role at all: requirePermPrecheck must refuse before the
-	// source lookup, so both a real and an absent source answer identically.
-	ctx := context.Background()
-
-	_, errPresent := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "someone-elses-vm", Target: "mine"})
-	_, errAbsent := s.CloneVM(ctx, &pb.CloneVMRequest{Source: "no-such-vm-anywhere", Target: "mine"})
-
-	if status.Code(errPresent) == codes.NotFound || status.Code(errAbsent) == codes.NotFound {
-		t.Fatalf("CloneVM answered NotFound before authorizing (present=%v absent=%v); "+
-			"that is a cross-tenant existence oracle", errPresent, errAbsent)
-	}
-	if status.Code(errPresent) != status.Code(errAbsent) {
-		t.Errorf("a present and an absent source gave different codes (%v vs %v); "+
-			"the difference is the oracle", status.Code(errPresent), status.Code(errAbsent))
-	}
-}

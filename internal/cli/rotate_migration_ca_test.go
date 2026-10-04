@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,9 @@ type fakeRotHost struct {
 	pkiDir     string
 	failPush   error
 	pushes     int
+	// clearAfterFail makes failPush one-shot: the host comes back right after
+	// its first failed push, so a later phase would reach it.
+	clearAfterFail bool
 }
 
 func (h *fakeRotHost) Name() string    { return h.name }
@@ -38,7 +42,11 @@ func (h *fakeRotHost) Provisioned(context.Context) (bool, error) {
 }
 func (h *fakeRotHost) Push(_ context.Context, files []migrationFile) error {
 	if h.failPush != nil {
-		return h.failPush
+		err := h.failPush
+		if h.clearAfterFail {
+			h.failPush = nil
+		}
+		return err
 	}
 	h.pushes++
 	for _, f := range files {
@@ -397,5 +405,130 @@ func TestRotateMigrationCA_RerunRepushesAHostThatFailedItsGate(t *testing.T) {
 	}
 	if hosts[0].pushes != 3 || hosts[1].pushes != 4 {
 		t.Errorf("pushes = %d, %d; want 3 (one per phase) and 4 (trust-both twice)", hosts[0].pushes, hosts[1].pushes)
+	}
+}
+
+// onlyOldCA fails t unless h's migration directory still trusts only oldFP
+// and holds a certificate from it: nothing of the rotation reached it.
+func onlyOldCA(t *testing.T, h *fakeRotHost, oldFP string) {
+	t.Helper()
+	info, err := pki.InspectMigrationTLS(h.pkiDir, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(info.TrustedCAs) != 1 || info.TrustedCAs[0].Fingerprint != oldFP || info.CertIssuerFingerprint != oldFP {
+		t.Errorf("%s = %+v; want the old CA alone, untouched", h.name, info)
+	}
+}
+
+// A host skipped under --force stays skipped for the rest of the run, even
+// once it is reachable again: it is never pushed a later phase.
+//
+// Mutation: drop the Skipped check in the push loop — node-3 is pushed
+// reissue and drop-old once it comes back.
+func TestRotateMigrationCA_SkippedHostIsNotPushedLaterInTheRun(t *testing.T) {
+	op, hosts := provisionedCluster(t, 3)
+	oldFP, _ := pki.CAFileFingerprint(filepath.Join(op, pki.MigrationCACertName))
+	hosts[2].failPush, hosts[2].clearAfterFail = errors.New("powered off"), true
+	if err := rotate(t, op, hosts, RotateMigrationCAOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	if hosts[2].pushes != 0 {
+		t.Errorf("node-3 pushes = %d; want 0 once skipped", hosts[2].pushes)
+	}
+	onlyOldCA(t, hosts[2], oldFP)
+}
+
+// A host skipped in an earlier run stays skipped on the re-run, which does
+// not pass --force: it is neither pushed nor gated.
+//
+// Mutations: drop the Skipped check in the push loop — node-3 is pushed;
+// drop the Skipped check in the gate — the re-run stops on node-3, which
+// still trusts only the old CA.
+func TestRotateMigrationCA_SkippedHostStaysSkippedOnTheRerun(t *testing.T) {
+	op, hosts := provisionedCluster(t, 3)
+	oldFP, _ := pki.CAFileFingerprint(filepath.Join(op, pki.MigrationCACertName))
+	hosts[2].failPush = errors.New("powered off")
+	statusDown := func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error) {
+		if r, _ := loadMigrationRotation(op); r != nil && r.Phase == phaseReissue {
+			return nil, errors.New("cluster unreachable") // stops the run, even under --force
+		}
+		return fakeStatus(hosts)(ctx)
+	}
+	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), statusDown, RotateMigrationCAOptions{Force: true}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("the first run did not stop")
+	}
+	if r, _ := loadMigrationRotation(op); !r.Skipped["node-3"] || r.Phase != phaseReissue {
+		t.Fatalf("state after the first run = %+v; want node-3 skipped, phase reissue", r)
+	}
+	hosts[2].failPush = nil
+	if err := rotate(t, op, hosts, RotateMigrationCAOptions{}); err != nil {
+		t.Fatalf("re-run: %v", err)
+	}
+	if hosts[2].pushes != 0 {
+		t.Errorf("node-3 pushes = %d; want 0 once skipped", hosts[2].pushes)
+	}
+	onlyOldCA(t, hosts[2], oldFP)
+}
+
+// A host skipped by a failed gate under --force is not pushed later phases.
+//
+// Mutation: drop the Skipped check in the push loop — node-2 is pushed
+// reissue and drop-old after its trust-both gate skipped it.
+func TestRotateMigrationCA_GateSkippedHostIsNotPushedLater(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	status := func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error) {
+		rows, err := fakeStatus(hosts)(ctx)
+		if err == nil {
+			rows[1].TrustedCas = rows[1].TrustedCas[:1] // node-2's daemon never takes the new CA
+		}
+		return rows, err
+	}
+	if err := RotateMigrationCA(context.Background(), op, asHosts(hosts), status, RotateMigrationCAOptions{Force: true}, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := loadMigrationRotation(op); !r.Skipped["node-2"] {
+		t.Fatalf("node-2 was not skipped: %+v", r)
+	}
+	if hosts[1].pushes != 1 {
+		t.Errorf("node-2 pushes = %d; want 1 (trust-both only)", hosts[1].pushes)
+	}
+}
+
+// A run that died after finalize and before "done" was saved, re-run with a
+// host still owed drop-old (its gate failed, which clears its done mark),
+// finishes: drop-old pushes the CA that is now current, not the next.crt
+// finalize renamed away.
+//
+// Mutation: push nextCACertName in drop-old — the re-run fails reading it.
+func TestRotateMigrationCA_DropOldResumesAfterFinalize(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	if err := rotate(t, op, hosts, RotateMigrationCAOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	newFP, _ := pki.CAFileFingerprint(filepath.Join(op, pki.MigrationCACertName))
+	r, err := loadMigrationRotation(op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Phase = phaseDropOld // finalize ran; "done" was never saved
+	r.Done["node-1"] = slices.DeleteFunc(r.Done["node-1"], func(p string) bool { return p == phaseDropOld })
+	if err := r.save(op); err != nil {
+		t.Fatal(err)
+	}
+	before := hosts[0].pushes
+	if err := rotate(t, op, hosts, RotateMigrationCAOptions{}); err != nil {
+		t.Fatalf("resume after finalize: %v", err)
+	}
+	if hosts[0].pushes != before+1 {
+		t.Errorf("node-1 pushes on resume = %d; want 1", hosts[0].pushes-before)
+	}
+	info, _ := pki.InspectMigrationTLS(hosts[0].pkiDir, time.Now())
+	if len(info.TrustedCAs) != 1 || info.TrustedCAs[0].Fingerprint != newFP {
+		t.Errorf("node-1 = %+v; want the new CA alone", info)
+	}
+	if MigrationRotationInProgress(op) {
+		t.Error("rotation still in progress after the resume")
 	}
 }

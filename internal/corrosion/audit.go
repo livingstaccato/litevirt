@@ -215,15 +215,27 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 			"action", r.Action, "target", r.Target, "host", r.HostName, "id", r.ID)
 	}
 
-	if err := c.Execute(ctx,
+	n, err := c.ExecuteRows(ctx,
 		`INSERT OR IGNORE INTO audit_log
 		   (id, timestamp, username, host_name, action, target, detail, result, prev_hash, content_hash, key_id, signature, seq)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.Timestamp, r.Username, r.HostName,
 		r.Action, r.Target, r.Detail, r.Result,
 		r.PrevHash, r.ContentHash, r.KeyID, r.Signature, r.Seq,
-	); err != nil {
+	)
+	if err != nil {
 		return err
+	}
+	if n == 0 {
+		// The id was already present, so nothing was written — the idempotent
+		// no-op the doc comment promises (a pending-audit replay after a crash
+		// lands here by design). The tail must not move: advancing it chained
+		// the next row onto a row that is not in the table, which verify reads
+		// as a hash break and a sequence gap. Not an error, because the record
+		// for this id exists; but the row that exists is the FIRST one, so a
+		// caller reusing an id for a different event has lost that event.
+		slog.Debug("audit row not written: id already present", "id", r.ID, "action", r.Action, "host", r.HostName)
+		return nil
 	}
 	tail.hash, tail.seq = r.ContentHash, r.Seq
 	// Only a stamp this node generated raises the ceiling. A caller-supplied one

@@ -139,7 +139,7 @@ func HostInit(ctx context.Context, sshTarget string, hostName string) error {
 		return fmt.Errorf("push setup script: %w", err)
 	}
 
-	if err := sc.Run(fmt.Sprintf("HOST_NAME=%s bash /tmp/litevirt-setup.sh", hostName)); err != nil {
+	if err := sc.Run(remoteInitSetupCommand(hostName)); err != nil {
 		return fmt.Errorf("run setup script: %w", err)
 	}
 
@@ -482,7 +482,7 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string) error {
 	}
 
 	cmd := execCommand("bash", scriptPath)
-	cmd.Env = append(os.Environ(), setupScriptEnv(hostName, advertiseAddr, "[]")...)
+	cmd.Env = append(os.Environ(), localInitSetupEnv(hostName, advertiseAddr)...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -694,6 +694,40 @@ func resolveHost(host string) (string, error) {
 		host, addrs)
 }
 
+// foundingSetupEnv tells the setup script this node is founding a cluster, so it
+// may write the founder marker (genesisMarkerScript). Only `lv host init` sets
+// it. It is deliberately NOT in setupScriptEnv, which `lv host add` also uses:
+// an added node carrying it would mint its own admin credential and replace the
+// cluster's (colonelpanik/litevirt#186).
+const foundingSetupEnv = "LITEVIRT_GENESIS=1"
+
+// genesisMarkerScript writes or clears the founder marker in the data dir. The
+// daemon mints the cluster's first admin credential only while the marker
+// exists, and deletes it once it has. It is written only when founding AND the
+// data dir has never held a database: re-running `lv host init` against a live
+// member must not re-arm a mint for the day its state.db is lost. Every other
+// setup clears a marker left by a `host init` whose daemon never started.
+// LV_DATA_DIR exists for tests; the daemon's data_dir is /var/lib/litevirt.
+const genesisMarkerScript = `
+# Founder marker: licenses this node's daemon to mint the cluster's first admin.
+LV_DATA_DIR="${LV_DATA_DIR:-/var/lib/litevirt}"
+if [ "${LITEVIRT_GENESIS:-}" = "1" ] && [ ! -e "${LV_DATA_DIR}/state.db" ]; then
+    touch "${LV_DATA_DIR}/genesis-pending"
+else
+    rm -f "${LV_DATA_DIR}/genesis-pending"
+fi
+`
+
+// remoteInitSetupCommand runs the setup script for a remote `lv host init`.
+func remoteInitSetupCommand(hostName string) string {
+	return fmt.Sprintf("%s HOST_NAME=%s bash /tmp/litevirt-setup.sh", foundingSetupEnv, hostName)
+}
+
+// localInitSetupEnv is the setup environment for `lv host init --local`.
+func localInitSetupEnv(hostName, advertiseAddr string) []string {
+	return append(setupScriptEnv(hostName, advertiseAddr, "[]"), foundingSetupEnv)
+}
+
 // setupScriptEnv is the environment the setup script reads to write the daemon
 // config. One place, so the local and remote paths cannot disagree about it —
 // they already had, which is how the local path shipped with no advertise_address.
@@ -802,7 +836,7 @@ echo "Enabled libvirtd TLS (port 16514)"
 # Create litevirt directories
 mkdir -p /var/lib/litevirt/{images,disks,cloudinit}
 mkdir -p /etc/litevirt
-
+` + genesisMarkerScript + `
 # Libvirt storage pools are auto-created by litevirtd on startup
 # (from storage_pools config or a default local pool).
 

@@ -85,7 +85,7 @@ func TestSeedAdminUser_AFounderStillMintsTheFirstCredential(t *testing.T) {
 	db := newHostTestClient(t)
 
 	pwFile := filepath.Join(t.TempDir(), "admin-password")
-	d := &Daemon{db: db, adminPasswordPath: pwFile, cfg: &Config{HostName: "node-1"}}
+	d := founderDaemon(t, db, pwFile)
 
 	if err := d.seedAdminUser(ctx); err != nil {
 		t.Fatalf("seedAdminUser on a founder: %v", err)
@@ -123,7 +123,7 @@ func TestSeedAdminUser_ASoleFounderDoesNotReMintOnRestart(t *testing.T) {
 	db := newHostTestClient(t)
 
 	pwFile := filepath.Join(t.TempDir(), "admin-password")
-	d := &Daemon{db: db, adminPasswordPath: pwFile, cfg: &Config{HostName: "node-1"}}
+	d := founderDaemon(t, db, pwFile)
 	if err := d.seedAdminUser(ctx); err != nil {
 		t.Fatalf("first start: %v", err)
 	}
@@ -132,7 +132,10 @@ func TestSeedAdminUser_ASoleFounderDoesNotReMintOnRestart(t *testing.T) {
 		t.Fatalf("read password file: %v", err)
 	}
 
-	// Restart. Still a cluster of one, so join_peers is still empty.
+	// Restart. Still a cluster of one, so join_peers is still empty. Re-arm the
+	// marker so the `users` guard is the only thing standing between this
+	// restart and a second mint.
+	rearmFounderMarker(t, d)
 	if err := d.seedAdminUser(ctx); err != nil {
 		t.Fatalf("restart: %v", err)
 	}
@@ -221,7 +224,7 @@ func TestSeedAdminUser_TightensAPreExistingLoosePasswordFile(t *testing.T) {
 		t.Fatalf("test setup did not produce a 0644 file (umask?): mode=%v err=%v", fi.Mode().Perm(), err)
 	}
 
-	d := &Daemon{db: db, adminPasswordPath: pwFile, cfg: &Config{HostName: "node-1"}}
+	d := founderDaemon(t, db, pwFile)
 	if err := d.seedAdminUser(ctx); err != nil {
 		t.Fatalf("seedAdminUser: %v", err)
 	}
@@ -256,7 +259,7 @@ func TestSeedAdminUser_DoesNotResurrectADeletedAdmin(t *testing.T) {
 	db := newHostTestClient(t)
 
 	pwFile := filepath.Join(t.TempDir(), "admin-password")
-	d := &Daemon{db: db, adminPasswordPath: pwFile, cfg: &Config{HostName: "node-1"}}
+	d := founderDaemon(t, db, pwFile)
 	if err := d.seedAdminUser(ctx); err != nil {
 		t.Fatalf("founder first start: %v", err)
 	}
@@ -269,7 +272,10 @@ func TestSeedAdminUser_DoesNotResurrectADeletedAdmin(t *testing.T) {
 		t.Fatalf("admin is still live after DeleteUser: %v (err %v)", u, err)
 	}
 
-	// The founder reboots.
+	// The founder reboots. Re-arm the marker so this test holds down the
+	// ever-existed guard on its own; seeding consumed the first one, and without
+	// this the test would pass with that guard deleted.
+	rearmFounderMarker(t, d)
 	if err := d.seedAdminUser(ctx); err != nil {
 		t.Fatalf("founder restart after the admin was deleted: %v", err)
 	}
@@ -282,5 +288,134 @@ func TestSeedAdminUser_DoesNotResurrectADeletedAdmin(t *testing.T) {
 		t.Errorf("a restart resurrected the deleted admin account (role %q); the "+
 			"un-delete replicates to every peer, so a revoked credential is live "+
 			"cluster-wide and whoever reads %s is cluster admin", u.Role, pwFile)
+	}
+}
+
+// founderDaemon is a node as `lv host init` leaves it at first start: no
+// join_peers, and the founder marker in its data dir. Only that combination is
+// allowed to mint the cluster's first admin credential.
+func founderDaemon(t *testing.T, db *corrosion.Client, pwFile string) *Daemon {
+	t.Helper()
+	d := &Daemon{db: db, adminPasswordPath: pwFile, cfg: &Config{HostName: "node-1", DataDir: t.TempDir()}}
+	rearmFounderMarker(t, d)
+	return d
+}
+
+func rearmFounderMarker(t *testing.T, d *Daemon) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(d.cfg.DataDir, genesisMarkerName), nil, 0600); err != nil {
+		t.Fatalf("write the founder marker: %v", err)
+	}
+}
+
+// A node with no founder marker must not mint, even with an empty join_peers.
+//
+// An empty join_peers is an ABSENCE, and #186 survived the join_peers guard by
+// every route that leaves one on a node that is not founding anything: a founder
+// whose peer list was never written (driving the cluster from a workstation
+// leaves it [] for life) and whose state.db was later rebuilt, a member
+// re-initialised with `lv host init`, a config restored from a template. Each
+// reads an empty `users` table, mints, and publishes a fresh admin row that wins
+// LWW cluster-wide.
+//
+// Founding is now a POSITIVE fact: `lv host init` writes the marker, and only
+// while the data dir holds no state.db. Without it there is nothing to found.
+func TestSeedAdminUser_NoFounderMarkerMintsNothing(t *testing.T) {
+	ctx := context.Background()
+	db := newHostTestClient(t)
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	pwFile := filepath.Join(t.TempDir(), "admin-password")
+	d := &Daemon{db: db, adminPasswordPath: pwFile, cfg: &Config{HostName: "node-1", DataDir: t.TempDir()}}
+	if err := d.seedAdminUser(ctx); err != nil {
+		t.Fatalf("seedAdminUser without a founder marker: %v", err)
+	}
+
+	users, err := corrosion.ListUsers(ctx, db)
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	if len(users) != 0 {
+		t.Fatalf("a node with no founder marker minted %v; with an empty state.db and an "+
+			"empty join_peers that row is newer than the cluster's real admin and replaces "+
+			"it on every node", users)
+	}
+	if _, err := os.Stat(pwFile); !os.IsNotExist(err) {
+		t.Errorf("a node that minted nothing wrote a password file (stat err %v)", err)
+	}
+
+	logged := buf.String()
+	// The way out for a genuine founder is the marker path itself; the log names it
+	// (as the "marker" attribute) so the operator can create it.
+	for _, want := range []string{"replicat", "lv host init", genesisMarkerName, "restart"} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("the skip log does not mention %q, so the operator cannot tell why no "+
+				"admin exists or what to do about it:\n\t%s", want, strings.TrimSpace(logged))
+		}
+	}
+	if strings.Contains(logged, adminPasswordFile) {
+		t.Errorf("the skip log names %s, which this branch never writes", adminPasswordFile)
+	}
+}
+
+// Seeding consumes the marker, so a founder can mint exactly once.
+//
+// Without that the marker is a standing licence: lose the founder's state.db (a
+// disk swap, a restore, an operator deleting it to "reset" a wedged node) and the
+// next start reads an empty `users` table beside a marker that still says "found
+// a cluster here", and mints over the live credential.
+func TestSeedAdminUser_SeedingConsumesTheFounderMarker(t *testing.T) {
+	ctx := context.Background()
+	db := newHostTestClient(t)
+
+	d := founderDaemon(t, db, filepath.Join(t.TempDir(), "admin-password"))
+	if err := d.seedAdminUser(ctx); err != nil {
+		t.Fatalf("founder first start: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(d.cfg.DataDir, genesisMarkerName)); !os.IsNotExist(err) {
+		t.Fatalf("the founder marker survived a successful seed (stat err %v); it licenses "+
+			"another mint the moment state.db is lost", err)
+	}
+
+	// state.db is rebuilt empty under the same data dir.
+	d.db = newHostTestClient(t)
+	if err := d.seedAdminUser(ctx); err != nil {
+		t.Fatalf("start after a state.db rebuild: %v", err)
+	}
+	users, err := corrosion.ListUsers(ctx, d.db)
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	if len(users) != 0 {
+		t.Errorf("a founder whose state.db was rebuilt minted %v again; that row replaces "+
+			"the cluster's admin credential when replication comes up", users)
+	}
+}
+
+// A stale marker does not outrank join_peers.
+//
+// A node can carry a marker it never consumed: `lv host init`, then — before the
+// daemon ever started — `lv host add` into a different cluster. join_peers is the
+// stronger fact there, and the joiner must still mint nothing.
+func TestSeedAdminUser_AJoinerWithAStaleMarkerStillMintsNothing(t *testing.T) {
+	ctx := context.Background()
+	db := newHostTestClient(t)
+
+	d := founderDaemon(t, db, filepath.Join(t.TempDir(), "admin-password"))
+	d.cfg.HostName = "node-5"
+	d.cfg.JoinPeers = []string{"10.77.0.11:7946"}
+	if err := d.seedAdminUser(ctx); err != nil {
+		t.Fatalf("seedAdminUser on a joiner with a stale marker: %v", err)
+	}
+	users, err := corrosion.ListUsers(ctx, db)
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	if len(users) != 0 {
+		t.Errorf("a joiner holding a stale founder marker minted %v", users)
 	}
 }

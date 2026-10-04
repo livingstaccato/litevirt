@@ -338,3 +338,45 @@ func TestExportAuditChain_NoGapsOnACompleteChain(t *testing.T) {
 		t.Fatalf("a contiguous chain reported gaps: %#v", g)
 	}
 }
+
+// A gap that falls exactly on a page boundary is reported on the page that
+// resumes after it. The comparison starts from the cursor's host and seq, not
+// from nothing, or a hole between two pages would never be seen.
+func TestExportAuditChain_ReportsASeqGapAcrossAPageBoundary(t *testing.T) {
+	s := testServerR2(t)
+	ctx := adminCtx()
+
+	for _, seq := range []int64{1, 2, 4} {
+		if err := s.db.Execute(ctx,
+			`INSERT INTO audit_log (id, timestamp, username, host_name, action, target, detail,
+			 result, prev_hash, content_hash, key_id, signature, seq)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			fmt.Sprintf("b-%d", seq), fmt.Sprintf("2026-09-22T00:00:0%dZ", seq),
+			"u", "kvm003", "vm.start", "vm-z", "", "ok", "ph", "ch", "k", "sig", seq); err != nil {
+			t.Fatalf("insert seq %d: %v", seq, err)
+		}
+	}
+
+	first, err := s.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{Limit: 2})
+	if err != nil {
+		t.Fatalf("ExportAuditChain page 1: %v", err)
+	}
+	if first.NextCursor == "" {
+		t.Fatal("page 1 returned no cursor; the test needs the gap to straddle two pages")
+	}
+	second, err := s.ExportAuditChain(ctx, &pb.ExportAuditChainRequest{Limit: 2, Cursor: first.NextCursor})
+	if err != nil {
+		t.Fatalf("ExportAuditChain page 2: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(second.Json), &doc); err != nil {
+		t.Fatalf("unmarshal page 2: %v", err)
+	}
+	list, ok := doc["seq_gaps"].([]any)
+	if !ok || len(list) != 1 {
+		t.Fatalf("page 2 seq_gaps = %#v, want the 3..3 hole between pages", doc["seq_gaps"])
+	}
+	if g := list[0].(map[string]any); g["missing_from"] != "3" || g["missing_to"] != "3" {
+		t.Errorf("gap = %#v, want kvm003 missing 3..3", g)
+	}
+}

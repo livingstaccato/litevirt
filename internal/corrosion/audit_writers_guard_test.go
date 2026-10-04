@@ -30,6 +30,7 @@ var auditWriters = map[string]struct{ dir, test string }{
 	"health.(*Reconciler).auditOwnerAssert": {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
 	"health.(*ContainerChecker).auditRekey": {"internal/health", "TestAuditWriter_OwnerAssertRowsAreSigned"},
 	"health.auditSettle":                    {"internal/health", "TestAuditWriter_SettleRowsAreSigned"},
+	"daemon.(*Daemon).checkAdminFloor":      {"internal/daemon", "TestAuditWriter_AdminFloorRowsAreSigned"},
 }
 
 // rawAuditInserts are the only non-test files allowed to spell an INSERT into

@@ -213,8 +213,8 @@ func TestDrill3_VoterRemovedAfterAFence(t *testing.T) {
 		t.Errorf("power on: %v", err)
 	}
 	l.waitAllActive(q, 6*time.Minute)
-	if out, err := l.lv(q, "cluster", "voter", "add", first); err != nil {
-		t.Errorf("voter add %s: %v\n%s", first, err, out)
+	if err := l.voterAdd(q, first); err != nil {
+		t.Errorf("%v", err)
 	}
 	if gen, members, err := l.voterSet(q); err != nil || len(members) != n {
 		t.Errorf("after voter add %s: generation %d, members %v, err %v", first, gen, members, err)

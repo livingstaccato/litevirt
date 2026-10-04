@@ -732,6 +732,11 @@ func (l *lab) vms(via string) map[string]vmInfo {
 		}
 		v, err := l.inspectVM(via, f[0])
 		if err != nil {
+			// A VM deleted between `ls` and `inspect` (a host removed for good
+			// takes its stranded rows) is simply gone.
+			if strings.Contains(err.Error(), "NotFound") {
+				continue
+			}
 			l.t.Fatalf("%v", err)
 		}
 		m[v.Name] = v
@@ -1128,10 +1133,8 @@ func (l *lab) restore(b baseline) {
 		}
 		for _, h := range b.voters {
 			if !have[h] {
-				if out, err := l.lv(via, "cluster", "voter", "add", h); err != nil {
-					t.Errorf("restore: voter add %s: %v\n%s", h, err, out)
-				} else {
-					l.mark("restore: voter add %s", h)
+				if err := l.voterAdd(via, h); err != nil {
+					t.Errorf("restore: %v", err)
 				}
 			}
 		}
@@ -1174,6 +1177,45 @@ func (l *lab) waitNoOwnershipConditions(via string, timeout time.Duration) {
 	l.t.Errorf("restore: ownership conditions still open after %v: %v", timeout, rows)
 }
 
+// voterAdd adds host to the voter set and waits until every member of the new
+// generation has adopted it. The next generation is decided by the members of
+// this one, and a member still on the previous generation refuses to prepare
+// it (recovery_claim_wrong_generation), so back-to-back adds fail without this.
+func (l *lab) voterAdd(via, host string) error {
+	deadline := time.Now().Add(3 * time.Minute)
+	var out string
+	var err error
+	for {
+		out, err = l.lv(via, "cluster", "voter", "add", host)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Second) // a member may still be adopting the last one
+	}
+	if err != nil {
+		return fmt.Errorf("voter add %s: %v\n%s", host, err, out)
+	}
+	gen, members, err := l.voterSet(via)
+	if err != nil {
+		return err
+	}
+	l.mark("voter add %s: generation %d %v", host, gen, members)
+	for _, m := range members {
+		ok := false
+		for !ok && time.Now().Before(deadline) {
+			rows, err := l.sql(m, "SELECT COALESCE(MAX(generation),0) FROM local_voter_adoption")
+			ok = err == nil && len(rows) > 0 && rows[0][0] == strconv.Itoa(gen)
+			if !ok {
+				time.Sleep(3 * time.Second)
+			}
+		}
+		if !ok {
+			return fmt.Errorf("voter add %s: %s did not adopt generation %d", host, m, gen)
+		}
+	}
+	return nil
+}
+
 func (l *lab) upHosts() []string {
 	var up []string
 	for _, h := range l.hosts {
@@ -1187,6 +1229,12 @@ func (l *lab) upHosts() []string {
 // waitAllActive undrains any host that is not active (once it answers) and
 // waits until every host is HOST_ACTIVE.
 func (l *lab) waitAllActive(via string, timeout time.Duration) {
+	l.waitActive(via, l.hosts, timeout)
+}
+
+// waitActive is waitAllActive over a subset of hosts (drill 6 adds hosts back
+// one at a time, while the others are still out of the cluster).
+func (l *lab) waitActive(via string, hosts []string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	undrained := map[string]bool{}
 	var states map[string]string
@@ -1195,7 +1243,7 @@ func (l *lab) waitAllActive(via string, timeout time.Duration) {
 		states, err = l.hostStates(via)
 		if err == nil {
 			all := true
-			for _, h := range l.hosts {
+			for _, h := range hosts {
 				if states[h] == "HOST_ACTIVE" {
 					continue
 				}

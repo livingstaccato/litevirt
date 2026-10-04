@@ -4,10 +4,39 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/health"
 )
+
+// waitProbeFailures waits until via's connectivity table (`lv health`) shows
+// via failing each target at least n consecutive times.
+func (l *lab) waitProbeFailures(via string, targets []string, n int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		out, _ := l.lv(via, "health") // exits non-zero while degraded
+		ok := true
+		for _, h := range targets {
+			re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(via) + `\s+` + regexp.QuoteMeta(h) + `\s+\S+\s+(\d+)\s*$`)
+			f := 0
+			if m := re.FindStringSubmatch(out); m != nil {
+				fmt.Sscan(m[1], &f)
+			}
+			if f < n {
+				ok = false
+			}
+		}
+		if ok {
+			l.mark("%s counts %v failing %d+ probes", via, targets, n)
+			return true
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return false
+}
 
 // Drill 6 (docs/design/recovery-claims.md §7.3): three of five hosts are lost
 // for good. The two survivors confirm the fences, force a 2-member voter
@@ -86,10 +115,12 @@ func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
 
 	// ── 1. lose three hosts; confirm the fences during the outage ──────────
 	off := l.powerOff(lost...)
-	for _, h := range lost {
-		if !l.waitHostNot(q, h, "HOST_ACTIVE", hostDownBy) {
-			t.Fatalf("%s still active %v after losing power", h, hostDownBy)
-		}
+	// Two survivors of five hold no quorum, so nobody fences the lost hosts
+	// and their state stays active. A confirmation counts only once the
+	// survivors have watched them fail, so wait for F consecutive probe
+	// failures of each in q's own probes.
+	if !l.waitProbeFailures(q, lost, health.FailuresToFence, hostDownBy) {
+		t.Fatalf("%s did not see %v fail %d probes within %v", q, lost, health.FailuresToFence, hostDownBy)
 	}
 	for _, h := range lost {
 		if out, err := l.lv(q, "host", "fence-confirm", h); err != nil {
@@ -275,7 +306,13 @@ func (d *d6) addBack() bool {
 				l.t.Errorf("%v", err)
 			}
 		}
-		l.waitAllActive(d.via, 6*time.Minute)
+		var in []string
+		for _, x := range l.hosts {
+			if !contains(d.lost, x) || d.added[x] || x == h {
+				in = append(in, x)
+			}
+		}
+		l.waitActive(d.via, in, 6*time.Minute)
 		d.added[h] = true
 		l.mark("drill6: %s added back", h)
 	}
@@ -296,11 +333,10 @@ func (d *d6) voteBack() bool {
 		if contains(members, h) {
 			continue
 		}
-		if out, err := l.lv(d.via, "cluster", "voter", "add", h); err != nil {
-			l.t.Errorf("voter add %s: %v\n%s", h, err, out)
+		if err := l.voterAdd(d.via, h); err != nil {
+			l.t.Errorf("%v", err)
 			return false
 		}
-		l.mark("drill6: voter add %s", h)
 	}
 	return true
 }

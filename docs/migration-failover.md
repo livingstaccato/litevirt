@@ -68,6 +68,12 @@ lv migrate my-vm host-b --with-storage
 The disk is streamed to the target over libvirt's block-copy / NBD channel
 while the VM keeps running; the source is undefined after a successful cutover.
 
+Only the host-local disks (`local` and `dir` pools) are copied. A disk on
+shared storage (NFS, Ceph, iSCSI, a volume manager) is already the same disk on
+the target, so it stays where it is; copying it would mirror the disk onto
+itself. A VM with no host-local disk is migrated without a storage copy, even
+with `--with-storage`.
+
 Before the copy, the source checks each disk against its record and the target
 creates an empty file for each disk to be copied into. The migration is refused,
 before anything is copied, when:

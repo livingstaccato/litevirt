@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
@@ -46,12 +47,8 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		return nil, err
 	}
 	src, err := corrosion.GetVM(ctx, s.db, req.Source)
-	if err != nil || src == nil {
-		return nil, status.Errorf(codes.NotFound, "source %q not found", req.Source)
-	}
-	project := tenancy.NormalizeProject(req.Project)
-	if req.Project == "" {
-		project = tenancy.NormalizeProject(src.Project)
+	if err != nil {
+		src = nil
 	}
 	// Authorize the SOURCE as well as the destination. A clone READS the source
 	// VM's disks and writes a full copy into the caller's project, so checking
@@ -61,8 +58,28 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	// (imageops.go), which calls this out as "a cross-project data-exposure
 	// surface"; cloning is that operation with a VM as the destination instead
 	// of an image.
-	if err := s.RequirePerm(ctx, vmRBACPath(src), "backup.create", "operator"); err != nil {
+	//
+	// requirePermResolved, not RequirePerm: the precheck above lets every
+	// binding-holder through, so a tenant with a grant on their own project
+	// reached this point either way. A plain NotFound for an absent source and
+	// RequirePerm's PermissionDenied (naming the source's project) for a
+	// foreign one was the oracle the precheck was meant to close. The resolved
+	// form answers both with one PermissionDenied, and a NotFound only to a
+	// caller who could have seen the name anyway.
+	var srcPath string
+	if src != nil {
+		srcPath = vmRBACPath(src)
+	}
+	if err := s.requirePermResolved(ctx, src != nil, srcPath, vmRBACPathFor("", req.Source),
+		"backup.create", "operator", "vm "+strconv.Quote(req.Source)); err != nil {
 		return nil, err
+	}
+	if src == nil {
+		return nil, status.Errorf(codes.NotFound, "source %q not found", req.Source)
+	}
+	project := tenancy.NormalizeProject(req.Project)
+	if req.Project == "" {
+		project = tenancy.NormalizeProject(src.Project)
 	}
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, req.Target), "vm.create", "operator"); err != nil {
 		return nil, err

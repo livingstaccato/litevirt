@@ -10,6 +10,7 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/dns"
 	"github.com/litevirt/litevirt/internal/network"
 )
 
@@ -50,6 +51,17 @@ func (s *Server) deleteVMOnRemovedHost(ctx context.Context, vm *corrosion.VMReco
 		return nil, status.Errorf(codes.Internal, "delete VM %q recorded on removed host %s: %v", vm.Name, vm.HostName, err)
 	}
 	s.clearDeviceLease(vm.Name)
+	// The A record goes too, as on DeleteVM's own path: the leases were just
+	// released, so a record left live points the VM's name at an address the
+	// next workload can be given. The reaper (ReapOrphanDNSRecords) remains the
+	// backstop if this delete fails.
+	domain := s.dnsDomain
+	if domain == "" {
+		domain = "lv.local"
+	}
+	if err := dns.DeleteRecord(ctx, s.db, dns.VMRecordName(vm.Name, vm.StackName, domain)); err != nil {
+		slog.Warn("failed to delete DNS record", "vm", vm.Name, "error", err)
+	}
 	s.audit(ctx, "vm.delete", vm.Name, "recorded on removed host "+vm.HostName+
 		": cluster rows deleted, nothing on that machine touched, disks on shared storage kept", "ok")
 	slog.Info("VM recorded on a removed host deleted", "vm", vm.Name, "host", vm.HostName)

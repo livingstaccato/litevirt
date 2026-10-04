@@ -84,6 +84,24 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	if !validResourceName(req.Target) {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid target name %q", req.Target)
 	}
+	// Authorize the SOURCE as well as the destination — see CloneVM. A container
+	// clone copies the source rootfs, so the destination check alone leaves the
+	// read of another tenant's filesystem unguarded.
+	//
+	// Authorized BEFORE the source is resolved, through requirePermResolved, so
+	// a caller without rights on it gets one answer whether it exists or not —
+	// resolving first returned NotFound for a free name and a PermissionDenied
+	// naming the owner's project for a foreign one (see CloneVM).
+	srcProject, known := s.containerProject(ctx, req.HostName, req.Source)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(srcProject, req.Source), ctRBACPathFor("", req.Source),
+		"backup.create", "operator", containerWhat(req.Source)); err != nil {
+		detail := "source project=" + srcProject
+		if !known {
+			detail = "source project=unresolved"
+		}
+		s.audit(ctx, "ct.clone", req.Source, detail, "denied")
+		return nil, err
+	}
 	host, src, err := s.resolveContainerHost(ctx, req.HostName, req.Source)
 	if err != nil {
 		return nil, err
@@ -91,13 +109,6 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 	project := tenancy.NormalizeProject(req.Project)
 	if req.Project == "" {
 		project = tenancy.NormalizeProject(src.Project)
-	}
-	// Authorize the SOURCE as well as the destination — see CloneVM. A container
-	// clone copies the source rootfs, so the destination check alone leaves the
-	// read of another tenant's filesystem unguarded.
-	if err := s.RequirePerm(ctx, ctRBACPathFor(src.Project, src.Name), "backup.create", "operator"); err != nil {
-		s.audit(ctx, "ct.clone", req.Source, "source project="+src.Project, "denied")
-		return nil, err
 	}
 	if err := s.RequirePerm(ctx, ctRBACPathFor(project, req.Target), "ct.create", "operator"); err != nil {
 		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")

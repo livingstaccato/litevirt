@@ -156,6 +156,7 @@ const (
 	LiteVirt_GarbageCollectBackupRepo_FullMethodName   = "/litevirt.v1.LiteVirt/GarbageCollectBackupRepo"
 	LiteVirt_PruneBackupRepo_FullMethodName            = "/litevirt.v1.LiteVirt/PruneBackupRepo"
 	LiteVirt_SyncBackupRepo_FullMethodName             = "/litevirt.v1.LiteVirt/SyncBackupRepo"
+	LiteVirt_ListBackupRepoSnapshots_FullMethodName    = "/litevirt.v1.LiteVirt/ListBackupRepoSnapshots"
 	LiteVirt_CreateContainer_FullMethodName            = "/litevirt.v1.LiteVirt/CreateContainer"
 	LiteVirt_StartContainer_FullMethodName             = "/litevirt.v1.LiteVirt/StartContainer"
 	LiteVirt_StopContainer_FullMethodName              = "/litevirt.v1.LiteVirt/StopContainer"
@@ -523,6 +524,9 @@ type LiteVirtClient interface {
 	GarbageCollectBackupRepo(ctx context.Context, in *GarbageCollectBackupRepoRequest, opts ...grpc.CallOption) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(ctx context.Context, in *PruneBackupRepoRequest, opts ...grpc.CallOption) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(ctx context.Context, in *SyncBackupRepoRequest, opts ...grpc.CallOption) (*SyncBackupRepoResponse, error)
+	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
+	// a read, so not audited.
+	ListBackupRepoSnapshots(ctx context.Context, in *ListBackupRepoSnapshotsRequest, opts ...grpc.CallOption) (*ListBackupRepoSnapshotsResponse, error)
 	// ── Containers ──
 	CreateContainer(ctx context.Context, in *CreateContainerRequest, opts ...grpc.CallOption) (*Container, error)
 	StartContainer(ctx context.Context, in *StartContainerRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -2377,6 +2381,16 @@ func (c *liteVirtClient) SyncBackupRepo(ctx context.Context, in *SyncBackupRepoR
 	return out, nil
 }
 
+func (c *liteVirtClient) ListBackupRepoSnapshots(ctx context.Context, in *ListBackupRepoSnapshotsRequest, opts ...grpc.CallOption) (*ListBackupRepoSnapshotsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListBackupRepoSnapshotsResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListBackupRepoSnapshots_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) CreateContainer(ctx context.Context, in *CreateContainerRequest, opts ...grpc.CallOption) (*Container, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Container)
@@ -4098,6 +4112,9 @@ type LiteVirtServer interface {
 	GarbageCollectBackupRepo(context.Context, *GarbageCollectBackupRepoRequest) (*GarbageCollectBackupRepoResponse, error)
 	PruneBackupRepo(context.Context, *PruneBackupRepoRequest) (*PruneBackupRepoResponse, error)
 	SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error)
+	// The /backups page's listing. Verb backup.read at `/`, legacy floor viewer;
+	// a read, so not audited.
+	ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error)
 	// ── Containers ──
 	CreateContainer(context.Context, *CreateContainerRequest) (*Container, error)
 	StartContainer(context.Context, *StartContainerRequest) (*emptypb.Empty, error)
@@ -4831,6 +4848,9 @@ func (UnimplementedLiteVirtServer) PruneBackupRepo(context.Context, *PruneBackup
 }
 func (UnimplementedLiteVirtServer) SyncBackupRepo(context.Context, *SyncBackupRepoRequest) (*SyncBackupRepoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SyncBackupRepo not implemented")
+}
+func (UnimplementedLiteVirtServer) ListBackupRepoSnapshots(context.Context, *ListBackupRepoSnapshotsRequest) (*ListBackupRepoSnapshotsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListBackupRepoSnapshots not implemented")
 }
 func (UnimplementedLiteVirtServer) CreateContainer(context.Context, *CreateContainerRequest) (*Container, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateContainer not implemented")
@@ -7511,6 +7531,24 @@ func _LiteVirt_SyncBackupRepo_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).SyncBackupRepo(ctx, req.(*SyncBackupRepoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_ListBackupRepoSnapshots_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListBackupRepoSnapshotsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListBackupRepoSnapshots(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListBackupRepoSnapshots_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListBackupRepoSnapshots(ctx, req.(*ListBackupRepoSnapshotsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -10347,6 +10385,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "SyncBackupRepo",
 			Handler:    _LiteVirt_SyncBackupRepo_Handler,
+		},
+		{
+			MethodName: "ListBackupRepoSnapshots",
+			Handler:    _LiteVirt_ListBackupRepoSnapshots_Handler,
 		},
 		{
 			MethodName: "CreateContainer",

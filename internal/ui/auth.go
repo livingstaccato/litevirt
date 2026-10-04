@@ -169,6 +169,17 @@ func rpcWriteFailed(w http.ResponseWriter, what string, err error) {
 	w.WriteHeader(httpStatusFor(err))
 }
 
+// renderPageRPCFailed renders a page whose read RPC failed or was refused: the
+// page shell with the daemon's message in its error banner, under the status
+// httpStatusFor derives, so a refused read arrives as 403 rather than as an
+// empty page that looks like there is nothing to see.
+func (s *Server) renderPageRPCFailed(w http.ResponseWriter, pageTmpl string, data map[string]any, err error) {
+	data["Error"] = status.Convert(err).Message()
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(httpStatusFor(err))
+	s.renderPage(w, pageTmpl, data)
+}
+
 // uiRoleLevels mirrors the daemon's admin > operator > viewer ordering. It is a
 // local copy because internal/grpcapi does not export one; the two must agree,
 // and the UI is deliberately the more permissive of the pair only in that it

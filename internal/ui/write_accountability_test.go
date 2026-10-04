@@ -64,3 +64,65 @@ func TestNoUIHandlerWritesReplicatedStateInProcess(t *testing.T) {
 		}
 	}
 }
+
+// uiInProcessReads is every in-process Corrosion read a UI handler may make,
+// keyed by "file:corrosion.Func", each with the reason it is not an RPC call.
+//
+// A read belongs here only when NO RPC serves the same data. Where one does,
+// the RPC is where the authorization lives — a RequireRole that refuses a scoped
+// token, a RequirePerm at a path, a per-caller filter — and a page reading the
+// table in-process skips all of it for whatever session it serves.
+var uiInProcessReads = map[string]string{
+	"handle_security_groups.go:corrosion.ListSecurityGroups": "no RPC lists security groups; `lv sg ls` " +
+		"reads this table in-process too. A list RPC would move this page onto it",
+	"handle_security_groups.go:corrosion.ListSGRules": "no RPC lists security-group rules; `lv sg rule-ls` " +
+		"reads this table in-process too",
+	"handle_vms.go:corrosion.ListSecurityGroups": "the Add-NIC modal's security-group names; no RPC lists " +
+		"security groups (see handle_security_groups.go)",
+}
+
+// TestNoUIHandlerReadsReplicatedStateAroundItsRPC is the read half of the guard
+// above. /rbac read role_bindings in-process and showed every binding in the
+// cluster to any session, where ListRoleBindings shows a non-admin only their
+// own; /resource-mappings, /firewall and the VM hardware modals skipped checks
+// their RPCs make. A read through the session's bearer gets the daemon's answer
+// for that caller; an in-process read gets the whole table.
+func TestNoUIHandlerReadsReplicatedStateAroundItsRPC(t *testing.T) {
+	callRe := regexp.MustCompile(`corrosion\.([A-Z][A-Za-z0-9]*)\(`)
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(filepath.Clean(name))
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		for i, line := range strings.Split(string(src), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "//") {
+				continue
+			}
+			for _, m := range callRe.FindAllStringSubmatch(line, -1) {
+				key := name + ":corrosion." + m[1]
+				if _, ok := uiInProcessReads[key]; ok {
+					seen[key] = true
+					continue
+				}
+				t.Errorf("%s:%d: corrosion.%s reads replicated state in-process. Call the RPC that serves "+
+					"it with s.uiBearerCtx(r), so the daemon applies its authorization and per-caller "+
+					"filtering for this session; only a read with no RPC twin may be allowlisted in "+
+					"uiInProcessReads, with the reason", name, i+1, m[1])
+			}
+		}
+	}
+	for key := range uiInProcessReads {
+		if !seen[key] {
+			t.Errorf("uiInProcessReads allows %s, which no handler calls any more; remove the entry", key)
+		}
+	}
+}

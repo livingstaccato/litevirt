@@ -823,8 +823,8 @@ func nextDiskName(existing []string) string {
 
 // handleAddDiskModal renders the Add-disk modal for a VM: the name field
 // prefilled with the next free dataN slot (from the VM's current disks via
-// ListVMHardware) and a storage-pool dropdown scoped to the VM's host (via a
-// local Corrosion read, when available — an empty host lists every pool).
+// ListVMHardware) and a storage-pool dropdown scoped to the VM's host (via
+// InspectVM with the session's bearer — an empty host lists every pool).
 func (s *Server) handleAddDiskModal(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ctx := s.uiBearerCtx(r)
@@ -837,10 +837,8 @@ func (s *Server) handleAddDiskModal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	host := ""
-	if s.db != nil {
-		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
-			host = vm.HostName
-		}
+	if vm, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name}); err == nil {
+		host = vm.GetHostName()
 	}
 	var pools []string
 	if resp, err := s.grpc.ListStoragePools(ctx, &pb.ListStoragePoolsRequest{}); err == nil {
@@ -1235,18 +1233,16 @@ func (s *Server) handleDetachNIC(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAddPCIModal renders the Add-PCI modal: unassigned devices scanned from
-// the VM's host (via ListHostDevices, resolving the host through a local
-// Corrosion read like handleAddDiskModal) grouped into GPU/NIC/NVMe/Other
-// optgroups, plus the cluster-wide resource mappings available as a
-// host-portable alternative to a raw scanned address.
+// the VM's host (via ListHostDevices, resolving the host through InspectVM
+// like handleAddDiskModal) grouped into GPU/NIC/NVMe/Other optgroups, plus the
+// cluster-wide resource mappings available as a host-portable alternative to a
+// raw scanned address.
 func (s *Server) handleAddPCIModal(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ctx := s.uiBearerCtx(r)
 	host := ""
-	if s.db != nil {
-		if vm, _ := corrosion.GetVM(ctx, s.db, name); vm != nil {
-			host = vm.HostName
-		}
+	if vm, err := s.grpc.InspectVM(ctx, &pb.InspectVMRequest{Name: name}); err == nil {
+		host = vm.GetHostName()
 	}
 	byType := map[string][]*pb.PCIDevice{}
 	if host != "" {

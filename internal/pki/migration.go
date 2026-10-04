@@ -240,14 +240,9 @@ func InstallQemuMigrationTLS(pkiDir, qemuDir string, keyUID, keyGID int) (bool, 
 // returns the host certificate and the CAs it parsed, as far as it got; any
 // failure is ErrInvalidMigrationCredentials.
 func ValidateMigrationCredentials(caPEM, certPEM, keyPEM []byte, now time.Time) (*x509.Certificate, []*x509.Certificate, error) {
-	cas, err := parsePEMCertificates(caPEM)
+	cas, err := parseCABundle(caPEM)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationCAName, err)
-	}
-	for _, ca := range cas {
-		if !ca.IsCA {
-			return nil, cas, fmt.Errorf("%w: %s holds a certificate that is not a CA (%s)", ErrInvalidMigrationCredentials, MigrationCAName, ca.Subject)
-		}
+		return nil, nil, err
 	}
 	cert, err := parsePEMCertificate(certPEM)
 	if err != nil {
@@ -287,6 +282,22 @@ func ValidateMigrationCredentials(caPEM, certPEM, keyPEM []byte, now time.Time) 
 			ErrInvalidMigrationCredentials, MigrationHostKeyName, MigrationHostCertName, err)
 	}
 	return cert, cas, nil
+}
+
+// parseCABundle parses a host's migration CA file: every PEM block a CA
+// certificate, in order. During a rotation it holds the old CA and the new
+// one. Any failure is ErrInvalidMigrationCredentials.
+func parseCABundle(data []byte) ([]*x509.Certificate, error) {
+	cas, err := parsePEMCertificates(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrInvalidMigrationCredentials, MigrationCAName, err)
+	}
+	for _, ca := range cas {
+		if !ca.IsCA {
+			return nil, fmt.Errorf("%w: %s holds a certificate that is not a CA (%s)", ErrInvalidMigrationCredentials, MigrationCAName, ca.Subject)
+		}
+	}
+	return cas, nil
 }
 
 // parsePEMCertificates parses every PEM CERTIFICATE block of data; there must

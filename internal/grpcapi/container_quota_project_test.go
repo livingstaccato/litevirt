@@ -81,3 +81,69 @@ func TestCreateContainer_WithinDefaultQuotaStillAdmitted(t *testing.T) {
 		t.Fatalf("2 vCPU against an 8-vCPU quota should be admitted: %v", err)
 	}
 }
+
+// capacityOpProjects returns the project recorded on every capacity operation
+// row the given method wrote.
+func capacityOpProjects(t *testing.T, s *Server, method string) []string {
+	t.Helper()
+	rows, err := s.db.Query(adminCtx(),
+		`SELECT project FROM operations WHERE method = ? AND resource_kind = ?`,
+		method, corrosion.CapacityResourceKind)
+	if err != nil {
+		t.Fatalf("query operations: %v", err)
+	}
+	var out []string
+	for _, r := range rows {
+		out = append(out, r.String("project"))
+	}
+	return out
+}
+
+// The host-capacity lease must name the project the container lands in. #216
+// normalized the QUOTA admission but left the host lease on the raw request
+// value, so a create without --project recorded project="" on its operation
+// row while the container itself was stored under _default. The start path
+// passed the stored row's project raw too.
+//
+// Mutation: pass req.Project / rec.Project to admitHostWithReservation again —
+// the create (resp. start) row records "" and its half goes red.
+func TestContainerHostLease_RecordsTheNormalizedProject(t *testing.T) {
+	s := testServer(t)
+	ctx := adminCtx()
+	s.SetContainerRuntime(&fakeCTRuntime{})
+
+	if _, err := s.CreateContainer(ctx, &pb.CreateContainerRequest{
+		Name: "plain", Template: "download", Distro: "alpine", Release: "3.19",
+		Cpu: 1, MemoryMib: 256,
+	}); err != nil {
+		t.Fatalf("CreateContainer: %v", err)
+	}
+	got := capacityOpProjects(t, s, "CreateContainer")
+	if len(got) == 0 {
+		t.Fatal("CreateContainer wrote no capacity operation; the test cannot see the host lease")
+	}
+	for _, p := range got {
+		if p != tenancy.Default {
+			t.Errorf("CreateContainer capacity op project = %q, want %q", p, tenancy.Default)
+		}
+	}
+
+	// A stopped row whose project column is empty (an older writer's), started.
+	if _, err := s.db.DB().ExecContext(ctx,
+		`UPDATE containers SET state = 'stopped', project = '' WHERE host_name = ? AND name = ?`,
+		s.hostName, "plain"); err != nil {
+		t.Fatalf("stop row: %v", err)
+	}
+	if _, err := s.StartContainer(ctx, &pb.StartContainerRequest{Name: "plain", HostName: s.hostName}); err != nil {
+		t.Fatalf("StartContainer: %v", err)
+	}
+	got = capacityOpProjects(t, s, "StartContainer")
+	if len(got) == 0 {
+		t.Fatal("StartContainer wrote no capacity operation; the test cannot see the host lease")
+	}
+	for _, p := range got {
+		if p != tenancy.Default {
+			t.Errorf("StartContainer capacity op project = %q, want %q", p, tenancy.Default)
+		}
+	}
+}

@@ -98,7 +98,7 @@ func TestReconcilePass_ABackingImagePullOutlivesTheWalkBudget(t *testing.T) {
 	// The walk gave up on this VM for the pass, but it did NOT fail the VM: the
 	// row is left in a state the next pass re-drives, with a reason. This start
 	// carries no proof, so that state is "starting", not "pending" — see
-	// TestReconcilePass_ADeferredLocalRecoveryIsNotRefusedAsProofMissing.
+	// TestReconcilePass_ADeferredTransferKeepsItsProofMarker for one that does.
 	vm, err := corrosion.GetVM(ctx, db, "vm-pull")
 	if err != nil || vm == nil {
 		t.Fatalf("GetVM: %v", err)
@@ -187,12 +187,16 @@ func TestStartPendingVM_AnUnboundedCallerStillAwaitsThePull(t *testing.T) {
 // design, because the coordinator writes pending and its proof marker
 // atomically and a pending row without one is stale or hand-mutated.
 //
-// So a deferred local start must not be parked in pending. The walk budget
-// expired mid-transfer, the VM was re-armed as pending, and every later pass
-// refused it — even after the image finished — leaving the VM permanently
-// unstarted for having a large image. A markerless "starting" row is the
-// documented shape of an interrupted local start and is re-driven.
-func TestReconcilePass_ADeferredLocalRecoveryIsNotRefusedAsProofMissing(t *testing.T) {
+// This test used to have such a recovery rebuild its missing disk from a
+// backing image that outlived the walk budget, and asserted the deferral was
+// not parked in pending. A local start no longer rebuilds a missing disk at
+// all: that boots the VM on a blank disk (missing_disk.go). So the same row
+// now never pulls, is never deferred, and is refused once, as vm_disk_missing,
+// never as proof_missing; and it never lands in pending.
+//
+// Mutation: rebuild the disk on a local start again — the VM is deferred into
+// "starting" and the pull runs, and the test goes red.
+func TestReconcilePass_ALocalRecoveryWithAMissingDiskIsNotRefusedAsProofMissing(t *testing.T) {
 	db := testReconcilerDB(t)
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -226,45 +230,34 @@ func TestReconcilePass_ADeferredLocalRecoveryIsNotRefusedAsProofMissing(t *testi
 	var refusals []string
 	r.SetGateRefusedObserver(func(_, reason string) { refusals = append(refusals, reason) })
 
-	release := make(chan struct{})
+	var pulls atomic.Int32
 	r.SetAutoPullImage(func(pctx context.Context, name string) error {
-		select {
-		case <-release:
-		case <-pctx.Done():
-			return pctx.Err()
-		}
-		if _, err := os.Stat(store.ImagePath(name)); err == nil {
-			return nil
-		}
-		return qcow2.Create(store.ImagePath(name), 64<<20, nil)
+		pulls.Add(1)
+		<-pctx.Done() // a transfer that would outlive the walk
+		return pctx.Err()
 	})
 
-	r.ReconcileOnce(ctx) // budget expires mid-transfer; the start is deferred
+	for i := 0; i < 3; i++ {
+		r.ReconcileOnce(ctx)
+	}
 
 	vm, err := corrosion.GetVM(ctx, db, "vm-local")
 	if err != nil || vm == nil {
 		t.Fatalf("GetVM: %v", err)
 	}
-	if vm.State == "pending" {
-		t.Errorf("a proof-less local recovery was deferred into %q; under the split-brain "+
-			"gate a markerless pending row is refused as proof_missing on every later pass", vm.State)
+	if vm.State != "error" {
+		t.Fatalf("state = %q / %q, want error: a local recovery whose disk is missing is refused", vm.State, vm.StateDetail)
 	}
-
-	close(release)
-	deadline := time.Now().Add(5 * time.Second)
-	for !startedOrDefined(fake, "vm-local") && time.Now().Before(deadline) {
-		r.ReconcileOnce(ctx)
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !startedOrDefined(fake, "vm-local") {
-		vm, _ := corrosion.GetVM(ctx, db, "vm-local")
-		t.Fatalf("the local recovery never started after its image finished transferring; "+
-			"row = %q / %q, refusals = %v", vm.State, vm.StateDetail, refusals)
+	if startedOrDefined(fake, "vm-local") || pulls.Load() != 0 {
+		t.Fatalf("started = %v, pulls = %d; a local recovery must neither rebuild nor start", startedOrDefined(fake, "vm-local"), pulls.Load())
 	}
 	for _, reason := range refusals {
 		if reason == ReasonProofMissing {
 			t.Fatalf("a local recovery was refused as proof_missing: %v", refusals)
 		}
+	}
+	if _, ok, _ := corrosion.GetHealthCondition(ctx, db, DiskMissingEvaluator, CondVMDiskMissing, "vm", "vm-local@host-a"); !ok {
+		t.Fatal("vm_disk_missing was not raised")
 	}
 }
 

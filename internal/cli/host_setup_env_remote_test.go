@@ -138,18 +138,69 @@ func TestAddSetupEnforcement_RefusesWhenNoClusterConfigCanBeRead(t *testing.T) {
 	}
 }
 
-// Run from a cluster node, add uses that node's own config and SSHes nowhere.
+// Run from a node of the join peers' cluster — its advertise_address is one of
+// them — add uses that node's own config and SSHes nowhere.
 func TestAddSetupEnforcement_OnAClusterNodeUsesItsOwnConfig(t *testing.T) {
-	useConfig(t, "enforcement:\n  audit_signature: true\n")
+	useConfig(t, "advertise_address: 10.0.0.1\nenforcement:\n  audit_signature: true\n")
 	asked := stubPeerConfig(t, func(string) (string, bool, error) {
 		return "", false, errors.New("must not be called")
 	})
 
-	block, err := addSetupEnforcement("root", []string{"10.0.0.1:7946"})
+	block, err := addSetupEnforcement("root", []string{"10.0.0.2:7946", "10.0.0.1:7946"})
 	if err != nil || block != "enforcement:\n  audit_signature: true\n" {
 		t.Errorf("got (%q, %v), want this node's block", block, err)
 	}
 	if len(*asked) != 0 {
 		t.Errorf("read a peer's config (%v) although this node has its own", *asked)
+	}
+}
+
+// The CLI can address a different cluster from the one this machine is a node
+// of (LV_HOST), and joinPeers then come from THAT cluster. This node's block
+// belongs to its own cluster and must not be copied onto the new host: here it
+// would carry gossip encryption off into a cluster that enforces it, and no
+// gossip key would be pushed, so the new host could never join.
+func TestAddSetupEnforcement_ANodeOfAnotherClusterReadsTheJoinPeers(t *testing.T) {
+	useConfig(t, "host_name: a1\nadvertise_address: 10.0.0.1\njoin_peers: [\"10.0.0.2:7946\"]\n"+
+		"enforcement:\n  gossip_encryption: off\n")
+	asked := stubPeerConfig(t, func(string) (string, bool, error) {
+		return "host_name: b1\nenforcement:\n  gossip_encryption: enforce\n", true, nil
+	})
+
+	block, err := addSetupEnforcement("root", []string{"10.9.0.1:7946", "10.9.0.2:7946"})
+	if err != nil {
+		t.Fatalf("addSetupEnforcement: %v", err)
+	}
+	if block != "enforcement:\n  gossip_encryption: enforce\n" {
+		t.Errorf("block = %q, want the join peers' cluster's, not this node's", block)
+	}
+	if len(*asked) == 0 || (*asked)[0] != "root@10.9.0.1" {
+		t.Errorf("read the config from %v, want root@10.9.0.1", *asked)
+	}
+}
+
+// A node of another cluster that cannot reach the join peers' configs refuses
+// rather than falling back to its own block.
+func TestAddSetupEnforcement_ANodeOfAnotherClusterRefusesWhenPeersAreUnreadable(t *testing.T) {
+	useConfig(t, "advertise_address: 10.0.0.1\nenforcement:\n  gossip_encryption: off\n")
+	stubPeerConfig(t, func(string) (string, bool, error) { return "", false, errors.New("connection refused") })
+
+	block, err := addSetupEnforcement("root", []string{"10.9.0.1:7946"})
+	if err == nil {
+		t.Fatalf("add proceeded with block %q from this machine, which is not a node of the join peers' cluster", block)
+	}
+}
+
+// A local config that names no advertise_address proves nothing about which
+// cluster it belongs to, so the peers are read.
+func TestAddSetupEnforcement_ALocalConfigWithNoAdvertiseAddressReadsThePeers(t *testing.T) {
+	useConfig(t, "enforcement:\n  audit_signature: true\n")
+	stubPeerConfig(t, func(string) (string, bool, error) {
+		return "enforcement:\n  shared_storage_fence: true\n", true, nil
+	})
+
+	block, err := addSetupEnforcement("root", []string{"10.0.0.1:7946"})
+	if err != nil || block != "enforcement:\n  shared_storage_fence: true\n" {
+		t.Errorf("got (%q, %v), want the peer's block", block, err)
 	}
 }

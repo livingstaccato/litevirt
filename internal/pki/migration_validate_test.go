@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -111,5 +112,73 @@ func TestInstallQemuMigrationTLS_RefusesATornSetAndKeepsTheInstalledOne(t *testi
 	}
 	if after := mustRead(t, filepath.Join(qemu, "server-key.pem")); string(after) != string(before) {
 		t.Fatal("a refused install still replaced QEMU's key")
+	}
+}
+
+// Two concurrent migrations each run the installer. Rewriting unchanged files
+// lets one tear the other's server pair; skipping them removes the window.
+//
+// Mutation: make upToDate return false — the inode changes.
+func TestInstallQemuMigrationTLS_LeavesUnchangedFilesAlone(t *testing.T) {
+	pkiDir, qemu := t.TempDir(), filepath.Join(t.TempDir(), "qemu")
+	provisionMigration(t, pkiDir)
+	if _, err := InstallQemuMigrationTLS(pkiDir, qemu, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(filepath.Join(qemu, "server-key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallQemuMigrationTLS(pkiDir, qemu, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(filepath.Join(qemu, "server-key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("an unchanged key was rewritten")
+	}
+}
+
+// Review focus 1: the QEMU user changed. Same bytes, different owner — the key
+// must be rewritten, or QEMU cannot read it.
+//
+// Mutation: drop the owner comparison from upToDate — the stale owner stays.
+func TestInstallQemuMigrationTLS_RewritesAKeyWhoseOwnerChanged(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("needs root to chown")
+	}
+	pkiDir, qemu := t.TempDir(), filepath.Join(t.TempDir(), "qemu")
+	provisionMigration(t, pkiDir)
+	if _, err := InstallQemuMigrationTLS(pkiDir, qemu, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := InstallQemuMigrationTLS(pkiDir, qemu, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(qemu, "server-key.pem"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid := st.Sys().(*syscall.Stat_t).Uid; uid != 65534 {
+		t.Fatalf("server-key.pem owned by uid %d; want 65534", uid)
+	}
+}
+
+// Mutation: compare only the mode in upToDate — the reissued key is skipped.
+func TestInstallQemuMigrationTLS_RewritesAReissuedKey(t *testing.T) {
+	pkiDir, qemu := t.TempDir(), filepath.Join(t.TempDir(), "qemu")
+	provisionMigration(t, pkiDir)
+	if _, err := InstallQemuMigrationTLS(pkiDir, qemu, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	provisionMigration(t, pkiDir) // a fresh CA and host set, as a reissue would push
+	if _, err := InstallQemuMigrationTLS(pkiDir, qemu, -1, -1); err != nil {
+		t.Fatal(err)
+	}
+	want := mustRead(t, filepath.Join(MigrationDir(pkiDir), MigrationHostKeyName))
+	if got := mustRead(t, filepath.Join(qemu, "server-key.pem")); string(got) != string(want) {
+		t.Fatal("QEMU still has the old key after a reissue")
 	}
 }

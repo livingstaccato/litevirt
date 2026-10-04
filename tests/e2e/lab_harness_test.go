@@ -891,11 +891,24 @@ func (l *lab) deleteVMs(stack string, names map[string]string) {
 	// refused while a just-restarted node's replica catches up, and a row left
 	// behind makes that node's reconciler recreate the VM ("marked running but
 	// not in libvirt"). Only then is anything left on a node's disk an orphan.
+	//
+	// Only a host whose replica can be read is asked. A machine that is up but
+	// has no sqlite3 or no state.db (a rebuilt node before its add, or before
+	// the drill installs sqlite3 on it) holds no replica the harness can read,
+	// and counting it as unknown would spin here for the whole deadline.
 	deadline := time.Now().Add(5 * time.Minute)
+	unreadable := map[string]bool{}
 	for {
 		l.lv(via, "compose", "down", "--name", stack, "-y")
 		left := map[string]bool{}
 		for _, h := range l.upHosts() {
+			if !l.replicaReadable(h) {
+				if !unreadable[h] {
+					unreadable[h] = true
+					l.mark("cleanup: %s has no readable replica (no sqlite3 or no state.db); not asked for test VM rows", h)
+				}
+				continue
+			}
 			rows, err := l.sql(h, "SELECT name FROM vms WHERE deleted_at IS NULL AND name IN ('"+strings.Join(list, "','")+"')")
 			if err != nil {
 				left[h+":?"] = true
@@ -925,6 +938,18 @@ func (l *lab) deleteVMs(stack string, names map[string]string) {
 		}
 	}
 	l.mark("cleanup: test VMs %v deleted", list)
+}
+
+// replicaReadable reports whether host answers SSH and has both sqlite3 and a
+// state.db to read. An SSH failure is not "unreadable": the host may answer on
+// the next try, so callers keep asking it.
+func (l *lab) replicaReadable(host string) bool {
+	out, err := l.ssh(host, 20*time.Second,
+		"if command -v sqlite3 >/dev/null && test -s /var/lib/litevirt/state.db; then echo READABLE; else echo UNREADABLE; fi")
+	if err != nil {
+		return true
+	}
+	return !strings.Contains(out, "UNREADABLE")
 }
 
 // createContainer creates and starts a recoverable (image-recreate) container

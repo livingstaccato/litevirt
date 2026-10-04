@@ -137,8 +137,9 @@ func HostInit(ctx context.Context, sshTarget string, hostName string, force bool
 		}
 	}
 	// Migration-TLS credentials from the separate migration CA, so storage
-	// migrations to and from this host are encrypted.
-	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip)
+	// migrations to and from this host are encrypted. nil: init founds a
+	// cluster, so there is no host holding another CA's credentials to ask.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip, nil)
 	if err != nil {
 		return err
 	}
@@ -238,6 +239,12 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return err
 	}
+	// The migration CA, likewise decided before anything is pushed: minted here
+	// only when no join peer already holds credentials from one elsewhere.
+	migHolder := peerMigrationHolder(sshUser, joinPeers)
+	if _, _, _, err := ensureLocalMigrationCA(pkiDir, migHolder); err != nil {
+		return err
+	}
 
 	// Generate CLI client certificate if it doesn't exist
 	caKeyPath := filepath.Join(pkiDir, "ca.key")
@@ -293,10 +300,9 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 			return fmt.Errorf("push %s: %w", pki.GossipKeyName, err)
 		}
 	}
-	// Migration-TLS credentials from the cluster's migration CA (minted here if
-	// this machine has none yet), so storage migrations with this host are
-	// encrypted.
-	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip)
+	// Migration-TLS credentials from the cluster's migration CA, decided above,
+	// so storage migrations with this host are encrypted.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, ip, migHolder)
 	if err != nil {
 		return err
 	}
@@ -559,7 +565,9 @@ func HostInitLocal(ctx context.Context, hostName, advertiseAddr string, force bo
 	// Migration-TLS credentials from the separate migration CA. The daemon
 	// installs them for QEMU, so storage migrations with this host are
 	// encrypted once a peer is provisioned too.
-	migFiles, err := issueMigrationCredentials(pkiDir, hostName, net.ParseIP(advertiseAddr))
+	// nil: init founds a cluster, so there is no host holding another CA's
+	// credentials to ask about.
+	migFiles, err := issueMigrationCredentials(pkiDir, hostName, net.ParseIP(advertiseAddr), nil)
 	if err != nil {
 		return err
 	}
@@ -1013,14 +1021,7 @@ func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
 		why = append(why, reason)
 	}
 	for _, p := range joinPeers {
-		host := p
-		if h, _, serr := net.SplitHostPort(p); serr == nil {
-			host = h
-		}
-		target := host
-		if sshUser != "" {
-			target = sshUser + "@" + host
-		}
+		target := sshTargetForPeer(sshUser, p)
 		cfg, ok, rerr := readPeerConfig(target)
 		switch {
 		case rerr != nil:
@@ -1034,6 +1035,19 @@ func addSetupEnforcement(sshUser string, joinPeers []string) (string, error) {
 	return "", fmt.Errorf("could not read the cluster's enforcement block, which the new host "+
 		"must boot with so its flags match its peers': %s. Run `lv host add` on a cluster node, "+
 		"or from a machine that can SSH to one as %q", strings.Join(why, "; "), sshUser)
+}
+
+// sshTargetForPeer is the SSH target for a join peer ("host:port"), reached as
+// sshUser when one is given.
+func sshTargetForPeer(sshUser, peer string) string {
+	host := peer
+	if h, _, err := net.SplitHostPort(peer); err == nil {
+		host = h
+	}
+	if sshUser == "" {
+		return host
+	}
+	return sshUser + "@" + host
 }
 
 // localEnforcementForPeers returns this machine's enforcement block when its

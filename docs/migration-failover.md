@@ -78,6 +78,12 @@ migration-TLS credentials:
   must not get the node's cluster identity.
 - `lv host init` and `lv host add` issue them. On an older cluster, run
   `lv host install-migration-tls` once from the machine that holds the cluster CA.
+- The migration CA lives only on the machine that minted it. `lv host add` and
+  `lv host install-migration-tls` refuse to mint a second one while a cluster
+  host already holds credentials: certificates from it would not verify against
+  the first, and every storage migration with the new host would fail its TLS
+  handshake. Copy `migration-ca.crt` and `migration-ca.key` (mode 0600) from the
+  machine that holds them, or run the command there.
 - Each daemon installs its host's credentials into `/etc/pki/qemu`, with the key
   readable only by the QEMU user, at start and again before each storage
   migration, so no restart is needed. It refuses to touch `/etc/pki/qemu` if

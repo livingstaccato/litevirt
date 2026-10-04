@@ -2217,6 +2217,13 @@ type ConfigureHostRequest struct {
 	MemOvercommit *float64 `protobuf:"fixed64,10,opt,name=mem_overcommit,json=memOvercommit,proto3,oneof" json:"mem_overcommit,omitempty"`
 	CpuReserve    *int32   `protobuf:"varint,11,opt,name=cpu_reserve,json=cpuReserve,proto3,oneof" json:"cpu_reserve,omitempty"`
 	MemReserveMib *int32   `protobuf:"varint,12,opt,name=mem_reserve_mib,json=memReserveMib,proto3,oneof" json:"mem_reserve_mib,omitempty"`
+	// Clear the host's IPMI address, user and password. An empty ipmi_* field
+	// means "leave alone", so this is the only way to remove them. Refused
+	// together with any ipmi_* field, and while the host would be left fencing
+	// by "ipmi" (pass another fence_strategy with it). A server that predates
+	// the field ignores it: alone it answers "no fields to update", and a
+	// client must check the returned host's ipmi_address is empty.
+	ClearIpmi     bool `protobuf:"varint,13,opt,name=clear_ipmi,json=clearIpmi,proto3" json:"clear_ipmi,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2333,6 +2340,13 @@ func (x *ConfigureHostRequest) GetMemReserveMib() int32 {
 		return *x.MemReserveMib
 	}
 	return 0
+}
+
+func (x *ConfigureHostRequest) GetClearIpmi() bool {
+	if x != nil {
+		return x.ClearIpmi
+	}
+	return false
 }
 
 // ── VMs ──
@@ -31158,7 +31172,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\vtype_filter\x18\x02 \x01(\tR\n" +
 	"typeFilter\"K\n" +
 	"\x17ListHostDevicesResponse\x120\n" +
-	"\adevices\x18\x01 \x03(\v2\x16.litevirt.v1.PCIDeviceR\adevices\"\xf2\x03\n" +
+	"\adevices\x18\x01 \x03(\v2\x16.litevirt.v1.PCIDeviceR\adevices\"\x91\x04\n" +
 	"\x14ConfigureHostRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12%\n" +
 	"\x0efence_strategy\x18\x02 \x01(\tR\rfenceStrategy\x12!\n" +
@@ -31173,7 +31187,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	" \x01(\x01H\x01R\rmemOvercommit\x88\x01\x01\x12$\n" +
 	"\vcpu_reserve\x18\v \x01(\x05H\x02R\n" +
 	"cpuReserve\x88\x01\x01\x12+\n" +
-	"\x0fmem_reserve_mib\x18\f \x01(\x05H\x03R\rmemReserveMib\x88\x01\x01B\x11\n" +
+	"\x0fmem_reserve_mib\x18\f \x01(\x05H\x03R\rmemReserveMib\x88\x01\x01\x12\x1d\n" +
+	"\n" +
+	"clear_ipmi\x18\r \x01(\bR\tclearIpmiB\x11\n" +
 	"\x0f_cpu_overcommitB\x11\n" +
 	"\x0f_mem_overcommitB\x0e\n" +
 	"\f_cpu_reserveB\x12\n" +

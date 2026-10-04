@@ -534,6 +534,7 @@ func newHostConfigCmd() *cobra.Command {
 	var fenceStrategy, ipmiAddr, ipmiUser, ipmiPass, watchdogDev, role, region string
 	var cpuOvercommit, memOvercommit float64
 	var cpuReserve, memReserveMiB int
+	var clearIPMI bool
 
 	cmd := &cobra.Command{
 		Use:   "config <host>",
@@ -550,6 +551,7 @@ func newHostConfigCmd() *cobra.Command {
 					WatchdogDev:   watchdogDev,
 					Role:          role,
 					Region:        region,
+					ClearIpmi:     clearIPMI,
 				}
 				// Send capacity overrides only when the operator actually passed the
 				// flag: an omitted numeric flag is 0, which for a reserve is a REAL
@@ -571,6 +573,11 @@ func newHostConfigCmd() *cobra.Command {
 				h, err := c.ConfigureHost(ctx, out)
 				if err != nil {
 					return fmt.Errorf("configure host: %w", err)
+				}
+				if clearIPMI {
+					if err := checkIPMICleared(h); err != nil {
+						return err
+					}
 				}
 				fmt.Printf("Host %s configured.\n", h.Name)
 				return nil
@@ -596,8 +603,25 @@ func newHostConfigCmd() *cobra.Command {
 		"vCPUs held back for the host itself (negative = inherit the cluster default).")
 	cmd.Flags().IntVar(&memReserveMiB, "mem-reserve", 0,
 		"MiB held back for the host itself (negative = inherit). 0 means hand guests every last MiB — the host gets no headroom.")
+	cmd.Flags().BoolVar(&clearIPMI, "clear-ipmi", false,
+		"Remove the host's IPMI address, user and password (an empty --ipmi-* flag leaves them alone). A host that fences by ipmi needs another --fence-strategy with it.")
+	for _, f := range []string{"ipmi-address", "ipmi-user", "ipmi-pass"} {
+		cmd.MarkFlagsMutuallyExclusive("clear-ipmi", f)
+	}
 
 	return cmd
+}
+
+// checkIPMICleared confirms a --clear-ipmi took effect. A server that predates
+// clear_ipmi ignores the field: alone it refuses ("no fields to update"), but
+// beside another setting it applies that one and returns the host with its
+// IPMI settings intact.
+func checkIPMICleared(h *pb.Host) error {
+	if h.GetIpmiAddress() != "" {
+		return fmt.Errorf("host %s still has IPMI address %s: the server did not clear it (it may predate "+
+			"--clear-ipmi; retry once every host is upgraded)", h.GetName(), h.GetIpmiAddress())
+	}
+	return nil
 }
 
 func newHostRescanCmd() *cobra.Command {

@@ -633,6 +633,8 @@ func hostStateBadge(state pb.HostState) template.HTML {
 		return `<span class="badge badge-red">suspect</span>`
 	case pb.HostState_HOST_OFFLINE:
 		return `<span class="badge badge-red">offline</span>`
+	case pb.HostState_HOST_JOINING:
+		return `<span class="badge badge-blue">joining</span>`
 	default:
 		return `<span class="badge badge-gray">unknown</span>`
 	}

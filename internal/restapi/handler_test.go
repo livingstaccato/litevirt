@@ -794,6 +794,20 @@ func TestListHosts_Success(t *testing.T) {
 	}
 }
 
+// A host `lv host add` admitted whose daemon has not started is listed as
+// joining, by name, not as offline.
+func TestListHosts_ShowsAJoiningHost(t *testing.T) {
+	s, mock := newMockServer("test-token")
+	mock.listHostsResp = &pb.ListHostsResponse{Hosts: []*pb.Host{{Name: "node-5", State: pb.HostState_HOST_JOINING}}}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/hosts", nil)
+	req.Header.Set("Authorization", "Bearer test-token")
+	rec := httptest.NewRecorder()
+	s.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"HOST_JOINING"`) {
+		t.Errorf("GET /api/v1/hosts = %d %s, want the host's state as \"HOST_JOINING\"", rec.Code, rec.Body.String())
+	}
+}
+
 func TestListHosts_MethodNotAllowed(t *testing.T) {
 	s, _ := newMockServer("test-token")
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/hosts", nil)

@@ -3,7 +3,6 @@ package corrosion
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // netbox_host_config is the per-host publication of the NetBox configuration a
@@ -54,8 +53,18 @@ func PublishNetBoxHostConfig(ctx context.Context, c *Client, host, clusterName s
 			netbox_cluster = excluded.netbox_cluster,
 			updated_at     = excluded.updated_at,
 			deleted_at     = NULL`,
-		host, clusterName, time.Now().UTC().Format(time.RFC3339), now)
+		host, clusterName, netboxHostConfigCreatedAt, now)
 }
+
+// netboxHostConfigCreatedAt is the created_at every netbox_host_config INSERT
+// binds, for the reason healthConditionCreatedAt gives: the conflict path
+// leaves created_at alone, and the same host's row is INSERTed on two replicas
+// that never saw each other's when a machine rebuilt under a removed host's
+// name publishes from an empty database while its peers hold the old
+// machine's row (tombstoned at its re-admission). A wall-clock value left them
+// one updated_at over two created_at values, which the WAL push cannot settle.
+// Nothing reads netbox_host_config.created_at. Only a bound value changed.
+const netboxHostConfigCreatedAt = healthConditionCreatedAt
 
 // ListNetBoxHostConfig returns every host's published NetBox cluster name.
 //

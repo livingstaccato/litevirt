@@ -95,13 +95,31 @@ scp bin/litevirt root@10.0.50.11:/usr/local/bin/
 lv host add root@10.0.50.11 --name host-b
 ```
 
-The host is admitted in state `joining` (`HOST_OFFLINE` in `lv host ls`) and
+The host is admitted in state `joining` (`HOST_JOINING` in `lv host ls`; a
+server on an older release reports it `HOST_OFFLINE`, and an older `lv` shows
+the number `5`) and
 becomes `active` when its daemon first starts. Until then nothing is placed on
 it and the failover coordinator never fences it, however long its setup takes:
 it is down to every peer by construction, and runs nothing. A host removed
 with `lv host rm` and added back under the same name starts with no failure
 history; every peer forgets the old machine's failed probes when it leaves the
 host table.
+
+Such a host is a new machine to the cluster and inherits nothing the old one
+was configured with: its fencing and IPMI settings, labels, role, region and
+capacity overrides return to their defaults, and its IPMI password is retired
+(already at `lv host rm`). Its `lv host network` intents are dropped too,
+since they name the old machine's NICs and addresses: record the new
+machine's wiring before its first `lv host network apply`. Its host-tier
+firewall rules (`lv firewall host-rule`) are kept: they are policy for guest
+traffic through the host of that name, not a property of the hardware.
+
+Nor does it inherit the old machine's workloads. `lv host add` refuses a name
+while VMs or containers are still recorded on the host removed under it, and
+names them. They are recovered onto live hosts by the claim path for a host
+removed for good, which needs the name to stay removed; wait until they have
+moved (`lv health` shows `ha.claim.stranded` for any that cannot), or remove
+them, and add the host again.
 
 3. Edit `/etc/litevirt/config.yaml` on the new host to set the join address:
 

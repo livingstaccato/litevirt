@@ -102,6 +102,11 @@ const (
 	HostState_HOST_MAINTENANCE HostState = 2
 	HostState_HOST_SUSPECT     HostState = 3
 	HostState_HOST_OFFLINE     HostState = 4
+	// Admitted by `lv host add`, its daemon not yet started: down to every
+	// observer by construction, never fenced, no placement target. A server
+	// on a release before this value reports such a host HOST_OFFLINE; a
+	// client before it shows the number 5.
+	HostState_HOST_JOINING HostState = 5
 )
 
 // Enum value maps for HostState.
@@ -112,6 +117,7 @@ var (
 		2: "HOST_MAINTENANCE",
 		3: "HOST_SUSPECT",
 		4: "HOST_OFFLINE",
+		5: "HOST_JOINING",
 	}
 	HostState_value = map[string]int32{
 		"HOST_ACTIVE":      0,
@@ -119,6 +125,7 @@ var (
 		"HOST_MAINTENANCE": 2,
 		"HOST_SUSPECT":     3,
 		"HOST_OFFLINE":     4,
+		"HOST_JOINING":     5,
 	}
 )
 
@@ -6250,13 +6257,14 @@ const file_litevirt_v1_types_proto_rawDesc = "" +
 	"\bVM_ERROR\x10\x06\x12\x0e\n" +
 	"\n" +
 	"VM_UNKNOWN\x10\a\x12\r\n" +
-	"\tVM_PAUSED\x10\b*i\n" +
+	"\tVM_PAUSED\x10\b*{\n" +
 	"\tHostState\x12\x0f\n" +
 	"\vHOST_ACTIVE\x10\x00\x12\x11\n" +
 	"\rHOST_DRAINING\x10\x01\x12\x14\n" +
 	"\x10HOST_MAINTENANCE\x10\x02\x12\x10\n" +
 	"\fHOST_SUSPECT\x10\x03\x12\x10\n" +
-	"\fHOST_OFFLINE\x10\x04*G\n" +
+	"\fHOST_OFFLINE\x10\x04\x12\x10\n" +
+	"\fHOST_JOINING\x10\x05*G\n" +
 	"\x0fMigrateStrategy\x12\x10\n" +
 	"\fMIGRATE_LIVE\x10\x00\x12\x10\n" +
 	"\fMIGRATE_COLD\x10\x01\x12\x10\n" +

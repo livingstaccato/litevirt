@@ -115,8 +115,25 @@ func UpsertHostNetwork(ctx context.Context, c *Client, rec HostNetworkRecord) er
 		   deleted_at = NULL`,
 		rec.HostName, rec.Name, rec.Kind, members, rec.VLANID, rec.VLANLink,
 		rec.Addressing, rec.MTU, rec.BondMode, rec.LACPRate, rec.HashPolicy,
-		nowRFC3339Nano(), now)
+		hostNetworkCreatedAt, now)
 }
+
+// hostNetworkCreatedAt is the created_at every host_networks INSERT binds, for
+// the reason healthConditionCreatedAt gives. The conflict path above leaves
+// created_at alone, so a row's created_at is whatever the INSERT that first
+// created it on THIS replica bound. The same (host, name) is INSERTed on two
+// replicas that never saw each other's row when a machine rebuilt under a
+// removed host's name, on an empty database, is given an intent under a name
+// its peers hold for the old machine (tombstoned at its re-admission). With a
+// wall-clock created_at the two replicas held one updated_at over two
+// created_at values, which the WAL push cannot settle. A value every writer
+// binds alike makes the later write alone converge them.
+//
+// Nothing reads host_networks.created_at but ListHostNetworks, which hands it
+// on in HostNetwork.created_at; no CLI or UI view shows it. A row an older
+// binary created keeps its wall-clock value. Only a bound value changed: the
+// statement's shape is the same.
+const hostNetworkCreatedAt = healthConditionCreatedAt
 
 // SetHostNetworkState records an apply-lifecycle transition (applying /
 // rolled_back with its error). The confirmed-apply transition has its own

@@ -239,6 +239,10 @@ func TestFleet_HostMembership_ARollKeepsFencingAndTheVoterSet(t *testing.T) {
 	}
 
 	c.Isolate(victim)
+	// The victim fails now, after the undrain made it active: its
+	// observations are stamped after that, or the coordinator rightly reads
+	// them as about the host before it turned active (HostsActiveSince).
+	clock = NewVirtualClock(time.Now().UTC())
 	PublishHealth(t, a, victim.Name, 5, clock.Now())
 	PublishHealth(t, b, victim.Name, 5, clock.Now())
 	c.WaitConverged(t, convergeTimeout, a, b)

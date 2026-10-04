@@ -251,6 +251,21 @@ lv host config host-b \
   --ipmi-pass <secret>
 ```
 
+An empty `--ipmi-*` flag leaves the setting alone. To remove a host's IPMI
+address, user and password, use `--clear-ipmi`; a host that fences by `ipmi`
+needs another strategy in the same command, since it would have nothing to
+authenticate with:
+
+```bash
+lv host config host-b --fence-strategy ssh --clear-ipmi
+```
+
+The clear writes both copies of the password, the `host_fence_credentials`
+row and the old `hosts.ipmi_pass` column, so it is refused until
+`credentials_split_v1` has latched on the node that takes it. A server that
+predates the flag ignores it; the CLI reports an error when the host it gets
+back still has an IPMI address.
+
 ### Manual fence confirmation flow
 
 Under `manual` strategy, the failover coordinator records the failure but
@@ -407,6 +422,19 @@ then fenced again once the row is 5 minutes old, as before.
 A shared-disk VM is still moved only on a proof-grade fence under 5 minutes old
 (see above), which a resume from a verified fence always has: a fresh one when
 the recorded one was older.
+
+**A fence row belongs to the host's life it was written in.** A `fencing_log`
+row older than the moment the host last turned `active` (its own boot write,
+or a recovery) is about an earlier life: the machine removed under the name
+before `lv host add` gave it to a new one, or the same machine before it booted
+again. Such a row does not make the host "recently fenced", does not confirm
+it off, and is not the proof-grade fence a shared-disk VM is moved on. A host
+that fails again after coming back is fenced anew, without waiting out the
+5 minutes. A row newer than the host's last activation still counts, which is
+the race the window exists for. Likewise, a health observation older than the
+moment a host turned active does not count toward fencing it: a host that just
+turned active is counted down afresh, and a host `lv host add` admitted is not
+probed at all until its daemon's first boot records it `active`.
 
 ### Resuming a recovery from a confirmation
 

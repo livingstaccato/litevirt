@@ -165,6 +165,9 @@ type Coordinator struct {
 	// one that moved VMs (value=true) must wait for a manual `undrain` to avoid
 	// split-brain. Absent key ⇒ we can't prove it's safe ⇒ stays manual.
 	fenceRelocated map[string]bool
+	// skipAudited is the failover.skip state last audited per host and
+	// workload (auditSkip).
+	skipAudited map[string]string
 	// confirmResumed records, per host, the operator confirmation a recovery
 	// was already resumed from in this process, so one confirmation resumes one
 	// recovery rather than one per cycle. Losing it on restart costs at most one
@@ -621,6 +624,14 @@ func (c *Coordinator) run(ctx context.Context) {
 	// the skew lasts; host recovery (recoverHosts) deliberately keeps the
 	// one-sided test, since readmitting a host is not the irreversible act.
 	futureCutoff := c.now().Add(healthFreshness)
+	// An observation older than the moment its target turned active is about
+	// the host before (joining, offline, fenced), not the one active now, so
+	// a host that just turned active is counted down afresh. Unreadable: judged
+	// as before.
+	activeSince, aerr := corrosion.HostsActiveSince(ctx, c.db)
+	if aerr != nil {
+		slog.Warn("failover: read when hosts turned active", "error", aerr)
+	}
 	freshObservers := map[string]map[string]struct{}{}
 	// clusterObservers is the cluster-wide count, kept under region scope only
 	// to report a host it would have fenced and the region count does not.
@@ -637,6 +648,9 @@ func (c *Coordinator) run(ctx context.Context) {
 			continue
 		}
 		t, o := r.String("target"), r.String("observer")
+		if since, ok := activeSince[t]; ok && inst.Before(since) {
+			continue
+		}
 		if c.scope.region && countsAsVote(voters, o, t) {
 			if clusterObservers[t] == nil {
 				clusterObservers[t] = map[string]struct{}{}
@@ -743,6 +757,10 @@ func (c *Coordinator) run(ctx context.Context) {
 		// the boot write can land on any cycle.
 		if h.State == corrosion.HostStateJoining {
 			slog.Info("failover: target is still joining (its daemon has not started), skipping fence", "host", target)
+			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
+			continue
+		}
+		if aerr == nil && c.turnedActiveThisCycle(ctx, target, activeSince) {
 			c.mAttempt(PhaseSkip, ResultSkipped, ErrJoining)
 			continue
 		}
@@ -1473,6 +1491,7 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 		return false
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
+	life, lifeKnown := c.fenceRowCutoff(ctx, host)
 	for _, r := range rows {
 		switch result := r.String("result"); {
 		case manualOnly && result != "manual-confirmed":
@@ -1483,6 +1502,9 @@ func (c *Coordinator) fenceWithinWindow(ctx context.Context, host string, manual
 		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
 		if perr != nil {
 			continue
+		}
+		if lifeKnown && ts.Before(life) {
+			continue // an earlier life of the host (fenceRowCutoff)
 		}
 		if ts.After(cutoff) {
 			return true
@@ -2005,6 +2027,7 @@ func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (f
 		return fenceRecord{}, false
 	}
 	cutoff := c.now().Add(-recentFenceWindow)
+	life, lifeKnown := c.fenceRowCutoff(ctx, host)
 	var best time.Time
 	var out fenceRecord
 	found := false
@@ -2013,7 +2036,7 @@ func (c *Coordinator) newestProofGradeFence(ctx context.Context, host string) (f
 			continue
 		}
 		ts, perr := time.Parse(time.RFC3339, r.String("timestamp"))
-		if perr != nil || !ts.After(cutoff) {
+		if perr != nil || !ts.After(cutoff) || (lifeKnown && ts.Before(life)) {
 			continue
 		}
 		if !found || ts.After(best) {
@@ -2496,7 +2519,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 		if vmUsesFirmwareState(vm) {
 			slog.Warn("failover: skipping Secure Boot / vTPM VM — firmware state was host-local and died with the host; restore from backup",
 				"vm", vm.Name, "host", h.Name)
-			c.audit(ctx, "failover.skip", vm.Name, "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with "+h.Name+")", "skipped")
+			c.auditSkip(ctx, h.Name, vm.Name, "Secure Boot / vTPM VM not auto-failed-over (firmware state lost with "+h.Name+")", "skipped")
 			c.mVM(ActionReschedule, ResultSkipped, ErrFirmwareState)
 			continue
 		}
@@ -2519,7 +2542,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				"vm", vm.Name, "condition", code)
 			c.noteGateRefused(corrosion.ActionReschedule, health.ReasonOwnershipDispute)
 			c.mVM(ActionReschedule, ResultRefused, ErrOwnershipDispute)
-			c.audit(ctx, "failover.skip", vm.Name, "active ownership condition "+code+" — automated recovery refused", "refused")
+			c.auditSkip(ctx, h.Name, vm.Name, "active ownership condition "+code+" — automated recovery refused", "refused")
 			continue
 		}
 
@@ -2677,7 +2700,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 			for i := range plans {
 				if plans[i].needsPlacement {
 					c.mVM(ActionReschedule, ResultError, ErrPlacementFailed)
-					c.audit(ctx, "failover.skip", plans[i].vm.Name, "batch placement failed after fencing "+h.Name+": "+err.Error(), "error")
+					c.auditSkip(ctx, h.Name, plans[i].vm.Name, "batch placement failed after fencing "+h.Name+": "+err.Error(), "error")
 				}
 			}
 			plans = plans[:0]
@@ -2702,7 +2725,7 @@ func (c *Coordinator) recoverWorkloads(ctx context.Context, h *corrosion.HostRec
 				slog.Warn("failover: no eligible host for VM — left for operator recovery, NOT round-robined",
 					"vm", vm.Name, "from", h.Name, "reason", result.Err)
 				c.mVM(ActionReschedule, ResultSkipped, ErrPlacementFailed)
-				c.audit(ctx, "failover.skip", vm.Name, detail, "skipped")
+				c.auditSkip(ctx, h.Name, vm.Name, detail, "skipped")
 				continue
 			}
 			p.targetName = result.Host

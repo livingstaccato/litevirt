@@ -881,6 +881,36 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 		}
 	}
 
+	// clear_ipmi removes the IPMI address, user and password, which an empty
+	// field cannot: empty means "leave alone". It is refused with any ipmi_*
+	// value beside it (set or clear, not both), and when it would leave the
+	// host fencing by "ipmi" with nothing to authenticate with — every fence
+	// would fail. And it needs this node's credentials_split_v1 gate open:
+	// readers take the live credential row whenever one exists, a closed gate
+	// cannot write it, and an empty old column is never absorbed into one
+	// (credentials_absorb.go), so a latched peer would go on serving the
+	// password this was meant to remove.
+	if req.ClearIpmi {
+		if req.IpmiAddress != "" || req.IpmiUser != "" || req.IpmiPass != "" {
+			return nil, status.Error(codes.InvalidArgument,
+				"clear_ipmi cannot be combined with ipmi_address, ipmi_user or ipmi_pass")
+		}
+		strategy := h.FenceStrategy
+		if req.FenceStrategy != "" {
+			strategy = req.FenceStrategy
+		}
+		if strategy == "ipmi" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"host %q fences by ipmi; clearing its IPMI settings would fail every fence. "+
+					"Set another fence strategy in the same request", req.Name)
+		}
+		if !s.db.MayWriteCredentialTables() {
+			return nil, status.Error(codes.FailedPrecondition,
+				"IPMI settings cannot be cleared until credentials_split_v1 has latched on this node "+
+					"(a peer's credential row would keep the password); retry once the upgrade completes")
+		}
+	}
+
 	// Validate role if provided (side-effecting: refuse witness promotion with VMs).
 	if req.Role != "" {
 		switch req.Role {
@@ -938,7 +968,15 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	}
 	args := make([]interface{}, 0, len(fields)+2)
 	provided := 0
-	for _, f := range fields {
+	for i, f := range fields {
+		// A clear binds '' to the three IPMI columns, which COALESCE keeps:
+		// the statement's shape is unchanged, and every reader treats an
+		// empty value as "not configured".
+		if req.ClearIpmi && i >= 1 && i <= 3 {
+			args = append(args, "")
+			provided++
+			continue
+		}
 		if f == "" {
 			args = append(args, nil)
 			continue
@@ -986,7 +1024,10 @@ func (s *Server) ConfigureHost(ctx context.Context, req *pb.ConfigureHostRequest
 	// the latch no node may write the credential table (a previous-release
 	// peer cannot decode it), so the password goes to hosts.ipmi_pass alone.
 	// err is reused from the host lookup above.
-	if req.IpmiPass != "" && s.db.MayWriteCredentialTables() {
+	// A clear writes an empty password to the credential row the same way
+	// (checked above that the gate is open): a live row with no secret, which
+	// readers serve as "none".
+	if (req.IpmiPass != "" || req.ClearIpmi) && s.db.MayWriteCredentialTables() {
 		err = s.db.ExecuteBatch(ctx, []corrosion.Statement{
 			{SQL: configureHostSQL, Params: args},
 			{SQL: corrosion.HostFenceCredentialUpsertSQL, Params: []interface{}{req.Name, req.IpmiPass, now}},
@@ -1082,7 +1123,24 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 	if req.Name == "" || req.Address == "" || req.CertSerial == "" {
 		return nil, status.Error(codes.InvalidArgument, "name, address, and certificate serial are required")
 	}
-	err := corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
+	// A name whose removed machine still has workloads recorded on it is not
+	// given to a new machine: those rows are the old machine's, recovered by
+	// the claim path only while the name stays removed, and the new machine
+	// would take them over (corrosion.WorkloadsOnRemovedHost).
+	left, err := corrosion.WorkloadsOnRemovedHost(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read the workloads recorded on %s: %v", req.Name, err)
+	}
+	if len(left) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"host %q was removed with %d workload(s) still recorded on it (%s). They belong to the machine "+
+				"removed under that name, and a new machine admitted under it would take them over. The "+
+				"failover coordinator recovers them onto live hosts once the removal and the CRL have "+
+				"replicated (`lv health` shows ha.claim.stranded for any it cannot); wait for them to move, "+
+				"or remove them (`lv rm <vm>`, `lv ct rm <name>`), then add the host again",
+			req.Name, len(left), strings.Join(left, ", "))
+	}
+	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
 		Name:       req.Name,
 		Address:    req.Address,
 		SSHUser:    "root",
@@ -1139,6 +1197,10 @@ func hostStateToPB(s string) pb.HostState {
 		return pb.HostState_HOST_SUSPECT
 	case "offline", "fenced":
 		return pb.HostState_HOST_OFFLINE
+	case corrosion.HostStateJoining:
+		// Admitted by `lv host add`, its daemon not yet started. Not OFFLINE:
+		// nothing has failed, and the coordinator never fences it.
+		return pb.HostState_HOST_JOINING
 	default:
 		return pb.HostState_HOST_OFFLINE
 	}

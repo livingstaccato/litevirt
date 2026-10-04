@@ -51,6 +51,13 @@ func oldIncarnation(t *testing.T, c *Client) {
 	if err := DeleteHost(ctx, c, "host-x"); err != nil {
 		t.Fatalf("DeleteHost: %v", err)
 	}
+	// The lab's host was removed by a release whose DeleteHost left the
+	// credential row live (host_delete_credential_test.go covers today's).
+	// A re-admission must retire such a row itself.
+	if _, err := c.DB().Exec(`UPDATE host_fence_credentials SET ipmi_pass = 'Ipmi-Probe-0928',
+		deleted_at = NULL, updated_at = ? WHERE host_name = 'host-x'`, ts); err != nil {
+		t.Fatalf("restore the live credential row: %v", err)
+	}
 }
 
 // hostSettings is every per-host setting column of host-x, as stored.

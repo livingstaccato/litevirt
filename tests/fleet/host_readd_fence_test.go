@@ -50,21 +50,36 @@ func observedFailures(n *Node, target string) (int, time.Time, bool) {
 // TestFleet_ReaddedHostIsNotFencedWhileItJoins: observers a, b and o watch d
 // die long enough to build a failure count past the fence threshold. d is
 // confirmed off and removed for good, then admitted again under its name with
-// a fresh certificate, as `lv host add` does, and its daemon never starts. The
-// coordinator must not fence it while it joins, and every observer's first
-// verdict on the new machine must start from a clean count. Once the daemon's
-// boot write records it 'active', a host that still does not answer is fenced
-// as usual.
+// a fresh certificate, as `lv host add` does, and its daemon does not start
+// for twice the time a fence takes to build. The coordinator must not fence it
+// while it joins, and no observer counts a failure against it meanwhile: a
+// joining host is not probed. Once the daemon's boot write records it
+// 'active', a host that still does not answer is fenced as usual, but only
+// after the observers have counted it down afresh, from zero.
 //
-// Mutations: (1) do not prune a removed host from the checker's peers — the
-// first verdict carries the old count; (2) skip the 'joining' check in the
-// coordinator, or (3) admit the host 'active' — d is fenced while it joins.
+// On the kvm003 lab (drill 6, main-b3368d7c) node-4 was SSH-fenced 2 s after
+// `lv host add` returned: the observers had counted it down all through its
+// setup, the coordinator skipped it only while it was joining, and the count
+// was past the threshold the moment its boot write made it 'active'.
+//
+// Mutations: (1) probe a joining host again — the first verdict after the
+// boot write carries the count from the join and d is fenced at once; (2) skip
+// the 'joining' check in the coordinator together with (1), or (3) admit the
+// host 'active' — d is fenced while it joins; (4) let a fence row from before
+// d last turned active count (fenceRowCutoff) — the old machine's
+// confirmation, a minute old, has the new one skipped as recently fenced.
 func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	c := New(t, Options{Nodes: 4, IndependentReplicas: true, FaultSeed: 3301})
 	a, b, o, d := c.Nodes[0], c.Nodes[1], c.Nodes[2], c.Nodes[3]
 	observers := []*Node{a, b, o}
+	c.WaitConverged(t, convergeTimeout)
+	// host_membership_split_v1 is mandatory and latched on any current
+	// cluster, the lab included: every node reads host_membership.
+	for _, n := range c.Nodes {
+		splitMembership(t, n)
+	}
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range observers {
 		go health.NewChecker(n.Name, n.PKIDir, n.DB).Start(ctx)
@@ -83,14 +98,16 @@ func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 		return true
 	})
 
-	// Confirmed off and removed for good. The confirmation is the drill's,
-	// twelve minutes before the add: one under five minutes old would, quite
-	// separately, have the coordinator skip the new machine as recently
-	// fenced. Written in fence-confirm's statement shape, so it replicates.
+	// Confirmed off and removed for good. The confirmation is a minute old
+	// when the machine is added again, well inside the five-minute window in
+	// which the coordinator skips a host as recently fenced: it is the OLD
+	// machine's, and must not hold back a fence of the new one once it is
+	// active (failover.fenceRowCutoff). Written in fence-confirm's statement
+	// shape, so it replicates.
 	if err := a.DB.Execute(ctx,
 		`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
 		"confirm-"+d.Name, d.Name, "manual", "manual-confirmed",
-		time.Now().Add(-12*time.Minute).UTC().Format(time.RFC3339), "operator confirmation"); err != nil {
+		time.Now().Add(-time.Minute).UTC().Format(time.RFC3339), "operator confirmation"); err != nil {
 		t.Fatalf("fence-confirm %s: %v", d.Name, err)
 	}
 	if err := corrosion.UpdateHostState(ctx, a.DB, d.Name, "fenced"); err != nil {
@@ -151,35 +168,16 @@ func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 		t.Fatalf("admit %s again: %v", d.Name, err)
 	}
 
-	// Each observer's first verdict on the new machine starts from a clean
-	// count. Watched on the observer's own replica, where it is written.
-	first := map[string]int{}
+	// It joins for twice the time a fence takes to build, and no observer
+	// counts a failure against it meanwhile: there is nothing to probe yet,
+	// and a count built now would be past the threshold the moment its boot
+	// write made it 'active'.
 	joinedFor := 2 * health.FailuresToFence * health.ProbeInterval
 	for deadline := admitted.Add(joinedFor); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
 		for _, n := range observers {
-			if _, seen := first[n.Name]; seen {
-				continue
+			if f, at, ok := observedFailures(n, d.Name); ok && at.After(admitted) && f > 0 {
+				t.Fatalf("%s counted %d failure(s) against %s while it was joining", n.Name, f, d.Name)
 			}
-			if f, at, ok := observedFailures(n, d.Name); ok && at.After(admitted) {
-				first[n.Name] = f
-			}
-		}
-	}
-	for _, n := range observers {
-		f, seen := first[n.Name]
-		if !seen {
-			t.Fatalf("%s published no verdict on the re-added %s in %s", n.Name, d.Name, joinedFor)
-		}
-		if f >= health.FailuresToFence {
-			t.Errorf("%s's first verdict on the re-added %s carried %d failures: the count from before the removal (>= %d)",
-				n.Name, d.Name, f, before)
-		}
-	}
-	// The observers have all called it down by now: what held the fence back
-	// is that it is joining, not that nobody had counted.
-	for _, n := range observers {
-		if f, _, _ := observedFailures(n, d.Name); f < health.FailuresToFence {
-			t.Fatalf("fixture: %s counts only %d failures of the joining %s after %s", n.Name, f, d.Name, joinedFor)
 		}
 	}
 	if n := fences(); n != 0 {
@@ -187,11 +185,23 @@ func TestFleet_ReaddedHostIsNotFencedWhileItJoins(t *testing.T) {
 	}
 
 	// The daemon's boot write, which records it 'active'. It still does not
-	// answer, so it is now a failed host like any other.
+	// answer, so it is now a failed host like any other: fenced, but only once
+	// the observers have counted it down from zero. A probe cycle can begin
+	// at any moment after the boot write, so FailuresToFence failures span at
+	// least FailuresToFence-1 intervals.
+	booted := time.Now()
 	if err := corrosion.UpdateHostStartup(ctx, a.DB, d.Name, "active", "", 0, 0, 0, false); err != nil {
 		t.Fatalf("boot write: %v", err)
 	}
 	eventually(t, convergeTimeout, "the coordinator to fence the booted host that does not answer", func() bool {
 		return fences() > 0
 	})
+	mu.Lock()
+	first := fencedAt[0]
+	mu.Unlock()
+	if grace := time.Duration(health.FailuresToFence-1) * health.ProbeInterval; first.Sub(booted) < grace {
+		t.Fatalf("%s was fenced %s after its boot write made it active, inside the %s its observers need "+
+			"to count it down afresh: the count built while it joined carried over", d.Name,
+			first.Sub(booted).Round(time.Millisecond), grace)
+	}
 }

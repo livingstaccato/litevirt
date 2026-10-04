@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/litevirt/litevirt/internal/health"
 )
 
@@ -87,11 +89,13 @@ type d6 struct {
 	// cleared: no workload is recorded on a lost host any more.
 	cleared bool
 	// stacks holds the exported compose YAML of each stack a removed lab VM
-	// belonged to, and goneCts the lab containers removed, both put back by
-	// putBack once their hosts have joined.
-	stacks      map[string]string
-	goneCts     map[string]ctInfo
-	putBackDone bool
+	// belonged to, goneVMs each removed lab VM's recorded host, and goneCts
+	// the lab containers removed, all put back by putBack once their hosts
+	// have joined. putBack drops each entry once it is back, so a cleanup
+	// resuming after a partial put-back does not create anything twice.
+	stacks  map[string]string
+	goneVMs map[string]string
+	goneCts map[string]ctInfo
 }
 
 func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
@@ -109,7 +113,7 @@ func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
 	}
 	d := &d6{l: l, via: q, survivors: survivors, lost: lost, removed: map[string]bool{},
 		rebuilt: map[string]bool{}, added: map[string]bool{}, lxc: map[string]bool{}, cts: map[string]ctInfo{},
-		stacks: map[string]string{}, goneCts: map[string]ctInfo{}}
+		stacks: map[string]string{}, goneVMs: map[string]string{}, goneCts: map[string]ctInfo{}}
 	for _, h := range lost {
 		d.lxc[h] = b.lxcHosts[h]
 	}
@@ -552,6 +556,7 @@ func (d *d6) clearRemoved() bool {
 					d.stacks[stack] = y
 					l.saveEvidence("stack-"+stack+".yaml", y)
 				}
+				d.goneVMs[name] = h
 			}
 			if out, err := l.lv(d.via, "rm", name); err != nil {
 				l.t.Errorf("R4: %s is recorded on removed %s and `lv rm %s` fails, so %s cannot be added back: %v\n%s", k, h, name, h, err, out)
@@ -589,13 +594,22 @@ func (d *d6) clearRemoved() bool {
 // is brought up again (compose creates only what is missing, which the plan
 // must say before it runs), and each container is re-created from its own
 // create spec on its own host.
+//
+// A removed VM goes back on the host it was recorded on, which is the rebuilt
+// machine under the same name. Its exported placement still names the host it
+// was first pinned to, and failover had moved it from there long before: the
+// survivors now hold what the coordinator recovered onto them, so that host
+// can be full ("no eligible host ... memory").
 func (d *d6) putBack() bool {
-	if d.putBackDone {
-		return true
-	}
 	l := d.l
 	ok := true
 	for stack, y := range d.stacks {
+		y, err := repinVMs(y, d.goneVMs)
+		if err != nil {
+			l.t.Errorf("restore stack %s: %v", stack, err)
+			ok = false
+			continue
+		}
 		file := "/tmp/e2e-d6-restore-" + stack + ".yaml"
 		l.mustSSH(d.via, 30*time.Second, "echo "+base64.StdEncoding.EncodeToString([]byte(y))+" | base64 -d > "+file)
 		plan, err := l.lv(d.via, "compose", "diff", "-f", file)
@@ -610,6 +624,7 @@ func (d *d6) putBack() bool {
 			continue
 		}
 		l.mark("drill6: stack %s brought back: %s", stack, strings.TrimSpace(strings.SplitN(plan, "\n", 2)[0]))
+		delete(d.stacks, stack)
 	}
 	for name, c := range d.goneCts {
 		var spec struct{ Distro, Release, Arch string }
@@ -632,9 +647,61 @@ func (d *d6) putBack() bool {
 			continue
 		}
 		l.mark("drill6: re-created container %s on %s", name, c.Host)
+		delete(d.goneCts, name)
 	}
-	d.putBackDone = ok
 	return ok
+}
+
+// repinVMs rewrites the placement host of each VM in hosts (name → host) in
+// the compose YAML y, keeping everything else as exported (a node tree, so key
+// order and quoting survive). A VM y does not name is left alone.
+func repinVMs(y string, hosts map[string]string) (string, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(y), &root); err != nil {
+		return "", fmt.Errorf("parse exported stack: %w", err)
+	}
+	if len(root.Content) == 0 {
+		return "", fmt.Errorf("exported stack is empty")
+	}
+	vms := mapValue(root.Content[0], "vms")
+	if vms == nil {
+		return "", fmt.Errorf("exported stack has no vms")
+	}
+	for name, h := range hosts {
+		vm := mapValue(vms, name)
+		if vm == nil || vm.Kind != yaml.MappingNode {
+			continue
+		}
+		pl := mapValue(vm, "placement")
+		if pl == nil {
+			pl = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+			vm.Content = append(vm.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "placement"}, pl)
+		}
+		if hn := mapValue(pl, "host"); hn != nil {
+			hn.Value = h
+		} else {
+			pl.Content = append(pl.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: "host"},
+				&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: h})
+		}
+	}
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// mapValue returns the value node under key in mapping node m, or nil.
+func mapValue(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
 }
 
 // leastLoaded returns the host among hosts with the least memory in use, per

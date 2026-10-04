@@ -55,9 +55,17 @@ func preflightCapabilityRollback(dataDir string) []string {
 	}
 	var unknown []string
 	for _, token := range latched {
-		if !known[token] {
-			unknown = append(unknown, token)
+		if known[token] {
+			continue
 		}
+		// A retired token's marker was written by an OLDER binary, so it is the
+		// opposite of rollback evidence. This build ignores the latch.
+		if capabilities.Retired(token) {
+			slog.Info("preflight: ignoring the activation marker of a retired capability token",
+				"token", token)
+			continue
+		}
+		unknown = append(unknown, token)
 	}
 	return unknown
 }

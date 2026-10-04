@@ -1,35 +1,34 @@
 package grpcapi
 
 import (
+	"context"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/capabilities"
 )
 
-// TestCanonicalRegistry_AdvertiseAndTokenEnabled: canonical_registry_v1 is advertised (and
-// tokenEnabled — the predicate driveCapabilityActivation uses to flip the durable latch) ONLY when
-// the node is config-enforcing. Latching accepts replicated canonical writes (mutating shared
-// state), so it must require CONFIG uniformity: a not-yet-opted-in node withholds advertisement and
-// stops the latch.
-func TestCanonicalRegistry_AdvertiseAndTokenEnabled(t *testing.T) {
-	off := testServer(t) // enfCanonicalRegistry defaults false
-	if hasCap(off.advertisedCapabilities(), capabilities.CanonicalRegistryV1) {
-		t.Fatal("canonical_registry_v1 must NOT be advertised when config-off")
+// TestCanonicalRegistry_RetiredIsNeverAdvertisedOrDriven: canonical_registry_v1 is retired. With
+// every kill switch on, this build neither advertises it (so no cluster can latch it again) nor
+// treats it as enabled (so it is never reported as not-enforcing or degraded), and a node that
+// still holds its latch in memory does not drive it: there is nothing left to enforce.
+func TestCanonicalRegistry_RetiredIsNeverAdvertisedOrDriven(t *testing.T) {
+	const tok = capabilities.RetiredCanonicalRegistryV1
+
+	s := testServer(t)
+	enforceEveryToken(s)
+	if hasCap(s.advertisedCapabilities(), tok) {
+		t.Errorf("%s is advertised; a cluster could latch the retired token again", tok)
 	}
-	if off.tokenEnabled(capabilities.CanonicalRegistryV1) {
-		t.Fatal("tokenEnabled(canonical_registry_v1) must be false when config-off (latch not driven)")
+	if s.tokenEnabled(tok) {
+		t.Errorf("tokenEnabled(%s) = true; a retired token has no flag to be on", tok)
 	}
 
-	on := testServer(t)
-	on.SetCanonicalRegistryEnforce(true)
-	if !hasCap(on.advertisedCapabilities(), capabilities.CanonicalRegistryV1) {
-		t.Fatal("canonical_registry_v1 must be advertised when config-on")
+	g := &recordingGate{latched: map[string]bool{tok: true}}
+	d := &Server{gate: g}
+	for i := 0; i < 3; i++ {
+		d.driveCapabilityActivation(context.Background())
 	}
-	if !on.tokenEnabled(capabilities.CanonicalRegistryV1) {
-		t.Fatal("tokenEnabled(canonical_registry_v1) must be true when config-on (drives the latch)")
-	}
-
-	if !hasCap(capabilities.Supported(), capabilities.CanonicalRegistryV1) {
-		t.Fatal("advertisedCapabilities filtering corrupted the shared Supported() slice")
+	if g.drivenUnique()[tok] {
+		t.Errorf("the retired %s was driven; nothing on this build enforces it", tok)
 	}
 }

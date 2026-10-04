@@ -32,7 +32,6 @@ func TestTokenEnabledCoversEverySupportedToken(t *testing.T) {
 	s.enfOperationProtocol = true
 	s.enfLiveResize = true
 	s.enfCanonicalIdentity = true
-	s.enfCanonicalRegistry = true
 	s.enfProjectAuthority = true
 	s.enfAuditSignature = true
 	s.enfOwnerEpoch = true

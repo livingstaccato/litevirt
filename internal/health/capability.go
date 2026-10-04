@@ -187,8 +187,8 @@ func (c *Checker) Latched(token string) bool {
 
 // DurablyLatched is the STRONGER form of Latched: the latch is active in memory AND has been
 // persisted to its durable marker. A contract whose enforcement must survive a restart — accepting a
-// canonical registry-credential wire shape, where a node that latched only in memory would, after a
-// reboot that reloads no marker, revert to REJECTING an already-in-flight canonical entry and stall
+// guarded VM-name replacement (vm_replace_v1), where a node that latched only in memory would, after
+// a reboot that reloads no marker, revert to REJECTING an already-in-flight replace batch and stall
 // replication — must gate on this, not Latched. An unset marker base is NEVER durable (nothing can
 // persist), even if the in-memory latch is set. The marker write is retried by Enforced/the HA
 // driver until it sticks, so a transient disk error resolves to durable without operator action.

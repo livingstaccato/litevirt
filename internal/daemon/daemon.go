@@ -548,15 +548,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.db.SetCanonicalIdentity(func() bool {
 		return d.cfg.Enforcement.CanonicalIdentity && d.checker.Latched(capabilities.CanonicalIdentityV1)
 	})
-	// Part H2 (preparatory infrastructure): accept a replicated canonical registry upsert once
-	// canonical_registry_v1 is DURABLY LATCHED (in memory AND persisted to its marker). Gating on the
-	// DURABLE latch — not Latched or the config flag — is what makes acceptance survive a restart: a
-	// node that latched only in memory would, after a reboot that reloads no marker, revert to
-	// rejecting an already-in-flight canonical entry and stall replication. The flag only gates
-	// ADVERTISEMENT (opt-in to drive the latch); no writer switch, no consolidation controller.
-	d.db.SetCanonicalRegistryAccept(func() bool {
-		return d.checker.DurablyLatched(capabilities.CanonicalRegistryV1)
-	})
 
 	d.wireLeaseTermLedgerGate()
 	d.wireLeaseMintClearance()
@@ -566,9 +557,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.wireRecoveryClaimGate()
 
 	// Apply a replicated guarded VM-name replacement once vm_replace_v1 is DURABLY
-	// LATCHED. Durable, not Latched or the config flag, for the same reason as
-	// canonical_registry above: a replace batch already on the wire must not become
-	// unacceptable across a restart, or it stalls that sender's stream forever.
+	// LATCHED. Durable, not Latched or the config flag: a replace batch already on
+	// the wire must not become unacceptable across a restart — a node that latched
+	// only in memory would reload no marker and refuse it — or it stalls that
+	// sender's stream forever.
 	d.db.SetVMReplaceAccept(func() bool {
 		return d.checker.DurablyLatched(capabilities.VMReplaceV1)
 	})
@@ -919,7 +911,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// overrides live on the host record and win where set.
 	svc.SetCapacityPolicy(capacity)
 	svc.SetCanonicalIdentityEnforce(d.cfg.Enforcement.CanonicalIdentity) // drives the latch + conditional advertisement
-	svc.SetCanonicalRegistryEnforce(d.cfg.Enforcement.CanonicalRegistry) // Part H2 phase 1: conditional advertisement of canonical_registry_v1
 	svc.SetVMReplaceEnforce(d.cfg.Enforcement.VMReplace)                 // drives the latch + conditional advertisement; gates `lv cutover`
 	// Finish any cutover cleanup a previous process left committed-but-unfinished.
 	// The replacement transition displaced the rows describing what the replaced VM

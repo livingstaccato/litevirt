@@ -212,13 +212,13 @@ var explicitPolicyDefs = []explicitPolicyDef{
 	{SQL: `UPDATE sessions SET last_used_at = ? WHERE id = ? AND revoked_at IS NULL`, Disposition: DispFullPKUpdateNoClock, MonotoneColumn: "last_used_at"},
 	// token touch: last_used_at must only advance.
 	{SQL: `UPDATE tokens SET last_used_at = ? WHERE id = ?`, Disposition: DispFullPKUpdateNoClock, MonotoneColumn: "last_used_at"},
-	// Canonical registry-credential upsert (Part H2): REJECT until canonical_registry_v1 is active
-	// on this receiver (so a prematurely-enabled peer can't inject canonical rows while legacy
-	// writers still run), then apply through DispCanonicalRegistry, which verifies the
-	// deterministic-ID contract before the LWW upsert. (The legacy mint-new-id INSERT is NOT
-	// capability-gated — it auto-derives to DispPlainInsert and stays accepted; rejecting it is part
-	// of the deferred operator-run writer-activation contract, not this reversible core.)
-	{SQL: registryCanonicalUpsertSQL, Disposition: DispReject, RequiresCapability: capCanonicalRegistryV1, DispositionAfter: DispCanonicalRegistry},
+	// Canonical registry-credential upsert of the RETIRED design: always REJECT. It used to turn
+	// acceptable once canonical_registry_v1 latched; that token is retired and no writer emits the
+	// shape, so it carries no capability and no node on this build applies it — whatever marker
+	// the node holds. The planned writer ships under a new token and decides its own shape
+	// (docs/design/canonical-registry-credentials.md). The legacy mint-new-id INSERT is not gated:
+	// it auto-derives to DispPlainInsert and stays accepted.
+	{SQL: registryCanonicalUpsertSQL, Disposition: DispReject},
 	// Guarded VM-name replacement (`lv cutover`): REJECT until vm_replace_v1 is
 	// active on this receiver, then apply verbatim under the shared
 	// workload_replace_v1 guard. Rejecting before activation is what makes the

@@ -374,5 +374,25 @@ func HistoricalShapes() []HistoricalShape {
 		})
 	}
 
+	// The two replicated shapes of the retired canonical registry-credential design
+	// (canonical_registry_v1): the canonical upsert, and consolidation's full-content-CAS
+	// tombstone of one legacy row. Both builders shipped in v1.4.0 and were removed on 2026-10-04
+	// with the token. Neither ever had a production caller, so no released peer has emitted
+	// them; they stay recognised so the retirement is not also a ledger removal. Each keeps the
+	// disposition its policy gives it: the upsert is plain DispReject (stmtledger_derive.go), so
+	// a receiver refuses it; the tombstone derives to an ordinary LWW-gated full-PK update.
+	for _, sql := range []string{
+		registryCanonicalUpsertSQL,
+		`UPDATE registry_credentials SET deleted_at = ?, updated_at = ? WHERE id = ? AND scope = ? AND owner = ? AND registry = ? AND username = ? AND secret = ? AND created_at = ? AND updated_at = ? AND deleted_at IS NULL`,
+	} {
+		out = append(out, HistoricalShape{
+			SQL:          sql,
+			Family:       "canonical_registry_v1_retired",
+			FirstEmitter: "v1.4.0 (builder present, never called)",
+			LastEmitter:  "v1.9.0 (builder present, never called)",
+			Removal:      "any time: no build emits it (the removal still needs ALLOW_LEDGER_REMOVAL)",
+		})
+	}
+
 	return out
 }

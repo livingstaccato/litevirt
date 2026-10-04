@@ -4,7 +4,7 @@
 // and hardware_v2 use, and the difference is easy to get backwards. Its
 // advertisement is build-STATIC: advertisedCapabilities withholds a specific
 // list (operation_protocol_v1 and its dependent capacity_admission_v1,
-// isolation_epoch_v1, canonical_identity_v1, canonical_registry_v1,
+// isolation_epoch_v1, canonical_identity_v1,
 // project_authority_v1, audit_signature_v1, hardware_v2, owner_epoch_v1 — read
 // the function, not this comment, for the current set), and live_resize_v1 is
 // not on it, so it latches as soon as every voting-eligible member is running a

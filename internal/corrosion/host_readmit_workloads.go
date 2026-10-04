@@ -38,3 +38,23 @@ func WorkloadsOnRemovedHost(ctx context.Context, c *Client, host string) ([]stri
 	sort.Strings(out)
 	return out, nil
 }
+
+// HostRemoved reports whether host has been removed from the cluster: this
+// replica holds its removed hosts row and no live one. A name it has no row
+// for at all is not removed, only unknown (a host whose row has not arrived
+// yet reads the same).
+func HostRemoved(ctx context.Context, c *Client, host string) (bool, error) {
+	rows, err := c.Query(ctx, `SELECT COALESCE(deleted_at, '') AS deleted_at FROM hosts WHERE name = ?`, host)
+	if err != nil {
+		return false, err
+	}
+	if len(rows) == 0 {
+		return false, nil
+	}
+	for _, r := range rows {
+		if r.String("deleted_at") == "" {
+			return false, nil
+		}
+	}
+	return true, nil
+}

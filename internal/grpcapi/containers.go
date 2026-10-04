@@ -462,6 +462,13 @@ func (s *Server) DeleteContainer(ctx context.Context, req *pb.DeleteContainerReq
 		}
 		targetHost = h
 	}
+	// A removed host is not dialled: its rows are deleted here
+	// (removed_host_delete.go).
+	if removed, err := s.workloadHostRemoved(ctx, targetHost); err != nil {
+		return nil, err
+	} else if removed {
+		return s.deleteContainerOnRemovedHost(ctx, targetHost, req.Name, project)
+	}
 	if forwarded, err := s.forwardSimpleCT(ctx, targetHost, func(c pb.LiteVirtClient) (*emptypb.Empty, error) {
 		return c.DeleteContainer(ctx, &pb.DeleteContainerRequest{Name: req.Name, HostName: targetHost})
 	}); err != nil || forwarded != nil {

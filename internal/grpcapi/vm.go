@@ -1837,6 +1837,13 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	}
 
 	if !localOnly && vm.HostName != s.hostName {
+		// A removed host is not dialled: its rows are deleted here
+		// (removed_host_delete.go).
+		if removed, err := s.workloadHostRemoved(ctx, vm.HostName); err != nil {
+			return nil, err
+		} else if removed {
+			return s.deleteVMOnRemovedHost(ctx, vm)
+		}
 		releaseLock() // never hold a process lock across a peer RPC
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err != nil {

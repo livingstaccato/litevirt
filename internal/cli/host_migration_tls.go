@@ -252,8 +252,12 @@ func (h *sshMigrationTLSHost) Push(ctx context.Context, files []migrationFile) e
 }
 
 // MigrationRotationInProgress reports whether pkiDir holds an unfinished
-// `lv host rotate-migration-ca`. // ci:skip-cmd: rotate-migration-ca ships in a later task
-func MigrationRotationInProgress(pkiDir string) bool { return false }
+// `lv host rotate-migration-ca`. An unreadable state file counts as in // ci:skip-cmd: rotate-migration-ca ships in a later task
+// progress: guessing "no" would let a reissue mint from the wrong CA.
+func MigrationRotationInProgress(pkiDir string) bool {
+	r, err := loadMigrationRotation(pkiDir)
+	return err != nil || r.inProgress()
+}
 
 // SSHMigrationTLSHosts connects to every host in the cluster as sshUser.
 func SSHMigrationTLSHosts(ctx context.Context, c pb.LiteVirtClient, sshUser string) ([]MigrationTLSHost, func(), error) {

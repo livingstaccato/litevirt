@@ -21,7 +21,7 @@
 vms:
   prod-db:
     placement:
-      mode: ha-critical              # spread-strict + on-demand rebalance
+      mode: ha-critical              # spread-strict + dry-run rebalance
 
   batch-job-1:
     placement:
@@ -115,8 +115,12 @@ The day-2 loop runs every 60 s on the leader-only coordinator (gated by the `lea
 |---|---|
 | `off` | No proposals emitted. |
 | `dry-run` (recommended default) | Proposals written to `rebalance_proposals` table; never applied automatically. Operator reviews via `lv rebalance list` and may `approve` one to execute it. |
-| `on-demand` | Proposals written; require explicit `lv rebalance approve <id>` before the executor applies them. |
 | `auto` | Proposals written and immediately approved (subject to budget); the executor applies them automatically. |
+
+There was an `on-demand` mode; it behaved exactly like `dry-run` and was
+removed. Compose rejects it and names `dry-run` instead. A VM whose stored spec
+still carries it (written before the removal, or by an older node during a
+rolling upgrade) is treated as `dry-run`.
 
 Proposals score destinations with the **same hard-constraint pipeline as initial
 placement** — anti-affinity, required labels, max-per-node, device fit, witness
@@ -166,7 +170,7 @@ vms:
 
       # ── Day-2 reconciliation ──
       rebalance:
-        mode: dry-run              # off | dry-run | on-demand | auto
+        mode: dry-run              # off | dry-run | auto
         threshold: 15              # min % score gain to propose a move
         cooldown: 5m               # min interval per VM
         budget:
@@ -194,7 +198,7 @@ vms:
 placement:
   mode: performance       # balance + dry-run
   mode: savings           # bin-pack + auto + generous budget + off-hours window
-  mode: ha-critical       # spread-strict + on-demand
+  mode: ha-critical       # spread-strict + dry-run
   mode: spot-cheap        # cost-aware + auto + tight budget
 ```
 
@@ -320,7 +324,7 @@ vms:
 ```
 
 Three replicas always on three different hosts; if a host goes offline, the
-rebalancer (`on-demand`) proposes a move that operators approve.
+rebalancer (`dry-run`) proposes a move that operators approve.
 
 ### Mixed batch + prod cluster
 
@@ -329,7 +333,7 @@ vms:
   batch-render-1:
     placement: { policy: bin-pack, rebalance: { mode: off } }
   prod-api-1:
-    placement: { policy: spread-strict, rebalance: { mode: on-demand } }
+    placement: { policy: spread-strict, rebalance: { mode: dry-run } }
 ```
 
 The same cluster runs both. The rebalancer evaluates each VM under *its own*

@@ -189,7 +189,7 @@ message PlacementSpec {
 
 // RebalanceSpec: day-2 reconciliation policy. See docs/placement.md.
 message RebalanceSpec {
-    string         mode      = 1;     // off | dry-run | on-demand | auto
+    string         mode      = 1;     // off | dry-run | auto
     int32          threshold = 2;     // min imbalance % to trigger a proposal (default 15)
     string         cooldown  = 3;     // "5m" — min interval per VM
     RebalanceBudget budget   = 4;

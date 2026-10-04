@@ -521,6 +521,14 @@ func (v *validator) validate(f *File) {
 			v.ps.add(joinPath(p+".healthcheck", hp.field), hp.msg, hp.hint)
 		}
 
+		// Rebalance mode: the rebalancer treats any unrecognized string as
+		// propose-only, so a typo would silently do the wrong thing.
+		if vm.Placement != nil && vm.Placement.Rebalance != nil {
+			if msg := rebalanceModeProblem(vm.Placement.Rebalance.Mode); msg != "" {
+				v.ps.add(p+".placement.rebalance.mode", msg, "")
+			}
+		}
+
 		// Replicas validation
 		if vm.Replicas != nil && *vm.Replicas < 0 {
 			v.ps.add(p+".replicas", "replicas must be >= 0", "")

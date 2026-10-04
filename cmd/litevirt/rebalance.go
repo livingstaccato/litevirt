@@ -92,7 +92,7 @@ func newRebalanceRunCmd() *cobra.Command {
 		Short: "Trigger a single rebalance evaluation cycle now",
 		Long: `Forces an immediate rebalance evaluation. Without --dry-run, the
 engine still respects each VM's resolved rebalance.mode (so VMs with mode=off
-or mode=on-demand are still skipped). With --dry-run, all proposals are
+are still skipped). With --dry-run, all proposals are
 recorded as pending regardless of mode.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(context.Background(), func(ctx context.Context, c pb.LiteVirtClient) error {

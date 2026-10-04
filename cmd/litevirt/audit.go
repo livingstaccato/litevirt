@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	"github.com/spf13/cobra"
@@ -144,7 +145,11 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 		}
 
 		fmt.Fprintf(w, "\nPART OF THIS LOG COULD NOT BE VERIFIED\n")
+		reportAmbiguousRows(w, resp)
 		if len(resp.NeverAdopted) == 0 {
+			if len(resp.AmbiguousRows) > 0 {
+				return fmt.Errorf("audit chain verification incomplete: rows whose hash does not determine their content")
+			}
 			fmt.Fprintln(w, "\nthe daemon reported an unverified audit condition; inspect its logs and health findings")
 			return fmt.Errorf("audit chain verification incomplete")
 		}
@@ -201,7 +206,25 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 			fmt.Fprintf(w, "  could not be verified either way (any peer can publish this row): %s\n", h)
 		}
 	}
+	reportAmbiguousRows(w, resp)
 	return fmt.Errorf("audit chain verification failed: the log shows evidence of tampering")
+}
+
+// reportAmbiguousRows lists rows with a NUL byte in a hashed field. The content
+// hash is collision-free only over NUL-free rows, so for these the hash and the
+// signature say nothing about WHICH content was written. Not tampering — an
+// older build wrote such rows verbatim — and not clean either.
+func reportAmbiguousRows(w io.Writer, resp *pb.VerifyAuditChainResponse) {
+	if len(resp.AmbiguousRows) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\nrows whose hash does not determine their content (a NUL byte in a field):\n")
+	for _, r := range resp.AmbiguousRows {
+		fmt.Fprintf(w, "  %s\n", strings.ReplaceAll(r, "\x00", "␀"))
+	}
+	fmt.Fprintf(w, "\nA current daemon never writes such a row; it came from an older build or a\n"+
+		"direct write to the table. Its signature would verify a different row equally\n"+
+		"well, so treat its content as unconfirmed.\n")
 }
 
 func newAuditExportCmd() *cobra.Command {

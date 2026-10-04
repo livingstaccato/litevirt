@@ -163,6 +163,13 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	}
 	r.PrevHash = tail.hash
 	r.Seq = tail.seq + 1
+	// After every hashed input is final, prev_hash included, and before the
+	// hash: this is the one place every audit row passes through
+	// (TestAuditWriters_EveryCallSiteIsCovered holds it so).
+	if err := guardAuditNUL(&r); err != nil {
+		slog.Error("audit row refused", "action", r.Action, "host", r.HostName, "error", err)
+		return err
+	}
 	r.ContentHash = HashAuditRow(r)
 
 	// Sign before writing, and fail the insert if signing itself errors.
@@ -215,6 +222,47 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	// host's timeline.
 	if generated && r.Timestamp > tail.ts {
 		tail.ts = r.Timestamp
+	}
+	return nil
+}
+
+// auditNULReplacement stands in for a NUL byte in a free-text audit field. It is
+// U+2400 SYMBOL FOR NULL: visible in `lv audit ls`, and not a byte the encoding
+// treats as a separator.
+const auditNULReplacement = "␀"
+
+// guardAuditNUL keeps every row InsertAuditLog writes inside the domain on
+// which the content hash is injective (no NUL in any hashed field; see
+// auditCanonical). It decides per field whether to escape or refuse.
+//
+// username, target and detail are ESCAPED. They carry text that callers take
+// from requests — a login writes the submitted username into target and
+// username verbatim, before anything has authenticated it — so a NUL there is
+// attacker-chosen. Refusing would hand that attacker an unaudited action:
+// every caller discards InsertAuditLog's error, so a refused row is a silent
+// gap, and a failed login that leaves no trace is worse than one recorded with
+// a visible stand-in. The escape is lossy (a literal U+2400 in the input reads
+// the same), which costs nothing here: the log records what was attempted, and
+// the hash only needs the STORED value to be NUL-free.
+//
+// id, timestamp, host_name, action and result are REFUSED. The daemon sets
+// them; none is free text from a request. Each is also load-bearing as an
+// exact value — id is the primary key every replica dedups on, host_name keys
+// the sub-chain, a timestamp is parsed and ordered, action and result are
+// matched by equality — so rewriting one would silently change what the row
+// means. A NUL in one is a bug, and the row is refused loudly.
+//
+// prev_hash is refused for the same reason: it is this host's own previous
+// content hash, hex by construction, and a NUL there means the table under
+// this node was edited.
+func guardAuditNUL(r *AuditRecord) error {
+	for _, f := range []*string{&r.Username, &r.Target, &r.Detail} {
+		if strings.IndexByte(*f, 0) >= 0 {
+			*f = strings.ReplaceAll(*f, "\x00", auditNULReplacement)
+		}
+	}
+	if f := auditRecordNULField(*r); f != "" {
+		return fmt.Errorf("audit row %q: field %s contains a NUL byte, which would make its content hash ambiguous", r.ID, f)
 	}
 	return nil
 }
@@ -334,31 +382,75 @@ func HostHasSignedAuditRows(ctx context.Context, c *Client, hostName string) (bo
 	return len(rows) > 0, nil
 }
 
+// auditFieldNames are the row fields HashAuditRow covers, in hash order.
+var auditFieldNames = [...]string{
+	"id", "timestamp", "username", "host_name", "action", "target", "detail", "result",
+}
+
+// auditFieldValues returns r's hashed fields in auditFieldNames order.
+func auditFieldValues(r AuditRecord) [len(auditFieldNames)]string {
+	return [...]string{r.ID, r.Timestamp, r.Username, r.HostName, r.Action, r.Target, r.Detail, r.Result}
+}
+
+// auditCanonical is the v1 encoding HashAuditRow hashes:
+//
+//	prev_hash NUL ("id" NUL id NUL) ("timestamp" NUL timestamp NUL) ... ("result" NUL result NUL)
+//
+// It is injective ONLY over records with no NUL in any value, prev_hash
+// included. Under that condition the encoding holds exactly 17 NULs, so it
+// parses back one way only: prev_hash runs to the first NUL, and each following
+// pair is a field name — a fixed NUL-free constant, which the parse checks
+// rather than trusts — then a value running to the next NUL. An empty value is
+// two adjacent NULs and parses back as empty. Equal encodings therefore parse
+// to equal records.
+//
+// With a NUL inside a value the argument fails — the separators and field names
+// on their own do not stop a value from forging a field boundary. It fails
+// usefully, though: equal encodings have equal NUL counts, so any colliding pair
+// carries a NUL in a value on BOTH sides. Refusing or escaping NUL at the one
+// write path (InsertAuditLog) and flagging any NUL row on read
+// (VerifyAuditChain) closes collisions without changing a byte of the encoding
+// for any row that has none, so every hash and signature already written stays
+// valid and no peer on an older build disagrees about a hash.
+func auditCanonical(r AuditRecord) []byte {
+	b := make([]byte, 0, 256)
+	b = append(b, r.PrevHash...)
+	b = append(b, 0)
+	vals := auditFieldValues(r)
+	for i, k := range auditFieldNames {
+		b = append(b, k...)
+		b = append(b, 0)
+		b = append(b, vals[i]...)
+		b = append(b, 0)
+	}
+	return b
+}
+
+// auditRecordNULField names the first hashed input of r — prev_hash included —
+// that contains a NUL byte, or "" when none does. A record for which this is
+// non-empty lies outside the domain on which auditCanonical is injective.
+func auditRecordNULField(r AuditRecord) string {
+	if strings.IndexByte(r.PrevHash, 0) >= 0 {
+		return "prev_hash"
+	}
+	vals := auditFieldValues(r)
+	for i, k := range auditFieldNames {
+		if strings.IndexByte(vals[i], 0) >= 0 {
+			return k
+		}
+	}
+	return ""
+}
+
 // HashAuditRow returns the canonical SHA-256 of one audit row, mixed
 // with its prev_hash. Format-stable across versions — operators can
 // re-verify chains lifted from any future schema rev.
+//
+// It is collision-free only over rows with no NUL in any field; see
+// auditCanonical for why, and for where that is enforced.
 func HashAuditRow(r AuditRecord) string {
-	h := sha256.New()
-	h.Write([]byte(r.PrevHash))
-	h.Write([]byte{0})
-	// Use a NUL separator + field name so a field reorganisation
-	// (or an injected NUL byte in any field) can't forge a chain.
-	for _, kv := range []struct{ k, v string }{
-		{"id", r.ID},
-		{"timestamp", r.Timestamp},
-		{"username", r.Username},
-		{"host_name", r.HostName},
-		{"action", r.Action},
-		{"target", r.Target},
-		{"detail", r.Detail},
-		{"result", r.Result},
-	} {
-		h.Write([]byte(kv.k))
-		h.Write([]byte{0})
-		h.Write([]byte(kv.v))
-		h.Write([]byte{0})
-	}
-	return hex.EncodeToString(h.Sum(nil))
+	sum := sha256.Sum256(auditCanonical(r))
+	return hex.EncodeToString(sum[:])
 }
 
 // VerifyAuditChain validates every host's audit sub-chain independently
@@ -447,6 +539,18 @@ type AuditVerifyResult struct {
 	// signature verifies, the sequence numbers are untouched, and only the head
 	// — signed by the successor key they do not have — disagrees.
 	HeadMismatch []string
+	// Ambiguous lists rows with a NUL byte in a hashed field. The content hash
+	// is injective only over NUL-free rows (see auditCanonical), so such a row's
+	// hash — and the signature over it — does not pin down which content it
+	// covers: a different row with the same hash verifies just as well. A daemon
+	// that guards NUL at write time never produces one; it comes from an older
+	// build or from a direct write to the table.
+	//
+	// Not tamper evidence: the row may have been written verbatim by an older
+	// build, and the verifier cannot tell that from a substitution. It fails
+	// verification as Unverified instead, because the row's content is exactly
+	// what could not be verified.
+	Ambiguous []string
 }
 
 // Tampered reports whether anything found is evidence of deliberate
@@ -518,7 +622,7 @@ func (r AuditVerifyResult) Tampered() bool {
 // not simply made deletable — that would hand the same attacker a way to suppress
 // a GENUINE finding.
 func (r AuditVerifyResult) Unverified() bool {
-	return len(r.NeverAdopted) > 0
+	return len(r.NeverAdopted) > 0 || len(r.Ambiguous) > 0
 }
 
 // VerifyAuditChain walks every host's sub-chain and reports what it finds.
@@ -609,6 +713,15 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 		}
 		if expect := HashAuditRow(rec); !strings.EqualFold(expect, stored) && res.BrokenAt == "" {
 			res.BrokenAt = rec.ID
+		}
+		// A row with a NUL in a hashed field can share its hash — and so its
+		// signature — with a different row (auditCanonical). Checked whether or
+		// not the hash matched: a matching hash is exactly the case in which
+		// the content it covers is in doubt.
+		if f := auditRecordNULField(rec); f != "" {
+			res.Ambiguous = append(res.Ambiguous, fmt.Sprintf(
+				"%s: %s: field %s contains a NUL byte, so its hash and signature do not determine "+
+					"its content — a different row would verify the same", rec.ID, host, f))
 		}
 		hashedByHost[host] = true
 		prevByHost[host] = stored

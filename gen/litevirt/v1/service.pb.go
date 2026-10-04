@@ -24164,7 +24164,15 @@ type VerifyAuditChainResponse struct {
 	// straight back to reporting a host that cannot sign as a clean chain. A
 	// verdict field that means "not a pass" has to travel with the verdict field
 	// that means "not tampering".
-	Unverified    bool `protobuf:"varint,17,opt,name=unverified,proto3" json:"unverified,omitempty"`
+	Unverified bool `protobuf:"varint,17,opt,name=unverified,proto3" json:"unverified,omitempty"`
+	// 18 is left free: the fork's not_signing_hosts holds it, and numbering
+	// past it keeps the two from colliding on the wire when both land.
+	// Rows with a NUL byte in a hashed field, as "rowid: host: reason". The
+	// content hash is injective only over NUL-free rows, so such a row's hash
+	// and signature do not determine its content: a different row verifies
+	// the same. A current daemon never writes one. Feeds `unverified`, not
+	// `tampered` — an older build may have written the row verbatim.
+	AmbiguousRows []string `protobuf:"bytes,19,rep,name=ambiguous_rows,json=ambiguousRows,proto3" json:"ambiguous_rows,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24316,6 +24324,13 @@ func (x *VerifyAuditChainResponse) GetUnverified() bool {
 		return x.Unverified
 	}
 	return false
+}
+
+func (x *VerifyAuditChainResponse) GetAmbiguousRows() []string {
+	if x != nil {
+		return x.AmbiguousRows
+	}
+	return nil
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.
@@ -27845,7 +27860,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"targetPool\x12\x14\n" +
 	"\x05scope\x18\x03 \x01(\tR\x05scope\x12\x1b\n" +
 	"\tpool_name\x18\x04 \x01(\tR\bpoolName\x12!\n" +
-	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\x83\x05\n" +
+	"\fproject_name\x18\x05 \x01(\tR\vprojectName\"\xaa\x05\n" +
 	"\x18VerifyAuditChainResponse\x12!\n" +
 	"\frows_checked\x18\x01 \x01(\x05R\vrowsChecked\x12 \n" +
 	"\fbroken_at_id\x18\x02 \x01(\tR\n" +
@@ -27867,7 +27882,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\rnever_adopted\x18\x10 \x03(\tR\fneverAdopted\x12\x1e\n" +
 	"\n" +
 	"unverified\x18\x11 \x01(\bR\n" +
-	"unverified\"\x8b\x02\n" +
+	"unverified\x12%\n" +
+	"\x0eambiguous_rows\x18\x13 \x03(\tR\rambiguousRows\"\x8b\x02\n" +
 	"\x15RetireAuditKeyRequest\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x19\n" +
 	"\bcert_pem\x18\x02 \x01(\tR\acertPem\x12\x1c\n" +

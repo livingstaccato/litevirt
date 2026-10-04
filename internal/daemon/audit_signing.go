@@ -399,6 +399,9 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			// alerting on, but NOT a tamper finding: the certificate row it reads
 			// is unauthenticated, so any peer can manufacture one.
 			"never_adopted": len(res.NeverAdopted),
+			// Rows with a NUL in a hashed field: their hash does not determine
+			// their content. Unverified, not tampered.
+			"ambiguous": len(res.Ambiguous),
 		})
 		if res.Tampered() {
 			// Error, not warn: this is the one finding in the daemon that means
@@ -417,7 +420,7 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 			// triggerable page.
 			slog.Warn("audit chain verification could not check part of the log",
 				"rows", res.RowsChecked, "unverifiable", res.Unverifiable,
-				"never_adopted", res.NeverAdopted)
+				"never_adopted", res.NeverAdopted, "ambiguous", res.Ambiguous)
 		}
 	}
 

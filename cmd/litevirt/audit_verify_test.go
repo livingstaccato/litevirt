@@ -179,3 +179,28 @@ func TestAuditVerifyConsumesTheDaemonUnverifiedVerdict(t *testing.T) {
 		t.Fatalf("CLI did not report the daemon's verdict: %q", out.String())
 	}
 }
+
+// A row with a NUL in a hashed field has a hash that does not determine its
+// content, so it must fail the run. It is not tampering — an older build wrote
+// such rows verbatim — so it must not say TAMPERED, and the row has to be named.
+func TestAuditVerifyAmbiguousRowsFailWithoutClaimingTampering(t *testing.T) {
+	var out strings.Builder
+	err := reportAuditVerify(&out, &pb.VerifyAuditChainResponse{
+		RowsChecked:   3,
+		Unverified:    true,
+		AmbiguousRows: []string{"row-7: node-1: field target contains a NUL byte"},
+	})
+	if err == nil {
+		t.Fatal("an ambiguous row exited 0")
+	}
+	got := out.String()
+	if strings.Contains(got, "TAMPERED") {
+		t.Errorf("an ambiguous row is reported as tampering: %q", got)
+	}
+	if !strings.Contains(got, "row-7") {
+		t.Errorf("the ambiguous row is not named: %q", got)
+	}
+	if strings.Contains(got, "inspect its logs") {
+		t.Errorf("a named finding fell through to the unspecified message: %q", got)
+	}
+}

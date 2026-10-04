@@ -2923,6 +2923,14 @@ message VerifyAuditChainResponse {
     // verdict field that means "not a pass" has to travel with the verdict field
     // that means "not tampering".
     bool unverified = 17;
+    // 18 is left free: the fork's not_signing_hosts holds it, and numbering
+    // past it keeps the two from colliding on the wire when both land.
+    // Rows with a NUL byte in a hashed field, as "rowid: host: reason". The
+    // content hash is injective only over NUL-free rows, so such a row's hash
+    // and signature do not determine its content: a different row verifies
+    // the same. A current daemon never writes one. Feeds `unverified`, not
+    // `tampered` — an older build may have written the row verbatim.
+    repeated string ambiguous_rows = 19;
 }
 
 // RetireAuditKey retires a host's audit signing key ON ITS BEHALF.

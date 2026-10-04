@@ -52,7 +52,7 @@ func TestDrill2_FrozenLeaseHolderWhileAHostFails(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	holder := l.leaseHolder(l.hosts[0], "failover")
-	victim := l.pick(func(h string) bool { return h != holder }, true)
+	victim := l.leastLoaded(l.hosts[0], l.except(holder))
 	q := l.pick(func(h string) bool { return h != holder && h != victim }, false)
 	test := l.createVMs(q, "d2", victim)[victim]
 	keys := l.relocatableOn(q, b, victim)
@@ -140,8 +140,9 @@ func TestDrill3_VoterRemovedAfterAFence(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	n := len(l.hosts)
-	first, second := l.hosts[n-1], l.hosts[n-2]
 	q := l.hosts[0]
+	second := l.leastLoaded(q, l.except(q))
+	first := l.pick(func(h string) bool { return h != q && h != second }, true)
 	test := l.createVMs(q, "d3", second)[second]
 	keys := l.relocatableOn(q, b, second)
 	gen0, _, err := l.voterSet(q)
@@ -245,7 +246,7 @@ func TestDrill4_OwnerReachableVetoesTheClaim(t *testing.T) {
 	l.restoreOnCleanup(b)
 
 	coord := l.leaseHolder(l.hosts[0], "failover")
-	owner := l.pick(func(h string) bool { return h != coord }, true)
+	owner := l.leastLoaded(l.hosts[0], l.except(coord))
 	keep := l.pick(func(h string) bool { return h != coord && h != owner }, true)
 	q := l.pick(func(h string) bool { return h != owner && h != keep }, false)
 	var cut []string
@@ -344,8 +345,8 @@ func TestDrill5_LegacyRecoveryWithClaimsOff(t *testing.T) {
 	b := l.requireBaseline()
 	l.restoreOnCleanup(b)
 
-	victim := l.hosts[len(l.hosts)-1]
 	q := l.hosts[0]
+	victim := l.leastLoaded(q, l.except(q))
 	test := l.createVMs(q, "d5", victim)[victim]
 	keys := l.relocatableOn(q, b, victim)
 	for i, h := range l.hosts {
@@ -393,6 +394,17 @@ func TestDrill5_LegacyRecoveryWithClaimsOff(t *testing.T) {
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
+
+// except returns every host but the named ones.
+func (l *lab) except(skip ...string) []string {
+	var hs []string
+	for _, h := range l.hosts {
+		if !contains(skip, h) {
+			hs = append(hs, h)
+		}
+	}
+	return hs
+}
 
 // pick returns the first host (or, with fromEnd, the last) that ok accepts.
 func (l *lab) pick(ok func(string) bool, fromEnd bool) string {

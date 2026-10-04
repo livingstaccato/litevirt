@@ -628,8 +628,26 @@ back, because the disk stayed on the failed host. The new host rebuilds the disk
 from the VM's image at the disk's recorded size. The new host might still have
 an old copy of the disk from an earlier stay there. The restart never boots that
 copy. It renames the copy to `<disk path>.superseded-<time>` next to the new
-disk. Nothing removes the renamed file. Delete it when you no longer need
-anything in it.
+disk. Each failover rebuilds the disk from the image, so each copy holds its
+own data and not an older version of the current disk.
+
+A host removes a renamed copy once it is older than
+`superseded_disk_retention_days` (default 7 days; `0` keeps every copy). It
+checks hourly. The age comes from the time in the file name. While the VM the
+copy came from is in `error`, `pending` or `starting`, the copy is held, whatever
+its age: a restart that failed may need it put back. The host removes it on
+the first check after the VM leaves that state.
+
+To see the copies on a host, with the VM each came from, when it was set aside
+and whether it is held, run `lv host superseded-disks <host>`. Add `--purge`
+to remove every copy that is not held now, whatever its age, and
+`--older-than <duration>` to remove only older ones. Purging needs the admin
+role and is audited (`host.superseded_disks.purge`). To keep a copy, move it
+somewhere else. The check finds copies next to the disk paths the cluster
+records and in the data directory's `disks/` folder.
+
+The restart of a VM on its own host never rebuilds a missing disk. That case
+is `vm_disk_missing` in [diagnostics](diagnostics.md).
 
 ## Load-balancer VIP split-brain safety
 

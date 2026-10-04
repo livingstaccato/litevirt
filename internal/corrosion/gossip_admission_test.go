@@ -153,6 +153,61 @@ func TestGossipAdmission_BootstrapTrustsSeedsOnlyUntilTheClusterIsKnown(t *testi
 	}
 }
 
+// TestGossipAdmission_SeedTrustLastsUntilItsAddressIsLearned: kvm003 drill 6.
+// A newcomer whose first foreign row came from ANOTHER newcomer still admits
+// the hosts at its seeds' addresses, because nothing else can ever bring their
+// rows: their history is pruned from every push backlog, and anti-entropy
+// dials admitted members only. That trust is per address, and ends for an
+// address the moment any row here records it.
+func TestGossipAdmission_SeedTrustLastsUntilItsAddressIsLearned(t *testing.T) {
+	joiner := admissionClient(t, "node-5", map[string]string{
+		"node-5": "10.0.0.5",
+		"node-4": "10.0.0.4", // the other newcomer's boot row, pushed first
+	})
+	joiner.gossipSeeded = true
+	joiner.gossipSeedIPs = seedIPs([]string{"10.0.0.1:7946", "10.0.0.2:7946", "10.0.0.7:7946"})
+	d := &admissionDelegate{client: joiner}
+
+	if err := d.NotifyAlive(node("node-1", "10.0.0.1")); err != nil {
+		t.Fatalf("the newcomer refused the established host at its seed's address: %v", err)
+	}
+	if err := d.NotifyAlive(node("phantom", "10.0.0.66")); err == nil {
+		t.Error("a newcomer that knows a host admits an unknown name at an address that is not a seed")
+	}
+
+	// node-1's row arrives (anti-entropy from node-1 itself): from now on the
+	// row is the authority for 10.0.0.1, and another name there is a phantom.
+	admitRow(t, joiner, "node-1", "10.0.0.1")
+	if err := d.NotifyAlive(node("node-1", "10.0.0.1")); err != nil {
+		t.Fatalf("node-1 was refused once its row arrived: %v", err)
+	}
+	if err := d.NotifyAlive(node("aa-phantom", "10.0.0.1")); err == nil {
+		t.Error("an unknown name at a seed address this node has learned was admitted")
+	}
+
+	// A tombstone records its address too: a seed that was removed is known,
+	// and is not trusted again under some other name.
+	admitRow(t, joiner, "gone", "10.0.0.7")
+	tombstone(t, joiner, "gone")
+	if err := d.NotifyAlive(node("other", "10.0.0.7")); err == nil {
+		t.Error("an unknown name at a removed seed's address was admitted")
+	}
+
+	// A node with no seeds has no seed trust, whatever it was handed.
+	unseeded := admissionClient(t, "node-5", map[string]string{"node-5": "10.0.0.5", "node-4": "10.0.0.4"})
+	unseeded.gossipSeedIPs = seedIPs([]string{"10.0.0.1:7946"})
+	if err := (&admissionDelegate{client: unseeded}).NotifyAlive(node("node-1", "10.0.0.1")); err == nil {
+		t.Error("an unseeded node admitted an unknown name")
+	}
+}
+
+func TestSeedIPs_ParsesAddressForms(t *testing.T) {
+	got := seedIPs([]string{"10.0.0.1:7946", "10.0.0.2", "not a host name at all:7946"})
+	if !got["10.0.0.1"] || !got["10.0.0.2"] || len(got) != 2 {
+		t.Fatalf("seedIPs = %v, want exactly 10.0.0.1 and 10.0.0.2", got)
+	}
+}
+
 // TestGossipAdmission_RefusalIsPerAttempt: the join race. A host whose row has
 // not replicated here yet is refused, and nothing about that refusal sticks —
 // the first exchange after its row lands admits it.

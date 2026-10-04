@@ -971,6 +971,15 @@ leadership churn or a partition.
   newly added host can find the peers it learns the hosts table from. That
   window closes at the first replicated row. A founder with no `join_peers`
   never opens it.
+- A host gossiping from one of this node's `join_peers` addresses is admitted
+  under any name until this node holds a `hosts` row, live or removed, for that
+  address. From then on the row decides. This matters when several hosts are
+  added on fresh databases at once. Each pushes its own row to the others, so
+  a newcomer can learn another newcomer before any established host. The
+  established hosts' rows are old enough to be pruned from every push backlog,
+  so they reach a newcomer only by anti-entropy, and anti-entropy dials only
+  admitted members. Without this rule the newcomers replicate only among
+  themselves.
 - A host whose gossip address differs from its recorded address is refused and
   logged with both addresses. On a multi-homed host, set `advertise_address` to
   the address the host was added with.

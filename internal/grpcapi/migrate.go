@@ -1282,36 +1282,13 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 		return err
 	}
 
-	// Repoint the (shared-storage) disk records at the target — same path. Treat
-	// these as part of the handoff: on ANY failure (mid-loop or the VM-host flip),
-	// roll back EVERY disk we already moved and the target firmware, and abort, so
-	// VM/disk records never diverge and nothing on the source is lost.
-	rollbackDisks := func() {
-		for _, d := range disks {
-			if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, s.hostName, d.Path); err != nil {
-				slog.Error("cold firmware migration: disk rollback re-point failed", "vm", vm.Name, "disk", d.DiskName, "error", err)
-				s.noteStateWriteFail(corrosion.OpDiskHostPath, err)
-			}
-		}
+	if err := s.handOffColdFirmwareVM(ctx, vm, targetHost, fwSpec); err != nil {
+		return err
 	}
-	for _, d := range disks {
-		if err := corrosion.UpdateDiskHostAndPath(ctx, s.db, vm.Name, d.DiskName, targetHost.Name, d.Path); err != nil {
-			rollbackDisks() // includes the ones updated so far (idempotent re-point to source)
-			s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
-			return status.Errorf(codes.Internal, "repoint disk %q to %s: %v", d.DiskName, targetHost.Name, err)
-		}
-	}
-
-	// Hand the VM to the target, PRESERVING its (stopped) state. On failure, roll
-	// the disks AND target back and abort (source still owns it + is intact).
-	// Phase 4: migration commit is an ownership transition (fresh-read CAS + increment).
-	//runningcheck:allow ownership handoff — the cold firmware migration hands the VM to
-	// targetHost while running on the source. Same reason as the cutover commit above.
-	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, targetHost.Name, vm.State); err != nil {
-		rollbackDisks()
-		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
-		return status.Errorf(codes.Internal, "reassign VM %q to %s: %v", vm.Name, targetHost.Name, err)
-	}
+	// The handoff is committed: the target owns the VM. What follows is cleanup
+	// and bookkeeping for a migration that has happened, so it must not die with
+	// a client that went away.
+	ctx = context.WithoutCancel(ctx)
 
 	// Clean up the source ONLY after a fully successful handoff: undefine the
 	// shut-off domain, then wipe the now-orphaned firmware. Do NOT wipe firmware
@@ -1339,6 +1316,55 @@ func (s *Server) coldMigrateFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 	slog.Info("cold firmware migration complete", "vm", vm.Name, "from", s.hostName, "to", targetHost.Name, "state", vm.State)
 	s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok", "from="+s.hostName+" to="+targetHost.Name+" (cold firmware, "+vm.State+")")
 	s.audit(ctx, "vm.migrate", vm.Name, "from="+s.hostName+" to="+targetHost.Name+" (cold firmware)", "ok")
+	return nil
+}
+
+// coldFirmwareHandoffTimeout bounds the cold firmware migration's ownership
+// commit once it runs detached from the request (handOffColdFirmwareVM).
+const coldFirmwareHandoffTimeout = 30 * time.Second
+
+// handOffColdFirmwareVM commits a cold firmware migration's ownership handoff:
+// the VM and every one of its disk records move to targetHost in ONE guarded
+// transaction (corrosion.TransferVMOwnerWithDisks), which CASes on the VM's
+// owner epoch, advances it once, and keeps the VM's (stopped) state. On failure
+// the target's firmware and domain are torn down and the source still owns the
+// VM and all of its disks.
+//
+// It used to commit each disk record, then the VM row, as separate writes,
+// rolling them back one by one on the request context. A client that went away
+// part-way cancelled that context, so every later write — the rollback's
+// included — failed, and a daemon crash between the commits had no rollback at
+// all: either way the VM still belonged to the source while disk records named
+// the target. One transaction leaves no intermediate state to strand.
+//
+// The commit runs on a context detached from the request, bounded by
+// coldFirmwareHandoffTimeout: once it starts, it and the cleanup that follows
+// it are one unit, not something a disconnecting client can cut in half. A
+// request already cancelled before that point aborts instead.
+func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMRecord, targetHost *corrosion.HostRecord, fwSpec firmwareSpec) error {
+	if err := ctx.Err(); err != nil {
+		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
+		return status.FromContextError(err).Err()
+	}
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), coldFirmwareHandoffTimeout)
+	defer cancel()
+
+	// Phase 4: migration commit is an ownership transition (fresh-read CAS + increment).
+	// The CAS is on the epoch read here, as TransferVMOwnerFresh does: a concurrent
+	// transition between this read and the commit makes the commit lose cleanly.
+	cur, err := corrosion.GetVM(cctx, s.db, vm.Name)
+	if err == nil && cur == nil {
+		err = corrosion.ErrNoRowsAffected
+	}
+	if err == nil {
+		//runningcheck:allow ownership handoff — the cold firmware migration hands the VM to
+		// targetHost while running on the source. Same reason as the cutover commit above.
+		err = corrosion.TransferVMOwnerWithDisks(cctx, s.db, vm.Name, targetHost.Name, vm.State, cur.OwnerEpoch)
+	}
+	if err != nil {
+		s.rollbackFirmwareTarget(targetHost.Name, vm.Name, fwSpec.UUID)
+		return status.Errorf(codes.Internal, "reassign VM %q and its disks to %s: %v", vm.Name, targetHost.Name, err)
+	}
 	return nil
 }
 

@@ -51,6 +51,25 @@ func TestFleet_IndependentReplicas_PushLoopConverges(t *testing.T) {
 	}
 }
 
+// New hands a scenario independent replicas that already agree. Every node
+// writes its own copy of every seeded hosts row, so the copies differ until the
+// push loops carry the seed across. A scenario write to a hosts column before
+// then holds a newer clock than a peer's late seed INSERT, which loses the LWW
+// gate on that node and takes its created_at with it. created_at has
+// one-second resolution, so a seed that straddled a second boundary leaves
+// that node's copy a second apart for good: the push loop has nothing left to
+// send, and only anti-entropy, which the fleet does not run, settles the tie.
+func TestFleet_IndependentReplicas_NewStartsConverged(t *testing.T) {
+	c := New(t, Options{Nodes: 4, IndependentReplicas: true})
+	apart, err := divergence(c.Nodes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(apart) != 0 {
+		t.Fatalf("New returned replicas still apart on %v; a scenario's first write races the seed", apart)
+	}
+}
+
 // A blocked link withholds history in its direction only, and delivers it once
 // healed.
 func TestFleet_IndependentReplicas_BlockIsDirectional(t *testing.T) {

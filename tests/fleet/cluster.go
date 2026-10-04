@@ -422,6 +422,16 @@ func New(t *testing.T, opts Options) *Cluster {
 		// joins and the membership loop close the mesh.
 		c.WaitGossip(t, 20*time.Second, "the gossip mesh to form", c.GossipConverged)
 	}
+	if opts.IndependentReplicas && opts.Joiners == 0 {
+		// crossRegisterHosts wrote every node's copy of every hosts row on
+		// that node, so the copies differ until the push loops carry the seed
+		// across. Hand the scenario replicas that agree. A scenario write to a
+		// hosts column before then outruns a peer's late seed INSERT, which
+		// loses the LWW gate on that node and leaves its one-second created_at
+		// apart for good; only anti-entropy, which the fleet does not run,
+		// would settle it. Joiners start apart on purpose.
+		c.WaitConverged(t, 20*time.Second)
+	}
 	return c
 }
 

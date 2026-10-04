@@ -70,7 +70,9 @@ advertise_address.
 
 init refuses a target that is already a cluster member, because it rewrites the
 whole config.yaml and would reset join_peers to []. Use "lv host add" to add a
-node to an existing cluster; --force re-initialises a member anyway.`,
+node to an existing cluster; --force re-initialises a member anyway. A founder's
+own join_peers is empty, so init also asks the cluster this CLI is configured for,
+and refuses an address that cluster lists beside other hosts.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if local {
@@ -78,6 +80,11 @@ node to an existing cluster; --force re-initialises a member anyway.`,
 			}
 			if len(args) == 0 {
 				return fmt.Errorf("SSH target required (or use --local for standalone setup)")
+			}
+			// A founder's own join_peers is empty, so the target-side check
+			// cannot tell it from a half-finished first node; the cluster can.
+			if err := cli.RefuseInitOfAClusterMember(cmd.Context(), args[0], force); err != nil {
+				return err
 			}
 			return cli.HostInit(cmd.Context(), args[0], name, force)
 		},

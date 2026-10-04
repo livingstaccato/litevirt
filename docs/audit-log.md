@@ -583,6 +583,24 @@ which is the one failure an attestation must not have. The page size exists
 because the response is a unary gRPC message against a 64 MiB server cap, and a
 chain worth attesting to is larger than that.
 
+The web UI and the REST endpoint assemble the document in the daemon's own
+memory, so they refuse a chain over 256 MiB of rows rather than risk the OOM
+killer. `lv audit export` has no such limit: it writes the pages to a spool
+file as they arrive, and the spool becomes the output (`--out`, or stdout) only
+once the whole walk has succeeded. A refused export leaves no file and prints
+nothing.
+
+An export is also refused when the server reports a **sequence gap** — a seq
+missing from a host's chain — listed per gap under `seq_gaps`. Usually that is
+replication still delivering a partitioned host's backlog, and a re-run a little
+later succeeds. A gap that persists is rows missing from the chain, and
+`lv audit export --allow-gaps` exports it anyway, with every gap listed under
+`seq_gaps`, so the rest of the chain can be examined. That document is for
+investigation, not attestation: replayed offline it shows a chain break at each
+listed gap, exactly as `lv audit verify` reports one. Under `--since` /
+`--until`, a row the window leaves out is not a gap; only a seq the host has no
+row for at all is reported.
+
 One limit exists, and it is inherent: `--since` / `--until` bound the window
 by timestamp, so a window starting mid-chain exports a fragment whose first
 row links to a row outside it. Narrow the window to answer a question about a

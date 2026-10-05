@@ -202,7 +202,19 @@ lv host drain host-a
 lv host drain host-a --parallel 4    # Migrate 4 VMs at a time
 ```
 
-Drain live-migrates running VMs and cold-reassigns stopped VMs. When done:
+Drain live-migrates running VMs whose disks are all on shared storage, and
+shuts down and reassigns the other running VMs. A stopped VM moves the way
+`lv migrate <vm> <target> --cold` moves it (see [Cold migration](#cold-migration)):
+its host-local disks are copied to the target, its domain is defined there,
+and it stays stopped. It is refused for the same reasons, and a Secure Boot /
+vTPM VM drains only while stopped and on shared storage.
+
+A stopped VM that drain cannot move stays on the host, stopped, with its
+disks; a failed attempt removes what it put on the target. It is never moved
+without its disks. Drain reports each VM it did not move with the reason,
+finishes the other VMs, and then fails with `drain incomplete: N VM(s) remain
+on host ...`. The host stays `draining`. Fix what the message names (or
+migrate the VM yourself) and run the drain again. When done:
 
 ```bash
 # Perform maintenance...

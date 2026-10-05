@@ -155,6 +155,17 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			}
 		}
 	}
+	return s.migrateOwnedVM(ctx, req, vm, send, unlock, &adopted)
+}
+
+// migrateOwnedVM is MigrateVM on the host that owns the VM, called with the
+// VM's lock held and the caller's permission already checked. unlock and
+// adopted let a live migration that outlives the request carry the lock to
+// its adopter (adoptAbandonedMigration): it sets *adopted and the caller must
+// then not release the lock itself. A stopped VM's cold move never outlives
+// the request, so host drain, which holds the VM's lock for the whole step,
+// calls this directly for one (drainStoppedVM).
+func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool) error {
 	// Secure Boot / vTPM firmware-state travel (G1). A firmware VM's NVRAM + swtpm
 	// are host-local and bind BitLocker, so they need a CONSISTENT capture:
 	//   - LIVE is refused: libvirt's native swtpm/NVRAM carry is not yet validated
@@ -655,7 +666,7 @@ poll:
 			// stops us watching. Returning bare here left the VM at
 			// host_name=source/state=migrating while it ran on the target, and
 			// the reconciler skips `migrating`, so nothing ever healed it.
-			adopted = true
+			*adopted = true
 			s.adoptAbandonedMigration(context.WithoutCancel(ctx), vm, req.TargetHost,
 				withStorage, disks, done, unlock, migrationFinish{
 					target: targetHost, detachedVFs: detachedVFs, pbVM: pbVM, hspec: hspec,

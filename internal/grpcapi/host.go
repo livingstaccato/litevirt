@@ -316,7 +316,10 @@ func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, t
 
 // DrainHost marks the host as draining and migrates all its VMs to healthy hosts.
 // Uses a worker pool of size req.Parallel (default 2) for concurrent migrations.
-// VMs with shared storage use live migration; local-only VMs use cold migration.
+// Running VMs with shared storage use live migration; other running VMs are shut
+// down and reassigned. A stopped VM moves as `lv migrate --cold` moves it, with its
+// host-local disks (drainStoppedVM); one that cannot move stays here, is reported,
+// and the drain ends incomplete.
 func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHostServer) error {
 	ctx := stream.Context()
 	if err := RequireRole(ctx, "admin"); err != nil {
@@ -470,7 +473,7 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 	if stillRunning > 0 {
 		return status.Errorf(codes.FailedPrecondition,
-			"drain incomplete: %d VM(s) remain on host %q (pinned or no eligible target)",
+			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, or not movable; see each VM's result)",
 			stillRunning, req.Name)
 	}
 
@@ -564,16 +567,17 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		}
 	}
 
-	// Drain moves a VM by either a raw libvirt live-migrate (shared storage) or a
-	// stop-and-reassign (cold) — NEITHER carries the host-local NVRAM + swtpm of a
+	// A RUNNING VM is drained by either a raw libvirt live-migrate (shared storage)
+	// or a stop-and-reassign — NEITHER carries the host-local NVRAM + swtpm of a
 	// Secure-Boot/vTPM VM (and a stale live carry would race the TPM). Refuse such
-	// VMs REGARDLESS of storage type (NVRAM is host-local even on shared disks) and
+	// a VM REGARDLESS of storage type (NVRAM is host-local even on shared disks) and
 	// point the operator at explicit migration, which captures firmware quiescently
-	// and transfers it (G1).
-	if usesFirmwareState(fresh.Spec) {
+	// and transfers it (G1). A STOPPED one takes that explicit path below
+	// (drainStoppedVM), with its refusals.
+	if fresh.State == "running" && usesFirmwareState(fresh.Spec) {
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
-			Error: "Secure Boot / vTPM VM can't be drained automatically (its firmware state isn't transferred) — stop it and migrate it explicitly (`lv migrate " + vm.Name + " <target-host> --cold`), which carries the firmware",
+			Error: "Secure Boot / vTPM VM can't be drained while running (its firmware state isn't transferred live) — stop it and drain again, or migrate it explicitly (`lv migrate " + vm.Name + " <target-host> --cold`), which carries the firmware",
 		}
 	}
 
@@ -591,15 +595,22 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		}
 	}
 
+	// A STOPPED VM moves as `lv migrate --cold` moves it: its host-local disks
+	// with it, its domain defined on the target, and the source cleaned up only
+	// after the handoff commits. It used to be reassigned by its row alone, which
+	// left its host-local disks here and its domain undefined on the target.
+	if fresh.State == "stopped" {
+		return s.drainStoppedVM(ctx, fresh, target)
+	}
+
 	// Destination admission for a RUNNING VM, before anything irreversible: a
 	// drain is an OPERATOR-initiated move and lands the same full-sized VM on
 	// the target an explicit migrate would — placement.Select is a read-only
 	// filter over replicated data, not an admission. The decision belongs to
 	// the DESTINATION daemon (fresh local inventory, ownership conditions,
 	// serialized reserve-then-verify), exactly like MigrateVM; the lease is
-	// held across the move and released when this VM's drain step returns. A
-	// STOPPED VM's reassign moves only the row — it consumes nothing on the
-	// target until StartVM admits it there — so it takes no lease.
+	// held across the move and released when this VM's drain step returns. (A
+	// stopped VM returned above; its cold move takes its own lease.)
 	if fresh.State == "running" {
 		migLease, aerr := s.acquireDestinationHostLease(ctx, "DrainHost", target.Name, fresh.Project,
 			"vm:"+vm.Name, fresh.CPUActual, fresh.MemActual, intentVMResident)
@@ -672,6 +683,37 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return progress
 	}
 
+	progress.Status = "done"
+	progress.ProgressPct = 100
+	return progress
+}
+
+// drainStoppedVM drains a STOPPED VM through the same path as `lv migrate
+// <vm> <target> --cold` (migrateOwnedVM, then coldMigrateStoppedVM), with the
+// same preconditions and refusals: capacity on the target, a Secure-Boot/vTPM
+// VM's shared-storage requirement, snapshots on a host-local disk, a disk that
+// cannot be flattened, free space, a target too old for the disk copy. The
+// caller holds the VM's lock and has re-checked ownership and quorum.
+//
+// A VM it cannot move stays on this host, stopped, with its disks and rows —
+// a failed attempt takes back what it put on the target — and is reported as
+// failed, which leaves the drain incomplete. It is never reassigned by its row
+// alone.
+func (s *Server) drainStoppedVM(ctx context.Context, vm *corrosion.VMRecord, target corrosion.HostRecord) *pb.DrainProgress {
+	progress := &pb.DrainProgress{
+		VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_COLD,
+	}
+	req := &pb.MigrateVMRequest{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_COLD}
+	discard := func(pb.MigratePhase, float32, float32) error { return nil }
+	// The lock is the caller's, released when its drain step returns; a cold
+	// move never outlives the call, so nothing adopts it.
+	adopted := false
+	if err := s.migrateOwnedVM(ctx, req, vm, discard, func() {}, &adopted); err != nil {
+		slog.Warn("drain: stopped VM not moved; it stays on this host", "vm", vm.Name, "target", target.Name, "error", err)
+		progress.Status = "failed"
+		progress.Error = "not moved, left stopped on " + s.hostName + " with its disks: " + status.Convert(err).Message()
+		return progress
+	}
 	progress.Status = "done"
 	progress.ProgressPct = 100
 	return progress

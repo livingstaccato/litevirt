@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1087,29 +1088,33 @@ func TestDrainOneVM_BackingUp(t *testing.T) {
 	}
 }
 
-// ── drainOneVM: cold-reassign a SOURCE-owned stopped VM ─────────────────────
+// ── drainOneVM: a SOURCE-owned stopped VM it cannot move stays put ──────────
 
-func TestDrainOneVM_ColdReassign(t *testing.T) {
+// A stopped VM drains through the cold migration path, never by reassigning its
+// row alone (which left its host-local disks behind). One that path refuses —
+// here the target does not exist, so the move fails before touching anything —
+// stays on this host, stopped, and is reported failed. The moving case, with
+// its disk bytes, is TestFleet_DrainMovesAStoppedVMWithItsLocalDisk.
+func TestDrainOneVM_StoppedVMItCannotMoveStaysPut(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminCtx()
 
-	// VM owned by THIS daemon (the source) — the only VM drain may reassign.
+	// VM owned by THIS daemon (the source) — the only VM drain may move.
 	insertTestVMR2(t, ctx, s.db, "own-vm", "test-host", "stopped")
 
 	vm := corrosion.VMRecord{Name: "own-vm", HostName: "test-host", State: "stopped"}
 	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
 
 	progress := s.drainOneVM(ctx, vm, target)
-	// Stopped + source-owned → cold reassign (no libvirt calls).
-	if progress.Status != "done" {
-		t.Errorf("Status = %q, want done", progress.Status)
+	if progress.Status != "failed" || !strings.Contains(progress.Error, "left stopped on test-host") {
+		t.Errorf("progress = %q %q, want failed, left stopped on test-host", progress.Status, progress.Error)
 	}
 	if progress.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
 		t.Errorf("Strategy = %v, want MIGRATE_COLD", progress.Strategy)
 	}
 	got, _ := corrosion.GetVM(ctx, s.db, "own-vm")
-	if got.HostName != "target-h" {
-		t.Errorf("host = %q, want target-h (reassigned)", got.HostName)
+	if got.HostName != "test-host" || got.State != "stopped" {
+		t.Errorf("row = host %q state %q, want test-host stopped (never reassigned by its row alone)", got.HostName, got.State)
 	}
 }
 
@@ -1710,9 +1715,9 @@ func TestListStacks_VMStateCounts(t *testing.T) {
 	}
 }
 
-// ── DrainHost: with target host, VMs on other-host (cold reassign) ──────────
+// ── DrainHost: with target host, a stopped VM the cold move refuses ─────────
 
-func TestDrainHost_WithTargetHost_ColdReassign(t *testing.T) {
+func TestDrainHost_WithTargetHost_StoppedVMItCannotMoveStaysPut(t *testing.T) {
 	s := testServerR2(t)
 	ctx := adminContext(context.Background())
 
@@ -1733,20 +1738,21 @@ func TestDrainHost_WithTargetHost_ColdReassign(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Stopped VM on the source → cold reassign (no libvirt needed).
+	// Stopped VM on the source, which this server cannot cold-migrate (no
+	// libvirt, no reachable target): it stays, and the drain says so.
 	insertTestVMR2WithStack(t, ctx, s.db, "drain-cold-vm", "test-host", "stopped", "")
 
 	stream := &mockDrainStreamR2{ctx: ctx}
-	if err := s.DrainHost(&pb.DrainHostRequest{Name: "test-host", Parallel: 1}, stream); err != nil {
-		t.Fatalf("DrainHost: %v", err)
+	err = s.DrainHost(&pb.DrainHostRequest{Name: "test-host", Parallel: 1}, stream)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete: 1 VM(s) remain") {
+		t.Fatalf("DrainHost = %v, want FailedPrecondition drain incomplete", err)
 	}
-	if len(stream.sent) == 0 {
-		t.Fatal("expected at least one drain progress message")
+	if len(stream.sent) != 1 || stream.sent[0].Status != "failed" || stream.sent[0].VmName != "drain-cold-vm" {
+		t.Fatalf("drain progress = %+v, want one failed frame for drain-cold-vm", stream.sent)
 	}
-	// The stopped VM was cold-reassigned to the target.
 	vm, _ := corrosion.GetVM(ctx, s.db, "drain-cold-vm")
-	if vm.HostName != "drain-dst" {
-		t.Errorf("vm host = %q, want drain-dst (cold reassigned)", vm.HostName)
+	if vm.HostName != "test-host" || vm.State != "stopped" {
+		t.Errorf("vm row = host %q state %q, want test-host stopped (left in place)", vm.HostName, vm.State)
 	}
 }
 

@@ -23797,6 +23797,7 @@ func (x *RollbackFirmwareStateResponse) GetRemoved() bool {
 type CheckCPUCompatibilityRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CpuXml        string                 `protobuf:"bytes,1,opt,name=cpu_xml,json=cpuXml,proto3" json:"cpu_xml,omitempty"`
+	Machine       string                 `protobuf:"bytes,2,opt,name=machine,proto3" json:"machine,omitempty"` // the guest's machine type (live <os><type machine>); "" = the hypervisor's default
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -23834,6 +23835,13 @@ func (*CheckCPUCompatibilityRequest) Descriptor() ([]byte, []int) {
 func (x *CheckCPUCompatibilityRequest) GetCpuXml() string {
 	if x != nil {
 		return x.CpuXml
+	}
+	return ""
+}
+
+func (x *CheckCPUCompatibilityRequest) GetMachine() string {
+	if x != nil {
+		return x.Machine
 	}
 	return ""
 }
@@ -33622,9 +33630,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"attempt_id\x18\x03 \x01(\tR\tattemptId\"9\n" +
 	"\x1dRollbackFirmwareStateResponse\x12\x18\n" +
-	"\aremoved\x18\x01 \x01(\bR\aremoved\"7\n" +
+	"\aremoved\x18\x01 \x01(\bR\aremoved\"Q\n" +
 	"\x1cCheckCPUCompatibilityRequest\x12\x17\n" +
-	"\acpu_xml\x18\x01 \x01(\tR\x06cpuXml\"m\n" +
+	"\acpu_xml\x18\x01 \x01(\tR\x06cpuXml\x12\x18\n" +
+	"\amachine\x18\x02 \x01(\tR\amachine\"m\n" +
 	"\x1dCheckCPUCompatibilityResponse\x12\x1a\n" +
 	"\brunnable\x18\x01 \x01(\bR\brunnable\x12\x18\n" +
 	"\averdict\x18\x02 \x01(\tR\averdict\x12\x16\n" +

@@ -261,3 +261,37 @@ func TestFleet_MigrateVM_PassthroughComparesTheSourceHostCPU(t *testing.T) {
 		t.Errorf("target was not asked about the SOURCE host's CPU: %q", asked[0])
 	}
 }
+
+// A target's "cannot run" is not believed when the SOURCE says the same about a
+// guest it is running at this moment: the compare is then provably wrong about
+// this guest, so it cannot decide anything and must not refuse.
+//
+// This is the lab failure (2026-10-05): every default host-model VM was refused
+// migration to every target, identical hosts included, because the compare
+// rejected the guest's expanded live CPU on its own source too.
+func TestFleet_MigrateVM_CPUPreflightCannotDecideWhenSourceRejectsItsOwnGuest(t *testing.T) {
+	c := New(t, Options{Nodes: 2})
+	defer c.Stop()
+
+	source, target := c.Nodes[0], c.Nodes[1]
+	seedRunningCPUVM(t, c, source, "vm-self", lv.CPUModeHostModel,
+		strings.Replace(expandedHostModelXML, "%s", "vm-self", 1))
+
+	incompatible := lv.CPUCompareIncompatible
+	target.Virt.CPUCompareResult = &incompatible
+	source.Virt.CPUCompareResult = &incompatible
+
+	if err := migrateAt(t, c, source, "vm-self", target.Name); err != nil {
+		t.Fatalf("migrate refused on a compare the source itself fails for its running guest: %v", err)
+	}
+	if len(target.Virt.ComparedCPUXML()) == 0 {
+		t.Error("target was never asked, so the pass proves nothing")
+	}
+	asked := source.Virt.ComparedCPUXML()
+	if len(asked) == 0 {
+		t.Fatal("source was never asked about its own guest")
+	}
+	if !strings.Contains(asked[0], "Skylake-Server-IBRS") {
+		t.Errorf("source was asked about the wrong CPU: %q", asked[0])
+	}
+}

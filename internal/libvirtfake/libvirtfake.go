@@ -16,6 +16,7 @@ package libvirtfake
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -105,13 +106,22 @@ type Fake struct {
 	// test can prove the shut-off reclaim took the config path, NOT the live one.
 	detachHostdevConfigN int
 
-	// comparedCPUXML records every CompareCPU argument (see ComparedCPUXML).
-	comparedCPUXML []string
+	// comparedCPUXML / comparedMachines record every CompareCPU argument pair
+	// (see ComparedCPUXML, ComparedMachines).
+	comparedCPUXML   []string
+	comparedMachines []string
 
 	// CPUCompareResult overrides CompareCPU's verdict; nil = Superset (this host
 	// can run anything). HostCPUModel names the model HostCPUXML reports.
 	CPUCompareResult *libvirt.CPUCompare
 	HostCPUModel     string
+	// HostModelFeatures, when set, models this host's hypervisor: it is the
+	// feature list its domcapabilities host-model reports (HostModelCPUFeatures;
+	// nil = no host-model to report, an error), and (with CPUCompareResult nil)
+	// CompareCPU answers by it — incompatible as soon as
+	// the compared CPU requires a feature not on the list, identical otherwise.
+	// That is how libvirt's hypervisor compare treats a live host-model CPU.
+	HostModelFeatures []string
 
 	// Fail* hooks let scenarios inject failures into specific methods.
 	// Nil = default success.
@@ -1469,10 +1479,11 @@ func (f *Fake) NodeInfo() (cpus int, memMiB int, err error) {
 // fake host runs anything — so no existing scenario changes behavior. Set
 // CPUCompareResult (or FailCompareCPU) to model a destination whose CPU is
 // poorer than the guest needs.
-func (f *Fake) CompareCPU(cpuXML string) (libvirt.CPUCompare, error) {
+func (f *Fake) CompareCPU(cpuXML, machine string) (libvirt.CPUCompare, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.comparedCPUXML = append(f.comparedCPUXML, cpuXML)
+	f.comparedMachines = append(f.comparedMachines, machine)
 	if f.FailCompareCPU != nil {
 		if err := f.FailCompareCPU(cpuXML); err != nil {
 			return libvirt.CPUCompareIncompatible, err
@@ -1481,7 +1492,63 @@ func (f *Fake) CompareCPU(cpuXML string) (libvirt.CPUCompare, error) {
 	if f.CPUCompareResult != nil {
 		return *f.CPUCompareResult, nil
 	}
+	if f.HostModelFeatures != nil {
+		have := make(map[string]bool, len(f.HostModelFeatures))
+		for _, name := range f.HostModelFeatures {
+			have[name] = true
+		}
+		for _, name := range requiredCPUFeatures(cpuXML) {
+			if !have[name] {
+				return libvirt.CPUCompareIncompatible, nil
+			}
+		}
+		return libvirt.CPUCompareIdentical, nil
+	}
 	return libvirt.CPUCompareSuperset, nil
+}
+
+// HostModelCPUFeatures reports HostModelFeatures as the host's domcapabilities
+// host-model list. Without one set it errors, as a host whose host-model
+// cannot be read would, so the source keeps the guest's requirement verbatim.
+func (f *Fake) HostModelCPUFeatures(machine string) (map[string]bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.HostModelFeatures == nil {
+		return nil, errors.New("libvirtfake: no host-model features configured")
+	}
+	out := make(map[string]bool, len(f.HostModelFeatures))
+	for _, name := range f.HostModelFeatures {
+		out[name] = true
+	}
+	return out, nil
+}
+
+// ComparedMachines returns, in order, the machine type of every CompareCPU.
+func (f *Fake) ComparedMachines() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.comparedMachines...)
+}
+
+// requiredCPUFeatures lists the names of a <cpu> element's
+// <feature policy='require'> children.
+func requiredCPUFeatures(cpuXML string) []string {
+	var cpu struct {
+		Features []struct {
+			Policy string `xml:"policy,attr"`
+			Name   string `xml:"name,attr"`
+		} `xml:"feature"`
+	}
+	if err := xml.Unmarshal([]byte(cpuXML), &cpu); err != nil {
+		return nil
+	}
+	var out []string
+	for _, ft := range cpu.Features {
+		if ft.Policy == "require" {
+			out = append(out, ft.Name)
+		}
+	}
+	return out
 }
 
 // HostCPUXML returns the fake host's CPU element. HostCPUModel (default

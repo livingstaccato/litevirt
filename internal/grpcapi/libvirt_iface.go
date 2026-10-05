@@ -137,9 +137,13 @@ type LibvirtBackend interface {
 	// Stats / introspection.
 	NodeInfo() (cpus int, memMiB int, err error)
 	// CompareCPU asks the LOCAL hypervisor whether it can run a guest requiring
-	// the CPU described by a standalone <cpu> element. The destination side of
-	// the migration CPU preflight.
-	CompareCPU(cpuXML string) (libvirt.CPUCompare, error)
+	// the CPU described by a standalone <cpu> element on the given machine type
+	// ("" = default). The destination side of the migration CPU preflight.
+	CompareCPU(cpuXML, machine string) (libvirt.CPUCompare, error)
+	// HostModelCPUFeatures returns the features this host's domain capabilities
+	// list for mode='host-model' (true = provided), which the migration source
+	// uses to credit a host-model guest's requirement (CreditCPURequirement).
+	HostModelCPUFeatures(machine string) (map[string]bool, error)
 	// HostCPUXML returns this host's own CPU as a comparable <cpu> element — the
 	// requirement a host-passthrough guest carries, which its live domain XML
 	// does not spell out.

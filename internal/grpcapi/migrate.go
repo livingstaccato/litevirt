@@ -189,7 +189,8 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// whose CPU is derived from its host (host-model / host-passthrough) may be
 	// executing instructions the destination does not have, and libvirt only says
 	// so once the migration is already underway. Advisory and fail-open — it
-	// refuses only on a positive "cannot run" from the target (see
+	// refuses only on a positive "cannot run" from the target that the source,
+	// running the guest, does not also give about itself (see
 	// preflightTargetCPU), never on a peer that is old or cannot answer.
 	if err := s.preflightTargetCPU(ctx, vm, req.TargetHost); err != nil {
 		return err

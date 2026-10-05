@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -101,8 +102,11 @@ func (s *Server) applyNICRetargets(ctx context.Context, resolved *planner.Resolv
 // does the host half at once when the VM lives here.
 func (s *Server) retargetVMNICs(ctx context.Context, vmName string, rts []compose.NICRetarget) (string, error) {
 	cur, err := corrosion.GetVM(ctx, s.db, vmName)
-	if err != nil || cur == nil {
-		return "", fmt.Errorf("read %q before recording its NIC move: %v", vmName, err)
+	if err != nil {
+		return "", fmt.Errorf("read %q before recording its NIC move: %w", vmName, err)
+	}
+	if cur == nil {
+		return "", status.Errorf(codes.NotFound, "VM %q not found", vmName)
 	}
 	for _, rt := range rts {
 		if err := s.checkNICRetarget(ctx, vmName, cur.Project, rt); err != nil {

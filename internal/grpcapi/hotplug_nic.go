@@ -119,25 +119,16 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 
 	// Owner leg of a peer forward: trust the entry node's op identity, skip the entry
 	// idempotency layer, go straight to the at-most-once owner path.
+	//
+	// The owner re-runs the managed-network half of admission itself. It needs
+	// no caller identity (only the VM's project and the network's owner), so it
+	// holds even when the entry node is an older build that admitted nothing.
+	// The raw-bridge half needs the caller's authority and stays at the entry.
 	if opID, reqHash, ok := s.deviceOpFromPeer(ctx); ok {
+		if err := s.admitManagedNetwork(ctx, vmRec.Project, spec.Name); err != nil {
+			return nil, err
+		}
 		return s.attachNICOwner(ctx, req, vmRec.Name, opID, reqHash, "")
-	}
-
-	// Project isolation: the same admission CreateVM applies to its NICs. A VM
-	// may gain a NIC only on a global network or one its own project owns, and
-	// a raw bridge needs cluster-root authority. Checked here at the entry,
-	// before the remote provisioning push below and before any operation row,
-	// so a refusal leaves nothing behind. The peer-forwarded owner leg above
-	// skips it: the entry node already decided, and with the caller's identity.
-	if err := s.admitNetworkAttach(ctx, vmRec.Project, spec.Name); err != nil {
-		return nil, err
-	}
-
-	// Cross-host race: push the network's provisioning to the VM's owning host
-	// before this attach reaches it, so a forwarded attachNIC there doesn't find an
-	// unprovisioned bridge (see provisionNetworkOnRemote).
-	if vmRec.HostName != s.hostName {
-		s.provisionNetworkOnRemote(ctx, vmRec.HostName, spec.Name)
 	}
 
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
@@ -168,6 +159,22 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 				resp, retErr = nil, ferr
 			}
 		}()
+	}
+
+	// Project isolation: the same admission CreateVM applies to its NICs. A VM
+	// may gain a NIC only on a global network or one its own project owns, and
+	// a raw bridge needs cluster-root authority. After the replay lookup above,
+	// so a completed attach replays its stored response; before the remote
+	// provisioning push and any operation row, so a refusal leaves nothing.
+	if err := s.admitNetworkAttach(ctx, vmRec.Project, spec.Name); err != nil {
+		return nil, err
+	}
+
+	// Cross-host race: push the network's provisioning to the VM's owning host
+	// before this attach reaches it, so a forwarded attachNIC there doesn't find an
+	// unprovisioned bridge (see provisionNetworkOnRemote).
+	if vmRec.HostName != s.hostName {
+		s.provisionNetworkOnRemote(ctx, vmRec.HostName, spec.Name)
 	}
 
 	// Forward to the owning host.

@@ -727,17 +727,19 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
 
-	// Project isolation: the restore rebuilds the archived spec's NICs in the
-	// authorized project, so each managed network must be one that project may
-	// use. Same project as the backup, so a raw bridge is carried. A cold migrate
-	// (a peer-verified migrate-from) is the same container moving, not a copy,
-	// and is not re-judged here, as a VM migrate is not.
-	if s.migrateSourceFromPeer(ctx) == "" {
-		if err := s.admitCopiedNetworks(ctx, "restore", project, project,
-			containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))); err != nil {
-			s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
-			return err
-		}
+	// Project isolation. An operator restore rebuilds the archived spec's NICs as
+	// a new workload in the authorized project, so each managed network must be
+	// one that project may use (same project as the backup: a raw bridge is
+	// carried). A failover relocation (a carried, peer-mTLS, token-bound proof)
+	// and a cold migrate (a peer-verified migrate-from) RE-HOME the existing
+	// container instead: refusing would leave it down without removing the
+	// attachment, so they warn and audit, as a takeover promote does.
+	ctNets := containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))
+	if req.Proof != nil || s.migrateSourceFromPeer(ctx) != "" {
+		s.warnForeignNetworks(ctx, "ct.restore", req.Name, project, ctNets)
+	} else if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
+		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
+		return err
 	}
 
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.

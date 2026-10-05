@@ -25,6 +25,7 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -90,6 +91,35 @@ func (s *Server) admitCopiedNetworks(ctx context.Context, op, targetProject, sou
 		}
 	}
 	return nil
+}
+
+// warnForeignNetworks is the non-blocking counterpart of admitCopiedNetworks for
+// a path that RE-HOMES an existing workload rather than creating an attachment:
+// takeover promote (manual or automated failover) and container relocation.
+// Refusing there would leave a fenced host's workload down without removing the
+// attachment it already holds, so the same managed-network check runs and a
+// failure is logged and audited ("allowed-foreign-network") instead of refused.
+// Such a workload can only exist through an attachment made before every path
+// was admitted; the record tells the operator where to look.
+func (s *Server) warnForeignNetworks(ctx context.Context, action, workload, project string, networkNames []string) {
+	for _, name := range networkNames {
+		if name == "" {
+			continue
+		}
+		err := s.admitManagedNetwork(ctx, project, name)
+		if err == nil {
+			continue
+		}
+		msg := status.Convert(err).Message()
+		if status.Code(err) != codes.PermissionDenied {
+			slog.Warn("network admission: could not check a re-homed workload's network",
+				"action", action, "workload", workload, "network", name, "error", msg)
+			continue
+		}
+		slog.Warn("network admission: re-homing a workload on a network its project may not use",
+			"action", action, "workload", workload, "network", name, "reason", msg)
+		s.audit(ctx, action, workload, msg, "allowed-foreign-network")
+	}
 }
 
 // admitManagedNetwork is the managed-network half of admitNetworkAttach: a name

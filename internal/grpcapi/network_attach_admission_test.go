@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -91,6 +92,71 @@ func TestAttachDeviceNIC_NetworkProjectAdmission(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("attach to %s: %v", network, err)
 		}
+	}
+}
+
+// The owner leg of a forwarded attach re-runs the managed-network check, so an
+// older entry node that admitted nothing cannot hand it another project's network.
+func TestAttachDeviceNIC_OwnerLegChecksManagedNetwork(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	seedAdmissionNetworks(t, s)
+	if err := corrosion.InsertHost(context.Background(), s.db, corrosion.HostRecord{Name: "peer-1", Address: "10.0.0.8", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "test-host", State: "stopped", Project: "acme",
+		CPUActual: 2, MemActual: 4096,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "vm1", Cpu: 2, MemoryMib: 4096, Project: "acme"}),
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	peer := func(opID string) context.Context {
+		return metadata.NewIncomingContext(mtlsAdminCtx("peer-1"),
+			metadata.Pairs(deviceOpIDMDKey, opID, deviceOpHashMDKey, "hash-"+opID))
+	}
+	if _, _, ok := s.deviceOpFromPeer(peer("op-x")); !ok {
+		t.Fatal("test context does not classify as a peer-forwarded owner leg")
+	}
+
+	_, err := s.AttachDevice(peer("op-1"), &pb.AttachDeviceRequest{
+		VmName: "vm1", Nic: &pb.NetworkAttachment{Name: "beta-net", Mac: "52:54:00:aa:30:01"},
+	})
+	wantNetworkRefused(t, err, "", "beta-net")
+	if nics, _ := corrosion.MergedVMNICs(adminCtx(), s.db, "vm1"); len(nics) != 0 {
+		t.Fatalf("a refused owner-leg attach wrote NIC rows: %+v", nics)
+	}
+	if _, err := s.AttachDevice(peer("op-2"), &pb.AttachDeviceRequest{
+		VmName: "vm1", Nic: &pb.NetworkAttachment{Name: "shared-net", Mac: "52:54:00:aa:30:02"},
+	}); err != nil {
+		t.Fatalf("owner-leg attach to a global network: %v", err)
+	}
+}
+
+// A completed keyed attach replays its stored response even if admission would
+// now refuse it: the replay lookup runs before admission.
+func TestAttachDeviceNIC_ReplayPrecedesAdmission(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedAdmissionNetworks(t, s)
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
+		Name: "vm1", HostName: "test-host", State: "stopped", Project: "acme",
+		CPUActual: 2, MemActual: 4096,
+		Spec: seedSpecJSON(t, &pb.VMSpec{Name: "vm1", Cpu: 2, MemoryMib: 4096, Project: "acme"}),
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	req := &pb.AttachDeviceRequest{
+		VmName: "vm1", IdempotencyKey: "attach-once",
+		Nic: &pb.NetworkAttachment{Name: "shared-net", Mac: "52:54:00:aa:40:01"},
+	}
+	if _, err := s.AttachDevice(ctx, req); err != nil {
+		t.Fatalf("first attach: %v", err)
+	}
+	mkProjectNetwork(t, s, "shared-net", "beta") // ownership changes after the attach
+	if _, err := s.AttachDevice(ctx, req); err != nil {
+		t.Fatalf("replay of a completed attach must return its stored response, got %v", err)
 	}
 }
 
@@ -195,19 +261,40 @@ func setPromotableNetwork(t *testing.T, s *Server, network string) {
 }
 
 func TestPromoteReplica_NetworkProjectAdmission(t *testing.T) {
-	t.Run("foreign network refused", func(t *testing.T) {
+	t.Run("renamed promotion onto a foreign network refused", func(t *testing.T) {
 		s := testServer(t)
 		s.dataDir = t.TempDir()
 		seedAdmissionNetworks(t, s)
 		poolDir := seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
 		setPromotableNetwork(t, s, "beta-net")
 
-		err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"})
+		err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1", NewName: "vm1-copy"})
 		wantNetworkRefused(t, err, "promote", "beta-net")
-		assertNoPromotedArtifacts(t, s, poolDir, "vm1")
+		assertNoPromotedArtifacts(t, s, poolDir, "vm1-copy")
+		if rec, _ := corrosion.GetVM(context.Background(), s.db, "vm1-copy"); rec != nil {
+			t.Fatalf("refused renamed promotion persisted a row: %+v", rec)
+		}
 		if rec, _ := corrosion.GetVM(context.Background(), s.db, "vm1"); rec == nil || rec.HostName != "dead-host" {
 			t.Fatalf("refused promotion disturbed the durable record: %+v", rec)
 		}
+	})
+	// A takeover re-homes the existing VM and its existing NICs. Refusing would
+	// leave a fenced host's VM down without removing the attachment, so it
+	// promotes and leaves an audit record instead.
+	t.Run("takeover onto a foreign network promotes and audits", func(t *testing.T) {
+		s := testServer(t)
+		s.dataDir = t.TempDir()
+		seedAdmissionNetworks(t, s)
+		seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
+		setPromotableNetwork(t, s, "beta-net")
+
+		if err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"}); err != nil {
+			t.Fatalf("takeover promotion must not be blocked by network admission: %v", err)
+		}
+		if rec, _ := corrosion.GetVM(context.Background(), s.db, "vm1"); rec == nil || rec.HostName != s.hostName {
+			t.Fatalf("takeover did not re-home vm1: %+v", rec)
+		}
+		wantForeignNetworkAudit(t, s, "vm.promote", "vm1", "beta-net")
 	})
 	t.Run("global network promotes", func(t *testing.T) {
 		s := testServer(t)
@@ -257,7 +344,7 @@ func TestAutoDefineRestoredVM_NetworkProjectAdmission(t *testing.T) {
 		s, repo, _ := newServer(t)
 		req := &pb.RestoreLiveRequest{VmName: "r1"}
 		_, _, err := s.autoDefineRestoredVM(adminCtx(), req, repo, manifestWith(specFor("acme", "acme-net")), "/tmp/o.qcow2", "beta", noSend)
-		wantNetworkRefused(t, err, "restore", "acme-net")
+		wantNetworkRefused(t, err, "", "acme-net")
 		if rec, _ := corrosion.GetVM(context.Background(), s.db, "r1"); rec != nil {
 			t.Fatalf("refused restore persisted a row: %+v", rec)
 		}
@@ -266,7 +353,7 @@ func TestAutoDefineRestoredVM_NetworkProjectAdmission(t *testing.T) {
 		s, repo, _ := newServer(t)
 		req := &pb.RestoreLiveRequest{VmName: "r1"}
 		_, _, err := s.autoDefineRestoredVM(adminCtx(), req, repo, manifestWith(specFor("acme", "beta-net")), "/tmp/o.qcow2", "acme", noSend)
-		wantNetworkRefused(t, err, "restore", "beta-net")
+		wantNetworkRefused(t, err, "", "beta-net")
 	})
 	t.Run("caller spec on a raw bridge takes the create gate", func(t *testing.T) {
 		s, repo, _ := newServer(t)
@@ -277,6 +364,42 @@ func TestAutoDefineRestoredVM_NetworkProjectAdmission(t *testing.T) {
 		if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "raw/unmanaged bridge") {
 			t.Fatalf("a caller-supplied spec on a raw bridge from a non-root caller: got %v, want the raw-bridge refusal", err)
 		}
+	})
+	t.Run("manifest spec on a raw bridge takes the create gate", func(t *testing.T) {
+		s, repo, _ := newServer(t)
+		// The manifest is untrusted backup data: its project field must not buy a
+		// raw bridge the same-project carry.
+		req := &pb.RestoreLiveRequest{VmName: "r1"}
+		_, _, err := s.autoDefineRestoredVM(viewerCtx(), req, repo, manifestWith(specFor("acme", "br-raw")), "/tmp/o.qcow2", "acme", noSend)
+		if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "raw/unmanaged bridge") {
+			t.Fatalf("a manifest spec on a raw bridge from a non-root caller: got %v, want the raw-bridge refusal", err)
+		}
+	})
+	t.Run("from-existing spec", func(t *testing.T) {
+		s, repo, _ := newServer(t)
+		seed := func(name, project, network string) {
+			b, _ := json.Marshal(specFor(project, network))
+			if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
+				Name: name, HostName: "test-host", State: "stopped", Project: project, Spec: string(b),
+			}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		seed("ex-raw", "acme", "br-raw")
+		seed("ex-owned", "acme", "acme-net")
+		empty := &pbsstore.Manifest{DiskName: "root", TotalSize: 1 << 20}
+
+		// The cluster's own row is trusted: a same-project raw bridge is carried,
+		// so the non-root caller is stopped by vm.create, not by the bridge.
+		_, _, err := s.autoDefineRestoredVM(viewerCtx(), &pb.RestoreLiveRequest{VmName: "ex-raw", FromExisting: true, NewName: "ex-raw-2"},
+			repo, empty, "/tmp/o.qcow2", "acme", noSend)
+		if err == nil || strings.Contains(err.Error(), "raw/unmanaged bridge") {
+			t.Fatalf("a from-existing same-project raw bridge must be carried past network admission, got %v", err)
+		}
+		// Into another project it is still judged.
+		_, _, err = s.autoDefineRestoredVM(adminCtx(), &pb.RestoreLiveRequest{VmName: "ex-owned", FromExisting: true, NewName: "ex-owned-2"},
+			repo, empty, "/tmp/o.qcow2", "beta", noSend)
+		wantNetworkRefused(t, err, "restore", "acme-net")
 	})
 	t.Run("global network gets past admission", func(t *testing.T) {
 		s, repo, fake := newServer(t)
@@ -321,6 +444,57 @@ func TestImportVM_NetworkProjectAdmission(t *testing.T) {
 
 // ── container restore ────────────────────────────────────────────────────────
 
+// wantForeignNetworkAudit fails unless exactly one "allowed-foreign-network"
+// audit row exists for action/target, naming network.
+func wantForeignNetworkAudit(t *testing.T, s *Server, action, target, network string) {
+	t.Helper()
+	rows, err := s.db.Query(context.Background(),
+		`SELECT detail FROM audit_log WHERE action = ? AND target = ? AND result = 'allowed-foreign-network'`, action, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !strings.Contains(rows[0].String("detail"), strconv.Quote(network)) {
+		t.Fatalf("want one allowed-foreign-network audit for %s %s naming %q, got %d rows", action, target, network, len(rows))
+	}
+}
+
+// A failover relocation re-homes the existing container: it proceeds onto a
+// network its project may not use, and leaves an audit record.
+func TestRestoreContainer_RelocationOnForeignNetworkProceedsAndAudits(t *testing.T) {
+	s := newPeerAuthServer(t) // hostName "self", knows peer "peer-1"
+	s.dataDir = t.TempDir()
+	s.gate = fakeServerGate{execOK: true}
+	seedAdmissionNetworks(t, s)
+	rt := &fakeCTRuntime{exportPayload: []byte("rootfs")}
+	s.SetContainerRuntime(rt)
+	repo, ts, token, proofID := ctTestRepo(t), "2026-07-03T10:00:00Z", "reloc-token-1", "restore-proof-1"
+	ctx := adminCtx()
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "self", Name: "ct1", State: "running", Image: "alpine:3.19", Project: "acme",
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+			Template: "download", Distro: "alpine",
+			Networks: []corrosion.ContainerNetwork{{Name: "eth0", NetworkName: "beta-net"}},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{Name: "ct1", HostName: "self", RepoPath: repo, Timestamp: ts},
+		&progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+	_ = corrosion.DeleteContainer(ctx, s.db, "self", "ct1")
+
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
+		Name: "ct1", RepoPath: repo, Timestamp: ts, Proof: relocProof(proofID, token),
+	}, &progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx(token)}); err != nil {
+		t.Fatalf("a relocation must not be blocked by network admission: %v", err)
+	}
+	if row, _ := corrosion.GetContainer(context.Background(), s.db, "self", "ct1"); row == nil {
+		t.Fatal("relocation did not land the container row")
+	}
+	wantForeignNetworkAudit(t, s, "ct.restore", "ct1", "beta-net")
+}
+
 func TestRestoreContainer_NetworkProjectAdmission(t *testing.T) {
 	run := func(t *testing.T, network string) (*Server, error) {
 		s := testServer(t)
@@ -362,6 +536,14 @@ func TestRestoreContainer_NetworkProjectAdmission(t *testing.T) {
 }
 
 // ── stack NIC retarget ───────────────────────────────────────────────────────
+
+func TestRetargetVMNICs_MissingVMIsNotFound(t *testing.T) {
+	s := testServer(t)
+	_, err := s.retargetVMNICs(adminCtx(), "ghost", []compose.NICRetarget{{Ordinal: 0, From: "stk_lan", To: "lan"}})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("retarget of a missing VM: got %v, want NotFound", err)
+	}
+}
 
 func TestCheckNICRetarget_NetworkProjectAdmission(t *testing.T) {
 	s := testServer(t)

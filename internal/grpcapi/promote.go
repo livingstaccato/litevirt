@@ -750,12 +750,20 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return err
 		}
 	}
-	// Project isolation: the promoted VM re-attaches the spec's networks, so each
-	// must still be one the VM's project may use. Same project on both sides, so
-	// a raw bridge is carried (the automated failover path has no caller to
-	// re-check) and only a managed network another project owns is refused.
-	if err := s.admitCopiedNetworks(ctx, "promote", vm.Project, vm.Project, specNetworkNames(spec.Network)); err != nil {
-		return err
+	// Project isolation. A RENAMED promotion writes a second VM with new NIC rows
+	// — a new attachment — so each network must be one the VM's project may use
+	// (same project on both sides: a raw bridge is carried, a managed network
+	// another project owns is refused). A TAKEOVER re-homes the existing VM and
+	// its existing NICs; like the bound-network refusal above it must not block,
+	// since refusing would leave a fenced host's VM down without removing the
+	// attachment. It warns and audits instead. Keyed on renamed, not automated:
+	// automated is lost through relayPromote, which re-enters as a manual call.
+	if renamed {
+		if err := s.admitCopiedNetworks(ctx, "promote", vm.Project, vm.Project, specNetworkNames(spec.Network)); err != nil {
+			return err
+		}
+	} else {
+		s.warnForeignNetworks(ctx, "vm.promote", targetName, vm.Project, specNetworkNames(spec.Network))
 	}
 
 	// Adoption gate (fail-closed, no-op pre-latch): under the active hardware_v2 regime a

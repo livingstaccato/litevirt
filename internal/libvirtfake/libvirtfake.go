@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -168,6 +169,10 @@ type Fake struct {
 	// fail-closed path that reads both views of a domain and must treat an
 	// unreadable persistent config as a gap rather than an absence.
 	FailDumpXMLInactive func(name string) error
+	// FailRunningDomainTaps, when set, runs at the start of RunningDomainTaps
+	// and its error is returned — a dead or restarting libvirt connection. It
+	// may also block, to model a hung libvirtd.
+	FailRunningDomainTaps func() error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -1591,6 +1596,36 @@ func (f *Fake) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) 
 	return nil
 }
 
+// fakeMACAttr finds the MACs in a fake domain XML (xmlgen output or the
+// fake's own string-built NICs).
+var fakeMACAttr = regexp.MustCompile(`<mac\s+address=["']([^"']+)["']`)
+
+// RunningDomainTaps is libvirt.Client.RunningDomainTaps over the fake: every
+// active domain, every MAC in its live XML, each with the tap TapDevice
+// would report.
+func (f *Fake) RunningDomainTaps() (map[string]map[string]string, error) {
+	if f.FailRunningDomainTaps != nil {
+		if err := f.FailRunningDomainTaps(); err != nil {
+			return nil, err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]map[string]string{}
+	for name, st := range f.domains {
+		if st != StateRunning && st != StatePaused {
+			continue
+		}
+		taps := map[string]string{}
+		for _, m := range fakeMACAttr.FindAllStringSubmatch(f.liveXMLLocked(name), -1) {
+			mac := strings.ToLower(m[1])
+			taps[mac] = f.tapLocked(name, mac)
+		}
+		out[name] = taps
+	}
+	return out, nil
+}
+
 // tapKey names one NIC in one run of a domain.
 type tapKey struct {
 	domain string
@@ -1618,14 +1653,20 @@ func (f *Fake) TapDevice(domainName, mac string) (string, error) {
 	if !strings.Contains(strings.ToLower(f.liveXMLLocked(domainName)), mac) {
 		return "", fmt.Errorf("libvirtfake: interface with MAC %s not found in domain %s", mac, domainName)
 	}
+	return f.tapLocked(domainName, mac), nil
+}
+
+// tapLocked returns the tap of an active domain's NIC in its current run,
+// handing out the next vnetN on first use. mac is lower-cased. Caller holds f.mu.
+func (f *Fake) tapLocked(domainName, mac string) string {
 	k := tapKey{domain: domainName, run: f.starts[domainName], mac: mac}
 	if tap, ok := f.taps[k]; ok {
-		return tap, nil
+		return tap
 	}
 	tap := fmt.Sprintf("vnet%d", f.nextTap)
 	f.nextTap++
 	f.taps[k] = tap
-	return tap, nil
+	return tap
 }
 
 // Lifecycle hooks — daemon-only paths. Connection management is a no-op (there

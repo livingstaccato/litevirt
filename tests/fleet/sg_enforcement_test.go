@@ -22,6 +22,7 @@ package fleet
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -58,7 +59,7 @@ func sgCluster(t *testing.T) *Cluster {
 func nodePlan(t *testing.T, n *Node) firewall.Plan {
 	t.Helper()
 	plan, err := firewall.CorrosionPlanLoader(n.DB, n.Name, firewall.Plan{},
-		firewall.LoaderOptions{ResolveTap: n.Virt.TapDevice})(context.Background())
+		firewall.LoaderOptions{RunningTaps: n.Virt.RunningDomainTaps})(context.Background())
 	if err != nil {
 		t.Fatalf("firewall plan on %s: %v", n.Name, err)
 	}
@@ -393,5 +394,27 @@ func TestFleet_SG_BindReachesAPostLatchHotAttachedNIC(t *testing.T) {
 	chain := nicChain(renderPlan(t, nodePlan(t, host)), tap)
 	if !strings.Contains(chain, "tcp dport 9 accept") || strings.Contains(chain, "dport 443") {
 		t.Errorf("after binding app's NIC to isolate, its chain must carry isolate and not web:\n%s", chain)
+	}
+}
+
+// TestFleet_SG_LibvirtOutageFailsThePass: with a VM running and libvirt's
+// connection down, the host's plan must fail to build — so the reconciler
+// keeps the applied ruleset — rather than come back without the VM's chain.
+func TestFleet_SG_LibvirtOutageFailsThePass(t *testing.T) {
+	c := sgCluster(t)
+	ctx := context.Background()
+	host := c.Nodes[1]
+	mustCreateSG(t, c, host, "ssh", "22")
+	if _, err := c.SelfClient(host).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+		Name: "web", Cpu: 1, MemoryMib: 512, Placement: &pb.PlacementSpec{Host: host.Name},
+		Network: []*pb.NetworkAttachment{{Name: sgNet, SecurityGroups: []string{"ssh"}}},
+	}}); err != nil {
+		t.Fatalf("CreateVM web: %v", err)
+	}
+	host.Virt.FailRunningDomainTaps = func() error { return errors.New("connection is shut down") }
+	plan, err := firewall.CorrosionPlanLoader(host.DB, host.Name, firewall.Plan{},
+		firewall.LoaderOptions{RunningTaps: host.Virt.RunningDomainTaps})(ctx)
+	if err == nil {
+		t.Fatalf("libvirt down: the plan must fail, got one with NICs %+v", plan.NICs)
 	}
 }

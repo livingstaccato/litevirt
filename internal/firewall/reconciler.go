@@ -2,6 +2,7 @@ package firewall
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -238,20 +239,37 @@ func (r *Reconciler) recordOK() {
 	r.lastTick = time.Now()
 }
 
-// TapResolver names the host device libvirt gave a running VM's NIC, by the
-// NIC's MAC. libvirt.Client.TapDevice is the production one. It answers from
-// the live domain, so it errors for a VM that is not running.
-type TapResolver func(vmName, mac string) (string, error)
+// RunningTaps lists the host device of every NIC of every running domain on
+// this host: domain name → lower-cased MAC → tap. libvirt.Client.
+// RunningDomainTaps is the production one. A domain that is not running is
+// simply absent; an error means libvirt could not be asked at all.
+type RunningTaps func() (map[string]map[string]string, error)
+
+// defaultTapTimeout bounds one RunningTaps call. go-libvirt calls take no
+// context, so a hung libvirtd would otherwise stall the reconciler — NAT,
+// isolation and `lv firewall reload` with it.
+const defaultTapTimeout = 10 * time.Second
 
 // LoaderOptions are CorrosionPlanLoader's host-local inputs: what it cannot
 // read from the replicated tables.
 type LoaderOptions struct {
-	// ResolveTap is asked for every local VM NIC's tap on every pass. The tap
-	// recorded in vm_interfaces is never used: it is written once, at create,
-	// and libvirt hands out a new vnetN on every start, so after a stop and
-	// start, a migration or a failover it names nothing — or another VM's tap
-	// on this host. nil renders no VM NIC chains at all.
-	ResolveTap TapResolver
+	// RunningTaps is asked once per pass for the taps of every running
+	// domain. The tap recorded in vm_interfaces is never used: it is written
+	// once, at create, and libvirt hands out a new vnetN on every start, so
+	// after a stop and start, a migration or a failover it names nothing — or
+	// another VM's tap on this host. nil renders no VM NIC chains at all.
+	//
+	// When it errors or times out, the pass fails and Reconcile keeps the
+	// ruleset it last applied. Dropping the VM NICs instead would remove every
+	// per-NIC chain on the host while libvirt is merely unreachable, and under
+	// the default accept policy every VM would run unfiltered until it came
+	// back.
+	RunningTaps RunningTaps
+
+	// TapTimeout bounds one RunningTaps call; zero means defaultTapTimeout.
+	// While a timed-out call is still outstanding, later passes fail at once
+	// rather than stack up goroutines behind a hung libvirtd.
+	TapTimeout time.Duration
 
 	// OnDuplicateSGs, when set, receives after every pass the security-group
 	// names that more than one live group holds and that a NIC on this host is
@@ -269,9 +287,10 @@ type LoaderOptions struct {
 // vm_nics/vm_interfaces overlay, with its groups from its vm_nics row when it
 // has one (a hot-attached NIC has them nowhere else) and from vm_interfaces
 // otherwise. Each VM NIC owned by `hostName` produces a NICBinding on the tap libvirt
-// reports for that NIC's MAC right now (opts.ResolveTap). A NIC whose tap
-// cannot be resolved — its VM is not running, or the NIC is not in the live
-// domain — is skipped: there is no device to filter.
+// reports for that NIC's MAC right now (opts.RunningTaps). A NIC libvirt does
+// not report — its VM is not running, or the NIC is not in the live domain — is
+// skipped: there is no device to filter. If libvirt cannot be asked, the pass
+// fails and the applied ruleset stays.
 //
 // A NIC (VM or container) bound to a group name that more than one live group
 // holds fails CLOSED: its chain drops everything new and renders neither
@@ -280,6 +299,7 @@ type LoaderOptions struct {
 // anyway — written before the refusal, by a peer on an older build, or by two
 // nodes racing, since the CRDT has no UNIQUE.
 func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
+	taps := &tapFetcher{}
 	return func(ctx context.Context) (Plan, error) {
 		plan := defaults
 
@@ -385,11 +405,22 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if err != nil {
 			return plan, err
 		}
+		var running map[string]map[string]string
+		if len(ifaces) > 0 && opts.RunningTaps != nil {
+			if running, err = taps.fetch(ctx, opts.RunningTaps, opts.TapTimeout); err != nil {
+				return plan, fmt.Errorf("read VM taps from libvirt (keeping the applied ruleset): %w", err)
+			}
+		}
 		plan.NICs = plan.NICs[:0:0]
 		claimed := map[string]string{} // tap → the VM that holds it this pass
 		for _, ifc := range ifaces {
-			tap := resolveVMTap(opts.ResolveTap, ifc.VMName, ifc.MAC, ifc.VMState)
+			tap := running[ifc.VMName][strings.ToLower(ifc.MAC)]
 			if tap == "" {
+				if ifc.VMState == "running" && opts.RunningTaps != nil {
+					// libvirt answered and does not have this NIC running.
+					slog.Warn("firewall: a VM recorded as running has no tap for this NIC in libvirt; no chain rendered",
+						"vm", ifc.VMName, "mac", ifc.MAC)
+				}
 				continue
 			}
 			if other, dup := claimed[tap]; dup {
@@ -446,25 +477,51 @@ func failClosed() []Rule {
 	}
 }
 
-// resolveVMTap asks libvirt for the tap of one local VM NIC. "" means there is
-// nothing to bind a chain to. A VM that is not running has no tap, which is the
-// common case and is not worth a warning; a running VM whose NIC libvirt cannot
-// name is, because that NIC may be passing traffic this host cannot filter.
-func resolveVMTap(resolve TapResolver, vmName, mac, vmState string) string {
-	if resolve == nil || mac == "" {
-		return ""
+// tapFetcher runs one RunningTaps call at a time under a deadline. The call
+// cannot be cancelled (go-libvirt takes no context), so on a timeout its
+// goroutine is left to finish on its own, and until it does every fetch fails
+// at once instead of starting another.
+type tapFetcher struct {
+	mu   sync.Mutex
+	busy bool
+}
+
+var errTapFetchOutstanding = errors.New("an earlier libvirt tap lookup has not returned")
+
+func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Duration) (map[string]map[string]string, error) {
+	if timeout <= 0 {
+		timeout = defaultTapTimeout
 	}
-	tap, err := resolve(vmName, mac)
-	if err != nil || tap == "" {
-		if vmState == "running" {
-			slog.Warn("firewall: cannot resolve the tap of a running VM's NIC; its security groups are not enforced",
-				"vm", vmName, "mac", mac, "error", err)
-		} else {
-			slog.Debug("firewall: no tap for VM NIC; no chain rendered", "vm", vmName, "mac", mac, "error", err)
-		}
-		return ""
+	f.mu.Lock()
+	if f.busy {
+		f.mu.Unlock()
+		return nil, errTapFetchOutstanding
 	}
-	return tap
+	f.busy = true
+	f.mu.Unlock()
+
+	type result struct {
+		taps map[string]map[string]string
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		m, err := src()
+		f.mu.Lock()
+		f.busy = false
+		f.mu.Unlock()
+		done <- result{m, err}
+	}()
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case r := <-done:
+		return r.taps, r.err
+	case <-t.C:
+		return nil, fmt.Errorf("libvirt did not answer within %s", timeout)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // intentToNATIsolation aggregates per-host firewall intent rows into the

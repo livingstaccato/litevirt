@@ -170,6 +170,69 @@ func readTapVLANs(tapDev string) ([]int, error) {
 	return vlans, nil
 }
 
+// RunningDomainTaps returns the host device of every NIC of every running
+// domain: domain name → lower-cased MAC → target dev, as the live XML reports
+// it. One domain list plus one XML fetch per running domain, so the cost per
+// call is bounded by the domains, not the NICs.
+//
+// A domain that stops between the list and its XML fetch is skipped: it has
+// no taps. Any other error — the connection is down, libvirtd is restarting —
+// is returned, so a caller can tell "no tap" from "could not ask". The
+// firewall depends on that: a missing answer must keep the applied ruleset,
+// not remove every per-NIC chain on the host.
+func (c *Client) RunningDomainTaps() (map[string]map[string]string, error) {
+	if c == nil {
+		return nil, fmt.Errorf("libvirt: no client")
+	}
+	names, err := c.ListRunningDomains()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[string]string, len(names))
+	for _, name := range names {
+		xmlStr, err := c.DumpXML(name)
+		if err != nil {
+			if IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		taps, err := parseTapDevices(xmlStr)
+		if err != nil {
+			return nil, fmt.Errorf("domain %s: %w", name, err)
+		}
+		out[name] = taps
+	}
+	return out, nil
+}
+
+// parseTapDevices maps every interface in a live domain XML that has a target
+// dev from its lower-cased MAC to that dev.
+func parseTapDevices(xmlStr string) (map[string]string, error) {
+	var doc struct {
+		Devices struct {
+			Interfaces []struct {
+				MAC struct {
+					Address string `xml:"address,attr"`
+				} `xml:"mac"`
+				Target struct {
+					Dev string `xml:"dev,attr"`
+				} `xml:"target"`
+			} `xml:"interface"`
+		} `xml:"devices"`
+	}
+	if err := xml.Unmarshal([]byte(xmlStr), &doc); err != nil {
+		return nil, fmt.Errorf("parse domain XML: %w", err)
+	}
+	out := map[string]string{}
+	for _, iface := range doc.Devices.Interfaces {
+		if iface.MAC.Address != "" && iface.Target.Dev != "" {
+			out[strings.ToLower(iface.MAC.Address)] = iface.Target.Dev
+		}
+	}
+	return out, nil
+}
+
 // findTapDevice returns the tap interface name for a given domain + MAC by
 // inspecting the live domain XML (which libvirt populates with target dev after start).
 func findTapDevice(c *Client, domainName, mac string) (string, error) {

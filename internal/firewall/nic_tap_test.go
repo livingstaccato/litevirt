@@ -49,9 +49,9 @@ func TestCorrosionPlanLoader_TapComesFromLibvirtNotTheRecord(t *testing.T) {
 
 	// libvirt now: vm-a restarted onto vnet3, vm-b holds vnet0, vm-stopped is
 	// not running and so has no tap at all.
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]string{
-		"52:54:00:00:00:0a": "vnet3",
-		"52:54:00:00:00:0b": "vnet0",
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{
+		"vm-a": {"52:54:00:00:00:0a": "vnet3"},
+		"vm-b": {"52:54:00:00:00:0b": "vnet0"},
 	}))(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
@@ -128,9 +128,9 @@ func TestCorrosionPlanLoader_OneTapIsBoundOnce(t *testing.T) {
 			t.Fatalf("InsertVM %s: %v", vm.name, err)
 		}
 	}
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]string{
-		"52:54:00:00:00:0a": "vnet7",
-		"52:54:00:00:00:0b": "vnet7",
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{
+		"vm-a": {"52:54:00:00:00:0a": "vnet7"},
+		"vm-b": {"52:54:00:00:00:0b": "vnet7"},
 	}))(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
@@ -191,7 +191,7 @@ func TestCorrosionPlanLoader_DuplicateNameFailsClosed(t *testing.T) {
 	}
 
 	var reported map[string]int
-	opts := liveTaps(map[string]string{"52:54:00:00:00:0a": "vnet1", "52:54:00:00:00:0b": "vnet2"})
+	opts := liveTaps(map[string]map[string]string{"vm-web": {"52:54:00:00:00:0a": "vnet1"}, "vm-ssh": {"52:54:00:00:00:0b": "vnet2"}})
 	opts.OnDuplicateSGs = func(m map[string]int) { reported = m }
 	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, opts)(ctx)
 	if err != nil {

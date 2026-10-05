@@ -3,7 +3,6 @@ package firewall
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -51,7 +50,7 @@ func TestCorrosionPlanLoader_BindsSGsToNICs(t *testing.T) {
 	}
 
 	// 3. Build the plan via the production loader and render it.
-	loader := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]string{"aa:bb:cc:dd:ee:01": "tap-vm-web-0"}))
+	loader := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{"vm-web": {"aa:bb:cc:dd:ee:01": "tap-vm-web-0"}}))
 	plan, err := loader(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
@@ -166,7 +165,7 @@ func TestCorrosionPlanLoader_DropsUnknownSGNamesGracefully(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]string{"aa:bb:cc:dd:ee:02": "tap-x-0"}))(ctx)
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{"vm-x": {"aa:bb:cc:dd:ee:02": "tap-x-0"}}))(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -246,8 +245,8 @@ func TestCorrosionPlanLoader_SkipsNICsOnOtherHosts(t *testing.T) {
 
 	// The resolver answers for BOTH MACs, so only the host filter can keep
 	// vm-on-b's NIC out of host-a's plan.
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]string{
-		"aa:bb:cc:dd:ee:0a": "tap-a-0", "aa:bb:cc:dd:ee:0b": "tap-b-0",
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{
+		"vm-on-a": {"aa:bb:cc:dd:ee:0a": "tap-a-0"}, "vm-on-b": {"aa:bb:cc:dd:ee:0b": "tap-b-0"},
 	}))(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
@@ -257,15 +256,18 @@ func TestCorrosionPlanLoader_SkipsNICsOnOtherHosts(t *testing.T) {
 	}
 }
 
-// liveTaps is a TapResolver over a fixed MAC → tap table, standing in for
-// libvirt's live domain XML. A MAC it does not know errors, as libvirt does for
-// a NIC that is not in a running domain.
-func liveTaps(byMAC map[string]string) LoaderOptions {
-	return LoaderOptions{ResolveTap: func(vmName, mac string) (string, error) {
-		if tap, ok := byMAC[strings.ToLower(mac)]; ok {
-			return tap, nil
+// liveTaps is a RunningTaps over a fixed domain → MAC → tap table, standing in
+// for libvirt's running domains. A domain it does not list is not running.
+func liveTaps(byVM map[string]map[string]string) LoaderOptions {
+	return LoaderOptions{RunningTaps: func() (map[string]map[string]string, error) {
+		out := map[string]map[string]string{}
+		for vm, taps := range byVM {
+			out[vm] = map[string]string{}
+			for mac, tap := range taps {
+				out[vm][strings.ToLower(mac)] = tap
+			}
 		}
-		return "", fmt.Errorf("interface with MAC %s not found in domain %s", mac, vmName)
+		return out, nil
 	}}
 }
 

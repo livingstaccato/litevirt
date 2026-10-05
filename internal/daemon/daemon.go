@@ -1220,7 +1220,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	fwApplier := firewall.NewApplier(firewall.NftBinary{})
 	fwMetrics := metrics.NewFirewallMetrics()
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
-		firewall.LoaderOptions{ResolveTap: d.virt.TapDevice, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs})
+		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
 	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables

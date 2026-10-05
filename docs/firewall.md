@@ -268,7 +268,10 @@ missing. Recommended order:
   libvirt for each local NIC's tap by MAC and binds the chain to that; a NIC
   of a VM that is not running has no tap and gets no chain. A running VM
   whose NIC libvirt cannot name is logged as a warning, because that NIC is
-  not filtered.
+  not filtered. If libvirt cannot be asked at all (the connection is down,
+  libvirtd is restarting, or it does not answer within 10s), the pass fails
+  and the ruleset already applied stays in place; `lv firewall show` reports
+  the error.
 - **Group names are unique, and a duplicate fails closed.** `lv sg create`
   and a stack deploy refuse a name another live group holds. Two live groups
   can still share a name (rows written before this check, by a node on an

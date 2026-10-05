@@ -238,16 +238,32 @@ func (r *Reconciler) recordOK() {
 	r.lastTick = time.Now()
 }
 
+// TapResolver names the host device libvirt gave a running VM's NIC, by the
+// NIC's MAC. libvirt.Client.TapDevice is the production one. It answers from
+// the live domain, so it errors for a VM that is not running.
+type TapResolver func(vmName, mac string) (string, error)
+
+// LoaderOptions are CorrosionPlanLoader's host-local inputs: what it cannot
+// read from the replicated tables.
+type LoaderOptions struct {
+	// ResolveTap is asked for every local VM NIC's tap on every pass. The tap
+	// recorded in vm_interfaces is never used: it is written once, at create,
+	// and libvirt hands out a new vnetN on every start, so after a stop and
+	// start, a migration or a failover it names nothing — or another VM's tap
+	// on this host. nil renders no VM NIC chains at all.
+	ResolveTap TapResolver
+}
+
 // CorrosionPlanLoader builds a Plan from the cluster's
 // security_groups + sg_rules + vm_interfaces tables, scoped to the
 // current host.
 //
-// closes the loop: per-NIC bindings come from the
-// vm_interfaces.security_groups column. Each VM interface owned by
-// `hostName` produces a NICBinding referencing the SG names stored on
-// that row. NICs without a tap_device (not yet provisioned) are
-// skipped so we don't emit chains for non-existent interfaces.
-func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) PlanLoader {
+// Per-NIC bindings come from the vm_interfaces.security_groups column. Each VM
+// interface owned by `hostName` produces a NICBinding on the tap libvirt
+// reports for that NIC's MAC right now (opts.ResolveTap). A NIC whose tap
+// cannot be resolved — its VM is not running, or the NIC is not in the live
+// domain — is skipped: there is no device to filter.
+func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
 	return func(ctx context.Context) (Plan, error) {
 		plan := defaults
 
@@ -314,10 +330,20 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 			return plan, err
 		}
 		plan.NICs = plan.NICs[:0:0]
+		claimed := map[string]string{} // tap → the VM that holds it this pass
 		for _, ifc := range ifaces {
-			if ifc.TapDevice == "" {
+			tap := resolveVMTap(opts.ResolveTap, ifc.VMName, ifc.MAC)
+			if tap == "" {
 				continue
 			}
+			if other, dup := claimed[tap]; dup {
+				// Two NICs cannot hold one device; rendering both would emit one
+				// chain twice and nft would refuse the whole ruleset.
+				slog.Warn("firewall: two VM NICs resolved to one tap; keeping the first",
+					"tap", tap, "vm", ifc.VMName, "other_vm", other)
+				continue
+			}
+			claimed[tap] = ifc.VMName
 			bound := make([]string, 0, len(ifc.SecurityGroups))
 			for _, name := range ifc.SecurityGroups {
 				if valid[name] {
@@ -325,7 +351,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 				}
 			}
 			plan.NICs = append(plan.NICs, NICBinding{
-				NICDev:         ifc.TapDevice,
+				NICDev:         tap,
 				VMName:         ifc.VMName,
 				SecurityGroups: bound,
 			})
@@ -366,6 +392,21 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 		plan.NAT, plan.HostIsolation = intentToNATIsolation(intents)
 		return plan, nil
 	}
+}
+
+// resolveVMTap asks libvirt for the tap of one local VM NIC. "" means there is
+// nothing to bind a chain to. A VM that is not running has no tap, which is the
+// common case, so a failed lookup is logged at debug level only.
+func resolveVMTap(resolve TapResolver, vmName, mac string) string {
+	if resolve == nil || mac == "" {
+		return ""
+	}
+	tap, err := resolve(vmName, mac)
+	if err != nil || tap == "" {
+		slog.Debug("firewall: no tap for VM NIC; no chain rendered", "vm", vmName, "mac", mac, "error", err)
+		return ""
+	}
+	return tap
 }
 
 // intentToNATIsolation aggregates per-host firewall intent rows into the

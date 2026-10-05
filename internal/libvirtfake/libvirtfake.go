@@ -71,6 +71,15 @@ type Fake struct {
 	managedInc             map[string]string // domain → the managed stamp's incarnation attribute
 	events                 []Event
 
+	// starts counts each domain's StartDomain calls, and taps holds the host
+	// device each NIC was given in one of those runs (keyed by domain, run and
+	// lower-cased MAC). nextTap is the host-wide vnetN counter. Together they
+	// model what libvirt does: a NIC gets the next free vnetN when the domain
+	// starts, so the same NIC has a different tap after a stop and start.
+	starts  map[string]int
+	taps    map[tapKey]string
+	nextTap int
+
 	// eventCB is the domain lifecycle callback registered by
 	// RegisterDomainEventCallback; nil until something registers. FireEvent
 	// delivers to it. Guarded by f.mu.
@@ -230,6 +239,8 @@ func New() *Fake {
 		stats:       make(map[string]*libvirt.DomainStats),
 		reasons:     make(map[string]string),
 		managedSave: make(map[string]bool),
+		starts:      make(map[string]int),
+		taps:        make(map[tapKey]string),
 
 		pendingUnplug:  make(map[string][]func()),
 		unplugRequests: make(map[string]int),
@@ -409,6 +420,7 @@ func (f *Fake) StartDomain(name string) error {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
 	f.domains[name] = StateRunning
+	f.starts[name]++
 	f.record("start", name, "")
 	return nil
 }
@@ -1579,10 +1591,41 @@ func (f *Fake) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) 
 	return nil
 }
 
-// TapDevice returns a deterministic fake tap name derived from the domain so
-// fleet tests can exercise the firewall's per-NIC binding path.
+// tapKey names one NIC in one run of a domain.
+type tapKey struct {
+	domain string
+	run    int
+	mac    string
+}
+
+// TapDevice returns the host device of the domain's NIC with this MAC, as
+// libvirt reports it in the live XML: only while the domain is active, only for
+// a NIC the live definition has, and a fresh vnetN for every run of the
+// domain. A real libvirt hands out the next free vnetN at each start, so a
+// recorded name goes stale on a stop and start; returning the same name for
+// ever would hide exactly that.
 func (f *Fake) TapDevice(domainName, mac string) (string, error) {
-	return "tap-" + domainName, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[domainName]
+	if !ok {
+		return "", fmt.Errorf("libvirtfake: domain %q not defined", domainName)
+	}
+	if st != StateRunning && st != StatePaused {
+		return "", fmt.Errorf("libvirtfake: domain %q is not active (%s): no target dev for interface %s", domainName, st, mac)
+	}
+	mac = strings.ToLower(mac)
+	if !strings.Contains(strings.ToLower(f.liveXMLLocked(domainName)), mac) {
+		return "", fmt.Errorf("libvirtfake: interface with MAC %s not found in domain %s", mac, domainName)
+	}
+	k := tapKey{domain: domainName, run: f.starts[domainName], mac: mac}
+	if tap, ok := f.taps[k]; ok {
+		return tap, nil
+	}
+	tap := fmt.Sprintf("vnet%d", f.nextTap)
+	f.nextTap++
+	f.taps[k] = tap
+	return tap, nil
 }
 
 // Lifecycle hooks — daemon-only paths. Connection management is a no-op (there

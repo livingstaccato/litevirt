@@ -48,7 +48,7 @@ func TestCorrosionPlanLoader_LoadsAllTiers(t *testing.T) {
 		t.Fatalf("SetFirewallDefault: %v", err)
 	}
 
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{})(ctx)
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestCorrosionPlanLoader_DefaultAcceptWhenUnset(t *testing.T) {
 	if err := corrosion.InitSchema(ctx, db); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{})(ctx)
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -125,11 +125,11 @@ func TestHostDefaultOverridesCluster(t *testing.T) {
 	if err := corrosion.SetFirewallDefault(ctx, db, "host-a", false, ""); err != nil {
 		t.Fatal(err)
 	}
-	planA, _ := CorrosionPlanLoader(db, "host-a", Plan{})(ctx)
+	planA, _ := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(ctx)
 	if planA.DefaultDeny {
 		t.Error("host-a should inherit its own accept override, got deny")
 	}
-	planB, _ := CorrosionPlanLoader(db, "host-b", Plan{})(ctx)
+	planB, _ := CorrosionPlanLoader(db, "host-b", Plan{}, LoaderOptions{})(ctx)
 	if !planB.DefaultDeny {
 		t.Error("host-b has no override, should inherit cluster deny")
 	}

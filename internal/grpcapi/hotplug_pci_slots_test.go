@@ -12,9 +12,9 @@ import (
 // reaches the domain libvirt defines for a brand-new VM — the exact scenario
 // the brief describes (a q35 guest needs spare root ports from the moment it
 // is created, so its SECOND hot-plug doesn't hit "No more available PCI
-// slots"). Without this end-to-end check, deleting the one-line
-// `vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg` at the CreateVM call
-// site would pass every other test in this package.
+// slots"). Without this end-to-end check, deleting the
+// `s.ensureSparePCIeRootPorts(spec.Name)` top-up after CreateVM's define
+// would pass every other test in this package.
 func TestCreateVM_SparePCIeRootPortsReachTheDefinedDomain(t *testing.T) {
 	s, fake := provableCreateServer(t)
 	s.SetSparePCIeRootPorts(5)
@@ -37,8 +37,8 @@ func TestCreateVM_SparePCIeRootPortsReachTheDefinedDomain(t *testing.T) {
 // TestCreateVM_SparePCIeRootPortsDefaultZero_NoControllers: the Server's
 // zero-value field (no SetSparePCIeRootPorts call — a daemon that never wired
 // it) must define a domain with NO pcie-root-port controllers, i.e. the exact
-// pre-this-feature XML. This is the companion to the xmlgen-level "0 is a
-// no-op" test, proven at the Server/RPC boundary instead of the pure builder.
+// pre-this-feature XML. This is the Server-level companion to
+// TestEnsureSparePCIeRootPorts's "want 0 never reads or defines anything".
 func TestCreateVM_SparePCIeRootPortsDefaultZero_NoControllers(t *testing.T) {
 	s, fake := provableCreateServer(t)
 	ctx := adminCtx()

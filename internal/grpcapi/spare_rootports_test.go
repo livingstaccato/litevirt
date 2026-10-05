@@ -1,13 +1,17 @@
 package grpcapi
 
 import (
+	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/pbsstore"
 )
 
 // q35PriorXML is an existing q35 domain as libvirt keeps it: every device
@@ -129,4 +133,136 @@ func TestCreateVM_SpareRootPortTopUpFailureIsNotFatal(t *testing.T) {
 	if strings.Contains(domXML, "pcie-root-port") {
 		t.Fatalf("the failed top-up must leave the first definition in place:\n%s", domXML)
 	}
+}
+
+// The remaining from-scratch define sites, one test each: deleting the
+// top-up call at any of them goes red. Each counts the root ports the fake
+// holds for the new domain. The fake assigns no addresses, so every port
+// there is a top-up port.
+func requireSpareRootPorts(t *testing.T, fake *libvirtfake.Fake, name string, want int) {
+	t.Helper()
+	got := fake.DefinedXML(name)
+	if got == "" {
+		t.Fatalf("no domain %q defined", name)
+	}
+	if n := strings.Count(got, `model="pcie-root-port"`); n != want {
+		t.Fatalf("domain %q has %d spare root ports, want %d:\n%s", name, n, want, got)
+	}
+}
+
+// Clone is what the slot-exhaustion message tells an operator to use, so
+// it must deliver the spares.
+//
+// Mutation: drop the top-up from CloneVM — red.
+func TestCloneVM_TopsUpSpareRootPorts(t *testing.T) {
+	s := cloneSourceTemplate(t)
+	s.SetSparePCIeRootPorts(4)
+	if _, err := s.CloneVM(adminCtx(), &pb.CloneVMRequest{Source: "tpl", Target: "c1", Mode: "linked"}); err != nil {
+		t.Fatalf("CloneVM: %v", err)
+	}
+	requireSpareRootPorts(t, s.virt.(*libvirtfake.Fake), "c1", 4)
+}
+
+// Mutation: drop the top-up from ImportVM — red.
+func TestImportVM_TopsUpSpareRootPorts(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	admissionHost(t, s)
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.SetSparePCIeRootPorts(4)
+	// A Proxmox conf with no machine line imports as i440fx, which has no
+	// root ports at all; name q35.
+	if err := importSmallVM(t, s, "imp1", "", 512, false, "machine: q35"); err != nil {
+		t.Fatalf("ImportVM: %v", err)
+	}
+	requireSpareRootPorts(t, fake, "imp1", 4)
+}
+
+// Mutation: drop the top-up from the promote define — red.
+func TestPromoteReplica_TopsUpSpareRootPorts(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.SetSparePCIeRootPorts(4)
+	ctx := adminCtx()
+
+	poolDir := t.TempDir()
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{"replica-pool": {Driver: "local", Target: poolDir}})
+	specJSON, _ := json.Marshal(&pb.VMSpec{
+		Name: "vm1", Cpu: 1, MemoryMib: 512,
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000"}},
+	})
+	if err := corrosion.InsertVM(ctx, s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running", Spec: string(specJSON)},
+		nil,
+		[]corrosion.DiskRecord{{
+			VMName: "vm1", DiskName: "root", HostName: "test-host",
+			Path: "/nonexistent-source", SizeBytes: 1 << 20, StorageType: "local",
+		}},
+	); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(poolDir, "vm1-root-20260101000000.raw"), make([]byte, 1<<20), 0644); err != nil {
+		t.Fatalf("write replica: %v", err)
+	}
+	stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}
+	if err := s.PromoteReplica(&pb.PromoteReplicaRequest{
+		VmName: "vm1", NewName: "vm1-promoted", TargetPool: "replica-pool", NoLocalize: true,
+	}, stream); err != nil {
+		t.Fatalf("PromoteReplica: %v", err)
+	}
+	requireSpareRootPorts(t, fake, "vm1-promoted", 4)
+}
+
+// Mutation: drop the top-up from the live-restore autostart define — red.
+func TestRestoreLive_AutoStart_TopsUpSpareRootPorts(t *testing.T) {
+	s := testServer(t)
+	s.hostName = "host-a"
+	s.dataDir = t.TempDir()
+	fake := libvirtfake.New()
+	s.virt = fake
+	s.SetSparePCIeRootPorts(4)
+
+	specJSON, err := json.Marshal(&pb.VMSpec{
+		Name: "vm1", Cpu: 2, MemoryMib: 2048,
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000"}},
+	})
+	if err != nil {
+		t.Fatalf("marshal spec: %v", err)
+	}
+	repoDir, ts := seedLiveRepo(t, make([]byte, pbsstore.ChunkSize), string(specJSON))
+	_, cancel, done := runRestoreLiveUntil(t, s, &pb.RestoreLiveRequest{
+		RepoPath: repoDir, VmName: "vm1", DiskName: "root", Timestamp: ts,
+		TargetPath: filepath.Join(t.TempDir(), "live.qcow2"), AutoStart: true,
+	}, pb.RestoreLiveProgress_STARTED)
+	defer func() { cancel(); <-done }()
+
+	requireSpareRootPorts(t, fake, "vm1", 4)
+}
+
+// UpdateVM with no inactive XML to patch regenerates the definition, which
+// is then topped up like a create.
+//
+// Mutation: drop the top-up from UpdateVM's regenerate branch — red.
+func TestUpdateVM_RegenerateTopsUpSpareRootPorts(t *testing.T) {
+	s := reconfigServer(t)
+	s.SetSparePCIeRootPorts(4)
+	ctx := adminCtx()
+	insertTestVMWithSpec(t, ctx, s.db, "regen", "test-host", "stopped",
+		seedSpecJSON(t, &pb.VMSpec{
+			Name: "regen", Cpu: 2, MemoryMib: 4096,
+			Disks: []*pb.DiskSpec{{Name: "root", Bus: "virtio"}},
+		}))
+	if err := corrosion.InsertDisk(ctx, s.db, corrosion.DiskRecord{
+		VMName: "regen", DiskName: "root", HostName: "test-host",
+		Path: "/x/regen-root.qcow2", DeviceKind: "disk", TargetDev: "vda", DeleteWithVM: true,
+	}); err != nil {
+		t.Fatalf("insert root: %v", err)
+	}
+	if _, err := s.UpdateVM(ctx, &pb.UpdateVMRequest{Name: "regen", Cpu: 4}); err != nil {
+		t.Fatalf("UpdateVM: %v", err)
+	}
+	requireSpareRootPorts(t, s.virt.(*libvirtfake.Fake), "regen", 4)
 }

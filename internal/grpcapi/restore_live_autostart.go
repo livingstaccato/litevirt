@@ -299,7 +299,6 @@ func (s *Server) autoDefineRestoredVM(
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}
-	s.ensureSparePCIeRootPorts(targetName)
 
 	// hardware_v2 pre-start (adoption gate + PCI preflight); no-op unless latched, so a
 	// fleet with the feature off restores exactly as before. A restore always targets a
@@ -317,6 +316,9 @@ func (s *Server) autoDefineRestoredVM(
 		_ = s.virt.UndefineDomain(targetName, false)
 		return "", "", hwErr
 	}
+	// Spare root ports last, as in the reconciler's start: a device the
+	// pre-start patches in would otherwise land on a spare.
+	s.ensureSparePCIeRootPorts(targetName)
 	if err := s.virt.StartDomain(targetName); err != nil {
 		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can

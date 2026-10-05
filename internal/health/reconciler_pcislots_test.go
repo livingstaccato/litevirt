@@ -13,8 +13,8 @@ import (
 // Reconciler-side analogue of the Server's CreateVM test: the reconciler
 // builds its own lv.VMConfig independently (startPendingVM, not
 // baseDomainConfig), so its own SetSparePCIeRootPorts wiring needs its own
-// proof — deleting r.sparePCIeRootPortsCfg at that build site would pass
-// every other reconciler test.
+// proof — deleting the r.ensureSparePCIeRootPorts(vm.Name) top-up after its
+// define would pass every other reconciler test.
 func TestReconciler_StartPendingVM_SparePCIeRootPortsReachTheDefinedDomain(t *testing.T) {
 	db := testReconcilerDB(t)
 	ctx := context.Background()

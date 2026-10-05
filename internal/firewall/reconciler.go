@@ -477,46 +477,61 @@ func failClosed() []Rule {
 	}
 }
 
-// tapFetcher runs one RunningTaps call at a time under a deadline. The call
-// cannot be cancelled (go-libvirt takes no context), so on a timeout its
-// goroutine is left to finish on its own, and until it does every fetch fails
-// at once instead of starting another.
+// tapFetcher runs at most one RunningTaps call at a time under a deadline.
+// Reconcile is not serialized (the 30s loop, `lv firewall reload` and the RPCs
+// that reconcile after provisioning a network all call it), so a pass that
+// arrives while a call is in flight JOINS it and shares its answer. It waits
+// under its own deadline, measured from when it arrived.
+//
+// The call cannot be cancelled (go-libvirt takes no context). A call that has
+// overrun the deadline is presumed hung: until it returns, every pass fails at
+// once with errTapFetchOutstanding instead of waiting on it again or stacking
+// another call behind it.
 type tapFetcher struct {
-	mu   sync.Mutex
-	busy bool
+	mu       sync.Mutex
+	inflight *tapCall
 }
 
-var errTapFetchOutstanding = errors.New("an earlier libvirt tap lookup has not returned")
+// tapCall is one in-flight RunningTaps call. taps and err are written once,
+// before done is closed.
+type tapCall struct {
+	started time.Time
+	done    chan struct{}
+	taps    map[string]map[string]string
+	err     error
+}
+
+var errTapFetchOutstanding = errors.New("an earlier libvirt tap lookup overran its deadline and has not returned")
 
 func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Duration) (map[string]map[string]string, error) {
 	if timeout <= 0 {
 		timeout = defaultTapTimeout
 	}
 	f.mu.Lock()
-	if f.busy {
+	call := f.inflight
+	if call != nil && time.Since(call.started) > timeout {
 		f.mu.Unlock()
 		return nil, errTapFetchOutstanding
 	}
-	f.busy = true
+	if call == nil {
+		call = &tapCall{started: time.Now(), done: make(chan struct{})}
+		f.inflight = call
+		go func() {
+			m, err := src()
+			f.mu.Lock()
+			call.taps, call.err = m, err
+			f.inflight = nil
+			f.mu.Unlock()
+			close(call.done)
+		}()
+	}
 	f.mu.Unlock()
 
-	type result struct {
-		taps map[string]map[string]string
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		m, err := src()
-		f.mu.Lock()
-		f.busy = false
-		f.mu.Unlock()
-		done <- result{m, err}
-	}()
 	t := time.NewTimer(timeout)
 	defer t.Stop()
 	select {
-	case r := <-done:
-		return r.taps, r.err
+	case <-call.done:
+		return call.taps, call.err
 	case <-t.C:
 		return nil, fmt.Errorf("libvirt did not answer within %s", timeout)
 	case <-ctx.Done():

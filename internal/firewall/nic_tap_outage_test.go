@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,9 +48,9 @@ func upTaps() (map[string]map[string]string, error) {
 // policy every VM ran unfiltered until libvirt came back.
 func TestReconcile_LibvirtOutageKeepsTheAppliedChains(t *testing.T) {
 	ctx := context.Background()
-	down := false
+	var down atomic.Bool // read on the lookup goroutine
 	opts := LoaderOptions{RunningTaps: func() (map[string]map[string]string, error) {
-		if down {
+		if down.Load() {
 			return nil, errors.New("list running domains: connection is shut down")
 		}
 		return upTaps()
@@ -61,7 +63,7 @@ func TestReconcile_LibvirtOutageKeepsTheAppliedChains(t *testing.T) {
 	if !strings.Contains(nft.applies[0], outageChain) {
 		t.Fatalf("control: the first apply must carry vm-a's chain:\n%s", nft.applies[0])
 	}
-	down = true
+	down.Store(true)
 	if err := r.Reconcile(ctx); err == nil {
 		t.Error("a pass that could not ask libvirt must fail, not succeed with the VM NICs dropped")
 	}
@@ -80,9 +82,10 @@ func TestReconcile_LibvirtOutageKeepsTheAppliedChains(t *testing.T) {
 func TestReconcile_HungLibvirtTimesOut(t *testing.T) {
 	ctx := context.Background()
 	release := make(chan struct{})
-	hung := true
+	var hung atomic.Bool // read on the lookup goroutine
+	hung.Store(true)
 	opts := LoaderOptions{TapTimeout: 50 * time.Millisecond, RunningTaps: func() (map[string]map[string]string, error) {
-		if hung {
+		if hung.Load() {
 			<-release
 			return nil, errors.New("late answer from a hung libvirtd")
 		}
@@ -106,7 +109,7 @@ func TestReconcile_HungLibvirtTimesOut(t *testing.T) {
 		t.Errorf("nothing may be applied while libvirt is hung, got %d applies", len(nft.applies))
 	}
 
-	hung = false
+	hung.Store(false)
 	close(release)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -121,5 +124,47 @@ func TestReconcile_HungLibvirtTimesOut(t *testing.T) {
 	}
 	if len(nft.applies) != 1 || !strings.Contains(nft.applies[0], outageChain) {
 		t.Errorf("once libvirt answers, vm-a's chain must be applied: %v", nft.applies)
+	}
+}
+
+// Reconcile is not serialized: the 30s loop, `lv firewall reload` and the
+// RPCs that reconcile after provisioning a network all call it. With libvirt
+// slow but healthy, a pass that overlaps another's tap lookup must share that
+// lookup's answer, not fail — a failure there surfaces as a CreateVM, hotplug
+// or network-create error and a spurious LastError.
+func TestReconcile_ConcurrentPassesShareASlowTapLookup(t *testing.T) {
+	ctx := context.Background()
+	var calls atomic.Int32
+	opts := LoaderOptions{TapTimeout: 5 * time.Second, RunningTaps: func() (map[string]map[string]string, error) {
+		calls.Add(1)
+		time.Sleep(500 * time.Millisecond)
+		return upTaps()
+	}}
+	r := NewReconciler(CorrosionPlanLoader(outageDB(t), "host-a", Plan{}, opts), NewApplier(&fakeNft{}), 0)
+
+	const passes = 4
+	errs := make(chan error, passes)
+	var wg sync.WaitGroup
+	for i := 0; i < passes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- r.Reconcile(ctx)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("a pass overlapping a healthy tap lookup failed: %v", err)
+		}
+	}
+	if r.LastError() != nil {
+		t.Errorf("LastError after only healthy passes: %v", r.LastError())
+	}
+	// The passes start together and the lookup takes 500ms, so they overlap:
+	// at least one must have joined another's call rather than asked again.
+	if n := calls.Load(); n >= passes {
+		t.Errorf("libvirt was asked %d times for %d overlapping passes; none joined the in-flight lookup", n, passes)
 	}
 }

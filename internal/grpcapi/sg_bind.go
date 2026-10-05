@@ -93,7 +93,9 @@ func (s *Server) BindSecurityGroups(ctx context.Context, req *pb.BindSecurityGro
 		n.SecurityGroups = sgsJSON
 		if err := corrosion.UpsertNIC(ctx, s.db, n); err != nil {
 			s.audit(ctx, "sg.bind", req.VmName, change, "error")
-			return nil, status.Errorf(codes.Internal, "update binding of NIC %s: %v", n.MAC, err)
+			return nil, status.Errorf(codes.Internal,
+				"update binding of NIC %s: %v; the legacy binding was written and may still apply via the hardware bridge",
+				n.MAC, err)
 		}
 	}
 	s.audit(ctx, "sg.bind", req.VmName, change, "ok")

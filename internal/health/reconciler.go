@@ -1942,6 +1942,11 @@ func hwPrepareRetryable(err error) bool {
 // will hold the lock until expiry.
 const vmLockTTL = 10 * time.Minute
 
+// VMStartLeaseTTL is how long a TryVMStartLease lease stands without being
+// taken again by its holder. A holder that keeps a lease longer than this — a
+// cold migration copying disks — re-takes it well within it.
+const VMStartLeaseTTL = vmLockTTL
+
 // acquireVMLock takes the per-VM startup lease. Returns true if this host
 // holds the lock. CRDT-tolerant via the same INSERT-OR-UPDATE-WHERE-expired
 // pattern as failover leader election.

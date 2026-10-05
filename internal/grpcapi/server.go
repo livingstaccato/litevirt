@@ -584,6 +584,10 @@ type Server struct {
 	// point a daemon could die mid-move, and stops right there, as a crash
 	// would, when it returns true (SetDrainCrashForTest). Nil in production.
 	drainCrashAt func(point string) bool
+	// coldMoveAfterHandoff is a FLEET TEST SEAM: coldMigrateStoppedVM calls it
+	// once the handoff has committed, before it touches the source
+	// (SetColdMoveAfterHandoffForTest). Nil in production.
+	coldMoveAfterHandoff func(vm string)
 	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)

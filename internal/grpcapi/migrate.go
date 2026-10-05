@@ -1492,15 +1492,20 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	if err != nil {
 		return err
 	}
+	// Hold the VM's start lease for the whole move, so neither the restart
+	// policy nor the reconciler starts it here while its disks are copied
+	// (migrate_cold_fence.go). Taken before the check below, so nothing can
+	// start it between the two.
+	releaseLease, err := s.holdColdMoveStartLease(ctx, vm.Name)
+	if err != nil {
+		return err
+	}
+	defer releaseLease()
 	// The row says stopped; the move goes ahead only if libvirt agrees. An
 	// active guest — paused counts, which DomainState reports as stopped —
 	// could write into a disk while it is being copied.
-	if active, aerr := s.virt.DomainIsActive(vm.Name); aerr != nil {
-		return status.Errorf(codes.FailedPrecondition,
-			"cannot confirm the domain of VM %q is shut off on %s, so it is not migrated cold: %v", vm.Name, s.hostName, aerr)
-	} else if active {
-		return status.Errorf(codes.FailedPrecondition,
-			"VM %q is recorded stopped, but its domain on %s is active; stop it before migrating it cold", vm.Name, s.hostName)
+	if err := s.coldSourceShutOff(vm.Name); err != nil {
+		return err
 	}
 	// Dump the source's (shut-off) domain XML so the target can DEFINE the same
 	// domain — a plain reassigned-stopped VM would otherwise be undefined on the
@@ -1540,6 +1545,13 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 		return s.abandonFirmwareTarget(ctx, targetHost.Name, vm.Name, fwSpec.UUID, attempt, outcome, err)
 	}
 
+	// Once more, immediately before the handoff: a domain started since the
+	// first check — by hand, or by anything the start lease does not fence —
+	// may have written to a disk while it was copied, and that copy must not
+	// become the VM's disk.
+	if err := s.coldSourceShutOff(vm.Name); err != nil {
+		return s.abandonFirmwareTarget(ctx, targetHost.Name, vm.Name, fwSpec.UUID, attempt, outcome, err)
+	}
 	if err := s.handOffColdFirmwareVM(ctx, vm, targetHost); err != nil {
 		return s.abandonFirmwareTarget(ctx, targetHost.Name, vm.Name, fwSpec.UUID, attempt, outcome, err)
 	}
@@ -1549,6 +1561,22 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	// What follows is cleanup and bookkeeping for a migration that has
 	// happened, so it must not die with a client that went away.
 	ctx = context.WithoutCancel(ctx)
+	if s.coldMoveAfterHandoff != nil {
+		s.coldMoveAfterHandoff(vm.Name)
+	}
+	// And before the source is touched: an active domain here is using these
+	// disks, so neither it nor they are removed. The move is reported failed —
+	// a drain must not start the VM on the target as well.
+	if err := s.coldSourceShutOff(vm.Name); err != nil {
+		msg := fmt.Sprintf("VM %q was handed off to %s, but its domain on %s is not confirmed shut off (%s); "+
+			"the domain and disks on %s are kept and the VM is not started anywhere by this migration — "+
+			"stop it on %s and check which copy of its disks is current",
+			vm.Name, targetHost.Name, s.hostName, status.Convert(err).Message(), s.hostName, s.hostName)
+		slog.Error("cold migration: "+msg, "vm", vm.Name, "from", s.hostName, "to", targetHost.Name)
+		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "error", msg)
+		s.recordMigrationMetrics("cold", "failure", time.Since(start), 0, 0)
+		return status.Error(codes.Aborted, msg)
+	}
 
 	// Clean up the source ONLY after a fully successful handoff: undefine the
 	// shut-off domain, then wipe the now-orphaned firmware. Do NOT wipe firmware

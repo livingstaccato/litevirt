@@ -1166,6 +1166,11 @@ func TestDrainOneVM_GateRefusesMidDrain(t *testing.T) {
 	if progress.Status != "skipped" {
 		t.Errorf("Status = %q, want skipped (gate refused mid-drain)", progress.Status)
 	}
+	// Nothing was moved, so the frame names no strategy (not the enum's zero
+	// value, MIGRATE_LIVE, which `lv host drain` used to print for it).
+	if progress.Strategy != pb.MigrateStrategy_MIGRATE_NONE {
+		t.Errorf("Strategy = %s, want MIGRATE_NONE (nothing moved)", progress.Strategy)
+	}
 	got, _ := corrosion.GetVM(ctx, s.db, "own-vm")
 	if got.HostName != "test-host" {
 		t.Errorf("host = %q, want test-host (not reassigned — gate refused)", got.HostName)

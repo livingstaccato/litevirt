@@ -63,7 +63,7 @@ func newMigrateCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVar(&cold, "cold", false, "Cold migration: a stopped VM moves stopped, its host-local disks copied to the target; a running VM is paused for the move instead of migrated live")
+	cmd.Flags().BoolVar(&cold, "cold", false, "Cold migration: a stopped VM moves stopped, its host-local disks copied to the target; a running VM is paused for the move instead of migrated live, and with a host-local disk also needs --with-storage (or stop it first)")
 	cmd.Flags().BoolVar(&withStorage, "with-storage", false, "Copy storage to target host during migration (encrypted when both hosts have migration TLS: lv host install-migration-tls)")
 	return cmd
 }

@@ -243,11 +243,9 @@ func newHostDrainCmd() *cobra.Command {
 						return fmt.Errorf("drain: %w", err)
 					}
 					if p.Error != "" {
-						fmt.Fprintf(os.Stderr, "  %s → %s [%s] ERROR: %s\n",
-							p.VmName, p.TargetHost, p.Strategy, p.Error)
+						fmt.Fprintln(os.Stderr, drainProgressLine(p))
 					} else {
-						fmt.Printf("  %s → %s [%s] %s\n",
-							p.VmName, p.TargetHost, p.Strategy, p.Status)
+						fmt.Println(drainProgressLine(p))
 					}
 				}
 
@@ -258,6 +256,20 @@ func newHostDrainCmd() *cobra.Command {
 	}
 	cmd.Flags().IntVar(&parallel, "parallel", 2, "Number of parallel migrations")
 	return cmd
+}
+
+// drainProgressLine is one VM's line of `lv host drain` output. The strategy
+// is shown only for a VM the drain moved or tried to move: a frame for one it
+// did not (MIGRATE_NONE) names no strategy, since none was used.
+func drainProgressLine(p *pb.DrainProgress) string {
+	strategy := ""
+	if p.Strategy != pb.MigrateStrategy_MIGRATE_NONE {
+		strategy = " [" + p.Strategy.String() + "]"
+	}
+	if p.Error != "" {
+		return fmt.Sprintf("  %s → %s%s ERROR: %s", p.VmName, p.TargetHost, strategy, p.Error)
+	}
+	return fmt.Sprintf("  %s → %s%s %s", p.VmName, p.TargetHost, strategy, p.Status)
 }
 
 func newHostShutdownWorkloadsCmd() *cobra.Command {

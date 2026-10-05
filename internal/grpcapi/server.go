@@ -570,6 +570,11 @@ type Server struct {
 	// costs the guest its seed on the next boot. Zero value ready.
 	migrationISOs migrationStubLedger
 
+	// hostDiskRoot is a FLEET TEST SEAM for the files a stopped VM's cold
+	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
+	// production.
+	hostDiskRoot string
+
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value

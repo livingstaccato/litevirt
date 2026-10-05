@@ -356,7 +356,7 @@ shell history.
 
 ```bash
 lv migrate <vm> <target-host>                  # Live migrate
-lv migrate <vm> <target-host> --cold           # Cold migrate (stop, move, start)
+lv migrate <vm> <target-host> --cold           # Cold migrate: a stopped VM moves stopped, disks copied
 lv migrate <vm> <target-host> --with-storage   # Copy disks to the target during migration
 ```
 

@@ -573,7 +573,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	if usesFirmwareState(fresh.Spec) {
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
-			Error: "Secure Boot / vTPM VM can't be drained automatically (its firmware state isn't transferred) — stop it and migrate it explicitly (`lv migrate " + vm.Name + " --strategy=cold`), which carries the firmware",
+			Error: "Secure Boot / vTPM VM can't be drained automatically (its firmware state isn't transferred) — stop it and migrate it explicitly (`lv migrate " + vm.Name + " <target-host> --cold`), which carries the firmware",
 		}
 	}
 

@@ -127,7 +127,12 @@ func (s *Server) RollbackFirmwareState(ctx context.Context, req *pb.RollbackFirm
 				"undefine domain %q failed; left firmware in place (recoverable): %v", req.VmName, err)
 		}
 	}
-	lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
+	// A VM without firmware state was defined with no bundle: there is no
+	// firmware of this attempt's to wipe, and the name-keyed files here may be
+	// another VM's.
+	if usesFirmwareState(vm.Spec) {
+		lv.WipeFirmwareState(s.dataDir, req.VmName, req.Uuid)
+	}
 	s.firmwareTargets.forget(req.VmName)
 	slog.Info("rollback firmware state: removed the domain and firmware this attempt defined",
 		"vm", req.VmName, "attempt", req.AttemptId)

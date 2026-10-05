@@ -18,7 +18,7 @@ func newMigrateCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "migrate <vm> <target-host>",
-		Short: "Live-migrate a VM to another host",
+		Short: "Migrate a VM to another host (live, or cold with --cold)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			vmName := args[0]
@@ -63,7 +63,7 @@ func newMigrateCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().BoolVar(&cold, "cold", false, "Cold migration (VM must be stopped)")
+	cmd.Flags().BoolVar(&cold, "cold", false, "Cold migration: a stopped VM moves stopped, its host-local disks copied to the target; a running VM is paused for the move instead of migrated live")
 	cmd.Flags().BoolVar(&withStorage, "with-storage", false, "Copy storage to target host during migration (encrypted when both hosts have migration TLS: lv host install-migration-tls)")
 	return cmd
 }

@@ -126,11 +126,54 @@ You can also set it as a per-VM default in compose:
       with-storage: true
 ```
 
-Or cold migrate (stops the VM, copies disks, starts it on the target):
+## Cold migration
+
+`--cold` migrates a VM without moving a running guest live:
 
 ```bash
+lv stop my-vm
 lv migrate my-vm host-b --cold
 ```
+
+A **stopped** VM moves stopped. Libvirt is not involved, because there is no
+guest running for it to migrate:
+
+1. Each host-local disk (`local` and `dir` storage) is copied to the same path
+   on the target over the cluster's mTLS connection. Disks on shared storage
+   stay where they are. A disk created from an image or as a linked clone is a
+   qcow2 overlay over a backing file; it arrives flattened, as a standalone
+   image, because the backing file is not part of the copy.
+2. The VM's domain is defined on the target, shut off.
+3. The VM and all of its disk records move to the target in one transaction.
+   The VM's state stays `stopped`. Start it there with `lv start my-vm`.
+4. After that commit, the source undefines its domain and removes its copy of
+   each disk it sent.
+
+Until the commit in step 3 the source keeps its disks, its domain and
+ownership of the VM. If any step before it fails, or the client goes away,
+the VM stays on the source, stopped. The target removes the disk copies and
+the domain that this attempt created there, and nothing else. A file the target
+already has at a disk's path, which this migration did not create, is refused
+rather than overwritten, as for `--with-storage`.
+
+A stopped VM is refused when:
+
+- libvirt reports its domain active, although its record says stopped;
+- it has snapshots and a host-local disk;
+- it holds a PCI passthrough device;
+- the target is a build from before stopped-VM cold migration and cannot
+  receive the disks.
+
+`--with-storage` has no effect on a stopped VM, whose host-local disks are
+always copied.
+
+A **running** VM given `--cold` is paused for the move instead of migrated
+live. Libvirt still migrates it, so a host-local disk needs `--with-storage`,
+or stop the VM first. A stopped VM migrated live is refused, with a message
+pointing to `--cold`.
+
+Secure Boot / vTPM VMs are always migrated stopped and cold, and need shared
+storage; see [cli-reference.md](cli-reference.md).
 
 ## Host drain
 

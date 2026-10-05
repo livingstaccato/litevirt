@@ -313,7 +313,7 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 			keep("outside a disk-artifact root")
 		case !recorded[p]:
 			keep("this host's replica does not record it as a disk detached from this incarnation here")
-		case !modifiedAfter(p, created):
+		case !modifiedAfter(s.hostDiskFile(p), created):
 			keep("the file was last written before this incarnation was created (or cannot be read)")
 		default:
 			// Exempting no VM: this one has no live rows left to exempt.
@@ -325,7 +325,7 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 				keep(why)
 				continue
 			}
-			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			if err := os.Remove(s.hostDiskFile(p)); err != nil && !os.IsNotExist(err) {
 				slog.Warn("deleted VM leftovers: remove detached disk", "vm", name, "path", p, "error", err)
 				continue
 			}

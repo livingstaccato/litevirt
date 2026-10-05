@@ -497,3 +497,27 @@ func (p abortingPeer) CleanupMigrationArtifacts(context.Context, *pb.CleanupMigr
 	}
 	return &emptypb.Empty{}, nil
 }
+
+// Under a per-host disk root the deleted-VM cleanup reads and removes
+// hostDiskFile(p), as the cold copy writes it.
+//
+// Mutation: stat or remove the recorded path again — the file under the root
+// is kept; red.
+func TestCleanupMigrationArtifacts_VMDeletedUsesTheHostDiskFile(t *testing.T) {
+	h := newLeftoverHost(t)
+	h.s.SetHostDiskRootForTest(t.TempDir())
+	f := h.s.hostDiskFile(h.disk)
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(h.disk, f); err != nil {
+		t.Fatal(err)
+	}
+	h.tombstone(t)
+	if err := h.cleanup(h.disk); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if fileExists(f) {
+		t.Fatal("the deleted VM's detached disk under the host disk root was kept")
+	}
+}

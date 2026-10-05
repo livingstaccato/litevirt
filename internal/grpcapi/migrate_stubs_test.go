@@ -202,3 +202,33 @@ func TestCleanupMigrationArtifacts_RemovesItsUnnamedStubsUntouchedSinceMade(t *t
 		})
 	}
 }
+
+// The unnamed-stub sweep reads the file it is about to remove: under a
+// per-host disk root (SetHostDiskRootForTest, the fleet's seam) that is
+// hostDiskFile(p), not p. Reading p skipped every unnamed stub there, so no
+// fleet test could reach the sweep for a cold copy.
+//
+// Mutation: Lstat the recorded path again — the stub is left; red.
+func TestCleanupMigrationArtifacts_SweepReadsTheFileItRemoves(t *testing.T) {
+	s, disks := stubTarget(t)
+	s.SetHostDiskRootForTest(t.TempDir())
+	p := filepath.Join(disks, "mig-root.qcow2")
+	f := s.hostDiskFile(p)
+	if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, []byte("stub"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(f, old, old); err != nil {
+		t.Fatal(err)
+	}
+	s.migrationStubs.add("mig", p)
+	if _, err := s.CleanupMigrationArtifacts(adminCtx(), &pb.CleanupMigrationArtifactsRequest{VmName: "mig"}); err != nil {
+		t.Fatalf("CleanupMigrationArtifacts: %v", err)
+	}
+	if _, err := os.Stat(f); !os.IsNotExist(err) {
+		t.Fatalf("the unnamed stub under the host disk root was left (stat: %v)", err)
+	}
+}

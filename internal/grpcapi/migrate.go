@@ -1756,7 +1756,9 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		if named[p] {
 			continue
 		}
-		if fi, err := os.Lstat(p); err != nil || fi.ModTime().After(at) {
+		// The file the removal below would take: hostDiskFile(p), as the
+		// cold copy wrote it.
+		if fi, err := os.Lstat(s.hostDiskFile(p)); err != nil || fi.ModTime().After(at) {
 			continue
 		}
 		paths = append(paths, p)

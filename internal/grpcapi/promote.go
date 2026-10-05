@@ -750,6 +750,13 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return err
 		}
 	}
+	// Project isolation: the promoted VM re-attaches the spec's networks, so each
+	// must still be one the VM's project may use. Same project on both sides, so
+	// a raw bridge is carried (the automated failover path has no caller to
+	// re-check) and only a managed network another project owns is refused.
+	if err := s.admitCopiedNetworks(ctx, "promote", vm.Project, vm.Project, specNetworkNames(spec.Network)); err != nil {
+		return err
+	}
 
 	// Adoption gate (fail-closed, no-op pre-latch): under the active hardware_v2 regime a
 	// "blocked" VM (hardware failed its per-VM compatibility audit) must not be brought

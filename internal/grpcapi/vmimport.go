@@ -127,6 +127,13 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if err := s.refuseIfBound(ctx, "import", names); err != nil {
 		return err
 	}
+	// Project isolation: an import names its networks (through --net-map or
+	// --network) the way a create does, so each takes create admission.
+	for _, name := range names {
+		if err := s.admitNetworkAttach(ctx, project, name); err != nil {
+			return err
+		}
+	}
 
 	// Resolve disk files (Proxmox .conf disks need --disk-map) + safety checks.
 	if err := s.applyImportDiskMap(ctx, fv, first); err != nil {

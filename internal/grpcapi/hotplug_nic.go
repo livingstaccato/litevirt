@@ -123,6 +123,16 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 		return s.attachNICOwner(ctx, req, vmRec.Name, opID, reqHash, "")
 	}
 
+	// Project isolation: the same admission CreateVM applies to its NICs. A VM
+	// may gain a NIC only on a global network or one its own project owns, and
+	// a raw bridge needs cluster-root authority. Checked here at the entry,
+	// before the remote provisioning push below and before any operation row,
+	// so a refusal leaves nothing behind. The peer-forwarded owner leg above
+	// skips it: the entry node already decided, and with the caller's identity.
+	if err := s.admitNetworkAttach(ctx, vmRec.Project, spec.Name); err != nil {
+		return nil, err
+	}
+
 	// Cross-host race: push the network's provisioning to the VM's owning host
 	// before this attach reaches it, so a forwarded attachNIC there doesn't find an
 	// unprovisioned bridge (see provisionNetworkOnRemote).

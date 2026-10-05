@@ -727,6 +727,19 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
 
+	// Project isolation: the restore rebuilds the archived spec's NICs in the
+	// authorized project, so each managed network must be one that project may
+	// use. Same project as the backup, so a raw bridge is carried. A cold migrate
+	// (a peer-verified migrate-from) is the same container moving, not a copy,
+	// and is not re-judged here, as a VM migrate is not.
+	if s.migrateSourceFromPeer(ctx) == "" {
+		if err := s.admitCopiedNetworks(ctx, "restore", project, project,
+			containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))); err != nil {
+			s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
+			return err
+		}
+	}
+
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.
 	//
 	//   HOST capacity — memory only. A container's cpu_limit is a cap in cores (a

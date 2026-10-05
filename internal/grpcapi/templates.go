@@ -131,6 +131,11 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 	if err := s.refuseIfBound(ctx, "clone", specNetworkNames(srcSpec.Network)); err != nil {
 		return nil, err
 	}
+	// Project isolation: the clone's NICs land in the TARGET project, which may
+	// differ from the source's. Refused before admission and any disk write.
+	if err := s.admitCopiedNetworks(ctx, "clone", project, src.Project, specNetworkNames(srcSpec.Network)); err != nil {
+		return nil, err
+	}
 
 	// Capacity + quota admission. A clone is a full-sized VM — same vCPU, same
 	// memory, its own disks — so it consumes exactly what CreateVM would, and

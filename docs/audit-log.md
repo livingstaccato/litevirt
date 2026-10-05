@@ -96,6 +96,21 @@ itself rewrite the chain around the edit. `verify` would then come back clean. A
 row is never resealed, locally or via replication, and the guard lives in the SQL
 as well as the caller because peers apply that statement by primary key.
 
+**History from before sequence numbers is anchored too.** Rows written before
+`seq` existed all carry `seq = 0`, so a host that adopted signing and has
+written nothing since has no position for a chain head to attest to. It still
+has a tail, and it signs a head at `seq = 0` over that tail's hash — an
+*anchor*. Without one, nothing signed committed to that history: cutting rows
+off its end, or deleting all of it, read exactly like an idle host. `verify`
+reports the host as **truncated** when no `seq = 0` row of its hashes to what
+the anchor says, which also catches a row edited and then re-hashed by the
+startup reseal. The anchor needs only that row to still exist, not to be the
+last one, so a node restored from an older snapshot that anchored a shorter
+copy of its own history does not get a permanent finding; a row appended after
+the anchor is as unanchored as before. A host with no rows at all signs no
+anchor, since there is nothing to attest to. Older builds ignore the anchor: a
+head at `seq = 0` attests to no rows, so their check has nothing to compare.
+
 Timestamps are RFC3339 with nanosecond precision so same-second
 inserts sort deterministically. Without nanoseconds, two events
 within the same second could swap order between reads, and the chain

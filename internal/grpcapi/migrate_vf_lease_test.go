@@ -439,3 +439,46 @@ func TestMigrateVM_TheVFLeaseAndItsRecoveryWorkWithTheProtocolOff(t *testing.T) 
 		t.Fatal("the migration never reached libvirt")
 	}
 }
+
+// TestMigrateVM_AnAttemptKeepsALeaseItDidNotWrite: an earlier migration left a
+// migration_detached lease — the only restart anchor for VFs still out of the
+// guest. A later attempt that detaches nothing writes no lease, so its failure
+// must not remove that one. Every cold move arms the abort, so any failed
+// `lv migrate --cold` or drain move of the VM used to wipe it.
+//
+// Mutation: end the lease whatever this attempt wrote (pass true for
+// leaseWritten) — both subtests lose the lease and go red.
+func TestMigrateVM_AnAttemptKeepsALeaseItDidNotWrite(t *testing.T) {
+	retained := func(t *testing.T, r *vfRig) *opjournal.Journal {
+		t.Helper()
+		j := r.withLeaseJournal(t)
+		if err := j.Write(opjournal.Entry{
+			OperationID: deviceLeaseOpID("vf-vm"), ResourceID: "vf-vm", Kind: deviceLeaseKind,
+			Stage:     deviceLeaseStageMigrationDetached,
+			Artifacts: map[string]string{"addresses": "0000:41:10.0"},
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
+		}); err != nil {
+			t.Fatalf("seed the retained lease: %v", err)
+		}
+		return j
+	}
+	t.Run("abandoned before the copy", func(t *testing.T) {
+		r := vfMigrationRig(t)
+		j := retained(t, r)
+		r.s.undoMigrationAttempt(adminCtx(), "vf-vm", "target-host", &migrationAbort{armed: true})
+		if _, found := migrationLease(t, j, "vf-vm"); !found {
+			t.Fatal("an attempt that wrote no lease removed the one an earlier migration left")
+		}
+	})
+	t.Run("libvirt failure", func(t *testing.T) {
+		r := vfMigrationRig(t)
+		j := retained(t, r)
+		r.fake.FailMigrateToTarget = func(string, string) error { return errors.New("injected libvirt migration failure") }
+		if err := r.migrate(t); err == nil {
+			t.Fatal("the migration succeeded; the scenario needs libvirt to fail it")
+		}
+		if _, found := migrationLease(t, j, "vf-vm"); !found {
+			t.Fatal("a failed migration that detached no VF removed the lease an earlier one left")
+		}
+	})
+}

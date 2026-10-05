@@ -630,6 +630,8 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if err := s.beginMigrationVFLease(req.VmName, pciAddresses(detachedVFs)); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "record the VFs detached for migration: %v", err)
 	}
+	// beginMigrationVFLease writes nothing for a VM with no VF to detach.
+	abort.leaseWritten = len(detachedVFs) > 0
 	for _, vf := range detachedVFs {
 		// Membership-aware (idempotent) guest detach so a retried migration converges: if a
 		// prior attempt already live-detached the VF but its release failed, the VF is gone
@@ -718,7 +720,7 @@ poll:
 				fctx, fcancel := detachedMigrateCleanupCtx(ctx)
 				defer fcancel()
 				// The VFs go back before the row says running: the guest stayed.
-				s.reattachVFsOnSource(fctx, vm.Name, detachedVFs)
+				s.reattachVFsOnSource(fctx, vm.Name, detachedVFs, len(detachedVFs) > 0)
 				if s.restoreSourceStateAfterFailedMigration(fctx, vm.Name,
 					fmt.Sprintf("migration to %s failed: %v", req.TargetHost, migrateErr), migrateErr.Error()) {
 					slog.Warn("migration failed but VM still running on source",
@@ -841,7 +843,7 @@ func (s *Server) adoptAbandonedMigration(
 			// heals.
 			// The guest stayed, so it gets back the VFs detached for the move,
 			// as a watched failure does.
-			s.reattachVFsOnSource(ctx, vm.Name, finish.detachedVFs)
+			s.reattachVFsOnSource(ctx, vm.Name, finish.detachedVFs, len(finish.detachedVFs) > 0)
 			state, detail := "error", fmt.Sprintf("migration to %s failed after the request was abandoned: %v", targetHost, err)
 			if st, sErr := s.virt.DomainState(vm.Name); sErr == nil && st == "running" {
 				state, detail = "running", fmt.Sprintf("migration to %s failed after the request was abandoned; VM still running on %s: %v", targetHost, s.hostName, err)
@@ -2176,6 +2178,10 @@ type migrationAbort struct {
 	createdStubs []string
 	// detachedVFs are the SR-IOV VFs taken out of the guest for the move.
 	detachedVFs []corrosion.PCIDeviceRecord
+	// leaseWritten is set once THIS attempt wrote the migration VF lease. A
+	// lease an earlier attempt left — the restart anchor of VFs still out of
+	// the guest — is not this attempt's to end.
+	leaseWritten bool
 }
 
 // undoMigrationAttempt is MigrateVM's exit path for an attempt that ended before
@@ -2188,7 +2194,7 @@ func (s *Server) undoMigrationAttempt(ctx context.Context, vmName, target string
 	ctx = context.WithoutCancel(ctx)
 	// The VFs first: the guest is staying, and every moment it runs without its
 	// NIC, with the VF free for another VM to claim, is the damage being undone.
-	s.reattachVFsOnSource(ctx, vmName, a.detachedVFs)
+	s.reattachVFsOnSource(ctx, vmName, a.detachedVFs, a.leaseWritten)
 	if a.stateWritten {
 		s.restoreSourceStateAfterFailedMigration(ctx, vmName,
 			fmt.Sprintf("migration to %s abandoned before the copy started", target),
@@ -2232,9 +2238,13 @@ func (s *Server) restoreSourceStateAfterFailedMigration(ctx context.Context, vmN
 // Best effort per VF, never failing the caller, whose own error is the one the
 // operator needs; each VF that cannot go back is logged and recorded as a VM
 // event.
-func (s *Server) reattachVFsOnSource(ctx context.Context, vmName string, vfs []corrosion.PCIDeviceRecord) {
+func (s *Server) reattachVFsOnSource(ctx context.Context, vmName string, vfs []corrosion.PCIDeviceRecord, leaseWritten bool) {
 	if len(vfs) == 0 {
-		s.endMigrationVFLease(vmName) // written, but no VF left the guest
+		// Only a lease this attempt wrote, and no VF left the guest. One an
+		// earlier attempt left still names VFs out of the guest.
+		if leaseWritten {
+			s.endMigrationVFLease(vmName)
+		}
 		return
 	}
 	// Keyed on the same disposition restart recovery uses: coarse DomainState

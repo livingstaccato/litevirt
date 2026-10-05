@@ -23905,8 +23905,17 @@ type CleanupMigrationArtifactsRequest struct {
 	RemoveCloudInit bool                   `protobuf:"varint,3,opt,name=remove_cloud_init,json=removeCloudInit,proto3" json:"remove_cloud_init,omitempty"` // also remove the cloud-init ISO for vm_name
 	FirmwareUuid    string                 `protobuf:"bytes,4,opt,name=firmware_uuid,json=firmwareUuid,proto3" json:"firmware_uuid,omitempty"`             // if set, wipe the pushed firmware state (NVRAM+swtpm) for vm_name (G1)
 	UndefineDomain  bool                   `protobuf:"varint,5,opt,name=undefine_domain,json=undefineDomain,proto3" json:"undefine_domain,omitempty"`      // if set, undefine a domain this host pre-defined for a failed firmware migration (G1)
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// vm_deleted: vm_name was deleted (without --keep-disks) on the host that
+	// owned it, and this host is one it left. Remove the VM's owner-epoch
+	// marker here, and treat disk_paths as disks detached from the VM while it
+	// ran here — each removed only if this host's own replica records it so and
+	// nothing still uses it. Refused (ABORTED, retryable) while this host's
+	// replica still holds a live row for the name; nothing is touched while a
+	// domain of that name is defined here. A host built before this field
+	// ignores it and applies the stub rule to disk_paths, which keeps them.
+	VmDeleted     bool `protobuf:"varint,6,opt,name=vm_deleted,json=vmDeleted,proto3" json:"vm_deleted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CleanupMigrationArtifactsRequest) Reset() {
@@ -23970,6 +23979,13 @@ func (x *CleanupMigrationArtifactsRequest) GetFirmwareUuid() string {
 func (x *CleanupMigrationArtifactsRequest) GetUndefineDomain() bool {
 	if x != nil {
 		return x.UndefineDomain
+	}
+	return false
+}
+
+func (x *CleanupMigrationArtifactsRequest) GetVmDeleted() bool {
+	if x != nil {
+		return x.VmDeleted
 	}
 	return false
 }
@@ -33628,14 +33644,16 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x1dCheckCPUCompatibilityResponse\x12\x1a\n" +
 	"\brunnable\x18\x01 \x01(\bR\brunnable\x12\x18\n" +
 	"\averdict\x18\x02 \x01(\tR\averdict\x12\x16\n" +
-	"\x06detail\x18\x03 \x01(\tR\x06detail\"\xd4\x01\n" +
+	"\x06detail\x18\x03 \x01(\tR\x06detail\"\xf3\x01\n" +
 	" CleanupMigrationArtifactsRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1d\n" +
 	"\n" +
 	"disk_paths\x18\x02 \x03(\tR\tdiskPaths\x12*\n" +
 	"\x11remove_cloud_init\x18\x03 \x01(\bR\x0fremoveCloudInit\x12#\n" +
 	"\rfirmware_uuid\x18\x04 \x01(\tR\ffirmwareUuid\x12'\n" +
-	"\x0fundefine_domain\x18\x05 \x01(\bR\x0eundefineDomain\"_\n" +
+	"\x0fundefine_domain\x18\x05 \x01(\bR\x0eundefineDomain\x12\x1d\n" +
+	"\n" +
+	"vm_deleted\x18\x06 \x01(\bR\tvmDeleted\"_\n" +
 	"\x0fSyncVTEPRequest\x12!\n" +
 	"\fnetwork_name\x18\x01 \x01(\tR\vnetworkName\x12\x17\n" +
 	"\avtep_ip\x18\x02 \x01(\tR\x06vtepIp\x12\x10\n" +

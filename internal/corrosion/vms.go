@@ -595,6 +595,47 @@ func GetDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRec
 	return disks, nil
 }
 
+// SoftDeletedDisk is a soft-deleted vm_disks row with the wall time it was
+// soft-deleted at.
+type SoftDeletedDisk struct {
+	DiskRecord
+	DeletedAt string // RFC3339 wall clock of the host that wrote the tombstone
+}
+
+// GetSoftDeletedVMDisks is GetDeletedVMDisks with each row's deleted_at.
+//
+// While the VM is live these rows are its DETACHED disks: detach soft-deletes
+// the row and keeps the file, and a migration repoints only live rows
+// (vmDiskHostMoveSQL), so a detached row still names the host the file is on.
+// deleted_at is what tells this incarnation's detaches from a previous VM of
+// the same name: create purges a name's tombstoned rows on one path only.
+func GetSoftDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]SoftDeletedDisk, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, disk_name, host_name, path, storage_type, storage_volume,
+			COALESCE(delete_with_vm, 1) AS delete_with_vm,
+			COALESCE(deleted_at, '') AS deleted_at
+		 FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SoftDeletedDisk, len(rows))
+	for i, r := range rows {
+		out[i] = SoftDeletedDisk{
+			DiskRecord: DiskRecord{
+				VMName:        r.String("vm_name"),
+				DiskName:      r.String("disk_name"),
+				HostName:      r.String("host_name"),
+				Path:          r.String("path"),
+				StorageType:   r.String("storage_type"),
+				StorageVolume: r.String("storage_volume"),
+				DeleteWithVM:  r.Int("delete_with_vm") == 1,
+			},
+			DeletedAt: r.String("deleted_at"),
+		}
+	}
+	return out, nil
+}
+
 // GetVMDisks returns all disks for a VM.
 func GetVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRecord, error) {
 	rows, err := c.Query(ctx,

@@ -2207,6 +2207,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Broadcast FDB removal for VXLAN networks so peers remove stale entries.
 	s.CleanupFDBForVM(ctx, req.Name)
 
+	// What this VM left on the hosts it migrated away from — a disk detached
+	// there, its owner-epoch marker — is freed by those hosts, after the
+	// tombstone below. Planned NOW: the tombstone re-stamps every disk row, and
+	// a detached row is only distinguishable from a live one before it. A
+	// --keep-disks delete keeps disks wherever they are, and drops the markers
+	// everywhere, as it does the local one above.
+	leftovers := s.planDeletedVMLeftovers(ctx, vm, !req.KeepDisks)
+
 	// Tombstone in corrosion — MANDATORY. Returning OK with the row still live
 	// (the guarded delete declines when the row's authority moved under it, and
 	// only reports that after retrying with a fresh guard) would leave a ghost
@@ -2233,6 +2241,10 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 
 	// Refresh LB backends so deleted VM is removed from rotation.
 	go s.refreshLBForStack(context.Background(), vm.StackName)
+
+	if len(leftovers.hosts) > 0 {
+		go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)
+	}
 
 	return &emptypb.Empty{}, nil
 }

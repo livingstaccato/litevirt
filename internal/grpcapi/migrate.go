@@ -915,6 +915,19 @@ func (s *Server) finalizeMigrationOwnership(ctx context.Context, vm *corrosion.V
 // disk's RECORDED path). The previous os.RemoveAll(<dataDir>/disks/<vm>) here
 // assumed a per-VM subdirectory that the flat <vm>-<disk>.qcow2 naming never
 // uses — at best a no-op, at worst a path-wrong removal — so it's gone.
+//
+// Two things stay on the source on purpose, until the VM is deleted (DeleteVM
+// then has each host it left remove them: deleted_vm_leftovers.go):
+//
+//   - a disk DETACHED while the VM ran here. The migration did not move it —
+//     only live disks are copied — and detach preserves the file; its
+//     soft-deleted row still names this host, which is how the delete finds it.
+//   - the owner-epoch marker. It is this host's statement that its runtime
+//     belonged to the old generation, and runtimeSuperseded reads an ABSENT
+//     marker as "not superseded": removing it would turn a refused self-heal
+//     restart from a stale replica into a permitted one, the dual-run the
+//     marker exists to stop (finishVMReplaceRuntime keeps a stale marker for
+//     the same reason). Once the row is tombstoned it fences nothing.
 func (s *Server) cleanupPostMigration(vmName string) {
 	// Always clean up cloud-init ISO — target regenerates from stored spec if needed.
 	isoPath := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
@@ -1409,6 +1422,10 @@ func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 // are orphaned; leaving them leaks space and shadows a later retry. Best-effort
 // per file — a missing file is not an error. Only files this host recorded
 // creating for the VM are removed, and none while the VM lives here.
+//
+// With vm_deleted it instead removes a DELETED VM's leftovers on a host the VM
+// left — its owner-epoch marker and the disks detached from it here — by this
+// host's own records (removeDeletedVMLeftoversHere).
 func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	if err := safename.ValidateVMName(req.VmName); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -1425,6 +1442,11 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	} else if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, status.Error(codes.PermissionDenied,
 			"cleaning up artifacts of a vanished VM requires the admin role")
+	}
+	// A deleted VM's leftovers on a host it left are a different request with
+	// its own rules: nothing below (stub ledger, firmware, undefine) applies.
+	if req.VmDeleted {
+		return s.removeDeletedVMLeftoversHere(ctx, req, vm)
 	}
 	// The firmware UUID keys a RemoveAll under the swtpm root, and the
 	// permission above was checked on VmName alone. So it must be a real UUID

@@ -1408,7 +1408,9 @@ func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 // was never defined here (PersistDest only persists on success), so the files
 // are orphaned; leaving them leaks space and shadows a later retry. Best-effort
 // per file — a missing file is not an error. Only files this host recorded
-// creating for the VM are removed, and none while the VM lives here.
+// creating for the VM are removed, and none while the VM lives here; a
+// recorded stub the source does not name is removed too, while nothing has
+// written to it since it was made.
 func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	if err := safename.ValidateVMName(req.VmName); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -1446,7 +1448,28 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	// never got that far.
 	rowNamesHere := vm != nil && vm.HostName == s.hostName
 	vmLivesHere := rowNamesHere || (s.virt != nil && s.virt.DomainExists(req.VmName))
-	for _, p := range req.DiskPaths {
+	// The paths the source names, and the stubs this host recorded making for
+	// the VM that it does not name. The source names only what EnsureDisks
+	// reported, and a source whose EnsureDisks call was cut — its client went
+	// away while this host was making the stubs — never got the report. Such a
+	// stub is taken only while nothing has written to it since it was made: a
+	// copy that ran, or a guest using it as its disk, has, and a record that
+	// outlived the migration that made it must not reach a disk.
+	paths := append([]string(nil), req.DiskPaths...)
+	named := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		named[p] = true
+	}
+	for p, at := range s.migrationStubs.recordedFor(req.VmName) {
+		if named[p] {
+			continue
+		}
+		if fi, err := os.Lstat(p); err != nil || fi.ModTime().After(at) {
+			continue
+		}
+		paths = append(paths, p)
+	}
+	for _, p := range paths {
 		if p == "" {
 			continue
 		}

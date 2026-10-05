@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
@@ -158,4 +159,46 @@ func TestCleanupMigrationArtifacts_LeavesFilesItDidNotCreate(t *testing.T) {
 			t.Fatalf("the disk of a VM that lives here was removed: %v", err)
 		}
 	})
+}
+
+// The cleanup removes a stub this host made for the VM even when the source
+// does not name it — the source's EnsureDisks call was cut, so it never
+// learned what was made — but only while nothing has written to it since: a
+// recorded path a copy or a guest has written is a disk now.
+//
+// Mutations: take only the paths the source names — "untouched" is left and
+// goes red; take every recorded path whatever has written to it — "written
+// since" is removed and goes red.
+func TestCleanupMigrationArtifacts_RemovesItsUnnamedStubsUntouchedSinceMade(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		writtenTo   bool
+		wantRemoved bool
+	}{
+		{"untouched", false, true},
+		{"written since", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, disks := stubTarget(t)
+			p := filepath.Join(disks, "mig-root.qcow2")
+			if _, err := ensure(s, "mig", &pb.DiskStub{Path: p, SizeBytes: 1 << 20}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.writtenTo {
+				later := time.Now().Add(time.Minute)
+				if err := os.Chtimes(p, later, later); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.CleanupMigrationArtifacts(adminCtx(), &pb.CleanupMigrationArtifactsRequest{
+				VmName: "mig", RemoveCloudInit: true,
+			}); err != nil {
+				t.Fatalf("CleanupMigrationArtifacts: %v", err)
+			}
+			_, err := os.Stat(p)
+			if removed := os.IsNotExist(err); removed != tc.wantRemoved {
+				t.Fatalf("stub removed = %v (stat err %v), want %v", removed, err, tc.wantRemoved)
+			}
+		})
+	}
 }

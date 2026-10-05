@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -312,6 +313,46 @@ func TestFleet_AbortedStorageMigrationLeavesNothingBehind(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A client that goes away while the target is preparing its disks leaves no
+// stub there. The target makes the stub, but the source's EnsureDisks call is
+// cut before the answer reaches it, so the source never learns what was
+// created — and cleaned up only the stubs the target had reported.
+//
+// Mutation: have the target remove only the stubs the cleanup names — the
+// stub is left and the test goes red.
+func TestFleet_ClientGoneWhileTargetPreparesDisksLeavesNoStub(t *testing.T) {
+	f := newStorageAbort(t, nil, false)
+	f.src.Virt.FailMigrateToTarget = func(string, string) error {
+		t.Error("libvirt was asked to migrate; the client went away before the target was ready")
+		return errors.New("must not be reached")
+	}
+	made, done := make(chan struct{}), make(chan struct{})
+	f.dst.HookUnary("EnsureDisks", func(ctx context.Context, req any, handler grpc.UnaryHandler) (any, error) {
+		defer close(done)
+		resp, err := handler(ctx, req)
+		close(made)
+		<-ctx.Done() // the source's call is cut; this answer never reaches it
+		return resp, err
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	end := f.start(t, ctx)
+	awaitAbort(t, made, "the target's EnsureDisks to make the stub")
+	if _, err := os.Stat(f.stub); err != nil {
+		t.Fatalf("the target made no stub (%v); the scenario has nothing to undo", err)
+	}
+	cancel()
+	if err := awaitAbort(t, end, "the client's migration to end"); status.Code(err) != codes.Canceled {
+		t.Fatalf("the client's migration ended with %v, want Canceled", err)
+	}
+	awaitAbort(t, f.migrate.Returned, "the source's MigrateVM handler to return")
+	awaitAbort(t, done, "the target's EnsureDisks to return")
+
+	f.requireLockFree(t)
+	f.requireUndone(t)
 }
 
 // A target that goes away mid-copy cannot be cleaned up by the source: the

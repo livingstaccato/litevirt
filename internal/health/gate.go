@@ -19,8 +19,8 @@ import (
 //     may decide/forward) but an upgrading/draining/warming host does not.
 //   - ExecutionGate — QuorumProof.Yes && the local host is an ACTIVE WORKER
 //     (localHostIsActiveWorker; witnesses never execute a workload).
-//     DrainExecutionGate is the same gate for a drain's own outbound moves,
-//     which a draining host must still make.
+//     DrainExecutionGate is the same gate for moving a VM AWAY from this
+//     host, which a draining host must still do.
 //
 // Callers in internal/failover additionally require holdLease() at the *decide*
 // site. The lease alone is never sufficient: a CRDT lease can be "held" on both
@@ -362,10 +362,11 @@ func (c *Checker) ExecutionGate(ctx context.Context) GateResult {
 // `draining` as well as `active`. DrainHost marks the host draining before it
 // moves anything, so under ExecutionGate a drain could never move a VM.
 //
-// It is for the drain's outbound moves only (internal/grpcapi drainGateRefused
-// names them). Anything that would GROW a draining host — a start, a new VM,
-// an explicit migration from or onto it — still asks ExecutionGate, and is
-// refused there.
+// It is for moves AWAY from this host only (internal/grpcapi drainGateRefused
+// names them): the drain's, and an operator's migration off the host. Anything
+// that would GROW a draining host — a start, a new VM — still asks
+// ExecutionGate, and is refused there; a migration onto it is refused as its
+// target is not active.
 func (c *Checker) DrainExecutionGate(ctx context.Context) GateResult {
 	return c.executionGate(ctx, localHostIsEvacuatingWorker)
 }

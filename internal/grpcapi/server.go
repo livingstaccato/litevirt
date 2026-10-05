@@ -1007,7 +1007,7 @@ func withoutCapability(caps []string, drop string) []string {
 type serverGate interface {
 	ExecutionGate(ctx context.Context) health.GateResult
 	// DrainExecutionGate is ExecutionGate with a `draining` local host
-	// allowed, for a drain's own outbound moves only (drainGateRefused).
+	// allowed, for a VM leaving this host only (drainGateRefused).
 	DrainExecutionGate(ctx context.Context) health.GateResult
 	// DecisionGate is the coordinator/decide-site gate (quorum + coordinator-eligible).
 	// Leader-gated decide loops (rebalance executor) require it ON TOP of their CRDT
@@ -1595,20 +1595,22 @@ func (s *Server) execGateWith(ctx context.Context, markerPresent bool, local fun
 	return "", false
 }
 
-// drainGateRefused is execGateRefused for a host drain's OWN outbound moves:
+// drainGateRefused is execGateRefused for a VM LEAVING this host:
 // the same gate, enforced the same way, except that this host may be
 // `draining` — which DrainHost makes it before it moves anything, and which
 // ExecutionGate refuses (health.DrainExecutionGate). Quorum, self-fence and
 // the witness rule all still apply.
 //
-// It is used only where the drain moves a VM AWAY from this host or undoes
-// its own step: DrainHost's up-front check (a re-run on a draining host
-// retries what is left), the per-VM re-check and the cold-fallback re-check
-// in drainOneVM, migrateOwnedVM's source gates for a drain's cold move
-// (ownedMigrateOpts.drain), and the restart of a VM the drain shut down for a
-// move that then failed. Everything that would grow a draining host keeps
-// execGateRefused and is refused there. The start of a moved VM on its target
-// runs on the target, which is active, under the target's own gate.
+// It is used only where a VM LEAVES this host or the drain undoes its own
+// step: DrainHost's up-front check (a re-run on a draining host retries what
+// is left), the per-VM re-check and the cold-fallback re-check in drainOneVM,
+// migrateOwnedVM's source gates for a VM moving to another host
+// (sourceGateRefused — the drain's cold moves and an operator's `lv migrate`
+// alike), and the restart of a VM the drain shut down for a move that then
+// failed. Everything that would grow a draining host keeps execGateRefused
+// and is refused there; a move onto it is refused as its target is not
+// active. The start of a moved VM on its target runs on the target, under the
+// target's own gate.
 func (s *Server) drainGateRefused(ctx context.Context) (reason string, refused bool) {
 	return s.execGateWith(ctx, false, serverGate.DrainExecutionGate)
 }

@@ -39,7 +39,6 @@ func (s *Server) drainColdMove(ctx context.Context, vm *corrosion.VMRecord, targ
 	defer span.End()
 	req := &pb.MigrateVMRequest{VmName: vm.Name, TargetHost: target, Strategy: pb.MigrateStrategy_MIGRATE_COLD}
 	discard := func(pb.MigratePhase, float32, float32) error { return nil }
-	opts.drain = true
 	return s.migrateOwnedVM(ctx, req, vm, discard, unlock, adopted, opts)
 }
 
@@ -202,8 +201,8 @@ func (s *Server) drainRunningVMCold(ctx context.Context, vm *corrosion.VMRecord,
 			"shut down for a cold move to "+target.Name+" that failed, and not started again: "+status.Convert(rerr).Message())
 		finish("not moved; not started again: " + status.Convert(rerr).Message())
 		progress.Status = "error"
-		progress.Error = fmt.Sprintf("VM %s was shut down for a cold move that failed (%s) and could NOT be started again on %s (%s); it is STOPPED there with its disks — start it with `lv start %s`",
-			vm.Name, reason, s.hostName, status.Convert(rerr).Message(), vm.Name)
+		progress.Error = fmt.Sprintf("VM %s was shut down for a cold move that failed (%s) and could NOT be started again on %s (%s); it is STOPPED there with its disks — %s",
+			vm.Name, reason, s.hostName, status.Convert(rerr).Message(), startOnDrainedHostHint(vm.Name, s.hostName))
 		return progress
 	}
 	finish("not moved; started again on " + s.hostName)
@@ -221,6 +220,16 @@ func (s *Server) drainRunningVMCold(ctx context.Context, vm *corrosion.VMRecord,
 	return progress
 }
 
+// startOnDrainedHostHint is how an operator starts a VM left stopped on a
+// host a drain made `draining`. `lv start` alone is refused there while the
+// host is draining (a draining host runs no workload it does not already
+// run), so it names the two ways that work: undrain the host first, or move
+// the VM off, which a draining host allows, and start it where it lands.
+func startOnDrainedHostHint(vm, host string) string {
+	return fmt.Sprintf("start it with `lv start %s` once %s is no longer draining (`lv host undrain %s`), "+
+		"or move it off with `lv migrate %s <target-host> --cold` and start it there", vm, host, host, vm)
+}
+
 // reportStillShuttingDown is the end of a failed cold move whose guest was
 // asked to shut down and has not, even after drainLateShutdownWait past its
 // stop timeout. The VM is still running here and is not started or stopped
@@ -231,8 +240,8 @@ func (s *Server) reportStillShuttingDown(ctx context.Context, name, target, reas
 	if werr := s.persistVMState(ctx, name, "running", "drain: shutdown requested, still in progress", corrosion.OpVMState); werr != nil {
 		slog.Error("drain: could not record a still-running VM as running", "vm", name, "error", werr)
 	}
-	msg := fmt.Sprintf("VM %s was not moved (%s). Its shutdown was requested and its domain on %s is still active after waiting %s more than its stop timeout: it is still running there, and will power off if the guest completes the shutdown — then start it with `lv start %s`",
-		name, reason, s.hostName, drainLateShutdownWait, name)
+	msg := fmt.Sprintf("VM %s was not moved (%s). Its shutdown was requested and its domain on %s is still active after waiting %s more than its stop timeout: it is still running there, and will power off if the guest completes the shutdown — then %s",
+		name, reason, s.hostName, drainLateShutdownWait, startOnDrainedHostHint(name, s.hostName))
 	slog.Error("drain: "+msg, "vm", name, "target", target)
 	s.recordVMEvent(ctx, name, "vm.drain", "error", msg)
 	finish("not moved; shutdown requested and still in progress")
@@ -430,7 +439,8 @@ func (s *Server) resumeDrainColdMoves(ctx context.Context, giveUp bool) (int, er
 			continue
 		case rerr != nil:
 			msg := fmt.Sprintf("an interrupted drain cold move of VM %s to %s could not be finished (%v), and is given up: "+
-				"the VM may be stopped — start it with `lv start %s`", m.VM, m.Target, rerr, m.VM)
+				"the VM may be stopped (`lv inspect %s` names its host). On %s, %s; on any other host, start it with `lv start %s`",
+				m.VM, m.Target, rerr, m.VM, m.Source, startOnDrainedHostHint(m.VM, m.Source), m.VM)
 			slog.Error("drain: "+msg, "vm", m.VM, "operation", m.OperationID)
 			s.recordVMEvent(ctx, m.VM, "vm.drain", "error", msg)
 			if ferr := corrosion.FailDrainColdMove(ctx, s.db, m, msg); ferr != nil {
@@ -543,7 +553,7 @@ func (s *Server) resumeDrainColdMoveHere(ctx context.Context, m corrosion.DrainC
 			return "", false, werr
 		}
 		if m.ShutdownRequested {
-			return "not moved; its shutdown was requested and is still in progress: it still runs here and will power off if the guest completes it — then start it with `lv start " + m.VM + "`", false, nil
+			return "not moved; its shutdown was requested and is still in progress: it still runs here and will power off if the guest completes it — then " + startOnDrainedHostHint(m.VM, s.hostName), false, nil
 		}
 		return "not moved; it kept running here", false, nil
 	}

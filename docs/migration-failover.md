@@ -238,9 +238,14 @@ removes what it put on the target. It is never moved without its disks:
   is started again only after the guest has powered off. A guest still running
   after that is reported as an error that says so: its shutdown was requested
   and it is still running, and it will power off if the guest completes the
-  shutdown. Start it with `lv start <vm>` then;
+  shutdown. Start it then, as below;
 - if the start fails, drain reports it as an error naming the VM, which is
-  then stopped on the host; start it with `lv start <vm>`.
+  then stopped on the host.
+
+`lv start` is refused on a host while it is `draining` (see below), so a VM
+left stopped there is started with `lv host undrain <host>` and then
+`lv start <vm>`, or moved off with `lv migrate <vm> <target-host> --cold` and
+started on its new host.
 
 The move of a running VM is journaled before anything is done to it (an
 operation of kind `drain_cold_move`). If the drained host's daemon dies in the
@@ -253,25 +258,27 @@ by the drain itself (its state detail then reads `drain-cold-move:<operation>`,
 which counts as an operator stop everywhere). A VM started, stopped, moved or
 deleted since is left as it is, and a VM event says the move was not finished.
 A move that still cannot be finished after about ten minutes of retries is
-closed as failed, with a VM event naming the VM to start with `lv start`; a
-later restart does not take it up again.
+closed as failed, with a VM event naming the VM and how to start it; a later
+restart does not take it up again.
 
 Drain reports each VM it did not move with the reason, finishes the other VMs,
 and then fails with `drain incomplete: N VM(s) remain on host ...`. The host
 stays `draining`. Fix what the message names and run the drain again: a drain
-of a host that is already `draining` moves what is left. To migrate a VM
-yourself instead, `lv host undrain` the host first (see below). A VM that moved but did not start on the target is
+of a host that is already `draining` moves what is left. You can also move a
+VM off yourself with `lv migrate`. A VM that moved but did not start on the target is
 reported too, with a VM event saying why; it is stopped there, and the drain
 also ends with `drain incomplete`, naming it.
 
 A drain needs the drained host to hold quorum, as every move does (the
 split-brain gate, `split_brain_gate_v1`, which latches on every cluster).
-Once the host is `draining`, the gate lets through only the drain's own work:
-moving its VMs away, live or cold, and starting again a VM whose cold move
-failed after the drain shut it down. Anything else that would run a VM there
-is refused with `local_not_active_worker`, as on any host that is not
-`active`: `lv start`, and `lv migrate` from or to it. A VM moved by a drain
-is started on its target, which is `active`.
+Once the host is `draining`, the gate lets through only what takes VMs away
+from it: the drain's moves, live or cold, an `lv migrate` of a VM off the
+host, and starting again a VM whose cold move failed after the drain shut it
+down. Anything else that would run a VM there is refused with
+`local_not_active_worker`, as on any host that is not `active`: `lv start`
+of a VM on it, for one. A migration onto it is refused because its target is
+not `active`. A VM moved by a drain is started on its target, which is
+`active`.
 
 ### A VM with no domain
 

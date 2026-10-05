@@ -211,14 +211,15 @@ func TestFleet_DrainUnderEnforcedGateStartsAFailedMoveAgain(t *testing.T) {
 	sc.assertRunningOnSource(t)
 }
 
-// The exemption is the drain's own outbound moves and nothing else. A draining
-// host with the gate enforced still refuses to grow: an operator start of a
-// stopped VM there is refused, and so is an explicit migration from it, which
-// is not the drain. Moving a VM ONTO it is refused as before (the target must
-// be active).
+// A draining host with the gate enforced still refuses to grow, while a VM
+// may leave it by any route. An operator start of a stopped VM there is
+// refused. An explicit `lv migrate` of a VM off it goes through — moving VMs
+// away is what draining is for — and moving one back onto it is refused (the
+// target must be active).
 //
-// Mutation: let ExecutionGate itself pass a draining host — the start and the
-// explicit migration go through and the test goes red.
+// Mutations: let ExecutionGate itself pass a draining host — the start goes
+// through and the test goes red; migrateOwnedVM's source gate back on
+// ExecutionGate — the migration off is refused and goes red.
 func TestFleet_DrainingHostStillRefusesGrowth(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	sc.addStoppedLocalVM(t, "os2", []byte("os2's disk"))
@@ -226,18 +227,7 @@ func TestFleet_DrainingHostStillRefusesGrowth(t *testing.T) {
 	sc.markDraining(t)
 	ctx := context.Background()
 
-	// The migration first: a start let through would make os1 running,
-	// and its migration would then be refused for another reason.
-	err := sc.migrateCold(t)
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), health.ReasonLocalNotActiveWorker) {
-		t.Errorf("explicit migration from a draining host = %v, want refused: %s", err, health.ReasonLocalNotActiveWorker)
-	}
-	if vm := sc.vm(t); vm.HostName != sc.src.Name {
-		t.Errorf("os1 row names %s after a refused migration, want %s", vm.HostName, sc.src.Name)
-	}
-
-	// A VM of its own, so a migration let through above cannot change it.
-	_, err = sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os2"})
+	_, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os2"})
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), health.ReasonLocalNotActiveWorker) {
 		t.Errorf("start of a VM on a draining host = %v, want refused: %s", err, health.ReasonLocalNotActiveWorker)
 	}
@@ -245,17 +235,106 @@ func TestFleet_DrainingHostStillRefusesGrowth(t *testing.T) {
 		t.Errorf("os2 was started on the draining host")
 	}
 
-	// Inbound: dst drains, src is active again, and a migration onto dst is
-	// refused.
-	if err := corrosion.UpdateHostState(ctx, sc.src.DB, sc.src.Name, "active"); err != nil {
-		t.Fatal(err)
+	if err := sc.migrateCold(t); err != nil {
+		t.Fatalf("explicit migration of a VM off a draining host = %v, want it moved", err)
 	}
-	if err := corrosion.UpdateHostState(ctx, sc.src.DB, sc.dst.Name, "draining"); err != nil {
-		t.Fatal(err)
+	if vm := sc.vm(t); vm.HostName != sc.dst.Name || vm.State != "stopped" {
+		t.Fatalf("os1 row = host %s state %s after its migration off, want host %s stopped", vm.HostName, vm.State, sc.dst.Name)
 	}
-	err = sc.migrateCold(t)
+	if got, err := os.ReadFile(sc.file(sc.dst, sc.disk)); err != nil || string(got) != string(sc.payload) {
+		t.Errorf("os1's disk did not arrive intact on %s (err %v)", sc.dst.Name, err)
+	}
+
+	// Inbound: moving it back onto the draining host is refused, from the
+	// host that now owns it.
+	st, err := sc.c.SelfClient(sc.dst).MigrateVM(ctx, &pb.MigrateVMRequest{
+		VmName: "os1", TargetHost: sc.src.Name, Strategy: pb.MigrateStrategy_MIGRATE_COLD,
+	})
+	if err == nil {
+		for {
+			if _, err = st.Recv(); err != nil {
+				break
+			}
+		}
+	}
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "is not active") {
 		t.Errorf("migration onto a draining host = %v, want refused: target is not active", err)
+	}
+	if vm := sc.vm(t); vm.HostName != sc.dst.Name {
+		t.Errorf("os1 row names %s after a refused migration onto the draining host, want %s", vm.HostName, sc.dst.Name)
+	}
+}
+
+// A live migration that fails during a drain under the enforced gate falls
+// back to a cold move, which re-checks the gate on the (draining) source and
+// goes ahead: the VM moves cold, with nothing left behind, and runs on the
+// target.
+//
+// Mutation: the cold-fallback re-check in drainOneVM back on ExecutionGate —
+// os3 is skipped with "drain refused: local_not_active_worker" and goes red.
+func TestFleet_DrainUnderEnforcedGateFallsBackToColdWhenLiveFails(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.addRunningSharedVM(t, "os3")
+	enforceGate(t, sc.c)
+	sc.src.Virt.FailMigrateToTarget = func(name, _ string) error {
+		if name == "os3" {
+			return io.ErrUnexpectedEOF
+		}
+		return nil
+	}
+
+	progress, err := sc.drain(t)
+	if err != nil {
+		t.Fatalf("drain with a failing live migration under the enforced gate: %v", err)
+	}
+	if p := progress["os3"]; p == nil || p.Status != "done" || p.Error != "" || p.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
+		t.Fatalf("drain progress for os3 = %+v, want done cold", p)
+	}
+	if vm := sc.vmNamed(t, "os3"); vm.HostName != sc.dst.Name || vm.State != "running" {
+		t.Errorf("os3 row = host %s state %s, want host %s state running", vm.HostName, vm.State, sc.dst.Name)
+	}
+	if active, _ := sc.dst.Virt.DomainIsActive("os3"); !active {
+		t.Errorf("os3 is not running on %s after its cold fallback", sc.dst.Name)
+	}
+	if sc.src.Virt.DomainExists("os3") {
+		t.Errorf("os3's domain is still defined on the drained host")
+	}
+}
+
+// The startup recovery of a drain's interrupted cold move runs on a host the
+// drain left `draining`, under the enforced gate. A move that died after the
+// shutdown is started again here; one that died after the handoff is started
+// on the target, which is active.
+//
+// Mutation: restartAfterFailedColdMove back on ExecutionGate — shut_off ends
+// with os1 stopped and recovery reporting a move still pending.
+func TestFleet_DrainRecoveryUnderEnforcedGateOnADrainingHost(t *testing.T) {
+	for _, tc := range []struct {
+		point  string
+		onDest bool
+	}{
+		{"shut_off", false},
+		{"handed_off", true},
+	} {
+		t.Run(tc.point, func(t *testing.T) {
+			sc := newColdStoppedScenario(t)
+			sc.makeRunning(t)
+			enforceGate(t, sc.c)
+			sc.crashAt(t, tc.point)
+			if st := sc.hostState(t, sc.src); st != "draining" {
+				t.Fatalf("drained host state = %s, want draining", st)
+			}
+
+			left, err := sc.src.Server.ResumeDrainColdMoves(context.Background())
+			if err != nil || left != 0 {
+				t.Fatalf("ResumeDrainColdMoves = %d left, %v; want 0, nil", left, err)
+			}
+			want := sc.src
+			if tc.onDest {
+				want = sc.dst
+			}
+			sc.assertRunsOnExactlyOneHost(t, want)
+		})
 	}
 }
 

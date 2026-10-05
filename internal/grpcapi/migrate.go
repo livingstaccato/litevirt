@@ -298,8 +298,9 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// Both local and dir keep the disk as a host-local file (same path = two
 		// distinct files on two hosts) — match the source-cleanup predicate so a
 		// dir-pool VM isn't mistaken for shared storage and migrated without its
-		// disk (G1 #3 / pre-existing for dir pools).
-		if isHostLocalDiskDriver(d.StorageType) {
+		// disk (G1 #3 / pre-existing for dir pools). An untyped legacy row is
+		// host-local, as the storage copy takes it (isHostLocalDisk).
+		if isHostLocalDisk(d) {
 			hasLocal = true
 			break
 		}
@@ -1389,7 +1390,7 @@ func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord, fwVM
 	}
 	if fwVM {
 		for _, d := range disks {
-			if isHostLocalDiskDriver(d.StorageType) {
+			if isHostLocalDisk(d) {
 				return nil, status.Errorf(codes.FailedPrecondition,
 					"Secure Boot / vTPM VM %q has a host-local disk (%s) and can't be migrated while stopped — move it to shared storage first (host-local firmware-VM migration is a follow-up)", vm.Name, d.StorageType)
 			}
@@ -1935,7 +1936,18 @@ func (s *Server) storageMigrationStubs(ctx context.Context, vmName string) ([]*p
 // it always was). A shared disk (nfs, ceph, iscsi, a volume manager) is the same
 // disk on the target already, and copying it would mirror it onto itself.
 func copiedByStorageMigration(d corrosion.DiskRecord) bool {
-	return d.Path != "" && (d.StorageType == "" || isHostLocalDiskDriver(d.StorageType))
+	return d.Path != "" && isHostLocalDisk(d)
+}
+
+// isHostLocalDisk is the one answer to "does this VM disk live on this host
+// only", for every decision about moving a VM: a host-local driver, or a row
+// with no storage type, which predates the column and has always been copied
+// as host-local. Drain's choice between a live and a cold move, the snapshot
+// refusal and the copy itself must agree, or an untyped disk is left behind by
+// a move that copies none. Removal paths keep the stricter
+// isHostLocalDiskDriver: they delete, and an untyped row proves less.
+func isHostLocalDisk(d corrosion.DiskRecord) bool {
+	return d.StorageType == "" || isHostLocalDiskDriver(d.StorageType)
 }
 
 // storageMigrationTargets is the migrate_disks list of a --with-storage

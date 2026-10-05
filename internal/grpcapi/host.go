@@ -612,15 +612,16 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		return s.drainStoppedVM(ctx, fresh, target, unlock, &adopted)
 	}
 
-	// A running VM with a host-local disk (local or dir storage) cannot be
-	// live-migrated by drain, which copies no storage: it is cold-moved, shut
-	// down only once every check of that move has passed. A disk list that
+	// A running VM with a host-local disk (local or dir storage, or a legacy
+	// row with none — isHostLocalDisk) cannot be live-migrated by drain, which
+	// copies no storage: it is cold-moved, shut down only once every check of
+	// that move has passed. A disk list that
 	// cannot be read is treated as holding one — the cold path reads it again
 	// and refuses with the reason, leaving the VM running.
 	disks, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	hostLocal := derr != nil
 	for _, d := range disks {
-		if isHostLocalDiskDriver(d.StorageType) {
+		if isHostLocalDisk(d) {
 			hostLocal = true
 			break
 		}

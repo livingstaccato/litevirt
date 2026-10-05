@@ -204,6 +204,8 @@ func (s *Server) markDeviceLeaseRollbackIncomplete(vmName string, addrs []string
 //     domain a CONFIG-only detach (a live-flagged detach a shut-off domain rejects would
 //     wedge the lease), and an indeterminate / paused / pm-suspended domain DEFERS (the
 //     entry is retained, reclaimed nothing, retried next pass);
+//   - the VM exists and the lease is Stage migration_detached → MigrateVM died with
+//     SR-IOV VFs out of the guest; recoverMigrationVFLease reattaches or releases them;
 //   - the VM exists with any other stage (Stage "bound" — a completed allocation whose
 //     finish() didn't run before the crash) → the entry is just cleared, WITHOUT releasing.
 //
@@ -245,6 +247,12 @@ func (s *Server) RecoverDeviceLeases(ctx context.Context) {
 			if rerr := s.reclaimLeasedDevices(ctx, e.ResourceID, addrs, reclaimNoDomain); rerr != nil {
 				slog.Error("device-lease recovery: reclaim incomplete — retaining lease for retry", "vm", e.ResourceID, "error", rerr)
 				continue // do NOT remove the entry; a later pass retries
+			}
+		} else if e.Stage == deviceLeaseStageMigrationDetached {
+			// MigrateVM died with VFs out of the guest: reattach if the guest
+			// stayed, release if it left (recoverMigrationVFLease).
+			if !s.recoverMigrationVFLease(ctx, vm, addrs) {
+				continue // retained for a later pass
 			}
 		} else if e.Stage == deviceLeaseStageInProgress || e.Stage == deviceLeaseStageRollbackIncomplete {
 			// The VM exists but a legacy running-attach crashed mid-flight (in_progress: the

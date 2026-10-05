@@ -177,6 +177,14 @@ PCI passthrough devices cannot be live-migrated. Options:
 
 The migration command will fail with an error if the VM has PCI devices attached and `--cold` is not specified.
 
+SR-IOV VFs are hot-detached from the guest just before the copy starts. The VM
+keeps owning them on the source until the cutover commits, so no other VM can
+claim one mid-move. Then they are released, and the target allocates its own.
+If the migration fails, they go back into the guest. A host-local device lease
+records them before the first detach. If the daemon restarts in the middle of
+the move, startup recovery reads that lease and puts the VFs back into a guest
+still running on the source, or releases them if the guest has moved.
+
 ## Resource mappings
 
 A **resource mapping** is a cluster-wide alias for an equivalent passthrough device

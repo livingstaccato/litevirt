@@ -131,8 +131,29 @@ func (s *Server) authorizeSchedule(ctx context.Context, scope, vmName, poolName,
 	return s.requirePermResolved(ctx, known, path, vmRBACPathFor("", vmName), "backup.schedule", "operator", "vm "+strconv.Quote(vmName))
 }
 
+// canReadSchedule reports whether the caller may see a backup/replication
+// schedule row — the read-side counterpart of authorizeSchedule, authorizing
+// on the same scheduleRBACTarget path but with the backup.read verb (matched
+// by Viewer/Auditor's "*.read" and by Operator/BackupOperator's "backup.*",
+// so every role that could read a schedule's target resource keeps reading
+// its schedules). A row whose project cannot be resolved here (an unreplicated
+// or deleted target) permits only a cluster-root grant or the legacy
+// no-bindings fallback — never a guess — matching requirePermResolved's rule,
+// applied to a filter instead of a single error.
+func (s *Server) canReadSchedule(ctx context.Context, r corrosion.BackupScheduleRecord) bool {
+	scope := r.Scope
+	if scope == "" {
+		scope = "vm"
+	}
+	path, known := s.scheduleRBACTarget(ctx, scope, r.VMName, r.PoolName, r.ProjectName)
+	if !known {
+		return s.RequirePerm(ctx, "/", "backup.read", "viewer") == nil
+	}
+	return s.RequirePerm(ctx, path, "backup.read", "viewer") == nil
+}
+
 func (s *Server) ListBackupSchedules(ctx context.Context, _ *pb.ListBackupSchedulesRequest) (*pb.ListBackupSchedulesResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
 	rows, err := corrosion.ListBackupSchedules(ctx, s.db)
@@ -143,6 +164,12 @@ func (s *Server) ListBackupSchedules(ctx context.Context, _ *pb.ListBackupSchedu
 	for _, r := range rows {
 		if r.Type == "replication" {
 			continue // listed via ListReplicationSchedules
+		}
+		// ListBackupSchedules used to check only the cluster-wide viewer
+		// floor above, so a caller scoped to one project could list every
+		// VM/pool/project's backup schedules.
+		if !s.canReadSchedule(ctx, r) {
+			continue
 		}
 		resp.Schedules = append(resp.Schedules, scheduleToPB(r))
 	}

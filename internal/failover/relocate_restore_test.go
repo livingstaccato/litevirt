@@ -428,3 +428,31 @@ func TestResolvePendingRelocations_StaleCollidingTargetSkips(t *testing.T) {
 		t.Fatalf("unrelated target container must be untouched, got %+v", tgt)
 	}
 }
+
+// A target row without the attempt token is not the coordinator's restore (an
+// operator restore stamps no token), so resuming a marker must not complete the
+// handoff onto it and tombstone the source.
+func TestRelocate_ResumeDoesNotCompleteOnTokenlessTargetRow(t *testing.T) {
+	db, src, cands := relocateSetup(t, "alpine:3.19", corrosion.CurrentSchemaVersion)
+	ctx := context.Background()
+	c := newTestCoordinator("coord", db)
+	fr := &fakeRestorer{db: db}
+	c.Restorer = fr
+	c.RelocateRestoreTimeout = time.Hour // fresh marker: no fallback this tick
+
+	if err := corrosion.SetContainerStateDetail(ctx, db, "src", "ct1", "relocating", corrosion.RelocateRestoreDetail("surv", "tok1")); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "surv", Name: "ct1", State: "stopped", Image: "alpine:3.19", OnHostFailure: "image-recreate",
+	}); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+
+	c.relocateContainers(ctx, src, cands)
+
+	row, _ := corrosion.GetContainer(ctx, db, "src", "ct1")
+	if row == nil || row.State != "relocating" {
+		t.Fatalf("a tokenless target row must not complete the handoff; source = %+v", row)
+	}
+}

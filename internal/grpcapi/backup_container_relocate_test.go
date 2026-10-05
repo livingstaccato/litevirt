@@ -542,8 +542,12 @@ func TestRestoreContainer_StampsRelocateTokenFromMetadata(t *testing.T) {
 	}
 	_ = corrosion.DeleteContainer(ctx, s.db, "host-a", "ct1")
 
-	// Restore with the relocation attempt token in incoming metadata.
-	rctx := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(relocateTokenMDKey, "tok-xyz"))
+	// Restore with the relocation attempt token in incoming metadata, over the
+	// coordinator's peer transport (the only caller allowed to carry it).
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: "peer-1", Address: "10.0.0.7", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	rctx := metadata.NewIncomingContext(mtlsAdminCtx("peer-1"), metadata.Pairs(relocateTokenMDKey, "tok-xyz"))
 	rs := &progressStream[pb.RestoreContainerProgress]{ctx: rctx}
 	if err := s.RestoreContainer(&pb.RestoreContainerRequest{
 		Name: "ct1", RepoPath: repo, Timestamp: "2026-06-27T13:00:00Z",

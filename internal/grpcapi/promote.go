@@ -750,6 +750,22 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return err
 		}
 	}
+	// Project isolation. A RENAMED promotion writes a second VM with new NIC rows
+	// — a new attachment — so each network must be one the VM's project may use
+	// (same project on both sides: a raw bridge is carried, a managed network
+	// another project owns is refused). A TAKEOVER re-homes the existing VM and
+	// its existing NICs; like the bound-network refusal above it must not block,
+	// since refusing would leave a fenced host's VM down without removing the
+	// attachment. It warns and audits instead. Keyed on renamed, not automated:
+	// automated is lost through relayPromote, which re-enters as a manual call.
+	var foreignNets []string // recorded only once the takeover has committed
+	if renamed {
+		if err := s.admitCopiedNetworks(ctx, "promote", vm.Project, vm.Project, specNetworkNames(spec.Network)); err != nil {
+			return err
+		}
+	} else {
+		foreignNets = s.foreignNetworks(ctx, "vm.promote", targetName, vm.Project, specNetworkNames(spec.Network))
+	}
 
 	// Adoption gate (fail-closed, no-op pre-latch): under the active hardware_v2 regime a
 	// "blocked" VM (hardware failed its per-VM compatibility audit) must not be brought
@@ -977,8 +993,11 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return status.Errorf(codes.FailedPrecondition, "network bridge %q unavailable on %q: %v", bridge, s.hostName, err)
 		}
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+		// The groups go on the legacy row as well as the vm_nics one: a peer on
+		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: targetName, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: n.Ip,
+			SecurityGroups: n.SecurityGroups,
 		})
 		nicRecords = append(nicRecords, corrosion.NICRecord{
 			VMName:         targetName,
@@ -1119,6 +1138,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	s.recordVMEvent(ctx, targetName, "vm.promoted", "ok",
 		fmt.Sprintf("from replica %s on %s%s", replica, s.hostName, multiDiskNote))
 	s.audit(ctx, "replica.promote", targetName, "replica="+replica+" host="+s.hostName, "ok")
+	s.recordForeignNetworks(ctx, "vm.promote", targetName, foreignNets)
 	_ = send(&pb.PromoteReplicaProgress{
 		Phase: pb.PromoteReplicaProgress_DONE, VmName: targetName, Host: s.hostName,
 		Replica: replica, DiskPath: livePath, Status: "promotion complete" + multiDiskNote,

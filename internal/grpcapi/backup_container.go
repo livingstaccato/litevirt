@@ -368,6 +368,17 @@ func (s *Server) RestoreContainerFromBackup(ctx context.Context, ctName, targetH
 	return s.driveRemoteRestore(ctx, targetHost, repoName, ctName, timestamp, token)
 }
 
+// relocationTokenToStamp is the relocate_token a restored row carries: the
+// coordinator's attempt token, and only for a peer relocation. RestoreContainer
+// already refuses a token without a peer cert; this keeps the stamp tied to the
+// same predicate rather than to whatever metadata reached the row write.
+func relocationTokenToStamp(ctx context.Context, peerRelocation bool) string {
+	if !peerRelocation {
+		return ""
+	}
+	return relocateTokenFromMD(ctx)
+}
+
 // relocateTokenFromMD reads the relocation attempt token from incoming gRPC
 // metadata (” for a direct, non-relocation restore).
 func relocateTokenFromMD(ctx context.Context) string {
@@ -609,6 +620,20 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		return status.Error(codes.Unavailable, "container runtime not wired on this host")
 	}
 
+	// The relocation token is the coordinator's provenance: stamped on the row,
+	// it lets the coordinator complete its handoff (tombstoning the source), pin
+	// a decided recovery claim to the row, and it stops owner re-key for the
+	// name. It is plain client metadata, and the real value is readable off the
+	// source row's state detail, so only the coordinator's peer transport may
+	// carry it. Anyone else sending it is refused before any side effect, rather
+	// than having it silently dropped. (Its only senders are driveRemoteRestore
+	// and MigrateContainer's restore leg, both over peer mTLS.)
+	if relocateTokenFromMD(ctx) != "" && s.requirePeerCert(ctx) != nil {
+		s.audit(ctx, "ct.restore", req.Name, "relocation token without a peer cert", "denied")
+		return status.Error(codes.PermissionDenied,
+			"the relocation token is reserved for a peer-driven relocation; an operator restore must not send it")
+	}
+
 	// Split-brain gate (Phase 1): a restore-relocation is a runtime-ownership
 	// action. The target must have local quorum (ExecutionGate) AND, for a
 	// token-bound coordinator restore, validate + single-use-claim the proof before
@@ -727,6 +752,22 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		_ = json.Unmarshal([]byte(manifest.ContainerSpecJSON), &spec)
 	}
 
+	// Project isolation. An operator restore rebuilds the archived spec's NICs as
+	// a new workload in the authorized project, so each managed network must be
+	// one that project may use (same project as the backup: a raw bridge is
+	// carried). A failover relocation (a carried, peer-mTLS, token-bound proof)
+	// and a cold migrate (a peer-verified migrate-from) RE-HOME the existing
+	// container instead: refusing would leave it down without removing the
+	// attachment, so they warn and audit, as a takeover promote does.
+	ctNets := containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))
+	var foreignNets []string // recorded only once the restored row has landed
+	if s.isPeerRelocation(ctx, req.Proof != nil) || s.migrateSourceFromPeer(ctx) != "" {
+		foreignNets = s.foreignNetworks(ctx, "ct.restore", req.Name, project, ctNets)
+	} else if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
+		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
+		return err
+	}
+
 	// Capacity + quota admission, the SAME two-scope split as CreateContainer.
 	//
 	//   HOST capacity — memory only. A container's cpu_limit is a cap in cores (a
@@ -764,7 +805,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// and accounts for the same figures.
 	var restoreQuotaLease *reservationLease
 	if s.migrateSourceFromPeer(ctx) == "" {
-		relocation := req.Proof != nil || relocateTokenFromMD(ctx) != ""
+		// Peer-only: the token is plain client metadata, so an operator setting it
+		// must not skip the project's quota (isPeerRelocation).
+		relocation := s.isPeerRelocation(ctx, req.Proof != nil)
 		// Unconditional, like CreateContainer: an archived spec with no limits
 		// still restores into RESIDENCY, and that is the safety decision.
 		{
@@ -957,7 +1000,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 		IsTemplate:    spec.IsTemplate,
 		// Stamp the failover coordinator's attempt token (if this is a
 		// restore-relocation) so it can prove this row is its restore.
-		RelocateToken: relocateTokenFromMD(ctx),
+		RelocateToken: relocationTokenToStamp(ctx, s.isPeerRelocation(ctx, req.Proof != nil)),
 	}
 	// FENCE, immediately before the durable write (see allowCommit): the whole
 	// archive import sat between the quota grant and here, so the project's
@@ -995,6 +1038,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// host-local proof marker is no longer needed (any future retry hits the "row already
 	// exists" guard above, never the resume path). Drop it best-effort.
 	s.removeRestoreMarker(req.Name)
+	s.recordForeignNetworks(ctx, "ct.restore", req.Name, foreignNets)
 	// Mark the relocation proof terminal (single-use) so a duplicate restore of the same
 	// attempt can't re-import.
 	if restoreProofID != "" {

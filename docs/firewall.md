@@ -254,11 +254,35 @@ missing. Recommended order:
 
 ## Per-NIC SG binding + reload
 
-- **Per-NIC SG binding** — `vm_interfaces.security_groups` JSON column.
-  Compose `network[].security-groups: [web]` persists on VM create;
-  `lv sg bind <vm> --network <net> --sg web` mutates at runtime. The
-  reconciler's `CorrosionPlanLoader` resolves names to real taps every
-  tick.
+- **Per-NIC SG binding** — the `security_groups` JSON column of the NIC's
+  `vm_nics` row, or of its `vm_interfaces` row when it has no `vm_nics` row.
+  Compose `network[].security-groups: [web]` persists on VM create, and
+  clone, promote, live-restore and NIC hot-attach carry the NIC's groups
+  too; `lv sg bind <vm> --network <net> --sg web` mutates at runtime: it
+  rewrites the NIC's `vm_nics` row (and its `vm_interfaces` row, for peers on
+  an older build), so the next reconcile applies it. A bind naming a network
+  the VM has no NIC on is refused rather than answered OK.
+- **The chain follows the tap libvirt gives the NIC now.** libvirt hands out
+  a new `vnetN` on every start, so the tap recorded at create is stale after
+  a stop and start, a migration or a failover. Every tick the reconciler asks
+  libvirt for each local NIC's tap by MAC and binds the chain to that; a NIC
+  of a VM that is not running has no tap and gets no chain. A running VM
+  whose NIC libvirt cannot name is logged as a warning, because that NIC is
+  not filtered. If libvirt cannot be asked at all (the connection is down,
+  libvirtd is restarting, or it does not answer within 10s), the pass fails
+  and the ruleset already applied stays in place; `lv firewall show` reports
+  the error.
+- **Group names are unique, and a duplicate fails closed.** `lv sg create`
+  and a stack deploy refuse a name another live group holds. Two live groups
+  can still share a name (rows written before this check, by a node on an
+  older build, or by two nodes racing). The reconciler cannot know which one
+  a NIC meant, so it renders neither: every NIC bound to that name gets a
+  chain that drops all new traffic in both directions (replies to existing
+  connections still pass), a warning is logged each tick, and
+  `litevirt_firewall_sg_duplicate_name_nics{sg}` counts the NICs held.
+  `lv sg ls` shows both ids; remove one with `lv sg rm <sg-id>` (or, for a
+  stack's group, rename it in the compose file and re-deploy) to release
+  them.
 - **Containers get identical per-NIC enforcement on their veth.** A managed
   container NIC's `container_interfaces.security_groups` binds to its
   deterministic veth exactly like a VM NIC binds to its tap — the same

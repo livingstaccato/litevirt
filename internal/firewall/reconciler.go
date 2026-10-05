@@ -2,6 +2,7 @@ package firewall
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -238,16 +239,67 @@ func (r *Reconciler) recordOK() {
 	r.lastTick = time.Now()
 }
 
+// RunningTaps lists the host device of every NIC of every running domain on
+// this host: domain name → lower-cased MAC → tap. libvirt.Client.
+// RunningDomainTaps is the production one. A domain that is not running is
+// simply absent; an error means libvirt could not be asked at all.
+type RunningTaps func() (map[string]map[string]string, error)
+
+// defaultTapTimeout bounds one RunningTaps call. go-libvirt calls take no
+// context, so a hung libvirtd would otherwise stall the reconciler — NAT,
+// isolation and `lv firewall reload` with it.
+const defaultTapTimeout = 10 * time.Second
+
+// LoaderOptions are CorrosionPlanLoader's host-local inputs: what it cannot
+// read from the replicated tables.
+type LoaderOptions struct {
+	// RunningTaps is asked once per pass for the taps of every running
+	// domain. The tap recorded in vm_interfaces is never used: it is written
+	// once, at create, and libvirt hands out a new vnetN on every start, so
+	// after a stop and start, a migration or a failover it names nothing — or
+	// another VM's tap on this host. nil renders no VM NIC chains at all.
+	//
+	// When it errors or times out, the pass fails and Reconcile keeps the
+	// ruleset it last applied. Dropping the VM NICs instead would remove every
+	// per-NIC chain on the host while libvirt is merely unreachable, and under
+	// the default accept policy every VM would run unfiltered until it came
+	// back.
+	RunningTaps RunningTaps
+
+	// TapTimeout bounds one RunningTaps call; zero means defaultTapTimeout.
+	// While a timed-out call is still outstanding, later passes fail at once
+	// rather than stack up goroutines behind a hung libvirtd.
+	TapTimeout time.Duration
+
+	// OnDuplicateSGs, when set, receives after every pass the security-group
+	// names that more than one live group holds and that a NIC on this host is
+	// bound to, each with the number of this host's NICs held at drop for it.
+	// An empty map means none. The daemon exports it as
+	// litevirt_firewall_sg_duplicate_name_nics.
+	OnDuplicateSGs func(nicsByName map[string]int)
+}
+
 // CorrosionPlanLoader builds a Plan from the cluster's
-// security_groups + sg_rules + vm_interfaces tables, scoped to the
+// security_groups + sg_rules + vm_nics/vm_interfaces tables, scoped to the
 // current host.
 //
-// closes the loop: per-NIC bindings come from the
-// vm_interfaces.security_groups column. Each VM interface owned by
-// `hostName` produces a NICBinding referencing the SG names stored on
-// that row. NICs without a tap_device (not yet provisioned) are
-// skipped so we don't emit chains for non-existent interfaces.
-func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) PlanLoader {
+// Per-NIC bindings come from corrosion.ListHostVMNICs: every live NIC in the
+// vm_nics/vm_interfaces overlay, with its groups from its vm_nics row when it
+// has one (a hot-attached NIC has them nowhere else) and from vm_interfaces
+// otherwise. Each VM NIC owned by `hostName` produces a NICBinding on the tap libvirt
+// reports for that NIC's MAC right now (opts.RunningTaps). A NIC libvirt does
+// not report — its VM is not running, or the NIC is not in the live domain — is
+// skipped: there is no device to filter. If libvirt cannot be asked, the pass
+// fails and the applied ruleset stays.
+//
+// A NIC (VM or container) bound to a group name that more than one live group
+// holds fails CLOSED: its chain drops everything new and renders neither
+// group, with a warning per pass and opts.OnDuplicateSGs. Creating such a name
+// is refused (CreateSecurityGroup, stack deploy); this covers rows that exist
+// anyway — written before the refusal, by a peer on an older build, or by two
+// nodes racing, since the CRDT has no UNIQUE.
+func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
+	taps := &tapFetcher{}
 	return func(ctx context.Context) (Plan, error) {
 		plan := defaults
 
@@ -286,8 +338,20 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 		if err != nil {
 			return plan, err
 		}
+		// A name two live groups hold cannot be resolved: which one a NIC
+		// meant is not in the data. Neither is rendered, and every NIC bound to
+		// the name is held at drop (failClosed) — picking one would silently
+		// hand the NIC rules nobody chose for it, and a union would accept
+		// traffic both groups' owners meant to refuse.
+		holders := map[string]int{}
+		for _, sg := range sgs {
+			holders[sg.Name]++
+		}
 		plan.SecurityGroups = plan.SecurityGroups[:0:0]
 		for _, sg := range sgs {
+			if holders[sg.Name] > 1 {
+				continue
+			}
 			rules, err := corrosion.ListSGRules(ctx, db, sg.ID)
 			if err != nil {
 				return plan, err
@@ -309,26 +373,65 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 		for _, sg := range plan.SecurityGroups {
 			valid[sg.Name] = true
 		}
-		ifaces, err := corrosion.ListVMInterfacesByHost(ctx, db, hostName)
+		ambiguous := map[string]int{} // duplicate name → this host's NICs held at drop for it
+		// bind resolves one NIC's bound names: the known ones, or, when any of
+		// them is a duplicate, none at all plus the drop rules.
+		bind := func(dev, owner string, names []string) NICBinding {
+			nb := NICBinding{NICDev: dev, VMName: owner}
+			var dups []string
+			for _, name := range names {
+				if holders[name] > 1 {
+					dups = append(dups, name)
+				}
+			}
+			if len(dups) > 0 {
+				for _, d := range dups {
+					ambiguous[d]++
+				}
+				slog.Warn("firewall: NIC bound to a security-group name more than one live group holds; holding it at drop",
+					"workload", owner, "nic", dev, "groups", dups)
+				nb.ExtraRules = failClosed()
+				return nb
+			}
+			nb.SecurityGroups = make([]string, 0, len(names))
+			for _, name := range names {
+				if valid[name] {
+					nb.SecurityGroups = append(nb.SecurityGroups, name)
+				}
+			}
+			return nb
+		}
+		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName)
 		if err != nil {
 			return plan, err
 		}
+		var running map[string]map[string]string
+		if len(ifaces) > 0 && opts.RunningTaps != nil {
+			if running, err = taps.fetch(ctx, opts.RunningTaps, opts.TapTimeout); err != nil {
+				return plan, fmt.Errorf("read VM taps from libvirt (keeping the applied ruleset): %w", err)
+			}
+		}
 		plan.NICs = plan.NICs[:0:0]
+		claimed := map[string]string{} // tap → the VM that holds it this pass
 		for _, ifc := range ifaces {
-			if ifc.TapDevice == "" {
+			tap := running[ifc.VMName][strings.ToLower(ifc.MAC)]
+			if tap == "" {
+				if ifc.VMState == "running" && opts.RunningTaps != nil {
+					// libvirt answered and does not have this NIC running.
+					slog.Warn("firewall: a VM recorded as running has no tap for this NIC in libvirt; no chain rendered",
+						"vm", ifc.VMName, "mac", ifc.MAC)
+				}
 				continue
 			}
-			bound := make([]string, 0, len(ifc.SecurityGroups))
-			for _, name := range ifc.SecurityGroups {
-				if valid[name] {
-					bound = append(bound, name)
-				}
+			if other, dup := claimed[tap]; dup {
+				// Two NICs cannot hold one device; rendering both would emit one
+				// chain twice and nft would refuse the whole ruleset.
+				slog.Warn("firewall: two VM NICs resolved to one tap; keeping the first",
+					"tap", tap, "vm", ifc.VMName, "other_vm", other)
+				continue
 			}
-			plan.NICs = append(plan.NICs, NICBinding{
-				NICDev:         ifc.TapDevice,
-				VMName:         ifc.VMName,
-				SecurityGroups: bound,
-			})
+			claimed[tap] = ifc.VMName
+			plan.NICs = append(plan.NICs, bind(tap, ifc.VMName, ifc.SecurityGroups))
 		}
 
 		// Container NICs: identical per-NIC SG enforcement on the veth. The loader
@@ -343,17 +446,10 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 			if ifc.VethDevice == "" {
 				continue
 			}
-			bound := make([]string, 0, len(ifc.SecurityGroups))
-			for _, name := range ifc.SecurityGroups {
-				if valid[name] {
-					bound = append(bound, name)
-				}
-			}
-			plan.NICs = append(plan.NICs, NICBinding{
-				NICDev:         ifc.VethDevice,
-				VMName:         ifc.CtName,
-				SecurityGroups: bound,
-			})
+			plan.NICs = append(plan.NICs, bind(ifc.VethDevice, ifc.CtName, ifc.SecurityGroups))
+		}
+		if opts.OnDuplicateSGs != nil {
+			opts.OnDuplicateSGs(ambiguous)
 		}
 
 		// NAT / SNAT / host-isolation infra: read this host's resolved intent
@@ -365,6 +461,81 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan) P
 		}
 		plan.NAT, plan.HostIsolation = intentToNATIsolation(intents)
 		return plan, nil
+	}
+}
+
+// failClosed is the chain body of a NIC whose groups cannot be resolved: drop
+// everything new in both directions. Replies to connections the NIC already
+// had still pass (the forward chain accepts established flows before any NIC
+// chain). The nft comment is fixed text, because nft caps a comment at 128
+// bytes and a group name is unbounded; the names go to the log and the metric.
+func failClosed() []Rule {
+	const why = "ambiguous security group name: held at drop"
+	return []Rule{
+		{Direction: Ingress, Proto: "all", Action: Drop, Comment: why},
+		{Direction: Egress, Proto: "all", Action: Drop, Comment: why},
+	}
+}
+
+// tapFetcher runs at most one RunningTaps call at a time under a deadline.
+// Reconcile is not serialized (the 30s loop, `lv firewall reload` and the RPCs
+// that reconcile after provisioning a network all call it), so a pass that
+// arrives while a call is in flight JOINS it and shares its answer. It waits
+// under its own deadline, measured from when it arrived.
+//
+// The call cannot be cancelled (go-libvirt takes no context). A call that has
+// overrun the deadline is presumed hung: until it returns, every pass fails at
+// once with errTapFetchOutstanding instead of waiting on it again or stacking
+// another call behind it.
+type tapFetcher struct {
+	mu       sync.Mutex
+	inflight *tapCall
+}
+
+// tapCall is one in-flight RunningTaps call. taps and err are written once,
+// before done is closed.
+type tapCall struct {
+	started time.Time
+	done    chan struct{}
+	taps    map[string]map[string]string
+	err     error
+}
+
+var errTapFetchOutstanding = errors.New("an earlier libvirt tap lookup overran its deadline and has not returned")
+
+func (f *tapFetcher) fetch(ctx context.Context, src RunningTaps, timeout time.Duration) (map[string]map[string]string, error) {
+	if timeout <= 0 {
+		timeout = defaultTapTimeout
+	}
+	f.mu.Lock()
+	call := f.inflight
+	if call != nil && time.Since(call.started) > timeout {
+		f.mu.Unlock()
+		return nil, errTapFetchOutstanding
+	}
+	if call == nil {
+		call = &tapCall{started: time.Now(), done: make(chan struct{})}
+		f.inflight = call
+		go func() {
+			m, err := src()
+			f.mu.Lock()
+			call.taps, call.err = m, err
+			f.inflight = nil
+			f.mu.Unlock()
+			close(call.done)
+		}()
+	}
+	f.mu.Unlock()
+
+	t := time.NewTimer(timeout)
+	defer t.Stop()
+	select {
+	case <-call.done:
+		return call.taps, call.err
+	case <-t.C:
+		return nil, fmt.Errorf("libvirt did not answer within %s", timeout)
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 

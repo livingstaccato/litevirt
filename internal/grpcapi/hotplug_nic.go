@@ -119,15 +119,16 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 
 	// Owner leg of a peer forward: trust the entry node's op identity, skip the entry
 	// idempotency layer, go straight to the at-most-once owner path.
+	//
+	// The owner re-runs the managed-network half of admission itself. It needs
+	// no caller identity (only the VM's project and the network's owner), so it
+	// holds even when the entry node is an older build that admitted nothing.
+	// The raw-bridge half needs the caller's authority and stays at the entry.
 	if opID, reqHash, ok := s.deviceOpFromPeer(ctx); ok {
+		if err := s.admitManagedNetwork(ctx, vmRec.Project, spec.Name); err != nil {
+			return nil, err
+		}
 		return s.attachNICOwner(ctx, req, vmRec.Name, opID, reqHash, "")
-	}
-
-	// Cross-host race: push the network's provisioning to the VM's owning host
-	// before this attach reaches it, so a forwarded attachNIC there doesn't find an
-	// unprovisioned bridge (see provisionNetworkOnRemote).
-	if vmRec.HostName != s.hostName {
-		s.provisionNetworkOnRemote(ctx, vmRec.HostName, spec.Name)
 	}
 
 	principal := callerUsername(ctx) + "@" + callerRealm(ctx)
@@ -158,6 +159,22 @@ func (s *Server) attachNICEntry(ctx context.Context, req *pb.AttachDeviceRequest
 				resp, retErr = nil, ferr
 			}
 		}()
+	}
+
+	// Project isolation: the same admission CreateVM applies to its NICs. A VM
+	// may gain a NIC only on a global network or one its own project owns, and
+	// a raw bridge needs cluster-root authority. After the replay lookup above,
+	// so a completed attach replays its stored response; before the remote
+	// provisioning push and any operation row, so a refusal leaves nothing.
+	if err := s.admitNetworkAttach(ctx, vmRec.Project, spec.Name); err != nil {
+		return nil, err
+	}
+
+	// Cross-host race: push the network's provisioning to the VM's owning host
+	// before this attach reaches it, so a forwarded attachNIC there doesn't find an
+	// unprovisioned bridge (see provisionNetworkOnRemote).
+	if vmRec.HostName != s.hostName {
+		s.provisionNetworkOnRemote(ctx, vmRec.HostName, spec.Name)
 	}
 
 	// Forward to the owning host.
@@ -350,6 +367,19 @@ func (s *Server) writeNICAttachRows(ctx context.Context, rb *nicAttachRollback, 
 			return fmt.Errorf("record legacy interface row: %w", err)
 		}
 		rb.legacyRowWritten = true
+		// InsertInterface's statement has no security_groups column, and a new
+		// shape would stall this node's stream to every peer on the previous
+		// release, so the groups follow in the existing per-NIC update (the
+		// legacy PK is (vm_name, network_name), so it touches this row only).
+		// Without them the legacy row is newer than the vm_nics row and
+		// group-less: a peer on an older build renders no chain for the NIC,
+		// and the hardware bridge, which mirrors a strictly newer legacy row
+		// into vm_nics, would copy the empty set over the groups written above.
+		if len(spec.SecurityGroups) > 0 {
+			if err := corrosion.SetInterfaceSecurityGroups(ctx, s.db, vmName, spec.Name, spec.SecurityGroups); err != nil {
+				return fmt.Errorf("record legacy interface security groups: %w", err)
+			}
+		}
 	}
 	return nil
 }

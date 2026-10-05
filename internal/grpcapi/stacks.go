@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -220,6 +221,23 @@ func (s *Server) persistStackFirewall(ctx context.Context, f *compose.File) erro
 		// Still clear any rows a previous deploy of this stack left behind, in
 		// case the firewall block was removed from the compose file.
 		return corrosion.DeleteStackFirewall(ctx, s.db, f.Name)
+	}
+	// A name another stack or `lv sg create` already holds is refused before
+	// anything is torn down: the firewall holds every NIC bound to a name two
+	// live groups hold at drop. The stack's own groups are re-created below,
+	// so they do not count.
+	for name := range f.SecurityGroups {
+		held, err := liveSGNamed(ctx, s.db, name, f.Name)
+		if err != nil {
+			return fmt.Errorf("security-group %q: check for an existing group: %w", name, err)
+		}
+		if held != nil {
+			owner := "lv sg create"
+			if held.StackName != "" {
+				owner = "stack " + strconv.Quote(held.StackName)
+			}
+			return fmt.Errorf("security-group %q is already defined by %s (id %s); names must be unique", name, owner, held.ID)
+		}
 	}
 	if err := corrosion.DeleteStackFirewall(ctx, s.db, f.Name); err != nil {
 		return err

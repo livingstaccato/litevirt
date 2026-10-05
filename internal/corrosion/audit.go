@@ -61,6 +61,9 @@ type AuditRecord struct {
 type chainState struct {
 	mu    sync.Mutex
 	tails map[string]*chainTail
+	// hold, when set, makes this client hold its own host's audit rows until
+	// that host's chain tail has caught up from its peers (audit_hold.go).
+	hold *auditHold
 }
 
 // chainTail is one host's in-flight sub-chain position.
@@ -73,6 +76,12 @@ type chainTail struct {
 	// (unsigned) rows, or found that it need not: only then does hash describe
 	// what a seq-0 anchor may commit to (PublishAuditChainHead).
 	legacySettled bool
+	// ready is set once the tail has been read from a replica known to hold this
+	// host's whole replicated history, and the rows held until then have landed.
+	// Only consulted while a hold is configured (audit_hold.go); from then on
+	// this process is the only writer of the chain, so the cached tail is the
+	// authority and nothing re-gates it.
+	ready bool
 }
 
 // tail returns hostName's tail state, creating it on first use.
@@ -163,6 +172,25 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	defer c.auditChain.mu.Unlock()
 	tail := c.auditChain.tail(r.HostName)
 
+	// A host whose own chain may still be arriving from its peers does not
+	// append to it yet: the row is held, durably, and lands once the tail is
+	// known to be the real one (audit_hold.go).
+	if held, err := c.holdAuditLocked(ctx, tail, r, generated); held || err != nil {
+		return err
+	}
+	var at time.Time
+	if generated {
+		at = c.now()
+	}
+	return insertAuditLocked(ctx, c, tail, r, at)
+}
+
+// insertAuditLocked appends r at the end of its host's sub-chain. at is the
+// moment a GENERATED stamp is taken from (clamped to the tail, see stampAfter);
+// the zero time means r carries a caller-supplied stamp, stored verbatim.
+// Caller must hold c.auditChain.mu.
+func insertAuditLocked(ctx context.Context, c *Client, tail *chainTail, r AuditRecord, at time.Time) error {
+	generated := !at.IsZero()
 	if !tail.known {
 		// First insert for this host on this client — bootstrap its sub-chain
 		// from what this host has already written.
@@ -173,7 +201,7 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	}
 
 	if generated {
-		r.Timestamp = stampAfter(c.now(), tail.ts)
+		r.Timestamp = stampAfter(at, tail.ts)
 	}
 	r.PrevHash = tail.hash
 	r.Seq = tail.seq + 1

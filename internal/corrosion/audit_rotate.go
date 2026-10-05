@@ -255,6 +255,14 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	if !keyring.CanSign() {
 		return "", nil
 	}
+	// Not before this host's own chain has caught up from its peers. Every
+	// sequence below is read from the local replica, and on a rebuilt host that
+	// replica holds none of the host's history yet: the contract started at 0 and
+	// claimed every row the removed machine wrote before it first signed (the lab
+	// recorded all 25 rebuild adoptions at seq 0). The caller retries.
+	if c.AuditChainHeld(ctx, hostName) {
+		return "", ErrAuditChainNotCaughtUp
+	}
 	if err := keyring.PublishSigningKey(ctx, c); err != nil {
 		return "", err
 	}
@@ -271,6 +279,17 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	startSeq, err := FlooredHostTailSeq(ctx, c, keyring, hostName, keyring.KeyID())
 	if err != nil {
 		return "", err
+	}
+	// And never below a boundary the cluster CA retired one of this host's keys
+	// at. The floor above deliberately ignores heads signed by retired keys, and
+	// removing a host retires every key it had — so on a host rebuilt under its
+	// old name, nothing above could raise the start past a replica that is still
+	// short of the history the CA retirement already accounts for. The CA's
+	// record is the one input here the host does not author.
+	if ca, cerr := caRetirementFloor(ctx, c, keyring, hostName); cerr != nil {
+		return "", cerr
+	} else if ca > startSeq {
+		startSeq = ca
 	}
 	// Strictly above every adoption this host has already recorded.
 	//
@@ -477,6 +496,16 @@ type lifecycleKey struct{ host, keyID string }
 // it — and because the table is append-only, a row deleted outright is simply
 // re-inserted from a peer by ordinary anti-entropy.
 func auditKeyLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring) (map[lifecycleKey]map[string]int64, error) {
+	verified, err := verifiedLifecycleRows(ctx, c, keyring)
+	if err != nil {
+		return nil, err
+	}
+	return reduceLifecycle(verified), nil
+}
+
+// verifiedLifecycleRows is every lifecycle record that passes the signature and
+// ownership checks auditKeyLifecycle describes, before standing is applied.
+func verifiedLifecycleRows(ctx context.Context, c *Client, keyring *AuditKeyring) ([]lifecycleRow, error) {
 	rows, err := c.Query(ctx,
 		`SELECT host_name, key_id, event, at_seq, by_key_id, signature FROM audit_key_lifecycle`)
 	if err != nil {
@@ -510,7 +539,29 @@ func auditKeyLifecycle(ctx context.Context, c *Client, keyring *AuditKeyring) (m
 			signerGeneration:  pki.AuditSigningGeneration(signerCert),
 		})
 	}
-	return reduceLifecycle(verified), nil
+	return verified, nil
+}
+
+// caRetirementFloor is the highest sequence at which the cluster CA retired any
+// of hostName's keys, or 0.
+//
+// It is the one boundary a rebuilt host cannot choose for itself. `lv host rm`
+// records it, signed with the CA key that lives with the operator, at the tail
+// the cluster held for the host when it was removed. So everything at or below
+// it was written by the machine that was removed, and a key adopted afterwards
+// under the same name cannot have committed to any of it.
+func caRetirementFloor(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (int64, error) {
+	rows, err := verifiedLifecycleRows(ctx, c, keyring)
+	if err != nil {
+		return 0, err
+	}
+	var floor int64
+	for _, r := range rows {
+		if r.host == hostName && r.event == auditLifecycleRetired && r.byKeyID == auditCASigner && r.seq > floor {
+			floor = r.seq
+		}
+	}
+	return floor, nil
 }
 
 // lifecycleRow is one record that passed signature and ownership checks. Standing —

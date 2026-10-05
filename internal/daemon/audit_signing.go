@@ -146,13 +146,41 @@ const auditLifecycleSettle = 45 * time.Second
 // legitimately signed, or claim history written before the host ever committed,
 // and neither can be corrected afterwards. That is why this does not run at the
 // same point in startup as the keyring.
+//
+// The settle alone was not enough: a host rebuilt on an empty database had not
+// caught up 45 seconds in, and every adoption the lab recorded for one started
+// its contract at seq 0. So it also waits for this host's audit chain to have
+// caught up from its peers (corrosion.Client.AuditChainHeld) — the same
+// condition its audit rows are held on, and the one AdoptAuditKey refuses
+// without.
 func (d *Daemon) finishAuditKeyLifecycle(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(auditLifecycleSettle):
 	}
+	if !d.awaitAuditChainCaughtUp(ctx) {
+		return
+	}
 	d.recordAuditKeyLifecycle(ctx)
+}
+
+// auditHoldPoll is how often a held audit chain is re-checked when nothing new
+// is being audited.
+const auditHoldPoll = 2 * time.Second
+
+// awaitAuditChainCaughtUp blocks until this host's audit rows are no longer
+// held, polling — which is also what lands the held rows on a node that has
+// stopped auditing anything. False when ctx ends first.
+func (d *Daemon) awaitAuditChainCaughtUp(ctx context.Context) bool {
+	for d.db.AuditChainHeld(ctx, d.cfg.HostName) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(auditHoldPoll):
+		}
+	}
+	return true
 }
 
 // recordAuditKeyLifecycle is finishAuditKeyLifecycle without the settle wait, and

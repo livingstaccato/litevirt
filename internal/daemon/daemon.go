@@ -342,6 +342,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
+	// Hold this host's audit rows until its own chain has caught up from its
+	// peers, before anything can write one. A host rebuilt on an empty database
+	// and re-added under its old name otherwise chains its first rows onto an
+	// empty tail and forks its chain for good (corrosion/audit_hold.go). Rows
+	// held across a restart are in the spool and land with the rest.
+	d.db.HoldAuditUntilCaughtUp(corrosion.AuditHoldConfig{
+		Host:     d.cfg.HostName,
+		Joiner:   len(d.cfg.JoinPeers) > 0,
+		SpoolDir: filepath.Join(d.cfg.DataDir, corrosion.AuditHoldDirName),
+	})
+	go d.awaitAuditChainCaughtUp(ctx)
+
 	// Before anything that writes an audit row is built: every writer signs with
 	// the keyring this installs on d.db.
 	d.wireAuditKeyring(ctx)

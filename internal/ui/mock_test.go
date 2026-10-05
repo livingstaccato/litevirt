@@ -63,6 +63,7 @@ type mockGRPC struct {
 	listSchedulesResp      *pb.ListBackupSchedulesResponse
 	listUsersResp          *pb.ListUsersResponse
 	listNetworksResp       *pb.ListNetworksResponse
+	listSGsResp            *pb.ListSecurityGroupsResponse
 	listLBsResp            *pb.ListLBResponse
 	inspectLBResp          *pb.LoadBalancer
 	inspectLBErr           error
@@ -370,6 +371,13 @@ func (m *mockGRPC) ListNetworks(context.Context, *emptypb.Empty, ...grpc.CallOpt
 		return &pb.ListNetworksResponse{}, nil
 	}
 	return m.listNetworksResp, nil
+}
+
+func (m *mockGRPC) ListSecurityGroups(context.Context, *pb.ListSecurityGroupsRequest, ...grpc.CallOption) (*pb.ListSecurityGroupsResponse, error) {
+	if m.listSGsResp == nil {
+		return &pb.ListSecurityGroupsResponse{}, nil
+	}
+	return m.listSGsResp, nil
 }
 
 func (m *mockGRPC) ListLoadBalancers(context.Context, *emptypb.Empty, ...grpc.CallOption) (*pb.ListLBResponse, error) {

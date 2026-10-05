@@ -6,13 +6,11 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// Security groups are READ in-process against the host-local Corrosion handle
-// (the same DB the rest of the read path uses), but every mutation goes through
-// the daemon's security-group RPCs (internal/grpcapi/security_groups.go) with
-// the session's bearer — the same handlers `lv sg` calls.
+// Security groups are read AND written through the daemon's security-group
+// RPCs (internal/grpcapi/security_groups.go) with the session's bearer — the
+// same handlers `lv sg` calls for its writes.
 //
 // That is what makes the two surfaces authorize one action identically
 // (colonelpanik/litevirt#182). The pages used to check the generic "write" verb
@@ -23,34 +21,44 @@ import (
 // has, so on a cluster without strict mTLS identity it authorized every session
 // as the bearerless admin. Routing through the RPCs leaves one check and one
 // audit row, written by the handler that performed the change.
+//
+// The reads went the same way for the same reason. Read in-process, the page
+// showed every group and rule to any session — a token scoped to one project,
+// or a session whose Whoami had failed and been let through as a read.
+// ListSecurityGroups checks sg.read at the cluster root, so the daemon refuses
+// those on the read itself.
+
+// sgRuleView is one rule as the page template prints it.
+type sgRuleView struct {
+	ID, Direction, Proto, PortRange, CIDR, Action string
+}
 
 // handleSecurityGroups renders /security-groups: every SG with its rules, plus
 // create / add-rule / delete actions.
 func (s *Server) handleSecurityGroups(w http.ResponseWriter, r *http.Request) {
 	data := s.pageData("Security Groups", "security-groups")
 
-	if s.db == nil {
-		data["Error"] = "corrosion DB not wired into UI server (build mismatch)"
-		s.renderPage(w, "security_groups.html", data)
-		return
-	}
-
-	sgs, err := corrosion.ListSecurityGroups(r.Context(), s.db, "")
+	resp, err := s.grpc.ListSecurityGroups(s.uiBearerCtx(r), &pb.ListSecurityGroupsRequest{IncludeRules: true})
 	if err != nil {
-		data["Error"] = err.Error()
-		s.renderPage(w, "security_groups.html", data)
+		s.renderPageRPCFailed(w, "security_groups.html", data, err)
 		return
 	}
 
+	rulesBySG := map[string][]sgRuleView{}
+	for _, rule := range resp.GetRules() {
+		rulesBySG[rule.GetSgId()] = append(rulesBySG[rule.GetSgId()], sgRuleView{
+			ID: rule.GetId(), Direction: rule.GetDirection(), Proto: rule.GetProto(),
+			PortRange: rule.GetPort(), CIDR: rule.GetCidr(), Action: rule.GetAction(),
+		})
+	}
 	type sgRow struct {
 		ID, Name, Stack string
-		Rules           []corrosion.SGRule
+		Rules           []sgRuleView
 	}
-	rows := make([]sgRow, 0, len(sgs))
-	for _, sg := range sgs {
-		rules, _ := corrosion.ListSGRules(r.Context(), s.db, sg.ID)
+	rows := make([]sgRow, 0, len(resp.GetGroups()))
+	for _, sg := range resp.GetGroups() {
 		rows = append(rows, sgRow{
-			ID: sg.ID, Name: sg.Name, Stack: sg.StackName, Rules: rules,
+			ID: sg.GetId(), Name: sg.GetName(), Stack: sg.GetStackName(), Rules: rulesBySG[sg.GetId()],
 		})
 	}
 	data["Groups"] = rows

@@ -8,7 +8,10 @@ package grpcapi
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"hash"
 	"os"
 	"path/filepath"
 	"strings"
@@ -329,3 +332,48 @@ func TestPlaceColdDisk_NoHardLinks(t *testing.T) {
 		t.Fatalf("dst exists after a refused placement (stat: %v)", serr)
 	}
 }
+
+// A frame whose zero pages lie between non-zero ones is written back exactly:
+// the receive skips each zero page and resumes at the next page's own offset.
+//
+// Mutation: resume one byte past the skipped page (i = end + 1) — the bytes
+// shift and this goes red.
+func TestReceiveMigrationDisk_ZeroPageBetweenDataPages(t *testing.T) {
+	f := newColdDiskFixture(t)
+	const page = 4096
+	data := make([]byte, 5*page+100)
+	fill := func(from, to int, b byte) {
+		for i := from; i < to; i++ {
+			data[i] = b + byte(i%7)
+		}
+	}
+	fill(0, page, 1)           // data
+	fill(2*page, 3*page, 2)    // data after one zero page
+	fill(4*page+3, 5*page, 3)  // a page that is non-zero only after its start, after another zero page
+	fill(5*page, len(data), 4) // a short tail
+	h := newFrameDigest()
+	coldDiskFrameDigest(h, 0, data)
+	srv := &diskRecvStream{ctx: f.peer, frames: []*pb.ReceiveMigrationDiskRequest{
+		{VmName: "os1", Path: f.path, SizeBytes: int64(len(data)), AllocatedBytes: int64(len(data))},
+		{Offset: 0, Data: data},
+		{Sha256: digestHex(h)},
+	}}
+	if err := f.dst.ReceiveMigrationDisk(srv); err != nil {
+		t.Fatalf("ReceiveMigrationDisk: %v", err)
+	}
+	got, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(data) {
+		for i := range data {
+			if i >= len(got) || got[i] != data[i] {
+				t.Fatalf("placed file differs from the frame at byte %d (len %d, want %d)", i, len(got), len(data))
+			}
+		}
+		t.Fatalf("placed file is %d bytes, want %d", len(got), len(data))
+	}
+}
+
+func newFrameDigest() hash.Hash    { return sha256.New() }
+func digestHex(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }

@@ -482,6 +482,7 @@ func fileAllocated(p string) (uint64, error) {
 // chainAllocated is the allocated bytes of a qcow2 image and of every image
 // in its backing chain: what qcow2.Convert can read clusters from.
 func chainAllocated(path string) (uint64, error) {
+	top := path
 	var total uint64
 	for i := 0; i < 64; i++ {
 		a, err := fileAllocated(path)
@@ -499,7 +500,7 @@ func chainAllocated(path string) (uint64, error) {
 		}
 		path = next
 	}
-	return 0, fmt.Errorf("backing chain of %s is longer than 64 images", path)
+	return 0, fmt.Errorf("backing chain of %s is longer than 64 images", top)
 }
 
 // writeNonZeroPages writes data at off into f, skipping every all-zero 4 KiB
@@ -597,9 +598,6 @@ func placeColdDisk(tmp, dst string) error {
 // coldDiskRecheckEvery is how many bytes a receive writes between re-checks
 // of the target's free space.
 var coldDiskRecheckEvery int64 = 256 << 20
-
-func newFrameDigest() hash.Hash    { return sha256.New() }
-func digestHex(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
 
 // The filesystem calls placeColdDisk makes, as variables so a test can fail
 // each one.

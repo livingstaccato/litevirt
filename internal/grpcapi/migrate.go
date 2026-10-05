@@ -563,8 +563,15 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// Hot-detach SR-IOV VFs, after the late gate and every progress send — the
 	// last step before the row is written `migrating` — so that as few exits as
 	// possible can follow it. Each VF is recorded in the abort as soon as it has
-	// left the guest: one that then fails to release, or that a later VF's
-	// failure strands, goes back into the guest, owned by it again.
+	// left the guest: one a later VF's failure strands goes back into the guest.
+	//
+	// The VM keeps owning each VF until the cutover commits
+	// (releaseSourceVFsAfterCutover), so no allocation can take one while it is
+	// out of the guest, and a durable lease names them first, so a restart in
+	// the window puts them back (RecoverDeviceLeases).
+	if err := s.beginMigrationVFLease(req.VmName, pciAddresses(detachedVFs)); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "record the VFs detached for migration: %v", err)
+	}
 	for _, vf := range detachedVFs {
 		// Membership-aware (idempotent) guest detach so a retried migration converges: if a
 		// prior attempt already live-detached the VF but its release failed, the VF is gone
@@ -576,15 +583,6 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			return status.Errorf(codes.Internal, "detach VF %s before migration: %v", vf.Address, err)
 		}
 		abort.detachedVFs = append(abort.detachedVFs, vf)
-		// DetachHostdev removed the guest device but the host vfio bind persists, so the
-		// VF is still bound. Release ownership only through the strict all-or-nothing
-		// primitive: if the unbind cannot be confirmed it releases NOTHING and errors,
-		// leaving the VF owned + bound on the source (recoverable) — never unowned +
-		// bound. ABORT the migration: a VF stuck bound on the source must not be silently
-		// released, and the move must not proceed leaving an orphan.
-		if err := s.unbindAndReleaseOwnership(ctx, req.VmName, []string{vf.Address}); err != nil {
-			return status.Errorf(codes.Internal, "release VF %s before migration: %v", vf.Address, err)
-		}
 		slog.Info("VF detached for migration", "vm", req.VmName, "address", vf.Address)
 	}
 
@@ -699,6 +697,7 @@ poll:
 		return status.Errorf(codes.Internal,
 			"VM %q cut over to %s but committing ownership failed: %v", vm.Name, req.TargetHost, err)
 	}
+	s.releaseSourceVFsAfterCutover(context.WithoutCancel(ctx), vm.Name, detachedVFs)
 
 	downtimeMs := float64(time.Since(cutoverStart).Milliseconds())
 	s.recordMigrationMetrics(strategyLabel, "success", time.Since(migrationStart), downtimeMs, 0)
@@ -816,6 +815,7 @@ func (s *Server) adoptAbandonedMigration(
 				"abandoned request; cut over to "+targetHost+" but ownership commit failed: "+ferr.Error())
 			return
 		}
+		s.releaseSourceVFsAfterCutover(ctx, vm.Name, finish.detachedVFs)
 		slog.Info("migrate: adopted migration completed", "vm", vm.Name, "target", targetHost)
 		s.recordVMEvent(ctx, vm.Name, "vm.migrated", "ok",
 			"abandoned request; completed to "+targetHost)
@@ -1922,15 +1922,33 @@ func (s *Server) restoreSourceStateAfterFailedMigration(ctx context.Context, vmN
 // event.
 func (s *Server) reattachVFsOnSource(ctx context.Context, vmName string, vfs []corrosion.PCIDeviceRecord) {
 	if len(vfs) == 0 {
+		s.endMigrationVFLease(vmName) // written, but no VF left the guest
 		return
 	}
-	if st, err := s.sourceDomainState(vmName); err != nil || st != "running" {
-		slog.Warn("migrate: VFs detached for the move not reattached — the domain is not running",
-			"vm", vmName, "state", st, "error", err, "vfs", len(vfs))
+	st, err := s.sourceDomainState(vmName)
+	if err != nil {
+		// Unknown: the VFs stay owned and the lease stays for restart recovery.
+		slog.Warn("migrate: VFs detached for the move not reattached — the domain's state is unreadable",
+			"vm", vmName, "error", err, "vfs", len(vfs))
 		return
 	}
+	if st != "running" {
+		// Nothing to put them into, and the VM keeps owning them until here:
+		// give them back to the pool, as a stopped guest's devices are
+		// allocated again when it starts.
+		slog.Warn("migrate: VFs detached for the move released — the domain is not running",
+			"vm", vmName, "state", st, "vfs", len(vfs))
+		if rerr := s.unbindAndReleaseOwnership(ctx, vmName, pciAddresses(vfs)); rerr != nil {
+			slog.Error("migrate: releasing the VFs of a guest that stopped", "vm", vmName, "error", rerr)
+			return
+		}
+		s.endMigrationVFLease(vmName)
+		return
+	}
+	allBack := true
 	for _, vf := range vfs {
 		if err := s.reattachVFOnSource(ctx, vmName, vf.Address); err != nil {
+			allBack = false
 			slog.Error("migrate: could not reattach a VF to the guest that stayed on the source",
 				"vm", vmName, "address", vf.Address, "error", err)
 			s.recordVMEvent(ctx, vmName, "device.attached", "error",
@@ -1939,6 +1957,9 @@ func (s *Server) reattachVFsOnSource(ctx context.Context, vmName string, vfs []c
 		}
 		slog.Info("migrate: VF reattached on the source", "vm", vmName, "address", vf.Address)
 	}
+	if allBack {
+		s.endMigrationVFLease(vmName)
+	}
 }
 
 // reattachVFOnSource returns one VF to vmName on this host: ownership, then the
@@ -1946,9 +1967,10 @@ func (s *Server) reattachVFsOnSource(ctx context.Context, vmName string, vfs []c
 // leaves the VF owned + bound (recoverable: a retried migration or detach
 // converges it), never unowned + bound.
 //
-// Ownership is the VM's already when the release failed, and is otherwise
-// claimed back with the same CAS any allocation uses, so a VF another VM took
-// in the meantime is left to it.
+// Ownership is the VM's already: MigrateVM holds it until the cutover commits.
+// A VF found unowned (released by an older daemon, or by hand) is claimed back
+// with the same CAS any allocation uses, so a VF another VM took in the
+// meantime is left to it.
 func (s *Server) reattachVFOnSource(ctx context.Context, vmName, addr string) error {
 	devs, err := corrosion.ListPCIDevices(ctx, s.db, s.hostName, "")
 	if err != nil {

@@ -1,13 +1,12 @@
 package grpcapi
 
 import (
-	"errors"
-	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
+	"github.com/litevirt/litevirt/internal/opjournal"
 	"github.com/litevirt/litevirt/internal/vfio"
 )
 
@@ -67,23 +66,24 @@ func TestDetachPCI_LegacyUnbindFails_NotUnownedBound(t *testing.T) {
 	}
 }
 
-// TestMigrateVM_VFUnbindFails_NotUnownedBound is FIX-18 ESCAPE 2: the SR-IOV VF
-// pre-migration detach must NOT release a VF whose post-detach vfio unbind fails.
-// The VF is vfio-bound on the source, so a warn-only unbind + unconditional
-// ReleasePCIDevice left it UNOWNED-but-vfio-BOUND on the source host. The strict
-// primitive must retain ownership (still bound) and ABORT the migration rather than
-// proceed leaving an orphan. RED before the fix: the VF was released regardless of
-// the unbind outcome and migration continued.
+// TestMigrateVM_VFUnbindFails_NotUnownedBound is FIX-18 ESCAPE 2: the source's
+// SR-IOV VF must NOT be released when its vfio unbind fails. The VF is held by
+// the VM for the whole move and given up only after the cutover commits, through
+// the strict primitive: if the unbind cannot be confirmed it releases NOTHING,
+// leaving the VF owned + bound on the source and its device lease in place for
+// restart recovery — never unowned + bound. The guest has moved, so the
+// migration itself still succeeds.
 func TestMigrateVM_VFUnbindFails_NotUnownedBound(t *testing.T) {
 	const vfAddr = "0000:41:10.0"
 	s := testServerWithLocks(t)
 	fake := libvirtfake.New()
-	// If the fix is NOT in place the migration proceeds past the VF loop; make the
-	// libvirt migration itself fail so the RED run terminates deterministically (the
-	// VF is still released — unowned+bound — which is what the assertions catch).
-	fake.FailMigrateToTarget = func(_, _ string) error { return errors.New("injected migrate failure") }
 	s.virt = fake
 	fakeDestinationAdmission(s)
+	j, err := opjournal.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetOpJournal(j)
 
 	fs := newPCIUnbindRecordingFS()
 	restore := vfio.SetFS(fs)
@@ -103,32 +103,27 @@ func TestMigrateVM_VFUnbindFails_NotUnownedBound(t *testing.T) {
 	fs.setVF(vfAddr)
 	fs.setBound(vfAddr)
 	fs.setFailUnbind(vfAddr)
-	// Place the VF hostdev in the guest so the membership-aware pre-migration detach can
-	// confirm it is present (and detach it) before the release fails.
 	if err := fake.AttachHostdev("pci-vm", vfAddr); err != nil {
 		t.Fatalf("seed VF hostdev in guest: %v", err)
 	}
 
-	stream := &mockMigrateStream{ctx: ctx}
-	err := s.MigrateVM(&pb.MigrateVMRequest{
+	if err := s.MigrateVM(&pb.MigrateVMRequest{
 		VmName:     "pci-vm",
 		TargetHost: "target-host",
 		Strategy:   pb.MigrateStrategy_MIGRATE_COLD,
-	}, stream)
-	if err == nil {
-		t.Fatal("a VF whose unbind fails before migration must abort the migration, not succeed")
+	}, &mockMigrateStream{ctx: ctx}); err != nil {
+		t.Fatalf("the guest cut over; a source VF that cannot be released must not fail the move: %v", err)
 	}
 
-	// The invariant: the VF stays OWNED by the VM on the source and still bound —
-	// owned + bound (the migration aborts), NEVER unowned + bound.
+	// The invariant: owned + bound on the source (recoverable), NEVER unowned + bound.
 	if o := pciOwnerOf(t, ctx, s, vfAddr); o != "pci-vm" {
 		t.Fatalf("a failed VF unbind must RETAIN ownership on the source (never unowned+bound), got owner %q, want pci-vm", o)
 	}
 	if !fs.isBound(vfAddr) {
 		t.Fatal("a failed VF unbind must leave the VF still bound (owned + bound on the source)")
 	}
-	// The abort comes from the strict release site (not a downstream libvirt failure).
-	if !strings.Contains(err.Error(), "release VF") {
-		t.Fatalf("the migration should abort at the VF release site; got %v", err)
+	// And the restart-recovery anchor survives, so the release is retried.
+	if e, found, err := j.Read(deviceLeaseOpID("pci-vm")); err != nil || !found || e.Stage != deviceLeaseStageMigrationDetached {
+		t.Fatalf("the migration lease must be kept for recovery: %+v found=%v err=%v", e, found, err)
 	}
 }

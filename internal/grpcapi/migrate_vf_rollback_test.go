@@ -155,13 +155,14 @@ func TestMigrateVM_ALibvirtFailureReattachesTheVFs(t *testing.T) {
 	r := vfMigrationRig(t, "0000:41:10.0", "0000:41:10.1")
 	r.fake.FailMigrateToTarget = func(string, string) error {
 		// The detach really happened: libvirt is asked to move a guest that no
-		// longer holds the VFs, and they are free.
+		// longer holds the VFs — which the VM still owns, so nothing else can
+		// claim them while it is out.
 		for _, a := range r.vfs {
 			if guestHasHostdev(t, r.s, "vf-vm", a) {
 				t.Errorf("VF %s still in the guest when libvirt was asked to migrate it", a)
 			}
-			if o := pciOwnerOf(t, adminCtx(), r.s, a); o != "" {
-				t.Errorf("VF %s still owned by %q when libvirt was asked to migrate", a, o)
+			if o := pciOwnerOf(t, adminCtx(), r.s, a); o != "vf-vm" {
+				t.Errorf("VF %s owned by %q when libvirt was asked to migrate, want vf-vm", a, o)
 			}
 		}
 		return errors.New("injected libvirt migration failure")
@@ -174,8 +175,8 @@ func TestMigrateVM_ALibvirtFailureReattachesTheVFs(t *testing.T) {
 }
 
 // TestMigrateVM_AFailedDetachReattachesTheVFsAlreadyDetached: the second VF
-// cannot be detached, so the migration stops. The first was already detached
-// and released, and goes back.
+// cannot be detached, so the migration stops. The first was already detached,
+// and goes back.
 func TestMigrateVM_AFailedDetachReattachesTheVFsAlreadyDetached(t *testing.T) {
 	r := vfMigrationRig(t, "0000:41:10.0", "0000:41:10.1")
 	r.fake.FailDetachHostdev = func(_, addr string) error {

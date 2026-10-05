@@ -111,7 +111,8 @@ install them (a refused `/etc/pki/qemu`, a failed validation) holds the gate.
 - Before a fresh start (not on resume), before anything is minted: every host
   answers, holds a complete set that passes validation and that its daemon can
   install, and trusts this machine's current migration CA. `--force` passes a
-  host that cannot answer; nothing passes the rest.
+  host that cannot answer; nothing passes the rest. Under `--no-overlap` the
+  set need not be valid, complete or installable (see `--no-overlap`).
 - Before phase 2: every host trusts the new CA's fingerprint, with a set that
   passes validation.
 - Before phase 3: every host's certificate was issued by the new CA.
@@ -123,6 +124,10 @@ For a compromised CA key. It mints the new CA, then pushes the new-CA-only
 pass, and finalizes as phase 3 does. Until every host is done, a storage
 copy between an updated host and one not yet updated is refused by the
 source's migration-CA comparison, never sent in plaintext.
+It is also the only way to rotate an already-expired CA: its preflight passes a
+host whose set is invalid or incomplete (or whose install refusal only repeats
+that validation failure), because cutover replaces the whole set, while the
+overlapping rotation refuses an expired CA and names `--no-overlap`.
 
 ### `--force`
 

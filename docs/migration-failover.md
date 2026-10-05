@@ -182,12 +182,21 @@ kept for audit once a rotation finishes; its key is deleted.
 
 `--no-overlap` skips the overlap window entirely: it cuts every host straight
 to the new CA alone in one pass. Use it only when the migration CA key is
-compromised — there is no window where both CAs are trusted, so migrations
-between a host already rotated and one not yet rotated are refused, never sent
-in plaintext, until every host is done. `--force` leaves an unreachable host
+compromised or the CA has already expired — there is no window where both CAs
+are trusted, so migrations between a host already rotated and one not yet
+rotated are refused, never sent in plaintext, until every host is done. `--force` leaves an unreachable host
 behind instead of stopping the whole run; it keeps the old CA's credentials,
 so migrations with it are refused until you run
 `lv host install-migration-tls --reissue` once it is back.
+
+If the migration CA has already expired, every host's credentials fail
+validation, so storage migrations are refused until you run
+`lv host rotate-migration-ca --no-overlap`. The overlapping rotation refuses
+an expired CA, because hosts can no longer trust the old CA through the
+overlap; `--no-overlap` accepts invalid or incomplete sets, since it replaces
+all three files on every host, but still requires each host to answer, to have
+credentials, and to trust this machine's migration CA. Reissuing first does
+not help: `--reissue` issues from the same expired CA.
 
 A rotation already in progress cannot switch to `--no-overlap`: re-run it the
 way it was started and let it finish. If the key is found compromised during

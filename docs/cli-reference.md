@@ -163,7 +163,7 @@ lv host install-migration-tls             # Issue every host the migration-TLS c
                                           #   none). See migration-failover.md "Migration with local disks"
 lv host rotate-migration-ca               # Replace the migration CA on every host, in three gated
   [--no-overlap] [--force]                #   phases (trust-both, reissue, drop-old); resumable.
-  [--ssh-user root]                       #   --no-overlap: one pass, for a compromised CA key.
+  [--ssh-user root]                       #   --no-overlap: one pass, for a compromised or expired CA.
                                           #   --force: leave unreachable hosts behind. See
                                           #   migration-failover.md "Rotating the migration CA"
 lv host rotate-gossip-key                 # Replace the gossip key everywhere, live, in three

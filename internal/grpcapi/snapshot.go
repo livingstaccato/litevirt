@@ -236,8 +236,15 @@ func (s *Server) ListSnapshots(ctx context.Context, req *pb.ListSnapshotsRequest
 	// so a caller scoped to one project could list every VM's snapshots.
 	// Unlike InspectVM/GetVMStats, a VM record absent here is not itself
 	// NotFound: snapshot rows may have replicated ahead of (or survive after)
-	// the vm row, so an unresolvable VM falls through to the local snapshot
-	// read below rather than answering NotFound for a snapshot that exists.
+	// the vm row, so requireVMReadByName's unresolved-VM path matters here —
+	// it denies a scoped caller outright (the ordinary PermissionDenied/
+	// NotFound-for-a-matching-guess outcome requirePermResolved already
+	// documents), but passes a caller with CLUSTER-WIDE authority (a root
+	// binding, or the legacy no-bindings fallback) straight through with
+	// vm == nil. ONLY for such a caller does execution reach the local
+	// snapshot read below with no VM record in hand, answering from
+	// whatever this node holds for the name rather than NotFound for a
+	// snapshot that exists.
 	vm, err := s.requireVMReadByName(ctx, req.VmName)
 	if err != nil {
 		return nil, err

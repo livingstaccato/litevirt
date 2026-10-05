@@ -349,6 +349,80 @@ func TestListVMEvents_ClusterWideCallersUnchanged(t *testing.T) {
 	}
 }
 
+// Foreign VM and a name that exists nowhere must answer alike (single-VM
+// mode) — the same shape every other single-VM read RPC's existence-not-leaked
+// test already pins.
+func TestListVMEvents_ExistenceNotLeaked(t *testing.T) {
+	holder := testServer(t)
+	seedPVRScopedVMs(t, holder)
+	seedPVREvents(t, holder)
+	lacker := testServer(t)
+
+	_, present := holder.ListVMEvents(grantUser(t, holder, "carol", "/projects/acme", "Viewer"), &pb.ListVMEventsRequest{VmName: "b1"})
+	_, absent := lacker.ListVMEvents(grantUser(t, lacker, "carol", "/projects/acme", "Viewer"), &pb.ListVMEventsRequest{VmName: "b1"})
+
+	if status.Code(present) != codes.PermissionDenied {
+		t.Fatalf("foreign VM: %v, want PermissionDenied", present)
+	}
+	if status.Code(absent) != status.Code(present) || status.Convert(absent).Message() != status.Convert(present).Message() {
+		t.Errorf("existence leaked:\n  present: %v\n  absent:  %v", present, absent)
+	}
+}
+
+// TestListVMEvents_ClusterWidePaginationDoesNotStarveInScopeRows is the
+// review-round regression: the cluster-wide activity mode applied corrosion's
+// `LIMIT` in SQL BEFORE the per-row RBAC filter, so if the newest rows in the
+// whole table happened to be a foreign project's, a scoped caller's own
+// (merely older) in-scope events never got read at all — an empty or
+// short page even though plenty of in-scope rows exist further back.
+// Five "beta" events are seeded strictly newer than three "acme" ones; a
+// caller scoped to acme asking for limit=3 must still get all three of its
+// own events, not zero.
+func TestListVMEvents_ClusterWidePaginationDoesNotStarveInScopeRows(t *testing.T) {
+	s := testServer(t)
+	seedPVRScopedVMs(t, s)
+	ctx := context.Background()
+	// Newest-first ordering (ts DESC): beta's 5 rows sort entirely ahead of
+	// acme's 3, so a naive `LIMIT 3` reads only beta's rows.
+	for i, ts := range []string{
+		"2026-01-01T00:00:15.000000000Z", "2026-01-01T00:00:14.000000000Z",
+		"2026-01-01T00:00:13.000000000Z", "2026-01-01T00:00:12.000000000Z",
+		"2026-01-01T00:00:11.000000000Z",
+	} {
+		if err := corrosion.InsertVMEvent(ctx, s.db, corrosion.VMEventRecord{
+			ID: "beta-" + string(rune('a'+i)), VMName: "b1", HostName: s.hostName,
+			Type: "vm.started", Result: "ok", TS: ts,
+		}); err != nil {
+			t.Fatalf("InsertVMEvent(beta %d): %v", i, err)
+		}
+	}
+	for i, ts := range []string{
+		"2026-01-01T00:00:03.000000000Z", "2026-01-01T00:00:02.000000000Z",
+		"2026-01-01T00:00:01.000000000Z",
+	} {
+		if err := corrosion.InsertVMEvent(ctx, s.db, corrosion.VMEventRecord{
+			ID: "acme-" + string(rune('a'+i)), VMName: "a1", HostName: s.hostName,
+			Type: "vm.started", Result: "ok", TS: ts,
+		}); err != nil {
+			t.Fatalf("InsertVMEvent(acme %d): %v", i, err)
+		}
+	}
+	acme := grantUser(t, s, "carol", "/projects/acme", "Viewer")
+
+	resp, err := s.ListVMEvents(acme, &pb.ListVMEventsRequest{Limit: 3})
+	if err != nil {
+		t.Fatalf("ListVMEvents: %v", err)
+	}
+	if len(resp.Events) != 3 {
+		t.Fatalf("got %d events, want 3 (acme's full page, not starved by beta's newer rows)", len(resp.Events))
+	}
+	for _, ev := range resp.Events {
+		if ev.VmName != "a1" {
+			t.Errorf("page included %q, outside the caller's scope", ev.VmName)
+		}
+	}
+}
+
 // --- ListContainerSnapshots ---
 
 func seedPVRScopedContainers(t *testing.T, s *Server) {
@@ -417,6 +491,43 @@ func TestListContainerSnapshots_ExistenceNotLeaked(t *testing.T) {
 	}
 	if status.Code(absent) != status.Code(present) || status.Convert(absent).Message() != status.Convert(present).Message() {
 		t.Errorf("existence leaked:\n  present: %v\n  absent:  %v", present, absent)
+	}
+}
+
+// TestListContainerSnapshots_BackupOperatorCanListInScope is the review-round
+// ruling: BackupOperator (backup.*, snapshot.*, vm.read — no ct.read) can
+// create, restore and delete container snapshots (SnapshotContainer /
+// RevertContainerSnapshot / DeleteContainerSnapshot all check snapshot.create
+// / snapshot.restore / snapshot.delete), but had lost the ability to LIST
+// them, since ListContainerSnapshots admitted only ct.read. It now admits
+// ct.read OR snapshot.read on the container's path — BackupOperator holds
+// snapshot.* (matches snapshot.read), so it can list what it can otherwise
+// fully manage.
+func TestListContainerSnapshots_BackupOperatorCanListInScope(t *testing.T) {
+	s := testServer(t)
+	seedPVRScopedContainers(t, s)
+	corrosion.InsertContainerSnapshot(context.Background(), s.db, corrosion.ContainerSnapshotRecord{
+		CtName: "ca1", HostName: s.hostName, Name: "s1", State: "ok", Type: "tar",
+	})
+	backupOp := grantUser(t, s, "bob", "/projects/acme", "BackupOperator")
+
+	resp, err := s.ListContainerSnapshots(backupOp, &pb.ListContainerSnapshotsRequest{Name: "ca1", HostName: s.hostName})
+	if err != nil || len(resp.Snapshots) != 1 {
+		t.Fatalf("BackupOperator in-scope ListContainerSnapshots(ca1): resp=%v err=%v", resp, err)
+	}
+}
+
+// TestListContainerSnapshots_BackupOperatorStillScopedPerContainer: the OR
+// above must not widen BackupOperator's reach past its own binding — a
+// BackupOperator scoped to acme still cannot list a container in another
+// project through the snapshot.read fallback.
+func TestListContainerSnapshots_BackupOperatorStillScopedPerContainer(t *testing.T) {
+	s := testServer(t)
+	seedPVRScopedContainers(t, s)
+	backupOp := grantUser(t, s, "bob", "/projects/acme", "BackupOperator")
+
+	if _, err := s.ListContainerSnapshots(backupOp, &pb.ListContainerSnapshotsRequest{Name: "cb1", HostName: s.hostName}); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("BackupOperator listing a foreign project's container (cb1): %v, want PermissionDenied", err)
 	}
 }
 

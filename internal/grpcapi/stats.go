@@ -72,7 +72,27 @@ func (s *Server) GetHostStats(ctx context.Context, req *pb.GetHostStatsRequest) 
 			return nil, status.Errorf(codes.Unavailable, "cannot reach host %s: %v", hostName, err)
 		}
 		defer conn.Close()
-		return client.GetHostStats(ctx, req)
+		resp, ferr := client.GetHostStats(ctx, req)
+		if ferr != nil {
+			return nil, ferr
+		}
+		// Re-apply the ORIGINAL caller's scope to the forwarded answer. The
+		// owning host served this request under the ENTRY node's host
+		// certificate (admin, unless auth.forwarded_identity is on and
+		// ForwardedIdentityV1 has latched — default off), so its own per-row
+		// canReadVM filter passed every VM through: it never saw a caller
+		// scoped to one project, only a peer. Returning that answer verbatim
+		// handed a scoped caller every VM on every OTHER host in the cluster.
+		// The vms table is replicated here, so this node can judge each name
+		// against the real caller's scope without another round trip.
+		filtered := resp.VmStats[:0:0]
+		for _, vs := range resp.VmStats {
+			if s.canReadVM(ctx, vs.Name) {
+				filtered = append(filtered, vs)
+			}
+		}
+		resp.VmStats = filtered
+		return resp, nil
 	}
 
 	allStats, err := s.virt.GetAllDomainStats()

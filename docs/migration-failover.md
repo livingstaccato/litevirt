@@ -258,10 +258,20 @@ later restart does not take it up again.
 
 Drain reports each VM it did not move with the reason, finishes the other VMs,
 and then fails with `drain incomplete: N VM(s) remain on host ...`. The host
-stays `draining`. Fix what the message names (or migrate the VM yourself) and
-run the drain again. A VM that moved but did not start on the target is
+stays `draining`. Fix what the message names and run the drain again: a drain
+of a host that is already `draining` moves what is left. To migrate a VM
+yourself instead, `lv host undrain` the host first (see below). A VM that moved but did not start on the target is
 reported too, with a VM event saying why; it is stopped there, and the drain
 also ends with `drain incomplete`, naming it.
+
+A drain needs the drained host to hold quorum, as every move does (the
+split-brain gate, `split_brain_gate_v1`, which latches on every cluster).
+Once the host is `draining`, the gate lets through only the drain's own work:
+moving its VMs away, live or cold, and starting again a VM whose cold move
+failed after the drain shut it down. Anything else that would run a VM there
+is refused with `local_not_active_worker`, as on any host that is not
+`active`: `lv start`, and `lv migrate` from or to it. A VM moved by a drain
+is started on its target, which is `active`.
 
 ### A VM with no domain
 

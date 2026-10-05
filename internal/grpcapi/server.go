@@ -1006,6 +1006,9 @@ func withoutCapability(caps []string, drop string) []string {
 // serverGate is the subset of *health.Checker the gRPC server consults.
 type serverGate interface {
 	ExecutionGate(ctx context.Context) health.GateResult
+	// DrainExecutionGate is ExecutionGate with a `draining` local host
+	// allowed, for a drain's own outbound moves only (drainGateRefused).
+	DrainExecutionGate(ctx context.Context) health.GateResult
 	// DecisionGate is the coordinator/decide-site gate (quorum + coordinator-eligible).
 	// Leader-gated decide loops (rebalance executor) require it ON TOP of their CRDT
 	// lease, since a lease can be "held" on both sides of a partition.
@@ -1563,6 +1566,11 @@ func (s *Server) selfFenced() bool {
 // and must NOT execute. Legacy (ungated) is allowed ONLY when there is no marker
 // AND enforcement never activated. Fail-open ("" ok) in that legacy case.
 func (s *Server) execGateForAction(ctx context.Context, markerPresent bool) (reason string, refused bool) {
+	return s.execGateWith(ctx, markerPresent, serverGate.ExecutionGate)
+}
+
+// execGateWith is execGateForAction with the local gate to run named.
+func (s *Server) execGateWith(ctx context.Context, markerPresent bool, local func(serverGate, context.Context) health.GateResult) (reason string, refused bool) {
 	// Self-fence is a HARD, unconditional local gate (independent of markers, quorum, or
 	// enforcement): a doomed node must not execute already-stamped or self-minted actions
 	// during the fence-timeout window.
@@ -1581,10 +1589,28 @@ func (s *Server) execGateForAction(ctx context.Context, markerPresent bool) (rea
 	if !markerPresent && !s.gate.Enforced(ctx, capabilities.SplitBrainGateV1) {
 		return "", false
 	}
-	if g := s.gate.ExecutionGate(ctx); !g.OK {
+	if g := local(s.gate, ctx); !g.OK {
 		return g.Reason, true
 	}
 	return "", false
+}
+
+// drainGateRefused is execGateRefused for a host drain's OWN outbound moves:
+// the same gate, enforced the same way, except that this host may be
+// `draining` — which DrainHost makes it before it moves anything, and which
+// ExecutionGate refuses (health.DrainExecutionGate). Quorum, self-fence and
+// the witness rule all still apply.
+//
+// It is used only where the drain moves a VM AWAY from this host or undoes
+// its own step: DrainHost's up-front check (a re-run on a draining host
+// retries what is left), the per-VM re-check and the cold-fallback re-check
+// in drainOneVM, migrateOwnedVM's source gates for a drain's cold move
+// (ownedMigrateOpts.drain), and the restart of a VM the drain shut down for a
+// move that then failed. Everything that would grow a draining host keeps
+// execGateRefused and is refused there. The start of a moved VM on its target
+// runs on the target, which is active, under the target's own gate.
+func (s *Server) drainGateRefused(ctx context.Context) (reason string, refused bool) {
+	return s.execGateWith(ctx, false, serverGate.DrainExecutionGate)
 }
 
 // execGateRefused is the markerless form (enforcement-gated only). Direct-RPC

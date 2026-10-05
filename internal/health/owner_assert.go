@@ -68,6 +68,17 @@ func localHostIsActiveWorker(hosts []corrosion.HostRecord, self string) bool {
 	return false
 }
 
+// localHostIsEvacuatingWorker is localHostIsActiveWorker for a host moving its
+// own workloads away: it may also be draining (DrainExecutionGate).
+func localHostIsEvacuatingWorker(hosts []corrosion.HostRecord, self string) bool {
+	for i := range hosts {
+		if hosts[i].Name == self {
+			return (hosts[i].State == "active" || hosts[i].State == "draining") && !hosts[i].IsWitness()
+		}
+	}
+	return false
+}
+
 // SetPeerRuntimeChecker injects the peer runtime checker (answered from the
 // peer's GetRuntimeInventory). Without it,
 // runtime owner-assert is disabled (no peer corroboration possible).

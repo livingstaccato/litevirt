@@ -21,6 +21,9 @@ type claimsGate struct{}
 func (claimsGate) ExecutionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }
+func (claimsGate) DrainExecutionGate(context.Context) health.GateResult {
+	return health.GateResult{OK: true}
+}
 func (claimsGate) DecisionGate(context.Context) health.GateResult { return health.GateResult{OK: true} }
 func (claimsGate) CapabilityActive(_ context.Context, tok string) (bool, string) {
 	return claimsLatched(tok), ""

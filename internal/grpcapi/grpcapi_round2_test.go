@@ -37,6 +37,11 @@ func (g *flipExecGate) ExecutionGate(context.Context) health.GateResult {
 	}
 	return health.GateResult{OK: false, Reason: health.ReasonNoQuorum}
 }
+
+// DrainExecutionGate shares ExecutionGate's call count: drain asks it.
+func (g *flipExecGate) DrainExecutionGate(ctx context.Context) health.GateResult {
+	return g.ExecutionGate(ctx)
+}
 func (g *flipExecGate) DecisionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }

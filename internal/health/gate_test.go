@@ -454,3 +454,74 @@ func TestQuorumProof_PostFenceSlackAcrossClusterSizes(t *testing.T) {
 		})
 	}
 }
+
+// DrainExecutionGate is ExecutionGate with one difference: a draining worker
+// passes. Every other local state, a witness, a lost quorum and a self-fence
+// are refused exactly as ExecutionGate refuses them, and ExecutionGate itself
+// still refuses a draining host.
+//
+// Mutations: let localHostIsActiveWorker pass "draining" — ExecutionGate's
+// draining row goes red; drop "draining" from localHostIsEvacuatingWorker —
+// DrainExecutionGate's goes red; let it pass any state — the upgrading,
+// maintenance and fenced rows go red.
+func TestDrainExecutionGate_OnlyDrainingIsAdded(t *testing.T) {
+	for _, tc := range []struct {
+		state, role string
+		exec, drain string // "" = OK, else the refusal reason
+	}{
+		{"active", "worker", "", ""},
+		{"draining", "worker", ReasonLocalNotActiveWorker, ""},
+		{"upgrading", "worker", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
+		{"maintenance", "worker", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
+		{"fenced", "worker", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
+		{"draining", "witness", ReasonLocalNotActiveWorker, ReasonLocalNotActiveWorker},
+	} {
+		t.Run(tc.state+"/"+tc.role, func(t *testing.T) {
+			db := testCheckHostDB(t)
+			gateHost(t, db, "host-a", tc.state, tc.role) // self
+			gateHost(t, db, "host-b", "active", "worker")
+			gateHost(t, db, "host-c", "active", "worker")
+			c := NewChecker("host-a", "/etc/litevirt/pki", db)
+			warm(c, map[string]bool{"host-b": true, "host-c": true})
+			ctx := context.Background()
+			for _, g := range []struct {
+				name string
+				got  GateResult
+				want string
+			}{
+				{"ExecutionGate", c.ExecutionGate(ctx), tc.exec},
+				{"DrainExecutionGate", c.DrainExecutionGate(ctx), tc.drain},
+			} {
+				if (g.want == "") != g.got.OK || g.got.Reason != g.want {
+					t.Errorf("%s: OK=%v reason=%q, want reason %q", g.name, g.got.OK, g.got.Reason, g.want)
+				}
+			}
+		})
+	}
+}
+
+// A draining host passes DrainExecutionGate only with quorum and unfenced.
+//
+// Mutation: skip the quorum check in executionGate for the drain gate — the
+// no-quorum case passes and goes red.
+func TestDrainExecutionGate_KeepsQuorumAndSelfFence(t *testing.T) {
+	db := testCheckHostDB(t)
+	gateHost(t, db, "host-a", "draining", "worker")
+	gateHost(t, db, "host-b", "active", "worker")
+	gateHost(t, db, "host-c", "active", "worker")
+	c := NewChecker("host-a", "/etc/litevirt/pki", db)
+	ctx := context.Background()
+
+	warm(c, map[string]bool{"host-b": false, "host-c": false})
+	if r := c.DrainExecutionGate(ctx); r.OK || r.Reason != ReasonNoQuorum {
+		t.Fatalf("draining, no quorum: OK=%v reason=%q, want no_quorum", r.OK, r.Reason)
+	}
+	warm(c, map[string]bool{"host-b": true, "host-c": true})
+	if r := c.DrainExecutionGate(ctx); !r.OK {
+		t.Fatalf("draining, quorum: refused %q", r.Reason)
+	}
+	c.SetSelfFenced(func() bool { return true })
+	if r := c.DrainExecutionGate(ctx); r.OK || r.Reason != ReasonSelfFenced {
+		t.Fatalf("draining, self-fenced: OK=%v reason=%q, want self_fenced", r.OK, r.Reason)
+	}
+}

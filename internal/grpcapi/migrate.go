@@ -168,6 +168,19 @@ type ownedMigrateOpts struct {
 	// path's remaining checks and only then shuts the VM down
 	// (drainRunningVMCold), under the one lease this migration holds.
 	beforeMove func(ctx context.Context) error
+	// drain marks a host drain's own move (drainColdMove): the source gates
+	// use drainGateRefused, which lets a draining source move the VM away.
+	// An explicit migration from a draining host is not a drain, and keeps
+	// execGateRefused.
+	drain bool
+}
+
+// sourceGateRefused is the split-brain gate for the source of this move.
+func (s *Server) sourceGateRefused(ctx context.Context, opts ownedMigrateOpts) (string, bool) {
+	if opts.drain {
+		return s.drainGateRefused(ctx)
+	}
+	return s.execGateRefused(ctx)
 }
 
 // migrateOwnedVM is MigrateVM on the host that owns the VM, called with the
@@ -263,7 +276,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// explicit operator MigrateVM that has no earlier gate. Placed before any
 	// target-side setup (PCI/network/disk provisioning) so a refusal wastes no work.
 	// Fail-open until split_brain_gate_v1 is cluster-wide.
-	if reason, refused := s.execGateRefused(ctx); refused {
+	if reason, refused := s.sourceGateRefused(ctx, opts); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return status.Errorf(codes.FailedPrecondition, "migration refused: %s", reason)
 	}
@@ -611,7 +624,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// source IMMEDIATELY before the irreversible step (state → migrating, then
 	// MigrateToTarget), so a quorum loss during setup still stops the move. Fail-open
 	// until split_brain_gate_v1 is cluster-wide.
-	if reason, refused := s.execGateRefused(ctx); refused {
+	if reason, refused := s.sourceGateRefused(ctx, opts); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return status.Errorf(codes.FailedPrecondition, "migration refused: %s", reason)
 	}

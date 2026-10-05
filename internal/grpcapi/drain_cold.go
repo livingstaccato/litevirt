@@ -39,6 +39,7 @@ func (s *Server) drainColdMove(ctx context.Context, vm *corrosion.VMRecord, targ
 	defer span.End()
 	req := &pb.MigrateVMRequest{VmName: vm.Name, TargetHost: target, Strategy: pb.MigrateStrategy_MIGRATE_COLD}
 	discard := func(pb.MigratePhase, float32, float32) error { return nil }
+	opts.drain = true
 	return s.migrateOwnedVM(ctx, req, vm, discard, unlock, adopted, opts)
 }
 
@@ -296,7 +297,9 @@ func (s *Server) restartAfterFailedColdMove(ctx context.Context, name string) er
 	if cur.HostName != s.hostName {
 		return status.Errorf(codes.FailedPrecondition, "its record now names %s, so it is not started here", cur.HostName)
 	}
-	if reason, refused := s.execGateRefused(ctx); refused {
+	// The drain gate: this host is draining, and starting the VM again puts
+	// back what the drain itself took down — it is not new work on the host.
+	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
 	}

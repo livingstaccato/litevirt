@@ -363,7 +363,10 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// ownership moves), so the SOURCE must hold local quorum once enforced — else an
 	// isolated host could evacuate its VMs onto peers without quorum. Checked before
 	// marking "draining" so a refusal is a clean no-op. Fail-open until cluster-wide.
-	if reason, refused := s.execGateRefused(ctx); refused {
+	// The drain gate, not ExecutionGate: a re-run on a host already draining
+	// retries what an earlier drain left, and must not be refused for the state
+	// that drain put the host in.
+	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return status.Errorf(codes.FailedPrecondition, "drain refused: %s", reason)
 	}
@@ -596,8 +599,9 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// the source right before THIS VM's irreversible move (a live migration, or a
 	// cold move's handoff) so a mid-drain quorum loss stops further moves. Placed
 	// after the fresh-row read and before any runtime/ownership mutation. Fail-open
-	// until split_brain_gate_v1 is cluster-wide.
-	if reason, refused := s.execGateRefused(ctx); refused {
+	// until split_brain_gate_v1 is cluster-wide. The drain gate: this host is
+	// draining by now, and moving its VMs away is what draining is for.
+	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
@@ -676,7 +680,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// and hands it over (irreversible). Re-check so a quorum loss during the live
 	// attempt stops the fallback. On refusal the VM is left running on the source
 	// (live migration failure leaves the source domain up).
-	if reason, refused := s.execGateRefused(ctx); refused {
+	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",

@@ -39,6 +39,10 @@ func settledAnchor(t *testing.T, c *Client, kr *AuditKeyring, hash string) {
 func TestAuditAnchor_PublishedOverTheLegacyTail(t *testing.T) {
 	ctx := context.Background()
 	c, _, tail := legacyAnchorClient(t)
+	// The daemon's startup reseal, which finds nothing to re-base.
+	if n, err := ResealAuditChain(ctx, c, "node-0"); err != nil || n != 0 {
+		t.Fatalf("ResealAuditChain = %d, %v; want nothing re-based", n, err)
+	}
 	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
 		t.Fatalf("PublishAuditChainHead: %v", err)
 	}
@@ -218,5 +222,46 @@ func TestAuditAnchor_ForgedAnchorAssertsNothing(t *testing.T) {
 	}
 	if res := verify(t, c); len(res.TruncatedHosts) > 0 {
 		t.Fatalf("an unverifiable anchor put a truncation on the host: %v", res.TruncatedHosts)
+	}
+}
+
+// The anchor commits to the legacy tail AS RESEALED. A daemon whose startup
+// reseal failed (only logged) still holds the un-rebased tail; an anchor over
+// it is contradicted by the next successful reseal, and the verifier then
+// reports the host truncated — permanently, since heads are append-only. So
+// no anchor is published until a reseal has succeeded in this process.
+//
+// Mutation: drop the gate in PublishAuditChainHead — an anchor is written
+// before any reseal and goes red.
+func TestAuditAnchor_WithheldUntilTheResealSucceeds(t *testing.T) {
+	ctx := context.Background()
+	c, _, tail := legacyAnchorClient(t)
+	heads := func() string {
+		return oneCol(t, c, `SELECT n FROM (SELECT COUNT(*) AS n FROM audit_chain_heads WHERE host_name = 'node-0')`)
+	}
+
+	// The reseal fails (its read is cancelled), as a store fault at boot would.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := ResealAuditChain(cancelled, c, "node-0"); err == nil {
+		t.Fatal("ResealAuditChain on a cancelled context succeeded; the scenario needs it to fail")
+	}
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err == nil {
+		t.Fatal("PublishAuditChainHead withheld the anchor without saying so")
+	}
+	if n := heads(); n != "0" {
+		t.Fatalf("%s anchor(s) published over a tail the startup reseal did not settle", n)
+	}
+
+	// A restart whose reseal succeeds publishes it.
+	c.ResetAuditChainForTests()
+	if _, err := ResealAuditChain(ctx, c, "node-0"); err != nil {
+		t.Fatalf("ResealAuditChain: %v", err)
+	}
+	if err := PublishAuditChainHead(ctx, c, "node-0"); err != nil {
+		t.Fatalf("PublishAuditChainHead after a successful reseal: %v", err)
+	}
+	if got := oneCol(t, c, `SELECT head_hash FROM audit_chain_heads WHERE host_name = 'node-0' AND seq = 0`); got != tail {
+		t.Fatalf("anchor = %q, want the resealed legacy tail %q", got, tail)
 	}
 }

@@ -366,8 +366,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("could not determine audit chain signing state", "error", err)
 	} else if signed {
 		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
+		d.db.NoteAuditResealNotNeeded(d.cfg.HostName)
 	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
-		slog.Warn("audit chain reseal at startup failed", "error", err)
+		// Logged, not fatal. Until a reseal succeeds the legacy tail is not
+		// anchored (corrosion.ErrAuditAnchorWithheld): an anchor over the
+		// un-rebased tail would read as a truncation once it is rebased.
+		slog.Warn("audit chain reseal at startup failed; the legacy chain is not anchored until a restart reseals it", "error", err)
 	} else if n > 0 {
 		slog.Info("audit: re-based legacy unsigned rows at startup",
 			"host", d.cfg.HostName, "rows", n)

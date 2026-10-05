@@ -2,6 +2,7 @@ package corrosion
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -44,6 +45,10 @@ type AuditChainHead struct {
 	CreatedAt string
 }
 
+// ErrAuditAnchorWithheld is PublishAuditChainHead declining to anchor a host's
+// legacy tail because no reseal has settled it in this process.
+var ErrAuditAnchorWithheld = errors.New("legacy audit anchor withheld: the startup reseal has not succeeded in this process")
+
 // PublishAuditChainHead signs and records this host's current chain position.
 //
 // A no-op without a signing keyring: an unsigned head would assert nothing an
@@ -63,11 +68,20 @@ func PublishAuditChainHead(ctx context.Context, c *Client, hostName string) erro
 		}
 		tail.known = true
 	}
-	seq, hash := tail.seq, tail.hash
+	seq, hash, settled := tail.seq, tail.hash, tail.legacySettled
 	c.auditChain.mu.Unlock()
 
 	if seq == 0 && hash == "" {
 		return nil // nothing written yet; a head over an empty chain says nothing
+	}
+	// The anchor commits to the legacy tail AS RESEALED. Until a reseal has
+	// succeeded in this process (ResealAuditChain, or NoteAuditResealNotNeeded)
+	// the tail may still be the un-rebased one: the startup reseal can fail and
+	// is only logged. An anchor over it is contradicted by the next reseal that
+	// succeeds, and since heads are append-only the verifier would then report
+	// this host truncated, permanently and cluster-wide.
+	if seq == 0 && !settled {
+		return ErrAuditAnchorWithheld
 	}
 	// seq 0 with a tail hash is a host holding only pre-v45 history: every row
 	// carries the column default, so there is no position to attest to, but

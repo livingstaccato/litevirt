@@ -69,6 +69,10 @@ type chainTail struct {
 	seq   int64  // highest seq this host has written; the next row is seq+1
 	ts    string // the stamp on that row; the ceiling a generated stamp clamps to
 	known bool   // true once the tail has been read back from the DB
+	// legacySettled is set once this process has resealed the host's legacy
+	// (unsigned) rows, or found that it need not: only then does hash describe
+	// what a seq-0 anchor may commit to (PublishAuditChainHead).
+	legacySettled bool
 }
 
 // tail returns hostName's tail state, creating it on first use.
@@ -1004,6 +1008,7 @@ func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, err
 		tail.known = true
 	}
 	tail.hash = hash
+	tail.legacySettled = true
 	seq := tail.seq
 	c.auditChain.mu.Unlock()
 
@@ -1093,6 +1098,16 @@ func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (str
 		prev = newHash
 	}
 	return prev, resealed, nil
+}
+
+// NoteAuditResealNotNeeded records that hostName's legacy rows need no
+// reseal in this process — its chain is signed, so it is verified rather than
+// re-based — which settles them for PublishAuditChainHead as a successful
+// ResealAuditChain does.
+func (c *Client) NoteAuditResealNotNeeded(hostName string) {
+	c.auditChain.mu.Lock()
+	defer c.auditChain.mu.Unlock()
+	c.auditChain.tail(hostName).legacySettled = true
 }
 
 // ResetAuditChainForTests forgets this client's cached tails so a test can

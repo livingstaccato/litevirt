@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -587,6 +588,50 @@ func TestAttachDevice_PCIMutationErrorRollsBack(t *testing.T) {
 		}
 	}
 	// Barrier released (op reached a terminal failure via compensation).
+	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID != "" {
+		t.Fatalf("mutation barrier not cleared after clean rollback: %q", vm.ActiveOperationID)
+	}
+}
+
+// TestAttachDevice_PCISlotsExhaustedMapsFailedPrecondition mirrors the disk/NIC
+// cases for a concrete-address PCI hostdev attach.
+func TestAttachDevice_PCISlotsExhaustedMapsFailedPrecondition(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, "0000:41:00.0", -1)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.FailAttachHostdev = func(_, _, _ string) error {
+		return errors.New("internal error: No more available PCI slots")
+	}
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Address: "0000:41:00.0"},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition; err: %v", status.Code(err), err)
+	}
+	if !strings.Contains(status.Convert(err).Message(), "spare_pcie_root_ports") {
+		t.Fatalf("message must point at the fix (pci.spare_pcie_root_ports), got: %v", err)
+	}
+	// Rollback as clean as the generic-Internal case: no intent, no realization,
+	// device ownership released, barrier cleared.
+	if in := liveIntents(t, ctx, s, "vm1"); len(in) != 0 {
+		t.Fatalf("intent must not survive a failed attach: %+v", in)
+	}
+	if rs := liveRealizations(t, ctx, s, "vm1"); len(rs) != 0 {
+		t.Fatalf("realizations must not survive a failed attach: %+v", rs)
+	}
+	devs, _ := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
+	for _, d := range devs {
+		if d.VMName == "vm1" {
+			t.Fatalf("device %s still owned by vm1 after rollback", d.Address)
+		}
+	}
 	if vm := mustGetVM(t, s, "vm1"); vm.ActiveOperationID != "" {
 		t.Fatalf("mutation barrier not cleared after clean rollback: %q", vm.ActiveOperationID)
 	}

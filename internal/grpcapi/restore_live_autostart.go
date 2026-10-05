@@ -245,19 +245,20 @@ func (s *Server) autoDefineRestoredVM(
 	}
 
 	vmCfg := lv.VMConfig{
-		Name:        targetName,
-		CPU:         int(spec.Cpu),
-		CPUMode:     spec.CpuMode,
-		CPUModel:    spec.CpuModel,
-		MemoryMiB:   int(spec.MemoryMib),
-		Machine:     spec.Machine,
-		Firmware:    spec.Firmware,
-		GuestAgent:  spec.GuestAgent,
-		EnableVNC:   !spec.DisableVnc,
-		EnableSPICE: spec.EnableSpice,
-		Disks:       diskCfg,
-		Networks:    netCfg,
-		Boot:        spec.Boot,
+		Name:               targetName,
+		CPU:                int(spec.Cpu),
+		CPUMode:            spec.CpuMode,
+		CPUModel:           spec.CpuModel,
+		MemoryMiB:          int(spec.MemoryMib),
+		Machine:            spec.Machine,
+		Firmware:           spec.Firmware,
+		GuestAgent:         spec.GuestAgent,
+		EnableVNC:          !spec.DisableVnc,
+		EnableSPICE:        spec.EnableSpice,
+		Disks:              diskCfg,
+		Networks:           netCfg,
+		Boot:               spec.Boot,
+		SparePCIeRootPorts: s.sparePCIeRootPortsCfg,
 	}
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.

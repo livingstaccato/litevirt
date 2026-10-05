@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,6 +226,74 @@ func TestAttachDevice_MutationErrorRollsBack(t *testing.T) {
 	vm := mustGetVM(t, s, "vm1")
 	if vm.ActiveOperationID != "" {
 		t.Fatalf("mutation barrier not cleared after clean rollback: %q", vm.ActiveOperationID)
+	}
+}
+
+// ── exhausted PCI slots maps to FailedPrecondition, with a clean rollback ────
+
+// TestAttachDevice_DiskPCISlotsExhaustedMapsFailedPrecondition is the brief's
+// exact repro (a q35 guest with no spare pcie-root-port): the live attach fails
+// with libvirt's generic "No more available PCI slots" wording, which must
+// surface as FailedPrecondition (an operator fix — raise
+// pci.spare_pcie_root_ports and redefine, or detach something) rather than the
+// unclassified Internal every other libvirt attach failure gets, AND the
+// rollback must be exactly as clean as any other failed attach (no row, no
+// barrier left held).
+func TestAttachDevice_DiskPCISlotsExhaustedMapsFailedPrecondition(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.FailAttachDisk = func(_, _, _, _ string) error {
+		return errors.New("internal error: No more available PCI slots")
+	}
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G"},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition; err: %v", status.Code(err), err)
+	}
+	if !strings.Contains(status.Convert(err).Message(), "spare_pcie_root_ports") {
+		t.Fatalf("message must point at the fix (pci.spare_pcie_root_ports), got: %v", err)
+	}
+	// Rollback must be exactly as clean as the generic-Internal case above.
+	disks, _ := corrosion.GetVMDisks(ctx, s.db, "vm1")
+	if hasDiskName(disks, "data1") {
+		t.Fatalf("row must not survive a failed attach: %+v", disks)
+	}
+	p, _ := libvirt.SafeDiskPath(s.dataDir, "vm1", "data1")
+	if _, statErr := os.Stat(p); !os.IsNotExist(statErr) {
+		t.Fatalf("rollback must delete the op-owned backing file %s (stat err=%v)", p, statErr)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("mutation barrier not cleared after clean rollback: %q", vm.ActiveOperationID)
+	}
+}
+
+// TestAttachDevice_OtherLibvirtErrorStaysInternal: the classifier must not
+// over-match — an unrelated libvirt attach failure keeps its existing Internal
+// mapping and unmodified message.
+func TestAttachDevice_OtherLibvirtErrorStaysInternal(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedDiskVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.FailAttachDisk = func(_, _, _, _ string) error {
+		return errors.New("internal error: qemu unexpectedly closed the monitor")
+	}
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Disk: &pb.DiskSpec{Name: "data1", Size: "5G"},
+	})
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal (not a PCI-slots error)", status.Code(err))
+	}
+	if strings.Contains(status.Convert(err).Message(), "spare_pcie_root_ports") {
+		t.Fatalf("an unrelated failure must not get the PCI-slots-exhausted message: %v", err)
 	}
 }
 

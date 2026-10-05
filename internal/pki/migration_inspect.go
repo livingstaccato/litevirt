@@ -49,11 +49,20 @@ func CertFingerprint(c *x509.Certificate) string {
 
 // CAFileFingerprint fingerprints the first certificate in a PEM file.
 func CAFileFingerprint(path string) (string, error) {
-	cas, err := readCABundleFile(path)
+	ca, err := CAFileCertificate(path)
 	if err != nil {
 		return "", err
 	}
-	return CertFingerprint(cas[0]), nil
+	return CertFingerprint(ca), nil
+}
+
+// CAFileCertificate parses the first certificate in a PEM file.
+func CAFileCertificate(path string) (*x509.Certificate, error) {
+	cas, err := readCABundleFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return cas[0], nil
 }
 
 func readCABundleFile(path string) ([]*x509.Certificate, error) {

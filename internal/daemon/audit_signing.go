@@ -481,7 +481,11 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 				"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 				"seq_gaps", len(res.SeqGaps), "laundered", len(res.Laundered),
 				"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
-				"truncated_hosts", res.TruncatedHosts)
+				"truncated_hosts", res.TruncatedHosts,
+				// Without it, a verdict resting only on unsigned-after-signed rows
+				// logged broken_at="" with every listed count at 0.
+				"unsigned_after_signed", len(res.UnsignedAfterSigned),
+				"never_adopted", len(res.NeverAdopted), "ambiguous", len(res.Ambiguous))
 		}
 		if res.Unverified() {
 			// Warn, not Error: part of the log went unchecked, which is serious but

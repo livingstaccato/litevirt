@@ -582,8 +582,9 @@ type AuditVerifyResult struct {
 	// UnknownKeyID lists rows whose key has no usable published certificate —
 	// either never published, or one that does not chain to the cluster CA.
 	UnknownKeyID []string
-	// SeqGaps lists breaks in a host's sequence numbering, which is how the
-	// deletion of a whole run of rows shows up.
+	// SeqGaps lists breaks in a host's sequence numbering: a jump, which is how
+	// the deletion of a whole run of rows shows up, or a repeated seq, which is
+	// a forked chain and is labelled as a duplicate.
 	SeqGaps []string
 	// Laundered lists rows that blanked their own hash to pose as a pre-chain
 	// reset point, which used to silently re-base everything after them.
@@ -837,7 +838,15 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 					flagLegacy(host)
 				}
 			}
-			if last, seen := seqByHost[host]; seen && seq != last+1 {
+			if last, seen := seqByHost[host]; seen && seq == last {
+				// Not a deletion: two rows claim one position. That is a forked
+				// chain — a second writer, or a host that appended to a replica
+				// still missing its own history — and saying "rows deleted" sends
+				// the investigation the wrong way.
+				res.SeqGaps = append(res.SeqGaps,
+					fmt.Sprintf("%s: row %s repeats seq %d (duplicate: two rows claim the same position, a forked chain)",
+						host, rec.ID, seq))
+			} else if seen && seq != last+1 {
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
 			}

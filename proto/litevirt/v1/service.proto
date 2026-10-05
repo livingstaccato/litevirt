@@ -2432,6 +2432,20 @@ message CleanupMigrationArtifactsRequest {
     bool   remove_cloud_init    = 3;  // also remove the cloud-init ISO for vm_name
     string firmware_uuid        = 4;  // if set, wipe the pushed firmware state (NVRAM+swtpm) for vm_name (G1)
     bool   undefine_domain      = 5;  // if set, undefine a domain this host pre-defined for a failed firmware migration (G1)
+    // vm_deleted: vm_name was deleted on the host that owned it, and this host
+    // is one it left. Accepted only from a cluster host acting as the system
+    // (bearerless peer certificate); every user, admin included, is refused,
+    // since only the deleting owner can tell which disks were this
+    // incarnation's detaches (and names none for --keep-disks). Remove the VM's owner-epoch
+    // marker here, and treat disk_paths as disks detached from the VM while it
+    // ran here — each removed only if this host's own replica records it so and
+    // nothing still uses it. Refused (ABORTED, retryable) while this host's
+    // replica still holds a live row for the name; nothing is touched while a
+    // domain of that name is defined here. A host built before this field
+    // ignores it and applies the stub rule to disk_paths: it removes a path
+    // only if it recorded that path as its own migration stub for vm_name
+    // within the stub ledger's TTL, and keeps every other.
+    bool   vm_deleted           = 6;
 }
 
 message SyncVTEPRequest {

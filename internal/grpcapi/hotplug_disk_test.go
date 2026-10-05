@@ -234,8 +234,8 @@ func TestAttachDevice_MutationErrorRollsBack(t *testing.T) {
 // TestAttachDevice_DiskPCISlotsExhaustedMapsFailedPrecondition is the brief's
 // exact repro (a q35 guest with no spare pcie-root-port): the live attach fails
 // with libvirt's generic "No more available PCI slots" wording, which must
-// surface as FailedPrecondition (an operator fix — raise
-// pci.spare_pcie_root_ports and redefine, or detach something) rather than the
+// surface as FailedPrecondition (an operator fix — detach something, or raise
+// pci.spare_pcie_root_ports for a newly defined domain) rather than the
 // unclassified Internal every other libvirt attach failure gets, AND the
 // rollback must be exactly as clean as any other failed attach (no row, no
 // barrier left held).

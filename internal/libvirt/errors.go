@@ -38,8 +38,8 @@ func IsNotFound(err error) bool {
 // PCI slot to put this device on" — the failure a q35 guest with no spare
 // pcie-root-port hits on a hot-plug (disk/NIC/PCI) once every root port already
 // holds a device. Callers map this to FailedPrecondition (an operator fix —
-// raise pci.spare_pcie_root_ports and redefine, or detach something first)
-// instead of Internal (a fault this host cannot explain).
+// detach something first, or raise pci.spare_pcie_root_ports for newly
+// defined domains) instead of Internal (a fault this host cannot explain).
 //
 // Substring-only: libvirt raises this as a generic VIR_ERR_INTERNAL_ERROR with no
 // dedicated typed code (unlike IsNotFound's ErrNoDomain family), so there is no

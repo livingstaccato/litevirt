@@ -28,7 +28,9 @@ func pciAttachErrorCode(err error) codes.Code {
 func pciAttachError(op string, err error) error {
 	if lv.IsPCISlotsExhausted(err) {
 		return fmt.Errorf("%s: no free PCI slot on this q35 guest "+
-			"(raise pci.spare_pcie_root_ports and redefine the VM, or detach another device first): %w", op, err)
+			"(detach another device first; raising pci.spare_pcie_root_ports gives more spare ports only to a "+
+			"newly defined domain, such as one made with `lv clone` — see docs/pci-passthrough.md, "+
+			"\"Spare PCIe root ports\"): %w", op, err)
 	}
 	return fmt.Errorf("%s: %w", op, err)
 }

@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -53,5 +54,23 @@ func TestCreateVM_SparePCIeRootPortsDefaultZero_NoControllers(t *testing.T) {
 	}
 	if strings.Contains(domXML, "pcie-root-port") {
 		t.Fatalf("a Server with no spare-ports config must define a domain with none: %s", domXML)
+	}
+}
+
+// The slot-exhaustion message names actions an operator can take. It used to
+// say "redefine the VM", which no command does: the spare-port count reaches
+// only a newly defined domain (create, import, clone), so it names lv clone
+// and the docs section that explains why.
+//
+// Mutation: restore "and redefine the VM" — red.
+func TestPCIAttachError_NamesAnActionThatExists(t *testing.T) {
+	msg := pciAttachError("attach disk", errors.New("internal error: No more available PCI slots")).Error()
+	for _, want := range []string{"detach another device", "pci.spare_pcie_root_ports", "lv clone", "docs/pci-passthrough.md"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message does not name %q: %s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "redefine") {
+		t.Errorf("message names a redefine no command performs: %s", msg)
 	}
 }

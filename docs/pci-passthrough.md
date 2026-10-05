@@ -164,12 +164,13 @@ A q35 guest (the default machine type) attaches every hot-plugged device — a
 disk, a NIC, or a PCI device — to a free `pcie-root-port`. A domain with no
 spare root port left fails the attach with libvirt's "No more available PCI
 slots", which litevirt reports as `FailedPrecondition` (an operator fix) rather
-than a generic internal error, and names the config key to raise:
+than a generic internal error, and names what can be done about it:
 
 ```
-attach disk: no free PCI slot on this q35 guest (raise pci.spare_pcie_root_ports
-and redefine the VM, or detach another device first): internal error: No more
-available PCI slots
+attach disk: no free PCI slot on this q35 guest (detach another device first;
+raising pci.spare_pcie_root_ports gives more spare ports only to a newly defined
+domain, such as one made with `lv clone` — see docs/pci-passthrough.md, "Spare
+PCIe root ports"): internal error: No more available PCI slots
 ```
 
 `pci.spare_pcie_root_ports` (default 4, see configuration.md) is the number of

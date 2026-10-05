@@ -9,7 +9,7 @@ import (
 )
 
 // CPUCompare is the verdict of comparing a guest CPU requirement against a
-// host. It mirrors virConnectCompareCPU, minus the error code (returned as a
+// host. It mirrors virConnectCompareHypervisorCPU, minus the error code (returned as a
 // Go error instead).
 type CPUCompare int
 
@@ -43,11 +43,31 @@ func (c CPUCompare) Runnable() bool {
 // CompareCPU asks the LOCAL hypervisor whether it can satisfy the guest CPU
 // described by cpuXML (a standalone <cpu>…</cpu> element). This is the
 // destination side of a migration CPU preflight.
+//
+// It uses virConnectCompareHypervisorCPU, not the legacy virConnectCompareCPU.
+// The legacy call compares against the host's raw capabilities CPU, which omits
+// features QEMU gives guests regardless (spec-ctrl, arch-capabilities, topoext
+// on AMD), so it calls a running host-model guest incompatible with the very
+// host it runs on. The hypervisor call compares against what this host's
+// default emulator (KVM) can actually provide — the hypervisor a migrated guest
+// lands on. Emulator, arch, machine and virttype are left to libvirt's defaults.
 func (c *Client) CompareCPU(cpuXML string) (CPUCompare, error) {
+	return compareCPU(c.virt, cpuXML)
+}
+
+// cpuCompareAPI is the slice of go-libvirt the CPU compare uses. The legacy
+// call is named too, though nothing here calls it, so a test fake can answer
+// the two differently and prove which one a verdict came from.
+type cpuCompareAPI interface {
+	ConnectCompareCPU(XML string, Flags golibvirt.ConnectCompareCPUFlags) (int32, error)
+	ConnectCompareHypervisorCPU(Emulator, Arch, Machine, Virttype golibvirt.OptString, XMLCPU string, Flags uint32) (int32, error)
+}
+
+func compareCPU(api cpuCompareAPI, cpuXML string) (CPUCompare, error) {
 	if strings.TrimSpace(cpuXML) == "" {
 		return CPUCompareIncompatible, fmt.Errorf("compare cpu: empty cpu xml")
 	}
-	res, err := c.virt.ConnectCompareCPU(cpuXML, 0)
+	res, err := api.ConnectCompareHypervisorCPU(nil, nil, nil, nil, cpuXML, 0)
 	if err != nil {
 		return CPUCompareIncompatible, fmt.Errorf("compare cpu: %w", err)
 	}
@@ -116,7 +136,7 @@ func extractRootChild(doc, name string) (string, bool) {
 // extractElement returns the named element from doc VERBATIM — attributes,
 // children and all — plus whether it was found.
 //
-// Verbatim matters: virConnectCompareCPU parses a <cpu> element in one of two
+// Verbatim matters: libvirt's CPU compare parses a <cpu> element in one of two
 // native forms, the host form from capabilities (which carries <arch> and no
 // mode/match) or the guest form from a domain (which carries mode/match and no
 // <arch>). Rebuilding the element by hand produces a hybrid that is neither, so
@@ -143,9 +163,8 @@ func extractElement(doc, name string) (string, bool) {
 }
 
 // hostCPUFromCapabilities lifts <capabilities><host><cpu> out verbatim, as the
-// host-form <cpu> element virConnectCompareCPU expects. This is the same
-// description `virsh cpu-compare` is fed to answer "can this host run a guest
-// that was running on that one".
+// host-form <cpu> element libvirt's CPU compare accepts — the requirement a
+// host-passthrough guest carries.
 func hostCPUFromCapabilities(caps string) (string, error) {
 	// Scope to <host> first: <guest> blocks further down also contain CPU
 	// material, and the host's own CPU is the one a passthrough guest requires.

@@ -432,6 +432,46 @@ func TestAttachDevice_PCITypeSpecUsesLegacyPath(t *testing.T) {
 	}
 }
 
+// TestAttachDevice_LegacyPCISlotsExhaustedMapsFailedPrecondition: the legacy
+// non-address-selector path (hotplug.go's attachPCIDevice) calls the identical
+// libvirt AttachHostdev primitive as the journaled address-selector path, so it
+// can hit the identical q35 "no free pcie-root-port" wall. Uses the
+// unbind-modeling fake because a failed attach here triggers
+// rollbackLegacyPCIAttach, whose strict release vfio-unbinds the claimed
+// device (bound during allocateDevices, before the attach was ever tried).
+func TestAttachDevice_LegacyPCISlotsExhaustedMapsFailedPrecondition(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	fs := newPCIUnbindRecordingFS()
+	restore := vfio.SetFS(fs)
+	defer restore()
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	seedPCIGPU(t, s, "0000:50:00.0", -1)
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.FailAttachHostdev = func(_, _, _ string) error {
+		return errors.New("internal error: No more available PCI slots")
+	}
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", PciDevice: &pb.DeviceSpec{Type: "gpu"},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition; err: %v", status.Code(err), err)
+	}
+	if !strings.Contains(status.Convert(err).Message(), "spare_pcie_root_ports") {
+		t.Fatalf("message must point at the fix (pci.spare_pcie_root_ports), got: %v", err)
+	}
+	// Rollback clean: the device must not be left owned by vm1 (the legacy
+	// path's own rollback releases what allocateDevices claimed).
+	devs, _ := corrosion.ListPCIDevices(ctx, s.db, "test-host", "")
+	for _, d := range devs {
+		if d.VMName == "vm1" {
+			t.Fatalf("device %s still owned by vm1 after a failed legacy attach", d.Address)
+		}
+	}
+}
+
 // ── protocol prerequisite / hardware_v2 gate ──────────────────────────────────
 
 func TestAttachDevice_PCIProtocolInactiveRejected(t *testing.T) {

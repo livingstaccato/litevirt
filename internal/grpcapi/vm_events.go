@@ -50,10 +50,22 @@ func (s *Server) recordVMEvent(ctx context.Context, vmName, evType, result, deta
 	}
 }
 
-// ListVMEvents returns a VM's recent operational events, newest-first.
+// ListVMEvents returns a VM's recent operational events, newest-first. An
+// empty VmName means the cluster-wide activity log instead of one VM (see
+// corrosion.ListVMEvents) — that mode used to hand every VM's events to any
+// cluster-wide viewer, so each row is additionally filtered by canReadVM
+// below. A non-empty VmName is a single-VM read: authorized up front via
+// requireVMReadByName, the same vm.read-on-its-own-path check GetVMStats and
+// ListSnapshots use, so a caller scoped to one project can no longer read
+// another project's VM's events by name either.
 func (s *Server) ListVMEvents(ctx context.Context, req *pb.ListVMEventsRequest) (*pb.ListVMEventsResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
+	}
+	if req.VmName != "" {
+		if _, err := s.requireVMReadByName(ctx, req.VmName); err != nil {
+			return nil, err
+		}
 	}
 	rows, err := corrosion.ListVMEvents(ctx, s.db, req.VmName, int(req.Limit), req.Since)
 	if err != nil {
@@ -61,6 +73,9 @@ func (s *Server) ListVMEvents(ctx context.Context, req *pb.ListVMEventsRequest) 
 	}
 	resp := &pb.ListVMEventsResponse{}
 	for _, r := range rows {
+		if req.VmName == "" && !s.canReadVM(ctx, r.VMName) {
+			continue
+		}
 		resp.Events = append(resp.Events, &pb.VMEvent{
 			Id: r.ID, VmName: r.VMName, HostName: r.HostName,
 			Type: r.Type, Result: r.Result, Severity: r.Severity,

@@ -1231,6 +1231,46 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 	return s.vmToProto(ctx, req.Name)
 }
 
+// requireVMReadByName resolves name to its VMRecord (if known locally) and
+// authorizes vm.read on its path, with the same existence-oracle protection
+// InspectVM uses (a foreign VM and a name that exists nowhere answer with one
+// PermissionDenied; NotFound only reaches a caller who could have seen the
+// name anyway — see requirePermResolved). Shared by every single-VM read RPC
+// given RBAC in the per-VM-reads-respect-rbac-scope follow-up: GetVMStats,
+// ListSnapshots, ListVMEvents, ListVMHardware, GetVMLogs. Returns the resolved
+// VM (nil if it doesn't exist here) so the caller doesn't need a second
+// lookup; a nil VM with a nil error means "not found" and the caller should
+// answer NotFound, matching InspectVM.
+func (s *Server) requireVMReadByName(ctx context.Context, name string) (*corrosion.VMRecord, error) {
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	if err != nil {
+		vm = nil
+	}
+	var path string
+	if vm != nil {
+		path = vmRBACPath(vm)
+	}
+	if err := s.requirePermResolved(ctx, vm != nil, path, vmRBACPathFor("", name),
+		"vm.read", "viewer", "vm "+strconv.Quote(name)); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
+// canReadVM reports whether the caller may vm.read the named VM, for use as a
+// per-row filter over a list that spans VMs (GetHostStats' per-VM entries,
+// ListVMEvents' cluster-wide activity mode with no vm_name filter). A name
+// unresolvable here passes only a cluster-root grant (or the legacy
+// no-bindings fallback) — requirePermResolved's "never authorize on a guess"
+// rule, applied to a filter instead of a single error.
+func (s *Server) canReadVM(ctx context.Context, name string) bool {
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	if err != nil || vm == nil {
+		return s.RequirePerm(ctx, "/", "vm.read", "viewer") == nil
+	}
+	return s.RequirePerm(ctx, vmRBACPath(vm), "vm.read", "viewer") == nil
+}
+
 func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, error) {
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return nil, err

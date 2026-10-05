@@ -123,11 +123,20 @@ func (s *Server) SnapshotContainer(ctx context.Context, req *pb.SnapshotContaine
 // ListContainerSnapshots returns a container's snapshots. Forwards to the
 // owning host for an immediately-consistent view.
 func (s *Server) ListContainerSnapshots(ctx context.Context, req *pb.ListContainerSnapshotsRequest) (*pb.ListContainerSnapshotsResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
+	}
+	// ct.read on the container's own path (same shape authorizeSchedule and
+	// the other container RPCs use): ListContainerSnapshots used to check
+	// only the cluster-wide viewer floor above, so a caller scoped to one
+	// project could list every container's snapshots.
+	project, known := s.containerProject(ctx, req.HostName, req.Name)
+	if err := s.requirePermResolved(ctx, known, ctRBACPathFor(project, req.Name), ctRBACPathFor("", req.Name),
+		"ct.read", "viewer", containerWhat(req.Name)); err != nil {
+		return nil, err
 	}
 	host, _, err := s.resolveContainerHost(ctx, req.HostName, req.Name)
 	if err != nil {

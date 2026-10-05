@@ -1,6 +1,6 @@
 # Security groups owned by projects
 
-Status: design, phase 1. Nothing here is implemented yet. Base: fork main
+Status: design, phase 1, decisions resolved 2026-10-05 (§10). Nothing here is implemented yet. Base: fork main
 `c7aa96f9`.
 
 ## 0. Summary
@@ -643,8 +643,10 @@ budget. It is not a merge gate.
 
 ## 9. Implementation plan
 
-The first commit is a standalone fix and ships on its own. The rest land
-together, in order.
+The first commit is a standalone fix on its own branch
+(`fix/sg-enforcement-follows-the-nic`), as is the D8 network-admission fix
+(`fix/network-admission-on-every-attach`). Commits 2–10 build on both and land
+together, in order, on `feat/security-group-projects`.
 
 | # | Commit | Content | Est. |
 |---|---|---|---|
@@ -653,7 +655,7 @@ together, in order.
 | 3 | `feat(capabilities): sg_projects_v1` | mandatory, ReplicationGated, advertised unconditionally; daemon wiring of the corrosion gate; capability docs | 0.5 d |
 | 4 | `feat(corrosion): owned security-group insert behind sg_projects_v1` | `InsertOwnedSecurityGroup`, gated ledger entry, regenerated ledger, stmtshapecheck | 0.5 d |
 | 5 | `feat(grpcapi): project-owned security groups` | create, delete and rule RBAC on the row's path; ListSecurityGroups visibility and new fields; DeleteProject guard; move | 2 d |
-| 6 | `feat(grpcapi): admit security-group bindings on every attach path` | `admitSGBindings` with §3.3 resolution; the 16 rows of §5; network admission at the same sites if D8 says yes | 2.5 d |
+| 6 | `feat(grpcapi): admit security-group bindings on every attach path` | `admitSGBindings` with §3.3 resolution; the 16 rows of §5; network admission at the same sites lands first on its own branch (D8) | 2.5 d |
 | 7 | `feat(firewall): render only bindings the NIC's project may use` | project-aware loader, owned-over-shared tie-break, inert-reference logging | 1 d |
 | 8 | `feat(cli): sg create --project, sg move, RPC-backed sg ls` | flags, docs (cli-reference, firewall, auth) | 1 d |
 | 9 | `feat(ui): project-aware security-group pickers and page` | Add-NIC, Create-VM (with D10), SG page, create modal | 2 d |
@@ -667,7 +669,10 @@ rather than a render-time lookup, add two days. The §5 table is the
 second-largest risk: each row is small, but sixteen of them each need their own
 fleet subtest.
 
-## 10. Open decisions (with recommendations)
+## 10. Decisions (resolved 2026-10-05)
+
+Every recommendation below was approved on 2026-10-05. Each entry keeps the
+option that was weighed and records the resolution.
 
 - **D1. Column and token, or no schema change?** The alternative stores
   ownership in the existing `stack_name` column as a sentinel (`@project:acme`,
@@ -679,43 +684,54 @@ fleet subtest.
   is how networks (v37) and pools gained owners, and the rollback cost is the
   same one every recent mandatory token carries. Pick the sentinel only if
   avoiding another mandatory token outweighs a hidden trap in the schema.
+  **Resolved 2026-10-05:** column and token (`security_groups.project`, schema v64, `sg_projects_v1`).
 - **D2. Who can read shared groups' rules?** *Recommend: anyone with `sg.read`
   in at least one project* (they can attach shared groups, so they need to know
   what those do). The alternative is root readers only, which leaves tenants
   binding shared groups blind.
+  **Resolved 2026-10-05:** shared groups and their rules are readable by anyone holding `sg.read` in at least one project.
 - **D3. Naming the shared group when a project group shadows it.** *Recommend a
   leading `/` as the explicit shared key form in input only* (`/web`), never
   stored. The alternative is to refuse the shadowing create outright, but that
   is best effort in a CRDT, so it cannot be the only answer.
+  **Resolved 2026-10-05:** a leading `/` (`/web`) names the shared group explicitly, in input only; it is never stored.
 - **D4. Give Operator `sg.write`?** *Recommend no.* Bound at `/`, it would let
   every cluster Operator edit shared groups such as "isolation". Project
   self-service is a `NetworkAdmin` binding at `/projects/<p>`. The docs will say
   so.
+  **Resolved 2026-10-05:** Operator keeps `sg.read` only; project self-service is `NetworkAdmin` bound at `/projects/<p>`.
 - **D5. Sticky shared groups for incident isolation.** Let a tenant add a shared
   group to its own NIC but require `sg.write` on that group to remove it, so a
   hostile tenant cannot undo an admin's quarantine. *Recommend deferring it to a
   follow-up.* Today the tenant-proof tool is a cluster-tier rule on the VM's
   address, which tenants cannot touch. Doing D5 now widens commit 6.
+  **Resolved 2026-10-05:** deferred to a follow-up; tenant-proof isolation stays a cluster-tier rule on the VM's address.
 - **D6. Make `BindSecurityGroups` and move update the VM spec too?** This is a
   pre-existing gap (§1.5 item 4). *Recommend a separate follow-up.* The spec
   write runs under the operation protocol, and folding it in doubles the risk of
   commit 6.
+  **Resolved 2026-10-05:** separate follow-up; bind and move rewrite NIC rows only.
 - **D7. Project-scoped stacks.** *Recommend out of scope.* Stacks stay
   root-deployed and their groups stay shared.
+  **Resolved 2026-10-05:** out of scope; stack groups stay shared.
 - **D8. Fix the missing network admission** (AttachDevice NIC, clone into
   another project, promote, live-restore; §1.5) in commit 6, at the same call
   sites? *Recommend yes, as its own `fix(grpcapi):` commit right before commit
   6.* The sites are the same, and leaving it means a tenant can still reach
   another project's network through the path this design hardens for groups.
+  **Resolved 2026-10-05:** yes, as its own `fix(grpcapi):` commit (branch `fix/network-admission-on-every-attach`), landed before the admission commit.
 - **D9. REST CRUD routes for security groups.** *Recommend not now.* None exist
   today, and adding them belongs with the REST coverage work.
+  **Resolved 2026-10-05:** no REST CRUD routes now.
 - **D10. Create-VM project selector.** The Create-VM picker can only list a
   project's groups once the modal has a project. *Recommend adding the selector
   in commit 9,* listing projects the caller can create VMs in. The server stays
   the authority.
+  **Resolved 2026-10-05:** add a project selector to Create-VM in the UI commit.
 - **D11. How commit 1 finds the tap:** resolve it at render through libvirt by
   MAC on the owning host, or pin `<target dev="lv-…">` in the domain XML so it is
   stable. *Recommend render-time resolution.* Pinning changes the domain XML of
   every VM, and an existing VM only picks the change up when it is redefined.
   The fix would then reach only new or redefined VMs. Containers already use
   deterministic veth names (`container_interfaces.go`, `ContainerVethName`).
+  **Resolved 2026-10-05:** render-time tap resolution by MAC on the owning host (part of commit 1, branch `fix/sg-enforcement-follows-the-nic`).

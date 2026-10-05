@@ -574,6 +574,9 @@ type Server struct {
 	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
 	// production.
 	hostDiskRoot string
+	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
+	// migration's disk copy (diskSpace). Nil in production.
+	diskSpaceOverride func(dir string) (avail, total uint64, err error)
 
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains

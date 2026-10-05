@@ -1291,6 +1291,11 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 	}
 	defer closeConn()
 	resp, err := client.EnsureFirmwareState(ctx, req)
+	if err != nil && len(req.Bundle) == 0 && status.Code(err) == codes.InvalidArgument &&
+		strings.Contains(status.Convert(err).Message(), oldTargetBundleRequired) {
+		// An older target's first check: it refused before defining anything.
+		return fwTargetUntouched, targetTooOldForColdMigration(targetHost, vmName)
+	}
 	if err != nil {
 		// The target may have defined the domain before the call failed: a
 		// cancelled request loses the answer, not the define.
@@ -1375,7 +1380,11 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 
 	// Host-local disks first: the source keeps its own copy until the handoff
 	// commits, so a failure here, or anywhere before the commit, loses nothing.
-	copied, err := s.copyColdDisksToTarget(ctx, targetHost.Name, vm.Name, disks, abort, send)
+	formats, err := domainDiskFormats(domXML)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "read the disks of VM %q from its domain definition: %v", vm.Name, err)
+	}
+	copied, err := s.copyColdDisksToTarget(ctx, targetHost.Name, vm.Name, disks, formats, abort, send)
 	if err != nil {
 		return err
 	}

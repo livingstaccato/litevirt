@@ -85,7 +85,10 @@ func newColdStoppedScenario(t *testing.T) *coldStoppedScenario {
 	}); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	if err := src.Virt.DefineDomain(`<domain type='kvm'><name>os1</name><uuid>11111111-2222-4333-8444-555555555555</uuid></domain>`); err != nil {
+	if err := src.Virt.DefineDomain(`<domain type='kvm'><name>os1</name><uuid>11111111-2222-4333-8444-555555555555</uuid><devices>` +
+		`<disk type='file' device='disk'><driver name='qemu' type='raw'/><source file='` + sc.disk + `'/><target dev='vda'/></disk>` +
+		`<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='` + sc.shared + `'/><target dev='vdb'/></disk>` +
+		`</devices></domain>`); err != nil {
 		t.Fatalf("define source domain: %v", err)
 	}
 	return sc

@@ -140,9 +140,11 @@ guest running for it to migrate:
 
 1. Each host-local disk (`local` and `dir` storage) is copied to the same path
    on the target over the cluster's mTLS connection. Disks on shared storage
-   stay where they are. A disk created from an image or as a linked clone is a
-   qcow2 overlay over a backing file; it arrives flattened, as a standalone
-   image, because the backing file is not part of the copy.
+   stay where they are. A disk's format is read from the VM's domain
+   definition, never from the file. A qcow2 disk created from an image or as a
+   linked clone is an overlay over a backing file. It arrives flattened, as a
+   standalone image, because the backing file is not part of the copy. A raw
+   disk is copied byte for byte.
 2. The VM's domain is defined on the target, shut off.
 3. The VM and all of its disk records move to the target in one transaction.
    The VM's state stays `stopped`. Start it there with `lv start my-vm`.
@@ -159,10 +161,21 @@ rather than overwritten, as for `--with-storage`.
 A stopped VM is refused when:
 
 - libvirt reports its domain active, although its record says stopped;
+- a disk is not in its domain definition, so its format is unknown;
+- a filesystem would be left with less than 1 GiB or 5% of its size free,
+  whichever is larger: the target's, for each disk copy, or the source's, for
+  flattening an overlay. The disks on a host's filesystem are thin-provisioned,
+  and a full filesystem pauses every guest writing to one;
+- a disk file is larger than its recorded size allows, plus qcow2 metadata;
 - it has snapshots and a host-local disk;
 - it holds a PCI passthrough device;
-- the target is a build from before stopped-VM cold migration and cannot
-  receive the disks.
+- the target is a build from before stopped-VM cold migration. The error says
+  so and names the target to upgrade.
+
+A copy in flight writes to a hidden scratch file beside the disk:
+`.<disk>.receiving-*` on the target, or `.<disk>.coldmig-*` on the source while
+it flattens an overlay. A daemon that stops mid-copy removes these files from
+its host-local disk directories when it next starts.
 
 `--with-storage` has no effect on a stopped VM, whose host-local disks are
 always copied.

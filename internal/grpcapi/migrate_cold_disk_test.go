@@ -159,7 +159,7 @@ func TestReceiveMigrationDisk_CopiesTheFile(t *testing.T) {
 	}
 	f.writeSource(t, data)
 
-	if err := f.src.streamColdDisk(adminCtx(), f.client, "os1", f.disk); err != nil {
+	if err := f.src.streamColdDisk(adminCtx(), f.client, "os1", f.disk, "raw"); err != nil {
 		t.Fatalf("streamColdDisk: %v", err)
 	}
 	got, err := os.ReadFile(f.path)
@@ -198,7 +198,7 @@ func TestStreamColdDisk_FlattensABackedOverlay(t *testing.T) {
 	if err := qcow2.CreateWithBacking(sp, base, size, nil); err != nil {
 		t.Fatalf("create overlay: %v", err)
 	}
-	if err := f.src.streamColdDisk(adminCtx(), f.client, "os1", f.disk); err != nil {
+	if err := f.src.streamColdDisk(adminCtx(), f.client, "os1", f.disk, "qcow2"); err != nil {
 		t.Fatalf("streamColdDisk: %v", err)
 	}
 	info, err := qcow2.Info(f.path)
@@ -234,7 +234,7 @@ func TestReceiveMigrationDisk_RefusesAFileItDidNotCreate(t *testing.T) {
 	if err := os.WriteFile(f.path, []byte("kept from an earlier stay"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := f.src.streamColdDisk(adminCtx(), f.client, "os1", f.disk)
+	err := f.src.streamColdDisk(adminCtx(), f.client, "os1", f.disk, "raw")
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("copy over an existing file = %v, want FailedPrecondition", err)
 	}

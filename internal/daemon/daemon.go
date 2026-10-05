@@ -991,6 +991,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
+	// Before this daemon serves: no cold-migration copy can be in flight yet.
+	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
 	svc.SetAuthEngine(d.authEngine)
 	svc.SetRealmRegistry(d.realmRegistry)

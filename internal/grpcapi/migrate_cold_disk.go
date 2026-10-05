@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"hash"
@@ -21,6 +22,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
@@ -70,7 +73,7 @@ func coldDiskFrameDigest(h hash.Hash, offset int64, data []byte) {
 // failure — a cancelled request included — has the cleanup ask the target for
 // it. The target removes a file only if it recorded writing it for this VM, so
 // naming one it never wrote removes nothing.
-func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName string, disks []corrosion.DiskRecord, abort *migrationAbort, send func(pb.MigratePhase, float32, float32) error) ([]corrosion.DiskRecord, error) {
+func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName string, disks []corrosion.DiskRecord, formats map[string]string, abort *migrationAbort, send func(pb.MigratePhase, float32, float32) error) ([]corrosion.DiskRecord, error) {
 	var toCopy []corrosion.DiskRecord
 	for _, d := range disks {
 		if copiedByStorageMigration(d) {
@@ -80,6 +83,16 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 	if len(toCopy) == 0 {
 		return nil, nil
 	}
+	// The format of each disk is the domain's, never the file's: a raw disk
+	// holds guest data, and a guest can write a qcow2 header into it that names
+	// any host file as its backing.
+	for _, d := range toCopy {
+		if formats[d.Path] == "" {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q (%s) is not in its domain definition on %s, so its format is unknown; "+
+					"repair the VM's disks before migrating it", d.DiskName, vmName, d.Path, s.hostName)
+		}
+	}
 	client, closeConn, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "cannot reach %s to copy the disks of VM %q: %v", targetHost, vmName, err)
@@ -87,13 +100,11 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 	defer closeConn()
 	for i, d := range toCopy {
 		abort.createdStubs = append(abort.createdStubs, d.Path)
-		if err := s.streamColdDisk(ctx, client, vmName, d); err != nil {
+		if err := s.streamColdDisk(ctx, client, vmName, d, formats[d.Path]); err != nil {
 			code := status.Code(err)
 			switch code {
 			case codes.Unimplemented:
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"%s cannot take the disks of a stopped VM (it is a build from before cold migration copied them); "+
-						"upgrade it, or start VM %q and migrate it live with --with-storage", targetHost, vmName)
+				return nil, targetTooOldForColdMigration(targetHost, vmName)
 			case codes.Unknown:
 				code = codes.Internal
 			}
@@ -112,7 +123,7 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 // part of the copy, and the target may not hold it at the same path — or at
 // all. The target then gets a standalone image of the same content, which is
 // what libvirt's storage copy of a running VM leaves there too.
-func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, vmName string, d corrosion.DiskRecord) error {
+func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, vmName string, d corrosion.DiskRecord, format string) error {
 	src := s.hostDiskFile(d.Path)
 	fi, err := os.Lstat(src)
 	if err != nil {
@@ -122,9 +133,21 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		return status.Errorf(codes.FailedPrecondition, "disk file %s is not a regular file", d.Path)
 	}
 	readPath := src
-	if info, ierr := qcow2.Info(src); ierr == nil && info.BackingFile != "" {
-		flat := filepath.Join(filepath.Dir(src), "."+filepath.Base(src)+".coldmig-"+uuid.NewString())
+	if format != "qcow2" {
+		// Copied as it is, whatever its bytes look like (see copyColdDisksToTarget).
+	} else if info, ierr := qcow2.Info(src); ierr != nil {
+		return status.Errorf(codes.FailedPrecondition, "disk %s is qcow2 in its domain definition, but its image cannot be read: %v", d.Path, ierr)
+	} else if info.BackingFile != "" {
+		// The flatten writes up to a full copy beside the disk (Convert's
+		// .tmp, renamed in place): refuse rather than fill the filesystem
+		// the VM's neighbours' thin-provisioned disks live on.
+		if err := s.requireDiskSpace(filepath.Dir(src), filepath.Dir(d.Path),
+			"flattening disk "+d.Path+" for the copy", info.VirtualSize+info.VirtualSize/32); err != nil {
+			return err
+		}
+		flat := filepath.Join(filepath.Dir(src), "."+filepath.Base(src)+coldMigScratch+uuid.NewString())
 		defer os.Remove(flat)
+		defer os.Remove(flat + ".tmp")
 		if err := qcow2.Convert(ctx, src, flat, &qcow2.Options{Uncompressed: true}); err != nil {
 			return status.Errorf(codes.Internal, "flatten disk %s (backed by %s) for the copy: %v", d.Path, info.BackingFile, err)
 		}
@@ -241,15 +264,21 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if err != nil {
 		return status.Errorf(codes.Internal, "read the disks of VM %q: %v", vm.Name, err)
 	}
-	known := false
-	for _, d := range disks {
+	var rec *corrosion.DiskRecord
+	for i, d := range disks {
 		if d.Path == hdr.Path && copiedByStorageMigration(d) {
-			known = true
+			rec = &disks[i]
 			break
 		}
 	}
-	if !known {
+	if rec == nil {
 		return status.Errorf(codes.InvalidArgument, "%s is not a host-local disk of VM %q", hdr.Path, vm.Name)
+	}
+	if rec.SizeBytes > 0 && hdr.SizeBytes > coldDiskSizeLimit(rec.SizeBytes) {
+		return status.Errorf(codes.FailedPrecondition,
+			"disk %s of VM %q is %d bytes on the source, more than its record of %d bytes allows (at most %d with image metadata); "+
+				"make the disk and its record agree, then migrate again",
+			hdr.Path, vm.Name, hdr.SizeBytes, rec.SizeBytes, coldDiskSizeLimit(rec.SizeBytes))
 	}
 	if !s.withinDiskArtifactRoot(hdr.Path) {
 		return status.Errorf(codes.InvalidArgument, "disk path %q is not in a disk-artifact root", hdr.Path)
@@ -271,7 +300,10 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(hdr.Path), err)
 	}
-	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dst)+".receiving-*")
+	if err := s.requireDiskSpace(dir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, uint64(hdr.SizeBytes)); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dst)+coldRecvScratch+"*")
 	if err != nil {
 		return status.Errorf(codes.Internal, "create scratch file for %s: %v", hdr.Path, err)
 	}
@@ -330,7 +362,20 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if err := tmp.Close(); err != nil {
 		return status.Errorf(codes.Internal, "close %s: %v", hdr.Path, err)
 	}
-	if err := os.Rename(tmp.Name(), dst); err != nil {
+	// A stub this host made for the VM's migration is the one file the copy may
+	// take the place of (checked above); anything else at the path — even one
+	// that appeared since the check — makes the placement fail.
+	if s.migrationStubs.owns(vm.Name, hdr.Path) {
+		if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
+			return status.Errorf(codes.Internal, "replace this host's stub %s: %v", hdr.Path, err)
+		}
+	}
+	if err := placeColdDisk(tmp.Name(), dst); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return status.Errorf(codes.FailedPrecondition,
+				"disk %s of VM %q appeared on %s during the copy, and this migration did not create it; it is left as it is",
+				hdr.Path, vm.Name, s.hostName)
+		}
 		return status.Errorf(codes.Internal, "place %s: %v", hdr.Path, err)
 	}
 	placed = true
@@ -365,4 +410,168 @@ func (s *Server) removeColdMigratedSourceDisks(ctx context.Context, vmName strin
 		}
 		slog.Info("cold migration: removed the source copy of a migrated disk", "vm", vmName, "path", d.Path)
 	}
+}
+
+// Scratch-file markers. A cold copy's scratch files are hidden (a leading dot)
+// and carry one of these after the disk's name: coldRecvScratch on the target
+// while a copy is received, coldMigScratch on the source while an overlay is
+// flattened (qcow2.Convert adds ".tmp" to that). SweepColdMigrationScratch
+// recognises them by the same markers.
+const (
+	coldRecvScratch = ".receiving-"
+	coldMigScratch  = ".coldmig-"
+)
+
+// coldDiskSizeLimit is the most bytes a disk file recorded at recorded bytes
+// may hold: its virtual size plus qcow2 metadata (L1/L2 and refcount tables,
+// well under 1/32 of the image) and a fixed allowance for a small image.
+func coldDiskSizeLimit(recorded int64) int64 { return recorded + recorded/32 + 64<<20 }
+
+// coldDiskHeadroom is the free space a cold copy leaves on a filesystem: the
+// larger of 1 GiB and 5% of it. The disks on a host's filesystem are
+// thin-provisioned, and when it fills every guest writing to one pauses.
+func coldDiskHeadroom(total uint64) uint64 {
+	if h := total / 20; h > 1<<30 {
+		return h
+	}
+	return 1 << 30
+}
+
+// diskSpace reports the bytes available to the daemon, and the total, on the
+// filesystem holding dir.
+func (s *Server) diskSpace(dir string) (avail, total uint64, err error) {
+	if s.diskSpaceOverride != nil {
+		return s.diskSpaceOverride(dir)
+	}
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(dir, &st); err != nil {
+		return 0, 0, err
+	}
+	return st.Bavail * uint64(st.Bsize), st.Blocks * uint64(st.Bsize), nil
+}
+
+// requireDiskSpace refuses a write of need bytes into dir (shown as shownDir,
+// the recorded path) that would leave less than coldDiskHeadroom free.
+func (s *Server) requireDiskSpace(dir, shownDir, what string, need uint64) error {
+	avail, total, err := s.diskSpace(dir)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%s: cannot read the free space of %s on %s: %v", what, shownDir, s.hostName, err)
+	}
+	headroom := coldDiskHeadroom(total)
+	if avail < need || avail-need < headroom {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s needs %d MiB on %s, where %s has %d MiB free; a cold migration leaves at least %d MiB free there, "+
+				"because the thin-provisioned disks on that filesystem pause their guests when it fills. "+
+				"Free space in %s on %s, or move the disk to shared storage, then migrate again",
+			what, need>>20, s.hostName, shownDir, avail>>20, headroom>>20, shownDir, s.hostName)
+	}
+	return nil
+}
+
+// placeColdDisk gives the received file at tmp the name dst, failing with an
+// error satisfying errors.Is(err, os.ErrExist) if dst exists: a hard link, not
+// a rename, so a file at dst is never replaced. The scratch name is removed.
+func placeColdDisk(tmp, dst string) error {
+	if err := os.Link(tmp, dst); err != nil {
+		return err
+	}
+	return os.Remove(tmp)
+}
+
+// domainDiskFormats maps the source file of each file-backed disk in a domain
+// definition to its driver type (qcow2, raw, ...).
+func domainDiskFormats(domXML string) (map[string]string, error) {
+	var dom struct {
+		Disks []struct {
+			Device string `xml:"device,attr"`
+			Driver struct {
+				Type string `xml:"type,attr"`
+			} `xml:"driver"`
+			Source struct {
+				File string `xml:"file,attr"`
+			} `xml:"source"`
+		} `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for _, d := range dom.Disks {
+		if d.Source.File == "" || (d.Device != "" && d.Device != "disk") {
+			continue
+		}
+		f := d.Driver.Type
+		if f == "" {
+			f = "raw" // libvirt's default, and the one that never reads a backing file
+		}
+		out[d.Source.File] = f
+	}
+	return out, nil
+}
+
+// isColdMigrationScratch reports whether a file name is a cold copy's scratch
+// file (see coldRecvScratch, coldMigScratch).
+func isColdMigrationScratch(name string) bool {
+	if !strings.HasPrefix(name, ".") {
+		return false
+	}
+	return strings.Contains(name, coldRecvScratch) || strings.Contains(name, coldMigScratch)
+}
+
+// SweepColdMigrationScratch removes the scratch files a cold migration left
+// in this host's disk-artifact roots when the daemon stopped mid-copy: a
+// partial receive, a partial flatten and its convert temp. Run once at
+// startup, before this daemon serves, when no copy can be in flight. Only the
+// host-local roots are swept — the disks dir and local/dir pools — never a
+// shared (nfs) pool, where another host's copy may be running.
+func (s *Server) SweepColdMigrationScratch() {
+	roots := []string{filepath.Join(s.dataDir, "disks")}
+	s.storagePoolsMu.RLock()
+	for _, pr := range s.storagePools {
+		if !isHostLocalDiskDriver(strings.ToLower(pr.Driver)) && pr.Driver != "" {
+			continue
+		}
+		if dir, err := fileBasedPoolDir(s.dataDir, pr); err == nil {
+			roots = append(roots, dir)
+		}
+	}
+	s.storagePoolsMu.RUnlock()
+	seen := map[string]bool{}
+	for _, root := range roots {
+		root = s.hostDiskFile(root)
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+		ents, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			if !e.Type().IsRegular() || !isColdMigrationScratch(e.Name()) {
+				continue
+			}
+			p := filepath.Join(root, e.Name())
+			if err := os.Remove(p); err != nil {
+				slog.Warn("cold migration: could not remove a scratch file left by an interrupted copy", "path", p, "error", err)
+				continue
+			}
+			slog.Info("cold migration: removed a scratch file left by an interrupted copy", "path", p)
+		}
+	}
+}
+
+// oldTargetBundleRequired is how a target built before stopped-VM cold
+// migration refuses a domain definition sent without a firmware bundle: the
+// first check of its EnsureFirmwareState, verbatim.
+const oldTargetBundleRequired = "vm_name and a non-empty firmware bundle are required"
+
+// targetTooOldForColdMigration is the refusal for a target whose build cannot
+// take a stopped VM's cold migration — it lacks ReceiveMigrationDisk, or
+// requires a firmware bundle to define a domain.
+func targetTooOldForColdMigration(targetHost, vmName string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s is a build from before cold migration of stopped VMs and cannot take VM %q; nothing was changed. "+
+			"To migrate it, upgrade %s, or start the VM and migrate it live (with --with-storage for a host-local disk)",
+		targetHost, vmName, targetHost)
 }

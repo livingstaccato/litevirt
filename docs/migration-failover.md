@@ -225,15 +225,29 @@ A VM that drain cannot move stays on the host with its disks; a failed attempt
 removes what it put on the target. It is never moved without its disks:
 
 - refused before the shutdown, it keeps running;
-- a move that fails after the shutdown starts it again on the host. If that
-  start fails too, drain reports it as an error naming the VM, which is then
-  stopped on the host; start it with `lv start <vm>`.
+- a move that fails after the shutdown starts it again on the host, once its
+  domain has shut off. A guest slower than its stop timeout is waited for, up
+  to 5 more minutes; the ACPI shutdown request cannot be withdrawn, so the VM
+  is started again only after the guest has powered off. A guest still running
+  after that is reported as an error that says so: its shutdown was requested
+  and it is still running, and it will power off if the guest completes the
+  shutdown. Start it with `lv start <vm>` then;
+- if the start fails, drain reports it as an error naming the VM, which is
+  then stopped on the host; start it with `lv start <vm>`.
+
+The move of a running VM is journaled before anything is done to it (an
+operation of kind `drain_cold_move`). If the drained host's daemon dies in the
+middle, it finishes the move when it starts again, and the VM ends running on
+exactly one host: on the drained host if it had not been handed over yet
+(started again, or its record put back to running if its domain never stopped),
+or on the target if it had.
 
 Drain reports each VM it did not move with the reason, finishes the other VMs,
 and then fails with `drain incomplete: N VM(s) remain on host ...`. The host
 stays `draining`. Fix what the message names (or migrate the VM yourself) and
 run the drain again. A VM that moved but did not start on the target is
-reported too; it is stopped there.
+reported too, with a VM event saying why; it is stopped there, and the drain
+also ends with `drain incomplete`, naming it.
 
 ### A VM with no domain
 

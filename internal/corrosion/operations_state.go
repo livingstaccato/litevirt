@@ -32,6 +32,13 @@ const (
 	// manifest is journaled first, and the step that AUTHORIZES the destruction is
 	// written in the same batch as the transition.
 	OpVMReplace OperationKind = "vm_replace"
+	// OpDrainColdMove journals host drain's cold move of a RUNNING VM: the VM
+	// is shut down, moved with its disks, and started again — on the target,
+	// or on the source if the move fails. Between the shutdown and that start
+	// the only record that the VM must run again would otherwise be the drain's
+	// goroutine; the journal is what a restarted daemon finishes from
+	// (drain_cold_move.go).
+	OpDrainColdMove OperationKind = "drain_cold_move"
 )
 
 // Step names. The happy-path steps differ per kind; the terminal + rollback
@@ -143,6 +150,18 @@ var opHappyPath = map[OperationKind][]string{
 		OpStepPlanned, OpStepDesiredPersisted, OpStepReleased, OpStepConfigApplied,
 		OpStepJournaled, OpStepStopped, OpStepRedefined,
 	},
+
+	// OpDrainColdMove:
+	//
+	//   planned  the VM was running and must run again when the move ends;
+	//            recorded before anything is done to it.
+	//   stopped  its shutdown has been requested (the ACPI request is never
+	//            withdrawn, so a recovery that finds the domain still active
+	//            waits for it to shut off before starting it).
+	//
+	// OpStepCompleted is appended once the VM has been started again, or the
+	// drain has reported why it could not be. Its facts say which.
+	OpDrainColdMove: {OpStepPlanned, OpStepStopped},
 }
 
 var opTerminalStates = map[string]bool{

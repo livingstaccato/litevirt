@@ -313,6 +313,20 @@ func (s *Server) checkColdDiskOnTarget(ctx context.Context, client pb.LiteVirtCl
 	return err
 }
 
+// nearestExistingDir is dir, or its closest ancestor that exists.
+func nearestExistingDir(dir string) string {
+	for {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return dir
+		}
+		dir = parent
+	}
+}
+
 // coldDiskSendErr is the error to return for a failed Send: io.EOF means the
 // target ended the stream, and its own error says why.
 func coldDiskSendErr(up grpc.ClientStreamingClient[pb.ReceiveMigrationDiskRequest, pb.ReceiveMigrationDiskResponse], err error) error {
@@ -413,7 +427,13 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	}
 
 	dir := filepath.Dir(dst)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	// A check-only call writes nothing, not even the directory: its free space
+	// is that of the nearest directory that exists, which is the filesystem
+	// the copy's MkdirAll would create it on.
+	spaceDir := dir
+	if hdr.CheckOnly {
+		spaceDir = nearestExistingDir(dir)
+	} else if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(hdr.Path), err)
 	}
 	// The data the copy writes, not the file's apparent size: the receive
@@ -424,7 +444,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if hdr.AllocatedBytes > 0 && hdr.AllocatedBytes < need {
 		need = hdr.AllocatedBytes
 	}
-	if err := s.requireDiskSpace(dir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, uint64(need)); err != nil {
+	if err := s.requireDiskSpace(spaceDir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, uint64(need)); err != nil {
 		return err
 	}
 	if hdr.CheckOnly {

@@ -113,6 +113,11 @@ type Fake struct {
 	// request when it returns true: the call succeeds, the domain keeps
 	// running, and WaitForShutdown times out.
 	IgnoreShutdown func(name string) bool
+	// ShutdownLate makes ShutdownDomain a guest slower than its stop timeout
+	// when it returns true: the domain keeps running through the first
+	// WaitForShutdown, which times out, and is shut off by the second.
+	ShutdownLate func(name string) bool
+	lateWaits    map[string]int
 	// FailSuspendDomain / FailResumeDomain inject a pause/resume failure
 	// (partition pause, docs/design/partition-pause.md §3.4).
 	FailSuspendDomain func(name string) error
@@ -412,6 +417,14 @@ func (f *Fake) StartDomain(name string) error {
 	if _, ok := f.domains[name]; !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
+	if n, ok := f.lateWaits[name]; ok && n > 0 && f.domains[name] == StateRunning {
+		// A ShutdownLate guest still going down: libvirt refuses to start a
+		// running domain, and the guest then completes its shutdown.
+		delete(f.lateWaits, name)
+		f.domains[name] = StateShutdown
+		f.record("shutoff-late", name, "")
+		return fmt.Errorf("libvirtfake: domain %q is already running", name)
+	}
 	f.domains[name] = StateRunning
 	f.record("start", name, "")
 	return nil
@@ -504,6 +517,13 @@ func (f *Fake) ShutdownDomain(name string) error {
 	}
 	f.record("shutdown", name, "")
 	if f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
+		return nil
+	}
+	if f.ShutdownLate != nil && f.ShutdownLate(name) {
+		if f.lateWaits == nil {
+			f.lateWaits = map[string]int{}
+		}
+		f.lateWaits[name] = 0
 		return nil
 	}
 	f.domains[name] = StateShutdown
@@ -829,6 +849,15 @@ func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
 	defer f.mu.Unlock()
 	if s, ok := f.domains[name]; ok && s == StateRunning && f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
 		return false
+	}
+	if n, ok := f.lateWaits[name]; ok && f.domains[name] == StateRunning {
+		if n == 0 {
+			f.lateWaits[name] = 1
+			return false // the stop timeout passes; the guest is still going down
+		}
+		delete(f.lateWaits, name)
+		f.domains[name] = StateShutdown
+		f.record("shutoff-late", name, "")
 	}
 	return true
 }

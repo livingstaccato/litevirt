@@ -100,11 +100,15 @@ func TestReceiveMigrationDisk_RunningRowNeedsTheOwnersWord(t *testing.T) {
 // shuts the VM down: it passes, and writes nothing — no file, no scratch, no
 // record of a copy.
 //
-// Mutation: drop the check-only return — the call goes on to wait for data,
-// fails with "ended without its digest", and goes red.
+// Mutations: drop the check-only return — the call goes on to wait for data,
+// fails with "ended without its digest", and goes red. Create the directory
+// before the check-only return — the directory check goes red.
 func TestReceiveMigrationDisk_CheckOnlyWritesNothing(t *testing.T) {
 	f := newColdDiskFixture(t)
 	lagTargetRow(t, f)
+	if _, err := os.Stat(filepath.Dir(f.path)); !os.IsNotExist(err) {
+		t.Fatalf("the fixture's disk directory exists already (stat: %v); the test needs it absent", err)
+	}
 	srv := &diskRecvStream{ctx: f.peer, frames: []*pb.ReceiveMigrationDiskRequest{
 		{VmName: "os1", Path: f.path, SizeBytes: 4 << 20, AllocatedBytes: 1 << 20, CheckOnly: true},
 	}}
@@ -119,6 +123,9 @@ func TestReceiveMigrationDisk_CheckOnlyWritesNothing(t *testing.T) {
 	}
 	if f.dst.migrationStubs.owns("os1", f.path) {
 		t.Error("a check-only call recorded a copy")
+	}
+	if _, err := os.Stat(filepath.Dir(f.path)); !os.IsNotExist(err) {
+		t.Errorf("a check-only call created the disk directory %s (stat: %v)", filepath.Dir(f.path), err)
 	}
 }
 

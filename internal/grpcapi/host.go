@@ -451,11 +451,17 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	close(jobs)
 
 	// Collect results and stream progress.
+	// notStarted: VMs moved off the host that did not start on their target
+	// (a `done` frame carrying an Error). They left the host, but the drain
+	// did not do what it was asked for them, so it does not end clean.
 	var failures int
+	var notStarted []string
 	for range drainJobs {
 		progress := <-results
 		if progress.Status == "error" || progress.Status == "failed" {
 			failures++
+		} else if progress.Status == "done" && progress.Error != "" {
+			notStarted = append(notStarted, progress.VmName)
 		}
 		if err := stream.Send(progress); err != nil {
 			return err
@@ -475,6 +481,11 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		return status.Errorf(codes.FailedPrecondition,
 			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, or not movable; see each VM's result)",
 			stillRunning, req.Name)
+	}
+	if len(notStarted) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"drain incomplete: every VM left host %q, but %d did not start on its target (%s); start each with `lv start <vm>`",
+			req.Name, len(notStarted), strings.Join(notStarted, ", "))
 	}
 
 	return nil

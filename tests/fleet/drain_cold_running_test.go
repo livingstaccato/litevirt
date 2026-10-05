@@ -189,24 +189,98 @@ func TestFleet_DrainStartsARunningVMAgainWhenItsMoveFails(t *testing.T) {
 	sc.assertRunningOnSource(t)
 }
 
-// A guest that ignores the shutdown request is not moved: the move waits out
-// the VM's stop timeout, gives up without forcing it off, and the VM keeps
-// running where it was, its row back to running.
+// A guest that never completes the shutdown it was asked for is not moved,
+// and the drain says what is true: its shutdown was requested and its domain
+// is still active, so it still runs here and will power off if the guest ever
+// completes the shutdown. It does not claim the VM was "started again", and
+// the row says running, which is what the VM is.
 //
 // Mutation: do not check that the domain shut off — the move goes on under a
 // running guest, is refused only by the cold path's own active-domain check,
-// and the frame's reason goes red.
-func TestFleet_DrainLeavesARunningVMThatWillNotShutDown(t *testing.T) {
+// and the frame's reason goes red. Report it as started again (drop the
+// still-active branch) — the frame goes red.
+func TestFleet_DrainReportsAGuestThatNeverShutsDown(t *testing.T) {
 	sc := newColdStoppedScenario(t)
 	sc.makeRunning(t)
 	sc.src.Virt.IgnoreShutdown = func(string) bool { return true }
 
 	progress, err := sc.drain(t)
 	assertIncomplete(t, err)
-	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "did not shut down within its stop timeout") {
-		t.Fatalf("drain progress for os1 = %+v, want failed: did not shut down", p)
+	p := progress["os1"]
+	if p == nil || p.Status != "error" || !strings.Contains(p.Error, "did not shut down within its stop timeout") ||
+		!strings.Contains(p.Error, "shutdown was requested and its domain on "+sc.src.Name+" is still active") ||
+		strings.Contains(p.Error, "started again") {
+		t.Fatalf("drain progress for os1 = %+v, want error: shutdown requested, domain still active, never \"started again\"", p)
 	}
 	sc.assertRunningOnSource(t)
+}
+
+// A guest slower than its stop timeout finishes its shutdown after the move
+// has given up. The drain waits for that (its separate, bounded budget past
+// the stop timeout), and only then starts the VM again, which ends running
+// where it was. Starting it while it was still going down would have been
+// undone moments later by the guest's own power-off, and stuck: a clean guest
+// shutdown is never restarted by the restart policy.
+//
+// Mutations: do not wait past the stop timeout — the guest is still going
+// down, the drain reports it still active instead of starting it, and the
+// frame goes red. Start it without checking that it shut off — libvirt refuses
+// a domain still running, the guest then powers off, and the VM ends stopped.
+func TestFleet_DrainStartsAGuestThatShutsDownLateAgain(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.src.Virt.ShutdownLate = func(string) bool { return true }
+
+	progress, err := sc.drain(t)
+	assertIncomplete(t, err)
+	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "started again on "+sc.src.Name) {
+		t.Fatalf("drain progress for os1 = %+v, want failed: started again", p)
+	}
+	late, started := -1, -1
+	for i, e := range sc.src.Virt.EventLog() {
+		if e.Domain != "os1" {
+			continue
+		}
+		switch e.Op {
+		case "shutoff-late":
+			late = i
+		case "start":
+			started = i
+		}
+	}
+	if late < 0 || started < late {
+		t.Fatalf("os1 was started again (event %d) before its late shutdown completed (event %d)", started, late)
+	}
+	sc.assertRunningOnSource(t)
+}
+
+// The row says stopped, by the operator, before the guest is asked to shut
+// down. A guest that went down under a row saying running would read as a
+// crash to the domain-event handler and the restart policy, which could start
+// it again while its disk is being copied.
+//
+// Mutation: request the shutdown before recording the row — the row seen at
+// the shutdown says running and goes red.
+func TestFleet_DrainRecordsTheVMStoppedBeforeShuttingItDown(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	var atShutdown *corrosion.VMRecord
+	sc.src.Virt.FailShutdownDomain = func(name string) error {
+		if name == "os1" && atShutdown == nil {
+			atShutdown, _ = corrosion.GetVM(context.Background(), sc.src.DB, "os1")
+		}
+		return nil
+	}
+
+	if _, err := sc.drain(t); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	if atShutdown == nil {
+		t.Fatal("os1 was never shut down")
+	}
+	if atShutdown.State != "stopped" || atShutdown.StateDetail != "operator-stop" {
+		t.Fatalf("os1's row when its shutdown was requested = %s/%q, want stopped/\"operator-stop\"", atShutdown.State, atShutdown.StateDetail)
+	}
 }
 
 // If the VM cannot be started again after a failed move, the drain says so
@@ -312,5 +386,41 @@ func TestFleet_DrainFallsBackToAColdMoveWhenLiveMigrationFails(t *testing.T) {
 	}
 	if sc.src.Virt.DomainExists("os3") {
 		t.Errorf("os3's domain is still defined on the drained host")
+	}
+}
+
+// A VM that moved but did not start on its target left the host, but the
+// drain did not do what it was asked for it: the drain ends incomplete,
+// naming the VM, and a VM event on it says why. The frame says where it is.
+//
+// Mutations: count a done frame with an error as success — the drain returns
+// nil and goes red. Drop the VM event — the event check goes red.
+func TestFleet_DrainCountsAVMThatDidNotStartOnItsTarget(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	sc.makeRunning(t)
+	sc.dst.Virt.FailStartDomain = func(string) error { return errors.New("injected start failure") }
+
+	progress, err := sc.drain(t)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "did not start on its target (os1)") {
+		t.Fatalf("drain = %v, want FailedPrecondition naming os1 as not started on its target", err)
+	}
+	if p := progress["os1"]; p == nil || p.Status != "done" || !strings.Contains(p.Error, "stopped on "+sc.dst.Name) {
+		t.Fatalf("drain progress for os1 = %+v, want done with the not-started error", p)
+	}
+	if vm := sc.vm(t); vm.HostName != sc.dst.Name || vm.State != "stopped" {
+		t.Errorf("os1 row = host %s state %s, want stopped on %s", vm.HostName, vm.State, sc.dst.Name)
+	}
+	evs, err := corrosion.ListVMEvents(context.Background(), sc.src.DB, "os1", 50, "")
+	if err != nil {
+		t.Fatalf("ListVMEvents: %v", err)
+	}
+	found := false
+	for _, e := range evs {
+		if e.Type == "vm.drain" && e.Result == "error" && strings.Contains(e.Detail, "not started there") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no vm.drain error event says os1 was not started on %s: %+v", sc.dst.Name, evs)
 	}
 }

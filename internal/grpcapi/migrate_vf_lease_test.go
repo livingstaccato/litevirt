@@ -402,3 +402,40 @@ func TestMigrateVM_AFailureWithTheGuestPausedKeepsTheVFs(t *testing.T) {
 		t.Errorf("no error VM event names the VF left out of the paused guest; events: %+v", evs)
 	}
 }
+
+// TestMigrateVM_TheVFLeaseAndItsRecoveryWorkWithTheProtocolOff pins a decision:
+// a migration's VF lease and its restart recovery are NOT gated on
+// operation_protocol (TestAttachDevice_ProtocolInactiveRejected pins the
+// opposite for operator hotplug). The migration's detach and reattach do not
+// change the VM's replicated hardware, which is the thing the protocol
+// journals. The lease is host-local and no peer relies on it, so a gate would
+// buy no safety. It would only turn restart recovery off on every cluster that
+// keeps the default enforcement.operation_protocol=false.
+func TestMigrateVM_TheVFLeaseAndItsRecoveryWorkWithTheProtocolOff(t *testing.T) {
+	r := vfMigrationRig(t, "0000:41:10.0")
+	j := r.withLeaseJournal(t)
+	r.s.SetOperationProtocol(false) // flag off, and the rig's gate latches nothing
+	if r.s.operationProtocolActive(adminCtx()) {
+		t.Fatal("precondition: operation_protocol must be inactive")
+	}
+	recovered := false
+	r.fake.FailMigrateToTarget = func(string, string) error {
+		r.assertVFsHeldInTheWindow(t, j) // the lease is written
+		r.s.RecoverDeviceLeases(context.Background())
+		recovered = true
+		for _, a := range r.vfs {
+			if !guestHasHostdev(t, r.s, "vf-vm", a) {
+				t.Errorf("with the protocol off, restart recovery did not put VF %s back", a)
+			}
+		}
+		if _, found, err := j.Read(deviceLeaseOpID("vf-vm")); err != nil || found {
+			t.Errorf("with the protocol off, restart recovery kept the lease (err %v)", err)
+		}
+		return errors.New("daemon died mid-migration")
+	}
+
+	_ = r.migrate(t)
+	if !recovered {
+		t.Fatal("the migration never reached libvirt")
+	}
+}

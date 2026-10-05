@@ -569,6 +569,9 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 	// (releaseSourceVFsAfterCutover), so no allocation can take one while it is
 	// out of the guest, and a durable lease names them first, so a restart in
 	// the window puts them back (RecoverDeviceLeases).
+	// Ungated on operation_protocol, on purpose: this move does not change the
+	// VM's replicated hardware, and the host-local lease is something no peer
+	// relies on (TestMigrateVM_TheVFLeaseAndItsRecoveryWorkWithTheProtocolOff).
 	if err := s.beginMigrationVFLease(req.VmName, pciAddresses(detachedVFs)); err != nil {
 		return status.Errorf(codes.FailedPrecondition, "record the VFs detached for migration: %v", err)
 	}

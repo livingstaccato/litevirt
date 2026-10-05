@@ -2416,7 +2416,10 @@ message RollbackFirmwareStateResponse {
 // and writes nothing. An older peer does not implement it at all, so the caller
 // treats Unimplemented as "cannot verify" and proceeds — the check must never be
 // the reason a migration stops working during a rolling upgrade.
-message CheckCPUCompatibilityRequest  { string cpu_xml = 1; }
+message CheckCPUCompatibilityRequest  {
+    string cpu_xml = 1;
+    string machine = 2;  // the guest's machine type (live <os><type machine>); "" = the hypervisor's default
+}
 message CheckCPUCompatibilityResponse {
     bool   runnable = 1;  // true = this host can run that guest (identical or superset)
     string verdict  = 2;  // identical | superset | incompatible

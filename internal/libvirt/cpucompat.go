@@ -41,18 +41,27 @@ func (c CPUCompare) Runnable() bool {
 }
 
 // CompareCPU asks the LOCAL hypervisor whether it can satisfy the guest CPU
-// described by cpuXML (a standalone <cpu>…</cpu> element). This is the
-// destination side of a migration CPU preflight.
+// described by cpuXML (a standalone <cpu>…</cpu> element) on the given machine
+// type ("" = libvirt's default). This is the destination side of a migration
+// CPU preflight.
 //
 // It uses virConnectCompareHypervisorCPU, not the legacy virConnectCompareCPU.
 // The legacy call compares against the host's raw capabilities CPU, which omits
-// features QEMU gives guests regardless (spec-ctrl, arch-capabilities, topoext
-// on AMD), so it calls a running host-model guest incompatible with the very
-// host it runs on. The hypervisor call compares against what this host's
-// default emulator (KVM) can actually provide — the hypervisor a migrated guest
-// lands on. Emulator, arch, machine and virttype are left to libvirt's defaults.
-func (c *Client) CompareCPU(cpuXML string) (CPUCompare, error) {
-	return compareCPU(c.virt, cpuXML)
+// features QEMU gives guests regardless (spec-ctrl, arch-capabilities on AMD),
+// so it calls a running host-model guest incompatible with the very host it
+// runs on. The hypervisor call compares against what this host's default
+// emulator (KVM) can actually provide for that machine type — the hypervisor a
+// migrated guest lands on. Emulator, arch and virttype are left to libvirt.
+func (c *Client) CompareCPU(cpuXML, machine string) (CPUCompare, error) {
+	return compareCPU(c.virt, cpuXML, machine)
+}
+
+// HostModelCPUFeatures returns the features this host's hypervisor lists for
+// mode='host-model' in its domain capabilities, for the given machine type
+// ("" = libvirt's default), mapped to whether the host-model PROVIDES each one
+// (a feature it lists only as disabled maps to false). See CreditCPURequirement.
+func (c *Client) HostModelCPUFeatures(machine string) (map[string]bool, error) {
+	return hostModelCPUFeatures(c.virt, machine)
 }
 
 // cpuCompareAPI is the slice of go-libvirt the CPU compare uses. The legacy
@@ -61,13 +70,23 @@ func (c *Client) CompareCPU(cpuXML string) (CPUCompare, error) {
 type cpuCompareAPI interface {
 	ConnectCompareCPU(XML string, Flags golibvirt.ConnectCompareCPUFlags) (int32, error)
 	ConnectCompareHypervisorCPU(Emulator, Arch, Machine, Virttype golibvirt.OptString, XMLCPU string, Flags uint32) (int32, error)
+	ConnectGetDomainCapabilities(Emulatorbin, Arch, Machine, Virttype golibvirt.OptString, Flags golibvirt.ConnectGetDomainCapabilitiesFlags) (string, error)
 }
 
-func compareCPU(api cpuCompareAPI, cpuXML string) (CPUCompare, error) {
+// optString is libvirt's optional string: absent for "", so libvirt applies
+// its default.
+func optString(v string) golibvirt.OptString {
+	if v == "" {
+		return nil
+	}
+	return golibvirt.OptString{v}
+}
+
+func compareCPU(api cpuCompareAPI, cpuXML, machine string) (CPUCompare, error) {
 	if strings.TrimSpace(cpuXML) == "" {
 		return CPUCompareIncompatible, fmt.Errorf("compare cpu: empty cpu xml")
 	}
-	res, err := api.ConnectCompareHypervisorCPU(nil, nil, nil, nil, cpuXML, 0)
+	res, err := api.ConnectCompareHypervisorCPU(nil, nil, optString(machine), nil, cpuXML, 0)
 	if err != nil {
 		return CPUCompareIncompatible, fmt.Errorf("compare cpu: %w", err)
 	}
@@ -75,6 +94,144 @@ func compareCPU(api cpuCompareAPI, cpuXML string) (CPUCompare, error) {
 		return CPUCompareIncompatible, fmt.Errorf("compare cpu: hypervisor returned an error result")
 	}
 	return CPUCompare(res), nil
+}
+
+func hostModelCPUFeatures(api cpuCompareAPI, machine string) (map[string]bool, error) {
+	caps, err := api.ConnectGetDomainCapabilities(nil, nil, optString(machine), nil, 0)
+	if err != nil {
+		return nil, fmt.Errorf("domain capabilities: %w", err)
+	}
+	return hostModelFeaturesFromDomCaps(caps)
+}
+
+// hostModelFeaturesFromDomCaps reads <domainCapabilities><cpu><mode
+// name='host-model'> feature list. A host-model that is absent or unsupported
+// is an error: with nothing to credit, the caller keeps the requirement as is.
+func hostModelFeaturesFromDomCaps(caps string) (map[string]bool, error) {
+	var doc struct {
+		XMLName xml.Name `xml:"domainCapabilities"`
+		CPU     struct {
+			Modes []struct {
+				Name      string `xml:"name,attr"`
+				Supported string `xml:"supported,attr"`
+				Model     string `xml:"model"`
+				Features  []struct {
+					Policy string `xml:"policy,attr"`
+					Name   string `xml:"name,attr"`
+				} `xml:"feature"`
+			} `xml:"mode"`
+		} `xml:"cpu"`
+	}
+	if err := xml.Unmarshal([]byte(caps), &doc); err != nil {
+		return nil, fmt.Errorf("parse domain capabilities: %w", err)
+	}
+	for _, m := range doc.CPU.Modes {
+		if m.Name != CPUModeHostModel {
+			continue
+		}
+		if m.Supported != "yes" || strings.TrimSpace(m.Model) == "" {
+			return nil, fmt.Errorf("domain capabilities: host-model is not supported here")
+		}
+		out := make(map[string]bool, len(m.Features))
+		for _, f := range m.Features {
+			out[f.Name] = f.Policy != "disable" && f.Policy != "forbid"
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("domain capabilities carry no host-model cpu mode")
+}
+
+// CreditCPURequirement returns a running host-model guest's live <cpu> with
+// every <feature policy='require'> removed that the SOURCE's own host-model
+// (hostModel, from HostModelCPUFeatures) does not provide, plus the names it
+// removed. Everything else passes through byte for byte.
+//
+// libvirt expands a running host-model guest with features its hypervisor
+// compare does not credit the host with — on the lab's EPYC-Milan, topoext: the
+// live CPU requires it, domcapabilities' host-model does not list it, and
+// virConnectCompareHypervisorCPU rejects the guest on its own host. A verbatim
+// requirement therefore cannot tell a good destination from a bad one there.
+// Stripping only what the source does not credit keeps every feature the
+// comparison can actually judge.
+//
+// It strips; it never adds. A guest that booted on an older host carries a
+// narrower expansion than this host's host-model, and comparing the host-model
+// wholesale would refuse moving it back to a host like the one it booted on.
+func CreditCPURequirement(cpuXML string, hostModel map[string]bool) (string, []string) {
+	dec := xml.NewDecoder(strings.NewReader(cpuXML))
+	type span struct{ start, end int64 }
+	var cuts []span
+	var dropped []string
+	var prevEnd int64 // offset just past the previous token
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			break
+		}
+		switch se := tok.(type) {
+		case xml.StartElement:
+			depth++
+			if depth == 2 && se.Name.Local == "feature" {
+				var policy, name string
+				for _, a := range se.Attr {
+					switch a.Name.Local {
+					case "policy":
+						policy = a.Value
+					case "name":
+						name = a.Value
+					}
+				}
+				start := prevEnd
+				if serr := dec.Skip(); serr != nil {
+					return cpuXML, nil
+				}
+				depth--
+				if policy == "require" && name != "" && !hostModel[name] {
+					cuts = append(cuts, span{start, dec.InputOffset()})
+					dropped = append(dropped, name)
+				}
+			}
+		case xml.EndElement:
+			depth--
+		}
+		prevEnd = dec.InputOffset()
+	}
+	if len(cuts) == 0 {
+		return cpuXML, nil
+	}
+	var b strings.Builder
+	var at int64
+	for _, c := range cuts {
+		// prevEnd for a feature is just past the whitespace before it, which the
+		// decoder returned as CharData; take that indentation out with it.
+		start := c.start
+		for start > at && strings.ContainsRune(" \t\r\n", rune(cpuXML[start-1])) {
+			start--
+		}
+		b.WriteString(cpuXML[at:start])
+		at = c.end
+	}
+	b.WriteString(cpuXML[at:])
+	return b.String(), dropped
+}
+
+// DomainMachineType returns the machine attribute of a domain XML's
+// <os><type> ("" when it has none) — the machine type a migrated guest keeps.
+func DomainMachineType(domainXML string) string {
+	osEl, ok := extractRootChild(domainXML, "os")
+	if !ok {
+		return ""
+	}
+	var probe struct {
+		Type struct {
+			Machine string `xml:"machine,attr"`
+		} `xml:"type"`
+	}
+	if err := xml.Unmarshal([]byte(osEl), &probe); err != nil {
+		return ""
+	}
+	return probe.Type.Machine
 }
 
 // HostCPUXML returns this host's own CPU as a comparable <cpu> element, read

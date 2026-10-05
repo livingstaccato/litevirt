@@ -630,7 +630,39 @@ type PCIConfig struct {
 	RescanInterval string      `yaml:"rescan_interval"` // "0" = off, "5m" = every 5 min
 	UdevHook       bool        `yaml:"udev_hook"`       // install udev rule for real-time events
 	SRIOV          SRIOVConfig `yaml:"sriov"`
+	// SparePCIeRootPorts is the number of extra, empty pcie-root-port controllers
+	// a NEW q35 domain is defined with, beyond what its disks/NICs/hostdevs need.
+	// q35 hot-plug (disk/NIC/PCI) needs a free PCIe slot at attach time; with none
+	// spare, a live attach fails with libvirt's "No more available PCI slots"
+	// (mapped to FailedPrecondition, not a generic Internal — see
+	// libvirt.IsPCISlotsExhausted). Default 4 (set below); an explicit 0 is
+	// honored as "no spare ports" (the pre-this-feature behavior), not silently
+	// overridden. Applies to q35 only — i440fx has no pcie-root-port controller.
+	//
+	// This is daemon config, NOT part of a VM's persisted spec, so it is NOT
+	// carried by live or cold migration (both transfer the VM's ACTUAL existing
+	// domain XML — live migration streams the live definition, cold migration
+	// DumpXML's the source and defines that verbatim on the target — neither
+	// ever regenerates from spec), and it does not retroactively change an
+	// existing VM: a redefine that patches the inactive XML in place (device
+	// hot-plug on a stopped VM, most reconciler sweeps) never touches the
+	// controller list, so an existing VM's root-port count is untouched. Only a
+	// FULL regenerate (CreateVM; ImportVM; Clone/Template; Promote; the rarer
+	// UpdateVM/reconcile paths that can't use the in-place patch, e.g. a scalar
+	// change alongside an ownership-derived hostdev set) picks up the node's
+	// CURRENT value at that moment. There is no backfill command — an existing
+	// VM converges opportunistically the next time it is fully redefined, or
+	// never, if it never is. See docs/pci-passthrough.md "Hot-plug".
+	SparePCIeRootPorts int `yaml:"spare_pcie_root_ports,omitempty"`
 }
+
+// maxSparePCIeRootPorts caps pci.spare_pcie_root_ports. q35's root complex
+// (pcie.0) has a fixed, small number of device slots shared with the chipset's
+// own auto-added controllers (SATA, LPC/ISA bridge, the primary display, …) —
+// defining more root ports than that leaves no slot for THEM, breaking the
+// domain before any real device is ever attached. This is a generous, not
+// precisely-measured, sanity ceiling: the documented range is 4-8.
+const maxSparePCIeRootPorts = 16
 
 // SRIOVConfig holds SR-IOV settings.
 type SRIOVConfig struct {
@@ -686,6 +718,11 @@ func LoadConfig() (*Config, error) {
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
 
+		// Spare pcie-root-ports a NEW q35 domain is defined with, so hot-plug has
+		// somewhere to land — see PCIConfig.SparePCIeRootPorts. An explicit
+		// `spare_pcie_root_ports: 0` in config overrides this and is honored.
+		PCI: PCIConfig{SparePCIeRootPorts: 4},
+
 		// The enforcement flags that default ON — see EnforcementConfig.
 		// AuditSignature, PartitionPause and DigestV2. An explicit false still wins.
 		Enforcement: EnforcementConfig{AuditSignature: true, PartitionPause: true, DigestV2: true},
@@ -708,6 +745,14 @@ func LoadConfig() (*Config, error) {
 	if cfg.QuorumLossDemoteAfterSec <= 0 || cfg.KeepalivedStopTimeoutSec <= 0 {
 		return nil, fmt.Errorf("invalid VIP self-demote timing: quorum_loss_demote_after(%ds) and keepalived_stop_timeout(%ds) must both be > 0",
 			cfg.QuorumLossDemoteAfterSec, cfg.KeepalivedStopTimeoutSec)
+	}
+
+	// pci.spare_pcie_root_ports: reject negative outright (meaningless), and cap
+	// at maxSparePCIeRootPorts — see its doc for why a huge value is a config
+	// mistake rather than a bigger hot-plug buffer.
+	if cfg.PCI.SparePCIeRootPorts < 0 || cfg.PCI.SparePCIeRootPorts > maxSparePCIeRootPorts {
+		return nil, fmt.Errorf("invalid pci.spare_pcie_root_ports %d: must be between 0 and %d",
+			cfg.PCI.SparePCIeRootPorts, maxSparePCIeRootPorts)
 	}
 
 	// VIP no-quorum reclaim policy: only "safe" is supported today (empty → safe). A weaker

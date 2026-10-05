@@ -805,6 +805,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSRIOVMetrics(metrics.NewSRIOVMetrics())
 	svc.SetSRIOVPolicy(d.cfg.PCI.SRIOV.Managed, d.cfg.PCI.SRIOV.MaxVFsPerPF, d.cfg.PCI.SRIOV.ManagedPFs)
 	svc.ValidateSRIOVPolicy()
+	// Spare pcie-root-ports on every newly-defined q35 domain, so hot-plug has a
+	// free slot to attach into (see daemon.PCIConfig.SparePCIeRootPorts). Both the
+	// server (create/import/clone/promote/update) and the reconciler (sweep
+	// redefines) need it — a redefine that goes through either must agree on the
+	// node's current value.
+	svc.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
+	reconciler.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
 	if d.cfg.PCI.SRIOV.Managed {
 		go svc.RunSRIOVValidation(ctx, d.parsePCIRescanInterval())
 	}

@@ -1039,6 +1039,7 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 	}, isoPath); err != nil {
 		return nil, status.Errorf(codes.Internal, "generate cloud-init ISO: %v", err)
 	}
+	s.migrationISOs.add(req.VmName, isoPath)
 	slog.Info("cloud-init ISO generated for migration", "vm", req.VmName, "path", isoPath)
 	return &emptypb.Empty{}, nil
 }
@@ -1406,7 +1407,8 @@ func (s *Server) handOffColdFirmwareVM(ctx context.Context, vm *corrosion.VMReco
 // host pre-created as a migration target, after the migration failed. The VM
 // was never defined here (PersistDest only persists on success), so the files
 // are orphaned; leaving them leaks space and shadows a later retry. Best-effort
-// per file — a missing file is not an error.
+// per file — a missing file is not an error. Only files this host recorded
+// creating for the VM are removed, and none while the VM lives here.
 func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	if err := safename.ValidateVMName(req.VmName); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -1470,11 +1472,20 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 		}
 		s.migrationStubs.forget(p)
 	}
+	// The cloud-init ISO by the same rule as the stubs: never one of a VM that
+	// lives here — the guest boots from it — and only one EnsureCloudInit
+	// generated here for the VM. One it found already there, or made before a
+	// restart forgot the record, is left in place.
 	if req.RemoveCloudInit {
 		if iso, perr := lv.SafeCloudInitISOPath(s.dataDir, req.VmName); perr != nil {
 			slog.Warn("cleanup migration artifacts: invalid vm name for cloud-init path", "vm", req.VmName, "error", perr)
+		} else if vmLivesHere || !s.migrationISOs.owns(req.VmName, iso) {
+			slog.Warn("cleanup migration artifacts: leaving a cloud-init ISO this host did not create for the migration",
+				"vm", req.VmName, "path", iso, "vm_lives_here", vmLivesHere)
 		} else if err := os.Remove(iso); err != nil && !os.IsNotExist(err) {
 			slog.Warn("cleanup migration artifacts: remove cloud-init iso", "vm", req.VmName, "path", iso, "error", err)
+		} else {
+			s.migrationISOs.forget(iso)
 		}
 	}
 	// Undefine a domain this host pre-defined for a failed firmware migration,

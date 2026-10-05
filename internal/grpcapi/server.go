@@ -563,6 +563,13 @@ type Server struct {
 	// a failed attempt (migrate_stubs.go). Zero value ready.
 	migrationStubs migrationStubLedger
 
+	// migrationISOs is the same record for the cloud-init ISOs EnsureCloudInit
+	// generated here as a migration target: the only ISO a cleanup after a
+	// failed attempt removes. One it found already there, or made before a
+	// restart, is left — a leaked ISO costs a few KiB, a deleted live one
+	// costs the guest its seed on the next boot. Zero value ready.
+	migrationISOs migrationStubLedger
+
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value

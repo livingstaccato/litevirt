@@ -2427,6 +2427,17 @@ message ReceiveMigrationDiskRequest {
     // (its allocated blocks), which the target's free-space check reserves.
     // size_bytes is still what the target bounds by the disk's record.
     int64  allocated_bytes = 7;
+    // header — the sender is the VM's owner and has confirmed its domain is
+    // shut off. The target's copy of the VM row may still say running (a drain
+    // stops a running VM moments before the copy, and the stopped write is
+    // still replicating), so the target accepts this from the host its row
+    // names as the owner, and only from it, in place of a stopped row.
+    bool   owner_domain_shut_off = 8;
+    // header — check only: the target runs every check it runs before writing
+    // (the path, the record, a file already there, free space) and then ends
+    // the call, writing nothing. The VM may still be running, so its state is
+    // not checked. A drain runs it before it shuts a running VM down.
+    bool   check_only = 9;
 }
 
 message ReceiveMigrationDiskResponse {

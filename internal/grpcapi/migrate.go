@@ -155,17 +155,29 @@ func (s *Server) MigrateVM(req *pb.MigrateVMRequest, stream grpc.ServerStreaming
 			}
 		}
 	}
-	return s.migrateOwnedVM(ctx, req, vm, send, unlock, &adopted)
+	return s.migrateOwnedVM(ctx, req, vm, send, unlock, &adopted, ownedMigrateOpts{})
+}
+
+// ownedMigrateOpts is what a caller other than MigrateVM adds to
+// migrateOwnedVM.
+type ownedMigrateOpts struct {
+	// beforeMove runs once every check of the migration has passed and the
+	// destination's capacity lease is held, before anything is done on the
+	// target or to the VM. An error from it ends the migration with nothing
+	// done. Host drain uses it to cold-move a RUNNING VM: it runs the cold
+	// path's remaining checks and only then shuts the VM down
+	// (drainRunningVMCold), under the one lease this migration holds.
+	beforeMove func(ctx context.Context) error
 }
 
 // migrateOwnedVM is MigrateVM on the host that owns the VM, called with the
 // VM's lock held and the caller's permission already checked. unlock and
 // adopted let a live migration that outlives the request carry the lock to
 // its adopter (adoptAbandonedMigration): it sets *adopted and the caller must
-// then not release the lock itself. A stopped VM's cold move never outlives
-// the request, so host drain, which holds the VM's lock for the whole step,
-// calls this directly for one (drainStoppedVM).
-func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool) error {
+// then not release the lock itself. Host drain, which holds the VM's lock for
+// its whole step, calls this directly for its cold moves (drainColdMove), with
+// the same lock discipline.
+func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, vm *corrosion.VMRecord, send func(pb.MigratePhase, float32, float32) error, unlock func(), adopted *bool, opts ownedMigrateOpts) error {
 	// Secure Boot / vTPM firmware-state travel (G1). A firmware VM's NVRAM + swtpm
 	// are host-local and bind BitLocker, so they need a CONSISTENT capture:
 	//   - LIVE is refused: libvirt's native swtpm/NVRAM carry is not yet validated
@@ -445,6 +457,12 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		return err
 	}
 	defer migLease.release(ctx)
+
+	if opts.beforeMove != nil {
+		if err := opts.beforeMove(ctx); err != nil {
+			return err
+		}
+	}
 
 	// From here until libvirt is handed the guest, every exit undoes what this
 	// attempt did: the row goes back to the state the guest is actually in, and
@@ -1318,6 +1336,105 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 	return fwTargetDefined, nil
 }
 
+// coldMoveDisks reads the VM's disk records and applies the cold path's
+// refusals that need no domain: a Secure-Boot/vTPM VM with a host-local disk,
+// a VM holding a PCI passthrough device, and a VM with no domain defined here.
+func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord, fwVM bool) ([]corrosion.DiskRecord, error) {
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "query disks for %q: %v", vm.Name, err)
+	}
+	if fwVM {
+		for _, d := range disks {
+			if isHostLocalDiskDriver(d.StorageType) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"Secure Boot / vTPM VM %q has a host-local disk (%s) and can't be migrated while stopped — move it to shared storage first (host-local firmware-VM migration is a follow-up)", vm.Name, d.StorageType)
+			}
+		}
+	}
+	// PCI/hostdev passthrough isn't carried by this path — the source XML embeds
+	// source host PCI addresses that won't be valid (or assigned) on the target.
+	// Refuse for now rather than define a domain with stale hostdevs (G1).
+	if assigned, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); len(assigned) > 0 {
+		for _, d := range assigned {
+			if d.VMName == vm.Name {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"VM %q has PCI passthrough device %s — migrating a stopped VM with hostdevs is not supported yet", vm.Name, d.Address)
+			}
+		}
+	}
+	// The domain is what the target is defined from, and its definition is
+	// what names each disk's format. A VM recorded here with no domain was
+	// most likely moved here by an older drain, which moved only its record:
+	// its disk files never left the host it came from.
+	if !s.virt.DomainExists(vm.Name) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q has no domain defined on %s, so there is nothing here to migrate cold. "+
+				"A drain by an older build moved only its record here; its host-local disks, if any, are still on the host it came from. "+
+				"See \"A VM with no domain\" in docs/migration-failover.md", vm.Name, s.hostName)
+	}
+	return disks, nil
+}
+
+// coldMovePreflight runs, for a VM that is still RUNNING, every check of its
+// cold move that needs neither the domain shut off nor anything written: the
+// refusals of coldMoveDisks, a disk missing from the domain definition, each
+// host-local disk's source-side checks (coldDiskSourceCheck: readable, and an
+// overlay flattenable with room for the flatten) and the target's checks of
+// each copy (ReceiveMigrationDisk check_only: path, record, a file already
+// there, free space). A drain runs it before it shuts the VM down, so a VM the
+// cold move would refuse is left running. vm is the VM's record; its State is
+// not read.
+func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, targetHost string) error {
+	if s.virt == nil {
+		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
+	}
+	fwSpec := parseFirmwareSpec(vm.Spec)
+	disks, err := s.coldMoveDisks(ctx, vm, fwSpec.SecureBoot || fwSpec.Tpm)
+	if err != nil {
+		return err
+	}
+	domXML, err := s.virt.DumpXML(vm.Name)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "cannot dump domain XML for %q: %v", vm.Name, err)
+	}
+	formats, err := domainDiskFormats(domXML)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "read the disks of VM %q from its domain definition: %v", vm.Name, err)
+	}
+	var client pb.LiteVirtClient
+	for _, d := range disks {
+		if !copiedByStorageMigration(d) {
+			continue
+		}
+		if formats[d.Path] == "" {
+			return status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q (%s) is not in its domain definition on %s, so its format is unknown; "+
+					"repair the VM's disks before migrating it", d.DiskName, vm.Name, d.Path, s.hostName)
+		}
+		flatten, err := s.coldDiskSourceCheck(d, formats[d.Path])
+		if err != nil {
+			return err
+		}
+		if client == nil {
+			c, closeConn, derr := s.dialPeer(ctx, targetHost)
+			if derr != nil {
+				return status.Errorf(codes.Unavailable, "cannot reach %s to check the disks of VM %q: %v", targetHost, vm.Name, derr)
+			}
+			defer closeConn()
+			client = c
+		}
+		if err := s.checkColdDiskOnTarget(ctx, client, vm.Name, d, flatten); err != nil {
+			if status.Code(err) == codes.Unimplemented {
+				return targetTooOldForColdMigration(targetHost, vm.Name)
+			}
+			return status.Errorf(status.Code(err), "%s would not take disk %q of VM %q: %s",
+				targetHost, d.DiskName, vm.Name, status.Convert(err).Message())
+		}
+	}
+	return nil
+}
+
 // coldMigrateStoppedVM moves a STOPPED VM to targetHost WITHOUT libvirt runtime
 // migration — a Secure-Boot/vTPM VM, which is always migrated this way, or any
 // other VM migrated with --cold while stopped. In order:
@@ -1344,28 +1461,9 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	}
 	// Must read disks successfully — proceeding on an error would skip the
 	// host-local refusal AND the disk-ownership updates, diverging VM/disk records.
-	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	disks, err := s.coldMoveDisks(ctx, vm, fwVM)
 	if err != nil {
-		return status.Errorf(codes.Internal, "query disks for %q: %v", vm.Name, err)
-	}
-	if fwVM {
-		for _, d := range disks {
-			if isHostLocalDiskDriver(d.StorageType) {
-				return status.Errorf(codes.FailedPrecondition,
-					"Secure Boot / vTPM VM %q has a host-local disk (%s) and can't be migrated while stopped — move it to shared storage first (host-local firmware-VM migration is a follow-up)", vm.Name, d.StorageType)
-			}
-		}
-	}
-	// PCI/hostdev passthrough isn't carried by this path — the source XML embeds
-	// source host PCI addresses that won't be valid (or assigned) on the target.
-	// Refuse for now rather than define a domain with stale hostdevs (G1).
-	if assigned, _ := corrosion.ListPCIDevices(ctx, s.db, s.hostName, ""); len(assigned) > 0 {
-		for _, d := range assigned {
-			if d.VMName == vm.Name {
-				return status.Errorf(codes.FailedPrecondition,
-					"VM %q has PCI passthrough device %s — migrating a stopped VM with hostdevs is not supported yet", vm.Name, d.Address)
-			}
-		}
+		return err
 	}
 	// The row says stopped; the move goes ahead only if libvirt agrees. An
 	// active guest — paused counts, which DomainState reports as stopped —

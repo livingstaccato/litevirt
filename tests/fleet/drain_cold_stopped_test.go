@@ -253,3 +253,28 @@ func TestFleet_DrainRefusesAStoppedFirmwareVMOnLocalStorage(t *testing.T) {
 		t.Errorf("the refused move left a disk copy on %s (stat: %v)", sc.dst.Name, err)
 	}
 }
+
+// A VM recorded here with no domain — what a drain by an older build left on
+// the host it moved a stopped VM to — is refused with a message that says so
+// and points at the recovery, not a bare libvirt lookup failure.
+//
+// Mutation: drop the no-domain refusal — the frame carries "cannot confirm
+// the domain ... is shut off" and goes red.
+func TestFleet_DrainExplainsAVMWithNoDomain(t *testing.T) {
+	sc := newColdStoppedScenario(t)
+	if err := sc.src.Virt.UndefineDomain("os1", false); err != nil {
+		t.Fatalf("undefine os1: %v", err)
+	}
+
+	progress, err := sc.drain(t)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete: 1 VM(s) remain") {
+		t.Fatalf("drain = %v, want drain incomplete", err)
+	}
+	if p := progress["os1"]; p == nil || p.Status != "failed" ||
+		!strings.Contains(p.Error, `VM "os1" has no domain defined on `+sc.src.Name) || !strings.Contains(p.Error, "A VM with no domain") {
+		t.Fatalf("drain progress for os1 = %+v, want failed: has no domain defined, with the docs pointer", p)
+	}
+	if vm := sc.vm(t); vm.HostName != sc.src.Name {
+		t.Errorf("os1 row names %s, want it left on %s", vm.HostName, sc.src.Name)
+	}
+}

@@ -109,6 +109,10 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// IgnoreShutdown makes ShutdownDomain a guest that ignores the ACPI
+	// request when it returns true: the call succeeds, the domain keeps
+	// running, and WaitForShutdown times out.
+	IgnoreShutdown func(name string) bool
 	// FailSuspendDomain / FailResumeDomain inject a pause/resume failure
 	// (partition pause, docs/design/partition-pause.md §3.4).
 	FailSuspendDomain func(name string) error
@@ -498,8 +502,11 @@ func (f *Fake) ShutdownDomain(name string) error {
 	if _, ok := f.domains[name]; !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
-	f.domains[name] = StateShutdown
 	f.record("shutdown", name, "")
+	if f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
+		return nil
+	}
+	f.domains[name] = StateShutdown
 	return nil
 }
 
@@ -816,11 +823,12 @@ func (f *Fake) SetInactiveXML(name, xml string) {
 }
 
 func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
-	// The fake transitions synchronously; the wait always succeeds.
+	// The fake transitions synchronously; the wait succeeds unless the guest
+	// ignored the shutdown (IgnoreShutdown) and still runs.
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if s, ok := f.domains[name]; ok && s == StateShutdown {
-		return true
+	if s, ok := f.domains[name]; ok && s == StateRunning && f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
+		return false
 	}
 	return true
 }

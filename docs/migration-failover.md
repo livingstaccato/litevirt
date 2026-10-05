@@ -202,19 +202,52 @@ lv host drain host-a
 lv host drain host-a --parallel 4    # Migrate 4 VMs at a time
 ```
 
-Drain live-migrates running VMs whose disks are all on shared storage, and
-shuts down and reassigns the other running VMs. A stopped VM moves the way
-`lv migrate <vm> <target> --cold` moves it (see [Cold migration](#cold-migration)):
-its host-local disks are copied to the target, its domain is defined there,
-and it stays stopped. It is refused for the same reasons, and a Secure Boot /
-vTPM VM drains only while stopped and on shared storage.
+Drain live-migrates a running VM whose disks are all on shared storage. Every
+other VM moves the way `lv migrate <vm> <target> --cold` moves a stopped VM
+(see [Cold migration](#cold-migration)): its host-local disks (`local` and
+`dir` storage) are copied to the target, its domain is defined there, and the
+VM and its disk records move in one transaction. It is refused for the same
+reasons. A Secure Boot / vTPM VM drains only while stopped and on shared
+storage.
 
-A stopped VM that drain cannot move stays on the host, stopped, with its
-disks; a failed attempt removes what it put on the target. It is never moved
-without its disks. Drain reports each VM it did not move with the reason,
-finishes the other VMs, and then fails with `drain incomplete: N VM(s) remain
-on host ...`. The host stays `draining`. Fix what the message names (or
-migrate the VM yourself) and run the drain again. When done:
+- A **stopped** VM stays stopped on the target.
+- A **running** VM with a host-local disk is checked first, while it still
+  runs: everything the cold move checks, including the target's capacity, a
+  disk whose backing image cannot be flattened, free space on both hosts, and
+  a file already at a disk's path on the target. Only then is it shut down.
+  Drain waits for its domain to shut off, up to the VM's stop timeout
+  (`stop_timeout_sec`, 30 seconds by default), and does not force it off. It
+  is then moved with its disks and started on the target.
+- A running VM on shared storage whose live migration fails is moved the same
+  way.
+
+A VM that drain cannot move stays on the host with its disks; a failed attempt
+removes what it put on the target. It is never moved without its disks:
+
+- refused before the shutdown, it keeps running;
+- a move that fails after the shutdown starts it again on the host. If that
+  start fails too, drain reports it as an error naming the VM, which is then
+  stopped on the host; start it with `lv start <vm>`.
+
+Drain reports each VM it did not move with the reason, finishes the other VMs,
+and then fails with `drain incomplete: N VM(s) remain on host ...`. The host
+stays `draining`. Fix what the message names (or migrate the VM yourself) and
+run the drain again. A VM that moved but did not start on the target is
+reported too; it is stopped there.
+
+### A VM with no domain
+
+A drain by a build from before this behaviour moved a stopped VM by its record
+alone: the record names the new host, but the domain was never defined there
+and its host-local disk files stayed on the host it came from. Such a VM
+cannot be drained or migrated cold again; both refuse with `VM "<vm>" has no
+domain defined on <host>`. Its host-local disk files are still on the host it
+came from, at the paths `lv inspect <vm>` lists. To recover it, copy them to
+the same paths on the host its record names and recreate the VM there over
+them, or `lv rm <vm> --keep-disks` to remove the record without touching any
+disk file. A VM with only shared disks lost nothing but its domain.
+
+When done:
 
 ```bash
 # Perform maintenance...

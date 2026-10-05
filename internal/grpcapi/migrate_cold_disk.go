@@ -126,30 +126,12 @@ func (s *Server) copyColdDisksToTarget(ctx context.Context, targetHost, vmName s
 // what libvirt's storage copy of a running VM leaves there too.
 func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, vmName string, d corrosion.DiskRecord, format string) error {
 	src := s.hostDiskFile(d.Path)
-	fi, err := os.Lstat(src)
+	info, err := s.coldDiskSourceCheck(d, format)
 	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "disk file %s: %v", d.Path, err)
-	}
-	if !fi.Mode().IsRegular() {
-		return status.Errorf(codes.FailedPrecondition, "disk file %s is not a regular file", d.Path)
+		return err
 	}
 	readPath := src
-	if format != "qcow2" {
-		// Copied as it is, whatever its bytes look like (see copyColdDisksToTarget).
-	} else if info, ierr := qcow2.Info(src); ierr != nil {
-		return status.Errorf(codes.FailedPrecondition, "disk %s is qcow2 in its domain definition, but its image cannot be read: %v", d.Path, ierr)
-	} else if info.BackingFile != "" {
-		// The flatten writes a copy of the chain's allocated clusters beside
-		// the disk (Convert's .tmp, renamed in place): refuse rather than fill
-		// the filesystem the VM's neighbours' thin-provisioned disks live on.
-		alloc, aerr := chainAllocated(src)
-		if aerr != nil {
-			return status.Errorf(codes.Internal, "measure disk %s and its backing chain: %v", d.Path, aerr)
-		}
-		if err := s.requireDiskSpace(filepath.Dir(src), filepath.Dir(d.Path),
-			"flattening disk "+d.Path+" for the copy", coldFlattenEstimate(alloc, info.VirtualSize)); err != nil {
-			return err
-		}
+	if info != nil {
 		flat := filepath.Join(filepath.Dir(src), "."+filepath.Base(src)+coldMigScratch+uuid.NewString())
 		defer os.Remove(flat)
 		defer os.Remove(flat + ".tmp")
@@ -177,8 +159,11 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	if err != nil {
 		return err
 	}
+	// The caller (coldMigrateStoppedVM) confirmed the domain shut off before
+	// the first disk, and holds the VM's lock until the handoff.
 	if err := up.Send(&pb.ReceiveMigrationDiskRequest{
 		VmName: vmName, Path: d.Path, SizeBytes: size, AllocatedBytes: allocated,
+		OwnerDomainShutOff: true,
 	}); err != nil {
 		return coldDiskSendErr(up, err)
 	}
@@ -221,6 +206,113 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	return nil
 }
 
+// coldDiskSourceCheck is everything this host checks about one disk before
+// copying it: the file is a regular file, a qcow2 disk's image can be read,
+// and an overlay's backing chain can be flattened — every image in it is a
+// readable qcow2, and the flatten fits in the disk's directory with headroom.
+// It returns the overlay's image info when the disk must be flattened for the
+// copy, and nil when it is copied as it is. It writes nothing, so a drain runs
+// it while the VM is still running (coldMovePreflight).
+func (s *Server) coldDiskSourceCheck(d corrosion.DiskRecord, format string) (*qcow2.ImageInfo, error) {
+	src := s.hostDiskFile(d.Path)
+	fi, err := os.Lstat(src)
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "disk file %s: %v", d.Path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, status.Errorf(codes.FailedPrecondition, "disk file %s is not a regular file", d.Path)
+	}
+	if format != "qcow2" {
+		// Copied as it is, whatever its bytes look like (see copyColdDisksToTarget).
+		return nil, nil
+	}
+	info, ierr := qcow2.Info(src)
+	if ierr != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "disk %s is qcow2 in its domain definition, but its image cannot be read: %v", d.Path, ierr)
+	}
+	if info.BackingFile == "" {
+		return nil, nil
+	}
+	// The flatten reads the chain with this package's qcow2 reader, which reads
+	// only qcow2 images: a raw backing (a promoted replica's overlay) cannot be
+	// flattened, and saying so here beats failing part-way through the copy.
+	if err := flattenableChain(src); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"disk %s cannot be flattened for the copy: %v; move the VM to shared storage, or rebase the disk onto a qcow2 image or none, then migrate again", d.Path, err)
+	}
+	// The flatten writes a copy of the chain's allocated clusters beside
+	// the disk (Convert's .tmp, renamed in place): refuse rather than fill
+	// the filesystem the VM's neighbours' thin-provisioned disks live on.
+	alloc, aerr := chainAllocated(src)
+	if aerr != nil {
+		return nil, status.Errorf(codes.Internal, "measure disk %s and its backing chain: %v", d.Path, aerr)
+	}
+	if err := s.requireDiskSpace(filepath.Dir(src), filepath.Dir(d.Path),
+		"flattening disk "+d.Path+" for the copy", coldFlattenEstimate(alloc, info.VirtualSize)); err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// flattenableChain reports why the backing chain under the qcow2 image at
+// path cannot be read by qcow2.Convert, or nil when every image in it is a
+// readable qcow2 file. Relative backing names resolve as chainAllocated does.
+func flattenableChain(path string) error {
+	for i := 0; i < 64; i++ {
+		info, err := qcow2.Info(path)
+		if err != nil {
+			return fmt.Errorf("its backing image %s is not a qcow2 image (%v)", path, err)
+		}
+		if info.BackingFile == "" {
+			return nil
+		}
+		next := info.BackingFile
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(path), next)
+		}
+		path = next
+	}
+	return fmt.Errorf("its backing chain is longer than 64 images")
+}
+
+// checkColdDiskOnTarget asks targetHost whether it would take disk d of the
+// VM (ReceiveMigrationDisk with check_only): the path, the record, a file
+// already there and its free space, with nothing written. It sends what a copy
+// would send: the file's size and allocation, or, for an overlay flattened for
+// the copy (flatten non-nil), the flatten's estimate of the data it writes.
+func (s *Server) checkColdDiskOnTarget(ctx context.Context, client pb.LiteVirtClient, vmName string, d corrosion.DiskRecord, flatten *qcow2.ImageInfo) error {
+	src := s.hostDiskFile(d.Path)
+	var size, allocated int64
+	if flatten != nil {
+		alloc, err := chainAllocated(src)
+		if err != nil {
+			return status.Errorf(codes.Internal, "measure disk %s and its backing chain: %v", d.Path, err)
+		}
+		size = int64(coldFlattenEstimate(alloc, flatten.VirtualSize))
+		allocated = size
+	} else {
+		st, err := os.Stat(src)
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition, "disk file %s: %v", d.Path, err)
+		}
+		size, allocated = st.Size(), st.Size()
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Blocks*512 < size {
+			allocated = sys.Blocks * 512
+		}
+	}
+	up, err := client.ReceiveMigrationDisk(ctx)
+	if err != nil {
+		return err
+	}
+	if err := up.Send(&pb.ReceiveMigrationDiskRequest{
+		VmName: vmName, Path: d.Path, SizeBytes: size, AllocatedBytes: allocated, CheckOnly: true,
+	}); err != nil {
+		return coldDiskSendErr(up, err)
+	}
+	_, err = up.CloseAndRecv()
+	return err
+}
+
 // coldDiskSendErr is the error to return for a failed Send: io.EOF means the
 // target ended the stream, and its own error says why.
 func coldDiskSendErr(up grpc.ClientStreamingClient[pb.ReceiveMigrationDiskRequest, pb.ReceiveMigrationDiskResponse], err error) error {
@@ -237,8 +329,10 @@ func coldDiskSendErr(up grpc.ClientStreamingClient[pb.ReceiveMigrationDiskReques
 //
 // Peer-only, and vm.migrate on the VM. It writes only a disk of a VM that does
 // not live here — its row names another host and no domain of that name is
-// defined here — that is recorded stopped, at that disk's recorded path, inside
-// a disk-artifact root. The path must hold no file, or one this host created
+// defined here — that is recorded stopped, or whose owner says in the header
+// that its domain is shut off, at that disk's recorded path, inside a
+// disk-artifact root. A check_only header runs these checks and free space,
+// and writes nothing. The path must hold no file, or one this host created
 // for the same VM's migration (EnsureDisks' rule: a file found here may be the
 // VM's disk from an earlier stay). The data goes to a scratch file first and
 // takes the path only once the digest matches, and the file is recorded as this
@@ -267,9 +361,20 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 		return status.Errorf(codes.FailedPrecondition,
 			"VM %q lives on %s; its disks are not overwritten by a migration to it", vm.Name, s.hostName)
 	}
-	if vm.State != "stopped" {
+	// The copy reads a disk no guest may be writing. A stopped row says so;
+	// so does the owner, which checked its own domain, and whose word is the
+	// fresher: this host's copy of the row lags the owner's stopped write (a
+	// drain stops a running VM moments before its copy). Only the host the row
+	// names as the owner can vouch for it — ownership does not change until the
+	// copy is done — and a check-only call writes nothing, so it needs neither.
+	ownerShutOff := hdr.OwnerDomainShutOff && callerMTLSCommonName(ctx) == vm.HostName
+	if !hdr.CheckOnly && vm.State != "stopped" && !ownerShutOff {
 		return status.Errorf(codes.FailedPrecondition,
 			"VM %q is %s; only a stopped VM's disks are copied this way", vm.Name, vm.State)
+	}
+	if !hdr.CheckOnly && vm.State != "stopped" {
+		slog.Info("receive migration disk: this host's row lags; the owner says the domain is shut off",
+			"vm", vm.Name, "row_state", vm.State, "owner", vm.HostName, "path", hdr.Path)
 	}
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
@@ -321,6 +426,10 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	}
 	if err := s.requireDiskSpace(dir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, uint64(need)); err != nil {
 		return err
+	}
+	if hdr.CheckOnly {
+		// Every check a copy would meet before writing has passed.
+		return stream.SendAndClose(&pb.ReceiveMigrationDiskResponse{})
 	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dst)+coldRecvScratch+"*")
 	if err != nil {

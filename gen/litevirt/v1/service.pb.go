@@ -23806,8 +23806,19 @@ type ReceiveMigrationDiskRequest struct {
 	// (its allocated blocks), which the target's free-space check reserves.
 	// size_bytes is still what the target bounds by the disk's record.
 	AllocatedBytes int64 `protobuf:"varint,7,opt,name=allocated_bytes,json=allocatedBytes,proto3" json:"allocated_bytes,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// header — the sender is the VM's owner and has confirmed its domain is
+	// shut off. The target's copy of the VM row may still say running (a drain
+	// stops a running VM moments before the copy, and the stopped write is
+	// still replicating), so the target accepts this from the host its row
+	// names as the owner, and only from it, in place of a stopped row.
+	OwnerDomainShutOff bool `protobuf:"varint,8,opt,name=owner_domain_shut_off,json=ownerDomainShutOff,proto3" json:"owner_domain_shut_off,omitempty"`
+	// header — check only: the target runs every check it runs before writing
+	// (the path, the record, a file already there, free space) and then ends
+	// the call, writing nothing. The VM may still be running, so its state is
+	// not checked. A drain runs it before it shuts a running VM down.
+	CheckOnly     bool `protobuf:"varint,9,opt,name=check_only,json=checkOnly,proto3" json:"check_only,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ReceiveMigrationDiskRequest) Reset() {
@@ -23887,6 +23898,20 @@ func (x *ReceiveMigrationDiskRequest) GetAllocatedBytes() int64 {
 		return x.AllocatedBytes
 	}
 	return 0
+}
+
+func (x *ReceiveMigrationDiskRequest) GetOwnerDomainShutOff() bool {
+	if x != nil {
+		return x.OwnerDomainShutOff
+	}
+	return false
+}
+
+func (x *ReceiveMigrationDiskRequest) GetCheckOnly() bool {
+	if x != nil {
+		return x.CheckOnly
+	}
+	return false
 }
 
 type ReceiveMigrationDiskResponse struct {
@@ -33775,7 +33800,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"attempt_id\x18\x03 \x01(\tR\tattemptId\"9\n" +
 	"\x1dRollbackFirmwareStateResponse\x12\x18\n" +
-	"\aremoved\x18\x01 \x01(\bR\aremoved\"\xd6\x01\n" +
+	"\aremoved\x18\x01 \x01(\bR\aremoved\"\xa8\x02\n" +
 	"\x1bReceiveMigrationDiskRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +
@@ -33784,7 +33809,10 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x06offset\x18\x04 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04data\x18\x05 \x01(\fR\x04data\x12\x16\n" +
 	"\x06sha256\x18\x06 \x01(\tR\x06sha256\x12'\n" +
-	"\x0fallocated_bytes\x18\a \x01(\x03R\x0eallocatedBytes\"=\n" +
+	"\x0fallocated_bytes\x18\a \x01(\x03R\x0eallocatedBytes\x121\n" +
+	"\x15owner_domain_shut_off\x18\b \x01(\bR\x12ownerDomainShutOff\x12\x1d\n" +
+	"\n" +
+	"check_only\x18\t \x01(\bR\tcheckOnly\"=\n" +
 	"\x1cReceiveMigrationDiskResponse\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x01 \x01(\x03R\tsizeBytes\"7\n" +

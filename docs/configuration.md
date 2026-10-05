@@ -135,6 +135,13 @@ pci:
   # one spare libvirt adds on its own. See docs/pci-passthrough.md "Spare PCIe
   # root ports" for what existing VMs get (no backfill) and why this is a
   # non-issue for live or cold migration.
+  #
+  # The value counts spares only: they are added on top of the root ports the
+  # VM's own devices use (five for one disk and one NIC), so the maximum, 16,
+  # can mean more than 20 root ports in total. Guest firmware reserves I/O and
+  # memory windows for every root port and may fail to enumerate devices
+  # beyond roughly 15 root ports in total; keep the value small on VMs with
+  # many disks, NICs or PCI devices.
   spare_pcie_root_ports: 4
 
   # SR-IOV configuration.

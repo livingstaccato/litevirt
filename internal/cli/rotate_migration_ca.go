@@ -53,7 +53,7 @@ func RotateMigrationCA(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 	if !prior.inProgress() {
 		// A fresh start only: a resumed rotation already changed hosts, so
 		// they legitimately disagree with this check.
-		if err := preflightRotation(ctx, pkiDir, hosts, status, opts.Force); err != nil {
+		if err := preflightRotation(ctx, pkiDir, hosts, status, opts, now()); err != nil {
 			return err
 		}
 	}
@@ -117,15 +117,36 @@ func RotateMigrationCA(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 // preflightRotation refuses, before anything is minted or pushed, a rotation
 // that could not finish: one whose status call fails outright (for
 // Unimplemented, the daemon the CLI talks to predates MigrationTLSStatus), a
-// host without a complete, valid, installable set, or a host that does not
-// trust this machine's current migration CA — which, on every host, means this
-// machine's CA is not the cluster's. A host that cannot answer refuses too,
-// unless force says to leave it behind, as the push path then does.
+// host without migration credentials, or a host that does not trust this
+// machine's current migration CA — which, on every host, means this machine's
+// CA is not the cluster's. A host that cannot answer refuses too, unless force
+// says to leave it behind, as the push path then does.
+//
+// The overlapping rotation also needs every host's current set to be complete,
+// valid and installable, because hosts keep using it through trust-both. That
+// cannot hold once the current CA has expired, so an expired CA refuses the
+// overlap outright and names --no-overlap.
+//
+// --no-overlap does not need the current set to work: cutover replaces all
+// three files on every host, and its gate then requires a valid, installable
+// set from the new CA. So under --no-overlap an incomplete or invalid set
+// passes — which is what lets an expired CA be rotated at all — and an install
+// refusal passes only when it is the daemon repeating that validation failure.
+// One with another cause (QEMU's user cannot be resolved, /etc/pki/qemu holds
+// someone else's files) survives the new set, so it still refuses. The
+// fingerprint check holds in both modes: a host whose ca.crt is missing cannot
+// show that it trusts this machine's CA, and is refused with the rest.
 func preflightRotation(ctx context.Context, pkiDir string, hosts []MigrationTLSHost,
-	status MigrationTLSStatusFunc, force bool) error {
-	curFP, err := pki.CAFileFingerprint(filepath.Join(pkiDir, pki.MigrationCACertName))
+	status MigrationTLSStatusFunc, opts RotateMigrationCAOptions, now time.Time) error {
+	cur, err := pki.CAFileCertificate(filepath.Join(pkiDir, pki.MigrationCACertName))
 	if err != nil {
 		return fmt.Errorf("read this machine's migration CA: %w", err)
+	}
+	curFP := pki.CertFingerprint(cur)
+	if !opts.NoOverlap && !cur.NotAfter.After(now) {
+		return fmt.Errorf("not starting a migration-CA rotation; nothing was changed: the current "+
+			"migration CA %s expired on %s, so hosts cannot keep trusting it through an overlap. "+
+			"Run `lv host rotate-migration-ca --no-overlap`", curFP, cur.NotAfter.UTC().Format("2006-01-02"))
 	}
 	rows, err := status(ctx)
 	if grpcstatus.Code(err) == codes.Unimplemented {
@@ -142,9 +163,10 @@ func preflightRotation(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 	var problems, wrongCA []string
 	for _, h := range hosts {
 		name, row := h.Name(), byHost[h.Name()]
+		ve, ie := row.GetValidationError(), row.GetInstallError()
 		switch {
 		case row == nil || row.GetError() != "":
-			if force {
+			if opts.Force {
 				continue
 			}
 			why := "did not answer the status check"
@@ -157,12 +179,17 @@ func preflightRotation(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 				"`lv host install-migration-tls` first", name))
 		case !slices.ContainsFunc(row.GetTrustedCas(), func(ca *pb.MigrationTLSCA) bool { return ca.GetFingerprint() == curFP }):
 			wrongCA = append(wrongCA, name)
-		case row.GetValidationError() != "":
+		case opts.NoOverlap:
+			if ie != "" && (ve == "" || !strings.Contains(ie, ve)) {
+				problems = append(problems, fmt.Sprintf("%s: its daemon cannot install migration credentials (%s), "+
+					"and a new set will not change that; fix that first", name, ie))
+			}
+		case ve != "":
 			problems = append(problems, fmt.Sprintf("%s: its migration credentials are invalid (%s); "+
-				"replace them with `lv host install-migration-tls --reissue` first", name, row.GetValidationError()))
-		case row.GetInstallError() != "":
+				"replace them with `lv host install-migration-tls --reissue` first", name, ve))
+		case ie != "":
 			problems = append(problems, fmt.Sprintf("%s: its daemon cannot install migration credentials (%s); "+
-				"fix that first", name, row.GetInstallError()))
+				"fix that first", name, ie))
 		}
 	}
 	if len(wrongCA) > 0 {

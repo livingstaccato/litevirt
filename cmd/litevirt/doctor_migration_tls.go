@@ -164,8 +164,14 @@ func migrationTLSProblems(rows []*pb.MigrationTLSHostStatus, rotating bool, now 
 		for _, ca := range r.GetTrustedCas() {
 			fps = append(fps, ca.GetFingerprint())
 			if t := ca.GetNotAfter(); t != nil && t.AsTime().Before(deadline) {
-				out = append(out, fmt.Sprintf("%s: CA %s expires %s; run `lv host rotate-migration-ca`",
-					h, shortFP(ca.GetFingerprint()), t.AsTime().Format("2006-01-02")))
+				// The overlapping rotation refuses an expired CA: hosts
+				// cannot keep trusting it through the overlap.
+				verb, fix := "expires", "`lv host rotate-migration-ca`"
+				if !t.AsTime().After(now) {
+					verb, fix = "expired", "`lv host rotate-migration-ca --no-overlap`"
+				}
+				out = append(out, fmt.Sprintf("%s: CA %s %s %s; run %s",
+					h, shortFP(ca.GetFingerprint()), verb, t.AsTime().Format("2006-01-02"), fix))
 			}
 		}
 		sort.Strings(fps)

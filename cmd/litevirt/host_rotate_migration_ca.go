@@ -27,14 +27,18 @@ Storage migrations keep working throughout. No restart is needed.
 
 Before it starts, it asks every host's daemon for its migration credentials and
 refuses, changing nothing, unless each holds a complete, valid set its daemon
-can install, trusting this machine's migration CA.
+can install, trusting this machine's migration CA. With --no-overlap the set
+may be invalid or incomplete, since it is replaced, but must still trust this
+machine's migration CA. An expired migration CA can be rotated only with
+--no-overlap.
 
 If it stops (a host is unreachable), progress is saved; run it again to continue.
 
-  --no-overlap  For a compromised CA key. One pass straight to the new CA alone:
-                migrations between updated and not-yet-updated hosts are refused
-                until every host is done. Never sent in plaintext unless that
-                host set migration.allow_unencrypted_storage.
+  --no-overlap  For a compromised or expired CA. One pass straight to the new
+                CA alone: migrations between updated and not-yet-updated
+                hosts are refused until every host is done. Never sent in
+                plaintext unless that host set
+                migration.allow_unencrypted_storage.
   --force       Leave unreachable hosts behind. They keep the old CA's
                 credentials, so migrations with them are refused, until you run
                 'lv host install-migration-tls --reissue' once they are back.
@@ -57,7 +61,7 @@ Check the result with 'lv doctor migration-tls'.`,
 		},
 	}
 	cmd.Flags().StringVar(&sshUser, "ssh-user", "root", "user to SSH to each host as")
-	cmd.Flags().BoolVar(&opts.NoOverlap, "no-overlap", false, "cut over in one pass, without a window where both CAs are trusted (use when the CA key is compromised)")
+	cmd.Flags().BoolVar(&opts.NoOverlap, "no-overlap", false, "cut over in one pass, without a window where both CAs are trusted (use when the CA key is compromised or the CA has expired)")
 	cmd.Flags().BoolVar(&opts.Force, "force", false, "leave unreachable hosts behind instead of stopping")
 	return cmd
 }

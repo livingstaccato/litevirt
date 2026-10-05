@@ -3,7 +3,11 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"slices"
@@ -733,4 +737,193 @@ func TestFinalizeMigrationRotation_RerunDoesNotDuplicateTheRetiredCA(t *testing.
 	if got, _ := filepath.Glob(filepath.Join(op, "migration-ca.retired-*.crt")); len(got) != 1 {
 		t.Errorf("retired certificates = %v; want the one already written", got)
 	}
+}
+
+// expireMigrationCA replaces the cluster's migration CA, on the operator
+// machine and in every host's ca.crt, with a copy that expired yesterday: the
+// same key and subject, so each host certificate still names it as issuer,
+// but Verify against it now fails on every host, as it does once a real CA
+// lapses. It returns the expired CA's fingerprint.
+func expireMigrationCA(t *testing.T, op string, hosts []*fakeRotHost) string {
+	t.Helper()
+	cur, err := pki.CAFileCertificate(filepath.Join(op, pki.MigrationCACertName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(filepath.Join(op, pki.MigrationCAKeyName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := pem.Decode(keyPEM)
+	if b == nil {
+		t.Fatal("no PEM in the migration CA key")
+	}
+	key, err := x509.ParseECPrivateKey(b.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               cur.Subject,
+		SubjectKeyId:          cur.SubjectKeyId,
+		NotBefore:             time.Now().Add(-2 * 365 * 24 * time.Hour),
+		NotAfter:              time.Now().Add(-24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		MaxPathLenZero:        true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(filepath.Join(op, pki.MigrationCACertName), expired, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range hosts {
+		if err := os.WriteFile(filepath.Join(pki.MigrationDir(h.pkiDir), pki.MigrationCAName), expired, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fp, _ := pki.CAFileFingerprint(filepath.Join(op, pki.MigrationCACertName))
+	return fp
+}
+
+// daemonStatus is fakeStatus plus what a real daemon adds for a set that
+// fails validation: its install hook validates first, so install_error
+// repeats the validation error.
+func daemonStatus(hosts []*fakeRotHost) MigrationTLSStatusFunc {
+	return func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error) {
+		rows, err := fakeStatus(hosts)(ctx)
+		for _, r := range rows {
+			if ve := r.GetValidationError(); ve != "" && r.InstallError == "" {
+				r.InstallError = "not installing migration credentials: " + ve
+			}
+		}
+		return rows, err
+	}
+}
+
+// An expired migration CA fails validation and installation on every host,
+// which is exactly when it must be replaced. --no-overlap replaces the whole
+// set, so it rotates such a cluster: every host ends trusting only the new CA,
+// with a valid certificate from it.
+//
+// Mutations: put the ValidationError refusal back under --no-overlap, or
+// refuse every install_error under it — the preflight refuses every host.
+func TestRotateMigrationCA_NoOverlapRotatesAnExpiredCA(t *testing.T) {
+	op, hosts := provisionedCluster(t, 3)
+	oldFP := expireMigrationCA(t, op, hosts)
+	rows, _ := daemonStatus(hosts)(context.Background())
+	for _, r := range rows {
+		if !strings.Contains(r.GetValidationError(), "expired") || r.GetInstallError() == "" {
+			t.Fatalf("%s = %+v; want the expired CA to fail validation and installation", r.GetHost(), r)
+		}
+	}
+	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), daemonStatus(hosts),
+		RotateMigrationCAOptions{NoOverlap: true}, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("--no-overlap on an expired CA: %v", err)
+	}
+	newFP, _ := pki.CAFileFingerprint(filepath.Join(op, pki.MigrationCACertName))
+	if newFP == oldFP {
+		t.Fatal("the operator's current CA did not change")
+	}
+	for _, h := range hosts {
+		info, _ := pki.InspectMigrationTLS(h.pkiDir, time.Now())
+		if len(info.TrustedCAs) != 1 || info.TrustedCAs[0].Fingerprint != newFP || info.CertIssuerFingerprint != newFP || info.ValidationError != "" {
+			t.Errorf("%s = %+v; want only the new CA, with a valid certificate from it", h.name, info)
+		}
+	}
+}
+
+// Under --no-overlap an incomplete set is fine: cutover pushes all three files.
+//
+// Mutation: put the ValidationError refusal back under --no-overlap — node-2
+// is refused as an incomplete set.
+func TestRotateMigrationCA_NoOverlapAcceptsAnIncompleteSet(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	if err := os.Remove(filepath.Join(pki.MigrationDir(hosts[1].pkiDir), pki.MigrationHostKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := rotate(t, op, hosts, RotateMigrationCAOptions{NoOverlap: true}); err != nil {
+		t.Fatalf("--no-overlap with an incomplete set: %v", err)
+	}
+	newFP, _ := pki.CAFileFingerprint(filepath.Join(op, pki.MigrationCACertName))
+	if info, _ := pki.InspectMigrationTLS(hosts[1].pkiDir, time.Now()); info.CertIssuerFingerprint != newFP || info.ValidationError != "" {
+		t.Errorf("node-2 = %+v; want a valid set from the new CA", info)
+	}
+}
+
+// The overlapping rotation cannot carry an expired CA through trust-both, so
+// it refuses before minting anything, and names --no-overlap rather than the
+// --reissue that would issue from the same expired CA. Expiry is judged by
+// the Now option, not the wall clock.
+//
+// Mutations: drop the expiry check — the refusal names --reissue instead (and
+// the Now case mints); judge expiry by time.Now() — the Now case mints.
+func TestRotateMigrationCA_OverlapRefusesAnExpiredCA(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	expireMigrationCA(t, op, hosts)
+	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), daemonStatus(hosts),
+		RotateMigrationCAOptions{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "expired on") || !strings.Contains(err.Error(), "`lv host rotate-migration-ca --no-overlap`") {
+		t.Fatalf("err = %v; want a refusal saying the CA expired and naming --no-overlap", err)
+	}
+	nothingMinted(t, op)
+	for _, h := range hosts {
+		if h.pushes != 0 {
+			t.Errorf("%s was pushed %d time(s)", h.name, h.pushes)
+		}
+	}
+
+	// A healthy 10-year CA, judged eleven years from now.
+	op, hosts = provisionedCluster(t, 2)
+	later := time.Now().Add(11 * 365 * 24 * time.Hour)
+	err = rotate(t, op, hosts, RotateMigrationCAOptions{Now: func() time.Time { return later }})
+	if err == nil || !strings.Contains(err.Error(), "--no-overlap") {
+		t.Fatalf("Now past the CA's expiry: err = %v; want a refusal naming --no-overlap", err)
+	}
+	nothingMinted(t, op)
+}
+
+// The wrong-machine guard holds under --no-overlap too, on an expired cluster
+// as on any other: run with a migration CA that is not the cluster's, it is
+// refused before minting.
+//
+// Mutation: skip the fingerprint check under --no-overlap — the run mints and
+// pushes.
+func TestRotateMigrationCA_NoOverlapRefusesAMachineWithAnotherCA(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	expireMigrationCA(t, op, hosts)
+	if err := pki.GenerateMigrationCA(filepath.Join(op, pki.MigrationCACertName), filepath.Join(op, pki.MigrationCAKeyName)); err != nil {
+		t.Fatal(err)
+	}
+	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), daemonStatus(hosts),
+		RotateMigrationCAOptions{NoOverlap: true}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "node-1, node-2") || !strings.Contains(err.Error(), "`lv host init` ran") {
+		t.Fatalf("err = %v; want a refusal naming both hosts and where to run it", err)
+	}
+	nothingMinted(t, op)
+	for _, h := range hosts {
+		if h.pushes != 0 {
+			t.Errorf("%s was pushed %d time(s)", h.name, h.pushes)
+		}
+	}
+}
+
+// An install refusal a new set would not cure still refuses --no-overlap
+// before minting: otherwise cutover pushes every host and then stalls at its
+// gate on that host.
+//
+// Mutation: pass every install_error under --no-overlap — the run mints.
+func TestRotateMigrationCA_NoOverlapRefusesAnUnrelatedInstallError(t *testing.T) {
+	op, hosts := provisionedCluster(t, 2)
+	hosts[1].installErr = "cannot tell which user QEMU runs as: tried libvirt-qemu, qemu"
+	err := rotate(t, op, hosts, RotateMigrationCAOptions{NoOverlap: true})
+	if err == nil || !strings.Contains(err.Error(), "node-2") || !strings.Contains(err.Error(), "QEMU runs as") {
+		t.Fatalf("err = %v; want node-2's install refusal", err)
+	}
+	nothingMinted(t, op)
 }

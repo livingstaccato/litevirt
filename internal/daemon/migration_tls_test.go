@@ -109,3 +109,27 @@ func TestLogMigrationExpiry_WarnsSoonAndErrorsOnceExpired(t *testing.T) {
 		t.Fatalf("expired CA: %s; want an Error naming the rotation", buf.String())
 	}
 }
+
+// An expired CA names --no-overlap, which the overlapping rotation refuses to
+// do without; a CA only expiring names the plain rotation.
+//
+// Mutation: always name the plain `lv host rotate-migration-ca` — the expired
+// case misses --no-overlap.
+func TestLogMigrationExpiry_ExpiredCANamesNoOverlap(t *testing.T) {
+	now := time.Date(2026, 10, 4, 0, 0, 0, 0, time.UTC)
+	day := 24 * time.Hour
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	logMigrationExpiry(log, pki.MigrationTLSInfo{Provisioned: true,
+		TrustedCAs: []pki.MigrationCAInfo{{Fingerprint: "aa", NotAfter: now.Add(-day)}}}, now)
+	if !strings.Contains(buf.String(), "lv host rotate-migration-ca --no-overlap") {
+		t.Fatalf("expired CA: %s; want the fix to name --no-overlap", buf.String())
+	}
+	buf.Reset()
+	logMigrationExpiry(log, pki.MigrationTLSInfo{Provisioned: true,
+		TrustedCAs: []pki.MigrationCAInfo{{Fingerprint: "aa", NotAfter: now.Add(30 * day)}}}, now)
+	if !strings.Contains(buf.String(), "lv host rotate-migration-ca`") || strings.Contains(buf.String(), "--no-overlap") {
+		t.Fatalf("expiring CA: %s; want the plain rotation, without --no-overlap", buf.String())
+	}
+}

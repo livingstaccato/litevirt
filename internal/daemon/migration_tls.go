@@ -113,12 +113,17 @@ func migrationTLSStatusRow(info pki.MigrationTLSInfo, err error) *pb.MigrationTL
 }
 
 // logMigrationExpiry logs each migration credential that expires within
-// pki.MigrationExpiryWarning: Warn before, Error after.
+// pki.MigrationExpiryWarning: Warn before, Error after. An expired CA names
+// --no-overlap: the overlapping rotation refuses one, because hosts cannot
+// keep trusting it through the overlap.
 func logMigrationExpiry(log *slog.Logger, info pki.MigrationTLSInfo, now time.Time) {
 	for _, e := range info.Expiring(now) {
 		fix := "`lv host install-migration-tls --reissue`"
 		if strings.HasPrefix(e.What, "CA ") {
 			fix = "`lv host rotate-migration-ca`"
+			if e.Expired {
+				fix = "`lv host rotate-migration-ca --no-overlap`"
+			}
 		}
 		level, verb := slog.LevelWarn, "expires"
 		if e.Expired {

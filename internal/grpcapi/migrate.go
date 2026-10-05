@@ -225,8 +225,18 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// refuses only on a positive "cannot run" from the target that the source,
 	// running the guest, does not also give about itself (see
 	// preflightTargetCPU), never on a peer that is old or cannot answer.
-	if err := s.preflightTargetCPU(ctx, vm, req.TargetHost); err != nil {
-		return err
+	//
+	// Only for a move that carries a RUNNING guest. A cold move (a stopped VM, a
+	// firmware VM, and drain's cold move of a running VM, which shuts it down
+	// first) boots the guest fresh on the target, where host-model and
+	// host-passthrough expand to the target's own CPU: what the source's guest
+	// is running on now is not a requirement there, and asking it refused moves
+	// between different CPU generations for nothing. A target that cannot run
+	// the guest's machine type still refuses, at the define.
+	if !coldStopped && !fwVM {
+		if err := s.preflightTargetCPU(ctx, vm, req.TargetHost); err != nil {
+			return err
+		}
 	}
 
 	// PCI passthrough cannot be re-realized cross-host in this release, so refuse

@@ -55,6 +55,13 @@ migration proceeds to libvirt's own check at cutover. A VM with an empty
 `cpu_mode` (QEMU's `qemu64`, identical on every host — see
 [`lv doctor cpu-mode`](diagnostics.md)) is not checked at all.
 
+A **cold** move is not checked either: a stopped VM migrated with `--cold`, a
+Secure Boot / vTPM VM, and a running VM that `lv host drain` moves cold (it has a
+host-local disk) all boot fresh on the target, where `host-model` and
+`host-passthrough` expand to the target's own CPU. Moving such a VM to a host of
+another CPU generation is therefore allowed; a target that cannot run the guest's
+machine type still refuses it when the domain is defined there.
+
 ### Migration with local disks
 
 For VMs whose disks are on local (non-shared) pools, the disk content is

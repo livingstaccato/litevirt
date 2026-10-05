@@ -23905,8 +23905,11 @@ type CleanupMigrationArtifactsRequest struct {
 	RemoveCloudInit bool                   `protobuf:"varint,3,opt,name=remove_cloud_init,json=removeCloudInit,proto3" json:"remove_cloud_init,omitempty"` // also remove the cloud-init ISO for vm_name
 	FirmwareUuid    string                 `protobuf:"bytes,4,opt,name=firmware_uuid,json=firmwareUuid,proto3" json:"firmware_uuid,omitempty"`             // if set, wipe the pushed firmware state (NVRAM+swtpm) for vm_name (G1)
 	UndefineDomain  bool                   `protobuf:"varint,5,opt,name=undefine_domain,json=undefineDomain,proto3" json:"undefine_domain,omitempty"`      // if set, undefine a domain this host pre-defined for a failed firmware migration (G1)
-	// vm_deleted: vm_name was deleted (without --keep-disks) on the host that
-	// owned it, and this host is one it left. Remove the VM's owner-epoch
+	// vm_deleted: vm_name was deleted on the host that owned it, and this host
+	// is one it left. Accepted only from a cluster host acting as the system
+	// (bearerless peer certificate); every user, admin included, is refused,
+	// since only the deleting owner can tell which disks were this
+	// incarnation's detaches (and names none for --keep-disks). Remove the VM's owner-epoch
 	// marker here, and treat disk_paths as disks detached from the VM while it
 	// ran here — each removed only if this host's own replica records it so and
 	// nothing still uses it. Refused (ABORTED, retryable) while this host's

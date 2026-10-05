@@ -100,6 +100,8 @@ func newLeftoverHost(t *testing.T) *leftoverHost {
 		t.Fatal(err)
 	}
 	detachAfterCreate(t, s.db, "os1", "post1")
+	// The owner, as a known cluster host its peer certificate names.
+	_ = peerCtxFor(t, s, "owner-host")
 	if err := health.WriteVMOwnerEpochMarker(s.dataDir, "os1", 3); err != nil {
 		t.Fatalf("WriteVMOwnerEpochMarker: %v", err)
 	}
@@ -145,11 +147,62 @@ func (h *leftoverHost) tombstone(t *testing.T) {
 	}
 }
 
+// cleanup sends the request the deleting owner sends: a bearerless call on a
+// peer host certificate.
 func (h *leftoverHost) cleanup(paths ...string) error {
-	_, err := h.s.CleanupMigrationArtifacts(adminCtx(), &pb.CleanupMigrationArtifactsRequest{
+	return h.cleanupAs(systemPeerCtx("owner-host"), paths...)
+}
+
+// systemPeerCtx is what the auth interceptor makes of a bearerless call on a
+// trusted host certificate: the system, with admin authority.
+func systemPeerCtx(cn string) context.Context {
+	ctx := context.WithValue(mtlsCtx(cn), ctxKeyUsername, "admin")
+	return context.WithValue(ctx, ctxKeyRole, "admin")
+}
+
+func (h *leftoverHost) cleanupAs(ctx context.Context, paths ...string) error {
+	_, err := h.s.CleanupMigrationArtifacts(ctx, &pb.CleanupMigrationArtifactsRequest{
 		VmName: "os1", DiskPaths: paths, VmDeleted: true,
 	})
 	return err
+}
+
+// Only the deleting owner may ask for a deleted VM's leftovers, because only
+// its planner can tell which detached disks are this incarnation's: once the
+// tombstone has re-stamped the rows, and with nothing replicated recording a
+// --keep-disks delete, this host's replica cannot. So every USER caller is
+// refused — admin included, and an admin relayed by a peer (forwarded
+// identity) too — and removes nothing.
+//
+// Mutation: drop the system-peer requirement from the vm_deleted branch — the
+// admin and forwarded-admin subtests remove the disk and go red; accept a
+// forwarded identity (check the transport only) — the forwarded subtest does.
+func TestCleanupMigrationArtifacts_VMDeletedIsForTheOwnersPeerCallOnly(t *testing.T) {
+	forwardedAdmin := func(t *testing.T, s *Server) context.Context {
+		ctx := peerCtxFor(t, s, "relay-host")
+		ctx = context.WithValue(ctx, ctxKeyAuthMethod, authMethodSession)
+		ctx = context.WithValue(ctx, ctxKeyUsername, "alice")
+		return context.WithValue(ctx, ctxKeyRole, "admin")
+	}
+	for _, tc := range []struct {
+		name string
+		ctx  func(t *testing.T, s *Server) context.Context
+	}{
+		{"admin user", func(*testing.T, *Server) context.Context { return adminCtx() }},
+		{"admin forwarded by a peer", forwardedAdmin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newLeftoverHost(t)
+			h.tombstone(t)
+			err := h.cleanupAs(tc.ctx(t, h.s), h.disk)
+			if status.Code(err) != codes.PermissionDenied {
+				t.Fatalf("a user's vm_deleted cleanup answered %v (%v), want PermissionDenied", status.Code(err), err)
+			}
+			if !fileExists(h.disk) || !fileExists(h.marker) {
+				t.Fatal("a refused vm_deleted cleanup removed something")
+			}
+		})
+	}
 }
 
 // A deleted VM's detached disk and owner-epoch marker on a host it left are

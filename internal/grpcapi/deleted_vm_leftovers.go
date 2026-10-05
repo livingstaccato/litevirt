@@ -216,14 +216,22 @@ func (s *Server) cleanupDeletedVMLeftoversOn(ctx context.Context, host, vmName s
 //   - this host's replica has a soft-deleted row of THIS VM naming THIS host at
 //     exactly that path, host-local and delete_with_vm — the deleting host's
 //     list is a request, not evidence;
-//   - it is THIS incarnation's, by this host's own replica: the tombstoned
-//     row's created_at is readable, the disk row's deleted_at is strictly
-//     after it, and so is the file's modification time. The row check alone
-//     cannot see a predecessor once the tombstone has re-stamped every disk
-//     row of the name; the file can — what a --keep-disks predecessor kept was
-//     last written before this VM existed, while a disk attached to this VM
-//     was made, and written, after. This holds however the request arrives,
-//     an admin calling CleanupMigrationArtifacts directly included;
+//   - the tombstoned row's created_at is readable, the disk row's deleted_at
+//     is strictly after it, and so is the file's modification time.
+//
+// WHAT IS GUARANTEED, and by whom. This host CANNOT prove from its replica
+// that a path is the deleted incarnation's: the tombstone re-stamps every disk
+// row of the name, predecessors' included, and a --keep-disks delete leaves no
+// replicated trace at all (delete_with_vm stays 1). The guarantee is therefore
+// the caller's: only the deleting owner may send this request
+// (requireSystemPeer refuses every user, admin included), and its planner
+// names only this incarnation's detaches, judged before the tombstone, and no
+// disk at all for --keep-disks (departedDetachedDisks). The row and mtime
+// checks here are defence in depth, not proof. The mtime check in particular
+// is defeated by clock skew (a creator whose clock lags this host's by more
+// than the gap between a predecessor's last write and the new create — seconds
+// for `lv rm --keep-disks x && lv run --name x`) and by any write to the file
+// after the create (qemu-img, qemu-nbd, guestfish, touch).
 //   - the VM has no live snapshot row (its snapshot chain may run through it);
 //   - no live disk row of any VM uses it as its file, backing image or
 //     linked-clone base;
@@ -280,7 +288,12 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 			"vm", name, "error", cerr)
 		return &emptypb.Empty{}, nil
 	}
-	created, _ := time.Parse(time.RFC3339Nano, createdAt)
+	created, perr := time.Parse(time.RFC3339Nano, createdAt)
+	if perr != nil {
+		slog.Warn("deleted VM leftovers: the deleted incarnation's created_at is unparseable; keeping its detached disks",
+			"vm", name, "created_at", createdAt, "error", perr)
+		return &emptypb.Empty{}, nil
+	}
 	recorded := map[string]bool{}
 	for _, r := range rows {
 		if r.HostName == s.hostName && isHostLocalDiskDriver(r.StorageType) && r.DeleteWithVM && r.Path != "" &&
@@ -366,4 +379,21 @@ func (s *Server) localDomainUsesPath(p string) (bool, string) {
 func modifiedAfter(p string, t time.Time) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !t.IsZero() && fi.ModTime().After(t)
+}
+
+// requireSystemPeer admits only a cluster host acting as the SYSTEM: a trusted
+// host certificate (requirePeerCert) with no user identity on the call. A user
+// is refused whatever their role, and so is a user relayed by a peer under
+// forwarded identity, which keeps the peer transport but authenticates as a
+// session or token. The deleting owner's fan-out runs on a context with the
+// incoming metadata stripped (notifyDetachedContext), so it arrives bearerless.
+func (s *Server) requireSystemPeer(ctx context.Context) error {
+	if err := s.requirePeerCert(ctx); err != nil {
+		return err
+	}
+	if m := callerAuthMethod(ctx); m != authMethodMTLS {
+		return status.Errorf(codes.PermissionDenied,
+			"only the deleting host may ask for a deleted VM's leftovers; this call carries a user identity (%s)", m)
+	}
+	return nil
 }

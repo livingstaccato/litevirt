@@ -1430,6 +1430,16 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	if err := safename.ValidateVMName(req.VmName); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	// A deleted VM's leftovers on a host it left are a different request with
+	// its own rules: nothing below (RBAC, stub ledger, firmware, undefine)
+	// applies. Only the deleting owner may send it (requireSystemPeer).
+	if req.VmDeleted {
+		if err := s.requireSystemPeer(ctx); err != nil {
+			return nil, err
+		}
+		vm, _ := corrosion.GetVM(ctx, s.db, req.VmName)
+		return s.removeDeletedVMLeftoversHere(ctx, req, vm)
+	}
 	// Require vm.migrate on the VM being cleaned up. A failed migration leaves the
 	// VM record intact (the source still owns it); only when the VM has truly
 	// vanished do we fall back to admin (orphan cleanup), so a binding-holder
@@ -1442,11 +1452,6 @@ func (s *Server) CleanupMigrationArtifacts(ctx context.Context, req *pb.CleanupM
 	} else if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, status.Error(codes.PermissionDenied,
 			"cleaning up artifacts of a vanished VM requires the admin role")
-	}
-	// A deleted VM's leftovers on a host it left are a different request with
-	// its own rules: nothing below (stub ledger, firmware, undefine) applies.
-	if req.VmDeleted {
-		return s.removeDeletedVMLeftoversHere(ctx, req, vm)
 	}
 	// The firmware UUID keys a RemoveAll under the swtpm root, and the
 	// permission above was checked on VmName alone. So it must be a real UUID

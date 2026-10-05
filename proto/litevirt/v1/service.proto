@@ -2402,6 +2402,48 @@ message RollbackFirmwareStateResponse {
     bool removed = 1;
 }
 
+// ReceiveMigrationDiskRequest is one frame of a cold migration's disk copy: a
+// STOPPED VM's host-local disk file, streamed by the source to the target over
+// the peer connection. The first frame is a header (vm_name, path, size_bytes)
+// and carries no data, so authorization precedes any byte reaching disk. Each
+// later frame carries one non-zero extent (offset, data), in ascending,
+// non-overlapping order; a range no frame covers reads as zeros. The last frame
+// carries only sha256: the digest of every (offset, length, data) frame in
+// order, which the target checks before the file takes the disk's path.
+//
+// The target writes only a disk of a VM that does not live there, at a path in
+// a disk-artifact root that holds no file — or holds one this host created for
+// the same VM's migration — and records the file as the attempt's, so the
+// cleanup of a failed attempt (CleanupMigrationArtifacts) removes it. An older
+// target does not implement the RPC, and the source refuses the migration.
+message ReceiveMigrationDiskRequest {
+    string vm_name    = 1;  // header
+    string path       = 2;  // header — the disk's recorded path
+    int64  size_bytes = 3;  // header — length of the file
+    int64  offset     = 4;  // data frame
+    bytes  data       = 5;  // data frame
+    string sha256     = 6;  // last frame — hex digest of the frames
+    // header — the source's estimate of the bytes the file occupies on disk
+    // (its allocated blocks), which the target's free-space check reserves.
+    // size_bytes is still what the target bounds by the disk's record.
+    int64  allocated_bytes = 7;
+    // header — the sender is the VM's owner and has confirmed its domain is
+    // shut off. The target's copy of the VM row may still say running (a drain
+    // stops a running VM moments before the copy, and the stopped write is
+    // still replicating), so the target accepts this from the host its row
+    // names as the owner, and only from it, in place of a stopped row.
+    bool   owner_domain_shut_off = 8;
+    // header — check only: the target runs every check it runs before writing
+    // (the path, the record, a file already there, free space) and then ends
+    // the call, writing nothing. The VM may still be running, so its state is
+    // not checked. A drain runs it before it shuts a running VM down.
+    bool   check_only = 9;
+}
+
+message ReceiveMigrationDiskResponse {
+    int64 size_bytes = 1;  // length of the file now at path
+}
+
 // CleanupMigrationArtifactsRequest removes the stub disks + cloud-init ISO that
 // EnsureDisks/EnsureCloudInit pre-created on a migration target, after the
 // migration failed (the VM never got defined there, so they are orphaned).
@@ -3204,6 +3246,9 @@ service LiteVirt {
     rpc EnsureFirmwareState(EnsureFirmwareStateRequest) returns (EnsureFirmwareStateResponse);
     rpc RollbackFirmwareState(RollbackFirmwareStateRequest) returns (RollbackFirmwareStateResponse);
     rpc CleanupMigrationArtifacts(CleanupMigrationArtifactsRequest) returns (google.protobuf.Empty);
+    // ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
+    // being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
+    rpc ReceiveMigrationDisk(stream ReceiveMigrationDiskRequest) returns (ReceiveMigrationDiskResponse);
     rpc CheckCPUCompatibility(CheckCPUCompatibilityRequest) returns (CheckCPUCompatibilityResponse);
 
     // ── Internal: State Sync ──

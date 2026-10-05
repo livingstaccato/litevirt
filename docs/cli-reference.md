@@ -283,7 +283,7 @@ than silently breaking BitLocker. The explicit refusals:
 | clone | gets a **fresh** vTPM + fresh NVRAM (the secret is never copied) — a cloned BitLocker guest needs its recovery key |
 | live migration | refused — use cold migration |
 | cold migration | supported for a **stopped** VM on **shared storage**; firmware is captured quiescent and carried to the target. Host-local-disk and PCI-passthrough firmware VMs are not supported yet |
-| host drain | refused — migrate the VM explicitly (`lv migrate … --cold`) |
+| host drain | a stopped VM on shared storage is moved as cold migration moves it; a running one is refused — stop it and drain again, or migrate it explicitly (`lv migrate … --cold`) |
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
 | replica promotion | refused — a disk replica carries no firmware |
 | `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
@@ -356,7 +356,7 @@ shell history.
 
 ```bash
 lv migrate <vm> <target-host>                  # Live migrate
-lv migrate <vm> <target-host> --cold           # Cold migrate (stop, move, start)
+lv migrate <vm> <target-host> --cold           # Cold migrate: a stopped VM moves stopped, disks copied
 lv migrate <vm> <target-host> --with-storage   # Copy disks to the target during migration
 ```
 

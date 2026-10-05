@@ -224,8 +224,8 @@ func TestColdMigrateFirmwareVM_RefusesHostdev(t *testing.T) {
 		t.Fatalf("UpsertPCIDevice: %v", err)
 	}
 	vm, _ := corrosion.GetVM(ctx, s.db, "fw")
-	err := s.coldMigrateFirmwareVM(ctx, vm, &corrosion.HostRecord{Name: "t1"},
-		firmwareSpec{Tpm: true, UUID: "u1"}, func(pb.MigratePhase, float32, float32) error { return nil })
+	err := s.coldMigrateStoppedVM(ctx, vm, &corrosion.HostRecord{Name: "t1"},
+		firmwareSpec{Tpm: true, UUID: "u1"}, &migrationAbort{}, func(pb.MigratePhase, float32, float32) error { return nil })
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for a firmware VM with a hostdev, got %v", err)
 	}
@@ -310,8 +310,8 @@ func TestColdMigrateFirmwareVM_RefusesLocalDisk(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 	vm, _ := corrosion.GetVM(ctx, s.db, "fw")
-	err := s.coldMigrateFirmwareVM(ctx, vm, &corrosion.HostRecord{Name: "t1"},
-		firmwareSpec{Tpm: true, UUID: "u1"}, func(pb.MigratePhase, float32, float32) error { return nil })
+	err := s.coldMigrateStoppedVM(ctx, vm, &corrosion.HostRecord{Name: "t1"},
+		firmwareSpec{Tpm: true, UUID: "u1"}, &migrationAbort{}, func(pb.MigratePhase, float32, float32) error { return nil })
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("expected FailedPrecondition for a host-local (dir) firmware migration, got %v", err)
 	}

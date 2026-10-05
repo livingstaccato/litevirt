@@ -126,11 +126,72 @@ You can also set it as a per-VM default in compose:
       with-storage: true
 ```
 
-Or cold migrate (stops the VM, copies disks, starts it on the target):
+## Cold migration
+
+`--cold` migrates a VM without moving a running guest live:
 
 ```bash
+lv stop my-vm
 lv migrate my-vm host-b --cold
 ```
+
+A **stopped** VM moves stopped. Libvirt is not involved, because there is no
+guest running for it to migrate:
+
+1. Each host-local disk (`local` and `dir` storage) is copied to the same path
+   on the target over the cluster's mTLS connection. Disks on shared storage
+   stay where they are. A disk's format is read from the VM's domain
+   definition, never from the file. A qcow2 disk created from an image or as a
+   linked clone is an overlay over a backing file. It arrives flattened, as a
+   standalone image, because the backing file is not part of the copy. A raw
+   disk is copied byte for byte.
+2. The VM's domain is defined on the target, shut off.
+3. The VM and all of its disk records move to the target in one transaction.
+   The VM's state stays `stopped`. Start it there with `lv start my-vm`.
+4. After that commit, the source undefines its domain and removes its copy of
+   each disk it sent.
+
+Until the commit in step 3 the source keeps its disks, its domain and
+ownership of the VM. If any step before it fails, or the client goes away,
+the VM stays on the source, stopped. The target removes the disk copies and
+the domain that this attempt created there, and nothing else. A file the target
+already has at a disk's path, which this migration did not create, is refused
+rather than overwritten, as for `--with-storage`.
+
+A stopped VM is refused when:
+
+- libvirt reports its domain active, although its record says stopped;
+- a disk is not in its domain definition, so its format is unknown;
+- a filesystem would be left with less free space than 5% of its size, with a
+  minimum of 1 GiB and a maximum of 64 GiB. The target checks this for each
+  disk it receives, and the source checks it before flattening an overlay. The
+  disks on a host's filesystem are thin-provisioned, and a full filesystem
+  pauses every guest writing to one. The check counts the data a copy actually
+  writes, not the disk's apparent or virtual size: a sparse disk stays sparse
+  on the target, and a flatten writes only allocated clusters. The target checks
+  its free space again as the data arrives;
+- a disk file is larger than its recorded size allows, plus qcow2 metadata;
+- it has snapshots and a host-local disk;
+- it holds a PCI passthrough device;
+- the target is a build from before stopped-VM cold migration. The error says
+  so and names the target to upgrade.
+
+A copy in flight writes to a hidden scratch file beside the disk:
+`.<disk>.receiving-<number>` on the target, or `.<disk>.coldmig-<uuid>` (and
+`.<disk>.coldmig-<uuid>.tmp`) on the source while it flattens an overlay. A
+daemon that stops mid-copy removes files of exactly these shapes from its
+host-local disk directories when it next starts. Any other file is left alone.
+
+`--with-storage` has no effect on a stopped VM, whose host-local disks are
+always copied.
+
+A **running** VM given `--cold` is paused for the move instead of migrated
+live. Libvirt still migrates it, so a host-local disk needs `--with-storage`,
+or stop the VM first. A stopped VM migrated live is refused, with a message
+pointing to `--cold`.
+
+Secure Boot / vTPM VMs are always migrated stopped and cold, and need shared
+storage; see [cli-reference.md](cli-reference.md).
 
 ## Host drain
 
@@ -141,7 +202,73 @@ lv host drain host-a
 lv host drain host-a --parallel 4    # Migrate 4 VMs at a time
 ```
 
-Drain live-migrates running VMs and cold-reassigns stopped VMs. When done:
+Drain live-migrates a running VM whose disks are all on shared storage. Every
+other VM moves the way `lv migrate <vm> <target> --cold` moves a stopped VM
+(see [Cold migration](#cold-migration)): its host-local disks (`local` and
+`dir` storage) are copied to the target, its domain is defined there, and the
+VM and its disk records move in one transaction. It is refused for the same
+reasons. A Secure Boot / vTPM VM drains only while stopped and on shared
+storage.
+
+- A **stopped** VM stays stopped on the target.
+- A **running** VM with a host-local disk is checked first, while it still
+  runs: everything the cold move checks, including the target's capacity, a
+  disk whose backing image cannot be flattened, free space on both hosts, and
+  a file already at a disk's path on the target. Only then is it shut down.
+  Drain waits for its domain to shut off, up to the VM's stop timeout
+  (`stop_timeout_sec`, 30 seconds by default), and does not force it off. It
+  is then moved with its disks and started on the target.
+- A running VM on shared storage whose live migration fails is moved the same
+  way.
+
+A VM that drain cannot move stays on the host with its disks; a failed attempt
+removes what it put on the target. It is never moved without its disks:
+
+- refused before the shutdown, it keeps running;
+- a move that fails after the shutdown starts it again on the host, once its
+  domain has shut off. A guest slower than its stop timeout is waited for, up
+  to 5 more minutes; the ACPI shutdown request cannot be withdrawn, so the VM
+  is started again only after the guest has powered off. A guest still running
+  after that is reported as an error that says so: its shutdown was requested
+  and it is still running, and it will power off if the guest completes the
+  shutdown. Start it with `lv start <vm>` then;
+- if the start fails, drain reports it as an error naming the VM, which is
+  then stopped on the host; start it with `lv start <vm>`.
+
+The move of a running VM is journaled before anything is done to it (an
+operation of kind `drain_cold_move`). If the drained host's daemon dies in the
+middle, it finishes the move when it starts again, and the VM ends running on
+exactly one host: on the drained host if it had not been handed over yet
+(started again, or its record put back to running if its domain never stopped),
+or on the target if it had. It does so only while the VM is still exactly as
+the drain left it: owned by the same host at the same owner epoch, and stopped
+by the drain itself (its state detail then reads `drain-cold-move:<operation>`,
+which counts as an operator stop everywhere). A VM started, stopped, moved or
+deleted since is left as it is, and a VM event says the move was not finished.
+A move that still cannot be finished after about ten minutes of retries is
+closed as failed, with a VM event naming the VM to start with `lv start`; a
+later restart does not take it up again.
+
+Drain reports each VM it did not move with the reason, finishes the other VMs,
+and then fails with `drain incomplete: N VM(s) remain on host ...`. The host
+stays `draining`. Fix what the message names (or migrate the VM yourself) and
+run the drain again. A VM that moved but did not start on the target is
+reported too, with a VM event saying why; it is stopped there, and the drain
+also ends with `drain incomplete`, naming it.
+
+### A VM with no domain
+
+A drain by a build from before this behaviour moved a stopped VM by its record
+alone: the record names the new host, but the domain was never defined there
+and its host-local disk files stayed on the host it came from. Such a VM
+cannot be drained or migrated cold again; both refuse with `VM "<vm>" has no
+domain defined on <host>`. Its host-local disk files are still on the host it
+came from, at the paths `lv inspect <vm>` lists. To recover it, copy them to
+the same paths on the host its record names and recreate the VM there over
+them, or `lv rm <vm> --keep-disks` to remove the record without touching any
+disk file. A VM with only shared disks lost nothing but its domain.
+
+When done:
 
 ```bash
 # Perform maintenance...

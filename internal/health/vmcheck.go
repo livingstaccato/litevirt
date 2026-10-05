@@ -315,7 +315,7 @@ func (v *VMChecker) sweep(ctx context.Context) {
 		// is the only safe direction — we promote to running solely when
 		// libvirt confirms it. Operator-stopped VMs are left alone: the
 		// operator's intent wins even if a stop didn't fully take effect.
-		if vm.StateDetail != "operator-stop" && v.virt != nil {
+		if !IsOperatorStop(vm.StateDetail) && v.virt != nil {
 			if st, err := v.virt.DomainState(vm.Name); err == nil && st == "running" {
 				if werr := v.publishRunning(ctx, vm.Name, "running", func(ctx context.Context) error {
 					return corrosion.UpdateVMStateStrict(ctx, v.db, vm.Name, "running",
@@ -339,7 +339,7 @@ func (v *VMChecker) sweep(ctx context.Context) {
 			}
 		}
 		// Never restart VMs explicitly stopped by the operator (#29).
-		if vm.StateDetail == "operator-stop" {
+		if IsOperatorStop(vm.StateDetail) {
 			continue
 		}
 		v.maybeRestartVM(ctx, vm, now)
@@ -715,7 +715,7 @@ func (v *VMChecker) takeAction(ctx context.Context, vm corrosion.VMRecord, hspec
 			"vm", vm.Name, "owner", fresh.HostName)
 		return
 	}
-	if fresh.State == "stopped" && fresh.StateDetail == "operator-stop" {
+	if fresh.State == "stopped" && IsOperatorStop(fresh.StateDetail) {
 		slog.Info("vmcheck: skipping action — VM was stopped by operator", "vm", vm.Name)
 		return
 	}

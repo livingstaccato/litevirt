@@ -230,6 +230,7 @@ const (
 	LiteVirt_EnsureFirmwareState_FullMethodName        = "/litevirt.v1.LiteVirt/EnsureFirmwareState"
 	LiteVirt_RollbackFirmwareState_FullMethodName      = "/litevirt.v1.LiteVirt/RollbackFirmwareState"
 	LiteVirt_CleanupMigrationArtifacts_FullMethodName  = "/litevirt.v1.LiteVirt/CleanupMigrationArtifacts"
+	LiteVirt_ReceiveMigrationDisk_FullMethodName       = "/litevirt.v1.LiteVirt/ReceiveMigrationDisk"
 	LiteVirt_CheckCPUCompatibility_FullMethodName      = "/litevirt.v1.LiteVirt/CheckCPUCompatibility"
 	LiteVirt_GetStateDigest_FullMethodName             = "/litevirt.v1.LiteVirt/GetStateDigest"
 	LiteVirt_AcknowledgeLeaseTermTie_FullMethodName    = "/litevirt.v1.LiteVirt/AcknowledgeLeaseTermTie"
@@ -618,6 +619,9 @@ type LiteVirtClient interface {
 	EnsureFirmwareState(ctx context.Context, in *EnsureFirmwareStateRequest, opts ...grpc.CallOption) (*EnsureFirmwareStateResponse, error)
 	RollbackFirmwareState(ctx context.Context, in *RollbackFirmwareStateRequest, opts ...grpc.CallOption) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(ctx context.Context, in *CleanupMigrationArtifactsRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	// ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
+	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
+	ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error)
 	CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*StateDigestResponse, error)
@@ -3167,6 +3171,19 @@ func (c *liteVirtClient) CleanupMigrationArtifacts(ctx context.Context, in *Clea
 	return out, nil
 }
 
+func (c *liteVirtClient) ReceiveMigrationDisk(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_ReceiveMigrationDisk_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ReceiveMigrationDiskClient = grpc.ClientStreamingClient[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]
+
 func (c *liteVirtClient) CheckCPUCompatibility(ctx context.Context, in *CheckCPUCompatibilityRequest, opts ...grpc.CallOption) (*CheckCPUCompatibilityResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CheckCPUCompatibilityResponse)
@@ -3219,7 +3236,7 @@ func (c *liteVirtClient) GetStateDump(ctx context.Context, in *emptypb.Empty, op
 
 func (c *liteVirtClient) StreamStateDump(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[30], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_StreamStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3238,7 +3255,7 @@ type LiteVirt_StreamStateDumpClient = grpc.ServerStreamingClient[StateDumpChunk]
 
 func (c *liteVirtClient) StreamTableDump(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[31], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_StreamTableDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3267,7 +3284,7 @@ func (c *liteVirtClient) GetSensitiveStateDigest(ctx context.Context, in *Sensit
 
 func (c *liteVirtClient) StreamSensitiveStateDump(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StateDumpChunk], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[32], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_StreamSensitiveStateDump_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3296,7 +3313,7 @@ func (c *liteVirtClient) GetTableBucketDigests(ctx context.Context, in *BucketDi
 
 func (c *liteVirtClient) StreamTableRows(ctx context.Context, in *TableDumpRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[33], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3315,7 +3332,7 @@ type LiteVirt_StreamTableRowsClient = grpc.ServerStreamingClient[TableRowsPage]
 
 func (c *liteVirtClient) StreamSensitiveTableRows(ctx context.Context, in *SensitiveStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TableRowsPage], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[34], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_StreamSensitiveTableRows_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3384,7 +3401,7 @@ func (c *liteVirtClient) GetRecoveryClaim(ctx context.Context, in *GetRecoveryCl
 
 func (c *liteVirtClient) ListRecoveryClaims(ctx context.Context, in *ListRecoveryClaimsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[RecoveryClaimState], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[35], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_ListRecoveryClaims_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3613,7 +3630,7 @@ func (c *liteVirtClient) RegionStatus(ctx context.Context, in *RegionStatusReque
 
 func (c *liteVirtClient) CrossRegionMigrate(ctx context.Context, in *CrossRegionMigrateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[36], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_CrossRegionMigrate_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -3742,7 +3759,7 @@ func (c *liteVirtClient) DeleteReplicationSchedule(ctx context.Context, in *Dele
 
 func (c *liteVirtClient) PromoteReplica(ctx context.Context, in *PromoteReplicaRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PromoteReplicaProgress], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[37], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &LiteVirt_ServiceDesc.Streams[38], LiteVirt_PromoteReplica_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4228,6 +4245,9 @@ type LiteVirtServer interface {
 	EnsureFirmwareState(context.Context, *EnsureFirmwareStateRequest) (*EnsureFirmwareStateResponse, error)
 	RollbackFirmwareState(context.Context, *RollbackFirmwareStateRequest) (*RollbackFirmwareStateResponse, error)
 	CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error)
+	// ReceiveMigrationDisk takes one host-local disk file of a STOPPED VM that is
+	// being cold-migrated here, as a client stream. See ReceiveMigrationDiskRequest.
+	ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error
 	CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error)
 	// ── Internal: State Sync ──
 	GetStateDigest(context.Context, *emptypb.Empty) (*StateDigestResponse, error)
@@ -5096,6 +5116,9 @@ func (UnimplementedLiteVirtServer) RollbackFirmwareState(context.Context, *Rollb
 }
 func (UnimplementedLiteVirtServer) CleanupMigrationArtifacts(context.Context, *CleanupMigrationArtifactsRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method CleanupMigrationArtifacts not implemented")
+}
+func (UnimplementedLiteVirtServer) ReceiveMigrationDisk(grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]) error {
+	return status.Error(codes.Unimplemented, "method ReceiveMigrationDisk not implemented")
 }
 func (UnimplementedLiteVirtServer) CheckCPUCompatibility(context.Context, *CheckCPUCompatibilityRequest) (*CheckCPUCompatibilityResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CheckCPUCompatibility not implemented")
@@ -8849,6 +8872,13 @@ func _LiteVirt_CleanupMigrationArtifacts_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _LiteVirt_ReceiveMigrationDisk_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(LiteVirtServer).ReceiveMigrationDisk(&grpc.GenericServerStream[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type LiteVirt_ReceiveMigrationDiskServer = grpc.ClientStreamingServer[ReceiveMigrationDiskRequest, ReceiveMigrationDiskResponse]
+
 func _LiteVirt_CheckCPUCompatibility_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CheckCPUCompatibilityRequest)
 	if err := dec(in); err != nil {
@@ -11115,6 +11145,11 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "PushReplicaIncrement",
 			Handler:       _LiteVirt_PushReplicaIncrement_Handler,
+			ClientStreams: true,
+		},
+		{
+			StreamName:    "ReceiveMigrationDisk",
+			Handler:       _LiteVirt_ReceiveMigrationDisk_Handler,
 			ClientStreams: true,
 		},
 		{

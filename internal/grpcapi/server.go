@@ -576,6 +576,18 @@ type Server struct {
 	// costs the guest its seed on the next boot. Zero value ready.
 	migrationISOs migrationStubLedger
 
+	// hostDiskRoot is a FLEET TEST SEAM for the files a stopped VM's cold
+	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
+	// production.
+	hostDiskRoot string
+	// drainCrashAt is a FLEET TEST SEAM: drainRunningVMCold asks it at each
+	// point a daemon could die mid-move, and stops right there, as a crash
+	// would, when it returns true (SetDrainCrashForTest). Nil in production.
+	drainCrashAt func(point string) bool
+	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
+	// migration's disk copy (diskSpace). Nil in production.
+	diskSpaceOverride func(dir string) (avail, total uint64, err error)
+
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains
 	// RollbackFirmwareState removes (migrate_firmware_rollback.go). Zero value

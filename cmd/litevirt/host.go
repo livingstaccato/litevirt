@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"text/tabwriter"
@@ -232,8 +233,14 @@ func newHostDrainCmd() *cobra.Command {
 
 				for {
 					p, err := stream.Recv()
-					if err != nil {
+					if err == io.EOF {
 						break
+					}
+					if err != nil {
+						// The drain ended without moving everything: the
+						// server's "drain incomplete" names how many VMs
+						// remain, and the lines above say why each one did.
+						return fmt.Errorf("drain: %w", err)
 					}
 					if p.Error != "" {
 						fmt.Fprintf(os.Stderr, "  %s → %s [%s] ERROR: %s\n",

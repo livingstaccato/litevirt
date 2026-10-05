@@ -998,6 +998,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
+	// Before this daemon serves: no cold-migration copy can be in flight yet.
+	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
 	svc.SetAuthEngine(d.authEngine)
 	svc.SetRealmRegistry(d.realmRegistry)
@@ -1112,6 +1114,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// capability, closing the fail-open race for a should-enforce node.
 	go vmChecker.Start(ctx)
 	go reconciler.Start(ctx)
+	// Finish any drain cold move a previous process died in the middle of: the
+	// VM was running, was (or was about to be) shut down for the move, and must
+	// run again on exactly one host. It starts VMs, so it runs with the runtime
+	// loops above — after the startup recovery barrier has restored host
+	// networks and every late setter has run — and in its own goroutine,
+	// because finishing one can wait for a guest's shutdown or for the target.
+	go svc.RunDrainColdMoveRecovery(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order.

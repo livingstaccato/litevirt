@@ -168,7 +168,7 @@ func (f *fwRollbackFixture) migrate(ctx context.Context, t *testing.T) error {
 	if err != nil || vm == nil {
 		t.Fatalf("GetVM: %v", err)
 	}
-	return f.src.coldMigrateFirmwareVM(ctx, vm, &corrosion.HostRecord{Name: f.targetHostName}, f.fwSpec,
+	return f.src.coldMigrateStoppedVM(ctx, vm, &corrosion.HostRecord{Name: f.targetHostName}, f.fwSpec, &migrationAbort{},
 		func(pb.MigratePhase, float32, float32) error { return nil })
 }
 

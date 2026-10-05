@@ -12,6 +12,8 @@ package health
 // "always" currently behave identically here — the distinction is reserved for a
 // future mode that would also restart clean exits.
 
+import "strings"
+
 // state_detail markers, written by the operators/reconcilers and read back by
 // the decision when the live stop-reason isn't available.
 const (
@@ -21,6 +23,25 @@ const (
 	outOfBandDestroyDetail = "out-of-band-destroy" // libvirt destroy not initiated by an operator stop (e.g. a fence)
 	suspendedDetail        = "suspended"           // managed-save / pm-suspend / RAM-snapshot
 )
+
+// DrainStopDetailPrefix starts the state_detail host drain records when it
+// stops a running VM for a cold move: the prefix, then the move's journal
+// operation id (DrainStopDetail). It is an operator stop in every decision
+// here — the drain is the operator's — and it names the move, so the drain's
+// crash recovery can tell its own stop from any later start or stop of the
+// VM, which overwrites the detail.
+const DrainStopDetailPrefix = "drain-cold-move:"
+
+// DrainStopDetail is the state_detail of a VM stopped by the drain cold move
+// whose journal operation is operationID.
+func DrainStopDetail(operationID string) string { return DrainStopDetailPrefix + operationID }
+
+// IsOperatorStop reports whether a state_detail records a deliberate stop:
+// an operator's (StopVM) or a host drain's for a cold move. Neither is ever
+// restarted, reconciled to running, or treated as a crash.
+func IsOperatorStop(detail string) bool {
+	return detail == operatorStopDetail || strings.HasPrefix(detail, DrainStopDetailPrefix)
+}
 
 // classifyStop maps a domain's coarse state + normalized stop reason to the
 // (state, state_detail) the reconciler should persist when it finds a VM that
@@ -76,7 +97,7 @@ func restartDecision(cause, stateDetail string, hasManagedSave bool, condition s
 		return false, "suspended (managed-save) — resume, never cold-restart"
 	}
 	// Operator explicitly stopped it → stick.
-	if stateDetail == operatorStopDetail {
+	if IsOperatorStop(stateDetail) {
 		return false, "operator stop — stick"
 	}
 

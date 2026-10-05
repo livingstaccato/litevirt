@@ -11,6 +11,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/opjournal"
 )
 
@@ -357,5 +358,47 @@ func TestMigrateVM_AFirstDetachFailureClearsTheLease(t *testing.T) {
 	r.assertVFsHome(t, "after the detach failed")
 	if _, found := migrationLease(t, j, "vf-vm"); found {
 		t.Error("the lease outlived a migration in which no VF left the guest")
+	}
+}
+
+// TestMigrateVM_AFailureWithTheGuestPausedKeepsTheVFs: libvirt fails and leaves
+// the guest paused. A paused guest is still active and resumes in place, so its
+// VFs must not go back to the pool: they stay owned and bound, the lease stays
+// for recovery, and a VM event says they are out of the guest.
+func TestMigrateVM_AFailureWithTheGuestPausedKeepsTheVFs(t *testing.T) {
+	r := vfMigrationRig(t, "0000:41:10.0")
+	j := r.withLeaseJournal(t)
+	r.fake.FailMigrateToTarget = func(string, string) error {
+		r.fake.SetState("vf-vm", libvirtfake.StatePaused)
+		return errors.New("injected libvirt migration failure")
+	}
+
+	if err := r.migrate(t); err == nil {
+		t.Fatal("the migration succeeded; the scenario needs libvirt to fail it")
+	}
+	ctx := adminCtx()
+	for _, a := range r.vfs {
+		if o := pciOwnerOf(t, ctx, r.s, a); o != "vf-vm" {
+			t.Errorf("VF %s owned by %q after a failure that left the guest paused, want vf-vm — released from a guest that will resume", a, o)
+		}
+		if !r.fs.isBound(a) {
+			t.Errorf("VF %s unbound from a paused guest's reservation", a)
+		}
+	}
+	if e, found := migrationLease(t, j, "vf-vm"); !found || e.Stage != deviceLeaseStageMigrationDetached {
+		t.Errorf("the lease must be kept for recovery: %+v found=%v", e, found)
+	}
+	evs, err := corrosion.ListVMEvents(ctx, r.s.db, "vf-vm", 50, "")
+	if err != nil {
+		t.Fatalf("ListVMEvents: %v", err)
+	}
+	seen := false
+	for _, ev := range evs {
+		if ev.Result == "error" && strings.Contains(ev.Detail, "0000:41:10.0") {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Errorf("no error VM event names the VF left out of the paused guest; events: %+v", evs)
 	}
 }

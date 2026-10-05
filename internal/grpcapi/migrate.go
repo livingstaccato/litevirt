@@ -1925,24 +1925,37 @@ func (s *Server) reattachVFsOnSource(ctx context.Context, vmName string, vfs []c
 		s.endMigrationVFLease(vmName) // written, but no VF left the guest
 		return
 	}
-	st, err := s.sourceDomainState(vmName)
-	if err != nil {
-		// Unknown: the VFs stay owned and the lease stays for restart recovery.
-		slog.Warn("migrate: VFs detached for the move not reattached — the domain's state is unreadable",
-			"vm", vmName, "error", err, "vfs", len(vfs))
+	// Keyed on the same disposition restart recovery uses: coarse DomainState
+	// folds paused and pm-suspended into "stopped", and releasing the VFs of
+	// a guest that will resume in place is the loss this exists to prevent.
+	if s.virt == nil {
+		slog.Warn("migrate: VFs detached for the move not reattached — libvirt not connected", "vm", vmName, "vfs", len(vfs))
 		return
 	}
-	if st != "running" {
+	switch s.recoveryDomainDisposition(vmName) {
+	case dispRunning:
+	case dispShutoff:
 		// Nothing to put them into, and the VM keeps owning them until here:
 		// give them back to the pool, as a stopped guest's devices are
 		// allocated again when it starts.
-		slog.Warn("migrate: VFs detached for the move released — the domain is not running",
-			"vm", vmName, "state", st, "vfs", len(vfs))
+		slog.Warn("migrate: VFs detached for the move released — the domain is shut off",
+			"vm", vmName, "vfs", len(vfs))
 		if rerr := s.unbindAndReleaseOwnership(ctx, vmName, pciAddresses(vfs)); rerr != nil {
 			slog.Error("migrate: releasing the VFs of a guest that stopped", "vm", vmName, "error", rerr)
 			return
 		}
 		s.endMigrationVFLease(vmName)
+		return
+	default:
+		// Paused, pm-suspended, or unreadable: the guest may resume here. The
+		// VFs stay owned + bound and the lease stays for restart recovery.
+		for _, vf := range vfs {
+			slog.Error("migrate: VF detached for the move left out of a guest that is not running — kept for it",
+				"vm", vmName, "address", vf.Address)
+			s.recordVMEvent(ctx, vmName, "device.attached", "error",
+				"VF "+vf.Address+" detached for a migration that did not happen is not back in the guest, which is not running; "+
+					"it stays reserved for the VM and a daemon restart retries the reattach")
+		}
 		return
 	}
 	allBack := true

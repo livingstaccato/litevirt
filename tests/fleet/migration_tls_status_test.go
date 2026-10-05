@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -52,6 +54,31 @@ func TestFleet_MigrationTLSStatusFansOutToEveryHost(t *testing.T) {
 	}
 	if !rows[c.Nodes[2].Name].GetAllowUnencryptedStorage() {
 		t.Errorf("%s allows plaintext but its row does not say so", c.Nodes[2].Name)
+	}
+}
+
+// A peer whose daemon cannot install its migration credentials says so in its
+// row, through the fan-out, so the doctor and the rotation's gates see it.
+//
+// Mutation: do not copy the install hook's error into the row — node-2's row
+// reads clean.
+func TestFleet_MigrationTLSStatusReportsAnInstallRefusal(t *testing.T) {
+	c := New(t, Options{Nodes: 3, SharedCRDT: true})
+	defer c.Stop()
+	for _, n := range c.Nodes {
+		reportsCA(n, "old", "old")
+		migrationTLSReady(n, true)
+	}
+	c.Nodes[1].Server.SetMigrationTLS(func() (bool, error) {
+		return false, errors.New("cannot tell which user QEMU runs as")
+	})
+
+	rows := migrationTLSRows(t, c, c.Nodes[0])
+	if r := rows[c.Nodes[1].Name]; r == nil || !strings.Contains(r.GetInstallError(), "QEMU runs as") {
+		t.Fatalf("%s row = %v; want its install refusal", c.Nodes[1].Name, r)
+	}
+	if r := rows[c.Nodes[2].Name]; r.GetInstallError() != "" || r.GetError() != "" {
+		t.Errorf("healthy peer row = %v; want no install error", r)
 	}
 }
 

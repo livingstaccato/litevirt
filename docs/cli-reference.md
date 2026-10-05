@@ -96,6 +96,11 @@ lv host install-gossip-key                # Put the cluster gossip key on every 
 lv host install-migration-tls             # Issue every host the migration-TLS credentials that
   [--reissue] [--ssh-user root]           #   encrypt storage migrations (mints the migration CA if
                                           #   none). See migration-failover.md "Migration with local disks"
+lv host rotate-migration-ca               # Replace the migration CA on every host, in three gated
+  [--no-overlap] [--force]                #   phases (trust-both, reissue, drop-old); resumable.
+  [--ssh-user root]                       #   --no-overlap: one pass, for a compromised CA key.
+                                          #   --force: leave unreachable hosts behind. See
+                                          #   migration-failover.md "Rotating the migration CA"
 lv host rotate-gossip-key                 # Replace the gossip key everywhere, live, in three
   [--grace 30s] [--timeout 2m]            #   barriered phases; re-run to settle an interrupted one
   [--ssh-user root]
@@ -890,7 +895,7 @@ TRUSTS (the migration CAs it trusts), CERT FROM (which CA issued its
 certificate), EXPIRES — and exits non-zero when a host is unreachable, holds a
 set its daemon would refuse to install, expires within 90 days, falls back to
 plaintext (`migration.allow_unencrypted_storage`), or trusts a different CA
-set from its peers while no rotation (`lv host rotate-migration-ca`) is running from this machine. <!-- ci:skip-cmd: rotate-migration-ca ships in a later task -->
+set from its peers while no rotation (`lv host rotate-migration-ca`) is running from this machine.
 
 ## Ansible integration
 

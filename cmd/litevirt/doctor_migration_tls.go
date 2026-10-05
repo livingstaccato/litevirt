@@ -29,7 +29,7 @@ certificate, and when they expire. Read-only.
 Exits non-zero when a host is unreachable, holds a set its daemon would refuse
 to install, expires within 90 days, falls back to plaintext
 (migration.allow_unencrypted_storage), or trusts a different CA set from its
-peers while no 'lv host rotate-migration-ca' is running from this machine.`, // ci:skip-cmd: rotate-migration-ca ships in a later task
+peers while no 'lv host rotate-migration-ca' is running from this machine.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -101,7 +101,7 @@ func printMigrationTLSRows(rows []*pb.MigrationTLSHostStatus, now time.Time) {
 			state, expires = "error", r.GetError()
 		case !r.GetProvisioned():
 			state = "none"
-		case r.GetValidationError() != "":
+		case r.GetValidationError() != "", r.GetInstallError() != "":
 			state = "invalid"
 		}
 		if len(r.GetTrustedCas()) > 0 {
@@ -149,6 +149,12 @@ func migrationTLSProblems(rows []*pb.MigrationTLSHostStatus, rotating bool, now 
 		if r.GetValidationError() != "" {
 			out = append(out, fmt.Sprintf("%s: %s", h, r.GetValidationError()))
 		}
+		// The installer validates first, so its refusal of an invalid set
+		// repeats the validation error; report it only when it says more.
+		if ie := r.GetInstallError(); ie != "" &&
+			(r.GetValidationError() == "" || !strings.Contains(ie, r.GetValidationError())) {
+			out = append(out, fmt.Sprintf("%s: its daemon cannot install migration credentials: %s", h, ie))
+		}
 		deadline := now.Add(pki.MigrationExpiryWarning)
 		if t := r.GetCertNotAfter(); t != nil && t.AsTime().Before(deadline) {
 			out = append(out, fmt.Sprintf("%s: host certificate expires %s; run `lv host install-migration-tls --reissue`",
@@ -158,7 +164,7 @@ func migrationTLSProblems(rows []*pb.MigrationTLSHostStatus, rotating bool, now 
 		for _, ca := range r.GetTrustedCas() {
 			fps = append(fps, ca.GetFingerprint())
 			if t := ca.GetNotAfter(); t != nil && t.AsTime().Before(deadline) {
-				out = append(out, fmt.Sprintf("%s: CA %s expires %s; run `lv host rotate-migration-ca`", // ci:skip-cmd: ships in a later task
+				out = append(out, fmt.Sprintf("%s: CA %s expires %s; run `lv host rotate-migration-ca`",
 					h, shortFP(ca.GetFingerprint()), t.AsTime().Format("2006-01-02")))
 			}
 		}

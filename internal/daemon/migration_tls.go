@@ -76,9 +76,13 @@ func qemuOwner(confPath string, lookup func(string) (*user.User, error)) (int, i
 // host's migration credentials into QEMU's TLS directory, owned by the QEMU
 // user, and reports whether they are in place. It runs at daemon start and
 // before each storage migration, so credentials pushed by
-// `lv host install-migration-tls` take effect without a restart.
+// `lv host install-migration-tls` take effect without a restart. MigrationTLSStatus
+// runs it too, to report what it would install. Calls are serialized on
+// d.migrationTLSMu.
 func (d *Daemon) migrationTLSInstaller() func() (bool, error) {
 	return func() (bool, error) {
+		d.migrationTLSMu.Lock()
+		defer d.migrationTLSMu.Unlock()
 		uid, gid, err := qemuOwner(qemuConfPath, user.Lookup)
 		if err != nil {
 			return false, err
@@ -88,7 +92,8 @@ func (d *Daemon) migrationTLSInstaller() func() (bool, error) {
 }
 
 // migrationTLSStatusRow is this host's MigrationTLSStatus answer. The server
-// fills in the host name and the plaintext flag.
+// fills in the host name, the plaintext flag and, by running the install hook,
+// install_error.
 func migrationTLSStatusRow(info pki.MigrationTLSInfo, err error) *pb.MigrationTLSHostStatus {
 	if err != nil {
 		return &pb.MigrationTLSHostStatus{Error: err.Error()}
@@ -113,7 +118,7 @@ func logMigrationExpiry(log *slog.Logger, info pki.MigrationTLSInfo, now time.Ti
 	for _, e := range info.Expiring(now) {
 		fix := "`lv host install-migration-tls --reissue`"
 		if strings.HasPrefix(e.What, "CA ") {
-			fix = "`lv host rotate-migration-ca`" // ci:skip-cmd: ships in a later task
+			fix = "`lv host rotate-migration-ca`"
 		}
 		level, verb := slog.LevelWarn, "expires"
 		if e.Expired {

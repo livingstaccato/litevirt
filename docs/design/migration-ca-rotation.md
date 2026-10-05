@@ -1,6 +1,6 @@
 # Rotating the migration CA
 
-Status: **proposed, not implemented.**
+Status: **implemented.**
 
 ## Why
 
@@ -68,8 +68,8 @@ It sits beside `install-migration-tls` and reaches hosts the same way
 |---|---|
 | `migration-ca.crt` / `.key` | the current CA |
 | `migration-ca.next.crt` / `.key` | the new CA; exists only mid-rotation (key 0600) |
-| `migration-rotation.json` | `phase` (`trust-both`, `reissued`, `drop-old`, `done`), `no_overlap`, the new CA's fingerprint, and per host which phases completed or were `skipped` |
-| `migration-ca.retired-<YYYYMMDD>.crt` | the old CA certificate, kept for audit after a rotation; its key is deleted |
+| `migration-rotation.json` | `phase` (`trust-both`, `reissue`, `drop-old`, `cutover` (`--no-overlap`'s single pass), `done`), `no_overlap`, the new CA's fingerprint, and per host which phases completed or were `skipped`. It remains after a rotation, recording the last one with phase `done`, and is overwritten by the next |
+| `migration-ca.retired-<YYYYMMDD>.crt` | the old CA certificate, kept for audit after a rotation (`-2`, `-3`, … for further rotations the same day; a retired certificate is never overwritten); its key is deleted |
 
 Re-running the command reads `migration-rotation.json` and continues from where
 it stopped. It never mints a second `next` CA: if `migration-ca.next.crt`
@@ -90,7 +90,8 @@ current phase's unfinished hosts.
    because every host trusts both CAs.
 3. **drop-old.** Each host's `ca.crt` becomes the new CA alone. Only then does
    the operator machine rename `migration-ca.next.*` over `migration-ca.*`,
-   delete the old key, keep the old certificate as `retired-<date>`, and mark
+   delete the old key, keep the old certificate as `retired-<date>` (`-2`,
+   `-3`, … for further rotations the same day), and mark
    the rotation `done`.
 
 ### Gates
@@ -100,7 +101,12 @@ every host to report what that phase delivered — asking the daemon what it
 would *install*, not reading files over SSH, so a host whose daemon cannot
 install them (a refused `/etc/pki/qemu`, a failed validation) holds the gate.
 
-- Before phase 2: every host trusts the new CA's fingerprint.
+- Before a fresh start (not on resume), before anything is minted: every host
+  answers, holds a complete set that passes validation and that its daemon can
+  install, and trusts this machine's current migration CA. `--force` passes a
+  host that cannot answer; nothing passes the rest.
+- Before phase 2: every host trusts the new CA's fingerprint, with a set that
+  passes validation.
 - Before phase 3: every host's certificate was issued by the new CA.
 
 ### `--no-overlap`
@@ -161,14 +167,18 @@ host:
 - `trusted_ca_fingerprints` — SHA-256 of each CA in `ca.crt`;
 - `cert_issuer_fingerprint` — the CA that issued the host certificate;
 - `cert_not_after` and each CA's `not_after`;
-- `allow_unencrypted_storage` — this host would fall back to plaintext.
+- `allow_unencrypted_storage` — this host would fall back to plaintext;
+- `install_error` — why the daemon's install hook, run for the answer, refused
+  the set (a refused `/etc/pki/qemu`, an unresolvable QEMU user). Every gate
+  requires it empty.
 
 The daemon the CLI calls answers for itself and fans out to every host in the
 `hosts` table through `s.peerClient`, with `local_only=true` so the fan-out does
 not recurse. An unreachable host, or one returning `Unimplemented` (an older
-build), becomes a row with `error` set, not a failed call. The RPC is read-only
-and returns nothing secret, so it takes the role the other read-only doctor
-RPCs take.
+build), becomes a row with `error` set, not a failed call. The RPC changes
+nothing an operator owns (the install it runs is the same change-only,
+serialized install a storage migration runs) and returns nothing secret, so it
+takes the role the other read-only doctor RPCs take.
 
 ### Command
 

@@ -735,8 +735,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// container instead: refusing would leave it down without removing the
 	// attachment, so they warn and audit, as a takeover promote does.
 	ctNets := containerSpecNetworkNames(corrosion.DecodeCreateSpec(spec.CreateSpec))
-	if req.Proof != nil || s.migrateSourceFromPeer(ctx) != "" {
-		s.warnForeignNetworks(ctx, "ct.restore", req.Name, project, ctNets)
+	var foreignNets []string // recorded only once the restored row has landed
+	if s.isPeerRelocation(ctx, req.Proof != nil) || s.migrateSourceFromPeer(ctx) != "" {
+		foreignNets = s.foreignNetworks(ctx, "ct.restore", req.Name, project, ctNets)
 	} else if err := s.admitCopiedNetworks(ctx, "restore", project, project, ctNets); err != nil {
 		s.audit(ctx, "ct.restore", req.Name, "project="+project, "denied")
 		return err
@@ -779,7 +780,9 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// and accounts for the same figures.
 	var restoreQuotaLease *reservationLease
 	if s.migrateSourceFromPeer(ctx) == "" {
-		relocation := req.Proof != nil || relocateTokenFromMD(ctx) != ""
+		// Peer-only: the token is plain client metadata, so an operator setting it
+		// must not skip the project's quota (isPeerRelocation).
+		relocation := s.isPeerRelocation(ctx, req.Proof != nil)
 		// Unconditional, like CreateContainer: an archived spec with no limits
 		// still restores into RESIDENCY, and that is the safety decision.
 		{
@@ -1010,6 +1013,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// host-local proof marker is no longer needed (any future retry hits the "row already
 	// exists" guard above, never the resume path). Drop it best-effort.
 	s.removeRestoreMarker(req.Name)
+	s.recordForeignNetworks(ctx, "ct.restore", req.Name, foreignNets)
 	// Mark the relocation proof terminal (single-use) so a duplicate restore of the same
 	// attempt can't re-import.
 	if restoreProofID != "" {

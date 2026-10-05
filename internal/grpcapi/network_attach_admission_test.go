@@ -588,3 +588,97 @@ func TestAdmitCopiedNetworks_RawBridge(t *testing.T) {
 		t.Fatalf("cross-project copy onto a global network: %v", err)
 	}
 }
+
+// seedForeignCTBackup backs up container ct1 (project acme, CPU 1 / 256 MiB) whose
+// only NIC is on network, on a peer-aware server ("self", knows "peer-1"), then
+// drops its row so a restore must rebuild it.
+func seedForeignCTBackup(t *testing.T, network string) (s *Server, repo, ts string) {
+	t.Helper()
+	s = newPeerAuthServer(t)
+	s.dataDir = t.TempDir()
+	s.gate = fakeServerGate{execOK: true}
+	seedAdmissionNetworks(t, s)
+	s.SetContainerRuntime(&fakeCTRuntime{exportPayload: []byte("rootfs")})
+	repo, ts = ctTestRepo(t), "2026-07-03T11:00:00Z"
+	ctx := adminCtx()
+	if err := corrosion.UpsertContainer(ctx, s.db, corrosion.ContainerRecord{
+		HostName: "self", Name: "ct1", State: "stopped", Image: "alpine:3.19", Project: "acme",
+		CPULimit: 1, MemMiB: 256,
+		CreateSpec: corrosion.EncodeCreateSpec(corrosion.ContainerCreateSpec{
+			Template: "download", Distro: "alpine",
+			Networks: []corrosion.ContainerNetwork{{Name: "eth0", NetworkName: network}},
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BackupContainer(&pb.BackupContainerRequest{Name: "ct1", HostName: "self", RepoPath: repo, Timestamp: ts},
+		&progressStream[pb.BackupContainerProgress]{ctx: adminCtx()}); err != nil {
+		t.Fatalf("BackupContainer: %v", err)
+	}
+	_ = corrosion.DeleteContainer(ctx, s.db, "self", "ct1")
+	return s, repo, ts
+}
+
+// Before split_brain_gate_v1 latches the coordinator's relocation carries only
+// its token. Over a trusted peer cert that is still a relocation: it re-homes
+// the container onto its existing network and audits, rather than being
+// refused and falling back to a fresh image-recreate.
+func TestRestoreContainer_ProoflessPeerRelocationOnForeignNetworkProceeds(t *testing.T) {
+	s, repo, ts := seedForeignCTBackup(t, "beta-net")
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
+		&progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx("reloc-token-2")}); err != nil {
+		t.Fatalf("a proofless peer relocation must not be blocked by network admission: %v", err)
+	}
+	if row, _ := corrosion.GetContainer(context.Background(), s.db, "self", "ct1"); row == nil {
+		t.Fatal("relocation did not land the container row")
+	}
+	wantForeignNetworkAudit(t, s, "ct.restore", "ct1", "beta-net")
+}
+
+// The token is plain client metadata. An operator who sets it is still an
+// operator: refused onto a foreign network, and charged the project's quota.
+func TestRestoreContainer_ForgedRelocationTokenIsNotARelocation(t *testing.T) {
+	forged := func() context.Context {
+		return metadata.NewIncomingContext(adminCtx(), metadata.Pairs(relocateTokenMDKey, "forged-token"))
+	}
+	t.Run("foreign network refused", func(t *testing.T) {
+		s, repo, ts := seedForeignCTBackup(t, "beta-net")
+		err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
+			&progressStream[pb.RestoreContainerProgress]{ctx: forged()})
+		wantNetworkRefused(t, err, "restore", "beta-net")
+	})
+	t.Run("quota charged", func(t *testing.T) {
+		s, repo, ts := seedForeignCTBackup(t, "shared-net")
+		quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{MemMiBLimit: 128})
+		err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
+			&progressStream[pb.RestoreContainerProgress]{ctx: forged()})
+		if status.Code(err) != codes.ResourceExhausted {
+			t.Fatalf("a 256 MiB restore into a 128 MiB quota with a forged relocation token: got %v, want ResourceExhausted", err)
+		}
+	})
+}
+
+// The allowed-foreign-network record is written only once the takeover has
+// committed: a takeover that fails afterwards leaves no record that it went ahead.
+func TestPromoteReplica_FailedTakeoverLeavesNoForeignNetworkAudit(t *testing.T) {
+	s := testServer(t)
+	s.dataDir = t.TempDir()
+	fake := libvirtfake.New()
+	fake.FailDefineDomain = func(string) error { return errors.New("define boom") }
+	s.virt = fake
+	seedAdmissionNetworks(t, s)
+	seedPromotableVM(t, s, "dead-host", "failed", "acme", 1, 512)
+	setPromotableNetwork(t, s, "beta-net")
+
+	if err := promoteVM(s, &pb.PromoteReplicaRequest{VmName: "vm1"}); err == nil {
+		t.Fatal("the injected define failure should fail the takeover")
+	}
+	rows, err := s.db.Query(context.Background(),
+		`SELECT detail FROM audit_log WHERE result = 'allowed-foreign-network'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("a failed takeover left %d allowed-foreign-network audit rows", len(rows))
+	}
+}

@@ -93,15 +93,17 @@ func (s *Server) admitCopiedNetworks(ctx context.Context, op, targetProject, sou
 	return nil
 }
 
-// warnForeignNetworks is the non-blocking counterpart of admitCopiedNetworks for
-// a path that RE-HOMES an existing workload rather than creating an attachment:
-// takeover promote (manual or automated failover) and container relocation.
-// Refusing there would leave a fenced host's workload down without removing the
-// attachment it already holds, so the same managed-network check runs and a
-// failure is logged and audited ("allowed-foreign-network") instead of refused.
-// Such a workload can only exist through an attachment made before every path
-// was admitted; the record tells the operator where to look.
-func (s *Server) warnForeignNetworks(ctx context.Context, action, workload, project string, networkNames []string) {
+// foreignNetworks is the non-blocking counterpart of admitCopiedNetworks for a
+// path that RE-HOMES an existing workload rather than creating an attachment:
+// takeover promote (manual or automated failover), container relocation and
+// cold migrate. Refusing there would leave a fenced host's workload down without
+// removing the attachment it already holds, so the same managed-network check
+// runs and returns each refusal's message instead. The caller records them with
+// recordForeignNetworks only once the re-home has committed, so a takeover that
+// fails later leaves no record claiming it went ahead. A lookup error is logged
+// and not returned: it is not evidence of a foreign network.
+func (s *Server) foreignNetworks(ctx context.Context, action, workload, project string, networkNames []string) []string {
+	var out []string
 	for _, name := range networkNames {
 		if name == "" {
 			continue
@@ -116,10 +118,31 @@ func (s *Server) warnForeignNetworks(ctx context.Context, action, workload, proj
 				"action", action, "workload", workload, "network", name, "error", msg)
 			continue
 		}
-		slog.Warn("network admission: re-homing a workload on a network its project may not use",
-			"action", action, "workload", workload, "network", name, "reason", msg)
+		out = append(out, msg)
+	}
+	return out
+}
+
+// recordForeignNetworks logs and audits ("allowed-foreign-network") each
+// refusal foreignNetworks returned, after the re-home it describes committed.
+// Such a workload can only exist through an attachment made before every path
+// was admitted; the record tells the operator where to look.
+func (s *Server) recordForeignNetworks(ctx context.Context, action, workload string, refusals []string) {
+	for _, msg := range refusals {
+		slog.Warn("network admission: re-homed a workload on a network its project may not use",
+			"action", action, "workload", workload, "reason", msg)
 		s.audit(ctx, action, workload, msg, "allowed-foreign-network")
 	}
+}
+
+// isPeerRelocation reports whether a container restore is a failover
+// relocation driven by the coordinator: a carried relocation proof (which the
+// handler has already required to arrive over peer mTLS), or, before
+// split_brain_gate_v1 latches and the proof is omitted, the relocation token
+// over a trusted peer cert. The token alone is plain client metadata that any
+// operator can set, so it never counts without the peer transport.
+func (s *Server) isPeerRelocation(ctx context.Context, proof bool) bool {
+	return proof || (relocateTokenFromMD(ctx) != "" && s.requirePeerCert(ctx) == nil)
 }
 
 // admitManagedNetwork is the managed-network half of admitNetworkAttach: a name

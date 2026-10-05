@@ -66,18 +66,14 @@ var (
 //     everywhere and may be some other host's live disk;
 //   - delete_with_vm is set: an adopted or foreign disk is never freed by a
 //     VM delete;
-//   - it was soft-deleted no earlier than this incarnation was created. Create
-//     purges a name's tombstoned rows on one path only, so a row left by a
-//     PREVIOUS VM of the same name — one deleted with --keep-disks, whose files
-//     were kept on purpose — can still be here, and its deleted_at predates
-//     this VM. deleted_at has second precision, so created_at is truncated to
-//     the second; an unparseable stamp keeps the file.
+//   - it was soft-deleted STRICTLY AFTER this incarnation was created
+//     (detachedAfterCreate). A row left by a PREVIOUS VM of the same name —
+//     one deleted with --keep-disks, whose files were kept on purpose — can
+//     still be here: InsertVMWithHardware purges a name's tombstoned rows,
+//     but BeginVMCreateOperation instead re-stamps them with deleted_at set to
+//     the new VM's created_at, to the nanosecond. Equal is therefore the
+//     predecessor's signature and is kept.
 func departedDetachedDisks(self, createdAt string, rows []corrosion.SoftDeletedDisk) map[string][]string {
-	created, err := time.Parse(time.RFC3339Nano, createdAt)
-	if err != nil {
-		return nil
-	}
-	created = created.Truncate(time.Second)
 	out := map[string][]string{}
 	for _, r := range rows {
 		if r.HostName == "" || r.HostName == self || r.Path == "" {
@@ -86,13 +82,28 @@ func departedDetachedDisks(self, createdAt string, rows []corrosion.SoftDeletedD
 		if !isHostLocalDiskDriver(r.StorageType) || !r.DeleteWithVM {
 			continue
 		}
-		deleted, derr := time.Parse(time.RFC3339Nano, r.DeletedAt)
-		if derr != nil || deleted.Before(created) {
+		if !detachedAfterCreate(r.DeletedAt, createdAt) {
 			continue
 		}
 		out[r.HostName] = append(out[r.HostName], r.Path)
 	}
 	return out
+}
+
+// detachedAfterCreate reports whether a soft-delete stamp is strictly after an
+// incarnation's created_at, both compared untruncated. deleted_at from a
+// detach has second precision, so a detach in the create's own second reads
+// as no later than it and the file is kept; so is anything unparseable.
+func detachedAfterCreate(deletedAt, createdAt string) bool {
+	created, err := time.Parse(time.RFC3339Nano, createdAt)
+	if err != nil {
+		return false
+	}
+	deleted, err := time.Parse(time.RFC3339Nano, deletedAt)
+	if err != nil {
+		return false
+	}
+	return deleted.After(created)
 }
 
 // planDeletedVMLeftovers reads, BEFORE the tombstone, what the delete will ask
@@ -205,6 +216,14 @@ func (s *Server) cleanupDeletedVMLeftoversOn(ctx context.Context, host, vmName s
 //   - this host's replica has a soft-deleted row of THIS VM naming THIS host at
 //     exactly that path, host-local and delete_with_vm — the deleting host's
 //     list is a request, not evidence;
+//   - it is THIS incarnation's, by this host's own replica: the tombstoned
+//     row's created_at is readable, the disk row's deleted_at is strictly
+//     after it, and so is the file's modification time. The row check alone
+//     cannot see a predecessor once the tombstone has re-stamped every disk
+//     row of the name; the file can — what a --keep-disks predecessor kept was
+//     last written before this VM existed, while a disk attached to this VM
+//     was made, and written, after. This holds however the request arrives,
+//     an admin calling CleanupMigrationArtifacts directly included;
 //   - the VM has no live snapshot row (its snapshot chain may run through it);
 //   - no live disk row of any VM uses it as its file, backing image or
 //     linked-clone base;
@@ -214,10 +233,15 @@ func (s *Server) cleanupDeletedVMLeftoversOn(ctx context.Context, host, vmName s
 // An unreadable answer to any of these keeps the file.
 func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.CleanupMigrationArtifactsRequest, vm *corrosion.VMRecord) (*emptypb.Empty, error) {
 	name := req.VmName
+	// The lock serializes with this host's other lockVM holders (delete,
+	// hotplug, migration out). It does NOT hold off a create of the same name —
+	// createVM does not take it — or a migration in (EnsureDisks does not
+	// either). Those are refused by the live-row and domain checks below, read
+	// as late as possible; a create that lands between those reads and the
+	// removals is the residual window, and it needs a row first, which is what
+	// both checks see.
 	unlock := s.lockVM(name)
 	defer unlock()
-	// Re-read under the lock: a create or migration of the same name here
-	// holds it.
 	if cur, err := corrosion.GetVM(ctx, s.db, name); err != nil {
 		return nil, status.Errorf(codes.Unavailable, "read the record of %q: %v", name, err)
 	} else if cur != nil {
@@ -250,9 +274,17 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 			"vm", name, "snapshots", len(snaps), "error", serr)
 		return &emptypb.Empty{}, nil
 	}
+	createdAt, cerr := corrosion.GetTombstonedVMCreatedAt(ctx, s.db, name)
+	if cerr != nil || createdAt == "" {
+		slog.Warn("deleted VM leftovers: cannot tell which incarnation was deleted; keeping its detached disks",
+			"vm", name, "error", cerr)
+		return &emptypb.Empty{}, nil
+	}
+	created, _ := time.Parse(time.RFC3339Nano, createdAt)
 	recorded := map[string]bool{}
 	for _, r := range rows {
-		if r.HostName == s.hostName && isHostLocalDiskDriver(r.StorageType) && r.DeleteWithVM && r.Path != "" {
+		if r.HostName == s.hostName && isHostLocalDiskDriver(r.StorageType) && r.DeleteWithVM && r.Path != "" &&
+			detachedAfterCreate(r.DeletedAt, createdAt) {
 			recorded[r.Path] = true
 		}
 	}
@@ -267,7 +299,9 @@ func (s *Server) removeDeletedVMLeftoversHere(ctx context.Context, req *pb.Clean
 		case !s.withinDiskArtifactRoot(p):
 			keep("outside a disk-artifact root")
 		case !recorded[p]:
-			keep("this host's replica does not record it as a disk detached from the VM here")
+			keep("this host's replica does not record it as a disk detached from this incarnation here")
+		case !modifiedAfter(p, created):
+			keep("the file was last written before this incarnation was created (or cannot be read)")
 		default:
 			// Exempting no VM: this one has no live rows left to exempt.
 			if referenced, why, _ := s.pathStillReferenced(ctx, p, "", ""); referenced {
@@ -325,4 +359,11 @@ func (s *Server) localDomainUsesPath(p string) (bool, string) {
 		}
 	}
 	return false, ""
+}
+
+// modifiedAfter reports whether p's modification time is strictly after t.
+// An unreadable file answers no.
+func modifiedAfter(p string, t time.Time) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !t.IsZero() && fi.ModTime().After(t)
 }

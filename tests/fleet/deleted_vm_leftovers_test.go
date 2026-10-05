@@ -43,12 +43,6 @@ func TestFleet_DeleteRemovesWhatTheVMLeftOnAHostItMigratedFrom(t *testing.T) {
 			srcData := filepath.Join(c.tmpRoot, src.Name, "data")
 
 			post1 := filepath.Join(srcData, "disks", "os1-post1.qcow2")
-			if err := os.MkdirAll(filepath.Dir(post1), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			if err := qcow2.Create(post1, 1<<30, nil); err != nil {
-				t.Fatal(err)
-			}
 			if err := corrosion.InsertVM(ctx, src.DB, corrosion.VMRecord{
 				Name: "os1", HostName: src.Name, State: "running", CPUActual: 1, MemActual: 512,
 			}, nil, []corrosion.DiskRecord{
@@ -58,6 +52,20 @@ func TestFleet_DeleteRemovesWhatTheVMLeftOnAHostItMigratedFrom(t *testing.T) {
 					SizeBytes: 1 << 30, StorageType: "local", TargetDev: "vdb"},
 			}); err != nil {
 				t.Fatalf("InsertVM: %v", err)
+			}
+			// lv attach-disk made the file after the VM existed.
+			if err := os.MkdirAll(filepath.Dir(post1), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := qcow2.Create(post1, 1<<30, nil); err != nil {
+				t.Fatal(err)
+			}
+			// os1 has existed for an hour: deleted_at has second precision, and a
+			// detach or delete in the create's own second is not provably this
+			// incarnation's, so its file would be kept.
+			if _, err := src.DB.ExecuteRows(ctx, `UPDATE vms SET created_at = ? WHERE name = 'os1'`,
+				time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano)); err != nil {
+				t.Fatal(err)
 			}
 			// lv detach-disk os1 post1: the row is soft-deleted, the file kept.
 			if err := corrosion.SoftDeleteDisk(ctx, src.DB, "os1", "post1"); err != nil {

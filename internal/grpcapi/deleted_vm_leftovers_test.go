@@ -25,7 +25,9 @@ import (
 //
 // Mutations: drop the self check — the "self" row is planned; drop the storage
 // check — the "nfs" row is; drop delete_with_vm — "adopted" is; drop the
-// incarnation check — "previous VM" is. Each makes the result differ.
+// incarnation check — "previous VM" is; compare against a truncated or
+// non-strict created_at — "begin-create re-stamp" (deleted_at == created_at to
+// the nanosecond, as BeginVMCreateOperation writes a predecessor's rows) is.
 func TestDepartedDetachedDisks_OnlyThisIncarnationsLocalDetachesElsewhere(t *testing.T) {
 	created := "2026-10-05T10:00:00.700000000Z"
 	row := func(disk, host, typ string, withVM bool, deletedAt string) corrosion.SoftDeletedDisk {
@@ -39,8 +41,13 @@ func TestDepartedDetachedDisks_OnlyThisIncarnationsLocalDetachesElsewhere(t *tes
 	}
 	rows := []corrosion.SoftDeletedDisk{
 		row("post1", "node-3", "local", true, "2026-10-05T11:00:00Z"),
-		// Same second as the create: deleted_at has second precision.
-		row("post2", "node-3", "dir", true, "2026-10-05T10:00:00Z"),
+		row("post2", "node-3", "dir", true, "2026-10-05T10:00:01Z"),
+		// The same second as the create, which deleted_at's second precision
+		// cannot order after it: kept, the safe direction.
+		row("same second", "node-3", "local", true, "2026-10-05T10:00:00Z"),
+		// BeginVMCreateOperation re-stamps a predecessor's rows with the new
+		// VM's created_at itself.
+		row("begin-create re-stamp", "node-3", "local", true, created),
 		row("self", "node-1", "local", true, "2026-10-05T11:00:00Z"),
 		row("nfs", "node-3", "nfs", true, "2026-10-05T11:00:00Z"),
 		row("adopted", "node-3", "local", false, "2026-10-05T11:00:00Z"),
@@ -76,12 +83,6 @@ func newLeftoverHost(t *testing.T) *leftoverHost {
 	s.virt = fake
 	ctx := adminCtx()
 	disk := filepath.Join(s.dataDir, "disks", "os1-post1.qcow2")
-	if err := os.MkdirAll(filepath.Dir(disk), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := qcow2.Create(disk, 1<<30, nil); err != nil {
-		t.Fatal(err)
-	}
 	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
 		Name: "os1", HostName: "owner-host", State: "running",
 	}, nil, []corrosion.DiskRecord{{
@@ -90,14 +91,51 @@ func newLeftoverHost(t *testing.T) *leftoverHost {
 	}}); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	if err := corrosion.SoftDeleteDisk(ctx, s.db, "os1", "post1"); err != nil {
-		t.Fatalf("SoftDeleteDisk: %v", err)
+	// The file is this incarnation's: made after the VM was created, as an
+	// attach makes it.
+	if err := os.MkdirAll(filepath.Dir(disk), 0o755); err != nil {
+		t.Fatal(err)
 	}
+	if err := qcow2.Create(disk, 1<<30, nil); err != nil {
+		t.Fatal(err)
+	}
+	detachAfterCreate(t, s.db, "os1", "post1")
 	if err := health.WriteVMOwnerEpochMarker(s.dataDir, "os1", 3); err != nil {
 		t.Fatalf("WriteVMOwnerEpochMarker: %v", err)
 	}
 	return &leftoverHost{s: s, fake: fake, disk: disk,
 		marker: filepath.Join(s.dataDir, "vms", "os1", "owner_epoch")}
+}
+
+// detachAfterCreate soft-deletes a disk row as lv detach-disk does, on a VM
+// that was created an hour earlier. The age matters: deleted_at (and the
+// tombstone's re-stamp of it) has second precision, so a detach or delete in
+// the create's own second is not provably after it and the file is kept.
+func detachAfterCreate(t *testing.T, db *corrosion.Client, vm, disk string) {
+	t.Helper()
+	backdateVM(t, db, vm)
+	if err := corrosion.SoftDeleteDisk(adminCtx(), db, vm, disk); err != nil {
+		t.Fatalf("SoftDeleteDisk: %v", err)
+	}
+}
+
+// backdateVM moves a VM's created_at an hour into the past.
+func backdateVM(t *testing.T, db *corrosion.Client, vm string) {
+	t.Helper()
+	if _, err := db.ExecuteRows(adminCtx(), `UPDATE vms SET created_at = ? WHERE name = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339Nano), vm); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// vmCreatedAt reads the created_at of a VM's row, live or tombstoned.
+func vmCreatedAt(t *testing.T, db *corrosion.Client, vm string) string {
+	t.Helper()
+	rows, err := db.Query(adminCtx(), `SELECT created_at FROM vms WHERE name = ?`, vm)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("created_at of %s: %v (%d rows)", vm, err, len(rows))
+	}
+	return rows[0].String("created_at")
 }
 
 func (h *leftoverHost) tombstone(t *testing.T) {
@@ -144,7 +182,9 @@ func TestCleanupMigrationArtifacts_VMDeletedRemovesItsLeftoversHere(t *testing.T
 // drop the recorded-here check ("not recorded here"); drop pathStillReferenced
 // ("another VM's backing image"); drop localDomainUsesPath ("in a local
 // domain's backing chain"); drop the snapshot check ("snapshot record"); drop
-// withinDiskArtifactRoot ("outside the disk root").
+// withinDiskArtifactRoot ("outside the disk root"); drop the row incarnation
+// check ("row stamped at the VM's created_at"); drop the file age check ("file
+// older than the VM").
 func TestCleanupMigrationArtifacts_VMDeletedKeepsWhatItCannotProve(t *testing.T) {
 	type outcome struct {
 		code       codes.Code
@@ -206,6 +246,31 @@ func TestCleanupMigrationArtifacts_VMDeletedKeepsWhatItCannotProve(t *testing.T)
 			}
 			return []string{h.disk}
 		}, outcome{codes.OK, false}},
+		{"row stamped at the VM's created_at", func(t *testing.T, h *leftoverHost) []string {
+			// A predecessor's row as BeginVMCreateOperation leaves it: re-stamped
+			// with the new VM's created_at. The tombstone re-stamps it again, so
+			// it is set back here to show the row check on its own.
+			h.tombstone(t)
+			if _, err := h.s.db.ExecuteRows(adminCtx(), `UPDATE vm_disks SET deleted_at = ? WHERE vm_name = 'os1'`,
+				vmCreatedAt(t, h.s.db, "os1")); err != nil {
+				t.Fatal(err)
+			}
+			return []string{h.disk}
+		}, outcome{codes.OK, false}},
+		{"file older than the VM", func(t *testing.T, h *leftoverHost) []string {
+			// What a --keep-disks predecessor kept: its last write predates this
+			// incarnation. Its row, re-stamped by the tombstone, says nothing.
+			h.tombstone(t)
+			created, err := time.Parse(time.RFC3339Nano, vmCreatedAt(t, h.s.db, "os1"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := created.Add(-time.Hour)
+			if err := os.Chtimes(h.disk, old, old); err != nil {
+				t.Fatal(err)
+			}
+			return []string{h.disk}
+		}, outcome{codes.OK, false}},
 		{"outside the disk root", func(t *testing.T, h *leftoverHost) []string {
 			// Recorded at a path no disk-artifact root contains.
 			outside := filepath.Join(h.s.dataDir, "os1-post1.qcow2")
@@ -248,9 +313,7 @@ func TestCleanupMigrationArtifacts_VMDeletedKeepsADiskNotDeletedWithTheVM(t *tes
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.SoftDeleteDisk(adminCtx(), h.s.db, "os1", "post1"); err != nil {
-		t.Fatal(err)
-	}
+	detachAfterCreate(t, h.s.db, "os1", "post1")
 	h.tombstone(t)
 	if err := h.cleanup(h.disk); err != nil {
 		t.Fatalf("cleanup: %v", err)
@@ -312,9 +375,7 @@ func TestDeleteVM_AsksTheHostsTheVMLeftToRemoveItsLeftovers(t *testing.T) {
 				t.Fatalf("InsertVM: %v", err)
 			}
 			for _, d := range []string{"post1", "shared"} {
-				if err := corrosion.SoftDeleteDisk(ctx, s.db, "os1", d); err != nil {
-					t.Fatal(err)
-				}
+				detachAfterCreate(t, s.db, "os1", d)
 			}
 			fake.SetState("os1", libvirtfake.StateRunning)
 

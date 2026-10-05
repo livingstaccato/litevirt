@@ -766,7 +766,8 @@ host the VM was running on when it was detached. A migration does not move a
 detached disk: it stays on that host. The file is freed when the VM is deleted
 — `lv rm <vm>` asks each host the VM left to remove the disks detached there
 and the VM's `vms/<name>/owner_epoch` marker. That host removes a disk only
-if its own records show it was detached from this VM there, and keeps it if
+if its own records show it was detached from this VM there after the VM was
+created (and the file was last written after that too), and keeps it if
 anything still uses it: another VM's disk or backing image, a domain defined
 on that host, or a snapshot of the VM. `lv rm --keep-disks` keeps detached
 disks too. A host that is down or not `active` during the delete keeps its

@@ -23912,7 +23912,9 @@ type CleanupMigrationArtifactsRequest struct {
 	// nothing still uses it. Refused (ABORTED, retryable) while this host's
 	// replica still holds a live row for the name; nothing is touched while a
 	// domain of that name is defined here. A host built before this field
-	// ignores it and applies the stub rule to disk_paths, which keeps them.
+	// ignores it and applies the stub rule to disk_paths: it removes a path
+	// only if it recorded that path as its own migration stub for vm_name
+	// within the stub ledger's TTL, and keeps every other.
 	VmDeleted     bool `protobuf:"varint,6,opt,name=vm_deleted,json=vmDeleted,proto3" json:"vm_deleted,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

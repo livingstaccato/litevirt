@@ -111,6 +111,7 @@ func (s *Server) handleTestNotifyTarget(w http.ResponseWriter, r *http.Request) 
 		sendToast(w, "send failed: "+grpcMsg(err), "error")
 		if status.Code(err) == codes.Unavailable {
 			// The target refused or timed out: the page worked, the endpoint did not.
+			// Deliberately 200 (rpcErrorAnswered200Allowed in the guard's test).
 			w.WriteHeader(http.StatusOK)
 			return
 		}

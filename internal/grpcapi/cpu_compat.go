@@ -124,11 +124,14 @@ func (s *Server) cpuRequirementForMigration(vm *corrosion.VMRecord) (cpuXML stri
 //     rolling upgrade the check must be a no-op rather than the reason migration
 //     stops working;
 //   - a peer that cannot run the compare answers Unavailable, which is "could not
-//     verify", not "incompatible".
+//     verify", not "incompatible";
+//   - a source that, asked the same question, rejects the guest it is running
+//     shows the compare cannot decide for this guest (sourceRunsGuestCPU).
 //
-// Only an explicit, positive "this host cannot run that guest" refuses. That is
-// the one answer libvirt would otherwise deliver mid-copy, after the target has
-// been provisioned and the guest's memory is already moving.
+// Only an explicit, positive "this host cannot run that guest" from the target,
+// confirmed by the source running it, refuses. That is the one answer libvirt
+// would otherwise deliver mid-copy, after the target has been provisioned and
+// the guest's memory is already moving.
 func (s *Server) preflightTargetCPU(ctx context.Context, vm *corrosion.VMRecord, targetHost string) error {
 	cpuXML, ok := s.cpuRequirementForMigration(vm)
 	if !ok {
@@ -156,9 +159,40 @@ func (s *Server) preflightTargetCPU(ctx context.Context, vm *corrosion.VMRecord,
 	if resp.GetRunnable() {
 		return nil
 	}
+	// The target says no. Believe it only if the source says yes to the guest
+	// it is running: otherwise the compare cannot tell this guest's hosts apart.
+	if !s.sourceRunsGuestCPU(vm.Name, targetHost, cpuXML) {
+		return nil
+	}
 	return status.Errorf(codes.FailedPrecondition,
 		"target host %q cannot run VM %q: its CPU does not provide what the guest is running on "+
 			"(cpu_mode=%s, verdict=%s). Migrate to a host with an equal-or-newer CPU, or stop the VM "+
 			"and `lv update %s --cpu-mode custom --cpu-model <baseline>` to pin a model both hosts support.",
 		targetHost, vm.Name, parseSpecCPUMode(vm.Spec), resp.GetVerdict(), vm.Name)
+}
+
+// sourceRunsGuestCPU asks THIS host — the source, running the guest right now —
+// the same question the target just answered "no" to, and reports whether the
+// target's refusal can be believed.
+//
+// A source that calls its own running guest unrunnable proves the compare is
+// wrong about this guest (libvirt's expanded host-model CPU can carry features
+// the compare does not credit the host with: topoext on AMD), so the target's
+// "no" decides nothing either. That is logged and the migration proceeds;
+// libvirt still has the final say at cutover. A source that cannot run the
+// compare at all is the same "could not verify".
+func (s *Server) sourceRunsGuestCPU(vmName, targetHost, cpuXML string) bool {
+	verdict, err := s.virt.CompareCPU(cpuXML)
+	if err != nil {
+		slog.Warn("migration CPU preflight cannot decide: the source could not compare the guest's CPU against itself",
+			"vm", vmName, "source", s.hostName, "target", targetHost, "err", err)
+		return false
+	}
+	if !verdict.Runnable() {
+		slog.Warn("migration CPU preflight cannot decide: the source rejects the CPU of the guest it is running, "+
+			"so the target's refusal is not evidence; proceeding",
+			"vm", vmName, "source", s.hostName, "target", targetHost, "source_verdict", verdict.String())
+		return false
+	}
+	return true
 }

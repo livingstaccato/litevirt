@@ -870,7 +870,10 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 			// says "tampered" for every honest idle host and for an attacked one
 			// alike, which distinguishes nothing. Once the host writes, its first
 			// row is chained onto the tail it holds, and a row appended after
-			// that tail was loaded breaks the link and is reported here.
+			// that tail was loaded breaks the link and is reported here. Until
+			// then the region's END is anchored separately: the host signs a
+			// seq-0 head over its legacy tail (PublishAuditChainHead), and
+			// verifyLegacyAnchors reports the region cut short or re-hashed.
 			contract, underContract := contracted[host]
 			if underContract && seq == 0 {
 				run := legacy[host]

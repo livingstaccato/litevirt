@@ -66,9 +66,18 @@ func PublishAuditChainHead(ctx context.Context, c *Client, hostName string) erro
 	seq, hash := tail.seq, tail.hash
 	c.auditChain.mu.Unlock()
 
-	if seq == 0 {
+	if seq == 0 && hash == "" {
 		return nil // nothing written yet; a head over an empty chain says nothing
 	}
+	// seq 0 with a tail hash is a host holding only pre-v45 history: every row
+	// carries the column default, so there is no position to attest to, but
+	// there IS a tail. Without a head over it nothing signed commits to that
+	// region — the verifier excuses an internally-linked seq-0 region that no
+	// numbered row closes — so cutting rows off its end, or deleting all of it,
+	// read exactly like an idle host. The head at seq 0 is the anchor
+	// (verifyLegacyAnchors). It goes through the same statement as every other
+	// head; an older verifier ignores it, because a seq-0 head raises no
+	// attested sequence and its hash check is guarded by seq > 0.
 	epoch, err := currentAuditEpoch(ctx, c, hostName)
 	if err != nil {
 		return err
@@ -268,6 +277,82 @@ func verifyChainHeads(ctx context.Context, c *Client, keyring *AuditKeyring, obs
 			res.TruncatedHosts = append(res.TruncatedHosts, fmt.Sprintf(
 				"%s: signed head attests seq %d but the log ends at %d (%d rows missing)",
 				host, attestedSeq, observedSeq[host], attestedSeq-observedSeq[host]))
+		}
+	}
+	return verifyLegacyAnchors(ctx, c, keyring, retired, res)
+}
+
+// verifyLegacyAnchors checks each host's seq-0 heads — the anchor
+// PublishAuditChainHead signs over a chain that holds only pre-v45 rows — against
+// the seq-0 rows actually present.
+//
+// latestAuditHeadsByKey cannot carry them: it keeps each key's HIGHEST head, so
+// an anchor drops out of it the moment that key publishes a numbered one. They
+// are read separately, and they stay checked after that, since the region they
+// describe does not change once the host starts numbering its rows.
+//
+// The anchored hash must be SOME seq-0 row of the host's, not necessarily the
+// last. The anchor is published from the local tail, and a node restored from an
+// older snapshot holds a shorter copy of its own legacy history than its peers
+// do; the table is append-only, so an anchor that had to be the last row would
+// turn that into a permanent tamper verdict nobody could clear. Requiring only
+// that the anchored row still exists catches what the anchor is for — rows cut
+// off the region's end, the region deleted outright, a row edited and the region
+// re-hashed around it by the legacy reseal — and leaves a row appended after the
+// anchor exactly as unanchored as it was before.
+//
+// A head that does not verify is skipped rather than reported: the latest head
+// per key is already signature-checked by verifyChainHeads, and an unverifiable
+// row in a replicated table asserts nothing.
+func verifyLegacyAnchors(ctx context.Context, c *Client, keyring *AuditKeyring, retired map[lifecycleKey]int64, res *AuditVerifyResult) error {
+	if keyring == nil {
+		return nil // verified nothing; assert nothing (headHasSettled)
+	}
+	rows, err := c.Query(ctx,
+		`SELECT host_name, epoch, seq, head_hash, key_id, signature, created_at
+		 FROM audit_chain_heads
+		 WHERE seq = 0 AND head_hash <> ''
+		 ORDER BY host_name ASC, key_id ASC, epoch ASC`)
+	if err != nil {
+		return fmt.Errorf("list audit chain anchors: %w", err)
+	}
+	reported := map[string]bool{}
+	for _, r := range rows {
+		h := AuditChainHead{
+			HostName:  r.String("host_name"),
+			Epoch:     r.Int64("epoch"),
+			Seq:       r.Int64("seq"),
+			HeadHash:  r.String("head_hash"),
+			KeyID:     r.String("key_id"),
+			Signature: r.String("signature"),
+			CreatedAt: r.String("created_at"),
+		}
+		if reported[h.HostName] {
+			continue
+		}
+		if err := keyring.VerifyHead(ctx, c, h.HostName, h.Epoch, h.Seq, h.HeadHash,
+			h.KeyID, h.Signature, h.CreatedAt); err != nil {
+			continue
+		}
+		if boundary, isRetired := retired[lifecycleKey{host: h.HostName, keyID: h.KeyID}]; isRetired && h.Seq > boundary {
+			continue
+		}
+		if !headHasSettled(h, true) {
+			continue
+		}
+		found, err := c.Query(ctx,
+			`SELECT 1 AS present FROM audit_log
+			 WHERE host_name = ? AND seq = 0 AND LOWER(content_hash) = LOWER(?) LIMIT 1`,
+			h.HostName, h.HeadHash)
+		if err != nil {
+			return fmt.Errorf("read anchored legacy row for %s: %w", h.HostName, err)
+		}
+		if len(found) == 0 {
+			reported[h.HostName] = true
+			res.TruncatedHosts = append(res.TruncatedHosts, fmt.Sprintf(
+				"%s: signed anchor says its pre-sequence (seq 0) history reached a row hashing to %s, "+
+					"but no such row exists — rows of that history were removed, or rewritten and re-hashed",
+				h.HostName, h.HeadHash))
 		}
 	}
 	return nil

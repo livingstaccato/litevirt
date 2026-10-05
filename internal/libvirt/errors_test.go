@@ -76,3 +76,47 @@ func TestIsNotFound(t *testing.T) {
 		})
 	}
 }
+
+func TestIsPCISlotsExhausted(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{
+			// libvirt's real wording for an exhausted q35 root-complex, wrapped the
+			// way grpcapi's attach call sites wrap it ("attach disk: %w").
+			"wrapped exact wording",
+			fmt.Errorf("attach disk: %w", errors.New("internal error: No more available PCI slots")),
+			true,
+		},
+		{"mixed case", errors.New("Internal error: no more available PCI SLOTS"), true},
+		{
+			// A differently-worded variant seen on some libvirt/qemu versions.
+			"addresses wording",
+			errors.New("internal error: No more available PCI addresses"),
+			true,
+		},
+		{
+			"free slots wording",
+			errors.New("no more free PCI slots available"),
+			true,
+		},
+		{
+			// Every other VIR_ERR_INTERNAL_ERROR must NOT be caught by this
+			// substring match — only the PCI-exhaustion wording.
+			"unrelated internal error",
+			errors.New("internal error: qemu unexpectedly closed the monitor"),
+			false,
+		},
+		{"unrelated PCI message", errors.New("PCI device 0000:41:00.0 not found"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsPCISlotsExhausted(tt.err); got != tt.want {
+				t.Errorf("IsPCISlotsExhausted(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}

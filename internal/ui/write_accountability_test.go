@@ -72,14 +72,7 @@ func TestNoUIHandlerWritesReplicatedStateInProcess(t *testing.T) {
 // the RPC is where the authorization lives — a RequireRole that refuses a scoped
 // token, a RequirePerm at a path, a per-caller filter — and a page reading the
 // table in-process skips all of it for whatever session it serves.
-var uiInProcessReads = map[string]string{
-	"handle_security_groups.go:corrosion.ListSecurityGroups": "no RPC lists security groups; `lv sg ls` " +
-		"reads this table in-process too. A list RPC would move this page onto it",
-	"handle_security_groups.go:corrosion.ListSGRules": "no RPC lists security-group rules; `lv sg rule-ls` " +
-		"reads this table in-process too",
-	"handle_vms.go:corrosion.ListSecurityGroups": "the Add-NIC modal's security-group names; no RPC lists " +
-		"security groups (see handle_security_groups.go)",
-}
+var uiInProcessReads = map[string]string{}
 
 // TestNoUIHandlerReadsReplicatedStateAroundItsRPC is the read half of the guard
 // above. /rbac read role_bindings in-process and showed every binding in the

@@ -86,6 +86,14 @@ func (s *Server) sessionValid(w http.ResponseWriter, r *http.Request) bool {
 		// that trade is deliberate. Letting a WRITE through means the one
 		// component that knows the caller's role is unreachable and the write
 		// lands anyway, which is not a trade — it is the check being optional.
+		//
+		// The read trade is safe only because no read handler serves data the
+		// daemon did not hand THIS session: every read is an RPC called with
+		// the session's bearer, so a revoked or expired session gets the RPC's
+		// refusal, not the data. TestNoUIHandlerReadsReplicatedStateAroundItsRPC
+		// keeps in-process reads out, and
+		// TestUIReads_DuringAWhoamiOutageADeadSessionGetsNoData drives every GET
+		// route through this branch with a dead session.
 		if mutating {
 			slog.Warn("ui: refusing a mutation because the caller's role could not be verified",
 				"method", r.Method, "path", r.URL.Path, "error", err)
@@ -162,8 +170,10 @@ func httpStatusFor(err error) int {
 // rpcWriteFailed reports a refused or failed RPC to the browser: a toast
 // naming what failed and why, and the status httpStatusFor derives from the
 // gRPC code. Handlers use it instead of a hard-coded 500, so a Viewer's refused
-// delete arrives as 403 and a bad form as 400, not as a server fault
-// (TestNoUIHandlerAnswersRPCErrorWith500 holds every handler to this).
+// delete arrives as 403 and a bad form as 400, not as a server fault or a 200
+// (TestNoUIHandlerAnswersRPCErrorWith500 and ...With200 hold every handler to
+// this). htmx fires the HX-Trigger toast whatever the status, and does not swap
+// a 4xx/5xx body into the target, so the reason still reaches the user.
 func rpcWriteFailed(w http.ResponseWriter, what string, err error) {
 	sendToast(w, what+" failed: "+err.Error(), "error")
 	w.WriteHeader(httpStatusFor(err))

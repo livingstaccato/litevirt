@@ -81,8 +81,7 @@ func (s *Server) handleSetVMTags(w http.ResponseWriter, r *http.Request) {
 	}
 	labels := parseTags(r.FormValue("tags"))
 	if _, err := s.grpc.SetVMLabels(s.uiBearerCtx(r), &pb.SetVMLabelsRequest{Name: name, Labels: labels}); err != nil {
-		sendToast(w, "Set tags failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusOK)
+		rpcWriteFailed(w, "Set tags", err)
 		return
 	}
 	sendToast(w, "Tags updated", "success")

@@ -41,8 +41,7 @@ func (s *Server) handleLBDetail(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLBDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, err := s.grpc.DeleteLoadBalancer(s.uiBearerCtx(r), &pb.DeleteLBRequest{Name: name}); err != nil {
-		sendToast(w, "Delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusOK)
+		rpcWriteFailed(w, "Delete", err)
 		return
 	}
 	sendToast(w, "Load balancer '"+name+"' deleted", "success")
@@ -61,8 +60,7 @@ func (s *Server) handleLBDrain(w http.ResponseWriter, r *http.Request) {
 		LbName:  name,
 		Backend: backend,
 	}); err != nil {
-		sendToast(w, "Drain failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusOK)
+		rpcWriteFailed(w, "Drain", err)
 		return
 	}
 	sendToast(w, "Backend '"+backend+"' draining", "success")

@@ -25,7 +25,7 @@ import (
 // init, or in the statement just before it) and fails on a WriteHeader or
 // http.Error inside it that names 500 directly.
 func TestNoUIHandlerAnswersRPCErrorWith500(t *testing.T) {
-	for _, off := range rpcErrorAnswered500(t, ".") {
+	for _, off := range rpcErrorAnswered(t, ".", is500) {
 		t.Errorf("%s: an error from %s is answered with a hard-coded 500; use "+
 			"rpcWriteFailed(w, what, err) or w.WriteHeader(httpStatusFor(err)), so the "+
 			"daemon's refusal reaches the browser as the 4xx it is, not as a server fault",
@@ -33,14 +33,50 @@ func TestNoUIHandlerAnswersRPCErrorWith500(t *testing.T) {
 	}
 }
 
+// TestNoUIHandlerAnswersRPCErrorWith200 is the same guard for the opposite
+// flattening: a refusal answered 200 with an error toast. Under htmx 2's default
+// responseHandling a 2xx is swapped into the target, so a refused Delete
+// replaced its own button with the empty body (and the VM page pushed /vms into
+// history as if the VM were gone), while the status told the access log the
+// write had worked. A 4xx is not swapped, and htmx fires the HX-Trigger toast
+// whatever the status, so rpcWriteFailed loses nothing.
+//
+// rpcErrorAnswered200Allowed names the handlers where 200 is deliberate; each
+// carries its reason beside the WriteHeader.
+func TestNoUIHandlerAnswersRPCErrorWith200(t *testing.T) {
+	for _, off := range rpcErrorAnswered(t, ".", is200) {
+		if reason, ok := rpcErrorAnswered200Allowed[off.fn]; ok && reason != "" {
+			continue
+		}
+		t.Errorf("%s (%s): an error from %s is answered with a hard-coded 200; use "+
+			"rpcWriteFailed(w, what, err), so a refused write is not reported as a success "+
+			"and its empty body is not swapped into the page", off.pos, off.fn, off.rpc)
+	}
+}
+
+// rpcErrorAnswered200Allowed: handler -> why a failed RPC is answered 200.
+var rpcErrorAnswered200Allowed = map[string]string{
+	"handleTestNotifyTarget": "Unavailable means the notification endpoint refused or timed out; " +
+		"the page and the caller's permission worked, so the toast reports the endpoint and the " +
+		"status stays 200. Every other code still goes through httpStatusFor.",
+}
+
 type rpc500Offence struct {
 	pos string
 	rpc string
+	fn  string
 }
 
-// rpcErrorAnswered500 parses every non-test Go file in dir and returns the
-// places where an s.grpc call's error is answered with a literal 500.
-func rpcErrorAnswered500(t *testing.T, dir string) []rpc500Offence {
+// rpcWrappers are Server methods whose error is an RPC's error, for the guard's
+// purposes: the call that returns it is not spelled s.grpc.X at the handler.
+var rpcWrappers = map[string]bool{
+	"streamUpload": true, // UploadStoragePoolContent's client stream
+}
+
+// rpcErrorAnswered parses every non-test Go file in dir and returns the places
+// where an s.grpc call's error is answered with a literal status code that
+// matches literal.
+func rpcErrorAnswered(t *testing.T, dir string, literal func(ast.Expr) bool) []rpc500Offence {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -57,40 +93,61 @@ func rpcErrorAnswered500(t *testing.T, dir string) []rpc500Offence {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			blk, ok := n.(*ast.BlockStmt)
-			if !ok {
-				return true
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
 			}
-			for i, st := range blk.List {
-				ifs, ok := st.(*ast.IfStmt)
-				if !ok {
-					continue
-				}
-				errName := nilCheckedIdent(ifs.Cond)
-				if errName == "" {
-					continue
-				}
-				rpc := grpcCallAssigning(ifs.Init, errName)
-				// Otherwise the nearest earlier statement in the block that
-				// assigns it — `_, rerr := stream.Recv()` is often followed by
-				// an io.EOF check before the error branch.
-				for j := i - 1; rpc == "" && j >= 0; j-- {
-					if assignsIdent(blk.List[j], errName) {
-						rpc = grpcCallAssigning(blk.List[j], errName)
-						break
-					}
-				}
-				if rpc == "" {
-					continue
-				}
-				for _, p := range hardCoded500s(ifs.Body) {
-					out = append(out, rpc500Offence{pos: fset.Position(p).String(), rpc: rpc})
-				}
-			}
-			return true
-		})
+			out = append(out, rpcErrorAnsweredIn(fset, fd, literal)...)
+		}
 	}
+	return out
+}
+
+func rpcErrorAnsweredIn(fset *token.FileSet, fd *ast.FuncDecl, literal func(ast.Expr) bool) []rpc500Offence {
+	var out []rpc500Offence
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		// A switch or select case holds its statements in a bare list, not a
+		// BlockStmt; an if directly under `case "file":` is still a handler's.
+		var list []ast.Stmt
+		switch b := n.(type) {
+		case *ast.BlockStmt:
+			list = b.List
+		case *ast.CaseClause:
+			list = b.Body
+		case *ast.CommClause:
+			list = b.Body
+		default:
+			return true
+		}
+		for i, st := range list {
+			ifs, ok := st.(*ast.IfStmt)
+			if !ok {
+				continue
+			}
+			errName := nilCheckedIdent(ifs.Cond)
+			if errName == "" {
+				continue
+			}
+			rpc := grpcCallAssigning(ifs.Init, errName)
+			// Otherwise the nearest earlier statement in the block that
+			// assigns it — `_, rerr := stream.Recv()` is often followed by
+			// an io.EOF check before the error branch.
+			for j := i - 1; rpc == "" && j >= 0; j-- {
+				if assignsIdent(list[j], errName) {
+					rpc = grpcCallAssigning(list[j], errName)
+					break
+				}
+			}
+			if rpc == "" {
+				continue
+			}
+			for _, p := range hardCodedStatus(ifs.Body, literal) {
+				out = append(out, rpc500Offence{pos: fset.Position(p).String(), rpc: rpc, fn: fd.Name.Name})
+			}
+		}
+		return true
+	})
 	return out
 }
 
@@ -172,6 +229,9 @@ func grpcCallName(n ast.Node) string {
 	if sel.Sel.Name == "Recv" || sel.Sel.Name == "CloseAndRecv" {
 		return "stream." + sel.Sel.Name
 	}
+	if isIdent(sel.X, "s") && rpcWrappers[sel.Sel.Name] {
+		return "s." + sel.Sel.Name
+	}
 	recv, ok := sel.X.(*ast.SelectorExpr)
 	if !ok || recv.Sel.Name != "grpc" || !isIdent(recv.X, "s") {
 		return ""
@@ -179,9 +239,9 @@ func grpcCallName(n ast.Node) string {
 	return "s.grpc." + sel.Sel.Name
 }
 
-// hardCoded500s finds w.WriteHeader(500) and http.Error(w, msg, 500), with 500
-// spelled either way, anywhere under body.
-func hardCoded500s(body ast.Node) []token.Pos {
+// hardCodedStatus finds w.WriteHeader(code) and http.Error(w, msg, code) where
+// literal(code) holds, anywhere under body.
+func hardCodedStatus(body ast.Node, literal func(ast.Expr) bool) []token.Pos {
 	var out []token.Pos
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -201,7 +261,7 @@ func hardCoded500s(body ast.Node) []token.Pos {
 		default:
 			return true
 		}
-		if is500(code) {
+		if literal(code) {
 			out = append(out, call.Pos())
 		}
 		return true
@@ -220,6 +280,16 @@ func is500(e ast.Expr) bool {
 		return v.Kind == token.INT && v.Value == "500"
 	case *ast.SelectorExpr:
 		return isIdent(v.X, "http") && v.Sel.Name == "StatusInternalServerError"
+	}
+	return false
+}
+
+func is200(e ast.Expr) bool {
+	switch v := e.(type) {
+	case *ast.BasicLit:
+		return v.Kind == token.INT && v.Value == "200"
+	case *ast.SelectorExpr:
+		return isIdent(v.X, "http") && v.Sel.Name == "StatusOK"
 	}
 	return false
 }

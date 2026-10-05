@@ -8,14 +8,16 @@ import (
 )
 
 // TestDeleteVMSurfacesError verifies a failed delete (e.g. linked-clone guard,
-// RBAC) is reported instead of falsely redirecting to /vms as success.
+// RBAC) is reported instead of falsely redirecting to /vms as success. An
+// error without a gRPC status is a fault, so it answers 500 with the reason in
+// the toast (a refusal's 403 is TestUIViewerRefusedWrites_403WithDaemonMessage).
 func TestDeleteVMSurfacesError(t *testing.T) {
 	mock := newDefaultMock()
 	mock.deleteVMErr = errSimulated
 	s := newTestUIServer(t, mock)
 
 	w := serveRequest(s, withAuth(mustReq(t, "DELETE", "/ui/vms/vm1")))
-	assertStatus(t, w, http.StatusOK)
+	assertRefusalToast(t, "delete VM", w, http.StatusInternalServerError, errSimulated.Error())
 	if got := w.Header().Get("HX-Redirect"); got != "" {
 		t.Errorf("HX-Redirect = %q, want empty (delete failed, must not redirect as success)", got)
 	}

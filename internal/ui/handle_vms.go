@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
-	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -372,8 +371,7 @@ func (s *Server) handleDeleteVM(w http.ResponseWriter, r *http.Request) {
 		// e.g. the linked-clone refcount guard or an RBAC denial — surface it
 		// instead of falsely reporting success and redirecting away.
 		slog.Error("UI: delete VM failed", "name", name, "error", err)
-		sendToast(w, "Delete failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusOK)
+		rpcWriteFailed(w, "Delete", err)
 		return
 	}
 	sendToast(w, "VM '"+name+"' deleted", "success")
@@ -1174,12 +1172,13 @@ func (s *Server) handleAddNICModal(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ctx := s.uiBearerCtx(r)
 	nets, _ := s.grpc.ListNetworks(ctx, &emptypb.Empty{})
+	// Through the RPC with the session's bearer, so a session that may not
+	// read security groups (a token scoped below the cluster root) is not
+	// shown their names here either.
 	var sgs []string
-	if s.db != nil {
-		if groups, err := corrosion.ListSecurityGroups(ctx, s.db, ""); err == nil {
-			for _, g := range groups {
-				sgs = append(sgs, g.Name)
-			}
+	if groups, err := s.grpc.ListSecurityGroups(ctx, &pb.ListSecurityGroupsRequest{}); err == nil {
+		for _, g := range groups.GetGroups() {
+			sgs = append(sgs, g.GetName())
 		}
 	}
 	s.renderFragment(w, "add_nic_modal.html", map[string]any{

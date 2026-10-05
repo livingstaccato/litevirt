@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"google.golang.org/grpc"
 )
 
 // fileBasedPoolDriver reports whether a pool driver exposes a browsable file
@@ -46,12 +47,12 @@ func (s *Server) handleStorageContents(w http.ResponseWriter, r *http.Request) {
 	if field == "" {
 		field = "iso"
 	}
-	s.renderPoolContents(w, r, host, pool, field, "")
+	s.renderPoolContents(w, r, host, pool, field)
 }
 
 // renderPoolContents renders the file list for one pool (or a prompt when no
-// pool is chosen). uploadErr surfaces a failed upload above the list.
-func (s *Server) renderPoolContents(w http.ResponseWriter, r *http.Request, host, pool, field, uploadErr string) {
+// pool is chosen).
+func (s *Server) renderPoolContents(w http.ResponseWriter, r *http.Request, host, pool, field string) {
 	if pool == "" {
 		s.renderFragment(w, "storage_contents.html", map[string]any{"Field": field})
 		return
@@ -62,7 +63,7 @@ func (s *Server) renderPoolContents(w http.ResponseWriter, r *http.Request, host
 		return
 	}
 	s.renderFragment(w, "storage_contents.html", map[string]any{
-		"Field": field, "Contents": resp.GetContents(), "Pool": pool, "Host": host, "UploadErr": uploadErr,
+		"Field": field, "Contents": resp.GetContents(), "Pool": pool, "Host": host,
 	})
 }
 
@@ -74,7 +75,7 @@ func (s *Server) handleUploadStorageContent(w http.ResponseWriter, r *http.Reque
 	mr, err := r.MultipartReader()
 	if err != nil {
 		sendToast(w, "Upload failed: "+err.Error(), "error")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 	var host, pool, field string
@@ -85,7 +86,7 @@ func (s *Server) handleUploadStorageContent(w http.ResponseWriter, r *http.Reque
 		}
 		if err != nil {
 			sendToast(w, "Upload failed: "+err.Error(), "error")
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		switch part.FormName() {
@@ -101,8 +102,10 @@ func (s *Server) handleUploadStorageContent(w http.ResponseWriter, r *http.Reque
 				continue
 			}
 			if uerr := s.streamUpload(r, host, pool, filename, part); uerr != nil {
+				// A non-2xx is not swapped into the pool list, so the reason
+				// travels in the toast, which htmx fires whatever the status.
 				slog.Error("ui: pool upload", "pool", pool, "file", filename, "error", uerr)
-				s.renderPoolContents(w, r, host, pool, field, uerr.Error())
+				rpcWriteFailed(w, "Upload of "+filename, uerr)
 				return
 			}
 			sendToast(w, "Uploaded "+filename, "success")
@@ -111,7 +114,7 @@ func (s *Server) handleUploadStorageContent(w http.ResponseWriter, r *http.Reque
 	if field == "" {
 		field = "iso"
 	}
-	s.renderPoolContents(w, r, host, pool, field, "")
+	s.renderPoolContents(w, r, host, pool, field)
 }
 
 // streamUpload pumps an uploaded file into the pool over the gRPC client stream.
@@ -121,14 +124,14 @@ func (s *Server) streamUpload(r *http.Request, host, pool, filename string, src 
 		return err
 	}
 	if err := up.Send(&pb.UploadStoragePoolContentRequest{PoolName: pool, Host: host, Filename: filename}); err != nil {
-		return err
+		return uploadSendFailed(up, err)
 	}
 	buf := make([]byte, 1<<20) // 1 MiB chunks
 	for {
 		n, rerr := src.Read(buf)
 		if n > 0 {
 			if err := up.Send(&pb.UploadStoragePoolContentRequest{Chunk: buf[:n]}); err != nil {
-				return err
+				return uploadSendFailed(up, err)
 			}
 		}
 		if rerr == io.EOF {
@@ -139,6 +142,21 @@ func (s *Server) streamUpload(r *http.Request, host, pool, filename string, src 
 		}
 	}
 	_, err = up.CloseAndRecv()
+	return err
+}
+
+// uploadSendFailed returns the real reason a Send on the upload stream failed.
+// grpc-go reports a stream the server has already ended — a refusal included —
+// as io.EOF from Send and delivers the status only from CloseAndRecv, so
+// passing the io.EOF on would toast "EOF" for a permission denial and answer
+// it 500 instead of 403.
+func uploadSendFailed(up grpc.ClientStreamingClient[pb.UploadStoragePoolContentRequest, pb.UploadStoragePoolContentResponse], err error) error {
+	if err != io.EOF {
+		return err
+	}
+	if _, rerr := up.CloseAndRecv(); rerr != nil {
+		return rerr
+	}
 	return err
 }
 

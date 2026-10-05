@@ -2,7 +2,6 @@
 <div class="error" style="margin:8px">{{.Error}}</div>
 {{else}}
 {{if .Pool}}
-{{if .UploadErr}}<div class="error" style="margin:8px">{{.UploadErr}}</div>{{end}}
 <form hx-post="/ui/storage/upload" hx-encoding="multipart/form-data" hx-target="#iso-contents" hx-swap="innerHTML"
       style="display:flex;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--border)">
   <input type="hidden" name="host" value="{{.Host}}">

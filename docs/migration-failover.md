@@ -162,10 +162,14 @@ A stopped VM is refused when:
 
 - libvirt reports its domain active, although its record says stopped;
 - a disk is not in its domain definition, so its format is unknown;
-- a filesystem would be left with less than 1 GiB or 5% of its size free,
-  whichever is larger: the target's, for each disk copy, or the source's, for
-  flattening an overlay. The disks on a host's filesystem are thin-provisioned,
-  and a full filesystem pauses every guest writing to one;
+- a filesystem would be left with less free space than 5% of its size, with a
+  minimum of 1 GiB and a maximum of 64 GiB. The target checks this for each
+  disk it receives, and the source checks it before flattening an overlay. The
+  disks on a host's filesystem are thin-provisioned, and a full filesystem
+  pauses every guest writing to one. The check counts the data a copy actually
+  writes, not the disk's apparent or virtual size: a sparse disk stays sparse
+  on the target, and a flatten writes only allocated clusters. The target checks
+  its free space again as the data arrives;
 - a disk file is larger than its recorded size allows, plus qcow2 metadata;
 - it has snapshots and a host-local disk;
 - it holds a PCI passthrough device;
@@ -173,9 +177,10 @@ A stopped VM is refused when:
   so and names the target to upgrade.
 
 A copy in flight writes to a hidden scratch file beside the disk:
-`.<disk>.receiving-*` on the target, or `.<disk>.coldmig-*` on the source while
-it flattens an overlay. A daemon that stops mid-copy removes these files from
-its host-local disk directories when it next starts.
+`.<disk>.receiving-<number>` on the target, or `.<disk>.coldmig-<uuid>` (and
+`.<disk>.coldmig-<uuid>.tmp`) on the source while it flattens an overlay. A
+daemon that stops mid-copy removes files of exactly these shapes from its
+host-local disk directories when it next starts. Any other file is left alone.
 
 `--with-storage` has no effect on a stopped VM, whose host-local disks are
 always copied.

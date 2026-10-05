@@ -2423,6 +2423,10 @@ message ReceiveMigrationDiskRequest {
     int64  offset     = 4;  // data frame
     bytes  data       = 5;  // data frame
     string sha256     = 6;  // last frame — hex digest of the frames
+    // header — the source's estimate of the bytes the file occupies on disk
+    // (its allocated blocks), which the target's free-space check reserves.
+    // size_bytes is still what the target bounds by the disk's record.
+    int64  allocated_bytes = 7;
 }
 
 message ReceiveMigrationDiskResponse {

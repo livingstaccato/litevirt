@@ -23795,15 +23795,19 @@ func (x *RollbackFirmwareStateResponse) GetRemoved() bool {
 // cleanup of a failed attempt (CleanupMigrationArtifacts) removes it. An older
 // target does not implement the RPC, and the source refuses the migration.
 type ReceiveMigrationDiskRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`           // header
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`                             // header — the disk's recorded path
-	SizeBytes     int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // header — length of the file
-	Offset        int64                  `protobuf:"varint,4,opt,name=offset,proto3" json:"offset,omitempty"`                        // data frame
-	Data          []byte                 `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`                             // data frame
-	Sha256        string                 `protobuf:"bytes,6,opt,name=sha256,proto3" json:"sha256,omitempty"`                         // last frame — hex digest of the frames
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	VmName    string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`           // header
+	Path      string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"`                             // header — the disk's recorded path
+	SizeBytes int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // header — length of the file
+	Offset    int64                  `protobuf:"varint,4,opt,name=offset,proto3" json:"offset,omitempty"`                        // data frame
+	Data      []byte                 `protobuf:"bytes,5,opt,name=data,proto3" json:"data,omitempty"`                             // data frame
+	Sha256    string                 `protobuf:"bytes,6,opt,name=sha256,proto3" json:"sha256,omitempty"`                         // last frame — hex digest of the frames
+	// header — the source's estimate of the bytes the file occupies on disk
+	// (its allocated blocks), which the target's free-space check reserves.
+	// size_bytes is still what the target bounds by the disk's record.
+	AllocatedBytes int64 `protobuf:"varint,7,opt,name=allocated_bytes,json=allocatedBytes,proto3" json:"allocated_bytes,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ReceiveMigrationDiskRequest) Reset() {
@@ -23876,6 +23880,13 @@ func (x *ReceiveMigrationDiskRequest) GetSha256() string {
 		return x.Sha256
 	}
 	return ""
+}
+
+func (x *ReceiveMigrationDiskRequest) GetAllocatedBytes() int64 {
+	if x != nil {
+		return x.AllocatedBytes
+	}
+	return 0
 }
 
 type ReceiveMigrationDiskResponse struct {
@@ -33764,7 +33775,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\n" +
 	"attempt_id\x18\x03 \x01(\tR\tattemptId\"9\n" +
 	"\x1dRollbackFirmwareStateResponse\x12\x18\n" +
-	"\aremoved\x18\x01 \x01(\bR\aremoved\"\xad\x01\n" +
+	"\aremoved\x18\x01 \x01(\bR\aremoved\"\xd6\x01\n" +
 	"\x1bReceiveMigrationDiskRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +
@@ -33772,7 +33783,8 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12\x16\n" +
 	"\x06offset\x18\x04 \x01(\x03R\x06offset\x12\x12\n" +
 	"\x04data\x18\x05 \x01(\fR\x04data\x12\x16\n" +
-	"\x06sha256\x18\x06 \x01(\tR\x06sha256\"=\n" +
+	"\x06sha256\x18\x06 \x01(\tR\x06sha256\x12'\n" +
+	"\x0fallocated_bytes\x18\a \x01(\x03R\x0eallocatedBytes\"=\n" +
 	"\x1cReceiveMigrationDiskResponse\x12\x1d\n" +
 	"\n" +
 	"size_bytes\x18\x01 \x01(\x03R\tsizeBytes\"7\n" +

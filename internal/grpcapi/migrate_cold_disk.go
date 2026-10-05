@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -138,11 +139,15 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	} else if info, ierr := qcow2.Info(src); ierr != nil {
 		return status.Errorf(codes.FailedPrecondition, "disk %s is qcow2 in its domain definition, but its image cannot be read: %v", d.Path, ierr)
 	} else if info.BackingFile != "" {
-		// The flatten writes up to a full copy beside the disk (Convert's
-		// .tmp, renamed in place): refuse rather than fill the filesystem
-		// the VM's neighbours' thin-provisioned disks live on.
+		// The flatten writes a copy of the chain's allocated clusters beside
+		// the disk (Convert's .tmp, renamed in place): refuse rather than fill
+		// the filesystem the VM's neighbours' thin-provisioned disks live on.
+		alloc, aerr := chainAllocated(src)
+		if aerr != nil {
+			return status.Errorf(codes.Internal, "measure disk %s and its backing chain: %v", d.Path, aerr)
+		}
 		if err := s.requireDiskSpace(filepath.Dir(src), filepath.Dir(d.Path),
-			"flattening disk "+d.Path+" for the copy", info.VirtualSize+info.VirtualSize/32); err != nil {
+			"flattening disk "+d.Path+" for the copy", coldFlattenEstimate(alloc, info.VirtualSize)); err != nil {
 			return err
 		}
 		flat := filepath.Join(filepath.Dir(src), "."+filepath.Base(src)+coldMigScratch+uuid.NewString())
@@ -163,12 +168,18 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		return status.Errorf(codes.Internal, "stat disk %s: %v", d.Path, err)
 	}
 	size := st.Size()
+	allocated := size
+	if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Blocks*512 < size {
+		allocated = sys.Blocks * 512
+	}
 
 	up, err := client.ReceiveMigrationDisk(ctx)
 	if err != nil {
 		return err
 	}
-	if err := up.Send(&pb.ReceiveMigrationDiskRequest{VmName: vmName, Path: d.Path, SizeBytes: size}); err != nil {
+	if err := up.Send(&pb.ReceiveMigrationDiskRequest{
+		VmName: vmName, Path: d.Path, SizeBytes: size, AllocatedBytes: allocated,
+	}); err != nil {
 		return coldDiskSendErr(up, err)
 	}
 	h := sha256.New()
@@ -300,7 +311,15 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "create disk dir %s: %v", filepath.Dir(hdr.Path), err)
 	}
-	if err := s.requireDiskSpace(dir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, uint64(hdr.SizeBytes)); err != nil {
+	// The data the copy writes, not the file's apparent size: the receive
+	// writes only non-zero pages, so a sparse disk stays sparse. The figure is
+	// the source's estimate, so the free space is checked again as the data
+	// arrives (coldDiskRecheckEvery).
+	need := hdr.SizeBytes
+	if hdr.AllocatedBytes > 0 && hdr.AllocatedBytes < need {
+		need = hdr.AllocatedBytes
+	}
+	if err := s.requireDiskSpace(dir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, uint64(need)); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, "."+filepath.Base(dst)+coldRecvScratch+"*")
@@ -319,7 +338,7 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 	}
 
 	h := sha256.New()
-	var next int64
+	var next, sinceCheck int64
 	var digest string
 	for digest == "" {
 		msg, err := stream.Recv()
@@ -341,8 +360,15 @@ func (s *Server) ReceiveMigrationDisk(stream grpc.ClientStreamingServer[pb.Recei
 			return status.Errorf(codes.InvalidArgument,
 				"frame [%d,%d) of %s is out of order or outside its %d bytes", msg.Offset, end, hdr.Path, hdr.SizeBytes)
 		}
-		if _, err := tmp.WriteAt(msg.Data, msg.Offset); err != nil {
+		n, err := writeNonZeroPages(tmp, msg.Data, msg.Offset)
+		if err != nil {
 			return status.Errorf(codes.Internal, "write %s: %v", hdr.Path, err)
+		}
+		if sinceCheck += n; sinceCheck >= coldDiskRecheckEvery {
+			sinceCheck = 0
+			if err := s.requireDiskSpace(dir, filepath.Dir(hdr.Path), "receiving disk "+hdr.Path, 0); err != nil {
+				return err
+			}
 		}
 		coldDiskFrameDigest(h, msg.Offset, msg.Data)
 		next = end
@@ -427,14 +453,83 @@ const (
 // well under 1/32 of the image) and a fixed allowance for a small image.
 func coldDiskSizeLimit(recorded int64) int64 { return recorded + recorded/32 + 64<<20 }
 
-// coldDiskHeadroom is the free space a cold copy leaves on a filesystem: the
-// larger of 1 GiB and 5% of it. The disks on a host's filesystem are
-// thin-provisioned, and when it fills every guest writing to one pauses.
+// coldDiskHeadroom is the free space a cold copy leaves on a filesystem:
+// 5% of it, but at least 1 GiB and at most 64 GiB. The disks on a host's
+// filesystem are thin-provisioned, and when it fills every guest writing to
+// one pauses; past 64 GiB a percentage only refuses copies that fit.
 func coldDiskHeadroom(total uint64) uint64 {
-	if h := total / 20; h > 1<<30 {
-		return h
+	const floor, ceiling = 1 << 30, 64 << 30
+	return max(floor, min(total/20, ceiling))
+}
+
+// coldFlattenEstimate is what flattening a qcow2 chain with alloc allocated
+// bytes and the given virtual size writes: the data (never more than the
+// virtual size) plus the new image's tables.
+func coldFlattenEstimate(alloc, virtual uint64) uint64 {
+	data := min(alloc, virtual)
+	return data + data/32 + 16<<20
+}
+
+// fileAllocated is the bytes a file occupies on disk.
+func fileAllocated(p string) (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(p, &st); err != nil {
+		return 0, err
 	}
-	return 1 << 30
+	return uint64(st.Blocks) * 512, nil
+}
+
+// chainAllocated is the allocated bytes of a qcow2 image and of every image
+// in its backing chain: what qcow2.Convert can read clusters from.
+func chainAllocated(path string) (uint64, error) {
+	var total uint64
+	for i := 0; i < 64; i++ {
+		a, err := fileAllocated(path)
+		if err != nil {
+			return 0, err
+		}
+		total += a
+		info, err := qcow2.Info(path)
+		if err != nil || info.BackingFile == "" {
+			return total, nil // the end of the chain (a raw backing ends it too)
+		}
+		next := info.BackingFile
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(path), next)
+		}
+		path = next
+	}
+	return 0, fmt.Errorf("backing chain of %s is longer than 64 images", path)
+}
+
+// writeNonZeroPages writes data at off into f, skipping every all-zero 4 KiB
+// page, so a range of zeros inside a frame allocates nothing. It returns the
+// bytes it wrote. The scratch file was truncated to size, so skipped pages read
+// as zeros.
+func writeNonZeroPages(f *os.File, data []byte, off int64) (int64, error) {
+	const page = 4096
+	var written int64
+	for i := 0; i < len(data); {
+		end := min(i+page, len(data))
+		if allZero(data[i:end]) {
+			i = end
+			continue
+		}
+		j := end
+		for j < len(data) {
+			e := min(j+page, len(data))
+			if allZero(data[j:e]) {
+				break
+			}
+			j = e
+		}
+		if _, err := f.WriteAt(data[i:j], off+int64(i)); err != nil {
+			return written, err
+		}
+		written += int64(j - i)
+		i = j
+	}
+	return written, nil
 }
 
 // diskSpace reports the bytes available to the daemon, and the total, on the
@@ -471,12 +566,48 @@ func (s *Server) requireDiskSpace(dir, shownDir, what string, need uint64) error
 // placeColdDisk gives the received file at tmp the name dst, failing with an
 // error satisfying errors.Is(err, os.ErrExist) if dst exists: a hard link, not
 // a rename, so a file at dst is never replaced. The scratch name is removed.
+//
+// A filesystem that cannot hard-link (EPERM, EXDEV, ENOTSUP from link) gets a
+// renameat2(RENAME_NOREPLACE), which never replaces dst either. One that can
+// do neither is refused: there is no rename there that cannot replace a file.
+//
+// Once the link has given the copy its name, the copy is placed: if the
+// scratch name then cannot be removed it is only logged — the startup sweep
+// takes it — so a retry is not refused over a file that is the copy itself.
 func placeColdDisk(tmp, dst string) error {
-	if err := os.Link(tmp, dst); err != nil {
+	err := coldLink(tmp, dst)
+	if err == nil {
+		if rerr := coldRemove(tmp); rerr != nil {
+			slog.Warn("cold migration: placed the received disk but could not remove its scratch name",
+				"scratch", tmp, "path", dst, "error", rerr)
+		}
+		return nil
+	}
+	if !errors.Is(err, syscall.EPERM) && !errors.Is(err, syscall.EXDEV) && !errors.Is(err, syscall.ENOTSUP) {
 		return err
 	}
-	return os.Remove(tmp)
+	rerr := coldRenameNoReplace(tmp, dst)
+	if rerr == nil || errors.Is(rerr, os.ErrExist) {
+		return rerr
+	}
+	return fmt.Errorf("the filesystem holding %s supports neither hard links (%v) nor a rename that cannot replace a file (%v); "+
+		"a received disk is never placed with a rename that could overwrite one", filepath.Dir(dst), err, rerr)
 }
+
+// coldDiskRecheckEvery is how many bytes a receive writes between re-checks
+// of the target's free space.
+var coldDiskRecheckEvery int64 = 256 << 20
+
+func newFrameDigest() hash.Hash    { return sha256.New() }
+func digestHex(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
+
+// The filesystem calls placeColdDisk makes, as variables so a test can fail
+// each one.
+var (
+	coldLink            = os.Link
+	coldRemove          = os.Remove
+	coldRenameNoReplace = renameNoReplace
+)
 
 // domainDiskFormats maps the source file of each file-backed disk in a domain
 // definition to its driver type (qcow2, raw, ...).
@@ -512,11 +643,15 @@ func domainDiskFormats(domXML string) (map[string]string, error) {
 // isColdMigrationScratch reports whether a file name is a cold copy's scratch
 // file (see coldRecvScratch, coldMigScratch).
 func isColdMigrationScratch(name string) bool {
-	if !strings.HasPrefix(name, ".") {
-		return false
-	}
-	return strings.Contains(name, coldRecvScratch) || strings.Contains(name, coldMigScratch)
+	return coldScratchName.MatchString(name)
 }
+
+// coldScratchName is the exact shape of the names the copy generates:
+// os.CreateTemp's decimal suffix after coldRecvScratch, and a uuid after
+// coldMigScratch with Convert's optional ".tmp". A file that only resembles
+// one — an operator's upload, say — never matches.
+var coldScratchName = regexp.MustCompile(`^\..+(` + regexp.QuoteMeta(coldRecvScratch) + `[0-9]+|` +
+	regexp.QuoteMeta(coldMigScratch) + `[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\.tmp)?)$`)
 
 // SweepColdMigrationScratch removes the scratch files a cold migration left
 // in this host's disk-artifact roots when the daemon stopped mid-copy: a

@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"fmt"
+	"log/slog"
 
 	"google.golang.org/grpc/codes"
 
@@ -33,4 +34,17 @@ func pciAttachError(op string, err error) error {
 			"\"Spare PCIe root ports\"): %w", op, err)
 	}
 	return fmt.Errorf("%s: %w", op, err)
+}
+
+// ensureSparePCIeRootPorts gives a domain just defined from GenerateDomainXML
+// the node's pci.spare_pcie_root_ports free root ports, once libvirt has
+// placed every device (lv.EnsureSparePCIeRootPorts). Spares declared in the
+// generated XML would be handed to the domain's own devices instead. Best
+// effort: a failure leaves a valid domain whose hot-plug may later be refused
+// FailedPrecondition, which is no reason to fail the create.
+func (s *Server) ensureSparePCIeRootPorts(name string) {
+	if _, err := lv.EnsureSparePCIeRootPorts(s.virt, name, s.sparePCIeRootPortsCfg); err != nil {
+		slog.Warn("spare PCIe root ports not added; a hot-plug may find no free slot",
+			"vm", name, "want", s.sparePCIeRootPortsCfg, "error", err)
+	}
 }

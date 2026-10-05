@@ -329,7 +329,6 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		Machine: machine, Firmware: firmware, GuestAgent: srcSpec.GuestAgent,
 		EnableVNC: !srcSpec.DisableVnc, EnableSPICE: srcSpec.EnableSpice,
 		Disks: diskConfigs, Networks: netConfigs, CloudInitISO: cloudInitISO, Boot: srcSpec.Boot,
-		SparePCIeRootPorts: s.sparePCIeRootPortsCfg,
 	}
 	// Thread Secure Boot + vTPM (fresh vTPM at the new UUID; fresh NVRAM from
 	// template) into the clone domain (G1).
@@ -346,6 +345,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		cleanup()
 		return nil, status.Errorf(codes.Internal, "define clone domain: %v", err)
 	}
+	s.ensureSparePCIeRootPorts(req.Target)
 	// specJSON above was marshalled BEFORE the define, so it carries whatever
 	// the source spec had — an alias if the source was never pinned. The define
 	// just resolved it against this host's qemu; persist that concrete value

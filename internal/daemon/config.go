@@ -630,14 +630,19 @@ type PCIConfig struct {
 	RescanInterval string      `yaml:"rescan_interval"` // "0" = off, "5m" = every 5 min
 	UdevHook       bool        `yaml:"udev_hook"`       // install udev rule for real-time events
 	SRIOV          SRIOVConfig `yaml:"sriov"`
-	// SparePCIeRootPorts is the number of extra, empty pcie-root-port controllers
-	// a NEW q35 domain is defined with, beyond what its disks/NICs/hostdevs need.
-	// q35 hot-plug (disk/NIC/PCI) needs a free PCIe slot at attach time; with none
-	// spare, a live attach fails with libvirt's "No more available PCI slots"
-	// (mapped to FailedPrecondition, not a generic Internal — see
+	// SparePCIeRootPorts is the number of pcie-root-port controllers a NEW q35
+	// domain is left with that none of its own devices sit on. q35 hot-plug
+	// (disk/NIC/PCI) needs a free PCIe slot at attach time; with none spare, a
+	// live attach fails with libvirt's "No more available PCI slots" (mapped to
+	// FailedPrecondition, not a generic Internal — see
 	// libvirt.IsPCISlotsExhausted). Default 4 (set below); an explicit 0 is
-	// honored as "no spare ports" (the pre-this-feature behavior), not silently
-	// overridden. Applies to q35 only — i440fx has no pcie-root-port controller.
+	// honored as "add none", which leaves the one spare libvirt itself adds
+	// when it creates root ports for a domain's devices. Applies to q35 only —
+	// i440fx has no pcie-root-port controller.
+	//
+	// The ports are added AFTER the define, from what libvirt actually
+	// assigned (libvirt.EnsureSparePCIeRootPorts): any unaddressed port
+	// declared in the generated XML is handed to the domain's own devices.
 	//
 	// This is daemon config, NOT part of a VM's persisted spec, so it is NOT
 	// carried by live or cold migration (both transfer the VM's ACTUAL existing
@@ -652,7 +657,8 @@ type PCIConfig struct {
 	// change alongside an ownership-derived hostdev set) picks up the node's
 	// CURRENT value at that moment. There is no backfill command — an existing
 	// VM converges opportunistically the next time it is fully redefined, or
-	// never, if it never is. See docs/pci-passthrough.md "Hot-plug".
+	// never, if it never is. See docs/pci-passthrough.md "Spare PCIe root
+	// ports".
 	SparePCIeRootPorts int `yaml:"spare_pcie_root_ports,omitempty"`
 }
 
@@ -718,7 +724,7 @@ func LoadConfig() (*Config, error) {
 		KeepalivedStopTimeoutSec: 3,
 		NoQuorumVIPPolicy:        "safe",
 
-		// Spare pcie-root-ports a NEW q35 domain is defined with, so hot-plug has
+		// Free pcie-root-ports a NEW q35 domain is left with, so hot-plug has
 		// somewhere to land — see PCIConfig.SparePCIeRootPorts. An explicit
 		// `spare_pcie_root_ports: 0` in config overrides this and is honored.
 		PCI: PCIConfig{SparePCIeRootPorts: 4},

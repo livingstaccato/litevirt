@@ -1020,7 +1020,6 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			MemoryMiB: int(spec.MemoryMib), Machine: spec.Machine, Firmware: spec.Firmware,
 			GuestAgent: spec.GuestAgent, EnableVNC: !spec.DisableVnc, EnableSPICE: spec.EnableSpice,
 			Disks: diskCfg, Networks: netCfg, Boot: spec.Boot,
-			SparePCIeRootPorts: s.sparePCIeRootPortsCfg,
 		})
 		if err != nil {
 			os.Remove(livePath)
@@ -1035,6 +1034,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			os.Remove(livePath)
 			return status.Errorf(codes.Internal, "define domain: %v", err)
 		}
+		s.ensureSparePCIeRootPorts(targetName)
 		// Durable checkpoints BEFORE the start, so a crash between StartDomain and the
 		// "started" checkpoint still lets a retry recognize the running domain as ours
 		// (via the running-domain observation above) instead of destroying it. The

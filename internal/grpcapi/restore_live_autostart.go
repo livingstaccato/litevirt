@@ -267,20 +267,19 @@ func (s *Server) autoDefineRestoredVM(
 	}
 
 	vmCfg := lv.VMConfig{
-		Name:               targetName,
-		CPU:                int(spec.Cpu),
-		CPUMode:            spec.CpuMode,
-		CPUModel:           spec.CpuModel,
-		MemoryMiB:          int(spec.MemoryMib),
-		Machine:            spec.Machine,
-		Firmware:           spec.Firmware,
-		GuestAgent:         spec.GuestAgent,
-		EnableVNC:          !spec.DisableVnc,
-		EnableSPICE:        spec.EnableSpice,
-		Disks:              diskCfg,
-		Networks:           netCfg,
-		Boot:               spec.Boot,
-		SparePCIeRootPorts: s.sparePCIeRootPortsCfg,
+		Name:        targetName,
+		CPU:         int(spec.Cpu),
+		CPUMode:     spec.CpuMode,
+		CPUModel:    spec.CpuModel,
+		MemoryMiB:   int(spec.MemoryMib),
+		Machine:     spec.Machine,
+		Firmware:    spec.Firmware,
+		GuestAgent:  spec.GuestAgent,
+		EnableVNC:   !spec.DisableVnc,
+		EnableSPICE: spec.EnableSpice,
+		Disks:       diskCfg,
+		Networks:    netCfg,
+		Boot:        spec.Boot,
 	}
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.
@@ -300,6 +299,7 @@ func (s *Server) autoDefineRestoredVM(
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		return "", "", status.Errorf(codes.Internal, "define domain: %v", err)
 	}
+	s.ensureSparePCIeRootPorts(targetName)
 
 	// hardware_v2 pre-start (adoption gate + PCI preflight); no-op unless latched, so a
 	// fleet with the feature off restores exactly as before. A restore always targets a

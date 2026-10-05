@@ -222,7 +222,6 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 		newXML = patched
 	} else {
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevConfigs)
-		vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 		// Preserve Secure Boot + vTPM across the regenerate (G1); verify the host can
 		// still satisfy a requested SB/TPM before applying it.
 		if spec.SecureBoot && !s.firmware.SecureBootAvailable() {
@@ -250,6 +249,9 @@ func (s *Server) reconcileDomainDefinition(ctx context.Context, vm *corrosion.VM
 			_ = s.virt.DefineDomain(oldXML)
 		}
 		return status.Errorf(codes.Internal, "redefine domain %q: %v", vm.Name, err)
+	}
+	if !usePatch {
+		s.ensureSparePCIeRootPorts(vm.Name)
 	}
 	return nil
 }

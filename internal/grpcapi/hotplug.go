@@ -409,7 +409,7 @@ func (s *Server) attachPCIDevice(ctx context.Context, vmName string, spec *pb.De
 			}
 			// Rollback FULLY completed: nothing is left owned+bound, so clear the durable lease.
 			finish()
-			return nil, status.Errorf(codes.Internal, "attach PCI device %s: %v", addr, err)
+			return nil, status.Error(pciAttachErrorCode(err), pciAttachError(fmt.Sprintf("attach PCI device %s", addr), err).Error())
 		}
 		attachedAddrs = append(attachedAddrs, addr)
 		slog.Info("PCI device attached", "vm", vmName, "address", addr)

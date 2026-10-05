@@ -102,6 +102,12 @@ type Server struct {
 	// normalizeCreateVMSpec for why it is never applied in the renderer.
 	defaultCPUModeCfg string
 
+	// sparePCIeRootPortsCfg is the node's `pci.spare_pcie_root_ports` — see
+	// daemon.PCIConfig.SparePCIeRootPorts for the full rationale and the
+	// migration/no-backfill story. Threaded into lv.VMConfig at every site that
+	// calls lv.GenerateDomainXML in this package.
+	sparePCIeRootPortsCfg int
+
 	// nbMetricsSink counts NetBox IPAM outcomes. nil means "not wired", which
 	// nbMetrics() resolves to a noop — a metrics sink must never be a reason a
 	// claim or a sweep behaves differently.
@@ -1053,6 +1059,11 @@ func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
 // operator sets it explicitly only to opt a genuinely heterogeneous fleet out of
 // the host-derived default — "" here does NOT mean "emit no <cpu> element".
 func (s *Server) SetDefaultCPUMode(mode string) { s.defaultCPUModeCfg = mode }
+
+// SetSparePCIeRootPorts sets the number of extra pcie-root-port controllers a
+// newly-defined q35 domain carries (`pci.spare_pcie_root_ports`). See
+// daemon.PCIConfig.SparePCIeRootPorts.
+func (s *Server) SetSparePCIeRootPorts(n int) { s.sparePCIeRootPortsCfg = n }
 
 // SetNetBoxIPAM sets this node's kill-switch for advertising netbox_ipam_v1 (see
 // enfNetBoxIPAM). The flag is the reversible kill switch: enabling on one node

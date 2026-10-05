@@ -374,6 +374,37 @@ func TestAttachDevice_NICMutationErrorRollsBack(t *testing.T) {
 	}
 }
 
+// TestAttachDevice_NICPCISlotsExhaustedMapsFailedPrecondition mirrors the disk
+// case: a live NIC attach can hit the same q35 "no free pcie-root-port" wall.
+func TestAttachDevice_NICPCISlotsExhaustedMapsFailedPrecondition(t *testing.T) {
+	s := hotplugDiskServer(t)
+	enableHardwareV2(t, s)
+	ctx := adminCtx()
+	seedNICVM(t, s, "vm1", "running")
+	fake := s.virt.(*libvirtfake.Fake)
+	fake.FailAttachNIC = func(_, _, _, _ string) error {
+		return errors.New("internal error: No more available PCI slots")
+	}
+
+	_, err := s.AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "vm1", Nic: &pb.NetworkAttachment{Name: "lan", Mac: "52:54:00:ee:00:02"},
+	})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("code = %v, want FailedPrecondition; err: %v", status.Code(err), err)
+	}
+	if !strings.Contains(status.Convert(err).Message(), "spare_pcie_root_ports") {
+		t.Fatalf("message must point at the fix (pci.spare_pcie_root_ports), got: %v", err)
+	}
+	nics, _ := corrosion.MergedVMNICs(ctx, s.db, "vm1")
+	if hasNICMac(nics, "52:54:00:ee:00:02") {
+		t.Fatalf("row must not survive a failed attach: %+v", nics)
+	}
+	vm := mustGetVM(t, s, "vm1")
+	if vm.ActiveOperationID != "" {
+		t.Fatalf("mutation barrier not cleared after clean rollback: %q", vm.ActiveOperationID)
+	}
+}
+
 // ── DB error is surfaced, not silently logged ─────────────────────────────────
 
 // TestAttachDevice_NICMembershipReadErrorSurfaced: a DB error on the pre-mutation

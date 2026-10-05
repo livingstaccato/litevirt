@@ -242,6 +242,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	// ── Define → persist stopped → optional start, with full rollback ──
 	cfg := fv.ToVMConfig()
+	cfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 	spec := fv.ToVMSpec(project)
 
 	// An import DEFINES a brand-new domain, so it takes the node's cpu_mode

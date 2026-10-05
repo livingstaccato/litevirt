@@ -791,6 +791,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// here, not in the shared builder.
 	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.CloudInitISO = cloudInitISO
+	vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
@@ -4265,6 +4266,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
+		vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 		// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
 		// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
 		// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no

@@ -158,6 +158,43 @@ lv detach-pci my-vm 0000:41:00.0
 
 Hot-plug is supported for most PCI devices. Some devices (particularly GPUs with active CUDA contexts) may require the VM to be stopped first.
 
+### Spare PCIe root ports
+
+A q35 guest (the default machine type) attaches every hot-plugged device — a
+disk, a NIC, or a PCI device — to a free `pcie-root-port`. A domain with no
+spare root port left fails the attach with libvirt's "No more available PCI
+slots", which litevirt reports as `FailedPrecondition` (an operator fix) rather
+than a generic internal error, and names the config key to raise:
+
+```
+attach disk: no free PCI slot on this q35 guest (raise pci.spare_pcie_root_ports
+and redefine the VM, or detach another device first): internal error: No more
+available PCI slots
+```
+
+`pci.spare_pcie_root_ports` (default 4, see configuration.md) is the number of
+EXTRA, empty root ports a NEWLY-DEFINED q35 domain carries beyond what its
+disks/NICs/hostdevs need at define time — headroom for later hot-plugs. A
+rolled-back attach is as clean as any other failed attach: nothing is left
+partially attached and the VM's mutation barrier is released.
+
+**This does not retroactively change an existing VM.** The value is daemon
+config, not part of a VM's persisted spec. A redefine that preserves the
+existing domain XML in place (device hot-plug on a stopped VM, most reconciler
+sweeps) never touches the controller list, so an existing VM keeps exactly the
+root-port count it was created with. Only a FULL regenerate — create, import,
+clone, promote, or the rarer update/reconcile paths that can't patch in place —
+picks up the node's current value. There is no backfill command; an existing
+VM converges the next time (if ever) its definition is fully regenerated.
+
+**This is a non-issue for migration.** Neither live nor cold migration ever
+regenerates a domain's XML from spec: live migration streams the source's
+actual live definition to the target, and cold migration dumps the source's
+XML and defines that verbatim on the target. Either way the migrated domain
+keeps exactly the root-port controllers it already had — a cluster where nodes
+disagree on `pci.spare_pcie_root_ports` cannot produce a migration-incompatible
+domain, because migration never consults this config on either side.
+
 ## Placement intelligence
 
 When a VM requests PCI devices, the placement engine considers:

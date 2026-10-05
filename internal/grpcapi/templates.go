@@ -329,6 +329,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		Machine: machine, Firmware: firmware, GuestAgent: srcSpec.GuestAgent,
 		EnableVNC: !srcSpec.DisableVnc, EnableSPICE: srcSpec.EnableSpice,
 		Disks: diskConfigs, Networks: netConfigs, CloudInitISO: cloudInitISO, Boot: srcSpec.Boot,
+		SparePCIeRootPorts: s.sparePCIeRootPortsCfg,
 	}
 	// Thread Secure Boot + vTPM (fresh vTPM at the new UUID; fresh NVRAM from
 	// template) into the clone domain (G1).

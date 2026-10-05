@@ -63,6 +63,19 @@ type VMConfig struct {
 	// PCI passthrough devices
 	Hostdevs []HostdevConfig
 
+	// SparePCIeRootPorts is the number of EXTRA, empty `<controller type='pci'
+	// model='pcie-root-port'>` entries to declare beyond what the devices above
+	// need. q35 hot-plug (disk/NIC/PCI) needs a free PCIe slot at attach time;
+	// with none spare, a live attach fails with libvirt's "No more available PCI
+	// slots" (mapped to FailedPrecondition — see IsPCISlotsExhausted). Ignored
+	// (and should be left 0) on a non-q35 machine — see isQ35Machine — since
+	// i440fx has no PCIe root-port concept. The daemon sets this from
+	// `pci.spare_pcie_root_ports`; it is NOT part of the persisted VMSpec, so a
+	// redefine that goes through the topology-preserving PATCH path (which never
+	// touches the controller list) leaves an existing VM's count exactly as it
+	// was — only a FULL regenerate picks up the node's current configured value.
+	SparePCIeRootPorts int
+
 	// Secure Boot + vTPM (G1). SecureBoot uses the secboot/MS OVMF pair + SMM
 	// (q35-only); TPM adds an emulated TPM 2.0 device. LoaderPath/NvramTemplate
 	// are daemon-resolved firmware paths (required when SecureBoot; else fall back
@@ -496,6 +509,23 @@ func GenerateDomainXML(cfg VMConfig) (string, error) {
 			Index: 0,
 			Model: scsiModel,
 		})
+	}
+
+	// Spare PCIe root ports (q35 only — i440fx has no pcie-root-port controller
+	// model). Each is empty (no <address>/<target>): libvirt's address-assignment
+	// pass at define time treats them as already-declared free slots, so a later
+	// hot-plug (live attach, which allocates against the ALREADY-DEFINED domain)
+	// has somewhere to land instead of failing "No more available PCI slots".
+	// Index starts at 1 — index 0 on a type="pci" controller is libvirt's own
+	// implicit pcie-root, which this builder never declares explicitly.
+	if isQ35Machine(cfg.Machine) {
+		for i := 1; i <= cfg.SparePCIeRootPorts; i++ {
+			dev.Controllers = append(dev.Controllers, controllerDevice{
+				Type:  "pci",
+				Index: i,
+				Model: "pcie-root-port",
+			})
+		}
 	}
 
 	// Network interfaces

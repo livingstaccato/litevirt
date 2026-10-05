@@ -516,7 +516,7 @@ func (s *Server) executeNICAttach(ctx context.Context, vm *corrosion.VMRecord, s
 
 	if running {
 		if err := s.virt.AttachNIC(vm.Name, bridge, model, mac); err != nil {
-			return s.failNICAttach(ctx, rb, codes.Internal, fmt.Errorf("attach NIC: %w", err))
+			return s.failNICAttach(ctx, rb, pciAttachErrorCode(err), pciAttachError("attach NIC", err))
 		}
 		rb.attached = true
 		if err := s.writeNICAttachRows(ctx, rb, vm.Name, spec, model, mac, nicID, sgsJSON, nicIP, ordinal); err != nil {

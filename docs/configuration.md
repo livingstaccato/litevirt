@@ -126,6 +126,17 @@ pci:
   # /etc/udev/rules.d/99-litevirt-pci.rules (an upgrade cleans up the litevirt one).
   udev_hook: false
 
+  # Extra, empty pcie-root-port controllers a NEWLY-DEFINED q35 domain gets
+  # beyond what its disks/NICs/hostdevs need, so a later hot-plug (disk, NIC,
+  # or PCI) has somewhere to land. With none spare, a live attach once every
+  # root port already holds a device fails with libvirt's "No more available
+  # PCI slots" (FailedPrecondition, not a generic internal error). Default 4;
+  # an explicit 0 restores the pre-this-feature behavior. See
+  # docs/pci-passthrough.md "Hot-plug" for the full story, including why this
+  # does NOT retroactively change an existing VM and is a non-issue for live
+  # or cold migration.
+  spare_pcie_root_ports: 4
+
   # SR-IOV configuration.
   sriov:
     # false: operators provision VFs (litevirt reuses free VFs on any PF, but never

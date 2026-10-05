@@ -399,7 +399,7 @@ func (s *Server) executePCIAttach(ctx context.Context, vm *corrosion.VMRecord, s
 		for _, m := range members {
 			alias := pciMemberAlias(deviceID, m.MemberID)
 			if err := s.virt.AttachHostdevWithAlias(vm.Name, m.Address, alias); err != nil {
-				return s.failPCIAttach(ctx, rb, codes.Internal, fmt.Errorf("attach PCI hostdev %s: %w", m.Address, err))
+				return s.failPCIAttach(ctx, rb, pciAttachErrorCode(err), pciAttachError(fmt.Sprintf("attach PCI hostdev %s", m.Address), err))
 			}
 			rb.attachedAddrs = append(rb.attachedAddrs, m.Address)
 		}

@@ -1199,6 +1199,7 @@ Operators should monitor these Prometheus metrics:
 | `litevirt_replication_backlog_age_seconds` | > 300 s sustained |
 | `litevirt_daemon_open_fds` | > 5000 (FD leak) |
 | `litevirt_lb_keepalived_up{lb}` | `== 0` sustained (a load balancer's VIP is not assigned — see [compose.md](compose.md#load-balancer)) |
+| `litevirt_firewall_sg_duplicate_name_nics{sg}` | `> 0` (NICs held at drop because two live security groups share the name — see [firewall.md](firewall.md#per-nic-sg-binding--reload)) |
 
 The web UI at port 7445 surfaces the most critical of these on the
 **Cluster** page; full dashboards are on the roadmap.

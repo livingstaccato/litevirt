@@ -1218,8 +1218,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// table. The applier short-circuits when the rendered ruleset
 	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
 	fwApplier := firewall.NewApplier(firewall.NftBinary{})
+	fwMetrics := metrics.NewFirewallMetrics()
 	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
-		firewall.LoaderOptions{ResolveTap: d.virt.TapDevice})
+		firewall.LoaderOptions{ResolveTap: d.virt.TapDevice, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
 	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables

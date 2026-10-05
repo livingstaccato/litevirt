@@ -56,6 +56,18 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 	if req.Name == "" {
 		return nil, status.Error(codes.InvalidArgument, "name required")
 	}
+	// One live group per name. The firewall cannot tell which of two same-name
+	// groups a NIC meant, so it holds every NIC bound to such a name at drop;
+	// refusing here keeps that from being created. Best effort only — two
+	// nodes can race, and the CRDT has no UNIQUE — which is why the reconciler
+	// still fails closed on a duplicate that exists anyway.
+	if held, err := liveSGNamed(ctx, s.db, req.Name, ""); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "check for a security group named %q: %v", req.Name, err)
+	} else if held != nil {
+		return nil, status.Errorf(codes.AlreadyExists,
+			"security group %q already exists (id %s); names must be unique, because a NIC bound to a name two groups hold is held at drop",
+			req.Name, held.ID)
+	}
 	row := corrosion.SecurityGroup{ID: randid.New(), Name: req.Name, StackName: req.StackName}
 	if err := corrosion.InsertSecurityGroup(ctx, s.db, row); err != nil {
 		return nil, status.Errorf(codes.Internal, "create security group: %v", err)
@@ -67,6 +79,21 @@ func (s *Server) CreateSecurityGroup(ctx context.Context, req *pb.CreateSecurity
 		row = *stored
 	}
 	return toPbSecurityGroup(row), nil
+}
+
+// liveSGNamed returns a live security group named name, ignoring the groups
+// of stack exceptStack ("" ignores none), or nil when there is none.
+func liveSGNamed(ctx context.Context, db *corrosion.Client, name, exceptStack string) (*corrosion.SecurityGroup, error) {
+	sgs, err := corrosion.ListSecurityGroups(ctx, db, "")
+	if err != nil {
+		return nil, err
+	}
+	for i := range sgs {
+		if sgs[i].Name == name && (exceptStack == "" || sgs[i].StackName != exceptStack) {
+			return &sgs[i], nil
+		}
+	}
+	return nil, nil
 }
 
 // DeleteSecurityGroup tombstones a security group and every rule in it.

@@ -142,3 +142,91 @@ func TestCorrosionPlanLoader_OneTapIsBoundOnce(t *testing.T) {
 		t.Errorf("want exactly one nic_vnet7 chain (err %v):\n%s", err, out)
 	}
 }
+
+// TestCorrosionPlanLoader_DuplicateNameFailsClosed: two live groups named
+// "web". A VM NIC and a container NIC bound to "web" are held at drop and get
+// neither group's rules; a NIC bound only to an unambiguous group is untouched;
+// the duplicate is reported with the number of NICs it holds.
+func TestCorrosionPlanLoader_DuplicateNameFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	for _, g := range []struct{ id, name, port string }{
+		{"web-1", "web", "80"},
+		{"web-2", "web", "8080"},
+		{"ssh-1", "ssh", "22"},
+	} {
+		if err := corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: g.id, Name: g.name}); err != nil {
+			t.Fatalf("InsertSecurityGroup %s: %v", g.id, err)
+		}
+		if err := corrosion.InsertSGRule(ctx, db, corrosion.SGRule{ID: "r-" + g.id, SGID: g.id,
+			Direction: "ingress", Proto: "tcp", PortRange: g.port, Action: "accept"}); err != nil {
+			t.Fatalf("InsertSGRule %s: %v", g.id, err)
+		}
+	}
+	for _, vm := range []struct {
+		name, mac string
+		sgs       []string
+	}{
+		{"vm-web", "52:54:00:00:00:0a", []string{"ssh", "web"}},
+		{"vm-ssh", "52:54:00:00:00:0b", []string{"ssh"}},
+	} {
+		if err := corrosion.InsertVM(ctx, db,
+			corrosion.VMRecord{Name: vm.name, HostName: "host-a", State: "running"},
+			[]corrosion.InterfaceRecord{{VMName: vm.name, NetworkName: "prod", MAC: vm.mac, SecurityGroups: vm.sgs}},
+			nil); err != nil {
+			t.Fatalf("InsertVM %s: %v", vm.name, err)
+		}
+	}
+	if err := corrosion.UpsertContainer(ctx, db, corrosion.ContainerRecord{
+		HostName: "host-a", Name: "ct-web", State: "running"}); err != nil {
+		t.Fatalf("UpsertContainer: %v", err)
+	}
+	if err := corrosion.UpsertContainerInterface(ctx, db, corrosion.ContainerInterfaceRecord{
+		HostName: "host-a", CtName: "ct-web", NetworkName: "prod", MAC: "52:00:00:00:00:10",
+		VethDevice: "lvc0web", SecurityGroups: []string{"web"}}); err != nil {
+		t.Fatalf("UpsertContainerInterface: %v", err)
+	}
+
+	var reported map[string]int
+	opts := liveTaps(map[string]string{"52:54:00:00:00:0a": "vnet1", "52:54:00:00:00:0b": "vnet2"})
+	opts.OnDuplicateSGs = func(m map[string]int) { reported = m }
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, opts)(ctx)
+	if err != nil {
+		t.Fatalf("loader: %v", err)
+	}
+	out, err := Render(plan)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	chain := func(dev string) string {
+		head := "chain nic_" + dev + " {\n"
+		i := strings.Index(out, head)
+		if i < 0 {
+			t.Fatalf("no chain for %s:\n%s", dev, out)
+		}
+		body := out[i+len(head):]
+		return body[:strings.Index(body, "\n    }")]
+	}
+	for _, dev := range []string{"vnet1", "lvc0web"} {
+		c := chain(dev)
+		for _, want := range []string{"oifname " + dev + " drop", "iifname " + dev + " drop"} {
+			if !strings.Contains(c, want) {
+				t.Errorf("%s is bound to the ambiguous web; want %q in its chain:\n%s", dev, want, c)
+			}
+		}
+		for _, leaked := range []string{"dport 80 ", "dport 8080 ", "dport 22 "} {
+			if strings.Contains(c, leaked) {
+				t.Errorf("%s failed closed must render no group's rules; found %q:\n%s", dev, leaked, c)
+			}
+		}
+	}
+	if c := chain("vnet2"); !strings.Contains(c, "oifname vnet2 tcp dport 22 accept") || strings.Contains(c, " drop") {
+		t.Errorf("vnet2 binds only the unambiguous ssh and must be unaffected:\n%s", c)
+	}
+	if len(reported) != 1 || reported["web"] != 2 {
+		t.Errorf("OnDuplicateSGs = %v, want web=2 (one VM NIC, one container NIC)", reported)
+	}
+}

@@ -252,6 +252,13 @@ type LoaderOptions struct {
 	// start, a migration or a failover it names nothing — or another VM's tap
 	// on this host. nil renders no VM NIC chains at all.
 	ResolveTap TapResolver
+
+	// OnDuplicateSGs, when set, receives after every pass the security-group
+	// names that more than one live group holds and that a NIC on this host is
+	// bound to, each with the number of this host's NICs held at drop for it.
+	// An empty map means none. The daemon exports it as
+	// litevirt_firewall_sg_duplicate_name_nics.
+	OnDuplicateSGs func(nicsByName map[string]int)
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
@@ -265,6 +272,13 @@ type LoaderOptions struct {
 // reports for that NIC's MAC right now (opts.ResolveTap). A NIC whose tap
 // cannot be resolved — its VM is not running, or the NIC is not in the live
 // domain — is skipped: there is no device to filter.
+//
+// A NIC (VM or container) bound to a group name that more than one live group
+// holds fails CLOSED: its chain drops everything new and renders neither
+// group, with a warning per pass and opts.OnDuplicateSGs. Creating such a name
+// is refused (CreateSecurityGroup, stack deploy); this covers rows that exist
+// anyway — written before the refusal, by a peer on an older build, or by two
+// nodes racing, since the CRDT has no UNIQUE.
 func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, opts LoaderOptions) PlanLoader {
 	return func(ctx context.Context) (Plan, error) {
 		plan := defaults
@@ -304,8 +318,20 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		if err != nil {
 			return plan, err
 		}
+		// A name two live groups hold cannot be resolved: which one a NIC
+		// meant is not in the data. Neither is rendered, and every NIC bound to
+		// the name is held at drop (failClosed) — picking one would silently
+		// hand the NIC rules nobody chose for it, and a union would accept
+		// traffic both groups' owners meant to refuse.
+		holders := map[string]int{}
+		for _, sg := range sgs {
+			holders[sg.Name]++
+		}
 		plan.SecurityGroups = plan.SecurityGroups[:0:0]
 		for _, sg := range sgs {
+			if holders[sg.Name] > 1 {
+				continue
+			}
 			rules, err := corrosion.ListSGRules(ctx, db, sg.ID)
 			if err != nil {
 				return plan, err
@@ -327,6 +353,34 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		for _, sg := range plan.SecurityGroups {
 			valid[sg.Name] = true
 		}
+		ambiguous := map[string]int{} // duplicate name → this host's NICs held at drop for it
+		// bind resolves one NIC's bound names: the known ones, or, when any of
+		// them is a duplicate, none at all plus the drop rules.
+		bind := func(dev, owner string, names []string) NICBinding {
+			nb := NICBinding{NICDev: dev, VMName: owner}
+			var dups []string
+			for _, name := range names {
+				if holders[name] > 1 {
+					dups = append(dups, name)
+				}
+			}
+			if len(dups) > 0 {
+				for _, d := range dups {
+					ambiguous[d]++
+				}
+				slog.Warn("firewall: NIC bound to a security-group name more than one live group holds; holding it at drop",
+					"workload", owner, "nic", dev, "groups", dups)
+				nb.ExtraRules = failClosed()
+				return nb
+			}
+			nb.SecurityGroups = make([]string, 0, len(names))
+			for _, name := range names {
+				if valid[name] {
+					nb.SecurityGroups = append(nb.SecurityGroups, name)
+				}
+			}
+			return nb
+		}
 		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName)
 		if err != nil {
 			return plan, err
@@ -346,17 +400,7 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 				continue
 			}
 			claimed[tap] = ifc.VMName
-			bound := make([]string, 0, len(ifc.SecurityGroups))
-			for _, name := range ifc.SecurityGroups {
-				if valid[name] {
-					bound = append(bound, name)
-				}
-			}
-			plan.NICs = append(plan.NICs, NICBinding{
-				NICDev:         tap,
-				VMName:         ifc.VMName,
-				SecurityGroups: bound,
-			})
+			plan.NICs = append(plan.NICs, bind(tap, ifc.VMName, ifc.SecurityGroups))
 		}
 
 		// Container NICs: identical per-NIC SG enforcement on the veth. The loader
@@ -371,17 +415,10 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 			if ifc.VethDevice == "" {
 				continue
 			}
-			bound := make([]string, 0, len(ifc.SecurityGroups))
-			for _, name := range ifc.SecurityGroups {
-				if valid[name] {
-					bound = append(bound, name)
-				}
-			}
-			plan.NICs = append(plan.NICs, NICBinding{
-				NICDev:         ifc.VethDevice,
-				VMName:         ifc.CtName,
-				SecurityGroups: bound,
-			})
+			plan.NICs = append(plan.NICs, bind(ifc.VethDevice, ifc.CtName, ifc.SecurityGroups))
+		}
+		if opts.OnDuplicateSGs != nil {
+			opts.OnDuplicateSGs(ambiguous)
 		}
 
 		// NAT / SNAT / host-isolation infra: read this host's resolved intent
@@ -393,6 +430,19 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		}
 		plan.NAT, plan.HostIsolation = intentToNATIsolation(intents)
 		return plan, nil
+	}
+}
+
+// failClosed is the chain body of a NIC whose groups cannot be resolved: drop
+// everything new in both directions. Replies to connections the NIC already
+// had still pass (the forward chain accepts established flows before any NIC
+// chain). The nft comment is fixed text, because nft caps a comment at 128
+// bytes and a group name is unbounded; the names go to the log and the metric.
+func failClosed() []Rule {
+	const why = "ambiguous security group name: held at drop"
+	return []Rule{
+		{Direction: Ingress, Proto: "all", Action: Drop, Comment: why},
+		{Direction: Egress, Proto: "all", Action: Drop, Comment: why},
 	}
 }
 

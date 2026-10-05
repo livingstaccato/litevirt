@@ -97,9 +97,10 @@ type Rule struct {
 }
 
 // SecurityGroup is a named set of Rules. NICs reference SGs by name;
-// the renderer expands references into rule chains. Same-name SGs
-// from different stacks collide — operators get a deterministic error
-// at deploy rather than a silent overwrite.
+// the renderer expands references into rule chains. Names are unique
+// within a Plan: CorrosionPlanLoader leaves out every name that more than
+// one live group holds and holds the NICs bound to it at drop, and the
+// daemon refuses to create a second live group under a held name.
 type SecurityGroup struct {
 	Name  string
 	Rules []Rule

@@ -26,6 +26,9 @@ import (
 	"strings"
 	"testing"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
@@ -301,5 +304,64 @@ func TestFleet_SG_ClonedNICIsEnforced(t *testing.T) {
 	}
 	if got := legacyGroups(t, host, "db1", sgNet); len(got) != 1 || got[0] != "db" {
 		t.Errorf("the clone's legacy vm_interfaces row must carry its groups for older peers; got %v", got)
+	}
+}
+
+// TestFleet_SG_DuplicateNameFailsClosed: a second live group cannot be created
+// under a name already held, and where two already exist (written before this
+// refusal, or by a peer on an older build) a NIC bound to that name is held at
+// drop — neither group's rules are rendered for it, and no other NIC changes.
+func TestFleet_SG_DuplicateNameFailsClosed(t *testing.T) {
+	c := sgCluster(t)
+	ctx := context.Background()
+	entry, host := c.Nodes[0], c.Nodes[1]
+	mustCreateSG(t, c, entry, "web", "80")
+	mustCreateSG(t, c, entry, "ssh", "22")
+
+	_, err := c.SelfClient(entry).CreateSecurityGroup(ctx, &pb.CreateSecurityGroupRequest{Name: "web"})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("creating a second live group named web: got %v, want AlreadyExists", err)
+	}
+
+	// The pre-existing duplicate, as an older build could write it.
+	if err := corrosion.InsertSecurityGroup(ctx, host.DB, corrosion.SecurityGroup{ID: "zz-legacy-web", Name: "web"}); err != nil {
+		t.Fatalf("seed duplicate group: %v", err)
+	}
+	if err := corrosion.InsertSGRule(ctx, host.DB, corrosion.SGRule{ID: "zz-legacy-rule", SGID: "zz-legacy-web",
+		Direction: "ingress", Proto: "tcp", PortRange: "8080", Action: "accept"}); err != nil {
+		t.Fatalf("seed duplicate group rule: %v", err)
+	}
+
+	for _, vm := range []struct {
+		name   string
+		groups []string
+	}{
+		{"web1", []string{"web", "ssh"}},
+		{"bastion", []string{"ssh"}},
+	} {
+		if _, err := c.SelfClient(host).CreateVM(ctx, &pb.CreateVMRequest{Spec: &pb.VMSpec{
+			Name: vm.name, Cpu: 1, MemoryMib: 512, Placement: &pb.PlacementSpec{Host: host.Name},
+			Network: []*pb.NetworkAttachment{{Name: sgNet, SecurityGroups: vm.groups}},
+		}}); err != nil {
+			t.Fatalf("CreateVM %s: %v", vm.name, err)
+		}
+	}
+	webTap := mustTap(t, host, "web1", liveNIC(t, host, "web1", sgNet).MAC)
+	bastionTap := mustTap(t, host, "bastion", liveNIC(t, host, "bastion", sgNet).MAC)
+
+	out := renderPlan(t, nodePlan(t, host))
+	chain := nicChain(out, webTap)
+	for _, want := range []string{"oifname " + webTap + " drop", "iifname " + webTap + " drop"} {
+		if !strings.Contains(chain, want) {
+			t.Errorf("web1 is bound to a name two live groups hold; its chain must drop (%q):\n%s", want, chain)
+		}
+	}
+	for _, leaked := range []string{"dport 80 ", "dport 8080 ", "dport 22 "} {
+		if strings.Contains(chain, leaked) {
+			t.Errorf("a NIC failed closed must render no group's rules, found %q:\n%s", leaked, chain)
+		}
+	}
+	if bc := nicChain(out, bastionTap); !strings.Contains(bc, "tcp dport 22 accept") || strings.Contains(bc, " drop") {
+		t.Errorf("bastion binds only the unambiguous ssh group and must be unaffected:\n%s", bc)
 	}
 }

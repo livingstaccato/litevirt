@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 )
 
 // makeRunning turns the scenario's stopped VM into a running one on the source.
@@ -254,8 +255,8 @@ func TestFleet_DrainStartsAGuestThatShutsDownLateAgain(t *testing.T) {
 	sc.assertRunningOnSource(t)
 }
 
-// The row says stopped, by the operator, before the guest is asked to shut
-// down. A guest that went down under a row saying running would read as a
+// The row says stopped, with the drain's own stop detail (an operator stop to
+// every health decision), before the guest is asked to shut down. A guest that went down under a row saying running would read as a
 // crash to the domain-event handler and the restart policy, which could start
 // it again while its disk is being copied.
 //
@@ -278,8 +279,9 @@ func TestFleet_DrainRecordsTheVMStoppedBeforeShuttingItDown(t *testing.T) {
 	if atShutdown == nil {
 		t.Fatal("os1 was never shut down")
 	}
-	if atShutdown.State != "stopped" || atShutdown.StateDetail != "operator-stop" {
-		t.Fatalf("os1's row when its shutdown was requested = %s/%q, want stopped/\"operator-stop\"", atShutdown.State, atShutdown.StateDetail)
+	if atShutdown.State != "stopped" || !health.IsOperatorStop(atShutdown.StateDetail) ||
+		!strings.HasPrefix(atShutdown.StateDetail, health.DrainStopDetailPrefix) {
+		t.Fatalf("os1's row when its shutdown was requested = %s/%q, want stopped with the drain's own operator-stop detail", atShutdown.State, atShutdown.StateDetail)
 	}
 }
 

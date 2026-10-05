@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/health"
 	"github.com/litevirt/litevirt/internal/obs"
 )
 
@@ -240,16 +241,19 @@ func (s *Server) reportStillShuttingDown(ctx context.Context, name, target, reas
 }
 
 // shutDownForColdMove stops a running VM for its cold move and returns once
-// its domain is shut off. The row is recorded stopped by the operator first:
-// a guest that shuts down under a row that says running reads as a crash to
-// the domain-event handler and the restart policy, which would start it again
-// while its disk is being copied. The journal's "stopped" step is recorded
+// its domain is shut off. The row is recorded stopped first, with the move's
+// own stop detail (health.DrainStopDetail), which every health decision
+// treats as an operator stop: a guest that shuts down under a row that says
+// running reads as a crash to the domain-event handler and the restart
+// policy, which would start it again while its disk is being copied. The
+// detail names the move, so its crash recovery can tell this stop from any
+// later start or stop of the VM. The journal's "stopped" step is recorded
 // before the shutdown is requested, so a daemon that dies after the request
 // knows to wait for the guest. If the domain is not shut off within the VM's
 // stop timeout the move fails (it is not forced off), and *requested tells
 // the caller the guest may still be shutting down.
 func (s *Server) shutDownForColdMove(ctx context.Context, vm *corrosion.VMRecord, m corrosion.DrainColdMove, requested *bool) error {
-	if err := s.persistVMState(ctx, vm.Name, "stopped", operatorStopDetail, corrosion.OpVMState); err != nil {
+	if err := s.persistVMState(ctx, vm.Name, "stopped", health.DrainStopDetail(m.OperationID), corrosion.OpVMState); err != nil {
 		return status.Errorf(codes.Internal, "record VM %q stopped for its cold move: %v", vm.Name, err)
 	}
 	if s.drainCrashed("recorded") {
@@ -268,6 +272,9 @@ func (s *Server) shutDownForColdMove(ctx context.Context, vm *corrosion.VMRecord
 	if active, err := s.virt.DomainIsActive(vm.Name); err != nil || active {
 		if err == nil {
 			err = fmt.Errorf("its domain is still active")
+		}
+		if s.drainCrashed("stop_timed_out") {
+			return errDrainCrashed
 		}
 		return status.Errorf(codes.DeadlineExceeded,
 			"VM %q did not shut down within its stop timeout of %s, so it is not moved: %v", vm.Name, timeout, err)
@@ -345,24 +352,38 @@ func (s *Server) startOnOwner(ctx context.Context, name, target string) error {
 }
 
 // drainRecoveryRetry is how often RunDrainColdMoveRecovery retries moves it
-// could not finish yet, and drainRecoveryAttempts how many times.
+// could not finish yet, and drainRecoveryAttempts how many times in all.
 var (
 	drainRecoveryRetry    = 30 * time.Second
 	drainRecoveryAttempts = 20
 )
 
+// SetDrainRecoveryRetryForTest sets RunDrainColdMoveRecovery's attempts and
+// interval, and returns the function that restores them.
+func SetDrainRecoveryRetryForTest(attempts int, every time.Duration) (restore func()) {
+	oldN, oldD := drainRecoveryAttempts, drainRecoveryRetry
+	drainRecoveryAttempts, drainRecoveryRetry = attempts, every
+	return func() { drainRecoveryAttempts, drainRecoveryRetry = oldN, oldD }
+}
+
 // RunDrainColdMoveRecovery finishes, at daemon startup, the drain cold moves a
 // previous process of this host left journaled (ResumeDrainColdMoves), and
 // retries what it could not finish yet — a start the split-brain gate refuses
 // until this host sees its quorum, a target not reachable yet — for a bounded
-// time. Run it in its own goroutine.
+// time. A move still unfinished after the last attempt is closed as failed,
+// with a VM event naming the VM: a later restart never takes it up again,
+// when the VM may long since have been started, stopped or moved on purpose.
+//
+// The daemon starts it with the runtime loops, after the startup recovery
+// barrier: it starts VMs, as they do.
 func (s *Server) RunDrainColdMoveRecovery(ctx context.Context) {
-	for i := 0; i < drainRecoveryAttempts; i++ {
-		left, err := s.ResumeDrainColdMoves(ctx)
+	for i := 1; ; i++ {
+		last := i >= drainRecoveryAttempts
+		left, err := s.resumeDrainColdMoves(ctx, last)
 		if err != nil {
 			slog.Warn("drain: resuming journaled cold moves", "error", err)
 		}
-		if err == nil && left == 0 {
+		if (err == nil && left == 0) || last {
 			return
 		}
 		select {
@@ -371,22 +392,23 @@ func (s *Server) RunDrainColdMoveRecovery(ctx context.Context) {
 		case <-time.After(drainRecoveryRetry):
 		}
 	}
-	slog.Error("drain: journaled cold moves still unfinished after every retry; see `lv` VM events and the daemon log")
 }
 
-// ResumeDrainColdMoves finishes every drain cold move this host journaled and
-// never finished — the work of a daemon that died mid-move. Each VM was
-// running when the drain found it, and ends running on exactly one host:
-//
-//   - its row still names this host (no handoff): a domain still active is
-//     left running — after waiting out a shutdown the move requested
-//     (drainLateShutdownWait) — and its row put back to running; a domain
-//     shut off is started here;
-//   - its row names the target (the handoff committed): it is started there,
-//     through its owner.
-//
-// It returns how many moves it could not finish yet; those stay journaled.
+// ResumeDrainColdMoves is one pass of RunDrainColdMoveRecovery that never
+// gives up on a move: it returns how many it could not finish yet, which stay
+// journaled.
 func (s *Server) ResumeDrainColdMoves(ctx context.Context) (int, error) {
+	return s.resumeDrainColdMoves(ctx, false)
+}
+
+// resumeDrainColdMoves finishes every drain cold move this host journaled and
+// never finished — the work of a daemon that died mid-move. It acts only on a
+// VM still exactly as the drain left it (resumeDrainColdMove), which was
+// running when the drain found it, and ends running on exactly one host. A
+// VM changed since — started, stopped, moved or deleted by anyone else — is
+// left as it is, and the move is closed with a VM event saying so. With
+// giveUp, a move it cannot finish is closed as failed, with a VM event.
+func (s *Server) resumeDrainColdMoves(ctx context.Context, giveUp bool) (int, error) {
 	pending, err := corrosion.ListDrainColdMoves(ctx, s.db, s.hostName)
 	if err != nil {
 		return 0, err
@@ -396,15 +418,31 @@ func (s *Server) ResumeDrainColdMoves(ctx context.Context) (int, error) {
 	ctx = context.WithValue(context.WithValue(ctx, ctxKeyRole, "admin"), ctxKeyUsername, "system:drain-recovery")
 	left := 0
 	for _, m := range pending {
-		outcome, rerr := s.resumeDrainColdMove(ctx, m)
-		if rerr != nil {
+		outcome, changed, rerr := s.resumeDrainColdMove(ctx, m)
+		switch {
+		case rerr != nil && !giveUp:
 			left++
 			slog.Error("drain: could not finish a journaled cold move yet; it stays journaled",
 				"vm", m.VM, "target", m.Target, "operation", m.OperationID, "error", rerr)
 			continue
+		case rerr != nil:
+			msg := fmt.Sprintf("an interrupted drain cold move of VM %s to %s could not be finished (%v), and is given up: "+
+				"the VM may be stopped — start it with `lv start %s`", m.VM, m.Target, rerr, m.VM)
+			slog.Error("drain: "+msg, "vm", m.VM, "operation", m.OperationID)
+			s.recordVMEvent(ctx, m.VM, "vm.drain", "error", msg)
+			if ferr := corrosion.FailDrainColdMove(ctx, s.db, m, msg); ferr != nil {
+				left++
+				slog.Error("drain: could not record a given-up cold move", "vm", m.VM, "error", ferr)
+			}
+			continue
+		case changed:
+			msg := "an interrupted drain cold move to " + m.Target + " was not finished: " + outcome + "; the VM was left as it is"
+			slog.Warn("drain: "+msg, "vm", m.VM, "operation", m.OperationID)
+			s.recordVMEvent(ctx, m.VM, "vm.drain", "warn", msg)
+		default:
+			slog.Warn("drain: finished a cold move a previous process left journaled", "vm", m.VM, "outcome", outcome)
+			s.recordVMEvent(ctx, m.VM, "vm.drain", "warn", "interrupted cold move to "+m.Target+" finished at startup: "+outcome)
 		}
-		slog.Warn("drain: finished a cold move a previous process left journaled", "vm", m.VM, "outcome", outcome)
-		s.recordVMEvent(ctx, m.VM, "vm.drain", "warn", "interrupted cold move to "+m.Target+" finished at startup: "+outcome)
 		if ferr := corrosion.FinishDrainColdMove(ctx, s.db, m, outcome); ferr != nil {
 			left++
 			slog.Error("drain: could not record a resumed cold move finished", "vm", m.VM, "error", ferr)
@@ -413,52 +451,101 @@ func (s *Server) ResumeDrainColdMoves(ctx context.Context) (int, error) {
 	return left, nil
 }
 
-func (s *Server) resumeDrainColdMove(ctx context.Context, m corrosion.DrainColdMove) (string, error) {
+// resumeDrainColdMove finishes one journaled move, if the VM is still exactly
+// as the drain left it — the only state in which the drain's intent ("it was
+// running, run it again") still holds:
+//
+//   - on the source, at the journaled owner epoch: running (the drain died
+//     before it stopped it; nothing to do), or stopped with this move's own
+//     stop detail. Then a domain still active is left running — after waiting
+//     out a shutdown the move requested — and its row put back to running, and
+//     a domain shut off is started here;
+//   - on the target, at the journaled epoch + 1 (the handoff advances it once),
+//     stopped with the empty detail the handoff writes: started there, through
+//     its owner.
+//
+// Anything else — another owner or epoch, an operator's later start or stop,
+// no row, no domain — returns changed with what it found, and nothing is done
+// to the VM. err means try again later.
+func (s *Server) resumeDrainColdMove(ctx context.Context, m corrosion.DrainColdMove) (outcome string, changed bool, err error) {
+	vm, err := corrosion.GetVM(ctx, s.db, m.VM)
+	if err != nil {
+		return "", false, err
+	}
+	if vm == nil {
+		return "the VM no longer exists", true, nil
+	}
+	found := fmt.Sprintf("it is now %s/%q on %s at owner epoch %d", vm.State, vm.StateDetail, vm.HostName, vm.OwnerEpoch)
+	switch {
+	case vm.HostName == m.Target && vm.OwnerEpoch == m.OwnerEpoch+1:
+		if vm.State != "stopped" || vm.StateDetail != "" {
+			return found, true, nil
+		}
+		// The handoff committed: the VM is the owner's to start, under a bound
+		// (a target that hangs must not stall recovery), and without this VM's
+		// lock, which is never held across a peer call.
+		sctx, cancel := context.WithTimeout(ctx, drainOwnershipWait+drainStartTimeout)
+		defer cancel()
+		if err := s.startOnOwner(sctx, m.VM, vm.HostName); err != nil {
+			return "", false, fmt.Errorf("start it on %s, its owner: %w", vm.HostName, err)
+		}
+		return "started on " + vm.HostName + ", where it was moved", false, nil
+	case vm.HostName == m.Source && vm.OwnerEpoch == m.OwnerEpoch && m.Source == s.hostName:
+		return s.resumeDrainColdMoveHere(ctx, m)
+	default:
+		return found, true, nil
+	}
+}
+
+// resumeDrainColdMoveHere is resumeDrainColdMove for a VM still owned here at
+// the journaled epoch, under its lock.
+func (s *Server) resumeDrainColdMoveHere(ctx context.Context, m corrosion.DrainColdMove) (string, bool, error) {
 	unlock := s.lockVM(m.VM)
 	defer unlock()
 	vm, err := corrosion.GetVM(ctx, s.db, m.VM)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	if vm == nil {
-		return "the VM no longer exists", nil
+	if vm == nil || vm.HostName != s.hostName || vm.OwnerEpoch != m.OwnerEpoch {
+		return "it changed owner while recovery waited for it", true, nil
 	}
-	if vm.HostName != s.hostName {
-		// The handoff committed: the VM is the owner's to start. Never
-		// started here — its domain left this host with the handoff.
-		if err := s.startOnOwner(ctx, m.VM, vm.HostName); err != nil {
-			return "", fmt.Errorf("start it on %s, its owner: %w", vm.HostName, err)
-		}
-		return "started on " + vm.HostName + ", where it was moved", nil
+	if vm.State == "running" {
+		// The drain died before it stopped the VM, or the VM was started since:
+		// either way it runs, and there is nothing to finish.
+		return "not moved; it is running here", false, nil
+	}
+	if vm.State != "stopped" || vm.StateDetail != health.DrainStopDetail(m.OperationID) {
+		return fmt.Sprintf("it is now %s/%q here, not stopped by this move", vm.State, vm.StateDetail), true, nil
 	}
 	if s.virt == nil {
-		return "", fmt.Errorf("libvirt not connected")
+		return "", false, fmt.Errorf("libvirt not connected")
+	}
+	if !s.virt.DomainExists(m.VM) {
+		return "it has no domain here", true, nil
 	}
 	active, aerr := s.virt.DomainIsActive(m.VM)
 	if aerr != nil {
-		return "", aerr
+		return "", false, aerr
 	}
 	if active && m.ShutdownRequested {
 		s.virt.WaitForShutdown(m.VM, drainLateShutdownWait)
 		if active, aerr = s.virt.DomainIsActive(m.VM); aerr != nil {
-			return "", aerr
+			return "", false, aerr
 		}
 	}
 	if active {
 		// Never shut down (the daemon died before asking), or a shutdown that
 		// is still not done: it runs here, and its row says so.
-		if vm.State != "running" {
-			if werr := s.persistVMState(ctx, m.VM, "running", "drain cold move interrupted; the domain kept running", corrosion.OpVMState); werr != nil {
-				return "", werr
-			}
+		if werr := s.persistVMState(ctx, m.VM, "running", "drain cold move interrupted; the domain kept running", corrosion.OpVMState); werr != nil {
+			return "", false, werr
 		}
 		if m.ShutdownRequested {
-			return "not moved; its shutdown was requested and is still in progress, it still runs here and will power off if the guest completes it", nil
+			return "not moved; its shutdown was requested and is still in progress: it still runs here and will power off if the guest completes it — then start it with `lv start " + m.VM + "`", false, nil
 		}
-		return "not moved; it kept running here", nil
+		return "not moved; it kept running here", false, nil
 	}
 	if err := s.restartAfterFailedColdMove(ctx, m.VM); err != nil {
-		return "", fmt.Errorf("start it again here: %w", err)
+		return "", false, fmt.Errorf("start it again here: %w", err)
 	}
-	return "not moved; started again here", nil
+	return "not moved; started again here", false, nil
 }

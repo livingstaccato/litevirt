@@ -113,3 +113,11 @@ func ListDrainColdMoves(ctx context.Context, c *Client, source string) ([]DrainC
 	}
 	return out, nil
 }
+
+// FailDrainColdMove records the move as failed: its recovery gave up, and a
+// later restart must not take it up again. reason says why.
+func FailDrainColdMove(ctx context.Context, c *Client, m DrainColdMove, reason string) error {
+	return AppendOperationStep(ctx, c, OperationStepRecord{
+		OperationID: m.OperationID, OwnerEpoch: m.OwnerEpoch, StepName: OpStepFailed, Facts: reason,
+	})
+}

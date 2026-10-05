@@ -240,7 +240,14 @@ operation of kind `drain_cold_move`). If the drained host's daemon dies in the
 middle, it finishes the move when it starts again, and the VM ends running on
 exactly one host: on the drained host if it had not been handed over yet
 (started again, or its record put back to running if its domain never stopped),
-or on the target if it had.
+or on the target if it had. It does so only while the VM is still exactly as
+the drain left it: owned by the same host at the same owner epoch, and stopped
+by the drain itself (its state detail then reads `drain-cold-move:<operation>`,
+which counts as an operator stop everywhere). A VM started, stopped, moved or
+deleted since is left as it is, and a VM event says the move was not finished.
+A move that still cannot be finished after about ten minutes of retries is
+closed as failed, with a VM event naming the VM to start with `lv start`; a
+later restart does not take it up again.
 
 Drain reports each VM it did not move with the reason, finishes the other VMs,
 and then fails with `drain incomplete: N VM(s) remain on host ...`. The host

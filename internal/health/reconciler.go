@@ -545,7 +545,7 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context) {
 			continue
 		}
 		// Operator intent may have changed while quorum was absent: honor it.
-		if fresh.StateDetail == operatorStopDetail || !specOnboot(fresh.Spec) {
+		if IsOperatorStop(fresh.StateDetail) || !specOnboot(fresh.Spec) {
 			slog.Info("reconciler: dropping onboot retry — operator intent changed",
 				"vm", name, "state_detail", fresh.StateDetail, "onboot", specOnboot(fresh.Spec))
 			r.clearOnbootPending(name)
@@ -662,7 +662,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				}
 				break
 			}
-			if vm.StateDetail == operatorStopDetail {
+			if IsOperatorStop(vm.StateDetail) {
 				break
 			}
 			// A cutover whose RUNTIME HANDOFF has not finished has, by definition,

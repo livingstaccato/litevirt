@@ -59,7 +59,7 @@ func (h *DomainEventHandler) Callback(ctx context.Context) lv.DomainEventCallbac
 			if err != nil || vm == nil || vm.HostName != h.hostName {
 				return
 			}
-			if vm.StateDetail == "operator-stop" {
+			if IsOperatorStop(vm.StateDetail) {
 				return // don't act on intentional stops
 			}
 			slog.Warn("domain event: VM stopped/crashed", "vm", domName, "event", event, "detail", detail)

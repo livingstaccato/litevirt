@@ -316,7 +316,10 @@ func (s *Server) PeerCapabilities(ctx context.Context, host string) ([]string, t
 
 // DrainHost marks the host as draining and migrates all its VMs to healthy hosts.
 // Uses a worker pool of size req.Parallel (default 2) for concurrent migrations.
-// VMs with shared storage use live migration; local-only VMs use cold migration.
+// Running VMs with shared storage use live migration; other running VMs are shut
+// down and reassigned. A stopped VM moves as `lv migrate --cold` moves it, with its
+// host-local disks (drainStoppedVM); one that cannot move stays here, is reported,
+// and the drain ends incomplete.
 func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHostServer) error {
 	ctx := stream.Context()
 	if err := RequireRole(ctx, "admin"); err != nil {
@@ -448,11 +451,17 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	close(jobs)
 
 	// Collect results and stream progress.
+	// notStarted: VMs moved off the host that did not start on their target
+	// (a `done` frame carrying an Error). They left the host, but the drain
+	// did not do what it was asked for them, so it does not end clean.
 	var failures int
+	var notStarted []string
 	for range drainJobs {
 		progress := <-results
 		if progress.Status == "error" || progress.Status == "failed" {
 			failures++
+		} else if progress.Status == "done" && progress.Error != "" {
+			notStarted = append(notStarted, progress.VmName)
 		}
 		if err := stream.Send(progress); err != nil {
 			return err
@@ -470,8 +479,13 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	}
 	if stillRunning > 0 {
 		return status.Errorf(codes.FailedPrecondition,
-			"drain incomplete: %d VM(s) remain on host %q (pinned or no eligible target)",
+			"drain incomplete: %d VM(s) remain on host %q (pinned, no eligible target, or not movable; see each VM's result)",
 			stillRunning, req.Name)
+	}
+	if len(notStarted) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"drain incomplete: every VM left host %q, but %d did not start on its target (%s); start each with `lv start <vm>`",
+			req.Name, len(notStarted), strings.Join(notStarted, ", "))
 	}
 
 	return nil
@@ -518,14 +532,29 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 }
 
 // drainOneVM migrates a single VM to the target host. Returns progress message.
+//
+// A running VM whose disks are all on shared storage is live-migrated. Every
+// other VM moves the way `lv migrate --cold` moves a stopped one, with its
+// host-local disks: a stopped VM as it is (drainStoppedVM), a running one shut
+// down first and started again on the target (drainRunningVMCold), which is
+// also where a failed live migration falls back to. No VM is moved by its row
+// alone.
 func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target corrosion.HostRecord) *pb.DrainProgress {
 	// Acquire per-VM lock to avoid migrating while a backup is in progress (#54).
-	unlock := s.lockVM(vm.Name)
-	defer unlock()
+	// It is MigrateVM's lock discipline: a migration that outlives this step
+	// takes the lock with it (migrateOwnedVM's adoption), and then this step
+	// must not release it.
+	unlock := releaseOnce(s.lockVM(vm.Name))
+	adopted := false
+	defer func() {
+		if !adopted {
+			unlock()
+		}
+	}()
 
 	// Re-read under lock and act on the CURRENT row, not the queued snapshot:
 	// ownership or state may have changed since the drain job was queued, and a stale
-	// snapshot could otherwise live-migrate / cold-reassign a VM this daemon no longer
+	// snapshot could otherwise live-migrate / cold-move a VM this daemon no longer
 	// owns (split-brain). Everything below uses `fresh`.
 	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
 	if err != nil || fresh == nil {
@@ -537,7 +566,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			Error: "active backup in progress — re-run drain after backup completes"}
 	}
 	// Only drain a VM we still OWN, in a drainable state. Never act on one that moved
-	// off this host (or changed state) after the job was queued — a reassign of a VM
+	// off this host (or changed state) after the job was queued — a move of a VM
 	// running elsewhere would double-run it.
 	if fresh.HostName != s.hostName {
 		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
@@ -548,39 +577,24 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			Error: fmt.Sprintf("VM is %s — not drainable", fresh.State)}
 	}
 
-	progress := &pb.DrainProgress{
-		VmName:     vm.Name,
-		TargetHost: target.Name,
-		Status:     "migrating",
-	}
-
-	// Determine if this VM can live migrate (shared storage only).
-	disks, _ := corrosion.GetVMDisks(ctx, s.db, vm.Name)
-	hasLocalOnly := false
-	for _, d := range disks {
-		if d.StorageType == "local" {
-			hasLocalOnly = true
-			break
-		}
-	}
-
-	// Drain moves a VM by either a raw libvirt live-migrate (shared storage) or a
-	// stop-and-reassign (cold) — NEITHER carries the host-local NVRAM + swtpm of a
-	// Secure-Boot/vTPM VM (and a stale live carry would race the TPM). Refuse such
-	// VMs REGARDLESS of storage type (NVRAM is host-local even on shared disks) and
-	// point the operator at explicit migration, which captures firmware quiescently
-	// and transfers it (G1).
-	if usesFirmwareState(fresh.Spec) {
+	// A RUNNING VM is drained either by a raw libvirt live-migrate (shared storage)
+	// or shut down and cold-moved — NEITHER carries the host-local NVRAM + swtpm of a
+	// running Secure-Boot/vTPM VM (and a stale live carry would race the TPM). Refuse
+	// such a VM REGARDLESS of storage type (NVRAM is host-local even on shared disks)
+	// and point the operator at explicit migration, which captures firmware
+	// quiescently and transfers it (G1). A STOPPED one takes that explicit path
+	// below (drainStoppedVM), with its refusals.
+	if fresh.State == "running" && usesFirmwareState(fresh.Spec) {
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
-			Error: "Secure Boot / vTPM VM can't be drained automatically (its firmware state isn't transferred) — stop it and migrate it explicitly (`lv migrate " + vm.Name + " --strategy=cold`), which carries the firmware",
+			Error: "Secure Boot / vTPM VM can't be drained while running (its firmware state isn't transferred live) — stop it and drain again, or migrate it explicitly (`lv migrate " + vm.Name + " <target-host> --cold`), which carries the firmware",
 		}
 	}
 
 	// Split-brain gate, PER-VM re-check: DrainHost gated once up front, but drain is
 	// long-running and batch-oriented, so quorum can be lost between VMs. Re-check on
-	// the source right before THIS VM's irreversible move (live-migrate, or cold
-	// shutdown+reassign below) so a mid-drain quorum loss stops further moves. Placed
+	// the source right before THIS VM's irreversible move (a live migration, or a
+	// cold move's handoff) so a mid-drain quorum loss stops further moves. Placed
 	// after the fresh-row read and before any runtime/ownership mutation. Fail-open
 	// until split_brain_gate_v1 is cluster-wide.
 	if reason, refused := s.execGateRefused(ctx); refused {
@@ -591,58 +605,77 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		}
 	}
 
-	// Destination admission for a RUNNING VM, before anything irreversible: a
-	// drain is an OPERATOR-initiated move and lands the same full-sized VM on
-	// the target an explicit migrate would — placement.Select is a read-only
-	// filter over replicated data, not an admission. The decision belongs to
-	// the DESTINATION daemon (fresh local inventory, ownership conditions,
-	// serialized reserve-then-verify), exactly like MigrateVM; the lease is
-	// held across the move and released when this VM's drain step returns. A
-	// STOPPED VM's reassign moves only the row — it consumes nothing on the
-	// target until StartVM admits it there — so it takes no lease.
-	if fresh.State == "running" {
-		migLease, aerr := s.acquireDestinationHostLease(ctx, "DrainHost", target.Name, fresh.Project,
-			"vm:"+vm.Name, fresh.CPUActual, fresh.MemActual, intentVMResident)
-		if aerr != nil {
-			return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
-				Error: "target admission refused: " + aerr.Error()}
-		}
-		defer migLease.release(ctx)
+	// A STOPPED VM moves as `lv migrate --cold` moves it: its host-local disks
+	// with it, its domain defined on the target, and the source cleaned up only
+	// after the handoff commits.
+	if fresh.State == "stopped" {
+		return s.drainStoppedVM(ctx, fresh, target, unlock, &adopted)
 	}
 
-	if fresh.State == "running" && !hasLocalOnly {
-		// Live migrate — disks are on shared storage. (Ownership confirmed above.)
-		progress.Strategy = pb.MigrateStrategy_MIGRATE_LIVE
-		dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-		if err := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true}); err != nil {
-			slog.Warn("live migration failed during drain, falling back to cold",
-				"vm", vm.Name, "error", err)
-			// Fall through to cold migration.
-		} else {
-			// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
-			//runningcheck:allow ownership handoff — this commit names the TARGET host while
-			// running on the source, whose domain MigrateToTarget has already undefined
-			// (MigrateUndefineSource). A marker written here would describe a runtime that
-			// no longer exists; the destination's convergence marks the one that does.
-			if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, target.Name, "running"); err != nil {
-				slog.Error("drain: post-migration ownership write failed", "vm", vm.Name, "to", target.Name, "error", err)
-				s.noteStateWriteFail(corrosion.OpVMHost, err)
-				progress.Status = "error"
-				progress.Error = "migrated but recording new owner failed: " + err.Error()
-				return progress
-			}
-			progress.Status = "done"
-			progress.ProgressPct = 100
+	// A running VM with a host-local disk (local or dir storage, or a legacy
+	// row with none — isHostLocalDisk) cannot be live-migrated by drain, which
+	// copies no storage: it is cold-moved, shut down only once every check of
+	// that move has passed. A disk list that
+	// cannot be read is treated as holding one — the cold path reads it again
+	// and refuses with the reason, leaving the VM running.
+	disks, derr := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	hostLocal := derr != nil
+	for _, d := range disks {
+		if isHostLocalDisk(d) {
+			hostLocal = true
+			break
+		}
+	}
+	if hostLocal {
+		return s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
+	}
+
+	// Destination admission for the live migration, before anything
+	// irreversible: a drain is an OPERATOR-initiated move and lands the same
+	// full-sized VM on the target an explicit migrate would — placement.Select is
+	// a read-only filter over replicated data, not an admission. The decision
+	// belongs to the DESTINATION daemon (fresh local inventory, ownership
+	// conditions, serialized reserve-then-verify), exactly like MigrateVM. The
+	// lease is released before a cold fallback, which takes its own.
+	migLease, aerr := s.acquireDestinationHostLease(ctx, "DrainHost", target.Name, fresh.Project,
+		"vm:"+vm.Name, fresh.CPUActual, fresh.MemActual, intentVMResident)
+	if aerr != nil {
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			Error: "target admission refused: " + aerr.Error()}
+	}
+	defer migLease.release(ctx)
+
+	// Live migrate — every disk is on shared storage. (Ownership confirmed above.)
+	progress := &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE}
+	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true})
+	if lerr == nil {
+		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
+		//runningcheck:allow ownership handoff — this commit names the TARGET host while
+		// running on the source, whose domain MigrateToTarget has already undefined
+		// (MigrateUndefineSource). A marker written here would describe a runtime that
+		// no longer exists; the destination's convergence marks the one that does.
+		if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, target.Name, "running"); err != nil {
+			slog.Error("drain: post-migration ownership write failed", "vm", vm.Name, "to", target.Name, "error", err)
+			s.noteStateWriteFail(corrosion.OpVMHost, err)
+			progress.Status = "error"
+			progress.Error = "migrated but recording new owner failed: " + err.Error()
 			return progress
 		}
+		progress.Status = "done"
+		progress.ProgressPct = 100
+		return progress
 	}
+	slog.Warn("live migration failed during drain, falling back to a cold move",
+		"vm", vm.Name, "error", lerr)
+	// One lease per move: the cold move takes the destination's lease itself.
+	migLease.release(ctx)
 
 	// Split-brain gate, re-check before the COLD fallback: a failed live migration
-	// above can run long enough to lose quorum, and cold migration shuts the VM down
-	// and reassigns ownership (irreversible). Re-check so a quorum loss during the
-	// live attempt stops the fallback. (Cheap/redundant on the direct-cold path, where
-	// the per-VM check above just ran with no long op since.) On refusal the VM is
-	// left running on the source (live migration failure leaves the source domain up).
+	// above can run long enough to lose quorum, and a cold move shuts the VM down
+	// and hands it over (irreversible). Re-check so a quorum loss during the live
+	// attempt stops the fallback. On refusal the VM is left running on the source
+	// (live migration failure leaves the source domain up).
 	if reason, refused := s.execGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return &pb.DrainProgress{
@@ -650,31 +683,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 			Error: "drain refused: " + reason,
 		}
 	}
-
-	// Cold migration: stop on source (we own it), reassign to target.
-	progress.Strategy = pb.MigrateStrategy_MIGRATE_COLD
-	if fresh.State == "running" {
-		if err := s.virt.ShutdownDomain(vm.Name); err != nil {
-			slog.Warn("shutdown failed during drain", "vm", vm.Name, "error", err)
-			progress.Status = "error"
-			progress.Error = err.Error()
-			return progress
-		}
-	}
-
-	// Reassign VM to target host. Target daemon will pick it up and start it.
-	// Ownership was confirmed above (fresh.HostName == s.hostName), so this never
-	// yanks a VM running elsewhere.
-	// Phase 4: cold drain move is an ownership transition (fresh-read CAS + increment).
-	if err := corrosion.TransferVMOwnerFresh(ctx, s.db, vm.Name, target.Name, "stopped"); err != nil {
-		progress.Status = "error"
-		progress.Error = err.Error()
-		return progress
-	}
-
-	progress.Status = "done"
-	progress.ProgressPct = 100
-	return progress
+	return s.drainRunningVMCold(ctx, fresh, target, unlock, &adopted)
 }
 
 // UndrainHost returns a host from draining/maintenance to active.

@@ -40,6 +40,21 @@ func (s *Server) cloneContainerNICs(ctName string, srcSpec corrosion.ContainerCr
 	return ifaces, specNets
 }
 
+// containerSpecNetworkNames lists the network each create-spec NIC attaches to:
+// the managed network's name, or for a legacy raw NIC its bridge. It is what
+// admitCopiedNetworks judges for a path that copies a container's NICs.
+func containerSpecNetworkNames(spec corrosion.ContainerCreateSpec) []string {
+	out := make([]string, 0, len(spec.Networks))
+	for _, n := range spec.Networks {
+		if n.NetworkName != "" {
+			out = append(out, n.NetworkName)
+		} else {
+			out = append(out, n.Bridge)
+		}
+	}
+	return out
+}
+
 // managedNICCount is how many of a create-spec's NICs become container_interfaces
 // rows — the ONLY NICs a project's NIC quota counts. A legacy raw-bridge
 // attachment carries no managed state and no row, so charging it would refuse

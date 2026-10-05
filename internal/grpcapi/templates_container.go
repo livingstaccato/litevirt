@@ -141,6 +141,14 @@ func (s *Server) CloneContainer(ctx context.Context, req *pb.CloneContainerReque
 		return nil, status.Errorf(codes.AlreadyExists, "container %q already exists on host %q", req.Target, s.hostName)
 	}
 
+	// Project isolation: the clone's NICs land in the TARGET project, which may
+	// differ from the source's. Refused before admission and the rootfs copy.
+	if err := s.admitCopiedNetworks(ctx, "clone", project, src.Project,
+		containerSpecNetworkNames(corrosion.DecodeCreateSpec(src.CreateSpec))); err != nil {
+		s.audit(ctx, "ct.clone", req.Target, "project="+project, "denied")
+		return nil, err
+	}
+
 	unlock := s.lockVM("ct/" + req.Target)
 	defer unlock()
 

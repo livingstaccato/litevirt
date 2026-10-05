@@ -5,9 +5,14 @@ package grpcapi
 // The isolation guarantee is enforced at ATTACH TIME, not in the dataplane: a
 // workload may bind a NIC / place a disk only on a network/pool that is GLOBAL
 // (empty project — the deliberate admin escape hatch) or OWNED by its own project.
-// This is the privilege boundary — admitNetworkAttach / admitPoolAttach gate every
-// create and day-2 path (move, replicate, import, schedule, runner), and a
-// named-project workload may not use a raw/unmanaged bridge at all.
+// This is the privilege boundary. admitPoolAttach gates every create and day-2
+// pool path (move, replicate, import, schedule, runner). Network admission gates
+// every path that attaches a network: admitNetworkAttach where the caller names
+// the network (CreateVM, container create, AttachDevice NIC, ImportVM, a
+// live-restore given --spec), and admitCopiedNetworks where a path copies an
+// existing workload's NICs (CloneVM, CloneContainer, promote, live-restore from
+// the backed-up spec, container restore, a stack NIC retarget). A named-project
+// workload may not use a raw/unmanaged bridge at all.
 //
 // There is intentionally NO dataplane cross-project L2 firewall deny. Admission
 // already makes its firing condition unreachable: two DIFFERENT named projects can
@@ -20,6 +25,7 @@ package grpcapi
 
 import (
 	"context"
+	"log/slog"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -48,10 +54,117 @@ func (s *Server) admitNetworkAttach(ctx context.Context, wlProject, networkName 
 	if nr == nil {
 		return s.admitRawBridge(ctx, networkName)
 	}
+	return refuseForeignNetwork(wlProject, nr)
+}
+
+// admitCopiedNetworks is network admission for a path that COPIES an existing
+// workload's NICs into a new or re-homed workload in targetProject: clone,
+// promote, restore, live-restore from a backed-up spec, and a stack NIC
+// retarget. The managed-network rule is the same as admitNetworkAttach
+// (tenancy.AdmitAttach against the network's owner) and always applies, so a
+// copy can never carry a NIC onto a network the target project may not use —
+// whatever let the source hold it. A global network is shared and passes.
+//
+// A raw/unmanaged bridge differs by whether the copy changes project. Into the
+// SAME project it is carried: the source's create already passed the
+// raw-bridge gate, and the automated paths (failover promote, container
+// relocation) have no caller whose authority could be checked again. Into a
+// DIFFERENT project it is a new attachment, so it takes the caller-authority
+// gate admitNetworkAttach applies to a create.
+//
+// op names the path in the refusal ("clone", "promote", ...), so the error says
+// which operation, which network and why. Fail closed on a lookup error.
+func (s *Server) admitCopiedNetworks(ctx context.Context, op, targetProject, sourceProject string, networkNames []string) error {
+	crossProject := tenancy.NormalizeProject(targetProject) != tenancy.NormalizeProject(sourceProject)
+	for _, name := range networkNames {
+		if name == "" {
+			continue
+		}
+		var err error
+		if crossProject {
+			err = s.admitNetworkAttach(ctx, targetProject, name)
+		} else {
+			err = s.admitManagedNetwork(ctx, targetProject, name)
+		}
+		if err != nil {
+			return status.Errorf(status.Code(err), "%s: %s", op, status.Convert(err).Message())
+		}
+	}
+	return nil
+}
+
+// foreignNetworks is the non-blocking counterpart of admitCopiedNetworks for a
+// path that RE-HOMES an existing workload rather than creating an attachment:
+// takeover promote (manual or automated failover), container relocation and
+// cold migrate. Refusing there would leave a fenced host's workload down without
+// removing the attachment it already holds, so the same managed-network check
+// runs and returns each refusal's message instead. The caller records them with
+// recordForeignNetworks only once the re-home has committed, so a takeover that
+// fails later leaves no record claiming it went ahead. A lookup error is logged
+// and not returned: it is not evidence of a foreign network.
+func (s *Server) foreignNetworks(ctx context.Context, action, workload, project string, networkNames []string) []string {
+	var out []string
+	for _, name := range networkNames {
+		if name == "" {
+			continue
+		}
+		err := s.admitManagedNetwork(ctx, project, name)
+		if err == nil {
+			continue
+		}
+		msg := status.Convert(err).Message()
+		if status.Code(err) != codes.PermissionDenied {
+			slog.Warn("network admission: could not check a re-homed workload's network",
+				"action", action, "workload", workload, "network", name, "error", msg)
+			continue
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+// recordForeignNetworks logs and audits ("allowed-foreign-network") each
+// refusal foreignNetworks returned, after the re-home it describes committed.
+// Such a workload can only exist through an attachment made before every path
+// was admitted; the record tells the operator where to look.
+func (s *Server) recordForeignNetworks(ctx context.Context, action, workload string, refusals []string) {
+	for _, msg := range refusals {
+		slog.Warn("network admission: re-homed a workload on a network its project may not use",
+			"action", action, "workload", workload, "reason", msg)
+		s.audit(ctx, action, workload, msg, "allowed-foreign-network")
+	}
+}
+
+// isPeerRelocation reports whether a container restore is a failover
+// relocation driven by the coordinator: a carried relocation proof (which the
+// handler has already required to arrive over peer mTLS), or, before
+// split_brain_gate_v1 latches and the proof is omitted, the relocation token
+// over a trusted peer cert. The token alone is plain client metadata that any
+// operator can set, so it never counts without the peer transport.
+func (s *Server) isPeerRelocation(ctx context.Context, proof bool) bool {
+	return proof || (relocateTokenFromMD(ctx) != "" && s.requirePeerCert(ctx) == nil)
+}
+
+// admitManagedNetwork is the managed-network half of admitNetworkAttach: a name
+// with a managed network record must be global or owned by wlProject. A name with
+// no record (a raw bridge) is not judged here.
+func (s *Server) admitManagedNetwork(ctx context.Context, wlProject, networkName string) error {
+	nr, err := corrosion.GetNetwork(ctx, s.db, networkName)
+	if err != nil {
+		return status.Errorf(codes.Internal, "network admission lookup %q: %v", networkName, err)
+	}
+	if nr == nil {
+		return nil
+	}
+	return refuseForeignNetwork(wlProject, nr)
+}
+
+// refuseForeignNetwork applies tenancy.AdmitAttach to a resolved network record.
+func refuseForeignNetwork(wlProject string, nr *corrosion.NetworkRecord) error {
 	if !tenancy.AdmitAttach(wlProject, nr.Project) {
 		return status.Errorf(codes.PermissionDenied,
 			"network %q is owned by project %q; a workload in project %q may not attach",
-			networkName, nr.Project, tenancy.NormalizeProject(wlProject))
+			nr.Name, nr.Project, tenancy.NormalizeProject(wlProject))
 	}
 	return nil
 }

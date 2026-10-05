@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/compose"
@@ -36,8 +38,9 @@ var errNICRetargetRefused = errors.New("NIC network change refused")
 
 // checkNICRetarget verifies a classified retarget is the legacy case: the old
 // name has no network record (so the NIC sits on a record-less flat bridge)
-// and the new name is a real cluster network.
-func (s *Server) checkNICRetarget(ctx context.Context, vmName string, rt compose.NICRetarget) error {
+// and the new name is a real cluster network that the VM's project may attach
+// to (admitCopiedNetworks: global, or owned by that project).
+func (s *Server) checkNICRetarget(ctx context.Context, vmName, vmProject string, rt compose.NICRetarget) error {
 	oldDef, err := lookupNetworkDef(ctx, s.db, rt.From)
 	if err != nil {
 		return err
@@ -56,6 +59,9 @@ func (s *Server) checkNICRetarget(ctx context.Context, vmName string, rt compose
 	}
 	if newDef == nil {
 		return fmt.Errorf("%w: vm %q nic %d: network %q does not exist", errNICRetargetRefused, vmName, rt.Ordinal, rt.To)
+	}
+	if err := s.admitCopiedNetworks(ctx, "nic move", vmProject, vmProject, []string{rt.To}); err != nil {
+		return fmt.Errorf("%w: vm %q nic %d: %s", errNICRetargetRefused, vmName, rt.Ordinal, status.Convert(err).Message())
 	}
 	return nil
 }
@@ -95,8 +101,15 @@ func (s *Server) applyNICRetargets(ctx context.Context, resolved *planner.Resolv
 // retargetVMNICs checks every move, records them in the VM's desired spec, and
 // does the host half at once when the VM lives here.
 func (s *Server) retargetVMNICs(ctx context.Context, vmName string, rts []compose.NICRetarget) (string, error) {
+	cur, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil {
+		return "", fmt.Errorf("read %q before recording its NIC move: %w", vmName, err)
+	}
+	if cur == nil {
+		return "", status.Errorf(codes.NotFound, "VM %q not found", vmName)
+	}
 	for _, rt := range rts {
-		if err := s.checkNICRetarget(ctx, vmName, rt); err != nil {
+		if err := s.checkNICRetarget(ctx, vmName, cur.Project, rt); err != nil {
 			return "", err
 		}
 	}
@@ -190,7 +203,7 @@ func (s *Server) retargetLocalVMNICs(ctx context.Context, vm corrosion.VMRecord)
 		return fmt.Errorf("read interfaces for %q: %w", vm.Name, err)
 	}
 	for _, rt := range pendingNICRetargets(spec, nics) {
-		if err := s.checkNICRetarget(ctx, vm.Name, rt); err != nil {
+		if err := s.checkNICRetarget(ctx, vm.Name, fresh.Project, rt); err != nil {
 			return err
 		}
 		var nic corrosion.NICRecord

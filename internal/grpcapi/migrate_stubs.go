@@ -65,6 +65,21 @@ func (l *migrationStubLedger) owns(vm, path string) bool {
 	return e.vm == vm
 }
 
+// recordedFor returns every unexpired stub recorded for vm, with when it was
+// made, so a cleanup can find what this host made where the source never
+// learned of it.
+func (l *migrationStubLedger) recordedFor(vm string) map[string]time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := map[string]time.Time{}
+	for p, e := range l.m {
+		if e.vm == vm && time.Since(e.at) <= stubLedgerTTL() {
+			out[p] = e.at
+		}
+	}
+	return out
+}
+
 func (l *migrationStubLedger) forget(path string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

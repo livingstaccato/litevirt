@@ -822,6 +822,28 @@ func (s *Server) requirePermResolved(ctx context.Context, known bool, path, gues
 	return denied(rootErr)
 }
 
+// requirePermResolvedAny is requirePermResolved admitting ANY of verbs — for
+// a resource a caller may read under more than one grant, because more than
+// one role fully manages it. ListContainerSnapshots is the first caller:
+// BackupOperator holds snapshot.* and can create/restore/delete a
+// container's snapshots outright, but held no ct.read, so the plain
+// ct.read-only check refused it the one read a role that can fully manage
+// the resource should obviously have. Each verb is tried in turn through the
+// same existing-hiding requirePermResolved; the first to succeed wins, and —
+// since every verb is checked against the identical (known, path, guessPath)
+// — a caller who fails every verb still gets the SAME one message
+// requirePermResolved always gives for this resource, not a different one
+// per verb tried.
+func (s *Server) requirePermResolvedAny(ctx context.Context, known bool, path, guessPath string, verbs []string, fallbackRole, what string) error {
+	var err error
+	for _, verb := range verbs {
+		if err = s.requirePermResolved(ctx, known, path, guessPath, verb, fallbackRole, what); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
 // requirePermPrecheck is a path-independent gate used by handlers that must
 // resolve the target object (and its tenancy project) before they can build
 // the real RBAC path for RequirePerm. It denies callers who could never be

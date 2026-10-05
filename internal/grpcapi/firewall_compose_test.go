@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/compose"
@@ -97,6 +98,71 @@ firewall:
 	}
 	if cr3, _ := corrosion.ListClusterFirewallRules(ctx, s.db); len(cr3) != 0 {
 		t.Errorf("cluster rules survived teardown: %+v", cr3)
+	}
+}
+
+// TestPersistStackFirewall_RefusesANameAnotherOwnerHolds: a stack may not
+// define a security group whose name another stack (or `lv sg create`) already
+// holds — the firewall would hold every NIC bound to it at drop. The refusal
+// comes before the stack's own firewall rows are torn down, so a refused
+// re-deploy leaves the stack's groups in place.
+func TestPersistStackFirewall_RefusesANameAnotherOwnerHolds(t *testing.T) {
+	ctx := context.Background()
+	s := newFWTestServer(t)
+	parse := func(y string) *compose.File {
+		t.Helper()
+		f, err := compose.ParseBytes([]byte(y))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		return f
+	}
+	a := parse(`
+name: stack-a
+security-groups:
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "80", action: accept}
+`)
+	if err := s.persistStackFirewall(ctx, a); err != nil {
+		t.Fatalf("persist stack-a: %v", err)
+	}
+	b := parse(`
+name: stack-b
+security-groups:
+  db:
+    rules:
+      - {direction: ingress, proto: tcp, port: "5432", action: accept}
+`)
+	if err := s.persistStackFirewall(ctx, b); err != nil {
+		t.Fatalf("persist stack-b: %v", err)
+	}
+	b2 := parse(`
+name: stack-b
+security-groups:
+  db:
+    rules:
+      - {direction: ingress, proto: tcp, port: "5432", action: accept}
+  web:
+    rules:
+      - {direction: ingress, proto: tcp, port: "8080", action: accept}
+`)
+	err := s.persistStackFirewall(ctx, b2)
+	if err == nil || !strings.Contains(err.Error(), `stack "stack-a"`) {
+		t.Fatalf("stack-b redefining stack-a's web: got %v, want a refusal naming stack-a", err)
+	}
+	if got, _ := corrosion.ListSecurityGroups(ctx, s.db, "stack-b"); len(got) != 1 || got[0].Name != "db" {
+		t.Errorf("a refused re-deploy must leave stack-b's groups as they were, got %+v", got)
+	}
+	all, _ := corrosion.ListSecurityGroups(ctx, s.db, "")
+	webs := 0
+	for _, g := range all {
+		if g.Name == "web" {
+			webs++
+		}
+	}
+	if webs != 1 {
+		t.Errorf("want exactly one live group named web, got %d (%+v)", webs, all)
 	}
 }
 

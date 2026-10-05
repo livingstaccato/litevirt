@@ -161,6 +161,23 @@ func lvErr(t *testing.T, args ...string) (string, error) {
 	return stdout.String(), nil
 }
 
+// lvWithin runs the CLI under budget and returns stdout + stderr and its
+// error. Does NOT fail on non-zero exit. For a command that can outlast lv's
+// 2-minute budget, such as a drain that copies disks.
+func lvWithin(t *testing.T, budget time.Duration, args ...string) (string, error) {
+	t.Helper()
+	requireNotLabMode(t)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, lvBin, args...)
+	cmd.Env = lvEnv()
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	return out.String(), err
+}
+
 // lvStdin runs the CLI with stdin piped. Fails on non-zero exit.
 func lvStdin(t *testing.T, stdin string, args ...string) string {
 	t.Helper()
@@ -547,6 +564,11 @@ func TestHost_Labels(t *testing.T) {
 	}
 }
 
+// drainBudget bounds `lv host drain` in TestHost_DrainUndrain. A drain now
+// copies every host-local disk of the VMs it moves cold, so it takes as long
+// as those copies, not the 2 minutes of an ordinary lv call.
+const drainBudget = 30 * time.Minute
+
 func TestHost_DrainUndrain(t *testing.T) {
 	if skipSlow {
 		t.Skip("slow test skipped")
@@ -555,10 +577,35 @@ func TestHost_DrainUndrain(t *testing.T) {
 	// Use the last host to minimize disruption.
 	host := hostNames[len(hostNames)-1]
 
-	lv(t, "host", "drain", host)
+	// Whatever happens below, the host must not be left draining: placement
+	// skips a draining host, and every later multi-host test would run on one
+	// host fewer.
+	undrained := false
+	t.Cleanup(func() {
+		if undrained {
+			return
+		}
+		if out, err := lvErr(t, "host", "undrain", host); err != nil {
+			t.Errorf("cleanup: lv host undrain %s: %v\n%s", host, err, out)
+		}
+	})
+
+	out, err := lvWithin(t, drainBudget, "host", "drain", host)
+	if err != nil {
+		// A drain that leaves a VM behind fails with "drain incomplete" and
+		// names every VM it left, with the reason, before it does. Anything
+		// else is a failure of the drain itself.
+		if !strings.Contains(out, "drain incomplete") {
+			t.Fatalf("lv host drain %s failed: %v\n%s", host, err, out)
+		}
+		if !strings.Contains(out, "ERROR:") {
+			t.Fatalf("lv host drain %s ended incomplete without naming the VMs it left:\n%s", host, out)
+		}
+		t.Logf("drain of %s was incomplete; the VMs it left and why:\n%s", host, out)
+	}
 
 	// Check state — drain output or inspect should indicate drained.
-	out := lv(t, "host", "inspect", host)
+	out = lv(t, "host", "inspect", host)
 	drainStr := strings.ToLower(out)
 	if !strings.Contains(drainStr, "drain") && !strings.Contains(drainStr, "DRAIN") &&
 		!strings.Contains(drainStr, "maintenance") {
@@ -575,6 +622,7 @@ func TestHost_DrainUndrain(t *testing.T) {
 	}
 
 	lv(t, "host", "undrain", host)
+	undrained = true
 	t.Logf("drain/undrain cycle completed for %s", host)
 }
 

@@ -52,31 +52,55 @@ func (s *Server) BindSecurityGroups(ctx context.Context, req *pb.BindSecurityGro
 	// a compromised VM into an isolation group — or takes it out of one — so the
 	// audit row has to be able to say which groups the NIC left
 	// (colonelpanik/litevirt#182).
-	ifaces, ierr := corrosion.GetVMInterfaces(ctx, s.db, req.VmName)
-	before := nicSGState(ifaces, ierr, req.NetworkName)
+	//
+	// It is read through the vm_nics/vm_interfaces overlay, the view the
+	// firewall reconciler renders from. A NIC hot-attached after the
+	// hardware_v2 latch has no vm_interfaces row at all, so a bind that wrote
+	// only vm_interfaces updated nothing there and still answered OK.
+	nics, nerr := corrosion.MergedVMNICs(ctx, s.db, req.VmName)
+	if nerr != nil {
+		s.audit(ctx, "sg.bind", req.VmName, "network="+req.NetworkName+" "+
+			corrosion.AuditChange(corrosion.AuditUnknown(nerr), corrosion.AuditSGList(req.SecurityGroups)), "error")
+		return nil, status.Errorf(codes.Unavailable, "read the NICs of vm %q: %v", req.VmName, nerr)
+	}
+	var matched []corrosion.NICRecord
+	for _, n := range nics {
+		if n.NetworkName == req.NetworkName {
+			matched = append(matched, n)
+		}
+	}
+	if len(matched) == 0 {
+		s.audit(ctx, "sg.bind", req.VmName, "network="+req.NetworkName+" "+
+			corrosion.AuditChange(corrosion.AuditStateNone, corrosion.AuditSGList(req.SecurityGroups)), "error")
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"vm %q has no NIC on network %q; nothing to bind", req.VmName, req.NetworkName)
+	}
+	before := corrosion.AuditSGList(corrosion.DecodeSecurityGroups(matched[0].SecurityGroups))
+	// The legacy row first, for peers on an older build (they render from
+	// vm_interfaces only); a NIC without one makes this a no-op. Then each
+	// matching vm_nics row, rewritten whole through the existing UpsertNIC
+	// shape. Written last, the vm_nics row is the newer of the two, so the
+	// hardware bridge — which copies a strictly newer legacy row over it —
+	// leaves it alone, and the reconciler sees the bind on its next pass.
+	change := "network=" + req.NetworkName + " " + corrosion.AuditChange(before, corrosion.AuditSGList(req.SecurityGroups))
 	if err := corrosion.SetInterfaceSecurityGroups(ctx, s.db,
 		req.VmName, req.NetworkName, req.SecurityGroups); err != nil {
+		s.audit(ctx, "sg.bind", req.VmName, change, "error")
 		return nil, status.Errorf(codes.Internal, "update binding: %v", err)
 	}
-	s.audit(ctx, "sg.bind", req.VmName, "network="+req.NetworkName+" "+
-		corrosion.AuditChange(before, corrosion.AuditSGList(req.SecurityGroups)), "ok")
+	sgsJSON := encodeSecurityGroups(req.SecurityGroups)
+	for _, n := range matched {
+		n.SecurityGroups = sgsJSON
+		if err := corrosion.UpsertNIC(ctx, s.db, n); err != nil {
+			s.audit(ctx, "sg.bind", req.VmName, change, "error")
+			return nil, status.Errorf(codes.Internal,
+				"update binding of NIC %s: %v; the legacy binding was written and may still apply via the hardware bridge",
+				n.MAC, err)
+		}
+	}
+	s.audit(ctx, "sg.bind", req.VmName, change, "ok")
 	slog.Info("vm-nic security groups updated",
 		"vm", req.VmName, "network", req.NetworkName,
 		"sgs", req.SecurityGroups, "by", callerUsername(ctx))
 	return &emptypb.Empty{}, nil
-}
-
-// nicSGState is the audit state of one NIC's security-group binding: the list,
-// none when the VM has no NIC on that network, or unknown when the interfaces
-// could not be read.
-func nicSGState(ifaces []corrosion.InterfaceRecord, err error, network string) string {
-	if err != nil {
-		return corrosion.AuditUnknown(err)
-	}
-	for _, nic := range ifaces {
-		if nic.NetworkName == network {
-			return corrosion.AuditSGList(nic.SecurityGroups)
-		}
-	}
-	return corrosion.AuditStateNone
 }

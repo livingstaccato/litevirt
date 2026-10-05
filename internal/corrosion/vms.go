@@ -22,6 +22,10 @@ func encodeSGs(sgs []string) (string, error) {
 	return string(b), nil
 }
 
+// DecodeSecurityGroups decodes a stored security_groups column (the JSON list
+// NICRecord.SecurityGroups carries verbatim); empty or invalid returns nil.
+func DecodeSecurityGroups(raw string) []string { return decodeSGs(raw) }
+
 // decodeSGs is the inverse — empty string or invalid JSON returns nil.
 func decodeSGs(raw string) []string {
 	if raw == "" {
@@ -593,6 +597,62 @@ func GetDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]DiskRec
 		}
 	}
 	return disks, nil
+}
+
+// SoftDeletedDisk is a soft-deleted vm_disks row with the wall time it was
+// soft-deleted at.
+type SoftDeletedDisk struct {
+	DiskRecord
+	DeletedAt string // RFC3339 wall clock of the host that wrote the tombstone
+}
+
+// GetSoftDeletedVMDisks is GetDeletedVMDisks with each row's deleted_at.
+//
+// While the VM is live these rows are its DETACHED disks: detach soft-deletes
+// the row and keeps the file, and a migration repoints only live rows
+// (vmDiskHostMoveSQL), so a detached row still names the host the file is on.
+// deleted_at is what tells this incarnation's detaches from a previous VM of
+// the same name, while the VM is live: InsertVMWithHardware purges a name's
+// tombstoned rows, but BeginVMCreateOperation re-stamps them with deleted_at
+// equal to the new VM's created_at. Once the VM itself is tombstoned the
+// stamp is gone too — the tombstone re-stamps every disk row of the name.
+func GetSoftDeletedVMDisks(ctx context.Context, c *Client, vmName string) ([]SoftDeletedDisk, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, disk_name, host_name, path, storage_type, storage_volume,
+			COALESCE(delete_with_vm, 1) AS delete_with_vm,
+			COALESCE(deleted_at, '') AS deleted_at
+		 FROM vm_disks WHERE vm_name = ? AND deleted_at IS NOT NULL`, vmName)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SoftDeletedDisk, len(rows))
+	for i, r := range rows {
+		out[i] = SoftDeletedDisk{
+			DiskRecord: DiskRecord{
+				VMName:        r.String("vm_name"),
+				DiskName:      r.String("disk_name"),
+				HostName:      r.String("host_name"),
+				Path:          r.String("path"),
+				StorageType:   r.String("storage_type"),
+				StorageVolume: r.String("storage_volume"),
+				DeleteWithVM:  r.Int("delete_with_vm") == 1,
+			},
+			DeletedAt: r.String("deleted_at"),
+		}
+	}
+	return out, nil
+}
+
+// GetTombstonedVMCreatedAt returns the created_at of name's TOMBSTONED vms row
+// — the incarnation a delete removed — or "" when there is none (no row, or a
+// live one).
+func GetTombstonedVMCreatedAt(ctx context.Context, c *Client, name string) (string, error) {
+	rows, err := c.Query(ctx,
+		`SELECT created_at FROM vms WHERE name = ? AND deleted_at IS NOT NULL`, name)
+	if err != nil || len(rows) == 0 {
+		return "", err
+	}
+	return rows[0].String("created_at"), nil
 }
 
 // GetVMDisks returns all disks for a VM.

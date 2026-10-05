@@ -985,6 +985,12 @@ observed → confirmed → resolved lifecycle:
 
 - first positive scan → **observed** (warning); second consecutive scan →
   **confirmed** (critical for the corruption-class codes);
+- a VM or container seen on two hosts counts as positive only if a re-probe
+  of those hosts, begun after the scan's gather, still sees it on both — or
+  cannot see them completely. Hosts are probed one by one, so a scan can read
+  a migration's source before the cutover and its target after it; the
+  re-probe settles that, and a real dual run is still recorded in the same
+  scan;
 - resolution needs **two consecutive clean scans with complete coverage** by
   the detector lease holder under a valid decision gate — an unreachable,
   partial, or older-binary peer blocks resolution (blind is not clean);

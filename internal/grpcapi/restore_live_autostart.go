@@ -94,6 +94,25 @@ func (s *Server) autoDefineRestoredVM(
 	if err := s.refuseIfBound(ctx, "restore", specNetworkNames(spec.Network)); err != nil {
 		return "", "", err
 	}
+	// Project isolation: the restored VM lands in the authorized restore project.
+	// A caller-supplied --spec names its networks the way a create does, and a
+	// spec embedded in the manifest is untrusted backup data (its project field
+	// included), so both take create admission — a raw bridge needs root. Only
+	// the --from-existing spec, read from this cluster's own vms row, is a copy
+	// of a VM in spec.Project and admitted as one. Refused before admission and
+	// DefineDomain.
+	fromExisting := req.Spec == nil && manifest.VMSpecJSON == ""
+	if fromExisting {
+		if err := s.admitCopiedNetworks(ctx, "restore", project, spec.Project, specNetworkNames(spec.Network)); err != nil {
+			return "", "", err
+		}
+	} else {
+		for _, name := range specNetworkNames(spec.Network) {
+			if err := s.admitNetworkAttach(ctx, project, name); err != nil {
+				return "", "", err
+			}
+		}
+	}
 	// This path creates a RUNNING managed VM, so beyond backup.restore the caller
 	// must hold vm.create on the target name in the (authorized) restore project.
 	if err := s.RequirePerm(ctx, vmRBACPathFor(project, targetName), "vm.create", "operator"); err != nil {
@@ -228,8 +247,11 @@ func (s *Server) autoDefineRestoredVM(
 				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
 		}
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+		// The groups go on the legacy row as well as the vm_nics one: a peer on
+		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: targetName, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: n.Ip,
+			SecurityGroups: n.SecurityGroups,
 		})
 		nicRecords = append(nicRecords, corrosion.NICRecord{
 			VMName:         targetName,
@@ -245,19 +267,20 @@ func (s *Server) autoDefineRestoredVM(
 	}
 
 	vmCfg := lv.VMConfig{
-		Name:        targetName,
-		CPU:         int(spec.Cpu),
-		CPUMode:     spec.CpuMode,
-		CPUModel:    spec.CpuModel,
-		MemoryMiB:   int(spec.MemoryMib),
-		Machine:     spec.Machine,
-		Firmware:    spec.Firmware,
-		GuestAgent:  spec.GuestAgent,
-		EnableVNC:   !spec.DisableVnc,
-		EnableSPICE: spec.EnableSpice,
-		Disks:       diskCfg,
-		Networks:    netCfg,
-		Boot:        spec.Boot,
+		Name:               targetName,
+		CPU:                int(spec.Cpu),
+		CPUMode:            spec.CpuMode,
+		CPUModel:           spec.CpuModel,
+		MemoryMiB:          int(spec.MemoryMib),
+		Machine:            spec.Machine,
+		Firmware:           spec.Firmware,
+		GuestAgent:         spec.GuestAgent,
+		EnableVNC:          !spec.DisableVnc,
+		EnableSPICE:        spec.EnableSpice,
+		Disks:              diskCfg,
+		Networks:           netCfg,
+		Boot:               spec.Boot,
+		SparePCIeRootPorts: s.sparePCIeRootPortsCfg,
 	}
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.

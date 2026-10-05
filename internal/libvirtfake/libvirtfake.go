@@ -16,9 +16,11 @@ package libvirtfake
 
 import (
 	"context"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +73,15 @@ type Fake struct {
 	managedInc             map[string]string // domain → the managed stamp's incarnation attribute
 	events                 []Event
 
+	// starts counts each domain's StartDomain calls, and taps holds the host
+	// device each NIC was given in one of those runs (keyed by domain, run and
+	// lower-cased MAC). nextTap is the host-wide vnetN counter. Together they
+	// model what libvirt does: a NIC gets the next free vnetN when the domain
+	// starts, so the same NIC has a different tap after a stop and start.
+	starts  map[string]int
+	taps    map[tapKey]string
+	nextTap int
+
 	// eventCB is the domain lifecycle callback registered by
 	// RegisterDomainEventCallback; nil until something registers. FireEvent
 	// delivers to it. Guarded by f.mu.
@@ -95,13 +106,22 @@ type Fake struct {
 	// test can prove the shut-off reclaim took the config path, NOT the live one.
 	detachHostdevConfigN int
 
-	// comparedCPUXML records every CompareCPU argument (see ComparedCPUXML).
-	comparedCPUXML []string
+	// comparedCPUXML / comparedMachines record every CompareCPU argument pair
+	// (see ComparedCPUXML, ComparedMachines).
+	comparedCPUXML   []string
+	comparedMachines []string
 
 	// CPUCompareResult overrides CompareCPU's verdict; nil = Superset (this host
 	// can run anything). HostCPUModel names the model HostCPUXML reports.
 	CPUCompareResult *libvirt.CPUCompare
 	HostCPUModel     string
+	// HostModelFeatures, when set, models this host's hypervisor: it is the
+	// feature list its domcapabilities host-model reports (HostModelCPUFeatures;
+	// nil = no host-model to report, an error), and (with CPUCompareResult nil)
+	// CompareCPU answers by it — incompatible as soon as
+	// the compared CPU requires a feature not on the list, identical otherwise.
+	// That is how libvirt's hypervisor compare treats a live host-model CPU.
+	HostModelFeatures []string
 
 	// Fail* hooks let scenarios inject failures into specific methods.
 	// Nil = default success.
@@ -109,6 +129,15 @@ type Fake struct {
 	FailHostCPUXML   func() error
 	FailDefineDomain func(xml string) error
 	FailStartDomain  func(name string) error
+	// IgnoreShutdown makes ShutdownDomain a guest that ignores the ACPI
+	// request when it returns true: the call succeeds, the domain keeps
+	// running, and WaitForShutdown times out.
+	IgnoreShutdown func(name string) bool
+	// ShutdownLate makes ShutdownDomain a guest slower than its stop timeout
+	// when it returns true: the domain keeps running through the first
+	// WaitForShutdown, which times out, and is shut off by the second.
+	ShutdownLate func(name string) bool
+	lateWaits    map[string]int
 	// FailSuspendDomain / FailResumeDomain inject a pause/resume failure
 	// (partition pause, docs/design/partition-pause.md §3.4).
 	FailSuspendDomain func(name string) error
@@ -159,6 +188,10 @@ type Fake struct {
 	// fail-closed path that reads both views of a domain and must treat an
 	// unreadable persistent config as a gap rather than an absence.
 	FailDumpXMLInactive func(name string) error
+	// FailRunningDomainTaps, when set, runs at the start of RunningDomainTaps
+	// and its error is returned — a dead or restarting libvirt connection. It
+	// may also block, to model a hung libvirtd.
+	FailRunningDomainTaps func() error
 	// FailCreateLiveSnapshot fires AFTER the disk overlay has cut over, modeling a
 	// RAM-save/capture failure that leaves the VM on an overlay.
 	FailCreateLiveSnapshot func(domain, snap string) error
@@ -230,6 +263,8 @@ func New() *Fake {
 		stats:       make(map[string]*libvirt.DomainStats),
 		reasons:     make(map[string]string),
 		managedSave: make(map[string]bool),
+		starts:      make(map[string]int),
+		taps:        make(map[tapKey]string),
 
 		pendingUnplug:  make(map[string][]func()),
 		unplugRequests: make(map[string]int),
@@ -408,7 +443,16 @@ func (f *Fake) StartDomain(name string) error {
 	if _, ok := f.domains[name]; !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
+	if n, ok := f.lateWaits[name]; ok && n > 0 && f.domains[name] == StateRunning {
+		// A ShutdownLate guest still going down: libvirt refuses to start a
+		// running domain, and the guest then completes its shutdown.
+		delete(f.lateWaits, name)
+		f.domains[name] = StateShutdown
+		f.record("shutoff-late", name, "")
+		return fmt.Errorf("libvirtfake: domain %q is already running", name)
+	}
 	f.domains[name] = StateRunning
+	f.starts[name]++
 	f.record("start", name, "")
 	return nil
 }
@@ -498,8 +542,18 @@ func (f *Fake) ShutdownDomain(name string) error {
 	if _, ok := f.domains[name]; !ok {
 		return fmt.Errorf("libvirtfake: domain %q not defined", name)
 	}
-	f.domains[name] = StateShutdown
 	f.record("shutdown", name, "")
+	if f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
+		return nil
+	}
+	if f.ShutdownLate != nil && f.ShutdownLate(name) {
+		if f.lateWaits == nil {
+			f.lateWaits = map[string]int{}
+		}
+		f.lateWaits[name] = 0
+		return nil
+	}
+	f.domains[name] = StateShutdown
 	return nil
 }
 
@@ -816,11 +870,21 @@ func (f *Fake) SetInactiveXML(name, xml string) {
 }
 
 func (f *Fake) WaitForShutdown(name string, timeout time.Duration) bool {
-	// The fake transitions synchronously; the wait always succeeds.
+	// The fake transitions synchronously; the wait succeeds unless the guest
+	// ignored the shutdown (IgnoreShutdown) and still runs.
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if s, ok := f.domains[name]; ok && s == StateShutdown {
-		return true
+	if s, ok := f.domains[name]; ok && s == StateRunning && f.IgnoreShutdown != nil && f.IgnoreShutdown(name) {
+		return false
+	}
+	if n, ok := f.lateWaits[name]; ok && f.domains[name] == StateRunning {
+		if n == 0 {
+			f.lateWaits[name] = 1
+			return false // the stop timeout passes; the guest is still going down
+		}
+		delete(f.lateWaits, name)
+		f.domains[name] = StateShutdown
+		f.record("shutoff-late", name, "")
 	}
 	return true
 }
@@ -1452,10 +1516,11 @@ func (f *Fake) NodeInfo() (cpus int, memMiB int, err error) {
 // fake host runs anything — so no existing scenario changes behavior. Set
 // CPUCompareResult (or FailCompareCPU) to model a destination whose CPU is
 // poorer than the guest needs.
-func (f *Fake) CompareCPU(cpuXML string) (libvirt.CPUCompare, error) {
+func (f *Fake) CompareCPU(cpuXML, machine string) (libvirt.CPUCompare, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.comparedCPUXML = append(f.comparedCPUXML, cpuXML)
+	f.comparedMachines = append(f.comparedMachines, machine)
 	if f.FailCompareCPU != nil {
 		if err := f.FailCompareCPU(cpuXML); err != nil {
 			return libvirt.CPUCompareIncompatible, err
@@ -1464,7 +1529,63 @@ func (f *Fake) CompareCPU(cpuXML string) (libvirt.CPUCompare, error) {
 	if f.CPUCompareResult != nil {
 		return *f.CPUCompareResult, nil
 	}
+	if f.HostModelFeatures != nil {
+		have := make(map[string]bool, len(f.HostModelFeatures))
+		for _, name := range f.HostModelFeatures {
+			have[name] = true
+		}
+		for _, name := range requiredCPUFeatures(cpuXML) {
+			if !have[name] {
+				return libvirt.CPUCompareIncompatible, nil
+			}
+		}
+		return libvirt.CPUCompareIdentical, nil
+	}
 	return libvirt.CPUCompareSuperset, nil
+}
+
+// HostModelCPUFeatures reports HostModelFeatures as the host's domcapabilities
+// host-model list. Without one set it errors, as a host whose host-model
+// cannot be read would, so the source keeps the guest's requirement verbatim.
+func (f *Fake) HostModelCPUFeatures(machine string) (map[string]bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.HostModelFeatures == nil {
+		return nil, errors.New("libvirtfake: no host-model features configured")
+	}
+	out := make(map[string]bool, len(f.HostModelFeatures))
+	for _, name := range f.HostModelFeatures {
+		out[name] = true
+	}
+	return out, nil
+}
+
+// ComparedMachines returns, in order, the machine type of every CompareCPU.
+func (f *Fake) ComparedMachines() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.comparedMachines...)
+}
+
+// requiredCPUFeatures lists the names of a <cpu> element's
+// <feature policy='require'> children.
+func requiredCPUFeatures(cpuXML string) []string {
+	var cpu struct {
+		Features []struct {
+			Policy string `xml:"policy,attr"`
+			Name   string `xml:"name,attr"`
+		} `xml:"feature"`
+	}
+	if err := xml.Unmarshal([]byte(cpuXML), &cpu); err != nil {
+		return nil
+	}
+	var out []string
+	for _, ft := range cpu.Features {
+		if ft.Policy == "require" {
+			out = append(out, ft.Name)
+		}
+	}
+	return out
 }
 
 // HostCPUXML returns the fake host's CPU element. HostCPUModel (default
@@ -1579,10 +1700,77 @@ func (f *Fake) ConfigureTrunkTap(domainName, bridge, mac string, vlanIDs []int) 
 	return nil
 }
 
-// TapDevice returns a deterministic fake tap name derived from the domain so
-// fleet tests can exercise the firewall's per-NIC binding path.
+// fakeMACAttr finds the MACs in a fake domain XML (xmlgen output or the
+// fake's own string-built NICs).
+var fakeMACAttr = regexp.MustCompile(`<mac\s+address=["']([^"']+)["']`)
+
+// RunningDomainTaps is libvirt.Client.RunningDomainTaps over the fake: every
+// active domain, every MAC in its live XML, each with the tap TapDevice
+// would report.
+func (f *Fake) RunningDomainTaps() (map[string]map[string]string, error) {
+	if f.FailRunningDomainTaps != nil {
+		if err := f.FailRunningDomainTaps(); err != nil {
+			return nil, err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]map[string]string{}
+	for name, st := range f.domains {
+		if st != StateRunning && st != StatePaused {
+			continue
+		}
+		taps := map[string]string{}
+		for _, m := range fakeMACAttr.FindAllStringSubmatch(f.liveXMLLocked(name), -1) {
+			mac := strings.ToLower(m[1])
+			taps[mac] = f.tapLocked(name, mac)
+		}
+		out[name] = taps
+	}
+	return out, nil
+}
+
+// tapKey names one NIC in one run of a domain.
+type tapKey struct {
+	domain string
+	run    int
+	mac    string
+}
+
+// TapDevice returns the host device of the domain's NIC with this MAC, as
+// libvirt reports it in the live XML: only while the domain is active, only for
+// a NIC the live definition has, and a fresh vnetN for every run of the
+// domain. A real libvirt hands out the next free vnetN at each start, so a
+// recorded name goes stale on a stop and start; returning the same name for
+// ever would hide exactly that.
 func (f *Fake) TapDevice(domainName, mac string) (string, error) {
-	return "tap-" + domainName, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.domains[domainName]
+	if !ok {
+		return "", fmt.Errorf("libvirtfake: domain %q not defined", domainName)
+	}
+	if st != StateRunning && st != StatePaused {
+		return "", fmt.Errorf("libvirtfake: domain %q is not active (%s): no target dev for interface %s", domainName, st, mac)
+	}
+	mac = strings.ToLower(mac)
+	if !strings.Contains(strings.ToLower(f.liveXMLLocked(domainName)), mac) {
+		return "", fmt.Errorf("libvirtfake: interface with MAC %s not found in domain %s", mac, domainName)
+	}
+	return f.tapLocked(domainName, mac), nil
+}
+
+// tapLocked returns the tap of an active domain's NIC in its current run,
+// handing out the next vnetN on first use. mac is lower-cased. Caller holds f.mu.
+func (f *Fake) tapLocked(domainName, mac string) string {
+	k := tapKey{domain: domainName, run: f.starts[domainName], mac: mac}
+	if tap, ok := f.taps[k]; ok {
+		return tap
+	}
+	tap := fmt.Sprintf("vnet%d", f.nextTap)
+	f.nextTap++
+	f.taps[k] = tap
+	return tap
 }
 
 // Lifecycle hooks — daemon-only paths. Connection management is a no-op (there

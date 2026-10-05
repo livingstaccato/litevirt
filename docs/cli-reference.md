@@ -283,7 +283,7 @@ than silently breaking BitLocker. The explicit refusals:
 | clone | gets a **fresh** vTPM + fresh NVRAM (the secret is never copied) — a cloned BitLocker guest needs its recovery key |
 | live migration | refused — use cold migration |
 | cold migration | supported for a **stopped** VM on **shared storage**; firmware is captured quiescent and carried to the target. Host-local-disk and PCI-passthrough firmware VMs are not supported yet |
-| host drain | refused — migrate the VM explicitly (`lv migrate … --cold`) |
+| host drain | a stopped VM on shared storage is moved as cold migration moves it; a running one is refused — stop it and drain again, or migrate it explicitly (`lv migrate … --cold`) |
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
 | replica promotion | refused — a disk replica carries no firmware |
 | `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
@@ -356,7 +356,7 @@ shell history.
 
 ```bash
 lv migrate <vm> <target-host>                  # Live migrate
-lv migrate <vm> <target-host> --cold           # Cold migrate (stop, move, start)
+lv migrate <vm> <target-host> --cold           # Cold migrate: a stopped VM moves stopped, disks copied
 lv migrate <vm> <target-host> --with-storage   # Copy disks to the target during migration
 ```
 
@@ -760,6 +760,18 @@ lv detach-nic <vm> <mac>
 lv attach-pci <vm> --type gpu [--vendor 10de] [--count 1] [--sriov]
 lv detach-pci <vm> <pci-address>
 ```
+
+`lv detach-disk` removes the disk from the VM but **keeps its file**, on the
+host the VM was running on when it was detached. A migration does not move a
+detached disk: it stays on that host. The file is freed when the VM is deleted
+— `lv rm <vm>` asks each host the VM left to remove the disks detached there
+and the VM's `vms/<name>/owner_epoch` marker. The deleting host names only the
+disks detached from this VM since it was created; nothing else can make that
+request (it is refused for every user, admin included). The host holding the
+file still keeps it if anything uses it: another VM's disk or backing image, a
+domain defined on that host, or a snapshot of the VM. `lv rm --keep-disks`
+keeps detached disks too. A host that is down or not `active` during the delete
+keeps its copy; remove it by hand (`<data_dir>/disks/<vm>-<disk>.qcow2`).
 
 ## Users and tokens
 

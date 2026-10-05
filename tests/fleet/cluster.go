@@ -243,6 +243,9 @@ type Node struct {
 	// streamWatches are armed by WatchStream, keyed by method name, and
 	// consumed by the next call to that stream method. Guarded by partMu.
 	streamWatches map[string][]*StreamWatch
+	// unaryHooks are armed by HookUnary, keyed by method name, and consumed
+	// by the next call to that unary method. Guarded by partMu.
+	unaryHooks map[string][]UnaryHook
 
 	// faults is the per-link replication fault injector for pushes INTO this
 	// node (see LinkFault). Inert until a scenario sets a fault.
@@ -286,6 +289,37 @@ func (n *Node) takeStreamWatches(method string) []*StreamWatch {
 	ws := n.streamWatches[method]
 	delete(n.streamWatches, method)
 	return ws
+}
+
+// UnaryHook stands in for one call of a unary method on a node: it receives
+// the call's context and request and the real handler, and returns what the
+// caller gets. It decides whether, and when, the handler runs — which is how a
+// scenario holds a peer RPC at an exact point, before or after the handler has
+// done its work, while something else happens to the caller.
+type UnaryHook func(ctx context.Context, req any, handler grpc.UnaryHandler) (any, error)
+
+// HookUnary arms fn for the next call of the named unary method (e.g.
+// "EnsureDisks") served by this node. It runs inside the auth interceptor, so
+// the handler it is given is the method itself.
+func (n *Node) HookUnary(method string, fn UnaryHook) {
+	n.partMu.Lock()
+	n.unaryHooks[method] = append(n.unaryHooks[method], fn)
+	n.partMu.Unlock()
+}
+
+func (n *Node) hookUnaryInterceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+	m := methodName(info.FullMethod)
+	n.partMu.Lock()
+	var fn UnaryHook
+	if hs := n.unaryHooks[m]; len(hs) > 0 {
+		fn = hs[0]
+		n.unaryHooks[m] = hs[1:]
+	}
+	n.partMu.Unlock()
+	if fn == nil {
+		return handler(ctx, req)
+	}
+	return fn(ctx, req, handler)
 }
 
 // New brings up a Cluster ready for scenarios. Each node has:
@@ -352,6 +386,7 @@ func New(t *testing.T, opts Options) *Cluster {
 			blockedFrom:   make(map[string]bool),
 			unimplemented: make(map[string]bool),
 			streamWatches: make(map[string][]*StreamWatch),
+			unaryHooks:    make(map[string][]UnaryHook),
 			cluster:       c,
 		}
 		c.mintHostCert(n)
@@ -807,7 +842,7 @@ func (c *Cluster) buildServer(n *Node) {
 	// never hit a unary interceptor.
 	srv := grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor),
+		grpc.ChainUnaryInterceptor(n.partitionUnaryInterceptor, n.aeMeterUnaryInterceptor, n.faultUnaryInterceptor, n.Server.UnaryAuthInterceptor, n.hookUnaryInterceptor),
 		grpc.ChainStreamInterceptor(n.partitionStreamInterceptor, n.aeMeterStreamInterceptor, n.Server.StreamAuthInterceptor),
 	)
 	pb.RegisterLiteVirtServer(srv, n.Server)

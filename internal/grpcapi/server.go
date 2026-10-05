@@ -102,6 +102,12 @@ type Server struct {
 	// normalizeCreateVMSpec for why it is never applied in the renderer.
 	defaultCPUModeCfg string
 
+	// sparePCIeRootPortsCfg is the node's `pci.spare_pcie_root_ports` — see
+	// daemon.PCIConfig.SparePCIeRootPorts for the full rationale and the
+	// migration/no-backfill story. Threaded into lv.VMConfig at every site that
+	// calls lv.GenerateDomainXML in this package.
+	sparePCIeRootPortsCfg int
+
 	// nbMetricsSink counts NetBox IPAM outcomes. nil means "not wired", which
 	// nbMetrics() resolves to a noop — a metrics sink must never be a reason a
 	// claim or a sweep behaves differently.
@@ -569,6 +575,22 @@ type Server struct {
 	// restart, is left — a leaked ISO costs a few KiB, a deleted live one
 	// costs the guest its seed on the next boot. Zero value ready.
 	migrationISOs migrationStubLedger
+
+	// hostDiskRoot is a FLEET TEST SEAM for the files a stopped VM's cold
+	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
+	// production.
+	hostDiskRoot string
+	// drainCrashAt is a FLEET TEST SEAM: drainRunningVMCold asks it at each
+	// point a daemon could die mid-move, and stops right there, as a crash
+	// would, when it returns true (SetDrainCrashForTest). Nil in production.
+	drainCrashAt func(point string) bool
+	// coldMoveAfterHandoff is a FLEET TEST SEAM: coldMigrateStoppedVM calls it
+	// once the handoff has committed, before it touches the source
+	// (SetColdMoveAfterHandoffForTest). Nil in production.
+	coldMoveAfterHandoff func(vm string)
+	// diskSpaceOverride is a TEST SEAM for the free-space checks of a cold
+	// migration's disk copy (diskSpace). Nil in production.
+	diskSpaceOverride func(dir string) (avail, total uint64, err error)
 
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains
@@ -1053,6 +1075,11 @@ func (s *Server) SetOperationProtocol(on bool) { s.enfOperationProtocol = on }
 // operator sets it explicitly only to opt a genuinely heterogeneous fleet out of
 // the host-derived default — "" here does NOT mean "emit no <cpu> element".
 func (s *Server) SetDefaultCPUMode(mode string) { s.defaultCPUModeCfg = mode }
+
+// SetSparePCIeRootPorts sets the number of extra pcie-root-port controllers a
+// newly-defined q35 domain carries (`pci.spare_pcie_root_ports`). See
+// daemon.PCIConfig.SparePCIeRootPorts.
+func (s *Server) SetSparePCIeRootPorts(n int) { s.sparePCIeRootPortsCfg = n }
 
 // SetNetBoxIPAM sets this node's kill-switch for advertising netbox_ipam_v1 (see
 // enfNetBoxIPAM). The flag is the reversible kill switch: enabling on one node

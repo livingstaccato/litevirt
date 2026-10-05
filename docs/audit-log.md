@@ -31,7 +31,7 @@ evidence the verifier reasons over, and every row in all three is signed:
 | Table | Holds |
 |---|---|
 | `audit_signing_keys` | each host's verification certificate, so any node can check any host's chain |
-| `audit_chain_heads` | periodic signed "host H had written seq S, chain hashed to X" — the only thing that can detect a truncated tail, since a hash chain links backward and cannot notice its own end was cut |
+| `audit_chain_heads` | periodic signed "host H had written seq S, chain hashed to X" — the only thing that can detect a truncated tail, since a hash chain links backward and cannot notice its own end was cut. A head at **seq 0** is the *legacy anchor*: a host whose chain holds only pre-v45 rows (all seq 0) signs the hash of its last legacy row, so cutting or re-hashing that region is detectable too |
 | `audit_key_lifecycle` | signed `adopted` / `retired` events bounding each key's signing contract |
 
 All three are append-only, and the verifier ignores `deleted_at` on them: a
@@ -95,6 +95,21 @@ database write access could edit a row, wait for a restart, and have the daemon
 itself rewrite the chain around the edit. `verify` would then come back clean. A signed
 row is never resealed, locally or via replication, and the guard lives in the SQL
 as well as the caller because peers apply that statement by primary key.
+
+**History from before sequence numbers is anchored too.** Rows written before
+`seq` existed all carry `seq = 0`, so a host that adopted signing and has
+written nothing since has no position for a chain head to attest to. It still
+has a tail, and it signs a head at `seq = 0` over that tail's hash — an
+*anchor*. Without one, nothing signed committed to that history: cutting rows
+off its end, or deleting all of it, read exactly like an idle host. `verify`
+reports the host as **truncated** when no `seq = 0` row of its hashes to what
+the anchor says, which also catches a row edited and then re-hashed by the
+startup reseal. The anchor needs only that row to still exist, not to be the
+last one, so a node restored from an older snapshot that anchored a shorter
+copy of its own history does not get a permanent finding; a row appended after
+the anchor is as unanchored as before. A host with no rows at all signs no
+anchor, since there is nothing to attest to. Older builds ignore the anchor: a
+head at `seq = 0` attests to no rows, so their check has nothing to compare.
 
 Timestamps are RFC3339 with nanosecond precision so same-second
 inserts sort deterministically. Without nanoseconds, two events
@@ -170,7 +185,12 @@ grouped by what it means:
   cluster CA.
 - **sequence gap** — a run of rows was deleted from one host's chain.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
-- **truncated** — a host's signed chain head attests to more rows than exist.
+- **truncated** — a host's signed chain head attests to more rows than exist,
+  or a host's seq-0 legacy anchor names a hash that no seq-0 row of that host
+  has any more (legacy rows cut off, deleted, or edited and re-hashed by the
+  legacy reseal). A daemon publishes the anchor only after its startup reseal
+  has succeeded in that process, so a failed reseal cannot later make the
+  host's own anchor read as a truncation.
 - **retired key used** — a row signed by a key past the sequence at which it was
   rotated out.
 - **chain head mismatch** — a row covered by a signed head was rewritten.
@@ -566,6 +586,14 @@ last N rows leaves every surviving link valid. Without the contracts an
 unsigned row cannot be told from one written before the host committed to
 signing. Without the CA a certificate can be read but not attributed to this
 cluster.
+
+The seq-0 legacy anchors are among the chain heads. An external verifier
+checks one by finding a seq-0 row of that host whose `content_hash` equals the
+anchor's `head_hash` — not necessarily the last such row. A `--since`
+window that starts after a host's legacy rows leaves those rows out of the
+export but not its anchor, so verify a windowed export's anchors only against
+an export that includes the host's seq-0 rows; a missing anchored row in a
+window that cannot contain it is not a truncation.
 
 Rows in those three tables are exported **including** any marked deleted.
 That is deliberate and matches the verifier, which does not filter

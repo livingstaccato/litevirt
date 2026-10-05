@@ -50,7 +50,7 @@ func TestCorrosionPlanLoader_BindsSGsToNICs(t *testing.T) {
 	}
 
 	// 3. Build the plan via the production loader and render it.
-	loader := CorrosionPlanLoader(db, "host-a", Plan{})
+	loader := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{"vm-web": {"aa:bb:cc:dd:ee:01": "tap-vm-web-0"}}))
 	plan, err := loader(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
@@ -113,7 +113,7 @@ func TestCorrosionPlanLoader_BindsSGsToContainerVeths(t *testing.T) {
 		t.Fatalf("UpsertContainerInterface(no-veth): %v", err)
 	}
 
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{})(ctx)
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, LoaderOptions{})(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -165,7 +165,7 @@ func TestCorrosionPlanLoader_DropsUnknownSGNamesGracefully(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{})(ctx)
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{"vm-x": {"aa:bb:cc:dd:ee:02": "tap-x-0"}}))(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
@@ -230,26 +230,45 @@ func TestCorrosionPlanLoader_SkipsNICsOnOtherHosts(t *testing.T) {
 	_ = corrosion.InsertSecurityGroup(ctx, db, corrosion.SecurityGroup{ID: "sg", Name: "shared"})
 	if err := corrosion.InsertVM(ctx, db,
 		corrosion.VMRecord{Name: "vm-on-a", HostName: "host-a", State: "running"},
-		[]corrosion.InterfaceRecord{{VMName: "vm-on-a", NetworkName: "prod", TapDevice: "tap-a-0", SecurityGroups: []string{"shared"}}},
+		[]corrosion.InterfaceRecord{{VMName: "vm-on-a", NetworkName: "prod", MAC: "aa:bb:cc:dd:ee:0a", TapDevice: "tap-a-0", SecurityGroups: []string{"shared"}}},
 		nil,
 	); err != nil {
 		t.Fatalf("InsertVM A: %v", err)
 	}
 	if err := corrosion.InsertVM(ctx, db,
 		corrosion.VMRecord{Name: "vm-on-b", HostName: "host-b", State: "running"},
-		[]corrosion.InterfaceRecord{{VMName: "vm-on-b", NetworkName: "prod", TapDevice: "tap-b-0", SecurityGroups: []string{"shared"}}},
+		[]corrosion.InterfaceRecord{{VMName: "vm-on-b", NetworkName: "prod", MAC: "aa:bb:cc:dd:ee:0b", TapDevice: "tap-b-0", SecurityGroups: []string{"shared"}}},
 		nil,
 	); err != nil {
 		t.Fatalf("InsertVM B: %v", err)
 	}
 
-	plan, err := CorrosionPlanLoader(db, "host-a", Plan{})(ctx)
+	// The resolver answers for BOTH MACs, so only the host filter can keep
+	// vm-on-b's NIC out of host-a's plan.
+	plan, err := CorrosionPlanLoader(db, "host-a", Plan{}, liveTaps(map[string]map[string]string{
+		"vm-on-a": {"aa:bb:cc:dd:ee:0a": "tap-a-0"}, "vm-on-b": {"aa:bb:cc:dd:ee:0b": "tap-b-0"},
+	}))(ctx)
 	if err != nil {
 		t.Fatalf("loader: %v", err)
 	}
 	if len(plan.NICs) != 1 || plan.NICs[0].NICDev != "tap-a-0" {
 		t.Errorf("host-a should see only its own NIC, got %+v", plan.NICs)
 	}
+}
+
+// liveTaps is a RunningTaps over a fixed domain → MAC → tap table, standing in
+// for libvirt's running domains. A domain it does not list is not running.
+func liveTaps(byVM map[string]map[string]string) LoaderOptions {
+	return LoaderOptions{RunningTaps: func() (map[string]map[string]string, error) {
+		out := map[string]map[string]string{}
+		for vm, taps := range byVM {
+			out[vm] = map[string]string{}
+			for mac, tap := range taps {
+				out[vm][strings.ToLower(mac)] = tap
+			}
+		}
+		return out, nil
+	}}
 }
 
 // equalStringSlice compares without enforcing order or capacity quirks.

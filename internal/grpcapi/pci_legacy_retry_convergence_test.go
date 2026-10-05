@@ -3,7 +3,6 @@ package grpcapi
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
@@ -190,20 +189,17 @@ func TestDetachPCI_LegacyReleaseFailThenRetry_Converges(t *testing.T) {
 }
 
 // TestMigrateVM_VFReleaseFailThenRetry_Converges is FIX-20 Fix B (migrate VF loop):
-// the SR-IOV VF pre-migration detach mirrors the legacy detach — if the first migration
-// attempt's VF release fails after the VF's live detach succeeded, a RETRY must converge
-// (skip the already-gone detach, re-attempt the idempotent release) rather than aborting
-// on a "device not found" detach error.
+// the SR-IOV VF pre-migration detach mirrors the legacy detach — a retry after an
+// attempt that left the VF out of the guest must converge (skip the already-gone
+// detach) rather than abort on a "device not found" detach error.
 //
-// RED before the fix: the retry called DetachHostdev on the already-detached VF → libvirt
-// errors "not found" → the migration aborts before the release → never converges.
+// The first attempt detaches the VF, libvirt fails the copy, and putting the VF
+// back into the guest fails too: the VF is left owned + bound, out of the guest.
+// The retry must get past the VF loop, cut over, and only then release it.
 func TestMigrateVM_VFReleaseFailThenRetry_Converges(t *testing.T) {
 	const vfAddr = "0000:41:10.0"
 	s := testServerWithLocks(t)
 	fake := libvirtfake.New()
-	// After the VF loop converges the migration proceeds; make the libvirt migration itself
-	// fail so the retry terminates deterministically at a NON-VF step.
-	fake.FailMigrateToTarget = func(_, _ string) error { return errors.New("injected migrate failure") }
 	fake.FailDetachHostdev = notFoundOnAbsentDetach(fake)
 	s.virt = fake
 	fakeDestinationAdmission(s)
@@ -215,6 +211,7 @@ func TestMigrateVM_VFReleaseFailThenRetry_Converges(t *testing.T) {
 
 	insertTestVMWithSpec(t, ctx, s.db, "pci-vm", "test-host", "running", "")
 	insertTestHost(t, ctx, s.db, "target-host", "active")
+	fake.SetState("pci-vm", "running") // the guest the VF is put back into
 
 	// Seed the VF in host inventory owned by the VM, mark it a VF + vfio-bound, and place its
 	// hostdev in the guest so the first detach actually removes it.
@@ -237,29 +234,31 @@ func TestMigrateVM_VFReleaseFailThenRetry_Converges(t *testing.T) {
 		}, &mockMigrateStream{ctx: ctx})
 	}
 
-	// First attempt: the VF live-detaches but its release cannot confirm the unbind → the
-	// migration aborts at the VF release site. The guest VF is now gone; still owned + bound.
-	fs.setFailUnbind(vfAddr)
-	err := migrate()
-	if err == nil || !strings.Contains(err.Error(), "release VF") {
-		t.Fatalf("first attempt must abort at the VF release site, got %v", err)
+	// First attempt: libvirt fails the copy and the VF cannot be put back.
+	fake.FailMigrateToTarget = func(_, _ string) error { return errors.New("injected migrate failure") }
+	fake.FailAttachHostdev = func(_, _, _ string) error { return errors.New("injected attach failure") }
+	if err := migrate(); err == nil {
+		t.Fatal("first attempt must fail at libvirt")
 	}
 	if guestHasHostdev(t, s, "pci-vm", vfAddr) {
-		t.Fatal("precondition: the first attempt should have live-detached the VF from the guest")
+		t.Fatal("precondition: the first attempt should have left the VF out of the guest")
+	}
+	if o := pciOwnerOf(t, ctx, s, vfAddr); o != "pci-vm" || !fs.isBound(vfAddr) {
+		t.Fatalf("precondition: the VF should be left owned + bound, got owner %q bound %v", o, fs.isBound(vfAddr))
 	}
 
-	// Clear the fault and RETRY: the VF is already gone from the guest, so the retry must skip
-	// the (now not-found-erroring) detach and re-attempt the release, which converges.
-	fs.clearFailUnbind(vfAddr)
-	err = migrate()
-	if err != nil && (strings.Contains(err.Error(), "detach VF") || strings.Contains(err.Error(), "release VF")) {
-		t.Fatalf("the retry must converge past the VF loop, not fail on the already-detached VF: %v", err)
+	// Clear the faults and RETRY: the VF is already gone from the guest, so the retry must skip
+	// the (now not-found-erroring) detach and go on to the cutover.
+	fake.FailMigrateToTarget = nil
+	fake.FailAttachHostdev = nil
+	if err := migrate(); err != nil {
+		t.Fatalf("the retry must converge past the VF loop and migrate: %v", err)
 	}
-	// Converged: the VF was released and unbound before the migration proceeded.
+	// Converged: the cutover released and unbound the source's VF.
 	if o := pciOwnerOf(t, ctx, s, vfAddr); o != "" {
-		t.Fatalf("the retry must release the VF, got owner %q", o)
+		t.Fatalf("the cutover must release the VF, got owner %q", o)
 	}
 	if fs.isBound(vfAddr) {
-		t.Fatal("the retry must unbind the VF from vfio-pci")
+		t.Fatal("the cutover must unbind the VF from vfio-pci")
 	}
 }

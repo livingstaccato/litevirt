@@ -104,6 +104,9 @@ type Reconciler struct {
 	autoPullImage    func(ctx context.Context, imageName string) error // optional: auto-pull image from peer
 	backupInProgress func(vmName string) bool                          // optional: is a backup actively running locally?
 	firmware         lv.FirmwarePaths                                  // resolved OVMF paths (G1); set via SetFirmwarePaths
+	// sparePCIeRootPortsCfg is `pci.spare_pcie_root_ports` (see
+	// daemon.PCIConfig.SparePCIeRootPorts), set via SetSparePCIeRootPorts.
+	sparePCIeRootPortsCfg int
 	// provision sets up a network on this host for a VM start. nil means
 	// network.SafeProvision. Set via SetNetworkProvision.
 	provision network.ProvisionFunc
@@ -307,6 +310,10 @@ func (r *Reconciler) noteGateRefused(action, reason string) {
 // SetFirmwarePaths injects the host's resolved OVMF firmware paths (G1) so the
 // reconciler renders the same firmware as CreateVM when it rebuilds a domain.
 func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
+
+// SetSparePCIeRootPorts sets `pci.spare_pcie_root_ports` — see
+// daemon.PCIConfig.SparePCIeRootPorts.
+func (r *Reconciler) SetSparePCIeRootPorts(n int) { r.sparePCIeRootPortsCfg = n }
 
 // SetNetworkProvision replaces how a VM start provisions the VM's networks on
 // this host (nil restores network.SafeProvision). The daemon passes the same
@@ -545,7 +552,7 @@ func (r *Reconciler) retryOnbootPending(ctx context.Context) {
 			continue
 		}
 		// Operator intent may have changed while quorum was absent: honor it.
-		if fresh.StateDetail == operatorStopDetail || !specOnboot(fresh.Spec) {
+		if IsOperatorStop(fresh.StateDetail) || !specOnboot(fresh.Spec) {
 			slog.Info("reconciler: dropping onboot retry — operator intent changed",
 				"vm", name, "state_detail", fresh.StateDetail, "onboot", specOnboot(fresh.Spec))
 			r.clearOnbootPending(name)
@@ -662,7 +669,7 @@ func (r *Reconciler) reconcile(ctx context.Context) {
 				}
 				break
 			}
-			if vm.StateDetail == operatorStopDetail {
+			if IsOperatorStop(vm.StateDetail) {
 				break
 			}
 			// A cutover whose RUNTIME HANDOFF has not finished has, by definition,
@@ -1621,16 +1628,17 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	// Build libvirt domain config.
 	vmCfg := lv.VMConfig{
-		Name:         vm.Name,
-		CPU:          vm.CPUActual,
-		MemoryMiB:    vm.MemActual,
-		Machine:      spec.Machine,
-		Firmware:     spec.Firmware,
-		GuestAgent:   spec.GuestAgent,
-		Disks:        diskConfigs,
-		Networks:     netConfigs,
-		CloudInitISO: cloudInitISO,
-		Boot:         spec.Boot,
+		Name:               vm.Name,
+		CPU:                vm.CPUActual,
+		MemoryMiB:          vm.MemActual,
+		Machine:            spec.Machine,
+		Firmware:           spec.Firmware,
+		GuestAgent:         spec.GuestAgent,
+		Disks:              diskConfigs,
+		Networks:           netConfigs,
+		CloudInitISO:       cloudInitISO,
+		Boot:               spec.Boot,
+		SparePCIeRootPorts: r.sparePCIeRootPortsCfg,
 	}
 	if vmCfg.Machine == "" {
 		vmCfg.Machine = "q35"
@@ -1933,6 +1941,11 @@ func hwPrepareRetryable(err error) bool {
 // + libvirt start). Longer is safer; in pathological cases a stuck reconciler
 // will hold the lock until expiry.
 const vmLockTTL = 10 * time.Minute
+
+// VMStartLeaseTTL is how long a TryVMStartLease lease stands without being
+// taken again by its holder. A holder that keeps a lease longer than this — a
+// cold migration copying disks — re-takes it well within it.
+const VMStartLeaseTTL = vmLockTTL
 
 // acquireVMLock takes the per-VM startup lease. Returns true if this host
 // holds the lock. CRDT-tolerant via the same INSERT-OR-UPDATE-WHERE-expired

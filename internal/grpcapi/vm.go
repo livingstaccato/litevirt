@@ -791,6 +791,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// here, not in the shared builder.
 	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.CloudInitISO = cloudInitISO
+	vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
@@ -1083,9 +1084,7 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
-	canRead := func(vm *corrosion.VMRecord) bool {
-		return s.RequirePerm(ctx, vmRBACPath(vm), "vm.read", "viewer") == nil
-	}
+	canRead := func(vm *corrosion.VMRecord) bool { return s.canReadVMRecord(ctx, vm) }
 
 	// Keyset pagination (page_size > 0): fetch one extra row to detect a next page
 	// without a separate count. page_size == 0 preserves the legacy unpaginated
@@ -1248,24 +1247,16 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
 	}
-	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
-	if err != nil {
-		vm = nil
-	}
 	// vm.read on the VM's own path, as every per-VM write checks its verb.
 	// The answer carries the full stored spec, cloud-init user-data included,
 	// so a viewer floor alone handed every VM in the cluster to a caller scoped
-	// to one project. requirePermResolved, not RequirePerm: a foreign VM and a
-	// name that exists nowhere must answer alike (one PermissionDenied), with a
-	// NotFound only for a caller who could have seen the name anyway. Checked
-	// HERE, before the forward below, because the owner may see the call under
-	// the entry node's host identity.
-	var path string
-	if vm != nil {
-		path = vmRBACPath(vm)
-	}
-	if err := s.requirePermResolved(ctx, vm != nil, path, vmRBACPathFor("", req.Name),
-		"vm.read", "viewer", "vm "+strconv.Quote(req.Name)); err != nil {
+	// to one project. requireVMReadByName (via requirePermResolved, not
+	// RequirePerm): a foreign VM and a name that exists nowhere must answer
+	// alike (one PermissionDenied), with a NotFound only for a caller who
+	// could have seen the name anyway. Checked HERE, before the forward below,
+	// because the owner may see the call under the entry node's host identity.
+	vm, err := s.requireVMReadByName(ctx, req.Name)
+	if err != nil {
 		return nil, err
 	}
 	if vm == nil {
@@ -1282,6 +1273,59 @@ func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.V
 		// Fall through to local view if peer unreachable.
 	}
 	return s.vmToProto(ctx, req.Name)
+}
+
+// requireVMReadByName resolves name to its VMRecord (if known locally) and
+// authorizes vm.read on its path, with the same existence-oracle protection
+// InspectVM uses (a foreign VM and a name that exists nowhere answer with one
+// PermissionDenied; NotFound only reaches a caller who could have seen the
+// name anyway — see requirePermResolved). Shared by every single-VM read RPC
+// given RBAC in the per-VM-reads-respect-rbac-scope follow-up — InspectVM,
+// GetVMStats, ListSnapshots, ListVMEvents, ListVMHardware, GetVMLogs — so the
+// resolve-by-name-then-authorize shape lives in exactly one place. Returns the
+// resolved VM (nil if it doesn't exist here) so the caller doesn't need a
+// second lookup; a nil VM with a nil error means "not found" and the caller
+// should answer NotFound, matching InspectVM's own shape.
+func (s *Server) requireVMReadByName(ctx context.Context, name string) (*corrosion.VMRecord, error) {
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	if err != nil {
+		vm = nil
+	}
+	var path string
+	if vm != nil {
+		path = vmRBACPath(vm)
+	}
+	if err := s.requirePermResolved(ctx, vm != nil, path, vmRBACPathFor("", name),
+		"vm.read", "viewer", "vm "+strconv.Quote(name)); err != nil {
+		return nil, err
+	}
+	return vm, nil
+}
+
+// canReadVMRecord reports whether the caller may vm.read a VM the caller
+// already has the record for — the core check both ListVMs' per-row filter
+// (which already has the record from its page/scan, so a second DB lookup
+// would be pure waste) and canReadVM (below, for a caller that only has a
+// name) build on. The single place "can this caller read this VM" is decided.
+func (s *Server) canReadVMRecord(ctx context.Context, vm *corrosion.VMRecord) bool {
+	return s.RequirePerm(ctx, vmRBACPath(vm), "vm.read", "viewer") == nil
+}
+
+// canReadVM reports whether the caller may vm.read the named VM, for use as a
+// per-row filter over a list that spans VMs where only the name is in hand
+// (GetHostStats' per-VM entries, ListVMEvents' cluster-wide activity mode with
+// no vm_name filter — both read a bare name off a non-corrosion row, e.g. a
+// live libvirt domain stat or a vm_events record, so unlike ListVMs' own
+// per-row filter there is no VMRecord to reuse). A name unresolvable here
+// passes only a cluster-root grant (or the legacy no-bindings fallback) —
+// requirePermResolved's "never authorize on a guess" rule, applied to a
+// filter instead of a single error.
+func (s *Server) canReadVM(ctx context.Context, name string) bool {
+	vm, err := corrosion.GetVM(ctx, s.db, name)
+	if err != nil || vm == nil {
+		return s.RequirePerm(ctx, "/", "vm.read", "viewer") == nil
+	}
+	return s.canReadVMRecord(ctx, vm)
 }
 
 func (s *Server) StartVM(ctx context.Context, req *pb.StartVMRequest) (*pb.VM, error) {
@@ -2207,6 +2251,14 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 	// Broadcast FDB removal for VXLAN networks so peers remove stale entries.
 	s.CleanupFDBForVM(ctx, req.Name)
 
+	// What this VM left on the hosts it migrated away from — a disk detached
+	// there, its owner-epoch marker — is freed by those hosts, after the
+	// tombstone below. Planned NOW: the tombstone re-stamps every disk row, and
+	// a detached row is only distinguishable from a live one before it. A
+	// --keep-disks delete keeps disks wherever they are, and drops the markers
+	// everywhere, as it does the local one above.
+	leftovers := s.planDeletedVMLeftovers(ctx, vm, !req.KeepDisks)
+
 	// Tombstone in corrosion — MANDATORY. Returning OK with the row still live
 	// (the guarded delete declines when the row's authority moved under it, and
 	// only reports that after retrying with a fresh guard) would leave a ghost
@@ -2233,6 +2285,10 @@ func (s *Server) DeleteVM(ctx context.Context, req *pb.DeleteVMRequest) (*emptyp
 
 	// Refresh LB backends so deleted VM is removed from rotation.
 	go s.refreshLBForStack(context.Background(), vm.StackName)
+
+	if len(leftovers.hosts) > 0 {
+		go s.cleanupDeletedVMLeftovers(context.WithoutCancel(ctx), leftovers)
+	}
 
 	return &emptypb.Empty{}, nil
 }
@@ -4222,6 +4278,7 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
+		vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 		// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
 		// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
 		// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no

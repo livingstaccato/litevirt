@@ -265,6 +265,7 @@ func TestLoadConfig_PCIConfig(t *testing.T) {
 pci:
   rescan_interval: "5m"
   udev_hook: true
+  spare_pcie_root_ports: 6
   sriov:
     managed: true
     max_vfs_per_pf: 16
@@ -285,11 +286,80 @@ pci:
 	if !cfg.PCI.UdevHook {
 		t.Error("UdevHook should be true")
 	}
+	if cfg.PCI.SparePCIeRootPorts != 6 {
+		t.Errorf("SparePCIeRootPorts = %d, want 6", cfg.PCI.SparePCIeRootPorts)
+	}
 	if !cfg.PCI.SRIOV.Managed {
 		t.Error("SRIOV.Managed should be true")
 	}
 	if cfg.PCI.SRIOV.MaxVFsPerPF != 16 {
 		t.Errorf("MaxVFsPerPF = %d, want 16", cfg.PCI.SRIOV.MaxVFsPerPF)
+	}
+}
+
+// TestLoadConfig_SparePCIeRootPortsDefault: absent from config → the sane
+// non-zero default (4), not the Go zero value — a cluster that never heard of
+// this key must still get spare hot-plug slots on every new VM.
+func TestLoadConfig_SparePCIeRootPortsDefault(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("host_name: h\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITEVIRT_CONFIG", configPath)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.PCI.SparePCIeRootPorts != 4 {
+		t.Errorf("default SparePCIeRootPorts = %d, want 4", cfg.PCI.SparePCIeRootPorts)
+	}
+}
+
+// TestLoadConfig_SparePCIeRootPortsExplicitZero: an operator can explicitly
+// disable the feature — the default must not silently override a real zero.
+func TestLoadConfig_SparePCIeRootPortsExplicitZero(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	yaml := "host_name: h\npci:\n  spare_pcie_root_ports: 0\n"
+	if err := os.WriteFile(configPath, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITEVIRT_CONFIG", configPath)
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.PCI.SparePCIeRootPorts != 0 {
+		t.Errorf("explicit 0 must be honored, got %d", cfg.PCI.SparePCIeRootPorts)
+	}
+}
+
+// TestLoadConfig_SparePCIeRootPortsRejectsInvalid: negative is meaningless and a
+// huge value would starve q35's own platform controllers of root-complex slots
+// (see maxSparePCIeRootPorts) — both must fail LoadConfig loudly, not degrade
+// silently to some fallback the operator never asked for.
+func TestLoadConfig_SparePCIeRootPortsRejectsInvalid(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+	}{
+		{"negative", "host_name: h\npci:\n  spare_pcie_root_ports: -1\n"},
+		{"too large", "host_name: h\npci:\n  spare_pcie_root_ports: 17\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "config.yaml")
+			if err := os.WriteFile(configPath, []byte(tc.yaml), 0644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("LITEVIRT_CONFIG", configPath)
+			if _, err := LoadConfig(); err == nil {
+				t.Fatalf("LoadConfig accepted spare_pcie_root_ports %q (must reject)", tc.name)
+			}
+		})
 	}
 }
 

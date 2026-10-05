@@ -326,6 +326,8 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 			tieHosts[h] = snap.unresolvedTies
 		}
 	}
+	// A multi-holder sighting must survive one re-probe before it is a finding.
+	s.reprobeMultiHolders(ctx, vmHolders, ctHolders)
 
 	// DB view for the owner-mismatch cutover-lag exclusion.
 	dbVMs, dbIndexOK := s.dbVMIndex(ctx)
@@ -345,10 +347,13 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 
 	// 1. Same VM an ACTIVE DISK-HOLDER on >1 host. This does NOT exempt DB "migrating"
 	//    states: a healthy live migration keeps the incoming target PAUSED (a non-disk-holder)
-	//    until cutover, so a legitimate migration shows only ONE disk-holder and the brief
-	//    cutover overlap is filtered by the debounce. Exempting the DB state instead would
-	//    hide the case this check exists for — a failed/stuck failover left "pending"/"migrating"
-	//    while BOTH the old and new hosts actively run (and write) the VM.
+	//    until cutover and pauses the source before resuming the target, so no instant has
+	//    two disk-holders. A gather that straddles the cutover can still read both — the
+	//    source probed before it, the target after — and the debounce does NOT absorb that:
+	//    admission honours an OBSERVED row at once. reprobeMultiHolders settles it instead,
+	//    from runtime evidence alone. Exempting the DB state would hide the case this check
+	//    exists for — a failed/stuck failover left "pending"/"migrating" while BOTH the old
+	//    and new hosts actively run (and write) the VM.
 	for vm, hs := range vmHolders {
 		if len(hs) > 1 {
 			add(kindDualRunVM, vm, fmt.Sprintf(
@@ -357,8 +362,9 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 		}
 	}
 	// 2. Same container running on >1 host. Same reasoning as VMs: a cold CT migration
-	//    stops the source before starting the target (never two running at once beyond a
-	//    debounce window), so a sustained two-holder state is a real dual-run, not a migration.
+	//    stops the source before starting the target (never two running at once; a gather
+	//    straddling the move is settled by reprobeMultiHolders), so a two-holder state that
+	//    survives the re-probe is a real dual-run, not a migration.
 	//    BUT: container names are NOT cluster-unique — the schema keys rows by
 	//    (host_name, name), and two unrelated containers named "web" on two hosts
 	//    are a legitimate steady state. Multiple runtime holders alone therefore
@@ -624,6 +630,117 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 	}
 
 	s.applyConditionLifecycle(ctx, current, details, evidenceHosts, rc, coverageDetail, probeFailed)
+}
+
+// reprobeMultiHolders re-probes, once, every host that a multi-holder VM or
+// container sighting names, and narrows that workload's holders to the hosts
+// that still hold it — but only where the re-probe answered COMPLETELY for
+// every host of the sighting.
+//
+// gatherRuntime is not atomic: each host is probed at its own moment. A live
+// migration pauses the source before it resumes the target, and a cold
+// container move stops the source before starting the target, so no instant
+// has two running copies; yet a gather that probed the source just before the
+// cutover and the target just after reads both as holders. That sighting used
+// to become an OBSERVED vm_dual_run, which admission honours immediately
+// (host_safety.go), so the VM's next migration and all growth on both hosts
+// were refused until two clean passes later.
+//
+// The re-probe begins after the whole gather returned, so after the target
+// was seen holding: the cutover is behind it and cannot straddle it again. A
+// real dual run is still there, is recorded in the SAME pass as before, and
+// blocks admission exactly as early. Only runtime evidence decides — no DB
+// state or replicated row can switch this on — and a re-probe that is blind
+// to any involved host (unreachable, partial, older binary) proves nothing,
+// so the first sighting stands.
+//
+// Nor is a workload narrowed while a vm_dual_run / ct_dual_run condition for
+// it is already recorded: a cutover straddles a gather once, but a real dual
+// run with one copy flapping is missed by the re-probe now and then, and
+// narrowing those passes counted them clean and resolved the split brain
+// between sightings, reopening admission while both copies ran. A condition
+// list that cannot be read narrows nothing either.
+func (s *Server) reprobeMultiHolders(ctx context.Context, vmHolders, ctHolders map[string][]string) {
+	involved := map[string]bool{}
+	for _, holders := range []map[string][]string{vmHolders, ctHolders} {
+		for _, hs := range holders {
+			if len(hs) > 1 {
+				for _, h := range hs {
+					involved[h] = true
+				}
+			}
+		}
+	}
+	if len(involved) == 0 {
+		return
+	}
+	recorded, err := s.recordedDualRuns(ctx)
+	if err != nil {
+		slog.Warn("dual-run detector: cannot read recorded dual runs; multi-holder sightings stand without a re-probe", "error", err)
+		return
+	}
+	hosts := make([]string, 0, len(involved))
+	for h := range involved {
+		hosts = append(hosts, h)
+	}
+	sort.Strings(hosts)
+	again, _, _ := s.gatherRuntime(ctx, hosts)
+
+	narrow := func(kind string, holders map[string][]string, held func(runtimeSnapshot) []string) {
+		for name, hs := range holders {
+			if len(hs) <= 1 || recorded[finding{kind: kind, target: name}] {
+				continue
+			}
+			var still []string
+			proven := true
+			for _, h := range hs {
+				snap, ok := again[h]
+				if !ok || snap.partial {
+					proven = false
+					break
+				}
+				for _, n := range held(snap) {
+					if n == name {
+						still = append(still, h)
+						break
+					}
+				}
+			}
+			if !proven || len(still) > 1 {
+				continue // still a multi-holder sighting, or absence unproven
+			}
+			slog.Info("dual-run detector: multi-holder sighting did not survive a re-probe (cutover straddle)",
+				"workload", name, "first_seen_on", strings.Join(hs, ", "), "re_probed_on", strings.Join(still, ", "))
+			if len(still) == 0 {
+				delete(holders, name)
+			} else {
+				holders[name] = still
+			}
+		}
+	}
+	narrow(kindDualRunVM, vmHolders, func(sn runtimeSnapshot) []string { return sn.diskHolderVMs })
+	narrow(kindDualRunCT, ctHolders, func(sn runtimeSnapshot) []string { return sn.runningCTs })
+}
+
+// recordedDualRuns is the set of VM and container dual runs this evaluator
+// has recorded and not resolved.
+func (s *Server) recordedDualRuns(ctx context.Context) (map[finding]bool, error) {
+	active, err := corrosion.ListHealthConditions(ctx, s.db, false)
+	if err != nil {
+		return nil, err
+	}
+	out := map[finding]bool{}
+	for _, h := range active {
+		if h.Evaluator != dualRunEvaluator {
+			continue
+		}
+		for _, kind := range []string{kindDualRunVM, kindDualRunCT} {
+			if code, subjectKind := conditionIdentity(kind); h.Code == code && h.SubjectKind == subjectKind {
+				out[finding{kind: kind, target: h.SubjectID}] = true
+			}
+		}
+	}
+	return out, nil
 }
 
 // ctHostName keys a container by the pair the schema keys it by.

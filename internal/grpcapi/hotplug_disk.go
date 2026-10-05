@@ -634,7 +634,7 @@ func (s *Server) executeDiskAttach(ctx context.Context, vm *corrosion.VMRecord, 
 
 	if running {
 		if err := s.virt.AttachDisk(vm.Name, diskPath, targetDev, bus); err != nil {
-			return s.failDeviceAttach(ctx, rb, codes.Internal, fmt.Errorf("attach disk: %w", err))
+			return s.failDeviceAttach(ctx, rb, pciAttachErrorCode(err), pciAttachError("attach disk", err))
 		}
 		rb.attached = true
 		if err := corrosion.InsertDisk(ctx, s.db, rec); err != nil {

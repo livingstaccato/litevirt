@@ -48,6 +48,8 @@ type firmwareTargetPeer struct {
 	oldBuild bool
 
 	mu sync.Mutex
+	// srcCtx is the source daemon calling the target: a trusted peer.
+	srcCtx context.Context
 	// afterEnsure, if set, sees the target's EnsureFirmwareState result and
 	// decides what reaches the source (e.g. a cancellation that loses it).
 	afterEnsure    func(*pb.EnsureFirmwareStateResponse, error) (*pb.EnsureFirmwareStateResponse, error)
@@ -71,7 +73,7 @@ func (p *firmwareTargetPeer) EnsureFirmwareState(_ context.Context, req *pb.Ensu
 	p.ensureAttempts = append(p.ensureAttempts, req.AttemptId)
 	hook := p.afterEnsure
 	p.mu.Unlock()
-	resp, err := p.dst.EnsureFirmwareState(adminCtx(), r)
+	resp, err := p.dst.EnsureFirmwareState(p.srcCtx, r)
 	if p.oldBuild && err == nil {
 		resp = &pb.EnsureFirmwareStateResponse{} // google.protobuf.Empty on the wire
 	}
@@ -140,7 +142,9 @@ func newFWRollbackFixture(t *testing.T) *fwRollbackFixture {
 	// The VM row is replicated to the target, still naming the source.
 	insertTestVMWithSpec(t, ctx, dst.db, fwRollbackVM, src.hostName, "stopped", fwRollbackSpec)
 
-	peer := &firmwareTargetPeer{dst: dst, srcFP: src.firmwareLayoutFingerprint()}
+	srcCtx := context.WithValue(peerCtxFor(t, dst, src.hostName), ctxKeyUsername, "admin")
+	srcCtx = context.WithValue(srcCtx, ctxKeyRole, "admin")
+	peer := &firmwareTargetPeer{dst: dst, srcFP: src.firmwareLayoutFingerprint(), srcCtx: srcCtx}
 	src.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
 		return peer, func() {}, nil
 	}
@@ -168,7 +172,7 @@ func (f *fwRollbackFixture) migrate(ctx context.Context, t *testing.T) error {
 	if err != nil || vm == nil {
 		t.Fatalf("GetVM: %v", err)
 	}
-	return f.src.coldMigrateFirmwareVM(ctx, vm, &corrosion.HostRecord{Name: f.targetHostName}, f.fwSpec,
+	return f.src.coldMigrateStoppedVM(ctx, vm, &corrosion.HostRecord{Name: f.targetHostName}, f.fwSpec, &migrationAbort{},
 		func(pb.MigratePhase, float32, float32) error { return nil })
 }
 
@@ -410,20 +414,20 @@ func TestRollbackFirmwareState_RemovesOnlyItsOwnAttempt(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFWRollbackFixture(t)
-			owner := f.src.hostName
-			if tc.rowHere {
-				owner = fwRollbackDst
-			}
-			if err := f.dst.db.Execute(context.Background(),
-				`UPDATE vms SET host_name = ? WHERE name = ?`, owner, fwRollbackVM); err != nil {
-				t.Fatalf("set owner: %v", err)
-			}
 			src := nvramBundle(t, f.dst.dataDir)
-			if _, err := f.dst.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{
+			if _, err := f.dst.EnsureFirmwareState(f.peer.srcCtx, &pb.EnsureFirmwareStateRequest{
 				VmName: fwRollbackVM, Uuid: fwRollbackUUID, Bundle: src, AttemptId: "attempt-a",
 				DomainXml: `<domain type='kvm'><name>fw</name><uuid>` + fwRollbackUUID + `</uuid></domain>`,
 			}); err != nil {
 				t.Fatalf("EnsureFirmwareState: %v", err)
+			}
+			// The row comes to name this host after the define: the handoff
+			// committed before the rollback arrived.
+			if tc.rowHere {
+				if err := f.dst.db.Execute(context.Background(),
+					`UPDATE vms SET host_name = ? WHERE name = ?`, fwRollbackDst, fwRollbackVM); err != nil {
+					t.Fatalf("set owner: %v", err)
+				}
 			}
 			resp, err := f.dst.RollbackFirmwareState(adminCtx(), &pb.RollbackFirmwareStateRequest{
 				VmName: fwRollbackVM, Uuid: fwRollbackUUID, AttemptId: tc.attempt,

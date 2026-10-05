@@ -366,8 +366,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("could not determine audit chain signing state", "error", err)
 	} else if signed {
 		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
+		d.db.NoteAuditResealNotNeeded(d.cfg.HostName)
 	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
-		slog.Warn("audit chain reseal at startup failed", "error", err)
+		// Logged, not fatal. Until a reseal succeeds the legacy tail is not
+		// anchored (corrosion.ErrAuditAnchorWithheld): an anchor over the
+		// un-rebased tail would read as a truncation once it is rebased.
+		slog.Warn("audit chain reseal at startup failed; the legacy chain is not anchored until a restart reseals it", "error", err)
 	} else if n > 0 {
 		slog.Info("audit: re-based legacy unsigned rows at startup",
 			"host", d.cfg.HostName, "rows", n)
@@ -805,6 +809,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetSRIOVMetrics(metrics.NewSRIOVMetrics())
 	svc.SetSRIOVPolicy(d.cfg.PCI.SRIOV.Managed, d.cfg.PCI.SRIOV.MaxVFsPerPF, d.cfg.PCI.SRIOV.ManagedPFs)
 	svc.ValidateSRIOVPolicy()
+	// Spare pcie-root-ports on every newly-defined q35 domain, so hot-plug has a
+	// free slot to attach into (see daemon.PCIConfig.SparePCIeRootPorts). Both the
+	// server (create/import/clone/promote/update) and the reconciler (sweep
+	// redefines) need it — a redefine that goes through either must agree on the
+	// node's current value.
+	svc.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
+	reconciler.SetSparePCIeRootPorts(d.cfg.PCI.SparePCIeRootPorts)
 	if d.cfg.PCI.SRIOV.Managed {
 		go svc.RunSRIOVValidation(ctx, d.parsePCIRescanInterval())
 	}
@@ -991,6 +1002,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetHAHealthMetrics(metrics.NewHAHealthMetrics())
 	svc.SetDualRunMetrics(metrics.NewDualRunMetrics())
 	svc.SetStoragePoolsByName(d.storagePoolRefs())
+	// Before this daemon serves: no cold-migration copy can be in flight yet.
+	svc.SweepColdMigrationScratch()
 	svc.SetReplicator(repl)
 	svc.SetAuthEngine(d.authEngine)
 	svc.SetRealmRegistry(d.realmRegistry)
@@ -1105,6 +1118,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// capability, closing the fail-open race for a should-enforce node.
 	go vmChecker.Start(ctx)
 	go reconciler.Start(ctx)
+	// Finish any drain cold move a previous process died in the middle of: the
+	// VM was running, was (or was about to be) shut down for the move, and must
+	// run again on exactly one host. It starts VMs, so it runs with the runtime
+	// loops above — after the startup recovery barrier has restored host
+	// networks and every late setter has run — and in its own goroutine,
+	// because finishing one can wait for a guest's shutdown or for the target.
+	go svc.RunDrainColdMoveRecovery(ctx)
 	// Autostart onboot VMs once, in startup_order (#10). Runs only for VMs not
 	// already running in libvirt, so a daemon restart (qemu kept alive by
 	// KillMode=process) is a no-op while a host reboot brings them up in order.
@@ -1218,7 +1238,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// table. The applier short-circuits when the rendered ruleset
 	// hasn't changed, so idle clusters cost ~one corrosion query/tick.
 	fwApplier := firewall.NewApplier(firewall.NftBinary{})
-	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{})
+	fwMetrics := metrics.NewFirewallMetrics()
+	fwLoader := firewall.CorrosionPlanLoader(d.db, d.cfg.HostName, firewall.Plan{},
+		firewall.LoaderOptions{RunningTaps: d.virt.RunningDomainTaps, OnDuplicateSGs: fwMetrics.SetDuplicateSGNICs})
 	d.fwReconciler = firewall.NewReconciler(fwLoader, fwApplier, 30*time.Second)
 	// Upgrade migration: once the reconciler renders a bridge's NAT/isolation into
 	// litevirt-fw, clear the pre-consolidation out-of-band rules (old iptables

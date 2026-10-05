@@ -351,7 +351,7 @@ func TestEnsureFirmwareState_FirmwareVMNeedsItsBundle(t *testing.T) {
 	s.virt = libvirtfake.New()
 	s.dataDir = t.TempDir()
 	insertTestVMWithSpec(t, adminCtx(), s.db, "fw", "src-host", "stopped", `{"name":"fw","tpm":true,"uuid":"u1"}`)
-	_, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{
+	_, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{
 		VmName: "fw", DomainXml: `<domain type='kvm'><name>fw</name></domain>`, AttemptId: "a1",
 	})
 	if status.Code(err) != codes.InvalidArgument {
@@ -383,9 +383,10 @@ func TestColdDefineWithoutFirmware_LeavesNameKeyedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	xml := `<domain type='kvm'><name>os1</name></domain>`
+	peer := diskPeerCtx(t, s)
 
 	fake.FailDefineDomain = func(string) error { return errors.New("define fails") }
-	if _, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1"}); err == nil {
+	if _, err := s.EnsureFirmwareState(peer, &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a1"}); err == nil {
 		t.Fatal("EnsureFirmwareState with a failing define succeeded")
 	}
 	if _, err := os.Stat(nv); err != nil {
@@ -393,7 +394,7 @@ func TestColdDefineWithoutFirmware_LeavesNameKeyedFiles(t *testing.T) {
 	}
 
 	fake.FailDefineDomain = nil
-	resp, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a2"})
+	resp, err := s.EnsureFirmwareState(peer, &pb.EnsureFirmwareStateRequest{VmName: "os1", DomainXml: xml, AttemptId: "a2"})
 	if err != nil || !resp.GetDomainDefined() {
 		t.Fatalf("bundle-less define = %v %v, want the domain defined", resp, err)
 	}

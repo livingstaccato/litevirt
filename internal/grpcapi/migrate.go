@@ -1222,9 +1222,23 @@ func (s *Server) EnsureFirmwareState(ctx context.Context, req *pb.EnsureFirmware
 	if req.VmName == "" || (len(req.Bundle) == 0 && req.DomainXml == "") {
 		return nil, status.Error(codes.InvalidArgument, "vm_name and a non-empty firmware bundle or domain definition are required")
 	}
+	// The target half of a cold migration its SOURCE DAEMON drives, as
+	// ReceiveMigrationDisk is: it defines caller-supplied domain XML (only its
+	// name and uuid are checked), so a user holding vm.migrate must not reach
+	// it directly. requirePeerCert also admits a promoted forwarded peer, so
+	// the source's own call is unaffected.
+	if err := s.requirePeerCert(ctx); err != nil {
+		return nil, err
+	}
 	vm, err := s.authorizeMigrationHelper(ctx, req.VmName)
 	if err != nil {
 		return nil, err
+	}
+	// A VM whose row names this host lives here: a domain defined for it is
+	// the one `lv start` boots, and a migration TO this host never names it.
+	if vm.HostName == s.hostName {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"VM %q lives on %s; its domain is not defined here by a migration to it", vm.Name, s.hostName)
 	}
 	hasBundle := len(req.Bundle) > 0
 	if !hasBundle && usesFirmwareState(vm.Spec) {

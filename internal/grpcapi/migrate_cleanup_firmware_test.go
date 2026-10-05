@@ -192,7 +192,7 @@ func TestEnsureFirmwareState_OtherVMsUUIDRefused(t *testing.T) {
 	s := testServer(t)
 	s.virt = libvirtfake.New()
 	fwCleanupFixture(t, s, "src-host")
-	_, err := s.EnsureFirmwareState(adminCtx(), &pb.EnsureFirmwareStateRequest{
+	_, err := s.EnsureFirmwareState(diskPeerCtx(t, s), &pb.EnsureFirmwareStateRequest{
 		VmName: "vma", Uuid: cleanupUUIDB, Bundle: nvramBundle(t, s.dataDir),
 		DomainXml: `<domain type='kvm'><name>vma</name><uuid>` + cleanupUUIDA + `</uuid></domain>`,
 	})

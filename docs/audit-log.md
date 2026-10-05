@@ -183,7 +183,11 @@ grouped by what it means:
   host's key. This is the finding that survives a reseal.
 - **unknown key** — the signer has no published certificate that chains to the
   cluster CA.
-- **sequence gap** — a run of rows was deleted from one host's chain.
+- **sequence break** — a jump in one host's numbering (a run of rows was
+  deleted from its chain), or a **duplicate**: two rows claiming the same seq,
+  which is a forked chain — a second writer, or a host that appended to a
+  replica still missing its own history (see "Rebuilding a host under its old
+  name" below) — and is labelled as one rather than as a deletion.
 - **laundered** — a row blanked its own hash to pose as a pre-chain reset point.
 - **truncated** — a host's signed chain head attests to more rows than exist,
   or a host's seq-0 legacy anchor names a hash that no seq-0 row of that host
@@ -553,6 +557,76 @@ by any peer: forging a retirement put every row a host had ever signed past a
 boundary, on every node, with no key required — and clearing a genuine one was
 just as cheap. The detector for "somebody else has this key" cannot itself be
 something somebody else can write.
+
+## Rebuilding a host under its old name
+
+A host removed with `lv host rm` (or `lv host rm --dead`), rebuilt on an empty
+database and re-added with `lv host add` under the same name continues the
+chain it had. Nothing needs doing by hand; this section says what happens and
+what it costs.
+
+**Removal closes the old contract.** `lv host rm` CA-retires the host's live
+signing key at the sequence the cluster holds for it. That boundary is signed
+with the cluster CA key, so the host cannot choose it, and everything at or
+below it belongs to the machine that was removed.
+
+**The rebuilt daemon holds its audit rows until its own history has arrived.**
+A host chains each row onto the tail of its own sub-chain as its local replica
+holds it, and a rebuilt host's replica holds none of its history until
+anti-entropy delivers it — typically within one anti-entropy interval. Appending
+before then starts a second chain under a name that already has one: `seq 1`,
+an empty `prev_hash`, and a hash mismatch plus duplicated sequence numbers on
+every node, permanently, since signed rows are never resealed. So until the tail
+can be trusted, every row the host audits is **held**: written to
+`<data_dir>/audit-hold/`, mode 0700, one fsynced file per row, never replicated.
+A daemon restart in that window loses nothing. Once the tail is trusted the held
+rows are appended, in the order they were audited, after the real tail. Each
+keeps the time it was audited as its stamp; `seq` records where it entered the
+chain.
+
+The tail is trusted once both hold:
+
+- **the replica has caught up** — an anti-entropy exchange with a peer has
+  completed since the daemon started, so the host's rows, the lifecycle records
+  and the chain heads that peer held are all local; and
+- **the tail has reached what the cluster's records say it reached** — every
+  verified retirement boundary of the host's keys (the one `lv host rm` wrote
+  among them) and every verified chain head, a retired key's head counting only
+  up to its boundary.
+
+The second condition can name a sequence no row will ever reach — a boundary an
+operator raised past the real tail with `--at-seq`, or a head published by a
+leaked key. Ten minutes after the replica caught up, a shortfall is no longer
+replication lag: the daemon logs an error naming it and appends anyway, and if
+the missing rows do exist, `verify` reports the fork.
+
+Every daemon start holds this way, not only a rebuild's, because a restart and
+a rebuild cannot be told apart locally — a node restored from an older snapshot
+has the same problem with a shorter gap. On an ordinary restart the cost is up
+to one anti-entropy interval of audit latency, and nothing is lost. Two cases
+are trusted at once, because there is nobody to catch up with: a node that sees
+no peer (no gossip member and no other live host) and either founded the
+cluster (no `join_peers`) or already holds rows of its own. A node configured
+with `join_peers` that holds none of its own history is the rebuilt host, and
+it waits even when it sees no peer — at its first start its hosts table can
+name only itself. While held, a warning names the reason once a minute. A host
+that cannot reach any peer holds its rows until it can; past 10000 held rows a
+row is logged in full at error level and not written.
+
+**The new key's contract starts after the old machine's rows.** The new key's
+`adopted` record is written only once the hold has opened, and its start is
+never below the highest CA retirement boundary for the host. Without that, a
+contract started at seq 0 claims every unsigned row the removed machine wrote
+before it first signed, and `verify` reports each as `unsigned after signed`.
+
+**A chain that already forked stays flagged.** A host rebuilt under its old name
+by a build without the hold may already have written a second chain. Those rows
+are signed and append-only: `verify` keeps reporting the hash mismatch, the
+duplicated sequence numbers and any `unsigned after signed` rows, on every node,
+and the hourly check keeps logging them. Nothing repairs them in place and
+nothing backfills them, deliberately — a log that could be rewritten to clear a
+finding could be rewritten to clear a real one. Such a cluster carries the
+finding until its audit history is recreated.
 
 ## WORM export
 

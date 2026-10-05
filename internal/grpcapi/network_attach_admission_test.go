@@ -635,27 +635,61 @@ func TestRestoreContainer_ProoflessPeerRelocationOnForeignNetworkProceeds(t *tes
 	wantForeignNetworkAudit(t, s, "ct.restore", "ct1", "beta-net")
 }
 
-// The token is plain client metadata. An operator who sets it is still an
-// operator: refused onto a foreign network, and charged the project's quota.
-func TestRestoreContainer_ForgedRelocationTokenIsNotARelocation(t *testing.T) {
-	forged := func() context.Context {
-		return metadata.NewIncomingContext(adminCtx(), metadata.Pairs(relocateTokenMDKey, "forged-token"))
-	}
-	t.Run("foreign network refused", func(t *testing.T) {
-		s, repo, ts := seedForeignCTBackup(t, "beta-net")
+// The token is plain client metadata, and its real value is readable off the
+// source row's state detail. An operator who sends it is refused outright,
+// before anything is imported or written, whatever the network.
+func TestRestoreContainer_ForgedRelocationTokenRefused(t *testing.T) {
+	forged := metadata.NewIncomingContext(adminCtx(), metadata.Pairs(relocateTokenMDKey, "reloc-token-2"))
+	for _, network := range []string{"beta-net", "shared-net"} {
+		s, repo, ts := seedForeignCTBackup(t, network)
 		err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
-			&progressStream[pb.RestoreContainerProgress]{ctx: forged()})
-		wantNetworkRefused(t, err, "restore", "beta-net")
-	})
-	t.Run("quota charged", func(t *testing.T) {
-		s, repo, ts := seedForeignCTBackup(t, "shared-net")
-		quotaProject(t, s, "acme", corrosion.ProjectQuotaRecord{MemMiBLimit: 128})
-		err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
-			&progressStream[pb.RestoreContainerProgress]{ctx: forged()})
-		if status.Code(err) != codes.ResourceExhausted {
-			t.Fatalf("a 256 MiB restore into a 128 MiB quota with a forged relocation token: got %v, want ResourceExhausted", err)
+			&progressStream[pb.RestoreContainerProgress]{ctx: forged})
+		if status.Code(err) != codes.PermissionDenied || !strings.Contains(err.Error(), "relocation token") {
+			t.Fatalf("%s: an operator restore carrying the relocation token: got %v, want PermissionDenied", network, err)
 		}
-	})
+		if row, _ := corrosion.GetContainer(context.Background(), s.db, "self", "ct1"); row != nil {
+			t.Fatalf("%s: a refused forged-token restore wrote a row: %+v", network, row)
+		}
+	}
+}
+
+// A peer relocation still stamps the coordinator's token on the restored row.
+func TestRestoreContainer_PeerRelocationStampsToken(t *testing.T) {
+	s, repo, ts := seedForeignCTBackup(t, "shared-net")
+	if err := s.RestoreContainer(&pb.RestoreContainerRequest{Name: "ct1", RepoPath: repo, Timestamp: ts},
+		&progressStream[pb.RestoreContainerProgress]{ctx: proofRestoreCtx("reloc-token-3")}); err != nil {
+		t.Fatalf("peer relocation: %v", err)
+	}
+	row, _ := corrosion.GetContainer(context.Background(), s.db, "self", "ct1")
+	if row == nil || row.RelocateToken != "reloc-token-3" {
+		t.Fatalf("peer relocation must stamp its token, got %+v", row)
+	}
+}
+
+// isPeerRelocation is also what exempts a relocation from quota: a token on a
+// bearer call never counts.
+func TestIsPeerRelocation(t *testing.T) {
+	s := newPeerAuthServer(t)
+	withToken := func(ctx context.Context) context.Context {
+		return metadata.NewIncomingContext(ctx, metadata.Pairs(relocateTokenMDKey, "t"))
+	}
+	cases := []struct {
+		name  string
+		ctx   context.Context
+		proof bool
+		want  bool
+	}{
+		{"proof", adminCtx(), true, true},
+		{"token over a peer cert", withToken(mtlsAdminCtx("peer-1")), false, true},
+		{"token on a bearer call", withToken(adminCtx()), false, false},
+		{"token from an unknown cert", withToken(mtlsAdminCtx("stranger")), false, false},
+		{"peer cert, no token", mtlsAdminCtx("peer-1"), false, false},
+	}
+	for _, c := range cases {
+		if got := s.isPeerRelocation(c.ctx, c.proof); got != c.want {
+			t.Errorf("%s: isPeerRelocation = %v, want %v", c.name, got, c.want)
+		}
+	}
 }
 
 // The allowed-foreign-network record is written only once the takeover has

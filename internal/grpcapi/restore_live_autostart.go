@@ -228,8 +228,11 @@ func (s *Server) autoDefineRestoredVM(
 				"network bridge %q not available on host %s: %v", bridge, s.hostName, err)
 		}
 		netCfg = append(netCfg, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
+		// The groups go on the legacy row as well as the vm_nics one: a peer on
+		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: targetName, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: n.Ip,
+			SecurityGroups: n.SecurityGroups,
 		})
 		nicRecords = append(nicRecords, corrosion.NICRecord{
 			VMName:         targetName,

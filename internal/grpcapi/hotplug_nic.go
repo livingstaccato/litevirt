@@ -350,6 +350,19 @@ func (s *Server) writeNICAttachRows(ctx context.Context, rb *nicAttachRollback, 
 			return fmt.Errorf("record legacy interface row: %w", err)
 		}
 		rb.legacyRowWritten = true
+		// InsertInterface's statement has no security_groups column, and a new
+		// shape would stall this node's stream to every peer on the previous
+		// release, so the groups follow in the existing per-NIC update (the
+		// legacy PK is (vm_name, network_name), so it touches this row only).
+		// Without them the legacy row is newer than the vm_nics row and
+		// group-less: a peer on an older build renders no chain for the NIC,
+		// and the hardware bridge, which mirrors a strictly newer legacy row
+		// into vm_nics, would copy the empty set over the groups written above.
+		if len(spec.SecurityGroups) > 0 {
+			if err := corrosion.SetInterfaceSecurityGroups(ctx, s.db, vmName, spec.Name, spec.SecurityGroups); err != nil {
+				return fmt.Errorf("record legacy interface security groups: %w", err)
+			}
+		}
 	}
 	return nil
 }

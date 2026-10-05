@@ -241,8 +241,11 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			}
 			netConfigs = append(netConfigs, lv.NetworkConfig{Bridge: bridge, Model: n.Model, MAC: mac})
 		}
+		// The groups go on the legacy row as well as the vm_nics one: a peer on
+		// an older build renders this NIC's chain from vm_interfaces alone.
 		ifaceRecords = append(ifaceRecords, corrosion.InterfaceRecord{
 			VMName: req.Target, NetworkName: n.Name, Ordinal: i, MAC: mac, IP: ip,
+			SecurityGroups: n.SecurityGroups,
 		})
 		nicRecords = append(nicRecords, corrosion.NICRecord{
 			VMName:         req.Target,

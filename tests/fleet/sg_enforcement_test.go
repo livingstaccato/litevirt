@@ -21,12 +21,16 @@ package fleet
 
 import (
 	"context"
+	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/firewall"
+	"github.com/litevirt/litevirt/internal/image"
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -126,6 +130,22 @@ func mustTap(t *testing.T, n *Node, vmName, mac string) string {
 	return tap
 }
 
+// legacyGroups is the security_groups column of vmName's vm_interfaces row on
+// netName — what a peer on an older build renders from.
+func legacyGroups(t *testing.T, n *Node, vmName, netName string) []string {
+	t.Helper()
+	ifaces, err := corrosion.GetVMInterfaces(context.Background(), n.DB, vmName)
+	if err != nil {
+		t.Fatalf("GetVMInterfaces %s: %v", vmName, err)
+	}
+	for _, i := range ifaces {
+		if i.NetworkName == netName {
+			return i.SecurityGroups
+		}
+	}
+	return nil
+}
+
 // ── scenarios ───────────────────────────────────────────────────────────────
 
 // TestFleet_SG_ChainFollowsTheTapAcrossARestart is the lab finding: create a VM
@@ -167,5 +187,119 @@ func TestFleet_SG_ChainFollowsTheTapAcrossARestart(t *testing.T) {
 	}
 	if nicChain(out, before) != "" {
 		t.Errorf("the pre-restart tap %s no longer belongs to web and must have no chain:\n%s", before, out)
+	}
+}
+
+// TestFleet_SG_HotAttachedNICIsEnforced: a NIC attached with groups gets a
+// chain, before the hardware_v2 latch (vm_nics + legacy dual write) and after
+// it (vm_nics only). Pre-latch the legacy row must carry the groups too, both
+// for a peer on an older build and so the hardware bridge — which mirrors a
+// strictly newer legacy row into vm_nics — cannot copy a group-less legacy row
+// over the hot-attach's vm_nics groups.
+func TestFleet_SG_HotAttachedNICIsEnforced(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		latchV2 bool
+	}{
+		{"before hardware_v2", false},
+		{"after hardware_v2", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := sgCluster(t)
+			ctx := context.Background()
+			gates := gateAll(t, c)
+			if tc.latchV2 {
+				latchHardwareV2(t, c, gates)
+			} else {
+				latchOperationProtocol(t, c, gates)
+			}
+			host := c.Nodes[1]
+			mustCreateSG(t, c, host, "web", "443")
+			mustCreateNICLessVM(t, c, host, "app")
+
+			if _, err := c.SelfClient(host).AttachDevice(ctx, &pb.AttachDeviceRequest{
+				VmName: "app",
+				Nic:    &pb.NetworkAttachment{Name: sgNet, SecurityGroups: []string{"web"}},
+			}); err != nil {
+				t.Fatalf("AttachDevice nic with groups: %v", err)
+			}
+			nic := liveNIC(t, host, "app", sgNet)
+			tap := mustTap(t, host, "app", nic.MAC)
+
+			if chain := nicChain(renderPlan(t, nodePlan(t, host)), tap); !strings.Contains(chain, "oifname "+tap+" tcp dport 443 accept") {
+				t.Fatalf("hot-attached NIC %s (tap %s) must carry its web rule; chain:\n%s", nic.MAC, tap, chain)
+			}
+			if tc.latchV2 {
+				return
+			}
+			if got := legacyGroups(t, host, "app", sgNet); len(got) != 1 || got[0] != "web" {
+				t.Errorf("pre-latch the legacy vm_interfaces row must carry the NIC's groups for older peers; got %v", got)
+			}
+			// One bridge pass, as every node runs every 30s.
+			if err := corrosion.BridgeVMNICs(ctx, host.DB, "app"); err != nil {
+				t.Fatalf("BridgeVMNICs: %v", err)
+			}
+			if chain := nicChain(renderPlan(t, nodePlan(t, host)), tap); !strings.Contains(chain, "tcp dport 443 accept") {
+				t.Errorf("after a hardware bridge pass the hot-attached NIC lost its web rule; chain:\n%s", chain)
+			}
+		})
+	}
+}
+
+// seedCloneSourceWithNIC stages a clonable template on n whose spec has one NIC
+// on sgNet bound to groups. The disk is real because the clone engine is.
+func seedCloneSourceWithNIC(t *testing.T, c *Cluster, n *Node, name string, groups []string) {
+	t.Helper()
+	ctx := context.Background()
+	store := image.NewStore(filepath.Join(c.tmpRoot, n.Name, "data"))
+	if err := store.Init(); err != nil {
+		t.Fatalf("init image store on %s: %v", n.Name, err)
+	}
+	diskPath := store.DiskPath(name, "root")
+	if err := mkdirAll(filepath.Dir(diskPath)); err != nil {
+		t.Fatalf("mkdir disk dir: %v", err)
+	}
+	if err := qcow2.Create(diskPath, 64*1024*1024, nil); err != nil {
+		t.Fatalf("create source qcow2: %v", err)
+	}
+	spec, err := json.Marshal(&pb.VMSpec{Name: name, Cpu: 1, MemoryMib: 512,
+		Network: []*pb.NetworkAttachment{{Name: sgNet, SecurityGroups: groups}}})
+	if err != nil {
+		t.Fatalf("marshal source spec: %v", err)
+	}
+	if err := corrosion.InsertVM(ctx, n.DB,
+		corrosion.VMRecord{Name: name, HostName: n.Name, State: "stopped", IsTemplate: true,
+			Spec: string(spec), CPUActual: 1, MemActual: 512},
+		nil,
+		[]corrosion.DiskRecord{{VMName: name, DiskName: "root", HostName: n.Name, Path: diskPath,
+			SizeBytes: 64 * 1024 * 1024, StorageType: "local"}},
+	); err != nil {
+		t.Fatalf("InsertVM %s: %v", name, err)
+	}
+}
+
+// TestFleet_SG_ClonedNICIsEnforced: a clone of a template whose NIC has a
+// group must come up with that group enforced on its own tap, and its legacy
+// row must carry the group for a peer on an older build. The clone is entered
+// on the other node, so it is forwarded to the template's host.
+func TestFleet_SG_ClonedNICIsEnforced(t *testing.T) {
+	c := sgCluster(t)
+	ctx := context.Background()
+	entry, host := c.Nodes[0], c.Nodes[1]
+	mustCreateSG(t, c, host, "db", "5432")
+	seedCloneSourceWithNIC(t, c, host, "tpl", []string{"db"})
+
+	if _, err := c.SelfClient(entry).CloneVM(ctx, &pb.CloneVMRequest{
+		Source: "tpl", Target: "db1", Start: true,
+	}); err != nil {
+		t.Fatalf("CloneVM: %v", err)
+	}
+	nic := liveNIC(t, host, "db1", sgNet)
+	tap := mustTap(t, host, "db1", nic.MAC)
+	if chain := nicChain(renderPlan(t, nodePlan(t, host)), tap); !strings.Contains(chain, "oifname "+tap+" tcp dport 5432 accept") {
+		t.Errorf("the clone's NIC (tap %s) must carry the db rule; chain:\n%s", tap, chain)
+	}
+	if got := legacyGroups(t, host, "db1", sgNet); len(got) != 1 || got[0] != "db" {
+		t.Errorf("the clone's legacy vm_interfaces row must carry its groups for older peers; got %v", got)
 	}
 }

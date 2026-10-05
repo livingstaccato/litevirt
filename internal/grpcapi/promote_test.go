@@ -106,7 +106,7 @@ func TestPromoteReplica_RenamedPopulatesHardwareTables(t *testing.T) {
 
 	specJSON, _ := json.Marshal(&pb.VMSpec{
 		Name: "vm1", Cpu: 1, MemoryMib: 512,
-		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000"}},
+		Network: []*pb.NetworkAttachment{{Name: "lo", Model: "e1000", SecurityGroups: []string{"web"}}},
 	})
 	if err := corrosion.InsertVM(ctx, s.db,
 		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "running", Spec: string(specJSON)},
@@ -140,6 +140,11 @@ func TestPromoteReplica_RenamedPopulatesHardwareTables(t *testing.T) {
 	if len(ifaces) != 1 || ifaces[0].NetworkName != "lo" {
 		t.Fatalf("vm_interfaces = %+v, want 1 row on lo", ifaces)
 	}
+	// The legacy row carries the NIC's groups: a peer on an older build renders
+	// the NIC's firewall chain from vm_interfaces alone.
+	if got := ifaces[0].SecurityGroups; len(got) != 1 || got[0] != "web" {
+		t.Errorf("vm_interfaces security_groups = %v, want [web]", got)
+	}
 
 	nics, err := corrosion.GetVMNICsRaw(ctx, s.db, "vm_nics", "vm1-promoted")
 	if err != nil {
@@ -147,6 +152,9 @@ func TestPromoteReplica_RenamedPopulatesHardwareTables(t *testing.T) {
 	}
 	if len(nics) != 1 || nics[0].NetworkName != "lo" || nics[0].Model != "e1000" || nics[0].MAC != ifaces[0].MAC {
 		t.Fatalf("vm_nics = %+v, want 1 e1000 row on lo matching vm_interfaces MAC %q", nics, ifaces[0].MAC)
+	}
+	if nics[0].SecurityGroups != `["web"]` {
+		t.Errorf("vm_nics security_groups = %q, want [\"web\"]", nics[0].SecurityGroups)
 	}
 
 	intents, err := corrosion.ListVMPCIIntents(ctx, s.db, "vm1-promoted")

@@ -255,11 +255,13 @@ type LoaderOptions struct {
 }
 
 // CorrosionPlanLoader builds a Plan from the cluster's
-// security_groups + sg_rules + vm_interfaces tables, scoped to the
+// security_groups + sg_rules + vm_nics/vm_interfaces tables, scoped to the
 // current host.
 //
-// Per-NIC bindings come from the vm_interfaces.security_groups column. Each VM
-// interface owned by `hostName` produces a NICBinding on the tap libvirt
+// Per-NIC bindings come from corrosion.ListHostVMNICs: every live NIC in the
+// vm_nics/vm_interfaces overlay, with its groups from its vm_nics row when it
+// has one (a hot-attached NIC has them nowhere else) and from vm_interfaces
+// otherwise. Each VM NIC owned by `hostName` produces a NICBinding on the tap libvirt
 // reports for that NIC's MAC right now (opts.ResolveTap). A NIC whose tap
 // cannot be resolved — its VM is not running, or the NIC is not in the live
 // domain — is skipped: there is no device to filter.
@@ -325,14 +327,14 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 		for _, sg := range plan.SecurityGroups {
 			valid[sg.Name] = true
 		}
-		ifaces, err := corrosion.ListVMInterfacesByHost(ctx, db, hostName)
+		ifaces, err := corrosion.ListHostVMNICs(ctx, db, hostName)
 		if err != nil {
 			return plan, err
 		}
 		plan.NICs = plan.NICs[:0:0]
 		claimed := map[string]string{} // tap → the VM that holds it this pass
 		for _, ifc := range ifaces {
-			tap := resolveVMTap(opts.ResolveTap, ifc.VMName, ifc.MAC)
+			tap := resolveVMTap(opts.ResolveTap, ifc.VMName, ifc.MAC, ifc.VMState)
 			if tap == "" {
 				continue
 			}
@@ -396,14 +398,20 @@ func CorrosionPlanLoader(db *corrosion.Client, hostName string, defaults Plan, o
 
 // resolveVMTap asks libvirt for the tap of one local VM NIC. "" means there is
 // nothing to bind a chain to. A VM that is not running has no tap, which is the
-// common case, so a failed lookup is logged at debug level only.
-func resolveVMTap(resolve TapResolver, vmName, mac string) string {
+// common case and is not worth a warning; a running VM whose NIC libvirt cannot
+// name is, because that NIC may be passing traffic this host cannot filter.
+func resolveVMTap(resolve TapResolver, vmName, mac, vmState string) string {
 	if resolve == nil || mac == "" {
 		return ""
 	}
 	tap, err := resolve(vmName, mac)
 	if err != nil || tap == "" {
-		slog.Debug("firewall: no tap for VM NIC; no chain rendered", "vm", vmName, "mac", mac, "error", err)
+		if vmState == "running" {
+			slog.Warn("firewall: cannot resolve the tap of a running VM's NIC; its security groups are not enforced",
+				"vm", vmName, "mac", mac, "error", err)
+		} else {
+			slog.Debug("firewall: no tap for VM NIC; no chain rendered", "vm", vmName, "mac", mac, "error", err)
+		}
 		return ""
 	}
 	return tap

@@ -365,3 +365,33 @@ func TestFleet_SG_DuplicateNameFailsClosed(t *testing.T) {
 		t.Errorf("bastion binds only the unambiguous ssh group and must be unaffected:\n%s", bc)
 	}
 }
+
+// TestFleet_SG_BindReachesAPostLatchHotAttachedNIC: `lv sg bind` is how an
+// operator pulls a compromised VM into an isolation group. On a NIC
+// hot-attached after the hardware_v2 latch (vm_nics row only) it was a
+// zero-row UPDATE that still answered OK; the chain must change.
+func TestFleet_SG_BindReachesAPostLatchHotAttachedNIC(t *testing.T) {
+	c := sgCluster(t)
+	ctx := context.Background()
+	latchHardwareV2(t, c, gateAll(t, c))
+	entry, host := c.Nodes[0], c.Nodes[1]
+	mustCreateSG(t, c, entry, "web", "443")
+	mustCreateSG(t, c, entry, "isolate", "9")
+	mustCreateNICLessVM(t, c, host, "app")
+	if _, err := c.SelfClient(host).AttachDevice(ctx, &pb.AttachDeviceRequest{
+		VmName: "app", Nic: &pb.NetworkAttachment{Name: sgNet, SecurityGroups: []string{"web"}},
+	}); err != nil {
+		t.Fatalf("AttachDevice: %v", err)
+	}
+	tap := mustTap(t, host, "app", liveNIC(t, host, "app", sgNet).MAC)
+
+	if _, err := c.SelfClient(entry).BindSecurityGroups(ctx, &pb.BindSecurityGroupsRequest{
+		VmName: "app", NetworkName: sgNet, SecurityGroups: []string{"isolate"},
+	}); err != nil {
+		t.Fatalf("BindSecurityGroups: %v", err)
+	}
+	chain := nicChain(renderPlan(t, nodePlan(t, host)), tap)
+	if !strings.Contains(chain, "tcp dport 9 accept") || strings.Contains(chain, "dport 443") {
+		t.Errorf("after binding app's NIC to isolate, its chain must carry isolate and not web:\n%s", chain)
+	}
+}

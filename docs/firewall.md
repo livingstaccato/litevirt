@@ -258,9 +258,10 @@ missing. Recommended order:
   `vm_nics` row, or of its `vm_interfaces` row when it has no `vm_nics` row.
   Compose `network[].security-groups: [web]` persists on VM create, and
   clone, promote, live-restore and NIC hot-attach carry the NIC's groups
-  too; `lv sg bind <vm> --network <net> --sg web` mutates at runtime (it
-  writes `vm_interfaces`, and the hardware bridge carries the change into
-  `vm_nics` within one 30s pass).
+  too; `lv sg bind <vm> --network <net> --sg web` mutates at runtime: it
+  rewrites the NIC's `vm_nics` row (and its `vm_interfaces` row, for peers on
+  an older build), so the next reconcile applies it. A bind naming a network
+  the VM has no NIC on is refused rather than answered OK.
 - **The chain follows the tap libvirt gives the NIC now.** libvirt hands out
   a new `vnetN` on every start, so the tap recorded at create is stale after
   a stop and start, a migration or a failover. Every tick the reconciler asks

@@ -22,6 +22,10 @@ func encodeSGs(sgs []string) (string, error) {
 	return string(b), nil
 }
 
+// DecodeSecurityGroups decodes a stored security_groups column (the JSON list
+// NICRecord.SecurityGroups carries verbatim); empty or invalid returns nil.
+func DecodeSecurityGroups(raw string) []string { return decodeSGs(raw) }
+
 // decodeSGs is the inverse — empty string or invalid JSON returns nil.
 func decodeSGs(raw string) []string {
 	if raw == "" {

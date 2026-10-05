@@ -826,6 +826,10 @@ func (x *DrainHostRequest) GetParallel() int32 {
 	return 0
 }
 
+// One VM's drain result. strategy is how the VM moved, or the move that was
+// tried: MIGRATE_LIVE or MIGRATE_COLD. MIGRATE_NONE means the drain did not
+// try to move it (refused or skipped first; error says why), not the VMSpec
+// "never migrate" policy.
 type DrainProgress struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	VmName        string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`

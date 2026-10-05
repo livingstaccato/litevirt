@@ -158,3 +158,62 @@ func TestDualRun_ContainerCutoverStraddle_IsNotRecorded(t *testing.T) {
 		t.Fatalf("a container on two hosts at gather and re-probe: lifecycle %q, want observed", got)
 	}
 }
+
+// TestDualRun_RecordedDualRunIsNotNarrowedByAFlappingCopy: once a dual run is
+// recorded, a re-probe that misses one copy — a host flapping, or a copy that
+// stops and starts — is not a cutover straddle. Narrowing it would record the
+// pass as clean and resolve a real split brain between sightings, reopening
+// admission while both copies still write. The sighting stands, so the
+// condition is confirmed and stays.
+//
+// Mutation: drop the active-condition check from reprobeMultiHolders — the
+// second pass is clean, the condition is never confirmed and goes red.
+func TestDualRun_RecordedDualRunIsNotNarrowedByAFlappingCopy(t *testing.T) {
+	both := map[string]runtimeSnapshot{
+		"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {diskHolderVMs: []string{"vmA"}},
+	}
+	flapped := map[string]runtimeSnapshot{"h1": {diskHolderVMs: []string{"vmA"}}, "h2": {}}
+	s := dualRunTestServer(t, 2)
+	seedVM(t, s, "vmA", "h1", "running")
+	ctx := context.Background()
+
+	gather, _ := sequencedGather(both, both)
+	s.gatherRuntimeOverride = gather
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunVM, "vmA"); got != corrosion.ConditionObserved {
+		t.Fatalf("first pass: lifecycle %q, want observed", got)
+	}
+
+	for pass := 2; pass <= 4; pass++ {
+		gather, _ := sequencedGather(both, flapped)
+		s.gatherRuntimeOverride = gather
+		s.detectDualRunPass(ctx)
+		if got := condLifecycle(s, kindDualRunVM, "vmA"); got != corrosion.ConditionConfirmed {
+			t.Fatalf("pass %d with a copy missing only at the re-probe: lifecycle %q, want confirmed", pass, got)
+		}
+	}
+	if err := s.checkHostSafety(ctx, "h2", corrosion.WorkloadVM, "vmA", false, false); err == nil {
+		t.Fatal("admission for vmA reopened during a recorded dual run")
+	}
+}
+
+// TestDualRun_RecordedContainerDualRunIsNotNarrowed is the container case.
+func TestDualRun_RecordedContainerDualRunIsNotNarrowed(t *testing.T) {
+	both := map[string]runtimeSnapshot{"h1": {runningCTs: []string{"ctA"}}, "h2": {runningCTs: []string{"ctA"}}}
+	flapped := map[string]runtimeSnapshot{"h1": {runningCTs: []string{"ctA"}}, "h2": {}}
+	s := dualRunTestServer(t, 2)
+	seedContainer(t, s, "ctA", "h1", "running")
+	ctx := context.Background()
+	gather, _ := sequencedGather(both, both)
+	s.gatherRuntimeOverride = gather
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunCT, "ctA"); got != corrosion.ConditionObserved {
+		t.Fatalf("first pass: lifecycle %q, want observed", got)
+	}
+	gather, _ = sequencedGather(both, flapped)
+	s.gatherRuntimeOverride = gather
+	s.detectDualRunPass(ctx)
+	if got := condLifecycle(s, kindDualRunCT, "ctA"); got != corrosion.ConditionConfirmed {
+		t.Fatalf("second pass with a copy missing only at the re-probe: lifecycle %q, want confirmed", got)
+	}
+}

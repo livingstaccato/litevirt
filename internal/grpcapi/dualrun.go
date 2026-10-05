@@ -653,6 +653,13 @@ func (s *Server) detectDualRunPass(ctx context.Context) {
 // state or replicated row can switch this on — and a re-probe that is blind
 // to any involved host (unreachable, partial, older binary) proves nothing,
 // so the first sighting stands.
+//
+// Nor is a workload narrowed while a vm_dual_run / ct_dual_run condition for
+// it is already recorded: a cutover straddles a gather once, but a real dual
+// run with one copy flapping is missed by the re-probe now and then, and
+// narrowing those passes counted them clean and resolved the split brain
+// between sightings, reopening admission while both copies ran. A condition
+// list that cannot be read narrows nothing either.
 func (s *Server) reprobeMultiHolders(ctx context.Context, vmHolders, ctHolders map[string][]string) {
 	involved := map[string]bool{}
 	for _, holders := range []map[string][]string{vmHolders, ctHolders} {
@@ -667,6 +674,11 @@ func (s *Server) reprobeMultiHolders(ctx context.Context, vmHolders, ctHolders m
 	if len(involved) == 0 {
 		return
 	}
+	recorded, err := s.recordedDualRuns(ctx)
+	if err != nil {
+		slog.Warn("dual-run detector: cannot read recorded dual runs; multi-holder sightings stand without a re-probe", "error", err)
+		return
+	}
 	hosts := make([]string, 0, len(involved))
 	for h := range involved {
 		hosts = append(hosts, h)
@@ -674,9 +686,9 @@ func (s *Server) reprobeMultiHolders(ctx context.Context, vmHolders, ctHolders m
 	sort.Strings(hosts)
 	again, _, _ := s.gatherRuntime(ctx, hosts)
 
-	narrow := func(holders map[string][]string, held func(runtimeSnapshot) []string) {
+	narrow := func(kind string, holders map[string][]string, held func(runtimeSnapshot) []string) {
 		for name, hs := range holders {
-			if len(hs) <= 1 {
+			if len(hs) <= 1 || recorded[finding{kind: kind, target: name}] {
 				continue
 			}
 			var still []string
@@ -706,8 +718,29 @@ func (s *Server) reprobeMultiHolders(ctx context.Context, vmHolders, ctHolders m
 			}
 		}
 	}
-	narrow(vmHolders, func(sn runtimeSnapshot) []string { return sn.diskHolderVMs })
-	narrow(ctHolders, func(sn runtimeSnapshot) []string { return sn.runningCTs })
+	narrow(kindDualRunVM, vmHolders, func(sn runtimeSnapshot) []string { return sn.diskHolderVMs })
+	narrow(kindDualRunCT, ctHolders, func(sn runtimeSnapshot) []string { return sn.runningCTs })
+}
+
+// recordedDualRuns is the set of VM and container dual runs this evaluator
+// has recorded and not resolved.
+func (s *Server) recordedDualRuns(ctx context.Context) (map[finding]bool, error) {
+	active, err := corrosion.ListHealthConditions(ctx, s.db, false)
+	if err != nil {
+		return nil, err
+	}
+	out := map[finding]bool{}
+	for _, h := range active {
+		if h.Evaluator != dualRunEvaluator {
+			continue
+		}
+		for _, kind := range []string{kindDualRunVM, kindDualRunCT} {
+			if code, subjectKind := conditionIdentity(kind); h.Code == code && h.SubjectKind == subjectKind {
+				out[finding{kind: kind, target: h.SubjectID}] = true
+			}
+		}
+	}
+	return out, nil
 }
 
 // ctHostName keys a container by the pair the schema keys it by.

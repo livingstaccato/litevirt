@@ -1071,9 +1071,20 @@ func (s *Server) resolveMachineType(name string) string {
 	return lv.MachineTypeFromXML(xml)
 }
 
+// ListVMs returns the VMs the caller may read: each row is authorized against
+// its own RBAC path with vm.read, the check every per-VM write makes with its
+// own verb. A cluster-wide viewer (a root binding, or the legacy role fallback)
+// and a peer under its host certificate still see every VM; a caller whose
+// binding or token scope covers one project sees that project's VMs only.
+// Same shape as ListNetworks.
 func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListVMsResponse, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	// The path-blind floor. requirePermPrecheck, not RequireRole: RequireRole
+	// refuses every scoped token, and the per-row check below is what decides.
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
+	}
+	canRead := func(vm *corrosion.VMRecord) bool {
+		return s.RequirePerm(ctx, vmRBACPath(vm), "vm.read", "viewer") == nil
 	}
 
 	// Keyset pagination (page_size > 0): fetch one extra row to detect a next page
@@ -1094,16 +1105,39 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 		if len(parts) >= 1 {
 			after = parts[0]
 		}
-		vms, err = corrosion.ListVMsPage(ctx, s.db, req.StackName, req.HostName, after, pageSize+1)
-		if err != nil {
-			return nil, status.Errorf(codes.Internal, "list VMs: %v", err)
+		// Filter BEFORE paginating. The cursor is a readable encoding of the
+		// last row's name, so cutting the page from the unfiltered rows would
+		// hand a scoped caller the name of a VM it may not see. Keep reading
+		// until pageSize+1 readable rows or the end of the table.
+		for len(vms) <= pageSize {
+			batch, berr := corrosion.ListVMsPage(ctx, s.db, req.StackName, req.HostName, after, pageSize+1)
+			if berr != nil {
+				return nil, status.Errorf(codes.Internal, "list VMs: %v", berr)
+			}
+			for i := range batch {
+				if canRead(&batch[i]) {
+					vms = append(vms, batch[i])
+				}
+			}
+			if len(batch) < pageSize+1 {
+				break
+			}
+			after = batch[len(batch)-1].Name
 		}
 		if len(vms) > pageSize {
 			vms = vms[:pageSize]
 			resp.NextPageToken = encodePageToken(vms[len(vms)-1].Name)
 		}
-	} else if vms, err = corrosion.ListVMs(ctx, s.db, req.StackName, req.HostName); err != nil {
-		return nil, status.Errorf(codes.Internal, "list VMs: %v", err)
+	} else {
+		all, lerr := corrosion.ListVMs(ctx, s.db, req.StackName, req.HostName)
+		if lerr != nil {
+			return nil, status.Errorf(codes.Internal, "list VMs: %v", lerr)
+		}
+		for i := range all {
+			if canRead(&all[i]) {
+				vms = append(vms, all[i])
+			}
+		}
 	}
 
 	// Batch-load all interfaces in a single query instead of per-VM N+1.
@@ -1211,15 +1245,34 @@ func (s *Server) ListVMs(ctx context.Context, req *pb.ListVMsRequest) (*pb.ListV
 }
 
 func (s *Server) InspectVM(ctx context.Context, req *pb.InspectVMRequest) (*pb.VM, error) {
-	if err := RequireRole(ctx, "viewer"); err != nil {
+	if err := s.requirePermPrecheck(ctx, "viewer"); err != nil {
 		return nil, err
+	}
+	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
+	if err != nil {
+		vm = nil
+	}
+	// vm.read on the VM's own path, as every per-VM write checks its verb.
+	// The answer carries the full stored spec, cloud-init user-data included,
+	// so a viewer floor alone handed every VM in the cluster to a caller scoped
+	// to one project. requirePermResolved, not RequirePerm: a foreign VM and a
+	// name that exists nowhere must answer alike (one PermissionDenied), with a
+	// NotFound only for a caller who could have seen the name anyway. Checked
+	// HERE, before the forward below, because the owner may see the call under
+	// the entry node's host identity.
+	var path string
+	if vm != nil {
+		path = vmRBACPath(vm)
+	}
+	if err := s.requirePermResolved(ctx, vm != nil, path, vmRBACPathFor("", req.Name),
+		"vm.read", "viewer", "vm "+strconv.Quote(req.Name)); err != nil {
+		return nil, err
+	}
+	if vm == nil {
+		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
 	}
 	// Forward to the VM's host so local-only operations (disk size discovery,
 	// VNC port, ARP lookup) work correctly.
-	vm, err := corrosion.GetVM(ctx, s.db, req.Name)
-	if err != nil || vm == nil {
-		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.Name)
-	}
 	if vm.HostName != s.hostName {
 		client, conn, err := s.peerClient(ctx, vm.HostName)
 		if err == nil {

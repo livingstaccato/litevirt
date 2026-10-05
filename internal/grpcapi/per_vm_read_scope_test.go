@@ -577,6 +577,49 @@ func TestGetVMLogs_ClusterWideCallersUnchanged(t *testing.T) {
 	}
 }
 
+// --- backup.read role matrix ---
+
+// TestBackupReadVerb_RoleMatrix confirms backup.read resolves through the
+// real auth engine for exactly the built-in roles that should see a schedule:
+// Admin ("*"), Viewer/Auditor ("*.read") and Operator/BackupOperator
+// ("backup.*") all match; NetworkAdmin, VMOperator and NoAccess — which hold
+// none of those grants — do not. canReadSchedule/canReadVM only ever call
+// RequirePerm with a ".read"-suffixed verb, so this is the one place the verb
+// string itself needs pinning against auth.BuiltinRoles (internal/auth/permissions.go).
+func TestBackupReadVerb_RoleMatrix(t *testing.T) {
+	want := map[string]bool{
+		"Admin": true, "Viewer": true, "Auditor": true, "Operator": true, "BackupOperator": true,
+		"NetworkAdmin": false, "VMOperator": false, "NoAccess": false,
+	}
+	for role, allowed := range want {
+		t.Run(role, func(t *testing.T) {
+			s := testServer(t)
+			ctx := grantUser(t, s, "u-"+role, "/projects/acme", role)
+			got := s.RequirePerm(ctx, "/projects/acme/vms/a1", "backup.read", "viewer") == nil
+			if got != allowed {
+				t.Errorf("role %s: backup.read allowed=%v, want %v", role, got, allowed)
+			}
+		})
+	}
+}
+
+// TestBackupReadVerb_LegacyRoleFallbackUnaffected pins that a cluster with NO
+// RBAC bindings at all (the pre-RBAC "role" column alone) resolves canReadSchedule
+// identically to how RequireRole(ctx, "viewer") always did: a caller whose legacy
+// role is at least viewer passes, full stop, regardless of the schedule's
+// project — because with no bindings RequirePerm/requirePermResolved fall all
+// the way through to the same requireRoleLevel(ctx, fallbackRole) comparison
+// RequireRole itself used. This is also exercised end-to-end by every
+// "legacy-viewer" case in the ClusterWideCallersUnchanged tests above; this test
+// isolates just the verb-resolution step.
+func TestBackupReadVerb_LegacyRoleFallbackUnaffected(t *testing.T) {
+	s := testServer(t) // no authEngine wired at all — the legacy, no-bindings cluster
+	ctx := viewerCtx()
+	if err := s.RequirePerm(ctx, "/projects/someone-elses-project/vms/x", "backup.read", "viewer"); err != nil {
+		t.Errorf("legacy viewer denied backup.read on a foreign path: %v, want nil (cluster-wide, as RequireRole always was)", err)
+	}
+}
+
 func TestGetVMLogs_ExistenceNotLeaked(t *testing.T) {
 	holder, holderLogDir := logsTestServer(t)
 	seedPVRScopedVMs(t, holder)

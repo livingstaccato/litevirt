@@ -114,16 +114,25 @@ host's daemon between them:
 3. **drop-old** — every host trusts the new CA alone; the operator machine
    retires the old one.
 
-Storage migrations keep working throughout, and no host needs a restart. If
-the command stops partway (a host is unreachable), its progress is saved
+Storage migrations keep working throughout, and no host needs a restart.
+Before it starts, the command asks every host's daemon for its migration
+credentials and refuses, changing nothing, unless each holds a complete, valid
+set its daemon can install, trusting this machine's migration CA. A host with
+none needs `lv host install-migration-tls` first; one with an incomplete or
+invalid set, `lv host install-migration-tls --reissue`. A host that cannot
+answer refuses the start too, unless you pass `--force`.
+
+If the command stops partway (a host is unreachable), its progress is saved
 beside the CA; running it again resumes from where it left off rather than
-starting over. That progress — and the new CA while a rotation is in
-progress — lives in `pki_dir` alongside the current CA, in five files:
-`migration-ca.next.crt` / `migration-ca.next.key` (the new CA, key mode 0600),
-`migration-ca.bundle.crt` (the two-certificate trust bundle pushed during
-trust-both), `migration-rotation.json` (phase and per-host progress), and,
-once the rotation finishes, `migration-ca.retired-YYYYMMDD.crt` (the old CA
-certificate, kept for audit; its key is deleted).
+starting over. That state lives in `pki_dir` alongside the current CA:
+`migration-ca.next.crt` / `migration-ca.next.key` (the new CA, key mode 0600)
+and `migration-ca.bundle.crt` (the two-certificate trust bundle pushed during
+trust-both) exist only while a rotation is in progress;
+`migration-rotation.json` (phase and per-host progress) remains after a
+rotation finishes, recording the last one with phase `done`, and is
+overwritten by the next rotation; and `migration-ca.retired-YYYYMMDD.crt`
+(`-2`, `-3`, … for further rotations the same day) is the old CA certificate,
+kept for audit once a rotation finishes; its key is deleted.
 
 `--no-overlap` skips the overlap window entirely: it cuts every host straight
 to the new CA alone in one pass. Use it only when the migration CA key is
@@ -135,6 +144,11 @@ behind instead of stopping the whole run; it keeps the old CA's credentials,
 so migrations with it are refused until you run
 `lv host install-migration-tls --reissue` once it is back.
 
+A rotation already in progress cannot switch to `--no-overlap`: re-run it the
+way it was started and let it finish. If the key is found compromised during
+an overlap rotation, finish that rotation, then immediately run
+`lv host rotate-migration-ca --no-overlap`.
+
 While a rotation is in progress, `lv host add` issues the new node's migration
 credentials from the rotation's new CA, and `lv host install-migration-tls`
 refuses to run at all (reissuing from the old CA would hand out credentials
@@ -143,7 +157,10 @@ the rotation is retiring).
 *If the migration CA key is compromised:*
 
 1. `lv host rotate-migration-ca --no-overlap`
-2. `lv doctor migration-tls` until it exits 0
+2. `lv doctor migration-tls` until it reports no problem other than ones
+   you accept (for example, a host deliberately allowed to fall back to
+   plaintext with `migration.allow_unencrypted_storage`, which keeps it
+   non-zero)
 3. For any host the rotation skipped, `lv host install-migration-tls
    --reissue` once it is back.
 

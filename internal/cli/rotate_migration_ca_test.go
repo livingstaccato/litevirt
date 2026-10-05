@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -791,17 +792,29 @@ func expireMigrationCA(t *testing.T, op string, hosts []*fakeRotHost) string {
 }
 
 // daemonStatus is fakeStatus plus what a real daemon adds for a set that
-// fails validation: its install hook validates first, so install_error
-// repeats the validation error.
+// fails validation: its install hook validates again, separately, and refuses
+// with pki.ErrCredentialsInvalid. That second validation runs at its own
+// moment, here a second after the first, so an expiry's "current time ..."
+// differs between validation_error and install_error, as it can on a daemon.
 func daemonStatus(hosts []*fakeRotHost) MigrationTLSStatusFunc {
 	return func(ctx context.Context) ([]*pb.MigrationTLSHostStatus, error) {
 		rows, err := fakeStatus(hosts)(ctx)
-		for _, r := range rows {
-			if ve := r.GetValidationError(); ve != "" && r.InstallError == "" {
-				r.InstallError = "not installing migration credentials: " + ve
+		if err != nil {
+			return rows, err
+		}
+		for i, r := range rows {
+			if r.GetValidationError() == "" || r.InstallError != "" {
+				continue
+			}
+			dir := pki.MigrationDir(hosts[i].pkiDir)
+			ca, _ := os.ReadFile(filepath.Join(dir, pki.MigrationCAName))
+			cert, _ := os.ReadFile(filepath.Join(dir, pki.MigrationHostCertName))
+			key, _ := os.ReadFile(filepath.Join(dir, pki.MigrationHostKeyName))
+			if _, _, verr := pki.ValidateMigrationCredentials(ca, cert, key, time.Now().Add(time.Second)); verr != nil {
+				r.InstallError = fmt.Errorf("%w: %w", pki.ErrCredentialsInvalid, verr).Error()
 			}
 		}
-		return rows, err
+		return rows, nil
 	}
 }
 
@@ -810,8 +823,10 @@ func daemonStatus(hosts []*fakeRotHost) MigrationTLSStatusFunc {
 // set, so it rotates such a cluster: every host ends trusting only the new CA,
 // with a valid certificate from it.
 //
-// Mutations: put the ValidationError refusal back under --no-overlap, or
-// refuse every install_error under it — the preflight refuses every host.
+// Mutations: put the ValidationError refusal back under --no-overlap, refuse
+// every install_error under it, or classify install_error by
+// strings.Contains(install_error, validation_error) — the preflight refuses
+// every host.
 func TestRotateMigrationCA_NoOverlapRotatesAnExpiredCA(t *testing.T) {
 	op, hosts := provisionedCluster(t, 3)
 	oldFP := expireMigrationCA(t, op, hosts)
@@ -819,6 +834,13 @@ func TestRotateMigrationCA_NoOverlapRotatesAnExpiredCA(t *testing.T) {
 	for _, r := range rows {
 		if !strings.Contains(r.GetValidationError(), "expired") || r.GetInstallError() == "" {
 			t.Fatalf("%s = %+v; want the expired CA to fail validation and installation", r.GetHost(), r)
+		}
+		// The two validations ran a second apart, so their texts differ: the
+		// preflight must classify the install error by its cause, not by
+		// finding validation_error inside it.
+		if strings.Contains(r.GetInstallError(), r.GetValidationError()) {
+			t.Fatalf("%s: install_error %q repeats validation_error verbatim; want different check times",
+				r.GetHost(), r.GetInstallError())
 		}
 	}
 	err := RotateMigrationCA(context.Background(), op, asHosts(hosts), daemonStatus(hosts),

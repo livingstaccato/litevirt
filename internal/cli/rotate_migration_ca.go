@@ -131,7 +131,9 @@ func RotateMigrationCA(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 // three files on every host, and its gate then requires a valid, installable
 // set from the new CA. So under --no-overlap an incomplete or invalid set
 // passes — which is what lets an expired CA be rotated at all — and an install
-// refusal passes only when it is the daemon repeating that validation failure.
+// refusal passes only when its cause is that validation failure
+// (pki.IsCredentialsInvalidText; its text is not compared with
+// validation_error, which comes from a separate validation a second apart).
 // One with another cause (QEMU's user cannot be resolved, /etc/pki/qemu holds
 // someone else's files) survives the new set, so it still refuses. The
 // fingerprint check holds in both modes: a host whose ca.crt is missing cannot
@@ -180,7 +182,7 @@ func preflightRotation(ctx context.Context, pkiDir string, hosts []MigrationTLSH
 		case !slices.ContainsFunc(row.GetTrustedCas(), func(ca *pb.MigrationTLSCA) bool { return ca.GetFingerprint() == curFP }):
 			wrongCA = append(wrongCA, name)
 		case opts.NoOverlap:
-			if ie != "" && (ve == "" || !strings.Contains(ie, ve)) {
+			if ie != "" && !pki.IsCredentialsInvalidText(ie) {
 				problems = append(problems, fmt.Sprintf("%s: its daemon cannot install migration credentials (%s), "+
 					"and a new set will not change that; fix that first", name, ie))
 			}

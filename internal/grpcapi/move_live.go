@@ -108,7 +108,12 @@ func (s *Server) liveMoveVolume(
 	if info, ierr := qcow2.Info(src.Path); ierr == nil && info.VirtualSize > 0 {
 		virtualSize = int64(info.VirtualSize)
 	}
+	// A new file only: preallocate refuses one that exists (AlreadyExists),
+	// so the cleanups below only ever remove what this move created.
 	if err := preallocate(destPath, virtualSize); err != nil {
+		if status.Code(err) == codes.AlreadyExists {
+			return err
+		}
 		return status.Errorf(codes.Internal, "preallocate destination: %v", err)
 	}
 
@@ -354,7 +359,20 @@ func preallocate(path string, virtualSize int64) error {
 	if virtualSize <= 0 {
 		return fmt.Errorf("destination virtual size must be > 0")
 	}
-	return qcow2.Create(path, uint64(virtualSize), nil)
+	if err := refuseExistingFile(path); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".repl-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp) // gone after a successful place
+	if err := qcow2.Create(tmp, uint64(virtualSize), nil); err != nil {
+		return err
+	}
+	return placeNoClobber(tmp, path)
 }
 
 // buildDiskXML produces the small <disk> snippet libvirt's BlockCopy

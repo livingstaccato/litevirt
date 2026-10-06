@@ -57,8 +57,9 @@ func newReplicateVolumeCmd() *cobra.Command {
 		Short: "Copy a VM disk to another pool without disturbing the VM",
 		Long: `Replicate-volume produces a point-in-time copy in target-pool. The VM
 keeps using its source disk; the copy is suitable for off-site DR or
-clone-to-new-VM workflows. Today only file-based pools are supported;
-ZFS / Ceph send-receive primitives land in `,
+clone-to-new-VM workflows. The copy is always a new file the daemon names
+in the pool; --target-path (admin only) names it instead, and an existing
+file is refused, never replaced. Only file-based pools are supported.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
@@ -89,6 +90,6 @@ ZFS / Ceph send-receive primitives land in `,
 		},
 	}
 	cmd.Flags().StringVar(&targetPath, "target-path", "",
-		"Override the destination filename (default: <vm>-<disk>.qcow2 in the pool)")
+		"Name the destination file (admin only; never an existing file). Default: a new <vm>-<disk>-copy-<time>-<id>.qcow2 in the pool")
 	return cmd
 }

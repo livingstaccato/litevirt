@@ -557,6 +557,22 @@ func (s *Server) relayPromote(ctx context.Context, host string, req *pb.PromoteR
 	}
 }
 
+// createOverlayNoClobber creates a qcow2 at path backed by backing, as a new
+// file: built at a temp beside it and placed with RENAME_NOREPLACE.
+func createOverlayNoClobber(path, backing, backingFmt string) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".promote-*.tmp")
+	if err != nil {
+		return status.Errorf(codes.Internal, "create overlay temp: %v", err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp) // gone after a successful place
+	if err := qcow2.CreateWithBackingFormat(tmp, backing, backingFmt, 0, nil); err != nil {
+		return status.Errorf(codes.Internal, "create overlay: %v", err)
+	}
+	return placeNoClobber(tmp, path)
+}
+
 // doPromoteLocal performs the promotion on the host that holds the replica:
 // build a self-contained live disk from the replica, define + start the VM, and
 // persist it. Runs only when this host owns the replica file + libvirt.
@@ -902,6 +918,13 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Skip the (re)build if a prior attempt already built the live disk (and definitely if
 	// it already STARTED the domain off it — rebuilding would overwrite a running VM's disk).
 	if !diskBuilt && !started {
+		// A file already at livePath that this proof did not build is not ours:
+		// targetName is the caller's choice, so in a shared pool the name can be
+		// another VM's disk. Refused before anything is written, and so before
+		// any of the error paths below that remove livePath.
+		if err := refuseExistingFile(livePath); err != nil {
+			return err
+		}
 		if req.NoLocalize {
 			backingFmt := "qcow2"
 			if strings.HasSuffix(replica, ".raw") {
@@ -911,8 +934,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
 				Status: "creating overlay backed by replica (fast; pins the replica)",
 			})
-			if err := qcow2.CreateWithBackingFormat(livePath, replicaPath, backingFmt, 0, nil); err != nil {
-				return status.Errorf(codes.Internal, "create overlay: %v", err)
+			if err := createOverlayNoClobber(livePath, replicaPath, backingFmt); err != nil {
+				return err
 			}
 		} else if !qemuImgAvailable() && strings.HasSuffix(replica, ".raw") {
 			// Localize would convert raw→qcow2, but without qemu-img convertQcow2
@@ -925,8 +948,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
 				Status: "qemu-img unavailable — overlay over raw replica (pins replica; install qemu-img to localize)",
 			})
-			if err := qcow2.CreateWithBackingFormat(livePath, replicaPath, "raw", 0, nil); err != nil {
-				return status.Errorf(codes.Internal, "create overlay over raw replica: %v", err)
+			if err := createOverlayNoClobber(livePath, replicaPath, "raw"); err != nil {
+				return err
 			}
 			slog.Warn("promote: localized via raw-backed overlay (qemu-img absent) — replica is pinned",
 				"vm", targetName, "replica", replica)
@@ -950,9 +973,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				os.Remove(tmpLive)
 				return status.Errorf(codes.Internal, "copy replica: %v", err)
 			}
-			if err := os.Rename(tmpLive, livePath); err != nil {
+			if err := placeNoClobber(tmpLive, livePath); err != nil {
 				os.Remove(tmpLive)
-				return status.Errorf(codes.Internal, "finalize live disk: %v", err)
+				return err
 			}
 		}
 		recordStep("disk_built")

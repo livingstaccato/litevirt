@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"fmt"
-	"path/filepath"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -36,6 +35,13 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	}
 	if req.VmName == "" || req.DiskName == "" || req.TargetPool == "" {
 		return status.Error(codes.InvalidArgument, "vm_name, disk_name, target_pool required")
+	}
+	// Naming the destination is admin only: a global pool is a directory every
+	// project shares, and the copy lands wherever the name points.
+	if req.TargetPath != "" {
+		if err := s.requireAdminTargetPath(ctx); err != nil {
+			return err
+		}
 	}
 
 	unlock := s.lockVM(req.VmName)
@@ -84,43 +90,13 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		return err
 	}
 
-	// prefer native send/recv when the source driver
-	// implements Replicator. Skipped for cross-driver replication
-	// since e.g. zfs send / btrfs receive aren't compatible.
-	if src.StorageType == dstPool.Driver {
-		srcDrv, _ := storage.New(s.dataDir, storage.Config{
-			Driver:  src.StorageType,
-			Source:  src.StorageVolume,
-			Options: dstPool.Options,
-		})
-		if rep := storage.AsReplicator(srcDrv); rep != nil {
-			progress := func(phase pb.ReplicateVolumeProgress_Phase, statusText string) error {
-				return stream.Send(&pb.ReplicateVolumeProgress{
-					Phase:      phase,
-					Status:     statusText,
-					BytesTotal: src.SizeBytes,
-				})
-			}
-			if err := progress(pb.ReplicateVolumeProgress_SNAPSHOT,
-				fmt.Sprintf("native %s send/recv", src.StorageType)); err != nil {
-				return err
-			}
-			if err := rep.Replicate(ctx, storage.ReplicateOptions{
-				SrcRef: src.Path, DstRef: req.TargetPool,
-			}); err != nil {
-				return status.Errorf(codes.Internal, "native replicate: %v", err)
-			}
-			s.recordVMEvent(ctx, req.VmName, "disk.replicated", "ok",
-				fmt.Sprintf("%s → %s", req.DiskName, req.TargetPool))
-			return stream.Send(&pb.ReplicateVolumeProgress{
-				Phase:      pb.ReplicateVolumeProgress_DONE,
-				Status:     "native replication complete",
-				TargetPath: req.TargetPool,
-				BytesTotal: src.SizeBytes,
-			})
-		}
-	}
-
+	// There is no native send/recv branch. The one that was here passed the
+	// target POOL NAME as the receive destination — `zfs recv -F -- <pool>`,
+	// `rbd import-diff - <pool>`, `btrfs receive <pool>` — so a pool named like
+	// a host dataset was force-received over, against the rule that a copy
+	// never replaces what is there. A btrfs disk takes the file copy below;
+	// zfs and ceph are refused until a receive into a fresh, daemon-derived
+	// dataset or image exists.
 	if !isFileBasedDriver(src.StorageType) {
 		return status.Errorf(codes.Unimplemented,
 			"source pool driver %q: replication not yet implemented", src.StorageType)
@@ -147,23 +123,21 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	if err != nil {
 		return status.Errorf(codes.Internal, "resolve target dir: %v", err)
 	}
-	// target_path: empty → the auto-derived "<vm>-<disk>.qcow2" under the pool
-	// dir; a bare filename is contained under the pool dir; a custom absolute
-	// path is admin-only (same policy as restore destinations).
+	// The destination is a new file: daemon-named
+	// ("<vm>-<disk>-copy-<time>-<id>.qcow2") unless an admin named it, and
+	// never one that exists. The old fixed "<vm>-<disk>.qcow2" was also the
+	// name of other disks in a shared pool (VM "a" disk "b-root" against VM
+	// "a-b" disk "root"), and qemu-img convert writes over what it is given.
 	var dstPath string
 	if req.TargetPath == "" {
-		dstPath = filepath.Join(dstDir, fmt.Sprintf("%s-%s.qcow2", req.VmName, req.DiskName))
-	} else {
-		dstPath, err = s.resolveRestoreTarget(ctx, req.TargetPath, dstDir)
-		if err != nil {
+		if dstPath, err = derivedDiskFile(dstDir, req.VmName, req.DiskName, "copy", ".qcow2"); err != nil {
 			return err
 		}
+	} else if dstPath, err = s.resolveAdminTarget(ctx, req.TargetPath, dstDir); err != nil {
+		return err
 	}
 	if dstPath == src.Path {
 		return status.Error(codes.FailedPrecondition, "source and destination resolve to the same path")
-	}
-	if err := refuseSymlinkTarget(dstPath); err != nil {
-		return err
 	}
 
 	send := func(p *pb.ReplicateVolumeProgress) error {
@@ -187,8 +161,8 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 			BytesCopied: p.BytesCopied,
 		})
 	}
-	if err := convertQcow2(ctx, src.Path, dstPath, emit); err != nil {
-		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
+	if err := copyNoClobber(ctx, src.Path, dstPath, emit); err != nil {
+		return err
 	}
 
 	s.recordVMEvent(ctx, req.VmName, "disk.replicated", "ok",

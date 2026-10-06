@@ -269,9 +269,20 @@ volumes**) and over REST (`POST /api/v1/stacks/{name}/migrate-volumes`, SSE).
 lv replicate-volume web-1 root dr-pool
 ```
 
-**Native send/recv** — when the source driver implements the
-`Replicator` interface, replication uses the backend's native
-primitive instead of qemu-img convert:
+The copy is always a **new** file in the target pool, named by the daemon —
+`<vm>-<disk>-copy-<time>-<id>.qcow2` — and reported on the DONE line. A pool
+can be shared by every project, so the old fixed `<vm>-<disk>.qcow2` could be
+another VM's disk (VM `a` disk `b-root` against VM `a-b` disk `root`), and the
+copy wrote over it. `--target-path` names the file instead; it requires the
+**admin** role (`storage.hostpath`), and an existing file there is refused with
+`AlreadyExists`, never replaced.
+
+**Native send/recv is not wired into `replicate-volume`.** The drivers below
+implement the `Replicator` interface, but the RPC used to pass the target
+*pool name* as the receive destination (`zfs recv -F -- <pool>`), which
+force-receives over whatever dataset carries that name. Until a receive into
+a fresh, daemon-derived dataset or image exists, a btrfs disk takes the file
+copy and a zfs or ceph disk is refused. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when
@@ -295,7 +306,7 @@ consistency is a planned follow-up.
 | Move (offline) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Move (live) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Replicate via qemu-img | ✓ | ✓ | ✓ | ✓ | fallback | fallback | — | — |
-| Native send / receive | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export-diff | n/a | n/a |
+| Native send / receive (driver only; not used by `replicate-volume`) | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export-diff | n/a | n/a |
 | HA-friendly cluster store | no | yes | depends | no (host-local) | no (host-local) | yes | yes | no |
 
 The **Snapshots** row describes each backend's *native* snapshot capability

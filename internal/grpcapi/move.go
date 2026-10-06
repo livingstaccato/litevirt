@@ -241,9 +241,12 @@ func (s *Server) moveOneVolume(
 		}); err != nil {
 			return err
 		}
-		if err := convertQcow2(ctx, src.Path, dstPath, emit); err != nil {
-			_ = os.Remove(dstPath) // best-effort cleanup of partial output
-			return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
+		// A new file, never one already there: in a shared pool the derived
+		// "<vm>-<disk>.qcow2" can be another VM's disk (VM "a" disk "b-root"
+		// against VM "a-b" disk "root"). A failed copy leaves nothing at
+		// dstPath, so nothing here removes a file this move did not create.
+		if err := copyNoClobber(ctx, src.Path, dstPath, emit); err != nil {
+			return err
 		}
 		if cs == cutoverRedefined {
 			// The stopped VM must be redefined or it fails to start with "Cannot access
@@ -826,6 +829,27 @@ func convertQcow2(ctx context.Context, src, dst string, emit func(*pb.MoveVolume
 		return err
 	}
 	return nil
+}
+
+// copyNoClobber converts src into a NEW file at dst: into a temp beside dst,
+// then placed with RENAME_NOREPLACE. An existing dst — a file, a symlink, a
+// disk another VM uses — is refused with AlreadyExists, never written through,
+// and a failed copy leaves nothing at dst.
+func copyNoClobber(ctx context.Context, src, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	if err := refuseExistingFile(dst); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(dst), ".repl-*.tmp")
+	if err != nil {
+		return status.Errorf(codes.Internal, "create copy temp: %v", err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp) // gone after a successful place
+	if err := convertQcow2(ctx, src, tmp, emit); err != nil {
+		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
+	}
+	return placeNoClobber(tmp, dst)
 }
 
 // parseQemuImgProgress extracts "    (12.34/100%)" → 12.34. Returns -1

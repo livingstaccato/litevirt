@@ -582,7 +582,9 @@ message ReplicateVolumeRequest {
     string vm_name      = 1;
     string disk_name    = 2;
     string target_pool  = 3;
-    // target_path overrides the auto-derived "<vm>-<disk>.qcow2" filename.
+    // target_path names the destination file instead of the daemon-derived
+    // "<vm>-<disk>-copy-<time>-<id>.qcow2". Admin only, and never an existing
+    // file.
     string target_path  = 4;
 }
 message ReplicateVolumeProgress {

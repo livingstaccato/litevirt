@@ -6306,7 +6306,9 @@ type ReplicateVolumeRequest struct {
 	VmName     string                 `protobuf:"bytes,1,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
 	DiskName   string                 `protobuf:"bytes,2,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
 	TargetPool string                 `protobuf:"bytes,3,opt,name=target_pool,json=targetPool,proto3" json:"target_pool,omitempty"`
-	// target_path overrides the auto-derived "<vm>-<disk>.qcow2" filename.
+	// target_path names the destination file instead of the daemon-derived
+	// "<vm>-<disk>-copy-<time>-<id>.qcow2". Admin only, and never an existing
+	// file.
 	TargetPath    string `protobuf:"bytes,4,opt,name=target_path,json=targetPath,proto3" json:"target_path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

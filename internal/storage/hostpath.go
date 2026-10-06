@@ -114,11 +114,11 @@ var systemRoots = []string{
 const litevirtVarLibPrefix = "litevirt"
 
 // dataDirPoolAreas are the only parts of the daemon's data directory a pool
-// may live in: disks/ is the default local pool, mounts/ holds the NFS mounts
-// the daemon makes itself, pools/<name> is a target-less local pool's own
-// directory. Everything else there is the daemon's own state
+// may live in: mounts/ holds the NFS mounts the daemon makes itself, and
+// pools/<name> is a target-less local pool's own directory. disks/ is not one:
+// it holds every VM's local disks, across projects, and no pool shares it. Everything else there is the daemon's own state
 // (state.db, pki, images, the audit assertion file, …).
-var dataDirPoolAreas = []string{"disks", "mounts", "pools"}
+var dataDirPoolAreas = []string{"mounts", "pools"}
 
 // CheckWriteRoot refuses a directory no pool may write into: a relative path,
 // the filesystem root, anything under a system directory, the daemon's PKI
@@ -161,7 +161,7 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dataDir)
 				}
 				if within(d, cand) && !inPoolArea(d, cand) {
-					return fmt.Errorf("%q is inside the daemon's data directory %s; only its disks/ and mounts/ hold pools", p, dataDir)
+					return fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/ and mounts/ hold pools", p, dataDir)
 				}
 			}
 		}
@@ -276,6 +276,7 @@ func inAnyPoolArea(dataDir, p string) bool {
 var (
 	nfsSourceRe   = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\]):/[^\s,]*$`)
 	cephNameRe    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
+	cephPoolRe    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*(/[A-Za-z0-9_][A-Za-z0-9_.-]*)?$`) // pool[/namespace]
 	zfsDatasetRe  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:-]*(/[A-Za-z0-9_][A-Za-z0-9_.:-]*)*$`)
 	lvmNameRe     = regexp.MustCompile(`^[A-Za-z0-9_+.][A-Za-z0-9_+.-]*$`)
 	iscsiTargetRe = regexp.MustCompile(`^(?i:iqn|eui|naa)\.[A-Za-z0-9.:_-]+$`)
@@ -299,8 +300,8 @@ func ValidateSource(cfg Config) error {
 			return bad("nfs source", src, "server:/export")
 		}
 	case "ceph":
-		if !cephNameRe.MatchString(src) {
-			return bad("ceph pool", src, "a pool name")
+		if !cephPoolRe.MatchString(src) {
+			return bad("ceph pool", src, "a pool[/namespace] name")
 		}
 		if id := cfg.Options["id"]; id != "" && !cephNameRe.MatchString(id) {
 			return bad("ceph id", id, "a client name")

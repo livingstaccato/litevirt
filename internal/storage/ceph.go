@@ -136,7 +136,7 @@ func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) error
 		snap = "litevirt-" + nowSnapTag()
 	}
 	srcSnapSpec := opts.SrcRef + "@" + snap
-	if out, err := exec.CommandContext(ctx, "rbd", d.rbdArgs("snap", "create", srcSnapSpec)...).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "rbd", d.rbdArgs("snap", "create", "--", srcSnapSpec)...).CombinedOutput(); err != nil {
 		return fmt.Errorf("rbd snap create %s: %w: %s", srcSnapSpec, err, out)
 	}
 
@@ -144,8 +144,8 @@ func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) error
 	if opts.Incremental {
 		sendArgs = append(sendArgs, "--from-snap", "litevirt-replicate-prev")
 	}
-	sendArgs = append(sendArgs, srcSnapSpec, "-")
-	recvArgs := []string{"import-diff", "-", opts.DstRef}
+	sendArgs = append(sendArgs, "--", srcSnapSpec, "-")
+	recvArgs := []string{"import-diff", "--", "-", opts.DstRef}
 
 	if _, err := pipeCmds(ctx, opts.SSHTarget, "rbd", sendArgs, "rbd", recvArgs); err != nil {
 		return fmt.Errorf("ceph replicate %s → %s: %w", opts.SrcRef, opts.DstRef, err)

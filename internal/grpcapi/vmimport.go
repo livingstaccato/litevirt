@@ -689,10 +689,15 @@ func (s *Server) importPoolDir(ctx context.Context, pool string) (string, error)
 	if !ok {
 		return "", status.Errorf(codes.NotFound, "storage pool %q not found", pool)
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, ref)
-	if err != nil {
+	if !isFileBasedDriver(ref.Driver) {
 		return "", status.Errorf(codes.FailedPrecondition,
 			"pool %q (driver %q) is not file-backed; VM import targets file pools (local/dir/nfs/btrfs) only", pool, ref.Driver)
+	}
+	// The same write check as every other write into a pool, and an NFS
+	// export mounted (hardened) first — never a bare mount point.
+	dir, err := s.poolDirForWrite(ctx, pool, ref)
+	if err != nil {
+		return "", err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", status.Errorf(codes.Internal, "prepare pool dir: %v", err)

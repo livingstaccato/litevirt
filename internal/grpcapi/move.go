@@ -162,7 +162,7 @@ func (s *Server) moveOneVolume(
 	// Resolve the destination directory. We piggyback on the storage
 	// driver's Prepare to ensure it's mounted/ready, then derive a
 	// per-VM filename.
-	if err := s.checkPoolForWrite(targetPool, dstPool); err != nil {
+	if err := s.checkPoolForWrite(ctx, targetPool, dstPool); err != nil {
 		return err
 	}
 	drv, err := storage.New(s.dataDir, storage.Config{

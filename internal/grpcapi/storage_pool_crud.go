@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
+	"strings"
 	"syscall"
 
 	"google.golang.org/grpc/codes"
@@ -110,13 +112,31 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return client.CreateStoragePool(ctx, req)
 	}
 
-	// A new target-less local pool gets a directory of its own rather than the
-	// shared <data_dir>/disks, where its content operations would reach every
-	// local VM disk on the host. A row that already exists target-less (created
-	// before this) keeps its directory; its content operations skip files that
-	// live disks use.
-	if req.Driver == "local" && req.Target == "" && !(found && existing.Target == "") {
+	// A target-less local pool gets a directory of its own, never the shared
+	// <data_dir>/disks that holds every VM's local disks across projects.
+	if req.Driver == "local" && req.Target == "" {
 		req.Target = localPoolDir(s.dataDir, req.Name)
+		// A directory left by an earlier pool of this name (in any project)
+		// is not handed to this one with its files in it.
+		if !(found && existing.Target == req.Target) {
+			if left := dirEntriesSample(req.Target, 5); len(left) > 0 {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"pool %q: %s already holds files from an earlier pool (%s); an admin must remove them first",
+					req.Name, req.Target, strings.Join(left, ", "))
+			}
+		}
+	}
+	// Every pool has a directory of its own: never one another pool uses.
+	if isFileBasedDriver(req.Driver) {
+		if dir, derr := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target}); derr == nil {
+			other, err := s.poolDirSharedWith(ctx, req.Name, dir)
+			if err != nil {
+				return nil, status.Errorf(codes.Internal, "check for a shared directory: %v", err)
+			}
+			if other != "" {
+				return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already pool %q's directory; every pool needs its own", req.Name, dir, other)
+			}
+		}
 	}
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,
@@ -225,6 +245,17 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, err
 	}
 
+	// A pool's own <data_dir>/pools/<name> goes with it — but never with files
+	// in it: the next pool of this name, in any project, would inherit them.
+	ownDir := ""
+	if (rec.Driver == "local" || rec.Driver == "") && rec.Target == localPoolDir(s.dataDir, rec.Name) {
+		ownDir = rec.Target
+		if left := dirEntriesSample(ownDir, 5); len(left) > 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"pool %q still holds files in %s (%s); delete them first", req.Name, ownDir, strings.Join(left, ", "))
+		}
+	}
+
 	// Driver teardown (unmount NFS / log out of iSCSI) is best-effort about ERRORS
 	// — an operator who hit delete wants the pool gone from inventory even if
 	// cleanup is incomplete — but its refcount PREDICATES are hard guards (never
@@ -245,6 +276,11 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	s.removeStoragePoolRef(req.Name)
+	if ownDir != "" {
+		if err := os.Remove(ownDir); err != nil && !os.IsNotExist(err) {
+			slog.Warn("storage pool directory not removed", "pool", req.Name, "dir", ownDir, "error", err)
+		}
+	}
 	s.audit(ctx, "storage.pool.delete", req.Name, fmt.Sprintf("force=%t", req.Force), "ok")
 	slog.Info("storage pool deleted", "host", host, "name", req.Name)
 	return &pb.DeleteStoragePoolResponse{}, nil

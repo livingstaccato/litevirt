@@ -40,7 +40,7 @@ lv pool create warm \
 lv pool ls
 # HOST       NAME    DRIVER  SOURCE                                  TARGET                  STATE
 # host-a     warm    nfs     nas.internal:/srv/exports/litevirt      /mnt/litevirt-warm      active
-# host-a     default local                                           /var/lib/litevirt/disks active
+# host-a     default local                                           /var/lib/litevirt/pools/default active
 
 lv pool inspect warm
 lv pool delete warm
@@ -93,18 +93,23 @@ an absolute path for btrfs, nothing for local and dir — so no value can reach
 `mount`, `rbd`, `zfs`, `lvs` or `iscsiadm` as an option. The drivers also put
 `--` before positional arguments.
 
-NFS pools are always mounted `nosuid,nodev,noexec`, whatever `options=` says,
-and `nosymfollow` where the kernel supports it (Linux 5.10+); without it the
-daemon logs a WARN and mounts without. Disk files the daemon creates in a pool
-are created exclusively and never through a symlink.
+NFS pools are always mounted `nosuid,nodev,noexec,nosymfollow`, whatever
+`options=` says. `nosymfollow` needs Linux 5.10+ and a mount.nfs that passes
+it on; where it is missing the mount is refused, with an error saying so, rather
+than made weaker. An export that is already mounted without these flags — mounted
+by hand, or by an earlier build — is never remounted: the pool is refused
+(nothing lists, reads or writes it) and the daemon logs an ERROR at start and
+on each refusal, until the export is unmounted and litevirt mounts it again. Disk files the daemon creates in a pool
+are created exclusively and never through a symlink. Pool names may not start
+with `-`.
 
 Some directories are refused to everyone, `Admin` included: the filesystem
 root; anything under `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib*`,
 `/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr`, `/var/lib/libvirt`,
 `/var/run` or `/var/spool`; `/var/lib/litevirt` and any `/var/lib/litevirt-*`;
 the daemon's PKI directory; the data directory and any directory containing
-it; and anything inside the data directory other than its `disks/`, `mounts/`
-and `pools/` areas. The list is a backstop, not exhaustive: `/opt`, `/srv`,
+it; and anything inside the data directory other than its `mounts/` and
+`pools/` areas (`disks/` included). The list is a backstop, not exhaustive: `/opt`, `/srv`,
 `/var/log` and `/var/tmp` are left to the admin who names them. A target
 is judged both as written and after resolving symlinks, so a link at an
 innocent name does not reach a refused directory. Authority is checked on the
@@ -124,19 +129,32 @@ with an image-like extension — `.iso .img .qcow2 .qcow .raw .vmdk .vdi .vhd
 not start with `.`. It never replaces anything already at the name, file or
 symlink: delete the old file first.
 
-Content operations never reach a file a live VM disk uses. A pool listing
-leaves out files that a live disk of another pool (or of no pool) uses, and a
-content delete refuses any file a live disk uses, as its own file or as a
-backing file. This matters for a target-less `local` pool created before pools
-got their own directories: it shares `<data_dir>/disks` with every local VM
-disk on the host.
+Every pool has a directory of its own. A target-less `local` pool — the
+built-in `default` pool included — gets `<data_dir>/pools/<name>`, never
+`<data_dir>/disks`, which holds every VM's local disks across projects.
+Deleting the pool removes that directory, and is refused while it still holds
+files (the error names them). Creating a pool whose `<data_dir>/pools/<name>`
+already holds files left by an earlier pool is refused until an admin removes
+them. A pool is never created on a directory another pool on the host already
+uses, and a pool row that shares its directory with another, or sits on
+`<data_dir>/disks`, is refused for everything — listing included — with
+`FailedPrecondition` saying to recreate it.
+
+Content operations never reach a file a live VM disk uses: a listing leaves
+out files a live disk of another pool uses, and a content delete refuses any
+file a live disk uses, as its own file or as a backing file.
 
 A pool created before these checks whose directory or source is now refused
-keeps listing its contents, but nothing writes into it: uploads, content
-deletes, new VM disks, volume moves and replicas onto it, replica increments
-and promotes are refused with `FailedPrecondition`, it is never re-mounted for
-them, and the daemon logs an ERROR naming the pool. Nothing is moved or deleted
-for you: recreate the pool somewhere allowed and move its disks there.
+is refused for everything — listing, reads and writes: uploads, content deletes, new VM disks,
+volume moves and replicas onto it (native send/recv included), replica
+increments, promotes and VM imports are refused with `FailedPrecondition`, it
+is never re-mounted for them, and the daemon logs an ERROR naming the pool.
+Nothing is moved or deleted for you: recreate the pool somewhere allowed and
+move its disks there.
+
+During a rolling upgrade, a request that enters through a node still on an
+older build reaches the pool's host as a cluster peer, which is trusted; the
+authority checks above hold only once every node runs this release.
 
 ## Compose example
 

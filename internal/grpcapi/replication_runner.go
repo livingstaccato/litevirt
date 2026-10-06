@@ -178,7 +178,7 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 	if !isFileBasedDriver(dstPool.Driver) {
 		return fmt.Errorf("target pool %q driver %q is not file-based", sched.TargetPool, dstPool.Driver)
 	}
-	if err := s.checkPoolForWrite(sched.TargetPool, dstPool); err != nil {
+	if err := s.checkPoolForWrite(ctx, sched.TargetPool, dstPool); err != nil {
 		return err
 	}
 	drv, err := storage.New(s.dataDir, storage.Config{
@@ -438,7 +438,7 @@ func (s *Server) applyIncrementLocal(ctx context.Context, pool, newName, base st
 	if !ok {
 		return fmt.Errorf("pool %q not on host %q", pool, s.hostName)
 	}
-	dir, err := s.poolDirForWrite(pool, poolRef)
+	dir, err := s.poolDirForWrite(ctx, pool, poolRef)
 	if err != nil {
 		return err
 	}

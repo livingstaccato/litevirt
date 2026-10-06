@@ -78,7 +78,14 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		// Block-backed pool: no browsable file directory.
 		return &pb.ListStoragePoolContentsResponse{}, nil
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
+	// A refused pool — a directory no pool may use, one shared with another
+	// pool, a weak NFS mount — is not even listed: its directory may be
+	// /root/.ssh, the daemon's state, or another project's disks.
+	if err := s.checkPoolForWrite(ctx, rec.Name, ref); err != nil {
+		return nil, err
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, ref)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
@@ -103,7 +110,7 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		// A file a live disk of another pool (or of no pool) uses is not this
 		// pool's content: a legacy target-less local pool shares <data_dir>/disks
 		// with every local VM disk on the host. Unknown ownership hides it.
-		owners, oerr := s.liveDiskOwners(ctx, filepath.Join(dir, name))
+		owners, oerr := s.liveDiskOwners(ctx, s.hostName, filepath.Join(dir, name))
 		if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != req.PoolName }) {
 			continue
 		}
@@ -158,7 +165,7 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if !isFileBasedDriver(rec.Driver) {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", req.PoolName)
 	}
-	dir, err := s.poolWriteDir(rec)
+	dir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +175,7 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	}
 	// Never a file a live disk uses — this pool's or, in a directory shared
 	// with other disks, anyone's.
-	owners, err := s.liveDiskOwners(ctx, target)
+	owners, err := s.liveDiskOwners(ctx, s.hostName, target)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check disk use: %v", err)
 	}
@@ -263,7 +270,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if !isFileBasedDriver(rec.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
 	}
-	dir, err := s.poolWriteDir(rec)
+	dir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
 		return err
 	}

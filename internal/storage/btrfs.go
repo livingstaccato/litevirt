@@ -75,7 +75,7 @@ func (d *btrfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) erro
 	}
 	snapPath := opts.SrcRef + "-" + tag
 	if out, err := exec.CommandContext(ctx,
-		"btrfs", "subvolume", "snapshot", "-r", opts.SrcRef, snapPath,
+		"btrfs", "subvolume", "snapshot", "-r", "--", opts.SrcRef, snapPath,
 	).CombinedOutput(); err != nil {
 		return fmt.Errorf("btrfs snapshot %s: %w: %s", snapPath, err, out)
 	}
@@ -85,9 +85,9 @@ func (d *btrfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) erro
 	if opts.Incremental && pathExists(prev) {
 		sendArgs = append(sendArgs, "-p", prev)
 	}
-	sendArgs = append(sendArgs, snapPath)
+	sendArgs = append(sendArgs, "--", snapPath)
 
-	recvArgs := []string{"receive", opts.DstRef}
+	recvArgs := []string{"receive", "--", opts.DstRef}
 	if _, err := pipeCmds(ctx, opts.SSHTarget, "btrfs", sendArgs, "btrfs", recvArgs); err != nil {
 		return fmt.Errorf("btrfs replicate: %w", err)
 	}

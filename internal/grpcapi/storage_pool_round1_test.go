@@ -159,6 +159,8 @@ func TestPoolContents_ProjectCannotReachAnotherProjectsDisks(t *testing.T) {
 		}
 	})
 
+	// Round 2: a pool on the shared <data_dir>/disks (created before pools got
+	// their own directories) is refused outright — listing included.
 	t.Run("legacy shared pool", func(t *testing.T) {
 		if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
 			HostName: s.hostName, Name: "shared", Driver: "local", Project: "acme", State: "active",
@@ -169,28 +171,18 @@ func TestPoolContents_ProjectCannotReachAnotherProjectsDisks(t *testing.T) {
 		if err := os.WriteFile(own, []byte("iso"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		resp, err := s.ListStoragePoolContents(pat, &pb.ListStoragePoolContentsRequest{PoolName: "shared"})
-		if err != nil {
-			t.Fatalf("list: %v", err)
+		if _, err := s.ListStoragePoolContents(pat, &pb.ListStoragePoolContentsRequest{PoolName: "shared"}); status.Code(err) != codes.FailedPrecondition {
+			t.Errorf("listing the shared pool: got %v, want FailedPrecondition", err)
 		}
-		var sawOwn bool
-		for _, c := range resp.Contents {
-			if c.Name == "bvm-root.qcow2" {
-				t.Errorf("another project's live disk is listed in the shared pool")
+		for _, f := range []string{"bvm-root.qcow2", "installer.iso"} {
+			if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "shared", Filename: f}); status.Code(err) != codes.FailedPrecondition {
+				t.Errorf("deleting %s: got %v, want FailedPrecondition", f, err)
 			}
-			sawOwn = sawOwn || c.Name == "installer.iso"
 		}
-		if !sawOwn {
-			t.Errorf("unowned content is no longer listed")
-		}
-		if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "shared", Filename: "bvm-root.qcow2"}); status.Code(err) != codes.FailedPrecondition {
-			t.Errorf("deleting a live disk: got %v, want FailedPrecondition", err)
-		}
-		if _, err := os.Stat(theirs); err != nil {
-			t.Fatalf("another project's live disk was deleted: %v", err)
-		}
-		if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "shared", Filename: "installer.iso"}); err != nil {
-			t.Errorf("deleting unowned content: %v", err)
+		for _, p := range []string{theirs, own} {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("%s was deleted: %v", filepath.Base(p), err)
+			}
 		}
 	})
 }

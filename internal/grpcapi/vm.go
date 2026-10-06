@@ -3576,7 +3576,7 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	if pool, ok := s.resolvePool(ctx, volumeName); ok {
 		// The disk is created there: a pool created before the directory and
 		// source checks must not take one (nor be re-mounted for it).
-		if err := s.checkPoolForWrite(volumeName, pool); err != nil {
+		if err := s.checkPoolForWrite(ctx, volumeName, pool); err != nil {
 			return storage.Config{}, err
 		}
 		return storage.Config{

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,9 +50,9 @@ func TestNFSMountIsHardened(t *testing.T) {
 	}
 }
 
-// A kernel without nosymfollow refuses it; the mount is retried without it
-// (the rest of the hardening stays) rather than failing every NFS pool.
-func TestNFSMountFallsBackWithoutNosymfollow(t *testing.T) {
+// nosymfollow is required. A kernel or mount.nfs that refuses it gets no NFS
+// pool: the mount fails with a message naming why, and is not retried weaker.
+func TestNFSMountRequiresNosymfollow(t *testing.T) {
 	var mounts []string
 	d := &nfsDriver{source: "server:/export", targetOverride: t.TempDir(), opts: map[string]string{},
 		run: func(_ context.Context, cmd string, args ...string) ([]byte, error) {
@@ -64,11 +65,83 @@ func TestNFSMountFallsBackWithoutNosymfollow(t *testing.T) {
 			}
 			return nil, nil
 		}}
-	if err := d.Prepare(context.Background()); err != nil {
-		t.Fatalf("Prepare: %v", err)
+	err := d.Prepare(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "nosymfollow") {
+		t.Fatalf("Prepare = %v, want a refusal naming nosymfollow", err)
 	}
-	if len(mounts) != 2 || strings.Contains(mounts[1], "nosymfollow") || !strings.Contains(mounts[1], "nosuid,nodev,noexec") {
-		t.Fatalf("mounts = %q, want a retry without nosymfollow keeping the rest", mounts)
+	if len(mounts) != 1 {
+		t.Fatalf("mounts = %q, want exactly one attempt and no weaker retry", mounts)
+	}
+}
+
+// fakeMountInfo makes mountFlags see dir → per-mount options.
+func fakeMountInfo(t *testing.T, mounts map[string]string) *map[string]string {
+	t.Helper()
+	cur := mounts
+	prev := readMountInfo
+	readMountInfo = func() ([]byte, error) {
+		var b strings.Builder
+		i := 100
+		for dir, opts := range cur {
+			fmt.Fprintf(&b, "%d 1 0:50 / %s %s shared:1 - nfs4 srv:/x rw\n", i, strings.ReplaceAll(dir, " ", "\\040"), opts)
+			i++
+		}
+		return []byte(b.String()), nil
+	}
+	t.Cleanup(func() { readMountInfo = prev })
+	return &cur
+}
+
+// An export already mounted without the hardening (by hand, or by an earlier
+// build) is refused, not remounted: Prepare fails and runs no mount command.
+func TestNFSExistingWeakMountIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flags   string
+		wantErr bool
+	}{
+		{"weak mount", "rw,relatime", true},
+		{"missing only nosymfollow", "rw,nosuid,nodev,noexec", true},
+		{"hardened mount", "rw,nosuid,nodev,noexec,nosymfollow,relatime", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			fakeMountInfo(t, map[string]string{dir: tc.flags})
+			var other []string
+			d := &nfsDriver{source: "server:/export", targetOverride: dir, opts: map[string]string{},
+				run: func(_ context.Context, cmd string, args ...string) ([]byte, error) {
+					if cmd != "mountpoint" {
+						other = append(other, cmd+" "+strings.Join(args, " "))
+					}
+					return nil, nil // mounted
+				}}
+			err := d.Prepare(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Prepare = %v, wantErr %v", err, tc.wantErr)
+			}
+			if len(other) != 0 {
+				t.Fatalf("ran %q on an existing mount; nothing is remounted", other)
+			}
+		})
+	}
+}
+
+// CheckNFSMountHardened — the pool check and the daemon-start report — refuses
+// a weak existing mount and passes an unmounted pool (Prepare mounts it).
+func TestCheckNFSMountHardened(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{Driver: "nfs", Source: "server:/export", Target: dir}
+	mi := fakeMountInfo(t, map[string]string{dir: "rw"})
+	if err := CheckNFSMountHardened(t.TempDir(), cfg); err == nil {
+		t.Fatalf("a weak mount was accepted")
+	}
+	(*mi)[dir] = "rw,nosuid,nodev,noexec,nosymfollow"
+	if err := CheckNFSMountHardened(t.TempDir(), cfg); err != nil {
+		t.Fatalf("a hardened mount: %v", err)
+	}
+	delete(*mi, dir)
+	if err := CheckNFSMountHardened(t.TempDir(), cfg); err != nil {
+		t.Fatalf("an unmounted pool: %v", err)
 	}
 }
 

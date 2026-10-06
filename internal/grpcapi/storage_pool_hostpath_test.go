@@ -196,6 +196,7 @@ func TestPoolHostPath_ProtectedDirectoriesAreRefusedEvenToAdmin(t *testing.T) {
 		"nfs mounted over etc":      {Driver: "nfs", Source: "nas:/x", Target: "/etc"},
 		"btrfs under usr":           {Driver: "btrfs", Source: "/usr/local/vm"},
 		"nfs source deriving ..":    {Driver: "nfs", Source: ".."},
+		"data dir disks":            {Driver: "dir", Target: filepath.Join(s.dataDir, "disks")},
 	}
 	for name, req := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -207,15 +208,15 @@ func TestPoolHostPath_ProtectedDirectoriesAreRefusedEvenToAdmin(t *testing.T) {
 		})
 	}
 
-	// The daemon's own pool areas stay usable.
-	disks := filepath.Join(s.dataDir, "disks")
-	if err := os.MkdirAll(disks, 0o755); err != nil {
+	// The daemon's own pool area stays usable.
+	own := filepath.Join(s.dataDir, "pools", "elsewhere")
+	if err := os.MkdirAll(own, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{
-		Name: "default2", Driver: "dir", Target: disks,
+		Name: "default2", Driver: "dir", Target: own,
 	}); err != nil {
-		t.Fatalf("a dir pool on <data_dir>/disks: %v", err)
+		t.Fatalf("a dir pool under <data_dir>/pools: %v", err)
 	}
 }
 
@@ -313,9 +314,9 @@ func TestPoolUpload_ExistingPoolOnAProtectedDirectoryRefusesWrites(t *testing.T)
 	if _, err := os.Lstat(filepath.Join(s.dataDir, "audit-seeded-assert.iso")); err == nil {
 		t.Errorf("an upload landed in the data dir")
 	}
-	resp, err := s.ListStoragePoolContents(adminCtx(), &pb.ListStoragePoolContentsRequest{PoolName: "legacy"})
-	if err != nil || len(resp.Contents) == 0 {
-		t.Errorf("listing a protected pool should keep working: %v (%d entries)", err, len(resp.GetContents()))
+	// Round 2: it is not even listed — its directory may be /root/.ssh.
+	if _, err := s.ListStoragePoolContents(adminCtx(), &pb.ListStoragePoolContentsRequest{PoolName: "legacy"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("listing a protected pool: got %v, want FailedPrecondition", err)
 	}
 }
 

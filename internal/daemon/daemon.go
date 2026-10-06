@@ -49,6 +49,7 @@ import (
 	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/restapi"
 	"github.com/litevirt/litevirt/internal/scheduler"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 	"github.com/litevirt/litevirt/internal/ui"
 	"github.com/litevirt/litevirt/internal/watchdog"
@@ -479,6 +480,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Register storage pools in the cluster DB and start periodic refresh.
 	d.registerStoragePools(ctx)
+	d.hardenNFSPoolMounts(ctx)
 	d.refreshDBPoolCapacity(ctx)
 	go d.refreshStoragePools(ctx)
 
@@ -1849,10 +1851,16 @@ func (d *Daemon) sumPoolDiskTotalGiB(ctx context.Context) int {
 func (d *Daemon) registerStoragePools(ctx context.Context) {
 	pools := d.cfg.StoragePools
 	if len(pools) == 0 {
+		// Its own directory, like every pool: never <data_dir>/disks, which
+		// holds every VM's local disks across projects.
+		defDir := filepath.Join(d.cfg.DataDir, "pools", "default")
+		if err := os.MkdirAll(defDir, 0o755); err != nil {
+			slog.Warn("create default pool directory", "dir", defDir, "error", err)
+		}
 		pools = []StoragePoolConfig{{
 			Name:   "default",
 			Driver: "local",
-			Target: filepath.Join(d.cfg.DataDir, "disks"),
+			Target: defDir,
 		}}
 	}
 	for _, p := range pools {
@@ -1876,6 +1884,31 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		}
 		if err := corrosion.UpsertStoragePool(ctx, d.db, rec); err != nil {
 			slog.Warn("failed to register storage pool", "pool", p.Name, "error", err)
+		}
+	}
+}
+
+// hardenNFSPoolMounts reports, at ERROR, every NFS pool of this host that is
+// already mounted without nosuid,nodev,noexec,nosymfollow (by hand, or by an
+// earlier build). Nothing is remounted: the server's pool check refuses such a
+// pool outright until it is unmounted and litevirt mounts it again.
+func (d *Daemon) hardenNFSPoolMounts(ctx context.Context) {
+	var cfgs []storage.Config
+	for _, p := range d.cfg.StoragePools {
+		cfgs = append(cfgs, storage.Config{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options})
+	}
+	if rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName); err == nil {
+		for _, p := range rows {
+			cfgs = append(cfgs, storage.Config{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options})
+		}
+	}
+	for _, c := range cfgs {
+		if !strings.EqualFold(c.Driver, "nfs") {
+			continue
+		}
+		if err := storage.CheckNFSMountHardened(d.cfg.DataDir, c); err != nil {
+			slog.Error("NFS pool is mounted without nosuid,nodev,noexec,nosymfollow; the pool is refused until litevirt mounts it again",
+				"source", c.Source, "target", c.Target, "error", err)
 		}
 	}
 }

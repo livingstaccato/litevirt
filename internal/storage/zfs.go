@@ -94,19 +94,19 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) error 
 		snap = "litevirt-" + nowSnapTag()
 	}
 	srcSnap := fmt.Sprintf("%s@%s", opts.SrcRef, snap)
-	if out, err := exec.CommandContext(ctx, "zfs", "snapshot", srcSnap).CombinedOutput(); err != nil {
+	if out, err := exec.CommandContext(ctx, "zfs", "snapshot", "--", srcSnap).CombinedOutput(); err != nil {
 		return fmt.Errorf("zfs snapshot %s: %w: %s", srcSnap, err, out)
 	}
 
 	sendArgs := []string{"send"}
 	prev := fmt.Sprintf("%s@litevirt-replicate-prev", opts.SrcRef)
 	if opts.Incremental && snapshotExists(ctx, prev) {
-		sendArgs = append(sendArgs, "-I", prev, srcSnap)
+		sendArgs = append(sendArgs, "-I", prev, "--", srcSnap)
 	} else {
-		sendArgs = append(sendArgs, srcSnap)
+		sendArgs = append(sendArgs, "--", srcSnap)
 	}
 
-	recvArgs := []string{"recv", "-F", opts.DstRef}
+	recvArgs := []string{"recv", "-F", "--", opts.DstRef}
 	pipe, err := pipeCmds(ctx, opts.SSHTarget, "zfs", sendArgs, "zfs", recvArgs)
 	if err != nil {
 		return fmt.Errorf("zfs replicate %s → %s: %w", opts.SrcRef, opts.DstRef, err)

@@ -87,7 +87,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	if !isFileBasedDriver(rec.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
 	}
-	dir, err := s.poolWriteDir(rec)
+	dir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
 		return err
 	}

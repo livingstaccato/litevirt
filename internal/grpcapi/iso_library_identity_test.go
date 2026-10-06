@@ -96,3 +96,20 @@ func TestISOIdentity_AStoppedMoveToAHostWithoutTheISOIsAllowed(t *testing.T) {
 		t.Fatalf("live move to a host without a-lib: got %v, want FailedPrecondition", err)
 	}
 }
+
+// m6 keeps authority: a stopped move to a host where the pool of that name
+// belongs to another project is refused, not waved through with a warning.
+func TestISOIdentity_AStoppedMoveStillJudgesAuthority(t *testing.T) {
+	s, _ := stubTarget(t)
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "mig", Iso: "b-lib/x.iso", IsoScope: isoScopeProject, Project: "acme"})
+	if err := s.db.Execute(context.Background(), `UPDATE vms SET spec = ?, project = 'acme' WHERE name = 'mig'`, string(spec)); err != nil {
+		t.Fatal(err)
+	}
+	lib := projectLibrary(t, s, "b-lib", "other")
+	writeLibFile(t, filepath.Join(lib, "x.iso"), isoBody)
+	_, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+		InstallerIsoListed: true, InstallerIsoPaths: []string{"/srv/source/b-lib/x.iso"}, InstallerIsoRuntime: false})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("stopped move to a host whose b-lib is another project's: got %v, want FailedPrecondition", err)
+	}
+}

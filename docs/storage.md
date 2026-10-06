@@ -82,9 +82,9 @@ pool's directory, when the VM is created and again at every start (restart
 policy, health restarts, a snapshot restore, a replace cutover, and a
 migration target before the VM lands there). The file must be a plain file:
 not a symlink, not a second hard link to some other file, and not anywhere
-`storage.CheckReadFile` refuses (below). Just before the file is handed to
-qemu it is opened without following a link and confirmed to be the same file
-at the same path. The daemon writes every file a library holds — an upload, a
+`storage.CheckReadFile` refuses (below). The last check before the VM starts
+opens the file without following a link and confirms it is the same file at
+the same path; qemu then opens the path itself (see the known limits below). The daemon writes every file a library holds — an upload, a
 pull, a sync — so a link there is never one of them, and a library write never
 replaces a file already there (remove it first with `lv iso rm`).
 
@@ -97,14 +97,27 @@ VM was created:
   owns (or, for an Admin's host path, that). On any host where the reference
   resolves to a pool of another kind, the VM does not start there.
 - On every host, every pool mapping that directory must be global or the VM's
-  project's. A same-named pool of another project on the host a VM moved to
-  is not its library: the start, or the migration, is refused.
-- A migration target without the pool refuses the migration. A **running**
-  VM's CD-ROM path cannot change in a migration (libvirt hands qemu on the
-  target the source's path), so the target must resolve the reference to that
-  very path; otherwise migrate it stopped, or give the library the same
-  directory on both hosts. A stopped VM's domain is pointed at the target's
-  file when it starts.
+  project's. Directories are compared with symlinks resolved, as the file is
+  opened, so a pool whose target is a link (or `/proc/self/root/…`) to another
+  pool's directory maps that directory. A same-named pool of another project
+  on the host a VM moved to is not its library: the start, or the migration,
+  is refused.
+- The create also records which file the ISO resolved to on that host
+  (`VMSpec.iso_identity`: resolved path, device, inode, size, mtime). A start
+  of that unchanged file on that host keeps working even if another project's
+  pool has since come to share the directory — another project's ordinary
+  `lv pool create` cannot stop a VM that started before. A file put there
+  since is judged by the full rule.
+- A **running** VM's CD-ROM path cannot change in a migration (libvirt hands
+  qemu on the target the source's path), so the target must resolve the
+  reference to that very path, and a target without the pool or the file
+  refuses; otherwise migrate it stopped, or give the library the same
+  directory on both hosts. A **stopped** VM may move to a host that does not
+  have its ISO or library yet: the move is accepted with a warning, and the VM
+  will not start there until the ISO is present (upload or pull it, or wait for
+  the library to sync). A stopped VM's domain is pointed at the target's file
+  when it starts. A target where the pool of that name is another project's,
+  or of another kind, refuses the move either way.
 
 ### The global library
 
@@ -152,9 +165,9 @@ Switching:
   and every host records the ISOs its own library holds that the new
   generation has no record of — the connected host at once, the others on
   their next sync pass. So the records describe the files as they are. A file
-  two hosts hold under one name with different content is recorded as the
-  first host records it (the connected host's, when it has one), and the other
-  host's copy is replaced by it.
+  two hosts hold under one name with different content ends up recorded as
+  whichever host's record replicates last (last writer wins), and every other
+  host's copy is then replaced by that one.
 
 Changing the mode needs the admin role and refuses until every host runs a
 release that knows it (`failover_scope_v1` latched). In sync mode an upload or
@@ -242,10 +255,27 @@ at a different path on the starting host than where the domain was defined
 file.
 
 The entry node checks authority before forwarding; the owning host resolves
-the file against its own filesystem. An entry node on an older build forwards
-without the authority check, so the library route is only as strong as the
-oldest host involved until every host runs this build (as with the other
-content checks in [auth.md](auth.md)).
+the file against its own filesystem.
+
+### Known limits
+
+- **qemu reopens the path.** The last check opens the file without following a
+  link, then closes it; qemu opens the path again when the VM starts. In a
+  local library only the daemon (root) writes, so nothing else can swap the
+  file in between. A library on NFS needs the pool mounted `nosymfollow`
+  (the hardened-mount rule for directory pools on NFS), or the NFS server can
+  answer qemu's lookup with a link.
+- **Mixed versions fail open, as before this release.** Until every host runs
+  this build: an entry node on an older build forwards without the authority
+  check (a non-admin's absolute path then arrives as the peer's and is
+  recorded as a host path); an older migration target ignores the CD-ROM paths
+  the source lists and judges nothing, and an older source lists none, so the
+  target skips the running-VM path check; an older owner rewriting a spec
+  drops `iso_scope`, which makes the VM's ISO a legacy, file-only one. None of
+  these is weaker than a release without these checks (as with the other
+  content checks in [auth.md](auth.md)).
+- **VMs created before `iso_scope`** with an absolute path are judged as the
+  file they name on every host, as before.
 
 ## Compose example
 

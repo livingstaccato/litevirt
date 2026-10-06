@@ -846,13 +846,41 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 }
 
 type qemuImgInfo struct {
+	Filename            string `json:"filename"`
 	BackingFilename     string `json:"backing-filename"`
 	FullBackingFilename string `json:"full-backing-filename"`
 	FormatSpecific      struct {
 		Data struct {
 			DataFile string `json:"data-file"`
+			Extents  []struct {
+				Filename string `json:"filename"`
+			} `json:"extents"`
 		} `json:"data"`
 	} `json:"format-specific"`
+	Children []struct {
+		Name string      `json:"name"`
+		Info qemuImgInfo `json:"info"`
+	} `json:"children"`
+}
+
+// openedFiles is every file qemu-img reported opening for this image: the
+// image, its children (extents, data file, the protocol layer) and the
+// format-specific extent list. Judging these, rather than parsing VMDK text,
+// covers every way a format can name another file.
+func (i *qemuImgInfo) openedFiles() []string {
+	var out []string
+	if i.Filename != "" {
+		out = append(out, i.Filename)
+	}
+	for _, e := range i.FormatSpecific.Data.Extents {
+		if e.Filename != "" {
+			out = append(out, e.Filename)
+		}
+	}
+	for c := range i.Children {
+		out = append(out, i.Children[c].Info.openedFiles()...)
+	}
+	return out
 }
 
 // maxBackingDepth bounds the chain walk; a legitimate foreign disk has at most
@@ -867,10 +895,29 @@ const maxBackingDepth = 16
 // anything. The chain is walked one image at a time, and nothing outside
 // allowedDir is ever opened.
 func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) error {
-	return assertNoExternalDiskRefsDepth(ctx, file, allowedDir, 0)
+	// The disk's own directory is allowed too: a disk staged outside the
+	// import directory (--disk-map, an admin's path) may keep its extents or
+	// backing files beside it; anything beyond is an escape.
+	roots := []string{allowedDir}
+	if dir, err := filepath.EvalSymlinks(filepath.Dir(file)); err == nil {
+		roots = append(roots, dir)
+	} else {
+		roots = append(roots, filepath.Dir(file))
+	}
+	return assertNoExternalDiskRefsDepth(ctx, file, roots, 0)
 }
 
-func assertNoExternalDiskRefsDepth(ctx context.Context, file, allowedDir string, depth int) error {
+func withinAnyRoot(roots []string, p string) bool {
+	for _, r := range roots {
+		if safename.Contains(r, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func assertNoExternalDiskRefsDepth(ctx context.Context, file string, roots []string, depth int) error {
+	allowedDir := roots[0]
 	if depth > maxBackingDepth {
 		return fmt.Errorf("backing chain deeper than %d images", maxBackingDepth)
 	}
@@ -904,6 +951,21 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file, allowedDir string,
 	if err := json.Unmarshal(out, &info); err != nil {
 		return fmt.Errorf("inspect %s: unreadable qemu-img info: %w", filepath.Base(file), err)
 	}
+	for _, f := range info.openedFiles() {
+		if !plainBackingPath(f) {
+			return fmt.Errorf("disk makes qemu open %q, which is not a plain path", f)
+		}
+		resolved := f
+		if !filepath.IsAbs(f) {
+			resolved = filepath.Join(filepath.Dir(file), f)
+		}
+		if real, err := filepath.EvalSymlinks(resolved); err == nil {
+			resolved = real
+		}
+		if !withinAnyRoot(roots, resolved) {
+			return fmt.Errorf("disk makes qemu open %q, outside the import directory", f)
+		}
+	}
 	if df := info.FormatSpecific.Data.DataFile; df != "" {
 		return fmt.Errorf("disk keeps its data in an external file %q; only standalone disks are imported", df)
 	}
@@ -924,10 +986,10 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file, allowedDir string,
 	if real, err := filepath.EvalSymlinks(resolved); err == nil {
 		resolved = real
 	}
-	if !safename.Contains(allowedDir, resolved) {
+	if !withinAnyRoot(roots, resolved) {
 		return fmt.Errorf("disk has an external backing file %q outside the import directory", backing)
 	}
-	return assertNoExternalDiskRefsDepth(ctx, resolved, allowedDir, depth+1)
+	return assertNoExternalDiskRefsDepth(ctx, resolved, roots, depth+1)
 }
 
 // plainBackingPath reports whether a backing name is a filesystem path rather

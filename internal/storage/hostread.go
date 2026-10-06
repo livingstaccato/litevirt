@@ -22,8 +22,10 @@ import (
 // they hold nothing secret, and distribution ISOs live there (virtio-win
 // installs into /usr/share/virtio-win).
 var secretRoots = []string{
-	"/boot", "/dev", "/etc", "/proc", "/root", "/run", "/sys",
-	"/var/run", "/var/spool",
+	"/boot", "/dev", "/etc", "/home", "/proc", "/root", "/run", "/sys",
+	"/var/backups", "/var/run", "/var/spool",
+	// LXC container root filesystems and configs.
+	"/var/lib/lxc",
 	// libvirt's per-domain state (master-key.aes) and vTPM state.
 	"/var/lib/libvirt/qemu", "/var/lib/libvirt/swtpm",
 }

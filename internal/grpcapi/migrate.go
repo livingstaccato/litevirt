@@ -556,7 +556,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 				"migration.allow_unencrypted_storage is set", "vm", req.VmName,
 				"source_tls", srcTLS, "target_tls", dstTLS, "target", req.TargetHost)
 		}
-	} else if s.vmHasInstallerISO(ctx, vm.Name) {
+	} else if s.domainCarriesInstallerISO(vm.Name) {
 		// No disks to stub, but the target's qemu opens the installer ISO from
 		// its own filesystem: the target judges that file before the migration
 		// (EnsureDisks with no stubs does only that).
@@ -1171,7 +1171,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	// The domain lands here with its installer ISO path; qemu on THIS host
 	// opens it, so this host judges it before the migration may proceed.
 	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
-		if err := s.verifyVMISOForStart(rec); err != nil {
+		if err := s.verifyIncomingVMISO(rec); err != nil {
 			return nil, err
 		}
 	}
@@ -2017,7 +2017,7 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // for QEMU and returns whether it could. An older target never answers that,
 // which reads as false.
 func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS bool) ([]string, bool, error) {
-	if len(stubs) == 0 && !wantTLS && !s.vmHasInstallerISO(ctx, vmName) {
+	if len(stubs) == 0 && !wantTLS && !s.domainCarriesInstallerISO(vmName) {
 		return nil, false, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)

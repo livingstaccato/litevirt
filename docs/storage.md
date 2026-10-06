@@ -80,20 +80,32 @@ Naming one is reading that file, so it is gated like any other host path:
 Some files are refused to everyone, Admin included, judged as written and after
 resolving symlinks: the PKI directory, anything in the data directory outside
 `disks/` and `mounts/` (`state.db`, `cloudinit/`, `nvram/`, …), and anything
-under `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/run`, `/sys`, `/var/run`,
-`/var/spool`, `/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. The path
-must be absolute and clean (no `.` or `..`), and must name a regular file that
-exists on the target host. `/usr` is allowed (`virtio-win` installs there).
+under `/boot`, `/dev`, `/etc`, `/home`, `/proc`, `/root`, `/run`, `/sys`,
+`/var/backups`, `/var/run`, `/var/spool`, `/var/lib/lxc`,
+`/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. `/usr` is allowed
+(`virtio-win` installs there).
+
+The ISO must be the file itself: an absolute, clean path (no `.` or `..`) with
+no symlink anywhere along it, naming a regular file with a single hard link.
+Name the real file rather than a link to it (`virtio-win.iso` is often a link
+to a versioned file).
 
 The entry node checks authority before forwarding; the owning host checks the
 file against its own filesystem. An entry node on an older build forwards
-without the authority check, as with the other content checks in
-[auth.md](auth.md).
+without the authority check, and an owner on an older build has no
+filesystem check, so the pool route is only as strong as the oldest host
+involved until every host runs this build (as with the other content checks
+in [auth.md](auth.md)).
 
-A VM created before this check whose stored ISO is one of the refused files no
-longer starts: the start fails with `FailedPrecondition` and an ERROR log
-naming the VM and the file. Nothing is rewritten; recreate the VM without that
-ISO or with a pool ISO. A VM with any other ISO starts as before.
+qemu opens the ISO again at every start, so the host judges it again each
+time it hands the file to qemu: every start (restart policy and health
+restarts included), a snapshot restore, a replace cutover, and a migration
+target before the VM lands there. What is judged is the CD-ROM the VM's
+domain actually carries, so a VM whose domain was redefined without its
+installer CD-ROM starts even after the ISO is gone. A refusal fails with
+`FailedPrecondition` and an ERROR log naming the VM and the file, and the VM
+stays down; nothing is rewritten. Replace the file with a plain `.iso`, or
+recreate the VM without it.
 
 ## Compose example
 

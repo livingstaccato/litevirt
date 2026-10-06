@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -214,5 +215,42 @@ func TestVMISOStart_PreflightRefusesASymlinkedParentDirectory(t *testing.T) {
 	_, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "parent"))
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("start with a directory above the ISO swapped for a link: got %v, want FailedPrecondition", err)
+	}
+}
+
+// The start judges the CD-ROM the domain actually carries, not spec.Iso: a
+// domain regenerated without the installer CD-ROM (reconciler, failover,
+// UpdateVM) starts even when that ISO is long gone from this host.
+func TestVMISOStart_DomainWithoutTheCDROMStartsEvenIfTheISOIsGone(t *testing.T) {
+	s, fake, _ := isoServer(t)
+	iso, _ := isoVMStopped(t, s, "noiso")
+	xml := fake.DefinedXML("noiso")
+	stripped := regexp.MustCompile(`(?s)<disk[^>]*device="cdrom"[^>]*>.*?`+regexp.QuoteMeta(iso)+`.*?</disk>`).ReplaceAllString(xml, "")
+	if stripped == xml {
+		t.Fatalf("test setup: no installer CD-ROM found in the domain XML:\n%s", xml)
+	}
+	if err := fake.DefineDomain(stripped); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(iso); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "noiso")); err != nil {
+		t.Fatalf("start of a domain that no longer carries the ISO: %v", err)
+	}
+}
+
+// A caller without snapshot.restore learns nothing about the ISO: the check
+// runs after authorization (and on the owner, after any forward).
+func TestVMISOStart_SnapshotRestoreChecksAuthorityFirst(t *testing.T) {
+	s, _, key := isoServer(t)
+	iso, _ := isoVMStopped(t, s, "revert-auth")
+	swapForSymlink(t, iso, key)
+	viewer := isoEngineCtx(t, s, "vic", "Viewer", "/")
+
+	_, err := s.RestoreSnapshot(viewer, &pb.RestoreSnapshotRequest{VmName: "revert-auth", SnapshotName: "any"})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("restore by a viewer: got %v, want PermissionDenied before any ISO check", err)
 	}
 }

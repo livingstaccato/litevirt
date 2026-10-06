@@ -106,8 +106,11 @@ func assertNoISODomain(t *testing.T, s *Server, fake *libvirtfake.Fake, name, is
 func TestVMISO_OperatorCannotAttachTheHostKey(t *testing.T) {
 	s, fake, key := isoServer(t)
 	_, err := s.CreateVM(userCtx("op", "operator"), isoCreate("leak", key, ""))
-	if err == nil {
-		t.Fatalf("an operator attached %s as an ISO", key)
+	if c := status.Code(err); c != codes.InvalidArgument && c != codes.PermissionDenied {
+		t.Fatalf("an operator naming the host key as an ISO: got %v, want InvalidArgument or PermissionDenied", err)
+	}
+	if !strings.Contains(err.Error(), "PKI directory") {
+		t.Fatalf("refusal does not name the reason (the PKI directory): %v", err)
 	}
 	assertNoISODomain(t, s, fake, "leak", key)
 }
@@ -311,6 +314,11 @@ func TestVMISO_StartRefusesAStoredProtectedISO(t *testing.T) {
 	spec.Iso = key
 	b, _ := json.Marshal(&spec)
 	if err := s.db.Execute(context.Background(), `UPDATE vms SET spec = ? WHERE name = 'old-bad'`, string(b)); err != nil {
+		t.Fatal(err)
+	}
+	// ...and the domain a pre-fix create would have defined, with the key as
+	// its CD-ROM: the start judges what the domain carries.
+	if err := fake.DefineDomain(strings.ReplaceAll(fake.DefinedXML("old-bad"), ok, key)); err != nil {
 		t.Fatal(err)
 	}
 

@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -155,40 +156,100 @@ func (s *Server) checkVMISOFile(iso string, _ bool) error {
 	return nil
 }
 
-// verifyVMISOForStart judges a VM's stored installer ISO on this host before
-// anything here hands it to qemu again: a start, a snapshot revert that can
-// start the domain, a replace cutover, a migration landing here. A refusal
-// keeps the VM down, loudly; nothing is rewritten — the operator replaces the
-// ISO with a plain file or recreates the VM without it.
+// domainInstallerISOs returns the file sources of the CD-ROMs in a domain
+// definition, other than the VM's own cloud-init seed (litevirt writes that
+// one into its data directory itself).
+func (s *Server) domainInstallerISOs(vmName, domXML string) []string {
+	var dom struct {
+		Disks []struct {
+			Device string `xml:"device,attr"`
+			Source struct {
+				File string `xml:"file,attr"`
+			} `xml:"source"`
+		} `xml:"devices>disk"`
+	}
+	if err := xml.Unmarshal([]byte(domXML), &dom); err != nil {
+		return nil
+	}
+	seed := filepath.Join(s.dataDir, "cloudinit", vmName+".iso")
+	var out []string
+	for _, d := range dom.Disks {
+		if d.Device != "cdrom" || d.Source.File == "" || d.Source.File == seed {
+			continue
+		}
+		out = append(out, d.Source.File)
+	}
+	return out
+}
+
+// verifyVMISOForStart judges, on this host, every installer CD-ROM the VM's
+// defined domain will hand qemu at its next start: a start, a snapshot revert
+// that can start it, a replace cutover. It reads the domain's own definition
+// rather than spec.Iso, so a domain regenerated without the CD-ROM (failover,
+// the reconciler, UpdateVM) starts even after the ISO is gone; with no domain
+// defined there is nothing to hand qemu yet. A refusal keeps the VM down,
+// loudly; nothing is rewritten.
 func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
+	if vm == nil || s.virt == nil {
+		return nil
+	}
+	domXML, err := s.virt.DumpXMLInactive(vm.Name)
+	if err != nil {
+		return nil
+	}
+	for _, iso := range s.domainInstallerISOs(vm.Name, domXML) {
+		if err := s.checkVMISOFile(iso, false); err != nil {
+			return s.refuseISO(vm.Name, iso, err)
+		}
+	}
+	return nil
+}
+
+// verifyIncomingVMISO is the migration target's judgement, before a domain
+// carrying spec.Iso lands here: the file must not be a link, a second name
+// for another file, or a protected file. A missing file is not a read, so it
+// is left to libvirt (which refuses a domain whose CD-ROM path is absent).
+func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord) error {
 	if vm == nil || vm.Spec == "" {
 		return nil
 	}
 	var spec pb.VMSpec
 	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil || spec.Iso == "" {
-		return nil // an unreadable spec is the start path's own concern
-	}
-	err := s.checkVMISOFile(spec.Iso, false)
-	if err == nil {
 		return nil
 	}
+	if _, err := os.Lstat(spec.Iso); os.IsNotExist(err) {
+		if rerr := storage.CheckRefusedReadPath(spec.Iso, s.dataDir, s.pkiDir); rerr != nil {
+			return s.refuseISO(vm.Name, spec.Iso, status.Errorf(codes.InvalidArgument, "iso: %v", rerr))
+		}
+		return nil
+	}
+	if err := s.checkVMISOFile(spec.Iso, false); err != nil {
+		return s.refuseISO(vm.Name, spec.Iso, err)
+	}
+	return nil
+}
+
+func (s *Server) refuseISO(vmName, iso string, err error) error {
 	reason := status.Convert(err).Message()
 	slog.Error("refusing to hand a VM its installer ISO: the file is not the plain file the VM was given; "+
 		"the guest would read whatever it now names",
-		"vm", vm.Name, "host", s.hostName, "iso", spec.Iso, "reason", reason)
+		"vm", vmName, "host", s.hostName, "iso", iso, "reason", reason)
 	return status.Errorf(codes.FailedPrecondition,
 		"VM %q has installer ISO %q, which this host will not attach (%s); replace it with a plain .iso file or recreate the VM without it",
-		vm.Name, spec.Iso, reason)
+		vmName, iso, reason)
 }
 
-// vmHasInstallerISO reports whether the VM's stored spec names an installer ISO.
-func (s *Server) vmHasInstallerISO(ctx context.Context, name string) bool {
-	rec, err := corrosion.GetVM(ctx, s.db, name)
-	if err != nil || rec == nil || rec.Spec == "" {
+// domainCarriesInstallerISO reports whether the VM's domain on THIS host
+// (the migration source) has an installer CD-ROM the target would open.
+func (s *Server) domainCarriesInstallerISO(name string) bool {
+	if s.virt == nil {
 		return false
 	}
-	var spec pb.VMSpec
-	return json.Unmarshal([]byte(rec.Spec), &spec) == nil && spec.Iso != ""
+	domXML, err := s.virt.DumpXMLInactive(name)
+	if err != nil {
+		return false
+	}
+	return len(s.domainInstallerISOs(name, domXML)) > 0
 }
 
 func isISOName(name string) bool {

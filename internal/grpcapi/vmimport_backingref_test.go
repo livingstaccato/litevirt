@@ -150,3 +150,52 @@ func TestAssertNoExternalDiskRefs_AcceptsAStagedDiskOutsideTheImportDir(t *testi
 		t.Fatalf("standalone staged disk outside the import dir: %v", err)
 	}
 }
+
+// qemu opens a disk in the format it is TOLD, not the one it would probe: a
+// VMDK descriptor whose first line is not "version=" probes as raw, yet
+// `convert -f vmdk` follows its extents. The check must judge the disk in the
+// format conversion will use.
+func vmdkDescriptorNamedLikeRaw(t *testing.T, dir, outside string) string {
+	t.Helper()
+	desc := filepath.Join(dir, "disk.vmdk")
+	body := "CID=fffffffe\nversion=1\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\nRW 2048 FLAT \"" + outside + "\" 0\n"
+	if err := os.WriteFile(desc, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return desc
+}
+
+func TestConvertForeignDisk_DeclaredVMDKIsJudgedAsVMDK(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not available")
+	}
+	outside := filepath.Join(t.TempDir(), "host-only")
+	if err := os.WriteFile(outside, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	importDir := t.TempDir()
+	desc := vmdkDescriptorNamedLikeRaw(t, importDir, outside)
+	dst := filepath.Join(t.TempDir(), "out.qcow2")
+
+	if err := convertForeignDisk(context.Background(), desc, "vmdk", dst, importDir, nil); err == nil {
+		t.Fatal("declared-vmdk descriptor whose extent is outside: converted, want refusal")
+	}
+}
+
+func TestAssertNoExternalDiskRefs_BackingIsJudgedInItsRecordedFormat(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not available")
+	}
+	outside := filepath.Join(t.TempDir(), "host-only")
+	if err := os.WriteFile(outside, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	importDir := t.TempDir()
+	vmdkDescriptorNamedLikeRaw(t, importDir, outside)
+	top := filepath.Join(importDir, "top.qcow2")
+	qemuImg(t, "create", "-f", "qcow2", "-u", "-b", "disk.vmdk", "-F", "vmdk", top, "1M")
+
+	if err := assertNoExternalDiskRefs(context.Background(), top, importDir); err == nil {
+		t.Fatal("qcow2 backed (-F vmdk) by a descriptor naming an outside extent: got nil, want refusal")
+	}
+}

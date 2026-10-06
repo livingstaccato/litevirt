@@ -806,7 +806,16 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
 	}
-	if err := assertNoExternalDiskRefs(ctx, src, allowedDir); err != nil {
+	// One format for the check and the conversion: a disk judged as probed
+	// but converted as declared can name files the check never saw.
+	if srcFormat == "" {
+		probed, err := probeDiskFormat(ctx, src)
+		if err != nil {
+			return err
+		}
+		srcFormat = probed
+	}
+	if err := assertNoExternalDiskRefsAs(ctx, src, srcFormat, allowedDir); err != nil {
 		return err
 	}
 
@@ -845,7 +854,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		return fmt.Errorf("qemu-img convert: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	// Defense-in-depth: the produced qcow2 must be standalone.
-	if err := assertNoExternalDiskRefs(ctx, tmp, allowedDir); err != nil {
+	if err := assertNoExternalDiskRefsAs(ctx, tmp, "qcow2", allowedDir); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -857,10 +866,12 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 }
 
 type qemuImgInfo struct {
-	Filename            string `json:"filename"`
-	BackingFilename     string `json:"backing-filename"`
-	FullBackingFilename string `json:"full-backing-filename"`
-	FormatSpecific      struct {
+	Filename              string `json:"filename"`
+	Format                string `json:"format"`
+	BackingFilenameFormat string `json:"backing-filename-format"`
+	BackingFilename       string `json:"backing-filename"`
+	FullBackingFilename   string `json:"full-backing-filename"`
+	FormatSpecific        struct {
 		Data struct {
 			DataFile string `json:"data-file"`
 			Extents  []struct {
@@ -906,6 +917,14 @@ const maxBackingDepth = 16
 // anything. The chain is walked one image at a time, and nothing outside
 // allowedDir is ever opened.
 func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) error {
+	return assertNoExternalDiskRefsAs(ctx, file, "", allowedDir)
+}
+
+// assertNoExternalDiskRefsAs judges file opened as format — the format qemu
+// will be told, not the one it would probe: a VMDK descriptor can probe as
+// raw yet be opened as vmdk. An empty format means "as probed", and is only
+// for a caller that then converts with the probed format.
+func assertNoExternalDiskRefsAs(ctx context.Context, file, format, allowedDir string) error {
 	// The disk's own directory is allowed too: a disk staged outside the
 	// import directory (--disk-map, an admin's path) may keep its extents or
 	// backing files beside it; anything beyond is an escape.
@@ -918,7 +937,7 @@ func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) erro
 	} else {
 		roots = append(roots, filepath.Dir(file))
 	}
-	return assertNoExternalDiskRefsDepth(ctx, file, roots, 0)
+	return assertNoExternalDiskRefsDepth(ctx, file, format, roots, 0)
 }
 
 func withinAnyRoot(roots []string, p string) bool {
@@ -930,7 +949,7 @@ func withinAnyRoot(roots []string, p string) bool {
 	return false
 }
 
-func assertNoExternalDiskRefsDepth(ctx context.Context, file string, roots []string, depth int) error {
+func assertNoExternalDiskRefsDepth(ctx context.Context, file, format string, roots []string, depth int) error {
 	allowedDir := roots[0]
 	if depth > maxBackingDepth {
 		return fmt.Errorf("backing chain deeper than %d images", maxBackingDepth)
@@ -956,7 +975,11 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file string, roots []str
 	}
 	// qemu-img info on this one image only (no --backing-chain: that would
 	// open the backing file before it is judged).
-	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", file).Output()
+	args := []string{"info", "-U", "--output=json"}
+	if format != "" {
+		args = append(args, "-f", format)
+	}
+	out, err := exec.CommandContext(ctx, "qemu-img", append(args, "--", file)...).Output()
 	if err != nil {
 		// info failure is not itself an escape; surface it as a convert-time error.
 		return fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
@@ -1003,7 +1026,27 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file string, roots []str
 	if !withinAnyRoot(roots, resolved) {
 		return fmt.Errorf("disk has an external backing file %q outside the import directory", backing)
 	}
-	return assertNoExternalDiskRefsDepth(ctx, resolved, roots, depth+1)
+	// Walk the backing file in the format the image records for it; qemu
+	// opens it that way. With none recorded qemu would probe, so refuse.
+	if info.BackingFilenameFormat == "" {
+		return fmt.Errorf("disk names a backing file %q without its format", backing)
+	}
+	return assertNoExternalDiskRefsDepth(ctx, resolved, info.BackingFilenameFormat, roots, depth+1)
+}
+
+// probeDiskFormat asks qemu-img what format a disk is, for a source whose
+// format the caller did not declare; that format is then used for both the
+// check and the conversion.
+func probeDiskFormat(ctx context.Context, file string) (string, error) {
+	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", "--", file).Output()
+	if err != nil {
+		return "", fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
+	}
+	var info qemuImgInfo
+	if err := json.Unmarshal(out, &info); err != nil || info.Format == "" {
+		return "", fmt.Errorf("inspect %s: no format reported", filepath.Base(file))
+	}
+	return info.Format, nil
 }
 
 // plainBackingPath reports whether a backing name is a filesystem path rather

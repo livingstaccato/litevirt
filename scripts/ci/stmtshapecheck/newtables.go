@@ -147,13 +147,15 @@ var firstShapeAcks = map[string]string{
 		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
 		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
 		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
-	"cluster_policies": "the only writer is corrosion.SetFailoverScope, which returns " +
+	"cluster_policies": "every writer (corrosion.SetFailoverScope, SetISOLibraryMode and PutISOCatalogEntry, " +
+		"all through the one clusterPolicyUpsertSQL) returns " +
 		"ErrClusterPolicyGateClosed unless Client.MayWriteClusterPolicy. The daemon wires that gate to " +
 		"DurablyLatched(failover_scope_v1) — mandatory, so advertised by every build carrying this table and " +
 		"by none that does not, and in capabilities.replicationGated, so it is confirmed against every " +
 		"memberlist recipient rather than the voting members only. It fails CLOSED when unwired, so the " +
-		"latch cannot form, and nothing is written, while a previous-release peer is listening. Its one " +
-		"caller is the operator's SetFailoverScope RPC, which refuses on the same latch first",
+		"latch cannot form, and nothing is written, while a previous-release peer is listening. Their " +
+		"callers (SetFailoverScope, SetISOLibraryMode, and ISO library uploads, pulls and removals) refuse " +
+		"on the same gate first",
 	"voter_configs": "the only writer is corrosion.WriteVoterConfig, which returns ErrVoterConfigGateClosed " +
 		"without touching the table unless Client.MayWriteVoterConfigs — the durable voter_config_v1 marker, " +
 		"wired by the daemon and failing CLOSED when unwired. voter_config_v1 is mandatory, so advertised by " +

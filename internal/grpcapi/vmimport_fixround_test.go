@@ -188,7 +188,21 @@ func TestImportVM_ASecondImportOfTheSameNameIsRefused(t *testing.T) {
 // disk — is never replaced, and the refused import does not remove it.
 func TestImportVM_AnExistingDiskInThePoolIsNeverReplaced(t *testing.T) {
 	s := concurrentImportServer(t, 10*oneDiskNeed())
-	stubQemuImg(t)
+	calls := filepath.Join(t.TempDir(), "calls")
+	bin := t.TempDir()
+	shim := "#!/bin/sh\n" +
+		"echo \"$1\" >> '" + calls + "'\n" +
+		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"prev=\"\"; last=\"\"\n" +
+		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
+		"cp \"$prev\" \"$last\"\n"
+	if err := writeFileHelper(bin+"/qemu-img", []byte(shim)); err != nil {
+		t.Fatal(err)
+	}
+	if err := chmodHelper(bin+"/qemu-img", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+envPath())
 	poolDir, err := s.importPoolDir(adminCtx(), "")
 	if err != nil {
 		t.Fatal(err)
@@ -206,6 +220,10 @@ func TestImportVM_AnExistingDiskInThePoolIsNeverReplaced(t *testing.T) {
 	}
 	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-dst"); rec != nil {
 		t.Fatal("a refused import persisted a row")
+	}
+	// Refused before converting anything it could not place.
+	if b, _ := os.ReadFile(calls); strings.Contains(string(b), "convert") {
+		t.Fatalf("qemu-img converted a disk it could not place: %s", b)
 	}
 }
 
@@ -254,5 +272,53 @@ func TestFSKeyFor_NamesSharedFreeSpaceOnce(t *testing.T) {
 		if got := fsKeyFor(c.fstype, c.source, dev); got != c.want {
 			t.Errorf("%s %s: %q, want %q", c.fstype, c.source, got, c.want)
 		}
+	}
+}
+
+// The free space falling is not this import's writing unless its own files
+// grew by as much: another writer's bytes are credited to no import.
+func TestImportSpace_AnotherWritersBytesAreNotCredited(t *testing.T) {
+	a, other, b := t.TempDir(), t.TempDir(), t.TempDir()
+	s := spaceTestServer(t, 10<<20, a, other, b)
+	ra := s.reserveImportSpace(a)
+	defer ra.release()
+	if err := ra.reserve(a, 8<<20, "a"); err != nil {
+		t.Fatal(err)
+	}
+	writeAllocated(t, a, 1<<20)
+	writeAllocated(t, other, 5<<20) // not an import
+	ra.refresh()
+	// 4 MiB free; a has 7 MiB of its 8 left to write.
+	rb := s.reserveImportSpace(b)
+	defer rb.release()
+	refusedForReservation(t, rb.reserve(b, 1<<20, "b"))
+}
+
+// A file that appears at the disk's name while it converts — another
+// import's or VM's — is not replaced: the placement refuses.
+func TestImportVM_ADiskThatAppearsDuringTheConversionIsNotReplaced(t *testing.T) {
+	s := concurrentImportServer(t, 10*oneDiskNeed())
+	dir := t.TempDir()
+	shim := "#!/bin/sh\n" +
+		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"prev=\"\"; last=\"\"\n" +
+		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
+		"d=$(dirname \"$last\"); b=$(basename \"$last\"); b=${b#.}; b=${b%%.convert-*}\n" +
+		"printf theirs > \"$d/$b\"\n" +
+		"cp \"$prev\" \"$last\"\n"
+	if err := writeFileHelper(dir+"/qemu-img", []byte(shim)); err != nil {
+		t.Fatal(err)
+	}
+	if err := chmodHelper(dir+"/qemu-img", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+envPath())
+	err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-race", false)}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a disk placed over a file that appeared meanwhile: %v, want FailedPrecondition", err)
+	}
+	poolDir, _ := s.importPoolDir(adminCtx(), "")
+	if b, _ := os.ReadFile(filepath.Join(poolDir, "imp-race-root.qcow2")); string(b) != "theirs" {
+		t.Fatalf("the file that appeared now holds %q", b)
 	}
 }

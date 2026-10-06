@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/litevirt/litevirt/internal/pki"
 	"github.com/litevirt/litevirt/internal/secretfile"
 )
 
@@ -85,16 +86,21 @@ const auditRejoinDomain = "litevirt-audit-rejoin-v1"
 // whose row hashed to Hash, when the name was admitted again. Signature is the
 // cluster CA's, over all three.
 type AuditRejoin struct {
-	Host      string `json:"host"`
-	Seq       int64  `json:"seq"`
-	Hash      string `json:"hash"`
-	Signature string `json:"signature"`
+	Host string `json:"host"`
+	// CertSerial is the serial of the host certificate minted for the machine
+	// this record was written for. A record left in a reused pki dir by an
+	// earlier admission names another certificate and is ignored.
+	CertSerial string `json:"cert_serial"`
+	Seq        int64  `json:"seq"`
+	Hash       string `json:"hash"`
+	Signature  string `json:"signature"`
 }
 
-func auditRejoinDigest(host string, seq int64, hash string) []byte {
+func auditRejoinDigest(host, certSerial string, seq int64, hash string) []byte {
 	h := sha256.New()
 	writeField(h, auditRejoinDomain)
 	writeField(h, host)
+	writeField(h, strings.ToLower(certSerial))
 	writeField(h, strconv.FormatInt(seq, 10))
 	writeField(h, strings.ToLower(hash))
 	return h.Sum(nil)
@@ -102,16 +108,17 @@ func auditRejoinDigest(host string, seq int64, hash string) []byte {
 
 // SignAuditRejoin signs an admission record with the cluster CA key in pkiDir.
 // Run where the CA key is: `lv host add`.
-func SignAuditRejoin(pkiDir, host string, seq int64, hash string) (AuditRejoin, error) {
+func SignAuditRejoin(pkiDir, host, certSerial string, seq int64, hash string) (AuditRejoin, error) {
 	key, err := loadClusterCAKey(pkiDir)
 	if err != nil {
 		return AuditRejoin{}, err
 	}
-	sig, err := ecdsa.SignASN1(rand.Reader, key, auditRejoinDigest(host, seq, hash))
+	sig, err := ecdsa.SignASN1(rand.Reader, key, auditRejoinDigest(host, certSerial, seq, hash))
 	if err != nil {
 		return AuditRejoin{}, fmt.Errorf("sign the audit rejoin record: %w", err)
 	}
-	return AuditRejoin{Host: host, Seq: seq, Hash: hash, Signature: hex.EncodeToString(sig)}, nil
+	return AuditRejoin{Host: host, CertSerial: certSerial, Seq: seq, Hash: hash,
+		Signature: hex.EncodeToString(sig)}, nil
 }
 
 // LoadAuditRejoin reads and verifies pkiDir's admission record for host. ok is
@@ -138,8 +145,16 @@ func LoadAuditRejoin(pkiDir, host string) (AuditRejoin, bool, error) {
 	}
 	pub, okKey := roots.caCert.PublicKey.(*ecdsa.PublicKey)
 	sig, herr := hex.DecodeString(rj.Signature)
-	if !okKey || herr != nil || !ecdsa.VerifyASN1(pub, auditRejoinDigest(rj.Host, rj.Seq, rj.Hash), sig) {
+	if !okKey || herr != nil || !ecdsa.VerifyASN1(pub, auditRejoinDigest(rj.Host, rj.CertSerial, rj.Seq, rj.Hash), sig) {
 		return rj, false, fmt.Errorf("%s is not signed by the cluster CA", AuditRejoinFileName)
+	}
+	serial, err := pki.CertSerial(filepath.Join(pkiDir, "host.crt"))
+	if err != nil {
+		return rj, false, fmt.Errorf("read this host's certificate serial to match %s: %w", AuditRejoinFileName, err)
+	}
+	if !strings.EqualFold(serial, rj.CertSerial) {
+		return rj, false, fmt.Errorf("%s was written for host certificate %s, and this machine holds %s: "+
+			"it is left over from an earlier admission", AuditRejoinFileName, rj.CertSerial, serial)
 	}
 	return rj, true, nil
 }
@@ -190,16 +205,34 @@ func ConfigureAuditHold(ctx context.Context, c *Client, pkiDir, host, spoolDir s
 	cfg := AuditHoldConfig{Host: host, SpoolDir: spoolDir}
 	rj, ok, rerr := LoadAuditRejoin(pkiDir, host)
 	if ok && rj.Seq > 0 {
+		// A local read that fails holds: the check that would have let this
+		// node skip the hold could not be made, and appending to a tail it could
+		// not read is how the chain forks. A replica that does hold the row
+		// opens the hold on the next poll.
 		local, err := freshHostTailSeq(ctx, c, host)
-		if err != nil {
-			return cfg, err
-		}
-		if local < rj.Seq || !auditRowPresent(ctx, c, host, rj.Seq, rj.Hash) {
+		if err != nil || local < rj.Seq || !auditHistoryArrived(ctx, c, host, rj.Seq, rj.Hash) {
 			cfg.Target, cfg.TargetHash = rj.Seq, rj.Hash
+		}
+		if err != nil && rerr == nil {
+			rerr = fmt.Errorf("read this host's audit tail: %w", err)
 		}
 	}
 	c.HoldAuditUntilCaughtUp(cfg)
 	return cfg, rerr
+}
+
+// auditHistoryArrived reports whether this replica holds host's chain up to
+// the admitted row: the row at seq with hash, and some row at every seq below
+// it. The row alone is not enough — anti-entropy does not deliver a chain in
+// seq order, and a replica holding rows 1 and 3 but not 2 must not be resealed
+// or treated as the host's history.
+func auditHistoryArrived(ctx context.Context, c *Client, host string, seq int64, hash string) bool {
+	if !auditRowPresent(ctx, c, host, seq, hash) {
+		return false
+	}
+	rows, err := c.Query(ctx,
+		`SELECT COUNT(DISTINCT seq) AS n FROM audit_log WHERE host_name = ? AND seq BETWEEN 1 AND ?`, host, seq)
+	return err == nil && len(rows) == 1 && rows[0].Int64("n") == seq
 }
 
 // auditRowPresent reports whether host has a row at seq with hash ("" matches
@@ -223,7 +256,7 @@ func auditRowPresent(ctx context.Context, c *Client, host string, seq int64, has
 // spooled under cfg.SpoolDir by an earlier process are kept, and land first.
 // Unset, nothing is held, which is every client but a daemon's.
 func (c *Client) HoldAuditUntilCaughtUp(cfg AuditHoldConfig) {
-	h := &auditHold{cfg: cfg}
+	h := &auditHold{cfg: cfg, coalesced: map[string]string{}}
 	if cfg.SpoolDir != "" {
 		for _, row := range readHeldSpool(cfg.SpoolDir, cfg.Host, false) {
 			h.count++
@@ -231,7 +264,7 @@ func (c *Client) HoldAuditUntilCaughtUp(cfg AuditHoldConfig) {
 				h.nextSeq = row.HeldSeq + 1
 			}
 			if row.Coalesced > 0 {
-				h.coalescedID = row.Record.ID
+				h.coalesced[row.Record.Action] = row.Record.ID
 			}
 		}
 	}
@@ -341,7 +374,10 @@ func (c *Client) landHeldBatch(ctx context.Context, hostName string) (held, more
 		return true, false, err
 	}
 	if h.count > 0 {
-		return true, true, nil
+		// Another batch only if this one landed something. A spool file that is
+		// counted but can be neither read nor set aside lands nothing, and
+		// looping on it would spin on the chain lock; the next poll retries.
+		return true, n > 0, nil
 	}
 	tail.ready = true
 	slog.Info("this host's audit chain has caught up from its peers; held audit rows appended after "+
@@ -351,13 +387,13 @@ func (c *Client) landHeldBatch(ctx context.Context, hostName string) (held, more
 
 // auditHold is the state of one host's hold. Guarded by chainState.mu.
 type auditHold struct {
-	cfg         AuditHoldConfig
-	mem         []heldAuditRow // held rows when there is no spool, or the spool failed
-	count       int            // rows held, spooled and in memory
-	nextSeq     int64          // the next row's HeldSeq; persisted in each row
-	coalescedID string         // the held row denied logins are folded into
-	tailLoaded  bool
-	landed      int
+	cfg        AuditHoldConfig
+	mem        []heldAuditRow    // held rows when there is no spool, or the spool failed
+	count      int               // rows held, spooled and in memory
+	nextSeq    int64             // the next row's HeldSeq; persisted in each row
+	coalesced  map[string]string // action → the held row its denied attempts are folded into
+	tailLoaded bool
+	landed     int
 }
 
 // heldAuditRow is one held row as spooled.
@@ -381,10 +417,12 @@ type heldAuditRow struct {
 	path string // the spool file, when it came from one
 }
 
-// isDeniedLogin is the audited action an unauthenticated caller can repeat at
-// will, and so the one that is coalesced while held.
-func isDeniedLogin(r AuditRecord) bool {
-	return r.Action == "auth.login" && r.Result == "denied"
+// isDenied is a refused attempt: a denied login, which an unauthenticated
+// caller can repeat at will, or a denied action, which any authenticated one
+// can. Either would otherwise fill the hold for everyone, so while held each
+// action's denials are folded into one row.
+func isDenied(r AuditRecord) bool {
+	return r.Result == "denied"
 }
 
 // holdAuditLocked holds r instead of appending it, when the hold applies and
@@ -402,18 +440,18 @@ func (c *Client) holdAuditLocked(ctx context.Context, tail *chainTail, r AuditRe
 		at = c.now().UTC().Format(time.RFC3339Nano)
 		r.Timestamp = ""
 	}
-	if isDeniedLogin(r) && h.coalescedID != "" {
-		c.coalesceDeniedLoginLocked(h, r, at)
+	if isDenied(r) && h.coalesced[r.Action] != "" {
+		c.coalesceDeniedLocked(h, r, at)
 		return true, nil
 	}
 	row := heldAuditRow{Record: r, At: at, HeldSeq: h.nextSeq}
-	if isDeniedLogin(r) {
+	if isDenied(r) {
 		row.Coalesced = 1
 	}
 	if c.spoolAuditLocked(h, row) {
 		h.nextSeq++
 		if row.Coalesced > 0 {
-			h.coalescedID = r.ID
+			h.coalesced[r.Action] = r.ID
 		}
 	}
 	if h.count == maxHeldAuditRows {
@@ -424,9 +462,10 @@ func (c *Client) holdAuditLocked(ctx context.Context, tail *chainTail, r AuditRe
 	return true, nil
 }
 
-// coalesceDeniedLoginLocked folds a denied login into the held row already
-// carrying them.
-func (c *Client) coalesceDeniedLoginLocked(h *auditHold, r AuditRecord, at string) {
+// coalesceDeniedLocked folds a denied attempt into the held row already
+// carrying its action's denials.
+func (c *Client) coalesceDeniedLocked(h *auditHold, r AuditRecord, at string) {
+	id := h.coalesced[r.Action]
 	if at == "" {
 		at = r.Timestamp
 	}
@@ -435,27 +474,27 @@ func (c *Client) coalesceDeniedLoginLocked(h *auditHold, r AuditRecord, at strin
 		row.LastAt, row.LastTarget, row.LastDetail = at, r.Target, r.Detail
 	}
 	for i := range h.mem {
-		if h.mem[i].Record.ID == h.coalescedID {
+		if h.mem[i].Record.ID == id {
 			update(&h.mem[i])
 			return
 		}
 	}
-	path := heldAuditPath(h.cfg.SpoolDir, h.coalescedID)
+	path := heldAuditPath(h.cfg.SpoolDir, id)
 	row, err := readHeldAudit(path)
 	if err != nil {
-		slog.Error("could not read the coalesced denied-login row back from the audit hold spool; "+
-			"holding this attempt as its own row", "error", err)
-		h.coalescedID = ""
+		slog.Error("could not read the coalesced denied row back from the audit hold spool; "+
+			"holding this attempt as its own row", "action", r.Action, "error", err)
+		delete(h.coalesced, r.Action)
 		nr := heldAuditRow{Record: r, At: at, HeldSeq: h.nextSeq, Coalesced: 1}
 		if c.spoolAuditLocked(h, nr) {
 			h.nextSeq++
-			h.coalescedID = r.ID
+			h.coalesced[r.Action] = r.ID
 		}
 		return
 	}
 	update(&row)
 	if err := writeHeldAudit(h.cfg.SpoolDir, path, row); err != nil {
-		slog.Error("could not update the coalesced denied-login row in the audit hold spool",
+		slog.Error("could not update the coalesced denied row in the audit hold spool",
 			"error", err, "attempt_target", r.Target, "attempt_detail", r.Detail)
 	}
 }
@@ -546,10 +585,14 @@ func (c *Client) auditTargetReached(ctx context.Context, h *auditHold) (bool, st
 	if h.cfg.Target <= 0 {
 		return true, ""
 	}
-	if auditRowPresent(ctx, c, h.cfg.Host, h.cfg.Target, h.cfg.TargetHash) {
+	if auditHistoryArrived(ctx, c, h.cfg.Host, h.cfg.Target, h.cfg.TargetHash) {
 		return true, ""
 	}
 	local, _ := freshHostTailSeq(ctx, c, h.cfg.Host)
+	if auditRowPresent(ctx, c, h.cfg.Host, h.cfg.Target, h.cfg.TargetHash) {
+		return false, fmt.Sprintf("this node holds its admitted audit row (seq %d) but not every row "+
+			"below it yet; waiting for the rest of its history from its peers", h.cfg.Target)
+	}
 	if local >= h.cfg.Target {
 		return false, fmt.Sprintf("this node's copy of its own audit chain reaches seq %d, but its row at seq %d "+
 			"does not hash to %s as the admission record says: it holds a different history than the "+
@@ -585,15 +628,15 @@ func (c *Client) landHeldAuditLocked(ctx context.Context, tail *chainTail, h *au
 		rec := row.Record
 		if row.Coalesced > 1 {
 			rec.Detail = strings.TrimSpace(fmt.Sprintf("%s; coalesced while this host's audit chain was held: "+
-				"%d denied login attempts, first %s, last %s (target=%q %s)",
+				"%d denied attempts, first %s, last %s (target=%q %s)",
 				rec.Detail, row.Coalesced, row.At+rec.Timestamp, row.LastAt, row.LastTarget, row.LastDetail))
 		}
 		if err := insertAuditLocked(ctx, c, tail, rec, at); err != nil {
 			return landed, fmt.Errorf("append held audit row %s: %w", row.Record.ID, err)
 		}
 		landed++
-		if row.Record.ID == h.coalescedID {
-			h.coalescedID = ""
+		if h.coalesced[row.Record.Action] == row.Record.ID {
+			delete(h.coalesced, row.Record.Action)
 		}
 		if row.path != "" {
 			if err := os.Remove(row.path); err != nil && !errors.Is(err, os.ErrNotExist) {

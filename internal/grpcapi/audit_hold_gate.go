@@ -17,9 +17,11 @@ import (
 // is an audited action too; denied ones are coalesced while held and cannot
 // fill the hold by themselves).
 //
-// Peer RPCs from a host acting as the system are never refused: replication and
-// anti-entropy are how the history arrives and the hold drains. A user's call a
-// peer relays under forwarded identity is a client call and is refused.
+// Calls on a cluster host certificate with no user identity are never refused:
+// a peer host acting as the system (replication and anti-entropy are how the
+// history arrives and the hold drains), and root on this node itself, the
+// operator's way in when nothing else can act. A user's call a peer relays
+// under forwarded identity is a client call and is refused.
 
 // auditHoldReadPrefixes are method-name prefixes of RPCs that only read. Anything
 // else is treated as able to write an audit row. Erring that way refuses a read
@@ -30,8 +32,17 @@ var auditHoldReadPrefixes = []string{
 	"Ping", "Ready",
 }
 
+// auditHoldWriteRPCs are read-prefixed RPCs that write audit rows anyway.
+// VerifyBackupRepo audits the check it runs (and a refusal to open the repo).
+var auditHoldWriteRPCs = map[string]bool{
+	"VerifyBackupRepo": true,
+}
+
 func auditHoldReadOnly(fullMethod string) bool {
 	name := methodShortName(fullMethod)
+	if auditHoldWriteRPCs[name] {
+		return false
+	}
 	for _, p := range auditHoldReadPrefixes {
 		if strings.HasPrefix(name, p) {
 			return true
@@ -41,8 +52,8 @@ func auditHoldReadOnly(fullMethod string) bool {
 }
 
 // gateAuditHold refuses fullMethod with Unavailable while this host's audit hold
-// is full, unless it only reads or the caller is a peer host acting as the
-// system. Called by the auth interceptors after authentication, and for the
+// is full, unless it only reads or the caller is a peer host or on-node root
+// with no user identity. Called by the auth interceptors after authentication, and for the
 // pre-session logins.
 func (s *Server) gateAuditHold(ctx context.Context, fullMethod string, preSession bool) error {
 	if s.db == nil || auditHoldReadOnly(fullMethod) || !s.db.AuditHoldFull(s.hostName) {

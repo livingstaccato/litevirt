@@ -354,7 +354,7 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	// of starting a second chain under an old name. Before setup, which starts
 	// the daemon. A name with no history gets no record — and loses any a
 	// previous machine under the name left behind.
-	rejoin, err := AuditRejoinFile(pkiDir, hostName, admitted)
+	rejoin, remove, err := AuditRejoinFile(pkiDir, hostName, serial, admitted)
 	if err != nil {
 		return fmt.Errorf("sign %s's audit admission record: %w", hostName, err)
 	}
@@ -363,8 +363,10 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 		if err := sc.WriteFile(rejoinPath, rejoin, 0644); err != nil {
 			return fmt.Errorf("push %s: %w", corrosion.AuditRejoinFileName, err)
 		}
-	} else if err := sc.Run("rm -f " + ssh.ShellQuote(rejoinPath)); err != nil {
-		return fmt.Errorf("remove a stale %s: %w", corrosion.AuditRejoinFileName, err)
+	} else if remove {
+		if err := sc.Run("rm -f " + ssh.ShellQuote(rejoinPath)); err != nil {
+			return fmt.Errorf("remove a stale %s: %w", corrosion.AuditRejoinFileName, err)
+		}
 	}
 	// Admission must replicate before setup starts the daemon. A re-added node's
 	// local database still contains its tombstone; starting it first lets its boot
@@ -404,17 +406,26 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 
 // AuditRejoinFile is the CA-signed admission record `lv host add` writes into a
 // re-added machine's pki dir (corrosion.AuditRejoinFileName): the audit chain
-// position the admitting node holds for the name. nil for a name with no
-// history, or from a daemon too old to report one.
-func AuditRejoinFile(pkiDir, hostName string, admitted *pb.AdmitHostResponse) ([]byte, error) {
+// position the admitting node holds for the name, bound to the certificate
+// (certSerial) minted for this machine.
+//
+// It returns no record for a name with no history. remove then says whether an
+// existing record on the machine should go: only when the admitting daemon
+// vouched for "no history" (AuditPositionProven). A daemon too old to vouch
+// answers 0 for every name, and deleting a record on its word would let a
+// rebuilt host fork; a record for another certificate is ignored by the daemon
+// anyway.
+func AuditRejoinFile(pkiDir, hostName, certSerial string, admitted *pb.AdmitHostResponse) (record []byte, remove bool, err error) {
 	if admitted.GetAuditTailSeq() <= 0 {
-		return nil, nil
+		return nil, admitted.GetAuditPositionProven(), nil
 	}
-	rj, err := corrosion.SignAuditRejoin(pkiDir, hostName, admitted.GetAuditTailSeq(), admitted.GetAuditTailHash())
+	rj, err := corrosion.SignAuditRejoin(pkiDir, hostName, certSerial,
+		admitted.GetAuditTailSeq(), admitted.GetAuditTailHash())
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return json.MarshalIndent(rj, "", "  ")
+	b, err := json.MarshalIndent(rj, "", "  ")
+	return b, false, err
 }
 
 // ensureLocalPeer adds a gossip peer address to the local daemon config if not already present.

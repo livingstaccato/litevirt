@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"testing"
 
@@ -89,5 +90,51 @@ func TestAuditHoldGate_DeniedLoginsCannotFillIt(t *testing.T) {
 	}
 	if err := interceptOK(t, s, "/litevirt.v1.LiteVirt/DeleteVM"); err != nil {
 		t.Fatalf("DeleteVM refused after denied logins: %v", err)
+	}
+}
+
+// TestAuditHoldGate_PeersAndOnNodeRootPassAForwardedIdentityDoesNot: on a full
+// hold, a cluster host acting as the system (replication is how the hold
+// drains) and root on this node (the operator's way in) pass; a user's call a
+// peer relays under forwarded identity is a client call and is refused.
+//
+// Mutations: drop the system exemption — the peer and local root are refused;
+// exempt on peer transport alone — the forwarded identity passes.
+func TestAuditHoldGate_PeersAndOnNodeRootPassAForwardedIdentityDoesNot(t *testing.T) {
+	s := heldServer(t, 1)
+	if err := corrosion.InsertAuditLog(context.Background(), s.db, corrosion.AuditRecord{
+		HostName: s.hostName, Action: "vm.delete", Target: "vm0", Result: "success",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.db.AuditHoldFull(s.hostName) {
+		t.Fatal("fixture: the hold is not full")
+	}
+	const deleteVM = "/litevirt.v1.LiteVirt/DeleteVM"
+
+	localRoot := context.WithValue(certCtx(s.hostName, x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth),
+		ctxKeyAuthMethod, authMethodMTLS)
+	localRoot = context.WithValue(localRoot, ctxKeyMTLSCommonName, s.hostName)
+	localRoot = context.WithValue(localRoot, ctxKeyPrincipalKind, principalKindLocalRoot)
+
+	forwarded := context.WithValue(unrowedPeerCtx(), ctxKeyAuthMethod, authMethodSession)
+	forwarded = context.WithValue(forwarded, ctxKeyUsername, "alice")
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		want codes.Code
+	}{
+		{"peer host as the system", unrowedPeerCtx(), codes.OK},
+		{"root on this node", localRoot, codes.OK},
+		{"forwarded user identity", forwarded, codes.Unavailable},
+		{"plain client", adminCtx(), codes.Unavailable},
+	} {
+		if got := status.Code(s.gateAuditHold(tc.ctx, deleteVM, false)); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+	if got := status.Code(s.gateAuditHold(adminCtx(), "/litevirt.v1.LiteVirt/VerifyBackupRepo", false)); got != codes.Unavailable {
+		t.Errorf("VerifyBackupRepo writes audit rows and must be refused on a full hold: %v", got)
 	}
 }

@@ -286,7 +286,7 @@ func AdoptAuditKey(ctx context.Context, c *Client, keyring *AuditKeyring, hostNa
 	// old name, nothing above could raise the start past a replica that is still
 	// short of the history the CA retirement already accounts for. The CA's
 	// record is the one input here the host does not author.
-	if ca, cerr := caRetirementFloor(ctx, c, keyring, hostName); cerr != nil {
+	if ca, cerr := CARetirementFloor(ctx, c, keyring, hostName); cerr != nil {
 		return "", cerr
 	} else if ca > startSeq {
 		startSeq = ca
@@ -542,7 +542,7 @@ func verifiedLifecycleRows(ctx context.Context, c *Client, keyring *AuditKeyring
 	return verified, nil
 }
 
-// caRetirementFloor is the highest sequence at which the cluster CA retired any
+// CARetirementFloor is the highest sequence at which the cluster CA retired any
 // of hostName's keys, or 0.
 //
 // It is the one boundary a rebuilt host cannot choose for itself. `lv host rm`
@@ -550,7 +550,7 @@ func verifiedLifecycleRows(ctx context.Context, c *Client, keyring *AuditKeyring
 // the cluster held for the host when it was removed. So everything at or below
 // it was written by the machine that was removed, and a key adopted afterwards
 // under the same name cannot have committed to any of it.
-func caRetirementFloor(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (int64, error) {
+func CARetirementFloor(ctx context.Context, c *Client, keyring *AuditKeyring, hostName string) (int64, error) {
 	rows, err := verifiedLifecycleRows(ctx, c, keyring)
 	if err != nil {
 		return 0, err

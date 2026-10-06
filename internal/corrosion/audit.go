@@ -1027,7 +1027,17 @@ func isUnknownKeyErr(err error) bool {
 // re-based at a particular moment is itself part of the permanent record. An
 // operator reading `lv audit verify` can see that it happened and when; the
 // pre-v45 behaviour left no trace at all.
+//
+// Never while this host's audit rows are held for history that has not arrived
+// (audit_hold.go). A rebuilt host's replica can hold rows 1 and 3 of its chain
+// and not 2; a reseal then recomputes row 3 against row 1, and the rewrite
+// replicates and is applied by every peer, breaking the chain cluster-wide and
+// leaving the admitted row unmatchable. Whatever reseal the host's history
+// needed was done by the machine that wrote it.
 func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, error) {
+	if c.AuditChainHeld(ctx, hostName) {
+		return 0, ErrAuditChainNotCaughtUp
+	}
 	c.auditChain.mu.Lock()
 	hash, resealed, err := resealHostChainLocked(ctx, c, hostName)
 	if err != nil {
@@ -1090,7 +1100,8 @@ const auditResealGuardedSQL = `UPDATE audit_log SET prev_hash = ?, content_hash 
 // peer then reports as broken. Returns the resealed tail hash + rows rewritten.
 // Caller must hold auditChainState.mu. A host authors all its own rows
 // locally, so the local DB has the complete sub-chain even right after a
-// restart (replication only brings OTHER hosts' rows).
+// restart — except a host rebuilt under an old name, whose history arrives by
+// replication, which is why ResealAuditChain refuses while its rows are held.
 func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (string, int, error) {
 	rows, err := c.Query(ctx,
 		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash, signature, seq

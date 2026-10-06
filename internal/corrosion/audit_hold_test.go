@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/pki"
 )
 
 // caRetire records what `lv host rm` records for a removed host: a retirement of
@@ -45,7 +47,16 @@ func auditSeqOf(t *testing.T, c *Client, id string) (int64, bool) {
 // into dir, signed with dir's cluster CA.
 func writeRejoin(t *testing.T, dir, host string, seq int64, hash string) {
 	t.Helper()
-	rj, err := SignAuditRejoin(dir, host, seq, hash)
+	serial, err := pki.CertSerial(filepath.Join(dir, "host.crt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRejoinFor(t, dir, host, serial, seq, hash)
+}
+
+func writeRejoinFor(t *testing.T, dir, host, serial string, seq int64, hash string) {
+	t.Helper()
+	rj, err := SignAuditRejoin(dir, host, serial, seq, hash)
 	if err != nil {
 		t.Fatalf("SignAuditRejoin: %v", err)
 	}
@@ -391,7 +402,7 @@ func TestAuditHold_DeniedLoginsAreCoalesced(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("%d login rows (%v), want one coalesced row", len(rows), err)
 	}
-	if d := rows[0].String("detail"); !strings.Contains(d, "50 denied login attempts") || !strings.Contains(d, "user49") {
+	if d := rows[0].String("detail"); !strings.Contains(d, "50 denied attempts") || !strings.Contains(d, "user49") {
 		t.Fatalf("coalesced row's detail %q does not carry the count and the last attempt", d)
 	}
 }
@@ -431,7 +442,7 @@ func TestAuditHold_RejectsASpoolFileForAnotherHost(t *testing.T) {
 // wrote — so its unsigned ones became "unsigned after signed" findings. The CA's
 // retirement boundary is the floor.
 //
-// Mutation: drop the caRetirementFloor raise in AdoptAuditKey — the adoption is
+// Mutation: drop the CARetirementFloor raise in AdoptAuditKey — the adoption is
 // recorded at 1.
 func TestAdoptAuditKey_NeverStartsBelowACARetirement(t *testing.T) {
 	ctx := context.Background()
@@ -464,5 +475,158 @@ func TestAdoptAuditKey_NeverStartsBelowACARetirement(t *testing.T) {
 	if got := rows[0].Int64("at_seq"); got < 3 {
 		t.Fatalf("the new key's contract starts at seq %d, below the CA retirement at 3: rows the "+
 			"removed machine wrote are claimed by a key adopted after it was gone", got)
+	}
+}
+
+// TestAuditHold_ARecordForAnotherCertificateIsIgnored: a record left in a
+// reused pki dir by an earlier admission names that admission's certificate,
+// not this machine's, and must not set this machine's target — an old, lower
+// target would open the hold early.
+//
+// Mutation: drop the serial comparison in LoadAuditRejoin — the stale record
+// sets a target.
+func TestAuditHold_ARecordForAnotherCertificateIsIgnored(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+	dir := testPKI(t, "node-0")
+	writeRejoinFor(t, dir, "node-0", "0badc0ffee", 7, "ab")
+	cfg, err := ConfigureAuditHold(ctx, c, dir, "node-0", "")
+	if err == nil || !strings.Contains(err.Error(), "earlier admission") || cfg.Target != 0 {
+		t.Fatalf("ConfigureAuditHold = %+v, %v; want the stale record ignored and reported", cfg, err)
+	}
+}
+
+// TestAuditHold_TheLegacyResealWaitsForTheHistory is I-B: a rebuilt host whose
+// replica holds unsigned rows 1 and 3 of its chain, and not 2, must not reseal
+// them. The reseal would recompute row 3 against row 1 and replicate the
+// rewrite over every peer's good copy.
+//
+// Mutations: drop the AuditChainHeld check in ResealAuditChain, or the
+// completeness check in auditTargetReached — either way row 3 is rewritten.
+func TestAuditHold_TheLegacyResealWaitsForTheHistory(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+	dir := testPKI(t, "node-0")
+	for i := 1; i <= 3; i++ {
+		ins(t, c, fmt.Sprintf("old-%d", i), "node-0", "")
+	}
+	seq, hash, err := AuditChainTail(ctx, c, "node-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeRejoin(t, dir, "node-0", seq, hash)
+	before := rowsByID(t, c, "old-3")[0]
+	if err := c.Execute(ctx, `DELETE FROM audit_log WHERE id = 'old-2'`); err != nil {
+		t.Fatal(err)
+	}
+	// Row 3 — the admitted row itself — has arrived; row 2 has not. The hold
+	// has not opened: the history below the target is incomplete.
+	c.ResetAuditChainForTests()
+	if cfg, _ := ConfigureAuditHold(ctx, c, dir, "node-0", ""); cfg.Target == 0 {
+		t.Fatal("fixture: no hold")
+	}
+	if n, err := ResealAuditChain(ctx, c, "node-0"); err != ErrAuditChainNotCaughtUp || n != 0 {
+		t.Fatalf("ResealAuditChain while held = %d, %v; want ErrAuditChainNotCaughtUp", n, err)
+	}
+	after := rowsByID(t, c, "old-3")[0]
+	if after["prev_hash"] != before["prev_hash"] || after["content_hash"] != before["content_hash"] {
+		t.Fatalf("row 3 was rewritten by a reseal of a partial replica:\n  before %v\n  after  %v", before, after)
+	}
+}
+
+// TestAuditHold_AnUnreadableTailHolds is M-B: when the check that would skip
+// the hold cannot be made, the node holds rather than append to a tail it could
+// not read.
+//
+// Mutation: return before installing the hold on a read error — no target.
+func TestAuditHold_AnUnreadableTailHolds(t *testing.T) {
+	ctx := context.Background()
+	c := newAuditTestClient(t)
+	dir := testPKI(t, "node-0")
+	writeRejoin(t, dir, "node-0", 4, "ab")
+	if _, err := c.DB().Exec(`ALTER TABLE audit_log RENAME TO audit_log_gone`); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ConfigureAuditHold(ctx, c, dir, "node-0", "")
+	if err == nil || cfg.Target != 4 {
+		t.Fatalf("ConfigureAuditHold = %+v, %v; want the record's target and the error", cfg, err)
+	}
+	if !c.AuditChainHeld(ctx, "node-0") {
+		t.Fatal("not held after a failed tail read")
+	}
+}
+
+// TestAuditHold_LandingDoesNotSpinOnAStuckSpoolFile is M-C: a spool file that
+// is counted but can be neither read nor set aside lands nothing, and the land
+// loop must return to its poll instead of spinning on the chain lock.
+//
+// Mutation: keep looping after a batch that landed nothing — LandHeldAudit
+// never returns.
+func TestAuditHold_LandingDoesNotSpinOnAStuckSpoolFile(t *testing.T) {
+	ctx := context.Background()
+	c, dir, late := rebuiltClient(t, 2, 1)
+	spool := t.TempDir()
+	if _, err := ConfigureAuditHold(ctx, c, dir, "node-0", spool); err != nil {
+		t.Fatal(err)
+	}
+	// A directory named like a spool file, whose .rejected name is taken by a
+	// non-empty directory: unreadable, and the rename aside fails.
+	stuck := filepath.Join(spool, "00stuck.json")
+	if err := os.MkdirAll(stuck, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(spool, "00stuck.rejected", "x"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ins(t, c, "held-1", "node-0", "")
+	restoreRows(t, c, late)
+	done := make(chan bool, 1)
+	go func() {
+		held, _ := c.LandHeldAudit(ctx, "node-0")
+		done <- held
+	}()
+	select {
+	case held := <-done:
+		if !held {
+			t.Fatal("reported nothing held while a spool file is still counted")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("LandHeldAudit spun on a spool file it could neither read nor set aside")
+	}
+	if _, ok := auditSeqOf(t, c, "held-1"); !ok {
+		t.Fatal("the readable held row did not land")
+	}
+}
+
+// TestAuditHold_DeniedActionsAreCoalescedPerAction is M-G: an authenticated
+// caller repeating a refused action cannot fill the hold either. Each action's
+// denials fold into one row.
+func TestAuditHold_DeniedActionsAreCoalescedPerAction(t *testing.T) {
+	SetMaxHeldAuditRowsForTest(t, 3)
+	ctx := context.Background()
+	c, dir, late := rebuiltClient(t, 2, 1)
+	if _, err := ConfigureAuditHold(ctx, c, dir, "node-0", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		for _, action := range []string{"vm.delete", "ct.exec"} {
+			if err := InsertAuditLog(ctx, c, AuditRecord{Username: "viewer", HostName: "node-0",
+				Action: action, Target: fmt.Sprintf("x%d", i), Detail: "permission denied", Result: "denied"}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if c.AuditHoldFull("node-0") {
+		t.Fatal("denied actions filled the hold")
+	}
+	restoreRows(t, c, late)
+	if land(t, c) {
+		t.Fatal("still held")
+	}
+	for _, action := range []string{"vm.delete", "ct.exec"} {
+		rows, err := c.Query(ctx, `SELECT detail FROM audit_log WHERE action = ?`, action)
+		if err != nil || len(rows) != 1 || !strings.Contains(rows[0].String("detail"), "30 denied attempts") {
+			t.Fatalf("%s: %d rows (%v), want one carrying 30 denied attempts", action, len(rows), err)
+		}
 	}
 }

@@ -44,6 +44,7 @@ const auditHeadInterval = 5 * time.Minute
 // its real replicated history and pin a boundary there permanently. See
 // finishAuditKeyLifecycle, called once replication is up.
 func (d *Daemon) wireAuditKeyring(ctx context.Context) {
+	defer d.markAuditKeyringWired()
 	if !d.cfg.Enforcement.AuditSignature {
 		// A non-signing node still needs the cluster CA: a keyring is what
 		// verifies a lifecycle record, so a node without one ignores every
@@ -204,6 +205,14 @@ func (d *Daemon) configureAuditHold(ctx context.Context) {
 // whose audit rows are not reaching the cluster. It never opens a hold whose
 // history has not arrived.
 func (d *Daemon) runAuditHold(ctx context.Context) {
+	// Nothing lands before the signing keyring is installed: a row landed
+	// before it is written unsigned after a signed history, which verify
+	// reports as unsigned-after-signed.
+	select {
+	case <-ctx.Done():
+		return
+	case <-d.auditKeyringWired():
+	}
 	var lastReport time.Time
 	raised := false
 	for {
@@ -233,6 +242,17 @@ func (d *Daemon) runAuditHold(ctx context.Context) {
 		case <-time.After(auditHoldPoll):
 		}
 	}
+}
+
+// auditKeyringWired is closed once wireAuditKeyring has run.
+func (d *Daemon) auditKeyringWired() <-chan struct{} {
+	d.auditWiredOnce.Do(func() { d.auditWired = make(chan struct{}) })
+	return d.auditWired
+}
+
+func (d *Daemon) markAuditKeyringWired() {
+	d.auditKeyringWired()
+	d.auditWiredDone.Do(func() { close(d.auditWired) })
 }
 
 // writeAuditHoldCondition raises or resolves audit_chain_held about this host.

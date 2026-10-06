@@ -2849,6 +2849,14 @@ message AdmitHostRequest {
 message AdmitHostResponse {
     int64 audit_tail_seq = 1;
     string audit_tail_hash = 2;
+    // True when the answering daemon vouches for the position: its replica has
+    // caught up with a peer (or it founded a cluster it is alone in), it is not
+    // itself holding its own audit rows, and the name's tail is not below a CA
+    // retirement it knows of. A daemon that cannot vouch refuses instead, so
+    // false means a daemon too old to say — and `lv host add` then leaves any
+    // admission record already on the machine alone rather than remove it on a
+    // "no history" it cannot trust.
+    bool audit_position_proven = 3;
 }
 
 // ── Host network configuration (schema v48, §O Tier 1) ──

@@ -124,7 +124,7 @@ func TestFleet_AuditChainSurvivesThreeRebuildsUnderTheSameNames(t *testing.T) {
 		if admitted.GetAuditTailSeq() != 4 {
 			t.Fatalf("%s admitted with audit tail %d, want 4", n.Name, admitted.GetAuditTailSeq())
 		}
-		rejoin, err := cli.AuditRejoinFile(cli.PKIDir(), n.Name, admitted)
+		rejoin, _, err := cli.AuditRejoinFile(cli.PKIDir(), n.Name, serial, admitted)
 		if err != nil {
 			t.Fatalf("sign %s's admission record: %v", n.Name, err)
 		}

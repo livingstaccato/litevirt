@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -62,6 +63,12 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// auditWired is closed once wireAuditKeyring has installed the keyring
+	// audit rows are signed with; runAuditHold lands nothing before it.
+	auditWiredOnce sync.Once
+	auditWired     chan struct{}
+	auditWiredDone sync.Once
+
 	cfg     *Config
 	db      *corrosion.Client
 	virt    *libvirt.Client
@@ -351,11 +358,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (corrosion/audit_hold.go). Rows held across a restart are in the spool and
 	// land first.
 	d.configureAuditHold(ctx)
-	go d.runAuditHold(ctx)
 
 	// Before anything that writes an audit row is built: every writer signs with
 	// the keyring this installs on d.db.
 	d.wireAuditKeyring(ctx)
+
+	// After the keyring: rows an earlier process left in the spool may land on
+	// the first poll, and landed before it they would be written unsigned
+	// (runAuditHold also waits for the wiring, whatever the order here).
+	go d.runAuditHold(ctx)
 
 	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
 	// still entirely unsigned.
@@ -378,7 +389,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if signed {
 		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
 		d.db.NoteAuditResealNotNeeded(d.cfg.HostName)
-	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
+	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); errors.Is(err, corrosion.ErrAuditChainNotCaughtUp) {
+		// A rebuilt host whose history has not arrived: a reseal of a partial
+		// replica would rewrite rows its peers hold intact.
+		slog.Info("audit: skipping the legacy reseal while this host's audit history is still arriving",
+			"host", d.cfg.HostName)
+	} else if err != nil {
 		// Logged, not fatal. Until a reseal succeeds the legacy tail is not
 		// anchored (corrosion.ErrAuditAnchorWithheld): an anchor over the
 		// un-rebased tail would read as a truncation once it is rebased.
@@ -852,6 +868,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
 	svc.SetRBACRealm(d.cfg.Auth.RBACRealm)
+	svc.SetJoinedCluster(len(d.cfg.JoinPeers) > 0)
 	// Split-brain-family enforcement kill-switches — so the HA monitor drives the
 	// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
 	// config intent. The actual enforcement predicates live on the consumers

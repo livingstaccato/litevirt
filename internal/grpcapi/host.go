@@ -1129,9 +1129,9 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 // The response carries the name's audit chain position on this node (the last
 // seq and its hash), which `lv host add` signs and hands to the new machine so
 // it does not append to its own chain before that history has reached it
-// (corrosion/audit_hold.go). It is read from THIS replica, so a node that has
-// not caught up refuses: a stale position would let the rebuilt host open its
-// hold early and fork.
+// (corrosion/audit_hold.go). It is read from THIS replica, which therefore has
+// to be able to vouch for it (auditAdmissionPosition), or the admission is
+// refused.
 func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.AdmitHostResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -1158,12 +1158,9 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 				"remove the workload (`lv rm <vm>`, `lv ct rm <name>`). Then add the host again",
 			req.Name, len(left), strings.Join(left, ", "))
 	}
-	if err := s.requireReplicaCaughtUp(ctx, "AdmitHost"); err != nil {
-		return nil, err
-	}
-	tailSeq, tailHash, err := corrosion.AuditChainTail(ctx, s.db, req.Name)
+	tailSeq, tailHash, err := s.auditAdmissionPosition(ctx, req.Name)
 	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "read %s's audit chain position: %v", req.Name, err)
+		return nil, err
 	}
 	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
 		Name:       req.Name,
@@ -1178,7 +1175,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.A
 		return nil, status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
-	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash}, nil
+	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash, AuditPositionProven: true}, nil
 }
 
 // hostAllocatedResources returns running-VM CPU and memory, and the DECLARED

@@ -26794,8 +26794,16 @@ type AdmitHostResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	AuditTailSeq  int64                  `protobuf:"varint,1,opt,name=audit_tail_seq,json=auditTailSeq,proto3" json:"audit_tail_seq,omitempty"`
 	AuditTailHash string                 `protobuf:"bytes,2,opt,name=audit_tail_hash,json=auditTailHash,proto3" json:"audit_tail_hash,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// True when the answering daemon vouches for the position: its replica has
+	// caught up with a peer (or it founded a cluster it is alone in), it is not
+	// itself holding its own audit rows, and the name's tail is not below a CA
+	// retirement it knows of. A daemon that cannot vouch refuses instead, so
+	// false means a daemon too old to say — and `lv host add` then leaves any
+	// admission record already on the machine alone rather than remove it on a
+	// "no history" it cannot trust.
+	AuditPositionProven bool `protobuf:"varint,3,opt,name=audit_position_proven,json=auditPositionProven,proto3" json:"audit_position_proven,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *AdmitHostResponse) Reset() {
@@ -26840,6 +26848,13 @@ func (x *AdmitHostResponse) GetAuditTailHash() string {
 		return x.AuditTailHash
 	}
 	return ""
+}
+
+func (x *AdmitHostResponse) GetAuditPositionProven() bool {
+	if x != nil {
+		return x.AuditPositionProven
+	}
+	return false
 }
 
 // ── Host network configuration (schema v48, §O Tier 1) ──
@@ -34112,10 +34127,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1f\n" +
 	"\vcert_serial\x18\x03 \x01(\tR\n" +
-	"certSerial\"a\n" +
+	"certSerial\"\x95\x01\n" +
 	"\x11AdmitHostResponse\x12$\n" +
 	"\x0eaudit_tail_seq\x18\x01 \x01(\x03R\fauditTailSeq\x12&\n" +
-	"\x0faudit_tail_hash\x18\x02 \x01(\tR\rauditTailHash\"\xc2\x03\n" +
+	"\x0faudit_tail_hash\x18\x02 \x01(\tR\rauditTailHash\x122\n" +
+	"\x15audit_position_proven\x18\x03 \x01(\bR\x13auditPositionProven\"\xc2\x03\n" +
 	"\vHostNetwork\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +

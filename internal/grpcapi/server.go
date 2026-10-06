@@ -581,6 +581,10 @@ type Server struct {
 	// migration copies (hostDiskFile, SetHostDiskRootForTest). Empty in
 	// production.
 	hostDiskRoot string
+	// firmwareLayoutDir is a FLEET TEST SEAM: the dataDir the firmware layout
+	// fingerprint names, in place of this server's own
+	// (SetFirmwareLayoutDirForTest). Empty in production.
+	firmwareLayoutDir string
 	// drainCrashAt is a FLEET TEST SEAM: drainRunningVMCold asks it at each
 	// point a daemon could die mid-move, and stops right there, as a crash
 	// would, when it returns true (SetDrainCrashForTest). Nil in production.

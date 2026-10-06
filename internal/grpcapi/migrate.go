@@ -210,11 +210,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	if fwVM {
 		if req.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
 			return status.Errorf(codes.FailedPrecondition,
-				"Secure Boot / vTPM VM %q must be migrated cold (--cold); live firmware carry is not yet a validated path", req.VmName)
+				"Secure Boot / vTPM VM %q must be migrated cold (--cold), and stopped: live firmware carry is not yet a validated path — "+
+					"stop it (`lv stop %s`), then `lv migrate %s %s --cold`", req.VmName, req.VmName, req.VmName, req.TargetHost)
 		}
 		if vm.State != "stopped" {
 			return status.Errorf(codes.FailedPrecondition,
-				"stop Secure Boot / vTPM VM %q before migrating it — its firmware state can't be captured consistently while running", req.VmName)
+				"stop Secure Boot / vTPM VM %q before migrating it — its firmware state can't be captured consistently while running: "+
+					"`lv stop %s`, then `lv migrate %s %s --cold`", req.VmName, req.VmName, req.VmName, req.TargetHost)
 		}
 	} else if !coldStopped && vm.State != "running" {
 		if vm.State == "stopped" {
@@ -1396,20 +1398,17 @@ func (s *Server) ensureFirmwareStateOnTarget(ctx context.Context, targetHost, vm
 }
 
 // coldMoveDisks reads the VM's disk records and applies the cold path's
-// refusals that need no domain: a Secure-Boot/vTPM VM with a host-local disk,
-// a VM holding a PCI passthrough device, and a VM with no domain defined here.
-func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord, fwVM bool) ([]corrosion.DiskRecord, error) {
+// refusals that need no domain: a VM holding a PCI passthrough device, and a
+// VM with no domain defined here.
+//
+// A Secure-Boot/vTPM VM with a host-local disk is not refused. It was, from
+// before this path copied host-local disks at all; it now moves as any stopped
+// VM does, its disks streamed first and its firmware bundle carried with the
+// domain's define, and a failure before the handoff takes both back.
+func (s *Server) coldMoveDisks(ctx context.Context, vm *corrosion.VMRecord) ([]corrosion.DiskRecord, error) {
 	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "query disks for %q: %v", vm.Name, err)
-	}
-	if fwVM {
-		for _, d := range disks {
-			if isHostLocalDisk(d) {
-				return nil, status.Errorf(codes.FailedPrecondition,
-					"Secure Boot / vTPM VM %q has a host-local disk (%s) and can't be migrated while stopped — move it to shared storage first (host-local firmware-VM migration is a follow-up)", vm.Name, d.StorageType)
-			}
-		}
 	}
 	// PCI/hostdev passthrough isn't carried by this path — the source XML embeds
 	// source host PCI addresses that won't be valid (or assigned) on the target.
@@ -1448,8 +1447,7 @@ func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, 
 	if s.virt == nil {
 		return status.Errorf(codes.Internal, "libvirt not connected on host %s", s.hostName)
 	}
-	fwSpec := parseFirmwareSpec(vm.Spec)
-	disks, err := s.coldMoveDisks(ctx, vm, fwSpec.SecureBoot || fwSpec.Tpm)
+	disks, err := s.coldMoveDisks(ctx, vm)
 	if err != nil {
 		return err
 	}
@@ -1498,8 +1496,8 @@ func (s *Server) coldMovePreflight(ctx context.Context, vm *corrosion.VMRecord, 
 // migration — a Secure-Boot/vTPM VM, which is always migrated this way, or any
 // other VM migrated with --cold while stopped. In order:
 //
-//  1. each host-local disk file is streamed to the target (ReceiveMigrationDisk;
-//     a Secure-Boot/vTPM VM must be on shared storage, see below);
+//  1. each host-local disk file is streamed to the target (ReceiveMigrationDisk),
+//     a Secure-Boot/vTPM VM's included;
 //  2. the domain is defined on the target from this host's XML, with the
 //     quiescent firmware bundle of a firmware VM (EnsureFirmwareState);
 //  3. the VM and every one of its disk records move to the target in ONE
@@ -1520,7 +1518,7 @@ func (s *Server) coldMigrateStoppedVM(ctx context.Context, vm *corrosion.VMRecor
 	}
 	// Must read disks successfully — proceeding on an error would skip the
 	// host-local refusal AND the disk-ownership updates, diverging VM/disk records.
-	disks, err := s.coldMoveDisks(ctx, vm, fwVM)
+	disks, err := s.coldMoveDisks(ctx, vm)
 	if err != nil {
 		return err
 	}

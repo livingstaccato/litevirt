@@ -26,11 +26,23 @@ import (
 // mismatch rather than defining a domain pointing at the source's paths (G1).
 func (s *Server) firmwareLayoutFingerprint() string {
 	fp := s.firmware
+	dataDir := s.dataDir
+	if s.firmwareLayoutDir != "" {
+		dataDir = s.firmwareLayoutDir
+	}
 	h := sha256.Sum256([]byte(strings.Join([]string{
-		s.dataDir, fp.Code, fp.Vars, fp.SecbootCode, fp.MsVars,
+		dataDir, fp.Code, fp.Vars, fp.SecbootCode, fp.MsVars,
 	}, "\x00")))
 	return hex.EncodeToString(h[:])
 }
+
+// SetFirmwareLayoutDirForTest makes the firmware layout fingerprint name dir
+// as this host's dataDir. Every host of a real cluster has the same dataDir,
+// which is what lets a firmware VM's domain XML define on another host; the
+// fleet runs its nodes on one filesystem, each with a dataDir of its own, so
+// without this no cold move of a firmware VM between two of them gets past
+// the target's layout check. Never set in production.
+func (s *Server) SetFirmwareLayoutDirForTest(dir string) { s.firmwareLayoutDir = dir }
 
 // domainIdentity extracts the <name> and <uuid> from a domain XML, for
 // validating a pushed migration definition against the request.

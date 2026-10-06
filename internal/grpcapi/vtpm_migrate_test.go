@@ -295,30 +295,8 @@ func TestCleanupMigrationArtifacts_RefusesPathOutsideDataDir(t *testing.T) {
 	}
 }
 
-// The stopped-firmware cold move requires shared storage — a host-local disk
-// can't be block-copied while stopped, so it's refused (would leave disks behind).
-func TestColdMigrateFirmwareVM_RefusesLocalDisk(t *testing.T) {
-	s := testServerWithLocks(t)
-	s.virt = libvirtfake.New()
-	s.dataDir = t.TempDir()
-	ctx := adminCtx()
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{
-		Name: "fw", HostName: s.hostName, Spec: `{"name":"fw","tpm":true,"uuid":"u1"}`, State: "stopped",
-	}, nil, []corrosion.DiskRecord{
-		{VMName: "fw", DiskName: "root", HostName: s.hostName, Path: "/x/root.qcow2", StorageType: "dir"},
-	}); err != nil {
-		t.Fatalf("InsertVM: %v", err)
-	}
-	vm, _ := corrosion.GetVM(ctx, s.db, "fw")
-	err := s.coldMigrateStoppedVM(ctx, vm, &corrosion.HostRecord{Name: "t1"},
-		firmwareSpec{Tpm: true, UUID: "u1"}, &migrationAbort{}, func(pb.MigratePhase, float32, float32) error { return nil })
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("expected FailedPrecondition for a host-local (dir) firmware migration, got %v", err)
-	}
-	if !strings.Contains(err.Error(), "shared storage") {
-		t.Errorf("error should steer to shared storage, got: %v", err)
-	}
-}
+// A stopped firmware VM with a host-local disk is no longer refused: it moves
+// with its disks and its firmware (TestColdMigrateStoppedVM_CarriesFirmwareWithAHostLocalDisk).
 
 // Drain must refuse an SB/vTPM VM regardless of storage type (firmware isn't
 // transferred by reassignment / raw live-migrate).
@@ -331,8 +309,12 @@ func TestDrainOneVM_RefusesFirmwareVM(t *testing.T) {
 	if prog.Status != "skipped" {
 		t.Fatalf("expected firmware VM drain to be skipped, got %q (err=%q)", prog.Status, prog.Error)
 	}
-	if !strings.Contains(prog.Error, "migrate it explicitly") {
-		t.Errorf("skip reason should point to explicit migration, got: %q", prog.Error)
+	// It names the routes that work for a stopped one: stop, then drain
+	// again or migrate it cold.
+	for _, w := range []string{"`lv stop fw`", "drain again", "`lv migrate fw <target-host> --cold`"} {
+		if !strings.Contains(prog.Error, w) {
+			t.Errorf("skip reason should name %q, got: %q", w, prog.Error)
+		}
 	}
 }
 

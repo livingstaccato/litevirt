@@ -197,8 +197,9 @@ live. Libvirt still migrates it, so a host-local disk needs `--with-storage`,
 or stop the VM first. A stopped VM migrated live is refused, with a message
 pointing to `--cold`.
 
-Secure Boot / vTPM VMs are always migrated stopped and cold, and need shared
-storage; see [cli-reference.md](cli-reference.md).
+Secure Boot / vTPM VMs are always migrated stopped and cold. Their host-local
+disks are copied as any stopped VM's are, and their firmware state (UEFI vars
+and vTPM) is carried with them; see [cli-reference.md](cli-reference.md).
 
 ## Host drain
 
@@ -214,8 +215,9 @@ other VM moves the way `lv migrate <vm> <target> --cold` moves a stopped VM
 (see [Cold migration](#cold-migration)): its host-local disks (`local` and
 `dir` storage) are copied to the target, its domain is defined there, and the
 VM and its disk records move in one transaction. It is refused for the same
-reasons. A Secure Boot / vTPM VM drains only while stopped and on shared
-storage.
+reasons. A Secure Boot / vTPM VM drains only while stopped, with its
+host-local disks and its firmware; a running one is reported with the commands
+to stop it and move it.
 
 - A **stopped** VM stays stopped on the target.
 - A **running** VM with a host-local disk is checked first, while it still

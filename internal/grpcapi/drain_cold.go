@@ -44,8 +44,8 @@ func (s *Server) drainColdMove(ctx context.Context, vm *corrosion.VMRecord, targ
 
 // drainStoppedVM drains a STOPPED VM through the same path as `lv migrate
 // <vm> <target> --cold`, with the same preconditions and refusals: capacity on
-// the target, a Secure-Boot/vTPM VM's shared-storage requirement, snapshots on
-// a host-local disk, a disk that cannot be flattened, free space, a target too
+// the target, a Secure-Boot/vTPM VM's target capability (its firmware travels
+// with it), snapshots on a host-local disk, a disk that cannot be flattened, free space, a target too
 // old for the disk copy. The caller holds the VM's lock and has re-checked
 // ownership and quorum.
 //

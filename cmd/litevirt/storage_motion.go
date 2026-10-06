@@ -59,7 +59,8 @@ func newReplicateVolumeCmd() *cobra.Command {
 keeps using its source disk; the copy is suitable for off-site DR or
 clone-to-new-VM workflows. The copy is always a new file the daemon names
 in the pool; --target-path (admin only) names it instead, and an existing
-file is refused, never replaced. Only file-based pools are supported.`,
+file is refused, never replaced. A zfs or ceph disk copied into a pool of
+the same driver uses native send/receive into a new dataset or image.`,
 		Args: cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {

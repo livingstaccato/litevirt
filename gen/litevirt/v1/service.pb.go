@@ -18662,12 +18662,19 @@ func (x *GetStoragePoolResponse) GetPool() *StoragePool {
 
 // A file in a (file-based) storage pool — used by the content browser.
 type StoragePoolContent struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // file name
-	Path          string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"` // absolute path on the host (usable as VMSpec.iso)
-	SizeBytes     int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
-	ModifiedAt    string                 `protobuf:"bytes,4,opt,name=modified_at,json=modifiedAt,proto3" json:"modified_at,omitempty"` // RFC3339
-	IsIso         bool                   `protobuf:"varint,5,opt,name=is_iso,json=isIso,proto3" json:"is_iso,omitempty"`               // .iso extension
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Name       string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"` // file name
+	Path       string                 `protobuf:"bytes,2,opt,name=path,proto3" json:"path,omitempty"` // absolute path on the host (usable as VMSpec.iso)
+	SizeBytes  int64                  `protobuf:"varint,3,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	ModifiedAt string                 `protobuf:"bytes,4,opt,name=modified_at,json=modifiedAt,proto3" json:"modified_at,omitempty"` // RFC3339
+	IsIso      bool                   `protobuf:"varint,5,opt,name=is_iso,json=isIso,proto3" json:"is_iso,omitempty"`               // .iso extension
+	// Set for a replica: the VM and disk it is a replica of, and its time. A
+	// listing shows only the replicas of VMs the caller may read, from their
+	// records in the pool's replica area; name is what PromoteReplica.replica
+	// takes.
+	ReplicaVm     string `protobuf:"bytes,6,opt,name=replica_vm,json=replicaVm,proto3" json:"replica_vm,omitempty"`
+	ReplicaDisk   string `protobuf:"bytes,7,opt,name=replica_disk,json=replicaDisk,proto3" json:"replica_disk,omitempty"`
+	ReplicaTaken  string `protobuf:"bytes,8,opt,name=replica_taken,json=replicaTaken,proto3" json:"replica_taken,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -18735,6 +18742,27 @@ func (x *StoragePoolContent) GetIsIso() bool {
 		return x.IsIso
 	}
 	return false
+}
+
+func (x *StoragePoolContent) GetReplicaVm() string {
+	if x != nil {
+		return x.ReplicaVm
+	}
+	return ""
+}
+
+func (x *StoragePoolContent) GetReplicaDisk() string {
+	if x != nil {
+		return x.ReplicaDisk
+	}
+	return ""
+}
+
+func (x *StoragePoolContent) GetReplicaTaken() string {
+	if x != nil {
+		return x.ReplicaTaken
+	}
+	return ""
 }
 
 type ListStoragePoolContentsRequest struct {
@@ -19081,8 +19109,9 @@ func (x *PushReplicaResponse) GetSizeBytes() int64 {
 	return 0
 }
 
-// Delete one file from a file-based pool (used by cross-host replication to
-// prune old replicas on a peer). filename is a base name.
+// Delete one file from a file-based pool. filename is a base name. A file any
+// VM disk on any host uses is refused. (Replicas are pruned with the
+// peer-only PruneReplicas, by record, not through this.)
 type DeleteStoragePoolContentRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	PoolName      string                 `protobuf:"bytes,1,opt,name=pool_name,json=poolName,proto3" json:"pool_name,omitempty"`
@@ -33929,7 +33958,7 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\"F\n" +
 	"\x16GetStoragePoolResponse\x12,\n" +
-	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"\x93\x01\n" +
+	"\x04pool\x18\x01 \x01(\v2\x18.litevirt.v1.StoragePoolR\x04pool\"\xfa\x01\n" +
 	"\x12StoragePoolContent\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x12\n" +
 	"\x04path\x18\x02 \x01(\tR\x04path\x12\x1d\n" +
@@ -33937,7 +33966,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12\x1f\n" +
 	"\vmodified_at\x18\x04 \x01(\tR\n" +
 	"modifiedAt\x12\x15\n" +
-	"\x06is_iso\x18\x05 \x01(\bR\x05isIso\"Q\n" +
+	"\x06is_iso\x18\x05 \x01(\bR\x05isIso\x12\x1d\n" +
+	"\n" +
+	"replica_vm\x18\x06 \x01(\tR\treplicaVm\x12!\n" +
+	"\freplica_disk\x18\a \x01(\tR\vreplicaDisk\x12#\n" +
+	"\rreplica_taken\x18\b \x01(\tR\freplicaTaken\"Q\n" +
 	"\x1eListStoragePoolContentsRequest\x12\x1b\n" +
 	"\tpool_name\x18\x01 \x01(\tR\bpoolName\x12\x12\n" +
 	"\x04host\x18\x02 \x01(\tR\x04host\"^\n" +

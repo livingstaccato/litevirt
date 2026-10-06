@@ -64,14 +64,23 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		}
 	}
 
-	// Files live on the owning host — forward there if it isn't us.
+	// Files live on the owning host — forward there if it isn't us. A user's
+	// listing then gains the replicas of the VMs that user may read, decided
+	// here where the user is known (the owner sees only this host's cert).
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		return client.ListStoragePoolContents(ctx, req)
+		resp, err := client.ListStoragePoolContents(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if s.requirePeerCert(ctx) != nil {
+			s.appendReadableReplicas(ctx, resp, req.PoolName, host)
+		}
+		return resp, nil
 	}
 
 	if !isFileBasedDriver(rec.Driver) {
@@ -123,7 +132,32 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		})
 	}
 	sort.Slice(resp.Contents, func(i, j int) bool { return resp.Contents[i].Name < resp.Contents[j].Name })
+	if s.requirePeerCert(ctx) != nil {
+		s.appendReadableReplicas(ctx, resp, req.PoolName, host)
+	}
 	return resp, nil
+}
+
+// appendReadableReplicas adds to a user's pool listing the replicas of every
+// VM the user may read (canReadVMRecord), each from its records in the pool's
+// replica area on host — never another project's, never a file by name.
+func (s *Server) appendReadableReplicas(ctx context.Context, resp *pb.ListStoragePoolContentsResponse, pool, host string) {
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return
+	}
+	for i := range vms {
+		vm := &vms[i]
+		if !s.canReadVMRecord(ctx, vm) {
+			continue
+		}
+		for _, r := range s.replicaRecordsOn(ctx, pool, host, vm.Project, vm.Name) {
+			resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
+				Name: r.File, SizeBytes: r.SizeBytes,
+				ReplicaVm: vm.Name, ReplicaDisk: r.Disk, ReplicaTaken: r.Taken,
+			})
+		}
+	}
 }
 
 // DeleteStoragePoolContent removes one file from a file-based pool (forwarded

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"time"
 )
 
@@ -59,7 +60,7 @@ func nowSnapTag() string {
 // Used by zfs to detect the previous-replicate snapshot for
 // incremental sends.
 func snapshotExists(ctx context.Context, ref string) bool {
-	_, err := exec.CommandContext(ctx, "zfs", "list", "-t", "snapshot", "-H", "-o", "name", ref).Output()
+	_, err := exec.CommandContext(ctx, "zfs", "list", "-t", "snapshot", "-H", "-o", "name", "--", ref).Output()
 	return err == nil
 }
 
@@ -70,4 +71,15 @@ func snapshotExists(ctx context.Context, ref string) bool {
 func pathExists(p string) bool {
 	_, err := osStat(p)
 	return err == nil
+}
+
+// sortedKeys returns m's keys in order, so a record is written the same way
+// every time.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

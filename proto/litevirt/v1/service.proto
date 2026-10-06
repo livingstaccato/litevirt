@@ -1724,6 +1724,13 @@ message StoragePoolContent {
     int64  size_bytes  = 3;
     string modified_at = 4; // RFC3339
     bool   is_iso      = 5; // .iso extension
+    // Set for a replica: the VM and disk it is a replica of, and its time. A
+    // listing shows only the replicas of VMs the caller may read, from their
+    // records in the pool's replica area; name is what PromoteReplica.replica
+    // takes.
+    string replica_vm    = 6;
+    string replica_disk  = 7;
+    string replica_taken = 8;
 }
 message ListStoragePoolContentsRequest {
     string pool_name = 1;

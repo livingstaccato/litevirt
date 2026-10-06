@@ -89,6 +89,11 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) error 
 	if opts.SrcRef == "" || opts.DstRef == "" {
 		return fmt.Errorf("zfs replicate: src and dst refs required")
 	}
+	// The destination must not exist: the receive below has no -F, and a
+	// dataset of that name is refused here first, before anything is sent.
+	if _, err := d.zfs(ctx, "list", "-H", "-o", "name", "--", opts.DstRef); err == nil {
+		return fmt.Errorf("zfs replicate → %s: %w", opts.DstRef, ErrDestinationExists)
+	}
 	snap := opts.SnapshotName
 	if snap == "" {
 		snap = "litevirt-" + nowSnapTag()
@@ -106,7 +111,9 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) error 
 		sendArgs = append(sendArgs, "--", srcSnap)
 	}
 
-	recvArgs := []string{"recv", "-F", "--", opts.DstRef}
+	// Never -F: a forced receive rolls back or replaces whatever dataset has
+	// the name. Without it, zfs refuses an existing destination itself.
+	recvArgs := []string{"recv", "--", opts.DstRef}
 	pipe, err := pipeCmds(ctx, opts.SSHTarget, "zfs", sendArgs, "zfs", recvArgs)
 	if err != nil {
 		return fmt.Errorf("zfs replicate %s → %s: %w", opts.SrcRef, opts.DstRef, err)
@@ -119,6 +126,11 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) error 
 	if err := d.rollPrevSnapshot(ctx, prev); err != nil {
 		return fmt.Errorf("zfs replicate %s → %s: roll prev snapshot: %w", opts.SrcRef, opts.DstRef, err)
 	}
+	for _, k := range sortedKeys(opts.Record) {
+		if out, err := d.zfs(ctx, "set", "--", "litevirt:"+k+"="+opts.Record[k], opts.DstRef); err != nil {
+			return fmt.Errorf("zfs replicate → %s: record %s: %w: %s", opts.DstRef, k, err, out)
+		}
+	}
 	return nil
 }
 
@@ -128,13 +140,13 @@ func (d *zfsDriver) Replicate(ctx context.Context, opts ReplicateOptions) error 
 // but any real failure aborts the roll rather than leaving a stale base.
 func (d *zfsDriver) rollPrevSnapshot(ctx context.Context, prev string) error {
 	prevNew := prev + "-new"
-	if out, err := d.zfs(ctx, "snapshot", prevNew); err != nil {
+	if out, err := d.zfs(ctx, "snapshot", "--", prevNew); err != nil {
 		return fmt.Errorf("snapshot %s: %w: %s", prevNew, err, out)
 	}
-	if out, err := d.zfs(ctx, "destroy", prev); err != nil && !strings.Contains(string(out), "does not exist") {
+	if out, err := d.zfs(ctx, "destroy", "--", prev); err != nil && !strings.Contains(string(out), "does not exist") {
 		return fmt.Errorf("destroy %s: %w: %s", prev, err, out)
 	}
-	if out, err := d.zfs(ctx, "rename", prevNew, prev); err != nil {
+	if out, err := d.zfs(ctx, "rename", "--", prevNew, prev); err != nil {
 		return fmt.Errorf("rename %s -> %s: %w: %s", prevNew, prev, err, out)
 	}
 	return nil

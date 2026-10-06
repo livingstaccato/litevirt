@@ -27,19 +27,12 @@ func precheckQcow2Input(path string, allowBacking func(resolved string) error) e
 		if depth > maxBackingDepth {
 			return fmt.Errorf("backing chain deeper than %d", maxBackingDepth)
 		}
+		if err := precheckQcow2Header(path); err != nil {
+			return err
+		}
 		info, err := qcow2.Info(path)
 		if err != nil {
 			return fmt.Errorf("%s is not a qcow2 image: %w", path, err)
-		}
-		if err := qcow2.AssertNoExternalData(path); err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-		n, err := qcow2.BackingFormatExtensionCount(path)
-		if err != nil {
-			return fmt.Errorf("%s: %w", path, err)
-		}
-		if n > 1 {
-			return fmt.Errorf("%s declares its backing format %d times", path, n)
 		}
 		if info.BackingFile == "" {
 			return nil
@@ -63,6 +56,26 @@ func precheckQcow2Input(path string, allowBacking func(resolved string) error) e
 		}
 		path = resolved
 	}
+}
+
+// precheckQcow2Header judges one qcow2 header without following its backing
+// file: it parses as qcow2, keeps no data in an external file, and declares
+// its backing format at most once.
+func precheckQcow2Header(path string) error {
+	if _, err := qcow2.Info(path); err != nil {
+		return fmt.Errorf("%s is not a qcow2 image: %w", path, err)
+	}
+	if err := qcow2.AssertNoExternalData(path); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	n, err := qcow2.BackingFormatExtensionCount(path)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
+	if n > 1 {
+		return fmt.Errorf("%s declares its backing format %d times", path, n)
+	}
+	return nil
 }
 
 // imageStoreBaseOnly accepts a backing file only inside dataDir's image store

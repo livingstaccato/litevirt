@@ -163,37 +163,3 @@ func TestReplicateVolume_BlockSourceDriverUnimplemented(t *testing.T) {
 		t.Fatalf("block-source rejection should happen before progress is sent: %+v", rec.Sent)
 	}
 }
-
-// A same-driver block replicate used to run the driver's native send/recv
-// with the target POOL NAME as the receive destination — `zfs recv -F --
-// <pool>` force-receives over whatever dataset carries that name. It is
-// refused before any command runs, with nothing sent.
-func TestReplicateVolume_NoNativeReceiveIntoAPoolName(t *testing.T) {
-	s := testServer(t)
-	s.hostName = "test-host"
-	s.SetStoragePoolsByName(map[string]StoragePoolRef{
-		"rpool": {Driver: "zfs", Source: "rpool"},
-	})
-	ctx := context.Background()
-	if err := corrosion.InsertVM(ctx, s.db,
-		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped"},
-		nil,
-		[]corrosion.DiskRecord{{
-			VMName: "vm1", DiskName: "root", HostName: "test-host",
-			Path: "tank/vm1-root", SizeBytes: 1 << 20,
-			StorageType: "zfs", StorageVolume: "tank",
-		}},
-	); err != nil {
-		t.Fatalf("InsertVM: %v", err)
-	}
-	rec := &streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()}
-	err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{
-		VmName: "vm1", DiskName: "root", TargetPool: "rpool",
-	}, rec)
-	if status.Code(err) != codes.Unimplemented {
-		t.Fatalf("zfs→zfs ReplicateVolume: got %v, want Unimplemented (no native receive into a pool name)", err)
-	}
-	if len(rec.Sent) != 0 {
-		t.Fatalf("refusal must come before any progress: %+v", rec.Sent)
-	}
-}

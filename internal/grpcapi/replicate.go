@@ -1,7 +1,11 @@
 package grpcapi
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -9,25 +13,23 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/randid"
+	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/storage"
+	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
 // ReplicateVolume copies a VM disk into a target pool without cutting
 // the VM over. The source remains the VM's authoritative disk; the
 // target receives a point-in-time copy suitable for off-site DR.
 //
-// first cut:
-//   - File-based source AND target only (local, nfs, dir, btrfs).
+//   - File-based pools (local, nfs, dir, btrfs) get a qemu-img copy into a
+//     new daemon-named file (convertImage: format named, input pre-checked).
+//   - zfs→zfs and ceph→ceph use native send/receive into a new daemon-named
+//     dataset or image (replicateVolumeNative), never an existing one.
 //   - Crash-consistent: we don't quiesce the guest. For application
-//     consistency the operator should snapshot the VM first
-//     (snapshot + replicate is the common pattern).
-//   - Full copy every call. Incremental sync arrives with the
-//     scheduler in
-//
-// Block backends (ceph, zfs, iscsi, lvm-thin) return Unimplemented. A
-// native send/receive (rbd export-diff | import-diff, zfs send | recv) would
-// need a receive into a fresh, daemon-derived dataset or image; the old one
-// received into the target POOL NAME and was removed (see below).
+//     consistency the operator should snapshot the VM first.
+//   - Full copy every call.
 func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.ServerStreamingServer[pb.ReplicateVolumeProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
@@ -90,13 +92,16 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		return err
 	}
 
-	// There is no native send/recv branch. The one that was here passed the
-	// target POOL NAME as the receive destination — `zfs recv -F -- <pool>`,
-	// `rbd import-diff - <pool>`, `btrfs receive <pool>` — so a pool named like
-	// a host dataset was force-received over, against the rule that a copy
-	// never replaces what is there. A btrfs disk takes the file copy below;
-	// zfs and ceph are refused until a receive into a fresh, daemon-derived
-	// dataset or image exists.
+	// Native send/receive between two pools of the same block driver (zfs,
+	// ceph). The destination is a NEW dataset or image the daemon names in
+	// the target pool — "<pool source>/<vm>-<disk>-copy-<time>-<id>", or an
+	// admin's target_path as the leaf — never the pool itself and never an
+	// existing one: the driver refuses an existing destination before
+	// sending, receives without -F (zfs) or with a creating import (rbd), and
+	// writes the copy's owner record (project, VM, disk) onto it.
+	if src.StorageType == dstPool.Driver && (src.StorageType == "zfs" || src.StorageType == "ceph") {
+		return s.replicateVolumeNative(ctx, req, vm, src, dstPool, stream)
+	}
 	if !isFileBasedDriver(src.StorageType) {
 		return status.Errorf(codes.Unimplemented,
 			"source pool driver %q: replication not yet implemented", src.StorageType)
@@ -174,4 +179,79 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		CopyPct:     100,
 		TargetPath:  dstPath,
 	})
+}
+
+// replicateVolumeNative is ReplicateVolume's zfs/ceph send/receive.
+func (s *Server) replicateVolumeNative(ctx context.Context, req *pb.ReplicateVolumeRequest, vm *corrosion.VMRecord, src *corrosion.DiskRecord, dstPool StoragePoolRef, stream grpc.ServerStreamingServer[pb.ReplicateVolumeProgress]) error {
+	leaf := req.TargetPath
+	if leaf == "" {
+		leaf = fmt.Sprintf("%s-%s-copy-%s-%s", req.VmName, req.DiskName,
+			time.Now().UTC().Format("20060102-150405"), randid.New()[:8])
+	} else if err := safename.ValidateName(leaf); err != nil || strings.HasPrefix(leaf, "-") {
+		// Admin-only (checked above). A leaf name, never a path.
+		return status.Errorf(codes.InvalidArgument, "target_path on a %s pool is a dataset/image name: %v", dstPool.Driver, err)
+	}
+	srcRef, dstRef, err := nativeRefs(src, dstPool, leaf)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	drv, err := storage.New(s.dataDir, storage.Config{
+		Driver: dstPool.Driver, Source: dstPool.Source, Options: dstPool.Options,
+	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "construct driver: %v", err)
+	}
+	rep := storage.AsReplicator(drv)
+	if rep == nil {
+		return status.Errorf(codes.Unimplemented, "driver %q has no native replication", dstPool.Driver)
+	}
+	if err := stream.Send(&pb.ReplicateVolumeProgress{
+		Phase: pb.ReplicateVolumeProgress_SNAPSHOT, Status: fmt.Sprintf("native %s send/recv → %s", dstPool.Driver, dstRef),
+		BytesTotal: src.SizeBytes,
+	}); err != nil {
+		return err
+	}
+	if err := rep.Replicate(ctx, storage.ReplicateOptions{
+		SrcRef: srcRef, DstRef: dstRef,
+		Record: map[string]string{"project": tenancy.NormalizeProject(vm.Project), "vm": vm.Name, "disk": src.DiskName},
+	}); err != nil {
+		if errors.Is(err, storage.ErrDestinationExists) {
+			return status.Errorf(codes.AlreadyExists, "%v", err)
+		}
+		return status.Errorf(codes.Internal, "native replicate: %v", err)
+	}
+	s.recordVMEvent(ctx, req.VmName, "disk.replicated", "ok", fmt.Sprintf("%s → %s", req.DiskName, dstRef))
+	return stream.Send(&pb.ReplicateVolumeProgress{
+		Phase: pb.ReplicateVolumeProgress_DONE, Status: "native replication complete",
+		TargetPath: dstRef, BytesTotal: src.SizeBytes, CopyPct: 100,
+	})
+}
+
+// nativeRefs derives the source and destination of a native copy: the
+// source from the disk's own recorded path (/dev/zvol/<dataset>, or
+// rbd:<pool>/<image>[:opts]), the destination as leaf under the target pool's
+// dataset or ceph pool.
+func nativeRefs(src *corrosion.DiskRecord, dstPool StoragePoolRef, leaf string) (string, string, error) {
+	if dstPool.Source == "" || strings.HasPrefix(dstPool.Source, "-") {
+		return "", "", fmt.Errorf("target pool has no usable source dataset/pool")
+	}
+	switch src.StorageType {
+	case "zfs":
+		ds, ok := strings.CutPrefix(src.Path, "/dev/zvol/")
+		if !ok || ds == "" || strings.HasPrefix(ds, "-") {
+			return "", "", fmt.Errorf("zfs disk path %q is not /dev/zvol/<dataset>", src.Path)
+		}
+		return ds, strings.TrimSuffix(dstPool.Source, "/") + "/" + leaf, nil
+	case "ceph":
+		img, ok := strings.CutPrefix(src.Path, "rbd:")
+		if !ok {
+			return "", "", fmt.Errorf("ceph disk path %q is not rbd:<pool>/<image>", src.Path)
+		}
+		img, _, _ = strings.Cut(img, ":")
+		if img == "" || strings.HasPrefix(img, "-") || !strings.Contains(img, "/") {
+			return "", "", fmt.Errorf("ceph disk path %q is not rbd:<pool>/<image>", src.Path)
+		}
+		return img, dstPool.Source + "/" + leaf, nil
+	}
+	return "", "", fmt.Errorf("driver %q has no native replication", src.StorageType)
 }

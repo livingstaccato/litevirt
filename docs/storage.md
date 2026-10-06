@@ -285,18 +285,26 @@ copy wrote over it. `--target-path` names the file instead; it requires the
 **admin** role (`storage.hostpath`), and an existing file there is refused with
 `AlreadyExists`, never replaced.
 
-**Native send/recv is not wired into `replicate-volume`.** The drivers below
-implement the `Replicator` interface, but the RPC used to pass the target
-*pool name* as the receive destination (`zfs recv -F -- <pool>`), which
-force-receives over whatever dataset carries that name. Until a receive into
-a fresh, daemon-derived dataset or image exists, a btrfs disk takes the file
-copy and a zfs or ceph disk is refused. What the drivers implement:
+**Native send/recv** — a zfs disk replicated into a zfs pool, or a ceph disk
+into a ceph pool, uses the backend's native primitive instead of qemu-img.
+The destination is a **new** dataset or image the daemon names under the
+target pool — `<pool source>/<vm>-<disk>-copy-<time>-<id>`, or, for an admin,
+`--target-path` as the leaf name — never the pool itself and never one that
+exists: the driver checks first (`zfs list` / `rbd info`) and refuses with
+`AlreadyExists` before anything is sent, `zfs recv` runs without `-F`, and a
+ceph full copy is `rbd export | rbd import`, which creates the image. Every
+command keeps `--` before its positional arguments. The copy carries its
+owner record — project, VM, disk — as zfs user properties (`litevirt:*`) or
+rbd image metadata (`litevirt.*`). A btrfs disk takes the file copy. What the
+drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when
   `Incremental: true`.
-- **Ceph RBD** — `rbd export-diff | rbd import-diff`. Incremental
-  uses `--from-snap`. Cross-cluster via SSH wrap on the receive side.
+- **Ceph RBD** — a full copy is `rbd export | rbd import` (creating);
+  an incremental is `rbd export-diff --from-snap | rbd import-diff` onto an
+  image the replication created. Cross-cluster via SSH wrap on the receive
+  side.
 - **BTRFS** — `btrfs send | btrfs receive`. Incremental via `-p` against
   the prior replicate snapshot.
 
@@ -314,7 +322,7 @@ consistency is a planned follow-up.
 | Move (offline) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Move (live) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Replicate via qemu-img | ✓ | ✓ | ✓ | ✓ | fallback | fallback | — | — |
-| Native send / receive (driver only; not used by `replicate-volume`) | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export-diff | n/a | n/a |
+| Native send / receive (`replicate-volume`) | n/a | n/a | n/a | file copy | zfs s/r | rbd export/import | n/a | n/a |
 | HA-friendly cluster store | no | yes | depends | no (host-local) | no (host-local) | yes | yes | no |
 
 The **Snapshots** row describes each backend's *native* snapshot capability

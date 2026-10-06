@@ -140,15 +140,30 @@ func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) error
 		return fmt.Errorf("rbd snap create %s: %w: %s", srcSnapSpec, err, out)
 	}
 
-	sendArgs := []string{"export-diff"}
+	// A full copy is export | import, and import CREATES the destination,
+	// refusing one that exists; it is checked first too, before anything is
+	// sent. An incremental (export-diff | import-diff) applies onto an
+	// existing image, so it is only ever run against one this replication
+	// created earlier — the caller's choice, never a full copy's.
+	var sendArgs, recvArgs []string
 	if opts.Incremental {
-		sendArgs = append(sendArgs, "--from-snap", "litevirt-replicate-prev")
+		sendArgs = d.rbdArgs("export-diff", "--from-snap", "litevirt-replicate-prev", "--", srcSnapSpec, "-")
+		recvArgs = d.rbdArgs("import-diff", "--", "-", opts.DstRef)
+	} else {
+		if _, err := d.rbd(ctx, d.rbdArgs("info", "--", opts.DstRef)...); err == nil {
+			return fmt.Errorf("ceph replicate → %s: %w", opts.DstRef, ErrDestinationExists)
+		}
+		sendArgs = d.rbdArgs("export", "--", srcSnapSpec, "-")
+		recvArgs = d.rbdArgs("import", "--", "-", opts.DstRef)
 	}
-	sendArgs = append(sendArgs, "--", srcSnapSpec, "-")
-	recvArgs := []string{"import-diff", "--", "-", opts.DstRef}
 
 	if _, err := pipeCmds(ctx, opts.SSHTarget, "rbd", sendArgs, "rbd", recvArgs); err != nil {
 		return fmt.Errorf("ceph replicate %s → %s: %w", opts.SrcRef, opts.DstRef, err)
+	}
+	for _, k := range sortedKeys(opts.Record) {
+		if out, err := d.rbd(ctx, d.rbdArgs("image-meta", "set", "--", opts.DstRef, "litevirt."+k, opts.Record[k])...); err != nil {
+			return fmt.Errorf("ceph replicate → %s: record %s: %w: %s", opts.DstRef, k, err, out)
+		}
 	}
 	return nil
 }

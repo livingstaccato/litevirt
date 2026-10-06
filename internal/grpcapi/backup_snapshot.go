@@ -688,7 +688,7 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	// In place, the bytes become a VM disk: never placed as-is, always
 	// rebuilt into a fresh standalone image (diskImageFromBackup).
 	if dest.inPlace {
-		img, err := s.diskImageFromBackup(ctx, manifest.ContentFormat, tmpTarget, filepath.Dir(dest.path))
+		img, err := s.diskImageFromBackup(ctx, manifest, tmpTarget, dest)
 		if err != nil {
 			return err
 		}

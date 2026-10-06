@@ -292,10 +292,12 @@ re-created under the same name in the same project inherits the earlier VM's
 replicas (they can be promoted and are pruned by its schedule). No other
 project's VM ever shares the directory.
 
-Replicas written by an earlier build as `<vm>-<disk>-<time>.<ext>` files in
-the pool are not records: nothing selects or prunes them any more. Delete them
-by hand (the pool's content view in the UI, `DeleteStoragePoolContent`) once newer
-replicas exist.
+A pool's content listing shows the replicas of the VMs the caller may read —
+their file name (what `--replica` takes), VM, disk and time, from their
+records — and never another project's. Replicas written by an earlier build
+as `<vm>-<disk>-<time>.<ext>` files in the pool are not records: nothing
+selects or prunes them any more. Delete them by hand (the pool's content view
+in the UI, `DeleteStoragePoolContent`) once newer replicas exist.
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 
@@ -524,17 +526,33 @@ a way to overwrite another project's VM disk.
   ANY host may use it. This is the only restore that replaces a file, and its
   path comes from the record, not the request.
 
-  The backup's bytes are never placed as the disk. A backup records what its
-  bytes are (`content_format`): `raw` for a running VM's guest content, read
-  over NBD, or `disk-file` for a stopped VM's image file. The restore rebuilds
-  a **new** qcow2 from them with the source format named, never probed
-  (`qemu-img convert -f raw|qcow2 -O qcow2`), refuses the result unless it is
-  standalone (no backing file, no external data file), and only then swaps it
-  in. Raw guest content is the guest's to write — a qcow2 header planted in
-  sector 0 would otherwise make qemu follow a backing file the guest chose. A
-  disk-file backup may name a backing file only if it is a qcow2 base in this
-  host's image store; it is flattened. A backup that predates content formats
-  is refused for `--in-place`; restore it to a new file instead.
+  The backup's bytes are never placed as the disk; the restore rebuilds a
+  **new** qcow2 from them, with the source format named and never probed, and
+  swaps it in. What the bytes are is the backup's `content_format`: `raw` for
+  a running VM's guest content (read over NBD), `disk-file` for a stopped VM's
+  image file. A backup written before formats were recorded is classified from
+  what the daemon wrote into its manifest — a guest-content backup always
+  carries its checkpoint, a disk-file backup never does — never from its bytes;
+  a container archive is refused.
+
+  - **Raw guest content** (`qemu-img convert -f raw`) becomes a standalone
+    disk. The guest controls every byte, so a qcow2 header it planted in
+    sector 0 is restored as data, never followed.
+  - **A disk file** (`-f qcow2`) has its header judged first — no external
+    data file, one backing format — and keeps the backing of the disk it
+    replaces, never one the backup names. A **linked clone** stays an overlay
+    on its base, a **`--no-localize` promoted VM** stays an overlay on its
+    replica, and a **disk created from an image** stays an overlay on that
+    image. The backing comes from the disk's own record (`backing_disk`,
+    `backing_image`), resolved through symlinks, inside the image store or
+    the disk's pool directory, every layer pre-checked down to a standalone
+    base. The restored header is re-pointed to it without opening what the
+    backup named (`qemu-img rebase -u`), and the rebuilt overlay must name
+    exactly that backing. A standalone disk's backup may name a backing only
+    as a standalone base in the image store; it is flattened.
+
+  The restore streams into a temp beside the disk and rebuilds next to it, so
+  it needs room for about twice the disk in that directory while it runs.
 - **`--target-path`**: names the file. It needs `storage.hostpath` — the
   **admin** role — whether it is a bare name (under `<data_dir>/disks`) or an
   absolute path, and an existing file there is refused with `AlreadyExists`,

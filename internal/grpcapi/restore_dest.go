@@ -43,6 +43,12 @@ type restoreDest struct {
 	path    string
 	inPlace bool
 	unlock  func()
+	// disk and poolDir describe the disk an in-place restore replaces: its
+	// record, and the directory of the pool it lives in (<data_dir>/disks for
+	// a pool-less disk). The rebuilt image keeps the disk's OWN backing,
+	// taken from these, never from the backup's bytes.
+	disk    *corrosion.DiskRecord
+	poolDir string
 }
 
 func (d restoreDest) release() {
@@ -260,7 +266,14 @@ func (s *Server) inPlaceRestoreLocked(ctx context.Context, vmName, diskName stri
 				"in_place: %q is also used by vm %q disk %q; a restore never replaces it", disk.Path, o.VMName, o.DiskName)
 		}
 	}
-	return restoreDest{path: disk.Path, inPlace: true}, nil
+	poolDir := filepath.Join(s.dataDir, "disks")
+	if disk.StorageVolume != "" {
+		ref, _ := s.resolvePool(ctx, disk.StorageVolume)
+		if d, derr := fileBasedPoolDir(s.dataDir, ref); derr == nil {
+			poolDir = d
+		}
+	}
+	return restoreDest{path: disk.Path, inPlace: true, disk: disk, poolDir: poolDir}, nil
 }
 
 // vmDisksClosed reports whether nothing holds vm's disks open: the record says
@@ -276,73 +289,228 @@ func (s *Server) vmDisksClosed(vm *corrosion.VMRecord) bool {
 	return s.sourceIsShutOff(vm)
 }
 
-// inPlaceContentAccepted refuses, before any byte is restored, an in-place
-// restore from a backup whose content format is not recorded: the bytes are
-// written back as a VM disk, and what they ARE decides how.
-func inPlaceContentAccepted(m *pbsstore.Manifest) error {
+// backupContentFormat is what a manifest's bytes are. A manifest written
+// since content formats records it. One written before is classified from
+// what the daemon itself wrote into it, never from the bytes: a guest-content
+// backup (NBD) always establishes a checkpoint and records its BitmapName,
+// while a disk-file backup (PushFile of a stopped VM's image) never does. A
+// container archive is neither, and is refused.
+func backupContentFormat(m *pbsstore.Manifest) (string, error) {
 	switch m.ContentFormat {
 	case pbsstore.ContentGuestRaw, pbsstore.ContentDiskFile:
-		return nil
+		return m.ContentFormat, nil
 	case "":
-		return status.Error(codes.FailedPrecondition,
-			"in_place: this backup does not record what its bytes are (it predates content formats); restore it to a new file instead")
 	default:
-		return status.Errorf(codes.FailedPrecondition, "in_place: unknown backup content format %q", m.ContentFormat)
+		return "", status.Errorf(codes.FailedPrecondition, "in_place: unknown backup content format %q", m.ContentFormat)
+	}
+	switch {
+	case m.ContainerSpecJSON != "":
+		return "", status.Error(codes.FailedPrecondition,
+			"in_place: this is a container backup, not a VM disk; it cannot be restored over a disk")
+	case m.BitmapName != "":
+		return pbsstore.ContentGuestRaw, nil
+	default:
+		return pbsstore.ContentDiskFile, nil
 	}
 }
 
-// diskImageFromBackup turns restored backup bytes into a NEW standalone qcow2
-// beside dir — the format libvirt opens every file disk as — and returns its
-// path. Backup bytes are never placed as a disk directly.
+// inPlaceContentAccepted refuses, before any byte is restored, an in-place
+// restore whose bytes cannot be told apart (backupContentFormat).
+func inPlaceContentAccepted(m *pbsstore.Manifest) error {
+	_, err := backupContentFormat(m)
+	return err
+}
+
+// diskImageFromBackup turns restored backup bytes into a NEW qcow2 beside
+// dir — the format libvirt opens every file disk as — and returns its path.
+// Backup bytes are never placed as a disk directly, and qemu-img never probes.
 //
-// A guest-content backup is raw guest bytes, and the guest controls all of
-// them: placed as-is under a disk libvirt opens as qcow2, a guest-written
-// qcow2 header with a backing file would make qemu read whatever file the
-// guest named (another project's disk). So the bytes are converted with the
-// source format NAMED (-f raw, never probed) into a fresh image, and the
-// result must name no backing or external data file before it is used.
+// Raw guest content (-f raw) is the whole guest disk: the guest controls every
+// byte, a planted qcow2 header included, so it is only ever read as raw, and
+// the result is a standalone image.
 //
-// A disk-file backup is the disk's own image file. It must parse as qcow2;
-// a backing file it names must be a qcow2 base in this host's image store
-// (a VM created from an image), and it is flattened (-f qcow2) into a fresh
-// standalone image the same way.
-func (s *Server) diskImageFromBackup(ctx context.Context, contentFormat, restored, dir string) (string, error) {
-	var srcFormat string
-	switch contentFormat {
-	case pbsstore.ContentGuestRaw:
-		srcFormat = "raw"
-	case pbsstore.ContentDiskFile:
-		// The container's header is judged BEFORE qemu-img opens it: no
-		// external data file (qemu-img would copy whatever file it names
-		// into a perfectly standalone output), one backing format, and a
-		// backing file only as a standalone qcow2 base inside this host's
-		// image store, resolved through symlinks.
-		if err := precheckQcow2Input(restored, imageStoreBaseOnly(s.dataDir)); err != nil {
-			return "", status.Errorf(codes.FailedPrecondition, "in_place: the backed-up disk file is refused: %v", err)
-		}
-		srcFormat = "qcow2"
-	default:
-		return "", inPlaceContentAccepted(&pbsstore.Manifest{ContentFormat: contentFormat})
+// A disk-file backup is the disk's image file (-f qcow2). Its header is judged
+// before qemu-img opens it (no external data file, one backing format). Its
+// backing is then decided by the disk being REPLACED, not by the bytes:
+//   - if that disk is backed — a linked clone, a --no-localize promotion, a
+//     disk created from an image — the restored image is re-pointed to that
+//     disk's own backing (originalDiskBacking: from its record, resolved,
+//     inside the image store or the disk's pool directory, every layer
+//     pre-checked down to a standalone base), and rebuilt as a fresh overlay
+//     on it;
+//   - if it is standalone, a backing the bytes name is accepted only as a
+//     standalone base in the image store, and flattened.
+func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, restored string, dest restoreDest) (string, error) {
+	format, err := backupContentFormat(m)
+	if err != nil {
+		return "", err
 	}
 	if !qemuImgAvailable() {
 		return "", status.Error(codes.FailedPrecondition, "in_place: qemu-img is required to rebuild the disk image")
 	}
+	dir := filepath.Dir(dest.path)
 	f, err := os.CreateTemp(dir, "restore-*.tmp")
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "create image temp: %v", err)
 	}
 	out := f.Name()
 	_ = f.Close()
-	cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-f", srcFormat, "-O", "qcow2", restored, out)
-	if msg, err := cmd.CombinedOutput(); err != nil {
+	fail := func(code codes.Code, format string, a ...any) (string, error) {
 		_ = os.Remove(out)
-		return "", status.Errorf(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
+		return "", status.Errorf(code, format, a...)
 	}
-	if err := qcow2.AssertStandalone(out); err != nil {
-		_ = os.Remove(out)
-		return "", status.Errorf(codes.FailedPrecondition, "in_place: the rebuilt image is not standalone: %v", err)
+
+	if format == pbsstore.ContentGuestRaw {
+		if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "raw", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
+		}
+		if err := qcow2.AssertStandalone(out); err != nil {
+			return fail(codes.FailedPrecondition, "in_place: the rebuilt image is not standalone: %v", err)
+		}
+		return out, nil
+	}
+
+	// Disk file. Judge the bytes' own header first — without following the
+	// backing file it names, which is not trusted.
+	if err := precheckQcow2Header(restored); err != nil {
+		return fail(codes.FailedPrecondition, "in_place: the backed-up disk file is refused: %v", err)
+	}
+	backing, backingFmt, err := s.originalDiskBacking(dest)
+	if err != nil {
+		return fail(codes.FailedPrecondition, "in_place: %v", err)
+	}
+	if backing == "" {
+		if err := precheckQcow2Input(restored, imageStoreBaseOnly(s.dataDir)); err != nil {
+			return fail(codes.FailedPrecondition, "in_place: the backed-up disk file is refused: %v", err)
+		}
+		if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
+		}
+		if err := qcow2.AssertStandalone(out); err != nil {
+			return fail(codes.FailedPrecondition, "in_place: the rebuilt image is not standalone: %v", err)
+		}
+		return out, nil
+	}
+	// Re-point the bytes' header to the disk's own backing WITHOUT opening
+	// what the header named (-u), confirm the header now names exactly that,
+	// and only then let qemu-img read the chain.
+	if msg, err := exec.CommandContext(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", backing, "-F", backingFmt, restored).CombinedOutput(); err != nil {
+		return fail(codes.Internal, "in_place: qemu-img rebase: %v: %s", err, strings.TrimSpace(string(msg)))
+	}
+	if err := namesExactly(restored, backing, backingFmt); err != nil {
+		return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
+	}
+	if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2",
+		"-B", backing, "-F", backingFmt, restored, out).CombinedOutput(); err != nil {
+		return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
+	}
+	// The rebuilt overlay names exactly the disk's own backing, nothing else.
+	if err := namesExactly(out, backing, backingFmt); err != nil {
+		return fail(codes.FailedPrecondition, "in_place: the rebuilt image is refused: %v", err)
 	}
 	return out, nil
+}
+
+// namesExactly checks a qcow2 header that should name exactly backing (in
+// backingFmt) and nothing else: no external data file, one backing format.
+func namesExactly(path, backing, backingFmt string) error {
+	if err := precheckQcow2Header(path); err != nil {
+		return err
+	}
+	info, err := qcow2.Info(path)
+	if err != nil {
+		return err
+	}
+	if info.BackingFile != backing || info.BackingFormat != backingFmt {
+		return fmt.Errorf("%s names backing %q (%q), want %q (%q)", path, info.BackingFile, info.BackingFormat, backing, backingFmt)
+	}
+	return nil
+}
+
+// originalDiskBacking returns the backing of the disk an in-place restore
+// replaces and its format — "" for a standalone disk. It comes from the disk's
+// RECORD (backing_disk: a linked clone's base or a --no-localize promotion's
+// replica; backing_image: the image a disk was created from), else from the
+// current file's own header — never from the backup. The format is the one the
+// current disk declares (daemon-written; a raw replica is "raw"). The path is
+// resolved through symlinks and must be inside the image store or the disk's
+// own pool directory. A qcow2 backing's whole chain is pre-checked, every
+// layer inside those directories, down to a standalone base; a raw backing is
+// a leaf and is never interpreted.
+func (s *Server) originalDiskBacking(dest restoreDest) (string, string, error) {
+	d := dest.disk
+	if d == nil {
+		return "", "", fmt.Errorf("no disk record")
+	}
+	// The disk being replaced may be damaged — that is often why it is being
+	// restored — so its header is consulted only when it still parses, and
+	// only after the record.
+	cur, _ := qcow2.Info(d.Path)
+	if cur == nil {
+		cur = &qcow2.ImageInfo{}
+	}
+	images := filepath.Join(s.dataDir, "images")
+	var cand string
+	switch {
+	case d.BackingDisk != "":
+		cand = d.BackingDisk
+	case d.BackingImage != "":
+		cand = d.BackingImage
+		if !filepath.IsAbs(cand) {
+			cand = filepath.Join(images, strings.TrimSuffix(cand, ".qcow2")+".qcow2")
+		}
+	case cur.BackingFile != "":
+		cand = cur.BackingFile
+		if !filepath.IsAbs(cand) {
+			cand = filepath.Join(filepath.Dir(d.Path), cand)
+		}
+	default:
+		return "", "", nil
+	}
+	format := cur.BackingFormat
+	if format == "" {
+		// No header to say (a damaged disk, or none declared): a backing the
+		// daemon made in an allowed directory is qcow2 if it parses as one
+		// (this package's parser, not a qemu-img probe), else raw.
+		format = "raw"
+		if r, err := filepath.EvalSymlinks(cand); err == nil {
+			if _, err := qcow2.Info(r); err == nil {
+				format = "qcow2"
+			}
+		}
+	}
+	if format != "qcow2" && format != "raw" {
+		return "", "", fmt.Errorf("the disk's backing format %q is not qcow2 or raw", format)
+	}
+	var roots []string
+	for _, r := range []string{images, dest.poolDir} {
+		if rr, err := filepath.EvalSymlinks(r); err == nil {
+			roots = append(roots, rr)
+		}
+	}
+	within := func(resolved string) error {
+		for _, r := range roots {
+			if resolved != r && safename.Contains(r, resolved) {
+				return nil
+			}
+		}
+		return fmt.Errorf("backing %q is outside the image store and the disk's pool directory", resolved)
+	}
+	resolved, err := filepath.EvalSymlinks(cand)
+	if err != nil {
+		return "", "", fmt.Errorf("the disk's backing %q: %w", cand, err)
+	}
+	if err := within(resolved); err != nil {
+		return "", "", err
+	}
+	if format == "qcow2" {
+		if err := precheckQcow2Input(resolved, within); err != nil {
+			return "", "", fmt.Errorf("the disk's backing chain is refused: %w", err)
+		}
+	} else if fi, err := os.Lstat(resolved); err != nil || !fi.Mode().IsRegular() {
+		return "", "", fmt.Errorf("the disk's raw backing %q is not a regular file", resolved)
+	}
+	return resolved, format, nil
 }
 
 // diskReferencesAnyHost returns every disk row, on ANY host, that uses path —

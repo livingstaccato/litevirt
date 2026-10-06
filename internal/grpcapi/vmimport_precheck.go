@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -301,18 +302,17 @@ func (s *Server) requireImportSpace(dir string, need uint64, what string) error 
 	return nil
 }
 
-// sameFilesystem reports whether a and b are on one filesystem. An unreadable
-// path counts as the same, which charges more space rather than less.
-func sameFilesystem(a, b string) bool {
-	fa, errA := os.Stat(a)
-	fb, errB := os.Stat(b)
-	if errA != nil || errB != nil {
-		return true
+// qemuVirtualSize is the virtual size qemu-img reports for a disk that has
+// already passed the header check, opened in the format it will be converted
+// from.
+func qemuVirtualSize(ctx context.Context, file, format string) (uint64, error) {
+	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file).Output()
+	if err != nil {
+		return 0, fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
 	}
-	sa, okA := fa.Sys().(*syscall.Stat_t)
-	sb, okB := fb.Sys().(*syscall.Stat_t)
-	if !okA || !okB {
-		return true
+	var info qemuImgInfo
+	if err := json.Unmarshal(out, &info); err != nil {
+		return 0, fmt.Errorf("inspect %s: unreadable qemu-img info: %w", filepath.Base(file), err)
 	}
-	return sa.Dev == sb.Dev
+	return info.VirtualSize, nil
 }

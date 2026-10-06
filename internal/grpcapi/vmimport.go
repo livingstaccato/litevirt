@@ -124,7 +124,10 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	if first.Inspect {
+		// Nothing unpacked is needed to describe the source; free it before
+		// waiting on the client.
 		releaseWrites()
+		_ = os.RemoveAll(importDir)
 		return s.sendImportInspect(stream, fv, project)
 	}
 
@@ -215,11 +218,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 				cleanupDisks()
 				return err
 			}
-			// The copy lives until its conversion is done, so on one
-			// filesystem the two need room together.
-			if sameFilesystem(importDir, poolDir) {
-				need += limit
-			}
+			// The copy lives until its conversion is done. Charged against
+			// the pool as well, whatever filesystem it is on: a btrfs
+			// subvolume or ZFS dataset has its own device number but shares
+			// the free space, and too much charged is a refusal where too
+			// little is a full disk.
+			need += limit
 		}
 		if err := s.requireImportSpace(poolDir, need, "converting disk "+d.Name); err != nil {
 			cleanupDisks()
@@ -244,11 +248,10 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			d.CapacityBytes = info.VirtualSize
 		}
 	}
-	// The writes are done; let the next import write before anything here
-	// waits on this one's client again.
+	// The writes are done; let the next import write, and free the unpacked
+	// source, before anything here waits on this one's client again.
 	releaseWrites()
-	stopProgress()
-	<-progressSent
+	_ = os.RemoveAll(importDir)
 
 	// Re-check quota against the real converted sizes before committing.
 	if err := s.admitImport(ctx, project, fv); err != nil {
@@ -438,6 +441,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	s.recordVMEvent(ctx, name, "vm.imported", "ok", fmt.Sprintf("format=%s disks=%d", first.SourceFormat, len(convertedPaths)))
 	slog.Info("VM imported", "name", name, "host", s.hostName, "disks", len(convertedPaths), "started", first.Start, "warnings", len(fv.Warnings))
 
+	// Every progress frame is out before the final one: one sender at a
+	// time on the stream. The converted disks are charged to the project by
+	// now, so a client that stops reading pins nothing uncharged.
+	stopProgress()
+	<-progressSent
 	return stream.Send(&pb.ImportVMProgress{
 		Phase:          "done",
 		MappedSpecJson: string(specJSON),
@@ -882,6 +890,13 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	if err := assertNoExternalDiskRefsAs(ctx, src, srcFormat, allowedDir); err != nil {
 		return err
 	}
+	// The conversion writes up to the image's virtual size, which a
+	// compressed image can make far larger than its file.
+	if vs, err := qemuVirtualSize(ctx, src, srcFormat); err != nil {
+		return err
+	} else if vs > uint64(maxSrcBytes) {
+		return fmt.Errorf("disk's virtual size is %d bytes, more than the %d bytes the import was admitted for", vs, maxSrcBytes)
+	}
 
 	// A fresh name of its own, never a fixed "<dst>.tmp" another writer to
 	// the pool directory could plant first.
@@ -939,6 +954,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 
 type qemuImgInfo struct {
 	Filename              string `json:"filename"`
+	VirtualSize           uint64 `json:"virtual-size"`
 	Format                string `json:"format"`
 	BackingFilenameFormat string `json:"backing-filename-format"`
 	BackingFilename       string `json:"backing-filename"`

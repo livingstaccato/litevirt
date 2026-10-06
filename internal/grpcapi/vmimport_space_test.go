@@ -2,6 +2,8 @@ package grpcapi
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -176,6 +178,50 @@ func TestImportVM_AClientThatStopsReadingDoesNotHoldOtherImports(t *testing.T) {
 			if err := s.ImportVM(st); err != nil {
 				t.Fatalf("an import behind a client that stopped reading: %v", err)
 			}
+
+			// Nor does it keep its unpacked source on disk while it waits.
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				left, _ := filepath.Glob(filepath.Join(s.dataDir, "imports", "imp-a-*"))
+				if len(left) == 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("an import waiting on its client still holds %v", left)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
 		})
+	}
+}
+
+// A compressed image can name a virtual size far beyond the file it arrives
+// in; the conversion writes up to that size, so it must fit what the import
+// was admitted for.
+func TestConvertForeignDisk_RefusesAnImageLargerThanItsLimit(t *testing.T) {
+	dir := t.TempDir()
+	bin := t.TempDir()
+	log := filepath.Join(t.TempDir(), "calls")
+	shim := "#!/bin/sh\n" +
+		"echo \"$*\" >> '" + log + "'\n" +
+		"for a; do last=$a; done\n" +
+		"if [ \"$1\" = info ]; then printf '{\"filename\":\"%s\",\"format\":\"raw\",\"virtual-size\":35184372088832}' \"$last\"; exit 0; fi\n" +
+		": > \"$last\"\n"
+	if err := writeFileHelper(bin+"/qemu-img", []byte(shim)); err != nil {
+		t.Fatal(err)
+	}
+	if err := chmodHelper(bin+"/qemu-img", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+":"+envPath())
+	src := filepath.Join(dir, "disk.raw")
+	if err := writeFileHelper(src, make([]byte, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), dir, 1<<30, nil); err == nil {
+		t.Fatal("an image whose virtual size is 32 TiB converted under a 1 GiB limit")
+	}
+	if b, _ := os.ReadFile(log); strings.Contains(string(b), "convert") {
+		t.Fatalf("qemu-img convert ran on an image past its limit: %s", b)
 	}
 }

@@ -3,6 +3,7 @@ package qcow2
 import (
 	"encoding/binary"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -86,5 +87,35 @@ func TestAssertStandalone_SparseVMDKRefused(t *testing.T) {
 	}
 	if err := AssertStandalone(p); err == nil {
 		t.Fatal("sparse VMDK (may embed an extent descriptor): got nil, want refusal")
+	}
+}
+
+// The external-data-file name lives in a header extension; an image that
+// carries one is refused even with the feature bit cleared, since a reader
+// that honours the extension alone would still open the named file.
+func TestAssertStandalone_DataFileExtensionRefusedWithoutTheBit(t *testing.T) {
+	if _, err := exec.LookPath("qemu-img"); err != nil {
+		t.Skip("qemu-img not available")
+	}
+	dir := t.TempDir()
+	p := filepath.Join(dir, "df.qcow2")
+	if out, err := exec.Command("qemu-img", "create", "-f", "qcow2", "-o", "data_file="+filepath.Join(dir, "data.raw"), p, "1M").CombinedOutput(); err != nil {
+		t.Fatalf("qemu-img: %v: %s", err, out)
+	}
+	f, err := os.OpenFile(p, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 8)
+	if _, err := f.ReadAt(buf, 72); err != nil {
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint64(buf, binary.BigEndian.Uint64(buf)&^4)
+	if _, err := f.WriteAt(buf, 72); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := AssertStandalone(p); err == nil {
+		t.Fatal("qcow2 with a data-file extension and the bit cleared: got nil, want refusal")
 	}
 }

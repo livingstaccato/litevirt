@@ -206,11 +206,14 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 	// Cap the body at MaxBytes+1 so reaching the extra byte means "too big".
 	body := io.LimitReader(resp.Body, opts.MaxBytes+1)
 
-	tmpPath := destPath + ".tmp"
-	f, err := os.Create(tmpPath)
+	// A fresh temp per pull (O_EXCL, never a link): a fixed "<dest>.tmp" let
+	// two pulls of one name write into the same file, and a link planted at
+	// that name be followed.
+	f, err := os.CreateTemp(filepath.Dir(destPath), "."+filepath.Base(destPath)+".pull-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
+	tmpPath := f.Name()
 	defer func() {
 		f.Close()
 		os.Remove(tmpPath) // clean up on error

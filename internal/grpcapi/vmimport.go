@@ -910,6 +910,9 @@ func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) erro
 	// import directory (--disk-map, an admin's path) may keep its extents or
 	// backing files beside it; anything beyond is an escape.
 	roots := []string{allowedDir}
+	if real, err := filepath.EvalSymlinks(allowedDir); err == nil {
+		roots[0] = real
+	}
 	if dir, err := filepath.EvalSymlinks(filepath.Dir(file)); err == nil {
 		roots = append(roots, dir)
 	} else {

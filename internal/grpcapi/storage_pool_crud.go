@@ -63,6 +63,10 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return nil, status.Errorf(codes.InvalidArgument,
 			"unknown driver %q (supported: %v)", req.Driver, storage.SupportedDrivers)
 	}
+	if _, ok := req.Options[storage.NFSExportOption]; ok {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"option %q is recorded by the daemon, not set in a request", storage.NFSExportOption)
+	}
 
 	host := req.Host
 	if host == "" {
@@ -129,10 +133,12 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			}
 		}
 	}
-	// Every pool has storage of its own: never a directory (or an alias of
-	// one, or one inside or around one) or an NFS export another pool uses.
-	// The other pool is not named: it may be another project's.
-	// An NFS export counts cluster-wide, under any spelling of its server.
+	// An NFS export — an nfs pool's, or the one under a directory pool on an
+	// NFS mount — is one pool's, cluster-wide and under any spelling of its
+	// server, and an NFS pool's mount point is never another pool's
+	// directory. Directory pools may share a local directory (their content
+	// is confined per file). The other pool is not named: it may be another
+	// project's.
 	newRef := StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target}
 	other, why, err := s.poolSharedWith(ctx, req.Name, &project, newRef, true)
 	if errors.Is(err, errNFSUnresolved) {
@@ -148,10 +154,24 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		if strings.EqualFold(req.Driver, "nfs") {
 			what = req.Source
 		}
-		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); every pool needs its own", req.Name, what, why)
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); an NFS export or mount point belongs to one pool", req.Name, what, why)
 	}
-	if err := checkDirPoolNotOnNFS(s.dataDir, newRef); err != nil {
+	if err := checkDirPoolNFSHardened(s.dataDir, newRef); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %v", req.Name, err)
+	}
+	// A directory pool on an NFS mount records the export it is on, so a
+	// pool on another host — which cannot see this host's mounts — compares
+	// against it.
+	var mt storage.MountTable
+	if exp, err := s.poolExportOf(&mt, s.hostName, newRef); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %v", req.Name, err)
+	} else if exp != nil && !strings.EqualFold(req.Driver, "nfs") {
+		opts := make(map[string]string, len(req.Options)+1)
+		for k, v := range req.Options {
+			opts[k] = v
+		}
+		opts[storage.NFSExportOption] = exp.String()
+		req.Options = opts
 	}
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,

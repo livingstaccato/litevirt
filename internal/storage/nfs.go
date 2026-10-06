@@ -290,29 +290,83 @@ func CheckNFSMountHardened(dataDir string, cfg Config) error {
 	return d.ensureHardened()
 }
 
-// CheckNotOnNFS refuses a directory pool (local, dir, btrfs) whose directory
-// is on an NFS mount — the mount point itself or anything under it, judged as
-// written and after resolving symlinks. Such a mount is an export no NFS pool
-// of its own holds: its source and options are nothing litevirt chose (a
-// deleted NFS pool's leftover mount, or one made by hand), so the pool would
-// serve whoever's files are on it. An NFS export is used only by an nfs pool.
-func CheckNotOnNFS(dir string) error {
+// MountTable is a snapshot of this host's mount table, read once and judged
+// many times (one per pool row).
+type MountTable struct{ all []mountEntry }
+
+// ReadMountTable reads the mount table.
+func ReadMountTable() (MountTable, error) {
 	all, err := mounts()
 	if err != nil {
-		return fmt.Errorf("read the mount table: %w", err)
+		return MountTable{}, fmt.Errorf("read the mount table: %w", err)
 	}
+	return MountTable{all: all}, nil
+}
+
+// NFSBacking is the NFS export a directory is stored on, and what its mount
+// lacks of nosuid,nodev,noexec,nosymfollow.
+type NFSBacking struct {
+	// Export is the export of the mount the directory is on plus the path of
+	// the directory below that mount point: the directory's identity as NFS
+	// storage, comparable with an nfs pool's Source and with any other
+	// directory on the same export, on any host.
+	Export NFSExport
+	// MountPoint is where that export is mounted on this host.
+	MountPoint string
+	// Missing lists the required per-mount options the mount lacks.
+	Missing []string
+}
+
+// NFSBackingOf reports whether dir is on an NFS mount — the mount point
+// itself or anything below it, judged as written and after resolving
+// symlinks (the resolved form wins) — and if so which export it is and what
+// its mount lacks. nil: on no NFS mount. An error: the mount's source is not
+// an NFS export litevirt can identify.
+func (t MountTable) NFSBackingOf(dir string) (*NFSBacking, error) {
+	var out *NFSBacking
 	for _, p := range pathForms(dir) {
 		var under mountEntry
-		for _, e := range all {
+		for _, e := range t.all {
 			// The deepest mount containing p is the one p is on; the last of
 			// equal depth is on top.
 			if within(e.dir, p) && len(e.dir) >= len(under.dir) {
 				under = e
 			}
 		}
-		if isNFSFstype(under.fstype) {
-			return fmt.Errorf("%s is on an NFS mount (%s at %s); an NFS export is used only through an nfs pool", dir, under.source, under.dir)
+		if !isNFSFstype(under.fstype) {
+			continue
 		}
+		exp, err := ParseNFSExport(under.source)
+		if err != nil {
+			return nil, fmt.Errorf("%s is on an NFS mount at %s whose source is not server:/export", dir, under.dir)
+		}
+		rel, err := filepath.Rel(under.dir, p)
+		if err != nil {
+			return nil, err
+		}
+		exp.Path = filepath.Clean(filepath.Join(exp.Path, rel))
+		out = &NFSBacking{Export: exp, MountPoint: under.dir, Missing: missingNFSFlags(under.flags)}
+	}
+	return out, nil
+}
+
+// CheckNFSBackingHardened refuses a directory pool (local, dir, btrfs) whose
+// directory is on an NFS mount without nosuid,nodev,noexec,nosymfollow: the
+// export's server decides what is on it, so nothing there may be a setuid
+// binary, a device node, an executable or a symlink followed as root. The
+// refusal names the mount point and the options it lacks, never the export.
+func CheckNFSBackingHardened(dir string) error {
+	t, err := ReadMountTable()
+	if err != nil {
+		return err
+	}
+	b, err := t.NFSBackingOf(dir)
+	if err != nil || b == nil {
+		return err
+	}
+	if len(b.Missing) > 0 {
+		return fmt.Errorf("%s is on an NFS mount at %s without %s; mount it with nosuid,nodev,noexec,nosymfollow (in fstab, for a mount litevirt does not make)",
+			dir, b.MountPoint, strings.Join(b.Missing, ","))
 	}
 	return nil
 }
@@ -444,3 +498,6 @@ func hardenNFSOptions(opts string) string {
 	}
 	return strings.Join(out, ",")
 }
+
+// Empty reports whether the table was never read.
+func (t MountTable) Empty() bool { return t.all == nil }

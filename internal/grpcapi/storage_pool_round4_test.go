@@ -78,22 +78,7 @@ func TestPoolRound4_MountOfAnotherExportIsRefused(t *testing.T) {
 	}
 }
 
-// IMP-2: a dir or local pool on an NFS mount point is on an export no NFS
-// pool of it owns, mounted with nothing litevirt checks: refused at create and
-// at use.
-func TestPoolRound4_DirPoolOnAnNFSMountIsRefused(t *testing.T) {
-	s := newPoolTestServer(t)
-	dir := t.TempDir()
-	overrideMounts(t, nfsMountLine(dir, "nas:/bravo"))
-	_, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "d", Driver: "dir", Target: dir, Project: "acme"})
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "NFS") {
-		t.Fatalf("a dir pool on an NFS mount point: got %v, want FailedPrecondition naming NFS", err)
-	}
-	upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "d", Driver: "dir", Target: dir, Project: "acme"})
-	if _, err := s.resolveVolume(adminCtx(), "", "d"); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a disk on a dir pool over an NFS mount: got %v, want FailedPrecondition", err)
-	}
-}
+// Item 2 (directory pools on an NFS mount): storage_pool_nfsdir_test.go.
 
 // IMP-3: an NFS export is cluster-wide storage. The same export on another
 // host is the same storage, allowed only for the same pool (name and

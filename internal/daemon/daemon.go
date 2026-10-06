@@ -1851,16 +1851,10 @@ func (d *Daemon) sumPoolDiskTotalGiB(ctx context.Context) int {
 func (d *Daemon) registerStoragePools(ctx context.Context) {
 	pools := d.cfg.StoragePools
 	if len(pools) == 0 {
-		// Its own directory, like every pool: never <data_dir>/disks, which
-		// holds every VM's local disks across projects.
-		defDir := filepath.Join(d.cfg.DataDir, "pools", "default")
-		if err := os.MkdirAll(defDir, 0o755); err != nil {
-			slog.Warn("create default pool directory", "dir", defDir, "error", err)
-		}
 		pools = []StoragePoolConfig{{
 			Name:   "default",
 			Driver: "local",
-			Target: defDir,
+			Target: d.defaultPoolDir(ctx),
 		}}
 	}
 	for _, p := range pools {
@@ -1871,6 +1865,11 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 			Source:   p.Source,
 			Target:   p.Target,
 			State:    "active",
+		}
+		// A directory pool on an NFS mount records the export it is on, so
+		// other hosts compare their pools against it (storage.NFSExportOption).
+		if exp := nfsExportOfDirPool(d.cfg.DataDir, p); exp != "" {
+			rec.Options = map[string]string{storage.NFSExportOption: exp}
 		}
 		if p.Target != "" {
 			var st syscall.Statfs_t
@@ -1886,6 +1885,54 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 			slog.Warn("failed to register storage pool", "pool", p.Name, "error", err)
 		}
 	}
+}
+
+// defaultPoolDir is where the built-in default pool lives: where this host's
+// registered default pool already is when that is <data_dir>/disks (an older
+// cluster's — it is not moved), otherwise <data_dir>/pools/default, its own
+// directory.
+func (d *Daemon) defaultPoolDir(ctx context.Context) string {
+	legacy := filepath.Join(d.cfg.DataDir, "disks")
+	if rec, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, "default"); err == nil && ok &&
+		rec.Driver == "local" && (rec.Target == legacy || rec.Target == "") {
+		return legacy
+	}
+	defDir := filepath.Join(d.cfg.DataDir, "pools", "default")
+	if err := os.MkdirAll(defDir, 0o755); err != nil {
+		slog.Warn("create default pool directory", "dir", defDir, "error", err)
+	}
+	return defDir
+}
+
+// nfsExportOfDirPool is the export a configured directory pool's directory is
+// on ("" when on none, or not a directory pool).
+func nfsExportOfDirPool(dataDir string, p StoragePoolConfig) string {
+	var dir string
+	switch strings.ToLower(p.Driver) {
+	case "", "local":
+		dir = p.Target
+		if dir == "" {
+			dir = filepath.Join(dataDir, "disks")
+		}
+	case "dir":
+		dir = p.Target
+	case "btrfs":
+		dir = p.Source
+	default:
+		return ""
+	}
+	if dir == "" {
+		return ""
+	}
+	mt, err := storage.ReadMountTable()
+	if err != nil {
+		return ""
+	}
+	b, err := mt.NFSBackingOf(dir)
+	if err != nil || b == nil {
+		return ""
+	}
+	return b.Export.String()
 }
 
 // hardenNFSPoolMounts reports, at ERROR, every NFS pool of this host whose

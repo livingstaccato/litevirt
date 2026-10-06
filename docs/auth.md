@@ -139,7 +139,9 @@ binding can:
   a backup or restore RPC all need it, because the daemon reads and writes
   there as root. Only `Admin` holds it (through `*`): `Operator` holds
   `storage.pool.write` but not this, at any path. A custom role gets it by
-  naming it or `storage.*`. Without bindings the floor is `admin`. See
+  naming it or `storage.*`. Without bindings the floor is `admin`. Using a pool
+  an admin created — disks on a `zfs` or `lvm-thin` pool included — needs only
+  the project's ordinary VM and disk permissions. See
   [storage.md](storage.md#host-paths).
 - **Security groups** (`sg.write`: `lv sg create/rm/rule-add/rule-rm`) are
   cluster-global, bound to NICs by name, and checked at `/`. Admin and

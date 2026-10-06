@@ -151,11 +151,12 @@ func (s *Server) poolRefusal(ctx context.Context, name string, ref StoragePoolRe
 			}
 		}
 	}
-	// A directory another pool also uses — the same one, an alias, one inside
-	// the other, or the same NFS export — is neither pool's own.
+	// An NFS export another pool also uses — directly, or as the export under
+	// a directory pool's NFS-mounted directory — and a directory under an NFS
+	// pool's mount point are neither pool's own.
 	other, why, err := s.poolSharedWith(ctx, name, nil, ref, false)
 	if err != nil {
-		return fmt.Errorf("check for a shared directory: %w", err), ""
+		return fmt.Errorf("check for shared storage: %w", err), ""
 	}
 	if other != "" {
 		return fmt.Errorf("its storage overlaps another pool's (%s)", why), fmt.Sprintf("other pool %q", other)
@@ -166,16 +167,19 @@ func (s *Server) poolRefusal(ctx context.Context, name string, ref StoragePoolRe
 	if err := storage.CheckNFSMountHardened(s.dataDir, cfg); err != nil {
 		return err, ""
 	}
-	// A directory pool on an NFS mount serves an export no NFS pool holds.
-	if err := checkDirPoolNotOnNFS(s.dataDir, ref); err != nil {
+	// A directory pool on an NFS mount (fstab, an NFS data_dir) is used only
+	// when that mount is hardened.
+	if err := checkDirPoolNFSHardened(s.dataDir, ref); err != nil {
 		return err, ""
 	}
 	return nil, ""
 }
 
-// checkDirPoolNotOnNFS refuses a directory pool (local, dir, btrfs) whose
-// directory is on an NFS mount (storage.CheckNotOnNFS).
-func checkDirPoolNotOnNFS(dataDir string, ref StoragePoolRef) error {
+// checkDirPoolNFSHardened refuses a directory pool (local, dir, btrfs) whose
+// directory is on an NFS mount lacking nosuid,nodev,noexec,nosymfollow
+// (storage.CheckNFSBackingHardened). On a hardened mount, or no NFS mount at
+// all, it passes.
+func checkDirPoolNFSHardened(dataDir string, ref StoragePoolRef) error {
 	if !isFileBasedDriver(ref.Driver) || strings.EqualFold(ref.Driver, "nfs") {
 		return nil
 	}
@@ -183,7 +187,7 @@ func checkDirPoolNotOnNFS(dataDir string, ref StoragePoolRef) error {
 	if err != nil {
 		return nil
 	}
-	return storage.CheckNotOnNFS(d)
+	return storage.CheckNFSBackingHardened(d)
 }
 
 // poolDirForWrite is fileBasedPoolDir for a write: checkPoolForWrite first,
@@ -334,17 +338,66 @@ func dirEntriesSample(dir string, n int) []string {
 // server, so could not tell its export apart from another pool's.
 var errNFSUnresolved = errors.New("an NFS server does not resolve")
 
+// poolExportOf is a pool's identity as NFS storage, or nil when it has none:
+// an nfs pool's export; for a directory pool (local, dir, btrfs) the export
+// its directory is on plus the path below the mount — read from this host's
+// mount table for a row of this host, from the export the row recorded
+// (storage.NFSExportOption) for another host's.
+func (s *Server) poolExportOf(mt *storage.MountTable, host string, ref StoragePoolRef) (*storage.NFSExport, error) {
+	switch {
+	case strings.EqualFold(ref.Driver, "nfs"):
+		e, err := storage.ParseNFSExport(ref.Source)
+		if err != nil {
+			return nil, err
+		}
+		return &e, nil
+	case !isFileBasedDriver(ref.Driver):
+		return nil, nil
+	case host != s.hostName:
+		rec := ref.Options[storage.NFSExportOption]
+		if rec == "" {
+			return nil, nil
+		}
+		e, err := storage.ParseNFSExport(rec)
+		if err != nil {
+			return nil, nil // not written by a daemon; compared on its own host
+		}
+		return &e, nil
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, ref)
+	if err != nil {
+		return nil, nil
+	}
+	if mt.Empty() {
+		t, err := storage.ReadMountTable()
+		if err != nil {
+			return nil, err
+		}
+		*mt = t
+	}
+	b, err := mt.NFSBackingOf(dir)
+	if err != nil || b == nil {
+		return nil, err
+	}
+	return &b.Export, nil
+}
+
 // poolSharedWith returns another live pool row ("host/name", for the log) that
 // shares ref's storage, and how ("" when none):
 //
-//   - a directory on this host: the same one, an alias of it, or one inside
-//     the other;
 //   - an NFS export, cluster-wide: an export is the same storage from every
-//     host, so a row on any host counts. The same export is the same server
-//     (canonical name or address) with the same export path or one inside the
-//     other — "/" (an NFSv4 pseudo-root) contains every export of its server.
-//     Only the same pool — the same name AND project — defined on several
-//     hosts may share it.
+//     host, so a row on any host counts. A pool's export is an nfs pool's
+//     Source, or the export under a directory pool whose directory is on an
+//     NFS mount (with the path below the mount). The same export is the same
+//     server (canonical name or address) with the same export path or one
+//     inside the other — "/" (an NFSv4 pseudo-root) contains every export of
+//     its server. Only the same pool — the same name AND project — defined on
+//     several hosts may share it.
+//   - a directory on this host under an NFS pool's mount point, or containing
+//     it: the mount would hide one pool's files or lay the export over them.
+//
+// Directory pools may otherwise share a local directory: what each caller
+// sees and changes there is confined to its project's files (poolDirShared).
 //
 // project is the pool's; nil means its stored row's (at use). With resolve
 // (at create) the servers of exports whose paths overlap are also resolved,
@@ -364,13 +417,12 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 		}
 		project = &stored
 	}
-	isNFS := strings.EqualFold(ref.Driver, "nfs")
-	var exp storage.NFSExport
-	if isNFS {
-		if exp, err = storage.ParseNFSExport(ref.Source); err != nil {
-			return "", "", err
-		}
+	var mt storage.MountTable
+	mine, err := s.poolExportOf(&mt, s.hostName, ref)
+	if err != nil {
+		return "", "", err
 	}
+	isNFS := strings.EqualFold(ref.Driver, "nfs")
 	dir := ""
 	if isFileBasedDriver(ref.Driver) {
 		dir, _ = fileBasedPoolDir(s.dataDir, ref)
@@ -385,28 +437,36 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 			continue // this pool's own row
 		}
 		label := r.HostName + "/" + r.Name
-		if isNFS && strings.EqualFold(r.Driver, "nfs") && !(r.Name == name && r.Project == *project) {
+		rref := StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}
+		if mine != nil && !(r.Name == name && r.Project == *project) {
 			// A row whose source does not parse is refused for every use by
 			// CheckConfig; it mounts nothing.
-			if e, err := storage.ParseNFSExport(r.Source); err == nil && exp.PathsOverlap(e) {
-				if e.Server == exp.Server {
+			theirs, err := s.poolExportOf(&mt, r.HostName, rref)
+			if err != nil && r.HostName == s.hostName && !strings.EqualFold(r.Driver, "nfs") {
+				return "", "", err
+			}
+			if err == nil && theirs != nil && mine.PathsOverlap(*theirs) {
+				if theirs.Server == mine.Server {
 					return label, "the same NFS export, or one inside the other", nil
 				}
-				overlapping = append(overlapping, nfsRow{label, e})
+				overlapping = append(overlapping, nfsRow{label, *theirs})
 			}
 		}
 		if r.HostName != s.hostName || dir == "" || !isFileBasedDriver(r.Driver) {
 			continue
 		}
-		d, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target})
+		if !isNFS && !strings.EqualFold(r.Driver, "nfs") {
+			continue // two directory pools may share a directory
+		}
+		d, err := fileBasedPoolDir(s.dataDir, rref)
 		if err == nil && storage.DirsOverlap(dir, d) {
-			return label, "the same directory, an alias of it, or one inside the other", nil
+			return label, "a directory under an NFS pool's mount point, or one containing it", nil
 		}
 	}
-	if !resolve || !isNFS {
+	if !resolve || mine == nil {
 		return "", "", nil
 	}
-	mine, err := storage.ResolveNFSServer(ctx, exp.Server)
+	myAddrs, err := storage.ResolveNFSServer(ctx, mine.Server)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %v", errNFSUnresolved, err)
 	}
@@ -416,7 +476,7 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 			slog.Error("storage pool check: another NFS pool's server does not resolve", "other", o.label, "error", err)
 			return "", "", fmt.Errorf("%w: another NFS pool's server, whose export path overlaps this one's, does not resolve", errNFSUnresolved)
 		}
-		if storage.SharesAddress(mine, theirs) {
+		if storage.SharesAddress(myAddrs, theirs) {
 			return o.label, "the same NFS export on a server with another name, or one inside the other", nil
 		}
 	}

@@ -159,32 +159,7 @@ func TestPoolContents_ProjectCannotReachAnotherProjectsDisks(t *testing.T) {
 		}
 	})
 
-	// Round 2: a pool on the shared <data_dir>/disks (created before pools got
-	// their own directories) is refused outright — listing included.
-	t.Run("legacy shared pool", func(t *testing.T) {
-		if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
-			HostName: s.hostName, Name: "shared", Driver: "local", Project: "acme", State: "active",
-		}); err != nil {
-			t.Fatal(err)
-		}
-		own := filepath.Join(disks, "installer.iso")
-		if err := os.WriteFile(own, []byte("iso"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := s.ListStoragePoolContents(pat, &pb.ListStoragePoolContentsRequest{PoolName: "shared"}); status.Code(err) != codes.FailedPrecondition {
-			t.Errorf("listing the shared pool: got %v, want FailedPrecondition", err)
-		}
-		for _, f := range []string{"bvm-root.qcow2", "installer.iso"} {
-			if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "shared", Filename: f}); status.Code(err) != codes.FailedPrecondition {
-				t.Errorf("deleting %s: got %v, want FailedPrecondition", f, err)
-			}
-		}
-		for _, p := range []string{theirs, own} {
-			if _, err := os.Stat(p); err != nil {
-				t.Errorf("%s was deleted: %v", filepath.Base(p), err)
-			}
-		}
-	})
+	// A legacy pool on the shared <data_dir>/disks: storage_pool_restore_test.go.
 }
 
 // The new per-pool directory is recorded as the pool's target.

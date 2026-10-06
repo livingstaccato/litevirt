@@ -196,7 +196,7 @@ func TestPoolHostPath_ProtectedDirectoriesAreRefusedEvenToAdmin(t *testing.T) {
 		"nfs mounted over etc":      {Driver: "nfs", Source: "nas:/x", Target: "/etc"},
 		"btrfs under usr":           {Driver: "btrfs", Source: "/usr/local/vm"},
 		"nfs source deriving ..":    {Driver: "nfs", Source: ".."},
-		"data dir disks":            {Driver: "dir", Target: filepath.Join(s.dataDir, "disks")},
+		"inside data dir disks":     {Driver: "dir", Target: filepath.Join(s.dataDir, "disks", "sub")},
 	}
 	for name, req := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -208,15 +208,24 @@ func TestPoolHostPath_ProtectedDirectoriesAreRefusedEvenToAdmin(t *testing.T) {
 		})
 	}
 
-	// The daemon's own pool area stays usable.
+	// The daemon's own pool area stays usable, and so does <data_dir>/disks
+	// itself, where an older cluster's default pool is.
 	own := filepath.Join(s.dataDir, "pools", "elsewhere")
-	if err := os.MkdirAll(own, 0o755); err != nil {
-		t.Fatal(err)
+	disks := filepath.Join(s.dataDir, "disks")
+	for _, d := range []string{own, disks} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{
 		Name: "default2", Driver: "dir", Target: own,
 	}); err != nil {
 		t.Fatalf("a dir pool under <data_dir>/pools: %v", err)
+	}
+	if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{
+		Name: "legacy", Driver: "dir", Target: disks,
+	}); err != nil {
+		t.Fatalf("a dir pool on <data_dir>/disks: %v", err)
 	}
 }
 

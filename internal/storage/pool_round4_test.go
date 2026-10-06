@@ -155,10 +155,11 @@ func TestResolveNFSServer(t *testing.T) {
 	}
 }
 
-// IMP-2: a directory pool on an NFS mount — the mount point or below it,
-// directly or through a symlink — is refused; one on a local filesystem, or
-// on a local mount inside an NFS one, is not.
-func TestCheckNotOnNFS(t *testing.T) {
+// Item 2: a directory on an NFS mount — the mount point or below it, directly
+// or through a symlink — is that export's storage: the export plus the path
+// below the mount. One on a local filesystem, or on a local mount inside an
+// NFS one, is on no export.
+func TestNFSBackingOf(t *testing.T) {
 	nfs := t.TempDir()
 	local := t.TempDir()
 	inner := filepath.Join(nfs, "disk")
@@ -172,21 +173,59 @@ func TestCheckNotOnNFS(t *testing.T) {
 	prev := readMountInfo
 	readMountInfo = func() ([]byte, error) {
 		return []byte(fmt.Sprintf("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n"+
-			"40 1 0:60 / %s %s - nfs4 nas:/bravo rw\n"+
+			"40 1 0:60 / %s %s - nfs4 NAS:/bravo/ rw\n"+
 			"41 40 8:2 / %s rw - ext4 /dev/sdb1 rw\n", nfs, hardenedFlags, inner)), nil
 	}
 	defer func() { readMountInfo = prev }()
-	for dir, wantErr := range map[string]bool{
-		nfs:                        true,
-		filepath.Join(nfs, "sub"):  true,
-		filepath.Join(nfs, "new"):  true,
-		link:                       true,
-		local:                      false,
-		inner:                      false,
-		filepath.Join(inner, "vm"): false,
+	mt, err := ReadMountTable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for dir, want := range map[string]string{
+		nfs:                        "nas:/bravo",
+		filepath.Join(nfs, "sub"):  "nas:/bravo/sub",
+		filepath.Join(nfs, "new"):  "nas:/bravo/new",
+		link:                       "nas:/bravo/sub",
+		local:                      "",
+		inner:                      "",
+		filepath.Join(inner, "vm"): "",
 	} {
-		if err := CheckNotOnNFS(dir); (err != nil) != wantErr {
-			t.Errorf("CheckNotOnNFS(%s) = %v, wantErr %v", dir, err, wantErr)
+		b, err := mt.NFSBackingOf(dir)
+		if err != nil {
+			t.Fatalf("NFSBackingOf(%s): %v", dir, err)
 		}
+		got := ""
+		if b != nil {
+			got = b.Export.String()
+			if len(b.Missing) != 0 {
+				t.Errorf("%s: hardened mount reports missing %v", dir, b.Missing)
+			}
+		}
+		if got != want {
+			t.Errorf("NFSBackingOf(%s) = %q, want %q", dir, got, want)
+		}
+		if err := CheckNFSBackingHardened(dir); err != nil {
+			t.Errorf("CheckNFSBackingHardened(%s) on a hardened mount: %v", dir, err)
+		}
+	}
+}
+
+// Item 2: a directory on an NFS mount lacking any of the four options is
+// refused, the refusal saying which are missing (and only those) — and not
+// naming the export.
+func TestCheckNFSBackingHardenedNamesWhatIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	mountInfoWith(t, dir, "rw,nosuid,relatime", "nfs", "nas:/secret-tenant")
+	err := CheckNFSBackingHardened(filepath.Join(dir, "pool"))
+	if err == nil {
+		t.Fatal("an unhardened NFS mount was accepted")
+	}
+	for _, want := range []string{"without nodev,noexec,nosymfollow;", dir} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q lacks %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "secret-tenant") {
+		t.Errorf("refusal %q names the export", err)
 	}
 }

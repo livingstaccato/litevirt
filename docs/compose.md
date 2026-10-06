@@ -1034,6 +1034,9 @@ change one, and refuses system and litevirt-internal directories to everyone
 ([storage.md](storage.md#host-paths)). Re-deploying
 a volume exactly as the stored stack already has it needs no new authority, so
 an operator can re-deploy a stack an admin wrote.
+A disk whose `storage:` names a pool an admin already created — a `zfs` or
+`lvm-thin` pool included — needs no such authority: using a pool takes only
+the project's ordinary VM permissions.
 
 ## Stack-level settings
 

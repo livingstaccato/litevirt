@@ -17,9 +17,9 @@ import (
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
-// I1: "every pool has its own directory" is judged on resolved, canonical
-// directories — a symlink alias, a directory inside another pool's or one
-// containing it is not a directory of its own — at create and at use.
+// Item 3: two directory pools on one directory — the same one, a symlink
+// alias, one inside the other — are both created and both used; what each
+// lists is confined per file (storage_pool_restore_test.go).
 func TestPoolRound3_AliasedOrNestedDirectoriesAreShared(t *testing.T) {
 	parent := t.TempDir()
 	base := filepath.Join(parent, "a")
@@ -40,17 +40,16 @@ func TestPoolRound3_AliasedOrNestedDirectoriesAreShared(t *testing.T) {
 			if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "a", Driver: "dir", Target: base}); err != nil {
 				t.Fatal(err)
 			}
-			_, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "b", Driver: "dir", Target: second})
-			wantSharedRefusal(t, "create", err)
-			// The same pair, already stored, is refused at use.
-			if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
-				HostName: s.hostName, Name: "b", Driver: "dir", Target: second, State: "active",
-			}); err != nil {
-				t.Fatal(err)
+			if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "b", Driver: "dir", Target: second}); err != nil {
+				t.Fatalf("second pool on %s: %v", name, err)
 			}
 			for _, p := range []string{"a", "b"} {
-				if _, err := s.resolveVolume(adminCtx(), "", p); status.Code(err) != codes.FailedPrecondition {
-					t.Errorf("use of %s: got %v, want FailedPrecondition", p, err)
+				if _, err := s.resolveVolume(adminCtx(), "", p); err != nil {
+					t.Errorf("use of %s: %v", p, err)
+				}
+				rec, _, _ := corrosion.GetStoragePool(adminCtx(), s.db, s.hostName, p)
+				if !s.poolDirShared(adminCtx(), rec) {
+					t.Errorf("%s is not seen as a shared directory", p)
 				}
 			}
 		})
@@ -153,17 +152,25 @@ func TestPoolRound3_RefusalsDoNotLeakNames(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	_, err = s.ListStoragePoolContents(pat, &pb.ListStoragePoolContentsRequest{PoolName: "mine"})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("got %v, want FailedPrecondition", err)
+	if err := os.WriteFile(filepath.Join(dir, "bravo-plan.iso"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(err.Error(), "bravo-secret") {
-		t.Errorf("the refusal names another project's pool: %v", err)
+	resp, err := s.ListStoragePoolContents(pat, &pb.ListStoragePoolContentsRequest{PoolName: "mine"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Contents) != 0 {
+		t.Errorf("acme's listing of a shared directory shows files it does not own: %v", resp.Contents)
+	}
+	_, err = s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "mine", Filename: "bravo-plan.iso"})
+	if status.Code(err) != codes.NotFound || strings.Contains(err.Error(), "bravo-secret") {
+		t.Errorf("deleting another project's file: got %v, want NotFound naming no other pool", err)
 	}
 }
 
 // m-f: the migration helpers' artifact roots and the scratch sweep use the
-// same check as every other use: a shared or weakly mounted pool is no root.
+// same check as every other use: a weakly mounted pool is no root; a shared
+// directory, which VM disks use, is one.
 func TestPoolRound3_ArtifactRootsUseTheSameCheck(t *testing.T) {
 	s := newPoolTestServer(t)
 	shared := t.TempDir()
@@ -185,8 +192,8 @@ func TestPoolRound3_ArtifactRootsUseTheSameCheck(t *testing.T) {
 	defer storage.OverrideMountInfoForTest(func() ([]byte, error) {
 		return []byte(fmt.Sprintf("1 1 0:1 / %s rw,relatime - nfs4 nas:/w rw\n", weak)), nil
 	})()
-	if s.withinDiskArtifactRoot(filepath.Join(shared, "vm-root.qcow2")) {
-		t.Errorf("a shared directory is a disk-artifact root")
+	if !s.withinDiskArtifactRoot(filepath.Join(shared, "vm-root.qcow2")) {
+		t.Errorf("a shared directory (usable for VM disks) is not a disk-artifact root")
 	}
 	if s.withinDiskArtifactRoot(filepath.Join(weak, "vm-root.qcow2")) {
 		t.Errorf("a weakly mounted NFS pool is a disk-artifact root")

@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -89,6 +90,12 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
+	// A directory that is not the pool's own shows a caller only its
+	// project's files.
+	conf, err := s.poolConfinementFor(ctx, rec)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "pool content owners: %v", err)
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -112,6 +119,9 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		// with every local VM disk on the host. Unknown ownership hides it.
 		owners, oerr := s.liveDiskOwners(ctx, s.hostName, filepath.Join(dir, name))
 		if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != req.PoolName }) {
+			continue
+		}
+		if !conf.allows(ctx, filepath.Join(dir, name)) {
 			continue
 		}
 		resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
@@ -173,6 +183,15 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
+	// In a directory that is not the pool's own, only the caller's project's
+	// files; another's is reported as absent, not as someone else's.
+	conf, err := s.poolConfinementFor(ctx, rec)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "pool content owners: %v", err)
+	}
+	if !conf.allows(ctx, target) {
+		return nil, status.Errorf(codes.NotFound, "%q is not in pool %q", req.Filename, req.PoolName)
+	}
 	// Never a file a live disk uses — this pool's or, in a directory shared
 	// with other disks, anyone's.
 	owners, err := s.liveDiskOwners(ctx, s.hostName, target)
@@ -187,6 +206,9 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	// redirected to delete an arbitrary file outside the pool.
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
+	}
+	if err := s.forgetPoolUpload(target); err != nil {
+		slog.Warn("pool content deleted but its upload record was not dropped", "pool", req.PoolName, "file", req.Filename, "error", err)
 	}
 	return &emptypb.Empty{}, nil
 }
@@ -341,6 +363,15 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		// name the storage will not vouch for.
 		_ = os.Remove(dest)
 		return status.Errorf(codes.Internal, "sync directory: %v", err)
+	}
+	// A caller's upload is recorded as its pool's project's: in a directory
+	// that is not the pool's own, the record is what makes it theirs. A
+	// peer's (a cross-host replica) is owned through its schedule instead.
+	if s.requirePeerCert(ctx) != nil {
+		if err := s.recordPoolUpload(rec.Name, rec.Project, dest); err != nil {
+			_ = os.Remove(dest)
+			return status.Errorf(codes.Internal, "record upload: %v", err)
+		}
 	}
 	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total})
 }

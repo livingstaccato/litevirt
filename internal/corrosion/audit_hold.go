@@ -235,6 +235,18 @@ func auditHistoryArrived(ctx context.Context, c *Client, host string, seq int64,
 	return err == nil && len(rows) == 1 && rows[0].Int64("n") == seq
 }
 
+// gapReason says what a hold whose admitted row is present is still waiting
+// for. missing is the lowest absent seq, or 0 when it could not be determined.
+func gapReason(target, missing int64) string {
+	if missing <= 0 {
+		return fmt.Sprintf("this node holds its admitted audit row (seq %d) but not every row below "+
+			"it yet; waiting for the rest of its history from its peers", target)
+	}
+	return fmt.Sprintf("this node holds its admitted audit row (seq %d) but not every row below it: "+
+		"seq %d is missing. If a peer holds it, it arrives; if no node does, the history has a gap "+
+		"and this hold cannot open by itself", target, missing)
+}
+
 // lowestMissingSeq is the lowest seq in 1..upTo with no row of host's, or 0.
 func lowestMissingSeq(ctx context.Context, c *Client, host string, upTo int64) int64 {
 	rows, err := c.Query(ctx,
@@ -610,10 +622,7 @@ func (c *Client) auditTargetReached(ctx context.Context, h *auditHold) (bool, st
 	}
 	local, _ := freshHostTailSeq(ctx, c, h.cfg.Host)
 	if auditRowPresent(ctx, c, h.cfg.Host, h.cfg.Target, h.cfg.TargetHash) {
-		return false, fmt.Sprintf("this node holds its admitted audit row (seq %d) but not every row "+
-			"below it: seq %d is missing. If a peer holds it, it arrives; if no node does, the "+
-			"history has a gap and this hold cannot open by itself", h.cfg.Target,
-			lowestMissingSeq(ctx, c, h.cfg.Host, h.cfg.Target))
+		return false, gapReason(h.cfg.Target, lowestMissingSeq(ctx, c, h.cfg.Host, h.cfg.Target))
 	}
 	if local >= h.cfg.Target {
 		return false, fmt.Sprintf("this node's copy of its own audit chain reaches seq %d, but its row at seq %d "+

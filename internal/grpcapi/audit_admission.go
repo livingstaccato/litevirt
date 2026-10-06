@@ -42,9 +42,11 @@ func (s *Server) auditAdmissionPosition(ctx context.Context, name string) (int64
 	}
 	if !s.db.AuditSeeded(ctx) {
 		return 0, "", status.Errorf(codes.Unavailable,
-			"%s cannot admit %s: its replica is not known to hold the cluster's history — it has not "+
-				"completed an anti-entropy exchange with a node that does (`seeded`) — so it cannot vouch "+
-				"for %s's audit history. Run `lv host add` against another node, or retry once it has",
+			"%s cannot admit %s: its replica is not known to hold the cluster's history (it is not "+
+				"seeded: it has not completed an anti-entropy exchange with a seeded node on this build — "+
+				"an older-build peer cannot seed it), so it cannot vouch for %s's audit history. Run "+
+				"`lv host add` against a seeded node: `lv health` shows audit_not_seeded for every node "+
+				"that is not. If no node is seeded, see docs/audit-log.md (\"No seeded node\")",
 			s.hostName, name, name)
 	}
 	if ok, why := s.db.ReplicaCaughtUp(); !ok {

@@ -258,14 +258,29 @@ func (d *Daemon) markAuditKeyringWired() {
 // writeAuditHoldCondition raises or resolves audit_chain_held about this host.
 // Reports whether the row was written.
 func (d *Daemon) writeAuditHoldCondition(ctx context.Context, open bool, count int, why string) bool {
+	severity := corrosion.SeverityWarning
+	if d.db.AuditHoldFull(d.cfg.HostName) {
+		severity = corrosion.SeverityCritical
+	}
+	return d.writeSelfCondition(ctx, CondAuditChainHeld, open, severity,
+		map[string]any{"held_rows": count, "waiting_for": why})
+}
+
+// writeSelfCondition raises (open) or resolves an audit health condition about
+// this host. One writer per row: each node about itself. Reports whether the row
+// was written.
+func (d *Daemon) writeSelfCondition(ctx context.Context, code string, open bool, severity string, evidence any) bool {
 	ts := time.Now().UTC().Format(time.RFC3339)
-	row, found, err := corrosion.GetHealthCondition(ctx, d.db, auditHoldEvaluator, CondAuditChainHeld, "host", d.cfg.HostName)
+	row, found, err := corrosion.GetHealthCondition(ctx, d.db, auditHoldEvaluator, code, "host", d.cfg.HostName)
 	if err != nil {
+		return false
+	}
+	if !open && (!found || row.Lifecycle == corrosion.ConditionResolved) {
 		return false
 	}
 	if !found || row.Lifecycle == corrosion.ConditionResolved {
 		row = corrosion.HealthCondition{
-			Evaluator: auditHoldEvaluator, Code: CondAuditChainHeld,
+			Evaluator: auditHoldEvaluator, Code: code,
 			SubjectKind: "host", SubjectID: d.cfg.HostName, FirstSeen: ts,
 		}
 	}
@@ -277,29 +292,72 @@ func (d *Daemon) writeAuditHoldCondition(ctx context.Context, open bool, count i
 		if row.ConfirmedAt == "" {
 			row.ConfirmedAt = ts
 		}
-		row.Severity = corrosion.SeverityWarning
-		if d.db.AuditHoldFull(d.cfg.HostName) {
-			row.Severity = corrosion.SeverityCritical
-		}
+		row.Severity = severity
 		row.ObserveCount++
 		row.CleanCount = 0
 		row.ResolvedAt = ""
-		ev, _ := json.Marshal(map[string]any{"held_rows": count, "waiting_for": why})
+		ev, _ := json.Marshal(evidence)
 		row.Evidence = string(ev)
 	} else {
-		if !found {
-			return false
-		}
 		row.Lifecycle = corrosion.ConditionResolved
 		row.ResolvedAt = ts
 		row.ObserveCount = 0
 		row.CleanCount = 1
 	}
 	if err := corrosion.UpsertHealthCondition(ctx, d.db, row); err != nil {
-		slog.Warn("could not record the audit_chain_held condition", "error", err)
+		slog.Warn("could not record an audit health condition", "code", code, "error", err)
 		return false
 	}
 	return true
+}
+
+// CondAuditNotSeeded is raised by a node about itself while its replica is not
+// seeded (corrosion/audit_seeded.go): `lv host add` through it is refused.
+const CondAuditNotSeeded = "audit_not_seeded"
+
+// auditSeededPoll is how often runAuditSeeded re-checks.
+const auditSeededPoll = 30 * time.Second
+
+// runAuditSeeded shows, in `lv health`, every node whose replica is not seeded,
+// so an operator can see which nodes `lv host add` may be run against. Info for
+// the ordinary case (a fresh joiner that has not yet exchanged with a seeded
+// peer, which clears by itself); warning, and an ERROR line, when the marker
+// cannot be used or written — the replica is then not seeded until the marker
+// is fixed (it fails closed). Resolved, and the loop ends, once seeded.
+func (d *Daemon) runAuditSeeded(ctx context.Context) {
+	for {
+		if d.reportAuditSeeded(ctx) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(auditSeededPoll):
+		}
+	}
+}
+
+// reportAuditSeeded is one pass of runAuditSeeded. It reports whether the
+// replica is seeded.
+func (d *Daemon) reportAuditSeeded(ctx context.Context) bool {
+	if d.db.AuditSeeded(ctx) {
+		d.writeSelfCondition(ctx, CondAuditNotSeeded, false, "", nil)
+		return true
+	}
+	severity := corrosion.SeverityInfo
+	problem := d.db.AuditSeededProblem(ctx)
+	if problem != "" {
+		severity = corrosion.SeverityWarning
+		slog.Error("this replica's seeded marker cannot be used or written; it is treated as not "+
+			"seeded, and `lv host add` through this node is refused", "problem", problem,
+			"file", filepath.Join(d.cfg.DataDir, corrosion.AuditSeededFileName))
+	}
+	d.writeSelfCondition(ctx, CondAuditNotSeeded, true, severity, map[string]any{
+		"problem": problem,
+		"becomes_seeded": "by completing an anti-entropy exchange with a seeded node on this build " +
+			"that is not holding its own audit rows",
+	})
+	return false
 }
 
 // awaitAuditChainCaughtUp blocks until this host's audit rows are no longer

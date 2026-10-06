@@ -1451,6 +1451,23 @@ on the host and restarting its daemon ends the hold at the cost of a permanent
 fork finding for that host
 ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
 
+### Audit replica not seeded (`audit_not_seeded`)
+
+A node whose replica is not known to hold the cluster's history raises
+`audit_not_seeded` about **itself**. `lv host add` run against it is refused,
+because the audit chain position it would hand the new machine may be missing
+history ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
+Run `lv host add` against a node without this condition.
+
+| Raised when | Clears when |
+|---|---|
+| The daemon starts on a replica that is not seeded, and every 30 s after that. **Info** for the ordinary case: a node that has just joined and has not yet completed an exchange with a seeded node on this build. **Warning**, with an error line, when `<data_dir>/audit-seeded.json` exists but cannot be read or written; the node then stays not seeded (it fails closed). The evidence carries `problem`. | The replica becomes seeded: an anti-entropy exchange with a seeded node that is not holding its own audit rows. |
+
+**If it does not clear,** check that a seeded node on this build is reachable;
+a node on an older build cannot seed one. With `problem` set, fix or remove the
+marker file and restart. If no node in the cluster is seeded, see "No seeded
+node" in [audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name).
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

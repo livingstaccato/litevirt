@@ -593,8 +593,13 @@ node refuses with `Unavailable` when it cannot vouch for it:
   first exchange can be with another rebuilt host as empty as itself, while at
   first boot its hosts table names only itself. The marker is local, never
   replicated, kept as `<data_dir>/audit-seeded.json` and bound to the state.db
-  it was written for, so a lost or replaced state.db is not seeded. A peer on an
-  older build reports nothing and does not seed;
+  it was written for, so a lost or replaced state.db is not seeded (an in-place
+  `lv host reseed` keeps it, which is sound: a reseed keeps every audit table
+  and only adds rows). A marker that exists but cannot be read, or a decision
+  that cannot be written, counts as not seeded. A peer on an older build
+  reports nothing and does not seed. Every node that is not seeded raises
+  `audit_not_seeded` about itself, so `lv health` shows which nodes `lv host
+  add` can run against;
 - its replica has not caught up since the daemon started, unless it is alone in
   the cluster (a founder adding its first host has nobody to catch up with);
 - the name's tail on it is below a retirement the cluster CA recorded for the
@@ -602,6 +607,22 @@ node refuses with `Unavailable` when it cannot vouch for it:
   the host.
 
 Run `lv host add` against another node, or retry once it has caught up.
+
+**No seeded node.** A cluster can end up with no seeded replica at all: a
+single-node cluster whose founder lost its state.db, or a total loss where
+every replica is fresh. `lv host add` is then refused everywhere, for good. The
+way out is an operator's assertion, as root on the node that holds the most
+complete history:
+
+```bash
+touch /var/lib/litevirt/audit-seeded-assert   # <data_dir>/audit-seeded-assert
+systemctl restart litevirt
+```
+
+The next start records the replica as seeded on that assertion and removes the
+file. If the replica does **not** hold a re-added name's history, the position
+it vouches for is too low and that host forks its audit chain, which `verify`
+then reports for good — the assertion is the operator taking that on.
 An admitting daemon older than this reports no position, so its admissions get
 no record and nothing is held — the behaviour before this change.
 

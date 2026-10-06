@@ -44,8 +44,11 @@ import (
 // The marker is local and never replicated: it is a statement about this
 // replica. It is a file under data_dir bound to this state.db's voter
 // incarnation (minted once per state.db by InitSchema), so it dies with the
-// replica — a lost, reseeded or replaced state.db gets a new incarnation and the
-// old marker no longer counts. No table is added, so there is no schema change
+// replica — a lost or replaced state.db gets a new incarnation and the old
+// marker no longer counts. An in-place `lv host reseed` keeps the incarnation,
+// and with it the marker; that is sound, because a reseed keeps every audit
+// table and the hosts table (reseedKeepTables) and only adds the source's rows,
+// so the replica still holds everything it held when it was seeded. No table is added, so there is no schema change
 // and no statement shape.
 
 // AuditSeededFileName is the marker under data_dir.
@@ -65,6 +68,9 @@ type auditSeededState struct {
 	loaded  bool
 	decided bool
 	seeded  bool
+	// problem says why the marker could not be used, if it could not: the
+	// replica is then treated as decided and NOT seeded (fails closed).
+	problem string
 }
 
 func (c *Client) auditSeededPath() string {
@@ -75,50 +81,89 @@ func (c *Client) auditSeededPath() string {
 }
 
 // loadAuditSeededLocked reads the marker once. Caller holds c.seeded.mu.
+//
+// Only an absent marker, or one written for a DIFFERENT state.db, leaves the
+// replica undecided. A marker that is present and cannot be used — unreadable,
+// unparseable, or not checkable against this state.db — counts as decided and
+// not seeded. Treating it as undecided would hand the next start to the
+// upgrade rule, which grandfathers any replica holding rows of its own: a
+// rebuilt host whose hold has since opened would be seeded without ever
+// exchanging with a seeded peer.
 func (c *Client) loadAuditSeededLocked(ctx context.Context) {
 	if c.seeded.loaded {
 		return
 	}
+	c.seeded.loaded = true
 	path := c.auditSeededPath()
 	if path == "" {
-		c.seeded.loaded = true
 		return
 	}
 	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	failClosed := func(why string) {
+		c.seeded.decided, c.seeded.seeded, c.seeded.problem = true, false, why
+		slog.Error("this replica's seeded marker cannot be used; the replica is treated as NOT seeded "+
+			"and does not vouch for audit chain positions at host admission", "file", path, "problem", why)
+	}
 	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("could not read this replica's seeded marker; it is treated as not seeded",
-				"file", path, "error", err)
-		}
-		c.seeded.loaded = true
+		failClosed("marker unreadable: " + err.Error())
 		return
 	}
 	var m auditSeededMarker
-	inc, ierr := c.VoterIncarnation(ctx)
-	if json.Unmarshal(data, &m) != nil || ierr != nil || m.Incarnation != inc {
-		// Another state.db's marker: this replica has decided nothing yet.
-		c.seeded.loaded = true
+	if err := json.Unmarshal(data, &m); err != nil {
+		failClosed("marker does not parse: " + err.Error())
 		return
-	}
-	c.seeded.loaded, c.seeded.decided, c.seeded.seeded = true, true, m.Seeded
-}
-
-func (c *Client) writeAuditSeededLocked(ctx context.Context, seeded bool, reason string) error {
-	c.seeded.decided, c.seeded.seeded = true, seeded
-	path := c.auditSeededPath()
-	if path == "" {
-		return nil
 	}
 	inc, err := c.VoterIncarnation(ctx)
 	if err != nil {
-		return err
+		failClosed("this state.db's incarnation cannot be read: " + err.Error())
+		return
 	}
-	data, err := json.Marshal(auditSeededMarker{Incarnation: inc, Seeded: seeded, Reason: reason,
-		At: time.Now().UTC().Format(time.RFC3339)})
+	if m.Incarnation != inc {
+		return // another state.db's marker: this replica has decided nothing yet
+	}
+	c.seeded.decided, c.seeded.seeded = true, m.Seeded
+}
+
+// writeAuditSeededLocked persists a decision and adopts it only once it is
+// durable. A decision that cannot be written leaves the replica not seeded in
+// this process (fails closed) and records the problem.
+func (c *Client) writeAuditSeededLocked(ctx context.Context, seeded bool, reason string) error {
+	path := c.auditSeededPath()
+	if path == "" {
+		c.seeded.decided, c.seeded.seeded, c.seeded.problem = true, seeded, ""
+		return nil
+	}
+	err := func() error {
+		inc, err := c.VoterIncarnation(ctx)
+		if err != nil {
+			return err
+		}
+		data, err := json.Marshal(auditSeededMarker{Incarnation: inc, Seeded: seeded, Reason: reason,
+			At: time.Now().UTC().Format(time.RFC3339)})
+		if err != nil {
+			return err
+		}
+		return secretfile.Write(path, data, 0o600)
+	}()
 	if err != nil {
+		c.seeded.decided, c.seeded.seeded = true, false
+		c.seeded.problem = "the seeded marker could not be written: " + err.Error()
 		return err
 	}
-	return secretfile.Write(path, data, 0o600)
+	c.seeded.decided, c.seeded.seeded, c.seeded.problem = true, seeded, ""
+	return nil
+}
+
+// AuditSeededProblem says why this replica's seeded marker could not be used
+// or written, or "" when it could. A replica with a problem is not seeded.
+func (c *Client) AuditSeededProblem(ctx context.Context) string {
+	c.seeded.mu.Lock()
+	defer c.seeded.mu.Unlock()
+	c.loadAuditSeededLocked(ctx)
+	return c.seeded.problem
 }
 
 // AuditSeeded reports whether this replica is seeded (see above).
@@ -158,6 +203,9 @@ func (c *Client) MarkAuditSeededForTests() {
 // own host and is not holding them — an existing member at a rolling upgrade.
 // Called after ConfigureAuditHold and before the daemon writes anything.
 func DecideAuditSeeded(ctx context.Context, c *Client, host string) (bool, error) {
+	if seeded, done, err := c.consumeAuditSeededAssertion(ctx); done {
+		return seeded, err
+	}
 	held := c.AuditChainHeld(ctx, host)
 	c.seeded.mu.Lock()
 	defer c.seeded.mu.Unlock()
@@ -177,8 +225,45 @@ func DecideAuditSeeded(ctx context.Context, c *Client, host string) (bool, error
 		reason = "first start of this build while holding its own audit rows"
 	}
 	if err := c.writeAuditSeededLocked(ctx, seeded, reason); err != nil {
-		return seeded, fmt.Errorf("record this replica's seeded decision: %w", err)
+		// Not adopted: a decision that is not durable could be taken differently
+		// on the next start, so this process proceeds as not seeded.
+		return false, fmt.Errorf("record this replica's seeded decision: %w", err)
 	}
 	slog.Info("recorded whether this replica holds the cluster's history", "seeded", seeded, "reason", reason)
 	return seeded, nil
+}
+
+// AuditSeededAssertFileName is the operator's way out of a cluster with no
+// seeded replica at all — a single-node cluster whose founder lost its
+// state.db, or a total loss — where `lv host add` is otherwise refused
+// forever. Root creates it under data_dir and restarts the daemon; the next
+// start records this replica as seeded, on the operator's word, and removes
+// it. If this replica does NOT hold the cluster's history, an admission it then
+// vouches for can let a re-added host fork its audit chain: the assertion is
+// the operator taking that on.
+const AuditSeededAssertFileName = "audit-seeded-assert"
+
+// consumeAuditSeededAssertion applies an operator's assertion, if one is
+// present. done is false when there is none.
+func (c *Client) consumeAuditSeededAssertion(ctx context.Context) (seeded, done bool, err error) {
+	if c.dataDir == "" {
+		return false, false, nil
+	}
+	assert := filepath.Join(c.dataDir, AuditSeededAssertFileName)
+	if _, err := os.Lstat(assert); errors.Is(err, os.ErrNotExist) {
+		return false, false, nil
+	}
+	c.seeded.mu.Lock()
+	c.loadAuditSeededLocked(ctx)
+	werr := c.writeAuditSeededLocked(ctx, true, "operator asserted ("+AuditSeededAssertFileName+")")
+	c.seeded.mu.Unlock()
+	if werr != nil {
+		return false, true, fmt.Errorf("record the operator's seeded assertion: %w", werr)
+	}
+	slog.Warn("this replica was asserted seeded by an operator: it vouches for audit chain positions at "+
+		"host admission on the operator's word that it holds the cluster's history", "file", assert)
+	if err := os.Remove(assert); err != nil {
+		slog.Warn("could not remove the seeded assertion after applying it", "file", assert, "error", err)
+	}
+	return true, true, nil
 }

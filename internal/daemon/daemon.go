@@ -363,9 +363,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// a fresh replica becomes seeded at genesis or by an exchange with a seeded
 	// peer (corrosion/audit_seeded.go). AdmitHost vouches only when seeded.
 	if _, err := corrosion.DecideAuditSeeded(ctx, d.db, d.cfg.HostName); err != nil {
-		slog.Warn("could not decide whether this replica is seeded; it does not vouch for audit chain "+
-			"positions until an exchange with a seeded peer", "error", err)
+		slog.Error("could not decide whether this replica is seeded; it is treated as NOT seeded and "+
+			"does not vouch for audit chain positions until an exchange with a seeded peer", "error", err)
 	}
+	go d.runAuditSeeded(ctx)
 
 	// Before anything that writes an audit row is built: every writer signs with
 	// the keyring this installs on d.db.

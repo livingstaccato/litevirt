@@ -1745,14 +1745,16 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 			Detail: fmt.Sprintf("pulling image %s from %s", img, def.Source),
 		})
 
-		if err := s.refuseReplacingImageUnderADisk(ctx, img); err != nil {
-			return err
-		}
-		// Pull synchronously so the image is ready before VM creation.
+		// Pull synchronously so the image is ready before VM creation. The
+		// content is published, never written over a file a disk is built
+		// on (image.Store.Publish).
 		progressCh := make(chan image.PullProgress, 10)
 		errCh := make(chan error, 1)
+		var pub image.Published
 		go func() {
-			errCh <- image.Pull(s.images, img, def.Source, def.Checksum, s.imagePullOptions(), progressCh)
+			var err error
+			pub, err = image.PullPublished(s.images, img, def.Source, def.Checksum, s.imagePullOptions(), progressCh)
+			errCh <- err
 		}()
 
 		// Drain progress, forwarding to deploy stream.
@@ -1768,13 +1770,14 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 			return status.Errorf(codes.Internal, "auto-pull image %q: %v", img, err)
 		}
 
+		s.imagePublished(ctx, img, pub)
 		// Persist image + image_host records.
 		now := time.Now().UTC().Format(time.RFC3339)
 		if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{
 			Name:      img,
 			Format:    def.Format,
 			SourceURL: def.Source,
-			Checksum:  def.Checksum,
+			Checksum:  recordedChecksum(def.Checksum, pub.Digest),
 		}); err != nil {
 			s.noteStateWriteFail(corrosion.OpImage, err)
 			return status.Errorf(codes.Internal, "record auto-pulled image %q: %v", img, err)
@@ -1782,7 +1785,7 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 			ImageName: img,
 			HostName:  s.hostName,
-			Path:      s.images.ImagePath(img),
+			Path:      pub.Path,
 			Status:    "ready",
 			PulledAt:  now,
 		}); err != nil {

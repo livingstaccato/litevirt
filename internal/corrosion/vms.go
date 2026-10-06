@@ -1521,37 +1521,51 @@ func BackfillDiskBus(ctx context.Context, c *Client, read DiskRecord, bus, owner
 	}
 	d := read
 	d.Bus = bus
+	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		return diskRowStill(ctx, tx, read)
+	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
+}
+
+// diskRowStill reports, inside tx, whether the live row of disk
+// (read.VMName, read.DiskName) is still exactly read — every column a whole-row
+// write publishes. A guarded whole-row write made from a read taken outside the
+// transaction must not revert a column changed since (a resize's size_bytes, a
+// hotplug's bus or target_dev, delete_with_vm): last-writer-wins would carry
+// the stale value cluster-wide.
+func diskRowStill(ctx context.Context, tx *sql.Tx, read DiskRecord) (bool, error) {
+	var (
+		host, path, backingImage, storageType, storageVolume, targetDev string
+		backingDisk, curBus, deviceKind, controllerModel                string
+		sizeBytes, deleteWithVM                                         int64
+	)
 	readKind := read.DeviceKind
 	if readKind == "" {
 		readKind = "disk"
 	}
-	return c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var (
-			host, path, backingImage, storageType, storageVolume, targetDev string
-			backingDisk, curBus, deviceKind, controllerModel                string
-			sizeBytes, deleteWithVM                                         int64
-		)
-		err := tx.QueryRowContext(ctx,
-			`SELECT host_name, path, size_bytes, backing_image, storage_type, storage_volume,
-			        COALESCE(target_dev, ''), COALESCE(backing_disk, ''), COALESCE(bus, ''),
-			        COALESCE(device_kind, 'disk'), COALESCE(delete_with_vm, 1), COALESCE(controller_model, '')
-			 FROM vm_disks WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
-			read.VMName, read.DiskName).Scan(&host, &path, &sizeBytes, &backingImage, &storageType,
-			&storageVolume, &targetDev, &backingDisk, &curBus, &deviceKind, &deleteWithVM, &controllerModel)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return host == owner && curBus == "" &&
-			path == read.Path && sizeBytes == read.SizeBytes && backingImage == read.BackingImage &&
-			storageType == read.StorageType && storageVolume == read.StorageVolume &&
-			targetDev == read.TargetDev && backingDisk == read.BackingDisk &&
-			deviceKind == readKind && (deleteWithVM == 1) == read.DeleteWithVM &&
-			controllerModel == read.ControllerModel, nil
-	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
+	err := tx.QueryRowContext(ctx,
+		`SELECT host_name, path, size_bytes, backing_image, storage_type, storage_volume,
+		        COALESCE(target_dev, ''), COALESCE(backing_disk, ''), COALESCE(bus, ''),
+		        COALESCE(device_kind, 'disk'), COALESCE(delete_with_vm, 1), COALESCE(controller_model, '')
+		 FROM vm_disks WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+		read.VMName, read.DiskName).Scan(&host, &path, &sizeBytes, &backingImage, &storageType,
+		&storageVolume, &targetDev, &backingDisk, &curBus, &deviceKind, &deleteWithVM, &controllerModel)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return host == read.HostName && curBus == read.Bus &&
+		path == read.Path && sizeBytes == read.SizeBytes && backingImage == read.BackingImage &&
+		storageType == read.StorageType && storageVolume == read.StorageVolume &&
+		targetDev == read.TargetDev && backingDisk == read.BackingDisk &&
+		deviceKind == readKind && (deleteWithVM == 1) == read.DeleteWithVM &&
+		controllerModel == read.ControllerModel, nil
 }
+
+// clearDiskBackingAfterRead is a test seam: run between ClearDiskBacking's
+// read and its guarded write. Never set in production.
+var clearDiskBackingAfterRead func()
 
 // ClearDiskBacking records that disk (vmName, diskName), now at path, has no
 // backing: a move that flattens a disk — a full copy or a block mirror — leaves
@@ -1559,7 +1573,8 @@ func BackfillDiskBus(ctx context.Context, c *Client, read DiskRecord, bus, owner
 // make a later in-place restore rebuild it as an overlay on the old base. It
 // writes only while the live row still names path, and uses InsertDisk's
 // whole-row shape so it mints no fingerprint a previous-release receiver does
-// not know. A row already without a backing is left alone.
+// not know, and only while the live row is still, column for column, the one
+// it read (diskRowStill). A row already without a backing is left alone.
 func ClearDiskBacking(ctx context.Context, c *Client, vmName, diskName, path string) error {
 	var cur DiskRecord
 	found := false
@@ -1575,20 +1590,16 @@ func ClearDiskBacking(ctx context.Context, c *Client, vmName, diskName, path str
 	if !found || cur.Path != path || (cur.BackingDisk == "" && cur.BackingImage == "") {
 		return nil
 	}
+	if clearDiskBackingAfterRead != nil {
+		clearDiskBackingAfterRead()
+	}
 	d := cur
 	d.BackingDisk, d.BackingImage = "", ""
+	// The whole row is re-written, so it is written only while the live row
+	// is still exactly the one read: a column changed in between is never
+	// reverted.
 	_, err = c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
-		var curPath string
-		err := tx.QueryRowContext(ctx,
-			`SELECT path FROM vm_disks WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
-			vmName, diskName).Scan(&curPath)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
-		}
-		if err != nil {
-			return false, err
-		}
-		return curPath == path, nil
+		return diskRowStill(ctx, tx, cur)
 	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
 	return err
 }

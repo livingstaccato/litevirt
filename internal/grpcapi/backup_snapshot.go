@@ -700,6 +700,13 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	if err := dest.place(tmpTarget); err != nil {
 		return err
 	}
+	// A restore that left the disk standalone (raw guest content, a
+	// standalone backup, a flat rebuild) leaves no base: a backing record
+	// kept on the row would pin the old base, and make a later restore
+	// rebuild onto it. Cleared under the VM lock the restore still holds.
+	if dest.inPlace && dest.disk != nil {
+		s.clearBackingIfFlattened(ctx, dest.disk.VMName, dest.disk.DiskName, dest.path)
+	}
 	s.recordVMEvent(ctx, req.VmName, "backup.restored", "ok",
 		fmt.Sprintf("%s @ %s → %s", req.DiskName, req.Timestamp, target))
 	return send(&pb.RestoreFromBackupProgress{

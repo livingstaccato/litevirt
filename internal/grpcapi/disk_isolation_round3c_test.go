@@ -14,7 +14,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -97,8 +96,7 @@ func TestRestoreInPlace_FlattenedDiskOnAChangedBaseIsRefused(t *testing.T) {
 	}
 }
 
-// Concern 1: the reconciler's heal never replaces an image a disk is built
-// on, however its local copy looks; it does not even ask a peer for it.
+// countingPushPeer counts the PushImage calls a heal makes and fails them.
 type countingPushPeer struct {
 	pb.LiteVirtClient
 	pushes int
@@ -109,39 +107,8 @@ func (c *countingPushPeer) PushImage(context.Context, *pb.PushImageRequest, ...g
 	return nil, status.Error(codes.Unavailable, "test peer")
 }
 
-func TestAutoPullImage_NeverHealsOverAnImageADiskIsBuiltOn(t *testing.T) {
-	s := testServer(t)
-	s.dataDir = t.TempDir()
-	s.images = image.NewStore(s.dataDir)
-	_ = s.images.Init()
-	ctx := context.Background()
-	img := s.images.ImagePath("ubuntu")
-	if err := os.WriteFile(img, []byte("short, damaged-looking local copy"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2", SizeBytes: 1 << 20}); err != nil {
-		t.Fatal(err)
-	}
-	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{ImageName: "ubuntu", HostName: "peer-host", Path: img, Status: "ready"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "v", HostName: "other-host", State: "running"}, nil,
-		[]corrosion.DiskRecord{{VMName: "v", DiskName: "root", HostName: "other-host", Path: "/x/v-root.qcow2", BackingImage: "ubuntu"}}); err != nil {
-		t.Fatal(err)
-	}
-	peer := &countingPushPeer{}
-	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return peer, func() {}, nil }
-	err := s.autoPullImage(ctx, "ubuntu")
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "base of VM") {
-		t.Errorf("heal of an image a disk is built on: got %v, want FailedPrecondition naming the disk", err)
-	}
-	if peer.pushes != 0 {
-		t.Errorf("a peer was asked for a replacement %d time(s)", peer.pushes)
-	}
-}
-
-// ... and refused when the recorded base lies outside the image store and the
-// disk's pool directory, unchanged or not.
+// ... and refused when the recorded base lies outside every place the disk's
+// chain may read from, unchanged or not.
 func TestRestoreInPlace_FlattenedDiskOnABaseOutsideTheRootsIsRefused(t *testing.T) {
 	needQemuImg(t)
 	f := newRestoreFixture(t)

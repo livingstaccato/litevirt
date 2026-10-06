@@ -277,6 +277,11 @@ func openChain(src string, allow func(string) error) ([]*chainImage, error) {
 		seen[canonical] = struct{}{}
 		path = canonical
 
+		// A regular file only, judged before it is opened: opening a FIFO
+		// would block, and a device is not an image this reader may read.
+		if err := regularFile(path); err != nil {
+			return fail("%w", err)
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			return fail("open %s: %w", path, err)
@@ -347,6 +352,9 @@ func openChain(src string, allow func(string) error) ([]*chainImage, error) {
 			}
 		}
 		if format == "raw" {
+			if err := regularFile(resolved); err != nil {
+				return fail("raw backing: %w", err)
+			}
 			rf, err := os.Open(resolved)
 			if err != nil {
 				return fail("open %s: %w", resolved, err)
@@ -363,6 +371,20 @@ func openChain(src string, allow func(string) error) ([]*chainImage, error) {
 	}
 
 	return chain, nil
+}
+
+// regularFile refuses anything at path but a regular file, judged by stat
+// before anything opens it (every backing is already resolved through
+// symlinks when it gets here).
+func regularFile(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file (%s)", path, fi.Mode().Type())
+	}
+	return nil
 }
 
 func closeChain(chain []*chainImage) {

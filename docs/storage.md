@@ -159,10 +159,27 @@ cold migration's flatten, a move or copy with qemu-img — follows each layer's
 DECLARED backing format, never a guess: a backing declared `raw` (a
 `--no-localize` promoted VM's replica, which is guest content) is read as
 raw and never parsed for a header the guest may have written; a backing with
-no declared format, or declared twice, is refused. Every backing, resolved
-through symlinks, must lie in the image store or the disk's own pool
-directory, and a raw one must be the disk record's own `backing_disk`.
-A move that flattens a disk clears its record's backing fields.
+no declared format, or declared twice, is refused. Every backing is judged,
+resolved through symlinks, before anything opens it, and is accepted only as:
+
+- a file in the image store that is itself **standalone** (no backing file,
+  no external data file) — an image is a base, never a way to name another
+  file;
+- the `backing_disk` recorded on the layer naming it — the disk's own record,
+  or the record of whichever disk that layer is: a linked clone's template
+  disk, in whatever pool it lives in, and a `--no-localize` promoted VM's
+  replica. A backing declared `raw` is accepted only this way, so a linked
+  clone of a promoted VM (clone → promoted overlay → raw replica) copies too;
+- a file in the directory of a file-based pool on this host that the VM's
+  project may use (global, or owned by that project), or the disk's own pool;
+- in `<data_dir>/disks` (which holds every project's disks) or the disk's own
+  directory, only a file the VM's project owns by record — a disk of one of
+  its VMs, or its recorded replica — or the base an external snapshot of the
+  VM left beside its overlay.
+
+Another project's file is refused wherever it sits, unless a record ties it
+to the layer naming it. A move, a restore or a copy that leaves a disk
+standalone clears its record's backing fields.
 
 Content operations never reach a file a live VM disk uses: a listing leaves
 out files a live disk of another pool uses, and a content delete refuses any
@@ -302,7 +319,9 @@ target pool — `<pool source>/<vm>-<disk>-copy-<time>-<id>`, or, for an admin,
 `--target-path` as the leaf name — never the pool itself and never one that
 exists: the driver checks first (`zfs list` / `rbd info`) and refuses with
 `AlreadyExists` before anything is sent, `zfs recv` runs without `-F`, and a
-ceph full copy is `rbd export | rbd import`, which creates the image. Every
+ceph full copy is `rbd export | rbd import` into a fresh name of its own,
+renamed into place only once it is recorded (`rbd rename` refuses an existing
+name). Every
 command keeps `--` before its positional arguments. The copy carries its
 owner record — project, VM, disk — as zfs user properties (`litevirt:*`) or
 rbd image metadata (`litevirt.*`). A ceph copy runs its source side
@@ -310,7 +329,9 @@ rbd image metadata (`litevirt.*`). A ceph copy runs its source side
 its destination side (check, import, metadata) with the destination pool's,
 so a copy between two ceph clusters uses each cluster's own credentials. The
 per-copy source snapshot is removed afterwards, and a copy that fails after it
-was received is removed rather than left unrecorded. A btrfs disk takes the
+was received is removed rather than left unrecorded — only the image the copy
+itself created, never the destination name, which an image created in the
+meantime may hold. A btrfs disk takes the
 file copy. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental

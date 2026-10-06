@@ -794,12 +794,12 @@ func qemuImgAvailable() bool {
 }
 
 // convertVMDisk converts a VM disk — a qcow2 the daemon created — to a new
-// qcow2 at dst. Its backing chain may live only in the image store or the
-// disk's pool directory, every file in it pre-checked; a raw backing is
-// accepted only as the disk record's own backing_disk (a --no-localize
-// promotion's replica), and qemu-img reads it as raw, as declared.
+// qcow2 at dst. Every file of its backing chain is pre-checked and judged by
+// diskChainRule; a raw backing is accepted only as the backing_disk recorded
+// on the layer naming it (a --no-localize promotion's replica), and qemu-img
+// reads it as raw, as declared.
 func (s *Server) convertVMDisk(ctx context.Context, d *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) error {
-	return convertImage(ctx, s.hostDiskFile(d.Path), "qcow2", s.diskChainAllow(*d), s.diskRawBacking(*d), dst, emit)
+	return convertImage(ctx, s.hostDiskFile(d.Path), "qcow2", s.diskChainRule(ctx, *d), dst, emit)
 }
 
 // convertImage is the one place a disk image is converted with qemu-img. It
@@ -811,17 +811,17 @@ func (s *Server) convertVMDisk(ctx context.Context, d *corrosion.DiskRecord, dst
 // probe on bytes a guest wrote (raw guest content) would obey a qcow2 header
 // the guest planted and read the backing or data file it names. A qcow2
 // source's header is pre-checked before qemu-img opens it: no external data
-// file, one backing format at most, and a backing file only where
-// allowBacking accepts its resolved path (nil: none at all). The output, a
-// fresh qcow2, must be standalone.
+// file, one backing format at most, and a backing file only where rule
+// accepts it (nil: none at all). The output, a fresh qcow2, must be
+// standalone.
 //
 // Without qemu-img a qcow2 source is byte-copied (it was pre-checked); a raw
 // source cannot be, since the copy would land raw bytes in a qcow2-declared
 // file.
-func convertImage(ctx context.Context, src, srcFormat string, allowBacking func(string) error, rawBacking, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+func convertImage(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error) error {
 	switch srcFormat {
 	case "qcow2":
-		if err := precheckChain(src, allowBacking, rawBacking); err != nil {
+		if _, err := precheckChain(src, rule); err != nil {
 			return status.Errorf(codes.FailedPrecondition, "%s: %v", filepath.Base(src), err)
 		}
 	case "raw":

@@ -162,23 +162,35 @@ type PullProgress struct {
 // and a hard size ceiling enforced via LimitReader (an oversized source FAILS
 // rather than being silently truncated).
 func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) error {
+	_, err := PullPublished(store, name, rawURL, checksum, opts, progressCh)
+	return err
+}
+
+// PullPublished is Pull, saying what the publish did: the downloaded content
+// never replaces a file a disk may be built on (Store.Publish).
+func PullPublished(store *Store, name, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) (Published, error) {
 	defer close(progressCh)
+	return pull(store, name, rawURL, checksum, opts, progressCh)
+}
+
+func pull(store *Store, name, rawURL, checksum string, opts PullOptions, progressCh chan<- PullProgress) (Published, error) {
+	fail := func(err error) (Published, error) { return Published{}, err }
 	opts = opts.withDefaults()
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("parse url: %w", err)
+		return fail(fmt.Errorf("parse url: %w", err))
 	}
 	if !opts.schemeAllowed(u.Scheme) {
-		return fmt.Errorf("disallowed image URL scheme %q (allowed: %s)", u.Scheme, strings.Join(opts.Schemes, ", "))
+		return fail(fmt.Errorf("disallowed image URL scheme %q (allowed: %s)", u.Scheme, strings.Join(opts.Schemes, ", ")))
 	}
 
 	destPath, err := store.SafeImagePath(name)
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		return fmt.Errorf("create image dir: %w", err)
+		return fail(fmt.Errorf("create image dir: %w", err))
 	}
 
 	progressCh <- PullProgress{Status: "downloading"}
@@ -194,24 +206,26 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 	})
 	resp, err := client.Get(rawURL)
 	if err != nil {
-		return fmt.Errorf("download: %w", err)
+		return fail(fmt.Errorf("download: %w", err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: HTTP %d", resp.StatusCode)
+		return fail(fmt.Errorf("download: HTTP %d", resp.StatusCode))
 	}
 	// Cap the body at MaxBytes+1 so reaching the extra byte means "too big".
 	body := io.LimitReader(resp.Body, opts.MaxBytes+1)
 
-	tmpPath := destPath + ".tmp"
-	f, err := os.Create(tmpPath)
+	// A fresh, exclusive temp in the image directory (the "import-" prefix is
+	// one the startup staging sweep collects after a crash).
+	f, err := os.CreateTemp(filepath.Dir(destPath), "import-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
+		return fail(fmt.Errorf("create temp file: %w", err))
 	}
+	tmpPath := f.Name()
 	defer func() {
 		f.Close()
-		os.Remove(tmpPath) // clean up on error
+		os.Remove(tmpPath) // clean up on error; gone after a publish
 	}()
 
 	hasher := sha256.New()
@@ -223,11 +237,11 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 		n, err := body.Read(buf)
 		if n > 0 {
 			if _, err := writer.Write(buf[:n]); err != nil {
-				return fmt.Errorf("write: %w", err)
+				return fail(fmt.Errorf("write: %w", err))
 			}
 			downloaded += int64(n)
 			if downloaded > opts.MaxBytes {
-				return fmt.Errorf("image exceeds the %d-byte ceiling", opts.MaxBytes)
+				return fail(fmt.Errorf("image exceeds the %d-byte ceiling", opts.MaxBytes))
 			}
 			var pct float32
 			if resp.ContentLength > 0 {
@@ -244,7 +258,7 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("read: %w", err)
+			return fail(fmt.Errorf("read: %w", err))
 		}
 	}
 
@@ -260,13 +274,15 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 		}
 		if got != expected {
 			os.Remove(tmpPath) // explicit cleanup on checksum failure (#28)
-			return fmt.Errorf("checksum mismatch: got %s, expected %s", got, expected)
+			return fail(fmt.Errorf("checksum mismatch: got %s, expected %s", got, expected))
 		}
 	}
 
-	// Move to final location
-	if err := os.Rename(tmpPath, destPath); err != nil {
-		return fmt.Errorf("rename: %w", err)
+	// Publish: never over a file a disk may be built on — a refresh becomes
+	// a new version (Store.Publish).
+	pub, err := store.Publish(name, tmpPath, hex.EncodeToString(hasher.Sum(nil)))
+	if err != nil {
+		return fail(fmt.Errorf("publish: %w", err))
 	}
 
 	progressCh <- PullProgress{
@@ -276,5 +292,5 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 		Status:          "complete",
 	}
 
-	return nil
+	return pub, nil
 }

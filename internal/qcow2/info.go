@@ -61,8 +61,20 @@ func Info(path string) (*ImageInfo, error) {
 }
 
 // readBackingFormat scans header extensions for the backing format string.
+//
+// The extensions start where BackingFormatExtensionCount and qemu start them:
+// right after the 72-byte v2 header, or after a v3 header's declared length
+// (at least 104). A v2 header has no header_length field — bytes 100-104 are
+// already the extension area — so reading it there would let this package
+// and qemu disagree on the backing format.
 func readBackingFormat(f *os.File, h *Header) string {
-	offset := int64(h.HeaderLength)
+	offset := int64(72)
+	if h.Version >= 3 {
+		offset = int64(h.HeaderLength)
+		if offset < 104 {
+			offset = 104
+		}
+	}
 	clusterEnd := int64(h.ClusterSize())
 
 	for offset+8 <= clusterEnd {

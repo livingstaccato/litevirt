@@ -206,14 +206,16 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			// on every guest read). Pure-Go — no qemu-img dependency.
 			//
 			// The chain is read by each layer's DECLARED backing format, every
-			// backing confined to the image store or the disk's pool: a raw
-			// backing (a promoted VM's replica, guest content) is read as raw,
-			// never parsed for a header the guest may have written.
-			if err := precheckChain(d.Path, s.diskChainAllow(d), s.diskRawBacking(d)); err != nil {
+			// backing judged by diskChainRule first and the reader confined to
+			// exactly those: a raw backing (a promoted VM's replica, guest
+			// content) is read as raw, never parsed for a header the guest may
+			// have written.
+			accepted, err := precheckChain(d.Path, s.diskChainRule(ctx, d))
+			if err != nil {
 				cleanup()
 				return nil, status.Errorf(codes.FailedPrecondition, "full-clone disk %s: %v", d.DiskName, err)
 			}
-			if err := qcow2.ConvertConfined(ctx, d.Path, clonePath, &qcow2.Options{Uncompressed: true}, s.diskChainAllow(d)); err != nil {
+			if err := qcow2.ConvertConfined(ctx, d.Path, clonePath, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
 				cleanup()
 				return nil, cloneDiskErr("full-clone disk", d.DiskName, err)
 			}

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
-	"os"
+	"slices"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -52,9 +52,9 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	if err := safename.ValidateImageName(req.Name); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if err := s.refuseReplacingImageUnderADisk(stream.Context(), req.Name); err != nil {
-		return err
-	}
+	// A re-pull of a name disks are built on is a refresh: the new content is
+	// published as a new version for new disks, and the file existing disks
+	// are built on is never written over (image.Store.Publish).
 	slog.Info("pulling image", "name", req.Name, "url", req.SourceUrl)
 
 	// Insert image + image_host records with "pulling" status so the image
@@ -90,7 +90,7 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	// pull completes even if the client disconnects (#17).
 	errCh := make(chan error, 1)
 	go func() {
-		pullErr := image.Pull(s.images, req.Name, req.SourceUrl, req.Checksum, s.imagePullOptions(), progressCh)
+		pub, pullErr := image.PullPublished(s.images, req.Name, req.SourceUrl, req.Checksum, s.imagePullOptions(), progressCh)
 		errCh <- pullErr
 		if pullErr != nil {
 			slog.Error("image pull failed", "name", req.Name, "error", pullErr)
@@ -100,7 +100,8 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 			return
 		}
 		// Persist final result with a background context — stream ctx may be cancelled.
-		if err := s.persistImageRecord(req); err != nil {
+		s.imagePublished(bgCtx, req.Name, pub)
+		if err := s.persistImageRecord(req, pub); err != nil {
 			slog.Error("image record persist failed after pull", "name", req.Name, "error", err)
 			if uerr := corrosion.UpdateImageHostStatus(bgCtx, s.db, req.Name, s.hostName, "error"); uerr != nil {
 				s.noteStateWriteFail(corrosion.OpImageHost, uerr)
@@ -146,12 +147,18 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 }
 
 // persistImageRecord writes the image and image_host records after a successful pull.
-func (s *Server) persistImageRecord(req *pb.PullImageRequest) error {
+// The recorded checksum is the published content's own sha256 — what disks
+// built on it now are built on — whether or not the request named one.
+func (s *Server) persistImageRecord(req *pb.PullImageRequest, pub image.Published) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	path := pub.Path
+	if path == "" {
+		path = s.images.ImagePath(req.Name)
+	}
 	var sizeBytes int64
-	if _, sz, err := s.images.DiskInfo(s.images.ImagePath(req.Name)); err == nil {
+	if _, sz, err := s.images.DiskInfo(path); err == nil {
 		sizeBytes = sz
 	}
 
@@ -160,7 +167,7 @@ func (s *Server) persistImageRecord(req *pb.PullImageRequest) error {
 		Name:      req.Name,
 		Format:    req.Format,
 		SourceURL: req.SourceUrl,
-		Checksum:  req.Checksum,
+		Checksum:  recordedChecksum(req.Checksum, pub.Digest),
 		SizeBytes: sizeBytes,
 	}); err != nil {
 		s.noteStateWriteFail(corrosion.OpImage, err)
@@ -170,7 +177,7 @@ func (s *Server) persistImageRecord(req *pb.PullImageRequest) error {
 	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{
 		ImageName: req.Name,
 		HostName:  s.hostName,
-		Path:      s.images.ImagePath(req.Name),
+		Path:      path,
 		Status:    "ready",
 		PulledAt:  now,
 	}); err != nil {
@@ -236,33 +243,57 @@ func (s *Server) DeleteImage(ctx context.Context, req *pb.DeleteImageRequest) (*
 	return &emptypb.Empty{}, nil
 }
 
-// refuseReplacingImageUnderADisk refuses to write an image over one that any
-// disk, on any host, is built on — as its backing_image, a backing file or
-// its own file. An overlay's data is only the delta over that image, so
-// replacing the image under the same name silently changes every such disk
-// (and makes a backup taken on the old image restore onto different data).
-// Pull, import and a compose auto-pull ask first; a missing image is fine.
-func (s *Server) refuseReplacingImageUnderADisk(ctx context.Context, name string) error {
+// recordedChecksum is the checksum an image record carries: the published
+// content's own sha256 when there is one, else what the request declared.
+func recordedChecksum(declared, digest string) string {
+	if digest != "" {
+		return "sha256:" + digest
+	}
+	return declared
+}
+
+// imagePublished follows a publish of image name: a heal is logged, and a
+// refresh sweeps the image's older versions nothing is built on.
+func (s *Server) imagePublished(ctx context.Context, name string, pub image.Published) {
+	for _, f := range pub.Healed {
+		slog.Warn("image: a local copy no longer matched its recorded identity and was healed in place with byte-identical content",
+			"image", name, "path", f, "sha256", pub.Digest)
+	}
+	if pub.Superseded == "" {
+		return
+	}
+	slog.Info("image refreshed: new disks use the new version; disks built on the old one keep it",
+		"image", name, "current", pub.Path, "superseded", pub.Superseded)
+	s.sweepImageVersions(ctx, name, pub.Path, pub.Superseded)
+}
+
+// sweepImageVersions removes image name's files that are neither kept (the
+// current file, and the one this refresh just superseded — a VM created on
+// it a moment ago may not have its disk row yet) nor referenced: no disk row
+// on any host names the file, and no disk row is built on the image by name
+// (its overlay names one of the image's files, and which one is not
+// recorded, so every file is kept). A file a disk is built on is never
+// removed.
+func (s *Server) sweepImageVersions(ctx context.Context, name string, keep ...string) {
 	if s.images == nil {
-		return nil
-	}
-	path := s.images.ImagePath(name)
-	if _, err := os.Lstat(path); err != nil {
-		return nil
-	}
-	rows, err := s.diskReferencesAnyHost(ctx, path)
-	if err != nil {
-		return status.Errorf(codes.Unavailable, "check disks built on image %q: %v", name, err)
+		return
 	}
 	byName, err := corrosion.DisksReferencingPath(ctx, s.db, name)
-	if err != nil {
-		return status.Errorf(codes.Unavailable, "check disks built on image %q: %v", name, err)
+	if err != nil || len(byName) > 0 {
+		return
 	}
-	rows = append(rows, byName...)
-	if len(rows) > 0 {
-		return status.Errorf(codes.FailedPrecondition,
-			"image %q is the base of VM %q disk %q (host %s); it is never replaced under a disk — use a new image name",
-			name, rows[0].VMName, rows[0].DiskName, rows[0].HostName)
+	for _, f := range s.images.ImageFiles(name) {
+		if slices.Contains(keep, f) {
+			continue
+		}
+		rows, err := s.diskReferencesAnyHost(ctx, f)
+		if err != nil || len(rows) > 0 {
+			continue
+		}
+		if err := s.images.RemoveImageFile(name, f); err != nil {
+			slog.Warn("image: sweep of an old version failed", "image", name, "file", f, "error", err)
+			continue
+		}
+		slog.Info("image: removed an old version nothing is built on", "image", name, "file", f)
 	}
-	return nil
 }

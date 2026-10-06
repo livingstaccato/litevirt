@@ -35,9 +35,14 @@ func (s *Store) Init() error {
 	return nil
 }
 
-// ImagePath returns the path to a base image.
+// ImagePath returns the path to a base image: its current file, the one new
+// disks are built on — the version a refresh last published (versions.go), or
+// its first content.
 func (s *Store) ImagePath(imageName string) string {
-	return filepath.Join(s.imageDir, imageName+".qcow2")
+	if p, ok := s.currentVersion(imageName); ok {
+		return p
+	}
+	return s.CanonicalImagePath(imageName)
 }
 
 // SafeImagePath is ImagePath with the image name validated, so a name like

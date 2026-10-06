@@ -130,20 +130,29 @@ func TestReplicateVolume_NativeCephWorksIntoAFreshImage(t *testing.T) {
 	if !strings.HasPrefix(dst, "copies/vm1-root-copy-") {
 		t.Fatalf("destination %q, want a new image in the target pool", dst)
 	}
-	var imported bool
+	// Imported under a fresh name of its own, then renamed into place.
+	var incoming string
+	var renamed bool
 	for _, c := range calls(t, log) {
-		if strings.HasPrefix(c, "rbd import") {
-			imported = true
-			if c != "rbd import -- - "+dst {
-				t.Errorf("import argv %q, want %q", c, "rbd import -- - "+dst)
-			}
-		}
 		if strings.HasPrefix(c, "rbd import-diff") {
 			t.Errorf("a full copy applied a diff onto an existing image: %q", c)
+			continue
+		}
+		if rest, ok := strings.CutPrefix(c, "rbd import -- - "); ok {
+			incoming = rest
+			if !strings.HasPrefix(rest, dst+".litevirt-incoming-") {
+				t.Errorf("import argv %q, want a fresh name beside %q", c, dst)
+			}
+		}
+		if strings.HasPrefix(c, "rbd rename") {
+			renamed = true
+			if c != "rbd rename -- "+incoming+" "+dst {
+				t.Errorf("rename argv %q, want %q", c, "rbd rename -- "+incoming+" "+dst)
+			}
 		}
 	}
-	if !imported {
-		t.Error("no rbd import ran")
+	if incoming == "" || !renamed {
+		t.Errorf("import into %q, renamed=%v: want an import then a rename into place", incoming, renamed)
 	}
 }
 
@@ -219,7 +228,7 @@ func TestReplicateVolume_NativeCephUsesEachSidesOwnCredentials(t *testing.T) {
 				}
 			}
 		}
-		for _, sub := range []string{"info", "import", "image-meta"} {
+		for _, sub := range []string{"info", "import", "image-meta", "rename"} {
 			if strings.Contains(c, " "+sub+" ") {
 				seen[sub] = true
 				if !strings.HasPrefix(c, dstCreds) {
@@ -228,7 +237,7 @@ func TestReplicateVolume_NativeCephUsesEachSidesOwnCredentials(t *testing.T) {
 			}
 		}
 	}
-	for _, sub := range []string{"snap create", "export", "snap rm", "info", "import", "image-meta"} {
+	for _, sub := range []string{"snap create", "export", "snap rm", "info", "import", "image-meta", "rename"} {
 		if !seen[sub] {
 			t.Errorf("no rbd %s ran", sub)
 		}
@@ -254,5 +263,38 @@ func TestReplicateVolume_NativeZFSRemovesItsSnapshot(t *testing.T) {
 	}
 	if snap == "" || snap != destroyed {
 		t.Errorf("snapshot %q, destroyed %q: the per-call snapshot must be destroyed", snap, destroyed)
+	}
+}
+
+// m3: a full ceph copy whose import fails removes only the image it created —
+// never the destination name, which an image created in between may hold.
+func TestReplicateVolume_NativeCephFailedImportNeverRemovesTheDestination(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	script := `#!/bin/sh
+echo "$(basename "$0") $*" >> ` + logPath + `
+for a in "$@"; do
+  case "$a" in
+    info) exit 1 ;;
+    export) echo stream; exit 0 ;;
+    import) cat >/dev/null; echo "rbd: image exists" >&2; exit 1 ;;
+  esac
+done
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "rbd"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	s, _ := nativeVM(t, "ceph", "rbd:rbd/vm1-root", "copies")
+	err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "copies", TargetPath: "db-root"},
+		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()})
+	if err == nil {
+		t.Fatal("a failed import reported success")
+	}
+	for _, c := range calls(t, logPath) {
+		if strings.Contains(c, " rm ") && strings.HasSuffix(c, " copies/db-root") {
+			t.Errorf("the destination name was removed after a failed import: %q", c)
+		}
 	}
 }

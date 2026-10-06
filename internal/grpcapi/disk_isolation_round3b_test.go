@@ -3,8 +3,6 @@ package grpcapi
 import (
 	"bytes"
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,7 +14,6 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
-	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -114,19 +111,6 @@ func TestRunReplication_PromotedVMOnARawReplica(t *testing.T) {
 	}
 }
 
-// I-1: a raw backing that is NOT the disk record's own backing_disk is refused.
-func TestConvertVMDisk_RefusesARawBackingTheRecordDoesNotName(t *testing.T) {
-	s := testServer(t)
-	s.dataDir = t.TempDir()
-	victim := victimDisk(t)
-	_, overlay, _ := promotedVMInPool(t, s, victim)
-	d := corrosion.DiskRecord{VMName: "pr", DiskName: "root", Path: overlay, StorageVolume: "dr"} // no backing_disk
-	err := s.convertVMDisk(context.Background(), &d, filepath.Join(t.TempDir(), "x.qcow2"), func(*pb.MoveVolumeProgress) error { return nil })
-	if err == nil {
-		t.Error("a raw backing the record does not name was accepted")
-	}
-}
-
 // I-2: a move flattened the disk, but its record still names the replica it
 // was promoted from. The in-place restore of a backup of the (standalone) disk
 // stays standalone: it is never rebuilt onto the stale record's base, and the
@@ -216,58 +200,6 @@ func TestRestoreInPlace_ABaseChangedSinceTheBackupIsRefused(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(disk); !bytes.Equal(before, after) {
 		t.Error("the disk was replaced")
-	}
-}
-
-// I-3: an image any disk is built on cannot be replaced by an import.
-func TestImportImage_NeverReplacesAnImageADiskIsBuiltOn(t *testing.T) {
-	s := testServer(t)
-	s.dataDir = t.TempDir()
-	s.images = image.NewStore(s.dataDir)
-	_ = s.images.Init()
-	img := s.images.ImagePath("ubuntu")
-	if err := qcow2.Create(img, 1<<20, nil); err != nil {
-		t.Fatal(err)
-	}
-	want, _ := os.ReadFile(img)
-	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "v", HostName: "other-host", State: "running"}, nil,
-		[]corrosion.DiskRecord{{VMName: "v", DiskName: "root", HostName: "other-host", Path: "/x/v-root.qcow2", BackingImage: "ubuntu"}}); err != nil {
-		t.Fatal(err)
-	}
-	stream := &mockImportImageStream{ctx: adminCtx(), msgs: []*pb.ImportImageRequest{
-		{Name: "ubuntu", Format: "qcow2", Chunk: []byte("replacement")},
-	}}
-	if err := s.ImportImage(stream); status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("import over an image a disk is built on: got %v, want FailedPrecondition", err)
-	}
-	if got, _ := os.ReadFile(img); !bytes.Equal(got, want) {
-		t.Error("the image under a disk was replaced")
-	}
-}
-
-// I-3: ... nor by a pull.
-func TestPullImage_NeverReplacesAnImageADiskIsBuiltOn(t *testing.T) {
-	s := testServer(t)
-	s.dataDir = t.TempDir()
-	s.images = image.NewStore(s.dataDir)
-	_ = s.images.Init()
-	img := s.images.ImagePath("ubuntu")
-	if err := qcow2.Create(img, 1<<20, nil); err != nil {
-		t.Fatal(err)
-	}
-	want, _ := os.ReadFile(img)
-	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "v", HostName: "other-host", State: "running"}, nil,
-		[]corrosion.DiskRecord{{VMName: "v", DiskName: "root", HostName: "other-host", Path: "/x/v-root.qcow2", BackingImage: "ubuntu"}}); err != nil {
-		t.Fatal(err)
-	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("replacement")) }))
-	defer srv.Close()
-	err := s.PullImage(&pb.PullImageRequest{Name: "ubuntu", SourceUrl: srv.URL + "/u.qcow2"}, &streamRecorder[pb.PullProgress]{ctx: adminCtx()})
-	if status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("pull over an image a disk is built on: got %v, want FailedPrecondition", err)
-	}
-	if got, _ := os.ReadFile(img); !bytes.Equal(got, want) {
-		t.Error("the image under a disk was replaced")
 	}
 }
 

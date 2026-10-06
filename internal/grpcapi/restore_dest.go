@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/pbsstore"
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
@@ -46,12 +47,10 @@ type restoreDest struct {
 	path    string
 	inPlace bool
 	unlock  func()
-	// disk and poolDir describe the disk an in-place restore replaces: its
-	// record, and the directory of the pool it lives in (<data_dir>/disks for
-	// a pool-less disk). The rebuilt image keeps the disk's OWN backing,
-	// taken from these, never from the backup's bytes.
-	disk    *corrosion.DiskRecord
-	poolDir string
+	// disk is the record of the disk an in-place restore replaces. The
+	// rebuilt image keeps the disk's OWN backing, judged by the disk's chain
+	// rule, never taken from the backup's bytes.
+	disk *corrosion.DiskRecord
 }
 
 func (d restoreDest) release() {
@@ -269,14 +268,7 @@ func (s *Server) inPlaceRestoreLocked(ctx context.Context, vmName, diskName stri
 				"in_place: %q is also used by vm %q disk %q; a restore never replaces it", disk.Path, o.VMName, o.DiskName)
 		}
 	}
-	poolDir := filepath.Join(s.dataDir, "disks")
-	if disk.StorageVolume != "" {
-		ref, _ := s.resolvePool(ctx, disk.StorageVolume)
-		if d, derr := fileBasedPoolDir(s.dataDir, ref); derr == nil {
-			poolDir = d
-		}
-	}
-	return restoreDest{path: disk.Path, inPlace: true, disk: disk, poolDir: poolDir}, nil
+	return restoreDest{path: disk.Path, inPlace: true, disk: disk}, nil
 }
 
 // vmDisksClosed reports whether nothing holds vm's disks open: the record says
@@ -397,7 +389,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 	// since): rebuild the disk FLAT from the backup and the base it was taken
 	// on, when that base is recorded, still there and unchanged.
 	if cur, cerr := qcow2.Info(dest.disk.Path); cerr == nil && cur.BackingFile == "" {
-		base, baseFmt, err := s.recordedBackupBase(dest, m)
+		base, baseFmt, err := s.recordedBackupBase(ctx, dest, m)
 		if err != nil {
 			return fail(codes.FailedPrecondition, "in_place: %v; restoring it to a new file still works", err)
 		}
@@ -407,11 +399,19 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		if err := namesExactly(restored, base, baseFmt); err != nil {
 			return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
 		}
-		rawBase := ""
-		if baseFmt == "raw" {
-			rawBase = base
-		}
-		if err := precheckChain(restored, func(r string) error { return confineTo(r, s.restoreRoots(dest)...) }, rawBase); err != nil {
+		// The re-pointed file names exactly the recorded base; below it, the
+		// disk's own rule.
+		top := resolvedOr(restored)
+		rule := s.diskChainRule(ctx, *dest.disk)
+		if _, err := precheckChain(restored, func(layer, resolved, format string) error {
+			if layer == top {
+				if resolved != base || format != baseFmt {
+					return fmt.Errorf("%s names %q (%s), not the recorded base %q (%s)", layer, resolved, format, base, baseFmt)
+				}
+				return nil
+			}
+			return rule(layer, resolved, format)
+		}); err != nil {
 			return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
 		}
 		if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
@@ -422,7 +422,7 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		}
 		return out, nil
 	}
-	backing, backingFmt, err := s.originalDiskBacking(dest, m)
+	backing, backingFmt, err := s.originalDiskBacking(ctx, dest, m)
 	if err != nil {
 		return fail(codes.FailedPrecondition, "in_place: %v", err)
 	}
@@ -466,7 +466,9 @@ func namesExactly(path, backing, backingFmt string) error {
 // restore of an overlay backup rebuilds onto. Nothing of it comes from the
 // backup, and nothing from guest bytes:
 //   - the path is the CURRENT disk's own header's backing, resolved through
-//     symlinks and confined to the image store or the disk's pool directory;
+//     symlinks and accepted by the disk's chain rule (diskChainRule): the
+//     image store, a pool the VM's project may use, the backing_disk the
+//     record names, or a file the project owns by record;
 //   - the disk record, where it names a backing (backing_disk, backing_image),
 //     must agree with it — a record a move left stale is a refusal, not a
 //     choice;
@@ -475,13 +477,14 @@ func namesExactly(path, backing, backingFmt string) error {
 //     Anything else is unknown and refused; the current header must declare
 //     the same format;
 //   - the base must be the one the backup was taken on (m.BaseIdentity:
-//     path, size, sha256). A backup that predates that record is accepted
-//     only on a base that cannot change under its name — a recorded replica
-//     or another VM's disk — never an image, which a re-pull can replace.
+//     path, size, sha256). A backup that predates that record is accepted on
+//     a base that cannot change under its name — a recorded replica or
+//     another VM's disk — and on an image only when the image's own records
+//     show it has not been replaced since the backup (imageUnchangedSince).
 //
-// A qcow2 base's own chain is pre-checked down to a standalone base inside the
-// same directories; a raw base is a leaf and is never interpreted.
-func (s *Server) originalDiskBacking(dest restoreDest, m *pbsstore.Manifest) (string, string, error) {
+// A qcow2 base's own chain is pre-checked by the same rule down to a
+// standalone base; a raw base is a leaf and is never interpreted.
+func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *pbsstore.Manifest) (string, string, error) {
 	d := dest.disk
 	if d == nil {
 		return "", "", fmt.Errorf("no disk record")
@@ -505,11 +508,8 @@ func (s *Server) originalDiskBacking(dest restoreDest, m *pbsstore.Manifest) (st
 		return "", "", fmt.Errorf("the disk's backing %q: %w", cand, err)
 	}
 	images := filepath.Join(s.dataDir, "images")
-	roots := []string{images, dest.poolDir}
-	within := func(r string) error { return confineTo(r, roots...) }
-	if err := within(resolved); err != nil {
-		return "", "", err
-	}
+	rule := s.diskChainRule(ctx, *d)
+	self := resolvedOr(d.Path)
 
 	// The record must agree.
 	for what, rec := range map[string]string{"backing_disk": d.BackingDisk, "backing_image": d.BackingImage} {
@@ -518,6 +518,11 @@ func (s *Server) originalDiskBacking(dest restoreDest, m *pbsstore.Manifest) (st
 		}
 		p := rec
 		if what == "backing_image" && !filepath.IsAbs(p) {
+			// An image name: any version of it the store has published (a
+			// refresh never replaces the file a disk was built on).
+			if image.IsImageFile(resolvedOr(images), strings.TrimSuffix(p, ".qcow2"), resolved) {
+				continue
+			}
 			p = filepath.Join(images, strings.TrimSuffix(p, ".qcow2")+".qcow2")
 		}
 		if r, err := filepath.EvalSymlinks(p); err != nil || r != resolved {
@@ -533,6 +538,9 @@ func (s *Server) originalDiskBacking(dest restoreDest, m *pbsstore.Manifest) (st
 	if cur.BackingFormat != format {
 		return "", "", fmt.Errorf("the disk declares its backing %q as %q, but its record says %q; refusing", resolved, cur.BackingFormat, format)
 	}
+	if err := rule(self, resolved, format); err != nil {
+		return "", "", err
+	}
 
 	// The base must be the one the backup was taken on.
 	if id := m.BaseIdentity; id != nil {
@@ -545,11 +553,13 @@ func (s *Server) originalDiskBacking(dest restoreDest, m *pbsstore.Manifest) (st
 				id.Path, id.Size, id.SHA256, got.Path, got.Size, got.SHA256)
 		}
 	} else if !immutable {
-		return "", "", fmt.Errorf("this backup does not record the identity of its base %s, and an image can be replaced under its name; restore it to a new file instead", resolved)
+		if err := s.imageUnchangedSince(ctx, d, resolved, m.Timestamp); err != nil {
+			return "", "", fmt.Errorf("this backup does not record the identity of its base %s, and %v; restore it to a new file instead", resolved, err)
+		}
 	}
 
 	if format == "qcow2" {
-		if err := precheckQcow2Input(resolved, within); err != nil {
+		if _, err := precheckChain(resolved, rule); err != nil {
 			return "", "", fmt.Errorf("the disk's backing chain is refused: %w", err)
 		}
 	} else if fi, err := os.Lstat(resolved); err != nil || !fi.Mode().IsRegular() {
@@ -558,19 +568,15 @@ func (s *Server) originalDiskBacking(dest restoreDest, m *pbsstore.Manifest) (st
 	return resolved, format, nil
 }
 
-// restoreRoots are the directories an in-place restore's bases may live in:
-// the image store and the disk's pool directory.
-func (s *Server) restoreRoots(dest restoreDest) []string {
-	return []string{filepath.Join(s.dataDir, "images"), dest.poolDir}
-}
-
 // recordedBackupBase is the base an overlay backup was taken on, for
 // rebuilding a disk that has been flattened since: the manifest's
-// BaseIdentity, never the backup's header. The base must still exist,
-// resolve to the recorded path inside restoreRoots, and match the recorded
-// size and sha256; its format comes from a record (recordedBackingFormat);
-// a qcow2 base's own chain is pre-checked inside the same roots.
-func (s *Server) recordedBackupBase(dest restoreDest, m *pbsstore.Manifest) (string, string, error) {
+// BaseIdentity, never the backup's header — and the manifest's path is never
+// trusted on its own: the base must still exist, be accepted by the disk's
+// chain rule (the image store, a pool the VM's project may use, a file the
+// project owns by record), and match the recorded size and sha256; its format
+// comes from a record (recordedBackingFormat); a qcow2 base's own chain is
+// pre-checked by the same rule.
+func (s *Server) recordedBackupBase(ctx context.Context, dest restoreDest, m *pbsstore.Manifest) (string, string, error) {
 	id := m.BaseIdentity
 	if id == nil {
 		return "", "", fmt.Errorf("the backup is an overlay, disk %s is now standalone (flattened since), and the backup does not record the base it was taken on", dest.disk.Path)
@@ -578,10 +584,6 @@ func (s *Server) recordedBackupBase(dest restoreDest, m *pbsstore.Manifest) (str
 	resolved, err := filepath.EvalSymlinks(id.Path)
 	if err != nil {
 		return "", "", fmt.Errorf("the base the backup was taken on (%s) is gone: %w", id.Path, err)
-	}
-	roots := s.restoreRoots(dest)
-	if err := confineTo(resolved, roots...); err != nil {
-		return "", "", err
 	}
 	got, err := fileIdentity(resolved)
 	if err != nil {
@@ -591,16 +593,87 @@ func (s *Server) recordedBackupBase(dest restoreDest, m *pbsstore.Manifest) (str
 		return "", "", fmt.Errorf("the base the backup was taken on (%s, %d bytes, sha256 %s) has changed (%s, %d bytes, sha256 %s)",
 			id.Path, id.Size, id.SHA256, got.Path, got.Size, got.SHA256)
 	}
+	// Where it is first: the disk's chain rule, as for a qcow2 layer (a
+	// flattened disk's record names no backing_disk any more, so no record
+	// link applies).
+	rule := s.diskChainRule(ctx, *dest.disk)
+	if err := rule(resolvedOr(dest.disk.Path), resolved, "qcow2"); err != nil {
+		return "", "", err
+	}
 	format, _, err := s.recordedBackingFormat(resolved, filepath.Join(s.dataDir, "images"))
 	if err != nil {
 		return "", "", err
 	}
+	if format == "raw" {
+		// Raw only as the VM's own project's recorded replica: guest content
+		// of that project, read as raw.
+		rec, ok := replicaRecordFor(resolved)
+		vm, verr := corrosion.GetVM(ctx, s.db, dest.disk.VMName)
+		if !ok || verr != nil || vm == nil || tenancy.NormalizeProject(rec.Project) != tenancy.NormalizeProject(vm.Project) {
+			return "", "", fmt.Errorf("the raw base the backup was taken on (%s) is not a replica of this VM's project", resolved)
+		}
+	}
 	if format == "qcow2" {
-		if err := precheckQcow2Input(resolved, func(r string) error { return confineTo(r, roots...) }); err != nil {
+		if _, err := precheckChain(resolved, rule); err != nil {
 			return "", "", fmt.Errorf("the base's own chain is refused: %w", err)
 		}
 	}
 	return resolved, format, nil
+}
+
+// imageUnchangedSince accepts, for a backup that does not record its base's
+// identity (taken before manifests recorded it), the image-store base resolved
+// of disk d only when the image's own records show it was not replaced after
+// the backup: this host's copy was pulled or imported no later than the backup
+// (backupTS), and the image's recorded checksum is the file's sha256 now. Any
+// other case is an error saying why.
+func (s *Server) imageUnchangedSince(ctx context.Context, d *corrosion.DiskRecord, resolved, backupTS string) error {
+	images := resolvedOr(filepath.Join(s.dataDir, "images"))
+	name := strings.TrimSuffix(d.BackingImage, ".qcow2")
+	if name == "" || filepath.IsAbs(name) || !image.IsImageFile(images, name, resolved) {
+		n, ok := image.ImageNameOfFile(resolved)
+		if !ok || !image.IsImageFile(images, n, resolved) {
+			return fmt.Errorf("its base is not a file of any image in the store")
+		}
+		name = n
+	}
+	backup, err := time.Parse(time.RFC3339, backupTS)
+	if err != nil {
+		return fmt.Errorf("the backup's time %q cannot be read", backupTS)
+	}
+	img, err := corrosion.GetImage(ctx, s.db, name)
+	if err != nil || img == nil {
+		return fmt.Errorf("image %q has no record to show it was not replaced since", name)
+	}
+	hosts, err := corrosion.GetImageHosts(ctx, s.db, name)
+	if err != nil {
+		return fmt.Errorf("image %q: %v", name, err)
+	}
+	var pulled string
+	for _, h := range hosts {
+		if h.HostName == s.hostName && h.Status == "ready" {
+			pulled = h.PulledAt
+		}
+	}
+	at, perr := time.Parse(time.RFC3339, pulled)
+	if pulled == "" || perr != nil {
+		return fmt.Errorf("image %q has no record of when this host's copy was pulled", name)
+	}
+	if at.After(backup) {
+		return fmt.Errorf("image %q was pulled or imported here at %s, after the backup (%s), so it may have been replaced since", name, pulled, backupTS)
+	}
+	want := normalizeChecksum(img.Checksum)
+	if want == "" {
+		return fmt.Errorf("image %q records no checksum to compare its file with", name)
+	}
+	got, err := image.FileDigest(resolved)
+	if err != nil {
+		return fmt.Errorf("image %q: %v", name, err)
+	}
+	if got != want {
+		return fmt.Errorf("image %q's file %s no longer matches its recorded checksum (sha256 %s, recorded %s)", name, resolved, got, want)
+	}
+	return nil
 }
 
 // recordedBackingFormat is a base file's format from a RECORD, never from its

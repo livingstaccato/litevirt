@@ -120,6 +120,19 @@ func newColdDiskFixture(t *testing.T) *coldDiskFixture {
 	return &coldDiskFixture{src: src, dst: dst, path: p, client: &loopDiskClient{up: up}, disk: disk, peer: peer}
 }
 
+// recordTemplateBase records <disk dir>/tpl-base.qcow2 as the root disk of a
+// template VM of the disk's project, and the fixture's disk as its linked
+// clone — what a base beside a disk is.
+func (f *coldDiskFixture) recordTemplateBase(t *testing.T) {
+	t.Helper()
+	base := filepath.Join(filepath.Dir(f.path), "tpl-base.qcow2")
+	if err := corrosion.InsertVM(context.Background(), f.src.db, corrosion.VMRecord{
+		Name: "tpl", HostName: f.src.hostName, State: "stopped", IsTemplate: true, Spec: `{"name":"tpl"}`,
+	}, nil, []corrosion.DiskRecord{{VMName: "tpl", DiskName: "root", HostName: f.src.hostName, Path: base, StorageType: "local"}}); err != nil {
+		t.Fatalf("InsertVM tpl: %v", err)
+	}
+}
+
 func (f *coldDiskFixture) writeSource(t *testing.T, data []byte) {
 	t.Helper()
 	sp := f.src.hostDiskFile(f.path)
@@ -188,7 +201,8 @@ func TestStreamColdDisk_FlattensABackedOverlay(t *testing.T) {
 	f := newColdDiskFixture(t)
 	const size = 1 << 20
 	// The base lives where a VM disk's base does: beside it, in the disk's
-	// directory (a linked clone's template disk), never anywhere else.
+	// directory — a linked clone's template disk, recorded as one.
+	f.recordTemplateBase(t)
 	baseDir := filepath.Dir(f.src.hostDiskFile(f.path))
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		t.Fatal(err)

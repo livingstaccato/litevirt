@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // cephDriver provisions Ceph RBD images via the rbd CLI. We deliberately
@@ -164,28 +166,43 @@ func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err 
 		}
 	}()
 
+	// A full copy is imported under a fresh name of its own, recorded, and
+	// only then renamed to DstRef (rbd rename refuses an existing name). Every
+	// cleanup removes only that fresh image — one this call created — never
+	// DstRef: an import that failed because an image of that name appeared in
+	// between (created by someone else) must not delete it.
+	recvRef := opts.DstRef
+	if !opts.Incremental {
+		recvRef = opts.DstRef + ".litevirt-incoming-" + randid.New()[:12]
+	}
 	var sendArgs, recvArgs []string
 	if opts.Incremental {
 		sendArgs = src.rbdArgs("export-diff", "--from-snap", "litevirt-replicate-prev", "--", srcSnapSpec, "-")
-		recvArgs = d.rbdArgs("import-diff", "--", "-", opts.DstRef)
+		recvArgs = d.rbdArgs("import-diff", "--", "-", recvRef)
 	} else {
 		sendArgs = src.rbdArgs("export", "--", srcSnapSpec, "-")
-		recvArgs = d.rbdArgs("import", "--", "-", opts.DstRef)
+		recvArgs = d.rbdArgs("import", "--", "-", recvRef)
+	}
+	removeIncoming := func() {
+		if !opts.Incremental {
+			_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", recvRef)...)
+		}
 	}
 
 	if _, perr := pipeCmds(ctx, opts.SSHTarget, "rbd", sendArgs, "rbd", recvArgs); perr != nil {
-		if !opts.Incremental {
-			// A partial image this copy created is not left unrecorded.
-			_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", opts.DstRef)...)
-		}
+		removeIncoming() // a partial image this copy created is not left unrecorded
 		return fmt.Errorf("ceph replicate %s → %s: %w", opts.SrcRef, opts.DstRef, perr)
 	}
 	for _, k := range sortedKeys(opts.Record) {
-		if out, merr := d.rbd(ctx, d.rbdArgs("image-meta", "set", "--", opts.DstRef, "litevirt."+k, opts.Record[k])...); merr != nil {
-			if !opts.Incremental {
-				_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", opts.DstRef)...)
-			}
+		if out, merr := d.rbd(ctx, d.rbdArgs("image-meta", "set", "--", recvRef, "litevirt."+k, opts.Record[k])...); merr != nil {
+			removeIncoming()
 			return fmt.Errorf("ceph replicate → %s: record %s: %w: %s", opts.DstRef, k, merr, out)
+		}
+	}
+	if !opts.Incremental {
+		if out, rerr := d.rbd(ctx, d.rbdArgs("rename", "--", recvRef, opts.DstRef)...); rerr != nil {
+			removeIncoming()
+			return fmt.Errorf("ceph replicate → %s: place the copy: %w: %s", opts.DstRef, rerr, out)
 		}
 	}
 	return nil

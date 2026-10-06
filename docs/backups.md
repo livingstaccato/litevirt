@@ -545,23 +545,31 @@ a way to overwrite another project's VM disk.
     backup names: a **linked clone** stays an overlay on its base, a
     **`--no-localize` promoted VM** on its replica, a **disk created from an
     image** on that image. That backing is the disk's CURRENT image header's,
-    resolved through symlinks, inside the image store or the disk's pool
-    directory, every layer pre-checked down to a standalone base; the disk's
-    record (`backing_disk`, `backing_image`) must agree with it. Its format
+    resolved through symlinks, judged like every chain a copy reads (see
+    *Storage*: the image store, the recorded `backing_disk`, a pool the VM's
+    project may use, a file the project owns by record), every layer
+    pre-checked down to a standalone base; the disk's record (`backing_disk`,
+    `backing_image`) must agree with it — `backing_image` with any version of
+    that image. Its format
     comes from a record — a replica's own record, `qcow2` for an image or a
     VM's disk — and must match what the disk declares; it is never read from
     the bytes. The base must be the one the backup was taken on: a backup
     records its base's path, size and sha256 (`base_identity`), and a
     restore onto a base that has changed since is refused, naming both. A
     backup taken before that was recorded is restored onto a base that cannot
-    change under its name (a replica, a template's disk), but not onto an
-    image. The restored header is re-pointed to the backing without opening
+    change under its name (a replica, a template's disk), and onto an image
+    only when the image's own records show it unchanged since the backup:
+    this host's copy was pulled or imported no later than the backup, and
+    the image's recorded checksum is its file's sha256 now. Otherwise it is
+    refused, saying which, and restoring to a new file still works. The
+    restored header is re-pointed to the backing without opening
     what the backup named (`qemu-img rebase -u`), and the rebuilt overlay must
     name exactly that backing. An overlay backup of a disk that is now
     standalone (flattened by a move since) is rebuilt **flat** from the backup
-    and the base it recorded — when that base still exists, inside the image
-    store or the disk's pool directory, with the recorded size and sha256 —
-    and the result must be standalone. A missing, moved or changed base is
+    and the base it recorded — when that base still exists where the disk's
+    chain may read from (the base's path in the backup is never trusted on
+    its own), with the recorded size and sha256 — and the result must be
+    standalone; the disk's record then names no backing. A missing, moved or changed base is
     refused, saying which; restoring to a new file still works.
 
   The restore streams into a temp beside the disk and rebuilds next to it, so

@@ -135,8 +135,8 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 		flat := filepath.Join(filepath.Dir(src), "."+filepath.Base(src)+coldMigScratch+uuid.NewString())
 		defer os.Remove(flat)
 		defer os.Remove(flat + ".tmp")
-		if err := qcow2.ConvertConfined(ctx, src, flat, &qcow2.Options{Uncompressed: true}, s.diskChainAllow(d)); err != nil {
-			return status.Errorf(codes.Internal, "flatten disk %s (backed by %s) for the copy: %v", d.Path, info.BackingFile, err)
+		if err := s.flattenColdDisk(ctx, d, src, flat); err != nil {
+			return err
 		}
 		readPath = flat
 	}
@@ -206,6 +206,21 @@ func (s *Server) streamColdDisk(ctx context.Context, client pb.LiteVirtClient, v
 	return nil
 }
 
+// flattenColdDisk writes a standalone copy of disk d's chain (its file src) to
+// flat with this package's qcow2 reader: every backing judged by
+// diskChainRule first, the reader confined to exactly the files that accepted,
+// each read by the format the layer above declares (a raw backing as raw).
+func (s *Server) flattenColdDisk(ctx context.Context, d corrosion.DiskRecord, src, flat string) error {
+	accepted, err := precheckChain(src, s.diskChainRule(ctx, d))
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "disk %s cannot be flattened for the copy: %v", d.Path, err)
+	}
+	if err := qcow2.ConvertConfined(ctx, src, flat, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
+		return status.Errorf(codes.Internal, "flatten disk %s for the copy: %v", d.Path, err)
+	}
+	return nil
+}
+
 // coldDiskSourceCheck is everything this host checks about one disk before
 // copying it: the file is a regular file, a qcow2 disk's image can be read,
 // and an overlay's backing chain can be flattened — every image in it is a
@@ -234,10 +249,10 @@ func (s *Server) coldDiskSourceCheck(d corrosion.DiskRecord, format string) (*qc
 		return nil, nil
 	}
 	// The flatten reads the chain with this package's qcow2 reader, by each
-	// layer's DECLARED backing format, confined to the image store and the
-	// disk's pool. A raw backing — a promoted replica, guest content — is read
-	// as raw and accepted only as the disk record's own backing_disk.
-	if err := precheckChain(src, s.diskChainAllow(d), s.diskRawBacking(d)); err != nil {
+	// layer's DECLARED backing format, every backing judged by diskChainRule.
+	// A raw backing — a promoted replica, guest content — is read as raw and
+	// accepted only as the backing_disk recorded on the layer naming it.
+	if _, err := precheckChain(src, s.diskChainRule(context.Background(), d)); err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"disk %s cannot be flattened for the copy: %v; move the VM to shared storage, or rebase the disk onto a qcow2 image or none, then migrate again", d.Path, err)
 	}

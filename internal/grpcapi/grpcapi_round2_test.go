@@ -606,7 +606,7 @@ func TestPersistImageRecord(t *testing.T) {
 		SourceUrl: "https://example.com/test.qcow2",
 		Format:    "qcow2",
 		Checksum:  "sha256:abc123",
-	})
+	}, image.Published{})
 
 	// Verify image was persisted in DB.
 	ctx := adminCtx()

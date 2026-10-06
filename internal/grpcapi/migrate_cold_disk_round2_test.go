@@ -62,7 +62,8 @@ func TestColdDiskHeadroom_IsBounded(t *testing.T) {
 func writeOverlay(t *testing.T, f *coldDiskFixture, virtual uint64, extra int) {
 	t.Helper()
 	// The base lives where a VM disk's base does: beside it, in the disk's
-	// directory (a linked clone's template disk), never anywhere else.
+	// directory — a linked clone's template disk, recorded as one.
+	f.recordTemplateBase(t)
 	baseDir := filepath.Dir(f.src.hostDiskFile(f.path))
 	if err := os.MkdirAll(baseDir, 0o755); err != nil {
 		t.Fatal(err)

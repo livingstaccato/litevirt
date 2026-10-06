@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -141,16 +142,48 @@ func replicaOwnerDir(poolDir, project, vm string) string {
 	return filepath.Join(poolDir, replicaAreaDir, hex.EncodeToString(sum[:16]))
 }
 
+// ownerDirChecked returns (project, vm)'s directory in poolDir's replica area
+// after checking that neither the area nor the owner directory is anything but
+// a real directory — a symlink planted at either (by an admin-pointed pool or
+// an NFS server) is refused, never followed. With create it makes both (0700);
+// otherwise a missing one is reported as fs.ErrNotExist.
+func ownerDirChecked(poolDir, project, vm string, create bool) (string, error) {
+	area := filepath.Join(poolDir, replicaAreaDir)
+	owner := replicaOwnerDir(poolDir, project, vm)
+	for _, d := range []string{area, owner} {
+		fi, err := os.Lstat(d)
+		switch {
+		case err == nil && fi.IsDir():
+			continue
+		case err == nil:
+			return "", fmt.Errorf("%s is not a directory (a symlink is never followed here)", d)
+		case errors.Is(err, fs.ErrNotExist) && create:
+			if merr := os.Mkdir(d, 0o700); merr != nil && !errors.Is(merr, fs.ErrExist) {
+				return "", merr
+			}
+			if fi, err := os.Lstat(d); err != nil || !fi.IsDir() {
+				return "", fmt.Errorf("%s is not a directory", d)
+			}
+		default:
+			return "", err
+		}
+	}
+	return owner, nil
+}
+
 // listReplicaRecords returns (project, vm)'s recorded replicas in poolDir:
 // every record in the owner directory that names exactly that project and VM
 // and whose file is a regular file there. Oldest first.
 func listReplicaRecords(poolDir, project, vm string) ([]replicaRecord, error) {
 	project = tenancy.NormalizeProject(project)
-	dir := replicaOwnerDir(poolDir, project, vm)
-	ents, err := os.ReadDir(dir)
+	dir, err := ownerDirChecked(poolDir, project, vm, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
 	}
+	if err != nil {
+		return nil, err
+	}
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -226,8 +259,8 @@ func publishRecordedReplica(ctx context.Context, poolDir string, r replicaRecord
 	if err := r.validate(); err != nil {
 		return "", err
 	}
-	dir := replicaOwnerDir(poolDir, r.Project, r.VM)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	dir, err := ownerDirChecked(poolDir, r.Project, r.VM, true)
+	if err != nil {
 		return "", fmt.Errorf("replica directory: %w", err)
 	}
 	dst := filepath.Join(dir, r.File)
@@ -339,7 +372,9 @@ func (s *Server) pruneRecordedReplicas(ctx context.Context, pool, project, vm, d
 	deleted := 0
 	for _, r := range mine[:len(mine)-keep] {
 		path := filepath.Join(dir, r.File)
-		owners, oerr := s.liveDiskOwners(ctx, s.hostName, path)
+		// Any host's disk: a pool on shared storage holds replicas a VM on
+		// another host runs from (a --no-localize promotion there).
+		owners, oerr := s.diskReferencesAnyHost(ctx, path)
 		if oerr != nil || len(owners) > 0 {
 			continue
 		}
@@ -420,4 +455,99 @@ func (s *Server) PruneReplicas(ctx context.Context, req *pb.PruneReplicasRequest
 		return nil, err
 	}
 	return &pb.PruneReplicasResponse{Deleted: int32(n)}, nil
+}
+
+// PushReplica receives a full replica from a peer: the header names the pool
+// and the record, and the file lands as a NEW file in the record's owner
+// directory with the record beside it. Host certificate only, refused before
+// a byte is read; an entry node forwards it only peer to peer.
+func (s *Server) PushReplica(stream pb.LiteVirt_PushReplicaServer) error {
+	ctx := stream.Context()
+	if err := s.requirePeerCert(ctx); err != nil {
+		return err
+	}
+	first, err := stream.Recv()
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "no header: %v", err)
+	}
+	if len(first.GetChunk()) != 0 {
+		return status.Error(codes.InvalidArgument, "the first message is the header only (no chunk data)")
+	}
+	if err := safename.ValidatePoolName(first.GetPoolName()); err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	rec, err := replicaRecordFromPB(first.GetReplica())
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	host := first.GetHost()
+	if host != "" && host != s.hostName {
+		client, closeConn, err := s.dialPeer(ctx, host)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
+		}
+		defer closeConn()
+		up, err := client.PushReplica(ctx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "open replica push to %q: %v", host, err)
+		}
+		if err := up.Send(first); err != nil {
+			return err
+		}
+		for {
+			msg, rerr := stream.Recv()
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return rerr
+			}
+			if err := up.Send(msg); err != nil {
+				return err
+			}
+		}
+		resp, err := up.CloseAndRecv()
+		if err != nil {
+			return err
+		}
+		return stream.SendAndClose(resp)
+	}
+	poolDir, err := s.replicaPoolDir(ctx, first.GetPoolName())
+	if err != nil {
+		return err
+	}
+	dir, err := ownerDirChecked(poolDir, rec.Project, rec.VM, true)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "replica directory: %v", err)
+	}
+	dest, total, err := receiveFileNoClobber(dir, 0o700, rec.File, func() ([]byte, error) {
+		msg, err := stream.Recv()
+		if err != nil {
+			return nil, err
+		}
+		return msg.GetChunk(), nil
+	})
+	if err != nil {
+		return err
+	}
+	if err := writeReplicaRecord(dir, rec); err != nil {
+		_ = os.Remove(dest)
+		return status.Errorf(codes.Internal, "record replica: %v", err)
+	}
+	return stream.SendAndClose(&pb.PushReplicaResponse{Path: dest, SizeBytes: total})
+}
+
+// proveReplicaRecords asks the receiving host for (project, vm)'s replica
+// records before a single replica byte is sent to it. A receiver that cannot
+// answer — an older build has no ListReplicas, and its upload or increment
+// handler would write the bytes as a bare name in the pool — or that errors
+// in any way, is refused: no replica is sent to a host that would not record
+// it.
+func proveReplicaRecords(ctx context.Context, client pb.LiteVirtClient, pool, host, project, vm string) error {
+	if _, err := client.ListReplicas(ctx, &pb.ListReplicasRequest{
+		PoolName: pool, Host: host, Project: tenancy.NormalizeProject(project), Vm: vm,
+	}); err != nil {
+		return fmt.Errorf("host %q cannot show it records replicas (%v); nothing was sent to it", host, err)
+	}
+	return nil
 }

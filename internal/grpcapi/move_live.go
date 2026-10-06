@@ -359,20 +359,8 @@ func preallocate(path string, virtualSize int64) error {
 	if virtualSize <= 0 {
 		return fmt.Errorf("destination virtual size must be > 0")
 	}
-	if err := refuseExistingFile(path); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".repl-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	_ = f.Close()
-	defer os.Remove(tmp) // gone after a successful place
-	if err := qcow2.Create(tmp, uint64(virtualSize), nil); err != nil {
-		return err
-	}
-	return placeNoClobber(tmp, path)
+	// qcow2.Create publishes exclusively: an existing path is refused.
+	return existAsAlreadyExists(qcow2.Create(path, uint64(virtualSize), nil))
 }
 
 // buildDiskXML produces the small <disk> snippet libvirt's BlockCopy

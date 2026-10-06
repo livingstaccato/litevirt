@@ -277,8 +277,20 @@ area without a matching record is never read, forked from or deleted, and
 pruning never deletes a replica a VM disk is backed by (a `--no-localize`
 promotion records its replica as the disk's `backing_disk`). No pool-content
 RPC reaches the area: uploads refuse dotted names, listings skip directories.
-A cross-host replica is uploaded with its record (peer certificate only), and
-pruned on the peer through the peer-only `PruneReplicas`.
+A cross-host replica is sent with its record over the peer-only `PushReplica`
+(incremental ones over `PushReplicaIncrement`, which also carries the record),
+and pruned on the peer through the peer-only `PruneReplicas`. Before a byte is
+sent, the sender asks the receiver for the VM's records (`ListReplicas`); a
+receiver that cannot answer — an older build — is refused, so no replica ever
+lands unrecorded in its pool. During a roll, replication to hosts not yet
+upgraded therefore stops until they are; and a sender still on the older build
+prunes the new hosts' pools by name until it is upgraded too. A pruned
+replica is never one a VM disk on any host references.
+
+The owner directory is keyed by project and VM name: a VM deleted and
+re-created under the same name in the same project inherits the earlier VM's
+replicas (they can be promoted and are pruned by its schedule). No other
+project's VM ever shares the directory.
 
 Replicas written by an earlier build as `<vm>-<disk>-<time>.<ext>` files in
 the pool are not records: nothing selects or prunes them any more. Delete them
@@ -507,9 +519,22 @@ a way to overwrite another project's VM disk.
   it (`target_path` in the DONE frame, the READY frame for `restore-live`).
 - **`--in-place`** (`restore-from` only, `in_place` on the RPC): restore over
   the disk the VM's own record names. The VM must be in the backup's project,
-  on the daemon's host, stopped, without snapshots, and the file must be that
-  disk's alone. This is the only restore that replaces a file, and its path
-  comes from the record, not the request.
+  on the daemon's host, stopped, without snapshots, in a pool that passes the
+  pool write check, and the file must be that disk's alone — no disk row on
+  ANY host may use it. This is the only restore that replaces a file, and its
+  path comes from the record, not the request.
+
+  The backup's bytes are never placed as the disk. A backup records what its
+  bytes are (`content_format`): `raw` for a running VM's guest content, read
+  over NBD, or `disk-file` for a stopped VM's image file. The restore rebuilds
+  a **new** qcow2 from them with the source format named, never probed
+  (`qemu-img convert -f raw|qcow2 -O qcow2`), refuses the result unless it is
+  standalone (no backing file, no external data file), and only then swaps it
+  in. Raw guest content is the guest's to write — a qcow2 header planted in
+  sector 0 would otherwise make qemu follow a backing file the guest chose. A
+  disk-file backup may name a backing file only if it is a qcow2 base in this
+  host's image store; it is flattened. A backup that predates content formats
+  is refused for `--in-place`; restore it to a new file instead.
 - **`--target-path`**: names the file. It needs `storage.hostpath` — the
   **admin** role — whether it is a bare name (under `<data_dir>/disks`) or an
   absolute path, and an existing file there is refused with `AlreadyExists`,

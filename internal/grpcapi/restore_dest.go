@@ -6,13 +6,17 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/pbsstore"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
@@ -97,6 +101,16 @@ func derivedDiskFile(dir, vm, disk, kind, ext string) (string, error) {
 	name := fmt.Sprintf("%s-%s-%s-%s-%s%s", vm, disk, kind,
 		time.Now().UTC().Format("20060102-150405"), randid.New()[:8], ext)
 	return filepath.Join(dir, name), nil
+}
+
+// existAsAlreadyExists maps a refused exclusive create (an error wrapping
+// fs.ErrExist, as every qcow2.Create* returns for an existing path) to
+// AlreadyExists; any other error is returned unchanged.
+func existAsAlreadyExists(err error) error {
+	if err != nil && errors.Is(err, fs.ErrExist) {
+		return status.Errorf(codes.AlreadyExists, "%v", err)
+	}
+	return err
 }
 
 // placeNoClobber makes tmp visible as dst only if nothing is at dst. The
@@ -215,6 +229,17 @@ func (s *Server) inPlaceRestoreLocked(ctx context.Context, vmName, diskName stri
 	if !filepath.IsAbs(disk.Path) {
 		return restoreDest{}, status.Errorf(codes.FailedPrecondition, "in_place: disk %q has no file path on record", diskName)
 	}
+	// A disk in a pool is written only through the one pool write check —
+	// a refused pool (shared, weakly mounted, a legacy area) takes no restore.
+	if disk.StorageVolume != "" {
+		ref, ok := s.resolvePool(ctx, disk.StorageVolume)
+		if !ok {
+			return restoreDest{}, status.Errorf(codes.FailedPrecondition, "in_place: disk %q's pool %q is not configured on this host", diskName, disk.StorageVolume)
+		}
+		if err := s.checkPoolForWrite(ctx, disk.StorageVolume, ref); err != nil {
+			return restoreDest{}, err
+		}
+	}
 	fi, err := os.Lstat(disk.Path)
 	if err != nil {
 		return restoreDest{}, status.Errorf(codes.FailedPrecondition, "in_place: disk file %q: %v", disk.Path, err)
@@ -222,8 +247,9 @@ func (s *Server) inPlaceRestoreLocked(ctx context.Context, vmName, diskName stri
 	if !fi.Mode().IsRegular() {
 		return restoreDest{}, status.Errorf(codes.FailedPrecondition, "in_place: disk file %q is not a regular file", disk.Path)
 	}
-	// The file must be this disk's alone: never a base another disk is backed by.
-	owners, err := s.liveDiskOwners(ctx, s.hostName, disk.Path)
+	// The file must be this disk's alone: never a base another disk is backed
+	// by, on this host or any other (shared storage).
+	owners, err := s.diskReferencesAnyHost(ctx, disk.Path)
 	if err != nil {
 		return restoreDest{}, status.Errorf(codes.Internal, "check disk use: %v", err)
 	}
@@ -247,4 +273,106 @@ func (s *Server) vmDisksClosed(vm *corrosion.VMRecord) bool {
 		return true
 	}
 	return s.sourceIsShutOff(vm)
+}
+
+// inPlaceContentAccepted refuses, before any byte is restored, an in-place
+// restore from a backup whose content format is not recorded: the bytes are
+// written back as a VM disk, and what they ARE decides how.
+func inPlaceContentAccepted(m *pbsstore.Manifest) error {
+	switch m.ContentFormat {
+	case pbsstore.ContentGuestRaw, pbsstore.ContentDiskFile:
+		return nil
+	case "":
+		return status.Error(codes.FailedPrecondition,
+			"in_place: this backup does not record what its bytes are (it predates content formats); restore it to a new file instead")
+	default:
+		return status.Errorf(codes.FailedPrecondition, "in_place: unknown backup content format %q", m.ContentFormat)
+	}
+}
+
+// diskImageFromBackup turns restored backup bytes into a NEW standalone qcow2
+// beside dir — the format libvirt opens every file disk as — and returns its
+// path. Backup bytes are never placed as a disk directly.
+//
+// A guest-content backup is raw guest bytes, and the guest controls all of
+// them: placed as-is under a disk libvirt opens as qcow2, a guest-written
+// qcow2 header with a backing file would make qemu read whatever file the
+// guest named (another project's disk). So the bytes are converted with the
+// source format NAMED (-f raw, never probed) into a fresh image, and the
+// result must name no backing or external data file before it is used.
+//
+// A disk-file backup is the disk's own image file. It must parse as qcow2;
+// a backing file it names must be a qcow2 base in this host's image store
+// (a VM created from an image), and it is flattened (-f qcow2) into a fresh
+// standalone image the same way.
+func (s *Server) diskImageFromBackup(ctx context.Context, contentFormat, restored, dir string) (string, error) {
+	var srcFormat string
+	switch contentFormat {
+	case pbsstore.ContentGuestRaw:
+		srcFormat = "raw"
+	case pbsstore.ContentDiskFile:
+		info, err := qcow2.Info(restored)
+		if err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "in_place: the backed-up disk file is not a qcow2 image: %v", err)
+		}
+		if info.BackingFile != "" {
+			images := filepath.Join(s.dataDir, "images")
+			if !filepath.IsAbs(info.BackingFile) || !safename.Contains(images, info.BackingFile) || info.BackingFormat != "qcow2" {
+				return "", status.Errorf(codes.FailedPrecondition,
+					"in_place: the backed-up disk file names backing file %q (format %q); only a qcow2 base in %s is accepted",
+					info.BackingFile, info.BackingFormat, images)
+			}
+		}
+		srcFormat = "qcow2"
+	default:
+		return "", inPlaceContentAccepted(&pbsstore.Manifest{ContentFormat: contentFormat})
+	}
+	if !qemuImgAvailable() {
+		return "", status.Error(codes.FailedPrecondition, "in_place: qemu-img is required to rebuild the disk image")
+	}
+	f, err := os.CreateTemp(dir, "restore-*.tmp")
+	if err != nil {
+		return "", status.Errorf(codes.Internal, "create image temp: %v", err)
+	}
+	out := f.Name()
+	_ = f.Close()
+	cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-f", srcFormat, "-O", "qcow2", restored, out)
+	if msg, err := cmd.CombinedOutput(); err != nil {
+		_ = os.Remove(out)
+		return "", status.Errorf(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
+	}
+	if err := qcow2.AssertStandalone(out); err != nil {
+		_ = os.Remove(out)
+		return "", status.Errorf(codes.FailedPrecondition, "in_place: the rebuilt image is not standalone: %v", err)
+	}
+	return out, nil
+}
+
+// diskReferencesAnyHost returns every disk row, on ANY host, that uses path —
+// as its own file, a backing image or a linked clone's base — matched on the
+// path as given and as resolved through symlinks. vm_disks is replicated, so
+// on shared storage a VM another host runs is seen here too; liveDiskOwners'
+// this-host filter is right for a host-local directory and wrong for a
+// replica or a restore target another host may be reading.
+func (s *Server) diskReferencesAnyHost(ctx context.Context, path string) ([]corrosion.DiskRecord, error) {
+	paths := []string{filepath.Clean(path)}
+	if r, err := filepath.EvalSymlinks(path); err == nil && r != paths[0] {
+		paths = append(paths, r)
+	}
+	var out []corrosion.DiskRecord
+	seen := map[string]bool{}
+	for _, p := range paths {
+		rows, err := corrosion.DisksReferencingPath(ctx, s.db, p)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range rows {
+			k := d.HostName + "\x00" + d.VMName + "\x00" + d.DiskName
+			if !seen[k] {
+				seen[k] = true
+				out = append(out, d)
+			}
+		}
+	}
+	return out, nil
 }

@@ -146,6 +146,14 @@ another, or sits on `<data_dir>/disks`, is refused for everything — listing
 included — with `FailedPrecondition` saying to recreate it; the error does not
 name the other pool, which may be another project's.
 
+Creating a disk never replaces a file. A VM's disk is named
+`<vm>-<disk>.qcow2`, which is ambiguous across hyphens — VM `a` with disk
+`b-root` is the same file as VM `a-b` with disk `root` — and a pool, like
+`<data_dir>/disks`, may hold every project's disks. VM create, clone, and every
+image the daemon creates are published exclusively: a file already at the name
+is refused (`FailedPrecondition` for a create or clone), never overwritten and
+never cleaned up by the failed create. Choose another VM or disk name.
+
 Content operations never reach a file a live VM disk uses: a listing leaves
 out files a live disk of another pool uses, and a content delete refuses any
 file a live disk uses, as its own file or as a backing file.

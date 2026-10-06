@@ -1,8 +1,9 @@
 package grpcapi
 
 import (
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
 
 	"google.golang.org/grpc"
@@ -122,19 +123,14 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return err
 	}
 
-	// Create the overlay at a temp path and place it BEFORE the domain is
-	// defined/started against it. The placement refuses anything already at
-	// the target — a file, a symlink, a disk a VM runs on.
-	tmpOverlay, err := stagingTemp(target)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmpOverlay) // gone after a successful place
-	if err := qcow2.CreateWithBackingURI(tmpOverlay, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
+	// Create the overlay BEFORE the domain is defined/started against it.
+	// qcow2 publishes it exclusively: anything already at the target — a
+	// file, a symlink, a disk a VM runs on — is refused, never replaced.
+	if err := qcow2.CreateWithBackingURI(target, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return existAsAlreadyExists(err)
+		}
 		return status.Errorf(codes.Internal, "create overlay qcow2: %v", err)
-	}
-	if err := placeNoClobber(tmpOverlay, target); err != nil {
-		return err
 	}
 
 	if err := stream.Send(&pb.RestoreLiveProgress{

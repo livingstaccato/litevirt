@@ -252,12 +252,16 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 		return fmt.Errorf("local scratch replicate: %w", err)
 	}
 
-	client, conn, err := s.peerClient(ctx, targetHost)
+	client, closeConn, err := s.dialPeer(ctx, targetHost)
 	if err != nil {
 		return fmt.Errorf("reach target host %q: %w", targetHost, err)
 	}
-	defer conn.Close()
+	defer closeConn()
 
+	if err := proveReplicaRecords(ctx, client, sched.TargetPool, targetHost, rec.Project, rec.VM); err != nil {
+		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: %v", src.DiskName, sched.TargetPool, targetHost, err))
+		return err
+	}
 	if err := streamReplicaToPool(ctx, client, scratch, sched.TargetPool, targetHost, rec); err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: upload: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return fmt.Errorf("stream to %q: %w", targetHost, err)
@@ -272,30 +276,26 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	return nil
 }
 
-// streamReplicaToPool uploads a local file into a peer's pool as the recorded
-// replica rec, via the client-streaming UploadStoragePoolContent RPC with a
-// replica header. A receiver that did not record it (one that ignored the
-// header) is a failure: the file would be an unrecorded name in a shared pool.
+// streamReplicaToPool sends a local file to a peer's pool as the recorded
+// replica rec, over the peer-only PushReplica.
 func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, pool, host string, rec replicaRecord) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	up, err := client.UploadStoragePoolContent(ctx)
+	up, err := client.PushReplica(ctx)
 	if err != nil {
 		return err
 	}
-	if err := up.Send(&pb.UploadStoragePoolContentRequest{
-		PoolName: pool, Host: host, Filename: rec.File, Replica: rec.toPB(),
-	}); err != nil {
+	if err := up.Send(&pb.PushReplicaRequest{PoolName: pool, Host: host, Replica: rec.toPB()}); err != nil {
 		return err
 	}
 	buf := make([]byte, 1<<20)
 	for {
 		n, rerr := f.Read(buf)
 		if n > 0 {
-			if err := up.Send(&pb.UploadStoragePoolContentRequest{Chunk: buf[:n]}); err != nil {
+			if err := up.Send(&pb.PushReplicaRequest{Chunk: buf[:n]}); err != nil {
 				return err
 			}
 		}
@@ -306,14 +306,8 @@ func streamReplicaToPool(ctx context.Context, client pb.LiteVirtClient, path, po
 			return rerr
 		}
 	}
-	resp, err := up.CloseAndRecv()
-	if err != nil {
-		return err
-	}
-	if !resp.GetReplicaRecorded() {
-		return fmt.Errorf("host %q stored the upload without recording it as a replica", host)
-	}
-	return nil
+	_, err = up.CloseAndRecv()
+	return err
 }
 
 // replicateIncremental transfers only the disk's dirty extents into a new raw
@@ -460,9 +454,9 @@ func (s *Server) receiveRawReplica(ctx context.Context, pool string, rec replica
 				"base %q is not a recorded raw replica of vm %q disk %q for this schedule", base, rec.VM, rec.Disk)
 		}
 	}
-	dir := replicaOwnerDir(poolDir, rec.Project, rec.VM)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+	dir, err := ownerDirChecked(poolDir, rec.Project, rec.VM, true)
+	if err != nil {
+		return "", status.Errorf(codes.FailedPrecondition, "replica directory: %v", err)
 	}
 	dest, err := forkRawAndApply(dir, rec.File, base, totalSize, apply)
 	if err != nil {
@@ -478,11 +472,16 @@ func (s *Server) receiveRawReplica(ctx context.Context, pool string, rec replica
 // applyIncrementRemote streams the new raw replica to a peer's pool via
 // PushReplicaIncrement (dirty extents only; the peer forks from base).
 func (s *Server) applyIncrementRemote(ctx context.Context, host, pool string, rec replicaRecord, base string, totalSize int64, r io.ReaderAt, extents [][2]int64) error {
-	client, conn, err := s.peerClient(ctx, host)
+	client, closeConn, err := s.dialPeer(ctx, host)
 	if err != nil {
 		return fmt.Errorf("reach host %q: %w", host, err)
 	}
-	defer conn.Close()
+	defer closeConn()
+	// An older receiver's PushReplicaIncrement ignores the record and writes
+	// the bytes as a bare name in the pool: prove it records replicas first.
+	if err := proveReplicaRecords(ctx, client, pool, host, rec.Project, rec.VM); err != nil {
+		return err
+	}
 	up, err := client.PushReplicaIncrement(ctx)
 	if err != nil {
 		return err

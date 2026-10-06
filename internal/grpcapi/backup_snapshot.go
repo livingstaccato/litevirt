@@ -332,6 +332,7 @@ func (s *Server) pushBackup(
 		if err := containerBackupUnsupported(disk); err != nil {
 			return nil, err
 		}
+		opts.ContentFormat = pbsstore.ContentDiskFile
 		m, err := pbsstore.PushFile(ctx, repo, disk.Path, opts)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "push: %v", err)
@@ -410,6 +411,7 @@ func (s *Server) pushBackup(
 			Status: fmt.Sprintf("guest-content backup unavailable (%v) — full container backup", err),
 		})
 		opts.BitmapName = ""
+		opts.ContentFormat = pbsstore.ContentDiskFile
 		m, perr := pbsstore.PushFile(ctx, repo, disk.Path, opts)
 		if perr != nil {
 			return nil, status.Errorf(codes.Internal, "push: %v", perr)
@@ -438,6 +440,7 @@ func (s *Server) pushBackup(
 		Status: fmt.Sprintf("%s guest-content backup: %d changed extent(s)", mode, len(extents)),
 	})
 
+	opts.ContentFormat = pbsstore.ContentGuestRaw
 	m, err := pbsstore.PushFromSource(ctx, repo, session, session.Size(), extents, inheritFrom, opts)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "push: %v", err)
@@ -637,6 +640,9 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	var dest restoreDest
 	switch {
 	case req.InPlace:
+		if err := inPlaceContentAccepted(manifest); err != nil {
+			return err
+		}
 		if dest, err = s.inPlaceRestoreTarget(ctx, req.VmName, req.DiskName, authProject); err != nil {
 			return err
 		}
@@ -678,6 +684,16 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 		},
 	}); err != nil {
 		return status.Errorf(codes.Internal, "restore: %v", err)
+	}
+	// In place, the bytes become a VM disk: never placed as-is, always
+	// rebuilt into a fresh standalone image (diskImageFromBackup).
+	if dest.inPlace {
+		img, err := s.diskImageFromBackup(ctx, manifest.ContentFormat, tmpTarget, filepath.Dir(dest.path))
+		if err != nil {
+			return err
+		}
+		defer os.Remove(img) // gone after a successful place
+		tmpTarget = img
 	}
 	if err := dest.place(tmpTarget); err != nil {
 		return err

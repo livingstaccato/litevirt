@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -368,10 +369,11 @@ var errReplicaTooOld = errors.New("newest replica is too old for automatic promo
 // reassigns it.
 var autoPromoteMaxReplicaAge = 48 * time.Hour
 
-// replicaTimestamp reads the UTC run time out of a replica filename, which the
-// replication runner writes as `<vm>-<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>`. The
-// VM and disk names may themselves contain dashes, so the stamp is taken from
-// the END of the name.
+// replicaTimestamp reads the UTC run time out of a replica's file name, which
+// the replication runner writes (and its record names) as
+// `<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>`. A disk name may itself contain
+// dashes, so the stamp is taken from the END of the name. Only a replica
+// already selected by its record is ever read this way.
 func replicaTimestamp(name string) (time.Time, bool) {
 	const layout = "20060102-150405"
 	base := strings.TrimSuffix(strings.TrimSuffix(name, ".qcow2"), ".raw")
@@ -516,19 +518,15 @@ func liveDiskBacking(livePath, replicaPath string) string {
 }
 
 // createOverlayNoClobber creates a qcow2 at path backed by backing, as a new
-// file: built at a temp beside it and placed with RENAME_NOREPLACE.
+// file: qcow2 publishes it exclusively, refusing an existing path.
 func createOverlayNoClobber(path, backing, backingFmt string) error {
-	f, err := os.CreateTemp(filepath.Dir(path), ".promote-*.tmp")
-	if err != nil {
-		return status.Errorf(codes.Internal, "create overlay temp: %v", err)
-	}
-	tmp := f.Name()
-	_ = f.Close()
-	defer os.Remove(tmp) // gone after a successful place
-	if err := qcow2.CreateWithBackingFormat(tmp, backing, backingFmt, 0, nil); err != nil {
+	if err := qcow2.CreateWithBackingFormat(path, backing, backingFmt, 0, nil); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return existAsAlreadyExists(err)
+		}
 		return status.Errorf(codes.Internal, "create overlay: %v", err)
 	}
-	return placeNoClobber(tmp, path)
+	return nil
 }
 
 // doPromoteLocal performs the promotion on the host that holds the replica:
@@ -927,7 +925,15 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// mid-copy leaves a sweepable temp (SweepStaleStaging) rather than an
 			// orphan live disk — the qemu-img child survives KillMode=process and
 			// would otherwise complete a final-named qcow2 with no domain.
-			tmpLive := filepath.Join(poolDir, fmt.Sprintf(".promote-%s-%s.tmp", targetName, ts))
+			// A fresh, unpredictable temp (O_EXCL): qemu-img convert follows a
+			// symlink at its output, so the name must not be one anything
+			// else could have planted.
+			tf, terr := os.CreateTemp(poolDir, ".promote-*.tmp")
+			if terr != nil {
+				return status.Errorf(codes.Internal, "create live-disk temp: %v", terr)
+			}
+			tmpLive := tf.Name()
+			_ = tf.Close()
 			if err := convertQcow2(ctx, replicaPath, tmpLive, emit); err != nil {
 				os.Remove(tmpLive)
 				return status.Errorf(codes.Internal, "copy replica: %v", err)

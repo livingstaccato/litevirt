@@ -240,8 +240,16 @@ func TestPromoteReplica_LiveDiskNeverOverwrites(t *testing.T) {
 func seedOwnReplica(t *testing.T, f *poolFixture, vm, disk string) string {
 	t.Helper()
 	rec := newReplicaRecord("a", vm, disk, vm+"/dr", "20261003-000000", "qcow2")
+	img := filepath.Join(t.TempDir(), "img.qcow2")
+	if err := qcow2.Create(img, 1<<20, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(img)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := publishRecordedReplica(context.Background(), f.dr, rec, func(tmp string) error {
-		return qcow2.Create(tmp, 1<<20, nil)
+		return os.WriteFile(tmp, data, 0o600) // the temp exists; qcow2.Create never overwrites
 	}); err != nil {
 		t.Fatal(err)
 	}

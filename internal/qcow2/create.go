@@ -38,6 +38,10 @@ func closeAndCleanup(c io.Closer, path string, err error) error {
 
 // Create creates a new empty qcow2 v3 image at path with the given virtual size.
 // opts may be nil for defaults (64 KB clusters, 16-bit refcounts).
+//
+// Every Create* refuses a path that already exists (an error wrapping
+// fs.ErrExist): the image is built at a temp and published with a hard link,
+// never renamed over what is there.
 func Create(path string, sizeBytes uint64, opts *Options) error {
 	if sizeBytes == 0 {
 		return fmt.Errorf("virtual size must be > 0")
@@ -307,8 +311,8 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	if err = Check(tmpPath); err != nil {
 		return fmt.Errorf("post-create check failed: %w", err)
 	}
-	if err = os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("rename into place: %w", err)
+	if err = publishNoReplace(tmpPath, path); err != nil {
+		return err
 	}
 	committed = true
 	fsyncDir(filepath.Dir(path))

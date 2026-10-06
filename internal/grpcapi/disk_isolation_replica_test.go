@@ -80,43 +80,73 @@ func TestDoPromoteLocal_RechecksTheRecord(t *testing.T) {
 	f.assertBIntact(t)
 }
 
-// A replica upload is a host's alone: a project Operator with write on the pool
-// cannot use the replica header to write into the replica area.
-func TestUpload_ReplicaHeaderIsPeerOnly(t *testing.T) {
+// A replica is a host's alone: a project Operator — even one with write on
+// the pool — cannot push one into the replica area.
+func TestPushReplica_IsPeerOnly(t *testing.T) {
 	f := newPoolFixture(t)
 	f.grantPoolWrite(t)
 	rec := newReplicaRecord("b", "web-1", "root", "web-1/dr", "20261009-000000", "qcow2")
-	st := &fakeUploadStream{ctx: f.alice, msgs: []*pb.UploadStoragePoolContentRequest{
-		{PoolName: "dr", Filename: rec.File, Replica: rec.toPB()},
+	st := &fakePushReplicaStream{ctx: f.alice, msgs: []*pb.PushReplicaRequest{
+		{PoolName: "dr", Replica: rec.toPB()},
 		{Chunk: []byte("forged replica")},
 	}}
-	if err := f.s.UploadStoragePoolContent(st); status.Code(err) != codes.PermissionDenied {
-		t.Errorf("operator upload with a replica header: got %v, want PermissionDenied", err)
+	if err := f.s.PushReplica(st); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("operator PushReplica: got %v, want PermissionDenied", err)
+	}
+	if st.idx > 0 {
+		t.Errorf("a refused push read %d message(s); it must refuse before reading any", st.idx)
 	}
 	if recs, _ := listReplicaRecords(f.dr, "b", "web-1"); len(recs) != 0 {
 		t.Errorf("a forged replica was recorded for project B: %+v", recs)
 	}
 }
 
-// From a peer, the upload lands in the VM's own directory with its record.
-func TestUpload_PeerReplicaIsRecordedInTheOwnersDirectory(t *testing.T) {
+// From a peer, the replica lands in the VM's own directory with its record.
+func TestPushReplica_PeerReplicaIsRecordedInTheOwnersDirectory(t *testing.T) {
 	f := newPoolFixture(t)
 	rec := newReplicaRecord("a", "web", "1", "web/dr", "20261009-000000", "qcow2")
-	st := &fakeUploadStream{ctx: peerCtxFor(t, f.s, "peer-host"), msgs: []*pb.UploadStoragePoolContentRequest{
-		{PoolName: "dr", Filename: rec.File, Replica: rec.toPB()},
+	st := &fakePushReplicaStream{ctx: peerCtxFor(t, f.s, "peer-host"), msgs: []*pb.PushReplicaRequest{
+		{PoolName: "dr", Replica: rec.toPB()},
 		{Chunk: []byte("replica bytes")},
 	}}
-	if err := f.s.UploadStoragePoolContent(st); err != nil {
-		t.Fatalf("peer replica upload: %v", err)
-	}
-	if !st.resp.GetReplicaRecorded() {
-		t.Error("response does not say the replica was recorded")
+	if err := f.s.PushReplica(st); err != nil {
+		t.Fatalf("peer PushReplica: %v", err)
 	}
 	recs, _ := listReplicaRecords(f.dr, "a", "web")
-	if len(recs) != 1 || recs[0].File != rec.File || recs[0].Schedule != "web/dr" {
-		t.Errorf("records of (a, web) = %+v, want the uploaded replica", recs)
+	if len(recs) != 1 || recs[0].File != rec.File || recs[0].Schedule != "web/dr" || recs[0].SizeBytes != int64(len("replica bytes")) {
+		t.Errorf("records of (a, web) = %+v, want the pushed replica", recs)
+	}
+	// A second push of the same record is refused, not replaced.
+	st = &fakePushReplicaStream{ctx: peerCtxFor(t, f.s, "peer-host2"), msgs: []*pb.PushReplicaRequest{
+		{PoolName: "dr", Replica: rec.toPB()}, {Chunk: []byte("other bytes")},
+	}}
+	if err := f.s.PushReplica(st); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("second push of the same replica: got %v, want AlreadyExists", err)
 	}
 	f.assertBIntact(t)
+}
+
+// fakePushReplicaStream scripts a client-streaming PushReplica.
+type fakePushReplicaStream struct {
+	grpc.ServerStream
+	ctx  context.Context
+	msgs []*pb.PushReplicaRequest
+	idx  int
+	resp *pb.PushReplicaResponse
+}
+
+func (f *fakePushReplicaStream) Context() context.Context { return f.ctx }
+func (f *fakePushReplicaStream) Recv() (*pb.PushReplicaRequest, error) {
+	if f.idx >= len(f.msgs) {
+		return nil, io.EOF
+	}
+	m := f.msgs[f.idx]
+	f.idx++
+	return m, nil
+}
+func (f *fakePushReplicaStream) SendAndClose(r *pb.PushReplicaResponse) error {
+	f.resp = r
+	return nil
 }
 
 // ListReplicas and PruneReplicas are host-certificate only.

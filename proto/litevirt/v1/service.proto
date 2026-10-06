@@ -1738,20 +1738,36 @@ message UploadStoragePoolContentRequest {
     string host      = 2; // optional — defaults to caller's host
     string filename  = 3; // base name only (no path separators)
     bytes  chunk     = 4;
-    // replica (header, peer only): the upload is a replica. It is written into
-    // the pool's replica area for (project, vm) under replica.file — which
-    // filename must equal — and its record written beside it.
-    ReplicaRecord replica = 5;
+    // 5 carried a replica record on an earlier build of this branch. Replicas
+    // now go only through the peer-only PushReplica, and a header carrying
+    // any field the receiver does not know is refused.
+    reserved 5;
 }
 message UploadStoragePoolContentResponse {
     string path       = 1;
     int64  size_bytes = 2;
-    // true when the upload was written and recorded as replica. A sender of a
-    // replica treats false (a receiver that ignored the header) as a failure.
-    bool   replica_recorded = 3;
+    reserved 3;
 }
-// Delete one file from a file-based pool (used by cross-host replication to
-// prune old replicas on a peer). filename is a base name.
+
+// Client-streaming replica push (cross-host replication), peer only. The
+// first message is the header (pool_name/host/replica, no chunk); the rest
+// carry chunks. The receiver writes a NEW file replica.file into the
+// replica area of (replica.project, replica.vm) and its record beside it.
+// A dedicated RPC rather than an upload field, so an entry node on an older
+// build — which has no handler for it — can never forward one for a user.
+message PushReplicaRequest {
+    string        pool_name = 1; // header
+    string        host      = 2; // header — optional, defaults to the receiver
+    ReplicaRecord replica   = 3; // header
+    bytes         chunk     = 4;
+}
+message PushReplicaResponse {
+    string path       = 1;
+    int64  size_bytes = 2;
+}
+// Delete one file from a file-based pool. filename is a base name. A file any
+// VM disk on any host uses is refused. (Replicas are pruned with the
+// peer-only PruneReplicas, by record, not through this.)
 message DeleteStoragePoolContentRequest {
     string pool_name = 1;
     string host      = 2; // optional — defaults to caller's host
@@ -3289,8 +3305,11 @@ service LiteVirt {
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);
-    // Peer only: one VM's replica records in a pool (promotion, incremental fork base).
+    // Peer only: one VM's replica records in a pool (promotion, incremental fork
+    // base, and a sender's proof that the receiver records replicas).
     rpc ListReplicas(ListReplicasRequest) returns (ListReplicasResponse);
+    // Peer only: a full replica, written and recorded in the replica area.
+    rpc PushReplica(stream PushReplicaRequest) returns (PushReplicaResponse);
     // Peer only: prune one schedule's recorded replicas of one disk.
     rpc PruneReplicas(PruneReplicasRequest) returns (PruneReplicasResponse);
 

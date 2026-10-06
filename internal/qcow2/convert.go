@@ -16,6 +16,11 @@ import (
 // The destination has no backing file. opts may be nil for defaults.
 func Convert(ctx context.Context, src, dst string, opts *Options) error {
 	tmpPath := dst + ".tmp"
+	// A crash's leftover temp (or anything planted at the name) is unlinked,
+	// never followed; Create below then makes the temp exclusively.
+	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("clear stale temp: %w", err)
+	}
 
 	err := doConvert(ctx, src, tmpPath, opts)
 	if err != nil {
@@ -23,10 +28,10 @@ func Convert(ctx context.Context, src, dst string, opts *Options) error {
 		return err
 	}
 
-	// Atomic rename.
-	if err := os.Rename(tmpPath, dst); err != nil {
+	// Never over an existing dst.
+	if err := publishNoReplace(tmpPath, dst); err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("rename temp to dest: %w", err)
+		return err
 	}
 	return nil
 }

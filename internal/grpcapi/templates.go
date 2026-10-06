@@ -3,7 +3,9 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -195,7 +197,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		if mode == "linked" {
 			if err := qcow2.CreateWithBacking(clonePath, d.Path, size, nil); err != nil {
 				cleanup()
-				return nil, status.Errorf(codes.Internal, "create linked clone disk %s: %v", d.DiskName, err)
+				return nil, cloneDiskErr("create linked clone disk", d.DiskName, err)
 			}
 			backing = d.Path
 		} else {
@@ -204,7 +206,7 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 			// on every guest read). Pure-Go — no qemu-img dependency.
 			if err := qcow2.Convert(ctx, d.Path, clonePath, &qcow2.Options{Uncompressed: true}); err != nil {
 				cleanup()
-				return nil, status.Errorf(codes.Internal, "full-clone disk %s: %v", d.DiskName, err)
+				return nil, cloneDiskErr("full-clone disk", d.DiskName, err)
 			}
 		}
 		created = append(created, clonePath)
@@ -554,4 +556,15 @@ func allDisksShared(disks []corrosion.DiskRecord) bool {
 		}
 	}
 	return true
+}
+
+// cloneDiskErr reports a failed clone disk. The clone's "<target>-<disk>.qcow2"
+// can be another VM's disk (VM "a" disk "b-root" is VM "a-b" disk "root");
+// qcow2 refuses to create over it, and that refusal is FailedPrecondition, not
+// an internal error.
+func cloneDiskErr(what, disk string, err error) error {
+	if errors.Is(err, fs.ErrExist) {
+		return status.Errorf(codes.FailedPrecondition, "%s %s: %v — choose another target name", what, disk, err)
+	}
+	return status.Errorf(codes.Internal, "%s %s: %v", what, disk, err)
 }

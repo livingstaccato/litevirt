@@ -104,8 +104,22 @@ type Manifest struct {
 	// the cluster row without the source cluster. The archived rootfs+config
 	// carries everything else. Empty on VM-disk manifests.
 	ContainerSpecJSON string `json:"container_spec_json,omitempty"`
-	SchemaVersion     int    `json:"schema_version"`
+	// ContentFormat says what the chunks are: ContentGuestRaw (the guest-
+	// visible disk content, read over NBD) or ContentDiskFile (the disk's
+	// image FILE, container header included). Empty on older manifests: the
+	// format is unknown, and nothing may assume either.
+	ContentFormat string `json:"content_format,omitempty"`
+	SchemaVersion int    `json:"schema_version"`
 }
+
+// Manifest.ContentFormat values.
+const (
+	// ContentGuestRaw: raw guest-visible bytes. The guest controls every one
+	// of them, a qcow2-looking header included.
+	ContentGuestRaw = "raw"
+	// ContentDiskFile: the disk's own image file, as stored on the host.
+	ContentDiskFile = "disk-file"
+)
 
 // Repo is an open backup repository. Multiple goroutines may use one
 // Repo concurrently — chunk writes are atomic (tmp+rename) and

@@ -24,10 +24,10 @@ import (
 //   - Full copy every call. Incremental sync arrives with the
 //     scheduler in
 //
-// Block backends (ceph, zfs, iscsi, lvm-thin) return Unimplemented;
-// each will eventually reach for native send/receive primitives
-// (rbd export-diff | rbd import-diff, zfs send | zfs recv) which
-// out-perform a raw byte stream by several orders of magnitude.
+// Block backends (ceph, zfs, iscsi, lvm-thin) return Unimplemented. A
+// native send/receive (rbd export-diff | import-diff, zfs send | recv) would
+// need a receive into a fresh, daemon-derived dataset or image; the old one
+// received into the target POOL NAME and was removed (see below).
 func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.ServerStreamingServer[pb.ReplicateVolumeProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {

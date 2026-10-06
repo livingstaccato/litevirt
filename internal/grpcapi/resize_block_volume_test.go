@@ -37,7 +37,7 @@ func TestResizeDisk_BlockVolumesGrowWithTheirTool(t *testing.T) {
 				}
 			}
 			calls := blockToolCalls(t, log)
-			for _, want := range []string{"zfs set volsize=2147483648 -- tank/acme/vm1-root", "lvextend -L 2147483648b -- vg0/vm1-data"} {
+			for _, want := range []string{"zfs set volsize=2147483648 tank/acme/vm1-root", "lvextend -L 2147483648b -- vg0/vm1-data"} {
 				if !strings.Contains(calls, want) {
 					t.Errorf("tool calls lack %q:\n%s", want, calls)
 				}
@@ -80,5 +80,29 @@ func TestResizeDisk_BlockVolumePathMustBeItsDriversForm(t *testing.T) {
 	}
 	if c := blockToolCalls(t, log); c != "" {
 		t.Errorf("a malformed volume reached a tool:\n%s", c)
+	}
+}
+
+// M3: a block volume whose current size is not recorded is not resized — the
+// "only grow" check cannot be made, and zfs set volsize shrinks — and a size
+// past what any volume can be is refused before any tool runs.
+func TestResizeDisk_BlockVolumeNeedsAKnownSizeAndASaneOne(t *testing.T) {
+	log := fakeBlockTools(t)
+	s, _ := provableCreateServer(t)
+	ctx := adminCtx()
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm1", HostName: s.hostName, State: "stopped"}, nil, []corrosion.DiskRecord{
+		{VMName: "vm1", DiskName: "unknown", HostName: s.hostName, Path: "/dev/zvol/tank/acme/vm1-unknown", SizeBytes: 0, StorageType: "zfs"},
+		{VMName: "vm1", DiskName: "known", HostName: s.hostName, Path: "/dev/vg0/vm1-known", SizeBytes: 1 << 30, StorageType: "lvm-thin"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResizeDisk(ctx, &pb.ResizeDiskRequest{VmName: "vm1", DiskName: "unknown", Size: "2G"}); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("resize of a volume of unknown size: got %v, want FailedPrecondition", err)
+	}
+	if _, err := s.ResizeDisk(ctx, &pb.ResizeDiskRequest{VmName: "vm1", DiskName: "known", Size: "70000T"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("resize to 70000T: got %v, want InvalidArgument", err)
+	}
+	if c := blockToolCalls(t, log); c != "" {
+		t.Errorf("a refused resize ran a tool:\n%s", c)
 	}
 }

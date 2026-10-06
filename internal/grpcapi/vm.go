@@ -3706,6 +3706,15 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 	if storage.IsBlockVolumeDriver(disk.StorageType) {
 		// A zvol or thin LV is grown by its volume manager; qemu-img (or the
 		// qcow2 code) cannot. A running VM's qemu is then told the new size.
+		// zfs set volsize also shrinks, so a volume whose size is not recorded
+		// — nothing to tell a grow from a shrink — is not resized.
+		if disk.SizeBytes <= 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q has no recorded size, so a grow cannot be told from a shrink; it is not resized", req.DiskName, req.VmName)
+		}
+		if newSizeBytes > storage.MaxBlockVolumeBytes {
+			return nil, status.Errorf(codes.InvalidArgument, "size %q is more than %d bytes", req.Size, int64(storage.MaxBlockVolumeBytes))
+		}
 		grown, err := storage.GrowBlockVolume(ctx, disk.StorageType, disk.Path, newSizeBytes)
 		if err != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "resize disk: %v", err)

@@ -14,14 +14,23 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// fakeBlockTools puts zfs, lvs, lvcreate, lvremove and lvextend on PATH. Each logs its
-// argv to the returned file and succeeds; `zfs list` and `lvs` print the
-// object asked for, as the real tools do for one that exists.
+// fakeBlockTools puts zfs, lvs, lvcreate, lvremove and lvextend on PATH. Each
+// logs its argv to the returned file and succeeds; `zfs list` and `lvs` print
+// the object asked for, as the real tools do for one that exists. Each refuses
+// what the real tool refuses:
+//
+//   - `zfs set` (OpenZFS 2.1: no getopt) takes every argument after the
+//     property as a dataset, so a "--" there is "cannot open '--'";
+//   - `lvextend -L` takes a size with an LVM unit suffix.
 func fakeBlockTools(t *testing.T) string {
 	t.Helper()
 	bin := t.TempDir()
 	log := filepath.Join(bin, "calls.log")
-	script := "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> " + log + "\nfor a; do last=$a; done\necho \"$last\"\n"
+	script := "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> " + log + "\n" +
+		"tool=$(basename \"$0\")\n" +
+		"if [ \"$tool\" = zfs ] && [ \"$1\" = set ]; then for a; do [ \"$a\" = -- ] && { echo \"cannot open '--': dataset does not exist\" >&2; exit 1; }; done; fi\n" +
+		"if [ \"$tool\" = lvextend ]; then [ \"$1\" = -L ] && echo \"$2\" | grep -Eq '^[0-9]+[bBsSkKmMgGtTpPeE]?$' || { echo \"lvextend: invalid size\" >&2; exit 3; }; fi\n" +
+		"for a; do last=$a; done\necho \"$last\"\n"
 	for _, tool := range []string{"zfs", "lvs", "lvcreate", "lvremove", "lvextend"} {
 		if err := os.WriteFile(filepath.Join(bin, tool), []byte(script), 0o755); err != nil {
 			t.Fatal(err)

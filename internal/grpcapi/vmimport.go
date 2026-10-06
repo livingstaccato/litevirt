@@ -808,7 +808,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	// Only a file nobody else can write is checked and converted; otherwise
 	// what was checked need not be what qemu-img opens.
-	private, err := privateImportDisk(src, allowedDir)
+	private, err := privateImportDisk(ctx, src, allowedDir)
 	if err != nil {
 		return err
 	}
@@ -827,8 +827,14 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		return err
 	}
 
-	tmp := dst + ".tmp"
-	_ = os.Remove(tmp)
+	// A fresh name of its own, never a fixed "<dst>.tmp" another writer to
+	// the pool directory could plant first.
+	tf, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".convert-*")
+	if err != nil {
+		return fmt.Errorf("create conversion target: %w", err)
+	}
+	tmp := tf.Name()
+	tf.Close()
 	args := []string{"convert", "-p", "-O", "qcow2", "-f", srcFormat, src, tmp}
 
 	cmd := exec.CommandContext(ctx, "qemu-img", args...)

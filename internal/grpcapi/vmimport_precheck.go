@@ -2,6 +2,7 @@ package grpcapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -107,6 +108,12 @@ func staticDiskFormat(file string) (string, error) {
 		return "vpc", nil
 	case bytes.Contains(head, []byte("# Disk DescriptorFile")):
 		return "", fmt.Errorf("a VMDK descriptor names other files; convert the disk to qcow2 first")
+	case bytes.HasPrefix(head, []byte("vhdxfile")),
+		bytes.HasPrefix(head, []byte("QED\x00")),
+		len(head) >= 0x44 && binary.LittleEndian.Uint32(head[0x40:0x44]) == 0xbeda107f:
+		// Converted as raw these would copy their container bytes into a
+		// disk that does not boot.
+		return "", fmt.Errorf("disk is VHDX, QED or VDI, which the import does not convert; convert it to qcow2 or raw first")
 	}
 	if fi, err := f.Stat(); err == nil && fi.Size() >= 512 {
 		foot := make([]byte, 8)
@@ -124,7 +131,7 @@ func staticDiskFormat(file string) (string, error) {
 // before qemu-img opens it. It is copied into importDir, opened without
 // following a link, and must be a plain file; the copy is what is checked and
 // converted.
-func privateImportDisk(src, importDir string) (string, error) {
+func privateImportDisk(ctx context.Context, src, importDir string) (string, error) {
 	// importDir and everything under it is written by the daemon alone, so a
 	// plain file named inside it (as written, or as resolved) is already
 	// private.
@@ -151,7 +158,7 @@ func privateImportDisk(src, importDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if err := copySparse(ctx, out, in); err != nil {
 		out.Close()
 		os.Remove(out.Name())
 		return "", fmt.Errorf("copy disk %s: %w", filepath.Base(src), err)
@@ -161,4 +168,35 @@ func privateImportDisk(src, importDir string) (string, error) {
 		return "", err
 	}
 	return out.Name(), nil
+}
+
+// copySparse copies in to out leaving every all-zero chunk a hole, so a thin
+// disk costs its data rather than its virtual size in the import directory,
+// which usually shares a filesystem with state.db. It stops when ctx ends.
+func copySparse(ctx context.Context, out, in *os.File) error {
+	buf := make([]byte, 1<<20)
+	var off int64
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, rerr := io.ReadFull(in, buf)
+		if n > 0 {
+			if allZero(buf[:n]) {
+				if _, err := out.Seek(int64(n), io.SeekCurrent); err != nil {
+					return err
+				}
+			} else if _, err := out.Write(buf[:n]); err != nil {
+				return err
+			}
+			off += int64(n)
+		}
+		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	return out.Truncate(off)
 }

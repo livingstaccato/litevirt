@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -204,12 +205,117 @@ func TestConvertForeignDisk_RefusesAnOutsideDiskReachedThroughALink(t *testing.T
 
 func TestConvertForeignDisk_RefusesAnOutsideDiskThatIsNotAPlainFile(t *testing.T) {
 	calls := fakeQemuImg(t)
-	staging := t.TempDir()
-	err := convertForeignDisk(context.Background(), staging, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), nil)
+	fifo := filepath.Join(t.TempDir(), "disk.raw")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Outside the import directory, so it reaches the private copy; a FIFO
+	// must be refused there without the open blocking on a writer.
+	err := convertForeignDisk(context.Background(), fifo, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), nil)
 	if err == nil {
-		t.Fatal("a directory was converted, want refusal")
+		t.Fatal("a FIFO was converted, want refusal")
 	}
 	if c := calls(); len(c) != 0 {
 		t.Fatalf("qemu-img ran on a refused disk: %q", c)
+	}
+}
+
+// The private copy keeps a sparse disk sparse: a thin volume staged for
+// import costs its data, not its virtual size, in the import directory (which
+// usually shares a filesystem with state.db).
+func TestPrivateImportDisk_KeepsAnOutsideDiskSparse(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "thin.raw")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const size = 256 << 20
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("data in the middle"), 100<<20); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	importDir := t.TempDir()
+	cp, err := privateImportDisk(context.Background(), src, importDir)
+	if err != nil {
+		t.Fatalf("privateImportDisk: %v", err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Stat(cp, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Size != size {
+		t.Fatalf("copy is %d bytes, want %d", st.Size, size)
+	}
+	if used := st.Blocks * 512; used > 8<<20 {
+		t.Fatalf("copy of a sparse disk allocates %d bytes; the holes were written out", used)
+	}
+	got := make([]byte, 18)
+	g, _ := os.Open(cp)
+	defer g.Close()
+	if _, err := g.ReadAt(got, 100<<20); err != nil || string(got) != "data in the middle" {
+		t.Fatalf("copy lost the data: %q, %v", got, err)
+	}
+}
+
+func TestPrivateImportDisk_StopsWhenTheImportIsCancelled(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "disk.raw")
+	if err := os.WriteFile(src, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	importDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := privateImportDisk(ctx, src, importDir); err == nil {
+		t.Fatal("a cancelled import copied the disk anyway")
+	}
+	if left, _ := os.ReadDir(importDir); len(left) != 0 {
+		t.Fatalf("a cancelled copy was left behind: %v", left)
+	}
+}
+
+// A disk whose header says it is a format the import does not convert is
+// refused, not converted byte for byte as raw into a disk that will not boot.
+func TestStaticDiskFormat_RefusesAFormatItRecognisesButDoesNotImport(t *testing.T) {
+	vdi := make([]byte, 4096)
+	binary.LittleEndian.PutUint32(vdi[0x40:], 0xbeda107f)
+	for name, head := range map[string][]byte{
+		"vhdx": append([]byte("vhdxfile"), make([]byte, 4088)...),
+		"qed":  append([]byte("QED\x00"), make([]byte, 4092)...),
+		"vdi":  vdi,
+	} {
+		p := filepath.Join(t.TempDir(), "disk."+name)
+		if err := os.WriteFile(p, head, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if f, err := staticDiskFormat(p); err == nil {
+			t.Errorf("%s header: read as %q, want refusal", name, f)
+		}
+	}
+}
+
+// The conversion writes to a fresh name of its own, never to a fixed
+// "<dst>.tmp" another writer to the pool directory could plant first.
+func TestConvertForeignDisk_DoesNotWriteThroughAPlantedTempName(t *testing.T) {
+	fakeQemuImg(t)
+	importDir := t.TempDir()
+	src := filepath.Join(importDir, "disk.raw")
+	if err := os.WriteFile(src, make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pool := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("not the import's to write"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(pool, "vm-root.qcow2")
+	if err := os.Symlink(victim, dst+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	_ = convertForeignDisk(context.Background(), src, "raw", dst, importDir, nil)
+	if b, err := os.ReadFile(victim); err != nil || string(b) != "not the import's to write" {
+		t.Fatalf("the conversion wrote through a planted temp name: %q, %v", b, err)
 	}
 }

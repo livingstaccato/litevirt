@@ -393,6 +393,35 @@ func (s *Server) diskImageFromBackup(ctx context.Context, m *pbsstore.Manifest, 
 		}
 		return out, nil
 	}
+	// An overlay backup of a disk that is standalone now (a move flattened it
+	// since): rebuild the disk FLAT from the backup and the base it was taken
+	// on, when that base is recorded, still there and unchanged.
+	if cur, cerr := qcow2.Info(dest.disk.Path); cerr == nil && cur.BackingFile == "" {
+		base, baseFmt, err := s.recordedBackupBase(dest, m)
+		if err != nil {
+			return fail(codes.FailedPrecondition, "in_place: %v; restoring it to a new file still works", err)
+		}
+		if msg, err := exec.CommandContext(ctx, "qemu-img", "rebase", "-u", "-f", "qcow2", "-b", base, "-F", baseFmt, restored).CombinedOutput(); err != nil {
+			return fail(codes.Internal, "in_place: qemu-img rebase: %v: %s", err, strings.TrimSpace(string(msg)))
+		}
+		if err := namesExactly(restored, base, baseFmt); err != nil {
+			return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
+		}
+		rawBase := ""
+		if baseFmt == "raw" {
+			rawBase = base
+		}
+		if err := precheckChain(restored, func(r string) error { return confineTo(r, s.restoreRoots(dest)...) }, rawBase); err != nil {
+			return fail(codes.FailedPrecondition, "in_place: the re-pointed disk file is refused: %v", err)
+		}
+		if msg, err := exec.CommandContext(ctx, "qemu-img", "convert", "-f", "qcow2", "-O", "qcow2", restored, out).CombinedOutput(); err != nil {
+			return fail(codes.Internal, "in_place: qemu-img convert: %v: %s", err, strings.TrimSpace(string(msg)))
+		}
+		if err := qcow2.AssertStandalone(out); err != nil {
+			return fail(codes.FailedPrecondition, "in_place: the rebuilt image is not standalone: %v", err)
+		}
+		return out, nil
+	}
 	backing, backingFmt, err := s.originalDiskBacking(dest, m)
 	if err != nil {
 		return fail(codes.FailedPrecondition, "in_place: %v", err)
@@ -525,6 +554,51 @@ func (s *Server) originalDiskBacking(dest restoreDest, m *pbsstore.Manifest) (st
 		}
 	} else if fi, err := os.Lstat(resolved); err != nil || !fi.Mode().IsRegular() {
 		return "", "", fmt.Errorf("the disk's raw backing %q is not a regular file", resolved)
+	}
+	return resolved, format, nil
+}
+
+// restoreRoots are the directories an in-place restore's bases may live in:
+// the image store and the disk's pool directory.
+func (s *Server) restoreRoots(dest restoreDest) []string {
+	return []string{filepath.Join(s.dataDir, "images"), dest.poolDir}
+}
+
+// recordedBackupBase is the base an overlay backup was taken on, for
+// rebuilding a disk that has been flattened since: the manifest's
+// BaseIdentity, never the backup's header. The base must still exist,
+// resolve to the recorded path inside restoreRoots, and match the recorded
+// size and sha256; its format comes from a record (recordedBackingFormat);
+// a qcow2 base's own chain is pre-checked inside the same roots.
+func (s *Server) recordedBackupBase(dest restoreDest, m *pbsstore.Manifest) (string, string, error) {
+	id := m.BaseIdentity
+	if id == nil {
+		return "", "", fmt.Errorf("the backup is an overlay, disk %s is now standalone (flattened since), and the backup does not record the base it was taken on", dest.disk.Path)
+	}
+	resolved, err := filepath.EvalSymlinks(id.Path)
+	if err != nil {
+		return "", "", fmt.Errorf("the base the backup was taken on (%s) is gone: %w", id.Path, err)
+	}
+	roots := s.restoreRoots(dest)
+	if err := confineTo(resolved, roots...); err != nil {
+		return "", "", err
+	}
+	got, err := fileIdentity(resolved)
+	if err != nil {
+		return "", "", fmt.Errorf("the base the backup was taken on (%s): %w", resolved, err)
+	}
+	if got.Path != id.Path || got.Size != id.Size || got.SHA256 != id.SHA256 {
+		return "", "", fmt.Errorf("the base the backup was taken on (%s, %d bytes, sha256 %s) has changed (%s, %d bytes, sha256 %s)",
+			id.Path, id.Size, id.SHA256, got.Path, got.Size, got.SHA256)
+	}
+	format, _, err := s.recordedBackingFormat(resolved, filepath.Join(s.dataDir, "images"))
+	if err != nil {
+		return "", "", err
+	}
+	if format == "qcow2" {
+		if err := precheckQcow2Input(resolved, func(r string) error { return confineTo(r, roots...) }); err != nil {
+			return "", "", fmt.Errorf("the base's own chain is refused: %w", err)
+		}
 	}
 	return resolved, format, nil
 }

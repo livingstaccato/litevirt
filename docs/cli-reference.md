@@ -512,6 +512,8 @@ lv image pull <url> --name <name> [--format qcow2] [--checksum sha256:...]
 lv image import <file> --name <name>
 #   An image any VM disk (on any host) is built on is never replaced: a pull or
 #   import under that name is refused (FailedPrecondition). Use a new name.
+#   The reconciler's heal of a damaged-looking local copy refuses the same way
+#   (and logs an ERROR naming the disk) instead of swapping it.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls

@@ -558,8 +558,11 @@ a way to overwrite another project's VM disk.
     image. The restored header is re-pointed to the backing without opening
     what the backup named (`qemu-img rebase -u`), and the rebuilt overlay must
     name exactly that backing. An overlay backup of a disk that is now
-    standalone (flattened by a move since) is refused, saying so; restore it
-    to a new file instead.
+    standalone (flattened by a move since) is rebuilt **flat** from the backup
+    and the base it recorded — when that base still exists, inside the image
+    store or the disk's pool directory, with the recorded size and sha256 —
+    and the result must be standalone. A missing, moved or changed base is
+    refused, saying which; restoring to a new file still works.
 
   The restore streams into a temp beside the disk and rebuilds next to it, so
   it needs room for about twice the disk in that directory while it runs.

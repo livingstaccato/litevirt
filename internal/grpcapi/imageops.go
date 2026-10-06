@@ -278,6 +278,14 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 			if ierr != nil || img == nil || img.SizeBytes <= 0 || img.SizeBytes == fi.Size() {
 				return nil
 			}
+			// A copy that any disk on any host is built on is never replaced,
+			// however damaged it looks: the swap would change every such
+			// disk under its delta. Refused before anything is transferred.
+			if err := s.refuseReplacingImageUnderADisk(ctx, imageName); err != nil {
+				slog.Error("auto-pull: local image size mismatch, but disks are built on it; refusing to replace it — repair it by hand",
+					"image", imageName, "local_bytes", fi.Size(), "expected_bytes", img.SizeBytes, "error", err)
+				return err
+			}
 			slog.Warn("auto-pull: local image size mismatch, re-pulling",
 				"image", imageName, "local_bytes", fi.Size(), "expected_bytes", img.SizeBytes)
 		}
@@ -347,11 +355,11 @@ func (s *Server) imageAvailable(ctx context.Context, imageName string) (bool, er
 func (s *Server) pullImageFromPeer(ctx context.Context, imageName, sourceHost string) error {
 	slog.Info("auto-pulling image from peer", "image", imageName, "source", sourceHost, "target", s.hostName)
 
-	client, conn, err := s.peerClient(ctx, sourceHost)
+	client, closeConn, err := s.dialPeer(ctx, sourceHost)
 	if err != nil {
 		return fmt.Errorf("cannot reach source host %s: %w", sourceHost, err)
 	}
-	defer conn.Close()
+	defer closeConn()
 
 	stream, err := client.PushImage(ctx, &pb.PushImageRequest{
 		Name:       imageName,

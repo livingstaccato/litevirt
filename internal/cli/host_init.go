@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/netutil"
 	"gopkg.in/yaml.v3"
 
@@ -341,10 +343,28 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 	if err != nil {
 		return fmt.Errorf("read generated host certificate serial: %w", err)
 	}
-	if _, err := c.AdmitHost(ctx, &pb.AdmitHostRequest{
+	admitted, err := c.AdmitHost(ctx, &pb.AdmitHostRequest{
 		Name: hostName, Address: hostAddr, CertSerial: serial,
-	}); err != nil {
+	})
+	if err != nil {
 		return fmt.Errorf("admit host identity to the cluster: %w", err)
+	}
+	// The name's audit chain position, signed with the CA, so the new machine's
+	// daemon holds its own audit rows until that history has reached it instead
+	// of starting a second chain under an old name. Before setup, which starts
+	// the daemon. A name with no history gets no record — and loses any a
+	// previous machine under the name left behind.
+	rejoin, err := AuditRejoinFile(pkiDir, hostName, admitted)
+	if err != nil {
+		return fmt.Errorf("sign %s's audit admission record: %w", hostName, err)
+	}
+	rejoinPath := filepath.Join(remotePKIDir, corrosion.AuditRejoinFileName)
+	if rejoin != nil {
+		if err := sc.WriteFile(rejoinPath, rejoin, 0644); err != nil {
+			return fmt.Errorf("push %s: %w", corrosion.AuditRejoinFileName, err)
+		}
+	} else if err := sc.Run("rm -f " + ssh.ShellQuote(rejoinPath)); err != nil {
+		return fmt.Errorf("remove a stale %s: %w", corrosion.AuditRejoinFileName, err)
 	}
 	// Admission must replicate before setup starts the daemon. A re-added node's
 	// local database still contains its tombstone; starting it first lets its boot
@@ -380,6 +400,21 @@ func HostAdd(ctx context.Context, c pb.LiteVirtClient, sshTarget string, hostNam
 
 	fmt.Printf("Host %s added to cluster at %s\n", hostName, hostAddr)
 	return nil
+}
+
+// AuditRejoinFile is the CA-signed admission record `lv host add` writes into a
+// re-added machine's pki dir (corrosion.AuditRejoinFileName): the audit chain
+// position the admitting node holds for the name. nil for a name with no
+// history, or from a daemon too old to report one.
+func AuditRejoinFile(pkiDir, hostName string, admitted *pb.AdmitHostResponse) ([]byte, error) {
+	if admitted.GetAuditTailSeq() <= 0 {
+		return nil, nil
+	}
+	rj, err := corrosion.SignAuditRejoin(pkiDir, hostName, admitted.GetAuditTailSeq(), admitted.GetAuditTailHash())
+	if err != nil {
+		return nil, err
+	}
+	return json.MarshalIndent(rj, "", "  ")
 }
 
 // ensureLocalPeer adds a gossip peer address to the local daemon config if not already present.

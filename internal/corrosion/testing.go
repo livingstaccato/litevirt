@@ -381,3 +381,12 @@ func (c *Client) RefoundTableForTest(ctx context.Context, table string, foundedA
 	}
 	return order, crow.Err()
 }
+
+// SetMaxHeldAuditRowsForTest lowers the audit hold's limit for t, so a test can
+// reach AuditHoldFull without holding ten thousand rows.
+func SetMaxHeldAuditRowsForTest(t TestingT, n int) {
+	t.Helper()
+	prev := maxHeldAuditRows
+	maxHeldAuditRows = n
+	t.Cleanup(func() { maxHeldAuditRows = prev })
+}

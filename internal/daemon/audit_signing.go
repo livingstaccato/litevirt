@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -150,9 +152,8 @@ const auditLifecycleSettle = 45 * time.Second
 // The settle alone was not enough: a host rebuilt on an empty database had not
 // caught up 45 seconds in, and every adoption the lab recorded for one started
 // its contract at seq 0. So it also waits for this host's audit chain to have
-// caught up from its peers (corrosion.Client.AuditChainHeld) — the same
-// condition its audit rows are held on, and the one AdoptAuditKey refuses
-// without.
+// arrived (corrosion.Client.AuditChainHeld) — the same condition its audit rows
+// are held on, and the one AdoptAuditKey refuses without.
 func (d *Daemon) finishAuditKeyLifecycle(ctx context.Context) {
 	select {
 	case <-ctx.Done():
@@ -165,13 +166,124 @@ func (d *Daemon) finishAuditKeyLifecycle(ctx context.Context) {
 	d.recordAuditKeyLifecycle(ctx)
 }
 
-// auditHoldPoll is how often a held audit chain is re-checked when nothing new
-// is being audited.
+// auditHoldPoll is how often a held audit chain is re-checked, and its held
+// rows landed, by runAuditHold.
 const auditHoldPoll = 2 * time.Second
 
+// auditHoldReport is how often a hold that has not opened is reported: an ERROR
+// line and the audit_chain_held health condition.
+const auditHoldReport = time.Minute
+
+// Health condition identity for a held audit chain. One writer per row: each
+// node about itself.
+const (
+	auditHoldEvaluator = "audit"
+	// CondAuditChainHeld is raised while this host holds its own audit rows.
+	CondAuditChainHeld = "audit_chain_held"
+)
+
+// configureAuditHold installs this host's audit hold from its admission record.
+func (d *Daemon) configureAuditHold(ctx context.Context) {
+	cfg, err := corrosion.ConfigureAuditHold(ctx, d.db, d.cfg.PKIDir, d.cfg.HostName,
+		filepath.Join(d.cfg.DataDir, corrosion.AuditHoldDirName))
+	if err != nil {
+		slog.Error("this host's audit admission record could not be used; its audit rows are not held, "+
+			"so if it was rebuilt under an old name its first rows may fork its chain",
+			"file", filepath.Join(d.cfg.PKIDir, corrosion.AuditRejoinFileName), "error", err)
+	}
+	if cfg.Target > 0 {
+		slog.Warn("this host was re-added under a name with audit history it does not hold yet; its audit "+
+			"rows are held until that history has arrived from its peers",
+			"host", d.cfg.HostName, "chain_reached_seq", cfg.Target)
+	}
+}
+
+// runAuditHold lands this host's held audit rows once its chain has arrived,
+// off every RPC's path, and until then reports the hold once a minute — at
+// ERROR, and as the audit_chain_held condition — so an operator sees a host
+// whose audit rows are not reaching the cluster. It never opens a hold whose
+// history has not arrived.
+func (d *Daemon) runAuditHold(ctx context.Context) {
+	var lastReport time.Time
+	raised := false
+	for {
+		held, err := d.db.LandHeldAudit(ctx, d.cfg.HostName)
+		if err != nil {
+			slog.Error("could not append this host's held audit rows; they stay held and are retried",
+				"error", err)
+		}
+		if !held {
+			if raised {
+				d.writeAuditHoldCondition(ctx, false, 0, "")
+			}
+			return
+		}
+		if time.Since(lastReport) >= auditHoldReport {
+			lastReport = time.Now()
+			_, count, why := d.db.AuditHoldStatus(ctx, d.cfg.HostName)
+			full := d.db.AuditHoldFull(d.cfg.HostName)
+			slog.Error("this host is holding its own audit rows: they are not in the cluster's audit log "+
+				"until its audit history has arrived from its peers",
+				"host", d.cfg.HostName, "held", count, "full", full, "waiting_for", why)
+			raised = d.writeAuditHoldCondition(ctx, true, count, why) || raised
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(auditHoldPoll):
+		}
+	}
+}
+
+// writeAuditHoldCondition raises or resolves audit_chain_held about this host.
+// Reports whether the row was written.
+func (d *Daemon) writeAuditHoldCondition(ctx context.Context, open bool, count int, why string) bool {
+	ts := time.Now().UTC().Format(time.RFC3339)
+	row, found, err := corrosion.GetHealthCondition(ctx, d.db, auditHoldEvaluator, CondAuditChainHeld, "host", d.cfg.HostName)
+	if err != nil {
+		return false
+	}
+	if !found || row.Lifecycle == corrosion.ConditionResolved {
+		row = corrosion.HealthCondition{
+			Evaluator: auditHoldEvaluator, Code: CondAuditChainHeld,
+			SubjectKind: "host", SubjectID: d.cfg.HostName, FirstSeen: ts,
+		}
+	}
+	row.Hosts = []string{d.cfg.HostName}
+	row.LastSeen = ts
+	row.Reporter = d.cfg.HostName
+	if open {
+		row.Lifecycle = corrosion.ConditionConfirmed
+		if row.ConfirmedAt == "" {
+			row.ConfirmedAt = ts
+		}
+		row.Severity = corrosion.SeverityWarning
+		if d.db.AuditHoldFull(d.cfg.HostName) {
+			row.Severity = corrosion.SeverityCritical
+		}
+		row.ObserveCount++
+		row.CleanCount = 0
+		row.ResolvedAt = ""
+		ev, _ := json.Marshal(map[string]any{"held_rows": count, "waiting_for": why})
+		row.Evidence = string(ev)
+	} else {
+		if !found {
+			return false
+		}
+		row.Lifecycle = corrosion.ConditionResolved
+		row.ResolvedAt = ts
+		row.ObserveCount = 0
+		row.CleanCount = 1
+	}
+	if err := corrosion.UpsertHealthCondition(ctx, d.db, row); err != nil {
+		slog.Warn("could not record the audit_chain_held condition", "error", err)
+		return false
+	}
+	return true
+}
+
 // awaitAuditChainCaughtUp blocks until this host's audit rows are no longer
-// held, polling — which is also what lands the held rows on a node that has
-// stopped auditing anything. False when ctx ends first.
+// held (runAuditHold lands them). False when ctx ends first.
 func (d *Daemon) awaitAuditChainCaughtUp(ctx context.Context) bool {
 	for d.db.AuditChainHeld(ctx, d.cfg.HostName) {
 		select {

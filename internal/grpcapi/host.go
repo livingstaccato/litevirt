@@ -1125,7 +1125,14 @@ func (s *Server) RemoveHost(ctx context.Context, req *pb.RemoveHostRequest) (*em
 // 'active' row for a machine with no daemon yet was a fence candidate as soon
 // as the observers' probes found nothing listening, and the coordinator
 // powered the machine off part-way through its setup (kvm003 drill 6).
-func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*emptypb.Empty, error) {
+//
+// The response carries the name's audit chain position on this node (the last
+// seq and its hash), which `lv host add` signs and hands to the new machine so
+// it does not append to its own chain before that history has reached it
+// (corrosion/audit_hold.go). It is read from THIS replica, so a node that has
+// not caught up refuses: a stale position would let the rebuilt host open its
+// hold early and fork.
+func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*pb.AdmitHostResponse, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
 	}
@@ -1151,6 +1158,13 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 				"remove the workload (`lv rm <vm>`, `lv ct rm <name>`). Then add the host again",
 			req.Name, len(left), strings.Join(left, ", "))
 	}
+	if err := s.requireReplicaCaughtUp(ctx, "AdmitHost"); err != nil {
+		return nil, err
+	}
+	tailSeq, tailHash, err := corrosion.AuditChainTail(ctx, s.db, req.Name)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "read %s's audit chain position: %v", req.Name, err)
+	}
 	err = corrosion.AdmitHost(ctx, s.db, corrosion.HostRecord{
 		Name:       req.Name,
 		Address:    req.Address,
@@ -1164,7 +1178,7 @@ func (s *Server) AdmitHost(ctx context.Context, req *pb.AdmitHostRequest) (*empt
 		return nil, status.Errorf(codes.FailedPrecondition, "admit host: %v", err)
 	}
 	s.publish("host.admitted", req.Name, "cert_serial="+req.CertSerial)
-	return &emptypb.Empty{}, nil
+	return &pb.AdmitHostResponse{AuditTailSeq: tailSeq, AuditTailHash: tailHash}, nil
 }
 
 // hostAllocatedResources returns running-VM CPU and memory, and the DECLARED

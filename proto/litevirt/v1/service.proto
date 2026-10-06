@@ -2838,6 +2838,19 @@ message AdmitHostRequest {
     string cert_serial = 3;
 }
 
+// AdmitHostResponse carries what the admitting node knows of the name's audit
+// chain: the last seq a host under this name wrote, and that row's content hash.
+// Both are zero for a name with no history. `lv host add` signs them with the
+// cluster CA and hands them to the new machine, whose daemon holds its own audit
+// rows until its replica has that row — so a host rebuilt under an old name
+// continues its chain instead of starting a second one. Replaces
+// google.protobuf.Empty, which is wire-compatible: an older daemon's empty
+// response reads as "no history", and an older CLI ignores the fields.
+message AdmitHostResponse {
+    int64 audit_tail_seq = 1;
+    string audit_tail_hash = 2;
+}
+
 // ── Host network configuration (schema v48, §O Tier 1) ──
 // Declarative per-host interface intent, rendered by the OWNING host into the
 // single litevirt-managed netplan file behind a journaled apply-with-rollback.
@@ -2916,7 +2929,7 @@ service LiteVirt {
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
-    rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
+    rpc AdmitHost(AdmitHostRequest)            returns (AdmitHostResponse);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated
     // rows); Plan and Apply are forwarded to the OWNING host — they read and
     // mutate its local netplan state.

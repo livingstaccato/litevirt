@@ -315,7 +315,7 @@ type LiteVirtClient interface {
 	GetClusterHealth(ctx context.Context, in *GetClusterHealthRequest, opts ...grpc.CallOption) (*ClusterHealth, error)
 	GetFenceReadiness(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*FenceReadiness, error)
 	RemoveHost(ctx context.Context, in *RemoveHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
-	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
 	// mutate its local netplan state.
@@ -979,9 +979,9 @@ func (c *liteVirtClient) RemoveHost(ctx context.Context, in *RemoveHostRequest, 
 	return out, nil
 }
 
-func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *liteVirtClient) AdmitHost(ctx context.Context, in *AdmitHostRequest, opts ...grpc.CallOption) (*AdmitHostResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(emptypb.Empty)
+	out := new(AdmitHostResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_AdmitHost_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
@@ -3941,7 +3941,7 @@ type LiteVirtServer interface {
 	GetClusterHealth(context.Context, *GetClusterHealthRequest) (*ClusterHealth, error)
 	GetFenceReadiness(context.Context, *emptypb.Empty) (*FenceReadiness, error)
 	RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error)
-	AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error)
+	AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error)
 	// Host network configuration (v48): intent CRUD runs anywhere (replicated
 	// rows); Plan and Apply are forwarded to the OWNING host — they read and
 	// mutate its local netplan state.
@@ -4517,7 +4517,7 @@ func (UnimplementedLiteVirtServer) GetFenceReadiness(context.Context, *emptypb.E
 func (UnimplementedLiteVirtServer) RemoveHost(context.Context, *RemoveHostRequest) (*emptypb.Empty, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveHost not implemented")
 }
-func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*emptypb.Empty, error) {
+func (UnimplementedLiteVirtServer) AdmitHost(context.Context, *AdmitHostRequest) (*AdmitHostResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method AdmitHost not implemented")
 }
 func (UnimplementedLiteVirtServer) ListHostNetworks(context.Context, *ListHostNetworksRequest) (*ListHostNetworksResponse, error) {

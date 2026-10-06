@@ -1,24 +1,32 @@
-// Fleet scenario: a host removed for good, rebuilt on an empty database and
-// re-added under its OLD name keeps one audit chain, and `lv audit verify`
-// stays clean on every node.
+// Fleet scenario: hosts removed for good, rebuilt on empty databases and re-added
+// under their OLD names keep one audit chain each, and `lv audit verify` stays
+// clean on every node.
 //
-// Observed on the kvm003-f3 lab (drill 6, 2026-10-03 and -04): every rebuilt
-// node's daemon wrote its first audited actions within seconds of starting, on
-// an audit_log that held none of its own history yet. InsertAuditLog chained
-// them onto that empty tail — seq 1, prev_hash "" — a second chain under a host
-// name that already had one, so every node reported a hash mismatch and
-// duplicated sequence numbers for good. Its key adoption, recorded once the
-// daemon's 45 s settle had passed and still before anti-entropy had delivered
-// that history, started the new signing contract at seq 0, which put every
-// unsigned row the host wrote before it first signed under the contract:
-// 98 "unsigned after signed" findings on a log nobody touched.
+// Observed on the kvm003-f3 lab (drill 6, 2026-10-03 and -04): drill 6 destroys
+// three of five nodes and rebuilds them together. Every rebuilt daemon wrote its
+// first audited actions within seconds of starting, on an audit_log that held
+// none of its own history. InsertAuditLog chained them onto that empty tail —
+// seq 1, prev_hash "" — a second chain under a name that already had one, so
+// every node reported a hash mismatch and duplicated seqs for good. Its key
+// adoption, still before anti-entropy had delivered that history, started the
+// new signing contract at seq 0 and put every unsigned row the host wrote before
+// it first signed under the contract: 98 "unsigned after signed" findings on a
+// log nobody touched.
+//
+// The three rebuild TOGETHER is the case that matters: an anti-entropy exchange
+// between two rebuilt nodes completes while both are empty, so "one exchange has
+// completed" says nothing about whether a node holds its own history. What it
+// waits for comes from the admitting node instead (AdmitHostResponse, signed by
+// `lv host add` into the new machine's pki dir).
 package fleet
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,41 +35,48 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// TestFleet_AuditChainSurvivesARebuildUnderTheSameName:
+// TestFleet_AuditChainSurvivesThreeRebuildsUnderTheSameNames:
 //
-//  1. d writes three unsigned rows, starts signing, writes three signed rows and
-//     publishes a chain head; every node holds all of it and verifies clean;
-//  2. d dies, is fence-confirmed and removed with `lv host rm --dead`, which
-//     CA-retires its key at seq 6;
-//  3. the machine is rebuilt on an empty database with a new key, re-added
-//     under the same name and booted. Nothing has replicated into it yet. Its
-//     daemon publishes its startup head (which reads its own chain tail) and
-//     audits two actions straight away, then tries to adopt its key;
-//  4. anti-entropy catches it up, the held rows land and the key is adopted,
-//     and it audits one more action;
-//  5. every node verifies the log clean, and d's new rows continue its old
-//     chain at seq 7, 8 and 9.
-func TestFleet_AuditChainSurvivesARebuildUnderTheSameName(t *testing.T) {
+//  1. each of c, d and e writes two unsigned rows, starts signing, writes two
+//     signed rows and publishes a chain head; every node verifies clean;
+//  2. all three die, are fence-confirmed and removed with `lv host rm --dead`,
+//     which CA-retires each key at seq 4;
+//  3. the three machines are rebuilt on empty databases with new keys and
+//     re-added under the same names; `lv host add` writes each one's signed
+//     admission record. They boot cut off from the survivors, and each audits
+//     two actions straight away and tries to adopt its key;
+//  4. anti-entropy runs among the three rebuilt nodes only: their exchanges
+//     complete against peers as empty as themselves, and nothing may land;
+//  5. the links heal and anti-entropy delivers the history; the held rows land,
+//     each key is adopted, and each node audits one more action;
+//  6. all five nodes verify the log clean, and each rebuilt host's new rows
+//     continue its old chain at seq 5, 6 and 7.
+func TestFleet_AuditChainSurvivesThreeRebuildsUnderTheSameNames(t *testing.T) {
 	ctx := context.Background()
-	c := New(t, Options{Nodes: 3, IndependentReplicas: true, FaultSeed: 4517})
-	a, b, d := c.Nodes[0], c.Nodes[1], c.Nodes[2]
+	c := New(t, Options{Nodes: 5, IndependentReplicas: true, FaultSeed: 4519})
+	a := c.Nodes[0]
+	survivors, lost := c.Nodes[:2], c.Nodes[2:]
 	c.WaitConverged(t, convergeTimeout)
 	for _, n := range c.Nodes {
 		splitMembership(t, n)
 	}
 
-	// 1. History from before d signed, then signed history.
-	for i := 1; i <= 3; i++ {
-		auditRow(t, d, fmt.Sprintf("old-unsigned-%d", i), "vm.start", "vm1")
+	// 1.
+	for _, n := range lost {
+		for i := 1; i <= 2; i++ {
+			auditRow(t, n, fmt.Sprintf("%s-old-unsigned-%d", n.Name, i), "vm.start", "vm1")
+		}
 	}
 	for _, n := range c.Nodes {
 		signNode(t, n)
 	}
-	for i := 1; i <= 3; i++ {
-		auditRow(t, d, fmt.Sprintf("old-signed-%d", i), "vm.stop", "vm1")
-	}
-	if err := corrosion.PublishAuditChainHead(ctx, d.DB, d.Name); err != nil {
-		t.Fatalf("publish %s's chain head: %v", d.Name, err)
+	for _, n := range lost {
+		for i := 1; i <= 2; i++ {
+			auditRow(t, n, fmt.Sprintf("%s-old-signed-%d", n.Name, i), "vm.stop", "vm1")
+		}
+		if err := corrosion.PublishAuditChainHead(ctx, n.DB, n.Name); err != nil {
+			t.Fatalf("publish %s's chain head: %v", n.Name, err)
+		}
 	}
 	convergeByAntiEntropy(t, c, convergeTimeout)
 	for _, n := range c.Nodes {
@@ -70,102 +85,193 @@ func TestFleet_AuditChainSurvivesARebuildUnderTheSameName(t *testing.T) {
 		}
 	}
 
-	// 2. d is lost, confirmed off and removed for good.
-	d.Stop()
-	c.Kill(d)
-	if err := a.DB.Execute(ctx,
-		`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
-		"confirm-"+d.Name, d.Name, "manual", "manual-confirmed",
-		time.Now().Add(-12*time.Minute).UTC().Format(time.RFC3339), "operator confirmation"); err != nil {
-		t.Fatalf("fence-confirm %s: %v", d.Name, err)
-	}
-	if err := corrosion.UpdateHostState(ctx, a.DB, d.Name, "fenced"); err != nil {
-		t.Fatalf("record %s fenced: %v", d.Name, err)
-	}
+	// 2.
 	withOperatorPKI(t, a)
-	if err := cli.HostRemoveDead(ctx, c.SelfClient(a), d.Name, false); err != nil {
-		t.Fatalf("lv host rm --dead %s: %v", d.Name, err)
+	for _, n := range lost {
+		n.Stop()
+		c.Kill(n)
 	}
-	if n := rowCount(t, a, `SELECT count(*) AS n FROM audit_key_lifecycle
-		WHERE host_name = ? AND event = 'retired' AND by_key_id = 'cluster-ca' AND at_seq = 6`, d.Name); n != 1 {
-		t.Fatalf("fixture: `lv host rm` recorded %d CA retirement(s) of %s's key at seq 6, want 1", n, d.Name)
-	}
-
-	// 3. The rebuilt machine, re-added under the same name.
-	serial := rebuildWithEmptyDB(t, c, d, a)
-	if _, err := c.SelfClient(a).AdmitHost(ctx, &pb.AdmitHostRequest{
-		Name: d.Name, Address: d.Address, CertSerial: serial,
-	}); err != nil {
-		t.Fatalf("admit %s again: %v", d.Name, err)
-	}
-	// Nothing reaches the new machine yet: its daemon has just started.
-	for _, p := range c.Nodes {
-		if p != d {
-			c.SetLinkFault(p, d, LinkFault{Block: true})
+	for _, n := range lost {
+		if err := a.DB.Execute(ctx,
+			`INSERT OR IGNORE INTO fencing_log (id, host_name, method, result, timestamp, detail) VALUES (?, ?, ?, ?, ?, ?)`,
+			"confirm-"+n.Name, n.Name, "manual", "manual-confirmed",
+			time.Now().Add(-12*time.Minute).UTC().Format(time.RFC3339), "operator confirmation"); err != nil {
+			t.Fatalf("fence-confirm %s: %v", n.Name, err)
+		}
+		if err := corrosion.UpdateHostState(ctx, a.DB, n.Name, "fenced"); err != nil {
+			t.Fatalf("record %s fenced: %v", n.Name, err)
+		}
+		if err := cli.HostRemoveDead(ctx, c.SelfClient(a), n.Name, false); err != nil {
+			t.Fatalf("lv host rm --dead %s: %v", n.Name, err)
+		}
+		if k := rowCount(t, a, `SELECT count(*) AS n FROM audit_key_lifecycle
+			WHERE host_name = ? AND event = 'retired' AND by_key_id = 'cluster-ca' AND at_seq = 4`, n.Name); k != 1 {
+			t.Fatalf("fixture: `lv host rm` recorded %d CA retirement(s) of %s's key at seq 4, want 1", k, n.Name)
 		}
 	}
-	bootRebuiltNode(t, d, serial)
-	d.DB.MarkReplicaStale("process started on a fresh database (fleet: modelled reinstall)")
-	// The daemon's startup wiring: `lv host add` configured join peers.
-	d.DB.HoldAuditUntilCaughtUp(corrosion.AuditHoldConfig{
-		Host: d.Name, Joiner: true, SpoolDir: filepath.Join(t.TempDir(), corrosion.AuditHoldDirName),
-	})
 
-	// wireAuditKeyring: the rebuilt machine's new key signs from the start.
-	kr := loadKeyring(t, d)
-	d.DB.SetAuditKeyring(kr)
-	// runAuditChainHeads publishes once at startup, reading the chain tail.
-	if err := corrosion.PublishAuditChainHead(ctx, d.DB, d.Name); err != nil {
-		t.Fatalf("startup head on %s: %v", d.Name, err)
+	// 3. Rebuilt and re-added; `lv host add` writes the admission record.
+	keyrings := map[string]*corrosion.AuditKeyring{}
+	serials := map[string]string{}
+	for _, n := range lost {
+		serial := rebuildWithEmptyDB(t, c, n, a)
+		admitted, err := c.SelfClient(a).AdmitHost(ctx, &pb.AdmitHostRequest{
+			Name: n.Name, Address: n.Address, CertSerial: serial,
+		})
+		if err != nil {
+			t.Fatalf("admit %s again: %v", n.Name, err)
+		}
+		if admitted.GetAuditTailSeq() != 4 {
+			t.Fatalf("%s admitted with audit tail %d, want 4", n.Name, admitted.GetAuditTailSeq())
+		}
+		rejoin, err := cli.AuditRejoinFile(cli.PKIDir(), n.Name, admitted)
+		if err != nil {
+			t.Fatalf("sign %s's admission record: %v", n.Name, err)
+		}
+		if err := os.WriteFile(filepath.Join(n.PKIDir, corrosion.AuditRejoinFileName), rejoin, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		serials[n.Name] = serial
 	}
-	auditRow(t, d, "new-1", "cluster.lease_term_tie.acknowledge", "failover")
-	auditRow(t, d, "new-2", "ct.start", "ct1")
-	// Held: nothing of d's has been written on the empty replica.
-	if n := rowCount(t, d, `SELECT count(*) AS n FROM audit_log WHERE host_name = ?`, d.Name); n != 0 {
-		t.Fatalf("%s appended %d audit row(s) to its own chain before it had caught up from its peers", d.Name, n)
+	// Every admission, and each rebuilt machine's boot write, has reached the
+	// other rebuilt machines' hosts tables — as replication between them
+	// delivers it — so the three can dial and authenticate each other.
+	deliverHosts := func(from *Node, where string, args ...any) {
+		rows, err := from.DB.Query(ctx, `SELECT * FROM hosts`+where, args...)
+		if err != nil {
+			t.Fatalf("read %s's host rows: %v", from.Name, err)
+		}
+		for _, n := range lost {
+			if n == from {
+				continue
+			}
+			for _, r := range rows {
+				marks := strings.TrimSuffix(strings.Repeat("?, ", len(r.Columns)), ", ")
+				if _, err := n.DB.DB().Exec(`INSERT OR REPLACE INTO hosts (`+strings.Join(r.Columns, ", ")+`) VALUES (`+marks+`)`,
+					r.Values...); err != nil {
+					t.Fatalf("deliver a host row to %s: %v", n.Name, err)
+				}
+			}
+		}
 	}
-	// finishAuditKeyLifecycle, once its settle has passed: on 4ca641c2 this
-	// adopted from the empty replica, at seq 0.
-	if err := adoptOn(ctx, d, kr); !errors.Is(err, corrosion.ErrAuditChainNotCaughtUp) {
-		t.Fatalf("%s adopted its key before its audit chain caught up (err=%v)", d.Name, err)
+	deliverHosts(a, "")
+	for _, n := range lost {
+		bootRebuiltNode(t, n, serials[n.Name])
+		n.DB.MarkReplicaStale("process started on a fresh database (fleet: modelled reinstall)")
+	}
+	for _, n := range lost {
+		deliverHosts(n, ` WHERE name = ?`, n.Name)
+	}
+	// The fleet's nodes serve on their own ports, which an admission (7443)
+	// does not record, so for step 4 each rebuilt node dials the others where
+	// they are. Put back before the cluster converges: the rows are not logged.
+	type portKey struct{ at, of string }
+	ports := map[portKey]int64{}
+	for _, n := range lost {
+		for _, o := range lost {
+			r, err := n.DB.Query(ctx, `SELECT grpc_port FROM hosts WHERE name = ?`, o.Name)
+			if err != nil || len(r) != 1 {
+				t.Fatalf("%s: read %s's port: %v", n.Name, o.Name, err)
+			}
+			ports[portKey{n.Name, o.Name}] = r[0].Int64("grpc_port")
+			if _, err := n.DB.DB().Exec(`UPDATE hosts SET grpc_port = ? WHERE name = ?`, o.Port, o.Name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	restorePorts := func() {
+		for k, p := range ports {
+			if _, err := c.Node(k.at).DB.DB().Exec(`UPDATE hosts SET grpc_port = ? WHERE name = ?`, p, k.of); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Cut off from the survivors, not from each other.
+	for _, s := range survivors {
+		for _, n := range lost {
+			c.SetLinkFaultBoth(s, n, LinkFault{Block: true})
+		}
+	}
+	for _, n := range lost {
+		// The daemon's startup wiring, in its order.
+		cfg, err := corrosion.ConfigureAuditHold(ctx, n.DB, n.PKIDir, n.Name,
+			filepath.Join(t.TempDir(), corrosion.AuditHoldDirName))
+		if err != nil || cfg.Target != 4 {
+			t.Fatalf("%s: ConfigureAuditHold = %+v, %v; want target 4", n.Name, cfg, err)
+		}
+		kr := loadKeyring(t, n)
+		keyrings[n.Name] = kr
+		n.DB.SetAuditKeyring(kr)
+		if err := corrosion.PublishAuditChainHead(ctx, n.DB, n.Name); err != nil {
+			t.Fatalf("startup head on %s: %v", n.Name, err)
+		}
+		auditRow(t, n, n.Name+"-new-1", "cluster.lease_term_tie.acknowledge", "failover")
+		auditRow(t, n, n.Name+"-new-2", "ct.start", "ct1")
+		if err := adoptOn(ctx, n, kr); !errors.Is(err, corrosion.ErrAuditChainNotCaughtUp) {
+			t.Fatalf("%s adopted its key before its audit history arrived (err=%v)", n.Name, err)
+		}
 	}
 
-	// 4. Catch-up.
-	c.ClearLinkFaults()
-	convergeByAntiEntropy(t, c, 2*convergeTimeout)
-	if ok, why := d.DB.ReplicaCaughtUp(); !ok {
-		t.Fatalf("%s did not catch up: %s", d.Name, why)
+	// 4. The rebuilt nodes exchange with each other only.
+	for _, n := range lost {
+		corrosion.NewAntiEntropy(n.DB, n.PKIDir, 0).RunOnce(ctx)
 	}
-	// awaitAuditChainCaughtUp's poll lands the held rows; then the adoption.
-	if d.DB.AuditChainHeld(ctx, d.Name) {
-		t.Fatalf("%s still holds its audit rows after catching up", d.Name)
+	caughtUp := 0
+	for _, n := range lost {
+		if ok, _ := n.DB.ReplicaCaughtUp(); ok {
+			caughtUp++
+		}
+		if held, err := n.DB.LandHeldAudit(ctx, n.Name); err != nil || !held {
+			t.Fatalf("%s stopped holding after exchanging only with other empty rebuilt nodes (held=%v, %v)",
+				n.Name, held, err)
+		}
+		if k := rowCount(t, n, `SELECT count(*) AS n FROM audit_log WHERE host_name = ?`, n.Name); k != 0 {
+			t.Fatalf("%s appended %d row(s) to its own chain before its history arrived", n.Name, k)
+		}
 	}
-	if err := adoptOn(ctx, d, kr); err != nil {
-		t.Fatalf("adopt %s's key once caught up: %v", d.Name, err)
+	if caughtUp == 0 {
+		t.Fatal("fixture: no rebuilt node completed an exchange with another; step 4 tested nothing")
 	}
-	auditRow(t, d, "new-3", "vm.repair-owner", "vm1")
-	convergeByAntiEntropy(t, c, 2*convergeTimeout)
 
 	// 5.
-	for _, n := range []*Node{a, b, d} {
-		res := verifyOn(t, n)
+	restorePorts()
+	c.ClearLinkFaults()
+	convergeByAntiEntropy(t, c, 2*convergeTimeout)
+	for _, n := range lost {
+		// runAuditHold's poll lands the held rows; then the adoption.
+		if held, err := n.DB.LandHeldAudit(ctx, n.Name); err != nil || held {
+			t.Fatalf("%s still holds its audit rows after its history arrived (%v)", n.Name, err)
+		}
+		if err := adoptOn(ctx, n, keyrings[n.Name]); err != nil {
+			t.Fatalf("adopt %s's key once caught up: %v", n.Name, err)
+		}
+		auditRow(t, n, n.Name+"-new-3", "vm.repair-owner", "vm1")
+	}
+	convergeByAntiEntropy(t, c, 2*convergeTimeout)
+
+	// 6.
+	for _, v := range c.Nodes {
+		res := verifyOn(t, v)
 		if res.Tampered() || res.Unverified() {
-			t.Errorf("%s: the rebuilt %s's chain does not verify clean:\n  broken_at=%q seq_gaps=%v\n  "+
+			t.Errorf("%s: the rebuilt hosts' chains do not verify clean:\n  broken_at=%q seq_gaps=%v\n  "+
 				"unsigned_after_signed=%v\n  retired_key_use=%v truncated=%v never_adopted=%v",
-				n.Name, d.Name, res.BrokenAt, res.SeqGaps, res.UnsignedAfterSigned,
+				v.Name, res.BrokenAt, res.SeqGaps, res.UnsignedAfterSigned,
 				res.RetiredKeyUse, res.TruncatedHosts, res.NeverAdopted)
 		}
-		for i, id := range []string{"new-1", "new-2", "new-3"} {
-			rows, err := n.DB.Query(ctx, `SELECT seq, signature FROM audit_log WHERE id = ?`, id)
-			if err != nil || len(rows) != 1 {
-				t.Fatalf("%s: read %s: %d rows, %v", n.Name, id, len(rows), err)
-			}
-			if got, want := rows[0].Int64("seq"), int64(7+i); got != want {
-				t.Errorf("%s: %s is at seq %d, want %d (after the six rows the old machine wrote)",
-					n.Name, id, got, want)
-			}
-			if rows[0].String("signature") == "" {
-				t.Errorf("%s: %s is unsigned", n.Name, id)
+		for _, n := range lost {
+			for i := 1; i <= 3; i++ {
+				id := fmt.Sprintf("%s-new-%d", n.Name, i)
+				rows, err := v.DB.Query(ctx, `SELECT seq, signature FROM audit_log WHERE id = ?`, id)
+				if err != nil || len(rows) != 1 {
+					t.Fatalf("%s: read %s: %d rows, %v", v.Name, id, len(rows), err)
+				}
+				if got, want := rows[0].Int64("seq"), int64(4+i); got != want {
+					t.Errorf("%s: %s is at seq %d, want %d (after the four rows the old machine wrote)",
+						v.Name, id, got, want)
+				}
+				if rows[0].String("signature") == "" {
+					t.Errorf("%s: %s is unsigned", v.Name, id)
+				}
 			}
 		}
 	}

@@ -88,7 +88,7 @@ them.
 
 ### The global library
 
-Every host has a pool named `isos` with no project, at `<data_dir>/isos`,
+Every host has a pool named `isos` with no project, at `<data_dir>/pools/isos`,
 which the daemon creates when the host has none. Every project may boot from
 it. Only an Admin writes it (`storage.library.write` at `/`): an upload in the
 UI's Browse dialog or `lv iso pull` (below). No other pool may be created in,
@@ -166,7 +166,7 @@ first, then the global library. `lv iso rm <pool>/<file>.iso` removes one.
 
 Some files are refused to everyone, Admin included, judged as written and after
 resolving symlinks: the PKI directory, anything in the data directory outside
-`disks/`, `mounts/` and `isos/` (`state.db`, `cloudinit/`, `nvram/`, …), and
+`disks/`, `mounts/` and `pools/isos/` (`state.db`, `cloudinit/`, `nvram/`, …), and
 anything under `/boot`, `/dev`, `/etc`, `/home`, `/proc`, `/root`, `/run`,
 `/sys`, `/var/backups`, `/var/run`, `/var/spool`, `/var/lib/lxc`,
 `/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`.

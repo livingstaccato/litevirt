@@ -49,3 +49,29 @@ func TestCheckReadFile_RefusedAndAllowed(t *testing.T) {
 		t.Errorf("an unclean but harmless stored path refused: %v", err)
 	}
 }
+
+// The built-in global ISO library lives at <data_dir>/pools/isos, and a guest
+// may be given a file there; the rest of the data directory stays refused.
+func TestCheckReadFile_TheGlobalISOLibraryDirectory(t *testing.T) {
+	data := t.TempDir()
+	for _, d := range []string{filepath.Join(data, ISOLibraryDir), filepath.Join(data, "isos"), filepath.Join(data, "pools", "other")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lib := filepath.Join(data, ISOLibraryDir, "debian.iso")
+	for _, p := range []string{lib, filepath.Join(data, "isos", "x.iso"), filepath.Join(data, "pools", "other", "x.iso")} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := CheckReadFile(lib, data, ""); err != nil {
+		t.Errorf("the global library file refused: %v", err)
+	}
+	if err := CheckReadFile(filepath.Join(data, "isos", "x.iso"), data, ""); err == nil {
+		t.Error("<data_dir>/isos allowed; the library is pools/isos")
+	}
+	if err := CheckWriteRoot(filepath.Join(data, ISOLibraryDir), data, ""); err == nil {
+		t.Error("a pool may be created over the global library's directory")
+	}
+}

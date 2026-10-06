@@ -1887,7 +1887,7 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 }
 
 // ensureGlobalISOLibrary gives this host the built-in global ISO library pool
-// ("isos", no project, <data_dir>/isos) when it has no pool of that name. An
+// ("isos", no project, <data_dir>/pools/isos) when it has no pool of that name. An
 // operator who puts the library on shared storage replaces the row with
 // `lv pool create isos --driver nfs ... --option content=iso` on each host,
 // which this then leaves alone.

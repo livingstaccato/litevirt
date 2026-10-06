@@ -75,9 +75,20 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		return client.ListStoragePoolContents(ctx, req)
 	}
 
+	contents, err := s.poolContents(ctx, rec)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.ListStoragePoolContentsResponse{Contents: contents}, nil
+}
+
+// poolContents lists the files of a pool on this host, sorted by name: the
+// one listing of pool content, which the content browser and the ISO library
+// listing (listLibrary) both go through. Block-backed pools have no browsable
+// file directory and list nothing.
+func (s *Server) poolContents(_ context.Context, rec corrosion.StoragePoolRecord) ([]*pb.StoragePoolContent, error) {
 	if !isFileBasedDriver(rec.Driver) {
-		// Block-backed pool: no browsable file directory.
-		return &pb.ListStoragePoolContentsResponse{}, nil
+		return nil, nil
 	}
 	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
 	if err != nil {
@@ -86,12 +97,11 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return &pb.ListStoragePoolContentsResponse{}, nil
+			return nil, nil
 		}
 		return nil, status.Errorf(codes.Internal, "read pool dir: %v", err)
 	}
-
-	resp := &pb.ListStoragePoolContentsResponse{}
+	var out []*pb.StoragePoolContent
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -101,7 +111,7 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 			continue
 		}
 		name := e.Name()
-		resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
+		out = append(out, &pb.StoragePoolContent{
 			Name:       name,
 			Path:       filepath.Join(dir, name),
 			SizeBytes:  info.Size(),
@@ -109,8 +119,8 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 			IsIso:      strings.HasSuffix(strings.ToLower(name), ".iso"),
 		})
 	}
-	sort.Slice(resp.Contents, func(i, j int) bool { return resp.Contents[i].Name < resp.Contents[j].Name })
-	return resp, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
 }
 
 // DeleteStoragePoolContent removes one file from a file-based pool (forwarded

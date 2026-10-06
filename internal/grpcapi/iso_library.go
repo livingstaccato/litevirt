@@ -504,12 +504,13 @@ func (s *Server) listLibrary(ctx context.Context, p corrosion.StoragePoolRecord)
 	}
 	var out []*pb.ISOEntry
 	seen := map[string]bool{}
-	entries, _ := os.ReadDir(dir)
-	for _, de := range entries {
-		name := de.Name()
-		if !isISOName(name) || safename.ValidateName(name) != nil {
+	contents, _ := s.poolContents(ctx, p)
+	for _, c := range contents {
+		name := c.GetName()
+		if !c.GetIsIso() || !isISOName(name) || safename.ValidateName(name) != nil {
 			continue
 		}
+		// What a VM could boot: a plain, singly-linked file in the library.
 		path := filepath.Join(dir, name)
 		fi, err := os.Lstat(path)
 		if err != nil || !fi.Mode().IsRegular() {

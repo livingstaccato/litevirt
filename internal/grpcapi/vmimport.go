@@ -100,6 +100,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
+	// From here to the last converted disk the import writes; one import at a
+	// time per host, so its free-space checks hold.
+	releaseWrites, err := s.acquireImportWrites(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseWrites()
+
 	// ── Parse via the source adapter → ForeignVM ──
 	fv, err := s.parseImportSource(ctx, first.SourceFormat, srcPath, importDir)
 	if err != nil {
@@ -181,6 +189,21 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		dst := lv.DiskPath(poolDir, name, d.Name) // poolDir/<vm>-<disk>.qcow2 (poolDir already the disks dir)
 		dst = filepath.Join(poolDir, name+"-"+d.Name+".qcow2")
 		curDisk := d.Name
+		// The conversion writes up to the disk's limit into the pool, and a
+		// disk from outside the import directory is first copied privately.
+		limit := uint64(importSourceLimit(d.CapacityBytes))
+		need := limit
+		if !inImportDir(importDir, d.LocalPath) {
+			if err := s.requireImportSpace(importDir, limit, "a private copy of disk "+d.Name); err != nil {
+				cleanupDisks()
+				return err
+			}
+			need += limit
+		}
+		if err := s.requireImportSpace(poolDir, need, "converting disk "+d.Name); err != nil {
+			cleanupDisks()
+			return err
+		}
 		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
 			_ = stream.Send(&pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk})
 		}); err != nil {

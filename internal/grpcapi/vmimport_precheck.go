@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -264,4 +265,37 @@ func (s *Server) importExtractBudget(importDir string) uint64 {
 		return 0
 	}
 	return avail - headroom
+}
+
+// acquireImportWrites waits for this host's one import write slot: an import
+// holds it from unpacking its source to the last converted disk. Each free-space
+// check before a write is a glance at the filesystem; two imports that glanced
+// together would both pass against space only one of them can have. Waiting
+// ends with ctx. The release is safe to call more than once.
+func (s *Server) acquireImportWrites(ctx context.Context) (func(), error) {
+	s.importWriteOnce.Do(func() { s.importWriteSlot = make(chan struct{}, 1) })
+	select {
+	case s.importWriteSlot <- struct{}{}:
+		var once sync.Once
+		return func() { once.Do(func() { <-s.importWriteSlot }) }, nil
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Aborted, "waiting for another import on %s to finish writing: %v", s.hostName, ctx.Err())
+	}
+}
+
+// requireImportSpace refuses an import write of need bytes into dir that would
+// leave less than the headroom a cold migration also keeps: the filesystem
+// usually holds state.db and thin disks that pause their guests when it fills.
+func (s *Server) requireImportSpace(dir string, need uint64, what string) error {
+	avail, total, err := s.diskSpace(dir)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "%s: cannot read the free space on %s: %v", what, s.hostName, err)
+	}
+	headroom := coldDiskHeadroom(total)
+	if avail < need || avail-need < headroom {
+		return status.Errorf(codes.FailedPrecondition,
+			"%s needs %d MiB on %s, which has %d MiB free; an import leaves at least %d MiB free there",
+			what, need>>20, s.hostName, avail>>20, headroom>>20)
+	}
+	return nil
 }

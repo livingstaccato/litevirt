@@ -1437,14 +1437,16 @@ audit log, so `lv audit ls` elsewhere does not show what was done on it.
 
 | Raised when | Clears when |
 |---|---|
-| The host's admission record (`<pki_dir>/audit-rejoin.json`) names a row of its chain its replica does not hold; re-raised once a minute while held. **Warning**; **critical** once the hold is full (10000 rows), when the host refuses every audited client action and login with `Unavailable`. The evidence carries `held_rows` and `waiting_for`. | The recorded row has arrived and every held row has landed. |
+| The host's admission record (`<pki_dir>/audit-rejoin.json`) names a row of its chain its replica does not hold; re-raised once a minute while held. **Warning**; **critical** once the hold is full (10000 rows), when the host refuses every audited client action and login with `Unavailable`. The evidence carries `held_rows` and `waiting_for`. | The recorded row, and a row at every seq below it, have arrived, and every held row has landed. |
 
 **If it does not clear,** the host cannot reach a peer holding its history:
 check `lv health` for replication and gossip, and that the survivors are
 reachable from it. `waiting_for` saying the row "does not hash" means the
 replica holds a different history than the cluster had for the name — the
 hold stays closed rather than fork the chain; investigate before anything else.
-If no node will ever hold the history, removing `<pki_dir>/audit-rejoin.json`
+`waiting_for` naming a missing seq means the row below the recorded one has not
+arrived; if no node holds it, the history has a gap and the hold cannot open by
+itself. If no node will ever hold the history, removing `<pki_dir>/audit-rejoin.json`
 on the host and restarting its daemon ends the hold at the cost of a permanent
 fork finding for that host
 ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).

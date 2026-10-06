@@ -584,9 +584,19 @@ node refuses with `Unavailable` when it cannot vouch for it:
 
 - it is itself holding its own audit rows (a rebuilt host whose history has not
   arrived — so other names' history has not either);
-- its replica has not completed an exchange with a peer, unless it founded the
-  cluster and is alone in it. Being alone is not enough for a node that joined:
-  a rebuilt host at first boot sees only its own host row;
+- its replica is not **seeded**. A replica is seeded when it founded the
+  cluster, when it already held its own audit history the first time a build
+  with this check ran on it (an existing member at a rolling upgrade), or once
+  it has completed an anti-entropy exchange with a peer that reported itself
+  seeded and not holding its rows. Neither "has completed an exchange" nor "is
+  alone" is enough: drill 6 rebuilds three hosts together, and a rebuilt host's
+  first exchange can be with another rebuilt host as empty as itself, while at
+  first boot its hosts table names only itself. The marker is local, never
+  replicated, kept as `<data_dir>/audit-seeded.json` and bound to the state.db
+  it was written for, so a lost or replaced state.db is not seeded. A peer on an
+  older build reports nothing and does not seed;
+- its replica has not caught up since the daemon started, unless it is alone in
+  the cluster (a founder adding its first host has nobody to catch up with);
 - the name's tail on it is below a retirement the cluster CA recorded for the
   name's key (the one `lv host rm` writes): it is behind the node that removed
   the host.
@@ -606,7 +616,9 @@ hold, every row the host audits is **held**: written to `<data_dir>/audit-hold/`
 mode 0700, one fsynced file per row, never replicated. The hold opens once the
 local replica holds the row at the recorded seq with the recorded hash **and a
 row at every seq below it**, from whichever peers delivered them —
-anti-entropy does not deliver a chain in order. While held, the startup reseal
+anti-entropy does not deliver a chain in order. If a seq below it is missing on
+every node — a gap in the history itself — the hold cannot open by itself;
+`waiting_for` names the lowest missing seq. While held, the startup reseal
 of unsigned legacy rows is skipped: resealing rows 1 and 3 without row 2 would
 rewrite row 3, and the rewrite replicates over every peer's good copy. Held
 rows land only after the signing keyring is installed, so they are signed. Held rows then land in the order they were held
@@ -630,10 +642,11 @@ minute and raises the `audit_chain_held` health condition about itself (warning,
 critical once full), so `lv health` shows a host whose actions are not yet in
 the cluster's audit log. It resolves when the held rows have landed.
 
-**Leaving a hold that can never open** is a decision with a permanent cost. Two
+**Leaving a hold that can never open** is a decision with a permanent cost. Three
 cases get there: no reachable node holds the host's history (the other node of
-a two-node cluster is gone for good), or the recorded row is present but hashes
-differently (`waiting_for` says it "does not hash"), meaning this replica holds
+a two-node cluster is gone for good); the history has a gap below the recorded
+row (`waiting_for` names the missing seq); or the recorded row is present but
+hashes differently (`waiting_for` says it "does not hash"), meaning this replica holds
 a different history than the cluster had for the name. Investigate the second
 before anything else. The way out, as root on the held host:
 

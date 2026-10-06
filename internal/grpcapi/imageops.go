@@ -110,6 +110,7 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 	// built on — except to heal that file with content byte-identical to its
 	// recorded identity (image.Store.Publish). A peer's push (the
 	// reconciler's heal, autoPullImage) arrives here too.
+	s.recordImageProvenance(ctx, name)
 	pub, err := s.images.Publish(name, tmpFile.Name(), strings.TrimPrefix(got, "sha256:"))
 	if err != nil {
 		return status.Errorf(codes.Internal, "publish image: %v", err)
@@ -488,6 +489,7 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "hash image: %v", err)
 	}
+	s.recordImageProvenance(ctx, req.ImageName)
 	pub, err := s.images.Publish(req.ImageName, destPath, digest)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "publish image: %v", err)

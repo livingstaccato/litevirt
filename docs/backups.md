@@ -558,9 +558,14 @@ a way to overwrite another project's VM disk.
     restore onto a base that has changed since is refused, naming both. A
     backup taken before that was recorded is restored onto a base that cannot
     change under its name (a replica, a template's disk), and onto an image
-    only when the image's own records show it unchanged since the backup:
-    this host's copy was pulled or imported no later than the backup, and
-    the image's recorded checksum is its file's sha256 now. Otherwise it is
+    only when the provenance of the very file the disk is built on shows it
+    unchanged since the backup: that file was written on this host no later
+    than the backup, and its bytes still have the sha256 recorded for it.
+    Each image-store file carries that record (`<file>.sha256`); a file an
+    earlier build left is given one when first seen — its sha256 then, and
+    the later of this host's pull time for the image and the file's mtime.
+    A refresh of the image name, here or on another host, writes another
+    file and does not affect it. Otherwise it is
     refused, saying which, and restoring to a new file still works. The
     restored header is re-pointed to the backing without opening
     what the backup named (`qemu-img rebase -u`), and the rebuilt overlay must

@@ -223,6 +223,12 @@ func (s *Server) replicateVolumeNative(ctx context.Context, req *pb.ReplicateVol
 		if srcOpts == nil {
 			srcOpts = map[string]string{}
 		}
+	} else if o := rbdPathOptions(src.Path); len(o) > 0 {
+		// A pool-less ceph disk names its cluster and identity in its own
+		// path (rbd:<pool>/<image>:conf=…:keyring=…:id=…): its source side
+		// runs with those. With none there, it is the destination's cluster,
+		// as before.
+		srcOpts = o
 	}
 	if err := rep.Replicate(ctx, storage.ReplicateOptions{
 		SrcRef: srcRef, DstRef: dstRef, SrcOptions: srcOpts,
@@ -267,4 +273,26 @@ func nativeRefs(src *corrosion.DiskRecord, dstPool StoragePoolRef, leaf string) 
 		return img, dstPool.Source + "/" + leaf, nil
 	}
 	return "", "", fmt.Errorf("driver %q has no native replication", src.StorageType)
+}
+
+// rbdPathOptions is the conf, keyring and id an "rbd:<pool>/<image>[:k=v...]"
+// disk path names for its cluster.
+func rbdPathOptions(path string) map[string]string {
+	rest, ok := strings.CutPrefix(path, "rbd:")
+	if !ok {
+		return nil
+	}
+	parts := strings.Split(rest, ":")
+	out := map[string]string{}
+	for _, kv := range parts[1:] {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || v == "" {
+			continue
+		}
+		switch k {
+		case "conf", "keyring", "id":
+			out[k] = v
+		}
+	}
+	return out
 }

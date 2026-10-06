@@ -93,6 +93,7 @@ const (
 	LiteVirt_ImportImage_FullMethodName                = "/litevirt.v1.LiteVirt/ImportImage"
 	LiteVirt_PushImage_FullMethodName                  = "/litevirt.v1.LiteVirt/PushImage"
 	LiteVirt_BuildImage_FullMethodName                 = "/litevirt.v1.LiteVirt/BuildImage"
+	LiteVirt_PruneImages_FullMethodName                = "/litevirt.v1.LiteVirt/PruneImages"
 	LiteVirt_BackupVM_FullMethodName                   = "/litevirt.v1.LiteVirt/BackupVM"
 	LiteVirt_RestoreVM_FullMethodName                  = "/litevirt.v1.LiteVirt/RestoreVM"
 	LiteVirt_ImportVM_FullMethodName                   = "/litevirt.v1.LiteVirt/ImportVM"
@@ -425,6 +426,7 @@ type LiteVirtClient interface {
 	ImportImage(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[ImportImageRequest, ImportImageResponse], error)
 	PushImage(ctx context.Context, in *PushImageRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PushImageProgress], error)
 	BuildImage(ctx context.Context, in *BuildImageRequest, opts ...grpc.CallOption) (*BuildImageResponse, error)
+	PruneImages(ctx context.Context, in *PruneImagesRequest, opts ...grpc.CallOption) (*PruneImagesResponse, error)
 	// ── Backup ──
 	BackupVM(ctx context.Context, in *BackupVMRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupChunk], error)
 	RestoreVM(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RestoreVMRequest, VM], error)
@@ -1718,6 +1720,16 @@ func (c *liteVirtClient) BuildImage(ctx context.Context, in *BuildImageRequest, 
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(BuildImageResponse)
 	err := c.cc.Invoke(ctx, LiteVirt_BuildImage_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PruneImages(ctx context.Context, in *PruneImagesRequest, opts ...grpc.CallOption) (*PruneImagesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneImagesResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PruneImages_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -4091,6 +4103,7 @@ type LiteVirtServer interface {
 	ImportImage(grpc.ClientStreamingServer[ImportImageRequest, ImportImageResponse]) error
 	PushImage(*PushImageRequest, grpc.ServerStreamingServer[PushImageProgress]) error
 	BuildImage(context.Context, *BuildImageRequest) (*BuildImageResponse, error)
+	PruneImages(context.Context, *PruneImagesRequest) (*PruneImagesResponse, error)
 	// ── Backup ──
 	BackupVM(*BackupVMRequest, grpc.ServerStreamingServer[BackupChunk]) error
 	RestoreVM(grpc.ClientStreamingServer[RestoreVMRequest, VM]) error
@@ -4755,6 +4768,9 @@ func (UnimplementedLiteVirtServer) PushImage(*PushImageRequest, grpc.ServerStrea
 }
 func (UnimplementedLiteVirtServer) BuildImage(context.Context, *BuildImageRequest) (*BuildImageResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BuildImage not implemented")
+}
+func (UnimplementedLiteVirtServer) PruneImages(context.Context, *PruneImagesRequest) (*PruneImagesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneImages not implemented")
 }
 func (UnimplementedLiteVirtServer) BackupVM(*BackupVMRequest, grpc.ServerStreamingServer[BackupChunk]) error {
 	return status.Error(codes.Unimplemented, "method BackupVM not implemented")
@@ -6572,6 +6588,24 @@ func _LiteVirt_BuildImage_Handler(srv interface{}, ctx context.Context, dec func
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(LiteVirtServer).BuildImage(ctx, req.(*BuildImageRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PruneImages_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneImagesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PruneImages(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PruneImages_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PruneImages(ctx, req.(*PruneImagesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -10361,6 +10395,10 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BuildImage",
 			Handler:    _LiteVirt_BuildImage_Handler,
+		},
+		{
+			MethodName: "PruneImages",
+			Handler:    _LiteVirt_PruneImages_Handler,
 		},
 		{
 			MethodName: "CreateSnapshot",

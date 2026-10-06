@@ -73,6 +73,11 @@ func precheckChain(path string, rule chainRule) ([]string, error) {
 		if depth > maxBackingDepth {
 			return nil, fmt.Errorf("backing chain deeper than %d", maxBackingDepth)
 		}
+		// A regular file only, judged by stat before anything opens it (a
+		// FIFO would block the open, a device is no image).
+		if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is not a regular file", path)
+		}
 		if err := precheckQcow2Header(path); err != nil {
 			return nil, err
 		}
@@ -96,6 +101,9 @@ func precheckChain(path string, rule chainRule) ([]string, error) {
 		resolved, err := filepath.EvalSymlinks(b)
 		if err != nil {
 			return nil, fmt.Errorf("%s: backing file %q: %w", path, info.BackingFile, err)
+		}
+		if fi, err := os.Stat(resolved); err != nil || !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s: backing %q is not a regular file", path, resolved)
 		}
 		if info.BackingFormat != "qcow2" && info.BackingFormat != "raw" {
 			return nil, fmt.Errorf("%s names backing file %q with format %q; only a declared qcow2 or (recorded) raw backing is accepted",
@@ -158,34 +166,50 @@ func confineTo(resolved string, roots ...string) error {
 // before a copy, move, replication, clone, migration, image build or in-place
 // restore reads it. A layer may be:
 //
-//   - in the image store, and then standalone (no backing, no external data
-//     file): an image is a base, never a way to name another file;
+//   - in the image store, with no external data file, its own backing (if
+//     any) another image-store file: an image is a base, never a way to name
+//     any other file;
 //   - exactly the backing_disk recorded on the layer naming it — d's own
 //     record for d's file, or any disk row whose path is that layer: a
 //     linked clone's template disk (in whichever pool, of whichever project
 //     the clone was authorized from), a --no-localize promotion's replica.
-//     A backing declared raw is accepted ONLY this way;
+//     A backing declared raw is accepted only this way, or as the replica
+//     under a VM an earlier build promoted with --no-localize
+//     (legacyPromotedRaw);
 //   - in the directory of a file-based pool on this host that d's VM's project
 //     may use (global, or owned by that project), or d's own pool;
 //   - in <data_dir>/disks or d's own directory (outside those pools) only as a
 //     file the VM's project owns by record — a disk row of a VM in that
-//     project, or that project's recorded replica — or as the base an external
-//     snapshot of d's VM left (same directory and stem, the layer named after
-//     one of the VM's recorded snapshots).
+//     project, or that project's recorded replica — or as the base an
+//     external snapshot of d's VM left (snapshotBase).
 //
-// Paths are compared resolved through symlinks. Under the hostDiskRoot test
-// seam, records name files as a host would, and are mapped onto it.
+// Paths are compared resolved through symlinks. Rows are this host's, unless
+// the file is on shared storage. Under the hostDiskRoot test seam, records
+// name files as a host would, and are mapped onto it.
 func (s *Server) diskChainRule(ctx context.Context, d corrosion.DiskRecord) chainRule {
+	return s.newDiskChain(ctx, d).judge
+}
+
+func (s *Server) newDiskChain(ctx context.Context, d corrosion.DiskRecord) *diskChain {
 	c := &diskChain{s: s, ctx: ctx, d: d, projects: map[string]string{}}
 	c.project = c.projectOf(d.VMName)
 	c.self = resolvedOr(s.hostDiskFile(d.Path))
 	c.images = s.rootsAsFound(filepath.Join(s.dataDir, "images"))
 	c.pools = s.chainPoolDirs(ctx, d, c.project)
+	if pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName); err == nil {
+		for _, p := range pools {
+			if strings.EqualFold(p.Driver, "nfs") {
+				if dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target}); err == nil {
+					c.shared = append(c.shared, s.rootsAsFound(dir)...)
+				}
+			}
+		}
+	}
 	c.own = s.rootsAsFound(filepath.Join(s.dataDir, "disks"))
 	if dir := filepath.Dir(d.Path); !atOrWithinAny(resolvedOr(s.hostDiskFile(dir)), c.pools) {
 		c.own = append(c.own, s.rootsAsFound(dir)...)
 	}
-	return c.judge
+	return c
 }
 
 type diskChain struct {
@@ -196,21 +220,31 @@ type diskChain struct {
 	self     string
 	images   []string
 	pools    []string
+	shared   []string // this host's shared (nfs) pool directories
 	own      []string
 	projects map[string]string // vm → normalized project ("" unknown)
 }
 
 func (c *diskChain) judge(layer, resolved, format string) error {
-	if withinAny(resolved, c.images) {
-		if err := qcow2.AssertStandalone(resolved); err != nil {
+	inImages := withinAny(resolved, c.images)
+	if withinAny(layer, c.images) && !inImages {
+		// An image is a base: it may be built only on another image in the
+		// store (a layered image), never name any other file.
+		return fmt.Errorf("image-store layer %q is refused: it names %q, outside the image store", layer, resolved)
+	}
+	if inImages {
+		if err := qcow2.AssertNoExternalData(resolved); err != nil {
 			return fmt.Errorf("image-store layer %q is refused: %w", resolved, err)
 		}
-		return nil
+		return nil // its own backing, if any, is judged next, as an image-store layer
 	}
 	if c.recordedBacking(layer, resolved) {
 		return nil
 	}
 	if format == "raw" {
+		if c.legacyPromotedRaw(layer, resolved) {
+			return nil
+		}
 		return fmt.Errorf("%s names a raw backing %q that is not the backing_disk recorded for it", layer, resolved)
 	}
 	if withinAny(resolved, c.pools) {
@@ -257,29 +291,109 @@ func (c *diskChain) ownedByProject(resolved string) bool {
 }
 
 // snapshotBase reports the base an external disk-only snapshot of d's VM
-// left: libvirt names the overlay after the snapshot, beside its source, with
-// the same stem (vm-root.qcow2 → vm-root.<snap>), and the VM's record keeps
-// the overlay as its path. The layer must carry d's own stem and one of the
-// VM's recorded snapshot names; the base the same stem, in the same
-// directory.
+// left: libvirt names the overlay beside its source with the same stem and
+// the snapshot's name as extension (vm-root.qcow2 → vm-root.<snap>), and the
+// VM's record moves to the overlay — and stays on an overlay named after a
+// snapshot that a revert or a delete has since removed. So the layer and the
+// base must sit in the same directory and carry d's own stem
+// (<vm>-<disk>, which an exclusive create gives one disk per directory), and
+// the base must not be claimed by any other VM's disk row or another
+// project's replica record.
 func (c *diskChain) snapshotBase(layer, resolved string) bool {
-	if filepath.Dir(layer) != filepath.Dir(resolved) {
+	if filepath.Dir(layer) != filepath.Dir(resolved) || layer == resolved {
 		return false
 	}
 	stem := func(p string) string { b := filepath.Base(p); return strings.TrimSuffix(b, filepath.Ext(b)) }
-	if stem(layer) != stem(c.self) || stem(resolved) != stem(c.self) || layer == resolved {
+	if stem(layer) != stem(c.self) || stem(resolved) != stem(c.self) {
 		return false
 	}
-	ext := strings.TrimPrefix(filepath.Ext(layer), ".")
-	if ext == "" {
+	for _, r := range c.rowsAt(resolved) {
+		if r.VMName != c.d.VMName {
+			return false
+		}
+	}
+	if rec, ok := replicaRecordFor(resolved); ok && tenancy.NormalizeProject(rec.Project) != c.project {
 		return false
 	}
-	snaps, err := corrosion.ListSnapshots(c.ctx, c.s.db, c.d.VMName)
+	return true
+}
+
+// legacyPromotedRaw accepts the raw replica under a VM promoted with
+// --no-localize by a build that did not record backing_disk: the layer is
+// that VM's own promoted disk (d's file, or the file of a disk row with no
+// backing_disk recorded), in its pool's directory, and the raw file is a
+// replica of it in a directory a daemon created for exactly that VM:
+//   - this build's replica owner directory of the VM's own project and name;
+//   - or, as an earlier build laid replicas out, the pool directory itself,
+//     with the overlay <vm>-promoted-<ts>.qcow2 and the replica
+//     <source>-<disk>-<ts>.raw of the same <ts> and disk.
+//
+// Paths are resolved (so no symlink is in them); the pool must be one the VM's
+// project may use; the file must not be claimed by any disk row, nor recorded
+// as another project's replica.
+func (c *diskChain) legacyPromotedRaw(layer, resolved string) bool {
+	var rows []corrosion.DiskRecord
+	if layer == c.self {
+		rows = append(rows, c.d)
+	}
+	rows = append(rows, c.rowsAt(layer)...)
+	for _, r := range rows {
+		if r.BackingDisk == "" && c.s.legacyPromotedReplica(c.ctx, r, c.projectOf(r.VMName), layer, resolved) {
+			return true
+		}
+	}
+	return false
+}
+
+// legacyPromotedReplica is legacyPromotedRaw's test for one disk row r of a
+// VM in project, whose file is layer.
+func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskRecord, project, layer, resolved string) bool {
+	if r.StorageVolume == "" || project == "" {
+		return false
+	}
+	ref, ok := s.resolvePool(ctx, r.StorageVolume)
+	if !ok || !isFileBasedDriver(ref.Driver) {
+		return false
+	}
+	if rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, r.StorageVolume); err != nil || (ok && !tenancy.AdmitAttach(project, rec.Project)) {
+		return false
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, ref)
 	if err != nil {
 		return false
 	}
-	for _, sn := range snaps {
-		if sn.Name == ext {
+	if rows, err := corrosion.DisksReferencingPath(ctx, s.db, s.recordPath(resolved)); err != nil {
+		return false
+	} else {
+		for _, o := range rows {
+			if o.Path != "" && resolvedOr(s.hostDiskFile(o.Path)) == resolved {
+				return false
+			}
+		}
+	}
+	if rec, ok := replicaRecordFor(resolved); ok && tenancy.NormalizeProject(rec.Project) != project {
+		return false
+	}
+	for _, pd := range s.rootsAsFound(dir) {
+		if filepath.Dir(layer) != pd {
+			continue
+		}
+		if filepath.Dir(resolved) == resolvedOr(replicaOwnerDir(pd, project, r.VMName)) {
+			return true
+		}
+		if filepath.Dir(resolved) != pd {
+			continue
+		}
+		ts, ok := strings.CutPrefix(filepath.Base(layer), r.VMName+"-promoted-")
+		if !ok {
+			continue
+		}
+		ts, ok = strings.CutSuffix(ts, ".qcow2")
+		if !ok || ts == "" {
+			continue
+		}
+		src, ok := strings.CutSuffix(filepath.Base(resolved), "-"+r.DiskName+"-"+ts+".raw")
+		if ok && safename.ValidateVMName(src) == nil {
 			return true
 		}
 	}
@@ -300,6 +414,12 @@ func (c *diskChain) rowsAt(resolved string) []corrosion.DiskRecord {
 			continue
 		}
 		for _, r := range rows {
+			// Another host's row names ITS file of that path — the flat
+			// <vm>-<disk> names can repeat across hosts — unless the file
+			// is on storage both share.
+			if r.HostName != "" && r.HostName != c.s.hostName && !withinAny(resolved, c.shared) {
+				continue
+			}
 			if r.Path != "" && resolvedOr(c.s.hostDiskFile(r.Path)) == resolved {
 				out = append(out, r)
 			}

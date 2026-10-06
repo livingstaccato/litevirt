@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/randid"
 )
@@ -173,7 +175,8 @@ func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err 
 	// between (created by someone else) must not delete it.
 	recvRef := opts.DstRef
 	if !opts.Incremental {
-		recvRef = opts.DstRef + ".litevirt-incoming-" + randid.New()[:12]
+		d.sweepIncoming(ctx, opts.DstRef, time.Now())
+		recvRef = fmt.Sprintf("%s%s%d-%s", opts.DstRef, incomingMarker, time.Now().Unix(), randid.New()[:12])
 	}
 	var sendArgs, recvArgs []string
 	if opts.Incremental {
@@ -280,4 +283,44 @@ func cephImageName(path string) string {
 	}
 	imgParts := strings.SplitN(parts[1], ":", 2)
 	return imgParts[0]
+}
+
+// incomingMarker names a full copy's image while it is received, before it is
+// renamed into place: <dst>.litevirt-incoming-<unix seconds>-<random>.
+const incomingMarker = ".litevirt-incoming-"
+
+// incomingMaxAge is how old an incoming image is before a later copy into
+// the same pool removes it as the leftover of a crash between import and
+// rename. No copy runs that long without finishing.
+const incomingMaxAge = 24 * time.Hour
+
+// sweepIncoming removes, in dstRef's pool, incoming images a crashed copy
+// left (incomingMarker, older than incomingMaxAge). Only names this driver
+// mints are touched; a failure to list is ignored.
+func (d *cephDriver) sweepIncoming(ctx context.Context, dstRef string, now time.Time) {
+	pool, _, ok := strings.Cut(dstRef, "/")
+	if !ok || pool == "" {
+		return
+	}
+	out, err := d.rbd(ctx, d.rbdArgs("ls", "--", pool)...)
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(string(out)) {
+		_, rest, ok := strings.Cut(name, incomingMarker)
+		if !ok {
+			continue
+		}
+		secs, _, ok := strings.Cut(rest, "-")
+		if !ok {
+			continue
+		}
+		t, err := strconv.ParseInt(secs, 10, 64)
+		if err != nil || now.Sub(time.Unix(t, 0)) < incomingMaxAge {
+			continue
+		}
+		if _, err := d.rbd(ctx, d.rbdArgs("rm", "--", pool+"/"+name)...); err == nil {
+			slog.Info("ceph: removed an incoming image a crashed copy left", "image", pool+"/"+name)
+		}
+	}
 }

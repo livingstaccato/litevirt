@@ -28,8 +28,8 @@ func stage(t *testing.T, s *Store, b []byte) string {
 	return f.Name()
 }
 
-// A first publish is <name>.qcow2; a refresh is a new version the name points
-// at, and the first file is never written over.
+// Content is published as <name>@<sha256[:16]>.qcow2 and the name pointed at
+// it; a refresh is a new version, and the first file is never written over.
 func TestPublish_ARefreshIsANewVersionNeverAWriteOver(t *testing.T) {
 	s := NewStore(t.TempDir())
 	_ = s.Init()
@@ -38,7 +38,9 @@ func TestPublish_ARefreshIsANewVersionNeverAWriteOver(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p1.Path != s.CanonicalImagePath("ubuntu") || p1.Superseded != "" {
+	// m-new-1: the first content is named by its content too, so every host
+	// that holds it names it the same.
+	if p1.Path != filepath.Join(s.imageDir, "ubuntu@"+digestOf(v1)[:16]+".qcow2") || p1.Superseded != "" || s.ImagePath("ubuntu") != p1.Path {
 		t.Fatalf("first publish = %+v", p1)
 	}
 	p2, err := s.Publish("ubuntu", stage(t, s, v2), digestOf(v2))

@@ -530,8 +530,21 @@ func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *p
 		}
 	}
 
-	// The format, from a record.
+	// The format, from a record — or, for the raw replica under a VM an
+	// earlier build promoted with --no-localize (no record of either), from
+	// the daemon-made layout that ties it to this VM (legacyPromotedReplica).
 	format, immutable, err := s.recordedBackingFormat(resolved, images)
+	if err != nil && cur.BackingFormat == "qcow2" && s.newDiskChain(ctx, *d).snapshotBase(self, resolved) {
+		// The base an external snapshot of this VM left (its own earlier
+		// file, qcow2 as libvirt wrote the overlay on it).
+		format, immutable, err = "qcow2", true, nil
+	}
+	if err != nil && cur.BackingFormat == "raw" && d.BackingDisk == "" {
+		if vm, verr := corrosion.GetVM(ctx, s.db, d.VMName); verr == nil && vm != nil &&
+			s.legacyPromotedReplica(ctx, *d, tenancy.NormalizeProject(vm.Project), self, resolved) {
+			format, immutable, err = "raw", true, nil
+		}
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -623,55 +636,42 @@ func (s *Server) recordedBackupBase(ctx context.Context, dest restoreDest, m *pb
 
 // imageUnchangedSince accepts, for a backup that does not record its base's
 // identity (taken before manifests recorded it), the image-store base resolved
-// of disk d only when the image's own records show it was not replaced after
-// the backup: this host's copy was pulled or imported no later than the backup
-// (backupTS), and the image's recorded checksum is the file's sha256 now. Any
-// other case is an error saying why.
+// of disk d only when THAT FILE's own provenance shows it unchanged since the
+// backup (backupTS): it was published on this host no later than the backup,
+// and its bytes still have the sha256 recorded for it. Since this build no
+// store file is ever written over (only healed to its own recorded sha256), so
+// the one way it can differ from the backup's base is an earlier build's
+// overwrite after the backup, which moved its publish time. Refreshes of the
+// image name — here or on any host — publish other files and change nothing
+// here. An earlier build's file gets its provenance when first seen
+// (imageFileProvenance). Any other case is an error saying why.
 func (s *Server) imageUnchangedSince(ctx context.Context, d *corrosion.DiskRecord, resolved, backupTS string) error {
-	images := resolvedOr(filepath.Join(s.dataDir, "images"))
-	name := strings.TrimSuffix(d.BackingImage, ".qcow2")
-	if name == "" || filepath.IsAbs(name) || !image.IsImageFile(images, name, resolved) {
-		n, ok := image.ImageNameOfFile(resolved)
-		if !ok || !image.IsImageFile(images, n, resolved) {
-			return fmt.Errorf("its base is not a file of any image in the store")
-		}
-		name = n
+	images := resolvedOr(s.imageStore().ImageDir())
+	name, ok := image.ImageNameOfFile(resolved)
+	if !ok || !image.IsImageFile(images, name, resolved) {
+		return fmt.Errorf("its base is not a file of any image in the store")
 	}
 	backup, err := time.Parse(time.RFC3339, backupTS)
 	if err != nil {
 		return fmt.Errorf("the backup's time %q cannot be read", backupTS)
 	}
-	img, err := corrosion.GetImage(ctx, s.db, name)
-	if err != nil || img == nil {
-		return fmt.Errorf("image %q has no record to show it was not replaced since", name)
-	}
-	hosts, err := corrosion.GetImageHosts(ctx, s.db, name)
+	prov, err := s.imageFileProvenance(ctx, name, resolved)
 	if err != nil {
-		return fmt.Errorf("image %q: %v", name, err)
+		return fmt.Errorf("image %q: the provenance of %s: %v", name, resolved, err)
 	}
-	var pulled string
-	for _, h := range hosts {
-		if h.HostName == s.hostName && h.Status == "ready" {
-			pulled = h.PulledAt
-		}
+	if prov.PublishedAt.IsZero() {
+		return fmt.Errorf("image %q's file %s has no recorded publish time", name, resolved)
 	}
-	at, perr := time.Parse(time.RFC3339, pulled)
-	if pulled == "" || perr != nil {
-		return fmt.Errorf("image %q has no record of when this host's copy was pulled", name)
-	}
-	if at.After(backup) {
-		return fmt.Errorf("image %q was pulled or imported here at %s, after the backup (%s), so it may have been replaced since", name, pulled, backupTS)
-	}
-	want := normalizeChecksum(img.Checksum)
-	if want == "" {
-		return fmt.Errorf("image %q records no checksum to compare its file with", name)
+	if prov.PublishedAt.After(backup) {
+		return fmt.Errorf("image %q's file %s was written here at %s, after the backup (%s), so it may have been replaced since",
+			name, resolved, prov.PublishedAt.Format(time.RFC3339), backupTS)
 	}
 	got, err := image.FileDigest(resolved)
 	if err != nil {
 		return fmt.Errorf("image %q: %v", name, err)
 	}
-	if got != want {
-		return fmt.Errorf("image %q's file %s no longer matches its recorded checksum (sha256 %s, recorded %s)", name, resolved, got, want)
+	if got != prov.SHA256 {
+		return fmt.Errorf("image %q's file %s no longer matches its recorded sha256 (sha256 %s, recorded %s)", name, resolved, got, prov.SHA256)
 	}
 	return nil
 }

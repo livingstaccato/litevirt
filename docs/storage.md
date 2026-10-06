@@ -162,20 +162,26 @@ raw and never parsed for a header the guest may have written; a backing with
 no declared format, or declared twice, is refused. Every backing is judged,
 resolved through symlinks, before anything opens it, and is accepted only as:
 
-- a file in the image store that is itself **standalone** (no backing file,
-  no external data file) — an image is a base, never a way to name another
-  file;
+- a file in the image store with no external data file, whose own backing,
+  if any, is another file in the image store (a layered image) — an image is
+  a base, never a way to name any other file;
 - the `backing_disk` recorded on the layer naming it — the disk's own record,
   or the record of whichever disk that layer is: a linked clone's template
   disk, in whatever pool it lives in, and a `--no-localize` promoted VM's
   replica. A backing declared `raw` is accepted only this way, so a linked
-  clone of a promoted VM (clone → promoted overlay → raw replica) copies too;
+  clone of a promoted VM (clone → promoted overlay → raw replica) copies too —
+  or, for a VM an earlier build promoted with `--no-localize` (which recorded
+  no `backing_disk`), as the replica beside its `<vm>-promoted-<ts>.qcow2` in
+  the pool directory, named `<source>-<disk>-<ts>.raw`, or in the VM's own
+  replica directory, claimed by no disk row and no other project's record;
 - a file in the directory of a file-based pool on this host that the VM's
   project may use (global, or owned by that project), or the disk's own pool;
 - in `<data_dir>/disks` (which holds every project's disks) or the disk's own
   directory, only a file the VM's project owns by record — a disk of one of
   its VMs, or its recorded replica — or the base an external snapshot of the
-  VM left beside its overlay.
+  VM left beside its overlay: same directory, the disk's own `<vm>-<disk>`
+  stem, claimed by no other VM's row. This holds after the snapshot is
+  reverted or deleted too, when the disk stays on an overlay named after it.
 
 Another project's file is refused wherever it sits, unless a record ties it
 to the layer naming it. A move, a restore or a copy that leaves a disk

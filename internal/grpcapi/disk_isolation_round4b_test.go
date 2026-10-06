@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
@@ -201,21 +204,62 @@ func TestImportImage_HealsADamagedBaseOnlyWithItsRecordedIdentity(t *testing.T) 
 	}
 }
 
-// Concern 1: the reconciler's heal no longer refuses before fetching — it asks
-// a peer — and an image whose local copy has no recorded identity is never
-// replaced (here the peer fails, and nothing is touched).
-func TestAutoPullImage_AsksAPeerAndNeverReplacesAnUnverifiedBase(t *testing.T) {
+// deliveringPeer is a peer that answers PushImage by importing content into
+// the asking server, as a real peer's push does.
+type deliveringPeer struct {
+	pb.LiteVirtClient
+	to      *Server
+	content []byte
+	pushes  int
+}
+
+type donePushStream struct {
+	grpc.ClientStream
+	sent bool
+}
+
+func (d *donePushStream) Recv() (*pb.PushImageProgress, error) {
+	if d.sent {
+		return nil, io.EOF
+	}
+	d.sent = true
+	return &pb.PushImageProgress{Status: "complete", ProgressPct: 100}, nil
+}
+
+func (p *deliveringPeer) PushImage(_ context.Context, req *pb.PushImageRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.PushImageProgress], error) {
+	p.pushes++
+	if err := p.to.ImportImage(&mockImportImageStream{ctx: adminCtx(), msgs: []*pb.ImportImageRequest{{Name: req.Name, Format: "qcow2", Chunk: p.content}}}); err != nil {
+		return nil, err
+	}
+	return &donePushStream{}, nil
+}
+
+// autoPullServer is a server whose local copy of "ubuntu" (the base of a disk
+// on another host) has the wrong size for its record, and a peer that holds
+// it and pushes content when asked.
+func autoPullServer(t *testing.T, local []byte, published bool, content []byte) (*Server, *deliveringPeer, string) {
+	t.Helper()
 	s := testServer(t)
 	s.dataDir = t.TempDir()
 	s.images = image.NewStore(s.dataDir)
 	_ = s.images.Init()
 	ctx := context.Background()
 	img := s.images.ImagePath("ubuntu")
-	damaged := []byte("short, damaged-looking local copy")
-	if err := os.WriteFile(img, damaged, 0o600); err != nil {
+	if published {
+		tmp := filepath.Join(s.images.ImageDir(), "import-seed.tmp")
+		if err := os.WriteFile(tmp, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		pub, err := s.images.Publish("ubuntu", tmp, sha256Hex(content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		img = pub.Path
+	}
+	if err := os.WriteFile(img, local, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2", SizeBytes: 1 << 20}); err != nil {
+	if err := corrosion.InsertImage(ctx, s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2", SizeBytes: int64(len(content))}); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.InsertImageHost(ctx, s.db, corrosion.ImageHostRecord{ImageName: "ubuntu", HostName: "peer-host", Path: img, Status: "ready"}); err != nil {
@@ -225,28 +269,75 @@ func TestAutoPullImage_AsksAPeerAndNeverReplacesAnUnverifiedBase(t *testing.T) {
 		[]corrosion.DiskRecord{{VMName: "v", DiskName: "root", HostName: "other-host", Path: "/x/v-root.qcow2", BackingImage: "ubuntu"}}); err != nil {
 		t.Fatal(err)
 	}
-	peer := &countingPushPeer{}
+	peer := &deliveringPeer{to: s, content: content}
 	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) { return peer, func() {}, nil }
-	_ = s.autoPullImage(ctx, "ubuntu")
+	return s, peer, img
+}
+
+// Concern 1: the reconciler's heal fetches from a peer; a damaged copy with
+// no recorded identity is never replaced — the fetched content becomes a new
+// version for new disks.
+func TestAutoPullImage_NeverReplacesAnUnverifiedBase(t *testing.T) {
+	damaged := []byte("short, damaged-looking local copy")
+	good := bytes.Repeat([]byte("GOOD"), 1024)
+	s, peer, img := autoPullServer(t, damaged, false, good)
+	if err := s.autoPullImage(context.Background(), "ubuntu"); err != nil {
+		t.Fatalf("auto-pull: %v", err)
+	}
 	if peer.pushes != 1 {
-		t.Errorf("a peer was asked %d time(s), want 1: the heal must fetch to verify", peer.pushes)
+		t.Errorf("a peer was asked %d time(s), want 1", peer.pushes)
 	}
 	if got, _ := os.ReadFile(img); !bytes.Equal(got, damaged) {
-		t.Error("the local copy was replaced")
+		t.Fatal("a base with no recorded identity was replaced")
+	}
+	if cur := s.images.ImagePath("ubuntu"); cur == img {
+		t.Error("the fetched content was not published for new disks")
+	} else if got, _ := os.ReadFile(cur); !bytes.Equal(got, good) {
+		t.Error("the new version does not hold the fetched content")
 	}
 }
 
-// legacyImageBackup is project a's VM "im" on image "ubuntu", the image
-// recorded as pulled here at pulledAt with its file's checksum, and a
-// disk-file backup at ts that records no base identity (taken before
-// manifests did).
-func legacyImageBackup(t *testing.T, f *restoreFixture, pulledAt, ts string) (disk, img string, want []byte) {
+// ... and a damaged copy whose recorded identity the fetched content has is
+// healed in place.
+func TestAutoPullImage_HealsABaseWithItsRecordedIdentity(t *testing.T) {
+	good := bytes.Repeat([]byte("GOOD"), 1024)
+	s, peer, img := autoPullServer(t, []byte("damaged"), true, good)
+	if err := s.autoPullImage(context.Background(), "ubuntu"); err != nil {
+		t.Fatalf("auto-pull: %v", err)
+	}
+	if peer.pushes != 1 {
+		t.Errorf("a peer was asked %d time(s), want 1", peer.pushes)
+	}
+	if got, _ := os.ReadFile(img); !bytes.Equal(got, good) {
+		t.Fatal("the damaged base was not healed with its recorded identity")
+	}
+	if s.images.ImagePath("ubuntu") != img {
+		t.Error("a heal published a new version")
+	}
+}
+
+// legacyImageBackup is project a's VM "im" on image "ubuntu", written here
+// and recorded as pulled here at pulledAt (an earlier build's file: no
+// provenance record), the image record carrying checksum, and a disk-file
+// backup at ts that records no base identity (taken before manifests did).
+func legacyImageBackup(t *testing.T, f *restoreFixture, checksum bool, pulledAt, ts string) (disk, img string, want []byte) {
 	t.Helper()
 	ctx := context.Background()
 	img = filepath.Join(f.s.dataDir, "images", "ubuntu.qcow2")
 	base := filledQcow2(t, img, "UBUNTU ")
 	raw, _ := os.ReadFile(img)
-	if err := corrosion.InsertImage(ctx, f.s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2", Checksum: "sha256:" + sha256Hex(raw), SizeBytes: int64(len(raw))}); err != nil {
+	at, err := time.Parse(time.RFC3339, pulledAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(img, at, at); err != nil {
+		t.Fatal(err)
+	}
+	rec := corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2", SizeBytes: int64(len(raw))}
+	if checksum {
+		rec.Checksum = "sha256:" + sha256Hex(raw)
+	}
+	if err := corrosion.InsertImage(ctx, f.s.db, rec); err != nil {
 		t.Fatal(err)
 	}
 	if err := corrosion.InsertImageHost(ctx, f.s.db, corrosion.ImageHostRecord{ImageName: "ubuntu", HostName: f.s.hostName, Path: img, Status: "ready", PulledAt: pulledAt}); err != nil {
@@ -260,30 +351,82 @@ func legacyImageBackup(t *testing.T, f *restoreFixture, pulledAt, ts string) (di
 	return disk, img, want
 }
 
-// IMP-5: a legacy backup restores in place onto an image its records show
-// unchanged since.
+const (
+	legacyPulled = "2020-01-01T00:00:00Z"
+	legacyBackup = "2020-06-01T00:00:00Z"
+)
+
+// IMP-5 / C-1: a legacy backup restores in place onto the image file the disk
+// is built on when that file's provenance shows it unchanged since — with or
+// without a recorded image checksum (main recorded none for a pull without
+// --checksum, a BuildImage, or a compose pull without one).
 func TestRestoreInPlace_LegacyBackupOnAnImageUnchangedSince(t *testing.T) {
+	for _, checksum := range []bool{true, false} {
+		t.Run(map[bool]string{true: "checksum-recorded", false: "no-checksum"}[checksum], func(t *testing.T) {
+			needQemuImg(t)
+			f := newRestoreFixture(t)
+			f.s.virt = libvirtfake.New()
+			disk, img, want := legacyImageBackup(t, f, checksum, legacyPulled, legacyBackup)
+			if err := inPlace(f, "im", legacyBackup); err != nil {
+				t.Fatalf("in-place restore of a legacy backup onto an unchanged image: %v", err)
+			}
+			requireRestoredOnto(t, disk, img, want)
+		})
+	}
+}
+
+// C-1b: the image name refreshed on ANOTHER host since: its record names the
+// other content, but this host's file is untouched.
+func TestRestoreInPlace_LegacyBackupAfterARefreshOnAnotherHost(t *testing.T) {
 	needQemuImg(t)
 	f := newRestoreFixture(t)
 	f.s.virt = libvirtfake.New()
-	const ts = "2026-10-10T14:00:00Z"
-	disk, img, want := legacyImageBackup(t, f, "2026-10-01T00:00:00Z", ts)
-	if err := inPlace(f, "im", ts); err != nil {
-		t.Fatalf("in-place restore of a legacy backup onto an unchanged image: %v", err)
+	ctx := context.Background()
+	disk, img, want := legacyImageBackup(t, f, true, legacyPulled, legacyBackup)
+	if err := corrosion.InsertImage(ctx, f.s.db, corrosion.ImageRecord{Name: "ubuntu", Format: "qcow2", Checksum: "sha256:" + sha256Hex([]byte("other")), SizeBytes: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := corrosion.InsertImageHost(ctx, f.s.db, corrosion.ImageHostRecord{ImageName: "ubuntu", HostName: "host-b", Path: img, Status: "ready", PulledAt: "2021-01-01T00:00:00Z"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := inPlace(f, "im", legacyBackup); err != nil {
+		t.Fatalf("in-place restore after a refresh on another host: %v", err)
+	}
+	requireRestoredOnto(t, disk, img, want)
+}
+
+// C-1c: the image name refreshed on THIS host since (after the upgrade): a new
+// version is published, the file the disk is built on is untouched, and the
+// restore onto it works.
+func TestRestoreInPlace_LegacyBackupAfterARefreshOnThisHost(t *testing.T) {
+	needQemuImg(t)
+	f := newRestoreFixture(t)
+	f.s.virt = libvirtfake.New()
+	f.s.images = image.NewStore(f.s.dataDir)
+	disk, img, want := legacyImageBackup(t, f, false, legacyPulled, legacyBackup)
+	// No startup pass here: the pull itself records the file's provenance
+	// before it moves this host's pulled_at.
+	newFile, _ := newContent(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(newFile) }))
+	defer srv.Close()
+	if err := f.s.PullImage(&pb.PullImageRequest{Name: "ubuntu", SourceUrl: srv.URL + "/u.qcow2"}, &streamRecorder[pb.PullProgress]{ctx: adminCtx()}); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	if err := inPlace(f, "im", legacyBackup); err != nil {
+		t.Fatalf("in-place restore after a refresh on this host: %v", err)
 	}
 	requireRestoredOnto(t, disk, img, want)
 }
 
 // IMP-5: ... and refused, saying why and that a new file works, when the
-// image was pulled after the backup.
+// image was pulled here after the backup.
 func TestRestoreInPlace_LegacyBackupOnAnImagePulledSinceIsRefused(t *testing.T) {
 	needQemuImg(t)
 	f := newRestoreFixture(t)
 	f.s.virt = libvirtfake.New()
-	const ts = "2026-10-10T15:00:00Z"
-	disk, _, _ := legacyImageBackup(t, f, "2026-10-11T00:00:00Z", ts)
+	disk, _, _ := legacyImageBackup(t, f, true, "2020-12-01T00:00:00Z", legacyBackup)
 	before, _ := os.ReadFile(disk)
-	err := inPlace(f, "im", ts)
+	err := inPlace(f, "im", legacyBackup)
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "after the backup") || !strings.Contains(err.Error(), "new file") {
 		t.Errorf("legacy backup onto an image pulled since: got %v, want FailedPrecondition naming why and the new-file route", err)
 	}
@@ -292,19 +435,41 @@ func TestRestoreInPlace_LegacyBackupOnAnImagePulledSinceIsRefused(t *testing.T) 
 	}
 }
 
-// IMP-5: ... and refused when the image's file no longer matches its record.
-func TestRestoreInPlace_LegacyBackupOnAnImageWhoseFileChangedIsRefused(t *testing.T) {
+// IMP-5: ... refused when an earlier build wrote over the file after the
+// backup (its mtime moved) ...
+func TestRestoreInPlace_LegacyBackupOnAnImageWrittenOverSinceIsRefused(t *testing.T) {
 	needQemuImg(t)
 	f := newRestoreFixture(t)
 	f.s.virt = libvirtfake.New()
-	const ts = "2026-10-10T16:00:00Z"
-	_, img, _ := legacyImageBackup(t, f, "2026-10-01T00:00:00Z", ts)
+	_, img, _ := legacyImageBackup(t, f, true, legacyPulled, legacyBackup)
 	if err := os.Remove(img); err != nil {
 		t.Fatal(err)
 	}
 	filledQcow2(t, img, "REPLACED ")
-	err := inPlace(f, "im", ts)
+	err := inPlace(f, "im", legacyBackup)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "after the backup") {
+		t.Errorf("legacy backup onto an image written over since: got %v, want FailedPrecondition naming it", err)
+	}
+}
+
+// ... and refused when the file's bytes no longer have the sha256 recorded
+// for it.
+func TestRestoreInPlace_LegacyBackupOnAnImageWhoseBytesChangedIsRefused(t *testing.T) {
+	needQemuImg(t)
+	f := newRestoreFixture(t)
+	f.s.virt = libvirtfake.New()
+	_, img, _ := legacyImageBackup(t, f, true, legacyPulled, legacyBackup)
+	f.s.RecordLegacyImageProvenance(context.Background())
+	fh, err := os.OpenFile(img, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fh.WriteAt([]byte("flipped"), 1<<19)
+	fh.Close()
+	at, _ := time.Parse(time.RFC3339, legacyPulled)
+	_ = os.Chtimes(img, at, at)
+	err = inPlace(f, "im", legacyBackup)
 	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "no longer matches") {
-		t.Errorf("legacy backup onto an image whose file changed: got %v, want FailedPrecondition naming it", err)
+		t.Errorf("legacy backup onto an image whose bytes changed: got %v, want FailedPrecondition naming it", err)
 	}
 }

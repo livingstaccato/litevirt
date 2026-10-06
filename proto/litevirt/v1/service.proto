@@ -677,6 +677,11 @@ message ImportImageRequest { string name = 1; string format = 2;
 message ImportImageResponse { string name = 1; int64 size_bytes = 2;
     string checksum = 3; }
 message PushImageRequest   { string name = 1; string target_host = 2; }
+// PruneImagesRequest removes, on one host, the image-store files no disk there
+// is built on (each image's current file is always kept). name empty: every
+// image. host_name empty: the host serving the call.
+message PruneImagesRequest { string name = 1; string host_name = 2; bool dry_run = 3; }
+message PruneImagesResponse { string host_name = 1; repeated string removed = 2; int64 freed_bytes = 3; }
 message PushImageProgress  { string status = 1; float progress_pct = 2;
     string error = 3; }
 message BuildImageRequest  { string vm_name = 1; string image_name = 2; }
@@ -3113,6 +3118,7 @@ service LiteVirt {
     rpc ImportImage(stream ImportImageRequest)  returns (ImportImageResponse);
     rpc PushImage(PushImageRequest)            returns (stream PushImageProgress);
     rpc BuildImage(BuildImageRequest)          returns (BuildImageResponse);
+    rpc PruneImages(PruneImagesRequest)        returns (PruneImagesResponse);
 
     // ── Backup ──
     rpc BackupVM(BackupVMRequest)              returns (stream BackupChunk);

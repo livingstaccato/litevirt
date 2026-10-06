@@ -1393,6 +1393,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// deferred cleanup of replicate/upload/import/restore temps — they'd
 	// otherwise accumulate and fill the pool/image dirs).
 	svc.SweepStaleStaging(ctx)
+	svc.RecordLegacyImageProvenance(ctx)
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.

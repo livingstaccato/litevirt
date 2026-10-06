@@ -215,8 +215,9 @@ func templateRow(t *testing.T, f *restoreFixture, name, base string) {
 }
 
 // I-3: a backup that does not record its base's identity (taken before the
-// manifest recorded it) is restored onto an image only if the image cannot
-// have changed — and an image can, so it is refused, saying why.
+// manifest recorded it) is restored onto an image only if that file cannot
+// have changed since: here it was written after the backup, so it is refused,
+// saying why.
 func TestRestoreInPlace_UnrecordedImageBaseIsRefused(t *testing.T) {
 	needQemuImg(t)
 	f := newRestoreFixture(t)
@@ -230,10 +231,10 @@ func TestRestoreInPlace_UnrecordedImageBaseIsRefused(t *testing.T) {
 	disk := filepath.Join(f.s.dataDir, "disks", "im-root.qcow2")
 	runQemuImg(t, "create", "-q", "-f", "qcow2", "-b", img, "-F", "qcow2", disk)
 	backedVM(t, f, "im", disk, corrosion.DiskRecord{StorageType: "local", BackingImage: "ubuntu"})
-	const ts = "2026-10-08T13:00:00Z"
+	const ts = "2020-10-08T13:00:00Z" // before the image file was written
 	pushVMWithIdentity(t, f, "im", disk, ts, pbsstore.ContentDiskFile, "", nil)
 	err := inPlace(f, "im", ts)
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "does not record the identity of its base") {
-		t.Errorf("unrecorded image base: got %v, want FailedPrecondition saying the base is unrecorded", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "does not record the identity of its base") || !strings.Contains(err.Error(), "after the backup") {
+		t.Errorf("unrecorded image base written after the backup: got %v, want FailedPrecondition saying why", err)
 	}
 }

@@ -510,14 +510,18 @@ lv stack migrate-volumes <stack> --to fast --map pg-1/data=archive --map pg-2=wa
 ```bash
 lv image pull <url> --name <name> [--format qcow2] [--checksum sha256:...]
 lv image import <file> --name <name>
-#   A pull or import under an existing name is a refresh: the new content is
-#   published as a new version (<name>@<sha256-prefix>.qcow2) that new VMs are
-#   built on. A file a disk is built on is never written over or removed;
-#   older versions nothing is built on are swept on a later refresh.
+#   Content is published as <name>@<sha256-prefix>.qcow2 (every host names the
+#   same content the same) and the name points at it. A pull or import under
+#   an existing name is a refresh: a new version that new VMs are built on. A file a disk is built on is never written over or removed.
 #   The one exception is a heal: a local copy whose bytes no longer match the
 #   sha256 recorded when it was published is put back from byte-identical
 #   content (the reconciler fetches it from a peer); any other content becomes
 #   a new version, and an unhealable base under disks is logged at ERROR.
+lv image prune [<image>] [--host <host>] [--dry-run]
+#   Removes, on one host, the image files no disk there is built on — judged
+#   from every visible disk's backing header, never from the image's name —
+#   keeping each image's current version. Needs image.import. A refresh prunes
+#   the image's older unused versions by itself, keeping the one it superseded.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls

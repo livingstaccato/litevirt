@@ -1748,6 +1748,7 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 		// Pull synchronously so the image is ready before VM creation. The
 		// content is published, never written over a file a disk is built
 		// on (image.Store.Publish).
+		s.recordImageProvenance(ctx, img)
 		progressCh := make(chan image.PullProgress, 10)
 		errCh := make(chan error, 1)
 		var pub image.Published

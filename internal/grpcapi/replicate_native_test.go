@@ -298,3 +298,38 @@ exit 0
 		}
 	}
 }
+
+// m2: a pool-less ceph disk names its cluster and identity in its own path;
+// the copy's source side runs with those, never the destination's.
+func TestReplicateVolume_NativeCephPoolLessSourceUsesItsPathCredentials(t *testing.T) {
+	log := fakeCLI(t)
+	s := testServer(t)
+	s.hostName = "test-host"
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{
+		"copies": {Driver: "ceph", Source: "copies", Options: map[string]string{"conf": "/etc/ceph/b.conf", "keyring": "/etc/ceph/b.keyring", "id": "b"}},
+	})
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Project: "a"})
+	if err := corrosion.InsertVM(context.Background(), s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped", Project: "a", Spec: string(spec)},
+		nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host",
+			Path: "rbd:rbd/vm1-root:conf=/etc/ceph/a.conf:keyring=/etc/ceph/a.keyring:id=a", SizeBytes: 1 << 20, StorageType: "ceph"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "copies"},
+		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()}); err != nil {
+		t.Fatalf("native ceph copy of a pool-less disk: %v", err)
+	}
+	srcCreds := "rbd --id a --conf /etc/ceph/a.conf --keyring /etc/ceph/a.keyring "
+	seen := false
+	for _, c := range calls(t, log) {
+		if strings.Contains(c, " snap create ") || strings.Contains(c, " export ") {
+			seen = true
+			if !strings.HasPrefix(c, srcCreds) {
+				t.Errorf("source-side call %q, want the credentials the disk's path names", c)
+			}
+		}
+	}
+	if !seen {
+		t.Error("no source-side call ran")
+	}
+}

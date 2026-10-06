@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
-	"slices"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -54,7 +53,9 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	}
 	// A re-pull of a name disks are built on is a refresh: the new content is
 	// published as a new version for new disks, and the file existing disks
-	// are built on is never written over (image.Store.Publish).
+	// are built on is never written over (image.Store.Publish). The files
+	// already here keep their provenance from before this pull's records.
+	s.recordImageProvenance(stream.Context(), req.Name)
 	slog.Info("pulling image", "name", req.Name, "url", req.SourceUrl)
 
 	// Insert image + image_host records with "pulling" status so the image
@@ -264,36 +265,66 @@ func (s *Server) imagePublished(ctx context.Context, name string, pub image.Publ
 	}
 	slog.Info("image refreshed: new disks use the new version; disks built on the old one keep it",
 		"image", name, "current", pub.Path, "superseded", pub.Superseded)
-	s.sweepImageVersions(ctx, name, pub.Path, pub.Superseded)
+	// Keep the file just superseded too: a VM created on it a moment ago may
+	// not have its disk file written yet.
+	if _, _, err := s.pruneImageVersions(ctx, name, false, pub.Path, pub.Superseded); err != nil {
+		slog.Warn("image: pruning unused versions after a refresh failed", "image", name, "error", err)
+	}
 }
 
-// sweepImageVersions removes image name's files that are neither kept (the
-// current file, and the one this refresh just superseded — a VM created on
-// it a moment ago may not have its disk row yet) nor referenced: no disk row
-// on any host names the file, and no disk row is built on the image by name
-// (its overlay names one of the image's files, and which one is not
-// recorded, so every file is kept). A file a disk is built on is never
-// removed.
-func (s *Server) sweepImageVersions(ctx context.Context, name string, keep ...string) {
-	if s.images == nil {
-		return
+// imageFileProvenance is the provenance of store file path of image name,
+// recorded first if an earlier build left it without one: its sha256 now,
+// and as its publish time the latest of this host's pulled_at for the image
+// and the file's mtime — every earlier build's write of the file (a pull, an
+// import, a peer's push, a build) moved one of them. It must run before
+// anything here moves pulled_at for the image.
+func (s *Server) imageFileProvenance(ctx context.Context, name, path string) (image.Provenance, error) {
+	if p, ok := image.RecordedProvenance(path); ok {
+		return p, nil
 	}
-	byName, err := corrosion.DisksReferencingPath(ctx, s.db, name)
-	if err != nil || len(byName) > 0 {
-		return
+	var at time.Time
+	if hosts, err := corrosion.GetImageHosts(ctx, s.db, name); err == nil {
+		for _, h := range hosts {
+			if h.HostName != s.hostName {
+				continue
+			}
+			if t, err := time.Parse(time.RFC3339, h.PulledAt); err == nil && t.After(at) {
+				at = t
+			}
+		}
 	}
-	for _, f := range s.images.ImageFiles(name) {
-		if slices.Contains(keep, f) {
+	return s.imageStore().EnsureProvenance(path, at)
+}
+
+// imageStore is this host's image store (one rooted at the data dir when the
+// server was built without one).
+func (s *Server) imageStore() *image.Store {
+	if s.images != nil {
+		return s.images
+	}
+	return image.NewStore(s.dataDir)
+}
+
+// recordImageProvenance gives every file of image name that has no
+// provenance record one (imageFileProvenance). Pull, import, build and the
+// compose pull call it before they touch the image's records.
+func (s *Server) recordImageProvenance(ctx context.Context, name string) {
+	for _, f := range s.imageStore().ImageFiles(name) {
+		if _, err := s.imageFileProvenance(ctx, name, f); err != nil {
+			slog.Warn("image: recording a file's provenance failed", "image", name, "file", f, "error", err)
+		}
+	}
+}
+
+// RecordLegacyImageProvenance records, at daemon start, the provenance of
+// every image-store file an earlier build left without one.
+func (s *Server) RecordLegacyImageProvenance(ctx context.Context) {
+	for f, name := range s.imageStore().StoreFiles() {
+		if _, ok := image.RecordedProvenance(f); ok {
 			continue
 		}
-		rows, err := s.diskReferencesAnyHost(ctx, f)
-		if err != nil || len(rows) > 0 {
-			continue
+		if _, err := s.imageFileProvenance(ctx, name, f); err != nil {
+			slog.Warn("image: recording a file's provenance failed", "image", name, "file", f, "error", err)
 		}
-		if err := s.images.RemoveImageFile(name, f); err != nil {
-			slog.Warn("image: sweep of an old version failed", "image", name, "file", f, "error", err)
-			continue
-		}
-		slog.Info("image: removed an old version nothing is built on", "image", name, "file", f)
 	}
 }

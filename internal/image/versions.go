@@ -3,13 +3,16 @@ package image
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
@@ -22,21 +25,24 @@ import (
 // changes every disk built on it, silently. So a file in the store is never
 // written over:
 //
-//   - an image's first content is <name>.qcow2;
-//   - a refresh (a re-pull, a re-import) publishes its content as a new file,
-//     <name>@<sha256[:12]>.qcow2, and points the name at it with the symlink
-//     <name>.current. ImagePath, which every new disk is created from, follows
-//     that pointer; disks already built keep naming the file they were built
-//     on, which stays where it is;
-//   - each published file's sha256 is recorded beside it (<file>.sha256), its
-//     identity. The one write a file may take after it is published is a heal:
-//     content byte-identical to that recorded identity, put back over a copy
-//     whose bytes no longer match it.
+//   - content is published as <name>@<sha256[:16]>.qcow2 — named by what it
+//     is, so every host that holds the same content names it the same — and
+//     the name is pointed at it with the symlink <name>.current. ImagePath,
+//     which every new disk is created from, follows that pointer; disks
+//     already built keep naming the file they were built on, which stays where
+//     it is. A file an earlier build published as <name>.qcow2 stays too;
+//   - each file's provenance is recorded beside it (<file>.sha256): its sha256
+//     and when it was published here. A file an earlier build left is given
+//     one when it is first seen (EnsureProvenance). The one write a file may
+//     take after it is published is a heal: content byte-identical to its
+//     recorded sha256, put back over a copy whose bytes no longer match it.
 //
 // '@' is not in the image-name charset (safename), so a version file never
 // collides with another image's file.
 
-const versionHexLen = 12
+// versionHexLen is how much of the sha256 a version file is named by; a
+// 12-hex name from an earlier build of this branch is still read.
+const versionHexLen = 16
 
 // pointerPath is the symlink naming an image's current version.
 func (s *Store) pointerPath(name string) string {
@@ -52,11 +58,17 @@ func (s *Store) CanonicalImagePath(name string) string {
 // valid version of name and a regular file.
 func (s *Store) currentVersion(name string) (string, bool) {
 	t, err := os.Readlink(s.pointerPath(name))
-	if err != nil || !isVersionFile(name, t) {
+	if err != nil {
+		return "", false
+	}
+	if !isVersionFile(name, t) {
+		slog.Error("image: the current-version pointer names no version of the image; ignoring it", "image", name, "target", t)
 		return "", false
 	}
 	p := filepath.Join(s.imageDir, t)
 	if fi, err := os.Lstat(p); err != nil || !fi.Mode().IsRegular() {
+		slog.Error("image: the current version the pointer names is missing; new disks fall back to the image's first file",
+			"image", name, "version", p)
 		return "", false
 	}
 	return p, true
@@ -69,7 +81,7 @@ func isVersionFile(name, base string) bool {
 		return false
 	}
 	h, ok := strings.CutSuffix(rest, ".qcow2")
-	if !ok || len(h) != versionHexLen {
+	if !ok || (len(h) != versionHexLen && len(h) != 12) {
 		return false
 	}
 	for _, c := range h {
@@ -103,21 +115,39 @@ func ImageNameOfFile(path string) (string, bool) {
 	return name, ok && safename.ValidateImageName(name) == nil
 }
 
-// identityPath is where a published file's sha256 is recorded.
+// identityPath is where a file's provenance is recorded.
 func identityPath(path string) string { return path + ".sha256" }
 
-// RecordedDigest is the sha256 (hex) recorded when path was published; ok is
-// false for a file published before identities were recorded.
-func RecordedDigest(path string) (string, bool) {
+// Provenance is what the store records about one of its files: its sha256
+// and when it was published on this host.
+type Provenance struct {
+	SHA256      string    `json:"sha256"`
+	PublishedAt time.Time `json:"published_at"`
+}
+
+// RecordedProvenance is path's provenance record; ok is false when it has
+// none (a file an earlier build published and nothing has seen since). A
+// record from an earlier build of this branch (the bare digest) reads with a
+// zero PublishedAt.
+func RecordedProvenance(path string) (Provenance, bool) {
 	b, err := os.ReadFile(identityPath(path))
 	if err != nil {
-		return "", false
+		return Provenance{}, false
 	}
-	d := strings.TrimSpace(string(b))
-	if !validDigest(d) {
-		return "", false
+	var p Provenance
+	if json.Unmarshal(b, &p) != nil {
+		p = Provenance{SHA256: strings.TrimSpace(string(b))}
 	}
-	return d, true
+	if !validDigest(p.SHA256) {
+		return Provenance{}, false
+	}
+	return p, true
+}
+
+// RecordedDigest is the sha256 (hex) recorded for path.
+func RecordedDigest(path string) (string, bool) {
+	p, ok := RecordedProvenance(path)
+	return p.SHA256, ok
 }
 
 func validDigest(d string) bool {
@@ -128,11 +158,15 @@ func validDigest(d string) bool {
 	return err == nil && strings.ToLower(d) == d
 }
 
-// recordDigest writes path's identity beside it (temp + rename: the record is
-// the store's own file, never a disk's).
-func recordDigest(path, digest string) error {
+// recordProvenance writes path's provenance beside it (temp + rename: the
+// record is the store's own file, never a disk's).
+func recordProvenance(path string, p Provenance) error {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return err
+	}
 	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+"."+randid.New()+".tmp")
-	if err := os.WriteFile(tmp, []byte(digest+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(tmp, append(b, '\n'), 0o644); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, identityPath(path)); err != nil {
@@ -141,6 +175,64 @@ func recordDigest(path, digest string) error {
 	}
 	return nil
 }
+
+func recordDigest(path, digest string) error {
+	return recordProvenance(path, Provenance{SHA256: digest, PublishedAt: time.Now().UTC()})
+}
+
+// EnsureProvenance gives a store file an earlier build published — one with
+// no record — its provenance: its sha256 now, and publishedAt, the latest
+// time anything is known to have written it here. A file that has a record
+// keeps it. It returns the file's provenance.
+func (s *Store) EnsureProvenance(path string, publishedAt time.Time) (Provenance, error) {
+	if p, ok := RecordedProvenance(path); ok {
+		return p, nil
+	}
+	if !sameDir(filepath.Dir(path), s.imageDir) {
+		return Provenance{}, fmt.Errorf("%s is not in the image store", path)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return Provenance{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return Provenance{}, fmt.Errorf("%s is not a regular file", path)
+	}
+	d, err := FileDigest(path)
+	if err != nil {
+		return Provenance{}, err
+	}
+	if mt := fi.ModTime().UTC(); mt.After(publishedAt) {
+		publishedAt = mt
+	}
+	p := Provenance{SHA256: d, PublishedAt: publishedAt.UTC()}
+	if err := recordProvenance(path, p); err != nil {
+		return Provenance{}, err
+	}
+	return p, nil
+}
+
+// StoreFiles is every image file in the store, with the image it belongs to.
+func (s *Store) StoreFiles() map[string]string {
+	out := map[string]string{}
+	ents, err := os.ReadDir(s.imageDir)
+	if err != nil {
+		return out
+	}
+	for _, e := range ents {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		p := filepath.Join(s.imageDir, e.Name())
+		if name, ok := ImageNameOfFile(p); ok {
+			out[p] = name
+		}
+	}
+	return out
+}
+
+// ImageDir is the store's image directory.
+func (s *Store) ImageDir() string { return s.imageDir }
 
 // FileDigest hashes the file at path (sha256, hex).
 func FileDigest(path string) (string, error) {
@@ -178,10 +270,10 @@ type Published struct {
 //     bytes no longer match it is healed: a copy of tmp is renamed over it
 //     (the directory entry is replaced, nothing is followed), byte-identical
 //     to the base every overlay on it was built on;
-//   - no current file yet: tmp becomes <name>.qcow2 (no-replace);
 //   - the current file's recorded identity is digest: nothing more changes;
-//   - otherwise tmp is published as the version <name>@<digest[:12]>.qcow2
-//     (no-replace) and the name pointed at it.
+//   - otherwise tmp is published as the version <name>@<digest[:16]>.qcow2
+//     (no-replace) and the name pointed at it — the image's first content
+//     too, so that every host names the same content the same.
 //
 // tmp is consumed (moved, or removed) on success.
 func (s *Store) Publish(name, tmp, digest string) (Published, error) {
@@ -211,22 +303,12 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 
 	cur := s.ImagePath(name)
 	if _, err := os.Lstat(cur); errors.Is(err, fs.ErrNotExist) {
-		err := linkNoReplace(tmp, cur)
-		if err == nil {
-			if rerr := recordDigest(cur, digest); rerr != nil {
-				return Published{}, fmt.Errorf("record identity of %s: %w", cur, rerr)
-			}
-			return Published{Path: cur, Healed: healed, Digest: digest}, nil
-		}
-		if !errors.Is(err, fs.ErrExist) {
-			return Published{}, err
-		}
-		// Published by someone else in between: a refresh of that.
+		cur = "" // the image's first content: nothing is superseded
 	} else if err != nil {
 		return Published{}, err
 	}
 
-	if rec, ok := RecordedDigest(cur); ok && rec == digest {
+	if rec, ok := RecordedDigest(cur); cur != "" && ok && rec == digest {
 		_ = os.Remove(tmp)
 		return Published{Path: cur, Healed: healed, Digest: digest}, nil
 	}
@@ -247,6 +329,9 @@ func (s *Store) Publish(name, tmp, digest string) (Published, error) {
 	}
 	if err := s.setCurrent(name, filepath.Base(ver)); err != nil {
 		return Published{}, err
+	}
+	if cur == ver {
+		cur = ""
 	}
 	return Published{Path: ver, Superseded: cur, Healed: healed, Digest: digest}, nil
 }
@@ -354,4 +439,17 @@ func linkNoReplace(tmp, path string) error {
 		return fmt.Errorf("remove the temp's second link %s (the publish was withdrawn): %w", tmp, err)
 	}
 	return nil
+}
+
+// sameDir compares two directories resolved through symlinks.
+func sameDir(a, b string) bool {
+	ra, err := filepath.EvalSymlinks(a)
+	if err != nil {
+		ra = filepath.Clean(a)
+	}
+	rb, err := filepath.EvalSymlinks(b)
+	if err != nil {
+		rb = filepath.Clean(b)
+	}
+	return ra == rb
 }

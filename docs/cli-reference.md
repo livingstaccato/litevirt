@@ -550,24 +550,27 @@ target sees the entry node, not the caller. Every file a foreign disk makes
 qemu open (backing files, VMDK extents, a data file) must sit beside the disk
 or in the import directory.
 
-Several imports can run on one host at once. Before each write — each chunk
-of an upload, unpacking an OVA or VMA, copying a mapped disk, converting a disk
-into the pool — an import reserves the bytes it will write, and is admitted
-only if that filesystem has room for them on top of what the other running
-imports writing to the same filesystem have reserved and not yet written,
-while still keeping the free headroom a cold migration keeps (5% of the
-filesystem, between 1 and 64 GiB). Imports into unrelated storage do not count
-against each other; btrfs subvolumes, datasets of one ZFS pool and exports of
-one NFS server count as one filesystem, and one litevirt cannot identify counts
-as shared with every other. A reservation shrinks as the import's writes reach
-the disk and is released when it finishes or fails, so an import that does not
-fit beside the others is refused with the space it needs and what the others
-hold; retry it when they finish. Two imports of the same VM name on one host do
-not run at once, and an import never replaces a file already at its disk's
-name in the pool. A file there that no disk (of a live VM, or kept from a
-deleted one) and no image records — a crashed earlier import's output — is
-moved aside to `<name>.orphan-<unix time>`, kept, and logged, and the import
-goes ahead; one that something records refuses the import, naming it.
+Several imports can run on one host at once. Before each write — an upload
+(reserved 64 MiB at a time), unpacking an OVA or VMA, copying a mapped disk,
+converting a disk into the pool — an import reserves the bytes it will write,
+and is admitted only if that filesystem has room for them on top of what the
+running imports writing to the same filesystem have reserved and its free space
+does not yet show written, while still keeping the free headroom a cold
+migration keeps (5% of the filesystem, between 1 and 64 GiB). Imports into
+unrelated storage do not count against each other; btrfs subvolumes, datasets
+of one ZFS pool and exports of one NFS server (by address) count as one
+filesystem, and one litevirt cannot identify counts as shared with every other.
+A reservation shrinks as the filesystem's free space shows the import's writes,
+and is released when it finishes or fails, so an import that does not fit
+beside the others is refused with the space it needs and what the others hold;
+retry it when they finish. Two imports of the same VM name on one host do not
+run at once (`--inspect` is not held back), and an import never replaces a file
+already at its disk's name in the pool. A file there that no disk (of a live
+VM, kept from a deleted one, or under a kept snapshot) and no image records,
+that no create, clone, restore, disk attach or import in flight may be writing,
+and that has not been modified for 15 minutes — a crashed earlier import's
+output — is moved aside to `<name>.orphan-<unix time>`, kept, and logged, and
+the import goes ahead; any other file there refuses the import, saying why.
 
 ## Snapshots
 

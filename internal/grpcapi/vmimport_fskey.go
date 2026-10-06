@@ -2,8 +2,10 @@ package grpcapi
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -46,7 +48,8 @@ var blockFilesystems = map[string]bool{
 //   - btrfs: its device, not the per-subvolume device number (every
 //     subvolume of one btrfs shares its free space);
 //   - ZFS: its pool, which every dataset in it draws on;
-//   - NFS: its server, since two exports can share one disk there;
+//   - NFS: its server's address, since two exports can share one disk
+//     there and one server can be spelled two ways;
 //   - a block filesystem: its device number;
 //   - anything else (overlay, FUSE, a cluster filesystem) cannot be told
 //     apart, and counts as the same as every other.
@@ -68,12 +71,23 @@ func fsKeyFor(fstype, source string, dev func() fsKey) fsKey {
 		if i <= 0 {
 			return ""
 		}
-		return fsKey("nfs:" + source[:i])
+		// By address, not by spelling: two names of one server are one
+		// disk there. A server that does not resolve is not told apart.
+		addrs, err := lookupNFSServer(strings.Trim(source[:i], "[]"))
+		if err != nil || len(addrs) == 0 {
+			return ""
+		}
+		slices.Sort(addrs)
+		return fsKey("nfs:" + addrs[0])
 	case blockFilesystems[fstype]:
 		return dev()
 	}
 	return ""
 }
+
+// lookupNFSServer resolves an NFS server's name; a variable so a test can fix
+// it.
+var lookupNFSServer = net.LookupHost
 
 func devFSKey(p string) fsKey {
 	var st syscall.Stat_t

@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -259,6 +261,16 @@ func TestMountOf_FindsTheMountAPathIsOn(t *testing.T) {
 
 func TestFSKeyFor_NamesSharedFreeSpaceOnce(t *testing.T) {
 	dev := func() fsKey { return "dev:7" }
+	lookupNFSServer = func(h string) ([]string, error) {
+		switch h {
+		case "nas.lan":
+			return []string{"10.0.0.9", "10.0.0.5"}, nil
+		case "nowhere.invalid":
+			return nil, fmt.Errorf("no such host")
+		}
+		return []string{h}, nil
+	}
+	t.Cleanup(func() { lookupNFSServer = net.LookupHost })
 	for _, c := range []struct {
 		fstype, source string
 		want           fsKey
@@ -267,7 +279,9 @@ func TestFSKeyFor_NamesSharedFreeSpaceOnce(t *testing.T) {
 		{"zfs", "rpool/data/vm", "zfs:rpool"},
 		{"zfs", "rpool", "zfs:rpool"},
 		{"nfs4", "10.0.0.5:/export/a", "nfs:10.0.0.5"},
-		{"nfs", "[fd00::1]:/x", "nfs:[fd00::1]"},
+		{"nfs4", "nas.lan:/export/b", "nfs:10.0.0.5"}, // another spelling of one server
+		{"nfs", "[fd00::1]:/x", "nfs:fd00::1"},
+		{"nfs", "nowhere.invalid:/x", ""},
 		{"ext4", "/dev/sda2", "dev:7"},
 		{"xfs", "/dev/sda3", "dev:7"},
 		{"overlay", "overlay", ""},
@@ -326,5 +340,71 @@ func TestImportVM_ADiskThatAppearsDuringTheConversionIsNotReplaced(t *testing.T)
 	poolDir, _ := s.importPoolDir(adminCtx(), "")
 	if b, _ := os.ReadFile(filepath.Join(poolDir, "imp-race-root.qcow2")); string(b) != "theirs" {
 		t.Fatalf("the file that appeared now holds %q", b)
+	}
+}
+
+// sharedSpaceServer's one filesystem ("fs") has room bytes above its headroom
+// less *used, which a test moves by hand: what the free space shows, not what
+// blocks the files hold.
+func sharedSpaceServer(room uint64, used *int64) *Server {
+	s := &Server{hostName: "test-host"}
+	s.diskSpaceOverride = func(string) (uint64, uint64, error) {
+		return uint64(int64(coldDiskHeadroom(spaceTestTotal)+room) - *used), spaceTestTotal, nil
+	}
+	s.fsKeyOverride = func(string) string { return "fs" }
+	return s
+}
+
+// Two imports cannot both credit one drop in the free space: on btrfs a
+// flushed file's blocks show before its free space falls, so each import's
+// own growth can be all there, and the drop only one of them.
+func TestImportSpace_TwoImportsDoNotBothCreditOneDrop(t *testing.T) {
+	var used int64
+	s := sharedSpaceServer(20<<20, &used)
+	a, b, c := t.TempDir(), t.TempDir(), t.TempDir()
+	ra, rb := s.reserveImportSpace(a), s.reserveImportSpace(b)
+	defer ra.release()
+	defer rb.release()
+	for _, r := range []*importReservation{ra, rb} {
+		if err := r.reserve(r.dir, 8<<20, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeAllocated(t, a, 4<<20)
+	writeAllocated(t, b, 4<<20)
+	used = 4 << 20 // only one of the two shows in the free space yet
+	ra.refresh()
+	rb.refresh()
+	// 16 MiB free; 16 reserved, 4 of them shown written: 12 outstanding.
+	rc := s.reserveImportSpace(c)
+	defer rc.release()
+	refusedForReservation(t, rc.reserve(c, 5<<20, "c"))
+	if err := rc.reserve(c, 3<<20, "c"); err != nil {
+		t.Fatalf("beside 12 MiB outstanding of 16 free: %v", err)
+	}
+}
+
+// Space freed on the filesystem by something else (a VM deleted) does not
+// take back what an import was credited, nor credit it more.
+func TestImportSpace_AnUnrelatedFreeNeitherCancelsNorGrowsACredit(t *testing.T) {
+	var used int64
+	s := sharedSpaceServer(20<<20, &used)
+	a, b := t.TempDir(), t.TempDir()
+	ra := s.reserveImportSpace(a)
+	defer ra.release()
+	if err := ra.reserve(a, 8<<20, "a"); err != nil {
+		t.Fatal(err)
+	}
+	writeAllocated(t, a, 4<<20)
+	used = 4 << 20
+	ra.refresh()
+	used -= 10 << 20 // a VM deleted: 10 MiB freed
+	ra.refresh()
+	// 26 MiB free; a has 4 of its 8 left to write.
+	rb := s.reserveImportSpace(b)
+	defer rb.release()
+	refusedForReservation(t, rb.reserve(b, 23<<20, "b"))
+	if err := rb.reserve(b, 22<<20, "b"); err != nil {
+		t.Fatalf("beside 4 MiB outstanding of 26 free: %v", err)
 	}
 }

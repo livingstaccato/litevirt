@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,17 +18,18 @@ import (
 // others may write into too: the import directory (usually the one state.db
 // is on) and the target pool. A free-space glance alone would let two imports
 // that glanced together each claim the same bytes, so each import reserves
-// what it is about to write before writing it, and every check counts the
-// other imports' reservations on the same filesystem less what they have
-// already written — written bytes are already gone from the free space, so
-// counting them again would refuse imports that fit.
+// what it is about to write before writing it, and every check counts what
+// the imports writing to the same filesystem have reserved and not yet
+// written.
 //
-// "Already written" is credited conservatively. A file's allocated blocks are
-// measured, the file is then flushed, and only then is the free space read:
-// a filesystem may count dirty data in a file's blocks before it takes it
-// from its free space (btrfs does), and a byte counted in neither place would
-// be admitted twice. The credit is also never more than the free space has
-// fallen since the phase began.
+// "Already written" is credited per filesystem, for all of its imports
+// together: never more than the free space has fallen since the first of
+// them began, and never more than their files have grown. A filesystem may
+// count a file's blocks before it takes them from its free space (btrfs does,
+// until its transaction commits, flush or not), so one import's growth is not
+// proof that its bytes are gone from the free space; the fall in free space
+// is, and one fall is credited once however many imports grew. Space another
+// writer frees does not take a credit back, or grow it.
 
 // importSpaceRefreshEvery is how often an import re-measures the files it
 // writes, so the part of its reservation already written stops counting
@@ -39,12 +41,31 @@ const importSpaceRefreshEvery = time.Second
 // than holding every other import's reservation on the host.
 const importStatfsTimeout = 10 * time.Second
 
-// importSpaceLedger holds this host's running imports' reservations, and the
-// names of the VMs being imported. Zero value ready.
+// importUploadStep is how much of an upload is reserved at a time: at most
+// this much is held, unwritten, while the import waits for the client's next
+// chunk.
+const importUploadStep = 64 << 20
+
+// importSpaceLedger holds this host's running imports' reservations, what
+// each filesystem has been credited, and the names of the VMs being imported.
+// Zero value ready.
 type importSpaceLedger struct {
 	mu    sync.Mutex
 	held  map[*importReservation]struct{}
+	keys  map[fsKey]*keySpace
 	names map[string]struct{}
+}
+
+// keySpace is one filesystem's credit: what the free space shows its running
+// imports have written.
+type keySpace struct {
+	// baseAvail is the free space when the first running import began on it,
+	// less what imports that have since finished wrote there. It can go
+	// below the free space (a finished import's bytes not yet shown), which
+	// holds the credit back until they show.
+	baseAvail int64
+	avail     uint64 // the free space last read
+	credit    uint64 // bytes credited as written, all imports together
 }
 
 // claimImportName refuses a second import of a VM name already being imported
@@ -69,27 +90,32 @@ func (s *Server) claimImportName(name string) (func(), error) {
 	}), nil
 }
 
-// spaceShare is one import's claim on one filesystem in its current phase.
+// importNamesInFlight is the names this host is importing now.
+func (s *Server) importNamesInFlight() []string {
+	l := &s.importSpace
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]string, 0, len(l.names))
+	for n := range l.names {
+		out = append(out, n)
+	}
+	return out
+}
+
+// spaceShare is one import's claim on one filesystem.
 type spaceShare struct {
-	need      uint64 // bytes reserved this phase
-	baseAlloc uint64 // its files' blocks there when the phase began
-	baseAvail uint64 // the filesystem's free space when the phase began
-	alloc     uint64 // its files' blocks there, last measured and flushed
-	avail     uint64 // the free space read after that flush
+	dir       string // a directory on it, for a flush
+	need      uint64 // bytes reserved
+	baseAlloc uint64 // its files' blocks there when the share began
+	alloc     uint64 // its files' blocks there, last measured
 }
 
 func sub0(a, b uint64) uint64 { return a - min(a, b) }
 
-// written is what the phase has written there and the free space shows gone.
-func (sh *spaceShare) written() uint64 {
-	return min(sub0(sh.alloc, sh.baseAlloc), sub0(sh.baseAvail, sh.avail))
-}
+// grown is what the share's files have grown by.
+func (sh *spaceShare) grown() uint64 { return sub0(sh.alloc, sh.baseAlloc) }
 
-func (sh *spaceShare) outstanding() uint64 { return sub0(sh.need, sh.written()) }
-
-// importReservation is one import's claim on disk space for its current write
-// phase: the upload, an extraction, or one disk's private copy and
-// conversion. It is kept per filesystem.
+// importReservation is one import's claim on disk space, kept per filesystem.
 type importReservation struct {
 	s   *Server
 	dir string // the import directory, walked
@@ -114,21 +140,21 @@ type importReservation struct {
 func (s *Server) reserveImportSpace(importDir string) *importReservation {
 	r := &importReservation{s: s, dir: importDir, stop: make(chan struct{}), dirKeys: map[string]fsKey{}}
 	l := &s.importSpace
+	r.refreshMu.Lock()
+	m := r.measureLocked()
 	l.mu.Lock()
 	if l.held == nil {
 		l.held = map[*importReservation]struct{}{}
 	}
 	r.shares = map[fsKey]*spaceShare{}
+	for k, v := range m {
+		l.ensureKeyLocked(k, v.avail)
+		r.shares[k] = &spaceShare{dir: v.dir, baseAlloc: v.alloc, alloc: v.alloc}
+	}
 	l.held[r] = struct{}{}
 	l.mu.Unlock()
-	r.begin()
-	r.release = sync.OnceFunc(func() {
-		l.mu.Lock()
-		delete(l.held, r)
-		r.released = true
-		l.mu.Unlock()
-		close(r.stop)
-	})
+	r.refreshMu.Unlock()
+	r.release = sync.OnceFunc(func() { r.finish() })
 	go func() {
 		t := time.NewTicker(importSpaceRefreshEvery)
 		defer t.Stop()
@@ -144,10 +170,123 @@ func (s *Server) reserveImportSpace(importDir string) *importReservation {
 	return r
 }
 
+// finish releases the reservation. What it wrote becomes ordinary used space:
+// its filesystems' baselines drop by it, so its bytes, shown in the free space
+// or not yet, are never credited to another import. On btrfs the transaction
+// is committed first, so the bytes show before nothing counts them.
+func (r *importReservation) finish() {
+	l := &r.s.importSpace
+	l.mu.Lock()
+	var btrfs []string
+	for k, sh := range r.shares {
+		if strings.HasPrefix(string(k), "btrfs:") && sh.grown() > 0 {
+			btrfs = append(btrfs, sh.dir)
+		}
+	}
+	l.mu.Unlock()
+	for _, d := range btrfs {
+		_ = syncFilesystem(d)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.held, r)
+	r.released = true
+	for k, sh := range r.shares {
+		ks := l.keys[k]
+		if ks == nil {
+			continue
+		}
+		ks.baseAvail -= int64(sh.grown())
+		l.recreditLocked(k)
+	}
+	l.dropIdleKeysLocked()
+	close(r.stop)
+}
+
+// ensureKeyLocked starts a filesystem's credit at the free space now, when no
+// running import is on it yet.
+func (l *importSpaceLedger) ensureKeyLocked(k fsKey, avail uint64) {
+	if l.keys == nil {
+		l.keys = map[fsKey]*keySpace{}
+	}
+	if l.keys[k] == nil {
+		l.keys[k] = &keySpace{baseAvail: int64(avail), avail: avail}
+	}
+}
+
+// grownLocked is what the running imports' files on k have grown by, each
+// counted no further than it reserved.
+func (l *importSpaceLedger) grownLocked(k fsKey) (grown, need uint64) {
+	for o := range l.held {
+		if sh := o.shares[k]; sh != nil {
+			grown = satAdd(grown, min(sh.grown(), sh.need))
+			need = satAdd(need, sh.need)
+		}
+	}
+	return grown, need
+}
+
+// observeLocked takes a fresh reading of k's free space. The credit follows
+// the fall since the baseline, up to what the imports grew; a rise (space
+// freed by something else) leaves the credit where it was, moving the
+// baseline instead.
+func (l *importSpaceLedger) observeLocked(k fsKey, avail uint64) {
+	ks := l.keys[k]
+	if ks == nil {
+		return
+	}
+	ks.avail = avail
+	grown, _ := l.grownLocked(k)
+	drop := ks.baseAvail - int64(avail)
+	if drop < int64(ks.credit) {
+		keep := min(ks.credit, grown)
+		ks.baseAvail = int64(avail) + int64(keep)
+		ks.credit = keep
+		return
+	}
+	ks.credit = uint64(max(0, min(int64(grown), drop)))
+}
+
+// recreditLocked re-derives k's credit from its baseline and last reading,
+// after a baseline moved down or an import left.
+func (l *importSpaceLedger) recreditLocked(k fsKey) {
+	ks := l.keys[k]
+	grown, _ := l.grownLocked(k)
+	drop := ks.baseAvail - int64(ks.avail)
+	ks.credit = uint64(max(0, min(int64(grown), drop)))
+}
+
+// dropIdleKeysLocked forgets a filesystem no running import is on.
+func (l *importSpaceLedger) dropIdleKeysLocked() {
+	for k := range l.keys {
+		used := false
+		for o := range l.held {
+			if o.shares[k] != nil {
+				used = true
+				break
+			}
+		}
+		if !used {
+			delete(l.keys, k)
+		}
+	}
+}
+
+// outstandingLocked is what the running imports on k have reserved and the
+// free space does not yet show written.
+func (l *importSpaceLedger) outstandingLocked(k fsKey) uint64 {
+	_, need := l.grownLocked(k)
+	credit := uint64(0)
+	if ks := l.keys[k]; ks != nil {
+		credit = ks.credit
+	}
+	return sub0(need, credit)
+}
+
 // track adds a file the import is about to write outside its import
 // directory — a conversion's scratch file in the pool — to what is measured.
 // Only a file the import itself created is tracked: another file's blocks
-// would be credited as this import's writing.
+// would be counted as this import's writing.
 func (r *importReservation) track(path string) {
 	r.refreshMu.Lock()
 	r.files = append(r.files, path)
@@ -164,13 +303,15 @@ func (r *importReservation) keyLocked(dir string) fsKey {
 	return k
 }
 
-type spaceMeasure struct{ alloc, avail uint64 }
+type spaceMeasure struct {
+	dir          string
+	alloc, avail uint64
+}
 
-// measureLocked reads the blocks the import's files occupy, per filesystem,
-// flushing each file after reading it, and then each filesystem's free space.
-// Only the import's own goroutines measure its files: a stat that hangs on a
-// dead mount stalls the import that writes there, never another import's
-// check. refreshMu is held.
+// measureLocked reads the blocks the import's files occupy and the free
+// space, per filesystem. Only the import's own goroutines measure its files:
+// a stat that hangs on a dead mount stalls the import that writes there, never
+// another import's check. refreshMu is held.
 func (r *importReservation) measureLocked() map[fsKey]spaceMeasure {
 	type acc struct {
 		dir   string
@@ -189,51 +330,39 @@ func (r *importReservation) measureLocked() map[fsKey]spaceMeasure {
 	add(r.dir, 0)
 	_ = filepath.WalkDir(r.dir, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.Type().IsRegular() {
-			add(r.dir, flushedAllocated(p))
+			add(r.dir, lstatAllocated(p))
 		}
 		return nil
 	})
 	for _, p := range r.files {
-		add(filepath.Dir(p), flushedAllocated(p))
+		add(filepath.Dir(p), lstatAllocated(p))
 	}
 	out := map[fsKey]spaceMeasure{}
 	for k, a := range byKey {
 		avail, _, err := r.s.diskSpace(a.dir)
 		if err != nil {
-			// Unreadable: credit nothing new on it.
-			continue
+			continue // unreadable: nothing new is credited on it
 		}
-		out[k] = spaceMeasure{alloc: a.alloc, avail: avail}
+		out[k] = spaceMeasure{dir: a.dir, alloc: a.alloc, avail: avail}
 	}
 	return out
 }
 
-// flushedAllocated is the blocks p occupies, read before p is flushed: once
-// the flush returns, every byte counted has been taken from the free space.
-// A file that cannot be opened or flushed counts as nothing written.
-func flushedAllocated(p string) uint64 {
-	f, err := os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	fi, err := f.Stat()
+// lstatAllocated is the blocks the file at p occupies; a file that is gone
+// occupies none.
+func lstatAllocated(p string) uint64 {
+	fi, err := os.Lstat(p)
 	if err != nil || !fi.Mode().IsRegular() {
 		return 0
 	}
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return uint64(st.Blocks) * 512
 	}
-	n := uint64(st.Blocks) * 512
-	if f.Sync() != nil {
-		return 0
-	}
-	return n
+	return 0
 }
 
-// refresh credits what the import's files have written since the phase
-// began.
+// refresh records what the import's files have grown by, and what the free
+// space shows.
 func (r *importReservation) refresh() {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
@@ -241,31 +370,27 @@ func (r *importReservation) refresh() {
 	l := &r.s.importSpace
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if r.released {
+		return
+	}
 	for k, v := range m {
 		if sh := r.shares[k]; sh != nil {
-			sh.alloc, sh.avail = v.alloc, v.avail
+			sh.alloc = v.alloc
+			l.observeLocked(k, v.avail)
 		}
 	}
 }
 
-// begin starts a new write phase: what earlier phases reserved and did not
-// write, they never will, so it stops counting against anyone at once —
-// before the measurement that sets the new phase's base, which may be slow.
+// begin ends a write phase: what it reserved and did not write (a sparse
+// disk, the rest of an upload step) it never will, so it stops counting.
+// What it wrote stays counted until the free space shows it.
 func (r *importReservation) begin() {
+	r.refresh()
 	l := &r.s.importSpace
 	l.mu.Lock()
-	for _, sh := range r.shares {
-		sh.need = 0
-	}
-	l.mu.Unlock()
-	r.refreshMu.Lock()
-	defer r.refreshMu.Unlock()
-	m := r.measureLocked()
-	l.mu.Lock()
 	defer l.mu.Unlock()
-	r.shares = map[fsKey]*spaceShare{}
-	for k, v := range m {
-		r.shares[k] = &spaceShare{baseAlloc: v.alloc, baseAvail: v.avail, alloc: v.alloc, avail: v.avail}
+	for _, sh := range r.shares {
+		sh.need = min(sh.need, sh.grown())
 	}
 }
 
@@ -275,12 +400,10 @@ type fsKey string
 
 func sameSpace(a, b fsKey) bool { return a == "" || b == "" || a == b }
 
-// reserve claims n more bytes for the current phase to write into dir. It
-// refuses when dir's filesystem, less the headroom a cold migration also
-// keeps, cannot hold what the imports on this host have reserved there and
-// not yet written, this one included, plus n. The other imports' outstanding
-// bytes are read before the glance, so a write they make meanwhile is counted
-// in both and never in neither.
+// reserve claims n more bytes for the import to write into dir. It refuses
+// when dir's filesystem, less the headroom a cold migration also keeps,
+// cannot hold what the imports on this host have reserved there and the free
+// space does not yet show written, this one included, plus n.
 func (r *importReservation) reserve(dir string, n uint64, what string) error {
 	r.refreshMu.Lock()
 	key := r.keyLocked(dir)
@@ -291,33 +414,28 @@ func (r *importReservation) reserve(dir string, n uint64, what string) error {
 	if r.released {
 		return status.Errorf(codes.Internal, "%s: the import's space reservation was already released", what)
 	}
-	var others, mine uint64
-	for o := range l.held {
-		for k, sh := range o.shares {
-			if !sameSpace(k, key) {
-				continue
-			}
-			if o == r {
-				mine = satAdd(mine, sh.outstanding())
-			} else {
-				others = satAdd(others, sh.outstanding())
-			}
-		}
-	}
 	avail, fsTotal, err := r.s.diskSpaceWithin(dir, importStatfsTimeout)
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "%s: cannot read the free space on %s: %v", what, r.s.hostName, err)
 	}
+	l.ensureKeyLocked(key, avail)
+	l.observeLocked(key, avail)
+	var outstanding uint64
+	for k := range l.keys {
+		if sameSpace(k, key) {
+			outstanding = satAdd(outstanding, l.outstandingLocked(k))
+		}
+	}
 	headroom := coldDiskHeadroom(fsTotal)
-	if avail < satAdd(satAdd(headroom, others), satAdd(mine, n)) {
+	if avail < satAdd(satAdd(headroom, outstanding), n) {
 		return status.Errorf(codes.FailedPrecondition,
-			"%s needs %d MiB more on %s, which has %d MiB free there, of which imports writing to the same filesystem have reserved %d MiB (%d MiB of them by other imports); "+
+			"%s needs %d MiB more on %s, which has %d MiB free there, of which running imports writing to the same filesystem have reserved %d MiB not yet written; "+
 				"an import leaves at least %d MiB free there",
-			what, n>>20, r.s.hostName, avail>>20, satAdd(others, mine)>>20, others>>20, headroom>>20)
+			what, n>>20, r.s.hostName, avail>>20, outstanding>>20, headroom>>20)
 	}
 	sh := r.shares[key]
 	if sh == nil {
-		sh = &spaceShare{baseAvail: avail, avail: avail}
+		sh = &spaceShare{dir: dir}
 		r.shares[key] = sh
 	}
 	sh.need = satAdd(sh.need, n)

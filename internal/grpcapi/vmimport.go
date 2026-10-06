@@ -86,14 +86,6 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return status.Errorf(codes.AlreadyExists,
 			"VM %q already exists (on host %s) — choose a different --name or remove it first", name, existing.HostName)
 	}
-	// The row is written only at the end; until then the name is held here,
-	// or two imports of one name would write the same files into the pool.
-	releaseName, err := s.claimImportName(name)
-	if err != nil {
-		return err
-	}
-	defer releaseName()
-
 	// ── Stage the source into a temp import dir (always cleaned up) ──
 	if err := os.MkdirAll(filepath.Join(s.dataDir, "imports"), 0o755); err != nil {
 		return status.Errorf(codes.Internal, "prepare import dir: %v", err)
@@ -140,6 +132,15 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		_ = os.RemoveAll(importDir)
 		return s.sendImportInspect(stream, fv, project)
 	}
+
+	// The row is written only at the end; until then the name is held here,
+	// or two imports of one name would write the same files into the pool.
+	// (An --inspect writes nothing there, and does not take it.)
+	releaseName, err := s.claimImportName(name)
+	if err != nil {
+		return err
+	}
+	defer releaseName()
 
 	// An import does not claim. importRecords builds the NIC rows straight from
 	// the foreign hypervisor's NICs, so importing onto a NetBox-bound network
@@ -222,7 +223,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		// A file already at the name is never replaced. One that something
 		// records is refused; an orphan (a crashed import's output) is moved
 		// aside and kept.
-		if err := s.clearImportDiskName(ctx, d.Name, dst); err != nil {
+		if err := s.clearImportDiskName(ctx, name, d.Name, dst); err != nil {
 			cleanupDisks()
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
@@ -551,6 +552,7 @@ func (s *Server) stageImportSource(ctx context.Context, stream pb.LiteVirt_Impor
 	defer f.Close()
 
 	var total int64
+	var reserved uint64
 	write := func(chunk []byte) error {
 		if len(chunk) == 0 {
 			return nil
@@ -558,8 +560,13 @@ func (s *Server) stageImportSource(ctx context.Context, stream pb.LiteVirt_Impor
 		if total+int64(len(chunk)) > maxRestoreBytes {
 			return status.Errorf(codes.ResourceExhausted, "import upload exceeded the %d-byte ceiling", maxRestoreBytes)
 		}
-		if err := space.reserve(importDir, uint64(len(chunk)), "uploading the source"); err != nil {
-			return err
+		// Reserved a step at a time, so no more than a step is held
+		// unwritten while the client sends the next chunk.
+		for uint64(total)+uint64(len(chunk)) > reserved {
+			if err := space.reserve(importDir, importUploadStep, "uploading the source"); err != nil {
+				return err
+			}
+			reserved += importUploadStep
 		}
 		n, werr := f.Write(chunk)
 		if werr != nil {

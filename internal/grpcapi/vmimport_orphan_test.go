@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,11 +14,13 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/opjournal"
 )
 
-// A file at the disk's name that nothing in the cluster records — a crashed
-// earlier import's output — is moved aside under a new name, kept, and the
-// re-import goes ahead.
+// A file at the disk's name that nothing in the cluster records or is still
+// creating, and that has been quiet longer than importOrphanMinAge — a
+// crashed earlier import's output — is moved aside under a new name, kept,
+// and the re-import goes ahead.
 func TestImportVM_AnOrphanAtTheDisksNameIsMovedAsideAndKept(t *testing.T) {
 	s := concurrentImportServer(t, 10*oneDiskNeed())
 	stubQemuImg(t)
@@ -26,9 +29,7 @@ func TestImportVM_AnOrphanAtTheDisksNameIsMovedAsideAndKept(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(poolDir, "imp-again-root.qcow2")
-	if err := os.WriteFile(dst, []byte("leftover"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	plantOld(t, dst, "leftover")
 	if err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-again", false)}}); err != nil {
 		t.Fatalf("a re-import over an orphan: %v", err)
 	}
@@ -57,9 +58,7 @@ func TestImportVM_AKeptDiskOfADeletedVMIsNotAnOrphan(t *testing.T) {
 				t.Fatal(err)
 			}
 			dst := filepath.Join(poolDir, "imp-kept-root.qcow2")
-			if err := os.WriteFile(dst, []byte("their kept disk"), 0o600); err != nil {
-				t.Fatal(err)
-			}
+			plantOld(t, dst, "their kept disk")
 			now := time.Now().UTC().Format(time.RFC3339Nano)
 			path, backing := "/elsewhere/x.qcow2", ""
 			if col == "path" {
@@ -105,9 +104,7 @@ func TestImportVM_AnImageAtTheDisksNameIsNotAnOrphan(t *testing.T) {
 		t.Fatal(err)
 	}
 	dst := filepath.Join(poolDir, "imp-img-root.qcow2")
-	if err := os.WriteFile(dst, []byte("an image"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	plantOld(t, dst, "an image")
 	if err := s.db.Execute(context.Background(),
 		`INSERT INTO image_hosts (image_name, host_name, path, status, updated_at) VALUES ('base', 'test-host', ?, 'ready', ?)`,
 		dst, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
@@ -143,5 +140,149 @@ func TestMoveOrphanAside_NeverReplacesAFile(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(p); string(b) != "orphan" {
 		t.Fatalf("the orphan now holds %q", b)
+	}
+}
+
+// plantOld writes body to p and dates it two importOrphanMinAge-s back.
+func plantOld(t *testing.T, p, body string) {
+	t.Helper()
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// refusedAndUntouched asserts the import was refused and left dst as it was.
+func refusedAndUntouched(t *testing.T, s *Server, name, dst, body string) {
+	t.Helper()
+	err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, name, false)}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("an import over a file another flow may still be creating: %v, want FailedPrecondition", err)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != body {
+		t.Fatalf("the file now holds %q", b)
+	}
+	if aside, _ := filepath.Glob(dst + ".orphan-*"); len(aside) != 0 {
+		t.Fatalf("the file was moved aside: %v", aside)
+	}
+}
+
+func orphanFixture(t *testing.T, name string) (*Server, string) {
+	t.Helper()
+	s := concurrentImportServer(t, 10*oneDiskNeed())
+	stubQemuImg(t)
+	poolDir, err := s.importPoolDir(adminCtx(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, filepath.Join(poolDir, name+"-root.qcow2")
+}
+
+// CreateVM (and clone, restore) creates a VM's disk files while it holds its
+// admission reservation and before it writes the VM's row: a file at that
+// name is being created, not left over.
+func TestImportVM_ADiskAVMCreateIsStillWritingIsNotAnOrphan(t *testing.T) {
+	s, dst := orphanFixture(t, "web")
+	plantOld(t, dst, "being created")
+	amount := corrosion.QuotaAmount{VCPU: 1, MemMiB: 512, DiskGiB: 1}
+	lease, err := s.admitQuotaWithReservation(adminCtx(), "CreateVM", s.hostName, "default",
+		corrosion.WorkloadVM, "web", amount, amount, intentResourceGrow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.release(context.Background())
+	if ids, _ := corrosion.InFlightResourceIDs(context.Background(), s.db); !slices.Contains(ids, "vm:web") {
+		t.Fatalf("the create's reservation is not in flight: %v", ids)
+	}
+	refusedAndUntouched(t, s, "web", dst, "being created")
+}
+
+// A file modified within importOrphanMinAge may be another host's import into
+// a shared pool, or any flow that has not recorded it yet.
+func TestImportVM_ARecentlyWrittenFileIsNotAnOrphan(t *testing.T) {
+	s, dst := orphanFixture(t, "imp-fresh")
+	if err := os.WriteFile(dst, []byte("fresh"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	minuteAgo := time.Now().Add(-time.Minute)
+	if err := os.Chtimes(dst, minuteAgo, minuteAgo); err != nil {
+		t.Fatal(err)
+	}
+	refusedAndUntouched(t, s, "imp-fresh", dst, "fresh")
+}
+
+// A hotplug attach journals the path it is about to publish before the disk
+// row exists.
+func TestImportVM_AFileAnOperationJournaledIsNotAnOrphan(t *testing.T) {
+	s, dst := orphanFixture(t, "imp-hot")
+	plantOld(t, dst, "attaching")
+	j, err := opjournal.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetOpJournal(j)
+	if err := j.Write(opjournal.Entry{OperationID: "op-1", ResourceID: "vm:other", Kind: "attach_disk", Stage: "claimed",
+		Artifacts: map[string]string{"file_created_by_operation": dst}}); err != nil {
+		t.Fatal(err)
+	}
+	refusedAndUntouched(t, s, "imp-hot", dst, "attaching")
+}
+
+// Disk names may hold '-': VM web's disk x-root and import web-x's disk root
+// share web-x-root.qcow2. A same-host import of web in flight claims it.
+func TestImportVM_AFileAnotherImportInFlightMayWriteIsNotAnOrphan(t *testing.T) {
+	s, dst := orphanFixture(t, "web-x")
+	plantOld(t, dst, "web's")
+	release, err := s.claimImportName("web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	refusedAndUntouched(t, s, "web-x", dst, "web's")
+}
+
+// After an external snapshot a disk row names the overlay, and only the
+// overlay's header names the base at the disk's plain name.
+func TestImportVM_AKeptSnapshotsBaseIsNotAnOrphan(t *testing.T) {
+	s, dst := orphanFixture(t, "imp-snap")
+	plantOld(t, dst, "base")
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := s.db.Execute(context.Background(),
+		`INSERT INTO vm_disks (vm_name, disk_name, host_name, path, storage_type, updated_at, deleted_at)
+		 VALUES ('imp-snap', 'root', 'test-host', ?, 'local', ?, ?)`, strings.TrimSuffix(dst, ".qcow2")+".snap1", now, now); err != nil {
+		t.Fatal(err)
+	}
+	refusedAndUntouched(t, s, "imp-snap", dst, "base")
+}
+
+// A row that names the file through a symlinked directory still names it.
+func TestImportVM_AFileARowNamesThroughASymlinkIsNotAnOrphan(t *testing.T) {
+	s, dst := orphanFixture(t, "imp-link")
+	plantOld(t, dst, "linked")
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(filepath.Dir(dst), alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(context.Background(),
+		`INSERT INTO vm_disks (vm_name, disk_name, host_name, path, storage_type, updated_at)
+		 VALUES ('other', 'root', 'test-host', ?, 'local', ?)`, filepath.Join(alias, filepath.Base(dst)), time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	refusedAndUntouched(t, s, "imp-link", dst, "linked")
+}
+
+// --inspect writes nothing: it does not take, or wait on, the name's claim.
+func TestImportVM_InspectDoesNotNeedTheNamesClaim(t *testing.T) {
+	s, _ := orphanFixture(t, "imp-i")
+	release, err := s.claimImportName("imp-i")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-i", true)}}); err != nil {
+		t.Fatalf("an inspect beside an import of the same name: %v", err)
 	}
 }

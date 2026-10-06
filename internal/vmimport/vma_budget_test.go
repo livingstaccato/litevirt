@@ -14,7 +14,7 @@ import (
 func TestParseVMA_RefusesDevicesLargerThanItsBudget(t *testing.T) {
 	vma, _ := buildSyntheticVMA(t) // one 128 KiB device
 	dest := t.TempDir()
-	if _, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, 64*1024); err == nil {
+	if _, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, Budget(64*1024)); err == nil {
 		t.Fatal("a VMA declaring more than its budget was extracted")
 	}
 	if left, _ := os.ReadDir(dest); len(left) != 0 {
@@ -26,7 +26,7 @@ func TestParseVMA_StopsWhenTheImportIsCancelled(t *testing.T) {
 	vma, _ := buildSyntheticVMA(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := ParseVMA(ctx, bytes.NewReader(vma), t.TempDir(), 1<<40); err == nil {
+	if _, err := ParseVMA(ctx, bytes.NewReader(vma), t.TempDir(), Budget(1<<40)); err == nil {
 		t.Fatal("a cancelled import extracted the VMA anyway")
 	}
 }

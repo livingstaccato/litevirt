@@ -550,6 +550,16 @@ target sees the entry node, not the caller. Every file a foreign disk makes
 qemu open (backing files, VMDK extents, a data file) must sit beside the disk
 or in the import directory.
 
+Several imports can run on one host at once. Before each write — unpacking an
+OVA or VMA, copying a mapped disk, converting a disk into the pool — an import
+reserves the bytes it will write, and is admitted only if the filesystem has
+room for them on top of what the other running imports have reserved and not
+yet written, while still keeping the free headroom a cold migration keeps (5%
+of the filesystem, between 1 and 64 GiB). A reservation shrinks as the import
+writes and is released when it finishes or fails, so an import that does not
+fit beside the others is refused with the space it needs and what the others
+hold; retry it when they finish.
+
 ## Snapshots
 
 ```bash

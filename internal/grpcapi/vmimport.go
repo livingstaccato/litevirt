@@ -101,18 +101,18 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
-	// From here to the last converted disk the import writes; one import at a
-	// time per host, so its free-space checks hold. Nothing that waits on the
-	// client happens while it is held: a client that stops reading would hold
-	// every other import on the host.
-	releaseWrites, err := s.acquireImportWrites(ctx)
-	if err != nil {
-		return err
-	}
-	defer releaseWrites()
+	// From here to the last converted disk the import writes, alongside any
+	// other import on the host: each write phase reserves its bytes first, and
+	// every other import's check counts what this one has reserved and not yet
+	// written. The reservation is released before anything waits on the
+	// client, so a client that stops reading holds no other import's room.
+	space := s.reserveImportSpace(importDir)
+	defer space.release()
 
 	// ── Parse via the source adapter → ForeignVM ──
-	fv, err := s.parseImportSource(ctx, first.SourceFormat, srcPath, importDir)
+	fv, err := s.parseImportSource(ctx, first.SourceFormat, srcPath, importDir, func(total uint64) error {
+		return space.reserve(importDir, total, "unpacking the source")
+	})
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse source: %v", err)
 	}
@@ -126,7 +126,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	if first.Inspect {
 		// Nothing unpacked is needed to describe the source; free it before
 		// waiting on the client.
-		releaseWrites()
+		space.release()
 		_ = os.RemoveAll(importDir)
 		return s.sendImportInspect(stream, fv, project)
 	}
@@ -185,7 +185,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 	// Convert progress goes to the client from its own goroutine, and is
 	// dropped while a send is still pending: the conversion never waits on the
-	// client while it holds the import writes.
+	// client while it holds a reservation.
 	progress := make(chan *pb.ImportVMProgress, 1)
 	progressSent := make(chan struct{})
 	go func() {
@@ -209,12 +209,16 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		dst := lv.DiskPath(poolDir, name, d.Name) // poolDir/<vm>-<disk>.qcow2 (poolDir already the disks dir)
 		dst = filepath.Join(poolDir, name+"-"+d.Name+".qcow2")
 		curDisk := d.Name
+		// Each disk is a write phase of its own: what an earlier disk reserved
+		// and did not write (a sparse disk), it never will.
+		space.track(dst)
+		space.begin()
 		// The conversion writes up to the disk's limit into the pool, and a
 		// disk from outside the import directory is first copied privately.
 		limit := uint64(importSourceLimit(d.CapacityBytes))
 		need := limit
 		if !inImportDir(importDir, d.LocalPath) {
-			if err := s.requireImportSpace(importDir, limit, "a private copy of disk "+d.Name); err != nil {
+			if err := space.reserve(importDir, limit, "a private copy of disk "+d.Name); err != nil {
 				cleanupDisks()
 				return err
 			}
@@ -225,7 +229,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			// little is a full disk.
 			need += limit
 		}
-		if err := s.requireImportSpace(poolDir, need, "converting disk "+d.Name); err != nil {
+		if err := space.reserve(poolDir, need, "converting disk "+d.Name); err != nil {
 			cleanupDisks()
 			return err
 		}
@@ -234,7 +238,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			case progress <- &pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk}:
 			default:
 			}
-		}); err != nil {
+		}, space.track); err != nil {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "convert disk %q: %v", d.Name, err)
 		}
@@ -248,9 +252,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			d.CapacityBytes = info.VirtualSize
 		}
 	}
-	// The writes are done; let the next import write, and free the unpacked
-	// source, before anything here waits on this one's client again.
-	releaseWrites()
+	// The writes are done; drop what is left of the reservation, and free the
+	// unpacked source, before anything here waits on this one's client again.
+	space.release()
 	_ = os.RemoveAll(importDir)
 
 	// Re-check quota against the real converted sizes before committing.
@@ -602,7 +606,8 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 }
 
 // parseImportSource dispatches to the right adapter. auto sniffs by content.
-func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importDir string) (*vmimport.ForeignVM, error) {
+// An archive reserves what it unpacks into importDir through reserve.
+func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importDir string, reserve vmimport.Reserve) (*vmimport.ForeignVM, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	if format == "" || format == "auto" {
 		format = sniffImportFormat(srcPath)
@@ -627,7 +632,7 @@ func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importD
 			return nil, err
 		}
 		defer f.Close()
-		ovfPath, err := vmimport.UnpackOVA(f, importDir, int64(min(s.importExtractBudget(importDir), 1<<62)))
+		ovfPath, err := vmimport.UnpackOVA(f, importDir, reserve)
 		if err != nil {
 			return nil, err
 		}
@@ -648,7 +653,7 @@ func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importD
 			return nil, err
 		}
 		defer f.Close()
-		return vmimport.ParseVMA(ctx, f, importDir, s.importExtractBudget(importDir))
+		return vmimport.ParseVMA(ctx, f, importDir, reserve)
 	default:
 		return nil, fmt.Errorf("unrecognized source format (use --from ova|ovf|proxmox|vma)")
 	}
@@ -866,7 +871,10 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 // elsewhere would dump foreign bytes into a qcow2-named file and corrupt it) and
 // rejects any external backing-file / out-of-dir extent reference BEFORE invoking
 // qemu-img (a malicious descriptor would otherwise make qemu-img read host files).
-func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32)) error {
+//
+// track, when set, is told the name of the scratch file the conversion writes
+// in dst's directory before anything is written to it.
+func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32), track func(path string)) error {
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
 	}
@@ -906,6 +914,9 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	tmp := tf.Name()
 	tf.Close()
+	if track != nil {
+		track(tmp)
+	}
 	finished := false
 	defer func() {
 		if !finished {

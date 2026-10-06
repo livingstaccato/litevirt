@@ -20,7 +20,7 @@ func TestParseVMA_DeviceNameNeverLeavesTheImportDir(t *testing.T) {
 
 	root := t.TempDir()
 	dest := filepath.Join(root, "a", "b", "import")
-	if _, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, 1<<40); err != nil {
+	if _, err := ParseVMA(context.Background(), bytes.NewReader(vma), dest, Budget(1<<40)); err != nil {
 		t.Logf("ParseVMA: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "a", "escaped.raw")); err == nil {

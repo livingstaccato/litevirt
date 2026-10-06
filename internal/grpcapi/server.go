@@ -602,11 +602,10 @@ type Server struct {
 	// migration's disk copy (diskSpace). Nil in production.
 	diskSpaceOverride func(dir string) (avail, total uint64, err error)
 
-	// importWriteSlot admits one import's disk-writing phase at a time on this
-	// host (acquireImportWrites), so the free-space checks before each write
-	// are not glances two imports pass together. Made on first use.
-	importWriteSlot chan struct{}
-	importWriteOnce sync.Once
+	// importSpace holds the disk space each running import on this host has
+	// reserved and not yet written (reserveImportSpace), so the free-space
+	// checks before each write are not glances two imports pass together.
+	importSpace importSpaceLedger
 
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains

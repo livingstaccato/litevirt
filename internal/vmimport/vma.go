@@ -60,11 +60,12 @@ type vmaDevice struct {
 // file under destDir, parses the embedded qemu-server.conf, and returns the
 // assembled ForeignVM with each disk's LocalPath pointing at its raw file.
 //
-// budget bounds what extraction may write: the archive declares its devices'
-// sizes, a small compressed archive can declare terabytes, and destDir usually
-// shares a filesystem with the daemon's database. A declared total over budget
-// is refused before any file is created. Extraction stops when ctx ends.
-func ParseVMA(ctx context.Context, r io.Reader, destDir string, budget uint64) (*ForeignVM, error) {
+// reserve admits what extraction will write: the archive declares its
+// devices' sizes, a small compressed archive can declare terabytes, and
+// destDir usually shares a filesystem with the daemon's database. The declared
+// total is reserved before any file is created, and a refusal creates none.
+// Extraction stops when ctx ends.
+func ParseVMA(ctx context.Context, r io.Reader, destDir string, reserve Reserve) (*ForeignVM, error) {
 	dec, err := vmaDecompress(r)
 	if err != nil {
 		return nil, err
@@ -167,8 +168,8 @@ func ParseVMA(ctx context.Context, r io.Reader, destDir string, budget uint64) (
 	for _, dev := range devices {
 		declared += dev.size // each is capped at vmaMaxDeviceSize; no overflow
 	}
-	if declared > budget {
-		return nil, fmt.Errorf("vma: devices total %d bytes, more than the %d bytes free for extraction on this host", declared, budget)
+	if err := reserve(declared); err != nil {
+		return nil, fmt.Errorf("vma: devices total %d bytes: %w", declared, err)
 	}
 
 	// --- Create the sparse raw target files, indexed by dev_id. ---

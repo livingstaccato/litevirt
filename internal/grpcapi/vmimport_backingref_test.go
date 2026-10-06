@@ -148,7 +148,7 @@ func TestConvertForeignDisk_AStagedDiskOutsideTheImportDirConverts(t *testing.T)
 	disk := filepath.Join(staging, "vm-100-disk-0.qcow2")
 	qemuImg(t, "create", "-f", "qcow2", disk, "1M")
 	dst := filepath.Join(t.TempDir(), "out.qcow2")
-	if err := convertForeignDisk(context.Background(), disk, "qcow2", dst, importDir, 1<<40, nil); err != nil {
+	if err := convertForeignDisk(context.Background(), disk, "qcow2", dst, importDir, 1<<40, nil, nil); err != nil {
 		t.Fatalf("standalone staged disk outside the import dir: %v", err)
 	}
 }
@@ -179,7 +179,7 @@ func TestConvertForeignDisk_DeclaredVMDKIsJudgedAsVMDK(t *testing.T) {
 	desc := vmdkDescriptorNamedLikeRaw(t, importDir, outside)
 	dst := filepath.Join(t.TempDir(), "out.qcow2")
 
-	if err := convertForeignDisk(context.Background(), desc, "vmdk", dst, importDir, 1<<40, nil); err == nil {
+	if err := convertForeignDisk(context.Background(), desc, "vmdk", dst, importDir, 1<<40, nil, nil); err == nil {
 		t.Fatal("declared-vmdk descriptor whose extent is outside: converted, want refusal")
 	}
 }

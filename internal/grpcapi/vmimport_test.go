@@ -34,7 +34,7 @@ func TestConvertForeignDisk_VMDKRoundTrip(t *testing.T) {
 	qemuImg(t, "create", "-f", "qcow2", base, "16M")
 	qemuImg(t, "convert", "-O", "vmdk", "-o", "subformat=streamOptimized", base, vmdk)
 
-	if err := convertForeignDisk(context.Background(), vmdk, "vmdk", out, dir, 1<<40, nil); err != nil {
+	if err := convertForeignDisk(context.Background(), vmdk, "vmdk", out, dir, 1<<40, nil, nil); err != nil {
 		t.Fatalf("convertForeignDisk: %v", err)
 	}
 	info, err := qcow2.Info(out)
@@ -77,7 +77,7 @@ func TestConvertForeignDisk_HardFailsWithoutQemuImg(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "x.raw")
 	os.WriteFile(src, []byte("not a real disk"), 0o600)
-	err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(dir, "out.qcow2"), dir, 1<<40, nil)
+	err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(dir, "out.qcow2"), dir, 1<<40, nil, nil)
 	if err == nil {
 		t.Fatal("expected hard failure without qemu-img, got nil")
 	}

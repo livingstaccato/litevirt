@@ -662,7 +662,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// The target's qemu opens the installer ISO from its own filesystem: the
 	// target judges that file first (EnsureDisks with no stubs does only that).
 	if s.domainCarriesInstallerISO(vm.Name) {
-		if _, _, ierr := s.ensureDisksOnTarget(ctx, target.Name, vm.Name, nil, false); ierr != nil {
+		if _, _, ierr := s.ensureDisksOnTarget(ctx, target.Name, vm.Name, nil, false, true); ierr != nil {
 			progress.Status = "error"
 			progress.Error = "target refused the installer ISO: " + ierr.Error()
 			return progress

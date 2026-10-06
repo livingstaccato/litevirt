@@ -36,11 +36,14 @@ func sha(b string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// globalLibrary registers the built-in global library on the test host and
-// returns its directory.
+// globalLibrary registers the built-in global library on the test host, as the
+// daemon makes it (<data_dir>/pools/isos), and returns its directory.
 func globalLibrary(t *testing.T, s *Server) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := filepath.Join(s.dataDir, "pools", "isos")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
 		HostName: s.hostName, Name: globalISOLibrary, Driver: "dir", Target: dir,
 		Options: GlobalISOLibraryOptions(), State: "active",
@@ -165,8 +168,13 @@ func TestISOLibrary_AnEarlierPoolPathStillWorks(t *testing.T) {
 	if got := storedISO(t, s, "old"); got != iso {
 		t.Fatalf("stored iso = %q, want it as written (%s)", got, iso)
 	}
-	if pool, file, ok := s.specISORef(context.Background(), vmRecord(t, s, "old")); !ok || pool != "acme-isos" || file != "old.iso" {
-		t.Fatalf("a start takes it as %q/%q (%v), want acme-isos/old.iso", pool, file, ok)
+	spec := vmSpecFor(vmRecord(t, s, "old"))
+	if spec.GetIsoScope() != isoScopeProject {
+		t.Fatalf("recorded iso_scope = %q, want %q", spec.GetIsoScope(), isoScopeProject)
+	}
+	path, viaPool, err := s.resolveSpecISO(context.Background(), "acme", spec)
+	if err != nil || !viaPool || path != filepath.Join(mustEval(t, dir), "old.iso") {
+		t.Fatalf("a start takes it as %q (via pool %v, %v), want acme-isos/old.iso's file", path, viaPool, err)
 	}
 }
 
@@ -615,7 +623,10 @@ func TestISOLibrary_SyncCopiesVerifiesAndRemoves(t *testing.T) {
 	// host-b is a live cluster host, and what it presents to A is its peer cert.
 	asPeer := peerCtxFor(t, a, "host-b")
 	libA := globalLibrary(t, a)
-	libB := t.TempDir()
+	libB := filepath.Join(b.dataDir, "pools", "isos")
+	if err := os.MkdirAll(libB, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	if err := corrosion.UpsertStoragePool(context.Background(), a.db, corrosion.StoragePoolRecord{
 		HostName: "host-b", Name: globalISOLibrary, Driver: "dir", Target: libB, Options: GlobalISOLibraryOptions(), State: "active",
 	}); err != nil {
@@ -718,13 +729,13 @@ func TestISOLibrary_SyncServesOnlyTheRecordedVersion(t *testing.T) {
 func TestISOLibrary_SyncKeepsOnlyBytesMatchingTheRecord(t *testing.T) {
 	s, _, _ := isoServer(t)
 	dir := t.TempDir()
-	if _, _, err := s.writeLibraryFile(dir, "debian.iso", strings.NewReader("tampered"), 1<<20, sha(isoBody)); err == nil {
+	if _, _, err := s.writeLibraryFile(dir, "debian.iso", strings.NewReader("tampered"), 1<<20, sha(isoBody), true); err == nil {
 		t.Fatal("bytes that do not hash to the record were kept")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "debian.iso")); !os.IsNotExist(err) {
 		t.Fatal("a mismatched copy was left in the library")
 	}
-	if _, _, err := s.writeLibraryFile(dir, "debian.iso", strings.NewReader(isoBody), 1<<20, sha(isoBody)); err != nil {
+	if _, _, err := s.writeLibraryFile(dir, "debian.iso", strings.NewReader(isoBody), 1<<20, sha(isoBody), true); err != nil {
 		t.Fatalf("matching bytes: %v", err)
 	}
 }

@@ -159,19 +159,6 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		defer conn.Close()
 		return client.DeleteStoragePoolContent(ctx, req)
 	}
-	// A sync-mode global library removes the file from every host: record the
-	// removal first, so no host offers its copy back.
-	if isGlobalISOLibrary(rec) && isISOName(req.Filename) {
-		mode, merr := corrosion.GetISOLibraryMode(ctx, s.db)
-		if merr != nil {
-			return nil, status.Errorf(codes.FailedPrecondition, "read the ISO library mode: %v", merr)
-		}
-		if mode.Value == corrosion.ISOLibrarySync {
-			if perr := corrosion.PutISOCatalogEntry(ctx, s.db, corrosion.ISOCatalogEntry{Name: req.Filename, Deleted: true, Origin: s.hostName}, callerUsername(ctx)); perr != nil {
-				return nil, status.Errorf(codes.FailedPrecondition, "record the removal of %s from the ISO library: %v", req.Filename, perr)
-			}
-		}
-	}
 	if !isFileBasedDriver(rec.Driver) {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", req.PoolName)
 	}
@@ -182,6 +169,20 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	target, err := safename.SafeJoin(dir, req.Filename)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// A sync-mode global library removes the file from every host: record the
+	// removal (once the name is known good) before removing the file here, so
+	// no host offers its copy back.
+	if s.isGlobalISOLibrary(ctx, rec) && isISOName(req.Filename) {
+		mode, merr := corrosion.GetISOLibraryMode(ctx, s.db)
+		if merr != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "read the ISO library mode: %v", merr)
+		}
+		if mode.Value == corrosion.ISOLibrarySync {
+			if perr := corrosion.PutISOCatalogEntry(ctx, s.db, corrosion.ISOCatalogEntry{Name: req.Filename, Deleted: true, Origin: s.hostName}, callerUsername(ctx)); perr != nil {
+				return nil, status.Errorf(codes.FailedPrecondition, "record the removal of %s from the ISO library: %v", req.Filename, perr)
+			}
+		}
 	}
 	// os.Remove deletes a symlink itself (not its target), so this can't be
 	// redirected to delete an arbitrary file outside the pool.
@@ -234,7 +235,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		}
 	}
 	// A library holds ISOs, and a VM can only name a .iso there.
-	if isISOLibrary(rec) && !isISOName(first.Filename) {
+	if s.isISOLibrary(ctx, rec) && !isISOName(first.Filename) {
 		return status.Errorf(codes.InvalidArgument, "pool %q is an ISO library; only .iso files go in it", first.PoolName)
 	}
 
@@ -277,12 +278,22 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := s.globalLibraryWritable(ctx, rec); err != nil {
 		return err
 	}
+	// A library file is never replaced (a VM may boot it): refuse a taken name
+	// before reading a byte. The publish below is no-replace too.
+	library := s.isISOLibrary(ctx, rec)
 	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
+	}
+	if library {
+		if p, jerr := safename.SafeJoin(dir, first.Filename); jerr == nil {
+			if _, lerr := os.Lstat(p); lerr == nil {
+				return errLibraryFileExists(first.Filename)
+			}
+		}
 	}
 	hasher := sha256.New()
 	tmp, err := os.CreateTemp(dir, ".upload-*.tmp")
@@ -339,7 +350,11 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if fi, lerr := os.Lstat(dest); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
 		return status.Errorf(codes.FailedPrecondition, "destination %q is a symlink", first.Filename)
 	}
-	if err := os.Rename(tmpName, dest); err != nil {
+	if library {
+		if err := publishLibraryFile(tmpName, dest, first.Filename, false); err != nil {
+			return err
+		}
+	} else if err := os.Rename(tmpName, dest); err != nil {
 		return status.Errorf(codes.Internal, "finalize: %v", err)
 	}
 	if err := syncPath(dir); err != nil {
@@ -348,7 +363,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		_ = os.Remove(dest)
 		return status.Errorf(codes.Internal, "sync directory: %v", err)
 	}
-	if isGlobalISOLibrary(rec) {
+	if s.isGlobalISOLibrary(ctx, rec) {
 		sum := hex.EncodeToString(hasher.Sum(nil))
 		if fi, lerr := os.Lstat(dest); lerr == nil {
 			s.rememberISOHash(dest, fi, sum)

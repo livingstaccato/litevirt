@@ -1895,7 +1895,14 @@ func (d *Daemon) ensureGlobalISOLibrary(ctx context.Context) {
 	if d.db == nil {
 		return
 	}
-	if _, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, grpcapi.GlobalISOLibraryName); err != nil || ok {
+	if rec, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, grpcapi.GlobalISOLibraryName); err != nil || ok {
+		if ok && rec.Project != "" {
+			slog.Warn("global ISO library: this host has a project-owned pool named isos, so it has no global library; rename that pool",
+				"host", d.cfg.HostName, "project", rec.Project)
+		} else if ok && !corrosion.IsBuiltinISOLibraryRow(rec) {
+			slog.Info("global ISO library: this host's isos pool is not the daemon's (shared storage, say); it is the global library only in shared mode",
+				"host", d.cfg.HostName, "target", rec.Target)
+		}
 		return
 	}
 	dir := filepath.Join(d.cfg.DataDir, storage.ISOLibraryDir)

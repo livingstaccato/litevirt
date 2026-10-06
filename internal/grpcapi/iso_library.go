@@ -60,6 +60,9 @@ const (
 // which the daemon creates on every host that has none.
 const GlobalISOLibraryName = globalISOLibrary
 
+// DataDir is the daemon's data directory.
+func (s *Server) DataDir() string { return s.dataDir }
+
 // GlobalISOLibraryOptions are the options the daemon gives the built-in pool.
 func GlobalISOLibraryOptions() map[string]string { return map[string]string{isoContentOption: "iso"} }
 
@@ -78,16 +81,65 @@ func parseISORef(s string) (pool, file string, ok bool) {
 	return pool, file, true
 }
 
-func isGlobalISOLibrary(p corrosion.StoragePoolRecord) bool {
-	return p.Name == globalISOLibrary && p.Project == "" && isFileBasedDriver(p.Driver)
+// The kinds of pool a reference can resolve to, recorded in VMSpec.iso_scope.
+const (
+	isoScopeGlobal   = "global"   // the global ISO library
+	isoScopePool     = "pool"     // another pool with no project
+	isoScopeProject  = "project"  // a pool the VM's project owns
+	isoScopeHostPath = "hostpath" // an Admin's absolute host path
+)
+
+// isGlobalISOLibrary reports whether p is the cluster-global library. It is
+// not any row named "isos": in sync mode it is the daemon-made pool at
+// <data_dir>/pools/isos; in shared mode it is the global "isos" pool the Admin
+// put on shared storage (the setting is the designation, and only an Admin may
+// create or retarget that row). An unreadable mode fails closed: no pool is it.
+func (s *Server) isGlobalISOLibrary(ctx context.Context, p corrosion.StoragePoolRecord) bool {
+	if p.Name != globalISOLibrary || p.Project != "" || !isFileBasedDriver(p.Driver) {
+		return false
+	}
+	mode, err := corrosion.GetISOLibraryMode(ctx, s.db)
+	if err != nil {
+		return false
+	}
+	if mode.Value == corrosion.ISOLibraryShared {
+		return true
+	}
+	if !corrosion.IsBuiltinISOLibraryRow(p) {
+		return false
+	}
+	if p.HostName == s.hostName {
+		return filepath.Clean(p.Target) == filepath.Join(s.dataDir, storage.ISOLibraryDir)
+	}
+	return true
 }
 
 func isProjectISOLibrary(p corrosion.StoragePoolRecord) bool {
 	return p.Project != "" && isFileBasedDriver(p.Driver) && strings.EqualFold(p.Options[isoContentOption], "iso")
 }
 
-func isISOLibrary(p corrosion.StoragePoolRecord) bool {
-	return isGlobalISOLibrary(p) || isProjectISOLibrary(p)
+func (s *Server) isISOLibrary(ctx context.Context, p corrosion.StoragePoolRecord) bool {
+	return s.isGlobalISOLibrary(ctx, p) || isProjectISOLibrary(p)
+}
+
+// poolISOKind is the kind of pool p is, as VMSpec.iso_scope records it.
+func (s *Server) poolISOKind(ctx context.Context, p corrosion.StoragePoolRecord) string {
+	switch {
+	case s.isGlobalISOLibrary(ctx, p):
+		return isoScopeGlobal
+	case p.Project == "":
+		return isoScopePool
+	}
+	return isoScopeProject
+}
+
+// poolsSharingDir returns the pool rows on host whose directory is rec's.
+func (s *Server) poolsSharingDir(ctx context.Context, host string, rec corrosion.StoragePoolRecord) ([]corrosion.StoragePoolRecord, error) {
+	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	if err != nil {
+		return nil, err
+	}
+	return s.isoPoolFor(ctx, host, filepath.Join(filepath.Clean(dir), "x.iso"))
 }
 
 // poolDirResolved is a file-based pool's directory with symlinks resolved.
@@ -102,47 +154,38 @@ func (s *Server) poolDirResolved(p corrosion.StoragePoolRecord) (string, error) 
 }
 
 // authorizeISORef is the create-time authority for a library reference, judged
-// against the replicated pool rows of host. The global library is open to every
-// VM; any other pool must be one the VM's project may use and the caller may
-// read — every pool row mapping that directory, since a file there is in all of
-// them.
-func (s *Server) authorizeISORef(ctx context.Context, project, host, pool, file string) error {
+// against the replicated pool rows of host: the VM's project must be allowed
+// to use, and the caller to read, every pool row mapping that directory, since
+// a file there is in all of them. The global library is a row like any other
+// here (no other pool may share its directory). It returns the kind of pool
+// the reference names, which the create records.
+func (s *Server) authorizeISORef(ctx context.Context, project, host, pool, file string) (string, error) {
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, pool)
 	if err != nil {
-		return status.Errorf(codes.Internal, "iso: look up pool %q on %s: %v", pool, host, err)
+		return "", status.Errorf(codes.Internal, "iso: look up pool %q on %s: %v", pool, host, err)
 	}
 	if !ok {
-		return status.Errorf(codes.FailedPrecondition, "iso %s/%s: there is no pool %q on host %s", pool, file, pool, host)
+		return "", status.Errorf(codes.FailedPrecondition, "iso %s/%s: there is no pool %q on host %s", pool, file, pool, host)
 	}
 	if !isFileBasedDriver(rec.Driver) {
-		return status.Errorf(codes.InvalidArgument, "iso %s/%s: pool %q (%s) holds no files", pool, file, pool, rec.Driver)
+		return "", status.Errorf(codes.InvalidArgument, "iso %s/%s: pool %q (%s) holds no files", pool, file, pool, rec.Driver)
 	}
-	if isGlobalISOLibrary(rec) {
-		return nil
-	}
-	dir, derr := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
-	if derr != nil {
-		return status.Errorf(codes.FailedPrecondition, "iso %s/%s: %v", pool, file, derr)
-	}
-	rows, err := s.isoPoolFor(ctx, host, filepath.Join(filepath.Clean(dir), file))
+	rows, err := s.poolsSharingDir(ctx, host, rec)
 	if err != nil {
-		return status.Errorf(codes.Internal, "iso: look up storage pools on %s: %v", host, err)
+		return "", status.Errorf(codes.FailedPrecondition, "iso %s/%s: %v", pool, file, err)
 	}
 	for _, p := range rows {
-		if isGlobalISOLibrary(p) {
-			continue
-		}
 		denied := s.admitPoolAttach(ctx, project, host, p.Name)
 		if denied == nil {
 			denied = s.authorizeResourceRead(ctx, p.Project, poolRBACPathFor(p.Project, p.Name), "storage.content.read")
 		}
 		if denied != nil {
-			return status.Errorf(codes.PermissionDenied,
+			return "", status.Errorf(codes.PermissionDenied,
 				"iso %s/%s is in the directory of storage pool %q, which this caller may not read or this VM's project may not use: %v",
 				pool, file, p.Name, status.Convert(denied).Message())
 		}
 	}
-	return nil
+	return s.poolISOKind(ctx, rec), nil
 }
 
 // isoRefForPath maps an absolute path that names a .iso directly in a
@@ -162,11 +205,16 @@ func (s *Server) isoRefForPath(ctx context.Context, host, p string) (string, boo
 	return rows[0].Name + "/" + base, true
 }
 
-// resolveISORef is the host's own resolution of a reference to the file qemu
-// opens: a plain file directly in the pool's directory (no symlink, one link,
-// not refused by storage.CheckReadFile), and — for the global library in sync
-// mode — a copy matching the library record.
-func (s *Server) resolveISORef(ctx context.Context, pool, file string) (string, error) {
+// resolveISOForVM is a host's own resolution of a reference to the file qemu
+// opens for a VM of project, wherever that happens — the create, every start,
+// a migration target. The pool must be on this host and of the kind recorded
+// at create (scope; empty for a VM created before it was recorded), and every
+// pool mapping its directory here must be global or the VM's project's: a
+// same-named pool of another project on another host is not this VM's. The
+// file is a plain file directly in the pool's directory (no symlink, one link,
+// not refused by storage.CheckReadFile), and with libraryCheck a global-library
+// file in sync mode must match the library record.
+func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file string, libraryCheck bool) (string, error) {
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool)
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "iso: look up pool %q: %v", pool, err)
@@ -177,6 +225,22 @@ func (s *Server) resolveISORef(ctx context.Context, pool, file string) (string, 
 	if !isFileBasedDriver(rec.Driver) {
 		return "", status.Errorf(codes.InvalidArgument, "iso %s/%s: pool %q (%s) holds no files", pool, file, pool, rec.Driver)
 	}
+	if kind := s.poolISOKind(ctx, rec); scope != "" && scope != isoScopeHostPath && kind != scope {
+		return "", status.Errorf(codes.FailedPrecondition,
+			"iso %s/%s: pool %q on this host (%s) is a %s pool, but the VM was created with a %s one, so it is not the same library",
+			pool, file, pool, s.hostName, kind, scope)
+	}
+	rows, err := s.poolsSharingDir(ctx, s.hostName, rec)
+	if err != nil {
+		return "", status.Errorf(codes.FailedPrecondition, "iso %s/%s: %v", pool, file, err)
+	}
+	for _, r := range rows {
+		if r.Project != "" && !tenancy.AdmitAttach(project, r.Project) {
+			return "", status.Errorf(codes.FailedPrecondition,
+				"iso %s/%s: on this host (%s) that directory belongs to pool %q of project %q, which project %q may not use",
+				pool, file, s.hostName, r.Name, r.Project, tenancy.NormalizeProject(project))
+		}
+	}
 	dir, err := s.poolDirResolved(rec)
 	if err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "iso %s/%s: pool directory: %v", pool, file, err)
@@ -185,8 +249,10 @@ func (s *Server) resolveISORef(ctx context.Context, pool, file string) (string, 
 	if err := s.checkVMISOFile(path); err != nil {
 		return "", err
 	}
-	if err := s.checkLibraryCopy(ctx, rec, file, path); err != nil {
-		return "", err
+	if libraryCheck {
+		if err := s.checkLibraryCopy(ctx, rec, file, path); err != nil {
+			return "", err
+		}
 	}
 	return path, nil
 }
@@ -194,20 +260,17 @@ func (s *Server) resolveISORef(ctx context.Context, pool, file string) (string, 
 // checkLibraryCopy refuses a sync-mode global-library file whose local copy
 // does not match the replicated library record (or that has none).
 func (s *Server) checkLibraryCopy(ctx context.Context, rec corrosion.StoragePoolRecord, file, path string) error {
-	if !isGlobalISOLibrary(rec) {
+	if !s.isGlobalISOLibrary(ctx, rec) {
 		return nil
 	}
-	mode, err := corrosion.GetISOLibraryMode(ctx, s.db)
+	mode, cur, err := corrosion.CurrentISOCatalog(ctx, s.db)
 	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "iso %s/%s: cannot read the ISO library mode: %v", globalISOLibrary, file, err)
+		return status.Errorf(codes.FailedPrecondition, "iso %s/%s: cannot read the ISO library: %v", globalISOLibrary, file, err)
 	}
 	if mode.Value != corrosion.ISOLibrarySync {
 		return nil
 	}
-	e, ok, err := corrosion.GetISOCatalogEntry(ctx, s.db, file)
-	if err != nil {
-		return status.Errorf(codes.Internal, "iso: read the ISO library record: %v", err)
-	}
+	e, ok := cur[file]
 	if !ok || e.Deleted {
 		return status.Errorf(codes.FailedPrecondition,
 			"iso %s/%s is not in the cluster's ISO library (iso_library_mode is sync, so every library file is recorded when it is uploaded or pulled); upload or pull it again",
@@ -294,16 +357,30 @@ func (s *Server) rememberISOHash(path string, fi os.FileInfo, sum string) {
 	s.isoLib.hashes[path] = isoHashEntry{key: isoKeyFor(fi), sum: sum}
 }
 
+// errLibraryFileExists is the refusal of a write over a library file.
+func errLibraryFileExists(name string) error {
+	return status.Errorf(codes.FailedPrecondition,
+		"%s is already in the library, and a library file is never replaced (a VM may boot it); remove it first with `lv iso rm`, or use another name", name)
+}
+
 // writeLibraryFile writes src into dir/name: through a temp file, at most
-// limit bytes, matching wantSHA when given, synced, then renamed over the old
-// name (never written through a link there). It returns the sha256 and size.
-func (s *Server) writeLibraryFile(dir, name string, src io.Reader, limit int64, wantSHA string) (string, int64, error) {
+// limit bytes, matching wantSHA when given, synced, then put in place. Only
+// the daemon's sync (replace) puts a file over an existing name, by rename;
+// every other write is no-replace, and a name already taken is refused
+// (errLibraryFileExists) — never written through a link there either. It
+// returns the sha256 and size.
+func (s *Server) writeLibraryFile(dir, name string, src io.Reader, limit int64, wantSHA string, replace bool) (string, int64, error) {
 	dest, err := safename.SafeJoin(dir, name)
 	if err != nil {
 		return "", 0, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if fi, lerr := os.Lstat(dest); lerr == nil && !fi.Mode().IsRegular() {
-		return "", 0, status.Errorf(codes.FailedPrecondition, "%s exists and is not a plain file", dest)
+	if fi, lerr := os.Lstat(dest); lerr == nil {
+		if !replace {
+			return "", 0, errLibraryFileExists(name)
+		}
+		if !fi.Mode().IsRegular() {
+			return "", 0, status.Errorf(codes.FailedPrecondition, "%s exists and is not a plain file", dest)
+		}
 	}
 	tmp, err := os.CreateTemp(dir, ".iso-*.tmp")
 	if err != nil {
@@ -333,8 +410,8 @@ func (s *Server) writeLibraryFile(dir, name string, src io.Reader, limit int64, 
 	if err := syncPath(tmpName); err != nil {
 		return "", 0, status.Errorf(codes.Internal, "sync: %v", err)
 	}
-	if err := os.Rename(tmpName, dest); err != nil {
-		return "", 0, status.Errorf(codes.Internal, "finalize: %v", err)
+	if err := publishLibraryFile(tmpName, dest, name, replace); err != nil {
+		return "", 0, err
 	}
 	if err := syncPath(dir); err != nil {
 		_ = os.Remove(dest)
@@ -346,11 +423,34 @@ func (s *Server) writeLibraryFile(dir, name string, src io.Reader, limit int64, 
 	return sum, n, nil
 }
 
+// publishLibraryFile puts a written temp file at dest: by rename when
+// replacing, otherwise by a hard link that fails on an existing name (the
+// temp name is removed by the caller, leaving the file one link).
+func publishLibraryFile(tmpName, dest, name string, replace bool) error {
+	if replace {
+		if err := os.Rename(tmpName, dest); err != nil {
+			return status.Errorf(codes.Internal, "finalize: %v", err)
+		}
+		return nil
+	}
+	if err := os.Link(tmpName, dest); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return errLibraryFileExists(name)
+		}
+		return status.Errorf(codes.Internal, "finalize: %v", err)
+	}
+	if err := os.Remove(tmpName); err != nil {
+		_ = os.Remove(dest)
+		return status.Errorf(codes.Internal, "finalize: %v", err)
+	}
+	return nil
+}
+
 // recordLibraryFile records a file just written to the global library, when
 // the library is in sync mode; on failure the file is withdrawn, so no host
 // holds a library file the cluster has no record of.
 func (s *Server) recordLibraryFile(ctx context.Context, rec corrosion.StoragePoolRecord, name, path, sum string, size int64) error {
-	if !isGlobalISOLibrary(rec) {
+	if !s.isGlobalISOLibrary(ctx, rec) {
 		return nil
 	}
 	mode, err := corrosion.GetISOLibraryMode(ctx, s.db)
@@ -377,7 +477,7 @@ func (s *Server) recordLibraryFile(ctx context.Context, rec corrosion.StoragePoo
 // globalLibraryWritable is the pre-write check for the global library in sync
 // mode, so a write that could not be recorded is refused before any byte lands.
 func (s *Server) globalLibraryWritable(ctx context.Context, rec corrosion.StoragePoolRecord) error {
-	if !isGlobalISOLibrary(rec) {
+	if !s.isGlobalISOLibrary(ctx, rec) {
 		return nil
 	}
 	mode, err := corrosion.GetISOLibraryMode(ctx, s.db)
@@ -396,7 +496,7 @@ func (s *Server) globalLibraryWritable(ctx context.Context, rec corrosion.Storag
 // the global library takes storage.library.write at / (Admin), any other pool
 // storage.content.write on the pool.
 func (s *Server) authorizeLibraryWrite(ctx context.Context, rec corrosion.StoragePoolRecord) error {
-	if isGlobalISOLibrary(rec) {
+	if s.isGlobalISOLibrary(ctx, rec) || (rec.Name == globalISOLibrary && rec.Project == "") {
 		if err := s.RequirePerm(ctx, "/", verbISOLibraryWrite, "admin"); err != nil {
 			if status.Code(err) == codes.PermissionDenied {
 				return status.Errorf(codes.PermissionDenied,
@@ -430,7 +530,7 @@ func (s *Server) ListISOs(ctx context.Context, req *pb.ListISOsRequest) (*pb.Lis
 	allowed := map[string]bool{}
 	for _, p := range pools {
 		switch {
-		case isGlobalISOLibrary(p):
+		case s.isGlobalISOLibrary(ctx, p):
 			allowed[p.Name] = true
 		case isProjectISOLibrary(p):
 			if req.GetProject() != "" && tenancy.NormalizeProject(req.GetProject()) != tenancy.NormalizeProject(p.Project) {
@@ -490,16 +590,23 @@ func (s *Server) listLibrary(ctx context.Context, p corrosion.StoragePoolRecord)
 	if err != nil {
 		return nil
 	}
-	global := isGlobalISOLibrary(p)
+	// A directory another project's pool also maps holds files that may be
+	// that project's: none of them is listed through this library. (The
+	// storage branch's per-file ownership refines this once merged.)
+	rows, err := s.poolsSharingDir(ctx, s.hostName, p)
+	if err != nil {
+		return nil
+	}
+	for _, r := range rows {
+		if r.Project != "" && r.Project != p.Project {
+			return nil
+		}
+	}
+	global := s.isGlobalISOLibrary(ctx, p)
 	var catalog map[string]corrosion.ISOCatalogEntry
 	if global {
-		if mode, merr := corrosion.GetISOLibraryMode(ctx, s.db); merr == nil && mode.Value == corrosion.ISOLibrarySync {
-			catalog = map[string]corrosion.ISOCatalogEntry{}
-			if all, cerr := corrosion.ListISOCatalog(ctx, s.db); cerr == nil {
-				for _, e := range all {
-					catalog[e.Name] = e
-				}
-			}
+		if mode, cur, merr := corrosion.CurrentISOCatalog(ctx, s.db); merr == nil && mode.Value == corrosion.ISOLibrarySync {
+			catalog = cur
 		}
 	}
 	var out []*pb.ISOEntry
@@ -569,7 +676,7 @@ func (s *Server) PullISO(ctx context.Context, req *pb.PullISORequest) (*pb.PullI
 	if !found {
 		return nil, status.Errorf(codes.NotFound, "pool %q not on host %q", pool, host)
 	}
-	if !isISOLibrary(rec) {
+	if !s.isISOLibrary(ctx, rec) {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"pool %q is not an ISO library: the global library is %q, and a project library is a file-based pool the project owns with --option content=iso",
 			pool, globalISOLibrary)
@@ -638,16 +745,29 @@ func (s *Server) copyHostFileToLibrary(dir, name, src, checksum string) (string,
 	if err := storage.CheckReadFile(src, s.dataDir, s.pkiDir); err != nil {
 		return "", 0, status.Errorf(codes.InvalidArgument, "host_path: %v", err)
 	}
-	f, err := os.Open(src)
+	// The link (virtio-win.iso → a versioned file) is resolved once; the file
+	// it names is opened without following anything further, and the file
+	// actually opened is judged again, so a link swapped in after the check
+	// above cannot point the copy at a refused file.
+	resolved, err := filepath.EvalSymlinks(src)
+	if err != nil {
+		return "", 0, status.Errorf(codes.FailedPrecondition, "host_path: %v", err)
+	}
+	f, fi, openedAs, err := openNoFollow(resolved)
 	if err != nil {
 		return "", 0, status.Errorf(codes.FailedPrecondition, "host_path: %v", err)
 	}
 	defer f.Close()
-	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() {
+	if !fi.Mode().IsRegular() {
 		return "", 0, status.Errorf(codes.InvalidArgument, "host_path %q is not a regular file", src)
 	}
-	return s.writeLibraryFile(dir, name, f, maxPoolUploadBytes, checksum)
+	if openedAs == "" {
+		openedAs = resolved
+	}
+	if err := storage.CheckReadFile(openedAs, s.dataDir, s.pkiDir); err != nil {
+		return "", 0, status.Errorf(codes.InvalidArgument, "host_path: %v", err)
+	}
+	return s.writeLibraryFile(dir, name, f, maxPoolUploadBytes, checksum, false)
 }
 
 // pullURLToLibrary downloads into a library under the image-pull limits
@@ -671,7 +791,7 @@ func (s *Server) pullURLToLibrary(dir, name, url, checksum string) (string, int6
 		return "", 0, status.Errorf(codes.Internal, "open pulled file: %v", err)
 	}
 	defer f.Close()
-	return s.writeLibraryFile(dir, name, f, maxPoolUploadBytes, checksum)
+	return s.writeLibraryFile(dir, name, f, maxPoolUploadBytes, checksum, false)
 }
 
 // ── library mode ──
@@ -692,9 +812,11 @@ func (s *Server) GetISOLibraryMode(ctx context.Context, _ *emptypb.Empty) (*pb.I
 	return s.isoLibraryModeStatus(ctx)
 }
 
-// SetISOLibraryMode changes it (admin). Switching to sync records the files
-// this host's global library holds that the library has no record of yet, so
-// they reach every other host.
+// SetISOLibraryMode changes it (admin). Setting it starts a new generation of
+// library records (corrosion/iso_library.go): earlier records, tombstones
+// included, stop counting, and every host records what its library actually
+// holds — this host at once, the others on their next sync pass — so the
+// records describe the files as they are.
 func (s *Server) SetISOLibraryMode(ctx context.Context, req *pb.SetISOLibraryModeRequest) (*pb.ISOLibraryMode, error) {
 	if err := RequireRole(ctx, "admin"); err != nil {
 		return nil, err
@@ -712,7 +834,9 @@ func (s *Server) SetISOLibraryMode(ctx context.Context, req *pb.SetISOLibraryMod
 		return nil, status.Errorf(codes.Internal, "set ISO library mode: %v", err)
 	}
 	if mode == corrosion.ISOLibrarySync {
-		s.adoptLocalLibraryFiles(ctx)
+		if err := s.SyncISOLibrary(ctx); err != nil {
+			slog.Warn("iso library: first sync pass after the switch", "error", err)
+		}
 	}
 	s.audit(ctx, "storage.iso_library_mode", "iso_library_mode", "ISO library mode set to "+mode, "ok")
 	s.publish("storage.iso_library_mode", mode, "set by "+callerUsername(ctx))
@@ -720,25 +844,12 @@ func (s *Server) SetISOLibraryMode(ctx context.Context, req *pb.SetISOLibraryMod
 }
 
 // adoptLocalLibraryFiles records every plain .iso in this host's global
-// library that the library has no record of.
-func (s *Server) adoptLocalLibraryFiles(ctx context.Context) {
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
-	if err != nil || !ok || !isGlobalISOLibrary(rec) {
-		return
-	}
-	known := map[string]bool{}
-	if all, err := corrosion.ListISOCatalog(ctx, s.db); err == nil {
-		for _, e := range all {
-			known[e.Name] = true
-		}
-	}
+// library that the current generation has no record of (a tombstone counts
+// as one). It runs once per generation on each host.
+func (s *Server) adoptLocalLibraryFiles(ctx context.Context, rec corrosion.StoragePoolRecord, dir string, cur map[string]corrosion.ISOCatalogEntry) error {
 	for _, e := range s.listLibrary(ctx, rec) {
-		if known[e.GetName()] {
+		if _, known := cur[e.GetName()]; known || e.GetSyncState() == "syncing" {
 			continue
-		}
-		dir, err := s.poolDirResolved(rec)
-		if err != nil {
-			return
 		}
 		sum, err := s.isoFileSHA256(filepath.Join(dir, e.GetName()))
 		if err != nil {
@@ -746,10 +857,11 @@ func (s *Server) adoptLocalLibraryFiles(ctx context.Context) {
 		}
 		if err := corrosion.PutISOCatalogEntry(ctx, s.db, corrosion.ISOCatalogEntry{
 			Name: e.GetName(), SHA256: sum, Size: e.GetSizeBytes(), Origin: s.hostName,
-		}, callerUsername(ctx)); err != nil {
-			slog.Warn("iso library: record an existing file", "file", e.GetName(), "error", err)
+		}, "system:"+s.hostName); err != nil {
+			return fmt.Errorf("record %s: %w", e.GetName(), err)
 		}
 	}
+	return nil
 }
 
 // ── sync ──
@@ -766,7 +878,7 @@ func (s *Server) FetchISOLibraryFile(req *pb.FetchISOLibraryFileRequest, stream 
 		return status.Errorf(codes.InvalidArgument, "invalid library file name %q", name)
 	}
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
-	if err != nil || !ok || !isGlobalISOLibrary(rec) {
+	if err != nil || !ok || !s.isGlobalISOLibrary(ctx, rec) {
 		return status.Errorf(codes.NotFound, "no global ISO library on %s", s.hostName)
 	}
 	dir, err := s.poolDirResolved(rec)
@@ -824,21 +936,30 @@ func (r *fetchReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// SyncISOLibrary is one pass of a sync-mode global library on this host: every
-// recorded file is brought to the recorded sha256 (fetched from a host whose
-// copy matches), and every file recorded as removed is removed. A file the
-// library has no record of is left alone. The daemon runs it periodically.
+// SyncISOLibrary is one pass of a sync-mode global library on this host:
+//
+//  1. once per record generation, record the files this host holds that the
+//     generation has no record of (adoptLocalLibraryFiles);
+//  2. bring every recorded file to its recorded sha256 (fetched from a host
+//     whose copy matches), and remove every file recorded as removed; a file
+//     with no record is left alone;
+//  3. after a pass with no failures, record what this host has applied
+//     (its ack), and collect the records this host wrote that no longer count:
+//     those of an earlier generation, and tombstones every library host has
+//     applied.
+//
+// The daemon runs it periodically.
 func (s *Server) SyncISOLibrary(ctx context.Context) error {
 	if !s.isoLib.syncing.TryLock() {
 		return nil
 	}
 	defer s.isoLib.syncing.Unlock()
-	mode, err := corrosion.GetISOLibraryMode(ctx, s.db)
+	mode, cur, err := corrosion.CurrentISOCatalog(ctx, s.db)
 	if err != nil || mode.Value != corrosion.ISOLibrarySync {
 		return err
 	}
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
-	if err != nil || !ok || !isGlobalISOLibrary(rec) {
+	if err != nil || !ok || !s.isGlobalISOLibrary(ctx, rec) {
 		return err
 	}
 	raw, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
@@ -852,12 +973,28 @@ func (s *Server) SyncISOLibrary(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	entries, err := corrosion.ListISOCatalog(ctx, s.db)
+	acks, err := corrosion.ListISOLibraryHostAcks(ctx, s.db)
 	if err != nil {
 		return err
 	}
+	mine, acked := acks[s.hostName]
+	if !acked || mine.Gen != mode.UpdatedAt {
+		if err := s.adoptLocalLibraryFiles(ctx, rec, dir, cur); err != nil {
+			if errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
+				return nil // nothing can be recorded yet; try again next pass
+			}
+			return err
+		}
+		if mode, cur, err = corrosion.CurrentISOCatalog(ctx, s.db); err != nil {
+			return err
+		}
+	}
 	var errs []error
-	for _, e := range entries {
+	appliedThrough := ""
+	for _, e := range cur {
+		if appliedThrough == "" || corrosion.ISOTimestampAtOrAfter(e.UpdatedAt, appliedThrough) {
+			appliedThrough = e.UpdatedAt
+		}
 		if safename.ValidateName(e.Name) != nil || !isISOName(e.Name) {
 			continue
 		}
@@ -877,7 +1014,62 @@ func (s *Server) SyncISOLibrary(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("%s: %w", e.Name, ferr))
 		}
 	}
-	return errors.Join(errs...)
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	ack := corrosion.ISOLibraryHostAck{Host: s.hostName, Gen: mode.UpdatedAt, AppliedThrough: appliedThrough}
+	if !acked || mine.Gen != ack.Gen || mine.AppliedThrough != ack.AppliedThrough {
+		if err := corrosion.PutISOLibraryHostAck(ctx, s.db, ack); err != nil && !errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
+			return err
+		}
+		acks[s.hostName] = ack
+	}
+	return s.collectLibraryRecords(ctx, mode, acks)
+}
+
+// collectLibraryRecords empties the records this host wrote that no longer
+// count: an earlier generation's, and tombstones every host holding a global
+// library has applied (its ack is of this generation and at or after the
+// tombstone).
+func (s *Server) collectLibraryRecords(ctx context.Context, mode corrosion.ISOLibraryModePolicy, acks map[string]corrosion.ISOLibraryHostAck) error {
+	all, err := corrosion.ListISOCatalog(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	pools, err := corrosion.ListAllStoragePools(ctx, s.db)
+	if err != nil {
+		return err
+	}
+	var hosts []string
+	for _, p := range pools {
+		if corrosion.IsBuiltinISOLibraryRow(p) {
+			hosts = append(hosts, p.HostName)
+		}
+	}
+	appliedEverywhere := func(e corrosion.ISOCatalogEntry) bool {
+		for _, h := range hosts {
+			a, ok := acks[h]
+			if !ok || a.Gen != mode.UpdatedAt || a.AppliedThrough == "" || !corrosion.ISOTimestampAtOrAfter(a.AppliedThrough, e.UpdatedAt) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, e := range all {
+		if e.Origin != s.hostName || e.Collected() {
+			continue
+		}
+		if e.Gen == mode.UpdatedAt && !(e.Deleted && appliedEverywhere(e)) {
+			continue
+		}
+		if err := corrosion.CollectISOCatalogEntry(ctx, s.db, e.Name, "system:"+s.hostName); err != nil {
+			if errors.Is(err, corrosion.ErrClusterPolicyGateClosed) {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Server) fetchLibraryFile(ctx context.Context, dir string, e corrosion.ISOCatalogEntry) error {
@@ -896,7 +1088,7 @@ func (s *Server) fetchLibraryFile(ctx context.Context, dir string, e corrosion.I
 		}
 		st, err := client.FetchISOLibraryFile(ctx, &pb.FetchISOLibraryFileRequest{Name: e.Name, Sha256: e.SHA256})
 		if err == nil {
-			_, _, err = s.writeLibraryFile(dir, e.Name, &fetchReader{stream: st}, e.Size, e.SHA256)
+			_, _, err = s.writeLibraryFile(dir, e.Name, &fetchReader{stream: st}, e.Size, e.SHA256, true)
 		}
 		closePeer()
 		if err == nil {

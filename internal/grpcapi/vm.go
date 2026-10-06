@@ -85,6 +85,11 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	if err != nil {
 		return nil, err
 	}
+	// iso_scope is server-owned: a client's is dropped, and only a forwarded
+	// leg (a peer) carries the entry node's classification to the owner.
+	if sc := req.GetSpec().GetIsoScope(); sc != "" && s.requirePeerCert(ctx) == nil {
+		spec.IsoScope = sc
+	}
 	req = proto.Clone(req).(*pb.CreateVMRequest)
 	req.Spec = spec
 	if spec.Name == "" {
@@ -317,7 +322,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
 	// The owner's own filesystem decides which file the ISO is.
-	isoPath, err := s.resolveVMISO(ctx, spec.Iso)
+	isoPath, err := s.resolveVMISO(ctx, project, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -861,7 +866,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
-	if again, err := s.resolveVMISO(ctx, spec.Iso); err != nil || again != isoPath {
+	if again, err := s.resolveVMISO(ctx, project, spec); err != nil || again != isoPath {
 		claims.releaseAll(ctx)
 		cleanupDisks()
 		if err == nil {

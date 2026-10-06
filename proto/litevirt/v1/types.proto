@@ -139,6 +139,14 @@ message VMSpec {
     // and an older entry node simply never sets it (a custom-mode spec is
     // refused at validation rather than rendered without a model).
     string cpu_model = 42;
+
+    // iso_scope is server-owned: which kind of pool the owner resolved iso to
+    // at create — "global" (the global ISO library), "pool" (another pool with
+    // no project), "project" (a pool the VM's project owns) or "hostpath" (an
+    // Admin's absolute path). Every host that resolves iso later (a start, a
+    // migration target) refuses a pool of another kind, so a same-named pool
+    // elsewhere cannot stand in for it. Empty on VMs created before it existed.
+    string iso_scope = 43;
 }
 
 message DiskSpec {

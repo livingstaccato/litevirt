@@ -92,6 +92,13 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			return nil, err
 		}
 	}
+	// The global ISO library's row decides what every project may boot, so
+	// creating, replacing or retargeting it is an Admin's (storage.hostpath).
+	if req.Name == globalISOLibrary && (project == "" || (found && existing.Project == "")) {
+		if err := s.requireISOLibraryRowAuthority(ctx); err != nil {
+			return nil, err
+		}
+	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
@@ -189,6 +196,11 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 	}
 	if err := s.RequirePerm(ctx, poolRBACPathFor(rec.Project, req.Name), "storage.pool.write", "operator"); err != nil {
 		return nil, err
+	}
+	if rec.Name == globalISOLibrary && rec.Project == "" {
+		if err := s.requireISOLibraryRowAuthority(ctx); err != nil {
+			return nil, err
+		}
 	}
 	if host != s.hostName {
 		// Run the reference guard on THIS (entry) node's replicated view BEFORE
@@ -329,28 +341,64 @@ func (s *Server) poolReferenceGuard(ctx context.Context, host, name string, forc
 	return nil
 }
 
-// refuseGlobalISOLibraryOverlap keeps every other pool out of the global ISO
-// library's directory: a pool there (or above or below it) would let its
+// requireISOLibraryRowAuthority is what touching the global "isos" row takes.
+func (s *Server) requireISOLibraryRowAuthority(ctx context.Context) error {
+	if err := s.RequirePerm(ctx, "/", verbISOHostPath, "admin"); err != nil {
+		if status.Code(err) == codes.PermissionDenied {
+			return status.Errorf(codes.PermissionDenied,
+				"the global ISO library pool %q is created, replaced, retargeted or deleted only with %s at / (Admin): every project boots from it",
+				globalISOLibrary, verbISOHostPath)
+		}
+		return err
+	}
+	return nil
+}
+
+// refuseGlobalISOLibraryOverlap keeps the global ISO library's directory its
+// own: no pool may be created in, above or below it, and the library row may
+// not be put on a directory another pool maps. A pool sharing it would let its
 // writers put files in the library, which only an Admin may write.
 func (s *Server) refuseGlobalISOLibraryOverlap(ctx context.Context, req *pb.CreateStoragePoolRequest) error {
-	if !isFileBasedDriver(req.Driver) || (req.Name == globalISOLibrary && req.Project == "") {
-		return nil
-	}
-	lib, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
-	if err != nil {
-		return status.Errorf(codes.Internal, "lookup %s: %v", globalISOLibrary, err)
-	}
-	if !ok || !isGlobalISOLibrary(lib) {
-		return nil
-	}
-	libDir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: lib.Driver, Source: lib.Source, Target: lib.Target})
-	if err != nil {
+	if !isFileBasedDriver(req.Driver) {
 		return nil
 	}
 	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target})
 	if err != nil {
 		return nil // the driver reports a pool it cannot place
 	}
+	var others []corrosion.StoragePoolRecord
+	if req.Name == globalISOLibrary && req.Project == "" {
+		rows, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
+		if err != nil {
+			return status.Errorf(codes.Internal, "list pools: %v", err)
+		}
+		for _, r := range rows {
+			if r.Name != req.Name && isFileBasedDriver(r.Driver) {
+				others = append(others, r)
+			}
+		}
+	} else {
+		lib, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
+		if err != nil {
+			return status.Errorf(codes.Internal, "lookup %s: %v", globalISOLibrary, err)
+		}
+		if ok && lib.Project == "" && isFileBasedDriver(lib.Driver) {
+			others = append(others, lib)
+		}
+	}
+	for _, o := range others {
+		odir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: o.Driver, Source: o.Source, Target: o.Target})
+		if err != nil {
+			continue
+		}
+		if err := refuseOverlap(dir, odir, o.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func refuseOverlap(dir, libDir, other string) error {
 	forms := func(p string) []string {
 		out := []string{filepath.Clean(p)}
 		if r, err := filepath.EvalSymlinks(p); err == nil && r != out[0] {
@@ -362,7 +410,7 @@ func (s *Server) refuseGlobalISOLibraryOverlap(ctx context.Context, req *pb.Crea
 		for _, b := range forms(libDir) {
 			if pathWithin(a, b) || pathWithin(b, a) {
 				return status.Errorf(codes.InvalidArgument,
-					"pool directory %s overlaps the global ISO library's directory %s; choose another directory", dir, libDir)
+					"pool directory %s overlaps the directory %s of pool %q, and the global ISO library's directory is its own; choose another directory", dir, libDir, other)
 			}
 		}
 	}

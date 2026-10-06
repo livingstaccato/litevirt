@@ -2389,6 +2389,15 @@ message EnsureDisksRequest {
     // credentials into QEMU's TLS directory before the copy, and to report in
     // migration_tls_ready whether it could.
     bool want_migration_tls = 3;
+    // installer_iso_listed: the source sent installer_iso_paths (a source on an
+    // older build never sets it). installer_iso_paths are the installer CD-ROM
+    // paths the source's domain carries; empty means it carries none.
+    // installer_iso_runtime: the domain moves by libvirt runtime migration, so
+    // qemu here opens exactly those paths and the target must resolve the VM's
+    // ISO to the same file.
+    bool installer_iso_listed = 4;
+    repeated string installer_iso_paths = 5;
+    bool installer_iso_runtime = 6;
 }
 
 message DiskStub {

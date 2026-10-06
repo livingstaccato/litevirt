@@ -70,17 +70,36 @@ func (s *Server) isoPoolFor(ctx context.Context, host, iso string) ([]corrosion.
 
 // authorizeVMISO is the create-time gate for spec.Iso. It runs on the entry
 // node, where the caller is the user, and again on the owner, where a
-// forwarded call is a peer; both judge the replicated pool rows of host. A
-// non-admin's absolute path into a pool directory is judged as that pool's
+// forwarded call is a peer; both judge the replicated pool rows of host. It
+// records in spec.IsoScope which kind of pool (or an Admin's host path) the
+// ISO is, which every later resolution holds the VM to. On the owner, a
+// peer-forwarded spec arrives with the entry's classification, which the owner
+// keeps rather than re-deriving it from the peer's own (admin) authority.
+//
+// A non-admin's absolute path into a pool directory is judged as that pool's
 // reference and stored as written, so a compose file that names it does not
 // differ from what was stored.
 func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec *pb.VMSpec) error {
 	iso := spec.GetIso()
+	trusted := spec.GetIsoScope()
+	spec.IsoScope = ""
 	if iso == "" {
 		return nil
 	}
+	poolScope := func(pool, file string) error {
+		kind, err := s.authorizeISORef(ctx, project, host, pool, file)
+		if err != nil {
+			return err
+		}
+		if trusted != "" && trusted != kind {
+			return status.Errorf(codes.FailedPrecondition,
+				"iso %s/%s is a %s pool on %s, but the entry node saw a %s one; retry once the pool rows agree", pool, file, kind, host, trusted)
+		}
+		spec.IsoScope = kind
+		return nil
+	}
 	if pool, file, ok := parseISORef(iso); ok {
-		return s.authorizeISORef(ctx, project, host, pool, file)
+		return poolScope(pool, file)
 	}
 	if !filepath.IsAbs(iso) {
 		return status.Errorf(codes.InvalidArgument,
@@ -94,15 +113,16 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 		return status.Errorf(codes.InvalidArgument, "iso: %v", err)
 	}
 	perr := s.RequirePerm(ctx, "/", verbISOHostPath, "admin")
-	if perr == nil {
+	if perr == nil && (trusted == "" || trusted == isoScopeHostPath) {
+		spec.IsoScope = isoScopeHostPath
 		return nil
 	}
-	if status.Code(perr) != codes.PermissionDenied {
+	if perr != nil && status.Code(perr) != codes.PermissionDenied {
 		return perr
 	}
 	if ref, ok := s.isoRefForPath(ctx, host, iso); ok {
 		pool, file, _ := parseISORef(ref)
-		return s.authorizeISORef(ctx, project, host, pool, file)
+		return poolScope(pool, file)
 	}
 	return status.Errorf(codes.PermissionDenied,
 		"iso %q is a host path on %s; attaching an arbitrary host file lets the guest read it, "+
@@ -111,28 +131,47 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 		iso, host, verbISOHostPath)
 }
 
-// resolveVMISO is the owning host's resolution of spec.Iso to the file qemu
-// is handed, against its own filesystem: a library reference — or a path
-// directly in a pool directory — through its pool, any other (admin) absolute
-// path as itself. Either way the file is judged by
-// checkVMISOFile.
-func (s *Server) resolveVMISO(ctx context.Context, iso string) (string, error) {
+// resolveSpecISO is this host's resolution of a VM's ISO through its pool: a
+// library reference, or an absolute path recorded at create as a pool's file.
+// viaPool is false for an Admin's host path and for a VM created before
+// iso_scope was recorded whose ISO is an absolute path; the caller judges
+// that path as itself.
+func (s *Server) resolveSpecISO(ctx context.Context, project string, spec *pb.VMSpec) (path string, viaPool bool, err error) {
+	iso, scope := spec.GetIso(), spec.GetIsoScope()
 	if iso == "" {
-		return "", nil
+		return "", false, nil
 	}
 	if pool, file, ok := parseISORef(iso); ok {
-		return s.resolveISORef(ctx, pool, file)
+		path, err := s.resolveISOForVM(ctx, project, scope, pool, file, true)
+		return path, true, err
 	}
-	// A path directly in a pool directory is that pool's file, as every
-	// start will take it (specISORef).
-	if ref, ok := s.isoRefForPath(ctx, s.hostName, iso); ok {
+	switch scope {
+	case isoScopeGlobal, isoScopePool, isoScopeProject:
+		ref, ok := s.isoRefForPath(ctx, s.hostName, iso)
+		if !ok {
+			return "", true, status.Errorf(codes.FailedPrecondition,
+				"iso %q names a file in a %s pool, and no pool on this host (%s) has that directory", iso, scope, s.hostName)
+		}
 		pool, file, _ := parseISORef(ref)
-		return s.resolveISORef(ctx, pool, file)
+		path, err := s.resolveISOForVM(ctx, project, scope, pool, file, false)
+		return path, true, err
 	}
-	if err := s.checkVMISOFile(iso); err != nil {
+	return "", false, nil
+}
+
+// resolveVMISO is the owning host's resolution of spec.Iso to the file qemu
+// is handed, against its own filesystem: through its pool (resolveSpecISO),
+// or an Admin's absolute path as itself. Either way the file is judged by
+// checkVMISOFile.
+func (s *Server) resolveVMISO(ctx context.Context, project string, spec *pb.VMSpec) (string, error) {
+	path, viaPool, err := s.resolveSpecISO(ctx, project, spec)
+	if err != nil || viaPool || spec.GetIso() == "" {
+		return path, err
+	}
+	if err := s.checkVMISOFile(spec.GetIso()); err != nil {
 		return "", err
 	}
-	return iso, nil
+	return spec.GetIso(), nil
 }
 
 // checkVMISOFile is the host's judgement of the file qemu is handed, at
@@ -165,8 +204,29 @@ func (s *Server) checkVMISOFile(iso string) error {
 		return status.Errorf(codes.InvalidArgument,
 			"iso %q has %d hard links, so it is also another file; put a copy in a library instead (`lv iso pull`)", iso, n)
 	}
+	// The checks above name the file; this opens it the way the last moment
+	// before qemu can, without following a link, and confirms the open file
+	// is that same file at that same path.
+	if isoBeforeOpen != nil {
+		isoBeforeOpen(iso)
+	}
+	f, ofi, openedAs, err := openNoFollow(iso)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "iso %q could not be opened as the file itself (%v); an ISO must not be a link", iso, err)
+	}
+	f.Close()
+	if !os.SameFile(fi, ofi) || (openedAs != "" && openedAs != iso) {
+		return status.Errorf(codes.InvalidArgument, "iso %q changed while it was being checked; an ISO must be the file itself", iso)
+	}
+	if n, ok := linkCount(ofi); ok && n != 1 {
+		return status.Errorf(codes.InvalidArgument, "iso %q has %d hard links, so it is also another file", iso, n)
+	}
 	return nil
 }
+
+// isoBeforeOpen is a test seam: it runs between checkVMISOFile's checks of the
+// name and its no-follow open, where a swap would land.
+var isoBeforeOpen func(path string)
 
 // domainInstallerISOs returns the file sources of the CD-ROMs in a domain
 // definition, other than the VM's own cloud-init seed (litevirt writes that
@@ -194,34 +254,27 @@ func (s *Server) domainInstallerISOs(vmName, domXML string) []string {
 	return out
 }
 
-// specISORef returns the library reference spec.Iso stands for on this host:
-// the reference itself, or — for an absolute path naming a .iso directly in a
-// pool directory here, as earlier specs stored it — that pool's reference.
-func (s *Server) specISORef(ctx context.Context, vm *corrosion.VMRecord) (pool, file string, ok bool) {
+// vmSpecFor parses a VM row's spec; nil when it has none or it does not parse.
+func vmSpecFor(vm *corrosion.VMRecord) *pb.VMSpec {
 	if vm == nil || vm.Spec == "" {
-		return "", "", false
+		return nil
 	}
 	var spec pb.VMSpec
-	if json.Unmarshal([]byte(vm.Spec), &spec) != nil || spec.Iso == "" {
-		return "", "", false
+	if json.Unmarshal([]byte(vm.Spec), &spec) != nil {
+		return nil
 	}
-	if pool, file, ok := parseISORef(spec.Iso); ok {
-		return pool, file, true
-	}
-	if ref, ok := s.isoRefForPath(ctx, s.hostName, spec.Iso); ok {
-		return parseISORef(ref)
-	}
-	return "", "", false
+	return &spec
 }
 
 // verifyVMISOForStart judges, on this host, every installer CD-ROM the VM's
 // defined domain will hand qemu at its next start: a start, a snapshot revert
 // that can start it, a replace cutover. A domain with no installer CD-ROM
 // (failover, the reconciler, UpdateVM regenerate without it) starts even
-// after the ISO is gone. A library ISO is resolved again through its pool,
-// and the domain is pointed at that file if it names another path (a pool
-// directory that differs from the host the domain was defined on); any other
-// CD-ROM is judged as the path it is. A refusal keeps the VM down, loudly.
+// after the ISO is gone. An ISO in a pool is resolved again through this
+// host's pool, held to the kind recorded at create and to the VM's project,
+// and the domain is pointed at that file if it names another path (it was
+// defined on another host); an Admin's host path is judged as the path it is.
+// A refusal keeps the VM down, loudly.
 func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
 	if vm == nil || s.virt == nil {
 		return nil
@@ -235,24 +288,26 @@ func (s *Server) verifyVMISOForStart(vm *corrosion.VMRecord) error {
 		return nil
 	}
 	ctx := context.Background()
-	if pool, file, ok := s.specISORef(ctx, vm); ok {
-		path, err := s.resolveISORef(ctx, pool, file)
+	if spec := vmSpecFor(vm); spec != nil {
+		path, viaPool, err := s.resolveSpecISO(ctx, vm.Project, spec)
 		if err != nil {
-			return s.refuseISO(vm.Name, pool+"/"+file, err)
+			return s.refuseISO(vm.Name, spec.GetIso(), err)
 		}
-		updated := domXML
-		for _, c := range cdroms {
-			if c != path {
-				updated = repointCDROM(updated, c, path)
+		if viaPool {
+			updated := domXML
+			for _, c := range cdroms {
+				if c != path {
+					updated = repointCDROM(updated, c, path)
+				}
 			}
-		}
-		if updated != domXML {
-			if err := s.virt.DefineDomain(updated); err != nil {
-				return status.Errorf(codes.Internal, "point %s's installer CD-ROM at %s: %v", vm.Name, path, err)
+			if updated != domXML {
+				if err := s.virt.DefineDomain(updated); err != nil {
+					return status.Errorf(codes.Internal, "point %s's installer CD-ROM at %s: %v", vm.Name, path, err)
+				}
+				slog.Info("installer ISO: domain repointed at this host's library file", "vm", vm.Name, "iso", spec.GetIso(), "path", path)
 			}
-			slog.Info("installer ISO: domain repointed at this host's library file", "vm", vm.Name, "iso", pool+"/"+file, "path", path)
+			return nil
 		}
-		return nil
 	}
 	for _, iso := range cdroms {
 		if err := s.checkVMISOFile(iso); err != nil {
@@ -271,33 +326,55 @@ func repointCDROM(domXML, from, to string) string {
 }
 
 // verifyIncomingVMISO is the migration target's judgement, before a domain
-// carrying the VM's ISO lands here. A library ISO is resolved through this
-// host's pool; an absolute path is judged as itself. A missing file (or a
-// library this host lacks) is not a read, so it is left to libvirt, which
-// refuses a domain whose CD-ROM path is absent.
-func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord) error {
-	if vm == nil || vm.Spec == "" {
-		return nil
+// carrying the VM's installer ISO lands here. The source lists the CD-ROM
+// paths its domain carries (none: nothing to judge). An ISO in a pool is
+// resolved through this host's pool, held to the recorded kind and the VM's
+// project — a target without the pool refuses — and for a runtime migration,
+// where libvirt hands qemu here the source's path, that resolution must be
+// the very same path. Any other CD-ROM is judged as the path it is, and must
+// exist. A source on an older build lists nothing; then the spec decides.
+func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord, req *pb.EnsureDisksRequest) error {
+	spec := vmSpecFor(vm)
+	if spec == nil {
+		spec = &pb.VMSpec{}
 	}
-	var spec pb.VMSpec
-	if err := json.Unmarshal([]byte(vm.Spec), &spec); err != nil || spec.Iso == "" {
-		return nil
-	}
-	if pool, file, ok := s.specISORef(context.Background(), vm); ok {
-		rec, found, err := corrosion.GetStoragePool(context.Background(), s.db, s.hostName, pool)
-		if err != nil || !found {
+	ctx := context.Background()
+	if req.GetInstallerIsoListed() {
+		paths := req.GetInstallerIsoPaths()
+		if len(paths) == 0 {
 			return nil
 		}
-		dir, err := s.poolDirResolved(rec)
+		path, viaPool, err := s.resolveSpecISO(ctx, vm.Project, spec)
 		if err != nil {
+			return s.refuseISO(vm.Name, spec.GetIso(), err)
+		}
+		if viaPool {
+			if req.GetInstallerIsoRuntime() {
+				for _, p := range paths {
+					if p != path {
+						return s.refuseISO(vm.Name, spec.GetIso(), status.Errorf(codes.FailedPrecondition,
+							"the running VM's domain opens it at %s, and on this host it is %s; a running VM's CD-ROM path cannot change in a migration, so stop the VM and migrate it stopped, or give the library the same directory on both hosts",
+							p, path))
+					}
+				}
+			}
 			return nil
 		}
-		if _, err := os.Lstat(filepath.Join(dir, file)); os.IsNotExist(err) {
-			return nil
+		for _, p := range paths {
+			if err := s.checkVMISOFile(p); err != nil {
+				return s.refuseISO(vm.Name, p, err)
+			}
 		}
-		if _, err := s.resolveISORef(context.Background(), pool, file); err != nil {
-			return s.refuseISO(vm.Name, pool+"/"+file, err)
-		}
+		return nil
+	}
+	if spec.GetIso() == "" {
+		return nil
+	}
+	_, viaPool, err := s.resolveSpecISO(ctx, vm.Project, spec)
+	if err != nil {
+		return s.refuseISO(vm.Name, spec.GetIso(), err)
+	}
+	if viaPool {
 		return nil
 	}
 	if _, err := os.Lstat(spec.Iso); os.IsNotExist(err) {
@@ -322,17 +399,23 @@ func (s *Server) refuseISO(vmName, iso string, err error) error {
 		vmName, iso, reason)
 }
 
-// domainCarriesInstallerISO reports whether the VM's domain on THIS host
-// (the migration source) has an installer CD-ROM the target would open.
-func (s *Server) domainCarriesInstallerISO(name string) bool {
+// domainInstallerISOPaths returns the installer CD-ROM paths the VM's domain
+// on THIS host (the migration source) carries, which the target would open.
+func (s *Server) domainInstallerISOPaths(name string) []string {
 	if s.virt == nil {
-		return false
+		return nil
 	}
 	domXML, err := s.virt.DumpXMLInactive(name)
 	if err != nil {
-		return false
+		return nil
 	}
-	return len(s.domainInstallerISOs(name, domXML)) > 0
+	return s.domainInstallerISOs(name, domXML)
+}
+
+// domainCarriesInstallerISO reports whether the VM's domain on THIS host has
+// an installer CD-ROM.
+func (s *Server) domainCarriesInstallerISO(name string) bool {
+	return len(s.domainInstallerISOPaths(name)) > 0
 }
 
 func isISOName(name string) bool {

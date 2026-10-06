@@ -539,7 +539,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	useTLS := false
 	if withStorage {
 		var dstTLS bool
-		if createdStubs, dstTLS, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS); err != nil {
+		if createdStubs, dstTLS, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, diskStubs, srcTLS, !(fwVM || coldStopped)); err != nil {
 			// EnsureDisks removed whatever it had created; the cloud-init ISO
 			// pre-created above is the only leftover, and the abort removes it.
 			return err
@@ -560,7 +560,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 		// No disks to stub, but the target's qemu opens the installer ISO from
 		// its own filesystem: the target judges that file before the migration
 		// (EnsureDisks with no stubs does only that).
-		if _, _, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, nil, false); err != nil {
+		if _, _, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, nil, false, !(fwVM || coldStopped)); err != nil {
 			return err
 		}
 	}
@@ -1171,7 +1171,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	// The domain lands here with its installer ISO path; qemu on THIS host
 	// opens it, so this host judges it before the migration may proceed.
 	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
-		if err := s.verifyIncomingVMISO(rec); err != nil {
+		if err := s.verifyIncomingVMISO(rec, req); err != nil {
 			return nil, err
 		}
 	}
@@ -2016,8 +2016,13 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // With wantTLS it also has the target install its migration-TLS credentials
 // for QEMU and returns whether it could. An older target never answers that,
 // which reads as false.
-func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS bool) ([]string, bool, error) {
-	if len(stubs) == 0 && !wantTLS && !s.domainCarriesInstallerISO(vmName) {
+//
+// It also sends the installer CD-ROM paths the domain here carries, so the
+// target judges the ISO it would open; runtime says the domain moves by
+// libvirt runtime migration, where the target's qemu opens exactly those paths.
+func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, error) {
+	isoPaths := s.domainInstallerISOPaths(vmName)
+	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 {
 		return nil, false, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)
@@ -2027,7 +2032,10 @@ func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName str
 	}
 	defer conn.Close()
 
-	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS})
+	resp, err := client.EnsureDisks(ctx, &pb.EnsureDisksRequest{
+		VmName: vmName, Disks: stubs, WantMigrationTls: wantTLS,
+		InstallerIsoListed: true, InstallerIsoPaths: isoPaths, InstallerIsoRuntime: runtime && len(isoPaths) > 0,
+	})
 	if err != nil {
 		code := status.Code(err)
 		if code == codes.Unknown {

@@ -23901,8 +23901,17 @@ type EnsureDisksRequest struct {
 	// credentials into QEMU's TLS directory before the copy, and to report in
 	// migration_tls_ready whether it could.
 	WantMigrationTls bool `protobuf:"varint,3,opt,name=want_migration_tls,json=wantMigrationTls,proto3" json:"want_migration_tls,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// installer_iso_listed: the source sent installer_iso_paths (a source on an
+	// older build never sets it). installer_iso_paths are the installer CD-ROM
+	// paths the source's domain carries; empty means it carries none.
+	// installer_iso_runtime: the domain moves by libvirt runtime migration, so
+	// qemu here opens exactly those paths and the target must resolve the VM's
+	// ISO to the same file.
+	InstallerIsoListed  bool     `protobuf:"varint,4,opt,name=installer_iso_listed,json=installerIsoListed,proto3" json:"installer_iso_listed,omitempty"`
+	InstallerIsoPaths   []string `protobuf:"bytes,5,rep,name=installer_iso_paths,json=installerIsoPaths,proto3" json:"installer_iso_paths,omitempty"`
+	InstallerIsoRuntime bool     `protobuf:"varint,6,opt,name=installer_iso_runtime,json=installerIsoRuntime,proto3" json:"installer_iso_runtime,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *EnsureDisksRequest) Reset() {
@@ -23952,6 +23961,27 @@ func (x *EnsureDisksRequest) GetDisks() []*DiskStub {
 func (x *EnsureDisksRequest) GetWantMigrationTls() bool {
 	if x != nil {
 		return x.WantMigrationTls
+	}
+	return false
+}
+
+func (x *EnsureDisksRequest) GetInstallerIsoListed() bool {
+	if x != nil {
+		return x.InstallerIsoListed
+	}
+	return false
+}
+
+func (x *EnsureDisksRequest) GetInstallerIsoPaths() []string {
+	if x != nil {
+		return x.InstallerIsoPaths
+	}
+	return nil
+}
+
+func (x *EnsureDisksRequest) GetInstallerIsoRuntime() bool {
+	if x != nil {
+		return x.InstallerIsoRuntime
 	}
 	return false
 }
@@ -34379,11 +34409,14 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x16EnsureCloudInitRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x1a\n" +
 	"\buserdata\x18\x02 \x01(\tR\buserdata\x12$\n" +
-	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\x88\x01\n" +
+	"\rnetworkconfig\x18\x03 \x01(\tR\rnetworkconfig\"\x9e\x02\n" +
 	"\x12EnsureDisksRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12+\n" +
 	"\x05disks\x18\x02 \x03(\v2\x15.litevirt.v1.DiskStubR\x05disks\x12,\n" +
-	"\x12want_migration_tls\x18\x03 \x01(\bR\x10wantMigrationTls\"=\n" +
+	"\x12want_migration_tls\x18\x03 \x01(\bR\x10wantMigrationTls\x120\n" +
+	"\x14installer_iso_listed\x18\x04 \x01(\bR\x12installerIsoListed\x12.\n" +
+	"\x13installer_iso_paths\x18\x05 \x03(\tR\x11installerIsoPaths\x122\n" +
+	"\x15installer_iso_runtime\x18\x06 \x01(\bR\x13installerIsoRuntime\"=\n" +
 	"\bDiskStub\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +

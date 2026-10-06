@@ -30,7 +30,10 @@ func TestFleet_ISOLibrarySync(t *testing.T) {
 	}
 	dirs := map[string]string{}
 	for _, n := range c.Nodes {
-		dirs[n.Name] = t.TempDir()
+		dirs[n.Name] = filepath.Join(n.Server.DataDir(), "pools", "isos")
+		if err := os.MkdirAll(dirs[n.Name], 0o755); err != nil {
+			t.Fatal(err)
+		}
 		if err := corrosion.UpsertStoragePool(ctx, n.DB, corrosion.StoragePoolRecord{
 			HostName: n.Name, Name: grpcapi.GlobalISOLibraryName, Driver: "dir", Target: dirs[n.Name],
 			Options: grpcapi.GlobalISOLibraryOptions(), State: "active",

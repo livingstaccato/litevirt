@@ -1738,10 +1738,17 @@ message UploadStoragePoolContentRequest {
     string host      = 2; // optional — defaults to caller's host
     string filename  = 3; // base name only (no path separators)
     bytes  chunk     = 4;
+    // replica (header, peer only): the upload is a replica. It is written into
+    // the pool's replica area for (project, vm) under replica.file — which
+    // filename must equal — and its record written beside it.
+    ReplicaRecord replica = 5;
 }
 message UploadStoragePoolContentResponse {
     string path       = 1;
     int64  size_bytes = 2;
+    // true when the upload was written and recorded as replica. A sender of a
+    // replica treats false (a receiver that ignored the header) as a failure.
+    bool   replica_recorded = 3;
 }
 // Delete one file from a file-based pool (used by cross-host replication to
 // prune old replicas on a peer). filename is a base name.
@@ -1761,16 +1768,55 @@ message DeleteStoragePoolContentRequest {
 message PushReplicaIncrementRequest {
     string pool_name  = 1; // header
     string host       = 2; // header — optional, defaults to caller
-    string filename   = 3; // header — new replica base name
-    string base       = 4; // header — previous replica to fork from; "" = full
+    string filename   = 3; // header — new replica base name; must equal replica.file
+    string base       = 4; // header — a RECORDED replica of the same disk and schedule to fork from; "" = full
     int64  total_size = 5; // header — raw file virtual size
     int64  offset      = 6; // extent
     bytes  data        = 7; // extent
+    ReplicaRecord replica = 8; // header — required: the new replica's record
 }
 message PushReplicaIncrementResponse {
     string path          = 1;
     int64  bytes_written = 2;
+    bool   replica_recorded = 3;
 }
+
+// A replica's record. Replicas live in a daemon-owned area of the pool, one
+// directory per (project, vm), each file beside its record. Replication
+// lists, prunes and forks from, and promotion boots, only files that have a
+// record naming the caller's own project and VM — never a file matched by
+// name — so a pool every project shares cannot be used to read, overwrite or
+// delete another project's replicas or disks.
+message ReplicaRecord {
+    string project    = 1; // normalized project of the VM
+    string vm         = 2;
+    string disk       = 3;
+    string schedule   = 4; // the schedule that wrote it: "<schedule row vm_name>/<repo>"
+    string file       = 5; // "<disk>-<taken>.<format>", a base name in the owner directory
+    string format     = 6; // qcow2 | raw
+    string taken      = 7; // UTC run time, 20060102-150405
+    int64  size_bytes = 8; // set by ListReplicas
+}
+// Peer only. The replica records of one VM in a pool on host.
+message ListReplicasRequest {
+    string pool_name = 1;
+    string host      = 2; // optional — defaults to the receiver
+    string project   = 3;
+    string vm        = 4;
+}
+message ListReplicasResponse { repeated ReplicaRecord replicas = 1; }
+// Peer only. Keep the newest `keep` replicas one schedule recorded for one disk
+// of one VM; delete the older ones, never a file a VM disk references.
+message PruneReplicasRequest {
+    string pool_name = 1;
+    string host      = 2;
+    string project   = 3;
+    string vm        = 4;
+    string disk      = 5;
+    string schedule  = 6;
+    int32  keep      = 7;
+}
+message PruneReplicasResponse { int32 deleted = 1; }
 
 // ── Failover promotion (recover a VM from a replica) ──
 // RuntimeActionProof is the single-use authorization a coordinator (holding the
@@ -3243,6 +3289,10 @@ service LiteVirt {
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);
+    // Peer only: one VM's replica records in a pool (promotion, incremental fork base).
+    rpc ListReplicas(ListReplicasRequest) returns (ListReplicasResponse);
+    // Peer only: prune one schedule's recorded replicas of one disk.
+    rpc PruneReplicas(PruneReplicasRequest) returns (PruneReplicasResponse);
 
     // ── Internal ──
     rpc Ping(PingRequest) returns (PingResponse);

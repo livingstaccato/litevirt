@@ -235,15 +235,17 @@ func TestPromoteReplica_LiveDiskNeverOverwrites(t *testing.T) {
 	f.assertBIntact(t)
 }
 
-// seedOwnReplica gives (vm, disk) one replica in dr the way the replication
-// runner names it, and returns its name.
+// seedOwnReplica gives project a's (vm, disk) one recorded replica in dr and
+// returns its name.
 func seedOwnReplica(t *testing.T, f *poolFixture, vm, disk string) string {
 	t.Helper()
-	name := vm + "-" + disk + "-20261003-000000.qcow2"
-	if err := qcow2.Create(filepath.Join(f.dr, name), 1<<20, nil); err != nil {
+	rec := newReplicaRecord("a", vm, disk, vm+"/dr", "20261003-000000", "qcow2")
+	if _, err := publishRecordedReplica(context.Background(), f.dr, rec, func(tmp string) error {
+		return qcow2.Create(tmp, 1<<20, nil)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	return name
+	return rec.File
 }
 
 // promotedLiveName is the live-disk name doPromoteLocal derives.

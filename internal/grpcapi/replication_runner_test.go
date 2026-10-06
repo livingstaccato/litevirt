@@ -7,41 +7,64 @@ import (
 	"testing"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
+	"github.com/litevirt/litevirt/internal/corrosion"
 	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
-func TestPruneReplicas(t *testing.T) {
-	dir := t.TempDir()
-	// Five timestamped replicas of vm1/root, plus an unrelated file.
-	names := []string{
-		"vm1-root-20260101-000000.qcow2",
-		"vm1-root-20260102-000000.qcow2",
-		"vm1-root-20260103-000000.qcow2",
-		"vm1-root-20260104-000000.qcow2",
-		"vm1-root-20260105-000000.qcow2",
+// Pruning keeps the newest N of ONE schedule's recorded replicas of one disk
+// and touches nothing else: not another schedule's, not another disk's, not a
+// file with no record, and not one a VM disk is backed by.
+func TestPruneRecordedReplicas(t *testing.T) {
+	s := testServer(t)
+	dir := replicaPoolDir(t, s, "dr")
+	ctx := context.Background()
+	seed := func(disk, sched, taken string) string {
+		rec := newReplicaRecord("", "vm1", disk, sched, taken, "qcow2")
+		path, err := publishRecordedReplica(ctx, dir, rec, func(tmp string) error {
+			return os.WriteFile(tmp, []byte("x"), 0o600)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return path
 	}
-	for _, n := range names {
-		os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o644)
+	var mine []string
+	for _, ts := range []string{"20260101-000000", "20260102-000000", "20260103-000000", "20260104-000000", "20260105-000000"} {
+		mine = append(mine, seed("root", "vm1/dr", ts))
 	}
-	os.WriteFile(filepath.Join(dir, "other-vm-root-20260105-000000.qcow2"), []byte("x"), 0o644)
+	otherSched := seed("root", "fleet/dr", "20260101-000001")
+	otherDisk := seed("data", "vm1/dr", "20260101-000000")
+	unrecorded := filepath.Join(replicaOwnerDir(dir, "", "vm1"), "root-20251231-000000.qcow2")
+	if err := os.WriteFile(unrecorded, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The second-oldest is the base of a --no-localize promotion's overlay.
+	if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "vm1-promoted", HostName: s.hostName, State: "running"}, nil,
+		[]corrosion.DiskRecord{{VMName: "vm1-promoted", DiskName: "root", HostName: s.hostName, Path: "/live.qcow2", BackingDisk: mine[1]}}); err != nil {
+		t.Fatal(err)
+	}
 
-	// Keep newest 2 → delete the 3 oldest.
-	if got := pruneReplicas(dir, "vm1", "root", 2); got != 3 {
-		t.Fatalf("pruned %d, want 3", got)
+	// Keep the newest 2: the three oldest are candidates, the pinned one stays.
+	got, err := s.pruneRecordedReplicas(ctx, "dr", "", "vm1", "root", "vm1/dr", 2)
+	if err != nil || got != 2 {
+		t.Fatalf("pruned %d (%v), want 2", got, err)
 	}
-	// The two newest survive; the unrelated file is untouched.
-	for _, keep := range []string{"vm1-root-20260104-000000.qcow2", "vm1-root-20260105-000000.qcow2", "other-vm-root-20260105-000000.qcow2"} {
-		if _, err := os.Stat(filepath.Join(dir, keep)); err != nil {
-			t.Errorf("expected %s to survive: %v", keep, err)
+	for _, p := range []string{mine[1], mine[3], mine[4], otherSched, otherDisk, unrecorded} {
+		if _, err := os.Stat(p); err != nil {
+			t.Errorf("%s should survive: %v", filepath.Base(p), err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(dir, "vm1-root-20260101-000000.qcow2")); !os.IsNotExist(err) {
-		t.Errorf("oldest replica should have been pruned")
+	for _, p := range []string{mine[0], mine[2]} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("%s should have been pruned", filepath.Base(p))
+		}
+		if _, err := os.Stat(p + ".json"); !os.IsNotExist(err) {
+			t.Errorf("%s's record should have been removed", filepath.Base(p))
+		}
 	}
-	// keepN=0 keeps all.
-	if got := pruneReplicas(dir, "vm1", "root", 0); got != 0 {
-		t.Errorf("keepN=0 should prune nothing, got %d", got)
+	// keep=0 keeps all.
+	if got, _ := s.pruneRecordedReplicas(ctx, "dr", "", "vm1", "root", "vm1/dr", 0); got != 0 {
+		t.Errorf("keep=0 should prune nothing, got %d", got)
 	}
 }
 
@@ -58,36 +81,31 @@ func TestIsSharedDriver(t *testing.T) {
 	}
 }
 
-// fakeReplClient implements just the two RPCs pruneReplicasRemote uses.
+// fakeReplClient records the PruneReplicas call a cross-host prune makes.
 type fakeReplClient struct {
 	pb.LiteVirtClient
-	contents []*pb.StoragePoolContent
-	deleted  []string
+	got *pb.PruneReplicasRequest
 }
 
-func (f *fakeReplClient) ListStoragePoolContents(_ context.Context, _ *pb.ListStoragePoolContentsRequest, _ ...grpc.CallOption) (*pb.ListStoragePoolContentsResponse, error) {
-	return &pb.ListStoragePoolContentsResponse{Contents: f.contents}, nil
-}
-func (f *fakeReplClient) DeleteStoragePoolContent(_ context.Context, in *pb.DeleteStoragePoolContentRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
-	f.deleted = append(f.deleted, in.Filename)
-	return &emptypb.Empty{}, nil
+func (f *fakeReplClient) PruneReplicas(_ context.Context, in *pb.PruneReplicasRequest, _ ...grpc.CallOption) (*pb.PruneReplicasResponse, error) {
+	f.got = in
+	return &pb.PruneReplicasResponse{Deleted: 2}, nil
 }
 
-func TestPruneReplicasRemote(t *testing.T) {
-	c := &fakeReplClient{contents: []*pb.StoragePoolContent{
-		{Name: "vm1-root-20260101-000000.qcow2"},
-		{Name: "vm1-root-20260102-000000.qcow2"},
-		{Name: "vm1-root-20260103-000000.qcow2"},
-		{Name: "other-root-20260103-000000.qcow2"}, // different VM — must be ignored
-	}}
-	n := pruneReplicasRemote(context.Background(), c, "dr", "host-b", "vm1", "root", 1)
-	if n != 2 {
-		t.Fatalf("pruned %d, want 2", n)
+// A cross-host prune names the VM's project, the disk and the schedule, so the
+// peer prunes exactly that schedule's records — never a listing by name.
+func TestPruneReplicasAnywhere_Remote(t *testing.T) {
+	s := testServer(t)
+	c := &fakeReplClient{}
+	s.peerClientOverride = func(context.Context, string) (pb.LiteVirtClient, func(), error) {
+		return c, func() {}, nil
 	}
-	want := map[string]bool{"vm1-root-20260101-000000.qcow2": true, "vm1-root-20260102-000000.qcow2": true}
-	for _, d := range c.deleted {
-		if !want[d] {
-			t.Errorf("deleted unexpected %q (should keep newest + other VM)", d)
-		}
+	n := s.pruneReplicasAnywhere(context.Background(), "dr", "host-b", "acme", "vm1", "root", "vm1/dr", 1)
+	if n != 2 || c.got == nil {
+		t.Fatalf("pruned %d, request %+v", n, c.got)
+	}
+	if c.got.GetProject() != "acme" || c.got.GetVm() != "vm1" || c.got.GetDisk() != "root" ||
+		c.got.GetSchedule() != "vm1/dr" || c.got.GetKeep() != 1 || c.got.GetHost() != "host-b" {
+		t.Errorf("PruneReplicas request = %+v", c.got)
 	}
 }

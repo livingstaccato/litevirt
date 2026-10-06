@@ -218,6 +218,8 @@ const (
 	LiteVirt_ListSecurityGroups_FullMethodName         = "/litevirt.v1.LiteVirt/ListSecurityGroups"
 	LiteVirt_DeleteStoragePoolContent_FullMethodName   = "/litevirt.v1.LiteVirt/DeleteStoragePoolContent"
 	LiteVirt_PushReplicaIncrement_FullMethodName       = "/litevirt.v1.LiteVirt/PushReplicaIncrement"
+	LiteVirt_ListReplicas_FullMethodName               = "/litevirt.v1.LiteVirt/ListReplicas"
+	LiteVirt_PruneReplicas_FullMethodName              = "/litevirt.v1.LiteVirt/PruneReplicas"
 	LiteVirt_Ping_FullMethodName                       = "/litevirt.v1.LiteVirt/Ping"
 	LiteVirt_Ready_FullMethodName                      = "/litevirt.v1.LiteVirt/Ready"
 	LiteVirt_ProvisionNetwork_FullMethodName           = "/litevirt.v1.LiteVirt/ProvisionNetwork"
@@ -602,6 +604,10 @@ type LiteVirtClient interface {
 	DeleteStoragePoolContent(ctx context.Context, in *DeleteStoragePoolContentRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// Incremental replica push (dirty extents into a raw replica on a peer pool).
 	PushReplicaIncrement(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse], error)
+	// Peer only: one VM's replica records in a pool (promotion, incremental fork base).
+	ListReplicas(ctx context.Context, in *ListReplicasRequest, opts ...grpc.CallOption) (*ListReplicasResponse, error)
+	// Peer only: prune one schedule's recorded replicas of one disk.
+	PruneReplicas(ctx context.Context, in *PruneReplicasRequest, opts ...grpc.CallOption) (*PruneReplicasResponse, error)
 	// ── Internal ──
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
 	// Application-level readiness — see ReadyResponse. Ping says the endpoint is
@@ -3051,6 +3057,26 @@ func (c *liteVirtClient) PushReplicaIncrement(ctx context.Context, opts ...grpc.
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PushReplicaIncrementClient = grpc.ClientStreamingClient[PushReplicaIncrementRequest, PushReplicaIncrementResponse]
 
+func (c *liteVirtClient) ListReplicas(ctx context.Context, in *ListReplicasRequest, opts ...grpc.CallOption) (*ListReplicasResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListReplicasResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_ListReplicas_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *liteVirtClient) PruneReplicas(ctx context.Context, in *PruneReplicasRequest, opts ...grpc.CallOption) (*PruneReplicasResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PruneReplicasResponse)
+	err := c.cc.Invoke(ctx, LiteVirt_PruneReplicas_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *liteVirtClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PingResponse)
@@ -4228,6 +4254,10 @@ type LiteVirtServer interface {
 	DeleteStoragePoolContent(context.Context, *DeleteStoragePoolContentRequest) (*emptypb.Empty, error)
 	// Incremental replica push (dirty extents into a raw replica on a peer pool).
 	PushReplicaIncrement(grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]) error
+	// Peer only: one VM's replica records in a pool (promotion, incremental fork base).
+	ListReplicas(context.Context, *ListReplicasRequest) (*ListReplicasResponse, error)
+	// Peer only: prune one schedule's recorded replicas of one disk.
+	PruneReplicas(context.Context, *PruneReplicasRequest) (*PruneReplicasResponse, error)
 	// ── Internal ──
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
 	// Application-level readiness — see ReadyResponse. Ping says the endpoint is
@@ -5080,6 +5110,12 @@ func (UnimplementedLiteVirtServer) DeleteStoragePoolContent(context.Context, *De
 }
 func (UnimplementedLiteVirtServer) PushReplicaIncrement(grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]) error {
 	return status.Error(codes.Unimplemented, "method PushReplicaIncrement not implemented")
+}
+func (UnimplementedLiteVirtServer) ListReplicas(context.Context, *ListReplicasRequest) (*ListReplicasResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListReplicas not implemented")
+}
+func (UnimplementedLiteVirtServer) PruneReplicas(context.Context, *PruneReplicasRequest) (*PruneReplicasResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PruneReplicas not implemented")
 }
 func (UnimplementedLiteVirtServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
@@ -8656,6 +8692,42 @@ func _LiteVirt_PushReplicaIncrement_Handler(srv interface{}, stream grpc.ServerS
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type LiteVirt_PushReplicaIncrementServer = grpc.ClientStreamingServer[PushReplicaIncrementRequest, PushReplicaIncrementResponse]
 
+func _LiteVirt_ListReplicas_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListReplicasRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).ListReplicas(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_ListReplicas_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).ListReplicas(ctx, req.(*ListReplicasRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _LiteVirt_PruneReplicas_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PruneReplicasRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(LiteVirtServer).PruneReplicas(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: LiteVirt_PruneReplicas_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(LiteVirtServer).PruneReplicas(ctx, req.(*PruneReplicasRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _LiteVirt_Ping_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PingRequest)
 	if err := dec(in); err != nil {
@@ -10707,6 +10779,14 @@ var LiteVirt_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "DeleteStoragePoolContent",
 			Handler:    _LiteVirt_DeleteStoragePoolContent_Handler,
+		},
+		{
+			MethodName: "ListReplicas",
+			Handler:    _LiteVirt_ListReplicas_Handler,
+		},
+		{
+			MethodName: "PruneReplicas",
+			Handler:    _LiteVirt_PruneReplicas_Handler,
 		},
 		{
 			MethodName: "Ping",

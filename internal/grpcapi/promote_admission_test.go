@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -24,7 +23,8 @@ import (
 // the doPromoteLocal admission gate the way the create/start/migrate paths are
 // pinned.
 
-const promoteReplicaFile = "vm1-root-20260101000000.raw"
+// promoteReplicaFile is the replica seedPromotableVM records for vm1/root.
+const promoteReplicaFile = "root-20260101-000000.raw"
 
 // seedPromotableVM stages the durable record + replica file doPromoteLocal
 // needs: vm1 owned by ownerHost, a root-disk record, and a matching replica in
@@ -59,9 +59,7 @@ func seedPromotableVM(t *testing.T, s *Server, ownerHost, ownerState, project st
 			t.Fatalf("InsertHost(%s): %v", ownerHost, err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(poolDir, promoteReplicaFile), make([]byte, 1<<20), 0o644); err != nil {
-		t.Fatalf("write replica: %v", err)
-	}
+	seedReplica(t, poolDir, project, "vm1", "root", "20260101-000000", "raw", 1<<20)
 	return poolDir
 }
 
@@ -81,7 +79,7 @@ func assertNoPromotedArtifacts(t *testing.T, s *Server, poolDir, domain string) 
 	}
 	entries, _ := os.ReadDir(poolDir)
 	for _, e := range entries {
-		if e.Name() != promoteReplicaFile {
+		if e.Name() != replicaAreaDir {
 			t.Errorf("refused promotion left artifact %q in the pool", e.Name())
 		}
 	}

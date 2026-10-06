@@ -673,7 +673,7 @@ lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--pool-name 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>
   [--pool <p>] [--host <h>]   # where the replica lives (default: from the VM's schedule)
-  [--replica <file>]          # exact replica filename (default: newest)
+  [--replica <file>]          # one of the VM's recorded replicas, <disk>-<time>.<ext> (default: newest)
   [--new-name <name>]         # promote alongside a still-running original
   [--no-localize]             # boot off an overlay backed by the replica (fast; pins it)
   [--force]                   # promote even if the original is on a healthy host

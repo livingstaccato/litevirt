@@ -133,22 +133,3 @@ func TestForEachExtentChunk_SplitsLargeExtent(t *testing.T) {
 		}
 	}
 }
-
-func TestIsReplicaOf(t *testing.T) {
-	cases := []struct {
-		name, vm, disk string
-		want           bool
-	}{
-		{"web-root-20260608-120000.qcow2", "web", "root", true},
-		{"web-root-20260608-120000.raw", "web", "root", true},
-		{"web-data-20260608-120000.qcow2", "web", "root", false},
-		{"web-root-promoted-20260608.qcow2", "web", "root", true}, // still has the prefix
-		{"other-root-20260608.qcow2", "web", "root", false},
-		{"web-root-20260608.iso", "web", "root", false},
-	}
-	for _, c := range cases {
-		if got := isReplicaOf(c.name, c.vm, c.disk); got != c.want {
-			t.Errorf("isReplicaOf(%q,%q,%q) = %v, want %v", c.name, c.vm, c.disk, got, c.want)
-		}
-	}
-}

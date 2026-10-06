@@ -215,6 +215,23 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := validatePoolUploadName(first.Filename); err != nil {
 		return status.Errorf(codes.InvalidArgument, "filename: %v", err)
 	}
+	// A replica upload (cross-host replication) is a peer's alone, and lands in
+	// the VM's own directory of the replica area with its record — never as a
+	// bare name in a pool other projects use.
+	var replica *replicaRecord
+	if first.GetReplica() != nil {
+		if err := s.requirePeerCert(ctx); err != nil {
+			return status.Error(codes.PermissionDenied, "a replica upload is accepted only from a cluster host")
+		}
+		r, err := replicaRecordFromPB(first.GetReplica())
+		if err != nil {
+			return status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		if first.Filename != r.File {
+			return status.Errorf(codes.InvalidArgument, "filename %q is not the replica record's file %q", first.Filename, r.File)
+		}
+		replica = &r
+	}
 	host := first.Host
 	if host == "" {
 		host = s.hostName
@@ -274,6 +291,9 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err != nil {
 		return err
 	}
+	if replica != nil {
+		dir = replicaOwnerDir(dir, replica.Project, replica.VM)
+	}
 	dest, err := safename.SafeJoin(dir, first.Filename)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
@@ -283,7 +303,11 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := refuseExistingDest(dest, first.Filename); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	dirMode := os.FileMode(0o755)
+	if replica != nil {
+		dirMode = 0o700
+	}
+	if err := os.MkdirAll(dir, dirMode); err != nil {
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
 	}
 	tmp, err := os.CreateTemp(dir, ".upload-*.tmp")
@@ -342,5 +366,11 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		_ = os.Remove(dest)
 		return status.Errorf(codes.Internal, "sync directory: %v", err)
 	}
-	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total})
+	if replica != nil {
+		if err := writeReplicaRecord(dir, *replica); err != nil {
+			_ = os.Remove(dest)
+			return status.Errorf(codes.Internal, "record replica: %v", err)
+		}
+	}
+	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total, ReplicaRecorded: replica != nil})
 }

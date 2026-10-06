@@ -253,9 +253,37 @@ image. Watch for `replication.failed` notifications: a schedule failing this
 way keeps its previous replicas and stops making new ones.
 
 A replica is also **published by rename**. The copy lands in a dotted
-`.partial` sibling and is renamed into its final name only once it has
-completed and is non-empty, so an interrupted run cannot leave a
-truncated file under a name promotion would select.
+temp sibling and is renamed into its final name only once it has completed
+and is non-empty — never over a file already there — so an interrupted run
+cannot leave a truncated file promotion would select.
+
+### Where replicas live, and how they are selected
+
+A target pool is often a global pool every project uses, so replicas are not
+plain files in it. Each VM has its own directory in the pool's daemon-owned
+replica area, and each replica a **record** beside it:
+
+```
+<pool>/.replicas/<owner>/<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>
+<pool>/.replicas/<owner>/<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>.json
+```
+
+`<owner>` is a hash of the VM's project and name; the record names the
+project, VM, disk, format, time and the **schedule** that wrote it. Pruning
+(`--keep`), the incremental fork base and promotion select replicas only from
+the records of the VM's own project and name — never by a file-name prefix —
+and pruning only the records of the schedule that is running. A file in the
+area without a matching record is never read, forked from or deleted, and
+pruning never deletes a replica a VM disk is backed by (a `--no-localize`
+promotion records its replica as the disk's `backing_disk`). No pool-content
+RPC reaches the area: uploads refuse dotted names, listings skip directories.
+A cross-host replica is uploaded with its record (peer certificate only), and
+pruned on the peer through the peer-only `PruneReplicas`.
+
+Replicas written by an earlier build as `<vm>-<disk>-<time>.<ext>` files in
+the pool are not records: nothing selects or prunes them any more. Delete them
+by hand (the pool's content view in the UI, `DeleteStoragePoolContent`) once newer
+replicas exist.
 
 Manage it from the **Replication** section of the `/schedules` UI or the CLI:
 
@@ -284,9 +312,11 @@ to a full copy for a stopped VM / old libvirt / broken chain.
 ### Promotion (disaster recovery)
 
 A replica is inert until promoted. `lv replication promote <vm>` brings a VM up
-from its newest replica — locating it (from the VM's schedule, or `--pool`/
-`--host`), copying it into a self-contained live disk on the host that holds it,
-and defining + starting the VM there:
+from its newest recorded replica — locating it (from the VM's schedule, or
+`--pool`/`--host`), copying it into a self-contained live disk on the host that
+holds it, and defining + starting the VM there. `--replica` names one by its
+file name (`<disk>-<time>.<ext>`, as the `disk.replicated` event reports it);
+it must be one of the VM's own recorded replicas:
 
 ```bash
 lv replication promote web-1                 # take over the name (host-loss case)

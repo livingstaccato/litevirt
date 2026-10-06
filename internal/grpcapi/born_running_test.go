@@ -155,10 +155,7 @@ func TestPromoteReplica_ARenamedPromotionIsBornProvable(t *testing.T) {
 	); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	replicaPath := filepath.Join(poolDir, "vm1-root-20260101000000.raw")
-	if err := os.WriteFile(replicaPath, make([]byte, 1<<20), 0644); err != nil {
-		t.Fatalf("write replica: %v", err)
-	}
+	seedReplica(t, poolDir, "", "vm1", "root", "20260101-000000", "raw", 1<<20)
 
 	stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}
 	if err := s.PromoteReplica(&pb.PromoteReplicaRequest{

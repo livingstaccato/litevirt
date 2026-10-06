@@ -219,7 +219,7 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 		Status: "locating replica of disk " + src.DiskName + " in pool " + pool,
 	})
 
-	host, replica, err := s.findReplicaHost(ctx, req, src.DiskName, pool, schedHost)
+	host, replica, err := s.findReplicaHost(ctx, req, vm, src.DiskName, pool, schedHost)
 	if err != nil {
 		return err
 	}
@@ -424,24 +424,17 @@ func (s *Server) replicationScheduleForVM(ctx context.Context, vmName string) (c
 	return corrosion.BackupScheduleRecord{}, false
 }
 
-// replicaPattern matches a replica file for (vm, disk): both the full-copy
-// qcow2 form and the incremental raw form.
-func isReplicaOf(name, vmName, diskName string) bool {
-	prefix := fmt.Sprintf("%s-%s-", vmName, diskName)
-	return strings.HasPrefix(name, prefix) &&
-		(strings.HasSuffix(name, ".qcow2") || strings.HasSuffix(name, ".raw"))
-}
-
 // findReplicaHost locates the host holding the chosen (req.replica) or newest
 // replica of (vm, disk) in pool. Candidates come from an explicit target host,
 // the schedule's host, or every active host that has the pool.
 //
-// It lists pool files via poolContentNames (local read or host-cert peer call),
-// NOT the RBAC-gated ListStoragePoolContents handler: AutoPromoteReplica runs
-// from the failover coordinator with an unauthenticated context, which the
-// handler's RequireRole would reject (manual promote, with an operator ctx,
-// worked — auto-promote did not).
-func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequest, diskName, pool, schedHost string) (host, replica string, err error) {
+// Replicas are chosen from the VM's own records only (replicaRecordsOn: the
+// records in its project's and name's directory of the pool's replica area),
+// so a file of another project that merely shares a name prefix is never a
+// candidate. Remote hosts are asked with this host's certificate, not through
+// an RBAC-gated handler: AutoPromoteReplica runs from the failover coordinator
+// with an unauthenticated context.
+func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, diskName, pool, schedHost string) (host, replica string, err error) {
 	var candidates []string
 	switch {
 	case req.TargetHost != "":
@@ -458,77 +451,31 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 		}
 	}
 
-	bestHost, bestName := "", ""
+	var best replicaRecord
+	bestHost := ""
 	for _, h := range candidates {
-		for _, n := range s.poolContentNames(ctx, pool, h) {
-			if !isReplicaOf(n, req.VmName, diskName) {
+		for _, r := range s.replicaRecordsOn(ctx, pool, h, vm.Project, vm.Name) {
+			if r.Disk != diskName {
 				continue
 			}
 			if req.Replica != "" {
-				if n == req.Replica {
-					return h, n, nil
+				if r.File == req.Replica {
+					return h, r.File, nil
 				}
 				continue
 			}
-			// Timestamped suffix sorts lexically oldest→newest.
-			if n > bestName {
-				bestName, bestHost = n, h
+			if bestHost == "" || r.Taken > best.Taken || (r.Taken == best.Taken && r.File > best.File) {
+				best, bestHost = r, h
 			}
 		}
 	}
 	if req.Replica != "" {
-		return "", "", status.Errorf(codes.NotFound, "replica %q not found in pool %q", req.Replica, pool)
+		return "", "", status.Errorf(codes.NotFound, "replica %q of vm %q disk %q not found in pool %q", req.Replica, req.VmName, diskName, pool)
 	}
 	if bestHost == "" {
 		return "", "", status.Errorf(codes.NotFound, "no replica of %q disk %q found in pool %q", req.VmName, diskName, pool)
 	}
-	return bestHost, bestName, nil
-}
-
-// poolContentNames lists file names in a pool WITHOUT the RBAC gate, so it is
-// safe from unauthenticated internal contexts (scheduler / failover
-// coordinator). Local pool → read the directory; peer → dial with the host cert
-// (which the peer authorizes). Any error yields an empty list.
-func (s *Server) poolContentNames(ctx context.Context, pool, host string) []string {
-	if host == "" || host == s.hostName {
-		poolRef, ok := s.resolvePool(ctx, pool)
-		if !ok {
-			return nil
-		}
-		// A refused pool's directory is not listed, here or anywhere.
-		if !s.poolUsableForWrite(ctx, pool, poolRef) {
-			return nil
-		}
-		dir, err := fileBasedPoolDir(s.dataDir, poolRef)
-		if err != nil {
-			return nil
-		}
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return nil
-		}
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			if !e.IsDir() {
-				names = append(names, e.Name())
-			}
-		}
-		return names
-	}
-	client, conn, err := s.peerClient(ctx, host)
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-	resp, err := client.ListStoragePoolContents(ctx, &pb.ListStoragePoolContentsRequest{PoolName: pool, Host: host})
-	if err != nil {
-		return nil
-	}
-	names := make([]string, 0, len(resp.GetContents()))
-	for _, c := range resp.GetContents() {
-		names = append(names, c.GetName())
-	}
-	return names
+	return bestHost, best.File, nil
 }
 
 // relayPromote forwards a PromoteReplica stream to the host that holds the
@@ -555,6 +502,17 @@ func (s *Server) relayPromote(ctx context.Context, host string, req *pb.PromoteR
 			return err
 		}
 	}
+}
+
+// liveDiskBacking is replicaPath when the promoted live disk is an overlay on
+// it (--no-localize, or no qemu-img), "" when it was localized. Recorded as
+// the disk's backing_disk, it is what keeps replica pruning — and pool content
+// delete — off the replica a running VM reads through (DisksReferencingPath).
+func liveDiskBacking(livePath, replicaPath string) string {
+	if info, err := qcow2.Info(livePath); err == nil && info.BackingFile == replicaPath {
+		return replicaPath
+	}
+	return ""
 }
 
 // createOverlayNoClobber creates a qcow2 at path backed by backing, as a new
@@ -729,9 +687,13 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if err != nil {
 		return err
 	}
-	replicaPath := filepath.Join(poolDir, replica)
-	if _, err := os.Stat(replicaPath); err != nil {
-		return status.Errorf(codes.NotFound, "replica %q not present on %q: %v", replica, s.hostName, err)
+	// The replica is looked up again HERE, among this VM's own records on this
+	// host: a relayed or peer-direct request names a file, and a name is never
+	// enough to read one.
+	replicaRec, replicaPath, ok := recordedReplica(poolDir, vm.Project, vm.Name, replica)
+	if !ok || replicaRec.Disk != src.DiskName {
+		return status.Errorf(codes.NotFound, "replica %q is not a recorded replica of vm %q disk %q in pool %q on %q",
+			replica, vm.Name, src.DiskName, pool, s.hostName)
 	}
 
 	targetName := vm.Name
@@ -926,10 +888,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			return err
 		}
 		if req.NoLocalize {
-			backingFmt := "qcow2"
-			if strings.HasSuffix(replica, ".raw") {
-				backingFmt = "raw"
-			}
+			backingFmt := replicaRec.Format
 			_ = send(&pb.PromoteReplicaProgress{
 				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
 				Status: "creating overlay backed by replica (fast; pins the replica)",
@@ -1004,6 +963,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		VMName: targetName, DiskName: src.DiskName, HostName: s.hostName,
 		Path: livePath, SizeBytes: src.SizeBytes, StorageType: poolRef.Driver,
 		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0), Bus: promBus,
+		BackingDisk: liveDiskBacking(livePath, replicaPath),
 	}}
 
 	var netCfg []lv.NetworkConfig

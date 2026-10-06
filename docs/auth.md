@@ -498,7 +498,9 @@ it to impersonate a user.
 > (`GetRuntimeInventory`/`CheckVIPParticipant`/`CheckLBPresent`),
 > `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
 > peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
-> `PushReplicaIncrement`. Not enforced today.
+> `PushReplicaIncrement`. Not enforced today. (`ListReplicas`, `PruneReplicas`
+> and a replica-header `UploadStoragePoolContent` ARE peer-only, enforced: a
+> replica's record is written and read only by cluster hosts.)
 
 ### Who can read the state dump
 

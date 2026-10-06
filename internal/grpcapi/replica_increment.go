@@ -36,6 +36,15 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	if !isBaseName(first.Filename) || (first.Base != "" && !isBaseName(first.Base)) {
 		return status.Error(codes.InvalidArgument, "filename and base must be base names")
 	}
+	// Every replica carries its record: the receiver writes it into that VM's
+	// own directory of the replica area, never a bare name into the pool.
+	rec, err := replicaRecordFromPB(first.GetReplica())
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if first.Filename != rec.File {
+		return status.Errorf(codes.InvalidArgument, "filename %q is not the record's file %q", first.Filename, rec.File)
+	}
 	if first.TotalSize <= 0 {
 		return status.Error(codes.InvalidArgument, "total_size must be > 0")
 	}
@@ -43,7 +52,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	if host == "" {
 		host = s.hostName
 	}
-	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, host, first.PoolName)
+	pool, ok, err := corrosion.GetStoragePool(ctx, s.db, host, first.PoolName)
 	if err != nil {
 		return status.Errorf(codes.Internal, "lookup pool: %v", err)
 	}
@@ -84,17 +93,8 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 		return stream.SendAndClose(resp)
 	}
 
-	if !isFileBasedDriver(rec.Driver) {
+	if !isFileBasedDriver(pool.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
-	}
-	dir, err := s.poolWriteDir(ctx, rec)
-	if err != nil {
-		return err
-	}
-	if first.Base != "" {
-		if _, serr := os.Stat(filepath.Join(dir, first.Base)); serr != nil {
-			return status.Errorf(codes.FailedPrecondition, "base replica %q not present: %v", first.Base, serr)
-		}
 	}
 
 	var written int64
@@ -126,11 +126,14 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			written += int64(len(msg.Data))
 		}
 	}
-	dest, ferr := forkRawAndApply(dir, first.Filename, first.Base, first.TotalSize, apply)
+	dest, ferr := s.receiveRawReplica(ctx, first.PoolName, rec, first.Base, first.TotalSize, apply)
 	if ferr != nil {
+		if _, isStatus := status.FromError(ferr); isStatus {
+			return ferr
+		}
 		return status.Errorf(codes.Internal, "apply replica: %v", ferr)
 	}
-	return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written})
+	return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written, ReplicaRecorded: true})
 }
 
 // isBaseName rejects path separators / traversal so a streamed filename can't
@@ -182,7 +185,8 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 		return "", err
 	}
 	dest := filepath.Join(dir, name)
-	if err := os.Rename(tmpName, dest); err != nil {
+	// Never over a file already there (RENAME_NOREPLACE).
+	if err := placeNoClobber(tmpName, dest); err != nil {
 		return "", err
 	}
 	committed = true

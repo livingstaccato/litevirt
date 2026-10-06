@@ -63,6 +63,58 @@ best-effort basis but failure does not block the delete — operators
 who hit "rm" likely want the pool gone regardless. The underlying
 mount, if any, stays until manually cleaned up.
 
+## Host paths
+
+### Who may name one
+
+A pool that names a place on the host's own filesystem makes the daemon write
+there as root: VM disks, uploaded content, an NFS mount laid over the
+directory. Naming one is therefore root on that host, and takes the
+`storage.hostpath` verb at the cluster root `/` — which only the `Admin` role
+holds. An `Operator` binding does not carry it, not even at `/`, and neither
+does an `Admin` binding scoped to a project. What counts as a host path:
+
+| Driver | Host path |
+|---|---|
+| `local` | `--target` (with no target the pool lives in `<data_dir>/disks`) |
+| `dir` | `--target` (always) |
+| `nfs` | `--target`, and `--option options=…` (mount options reach mount(8) verbatim); with neither, the export is mounted under `<data_dir>/mounts` |
+| `btrfs` | `--source` |
+| `ceph` | `--option conf=…` and `--option keyring=…` |
+
+`iscsi`, `zfs`, `lvm-thin`, a `local` pool with no target and an `nfs` pool
+with neither a target nor mount options name no host path, so an operator with
+`storage.pool.write` on the pool's path may still create them.
+
+Some directories are refused to everyone, `Admin` included: the filesystem
+root; anything under `/bin`, `/boot`, `/dev`, `/etc`, `/lib*`, `/proc`, `/root`,
+`/run`, `/sbin`, `/sys`, `/usr`, `/var/run` or `/var/spool`; the daemon's PKI
+directory; the data directory and any directory containing it; and anything
+inside the data directory other than its `disks/` and `mounts/` areas. A target
+is judged both as written and after resolving symlinks, so a link at an
+innocent name does not reach a refused directory. Authority is checked on the
+node the request enters, so during a rolling upgrade an entry node on an older
+build does not check it; the directory check runs there and again on the
+pool's host.
+
+The same rules apply to compose `volumes:`, which are pools by another name,
+and a compose `backup-repos:` path needs the same authority (see
+[compose.md](compose.md#backup-repositories)).
+
+### Uploads
+
+`UploadStoragePoolContent` (the UI's ISO upload) writes only a plain file name
+with an image-like extension — `.iso .img .qcow2 .qcow .raw .vmdk .vdi .vhd
+.vhdx .ova .ovf`, or one of those compressed as `.gz .xz .zst .bz2` — that does
+not start with `.`. It never replaces anything already at the name, file or
+symlink: delete the old file first.
+
+A pool created before these checks whose directory is now refused keeps
+listing its contents, but every upload and content delete is refused with
+`FailedPrecondition`, and the daemon logs an ERROR naming the pool. Nothing is
+moved or deleted for you: recreate the pool on an allowed directory and move
+its disks there.
+
 ## Compose example
 
 ```yaml

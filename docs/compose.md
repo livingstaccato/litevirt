@@ -1025,6 +1025,14 @@ A disk with no `storage:` uses the default local driver. A disk's `storage:` nam
 
 and creating the VM fails with `storage "fast" is neither a volume of stack "shop" nor a storage pool on host "node-2"` when the pool exists on other hosts but not the one the VM is placed on. See [storage.md](storage.md) for host-level pool configuration.
 
+A volume that names a host path (a `target`, a `dir` or `btrfs` volume, NFS
+mount `options`, a Ceph `conf` or `keyring`) follows the same rule as a pool:
+`lv compose up` needs `storage.hostpath` at `/` (the Admin role) to add or
+change one, and refuses system and litevirt-internal directories to everyone
+([storage.md](storage.md#host-paths)). Re-deploying
+a volume exactly as the stored stack already has it needs no new authority, so
+an operator can re-deploy a stack an admin wrote.
+
 ## Stack-level settings
 
 ### DNS
@@ -1051,6 +1059,12 @@ Register logical backup-repo name → on-disk path mappings for the cluster, so 
 VM's `backup: { repo: <name> }` resolves without editing daemon config. These
 are CRDT-replicated and removed when the stack is deleted. A repo of the same
 name in the daemon config (`backup_repos:`) takes precedence.
+
+Registering a repo writes a host path the daemon later writes backups into as
+root, so adding one, or changing an existing name's path, needs
+`storage.hostpath` at `/` (the Admin role) — the same rule as passing a custom
+absolute `repo_path` to a backup RPC. Re-deploying a stack whose repos are
+already registered by it, unchanged, needs nothing more.
 
 ```yaml
 backup-repos:

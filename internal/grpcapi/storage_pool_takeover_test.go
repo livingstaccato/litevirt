@@ -60,7 +60,7 @@ func TestCreateStoragePool_CannotTakeOverAGlobalPool(t *testing.T) {
 	}
 
 	_, err := s.CreateStoragePool(mallory, &pb.CreateStoragePoolRequest{
-		Name: "shared-nfs", Driver: "local", Target: "/tmp/mallory", Project: "acme",
+		Name: "shared-nfs", Driver: "local", Project: "acme",
 	})
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("taking over a global pool: got %v, want PermissionDenied", err)
@@ -92,7 +92,7 @@ func TestCreateStoragePool_CannotTakeOverAnotherProjectsPool(t *testing.T) {
 	}
 
 	_, err := s.CreateStoragePool(mallory, &pb.CreateStoragePoolRequest{
-		Name: "bravo-pool", Driver: "local", Target: "/tmp/mallory", Project: "acme",
+		Name: "bravo-pool", Driver: "local", Project: "acme",
 	})
 	if status.Code(err) != codes.PermissionDenied {
 		t.Fatalf("taking over another project's pool: got %v, want PermissionDenied", err)
@@ -101,12 +101,16 @@ func TestCreateStoragePool_CannotTakeOverAnotherProjectsPool(t *testing.T) {
 
 // A tenant creating a NEW pool in their own project is unaffected: there is no
 // stored row to authorize against, so only the claimed path is checked.
+//
+// No Target: a pool on a host directory needs cluster-root authority, which a
+// project Admin does not hold (storage_pool_hostpath_test.go).
 func TestCreateStoragePool_OwnProjectNewPoolStillAllowed(t *testing.T) {
 	s := testServer(t)
+	s.dataDir = t.TempDir()
 	mallory := poolTenantCtx(t, s)
 
 	if _, err := s.CreateStoragePool(mallory, &pb.CreateStoragePoolRequest{
-		Name: "acme-pool", Driver: "local", Target: t.TempDir(), Project: "acme",
+		Name: "acme-pool", Driver: "local", Project: "acme",
 	}); err != nil {
 		t.Fatalf("creating a pool in one's own project: %v", err)
 	}
@@ -116,17 +120,17 @@ func TestCreateStoragePool_OwnProjectNewPoolStillAllowed(t *testing.T) {
 // CLI does) must keep working — the stored project matches the claim.
 func TestCreateStoragePool_OwnProjectRecreateStillAllowed(t *testing.T) {
 	s := testServer(t)
+	s.dataDir = t.TempDir()
 	mallory := poolTenantCtx(t, s)
-	dir := t.TempDir()
 
 	if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
 		HostName: s.hostName, Name: "acme-pool", Driver: "local",
-		Target: dir, State: "active", Project: "acme",
+		State: "active", Project: "acme",
 	}); err != nil {
 		t.Fatalf("seed acme pool: %v", err)
 	}
 	if _, err := s.CreateStoragePool(mallory, &pb.CreateStoragePoolRequest{
-		Name: "acme-pool", Driver: "local", Target: dir, Project: "acme",
+		Name: "acme-pool", Driver: "local", Project: "acme",
 	}); err != nil {
 		t.Fatalf("re-creating one's own pool: %v", err)
 	}

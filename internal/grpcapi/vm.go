@@ -3554,12 +3554,18 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 		}
 		if f != nil {
 			if vol, ok := f.Volumes[volumeName]; ok {
-				return storage.Config{
+				cfg := storage.Config{
 					Driver:  vol.Driver,
 					Source:  vol.Source,
 					Target:  vol.Target,
 					Options: vol.Options,
-				}, nil
+				}
+				// A stack stored before deploys checked this can still name a
+				// directory no pool may write into; refuse it at use.
+				if err := storage.CheckConfig(cfg, s.dataDir, s.pkiDir); err != nil {
+					return storage.Config{}, fmt.Errorf("volume %q of stack %q: %w", volumeName, stackName, err)
+				}
+				return cfg, nil
 			}
 		}
 	}

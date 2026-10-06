@@ -150,9 +150,9 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if !isFileBasedDriver(rec.Driver) {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", req.PoolName)
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	dir, err := s.poolWriteDir(rec)
 	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+		return nil, err
 	}
 	target, err := safename.SafeJoin(dir, req.Filename)
 	if err != nil {
@@ -187,7 +187,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := safename.ValidatePoolName(first.PoolName); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if err := safename.ValidateName(first.Filename); err != nil {
+	if err := validatePoolUploadName(first.Filename); err != nil {
 		return status.Errorf(codes.InvalidArgument, "filename: %v", err)
 	}
 	host := first.Host
@@ -245,9 +245,18 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if !isFileBasedDriver(rec.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	dir, err := s.poolWriteDir(rec)
 	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+		return err
+	}
+	dest, err := safename.SafeJoin(dir, first.Filename)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Refuse a taken name before streaming anything; publishNoClobber below
+	// refuses it again atomically.
+	if err := refuseExistingDest(dest, first.Filename); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
@@ -297,16 +306,10 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := syncPath(tmpName); err != nil {
 		return status.Errorf(codes.Internal, "sync: %v", err)
 	}
-	dest, err := safename.SafeJoin(dir, first.Filename)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "%v", err)
-	}
-	// Don't clobber/write through a symlink an admin may have placed at dest.
-	if fi, lerr := os.Lstat(dest); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return status.Errorf(codes.FailedPrecondition, "destination %q is a symlink", first.Filename)
-	}
-	if err := os.Rename(tmpName, dest); err != nil {
-		return status.Errorf(codes.Internal, "finalize: %v", err)
+	// Never replace what is there — a file, or a symlink planted at the name —
+	// and never write through one.
+	if err := publishNoClobber(tmpName, dest, first.Filename); err != nil {
+		return err
 	}
 	if err := syncPath(dir); err != nil {
 		// The rename may not survive a crash; withdraw it rather than leave a

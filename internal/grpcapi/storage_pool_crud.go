@@ -90,6 +90,16 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			return nil, err
 		}
 	}
+	// A pool that names a directory or file on the host makes the daemon write
+	// there as root, so naming one takes cluster-root authority, and some
+	// directories are refused to everyone. Checked here, before the forward,
+	// because a forwarded call reaches the owner as a peer; the owner checks the
+	// directories again against its own data and PKI dirs.
+	if err := s.authorizePoolHostPaths(ctx, fmt.Sprintf("pool %q", req.Name), storage.Config{
+		Driver: req.Driver, Source: req.Source, Target: req.Target, Options: req.Options,
+	}); err != nil {
+		return nil, err
+	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {

@@ -205,15 +205,20 @@ record:
 - files uploaded into this pool while it belonged to its current project (a
   global pool's uploads are visible to everyone who may use the pool).
 
-A plain ISO or image file (a name an upload may take) that no record refers
-to — no VM disk row on any host, no replication schedule's replica, no upload
-— is library content, as before pools were confined: everyone who may read
-the pool sees it and can attach it, in a global pool every reader and in a
-project's pool that project's readers. A delete touches only the caller's own
-uploads and replicas; unowned library content is deleted only by a caller with
-`storage.hostpath` at the cluster root, and an upload never replaces anything.
-Any other file no record refers to — a failover's set-aside copy, a restore, a
-deleted VM's kept disk — is listed and deletable only by such a caller.
+Installer media — an `.iso`, plain or compressed (`.iso.gz`, `.iso.xz`,
+`.iso.zst`, `.iso.bz2`) — that no record refers to (no VM disk row on any
+host, live or kept after its VM was deleted; no replication schedule's
+replica; no upload) is library content, as before pools were confined:
+everyone who may read the pool sees it and can attach it, in a global pool
+every reader and in a project's pool that project's readers. A disk kept
+after its VM was deleted, or detached from it, stays its VM's project's: its
+deleted row still says whose it is, on any host. A delete touches only the
+caller's own uploads and replicas; unowned library content is deleted only by
+a caller with `storage.hostpath` at the cluster root, and an upload never
+replaces anything. Any other file no record refers to — a disk image
+(`.qcow2`, `.raw`, `.img`, `.vmdk`, …), a failover's set-aside copy, a
+restore — may be any project's, and is listed and deletable only by such a
+caller.
 Another project's file is reported as not there. Uploads are recorded in
 `<data_dir>/pool-uploads.json` on the pool's host, bound to the file itself
 (device and inode), so a file put at an uploaded name afterwards is nobody's.

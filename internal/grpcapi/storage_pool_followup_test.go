@@ -61,3 +61,45 @@ func TestPoolFollowup_UnownedImagesAreLibraryContent(t *testing.T) {
 		})
 	}
 }
+
+// Follow-up 2: unowned library content is installer media only. An unowned
+// disk image (.qcow2, .raw, .img, …) may be any project's — it is an
+// admin's, not library content. A disk kept after its VM was deleted (or
+// detached) is still owned, through its tombstoned rows, on any host: its
+// project sees it, nobody else does.
+func TestPoolFollowup2_LibraryIsMediaAndKeptDisksStayOwned(t *testing.T) {
+	s := newPoolTestServer(t)
+	disks := filepath.Join(s.dataDir, "disks")
+	if err := os.MkdirAll(disks, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "default", Driver: "local", Target: disks})
+	in := func(n string) string { return filepath.Join(disks, n) }
+
+	// bravo's VM, deleted with its disk kept; a VM on another host likewise.
+	insertProjectVM(t, s, "bvm", "bravo", "root", in("bvm-root.qcow2"), "default")
+	if err := corrosion.InsertVM(adminCtx(), s.db, corrosion.VMRecord{Name: "cvm", Project: "bravo", HostName: "host-b", State: "stopped"}, nil,
+		[]corrosion.DiskRecord{{VMName: "cvm", DiskName: "root", HostName: "host-b", Path: in("cvm-root.raw"), StorageType: "local"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, vm := range []string{"bvm", "cvm"} {
+		if err := corrosion.DeleteVM(adminCtx(), s.db, vm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, n := range []string{"debian.iso", "win.iso.xz", "other-project.qcow2", "old.img", "bvm-root.qcow2", "cvm-root.raw"} {
+		writePoolFile(t, in(n), n)
+	}
+	pat := hostPathEngineCtx(t, s, "pat", "Operator", projectRBACBase("acme"))
+	bob := hostPathEngineCtx(t, s, "bob", "Operator", projectRBACBase("bravo"))
+
+	if got := listNames(t, s, pat, "default"); !slices.Equal(got, []string{"debian.iso", "win.iso.xz"}) {
+		t.Errorf("acme's listing = %v, want only the ISOs", got)
+	}
+	if got := listNames(t, s, bob, "default"); !slices.Equal(got, []string{"bvm-root.qcow2", "cvm-root.raw", "debian.iso", "win.iso.xz"}) {
+		t.Errorf("bravo's listing = %v, want its kept disks and the ISOs", got)
+	}
+	if got := listNames(t, s, adminCtx(), "default"); !slices.Contains(got, "other-project.qcow2") || !slices.Contains(got, "old.img") {
+		t.Errorf("the admin's listing lacks the unowned disk images: %v", got)
+	}
+}

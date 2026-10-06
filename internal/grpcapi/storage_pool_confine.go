@@ -214,7 +214,8 @@ func (c *poolFileConfinement) callerReadsVM(ctx context.Context, name string) bo
 	if ok, seen := c.vmOK[name]; seen {
 		return ok
 	}
-	vm, err := corrosion.GetVM(ctx, c.s.db, name)
+	// A deleted VM's row still says whose its kept disks are.
+	vm, err := corrosion.GetVMIncludingDeleted(ctx, c.s.db, name)
 	ok := err == nil && vm != nil && c.s.RequirePerm(ctx, vmRBACPath(vm), "vm.read", "viewer") == nil
 	c.vmOK[name] = ok
 	return ok
@@ -243,7 +244,13 @@ func (c *poolFileConfinement) ownership(ctx context.Context, path string) (fileO
 	if err != nil {
 		return o, err
 	}
-	for _, d := range refs {
+	// A detached disk, or one kept when its VM was deleted, is still its
+	// VM's project's: its tombstoned row says so.
+	kept, err := corrosion.TombstonedDisksReferencingPath(ctx, c.s.db, path)
+	if err != nil {
+		return o, err
+	}
+	for _, d := range append(refs, kept...) {
 		o.owned = true
 		if c.callerReadsVM(ctx, d.VMName) {
 			o.callerOwns = true
@@ -272,8 +279,9 @@ func (c *poolFileConfinement) ownership(ctx context.Context, path string) (fileO
 }
 
 // visible reports whether the caller sees path: a file its project owns by
-// record, or a plain ISO/image file no record refers to — library content,
-// which everyone who may read the pool sees. A lookup error hides the file.
+// record, or installer media (an ISO) no record refers to — library content,
+// which everyone who may read the pool sees. An unowned disk image is not:
+// it may be any project's. A lookup error hides the file.
 func (c *poolFileConfinement) visible(ctx context.Context, path string) bool {
 	if c == nil {
 		return true
@@ -285,7 +293,7 @@ func (c *poolFileConfinement) visible(ctx context.Context, path string) bool {
 	if o.owned {
 		return o.callerOwns
 	}
-	return isPoolImageName(filepath.Base(path))
+	return isLibraryMediaName(filepath.Base(path))
 }
 
 // deletable reports whether the caller may delete path: only its own upload
@@ -298,8 +306,19 @@ func (c *poolFileConfinement) deletable(ctx context.Context, path string) bool {
 	return err == nil && o.deletable
 }
 
-// isPoolImageName reports whether name is a plain ISO or image file: the
-// names an upload may take (validatePoolUploadName).
-func isPoolImageName(name string) bool {
-	return validatePoolUploadName(name) == nil
+// isLibraryMediaName reports whether name is installer media: a name an
+// upload may take (validatePoolUploadName) that is an ISO, plain or
+// compressed (x.iso, x.iso.xz). Disk images (.qcow2, .raw, .img, .vmdk, …)
+// are not library media.
+func isLibraryMediaName(name string) bool {
+	if validatePoolUploadName(name) != nil {
+		return false
+	}
+	lower := strings.ToLower(name)
+	for _, c := range []string{"", ".gz", ".xz", ".zst", ".bz2"} {
+		if strings.HasSuffix(lower, ".iso"+c) {
+			return true
+		}
+	}
+	return false
 }

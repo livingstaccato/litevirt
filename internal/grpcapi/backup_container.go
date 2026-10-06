@@ -643,7 +643,7 @@ func (s *Server) RestoreContainer(req *pb.RestoreContainerRequest, stream grpc.S
 	// for a proofless restore before activation.
 	if reason, refused := s.execGateForAction(ctx, req.Proof != nil); refused {
 		s.noteGateRefused(corrosion.ActionRelocate, reason)
-		return status.Errorf(codes.FailedPrecondition, "restore refused: %s", reason)
+		return status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "restore", reason, returnToServiceHint))
 	}
 	// A carried relocation proof must arrive over peer mTLS (coordinator-driven).
 	if req.Proof != nil {

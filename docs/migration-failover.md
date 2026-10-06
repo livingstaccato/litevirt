@@ -197,8 +197,9 @@ live. Libvirt still migrates it, so a host-local disk needs `--with-storage`,
 or stop the VM first. A stopped VM migrated live is refused, with a message
 pointing to `--cold`.
 
-Secure Boot / vTPM VMs are always migrated stopped and cold, and need shared
-storage; see [cli-reference.md](cli-reference.md).
+Secure Boot / vTPM VMs are always migrated stopped and cold. Their host-local
+disks are copied as any stopped VM's are, and their firmware state (UEFI vars
+and vTPM) is carried with them; see [cli-reference.md](cli-reference.md).
 
 ## Host drain
 
@@ -214,8 +215,9 @@ other VM moves the way `lv migrate <vm> <target> --cold` moves a stopped VM
 (see [Cold migration](#cold-migration)): its host-local disks (`local` and
 `dir` storage) are copied to the target, its domain is defined there, and the
 VM and its disk records move in one transaction. It is refused for the same
-reasons. A Secure Boot / vTPM VM drains only while stopped and on shared
-storage.
+reasons. A Secure Boot / vTPM VM drains only while stopped, with its
+host-local disks and its firmware; a running one is reported with the commands
+to stop it and move it.
 
 - A **stopped** VM stays stopped on the target.
 - A **running** VM with a host-local disk is checked first, while it still
@@ -276,7 +278,14 @@ from it: the drain's moves, live or cold, an `lv migrate` of a VM off the
 host, and starting again a VM whose cold move failed after the drain shut it
 down. Anything else that would run a VM there is refused with
 `local_not_active_worker`, as on any host that is not `active`: `lv start`
-of a VM on it, for one. A migration onto it is refused because its target is
+of a VM on it, for one. On a host that is `draining` or in `maintenance`,
+`lv start` and `lv restart` add the host's state and what to do: undrain it
+first (`lv host undrain <host>`), or, on a `draining` host, move the VM off
+with `lv migrate <vm> <target-host> --cold` (after `lv stop <vm>`, for a
+running one) and start it there. A host in `maintenance` lets no VM leave it
+either: a migration off it is refused, naming the state and
+`lv host undrain <host>`, as are a replica promote, a container restore and a
+load-balancer apply there. A migration onto it is refused because its target is
 not `active`. A VM moved by a drain is started on its target, which is
 `active`.
 

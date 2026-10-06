@@ -597,7 +597,8 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	if fresh.State == "running" && usesFirmwareState(fresh.Spec) {
 		return &pb.DrainProgress{
 			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
-			Error: "Secure Boot / vTPM VM can't be drained while running (its firmware state isn't transferred live) — stop it and drain again, or migrate it explicitly (`lv migrate " + vm.Name + " <target-host> --cold`), which carries the firmware",
+			Error: "Secure Boot / vTPM VM can't be drained while running (its firmware state isn't transferred live) — stop it (`lv stop " + vm.Name + "`), " +
+				"then drain again, or migrate it with `lv migrate " + vm.Name + " <target-host> --cold`; either moves it stopped, with its disks and its firmware",
 		}
 	}
 

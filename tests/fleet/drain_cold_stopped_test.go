@@ -214,46 +214,6 @@ func TestFleet_DrainLeavesAStoppedVMItCannotMoveAndReportsIt(t *testing.T) {
 	}
 }
 
-// A stopped Secure Boot VM now drains through the cold path too, and with its
-// refusals: one with a host-local disk is refused there ("move it to shared
-// storage first"), not moved, and left on the drained host with its disk.
-// Drain used to refuse every firmware VM up front, so this also shows the
-// stopped one reaches the cold path at all.
-//
-// Mutation: refuse every firmware VM up front again — os1's frame is the old
-// "skipped" refusal and the test goes red.
-func TestFleet_DrainRefusesAStoppedFirmwareVMOnLocalStorage(t *testing.T) {
-	sc := newColdStoppedScenario(t)
-	ctx := context.Background()
-	spec, err := json.Marshal(&pb.VMSpec{Name: "os1", Cpu: 1, MemoryMib: 256, SecureBoot: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sc.src.DB.Execute(ctx, `UPDATE vms SET spec = ?, updated_at = ? WHERE name = 'os1'`, string(spec), sc.src.DB.NowTS()); err != nil {
-		t.Fatalf("mark os1 Secure Boot: %v", err)
-	}
-	if err := corrosion.SetHostLabel(ctx, sc.src.DB, sc.dst.Name, corrosion.LabelSecureBootCapable, "true"); err != nil {
-		t.Fatalf("label %s Secure-Boot-capable: %v", sc.dst.Name, err)
-	}
-
-	progress, err := sc.drain(t)
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "drain incomplete: 1 VM(s) remain") {
-		t.Fatalf("drain with a stopped firmware VM on local storage = %v, want drain incomplete", err)
-	}
-	if p := progress["os1"]; p == nil || p.Status != "failed" || !strings.Contains(p.Error, "has a host-local disk") {
-		t.Fatalf("drain progress for os1 = %+v, want failed with the cold path's host-local refusal", p)
-	}
-	if vm := sc.vmNamed(t, "os1"); vm.HostName != sc.src.Name || vm.State != "stopped" {
-		t.Fatalf("os1 row = host %s state %s, want it left on %s, stopped", vm.HostName, vm.State, sc.src.Name)
-	}
-	if got, err := os.ReadFile(sc.file(sc.src, sc.disk)); err != nil || string(got) != string(sc.payload) {
-		t.Fatalf("os1's disk did not stay intact on the drained host (err %v)", err)
-	}
-	if _, err := os.Stat(sc.file(sc.dst, sc.disk)); !os.IsNotExist(err) {
-		t.Errorf("the refused move left a disk copy on %s (stat: %v)", sc.dst.Name, err)
-	}
-}
-
 // A VM recorded here with no domain — what a drain by an older build left on
 // the host it moved a stopped VM to — is refused with a message that says so
 // and points at the recovery, not a bare libvirt lookup failure.

@@ -282,8 +282,8 @@ than silently breaking BitLocker. The explicit refusals:
 | backup | snapshot backup only; the legacy raw stream backup is refused. Running VMs are refused — **stop the VM** to back up its firmware consistently. Multi-disk firmware VMs are not supported yet |
 | clone | gets a **fresh** vTPM + fresh NVRAM (the secret is never copied) — a cloned BitLocker guest needs its recovery key |
 | live migration | refused — use cold migration |
-| cold migration | supported for a **stopped** VM on **shared storage**; firmware is captured quiescent and carried to the target. Host-local-disk and PCI-passthrough firmware VMs are not supported yet |
-| host drain | a stopped VM on shared storage is moved as cold migration moves it; a running one is refused — stop it and drain again, or migrate it explicitly (`lv migrate … --cold`) |
+| cold migration | supported for a **stopped** VM; its host-local disks are copied as for any stopped VM, and its firmware is captured quiescent and carried to the target. PCI-passthrough firmware VMs are not supported yet |
+| host drain | a stopped VM is moved as cold migration moves it, host-local disks included; a running one is refused — stop it (`lv stop <vm>`), then drain again or `lv migrate <vm> <target-host> --cold` |
 | automatic failover (host died) | skipped — firmware is host-local and died with the host; recover via restore from a firmware-carrying backup |
 | replica promotion | refused — a disk replica carries no firmware |
 | `lv rm --keep-disks` then `lv run --name <same>` | refused — the retained NVRAM isn't inherited; restore the VM instead of recreating it |
@@ -770,8 +770,13 @@ disks detached from this VM since it was created; nothing else can make that
 request (it is refused for every user, admin included). The host holding the
 file still keeps it if anything uses it: another VM's disk or backing image, a
 domain defined on that host, or a snapshot of the VM. `lv rm --keep-disks`
-keeps detached disks too. A host that is down or not `active` during the delete
-keeps its copy; remove it by hand (`<data_dir>/disks/<vm>-<disk>.qcow2`).
+keeps detached disks too. A host that is `active` or `draining` is asked. One
+that is down, in `maintenance` or otherwise out of service during the delete
+keeps its copy of a detached disk; remove it by hand
+(`<data_dir>/disks/<vm>-<disk>.qcow2`). Its `vms/<name>/owner_epoch` marker it
+removes itself when it is next `active` (at a daemon start, once its replica
+has caught up with a peer, or after `lv host undrain`), if its own records
+show the VM deleted and no domain of that name is defined there.
 
 ## Users and tokens
 

@@ -623,7 +623,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// it must not promote. Fail-open only for a proofless promote before activation.
 	if reason, refused := s.execGateForAction(ctx, req.Proof != nil); refused {
 		s.noteGateRefused(corrosion.ActionPromote, reason)
-		return status.Errorf(codes.FailedPrecondition, "promote refused: %s", reason)
+		return status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "promote", reason, returnToServiceHint))
 	}
 	// Under active enforcement an AUTOMATED (coordinator/relayed) promote MUST carry a
 	// proof — a proofless automated promote is refused. This keys off `automated`, NOT

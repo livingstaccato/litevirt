@@ -392,12 +392,18 @@ func (p leftoverRecordingPeer) CleanupMigrationArtifacts(_ context.Context, r *p
 	return &emptypb.Empty{}, nil
 }
 
-// The owner's delete asks every other active workload host — once the row is
-// tombstoned — to remove the VM's leftovers, naming to each only the detached
-// disks its rows place there; never a witness or a host that is not active.
-// A --keep-disks delete names no disks (the markers still go).
+// The owner's delete asks every other active or draining workload host — once
+// the row is tombstoned — to remove the VM's leftovers, naming to each only the
+// detached disks its rows place there; never a witness or a host in another
+// state (one in maintenance sweeps its own markers when it is active again,
+// sweepDeletedVMMarkers). A --keep-disks delete names no disks (the markers
+// still go).
 //
-// Mutations: drop the fan-out from DeleteVM — no call arrives; plan it after
+// A draining host is asked because it is in service, running its drain: the
+// lab drained a host, deleted the VMs the drain had moved off it, and the
+// host kept their markers for good.
+//
+// Mutations: ask active hosts only — node-5 (draining) is never asked; drop the fan-out from DeleteVM — no call arrives; plan it after
 // the tombstone — the detached path is missing (the tombstone re-stamps every
 // row); plan disks for --keep-disks — the keep-disks subtest sees a path.
 func TestDeleteVM_AsksTheHostsTheVMLeftToRemoveItsLeftovers(t *testing.T) {
@@ -410,6 +416,8 @@ func TestDeleteVM_AsksTheHostsTheVMLeftToRemoveItsLeftovers(t *testing.T) {
 				{Name: "node-4", Address: "10.0.0.4", State: "active"},
 				{Name: "witness", Address: "10.0.0.5", State: "active", Role: "witness"},
 				{Name: "fenced", Address: "10.0.0.6", State: "fenced"},
+				{Name: "node-5", Address: "10.0.0.7", State: "draining"},
+				{Name: "maint", Address: "10.0.0.8", State: "maintenance"},
 			} {
 				if err := corrosion.InsertHost(ctx, s.db, h); err != nil {
 					t.Fatalf("InsertHost %s: %v", h.Name, err)
@@ -424,10 +432,11 @@ func TestDeleteVM_AsksTheHostsTheVMLeftToRemoveItsLeftovers(t *testing.T) {
 			}, nil, []corrosion.DiskRecord{
 				{VMName: "os1", DiskName: "post1", HostName: "node-3", Path: "/x/os1-post1.qcow2", StorageType: "local", TargetDev: "vdb"},
 				{VMName: "os1", DiskName: "shared", HostName: "node-3", Path: "/x/os1-shared.qcow2", StorageType: "nfs", TargetDev: "vdc"},
+				{VMName: "os1", DiskName: "post5", HostName: "node-5", Path: "/x/os1-post5.qcow2", StorageType: "local", TargetDev: "vdd"},
 			}); err != nil {
 				t.Fatalf("InsertVM: %v", err)
 			}
-			for _, d := range []string{"post1", "shared"} {
+			for _, d := range []string{"post1", "shared", "post5"} {
 				detachAfterCreate(t, s.db, "os1", d)
 			}
 			fake.SetState("os1", libvirtfake.StateRunning)
@@ -437,7 +446,7 @@ func TestDeleteVM_AsksTheHostsTheVMLeftToRemoveItsLeftovers(t *testing.T) {
 			}
 
 			got := map[string][]string{}
-			for len(got) < 2 {
+			for len(got) < 3 {
 				select {
 				case c := <-calls:
 					if !c.req.VmDeleted || c.req.VmName != "os1" || c.req.RemoveCloudInit || c.req.FirmwareUuid != "" || c.req.UndefineDomain {
@@ -445,20 +454,20 @@ func TestDeleteVM_AsksTheHostsTheVMLeftToRemoveItsLeftovers(t *testing.T) {
 					}
 					got[c.host] = c.req.DiskPaths
 				case <-time.After(5 * time.Second):
-					t.Fatalf("the delete asked only %v; want node-3 and node-4", got)
+					t.Fatalf("the delete asked only %v; want node-3, node-4 and node-5", got)
 				}
 			}
-			want := map[string][]string{"node-3": {"/x/os1-post1.qcow2"}, "node-4": nil}
+			want := map[string][]string{"node-3": {"/x/os1-post1.qcow2"}, "node-4": nil, "node-5": {"/x/os1-post5.qcow2"}}
 			if keepDisks {
 				// The markers still go; the disks stay wherever they are.
-				want = map[string][]string{"node-3": nil, "node-4": nil}
+				want = map[string][]string{"node-3": nil, "node-4": nil, "node-5": nil}
 			}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("asked %v, want %v", got, want)
 			}
 			select {
 			case c := <-calls:
-				t.Fatalf("asked a host that is not an active worker: %s", c.host)
+				t.Fatalf("asked a host that is neither an active nor a draining worker: %s", c.host)
 			case <-time.After(200 * time.Millisecond):
 			}
 		})

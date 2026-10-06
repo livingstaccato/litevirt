@@ -1,12 +1,11 @@
 package grpcapi
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -38,7 +37,8 @@ func TestImportVM_ALeftoverOfADeadImportIsMovedAsideAtOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range []string{dst, sib} {
-		setOriginForTest(t, p, "test-host/a-daemon-gone/imp-1")
+		body, _ := os.ReadFile(p)
+		plantDeadLeftover(t, s, p, string(body), false)
 	}
 	if err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "web", false)}}); err != nil {
 		t.Fatalf("a re-import right after a crash: %v", err)
@@ -52,8 +52,8 @@ func TestImportVM_ALeftoverOfADeadImportIsMovedAsideAtOnce(t *testing.T) {
 	}
 }
 
-// One whose origin is another host's import, or a running import here, is
-// judged as before: fresh, so refused.
+// One whose origin is another host's import (no record here), or a running
+// import here, is judged as before: fresh, so refused.
 func TestImportVM_AFreshFileOfALiveOriginIsNotAnOrphan(t *testing.T) {
 	for _, origin := range []string{"other-host/its-daemon/imp-1", "test-host/" + importDaemonInstance + "/still-running"} {
 		t.Run(origin, func(t *testing.T) {
@@ -67,11 +67,18 @@ func TestImportVM_AFreshFileOfALiveOriginIsNotAnOrphan(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer release()
+			if strings.HasPrefix(origin, "test-host/") {
+				fi, err := os.Lstat(dst)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := s.recordImportPlacement(dst, fi, "still-running", false); err != nil {
+					t.Fatal(err)
+				}
+			}
 			refusedAndUntouched(t, s, "web", dst, "live")
 		})
 	}
-	_ = context.Background
-	_ = time.Now
 }
 
 // An import's own disks, placed a moment ago, are not a flow that holds its

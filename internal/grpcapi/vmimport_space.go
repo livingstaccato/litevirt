@@ -52,10 +52,15 @@ const importUploadStep = 64 << 20
 // each filesystem has been credited, and the names of the VMs being imported.
 // Zero value ready.
 type importSpaceLedger struct {
-	mu    sync.Mutex
-	held  map[*importReservation]struct{}
-	keys  map[fsKey]*keySpace
-	names map[string]string // name → import id
+	mu   sync.Mutex
+	held map[*importReservation]struct{}
+	keys map[fsKey]*keySpace
+
+	// namesMu guards names on its own: judging whether a file is a running
+	// import's never waits on mu, which a reservation holds across a
+	// free-space read of a pool that may be slow to answer.
+	namesMu sync.Mutex
+	names   map[string]string // name → import id
 }
 
 // keySpace is one filesystem's credit: what the free space shows its running
@@ -76,8 +81,8 @@ type keySpace struct {
 // call more than once.
 func (s *Server) claimImportNameAs(name, importID string) (func(), error) {
 	l := &s.importSpace
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.namesMu.Lock()
+	defer l.namesMu.Unlock()
 	if _, busy := l.names[name]; busy {
 		return nil, status.Errorf(codes.AlreadyExists,
 			"VM %q is already being imported on %s; wait for that import to finish, or choose a different --name", name, s.hostName)
@@ -87,9 +92,9 @@ func (s *Server) claimImportNameAs(name, importID string) (func(), error) {
 	}
 	l.names[name] = importID
 	return sync.OnceFunc(func() {
-		l.mu.Lock()
+		l.namesMu.Lock()
 		delete(l.names, name)
-		l.mu.Unlock()
+		l.namesMu.Unlock()
 	}), nil
 }
 
@@ -101,8 +106,8 @@ func (s *Server) claimImportName(name string) (func(), error) {
 // importNamesInFlight is the names this host is importing now.
 func (s *Server) importNamesInFlight() []string {
 	l := &s.importSpace
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.namesMu.Lock()
+	defer l.namesMu.Unlock()
 	out := make([]string, 0, len(l.names))
 	for n := range l.names {
 		out = append(out, n)
@@ -112,15 +117,21 @@ func (s *Server) importNamesInFlight() []string {
 
 // importRunning reports whether this process is running the import importID.
 func (s *Server) importRunning(importID string) bool {
+	_, ok := s.importNameRunning(importID)
+	return ok
+}
+
+// importNameRunning is the VM name the running import importID imports.
+func (s *Server) importNameRunning(importID string) (string, bool) {
 	l := &s.importSpace
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, id := range l.names {
+	l.namesMu.Lock()
+	defer l.namesMu.Unlock()
+	for n, id := range l.names {
 		if id == importID {
-			return true
+			return n, true
 		}
 	}
-	return false
+	return "", false
 }
 
 // spaceShare is one import's claim on one filesystem.
@@ -146,6 +157,11 @@ type importReservation struct {
 	refreshMu sync.Mutex
 	files     []string // files it writes outside dir, each stat'd
 	dirKeys   map[string]fsKey
+	// flushed is, on btrfs, each file's blocks when it was last flushed: a
+	// file is flushed again only once it has grown.
+	flushed map[string]uint64
+	// flushFailed is whether the last measurement failed to flush a file.
+	flushFailed bool
 
 	// Guarded by the ledger's mu.
 	shares   map[fsKey]*spaceShare
@@ -349,12 +365,26 @@ func (r *importReservation) measureLocked() map[fsKey]spaceMeasure {
 		a.alloc += n
 	}
 	// On btrfs a file's blocks count before its free space falls, so only
-	// bytes flushed there are counted as written.
+	// bytes flushed there are counted as written. A file is flushed once per
+	// growth, not on every measurement; one that cannot be flushed counts
+	// what it held when it last was.
+	r.flushFailed = false
 	alloc := func(dir, p string) uint64 {
 		n := lstatAllocated(p)
-		if n > 0 && strings.HasPrefix(string(r.keyLocked(dir)), "btrfs:") && flushForCredit(p) != nil {
-			return 0
+		if n == 0 || !strings.HasPrefix(string(r.keyLocked(dir)), "btrfs:") {
+			return n
 		}
+		if f, ok := r.flushed[p]; ok && f == n {
+			return n
+		}
+		if flushForCredit(p) != nil {
+			r.flushFailed = true
+			return min(r.flushed[p], n)
+		}
+		if r.flushed == nil {
+			r.flushed = map[string]uint64{}
+		}
+		r.flushed[p] = n
 		return n
 	}
 	add(r.dir, 0)
@@ -396,6 +426,12 @@ func lstatAllocated(p string) uint64 {
 func (r *importReservation) refresh() {
 	r.refreshMu.Lock()
 	defer r.refreshMu.Unlock()
+	r.refreshLocked(false)
+}
+
+// refreshLocked is refresh with refreshMu held; with endPhase it also drops
+// what the phase reserved and did not write (see begin).
+func (r *importReservation) refreshLocked(endPhase bool) {
 	m := r.measureLocked()
 	l := &r.s.importSpace
 	l.mu.Lock()
@@ -409,19 +445,23 @@ func (r *importReservation) refresh() {
 			l.observeLocked(k, v.avail)
 		}
 	}
+	// A file that could not be flushed may hold more than it counts; what
+	// the phase reserved stays reserved until a measurement sees it all.
+	if !endPhase || r.flushFailed {
+		return
+	}
+	for _, sh := range r.shares {
+		sh.need = min(sh.need, sh.grown())
+	}
 }
 
 // begin ends a write phase: what it reserved and did not write (a sparse
 // disk, the rest of an upload step) it never will, so it stops counting.
 // What it wrote stays counted until the free space shows it.
 func (r *importReservation) begin() {
-	r.refresh()
-	l := &r.s.importSpace
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, sh := range r.shares {
-		sh.need = min(sh.need, sh.grown())
-	}
+	r.refreshMu.Lock()
+	defer r.refreshMu.Unlock()
+	r.refreshLocked(true)
 }
 
 // fsKey names a filesystem's free space; "" is a filesystem that could not be

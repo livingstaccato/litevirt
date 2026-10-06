@@ -143,13 +143,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 	defer releaseName()
-	// Each file the import writes into the pool is measured, and records its
-	// origin, from before its first byte.
-	origin := s.importOriginFor(importID)
-	writes := func(p string) {
-		space.track(p)
-		_ = setImportOrigin(p, origin)
-	}
+	// Each file the import writes into the pool is measured, and recorded as
+	// its own, from before its first byte (importWritesFor). The records go
+	// when the import ends, either way: by then its disks are a row's, or
+	// removed. Only a crash leaves them, to show its leftovers dead.
+	writes, forgetWrites := s.importWritesFor(importID, space)
+	defer forgetWrites()
 
 	// An import does not claim. importRecords builds the NIC rows straight from
 	// the foreign hypervisor's NICs, so importing onto a NetBox-bound network
@@ -196,6 +195,13 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	poolDir, err := s.importPoolDir(ctx, first.TargetPool)
 	if err != nil {
 		return err
+	}
+	// A pool that can place a disk only by copying it holds it twice for a
+	// moment: the second copy is reserved like the first, once the
+	// conversion's own unwritten reservation is dropped.
+	writes.copying = func(n uint64) error {
+		space.begin()
+		return space.reserve(poolDir, n, "copying a converted disk into place (the pool has neither link() nor RENAME_NOREPLACE)")
 	}
 	var convertedPaths []string
 	cleanupDisks := func() {
@@ -261,6 +267,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			if errors.Is(err, os.ErrExist) {
 				return status.Errorf(codes.FailedPrecondition,
 					"disk %q: %s appeared in the pool during the conversion; an import never replaces a file there", d.Name, dst)
+			}
+			// A refused reservation (the copy a pool without link() needs)
+			// keeps its code.
+			var st interface{ GRPCStatus() *status.Status }
+			if errors.As(err, &st) && st.GRPCStatus().Code() == codes.FailedPrecondition {
+				return status.Errorf(codes.FailedPrecondition, "convert disk %q: %v", d.Name, err)
 			}
 			return status.Errorf(codes.Internal, "convert disk %q: %v", d.Name, err)
 		}
@@ -906,16 +918,106 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 
 // ── disk conversion ──
 
+// importDiskWrites is told of the files a disk conversion writes in the pool,
+// so its import can measure them and record them as its own. Every field is
+// optional, and a nil *importDiskWrites is told nothing.
+type importDiskWrites struct {
+	// created is a scratch file the conversion just created, before its
+	// first byte.
+	created func(p string)
+	// placing is the finished, flushed scratch file tmp about to take dst's
+	// name.
+	placing func(tmp, dst string)
+	// placed is tmp now placed at dst: dst is the import's file.
+	placed func(tmp, dst string)
+	// copying is a placement that has to copy n bytes (a pool with neither
+	// link() nor RENAME_NOREPLACE): an error refuses it.
+	copying func(n uint64) error
+}
+
+func (w *importDiskWrites) didCreate(p string) {
+	if w != nil && w.created != nil {
+		w.created(p)
+	}
+}
+
+func (w *importDiskWrites) willPlace(tmp, dst string) {
+	if w != nil && w.placing != nil {
+		w.placing(tmp, dst)
+	}
+}
+
+func (w *importDiskWrites) didPlace(tmp, dst string) {
+	if w != nil && w.placed != nil {
+		w.placed(tmp, dst)
+	}
+}
+
+func (w *importDiskWrites) copy(n uint64) error {
+	if w != nil && w.copying != nil {
+		return w.copying(n)
+	}
+	return nil
+}
+
+// importWritesFor is what the import importID does with each file it writes
+// into a pool: measures it in space, sets its origin xattr where the pool
+// keeps one, and records it in this host's placement record (see
+// vmimport_placement.go). A scratch file is recorded when it is created; a
+// placed disk is recorded before it takes its name, in the state it is placed
+// in, so a crash at any point leaves no unrecorded disk of the import, and
+// again once placed if placing made it another file (a copy). forget drops
+// every record the import wrote. The caller sets copying.
+func (s *Server) importWritesFor(importID string, space *importReservation) (w *importDiskWrites, forget func()) {
+	s.pruneImportPlacements()
+	origin := s.importOriginFor(importID)
+	var recorded []string
+	record := func(p string, fi os.FileInfo, scratch bool) {
+		if err := s.recordImportPlacement(p, fi, importID, scratch); err != nil {
+			slog.Warn("import: could not record a file it writes; a leftover of it is judged by age", "path", p, "error", err)
+			return
+		}
+		recorded = append(recorded, p)
+	}
+	w = &importDiskWrites{
+		created: func(p string) {
+			space.track(p)
+			_ = setImportOrigin(p, origin)
+			if fi, err := os.Lstat(p); err == nil {
+				record(p, fi, true)
+			}
+		},
+		placing: func(tmp, dst string) {
+			if fi, err := os.Lstat(tmp); err == nil {
+				record(dst, fi, false)
+			}
+		},
+		placed: func(tmp, dst string) {
+			space.track(dst)
+			s.forgetImportPlacement(tmp, importID)
+			if fi, err := os.Lstat(dst); err == nil {
+				if rec, ok := s.importPlacementOf(dst); !ok || !rec.matches(fi) {
+					record(dst, fi, false)
+				}
+			}
+		},
+	}
+	return w, func() {
+		for _, p := range recorded {
+			s.forgetImportPlacement(p, importID)
+		}
+	}
+}
+
 // convertForeignDisk converts a foreign-format disk to qcow2 at dst using
 // qemu-img. It HARD-FAILS if qemu-img is absent (the byte-copy fallback used
 // elsewhere would dump foreign bytes into a qcow2-named file and corrupt it) and
 // rejects any external backing-file / out-of-dir extent reference BEFORE invoking
 // qemu-img (a malicious descriptor would otherwise make qemu-img read host files).
 //
-// track, when set, is told the name of the scratch file the conversion writes
-// in dst's directory before anything is written to it, and dst once the disk
-// has been placed there.
-func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32), track func(path string)) error {
+// w, when set, is told of each file the conversion writes in dst's directory
+// (see importDiskWrites).
+func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32), w *importDiskWrites) error {
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
 	}
@@ -955,9 +1057,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	tmp := tf.Name()
 	tf.Close()
-	if track != nil {
-		track(tmp)
-	}
+	w.didCreate(tmp)
 	finished := false
 	defer func() {
 		if !finished {
@@ -1004,17 +1104,16 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		_ = os.Remove(tmp)
 		return fmt.Errorf("flush converted disk: %w", err)
 	}
+	w.willPlace(tmp, dst)
 	// Never over a file already there: another VM's disk keeps its bytes.
-	if err := placeNoReplace(tmp, dst); err != nil {
+	if err := placeNoReplace(ctx, tmp, dst, w.copy); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("finalize converted disk: %w", err)
 	}
 	finished = true
 	// The disk is the import's own file under its new name, and stays
 	// measured as such.
-	if track != nil {
-		track(dst)
-	}
+	w.didPlace(tmp, dst)
 	return nil
 }
 

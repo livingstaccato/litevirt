@@ -2,7 +2,7 @@
 
 package grpcapi
 
-// Off Linux no origin is recorded, and leftovers are judged by age alone.
-func setImportOrigin(string, string) error { return nil }
+// Off Linux no origin xattr is kept; the placement record alone binds a file.
+func setImportOriginXattr(string, string) error { return nil }
 
-func getImportOrigin(string) (string, bool) { return "", false }
+func getImportOriginXattr(string) (string, bool) { return "", false }

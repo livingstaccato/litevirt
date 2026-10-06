@@ -260,7 +260,8 @@ func TestMoveOrphanAside_WithoutLinkOrNoReplaceRename(t *testing.T) {
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		t.Fatalf("the orphan's name is still taken: %v", err)
 	}
-	// And never over a file at the new name.
+	// And never over a file at the name it would take elsewhere: there it
+	// takes a name no other flow can choose.
 	if err := os.WriteFile(p, []byte("orphan 2"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -271,8 +272,15 @@ func TestMoveOrphanAside_WithoutLinkOrNoReplaceRename(t *testing.T) {
 	if err := os.WriteFile(there, []byte("already there"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := moveOrphanAside(p); err == nil {
-		t.Fatal("moved an orphan over a file at its new name")
+	aside2, err := moveOrphanAside(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aside2 == there || aside2 == aside {
+		t.Fatalf("moved aside as %s", aside2)
+	}
+	if b, _ := os.ReadFile(aside2); string(b) != "orphan 2" {
+		t.Fatalf("moved aside as %q", b)
 	}
 	if b, _ := os.ReadFile(there); string(b) != "already there" {
 		t.Fatalf("the file at the new name now holds %q", b)

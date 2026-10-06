@@ -508,7 +508,7 @@ func TestImportSpace_APlacedDiskStaysItsImports(t *testing.T) {
 	if err := ra.reserve(pool, 8<<20, "a"); err != nil {
 		t.Fatal(err)
 	}
-	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(pool, "a-root.qcow2"), importDir, 1<<30, nil, ra.track); err != nil {
+	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(pool, "a-root.qcow2"), importDir, 1<<30, nil, &importDiskWrites{created: ra.track, placed: func(_, p string) { ra.track(p) }}); err != nil {
 		t.Fatal(err)
 	}
 	used = 4 << 20 // the converted disk shows

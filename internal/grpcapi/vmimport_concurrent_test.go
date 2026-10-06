@@ -212,15 +212,19 @@ func TestConvertForeignDisk_TracksItsScratchFileBeforeWriting(t *testing.T) {
 	pool := t.TempDir()
 	dst := filepath.Join(pool, "out.qcow2")
 	var tracked []string
-	err := convertForeignDisk(context.Background(), src, "raw", dst, dir, 1<<30, nil, func(p string) {
-		if p != dst {
+	err := convertForeignDisk(context.Background(), src, "raw", dst, dir, 1<<30, nil, &importDiskWrites{
+		created: func(p string) {
 			if fi, err := os.Stat(p); err != nil || fi.Size() != 0 {
 				t.Errorf("tracked %s after it was written (%v)", p, err)
 			}
-		} else if _, err := os.Stat(dst); err != nil {
-			t.Errorf("tracked the disk before it was placed: %v", err)
-		}
-		tracked = append(tracked, p)
+			tracked = append(tracked, p)
+		},
+		placed: func(_, p string) {
+			if _, err := os.Stat(p); err != nil {
+				t.Errorf("tracked the disk before it was placed: %v", err)
+			}
+			tracked = append(tracked, p)
+		},
 	})
 	if err != nil {
 		t.Fatal(err)

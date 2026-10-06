@@ -568,15 +568,40 @@ run at once (`--inspect` is not held back), and an import never replaces a file
 already at its disk's name in the pool. A file there is taken for a crashed
 earlier import's leftover — moved aside to `<name>.orphan-<unix time>`, kept,
 and logged, after which the import goes ahead — only when all of these hold:
-no disk (of a live VM, kept from a deleted one, or under a kept snapshot) and
-no image records it; no VM exists whose name followed by `-` begins the file's
-name; no operation in flight (a create, clone, restore or disk attach) names a
-VM whose disks would be named like it, and no other import on the host does;
-and neither it nor any file beside it named for the same VM (including another
-host's conversion scratch files) has been modified in the last 15 minutes. A
-file an import of this host wrote, under an import that is no longer running
-here (the daemon restarted mid-import), carries that origin and is a leftover
-at once, without the wait. Any other file there refuses the import, saying why.
+
+- no disk (of a live VM, kept from a deleted one, or under a kept snapshot)
+  and no image records it;
+- no operation in flight (a create, clone, restore or disk attach) names a VM
+  whose disks would be named like it, and no other import on the host does;
+- it is this host's own leftover (below), or both: no VM exists whose name
+  followed by `-` begins the file's name, and it has not been modified in the
+  last 15 minutes;
+- no file beside it whose name begins like its own up to any `-` (so for
+  `web-3-root.qcow2`, any `web-*` file), and no other host's conversion
+  scratch file for such a name, has been modified in the last 15 minutes —
+  except files a disk row or an image records (a running VM's own disks, such
+  as `web-1`'s beside an import of `web-3`, never hold it back), files named
+  for an existing VM whose name does not begin the leftover's the same way,
+  and this host's own leftovers.
+
+**This host's own leftover.** Every file an import writes into a pool is
+recorded on its host, in `<data_dir>/import-placements/`: its path, which file
+it is (device and inode), and, for a placed disk, the size and modification
+time it was left with, under the import and the daemon process that wrote it.
+A file whose record names an import that is no longer running on this host
+(the daemon stopped or restarted mid-import; an import that ends drops its
+records), and which still has that inode, size and modification time, is that import's
+leftover at once, without the 15-minute wait and whatever VM it is named like.
+The record works on every filesystem, NFS without user xattrs and FUSE
+included; where the pool keeps user xattrs, the file also carries its origin
+in `user.litevirt.import-origin`, which must then name the same import. A file
+written since its import left it — rewritten in place by a replication into
+that path, say — is not a leftover by its record: it waits out the 15 minutes
+like any file whose origin is unknown. Any other file there refuses the
+import, saying why. On a pool with neither hard links nor a rename that
+cannot replace a file (some FUSE filesystems), a converted disk is copied into
+place, and that second copy is reserved like the first; the leftover is moved
+aside to `<name>.orphan-<unix time>-<random>`.
 
 ## Snapshots
 

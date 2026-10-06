@@ -806,14 +806,22 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
 	}
-	// One format for the check and the conversion: a disk judged as probed
-	// but converted as declared can name files the check never saw.
+	// Only a file nobody else can write is checked and converted; otherwise
+	// what was checked need not be what qemu-img opens.
+	private, err := privateImportDisk(src, allowedDir)
+	if err != nil {
+		return err
+	}
+	if private != src {
+		defer os.Remove(private)
+	}
+	src = private
+	// One format for the check and the conversion: a disk judged as one
+	// format but converted as another can name files the check never saw.
 	if srcFormat == "" {
-		probed, err := probeDiskFormat(ctx, src)
-		if err != nil {
+		if srcFormat, err = staticDiskFormat(src); err != nil {
 			return err
 		}
-		srcFormat = probed
 	}
 	if err := assertNoExternalDiskRefsAs(ctx, src, srcFormat, allowedDir); err != nil {
 		return err
@@ -821,11 +829,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 
 	tmp := dst + ".tmp"
 	_ = os.Remove(tmp)
-	args := []string{"convert", "-p", "-O", "qcow2"}
-	if srcFormat != "" {
-		args = append(args, "-f", srcFormat)
-	}
-	args = append(args, src, tmp)
+	args := []string{"convert", "-p", "-O", "qcow2", "-f", srcFormat, src, tmp}
 
 	cmd := exec.CommandContext(ctx, "qemu-img", args...)
 	var stderr bytes.Buffer
@@ -922,20 +926,22 @@ func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) erro
 
 // assertNoExternalDiskRefsAs judges file opened as format — the format qemu
 // will be told, not the one it would probe: a VMDK descriptor can probe as
-// raw yet be opened as vmdk. An empty format means "as probed", and is only
-// for a caller that then converts with the probed format.
+// raw yet be opened as vmdk. An empty format is read from the header
+// (staticDiskFormat), never probed by qemu-img. Every file the disk names must
+// lie in allowedDir, which the daemon alone writes: a disk from anywhere else
+// is copied there first (privateImportDisk), and what it named beside it is
+// not.
 func assertNoExternalDiskRefsAs(ctx context.Context, file, format, allowedDir string) error {
-	// The disk's own directory is allowed too: a disk staged outside the
-	// import directory (--disk-map, an admin's path) may keep its extents or
-	// backing files beside it; anything beyond is an escape.
+	if format == "" {
+		f, err := staticDiskFormat(file)
+		if err != nil {
+			return err
+		}
+		format = f
+	}
 	roots := []string{allowedDir}
 	if real, err := filepath.EvalSymlinks(allowedDir); err == nil {
-		roots[0] = real
-	}
-	if dir, err := filepath.EvalSymlinks(filepath.Dir(file)); err == nil {
-		roots = append(roots, dir)
-	} else {
-		roots = append(roots, filepath.Dir(file))
+		roots = append(roots, real)
 	}
 	return assertNoExternalDiskRefsDepth(ctx, file, format, roots, 0)
 }
@@ -950,36 +956,17 @@ func withinAnyRoot(roots []string, p string) bool {
 }
 
 func assertNoExternalDiskRefsDepth(ctx context.Context, file, format string, roots []string, depth int) error {
-	allowedDir := roots[0]
 	if depth > maxBackingDepth {
 		return fmt.Errorf("backing chain deeper than %d images", maxBackingDepth)
 	}
-	// Text VMDK descriptor: scan extent lines for absolute/escaping paths.
-	if head, err := readHead(file, 4096); err == nil && bytes.Contains(head, []byte("# Disk DescriptorFile")) {
-		full, _ := readHead(file, 256<<10)
-		for _, line := range strings.Split(string(full), "\n") {
-			line = strings.TrimSpace(line)
-			if !(strings.HasPrefix(line, "RW ") || strings.HasPrefix(line, "RDONLY ") || strings.HasPrefix(line, "NOACCESS ")) {
-				continue
-			}
-			a := strings.IndexByte(line, '"')
-			b := strings.LastIndexByte(line, '"')
-			if a < 0 || b <= a {
-				continue
-			}
-			ext := line[a+1 : b]
-			if filepath.IsAbs(ext) || strings.Contains(ext, "..") || !safename.Contains(allowedDir, filepath.Join(allowedDir, ext)) {
-				return fmt.Errorf("VMDK descriptor references an external/escaping extent %q", ext)
-			}
-		}
+	// Nothing the header names may be opened before it is judged: refuse
+	// what qemu-img info itself would open (extents, a data file).
+	if err := precheckDiskHeader(file, format); err != nil {
+		return err
 	}
 	// qemu-img info on this one image only (no --backing-chain: that would
 	// open the backing file before it is judged).
-	args := []string{"info", "-U", "--output=json"}
-	if format != "" {
-		args = append(args, "-f", format)
-	}
-	out, err := exec.CommandContext(ctx, "qemu-img", append(args, "--", file)...).Output()
+	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file).Output()
 	if err != nil {
 		// info failure is not itself an escape; surface it as a convert-time error.
 		return fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
@@ -988,7 +975,14 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file, format string, roo
 	if err := json.Unmarshal(out, &info); err != nil {
 		return fmt.Errorf("inspect %s: unreadable qemu-img info: %w", filepath.Base(file), err)
 	}
+	self := file
+	if real, err := filepath.EvalSymlinks(file); err == nil {
+		self = real
+	}
 	for _, f := range info.openedFiles() {
+		if f == file || f == self {
+			continue // the disk itself, which its caller chose
+		}
 		if !plainBackingPath(f) {
 			return fmt.Errorf("disk makes qemu open %q, which is not a plain path", f)
 		}
@@ -1032,21 +1026,6 @@ func assertNoExternalDiskRefsDepth(ctx context.Context, file, format string, roo
 		return fmt.Errorf("disk names a backing file %q without its format", backing)
 	}
 	return assertNoExternalDiskRefsDepth(ctx, resolved, info.BackingFilenameFormat, roots, depth+1)
-}
-
-// probeDiskFormat asks qemu-img what format a disk is, for a source whose
-// format the caller did not declare; that format is then used for both the
-// check and the conversion.
-func probeDiskFormat(ctx context.Context, file string) (string, error) {
-	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", "--", file).Output()
-	if err != nil {
-		return "", fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
-	}
-	var info qemuImgInfo
-	if err := json.Unmarshal(out, &info); err != nil || info.Format == "" {
-		return "", fmt.Errorf("inspect %s: no format reported", filepath.Base(file))
-	}
-	return info.Format, nil
 }
 
 // plainBackingPath reports whether a backing name is a filesystem path rather

@@ -112,15 +112,16 @@ func TestAssertNoExternalDiskRefs_RejectsAHeaderlessTabSeparatedVMDK(t *testing.
 	if err := os.WriteFile(desc, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := assertNoExternalDiskRefs(context.Background(), desc, allowed); err == nil {
+	if err := assertNoExternalDiskRefsAs(context.Background(), desc, "vmdk", allowed); err == nil {
 		t.Fatal("header-less, tab-separated VMDK extent outside: got nil, want rejection")
 	}
 }
 
-func TestAssertNoExternalDiskRefs_AcceptsAVMDKWithItsExtentInside(t *testing.T) {
-	if _, err := exec.LookPath("qemu-img"); err != nil {
-		t.Skip("qemu-img not available")
-	}
+// A text descriptor is refused even when its extent is inside the import
+// directory: whether a line names an extent is qemu's parser's call, and
+// qemu-img opens what it names before anything can judge it. Only a
+// single-file sparse VMDK is imported.
+func TestAssertNoExternalDiskRefs_RefusesATextDescriptorEvenWithItsExtentInside(t *testing.T) {
 	allowed := t.TempDir()
 	if err := os.WriteFile(filepath.Join(allowed, "flat.bin"), make([]byte, 1<<20), 0o644); err != nil {
 		t.Fatal(err)
@@ -130,15 +131,15 @@ func TestAssertNoExternalDiskRefs_AcceptsAVMDKWithItsExtentInside(t *testing.T) 
 	if err := os.WriteFile(desc, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := assertNoExternalDiskRefs(context.Background(), desc, allowed); err != nil {
-		t.Fatalf("VMDK whose extent is inside the import dir: %v", err)
+	if err := assertNoExternalDiskRefsAs(context.Background(), desc, "vmdk", allowed); err == nil {
+		t.Fatal("a text VMDK descriptor: got nil, want refusal")
 	}
 }
 
 // A disk staged outside the import directory (--disk-map into the staging
-// root, or an admin's path) is converted in place; its own location is not an
-// escape, only files it names beyond its own directory are.
-func TestAssertNoExternalDiskRefs_AcceptsAStagedDiskOutsideTheImportDir(t *testing.T) {
+// root, or an admin's path) still imports: it is converted from a private
+// copy.
+func TestConvertForeignDisk_AStagedDiskOutsideTheImportDirConverts(t *testing.T) {
 	if _, err := exec.LookPath("qemu-img"); err != nil {
 		t.Skip("qemu-img not available")
 	}
@@ -146,7 +147,8 @@ func TestAssertNoExternalDiskRefs_AcceptsAStagedDiskOutsideTheImportDir(t *testi
 	importDir := t.TempDir()
 	disk := filepath.Join(staging, "vm-100-disk-0.qcow2")
 	qemuImg(t, "create", "-f", "qcow2", disk, "1M")
-	if err := assertNoExternalDiskRefs(context.Background(), disk, importDir); err != nil {
+	dst := filepath.Join(t.TempDir(), "out.qcow2")
+	if err := convertForeignDisk(context.Background(), disk, "qcow2", dst, importDir, nil); err != nil {
 		t.Fatalf("standalone staged disk outside the import dir: %v", err)
 	}
 }

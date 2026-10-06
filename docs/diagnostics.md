@@ -1427,6 +1427,24 @@ holder writes.
   a destroyed domain whose row moved. Otherwise leave the local copy running.
   The condition resolves once the copy is no longer declined.
 
+### Audit chain held (`audit_chain_held`)
+
+A host re-added under a name with audit history raises `audit_chain_held` about
+**itself** while it holds its own audit rows until that history has reached it
+from its peers ([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
+Its audit rows are durable in its local spool but are not yet in the cluster's
+audit log, so `lv audit ls` elsewhere does not show what was done on it.
+
+| Raised when | Clears when |
+|---|---|
+| The host's admission record (`<pki_dir>/audit-rejoin.json`) names a row of its chain its replica does not hold; re-raised once a minute while held. **Warning**; **critical** once the hold is full (10000 rows), when the host refuses every audited client action and login with `Unavailable`. The evidence carries `held_rows` and `waiting_for`. | The recorded row has arrived and every held row has landed. |
+
+**If it does not clear,** the host cannot reach a peer holding its history:
+check `lv health` for replication and gossip, and that the survivors are
+reachable from it. `waiting_for` saying the row "does not hash" means the
+replica holds a different history than the cluster had for the name — the
+hold stays closed rather than fork the chain; investigate before anything else.
+
 ### Observer stalled (`observer_stalled`)
 
 A node that was itself not running — its VM suspended, swapped out, or starved

@@ -570,48 +570,63 @@ signing key at the sequence the cluster holds for it. That boundary is signed
 with the cluster CA key, so the host cannot choose it, and everything at or
 below it belongs to the machine that was removed.
 
-**The rebuilt daemon holds its audit rows until its own history has arrived.**
-A host chains each row onto the tail of its own sub-chain as its local replica
+**`lv host add` hands the new machine its chain position.** The admitting
+node reports the last seq the name wrote and that row's content hash. `lv host
+add` signs the pair with the cluster CA and writes it to the new machine as
+`<pki_dir>/audit-rejoin.json` before its daemon first starts. A name with no
+history gets no record, and any record a previous machine left there is
+removed. The admitting node refuses with `Unavailable` while its own replica has
+not caught up, since a stale position is the one thing this record must not
+carry.
+An admitting daemon older than this reports no position, so its admissions get
+no record and nothing is held — the behaviour before this change.
+
+**The rebuilt daemon holds its audit rows until that history has arrived.** A
+host chains each row onto the tail of its own sub-chain as its local replica
 holds it, and a rebuilt host's replica holds none of its history until
-anti-entropy delivers it — typically within one anti-entropy interval. Appending
-before then starts a second chain under a name that already has one: `seq 1`,
-an empty `prev_hash`, and a hash mismatch plus duplicated sequence numbers on
-every node, permanently, since signed rows are never resealed. So until the tail
-can be trusted, every row the host audits is **held**: written to
-`<data_dir>/audit-hold/`, mode 0700, one fsynced file per row, never replicated.
-A daemon restart in that window loses nothing. Once the tail is trusted the held
-rows are appended, in the order they were audited, after the real tail. Each
-keeps the time it was audited as its stamp; `seq` records where it entered the
-chain.
+anti-entropy delivers it. Appending before then starts a second chain under a
+name that already has one: `seq 1`, an empty `prev_hash`, and a hash mismatch
+plus duplicated seqs on every node, permanently, since signed rows are never
+resealed. So when the admission record names a row this replica does not hold,
+every row the host audits is **held**: written to `<data_dir>/audit-hold/`,
+mode 0700, one fsynced file per row, never replicated. The hold opens once a
+row at the recorded seq with the recorded hash is in the local replica, from
+whichever peer delivered it. Held rows then land in the order they were held
+(a counter, not a clock), after the real tail, off any RPC's path and in
+batches. Each keeps the time it was audited as its stamp; `seq` records where
+it entered the chain. A daemon restart in that window loses nothing.
 
-The tail is trusted once both hold:
+"One anti-entropy exchange completed" is not the condition, deliberately. Drill
+6 rebuilds three of five hosts at once, and an exchange between two rebuilt
+hosts completes while both are empty.
 
-- **the replica has caught up** — an anti-entropy exchange with a peer has
-  completed since the daemon started, so the host's rows, the lifecycle records
-  and the chain heads that peer held are all local; and
-- **the tail has reached what the cluster's records say it reached** — every
-  verified retirement boundary of the host's keys (the one `lv host rm` wrote
-  among them) and every verified chain head, a retired key's head counting only
-  up to its boundary.
+**Only that case holds.** A normal restart's replica already holds the
+recorded row (or there is no record), so it never holds. A brand-new name has no
+record, so it never holds either. A record that does not verify against the
+cluster CA is logged at error level and not acted on. If the row at the
+recorded seq hashes differently, the replica holds a different history than the
+cluster had for the name: the hold stays closed, and says so.
 
-The second condition can name a sequence no row will ever reach — a boundary an
-operator raised past the real tail with `--at-seq`, or a head published by a
-leaked key. Ten minutes after the replica caught up, a shortfall is no longer
-replication lag: the daemon logs an error naming it and appends anyway, and if
-the missing rows do exist, `verify` reports the fork.
+**A hold does not open by itself.** While held, the daemon logs an error once a
+minute and raises the `audit_chain_held` health condition about itself (warning,
+critical once full), so `lv health` shows a host whose actions are not yet in
+the cluster's audit log. It resolves when the held rows have landed.
 
-Every daemon start holds this way, not only a rebuild's, because a restart and
-a rebuild cannot be told apart locally — a node restored from an older snapshot
-has the same problem with a shorter gap. On an ordinary restart the cost is up
-to one anti-entropy interval of audit latency, and nothing is lost. Two cases
-are trusted at once, because there is nobody to catch up with: a node that sees
-no peer (no gossip member and no other live host) and either founded the
-cluster (no `join_peers`) or already holds rows of its own. A node configured
-with `join_peers` that holds none of its own history is the rebuilt host, and
-it waits even when it sees no peer — at its first start its hosts table can
-name only itself. While held, a warning names the reason once a minute. A host
-that cannot reach any peer holds its rows until it can; past 10000 held rows a
-row is logged in full at error level and not written.
+**No row is ever dropped.** Past 10000 held rows the hold is **full**, and the
+node refuses every audited action it can refuse rather than take it with
+nowhere for its row to go: every client RPC except reads (`Get…`, `List…`,
+`Watch…`, `Verify…`, `Export…` and similar), and the logins, are refused with
+`Unavailable`. RPCs from a peer host acting as the system are not refused —
+replication is how the history arrives. Rows from background writers (failover,
+health) are still held past the limit. Denied logins — the one audited action
+an unauthenticated caller can repeat at will — are coalesced while held into a
+single row carrying their count, the first and last time and the last attempt,
+so they cannot fill the hold.
+
+Landing is exactly once: an id already in the log is skipped, and a spool file
+is removed only after its row is committed. That relies on the commit being
+durable before the removal, which `synchronous=FULL` provides (a voting node
+requires it).
 
 **The new key's contract starts after the old machine's rows.** The new key's
 `adopted` record is written only once the hold has opened, and its start is

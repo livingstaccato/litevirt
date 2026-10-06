@@ -363,7 +363,10 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 	// ownership moves), so the SOURCE must hold local quorum once enforced — else an
 	// isolated host could evacuate its VMs onto peers without quorum. Checked before
 	// marking "draining" so a refusal is a clean no-op. Fail-open until cluster-wide.
-	if reason, refused := s.execGateRefused(ctx); refused {
+	// The drain gate, not ExecutionGate: a re-run on a host already draining
+	// retries what an earlier drain left, and must not be refused for the state
+	// that drain put the host in.
+	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return status.Errorf(codes.FailedPrecondition, "drain refused: %s", reason)
 	}
@@ -405,9 +408,10 @@ func (s *Server) DrainHost(req *pb.DrainHostRequest, stream pb.LiteVirt_DrainHos
 		if err != nil {
 			slog.Warn("drain: no placement target for VM", "vm", vm.Name, "error", err)
 			if err := stream.Send(&pb.DrainProgress{
-				VmName: vm.Name,
-				Status: "failed",
-				Error:  fmt.Sprintf("no eligible target: %v", err),
+				VmName:   vm.Name,
+				Status:   "failed",
+				Strategy: notMoved,
+				Error:    fmt.Sprintf("no eligible target: %v", err),
 			}); err != nil {
 				return err
 			}
@@ -531,6 +535,12 @@ func buildDrainPlacementRequest(vm corrosion.VMRecord, drainHost string, capacit
 	return placementReq
 }
 
+// notMoved is the Strategy of a drain frame for a VM the drain did not try to
+// move — refused or skipped before any move began. Without it the frame would
+// carry the enum's zero value, MIGRATE_LIVE, and `lv host drain` printed
+// [MIGRATE_LIVE] for a stopped VM that would have moved cold.
+const notMoved = pb.MigrateStrategy_MIGRATE_NONE
+
 // drainOneVM migrates a single VM to the target host. Returns progress message.
 //
 // A running VM whose disks are all on shared storage is live-migrated. Every
@@ -558,22 +568,22 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// owns (split-brain). Everything below uses `fresh`.
 	fresh, err := corrosion.GetVM(ctx, s.db, vm.Name)
 	if err != nil || fresh == nil {
-		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
 			Error: "VM no longer exists"}
 	}
 	if fresh.State == "backing-up" {
-		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
 			Error: "active backup in progress — re-run drain after backup completes"}
 	}
 	// Only drain a VM we still OWN, in a drainable state. Never act on one that moved
 	// off this host (or changed state) after the job was queued — a move of a VM
 	// running elsewhere would double-run it.
 	if fresh.HostName != s.hostName {
-		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
 			Error: "VM no longer owned by this host (moved since drain was queued)"}
 	}
 	if fresh.State != "running" && fresh.State != "stopped" {
-		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
 			Error: fmt.Sprintf("VM is %s — not drainable", fresh.State)}
 	}
 
@@ -586,7 +596,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// below (drainStoppedVM), with its refusals.
 	if fresh.State == "running" && usesFirmwareState(fresh.Spec) {
 		return &pb.DrainProgress{
-			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
 			Error: "Secure Boot / vTPM VM can't be drained while running (its firmware state isn't transferred live) — stop it and drain again, or migrate it explicitly (`lv migrate " + vm.Name + " <target-host> --cold`), which carries the firmware",
 		}
 	}
@@ -596,11 +606,12 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// the source right before THIS VM's irreversible move (a live migration, or a
 	// cold move's handoff) so a mid-drain quorum loss stops further moves. Placed
 	// after the fresh-row read and before any runtime/ownership mutation. Fail-open
-	// until split_brain_gate_v1 is cluster-wide.
-	if reason, refused := s.execGateRefused(ctx); refused {
+	// until split_brain_gate_v1 is cluster-wide. The drain gate: this host is
+	// draining by now, and moving its VMs away is what draining is for.
+	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return &pb.DrainProgress{
-			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: notMoved,
 			Error: "drain refused: " + reason,
 		}
 	}
@@ -641,7 +652,7 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 		"vm:"+vm.Name, fresh.CPUActual, fresh.MemActual, intentVMResident)
 	if aerr != nil {
 		return &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
-			Error: "target admission refused: " + aerr.Error()}
+			Strategy: pb.MigrateStrategy_MIGRATE_LIVE, Error: "target admission refused: " + aerr.Error()}
 	}
 	defer migLease.release(ctx)
 
@@ -676,10 +687,10 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	// and hands it over (irreversible). Re-check so a quorum loss during the live
 	// attempt stops the fallback. On refusal the VM is left running on the source
 	// (live migration failure leaves the source domain up).
-	if reason, refused := s.execGateRefused(ctx); refused {
+	if reason, refused := s.drainGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
 		return &pb.DrainProgress{
-			VmName: vm.Name, TargetHost: target.Name, Status: "skipped",
+			VmName: vm.Name, TargetHost: target.Name, Status: "skipped", Strategy: pb.MigrateStrategy_MIGRATE_LIVE,
 			Error: "drain refused: " + reason,
 		}
 	}

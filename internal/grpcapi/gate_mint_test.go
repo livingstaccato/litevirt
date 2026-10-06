@@ -50,6 +50,9 @@ func (f fakeServerGate) ExecutionGate(context.Context) health.GateResult {
 	}
 	return health.GateResult{OK: false, Reason: health.ReasonNoQuorum}
 }
+func (f fakeServerGate) DrainExecutionGate(ctx context.Context) health.GateResult {
+	return f.ExecutionGate(ctx)
+}
 func (f fakeServerGate) DecisionGate(context.Context) health.GateResult {
 	if f.decideOK {
 		return health.GateResult{OK: true}

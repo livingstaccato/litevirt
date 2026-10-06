@@ -315,6 +315,18 @@ func (r *Reconciler) SetFirmwarePaths(fp lv.FirmwarePaths) { r.firmware = fp }
 // daemon.PCIConfig.SparePCIeRootPorts.
 func (r *Reconciler) SetSparePCIeRootPorts(n int) { r.sparePCIeRootPortsCfg = n }
 
+// ensureSparePCIeRootPorts gives a domain this reconciler just defined from
+// GenerateDomainXML its pci.spare_pcie_root_ports free root ports, once
+// libvirt has placed every device (lv.EnsureSparePCIeRootPorts). Best
+// effort: a failure leaves a valid domain that a later hot-plug may find
+// full, which is no reason to keep the VM from starting.
+func (r *Reconciler) ensureSparePCIeRootPorts(name string) {
+	if _, err := lv.EnsureSparePCIeRootPorts(r.virt, name, r.sparePCIeRootPortsCfg); err != nil {
+		slog.Warn("reconciler: spare PCIe root ports not added; a hot-plug may find no free slot",
+			"vm", name, "want", r.sparePCIeRootPortsCfg, "error", err)
+	}
+}
+
 // SetNetworkProvision replaces how a VM start provisions the VM's networks on
 // this host (nil restores network.SafeProvision). The daemon passes the same
 // provisioner the gRPC server uses, so a failover restart and a VM create set
@@ -1628,17 +1640,16 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 
 	// Build libvirt domain config.
 	vmCfg := lv.VMConfig{
-		Name:               vm.Name,
-		CPU:                vm.CPUActual,
-		MemoryMiB:          vm.MemActual,
-		Machine:            spec.Machine,
-		Firmware:           spec.Firmware,
-		GuestAgent:         spec.GuestAgent,
-		Disks:              diskConfigs,
-		Networks:           netConfigs,
-		CloudInitISO:       cloudInitISO,
-		Boot:               spec.Boot,
-		SparePCIeRootPorts: r.sparePCIeRootPortsCfg,
+		Name:         vm.Name,
+		CPU:          vm.CPUActual,
+		MemoryMiB:    vm.MemActual,
+		Machine:      spec.Machine,
+		Firmware:     spec.Firmware,
+		GuestAgent:   spec.GuestAgent,
+		Disks:        diskConfigs,
+		Networks:     netConfigs,
+		CloudInitISO: cloudInitISO,
+		Boot:         spec.Boot,
 	}
 	if vmCfg.Machine == "" {
 		vmCfg.Machine = "q35"
@@ -1733,6 +1744,9 @@ func (r *Reconciler) startPendingVM(ctx context.Context, vm corrosion.VMRecord) 
 		r.failPendingStart(ctx, vm.Name, proofID, hwPrepareRetryable(hwErr), fmt.Sprintf("hardware pre-start: %v", hwErr))
 		return
 	}
+	// Spare root ports last: the pre-start above may have patched hostdevs
+	// in, and libvirt places those on any free port, spares included.
+	r.ensureSparePCIeRootPorts(vm.Name)
 
 	if r.startDomainHook != nil {
 		r.startDomainHook(ctx)

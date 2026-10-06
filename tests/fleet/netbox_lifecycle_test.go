@@ -548,6 +548,10 @@ func (quorumGranted) ExecutionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }
 
+func (quorumGranted) DrainExecutionGate(context.Context) health.GateResult {
+	return health.GateResult{OK: true}
+}
+
 func (quorumGranted) DecisionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }

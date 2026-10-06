@@ -35,6 +35,10 @@ func (g quorumLossGate) ExecutionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }
 
+func (g quorumLossGate) DrainExecutionGate(ctx context.Context) health.GateResult {
+	return g.ExecutionGate(ctx)
+}
+
 // admissionHookDest is the always-admitting destination with a hook that runs
 // when the source asks it for capacity — after the early gate, before any VF
 // is touched.

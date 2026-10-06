@@ -268,8 +268,9 @@ func TestFleet_DrainRecoveryGivesUpOnce(t *testing.T) {
 	if n := sc.pendingMoves(t); n != 0 {
 		t.Fatalf("a move recovery gave up on is still pending (%d); every restart would retry it", n)
 	}
-	if !sc.drainEvent(t, "error", "start it with `lv start os1`") {
-		t.Error("no vm.drain error event tells the operator to start os1")
+	if !sc.drainEvent(t, "error", "on any other host, start it with `lv start os1`") ||
+		!sc.drainEvent(t, "error", "`lv host undrain "+sc.src.Name+"`") {
+		t.Error("no vm.drain error event tells the operator how to start os1, on the drained host and elsewhere")
 	}
 	if active, _ := sc.dst.Virt.DomainIsActive("os1"); active {
 		t.Error("os1 is running on the target although every start failed")

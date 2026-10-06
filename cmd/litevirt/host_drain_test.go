@@ -71,3 +71,30 @@ func TestHostDrain_IncompleteDrainIsAnError(t *testing.T) {
 		t.Errorf("the VM left behind is not reported: stderr=%q", stderr)
 	}
 }
+
+// A drain line names a strategy only for a VM the drain moved or tried to
+// move. The lab printed [MIGRATE_LIVE] for a stopped VM and a local-disk VM
+// that a refusal left where they were: their frames carried no strategy, and
+// the enum's zero value is MIGRATE_LIVE.
+//
+// Mutation: print the strategy whatever it is — the refused line carries
+// [MIGRATE_NONE] and goes red.
+func TestDrainProgressLine(t *testing.T) {
+	for _, tc := range []struct {
+		p    *pb.DrainProgress
+		want string
+	}{
+		{&pb.DrainProgress{VmName: "a", TargetHost: "h2", Strategy: pb.MigrateStrategy_MIGRATE_NONE, Status: "skipped", Error: "drain refused: no_quorum"},
+			"  a → h2 ERROR: drain refused: no_quorum"},
+		{&pb.DrainProgress{VmName: "b", TargetHost: "h2", Strategy: pb.MigrateStrategy_MIGRATE_COLD, Status: "done"},
+			"  b → h2 [MIGRATE_COLD] done"},
+		{&pb.DrainProgress{VmName: "c", TargetHost: "h2", Strategy: pb.MigrateStrategy_MIGRATE_LIVE, Status: "done"},
+			"  c → h2 [MIGRATE_LIVE] done"},
+		{&pb.DrainProgress{VmName: "d", TargetHost: "h2", Strategy: pb.MigrateStrategy_MIGRATE_COLD, Status: "failed", Error: "not moved"},
+			"  d → h2 [MIGRATE_COLD] ERROR: not moved"},
+	} {
+		if got := drainProgressLine(tc.p); got != tc.want {
+			t.Errorf("drainProgressLine(%v) = %q, want %q", tc.p, got, tc.want)
+		}
+	}
+}

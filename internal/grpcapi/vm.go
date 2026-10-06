@@ -791,7 +791,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// here, not in the shared builder.
 	vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, nil)
 	vmCfg.CloudInitISO = cloudInitISO
-	vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 	// Secure Boot + vTPM (G1). Use the host-resolved firmware paths and pin per-VM
 	// nvram + swtpm state under dataDir so they travel across the lifecycle. Refuse
 	// to silently adopt firmware state left by a prior `delete --keep-disks`.
@@ -853,6 +852,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		lv.WipeFirmwareState(s.dataDir, spec.Name, spec.Uuid) // no orphan nvram/swtpm (G1)
 		return nil, status.Errorf(codes.Internal, "define domain: %v", err)
 	}
+	s.ensureSparePCIeRootPorts(spec.Name)
 
 	if err := s.virt.StartDomain(spec.Name); err != nil {
 		s.virt.UndefineDomain(spec.Name, false)
@@ -4269,6 +4269,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			}
 		}
 	}
+	// A regenerated definition has no spare root ports until they are topped
+	// up after the define; a patched one keeps the ones it had.
+	regenerated := domXML == ""
 	if domXML == "" {
 		var hostdevs []lv.HostdevConfig
 		for _, addr := range liveDevs {
@@ -4278,7 +4281,6 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 		// Hostdevs are populated here — the fields the old inline redefine builder
 		// dropped, collapsing the balloon ceiling and detaching passthrough).
 		vmCfg := baseDomainConfig(spec, diskConfigs, netConfigs, hostdevs)
-		vmCfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 		// Preserve Secure Boot + vTPM across the redefine (G1): without this a stopped
 		// SB/vTPM VM updated for cpu/mem would be redefined with no <uuid>/<tpm>/SB
 		// loader/SMM/nvram — silent BitLocker breakage. ApplyTo only sets fields (no
@@ -4320,6 +4322,9 @@ func (s *Server) UpdateVM(ctx context.Context, req *pb.UpdateVMRequest) (*pb.VM,
 			_ = s.virt.DefineDomain(oldXML)
 		}
 		return nil, status.Errorf(codes.Internal, "redefine domain: %v", err)
+	}
+	if regenerated {
+		s.ensureSparePCIeRootPorts(req.Name)
 	}
 
 	// Pin the resolved machine type. The redefine just resolved any alias

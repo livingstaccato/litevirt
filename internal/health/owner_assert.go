@@ -60,10 +60,32 @@ func workloadCapablePeers(hosts []corrosion.HostRecord, self string) []string {
 // localHostIsActiveWorker reports whether this host may perform a runtime
 // ownership repair: it must be present, active, and a worker (never a witness).
 func localHostIsActiveWorker(hosts []corrosion.HostRecord, self string) bool {
+	return localWorkerIn(hosts, self, "active")
+}
+
+// localHostIsEvacuatingWorker is localHostIsActiveWorker for a host moving its
+// own workloads away: it may also be draining (DrainExecutionGate).
+func localHostIsEvacuatingWorker(hosts []corrosion.HostRecord, self string) bool {
+	return localWorkerIn(hosts, self, "active", "draining")
+}
+
+// localWorkerIn reports whether this host is present, a worker (never a
+// witness), and in one of states. The two predicates above share it, so a
+// change to what makes a host a worker reaches both gates.
+func localWorkerIn(hosts []corrosion.HostRecord, self string, states ...string) bool {
 	for i := range hosts {
-		if hosts[i].Name == self {
-			return hosts[i].State == "active" && !hosts[i].IsWitness()
+		if hosts[i].Name != self {
+			continue
 		}
+		if hosts[i].IsWitness() {
+			return false
+		}
+		for _, st := range states {
+			if hosts[i].State == st {
+				return true
+			}
+		}
+		return false
 	}
 	return false
 }

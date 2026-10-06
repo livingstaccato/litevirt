@@ -14,6 +14,10 @@ message ListHostsRequest   { map<string, string> label_filter = 1; }
 message ListHostsResponse  { repeated Host hosts = 1; }
 message InspectHostRequest { string name = 1; }
 message DrainHostRequest   { string name = 1; int32 parallel = 2; }
+// One VM's drain result. strategy is how the VM moved, or the move that was
+// tried: MIGRATE_LIVE or MIGRATE_COLD. MIGRATE_NONE means the drain did not
+// try to move it (refused or skipped first; error says why), not the VMSpec
+// "never migrate" policy.
 message DrainProgress      { string vm_name = 1; string target_host = 2;
     MigrateStrategy strategy = 3; float progress_pct = 4;
     string status = 5; string error = 6; }

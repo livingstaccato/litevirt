@@ -24,13 +24,20 @@ import (
 	"github.com/litevirt/litevirt/internal/metrics"
 )
 
-// flipExecGate returns ExecutionGate OK on the FIRST call, then refuses — modeling
-// quorum lost DURING a long live migration, so a re-check on the cold fallback path
-// catches it. DecisionGate/Enforced/PeerSupportsFresh always pass so only the
-// ExecutionGate transition is under test.
+// flipExecGate is the gate of a DRAINING source: ExecutionGate always refuses
+// it (local_not_active_worker), and DrainExecutionGate returns OK on the FIRST
+// call, then refuses with no_quorum — modeling quorum lost DURING a long live
+// migration, so a re-check on the cold fallback path catches it. A drain site
+// that asked ExecutionGate would be refused for the wrong reason, which the
+// test tells apart. DecisionGate/Enforced/PeerSupportsFresh always pass so only
+// the gate transition is under test.
 type flipExecGate struct{ calls int }
 
 func (g *flipExecGate) ExecutionGate(context.Context) health.GateResult {
+	return health.GateResult{OK: false, Reason: health.ReasonLocalNotActiveWorker}
+}
+
+func (g *flipExecGate) DrainExecutionGate(context.Context) health.GateResult {
 	g.calls++
 	if g.calls == 1 {
 		return health.GateResult{OK: true}
@@ -1161,6 +1168,11 @@ func TestDrainOneVM_GateRefusesMidDrain(t *testing.T) {
 	if progress.Status != "skipped" {
 		t.Errorf("Status = %q, want skipped (gate refused mid-drain)", progress.Status)
 	}
+	// Nothing was moved, so the frame names no strategy (not the enum's zero
+	// value, MIGRATE_LIVE, which `lv host drain` used to print for it).
+	if progress.Strategy != pb.MigrateStrategy_MIGRATE_NONE {
+		t.Errorf("Strategy = %s, want MIGRATE_NONE (nothing moved)", progress.Strategy)
+	}
 	got, _ := corrosion.GetVM(ctx, s.db, "own-vm")
 	if got.HostName != "test-host" {
 		t.Errorf("host = %q, want test-host (not reassigned — gate refused)", got.HostName)
@@ -1177,16 +1189,30 @@ func TestDrainOneVM_LiveFailure_ColdFallbackReGated(t *testing.T) {
 	// Running VM, shared storage (no local disks) → enters the live-migrate path.
 	insertTestVMR2(t, ctx, s.db, "live-vm", "test-host", "running")
 	f := libvirtfake.New()
-	f.FailMigrateToTarget = func(_, _ string) error { return errors.New("live migrate failed") }
+	liveAttempts := 0
+	f.FailMigrateToTarget = func(_, _ string) error { liveAttempts++; return errors.New("live migrate failed") }
 	s.virt = f
 	s.SetGate(&flipExecGate{}) // per-VM check OK, cold-fallback check refuses
 
 	vm := corrosion.VMRecord{Name: "live-vm", HostName: "test-host", State: "running"}
-	target := corrosion.HostRecord{Name: "target-h", Address: "10.0.0.2"}
+	// The target is this daemon's own host, so the destination admission
+	// before the live attempt is answered locally: a unit test has no peer
+	// to ask, and a remote target stops the drain at that admission, before
+	// the live attempt and the cold fallback this test is about.
+	insertTestHostR2(t, ctx, s.db, "test-host", "draining")
+	target := corrosion.HostRecord{Name: "test-host", Address: "10.0.0.1"}
 
 	progress := s.drainOneVM(ctx, vm, target)
 	if progress.Status != "skipped" {
 		t.Errorf("Status = %q, want skipped (cold fallback re-gated after live failure)", progress.Status)
+	}
+	if liveAttempts != 1 {
+		t.Errorf("live attempts = %d, want 1: the drain must reach its live attempt and the fallback after it", liveAttempts)
+	}
+	// Refused at the cold fallback, after the live attempt, for the lost
+	// quorum — not at the per-VM check for the source being draining.
+	if !strings.Contains(progress.Error, "drain refused: "+health.ReasonNoQuorum) || progress.Strategy != pb.MigrateStrategy_MIGRATE_LIVE {
+		t.Errorf("progress = %+v, want the cold fallback's no_quorum refusal after a live attempt", progress)
 	}
 	// VM left on the source (live migration failure leaves the source domain up; the
 	// re-gate stopped the cold shutdown+reassign).

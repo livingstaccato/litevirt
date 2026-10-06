@@ -48,6 +48,9 @@ func newMarkerSweepHost(t *testing.T) *markerSweepHost {
 			t.Fatalf("marker %s: %v", name, err)
 		}
 	}
+	// Caught up, as a running host is once it has exchanged with a peer;
+	// TestDeletedVMMarkerSweep_WaitsForAReplicaItCanTrust starts without.
+	s.db.MarkReplicaCaughtUpForTests("peer")
 	return &markerSweepHost{s: s, fake: fake}
 }
 
@@ -145,6 +148,59 @@ func TestDeletedVMMarkerSweep_RunsWhenTheHostBecomesActive(t *testing.T) {
 		h.s.DeletedVMMarkerSweepTick(ctx)
 		if !h.markers(t)["gone"] {
 			t.Error("swept again while the host stayed active")
+		}
+	})
+}
+
+// A daemon start is the case the startup sweep exists for — a host that was
+// down while a VM was deleted — and its replica then holds the cluster as it
+// was when it went down: no tombstone yet, and probably its own record still
+// `active`. So the sweep waits until the replica has caught up with a peer,
+// and a look it could not act on (not caught up, or no libvirt to ask about
+// domains) does not count as having seen the host active: the next look that
+// can act still sweeps.
+//
+// Mutations: don't wait for the replica — the first look sweeps an
+// uncaught-up replica, finds no tombstone, and (having seen the host active)
+// never sweeps again, so the marker stays; record the state before the
+// libvirt check — the look without libvirt consumes the activation and the
+// marker stays.
+func TestDeletedVMMarkerSweep_WaitsForAReplicaItCanTrust(t *testing.T) {
+	ctx := adminCtx()
+	t.Run("replica not caught up", func(t *testing.T) {
+		s := testServerWithLocks(t)
+		s.virt = libvirtfake.New()
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := health.WriteVMOwnerEpochMarker(s.dataDir, "gone", 2); err != nil {
+			t.Fatal(err)
+		}
+		// The daemon's first look: the tombstone has not arrived.
+		s.DeletedVMMarkerSweepTick(ctx)
+		// Anti-entropy delivers it, and marks the replica caught up.
+		if err := corrosion.InsertVM(ctx, s.db, corrosion.VMRecord{Name: "gone", HostName: "owner-host", State: "running"}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := corrosion.DeleteVM(ctx, s.db, "gone"); err != nil {
+			t.Fatal(err)
+		}
+		s.db.MarkReplicaCaughtUpForTests("peer")
+		s.DeletedVMMarkerSweepTick(ctx)
+		if _, found, _ := health.ReadVMOwnerEpochMarker(s.dataDir, "gone"); found {
+			t.Error("the deleted VM's marker survived the host's start: the sweep ran on a replica that had not caught up")
+		}
+	})
+	t.Run("no libvirt yet", func(t *testing.T) {
+		h := newMarkerSweepHost(t)
+		h.setState(t, "active")
+		virt := h.s.virt
+		h.s.virt = nil
+		h.s.DeletedVMMarkerSweepTick(ctx)
+		h.s.virt = virt
+		h.s.DeletedVMMarkerSweepTick(ctx)
+		if h.markers(t)["gone"] {
+			t.Error("a look without libvirt consumed the activation; the deleted VM's marker stayed")
 		}
 	})
 }

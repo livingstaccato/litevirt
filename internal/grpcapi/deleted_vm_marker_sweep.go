@@ -57,9 +57,25 @@ func (s *Server) RunDeletedVMMarkerSweep(ctx context.Context) {
 
 // DeletedVMMarkerSweepTick is one look of RunDeletedVMMarkerSweep: it reads
 // this host's state and sweeps when the host is active and was not at the
-// previous look — or there was none, as at a daemon start. A state it cannot
-// read changes nothing.
+// previous look — or there was none, as at a daemon start.
+//
+// A look that could not act changes nothing, so the next one that can still
+// sees the activation:
+//   - a replica that has not caught up with a peer (ReplicaCaughtUp). At a
+//     daemon start the replica holds the cluster as it was when the host went
+//     down — the case this sweep exists for — so the tombstone it needs has
+//     not arrived yet, and the host's own record most likely still says it is
+//     active. Sweeping then removes nothing and would use up the activation.
+//   - no libvirt connection: the sweep cannot tell whether a domain of a name
+//     is defined, so it removes nothing.
+//   - a state it cannot read.
 func (s *Server) DeletedVMMarkerSweepTick(ctx context.Context) {
+	if s.virt == nil {
+		return
+	}
+	if ok, _ := s.db.ReplicaCaughtUp(); !ok {
+		return
+	}
 	h, err := corrosion.GetHost(ctx, s.db, s.hostName)
 	if err != nil || h == nil {
 		return
@@ -75,7 +91,8 @@ func (s *Server) DeletedVMMarkerSweepTick(ctx context.Context) {
 
 // sweepDeletedVMMarkers removes the owner-epoch marker of every VM this
 // host's replica records as deleted, unless a domain of that name is defined
-// here. Without libvirt it removes nothing: it cannot tell whether one is.
+// here. Without libvirt it removes nothing: it cannot tell whether one is
+// (DeletedVMMarkerSweepTick does not count such a look).
 func (s *Server) sweepDeletedVMMarkers(ctx context.Context) {
 	if s.virt == nil || s.dataDir == "" {
 		return
@@ -100,9 +117,18 @@ func (s *Server) sweepDeletedVMMarkers(ctx context.Context) {
 }
 
 // removeDeletedVMMarker removes name's marker if this host's replica records
-// the VM as deleted and no domain of the name is defined here. It holds the
-// VM's lock, as the receiving side of a deleting owner's request does, and
-// reads the row and the domain as late as it can.
+// the VM as deleted and no domain of the name is defined here. It reads the
+// row and the domain as late as it can, under the VM's lock.
+//
+// The lock serializes with this host's other lockVM holders (delete, hotplug,
+// migration out, the deleting owner's request). It does NOT hold off a create
+// of the same name — createVM does not take it. Such a create defines its
+// domain, then revives the row, then writes the marker, so it is refused by
+// the tombstone and domain checks here unless it does all three between those
+// checks and the removal; that is the residual window, as on the receiving
+// side (removeDeletedVMLeftoversHere), and it would remove the new VM's marker,
+// which the reconciler's convergeOwnerEpochMarker writes again from its row
+// once the VM runs here.
 func (s *Server) removeDeletedVMMarker(ctx context.Context, name string) {
 	unlock := s.lockVM(name)
 	defer unlock()

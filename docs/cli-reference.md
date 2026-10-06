@@ -774,9 +774,9 @@ keeps detached disks too. A host that is `active` or `draining` is asked. One
 that is down, in `maintenance` or otherwise out of service during the delete
 keeps its copy of a detached disk; remove it by hand
 (`<data_dir>/disks/<vm>-<disk>.qcow2`). Its `vms/<name>/owner_epoch` marker it
-removes itself when it is next `active` (at a daemon start, or after
-`lv host undrain`), once its own records show the VM deleted and no domain of
-that name is defined there.
+removes itself when it is next `active` (at a daemon start, once its replica
+has caught up with a peer, or after `lv host undrain`), if its own records
+show the VM deleted and no domain of that name is defined there.
 
 ## Users and tokens
 

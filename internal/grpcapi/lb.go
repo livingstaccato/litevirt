@@ -769,7 +769,7 @@ func (s *Server) applyLBLocal(ctx context.Context, cfg lb.Config) error {
 	// is the right gate; a proof is validated separately when a caller supplies one.)
 	if reason, refused := s.lbGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionLBApply, reason)
-		return status.Errorf(codes.FailedPrecondition, "lb apply refused: %s", reason)
+		return status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "lb apply", reason, returnToServiceHint))
 	}
 	// NOTE: the Phase-2 VIP-takeover gate is NOT here. Whether a new claim is safe is
 	// a TRANSITION decision (which OLD holder is being removed and must release), and
@@ -2320,7 +2320,7 @@ func (s *Server) ApplyLB(ctx context.Context, req *pb.ApplyLBRequest) (*emptypb.
 	// so it would miss a proof-carrying apply on a not-yet-enforcing regressed host.)
 	if reason, refused := s.execGateForAction(ctx, req.Proof != nil); refused {
 		s.noteGateRefused(corrosion.ActionLBApply, reason)
-		return nil, status.Errorf(codes.FailedPrecondition, "lb apply refused: %s", reason)
+		return nil, status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "lb apply", reason, returnToServiceHint))
 	}
 
 	algorithm := req.Algorithm

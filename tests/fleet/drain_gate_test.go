@@ -357,3 +357,63 @@ func TestFleet_DrainOnADrainingHostWithoutQuorumIsRefused(t *testing.T) {
 		t.Errorf("os1 row names %s, want it left on %s", vm.HostName, sc.src.Name)
 	}
 }
+
+// An operator start refused on a host that is draining, or in maintenance,
+// says so and says what to do. The gate's bare reason,
+// "local_not_active_worker", named neither the host's state nor a way out,
+// and was all the lab got back from `lv start` on a draining host.
+//
+// A stopped VM's start and restart point at `lv host undrain` and at moving
+// it off cold; a running VM's restart adds the stop that a move off needs.
+//
+// Mutation: return the bare "start refused: <reason>" / "restart refused:
+// <reason>" again — every message loses the host state and the commands, and
+// goes red.
+func TestFleet_StartRefusedOnAnInactiveHostSaysWhyAndWhatToDo(t *testing.T) {
+	for _, state := range []string{"draining", "maintenance"} {
+		t.Run(state, func(t *testing.T) {
+			sc := newColdStoppedScenario(t)
+			sc.makeRunning(t)
+			sc.addStoppedLocalVM(t, "os2", []byte("os2's disk"))
+			enforceGate(t, sc.c)
+			ctx := context.Background()
+			if err := corrosion.UpdateHostState(ctx, sc.src.DB, sc.src.Name, state); err != nil {
+				t.Fatalf("mark %s %s: %v", sc.src.Name, state, err)
+			}
+			h := sc.src.Name
+			is := map[string]string{"draining": "is draining", "maintenance": "is in maintenance"}[state]
+			stopped := []string{
+				health.ReasonLocalNotActiveWorker,
+				"host " + h + " " + is,
+				"`lv host undrain " + h + "`",
+				"`lv migrate os2 <target-host> --cold`",
+			}
+
+			_, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os2"})
+			assertRefusedWith(t, "start of stopped os2", err, append(stopped, "start refused", "`lv start os2`")...)
+			_, err = sc.c.SelfClient(sc.src).RestartVM(ctx, &pb.RestartVMRequest{Name: "os2"})
+			assertRefusedWith(t, "restart of stopped os2", err, append(stopped, "restart refused", "`lv start os2`")...)
+			if active, _ := sc.src.Virt.DomainIsActive("os2"); active {
+				t.Errorf("os2 was started on the %s host", state)
+			}
+
+			_, err = sc.c.SelfClient(sc.src).RestartVM(ctx, &pb.RestartVMRequest{Name: "os1"})
+			assertRefusedWith(t, "restart of running os1", err,
+				health.ReasonLocalNotActiveWorker, "restart refused", "host "+h+" "+is,
+				"`lv host undrain "+h+"`", "`lv restart os1`", "`lv stop os1`", "`lv migrate os1 <target-host> --cold`")
+		})
+	}
+}
+
+func assertRefusedWith(t *testing.T, what string, err error, want ...string) {
+	t.Helper()
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("%s = %v, want FailedPrecondition", what, err)
+		return
+	}
+	for _, w := range want {
+		if !strings.Contains(err.Error(), w) {
+			t.Errorf("%s refusal %q does not contain %q", what, status.Convert(err).Message(), w)
+		}
+	}
+}

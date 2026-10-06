@@ -1439,7 +1439,8 @@ func (s *Server) startGatesLocked(ctx context.Context, method string, vm *corros
 	// automated start paths. Fail-open until split_brain_gate_v1 is cluster-wide.
 	if reason, refused := s.execGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
-		return nil, status.Errorf(codes.FailedPrecondition, "start refused: %s", reason)
+		return nil, status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "start", reason,
+			func(host, is string) string { return startOnInactiveHostHint(vm.Name, host, is) }))
 	}
 
 	// IsTemplate is not the whole invariant. CloneVM accepts ANY stopped
@@ -1799,7 +1800,12 @@ func (s *Server) RestartVM(ctx context.Context, req *pb.RestartVMRequest) (*pb.V
 	// once enforced. Fail-open until split_brain_gate_v1 is cluster-wide.
 	if reason, refused := s.execGateRefused(ctx); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
-		return nil, status.Errorf(codes.FailedPrecondition, "restart refused: %s", reason)
+		hint := startOnInactiveHostHint
+		if vm.State == "running" {
+			hint = restartRunningOnInactiveHostHint
+		}
+		return nil, status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "restart", reason,
+			func(host, is string) string { return hint(vm.Name, host, is) }))
 	}
 
 	// A restart of a STOPPED VM is an operator START in restart clothing: the VM

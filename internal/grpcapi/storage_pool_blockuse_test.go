@@ -14,7 +14,7 @@ import (
 	"github.com/litevirt/litevirt/internal/libvirtfake"
 )
 
-// fakeBlockTools puts zfs, lvs, lvcreate and lvremove on PATH. Each logs its
+// fakeBlockTools puts zfs, lvs, lvcreate, lvremove and lvextend on PATH. Each logs its
 // argv to the returned file and succeeds; `zfs list` and `lvs` print the
 // object asked for, as the real tools do for one that exists.
 func fakeBlockTools(t *testing.T) string {
@@ -22,7 +22,7 @@ func fakeBlockTools(t *testing.T) string {
 	bin := t.TempDir()
 	log := filepath.Join(bin, "calls.log")
 	script := "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> " + log + "\nfor a; do last=$a; done\necho \"$last\"\n"
-	for _, tool := range []string{"zfs", "lvs", "lvcreate", "lvremove"} {
+	for _, tool := range []string{"zfs", "lvs", "lvcreate", "lvremove", "lvextend"} {
 		if err := os.WriteFile(filepath.Join(bin, tool), []byte(script), 0o755); err != nil {
 			t.Fatal(err)
 		}

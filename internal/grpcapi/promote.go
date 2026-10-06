@@ -421,6 +421,11 @@ func checkAutoPromoteReplicaAge(replica string, now time.Time, limit time.Durati
 	if !ok {
 		return fmt.Errorf("%w: cannot read a timestamp from %q", errReplicaTooOld, replica)
 	}
+	// A stamp in the future (beyond clock skew) was not written by a
+	// replication run: its age cannot be shown to be within the bound.
+	if ts.After(now.Add(replicaStampSkew)) {
+		return fmt.Errorf("%w: %q is stamped in the future (%s)", errReplicaTooOld, replica, ts.Format(time.RFC3339))
+	}
 	if age := now.Sub(ts); age > limit {
 		return fmt.Errorf("%w: %q is %s old (limit %s); promote it manually if it is still the best available",
 			errReplicaTooOld, replica, age.Round(time.Minute), limit)
@@ -482,10 +487,13 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 	}
 
 	k := replicaKeyOf(vm, diskName)
+	// A replica the operator names may be any file an admin names, or one its
+	// project owns (explicitReplicaOK); the newest is chosen by record.
+	admin := req.Replica != "" && s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") == nil
 	byHost := map[string][]string{}
 	bestHost, bestName := "", ""
 	for _, h := range candidates {
-		names := s.replicaNames(ctx, pool, h, k)
+		names := s.replicaNames(ctx, pool, h, k, req.Replica, admin)
 		if req.Replica != "" {
 			if slices.Contains(names, req.Replica) {
 				return h, []string{req.Replica}, nil
@@ -691,7 +699,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if err != nil {
 		return err
 	}
-	replicaPath := filepath.Join(poolDir, replica)
+	replicaPath := s.namedReplicaPath(poolDir, replica)
 	if err := replicaReadable(replicaPath); err != nil {
 		return status.Errorf(codes.NotFound, "%s: %q on %q: %v", errReplicaUnavailable, replica, s.hostName, err)
 	}

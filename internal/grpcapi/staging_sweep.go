@@ -101,7 +101,11 @@ func hasStagingPrefix(name string) bool {
 // killed mid-replicate/upload/import/restore doesn't leak staging files forever.
 // Pool directories additionally lose any stale ".<replica>.partial" an older
 // build's publishReplica left behind (isLegacyReplicaPartial).
+//
+// It is also where a starting daemon records that this host has begun
+// recording pool files (markPoolRecordsStarted, pool_records.go).
 func (s *Server) SweepStaleStaging(ctx context.Context) {
+	s.markPoolRecordsStarted(ctx)
 	dirs := map[string]struct{}{
 		filepath.Join(s.dataDir, "images"): {},
 		filepath.Join(s.dataDir, "disks"):  {},

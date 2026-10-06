@@ -584,9 +584,9 @@ func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, cand
 	keep := make(map[string]bool, len(candidates))
 	for _, path := range candidates {
 		// An upload (an older one, from before uploads into <data_dir>/disks
-		// went to disks/uploads) is a project's file, not a VM's debris,
-		// whatever its name.
-		if s.isRecordedUpload(path) {
+		// went to disks/uploads), or a recorded replica, is a project's file,
+		// not a VM's debris, whatever its name. Unreadable records protect.
+		if _, recorded, rerr := s.recordOf(ctx, path); recorded || rerr != nil {
 			keep[path] = true
 			continue
 		}

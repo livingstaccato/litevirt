@@ -213,7 +213,7 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 	// it is still matched by its exact name, so a failed write only warns.
 	pruned := 0
 	if known {
-		if err := s.recordPoolReplica(sched.TargetPool, k, dstPath); err != nil {
+		if err := s.recordPoolReplica(ctx, sched.TargetPool, k, dstPath); err != nil {
 			slog.Warn("replication: replica written but not recorded", "vm", sched.VMName, "replica", dstPath, "error", err)
 		}
 		pruned = s.pruneLocalReplicas(ctx, dstDir, k, sched.KeepReplicas)
@@ -278,7 +278,7 @@ func streamFileToPool(ctx context.Context, client pb.LiteVirtClient, path, pool,
 	defer f.Close()
 	// The daemon's own upload of a replica of k's disk: the pool's host puts
 	// it where promotion reads it and records it as that VM's.
-	up, err := client.UploadStoragePoolContent(withReplicaContentView(ctx, k))
+	up, err := client.UploadStoragePoolContent(withReplicaContentView(ctx, k, "", false))
 	if err != nil {
 		return err
 	}
@@ -313,11 +313,11 @@ func (s *Server) pruneReplicasRemote(ctx context.Context, client pb.LiteVirtClie
 	if keepN <= 0 {
 		return 0
 	}
-	names := s.remoteReplicaNames(ctx, client, pool, host, k)
+	names := s.remoteReplicaNames(ctx, client, pool, host, k, "", false)
 	if len(names) <= keepN {
 		return 0
 	}
-	ctx = withReplicaContentView(ctx, k)
+	ctx = withReplicaContentView(ctx, k, "", false)
 	deleted := 0
 	for _, n := range names[:len(names)-keepN] {
 		if _, err := client.DeleteStoragePoolContent(ctx, &pb.DeleteStoragePoolContentRequest{PoolName: pool, Host: host, Filename: n}); err == nil {
@@ -431,7 +431,7 @@ func (s *Server) advanceReplicationCheckpoint(ctx context.Context, vmName, repo,
 // Uses replicaNames (RBAC-free), since the scheduler runs unauthenticated.
 func (s *Server) newestRawReplica(ctx context.Context, pool, host string, k replicaKey) string {
 	best := ""
-	for _, n := range s.replicaNames(ctx, pool, host, k) {
+	for _, n := range s.replicaNames(ctx, pool, host, k, "", false) {
 		if strings.HasSuffix(n, ".raw") && n > best {
 			best = n
 		}
@@ -460,7 +460,7 @@ func (s *Server) applyIncrementLocal(ctx context.Context, pool, newName, base st
 	if err != nil {
 		return err
 	}
-	if err := s.recordPoolReplica(pool, k, dest); err != nil {
+	if err := s.recordPoolReplica(ctx, pool, k, dest); err != nil {
 		slog.Warn("replication: replica written but not recorded", "vm", k.VM, "replica", dest, "error", err)
 	}
 	return nil
@@ -475,7 +475,7 @@ func (s *Server) applyIncrementRemote(ctx context.Context, host, pool, newName, 
 		return fmt.Errorf("reach host %q: %w", host, err)
 	}
 	defer conn.Close()
-	up, err := client.PushReplicaIncrement(withReplicaContentView(ctx, k))
+	up, err := client.PushReplicaIncrement(withReplicaContentView(ctx, k, "", false))
 	if err != nil {
 		return err
 	}
@@ -590,21 +590,26 @@ func isSharedDriver(driver string) bool {
 
 // pruneLocalReplicas keeps the newest keepN replicas of k's disk in dir
 // (localReplicaNames: by record, or an unrecorded file by its exact name),
-// deleting older ones. keepN <= 0 keeps all. Returns the count deleted.
+// deleting older ones — never one a live disk uses (a promotion that kept the
+// replica as its backing file), as a remote prune's delete refuses too.
+// keepN <= 0 keeps all. Returns the count deleted.
 func (s *Server) pruneLocalReplicas(ctx context.Context, dir string, k replicaKey, keepN int) int {
 	if keepN <= 0 {
 		return 0
 	}
-	names := s.localReplicaNames(ctx, dir, k) // timestamped suffix sorts oldest→newest
+	names := s.localReplicaNames(ctx, dir, k, "", false) // timestamped suffix sorts oldest→newest
 	if len(names) <= keepN {
 		return 0
 	}
 	deleted := 0
 	for _, n := range names[:len(names)-keepN] {
 		p := filepath.Join(dir, n)
+		if owners, err := s.liveDiskOwners(ctx, s.hostName, p); err != nil || len(owners) > 0 {
+			continue
+		}
 		if os.Remove(p) == nil {
 			deleted++
-			if err := s.forgetPoolUpload(p); err != nil {
+			if err := s.forgetPoolUpload(ctx, p); err != nil {
 				slog.Warn("replication: pruned replica's record not dropped", "replica", p, "error", err)
 			}
 		}

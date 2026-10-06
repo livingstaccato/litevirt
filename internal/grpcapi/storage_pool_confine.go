@@ -56,18 +56,27 @@ const poolUploadsFile = "pool-uploads.json"
 // the same name, rewritten, or put at a reused inode number is not the
 // upload. A published upload is never written again.
 //
-// A replica the daemon places (replication's upload, push or local copy) is
-// recorded the same way with VM and Disk set: it is a replica of that VM's
-// disk, and Project is the VM's project, not the pool's.
+// A replica the daemon places (replication's upload, push or local copy, a
+// replicate-volume copy) is recorded the same way with VM and Disk set: it is
+// a replica of that VM's disk, and Project is the VM's project, not the
+// pool's. A user's upload names its uploader (Uploader, user@realm); an older
+// node's upload, which carries no identity, is marked Peer.
+//
+// A file on shared storage also has its record in the replicated rows
+// (pool_records.go); read from there it is bound by size and modification
+// time only (shared).
 type poolUpload struct {
-	Pool    string `json:"pool"`
-	Project string `json:"project"`
-	VM      string `json:"vm,omitempty"`
-	Disk    string `json:"disk,omitempty"`
-	Dev     uint64 `json:"dev"`
-	Ino     uint64 `json:"ino"`
-	Size    int64  `json:"size"`
-	MtimeNs int64  `json:"mtime_ns"`
+	Pool     string `json:"pool"`
+	Project  string `json:"project"`
+	VM       string `json:"vm,omitempty"`
+	Disk     string `json:"disk,omitempty"`
+	Uploader string `json:"uploader,omitempty"`
+	Peer     bool   `json:"peer,omitempty"`
+	Dev      uint64 `json:"dev"`
+	Ino      uint64 `json:"ino"`
+	Size     int64  `json:"size"`
+	MtimeNs  int64  `json:"mtime_ns"`
+	shared   bool
 }
 
 // fileID is what binds an upload record to one file.
@@ -129,17 +138,23 @@ func (s *Server) writePoolUploads(m map[string]poolUpload) error {
 	return os.Rename(tmp.Name(), dst)
 }
 
-// recordPoolUpload records path as uploaded into pool for project.
-func (s *Server) recordPoolUpload(pool, project, path string) error {
-	return s.writePoolUploadRecord(path, poolUpload{Pool: pool, Project: project})
+// recordPoolUpload records path as a user's upload into pool (of project).
+func (s *Server) recordPoolUpload(ctx context.Context, pool, project, uploader, path string) error {
+	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Project: project, Uploader: uploader})
+}
+
+// recordPeerUpload records path as an older node's upload into pool: it
+// carries no identity, so it is no one's, but it was put there by a node.
+func (s *Server) recordPeerUpload(ctx context.Context, pool, path string) error {
+	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Peer: true})
 }
 
 // recordPoolReplica records path, in pool, as a replica of k's disk.
-func (s *Server) recordPoolReplica(pool string, k replicaKey, path string) error {
-	return s.writePoolUploadRecord(path, poolUpload{Pool: pool, Project: k.Project, VM: k.VM, Disk: k.Disk})
+func (s *Server) recordPoolReplica(ctx context.Context, pool string, k replicaKey, path string) error {
+	return s.writePoolUploadRecord(ctx, path, poolUpload{Pool: pool, Project: k.Project, VM: k.VM, Disk: k.Disk})
 }
 
-func (s *Server) writePoolUploadRecord(path string, u poolUpload) error {
+func (s *Server) writePoolUploadRecord(ctx context.Context, path string, u poolUpload) error {
 	id, err := fileIdentity(path)
 	if err != nil {
 		return err
@@ -152,54 +167,79 @@ func (s *Server) writePoolUploadRecord(path string, u poolUpload) error {
 		return err
 	}
 	m[filepath.Clean(path)] = u
-	return s.writePoolUploads(m)
+	if err := s.writePoolUploads(m); err != nil {
+		return err
+	}
+	s.shareRecord(ctx, path, u, false)
+	return nil
 }
 
-// loadPoolUploads reads the upload records under their lock.
-func (s *Server) loadPoolUploads() (map[string]poolUpload, error) {
+// loadPoolUploads reads this host's records, and the replicated records of
+// the files in dirs that are on shared storage.
+func (s *Server) loadPoolUploads(ctx context.Context, dirs ...string) (map[string]poolUpload, error) {
 	s.poolUploadsMu.Lock()
-	defer s.poolUploadsMu.Unlock()
-	return s.readPoolUploads()
-}
-
-// forgetPoolUpload drops path's record, if any.
-func (s *Server) forgetPoolUpload(path string) error {
-	s.poolUploadsMu.Lock()
-	defer s.poolUploadsMu.Unlock()
 	m, err := s.readPoolUploads()
+	s.poolUploadsMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range dirs {
+		if err := s.addSharedRecords(ctx, m, d); err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
+}
+
+// forgetPoolUpload drops path's record, if any, here and on shared storage.
+func (s *Server) forgetPoolUpload(ctx context.Context, path string) error {
+	m, err := s.loadPoolUploads(ctx, filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	if _, ok := m[filepath.Clean(path)]; !ok {
+	u, ok := m[filepath.Clean(path)]
+	if !ok {
 		return nil
 	}
-	delete(m, filepath.Clean(path))
-	return s.writePoolUploads(m)
+	s.poolUploadsMu.Lock()
+	defer s.poolUploadsMu.Unlock()
+	local, err := s.readPoolUploads()
+	if err != nil {
+		return err
+	}
+	if _, here := local[filepath.Clean(path)]; here {
+		delete(local, filepath.Clean(path))
+		if err := s.writePoolUploads(local); err != nil {
+			return err
+		}
+	}
+	s.shareRecord(ctx, path, u, true)
+	return nil
 }
 
 // poolUploadOf returns path's upload record when it still describes the file
-// there now.
+// there now: the same file (device and inode, for this host's record), with
+// the size and modification time it had.
 func (s *Server) poolUploadOf(uploads map[string]poolUpload, path string) (poolUpload, bool) {
 	u, ok := uploads[filepath.Clean(path)]
 	if !ok {
 		return poolUpload{}, false
 	}
 	id, err := fileIdentity(path)
-	if err != nil || id.dev != u.Dev || id.ino != u.Ino || id.size != u.Size || id.mtimeNs != u.MtimeNs {
+	if err != nil || id.size != u.Size || id.mtimeNs != u.MtimeNs || (!u.shared && (id.dev != u.Dev || id.ino != u.Ino)) {
 		return poolUpload{}, false
 	}
 	return u, true
 }
 
-// isRecordedUpload reports whether path is an upload any pool recorded and
-// that still describes the file there. The VM-disk debris sweep keeps these.
-func (s *Server) isRecordedUpload(path string) bool {
-	m, err := s.loadPoolUploads()
+// recordOf returns path's record when it still describes the file there.
+func (s *Server) recordOf(ctx context.Context, path string) (poolUpload, bool, error) {
+	m, err := s.loadPoolUploads(ctx, filepath.Dir(path))
 	if err != nil {
-		return true // unreadable records protect, never expose to a sweep
+		return poolUpload{}, false, err
 	}
-	_, ok := s.poolUploadOf(m, path)
-	return ok
+	u, ok := s.poolUploadOf(m, path)
+	return u, ok, nil
 }
 
 // poolUploadsSubdir is where a user's uploads into a pool on
@@ -274,6 +314,11 @@ const (
 	replicaVMMDKey      = "x-litevirt-replica-vm"
 	replicaDiskMDKey    = "x-litevirt-replica-disk"
 	replicaProjectMDKey = "x-litevirt-replica-project"
+	// A manual promotion's operator-named replica, and whether the operator
+	// is an admin (storage.hostpath at the root) who may name any file. Set
+	// by the entry node, which authenticated the operator.
+	replicaNamedMDKey      = "x-litevirt-replica-named"
+	replicaNamedAdminMDKey = "x-litevirt-replica-named-admin"
 )
 
 // replicaListingMDKey is the response header a pool's host sets on a
@@ -289,9 +334,16 @@ func withPoolContentViewAll(ctx context.Context) context.Context {
 
 // withReplicaContentView marks an outgoing content call as the daemon's own,
 // about the replicas of k's disk.
-func withReplicaContentView(ctx context.Context, k replicaKey) context.Context {
-	return metadata.AppendToOutgoingContext(ctx, poolContentViewMDKey, "replicas",
-		replicaVMMDKey, k.VM, replicaDiskMDKey, k.Disk, replicaProjectMDKey, k.Project)
+func withReplicaContentView(ctx context.Context, k replicaKey, named string, admin bool) context.Context {
+	kv := []string{poolContentViewMDKey, "replicas",
+		replicaVMMDKey, k.VM, replicaDiskMDKey, k.Disk, replicaProjectMDKey, k.Project}
+	if named != "" {
+		kv = append(kv, replicaNamedMDKey, named)
+		if admin {
+			kv = append(kv, replicaNamedAdminMDKey, "1")
+		}
+	}
+	return metadata.AppendToOutgoingContext(ctx, kv...)
 }
 
 // poolContentView is how much of a shared pool directory a content caller sees.
@@ -309,6 +361,8 @@ type poolContentCaller struct {
 	view    poolContentView
 	record  bool       // an upload by this caller is a user's, recorded as its pool's project's
 	replica replicaKey // viewReplicas: whose replicas
+	named   string     // viewReplicas: a manual promotion's named replica
+	admin   bool       // viewReplicas: named by an admin
 }
 
 // forwardedIdentityWait bounds how long a content call forwarded for a user
@@ -351,7 +405,9 @@ func (s *Server) poolContentCallerOf(ctx context.Context) (poolContentCaller, er
 				if err != nil {
 					return poolContentCaller{}, err
 				}
-				return poolContentCaller{ctx: ctx, view: viewReplicas, replica: k}, nil
+				named := mdOne(md, replicaNamedMDKey)
+				return poolContentCaller{ctx: ctx, view: viewReplicas, replica: k,
+					named: named, admin: named != "" && mdOne(md, replicaNamedAdminMDKey) == "1"}, nil
 			}
 		}
 	}
@@ -388,21 +444,23 @@ func (s *Server) awaitForwardedBearer(ctx context.Context, fwd string) (context.
 	}
 }
 
-// replicaKeyFromMD reads the replica a "replicas" content call is about. The
-// project is the calling daemon's; when the VM's row is here too, it must
-// agree.
-func (s *Server) replicaKeyFromMD(ctx context.Context, md metadata.MD) (replicaKey, error) {
-	one := func(key string) string {
-		if v := md.Get(key); len(v) > 0 {
-			return v[0]
-		}
-		return ""
+func mdOne(md metadata.MD, key string) string {
+	if v := md.Get(key); len(v) > 0 {
+		return v[0]
 	}
-	k := replicaKey{VM: one(replicaVMMDKey), Disk: one(replicaDiskMDKey), Project: tenancy.NormalizeProject(one(replicaProjectMDKey))}
+	return ""
+}
+
+// replicaKeyFromMD reads the replica a "replicas" content call is about. The
+// project is the calling daemon's; when the VM's live row is here too, it
+// must agree. (A deleted VM of the same name in another project, whose
+// successor has not replicated here yet, does not refuse the call.)
+func (s *Server) replicaKeyFromMD(ctx context.Context, md metadata.MD) (replicaKey, error) {
+	k := replicaKey{VM: mdOne(md, replicaVMMDKey), Disk: mdOne(md, replicaDiskMDKey), Project: tenancy.NormalizeProject(mdOne(md, replicaProjectMDKey))}
 	if k.VM == "" || k.Disk == "" {
 		return replicaKey{}, status.Error(codes.InvalidArgument, "a replica content call names no VM and disk")
 	}
-	vm, err := corrosion.GetVMIncludingDeleted(ctx, s.db, k.VM)
+	vm, err := corrosion.GetVM(ctx, s.db, k.VM)
 	if err != nil {
 		return replicaKey{}, status.Errorf(codes.Unavailable, "look up vm %q: %v", k.VM, err)
 	}
@@ -417,23 +475,26 @@ func (s *Server) replicaKeyFromMD(ctx context.Context, md metadata.MD) (replicaK
 // host. A bearer is relayed by PeerDial; a caller with none (a bearerless
 // admin certificate, on-node root) who holds storage.hostpath is marked as
 // seeing every file, as it would on the pool's host itself, and the daemon's
-// own replica call keeps saying which replicas it is about.
-func (s *Server) forwardContentCall(ctx context.Context) context.Context {
+// own replica call keeps saying which replicas it is about. Anyone else with
+// no bearer to relay is refused: forwarded bare, it would reach the pool's
+// host as the daemon.
+func (s *Server) forwardContentCall(ctx context.Context) (context.Context, error) {
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		if a := md.Get("authorization"); len(a) > 0 && a[0] != "" {
-			return ctx
+			return ctx, nil
 		}
 	}
 	c, err := s.poolContentCallerOf(ctx)
 	switch {
 	case err != nil:
-		return ctx
+		return nil, err
 	case c.view == viewAll:
-		return withPoolContentViewAll(ctx)
+		return withPoolContentViewAll(ctx), nil
 	case c.view == viewReplicas:
-		return withReplicaContentView(ctx, c.replica)
+		return withReplicaContentView(ctx, c.replica, c.named, c.admin), nil
 	}
-	return ctx
+	return nil, status.Error(codes.PermissionDenied,
+		"this caller has no identity to carry to the pool's host; call that host directly or sign in")
 }
 
 // poolFileConfinement decides, for one content operation on one pool, which
@@ -462,7 +523,7 @@ func (s *Server) poolConfinementFor(ctx context.Context, rec corrosion.StoragePo
 	if err != nil {
 		return nil, err
 	}
-	uploads, err := s.loadPoolUploads()
+	uploads, err := s.loadPoolUploads(ctx, s.poolContentDirs(dir)...)
 	if err != nil {
 		return nil, err
 	}
@@ -522,7 +583,7 @@ func (c *poolFileConfinement) replicaOwner(ctx context.Context, path string) (vm
 // library content) but gives it to no one.
 func (c *poolFileConfinement) ownership(ctx context.Context, path string) (fileOwnership, error) {
 	var o fileOwnership
-	if u, ok := c.s.poolUploadOf(c.uploads, path); ok && u.VM == "" {
+	if u, ok := c.s.poolUploadOf(c.uploads, path); ok && u.VM == "" && !u.Peer {
 		o.owned = true
 		if c.caller.view == viewCaller && u.Pool == c.rec.Name && u.Project == c.rec.Project {
 			o.callerOwns, o.deletable = true, true
@@ -610,5 +671,12 @@ func isLibraryMediaName(name string) bool {
 // isCallersReplica reports whether path, in the pool's own directory, is a
 // replica of the disk a daemon's replica call is about.
 func (c *poolFileConfinement) isCallersReplica(ctx context.Context, path string) bool {
-	return filepath.Dir(path) == filepath.Clean(c.dir) && c.s.isReplicaFor(ctx, c.uploads, path, c.caller.replica)
+	if c.caller.named != "" {
+		return filepath.Clean(path) == c.s.namedReplicaPath(c.dir, c.caller.named) &&
+			c.s.explicitReplicaOK(ctx, c.uploads, path, c.caller.replica, c.caller.admin)
+	}
+	if filepath.Dir(path) != filepath.Clean(c.dir) {
+		return false
+	}
+	return c.s.isReplicaFor(ctx, c.uploads, path, c.caller.replica)
 }

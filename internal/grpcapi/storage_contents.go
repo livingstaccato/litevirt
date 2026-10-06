@@ -69,12 +69,16 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 
 	// Files live on the owning host — forward there if it isn't us.
 	if host != s.hostName {
+		fctx, err := s.forwardContentCall(ctx)
+		if err != nil {
+			return nil, err
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		return client.ListStoragePoolContents(s.forwardContentCall(ctx), req)
+		return client.ListStoragePoolContents(fctx, req)
 	}
 
 	if !isFileBasedDriver(rec.Driver) {
@@ -180,12 +184,16 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 		}
 	}
 	if host != s.hostName {
+		fctx, err := s.forwardContentCall(ctx)
+		if err != nil {
+			return nil, err
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		return client.DeleteStoragePoolContent(s.forwardContentCall(ctx), req)
+		return client.DeleteStoragePoolContent(fctx, req)
 	}
 	if !isFileBasedDriver(rec.Driver) {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", req.PoolName)
@@ -260,7 +268,7 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
-	if err := s.forgetPoolUpload(target); err != nil {
+	if err := s.forgetPoolUpload(ctx, target); err != nil {
 		slog.Warn("pool content deleted but its upload record was not dropped", "pool", req.PoolName, "file", req.Filename, "error", err)
 	}
 	return &emptypb.Empty{}, nil
@@ -311,12 +319,16 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 
 	// Remote pool: proxy the stream to the owning host.
 	if host != s.hostName {
+		fctx, err := s.forwardContentCall(ctx)
+		if err != nil {
+			return err
+		}
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, err)
 		}
 		defer conn.Close()
-		up, err := client.UploadStoragePoolContent(s.forwardContentCall(ctx))
+		up, err := client.UploadStoragePoolContent(fctx)
 		if err != nil {
 			return status.Errorf(codes.Unavailable, "open upload to %q: %v", host, err)
 		}
@@ -448,9 +460,11 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	var recErr error
 	switch {
 	case caller.view == viewReplicas:
-		recErr = s.recordPoolReplica(rec.Name, caller.replica, dest)
+		recErr = s.recordPoolReplica(ctx, rec.Name, caller.replica, dest)
 	case caller.record:
-		recErr = s.recordPoolUpload(rec.Name, rec.Project, dest)
+		recErr = s.recordPoolUpload(ctx, rec.Name, rec.Project, callerUsername(caller.ctx)+"@"+callerRealm(caller.ctx), dest)
+	default:
+		recErr = s.recordPeerUpload(ctx, rec.Name, dest)
 	}
 	if recErr != nil {
 		_ = os.Remove(dest)

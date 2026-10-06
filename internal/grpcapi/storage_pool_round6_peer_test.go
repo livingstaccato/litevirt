@@ -76,7 +76,7 @@ func TestPoolRound6_PeerReplicaCallsAreTheVMsInItsProject(t *testing.T) {
 		p := filepath.Join(disks, n)
 		writePoolFile(t, p, n)
 		if project != "" {
-			if err := pool.recordPoolReplica("default", replicaKey{VM: "web", Disk: "prod-root", Project: project}, p); err != nil {
+			if err := pool.recordPoolReplica(context.Background(), "default", replicaKey{VM: "web", Disk: "prod-root", Project: project}, p); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -88,7 +88,7 @@ func TestPoolRound6_PeerReplicaCallsAreTheVMsInItsProject(t *testing.T) {
 		t.Fatal(err)
 	}
 	writePoolFile(t, up, "x")
-	if err := pool.recordPoolReplica("default", replicaKey{VM: "web", Disk: "prod-root", Project: "acme"}, up); err != nil {
+	if err := pool.recordPoolReplica(context.Background(), "default", replicaKey{VM: "web", Disk: "prod-root", Project: "acme"}, up); err != nil {
 		t.Fatal(err)
 	}
 
@@ -103,7 +103,7 @@ func TestPoolRound6_PeerReplicaCallsAreTheVMsInItsProject(t *testing.T) {
 	k := replicaKeyOf(vm, "prod-root")
 
 	want := []string{"web-prod-root-20261006-090000.qcow2", "web-prod-root-20261006-120000.qcow2"}
-	if got := coord.replicaNames(context.Background(), "default", pool.hostName, k); !slices.Equal(got, want) {
+	if got := coord.replicaNames(context.Background(), "default", pool.hostName, k, "", false); !slices.Equal(got, want) {
 		t.Fatalf("promote's listing of acme's web/prod-root on the pool's host = %v, want %v", got, want)
 	}
 	if n := coord.pruneReplicasAnywhere(context.Background(), "default", pool.hostName, k, 1); n != 1 {
@@ -129,7 +129,7 @@ func TestPoolRound6_AnOlderHostsListingIsMatchedByExactName(t *testing.T) {
 		{Name: "debian.iso"},
 	}}
 	k := replicaKey{VM: "bvm-root", Disk: "20261006", Project: "acme"}
-	if got := s.remoteReplicaNames(context.Background(), c, "default", "host-b", k); len(got) != 0 {
+	if got := s.remoteReplicaNames(context.Background(), c, "default", "host-b", k, "", false); len(got) != 0 {
 		t.Errorf("acme's bvm-root/20261006 matched %v on an older host", got)
 	}
 	if n := s.pruneReplicasRemote(context.Background(), c, "default", "host-b", k, 1); n != 0 || len(c.deleted) != 0 {
@@ -137,7 +137,7 @@ func TestPoolRound6_AnOlderHostsListingIsMatchedByExactName(t *testing.T) {
 	}
 	own := replicaKey{VM: "avm", Disk: "root", Project: "acme"}
 	c.contents = append(c.contents, &pb.StoragePoolContent{Name: "avm-root-20261006-120000.qcow2"})
-	if got := s.remoteReplicaNames(context.Background(), c, "default", "host-b", own); !slices.Equal(got, []string{"avm-root-20261006-120000.qcow2"}) {
+	if got := s.remoteReplicaNames(context.Background(), c, "default", "host-b", own, "", false); !slices.Equal(got, []string{"avm-root-20261006-120000.qcow2"}) {
 		t.Errorf("acme's own replica on an older host: matched %v", got)
 	}
 }
@@ -190,7 +190,7 @@ func TestPoolRound6_ReplicasArriveNamedAndRecordedForTheirVM(t *testing.T) {
 	}
 	theirs := "app-x-root-20261006-090000.raw"
 	writePoolFile(t, filepath.Join(disks, theirs), "bravo")
-	if err := s.recordPoolReplica("default", replicaKey{VM: "app-x", Disk: "root", Project: "bravo"}, filepath.Join(disks, theirs)); err != nil {
+	if err := s.recordPoolReplica(context.Background(), "default", replicaKey{VM: "app-x", Disk: "root", Project: "bravo"}, filepath.Join(disks, theirs)); err != nil {
 		t.Fatal(err)
 	}
 	if err := push("app-x-root-20261006-130000.raw", theirs); status.Code(err) != codes.FailedPrecondition {
@@ -200,7 +200,7 @@ func TestPoolRound6_ReplicasArriveNamedAndRecordedForTheirVM(t *testing.T) {
 	if err := push(incr, ""); err != nil {
 		t.Fatalf("app's replica push: %v", err)
 	}
-	if got := s.replicaNames(context.Background(), "default", "", k); !slices.Equal(got, []string{full, incr}) {
+	if got := s.replicaNames(context.Background(), "default", "", k, "", false); !slices.Equal(got, []string{full, incr}) {
 		t.Errorf("app's replicas = %v, want [%s %s]", got, full, incr)
 	}
 }
@@ -215,7 +215,7 @@ func TestPoolRound6_UsersOwnTheirVMsRecordedReplicas(t *testing.T) {
 	mine, stale := "avm-root-20261006-120000.qcow2", "avm-root-20261006-110000.qcow2"
 	for n, project := range map[string]string{mine: "acme", stale: "bravo"} {
 		writePoolFile(t, filepath.Join(disks, n), n)
-		if err := s.recordPoolReplica("pa", replicaKey{VM: "avm", Disk: "root", Project: project}, filepath.Join(disks, n)); err != nil {
+		if err := s.recordPoolReplica(context.Background(), "pa", replicaKey{VM: "avm", Disk: "root", Project: project}, filepath.Join(disks, n)); err != nil {
 			t.Fatal(err)
 		}
 	}

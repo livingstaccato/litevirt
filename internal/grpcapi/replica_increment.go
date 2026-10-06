@@ -58,7 +58,11 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, perr)
 		}
 		defer conn.Close()
-		up, perr := client.PushReplicaIncrement(s.forwardContentCall(ctx))
+		fctx, ferr := s.forwardContentCall(ctx)
+		if ferr != nil {
+			return ferr
+		}
+		up, perr := client.PushReplicaIncrement(fctx)
 		if perr != nil {
 			return status.Errorf(codes.Unavailable, "open push to %q: %v", host, perr)
 		}
@@ -109,7 +113,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			return status.Errorf(codes.InvalidArgument, "%q is not a replica name of vm %q disk %q", first.Filename, k.VM, k.Disk)
 		}
 		if first.Base != "" {
-			uploads, uerr := s.loadPoolUploads()
+			uploads, uerr := s.loadPoolUploads(ctx, dir)
 			if uerr != nil {
 				return status.Errorf(codes.Internal, "replica records: %v", uerr)
 			}
@@ -153,7 +157,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 		return status.Errorf(codes.Internal, "apply replica: %v", ferr)
 	}
 	if caller.view == viewReplicas {
-		if err := s.recordPoolReplica(rec.Name, caller.replica, dest); err != nil {
+		if err := s.recordPoolReplica(ctx, rec.Name, caller.replica, dest); err != nil {
 			_ = os.Remove(dest)
 			return status.Errorf(codes.Internal, "record replica: %v", err)
 		}

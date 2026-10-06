@@ -192,7 +192,7 @@ func TestPoolRound5_UploadsIntoDisksStayOutOfTheDiskNamespace(t *testing.T) {
 	// An older upload already at the root of disks/ is recorded and kept.
 	old := filepath.Join(disks, "ubuntu-old.qcow2")
 	writePoolFile(t, old, "bravo's older upload")
-	if err := s.recordPoolUpload("pb", "bravo", old); err != nil {
+	if err := s.recordPoolUpload(context.Background(), "pb", "bravo", "bob@local", old); err != nil {
 		t.Fatal(err)
 	}
 	s.sweepVMDiskDebris(adminCtx(), "ubuntu")

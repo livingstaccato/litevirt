@@ -233,12 +233,40 @@ forwarded call always carries it.
 Replication and promotion act for one VM in one project. Their content calls
 say so, and the pool's host answers with that VM's replicas only: those whose
 record names the VM, disk and project, and a replica made before records (no
-record) only when its name is exactly `<vm>-<disk>-<YYYYMMDD-HHMMSS>` and no VM
-of another project could have written the same name — `bvm` + `root-20261006`
-and `bvm-root` + `20261006` both write `bvm-root-20261006-…`, so neither is
-taken for the other. Promotion boots, and pruning deletes, nothing else. When
-the replica promotion picked is missing or unreadable on its host, it tries
-the next-older one there; a replica the operator named is never swapped.
+record) only when its name is exactly `<vm>-<disk>-<YYYYMMDD-HHMMSS>`, its stamp
+is not in the future, and no VM of another project has a disk that writes the
+same name — `bvm` with a disk `root-20261006` and `bvm-root` with a disk
+`20261006` both write `bvm-root-20261006-…`, so neither is taken for the other,
+while another project's VM `web` without a disk `prod-root` does not stop
+`web-prod`'s `web-prod-root-…` replicas from being `web-prod`'s. Promotion
+boots, and pruning deletes, nothing else; pruning never deletes a replica a
+live disk uses. When the replica promotion picked is missing or unreadable on
+its host, it tries the next-older one there; a replica the operator named is
+never swapped.
+
+A replica an operator names for a manual promotion (`--replica`) may also be
+a file the VM's project owns by record — an upload into one of its pools, or
+into a global pool by a user who may create the VM — or a file from before
+records named `<vm>-<disk>-<anything>.qcow2|.raw` (no stamp needed) that no
+other project's VM and disk could have written. A `replicate-volume` copy into
+a pool is recorded as the VM's replica, whatever it is named. An admin
+(`storage.hostpath` at the root) may name any file in the pool. Another
+project's upload is never taken.
+
+On shared storage — a pool directory on an NFS export several hosts mount —
+the record of each upload and replica is also kept cluster-wide (in the
+replicated `cluster_policies` table, once `failover_scope_v1` has latched), so
+every host matches a file the same way. Each host notes when it began
+recording; once every host has, that moment is kept as the records epoch, and a
+file with no record that was modified after it was not put there by any
+host's daemon: it is never taken for a replica by its name. Until every host
+runs this release (or while `failover_scope_v1` has not latched), files with no
+record are matched by name as described above.
+
+Recorded replicas in `<data_dir>/disks` are kept when their VM is deleted: the
+VM-disk debris sweep keeps every recorded file. Remove them with a delete of
+the pool content (the VM's project's operators, or an admin) once the VM is
+gone.
 
 A user's upload into a pool on `<data_dir>/disks` lands in
 `<data_dir>/disks/uploads/` and is listed with the pool's other content: the VM

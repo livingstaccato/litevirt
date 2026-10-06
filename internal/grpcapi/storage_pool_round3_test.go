@@ -216,7 +216,7 @@ func TestPoolRound3_ContentNamesOfARefusedPoolAreNotListed(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(s.dataDir, "vm-root-20260101-000000.qcow2"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if names := s.replicaNames(context.Background(), "legacy", "", replicaKey{VM: "vm", Disk: "root"}); len(names) != 0 {
+	if names := s.replicaNames(context.Background(), "legacy", "", replicaKey{VM: "vm", Disk: "root"}, "", false); len(names) != 0 {
 		t.Fatalf("a refused pool's directory was listed: %v", names)
 	}
 }

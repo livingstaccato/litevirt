@@ -321,12 +321,15 @@ const auditSeededPoll = 30 * time.Second
 // runAuditSeeded shows, in `lv health`, every node whose replica is not seeded,
 // so an operator can see which nodes `lv host add` may be run against. Info for
 // the ordinary case (a fresh joiner that has not yet exchanged with a seeded
-// peer, which clears by itself); warning, and an ERROR line, when the marker
-// cannot be used or written — the replica is then not seeded until the marker
-// is fixed (it fails closed). Resolved, and the loop ends, once seeded.
+// peer, which clears by itself); warning, with an ERROR line at most once a
+// minute, when the marker cannot be used or written — the replica is then not
+// seeded until the marker is fixed (it fails closed), and a decision that could
+// not be written is retried here. The condition row is written only when what it
+// says changes. Resolved, and the loop ends, once seeded.
 func (d *Daemon) runAuditSeeded(ctx context.Context) {
+	var st auditSeededReport
 	for {
-		if d.reportAuditSeeded(ctx) {
+		if d.reportAuditSeeded(ctx, &st) {
 			return
 		}
 		select {
@@ -337,9 +340,22 @@ func (d *Daemon) runAuditSeeded(ctx context.Context) {
 	}
 }
 
+// auditSeededReport is what runAuditSeeded last reported.
+type auditSeededReport struct {
+	written     bool   // a raise has been written in this process
+	key         string // severity and problem of that raise
+	lastErrorAt time.Time
+}
+
+// auditSeededErrorEvery bounds the ERROR line about an unusable marker.
+const auditSeededErrorEvery = time.Minute
+
 // reportAuditSeeded is one pass of runAuditSeeded. It reports whether the
 // replica is seeded.
-func (d *Daemon) reportAuditSeeded(ctx context.Context) bool {
+func (d *Daemon) reportAuditSeeded(ctx context.Context, st *auditSeededReport) bool {
+	if err := d.db.RetryAuditSeededDecision(ctx); err != nil {
+		slog.Debug("the seeded decision still cannot be written", "error", err)
+	}
 	if d.db.AuditSeeded(ctx) {
 		d.writeSelfCondition(ctx, CondAuditNotSeeded, false, "", nil)
 		return true
@@ -348,15 +364,24 @@ func (d *Daemon) reportAuditSeeded(ctx context.Context) bool {
 	problem := d.db.AuditSeededProblem(ctx)
 	if problem != "" {
 		severity = corrosion.SeverityWarning
-		slog.Error("this replica's seeded marker cannot be used or written; it is treated as not "+
-			"seeded, and `lv host add` through this node is refused", "problem", problem,
-			"file", filepath.Join(d.cfg.DataDir, corrosion.AuditSeededFileName))
+		if time.Since(st.lastErrorAt) >= auditSeededErrorEvery {
+			st.lastErrorAt = time.Now()
+			slog.Error("this replica's seeded marker cannot be used or written; it is treated as not "+
+				"seeded, and `lv host add` through this node is refused", "problem", problem,
+				"file", filepath.Join(d.cfg.DataDir, corrosion.AuditSeededFileName))
+		}
 	}
-	d.writeSelfCondition(ctx, CondAuditNotSeeded, true, severity, map[string]any{
+	key := severity + "\x00" + problem
+	if st.written && st.key == key {
+		return false
+	}
+	if d.writeSelfCondition(ctx, CondAuditNotSeeded, true, severity, map[string]any{
 		"problem": problem,
 		"becomes_seeded": "by completing an anti-entropy exchange with a seeded node on this build " +
 			"that is not holding its own audit rows",
-	})
+	}) {
+		st.written, st.key = true, key
+	}
 	return false
 }
 

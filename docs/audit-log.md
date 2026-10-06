@@ -612,17 +612,34 @@ Run `lv host add` against another node, or retry once it has caught up.
 single-node cluster whose founder lost its state.db, or a total loss where
 every replica is fresh. `lv host add` is then refused everywhere, for good. The
 way out is an operator's assertion, as root on the node that holds the most
-complete history:
+complete history. The assertion must contain that node's **state.db
+incarnation** — a value that is local to the node and never replicated, so
+only someone who can read its files can produce it:
 
 ```bash
-touch /var/lib/litevirt/audit-seeded-assert   # <data_dir>/audit-seeded-assert
+# the incarnation is in the seeded marker...
+grep -o '"incarnation":"[^"]*"' /var/lib/litevirt/audit-seeded.json
+# ...or in state.db itself
+sqlite3 /var/lib/litevirt/state.db 'SELECT incarnation FROM local_voter_incarnation'
+
+echo <incarnation> > /var/lib/litevirt/audit-seeded-assert   # <data_dir>/audit-seeded-assert
 systemctl restart litevirt
 ```
 
-The next start records the replica as seeded on that assertion and removes the
-file. If the replica does **not** hold a re-added name's history, the position
-it vouches for is too low and that host forks its audit chain, which `verify`
-then reports for good — the assertion is the operator taking that on.
+The next start records the replica as seeded on that assertion, removes the
+file, and — once its signing key is loaded — writes one signed
+`audit.seeded_asserted` row to the audit log, so the cluster's history says
+which node vouches on an operator's word and since when. A file that does not
+contain this state.db's incarnation is ignored, and logged at error level; one
+left behind after it was applied is not applied again, and does not carry over
+to a later state.db. If the replica does **not** hold a re-added name's
+history, the position it vouches for is too low and that host forks its audit
+chain, which `verify` then reports for good — the assertion is the operator
+taking that on.
+
+A seeded decision that cannot be written (a full disk) is not acted on: the
+node stays not seeded and holds its own audit rows until the decision is
+written, so a restart cannot mistake it for an existing member.
 An admitting daemon older than this reports no position, so its admissions get
 no record and nothing is held — the behaviour before this change.
 

@@ -614,6 +614,14 @@ func (c *Client) openAuditChainLocked(ctx context.Context, tail *chainTail, h *a
 // auditTargetReached reports whether the admission record's row is present in
 // this replica, and if not, what is missing.
 func (c *Client) auditTargetReached(ctx context.Context, h *auditHold) (bool, string) {
+	// A seeded decision taken and not yet written: nothing of this host's may
+	// land, or the next start finds rows of its own and no decision, and the
+	// upgrade rule grandfathers a replica that decided it was not seeded
+	// (audit_seeded.go).
+	if unpersisted, problem := c.auditSeededPending(); unpersisted {
+		return false, "this replica's seeded decision could not be recorded yet (" + problem +
+			"); its audit rows are held until it is"
+	}
 	if h.cfg.Target <= 0 {
 		return true, ""
 	}

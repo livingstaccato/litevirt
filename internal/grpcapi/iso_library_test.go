@@ -668,3 +668,37 @@ func TestISOLibrary_ModeIsAdminSetAndAdoptsExistingFiles(t *testing.T) {
 		t.Fatalf("an existing library file was not recorded on switching to sync: %+v %v", e, ok)
 	}
 }
+
+// Both ends of a sync check the version: the serving host serves only a copy
+// matching the sha256 asked for, and the receiving host keeps only bytes that
+// hash to it.
+func TestISOLibrary_SyncServesOnlyTheRecordedVersion(t *testing.T) {
+	s, _, _ := isoServer(t)
+	lib := globalLibrary(t, s)
+	writeLibFile(t, filepath.Join(lib, "debian.iso"), isoBody)
+	st := &fetchStream{ctx: peerCtxFor(t, s, "host-b")}
+	err := s.FetchISOLibraryFile(&pb.FetchISOLibraryFileRequest{Name: "debian.iso", Sha256: sha("another version")}, st)
+	if status.Code(err) != codes.FailedPrecondition || len(st.chunks) != 0 {
+		t.Fatalf("serving a copy that is not the version asked for: err=%v, %d chunks sent", err, len(st.chunks))
+	}
+	if err := s.FetchISOLibraryFile(&pb.FetchISOLibraryFileRequest{Name: "debian.iso", Sha256: sha(isoBody)}, st); err != nil {
+		t.Fatalf("serving the recorded version: %v", err)
+	}
+	if err := s.FetchISOLibraryFile(&pb.FetchISOLibraryFileRequest{Name: "debian.iso", Sha256: sha(isoBody)}, &fetchStream{ctx: adminCtx()}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("a user (not a peer) fetching a library file: got %v, want PermissionDenied", err)
+	}
+}
+
+func TestISOLibrary_SyncKeepsOnlyBytesMatchingTheRecord(t *testing.T) {
+	s, _, _ := isoServer(t)
+	dir := t.TempDir()
+	if _, _, err := s.writeLibraryFile(dir, "debian.iso", strings.NewReader("tampered"), 1<<20, sha(isoBody)); err == nil {
+		t.Fatal("bytes that do not hash to the record were kept")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "debian.iso")); !os.IsNotExist(err) {
+		t.Fatal("a mismatched copy was left in the library")
+	}
+	if _, _, err := s.writeLibraryFile(dir, "debian.iso", strings.NewReader(isoBody), 1<<20, sha(isoBody)); err != nil {
+		t.Fatalf("matching bytes: %v", err)
+	}
+}

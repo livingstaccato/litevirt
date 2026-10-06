@@ -140,26 +140,60 @@ var nfsRequiredFlags = []string{"nosuid", "nodev", "noexec", "nosymfollow"}
 // readMountInfo returns /proc/self/mountinfo; tests replace it.
 var readMountInfo = func() ([]byte, error) { return os.ReadFile("/proc/self/mountinfo") }
 
-// mountFlags returns the per-mount options of the mount at dir (the last one,
-// when mounts are stacked), and whether dir is a mount point at all.
-func mountFlags(dir string) ([]string, bool, error) {
+// mountEntry is one line of mountinfo: where, the per-mount options, and what
+// is mounted there (filesystem type and source).
+type mountEntry struct {
+	dir    string
+	flags  []string
+	fstype string
+	source string
+}
+
+// mounts parses mountinfo, in order (a later mount on the same point is on top).
+func mounts() ([]mountEntry, error) {
 	data, err := readMountInfo()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	want := filepath.Clean(dir)
-	var flags []string
-	found := false
+	var out []mountEntry
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) < 6 {
 			continue
 		}
-		if filepath.Clean(unescapeMountInfo(f[4])) == want {
-			flags, found = strings.Split(f[5], ","), true
+		e := mountEntry{dir: filepath.Clean(unescapeMountInfo(f[4])), flags: strings.Split(f[5], ",")}
+		// Optional fields end at "-"; filesystem type and source follow it.
+		if i := slices.Index(f[6:], "-"); i >= 0 && len(f) > 6+i+2 {
+			e.fstype, e.source = f[6+i+1], unescapeMountInfo(f[6+i+2])
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// mountAt returns the mount at dir (the top one, when mounts are stacked), and
+// whether dir is a mount point at all.
+func mountAt(dir string) (mountEntry, bool, error) {
+	all, err := mounts()
+	if err != nil {
+		return mountEntry{}, false, err
+	}
+	want := filepath.Clean(dir)
+	var top mountEntry
+	found := false
+	for _, e := range all {
+		if e.dir == want {
+			top, found = e, true
 		}
 	}
-	return flags, found, nil
+	return top, found, nil
+}
+
+// mountFlags returns the per-mount options of the mount at dir (the last one,
+// when mounts are stacked), and whether dir is a mount point at all.
+func mountFlags(dir string) ([]string, bool, error) {
+	e, found, err := mountAt(dir)
+	return e.flags, found, err
 }
 
 // unescapeMountInfo undoes mountinfo's octal escapes (\040 for a space …).
@@ -191,18 +225,32 @@ func missingNFSFlags(flags []string) []string {
 	return miss
 }
 
-// ensureHardened refuses an existing mount at d.mountDir that lacks any of
-// nfsRequiredFlags. It does not remount: litevirt uses only a mount it made
-// itself with those flags, so a weaker one (mounted by hand, or by an earlier
-// build) must be unmounted and is then mounted again by Prepare.
+// ensureHardened refuses an existing mount at d.mountDir that is not this
+// pool's export, or that lacks any of nfsRequiredFlags. It does not remount:
+// litevirt uses only a mount it made itself, of the pool's own export with
+// those flags, so anything else there (another export left by a deleted pool,
+// a mount made by hand, or by an earlier build) must be unmounted and is then
+// mounted again by Prepare.
 func (d *nfsDriver) ensureHardened() error {
-	flags, mounted, err := mountFlags(d.mountDir)
+	m, mounted, err := mountAt(d.mountDir)
 	if err != nil {
 		return fmt.Errorf("read mount options of %s: %w", d.mountDir, err)
 	}
 	if !mounted {
 		return fmt.Errorf("%s reports as a mount point but is not in mountinfo; refusing to use it", d.mountDir)
 	}
+	// The export mounted there is compared in the same canonical form as the
+	// pool's source: another export (or the same server's parent export) at
+	// the pool's mount point would hand the pool someone else's files.
+	want, werr := ParseNFSExport(d.source)
+	got, gerr := ParseNFSExport(m.source)
+	if werr != nil || gerr != nil || got != want || !isNFSFstype(m.fstype) {
+		slog.Error("NFS pool's mount point holds a mount that is not its export; the pool is refused until it is unmounted",
+			"mountpoint", d.mountDir, "mounted", m.source, "fstype", m.fstype, "source", d.source)
+		return fmt.Errorf("%s has %s mounted, not this pool's export %s; unmount it (umount %s) and litevirt mounts the pool's export there",
+			d.mountDir, mountedWhat(m), d.source, d.mountDir)
+	}
+	flags := m.flags
 	if miss := missingNFSFlags(flags); len(miss) > 0 {
 		slog.Error("NFS pool is mounted without the required options; the pool is refused until it is unmounted and mounted again by litevirt",
 			"mountpoint", d.mountDir, "missing", miss)
@@ -212,7 +260,17 @@ func (d *nfsDriver) ensureHardened() error {
 	return nil
 }
 
-// CheckNFSMountHardened refuses an NFS pool whose export is mounted without
+func isNFSFstype(t string) bool { return t == "nfs" || t == "nfs4" }
+
+func mountedWhat(m mountEntry) string {
+	if m.source == "" {
+		return "a mount"
+	}
+	return fmt.Sprintf("%q (%s)", m.source, m.fstype)
+}
+
+// CheckNFSMountHardened refuses an NFS pool whose mount point holds anything
+// but its own export (ensureHardened), or holds it mounted without
 // nosuid,nodev,noexec,nosymfollow. A pool that is not mounted passes (Prepare
 // mounts it with them). Not an NFS config: nil.
 func CheckNFSMountHardened(dataDir string, cfg Config) error {
@@ -223,13 +281,40 @@ func CheckNFSMountHardened(dataDir string, cfg Config) error {
 	if dir == "" {
 		dir = filepath.Join(dataDir, "mounts", NFSMountName(cfg.Source))
 	}
-	d := &nfsDriver{mountDir: dir}
+	d := &nfsDriver{source: cfg.Source, mountDir: dir}
 	if _, mounted, err := mountFlags(dir); err != nil {
 		return fmt.Errorf("read mount options of %s: %w", dir, err)
 	} else if !mounted {
 		return nil
 	}
 	return d.ensureHardened()
+}
+
+// CheckNotOnNFS refuses a directory pool (local, dir, btrfs) whose directory
+// is on an NFS mount — the mount point itself or anything under it, judged as
+// written and after resolving symlinks. Such a mount is an export no NFS pool
+// of its own holds: its source and options are nothing litevirt chose (a
+// deleted NFS pool's leftover mount, or one made by hand), so the pool would
+// serve whoever's files are on it. An NFS export is used only by an nfs pool.
+func CheckNotOnNFS(dir string) error {
+	all, err := mounts()
+	if err != nil {
+		return fmt.Errorf("read the mount table: %w", err)
+	}
+	for _, p := range pathForms(dir) {
+		var under mountEntry
+		for _, e := range all {
+			// The deepest mount containing p is the one p is on; the last of
+			// equal depth is on top.
+			if within(e.dir, p) && len(e.dir) >= len(under.dir) {
+				under = e
+			}
+		}
+		if isNFSFstype(under.fstype) {
+			return fmt.Errorf("%s is on an NFS mount (%s at %s); an NFS export is used only through an nfs pool", dir, under.source, under.dir)
+		}
+	}
+	return nil
 }
 
 // OverrideMountInfoForTest replaces how mounts are inspected, for tests in

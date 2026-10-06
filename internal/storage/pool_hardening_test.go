@@ -83,7 +83,7 @@ func fakeMountInfo(t *testing.T, mounts map[string]string) *map[string]string {
 		var b strings.Builder
 		i := 100
 		for dir, opts := range cur {
-			fmt.Fprintf(&b, "%d 1 0:50 / %s %s shared:1 - nfs4 srv:/x rw\n", i, strings.ReplaceAll(dir, " ", "\\040"), opts)
+			fmt.Fprintf(&b, "%d 1 0:50 / %s %s shared:1 - nfs4 server:/export rw\n", i, strings.ReplaceAll(dir, " ", "\\040"), opts)
 			i++
 		}
 		return []byte(b.String()), nil

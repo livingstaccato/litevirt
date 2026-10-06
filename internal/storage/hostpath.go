@@ -273,16 +273,6 @@ func DirsOverlap(a, b string) bool {
 	return false
 }
 
-// NFSExportKey is an NFS source in canonical form (lower-cased server, cleaned
-// export path), so one export written two ways is recognised as one.
-func NFSExportKey(source string) string {
-	host, p, ok := strings.Cut(source, ":")
-	if !ok {
-		return source
-	}
-	return strings.ToLower(host) + ":" + filepath.Clean(p)
-}
-
 func underLitevirtVarLib(p string) bool {
 	rel, err := filepath.Rel("/var/lib", p)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {

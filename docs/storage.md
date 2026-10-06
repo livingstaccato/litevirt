@@ -101,7 +101,13 @@ it on; where it is missing the mount is refused, with an error saying so, rather
 than made weaker. An export that is already mounted without these flags — mounted
 by hand, or by an earlier build — is never remounted: the pool is refused
 (nothing lists, reads or writes it) and the daemon logs an ERROR at start and
-on each refusal, until the export is unmounted and litevirt mounts it again. Disk files the daemon creates in a pool
+on each refusal, until the export is unmounted and litevirt mounts it again.
+The same holds when the pool's mount point holds anything but the pool's own
+export (compared in canonical form) — another export left there by a deleted
+pool (deleting a pool with `--target` never unmounts it), the same server's
+parent export, or a mount made by hand. A `local`, `dir` or `btrfs` pool whose
+directory is on an NFS mount (the mount point or below it) is refused at
+create and at use: an export is used only through an `nfs` pool. Disk files the daemon creates in a pool
 are created exclusively and never through a symlink. Pool names may not start
 with `-`.
 
@@ -139,12 +145,29 @@ files (the error names them). Creating a pool whose `<data_dir>/pools/<name>`
 already holds files left by an earlier pool is refused until an admin removes
 them; the error says how many files, not their names. A pool is never created
 on storage another pool on the host already uses — the same directory, a
-symlink alias of it, a directory inside it or containing it, or the same NFS
-export mounted elsewhere — and the roots `<data_dir>/pools` and
+symlink alias of it, a directory inside it or containing it — or on an NFS
+export another pool on any host in the cluster uses, and the roots
+`<data_dir>/pools` and
 `<data_dir>/mounts` are not pools. A pool row that shares its storage with
 another, or sits on `<data_dir>/disks`, is refused for everything — listing
 included — with `FailedPrecondition` saying to recreate it; the error does not
 name the other pool, which may be another project's.
+
+An NFS export is the same storage from every host. Two exports are the same
+storage when their servers are the same and their export paths are the same or
+one is inside the other (`nas:/tenants` contains `nas:/tenants/acme`; `nas:/`,
+an NFSv4 pseudo-root, contains every export of `nas`). Servers are compared in
+canonical form (case, IPv6 brackets and zero compression, trailing slashes do
+not matter) and, at create, by address: each server name is resolved, and two
+servers that share any address are one server (`nas`, `nas.corp.lan` and
+`10.0.0.5` can all be one). A create whose server does not resolve is refused,
+and so is one whose export path overlaps another pool's whose server no longer
+resolves. The only pool that may share an export is the same pool — the same
+name and project — defined on several hosts. At use the comparison is by
+canonical form only, without lookups, so a later DNS change is not re-checked
+there. An NFSv4 path relative to the pseudo-root (`nas:/acme`) and the NFSv3
+path of the same directory (`nas:/srv/nfs/acme`) cannot be told apart from the
+client: do not mix the two forms for one server.
 
 Content operations never reach a file a live VM disk uses: a listing leaves
 out files a live disk of another pool uses, and a content delete refuses any

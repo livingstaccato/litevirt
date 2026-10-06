@@ -132,13 +132,26 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	// Every pool has storage of its own: never a directory (or an alias of
 	// one, or one inside or around one) or an NFS export another pool uses.
 	// The other pool is not named: it may be another project's.
-	other, why, err := s.poolSharedWith(ctx, req.Name, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target})
+	// An NFS export counts cluster-wide, under any spelling of its server.
+	newRef := StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target}
+	other, why, err := s.poolSharedWith(ctx, req.Name, &project, newRef, true)
+	if errors.Is(err, errNFSUnresolved) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"pool %q: %v; an NFS server must resolve so its export can be told apart from every other pool's", req.Name, err)
+	}
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "check for a shared directory: %v", err)
 	}
 	if other != "" {
 		slog.Error("storage pool create refused: storage shared with another pool", "pool", req.Name, "other", other, "how", why)
-		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); every pool needs its own", req.Name, req.Target, why)
+		what := req.Target
+		if strings.EqualFold(req.Driver, "nfs") {
+			what = req.Source
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); every pool needs its own", req.Name, what, why)
+	}
+	if err := checkDirPoolNotOnNFS(s.dataDir, newRef); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %v", req.Name, err)
 	}
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,

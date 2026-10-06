@@ -1888,9 +1888,9 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 	}
 }
 
-// hardenNFSPoolMounts reports, at ERROR, every NFS pool of this host that is
-// already mounted without nosuid,nodev,noexec,nosymfollow (by hand, or by an
-// earlier build). Nothing is remounted: the server's pool check refuses such a
+// hardenNFSPoolMounts reports, at ERROR, every NFS pool of this host whose
+// mount point holds another export, or holds its export mounted without
+// nosuid,nodev,noexec,nosymfollow (by hand, or by an earlier build). Nothing is remounted: the server's pool check refuses such a
 // pool outright until it is unmounted and litevirt mounts it again.
 func (d *Daemon) hardenNFSPoolMounts(ctx context.Context) {
 	var cfgs []storage.Config
@@ -1907,7 +1907,7 @@ func (d *Daemon) hardenNFSPoolMounts(ctx context.Context) {
 			continue
 		}
 		if err := storage.CheckNFSMountHardened(d.cfg.DataDir, c); err != nil {
-			slog.Error("NFS pool is mounted without nosuid,nodev,noexec,nosymfollow; the pool is refused until litevirt mounts it again",
+			slog.Error("NFS pool's mount point holds another export, or its export mounted without nosuid,nodev,noexec,nosymfollow; the pool is refused until litevirt mounts it again",
 				"source", c.Source, "target", c.Target, "error", err)
 		}
 	}

@@ -40,9 +40,8 @@ func TestPoolRound3_AliasedOrNestedDirectoriesAreShared(t *testing.T) {
 			if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "a", Driver: "dir", Target: base}); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "b", Driver: "dir", Target: second}); status.Code(err) != codes.FailedPrecondition {
-				t.Fatalf("create: got %v, want FailedPrecondition", err)
-			}
+			_, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "b", Driver: "dir", Target: second})
+			wantSharedRefusal(t, "create", err)
 			// The same pair, already stored, is refused at use.
 			if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
 				HostName: s.hostName, Name: "b", Driver: "dir", Target: second, State: "active",
@@ -83,9 +82,7 @@ func TestPoolRound3_OneNFSExportAtTwoTargetsIsShared(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: "n2", Driver: "nfs", Source: "nas:/x/", Target: t2})
-	if status.Code(err) != codes.FailedPrecondition || strings.Contains(err.Error(), "prepare") {
-		t.Fatalf("a second pool on the same export: got %v, want a FailedPrecondition before any mount", err)
-	}
+	wantSharedRefusal(t, "a second pool on the same export", err)
 	if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
 		HostName: s.hostName, Name: "n2", Driver: "nfs", Source: "nas:/x", Target: t2, State: "active",
 	}); err != nil {

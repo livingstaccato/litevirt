@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // Defaults for PullOptions when a field is left zero. Generous so real cloud
@@ -204,11 +206,14 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 	// Cap the body at MaxBytes+1 so reaching the extra byte means "too big".
 	body := io.LimitReader(resp.Body, opts.MaxBytes+1)
 
-	tmpPath := destPath + ".tmp"
-	f, err := os.Create(tmpPath)
+	// A fresh temp per pull (O_EXCL, never a link): a fixed "<dest>.tmp" let
+	// two pulls of one name write into the same file, and a link planted at
+	// that name be followed.
+	f, err := os.CreateTemp(filepath.Dir(destPath), "."+filepath.Base(destPath)+".pull-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
+	tmpPath := f.Name()
 	defer func() {
 		f.Close()
 		os.Remove(tmpPath) // clean up on error
@@ -262,6 +267,13 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 			os.Remove(tmpPath) // explicit cleanup on checksum failure (#28)
 			return fmt.Errorf("checksum mismatch: got %s, expected %s", got, expected)
 		}
+	}
+
+	// A pulled image is the base of every VM created from it; one that names
+	// another file would have qemu open that file on the host for the guest.
+	if err := qcow2.AssertStandalone(tmpPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("image %q: %w", name, err)
 	}
 
 	// Move to final location

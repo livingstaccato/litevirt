@@ -424,7 +424,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 			sourceImage := ""
 			if isRootDisk {
-				sourceImage = spec.Image
+				if sourceImage, err = s.poolRootDiskBacking(spec.Image, volCfg.Driver); err != nil {
+					return nil, err
+				}
 			}
 			diskPath, err = drv.CreateDisk(ctx, storage.DiskOptions{
 				VMName:      spec.Name,

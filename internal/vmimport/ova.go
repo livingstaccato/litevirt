@@ -38,8 +38,10 @@ func safeJoin(dest, name string) (string, error) {
 
 // UnpackOVA extracts an OVA tar stream into dest (slip-safe, capped) and returns
 // the path to the single .ovf descriptor. Symlink/hardlink/device members are
-// rejected. Disk members and the descriptor land flat under dest.
-func UnpackOVA(r io.Reader, dest string) (ovfPath string, err error) {
+// rejected. Disk members and the descriptor land flat under dest. budget bounds
+// what extraction writes, below the fixed archive cap: dest usually shares a
+// filesystem with the daemon's database.
+func UnpackOVA(r io.Reader, dest string, budget int64) (ovfPath string, err error) {
 	tr := tar.NewReader(r)
 	var (
 		members int
@@ -75,7 +77,7 @@ func UnpackOVA(r io.Reader, dest string) (ovfPath string, err error) {
 		// Flatten: keep only the base name so split-VMDK extents + descriptor sit
 		// beside each other (OVF hrefs are relative basenames).
 		target = filepath.Join(dest, filepath.Base(target))
-		n, e := writeCapped(target, tr, &total)
+		n, e := writeCapped(target, tr, &total, min(budget, maxArchiveTotalSize))
 		if e != nil {
 			return "", e
 		}
@@ -91,13 +93,13 @@ func UnpackOVA(r io.Reader, dest string) (ovfPath string, err error) {
 }
 
 // writeCapped copies src to a new file at path, enforcing the cumulative total cap.
-func writeCapped(path string, src io.Reader, total *int64) (int64, error) {
+func writeCapped(path string, src io.Reader, total *int64, limit int64) (int64, error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return 0, fmt.Errorf("create %s: %w", path, err)
 	}
 	defer f.Close()
-	lr := &cappedReader{r: src, total: total}
+	lr := &cappedReader{r: src, total: total, limit: limit}
 	n, err := io.Copy(f, lr)
 	if err != nil {
 		return n, err
@@ -109,17 +111,18 @@ func writeCapped(path string, src io.Reader, total *int64) (int64, error) {
 }
 
 // cappedReader fails once the cumulative bytes read across the archive exceed
-// maxArchiveTotalSize.
+// limit.
 type cappedReader struct {
 	r     io.Reader
 	total *int64
+	limit int64
 }
 
 func (c *cappedReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	*c.total += int64(n)
-	if *c.total > maxArchiveTotalSize {
-		return n, fmt.Errorf("archive exceeds total size cap (%d bytes)", maxArchiveTotalSize)
+	if *c.total > c.limit {
+		return n, fmt.Errorf("archive exceeds the %d bytes it may extract on this host", c.limit)
 	}
 	return n, err
 }

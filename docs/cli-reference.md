@@ -520,6 +520,13 @@ lv image ls
 lv image rm <image>
 ```
 
+`pull` and `import` accept only standalone images. A qcow2 that names a
+backing file or an external data file, and any VMDK (whose extents can name
+other files), is refused, because qemu would open the named file on the host
+for every VM built from the image. Flatten it first with
+`qemu-img convert -O qcow2 <in> <out>`. A VM is also refused a new overlay on an
+already-stored image that names another file.
+
 ## Import (migrate VMs in)
 
 Import an existing VM from VMware (OVA/OVF) or Proxmox (qemu-server `.conf` or a
@@ -542,6 +549,14 @@ lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name a
 #   --server-path <path>           use a file/dir already staged on the target host
 #   --inspect                      print the mapping + warnings, import nothing
 ```
+
+`--server-path`, `--disk-map` and any disk a Proxmox `.conf` names must be
+under the target host's import staging root (`<data_dir>/imports/staging`).
+A path outside it needs an admin connected to the target host itself: an
+import forwarded with `--target-host` never names a host path, because the
+target sees the entry node, not the caller. Every file a foreign disk makes
+qemu open (backing files, VMDK extents, a data file) must sit beside the disk
+or in the import directory.
 
 ## Snapshots
 

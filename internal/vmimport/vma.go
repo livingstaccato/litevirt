@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -57,7 +59,12 @@ type vmaDevice struct {
 // .vma.zst / .vma.gz), reconstructs each device image as a sparse <devname>.raw
 // file under destDir, parses the embedded qemu-server.conf, and returns the
 // assembled ForeignVM with each disk's LocalPath pointing at its raw file.
-func ParseVMA(r io.Reader, destDir string) (*ForeignVM, error) {
+//
+// budget bounds what extraction may write: the archive declares its devices'
+// sizes, a small compressed archive can declare terabytes, and destDir usually
+// shares a filesystem with the daemon's database. A declared total over budget
+// is refused before any file is created. Extraction stops when ctx ends.
+func ParseVMA(ctx context.Context, r io.Reader, destDir string, budget uint64) (*ForeignVM, error) {
 	dec, err := vmaDecompress(r)
 	if err != nil {
 		return nil, err
@@ -156,6 +163,14 @@ func ParseVMA(r io.Reader, destDir string) (*ForeignVM, error) {
 		return nil, fmt.Errorf("vma: parse embedded conf: %w", err)
 	}
 
+	var declared uint64
+	for _, dev := range devices {
+		declared += dev.size // each is capped at vmaMaxDeviceSize; no overflow
+	}
+	if declared > budget {
+		return nil, fmt.Errorf("vma: devices total %d bytes, more than the %d bytes free for extraction on this host", declared, budget)
+	}
+
 	// --- Create the sparse raw target files, indexed by dev_id. ---
 	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return nil, fmt.Errorf("vma: mkdir dest: %w", err)
@@ -168,8 +183,10 @@ func ParseVMA(r io.Reader, destDir string) (*ForeignVM, error) {
 		}
 	}()
 	for id, dev := range devices {
-		raw := filepath.Join(destDir, dev.name+".raw")
-		f, err := os.OpenFile(raw, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+		// Named by dev_id, never by the archive's device name: that name is
+		// untrusted, and "../" in it placed the file anywhere on the host.
+		raw := filepath.Join(destDir, fmt.Sprintf("vma-dev-%d.raw", id))
+		f, err := os.OpenFile(raw, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 		if err != nil {
 			return nil, fmt.Errorf("vma: create %s: %w", raw, err)
 		}
@@ -182,7 +199,7 @@ func ParseVMA(r io.Reader, destDir string) (*ForeignVM, error) {
 	}
 
 	// --- Stream the extents and scatter cluster data into the targets. ---
-	if err := vmaRestoreExtents(br, uuid, devices, targets); err != nil {
+	if err := vmaRestoreExtents(ctx, br, uuid, devices, targets); err != nil {
 		return nil, err
 	}
 
@@ -285,9 +302,12 @@ func blobString(b []byte) string {
 
 // vmaRestoreExtents reads VMAE extents until EOF and writes each present block
 // into the matching device file at its computed offset.
-func vmaRestoreExtents(br *bufio.Reader, uuid []byte, devices map[int]*vmaDevice, targets map[int]*os.File) error {
+func vmaRestoreExtents(ctx context.Context, br *bufio.Reader, uuid []byte, devices map[int]*vmaDevice, targets map[int]*os.File) error {
 	ehdr := make([]byte, vmaExtentHeaderSize)
 	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("vma: %w", err)
+		}
 		// Read the extent header (or clean EOF between extents).
 		_, err := io.ReadFull(br, ehdr)
 		if err == io.EOF {

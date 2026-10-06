@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -68,7 +69,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	// Forward to the destination host without consuming more of the stream, so
 	// bytes land directly on the host that will own the VM (a concurrent stream
-	// proxy). The target re-runs every check below for itself.
+	// proxy). The target re-runs the checks below for itself, but it sees this
+	// node as an admin peer, not as the caller: so a forwarded import never
+	// names a host path outside the staging root (resolveStagedPath).
 	if first.TargetHost != "" && first.TargetHost != s.hostName {
 		return s.proxyImportVM(ctx, stream, first)
 	}
@@ -98,8 +101,18 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
+	// From here to the last converted disk the import writes; one import at a
+	// time per host, so its free-space checks hold. Nothing that waits on the
+	// client happens while it is held: a client that stops reading would hold
+	// every other import on the host.
+	releaseWrites, err := s.acquireImportWrites(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseWrites()
+
 	// ── Parse via the source adapter → ForeignVM ──
-	fv, err := s.parseImportSource(first.SourceFormat, srcPath, importDir)
+	fv, err := s.parseImportSource(ctx, first.SourceFormat, srcPath, importDir)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse source: %v", err)
 	}
@@ -111,6 +124,10 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	if first.Inspect {
+		// Nothing unpacked is needed to describe the source; free it before
+		// waiting on the client.
+		releaseWrites()
+		_ = os.RemoveAll(importDir)
 		return s.sendImportInspect(stream, fv, project)
 	}
 
@@ -136,10 +153,14 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	// Resolve disk files (Proxmox .conf disks need --disk-map) + safety checks.
-	if err := s.applyImportDiskMap(ctx, fv, first); err != nil {
+	if err := s.applyImportDiskMap(ctx, fv, first, importDir); err != nil {
 		return err
 	}
 
+	// Charge what will be copied, not only what the descriptor declares.
+	if err := bindImportDiskSizes(fv); err != nil {
+		return err
+	}
 	// Quota estimate from declared sizes (re-checked post-convert with real sizes).
 	if err := s.admitImport(ctx, project, fv); err != nil {
 		return err
@@ -162,6 +183,19 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			_ = os.Remove(p)
 		}
 	}
+	// Convert progress goes to the client from its own goroutine, and is
+	// dropped while a send is still pending: the conversion never waits on the
+	// client while it holds the import writes.
+	progress := make(chan *pb.ImportVMProgress, 1)
+	progressSent := make(chan struct{})
+	go func() {
+		defer close(progressSent)
+		for p := range progress {
+			_ = stream.Send(p)
+		}
+	}()
+	stopProgress := sync.OnceFunc(func() { close(progress) })
+	defer stopProgress()
 	for i := range fv.Disks {
 		d := &fv.Disks[i]
 		if d.IsCDROM {
@@ -175,8 +209,31 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		dst := lv.DiskPath(poolDir, name, d.Name) // poolDir/<vm>-<disk>.qcow2 (poolDir already the disks dir)
 		dst = filepath.Join(poolDir, name+"-"+d.Name+".qcow2")
 		curDisk := d.Name
-		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, func(pct float32) {
-			_ = stream.Send(&pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk})
+		// The conversion writes up to the disk's limit into the pool, and a
+		// disk from outside the import directory is first copied privately.
+		limit := uint64(importSourceLimit(d.CapacityBytes))
+		need := limit
+		if !inImportDir(importDir, d.LocalPath) {
+			if err := s.requireImportSpace(importDir, limit, "a private copy of disk "+d.Name); err != nil {
+				cleanupDisks()
+				return err
+			}
+			// The copy lives until its conversion is done. Charged against
+			// the pool as well, whatever filesystem it is on: a btrfs
+			// subvolume or ZFS dataset has its own device number but shares
+			// the free space, and too much charged is a refusal where too
+			// little is a full disk.
+			need += limit
+		}
+		if err := s.requireImportSpace(poolDir, need, "converting disk "+d.Name); err != nil {
+			cleanupDisks()
+			return err
+		}
+		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
+			select {
+			case progress <- &pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk}:
+			default:
+			}
 		}); err != nil {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "convert disk %q: %v", d.Name, err)
@@ -191,6 +248,10 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			d.CapacityBytes = info.VirtualSize
 		}
 	}
+	// The writes are done; let the next import write, and free the unpacked
+	// source, before anything here waits on this one's client again.
+	releaseWrites()
+	_ = os.RemoveAll(importDir)
 
 	// Re-check quota against the real converted sizes before committing.
 	if err := s.admitImport(ctx, project, fv); err != nil {
@@ -380,6 +441,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	s.recordVMEvent(ctx, name, "vm.imported", "ok", fmt.Sprintf("format=%s disks=%d", first.SourceFormat, len(convertedPaths)))
 	slog.Info("VM imported", "name", name, "host", s.hostName, "disks", len(convertedPaths), "started", first.Start, "warnings", len(fv.Warnings))
 
+	// Every progress frame is out before the final one: one sender at a
+	// time on the stream. The converted disks are charged to the project by
+	// now, so a client that stops reading pins nothing uncharged.
+	stopProgress()
+	<-progressSent
 	return stream.Send(&pb.ImportVMProgress{
 		Phase:          "done",
 		MappedSpecJson: string(specJSON),
@@ -517,7 +583,16 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 		stagingRoot = root
 	}
 	if !safename.Contains(stagingRoot, resolved) {
-		// Outside the staging root → privileged, require admin.
+		// Outside the staging root → privileged. A request that reached this
+		// host from a peer is a forwarded import (--target-host): the peer
+		// authenticates as admin here whoever called the entry node, so a
+		// forwarded import never names a host path. An admin connects to the
+		// target host itself for that.
+		if callerPrincipalKind(ctx) == principalKindPeer {
+			return "", status.Errorf(codes.PermissionDenied,
+				"path %q is outside the import staging root (%s); a forwarded import may not name a host path — "+
+					"stage the file under %s, or run the import against %s directly as an admin", p, stagingRoot, stagingRoot, s.hostName)
+		}
 		if err := RequireRole(ctx, "admin"); err != nil {
 			return "", status.Errorf(codes.PermissionDenied,
 				"path %q is outside the import staging root (%s); reading an arbitrary host path requires the admin role", p, stagingRoot)
@@ -527,7 +602,7 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 }
 
 // parseImportSource dispatches to the right adapter. auto sniffs by content.
-func (s *Server) parseImportSource(format, srcPath, importDir string) (*vmimport.ForeignVM, error) {
+func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importDir string) (*vmimport.ForeignVM, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	if format == "" || format == "auto" {
 		format = sniffImportFormat(srcPath)
@@ -552,7 +627,7 @@ func (s *Server) parseImportSource(format, srcPath, importDir string) (*vmimport
 			return nil, err
 		}
 		defer f.Close()
-		ovfPath, err := vmimport.UnpackOVA(f, importDir)
+		ovfPath, err := vmimport.UnpackOVA(f, importDir, int64(min(s.importExtractBudget(importDir), 1<<62)))
 		if err != nil {
 			return nil, err
 		}
@@ -573,7 +648,7 @@ func (s *Server) parseImportSource(format, srcPath, importDir string) (*vmimport
 			return nil, err
 		}
 		defer f.Close()
-		return vmimport.ParseVMA(f, importDir)
+		return vmimport.ParseVMA(ctx, f, importDir, s.importExtractBudget(importDir))
 	default:
 		return nil, fmt.Errorf("unrecognized source format (use --from ova|ovf|proxmox|vma)")
 	}
@@ -614,13 +689,25 @@ func (s *Server) applyImportNetworks(fv *vmimport.ForeignVM, meta *pb.ImportVMRe
 // applyImportDiskMap resolves disks that have no staged file yet (Proxmox .conf
 // references a storage volume) via --disk-map, with the same path safety as
 // --server-path.
-func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM, meta *pb.ImportVMRequest) error {
+//
+// A disk the source adapter unpacked into importDir needs no map. Any other
+// existing file is a path the source named — a Proxmox .conf keeps its volume
+// reference verbatim, so it can name any file on this host — and it takes the
+// same staging check as --disk-map; otherwise an operator could have a host
+// file converted into their VM's disk and read it from the guest.
+func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM, meta *pb.ImportVMRequest, importDir string) error {
 	for i := range fv.Disks {
 		d := &fv.Disks[i]
-		if d.IsCDROM || fileExists(d.LocalPath) {
+		if d.IsCDROM {
 			continue
 		}
 		mapped := meta.DiskMap[d.SourceID]
+		if mapped == "" && fileExists(d.LocalPath) {
+			if inImportDir(importDir, d.LocalPath) {
+				continue
+			}
+			mapped = d.LocalPath
+		}
 		if mapped == "" {
 			return status.Errorf(codes.FailedPrecondition,
 				"disk %q (source %q, ref %q) is not a local file — pass --disk-map %s=/staged/path", d.Name, d.SourceID, d.LocalPath, d.SourceID)
@@ -632,6 +719,19 @@ func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM,
 		d.LocalPath = resolved
 	}
 	return nil
+}
+
+// inImportDir reports whether p, with symlinks resolved, lies inside importDir.
+func inImportDir(importDir, p string) bool {
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return false
+	}
+	root, err := filepath.EvalSymlinks(importDir)
+	if err != nil {
+		return false
+	}
+	return safename.Contains(root, resolved)
 }
 
 // importQuotaAmount is what an import will charge the project, in every
@@ -771,21 +871,53 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 // elsewhere would dump foreign bytes into a qcow2-named file and corrupt it) and
 // rejects any external backing-file / out-of-dir extent reference BEFORE invoking
 // qemu-img (a malicious descriptor would otherwise make qemu-img read host files).
-func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, emit func(pct float32)) error {
+func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32)) error {
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
 	}
-	if err := assertNoExternalDiskRefs(ctx, src, allowedDir); err != nil {
+	// Only a file nobody else can write is checked and converted; otherwise
+	// what was checked need not be what qemu-img opens.
+	private, err := privateImportDisk(ctx, src, allowedDir, maxSrcBytes)
+	if err != nil {
 		return err
 	}
-
-	tmp := dst + ".tmp"
-	_ = os.Remove(tmp)
-	args := []string{"convert", "-p", "-O", "qcow2"}
-	if srcFormat != "" {
-		args = append(args, "-f", srcFormat)
+	if private != src {
+		defer os.Remove(private)
 	}
-	args = append(args, src, tmp)
+	src = private
+	// One format for the check and the conversion: a disk judged as one
+	// format but converted as another can name files the check never saw.
+	if srcFormat == "" {
+		if srcFormat, err = staticDiskFormat(src); err != nil {
+			return err
+		}
+	}
+	if err := assertNoExternalDiskRefsAs(ctx, src, srcFormat, allowedDir); err != nil {
+		return err
+	}
+	// The conversion writes up to the image's virtual size, which a
+	// compressed image can make far larger than its file.
+	if vs, err := qemuVirtualSize(ctx, src, srcFormat); err != nil {
+		return err
+	} else if vs > uint64(maxSrcBytes) {
+		return fmt.Errorf("disk's virtual size is %d bytes, more than the %d bytes the import was admitted for", vs, maxSrcBytes)
+	}
+
+	// A fresh name of its own, never a fixed "<dst>.tmp" another writer to
+	// the pool directory could plant first.
+	tf, err := os.CreateTemp(filepath.Dir(dst), "."+filepath.Base(dst)+".convert-*")
+	if err != nil {
+		return fmt.Errorf("create conversion target: %w", err)
+	}
+	tmp := tf.Name()
+	tf.Close()
+	finished := false
+	defer func() {
+		if !finished {
+			_ = os.Remove(tmp)
+		}
+	}()
+	args := []string{"convert", "-p", "-O", "qcow2", "-f", srcFormat, src, tmp}
 
 	cmd := exec.CommandContext(ctx, "qemu-img", args...)
 	var stderr bytes.Buffer
@@ -814,66 +946,190 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		return fmt.Errorf("qemu-img convert: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	// Defense-in-depth: the produced qcow2 must be standalone.
-	if err := assertNoExternalDiskRefs(ctx, tmp, allowedDir); err != nil {
+	if err := assertNoExternalDiskRefsAs(ctx, tmp, "qcow2", allowedDir); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
 		return fmt.Errorf("finalize converted disk: %w", err)
 	}
+	finished = true
 	return nil
 }
 
 type qemuImgInfo struct {
-	BackingFilename     string `json:"backing-filename"`
-	FullBackingFilename string `json:"full-backing-filename"`
+	Filename              string `json:"filename"`
+	VirtualSize           uint64 `json:"virtual-size"`
+	Format                string `json:"format"`
+	BackingFilenameFormat string `json:"backing-filename-format"`
+	BackingFilename       string `json:"backing-filename"`
+	FullBackingFilename   string `json:"full-backing-filename"`
+	FormatSpecific        struct {
+		Data struct {
+			DataFile string `json:"data-file"`
+			Extents  []struct {
+				Filename string `json:"filename"`
+			} `json:"extents"`
+		} `json:"data"`
+	} `json:"format-specific"`
+	Children []struct {
+		Name string      `json:"name"`
+		Info qemuImgInfo `json:"info"`
+	} `json:"children"`
 }
 
-// assertNoExternalDiskRefs rejects a disk whose backing file or VMDK extents
-// point outside allowedDir (a host-file-read escape via a crafted descriptor).
-func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) error {
-	// Text VMDK descriptor: scan extent lines for absolute/escaping paths.
-	if head, err := readHead(file, 4096); err == nil && bytes.Contains(head, []byte("# Disk DescriptorFile")) {
-		full, _ := readHead(file, 256<<10)
-		for _, line := range strings.Split(string(full), "\n") {
-			line = strings.TrimSpace(line)
-			if !(strings.HasPrefix(line, "RW ") || strings.HasPrefix(line, "RDONLY ") || strings.HasPrefix(line, "NOACCESS ")) {
-				continue
-			}
-			a := strings.IndexByte(line, '"')
-			b := strings.LastIndexByte(line, '"')
-			if a < 0 || b <= a {
-				continue
-			}
-			ext := line[a+1 : b]
-			if filepath.IsAbs(ext) || strings.Contains(ext, "..") || !safename.Contains(allowedDir, filepath.Join(allowedDir, ext)) {
-				return fmt.Errorf("VMDK descriptor references an external/escaping extent %q", ext)
-			}
+// openedFiles is every file qemu-img reported opening for this image: the
+// image, its children (extents, data file, the protocol layer) and the
+// format-specific extent list. Judging these, rather than parsing VMDK text,
+// covers every way a format can name another file.
+func (i *qemuImgInfo) openedFiles() []string {
+	var out []string
+	if i.Filename != "" {
+		out = append(out, i.Filename)
+	}
+	for _, e := range i.FormatSpecific.Data.Extents {
+		if e.Filename != "" {
+			out = append(out, e.Filename)
 		}
 	}
-	// qemu-img info: reject a backing file that escapes allowedDir.
-	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", file).Output()
+	for c := range i.Children {
+		out = append(out, i.Children[c].Info.openedFiles()...)
+	}
+	return out
+}
+
+// maxBackingDepth bounds the chain walk; a legitimate foreign disk has at most
+// a handful of snapshots.
+const maxBackingDepth = 16
+
+// assertNoExternalDiskRefs rejects a disk that would make qemu-img open a file
+// outside allowedDir: a VMDK extent, a backing file anywhere in the chain, or
+// a qcow2 external data file (a host-file-read escape via a crafted header).
+// A backing name that is not a plain path (json:{...}, nbd:, a URL) is refused
+// outright: joined to a directory it would look contained while naming
+// anything. The chain is walked one image at a time, and nothing outside
+// allowedDir is ever opened.
+func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) error {
+	return assertNoExternalDiskRefsAs(ctx, file, "", allowedDir)
+}
+
+// assertNoExternalDiskRefsAs judges file opened as format — the format qemu
+// will be told, not the one it would probe: a VMDK descriptor can probe as
+// raw yet be opened as vmdk. An empty format is read from the header
+// (staticDiskFormat), never probed by qemu-img. Every file the disk names must
+// lie in allowedDir, which the daemon alone writes: a disk from anywhere else
+// is copied there first (privateImportDisk), and what it named beside it is
+// not.
+func assertNoExternalDiskRefsAs(ctx context.Context, file, format, allowedDir string) error {
+	if format == "" {
+		f, err := staticDiskFormat(file)
+		if err != nil {
+			return err
+		}
+		format = f
+	}
+	roots := []string{allowedDir}
+	if real, err := filepath.EvalSymlinks(allowedDir); err == nil {
+		roots = append(roots, real)
+	}
+	return assertNoExternalDiskRefsDepth(ctx, file, format, roots, 0)
+}
+
+func withinAnyRoot(roots []string, p string) bool {
+	for _, r := range roots {
+		if safename.Contains(r, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func assertNoExternalDiskRefsDepth(ctx context.Context, file, format string, roots []string, depth int) error {
+	if depth > maxBackingDepth {
+		return fmt.Errorf("backing chain deeper than %d images", maxBackingDepth)
+	}
+	// Nothing the header names may be opened before it is judged: refuse
+	// what qemu-img info itself would open (extents, a data file).
+	if err := precheckDiskHeader(file, format); err != nil {
+		return err
+	}
+	// qemu-img info on this one image only (no --backing-chain: that would
+	// open the backing file before it is judged).
+	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", "-f", format, "--", file).Output()
 	if err != nil {
 		// info failure is not itself an escape; surface it as a convert-time error.
 		return fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
 	}
 	var info qemuImgInfo
-	if json.Unmarshal(out, &info) == nil {
-		for _, b := range []string{info.BackingFilename, info.FullBackingFilename} {
-			if b == "" {
-				continue
-			}
-			resolved := b
-			if !filepath.IsAbs(b) {
-				resolved = filepath.Join(filepath.Dir(file), b)
-			}
-			if !safename.Contains(allowedDir, resolved) {
-				return fmt.Errorf("disk has an external backing file %q outside the import directory", b)
-			}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return fmt.Errorf("inspect %s: unreadable qemu-img info: %w", filepath.Base(file), err)
+	}
+	self := file
+	if real, err := filepath.EvalSymlinks(file); err == nil {
+		self = real
+	}
+	for _, f := range info.openedFiles() {
+		if f == file || f == self {
+			continue // the disk itself, which its caller chose
+		}
+		if !plainBackingPath(f) {
+			return fmt.Errorf("disk makes qemu open %q, which is not a plain path", f)
+		}
+		resolved := f
+		if !filepath.IsAbs(f) {
+			resolved = filepath.Join(filepath.Dir(file), f)
+		}
+		if real, err := filepath.EvalSymlinks(resolved); err == nil {
+			resolved = real
+		}
+		if !withinAnyRoot(roots, resolved) {
+			return fmt.Errorf("disk makes qemu open %q, outside the import directory", f)
 		}
 	}
-	return nil
+	if df := info.FormatSpecific.Data.DataFile; df != "" {
+		return fmt.Errorf("disk keeps its data in an external file %q; only standalone disks are imported", df)
+	}
+	backing := info.BackingFilename
+	if backing == "" {
+		backing = info.FullBackingFilename
+	}
+	if backing == "" {
+		return nil
+	}
+	if !plainBackingPath(backing) {
+		return fmt.Errorf("disk names a backing file %q that is not a plain path", backing)
+	}
+	resolved := backing
+	if !filepath.IsAbs(backing) {
+		resolved = filepath.Join(filepath.Dir(file), backing)
+	}
+	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = real
+	}
+	if !withinAnyRoot(roots, resolved) {
+		return fmt.Errorf("disk has an external backing file %q outside the import directory", backing)
+	}
+	// Walk the backing file in the format the image records for it; qemu
+	// opens it that way. With none recorded qemu would probe, so refuse.
+	if info.BackingFilenameFormat == "" {
+		return fmt.Errorf("disk names a backing file %q without its format", backing)
+	}
+	return assertNoExternalDiskRefsDepth(ctx, resolved, info.BackingFilenameFormat, roots, depth+1)
+}
+
+// plainBackingPath reports whether a backing name is a filesystem path rather
+// than a json: spec or a protocol (nbd:, http:, file:, ...). qemu treats a
+// leading "<word>:" as a protocol prefix.
+func plainBackingPath(name string) bool {
+	if strings.HasPrefix(name, "json:") {
+		return false
+	}
+	if i := strings.IndexByte(name, ':'); i >= 0 {
+		if j := strings.IndexByte(name, '/'); j < 0 || i < j {
+			return false
+		}
+	}
+	return true
 }
 
 // ── small helpers ──

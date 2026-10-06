@@ -102,6 +102,13 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 		}
 	}
 
+	// Every VM created from this image boots through it: one that names
+	// another file (a backing file, an external data file, VMDK extents)
+	// would have qemu open that file on the host for the guest.
+	if err := qcow2.AssertStandalone(tmpFile.Name()); err != nil {
+		return status.Errorf(codes.InvalidArgument, "image %q: %v", name, err)
+	}
+
 	// Move to final location.
 	destPath := s.images.ImagePath(name)
 	if err := os.Rename(tmpFile.Name(), destPath); err != nil {

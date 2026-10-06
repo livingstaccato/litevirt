@@ -110,6 +110,11 @@ func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (
 			return "", fmt.Errorf("parse size %q: %w", size, err)
 		}
 	}
+	// Images stored before arrival checks existed are judged here too: an
+	// overlay must never chain to a base that names another host file.
+	if err := qcow2.AssertStandalone(backingPath); err != nil {
+		return "", fmt.Errorf("base image %q: %w", backingImage, err)
+	}
 	if err := qcow2.CreateWithBacking(diskPath, backingPath, sizeBytes, nil); err != nil {
 		return "", fmt.Errorf("create overlay disk: %w", err)
 	}

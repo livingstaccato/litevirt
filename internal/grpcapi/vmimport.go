@@ -219,13 +219,12 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		dst := lv.DiskPath(poolDir, name, d.Name) // poolDir/<vm>-<disk>.qcow2 (poolDir already the disks dir)
 		dst = filepath.Join(poolDir, name+"-"+d.Name+".qcow2")
 		curDisk := d.Name
-		// A file already at the name is another VM's disk, or a leftover:
-		// it is never replaced, and never removed by this import.
-		if _, err := os.Lstat(dst); err == nil {
+		// A file already at the name is never replaced. One that something
+		// records is refused; an orphan (a crashed import's output) is moved
+		// aside and kept.
+		if err := s.clearImportDiskName(ctx, d.Name, dst); err != nil {
 			cleanupDisks()
-			return status.Errorf(codes.FailedPrecondition,
-				"disk %q would be written to %s, which already exists in the pool; an import never replaces a file there — remove it if it is a leftover, or import under another --name",
-				d.Name, dst)
+			return status.Error(codes.FailedPrecondition, err.Error())
 		}
 		// The conversion writes up to the disk's limit, plus its qcow2
 		// tables, into the pool, and a disk from outside the import directory

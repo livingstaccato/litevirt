@@ -564,7 +564,10 @@ the disk and is released when it finishes or fails, so an import that does not
 fit beside the others is refused with the space it needs and what the others
 hold; retry it when they finish. Two imports of the same VM name on one host do
 not run at once, and an import never replaces a file already at its disk's
-name in the pool.
+name in the pool. A file there that no disk (of a live VM, or kept from a
+deleted one) and no image records — a crashed earlier import's output — is
+moved aside to `<name>.orphan-<unix time>`, kept, and logged, and the import
+goes ahead; one that something records refuses the import, naming it.
 
 ## Snapshots
 

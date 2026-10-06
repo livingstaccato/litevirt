@@ -184,8 +184,9 @@ func TestImportVM_ASecondImportOfTheSameNameIsRefused(t *testing.T) {
 	}
 }
 
-// A file already at the converted disk's name in the pool — another VM's
-// disk — is never replaced, and the refused import does not remove it.
+// A file already at the converted disk's name in the pool that a disk row
+// records — another VM's disk — is never replaced, and the refused import
+// does not remove it.
 func TestImportVM_AnExistingDiskInThePoolIsNeverReplaced(t *testing.T) {
 	s := concurrentImportServer(t, 10*oneDiskNeed())
 	calls := filepath.Join(t.TempDir(), "calls")
@@ -209,6 +210,11 @@ func TestImportVM_AnExistingDiskInThePoolIsNeverReplaced(t *testing.T) {
 	}
 	theirs := filepath.Join(poolDir, "imp-dst-root.qcow2")
 	if err := os.WriteFile(theirs, []byte("another project's disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.Execute(context.Background(),
+		`INSERT INTO vm_disks (vm_name, disk_name, host_name, path, storage_type, updated_at)
+		 VALUES ('theirs', 'root', 'test-host', ?, 'local', ?)`, theirs, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	err = s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-dst", false)}})

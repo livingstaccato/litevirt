@@ -82,22 +82,49 @@ pool's directory, when the VM is created and again at every start (restart
 policy, health restarts, a snapshot restore, a replace cutover, and a
 migration target before the VM lands there). The file must be a plain file:
 not a symlink, not a second hard link to some other file, and not anywhere
-`storage.CheckReadFile` refuses (below). The daemon writes every file a
-library holds — an upload, a pull, a sync — so a link there is never one of
-them.
+`storage.CheckReadFile` refuses (below). Just before the file is handed to
+qemu it is opened without following a link and confirmed to be the same file
+at the same path. The daemon writes every file a library holds — an upload, a
+pull, a sync — so a link there is never one of them, and a library write never
+replaces a file already there (remove it first with `lv iso rm`).
+
+Pools are per host, and two hosts can each have a pool of the same name. So
+the authority is judged wherever the reference is resolved, not only where the
+VM was created:
+
+- The create records which kind of pool the ISO is in (`VMSpec.iso_scope`):
+  the global library, another pool with no project, or a pool the VM's project
+  owns (or, for an Admin's host path, that). On any host where the reference
+  resolves to a pool of another kind, the VM does not start there.
+- On every host, every pool mapping that directory must be global or the VM's
+  project's. A same-named pool of another project on the host a VM moved to
+  is not its library: the start, or the migration, is refused.
+- A migration target without the pool refuses the migration. A **running**
+  VM's CD-ROM path cannot change in a migration (libvirt hands qemu on the
+  target the source's path), so the target must resolve the reference to that
+  very path; otherwise migrate it stopped, or give the library the same
+  directory on both hosts. A stopped VM's domain is pointed at the target's
+  file when it starts.
 
 ### The global library
 
 Every host has a pool named `isos` with no project, at `<data_dir>/pools/isos`,
 which the daemon creates when the host has none. Every project may boot from
 it. Only an Admin writes it (`storage.library.write` at `/`): an upload in the
-UI's Browse dialog or `lv iso pull` (below). No other pool may be created in,
-above or below its directory.
+UI's Browse dialog or `lv iso pull` (below).
+
+The global library is not just any pool called `isos`. In sync mode it is the
+daemon's pool at `<data_dir>/pools/isos`; in shared mode it is the global
+`isos` pool the Admin put on shared storage — setting the mode to `shared` is
+the designation. Creating, replacing, retargeting or deleting a global `isos`
+pool needs `storage.hostpath` at `/` (Admin), not `storage.pool.write`. No
+other pool may be created in, above or below its directory, and an `isos` pool
+may not be put on a directory another pool maps.
 
 Where its files live is the cluster setting `iso_library_mode`, shown and
 changed with `lv cluster iso-library-mode`:
 
-- **`sync`** (the default): every host keeps a local copy. An upload or pull
+- **`sync`**: every host keeps a local copy. An upload or pull
   to one host records the file's sha256 in replicated state, and every other
   host copies it from a host that has it and keeps it only if it hashes to
   that record (every 30 seconds). A VM starts from a global-library ISO only
@@ -110,21 +137,44 @@ changed with `lv cluster iso-library-mode`:
   over the built-in one on every host, with the same export:
   `lv pool create isos --driver nfs --source nas:/export/isos --option content=iso --host <h>`.
 
+With the setting never set, a cluster where some host already has an `isos`
+pool the daemon did not make (an NFS share, say) is in **`shared`** mode, so
+its files keep working as they are; any other cluster is in **`sync`** mode.
+An Admin's absolute host path (below) is never subject to the mode.
+
 Switching:
 
 - **to `shared`**: create the shared `isos` pool on every host (above), copy
   the files you need into it, then run `lv cluster iso-library-mode shared`.
 - **to `sync`**: run `lv cluster iso-library-mode sync` against a host whose
-  library holds the files you want. The switch records every ISO in that
-  host's library, and the other hosts copy them. A file another host holds
-  under the same name but with other content is replaced by that copy, and a
-  file only another host holds is not recorded (upload or pull it again).
-  The pools can stay on shared storage; then every host's copy already
-  matches.
+  library holds the files you want. Setting the mode starts a new generation
+  of library records: the earlier records, removals included, stop counting,
+  and every host records the ISOs its own library holds that the new
+  generation has no record of — the connected host at once, the others on
+  their next sync pass. So the records describe the files as they are. A file
+  two hosts hold under one name with different content is recorded as the
+  first host records it (the connected host's, when it has one), and the other
+  host's copy is replaced by it.
 
 Changing the mode needs the admin role and refuses until every host runs a
 release that knows it (`failover_scope_v1` latched). In sync mode an upload or
 pull to the global library is refused for the same reason until then.
+
+The records live in the replicated `cluster_policies` table, beside the
+failover scope:
+
+- `iso_library_mode` — the mode; its update time is the record generation.
+- `iso_library/<file>` — a file's sha256 and size, or its removal (a
+  tombstone, so a host that was down when the file was removed deletes its
+  copy rather than offering it back), stamped with its generation. A file
+  added again replaces its tombstone.
+- `iso_library_host/<host>` — the generation and the newest record a host has
+  applied.
+
+A tombstone every host holding the library has applied, and every record of
+an earlier generation, is collected by the host that wrote it: it becomes an
+empty row (the table has no replicated delete, and adding one would be a new
+statement shape for every peer to decode).
 
 ### Project libraries
 
@@ -135,8 +185,15 @@ A project library is any file-based pool a project owns with the option
 lv pool create acme-isos --driver dir --target /srv/acme-isos --project acme --option content=iso
 ```
 
-The project's operators upload to it (`storage.content.write`), and only that
-project's VMs may boot from it. Only `.iso` files go into a library.
+The project's operators upload to it (`storage.content.write`) and may pull
+into it from a URL, and only that project's VMs may boot from it, on any host.
+Only `.iso` files go into a library. A library whose directory another
+project's pool also maps lists nothing from it (the files may be that
+project's); give a library a directory of its own.
+
+A library on NFS relies on the pool being mounted `nosymfollow` (with
+`nodev,nosuid`), so the NFS server cannot answer the open with a link; see the
+hardened-mount rule for directory pools on NFS.
 
 ### Filling a library
 
@@ -161,8 +218,13 @@ first, then the global library. `lv iso rm <pool>/<file>.iso` removes one.
 - A **non-admin** may not. An absolute path that names a `.iso` directly in a
   pool directory — what earlier specs stored — is taken as that pool's
   reference, provided the caller may read the pool and the VM's project may
-  use it (every pool sharing that directory included). A VM created earlier
-  that way keeps starting, and is resolved through its pool.
+  use it (every pool sharing that directory included). It is stored as
+  written and resolved through its pool, with the same per-host checks as a
+  reference. A VM created before `iso_scope` was recorded is judged as the
+  path it names, as it was before.
+- A reference may also name a pool that is not a library (a global pool, or
+  one the VM's project owns), as earlier pool paths could; it is not listed by
+  `lv iso ls`, and the same checks apply.
 
 Some files are refused to everyone, Admin included, judged as written and after
 resolving symlinks: the PKI directory, anything in the data directory outside
@@ -177,9 +239,7 @@ domain actually carries, so a VM whose domain was redefined without its
 installer CD-ROM starts even after the ISO is gone. When a library file lives
 at a different path on the starting host than where the domain was defined
 (a library pool on another directory), the domain is pointed at this host's
-file. A live migration opens the source's path on the target, so give the
-library pool the same directory on every host if VMs migrate live with their
-installer attached.
+file.
 
 The entry node checks authority before forwarding; the owning host resolves
 the file against its own filesystem. An entry node on an older build forwards

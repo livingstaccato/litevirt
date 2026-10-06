@@ -147,7 +147,8 @@ var firstShapeAcks = map[string]string{
 		"capabilities.replicationGated, so it is confirmed against every memberlist recipient rather " +
 		"than the voting members only. It fails CLOSED when unwired (lv user reset-admin wires it to " +
 		"the same durable marker), so the latch cannot form while a previous-release peer is listening",
-	"cluster_policies": "every writer (corrosion.SetFailoverScope, SetISOLibraryMode and PutISOCatalogEntry, " +
+	"cluster_policies": "every writer (corrosion.SetFailoverScope, SetISOLibraryMode, PutISOCatalogEntry, " +
+		"CollectISOCatalogEntry and PutISOLibraryHostAck, " +
 		"all through the one clusterPolicyUpsertSQL) returns " +
 		"ErrClusterPolicyGateClosed unless Client.MayWriteClusterPolicy. The daemon wires that gate to " +
 		"DurablyLatched(failover_scope_v1) — mandatory, so advertised by every build carrying this table and " +

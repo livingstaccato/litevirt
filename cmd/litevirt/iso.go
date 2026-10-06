@@ -139,16 +139,21 @@ func newClusterISOLibraryModeCmd() *cobra.Command {
 		Short: "Show or set where the global ISO library lives",
 		Long: `With no argument, show where the cluster-global ISO library ("isos") lives.
 
-  sync    (the default) every host keeps a local copy. An upload or pull to
-          one host is recorded with its sha256 and copied to every other host
-          by the daemon, which verifies it; a VM starts only on a host whose
-          copy matches.
-  shared  the isos pool is on shared storage that every host mounts (create
-          it on each host with 'lv pool create isos --driver nfs ...
+  sync    every host keeps a local copy. An upload or pull to one host is
+          recorded with its sha256 and copied to every other host by the
+          daemon, which verifies it; a VM starts only on a host whose copy
+          matches. The global library is the daemon's <data_dir>/pools/isos.
+  shared  the isos pool is on shared storage that every host mounts (an Admin
+          creates it on each host with 'lv pool create isos --driver nfs ...
           --option content=iso'), so every host already sees the same files.
 
-Switching to sync records the files the connected host's library holds, so
-they reach every other host. Changing it needs the admin role and refuses
+Never set, the mode is shared when some host already has an isos pool the
+daemon did not make, and sync otherwise. An Admin's absolute host path is
+never subject to it.
+
+Setting the mode starts a new generation of library records: every host
+records what its own library holds (the connected host first), so the records
+describe the files as they are. Changing it needs the admin role and refuses
 until every host runs a release that knows it (failover_scope_v1).`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

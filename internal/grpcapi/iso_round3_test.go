@@ -306,11 +306,6 @@ func TestISORound3_AnUnansweringPoolDirectoryFailsClosedQuickly(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
-		HostName: s.hostName, Name: "daemon-nfs", Driver: "nfs", Source: "nas:/other", State: "active",
-	}); err != nil {
-		t.Fatal(err)
-	}
 	block := make(chan struct{})
 	t.Cleanup(func() { close(block) })
 	orig, origT := isoDirProbe, isoDirProbeTimeout
@@ -439,5 +434,92 @@ func TestISORound3_AReAddDuringCollectionIsKept(t *testing.T) {
 	}
 	if e, ok, _ := corrosion.GetISOCatalogEntry(ctx, s.db, "gone.iso"); !ok || e.Deleted || e.SHA256 != sha(isoBody) {
 		t.Fatalf("the re-added file lost its record to the collection: %+v %v", e, ok)
+	}
+}
+
+// I-1: the daemon's own NFS mount directory (an nfs pool with no target) is
+// never read to tell whether it shares an ISO's directory.
+func TestISORound3_TheDaemonsNFSMountsAreNeverRead(t *testing.T) {
+	s, _, _ := isoServer(t)
+	_, _ = libraryVMStopped(t, s, "v")
+	if err := corrosion.UpsertStoragePool(context.Background(), s.db, corrosion.StoragePoolRecord{
+		HostName: s.hostName, Name: "daemon-nfs", Driver: "nfs", Source: "nas:/other", State: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	orig := isoDirProbe
+	t.Cleanup(func() { isoDirProbe = orig })
+	isoDirProbe = func(p string) (string, os.FileInfo, error) {
+		if strings.Contains(p, "/mounts/") {
+			t.Errorf("the daemon's own NFS mount directory %s was read", p)
+		}
+		return orig(p)
+	}
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "v")); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+}
+
+// C-2: an Admin's link is resolved again at every start from the path named,
+// so a package update that moves the versioned file keeps working.
+func TestISORound3_AnUpdatedLinkIsFollowedAtTheNextStart(t *testing.T) {
+	s, fake, _ := isoServer(t)
+	dir := t.TempDir()
+	v1 := filepath.Join(dir, "virtio-win-0.1.240.iso")
+	writeLibFile(t, v1, isoBody)
+	link := filepath.Join(dir, "virtio-win.iso")
+	if err := os.Symlink(v1, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVM(adminCtx(), isoCreate("win", link, "")); err != nil {
+		t.Fatalf("CreateVM: %v", err)
+	}
+	stopVM(t, s, "win")
+	v2 := filepath.Join(dir, "virtio-win-0.1.262.iso")
+	writeLibFile(t, v2, isoBody+" new")
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(v2, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(v1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "win")); err != nil {
+		t.Fatalf("start after the package moved the versioned file: %v", err)
+	}
+	if x := fake.DefinedXML("win"); !strings.Contains(x, mustEval(t, v2)) {
+		t.Fatalf("the domain was not pointed at the new file:\n%s", x)
+	}
+}
+
+// C-2: a host path is judged as named too — a link inside a refused place is
+// refused even when it points somewhere harmless.
+func TestISORound3_ALinkInARefusedPlaceIsRefused(t *testing.T) {
+	s, _, _ := isoServer(t)
+	plain := filepath.Join(t.TempDir(), "x.iso")
+	writeLibFile(t, plain, isoBody)
+	inPKI := filepath.Join(s.pkiDir, "x.iso")
+	if err := os.Symlink(plain, inPKI); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateVM(adminCtx(), isoCreate("p", inPKI, "")); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("admin naming a link inside the PKI directory: got %v, want InvalidArgument", err)
+	}
+}
+
+// ...and at a start of a main-era VM, which no create-time check saw.
+func TestISORound3_AMainEraLinkInARefusedPlaceIsRefused(t *testing.T) {
+	s, fake, _ := isoServer(t)
+	plain := filepath.Join(t.TempDir(), "x.iso")
+	writeLibFile(t, plain, isoBody)
+	inPKI := filepath.Join(s.pkiDir, "x.iso")
+	if err := os.Symlink(plain, inPKI); err != nil {
+		t.Fatal(err)
+	}
+	legacyVM(t, s, fake, "p", inPKI)
+	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "p")); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("start of a VM whose ISO is a link inside the PKI directory: got %v, want FailedPrecondition", err)
 	}
 }

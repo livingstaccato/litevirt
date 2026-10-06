@@ -420,7 +420,7 @@ func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord, req *pb.EnsureDisks
 		spec = &pb.VMSpec{}
 	}
 	ctx := context.Background()
-	runtime := req.GetInstallerIsoRuntime() || !req.GetInstallerIsoListed()
+	runtime := req.GetInstallerIsoRuntime()
 	absentWarning := func(what string) string {
 		w := fmt.Sprintf("VM %q is moving to %s, which cannot attach its installer ISO yet (%s); it will not start there until the ISO is present (upload or pull it there, or wait for the library to sync)",
 			vm.Name, s.hostName, what)
@@ -463,6 +463,8 @@ func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord, req *pb.EnsureDisks
 		}
 		return strings.Join(warnings, "; "), nil
 	}
+	// Unlisted: an older source's runtime move (see above). Strict — an absent
+	// pool or file is refused, never waved through with a warning.
 	if spec.GetIso() == "" {
 		return "", nil
 	}

@@ -475,6 +475,17 @@ func TestISOAuthority_TombstonesAreCollectedOnceApplied(t *testing.T) {
 		t.Fatalf("the tombstone was collected while host-b had not applied it: %+v", e)
 	}
 	mode, _ := corrosion.GetISOLibraryMode(ctx, s.db)
+	// host-b has applied a later record of another file, not this tombstone:
+	// no high-water mark stands in for it.
+	if err := corrosion.PutISOLibraryHostAck(ctx, s.db, corrosion.ISOLibraryHostAck{Host: "host-b", Gen: mode.UpdatedAt, Applied: map[string]string{"other.iso": s.db.NowTS()}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncISOLibrary(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := tomb(); !e.Deleted {
+		t.Fatalf("the tombstone was collected on another record's ack: %+v", e)
+	}
 	if err := corrosion.PutISOLibraryHostAck(ctx, s.db, corrosion.ISOLibraryHostAck{Host: "host-b", Gen: mode.UpdatedAt, Applied: map[string]string{"gone.iso": tombVersion(t, s)}}); err != nil {
 		t.Fatal(err)
 	}

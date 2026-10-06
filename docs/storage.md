@@ -97,17 +97,29 @@ VM was created:
   owns (or, for an Admin's host path, that). On any host where the reference
   resolves to a pool of another kind, the VM does not start there.
 - On every host, every pool mapping that directory must be global or the VM's
-  project's. Directories are compared with symlinks resolved, as the file is
-  opened, so a pool whose target is a link (or `/proc/self/root/…`) to another
-  pool's directory maps that directory. A same-named pool of another project
-  on the host a VM moved to is not its library: the start, or the migration,
-  is refused.
-- The create also records which file the ISO resolved to on that host
-  (`VMSpec.iso_identity`: resolved path, device, inode, size, mtime). A start
-  of that unchanged file on that host keeps working even if another project's
-  pool has since come to share the directory — another project's ordinary
-  `lv pool create` cannot stop a VM that started before. A file put there
-  since is judged by the full rule.
+  project's. Directories are compared as the file is opened — with symlinks
+  resolved, and by the directory's identity — so neither a pool whose target
+  is a link (or `/proc/self/root/…`) to another pool's directory nor a bind
+  mount of it gets past the check. The pool the reference names must be
+  global or the VM's project's on that host, file or no file: a same-named
+  pool of another project on the host a VM moved to is not its library.
+- Reading another pool's directory can block (an NFS server that stopped
+  answering, on a hard mount). The daemon's own NFS mount directories are
+  never read for this; any other is read under a 3-second deadline, and one
+  that does not answer refuses the start (or create, or move) saying which
+  pool did not answer — it never hangs.
+- Each time a host judges the ISO by that full rule and it passes — at the
+  create, at a start, as a migration target — the host records which file it
+  was (in `<data_dir>/iso-identity`, by the VM's uuid and project: resolved
+  path, inode, size and mtime; not the device number, which a ZFS, btrfs, NFS
+  or LVM mount can renumber across a reboot). A later start of that unchanged
+  file on that host keeps working even if another project's pool has since
+  come to share the directory — another project's ordinary `lv pool create`
+  cannot stop a VM that started before, on the host it was created on or one
+  it moved to. A file put there since is judged by the full rule. A VM's
+  first arrival on a host where the directory is already shared is judged by
+  the full rule (refused) until per-file ownership comes with the storage
+  pools change.
 - A **running** VM's CD-ROM path cannot change in a migration (libvirt hands
   qemu on the target the source's path), so the target must resolve the
   reference to that very path, and a target without the pool or the file
@@ -115,9 +127,12 @@ VM was created:
   directory on both hosts. A **stopped** VM may move to a host that does not
   have its ISO or library yet: the move is accepted with a warning, and the VM
   will not start there until the ISO is present (upload or pull it, or wait for
-  the library to sync). A stopped VM's domain is pointed at the target's file
-  when it starts. A target where the pool of that name is another project's,
-  or of another kind, refuses the move either way.
+  the library to sync); the warning is logged and recorded as a VM event
+  (`vm.migrate.iso_warning`, in `lv events`). A stopped VM's domain is pointed
+  at the target's file when it starts. A target where the pool of that name is
+  another project's, or of another kind, refuses the move, file or no file.
+  The source lists the CD-ROMs of the running domain for a running VM, and a
+  migration whose running domain cannot be read stops.
 
 ### The global library
 
@@ -184,10 +199,15 @@ failover scope:
 - `iso_library_host/<host>` — the generation and the newest record a host has
   applied.
 
-A tombstone every host holding the library has applied, and every record of
-an earlier generation, is collected by the host that wrote it: it becomes an
-empty row (the table has no replicated delete, and adding one would be a new
-statement shape for every peer to decode).
+A tombstone every host holding the library has applied — that exact version,
+by each host's per-record ack — and every record of an earlier generation, is
+collected by the host that wrote it: it becomes an empty row (the table has no
+replicated delete, and adding one would be a new statement shape for every
+peer to decode). The key is read again just before, and left alone if it
+changed, so a file added again in the meantime keeps its record. The first
+time an Admin creates, replaces or deletes a global `isos` pool with no mode
+ever set, the mode in force is written first, so the change cannot flip it
+silently.
 
 ### Project libraries
 
@@ -226,15 +246,25 @@ first, then the global library. `lv iso rm <pool>/<file>.iso` removes one.
 ### Host paths and earlier specs
 
 - An **Admin** may still name an absolute host path (`storage.hostpath` at
-  `/`). It is judged as itself, at create and at every start, with the same
-  plain-file rules.
+  `/`). It may be a link or pass through one — virtio-win ships
+  `/usr/share/virtio-win/virtio-win.iso` as a link to a versioned file, and
+  `/var/lib/libvirt/images` is often a link to a data disk. The path is
+  resolved once, at create and again at every start, the file it names is
+  judged (not in a refused place, as named or as resolved; a regular file; no
+  link left in the resolved path), and the domain is given the resolved file,
+  so qemu never follows a link. The spec keeps the path as named, so an
+  updated package's new versioned file is picked up at the next start. A hard
+  link is accepted where `fs.protected_hardlinks=1` (the default; the kernel
+  then stops a user linking a file they do not own), and refused, saying so,
+  where it is 0.
 - A **non-admin** may not. An absolute path that names a `.iso` directly in a
   pool directory — what earlier specs stored — is taken as that pool's
   reference, provided the caller may read the pool and the VM's project may
   use it (every pool sharing that directory included). It is stored as
   written and resolved through its pool, with the same per-host checks as a
-  reference. A VM created before `iso_scope` was recorded is judged as the
-  path it names, as it was before.
+  reference, the library record included. A VM created before `iso_scope` was
+  recorded is treated as a host path (above), as it was before: it keeps
+  starting, links and all.
 - A reference may also name a pool that is not a library (a global pool, or
   one the VM's project owns), as earlier pool paths could; it is not listed by
   `lv iso ls`, and the same checks apply.

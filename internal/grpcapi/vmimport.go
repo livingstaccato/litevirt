@@ -101,7 +101,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	// ── Parse via the source adapter → ForeignVM ──
-	fv, err := s.parseImportSource(first.SourceFormat, srcPath, importDir)
+	fv, err := s.parseImportSource(ctx, first.SourceFormat, srcPath, importDir)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "parse source: %v", err)
 	}
@@ -542,7 +542,7 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 }
 
 // parseImportSource dispatches to the right adapter. auto sniffs by content.
-func (s *Server) parseImportSource(format, srcPath, importDir string) (*vmimport.ForeignVM, error) {
+func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importDir string) (*vmimport.ForeignVM, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	if format == "" || format == "auto" {
 		format = sniffImportFormat(srcPath)
@@ -588,7 +588,7 @@ func (s *Server) parseImportSource(format, srcPath, importDir string) (*vmimport
 			return nil, err
 		}
 		defer f.Close()
-		return vmimport.ParseVMA(f, importDir)
+		return vmimport.ParseVMA(ctx, f, importDir, s.importExtractBudget(importDir))
 	default:
 		return nil, fmt.Errorf("unrecognized source format (use --from ova|ovf|proxmox|vma)")
 	}

@@ -248,3 +248,20 @@ func bindImportDiskSizes(fv *vmimport.ForeignVM) error {
 	}
 	return nil
 }
+
+// importExtractBudget is how much an archive may unpack into importDir: its
+// filesystem's free space less the headroom a cold migration also keeps, since
+// the import directory usually shares that filesystem with state.db and with
+// thin-provisioned disks that pause their guests when it fills. An unreadable
+// filesystem gives no budget.
+func (s *Server) importExtractBudget(importDir string) uint64 {
+	avail, total, err := s.diskSpace(importDir)
+	if err != nil {
+		return 0
+	}
+	headroom := coldDiskHeadroom(total)
+	if avail <= headroom {
+		return 0
+	}
+	return avail - headroom
+}

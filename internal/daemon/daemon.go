@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -63,6 +64,12 @@ const grpcMaxMsgSize = 64 << 20 // 64 MiB
 
 // Daemon is the main litevirtd process.
 type Daemon struct {
+	// auditWired is closed once wireAuditKeyring has installed the keyring
+	// audit rows are signed with; runAuditHold lands nothing before it.
+	auditWiredOnce sync.Once
+	auditWired     chan struct{}
+	auditWiredDone sync.Once
+
 	cfg     *Config
 	db      *corrosion.Client
 	virt    *libvirt.Client
@@ -343,9 +350,40 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Warn("failed to migrate legacy network names", "error", err)
 	}
 
+	// Hold this host's audit rows while its own chain is still arriving, before
+	// anything can write one. Only a host re-added under an old name, whose
+	// CA-signed admission record (pki_dir/audit-rejoin.json, written by
+	// `lv host add`) names history this replica does not have yet, holds: a
+	// normal restart and a brand-new name never do. Without it a rebuilt host
+	// chains its first rows onto an empty tail and forks its chain for good
+	// (corrosion/audit_hold.go). Rows held across a restart are in the spool and
+	// land first.
+	d.configureAuditHold(ctx)
+	// Whether this replica holds the cluster's history, decided once per
+	// state.db: an existing member is seeded at its first start on this build;
+	// a fresh replica becomes seeded at genesis or by an exchange with a seeded
+	// peer (corrosion/audit_seeded.go). AdmitHost vouches only when seeded.
+	if _, err := corrosion.DecideAuditSeeded(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Error("could not decide whether this replica is seeded; it is treated as NOT seeded and "+
+			"does not vouch for audit chain positions until an exchange with a seeded peer", "error", err)
+	}
+	go d.runAuditSeeded(ctx)
+
 	// Before anything that writes an audit row is built: every writer signs with
 	// the keyring this installs on d.db.
 	d.wireAuditKeyring(ctx)
+
+	// An operator's seeded assertion is audited here, signed, exactly once: not
+	// in DecideAuditSeeded, which runs before the keyring exists.
+	if err := corrosion.RecordAuditSeededAssertion(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Error("could not audit this replica's seeded assertion; retried at the next start",
+			"error", err)
+	}
+
+	// After the keyring: rows an earlier process left in the spool may land on
+	// the first poll, and landed before it they would be written unsigned
+	// (runAuditHold also waits for the wiring, whatever the order here).
+	go d.runAuditHold(ctx)
 
 	// Re-base THIS host's audit sub-chain at startup — but ONLY when it is
 	// still entirely unsigned.
@@ -368,7 +406,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	} else if signed {
 		slog.Debug("audit: chain is signed; skipping the legacy reseal", "host", d.cfg.HostName)
 		d.db.NoteAuditResealNotNeeded(d.cfg.HostName)
-	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); err != nil {
+	} else if n, err := corrosion.ResealAuditChain(ctx, d.db, d.cfg.HostName); errors.Is(err, corrosion.ErrAuditChainNotCaughtUp) {
+		// A rebuilt host whose history has not arrived: a reseal of a partial
+		// replica would rewrite rows its peers hold intact.
+		slog.Info("audit: skipping the legacy reseal while this host's audit history is still arriving",
+			"host", d.cfg.HostName)
+	} else if err != nil {
 		// Logged, not fatal. Until a reseal succeeds the legacy tail is not
 		// anchored (corrosion.ErrAuditAnchorWithheld): an anchor over the
 		// un-rebased tail would read as a truncation once it is rebased.
@@ -2225,6 +2268,12 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 
 	if err := corrosion.InsertUser(ctx, d.db, "admin", "admin", string(hash)); err != nil {
 		return fmt.Errorf("insert admin: %w", err)
+	}
+	// Genesis: this replica founded the cluster, so there is no earlier history
+	// it could lack (corrosion/audit_seeded.go).
+	if err := d.db.MarkAuditSeeded(ctx, "founded the cluster (genesis)"); err != nil {
+		slog.Warn("could not record the founder's replica as seeded; `lv host add` through this node "+
+			"is refused until it is", "error", err)
 	}
 
 	// The marker licenses exactly one mint, and that mint has now happened: the

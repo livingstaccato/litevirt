@@ -140,6 +140,14 @@ func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
 	}
 	l.mark("drill6: survivors %v, lost %v; recoverable VMs on the lost hosts %v", survivors, lost, lostKeys)
 
+	// The audit verdict before anything is destroyed. A rebuilt host re-added
+	// under its old name used to fork its own audit chain (seq 1, prev_hash "")
+	// and start its new key's contract at seq 0, and nothing here looked: every
+	// run passed while each one added findings `lv audit verify` reports for good.
+	auditBefore, auditErr := l.lv(q, "audit", "verify")
+	auditCleanBefore := auditErr == nil
+	l.saveEvidence("audit-verify-before.txt", auditBefore)
+
 	since := l.nodeNow(q)
 	s := l.startSampler()
 	waitAllAt(t, s, []string{key}, target)
@@ -244,6 +252,22 @@ func TestDrill6_ForceReconfigureAndRebuild(t *testing.T) {
 		t.Errorf("%s executing on %v after the restore, want exactly one host", key, hs)
 	}
 	assertNoDualRun(t, l, q, since, time.Now().Add(-returnWatch))
+
+	// Every node, the rebuilt ones included, still verifies the audit log as it
+	// did before. A lab whose log already carried findings cannot show this —
+	// signed rows are never repaired (docs/audit-log.md, "Rebuilding a host
+	// under its old name") — so it is only checked from a clean start.
+	for _, h := range l.hosts {
+		out, err := l.lv(h, "audit", "verify")
+		l.saveEvidence("audit-verify-after-"+h+".txt", out)
+		switch {
+		case auditCleanBefore && err != nil:
+			t.Errorf("%s: the audit log verified clean before the drill and does not after it:\n%s", h, out)
+		case !auditCleanBefore:
+			t.Logf("%s: the audit log already carried findings before the drill, so the rebuild's effect "+
+				"on it is not checked (see audit-verify-before.txt)", h)
+		}
+	}
 }
 
 // finish completes whatever part of the rebuild the drill did not reach.

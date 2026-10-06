@@ -2555,6 +2555,11 @@ message TableDigest {
 message StateDigestResponse {
     string host_name                = 1;
     repeated TableDigest tables     = 2;
+    // True when this node's replica is seeded — it holds the cluster's history
+    // (corrosion/audit_seeded.go) — and it is not holding its own audit rows. A
+    // peer that completes an exchange with it becomes seeded too. An older node
+    // sends nothing, which reads as not seeded.
+    bool audit_seeded               = 3;
 }
 
 // TriggerAntiEntropy kicks an immediate anti-entropy pass (rather than waiting for the
@@ -2842,6 +2847,27 @@ message AdmitHostRequest {
     string cert_serial = 3;
 }
 
+// AdmitHostResponse carries what the admitting node knows of the name's audit
+// chain: the last seq a host under this name wrote, and that row's content hash.
+// Both are zero for a name with no history. `lv host add` signs them with the
+// cluster CA and hands them to the new machine, whose daemon holds its own audit
+// rows until its replica has that row — so a host rebuilt under an old name
+// continues its chain instead of starting a second one. Replaces
+// google.protobuf.Empty, which is wire-compatible: an older daemon's empty
+// response reads as "no history", and an older CLI ignores the fields.
+message AdmitHostResponse {
+    int64 audit_tail_seq = 1;
+    string audit_tail_hash = 2;
+    // True when the answering daemon vouches for the position: its replica has
+    // caught up with a peer (or it founded a cluster it is alone in), it is not
+    // itself holding its own audit rows, and the name's tail is not below a CA
+    // retirement it knows of. A daemon that cannot vouch refuses instead, so
+    // false means a daemon too old to say — and `lv host add` then leaves any
+    // admission record already on the machine alone rather than remove it on a
+    // "no history" it cannot trust.
+    bool audit_position_proven = 3;
+}
+
 // ── Host network configuration (schema v48, §O Tier 1) ──
 // Declarative per-host interface intent, rendered by the OWNING host into the
 // single litevirt-managed netplan file behind a journaled apply-with-rollback.
@@ -2920,7 +2946,7 @@ service LiteVirt {
     rpc GetClusterHealth(GetClusterHealthRequest) returns (ClusterHealth);
     rpc GetFenceReadiness(google.protobuf.Empty)  returns (FenceReadiness);
     rpc RemoveHost(RemoveHostRequest)          returns (google.protobuf.Empty);
-    rpc AdmitHost(AdmitHostRequest)            returns (google.protobuf.Empty);
+    rpc AdmitHost(AdmitHostRequest)            returns (AdmitHostResponse);
     // Host network configuration (v48): intent CRUD runs anywhere (replicated
     // rows); Plan and Apply are forwarded to the OWNING host — they read and
     // mutate its local netplan state.

@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -42,6 +44,7 @@ const auditHeadInterval = 5 * time.Minute
 // its real replicated history and pin a boundary there permanently. See
 // finishAuditKeyLifecycle, called once replication is up.
 func (d *Daemon) wireAuditKeyring(ctx context.Context) {
+	defer d.markAuditKeyringWired()
 	if !d.cfg.Enforcement.AuditSignature {
 		// A non-signing node still needs the cluster CA: a keyring is what
 		// verifies a lifecycle record, so a node without one ignores every
@@ -146,13 +149,253 @@ const auditLifecycleSettle = 45 * time.Second
 // legitimately signed, or claim history written before the host ever committed,
 // and neither can be corrected afterwards. That is why this does not run at the
 // same point in startup as the keyring.
+//
+// The settle alone was not enough: a host rebuilt on an empty database had not
+// caught up 45 seconds in, and every adoption the lab recorded for one started
+// its contract at seq 0. So it also waits for this host's audit chain to have
+// arrived (corrosion.Client.AuditChainHeld) — the same condition its audit rows
+// are held on, and the one AdoptAuditKey refuses without.
 func (d *Daemon) finishAuditKeyLifecycle(ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
 	case <-time.After(auditLifecycleSettle):
 	}
+	if !d.awaitAuditChainCaughtUp(ctx) {
+		return
+	}
 	d.recordAuditKeyLifecycle(ctx)
+}
+
+// auditHoldPoll is how often a held audit chain is re-checked, and its held
+// rows landed, by runAuditHold.
+const auditHoldPoll = 2 * time.Second
+
+// auditHoldReport is how often a hold that has not opened is reported: an ERROR
+// line and the audit_chain_held health condition.
+const auditHoldReport = time.Minute
+
+// Health condition identity for a held audit chain. One writer per row: each
+// node about itself.
+const (
+	auditHoldEvaluator = "audit"
+	// CondAuditChainHeld is raised while this host holds its own audit rows.
+	CondAuditChainHeld = "audit_chain_held"
+)
+
+// configureAuditHold installs this host's audit hold from its admission record.
+func (d *Daemon) configureAuditHold(ctx context.Context) {
+	cfg, err := corrosion.ConfigureAuditHold(ctx, d.db, d.cfg.PKIDir, d.cfg.HostName,
+		filepath.Join(d.cfg.DataDir, corrosion.AuditHoldDirName))
+	if err != nil {
+		slog.Error("this host's audit admission record could not be used; its audit rows are not held, "+
+			"so if it was rebuilt under an old name its first rows may fork its chain",
+			"file", filepath.Join(d.cfg.PKIDir, corrosion.AuditRejoinFileName), "error", err)
+	}
+	if cfg.Target > 0 {
+		slog.Warn("this host was re-added under a name with audit history it does not hold yet; its audit "+
+			"rows are held until that history has arrived from its peers",
+			"host", d.cfg.HostName, "chain_reached_seq", cfg.Target)
+	}
+}
+
+// runAuditHold lands this host's held audit rows once its chain has arrived,
+// off every RPC's path, and until then reports the hold once a minute — at
+// ERROR, and as the audit_chain_held condition — so an operator sees a host
+// whose audit rows are not reaching the cluster. It never opens a hold whose
+// history has not arrived.
+func (d *Daemon) runAuditHold(ctx context.Context) {
+	// Nothing lands before the signing keyring is installed: a row landed
+	// before it is written unsigned after a signed history, which verify
+	// reports as unsigned-after-signed.
+	select {
+	case <-ctx.Done():
+		return
+	case <-d.auditKeyringWired():
+	}
+	var lastReport time.Time
+	raised := false
+	for {
+		held, err := d.db.LandHeldAudit(ctx, d.cfg.HostName)
+		if err != nil {
+			slog.Error("could not append this host's held audit rows; they stay held and are retried",
+				"error", err)
+		}
+		if !held {
+			if raised {
+				d.writeAuditHoldCondition(ctx, false, 0, "")
+			}
+			return
+		}
+		if time.Since(lastReport) >= auditHoldReport {
+			lastReport = time.Now()
+			_, count, why := d.db.AuditHoldStatus(ctx, d.cfg.HostName)
+			full := d.db.AuditHoldFull(d.cfg.HostName)
+			slog.Error("this host is holding its own audit rows: they are not in the cluster's audit log "+
+				"until its audit history has arrived from its peers",
+				"host", d.cfg.HostName, "held", count, "full", full, "waiting_for", why)
+			raised = d.writeAuditHoldCondition(ctx, true, count, why) || raised
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(auditHoldPoll):
+		}
+	}
+}
+
+// auditKeyringWired is closed once wireAuditKeyring has run.
+func (d *Daemon) auditKeyringWired() <-chan struct{} {
+	d.auditWiredOnce.Do(func() { d.auditWired = make(chan struct{}) })
+	return d.auditWired
+}
+
+func (d *Daemon) markAuditKeyringWired() {
+	d.auditKeyringWired()
+	d.auditWiredDone.Do(func() { close(d.auditWired) })
+}
+
+// writeAuditHoldCondition raises or resolves audit_chain_held about this host.
+// Reports whether the row was written.
+func (d *Daemon) writeAuditHoldCondition(ctx context.Context, open bool, count int, why string) bool {
+	severity := corrosion.SeverityWarning
+	if d.db.AuditHoldFull(d.cfg.HostName) {
+		severity = corrosion.SeverityCritical
+	}
+	return d.writeSelfCondition(ctx, CondAuditChainHeld, open, severity,
+		map[string]any{"held_rows": count, "waiting_for": why})
+}
+
+// writeSelfCondition raises (open) or resolves an audit health condition about
+// this host. One writer per row: each node about itself. Reports whether the row
+// was written.
+func (d *Daemon) writeSelfCondition(ctx context.Context, code string, open bool, severity string, evidence any) bool {
+	ts := time.Now().UTC().Format(time.RFC3339)
+	row, found, err := corrosion.GetHealthCondition(ctx, d.db, auditHoldEvaluator, code, "host", d.cfg.HostName)
+	if err != nil {
+		return false
+	}
+	if !open && (!found || row.Lifecycle == corrosion.ConditionResolved) {
+		return false
+	}
+	if !found || row.Lifecycle == corrosion.ConditionResolved {
+		row = corrosion.HealthCondition{
+			Evaluator: auditHoldEvaluator, Code: code,
+			SubjectKind: "host", SubjectID: d.cfg.HostName, FirstSeen: ts,
+		}
+	}
+	row.Hosts = []string{d.cfg.HostName}
+	row.LastSeen = ts
+	row.Reporter = d.cfg.HostName
+	if open {
+		row.Lifecycle = corrosion.ConditionConfirmed
+		if row.ConfirmedAt == "" {
+			row.ConfirmedAt = ts
+		}
+		row.Severity = severity
+		row.ObserveCount++
+		row.CleanCount = 0
+		row.ResolvedAt = ""
+		ev, _ := json.Marshal(evidence)
+		row.Evidence = string(ev)
+	} else {
+		row.Lifecycle = corrosion.ConditionResolved
+		row.ResolvedAt = ts
+		row.ObserveCount = 0
+		row.CleanCount = 1
+	}
+	if err := corrosion.UpsertHealthCondition(ctx, d.db, row); err != nil {
+		slog.Warn("could not record an audit health condition", "code", code, "error", err)
+		return false
+	}
+	return true
+}
+
+// CondAuditNotSeeded is raised by a node about itself while its replica is not
+// seeded (corrosion/audit_seeded.go): `lv host add` through it is refused.
+const CondAuditNotSeeded = "audit_not_seeded"
+
+// auditSeededPoll is how often runAuditSeeded re-checks.
+const auditSeededPoll = 30 * time.Second
+
+// runAuditSeeded shows, in `lv health`, every node whose replica is not seeded,
+// so an operator can see which nodes `lv host add` may be run against. Info for
+// the ordinary case (a fresh joiner that has not yet exchanged with a seeded
+// peer, which clears by itself); warning, with an ERROR line at most once a
+// minute, when the marker cannot be used or written — the replica is then not
+// seeded until the marker is fixed (it fails closed), and a decision that could
+// not be written is retried here. The condition row is written only when what it
+// says changes. Resolved, and the loop ends, once seeded.
+func (d *Daemon) runAuditSeeded(ctx context.Context) {
+	var st auditSeededReport
+	for {
+		if d.reportAuditSeeded(ctx, &st) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(auditSeededPoll):
+		}
+	}
+}
+
+// auditSeededReport is what runAuditSeeded last reported.
+type auditSeededReport struct {
+	written     bool   // a raise has been written in this process
+	key         string // severity and problem of that raise
+	lastErrorAt time.Time
+}
+
+// auditSeededErrorEvery bounds the ERROR line about an unusable marker.
+const auditSeededErrorEvery = time.Minute
+
+// reportAuditSeeded is one pass of runAuditSeeded. It reports whether the
+// replica is seeded.
+func (d *Daemon) reportAuditSeeded(ctx context.Context, st *auditSeededReport) bool {
+	if err := d.db.RetryAuditSeededDecision(ctx); err != nil {
+		slog.Debug("the seeded decision still cannot be written", "error", err)
+	}
+	if d.db.AuditSeeded(ctx) {
+		d.writeSelfCondition(ctx, CondAuditNotSeeded, false, "", nil)
+		return true
+	}
+	severity := corrosion.SeverityInfo
+	problem := d.db.AuditSeededProblem(ctx)
+	if problem != "" {
+		severity = corrosion.SeverityWarning
+		if time.Since(st.lastErrorAt) >= auditSeededErrorEvery {
+			st.lastErrorAt = time.Now()
+			slog.Error("this replica's seeded marker cannot be used or written; it is treated as not "+
+				"seeded, and `lv host add` through this node is refused", "problem", problem,
+				"file", filepath.Join(d.cfg.DataDir, corrosion.AuditSeededFileName))
+		}
+	}
+	key := severity + "\x00" + problem
+	if st.written && st.key == key {
+		return false
+	}
+	if d.writeSelfCondition(ctx, CondAuditNotSeeded, true, severity, map[string]any{
+		"problem": problem,
+		"becomes_seeded": "by completing an anti-entropy exchange with a seeded node on this build " +
+			"that is not holding its own audit rows",
+	}) {
+		st.written, st.key = true, key
+	}
+	return false
+}
+
+// awaitAuditChainCaughtUp blocks until this host's audit rows are no longer
+// held (runAuditHold lands them). False when ctx ends first.
+func (d *Daemon) awaitAuditChainCaughtUp(ctx context.Context) bool {
+	for d.db.AuditChainHeld(ctx, d.cfg.HostName) {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(auditHoldPoll):
+		}
+	}
+	return true
 }
 
 // recordAuditKeyLifecycle is finishAuditKeyLifecycle without the settle wait, and
@@ -453,7 +696,11 @@ func (d *Daemon) runAuditChainVerify(ctx context.Context) {
 				"bad_signature", len(res.BadSignature), "unknown_key", len(res.UnknownKeyID),
 				"seq_gaps", len(res.SeqGaps), "laundered", len(res.Laundered),
 				"retired_key_use", res.RetiredKeyUse, "head_mismatch", res.HeadMismatch,
-				"truncated_hosts", res.TruncatedHosts)
+				"truncated_hosts", res.TruncatedHosts,
+				// Without it, a verdict resting only on unsigned-after-signed rows
+				// logged broken_at="" with every listed count at 0.
+				"unsigned_after_signed", len(res.UnsignedAfterSigned),
+				"never_adopted", len(res.NeverAdopted), "ambiguous", len(res.Ambiguous))
 		}
 		if res.Unverified() {
 			// Warn, not Error: part of the log went unchecked, which is serious but

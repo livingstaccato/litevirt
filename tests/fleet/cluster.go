@@ -638,6 +638,9 @@ func (c *Cluster) openDB(n *Node, shared bool) {
 	// refused by the stale-replica gate (grpcapi/replica_gate.go). A scenario
 	// modelling a rejoin calls n.DB.MarkReplicaStale itself.
 	db.MarkReplicaCaughtUpForTests("fleet-bootstrap")
+	// Bootstrapped together as members holding the cluster's history, which a
+	// real daemon is by genesis or by its first start on this build.
+	db.MarkAuditSeededForTests()
 	n.DB = db
 }
 

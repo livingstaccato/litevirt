@@ -298,6 +298,10 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 	if err != nil || vm == nil {
 		return nil, status.Errorf(codes.NotFound, "VM %q not found", req.VmName)
 	}
+	// A revert can bring the domain back running with its installer ISO.
+	if err := s.verifyVMISOForStart(vm); err != nil {
+		return nil, err
+	}
 	if err := s.RequirePerm(ctx, vmRBACPath(vm), "snapshot.restore", "operator"); err != nil {
 		return nil, err
 	}

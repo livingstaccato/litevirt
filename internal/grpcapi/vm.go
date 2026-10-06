@@ -858,6 +858,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
 
+	// The ISO was judged before admission; an image pull can run in between,
+	// and qemu opens it at this boot, so it is judged again now.
+	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		return nil, err
+	}
+
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
 		claims.releaseAll(ctx)
@@ -1570,6 +1578,12 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
 	}
 
+	// qemu reopens the installer ISO at every start, so it is judged again
+	// here, on the host that starts it — every start path runs this hook.
+	if err := s.verifyVMISOForStart(vm); err != nil {
+		return releasePreflight, err
+	}
+
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active
 	// hardware_v2 regime — this covers ALL start callers (StartVM, RestartVM, restore/
 	// autostart, the health reconciler/checker, promote, the resource coordinator).
@@ -1607,11 +1621,6 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 // never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
 // coordinator's restart path) call it directly under one lock.
 func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
-	// A VM created before installer ISOs were gated may carry a protected host
-	// file as its CD-ROM; it does not start again (refuseStoredISOAtStart).
-	if err := s.refuseStoredISOAtStart(vm); err != nil {
-		return nil, err
-	}
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.

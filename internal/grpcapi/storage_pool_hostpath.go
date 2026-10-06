@@ -125,37 +125,47 @@ func storedVolumeIs(stored *compose.File, name string, vol compose.VolumeDef) bo
 // attempt is refused and logged so the operator finds out and recreates the
 // pool somewhere allowed. Nothing is deleted or rewritten on their behalf.
 func (s *Server) checkPoolForWrite(ctx context.Context, name string, ref StoragePoolRef) error {
-	cfg := storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}
-	cerr := storage.CheckConfig(cfg, s.dataDir, s.pkiDir)
-	dir := ""
-	if cerr == nil && isFileBasedDriver(ref.Driver) {
-		if d, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
-			dir = d
-			cerr = storage.CheckWriteRoot(d, s.dataDir, s.pkiDir)
-		}
-	}
-	// A directory another pool also uses is neither pool's own.
-	if cerr == nil && dir != "" {
-		other, err := s.poolDirSharedWith(ctx, name, dir)
-		switch {
-		case err != nil:
-			cerr = fmt.Errorf("check for a shared directory: %w", err)
-		case other != "":
-			cerr = fmt.Errorf("its directory %s is also pool %q's", dir, other)
-		}
-	}
-	// An NFS export mounted without nosuid,nodev,noexec,nosymfollow (by hand,
-	// or by an earlier build) is not used until litevirt mounts it again.
-	if cerr == nil {
-		cerr = storage.CheckNFSMountHardened(s.dataDir, cfg)
-	}
+	cerr, detail := s.poolRefusal(ctx, name, ref)
 	if cerr == nil {
 		return nil
 	}
 	slog.Error("storage pool refused: recreate the pool",
-		"pool", name, "host", s.hostName, "driver", ref.Driver, "dir", dir, "reason", cerr)
+		"pool", name, "host", s.hostName, "driver", ref.Driver, "reason", cerr, "detail", detail)
 	return status.Errorf(codes.FailedPrecondition,
 		"pool %q is refused (%v): nothing lists, reads or writes it — recreate the pool", name, cerr)
+}
+
+// poolRefusal is the one predicate behind checkPoolForWrite and
+// poolUsableForWrite: why the pool may not be used, or nil. The error is safe
+// to show any caller of the pool; detail (another pool's name, its directory)
+// is for the log only — the other pool may be another project's.
+func (s *Server) poolRefusal(ctx context.Context, name string, ref StoragePoolRef) (error, string) {
+	cfg := storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}
+	if err := storage.CheckConfig(cfg, s.dataDir, s.pkiDir); err != nil {
+		return err, ""
+	}
+	if isFileBasedDriver(ref.Driver) {
+		if d, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
+			if err := storage.CheckWriteRoot(d, s.dataDir, s.pkiDir); err != nil {
+				return err, ""
+			}
+		}
+	}
+	// A directory another pool also uses — the same one, an alias, one inside
+	// the other, or the same NFS export — is neither pool's own.
+	other, why, err := s.poolSharedWith(ctx, name, ref)
+	if err != nil {
+		return fmt.Errorf("check for a shared directory: %w", err), ""
+	}
+	if other != "" {
+		return fmt.Errorf("its directory overlaps another pool's (%s)", why), fmt.Sprintf("other pool %q", other)
+	}
+	// An NFS export mounted without nosuid,nodev,noexec,nosymfollow (by hand,
+	// or by an earlier build) is not used until litevirt mounts it again.
+	if err := storage.CheckNFSMountHardened(s.dataDir, cfg); err != nil {
+		return err, ""
+	}
+	return nil, ""
 }
 
 // poolDirForWrite is fileBasedPoolDir for a write: checkPoolForWrite first,
@@ -187,17 +197,12 @@ func (s *Server) poolWriteDir(ctx context.Context, rec corrosion.StoragePoolReco
 	return s.poolDirForWrite(ctx, rec.Name, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options})
 }
 
-// poolUsableForWrite reports, without logging, whether writes into the pool
-// are allowed — for code that enumerates roots rather than acting on one.
-func (s *Server) poolUsableForWrite(ref StoragePoolRef) bool {
-	cfg := storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}
-	if storage.CheckConfig(cfg, s.dataDir, s.pkiDir) != nil {
-		return false
-	}
-	if dir, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
-		return storage.CheckWriteRoot(dir, s.dataDir, s.pkiDir) == nil
-	}
-	return true
+// poolUsableForWrite is checkPoolForWrite without the log, for code that
+// enumerates roots (the migration helpers' artifact roots, the scratch sweep)
+// rather than acting on one pool. One predicate, not two.
+func (s *Server) poolUsableForWrite(ctx context.Context, name string, ref StoragePoolRef) bool {
+	err, _ := s.poolRefusal(ctx, name, ref)
+	return err == nil
 }
 
 // poolUploadExts are the file types a pool holds: disk images, installer ISOs,
@@ -307,23 +312,42 @@ func dirEntriesSample(dir string, n int) []string {
 	return out
 }
 
-// poolDirSharedWith returns the name of another live pool row on this host
-// whose directory is dir ("" when none). A shared directory is no pool's own:
-// what is in it may belong to the other pool's project.
-func (s *Server) poolDirSharedWith(ctx context.Context, name, dir string) (string, error) {
+// poolSharedWith returns the name of another live pool row on this host that
+// shares ref's storage, and how: the same directory, an alias of it, one
+// inside the other, or the same NFS export mounted elsewhere ("" when none).
+func (s *Server) poolSharedWith(ctx context.Context, name string, ref StoragePoolRef) (string, string, error) {
 	rows, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	want := filepath.Clean(dir)
+	isNFS := strings.EqualFold(ref.Driver, "nfs")
+	dir := ""
+	if isFileBasedDriver(ref.Driver) {
+		dir, _ = fileBasedPoolDir(s.dataDir, ref)
+	}
 	for _, r := range rows {
-		if r.Name == name || !isFileBasedDriver(r.Driver) {
+		if r.Name == name {
+			continue
+		}
+		if isNFS && strings.EqualFold(r.Driver, "nfs") && storage.NFSExportKey(r.Source) == storage.NFSExportKey(ref.Source) {
+			return r.Name, "the same NFS export", nil
+		}
+		if dir == "" || !isFileBasedDriver(r.Driver) {
 			continue
 		}
 		d, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target})
-		if err == nil && filepath.Clean(d) == want {
-			return r.Name, nil
+		if err == nil && storage.DirsOverlap(dir, d) {
+			return r.Name, "the same directory, an alias of it, or one inside the other", nil
 		}
 	}
-	return "", nil
+	return "", "", nil
+}
+
+// dirEntryCount is how many entries dir holds (0 when it does not exist).
+func dirEntryCount(dir string) int {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	return len(ents)
 }

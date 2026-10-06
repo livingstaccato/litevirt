@@ -119,24 +119,26 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		// A directory left by an earlier pool of this name (in any project)
 		// is not handed to this one with its files in it.
 		if !(found && existing.Target == req.Target) {
-			if left := dirEntriesSample(req.Target, 5); len(left) > 0 {
+			// The count, never the names: they may be another project's.
+			if n := dirEntryCount(req.Target); n > 0 {
+				slog.Error("storage pool create refused: its directory holds an earlier pool's files",
+					"pool", req.Name, "dir", req.Target, "files", dirEntriesSample(req.Target, 20))
 				return nil, status.Errorf(codes.FailedPrecondition,
-					"pool %q: %s already holds files from an earlier pool (%s); an admin must remove them first",
-					req.Name, req.Target, strings.Join(left, ", "))
+					"pool %q: its directory already holds %d file(s) from an earlier pool of that name; an admin must remove them first",
+					req.Name, n)
 			}
 		}
 	}
-	// Every pool has a directory of its own: never one another pool uses.
-	if isFileBasedDriver(req.Driver) {
-		if dir, derr := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target}); derr == nil {
-			other, err := s.poolDirSharedWith(ctx, req.Name, dir)
-			if err != nil {
-				return nil, status.Errorf(codes.Internal, "check for a shared directory: %v", err)
-			}
-			if other != "" {
-				return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already pool %q's directory; every pool needs its own", req.Name, dir, other)
-			}
-		}
+	// Every pool has storage of its own: never a directory (or an alias of
+	// one, or one inside or around one) or an NFS export another pool uses.
+	// The other pool is not named: it may be another project's.
+	other, why, err := s.poolSharedWith(ctx, req.Name, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target})
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "check for a shared directory: %v", err)
+	}
+	if other != "" {
+		slog.Error("storage pool create refused: storage shared with another pool", "pool", req.Name, "other", other, "how", why)
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); every pool needs its own", req.Name, req.Target, why)
 	}
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,

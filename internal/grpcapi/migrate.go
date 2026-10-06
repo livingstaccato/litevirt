@@ -64,13 +64,13 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 		return true
 	}
 	s.storagePoolsMu.RLock()
-	pools := make([]StoragePoolRef, 0, len(s.storagePools))
-	for _, pr := range s.storagePools {
-		pools = append(pools, pr)
+	pools := make(map[string]StoragePoolRef, len(s.storagePools))
+	for n, pr := range s.storagePools {
+		pools[n] = pr
 	}
 	s.storagePoolsMu.RUnlock()
-	for _, pr := range pools {
-		if !isFileBasedDriver(pr.Driver) || !s.poolUsableForWrite(pr) {
+	for n, pr := range pools {
+		if !isFileBasedDriver(pr.Driver) || !s.poolUsableForWrite(context.Background(), n, pr) {
 			continue
 		}
 		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {

@@ -495,6 +495,10 @@ func (s *Server) poolContentNames(ctx context.Context, pool, host string) []stri
 		if !ok {
 			return nil
 		}
+		// A refused pool's directory is not listed, here or anywhere.
+		if !s.poolUsableForWrite(ctx, pool, poolRef) {
+			return nil
+		}
 		dir, err := fileBasedPoolDir(s.dataDir, poolRef)
 		if err != nil {
 			return nil

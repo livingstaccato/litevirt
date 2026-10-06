@@ -133,7 +133,8 @@ binding can:
 - **Host filesystem paths in storage** (`storage.hostpath`) are checked at `/`.
   A pool or compose volume that names a directory or file on the host (a `dir`
   pool, a `--target`, a btrfs source, NFS mount options, a Ceph conf or
-  keyring), any network-backed pool (`nfs`, `ceph`, `iscsi`), a compose
+  keyring), any network-backed pool (`nfs`, `ceph`, `iscsi`), any pool on
+  host block storage (`zfs`, `lvm-thin`), a compose
   `backup-repos:` path, and a custom absolute `repo_path` or `target_path` on
   a backup or restore RPC all need it, because the daemon reads and writes
   there as root. Only `Admin` holds it (through `*`): `Operator` holds

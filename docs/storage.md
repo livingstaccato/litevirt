@@ -82,9 +82,11 @@ does an `Admin` binding scoped to a project. What counts as a host path:
 | `ceph` | always (the cluster is remote storage), plus `--option conf=…` and `--option keyring=…` |
 | `iscsi` | always (the target's server decides what block devices appear) |
 | `btrfs` | `--source` |
+| `zfs` | always: the dataset is host storage (naming the host's root pool would let a pool fill it) |
+| `lvm-thin` | always: the volume group and thin pool are host storage |
 
-`zfs`, `lvm-thin` and a `local` pool with no target name no host path, so an
-operator with `storage.pool.write` on the pool's path may still create them.
+Only a `local` pool with no target names no host path, so it is the one pool an
+operator with `storage.pool.write` on the pool's path may create.
 
 Every source is checked against its driver's form before any tool sees it —
 `server:/export` for nfs, a pool, dataset or volume-group name for ceph, zfs
@@ -135,10 +137,14 @@ built-in `default` pool included — gets `<data_dir>/pools/<name>`, never
 Deleting the pool removes that directory, and is refused while it still holds
 files (the error names them). Creating a pool whose `<data_dir>/pools/<name>`
 already holds files left by an earlier pool is refused until an admin removes
-them. A pool is never created on a directory another pool on the host already
-uses, and a pool row that shares its directory with another, or sits on
-`<data_dir>/disks`, is refused for everything — listing included — with
-`FailedPrecondition` saying to recreate it.
+them; the error says how many files, not their names. A pool is never created
+on storage another pool on the host already uses — the same directory, a
+symlink alias of it, a directory inside it or containing it, or the same NFS
+export mounted elsewhere — and the roots `<data_dir>/pools` and
+`<data_dir>/mounts` are not pools. A pool row that shares its storage with
+another, or sits on `<data_dir>/disks`, is refused for everything — listing
+included — with `FailedPrecondition` saying to recreate it; the error does not
+name the other pool, which may be another project's.
 
 Content operations never reach a file a live VM disk uses: a listing leaves
 out files a live disk of another pool uses, and a content delete refuses any

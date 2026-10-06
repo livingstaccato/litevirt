@@ -24,6 +24,10 @@ type HostPaths struct {
 	// MountOptions is set when the config passes its own NFS mount options,
 	// which reach mount(8) verbatim.
 	MountOptions bool
+	// HostStorage names host block storage a pool allocates from: a zfs
+	// dataset, or an LVM volume group and thin pool. Naming the host's root
+	// pool or another tenant's VG lets a pool exhaust it.
+	HostStorage string
 	// Network names the remote storage a network-backed pool (nfs, ceph,
 	// iscsi) attaches. Its server, not the request, decides what the daemon
 	// then finds there — files, symlinks, block devices — and the daemon
@@ -34,7 +38,7 @@ type HostPaths struct {
 
 // Any reports whether the configuration names anything on the host.
 func (h HostPaths) Any() bool {
-	return len(h.WriteRoots) > 0 || len(h.ReadPaths) > 0 || h.MountOptions || h.Network != ""
+	return len(h.WriteRoots) > 0 || len(h.ReadPaths) > 0 || h.MountOptions || h.Network != "" || h.HostStorage != ""
 }
 
 // Describe names what was found, for an operator-facing refusal.
@@ -48,6 +52,9 @@ func (h HostPaths) Describe() string {
 	}
 	if h.MountOptions {
 		parts = append(parts, "custom NFS mount options")
+	}
+	if h.HostStorage != "" {
+		parts = append(parts, fmt.Sprintf("host storage %q", h.HostStorage))
 	}
 	if h.Network != "" {
 		parts = append(parts, fmt.Sprintf("network storage %q, whose server controls what the daemon reads and writes", h.Network))
@@ -81,6 +88,10 @@ func HostPathsOf(cfg Config) HostPaths {
 		h.Network = cfg.Source
 	case "btrfs":
 		h.WriteRoots = append(h.WriteRoots, cfg.Source)
+	case "zfs":
+		h.HostStorage = cfg.Source
+	case "lvm-thin", "lvmthin":
+		h.HostStorage = cfg.Source + "/" + cfg.Options["thinpool"]
 	case "ceph":
 		h.Network = cfg.Source
 		for _, k := range []string{"conf", "keyring"} {
@@ -237,13 +248,39 @@ func within(dir, path string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
+// inPoolArea reports whether p is strictly inside one of the data directory's
+// pool areas. An area's root is not a pool: it contains every pool there.
 func inPoolArea(dataDir, p string) bool {
 	for _, a := range dataDirPoolAreas {
-		if within(filepath.Join(dataDir, a), p) {
+		area := filepath.Join(dataDir, a)
+		if within(area, p) && filepath.Clean(p) != filepath.Clean(area) {
 			return true
 		}
 	}
 	return false
+}
+
+// DirsOverlap reports whether two directories are the same, or one is inside
+// the other, judged both as written and after resolving symlinks.
+func DirsOverlap(a, b string) bool {
+	for _, x := range pathForms(a) {
+		for _, y := range pathForms(b) {
+			if within(x, y) || within(y, x) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// NFSExportKey is an NFS source in canonical form (lower-cased server, cleaned
+// export path), so one export written two ways is recognised as one.
+func NFSExportKey(source string) string {
+	host, p, ok := strings.Cut(source, ":")
+	if !ok {
+		return source
+	}
+	return strings.ToLower(host) + ":" + filepath.Clean(p)
 }
 
 func underLitevirtVarLib(p string) bool {

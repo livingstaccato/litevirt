@@ -485,6 +485,10 @@ lv pool delete <name>
 `lv pool create` runs the driver's Prepare() hook (mount NFS, log into
 iSCSI, …) before persisting. See `docs/storage.md` for driver details.
 
+A `.iso` file in a file-based pool can be a VM's installer ISO (`VMSpec.iso`)
+for anyone who may read the pool's contents; any other host path as an ISO needs
+`storage.hostpath` at `/` (Admin). See `docs/storage.md`, "Installer ISOs".
+
 ## Volumes
 
 ```bash

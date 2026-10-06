@@ -63,6 +63,38 @@ best-effort basis but failure does not block the delete — operators
 who hit "rm" likely want the pool gone regardless. The underlying
 mount, if any, stays until manually cleaned up.
 
+## Installer ISOs
+
+A VM's installer ISO (`VMSpec.iso`, the **Installer ISO** field of the UI's
+create form) is a file on the target host that the guest reads as a CD-ROM.
+Naming one is reading that file, so it is gated like any other host path:
+
+- **A pool ISO** — a plain `.iso` file (no leading dot) directly in a
+  file-based pool's directory on the target host, which is what the content
+  browser lists and uploads. The caller needs `storage.content.read` on the
+  pool, and the VM's project must be allowed to use it (a global pool, or one
+  the project owns). A symlink in the pool directory is never pool content.
+- **Any other host path** needs `storage.hostpath` at `/`, which only the Admin
+  role holds. Upload the ISO to a pool instead.
+
+Some files are refused to everyone, Admin included, judged as written and after
+resolving symlinks: the PKI directory, anything in the data directory outside
+`disks/` and `mounts/` (`state.db`, `cloudinit/`, `nvram/`, …), and anything
+under `/boot`, `/dev`, `/etc`, `/proc`, `/root`, `/run`, `/sys`, `/var/run`,
+`/var/spool`, `/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. The path
+must be absolute and clean (no `.` or `..`), and must name a regular file that
+exists on the target host. `/usr` is allowed (`virtio-win` installs there).
+
+The entry node checks authority before forwarding; the owning host checks the
+file against its own filesystem. An entry node on an older build forwards
+without the authority check, as with the other content checks in
+[auth.md](auth.md).
+
+A VM created before this check whose stored ISO is one of the refused files no
+longer starts: the start fails with `FailedPrecondition` and an ERROR log
+naming the VM and the file. Nothing is rewritten; recreate the VM without that
+ISO or with a pool ISO. A VM with any other ISO starts as before.
+
 ## Compose example
 
 ```yaml

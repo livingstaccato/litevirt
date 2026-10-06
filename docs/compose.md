@@ -157,7 +157,7 @@ page.
 vms:
   <name>:
     image: "ubuntu"           # Base image name (required unless iso is set)
-    iso: "/path/to/boot.iso"  # Boot from ISO instead of image
+    iso: "debian-12-netinst"  # Image-store name to boot from as a CD-ROM instead of image; not a host path
     kind: "vm"                # vm (default) | lxc | oci — see "Workloads" below
     cpu: 2                    # vCPUs (default 2)
     max-cpu: 8                # vCPU hotplug ceiling (> cpu); with live_resize, cpu grows live up to it

@@ -400,4 +400,5 @@ func (c *Client) ResetAuditSeededForTests() {
 	s.loaded, s.decided, s.seeded, s.problem = false, false, false, ""
 	s.asserted, s.assertionAudited, s.assertedAt = false, false, ""
 	s.unpersisted, s.pendingSeeded, s.pendingReason = false, false, ""
+	s.assertNonce = ""
 }

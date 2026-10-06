@@ -1468,8 +1468,10 @@ a node on an older build cannot seed one. With `problem` set, fix or remove the
 marker file and restart; while the marker cannot be written, the node also
 holds its own audit rows (`audit_chain_held`). If no node in the cluster is
 seeded, see "No seeded node" in
-[audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name). The condition
-row is rewritten only when what it says changes.
+[audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name): root asserts
+with the `assert_nonce` in the node's marker, which neither this condition, the
+log, nor any RPC shows, and which a marker with `problem` set does not have. The
+condition row is rewritten only when what it says changes.
 
 ### Observer stalled (`observer_stalled`)
 

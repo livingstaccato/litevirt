@@ -2,7 +2,9 @@ package corrosion
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -68,6 +70,21 @@ type auditSeededMarker struct {
 	Asserted         bool   `json:"asserted,omitempty"`
 	AssertedAt       string `json:"asserted_at,omitempty"`
 	AssertionAudited bool   `json:"assertion_audited,omitempty"`
+	// AssertNonce is the secret an operator's assertion must contain
+	// (AuditSeededAssertFileName): 256 random bits, minted with the marker and
+	// again after each assertion is applied. It exists only in this 0600 file —
+	// never in state.db, never replicated, never in an RPC response or a log
+	// line — so reading it takes root's (or the daemon's) access to data_dir.
+	AssertNonce string `json:"assert_nonce,omitempty"`
+}
+
+// newAuditAssertNonce mints an assert nonce.
+func newAuditAssertNonce() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("mint the seeded assertion nonce: %w", err)
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // auditSeededState is a client's view of its marker. A client with no data dir
@@ -83,6 +100,9 @@ type auditSeededState struct {
 
 	asserted, assertionAudited bool
 	assertedAt                 string
+	// assertNonce is the marker's AssertNonce; "" when there is no usable
+	// marker for this state.db, and then no assertion is honoured.
+	assertNonce string
 
 	// unpersisted: a decision was taken and could not be written. Until it is
 	// (RetryAuditSeededDecision), the replica is not seeded AND this host's own
@@ -146,6 +166,26 @@ func (c *Client) loadAuditSeededLocked(ctx context.Context) {
 	}
 	c.seeded.decided, c.seeded.seeded = true, m.Seeded
 	c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited = m.Asserted, m.AssertedAt, m.AssertionAudited
+	c.seeded.assertNonce = m.AssertNonce
+	if m.AssertNonce == "" {
+		// A marker from the build before the nonce: add one, keeping the
+		// decision exactly as recorded. Failing here costs only the ability to
+		// assert until a later write succeeds; the decision itself stands.
+		n, err := newAuditAssertNonce()
+		if err == nil {
+			m.AssertNonce = n
+			var data []byte
+			if data, err = json.Marshal(m); err == nil {
+				err = secretfile.Write(path, data, 0o600)
+			}
+		}
+		if err != nil {
+			slog.Warn("could not add an assertion nonce to this replica's seeded marker; an operator's "+
+				"seeded assertion is not honoured until it is written", "file", path, "error", err)
+			return
+		}
+		c.seeded.assertNonce = m.AssertNonce
+	}
 }
 
 // writeAuditSeededLocked persists a decision and adopts it only once it is
@@ -157,14 +197,21 @@ func (c *Client) writeAuditSeededLocked(ctx context.Context, seeded bool, reason
 		c.seeded.decided, c.seeded.seeded, c.seeded.problem, c.seeded.unpersisted = true, seeded, "", false
 		return nil
 	}
+	nonce := c.seeded.assertNonce
 	err := func() error {
 		inc, err := c.VoterIncarnation(ctx)
 		if err != nil {
 			return err
 		}
+		if nonce == "" {
+			if nonce, err = newAuditAssertNonce(); err != nil {
+				return err
+			}
+		}
 		data, err := json.Marshal(auditSeededMarker{Incarnation: inc, Seeded: seeded, Reason: reason,
 			At: time.Now().UTC().Format(time.RFC3339), Asserted: c.seeded.asserted,
-			AssertedAt: c.seeded.assertedAt, AssertionAudited: c.seeded.assertionAudited})
+			AssertedAt: c.seeded.assertedAt, AssertionAudited: c.seeded.assertionAudited,
+			AssertNonce: nonce})
 		if err != nil {
 			return err
 		}
@@ -177,6 +224,7 @@ func (c *Client) writeAuditSeededLocked(ctx context.Context, seeded bool, reason
 		return err
 	}
 	c.seeded.decided, c.seeded.seeded, c.seeded.problem, c.seeded.unpersisted = true, seeded, "", false
+	c.seeded.assertNonce = nonce
 	return nil
 }
 
@@ -265,8 +313,8 @@ func DecideAuditSeeded(ctx context.Context, c *Client, host string) (bool, error
 // AuditSeededAssertFileName is the operator's way out of a cluster with no
 // seeded replica at all — a single-node cluster whose founder lost its
 // state.db, or a total loss — where `lv host add` is otherwise refused
-// forever. Root writes this state.db's voter incarnation into it and restarts
-// the daemon; the next start records this replica as seeded, on the operator's
+// forever. Root copies the "assert_nonce" field of the seeded marker
+// (AuditSeededFileName) into it and restarts the daemon; the next start records this replica as seeded, on the operator's
 // word, writes a signed audit.seeded_asserted row once the keyring is wired
 // (RecordAuditSeededAssertion), and removes the file. If this replica does NOT
 // hold the cluster's history, an admission it then vouches for can let a
@@ -274,11 +322,16 @@ func DecideAuditSeeded(ctx context.Context, c *Client, host string) (bool, error
 // that on.
 //
 // The content requirement is the defence against anyone able to put a file in
-// data_dir without being root on the node. The incarnation is node-local and
-// never replicated, and root reads it from the marker (the "incarnation" field
-// of AuditSeededFileName) or from state.db's local_voter_incarnation table. It
-// also binds the assertion to one state.db, so a file left behind is not
-// applied to the next one.
+// data_dir without being root on the node — an operator with a storage pool
+// aimed at it, for one. The nonce is the only value that works: it exists only
+// in the 0600 marker, is never replicated, and no RPC, log line or audit row
+// carries it. (The voter incarnation, which an earlier build checked for
+// instead, is NOT secret: GetRecoveryClaim returns it to an operator, the
+// replicated voter_configs rows carry every voter's, and GetVoterConfig and
+// InspectRecoveryClaim show it to a viewer.) The marker is bound to this
+// state.db's incarnation and the nonce to the marker, so a replaced state.db
+// gets a new nonce and a file left behind for the old one is not applied; the
+// nonce is replaced once an assertion is applied, too.
 const AuditSeededAssertFileName = "audit-seeded-assert"
 
 // consumeAuditSeededAssertion applies an operator's assertion, if a valid one
@@ -297,24 +350,27 @@ func (c *Client) consumeAuditSeededAssertion(ctx context.Context) (seeded, done 
 	}
 	removeIt := func() {
 		if err := os.Remove(assert); err != nil {
-			slog.Warn("could not remove the seeded assertion; it is not applied again, since it names this "+
-				"state.db's incarnation and this replica has recorded it", "file", assert, "error", err)
+			slog.Warn("could not remove the seeded assertion; it is not applied again: this replica "+
+				"has recorded it, and replaced the nonce it names", "file", assert, "error", err)
 		}
 	}
-	inc, ierr := c.VoterIncarnation(ctx)
 	var content []byte
 	if fi.Mode().IsRegular() && fi.Size() <= 256 {
 		content, _ = os.ReadFile(assert)
 	}
-	if ierr != nil || len(content) == 0 || strings.TrimSpace(string(content)) != inc {
-		slog.Error("a seeded assertion is present but does not name this state.db's voter incarnation; "+
-			"it is IGNORED. To assert, write the incarnation (the \"incarnation\" field of the seeded "+
-			"marker, or local_voter_incarnation in state.db) into it", "file", assert,
+	c.seeded.mu.Lock()
+	c.loadAuditSeededLocked(ctx)
+	nonce := c.seeded.assertNonce
+	got := strings.TrimSpace(string(content))
+	if nonce == "" || subtle.ConstantTimeCompare([]byte(got), []byte(nonce)) != 1 {
+		c.seeded.mu.Unlock()
+		// Neither value is logged: the nonce is the secret.
+		slog.Error("a seeded assertion is present but does not contain this replica's assert nonce; "+
+			"it is IGNORED. To assert, copy the \"assert_nonce\" field of the seeded marker into it "+
+			"(a marker that is missing or unusable has none)", "file", assert,
 			"marker", filepath.Join(c.dataDir, AuditSeededFileName))
 		return false, false, nil
 	}
-	c.seeded.mu.Lock()
-	c.loadAuditSeededLocked(ctx)
 	if c.seeded.asserted {
 		// Applied already, and the file outlived its removal: not again.
 		c.seeded.mu.Unlock()
@@ -323,12 +379,14 @@ func (c *Client) consumeAuditSeededAssertion(ctx context.Context) (seeded, done 
 	}
 	prevAsserted, prevAt, prevAudited := c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited
 	c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited = true, time.Now().UTC().Format(time.RFC3339Nano), false
+	c.seeded.assertNonce = "" // used: the write below mints its successor
 	werr := c.writeAuditSeededLocked(ctx, true, "operator asserted ("+AuditSeededAssertFileName+")")
 	if werr != nil {
 		// Not applied: the file stays, and the next start applies it. Nothing is
 		// left pending — a retry would persist "seeded" without the assertion
 		// that must be audited with it.
 		c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited = prevAsserted, prevAt, prevAudited
+		c.seeded.assertNonce = nonce
 		c.seeded.unpersisted = false
 	}
 	c.seeded.mu.Unlock()

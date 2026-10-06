@@ -564,15 +564,28 @@ func (s *Server) finishVMReplaceRuntime(ctx context.Context, cl corrosion.VMRepl
 		// of this attempt performing the rename. A retry after a failed redefine
 		// finds the file already moved, skips the rename, and would otherwise define
 		// the VM pointing at a vars file that is no longer there.
-		xml := strings.ReplaceAll(
-			replaceDomainName(handoff.XML, m.Replacement, m.ReplacedVM), oldNvram, newNvram)
-		// The firmware moves only while the temporary name is still ours. It is a
-		// name-keyed path, so a VM that took the freed name owns the file at it now,
-		// and moving it would hand that VM's firmware to the contested name.
+		// The cloud-init seed is name-keyed the same way, and the start check
+		// exempts only the seed at the VM's OWN name: left at the temporary
+		// name's path it reads as an installer ISO inside the data directory,
+		// and every later start is refused.
+		oldSeed := lv.CloudInitISOPath(s.dataDir, m.Replacement)
+		newSeed := lv.CloudInitISOPath(s.dataDir, m.ReplacedVM)
+		xml := strings.ReplaceAll(strings.ReplaceAll(
+			replaceDomainName(handoff.XML, m.Replacement, m.ReplacedVM), oldNvram, newNvram),
+			oldSeed, newSeed)
+		// The firmware and the seed move only while the temporary name is still
+		// ours. They are name-keyed paths, so a VM that took the freed name owns
+		// the files at them now, and moving them would hand that VM's state to
+		// the contested name.
 		if !foreignAtTemporary {
 			if _, e := os.Stat(oldNvram); e == nil {
 				if e := os.Rename(oldNvram, newNvram); e != nil {
 					return failed("nvram rename", e)
+				}
+			}
+			if _, e := os.Stat(oldSeed); e == nil {
+				if e := os.Rename(oldSeed, newSeed); e != nil {
+					return failed("seed rename", e)
 				}
 			}
 		}

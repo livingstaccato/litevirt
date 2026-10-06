@@ -45,6 +45,13 @@ func (s *Server) DeployStack(req *pb.DeployStackRequest, stream grpc.ServerStrea
 		return status.Errorf(codes.InvalidArgument, "parse compose: %v", err)
 	}
 
+	// A volume or backup repo that names a host path makes the daemon write
+	// there as root: the same authority a storage pool needs, before anything
+	// is pulled, provisioned or registered.
+	if err := s.authorizeComposeHostPaths(ctx, f); err != nil {
+		return err
+	}
+
 	// Auto-pull images defined in the compose images: section that are missing locally.
 	if err := s.autoPullImages(ctx, f, stream); err != nil {
 		return err

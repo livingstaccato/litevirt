@@ -78,6 +78,12 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 		return status.Errorf(codes.NotFound, "target pool %q not configured on this host", req.TargetPool)
 	}
 
+	// Every write into the target pool goes through the write check — the
+	// native send/recv below included.
+	if err := s.checkPoolForWrite(ctx, req.TargetPool, dstPool); err != nil {
+		return err
+	}
+
 	// prefer native send/recv when the source driver
 	// implements Replicator. Skipped for cross-driver replication
 	// since e.g. zfs send / btrfs receive aren't compatible.

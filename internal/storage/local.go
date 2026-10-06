@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
 )
@@ -41,7 +42,7 @@ func (d *localDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string,
 			}
 		}
 	} else {
-		f, err := os.Create(path)
+		f, err := CreateExclusive(path)
 		if err != nil {
 			return "", fmt.Errorf("create raw disk: %w", err)
 		}
@@ -96,4 +97,14 @@ func (d *dirDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, e
 
 func (d *dirDriver) DeleteDisk(ctx context.Context, path string) error {
 	return (&localDriver{dataDir: d.path}).DeleteDisk(ctx, path)
+}
+
+// CreateExclusive creates path for writing only if nothing is there: O_EXCL
+// fails on an existing file and on a symlink (even a dangling one), and
+// O_NOFOLLOW makes sure the last component is never followed. A pool directory
+// is somewhere others can write — an NFS export's server, at least — so a file
+// the daemon creates there must never land on, or through, a name planted in
+// advance.
+func CreateExclusive(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o644)
 }

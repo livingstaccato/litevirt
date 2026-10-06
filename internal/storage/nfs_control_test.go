@@ -86,6 +86,7 @@ func TestNFSPrepareControlCommands(t *testing.T) {
 				},
 			}
 
+			fakeMountInfo(t, map[string]string{d.targetOverride: "rw,nosuid,nodev,noexec,nosymfollow,relatime"})
 			err := d.Prepare(ctx)
 			if !errors.Is(err, tc.wantErr) {
 				t.Fatalf("Prepare error = %v, want %v", err, tc.wantErr)

@@ -484,6 +484,10 @@ lv pool delete <name>
 
 `lv pool create` runs the driver's Prepare() hook (mount NFS, log into
 iSCSI, …) before persisting. See `docs/storage.md` for driver details.
+A pool that names a host path (`dir`, `--target`, a btrfs `--source`, NFS
+mount options, a Ceph conf or keyring), attaches network storage (`nfs`,
+`ceph`, `iscsi`) or allocates from host block storage (`zfs`, `lvm-thin`) needs `storage.hostpath` at `/` (the Admin role), and system and litevirt-internal directories are refused to
+everyone; see `docs/storage.md#host-paths`.
 
 ## Volumes
 

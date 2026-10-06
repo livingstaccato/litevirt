@@ -35,6 +35,10 @@ func (f *fakeRBD) run(_ context.Context, _ string, args ...string) ([]byte, erro
 	}
 	sub := args[i]
 	rest := args[i+1:]
+	// Positional arguments follow "--" (an option-shaped name stays a name).
+	if len(rest) > 0 && rest[0] == "--" {
+		rest = rest[1:]
+	}
 	f.calls = append(f.calls, sub)
 
 	switch sub {

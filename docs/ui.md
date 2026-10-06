@@ -184,8 +184,10 @@ A content browser (reachable from the VM-create **Browse…** button) lists the
 files in any file-based pool — `ListStoragePoolContents`, forwarded to the
 pool's owning host. Pick an ISO to fill the create form's installer field, or
 **upload** a file straight into the pool: the browser streams it to
-`UploadStoragePoolContent` (1 MiB chunks; written to a temp file then atomically
-renamed) so admins do not need to `scp` ISOs onto hosts.
+`UploadStoragePoolContent` (1 MiB chunks; written to a temp file then
+published without replacing anything already at the name) so admins do not
+need to `scp` ISOs onto hosts. Only image-like names are accepted; see
+[storage.md](storage.md#uploads).
 
 ## Load Balancer Management
 

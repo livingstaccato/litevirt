@@ -789,15 +789,22 @@ var coldScratchName = regexp.MustCompile(`^\..+(` + regexp.QuoteMeta(coldRecvScr
 func (s *Server) SweepColdMigrationScratch() {
 	roots := []string{filepath.Join(s.dataDir, "disks")}
 	s.storagePoolsMu.RLock()
-	for _, pr := range s.storagePools {
+	pools := make(map[string]StoragePoolRef, len(s.storagePools))
+	for n, pr := range s.storagePools {
+		pools[n] = pr
+	}
+	s.storagePoolsMu.RUnlock()
+	for n, pr := range pools {
 		if !isHostLocalDiskDriver(strings.ToLower(pr.Driver)) && pr.Driver != "" {
+			continue
+		}
+		if !s.poolUsableForWrite(context.Background(), n, pr) {
 			continue
 		}
 		if dir, err := fileBasedPoolDir(s.dataDir, pr); err == nil {
 			roots = append(roots, dir)
 		}
 	}
-	s.storagePoolsMu.RUnlock()
 	seen := map[string]bool{}
 	for _, root := range roots {
 		root = s.hostDiskFile(root)

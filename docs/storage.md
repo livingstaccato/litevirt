@@ -40,7 +40,7 @@ lv pool create warm \
 lv pool ls
 # HOST       NAME    DRIVER  SOURCE                                  TARGET                  STATE
 # host-a     warm    nfs     nas.internal:/srv/exports/litevirt      /mnt/litevirt-warm      active
-# host-a     default local                                           /var/lib/litevirt/disks active
+# host-a     default local                                           /var/lib/litevirt/pools/default active
 
 lv pool inspect warm
 lv pool delete warm
@@ -62,6 +62,130 @@ driver is asked to tear down (unmount NFS, log out of iSCSI) on a
 best-effort basis but failure does not block the delete — operators
 who hit "rm" likely want the pool gone regardless. The underlying
 mount, if any, stays until manually cleaned up.
+
+## Host paths
+
+### Who may name one
+
+A pool that names a place on the host's own filesystem makes the daemon write
+there as root: VM disks, uploaded content, an NFS mount laid over the
+directory. Naming one is therefore root on that host, and takes the
+`storage.hostpath` verb at the cluster root `/` — which only the `Admin` role
+holds. An `Operator` binding does not carry it, not even at `/`, and neither
+does an `Admin` binding scoped to a project. What counts as a host path:
+
+| Driver | Host path |
+|---|---|
+| `local` | `--target` (with no target the pool gets its own `<data_dir>/pools/<name>`) |
+| `dir` | `--target` (always) |
+| `nfs` | always: the export's server decides what the daemon finds there (files, and symlinks it would follow as root); also `--target` and `--option options=…` |
+| `ceph` | always (the cluster is remote storage), plus `--option conf=…` and `--option keyring=…` |
+| `iscsi` | always (the target's server decides what block devices appear) |
+| `btrfs` | `--source` |
+| `zfs` | always: the dataset is host storage (naming the host's root pool would let a pool fill it) |
+| `lvm-thin` | always: the volume group and thin pool are host storage |
+
+Only a `local` pool with no target names no host path, so it is the one pool an
+operator with `storage.pool.write` on the pool's path may create.
+
+Every source is checked against its driver's form before any tool sees it —
+`server:/export` for nfs, a pool, dataset or volume-group name for ceph, zfs
+and lvm-thin, an `iqn.`/`eui.`/`naa.` name and `host[:port]` portal for iscsi,
+an absolute path for btrfs, nothing for local and dir — so no value can reach
+`mount`, `rbd`, `zfs`, `lvs` or `iscsiadm` as an option. The drivers also put
+`--` before positional arguments.
+
+NFS pools are always mounted `nosuid,nodev,noexec,nosharecache,nosymfollow`,
+whatever `options=` says. `nosharecache` gives each pool's mount its own
+superblock, so two pools on one server each report their own export as the
+mount source. `nosymfollow` needs Linux 5.10+ and a mount.nfs that passes
+it on; where it is missing the mount is refused, with an error saying so, rather
+than made weaker. An export that is already mounted without these flags — mounted
+by hand, or by an earlier build — is never remounted: the pool is refused
+(nothing lists, reads or writes it) and the daemon logs an ERROR at start and
+on each refusal, until the export is unmounted and litevirt mounts it again.
+The same holds when the pool's mount point holds anything but the pool's own
+export (compared in canonical form) — another export left there by a deleted
+pool (deleting a pool with `--target` never unmounts it), the same server's
+parent export, or a mount made by hand. A `local`, `dir` or `btrfs` pool whose
+directory is on an NFS mount (the mount point or below it) is refused at
+create and at use: an export is used only through an `nfs` pool. Disk files the daemon creates in a pool
+are created exclusively and never through a symlink. Pool names may not start
+with `-`.
+
+Some directories are refused to everyone, `Admin` included: the filesystem
+root; anything under `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib*`,
+`/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr`, `/var/lib/libvirt`,
+`/var/run` or `/var/spool`; `/var/lib/litevirt` and any `/var/lib/litevirt-*`;
+the daemon's PKI directory; the data directory and any directory containing
+it; and anything inside the data directory other than its `mounts/` and
+`pools/` areas (`disks/` included). The list is a backstop, not exhaustive: `/opt`, `/srv`,
+`/var/log` and `/var/tmp` are left to the admin who names them. A target
+is judged both as written and after resolving symlinks, so a link at an
+innocent name does not reach a refused directory. Authority is checked on the
+node the request enters, so during a rolling upgrade an entry node on an older
+build does not check it; the directory check runs there and again on the
+pool's host.
+
+The same rules apply to compose `volumes:`, which are pools by another name,
+and a compose `backup-repos:` path needs the same authority (see
+[compose.md](compose.md#backup-repositories)).
+
+### Uploads
+
+`UploadStoragePoolContent` (the UI's ISO upload) writes only a plain file name
+with an image-like extension — `.iso .img .qcow2 .qcow .raw .vmdk .vdi .vhd
+.vhdx .ova .ovf`, or one of those compressed as `.gz .xz .zst .bz2` — that does
+not start with `.`. It never replaces anything already at the name, file or
+symlink: delete the old file first.
+
+Every pool has a directory of its own. A target-less `local` pool — the
+built-in `default` pool included — gets `<data_dir>/pools/<name>`, never
+`<data_dir>/disks`, which holds every VM's local disks across projects.
+Deleting the pool removes that directory, and is refused while it still holds
+files (the error names them). Creating a pool whose `<data_dir>/pools/<name>`
+already holds files left by an earlier pool is refused until an admin removes
+them; the error says how many files, not their names. A pool is never created
+on storage another pool on the host already uses — the same directory, a
+symlink alias of it, a directory inside it or containing it — or on an NFS
+export another pool on any host in the cluster uses, and the roots
+`<data_dir>/pools` and
+`<data_dir>/mounts` are not pools. A pool row that shares its storage with
+another, or sits on `<data_dir>/disks`, is refused for everything — listing
+included — with `FailedPrecondition` saying to recreate it; the error does not
+name the other pool, which may be another project's.
+
+An NFS export is the same storage from every host. Two exports are the same
+storage when their servers are the same and their export paths are the same or
+one is inside the other (`nas:/tenants` contains `nas:/tenants/acme`; `nas:/`,
+an NFSv4 pseudo-root, contains every export of `nas`). Servers are compared in
+canonical form (case, IPv6 brackets and zero compression, trailing slashes do
+not matter) and, at create, by address: each server name is resolved, and two
+servers that share any address are one server (`nas`, `nas.corp.lan` and
+`10.0.0.5` can all be one). A create whose server does not resolve is refused,
+and so is one whose export path overlaps another pool's whose server no longer
+resolves. The only pool that may share an export is the same pool — the same
+name and project — defined on several hosts. At use the comparison is by
+canonical form only, without lookups, so a later DNS change is not re-checked
+there. An NFSv4 path relative to the pseudo-root (`nas:/acme`) and the NFSv3
+path of the same directory (`nas:/srv/nfs/acme`) cannot be told apart from the
+client: do not mix the two forms for one server.
+
+Content operations never reach a file a live VM disk uses: a listing leaves
+out files a live disk of another pool uses, and a content delete refuses any
+file a live disk uses, as its own file or as a backing file.
+
+A pool created before these checks whose directory or source is now refused
+is refused for everything — listing, reads and writes: uploads, content deletes, new VM disks,
+volume moves and replicas onto it (native send/recv included), replica
+increments, promotes and VM imports are refused with `FailedPrecondition`, it
+is never re-mounted for them, and the daemon logs an ERROR naming the pool.
+Nothing is moved or deleted for you: recreate the pool somewhere allowed and
+move its disks there.
+
+During a rolling upgrade, a request that enters through a node still on an
+older build reaches the pool's host as a cluster peer, which is trusted; the
+authority checks above hold only once every node runs this release.
 
 ## Compose example
 

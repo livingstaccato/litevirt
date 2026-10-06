@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -77,7 +78,14 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		// Block-backed pool: no browsable file directory.
 		return &pb.ListStoragePoolContentsResponse{}, nil
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	ref := StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options}
+	// A refused pool — a directory no pool may use, one shared with another
+	// pool, a weak NFS mount — is not even listed: its directory may be
+	// /root/.ssh, the daemon's state, or another project's disks.
+	if err := s.checkPoolForWrite(ctx, rec.Name, ref); err != nil {
+		return nil, err
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, ref)
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
@@ -99,6 +107,13 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 			continue
 		}
 		name := e.Name()
+		// A file a live disk of another pool (or of no pool) uses is not this
+		// pool's content: a legacy target-less local pool shares <data_dir>/disks
+		// with every local VM disk on the host. Unknown ownership hides it.
+		owners, oerr := s.liveDiskOwners(ctx, s.hostName, filepath.Join(dir, name))
+		if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != req.PoolName }) {
+			continue
+		}
 		resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
 			Name:       name,
 			Path:       filepath.Join(dir, name),
@@ -150,13 +165,23 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if !isFileBasedDriver(rec.Driver) {
 		return nil, status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", req.PoolName)
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	dir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+		return nil, err
 	}
 	target, err := safename.SafeJoin(dir, req.Filename)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Never a file a live disk uses — this pool's or, in a directory shared
+	// with other disks, anyone's.
+	owners, err := s.liveDiskOwners(ctx, s.hostName, target)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "check disk use: %v", err)
+	}
+	if len(owners) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q is in use by VM %q disk %q; it is not pool content to delete", req.Filename, owners[0].VMName, owners[0].DiskName)
 	}
 	// os.Remove deletes a symlink itself (not its target), so this can't be
 	// redirected to delete an arbitrary file outside the pool.
@@ -187,7 +212,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := safename.ValidatePoolName(first.PoolName); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if err := safename.ValidateName(first.Filename); err != nil {
+	if err := validatePoolUploadName(first.Filename); err != nil {
 		return status.Errorf(codes.InvalidArgument, "filename: %v", err)
 	}
 	host := first.Host
@@ -245,9 +270,18 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if !isFileBasedDriver(rec.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q is not file-based", first.PoolName)
 	}
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+	dir, err := s.poolWriteDir(ctx, rec)
 	if err != nil {
-		return status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
+		return err
+	}
+	dest, err := safename.SafeJoin(dir, first.Filename)
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Refuse a taken name before streaming anything; publishNoClobber below
+	// refuses it again atomically.
+	if err := refuseExistingDest(dest, first.Filename); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return status.Errorf(codes.Internal, "mkdir: %v", err)
@@ -257,7 +291,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		return status.Errorf(codes.Internal, "create temp: %v", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
+	defer os.Remove(tmpName) // after a publish, drops the temp's second link
 	defer tmp.Close()
 
 	var total int64
@@ -297,16 +331,10 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err := syncPath(tmpName); err != nil {
 		return status.Errorf(codes.Internal, "sync: %v", err)
 	}
-	dest, err := safename.SafeJoin(dir, first.Filename)
-	if err != nil {
-		return status.Errorf(codes.InvalidArgument, "%v", err)
-	}
-	// Don't clobber/write through a symlink an admin may have placed at dest.
-	if fi, lerr := os.Lstat(dest); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
-		return status.Errorf(codes.FailedPrecondition, "destination %q is a symlink", first.Filename)
-	}
-	if err := os.Rename(tmpName, dest); err != nil {
-		return status.Errorf(codes.Internal, "finalize: %v", err)
+	// Never replace what is there — a file, or a symlink planted at the name —
+	// and never write through one.
+	if err := publishNoClobber(tmpName, dest, first.Filename); err != nil {
+		return err
 	}
 	if err := syncPath(dir); err != nil {
 		// The rename may not survive a crash; withdraw it rather than leave a

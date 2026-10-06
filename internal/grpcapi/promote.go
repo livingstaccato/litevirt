@@ -495,6 +495,10 @@ func (s *Server) poolContentNames(ctx context.Context, pool, host string) []stri
 		if !ok {
 			return nil
 		}
+		// A refused pool's directory is not listed, here or anywhere.
+		if !s.poolUsableForWrite(ctx, pool, poolRef) {
+			return nil
+		}
 		dir, err := fileBasedPoolDir(s.dataDir, poolRef)
 		if err != nil {
 			return nil
@@ -705,9 +709,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if !isFileBasedDriver(poolRef.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q (%s) is not file-based", pool, poolRef.Driver)
 	}
-	poolDir, err := fileBasedPoolDir(s.dataDir, poolRef)
+	poolDir, err := s.poolDirForWrite(ctx, pool, poolRef)
 	if err != nil {
-		return status.Errorf(codes.Internal, "resolve pool dir: %v", err)
+		return err
 	}
 	replicaPath := filepath.Join(poolDir, replica)
 	if _, err := os.Stat(replicaPath); err != nil {

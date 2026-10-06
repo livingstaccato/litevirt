@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
+	"strings"
 	"syscall"
 
 	"google.golang.org/grpc/codes"
@@ -90,6 +92,16 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 			return nil, err
 		}
 	}
+	// A pool that names a directory or file on the host makes the daemon write
+	// there as root, so naming one takes cluster-root authority, and some
+	// directories are refused to everyone. Checked here, before the forward,
+	// because a forwarded call reaches the owner as a peer; the owner checks the
+	// directories again against its own data and PKI dirs.
+	if err := s.authorizePoolHostPaths(ctx, fmt.Sprintf("pool %q", req.Name), storage.Config{
+		Driver: req.Driver, Source: req.Source, Target: req.Target, Options: req.Options,
+	}); err != nil {
+		return nil, err
+	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
 		if err != nil {
@@ -100,6 +112,47 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return client.CreateStoragePool(ctx, req)
 	}
 
+	// A target-less local pool gets a directory of its own, never the shared
+	// <data_dir>/disks that holds every VM's local disks across projects.
+	if req.Driver == "local" && req.Target == "" {
+		req.Target = localPoolDir(s.dataDir, req.Name)
+		// A directory left by an earlier pool of this name (in any project)
+		// is not handed to this one with its files in it.
+		if !(found && existing.Target == req.Target) {
+			// The count, never the names: they may be another project's.
+			if n := dirEntryCount(req.Target); n > 0 {
+				slog.Error("storage pool create refused: its directory holds an earlier pool's files",
+					"pool", req.Name, "dir", req.Target, "files", dirEntriesSample(req.Target, 20))
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"pool %q: its directory already holds %d file(s) from an earlier pool of that name; an admin must remove them first",
+					req.Name, n)
+			}
+		}
+	}
+	// Every pool has storage of its own: never a directory (or an alias of
+	// one, or one inside or around one) or an NFS export another pool uses.
+	// The other pool is not named: it may be another project's.
+	// An NFS export counts cluster-wide, under any spelling of its server.
+	newRef := StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target}
+	other, why, err := s.poolSharedWith(ctx, req.Name, &project, newRef, true)
+	if errors.Is(err, errNFSUnresolved) {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"pool %q: %v; an NFS server must resolve so its export can be told apart from every other pool's", req.Name, err)
+	}
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "check for a shared directory: %v", err)
+	}
+	if other != "" {
+		slog.Error("storage pool create refused: storage shared with another pool", "pool", req.Name, "other", other, "how", why)
+		what := req.Target
+		if strings.EqualFold(req.Driver, "nfs") {
+			what = req.Source
+		}
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %s is already another pool's (%s); every pool needs its own", req.Name, what, why)
+	}
+	if err := checkDirPoolNotOnNFS(s.dataDir, newRef); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "pool %q: %v", req.Name, err)
+	}
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,
 		Source:  req.Source,
@@ -207,6 +260,17 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, err
 	}
 
+	// A pool's own <data_dir>/pools/<name> goes with it — but never with files
+	// in it: the next pool of this name, in any project, would inherit them.
+	ownDir := ""
+	if (rec.Driver == "local" || rec.Driver == "") && rec.Target == localPoolDir(s.dataDir, rec.Name) {
+		ownDir = rec.Target
+		if left := dirEntriesSample(ownDir, 5); len(left) > 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"pool %q still holds files in %s (%s); delete them first", req.Name, ownDir, strings.Join(left, ", "))
+		}
+	}
+
 	// Driver teardown (unmount NFS / log out of iSCSI) is best-effort about ERRORS
 	// — an operator who hit delete wants the pool gone from inventory even if
 	// cleanup is incomplete — but its refcount PREDICATES are hard guards (never
@@ -227,6 +291,11 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	s.removeStoragePoolRef(req.Name)
+	if ownDir != "" {
+		if err := os.Remove(ownDir); err != nil && !os.IsNotExist(err) {
+			slog.Warn("storage pool directory not removed", "pool", req.Name, "dir", ownDir, "error", err)
+		}
+	}
 	s.audit(ctx, "storage.pool.delete", req.Name, fmt.Sprintf("force=%t", req.Force), "ok")
 	slog.Info("storage pool deleted", "host", host, "name", req.Name)
 	return &pb.DeleteStoragePoolResponse{}, nil

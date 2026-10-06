@@ -3554,12 +3554,18 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 		}
 		if f != nil {
 			if vol, ok := f.Volumes[volumeName]; ok {
-				return storage.Config{
+				cfg := storage.Config{
 					Driver:  vol.Driver,
 					Source:  vol.Source,
 					Target:  vol.Target,
 					Options: vol.Options,
-				}, nil
+				}
+				// A stack stored before deploys checked this can still name a
+				// directory no pool may write into; refuse it at use.
+				if err := storage.CheckConfig(cfg, s.dataDir, s.pkiDir); err != nil {
+					return storage.Config{}, fmt.Errorf("volume %q of stack %q: %w", volumeName, stackName, err)
+				}
+				return cfg, nil
 			}
 		}
 	}
@@ -3568,6 +3574,11 @@ func (s *Server) resolveVolume(ctx context.Context, stackName, volumeName string
 	// (a pool created since the cache was last refreshed, e.g. just after a
 	// restart, is only there).
 	if pool, ok := s.resolvePool(ctx, volumeName); ok {
+		// The disk is created there: a pool created before the directory and
+		// source checks must not take one (nor be re-mounted for it).
+		if err := s.checkPoolForWrite(ctx, volumeName, pool); err != nil {
+			return storage.Config{}, err
+		}
 		return storage.Config{
 			Driver:  pool.Driver,
 			Source:  pool.Source,

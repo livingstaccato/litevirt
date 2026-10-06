@@ -96,7 +96,7 @@ func TestMoveVolume_OfflineFileToFile(t *testing.T) {
 	s.dataDir = t.TempDir()
 
 	srcDir := filepath.Join(s.dataDir, "src")
-	dstDir := filepath.Join(s.dataDir, "dst")
+	dstDir := filepath.Join(s.dataDir, "pools", "dst")
 	if err := os.MkdirAll(srcDir, 0755); err != nil {
 		t.Fatalf("mkdir src: %v", err)
 	}

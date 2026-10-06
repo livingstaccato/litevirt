@@ -80,7 +80,7 @@ func liveMoveTestServer(t *testing.T, srcSize int64) (*Server, string, string) {
 	s.hostName = "host-a"
 	s.dataDir = t.TempDir()
 	srcDir := filepath.Join(s.dataDir, "hot")
-	dstDir := filepath.Join(s.dataDir, "warm")
+	dstDir := filepath.Join(s.dataDir, "pools", "warm")
 	for _, d := range []string{srcDir, dstDir} {
 		if err := mkdir(d); err != nil {
 			t.Fatalf("mkdir: %v", err)

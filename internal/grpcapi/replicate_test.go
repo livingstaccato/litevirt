@@ -17,7 +17,7 @@ func TestReplicateVolume_SameResolvedPathRejected(t *testing.T) {
 	s := testServer(t)
 	s.hostName = "test-host"
 	s.dataDir = t.TempDir()
-	dstDir := filepath.Join(s.dataDir, "warm")
+	dstDir := filepath.Join(s.dataDir, "pools", "warm")
 	srcPath := filepath.Join(dstDir, "vm1-root.qcow2")
 	s.SetStoragePoolsByName(map[string]StoragePoolRef{
 		"warm": {Driver: "local", Target: dstDir},

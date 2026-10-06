@@ -54,8 +54,15 @@ func ValidateDiskName(s string) error      { return wrapName("disk", s) }
 func ValidateImageName(s string) error     { return wrapName("image", s) }
 func ValidateSnapshotName(s string) error  { return wrapName("snapshot", s) }
 func ValidateContainerName(s string) error { return wrapName("container", s) }
-func ValidatePoolName(s string) error      { return wrapName("pool", s) }
-func ValidateStackName(s string) error     { return wrapName("stack", s) }
+func ValidatePoolName(s string) error {
+	// A pool name reaches tool argv (zfs recv, rbd import-diff, btrfs
+	// receive); one starting with "-" would read as an option.
+	if strings.HasPrefix(s, "-") {
+		return fmt.Errorf("invalid pool name: %q may not start with '-'", s)
+	}
+	return wrapName("pool", s)
+}
+func ValidateStackName(s string) error { return wrapName("stack", s) }
 
 func wrapName(kind, s string) error {
 	if err := ValidateName(s); err != nil {

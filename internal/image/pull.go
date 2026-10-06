@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // Defaults for PullOptions when a field is left zero. Generous so real cloud
@@ -262,6 +264,13 @@ func Pull(store *Store, name, rawURL, checksum string, opts PullOptions, progres
 			os.Remove(tmpPath) // explicit cleanup on checksum failure (#28)
 			return fmt.Errorf("checksum mismatch: got %s, expected %s", got, expected)
 		}
+	}
+
+	// A pulled image is the base of every VM created from it; one that names
+	// another file would have qemu open that file on the host for the guest.
+	if err := qcow2.AssertStandalone(tmpPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("image %q: %w", name, err)
 	}
 
 	// Move to final location

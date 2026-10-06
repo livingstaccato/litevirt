@@ -543,10 +543,6 @@ type Server struct {
 	// in bare test servers (no throttling) and set by NewServer in production.
 	loginThrottle *loginThrottle
 
-	// joinedCluster: this node was set up to join an existing cluster
-	// (join_peers configured). See SetJoinedCluster.
-	joinedCluster bool
-
 	migrationMetrics *metrics.MigrationMetrics
 	lbMetrics        *metrics.LBMetrics
 	haMetrics        *metrics.HAHealthMetrics

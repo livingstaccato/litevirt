@@ -358,6 +358,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// (corrosion/audit_hold.go). Rows held across a restart are in the spool and
 	// land first.
 	d.configureAuditHold(ctx)
+	// Whether this replica holds the cluster's history, decided once per
+	// state.db: an existing member is seeded at its first start on this build;
+	// a fresh replica becomes seeded at genesis or by an exchange with a seeded
+	// peer (corrosion/audit_seeded.go). AdmitHost vouches only when seeded.
+	if _, err := corrosion.DecideAuditSeeded(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Warn("could not decide whether this replica is seeded; it does not vouch for audit chain "+
+			"positions until an exchange with a seeded peer", "error", err)
+	}
 
 	// Before anything that writes an audit row is built: every writer signs with
 	// the keyring this installs on d.db.
@@ -868,7 +876,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	svc.SetTrustRotatedPeerCerts(d.cfg.Auth.TrustRotatedPeerCerts)
 	svc.SetForwardedIdentity(d.cfg.Auth.ForwardedIdentity)
 	svc.SetRBACRealm(d.cfg.Auth.RBACRealm)
-	svc.SetJoinedCluster(len(d.cfg.JoinPeers) > 0)
 	// Split-brain-family enforcement kill-switches — so the HA monitor drives the
 	// right tokens' latches (mandatory ∪ configured-on) and gates degraded/paging on
 	// config intent. The actual enforcement predicates live on the consumers
@@ -2217,6 +2224,12 @@ func (d *Daemon) seedAdminUser(ctx context.Context) error {
 
 	if err := corrosion.InsertUser(ctx, d.db, "admin", "admin", string(hash)); err != nil {
 		return fmt.Errorf("insert admin: %w", err)
+	}
+	// Genesis: this replica founded the cluster, so there is no earlier history
+	// it could lack (corrosion/audit_seeded.go).
+	if err := d.db.MarkAuditSeeded(ctx, "founded the cluster (genesis)"); err != nil {
+		slog.Warn("could not record the founder's replica as seeded; `lv host add` through this node "+
+			"is refused until it is", "error", err)
 	}
 
 	// The marker licenses exactly one mint, and that mint has now happened: the

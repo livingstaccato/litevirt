@@ -2551,6 +2551,11 @@ message TableDigest {
 message StateDigestResponse {
     string host_name                = 1;
     repeated TableDigest tables     = 2;
+    // True when this node's replica is seeded — it holds the cluster's history
+    // (corrosion/audit_seeded.go) — and it is not holding its own audit rows. A
+    // peer that completes an exchange with it becomes seeded too. An older node
+    // sends nothing, which reads as not seeded.
+    bool audit_seeded               = 3;
 }
 
 // TriggerAntiEntropy kicks an immediate anti-entropy pass (rather than waiting for the

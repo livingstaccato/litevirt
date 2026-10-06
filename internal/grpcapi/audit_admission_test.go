@@ -29,39 +29,68 @@ func TestAdmitHost_AHeldAdmitterRefuses(t *testing.T) {
 	}
 }
 
-// TestAdmitHost_AJoinerAloneDoesNotVouch is I-A's other half: a rebuilt host at
-// first boot sees only its own host row, and that is no evidence it has the
-// cluster's history. Only a founder alone answers from its own replica.
+// TestAdmitHost_AnUnseededAdmitterRefuses is I-C: a replica that has caught up
+// — its one completed exchange was with a held, empty rebuilt peer — or that is
+// alone, is no evidence it holds the cluster's history. Only a seeded replica
+// vouches.
 //
-// Mutation: restore the cluster-of-one shortcut for joiners — the joiner
-// answers.
-func TestAdmitHost_AJoinerAloneDoesNotVouch(t *testing.T) {
+// Mutation: drop the AuditSeeded check — the caught-up, unseeded node answers.
+func TestAdmitHost_AnUnseededAdmitterRefuses(t *testing.T) {
 	ctx := context.Background()
-	for _, joined := range []bool{true, false} {
-		s := testServer(t)
-		s.SetJoinedCluster(joined)
-		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
-			t.Fatal(err)
-		}
-		s.db.MarkReplicaStale("fresh database")
-		resp, err := admit(s, "node-4")
-		switch {
-		case joined && status.Code(err) != codes.Unavailable:
-			t.Errorf("joiner alone: %v, want Unavailable", err)
-		case !joined && (err != nil || !resp.GetAuditPositionProven()):
-			t.Errorf("founder alone: %v (proven=%v), want a vouched answer", err, resp.GetAuditPositionProven())
-		}
-	}
-	// Not alone and not caught up: refused whoever it is.
+	// Caught up, not seeded, with a peer.
 	s := testServer(t)
 	for _, h := range []string{s.hostName, "peer-host"} {
 		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h, Address: "10.0.0.1", State: "active"}); err != nil {
 			t.Fatal(err)
 		}
 	}
+	s.db.MarkReplicaCaughtUpForTests("a-held-empty-peer")
+	if _, err := admit(s, "node-4"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("caught up but not seeded: %v, want Unavailable", err)
+	}
+	// Alone and not seeded: a founder that lost its state.db, or a rebuilt host
+	// at first boot (M-J).
+	s = testServer(t)
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := admit(s, "node-4"); status.Code(err) != codes.Unavailable {
+		t.Fatalf("alone, not seeded: %v, want Unavailable", err)
+	}
+}
+
+// TestAdmitHost_ASingleNodeFounderCanAddAHost: the founder, seeded at genesis
+// and alone in its cluster, has nobody to catch up with and vouches from its
+// own replica.
+//
+// Mutation: require a completed exchange even when alone — refused.
+func TestAdmitHost_ASingleNodeFounderCanAddAHost(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: s.hostName, Address: "10.0.0.1", State: "active"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.MarkAuditSeeded(ctx, "genesis"); err != nil {
+		t.Fatal(err)
+	}
+	s.db.MarkReplicaStale("no peer has ever been reachable")
+	resp, err := admit(s, "node-1")
+	if err != nil || !resp.GetAuditPositionProven() || resp.GetAuditTailSeq() != 0 {
+		t.Fatalf("a seeded founder alone: %+v, %v; want a vouched seq 0", resp, err)
+	}
+	// Seeded but with a peer and not caught up since starting: refused.
+	s = testServer(t)
+	for _, h := range []string{s.hostName, "peer-host"} {
+		if err := corrosion.InsertHost(ctx, s.db, corrosion.HostRecord{Name: h, Address: "10.0.0.1", State: "active"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.db.MarkAuditSeeded(ctx, "upgrade"); err != nil {
+		t.Fatal(err)
+	}
 	s.db.MarkReplicaStale("restarted")
 	if _, err := admit(s, "node-4"); status.Code(err) != codes.Unavailable {
-		t.Fatalf("stale replica with a peer: %v, want Unavailable", err)
+		t.Fatalf("seeded, stale replica with a peer: %v, want Unavailable", err)
 	}
 }
 
@@ -73,6 +102,9 @@ func TestAdmitHost_AJoinerAloneDoesNotVouch(t *testing.T) {
 func TestAdmitHost_ATailBelowTheCARetirementRefuses(t *testing.T) {
 	ctx := context.Background()
 	s, dir, keyID := retireFixture(t, "node-1")
+	if err := s.db.MarkAuditSeeded(ctx, "test"); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < 3; i++ {
 		insAudit(t, s, "node-1")
 	}
@@ -98,5 +130,28 @@ func TestAdmitHost_ATailBelowTheCARetirementRefuses(t *testing.T) {
 	_, err = admit(s, "node-1")
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("a replica behind the CA retirement: %v, want Unavailable", err)
+	}
+}
+
+// TestGetStateDigest_ReportsSeededOnlyWhenNotHeld: a peer that completes an
+// exchange with this node becomes seeded on its word, so it says seeded only
+// when its replica is seeded and it is not still waiting for its own history.
+//
+// Mutation: report AuditSeeded alone — a held node seeds its peers.
+func TestGetStateDigest_ReportsSeededOnlyWhenNotHeld(t *testing.T) {
+	ctx := context.Background()
+	s := testServer(t)
+	if resp, err := s.GetStateDigest(adminCtx(), nil); err != nil || resp.GetAuditSeeded() {
+		t.Fatalf("unseeded: %v %v", resp.GetAuditSeeded(), err)
+	}
+	if err := s.db.MarkAuditSeeded(ctx, "test"); err != nil {
+		t.Fatal(err)
+	}
+	if resp, err := s.GetStateDigest(adminCtx(), nil); err != nil || !resp.GetAuditSeeded() {
+		t.Fatalf("seeded: %v %v", resp.GetAuditSeeded(), err)
+	}
+	s.db.HoldAuditUntilCaughtUp(corrosion.AuditHoldConfig{Host: s.hostName, Target: 9, TargetHash: "ab"})
+	if resp, err := s.GetStateDigest(adminCtx(), nil); err != nil || resp.GetAuditSeeded() {
+		t.Fatalf("seeded but held: %v %v; want not reported seeded", resp.GetAuditSeeded(), err)
 	}
 }

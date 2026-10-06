@@ -525,6 +525,9 @@ func TestAuditHold_TheLegacyResealWaitsForTheHistory(t *testing.T) {
 	if cfg, _ := ConfigureAuditHold(ctx, c, dir, "node-0", ""); cfg.Target == 0 {
 		t.Fatal("fixture: no hold")
 	}
+	if held, _, why := c.AuditHoldStatus(ctx, "node-0"); !held || !strings.Contains(why, "seq 2 is missing") {
+		t.Fatalf("status held=%v why=%q; want it to name the missing seq 2", held, why)
+	}
 	if n, err := ResealAuditChain(ctx, c, "node-0"); err != ErrAuditChainNotCaughtUp || n != 0 {
 		t.Fatalf("ResealAuditChain while held = %d, %v; want ErrAuditChainNotCaughtUp", n, err)
 	}

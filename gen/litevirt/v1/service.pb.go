@@ -24577,9 +24577,14 @@ func (x *TableDigest) GetAcknowledgedResidual() string {
 }
 
 type StateDigestResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	HostName      string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
-	Tables        []*TableDigest         `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	HostName string                 `protobuf:"bytes,1,opt,name=host_name,json=hostName,proto3" json:"host_name,omitempty"`
+	Tables   []*TableDigest         `protobuf:"bytes,2,rep,name=tables,proto3" json:"tables,omitempty"`
+	// True when this node's replica is seeded — it holds the cluster's history
+	// (corrosion/audit_seeded.go) — and it is not holding its own audit rows. A
+	// peer that completes an exchange with it becomes seeded too. An older node
+	// sends nothing, which reads as not seeded.
+	AuditSeeded   bool `protobuf:"varint,3,opt,name=audit_seeded,json=auditSeeded,proto3" json:"audit_seeded,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -24626,6 +24631,13 @@ func (x *StateDigestResponse) GetTables() []*TableDigest {
 		return x.Tables
 	}
 	return nil
+}
+
+func (x *StateDigestResponse) GetAuditSeeded() bool {
+	if x != nil {
+		return x.AuditSeeded
+	}
+	return false
 }
 
 // TriggerAntiEntropy kicks an immediate anti-entropy pass (rather than waiting for the
@@ -33964,10 +33976,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x0funresolved_ties\x18\x04 \x01(\x05R\x0eunresolvedTies\x12\x17\n" +
 	"\ahash_v2\x18\x05 \x01(\tR\x06hashV2\x12+\n" +
 	"\x11acknowledged_ties\x18\x06 \x01(\x05R\x10acknowledgedTies\x123\n" +
-	"\x15acknowledged_residual\x18\a \x01(\tR\x14acknowledgedResidual\"d\n" +
+	"\x15acknowledged_residual\x18\a \x01(\tR\x14acknowledgedResidual\"\x87\x01\n" +
 	"\x13StateDigestResponse\x12\x1b\n" +
 	"\thost_name\x18\x01 \x01(\tR\bhostName\x120\n" +
-	"\x06tables\x18\x02 \x03(\v2\x18.litevirt.v1.TableDigestR\x06tables\"-\n" +
+	"\x06tables\x18\x02 \x03(\v2\x18.litevirt.v1.TableDigestR\x06tables\x12!\n" +
+	"\faudit_seeded\x18\x03 \x01(\bR\vauditSeeded\"-\n" +
 	"\x19TriggerAntiEntropyRequest\x12\x10\n" +
 	"\x03all\x18\x01 \x01(\bR\x03all\"\x9c\x01\n" +
 	"\x1aTriggerAntiEntropyResponse\x12\x1c\n" +

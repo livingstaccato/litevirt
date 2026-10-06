@@ -419,6 +419,11 @@ func AuditRejoinFile(pkiDir, hostName, certSerial string, admitted *pb.AdmitHost
 	if admitted.GetAuditTailSeq() <= 0 {
 		return nil, admitted.GetAuditPositionProven(), nil
 	}
+	// A position the daemon did not vouch for is not signed either: an
+	// unreleased build answered positions on a weaker test of its replica.
+	if !admitted.GetAuditPositionProven() {
+		return nil, false, nil
+	}
 	rj, err := corrosion.SignAuditRejoin(pkiDir, hostName, certSerial,
 		admitted.GetAuditTailSeq(), admitted.GetAuditTailHash())
 	if err != nil {

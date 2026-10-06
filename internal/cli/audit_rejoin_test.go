@@ -37,6 +37,11 @@ func TestAuditRejoinFile_KeepsARecordOnAnUnvouchedNoHistory(t *testing.T) {
 	if err != nil || remove || rec == nil {
 		t.Fatalf("seq 12: record=%v remove=%v err=%v", rec != nil, remove, err)
 	}
+	// M-M: a position nobody vouched for is not signed.
+	if rec, remove, err := AuditRejoinFile(dir, "node-4", "0a0b",
+		&pb.AdmitHostResponse{AuditTailSeq: 12, AuditTailHash: "ab"}); err != nil || rec != nil || remove {
+		t.Fatalf("unvouched seq 12: record=%v remove=%v err=%v; want neither", rec != nil, remove, err)
+	}
 	var rj corrosion.AuditRejoin
 	if err := json.Unmarshal(rec, &rj); err != nil || rj.Seq != 12 || rj.CertSerial != "0a0b" || rj.Host != "node-4" {
 		t.Fatalf("record %+v (%v)", rj, err)

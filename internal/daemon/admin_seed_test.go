@@ -450,3 +450,25 @@ func TestSeedAdminUser_AJoinerWithAStaleMarkerStillMintsNothing(t *testing.T) {
 		t.Errorf("a joiner holding a stale founder marker minted %v", users)
 	}
 }
+
+// TestSeedAdminUser_GenesisSeedsTheFoundersReplica: the founder's replica holds
+// the whole history there is, so it is seeded at genesis — what lets a
+// single-node cluster add its first host (corrosion/audit_seeded.go), and what
+// a joiner, which mints nothing, is not.
+//
+// Mutation: drop the MarkAuditSeeded call after the mint — the founder is not
+// seeded.
+func TestSeedAdminUser_GenesisSeedsTheFoundersReplica(t *testing.T) {
+	ctx := context.Background()
+	db := newHostTestClient(t)
+	d := founderDaemon(t, db, filepath.Join(t.TempDir(), "admin-password"))
+	if db.AuditSeeded(ctx) {
+		t.Fatal("fixture: seeded before genesis")
+	}
+	if err := d.seedAdminUser(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !db.AuditSeeded(ctx) {
+		t.Fatal("the founder's replica is not seeded after genesis")
+	}
+}

@@ -198,7 +198,12 @@ func (s *Server) GetStateDigest(ctx context.Context, _ *emptypb.Empty) (*pb.Stat
 	if err != nil {
 		return nil, err
 	}
-	return stateDigestResponse(s.hostName, digests, s.digestTieView(ctx, digests, corrosion.FreshDigestRequested(ctx))), nil
+	resp := stateDigestResponse(s.hostName, digests, s.digestTieView(ctx, digests, corrosion.FreshDigestRequested(ctx)))
+	// Whether a peer that completes this exchange may count itself seeded: this
+	// replica holds the cluster's history and is not still waiting for its own
+	// (corrosion/audit_seeded.go).
+	resp.AuditSeeded = s.db.AuditSeeded(ctx) && !s.db.AuditChainHeld(ctx, s.hostName)
+	return resp, nil
 }
 
 // digestTies is what a digest response says about this host's tracked ties:

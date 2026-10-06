@@ -61,6 +61,9 @@ type AuditRecord struct {
 type chainState struct {
 	mu    sync.Mutex
 	tails map[string]*chainTail
+	// hold, when set, makes this client hold its own host's audit rows until
+	// that host's chain tail has caught up from its peers (audit_hold.go).
+	hold *auditHold
 }
 
 // chainTail is one host's in-flight sub-chain position.
@@ -73,6 +76,12 @@ type chainTail struct {
 	// (unsigned) rows, or found that it need not: only then does hash describe
 	// what a seq-0 anchor may commit to (PublishAuditChainHead).
 	legacySettled bool
+	// ready is set once the tail has been read from a replica known to hold this
+	// host's whole replicated history, and the rows held until then have landed.
+	// Only consulted while a hold is configured (audit_hold.go); from then on
+	// this process is the only writer of the chain, so the cached tail is the
+	// authority and nothing re-gates it.
+	ready bool
 }
 
 // tail returns hostName's tail state, creating it on first use.
@@ -163,6 +172,25 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	defer c.auditChain.mu.Unlock()
 	tail := c.auditChain.tail(r.HostName)
 
+	// A host whose own chain may still be arriving from its peers does not
+	// append to it yet: the row is held, durably, and lands once the tail is
+	// known to be the real one (audit_hold.go).
+	if held, err := c.holdAuditLocked(ctx, tail, r, generated); held || err != nil {
+		return err
+	}
+	var at time.Time
+	if generated {
+		at = c.now()
+	}
+	return insertAuditLocked(ctx, c, tail, r, at)
+}
+
+// insertAuditLocked appends r at the end of its host's sub-chain. at is the
+// moment a GENERATED stamp is taken from (clamped to the tail, see stampAfter);
+// the zero time means r carries a caller-supplied stamp, stored verbatim.
+// Caller must hold c.auditChain.mu.
+func insertAuditLocked(ctx context.Context, c *Client, tail *chainTail, r AuditRecord, at time.Time) error {
+	generated := !at.IsZero()
 	if !tail.known {
 		// First insert for this host on this client — bootstrap its sub-chain
 		// from what this host has already written.
@@ -173,7 +201,7 @@ func InsertAuditLog(ctx context.Context, c *Client, r AuditRecord) error {
 	}
 
 	if generated {
-		r.Timestamp = stampAfter(c.now(), tail.ts)
+		r.Timestamp = stampAfter(at, tail.ts)
 	}
 	r.PrevHash = tail.hash
 	r.Seq = tail.seq + 1
@@ -554,8 +582,9 @@ type AuditVerifyResult struct {
 	// UnknownKeyID lists rows whose key has no usable published certificate —
 	// either never published, or one that does not chain to the cluster CA.
 	UnknownKeyID []string
-	// SeqGaps lists breaks in a host's sequence numbering, which is how the
-	// deletion of a whole run of rows shows up.
+	// SeqGaps lists breaks in a host's sequence numbering: a jump, which is how
+	// the deletion of a whole run of rows shows up, or a repeated seq, which is
+	// a forked chain and is labelled as a duplicate.
 	SeqGaps []string
 	// Laundered lists rows that blanked their own hash to pose as a pre-chain
 	// reset point, which used to silently re-base everything after them.
@@ -809,7 +838,15 @@ func VerifyAuditChain(ctx context.Context, c *Client) (AuditVerifyResult, error)
 					flagLegacy(host)
 				}
 			}
-			if last, seen := seqByHost[host]; seen && seq != last+1 {
+			if last, seen := seqByHost[host]; seen && seq == last {
+				// Not a deletion: two rows claim one position. That is a forked
+				// chain — a second writer, or a host that appended to a replica
+				// still missing its own history — and saying "rows deleted" sends
+				// the investigation the wrong way.
+				res.SeqGaps = append(res.SeqGaps,
+					fmt.Sprintf("%s: row %s repeats seq %d (duplicate: two rows claim the same position, a forked chain)",
+						host, rec.ID, seq))
+			} else if seen && seq != last+1 {
 				res.SeqGaps = append(res.SeqGaps,
 					fmt.Sprintf("%s: row %s has seq %d after %d", host, rec.ID, seq, last))
 			}
@@ -990,7 +1027,17 @@ func isUnknownKeyErr(err error) bool {
 // re-based at a particular moment is itself part of the permanent record. An
 // operator reading `lv audit verify` can see that it happened and when; the
 // pre-v45 behaviour left no trace at all.
+//
+// Never while this host's audit rows are held for history that has not arrived
+// (audit_hold.go). A rebuilt host's replica can hold rows 1 and 3 of its chain
+// and not 2; a reseal then recomputes row 3 against row 1, and the rewrite
+// replicates and is applied by every peer, breaking the chain cluster-wide and
+// leaving the admitted row unmatchable. Whatever reseal the host's history
+// needed was done by the machine that wrote it.
 func ResealAuditChain(ctx context.Context, c *Client, hostName string) (int, error) {
+	if c.AuditChainHeld(ctx, hostName) {
+		return 0, ErrAuditChainNotCaughtUp
+	}
 	c.auditChain.mu.Lock()
 	hash, resealed, err := resealHostChainLocked(ctx, c, hostName)
 	if err != nil {
@@ -1053,7 +1100,8 @@ const auditResealGuardedSQL = `UPDATE audit_log SET prev_hash = ?, content_hash 
 // peer then reports as broken. Returns the resealed tail hash + rows rewritten.
 // Caller must hold auditChainState.mu. A host authors all its own rows
 // locally, so the local DB has the complete sub-chain even right after a
-// restart (replication only brings OTHER hosts' rows).
+// restart — except a host rebuilt under an old name, whose history arrives by
+// replication, which is why ResealAuditChain refuses while its rows are held.
 func resealHostChainLocked(ctx context.Context, c *Client, hostName string) (string, int, error) {
 	rows, err := c.Query(ctx,
 		`SELECT id, timestamp, username, host_name, action, target, detail, result, content_hash, signature, seq

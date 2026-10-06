@@ -179,7 +179,7 @@ func reportAuditVerify(w io.Writer, resp *pb.VerifyAuditChainResponse) error {
 	}{
 		{"bad signature (edited by someone without the host's key):", resp.BadSignature},
 		{"unknown key (no trustworthy published certificate for the signer):", resp.UnknownKeyId},
-		{"sequence gap (rows deleted from a host's chain):", resp.SeqGaps},
+		{"sequence break (rows deleted from a host's chain, or a repeated seq — a forked chain):", resp.SeqGaps},
 		{"laundered (row blanked its own hash to fake a chain reset):", resp.Laundered},
 		{"retired key used (signed after the key was rotated out):", resp.RetiredKeyUse},
 		{"chain head mismatch (a row covered by a signed head was rewritten):", resp.HeadMismatch},

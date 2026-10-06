@@ -157,6 +157,11 @@ func (s *Server) UnaryAuthInterceptor(
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
 	if skipAuth[info.FullMethod] {
+		if preSessionAuthMethods[info.FullMethod] {
+			if err := s.gateAuditHold(ctx, info.FullMethod, true); err != nil {
+				return nil, err
+			}
+		}
 		admitted, err := s.admitPreSessionCredentialExchange(ctx, info.FullMethod)
 		if err != nil {
 			return nil, err
@@ -168,6 +173,9 @@ func (s *Server) UnaryAuthInterceptor(
 		return nil, err
 	}
 	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
+		return nil, err
+	}
+	if err := s.gateAuditHold(ctx, info.FullMethod, false); err != nil {
 		return nil, err
 	}
 	return handler(ctx, req)
@@ -184,6 +192,11 @@ func (s *Server) StreamAuthInterceptor(
 		// Stamped here too, so a pre-session credential exchange added as a
 		// STREAMING RPC later cannot slip in unstamped — the unary path would
 		// gate it and this one silently would not.
+		if preSessionAuthMethods[info.FullMethod] {
+			if err := s.gateAuditHold(ss.Context(), info.FullMethod, true); err != nil {
+				return err
+			}
+		}
 		admitted, err := s.admitPreSessionCredentialExchange(ss.Context(), info.FullMethod)
 		if err != nil {
 			return err
@@ -195,6 +208,9 @@ func (s *Server) StreamAuthInterceptor(
 		return err
 	}
 	if err := s.gateStaleReplica(ctx, info.FullMethod); err != nil {
+		return err
+	}
+	if err := s.gateAuditHold(ctx, info.FullMethod, false); err != nil {
 		return err
 	}
 	return handler(srv, &wrappedStream{ss, ctx})

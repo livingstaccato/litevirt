@@ -467,6 +467,9 @@ type Client struct {
 	// tests/fleet where N daemons share a process. See audit.go.
 	auditChain chainState
 
+	// seeded is this replica's seeded marker (audit_seeded.go).
+	seeded auditSeededState
+
 	// auditKeyring signs this host's audit rows and verifies any host's. Nil ⇒
 	// rows are written unsigned (the pre-v45 behaviour, and what a cluster does
 	// until enforcement.audit_signature is turned on). Guarded by mu.

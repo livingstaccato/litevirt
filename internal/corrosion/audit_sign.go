@@ -238,25 +238,9 @@ func PublishSigningCertOnly(ctx context.Context, c *Client, pkiDir, hostName str
 // cluster node — and it is what gives a retirement standing over a key whose holder
 // cannot or will not sign it themselves.
 func SignLifecycleWithCA(pkiDir, hostName, keyID, event string, seq int64) (string, error) {
-	keyPEM, err := os.ReadFile(filepath.Join(pkiDir, "ca.key"))
+	key, err := loadClusterCAKey(pkiDir)
 	if err != nil {
-		return "", fmt.Errorf("read cluster CA private key: %w", err)
-	}
-	blk, _ := pem.Decode(keyPEM)
-	if blk == nil {
-		return "", fmt.Errorf("cluster CA private key has no PEM block")
-	}
-	key, err := x509.ParseECPrivateKey(blk.Bytes)
-	if err != nil {
-		k8, err8 := x509.ParsePKCS8PrivateKey(blk.Bytes)
-		if err8 != nil {
-			return "", fmt.Errorf("parse cluster CA private key: %w", err)
-		}
-		ec, ok := k8.(*ecdsa.PrivateKey)
-		if !ok {
-			return "", fmt.Errorf("cluster CA private key is not ECDSA")
-		}
-		key = ec
+		return "", err
 	}
 	sig, err := ecdsa.SignASN1(rand.Reader, key,
 		auditLifecycleDigest(hostName, keyID, event, seq, auditCASigner))
@@ -264,6 +248,32 @@ func SignLifecycleWithCA(pkiDir, hostName, keyID, event string, seq int64) (stri
 		return "", fmt.Errorf("sign %s of %s with the cluster CA: %w", event, keyID, err)
 	}
 	return hex.EncodeToString(sig), nil
+}
+
+// loadClusterCAKey reads the cluster CA private key from pkiDir. It lives with
+// the operator (the machine that ran `lv host init`), never on a node.
+func loadClusterCAKey(pkiDir string) (*ecdsa.PrivateKey, error) {
+	keyPEM, err := os.ReadFile(filepath.Join(pkiDir, "ca.key"))
+	if err != nil {
+		return nil, fmt.Errorf("read cluster CA private key: %w", err)
+	}
+	blk, _ := pem.Decode(keyPEM)
+	if blk == nil {
+		return nil, fmt.Errorf("cluster CA private key has no PEM block")
+	}
+	key, err := x509.ParseECPrivateKey(blk.Bytes)
+	if err != nil {
+		k8, err8 := x509.ParsePKCS8PrivateKey(blk.Bytes)
+		if err8 != nil {
+			return nil, fmt.Errorf("parse cluster CA private key: %w", err)
+		}
+		ec, ok := k8.(*ecdsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("cluster CA private key is not ECDSA")
+		}
+		key = ec
+	}
+	return key, nil
 }
 
 // auditCASigner is the reserved by_key_id of a lifecycle record signed with the

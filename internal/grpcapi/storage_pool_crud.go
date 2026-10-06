@@ -98,6 +98,7 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		if err := s.requireISOLibraryRowAuthority(ctx); err != nil {
 			return nil, err
 		}
+		s.pinImplicitISOLibraryMode(ctx)
 	}
 	if host != s.hostName {
 		client, conn, err := s.peerClient(ctx, host)
@@ -201,6 +202,7 @@ func (s *Server) DeleteStoragePool(ctx context.Context, req *pb.DeleteStoragePoo
 		if err := s.requireISOLibraryRowAuthority(ctx); err != nil {
 			return nil, err
 		}
+		s.pinImplicitISOLibraryMode(ctx)
 	}
 	if host != s.hostName {
 		// Run the reference guard on THIS (entry) node's replicated view BEFORE
@@ -421,4 +423,22 @@ func refuseOverlap(dir, libDir, other string) error {
 func pathWithin(dir, p string) bool {
 	rel, err := filepath.Rel(dir, p)
 	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
+}
+
+// pinImplicitISOLibraryMode writes the ISO library mode in force when none was
+// ever set, before an Admin creates, replaces or deletes a global isos pool:
+// with no row the mode is derived from which isos pools exist, so that change
+// would otherwise flip it silently, with no new record generation (stale
+// records of the old mode would then count again). Best effort: it never
+// refuses the pool change.
+func (s *Server) pinImplicitISOLibraryMode(ctx context.Context) {
+	m, err := corrosion.GetISOLibraryMode(ctx, s.db)
+	if err != nil || !m.Implicit || !s.db.MayWriteClusterPolicy() {
+		return
+	}
+	if err := corrosion.SetISOLibraryMode(ctx, s.db, m.Value, callerUsername(ctx)); err != nil {
+		slog.Warn("iso library: pin the mode in force before an isos pool change", "mode", m.Value, "error", err)
+		return
+	}
+	slog.Info("iso library: the mode in force is now set explicitly, before an isos pool change", "mode", m.Value)
 }

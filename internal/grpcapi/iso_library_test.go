@@ -172,7 +172,7 @@ func TestISOLibrary_AnEarlierPoolPathStillWorks(t *testing.T) {
 	if spec.GetIsoScope() != isoScopeProject {
 		t.Fatalf("recorded iso_scope = %q, want %q", spec.GetIsoScope(), isoScopeProject)
 	}
-	path, viaPool, err := s.resolveSpecISO(context.Background(), "acme", spec)
+	path, viaPool, err := s.resolveSpecISO(context.Background(), "old", "acme", spec)
 	if err != nil || !viaPool || path != filepath.Join(mustEval(t, dir), "old.iso") {
 		t.Fatalf("a start takes it as %q (via pool %v, %v), want acme-isos/old.iso's file", path, viaPool, err)
 	}

@@ -874,13 +874,6 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return nil, err
 	}
-	// Which file that was, on this host: a later start of the unchanged file
-	// keeps working whoever comes to share its directory (isoFileOwnershipAllows).
-	spec.IsoIdentity = nil
-	switch spec.GetIsoScope() {
-	case isoScopeGlobal, isoScopePool, isoScopeProject:
-		spec.IsoIdentity = s.isoIdentityOf(isoPath)
-	}
 
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {

@@ -24,8 +24,7 @@ func normalizeCreateVMSpec(in *pb.VMSpec, defaultCPUMode string) (*pb.VMSpec, er
 	}
 
 	spec := proto.Clone(in).(*pb.VMSpec)
-	spec.IsoScope = ""     // server-owned (authorizeVMISO)
-	spec.IsoIdentity = nil // server-owned (createVM records it on the owner)
+	spec.IsoScope = "" // server-owned (authorizeVMISO)
 	if spec.Cpu < 0 || spec.MemoryMib < 0 {
 		return nil, status.Error(codes.InvalidArgument, "cpu and memory_mib must be non-negative")
 	}

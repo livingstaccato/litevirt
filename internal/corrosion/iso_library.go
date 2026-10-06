@@ -18,8 +18,9 @@ package corrosion
 //     generation means nothing: setting the mode starts a new generation, and
 //     every host then records what it holds (ReconcileGeneration). A record
 //     with no content ("{}") is a collected one.
-//   - iso_library_host/<host>: what a host has applied — the generation and the
-//     newest record it holds. A tombstone every host has applied is collected.
+//   - iso_library_host/<host>: what a host has applied — the generation and,
+//     per record, the version it applied. A tombstone every host has applied
+//     (that exact version) is collected.
 //
 // cluster_policies has no statement that deletes a row, and adding one is a
 // new replicated shape, so a collected record stays as an empty row.
@@ -229,11 +230,14 @@ func CollectISOCatalogEntry(ctx context.Context, c *Client, name, setBy string) 
 	return c.Execute(ctx, clusterPolicyUpsertSQL, isoCatalogKeyPrefix+name, "{}", setBy, c.NowTS())
 }
 
-// ISOLibraryHostAck is what one host has applied of the library records.
+// ISOLibraryHostAck is what one host has applied of the library records: per
+// record (file name → the UpdatedAt of the version it applied), because
+// records from different origins can replicate out of order, so a high-water
+// mark could claim a tombstone that never arrived.
 type ISOLibraryHostAck struct {
-	Host           string `json:"-"`
-	Gen            string `json:"gen"`
-	AppliedThrough string `json:"applied_through,omitempty"`
+	Host    string            `json:"-"`
+	Gen     string            `json:"gen"`
+	Applied map[string]string `json:"applied,omitempty"`
 }
 
 // ListISOLibraryHostAcks returns every host's ack, by host.

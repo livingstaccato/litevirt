@@ -148,21 +148,10 @@ message VMSpec {
     // elsewhere cannot stand in for it. Empty on VMs created before it existed.
     string iso_scope = 43;
 
-    // iso_identity is server-owned too: the file the owner resolved iso to at
-    // create, on that host. A start there of that unchanged file is allowed
-    // even if another project's pool has since come to share its directory;
-    // any other file is judged by the full ownership rule.
-    ISOFileIdentity iso_identity = 44;
-}
-
-// ISOFileIdentity names one file on one host.
-message ISOFileIdentity {
-    string host     = 1;
-    string path     = 2; // resolved
-    uint64 dev      = 3;
-    uint64 ino      = 4;
-    int64  size     = 5;
-    int64  mtime_ns = 6;
+    // 44 was iso_identity, replaced before release by a host-local record of
+    // the ISO file each host judged (grpcapi/iso_identity.go).
+    reserved 44;
+    reserved "iso_identity";
 }
 
 message DiskSpec {

@@ -556,7 +556,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 				"migration.allow_unencrypted_storage is set", "vm", req.VmName,
 				"source_tls", srcTLS, "target_tls", dstTLS, "target", req.TargetHost)
 		}
-	} else if s.domainCarriesInstallerISO(vm.Name) {
+	} else {
 		// No disks to stub, but the target's qemu opens the installer ISO from
 		// its own filesystem: the target judges that file before the migration
 		// (EnsureDisks with no stubs does only that).
@@ -2024,7 +2024,10 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // target judges the ISO it would open; runtime says the domain moves by
 // libvirt runtime migration, where the target's qemu opens exactly those paths.
 func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS, runtime bool) ([]string, bool, error) {
-	isoPaths := s.domainInstallerISOPaths(vmName)
+	isoPaths, err := s.domainInstallerISOPaths(vmName, runtime)
+	if err != nil {
+		return nil, false, err
+	}
 	if len(stubs) == 0 && !wantTLS && len(isoPaths) == 0 {
 		return nil, false, nil
 	}
@@ -2049,6 +2052,7 @@ func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName str
 	}
 	if w := resp.GetInstallerIsoWarning(); w != "" {
 		slog.Warn("migration: "+w, "vm", vmName, "target", targetHost)
+		s.recordVMEvent(ctx, vmName, "vm.migrate.iso_warning", "warn", w)
 	}
 	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), nil
 }

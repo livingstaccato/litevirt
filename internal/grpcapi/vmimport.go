@@ -848,11 +848,32 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 type qemuImgInfo struct {
 	BackingFilename     string `json:"backing-filename"`
 	FullBackingFilename string `json:"full-backing-filename"`
+	FormatSpecific      struct {
+		Data struct {
+			DataFile string `json:"data-file"`
+		} `json:"data"`
+	} `json:"format-specific"`
 }
 
-// assertNoExternalDiskRefs rejects a disk whose backing file or VMDK extents
-// point outside allowedDir (a host-file-read escape via a crafted descriptor).
+// maxBackingDepth bounds the chain walk; a legitimate foreign disk has at most
+// a handful of snapshots.
+const maxBackingDepth = 16
+
+// assertNoExternalDiskRefs rejects a disk that would make qemu-img open a file
+// outside allowedDir: a VMDK extent, a backing file anywhere in the chain, or
+// a qcow2 external data file (a host-file-read escape via a crafted header).
+// A backing name that is not a plain path (json:{...}, nbd:, a URL) is refused
+// outright: joined to a directory it would look contained while naming
+// anything. The chain is walked one image at a time, and nothing outside
+// allowedDir is ever opened.
 func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) error {
+	return assertNoExternalDiskRefsDepth(ctx, file, allowedDir, 0)
+}
+
+func assertNoExternalDiskRefsDepth(ctx context.Context, file, allowedDir string, depth int) error {
+	if depth > maxBackingDepth {
+		return fmt.Errorf("backing chain deeper than %d images", maxBackingDepth)
+	}
 	// Text VMDK descriptor: scan extent lines for absolute/escaping paths.
 	if head, err := readHead(file, 4096); err == nil && bytes.Contains(head, []byte("# Disk DescriptorFile")) {
 		full, _ := readHead(file, 256<<10)
@@ -872,28 +893,56 @@ func assertNoExternalDiskRefs(ctx context.Context, file, allowedDir string) erro
 			}
 		}
 	}
-	// qemu-img info: reject a backing file that escapes allowedDir.
+	// qemu-img info on this one image only (no --backing-chain: that would
+	// open the backing file before it is judged).
 	out, err := exec.CommandContext(ctx, "qemu-img", "info", "-U", "--output=json", file).Output()
 	if err != nil {
 		// info failure is not itself an escape; surface it as a convert-time error.
 		return fmt.Errorf("inspect %s: %w", filepath.Base(file), err)
 	}
 	var info qemuImgInfo
-	if json.Unmarshal(out, &info) == nil {
-		for _, b := range []string{info.BackingFilename, info.FullBackingFilename} {
-			if b == "" {
-				continue
-			}
-			resolved := b
-			if !filepath.IsAbs(b) {
-				resolved = filepath.Join(filepath.Dir(file), b)
-			}
-			if !safename.Contains(allowedDir, resolved) {
-				return fmt.Errorf("disk has an external backing file %q outside the import directory", b)
-			}
+	if err := json.Unmarshal(out, &info); err != nil {
+		return fmt.Errorf("inspect %s: unreadable qemu-img info: %w", filepath.Base(file), err)
+	}
+	if df := info.FormatSpecific.Data.DataFile; df != "" {
+		return fmt.Errorf("disk keeps its data in an external file %q; only standalone disks are imported", df)
+	}
+	backing := info.BackingFilename
+	if backing == "" {
+		backing = info.FullBackingFilename
+	}
+	if backing == "" {
+		return nil
+	}
+	if !plainBackingPath(backing) {
+		return fmt.Errorf("disk names a backing file %q that is not a plain path", backing)
+	}
+	resolved := backing
+	if !filepath.IsAbs(backing) {
+		resolved = filepath.Join(filepath.Dir(file), backing)
+	}
+	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = real
+	}
+	if !safename.Contains(allowedDir, resolved) {
+		return fmt.Errorf("disk has an external backing file %q outside the import directory", backing)
+	}
+	return assertNoExternalDiskRefsDepth(ctx, resolved, allowedDir, depth+1)
+}
+
+// plainBackingPath reports whether a backing name is a filesystem path rather
+// than a json: spec or a protocol (nbd:, http:, file:, ...). qemu treats a
+// leading "<word>:" as a protocol prefix.
+func plainBackingPath(name string) bool {
+	if strings.HasPrefix(name, "json:") {
+		return false
+	}
+	if i := strings.IndexByte(name, ':'); i >= 0 {
+		if j := strings.IndexByte(name, '/'); j < 0 || i < j {
+			return false
 		}
 	}
-	return nil
+	return true
 }
 
 // ── small helpers ──

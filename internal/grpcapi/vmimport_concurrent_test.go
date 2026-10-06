@@ -62,8 +62,12 @@ func openGate(t *testing.T, gate string) {
 }
 
 // oneDiskNeed is what a smallImportFrame import reserves while it converts
-// its one disk: a private copy of the mapped file and the converted output.
-func oneDiskNeed() uint64 { return 2 * uint64(importSourceLimit(1<<20)) }
+// its one disk: a private copy of the mapped file and the converted output
+// with its qcow2 tables.
+func oneDiskNeed() uint64 {
+	l := uint64(importSourceLimit(1 << 20))
+	return 2*l + l/4096 + 16<<20
+}
 
 // concurrentImportServer is a server whose import filesystem has room, above
 // its headroom, for room bytes.
@@ -158,13 +162,7 @@ func TestImportVM_TheSecondOfTwoImportsThatDoNotFitIsRefused(t *testing.T) {
 // An archive's extraction is a write phase like a conversion: it reserves
 // what it unpacks, against what other imports have reserved.
 func TestImportVM_AnArchiveReservesWhatItUnpacks(t *testing.T) {
-	s := concurrentImportServer(t, 4<<20)
-	other := s.reserveImportSpace(t.TempDir())
-	defer other.release()
-	if err := other.reserve(t.TempDir(), 3<<20, "another import"); err != nil {
-		t.Fatal(err)
-	}
-
+	s := uploadImportServer(t, 5<<20)
 	var ova bytes.Buffer
 	tw := tar.NewWriter(&ova)
 	for _, m := range []struct {
@@ -174,13 +172,26 @@ func TestImportVM_AnArchiveReservesWhatItUnpacks(t *testing.T) {
 		if err := tw.WriteHeader(&tar.Header{Name: m.name, Mode: 0o600, Size: int64(m.size), Typeflag: tar.TypeReg}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := tw.Write(make([]byte, m.size)); err != nil {
+		if _, err := tw.Write(bytes.Repeat([]byte{1}, m.size)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	tw.Close()
+	staged := filepath.Join(s.dataDir, "imports", "staging", "vm.ova")
+	if err := os.MkdirAll(filepath.Dir(staged), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(staged, ova.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 3 MiB left above the headroom; another import holds 2 of them.
+	other := s.reserveImportSpace(t.TempDir())
+	defer other.release()
+	if err := other.reserve(s.dataDir, 2<<20, "another import"); err != nil {
+		t.Fatal(err)
+	}
 	st := &fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{{
-		Name: "imp-ova", SourceFormat: "ova", Chunk: ova.Bytes(),
+		Name: "imp-ova", SourceFormat: "ova", SourcePath: staged,
 	}}}
 	err := s.ImportVM(st)
 	if err == nil || !strings.Contains(err.Error(), "unpacking the source") || !strings.Contains(err.Error(), "reserved") {

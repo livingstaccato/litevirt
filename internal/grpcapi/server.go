@@ -606,6 +606,9 @@ type Server struct {
 	// reserved and not yet written (reserveImportSpace), so the free-space
 	// checks before each write are not glances two imports pass together.
 	importSpace importSpaceLedger
+	// fsKeyOverride is a TEST SEAM naming the filesystem a directory is on,
+	// for the import space ledger (importFSKey). Nil in production.
+	fsKeyOverride func(dir string) string
 
 	// firmwareTargets is what EnsureFirmwareState defined on this host as a
 	// cold firmware migration target, by attempt: the only domains

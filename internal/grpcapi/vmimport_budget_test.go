@@ -93,7 +93,7 @@ func TestImportSpace_AReservationIsNotGrantedTwice(t *testing.T) {
 	}
 	ra.release()
 	ra.release() // twice is safe
-	if err := rb.reserve(b, 10<<20, "b"); err != nil {
+	if err := rb.reserve(b, 8<<20, "b"); err != nil {
 		t.Fatalf("after the other import released its reservation: %v", err)
 	}
 }

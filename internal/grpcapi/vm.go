@@ -303,11 +303,10 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 	}
 	// Installer ISO: the guest reads it, so naming it is reading that host file.
-	// Gated here, after placement, because a pool ISO is judged against the
-	// SELECTED host's pools; it runs on the entry node (as the user) and again
-	// on the owner (see authorizeVMISO).
-	isoInPool, err := s.authorizeVMISO(ctx, project, targetHost, spec.Iso)
-	if err != nil {
+	// Gated here, after placement, because a library reference is judged
+	// against the SELECTED host's pools; it runs on the entry node (as the
+	// user) and again on the owner (see authorizeVMISO).
+	if err := s.authorizeVMISO(ctx, project, targetHost, spec); err != nil {
 		return nil, err
 	}
 	if targetHost != s.hostName {
@@ -317,8 +316,9 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
 	}
-	// The owner's own filesystem decides what the ISO path really is.
-	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+	// The owner's own filesystem decides which file the ISO is.
+	isoPath, err := s.resolveVMISO(ctx, spec.Iso)
+	if err != nil {
 		return nil, err
 	}
 
@@ -502,12 +502,13 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// Installer ISO: attach as a read-only CDROM and boot from it by default so
 	// the guest can install an OS (xmlgen renders IsISO disks as <cdrom>). The
-	// path is on the target host. Persisted in the spec JSON, so it survives.
-	// authorizeVMISO and checkVMISOFile admitted it above.
+	// spec.Iso (a library reference, or an admin's host path) is persisted in
+	// the spec JSON; the domain carries the file it resolved to on this host,
+	// which authorizeVMISO and resolveVMISO admitted above.
 	if spec.Iso != "" {
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  "installer",
-			Path:  spec.Iso,
+			Path:  isoPath,
 			IsISO: true,
 		})
 		if spec.Boot == "" {
@@ -860,9 +861,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 
 	// The ISO was judged before admission; an image pull can run in between,
 	// and qemu opens it at this boot, so it is judged again now.
-	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+	if again, err := s.resolveVMISO(ctx, spec.Iso); err != nil || again != isoPath {
 		claims.releaseAll(ctx)
 		cleanupDisks()
+		if err == nil {
+			err = status.Errorf(codes.FailedPrecondition, "iso %q now resolves to %s, not %s; retry the create", spec.Iso, again, isoPath)
+		}
 		return nil, err
 	}
 

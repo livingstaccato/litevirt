@@ -1738,6 +1738,52 @@ message DeleteStoragePoolContentRequest {
     string filename  = 3;
 }
 
+// One ISO a VM may name, as the reference VMSpec.iso takes.
+message ISOEntry {
+    string ref        = 1; // <pool>/<file>
+    string pool       = 2;
+    string project    = 3; // owning project; empty for the global library
+    string name       = 4;
+    int64  size_bytes = 5;
+    bool   global     = 6; // in the cluster-global library ("isos")
+    // Global library in sync mode only: "ok" when this host's copy matches the
+    // library, "syncing" while it does not yet, "not in library" for a file the
+    // library has no record of (a VM cannot start from it).
+    string sync_state = 7;
+}
+message ListISOsRequest {
+    string host    = 1; // optional — defaults to the answering host
+    string project = 2; // optional — only this project's libraries (plus the global one)
+}
+message ListISOsResponse { repeated ISOEntry isos = 1; }
+
+message PullISORequest {
+    string ref       = 1; // <pool>/<file>.iso — the library and the name to store it under
+    string host      = 2; // optional — the host whose pool receives it; defaults to the answering host
+    string url       = 3; // http(s) source; exactly one of url / host_path
+    string host_path = 4; // absolute path on that host (Admin: storage.hostpath at /)
+    string checksum  = 5; // optional sha256 the copy must match ("sha256:" prefix optional)
+}
+message PullISOResponse {
+    string ref        = 1;
+    string sha256     = 2;
+    int64  size_bytes = 3;
+}
+
+message ISOLibraryMode {
+    string mode       = 1; // sync | shared
+    string set_by     = 2;
+    string updated_at = 3;
+    bool   settable   = 4; // false until failover_scope_v1 has latched on every host
+}
+message SetISOLibraryModeRequest { string mode = 1; }
+
+message FetchISOLibraryFileRequest {
+    string name   = 1; // file name in the global library
+    string sha256 = 2; // the copy is served only if it matches
+}
+message FetchISOLibraryFileChunk { bytes chunk = 1; }
+
 // Client-streaming incremental replica push. The first message is the header
 // (pool/host/filename/base/total_size); subsequent messages each carry one
 // dirty extent (offset,data) written into a new RAW replica. When base is set
@@ -3228,6 +3274,23 @@ service LiteVirt {
     rpc RemoveSecurityGroupRule(RemoveSecurityGroupRuleRequest)     returns (google.protobuf.Empty);
     rpc ListSecurityGroups(ListSecurityGroupsRequest)               returns (ListSecurityGroupsResponse);
     rpc DeleteStoragePoolContent(DeleteStoragePoolContentRequest) returns (google.protobuf.Empty);
+
+    // ── ISO libraries (docs/storage.md, "Installer ISOs") ──
+    // A VM names its installer ISO as <pool>/<file>.iso. ListISOs lists what
+    // the caller may name on a host: its projects' libraries, then the
+    // cluster-global library "isos".
+    rpc ListISOs(ListISOsRequest)                       returns (ListISOsResponse);
+    // PullISO copies an ISO into a library from a URL (the image-pull limits
+    // apply) or, for an Admin, from a host path. A copy, never a link.
+    rpc PullISO(PullISORequest)                         returns (PullISOResponse);
+    // GetISOLibraryMode / SetISOLibraryMode: where the global library lives —
+    // "sync" (a verified copy on every host) or "shared" (one pool on shared
+    // storage). Setting it needs the admin role and failover_scope_v1.
+    rpc GetISOLibraryMode(google.protobuf.Empty)        returns (ISOLibraryMode);
+    rpc SetISOLibraryMode(SetISOLibraryModeRequest)     returns (ISOLibraryMode);
+    // Peer-only: stream this host's copy of a global-library file whose sha256
+    // matches, so another host can sync it.
+    rpc FetchISOLibraryFile(FetchISOLibraryFileRequest) returns (stream FetchISOLibraryFileChunk);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);
 

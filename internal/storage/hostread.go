@@ -30,11 +30,17 @@ var secretRoots = []string{
 	"/var/lib/libvirt/qemu", "/var/lib/libvirt/swtpm",
 }
 
+// ISOLibraryDir is the directory under the data directory that holds the
+// built-in global ISO library pool. A guest may be given a file in it to read;
+// no pool other than that library may be created in it (CheckWriteRoot still
+// refuses it, as it does the rest of the data directory).
+const ISOLibraryDir = "isos"
+
 // CheckReadFile refuses a host file no VM may be given to read: a relative or
 // unclean path (one that still carries a "." or ".." to resolve), anything
 // under a secret system directory, anything in or below the daemon's PKI
-// directory, and anything in its data directory outside disks/ and mounts/
-// (state.db, cloudinit/, nvram/, imports/, images/ …). The path is judged as
+// directory, and anything in its data directory outside disks/, mounts/ and
+// isos/ (state.db, cloudinit/, nvram/, imports/, images/ …). The path is judged as
 // written and after resolving symlinks, so a link at an innocent name does not
 // reach a refused file. It must also exist and be a regular file once resolved:
 // a device, directory or FIFO is never an ISO.
@@ -117,8 +123,8 @@ func refuseSecretPath(p, cand, dataDir, pkiDir string) error {
 	}
 	if dataDir != "" {
 		for _, d := range pathForms(dataDir) {
-			if within(d, cand) && !inPoolArea(d, cand) {
-				return fmt.Errorf("%q is inside the daemon's data directory %s; only its disks/ and mounts/ hold pool content", p, dataDir)
+			if within(d, cand) && !inPoolArea(d, cand) && !within(filepath.Join(d, ISOLibraryDir), cand) {
+				return fmt.Errorf("%q is inside the daemon's data directory %s; only its disks/, mounts/ and isos/ hold pool content", p, dataDir)
 			}
 		}
 	}

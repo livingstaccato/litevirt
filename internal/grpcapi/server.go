@@ -49,6 +49,10 @@ type Server struct {
 	// SupersededDisks (superseded_disks.go).
 	supersededRetentionDays int
 
+	// isoLib holds the ISO library's per-host state: the sha256 cache of
+	// library files and the one-sync-pass-at-a-time lock (iso_library.go).
+	isoLib isoLibraryState
+
 	// Admission-gate local-inventory cache (see localInventoryCached).
 	invCacheMu sync.Mutex
 	invCache   runtimeInventory

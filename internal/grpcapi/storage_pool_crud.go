@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 
 	"google.golang.org/grpc/codes"
@@ -98,6 +100,10 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		defer conn.Close()
 		req.Host = host
 		return client.CreateStoragePool(ctx, req)
+	}
+
+	if err := s.refuseGlobalISOLibraryOverlap(ctx, req); err != nil {
+		return nil, err
 	}
 
 	driver, err := storage.New(s.dataDir, storage.Config{
@@ -321,4 +327,50 @@ func (s *Server) poolReferenceGuard(ctx context.Context, host, name string, forc
 			name, host, detail)
 	}
 	return nil
+}
+
+// refuseGlobalISOLibraryOverlap keeps every other pool out of the global ISO
+// library's directory: a pool there (or above or below it) would let its
+// writers put files in the library, which only an Admin may write.
+func (s *Server) refuseGlobalISOLibraryOverlap(ctx context.Context, req *pb.CreateStoragePoolRequest) error {
+	if !isFileBasedDriver(req.Driver) || (req.Name == globalISOLibrary && req.Project == "") {
+		return nil
+	}
+	lib, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, globalISOLibrary)
+	if err != nil {
+		return status.Errorf(codes.Internal, "lookup %s: %v", globalISOLibrary, err)
+	}
+	if !ok || !isGlobalISOLibrary(lib) {
+		return nil
+	}
+	libDir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: lib.Driver, Source: lib.Source, Target: lib.Target})
+	if err != nil {
+		return nil
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target})
+	if err != nil {
+		return nil // the driver reports a pool it cannot place
+	}
+	forms := func(p string) []string {
+		out := []string{filepath.Clean(p)}
+		if r, err := filepath.EvalSymlinks(p); err == nil && r != out[0] {
+			out = append(out, r)
+		}
+		return out
+	}
+	for _, a := range forms(dir) {
+		for _, b := range forms(libDir) {
+			if pathWithin(a, b) || pathWithin(b, a) {
+				return status.Errorf(codes.InvalidArgument,
+					"pool directory %s overlaps the global ISO library's directory %s; choose another directory", dir, libDir)
+			}
+		}
+	}
+	return nil
+}
+
+// pathWithin reports whether p is dir or below it.
+func pathWithin(dir, p string) bool {
+	rel, err := filepath.Rel(dir, p)
+	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))))
 }

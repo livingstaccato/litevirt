@@ -583,6 +583,13 @@ func (s *Server) deleteDiskAtRecordedLocation(ctx context.Context, d *corrosion.
 func (s *Server) protectedDiskPathsFrom(ctx context.Context, vmName string, candidates []string) map[string]bool {
 	keep := make(map[string]bool, len(candidates))
 	for _, path := range candidates {
+		// An upload (an older one, from before uploads into <data_dir>/disks
+		// went to disks/uploads) is a project's file, not a VM's debris,
+		// whatever its name.
+		if s.isRecordedUpload(path) {
+			keep[path] = true
+			continue
+		}
 		referrers, rerr := corrosion.DisksReferencingPath(ctx, s.db, path)
 		if rerr != nil {
 			// FAIL CLOSED, which is what this function's comment always claimed

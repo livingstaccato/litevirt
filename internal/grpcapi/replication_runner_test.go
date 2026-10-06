@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -88,6 +89,66 @@ func TestPruneReplicasRemote(t *testing.T) {
 	for _, d := range c.deleted {
 		if !want[d] {
 			t.Errorf("deleted unexpected %q (should keep newest + other VM)", d)
+		}
+	}
+}
+
+// viewRecordingClient records whether each content call carried the
+// daemon's own marker (poolContentViewMDKey).
+type viewRecordingClient struct {
+	pb.LiteVirtClient
+	marked map[string]bool
+}
+
+func (f *viewRecordingClient) note(ctx context.Context, rpc string) {
+	md, _ := metadata.FromOutgoingContext(ctx)
+	v := md.Get(poolContentViewMDKey)
+	f.marked[rpc] = len(v) > 0 && v[0] == "all"
+}
+
+func (f *viewRecordingClient) ListStoragePoolContents(ctx context.Context, _ *pb.ListStoragePoolContentsRequest, _ ...grpc.CallOption) (*pb.ListStoragePoolContentsResponse, error) {
+	f.note(ctx, "list")
+	return &pb.ListStoragePoolContentsResponse{Contents: []*pb.StoragePoolContent{
+		{Name: "vm1-root-20260101-000000.qcow2"}, {Name: "vm1-root-20260102-000000.qcow2"},
+	}}, nil
+}
+
+func (f *viewRecordingClient) DeleteStoragePoolContent(ctx context.Context, _ *pb.DeleteStoragePoolContentRequest, _ ...grpc.CallOption) (*emptypb.Empty, error) {
+	f.note(ctx, "delete")
+	return &emptypb.Empty{}, nil
+}
+
+type nopUploadClient struct {
+	grpc.ClientStream
+}
+
+func (nopUploadClient) Send(*pb.UploadStoragePoolContentRequest) error { return nil }
+func (nopUploadClient) CloseAndRecv() (*pb.UploadStoragePoolContentResponse, error) {
+	return &pb.UploadStoragePoolContentResponse{}, nil
+}
+
+func (f *viewRecordingClient) UploadStoragePoolContent(ctx context.Context, _ ...grpc.CallOption) (grpc.ClientStreamingClient[pb.UploadStoragePoolContentRequest, pb.UploadStoragePoolContentResponse], error) {
+	f.note(ctx, "upload")
+	return nopUploadClient{}, nil
+}
+
+// C1: replication's own content calls on a peer's pool — the replica upload,
+// and pruning's listing and deletes — say they are the daemon's, so the pool's
+// host shows them every file. Without the marker, a peer call with no user
+// identity is nobody and sees library media only: pruning would find nothing.
+func TestReplicationContentCallsAreTheDaemons(t *testing.T) {
+	c := &viewRecordingClient{marked: map[string]bool{}}
+	pruneReplicasRemote(context.Background(), c, "dr", "host-b", "vm1", "root", 1)
+	f := filepath.Join(t.TempDir(), "vm1-root-x.qcow2")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := streamFileToPool(context.Background(), c, f, "dr", "host-b", "vm1-root-x.qcow2"); err != nil {
+		t.Fatal(err)
+	}
+	for _, rpc := range []string{"list", "delete", "upload"} {
+		if !c.marked[rpc] {
+			t.Errorf("replication's %s call does not carry the daemon's marker", rpc)
 		}
 	}
 }

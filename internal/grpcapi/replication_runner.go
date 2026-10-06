@@ -264,7 +264,8 @@ func streamFileToPool(ctx context.Context, client pb.LiteVirtClient, path, pool,
 		return err
 	}
 	defer f.Close()
-	up, err := client.UploadStoragePoolContent(ctx)
+	// The daemon's own upload (a replica): never a user's, never recorded.
+	up, err := client.UploadStoragePoolContent(withPoolContentViewAll(ctx))
 	if err != nil {
 		return err
 	}
@@ -297,6 +298,9 @@ func pruneReplicasRemote(ctx context.Context, client pb.LiteVirtClient, pool, ho
 	if keepN <= 0 {
 		return 0
 	}
+	// The daemon's own listing and pruning see every file, whoever started
+	// the run.
+	ctx = withPoolContentViewAll(ctx)
 	resp, err := client.ListStoragePoolContents(ctx, &pb.ListStoragePoolContentsRequest{PoolName: pool, Host: host})
 	if err != nil {
 		return 0

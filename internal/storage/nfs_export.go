@@ -133,3 +133,9 @@ func OverrideNFSResolverForTest(f func(ctx context.Context, host string) ([]neti
 // this host's mounts; they compare their NFS pools against the recorded export.
 // The daemon sets it; a request may not.
 const NFSExportOption = "nfs_export"
+
+// DataDisksExportOption is the option key under which a host records, on the
+// pool rows it registers at start, the export its <data_dir>/disks is on when
+// that is on NFS. Every VM's local disks on that host are there: no pool on
+// any host may hold that export. The daemon sets it; a request may not.
+const DataDisksExportOption = "data_disks_nfs_export"

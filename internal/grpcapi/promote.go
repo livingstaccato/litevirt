@@ -520,7 +520,8 @@ func (s *Server) poolContentNames(ctx context.Context, pool, host string) []stri
 		return nil
 	}
 	defer conn.Close()
-	resp, err := client.ListStoragePoolContents(ctx, &pb.ListStoragePoolContentsRequest{PoolName: pool, Host: host})
+	// The daemon's own listing: every file, as the local branch reads.
+	resp, err := client.ListStoragePoolContents(withPoolContentViewAll(ctx), &pb.ListStoragePoolContentsRequest{PoolName: pool, Host: host})
 	if err != nil {
 		return nil
 	}

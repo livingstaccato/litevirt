@@ -96,8 +96,9 @@ resize and delete those disks, snapshot the VMs, and replicate and move disks
 onto it. A `zfs` or `lvm-thin` pool is used exactly like a file pool — the
 disks become zvols (`<dataset>/<vm>-<disk>`) or thin LVs (`<vg>/<vm>-<disk>`).
 Resizing such a disk grows the volume itself (`zfs set volsize=`, `lvextend`;
-the size is rounded up to whole MiB), and a running VM's qemu is then told the
-new size. Disks only grow.
+the size is rounded up to whole MiB, at most 16 PiB), and a running VM's qemu
+is then told the new size. Disks only grow, and a volume whose size litevirt
+has not recorded is not resized, since a grow could not be told from a shrink.
 
 Every source is checked against its driver's form before any tool sees it —
 `server:/export` for nfs, a pool, dataset or volume-group name for ceph, zfs
@@ -164,8 +165,18 @@ pool on the same export, on any host — except the same pool, the same name
 and project, defined on several hosts, which is how one fstab-mounted
 directory is shared for migration. The pool row records that export in its
 options (`nfs_export`) so other hosts, which cannot see this host's mounts,
-compare against it; the daemon sets it, and a request that sets it is
-refused.
+compare against it; the daemon sets it, at create and again at every start
+(so a pool made by an older build, or whose fstab mount changed, is compared
+by what it is now), and a request that sets it is refused. The exception for
+the same pool on several hosts holds only for the exact same export and the
+same kind of pool (two `nfs` pools, or two directory pools), never between an
+`nfs` pool and a directory pool, and never for a directory whose content is
+confined (`<data_dir>/disks`, or one several pools share).
+
+A host whose data directory is on NFS records the export its
+`<data_dir>/disks` is on (`data_disks_nfs_export`, on the pool rows it
+registers at start). Every VM's local disks on that host are there: no pool
+on any host may use that export, or one inside or around it.
 
 The same rules apply to compose `volumes:`, which are pools by another name,
 and a compose `backup-repos:` path needs the same authority (see
@@ -200,10 +211,26 @@ what their content operations — listing, upload, delete, the UI's ISO browser 
 show and touch is confined, per file, to what the caller's project owns by
 record:
 
-- the disks of the caller's VMs (as their own file or as a backing file);
-- replicas of those disks that a replication schedule wrote into this pool;
+- the disks of the caller's VMs on this host (as their own file or as a
+  backing file), including disks kept after the VM was deleted;
+- replicas of those disks, by an exact replica record — never by a file's
+  name: a file named like a replica (`<vm>-<disk>-<time>.qcow2`) is an
+  unowned disk image until such a record names it;
 - files uploaded into this pool while it belonged to its current project (a
   global pool's uploads are visible to everyone who may use the pool).
+
+The caller is the user who made the call, on whichever node it entered: a
+listing, upload or delete forwarded to the pool's host carries the user's
+identity there and is confined as that user. A call from another node that
+carries no user identity sees only library media and deletes nothing; the
+daemon's own replication and promote calls mark themselves and see every
+file.
+
+Uploads into a pool on `<data_dir>/disks` land in `<data_dir>/disks/uploads/`
+and are listed with the pool's other content: the VM disks' own names
+(`<vm>-<disk>.qcow2`) are never taken by an upload, so creating, deleting or
+migrating a VM never meets one, and the VM-disk debris sweep never removes a
+recorded upload. Files uploaded there by an older build stay where they are.
 
 Installer media — an `.iso`, plain or compressed (`.iso.gz`, `.iso.xz`,
 `.iso.zst`, `.iso.bz2`) — that no record refers to (no VM disk row on any
@@ -221,7 +248,8 @@ restore — may be any project's, and is listed and deletable only by such a
 caller.
 Another project's file is reported as not there. Uploads are recorded in
 `<data_dir>/pool-uploads.json` on the pool's host, bound to the file itself
-(device and inode), so a file put at an uploaded name afterwards is nobody's.
+(device, inode, size and modification time), so a file put at an uploaded name
+afterwards, or the upload rewritten, is nobody's.
 A pool whose directory is its own is not confined: its project sees
 everything in it.
 

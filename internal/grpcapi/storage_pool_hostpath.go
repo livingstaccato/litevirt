@@ -432,24 +432,55 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 		exp   storage.NFSExport
 	}
 	var overlapping []nfsRow // other servers' exports whose paths overlap
+	compare := func(label string, theirs storage.NFSExport) (string, string, bool) {
+		if !mine.PathsOverlap(theirs) {
+			return "", "", false
+		}
+		if theirs.Server == mine.Server {
+			return label, "the same NFS export, or one inside the other", true
+		}
+		overlapping = append(overlapping, nfsRow{label, theirs})
+		return "", "", false
+	}
+	// Every host's <data_dir>/disks on NFS is an export no pool but the one
+	// on that very directory may hold: it is every VM's local disks on that
+	// host. This host's is read live; another's is the one it recorded.
+	if mine != nil {
+		if own, err := s.dataDisksExport(&mt); err != nil {
+			return "", "", err
+		} else if own != nil && !storage.IsDataDirDisks(dir, s.dataDir) {
+			if l, w, hit := compare(s.hostName+"/<data_dir>/disks", *own); hit {
+				return l, w, nil
+			}
+		}
+	}
+	confinedHere := dir != "" && !isNFS && s.dirConfinedAmong(rows, name, dir)
 	for _, r := range rows {
 		if r.HostName == s.hostName && r.Name == name {
 			continue // this pool's own row
 		}
 		label := r.HostName + "/" + r.Name
 		rref := StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target, Options: r.Options}
-		if mine != nil && !(r.Name == name && r.Project == *project) {
+		if mine != nil && r.HostName != s.hostName {
+			if rec := r.Options[storage.DataDisksExportOption]; rec != "" {
+				if e, err := storage.ParseNFSExport(rec); err == nil {
+					if l, w, hit := compare(r.HostName+"/<data_dir>/disks", e); hit {
+						return l, w, nil
+					}
+				}
+			}
+		}
+		if mine != nil {
 			// A row whose source does not parse is refused for every use by
 			// CheckConfig; it mounts nothing.
 			theirs, err := s.poolExportOf(&mt, r.HostName, rref)
 			if err != nil && r.HostName == s.hostName && !strings.EqualFold(r.Driver, "nfs") {
 				return "", "", err
 			}
-			if err == nil && theirs != nil && mine.PathsOverlap(*theirs) {
-				if theirs.Server == mine.Server {
-					return label, "the same NFS export, or one inside the other", nil
+			if err == nil && theirs != nil && !samePoolOnAnotherHost(name, *project, ref, *mine, r, rref, *theirs, confinedHere) {
+				if l, w, hit := compare(label, *theirs); hit {
+					return l, w, nil
 				}
-				overlapping = append(overlapping, nfsRow{label, *theirs})
 			}
 		}
 		if r.HostName != s.hostName || dir == "" || !isFileBasedDriver(r.Driver) {
@@ -481,6 +512,60 @@ func (s *Server) poolSharedWith(ctx context.Context, name string, project *strin
 		}
 	}
 	return "", "", nil
+}
+
+// samePoolOnAnotherHost reports whether row r is the same pool as the one
+// being checked, defined on another host: the same name, project, kind of
+// pool (both nfs, or both directory pools) and the exact same export. That is
+// one logical pool, which may share its storage with itself. Never a pool
+// whose directory is confined (<data_dir>/disks, or a directory other pools
+// on its host share), on either side: its content is filtered per file there,
+// and the other host's view of the same export would not be.
+func samePoolOnAnotherHost(name, project string, ref StoragePoolRef, mine storage.NFSExport, r corrosion.StoragePoolRecord, rref StoragePoolRef, theirs storage.NFSExport, confinedHere bool) bool {
+	if r.Name != name || r.Project != project || theirs != mine || confinedHere {
+		return false
+	}
+	nfsA, nfsB := strings.EqualFold(ref.Driver, "nfs"), strings.EqualFold(rref.Driver, "nfs")
+	if nfsA != nfsB {
+		return false
+	}
+	if !nfsA && (rref.Target == "" || filepath.Base(filepath.Clean(rref.Target)) == "disks") {
+		return false // another host's <data_dir>/disks pool, as far as its row tells
+	}
+	return true
+}
+
+// dirConfinedAmong reports whether dir is <data_dir>/disks, or overlaps the
+// directory of another directory pool of this host in rows.
+func (s *Server) dirConfinedAmong(rows []corrosion.StoragePoolRecord, name, dir string) bool {
+	if storage.IsDataDirDisks(dir, s.dataDir) {
+		return true
+	}
+	for _, r := range rows {
+		if r.HostName != s.hostName || r.Name == name || !isFileBasedDriver(r.Driver) || strings.EqualFold(r.Driver, "nfs") {
+			continue
+		}
+		if d, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target}); err == nil && storage.DirsOverlap(dir, d) {
+			return true
+		}
+	}
+	return false
+}
+
+// dataDisksExport is the export this host's <data_dir>/disks is on, or nil.
+func (s *Server) dataDisksExport(mt *storage.MountTable) (*storage.NFSExport, error) {
+	if mt.Empty() {
+		t, err := storage.ReadMountTable()
+		if err != nil {
+			return nil, err
+		}
+		*mt = t
+	}
+	b, err := mt.NFSBackingOf(filepath.Join(s.dataDir, "disks"))
+	if err != nil || b == nil {
+		return nil, err
+	}
+	return &b.Export, nil
 }
 
 // dirEntryCount is how many entries dir holds (0 when it does not exist).

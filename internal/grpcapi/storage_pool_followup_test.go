@@ -65,8 +65,8 @@ func TestPoolFollowup_UnownedImagesAreLibraryContent(t *testing.T) {
 // Follow-up 2: unowned library content is installer media only. An unowned
 // disk image (.qcow2, .raw, .img, …) may be any project's — it is an
 // admin's, not library content. A disk kept after its VM was deleted (or
-// detached) is still owned, through its tombstoned rows, on any host: its
-// project sees it, nobody else does.
+// detached) is still owned, through its tombstoned rows: its project sees it
+// (a row on this host), nobody else does (a row on any host hides it).
 func TestPoolFollowup2_LibraryIsMediaAndKeptDisksStayOwned(t *testing.T) {
 	s := newPoolTestServer(t)
 	disks := filepath.Join(s.dataDir, "disks")
@@ -96,8 +96,10 @@ func TestPoolFollowup2_LibraryIsMediaAndKeptDisksStayOwned(t *testing.T) {
 	if got := listNames(t, s, pat, "default"); !slices.Equal(got, []string{"debian.iso", "win.iso.xz"}) {
 		t.Errorf("acme's listing = %v, want only the ISOs", got)
 	}
-	if got := listNames(t, s, bob, "default"); !slices.Equal(got, []string{"bvm-root.qcow2", "cvm-root.raw", "debian.iso", "win.iso.xz"}) {
-		t.Errorf("bravo's listing = %v, want its kept disks and the ISOs", got)
+	// cvm's row is on host-b: it describes host-b's file at that path, not
+	// this one, so it hides the file here (owned) without giving it to bravo.
+	if got := listNames(t, s, bob, "default"); !slices.Equal(got, []string{"bvm-root.qcow2", "debian.iso", "win.iso.xz"}) {
+		t.Errorf("bravo's listing = %v, want its kept disk on this host and the ISOs", got)
 	}
 	if got := listNames(t, s, adminCtx(), "default"); !slices.Contains(got, "other-project.qcow2") || !slices.Contains(got, "old.img") {
 		t.Errorf("the admin's listing lacks the unowned disk images: %v", got)

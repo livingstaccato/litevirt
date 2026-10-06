@@ -63,9 +63,11 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return nil, status.Errorf(codes.InvalidArgument,
 			"unknown driver %q (supported: %v)", req.Driver, storage.SupportedDrivers)
 	}
-	if _, ok := req.Options[storage.NFSExportOption]; ok {
-		return nil, status.Errorf(codes.InvalidArgument,
-			"option %q is recorded by the daemon, not set in a request", storage.NFSExportOption)
+	for _, k := range []string{storage.NFSExportOption, storage.DataDisksExportOption} {
+		if _, ok := req.Options[k]; ok {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"option %q is recorded by the daemon, not set in a request", k)
+		}
 	}
 
 	host := req.Host

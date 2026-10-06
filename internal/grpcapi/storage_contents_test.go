@@ -146,8 +146,14 @@ func TestStoragePoolContents_PeerBypassesProjectRBAC(t *testing.T) {
 	if _, err := s.ListStoragePoolContents(peer, &pb.ListStoragePoolContentsRequest{PoolName: "poolB"}); err != nil {
 		t.Fatalf("peer should be allowed on poolB, got %v", err)
 	}
-	if _, err := s.DeleteStoragePoolContent(peer, &pb.DeleteStoragePoolContentRequest{PoolName: "poolB", Filename: "absent.iso"}); err != nil {
-		t.Fatalf("peer delete (absent file) should be allowed, got %v", err)
+	// Deleting is the daemon's own flow (replication pruning), which says so;
+	// a peer carrying no identity and no such marker is nobody, and deletes
+	// nothing (a forwarded user call carries the user — see round5 tests).
+	if _, err := s.DeleteStoragePoolContent(withContentView(peer, "all"), &pb.DeleteStoragePoolContentRequest{PoolName: "poolB", Filename: "absent.iso"}); err != nil {
+		t.Fatalf("the daemon's own delete (absent file) should be allowed, got %v", err)
+	}
+	if _, err := s.DeleteStoragePoolContent(peer, &pb.DeleteStoragePoolContentRequest{PoolName: "poolB", Filename: "absent.iso"}); err == nil {
+		t.Fatalf("a peer with no identity deleted pool content")
 	}
 }
 

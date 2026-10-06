@@ -1857,7 +1857,12 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 			Target: d.defaultPoolDir(ctx),
 		}}
 	}
+	// <data_dir>/disks on NFS is an export no pool on any host may hold:
+	// every row this host registers records it (storage.DataDisksExportOption).
+	disksExp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: "dir", Target: filepath.Join(d.cfg.DataDir, "disks")})
+	configured := map[string]bool{}
 	for _, p := range pools {
+		configured[p.Name] = true
 		rec := corrosion.StoragePoolRecord{
 			HostName: d.cfg.HostName,
 			Name:     p.Name,
@@ -1868,8 +1873,15 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		}
 		// A directory pool on an NFS mount records the export it is on, so
 		// other hosts compare their pools against it (storage.NFSExportOption).
+		opts := map[string]string{}
 		if exp := nfsExportOfDirPool(d.cfg.DataDir, p); exp != "" {
-			rec.Options = map[string]string{storage.NFSExportOption: exp}
+			opts[storage.NFSExportOption] = exp
+		}
+		if disksExp != "" {
+			opts[storage.DataDisksExportOption] = disksExp
+		}
+		if len(opts) > 0 {
+			rec.Options = opts
 		}
 		if p.Target != "" {
 			var st syscall.Statfs_t
@@ -1883,6 +1895,48 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 		}
 		if err := corrosion.UpsertStoragePool(ctx, d.db, rec); err != nil {
 			slog.Warn("failed to register storage pool", "pool", p.Name, "error", err)
+		}
+	}
+	d.refreshDirPoolExports(ctx, configured)
+}
+
+// refreshDirPoolExports records, on this host's directory pools created
+// through the API, the export each one's directory is on now (or drops a
+// recorded one that no longer holds): read at start from the mount table, so
+// a pool created by an older build, or whose fstab mount has changed, is
+// compared on other hosts by what it is today. Only rows whose record
+// differs are written.
+func (d *Daemon) refreshDirPoolExports(ctx context.Context, configured map[string]bool) {
+	rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+	if err != nil {
+		slog.Warn("storage pools: cannot refresh recorded NFS exports", "error", err)
+		return
+	}
+	for _, r := range rows {
+		switch strings.ToLower(r.Driver) {
+		case "", "local", "dir", "btrfs":
+		default:
+			continue
+		}
+		if configured[r.Name] {
+			continue
+		}
+		exp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: r.Driver, Source: r.Source, Target: r.Target})
+		if r.Options[storage.NFSExportOption] == exp {
+			continue
+		}
+		opts := make(map[string]string, len(r.Options)+1)
+		for k, v := range r.Options {
+			opts[k] = v
+		}
+		if exp == "" {
+			delete(opts, storage.NFSExportOption)
+		} else {
+			opts[storage.NFSExportOption] = exp
+		}
+		r.Options = opts
+		if err := corrosion.UpsertStoragePool(ctx, d.db, r); err != nil {
+			slog.Warn("storage pools: cannot record a pool's NFS export", "pool", r.Name, "error", err)
 		}
 	}
 }

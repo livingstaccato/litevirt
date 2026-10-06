@@ -242,7 +242,6 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	// ── Define → persist stopped → optional start, with full rollback ──
 	cfg := fv.ToVMConfig()
-	cfg.SparePCIeRootPorts = s.sparePCIeRootPortsCfg
 	spec := fv.ToVMSpec(project)
 
 	// An import DEFINES a brand-new domain, so it takes the node's cpu_mode
@@ -296,6 +295,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		}
 		return status.Errorf(codes.Internal, "define domain: %v", err)
 	}
+	s.ensureSparePCIeRootPorts(name)
 
 	// The define above resolved any machine alias against this host's qemu;
 	// persist the concrete value so the imported VM's guest ABI travels with it.

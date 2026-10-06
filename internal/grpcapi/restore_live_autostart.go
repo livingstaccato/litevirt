@@ -267,20 +267,19 @@ func (s *Server) autoDefineRestoredVM(
 	}
 
 	vmCfg := lv.VMConfig{
-		Name:               targetName,
-		CPU:                int(spec.Cpu),
-		CPUMode:            spec.CpuMode,
-		CPUModel:           spec.CpuModel,
-		MemoryMiB:          int(spec.MemoryMib),
-		Machine:            spec.Machine,
-		Firmware:           spec.Firmware,
-		GuestAgent:         spec.GuestAgent,
-		EnableVNC:          !spec.DisableVnc,
-		EnableSPICE:        spec.EnableSpice,
-		Disks:              diskCfg,
-		Networks:           netCfg,
-		Boot:               spec.Boot,
-		SparePCIeRootPorts: s.sparePCIeRootPortsCfg,
+		Name:        targetName,
+		CPU:         int(spec.Cpu),
+		CPUMode:     spec.CpuMode,
+		CPUModel:    spec.CpuModel,
+		MemoryMiB:   int(spec.MemoryMib),
+		Machine:     spec.Machine,
+		Firmware:    spec.Firmware,
+		GuestAgent:  spec.GuestAgent,
+		EnableVNC:   !spec.DisableVnc,
+		EnableSPICE: spec.EnableSpice,
+		Disks:       diskCfg,
+		Networks:    netCfg,
+		Boot:        spec.Boot,
 	}
 	// Firmware fields (G1): point the domain at the just-materialized NVRAM
 	// (name-keyed) + the fresh UUID whose swtpm dir we re-homed the state into.
@@ -317,6 +316,9 @@ func (s *Server) autoDefineRestoredVM(
 		_ = s.virt.UndefineDomain(targetName, false)
 		return "", "", hwErr
 	}
+	// Spare root ports last, as in the reconciler's start: a device the
+	// pre-start patches in would otherwise land on a spare.
+	s.ensureSparePCIeRootPorts(targetName)
 	if err := s.virt.StartDomain(targetName); err != nil {
 		releaseHW()
 		// Roll back the definition but KEEP the overlay + NBD so the operator can

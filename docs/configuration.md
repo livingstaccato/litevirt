@@ -126,15 +126,22 @@ pci:
   # /etc/udev/rules.d/99-litevirt-pci.rules (an upgrade cleans up the litevirt one).
   udev_hook: false
 
-  # Extra, empty pcie-root-port controllers a NEWLY-DEFINED q35 domain gets
-  # beyond what its disks/NICs/hostdevs need, so a later hot-plug (disk, NIC,
-  # or PCI) has somewhere to land. With none spare, a live attach once every
-  # root port already holds a device fails with libvirt's "No more available
-  # PCI slots" (FailedPrecondition, not a generic internal error). Default 4;
-  # an explicit 0 restores the pre-this-feature behavior. See
-  # docs/pci-passthrough.md "Hot-plug" for the full story, including why this
-  # does NOT retroactively change an existing VM and is a non-issue for live
-  # or cold migration.
+  # Free pcie-root-port controllers a NEWLY-DEFINED q35 domain is left with —
+  # ports none of its own disks/NICs/hostdevs sit on — so a later hot-plug
+  # (disk, NIC, or PCI) has somewhere to land. They are added right after the
+  # define, from the addresses libvirt assigned. With none free, a live attach
+  # fails with libvirt's "No more available PCI slots" (FailedPrecondition, not
+  # a generic internal error). Default 4; an explicit 0 adds none, leaving the
+  # one spare libvirt adds on its own. See docs/pci-passthrough.md "Spare PCIe
+  # root ports" for what existing VMs get (no backfill) and why this is a
+  # non-issue for live or cold migration.
+  #
+  # The value counts spares only: they are added on top of the root ports the
+  # VM's own devices use (five for one disk and one NIC), so the maximum, 16,
+  # can mean more than 20 root ports in total. Guest firmware reserves I/O and
+  # memory windows for every root port and may fail to enumerate devices
+  # beyond roughly 15 root ports in total; keep the value small on VMs with
+  # many disks, NICs or PCI devices.
   spare_pcie_root_ports: 4
 
   # SR-IOV configuration.

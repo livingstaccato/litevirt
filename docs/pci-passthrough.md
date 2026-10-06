@@ -174,19 +174,42 @@ PCIe root ports"): internal error: No more available PCI slots
 ```
 
 `pci.spare_pcie_root_ports` (default 4, see configuration.md) is the number of
-EXTRA, empty root ports a NEWLY-DEFINED q35 domain carries beyond what its
-disks/NICs/hostdevs need at define time — headroom for later hot-plugs. A
-rolled-back attach is as clean as any other failed attach: nothing is left
-partially attached and the VM's mutation barrier is released.
+root ports a NEWLY-DEFINED q35 domain is left with that none of its own devices
+sit on — headroom for later hot-plugs. A rolled-back attach is as clean as any
+other failed attach: nothing is left partially attached and the VM's mutation
+barrier is released.
+
+**The spares are added after libvirt has placed the domain's devices.** libvirt
+puts every device that has no PCI address — including the USB and
+virtio-serial controllers it adds by itself — on the first free root port, and
+only creates new ports for what is still unplaced. Root ports declared in the
+generated XML would just be filled by the VM's own disk, NIC and balloon. So
+litevirt defines the domain without any, reads back what libvirt assigned
+(`virsh dumpxml --inactive`), and redefines it with as many new, empty ports
+as it is short of the configured number. On libvirt 10, a VM with one disk
+and one NIC uses five ports; libvirt leaves one free on its own, and the
+top-up adds three. The top-up is best effort: if it fails, the VM is still
+created, with the one spare libvirt left, and a warning is logged.
+
+A cold attach (to a stopped VM) also takes a free root port, so it uses up a
+spare just as a live attach does; detaching a device frees its port again.
 
 **This does not retroactively change an existing VM.** The value is daemon
 config, not part of a VM's persisted spec. A redefine that preserves the
 existing domain XML in place (device hot-plug on a stopped VM, most reconciler
-sweeps) never touches the controller list, so an existing VM keeps exactly the
-root-port count it was created with. Only a FULL regenerate — create, import,
-clone, promote, or the rarer update/reconcile paths that can't patch in place —
-picks up the node's current value. There is no backfill command; an existing
-VM converges the next time (if ever) its definition is fully regenerated.
+sweeps, migration) never touches the controller list, so an existing VM keeps
+exactly the root ports it has. Only a FULL regenerate — create, import, clone,
+promote, live-restore, a failover start, or the rarer update/reconcile paths
+that can't patch in place — tops up to the node's current value. There is no
+backfill command. In practice:
+
+- a VM created before spare ports existed has the one free port libvirt
+  left it;
+- a VM created by a build that declared the spares in its generated XML
+  (the first version of this feature) has none free: its first hot-plug
+  fails with `FailedPrecondition` until a device is detached;
+- either kind gets the configured spares only when its definition is fully
+  regenerated, or by making a new domain from it with `lv clone`.
 
 **This is a non-issue for migration.** Neither live nor cold migration ever
 regenerates a domain's XML from spec: live migration streams the source's

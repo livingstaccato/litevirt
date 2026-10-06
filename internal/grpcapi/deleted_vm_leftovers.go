@@ -31,8 +31,10 @@ import (
 //     deliberately leaves the source's marker (cleanupPostMigration), and only
 //     the owner's copy went with the delete.
 //
-// So after the tombstone the owner asks every other active host to remove
-// them, through CleanupMigrationArtifacts with vm_deleted set. The owner sends
+// So after the tombstone the owner asks every other active or draining host to
+// remove them, through CleanupMigrationArtifacts with vm_deleted set. A host
+// in another state is not asked; it removes a deleted VM's marker itself when
+// it is active again (deleted_vm_marker_sweep.go). The owner sends
 // only what its rows prove: a detached row naming that host, written by THIS
 // incarnation. The receiving host decides by its OWN replica and keeps
 // anything it cannot prove unused (removeDeletedVMLeftoversHere).
@@ -40,8 +42,8 @@ import (
 // deletedVMLeftovers is what a delete asks the hosts the VM left to remove.
 type deletedVMLeftovers struct {
 	vm string
-	// hosts are the other active workload hosts — the ones that may hold the
-	// marker. Every one is asked; the marker is name-keyed and inert once the
+	// hosts are the other active or draining workload hosts — the ones that
+	// may hold the marker and are in service to answer. Every one is asked; the marker is name-keyed and inert once the
 	// row is gone, which is exactly what the receiving host checks.
 	hosts []string
 	// detached maps a host to the detached disk files the VM left on it.
@@ -134,17 +136,22 @@ func (s *Server) planDeletedVMLeftovers(ctx context.Context, vm *corrosion.VMRec
 		plan.detached = nil
 		return plan
 	}
-	active := map[string]bool{}
+	// A draining host is asked too. It is in service — draining is what an
+	// operator does to a host about to be worked on, and its drain is still
+	// running — and it is where the VMs a drain moved off it left their
+	// markers. Every other state is left to the host itself: it sweeps a
+	// deleted VM's marker when it is active again (sweepDeletedVMMarkers).
+	asked := map[string]bool{}
 	for _, h := range hosts {
-		if h.Name == s.hostName || h.State != "active" || h.IsWitness() {
+		if h.Name == s.hostName || (h.State != "active" && h.State != "draining") || h.IsWitness() {
 			continue
 		}
-		active[h.Name] = true
+		asked[h.Name] = true
 		plan.hosts = append(plan.hosts, h.Name)
 	}
 	for h, paths := range plan.detached {
-		if !active[h] {
-			slog.Warn("delete: detached disks are left on a host that is not active",
+		if !asked[h] {
+			slog.Warn("delete: detached disks are left on a host that is neither active nor draining",
 				"vm", vm.Name, "host", h, "paths", paths)
 		}
 	}

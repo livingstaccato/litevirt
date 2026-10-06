@@ -770,8 +770,13 @@ disks detached from this VM since it was created; nothing else can make that
 request (it is refused for every user, admin included). The host holding the
 file still keeps it if anything uses it: another VM's disk or backing image, a
 domain defined on that host, or a snapshot of the VM. `lv rm --keep-disks`
-keeps detached disks too. A host that is down or not `active` during the delete
-keeps its copy; remove it by hand (`<data_dir>/disks/<vm>-<disk>.qcow2`).
+keeps detached disks too. A host that is `active` or `draining` is asked. One
+that is down, in `maintenance` or otherwise out of service during the delete
+keeps its copy of a detached disk; remove it by hand
+(`<data_dir>/disks/<vm>-<disk>.qcow2`). Its `vms/<name>/owner_epoch` marker it
+removes itself when it is next `active` (at a daemon start, or after
+`lv host undrain`), once its own records show the VM deleted and no domain of
+that name is defined there.
 
 ## Users and tokens
 

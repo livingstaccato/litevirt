@@ -109,7 +109,21 @@ type Manifest struct {
 	// image FILE, container header included). Empty on older manifests: the
 	// format is unknown, and nothing may assume either.
 	ContentFormat string `json:"content_format,omitempty"`
-	SchemaVersion int    `json:"schema_version"`
+	// BaseIdentity names, for a disk-file backup of an OVERLAY, the base the
+	// overlay was on when it was taken: the backup holds only the delta, so a
+	// restore onto a base that has since changed (an image re-pulled under
+	// the same name) would sit the old delta on new data. Nil for a
+	// standalone disk and for guest-content backups.
+	BaseIdentity  *BaseIdentity `json:"base_identity,omitempty"`
+	SchemaVersion int           `json:"schema_version"`
+}
+
+// BaseIdentity identifies an overlay's base file: its resolved path, size and
+// content hash.
+type BaseIdentity struct {
+	Path   string `json:"path"`
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"`
 }
 
 // Manifest.ContentFormat values.

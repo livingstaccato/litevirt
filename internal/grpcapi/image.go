@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -50,6 +51,9 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 	}
 	if err := safename.ValidateImageName(req.Name); err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := s.refuseReplacingImageUnderADisk(stream.Context(), req.Name); err != nil {
+		return err
 	}
 	slog.Info("pulling image", "name", req.Name, "url", req.SourceUrl)
 
@@ -230,4 +234,35 @@ func (s *Server) DeleteImage(ctx context.Context, req *pb.DeleteImageRequest) (*
 		return nil, status.Errorf(codes.Internal, "delete image: %v", err)
 	}
 	return &emptypb.Empty{}, nil
+}
+
+// refuseReplacingImageUnderADisk refuses to write an image over one that any
+// disk, on any host, is built on — as its backing_image, a backing file or
+// its own file. An overlay's data is only the delta over that image, so
+// replacing the image under the same name silently changes every such disk
+// (and makes a backup taken on the old image restore onto different data).
+// Pull, import and a compose auto-pull ask first; a missing image is fine.
+func (s *Server) refuseReplacingImageUnderADisk(ctx context.Context, name string) error {
+	if s.images == nil {
+		return nil
+	}
+	path := s.images.ImagePath(name)
+	if _, err := os.Lstat(path); err != nil {
+		return nil
+	}
+	rows, err := s.diskReferencesAnyHost(ctx, path)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "check disks built on image %q: %v", name, err)
+	}
+	byName, err := corrosion.DisksReferencingPath(ctx, s.db, name)
+	if err != nil {
+		return status.Errorf(codes.Unavailable, "check disks built on image %q: %v", name, err)
+	}
+	rows = append(rows, byName...)
+	if len(rows) > 0 {
+		return status.Errorf(codes.FailedPrecondition,
+			"image %q is the base of VM %q disk %q (host %s); it is never replaced under a disk — use a new image name",
+			name, rows[0].VMName, rows[0].DiskName, rows[0].HostName)
+	}
+	return nil
 }

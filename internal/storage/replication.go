@@ -52,6 +52,13 @@ type ReplicateOptions struct {
 	// rbd image-meta "litevirt.<key>") so the copy is identified by what it
 	// records, never by its name.
 	Record map[string]string
+
+	// SrcOptions are the SOURCE pool's driver options (ceph: id, conf,
+	// keyring). The source side — snapshot, export — runs with them, the
+	// destination side with the destination driver's own: two ceph clusters
+	// each get their own credentials. Nil: the source shares the
+	// destination's (one cluster).
+	SrcOptions map[string]string
 }
 
 // ErrDestinationExists refuses a native receive whose destination dataset or

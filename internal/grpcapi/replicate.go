@@ -166,7 +166,7 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 			BytesCopied: p.BytesCopied,
 		})
 	}
-	if err := copyNoClobber(ctx, src.Path, dstPath, emit); err != nil {
+	if err := s.copyNoClobber(ctx, src, dstPath, emit); err != nil {
 		return err
 	}
 
@@ -211,8 +211,21 @@ func (s *Server) replicateVolumeNative(ctx context.Context, req *pb.ReplicateVol
 	}); err != nil {
 		return err
 	}
+	// The source side runs with the SOURCE pool's own options (its ceph
+	// cluster and identity), never the destination's.
+	var srcOpts map[string]string
+	if src.StorageVolume != "" {
+		srcPool, ok := s.resolvePool(ctx, src.StorageVolume)
+		if !ok {
+			return status.Errorf(codes.FailedPrecondition, "the disk's pool %q is not configured on this host", src.StorageVolume)
+		}
+		srcOpts = srcPool.Options
+		if srcOpts == nil {
+			srcOpts = map[string]string{}
+		}
+	}
 	if err := rep.Replicate(ctx, storage.ReplicateOptions{
-		SrcRef: srcRef, DstRef: dstRef,
+		SrcRef: srcRef, DstRef: dstRef, SrcOptions: srcOpts,
 		Record: map[string]string{"project": tenancy.NormalizeProject(vm.Project), "vm": vm.Name, "disk": src.DiskName},
 	}); err != nil {
 		if errors.Is(err, storage.ErrDestinationExists) {

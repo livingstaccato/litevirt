@@ -160,7 +160,9 @@ func (s *Server) RunReplication(ctx context.Context, sched corrosion.BackupSched
 // replicateLocal writes the replica into a file-based pool on this host (the
 // shared-storage / same-host path), then prunes locally.
 func (s *Server) replicateLocal(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, ts string) error {
-	return s.replicateLocalWith(ctx, sched, vm, src, ts, convertQcow2)
+	return s.replicateLocalWith(ctx, sched, vm, src, ts, func(ctx context.Context, _, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+		return s.convertVMDisk(ctx, src, dst, emit)
+	})
 }
 
 // errUnsafeFullCopyFallback marks a refusal to replace a failed incremental
@@ -260,7 +262,7 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	defer os.Remove(scratch)
 
 	noop := func(*pb.MoveVolumeProgress) error { return nil }
-	if err := convertQcow2(ctx, src.Path, scratch, noop); err != nil {
+	if err := s.convertVMDisk(ctx, src, scratch, noop); err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: local copy: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return fmt.Errorf("local scratch replicate: %w", err)
 	}

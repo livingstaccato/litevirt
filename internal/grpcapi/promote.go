@@ -939,7 +939,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// obey a qcow2 header the guest wrote into it. A qcow2 replica
 			// must be standalone (nil: no backing at all). convertImage
 			// pre-checks the input and requires a standalone output.
-			if err := convertImage(ctx, replicaPath, replicaRec.Format, nil, tmpLive, emit); err != nil {
+			if err := convertImage(ctx, replicaPath, replicaRec.Format, nil, "", tmpLive, emit); err != nil {
 				os.Remove(tmpLive)
 				return status.Errorf(codes.Internal, "copy replica: %v", err)
 			}

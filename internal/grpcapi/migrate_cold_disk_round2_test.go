@@ -61,7 +61,13 @@ func TestColdDiskHeadroom_IsBounded(t *testing.T) {
 // to the overlay file (allocated, as an overlay that has been written to is).
 func writeOverlay(t *testing.T, f *coldDiskFixture, virtual uint64, extra int) {
 	t.Helper()
-	base := filepath.Join(t.TempDir(), "base.qcow2")
+	// The base lives where a VM disk's base does: beside it, in the disk's
+	// directory (a linked clone's template disk), never anywhere else.
+	baseDir := filepath.Dir(f.src.hostDiskFile(f.path))
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(baseDir, "tpl-base.qcow2")
 	if err := qcow2.Create(base, virtual, nil); err != nil {
 		t.Fatal(err)
 	}

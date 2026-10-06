@@ -15,10 +15,22 @@ import (
 // zlib compression, and writes a standalone qcow2 image to dst.
 // The destination has no backing file. opts may be nil for defaults.
 func Convert(ctx context.Context, src, dst string, opts *Options) error {
+	return ConvertConfined(ctx, src, dst, opts, nil)
+}
+
+// ConvertConfined is Convert with every backing file, resolved through
+// symlinks, passed to allow before it is opened (nil: no confinement). The
+// chain is read the way qemu reads it, by each layer's DECLARED backing
+// format: a "raw" backing is read as raw — never parsed, whatever its bytes
+// look like (a promoted replica is guest content, and a guest can write a
+// qcow2 header naming any file) — and ends the chain; a backing with no
+// declared format, or declared twice, is refused; a layer keeping its data in
+// an external file is refused.
+func ConvertConfined(ctx context.Context, src, dst string, opts *Options, allow func(resolved string) error) error {
 	// A fresh, unpredictable temp; Create below makes it exclusively.
 	tmpPath := tempSibling(dst)
 
-	err := doConvert(ctx, src, tmpPath, opts)
+	err := doConvert(ctx, src, tmpPath, opts, allow)
 	if err != nil {
 		os.Remove(tmpPath)
 		return err
@@ -32,9 +44,9 @@ func Convert(ctx context.Context, src, dst string, opts *Options) error {
 	return nil
 }
 
-func doConvert(ctx context.Context, src, dst string, opts *Options) error {
+func doConvert(ctx context.Context, src, dst string, opts *Options, allow func(string) error) error {
 	// Open the source chain.
-	chain, err := openChain(src)
+	chain, err := openChain(src, allow)
 	if err != nil {
 		return fmt.Errorf("open backing chain: %w", err)
 	}
@@ -218,6 +230,10 @@ type chainImage struct {
 	h       *Header
 	l1      []byte
 	l2cache map[uint64][]byte
+	// raw marks a backing declared raw: its bytes are the data at their
+	// offsets, never a header. size is the file's length.
+	raw  bool
+	size int64
 }
 
 // l2Table returns the (cached) L2 table at the given host offset.
@@ -233,61 +249,55 @@ func (img *chainImage) l2Table(offset, clusterSize uint64) ([]byte, error) {
 	return t, nil
 }
 
-// openChain opens src and all its backing files, returning them from topmost to base.
-func openChain(src string) ([]*chainImage, error) {
+// openChain opens src and all its backing files, returning them from topmost
+// to base. It reads the chain as qemu does — by each layer's declared backing
+// format — and passes every backing path, resolved through symlinks, to allow
+// (nil: anything) before opening it.
+func openChain(src string, allow func(string) error) ([]*chainImage, error) {
 	var chain []*chainImage
 	path := src
 	seen := make(map[string]struct{})
+	fail := func(format string, a ...any) ([]*chainImage, error) {
+		closeChain(chain)
+		return nil, fmt.Errorf(format, a...)
+	}
 
 	for {
-		// Abs+Clean is lexical and does NOT resolve symlinks, and that is sufficient
-		// here — worth stating, because it looks like a gap and is not one. Each file
-		// always yields the same backing name, so the graph of names mirrors the graph
-		// of files: a cycle among files is necessarily a cycle among names, and gets
-		// caught below. A link only costs an extra step before the repeat shows up.
-		// EvalSymlinks would key `seen` on file identity instead of spelling, which is
-		// tighter but changes no outcome, and it fails on a chain whose backing file is
-		// simply missing — a case that must keep producing the open error below.
 		canonical, err := filepath.Abs(path)
 		if err != nil {
-			closeChain(chain)
-			return nil, fmt.Errorf("resolve backing path %s: %w", path, err)
+			return fail("resolve backing path %s: %w", path, err)
 		}
 		canonical = filepath.Clean(canonical)
-
 		if _, ok := seen[canonical]; ok {
-			closeChain(chain)
-			return nil, fmt.Errorf("qcow2 backing chain cycle at %s", canonical)
+			return fail("qcow2 backing chain cycle at %s", canonical)
 		}
 		if len(chain) >= 64 {
-			closeChain(chain)
-			return nil, fmt.Errorf("qcow2 backing chain exceeds maximum depth 64")
+			return fail("qcow2 backing chain exceeds maximum depth 64")
 		}
 		seen[canonical] = struct{}{}
 		path = canonical
 
 		f, err := os.Open(path)
 		if err != nil {
-			closeChain(chain)
-			return nil, fmt.Errorf("open %s: %w", path, err)
+			return fail("open %s: %w", path, err)
 		}
-
 		h, err := readHeader(f)
 		if err != nil {
 			f.Close()
-			closeChain(chain)
-			return nil, fmt.Errorf("read header %s: %w", path, err)
+			return fail("read header %s: %w", path, err)
 		}
 		st, err := f.Stat()
 		if err != nil {
 			f.Close()
-			closeChain(chain)
-			return nil, fmt.Errorf("stat %s: %w", path, err)
+			return fail("stat %s: %w", path, err)
 		}
 		if err := validateHeaderRanges(h, st.Size()); err != nil {
 			f.Close()
-			closeChain(chain)
-			return nil, fmt.Errorf("validate header %s: %w", path, err)
+			return fail("validate header %s: %w", path, err)
+		}
+		if err := AssertNoExternalData(path); err != nil {
+			f.Close()
+			return fail("%s: %w", path, err)
 		}
 
 		img := &chainImage{f: f, h: h, l2cache: make(map[uint64][]byte)}
@@ -297,10 +307,7 @@ func openChain(src string) ([]*chainImage, error) {
 			img.l1 = make([]byte, uint64(h.L1Size)*8)
 			if _, err := f.ReadAt(img.l1, int64(h.L1TableOffset)); err != nil {
 				f.Close()
-				for _, c := range chain {
-					c.f.Close()
-				}
-				return nil, fmt.Errorf("read L1 table %s: %w", path, err)
+				return fail("read L1 table %s: %w", path, err)
 			}
 		}
 		chain = append(chain, img)
@@ -309,19 +316,50 @@ func openChain(src string) ([]*chainImage, error) {
 			break
 		}
 
-		// Read backing file path.
 		buf := make([]byte, h.BackingFileSize)
 		if _, err := f.ReadAt(buf, int64(h.BackingFileOffset)); err != nil {
-			closeChain(chain)
-			return nil, fmt.Errorf("read backing path from %s: %w", path, err)
+			return fail("read backing path from %s: %w", path, err)
 		}
 		backingPath := string(buf)
-
-		// Resolve relative paths against the directory of the current image.
 		if !filepath.IsAbs(backingPath) {
 			backingPath = filepath.Join(filepath.Dir(path), backingPath)
 		}
-		path = backingPath
+
+		// The backing's format is what this layer DECLARES — never a guess.
+		n, err := BackingFormatExtensionCount(path)
+		if err != nil {
+			return fail("%s: %w", path, err)
+		}
+		if n > 1 {
+			return fail("%s declares its backing format %d times", path, n)
+		}
+		format := readBackingFormat(f, h)
+		if format != "qcow2" && format != "raw" {
+			return fail("%s declares backing %q with format %q; only qcow2 or raw is read", path, backingPath, format)
+		}
+		resolved, err := filepath.EvalSymlinks(backingPath)
+		if err != nil {
+			return fail("open %s: %w", backingPath, err)
+		}
+		if allow != nil {
+			if err := allow(resolved); err != nil {
+				return fail("%s: backing %s: %w", path, resolved, err)
+			}
+		}
+		if format == "raw" {
+			rf, err := os.Open(resolved)
+			if err != nil {
+				return fail("open %s: %w", resolved, err)
+			}
+			rst, err := rf.Stat()
+			if err != nil || !rst.Mode().IsRegular() {
+				rf.Close()
+				return fail("raw backing %s is not a regular file", resolved)
+			}
+			chain = append(chain, &chainImage{f: rf, raw: true, size: rst.Size()})
+			break
+		}
+		path = resolved
 	}
 
 	return chain, nil
@@ -353,6 +391,18 @@ func readChainCluster(chain []*chainImage, virtualOffset, clusterSize uint64) ([
 // readImageCluster reads a single cluster from one image layer, using the
 // image's cached L1 table and L2-table cache (no per-cluster metadata syscalls).
 func readImageCluster(img *chainImage, virtualOffset, clusterSize uint64) ([]byte, bool, error) {
+	if img.raw {
+		if int64(virtualOffset) >= img.size {
+			return nil, false, nil
+		}
+		data := make([]byte, clusterSize)
+		n, err := img.f.ReadAt(data, int64(virtualOffset))
+		if err != nil && err != io.EOF {
+			return nil, false, fmt.Errorf("read raw backing: %w", err)
+		}
+		clear(data[n:])
+		return data, true, nil
+	}
 	h := img.h
 	imgClusterSize := h.ClusterSize()
 	l2Entries := imgClusterSize / 8

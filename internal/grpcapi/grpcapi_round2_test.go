@@ -2029,12 +2029,13 @@ func TestBuildImage_WithDisk_QemuFails(t *testing.T) {
 		VmName:    "build-img-vm",
 		ImageName: "built-img",
 	})
-	// Will fail because the source file doesn't exist.
+	// Will fail because the source file doesn't exist: its chain cannot be
+	// pre-checked, so nothing is converted.
 	if err == nil {
 		t.Fatal("expected error from convert")
 	}
-	if c := status.Code(err); c != codes.Internal {
-		t.Errorf("code = %v, want Internal", c)
+	if c := status.Code(err); c != codes.FailedPrecondition {
+		t.Errorf("code = %v, want FailedPrecondition", c)
 	}
 }
 

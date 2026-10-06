@@ -59,6 +59,9 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 			if format == "" {
 				format = "qcow2"
 			}
+			if err := s.refuseReplacingImageUnderADisk(stream.Context(), name); err != nil {
+				return err
+			}
 
 			destDir := filepath.Join(s.dataDir, "images")
 			os.MkdirAll(destDir, 0755)
@@ -102,7 +105,11 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 		}
 	}
 
-	// Move to final location.
+	// Move to final location — asked again right before, since a disk may
+	// have been created on the image while the upload streamed.
+	if err := s.refuseReplacingImageUnderADisk(stream.Context(), name); err != nil {
+		return err
+	}
 	destPath := s.images.ImagePath(name)
 	if err := os.Rename(tmpFile.Name(), destPath); err != nil {
 		return status.Errorf(codes.Internal, "move image: %v", err)
@@ -427,7 +434,13 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 	os.MkdirAll(filepath.Dir(destPath), 0755)
 
 	slog.Info("building image from VM disk", "vm", req.VmName, "src", srcDisk.Path, "dest", destPath)
-	if err := qcow2.Convert(ctx, srcDisk.Path, destPath, nil); err != nil {
+	// Read by each layer's declared backing format and confined to the image
+	// store and the disk's pool: a promoted VM's raw replica is guest content
+	// and is never parsed as a header.
+	if err := precheckChain(srcDisk.Path, s.diskChainAllow(srcDisk), s.diskRawBacking(srcDisk)); err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "image from VM %q: %v", req.VmName, err)
+	}
+	if err := qcow2.ConvertConfined(ctx, srcDisk.Path, destPath, nil, s.diskChainAllow(srcDisk)); err != nil {
 		return nil, status.Errorf(codes.Internal, "convert image: %v", err)
 	}
 

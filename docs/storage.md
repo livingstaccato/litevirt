@@ -154,6 +154,16 @@ image the daemon creates are published exclusively: a file already at the name
 is refused (`FailedPrecondition` for a create or clone), never overwritten and
 never cleaned up by the failed create. Choose another VM or disk name.
 
+Reading a disk's backing chain — a full clone, an image built from a VM, a
+cold migration's flatten, a move or copy with qemu-img — follows each layer's
+DECLARED backing format, never a guess: a backing declared `raw` (a
+`--no-localize` promoted VM's replica, which is guest content) is read as
+raw and never parsed for a header the guest may have written; a backing with
+no declared format, or declared twice, is refused. Every backing, resolved
+through symlinks, must lie in the image store or the disk's own pool
+directory, and a raw one must be the disk record's own `backing_disk`.
+A move that flattens a disk clears its record's backing fields.
+
 Content operations never reach a file a live VM disk uses: a listing leaves
 out files a live disk of another pool uses, and a content delete refuses any
 file a live disk uses, as its own file or as a backing file.
@@ -295,8 +305,13 @@ exists: the driver checks first (`zfs list` / `rbd info`) and refuses with
 ceph full copy is `rbd export | rbd import`, which creates the image. Every
 command keeps `--` before its positional arguments. The copy carries its
 owner record — project, VM, disk — as zfs user properties (`litevirt:*`) or
-rbd image metadata (`litevirt.*`). A btrfs disk takes the file copy. What the
-drivers implement:
+rbd image metadata (`litevirt.*`). A ceph copy runs its source side
+(snapshot, export) with the SOURCE pool's own `conf`, `keyring` and `id`, and
+its destination side (check, import, metadata) with the destination pool's,
+so a copy between two ceph clusters uses each cluster's own credentials. The
+per-copy source snapshot is removed afterwards, and a copy that fails after it
+was received is removed rather than left unrecorded. A btrfs disk takes the
+file copy. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when

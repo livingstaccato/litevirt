@@ -37,14 +37,26 @@ func backedVM(t *testing.T, f *restoreFixture, name, path string, rec corrosion.
 
 func pushVM(t *testing.T, f *restoreFixture, vm, path, ts, format, bitmap string) {
 	t.Helper()
+	var id *pbsstore.BaseIdentity
+	if format == pbsstore.ContentDiskFile {
+		id = overlayBaseIdentity(path) // what BackupSnapshot records
+	}
+	pushVMWithIdentity(t, f, vm, path, ts, format, bitmap, id)
+}
+
+// pushVMWithIdentity is pushVM with the manifest's base identity given.
+func pushVMWithIdentity(t *testing.T, f *restoreFixture, vm, path, ts, format, bitmap string, id *pbsstore.BaseIdentity) {
+	t.Helper()
 	repo, err := pbsstore.Open(f.s.backupRepos["r"])
 	if err != nil {
 		t.Fatal(err)
 	}
 	spec, _ := json.Marshal(&pb.VMSpec{Name: vm, Project: "a"})
-	if _, err := pbsstore.PushFile(context.Background(), repo, path, pbsstore.PushOptions{
+	opts := pbsstore.PushOptions{
 		VMName: vm, DiskName: "root", Timestamp: ts, VMSpecJSON: string(spec), ContentFormat: format, BitmapName: bitmap,
-	}); err != nil {
+		BaseIdentity: id,
+	}
+	if _, err := pbsstore.PushFile(context.Background(), repo, path, opts); err != nil {
 		t.Fatalf("PushFile: %v", err)
 	}
 }
@@ -105,6 +117,7 @@ func TestRestoreInPlace_LinkedClone(t *testing.T) {
 	base := filepath.Join(disks, "tpl-root.qcow2")
 	runQemuImg(t, "create", "-q", "-f", "qcow2", base, "1M")
 	disk := filepath.Join(disks, "lc-root.qcow2")
+	templateRow(t, f, "tpl", base)
 	content := bytes.Repeat([]byte("linked clone data "), 1<<16/18)
 	content = append(content, make([]byte, 1<<20-len(content))...)
 	overlayWithData(t, disk, base, "qcow2", content)
@@ -201,6 +214,7 @@ func TestRestoreInPlace_BackupHeaderNeverChoosesTheBacking(t *testing.T) {
 	disks := filepath.Join(f.s.dataDir, "disks")
 	base := filepath.Join(disks, "tpl-root.qcow2")
 	runQemuImg(t, "create", "-q", "-f", "qcow2", base, "1M")
+	templateRow(t, f, "tpl", base)
 	disk := filepath.Join(disks, "lc-root.qcow2")
 	runQemuImg(t, "create", "-q", "-f", "qcow2", "-b", base, "-F", "qcow2", disk)
 	backedVM(t, f, "lc", disk, corrosion.DiskRecord{StorageType: "local", BackingDisk: base})
@@ -217,7 +231,7 @@ func TestRestoreInPlace_BackupHeaderNeverChoosesTheBacking(t *testing.T) {
 	forged := filepath.Join(t.TempDir(), "forged.qcow2")
 	runQemuImg(t, "create", "-q", "-f", "qcow2", "-b", other, "-F", "qcow2", forged)
 	const ts = "2026-10-07T13:00:00Z"
-	pushVM(t, f, "lc", forged, ts, pbsstore.ContentDiskFile, "")
+	pushVMWithIdentity(t, f, "lc", forged, ts, pbsstore.ContentDiskFile, "", nil)
 	if err := inPlace(f, "lc", ts); err != nil {
 		t.Fatalf("in-place restore: %v", err)
 	}
@@ -236,7 +250,7 @@ func TestRestoreInPlace_BackupHeaderNeverChoosesTheBacking(t *testing.T) {
 		t.Fatal(err)
 	}
 	const ts2 = "2026-10-07T13:30:00Z"
-	pushVM(t, f, "lc", forged2, ts2, pbsstore.ContentDiskFile, "")
+	pushVMWithIdentity(t, f, "lc", forged2, ts2, pbsstore.ContentDiskFile, "", nil)
 	if err := inPlace(f, "lc", ts2); err != nil {
 		t.Fatalf("in-place restore of a backup whose header names a missing file: %v", err)
 	}

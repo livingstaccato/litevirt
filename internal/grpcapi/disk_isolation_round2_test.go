@@ -193,9 +193,11 @@ func TestRestoreInPlace_DiskFileOnANonStandaloneBaseIsRefused(t *testing.T) {
 	}
 }
 
-// The one accepted backed case: a disk file whose backing is a standalone
-// qcow2 base in this host's image store is flattened into a standalone disk.
-func TestRestoreInPlace_DiskFileOnAnImageStoreBaseIsFlattened(t *testing.T) {
+// A backup that is an overlay, of a disk that is now standalone (flattened by
+// a move since): the two disagree on whether the disk is backed, so the
+// in-place restore refuses and says why — it never takes the base from the
+// backup's own header.
+func TestRestoreInPlace_DiskFileBackedButTheDiskIsNowStandaloneIsRefused(t *testing.T) {
 	needQemuImg(t)
 	f := newRestoreFixture(t)
 	f.s.virt = libvirtfake.New()
@@ -209,14 +211,11 @@ func TestRestoreInPlace_DiskFileOnAnImageStoreBaseIsFlattened(t *testing.T) {
 	runQemuImg(t, "create", "-q", "-f", "qcow2", "-b", base, "-F", "qcow2", img)
 	const ts = "2026-10-06T16:00:00Z"
 	pushAs(t, f, img, ts, pbsstore.ContentDiskFile)
-	if err := f.s.RestoreFromBackup(&pb.RestoreFromBackupRequest{
+	err := f.s.RestoreFromBackup(&pb.RestoreFromBackupRequest{
 		RepoPath: "r", VmName: "web", DiskName: "root", Timestamp: ts, InPlace: true,
-	}, &progressStream[pb.RestoreFromBackupProgress]{ctx: f.alice}); err != nil {
-		t.Fatalf("in-place restore of an image-backed disk file: %v", err)
-	}
-	disks, _ := corrosion.GetVMDisks(context.Background(), f.s.db, "web")
-	if err := qcow2.AssertStandalone(disks[0].Path); err != nil {
-		t.Errorf("restored disk is not standalone: %v", err)
+	}, &progressStream[pb.RestoreFromBackupProgress]{ctx: f.alice})
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "now standalone") {
+		t.Errorf("overlay backup of a now-standalone disk: got %v, want FailedPrecondition naming the disagreement", err)
 	}
 }
 

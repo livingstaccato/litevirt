@@ -551,3 +551,23 @@ func proveReplicaRecords(ctx context.Context, client pb.LiteVirtClient, pool, ho
 	}
 	return nil
 }
+
+// replicaRecordFor returns the record of the replica file at path, read from
+// its owner directory: the record beside it, valid, naming exactly this file,
+// in the owner directory its own (project, vm) hash to. ok is false for any
+// file that is not a recorded replica.
+func replicaRecordFor(path string) (replicaRecord, bool) {
+	data, err := os.ReadFile(path + ".json")
+	if err != nil {
+		return replicaRecord{}, false
+	}
+	var r replicaRecord
+	if json.Unmarshal(data, &r) != nil || r.validate() != nil || r.File != filepath.Base(path) {
+		return replicaRecord{}, false
+	}
+	poolDir := filepath.Dir(filepath.Dir(filepath.Dir(path)))
+	if replicaOwnerDir(poolDir, r.Project, r.VM) != filepath.Dir(path) {
+		return replicaRecord{}, false
+	}
+	return r, true
+}

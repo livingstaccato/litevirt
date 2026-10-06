@@ -201,7 +201,11 @@ func (s *Server) liveMoveVolume(
 	// keeps the invariant: srcPath is never the durable restart path post-pivot, and
 	// no acknowledged post-pivot write is lost.
 	commit := func() error {
-		return corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, destPath, dstPool.Driver, targetPool)
+		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, destPath, dstPool.Driver, targetPool); err != nil {
+			return err
+		}
+		s.clearBackingIfFlattened(ctx, vm.Name, src.DiskName, destPath)
+		return nil
 	}
 	done := func() error {
 		if deleteSource {
@@ -317,6 +321,7 @@ func (s *Server) liveCatchUpAtDest(ctx context.Context, vm *corrosion.VMRecord, 
 			"vm", vm.Name, "disk", src.DiskName, "dest", destPath, "error", err)
 		return liveMovePlacementErr(err)
 	}
+	s.clearBackingIfFlattened(ctx, vm.Name, src.DiskName, destPath)
 	if deleteSource {
 		s.deleteSourceIfUnreferenced(ctx, vm, src, send)
 	}

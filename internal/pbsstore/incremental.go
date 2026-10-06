@@ -76,6 +76,7 @@ func PushIncremental(
 		BitmapName:     opts.BitmapName,
 		VMSpecJSON:     opts.VMSpecJSON,
 		ContentFormat:  opts.ContentFormat,
+		BaseIdentity:   opts.BaseIdentity,
 		DomainXML:      opts.DomainXML,
 		FirmwareChunks: opts.FirmwareChunks,
 	}
@@ -170,6 +171,7 @@ func pushIncrementalSeek(
 		BitmapName:     opts.BitmapName,
 		VMSpecJSON:     opts.VMSpecJSON,
 		ContentFormat:  opts.ContentFormat,
+		BaseIdentity:   opts.BaseIdentity,
 		DomainXML:      opts.DomainXML,
 		FirmwareChunks: opts.FirmwareChunks,
 	}

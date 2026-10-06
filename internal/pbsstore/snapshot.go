@@ -40,6 +40,9 @@ type PushOptions struct {
 	// ContentFormat is recorded on the manifest (Manifest.ContentFormat).
 	ContentFormat string
 
+	// BaseIdentity is recorded on the manifest (Manifest.BaseIdentity).
+	BaseIdentity *BaseIdentity
+
 	// FirmwareChunks, when set, references the content-addressed firmware-state
 	// bundle (UEFI NVRAM + swtpm) for a Secure-Boot/vTPM VM, captured on the
 	// root disk so a restore materializes BitLocker-binding firmware (G1).
@@ -82,6 +85,7 @@ func PushDisk(ctx context.Context, repo *Repo, src io.Reader, opts PushOptions) 
 		BitmapName:        opts.BitmapName,
 		VMSpecJSON:        opts.VMSpecJSON,
 		ContentFormat:     opts.ContentFormat,
+		BaseIdentity:      opts.BaseIdentity,
 		DomainXML:         opts.DomainXML,
 		ContainerSpecJSON: opts.ContainerSpecJSON,
 		FirmwareChunks:    opts.FirmwareChunks,

@@ -1745,6 +1745,9 @@ func (s *Server) autoPullImages(ctx context.Context, f *compose.File, stream grp
 			Detail: fmt.Sprintf("pulling image %s from %s", img, def.Source),
 		})
 
+		if err := s.refuseReplacingImageUnderADisk(ctx, img); err != nil {
+			return err
+		}
 		// Pull synchronously so the image is ready before VM creation.
 		progressCh := make(chan image.PullProgress, 10)
 		errCh := make(chan error, 1)

@@ -246,7 +246,7 @@ func (s *Server) moveOneVolume(
 		// "<vm>-<disk>.qcow2" can be another VM's disk (VM "a" disk "b-root"
 		// against VM "a-b" disk "root"). A failed copy leaves nothing at
 		// dstPath, so nothing here removes a file this move did not create.
-		if err := copyNoClobber(ctx, src.Path, dstPath, emit); err != nil {
+		if err := s.copyNoClobber(ctx, src, dstPath, emit); err != nil {
 			return err
 		}
 		if cs == cutoverRedefined {
@@ -272,6 +272,7 @@ func (s *Server) moveOneVolume(
 			return status.Errorf(codes.Internal, "update disk placement: %v", err)
 		}
 	}
+	s.clearBackingIfFlattened(ctx, vm.Name, src.DiskName, dstPath)
 	s.syncStackComposeForMovedDisk(ctx, vm, src.DiskName, targetPool)
 
 	if err := emit(&pb.MoveVolumeProgress{
@@ -792,16 +793,14 @@ func qemuImgAvailable() bool {
 	return err == nil
 }
 
-// convertQcow2 converts a VM disk — a qcow2 the daemon created — to a new
-// qcow2 at dst. Its backing chain (an image-store base, a linked clone's base)
-// is allowed, but every file in it is pre-checked (precheckQcow2Input).
-func convertQcow2(ctx context.Context, src, dst string, emit func(*pb.MoveVolumeProgress) error) error {
-	return convertImage(ctx, src, "qcow2", anyBacking, dst, emit)
+// convertVMDisk converts a VM disk — a qcow2 the daemon created — to a new
+// qcow2 at dst. Its backing chain may live only in the image store or the
+// disk's pool directory, every file in it pre-checked; a raw backing is
+// accepted only as the disk record's own backing_disk (a --no-localize
+// promotion's replica), and qemu-img reads it as raw, as declared.
+func (s *Server) convertVMDisk(ctx context.Context, d *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	return convertImage(ctx, s.hostDiskFile(d.Path), "qcow2", s.diskChainAllow(*d), s.diskRawBacking(*d), dst, emit)
 }
-
-// anyBacking accepts a backing file wherever it is; precheckQcow2Input still
-// judges the backing file's own header.
-func anyBacking(string) error { return nil }
 
 // convertImage is the one place a disk image is converted with qemu-img. It
 // invokes qemu-img convert -p (progress on stdout), parsing "(NN.NN/100%)"
@@ -819,10 +818,10 @@ func anyBacking(string) error { return nil }
 // Without qemu-img a qcow2 source is byte-copied (it was pre-checked); a raw
 // source cannot be, since the copy would land raw bytes in a qcow2-declared
 // file.
-func convertImage(ctx context.Context, src, srcFormat string, allowBacking func(string) error, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+func convertImage(ctx context.Context, src, srcFormat string, allowBacking func(string) error, rawBacking, dst string, emit func(*pb.MoveVolumeProgress) error) error {
 	switch srcFormat {
 	case "qcow2":
-		if err := precheckQcow2Input(src, allowBacking); err != nil {
+		if err := precheckChain(src, allowBacking, rawBacking); err != nil {
 			return status.Errorf(codes.FailedPrecondition, "%s: %v", filepath.Base(src), err)
 		}
 	case "raw":
@@ -875,7 +874,7 @@ func convertImage(ctx context.Context, src, srcFormat string, allowBacking func(
 // then placed with RENAME_NOREPLACE. An existing dst — a file, a symlink, a
 // disk another VM uses — is refused with AlreadyExists, never written through,
 // and a failed copy leaves nothing at dst.
-func copyNoClobber(ctx context.Context, src, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+func (s *Server) copyNoClobber(ctx context.Context, src *corrosion.DiskRecord, dst string, emit func(*pb.MoveVolumeProgress) error) error {
 	if err := refuseExistingFile(dst); err != nil {
 		return err
 	}
@@ -886,7 +885,7 @@ func copyNoClobber(ctx context.Context, src, dst string, emit func(*pb.MoveVolum
 	tmp := f.Name()
 	_ = f.Close()
 	defer os.Remove(tmp) // gone after a successful place
-	if err := convertQcow2(ctx, src, tmp, emit); err != nil {
+	if err := s.convertVMDisk(ctx, src, tmp, emit); err != nil {
 		if _, ok := status.FromError(err); ok {
 			return err
 		}
@@ -1012,5 +1011,20 @@ func (s *Server) sweepVMDiskDebrisIn(ctx context.Context, vmName string, candida
 	// keep set and would be swept with no reference check ever run against it.
 	if err := s.images.DeleteVMDisksIn(vmName, candidates, s.protectedDiskPathsFrom(ctx, vmName, candidates)); err != nil {
 		slog.Warn("delete: disk debris sweep failed", "vm", vmName, "error", err)
+	}
+}
+
+// clearBackingIfFlattened clears a moved disk's backing_disk/backing_image
+// when the file now at path is standalone — a move copies the whole chain, so
+// the old base is no longer this disk's — and leaves it when the copy kept a
+// backing (the byte copy without qemu-img). A stale record would make a later
+// in-place restore rebuild the disk as an overlay on the old base.
+func (s *Server) clearBackingIfFlattened(ctx context.Context, vmName, diskName, path string) {
+	info, err := qcow2.Info(s.hostDiskFile(path))
+	if err != nil || info.BackingFile != "" {
+		return
+	}
+	if err := corrosion.ClearDiskBacking(ctx, s.db, vmName, diskName, path); err != nil {
+		slog.Warn("move: clearing the flattened disk's backing record failed", "vm", vmName, "disk", diskName, "error", err)
 	}
 }

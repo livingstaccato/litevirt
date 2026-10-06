@@ -539,17 +539,27 @@ a way to overwrite another project's VM disk.
     disk. The guest controls every byte, so a qcow2 header it planted in
     sector 0 is restored as data, never followed.
   - **A disk file** (`-f qcow2`) has its header judged first — no external
-    data file, one backing format — and keeps the backing of the disk it
-    replaces, never one the backup names. A **linked clone** stays an overlay
-    on its base, a **`--no-localize` promoted VM** stays an overlay on its
-    replica, and a **disk created from an image** stays an overlay on that
-    image. The backing comes from the disk's own record (`backing_disk`,
-    `backing_image`), resolved through symlinks, inside the image store or
-    the disk's pool directory, every layer pre-checked down to a standalone
-    base. The restored header is re-pointed to it without opening what the
-    backup named (`qemu-img rebase -u`), and the rebuilt overlay must name
-    exactly that backing. A standalone disk's backup may name a backing only
-    as a standalone base in the image store; it is flattened.
+    data file, one backing format. Whether it is restored as an overlay is
+    the backup's own header: a standalone backup is restored standalone. An
+    overlay backup keeps the backing of the disk it replaces, never one the
+    backup names: a **linked clone** stays an overlay on its base, a
+    **`--no-localize` promoted VM** on its replica, a **disk created from an
+    image** on that image. That backing is the disk's CURRENT image header's,
+    resolved through symlinks, inside the image store or the disk's pool
+    directory, every layer pre-checked down to a standalone base; the disk's
+    record (`backing_disk`, `backing_image`) must agree with it. Its format
+    comes from a record — a replica's own record, `qcow2` for an image or a
+    VM's disk — and must match what the disk declares; it is never read from
+    the bytes. The base must be the one the backup was taken on: a backup
+    records its base's path, size and sha256 (`base_identity`), and a
+    restore onto a base that has changed since is refused, naming both. A
+    backup taken before that was recorded is restored onto a base that cannot
+    change under its name (a replica, a template's disk), but not onto an
+    image. The restored header is re-pointed to the backing without opening
+    what the backup named (`qemu-img rebase -u`), and the rebuilt overlay must
+    name exactly that backing. An overlay backup of a disk that is now
+    standalone (flattened by a move since) is refused, saying so; restore it
+    to a new file instead.
 
   The restore streams into a temp beside the disk and rebuilds next to it, so
   it needs room for about twice the disk in that directory while it runs.

@@ -127,42 +127,65 @@ func (d *cephDriver) rbdArgs(subArgs ...string) []string {
 // (or "<pool>/<image>@<snap>"); DstRef is "<pool>/<image>" on the
 // destination cluster. Cross-cluster replication uses SSHTarget,
 // matching ZFS.
-func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) error {
+func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err error) {
 	if opts.SrcRef == "" || opts.DstRef == "" {
 		return fmt.Errorf("ceph replicate: src and dst refs required")
+	}
+	// The source side runs as the source pool's cluster and identity, the
+	// destination side as the destination's: never one cluster's
+	// credentials against the other's names.
+	src := d
+	if opts.SrcOptions != nil {
+		src = &cephDriver{opts: opts.SrcOptions, run: d.run}
 	}
 	snap := opts.SnapshotName
 	if snap == "" {
 		snap = "litevirt-" + nowSnapTag()
 	}
 	srcSnapSpec := opts.SrcRef + "@" + snap
-	if out, err := exec.CommandContext(ctx, "rbd", d.rbdArgs("snap", "create", "--", srcSnapSpec)...).CombinedOutput(); err != nil {
-		return fmt.Errorf("rbd snap create %s: %w: %s", srcSnapSpec, err, out)
-	}
 
 	// A full copy is export | import, and import CREATES the destination,
 	// refusing one that exists; it is checked first too, before anything is
-	// sent. An incremental (export-diff | import-diff) applies onto an
-	// existing image, so it is only ever run against one this replication
-	// created earlier — the caller's choice, never a full copy's.
-	var sendArgs, recvArgs []string
-	if opts.Incremental {
-		sendArgs = d.rbdArgs("export-diff", "--from-snap", "litevirt-replicate-prev", "--", srcSnapSpec, "-")
-		recvArgs = d.rbdArgs("import-diff", "--", "-", opts.DstRef)
-	} else {
-		if _, err := d.rbd(ctx, d.rbdArgs("info", "--", opts.DstRef)...); err == nil {
+	// sent or snapshotted. An incremental (export-diff | import-diff) applies
+	// onto an existing image, so it is only ever run against one this
+	// replication created earlier — the caller's choice, never a full copy's.
+	if !opts.Incremental {
+		if _, ierr := d.rbd(ctx, d.rbdArgs("info", "--", opts.DstRef)...); ierr == nil {
 			return fmt.Errorf("ceph replicate → %s: %w", opts.DstRef, ErrDestinationExists)
 		}
-		sendArgs = d.rbdArgs("export", "--", srcSnapSpec, "-")
+	}
+	if out, serr := src.rbd(ctx, src.rbdArgs("snap", "create", "--", srcSnapSpec)...); serr != nil {
+		return fmt.Errorf("rbd snap create %s: %w: %s", srcSnapSpec, serr, out)
+	}
+	// The per-call snapshot is the copy's point in time only: always removed.
+	defer func() {
+		if out, rerr := src.rbd(ctx, src.rbdArgs("snap", "rm", "--", srcSnapSpec)...); rerr != nil && err == nil {
+			err = fmt.Errorf("rbd snap rm %s: %w: %s", srcSnapSpec, rerr, out)
+		}
+	}()
+
+	var sendArgs, recvArgs []string
+	if opts.Incremental {
+		sendArgs = src.rbdArgs("export-diff", "--from-snap", "litevirt-replicate-prev", "--", srcSnapSpec, "-")
+		recvArgs = d.rbdArgs("import-diff", "--", "-", opts.DstRef)
+	} else {
+		sendArgs = src.rbdArgs("export", "--", srcSnapSpec, "-")
 		recvArgs = d.rbdArgs("import", "--", "-", opts.DstRef)
 	}
 
-	if _, err := pipeCmds(ctx, opts.SSHTarget, "rbd", sendArgs, "rbd", recvArgs); err != nil {
-		return fmt.Errorf("ceph replicate %s → %s: %w", opts.SrcRef, opts.DstRef, err)
+	if _, perr := pipeCmds(ctx, opts.SSHTarget, "rbd", sendArgs, "rbd", recvArgs); perr != nil {
+		if !opts.Incremental {
+			// A partial image this copy created is not left unrecorded.
+			_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", opts.DstRef)...)
+		}
+		return fmt.Errorf("ceph replicate %s → %s: %w", opts.SrcRef, opts.DstRef, perr)
 	}
 	for _, k := range sortedKeys(opts.Record) {
-		if out, err := d.rbd(ctx, d.rbdArgs("image-meta", "set", "--", opts.DstRef, "litevirt."+k, opts.Record[k])...); err != nil {
-			return fmt.Errorf("ceph replicate → %s: record %s: %w: %s", opts.DstRef, k, err, out)
+		if out, merr := d.rbd(ctx, d.rbdArgs("image-meta", "set", "--", opts.DstRef, "litevirt."+k, opts.Record[k])...); merr != nil {
+			if !opts.Incremental {
+				_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", opts.DstRef)...)
+			}
+			return fmt.Errorf("ceph replicate → %s: record %s: %w: %s", opts.DstRef, k, merr, out)
 		}
 	}
 	return nil

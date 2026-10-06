@@ -1553,6 +1553,46 @@ func BackfillDiskBus(ctx context.Context, c *Client, read DiskRecord, bus, owner
 	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
 }
 
+// ClearDiskBacking records that disk (vmName, diskName), now at path, has no
+// backing: a move that flattens a disk — a full copy or a block mirror — leaves
+// a standalone image, and a backing_disk/backing_image left on the row would
+// make a later in-place restore rebuild it as an overlay on the old base. It
+// writes only while the live row still names path, and uses InsertDisk's
+// whole-row shape so it mints no fingerprint a previous-release receiver does
+// not know. A row already without a backing is left alone.
+func ClearDiskBacking(ctx context.Context, c *Client, vmName, diskName, path string) error {
+	var cur DiskRecord
+	found := false
+	disks, err := GetVMDisks(ctx, c, vmName)
+	if err != nil {
+		return err
+	}
+	for _, d := range disks {
+		if d.DiskName == diskName {
+			cur, found = d, true
+		}
+	}
+	if !found || cur.Path != path || (cur.BackingDisk == "" && cur.BackingImage == "") {
+		return nil
+	}
+	d := cur
+	d.BackingDisk, d.BackingImage = "", ""
+	_, err = c.ExecuteBatchGuarded(ctx, func(tx *sql.Tx) (bool, error) {
+		var curPath string
+		err := tx.QueryRowContext(ctx,
+			`SELECT path FROM vm_disks WHERE vm_name = ? AND disk_name = ? AND deleted_at IS NULL`,
+			vmName, diskName).Scan(&curPath)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return curPath == path, nil
+	}, []Statement{{SQL: diskRowSQL, Params: diskRowParams(d, c.NowTS())}})
+	return err
+}
+
 // UpdateDiskHostAndPath updates the host and path for a disk after migration.
 func UpdateDiskHostAndPath(ctx context.Context, c *Client, vmName, diskName, hostName, path string) error {
 	now := c.NowTS()

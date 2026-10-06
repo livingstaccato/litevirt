@@ -510,6 +510,8 @@ lv stack migrate-volumes <stack> --to fast --map pg-1/data=archive --map pg-2=wa
 ```bash
 lv image pull <url> --name <name> [--format qcow2] [--checksum sha256:...]
 lv image import <file> --name <name>
+#   An image any VM disk (on any host) is built on is never replaced: a pull or
+#   import under that name is refused (FailedPrecondition). Use a new name.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls

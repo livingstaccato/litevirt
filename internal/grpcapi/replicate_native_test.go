@@ -71,7 +71,10 @@ func nativeVM(t *testing.T, driver, diskPath, target string) (*Server, context.C
 	t.Helper()
 	s := testServer(t)
 	s.hostName = "test-host"
-	s.SetStoragePoolsByName(map[string]StoragePoolRef{"copies": {Driver: driver, Source: target}})
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{
+		"copies": {Driver: driver, Source: target},
+		"src":    {Driver: driver, Source: "srcpool"},
+	})
 	spec, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Project: "a"})
 	if err := corrosion.InsertVM(context.Background(), s.db,
 		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped", Project: "a", Spec: string(spec)},
@@ -179,5 +182,77 @@ func TestReplicateVolume_NativeTargetIsAdminOnly(t *testing.T) {
 	}
 	if c := calls(t, log); len(c) > 0 && c[0] != "" {
 		t.Errorf("zfs was run for a refused request: %v", c)
+	}
+}
+
+// I-4: a ceph copy between two clusters runs the source side (snapshot,
+// export) with the SOURCE pool's conf and keyring, and the destination side
+// (info, import, image-meta) with the destination's.
+func TestReplicateVolume_NativeCephUsesEachSidesOwnCredentials(t *testing.T) {
+	log := fakeCLI(t)
+	s := testServer(t)
+	s.hostName = "test-host"
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{
+		"src":    {Driver: "ceph", Source: "rbd", Options: map[string]string{"conf": "/etc/ceph/a.conf", "keyring": "/etc/ceph/a.keyring", "id": "a"}},
+		"copies": {Driver: "ceph", Source: "copies", Options: map[string]string{"conf": "/etc/ceph/b.conf", "keyring": "/etc/ceph/b.keyring", "id": "b"}},
+	})
+	spec, _ := json.Marshal(&pb.VMSpec{Name: "vm1", Project: "a"})
+	if err := corrosion.InsertVM(context.Background(), s.db,
+		corrosion.VMRecord{Name: "vm1", HostName: "test-host", State: "stopped", Project: "a", Spec: string(spec)},
+		nil, []corrosion.DiskRecord{{VMName: "vm1", DiskName: "root", HostName: "test-host", Path: "rbd:rbd/vm1-root",
+			SizeBytes: 1 << 20, StorageType: "ceph", StorageVolume: "src"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "copies"},
+		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()}); err != nil {
+		t.Fatalf("cross-cluster native ceph copy: %v", err)
+	}
+	srcCreds := "rbd --id a --conf /etc/ceph/a.conf --keyring /etc/ceph/a.keyring "
+	dstCreds := "rbd --id b --conf /etc/ceph/b.conf --keyring /etc/ceph/b.keyring "
+	seen := map[string]bool{}
+	for _, c := range calls(t, log) {
+		for _, sub := range []string{"snap create", "export", "snap rm"} {
+			if strings.Contains(c, " "+sub+" ") {
+				seen[sub] = true
+				if !strings.HasPrefix(c, srcCreds) {
+					t.Errorf("source-side %q ran as %q, want the source pool's credentials", sub, c)
+				}
+			}
+		}
+		for _, sub := range []string{"info", "import", "image-meta"} {
+			if strings.Contains(c, " "+sub+" ") {
+				seen[sub] = true
+				if !strings.HasPrefix(c, dstCreds) {
+					t.Errorf("destination-side %q ran as %q, want the destination pool's credentials", sub, c)
+				}
+			}
+		}
+	}
+	for _, sub := range []string{"snap create", "export", "snap rm", "info", "import", "image-meta"} {
+		if !seen[sub] {
+			t.Errorf("no rbd %s ran", sub)
+		}
+	}
+}
+
+// m3: the per-call source snapshot is destroyed after a zfs copy.
+func TestReplicateVolume_NativeZFSRemovesItsSnapshot(t *testing.T) {
+	log := fakeCLI(t)
+	s, alice := nativeVM(t, "zfs", "/dev/zvol/tank/vm1-root", "backup/copies")
+	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "vm1", DiskName: "root", TargetPool: "copies"},
+		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: alice}); err != nil {
+		t.Fatal(err)
+	}
+	var snap, destroyed string
+	for _, c := range calls(t, log) {
+		if strings.HasPrefix(c, "zfs snapshot -- tank/vm1-root@litevirt-2") {
+			snap = strings.TrimPrefix(c, "zfs snapshot -- ")
+		}
+		if strings.HasPrefix(c, "zfs destroy -- tank/vm1-root@litevirt-2") {
+			destroyed = strings.TrimPrefix(c, "zfs destroy -- ")
+		}
+	}
+	if snap == "" || snap != destroyed {
+		t.Errorf("snapshot %q, destroyed %q: the per-call snapshot must be destroyed", snap, destroyed)
 	}
 }

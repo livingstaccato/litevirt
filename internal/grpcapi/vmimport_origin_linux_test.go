@@ -73,3 +73,28 @@ func TestImportVM_AFreshFileOfALiveOriginIsNotAnOrphan(t *testing.T) {
 	_ = context.Background
 	_ = time.Now
 }
+
+// An import's own disks, placed a moment ago, are not a flow that holds its
+// next disk's leftover back.
+func TestImportVM_AnImportsOwnFreshDisksDoNotHoldItsNextDisk(t *testing.T) {
+	s, _ := orphanFixture(t, "web")
+	poolDir, err := s.importPoolDir(adminCtx(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	leftover := filepath.Join(poolDir, "web-disk1.qcow2")
+	plantOld(t, leftover, "leftover")
+	frame := smallImportFrame(t, "web", false)
+	second := t.TempDir() + "/disk1.raw"
+	if err := writeFileHelper(second, make([]byte, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	frame.Chunk = append(frame.Chunk, []byte("scsi1: local-lvm:web-disk-1,size=1M\n")...)
+	frame.DiskMap["scsi1"] = second
+	if err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{frame}}); err != nil {
+		t.Fatalf("a two-disk import over a leftover at its second disk's name: %v", err)
+	}
+	if aside, _ := filepath.Glob(leftover + ".orphan-*"); len(aside) != 1 {
+		t.Fatalf("leftover kept as %v", aside)
+	}
+}

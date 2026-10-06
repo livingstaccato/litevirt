@@ -4,8 +4,8 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -181,23 +181,128 @@ func orphanFixture(t *testing.T, name string) (*Server, string) {
 	return s, filepath.Join(poolDir, name+"-root.qcow2")
 }
 
-// CreateVM (and clone, restore) creates a VM's disk files while it holds its
-// admission reservation and before it writes the VM's row: a file at that
-// name is being created, not left over.
+// CreateVM (and clone, restore) creates a VM's disk files while it holds the
+// admission reservation it took through admitWithReservation, before it
+// writes the VM's row: a file at that name is being created, not left over.
 func TestImportVM_ADiskAVMCreateIsStillWritingIsNotAnOrphan(t *testing.T) {
 	s, dst := orphanFixture(t, "web")
 	plantOld(t, dst, "being created")
-	amount := corrosion.QuotaAmount{VCPU: 1, MemMiB: 512, DiskGiB: 1}
-	lease, err := s.admitQuotaWithReservation(adminCtx(), "CreateVM", s.hostName, "default",
-		corrosion.WorkloadVM, "web", amount, amount, intentResourceGrow)
+	// The call CreateVM makes (vm.go), in the default configuration.
+	lease, err := s.admitWithReservation(adminCtx(), "CreateVM", s.hostName, "default", "vm:web",
+		1, 512, corrosion.QuotaAmount{VCPU: 1, MemMiB: 512, DiskGiB: 1}, intentVMResident)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer lease.release(context.Background())
-	if ids, _ := corrosion.InFlightResourceIDs(context.Background(), s.db); !slices.Contains(ids, "vm:web") {
-		t.Fatalf("the create's reservation is not in flight: %v", ids)
-	}
 	refusedAndUntouched(t, s, "web", dst, "being created")
+}
+
+// A multi-disk flow leaves its first disks quiet while it writes the next:
+// a fresh sibling of the file, or another host's conversion scratch file,
+// means the flow is still running.
+func TestImportVM_AFileWhoseSiblingIsStillBeingWrittenIsNotAnOrphan(t *testing.T) {
+	for _, sibling := range []string{"web-data.qcow2", ".web-disk1.qcow2.convert-abc"} {
+		t.Run(sibling, func(t *testing.T) {
+			s, dst := orphanFixture(t, "web")
+			plantOld(t, dst, "first disk")
+			if err := os.WriteFile(filepath.Join(filepath.Dir(dst), sibling), []byte("writing"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			refusedAndUntouched(t, s, "web", dst, "first disk")
+		})
+	}
+}
+
+// Until replica and upload records exist on this branch, a live VM whose
+// name prefixes the file's claims it: its replica, or a disk it is growing.
+func TestImportVM_AFileNamedLikeALiveVMsDisksIsNotAnOrphan(t *testing.T) {
+	s, dst := orphanFixture(t, "web-x")
+	plantOld(t, dst, "web's replica")
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
+		Name: "web", HostName: "other-host", Spec: "{}", State: "stopped", Project: "default",
+	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	refusedAndUntouched(t, s, "web-x", dst, "web's replica")
+}
+
+// A pool on a filesystem with neither hard links nor a rename that cannot
+// replace (some FUSE filesystems) still takes imports, as it did with a plain
+// rename: the disk is copied into a file created exclusively.
+func TestImportVM_APoolWithoutLinkOrNoReplaceRenameTakesImports(t *testing.T) {
+	noLinkNoRenameNoReplace(t)
+	s, dst := orphanFixture(t, "imp-fuse")
+	if err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-fuse", false)}}); err != nil {
+		t.Fatalf("an import into a pool without link or RENAME_NOREPLACE: %v", err)
+	}
+	if _, err := os.Stat(dst); err != nil {
+		t.Fatalf("the disk was not placed: %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(filepath.Dir(dst), ".imp-fuse-*.convert-*")); len(left) != 0 {
+		t.Fatalf("the scratch file was left: %v", left)
+	}
+}
+
+// There too an orphan is moved aside without replacing anything.
+func TestMoveOrphanAside_WithoutLinkOrNoReplaceRename(t *testing.T) {
+	noLinkNoRenameNoReplace(t)
+	p := filepath.Join(t.TempDir(), "d.qcow2")
+	if err := os.WriteFile(p, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	aside, err := moveOrphanAside(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(aside); string(b) != "orphan" {
+		t.Fatalf("moved aside as %q", b)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Fatalf("the orphan's name is still taken: %v", err)
+	}
+	// And never over a file at the new name.
+	if err := os.WriteFile(p, []byte("orphan 2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(1700000000, 0)
+	orphanNow = func() time.Time { return at }
+	t.Cleanup(func() { orphanNow = time.Now })
+	there := p + ".orphan-1700000000"
+	if err := os.WriteFile(there, []byte("already there"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := moveOrphanAside(p); err == nil {
+		t.Fatal("moved an orphan over a file at its new name")
+	}
+	if b, _ := os.ReadFile(there); string(b) != "already there" {
+		t.Fatalf("the file at the new name now holds %q", b)
+	}
+}
+
+// A file that appears at the disk's name during the conversion is not
+// replaced on such a filesystem either.
+func TestImportVM_WithoutLinkADiskThatAppearsIsNotReplaced(t *testing.T) {
+	noLinkNoRenameNoReplace(t)
+	s := concurrentImportServer(t, 10*oneDiskNeed())
+	appearingQemuImg(t)
+	err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-race", false)}})
+	if status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("a disk placed over a file that appeared meanwhile: %v, want FailedPrecondition", err)
+	}
+	poolDir, _ := s.importPoolDir(adminCtx(), "")
+	if b, _ := os.ReadFile(filepath.Join(poolDir, "imp-race-root.qcow2")); string(b) != "theirs" {
+		t.Fatalf("the file that appeared now holds %q", b)
+	}
+}
+
+// noLinkNoRenameNoReplace makes link() and RENAME_NOREPLACE unsupported, as
+// on a FUSE filesystem that has neither.
+func noLinkNoRenameNoReplace(t *testing.T) {
+	t.Helper()
+	oldLink, oldRename := coldLink, coldRenameNoReplace
+	coldLink = func(o, n string) error { return &os.LinkError{Op: "link", Old: o, New: n, Err: syscall.EPERM} }
+	coldRenameNoReplace = func(o, n string) error { return &os.LinkError{Op: "renameat2", Old: o, New: n, Err: syscall.EINVAL} }
+	t.Cleanup(func() { coldLink, coldRenameNoReplace = oldLink, oldRename })
 }
 
 // A file modified within importOrphanMinAge may be another host's import into

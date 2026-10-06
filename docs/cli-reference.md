@@ -565,12 +565,18 @@ and is released when it finishes or fails, so an import that does not fit
 beside the others is refused with the space it needs and what the others hold;
 retry it when they finish. Two imports of the same VM name on one host do not
 run at once (`--inspect` is not held back), and an import never replaces a file
-already at its disk's name in the pool. A file there that no disk (of a live
-VM, kept from a deleted one, or under a kept snapshot) and no image records,
-that no create, clone, restore, disk attach or import in flight may be writing,
-and that has not been modified for 15 minutes — a crashed earlier import's
-output — is moved aside to `<name>.orphan-<unix time>`, kept, and logged, and
-the import goes ahead; any other file there refuses the import, saying why.
+already at its disk's name in the pool. A file there is taken for a crashed
+earlier import's leftover — moved aside to `<name>.orphan-<unix time>`, kept,
+and logged, after which the import goes ahead — only when all of these hold:
+no disk (of a live VM, kept from a deleted one, or under a kept snapshot) and
+no image records it; no VM exists whose name followed by `-` begins the file's
+name; no operation in flight (a create, clone, restore or disk attach) names a
+VM whose disks would be named like it, and no other import on the host does;
+and neither it nor any file beside it named for the same VM (including another
+host's conversion scratch files) has been modified in the last 15 minutes. A
+file an import of this host wrote, under an import that is no longer running
+here (the daemon restarted mid-import), carries that origin and is a leftover
+at once, without the wait. Any other file there refuses the import, saying why.
 
 ## Snapshots
 

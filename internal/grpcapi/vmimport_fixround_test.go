@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -261,6 +260,8 @@ func TestMountOf_FindsTheMountAPathIsOn(t *testing.T) {
 
 func TestFSKeyFor_NamesSharedFreeSpaceOnce(t *testing.T) {
 	dev := func() fsKey { return "dev:7" }
+	saved := lookupNFSServer
+	t.Cleanup(func() { lookupNFSServer = saved })
 	lookupNFSServer = func(h string) ([]string, error) {
 		switch h {
 		case "nas.lan":
@@ -270,7 +271,6 @@ func TestFSKeyFor_NamesSharedFreeSpaceOnce(t *testing.T) {
 		}
 		return []string{h}, nil
 	}
-	t.Cleanup(func() { lookupNFSServer = net.LookupHost })
 	for _, c := range []struct {
 		fstype, source string
 		want           fsKey
@@ -318,21 +318,7 @@ func TestImportSpace_AnotherWritersBytesAreNotCredited(t *testing.T) {
 // import's or VM's — is not replaced: the placement refuses.
 func TestImportVM_ADiskThatAppearsDuringTheConversionIsNotReplaced(t *testing.T) {
 	s := concurrentImportServer(t, 10*oneDiskNeed())
-	dir := t.TempDir()
-	shim := "#!/bin/sh\n" +
-		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
-		"prev=\"\"; last=\"\"\n" +
-		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
-		"d=$(dirname \"$last\"); b=$(basename \"$last\"); b=${b#.}; b=${b%%.convert-*}\n" +
-		"printf theirs > \"$d/$b\"\n" +
-		"cp \"$prev\" \"$last\"\n"
-	if err := writeFileHelper(dir+"/qemu-img", []byte(shim)); err != nil {
-		t.Fatal(err)
-	}
-	if err := chmodHelper(dir+"/qemu-img", 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+":"+envPath())
+	appearingQemuImg(t)
 	err := s.ImportVM(&fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-race", false)}})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("a disk placed over a file that appeared meanwhile: %v, want FailedPrecondition", err)
@@ -481,5 +467,109 @@ func TestImportSpace_BeginKeepsUnshownWrites(t *testing.T) {
 	refusedForReservation(t, rb.reserve(b, 17<<20, "b"))
 	if err := rb.reserve(b, 16<<20, "b"); err != nil {
 		t.Fatalf("beside 4 MiB written and not shown, of 20 free: %v", err)
+	}
+}
+
+// appearingQemuImg is stubQemuImg that, mid-conversion, makes a file appear at
+// the name the converted disk is to take.
+func appearingQemuImg(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	shim := "#!/bin/sh\n" +
+		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"prev=\"\"; last=\"\"\n" +
+		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
+		"d=$(dirname \"$last\"); b=$(basename \"$last\"); b=${b#.}; b=${b%%.convert-*}\n" +
+		"printf theirs > \"$d/$b\"\n" +
+		"cp \"$prev\" \"$last\"\n"
+	if err := writeFileHelper(dir+"/qemu-img", []byte(shim)); err != nil {
+		t.Fatal(err)
+	}
+	if err := chmodHelper(dir+"/qemu-img", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+envPath())
+}
+
+// A converted disk stays measured once it is placed under its name: the
+// fall in free space it made is its import's, and is never credited to
+// another import's writes the free space does not show yet.
+func TestImportSpace_APlacedDiskStaysItsImports(t *testing.T) {
+	var used int64
+	s := sharedSpaceServer(20<<20, &used)
+	stubQemuImg(t)
+	importDir, pool, b, c := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	src := filepath.Join(importDir, "disk.raw")
+	if err := os.WriteFile(src, bytes.Repeat([]byte{0x5a}, 4<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ra := s.reserveImportSpace(importDir)
+	defer ra.release()
+	if err := ra.reserve(pool, 8<<20, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(pool, "a-root.qcow2"), importDir, 1<<30, nil, ra.track); err != nil {
+		t.Fatal(err)
+	}
+	used = 4 << 20 // the converted disk shows
+	ra.refresh()
+	ra.begin()
+	rb := s.reserveImportSpace(b)
+	defer rb.release()
+	if err := rb.reserve(b, 8<<20, "b"); err != nil {
+		t.Fatal(err)
+	}
+	writeAllocated(t, b, 4<<20) // not shown yet
+	rb.refresh()
+	// 16 MiB free: a's 4 written and shown, b's 8 not shown written.
+	rc := s.reserveImportSpace(c)
+	defer rc.release()
+	refusedForReservation(t, rc.reserve(c, 9<<20, "c"))
+	if err := rc.reserve(c, 8<<20, "c"); err != nil {
+		t.Fatalf("beside 8 MiB outstanding of 16 free: %v", err)
+	}
+}
+
+// On btrfs only bytes flushed count as written: one that cannot be flushed
+// stays reserved, whatever its blocks and the free space say.
+func TestImportSpace_OnBtrfsOnlyFlushedBytesCount(t *testing.T) {
+	for _, flushes := range []bool{true, false} {
+		t.Run(fmt.Sprint("flushes=", flushes), func(t *testing.T) {
+			var used int64
+			s := sharedSpaceServer(20<<20, &used)
+			s.fsKeyOverride = func(string) string { return "btrfs:/dev/sdb1" }
+			var flushed []string
+			saved := flushForCredit
+			t.Cleanup(func() { flushForCredit = saved })
+			flushForCredit = func(p string) error {
+				flushed = append(flushed, p)
+				if !flushes {
+					return fmt.Errorf("no flush")
+				}
+				return nil
+			}
+			a, b := t.TempDir(), t.TempDir()
+			ra := s.reserveImportSpace(a)
+			defer ra.release()
+			if err := ra.reserve(a, 8<<20, "a"); err != nil {
+				t.Fatal(err)
+			}
+			writeAllocated(t, a, 4<<20)
+			used = 4 << 20
+			ra.refresh()
+			if len(flushed) == 0 {
+				t.Fatal("nothing was flushed before it counted as written on btrfs")
+			}
+			// 16 MiB free; a has 4 (flushed) or 8 (not) left to write.
+			rb := s.reserveImportSpace(b)
+			defer rb.release()
+			err := rb.reserve(b, 12<<20, "b")
+			if flushes && err != nil {
+				t.Fatalf("beside 4 MiB outstanding of 16 free: %v", err)
+			}
+			if !flushes {
+				refusedForReservation(t, err)
+			}
+		})
 	}
 }

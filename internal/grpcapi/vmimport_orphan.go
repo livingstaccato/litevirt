@@ -9,15 +9,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 )
 
-// importOrphanMinAge is how long a file at a converted disk's name must have
-// gone unmodified before an import may take it for a crashed import's
-// leftover. Another host importing the same name into a shared pool, or any
+// importOrphanMinAge is how long a file at a converted disk's name, and every
+// file beside it named for the same VM, must have gone unmodified before an
+// import may take it for a crashed flow's leftover (unless its recorded origin
+// shows it is a leftover of an import of this host that is no longer running). Another host importing the same name into a shared pool, or any
 // flow that has not recorded its file yet, is still writing it, or has just
 // finished; a leftover that is re-imported is older than this.
 const importOrphanMinAge = 15 * time.Minute
@@ -146,29 +146,86 @@ var orphanNow = time.Now
 // a file, and returns the new name. The file keeps its bytes.
 func moveOrphanAside(p string) (string, error) {
 	aside := fmt.Sprintf("%s.orphan-%d", p, orphanNow().Unix())
-	err := renameNoReplace(p, aside)
-	if err == nil {
-		return aside, nil
-	}
-	if errors.Is(err, os.ErrExist) {
+	if err := placeNoReplace(p, aside); err != nil {
 		return "", err
 	}
-	// No renameat2 here: a hard link never replaces a file either.
-	if lerr := os.Link(p, aside); lerr != nil {
-		return "", fmt.Errorf("rename (%v) or link (%v)", err, lerr)
-	}
-	if rerr := os.Remove(p); rerr != nil && !errors.Is(rerr, syscall.ENOENT) {
-		_ = os.Remove(aside)
-		return "", rerr
-	}
 	return aside, nil
+}
+
+// freshSibling names a file beside dst that a flow writing dst's VM may be
+// writing now: one whose name starts like dst's up to any '-' (a VM's other
+// disks; disk names may hold '-'), or another host's conversion scratch file
+// for such a name, modified within importOrphanMinAge. A multi-disk create,
+// clone or import leaves its first disks quiet while it writes the next.
+// Leftovers of imports no longer running here, and this import's own files,
+// are not a flow.
+func (s *Server) freshSibling(dst, importID string) (string, error) {
+	dir, base := filepath.Dir(dst), filepath.Base(dst)
+	lb := strings.ToLower(base)
+	var prefixes []string
+	for i := 0; i < len(lb); i++ {
+		if lb[i] == '-' {
+			prefixes = append(prefixes, lb[:i+1])
+		}
+	}
+	if len(prefixes) == 0 {
+		return "", nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", err
+	}
+	for _, e := range entries {
+		name := e.Name()
+		ln := strings.ToLower(name)
+		if name == base || strings.Contains(ln, ".orphan-") {
+			continue
+		}
+		match := false
+		for _, p := range prefixes {
+			if strings.HasPrefix(ln, p) || (strings.HasPrefix(ln, "."+p) && strings.Contains(ln, ".convert-")) {
+				match = true
+				break
+			}
+		}
+		if !match {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || orphanNow().Sub(info.ModTime()) >= importOrphanMinAge {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		if s.importLeftover(p) || s.importOwnFile(p, importID) {
+			continue
+		}
+		return name, nil
+	}
+	return "", nil
+}
+
+// liveVMNamedLike names a VM whose name followed by '-' starts dst's name:
+// its disks, or a replica of one (which this branch keeps no record of), take
+// names like that.
+func (s *Server) liveVMNamedLike(ctx context.Context, dst string) (string, error) {
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return "", err
+	}
+	lb := strings.ToLower(filepath.Base(dst))
+	for _, vm := range vms {
+		if vm.Name != "" && strings.HasPrefix(lb, strings.ToLower(vm.Name)+"-") {
+			return vm.Name, nil
+		}
+	}
+	return "", nil
 }
 
 // clearImportDiskName makes way for a converted disk at dst. A file there is
 // an orphan — a crashed import's output, moved aside and kept — only when
 // nothing records it, nothing in flight may be creating it, and it has been
 // quiet for importOrphanMinAge. Anything else refuses the import.
-func (s *Server) clearImportDiskName(ctx context.Context, importName, disk, dst string) error {
+func (s *Server) clearImportDiskName(ctx context.Context, importName, importID, disk, dst string) error {
 	fi, err := os.Lstat(dst)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -194,7 +251,24 @@ func (s *Server) clearImportDiskName(ctx context.Context, importName, disk, dst 
 	if busy != "" {
 		return refuse("may still be being created by " + busy + "; retry once it finishes")
 	}
-	if age := orphanNow().Sub(fi.ModTime()); age < importOrphanMinAge {
+	vm, err := s.liveVMNamedLike(ctx, dst)
+	if err != nil {
+		return refuse(fmt.Sprintf("the VMs whose disks it may be could not be read (%v); retry", err))
+	}
+	if vm != "" {
+		return refuse(fmt.Sprintf("is named like the disks of VM %s, which exists", vm))
+	}
+	sib, err := s.freshSibling(dst, importID)
+	if err != nil {
+		return refuse(fmt.Sprintf("what is being written beside it could not be read (%v); retry", err))
+	}
+	if sib != "" {
+		return refuse(fmt.Sprintf("%s beside it was written in the last %s, so the flow writing them may still be running; retry once it is quiet",
+			sib, importOrphanMinAge))
+	}
+	// A leftover of an import of this host that is no longer running is
+	// nobody's now; anything else has to have gone quiet.
+	if age := orphanNow().Sub(fi.ModTime()); age < importOrphanMinAge && !s.importLeftover(dst) {
 		return refuse(fmt.Sprintf("was written %s ago, so it may still be being created; "+
 			"a leftover nothing records is moved aside once it is %s old — retry then", age.Round(time.Second), importOrphanMinAge))
 	}

@@ -12,6 +12,8 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // Imports on one host run side by side, and each writes into filesystems
@@ -53,7 +55,7 @@ type importSpaceLedger struct {
 	mu    sync.Mutex
 	held  map[*importReservation]struct{}
 	keys  map[fsKey]*keySpace
-	names map[string]struct{}
+	names map[string]string // name → import id
 }
 
 // keySpace is one filesystem's credit: what the free space shows its running
@@ -69,9 +71,10 @@ type keySpace struct {
 }
 
 // claimImportName refuses a second import of a VM name already being imported
-// on this host: both would write the same files into the pool. The release is
-// safe to call more than once.
-func (s *Server) claimImportName(name string) (func(), error) {
+// on this host: both would write the same files into the pool. importID names
+// the import in the origin of the files it writes. The release is safe to
+// call more than once.
+func (s *Server) claimImportNameAs(name, importID string) (func(), error) {
 	l := &s.importSpace
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -80,14 +83,19 @@ func (s *Server) claimImportName(name string) (func(), error) {
 			"VM %q is already being imported on %s; wait for that import to finish, or choose a different --name", name, s.hostName)
 	}
 	if l.names == nil {
-		l.names = map[string]struct{}{}
+		l.names = map[string]string{}
 	}
-	l.names[name] = struct{}{}
+	l.names[name] = importID
 	return sync.OnceFunc(func() {
 		l.mu.Lock()
 		delete(l.names, name)
 		l.mu.Unlock()
 	}), nil
+}
+
+// claimImportName is claimImportNameAs under a fresh import id.
+func (s *Server) claimImportName(name string) (func(), error) {
+	return s.claimImportNameAs(name, randid.New())
 }
 
 // importNamesInFlight is the names this host is importing now.
@@ -100,6 +108,19 @@ func (s *Server) importNamesInFlight() []string {
 		out = append(out, n)
 	}
 	return out
+}
+
+// importRunning reports whether this process is running the import importID.
+func (s *Server) importRunning(importID string) bool {
+	l := &s.importSpace
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, id := range l.names {
+		if id == importID {
+			return true
+		}
+	}
+	return false
 }
 
 // spaceShare is one import's claim on one filesystem.
@@ -327,15 +348,24 @@ func (r *importReservation) measureLocked() map[fsKey]spaceMeasure {
 		}
 		a.alloc += n
 	}
+	// On btrfs a file's blocks count before its free space falls, so only
+	// bytes flushed there are counted as written.
+	alloc := func(dir, p string) uint64 {
+		n := lstatAllocated(p)
+		if n > 0 && strings.HasPrefix(string(r.keyLocked(dir)), "btrfs:") && flushForCredit(p) != nil {
+			return 0
+		}
+		return n
+	}
 	add(r.dir, 0)
 	_ = filepath.WalkDir(r.dir, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.Type().IsRegular() {
-			add(r.dir, lstatAllocated(p))
+			add(r.dir, alloc(r.dir, p))
 		}
 		return nil
 	})
 	for _, p := range r.files {
-		add(filepath.Dir(p), lstatAllocated(p))
+		add(filepath.Dir(p), alloc(filepath.Dir(p), p))
 	}
 	out := map[fsKey]spaceMeasure{}
 	for k, a := range byKey {
@@ -456,6 +486,10 @@ func (r *importReservation) totals(dir, what string) func(total uint64) error {
 		return nil
 	}
 }
+
+// flushForCredit flushes a file before its blocks are counted as written on
+// btrfs; a variable so a test can watch it.
+var flushForCredit = syncFile
 
 // syncFile flushes p's data to its filesystem.
 func syncFile(p string) error {

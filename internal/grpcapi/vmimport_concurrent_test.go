@@ -200,7 +200,8 @@ func TestImportVM_AnArchiveReservesWhatItUnpacks(t *testing.T) {
 }
 
 // The conversion names its scratch file in the pool before qemu-img writes
-// it, so its import's reservation shrinks as the output grows.
+// it, so its import's reservation shrinks as the output grows, and names the
+// disk again once it is placed, so it stays measured as the import's.
 func TestConvertForeignDisk_TracksItsScratchFileBeforeWriting(t *testing.T) {
 	stubQemuImg(t)
 	dir := t.TempDir()
@@ -212,15 +213,19 @@ func TestConvertForeignDisk_TracksItsScratchFileBeforeWriting(t *testing.T) {
 	dst := filepath.Join(pool, "out.qcow2")
 	var tracked []string
 	err := convertForeignDisk(context.Background(), src, "raw", dst, dir, 1<<30, nil, func(p string) {
-		if fi, err := os.Stat(p); err != nil || fi.Size() != 0 {
-			t.Errorf("tracked %s after it was written (%v)", p, err)
+		if p != dst {
+			if fi, err := os.Stat(p); err != nil || fi.Size() != 0 {
+				t.Errorf("tracked %s after it was written (%v)", p, err)
+			}
+		} else if _, err := os.Stat(dst); err != nil {
+			t.Errorf("tracked the disk before it was placed: %v", err)
 		}
 		tracked = append(tracked, p)
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tracked) != 1 || filepath.Dir(tracked[0]) != pool || tracked[0] == dst {
-		t.Fatalf("tracked %v, want the one scratch file in %s", tracked, pool)
+	if len(tracked) != 2 || filepath.Dir(tracked[0]) != pool || tracked[0] == dst || tracked[1] != dst {
+		t.Fatalf("tracked %v, want the scratch file in %s and then %s", tracked, pool, dst)
 	}
 }

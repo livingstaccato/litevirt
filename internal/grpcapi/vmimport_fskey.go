@@ -1,6 +1,7 @@
 package grpcapi
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // importFSKey names the free space dir's writes come out of, so an import's
@@ -87,7 +89,11 @@ func fsKeyFor(fstype, source string, dev func() fsKey) fsKey {
 
 // lookupNFSServer resolves an NFS server's name; a variable so a test can fix
 // it.
-var lookupNFSServer = net.LookupHost
+var lookupNFSServer = func(host string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return net.DefaultResolver.LookupHost(ctx, host)
+}
 
 func devFSKey(p string) fsKey {
 	var st syscall.Stat_t

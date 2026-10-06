@@ -6,12 +6,13 @@ import (
 )
 
 // InFlightResourceIDs returns the resource id ("vm:<name>", ...) of every
-// operation whose reduced state is not terminal: a create, clone or restore
+// operation whose reduced state is not terminal, and "vm:<workload>" for one
+// whose reservation names a VM: a create, clone or restore
 // that has reserved its admission and may be writing the resource's files
 // before it records them.
 func InFlightResourceIDs(ctx context.Context, c *Client) ([]string, error) {
 	orows, err := c.Query(ctx,
-		`SELECT id, resource_id, operation_kind, vm_owner_epoch FROM operations WHERE deleted_at IS NULL`)
+		`SELECT id, resource_id, operation_kind, vm_owner_epoch, reservation_json FROM operations WHERE deleted_at IS NULL`)
 	if err != nil {
 		return nil, err
 	}
@@ -32,8 +33,17 @@ func InFlightResourceIDs(ctx context.Context, c *Client) ([]string, error) {
 	for _, r := range orows {
 		key := fmt.Sprintf("%s\x00%d", r.String("id"), r.Int64("vm_owner_epoch"))
 		state, _ := ReduceOperationState(OperationKind(r.String("operation_kind")), steps[key])
-		if !IsOperationTerminal(state) {
-			out = append(out, r.String("resource_id"))
+		if IsOperationTerminal(state) {
+			continue
+		}
+		out = append(out, r.String("resource_id"))
+		// A create, clone or restore admitted through admitReserved names its
+		// workload only in its reservation.
+		if raw := r.String("reservation_json"); raw != "" {
+			if rv, err := DecodeReservation(raw); err == nil && rv.Workload != "" &&
+				(rv.WorkloadKind == WorkloadVM || rv.WorkloadKind == "") {
+				out = append(out, "vm:"+rv.Workload)
+			}
 		}
 	}
 	return out, nil

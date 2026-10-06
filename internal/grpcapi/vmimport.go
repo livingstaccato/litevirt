@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/corrosion"
 	lv "github.com/litevirt/litevirt/internal/libvirt"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
 	"github.com/litevirt/litevirt/internal/tenancy"
 	"github.com/litevirt/litevirt/internal/vmimport"
@@ -136,11 +137,19 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	// The row is written only at the end; until then the name is held here,
 	// or two imports of one name would write the same files into the pool.
 	// (An --inspect writes nothing there, and does not take it.)
-	releaseName, err := s.claimImportName(name)
+	importID := randid.New()
+	releaseName, err := s.claimImportNameAs(name, importID)
 	if err != nil {
 		return err
 	}
 	defer releaseName()
+	// Each file the import writes into the pool is measured, and records its
+	// origin, from before its first byte.
+	origin := s.importOriginFor(importID)
+	writes := func(p string) {
+		space.track(p)
+		_ = setImportOrigin(p, origin)
+	}
 
 	// An import does not claim. importRecords builds the NIC rows straight from
 	// the foreign hypervisor's NICs, so importing onto a NetBox-bound network
@@ -223,7 +232,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		// A file already at the name is never replaced. One that something
 		// records is refused; an orphan (a crashed import's output) is moved
 		// aside and kept.
-		if err := s.clearImportDiskName(ctx, name, d.Name, dst); err != nil {
+		if err := s.clearImportDiskName(ctx, name, importID, d.Name, dst); err != nil {
 			cleanupDisks()
 			return status.Error(codes.FailedPrecondition, err.Error())
 		}
@@ -247,7 +256,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			case progress <- &pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk}:
 			default:
 			}
-		}, space.track); err != nil {
+		}, writes); err != nil {
 			cleanupDisks()
 			if errors.Is(err, os.ErrExist) {
 				return status.Errorf(codes.FailedPrecondition,
@@ -904,7 +913,8 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 // qemu-img (a malicious descriptor would otherwise make qemu-img read host files).
 //
 // track, when set, is told the name of the scratch file the conversion writes
-// in dst's directory before anything is written to it.
+// in dst's directory before anything is written to it, and dst once the disk
+// has been placed there.
 func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32), track func(path string)) error {
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
@@ -995,11 +1005,16 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		return fmt.Errorf("flush converted disk: %w", err)
 	}
 	// Never over a file already there: another VM's disk keeps its bytes.
-	if err := placeColdDisk(tmp, dst); err != nil {
+	if err := placeNoReplace(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("finalize converted disk: %w", err)
 	}
 	finished = true
+	// The disk is the import's own file under its new name, and stays
+	// measured as such.
+	if track != nil {
+		track(dst)
+	}
 	return nil
 }
 

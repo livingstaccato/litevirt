@@ -136,7 +136,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	// Resolve disk files (Proxmox .conf disks need --disk-map) + safety checks.
-	if err := s.applyImportDiskMap(ctx, fv, first); err != nil {
+	if err := s.applyImportDiskMap(ctx, fv, first, importDir); err != nil {
 		return err
 	}
 
@@ -614,13 +614,25 @@ func (s *Server) applyImportNetworks(fv *vmimport.ForeignVM, meta *pb.ImportVMRe
 // applyImportDiskMap resolves disks that have no staged file yet (Proxmox .conf
 // references a storage volume) via --disk-map, with the same path safety as
 // --server-path.
-func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM, meta *pb.ImportVMRequest) error {
+//
+// A disk the source adapter unpacked into importDir needs no map. Any other
+// existing file is a path the source named — a Proxmox .conf keeps its volume
+// reference verbatim, so it can name any file on this host — and it takes the
+// same staging check as --disk-map; otherwise an operator could have a host
+// file converted into their VM's disk and read it from the guest.
+func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM, meta *pb.ImportVMRequest, importDir string) error {
 	for i := range fv.Disks {
 		d := &fv.Disks[i]
-		if d.IsCDROM || fileExists(d.LocalPath) {
+		if d.IsCDROM {
 			continue
 		}
 		mapped := meta.DiskMap[d.SourceID]
+		if mapped == "" && fileExists(d.LocalPath) {
+			if inImportDir(importDir, d.LocalPath) {
+				continue
+			}
+			mapped = d.LocalPath
+		}
 		if mapped == "" {
 			return status.Errorf(codes.FailedPrecondition,
 				"disk %q (source %q, ref %q) is not a local file — pass --disk-map %s=/staged/path", d.Name, d.SourceID, d.LocalPath, d.SourceID)
@@ -632,6 +644,19 @@ func (s *Server) applyImportDiskMap(ctx context.Context, fv *vmimport.ForeignVM,
 		d.LocalPath = resolved
 	}
 	return nil
+}
+
+// inImportDir reports whether p, with symlinks resolved, lies inside importDir.
+func inImportDir(importDir, p string) bool {
+	resolved, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return false
+	}
+	root, err := filepath.EvalSymlinks(importDir)
+	if err != nil {
+		return false
+	}
+	return safename.Contains(root, resolved)
 }
 
 // importQuotaAmount is what an import will charge the project, in every

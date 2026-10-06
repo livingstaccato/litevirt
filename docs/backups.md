@@ -339,7 +339,6 @@ lv backup restore-live \
     --repo /srv/backup/main \
     --vm postgres-1 --disk root \
     --timestamp 2026-05-11T02:15:00Z \
-    --target-path /var/lib/libvirt/images/postgres-live.qcow2 \
     --name postgres-restored \
     --auto-start --blockpull
 ```
@@ -466,8 +465,27 @@ the VM's project via path RBAC, and quota-aware:
 - restore with **`lv backup restore-from`** (→ `RestoreFromBackup`) or
   **`lv backup restore-live`** (→ `RestoreLive`).
 
-Restore destinations are a pool-relative filename by default; a custom absolute
-`target_path` (and a custom absolute `repo_path`) require the **admin** role.
+### Where a restore writes
+
+A restore never replaces a file it was merely told the name of. `<data_dir>/disks`
+holds the disks of every project on the host, so a caller-chosen name there was
+a way to overwrite another project's VM disk.
+
+- **No `--target-path`** (the default): the daemon writes a new file of its own
+  under `<data_dir>/disks` — `<vm>-<disk>-restore-<time>-<id>.img`, or
+  `<vm>-<disk>-live-<time>-<id>.qcow2` for a live-restore overlay — and reports
+  it (`target_path` in the DONE frame, the READY frame for `restore-live`).
+- **`--in-place`** (`restore-from` only, `in_place` on the RPC): restore over
+  the disk the VM's own record names. The VM must be in the backup's project,
+  on the daemon's host, stopped, without snapshots, and the file must be that
+  disk's alone. This is the only restore that replaces a file, and its path
+  comes from the record, not the request.
+- **`--target-path`**: names the file. It needs `storage.hostpath` — the
+  **admin** role — whether it is a bare name (under `<data_dir>/disks`) or an
+  absolute path, and an existing file there is refused with `AlreadyExists`,
+  for an admin too.
+
+A custom absolute `repo_path` also requires the **admin** role.
 
 ## gRPC + WebUI
 

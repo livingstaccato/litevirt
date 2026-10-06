@@ -589,25 +589,33 @@ func keepBitmapNames(repo *pbsstore.Repo, vm, disk string) []string {
 	return keep
 }
 
-// RestoreFromBackup streams a manifest's chunks back into a target
-// disk path. Same single-host model as BackupSnapshot.
+// RestoreFromBackup streams a manifest's chunks back into a disk file. Same
+// single-host model as BackupSnapshot. Where it writes is restoreDest's policy
+// (restore_dest.go): a fresh daemon-named file, an admin-named file that does
+// not exist yet, or — in_place — the VM's own stopped disk from its record.
 func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc.ServerStreamingServer[pb.RestoreFromBackupProgress]) error {
 	ctx := stream.Context()
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}
-	if req.RepoPath == "" || req.VmName == "" || req.DiskName == "" || req.Timestamp == "" || req.TargetPath == "" {
+	if req.RepoPath == "" || req.VmName == "" || req.DiskName == "" || req.Timestamp == "" {
 		return status.Error(codes.InvalidArgument,
-			"repo_path, vm_name, disk_name, timestamp, target_path all required")
+			"repo_path, vm_name, disk_name, timestamp all required")
+	}
+	if req.InPlace && req.TargetPath != "" {
+		return status.Error(codes.InvalidArgument, "in_place and target_path are exclusive: in_place restores over the disk the VM's record names")
+	}
+	disksDir := filepath.Join(s.dataDir, "disks")
+	// A named target is admin only and never an existing file — refused before
+	// the repo is even opened.
+	var named string
+	if req.TargetPath != "" {
+		var err error
+		if named, err = s.resolveAdminTarget(ctx, req.TargetPath, disksDir); err != nil {
+			return err
+		}
 	}
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	// target_path: a bare filename is contained under the disks dir; a custom
-	// absolute path is admin-only. Restore to a temp file + rename so we never
-	// write through a symlink planted at the final path.
-	target, err := s.resolveRestoreTarget(ctx, req.TargetPath, filepath.Join(s.dataDir, "disks"))
 	if err != nil {
 		return err
 	}
@@ -621,24 +629,44 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 	}
 	// Authorize against the backup's actual project (manifest spec authoritative;
 	// name-reuse mismatch or undeterminable → admin) — not a _default fallback.
-	if _, err := s.authorizeVMRestore(ctx, req.VmName, manifest); err != nil {
+	authProject, err := s.authorizeVMRestore(ctx, req.VmName, manifest)
+	if err != nil {
 		return err
 	}
+
+	var dest restoreDest
+	switch {
+	case req.InPlace:
+		if dest, err = s.inPlaceRestoreTarget(ctx, req.VmName, req.DiskName, authProject); err != nil {
+			return err
+		}
+	case named != "":
+		dest = restoreDest{path: named}
+	default:
+		path, derr := derivedDiskFile(disksDir, req.VmName, req.DiskName, "restore", ".img")
+		if derr != nil {
+			return derr
+		}
+		dest = restoreDest{path: path}
+	}
+	defer dest.release()
+	target := dest.path
 
 	send := func(p *pb.RestoreFromBackupProgress) error { return stream.Send(p) }
 	if err := send(&pb.RestoreFromBackupProgress{
 		Phase:       pb.RestoreFromBackupProgress_RESTORE,
 		ChunksTotal: int32(len(manifest.Chunks)),
 		Status:      fmt.Sprintf("restoring %s@%s → %s", req.VmName, req.Timestamp, target),
+		TargetPath:  target,
 	}); err != nil {
 		return err
 	}
 
-	if err := refuseSymlinkTarget(target); err != nil {
+	tmpTarget, err := stagingTemp(target)
+	if err != nil {
 		return err
 	}
-	tmpTarget := target + ".restore.tmp"
-	_ = os.Remove(tmpTarget)
+	defer os.Remove(tmpTarget) // gone after a successful place; a leftover otherwise
 	if err := pbsstore.RestoreToFile(ctx, repo, manifest, tmpTarget, pbsstore.RestoreOptions{
 		Progress: func(p pbsstore.RestoreProgress) {
 			_ = send(&pb.RestoreFromBackupProgress{
@@ -649,12 +677,10 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 			})
 		},
 	}); err != nil {
-		_ = os.Remove(tmpTarget)
 		return status.Errorf(codes.Internal, "restore: %v", err)
 	}
-	if err := os.Rename(tmpTarget, target); err != nil {
-		_ = os.Remove(tmpTarget)
-		return status.Errorf(codes.Internal, "finalize restore: %v", err)
+	if err := dest.place(tmpTarget); err != nil {
+		return err
 	}
 	s.recordVMEvent(ctx, req.VmName, "backup.restored", "ok",
 		fmt.Sprintf("%s @ %s → %s", req.DiskName, req.Timestamp, target))
@@ -664,6 +690,7 @@ func (s *Server) RestoreFromBackup(req *pb.RestoreFromBackupRequest, stream grpc
 		ChunksDone:   int32(len(manifest.Chunks)),
 		ChunksTotal:  int32(len(manifest.Chunks)),
 		Status:       "restore complete",
+		TargetPath:   target,
 	})
 }
 

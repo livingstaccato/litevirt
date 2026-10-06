@@ -135,8 +135,8 @@ binding can:
   pool, a `--target`, a btrfs source, NFS mount options, a Ceph conf or
   keyring), any network-backed pool (`nfs`, `ceph`, `iscsi`), any pool on
   host block storage (`zfs`, `lvm-thin`), a compose
-  `backup-repos:` path, and a custom absolute `repo_path` or `target_path` on
-  a backup or restore RPC all need it, because the daemon reads and writes
+  `backup-repos:` path, a custom absolute `repo_path`, and any `target_path` on
+  a restore RPC (a bare name included) all need it, because the daemon reads and writes
   there as root. Only `Admin` holds it (through `*`): `Operator` holds
   `storage.pool.write` but not this, at any path. A custom role gets it by
   naming it or `storage.*`. Without bindings the floor is `admin`. See

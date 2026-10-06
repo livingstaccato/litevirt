@@ -1001,7 +1001,14 @@ message RestoreFromBackupRequest {
     string vm_name       = 2;  // manifest selector
     string disk_name     = 3;
     string timestamp     = 4;  // exact RFC3339 of manifest
-    string target_path   = 5;  // where to write the restored disk
+    // target_path names the file to write, admin only, and never an existing
+    // file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+    // reports it in the DONE frame.
+    string target_path   = 5;
+    // in_place restores over the disk the VM's own record names (vm_name,
+    // disk_name). The VM must be in the backup's project, on this host and
+    // stopped. Exclusive with target_path.
+    bool   in_place      = 6;
 }
 message RestoreFromBackupProgress {
     enum Phase {
@@ -1015,6 +1022,7 @@ message RestoreFromBackupProgress {
     int32  chunks_total  = 4;
     string status        = 5;
     string error         = 6;
+    string target_path   = 7;  // the file written, on DONE
 }
 
 // ── Backup repository maintenance ──
@@ -1458,6 +1466,9 @@ message RestoreLiveRequest {
     string vm_name    = 2;
     string disk_name  = 3;
     string timestamp  = 4;
+    // target_path names the overlay file, admin only, and never an existing
+    // file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+    // reports it as RestoreLiveProgress.target_path.
     string target_path = 5;
     // bind_addr controls the address the NBD server listens on.
     // Empty defaults to "127.0.0.1:0" — localhost-only, ephemeral

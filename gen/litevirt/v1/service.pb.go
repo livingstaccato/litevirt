@@ -10656,12 +10656,19 @@ func (x *PushBackupResponse) GetBytesWritten() int64 {
 }
 
 type RestoreFromBackupRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RepoPath      string                 `protobuf:"bytes,1,opt,name=repo_path,json=repoPath,proto3" json:"repo_path,omitempty"`
-	VmName        string                 `protobuf:"bytes,2,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"` // manifest selector
-	DiskName      string                 `protobuf:"bytes,3,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
-	Timestamp     string                 `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`                     // exact RFC3339 of manifest
-	TargetPath    string                 `protobuf:"bytes,5,opt,name=target_path,json=targetPath,proto3" json:"target_path,omitempty"` // where to write the restored disk
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	RepoPath  string                 `protobuf:"bytes,1,opt,name=repo_path,json=repoPath,proto3" json:"repo_path,omitempty"`
+	VmName    string                 `protobuf:"bytes,2,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"` // manifest selector
+	DiskName  string                 `protobuf:"bytes,3,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
+	Timestamp string                 `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"` // exact RFC3339 of manifest
+	// target_path names the file to write, admin only, and never an existing
+	// file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+	// reports it in the DONE frame.
+	TargetPath string `protobuf:"bytes,5,opt,name=target_path,json=targetPath,proto3" json:"target_path,omitempty"`
+	// in_place restores over the disk the VM's own record names (vm_name,
+	// disk_name). The VM must be in the backup's project, on this host and
+	// stopped. Exclusive with target_path.
+	InPlace       bool `protobuf:"varint,6,opt,name=in_place,json=inPlace,proto3" json:"in_place,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10731,6 +10738,13 @@ func (x *RestoreFromBackupRequest) GetTargetPath() string {
 	return ""
 }
 
+func (x *RestoreFromBackupRequest) GetInPlace() bool {
+	if x != nil {
+		return x.InPlace
+	}
+	return false
+}
+
 type RestoreFromBackupProgress struct {
 	state         protoimpl.MessageState          `protogen:"open.v1"`
 	Phase         RestoreFromBackupProgress_Phase `protobuf:"varint,1,opt,name=phase,proto3,enum=litevirt.v1.RestoreFromBackupProgress_Phase" json:"phase,omitempty"`
@@ -10739,6 +10753,7 @@ type RestoreFromBackupProgress struct {
 	ChunksTotal   int32                           `protobuf:"varint,4,opt,name=chunks_total,json=chunksTotal,proto3" json:"chunks_total,omitempty"`
 	Status        string                          `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
 	Error         string                          `protobuf:"bytes,6,opt,name=error,proto3" json:"error,omitempty"`
+	TargetPath    string                          `protobuf:"bytes,7,opt,name=target_path,json=targetPath,proto3" json:"target_path,omitempty"` // the file written, on DONE
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -10811,6 +10826,13 @@ func (x *RestoreFromBackupProgress) GetStatus() string {
 func (x *RestoreFromBackupProgress) GetError() string {
 	if x != nil {
 		return x.Error
+	}
+	return ""
+}
+
+func (x *RestoreFromBackupProgress) GetTargetPath() string {
+	if x != nil {
+		return x.TargetPath
 	}
 	return ""
 }
@@ -14930,12 +14952,15 @@ func (x *AbortVMOperationResponse) GetDetail() string {
 // the operator can also supply/override a spec. Without auto_start the
 // behavior is unchanged (NBD + overlay only).
 type RestoreLiveRequest struct {
-	state      protoimpl.MessageState `protogen:"open.v1"`
-	RepoPath   string                 `protobuf:"bytes,1,opt,name=repo_path,json=repoPath,proto3" json:"repo_path,omitempty"`
-	VmName     string                 `protobuf:"bytes,2,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
-	DiskName   string                 `protobuf:"bytes,3,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
-	Timestamp  string                 `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	TargetPath string                 `protobuf:"bytes,5,opt,name=target_path,json=targetPath,proto3" json:"target_path,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	RepoPath  string                 `protobuf:"bytes,1,opt,name=repo_path,json=repoPath,proto3" json:"repo_path,omitempty"`
+	VmName    string                 `protobuf:"bytes,2,opt,name=vm_name,json=vmName,proto3" json:"vm_name,omitempty"`
+	DiskName  string                 `protobuf:"bytes,3,opt,name=disk_name,json=diskName,proto3" json:"disk_name,omitempty"`
+	Timestamp string                 `protobuf:"bytes,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// target_path names the overlay file, admin only, and never an existing
+	// file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+	// reports it as RestoreLiveProgress.target_path.
+	TargetPath string `protobuf:"bytes,5,opt,name=target_path,json=targetPath,proto3" json:"target_path,omitempty"`
 	// bind_addr controls the address the NBD server listens on.
 	// Empty defaults to "127.0.0.1:0" — localhost-only, ephemeral
 	// port. Set to "0.0.0.0:0" for a cluster-internal listener if
@@ -32787,14 +32812,15 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\x12PushBackupResponse\x12%\n" +
 	"\x0echunks_written\x18\x01 \x01(\x05R\rchunksWritten\x12%\n" +
 	"\x0echunks_deduped\x18\x02 \x01(\x05R\rchunksDeduped\x12#\n" +
-	"\rbytes_written\x18\x03 \x01(\x03R\fbytesWritten\"\xac\x01\n" +
+	"\rbytes_written\x18\x03 \x01(\x03R\fbytesWritten\"\xc7\x01\n" +
 	"\x18RestoreFromBackupRequest\x12\x1b\n" +
 	"\trepo_path\x18\x01 \x01(\tR\brepoPath\x12\x17\n" +
 	"\avm_name\x18\x02 \x01(\tR\x06vmName\x12\x1b\n" +
 	"\tdisk_name\x18\x03 \x01(\tR\bdiskName\x12\x1c\n" +
 	"\ttimestamp\x18\x04 \x01(\tR\ttimestamp\x12\x1f\n" +
 	"\vtarget_path\x18\x05 \x01(\tR\n" +
-	"targetPath\"\xa9\x02\n" +
+	"targetPath\x12\x19\n" +
+	"\bin_place\x18\x06 \x01(\bR\ainPlace\"\xca\x02\n" +
 	"\x19RestoreFromBackupProgress\x12B\n" +
 	"\x05phase\x18\x01 \x01(\x0e2,.litevirt.v1.RestoreFromBackupProgress.PhaseR\x05phase\x12#\n" +
 	"\rbytes_written\x18\x02 \x01(\x03R\fbytesWritten\x12\x1f\n" +
@@ -32802,7 +32828,9 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"chunksDone\x12!\n" +
 	"\fchunks_total\x18\x04 \x01(\x05R\vchunksTotal\x12\x16\n" +
 	"\x06status\x18\x05 \x01(\tR\x06status\x12\x14\n" +
-	"\x05error\x18\x06 \x01(\tR\x05error\"1\n" +
+	"\x05error\x18\x06 \x01(\tR\x05error\x12\x1f\n" +
+	"\vtarget_path\x18\a \x01(\tR\n" +
+	"targetPath\"1\n" +
 	"\x05Phase\x12\x11\n" +
 	"\rPHASE_UNKNOWN\x10\x00\x12\v\n" +
 	"\aRESTORE\x10\x01\x12\b\n" +

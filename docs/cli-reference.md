@@ -641,10 +641,11 @@ lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce
 #   --quiesce auto (default): freeze guest filesystems via the qemu-guest-agent for an
 #   application-consistent backup when the VM has an agent, else crash-consistent.
 #   --quiesce off: always crash-consistent. A freeze failure never fails the backup.
-lv backup restore-from --repo <p> --vm <v> --disk <d> \
-    --timestamp <ts> --target-path <path>
+lv backup restore-from --repo <p> --vm <v> --disk <d> --timestamp <ts>
+  [--in-place]        # restore over the VM's own disk from its record (VM stopped)
+  [--target-path <f>] # admin only; never an existing file. Default: a new daemon-named file
 lv backup restore-live --repo <p> --vm <v> --disk <d> \
-    --timestamp <ts> --target-path <overlay.qcow2> [--bind 127.0.0.1:0]
+    --timestamp <ts> [--target-path <overlay.qcow2>] [--bind 127.0.0.1:0]
   [--auto-start]      # define + start the VM against the overlay automatically
   [--name <new>]      # rename the restored VM (avoids collision with the original)
   [--blockpull]       # after start, localize the disk then tear down the NBD server

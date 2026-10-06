@@ -2,12 +2,15 @@ package corrosion
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +62,12 @@ type auditSeededMarker struct {
 	Seeded      bool   `json:"seeded"`
 	Reason      string `json:"reason"`
 	At          string `json:"at"`
+	// Asserted: an operator asserted this replica seeded (AuditSeededAssertFileName)
+	// at AssertedAt. AssertionAudited is set once the signed audit.seeded_asserted
+	// row is in the log (RecordAuditSeededAssertion).
+	Asserted         bool   `json:"asserted,omitempty"`
+	AssertedAt       string `json:"asserted_at,omitempty"`
+	AssertionAudited bool   `json:"assertion_audited,omitempty"`
 }
 
 // auditSeededState is a client's view of its marker. A client with no data dir
@@ -71,6 +80,17 @@ type auditSeededState struct {
 	// problem says why the marker could not be used, if it could not: the
 	// replica is then treated as decided and NOT seeded (fails closed).
 	problem string
+
+	asserted, assertionAudited bool
+	assertedAt                 string
+
+	// unpersisted: a decision was taken and could not be written. Until it is
+	// (RetryAuditSeededDecision), the replica is not seeded AND this host's own
+	// audit rows are held, so nothing on disk can make the next start's upgrade
+	// rule grandfather it (audit_hold.go, auditTargetReached).
+	unpersisted   bool
+	pendingSeeded bool
+	pendingReason string
 }
 
 func (c *Client) auditSeededPath() string {
@@ -125,6 +145,7 @@ func (c *Client) loadAuditSeededLocked(ctx context.Context) {
 		return // another state.db's marker: this replica has decided nothing yet
 	}
 	c.seeded.decided, c.seeded.seeded = true, m.Seeded
+	c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited = m.Asserted, m.AssertedAt, m.AssertionAudited
 }
 
 // writeAuditSeededLocked persists a decision and adopts it only once it is
@@ -133,7 +154,7 @@ func (c *Client) loadAuditSeededLocked(ctx context.Context) {
 func (c *Client) writeAuditSeededLocked(ctx context.Context, seeded bool, reason string) error {
 	path := c.auditSeededPath()
 	if path == "" {
-		c.seeded.decided, c.seeded.seeded, c.seeded.problem = true, seeded, ""
+		c.seeded.decided, c.seeded.seeded, c.seeded.problem, c.seeded.unpersisted = true, seeded, "", false
 		return nil
 	}
 	err := func() error {
@@ -142,7 +163,8 @@ func (c *Client) writeAuditSeededLocked(ctx context.Context, seeded bool, reason
 			return err
 		}
 		data, err := json.Marshal(auditSeededMarker{Incarnation: inc, Seeded: seeded, Reason: reason,
-			At: time.Now().UTC().Format(time.RFC3339)})
+			At: time.Now().UTC().Format(time.RFC3339), Asserted: c.seeded.asserted,
+			AssertedAt: c.seeded.assertedAt, AssertionAudited: c.seeded.assertionAudited})
 		if err != nil {
 			return err
 		}
@@ -150,10 +172,11 @@ func (c *Client) writeAuditSeededLocked(ctx context.Context, seeded bool, reason
 	}()
 	if err != nil {
 		c.seeded.decided, c.seeded.seeded = true, false
+		c.seeded.unpersisted, c.seeded.pendingSeeded, c.seeded.pendingReason = true, seeded, reason
 		c.seeded.problem = "the seeded marker could not be written: " + err.Error()
 		return err
 	}
-	c.seeded.decided, c.seeded.seeded, c.seeded.problem = true, seeded, ""
+	c.seeded.decided, c.seeded.seeded, c.seeded.problem, c.seeded.unpersisted = true, seeded, "", false
 	return nil
 }
 
@@ -226,7 +249,13 @@ func DecideAuditSeeded(ctx context.Context, c *Client, host string) (bool, error
 	}
 	if err := c.writeAuditSeededLocked(ctx, seeded, reason); err != nil {
 		// Not adopted: a decision that is not durable could be taken differently
-		// on the next start, so this process proceeds as not seeded.
+		// on the next start, so this process proceeds as not seeded, and holds
+		// its own audit rows until the decision is written (RetryAuditSeededDecision).
+		// Rows of its own landing first are what would let the next start's
+		// upgrade rule grandfather it.
+		c.seeded.mu.Unlock()
+		c.reholdAudit(host)
+		c.seeded.mu.Lock()
 		return false, fmt.Errorf("record this replica's seeded decision: %w", err)
 	}
 	slog.Info("recorded whether this replica holds the cluster's history", "seeded", seeded, "reason", reason)
@@ -236,34 +265,150 @@ func DecideAuditSeeded(ctx context.Context, c *Client, host string) (bool, error
 // AuditSeededAssertFileName is the operator's way out of a cluster with no
 // seeded replica at all — a single-node cluster whose founder lost its
 // state.db, or a total loss — where `lv host add` is otherwise refused
-// forever. Root creates it under data_dir and restarts the daemon; the next
-// start records this replica as seeded, on the operator's word, and removes
-// it. If this replica does NOT hold the cluster's history, an admission it then
-// vouches for can let a re-added host fork its audit chain: the assertion is
-// the operator taking that on.
+// forever. Root writes this state.db's voter incarnation into it and restarts
+// the daemon; the next start records this replica as seeded, on the operator's
+// word, writes a signed audit.seeded_asserted row once the keyring is wired
+// (RecordAuditSeededAssertion), and removes the file. If this replica does NOT
+// hold the cluster's history, an admission it then vouches for can let a
+// re-added host fork its audit chain: the assertion is the operator taking
+// that on.
+//
+// The content requirement is the defence against anyone able to put a file in
+// data_dir without being root on the node. The incarnation is node-local and
+// never replicated, and root reads it from the marker (the "incarnation" field
+// of AuditSeededFileName) or from state.db's local_voter_incarnation table. It
+// also binds the assertion to one state.db, so a file left behind is not
+// applied to the next one.
 const AuditSeededAssertFileName = "audit-seeded-assert"
 
-// consumeAuditSeededAssertion applies an operator's assertion, if one is
-// present. done is false when there is none.
+// consumeAuditSeededAssertion applies an operator's assertion, if a valid one
+// is present. done is false when there is none to apply.
 func (c *Client) consumeAuditSeededAssertion(ctx context.Context) (seeded, done bool, err error) {
 	if c.dataDir == "" {
 		return false, false, nil
 	}
 	assert := filepath.Join(c.dataDir, AuditSeededAssertFileName)
-	if _, err := os.Lstat(assert); errors.Is(err, os.ErrNotExist) {
+	fi, lerr := os.Lstat(assert)
+	if lerr != nil {
+		if !errors.Is(lerr, os.ErrNotExist) {
+			slog.Warn("could not check for a seeded assertion; none is applied", "file", assert, "error", lerr)
+		}
+		return false, false, nil
+	}
+	removeIt := func() {
+		if err := os.Remove(assert); err != nil {
+			slog.Warn("could not remove the seeded assertion; it is not applied again, since it names this "+
+				"state.db's incarnation and this replica has recorded it", "file", assert, "error", err)
+		}
+	}
+	inc, ierr := c.VoterIncarnation(ctx)
+	var content []byte
+	if fi.Mode().IsRegular() && fi.Size() <= 256 {
+		content, _ = os.ReadFile(assert)
+	}
+	if ierr != nil || len(content) == 0 || strings.TrimSpace(string(content)) != inc {
+		slog.Error("a seeded assertion is present but does not name this state.db's voter incarnation; "+
+			"it is IGNORED. To assert, write the incarnation (the \"incarnation\" field of the seeded "+
+			"marker, or local_voter_incarnation in state.db) into it", "file", assert,
+			"marker", filepath.Join(c.dataDir, AuditSeededFileName))
 		return false, false, nil
 	}
 	c.seeded.mu.Lock()
 	c.loadAuditSeededLocked(ctx)
+	if c.seeded.asserted {
+		// Applied already, and the file outlived its removal: not again.
+		c.seeded.mu.Unlock()
+		removeIt()
+		return false, false, nil
+	}
+	prevAsserted, prevAt, prevAudited := c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited
+	c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited = true, time.Now().UTC().Format(time.RFC3339Nano), false
 	werr := c.writeAuditSeededLocked(ctx, true, "operator asserted ("+AuditSeededAssertFileName+")")
+	if werr != nil {
+		// Not applied: the file stays, and the next start applies it. Nothing is
+		// left pending — a retry would persist "seeded" without the assertion
+		// that must be audited with it.
+		c.seeded.asserted, c.seeded.assertedAt, c.seeded.assertionAudited = prevAsserted, prevAt, prevAudited
+		c.seeded.unpersisted = false
+	}
 	c.seeded.mu.Unlock()
 	if werr != nil {
 		return false, true, fmt.Errorf("record the operator's seeded assertion: %w", werr)
 	}
 	slog.Warn("this replica was asserted seeded by an operator: it vouches for audit chain positions at "+
 		"host admission on the operator's word that it holds the cluster's history", "file", assert)
-	if err := os.Remove(assert); err != nil {
-		slog.Warn("could not remove the seeded assertion after applying it", "file", assert, "error", err)
-	}
+	removeIt()
 	return true, true, nil
+}
+
+// RecordAuditSeededAssertion writes the signed audit.seeded_asserted row for an
+// operator's assertion that has not been audited yet — exactly once. Called by
+// the daemon after its signing keyring is wired: a row written before it would
+// be unsigned after a signed history. The row's id is derived from the
+// assertion, so a crash between the row and the marker's flag cannot write it
+// twice. A held host spools it like any other row.
+func RecordAuditSeededAssertion(ctx context.Context, c *Client, host string) error {
+	c.seeded.mu.Lock()
+	c.loadAuditSeededLocked(ctx)
+	pending, at := c.seeded.asserted && !c.seeded.assertionAudited, c.seeded.assertedAt
+	c.seeded.mu.Unlock()
+	if !pending {
+		return nil
+	}
+	sum := sha256.Sum256([]byte(host + "\x00" + at))
+	if err := InsertAuditLog(ctx, c, AuditRecord{
+		ID:       "audit-seeded-asserted-" + hex.EncodeToString(sum[:8]),
+		Username: "root@" + host,
+		HostName: host,
+		Action:   "audit.seeded_asserted",
+		Target:   host,
+		Detail: "asserted at " + at + " by root on this host (" + AuditSeededAssertFileName + "): this " +
+			"replica vouches for audit chain positions at host admission on the operator's word that it " +
+			"holds the cluster's history; a re-added host admitted through it forks its chain if it does not",
+		Result: "success",
+	}); err != nil {
+		return fmt.Errorf("audit the seeded assertion: %w", err)
+	}
+	c.seeded.mu.Lock()
+	defer c.seeded.mu.Unlock()
+	c.seeded.assertionAudited = true
+	if err := c.writeAuditSeededLocked(ctx, c.seeded.seeded, "operator asserted ("+AuditSeededAssertFileName+")"); err != nil {
+		return fmt.Errorf("record that the seeded assertion is audited: %w", err)
+	}
+	return nil
+}
+
+// RetryAuditSeededDecision writes a decision that could not be written when it
+// was taken. Until it is written the replica is not seeded and its own audit
+// rows are held (auditSeededUnpersisted).
+func (c *Client) RetryAuditSeededDecision(ctx context.Context) error {
+	c.seeded.mu.Lock()
+	defer c.seeded.mu.Unlock()
+	if !c.seeded.unpersisted {
+		return nil
+	}
+	return c.writeAuditSeededLocked(ctx, c.seeded.pendingSeeded, c.seeded.pendingReason)
+}
+
+// auditSeededPending reports a decision taken and not yet written, and why.
+func (c *Client) auditSeededPending() (bool, string) {
+	c.seeded.mu.Lock()
+	defer c.seeded.mu.Unlock()
+	return c.seeded.unpersisted, c.seeded.problem
+}
+
+// reholdAudit closes host's hold again, so its own rows are held until the
+// hold re-opens (auditTargetReached). DecideAuditSeeded's check of the hold
+// opened it before the decision's write failed.
+func (c *Client) reholdAudit(host string) {
+	c.auditChain.mu.Lock()
+	defer c.auditChain.mu.Unlock()
+	h := c.auditChain.hold
+	if h == nil || h.cfg.Host != host {
+		return
+	}
+	if t := c.auditChain.tails[host]; t != nil {
+		t.ready = false
+	}
+	h.tailLoaded = false
 }

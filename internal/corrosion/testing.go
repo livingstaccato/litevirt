@@ -390,3 +390,14 @@ func SetMaxHeldAuditRowsForTest(t TestingT, n int) {
 	maxHeldAuditRows = n
 	t.Cleanup(func() { maxHeldAuditRows = prev })
 }
+
+// ResetAuditSeededForTests forgets this client's in-memory seeded state, as a
+// restart does, so the next read goes back to the marker.
+func (c *Client) ResetAuditSeededForTests() {
+	c.seeded.mu.Lock()
+	defer c.seeded.mu.Unlock()
+	s := &c.seeded
+	s.loaded, s.decided, s.seeded, s.problem = false, false, false, ""
+	s.asserted, s.assertionAudited, s.assertedAt = false, false, ""
+	s.unpersisted, s.pendingSeeded, s.pendingReason = false, false, ""
+}

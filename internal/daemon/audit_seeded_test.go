@@ -19,7 +19,8 @@ func TestReportAuditSeeded_ShowsAnUnseededNodeUntilItIsSeeded(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := &Daemon{cfg: &Config{HostName: "node-0", DataDir: t.TempDir()}, db: db}
-	if d.reportAuditSeeded(ctx) {
+	var st auditSeededReport
+	if d.reportAuditSeeded(ctx, &st) {
 		t.Fatal("fixture: seeded")
 	}
 	row, found, err := corrosion.GetHealthCondition(ctx, db, auditHoldEvaluator, CondAuditNotSeeded, "host", "node-0")
@@ -29,11 +30,32 @@ func TestReportAuditSeeded_ShowsAnUnseededNodeUntilItIsSeeded(t *testing.T) {
 	if err := db.MarkAuditSeeded(ctx, "test"); err != nil {
 		t.Fatal(err)
 	}
-	if !d.reportAuditSeeded(ctx) {
+	if !d.reportAuditSeeded(ctx, &st) {
 		t.Fatal("still reported unseeded")
 	}
 	row, _, _ = corrosion.GetHealthCondition(ctx, db, auditHoldEvaluator, CondAuditNotSeeded, "host", "node-0")
 	if row.Lifecycle != corrosion.ConditionResolved {
 		t.Fatalf("audit_not_seeded not resolved once seeded: %+v", row)
+	}
+}
+
+// TestReportAuditSeeded_WritesOnlyOnChange is M-R: the condition row is
+// replicated, so a node that stays unseeded does not rewrite it every pass.
+//
+// Mutation: write on every pass — observe_count climbs.
+func TestReportAuditSeeded_WritesOnlyOnChange(t *testing.T) {
+	ctx := context.Background()
+	db := corrosion.NewTestClientT(t)
+	if err := corrosion.InitSchema(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{cfg: &Config{HostName: "node-0", DataDir: t.TempDir()}, db: db}
+	var st auditSeededReport
+	for i := 0; i < 3; i++ {
+		d.reportAuditSeeded(ctx, &st)
+	}
+	row, _, _ := corrosion.GetHealthCondition(ctx, db, auditHoldEvaluator, CondAuditNotSeeded, "host", "node-0")
+	if row.ObserveCount != 1 {
+		t.Fatalf("observe_count %d after three unchanged passes, want 1", row.ObserveCount)
 	}
 }

@@ -153,29 +153,223 @@ func TestAuditSeeded_ADecisionThatCannotBeWrittenFailsClosed(t *testing.T) {
 	}
 }
 
-// TestAuditSeeded_AnOperatorAssertionSeedsOnce is M-O's way out of a cluster
-// with no seeded replica: root creates the assertion file, the next start
-// records the replica seeded and removes the file.
+func writeAssertion(t *testing.T, c *Client, dir, content string) {
+	t.Helper()
+	if content == "<incarnation>" {
+		inc, err := c.VoterIncarnation(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		content = inc + "\n"
+	}
+	if err := os.WriteFile(filepath.Join(dir, AuditSeededAssertFileName), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertionRows(t *testing.T, c *Client) int {
+	t.Helper()
+	rows, err := c.Query(context.Background(), `SELECT id FROM audit_log WHERE action = 'audit.seeded_asserted'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(rows)
+}
+
+// TestAuditSeeded_AnOperatorAssertionSeedsOnce is the way out of a cluster with
+// no seeded replica: root writes this state.db's incarnation into the assertion
+// file, the next start records the replica seeded and removes the file.
 //
 // Mutation: ignore the assertion — not seeded.
 func TestAuditSeeded_AnOperatorAssertionSeedsOnce(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	c := localClient(t, dir)
-	if seeded, _ := DecideAuditSeeded(ctx, c, "node-0"); seeded {
-		t.Fatal("fixture: a fresh replica decided seeded")
-	}
-	c.Close()
-	if err := os.WriteFile(filepath.Join(dir, AuditSeededAssertFileName), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	c = localClient(t, dir)
 	defer c.Close()
+	writeAssertion(t, c, dir, "<incarnation>")
 	if seeded, err := DecideAuditSeeded(ctx, c, "node-0"); !seeded || err != nil {
 		t.Fatalf("with the operator's assertion = %v, %v; want seeded", seeded, err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, AuditSeededAssertFileName)); !os.IsNotExist(err) {
 		t.Fatalf("the assertion was not consumed: %v", err)
+	}
+}
+
+// TestAuditSeeded_AnAssertionNotNamingThisStateDBIsIgnored is I-E: anyone who
+// can place a file in data_dir without being root on the node (a storage pool
+// aimed at it) does not know this state.db's incarnation, which is never
+// replicated. A file without it is ignored — and so is one left behind for an
+// earlier state.db.
+//
+// Mutation: drop the content check — the blind write seeds the replica.
+func TestAuditSeeded_AnAssertionNotNamingThisStateDBIsIgnored(t *testing.T) {
+	ctx := context.Background()
+	for _, content := range []string{"", "x", "0123456789abcdef0123456789abcdef"} {
+		dir := t.TempDir()
+		c := localClient(t, dir)
+		writeAssertion(t, c, dir, content)
+		if seeded, _ := DecideAuditSeeded(ctx, c, "node-0"); seeded || c.AuditSeeded(ctx) {
+			t.Errorf("an assertion containing %q seeded the replica", content)
+		}
+		c.Close()
+	}
+}
+
+// TestAuditSeeded_AnAssertionIsAuditedOnceSigned is I-D: the cluster's audit log
+// records that this node vouches on an operator's word — one signed row,
+// written once the keyring is wired, never twice: not on a second call, not
+// across a restart, and not when the marker's "audited" flag was lost after the
+// row landed.
+//
+// Mutation: drop the InsertAuditLog in RecordAuditSeededAssertion — no row.
+func TestAuditSeeded_AnAssertionIsAuditedOnceSigned(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	c := localClient(t, dir)
+	writeAssertion(t, c, dir, "<incarnation>")
+	if seeded, err := DecideAuditSeeded(ctx, c, "node-0"); !seeded || err != nil {
+		t.Fatalf("assertion not applied: %v %v", seeded, err)
+	}
+	pkiDir := SignAuditRowsForTest(t, c, "node-0")
+	for i := 0; i < 2; i++ {
+		if err := RecordAuditSeededAssertion(ctx, c, "node-0"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := assertionRows(t, c); n != 1 {
+		t.Fatalf("%d audit.seeded_asserted rows, want exactly one", n)
+	}
+	AssertAuditRowsSignedForTest(t, c, 1)
+	c.Close()
+
+	// The marker loses its "audited" flag (a crash between the row and the
+	// flag): the row's id is the assertion's, so it is not written again.
+	path := filepath.Join(dir, AuditSeededFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(strings.Replace(string(data), `"assertion_audited":true`, `"assertion_audited":false`, 1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c = localClient(t, dir)
+	defer c.Close()
+	kr, err := LoadAuditKeyring(pkiDir, "node-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetAuditKeyring(kr)
+	if _, err := DecideAuditSeeded(ctx, c, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecordAuditSeededAssertion(ctx, c, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	if n := assertionRows(t, c); n != 1 {
+		t.Fatalf("after a restart with the flag lost: %d audit.seeded_asserted rows, want one", n)
+	}
+}
+
+// TestAuditSeeded_AnAssertionThatOutlivesItsRemovalIsNotReapplied is M-Q (b):
+// if the file could not be removed it is still there on the next start, and
+// must not be applied — and audited — again.
+//
+// Mutation: drop the "applied already" guard — a second assertion row.
+func TestAuditSeeded_AnAssertionThatOutlivesItsRemovalIsNotReapplied(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	c := localClient(t, dir)
+	writeAssertion(t, c, dir, "<incarnation>")
+	if _, err := DecideAuditSeeded(ctx, c, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	pkiDir := SignAuditRowsForTest(t, c, "node-0")
+	if err := RecordAuditSeededAssertion(ctx, c, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	writeAssertion(t, c, dir, "<incarnation>") // the removal "failed"
+	c.Close()
+	c = localClient(t, dir)
+	defer c.Close()
+	kr, err := LoadAuditKeyring(pkiDir, "node-0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetAuditKeyring(kr)
+	if seeded, err := DecideAuditSeeded(ctx, c, "node-0"); !seeded || err != nil {
+		t.Fatalf("DecideAuditSeeded = %v %v", seeded, err)
+	}
+	if err := RecordAuditSeededAssertion(ctx, c, "node-0"); err != nil {
+		t.Fatal(err)
+	}
+	if n := assertionRows(t, c); n != 1 {
+		t.Fatalf("%d audit.seeded_asserted rows: the leftover assertion was applied again", n)
+	}
+}
+
+// unwritableMarkerClient is a client whose seeded marker cannot be written:
+// its data dir is read-only. (The database lives elsewhere, so its own writes
+// still work, as on a node whose data dir is full while the database is not.)
+func unwritableMarkerClient(t *testing.T) (*Client, string) {
+	t.Helper()
+	c := newAuditTestClient(t)
+	dir := t.TempDir()
+	c.SetDataDirForTest(dir)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	return c, dir
+}
+
+// TestAuditSeeded_AnUnwrittenDecisionHoldsOwnRows is M-N's remainder: a "not
+// seeded" decision that could not be written must not let this host write rows
+// of its own, or the next start finds rows and no decision and the upgrade rule
+// grandfathers it. Its rows are held until the decision is written.
+//
+// Mutations: drop the unpersisted check in auditTargetReached, or the rehold in
+// DecideAuditSeeded — the row lands, and the restart grandfathers the replica.
+func TestAuditSeeded_AnUnwrittenDecisionHoldsOwnRows(t *testing.T) {
+	ctx := context.Background()
+	c, dir := unwritableMarkerClient(t)
+	c.HoldAuditUntilCaughtUp(AuditHoldConfig{Host: "node-0"})
+	if seeded, err := DecideAuditSeeded(ctx, c, "node-0"); seeded || err == nil {
+		t.Fatalf("DecideAuditSeeded with an unwritable marker = %v, %v", seeded, err)
+	}
+	ins(t, c, "own-1", "node-0", "")
+	if _, ok := auditSeqOf(t, c, "own-1"); ok {
+		t.Fatal("a row of this host's landed while its seeded decision was unwritten")
+	}
+	// The restart, with the data dir writable again.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c.ResetAuditSeededForTests()
+	c.ResetAuditChainForTests()
+	if seeded, err := DecideAuditSeeded(ctx, c, "node-0"); seeded || err != nil {
+		t.Fatalf("the restart decided %v, %v; want not seeded", seeded, err)
+	}
+}
+
+// TestAuditSeeded_AWrittenRetryLandsTheHeldRows: once the decision can be
+// written, the held rows land.
+func TestAuditSeeded_AWrittenRetryLandsTheHeldRows(t *testing.T) {
+	ctx := context.Background()
+	c, dir := unwritableMarkerClient(t)
+	c.HoldAuditUntilCaughtUp(AuditHoldConfig{Host: "node-0"})
+	_, _ = DecideAuditSeeded(ctx, c, "node-0")
+	ins(t, c, "own-1", "node-0", "")
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RetryAuditSeededDecision(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := c.LandHeldAudit(ctx, "node-0"); held || err != nil {
+		t.Fatalf("still held after the decision was written: %v %v", held, err)
+	}
+	if _, ok := auditSeqOf(t, c, "own-1"); !ok {
+		t.Fatal("the held row did not land")
 	}
 }
 

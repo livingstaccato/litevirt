@@ -372,6 +372,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// the keyring this installs on d.db.
 	d.wireAuditKeyring(ctx)
 
+	// An operator's seeded assertion is audited here, signed, exactly once: not
+	// in DecideAuditSeeded, which runs before the keyring exists.
+	if err := corrosion.RecordAuditSeededAssertion(ctx, d.db, d.cfg.HostName); err != nil {
+		slog.Error("could not audit this replica's seeded assertion; retried at the next start",
+			"error", err)
+	}
+
 	// After the keyring: rows an earlier process left in the spool may land on
 	// the first poll, and landed before it they would be written unsigned
 	// (runAuditHold also waits for the wiring, whatever the order here).

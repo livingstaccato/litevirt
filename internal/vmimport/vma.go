@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -168,8 +169,10 @@ func ParseVMA(r io.Reader, destDir string) (*ForeignVM, error) {
 		}
 	}()
 	for id, dev := range devices {
-		raw := filepath.Join(destDir, dev.name+".raw")
-		f, err := os.OpenFile(raw, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+		// Named by dev_id, never by the archive's device name: that name is
+		// untrusted, and "../" in it placed the file anywhere on the host.
+		raw := filepath.Join(destDir, fmt.Sprintf("vma-dev-%d.raw", id))
+		f, err := os.OpenFile(raw, os.O_CREATE|os.O_EXCL|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 		if err != nil {
 			return nil, fmt.Errorf("vma: create %s: %w", raw, err)
 		}

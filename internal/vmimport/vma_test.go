@@ -272,7 +272,7 @@ func TestParseVMA_RawEndToEnd(t *testing.T) {
 	if d.Format != "raw" {
 		t.Errorf("Disk Format = %q, want raw", d.Format)
 	}
-	wantPath := filepath.Join(dest, "drive-scsi0.raw")
+	wantPath := filepath.Join(dest, "vma-dev-1.raw") // named by dev_id, never by the archive
 	if d.LocalPath != wantPath {
 		t.Errorf("Disk LocalPath = %q, want %q", d.LocalPath, wantPath)
 	}
@@ -324,7 +324,7 @@ func TestParseVMA_ZstdRoundTrip(t *testing.T) {
 	if fv.Name != "vm-100" {
 		t.Errorf("Name = %q, want vm-100", fv.Name)
 	}
-	got, err := os.ReadFile(filepath.Join(dest, "drive-scsi0.raw"))
+	got, err := os.ReadFile(filepath.Join(dest, "vma-dev-1.raw"))
 	if err != nil {
 		t.Fatalf("read raw: %v", err)
 	}

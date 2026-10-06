@@ -302,12 +302,24 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 		}
 	}
+	// Installer ISO: the guest reads it, so naming it is reading that host file.
+	// Gated here, after placement, because a pool ISO is judged against the
+	// SELECTED host's pools; it runs on the entry node (as the user) and again
+	// on the owner (see authorizeVMISO).
+	isoInPool, err := s.authorizeVMISO(ctx, project, targetHost, spec.Iso)
+	if err != nil {
+		return nil, err
+	}
 	if targetHost != s.hostName {
 		if decision != nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
+	}
+	// The owner's own filesystem decides what the ISO path really is.
+	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+		return nil, err
 	}
 
 	// Authoritative admission, on the OWNING node only (everything above either
@@ -491,6 +503,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Installer ISO: attach as a read-only CDROM and boot from it by default so
 	// the guest can install an OS (xmlgen renders IsISO disks as <cdrom>). The
 	// path is on the target host. Persisted in the spec JSON, so it survives.
+	// authorizeVMISO and checkVMISOFile admitted it above.
 	if spec.Iso != "" {
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  "installer",
@@ -1594,6 +1607,11 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 // never locks or forwards, so lock-owning orchestrations (RestartVM, the resource
 // coordinator's restart path) call it directly under one lock.
 func (s *Server) startVMLocked(ctx context.Context, vm *corrosion.VMRecord) (*pb.VM, error) {
+	// A VM created before installer ISOs were gated may carry a protected host
+	// file as its CD-ROM; it does not start again (refuseStoredISOAtStart).
+	if err := s.refuseStoredISOAtStart(vm); err != nil {
+		return nil, err
+	}
 	// Adoption gate + PCI start-preflight (shared with the automated restart paths).
 	// No-op pre-latch, so every start behaves byte-for-behavior as before until
 	// hardware_v2 latches.

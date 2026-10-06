@@ -187,6 +187,50 @@ During a rolling upgrade, a request that enters through a node still on an
 older build reaches the pool's host as a cluster peer, which is trusted; the
 authority checks above hold only once every node runs this release.
 
+## Installer ISOs
+
+A VM's installer ISO (`VMSpec.iso`, the **Installer ISO** field of the UI's
+create form) is a file on the target host that the guest reads as a CD-ROM.
+Naming one is reading that file, so it is gated like any other host path:
+
+- **A pool ISO** — a plain `.iso` file (no leading dot) directly in a
+  file-based pool's directory on the target host, which is what the content
+  browser lists and uploads. The caller needs `storage.content.read` on the
+  pool, and the VM's project must be allowed to use it (a global pool, or one
+  the project owns). A symlink in the pool directory is never pool content.
+- **Any other host path** needs `storage.hostpath` at `/`, which only the Admin
+  role holds. Upload the ISO to a pool instead.
+
+Some files are refused to everyone, Admin included, judged as written and after
+resolving symlinks: the PKI directory, anything in the data directory outside
+`pools/` and `mounts/` (`state.db`, `disks/`, `cloudinit/`, `nvram/`, …), and anything
+under `/boot`, `/dev`, `/etc`, `/home`, `/proc`, `/root`, `/run`, `/sys`,
+`/var/backups`, `/var/run`, `/var/spool`, `/var/lib/lxc`,
+`/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. `/usr` is allowed
+(`virtio-win` installs there).
+
+The ISO must be the file itself: an absolute, clean path (no `.` or `..`) with
+no symlink anywhere along it, naming a regular file with a single hard link.
+Name the real file rather than a link to it (`virtio-win.iso` is often a link
+to a versioned file).
+
+The entry node checks authority before forwarding; the owning host checks the
+file against its own filesystem. An entry node on an older build forwards
+without the authority check, and an owner on an older build has no
+filesystem check, so the pool route is only as strong as the oldest host
+involved until every host runs this build (as with the other content checks
+in [auth.md](auth.md)).
+
+qemu opens the ISO again at every start, so the host judges it again each
+time it hands the file to qemu: every start (restart policy and health
+restarts included), a snapshot restore, a replace cutover, and a migration
+target before the VM lands there. What is judged is the CD-ROM the VM's
+domain actually carries, so a VM whose domain was redefined without its
+installer CD-ROM starts even after the ISO is gone. A refusal fails with
+`FailedPrecondition` and an ERROR log naming the VM and the file, and the VM
+stays down; nothing is rewritten. Replace the file with a plain `.iso`, or
+recreate the VM without it.
+
 ## Compose example
 
 ```yaml

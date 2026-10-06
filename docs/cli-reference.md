@@ -489,6 +489,10 @@ mount options, a Ceph conf or keyring), attaches network storage (`nfs`,
 `ceph`, `iscsi`) or allocates from host block storage (`zfs`, `lvm-thin`) needs `storage.hostpath` at `/` (the Admin role), and system and litevirt-internal directories are refused to
 everyone; see `docs/storage.md#host-paths`.
 
+A `.iso` file in a file-based pool can be a VM's installer ISO (`VMSpec.iso`)
+for anyone who may read the pool's contents; any other host path as an ISO needs
+`storage.hostpath` at `/` (Admin). See `docs/storage.md`, "Installer ISOs".
+
 ## Volumes
 
 ```bash

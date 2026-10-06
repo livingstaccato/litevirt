@@ -141,6 +141,10 @@ binding can:
   `storage.pool.write` but not this, at any path. A custom role gets it by
   naming it or `storage.*`. Without bindings the floor is `admin`. See
   [storage.md](storage.md#host-paths).
+- **Installer ISOs** (`VMSpec.iso`) are a read of a host file by the guest. A
+  plain `.iso` in a file-based pool needs `storage.content.read` on that pool;
+  any other host path needs `storage.hostpath` at `/`, which only Admin holds.
+  See [storage.md](storage.md#installer-isos).
 - **Security groups** (`sg.write`: `lv sg create/rm/rule-add/rule-rm`) are
   cluster-global, bound to NICs by name, and checked at `/`. Admin and
   NetworkAdmin hold `sg.write`; Operator holds only `sg.read`. Binding groups to

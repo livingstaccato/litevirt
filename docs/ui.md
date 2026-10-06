@@ -15,7 +15,9 @@ The "New VM" form accepts the following fields:
 - Disk size
 - **Installer ISO** (path on host) with a **Browse…** button that opens the
   storage content browser to pick an ISO from a pool, plus a **Boot from**
-  selector (auto / disk / CD-ROM / network)
+  selector (auto / disk / CD-ROM / network). Any user who may create the VM
+  may pick a pool `.iso` they can read; typing any other host path needs the
+  Admin role (see [storage.md](storage.md#installer-isos))
 - Host
 - **Headless** (disables VNC) and **Enable SPICE console**
 - **Tags** (`key=value` or bare `key`, comma-separated)
@@ -182,7 +184,8 @@ Storage pool inventory at `/storage`:
 
 A content browser (reachable from the VM-create **Browse…** button) lists the
 files in any file-based pool — `ListStoragePoolContents`, forwarded to the
-pool's owning host. Pick an ISO to fill the create form's installer field, or
+pool's owning host. Pick an ISO to fill the create form's installer field (only
+`.iso` files can be attached that way), or
 **upload** a file straight into the pool: the browser streams it to
 `UploadStoragePoolContent` (1 MiB chunks; written to a temp file then
 published without replacing anything already at the name) so admins do not

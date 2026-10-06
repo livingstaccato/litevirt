@@ -302,12 +302,24 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 			}
 		}
 	}
+	// Installer ISO: the guest reads it, so naming it is reading that host file.
+	// Gated here, after placement, because a pool ISO is judged against the
+	// SELECTED host's pools; it runs on the entry node (as the user) and again
+	// on the owner (see authorizeVMISO).
+	isoInPool, err := s.authorizeVMISO(ctx, project, targetHost, spec.Iso)
+	if err != nil {
+		return nil, err
+	}
 	if targetHost != s.hostName {
 		if decision != nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
 				"resolved create owner %q does not match local host %q", targetHost, s.hostName)
 		}
 		return s.forwardCreateVM(ctx, req, targetHost)
+	}
+	// The owner's own filesystem decides what the ISO path really is.
+	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+		return nil, err
 	}
 
 	// Authoritative admission, on the OWNING node only (everything above either
@@ -491,6 +503,7 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// Installer ISO: attach as a read-only CDROM and boot from it by default so
 	// the guest can install an OS (xmlgen renders IsISO disks as <cdrom>). The
 	// path is on the target host. Persisted in the spec JSON, so it survives.
+	// authorizeVMISO and checkVMISOFile admitted it above.
 	if spec.Iso != "" {
 		diskConfigs = append(diskConfigs, lv.DiskConfig{
 			Name:  "installer",
@@ -844,6 +857,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// pre_start hook — fires before the domain is started for the first time.
 	stubVM := &pb.VM{Name: spec.Name, HostName: s.hostName, State: pb.VMState_VM_STARTING}
 	hooks.Run(ctx, hooks.PreStart, stubVM, spec.Hooks)
+
+	// The ISO was judged before admission; an image pull can run in between,
+	// and qemu opens it at this boot, so it is judged again now.
+	if err := s.checkVMISOFile(spec.Iso, isoInPool); err != nil {
+		claims.releaseAll(ctx)
+		cleanupDisks()
+		return nil, err
+	}
 
 	// Define and start in libvirt
 	if err := s.virt.DefineDomain(domXML); err != nil {
@@ -1555,6 +1576,12 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	releasePreflight := func() {}
 	if vm == nil {
 		return releasePreflight, status.Errorf(codes.InvalidArgument, "prepare hardware for start: nil vm record")
+	}
+
+	// qemu reopens the installer ISO at every start, so it is judged again
+	// here, on the host that starts it — every start path runs this hook.
+	if err := s.verifyVMISOForStart(vm); err != nil {
+		return releasePreflight, err
 	}
 
 	// Adoption gate (fail-closed): a blocked VM must not (re)start under the active

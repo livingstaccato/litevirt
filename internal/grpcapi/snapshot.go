@@ -317,6 +317,12 @@ func (s *Server) RestoreSnapshot(ctx context.Context, req *pb.RestoreSnapshotReq
 		return client.RestoreSnapshot(ctx, req)
 	}
 
+	// A revert can bring the domain back running with its installer ISO; it
+	// is judged here, on the owner, after the caller's authority.
+	if err := s.verifyVMISOForStart(vm); err != nil {
+		return nil, err
+	}
+
 	// Guard: block restore if VM is migrating or in an unsafe transient state.
 	switch vm.State {
 	case "migrating", "creating", "starting":

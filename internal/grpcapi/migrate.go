@@ -556,6 +556,13 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 				"migration.allow_unencrypted_storage is set", "vm", req.VmName,
 				"source_tls", srcTLS, "target_tls", dstTLS, "target", req.TargetHost)
 		}
+	} else if s.domainCarriesInstallerISO(vm.Name) {
+		// No disks to stub, but the target's qemu opens the installer ISO from
+		// its own filesystem: the target judges that file before the migration
+		// (EnsureDisks with no stubs does only that).
+		if _, _, err = s.ensureDisksOnTarget(ctx, req.TargetHost, vm.Name, nil, false); err != nil {
+			return err
+		}
 	}
 
 	// A STOPPED VM — every Secure-Boot/vTPM VM, and any other VM migrated with
@@ -1160,6 +1167,13 @@ func (s *Server) EnsureCloudInit(ctx context.Context, req *pb.EnsureCloudInitReq
 func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*pb.EnsureDisksResponse, error) {
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
+	}
+	// The domain lands here with its installer ISO path; qemu on THIS host
+	// opens it, so this host judges it before the migration may proceed.
+	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
+		if err := s.verifyIncomingVMISO(rec); err != nil {
+			return nil, err
+		}
 	}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
@@ -2003,7 +2017,7 @@ func storageMigrationTargets(vmName string, disks []corrosion.DiskRecord) ([]str
 // for QEMU and returns whether it could. An older target never answers that,
 // which reads as false.
 func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName string, stubs []*pb.DiskStub, wantTLS bool) ([]string, bool, error) {
-	if len(stubs) == 0 && !wantTLS {
+	if len(stubs) == 0 && !wantTLS && !s.domainCarriesInstallerISO(vmName) {
 		return nil, false, nil
 	}
 	client, conn, err := s.peerClient(ctx, targetHost)

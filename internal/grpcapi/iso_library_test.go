@@ -149,8 +149,10 @@ func TestISOLibrary_ProjectLibraryIsTheProjects(t *testing.T) {
 }
 
 // What earlier specs stored — an absolute path to a .iso directly in a pool
-// directory — still works for a non-admin, and is kept as that pool's reference.
-func TestISOLibrary_AnEarlierPoolPathBecomesItsReference(t *testing.T) {
+// directory — still works for a non-admin (a rebuild or a compose re-deploy
+// re-creates from it), is stored as written so a compose file naming it sees
+// no change, and is resolved through its pool at every start.
+func TestISOLibrary_AnEarlierPoolPathStillWorks(t *testing.T) {
 	s, _, _ := isoServer(t)
 	pat := acmeOperator(t, s)
 	dir := projectLibrary(t, s, "acme-isos", "acme")
@@ -160,8 +162,32 @@ func TestISOLibrary_AnEarlierPoolPathBecomesItsReference(t *testing.T) {
 	if _, err := s.CreateVM(pat, isoCreate("old", iso, "acme")); err != nil {
 		t.Fatalf("a non-admin re-creating from a stored pool path: %v", err)
 	}
-	if got := storedISO(t, s, "old"); got != "acme-isos/old.iso" {
-		t.Fatalf("stored iso = %q, want acme-isos/old.iso", got)
+	if got := storedISO(t, s, "old"); got != iso {
+		t.Fatalf("stored iso = %q, want it as written (%s)", got, iso)
+	}
+	if pool, file, ok := s.specISORef(context.Background(), vmRecord(t, s, "old")); !ok || pool != "acme-isos" || file != "old.iso" {
+		t.Fatalf("a start takes it as %q/%q (%v), want acme-isos/old.iso", pool, file, ok)
+	}
+}
+
+// The global library is written by an Admin only — not by an Operator bound
+// at the cluster root either, who holds storage.content.write on every pool.
+func TestISOLibrary_RootOperatorCannotWriteTheGlobalLibrary(t *testing.T) {
+	s, _, _ := isoServer(t)
+	libraryMode(t, s, corrosion.ISOLibraryShared)
+	g := globalLibrary(t, s)
+	rob := isoEngineCtx(t, s, "rob", "Operator", "/")
+	err := s.UploadStoragePoolContent(&fakeUploadStream{ctx: rob, msgs: []*pb.UploadStoragePoolContentRequest{
+		{PoolName: globalISOLibrary, Filename: "trojan.iso"}, {Chunk: []byte(isoBody)},
+	}})
+	if status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("root Operator upload to the global library: got %v, want PermissionDenied", err)
+	}
+	if _, err := os.Stat(filepath.Join(g, "trojan.iso")); !os.IsNotExist(err) {
+		t.Fatal("a refused upload wrote into the global library")
+	}
+	if _, err := s.PullISO(rob, &pb.PullISORequest{Ref: "isos/x.iso", Url: "http://127.0.0.1:1/x.iso"}); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("root Operator pull into the global library: got %v, want PermissionDenied", err)
 	}
 }
 

@@ -4,6 +4,19 @@
       <h3 style="margin:0">Browse storage</h3>
       <button class="btn" onclick="document.getElementById('iso-browser').remove()">Close</button>
     </div>
+    <div class="muted" style="font-size:12px;margin-bottom:6px">ISO libraries — your projects' first, then the global library. A VM names an ISO as <code>pool/file.iso</code>.</div>
+    <div class="cp-results" style="max-height:30vh;overflow-y:auto;border:1px solid var(--border);border-radius:6px;margin-bottom:12px">
+      {{if .ISOError}}<div class="error" style="margin:8px">{{.ISOError}}</div>
+      {{else if not .ISOs}}<div class="muted" style="padding:14px;font-size:13px">No ISOs in any library you can use yet. Upload one below.</div>
+      {{else}}{{range .ISOs}}
+      <button type="button" class="search-result" style="width:100%;text-align:left;border:none;background:transparent;cursor:pointer"
+              onclick="window.pickStorageFile(this.dataset.path)" data-path="{{.Ref}}">
+        <span>{{icon "disk"}} {{.Ref}}</span>
+        <span class="muted" style="float:right;font-size:11px">{{if .Global}}global{{else}}{{.Project}}{{end}}{{if .SyncState}} · {{.SyncState}}{{end}} · {{formatBytes .SizeBytes}}</span>
+      </button>
+      {{end}}{{end}}
+    </div>
+    <div class="muted" style="font-size:12px;margin-bottom:6px">Browse or upload to a pool (the global library <code>isos</code> takes uploads from an Admin only; a project library is a pool your project owns with <code>content=iso</code>).</div>
     {{if not .Pools}}
       <p class="muted" style="font-size:13px">No file-based storage pools found. Create one under Storage, or place files under a pool's directory on the host.</p>
     {{else}}

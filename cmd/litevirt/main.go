@@ -114,6 +114,7 @@ func newRootCmd() *cobra.Command {
 		newRegionCmd(),
 		newProjectCmd(),
 		newPoolCmd(),
+		newISOCmd(),
 		newRoleCmd(),
 		newOperationCmd(),
 		newUpdateCmd(),

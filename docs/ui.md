@@ -13,11 +13,11 @@ The "New VM" form accepts the following fields:
 - CPU count
 - Memory
 - Disk size
-- **Installer ISO** (path on host) with a **Browse…** button that opens the
-  storage content browser to pick an ISO from a pool, plus a **Boot from**
-  selector (auto / disk / CD-ROM / network). Any user who may create the VM
-  may pick a pool `.iso` they can read; typing any other host path needs the
-  Admin role (see [storage.md](storage.md#installer-isos))
+- **Installer ISO** (`pool/file.iso`) with a **Browse…** button that lists the
+  ISO libraries the caller may use — its projects' libraries first, then the
+  global library `isos` — and fills in the reference, plus a **Boot from**
+  selector (auto / disk / CD-ROM / network). Typing an absolute host path
+  needs the Admin role (see [storage.md](storage.md#installer-isos))
 - Host
 - **Headless** (disables VNC) and **Enable SPICE console**
 - **Tags** (`key=value` or bare `key`, comma-separated)
@@ -182,13 +182,17 @@ Storage pool inventory at `/storage`:
 
 ### Content browser + ISO upload
 
-A content browser (reachable from the VM-create **Browse…** button) lists the
+The VM-create **Browse…** button opens the ISO picker. Its top half is
+`ListISOs`: every ISO the caller may name on the host, as `pool/file.iso`, its
+projects' libraries first and then the global library (with each file's sync
+state when the library is in sync mode). Below it, a content browser lists the
 files in any file-based pool — `ListStoragePoolContents`, forwarded to the
-pool's owning host. Pick an ISO to fill the create form's installer field (only
-`.iso` files can be attached that way), or
-**upload** a file straight into the pool: the browser streams it to
-`UploadStoragePoolContent` (1 MiB chunks; written to a temp file then atomically
-renamed) so admins do not need to `scp` ISOs onto hosts.
+pool's owning host. Picking a `.iso` there fills in its `pool/file.iso`
+reference, or **upload** a file straight into the pool: the browser streams it
+to `UploadStoragePoolContent` (1 MiB chunks; written to a temp file then
+atomically renamed) so nobody needs to `scp` ISOs onto hosts. The global
+library takes uploads from an Admin only; a project library (a pool the
+project owns with `content=iso`) from the project's operators.
 
 ## Load Balancer Management
 

@@ -485,9 +485,22 @@ lv pool delete <name>
 `lv pool create` runs the driver's Prepare() hook (mount NFS, log into
 iSCSI, …) before persisting. See `docs/storage.md` for driver details.
 
-A `.iso` file in a file-based pool can be a VM's installer ISO (`VMSpec.iso`)
-for anyone who may read the pool's contents; any other host path as an ISO needs
-`storage.hostpath` at `/` (Admin). See `docs/storage.md`, "Installer ISOs".
+## Installer ISOs
+
+```bash
+lv iso ls [--host <h>] [--project <p>]         # ISOs a VM may name: project libraries, then the global one
+lv iso pull <pool>/<file>.iso --url <url> [--checksum <sha256>] [--host <h>]
+lv iso pull <pool>/<file>.iso --from-host-path <path> [--host <h>]   # Admin; a copy, never a link
+lv iso rm <pool>/<file>.iso [--host <h>]
+lv cluster iso-library-mode [sync|shared]      # where the global library "isos" lives
+```
+
+A VM names its installer ISO (`VMSpec.iso`, a compose file's `iso:`) as
+`<pool>/<file>.iso`: `isos/debian-12.iso` from the cluster-global library, or
+`<project-pool>/<file>.iso` from a project library (a pool the project owns,
+created with `--option content=iso`). Only an Admin writes the global library;
+a project's operators write its own. An Admin may still give an absolute host
+path. See `docs/storage.md`, "Installer ISOs".
 
 ## Volumes
 

@@ -17,7 +17,21 @@ func TestISOBrowser(t *testing.T) {
 	mock.poolContentsResp = &pb.ListStoragePoolContentsResponse{Contents: []*pb.StoragePoolContent{
 		{Name: "debian-12.iso", Path: "/var/lib/litevirt/disks/debian-12.iso", SizeBytes: 700 << 20, IsIso: true},
 	}}
+	mock.listISOsResp = &pb.ListISOsResponse{Isos: []*pb.ISOEntry{
+		{Ref: "acme-isos/win11.iso", Pool: "acme-isos", Project: "acme", Name: "win11.iso"},
+		{Ref: "isos/debian-12.iso", Pool: "isos", Name: "debian-12.iso", Global: true, SyncState: "ok"},
+	}}
 	s := newTestUIServer(t, mock)
+
+	t.Run("modal lists the ISO libraries as references", func(t *testing.T) {
+		w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/storage/iso-browser?field=iso")))
+		assertStatus(t, w, http.StatusOK)
+		body := w.Body.String()
+		mustContain(t, body, `data-path="acme-isos/win11.iso"`, `data-path="isos/debian-12.iso"`)
+		if strings.Index(body, "acme-isos/win11.iso") > strings.Index(body, "isos/debian-12.iso\"") {
+			t.Error("the project library should be listed before the global library")
+		}
+	})
 
 	t.Run("modal lists only file-based pools", func(t *testing.T) {
 		w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/storage/iso-browser?field=iso")))
@@ -29,10 +43,10 @@ func TestISOBrowser(t *testing.T) {
 		}
 	})
 
-	t.Run("contents lists files with picker path", func(t *testing.T) {
+	t.Run("contents picks an ISO as its pool reference", func(t *testing.T) {
 		w := serveRequest(s, withAuth(mustReq(t, "GET", "/ui/storage/contents?poolref=host1::local&field=iso")))
 		assertStatus(t, w, http.StatusOK)
-		mustContain(t, w.Body.String(), "debian-12.iso", `data-path="/var/lib/litevirt/disks/debian-12.iso"`)
+		mustContain(t, w.Body.String(), "debian-12.iso", `data-path="local/debian-12.iso"`)
 		if mock.lastPoolContentsReq.Host != "host1" || mock.lastPoolContentsReq.PoolName != "local" {
 			t.Errorf("forwarded req = %+v, want host1/local", mock.lastPoolContentsReq)
 		}

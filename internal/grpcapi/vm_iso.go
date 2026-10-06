@@ -29,9 +29,9 @@ import (
 //     use and the caller may read. The host resolves it to a plain file
 //     directly in the pool's directory, at create and at every start.
 //   - An absolute host path, which needs storage.hostpath at the cluster root
-//     (only Admin holds it). A non-admin's absolute path that names a .iso
-//     directly in such a pool's directory — what earlier specs stored — is
-//     taken as that pool's reference.
+//     (only Admin holds it). An absolute path that names a .iso directly in
+//     a pool's directory — what earlier specs stored — is taken as that
+//     pool's reference, for a non-admin too.
 //
 // Either way the file must be a plain file (no symlink anywhere along the
 // path the host hands qemu, a single hard link), and storage.CheckReadFile
@@ -71,8 +71,9 @@ func (s *Server) isoPoolFor(ctx context.Context, host, iso string) ([]corrosion.
 // authorizeVMISO is the create-time gate for spec.Iso. It runs on the entry
 // node, where the caller is the user, and again on the owner, where a
 // forwarded call is a peer; both judge the replicated pool rows of host. A
-// non-admin's absolute path into a pool directory is rewritten to that pool's
-// reference here, so the forwarded request carries the reference.
+// non-admin's absolute path into a pool directory is judged as that pool's
+// reference and stored as written, so a compose file that names it does not
+// differ from what was stored.
 func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec *pb.VMSpec) error {
 	iso := spec.GetIso()
 	if iso == "" {
@@ -101,11 +102,7 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 	}
 	if ref, ok := s.isoRefForPath(ctx, host, iso); ok {
 		pool, file, _ := parseISORef(ref)
-		if err := s.authorizeISORef(ctx, project, host, pool, file); err != nil {
-			return err
-		}
-		spec.Iso = ref
-		return nil
+		return s.authorizeISORef(ctx, project, host, pool, file)
 	}
 	return status.Errorf(codes.PermissionDenied,
 		"iso %q is a host path on %s; attaching an arbitrary host file lets the guest read it, "+
@@ -115,14 +112,21 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 }
 
 // resolveVMISO is the owning host's resolution of spec.Iso to the file qemu
-// is handed, against its own filesystem: a library reference through its
-// pool, an (admin) absolute path as itself. Either way the file is judged by
+// is handed, against its own filesystem: a library reference — or a path
+// directly in a pool directory — through its pool, any other (admin) absolute
+// path as itself. Either way the file is judged by
 // checkVMISOFile.
 func (s *Server) resolveVMISO(ctx context.Context, iso string) (string, error) {
 	if iso == "" {
 		return "", nil
 	}
 	if pool, file, ok := parseISORef(iso); ok {
+		return s.resolveISORef(ctx, pool, file)
+	}
+	// A path directly in a pool directory is that pool's file, as every
+	// start will take it (specISORef).
+	if ref, ok := s.isoRefForPath(ctx, s.hostName, iso); ok {
+		pool, file, _ := parseISORef(ref)
 		return s.resolveISORef(ctx, pool, file)
 	}
 	if err := s.checkVMISOFile(iso); err != nil {

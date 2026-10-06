@@ -9,8 +9,12 @@ import (
 	"os"
 	"path/filepath"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/vmimport"
 )
 
 // A foreign disk reaches qemu-img as root. qemu-img opens whatever the disk's
@@ -131,7 +135,7 @@ func staticDiskFormat(file string) (string, error) {
 // before qemu-img opens it. It is copied into importDir, opened without
 // following a link, and must be a plain file; the copy is what is checked and
 // converted.
-func privateImportDisk(ctx context.Context, src, importDir string) (string, error) {
+func privateImportDisk(ctx context.Context, src, importDir string, limit int64) (string, error) {
 	// importDir and everything under it is written by the daemon alone, so a
 	// plain file named inside it (as written, or as resolved) is already
 	// private.
@@ -158,7 +162,7 @@ func privateImportDisk(ctx context.Context, src, importDir string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	if err := copySparse(ctx, out, in); err != nil {
+	if err := copySparse(ctx, out, in, limit); err != nil {
 		out.Close()
 		os.Remove(out.Name())
 		return "", fmt.Errorf("copy disk %s: %w", filepath.Base(src), err)
@@ -172,8 +176,10 @@ func privateImportDisk(ctx context.Context, src, importDir string) (string, erro
 
 // copySparse copies in to out leaving every all-zero chunk a hole, so a thin
 // disk costs its data rather than its virtual size in the import directory,
-// which usually shares a filesystem with state.db. It stops when ctx ends.
-func copySparse(ctx context.Context, out, in *os.File) error {
+// which usually shares a filesystem with state.db. It stops when ctx ends, and
+// refuses a source longer than limit — the size the import was charged for —
+// whatever its holes, so a file grown after admission cannot fill the disk.
+func copySparse(ctx context.Context, out, in *os.File, limit int64) error {
 	buf := make([]byte, 1<<20)
 	var off int64
 	for {
@@ -190,6 +196,9 @@ func copySparse(ctx context.Context, out, in *os.File) error {
 				return err
 			}
 			off += int64(n)
+			if off > limit {
+				return fmt.Errorf("disk is larger than the %d bytes the import was admitted for", limit)
+			}
 		}
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
 			break
@@ -199,4 +208,43 @@ func copySparse(ctx context.Context, out, in *os.File) error {
 		}
 	}
 	return out.Truncate(off)
+}
+
+// importSourceLimit is the largest staged file accepted for a disk of the
+// given capacity: the capacity plus room for a format's own metadata (qcow2
+// tables, VMDK grain tables, a VHD footer and BAT). A qcow2 carrying internal
+// snapshots past that is refused; flatten it first.
+func importSourceLimit(capacity uint64) int64 {
+	const maxCap = 1 << 50
+	if capacity > maxCap {
+		capacity = maxCap
+	}
+	return int64(capacity + capacity/8 + 64<<20)
+}
+
+// bindImportDiskSizes makes the quota charge what the import will copy. The
+// declared capacity comes from the foreign descriptor, which the operator who
+// names --disk-map also writes; a disk that declares none is charged its file
+// size, and a file larger than its declared capacity allows is refused before
+// anything is admitted or copied.
+func bindImportDiskSizes(fv *vmimport.ForeignVM) error {
+	for i := range fv.Disks {
+		d := &fv.Disks[i]
+		if d.IsCDROM || d.LocalPath == "" {
+			continue
+		}
+		fi, err := os.Stat(d.LocalPath)
+		if err != nil {
+			continue // a missing disk is refused at conversion
+		}
+		if d.CapacityBytes == 0 {
+			d.CapacityBytes = uint64(fi.Size())
+		}
+		if fi.Size() > importSourceLimit(d.CapacityBytes) {
+			return status.Errorf(codes.InvalidArgument,
+				"disk %q is a %d-byte file but declares a %d-byte capacity; an import copies no more than its capacity allows",
+				d.Name, fi.Size(), d.CapacityBytes)
+		}
+	}
+	return nil
 }

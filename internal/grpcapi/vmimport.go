@@ -142,6 +142,10 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		return err
 	}
 
+	// Charge what will be copied, not only what the descriptor declares.
+	if err := bindImportDiskSizes(fv); err != nil {
+		return err
+	}
 	// Quota estimate from declared sizes (re-checked post-convert with real sizes).
 	if err := s.admitImport(ctx, project, fv); err != nil {
 		return err
@@ -177,7 +181,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 		dst := lv.DiskPath(poolDir, name, d.Name) // poolDir/<vm>-<disk>.qcow2 (poolDir already the disks dir)
 		dst = filepath.Join(poolDir, name+"-"+d.Name+".qcow2")
 		curDisk := d.Name
-		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, func(pct float32) {
+		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
 			_ = stream.Send(&pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk})
 		}); err != nil {
 			cleanupDisks()
@@ -802,13 +806,13 @@ func importRecords(fv *vmimport.ForeignVM, name, host string) ([]corrosion.DiskR
 // elsewhere would dump foreign bytes into a qcow2-named file and corrupt it) and
 // rejects any external backing-file / out-of-dir extent reference BEFORE invoking
 // qemu-img (a malicious descriptor would otherwise make qemu-img read host files).
-func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, emit func(pct float32)) error {
+func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir string, maxSrcBytes int64, emit func(pct float32)) error {
 	if !qemuImgAvailable() {
 		return fmt.Errorf("qemu-img not found on PATH (required to import/convert foreign disks)")
 	}
 	// Only a file nobody else can write is checked and converted; otherwise
 	// what was checked need not be what qemu-img opens.
-	private, err := privateImportDisk(ctx, src, allowedDir)
+	private, err := privateImportDisk(ctx, src, allowedDir, maxSrcBytes)
 	if err != nil {
 		return err
 	}
@@ -835,6 +839,12 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	tmp := tf.Name()
 	tf.Close()
+	finished := false
+	defer func() {
+		if !finished {
+			_ = os.Remove(tmp)
+		}
+	}()
 	args := []string{"convert", "-p", "-O", "qcow2", "-f", srcFormat, src, tmp}
 
 	cmd := exec.CommandContext(ctx, "qemu-img", args...)
@@ -869,9 +879,9 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		return err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
 		return fmt.Errorf("finalize converted disk: %w", err)
 	}
+	finished = true
 	return nil
 }
 

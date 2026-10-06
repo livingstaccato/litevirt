@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/vmimport"
 )
 
 // fakeQemuImg puts a qemu-img on PATH that records every invocation and
@@ -49,7 +50,7 @@ func refusedUnopened(t *testing.T, src, format string) {
 	calls := fakeQemuImg(t)
 	importDir := filepath.Dir(src)
 	dst := filepath.Join(t.TempDir(), "out.qcow2")
-	if err := convertForeignDisk(context.Background(), src, format, dst, importDir, nil); err == nil {
+	if err := convertForeignDisk(context.Background(), src, format, dst, importDir, 1<<40, nil); err == nil {
 		t.Fatalf("convert %s as %q: got nil, want refusal", filepath.Base(src), format)
 	}
 	if c := calls(); len(c) != 0 {
@@ -136,7 +137,7 @@ func TestConvertForeignDisk_AnUndeclaredDiskIsNeverProbedByQemu(t *testing.T) {
 	if err := os.WriteFile(p, make([]byte, 4096), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := convertForeignDisk(context.Background(), p, "", filepath.Join(t.TempDir(), "out.qcow2"), dir, nil); err != nil {
+	if err := convertForeignDisk(context.Background(), p, "", filepath.Join(t.TempDir(), "out.qcow2"), dir, 1<<40, nil); err != nil {
 		t.Fatalf("convert: %v", err)
 	}
 	c := calls()
@@ -162,7 +163,7 @@ func TestConvertForeignDisk_ConvertsAPrivateCopyOfAnOutsideDisk(t *testing.T) {
 	if err := os.WriteFile(src, make([]byte, 4096), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), importDir, nil); err != nil {
+	if err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), importDir, 1<<40, nil); err != nil {
 		t.Fatalf("convert: %v", err)
 	}
 	c := calls()
@@ -193,7 +194,7 @@ func TestConvertForeignDisk_RefusesAnOutsideDiskReachedThroughALink(t *testing.T
 		if runtime.GOOS != "linux" && strings.Contains(src, "/dir/") {
 			continue // only the final component is checked off Linux
 		}
-		err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), nil)
+		err := convertForeignDisk(context.Background(), src, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), 1<<40, nil)
 		if err == nil {
 			t.Fatalf("%s: a disk reached through a link was converted, want refusal", src)
 		}
@@ -211,7 +212,7 @@ func TestConvertForeignDisk_RefusesAnOutsideDiskThatIsNotAPlainFile(t *testing.T
 	}
 	// Outside the import directory, so it reaches the private copy; a FIFO
 	// must be refused there without the open blocking on a writer.
-	err := convertForeignDisk(context.Background(), fifo, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), nil)
+	err := convertForeignDisk(context.Background(), fifo, "raw", filepath.Join(t.TempDir(), "out.qcow2"), t.TempDir(), 1<<40, nil)
 	if err == nil {
 		t.Fatal("a FIFO was converted, want refusal")
 	}
@@ -238,7 +239,7 @@ func TestPrivateImportDisk_KeepsAnOutsideDiskSparse(t *testing.T) {
 	}
 	f.Close()
 	importDir := t.TempDir()
-	cp, err := privateImportDisk(context.Background(), src, importDir)
+	cp, err := privateImportDisk(context.Background(), src, importDir, 1<<40)
 	if err != nil {
 		t.Fatalf("privateImportDisk: %v", err)
 	}
@@ -268,7 +269,7 @@ func TestPrivateImportDisk_StopsWhenTheImportIsCancelled(t *testing.T) {
 	importDir := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := privateImportDisk(ctx, src, importDir); err == nil {
+	if _, err := privateImportDisk(ctx, src, importDir, 1<<40); err == nil {
 		t.Fatal("a cancelled import copied the disk anyway")
 	}
 	if left, _ := os.ReadDir(importDir); len(left) != 0 {
@@ -296,26 +297,56 @@ func TestStaticDiskFormat_RefusesAFormatItRecognisesButDoesNotImport(t *testing.
 	}
 }
 
-// The conversion writes to a fresh name of its own, never to a fixed
-// "<dst>.tmp" another writer to the pool directory could plant first.
-func TestConvertForeignDisk_DoesNotWriteThroughAPlantedTempName(t *testing.T) {
-	fakeQemuImg(t)
+// The private copy is bounded by what the import was charged for: a file that
+// grows after admission, or is denser than its holes suggested, stops there
+// rather than filling the import directory.
+func TestPrivateImportDisk_StopsAtItsLimit(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "disk.raw")
+	dense := make([]byte, 4<<20)
+	for i := range dense {
+		dense[i] = 1
+	}
+	if err := os.WriteFile(src, dense, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	importDir := t.TempDir()
-	src := filepath.Join(importDir, "disk.raw")
-	if err := os.WriteFile(src, make([]byte, 4096), 0o600); err != nil {
+	if _, err := privateImportDisk(context.Background(), src, importDir, 1<<20); err == nil {
+		t.Fatal("a disk past its limit was copied")
+	}
+	if left, _ := os.ReadDir(importDir); len(left) != 0 {
+		t.Fatalf("a refused copy was left behind: %v", left)
+	}
+}
+
+// The quota is charged the size the import will copy, not the size the
+// foreign descriptor declares: the operator who names --disk-map also writes
+// the descriptor.
+func TestBindImportDiskSizes_RefusesAFileLargerThanItsDeclaredCapacity(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "disk.raw")
+	f, err := os.Create(src)
+	if err != nil {
 		t.Fatal(err)
 	}
-	pool := t.TempDir()
-	victim := filepath.Join(t.TempDir(), "victim")
-	if err := os.WriteFile(victim, []byte("not the import's to write"), 0o600); err != nil {
+	if err := f.Truncate(1 << 30); err != nil {
 		t.Fatal(err)
 	}
-	dst := filepath.Join(pool, "vm-root.qcow2")
-	if err := os.Symlink(victim, dst+".tmp"); err != nil {
+	f.Close()
+	fv := &vmimport.ForeignVM{Disks: []vmimport.ForeignDisk{{Name: "root", LocalPath: src, CapacityBytes: 1 << 20}}}
+	if err := bindImportDiskSizes(fv); err == nil {
+		t.Fatal("a 1 GiB file declared as 1 MiB was admitted")
+	}
+}
+
+func TestBindImportDiskSizes_ChargesAnUndeclaredDiskItsFileSize(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "disk.raw")
+	if err := os.WriteFile(src, make([]byte, 3<<20), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_ = convertForeignDisk(context.Background(), src, "raw", dst, importDir, nil)
-	if b, err := os.ReadFile(victim); err != nil || string(b) != "not the import's to write" {
-		t.Fatalf("the conversion wrote through a planted temp name: %q, %v", b, err)
+	fv := &vmimport.ForeignVM{Disks: []vmimport.ForeignDisk{{Name: "root", LocalPath: src}}}
+	if err := bindImportDiskSizes(fv); err != nil {
+		t.Fatalf("bindImportDiskSizes: %v", err)
+	}
+	if got := fv.Disks[0].CapacityBytes; got != 3<<20 {
+		t.Fatalf("an undeclared disk is charged %d bytes, want its file size %d", got, 3<<20)
 	}
 }

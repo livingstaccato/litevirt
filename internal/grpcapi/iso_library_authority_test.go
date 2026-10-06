@@ -146,6 +146,19 @@ func TestISOAuthority_AnExistingIsosPoolKeepsWorking(t *testing.T) {
 	if _, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "old")); err != nil {
 		t.Fatalf("start: %v", err)
 	}
+	// With no mode set, a cluster that had an isos pool is in shared mode:
+	// that pool is the global library, listed for every project.
+	resp, err := s.ListISOs(adminCtx(), &pb.ListISOsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := false
+	for _, e := range resp.GetIsos() {
+		listed = listed || (e.GetRef() == "isos/debian.iso" && e.GetGlobal())
+	}
+	if !listed {
+		t.Fatalf("the existing isos pool is not the global library: %v", resp.GetIsos())
+	}
 	// Uploads to it keep working before failover_scope_v1 latches.
 	s.db.SetClusterPolicyGate(func() bool { return false })
 	if err := s.UploadStoragePoolContent(&fakeUploadStream{ctx: adminCtx(), msgs: []*pb.UploadStoragePoolContentRequest{
@@ -175,17 +188,24 @@ func TestISOAuthority_LibraryWritesNeverReplace(t *testing.T) {
 	dir := projectLibrary(t, s, "acme-isos", "acme")
 	victim := filepath.Join(dir, "build.iso")
 	writeLibFile(t, victim, isoBody)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, "trojan") }))
+	fetched := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fetched++; io.WriteString(w, "trojan") }))
 	defer srv.Close()
 
 	if _, err := s.PullISO(pat, &pb.PullISORequest{Ref: "acme-isos/build.iso", Url: srv.URL}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("pull over an existing library file: got %v, want FailedPrecondition", err)
 	}
-	err := s.UploadStoragePoolContent(&fakeUploadStream{ctx: pat, msgs: []*pb.UploadStoragePoolContentRequest{
+	if fetched != 0 {
+		t.Fatalf("a pull over a taken name downloaded first (%d requests); it is refused up front", fetched)
+	}
+	st := &fakeUploadStream{ctx: pat, msgs: []*pb.UploadStoragePoolContentRequest{
 		{PoolName: "acme-isos", Filename: "build.iso"}, {Chunk: []byte("trojan")},
-	}})
-	if status.Code(err) != codes.FailedPrecondition {
+	}}
+	if err := s.UploadStoragePoolContent(st); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("upload over an existing library file: got %v, want FailedPrecondition", err)
+	}
+	if st.idx != 1 {
+		t.Fatalf("an upload over a taken name read %d frames; it is refused after the header", st.idx)
 	}
 	if b, _ := os.ReadFile(victim); string(b) != isoBody {
 		t.Fatalf("the library file was replaced: %q", b)
@@ -356,8 +376,8 @@ func TestISOAuthority_TheRecordedKindIsHeldEverywhere(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "g"))
-	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "global") {
-		t.Fatalf("start where isos is not the global library: got %v, want FailedPrecondition", err)
+	if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "created with a global one") {
+		t.Fatalf("start where isos is not the global library: got %v, want FailedPrecondition naming the kinds", err)
 	}
 }
 
@@ -377,6 +397,11 @@ func TestISOAuthority_ScopeIsServerOwned(t *testing.T) {
 	dir := projectLibrary(t, s, "acme-isos", "acme")
 	iso := filepath.Join(dir, "in-pool.iso")
 	writeLibFile(t, iso, isoBody)
+	ref := isoCreate("r", "acme-isos/in-pool.iso", "acme")
+	ref.Spec.IsoScope = isoScopeHostPath // a client's claim is dropped, not judged
+	if _, err := s.CreateVM(pat, ref); err != nil {
+		t.Fatalf("a reference with a client-supplied iso_scope: %v", err)
+	}
 	peer := peerCtxFor(t, s, "entry-node")
 	peer = context.WithValue(peer, ctxKeyUsername, "entry-node")
 	peer = context.WithValue(peer, ctxKeyRole, "admin")
@@ -464,5 +489,56 @@ func TestISOAuthority_TombstonesAreCollectedOnceApplied(t *testing.T) {
 	}
 	if e, ok, _ := corrosion.GetISOCatalogEntry(ctx, s.db, "gone.iso"); !ok || e.Deleted || e.SHA256 != sha(isoBody) {
 		t.Fatalf("a re-added file is not recorded: %+v %v", e, ok)
+	}
+}
+
+// hookedUploadStream runs before(i) before handing out frame i.
+type hookedUploadStream struct {
+	fakeUploadStream
+	before func(i int)
+}
+
+func (h *hookedUploadStream) Recv() (*pb.UploadStoragePoolContentRequest, error) {
+	if h.before != nil {
+		h.before(h.idx)
+	}
+	return h.fakeUploadStream.Recv()
+}
+
+// I3: the publish itself is no-replace — a name taken while the bytes were
+// being written (after the up-front check) is not replaced either.
+func TestISOAuthority_ANameTakenDuringAWriteIsNotReplaced(t *testing.T) {
+	s, _, _ := isoServer(t)
+	pat := acmeOperator(t, s)
+	dir := projectLibrary(t, s, "acme-isos", "acme")
+	victim := filepath.Join(dir, "build.iso")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeLibFile(t, victim, isoBody) // B uploads it while A's pull streams
+		io.WriteString(w, "trojan")
+	}))
+	defer srv.Close()
+	if _, err := s.PullISO(pat, &pb.PullISORequest{Ref: "acme-isos/build.iso", Url: srv.URL}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("pull racing another write of the name: got %v, want FailedPrecondition", err)
+	}
+	if b, _ := os.ReadFile(victim); string(b) != isoBody {
+		t.Fatalf("the library file was replaced by a pull: %q", b)
+	}
+
+	other := filepath.Join(dir, "other.iso")
+	st := &hookedUploadStream{
+		fakeUploadStream: fakeUploadStream{ctx: pat, msgs: []*pb.UploadStoragePoolContentRequest{
+			{PoolName: "acme-isos", Filename: "other.iso"}, {Chunk: []byte("trojan")},
+		}},
+		before: func(i int) {
+			if i == 1 {
+				writeLibFile(t, other, isoBody)
+			}
+		},
+	}
+	if err := s.UploadStoragePoolContent(st); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("upload racing another write of the name: got %v, want FailedPrecondition", err)
+	}
+	if b, _ := os.ReadFile(other); string(b) != isoBody {
+		t.Fatalf("the library file was replaced by an upload: %q", b)
 	}
 }

@@ -717,6 +717,10 @@ func (s *Server) PullISO(ctx context.Context, req *pb.PullISORequest) (*pb.PullI
 	if err != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
+	// A library file is never replaced: refuse a taken name before fetching.
+	if _, err := os.Lstat(filepath.Join(dir, file)); err == nil {
+		return nil, errLibraryFileExists(file)
+	}
 	var sum string
 	var size int64
 	if req.GetHostPath() != "" {

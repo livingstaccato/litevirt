@@ -33,7 +33,7 @@ var secretRoots = []string{
 // CheckReadFile refuses a host file no VM may be given to read: a relative or
 // unclean path (one that still carries a "." or ".." to resolve), anything
 // under a secret system directory, anything in or below the daemon's PKI
-// directory, and anything in its data directory outside disks/ and mounts/
+// directory, and anything in its data directory outside pools/ and mounts/
 // (state.db, cloudinit/, nvram/, imports/, images/ …). The path is judged as
 // written and after resolving symlinks, so a link at an innocent name does not
 // reach a refused file. It must also exist and be a regular file once resolved:
@@ -118,7 +118,7 @@ func refuseSecretPath(p, cand, dataDir, pkiDir string) error {
 	if dataDir != "" {
 		for _, d := range pathForms(dataDir) {
 			if within(d, cand) && !inPoolArea(d, cand) {
-				return fmt.Errorf("%q is inside the daemon's data directory %s; only its disks/ and mounts/ hold pool content", p, dataDir)
+				return fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/ and mounts/ hold pool content", p, dataDir)
 			}
 		}
 	}

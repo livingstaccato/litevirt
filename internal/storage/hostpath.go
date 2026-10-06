@@ -133,7 +133,7 @@ var dataDirPoolAreas = []string{"mounts", "pools"}
 
 // CheckWriteRoot refuses a directory no pool may write into: a relative path,
 // the filesystem root, anything under a system directory, the daemon's PKI
-// directory, its data directory outside disks/ and mounts/, or any parent of
+// directory, its data directory outside pools/ and mounts/, or any parent of
 // those two directories. Symlinks are resolved first (through the deepest part
 // of the path that exists), and both the path as written and the path it
 // resolves to must pass, so a link planted at an innocent name cannot reach a

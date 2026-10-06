@@ -36,14 +36,10 @@ import (
 // Either way storage.CheckReadFile refuses the PKI directory, the daemon's
 // internal state and the secret system directories, to everyone.
 
-// verbISOHostPath is the RBAC verb an arbitrary host path takes. It is the
-// same verb the storage-pool host-path gate uses ("storage.hostpath"); kept as
-// its own name here so this file does not depend on that change's file.
-const verbISOHostPath = "storage.hostpath"
-
 // isoPoolFor returns the file-based pools on host whose directory is exactly
-// iso's directory. Several pool rows can share one directory (target-less
-// local pools all live in <data_dir>/disks).
+// iso's directory. Several rows can name one directory; the host refuses such
+// pools (checkPoolForWrite), and every row is returned so the caller is judged
+// against each.
 func (s *Server) isoPoolFor(ctx context.Context, host, iso string) ([]corrosion.StoragePoolRecord, error) {
 	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, host)
 	if err != nil {
@@ -107,16 +103,26 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host, iso string) 
 					iso, p.Name, status.Convert(denied).Message())
 			}
 		}
+		// A pool the host refuses lists, reads and writes nothing, so it
+		// offers no ISO either. The check reads the pool's host, so it runs
+		// there: on the owner, which a forwarded create always reaches.
+		if host == s.hostName {
+			for _, p := range pools {
+				if err := s.checkPoolForWrite(ctx, p.Name, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target, Options: p.Options}); err != nil {
+					return false, err
+				}
+			}
+		}
 		return true, nil
 	}
-	if perr := s.RequirePerm(ctx, "/", verbISOHostPath, "admin"); perr != nil {
+	if perr := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); perr != nil {
 		if status.Code(perr) != codes.PermissionDenied {
 			return false, perr
 		}
 		return false, status.Errorf(codes.PermissionDenied,
 			"iso %q is not a file in a storage pool on %s; attaching an arbitrary host file lets the guest read it, "+
 				"so it needs %s at the cluster root (the Admin role on /). Upload the ISO to a pool instead",
-			iso, host, verbISOHostPath)
+			iso, host, verbStorageHostPath)
 	}
 	return false, nil
 }

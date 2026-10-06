@@ -68,7 +68,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 
 	// Forward to the destination host without consuming more of the stream, so
 	// bytes land directly on the host that will own the VM (a concurrent stream
-	// proxy). The target re-runs every check below for itself.
+	// proxy). The target re-runs the checks below for itself, but it sees this
+	// node as an admin peer, not as the caller: so a forwarded import never
+	// names a host path outside the staging root (resolveStagedPath).
 	if first.TargetHost != "" && first.TargetHost != s.hostName {
 		return s.proxyImportVM(ctx, stream, first)
 	}
@@ -517,7 +519,16 @@ func (s *Server) resolveStagedPath(ctx context.Context, p string) (string, error
 		stagingRoot = root
 	}
 	if !safename.Contains(stagingRoot, resolved) {
-		// Outside the staging root → privileged, require admin.
+		// Outside the staging root → privileged. A request that reached this
+		// host from a peer is a forwarded import (--target-host): the peer
+		// authenticates as admin here whoever called the entry node, so a
+		// forwarded import never names a host path. An admin connects to the
+		// target host itself for that.
+		if callerPrincipalKind(ctx) == principalKindPeer {
+			return "", status.Errorf(codes.PermissionDenied,
+				"path %q is outside the import staging root (%s); a forwarded import may not name a host path — "+
+					"stage the file under %s, or run the import against %s directly as an admin", p, stagingRoot, stagingRoot, s.hostName)
+		}
 		if err := RequireRole(ctx, "admin"); err != nil {
 			return "", status.Errorf(codes.PermissionDenied,
 				"path %q is outside the import staging root (%s); reading an arbitrary host path requires the admin role", p, stagingRoot)

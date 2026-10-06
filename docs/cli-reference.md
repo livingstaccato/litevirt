@@ -542,6 +542,14 @@ lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name a
 #   --inspect                      print the mapping + warnings, import nothing
 ```
 
+`--server-path`, `--disk-map` and any disk a Proxmox `.conf` names must be
+under the target host's import staging root (`<data_dir>/imports/staging`).
+A path outside it needs an admin connected to the target host itself: an
+import forwarded with `--target-host` never names a host path, because the
+target sees the entry node, not the caller. Every file a foreign disk makes
+qemu open (backing files, VMDK extents, a data file) must sit beside the disk
+or in the import directory.
+
 ## Snapshots
 
 ```bash

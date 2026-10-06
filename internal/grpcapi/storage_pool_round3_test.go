@@ -152,7 +152,8 @@ func TestPoolRound3_RefusalsDoNotLeakNames(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(dir, "bravo-plan.iso"), []byte("b"), 0o644); err != nil {
+	bob := hostPathEngineCtx(t, s, "bob", "Operator", projectRBACBase("bravo"))
+	if err := uploadAs(bob, s, "bravo-secret", "bravo-plan.iso", "b"); err != nil {
 		t.Fatal(err)
 	}
 	resp, err := s.ListStoragePoolContents(pat, &pb.ListStoragePoolContentsRequest{PoolName: "mine"})

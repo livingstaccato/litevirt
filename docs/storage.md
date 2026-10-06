@@ -95,6 +95,9 @@ with their ordinary VM and disk permissions: they create VMs with disks on it,
 resize and delete those disks, snapshot the VMs, and replicate and move disks
 onto it. A `zfs` or `lvm-thin` pool is used exactly like a file pool — the
 disks become zvols (`<dataset>/<vm>-<disk>`) or thin LVs (`<vg>/<vm>-<disk>`).
+Resizing such a disk grows the volume itself (`zfs set volsize=`, `lvextend`;
+the size is rounded up to whole MiB), and a running VM's qemu is then told the
+new size. Disks only grow.
 
 Every source is checked against its driver's form before any tool sees it —
 `server:/export` for nfs, a pool, dataset or volume-group name for ceph, zfs
@@ -202,14 +205,20 @@ record:
 - files uploaded into this pool while it belonged to its current project (a
   global pool's uploads are visible to everyone who may use the pool).
 
-A delete touches only those files, and an upload never replaces anything. A
-file with no owner record — a failover's set-aside copy, a restore, a deleted
-VM's kept disk, a file put there by hand — is listed and deletable only by a
-caller with `storage.hostpath` at the cluster root. Another project's file is
-reported as not there. Uploads are recorded in `<data_dir>/pool-uploads.json`
-on the pool's host, bound to the file itself (device and inode), so a file
-put at an uploaded name afterwards is nobody's. A pool whose directory is its
-own is not confined: its project sees everything in it.
+A plain ISO or image file (a name an upload may take) that no record refers
+to — no VM disk row on any host, no replication schedule's replica, no upload
+— is library content, as before pools were confined: everyone who may read
+the pool sees it and can attach it, in a global pool every reader and in a
+project's pool that project's readers. A delete touches only the caller's own
+uploads and replicas; unowned library content is deleted only by a caller with
+`storage.hostpath` at the cluster root, and an upload never replaces anything.
+Any other file no record refers to — a failover's set-aside copy, a restore, a
+deleted VM's kept disk — is listed and deletable only by such a caller.
+Another project's file is reported as not there. Uploads are recorded in
+`<data_dir>/pool-uploads.json` on the pool's host, bound to the file itself
+(device and inode), so a file put at an uploaded name afterwards is nobody's.
+A pool whose directory is its own is not confined: its project sees
+everything in it.
 
 An NFS export is the same storage from every host. Two exports are the same
 storage when their servers are the same and their export paths are the same or

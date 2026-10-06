@@ -121,7 +121,7 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 		if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != req.PoolName }) {
 			continue
 		}
-		if !conf.allows(ctx, filepath.Join(dir, name)) {
+		if !conf.visible(ctx, filepath.Join(dir, name)) {
 			continue
 		}
 		resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
@@ -189,7 +189,7 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "pool content owners: %v", err)
 	}
-	if !conf.allows(ctx, target) {
+	if !conf.visible(ctx, target) {
 		return nil, status.Errorf(codes.NotFound, "%q is not in pool %q", req.Filename, req.PoolName)
 	}
 	// Never a file a live disk uses — this pool's or, in a directory shared
@@ -201,6 +201,12 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if len(owners) > 0 {
 		return nil, status.Errorf(codes.FailedPrecondition,
 			"%q is in use by VM %q disk %q; it is not pool content to delete", req.Filename, owners[0].VMName, owners[0].DiskName)
+	}
+	// Library content no record refers to is shared by everyone who reads
+	// the pool: only an admin deletes it.
+	if !conf.deletable(ctx, target) {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"%q is shared library content in a directory other pools use; deleting it needs %s at the cluster root", req.Filename, verbStorageHostPath)
 	}
 	// os.Remove deletes a symlink itself (not its target), so this can't be
 	// redirected to delete an arbitrary file outside the pool.

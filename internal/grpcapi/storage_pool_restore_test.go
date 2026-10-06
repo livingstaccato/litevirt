@@ -64,7 +64,9 @@ func insertReplicationSchedule(t *testing.T, s *Server, vm, pool string) {
 // keeps working. VM disks go there as before; its content operations show and
 // touch only the caller's project's files by record: its VMs' disks, their
 // replicas, and what was uploaded into the pool. A file with no owner record
-// (a failover's set-aside copy, a stray file) is an admin's alone.
+// is an admin's to delete; an unowned plain ISO/image is library content
+// everyone who reads the pool sees, and anything else unowned (a failover's
+// set-aside copy) only an admin sees.
 func TestPoolRestore_DisksPoolIsConfinedPerFile(t *testing.T) {
 	s := newPoolTestServer(t)
 	disks := filepath.Join(s.dataDir, "disks")
@@ -95,7 +97,7 @@ func TestPoolRestore_DisksPoolIsConfinedPerFile(t *testing.T) {
 		t.Fatalf("acme uploads into the pool: %v", err)
 	}
 
-	want := []string{"avm-root-20261006T000000Z.qcow2", "avm-root.qcow2", "inst.iso"}
+	want := []string{"avm-root-20261006T000000Z.qcow2", "avm-root.qcow2", "inst.iso", "stray.iso"}
 	if got := listNames(t, s, pat, "shared"); !slices.Equal(got, want) {
 		t.Fatalf("acme's listing = %v, want %v", got, want)
 	}
@@ -103,9 +105,13 @@ func TestPoolRestore_DisksPoolIsConfinedPerFile(t *testing.T) {
 		t.Errorf("the admin's listing lacks the unowned files: %v", got)
 	}
 
-	// Another project's files and unowned files are absent to acme: never
-	// deleted, and reported as not there.
-	for _, n := range []string{"bvm-root.qcow2.superseded-20261006T000000Z", "stray.iso", "bvm-root-20261006T000000Z.qcow2"} {
+	// Another project's files and unowned non-image files are absent to acme:
+	// never deleted, and reported as not there. Unowned library content is
+	// seen but deleted only by an admin.
+	if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "shared", Filename: "stray.iso"}); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("acme deleting unowned stray.iso: got %v, want PermissionDenied", err)
+	}
+	for _, n := range []string{"bvm-root.qcow2.superseded-20261006T000000Z", "bvm-root-20261006T000000Z.qcow2"} {
 		if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "shared", Filename: n}); status.Code(err) != codes.NotFound {
 			t.Errorf("acme deleting %s: got %v, want NotFound", n, err)
 		}
@@ -125,7 +131,8 @@ func TestPoolRestore_DisksPoolIsConfinedPerFile(t *testing.T) {
 	}
 
 	// An upload record names the file it was made for, not the name: a file
-	// put at that name afterwards is nobody's.
+	// put at that name afterwards is nobody's — library content acme sees but
+	// may not delete.
 	if err := uploadAs(pat, s, "shared", "again.iso", "iso"); err != nil {
 		t.Fatal(err)
 	}
@@ -133,8 +140,8 @@ func TestPoolRestore_DisksPoolIsConfinedPerFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	writePoolFile(t, in("again.iso"), "someone else's")
-	if got := listNames(t, s, pat, "shared"); slices.Contains(got, "again.iso") {
-		t.Errorf("a file recreated at an uploaded name is listed as acme's: %v", got)
+	if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "shared", Filename: "again.iso"}); status.Code(err) != codes.PermissionDenied {
+		t.Errorf("acme deleting a file recreated at its uploaded name: got %v, want PermissionDenied", err)
 	}
 }
 

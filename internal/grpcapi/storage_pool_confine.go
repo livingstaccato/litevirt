@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -219,41 +220,86 @@ func (c *poolFileConfinement) callerReadsVM(ctx context.Context, name string) bo
 	return ok
 }
 
-// allows reports whether the caller's project owns path by record.
-func (c *poolFileConfinement) allows(ctx context.Context, path string) bool {
-	if c == nil {
-		return true
+// fileOwnership is what the records say about one file in a shared pool
+// directory.
+type fileOwnership struct {
+	owned      bool // some record refers to it
+	callerOwns bool // one of those records is the caller's project's
+	deletable  bool // the caller may delete it (an upload or replica of theirs)
+}
+
+// ownership reads the records for path: an upload recorded for it (to any
+// pool), a VM disk row on any host using it as its file or backing file, and
+// a replication schedule whose replicas it is named as.
+func (c *poolFileConfinement) ownership(ctx context.Context, path string) (fileOwnership, error) {
+	var o fileOwnership
+	if u, ok := c.s.poolUploadOf(c.uploads, path); ok {
+		o.owned = true
+		if u.Pool == c.rec.Name && u.Project == c.rec.Project {
+			o.callerOwns, o.deletable = true, true
+		}
 	}
-	if u, ok := c.s.poolUploadOf(c.uploads, path); ok && u.Pool == c.rec.Name && u.Project == c.rec.Project {
-		return true
-	}
-	owners, err := c.s.liveDiskOwners(ctx, c.s.hostName, path)
+	refs, err := corrosion.DisksReferencingPath(ctx, c.s.db, path)
 	if err != nil {
-		return false
+		return o, err
 	}
-	for _, d := range owners {
+	for _, d := range refs {
+		o.owned = true
 		if c.callerReadsVM(ctx, d.VMName) {
-			return true
+			o.callerOwns = true
 		}
 	}
 	base := filepath.Base(path)
 	for _, sc := range c.scheds {
-		if sc.Type != "replication" || sc.TargetPool != c.rec.Name ||
-			(sc.TargetHost != "" && sc.TargetHost != c.s.hostName) || sc.VMName == "" {
-			continue
-		}
-		if !c.callerReadsVM(ctx, sc.VMName) {
+		if sc.Type != "replication" || sc.VMName == "" || !strings.HasPrefix(base, sc.VMName+"-") {
 			continue
 		}
 		disks, err := corrosion.GetVMDisks(ctx, c.s.db, sc.VMName)
 		if err != nil {
-			continue
+			return o, err
 		}
 		for _, d := range disks {
-			if isReplicaOf(base, sc.VMName, d.DiskName) {
-				return true
+			if !isReplicaOf(base, sc.VMName, d.DiskName) {
+				continue
+			}
+			o.owned = true
+			if c.callerReadsVM(ctx, sc.VMName) {
+				o.callerOwns, o.deletable = true, true
 			}
 		}
 	}
-	return false
+	return o, nil
+}
+
+// visible reports whether the caller sees path: a file its project owns by
+// record, or a plain ISO/image file no record refers to — library content,
+// which everyone who may read the pool sees. A lookup error hides the file.
+func (c *poolFileConfinement) visible(ctx context.Context, path string) bool {
+	if c == nil {
+		return true
+	}
+	o, err := c.ownership(ctx, path)
+	if err != nil {
+		return false
+	}
+	if o.owned {
+		return o.callerOwns
+	}
+	return isPoolImageName(filepath.Base(path))
+}
+
+// deletable reports whether the caller may delete path: only its own upload
+// or its own VM's replica. Unowned library content is an admin's to delete.
+func (c *poolFileConfinement) deletable(ctx context.Context, path string) bool {
+	if c == nil {
+		return true
+	}
+	o, err := c.ownership(ctx, path)
+	return err == nil && o.deletable
+}
+
+// isPoolImageName reports whether name is a plain ISO or image file: the
+// names an upload may take (validatePoolUploadName).
+func isPoolImageName(name string) bool {
+	return validatePoolUploadName(name) == nil
 }

@@ -408,3 +408,78 @@ func TestImportSpace_AnUnrelatedFreeNeitherCancelsNorGrowsACredit(t *testing.T) 
 		t.Fatalf("beside 4 MiB outstanding of 26 free: %v", err)
 	}
 }
+
+// A free on the filesystem keeps a credit where it was; it does not credit
+// bytes an import wrote that the free space has not shown yet.
+func TestImportSpace_AFreeDoesNotCreditUnshownWrites(t *testing.T) {
+	var used int64
+	s := sharedSpaceServer(20<<20, &used)
+	a, b := t.TempDir(), t.TempDir()
+	ra := s.reserveImportSpace(a)
+	defer ra.release()
+	if err := ra.reserve(a, 8<<20, "a"); err != nil {
+		t.Fatal(err)
+	}
+	writeAllocated(t, a, 4<<20)
+	used = 2 << 20 // half of it shows
+	ra.refresh()
+	used -= 10 << 20
+	ra.refresh()
+	// 28 MiB free; a has 6 of its 8 not shown written.
+	rb := s.reserveImportSpace(b)
+	defer rb.release()
+	refusedForReservation(t, rb.reserve(b, 23<<20, "b"))
+	if err := rb.reserve(b, 22<<20, "b"); err != nil {
+		t.Fatalf("beside 6 MiB outstanding of 28 free: %v", err)
+	}
+}
+
+// A finished import's writes leave the credit with it: they are ordinary used
+// space, and the fall they made in the free space is not another import's.
+func TestImportSpace_AFinishedImportsFallIsNotCreditedToAnother(t *testing.T) {
+	var used int64
+	s := sharedSpaceServer(20<<20, &used)
+	a, b, c := t.TempDir(), t.TempDir(), t.TempDir()
+	ra, rb := s.reserveImportSpace(a), s.reserveImportSpace(b)
+	defer rb.release()
+	for _, r := range []*importReservation{ra, rb} {
+		if err := r.reserve(r.dir, 8<<20, "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeAllocated(t, a, 4<<20)
+	used = 4 << 20
+	ra.refresh()
+	writeAllocated(t, b, 4<<20) // not shown yet
+	rb.refresh()
+	ra.release()
+	rb.refresh()
+	// 16 MiB free; b has all 8 of its 8 not shown written.
+	rc := s.reserveImportSpace(c)
+	defer rc.release()
+	refusedForReservation(t, rc.reserve(c, 9<<20, "c"))
+	if err := rc.reserve(c, 8<<20, "c"); err != nil {
+		t.Fatalf("beside 8 MiB outstanding of 16 free: %v", err)
+	}
+}
+
+// A phase that ends keeps what it wrote counted until the free space shows
+// it; only what it never wrote is dropped.
+func TestImportSpace_BeginKeepsUnshownWrites(t *testing.T) {
+	var used int64
+	s := sharedSpaceServer(20<<20, &used)
+	a, b := t.TempDir(), t.TempDir()
+	ra := s.reserveImportSpace(a)
+	defer ra.release()
+	if err := ra.reserve(a, 8<<20, "a"); err != nil {
+		t.Fatal(err)
+	}
+	writeAllocated(t, a, 4<<20) // not shown yet
+	ra.begin()
+	rb := s.reserveImportSpace(b)
+	defer rb.release()
+	refusedForReservation(t, rb.reserve(b, 17<<20, "b"))
+	if err := rb.reserve(b, 16<<20, "b"); err != nil {
+		t.Fatalf("beside 4 MiB written and not shown, of 20 free: %v", err)
+	}
+}

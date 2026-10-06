@@ -226,7 +226,7 @@ func (s *Server) drainRunningVMCold(ctx context.Context, vm *corrosion.VMRecord,
 // run), so it names the two ways that work: undrain the host first, or move
 // the VM off, which a draining host allows, and start it where it lands.
 func startOnDrainedHostHint(vm, host string) string {
-	return startOnInactiveHostHint(vm, host, "is draining")
+	return startOnInactiveHostHint(vm, host, isDraining)
 }
 
 // reportStillShuttingDown is the end of a failed cold move whose guest was

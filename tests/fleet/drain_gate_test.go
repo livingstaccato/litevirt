@@ -359,49 +359,157 @@ func TestFleet_DrainOnADrainingHostWithoutQuorumIsRefused(t *testing.T) {
 }
 
 // An operator start refused on a host that is draining, or in maintenance,
-// says so and says what to do. The gate's bare reason,
-// "local_not_active_worker", named neither the host's state nor a way out,
-// and was all the lab got back from `lv start` on a draining host.
+// says so and says what to do — and every route it names works. The gate's
+// bare reason, "local_not_active_worker", named neither the host's state nor
+// a way out, and was all the lab got back from `lv start` on a draining host.
 //
-// A stopped VM's start and restart point at `lv host undrain` and at moving
-// it off cold; a running VM's restart adds the stop that a move off needs.
+// A draining host lets VMs leave, so its hints name two routes: undrain it,
+// or move the VM off cold (a running VM's restart adds the stop) and start it
+// there. A host in maintenance lets nothing leave (DrainExecutionGate admits
+// active and draining hosts only), so its hints name undrain alone, and a
+// migration off it is refused saying the same.
 //
-// Mutation: return the bare "start refused: <reason>" / "restart refused:
-// <reason>" again — every message loses the host state and the commands, and
-// goes red.
+// Each subtest follows one route the refusals named and checks it ends with
+// the VM running.
+//
+// Mutations: return the bare "start refused: <reason>" / "restart refused:
+// <reason>" — the refusals subtests lose the state and the commands; name the
+// migrate route in maintenance too — the maintenance refusals subtest finds
+// it; return the bare "migration refused: <reason>" — the maintenance
+// move-off subtest loses the undrain command.
 func TestFleet_StartRefusedOnAnInactiveHostSaysWhyAndWhatToDo(t *testing.T) {
-	for _, state := range []string{"draining", "maintenance"} {
-		t.Run(state, func(t *testing.T) {
-			sc := newColdStoppedScenario(t)
-			sc.makeRunning(t)
-			sc.addStoppedLocalVM(t, "os2", []byte("os2's disk"))
-			enforceGate(t, sc.c)
-			ctx := context.Background()
-			if err := corrosion.UpdateHostState(ctx, sc.src.DB, sc.src.Name, state); err != nil {
-				t.Fatalf("mark %s %s: %v", sc.src.Name, state, err)
+	ctx := context.Background()
+	setup := func(t *testing.T, state string) *coldStoppedScenario {
+		t.Helper()
+		sc := newColdStoppedScenario(t)
+		sc.makeRunning(t)
+		sc.addStoppedLocalVM(t, "os2", []byte("os2's disk"))
+		enforceGate(t, sc.c)
+		if err := corrosion.UpdateHostState(ctx, sc.src.DB, sc.src.Name, state); err != nil {
+			t.Fatalf("mark %s %s: %v", sc.src.Name, state, err)
+		}
+		return sc
+	}
+	running := func(t *testing.T, sc *coldStoppedScenario, n *Node, name string) {
+		t.Helper()
+		if active, _ := n.Virt.DomainIsActive(name); !active {
+			t.Errorf("%s is not running on %s after following the hint", name, n.Name)
+		}
+		if vm := sc.vmNamed(t, name); vm.HostName != n.Name || vm.State != "running" {
+			t.Errorf("%s row = host %s state %s, want host %s running", name, vm.HostName, vm.State, n.Name)
+		}
+	}
+	migrate := func(sc *coldStoppedScenario, name string) error {
+		st, err := sc.c.SelfClient(sc.src).MigrateVM(ctx, &pb.MigrateVMRequest{
+			VmName: name, TargetHost: sc.dst.Name, Strategy: pb.MigrateStrategy_MIGRATE_COLD,
+		})
+		if err != nil {
+			return err
+		}
+		for {
+			if _, rerr := st.Recv(); rerr == io.EOF {
+				return nil
+			} else if rerr != nil {
+				return rerr
 			}
-			h := sc.src.Name
-			is := map[string]string{"draining": "is draining", "maintenance": "is in maintenance"}[state]
-			stopped := []string{
-				health.ReasonLocalNotActiveWorker,
-				"host " + h + " " + is,
-				"`lv host undrain " + h + "`",
-				"`lv migrate os2 <target-host> --cold`",
-			}
+		}
+	}
 
-			_, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os2"})
-			assertRefusedWith(t, "start of stopped os2", err, append(stopped, "start refused", "`lv start os2`")...)
-			_, err = sc.c.SelfClient(sc.src).RestartVM(ctx, &pb.RestartVMRequest{Name: "os2"})
-			assertRefusedWith(t, "restart of stopped os2", err, append(stopped, "restart refused", "`lv start os2`")...)
+	for _, state := range []string{"draining", "maintenance"} {
+		is := map[string]string{"draining": "is draining", "maintenance": "is in maintenance"}[state]
+		moveOff := state == "draining"
+
+		t.Run(state+"/refusals", func(t *testing.T) {
+			sc := setup(t, state)
+			h := sc.src.Name
+			common := []string{health.ReasonLocalNotActiveWorker, "host " + h + " " + is, "`lv host undrain " + h + "`"}
+			cases := []struct {
+				what  string
+				call  func() error
+				want  []string
+				route string // the move-off route, named only on a draining host
+			}{
+				{"start of stopped os2", func() error {
+					_, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os2"})
+					return err
+				}, []string{"start refused", "`lv start os2`"}, "`lv migrate os2 <target-host> --cold`"},
+				{"restart of stopped os2", func() error {
+					_, err := sc.c.SelfClient(sc.src).RestartVM(ctx, &pb.RestartVMRequest{Name: "os2"})
+					return err
+				}, []string{"restart refused", "`lv start os2`"}, "`lv migrate os2 <target-host> --cold`"},
+				{"restart of running os1", func() error {
+					_, err := sc.c.SelfClient(sc.src).RestartVM(ctx, &pb.RestartVMRequest{Name: "os1"})
+					return err
+				}, []string{"restart refused", "`lv restart os1`"}, "`lv migrate os1 <target-host> --cold`"},
+			}
+			for _, c := range cases {
+				err := c.call()
+				want := append(append([]string{}, common...), c.want...)
+				if moveOff {
+					want = append(want, c.route)
+					if c.what == "restart of running os1" {
+						want = append(want, "`lv stop os1`")
+					}
+				}
+				assertRefusedWith(t, c.what, err, want...)
+				if !moveOff && err != nil && strings.Contains(err.Error(), "lv migrate") {
+					t.Errorf("%s on a host in maintenance names a migration, which the gate refuses there: %q", c.what, status.Convert(err).Message())
+				}
+			}
 			if active, _ := sc.src.Virt.DomainIsActive("os2"); active {
 				t.Errorf("os2 was started on the %s host", state)
 			}
-
-			_, err = sc.c.SelfClient(sc.src).RestartVM(ctx, &pb.RestartVMRequest{Name: "os1"})
-			assertRefusedWith(t, "restart of running os1", err,
-				health.ReasonLocalNotActiveWorker, "restart refused", "host "+h+" "+is,
-				"`lv host undrain "+h+"`", "`lv restart os1`", "`lv stop os1`", "`lv migrate os1 <target-host> --cold`")
 		})
+
+		t.Run(state+"/undrain", func(t *testing.T) {
+			sc := setup(t, state)
+			if _, err := sc.c.SelfClient(sc.dst).UndrainHost(ctx, &pb.UndrainHostRequest{Name: sc.src.Name}); err != nil {
+				t.Fatalf("lv host undrain %s: %v", sc.src.Name, err)
+			}
+			if _, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os2"}); err != nil {
+				t.Fatalf("lv start os2 after the undrain: %v", err)
+			}
+			running(t, sc, sc.src, "os2")
+			if _, err := sc.c.SelfClient(sc.src).RestartVM(ctx, &pb.RestartVMRequest{Name: "os1"}); err != nil {
+				t.Fatalf("lv restart os1 after the undrain: %v", err)
+			}
+			running(t, sc, sc.src, "os1")
+		})
+
+		if moveOff {
+			t.Run(state+"/move-off", func(t *testing.T) {
+				sc := setup(t, state)
+				// Stopped os2: migrate it off cold, start it there.
+				if err := migrate(sc, "os2"); err != nil {
+					t.Fatalf("lv migrate os2 %s --cold: %v", sc.dst.Name, err)
+				}
+				if _, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os2"}); err != nil {
+					t.Fatalf("lv start os2 on %s: %v", sc.dst.Name, err)
+				}
+				running(t, sc, sc.dst, "os2")
+				// Running os1: stop it, migrate it off cold, start it there.
+				if _, err := sc.c.SelfClient(sc.src).StopVM(ctx, &pb.StopVMRequest{Name: "os1"}); err != nil {
+					t.Fatalf("lv stop os1: %v", err)
+				}
+				if err := migrate(sc, "os1"); err != nil {
+					t.Fatalf("lv migrate os1 %s --cold: %v", sc.dst.Name, err)
+				}
+				if _, err := sc.c.SelfClient(sc.src).StartVM(ctx, &pb.StartVMRequest{Name: "os1"}); err != nil {
+					t.Fatalf("lv start os1 on %s: %v", sc.dst.Name, err)
+				}
+				running(t, sc, sc.dst, "os1")
+			})
+		} else {
+			t.Run(state+"/move-off-refused", func(t *testing.T) {
+				sc := setup(t, state)
+				err := migrate(sc, "os2")
+				assertRefusedWith(t, "lv migrate os2 --cold off a host in maintenance", err,
+					"migration refused", health.ReasonLocalNotActiveWorker, "host "+sc.src.Name+" "+is, "`lv host undrain "+sc.src.Name+"`")
+				if vm := sc.vmNamed(t, "os2"); vm.HostName != sc.src.Name {
+					t.Errorf("os2 row names %s after a refused migration, want %s", vm.HostName, sc.src.Name)
+				}
+			})
+		}
 	}
 }
 

@@ -53,7 +53,15 @@ func TestGateRefusal_HintOnlyForAHostOutOfService(t *testing.T) {
 		!strings.Contains(got, "once h1 is no longer draining (`lv host undrain h1`)") {
 		t.Errorf("startOnDrainedHostHint = %q", got)
 	}
-	if got := startOnInactiveHostHint("os1", "h1", "is in maintenance"); !strings.Contains(got, "once h1 is no longer in maintenance") {
-		t.Errorf("maintenance start hint = %q", got)
+	// A host in maintenance lets nothing leave, so its hints name no migration.
+	for _, got := range []string{startOnInactiveHostHint("os1", "h1", "is in maintenance"), restartRunningOnInactiveHostHint("os1", "h1", "is in maintenance")} {
+		if !strings.Contains(got, "once h1 is no longer in maintenance (`lv host undrain h1`)") || strings.Contains(got, "lv migrate") {
+			t.Errorf("maintenance hint = %q, want the undrain route only", got)
+		}
+	}
+	for _, got := range []string{startOnInactiveHostHint("os1", "h1", "is draining"), restartRunningOnInactiveHostHint("os1", "h1", "is draining")} {
+		if !strings.Contains(got, "`lv migrate os1 <target-host> --cold`") {
+			t.Errorf("draining hint = %q, want the move-off route too", got)
+		}
 	}
 }

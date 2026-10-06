@@ -280,10 +280,12 @@ down. Anything else that would run a VM there is refused with
 `local_not_active_worker`, as on any host that is not `active`: `lv start`
 of a VM on it, for one. On a host that is `draining` or in `maintenance`,
 `lv start` and `lv restart` add the host's state and what to do: undrain it
-first, or move the VM off with `lv migrate <vm> <target-host> --cold` (after
-`lv stop <vm>`, for a running one) and start it there. A replica promote, a
-container restore and a load-balancer apply refused there name the state
-and `lv host undrain <host>`. A migration onto it is refused because its target is
+first (`lv host undrain <host>`), or, on a `draining` host, move the VM off
+with `lv migrate <vm> <target-host> --cold` (after `lv stop <vm>`, for a
+running one) and start it there. A host in `maintenance` lets no VM leave it
+either: a migration off it is refused, naming the state and
+`lv host undrain <host>`, as are a replica promote, a container restore and a
+load-balancer apply there. A migration onto it is refused because its target is
 not `active`. A VM moved by a drain is started on its target, which is
 `active`.
 

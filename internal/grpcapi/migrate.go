@@ -282,7 +282,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// Fail-open until split_brain_gate_v1 is cluster-wide.
 	if reason, refused := s.sourceGateRefused(ctx, vm, targetHost.Name); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
-		return status.Errorf(codes.FailedPrecondition, "migration refused: %s", reason)
+		return status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "migration", reason, returnToServiceHint))
 	}
 
 	// Gate the explicit target on the matching host capability (mirrors what
@@ -630,7 +630,7 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	// until split_brain_gate_v1 is cluster-wide.
 	if reason, refused := s.sourceGateRefused(ctx, vm, targetHost.Name); refused {
 		s.noteGateRefused(corrosion.ActionReschedule, reason)
-		return status.Errorf(codes.FailedPrecondition, "migration refused: %s", reason)
+		return status.Error(codes.FailedPrecondition, s.gateRefusal(ctx, "migration", reason, returnToServiceHint))
 	}
 
 	// Hot-detach SR-IOV VFs, after the late gate and every progress send — the

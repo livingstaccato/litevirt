@@ -49,22 +49,34 @@ func (s *Server) localOutOfServiceState(ctx context.Context) (string, bool) {
 	return "", false
 }
 
+// isDraining is the phrase localOutOfServiceState gives a draining host.
+const isDraining = "is draining"
+
 // startOnInactiveHostHint is how an operator starts a stopped VM on a host
 // that is draining or in maintenance (is, as localOutOfServiceState phrases
-// it): return the host to active first, or move the VM off — a move away is
-// allowed there — and start it where it lands.
+// it): return the host to active first, or — from a DRAINING host only — move
+// the VM off and start it where it lands. A host in maintenance lets nothing
+// leave: DrainExecutionGate admits an active or draining host only, so a
+// migration off it is refused, and the hint does not name one.
 func startOnInactiveHostHint(vm, host, is string) string {
-	return fmt.Sprintf("start it with `lv start %s` once %s is no longer %s (`lv host undrain %s`), "+
-		"or move it off with `lv migrate %s <target-host> --cold` and start it there", vm, host, inactivePhrase(is), host, vm)
+	undrain := fmt.Sprintf("start it with `lv start %s` once %s is no longer %s (`lv host undrain %s`)",
+		vm, host, inactivePhrase(is), host)
+	if is != isDraining {
+		return undrain
+	}
+	return undrain + fmt.Sprintf(", or move it off with `lv migrate %s <target-host> --cold` and start it there", vm)
 }
 
 // restartRunningOnInactiveHostHint is startOnInactiveHostHint for a RUNNING
 // VM's restart: a move off cold needs it stopped first, and a stop is allowed
 // on a host out of service.
 func restartRunningOnInactiveHostHint(vm, host, is string) string {
-	return fmt.Sprintf("restart it with `lv restart %s` once %s is no longer %s (`lv host undrain %s`), "+
-		"or stop it (`lv stop %s`), move it off with `lv migrate %s <target-host> --cold` and start it there",
-		vm, host, inactivePhrase(is), host, vm, vm)
+	undrain := fmt.Sprintf("restart it with `lv restart %s` once %s is no longer %s (`lv host undrain %s`)",
+		vm, host, inactivePhrase(is), host)
+	if is != isDraining {
+		return undrain
+	}
+	return undrain + fmt.Sprintf(", or stop it (`lv stop %s`), move it off with `lv migrate %s <target-host> --cold` and start it there", vm, vm)
 }
 
 // returnToServiceHint is the remedy of a refusal with no VM-specific way

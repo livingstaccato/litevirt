@@ -204,7 +204,7 @@ func TestPromoteReplica_TopsUpSpareRootPorts(t *testing.T) {
 	); err != nil {
 		t.Fatalf("InsertVM: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(poolDir, "vm1-root-20260101000000.raw"), make([]byte, 1<<20), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(poolDir, "vm1-root-20260101-000000.raw"), make([]byte, 1<<20), 0644); err != nil {
 		t.Fatalf("write replica: %v", err)
 	}
 	stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}

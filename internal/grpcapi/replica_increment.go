@@ -58,7 +58,7 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, perr)
 		}
 		defer conn.Close()
-		up, perr := client.PushReplicaIncrement(ctx)
+		up, perr := client.PushReplicaIncrement(s.forwardContentCall(ctx))
 		if perr != nil {
 			return status.Errorf(codes.Unavailable, "open push to %q: %v", host, perr)
 		}
@@ -96,6 +96,28 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			return status.Errorf(codes.FailedPrecondition, "base replica %q not present: %v", first.Base, serr)
 		}
 	}
+	// The daemon's push says whose disk it replicates (an older node's does
+	// not): the new replica must be named for it and fork only from one of
+	// its own replicas, and it is recorded as that VM's.
+	caller, err := s.poolContentCallerOf(ctx)
+	if err != nil {
+		return err
+	}
+	if caller.view == viewReplicas {
+		k := caller.replica
+		if !replicaNameIs(first.Filename, k) {
+			return status.Errorf(codes.InvalidArgument, "%q is not a replica name of vm %q disk %q", first.Filename, k.VM, k.Disk)
+		}
+		if first.Base != "" {
+			uploads, uerr := s.loadPoolUploads()
+			if uerr != nil {
+				return status.Errorf(codes.Internal, "replica records: %v", uerr)
+			}
+			if !s.isReplicaFor(ctx, uploads, filepath.Join(dir, first.Base), k) {
+				return status.Errorf(codes.FailedPrecondition, "base %q is not a replica of vm %q disk %q", first.Base, k.VM, k.Disk)
+			}
+		}
+	}
 
 	var written int64
 	apply := func(f *os.File) error {
@@ -129,6 +151,12 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	dest, ferr := forkRawAndApply(dir, first.Filename, first.Base, first.TotalSize, apply)
 	if ferr != nil {
 		return status.Errorf(codes.Internal, "apply replica: %v", ferr)
+	}
+	if caller.view == viewReplicas {
+		if err := s.recordPoolReplica(rec.Name, caller.replica, dest); err != nil {
+			_ = os.Remove(dest)
+			return status.Errorf(codes.Internal, "record replica: %v", err)
+		}
 	}
 	return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written})
 }

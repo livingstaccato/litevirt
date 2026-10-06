@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -219,10 +220,11 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 		Status: "locating replica of disk " + src.DiskName + " in pool " + pool,
 	})
 
-	host, replica, err := s.findReplicaHost(ctx, req, src.DiskName, pool, schedHost)
+	host, replicas, err := s.findReplicaHost(ctx, req, vm, src.DiskName, pool, schedHost)
 	if err != nil {
 		return err
 	}
+	replica := replicas[0]
 	// Region-scoped failover keeps a recovery in the fenced host's region. The
 	// replica's host is known only now, so this is the first point it can be
 	// checked, and it is before any proof is persisted or relayed. An unknown
@@ -245,9 +247,11 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 	// Returned unwrapped rather than as a gRPC status: `automated` is only ever
 	// the in-process AutoPromoteReplica call, and a status would drop the
 	// errReplicaTooOld chain that says WHY recovery fell back to a reschedule.
+	var ageLimit time.Duration
 	if automated {
 		sched, _ := s.replicationScheduleForVM(ctx, req.VmName)
-		if err := checkAutoPromoteReplicaAge(replica, time.Now(), autoPromoteAgeLimit(sched.Cron)); err != nil {
+		ageLimit = autoPromoteAgeLimit(sched.Cron)
+		if err := checkAutoPromoteReplicaAge(replica, time.Now(), ageLimit); err != nil {
 			return err
 		}
 	}
@@ -331,16 +335,40 @@ func (s *Server) promoteResolvedIn(ctx context.Context, req *pb.PromoteReplicaRe
 	}
 
 	// The replica file + libvirt live on `host`; forward there if it isn't us.
-	if host != s.hostName {
-		fwd := &pb.PromoteReplicaRequest{
-			VmName: req.VmName, TargetPool: pool, TargetHost: host, Replica: replica,
-			NewName: req.NewName, Force: req.Force, NoLocalize: req.NoLocalize,
-			Proof: req.Proof, // carry the full single-use proof to the executor
+	// When the chosen replica turns out to be missing or unreadable there, the
+	// next-older one on the same host is tried (the proof is bound to that
+	// host). A replica the operator named is the only candidate
+	// (findReplicaHost), so it is never swapped for another.
+	var lastErr error
+	for i, replica := range replicas {
+		if i > 0 {
+			if automated {
+				if err := checkAutoPromoteReplicaAge(replica, time.Now(), ageLimit); err != nil {
+					return fmt.Errorf("%w (a newer replica was unavailable: %v)", err, lastErr)
+				}
+			}
+			_ = send(&pb.PromoteReplicaProgress{
+				Phase: pb.PromoteReplicaProgress_RESOLVING, VmName: req.VmName, Host: host, Replica: replica,
+				Status: "newer replica unavailable; trying " + replica,
+			})
 		}
-		return s.relayPromote(ctx, host, fwd, send)
+		if host != s.hostName {
+			fwd := &pb.PromoteReplicaRequest{
+				VmName: req.VmName, TargetPool: pool, TargetHost: host, Replica: replica,
+				NewName: req.NewName, Force: req.Force, NoLocalize: req.NoLocalize,
+				Proof: req.Proof, // carry the full single-use proof to the executor
+			}
+			err = s.relayPromote(ctx, host, fwd, send)
+		} else {
+			err = s.doPromoteLocal(ctx, req, vm, src, pool, replica, automated, send)
+		}
+		if err == nil || !replicaUnavailable(err) {
+			return err
+		}
+		slog.Warn("promote: replica unavailable; trying the next-older one", "vm", req.VmName, "host", host, "replica", replica, "error", err)
+		lastErr = err
 	}
-
-	return s.doPromoteLocal(ctx, req, vm, src, pool, replica, automated, send)
+	return lastErr
 }
 
 // errReplicaTooOld marks an automatic promotion refused because the newest
@@ -424,24 +452,19 @@ func (s *Server) replicationScheduleForVM(ctx context.Context, vmName string) (c
 	return corrosion.BackupScheduleRecord{}, false
 }
 
-// replicaPattern matches a replica file for (vm, disk): both the full-copy
-// qcow2 form and the incremental raw form.
-func isReplicaOf(name, vmName, diskName string) bool {
-	prefix := fmt.Sprintf("%s-%s-", vmName, diskName)
-	return strings.HasPrefix(name, prefix) &&
-		(strings.HasSuffix(name, ".qcow2") || strings.HasSuffix(name, ".raw"))
-}
-
 // findReplicaHost locates the host holding the chosen (req.replica) or newest
-// replica of (vm, disk) in pool. Candidates come from an explicit target host,
-// the schedule's host, or every active host that has the pool.
+// replica of vm's disk in pool, and returns that host's replicas of it,
+// newest first (only req.Replica when one is named). Candidates come from an
+// explicit target host, the schedule's host, or every active host that has
+// the pool.
 //
-// It lists pool files via poolContentNames (local read or host-cert peer call),
-// NOT the RBAC-gated ListStoragePoolContents handler: AutoPromoteReplica runs
-// from the failover coordinator with an unauthenticated context, which the
-// handler's RequireRole would reject (manual promote, with an operator ctx,
-// worked — auto-promote did not).
-func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequest, diskName, pool, schedHost string) (host, replica string, err error) {
+// It lists through replicaNames (local read, or a peer call as the daemon for
+// this VM's replicas), NOT the RBAC-gated ListStoragePoolContents handler:
+// AutoPromoteReplica runs from the failover coordinator with an
+// unauthenticated context, which the handler's RequireRole would reject. Only
+// this VM's replicas are listed — by record, or an unrecorded one by its exact
+// name — never a file another VM's name happens to share a prefix with.
+func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, diskName, pool, schedHost string) (host string, replicas []string, err error) {
 	var candidates []string
 	switch {
 	case req.TargetHost != "":
@@ -458,78 +481,32 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 		}
 	}
 
+	k := replicaKeyOf(vm, diskName)
+	byHost := map[string][]string{}
 	bestHost, bestName := "", ""
 	for _, h := range candidates {
-		for _, n := range s.poolContentNames(ctx, pool, h) {
-			if !isReplicaOf(n, req.VmName, diskName) {
-				continue
+		names := s.replicaNames(ctx, pool, h, k)
+		if req.Replica != "" {
+			if slices.Contains(names, req.Replica) {
+				return h, []string{req.Replica}, nil
 			}
-			if req.Replica != "" {
-				if n == req.Replica {
-					return h, n, nil
-				}
-				continue
-			}
-			// Timestamped suffix sorts lexically oldest→newest.
-			if n > bestName {
-				bestName, bestHost = n, h
-			}
+			continue
+		}
+		byHost[h] = names
+		// Timestamped suffix sorts lexically oldest→newest.
+		if len(names) > 0 && names[len(names)-1] > bestName {
+			bestName, bestHost = names[len(names)-1], h
 		}
 	}
 	if req.Replica != "" {
-		return "", "", status.Errorf(codes.NotFound, "replica %q not found in pool %q", req.Replica, pool)
+		return "", nil, status.Errorf(codes.NotFound, "replica %q not found in pool %q", req.Replica, pool)
 	}
 	if bestHost == "" {
-		return "", "", status.Errorf(codes.NotFound, "no replica of %q disk %q found in pool %q", req.VmName, diskName, pool)
+		return "", nil, status.Errorf(codes.NotFound, "no replica of %q disk %q found in pool %q", req.VmName, diskName, pool)
 	}
-	return bestHost, bestName, nil
-}
-
-// poolContentNames lists file names in a pool WITHOUT the RBAC gate, so it is
-// safe from unauthenticated internal contexts (scheduler / failover
-// coordinator). Local pool → read the directory; peer → dial with the host cert
-// (which the peer authorizes). Any error yields an empty list.
-func (s *Server) poolContentNames(ctx context.Context, pool, host string) []string {
-	if host == "" || host == s.hostName {
-		poolRef, ok := s.resolvePool(ctx, pool)
-		if !ok {
-			return nil
-		}
-		// A refused pool's directory is not listed, here or anywhere.
-		if !s.poolUsableForWrite(ctx, pool, poolRef) {
-			return nil
-		}
-		dir, err := fileBasedPoolDir(s.dataDir, poolRef)
-		if err != nil {
-			return nil
-		}
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return nil
-		}
-		names := make([]string, 0, len(entries))
-		for _, e := range entries {
-			if !e.IsDir() {
-				names = append(names, e.Name())
-			}
-		}
-		return names
-	}
-	client, conn, err := s.peerClient(ctx, host)
-	if err != nil {
-		return nil
-	}
-	defer conn.Close()
-	// The daemon's own listing: every file, as the local branch reads.
-	resp, err := client.ListStoragePoolContents(withPoolContentViewAll(ctx), &pb.ListStoragePoolContentsRequest{PoolName: pool, Host: host})
-	if err != nil {
-		return nil
-	}
-	names := make([]string, 0, len(resp.GetContents()))
-	for _, c := range resp.GetContents() {
-		names = append(names, c.GetName())
-	}
-	return names
+	newestFirst := slices.Clone(byHost[bestHost])
+	slices.Reverse(newestFirst)
+	return bestHost, newestFirst, nil
 }
 
 // relayPromote forwards a PromoteReplica stream to the host that holds the
@@ -715,8 +692,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		return err
 	}
 	replicaPath := filepath.Join(poolDir, replica)
-	if _, err := os.Stat(replicaPath); err != nil {
-		return status.Errorf(codes.NotFound, "replica %q not present on %q: %v", replica, s.hostName, err)
+	if err := replicaReadable(replicaPath); err != nil {
+		return status.Errorf(codes.NotFound, "%s: %q on %q: %v", errReplicaUnavailable, replica, s.hostName, err)
 	}
 
 	targetName := vm.Name

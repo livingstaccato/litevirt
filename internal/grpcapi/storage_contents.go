@@ -14,7 +14,9 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/safename"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
@@ -99,6 +101,11 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 	conf, err := s.poolConfinementFor(ctx, rec, caller)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "pool content owners: %v", err)
+	}
+	if caller.view == viewReplicas {
+		// Tell the daemon asking that these are matched by record; an older
+		// host lists every file and the caller matches by name.
+		_ = grpc.SetHeader(ctx, metadata.Pairs(replicaListingMDKey, "matched"))
 	}
 	resp := &pb.ListStoragePoolContentsResponse{}
 	seen := map[string]bool{}
@@ -187,21 +194,6 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if err != nil {
 		return nil, err
 	}
-	// The file is in the pool's directory, or (a pool on <data_dir>/disks) in
-	// disks/uploads, where uploads land; an upload is found first.
-	var target string
-	for _, d := range s.poolContentDirs(dir) {
-		p, err := safename.SafeJoin(d, req.Filename)
-		if err != nil {
-			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
-		}
-		if target == "" {
-			target = p
-		}
-		if _, err := os.Lstat(p); err == nil {
-			target = p
-		}
-	}
 	// In a directory that is not the pool's own, only the caller's project's
 	// files — the caller who made the call, on whichever node; another's is
 	// reported as absent, not as someone else's.
@@ -212,6 +204,36 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	conf, err := s.poolConfinementFor(ctx, rec, caller)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "pool content owners: %v", err)
+	}
+	// The file is in the pool's directory, or (a pool on <data_dir>/disks) in
+	// disks/uploads, where users' uploads land. The name is the file the
+	// listing shows the caller under it: the first, in poolContentDirs order,
+	// that is there and that the caller sees. Otherwise it is the first that
+	// is there (refused below as not the caller's), or the first path.
+	var target, existing, first string
+	for _, d := range s.poolContentDirs(dir) {
+		p, err := safename.SafeJoin(d, req.Filename)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		if first == "" {
+			first = p
+		}
+		if _, err := os.Lstat(p); err != nil {
+			continue
+		}
+		if existing == "" {
+			existing = p
+		}
+		if target == "" && conf.visible(ctx, p) {
+			target = p
+		}
+	}
+	if target == "" {
+		target = existing
+	}
+	if target == "" {
+		target = first
 	}
 	if !conf.visible(ctx, target) {
 		return nil, status.Errorf(codes.NotFound, "%q is not in pool %q", req.Filename, req.PoolName)
@@ -327,16 +349,23 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	if err != nil {
 		return err
 	}
-	// Who the upload is for: the caller who made it, on whichever node. Its
-	// upload is recorded as its pool's project's; the daemon's own (a
-	// replica) and a peer's with no identity are not.
+	// Who the upload is for: the caller who made it, on whichever node. A
+	// user's upload is recorded as its pool's project's; the daemon's replica
+	// as its VM's; an older node's (no marker) is not recorded.
 	caller, err := s.poolContentCallerOf(ctx)
 	if err != nil {
 		return err
 	}
-	// Into a pool on <data_dir>/disks an upload lands in disks/uploads, out
-	// of the VM disks' namespace.
-	dir := s.poolUploadDir(poolDir)
+	// Into a pool on <data_dir>/disks a user's upload lands in disks/uploads,
+	// out of the VM disks' namespace. The daemon's replica lands in the pool
+	// directory, where promotion reads it.
+	dir := poolDir
+	if caller.record {
+		dir = s.poolUploadDir(poolDir)
+	}
+	if caller.view == viewReplicas && !replicaNameIs(first.Filename, caller.replica) {
+		return status.Errorf(codes.InvalidArgument, "%q is not a replica name of vm %q disk %q", first.Filename, caller.replica.VM, caller.replica.Disk)
+	}
 	dest, err := safename.SafeJoin(dir, first.Filename)
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "%v", err)
@@ -413,12 +442,19 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		return status.Errorf(codes.Internal, "sync directory: %v", err)
 	}
 	// A caller's upload is recorded as its pool's project's: in a directory
-	// that is not the pool's own, the record is what makes it theirs.
-	if caller.record {
-		if err := s.recordPoolUpload(rec.Name, rec.Project, dest); err != nil {
-			_ = os.Remove(dest)
-			return status.Errorf(codes.Internal, "record upload: %v", err)
-		}
+	// that is not the pool's own, the record is what makes it theirs. A
+	// replica's record says whose VM's disk it is, which is what promotion
+	// and pruning match it by.
+	var recErr error
+	switch {
+	case caller.view == viewReplicas:
+		recErr = s.recordPoolReplica(rec.Name, caller.replica, dest)
+	case caller.record:
+		recErr = s.recordPoolUpload(rec.Name, rec.Project, dest)
+	}
+	if recErr != nil {
+		_ = os.Remove(dest)
+		return status.Errorf(codes.Internal, "record upload: %v", recErr)
 	}
 	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total})
 }

@@ -111,22 +111,22 @@ func TestPoolRound5_ForwardedCallIsConfinedAsTheOriginalCaller(t *testing.T) {
 	}
 }
 
-// C1: a peer call with no user identity and no daemon marker is nobody's: it
-// sees library ISOs only and deletes nothing. The daemon's own content calls
-// (replication pruning and upload, promote) say so and see every file.
-func TestPoolRound5_PeerWithoutIdentityIsNoProject(t *testing.T) {
+// C1, restored by I-A: a peer call with no user identity is the daemon
+// itself or a node that predates the content marker — never a user, whose
+// bearer is always relayed — so it sees and changes every file, as on main.
+// The marker means nothing from a user.
+func TestPoolRound5_PeerWithoutIdentityIsTheDaemon(t *testing.T) {
 	s, _ := twoProjectsOnDisks(t)
 	peer := bareEntryPeer(t, s)
 	pat := hostPathEngineCtx(t, s, "pat", "Operator", projectRBACBase("acme"))
 	if err := uploadAs(pat, s, "pa", "acme-own.img", "acme"); err != nil {
 		t.Fatal(err)
 	}
-	if got := listNames(t, s, peer, "pa"); !slices.Equal(got, []string{"debian.iso"}) {
-		t.Fatalf("a bare peer's listing = %v, want [debian.iso]", got)
-	}
-	for _, n := range []string{"debian.iso", "stray.qcow2", "bvm-root.qcow2"} {
-		if _, err := s.DeleteStoragePoolContent(peer, &pb.DeleteStoragePoolContentRequest{PoolName: "pa", Filename: n}); err == nil {
-			t.Errorf("a bare peer deleted %s", n)
+	// (A live disk of another pool is never listed as this pool's content.)
+	all := []string{"acme-own.img", "avm-root.qcow2", "debian.iso", "stray.qcow2"}
+	for _, ctx := range []context.Context{peer, withContentView(peer, "all")} {
+		if got := listNames(t, s, ctx, "pa"); !slices.Equal(got, all) {
+			t.Errorf("the daemon's own listing = %v, want every file of the pool %v", got, all)
 		}
 	}
 	// Its upload is nobody's: an ISO it puts there is library content no
@@ -137,15 +137,12 @@ func TestPoolRound5_PeerWithoutIdentityIsNoProject(t *testing.T) {
 	if _, err := s.DeleteStoragePoolContent(pat, &pb.DeleteStoragePoolContentRequest{PoolName: "pa", Filename: "peer.iso"}); status.Code(err) != codes.PermissionDenied {
 		t.Errorf("acme deleting an unrecorded ISO: got %v, want PermissionDenied", err)
 	}
-	sys := withContentView(peer, "all")
-	// (A live disk of another pool is never listed as this pool's content.)
-	if got := listNames(t, s, sys, "pa"); !slices.Equal(got, []string{"acme-own.img", "avm-root.qcow2", "debian.iso", "peer.iso", "stray.qcow2"}) {
-		t.Errorf("the daemon's own listing = %v, want every file of the pool", got)
-	}
-	// The marker means nothing from a user.
 	op := withContentView(pat, "all")
 	if got := listNames(t, s, op, "pa"); slices.Contains(got, "stray.qcow2") {
 		t.Errorf("a user carrying the daemon's marker sees an unowned disk image: %v", got)
+	}
+	if got := listNames(t, s, withContentView(pat, "replicas"), "pa"); slices.Contains(got, "stray.qcow2") {
+		t.Errorf("a user carrying the replica marker sees an unowned disk image: %v", got)
 	}
 }
 

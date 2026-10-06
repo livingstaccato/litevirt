@@ -37,7 +37,7 @@ func promotableIn(t *testing.T, dir, vm, disk string) []string {
 	}
 	var out []string
 	for _, e := range ents {
-		if isReplicaOf(e.Name(), vm, disk) {
+		if replicaNameIs(e.Name(), replicaKey{VM: vm, Disk: disk}) {
 			out = append(out, e.Name())
 		}
 	}

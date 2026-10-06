@@ -111,7 +111,7 @@ func TestPoolHostPath_PreexistingRefusedPoolTakesNoWrites(t *testing.T) {
 	if s.withinDiskArtifactRoot(filepath.Join(s.dataDir, "state.db")) {
 		t.Errorf("the legacy pool made <data_dir>/state.db a disk-artifact root")
 	}
-	err := s.applyIncrementLocal(context.Background(), "legacy", "x.raw", "", 4, bytes.NewReader([]byte("data")), [][2]int64{{0, 4}})
+	err := s.applyIncrementLocal(context.Background(), "legacy", "x.raw", "", 4, bytes.NewReader([]byte("data")), [][2]int64{{0, 4}}, replicaKey{VM: "x", Disk: "root"})
 	if err == nil {
 		t.Errorf("a replica increment into the legacy pool was applied")
 	}

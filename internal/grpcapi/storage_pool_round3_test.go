@@ -201,7 +201,7 @@ func TestPoolRound3_ArtifactRootsUseTheSameCheck(t *testing.T) {
 	}
 }
 
-// poolContentNames (promote's and the failover coordinator's listing) does
+// replicaNames (promote's and the failover coordinator's listing) does
 // not list a refused pool's directory.
 func TestPoolRound3_ContentNamesOfARefusedPoolAreNotListed(t *testing.T) {
 	s := newPoolTestServer(t)
@@ -213,7 +213,10 @@ func TestPoolRound3_ContentNamesOfARefusedPoolAreNotListed(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if names := s.poolContentNames(context.Background(), "legacy", ""); len(names) != 0 {
+	if err := os.WriteFile(filepath.Join(s.dataDir, "vm-root-20260101-000000.qcow2"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if names := s.replicaNames(context.Background(), "legacy", "", replicaKey{VM: "vm", Disk: "root"}); len(names) != 0 {
 		t.Fatalf("a refused pool's directory was listed: %v", names)
 	}
 }

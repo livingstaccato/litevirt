@@ -24,7 +24,7 @@ import (
 // the doPromoteLocal admission gate the way the create/start/migrate paths are
 // pinned.
 
-const promoteReplicaFile = "vm1-root-20260101000000.raw"
+const promoteReplicaFile = "vm1-root-20260101-000000.raw"
 
 // seedPromotableVM stages the durable record + replica file doPromoteLocal
 // needs: vm1 owned by ownerHost, a root-disk record, and a matching replica in

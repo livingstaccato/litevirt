@@ -33,7 +33,7 @@ func isStagingTemp(name string) bool {
 
 // isLegacyReplicaPartial matches the ".<replica>.partial" temp publishReplica
 // staged into before it switched to ".repl-*.tmp": a dot, a replica-shaped
-// name (what isReplicaOf matches — a .qcow2 or .raw), then ".partial". This
+// name (a .qcow2 or .raw), then ".partial". This
 // build never creates one, so every match is a leftover of a crash on an older
 // one; nothing else collects them.
 func isLegacyReplicaPartial(name string) bool {
@@ -105,6 +105,8 @@ func (s *Server) SweepStaleStaging(ctx context.Context) {
 	dirs := map[string]struct{}{
 		filepath.Join(s.dataDir, "images"): {},
 		filepath.Join(s.dataDir, "disks"):  {},
+		// Users' uploads into a pool on <data_dir>/disks stage here.
+		filepath.Join(s.dataDir, "disks", poolUploadsSubdir): {},
 	}
 	// Replicas land only in file-based pool directories (replicateLocalWith),
 	// so the legacy replica-temp sweep is confined to those.

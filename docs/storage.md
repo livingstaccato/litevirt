@@ -213,29 +213,45 @@ record:
 
 - the disks of the caller's VMs on this host (as their own file or as a
   backing file), including disks kept after the VM was deleted;
-- replicas of those disks, by an exact replica record — never by a file's
-  name: a file named like a replica (`<vm>-<disk>-<time>.qcow2`) is an
-  unowned disk image until such a record names it;
+- replicas of those disks, by their replica record: each replica the daemon
+  places (replication's copy, upload or incremental push) is recorded on the
+  pool's host with the VM, disk and project it is a replica of. A file merely
+  named like a replica (`<vm>-<disk>-<time>.qcow2`) is never owned through its
+  name; listing and deleting it needs `storage.hostpath` at the root;
 - files uploaded into this pool while it belonged to its current project (a
   global pool's uploads are visible to everyone who may use the pool).
 
 The caller is the user who made the call, on whichever node it entered: a
 listing, upload or delete forwarded to the pool's host carries the user's
-identity there and is confined as that user. A call from another node that
-carries no user identity sees only library media and deletes nothing; the
-daemon's own replication and promote calls mark themselves and see every
-file.
+identity there and is confined as that user (a session minted a moment ago on
+the entry node is waited for briefly while it replicates). A caller with a
+host certificate and no bearer — the daemon itself, a node not yet upgraded,
+or root on the node using the mTLS-as-admin fallback — sees and changes every
+file, as before: every identity that is not an admin carries a bearer, and a
+forwarded call always carries it.
 
-Uploads into a pool on `<data_dir>/disks` land in `<data_dir>/disks/uploads/`
-and are listed with the pool's other content: the VM disks' own names
-(`<vm>-<disk>.qcow2`) are never taken by an upload, so creating, deleting or
-migrating a VM never meets one, and the VM-disk debris sweep never removes a
-recorded upload. Files uploaded there by an older build stay where they are.
+Replication and promotion act for one VM in one project. Their content calls
+say so, and the pool's host answers with that VM's replicas only: those whose
+record names the VM, disk and project, and a replica made before records (no
+record) only when its name is exactly `<vm>-<disk>-<YYYYMMDD-HHMMSS>` and no VM
+of another project could have written the same name — `bvm` + `root-20261006`
+and `bvm-root` + `20261006` both write `bvm-root-20261006-…`, so neither is
+taken for the other. Promotion boots, and pruning deletes, nothing else. When
+the replica promotion picked is missing or unreadable on its host, it tries
+the next-older one there; a replica the operator named is never swapped.
+
+A user's upload into a pool on `<data_dir>/disks` lands in
+`<data_dir>/disks/uploads/` and is listed with the pool's other content: the VM
+disks' own names (`<vm>-<disk>.qcow2`) are never taken by an upload, so
+creating, deleting or migrating a VM never meets one, and the VM-disk debris
+sweep never removes a recorded upload. A name in both directories is the
+upload, to the listing and to a delete alike. Replicas are not uploads in this
+sense: they land in `<data_dir>/disks` itself, where promotion reads them.
+Files uploaded there by an older build stay where they are.
 
 Installer media — an `.iso`, plain or compressed (`.iso.gz`, `.iso.xz`,
 `.iso.zst`, `.iso.bz2`) — that no record refers to (no VM disk row on any
-host, live or kept after its VM was deleted; no replication schedule's
-replica; no upload) is library content, as before pools were confined:
+host, live or kept after its VM was deleted; no replica record; no upload) is library content, as before pools were confined:
 everyone who may read the pool sees it and can attach it, in a global pool
 every reader and in a project's pool that project's readers. A disk kept
 after its VM was deleted, or detached from it, stays its VM's project's: its

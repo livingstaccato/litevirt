@@ -119,9 +119,9 @@ func TestPromoteReplica_RenamedPopulatesHardwareTables(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	// A replica file matching the (vm, disk) naming pattern doPromoteLocal
-	// scans the pool dir for (isReplicaOf): "<vm>-<disk>-<timestamp>.raw".
-	replicaPath := filepath.Join(poolDir, "vm1-root-20260101000000.raw")
+	// A replica file named exactly as the runner names (vm, disk)'s replicas
+	// (replicaNameIs): "<vm>-<disk>-<YYYYMMDD-HHMMSS>.raw".
+	replicaPath := filepath.Join(poolDir, "vm1-root-20260101-000000.raw")
 	if err := os.WriteFile(replicaPath, make([]byte, 1<<20), 0644); err != nil {
 		t.Fatalf("write replica: %v", err)
 	}

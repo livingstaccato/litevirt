@@ -121,3 +121,27 @@ func TestImportVM_AnImageAtTheDisksNameIsNotAnOrphan(t *testing.T) {
 		t.Fatalf("the image now holds %q", b)
 	}
 }
+
+// Moving an orphan aside never replaces a file at the new name either.
+func TestMoveOrphanAside_NeverReplacesAFile(t *testing.T) {
+	at := time.Unix(1700000000, 0)
+	orphanNow = func() time.Time { return at }
+	t.Cleanup(func() { orphanNow = time.Now })
+	p := filepath.Join(t.TempDir(), "d.qcow2")
+	if err := os.WriteFile(p, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	there := p + ".orphan-1700000000"
+	if err := os.WriteFile(there, []byte("already there"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := moveOrphanAside(p); err == nil {
+		t.Fatal("moved an orphan over a file at its new name")
+	}
+	if b, _ := os.ReadFile(there); string(b) != "already there" {
+		t.Fatalf("the file at the new name now holds %q", b)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "orphan" {
+		t.Fatalf("the orphan now holds %q", b)
+	}
+}

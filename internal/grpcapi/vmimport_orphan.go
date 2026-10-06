@@ -48,10 +48,13 @@ func (s *Server) importPathReferences(ctx context.Context, p string) (string, er
 	return strings.Join(refs, ", "), nil
 }
 
+// orphanNow stamps an orphan's new name; a variable so a test can fix it.
+var orphanNow = time.Now
+
 // moveOrphanAside gives the file at p a new name beside it, never replacing
 // a file, and returns the new name. The file keeps its bytes.
 func moveOrphanAside(p string) (string, error) {
-	aside := fmt.Sprintf("%s.orphan-%d", p, time.Now().Unix())
+	aside := fmt.Sprintf("%s.orphan-%d", p, orphanNow().Unix())
 	err := renameNoReplace(p, aside)
 	if err == nil {
 		return aside, nil

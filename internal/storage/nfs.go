@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,7 +56,7 @@ func (d *nfsDriver) Teardown(ctx context.Context) error {
 	}
 	safe := strings.NewReplacer("/", "_", ":", "_").Replace(d.source)
 	mountDir := filepath.Join(d.mountBase, safe)
-	if out, err := run(commandCtx, "mountpoint", "-q", mountDir); err != nil {
+	if out, err := run(commandCtx, "mountpoint", "-q", "--", mountDir); err != nil {
 		if commandCtx.Err() != nil {
 			return nfsCommandError("check nfs mountpoint", d.source, commandCtx.Err(), out)
 		}
@@ -64,7 +65,7 @@ func (d *nfsDriver) Teardown(ctx context.Context) error {
 		}
 		return nfsCommandError("check nfs mountpoint", mountDir, err, out)
 	}
-	if out, err := run(commandCtx, "umount", mountDir); err != nil {
+	if out, err := run(commandCtx, "umount", "--", mountDir); err != nil {
 		if commandCtx.Err() != nil {
 			return nfsCommandError("umount nfs", mountDir, commandCtx.Err(), out)
 		}
@@ -102,7 +103,7 @@ func (d *nfsDriver) Prepare(ctx context.Context) error {
 	// always true and re-ran `mount` on every Prepare (every CreateVM / restart),
 	// which fails on already-mounted configs or stacks mounts (bug-sweep #8).
 	// Skip the mount when it's already mounted, keyed on the exit code.
-	mountpointOut, err := run(commandCtx, "mountpoint", "-q", d.mountDir)
+	mountpointOut, err := run(commandCtx, "mountpoint", "-q", "--", d.mountDir)
 	if err != nil && commandCtx.Err() != nil {
 		return nfsCommandError("check nfs mountpoint", d.mountDir, commandCtx.Err(), mountpointOut)
 	}
@@ -112,7 +113,20 @@ func (d *nfsDriver) Prepare(ctx context.Context) error {
 		if extra, ok := d.opts["options"]; ok {
 			mountOpts = extra
 		}
-		if out, err := run(commandCtx, "mount", "-t", "nfs", "-o", mountOpts, d.source, d.mountDir); err != nil {
+		mountOpts = hardenNFSOptions(mountOpts)
+		mount := func(opts string) ([]byte, error) {
+			return run(commandCtx, "mount", "-t", "nfs", "-o", opts, "--", d.source, d.mountDir)
+		}
+		out, err := mount(mountOpts + ",nosymfollow")
+		if err != nil && commandCtx.Err() == nil && nosymfollowUnsupported(out) {
+			// nosymfollow needs Linux 5.10+ and a mount.nfs that passes it on.
+			// Without it a symlink the server plants is followed in the host's
+			// namespace; nosuid,nodev,noexec still hold.
+			slog.Warn("NFS mount without nosymfollow (unsupported here): symlinks on the export will be followed",
+				"source", d.source, "mountpoint", d.mountDir)
+			out, err = mount(mountOpts)
+		}
+		if err != nil {
 			if commandCtx.Err() != nil {
 				return nfsCommandError("mount nfs", d.source, commandCtx.Err(), out)
 			}
@@ -184,7 +198,7 @@ func (d *nfsDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, e
 			}
 		}
 	} else {
-		f, err := os.Create(path)
+		f, err := CreateExclusive(path)
 		if err != nil {
 			return "", fmt.Errorf("create raw disk on NFS: %w", err)
 		}
@@ -210,4 +224,38 @@ func (d *nfsDriver) DeleteDisk(_ context.Context, path string) error {
 		return fmt.Errorf("remove NFS disk %s: %w", path, err)
 	}
 	return nil
+}
+
+// nfsHardening is what every NFS pool is mounted with: the export's server
+// decides its contents, so nothing on it may be a setuid binary, a device
+// node or an executable as far as this host is concerned. Pool content is
+// disk images; qemu reads them, nothing executes them.
+var nfsHardening = []string{"nosuid", "nodev", "noexec"}
+
+// hardenNFSOptions appends nfsHardening to opts, and drops any option that
+// would undo it (suid, dev, exec).
+func hardenNFSOptions(opts string) string {
+	var out []string
+	for _, o := range strings.Split(opts, ",") {
+		o = strings.TrimSpace(o)
+		switch o {
+		case "", "suid", "dev", "exec", "symfollow", "nosymfollow":
+			continue
+		}
+		out = append(out, o)
+	}
+	for _, h := range nfsHardening {
+		if !slices.Contains(out, h) {
+			out = append(out, h)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// nosymfollowUnsupported reports whether a mount failure is the kernel or
+// mount.nfs refusing the nosymfollow option, rather than any other failure.
+func nosymfollowUnsupported(out []byte) bool {
+	s := strings.ToLower(string(out))
+	return strings.Contains(s, "nosymfollow") || strings.Contains(s, "incorrect mount option") ||
+		strings.Contains(s, "invalid argument") || strings.Contains(s, "unknown option")
 }

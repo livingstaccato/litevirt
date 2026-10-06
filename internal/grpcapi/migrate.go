@@ -70,7 +70,7 @@ func (s *Server) withinDiskArtifactRoot(p string) bool {
 	}
 	s.storagePoolsMu.RUnlock()
 	for _, pr := range pools {
-		if !isFileBasedDriver(pr.Driver) {
+		if !isFileBasedDriver(pr.Driver) || !s.poolUsableForWrite(pr) {
 			continue
 		}
 		if dir, derr := fileBasedPoolDir(s.dataDir, pr); derr == nil && safename.Contains(dir, p) {

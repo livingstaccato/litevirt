@@ -37,7 +37,7 @@ func offlineMoveServer(t *testing.T) (s *Server, f *libvirtfake.Fake, srcFile, d
 	s.hostName = "test-host"
 	s.dataDir = t.TempDir()
 	srcDir := filepath.Join(s.dataDir, "src")
-	dstDir := filepath.Join(s.dataDir, "dst")
+	dstDir := filepath.Join(s.dataDir, "pools", "dst")
 	for _, d := range []string{srcDir, dstDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
@@ -120,7 +120,7 @@ func TestMoveVolume_Offline_DBZeroRowAborted(t *testing.T) {
 	s.hostName = "test-host"
 	s.dataDir = t.TempDir()
 	srcDir := filepath.Join(s.dataDir, "src")
-	dstDir := filepath.Join(s.dataDir, "dst")
+	dstDir := filepath.Join(s.dataDir, "pools", "dst")
 	for _, d := range []string{srcDir, dstDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
@@ -158,7 +158,7 @@ func TestMoveVolume_Offline_RedefineOkDBFailRollsBack(t *testing.T) {
 	s.hostName = "test-host"
 	s.dataDir = t.TempDir()
 	srcDir := filepath.Join(s.dataDir, "src")
-	dstDir := filepath.Join(s.dataDir, "dst")
+	dstDir := filepath.Join(s.dataDir, "pools", "dst")
 	for _, d := range []string{srcDir, dstDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)
@@ -203,7 +203,7 @@ func TestMoveVolume_Offline_AlreadyAtDstSkipsCopy(t *testing.T) {
 	s.hostName = "test-host"
 	s.dataDir = t.TempDir()
 	srcDir := filepath.Join(s.dataDir, "src")
-	dstDir := filepath.Join(s.dataDir, "dst")
+	dstDir := filepath.Join(s.dataDir, "pools", "dst")
 	for _, d := range []string{srcDir, dstDir} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatalf("mkdir: %v", err)

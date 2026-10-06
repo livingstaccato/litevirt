@@ -117,24 +117,61 @@ func storedVolumeIs(stored *compose.File, name string, vol compose.VolumeDef) bo
 		old.Target == vol.Target && maps.Equal(old.Options, vol.Options)
 }
 
-// poolWriteDir resolves a file-based pool's directory for a WRITE (an upload or
-// a content delete). A pool aimed at a directory no pool may write into — one
-// created before that was checked — keeps listing, but every write is refused
-// and logged, so the operator finds out and recreates it somewhere allowed.
-// Nothing is deleted or rewritten on their behalf.
-func (s *Server) poolWriteDir(rec corrosion.StoragePoolRecord) (string, error) {
-	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target})
+// checkPoolForWrite is the one check every write into a pool goes through —
+// CreateVM's disk, move, replicate, the replication runner, promote, replica
+// increments, upload and content delete. A pool created before these checks
+// may name a directory no pool may use, or a Source in no valid form. It keeps
+// listing, but nothing writes into it, mounts it or creates disks on it: each
+// attempt is refused and logged so the operator finds out and recreates the
+// pool somewhere allowed. Nothing is deleted or rewritten on their behalf.
+func (s *Server) checkPoolForWrite(name string, ref StoragePoolRef) error {
+	cfg := storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}
+	cerr := storage.CheckConfig(cfg, s.dataDir, s.pkiDir)
+	dir := ""
+	if cerr == nil && isFileBasedDriver(ref.Driver) {
+		if d, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
+			dir = d
+			cerr = storage.CheckWriteRoot(d, s.dataDir, s.pkiDir)
+		}
+	}
+	if cerr == nil {
+		return nil
+	}
+	slog.Error("storage pool write refused: the pool names a directory or source no pool may use; recreate the pool",
+		"pool", name, "host", s.hostName, "driver", ref.Driver, "dir", dir, "reason", cerr)
+	return status.Errorf(codes.FailedPrecondition,
+		"pool %q names a directory or source no pool may use (%v); it still lists, but nothing is written to it — recreate the pool",
+		name, cerr)
+}
+
+// poolDirForWrite is fileBasedPoolDir for a write: checkPoolForWrite first.
+func (s *Server) poolDirForWrite(name string, ref StoragePoolRef) (string, error) {
+	if err := s.checkPoolForWrite(name, ref); err != nil {
+		return "", err
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, ref)
 	if err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "resolve pool dir: %v", err)
 	}
-	if cerr := storage.CheckWriteRoot(dir, s.dataDir, s.pkiDir); cerr != nil {
-		slog.Error("storage pool write refused: the pool's directory is one no pool may write into; recreate the pool on another directory",
-			"pool", rec.Name, "host", rec.HostName, "dir", dir, "reason", cerr)
-		return "", status.Errorf(codes.FailedPrecondition,
-			"pool %q writes into a directory no pool may use (%v); it still lists, but uploads and deletes are refused — recreate the pool on another directory",
-			rec.Name, cerr)
-	}
 	return dir, nil
+}
+
+// poolWriteDir is poolDirForWrite for a pool row.
+func (s *Server) poolWriteDir(rec corrosion.StoragePoolRecord) (string, error) {
+	return s.poolDirForWrite(rec.Name, StoragePoolRef{Driver: rec.Driver, Source: rec.Source, Target: rec.Target, Options: rec.Options})
+}
+
+// poolUsableForWrite reports, without logging, whether writes into the pool
+// are allowed — for code that enumerates roots rather than acting on one.
+func (s *Server) poolUsableForWrite(ref StoragePoolRef) bool {
+	cfg := storage.Config{Driver: ref.Driver, Source: ref.Source, Target: ref.Target, Options: ref.Options}
+	if storage.CheckConfig(cfg, s.dataDir, s.pkiDir) != nil {
+		return false
+	}
+	if dir, err := fileBasedPoolDir(s.dataDir, ref); err == nil {
+		return storage.CheckWriteRoot(dir, s.dataDir, s.pkiDir) == nil
+	}
+	return true
 }
 
 // poolUploadExts are the file types a pool holds: disk images, installer ISOs,
@@ -199,4 +236,29 @@ func publishNoClobber(tmp, dest, filename string) error {
 		return status.Errorf(codes.Internal, "finalize: %v", err)
 	}
 	return nil
+}
+
+// localPoolDir is where a new target-less local pool keeps its files: a
+// directory of its own, never the shared <data_dir>/disks that holds every
+// VM's local disks on the host, across projects.
+func localPoolDir(dataDir, name string) string {
+	return filepath.Join(dataDir, "pools", name)
+}
+
+// liveDiskOwners returns the live disks on this host that use path — as their
+// own file or as a backing file. A pool directory can hold files that belong to
+// VMs outside the pool: a legacy target-less local pool shares <data_dir>/disks
+// with every local disk on the host.
+func (s *Server) liveDiskOwners(ctx context.Context, path string) ([]corrosion.DiskRecord, error) {
+	refs, err := corrosion.DisksReferencingPath(ctx, s.db, path)
+	if err != nil {
+		return nil, err
+	}
+	out := refs[:0]
+	for _, d := range refs {
+		if d.HostName == "" || d.HostName == s.hostName {
+			out = append(out, d)
+		}
+	}
+	return out, nil
 }

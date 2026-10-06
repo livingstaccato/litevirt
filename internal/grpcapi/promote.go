@@ -705,9 +705,9 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if !isFileBasedDriver(poolRef.Driver) {
 		return status.Errorf(codes.FailedPrecondition, "pool %q (%s) is not file-based", pool, poolRef.Driver)
 	}
-	poolDir, err := fileBasedPoolDir(s.dataDir, poolRef)
+	poolDir, err := s.poolDirForWrite(pool, poolRef)
 	if err != nil {
-		return status.Errorf(codes.Internal, "resolve pool dir: %v", err)
+		return err
 	}
 	replicaPath := filepath.Join(poolDir, replica)
 	if _, err := os.Stat(replicaPath); err != nil {

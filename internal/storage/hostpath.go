@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -23,11 +24,17 @@ type HostPaths struct {
 	// MountOptions is set when the config passes its own NFS mount options,
 	// which reach mount(8) verbatim.
 	MountOptions bool
+	// Network names the remote storage a network-backed pool (nfs, ceph,
+	// iscsi) attaches. Its server, not the request, decides what the daemon
+	// then finds there — files, symlinks, block devices — and the daemon
+	// reads and writes it as root, so attaching one is a host-level act even
+	// when the pool names no local directory.
+	Network string
 }
 
 // Any reports whether the configuration names anything on the host.
 func (h HostPaths) Any() bool {
-	return len(h.WriteRoots) > 0 || len(h.ReadPaths) > 0 || h.MountOptions
+	return len(h.WriteRoots) > 0 || len(h.ReadPaths) > 0 || h.MountOptions || h.Network != ""
 }
 
 // Describe names what was found, for an operator-facing refusal.
@@ -42,12 +49,16 @@ func (h HostPaths) Describe() string {
 	if h.MountOptions {
 		parts = append(parts, "custom NFS mount options")
 	}
+	if h.Network != "" {
+		parts = append(parts, fmt.Sprintf("network storage %q, whose server controls what the daemon reads and writes", h.Network))
+	}
 	return strings.Join(parts, ", ")
 }
 
 // HostPathsOf returns the host paths a pool configuration names. A local pool
-// with no Target and an NFS pool with no Target name none: they live under the
-// daemon's own <data_dir>/disks and <data_dir>/mounts.
+// with no Target names none: it lives under the daemon's own data directory.
+// Every network-backed pool (nfs, ceph, iscsi) names its remote storage, with
+// or without a Target.
 func HostPathsOf(cfg Config) HostPaths {
 	var h HostPaths
 	switch strings.ToLower(cfg.Driver) {
@@ -59,15 +70,19 @@ func HostPathsOf(cfg Config) HostPaths {
 		// Target is mandatory for dir; an empty one is refused by New.
 		h.WriteRoots = append(h.WriteRoots, cfg.Target)
 	case "nfs":
+		h.Network = cfg.Source
 		if cfg.Target != "" {
 			h.WriteRoots = append(h.WriteRoots, cfg.Target)
 		}
 		if _, ok := cfg.Options["options"]; ok {
 			h.MountOptions = true
 		}
+	case "iscsi":
+		h.Network = cfg.Source
 	case "btrfs":
 		h.WriteRoots = append(h.WriteRoots, cfg.Source)
 	case "ceph":
+		h.Network = cfg.Source
 		for _, k := range []string{"conf", "keyring"} {
 			if v := cfg.Options[k]; v != "" {
 				h.ReadPaths = append(h.ReadPaths, v)
@@ -81,18 +96,29 @@ func HostPathsOf(cfg Config) HostPaths {
 // daemon writes as root into any of them can become code execution (cron.d,
 // profile.d, systemd units, ld.so.preload, authorized_keys) or can corrupt the
 // host. This is a backstop, not the boundary: the boundary is that only a
-// cluster-root caller may name a host path at all.
+// cluster-root caller may name a host path at all. It is not exhaustive —
+// /opt, /var/log, /var/tmp and /srv are left to the admin who names them — and
+// it is judged when the pool is created or used, not continuously: a symlink
+// or bind mount made afterwards by someone with root on the host is not seen
+// (EvalSymlinks does not see mounts at all). Network pools, whose server
+// could otherwise plant such links, are mounted nosymfollow.
 var systemRoots = []string{
-	"/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/libx32",
+	"/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/libx32",
 	"/proc", "/root", "/run", "/sbin", "/sys", "/usr",
-	"/var/run", "/var/spool",
+	"/var/lib/libvirt", "/var/run", "/var/spool",
 }
+
+// litevirtVarLibPrefix refuses /var/lib/litevirt and every /var/lib/litevirt-*
+// (an old or side-by-side install's state) except the configured data
+// directory's own pool areas.
+const litevirtVarLibPrefix = "litevirt"
 
 // dataDirPoolAreas are the only parts of the daemon's data directory a pool
 // may live in: disks/ is the default local pool, mounts/ holds the NFS mounts
-// the daemon makes itself. Everything else there is the daemon's own state
+// the daemon makes itself, pools/<name> is a target-less local pool's own
+// directory. Everything else there is the daemon's own state
 // (state.db, pki, images, the audit assertion file, …).
-var dataDirPoolAreas = []string{"disks", "mounts"}
+var dataDirPoolAreas = []string{"disks", "mounts", "pools"}
 
 // CheckWriteRoot refuses a directory no pool may write into: a relative path,
 // the filesystem root, anything under a system directory, the daemon's PKI
@@ -119,6 +145,9 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 				}
 			}
 		}
+		if underLitevirtVarLib(cand) && !inAnyPoolArea(dataDir, cand) {
+			return fmt.Errorf("%q is under /var/lib/%s*, litevirt state", p, litevirtVarLibPrefix)
+		}
 		if pkiDir != "" {
 			for _, d := range pathForms(pkiDir) {
 				if within(d, cand) || within(cand, d) {
@@ -140,10 +169,14 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 	return nil
 }
 
-// CheckConfig applies CheckWriteRoot to every directory the configuration
-// writes into, and refuses an NFS source that would derive a mount directory
-// outside <data_dir>/mounts.
+// CheckConfig refuses a Source or option that is not in its driver's strict
+// form (ValidateSource), applies CheckWriteRoot to every directory the
+// configuration writes into, and refuses an NFS source that would derive a
+// mount directory outside <data_dir>/mounts.
 func CheckConfig(cfg Config, dataDir, pkiDir string) error {
+	if err := ValidateSource(cfg); err != nil {
+		return err
+	}
 	for _, p := range HostPathsOf(cfg).WriteRoots {
 		if err := CheckWriteRoot(p, dataDir, pkiDir); err != nil {
 			return err
@@ -211,4 +244,94 @@ func inPoolArea(dataDir, p string) bool {
 		}
 	}
 	return false
+}
+
+func underLitevirtVarLib(p string) bool {
+	rel, err := filepath.Rel("/var/lib", p)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return false
+	}
+	first, _, _ := strings.Cut(rel, string(filepath.Separator))
+	return strings.HasPrefix(first, litevirtVarLibPrefix)
+}
+
+func inAnyPoolArea(dataDir, p string) bool {
+	if dataDir == "" {
+		return false
+	}
+	for _, d := range pathForms(dataDir) {
+		if inPoolArea(d, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// The strict forms a pool's Source and identifying options must take. Each
+// reaches a tool's argv (mount, rbd, zfs, lvs, iscsiadm, btrfs) as a positional
+// argument or option value; a value that starts with "-" would be parsed as an
+// option, which would let a caller pass the very options that need
+// storage.hostpath (an alternate config, keyring or log file). The drivers
+// also put "--" before positional arguments; this is the first line.
+var (
+	nfsSourceRe   = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\]):/[^\s,]*$`)
+	cephNameRe    = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
+	zfsDatasetRe  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.:-]*(/[A-Za-z0-9_][A-Za-z0-9_.:-]*)*$`)
+	lvmNameRe     = regexp.MustCompile(`^[A-Za-z0-9_+.][A-Za-z0-9_+.-]*$`)
+	iscsiTargetRe = regexp.MustCompile(`^(?i:iqn|eui|naa)\.[A-Za-z0-9.:_-]+$`)
+	iscsiPortalRe = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9.-]*|\[[0-9A-Fa-f:.]+\])(:[0-9]{1,5})?$`)
+)
+
+// ValidateSource refuses a Source, or a driver option that names an object,
+// that is not in its driver's strict form.
+func ValidateSource(cfg Config) error {
+	src := cfg.Source
+	bad := func(what, v, want string) error {
+		return fmt.Errorf("%s %q is not %s", what, v, want)
+	}
+	switch strings.ToLower(cfg.Driver) {
+	case "", "local", "dir":
+		if src != "" {
+			return fmt.Errorf("a %s pool takes no source (got %q)", strings.ToLower(cfg.Driver), src)
+		}
+	case "nfs":
+		if !nfsSourceRe.MatchString(src) {
+			return bad("nfs source", src, "server:/export")
+		}
+	case "ceph":
+		if !cephNameRe.MatchString(src) {
+			return bad("ceph pool", src, "a pool name")
+		}
+		if id := cfg.Options["id"]; id != "" && !cephNameRe.MatchString(id) {
+			return bad("ceph id", id, "a client name")
+		}
+		for _, k := range []string{"conf", "keyring"} {
+			if v := cfg.Options[k]; v != "" && !filepath.IsAbs(v) {
+				return bad("ceph "+k, v, "an absolute path")
+			}
+		}
+	case "zfs":
+		if !zfsDatasetRe.MatchString(src) {
+			return bad("zfs dataset", src, "pool/dataset")
+		}
+	case "btrfs":
+		if !filepath.IsAbs(src) {
+			return bad("btrfs source", src, "an absolute path")
+		}
+	case "lvm-thin", "lvmthin":
+		if !lvmNameRe.MatchString(src) {
+			return bad("volume group", src, "a volume group name")
+		}
+		if tp := cfg.Options["thinpool"]; tp != "" && !lvmNameRe.MatchString(tp) {
+			return bad("thin pool", tp, "a logical volume name")
+		}
+	case "iscsi":
+		if !iscsiTargetRe.MatchString(src) {
+			return bad("iscsi target", src, "an iqn./eui./naa. name")
+		}
+		if pt := cfg.Options["portal"]; pt != "" && !iscsiPortalRe.MatchString(pt) {
+			return bad("iscsi portal", pt, "host[:port]")
+		}
+	}
+	return nil
 }

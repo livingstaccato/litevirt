@@ -110,6 +110,14 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 		return client.CreateStoragePool(ctx, req)
 	}
 
+	// A new target-less local pool gets a directory of its own rather than the
+	// shared <data_dir>/disks, where its content operations would reach every
+	// local VM disk on the host. A row that already exists target-less (created
+	// before this) keeps its directory; its content operations skip files that
+	// live disks use.
+	if req.Driver == "local" && req.Target == "" && !(found && existing.Target == "") {
+		req.Target = localPoolDir(s.dataDir, req.Name)
+	}
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,
 		Source:  req.Source,

@@ -124,6 +124,9 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 			"target pool driver %q: replication not yet implemented", dstPool.Driver)
 	}
 
+	if err := s.checkPoolForWrite(req.TargetPool, dstPool); err != nil {
+		return err
+	}
 	drv, err := storage.New(s.dataDir, storage.Config{
 		Driver:  dstPool.Driver,
 		Source:  dstPool.Source,

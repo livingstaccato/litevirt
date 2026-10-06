@@ -133,8 +133,8 @@ func TestMigrateStackVolumes_DryRun(t *testing.T) {
 	s.dataDir = t.TempDir()
 	ctx := context.Background()
 
-	seedPool(t, s, ctx, "warm", "local", filepath.Join(s.dataDir, "warm"))
-	s.SetStoragePoolsByName(map[string]StoragePoolRef{"warm": {Driver: "local", Target: filepath.Join(s.dataDir, "warm")}})
+	seedPool(t, s, ctx, "warm", "local", filepath.Join(s.dataDir, "pools", "warm"))
+	s.SetStoragePoolsByName(map[string]StoragePoolRef{"warm": {Driver: "local", Target: filepath.Join(s.dataDir, "pools", "warm")}})
 	seedStackVM(t, s, ctx, "pg", "pg-1", "stopped", "hot", filepath.Join(s.dataDir, "pg-1.qcow2"), 1)
 	seedStackVM(t, s, ctx, "pg", "pg-2", "stopped", "hot", filepath.Join(s.dataDir, "pg-2.qcow2"), 1)
 
@@ -164,7 +164,7 @@ func TestMigrateStackVolumes_OfflineRollout(t *testing.T) {
 	s.dataDir = t.TempDir()
 	ctx := context.Background()
 
-	dstDir := filepath.Join(s.dataDir, "warm")
+	dstDir := filepath.Join(s.dataDir, "pools", "warm")
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}

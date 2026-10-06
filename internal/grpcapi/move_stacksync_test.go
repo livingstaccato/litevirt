@@ -20,7 +20,7 @@ func TestMoveVolume_SyncsStackComposeYAML(t *testing.T) {
 	s.hostName = "test-host"
 	s.dataDir = t.TempDir()
 
-	dstDir := filepath.Join(s.dataDir, "warm")
+	dstDir := filepath.Join(s.dataDir, "pools", "warm")
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		t.Fatal(err)
 	}

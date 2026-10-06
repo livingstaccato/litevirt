@@ -1026,7 +1026,8 @@ A disk with no `storage:` uses the default local driver. A disk's `storage:` nam
 and creating the VM fails with `storage "fast" is neither a volume of stack "shop" nor a storage pool on host "node-2"` when the pool exists on other hosts but not the one the VM is placed on. See [storage.md](storage.md) for host-level pool configuration.
 
 A volume that names a host path (a `target`, a `dir` or `btrfs` volume, NFS
-mount `options`, a Ceph `conf` or `keyring`) follows the same rule as a pool:
+mount `options`, a Ceph `conf` or `keyring`) or attaches network storage
+(`nfs`, `ceph`, `iscsi`) follows the same rule as a pool:
 `lv compose up` needs `storage.hostpath` at `/` (the Admin role) to add or
 change one, and refuses system and litevirt-internal directories to everyone
 ([storage.md](storage.md#host-paths)). Re-deploying

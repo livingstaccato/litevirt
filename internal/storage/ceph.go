@@ -30,7 +30,7 @@ func (d *cephDriver) rbd(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 func (d *cephDriver) Prepare(ctx context.Context) error {
-	args := d.rbdArgs("ls", d.pool)
+	args := d.rbdArgs("ls", "--", d.pool)
 	if out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("ceph pool %q not accessible: %w: %s", d.pool, err, out)
 	}
@@ -68,7 +68,7 @@ func (d *cephDriver) CreateDisk(ctx context.Context, opts DiskOptions) (string, 
 		args := d.rbdArgs("create",
 			"--size", fmt.Sprintf("%d", sizeMiB),
 			"--image-feature", "layering",
-			fmt.Sprintf("%s/%s", d.pool, imageName),
+			"--", fmt.Sprintf("%s/%s", d.pool, imageName),
 		)
 		if out, err := d.rbd(ctx, args...); err != nil {
 			return "", fmt.Errorf("rbd create %s: %w: %s", imageName, err, out)
@@ -91,7 +91,7 @@ func (d *cephDriver) DeleteDisk(ctx context.Context, path string) error {
 	if imageName == "" {
 		return fmt.Errorf("cannot parse Ceph image name from %q", path)
 	}
-	args := d.rbdArgs("rm", fmt.Sprintf("%s/%s", d.pool, imageName))
+	args := d.rbdArgs("rm", "--", fmt.Sprintf("%s/%s", d.pool, imageName))
 	if out, err := exec.CommandContext(ctx, "rbd", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("rbd rm %s: %w: %s", imageName, err, out)
 	}
@@ -99,7 +99,7 @@ func (d *cephDriver) DeleteDisk(ctx context.Context, path string) error {
 }
 
 func (d *cephDriver) cloneFromImage(ctx context.Context, sourceImage, destImage string) error {
-	args := d.rbdArgs("clone", sourceImage, fmt.Sprintf("%s/%s", d.pool, destImage))
+	args := d.rbdArgs("clone", "--", sourceImage, fmt.Sprintf("%s/%s", d.pool, destImage))
 	out, err := d.rbd(ctx, args...)
 	if err != nil {
 		return fmt.Errorf("rbd clone: %w: %s", err, out)

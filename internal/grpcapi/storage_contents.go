@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -99,6 +100,13 @@ func (s *Server) ListStoragePoolContents(ctx context.Context, req *pb.ListStorag
 			continue
 		}
 		name := e.Name()
+		// A file a live disk of another pool (or of no pool) uses is not this
+		// pool's content: a legacy target-less local pool shares <data_dir>/disks
+		// with every local VM disk on the host. Unknown ownership hides it.
+		owners, oerr := s.liveDiskOwners(ctx, filepath.Join(dir, name))
+		if oerr != nil || slices.ContainsFunc(owners, func(d corrosion.DiskRecord) bool { return d.StorageVolume != req.PoolName }) {
+			continue
+		}
 		resp.Contents = append(resp.Contents, &pb.StoragePoolContent{
 			Name:       name,
 			Path:       filepath.Join(dir, name),
@@ -157,6 +165,16 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	target, err := safename.SafeJoin(dir, req.Filename)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	// Never a file a live disk uses — this pool's or, in a directory shared
+	// with other disks, anyone's.
+	owners, err := s.liveDiskOwners(ctx, target)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "check disk use: %v", err)
+	}
+	if len(owners) > 0 {
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"%q is in use by VM %q disk %q; it is not pool content to delete", req.Filename, owners[0].VMName, owners[0].DiskName)
 	}
 	// os.Remove deletes a symlink itself (not its target), so this can't be
 	// redirected to delete an arbitrary file outside the pool.
@@ -266,7 +284,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		return status.Errorf(codes.Internal, "create temp: %v", err)
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
+	defer os.Remove(tmpName) // after a publish, drops the temp's second link
 	defer tmp.Close()
 
 	var total int64

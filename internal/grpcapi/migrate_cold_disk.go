@@ -793,6 +793,9 @@ func (s *Server) SweepColdMigrationScratch() {
 		if !isHostLocalDiskDriver(strings.ToLower(pr.Driver)) && pr.Driver != "" {
 			continue
 		}
+		if !s.poolUsableForWrite(pr) {
+			continue
+		}
 		if dir, err := fileBasedPoolDir(s.dataDir, pr); err == nil {
 			roots = append(roots, dir)
 		}

@@ -133,7 +133,7 @@ func (s *Server) resolveBackupRepoPath(ctx context.Context, repoPath string) (st
 		}
 	}
 	if filepath.IsAbs(repoPath) {
-		if err := RequireRole(ctx, "admin"); err != nil {
+		if err := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); err != nil {
 			return "", status.Error(codes.PermissionDenied,
 				"a custom absolute repo_path requires the admin role; otherwise reference a registered backup repo by name")
 		}
@@ -151,7 +151,7 @@ func (s *Server) resolveRestoreTarget(ctx context.Context, targetPath, defaultDi
 		return "", status.Error(codes.InvalidArgument, "target_path required")
 	}
 	if filepath.IsAbs(targetPath) {
-		if err := RequireRole(ctx, "admin"); err != nil {
+		if err := s.RequirePerm(ctx, "/", verbStorageHostPath, "admin"); err != nil {
 			return "", status.Error(codes.PermissionDenied,
 				"a custom absolute target_path requires the admin role; otherwise pass a bare filename to write under the pool")
 		}

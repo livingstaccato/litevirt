@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -161,6 +162,9 @@ func (s *Server) moveOneVolume(
 	// Resolve the destination directory. We piggyback on the storage
 	// driver's Prepare to ensure it's mounted/ready, then derive a
 	// per-VM filename.
+	if err := s.checkPoolForWrite(targetPool, dstPool); err != nil {
+		return err
+	}
 	drv, err := storage.New(s.dataDir, storage.Config{
 		Driver:  dstPool.Driver,
 		Source:  dstPool.Source,
@@ -180,6 +184,9 @@ func (s *Server) moveOneVolume(
 	dstPath := filepath.Join(dstDir, fmt.Sprintf("%s-%s.qcow2", vm.Name, src.DiskName))
 	if dstPath == src.Path {
 		return status.Error(codes.FailedPrecondition, "source and destination resolve to the same path")
+	}
+	if err := refuseSymlinkTarget(dstPath); err != nil {
+		return err
 	}
 
 	// Every frame carries the disk's total size for the caller's bar.
@@ -852,7 +859,8 @@ func copyFileWithProgress(ctx context.Context, src, dst string, emit func(*pb.Mo
 	}
 	total := st.Size()
 
-	out, err := os.Create(dst)
+	// Never through a symlink at dst: the pool may be somewhere others write.
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return err
 	}

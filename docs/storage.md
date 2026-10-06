@@ -76,21 +76,36 @@ does an `Admin` binding scoped to a project. What counts as a host path:
 
 | Driver | Host path |
 |---|---|
-| `local` | `--target` (with no target the pool lives in `<data_dir>/disks`) |
+| `local` | `--target` (with no target the pool gets its own `<data_dir>/pools/<name>`) |
 | `dir` | `--target` (always) |
-| `nfs` | `--target`, and `--option options=…` (mount options reach mount(8) verbatim); with neither, the export is mounted under `<data_dir>/mounts` |
+| `nfs` | always: the export's server decides what the daemon finds there (files, and symlinks it would follow as root); also `--target` and `--option options=…` |
+| `ceph` | always (the cluster is remote storage), plus `--option conf=…` and `--option keyring=…` |
+| `iscsi` | always (the target's server decides what block devices appear) |
 | `btrfs` | `--source` |
-| `ceph` | `--option conf=…` and `--option keyring=…` |
 
-`iscsi`, `zfs`, `lvm-thin`, a `local` pool with no target and an `nfs` pool
-with neither a target nor mount options name no host path, so an operator with
-`storage.pool.write` on the pool's path may still create them.
+`zfs`, `lvm-thin` and a `local` pool with no target name no host path, so an
+operator with `storage.pool.write` on the pool's path may still create them.
+
+Every source is checked against its driver's form before any tool sees it —
+`server:/export` for nfs, a pool, dataset or volume-group name for ceph, zfs
+and lvm-thin, an `iqn.`/`eui.`/`naa.` name and `host[:port]` portal for iscsi,
+an absolute path for btrfs, nothing for local and dir — so no value can reach
+`mount`, `rbd`, `zfs`, `lvs` or `iscsiadm` as an option. The drivers also put
+`--` before positional arguments.
+
+NFS pools are always mounted `nosuid,nodev,noexec`, whatever `options=` says,
+and `nosymfollow` where the kernel supports it (Linux 5.10+); without it the
+daemon logs a WARN and mounts without. Disk files the daemon creates in a pool
+are created exclusively and never through a symlink.
 
 Some directories are refused to everyone, `Admin` included: the filesystem
-root; anything under `/bin`, `/boot`, `/dev`, `/etc`, `/lib*`, `/proc`, `/root`,
-`/run`, `/sbin`, `/sys`, `/usr`, `/var/run` or `/var/spool`; the daemon's PKI
-directory; the data directory and any directory containing it; and anything
-inside the data directory other than its `disks/` and `mounts/` areas. A target
+root; anything under `/bin`, `/boot`, `/dev`, `/etc`, `/home`, `/lib*`,
+`/proc`, `/root`, `/run`, `/sbin`, `/sys`, `/usr`, `/var/lib/libvirt`,
+`/var/run` or `/var/spool`; `/var/lib/litevirt` and any `/var/lib/litevirt-*`;
+the daemon's PKI directory; the data directory and any directory containing
+it; and anything inside the data directory other than its `disks/`, `mounts/`
+and `pools/` areas. The list is a backstop, not exhaustive: `/opt`, `/srv`,
+`/var/log` and `/var/tmp` are left to the admin who names them. A target
 is judged both as written and after resolving symlinks, so a link at an
 innocent name does not reach a refused directory. Authority is checked on the
 node the request enters, so during a rolling upgrade an entry node on an older
@@ -109,11 +124,19 @@ with an image-like extension — `.iso .img .qcow2 .qcow .raw .vmdk .vdi .vhd
 not start with `.`. It never replaces anything already at the name, file or
 symlink: delete the old file first.
 
-A pool created before these checks whose directory is now refused keeps
-listing its contents, but every upload and content delete is refused with
-`FailedPrecondition`, and the daemon logs an ERROR naming the pool. Nothing is
-moved or deleted for you: recreate the pool on an allowed directory and move
-its disks there.
+Content operations never reach a file a live VM disk uses. A pool listing
+leaves out files that a live disk of another pool (or of no pool) uses, and a
+content delete refuses any file a live disk uses, as its own file or as a
+backing file. This matters for a target-less `local` pool created before pools
+got their own directories: it shares `<data_dir>/disks` with every local VM
+disk on the host.
+
+A pool created before these checks whose directory or source is now refused
+keeps listing its contents, but nothing writes into it: uploads, content
+deletes, new VM disks, volume moves and replicas onto it, replica increments
+and promotes are refused with `FailedPrecondition`, it is never re-mounted for
+them, and the daemon logs an ERROR naming the pool. Nothing is moved or deleted
+for you: recreate the pool somewhere allowed and move its disks there.
 
 ## Compose example
 

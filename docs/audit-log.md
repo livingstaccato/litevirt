@@ -615,15 +615,30 @@ way out is an operator's assertion, as root on the node that holds the most
 complete history. The assertion must contain that node's **assert nonce**: 256
 random bits the node minted with its seeded marker, `<data_dir>/audit-seeded.json`
 (mode 0600). The nonce exists only in that file. It is never replicated, and no
-RPC, log line or audit row carries it, so only someone who can read the node's
-data_dir as root can produce it. Copy it into the assertion file and restart:
+RPC, log line or audit row carries it. Copy it into the assertion file and
+restart. The copy goes to a fresh 0600 temporary file that is then renamed over
+the target, so a file or symlink already at `audit-seeded-assert` is replaced,
+never written through:
 
 ```bash
-# <data_dir>/audit-seeded.json -> <data_dir>/audit-seeded-assert, never world-readable
-( umask 077; grep -o '"assert_nonce":"[0-9a-f]*"' /var/lib/litevirt/audit-seeded.json \
-    | cut -d'"' -f4 > /var/lib/litevirt/audit-seeded-assert )
+# <data_dir>/audit-seeded.json -> <data_dir>/audit-seeded-assert
+( umask 077; d=/var/lib/litevirt
+  t=$(mktemp "$d/.audit-seeded-assert.XXXXXX") &&
+  grep -o '"assert_nonce":"[0-9a-f]*"' "$d/audit-seeded.json" | cut -d'"' -f4 > "$t" &&
+  mv -fT "$t" "$d/audit-seeded-assert" || rm -f "$t" )
 systemctl restart litevirt
 ```
+
+The nonce keeps the assertion private only while nothing short of root can
+read or write data_dir. That is what the barrier actually is, and it is enforced
+elsewhere: storage pools cannot be created on or above data_dir or write into
+one that reaches it, a VM's ISO and other spec host paths cannot point into it,
+and image import cannot pull a host file into a guest, by path or through a
+qcow2/VMDK backing or data-file reference. Someone who could write data_dir
+could replace the marker, or state.db itself, and no secret kept there would
+stop them. Within that barrier the nonce stops a writer who can drop the
+assertion file without reading the marker, a stale file outliving its state.db,
+and a value learned over an RPC.
 
 The node's voter incarnation does **not** work: it is not secret. `GetRecoveryClaim`
 returns it to an operator, the replicated `voter_configs` rows carry every

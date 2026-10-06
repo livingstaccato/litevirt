@@ -321,17 +321,24 @@ func DecideAuditSeeded(ctx context.Context, c *Client, host string) (bool, error
 // re-added host fork its audit chain: the assertion is the operator taking
 // that on.
 //
-// The content requirement is the defence against anyone able to put a file in
-// data_dir without being root on the node — an operator with a storage pool
-// aimed at it, for one. The nonce is the only value that works: it exists only
-// in the 0600 marker, is never replicated, and no RPC, log line or audit row
-// carries it. (The voter incarnation, which an earlier build checked for
-// instead, is NOT secret: GetRecoveryClaim returns it to an operator, the
-// replicated voter_configs rows carry every voter's, and GetVoterConfig and
-// InspectRecoveryClaim show it to a viewer.) The marker is bound to this
-// state.db's incarnation and the nonce to the marker, so a replaced state.db
-// gets a new nonce and a file left behind for the old one is not applied; the
-// nonce is replaced once an assertion is applied, too.
+// What keeps a non-root user from asserting is that nothing short of root can
+// read or write data_dir: storage pools cannot be created on or above it, nor
+// write into one that reaches it; a VM's ISO and other host paths named in a
+// spec cannot point into it; and image import cannot read a host file into a
+// guest, by path or through a qcow2/VMDK backing or data-file reference. Those
+// confinements are the barrier. Someone who can write data_dir can replace the
+// marker, or state.db itself, and no secret kept there stops them.
+//
+// Within that, the nonce stops what the confinements leave: a writer who can
+// drop the assertion file but not read the marker, a value learned from an RPC
+// — the voter incarnation is NOT secret: GetRecoveryClaim returns it to an
+// operator, the replicated voter_configs rows carry every voter's, and
+// GetVoterConfig and InspectRecoveryClaim show it to a viewer — and a stale
+// file outliving its state.db. It exists only in the 0600 marker, is never
+// replicated, and no RPC, log line or audit row carries it. The marker is bound
+// to this state.db's incarnation and the nonce to the marker, so a replaced
+// state.db gets a new nonce and a file left behind for the old one is not
+// applied; the nonce is replaced once an assertion is applied, too.
 const AuditSeededAssertFileName = "audit-seeded-assert"
 
 // consumeAuditSeededAssertion applies an operator's assertion, if a valid one

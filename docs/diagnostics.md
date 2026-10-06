@@ -1444,6 +1444,10 @@ check `lv health` for replication and gossip, and that the survivors are
 reachable from it. `waiting_for` saying the row "does not hash" means the
 replica holds a different history than the cluster had for the name — the
 hold stays closed rather than fork the chain; investigate before anything else.
+If no node will ever hold the history, removing `<pki_dir>/audit-rejoin.json`
+on the host and restarting its daemon ends the hold at the cost of a permanent
+fork finding for that host
+([audit-log.md](audit-log.md#rebuilding-a-host-under-its-old-name)).
 
 ### Observer stalled (`observer_stalled`)
 

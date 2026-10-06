@@ -95,8 +95,10 @@ an absolute path for btrfs, nothing for local and dir — so no value can reach
 `mount`, `rbd`, `zfs`, `lvs` or `iscsiadm` as an option. The drivers also put
 `--` before positional arguments.
 
-NFS pools are always mounted `nosuid,nodev,noexec,nosymfollow`, whatever
-`options=` says. `nosymfollow` needs Linux 5.10+ and a mount.nfs that passes
+NFS pools are always mounted `nosuid,nodev,noexec,nosharecache,nosymfollow`,
+whatever `options=` says. `nosharecache` gives each pool's mount its own
+superblock, so two pools on one server each report their own export as the
+mount source. `nosymfollow` needs Linux 5.10+ and a mount.nfs that passes
 it on; where it is missing the mount is refused, with an error saying so, rather
 than made weaker. An export that is already mounted without these flags — mounted
 by hand, or by an earlier build — is never remounted: the pool is refused

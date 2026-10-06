@@ -36,12 +36,12 @@ func TestNFSMountIsHardened(t *testing.T) {
 				t.Fatalf("mount args = %q, want -t nfs -o <opts> -- <source> <dir>", mount)
 			}
 			got := strings.Split(mount[3], ",")
-			for _, want := range []string{"nosuid", "nodev", "noexec", "nosymfollow"} {
+			for _, want := range []string{"nosuid", "nodev", "noexec", "nosymfollow", "nosharecache"} {
 				if !hasOpt(got, want) {
 					t.Errorf("mount options %q lack %s", mount[3], want)
 				}
 			}
-			for _, undo := range []string{"suid", "dev", "exec", "symfollow"} {
+			for _, undo := range []string{"suid", "dev", "exec", "symfollow", "sharecache"} {
 				if hasOpt(got, undo) {
 					t.Errorf("mount options %q keep %s", mount[3], undo)
 				}

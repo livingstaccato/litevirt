@@ -418,16 +418,21 @@ func (d *nfsDriver) DeleteDisk(_ context.Context, path string) error {
 // decides its contents, so nothing on it may be a setuid binary, a device
 // node or an executable as far as this host is concerned. Pool content is
 // disk images; qemu reads them, nothing executes them.
-var nfsHardening = []string{"nosuid", "nodev", "noexec"}
+//
+// nosharecache gives each mount its own superblock. Without it two mounts of
+// one server share the first mount's, and the kernel reports that mount's
+// spelling of the server as the source of both: a pool mounted by address
+// beside one mounted by name would then fail the source check at every use.
+var nfsHardening = []string{"nosuid", "nodev", "noexec", "nosharecache"}
 
 // hardenNFSOptions appends nfsHardening to opts, and drops any option that
-// would undo it (suid, dev, exec).
+// would undo it (suid, dev, exec, sharecache).
 func hardenNFSOptions(opts string) string {
 	var out []string
 	for _, o := range strings.Split(opts, ",") {
 		o = strings.TrimSpace(o)
 		switch o {
-		case "", "suid", "dev", "exec", "symfollow", "nosymfollow":
+		case "", "suid", "dev", "exec", "symfollow", "nosymfollow", "sharecache":
 			continue
 		}
 		out = append(out, o)

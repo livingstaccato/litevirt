@@ -151,7 +151,7 @@ func TestNFSPrepareUsesRunnerAndTimeout(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Prepare error = %v, want deadline exceeded", err)
 	}
-	if len(calls) != 2 || calls[0] != "mountpoint -q -- "+d.targetOverride || !strings.HasPrefix(calls[1], "mount -t nfs -o vers=4,hard,intr,nosuid,nodev,noexec,nosymfollow -- server:/export ") {
+	if len(calls) != 2 || calls[0] != "mountpoint -q -- "+d.targetOverride || !strings.HasPrefix(calls[1], "mount -t nfs -o vers=4,hard,intr,nosuid,nodev,noexec,nosharecache,nosymfollow -- server:/export ") {
 		t.Fatalf("calls = %v, want mountpoint then mount through runner", calls)
 	}
 }

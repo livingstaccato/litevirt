@@ -30,6 +30,9 @@ type ownerEpochOnlyGate struct{}
 func (ownerEpochOnlyGate) ExecutionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }
+func (ownerEpochOnlyGate) DrainExecutionGate(context.Context) health.GateResult {
+	return health.GateResult{OK: true}
+}
 func (ownerEpochOnlyGate) DecisionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }

@@ -447,7 +447,9 @@ curl -X POST -H "Authorization: Bearer $TOKEN" \
 curl -X DELETE -H "Authorization: Bearer $TOKEN" \
   "http://10.0.50.10:7446/api/v1/networks/app-net?force=true"
 
-# Drain a host before maintenance
+# Drain a host before maintenance. Each VM's progress frame carries a
+# "strategy": MIGRATE_LIVE or MIGRATE_COLD for the move made or tried, and
+# MIGRATE_NONE for a VM the drain did not try to move ("error" says why).
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   "http://10.0.50.10:7446/api/v1/hosts/host-a/drain"
 

@@ -43,6 +43,9 @@ type quotaOnlyGate struct{}
 func (quotaOnlyGate) ExecutionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }
+func (quotaOnlyGate) DrainExecutionGate(context.Context) health.GateResult {
+	return health.GateResult{OK: true}
+}
 func (quotaOnlyGate) DecisionGate(context.Context) health.GateResult {
 	return health.GateResult{OK: true}
 }

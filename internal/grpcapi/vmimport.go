@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -101,7 +102,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	// From here to the last converted disk the import writes; one import at a
-	// time per host, so its free-space checks hold.
+	// time per host, so its free-space checks hold. Nothing that waits on the
+	// client happens while it is held: a client that stops reading would hold
+	// every other import on the host.
 	releaseWrites, err := s.acquireImportWrites(ctx)
 	if err != nil {
 		return err
@@ -121,6 +124,7 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 	}
 
 	if first.Inspect {
+		releaseWrites()
 		return s.sendImportInspect(stream, fv, project)
 	}
 
@@ -176,6 +180,19 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			_ = os.Remove(p)
 		}
 	}
+	// Convert progress goes to the client from its own goroutine, and is
+	// dropped while a send is still pending: the conversion never waits on the
+	// client while it holds the import writes.
+	progress := make(chan *pb.ImportVMProgress, 1)
+	progressSent := make(chan struct{})
+	go func() {
+		defer close(progressSent)
+		for p := range progress {
+			_ = stream.Send(p)
+		}
+	}()
+	stopProgress := sync.OnceFunc(func() { close(progress) })
+	defer stopProgress()
 	for i := range fv.Disks {
 		d := &fv.Disks[i]
 		if d.IsCDROM {
@@ -198,14 +215,21 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 				cleanupDisks()
 				return err
 			}
-			need += limit
+			// The copy lives until its conversion is done, so on one
+			// filesystem the two need room together.
+			if sameFilesystem(importDir, poolDir) {
+				need += limit
+			}
 		}
 		if err := s.requireImportSpace(poolDir, need, "converting disk "+d.Name); err != nil {
 			cleanupDisks()
 			return err
 		}
 		if err := convertForeignDisk(ctx, d.LocalPath, d.Format, dst, importDir, importSourceLimit(d.CapacityBytes), func(pct float32) {
-			_ = stream.Send(&pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk})
+			select {
+			case progress <- &pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk}:
+			default:
+			}
 		}); err != nil {
 			cleanupDisks()
 			return status.Errorf(codes.Internal, "convert disk %q: %v", d.Name, err)
@@ -220,6 +244,11 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			d.CapacityBytes = info.VirtualSize
 		}
 	}
+	// The writes are done; let the next import write before anything here
+	// waits on this one's client again.
+	releaseWrites()
+	stopProgress()
+	<-progressSent
 
 	// Re-check quota against the real converted sizes before committing.
 	if err := s.admitImport(ctx, project, fv); err != nil {
@@ -590,7 +619,7 @@ func (s *Server) parseImportSource(ctx context.Context, format, srcPath, importD
 			return nil, err
 		}
 		defer f.Close()
-		ovfPath, err := vmimport.UnpackOVA(f, importDir)
+		ovfPath, err := vmimport.UnpackOVA(f, importDir, int64(min(s.importExtractBudget(importDir), 1<<62)))
 		if err != nil {
 			return nil, err
 		}

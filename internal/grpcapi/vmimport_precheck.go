@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -298,4 +299,20 @@ func (s *Server) requireImportSpace(dir string, need uint64, what string) error 
 			what, need>>20, s.hostName, avail>>20, headroom>>20)
 	}
 	return nil
+}
+
+// sameFilesystem reports whether a and b are on one filesystem. An unreadable
+// path counts as the same, which charges more space rather than less.
+func sameFilesystem(a, b string) bool {
+	fa, errA := os.Stat(a)
+	fb, errB := os.Stat(b)
+	if errA != nil || errB != nil {
+		return true
+	}
+	sa, okA := fa.Sys().(*syscall.Stat_t)
+	sb, okB := fb.Sys().(*syscall.Stat_t)
+	if !okA || !okB {
+		return true
+	}
+	return sa.Dev == sb.Dev
 }

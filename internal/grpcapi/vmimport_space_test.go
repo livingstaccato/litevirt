@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,8 +61,8 @@ func TestImportVM_WaitsForAnotherImportsWrites(t *testing.T) {
 		Chunk:   []byte("name: imp-wait\ncores: 1\nmemory: 512\nscsi0: local-lvm:imp-wait-disk-0,size=1M\n"),
 		DiskMap: map[string]string{"scsi0": raw},
 	}}}
-	if err := s.ImportVM(st); err == nil {
-		t.Fatal("an import ran its writes while another import held them")
+	if err := s.ImportVM(st); status.Code(err) != codes.Aborted || !strings.Contains(err.Error(), "another import") {
+		t.Fatalf("import while another held the writes: %v, want it to wait for the slot and give up", err)
 	}
 	if rec, _ := corrosion.GetVM(context.Background(), s.db, "imp-wait"); rec != nil {
 		t.Fatal("an import that never got to write persisted a row")
@@ -91,4 +92,90 @@ func TestAcquireImportWrites_OneHolderAtATime(t *testing.T) {
 		t.Fatal("a double release let two imports hold the writes")
 	}
 	r2()
+}
+
+// stuckStream is a client that stops reading: Send blocks until the test ends.
+type stuckStream struct {
+	fakeImportStream
+	entered chan struct{}
+	once    sync.Once
+	unblock chan struct{}
+}
+
+func (f *stuckStream) Send(p *pb.ImportVMProgress) error {
+	f.once.Do(func() { close(f.entered) })
+	<-f.unblock
+	return nil
+}
+
+// progressQemuImg is stubQemuImg that also reports convert progress, so the
+// import sends to its client during the conversion.
+func progressQemuImg(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	shim := "#!/bin/sh\n" +
+		"if [ \"$1\" = info ]; then echo '{\"format\":\"raw\",\"virtual-size\":1048576}'; exit 0; fi\n" +
+		"printf '    (50.00/100%%)\\r'\n" +
+		"prev=\"\"; last=\"\"\n" +
+		"for a; do prev=\"$last\"; last=\"$a\"; done\n" +
+		"cp \"$prev\" \"$last\"\n"
+	if err := writeFileHelper(dir+"/qemu-img", []byte(shim)); err != nil {
+		t.Fatal(err)
+	}
+	if err := chmodHelper(dir+"/qemu-img", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+envPath())
+}
+
+func smallImportFrame(t *testing.T, name string, inspect bool) *pb.ImportVMRequest {
+	t.Helper()
+	raw := t.TempDir() + "/disk0.raw"
+	if err := writeFileHelper(raw, make([]byte, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	return &pb.ImportVMRequest{
+		Name: name, SourceFormat: "proxmox", Inspect: inspect,
+		Chunk:   []byte("name: " + name + "\ncores: 1\nmemory: 512\nscsi0: local-lvm:" + name + "-disk-0,size=1M\n"),
+		DiskMap: map[string]string{"scsi0": raw},
+	}
+}
+
+// A client that stops reading its progress must not hold the host's import
+// writes: every other import on the host would wait for it forever.
+func TestImportVM_AClientThatStopsReadingDoesNotHoldOtherImports(t *testing.T) {
+	for _, inspect := range []bool{false, true} {
+		name := "stuck"
+		if inspect {
+			name = "stuck-inspect"
+		}
+		t.Run(name, func(t *testing.T) {
+			s := testServer(t)
+			s.dataDir = t.TempDir()
+			admissionHost(t, s)
+			s.virt = libvirtfake.New()
+			progressQemuImg(t)
+
+			stuck := &stuckStream{
+				fakeImportStream: fakeImportStream{ctx: adminCtx(), frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-a", inspect)}},
+				entered:          make(chan struct{}),
+				unblock:          make(chan struct{}),
+			}
+			done := make(chan struct{})
+			go func() { _ = s.ImportVM(stuck); close(done) }()
+			t.Cleanup(func() { close(stuck.unblock); <-done })
+			select {
+			case <-stuck.entered:
+			case <-time.After(20 * time.Second):
+				t.Fatal("the first import never sent to its client")
+			}
+
+			ctx, cancel := context.WithTimeout(adminCtx(), 10*time.Second)
+			defer cancel()
+			st := &fakeImportStream{ctx: ctx, frames: []*pb.ImportVMRequest{smallImportFrame(t, "imp-b", false)}}
+			if err := s.ImportVM(st); err != nil {
+				t.Fatalf("an import behind a client that stopped reading: %v", err)
+			}
+		})
+	}
 }

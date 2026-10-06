@@ -12,7 +12,7 @@ import (
 func TestCheckReadFile_RefusedAndAllowed(t *testing.T) {
 	data := t.TempDir()
 	pki := filepath.Join(t.TempDir(), "pki")
-	for _, d := range []string{pki, filepath.Join(data, "disks"), filepath.Join(data, "cloudinit")} {
+	for _, d := range []string{pki, filepath.Join(data, "pools", "isos"), filepath.Join(data, "disks"), filepath.Join(data, "cloudinit")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -24,7 +24,9 @@ func TestCheckReadFile_RefusedAndAllowed(t *testing.T) {
 		return p
 	}
 	key := write(filepath.Join(pki, "host.key"))
-	pool := write(filepath.Join(data, "disks", "debian.iso"))
+	pool := write(filepath.Join(data, "pools", "isos", "debian.iso"))
+	// disks/ holds every VM's local disks across projects; it is not a pool.
+	disks := write(filepath.Join(data, "disks", "other.iso"))
 	ci := write(filepath.Join(data, "cloudinit", "vm.iso"))
 	plain := write(filepath.Join(t.TempDir(), "x.iso"))
 
@@ -33,7 +35,7 @@ func TestCheckReadFile_RefusedAndAllowed(t *testing.T) {
 			t.Errorf("%s refused: %v", p, err)
 		}
 	}
-	for _, p := range []string{key, ci, "/etc/hostname", "/proc/self/environ", "rel.iso", plain + "/.."} {
+	for _, p := range []string{key, ci, disks, "/etc/hostname", "/proc/self/environ", "rel.iso", plain + "/.."} {
 		if err := CheckReadFile(p, data, pki); err == nil {
 			t.Errorf("%s allowed", p)
 		}

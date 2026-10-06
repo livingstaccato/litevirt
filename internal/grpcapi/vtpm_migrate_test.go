@@ -28,6 +28,31 @@ func insertFirmwareVM(t *testing.T, ctx context.Context, s *Server, name, state 
 	}
 }
 
+// A firmware VM migrated without --cold is told the command that works: a
+// running one to stop first, a stopped one only to add --cold — not to stop a
+// VM that is already stopped.
+//
+// Mutation: give the stopped VM the running VM's message — it names
+// `lv stop fw` and goes red.
+func TestMigrateVM_FirmwareNotColdNamesTheCommandThatWorks(t *testing.T) {
+	for _, tc := range []struct {
+		state    string
+		wantStop bool
+	}{{"running", true}, {"stopped", false}} {
+		s := testServerWithLocks(t)
+		ctx := adminCtx()
+		insertFirmwareVM(t, ctx, s, "fw", tc.state)
+		err := s.MigrateVM(&pb.MigrateVMRequest{VmName: "fw", TargetHost: "t1"}, &mockMigrateStream{ctx: ctx})
+		if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "`lv migrate fw t1 --cold`") {
+			t.Errorf("%s firmware VM migrated live = %v, want FailedPrecondition naming `lv migrate fw t1 --cold`", tc.state, err)
+			continue
+		}
+		if got := strings.Contains(err.Error(), "`lv stop fw`"); got != tc.wantStop {
+			t.Errorf("%s firmware VM migrated live: names `lv stop fw` = %v, want %v (%v)", tc.state, got, tc.wantStop, err)
+		}
+	}
+}
+
 // Live migration of an SB/vTPM VM is refused (carry unvalidated; source must not
 // be wiped on an unverified carry) — cold only.
 func TestMigrateVM_FirmwareLiveRefused(t *testing.T) {

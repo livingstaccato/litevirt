@@ -209,6 +209,11 @@ func (s *Server) migrateOwnedVM(ctx context.Context, req *pb.MigrateVMRequest, v
 	coldStopped := req.Strategy == pb.MigrateStrategy_MIGRATE_COLD && vm.State == "stopped"
 	if fwVM {
 		if req.Strategy != pb.MigrateStrategy_MIGRATE_COLD {
+			if vm.State == "stopped" {
+				return status.Errorf(codes.FailedPrecondition,
+					"Secure Boot / vTPM VM %q must be migrated cold: live firmware carry is not yet a validated path — "+
+						"`lv migrate %s %s --cold`", req.VmName, req.VmName, req.TargetHost)
+			}
 			return status.Errorf(codes.FailedPrecondition,
 				"Secure Boot / vTPM VM %q must be migrated cold (--cold), and stopped: live firmware carry is not yet a validated path — "+
 					"stop it (`lv stop %s`), then `lv migrate %s %s --cold`", req.VmName, req.VmName, req.VmName, req.TargetHost)

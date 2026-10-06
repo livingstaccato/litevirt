@@ -179,6 +179,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			_ = stream.Send(&pb.ImportVMProgress{Phase: "convert", ConvertPct: pct, CurrentDisk: curDisk})
 		}); err != nil {
 			cleanupDisks()
+			if status.Code(err) == codes.AlreadyExists {
+				return err
+			}
 			return status.Errorf(codes.Internal, "convert disk %q: %v", d.Name, err)
 		}
 		convertedPaths = append(convertedPaths, dst)
@@ -779,8 +782,20 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		return err
 	}
 
-	tmp := dst + ".tmp"
-	_ = os.Remove(tmp)
+	// A new file only. Without a pool the destination is <data_dir>/disks,
+	// which holds every project's pool-less disks, and "<vm>-<disk>.qcow2" can
+	// be another VM's disk (VM "a" disk "b-root" against VM "a-b" disk
+	// "root"): an existing file is refused, never replaced.
+	if err := refuseExistingFile(dst); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(filepath.Dir(dst), "import-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create convert temp: %w", err)
+	}
+	tmp := f.Name()
+	_ = f.Close()
+	defer os.Remove(tmp) // gone after a successful place
 	args := []string{"convert", "-p", "-O", "qcow2"}
 	if srcFormat != "" {
 		args = append(args, "-f", srcFormat)
@@ -818,11 +833,7 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("finalize converted disk: %w", err)
-	}
-	return nil
+	return placeNoClobber(tmp, dst)
 }
 
 type qemuImgInfo struct {

@@ -537,6 +537,9 @@ lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name a
 #   --preserve-mac                 keep source MACs (default: regenerate)
 #   --server-path <path>           use a file/dir already staged on the target host
 #   --inspect                      print the mapping + warnings, import nothing
+#   Each disk lands as a NEW <vm>-<disk>.qcow2 in the target pool (or
+#   <data_dir>/disks without one); an existing file of that name is refused
+#   (AlreadyExists), never replaced.
 ```
 
 ## Snapshots

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // encodeSGs turns a list of security-group names into JSON (or empty
@@ -780,6 +781,42 @@ func DisksReferencingPath(ctx context.Context, c *Client, path string) ([]DiskRe
 		 FROM vm_disks
 		 WHERE (path = ? OR backing_image = ? OR backing_disk = ?) AND deleted_at IS NULL`,
 		path, path, path)
+	if err != nil {
+		return nil, err
+	}
+	disks := make([]DiskRecord, len(rows))
+	for i, r := range rows {
+		disks[i] = DiskRecord{
+			VMName:        r.String("vm_name"),
+			DiskName:      r.String("disk_name"),
+			HostName:      r.String("host_name"),
+			Path:          r.String("path"),
+			SizeBytes:     r.Int64("size_bytes"),
+			BackingImage:  r.String("backing_image"),
+			StorageType:   r.String("storage_type"),
+			StorageVolume: r.String("storage_volume"),
+			TargetDev:     r.String("target_dev"),
+			BackingDisk:   r.String("backing_disk"),
+		}
+	}
+	return disks, nil
+}
+
+// DisksReferencingPathSuffix returns every non-deleted disk record whose
+// path, backing_image or backing_disk ends in "/"+rel. It finds references to
+// a file in a pool another host mounts at a different directory: the caller
+// then decides, per row, whether the prefix is that host's mount of the same
+// pool. rel is matched literally (LIKE wildcards in it are escaped).
+func DisksReferencingPathSuffix(ctx context.Context, c *Client, rel string) ([]DiskRecord, error) {
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace("/" + rel)
+	pat := "%" + esc
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, disk_name, host_name, path, size_bytes,
+			backing_image, storage_type, storage_volume, target_dev, backing_disk
+		 FROM vm_disks
+		 WHERE (path LIKE ? ESCAPE '\' OR backing_image LIKE ? ESCAPE '\' OR backing_disk LIKE ? ESCAPE '\')
+		   AND deleted_at IS NULL`,
+		pat, pat, pat)
 	if err != nil {
 		return nil, err
 	}

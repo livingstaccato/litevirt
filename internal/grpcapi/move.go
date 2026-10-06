@@ -22,6 +22,7 @@ import (
 	"github.com/litevirt/litevirt/internal/compose"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/libvirt"
+	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
@@ -783,9 +784,6 @@ func fileBasedPoolDir(dataDir string, p StoragePoolRef) (string, error) {
 	return "", fmt.Errorf("driver %q: not a file-based pool", p.Driver)
 }
 
-// convertQcow2 invokes qemu-img convert -p (progress on stdout). We parse
-// "(NN.NN/100%)" lines and forward them as progress chunks. If qemu-img
-// is missing we fall back to a simple file copy.
 // qemuImgAvailable reports whether qemu-img is on PATH. Callers that would
 // otherwise fall back to a verbatim byte copy must NOT do so for a raw source
 // (the copy would land raw bytes in a qcow2-declared file) — see promote.
@@ -794,14 +792,53 @@ func qemuImgAvailable() bool {
 	return err == nil
 }
 
+// convertQcow2 converts a VM disk — a qcow2 the daemon created — to a new
+// qcow2 at dst. Its backing chain (an image-store base, a linked clone's base)
+// is allowed, but every file in it is pre-checked (precheckQcow2Input).
 func convertQcow2(ctx context.Context, src, dst string, emit func(*pb.MoveVolumeProgress) error) error {
-	if _, err := exec.LookPath("qemu-img"); err != nil {
+	return convertImage(ctx, src, "qcow2", anyBacking, dst, emit)
+}
+
+// anyBacking accepts a backing file wherever it is; precheckQcow2Input still
+// judges the backing file's own header.
+func anyBacking(string) error { return nil }
+
+// convertImage is the one place a disk image is converted with qemu-img. It
+// invokes qemu-img convert -p (progress on stdout), parsing "(NN.NN/100%)"
+// lines into progress chunks.
+//
+// qemu-img never probes: the source format is NAMED (-f) by the caller from
+// what it knows — a VM disk is qcow2, a replica's format is in its record. A
+// probe on bytes a guest wrote (raw guest content) would obey a qcow2 header
+// the guest planted and read the backing or data file it names. A qcow2
+// source's header is pre-checked before qemu-img opens it: no external data
+// file, one backing format at most, and a backing file only where
+// allowBacking accepts its resolved path (nil: none at all). The output, a
+// fresh qcow2, must be standalone.
+//
+// Without qemu-img a qcow2 source is byte-copied (it was pre-checked); a raw
+// source cannot be, since the copy would land raw bytes in a qcow2-declared
+// file.
+func convertImage(ctx context.Context, src, srcFormat string, allowBacking func(string) error, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	switch srcFormat {
+	case "qcow2":
+		if err := precheckQcow2Input(src, allowBacking); err != nil {
+			return status.Errorf(codes.FailedPrecondition, "%s: %v", filepath.Base(src), err)
+		}
+	case "raw":
+	default:
+		return status.Errorf(codes.InvalidArgument, "source format %q: only raw or qcow2 is converted", srcFormat)
+	}
+	if !qemuImgAvailable() {
+		if srcFormat != "qcow2" {
+			return status.Error(codes.FailedPrecondition, "converting a raw image needs qemu-img")
+		}
 		return copyFileWithProgress(ctx, src, dst, emit)
 	}
 	// -U (force-share) lets us read a source image a running VM holds open —
 	// required for crash-consistent replication/move of a live disk; harmless
 	// for an offline (stopped) source.
-	cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-U", "-p", "-O", "qcow2", src, dst)
+	cmd := exec.CommandContext(ctx, "qemu-img", "convert", "-U", "-p", "-f", srcFormat, "-O", "qcow2", src, dst)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -828,6 +865,9 @@ func convertQcow2(ctx context.Context, src, dst string, emit func(*pb.MoveVolume
 	if err := cmd.Wait(); err != nil {
 		return err
 	}
+	if err := qcow2.AssertStandalone(dst); err != nil {
+		return status.Errorf(codes.FailedPrecondition, "converted image is not standalone: %v", err)
+	}
 	return nil
 }
 
@@ -847,6 +887,9 @@ func copyNoClobber(ctx context.Context, src, dst string, emit func(*pb.MoveVolum
 	_ = f.Close()
 	defer os.Remove(tmp) // gone after a successful place
 	if err := convertQcow2(ctx, src, tmp, emit); err != nil {
+		if _, ok := status.FromError(err); ok {
+			return err
+		}
 		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
 	}
 	return placeNoClobber(tmp, dst)

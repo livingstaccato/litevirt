@@ -15,12 +15,8 @@ import (
 // zlib compression, and writes a standalone qcow2 image to dst.
 // The destination has no backing file. opts may be nil for defaults.
 func Convert(ctx context.Context, src, dst string, opts *Options) error {
-	tmpPath := dst + ".tmp"
-	// A crash's leftover temp (or anything planted at the name) is unlinked,
-	// never followed; Create below then makes the temp exclusively.
-	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clear stale temp: %w", err)
-	}
+	// A fresh, unpredictable temp; Create below makes it exclusively.
+	tmpPath := tempSibling(dst)
 
 	err := doConvert(ctx, src, tmpPath, opts)
 	if err != nil {

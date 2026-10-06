@@ -934,7 +934,12 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			}
 			tmpLive := tf.Name()
 			_ = tf.Close()
-			if err := convertQcow2(ctx, replicaPath, tmpLive, emit); err != nil {
+			// The replica's format comes from its record, never a probe: an
+			// incremental replica is raw GUEST content, and a probe would
+			// obey a qcow2 header the guest wrote into it. A qcow2 replica
+			// must be standalone (nil: no backing at all). convertImage
+			// pre-checks the input and requires a standalone output.
+			if err := convertImage(ctx, replicaPath, replicaRec.Format, nil, tmpLive, emit); err != nil {
 				os.Remove(tmpLive)
 				return status.Errorf(codes.Internal, "copy replica: %v", err)
 			}

@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // publishNoReplace makes the finished temp image visible at path only if
@@ -13,6 +16,10 @@ import (
 // another VM's disk — "<vm>-<disk>.qcow2" is ambiguous across hyphens, and a
 // pool can be shared by every project. The error wraps fs.ErrExist. A
 // filesystem without hard links is a refusal, not a fallback to rename.
+//
+// The temp's own name must then go. If it cannot be removed, the published
+// name is withdrawn and the call fails: a surviving temp would be a second
+// link to what becomes a live disk.
 func publishNoReplace(tmpPath, path string) error {
 	if err := os.Link(tmpPath, path); err != nil {
 		if errors.Is(err, fs.ErrExist) {
@@ -20,32 +27,16 @@ func publishNoReplace(tmpPath, path string) error {
 		}
 		return fmt.Errorf("publish %s: %w", path, err)
 	}
-	_ = os.Remove(tmpPath)
+	if err := os.Remove(tmpPath); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("remove the temp's second link %s (the publish was withdrawn): %w", tmpPath, err)
+	}
 	return nil
 }
 
-// incompatExternalData is the qcow2 incompatible-feature bit for an external
-// data file: the image's clusters live in another file the header names.
-const incompatExternalData = 1 << 2
-
-// AssertStandalone refuses a qcow2 image that reads any other file: one with a
-// backing file, or with an external data file. Use it on an image built from
-// untrusted bytes before it is placed where a VM will open it.
-func AssertStandalone(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	h, err := readHeader(f)
-	if err != nil {
-		return err
-	}
-	if h.BackingFileOffset != 0 || h.BackingFileSize != 0 {
-		return fmt.Errorf("%s names a backing file; it is not a standalone image", path)
-	}
-	if h.IncompatibleFeatures&incompatExternalData != 0 {
-		return fmt.Errorf("%s uses an external data file; it is not a standalone image", path)
-	}
-	return nil
+// tempSibling is a fresh, unpredictable temp name beside path, not yet
+// created: ".<base>.<random>.tmp". Two creates of one path never share a
+// temp, and nothing can be planted at a name nobody can guess.
+func tempSibling(path string) string {
+	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+"."+randid.New()+".tmp")
 }

@@ -234,6 +234,19 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, targetHost, ts string) error {
 	key := replicaScheduleKey(sched)
 	rec := newReplicaRecord(vm.Project, sched.VMName, src.DiskName, key, ts, "qcow2")
+	// The receiver proves it records replicas BEFORE anything is spent on
+	// it: no full local copy for a host that would refuse it.
+	client, closeConn, err := s.dialPeer(ctx, targetHost)
+	if err != nil {
+		return fmt.Errorf("reach target host %q: %w", targetHost, err)
+	}
+	defer closeConn()
+
+	if err := proveReplicaRecords(ctx, client, sched.TargetPool, targetHost, rec.Project, rec.VM); err != nil {
+		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: %v", src.DiskName, sched.TargetPool, targetHost, err))
+		return err
+	}
+
 	scratchDir := filepath.Join(s.dataDir, "replicate-scratch")
 	if err := os.MkdirAll(scratchDir, 0o755); err != nil {
 		return fmt.Errorf("scratch dir: %w", err)
@@ -252,16 +265,6 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 		return fmt.Errorf("local scratch replicate: %w", err)
 	}
 
-	client, closeConn, err := s.dialPeer(ctx, targetHost)
-	if err != nil {
-		return fmt.Errorf("reach target host %q: %w", targetHost, err)
-	}
-	defer closeConn()
-
-	if err := proveReplicaRecords(ctx, client, sched.TargetPool, targetHost, rec.Project, rec.VM); err != nil {
-		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: %v", src.DiskName, sched.TargetPool, targetHost, err))
-		return err
-	}
 	if err := streamReplicaToPool(ctx, client, scratch, sched.TargetPool, targetHost, rec); err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: upload: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return fmt.Errorf("stream to %q: %w", targetHost, err)

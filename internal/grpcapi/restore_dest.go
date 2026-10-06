@@ -19,6 +19,7 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -311,17 +312,13 @@ func (s *Server) diskImageFromBackup(ctx context.Context, contentFormat, restore
 	case pbsstore.ContentGuestRaw:
 		srcFormat = "raw"
 	case pbsstore.ContentDiskFile:
-		info, err := qcow2.Info(restored)
-		if err != nil {
-			return "", status.Errorf(codes.FailedPrecondition, "in_place: the backed-up disk file is not a qcow2 image: %v", err)
-		}
-		if info.BackingFile != "" {
-			images := filepath.Join(s.dataDir, "images")
-			if !filepath.IsAbs(info.BackingFile) || !safename.Contains(images, info.BackingFile) || info.BackingFormat != "qcow2" {
-				return "", status.Errorf(codes.FailedPrecondition,
-					"in_place: the backed-up disk file names backing file %q (format %q); only a qcow2 base in %s is accepted",
-					info.BackingFile, info.BackingFormat, images)
-			}
+		// The container's header is judged BEFORE qemu-img opens it: no
+		// external data file (qemu-img would copy whatever file it names
+		// into a perfectly standalone output), one backing format, and a
+		// backing file only as a standalone qcow2 base inside this host's
+		// image store, resolved through symlinks.
+		if err := precheckQcow2Input(restored, imageStoreBaseOnly(s.dataDir)); err != nil {
+			return "", status.Errorf(codes.FailedPrecondition, "in_place: the backed-up disk file is refused: %v", err)
 		}
 		srcFormat = "qcow2"
 	default:
@@ -349,11 +346,19 @@ func (s *Server) diskImageFromBackup(ctx context.Context, contentFormat, restore
 }
 
 // diskReferencesAnyHost returns every disk row, on ANY host, that uses path —
-// as its own file, a backing image or a linked clone's base — matched on the
-// path as given and as resolved through symlinks. vm_disks is replicated, so
-// on shared storage a VM another host runs is seen here too; liveDiskOwners'
-// this-host filter is right for a host-local directory and wrong for a
-// replica or a restore target another host may be reading.
+// as its own file, a backing image or a linked clone's base. vm_disks is
+// replicated, so on shared storage a VM another host runs is seen here too;
+// liveDiskOwners' this-host filter is right for a host-local directory and
+// wrong for a replica or a restore target another host may be reading.
+//
+// A row matches in either of two ways:
+//   - by path: the path as given, or as resolved through symlinks here;
+//   - by pool: path lies in one of this host's file-based pools, and the row
+//     names the same file relative to the SAME pool as another host has it —
+//     a pool on shared storage can be mounted at /mnt/dr on one host and
+//     /srv/dr on another (poolIdentity). Where the other host's pool
+//     directory cannot be told from its row, the row is taken as a match:
+//     a false match keeps a file, a missed one deletes a running VM's disk.
 func (s *Server) diskReferencesAnyHost(ctx context.Context, path string) ([]corrosion.DiskRecord, error) {
 	paths := []string{filepath.Clean(path)}
 	if r, err := filepath.EvalSymlinks(path); err == nil && r != paths[0] {
@@ -361,18 +366,105 @@ func (s *Server) diskReferencesAnyHost(ctx context.Context, path string) ([]corr
 	}
 	var out []corrosion.DiskRecord
 	seen := map[string]bool{}
+	add := func(d corrosion.DiskRecord) {
+		k := d.HostName + "\x00" + d.VMName + "\x00" + d.DiskName
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, d)
+		}
+	}
 	for _, p := range paths {
 		rows, err := corrosion.DisksReferencingPath(ctx, s.db, p)
 		if err != nil {
 			return nil, err
 		}
 		for _, d := range rows {
-			k := d.HostName + "\x00" + d.VMName + "\x00" + d.DiskName
-			if !seen[k] {
-				seen[k] = true
-				out = append(out, d)
+			add(d)
+		}
+	}
+	id, rel, ok, err := s.poolRelativePath(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return out, nil
+	}
+	rows, err := corrosion.DisksReferencingPathSuffix(ctx, s.db, rel)
+	if err != nil {
+		return nil, err
+	}
+	pools := map[string][]corrosion.StoragePoolRecord{}
+	for _, d := range rows {
+		if d.HostName == "" || seen[d.HostName+"\x00"+d.VMName+"\x00"+d.DiskName] {
+			continue
+		}
+		hp, have := pools[d.HostName]
+		if !have {
+			if hp, err = corrosion.ListStoragePoolsForHost(ctx, s.db, d.HostName); err != nil {
+				return nil, err
+			}
+			pools[d.HostName] = hp
+		}
+		for _, ref := range []string{d.Path, d.BackingImage, d.BackingDisk} {
+			prefix, cut := strings.CutSuffix(filepath.Clean(ref), "/"+rel)
+			if ref == "" || !cut {
+				continue
+			}
+			if samePoolOnHost(hp, id, prefix) {
+				add(d)
+				break
 			}
 		}
 	}
 	return out, nil
+}
+
+// poolIdentity names a pool across hosts: an NFS pool by its export
+// (storage.NFSExportKey), any other by its name and project.
+func poolIdentity(p corrosion.StoragePoolRecord) string {
+	if strings.EqualFold(p.Driver, "nfs") {
+		return "nfs:" + storage.NFSExportKey(p.Source)
+	}
+	return "pool:" + p.Name + "\x00" + tenancy.NormalizeProject(p.Project)
+}
+
+// poolRelativePath finds the file-based pool on this host that holds path and
+// returns its identity and path's location relative to the pool directory.
+func (s *Server) poolRelativePath(ctx context.Context, path string) (id, rel string, ok bool, err error) {
+	rows, err := corrosion.ListStoragePoolsForHost(ctx, s.db, s.hostName)
+	if err != nil {
+		return "", "", false, err
+	}
+	for _, r := range rows {
+		if !isFileBasedDriver(r.Driver) {
+			continue
+		}
+		dir, derr := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: r.Driver, Source: r.Source, Target: r.Target})
+		if derr != nil {
+			continue
+		}
+		if rl, rerr := filepath.Rel(filepath.Clean(dir), filepath.Clean(path)); rerr == nil && rl != "." && !strings.HasPrefix(rl, "..") {
+			return poolIdentity(r), rl, true, nil
+		}
+	}
+	return "", "", false, nil
+}
+
+// samePoolOnHost reports whether one of a host's pools is the pool id and
+// could be mounted at prefix there. A pool whose directory comes from that
+// host's own data_dir (no Target) cannot be told apart, so it matches.
+func samePoolOnHost(pools []corrosion.StoragePoolRecord, id, prefix string) bool {
+	for _, p := range pools {
+		if !isFileBasedDriver(p.Driver) || poolIdentity(p) != id {
+			continue
+		}
+		dir := p.Target
+		if strings.EqualFold(p.Driver, "btrfs") {
+			dir = p.Source
+		}
+		if dir == "" || filepath.Clean(dir) == filepath.Clean(prefix) {
+			return true
+		}
+	}
+	return false
 }

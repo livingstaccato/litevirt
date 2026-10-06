@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -43,15 +44,28 @@ import (
 // its own name here so this file does not depend on that change's file.
 const verbISOHostPath = "storage.hostpath"
 
-// isoPoolFor returns the file-based pools on host whose directory is exactly
-// iso's directory. Several pool rows can share one directory (target-less
-// local pools all live in <data_dir>/disks).
+// isoPoolFor returns the file-based pools on host whose directory is iso's
+// directory. Several pool rows can share one directory (target-less local
+// pools all live in <data_dir>/disks). On this host both sides are compared
+// with symlinks resolved — the file is opened through the resolved directory,
+// so a pool aimed through a link (or /proc/self/root) at another pool's
+// directory maps that directory. Another host's directories are compared as
+// written; that host resolves them again itself.
 func (s *Server) isoPoolFor(ctx context.Context, host, iso string) ([]corrosion.StoragePoolRecord, error) {
 	pools, err := corrosion.ListStoragePoolsForHost(ctx, s.db, host)
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Dir(iso)
+	resolve := func(p string) string {
+		p = filepath.Clean(p)
+		if host == s.hostName {
+			if r, err := filepath.EvalSymlinks(p); err == nil {
+				return r
+			}
+		}
+		return p
+	}
+	dir := resolve(filepath.Dir(iso))
 	var out []corrosion.StoragePoolRecord
 	for _, p := range pools {
 		if !isFileBasedDriver(p.Driver) {
@@ -61,7 +75,7 @@ func (s *Server) isoPoolFor(ctx context.Context, host, iso string) ([]corrosion.
 		if perr != nil || pd == "" {
 			continue
 		}
-		if filepath.Clean(pd) == dir {
+		if resolve(pd) == dir {
 			out = append(out, p)
 		}
 	}
@@ -142,18 +156,18 @@ func (s *Server) resolveSpecISO(ctx context.Context, project string, spec *pb.VM
 		return "", false, nil
 	}
 	if pool, file, ok := parseISORef(iso); ok {
-		path, err := s.resolveISOForVM(ctx, project, scope, pool, file, true)
+		path, err := s.resolveISOForVM(ctx, project, scope, pool, file, true, spec.GetIsoIdentity())
 		return path, true, err
 	}
 	switch scope {
 	case isoScopeGlobal, isoScopePool, isoScopeProject:
 		ref, ok := s.isoRefForPath(ctx, s.hostName, iso)
 		if !ok {
-			return "", true, status.Errorf(codes.FailedPrecondition,
-				"iso %q names a file in a %s pool, and no pool on this host (%s) has that directory", iso, scope, s.hostName)
+			return "", true, isoAbsent(status.Errorf(codes.FailedPrecondition,
+				"iso %q names a file in a %s pool, and no pool on this host (%s) has that directory", iso, scope, s.hostName))
 		}
 		pool, file, _ := parseISORef(ref)
-		path, err := s.resolveISOForVM(ctx, project, scope, pool, file, false)
+		path, err := s.resolveISOForVM(ctx, project, scope, pool, file, false, spec.GetIsoIdentity())
 		return path, true, err
 	}
 	return "", false, nil
@@ -333,7 +347,12 @@ func repointCDROM(domXML, from, to string) string {
 // where libvirt hands qemu here the source's path, that resolution must be
 // the very same path. Any other CD-ROM is judged as the path it is, and must
 // exist. A source on an older build lists nothing; then the spec decides.
-func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord, req *pb.EnsureDisksRequest) error {
+//
+// A stopped VM's move (not runtime) to a host without the pool or the file is
+// accepted with a warning — the start there judges the ISO again, and refuses
+// until it is present — while one that names a pool of another kind or
+// another project here is refused.
+func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord, req *pb.EnsureDisksRequest) (string, error) {
 	spec := vmSpecFor(vm)
 	if spec == nil {
 		spec = &pb.VMSpec{}
@@ -342,51 +361,62 @@ func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord, req *pb.EnsureDisks
 	if req.GetInstallerIsoListed() {
 		paths := req.GetInstallerIsoPaths()
 		if len(paths) == 0 {
-			return nil
+			return "", nil
 		}
 		path, viaPool, err := s.resolveSpecISO(ctx, vm.Project, spec)
+		if err != nil && !req.GetInstallerIsoRuntime() && isISOAbsent(err) {
+			warn := fmt.Sprintf("VM %q is moving to %s, which cannot attach its installer ISO %q yet (%s); it will not start there until the ISO is present (upload or pull it there, or wait for the library to sync)",
+				vm.Name, s.hostName, spec.GetIso(), status.Convert(err).Message())
+			slog.Warn("installer ISO: a stopped VM moves to a host without its ISO", "vm", vm.Name, "host", s.hostName, "iso", spec.GetIso(), "reason", status.Convert(err).Message())
+			return warn, nil
+		}
 		if err != nil {
-			return s.refuseISO(vm.Name, spec.GetIso(), err)
+			return "", s.refuseISO(vm.Name, spec.GetIso(), err)
 		}
 		if viaPool {
 			if req.GetInstallerIsoRuntime() {
 				for _, p := range paths {
 					if p != path {
-						return s.refuseISO(vm.Name, spec.GetIso(), status.Errorf(codes.FailedPrecondition,
+						return "", s.refuseISO(vm.Name, spec.GetIso(), status.Errorf(codes.FailedPrecondition,
 							"the running VM's domain opens it at %s, and on this host it is %s; a running VM's CD-ROM path cannot change in a migration, so stop the VM and migrate it stopped, or give the library the same directory on both hosts",
 							p, path))
 					}
 				}
 			}
-			return nil
+			return "", nil
 		}
 		for _, p := range paths {
+			if _, lerr := os.Lstat(p); os.IsNotExist(lerr) && !req.GetInstallerIsoRuntime() {
+				warn := fmt.Sprintf("VM %q is moving to %s, which has no file %s; it will not start there until the file is present", vm.Name, s.hostName, p)
+				slog.Warn("installer ISO: a stopped VM moves to a host without its ISO", "vm", vm.Name, "host", s.hostName, "iso", p)
+				return warn, nil
+			}
 			if err := s.checkVMISOFile(p); err != nil {
-				return s.refuseISO(vm.Name, p, err)
+				return "", s.refuseISO(vm.Name, p, err)
 			}
 		}
-		return nil
+		return "", nil
 	}
 	if spec.GetIso() == "" {
-		return nil
+		return "", nil
 	}
 	_, viaPool, err := s.resolveSpecISO(ctx, vm.Project, spec)
 	if err != nil {
-		return s.refuseISO(vm.Name, spec.GetIso(), err)
+		return "", s.refuseISO(vm.Name, spec.GetIso(), err)
 	}
 	if viaPool {
-		return nil
+		return "", nil
 	}
 	if _, err := os.Lstat(spec.Iso); os.IsNotExist(err) {
 		if rerr := storage.CheckRefusedReadPath(spec.Iso, s.dataDir, s.pkiDir); rerr != nil {
-			return s.refuseISO(vm.Name, spec.Iso, status.Errorf(codes.InvalidArgument, "iso: %v", rerr))
+			return "", s.refuseISO(vm.Name, spec.Iso, status.Errorf(codes.InvalidArgument, "iso: %v", rerr))
 		}
-		return nil
+		return "", nil
 	}
 	if err := s.checkVMISOFile(spec.Iso); err != nil {
-		return s.refuseISO(vm.Name, spec.Iso, err)
+		return "", s.refuseISO(vm.Name, spec.Iso, err)
 	}
-	return nil
+	return "", nil
 }
 
 func (s *Server) refuseISO(vmName, iso string, err error) error {

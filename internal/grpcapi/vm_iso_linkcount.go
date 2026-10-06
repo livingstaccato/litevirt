@@ -24,6 +24,15 @@ func fileInode(fi os.FileInfo) (uint64, bool) {
 	return uint64(st.Ino), true
 }
 
+// fileDevice reports the device the file is on where the platform exposes it.
+func fileDevice(fi os.FileInfo) (uint64, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return uint64(st.Dev), true
+}
+
 // openNoFollow opens path read-only, refusing a symlink as its last component
 // at the moment of the open (O_NOFOLLOW), and returns the open file and what
 // it is. The path the kernel actually opened is reported where the platform

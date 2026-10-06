@@ -55,6 +55,17 @@ func TestISOAuthority_StartRefusesAnotherProjectsSameNamedPool(t *testing.T) {
 		t.Fatalf("CreateVM: %v", err)
 	}
 	stopVM(t, s, "a-vm")
+	// The VM was created on another host: its recorded file is that host's,
+	// and here b-lib is project other's.
+	spec := vmSpecFor(vmRecord(t, s, "a-vm"))
+	if spec.GetIsoIdentity() == nil {
+		t.Fatal("create recorded no iso_identity")
+	}
+	spec.IsoIdentity.Host = "creation-host"
+	b, _ := json.Marshal(spec)
+	if err := s.db.Execute(context.Background(), `UPDATE vms SET spec = ? WHERE name = 'a-vm'`, string(b)); err != nil {
+		t.Fatal(err)
+	}
 	repointPool(t, s, "b-lib", "other")
 
 	_, err := s.PrepareHardwareForStart(context.Background(), vmRecord(t, s, "a-vm"))

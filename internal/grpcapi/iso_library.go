@@ -214,13 +214,13 @@ func (s *Server) isoRefForPath(ctx context.Context, host, p string) (string, boo
 // file is a plain file directly in the pool's directory (no symlink, one link,
 // not refused by storage.CheckReadFile), and with libraryCheck a global-library
 // file in sync mode must match the library record.
-func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file string, libraryCheck bool) (string, error) {
+func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file string, libraryCheck bool, ident *pb.ISOFileIdentity) (string, error) {
 	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool)
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "iso: look up pool %q: %v", pool, err)
 	}
 	if !ok {
-		return "", status.Errorf(codes.FailedPrecondition, "iso %s/%s: this host (%s) has no pool %q", pool, file, s.hostName, pool)
+		return "", isoAbsent(status.Errorf(codes.FailedPrecondition, "iso %s/%s: this host (%s) has no pool %q", pool, file, s.hostName, pool))
 	}
 	if !isFileBasedDriver(rec.Driver) {
 		return "", status.Errorf(codes.InvalidArgument, "iso %s/%s: pool %q (%s) holds no files", pool, file, pool, rec.Driver)
@@ -230,23 +230,22 @@ func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file
 			"iso %s/%s: pool %q on this host (%s) is a %s pool, but the VM was created with a %s one, so it is not the same library",
 			pool, file, pool, s.hostName, kind, scope)
 	}
+	dir, err := s.poolDirResolved(rec)
+	if err != nil {
+		return "", isoAbsent(status.Errorf(codes.FailedPrecondition, "iso %s/%s: pool directory: %v", pool, file, err))
+	}
+	path := filepath.Join(dir, file)
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return "", isoAbsent(status.Errorf(codes.FailedPrecondition, "iso %s/%s: there is no such file on this host (%s)", pool, file, s.hostName))
+	}
+	if err := s.checkVMISOFile(path); err != nil {
+		return "", err
+	}
 	rows, err := s.poolsSharingDir(ctx, s.hostName, rec)
 	if err != nil {
 		return "", status.Errorf(codes.FailedPrecondition, "iso %s/%s: %v", pool, file, err)
 	}
-	for _, r := range rows {
-		if r.Project != "" && !tenancy.AdmitAttach(project, r.Project) {
-			return "", status.Errorf(codes.FailedPrecondition,
-				"iso %s/%s: on this host (%s) that directory belongs to pool %q of project %q, which project %q may not use",
-				pool, file, s.hostName, r.Name, r.Project, tenancy.NormalizeProject(project))
-		}
-	}
-	dir, err := s.poolDirResolved(rec)
-	if err != nil {
-		return "", status.Errorf(codes.FailedPrecondition, "iso %s/%s: pool directory: %v", pool, file, err)
-	}
-	path := filepath.Join(dir, file)
-	if err := s.checkVMISOFile(path); err != nil {
+	if err := s.isoFileOwnershipAllows(project, pool, file, path, rows, ident); err != nil {
 		return "", err
 	}
 	if libraryCheck {
@@ -255,6 +254,67 @@ func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file
 		}
 	}
 	return path, nil
+}
+
+// isoFileOwnershipAllows is THE ownership rule for an ISO file in a pool
+// directory, decided in this one place (the storage branch's per-file
+// ownership records belong here after the merge). Every pool mapping the
+// directory on this host must be global or the VM's project's — unless the
+// file is the very file the VM was created with on this host (ident, the same
+// device, inode, size and mtime at the same resolved path): another project's
+// pool coming to share the directory since then has not made that file its
+// own, so a VM that started yesterday still starts. A file put there since is
+// judged by the full rule.
+func (s *Server) isoFileOwnershipAllows(project, pool, file, path string, rows []corrosion.StoragePoolRecord, ident *pb.ISOFileIdentity) error {
+	if s.isoFileUnchanged(path, ident) {
+		return nil
+	}
+	for _, r := range rows {
+		if r.Project != "" && !tenancy.AdmitAttach(project, r.Project) {
+			return status.Errorf(codes.FailedPrecondition,
+				"iso %s/%s: on this host (%s) that directory belongs to pool %q of project %q, which project %q may not use",
+				pool, file, s.hostName, r.Name, r.Project, tenancy.NormalizeProject(project))
+		}
+	}
+	return nil
+}
+
+// isoIdentityOf records which file path is on this host.
+func (s *Server) isoIdentityOf(path string) *pb.ISOFileIdentity {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil
+	}
+	id := &pb.ISOFileIdentity{Host: s.hostName, Path: path, Size: fi.Size(), MtimeNs: fi.ModTime().UnixNano()}
+	id.Ino, _ = fileInode(fi)
+	id.Dev, _ = fileDevice(fi)
+	return id
+}
+
+// isoFileUnchanged reports whether path on this host is still the file ident
+// recorded.
+func (s *Server) isoFileUnchanged(path string, ident *pb.ISOFileIdentity) bool {
+	if ident == nil || ident.GetHost() != s.hostName || ident.GetPath() != path {
+		return false
+	}
+	now := s.isoIdentityOf(path)
+	return now != nil && now.GetDev() == ident.GetDev() && now.GetIno() == ident.GetIno() &&
+		now.GetSize() == ident.GetSize() && now.GetMtimeNs() == ident.GetMtimeNs()
+}
+
+// isoAbsentError marks a refusal because the ISO (its pool, or the file) is
+// not on this host — which a stopped VM's move tolerates, since the start
+// there judges it again.
+type isoAbsentError struct{ error }
+
+func (e isoAbsentError) GRPCStatus() *status.Status { return status.Convert(e.error) }
+func (e isoAbsentError) Unwrap() error              { return e.error }
+
+func isoAbsent(err error) error { return isoAbsentError{err} }
+
+func isISOAbsent(err error) bool {
+	var a isoAbsentError
+	return errors.As(err, &a)
 }
 
 // checkLibraryCopy refuses a sync-mode global-library file whose local copy

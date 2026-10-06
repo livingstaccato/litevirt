@@ -1168,12 +1168,15 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 	if _, err := s.authorizeMigrationHelper(ctx, req.VmName); err != nil {
 		return nil, err
 	}
+	isoWarning := ""
 	// The domain lands here with its installer ISO path; qemu on THIS host
 	// opens it, so this host judges it before the migration may proceed.
 	if rec, gErr := corrosion.GetVM(ctx, s.db, req.VmName); gErr == nil && rec != nil {
-		if err := s.verifyIncomingVMISO(rec, req); err != nil {
+		w, err := s.verifyIncomingVMISO(rec, req)
+		if err != nil {
 			return nil, err
 		}
+		isoWarning = w
 	}
 	for _, stub := range req.Disks {
 		// Only ever create stubs in a real disk-artifact root (the disks dir or a
@@ -1195,7 +1198,7 @@ func (s *Server) EnsureDisks(ctx context.Context, req *pb.EnsureDisksRequest) (*
 			return nil, status.Errorf(codes.Internal, "stat disk stub %s: %v", stub.Path, err)
 		}
 	}
-	resp := &pb.EnsureDisksResponse{}
+	resp := &pb.EnsureDisksResponse{InstallerIsoWarning: isoWarning}
 	var made []string // created by this call: removed again if a later one fails
 	undo := func() {
 		for _, p := range made {
@@ -2043,6 +2046,9 @@ func (s *Server) ensureDisksOnTarget(ctx context.Context, targetHost, vmName str
 		}
 		return nil, false, status.Errorf(code, "could not prepare the disks of VM %q on %s for the copy: %s",
 			vmName, targetHost, status.Convert(err).Message())
+	}
+	if w := resp.GetInstallerIsoWarning(); w != "" {
+		slog.Warn("migration: "+w, "vm", vmName, "target", targetHost)
 	}
 	return resp.GetCreatedPaths(), wantTLS && resp.GetMigrationTlsReady(), nil
 }

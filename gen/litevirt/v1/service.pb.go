@@ -24049,8 +24049,12 @@ type EnsureDisksResponse struct {
 	// for QEMU, so the copy can be encrypted. An older target never sets it,
 	// which reads as "not ready" and falls back to the plaintext guard.
 	MigrationTlsReady bool `protobuf:"varint,2,opt,name=migration_tls_ready,json=migrationTlsReady,proto3" json:"migration_tls_ready,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// installer_iso_warning: a stopped VM's move was accepted although this
+	// host cannot attach its installer ISO yet (no such library or file here);
+	// the VM will not start here until it can. Empty otherwise.
+	InstallerIsoWarning string `protobuf:"bytes,3,opt,name=installer_iso_warning,json=installerIsoWarning,proto3" json:"installer_iso_warning,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *EnsureDisksResponse) Reset() {
@@ -24095,6 +24099,13 @@ func (x *EnsureDisksResponse) GetMigrationTlsReady() bool {
 		return x.MigrationTlsReady
 	}
 	return false
+}
+
+func (x *EnsureDisksResponse) GetInstallerIsoWarning() string {
+	if x != nil {
+		return x.InstallerIsoWarning
+	}
+	return ""
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle
@@ -34420,10 +34431,11 @@ const file_litevirt_v1_service_proto_rawDesc = "" +
 	"\bDiskStub\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"j\n" +
+	"size_bytes\x18\x02 \x01(\x03R\tsizeBytes\"\x9e\x01\n" +
 	"\x13EnsureDisksResponse\x12#\n" +
 	"\rcreated_paths\x18\x01 \x03(\tR\fcreatedPaths\x12.\n" +
-	"\x13migration_tls_ready\x18\x02 \x01(\bR\x11migrationTlsReady\"\xdf\x01\n" +
+	"\x13migration_tls_ready\x18\x02 \x01(\bR\x11migrationTlsReady\x122\n" +
+	"\x15installer_iso_warning\x18\x03 \x01(\tR\x13installerIsoWarning\"\xdf\x01\n" +
 	"\x1aEnsureFirmwareStateRequest\x12\x17\n" +
 	"\avm_name\x18\x01 \x01(\tR\x06vmName\x12\x12\n" +
 	"\x04uuid\x18\x02 \x01(\tR\x04uuid\x12\x16\n" +

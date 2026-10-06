@@ -2415,6 +2415,10 @@ message EnsureDisksResponse {
     // for QEMU, so the copy can be encrypted. An older target never sets it,
     // which reads as "not ready" and falls back to the plaintext guard.
     bool migration_tls_ready = 2;
+    // installer_iso_warning: a stopped VM's move was accepted although this
+    // host cannot attach its installer ISO yet (no such library or file here);
+    // the VM will not start here until it can. Empty otherwise.
+    string installer_iso_warning = 3;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle

@@ -268,6 +268,10 @@ replica area, and each replica a **record** beside it:
 <pool>/.replicas/<owner>/<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>.json
 ```
 
+The area and each owner directory are mode `0711`: a `--no-localize`
+promotion boots qemu (the distro's qemu user) on a replica there, so qemu
+must reach it by name, while no one but the daemon can list them.
+
 `<owner>` is a hash of the VM's project and name; the record names the
 project, VM, disk, format, time and the **schedule** that wrote it. Pruning
 (`--keep`), the incremental fork base and promotion select replicas only from

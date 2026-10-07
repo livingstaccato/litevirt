@@ -145,11 +145,21 @@ func replicaOwnerDir(poolDir, project, vm string) string {
 	return filepath.Join(poolDir, replicaAreaDir, hex.EncodeToString(sum[:16]))
 }
 
+// replicaDirMode is the replica area's and each owner directory's mode:
+// searchable by every user, listable by none but the daemon. A
+// --no-localize promotion boots qemu, which runs as the distro's qemu user,
+// on a replica in its owner directory (libvirt labels the file, never the
+// directories above it), so qemu must be able to reach it by name; nothing
+// can list what is there (its name is a hash, and the files are the
+// daemon's), and no content API reaches into it whatever the mode.
+const replicaDirMode = 0o711
+
 // ownerDirChecked returns (project, vm)'s directory in poolDir's replica area
 // after checking that neither the area nor the owner directory is anything but
 // a real directory — a symlink planted at either (by an admin-pointed pool or
-// an NFS server) is refused, never followed. With create it makes both (0700);
-// otherwise a missing one is reported as fs.ErrNotExist.
+// an NFS server) is refused, never followed. With create it makes both
+// (replicaDirMode), and gives one made 0700 by an earlier build of the area
+// its search bits; otherwise a missing one is reported as fs.ErrNotExist.
 func ownerDirChecked(poolDir, project, vm string, create bool) (string, error) {
 	area := filepath.Join(poolDir, replicaAreaDir)
 	owner := replicaOwnerDir(poolDir, project, vm)
@@ -157,15 +167,27 @@ func ownerDirChecked(poolDir, project, vm string, create bool) (string, error) {
 		fi, err := os.Lstat(d)
 		switch {
 		case err == nil && fi.IsDir():
+			if create && fi.Mode().Perm()&0o011 != 0o011 {
+				if cerr := os.Chmod(d, fi.Mode().Perm()|0o011); cerr != nil {
+					return "", fmt.Errorf("%s: let qemu reach a replica in it: %w", d, cerr)
+				}
+			}
 			continue
 		case err == nil:
 			return "", fmt.Errorf("%s is not a directory (a symlink is never followed here)", d)
 		case errors.Is(err, fs.ErrNotExist) && create:
-			if merr := os.Mkdir(d, 0o700); merr != nil && !errors.Is(merr, fs.ErrExist) {
+			if merr := os.Mkdir(d, replicaDirMode); merr != nil && !errors.Is(merr, fs.ErrExist) {
 				return "", merr
 			}
-			if fi, err := os.Lstat(d); err != nil || !fi.IsDir() {
+			fi, err := os.Lstat(d)
+			if err != nil || !fi.IsDir() {
 				return "", fmt.Errorf("%s is not a directory", d)
+			}
+			// Whatever the umask took.
+			if fi.Mode().Perm() != replicaDirMode {
+				if cerr := os.Chmod(d, replicaDirMode); cerr != nil {
+					return "", cerr
+				}
 			}
 		default:
 			return "", err
@@ -523,7 +545,7 @@ func (s *Server) PushReplica(stream pb.LiteVirt_PushReplicaServer) error {
 	if err != nil {
 		return status.Errorf(codes.FailedPrecondition, "replica directory: %v", err)
 	}
-	dest, total, err := receiveFileNoClobber(dir, 0o700, rec.File, func() ([]byte, error) {
+	dest, total, err := receiveFileNoClobber(dir, replicaDirMode, rec.File, func() ([]byte, error) {
 		msg, err := stream.Recv()
 		if err != nil {
 			return nil, err

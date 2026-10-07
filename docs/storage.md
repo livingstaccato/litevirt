@@ -114,10 +114,13 @@ VM was created:
   time; one that does not answer, or answers with an error other than "no
   such directory", refuses the start (or create, or move) saying which pool
   did not answer. A read that blocks holds a thread until the filesystem
-  answers, so they are bounded: once a read on a network mount has timed
-  out, every new read on that mount is refused at once until it returns, and
-  no more than 64 reads wait at a time on the whole host — past that a read
-  is refused at once, saying so.
+  answers, so they are bounded, and in shares no project can spend for
+  another: at most 4 reads at a time on one network mount (and none once one
+  there has timed out, until it returns), at most 16 for one project (or for
+  the daemon's own sync), at most 64 in all of which 16 are kept for
+  directories not on a network mount. Past a bound the read is refused at
+  once, saying which bound. A non-admin's absolute path whose directory is
+  not, as written, a pool's directory is refused before anything is read.
 - Each time a host judges the ISO by that full rule and it passes — at the
   create, at a start, as a migration target — the host records which file it
   was (in `<data_dir>/iso-identity`, by the VM's uuid and project: resolved
@@ -148,6 +151,10 @@ VM was created:
   resolves to is refused, refuses the move. A target on an older release
   judges nothing and returns nothing; the source then hands it the path the
   VM was given (an Admin's link), which its qemu follows there, as before.
+  A stopped or cold move (`--cold`, every Secure Boot or vTPM VM, a drain of
+  a VM with a host-local disk) always ships an Admin's host-path ISO as the
+  path the VM was given: a target on this release resolves and judges it at
+  its start, and one on an older release follows the link, as before.
   A **stopped** VM may move to a host that does not
   have its ISO or library yet: the move is accepted with a warning, and the VM
   will not start there until the ISO is present (upload or pull it, or wait for

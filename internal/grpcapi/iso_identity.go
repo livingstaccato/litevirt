@@ -3,9 +3,15 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -27,9 +33,17 @@ import (
 //   - a daemon-made NFS mount directory (an nfs pool with no target,
 //     <data_dir>/mounts/<source>) is never stat'ed: it is a real directory the
 //     daemon created, never a link, and is compared as written;
-//   - every other directory is read under a deadline, and one that does not
-//     answer fails the question CLOSED — the caller refuses, saying which pool
-//     did not answer — rather than hanging or guessing it does not share.
+//   - a directory on a network filesystem other than the one the ISO's
+//     directory is on (by /proc/self/mountinfo, which never touches the mount)
+//     is not the same directory, and is not read either — as long as no link
+//     above its mount point leads somewhere else;
+//   - every other directory is read under a deadline, one probe per directory
+//     at a time. One that does not answer, or answers with an error other
+//     than "no such directory", fails the question CLOSED — the caller
+//     refuses, saying which pool did not answer — rather than hanging or
+//     guessing it does not share. Until a probe that timed out returns, the
+//     next question about that directory is answered "did not answer" at
+//     once, so a dead directory holds at most one blocked thread.
 //
 // Another host's rows are compared as written; that host judges them again
 // itself when it resolves the ISO.
@@ -45,7 +59,8 @@ var isoDirProbe = func(p string) (string, os.FileInfo, error) {
 	return r, fi, err
 }
 
-// isoDirProbeTimeout bounds one directory probe.
+// isoDirProbeTimeout bounds one directory probe, and any other read of a
+// library directory (deadlined).
 var isoDirProbeTimeout = 3 * time.Second
 
 type dirProbe struct {
@@ -54,46 +69,211 @@ type dirProbe struct {
 }
 
 // errDirProbeTimeout is the fail-closed answer for a directory that did not
-// answer in time.
+// answer in time (or whose earlier probe has not returned yet).
 type errDirProbeTimeout struct{ dir string }
 
 func (e errDirProbeTimeout) Error() string {
 	return fmt.Sprintf("directory %s did not answer within %s", e.dir, isoDirProbeTimeout)
 }
 
-// probeDir runs isoDirProbe under isoDirProbeTimeout. A missing directory is
-// (zero, nil): it maps nothing.
-func probeDir(p string) (dirProbe, error) {
-	type res struct {
-		r   string
-		fi  os.FileInfo
-		err error
+// errDirProbeFailed is the fail-closed answer for a directory that answered
+// with an error (EIO, ESTALE, EACCES, ELOOP …): what it is cannot be told.
+type errDirProbeFailed struct {
+	dir string
+	err error
+}
+
+func (e errDirProbeFailed) Error() string {
+	return fmt.Sprintf("directory %s could not be read: %v", e.dir, e.err)
+}
+
+// deadlineFlight is one in-flight deadlined read, shared by every caller
+// asking the same question while it runs.
+type deadlineFlight struct {
+	done     chan struct{}
+	val      any
+	err      error
+	timedOut atomic.Bool // a caller gave up on it: answer "did not answer" until it returns
+}
+
+var deadlineFlights = struct {
+	sync.Mutex
+	m map[string]*deadlineFlight
+}{m: map[string]*deadlineFlight{}}
+
+// deadlined runs fn for key under isoDirProbeTimeout, at most one at a time
+// per key: a caller asking while one runs waits on that one. Once a caller has
+// given up on it, every later caller is answered errDirProbeTimeout at once
+// until fn returns. A blocked fn holds its goroutine (in the kernel, an OS
+// thread) until the filesystem answers; this bounds them to one per key.
+func deadlined(ctx context.Context, key, what string, fn func() (any, error)) (any, error) {
+	deadlineFlights.Lock()
+	f, ok := deadlineFlights.m[key]
+	if ok && f.timedOut.Load() {
+		deadlineFlights.Unlock()
+		return nil, errDirProbeTimeout{dir: what}
 	}
-	ch := make(chan res, 1)
-	go func() {
-		r, fi, err := isoDirProbe(p)
-		ch <- res{r, fi, err}
-	}()
+	if !ok {
+		f = &deadlineFlight{done: make(chan struct{})}
+		deadlineFlights.m[key] = f
+		go func() {
+			v, err := fn()
+			f.val, f.err = v, err
+			deadlineFlights.Lock()
+			if deadlineFlights.m[key] == f {
+				delete(deadlineFlights.m, key)
+			}
+			deadlineFlights.Unlock()
+			close(f.done)
+		}()
+	}
+	deadlineFlights.Unlock()
 	t := time.NewTimer(isoDirProbeTimeout)
 	defer t.Stop()
 	select {
-	case v := <-ch:
-		if v.err != nil {
-			if os.IsNotExist(v.err) {
+	case <-f.done:
+		return f.val, f.err
+	case <-t.C:
+		f.timedOut.Store(true)
+		return nil, errDirProbeTimeout{dir: what}
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// probeDir is probeDirCtx with no caller context.
+func probeDir(p string) (dirProbe, error) { return probeDirCtx(context.Background(), p) }
+
+// probeDirCtx resolves and stats p under the deadline (deadlined). A missing
+// directory is (zero, nil): it maps nothing. Any other error fails closed.
+func probeDirCtx(ctx context.Context, p string) (dirProbe, error) {
+	v, err := deadlined(ctx, "probe:"+p, p, func() (any, error) {
+		r, fi, err := isoDirProbe(p)
+		if err != nil {
+			if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 				return dirProbe{}, nil
 			}
-			return dirProbe{path: filepath.Clean(p)}, nil
+			return nil, errDirProbeFailed{dir: p, err: err}
 		}
-		return dirProbe{path: v.r, info: v.fi}, nil
-	case <-t.C:
-		return dirProbe{}, errDirProbeTimeout{dir: p}
+		return dirProbe{path: r, info: fi}, nil
+	})
+	if err != nil {
+		return dirProbe{}, err
 	}
+	return v.(dirProbe), nil
 }
 
 // isDaemonNFSMount reports whether a pool's directory is the mount directory
 // the daemon makes for an nfs pool with no target.
 func isDaemonNFSMount(p corrosion.StoragePoolRecord) bool {
 	return p.Driver == "nfs" && p.Target == ""
+}
+
+// mountEntry is one line of /proc/self/mountinfo.
+type mountEntry struct {
+	point  string // mount point
+	dev    string // major:minor of the filesystem
+	fstype string
+}
+
+// isoMountInfo reads this process's mount table. A variable so a test can add
+// a mount. Reading /proc/self/mountinfo never touches a mounted filesystem.
+var isoMountInfo = func() ([]mountEntry, error) {
+	b, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	return parseMountInfo(string(b)), nil
+}
+
+// parseMountInfo parses mountinfo lines: "id parent major:minor root point
+// options [optional...] - fstype source superoptions".
+func parseMountInfo(s string) []mountEntry {
+	var out []mountEntry
+	for _, line := range strings.Split(s, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 7 {
+			continue
+		}
+		sep := -1
+		for i := 6; i < len(f); i++ {
+			if f[i] == "-" {
+				sep = i
+				break
+			}
+		}
+		if sep < 0 || sep+1 >= len(f) {
+			continue
+		}
+		out = append(out, mountEntry{point: unescapeMountField(f[4]), dev: f[2], fstype: f[sep+1]})
+	}
+	return out
+}
+
+// unescapeMountField undoes mountinfo's octal escapes (\040 for a space …).
+func unescapeMountField(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// mountOf returns the mount a lexical path is on: the last-mounted entry with
+// the longest mount point that is the path or above it.
+func mountOf(mounts []mountEntry, p string) (mountEntry, bool) {
+	var best mountEntry
+	found := false
+	for _, m := range mounts {
+		if !pathWithin(m.point, p) {
+			continue
+		}
+		if !found || len(m.point) >= len(best.point) {
+			best, found = m, true
+		}
+	}
+	return best, found
+}
+
+// isNetworkFS reports a filesystem type that can stop answering: a network
+// filesystem, or a FUSE one.
+func isNetworkFS(fstype string) bool {
+	switch fstype {
+	case "nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "9p", "afs", "lustre", "gpfs", "beegfs", "fuse":
+		return true
+	}
+	return strings.HasPrefix(fstype, "fuse.")
+}
+
+// onAnotherNetworkFS reports, without touching it, that pool directory pd is
+// on a network filesystem other than the one target (a resolved directory) is
+// on, reached with no link above that filesystem's mount point — so it cannot
+// be target, and need not be read. Anything it cannot tell is false (read it).
+func onAnotherNetworkFS(ctx context.Context, mounts []mountEntry, target, pd string) bool {
+	if len(mounts) == 0 || target == "" {
+		return false
+	}
+	tm, ok := mountOf(mounts, target)
+	if !ok {
+		return false
+	}
+	pm, ok := mountOf(mounts, pd)
+	if !ok || !isNetworkFS(pm.fstype) || pm.dev == tm.dev || pm.point == "/" {
+		return false
+	}
+	parent := filepath.Dir(pm.point)
+	got, err := probeDirCtx(ctx, parent)
+	return err == nil && got.path == parent
 }
 
 // poolsMappingDir returns the file-based pools on host whose directory is dir.
@@ -107,10 +287,12 @@ func (s *Server) poolsMappingDir(ctx context.Context, host, dir string) ([]corro
 	dir = filepath.Clean(dir)
 	local := host == s.hostName
 	var target dirProbe
+	var mounts []mountEntry
 	if local {
-		if target, err = probeDir(dir); err != nil {
+		if target, err = probeDirCtx(ctx, dir); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "which pools share %s cannot be told: %v; refusing until it answers", dir, err)
 		}
+		mounts, _ = isoMountInfo()
 	}
 	var out []corrosion.StoragePoolRecord
 	for _, p := range pools {
@@ -122,17 +304,21 @@ func (s *Server) poolsMappingDir(ctx context.Context, host, dir string) ([]corro
 			continue
 		}
 		pd = filepath.Clean(pd)
-		if !local || isDaemonNFSMount(p) {
-			if pd == dir || (local && pd == target.path) {
-				out = append(out, p)
-			}
+		if pd == dir || (local && pd == target.path) {
+			out = append(out, p)
 			continue
 		}
-		got, err := probeDir(pd)
+		if !local || isDaemonNFSMount(p) {
+			continue
+		}
+		if onAnotherNetworkFS(ctx, mounts, target.path, pd) {
+			continue
+		}
+		got, err := probeDirCtx(ctx, pd)
 		if err != nil {
 			return nil, status.Errorf(codes.Unavailable,
-				"the directory of pool %q (%s) on %s did not answer within %s, so whether it shares %s cannot be told; refusing until it answers",
-				p.Name, pd, s.hostName, isoDirProbeTimeout, dir)
+				"the directory of pool %q (%s) on %s did not answer (%v), so whether it shares %s cannot be told; refusing until it answers",
+				p.Name, pd, s.hostName, err, dir)
 		}
 		if got.path == dir || (got.info != nil && target.info != nil && os.SameFile(got.info, target.info)) {
 			out = append(out, p)
@@ -173,13 +359,25 @@ func isoIdentityKey(vmName string, spec *pb.VMSpec) string {
 	return "name-" + vmName
 }
 
+// isoIdentityDir is the host-local store of the records, under the data
+// directory. No pool may be created at or under it
+// (refuseISOIdentityStoreOverlap): a pool there could write a record.
+const isoIdentityDir = "iso-identity"
+
 func (s *Server) isoIdentityPath(key string) string {
-	return filepath.Join(s.dataDir, "iso-identity", key+".json")
+	return filepath.Join(s.dataDir, isoIdentityDir, key+".json")
 }
 
 func isoIdentityOfFile(project, path string) (isoIdentityRecord, bool) {
 	fi, err := os.Lstat(path)
-	if err != nil || !fi.Mode().IsRegular() {
+	if err != nil {
+		return isoIdentityRecord{}, false
+	}
+	return isoIdentityOfInfo(project, path, fi)
+}
+
+func isoIdentityOfInfo(project, path string, fi os.FileInfo) (isoIdentityRecord, bool) {
+	if fi == nil || !fi.Mode().IsRegular() {
 		return isoIdentityRecord{}, false
 	}
 	r := isoIdentityRecord{Project: project, Path: path, Size: fi.Size(), MtimeNs: fi.ModTime().UnixNano()}
@@ -188,26 +386,61 @@ func isoIdentityOfFile(project, path string) (isoIdentityRecord, bool) {
 	return r, true
 }
 
+// isoIdentityMu serializes the writers of the store (a start racing a
+// migration target's judgement of the same VM, a sweep).
+var isoIdentityMu sync.Mutex
+
 // recordISOIdentity records that path passed the full rule for the VM (best
 // effort: a failed write only means a later start judges the file in full).
+// It is written durably: a temp file of its own in the store, synced, renamed
+// over the record, and the directory synced.
 func (s *Server) recordISOIdentity(key, project, path string) {
-	r, ok := isoIdentityOfFile(project, path)
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return
+	}
+	s.recordISOIdentityOf(key, project, path, fi)
+}
+
+// recordISOIdentityOf records the file fi describes (one the caller opened and
+// judged) as the VM's file at path.
+func (s *Server) recordISOIdentityOf(key, project, path string, fi os.FileInfo) {
+	r, ok := isoIdentityOfInfo(project, path, fi)
 	if !ok || key == "" {
 		return
 	}
+	isoIdentityMu.Lock()
+	defer isoIdentityMu.Unlock()
 	if old, ok := s.readISOIdentity(key); ok && old == r {
 		return
 	}
 	b, _ := json.Marshal(r)
 	p := s.isoIdentityPath(key)
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
 		return
 	}
-	_ = os.Rename(tmp, p)
+	tmp := f.Name()
+	defer os.Remove(tmp) // a no-op after the rename
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return
+	}
+	if err := f.Close(); err != nil {
+		return
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		return
+	}
+	_ = syncPath(dir)
 }
 
 func (s *Server) readISOIdentity(key string) (isoIdentityRecord, bool) {
@@ -239,7 +472,83 @@ func (s *Server) isoIdentityHolds(key, project, path string) bool {
 
 // forgetISOIdentity drops a VM's record on this host.
 func (s *Server) forgetISOIdentity(key string) {
-	if key != "" {
-		_ = os.Remove(s.isoIdentityPath(key))
+	if key == "" {
+		return
 	}
+	isoIdentityMu.Lock()
+	defer isoIdentityMu.Unlock()
+	if err := os.Remove(s.isoIdentityPath(key)); err == nil {
+		_ = syncPath(filepath.Dir(s.isoIdentityPath(key)))
+	}
+}
+
+// forgetVMISOIdentity drops every record this host keeps for a VM: under its
+// uuid and under its name.
+func (s *Server) forgetVMISOIdentity(vmName, specJSON string) {
+	var sp struct {
+		Uuid string `json:"uuid"`
+	}
+	_ = json.Unmarshal([]byte(specJSON), &sp)
+	if sp.Uuid != "" {
+		s.forgetISOIdentity(isoIdentityKey(vmName, &pb.VMSpec{Uuid: sp.Uuid}))
+	}
+	s.forgetISOIdentity("name-" + vmName)
+}
+
+// isoIdentitySweepGrace keeps a record younger than this out of the sweep: a
+// create writes its record before the VM row exists.
+var isoIdentitySweepGrace = 10 * time.Minute
+
+// SweepISOIdentities removes this host's records of VMs that no longer exist
+// (a uuid no VM row carries, a name no VM row has), and temp files a crash
+// left. It keeps everything when the VM rows cannot be read.
+func (s *Server) SweepISOIdentities(ctx context.Context) error {
+	dir := filepath.Join(s.dataDir, isoIdentityDir)
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return err
+	}
+	names, uuids := map[string]bool{}, map[string]bool{}
+	for _, vm := range vms {
+		names[vm.Name] = true
+		var sp struct {
+			Uuid string `json:"uuid"`
+		}
+		if json.Unmarshal([]byte(vm.Spec), &sp) == nil && sp.Uuid != "" {
+			uuids[sp.Uuid] = true
+		}
+	}
+	isoIdentityMu.Lock()
+	defer isoIdentityMu.Unlock()
+	removed := 0
+	for _, e := range ents {
+		n := e.Name()
+		info, err := e.Info()
+		if err != nil || !info.Mode().IsRegular() || time.Since(info.ModTime()) < isoIdentitySweepGrace {
+			continue
+		}
+		orphan := false
+		switch {
+		case strings.HasPrefix(n, ".tmp-"):
+			orphan = true
+		case strings.HasPrefix(n, "uuid-") && strings.HasSuffix(n, ".json"):
+			orphan = !uuids[strings.TrimSuffix(strings.TrimPrefix(n, "uuid-"), ".json")]
+		case strings.HasPrefix(n, "name-") && strings.HasSuffix(n, ".json"):
+			orphan = !names[strings.TrimSuffix(strings.TrimPrefix(n, "name-"), ".json")]
+		}
+		if orphan && os.Remove(filepath.Join(dir, n)) == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		_ = syncPath(dir)
+	}
+	return nil
 }

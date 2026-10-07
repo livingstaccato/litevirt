@@ -75,3 +75,83 @@ func TestCheckReadFile_TheGlobalISOLibraryDirectory(t *testing.T) {
 		t.Error("a pool may be created over the global library's directory")
 	}
 }
+
+// opticalImage is a file with an ISO 9660 volume descriptor at sector 16.
+func opticalImage(body string) []byte {
+	b := make([]byte, 0x8800)
+	copy(b[0x8000:], "\x01CD001\x01")
+	return append(b, body...)
+}
+
+// udfImage is a file with a UDF volume recognition sequence at sector 16.
+func udfImage() []byte {
+	b := make([]byte, 0x9800)
+	copy(b[0x8000:], "\x00BEA01\x01")
+	copy(b[0x8800:], "\x00NSR02\x01")
+	copy(b[0x9000:], "\x00TEA01\x01")
+	return b
+}
+
+// Under /home and /run (user-data roots) a guest may be given an optical disc
+// image outside any dot-directory — an ISO a user downloaded, a USB stick under
+// /run/media — and nothing else: not a key, not a key renamed .iso, not an ISO
+// inside ~/.cache, not through a link.
+func TestCheckReadFile_UserDataRoots(t *testing.T) {
+	// The real roots are user-data roots: open to an ISO, not to anything.
+	if !UnderUserDataRoot("/home/u/x.iso") || !UnderUserDataRoot("/run/media/u/S/x.iso") || !UnderUserDataRoot("/var/run/media/u/S/x.iso") {
+		t.Error("/home and /run are not user-data roots")
+	}
+	if err := CheckReadPathLexical("/home/u/.ssh/id_rsa", "", ""); err == nil {
+		t.Error("/home/u/.ssh/id_rsa allowed lexically")
+	}
+	base := t.TempDir()
+	home, run := filepath.Join(base, "home"), filepath.Join(base, "run")
+	defer SetUserDataRootsForTest([]string{home, run})()
+	data := t.TempDir()
+	mk := func(p string, b []byte) string {
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	virtio := mk(filepath.Join(home, "u", "isos", "virtio-win.iso"), opticalImage("virtio"))
+	stick := mk(filepath.Join(run, "media", "u", "STICK", "x.iso"), opticalImage("stick"))
+	udf := mk(filepath.Join(home, "u", "isos", "win11.iso"), udfImage())
+	key := mk(filepath.Join(home, "u", ".ssh", "id_rsa"), []byte("-----BEGIN OPENSSH PRIVATE KEY-----\n"))
+	renamed := mk(filepath.Join(home, "u", "isos", "id_rsa.iso"), []byte("-----BEGIN OPENSSH PRIVATE KEY-----\n"))
+	dotISO := mk(filepath.Join(home, "u", ".cache", "x.iso"), opticalImage("cached"))
+	beaOnly := mk(filepath.Join(home, "u", "isos", "bea.iso"), append(make([]byte, 0x8000), "\x00BEA01\x01"...))
+	link := filepath.Join(home, "u", "isos", "key.iso")
+	if err := os.Symlink(key, link); err != nil {
+		t.Fatal(err)
+	}
+	dotLink := filepath.Join(home, "u", "isos", "cached.iso")
+	if err := os.Symlink(dotISO, dotLink); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{virtio, stick, udf} {
+		if err := CheckReadFile(p, data, ""); err != nil {
+			t.Errorf("%s refused: %v", p, err)
+		}
+	}
+	for _, p := range []string{key, renamed, dotISO, beaOnly, link, dotLink} {
+		if err := CheckReadFile(p, data, ""); err == nil {
+			t.Errorf("%s allowed", p)
+		}
+	}
+	if err := CheckReadPathLexical(virtio, data, ""); err != nil {
+		t.Errorf("lexical: %s refused: %v", virtio, err)
+	}
+	if err := CheckReadPathLexical(dotISO, data, ""); err == nil {
+		t.Errorf("lexical: %s allowed", dotISO)
+	}
+	if err := CheckRefusedReadPath(filepath.Join(home, "u", ".gnupg", "gone.iso"), data, ""); err == nil {
+		t.Error("stored path in a dot-directory under a user-data root allowed")
+	}
+	if err := CheckRefusedReadPath(filepath.Join(home, "u", "isos", "gone.iso"), data, ""); err != nil {
+		t.Errorf("stored path under a user-data root refused: %v", err)
+	}
+}

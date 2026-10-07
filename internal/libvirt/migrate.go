@@ -24,6 +24,18 @@ type MigrateParams struct {
 	// against (libvirt's tls.destination). Set it to the target address when the
 	// migrate_uri uses an IP, which the certificate carries as a SAN.
 	TLSDestination string
+	// CDROMSources points CD-ROMs at other files on the destination (source
+	// path here → path there): the target resolved the VM's installer ISO on
+	// its own filesystem, and a link (virtio-win.iso → a versioned file) or a
+	// library directory can name another file there. MigrateToTarget hands
+	// libvirt a destination definition (and persistent definition) with those
+	// sources; libvirt allows a disk's source to change in it. Empty: the
+	// domain migrates as it is.
+	CDROMSources map[string]string
+	// DestXML and PersistXML are the definitions MigrateToTarget builds from
+	// CDROMSources; callers leave them empty.
+	DestXML    string
+	PersistXML string
 }
 
 // MigrateToTarget performs a live (or cold) P2P migration of a domain to
@@ -42,6 +54,20 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		_ = c.virt.DomainMigrateSetMaxDowntime(dom, uint64(p.MaxDowntimeMS), 0)
 	}
 
+	if len(p.CDROMSources) > 0 {
+		live, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable)
+		if err != nil {
+			return fmt.Errorf("get migratable XML for %q: %w", name, err)
+		}
+		persist, err := c.virt.DomainGetXMLDesc(dom, golibvirt.DomainXMLSecure|golibvirt.DomainXMLMigratable|golibvirt.DomainXMLInactive)
+		if err != nil {
+			return fmt.Errorf("get persistent migratable XML for %q: %w", name, err)
+		}
+		if p.DestXML, p.PersistXML, err = MigrationCDROMXML(live, persist, p.CDROMSources); err != nil {
+			return fmt.Errorf("domain %q: %w", name, err)
+		}
+	}
+
 	flags, params := migrationFlagsAndParams(p)
 	_, err = c.virt.DomainMigratePerform3Params(
 		dom,
@@ -51,6 +77,25 @@ func (c *Client) MigrateToTarget(name, dconnuri string, p MigrateParams) error {
 		flags,
 	)
 	return err
+}
+
+// MigrationCDROMXML builds the destination and persistent definitions of a
+// migration whose CD-ROMs are pointed at other files there (CDROMSources).
+// The running domain must still carry every CD-ROM the destination judged:
+// one that changed since would land on a file nobody judged there.
+func MigrationCDROMXML(live, persist string, remap map[string]string) (dest, persistOut string, err error) {
+	dest, n, err := RewriteCDROMSources(live, remap)
+	if err != nil {
+		return "", "", err
+	}
+	if n == 0 {
+		return "", "", fmt.Errorf("the running domain no longer carries the installer CD-ROM the destination judged; migrate again")
+	}
+	persistOut, _, err = RewriteCDROMSources(persist, remap)
+	if err != nil {
+		return "", "", err
+	}
+	return dest, persistOut, nil
 }
 
 // migrationFlagsAndParams builds the flags and typed parameters MigrateToTarget
@@ -126,6 +171,19 @@ func migrationFlagsAndParams(p MigrateParams) (golibvirt.DomainMigrateFlags, []g
 		params = append(params, golibvirt.TypedParam{
 			Field: golibvirt.MigrateParamMigrateDisks,
 			Value: *golibvirt.NewTypedParamValueString(dt),
+		})
+	}
+
+	if p.DestXML != "" {
+		params = append(params, golibvirt.TypedParam{
+			Field: golibvirt.MigrateParamDestXML,
+			Value: *golibvirt.NewTypedParamValueString(p.DestXML),
+		})
+	}
+	if p.PersistXML != "" {
+		params = append(params, golibvirt.TypedParam{
+			Field: golibvirt.MigrateParamPersistXML,
+			Value: *golibvirt.NewTypedParamValueString(p.PersistXML),
 		})
 	}
 

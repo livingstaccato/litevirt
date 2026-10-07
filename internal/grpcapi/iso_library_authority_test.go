@@ -290,27 +290,29 @@ func libraryVM(t *testing.T, s *Server, name, project string) (lib, path string)
 	return lib, filepath.Join(mustEval(t, lib), "install.iso")
 }
 
-// C1, live migration: libvirt hands qemu on the target the source's path, so
-// the target's resolution must be that very file; a stopped (cold) move is
-// pointed at the target's file when it starts instead.
-func TestISOAuthority_RuntimeMigrationNeedsTheSamePath(t *testing.T) {
+// C1 / N-C1, live migration: the target resolves the VM's ISO through its own
+// pool and returns the file it judged, which the destination definition
+// carries — the same path, or this host's where the library's directory
+// differs; a stopped (cold) move is pointed at the target's file when it
+// starts instead.
+func TestISOAuthority_RuntimeMigrationIsPointedAtTheTargetsFile(t *testing.T) {
 	s, _ := stubTarget(t)
 	_, here := libraryVM(t, s, "mig", "acme")
-	run := func(paths []string, runtime bool) error {
-		_, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	run := func(paths []string, runtime bool) (*pb.EnsureDisksResponse, error) {
+		return s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
 			InstallerIsoListed: true, InstallerIsoPaths: paths, InstallerIsoRuntime: runtime})
-		return err
 	}
-	if err := run([]string{here}, true); err != nil {
-		t.Fatalf("live migration, same library path: %v", err)
+	if r, err := run([]string{here}, true); err != nil || r.GetInstallerIsoResolved()[here] != here {
+		t.Fatalf("live migration, same library path: %v %v", r.GetInstallerIsoResolved(), err)
 	}
-	if err := run([]string{"/srv/source-host/isos/install.iso"}, true); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("live migration, the source's path differs: got %v, want FailedPrecondition", err)
+	src := "/srv/source-host/isos/install.iso"
+	if r, err := run([]string{src}, true); err != nil || r.GetInstallerIsoResolved()[src] != here {
+		t.Fatalf("live migration, the source's path differs: resolved %v, %v; want %s → %s", r.GetInstallerIsoResolved(), err, src, here)
 	}
-	if err := run([]string{"/srv/source-host/isos/install.iso"}, false); err != nil {
-		t.Fatalf("stopped move, different path (repointed at start): %v", err)
+	if r, err := run([]string{src}, false); err != nil || len(r.GetInstallerIsoResolved()) != 0 {
+		t.Fatalf("stopped move, different path (repointed at start): %v %v", r.GetInstallerIsoResolved(), err)
 	}
-	if err := run(nil, true); err != nil {
+	if _, err := run(nil, true); err != nil {
 		t.Fatalf("a domain that carries no installer CD-ROM: %v", err)
 	}
 }

@@ -73,6 +73,29 @@ type ISOLibraryModePolicy struct {
 	Implicit  bool
 }
 
+// isoModePinPrefix marks, in set_by, a mode row written to pin the implicit
+// mode in force (PinISOLibraryMode) rather than to change it.
+const isoModePinPrefix = "pin:"
+
+// Pinned reports a mode row that pinned the implicit mode: the records made
+// while it was implicit (generation "") are still this generation's.
+func (m ISOLibraryModePolicy) Pinned() bool { return strings.HasPrefix(m.SetBy, isoModePinPrefix) }
+
+// PinnedBy is who pinned it ("" when it was not a pin).
+func (m ISOLibraryModePolicy) PinnedBy() string {
+	if !m.Pinned() {
+		return ""
+	}
+	return strings.TrimPrefix(m.SetBy, isoModePinPrefix)
+}
+
+// CurrentGen reports whether a record of generation gen counts under m: one
+// stamped with m's generation, or — when m pinned the implicit mode — one made
+// while the mode was implicit.
+func (m ISOLibraryModePolicy) CurrentGen(gen string) bool {
+	return gen == m.UpdatedAt || (gen == "" && m.Pinned())
+}
+
 // GetISOLibraryMode reads the effective mode (see the file comment for the
 // default). A stored value this build does not implement returns it with
 // ErrUnknownISOLibraryMode.
@@ -114,6 +137,13 @@ func SetISOLibraryMode(ctx context.Context, c *Client, mode, setBy string) error
 		return ErrClusterPolicyGateClosed
 	}
 	return c.Execute(ctx, clusterPolicyUpsertSQL, clusterPolicyISOLibraryMode, mode, setBy, c.NowTS())
+}
+
+// PinISOLibraryMode writes the implicit mode in force as an explicit row
+// without starting a new generation of records: the records made while it was
+// implicit keep counting (CurrentGen), so nothing is refused in the meantime.
+func PinISOLibraryMode(ctx context.Context, c *Client, mode, setBy string) error {
+	return SetISOLibraryMode(ctx, c, mode, isoModePinPrefix+setBy)
 }
 
 // ISOCatalogEntry is one file record of a sync-mode global library.
@@ -177,7 +207,7 @@ func CurrentISOCatalog(ctx context.Context, c *Client) (ISOLibraryModePolicy, ma
 	}
 	out := map[string]ISOCatalogEntry{}
 	for _, e := range all {
-		if e.Gen == mode.UpdatedAt && !e.Collected() {
+		if mode.CurrentGen(e.Gen) && !e.Collected() {
 			out[e.Name] = e
 		}
 	}

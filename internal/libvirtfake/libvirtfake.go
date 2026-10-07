@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1343,8 +1344,23 @@ func (f *Fake) MigrateToTarget(name, dconnuri string, p libvirt.MigrateParams) e
 	defer f.mu.Unlock()
 	// The parameters a test asserts on: whether the disks were copied, and
 	// which ones (libvirt's migrate_disks; empty means every writable disk).
-	f.record("migrate", name, fmt.Sprintf("to=%s with_storage=%t disks=%s tls=%t tls_dest=%s",
-		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ","), p.TLS, p.TLSDestination))
+	note := fmt.Sprintf("to=%s with_storage=%t disks=%s tls=%t tls_dest=%s",
+		dconnuri, p.WithStorage, strings.Join(p.DiskTargets, ","), p.TLS, p.TLSDestination)
+	if len(p.CDROMSources) > 0 {
+		// As libvirt would: the destination definition must still carry each
+		// CD-ROM being pointed elsewhere.
+		live := f.activeBaseline(name)
+		if _, _, err := libvirt.MigrationCDROMXML(live, f.xml[name], p.CDROMSources); err != nil {
+			return err
+		}
+		var pairs []string
+		for from, to := range p.CDROMSources {
+			pairs = append(pairs, from+"->"+to)
+		}
+		sort.Strings(pairs)
+		note += " cdroms=" + strings.Join(pairs, ",")
+	}
+	f.record("migrate", name, note)
 	return nil
 }
 

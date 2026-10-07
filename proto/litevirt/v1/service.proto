@@ -2392,12 +2392,18 @@ message EnsureDisksRequest {
     // installer_iso_listed: the source sent installer_iso_paths (a source on an
     // older build never sets it). installer_iso_paths are the installer CD-ROM
     // paths the source's domain carries; empty means it carries none.
-    // installer_iso_runtime: the domain moves by libvirt runtime migration, so
-    // qemu here opens exactly those paths and the target must resolve the VM's
-    // ISO to the same file.
+    // installer_iso_runtime: the domain moves by libvirt runtime migration: the
+    // target resolves the VM's ISO itself and returns the file it judged for
+    // each path (installer_iso_resolved), which the destination definition the
+    // source hands libvirt carries.
     bool installer_iso_listed = 4;
     repeated string installer_iso_paths = 5;
     bool installer_iso_runtime = 6;
+    // installer_iso_sha256: for the installer CD-ROM path whose file the
+    // source judged for this VM (through its pool), that file's sha256. On a
+    // VM's first arrival in a directory another project's pool also maps, the
+    // target admits only a file with these very bytes.
+    map<string, string> installer_iso_sha256 = 7;
 }
 
 message DiskStub {
@@ -2419,6 +2425,13 @@ message EnsureDisksResponse {
     // host cannot attach its installer ISO yet (no such library or file here);
     // the VM will not start here until it can. Empty otherwise.
     string installer_iso_warning = 3;
+    // installer_iso_resolved: for a runtime migration, each listed installer
+    // CD-ROM path → the file this host resolved and judged for it. The source
+    // hands libvirt a destination definition with those sources, so qemu here
+    // opens this host's file (a link or a library directory can name another
+    // file here than on the source). An older target never sets it: the
+    // source then migrates the domain unchanged, as before.
+    map<string, string> installer_iso_resolved = 4;
 }
 
 // EnsureFirmwareStateRequest pushes a Secure-Boot/vTPM VM's firmware-state bundle

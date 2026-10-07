@@ -34,7 +34,9 @@ func newISOLsCmd() *cobra.Command {
 your projects' libraries first, then the cluster-global library "isos".
 
 In sync mode (lv cluster iso-library-mode), SYNC says whether this host's copy
-of a global-library ISO matches the library: a VM starts only where it is "ok".`,
+of a global-library ISO matches the library: a VM starts only where it is "ok".
+A library whose directory does not answer (a dead NFS server) is listed as
+<pool>/ with SYNC "unavailable".`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {

@@ -113,6 +113,9 @@ func (s *Server) CreateStoragePool(ctx context.Context, req *pb.CreateStoragePoo
 	if err := s.refuseGlobalISOLibraryOverlap(ctx, req); err != nil {
 		return nil, err
 	}
+	if err := s.refuseISOIdentityStoreOverlap(req); err != nil {
+		return nil, err
+	}
 
 	driver, err := storage.New(s.dataDir, storage.Config{
 		Driver:  req.Driver,
@@ -400,6 +403,51 @@ func (s *Server) refuseGlobalISOLibraryOverlap(ctx context.Context, req *pb.Crea
 	return nil
 }
 
+// refuseISOIdentityStoreOverlap refuses a pool at or under the host-local
+// store of ISO identity records (<data_dir>/iso-identity): a pool there could
+// upload a record that excuses a file for a VM (iso_identity.go).
+func (s *Server) refuseISOIdentityStoreOverlap(req *pb.CreateStoragePoolRequest) error {
+	if !isFileBasedDriver(req.Driver) {
+		return nil
+	}
+	dir, err := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: req.Driver, Source: req.Source, Target: req.Target})
+	if err != nil {
+		return nil // the driver reports a pool it cannot place
+	}
+	store := filepath.Join(s.dataDir, isoIdentityDir)
+	for _, a := range pathFormsOf(dir) {
+		for _, b := range pathFormsOf(store) {
+			if pathWithin(b, a) {
+				return status.Errorf(codes.InvalidArgument,
+					"pool directory %s is in %s, where this host keeps its record of the installer ISOs it judged; choose another directory", dir, store)
+			}
+		}
+	}
+	return nil
+}
+
+// pathFormsOf is p cleaned, and resolved when that differs (resolving through
+// the deepest part that exists, so a link to the place is caught too).
+func pathFormsOf(p string) []string {
+	clean := filepath.Clean(p)
+	out := []string{clean}
+	cur, rest := clean, ""
+	for {
+		if r, err := filepath.EvalSymlinks(cur); err == nil {
+			if r = filepath.Join(r, rest); r != clean {
+				out = append(out, r)
+			}
+			return out
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return out
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
+}
+
 func refuseOverlap(dir, libDir, other string) error {
 	forms := func(p string) []string {
 		out := []string{filepath.Clean(p)}
@@ -429,14 +477,16 @@ func pathWithin(dir, p string) bool {
 // ever set, before an Admin creates, replaces or deletes a global isos pool:
 // with no row the mode is derived from which isos pools exist, so that change
 // would otherwise flip it silently, with no new record generation (stale
-// records of the old mode would then count again). Best effort: it never
-// refuses the pool change.
+// records of the old mode would then count again). The pin does not start a
+// new generation: the records made while the mode was implicit keep counting
+// (corrosion.PinISOLibraryMode), so no library start is refused while the
+// hosts re-record. Best effort: it never refuses the pool change.
 func (s *Server) pinImplicitISOLibraryMode(ctx context.Context) {
 	m, err := corrosion.GetISOLibraryMode(ctx, s.db)
 	if err != nil || !m.Implicit || !s.db.MayWriteClusterPolicy() {
 		return
 	}
-	if err := corrosion.SetISOLibraryMode(ctx, s.db, m.Value, callerUsername(ctx)); err != nil {
+	if err := corrosion.PinISOLibraryMode(ctx, s.db, m.Value, callerUsername(ctx)); err != nil {
 		slog.Warn("iso library: pin the mode in force before an isos pool change", "mode", m.Value, "error", err)
 		return
 	}

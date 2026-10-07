@@ -661,15 +661,16 @@ func (s *Server) drainOneVM(ctx context.Context, vm corrosion.VMRecord, target c
 	progress := &pb.DrainProgress{VmName: vm.Name, TargetHost: target.Name, Strategy: pb.MigrateStrategy_MIGRATE_LIVE}
 	// The target's qemu opens the installer ISO from its own filesystem: the
 	// target judges that file first (EnsureDisks with no stubs does only that).
-	{
-		if _, _, ierr := s.ensureDisksOnTarget(ctx, target.Name, vm.Name, nil, false, true); ierr != nil {
-			progress.Status = "error"
-			progress.Error = "target refused the installer ISO: " + ierr.Error()
-			return progress
-		}
+	// Where it resolves the ISO to another file (a link, a library
+	// directory), the destination definition carries that file.
+	_, _, cdromSources, ierr := s.ensureDisksOnTargetISO(ctx, target.Name, vm.Name, nil, false, true)
+	if ierr != nil {
+		progress.Status = "error"
+		progress.Error = "target refused the installer ISO: " + ierr.Error()
+		return progress
 	}
 	dconnuri := fmt.Sprintf("qemu+tls://%s/system", corrosion.URIHost(target.Address))
-	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true})
+	lerr := s.virt.MigrateToTarget(vm.Name, dconnuri, libvirt.MigrateParams{Live: true, CDROMSources: cdromSources})
 	if lerr == nil {
 		// Phase 4: drain move is an ownership transition (fresh-read CAS + increment).
 		//runningcheck:allow ownership handoff — this commit names the TARGET host while

@@ -282,8 +282,11 @@ func networkMountOf(p string) string {
 // the network mount it is on. A missing directory is (zero, nil): it maps
 // nothing. Any other error fails closed.
 func probeDirCtx(ctx context.Context, p string) (dirProbe, error) {
+	// The probe is read here, not in the read's own goroutine, which can
+	// outlive this call (a directory that does not answer).
+	probe := isoDirProbe
 	v, err := deadlined(ctx, "probe:"+p, networkMountOf(p), p, func() (any, error) {
-		r, fi, err := isoDirProbe(p)
+		r, fi, err := probe(p)
 		if err != nil {
 			if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 				return dirProbe{}, nil

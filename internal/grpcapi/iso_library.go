@@ -754,9 +754,12 @@ func (s *Server) listLibrary(ctx context.Context, p corrosion.StoragePoolRecord)
 			return nil
 		}
 	}
+	// The seam is read here, not in the read's own goroutine, which can
+	// outlive this call (a directory that does not answer).
+	beforeList := isoBeforeList
 	v, err := deadlined(ctx, "list:"+dir, networkMountOf(dir), dir, func() (any, error) {
-		if isoBeforeList != nil {
-			isoBeforeList(dir)
+		if beforeList != nil {
+			beforeList(dir)
 		}
 		return s.poolContents(ctx, p)
 	})

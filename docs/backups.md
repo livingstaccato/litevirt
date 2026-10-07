@@ -566,7 +566,12 @@ a way to overwrite another project's VM disk.
     the later of this host's pull time for the image and the file's mtime.
     A refresh of the image name, here or on another host, writes another
     file and does not affect it. Otherwise it is
-    refused, saying which, and restoring to a new file still works. The
+    refused, saying which, and restoring to a new file still works. That
+    includes a file an earlier build re-pulled after the backup with
+    byte-identical content: the pull moved the file's mtime and the pull
+    time, and nothing recorded that the bytes stayed the same, so it cannot
+    be told from a pull that changed them. Restore such a backup to a new
+    file instead, which writes the backed-up bytes untouched. The
     restored header is re-pointed to the backing without opening
     what the backup named (`qemu-img rebase -u`), and the rebuilt overlay must
     name exactly that backing. An overlay backup of a disk that is now

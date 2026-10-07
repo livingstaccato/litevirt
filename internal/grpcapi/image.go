@@ -101,13 +101,13 @@ func (s *Server) PullImage(req *pb.PullImageRequest, stream pb.LiteVirt_PullImag
 			return
 		}
 		// Persist final result with a background context — stream ctx may be cancelled.
-		s.imagePublished(bgCtx, req.Name, pub)
 		if err := s.persistImageRecord(req, pub); err != nil {
 			slog.Error("image record persist failed after pull", "name", req.Name, "error", err)
 			if uerr := corrosion.UpdateImageHostStatus(bgCtx, s.db, req.Name, s.hostName, "error"); uerr != nil {
 				s.noteStateWriteFail(corrosion.OpImageHost, uerr)
 			}
 		}
+		s.imagePublished(bgCtx, req.Name, pub)
 	}()
 
 	// Stream progress to client and persist to DB for UI polling.
@@ -254,7 +254,9 @@ func recordedChecksum(declared, digest string) string {
 }
 
 // imagePublished follows a publish of image name: a heal is logged, and a
-// refresh sweeps the image's older versions nothing is built on.
+// refresh starts a sweep of the image's older versions nothing is built on —
+// in the background, bounded (pruneAfterRefresh): the refresh never waits on
+// it.
 func (s *Server) imagePublished(ctx context.Context, name string, pub image.Published) {
 	for _, f := range pub.Healed {
 		slog.Warn("image: a local copy no longer matched its recorded identity and was healed in place with byte-identical content",
@@ -267,9 +269,7 @@ func (s *Server) imagePublished(ctx context.Context, name string, pub image.Publ
 		"image", name, "current", pub.Path, "superseded", pub.Superseded)
 	// Keep the file just superseded too: a VM created on it a moment ago may
 	// not have its disk file written yet.
-	if _, _, err := s.pruneImageVersions(ctx, name, false, pub.Path, pub.Superseded); err != nil {
-		slog.Warn("image: pruning unused versions after a refresh failed", "image", name, "error", err)
-	}
+	s.pruneAfterRefresh(name, pub.Path, pub.Superseded)
 }
 
 // imageFileProvenance is the provenance of store file path of image name,

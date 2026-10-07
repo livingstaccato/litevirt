@@ -520,8 +520,15 @@ lv image import <file> --name <name>
 lv image prune [<image>] [--host <host>] [--dry-run]
 #   Removes, on one host, the image files no disk there is built on — judged
 #   from every visible disk's backing header, never from the image's name —
-#   keeping each image's current version. Needs image.import. A refresh prunes
-#   the image's older unused versions by itself, keeping the one it superseded.
+#   keeping each image's current version, every version a kept image is
+#   layered on, every version a disk create in flight may use, and every base
+#   a backup manifest in a backup repo on the host records (base_identity).
+#   A backup taken by an older build records no base and pins nothing.
+#   Needs image.import. Nothing is removed unless the whole view can be read
+#   within 2 minutes: a pool directory, a disk header, an nfs share that is
+#   not mounted or a backup repo that cannot be read refuses the prune,
+#   saying which. A refresh prunes the image's older unused versions by
+#   itself, in the background, keeping the one it superseded.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls

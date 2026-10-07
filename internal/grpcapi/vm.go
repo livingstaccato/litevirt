@@ -343,6 +343,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	spec.Uuid = uuid.NewString()
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
 
+	// A disk built on the image resolves its current file now and is recorded
+	// only below: until then no prune removes a file of the image.
+	if spec.Image != "" {
+		defer s.holdImage(spec.Image)()
+	}
+
 	// Prepare disks — track created paths for cleanup on failure.
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord

@@ -372,6 +372,17 @@ func (r *Repo) ListManifests() ([]Manifest, error) {
 	return valid, err
 }
 
+// ListParsedManifests returns every manifest that parsed, valid or not: the
+// set a reader asking "what does any backup still reference?" needs (see
+// listParsedManifests). A file that does not parse is an error.
+func (r *Repo) ListParsedManifests() ([]Manifest, error) {
+	valid, invalid, err := r.listParsedManifests()
+	if err != nil {
+		return nil, err
+	}
+	return append(valid, invalid...), nil
+}
+
 // listParsedManifests returns every manifest file that PARSED, split into those
 // that validate and those that do not.
 //

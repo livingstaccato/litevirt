@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -162,12 +163,41 @@ func TestDeletedSnapshotOverlay_ABaseAnotherVMClaimsIsRefused(t *testing.T) {
 
 // ── I-2: a VM an earlier build promoted with --no-localize ───────────────────
 
-// mainPromotedVM is what main's promote --no-localize left: in pool "dr"'s
-// directory, the raw replica web-root-<ts>.raw (no record) and the overlay
-// web-promoted-<ts>.qcow2 on it (declared raw), recorded as project a's VM
-// "pv" disk "root" with no backing_disk. Returns the record and the raw
-// bytes (a qcow2 header naming victim, never to be followed).
+// mainReplicaName is the name main (3e4ba50b) gave a raw replica of disk of
+// vm run at runAt, copied from its replication runner:
+//
+//	ts := runAt.UTC().Format("20060102-150405")             // replication_runner.go:98
+//	newName := fmt.Sprintf("%s-%s-%s.raw", sched.VMName, src.DiskName, ts) // :365
+func mainReplicaName(vm, disk string, runAt time.Time) string {
+	ts := runAt.UTC().Format("20060102-150405")
+	return fmt.Sprintf("%s-%s-%s.raw", vm, disk, ts)
+}
+
+// mainPromotedName is the overlay main (3e4ba50b) built over replica when it
+// promoted it as targetName, copied from its promote (promote.go:887-888):
+//
+//	ts := strings.TrimSuffix(strings.TrimSuffix(replica, ".qcow2"), ".raw")
+//	livePath := filepath.Join(poolDir, fmt.Sprintf("%s-promoted-%s.qcow2", targetName, ts))
+func mainPromotedName(targetName, replica string) string {
+	ts := strings.TrimSuffix(strings.TrimSuffix(replica, ".qcow2"), ".raw")
+	return fmt.Sprintf("%s-promoted-%s.qcow2", targetName, ts)
+}
+
+// mainPromotedVM is what main's promote --no-localize of VM "web" disk "root"
+// as "pv" left: in pool "dr"'s directory, the raw replica
+// web-root-<ts>.raw (no record) and the overlay
+// pv-promoted-web-root-<ts>.qcow2 on it (declared raw), recorded as project
+// a's VM "pv" disk "root" with no backing_disk. Returns the record and the
+// raw bytes (a qcow2 header naming victim, never to be followed).
 func mainPromotedVM(t *testing.T, s *Server, replicaDir func(pool string) string) (corrosion.DiskRecord, []byte) {
+	t.Helper()
+	replicaName := mainReplicaName("web", "root", time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC))
+	return promotedVMNamed(t, s, replicaDir, replicaName, mainPromotedName("pv", replicaName))
+}
+
+// promotedVMNamed is mainPromotedVM with the replica and overlay named
+// replicaName and overlayName.
+func promotedVMNamed(t *testing.T, s *Server, replicaDir func(pool string) string, replicaName, overlayName string) (corrosion.DiskRecord, []byte) {
 	t.Helper()
 	pool := t.TempDir()
 	registerPool(t, s, "dr", "dir", "", pool, "")
@@ -179,7 +209,6 @@ func mainPromotedVM(t *testing.T, s *Server, replicaDir func(pool string) string
 	}
 	raw, _ := os.ReadFile(crafted)
 	raw = append(raw, make([]byte, (1<<20)-len(raw))...)
-	const ts = "20261013-000000"
 	rdir := pool
 	if replicaDir != nil {
 		rdir = replicaDir(pool)
@@ -187,11 +216,11 @@ func mainPromotedVM(t *testing.T, s *Server, replicaDir func(pool string) string
 	if err := os.MkdirAll(rdir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	replica := filepath.Join(rdir, "web-root-"+ts+".raw")
+	replica := filepath.Join(rdir, replicaName)
 	if err := os.WriteFile(replica, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	overlay := filepath.Join(pool, "pv-promoted-"+ts+".qcow2")
+	overlay := filepath.Join(pool, overlayName)
 	if err := qcow2.CreateWithBackingFormat(overlay, replica, "raw", 1<<20, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -315,6 +344,36 @@ func TestMainPromotedVM_AReplicaNotTheVMsIsRefused(t *testing.T) {
 	}
 }
 
+// I-2, red: in main's flat layout the raw file must be exactly the replica the
+// overlay's name was built from — of the row's own disk, at a replica
+// timestamp. A replica of another disk, of another stem, or a stem that is not
+// <vm>-<disk>-<ts> is refused.
+func TestMainPromotedVM_AFlatReplicaNotTheOverlaysIsRefused(t *testing.T) {
+	at := time.Date(2026, 10, 13, 0, 0, 0, 0, time.UTC)
+	cases := map[string][2]string{
+		// a replica of disk "data", promoted, recorded as disk "root"
+		"another-disk": {mainReplicaName("web", "data", at), mainPromotedName("pv", mainReplicaName("web", "data", at))},
+		// the overlay's stem names one replica, the header another
+		"another-stem": {mainReplicaName("db", "root", at), mainPromotedName("pv", mainReplicaName("web", "root", at))},
+		// no replica timestamp in the stem (of a timestamp's length, and short)
+		"no-timestamp": {"web-root-2026101x-000000.raw", mainPromotedName("pv", "web-root-2026101x-000000.raw")},
+		"short-stem":   {"web-root-x.raw", mainPromotedName("pv", "web-root-x.raw")},
+	}
+	for name, names := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := testServer(t)
+			s.dataDir = t.TempDir()
+			registerPool(t, s, "fast", "dir", "", t.TempDir(), "")
+			promotedVMNamed(t, s, nil, names[0], names[1])
+			err := s.MoveVolume(&pb.MoveVolumeRequest{VmName: "pv", DiskName: "root", TargetPool: "fast"},
+				&streamRecorder[pb.MoveVolumeProgress]{ctx: adminCtx()})
+			if status.Code(err) != codes.FailedPrecondition || !strings.Contains(err.Error(), "raw backing") {
+				t.Errorf("move: got %v, want FailedPrecondition naming the raw backing", err)
+			}
+		})
+	}
+}
+
 // ── I-1: per-host pruning of image versions ──────────────────────────────────
 
 // TestPruneImages_NeverRemovesAVersionADiskIsBuiltOn: three versions of
@@ -396,6 +455,7 @@ func TestPullImage_RefreshPrunesUnusedVersions(t *testing.T) {
 		if err := s.ImportImage(&mockImportImageStream{ctx: adminCtx(), msgs: []*pb.ImportImageRequest{{Name: "ubuntu", Format: "qcow2", Chunk: b}}}); err != nil {
 			t.Fatal(err)
 		}
+		s.waitImagePrunes() // the refresh prunes in the background
 		versions[s.images.ImagePath("ubuntu")] = true
 	}
 	files := s.images.ImageFiles("ubuntu")

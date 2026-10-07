@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/qcow2"
@@ -325,8 +326,9 @@ func (c *diskChain) snapshotBase(layer, resolved string) bool {
 // replica of it in a directory a daemon created for exactly that VM:
 //   - this build's replica owner directory of the VM's own project and name;
 //   - or, as an earlier build laid replicas out, the pool directory itself,
-//     with the overlay <vm>-promoted-<ts>.qcow2 and the replica
-//     <source>-<disk>-<ts>.raw of the same <ts> and disk.
+//     with the overlay <vm>-promoted-<stem>.qcow2 and the replica exactly
+//     <stem>.raw, where stem is <source>-<disk>-<ts> of d's own disk name
+//     and a replica timestamp (legacyReplicaStem).
 //
 // Paths are resolved (so no symlink is in them); the pool must be one the VM's
 // project may use; the file must not be claimed by any disk row, nor recorded
@@ -384,20 +386,33 @@ func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskReco
 		if filepath.Dir(resolved) != pd {
 			continue
 		}
-		ts, ok := strings.CutPrefix(filepath.Base(layer), r.VMName+"-promoted-")
+		stem, ok := strings.CutPrefix(filepath.Base(layer), r.VMName+"-promoted-")
 		if !ok {
 			continue
 		}
-		ts, ok = strings.CutSuffix(ts, ".qcow2")
-		if !ok || ts == "" {
-			continue
-		}
-		src, ok := strings.CutSuffix(filepath.Base(resolved), "-"+r.DiskName+"-"+ts+".raw")
-		if ok && safename.ValidateVMName(src) == nil {
+		stem, ok = strings.CutSuffix(stem, ".qcow2")
+		if ok && filepath.Base(resolved) == stem+".raw" && legacyReplicaStem(stem, r.DiskName) {
 			return true
 		}
 	}
 	return false
+}
+
+// legacyReplicaStem reports whether stem is the stem an earlier build gave a
+// raw replica of disk: <source vm>-<disk>-<YYYYMMDD-HHMMSS> (its replication
+// runner wrote "%s-%s-%s.raw" of the VM, the disk and the run time in that
+// layout, and its promote named the overlay <target>-promoted-<that stem>).
+func legacyReplicaStem(stem, disk string) bool {
+	const layout = "20060102-150405"
+	if disk == "" || len(stem) <= len(layout)+1 {
+		return false
+	}
+	ts := stem[len(stem)-len(layout):]
+	if _, err := time.Parse(layout, ts); err != nil {
+		return false
+	}
+	src, ok := strings.CutSuffix(stem[:len(stem)-len(layout)], "-"+disk+"-")
+	return ok && safename.ValidateVMName(src) == nil
 }
 
 // rowsAt is every disk row whose own file is resolved.

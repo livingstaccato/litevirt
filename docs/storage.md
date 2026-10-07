@@ -171,8 +171,10 @@ resolved through symlinks, before anything opens it, and is accepted only as:
   replica. A backing declared `raw` is accepted only this way, so a linked
   clone of a promoted VM (clone → promoted overlay → raw replica) copies too —
   or, for a VM an earlier build promoted with `--no-localize` (which recorded
-  no `backing_disk`), as the replica beside its `<vm>-promoted-<ts>.qcow2` in
-  the pool directory, named `<source>-<disk>-<ts>.raw`, or in the VM's own
+  no `backing_disk`), as the replica its overlay was built from: in the pool
+  directory, the overlay `<vm>-promoted-<source>-<disk>-<ts>.qcow2` beside
+  exactly `<source>-<disk>-<ts>.raw` (the replica's own name, of the disk's
+  own name and a `YYYYMMDD-HHMMSS` replica timestamp), or in the VM's own
   replica directory, claimed by no disk row and no other project's record;
 - a file in the directory of a file-based pool on this host that the VM's
   project may use (global, or owned by that project), or the disk's own pool;

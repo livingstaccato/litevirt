@@ -971,11 +971,22 @@ func (s *Server) copyHostFileToLibrary(dir, name, src, checksum string) (string,
 	if err := storage.CheckReadFile(openedAs, s.dataDir, s.pkiDir); err != nil {
 		return "", 0, status.Errorf(codes.InvalidArgument, "host_path: %v", err)
 	}
-	// Under /home or /run only an optical disc image may be read: judged on
-	// the file opened, which is the file copied.
-	if storage.UnderUserDataRoot(src) || storage.UnderUserDataRoot(openedAs) {
+	// Under /home, /root or /run, and beside the VM disks in
+	// <data_dir>/disks, only an optical disc image may be read: judged on the
+	// file opened, which is the file copied. In disks/ it must also be no VM's
+	// disk and have no second name.
+	disksFile := storage.DataDirDisksFile(src, s.dataDir) || storage.DataDirDisksFile(openedAs, s.dataDir)
+	if disksFile {
+		if err := s.refuseVMDiskAsISO(context.Background(), openedAs); err != nil {
+			return "", 0, err
+		}
+		if err := storage.SingleLink(f); err != nil {
+			return "", 0, status.Errorf(codes.InvalidArgument, "host_path %q is beside the VM disks: %v", src, err)
+		}
+	}
+	if disksFile || storage.UnderUserDataRoot(src) || storage.UnderUserDataRoot(openedAs) {
 		if err := storage.OpticalImageAt(f); err != nil {
-			return "", 0, status.Errorf(codes.InvalidArgument, "host_path %q is under a home or runtime directory, where only an ISO image may be read: %v", src, err)
+			return "", 0, status.Errorf(codes.InvalidArgument, "host_path %q is under a home or runtime directory, or beside the VM disks, where only an ISO image may be read: %v", src, err)
 		}
 	}
 	return s.writeLibraryFile(dir, name, f, maxPoolUploadBytes, checksum, false)

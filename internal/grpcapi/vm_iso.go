@@ -263,6 +263,12 @@ func (s *Server) checkISOFile(iso string, hostPath bool) error {
 	if err := storage.CheckReadFile(iso, s.dataDir, s.pkiDir); err != nil {
 		return status.Errorf(codes.InvalidArgument, "iso: %v", err)
 	}
+	disksFile := storage.DataDirDisksFile(iso, s.dataDir)
+	if disksFile {
+		if err := s.refuseVMDiskAsISO(context.Background(), iso); err != nil {
+			return err
+		}
+	}
 	if resolved, err := filepath.EvalSymlinks(iso); err != nil || resolved != iso {
 		return status.Errorf(codes.InvalidArgument,
 			"iso %q is reached through a symlink; an ISO must be the file itself", iso)
@@ -279,7 +285,7 @@ func (s *Server) checkISOFile(iso string, hostPath bool) error {
 		if !ok || n == 1 {
 			return nil
 		}
-		if !hostPath {
+		if !hostPath || disksFile {
 			return status.Errorf(codes.InvalidArgument,
 				"iso %q has %d hard links, so it is also another file; put a copy in a library instead (`lv iso pull`)", iso, n)
 		}
@@ -306,15 +312,43 @@ func (s *Server) checkISOFile(iso string, hostPath bool) error {
 	if !os.SameFile(fi, ofi) || (openedAs != "" && openedAs != iso) {
 		return status.Errorf(codes.InvalidArgument, "iso %q changed while it was being checked; an ISO must be the file itself", iso)
 	}
-	// Under /home or /run, only an optical disc image is a file a guest may
-	// read: judged on the file just opened, not on a name.
-	if storage.UnderUserDataRoot(iso) {
+	// Under /home, /root or /run, and directly in <data_dir>/disks, only an
+	// optical disc image is a file a guest may read: judged on the file just
+	// opened, not on a name.
+	if storage.UnderUserDataRoot(iso) || disksFile {
 		if err := storage.OpticalImageAt(f); err != nil {
 			return status.Errorf(codes.InvalidArgument,
-				"iso %q is under a home or runtime directory, where only an ISO image may be attached: %v", iso, err)
+				"iso %q is under a home or runtime directory, or beside the VM disks, where only an ISO image may be attached: %v", iso, err)
 		}
 	}
 	return links(ofi)
+}
+
+// refuseVMDiskAsISO refuses, for a file directly in <data_dir>/disks — where
+// an older cluster's default pool kept its ISOs beside every project's VM
+// disks — a file that is a VM's disk: one a disk row on any host names (as its
+// file, a backing image or a linked clone's base), or one a replica or copy
+// record gives to a VM. A guest can write an ISO 9660 signature into its own
+// raw disk, so the signature alone does not tell an installer from a disk.
+// What cannot be read is refused (fail closed).
+func (s *Server) refuseVMDiskAsISO(ctx context.Context, iso string) error {
+	rows, err := s.diskReferencesAnyHost(ctx, iso)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "iso %q is beside the VM disks, and whether a VM disk is that file cannot be told: %v", iso, err)
+	}
+	if len(rows) > 0 {
+		return status.Errorf(codes.InvalidArgument, "iso %q is disk %q of VM %q, not an installer image", iso, rows[0].DiskName, rows[0].VMName)
+	}
+	recs, err := s.recordsOf(ctx, iso)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "iso %q is beside the VM disks, and whether it is a VM's replica cannot be told: %v", iso, err)
+	}
+	for _, u := range recs {
+		if u.VM != "" {
+			return status.Errorf(codes.InvalidArgument, "iso %q is a replica of disk %q of VM %q, not an installer image", iso, u.Disk, u.VM)
+		}
+	}
+	return nil
 }
 
 // isoBeforeOpen is a test seam: it runs between checkVMISOFile's checks of the

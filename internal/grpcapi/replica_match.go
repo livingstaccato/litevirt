@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -510,7 +511,7 @@ func replicaReadable(path string) error {
 	if fi.Size() == 0 {
 		return fmt.Errorf("%s is empty", filepath.Base(path))
 	}
-	f, err := os.Open(path)
+	f, err := storage.OpenPoolFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}

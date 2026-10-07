@@ -527,7 +527,7 @@ func markUpload(path string) error {
 		slog.Warn("upload marker directory is not a directory; upload not marked", "dir", mdir)
 		return nil
 	}
-	f, err := os.OpenFile(uploadMarkerPath(path), os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	f, err := storage.OpenPoolFile(uploadMarkerPath(path), os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return err
 	}

@@ -21,6 +21,7 @@ import (
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
 	"github.com/litevirt/litevirt/internal/safename"
+	"github.com/litevirt/litevirt/internal/storage"
 	"github.com/litevirt/litevirt/internal/tenancy"
 )
 
@@ -193,7 +194,7 @@ func listReplicaRecords(poolDir, project, vm string) ([]replicaRecord, error) {
 		if !e.Type().IsRegular() || !strings.HasSuffix(name, ".json") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, name))
+		data, err := storage.ReadPoolFile(filepath.Join(dir, name))
 		if err != nil {
 			continue
 		}
@@ -228,7 +229,7 @@ func writeReplicaRecord(dir string, r replicaRecord) error {
 	if err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, ".repl-*.tmp")
+	f, err := storage.CreatePoolTemp(dir, ".repl-*.tmp")
 	if err != nil {
 		return err
 	}
@@ -557,7 +558,7 @@ func proveReplicaRecords(ctx context.Context, client pb.LiteVirtClient, pool, ho
 // in the owner directory its own (project, vm) hash to. ok is false for any
 // file that is not a recorded replica.
 func replicaRecordFor(path string) (replicaRecord, bool) {
-	data, err := os.ReadFile(path + ".json")
+	data, err := storage.ReadPoolFile(path + ".json")
 	if err != nil {
 		return replicaRecord{}, false
 	}

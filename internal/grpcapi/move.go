@@ -831,6 +831,13 @@ func (s *Server) convertVMDisk(ctx context.Context, d *corrosion.DiskRecord, dst
 // source cannot be, since the copy would land raw bytes in a qcow2-declared
 // file.
 func convertImage(ctx context.Context, src, srcFormat string, rule chainRule, dst string, emit func(*pb.MoveVolumeProgress) error) error {
+	// qemu-img follows symlinks; on an NFS export mounted without
+	// nosymfollow (a kernel before 5.10) none is handed to it.
+	for _, p := range []string{src, dst} {
+		if err := storage.CheckPoolPathNoSymlinks(p); err != nil {
+			return status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+	}
 	switch srcFormat {
 	case "qcow2":
 		if _, err := precheckChain(src, rule); err != nil {

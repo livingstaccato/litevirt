@@ -110,14 +110,27 @@ an absolute path for btrfs, nothing for local and dir — so no value can reach
 NFS pools are always mounted `nosuid,nodev,noexec,nosharecache,nosymfollow`,
 whatever `options=` says. `nosharecache` gives each pool's mount its own
 superblock, so two pools on one server each report their own export as the
-mount source. `nosymfollow` needs Linux 5.10+ and a mount.nfs that passes
-it on; where it is missing the mount is refused, with an error saying so, rather
-than made weaker. An export that is already mounted without these flags — mounted
-by hand, or by an earlier build — is never remounted: the pool is refused
-(nothing lists, reads or writes it) and the daemon logs an ERROR at start and
-on each refusal, until the export is unmounted and litevirt mounts it again.
-The same holds when the pool's mount point holds anything but the pool's own
-export (compared in canonical form) — another export left there by a deleted
+mount source. `nosymfollow` needs Linux 5.10+ and a mount (mount.nfs,
+util-linux) that passes it on. Where it is not available — a kernel before
+5.10 (RHEL 8, Ubuntu 20.04, Debian 10), or a mount that refuses or drops the
+option — the pool is mounted (or hardened) with the other options and used,
+the daemon logs a WARN once per mount point, and
+every open litevirt itself makes of the pool's content (records, uploads,
+replicas, temps) follows no symlink on the export — `openat2`
+`RESOLVE_NO_SYMLINKS`, or a component-by-component `O_NOFOLLOW` walk on a
+kernel without it — and a pool path is not handed to `qemu-img` through one.
+An export that is already mounted without these flags — mounted by an earlier
+build (`vers=4,hard,intr`), or by hand — is hardened in place, at daemon start
+and at the pool's first use: `mount -o remount,bind,<its flags plus
+nosuid,nodev,noexec,nosymfollow> -- <mount point>` changes only that mount's
+flags, so nothing is unmounted and VMs running from the pool are untouched
+(the remount keeps the mount's own flags, so a read-only mount stays
+read-only). Only when that remount fails, or leaves a flag missing, is the
+pool refused (nothing lists, reads or writes it), with an ERROR at start and
+on each refusal, until it is remounted with them or unmounted and mounted again
+by litevirt. A pool whose mount point holds anything but the pool's own
+export (compared in canonical form) is refused the same way and never
+remounted — another export left there by a deleted
 pool (deleting a pool with `--target` never unmounts it), the same server's
 parent export, or a mount made by hand. Disk files the daemon creates in a pool
 are created exclusively and never through a symlink. Pool names may not start
@@ -344,7 +357,25 @@ Deleting a VM sweeps its leftover `<vm>-<disk>.qcow2` files from
 A replication run's replicas (`<vm>-<disk>-<time>.qcow2`) were never among
 what the sweep removes: they are kept when their VM is deleted. Remove them
 with a delete of the pool content (the VM's project's operators, or an admin)
-once the VM is gone.
+once the VM is gone. That holds for a replica in the pool's replica area too
+(`<pool>/.replicas/<owner>/<disk>-<time>.<ext>`): a listing shows it, under
+its file name with the VM beside it (`replica_vm`), to whoever reads the VM —
+a deleted VM's too, whose tombstone still says whose it was — and a delete of
+that name removes the file and its record. When replicas of several VMs share
+the name (one schedule's fan-out run writes them at one time), the delete
+names the VM as well (`replica_vm` on `DeleteStoragePoolContent`) and is
+refused without it. Only the VM's project's readers (holding
+`storage.content.write` on the pool) or an admin delete one, and never one a
+disk on any host uses (a `--no-localize` promotion's backing).
+
+Deleting a pool on its own directory (`<data_dir>/pools/<name>`) removes the
+daemon's own directories in it first: the replica area's empty directories,
+and the upload markers (`.litevirt-uploads`) of uploads no longer there. A
+pool still holding replicas or files is refused, naming them; with `--force`
+it is deleted anyway, as it always was: the replicas in its area go with it
+(not one a disk uses), and any other file stays where it is, in the
+directory, which is then kept — and a new pool of that name is refused the
+directory until it is emptied.
 
 A user's upload into a pool on `<data_dir>/disks` lands in
 `<data_dir>/disks/uploads/` and is listed with the pool's other content: the VM
@@ -352,7 +383,8 @@ disks' own names (`<vm>-<disk>.qcow2`) are never taken by an upload, so
 creating, deleting or migrating a VM never meets one, and the VM-disk debris
 sweep never removes a recorded upload. A name in both directories is the
 upload, to the listing and to a delete alike. Replicas are not uploads in this
-sense: they land in `<data_dir>/disks` itself, where promotion reads them.
+sense: replication runs write them into the pool's replica area, and older
+replicas stay in `<data_dir>/disks` itself, where promotion reads them too.
 Files uploaded there by an older build stay where they are.
 
 Installer media — an `.iso`, plain or compressed (`.iso.gz`, `.iso.xz`,

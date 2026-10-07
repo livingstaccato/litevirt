@@ -9,6 +9,7 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/storage"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -158,7 +159,7 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	tmp, err := os.CreateTemp(dir, ".repl-*.tmp")
+	tmp, err := storage.CreatePoolTemp(dir, ".repl-*.tmp")
 	if err != nil {
 		return "", err
 	}
@@ -201,7 +202,7 @@ func forkRawAndApply(dir, name, base string, totalSize int64, apply func(*os.Fil
 // 1 MiB chunks so holes in the source stay holes in the destination (dst is
 // pre-truncated to size). Pure file I/O — no network.
 func sparseCopyInto(dst *os.File, srcPath string) error {
-	src, err := os.Open(srcPath)
+	src, err := storage.OpenPoolFile(srcPath, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}

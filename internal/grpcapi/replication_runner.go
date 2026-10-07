@@ -785,7 +785,7 @@ func (s *Server) replicaKeyFor(ctx context.Context, vmName, disk string) (replic
 // syncPath flushes a file or directory to stable storage. A var so a test can
 // observe the order publishReplica syncs in.
 var syncPath = func(path string) error {
-	f, err := os.Open(path)
+	f, err := storage.OpenPoolFile(path, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
@@ -800,7 +800,7 @@ func publishReplica(ctx context.Context, dst string, write func(tmp string) erro
 	// half-written is collected by sweepStaleStagingTemps. The earlier
 	// ".<name>.partial" matched no sweep pattern, and the next run's new
 	// timestamp never reused it, so each crash leaked a full-size image.
-	f, err := os.CreateTemp(filepath.Dir(dst), ".repl-*.tmp")
+	f, err := storage.CreatePoolTemp(filepath.Dir(dst), ".repl-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create replica temp: %w", err)
 	}

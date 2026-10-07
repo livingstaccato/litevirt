@@ -26,6 +26,7 @@ import (
 	"github.com/litevirt/litevirt/internal/qcow2"
 	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/scheduler"
+	"github.com/litevirt/litevirt/internal/storage"
 )
 
 // PromoteReplica brings an inert replica online for disaster recovery: it
@@ -498,7 +499,7 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 	k := replicaKeyOf(vm, diskName)
 	// A replica the operator names may be any file an admin names, or one its
 	// project owns (explicitReplicaOK); the newest is chosen by record.
-	admin := req.Replica != "" && s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") == nil
+	admin := req.Replica != "" && s.namedReplicaAdmin(ctx)
 	byHost := map[string][]string{}
 	bestHost, bestName := "", ""
 	for _, h := range candidates {
@@ -536,6 +537,28 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 	newestFirst := slices.Clone(byHost[bestHost])
 	slices.Reverse(newestFirst)
 	return bestHost, newestFirst, nil
+}
+
+// namedReplicaAdmin reports whether the operator who named a replica may name
+// any file: storage.hostpath at the cluster root. A promotion relayed from the
+// entry node arrives under that node's host certificate, which authenticates
+// as admin; the operator is the bearer it relays (pki.FwdBearerMDKey),
+// resolved here, never the relaying certificate. With forwarded identity
+// enforced the context is already the operator's. A relayed call with no
+// bearer is the daemon's own or an admin's bearerless certificate, as for
+// pool content (poolContentCallerOf). A bearer that does not authenticate
+// here is no admin.
+func (s *Server) namedReplicaAdmin(ctx context.Context) bool {
+	if s.requirePeerCert(ctx) == nil && callerAuthMethod(ctx) == authMethodMTLS {
+		if fwd := fwdBearerFromCtx(ctx); fwd != "" {
+			uctx, err := s.awaitForwardedBearer(ctx, fwd)
+			if err != nil {
+				return false
+			}
+			ctx = uctx
+		}
+	}
+	return s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") == nil
 }
 
 // relayPromote forwards a PromoteReplica stream to the host that holds the
@@ -760,7 +783,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		// Only a replica the operator named (findReplicaHost) may be any file
 		// an admin names; one chosen for the VM, or merely passed in, must be
 		// the VM's own.
-		admin := req.Replica != "" && req.Replica == replica && s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") == nil
+		admin := req.Replica != "" && req.Replica == replica && s.namedReplicaAdmin(ctx)
 		if !slices.Contains(s.localReplicaNames(ctx, poolDir, k, "", false), replica) &&
 			!slices.Contains(s.localReplicaNames(ctx, poolDir, k, replica, admin), replica) {
 			return status.Errorf(codes.NotFound, "replica %q is not a replica of vm %q disk %q in pool %q on %q",
@@ -1031,7 +1054,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// A fresh, unpredictable temp (O_EXCL): qemu-img convert follows a
 			// symlink at its output, so the name must not be one anything
 			// else could have planted.
-			tf, terr := os.CreateTemp(poolDir, ".promote-*.tmp")
+			tf, terr := storage.CreatePoolTemp(poolDir, ".promote-*.tmp")
 			if terr != nil {
 				return status.Errorf(codes.Internal, "create live-disk temp: %v", terr)
 			}

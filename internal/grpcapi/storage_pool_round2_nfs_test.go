@@ -1,7 +1,10 @@
 package grpcapi
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -12,10 +15,12 @@ import (
 	"github.com/litevirt/litevirt/internal/storage"
 )
 
-// N4: an NFS export mounted without nosuid,nodev,noexec,nosymfollow (by hand,
-// or by an earlier build) is refused until litevirt mounts it again. Nothing
-// remounts it.
-func TestPoolRound2_WeakNFSMountIsRefused(t *testing.T) {
+// N4, as restored by C1: an NFS export mounted without
+// nosuid,nodev,noexec,nosymfollow — by an earlier build (vers=4,hard,intr), or
+// by hand — is hardened in place by a bind remount at its first use, and then
+// keeps working. Only one whose remount fails is refused.
+func TestPoolRound2_WeakNFSMountIsHardenedInPlaceOrRefused(t *testing.T) {
+	defer storage.OverrideNosymfollowSupportForTest(true)()
 	s := newPoolTestServer(t)
 	dir := t.TempDir()
 	if err := corrosion.UpsertStoragePool(adminCtx(), s.db, corrosion.StoragePoolRecord{
@@ -23,19 +28,38 @@ func TestPoolRound2_WeakNFSMountIsRefused(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	flags := "rw,relatime"
+	flags := "rw,relatime" // what main mounted
 	defer storage.OverrideMountInfoForTest(func() ([]byte, error) {
 		return []byte(fmt.Sprintf("1 1 0:1 / %s %s - nfs4 nas:/x rw\n", dir, flags)), nil
 	})()
+	failRemount := true
+	var remounts []string
+	defer storage.OverrideNFSRemountForTest(func(_ context.Context, cmd string, args ...string) ([]byte, error) {
+		remounts = append(remounts, cmd+" "+strings.Join(args, " "))
+		if failRemount {
+			return nil, errors.New("permission denied")
+		}
+		flags = strings.TrimPrefix(args[1], "remount,bind,")
+		return nil, nil
+	})()
 
 	if _, err := s.resolveVolume(adminCtx(), "", "nas"); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("a disk on a weak NFS mount: got %v, want FailedPrecondition", err)
+		t.Fatalf("a weak NFS mount that cannot be hardened: got %v, want FailedPrecondition", err)
 	}
 	if _, err := s.ListStoragePoolContents(adminCtx(), &pb.ListStoragePoolContentsRequest{PoolName: "nas"}); status.Code(err) != codes.FailedPrecondition {
-		t.Fatalf("listing a weak NFS mount: got %v, want FailedPrecondition", err)
+		t.Fatalf("listing a weak NFS mount that cannot be hardened: got %v, want FailedPrecondition", err)
 	}
-	flags = "rw,nosuid,nodev,noexec,nosymfollow,relatime"
+	failRemount = false
 	if _, err := s.resolveVolume(adminCtx(), "", "nas"); err != nil {
-		t.Fatalf("a hardened mount: %v", err)
+		t.Fatalf("main's NFS mount after the upgrade: %v", err)
+	}
+	if !strings.Contains(flags, "nosymfollow") || !strings.Contains(flags, "noexec") {
+		t.Fatalf("flags after the in-place hardening = %q", flags)
+	}
+	if want := "mount -o remount,bind,"; !strings.HasPrefix(remounts[len(remounts)-1], want) || !strings.HasSuffix(remounts[len(remounts)-1], " -- "+dir) {
+		t.Fatalf("remount = %q, want %s<flags> -- %s", remounts[len(remounts)-1], want, dir)
+	}
+	if _, err := s.ListStoragePoolContents(adminCtx(), &pb.ListStoragePoolContentsRequest{PoolName: "nas"}); err != nil {
+		t.Fatalf("listing main's NFS pool after the upgrade: %v", err)
 	}
 }

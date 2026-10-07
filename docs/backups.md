@@ -293,8 +293,13 @@ there by name, to `--keep`. A receiver that cannot answer at all is sent
 nothing. During a roll, a new host also takes an older sender's record-less
 incremental push, at the pool's top level, only under the exact
 `<vm>-<disk>-<time>.raw` name of one VM disk on the cluster and forked only
-from a top-level raw replica of that disk. A pruned replica is never one a VM
-disk on any host references.
+from a top-level raw replica of that disk. While any host cannot answer
+`ListReplicas`, every run that writes a replica into the area also writes the
+same data as the `<vm>-<disk>-<time>.<ext>` file at the pool's top level, so a
+failover coordinated by an older host promotes the newest replica rather than
+the last one written before the upgrade; once every host answers, runs stop
+writing it and the top-level copies are pruned. A pruned replica is never one
+a VM disk on any host references.
 
 The owner directory is keyed by project and VM name: a VM deleted and
 re-created under the same name in the same project inherits the earlier VM's

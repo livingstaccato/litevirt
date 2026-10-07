@@ -207,15 +207,23 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 		return fmt.Errorf("source and destination resolve to the same path")
 	}
 	noop := func(*pb.MoveVolumeProgress) error { return nil }
-	if _, err := publishRecordedReplica(ctx, dstDir, rec, func(tmp string) error {
+	areaPath, err := publishRecordedReplica(ctx, dstDir, rec, func(tmp string) error {
 		return convert(ctx, src.Path, tmp, noop)
-	}); err != nil {
+	})
+	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s: %v", src.DiskName, sched.TargetPool, err))
 		s.notify(ctx, notify.Notification{
 			Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
 			Detail: fmt.Sprintf("%s → %s: %v", src.DiskName, sched.TargetPool, err),
 		})
 		return fmt.Errorf("replicate %s: %w", src.DiskName, err)
+	}
+	// A main-build host promotes only top-level replicas (replica_mirror.go).
+	if s.mirrorReplicasToTopLevel(ctx) {
+		if err := s.mirrorFullLocal(ctx, sched.TargetPool, replicaKeyOf(vm, src.DiskName), areaPath,
+			legacyReplicaName(rec.VM, rec.Disk, rec.Taken, rec.Format)); err != nil {
+			s.mirrorFailed(ctx, sched.VMName, src.DiskName, sched.TargetPool, s.hostName, err)
+		}
 	}
 	pruned, perr := s.pruneRecordedReplicas(ctx, sched.TargetPool, vm.Project, sched.VMName, src.DiskName, key, sched.KeepReplicas)
 	if perr != nil {
@@ -281,6 +289,14 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	if err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: upload: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return fmt.Errorf("stream to %q: %w", targetHost, err)
+	}
+	// A main-build host promotes only top-level replicas (replica_mirror.go):
+	// the same data again, under main's name at the top level.
+	if !legacy && s.mirrorReplicasToTopLevel(ctx) {
+		if err := streamLegacyReplica(ctx, client, scratch, sched.TargetPool, targetHost, replicaKeyOf(vm, src.DiskName),
+			legacyReplicaName(rec.VM, rec.Disk, rec.Taken, rec.Format)); err != nil {
+			s.mirrorFailed(ctx, sched.VMName, src.DiskName, sched.TargetPool, targetHost, err)
+		}
 	}
 
 	pruned := 0
@@ -467,6 +483,13 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 	} else {
 		if err := s.applyIncrementRemote(ctx, targetHost, sched.TargetPool, rec, base, totalSize, session, extents); err != nil {
 			return err
+		}
+	}
+	// A main-build host promotes only top-level replicas (replica_mirror.go).
+	// To an older receiver the push above already was main's.
+	if !legacy && s.mirrorReplicasToTopLevel(ctx) {
+		if err := s.mirrorIncrement(ctx, targetHost, sched.TargetPool, replicaKeyOf(vm, src.DiskName), rec, base, totalSize, session, extents); err != nil {
+			s.mirrorFailed(ctx, sched.VMName, src.DiskName, sched.TargetPool, targetHost, err)
 		}
 	}
 

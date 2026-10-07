@@ -213,14 +213,17 @@ func TestImportVM_AFileWhoseSiblingIsStillBeingWrittenIsNotAnOrphan(t *testing.T
 	}
 }
 
-// Until replica and upload records exist on this branch, a live VM whose
-// name prefixes the file's claims it: its replica, or a disk it is growing.
+// A live VM's replica at the file's name is claimed by its replica record
+// (the pool's record of it), not by the VM's name prefixing the file's.
 func TestImportVM_AFileNamedLikeALiveVMsDisksIsNotAnOrphan(t *testing.T) {
 	s, dst := orphanFixture(t, "web-x")
 	plantOld(t, dst, "web's replica")
 	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{
 		Name: "web", HostName: "other-host", Spec: "{}", State: "stopped", Project: "default",
 	}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.recordPoolReplica(context.Background(), "default", replicaKey{VM: "web", Disk: "x-root", Project: "default"}, dst); err != nil {
 		t.Fatal(err)
 	}
 	refusedAndUntouched(t, s, "web-x", dst, "web's replica")

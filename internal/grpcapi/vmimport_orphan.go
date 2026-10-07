@@ -93,7 +93,106 @@ func (s *Server) importPathReferences(ctx context.Context, dst string, fi os.Fil
 			refs = append(refs, fmt.Sprintf("image %s on %s", r.String("image_name"), r.String("host_name")))
 		}
 	}
-	return strings.Join(refs, ", "), nil
+	more, err := s.poolFileReferences(ctx, dst, rdst, fi)
+	if err != nil {
+		return "", err
+	}
+	return strings.Join(append(refs, more...), ", "), nil
+}
+
+// poolFileReferences names what a pool's records say about the file at dst
+// (resolved to rdst): a pool record of an upload or a replica — the latter
+// matched as promotion matches it (isReplicaFor: by its record, or a replica
+// from before records by its exact runner name) for every VM whose name
+// starts the file's — and a replica area's record of the same file
+// (replica_records.go).
+func (s *Server) poolFileReferences(ctx context.Context, dst, rdst string, fi os.FileInfo) ([]string, error) {
+	dirs := []string{filepath.Dir(dst)}
+	if d := filepath.Dir(rdst); d != dirs[0] {
+		dirs = append(dirs, d)
+	}
+	uploads, err := s.loadPoolUploads(ctx, dirs...)
+	if err != nil {
+		return nil, err
+	}
+	var refs []string
+	for _, p := range []string{dst, rdst} {
+		if u, ok := s.poolUploadOf(uploads, p); ok {
+			switch {
+			case u.VM != "":
+				refs = append(refs, fmt.Sprintf("a replica of disk %s of VM %s (project %s) in pool %s, by its record", u.Disk, u.VM, displayProject(u.Project), u.Pool))
+			default:
+				refs = append(refs, fmt.Sprintf("an upload into pool %s, by its record", u.Pool))
+			}
+			return refs, nil
+		}
+	}
+	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
+	if err != nil {
+		return nil, err
+	}
+	base := strings.ToLower(filepath.Base(rdst))
+	for i := range vms {
+		vm := &vms[i]
+		if vm.Name == "" || !strings.HasPrefix(base, strings.ToLower(vm.Name)+"-") {
+			continue
+		}
+		disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range disks {
+			if s.isReplicaFor(ctx, uploads, rdst, replicaKeyOf(vm, d.DiskName)) {
+				refs = append(refs, fmt.Sprintf("a replica of disk %s of VM %s, by its name", d.DiskName, vm.Name))
+				return refs, nil
+			}
+		}
+	}
+	for _, p := range replicaAreaFiles(filepath.Dir(rdst)) {
+		if namesFile(p, rdst, fi) {
+			if r, ok := replicaRecordFor(p); ok {
+				refs = append(refs, fmt.Sprintf("replica %s of disk %s of VM %s (project %s), by its record", r.File, r.Disk, r.VM, displayProject(r.Project)))
+				return refs, nil
+			}
+		}
+	}
+	return refs, nil
+}
+
+// replicaAreaFiles is every recorded replica file in poolDir's replica area.
+func replicaAreaFiles(poolDir string) []string {
+	owners, err := os.ReadDir(filepath.Join(poolDir, replicaAreaDir))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, o := range owners {
+		if !o.IsDir() {
+			continue
+		}
+		dir := filepath.Join(poolDir, replicaAreaDir, o.Name())
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range ents {
+			if n := e.Name(); strings.HasSuffix(n, ".json") {
+				p := filepath.Join(dir, strings.TrimSuffix(n, ".json"))
+				if _, ok := replicaRecordFor(p); ok {
+					out = append(out, p)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// displayProject is a project for a message: "default" for the empty one.
+func displayProject(p string) string {
+	if p == "" {
+		return "default"
+	}
+	return p
 }
 
 // importDiskNameInFlight names a flow that may be creating the file at dst
@@ -179,9 +278,10 @@ func moveOrphanAside(p string) (string, error) {
 // Not a flow: leftovers of imports no longer running here, this import's own
 // files, and files of another import running here whose VM's names do not
 // start dst's (by their placement records); a file a disk row (live, or a
-// deleted VM's kept disk) or an image records — a running VM's disk changes
-// all the time; and a file named for an existing VM whose name does not
-// prefix dst's (that VM's replica, for now — nothing of its writes dst).
+// deleted VM's kept disk), an image, a pool record (an upload or a replica)
+// or the pool's replica area records — a running VM's disk changes all the
+// time; and a file named for an existing VM whose name does not prefix dst's
+// (nothing of that VM's writes dst).
 func (s *Server) freshSiblings(ctx context.Context, dst, importID string) ([]importSibling, error) {
 	dir, base := filepath.Dir(dst), filepath.Base(dst)
 	lb := strings.ToLower(base)
@@ -233,7 +333,7 @@ func (s *Server) freshSiblings(ctx context.Context, dst, importID string) ([]imp
 	if len(fresh) == 0 {
 		return nil, nil
 	}
-	recorded, err := s.pathsRecordedLike(ctx, prefixes[0])
+	recorded, err := s.pathsRecordedLike(ctx, dir, prefixes[0])
 	if err != nil {
 		return nil, err
 	}
@@ -258,8 +358,9 @@ type importSibling struct {
 }
 
 // pathsRecordedLike is every path a disk row (live or kept) or an image
-// records whose name holds part, in one read.
-func (s *Server) pathsRecordedLike(ctx context.Context, part string) ([]string, error) {
+// records whose name holds part, in one read, and every file in dir a pool
+// record (an upload or a replica) or dir's replica area records.
+func (s *Server) pathsRecordedLike(ctx context.Context, dir, part string) ([]string, error) {
 	like := "%" + strings.ToLower(part) + "%"
 	var out []string
 	rows, err := s.db.Query(ctx,
@@ -279,7 +380,16 @@ func (s *Server) pathsRecordedLike(ctx context.Context, part string) ([]string, 
 	for _, r := range rows {
 		out = append(out, r.String("path"))
 	}
-	return out, nil
+	uploads, err := s.loadPoolUploads(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	for p := range uploads {
+		if _, ok := s.poolUploadOf(uploads, p); ok {
+			out = append(out, p)
+		}
+	}
+	return append(out, replicaAreaFiles(dir)...), nil
 }
 
 // recordedAmong reports whether one of the recorded paths names the file fi
@@ -310,30 +420,14 @@ func namedForAnotherVM(vms []corrosion.VMRecord, ln, lb string) bool {
 	return false
 }
 
-// liveVMNamedLike names a VM whose name followed by '-' starts dst's name:
-// its disks, or a replica of one (which this branch keeps no record of), take
-// names like that.
-func (s *Server) liveVMNamedLike(ctx context.Context, dst string) (string, error) {
-	vms, err := corrosion.ListVMs(ctx, s.db, "", "")
-	if err != nil {
-		return "", err
-	}
-	lb := strings.ToLower(filepath.Base(dst))
-	for _, vm := range vms {
-		if vm.Name != "" && strings.HasPrefix(lb, strings.ToLower(vm.Name)+"-") {
-			return vm.Name, nil
-		}
-	}
-	return "", nil
-}
-
 // clearImportDiskName makes way for a converted disk at dst in pool. A file
 // there is an orphan — a crashed import's output, moved aside and kept — only
 // when nothing records it, nothing in flight may be creating it, nothing
 // beside it is still being written, and either a placement record shows it a
 // dead import's leftover, unchanged since (this host's, or that of a host
-// sharing the pool, asked), or it is named for no existing VM and has been
-// quiet for importOrphanMinAge. Anything else refuses the import.
+// sharing the pool, asked), or it has been quiet for importOrphanMinAge. What
+// claims a file is a record (importPathReferences), never a VM's name alone.
+// Anything else refuses the import.
 func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, importID, disk, dst string) error {
 	s.removeDeadPartialCopies(dst)
 	fi, err := os.Lstat(dst)
@@ -362,15 +456,8 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 		return refuse("may still be being created by " + busy + "; retry once it finishes")
 	}
 	// A leftover of an import that is no longer running, that nothing has
-	// written since, is nobody's now: not a replica or a hotplug file of the
-	// VM it is named like, and not still being written.
+	// written since, is nobody's now, and not still being written.
 	leftover := s.importLeftover(dst, fi)
-	liveVM := ""
-	if !leftover {
-		if liveVM, err = s.liveVMNamedLike(ctx, dst); err != nil {
-			return refuse(fmt.Sprintf("the VMs whose disks it may be could not be read (%v); retry", err))
-		}
-	}
 	sibs, err := s.freshSiblings(ctx, dst, importID)
 	if err != nil {
 		return refuse(fmt.Sprintf("what is being written beside it could not be read (%v); retry", err))
@@ -381,14 +468,14 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	// its own dead import (it crashed there; this is the re-import).
 	var unasked []string
 	ask := sibs
-	if !leftover && (liveVM != "" || fresh) {
+	if !leftover && fresh {
 		ask = append([]importSibling{{filepath.Base(dst), dst, fi}}, sibs...)
 	}
 	if len(ask) > 0 {
 		var dead map[string]bool
 		dead, unasked = s.peerDeadImportFiles(ctx, pool, ask)
 		if !leftover && dead[filepath.Base(dst)] {
-			leftover, liveVM = true, ""
+			leftover = true
 		}
 		var still []importSibling
 		for _, sb := range sibs {
@@ -403,9 +490,6 @@ func (s *Server) clearImportDiskName(ctx context.Context, pool, importName, impo
 	notAsked := ""
 	if len(unasked) > 0 {
 		notAsked = fmt.Sprintf(" (%s, sharing the pool, could not be asked whether it is their crashed import's)", strings.Join(unasked, ", "))
-	}
-	if liveVM != "" {
-		return refuse(fmt.Sprintf("is named like the disks of VM %s, which exists%s", liveVM, notAsked))
 	}
 	if len(sibs) > 0 {
 		return refuse(fmt.Sprintf("%s beside it was written in the last %s, so the flow writing them may still be running%s; retry once it is quiet",

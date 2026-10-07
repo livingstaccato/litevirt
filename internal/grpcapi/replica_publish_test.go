@@ -37,7 +37,7 @@ func promotableIn(t *testing.T, dir, vm, disk string) []string {
 	}
 	var out []string
 	for _, e := range ents {
-		if isReplicaOf(e.Name(), vm, disk) {
+		if replicaNameIs(e.Name(), replicaKey{VM: vm, Disk: disk}) {
 			out = append(out, e.Name())
 		}
 	}
@@ -115,6 +115,12 @@ func TestReplicateLocal_AFailedCopyLeavesNoTempBehind(t *testing.T) {
 // rename" passes both tests above.
 func TestReplicateLocal_ASuccessfulCopyIsPublished(t *testing.T) {
 	s := testServer(t)
+	// A published replica is recorded as its VM's: in the data directory,
+	// from the VM's row.
+	s.dataDir = t.TempDir()
+	if err := corrosion.InsertVM(context.Background(), s.db, corrosion.VMRecord{Name: "web-1", HostName: s.hostName, State: "running"}, nil, nil); err != nil {
+		t.Fatalf("InsertVM: %v", err)
+	}
 	dir := replicaPoolDir(t, s, "dr")
 	srcPath := filepath.Join(t.TempDir(), "root.qcow2")
 	if err := os.WriteFile(srcPath, []byte("source"), 0o600); err != nil {

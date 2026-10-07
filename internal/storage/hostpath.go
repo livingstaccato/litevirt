@@ -124,20 +124,42 @@ var systemRoots = []string{
 // directory's own pool areas.
 const litevirtVarLibPrefix = "litevirt"
 
-// dataDirPoolAreas are the only parts of the daemon's data directory a pool
-// may live in: mounts/ holds the NFS mounts the daemon makes itself, and
-// pools/<name> is a target-less local pool's own directory. disks/ is not one:
-// it holds every VM's local disks, across projects, and no pool shares it. Everything else there is the daemon's own state
-// (state.db, pki, images, the audit assertion file, …).
+// dataDirPoolAreas are the parts of the daemon's data directory a pool may
+// live in: mounts/ holds the NFS mounts the daemon makes itself, and
+// pools/<name> is a target-less local pool's own directory. Everything else
+// there is the daemon's own state (state.db, pki, images, the audit assertion
+// file, …) — except disks/ itself (dataDirDisks).
 var dataDirPoolAreas = []string{"mounts", "pools"}
+
+// dataDirDisks is <data_dir>/disks, where every VM's local disks live across
+// projects and where the built-in default pool of an older cluster still is.
+// A pool may be that directory exactly (not one inside it); what a caller
+// sees and changes in it is confined to the files its project owns by record.
+const dataDirDisks = "disks"
+
+// IsDataDirDisks reports whether p is <data_dir>/disks, as written or after
+// resolving symlinks.
+func IsDataDirDisks(p, dataDir string) bool {
+	if dataDir == "" || p == "" {
+		return false
+	}
+	for _, d := range pathForms(dataDir) {
+		for _, c := range pathForms(p) {
+			if c == filepath.Join(d, dataDirDisks) {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // CheckWriteRoot refuses a directory no pool may write into: a relative path,
 // the filesystem root, anything under a system directory, the daemon's PKI
-// directory, its data directory outside pools/ and mounts/, or any parent of
-// those two directories. Symlinks are resolved first (through the deepest part
-// of the path that exists), and both the path as written and the path it
-// resolves to must pass, so a link planted at an innocent name cannot reach a
-// refused directory.
+// directory, its data directory or any parent of it, and anything inside it
+// other than a directory under pools/ or mounts/, or disks/ itself. Symlinks
+// are resolved first (through the deepest part of the path that exists), and
+// both the path as written and the path it resolves to must pass, so a link
+// planted at an innocent name cannot reach a refused directory.
 func CheckWriteRoot(p, dataDir, pkiDir string) error {
 	if p == "" {
 		return errors.New("an empty path names no directory")
@@ -156,7 +178,7 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 				}
 			}
 		}
-		if underLitevirtVarLib(cand) && !inAnyPoolArea(dataDir, cand) {
+		if underLitevirtVarLib(cand) && !inAnyPoolArea(dataDir, cand) && !IsDataDirDisks(cand, dataDir) {
 			return fmt.Errorf("%q is under /var/lib/%s*, litevirt state", p, litevirtVarLibPrefix)
 		}
 		if pkiDir != "" {
@@ -171,8 +193,8 @@ func CheckWriteRoot(p, dataDir, pkiDir string) error {
 				if within(cand, d) {
 					return fmt.Errorf("%q is the daemon's data directory %s or contains it", p, dataDir)
 				}
-				if within(d, cand) && !inPoolArea(d, cand) {
-					return fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/ and mounts/ hold pools", p, dataDir)
+				if within(d, cand) && !inPoolArea(d, cand) && cand != filepath.Join(d, dataDirDisks) {
+					return fmt.Errorf("%q is inside the daemon's data directory %s; only its disks/, pools/ and mounts/ hold pools", p, dataDir)
 				}
 			}
 		}

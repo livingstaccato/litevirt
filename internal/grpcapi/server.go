@@ -565,6 +565,15 @@ type Server struct {
 	storagePoolsMu sync.RWMutex
 	storagePools   map[string]StoragePoolRef
 
+	// poolUploadsMu serializes the read-modify-write of <data_dir>/pool-uploads.json
+	// (storage_pool_confine.go).
+	poolUploadsMu sync.Mutex
+	// epochCache caches each shared store's records epoch (store id →
+	// epochEntry); hostStoresMu serializes this host's stores row
+	// (pool_records.go).
+	epochCache   sync.Map
+	hostStoresMu sync.Mutex
+
 	// migrationStubs is what EnsureDisks created on this host as a migration
 	// target: the only disk files this host hands to a mirror or removes after
 	// a failed attempt (migrate_stubs.go). Zero value ready.

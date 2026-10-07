@@ -1436,6 +1436,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// deferred cleanup of replicate/upload/import/restore temps — they'd
 	// otherwise accumulate and fill the pool/image dirs).
 	svc.SweepStaleStaging(ctx)
+	// The pool-file records marks SweepStaleStaging wrote are retried until
+	// the replicated rows are writable: on a new cluster failover_scope_v1
+	// latches after the first start (pool_records.go).
+	go svc.RunPoolRecordsMarker(ctx)
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.
@@ -1894,19 +1898,18 @@ func (d *Daemon) sumPoolDiskTotalGiB(ctx context.Context) int {
 func (d *Daemon) registerStoragePools(ctx context.Context) {
 	pools := d.cfg.StoragePools
 	if len(pools) == 0 {
-		// Its own directory, like every pool: never <data_dir>/disks, which
-		// holds every VM's local disks across projects.
-		defDir := filepath.Join(d.cfg.DataDir, "pools", "default")
-		if err := os.MkdirAll(defDir, 0o755); err != nil {
-			slog.Warn("create default pool directory", "dir", defDir, "error", err)
-		}
 		pools = []StoragePoolConfig{{
 			Name:   "default",
 			Driver: "local",
-			Target: defDir,
+			Target: d.defaultPoolDir(ctx),
 		}}
 	}
+	// <data_dir>/disks on NFS is an export no pool on any host may hold:
+	// every row this host registers records it (storage.DataDisksExportOption).
+	disksExp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: "dir", Target: filepath.Join(d.cfg.DataDir, "disks")})
+	configured := map[string]bool{}
 	for _, p := range pools {
+		configured[p.Name] = true
 		rec := corrosion.StoragePoolRecord{
 			HostName: d.cfg.HostName,
 			Name:     p.Name,
@@ -1914,6 +1917,18 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 			Source:   p.Source,
 			Target:   p.Target,
 			State:    "active",
+		}
+		// A directory pool on an NFS mount records the export it is on, so
+		// other hosts compare their pools against it (storage.NFSExportOption).
+		opts := map[string]string{}
+		if exp := nfsExportOfDirPool(d.cfg.DataDir, p); exp != "" {
+			opts[storage.NFSExportOption] = exp
+		}
+		if disksExp != "" {
+			opts[storage.DataDisksExportOption] = disksExp
+		}
+		if len(opts) > 0 {
+			rec.Options = opts
 		}
 		if p.Target != "" {
 			var st syscall.Statfs_t
@@ -1929,6 +1944,96 @@ func (d *Daemon) registerStoragePools(ctx context.Context) {
 			slog.Warn("failed to register storage pool", "pool", p.Name, "error", err)
 		}
 	}
+	d.refreshDirPoolExports(ctx, configured)
+}
+
+// refreshDirPoolExports records, on this host's directory pools created
+// through the API, the export each one's directory is on now (or drops a
+// recorded one that no longer holds): read at start from the mount table, so
+// a pool created by an older build, or whose fstab mount has changed, is
+// compared on other hosts by what it is today. Only rows whose record
+// differs are written.
+func (d *Daemon) refreshDirPoolExports(ctx context.Context, configured map[string]bool) {
+	rows, err := corrosion.ListStoragePoolsForHost(ctx, d.db, d.cfg.HostName)
+	if err != nil {
+		slog.Warn("storage pools: cannot refresh recorded NFS exports", "error", err)
+		return
+	}
+	for _, r := range rows {
+		switch strings.ToLower(r.Driver) {
+		case "", "local", "dir", "btrfs":
+		default:
+			continue
+		}
+		if configured[r.Name] {
+			continue
+		}
+		exp := nfsExportOfDirPool(d.cfg.DataDir, StoragePoolConfig{Driver: r.Driver, Source: r.Source, Target: r.Target})
+		if r.Options[storage.NFSExportOption] == exp {
+			continue
+		}
+		opts := make(map[string]string, len(r.Options)+1)
+		for k, v := range r.Options {
+			opts[k] = v
+		}
+		if exp == "" {
+			delete(opts, storage.NFSExportOption)
+		} else {
+			opts[storage.NFSExportOption] = exp
+		}
+		r.Options = opts
+		if err := corrosion.UpsertStoragePool(ctx, d.db, r); err != nil {
+			slog.Warn("storage pools: cannot record a pool's NFS export", "pool", r.Name, "error", err)
+		}
+	}
+}
+
+// defaultPoolDir is where the built-in default pool lives: where this host's
+// registered default pool already is when that is <data_dir>/disks (an older
+// cluster's — it is not moved), otherwise <data_dir>/pools/default, its own
+// directory.
+func (d *Daemon) defaultPoolDir(ctx context.Context) string {
+	legacy := filepath.Join(d.cfg.DataDir, "disks")
+	if rec, ok, err := corrosion.GetStoragePool(ctx, d.db, d.cfg.HostName, "default"); err == nil && ok &&
+		rec.Driver == "local" && (rec.Target == legacy || rec.Target == "") {
+		return legacy
+	}
+	defDir := filepath.Join(d.cfg.DataDir, "pools", "default")
+	if err := os.MkdirAll(defDir, 0o755); err != nil {
+		slog.Warn("create default pool directory", "dir", defDir, "error", err)
+	}
+	return defDir
+}
+
+// nfsExportOfDirPool is the export a configured directory pool's directory is
+// on ("" when on none, or not a directory pool).
+func nfsExportOfDirPool(dataDir string, p StoragePoolConfig) string {
+	var dir string
+	switch strings.ToLower(p.Driver) {
+	case "", "local":
+		dir = p.Target
+		if dir == "" {
+			dir = filepath.Join(dataDir, "disks")
+		}
+	case "dir":
+		dir = p.Target
+	case "btrfs":
+		dir = p.Source
+	default:
+		return ""
+	}
+	if dir == "" {
+		return ""
+	}
+	mt, err := storage.ReadMountTable()
+	if err != nil {
+		return ""
+	}
+	b, err := mt.NFSBackingOf(dir)
+	if err != nil || b == nil {
+		return ""
+	}
+	return b.Export.String()
 }
 
 // hardenNFSPoolMounts reports, at ERROR, every NFS pool of this host whose

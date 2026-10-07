@@ -80,6 +80,7 @@ func TestRunReplication_NoSilentDowngradeOnARunningSource(t *testing.T) {
 // the test above.
 func TestRunReplication_AStoppedSourceStillFallsBack(t *testing.T) {
 	s := testServer(t)
+	s.dataDir = t.TempDir() // where the replica's record is written
 	s.SetBackupSource(failingBackupSource{})
 	dir := seedReplicationVM(t, s, "web-2", "stopped")
 	fake := libvirtfake.New()

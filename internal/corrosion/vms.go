@@ -561,6 +561,25 @@ func SetInterfaceSecurityGroups(ctx context.Context, c *Client, vmName, networkN
 		sgsJSON, now, vmName, networkName)
 }
 
+// TombstonedDisksReferencingPath is DisksReferencingPath over SOFT-DELETED
+// rows: a disk detached from its VM, or kept when the VM was deleted, still
+// names the VM (and so the project) whose file it is.
+func TombstonedDisksReferencingPath(ctx context.Context, c *Client, path string) ([]DiskRecord, error) {
+	rows, err := c.Query(ctx,
+		`SELECT vm_name, disk_name, host_name, path
+		 FROM vm_disks
+		 WHERE (path = ? OR backing_image = ? OR backing_disk = ?) AND deleted_at IS NOT NULL`,
+		path, path, path)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]DiskRecord, len(rows))
+	for i, r := range rows {
+		out[i] = DiskRecord{VMName: r.String("vm_name"), DiskName: r.String("disk_name"), HostName: r.String("host_name"), Path: r.String("path")}
+	}
+	return out, nil
+}
+
 // GetDeletedVMDisks returns a VM's SOFT-DELETED disk records. A teardown that
 // tombstoned a VM and then failed before freeing its volumes leaves them
 // recorded only here, and they still have to be freed — GetVMDisks hides them.

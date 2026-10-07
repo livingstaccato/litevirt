@@ -3732,7 +3732,29 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 		return nil, status.Errorf(codes.InvalidArgument, "new size must be larger than current size (%d bytes)", disk.SizeBytes)
 	}
 
-	if vm.State == "running" && s.virt != nil {
+	if storage.IsBlockVolumeDriver(disk.StorageType) {
+		// A zvol or thin LV is grown by its volume manager; qemu-img (or the
+		// qcow2 code) cannot. A running VM's qemu is then told the new size.
+		// zfs set volsize also shrinks, so a volume whose size is not recorded
+		// — nothing to tell a grow from a shrink — is not resized.
+		if disk.SizeBytes <= 0 {
+			return nil, status.Errorf(codes.FailedPrecondition,
+				"disk %q of VM %q has no recorded size, so a grow cannot be told from a shrink; it is not resized", req.DiskName, req.VmName)
+		}
+		if newSizeBytes > storage.MaxBlockVolumeBytes {
+			return nil, status.Errorf(codes.InvalidArgument, "size %q is more than %d bytes", req.Size, int64(storage.MaxBlockVolumeBytes))
+		}
+		grown, err := storage.GrowBlockVolume(ctx, disk.StorageType, disk.Path, newSizeBytes)
+		if err != nil {
+			return nil, status.Errorf(codes.FailedPrecondition, "resize disk: %v", err)
+		}
+		newSizeBytes = grown
+		if vm.State == "running" && s.virt != nil {
+			if err := s.virt.BlockResize(req.VmName, disk.Path, newSizeBytes); err != nil {
+				return nil, status.Errorf(codes.Internal, "block resize: %v", err)
+			}
+		}
+	} else if vm.State == "running" && s.virt != nil {
 		// Use libvirt DomainBlockResize — resizes the image and notifies the guest in one call.
 		if err := s.virt.BlockResize(req.VmName, disk.Path, newSizeBytes); err != nil {
 			return nil, status.Errorf(codes.Internal, "block resize: %v", err)
@@ -3749,7 +3771,7 @@ func (s *Server) ResizeDisk(ctx context.Context, req *pb.ResizeDiskRequest) (*pb
 		slog.Warn("failed to update disk size in DB", "vm", req.VmName, "disk", req.DiskName, "error", err)
 	}
 
-	slog.Info("disk resized", "vm", req.VmName, "disk", req.DiskName, "new_size", req.Size)
+	slog.Info("disk resized", "vm", req.VmName, "disk", req.DiskName, "new_size", req.Size, "bytes", newSizeBytes)
 	s.recordVMEvent(ctx, req.VmName, "disk.resized", "ok", req.DiskName+":"+req.Size)
 	return s.vmToProto(ctx, req.VmName)
 }

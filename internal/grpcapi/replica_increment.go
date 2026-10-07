@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,7 +59,11 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			return status.Errorf(codes.Unavailable, "reach host %q: %v", host, perr)
 		}
 		defer conn.Close()
-		up, perr := client.PushReplicaIncrement(ctx)
+		fctx, ferr := s.forwardContentCall(ctx)
+		if ferr != nil {
+			return ferr
+		}
+		up, perr := client.PushReplicaIncrement(fctx)
 		if perr != nil {
 			return status.Errorf(codes.Unavailable, "open push to %q: %v", host, perr)
 		}
@@ -96,6 +101,28 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 			return status.Errorf(codes.FailedPrecondition, "base replica %q not present: %v", first.Base, serr)
 		}
 	}
+	// The daemon's push says whose disk it replicates (an older node's does
+	// not): the new replica must be named for it and fork only from one of
+	// its own replicas, and it is recorded as that VM's.
+	caller, err := s.poolContentCallerOf(ctx)
+	if err != nil {
+		return err
+	}
+	if caller.view == viewReplicas {
+		k := caller.replica
+		if !replicaNameIs(first.Filename, k) {
+			return notAReplicaName(first.Filename, k)
+		}
+		if first.Base != "" {
+			uploads, uerr := s.loadPoolUploads(ctx, dir)
+			if uerr != nil {
+				return status.Errorf(codes.Internal, "replica records: %v", uerr)
+			}
+			if !s.isReplicaFor(ctx, uploads, filepath.Join(dir, first.Base), k) {
+				return status.Errorf(codes.FailedPrecondition, "base %q is not a replica of vm %q disk %q", first.Base, k.VM, k.Disk)
+			}
+		}
+	}
 
 	var written int64
 	apply := func(f *os.File) error {
@@ -129,6 +156,17 @@ func (s *Server) PushReplicaIncrement(stream pb.LiteVirt_PushReplicaIncrementSer
 	dest, ferr := forkRawAndApply(dir, first.Filename, first.Base, first.TotalSize, apply)
 	if ferr != nil {
 		return status.Errorf(codes.Internal, "apply replica: %v", ferr)
+	}
+	if caller.view == viewReplicas {
+		if err := s.recordPoolReplica(ctx, rec.Name, caller.replica, dest); err != nil {
+			// Matched by its name where an unrecorded file is (see
+			// UploadStoragePoolContent); withdrawn where it would not be.
+			if !s.isLegacyUnrecorded(ctx, dest) {
+				_ = os.Remove(dest)
+				return status.Errorf(codes.Internal, "record replica: %v", err)
+			}
+			slog.Warn("replica push not recorded; it is matched by its name", "path", dest, "error", err)
+		}
 	}
 	return stream.SendAndClose(&pb.PushReplicaIncrementResponse{Path: dest, BytesWritten: written})
 }

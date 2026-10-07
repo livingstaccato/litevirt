@@ -1,7 +1,9 @@
 package grpcapi
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 
 	"google.golang.org/grpc"
@@ -190,12 +192,29 @@ func (s *Server) ReplicateVolume(req *pb.ReplicateVolumeRequest, stream grpc.Ser
 	if err := convertQcow2(ctx, src.Path, dstPath, emit); err != nil {
 		return status.Errorf(codes.Internal, "qemu-img convert: %v", err)
 	}
+	// A copy into the pool's directory is the operator's copy of the disk,
+	// whatever it is named: recorded as the VM's project's, promotable by
+	// name, and never taken for a replication run's replica — not pruned,
+	// not the newest, not an increment's base.
+	// A record that cannot be written leaves the copy where it is, and the
+	// operator is told so in the final status.
+	done := "replication complete"
+	if filepath.Dir(dstPath) == filepath.Clean(dstDir) {
+		recErr := errors.New("its VM's row cannot be read")
+		if k, ok := s.replicaKeyFor(ctx, req.VmName, req.DiskName); ok {
+			recErr = s.recordPoolCopy(ctx, req.TargetPool, k, dstPath)
+		}
+		if recErr != nil {
+			slog.Warn("replicate: copy written but not recorded as the VM's; an admin can still promote it by name", "path", dstPath, "error", recErr)
+			done = fmt.Sprintf("replication complete, but the copy is not recorded as %s's (%v): an admin can still promote it by name", req.VmName, recErr)
+		}
+	}
 
 	s.recordVMEvent(ctx, req.VmName, "disk.replicated", "ok",
 		fmt.Sprintf("%s → %s", req.DiskName, req.TargetPool))
 	return send(&pb.ReplicateVolumeProgress{
 		Phase:       pb.ReplicateVolumeProgress_DONE,
-		Status:      "replication complete",
+		Status:      done,
 		BytesCopied: src.SizeBytes,
 		CopyPct:     100,
 		TargetPath:  dstPath,

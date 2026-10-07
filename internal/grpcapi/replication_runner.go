@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -194,6 +193,7 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 	if err != nil {
 		return fmt.Errorf("resolve target dir: %w", err)
 	}
+	k, known := s.replicaKeyFor(ctx, sched.VMName, src.DiskName)
 	dstPath := filepath.Join(dstDir, fmt.Sprintf("%s-%s-%s.qcow2", sched.VMName, src.DiskName, ts))
 	if dstPath == src.Path {
 		return fmt.Errorf("source and destination resolve to the same path")
@@ -209,7 +209,30 @@ func (s *Server) replicateLocalWith(ctx context.Context, sched corrosion.BackupS
 		})
 		return fmt.Errorf("replicate %s: %w", src.DiskName, err)
 	}
-	pruned := pruneReplicas(dstDir, sched.VMName, src.DiskName, sched.KeepReplicas)
+	// The record is what makes it this VM's to promote and prune. Where an
+	// unrecorded file made now is never matched by its name (a shared store
+	// whose records epoch is known), a replica that cannot be recorded is
+	// withdrawn and the run fails, to be retried, rather than left
+	// unpromotable; elsewhere it is matched by its exact name, as before
+	// records, and the failure only warns.
+	recErr := errors.New("its VM's row cannot be read")
+	if known {
+		recErr = s.recordPoolReplica(ctx, sched.TargetPool, k, dstPath)
+	}
+	if recErr != nil && s.isLegacyUnrecorded(ctx, dstPath) {
+		slog.Warn("replication: replica written but not recorded; it is matched by its name", "vm", sched.VMName, "replica", dstPath, "error", recErr)
+		recErr = nil
+	}
+	if recErr != nil {
+		_ = os.Remove(dstPath)
+		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s: replica not recorded: %v", src.DiskName, sched.TargetPool, recErr))
+		s.notify(ctx, notify.Notification{
+			Kind: "replication.failed", Severity: notify.SevError, Subject: sched.VMName,
+			Detail: fmt.Sprintf("%s → %s: the replica could not be recorded and was withdrawn: %v", src.DiskName, sched.TargetPool, recErr),
+		})
+		return fmt.Errorf("replicate %s: record the replica: %w", src.DiskName, recErr)
+	}
+	pruned := s.pruneLocalReplicas(ctx, dstDir, k, sched.KeepReplicas)
 	detail := fmt.Sprintf("%s → %s (%s)", src.DiskName, sched.TargetPool, ts)
 	if pruned > 0 {
 		detail += fmt.Sprintf(", pruned %d old", pruned)
@@ -242,12 +265,16 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	}
 	defer conn.Close()
 
-	if err := streamFileToPool(ctx, client, scratch, sched.TargetPool, targetHost, fname); err != nil {
+	k, known := s.replicaKeyFor(ctx, sched.VMName, src.DiskName)
+	if !known {
+		return fmt.Errorf("vm %q not found", sched.VMName)
+	}
+	if err := streamFileToPool(ctx, client, scratch, sched.TargetPool, targetHost, fname, k); err != nil {
 		s.recordVMEvent(ctx, sched.VMName, "disk.replicated", "error", fmt.Sprintf("%s → %s@%s: upload: %v", src.DiskName, sched.TargetPool, targetHost, err))
 		return fmt.Errorf("stream to %q: %w", targetHost, err)
 	}
 
-	pruned := pruneReplicasRemote(ctx, client, sched.TargetPool, targetHost, sched.VMName, src.DiskName, sched.KeepReplicas)
+	pruned := s.pruneReplicasRemote(ctx, client, sched.TargetPool, targetHost, k, sched.KeepReplicas)
 	detail := fmt.Sprintf("%s → %s@%s (%s)", src.DiskName, sched.TargetPool, targetHost, ts)
 	if pruned > 0 {
 		detail += fmt.Sprintf(", pruned %d old", pruned)
@@ -256,15 +283,17 @@ func (s *Server) replicateCrossHost(ctx context.Context, sched corrosion.BackupS
 	return nil
 }
 
-// streamFileToPool uploads a local file into a peer's pool via the
+// streamFileToPool uploads a replica of k's disk into a peer's pool via the
 // client-streaming UploadStoragePoolContent RPC.
-func streamFileToPool(ctx context.Context, client pb.LiteVirtClient, path, pool, host, filename string) error {
+func streamFileToPool(ctx context.Context, client pb.LiteVirtClient, path, pool, host, filename string, k replicaKey) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	up, err := client.UploadStoragePoolContent(ctx)
+	// The daemon's own upload of a replica of k's disk: the pool's host puts
+	// it where promotion reads it and records it as that VM's.
+	up, err := client.UploadStoragePoolContent(withReplicaContentView(ctx, k, "", false))
 	if err != nil {
 		return err
 	}
@@ -290,27 +319,20 @@ func streamFileToPool(ctx context.Context, client pb.LiteVirtClient, path, pool,
 	return err
 }
 
-// pruneReplicasRemote keeps the newest keepN replicas of <vm>-<disk>-*.qcow2 in
-// a peer's pool, deleting older ones via DeleteStoragePoolContent. Returns the
-// count deleted (best-effort; errors are logged by the caller's event).
-func pruneReplicasRemote(ctx context.Context, client pb.LiteVirtClient, pool, host, vmName, diskName string, keepN int) int {
+// pruneReplicasRemote keeps the newest keepN replicas of k's disk in a peer's
+// pool, deleting older ones via DeleteStoragePoolContent. It lists and
+// deletes as the daemon, for this VM's replicas only (remoteReplicaNames), so
+// the peer refuses any other file. Returns the count deleted (best-effort;
+// errors are logged by the caller's event).
+func (s *Server) pruneReplicasRemote(ctx context.Context, client pb.LiteVirtClient, pool, host string, k replicaKey, keepN int) int {
 	if keepN <= 0 {
 		return 0
 	}
-	resp, err := client.ListStoragePoolContents(ctx, &pb.ListStoragePoolContentsRequest{PoolName: pool, Host: host})
-	if err != nil {
-		return 0
-	}
-	var names []string
-	for _, c := range resp.GetContents() {
-		if isReplicaOf(c.GetName(), vmName, diskName) {
-			names = append(names, c.GetName())
-		}
-	}
+	names := s.remoteReplicaNames(ctx, client, pool, host, k, "", false)
 	if len(names) <= keepN {
 		return 0
 	}
-	sort.Strings(names)
+	ctx = withReplicaContentView(ctx, k, "", false)
 	deleted := 0
 	for _, n := range names[:len(names)-keepN] {
 		if _, err := client.DeleteStoragePoolContent(ctx, &pb.DeleteStoragePoolContentRequest{PoolName: pool, Host: host, Filename: n}); err == nil {
@@ -328,7 +350,8 @@ func pruneReplicasRemote(ctx context.Context, client pb.LiteVirtClient, pool, ho
 // checkpoint chain and prunes old replicas. Returns an error to let the caller
 // fall back to a full qcow2 copy.
 func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.BackupScheduleRecord, vm *corrosion.VMRecord, src *corrosion.DiskRecord, targetHost, ts string) error {
-	base := s.newestRawReplica(ctx, sched.TargetPool, targetHost, sched.VMName, src.DiskName)
+	k := replicaKeyOf(vm, src.DiskName)
+	base := s.newestRawReplica(ctx, sched.TargetPool, targetHost, k)
 	// Read the anchor from the per-VM replication_checkpoints table keyed by the
 	// REAL vm (sched.VMName), NOT sched.LastCheckpoint — for fan-out scopes the
 	// schedule row's vm_name is a sentinel, so sched.LastCheckpoint is always
@@ -368,11 +391,11 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 	newName := fmt.Sprintf("%s-%s-%s.raw", sched.VMName, src.DiskName, ts)
 
 	if targetHost == s.hostName {
-		if err := s.applyIncrementLocal(ctx, sched.TargetPool, newName, base, totalSize, session, extents); err != nil {
+		if err := s.applyIncrementLocal(ctx, sched.TargetPool, newName, base, totalSize, session, extents, k); err != nil {
 			return err
 		}
 	} else {
-		if err := s.applyIncrementRemote(ctx, targetHost, sched.TargetPool, newName, base, totalSize, session, extents); err != nil {
+		if err := s.applyIncrementRemote(ctx, targetHost, sched.TargetPool, newName, base, totalSize, session, extents, k); err != nil {
 			return err
 		}
 	}
@@ -384,7 +407,7 @@ func (s *Server) replicateIncremental(ctx context.Context, sched corrosion.Backu
 	}
 	committed = true // newCP is now the recorded anchor — keep it
 
-	pruned := s.pruneReplicasAnywhere(ctx, sched.TargetPool, targetHost, sched.VMName, src.DiskName, sched.KeepReplicas)
+	pruned := s.pruneReplicasAnywhere(ctx, sched.TargetPool, targetHost, k, sched.KeepReplicas)
 	mode := "full"
 	if base != "" {
 		mode = "incremental"
@@ -418,22 +441,24 @@ func (s *Server) advanceReplicationCheckpoint(ctx context.Context, vmName, repo,
 	return nil
 }
 
-// newestRawReplica returns the newest <vm>-<disk>-*.raw file in the target pool
-// on host, or "" if none. Used as the fork base for an incremental push. Uses
-// poolContentNames (RBAC-free), since the scheduler runs unauthenticated.
-func (s *Server) newestRawReplica(ctx context.Context, pool, host, vmName, diskName string) string {
-	prefix := fmt.Sprintf("%s-%s-", vmName, diskName)
+// newestRawReplica returns the newest raw replica of k's disk in the target
+// pool on host, or "" if none. Used as the fork base for an incremental push:
+// only a replica a run made (never an operator's copy, whatever its name),
+// newest by its run time. Uses replicaNames (RBAC-free), since the scheduler
+// runs unauthenticated.
+func (s *Server) newestRawReplica(ctx context.Context, pool, host string, k replicaKey) string {
 	best := ""
-	for _, n := range s.poolContentNames(ctx, pool, host) {
-		if strings.HasPrefix(n, prefix) && strings.HasSuffix(n, ".raw") && n > best {
+	for _, n := range s.replicaNames(ctx, pool, host, k, "", false) {
+		if strings.HasSuffix(n, ".raw") && (best == "" || replicaOlder(best, n)) {
 			best = n
 		}
 	}
 	return best
 }
 
-// applyIncrementLocal writes the new raw replica into a same-host pool.
-func (s *Server) applyIncrementLocal(ctx context.Context, pool, newName, base string, totalSize int64, r io.ReaderAt, extents [][2]int64) error {
+// applyIncrementLocal writes the new raw replica of k's disk into a same-host
+// pool and records it as that VM's.
+func (s *Server) applyIncrementLocal(ctx context.Context, pool, newName, base string, totalSize int64, r io.ReaderAt, extents [][2]int64, k replicaKey) error {
 	poolRef, ok := s.resolvePool(ctx, pool)
 	if !ok {
 		return fmt.Errorf("pool %q not on host %q", pool, s.hostName)
@@ -448,19 +473,33 @@ func (s *Server) applyIncrementLocal(ctx context.Context, pool, newName, base st
 			return werr
 		})
 	}
-	_, err = forkRawAndApply(dir, newName, base, totalSize, apply)
-	return err
+	dest, err := forkRawAndApply(dir, newName, base, totalSize, apply)
+	if err != nil {
+		return err
+	}
+	// Unrecorded where that makes it unpromotable: withdrawn, and the run
+	// fails (see replicateLocalWith).
+	if err := s.recordPoolReplica(ctx, pool, k, dest); err != nil {
+		if s.isLegacyUnrecorded(ctx, dest) {
+			slog.Warn("replication: replica written but not recorded; it is matched by its name", "vm", k.VM, "replica", dest, "error", err)
+			return nil
+		}
+		_ = os.Remove(dest)
+		return fmt.Errorf("record replica %s: %w", filepath.Base(dest), err)
+	}
+	return nil
 }
 
-// applyIncrementRemote streams the new raw replica to a peer's pool via
-// PushReplicaIncrement (dirty extents only; the peer forks from base).
-func (s *Server) applyIncrementRemote(ctx context.Context, host, pool, newName, base string, totalSize int64, r io.ReaderAt, extents [][2]int64) error {
+// applyIncrementRemote streams the new raw replica of k's disk to a peer's
+// pool via PushReplicaIncrement (dirty extents only; the peer forks from
+// base, and records the replica as k's VM's).
+func (s *Server) applyIncrementRemote(ctx context.Context, host, pool, newName, base string, totalSize int64, r io.ReaderAt, extents [][2]int64, k replicaKey) error {
 	client, conn, err := s.peerClient(ctx, host)
 	if err != nil {
 		return fmt.Errorf("reach host %q: %w", host, err)
 	}
 	defer conn.Close()
-	up, err := client.PushReplicaIncrement(ctx)
+	up, err := client.PushReplicaIncrement(withReplicaContentView(ctx, k, "", false))
 	if err != nil {
 		return err
 	}
@@ -478,22 +517,23 @@ func (s *Server) applyIncrementRemote(ctx context.Context, host, pool, newName, 
 	return err
 }
 
-// pruneReplicasAnywhere prunes old replicas in the target pool, local or remote.
-func (s *Server) pruneReplicasAnywhere(ctx context.Context, pool, host, vmName, diskName string, keepN int) int {
+// pruneReplicasAnywhere prunes old replicas of k's disk in the target pool,
+// local or remote.
+func (s *Server) pruneReplicasAnywhere(ctx context.Context, pool, host string, k replicaKey, keepN int) int {
 	if host == s.hostName {
 		if poolRef, ok := s.resolvePool(ctx, pool); ok {
 			if dir, err := fileBasedPoolDir(s.dataDir, poolRef); err == nil {
-				return pruneReplicas(dir, vmName, diskName, keepN)
+				return s.pruneLocalReplicas(ctx, dir, k, keepN)
 			}
 		}
 		return 0
 	}
-	client, conn, err := s.peerClient(ctx, host)
+	client, closeFn, err := s.dialPeer(ctx, host)
 	if err != nil {
 		return 0
 	}
-	defer conn.Close()
-	return pruneReplicasRemote(ctx, client, pool, host, vmName, diskName, keepN)
+	defer closeFn()
+	return s.pruneReplicasRemote(ctx, client, pool, host, k, keepN)
 }
 
 // forEachExtentChunk reads each extent from r in ≤1 MiB pieces and hands each
@@ -572,33 +612,70 @@ func isSharedDriver(driver string) bool {
 	return false
 }
 
-// pruneReplicas keeps the newest keepN timestamped replicas of <vm>-<disk>-*.qcow2
-// in dir, deleting older ones. keepN <= 0 keeps all. Returns the count deleted.
-func pruneReplicas(dir, vmName, diskName string, keepN int) int {
+// pruneLocalReplicas keeps the newest keepN replicas of k's disk in dir
+// (localReplicaNames: by record, or an unrecorded file by its exact name;
+// never an operator's copy), deleting older ones — never one a live disk uses
+// (a promotion that kept the replica as its backing file; on shared storage,
+// on any host), as a remote prune's delete refuses too. keepN <= 0 keeps
+// all. Returns the count deleted.
+func (s *Server) pruneLocalReplicas(ctx context.Context, dir string, k replicaKey, keepN int) int {
 	if keepN <= 0 {
 		return 0
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return 0
-	}
-	var names []string
-	for _, e := range entries {
-		if !e.IsDir() && isReplicaOf(e.Name(), vmName, diskName) {
-			names = append(names, e.Name())
-		}
-	}
+	names := s.localReplicaNames(ctx, dir, k, "", false) // oldest first
 	if len(names) <= keepN {
 		return 0
 	}
-	sort.Strings(names) // timestamped suffix sorts oldest→newest
 	deleted := 0
 	for _, n := range names[:len(names)-keepN] {
-		if os.Remove(filepath.Join(dir, n)) == nil {
+		p := filepath.Join(dir, n)
+		if owners, err := s.replicaUsers(ctx, p); err != nil || len(owners) > 0 {
+			continue
+		}
+		if os.Remove(p) == nil {
 			deleted++
+			if err := s.forgetPoolUpload(ctx, p); err != nil {
+				slog.Warn("replication: pruned replica's record not dropped", "replica", p, "error", err)
+			}
 		}
 	}
 	return deleted
+}
+
+// replicaUsers returns the live disks that use the replica at path: this
+// host's, and on shared storage every host's. Another host may mount the
+// store elsewhere, where the same file has another path; this host cannot see
+// its mounts, so any live disk on another host whose file or backing file has
+// this file's name counts (replica names carry their VM, disk and run time,
+// so this keeps more, never fewer).
+func (s *Server) replicaUsers(ctx context.Context, path string) ([]corrosion.DiskRecord, error) {
+	if !sharedStoreOf(filepath.Dir(path)).Shared {
+		return s.liveDiskOwners(ctx, s.hostName, path)
+	}
+	refs, err := corrosion.DisksReferencingPath(ctx, s.db, path)
+	if err != nil {
+		return nil, err
+	}
+	named, err := corrosion.DisksReferencingName(ctx, s.db, filepath.Base(path))
+	if err != nil {
+		return nil, err
+	}
+	for _, d := range named {
+		if d.HostName != s.hostName {
+			refs = append(refs, d)
+		}
+	}
+	return refs, nil
+}
+
+// replicaKeyFor is the replica key of vmName's disk, in the VM's project;
+// false when the VM's row cannot be read.
+func (s *Server) replicaKeyFor(ctx context.Context, vmName, disk string) (replicaKey, bool) {
+	vm, err := corrosion.GetVM(ctx, s.db, vmName)
+	if err != nil || vm == nil {
+		return replicaKey{VM: vmName, Disk: disk}, false
+	}
+	return replicaKeyOf(vm, disk), true
 }
 
 // publishReplica runs write against a temporary sibling of dst and renames it
@@ -611,7 +688,7 @@ func pruneReplicas(dir, vmName, diskName string, keepN int) int {
 // candidate on a failing schedule was the broken one. On a failure the file was
 // not even removed, so it stayed the newest until the next successful run.
 //
-// The temp name is dotted and does not end in .qcow2/.raw, so isReplicaOf never
+// The temp name is dotted and does not end in .qcow2/.raw, so replicaNameIs never
 // matches it: a run that dies between the two steps leaves litter, not a
 // promotable lie. The cross-host path already worked this way — its upload
 // lands in an os.CreateTemp file and is renamed by the receiver — so this makes
@@ -635,7 +712,7 @@ var syncPath = func(path string) error {
 func publishReplica(ctx context.Context, dst string, write func(tmp string) error) error {
 	_ = ctx
 	// A ".repl-*.tmp" name in the destination directory: the rename stays on
-	// one filesystem, isReplicaOf cannot match it, and a copy a crash left
+	// one filesystem, replicaNameIs cannot match it, and a copy a crash left
 	// half-written is collected by sweepStaleStagingTemps. The earlier
 	// ".<name>.partial" matched no sweep pattern, and the next run's new
 	// timestamp never reused it, so each crash leaked a full-size image.

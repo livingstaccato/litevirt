@@ -666,17 +666,21 @@ type fileOwnership struct {
 	deletable  bool // the caller may delete it: its own upload or replica
 }
 
-// replicaOwner returns the VM and project path's replica record gives it to.
-// A file named like a replica but with no record is owned by no one through
-// its name — the name is not a record, and "<vm>-<disk>-<ts>" splits more than
-// one way. Further replica records (fix/disk-files-project-isolation) are
-// wired in here, and only here.
+// replicaOwner returns the VM and project path's replica record gives it to:
+// the pool record of a replica at the pool's top level, or the record beside a
+// replica in the pool's replica area (replicaRecordFor, replica_records.go),
+// where replication runs write every replica now. A file named like a replica
+// but with no record is owned by no one through its name — the name is not a
+// record, and "<vm>-<disk>-<ts>" splits more than one way. Replica records
+// are wired in here, and only here.
 func (c *poolFileConfinement) replicaOwner(ctx context.Context, path string) (vm, project string, ok bool) {
-	u, ok := c.s.poolUploadOf(c.uploads, path)
-	if !ok || u.VM == "" {
-		return "", "", false
+	if u, ok := c.s.poolUploadOf(c.uploads, path); ok && u.VM != "" {
+		return u.VM, u.Project, true
 	}
-	return u.VM, u.Project, true
+	if r, ok := replicaRecordFor(path); ok {
+		return r.VM, r.Project, true
+	}
+	return "", "", false
 }
 
 // ownership reads the records for path: an upload recorded for it (to any

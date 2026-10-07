@@ -71,7 +71,7 @@ func TestISORound4_ALiveMoveOfALinkedHostPathISO(t *testing.T) {
 	}
 	setMigSpec(t, s, &pb.VMSpec{Name: "mig", Iso: link, IsoScope: isoScopeHostPath})
 	srcPath := filepath.Join(dir, "virtio-win-0.1.240.iso") // the source's version: not on this host
-	r, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	r, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: []string{srcPath}, InstallerIsoRuntime: true})
 	if err != nil {
 		t.Fatalf("live move of a VM whose ISO link names another version here: %v", err)
@@ -91,7 +91,7 @@ func TestISORound4_ALiveMoveToALinkAtTheHostKeyIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	setMigSpec(t, s, &pb.VMSpec{Name: "mig", Iso: link, IsoScope: isoScopeHostPath})
-	_, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	_, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: []string{filepath.Join(dir, "virtio-win-0.1.240.iso")}, InstallerIsoRuntime: true})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("live move where the ISO link names the host key: got %v, want FailedPrecondition", err)
@@ -103,7 +103,7 @@ func TestISORound4_ALiveMoveToALinkAtTheHostKeyIsRefused(t *testing.T) {
 func TestISORound4_ALiveMoveOfALibraryISOInAnotherDirectory(t *testing.T) {
 	s, _ := stubTarget(t)
 	_, here := libraryVM(t, s, "mig", "acme")
-	r, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	r, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: []string{"/srv/source-host/isos/install.iso"}, InstallerIsoRuntime: true})
 	if err != nil {
 		t.Fatalf("live move of a library ISO whose directory differs here: %v", err)

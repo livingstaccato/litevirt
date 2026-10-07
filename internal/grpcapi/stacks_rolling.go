@@ -33,25 +33,41 @@ var _ rolling.Ops = (*serverOps)(nil)
 // leaves the old runtime alive) then creates it from a clone of `desired` renamed to
 // `target`. It DESTROYS the target's disks, so the rolling engine only reaches it
 // under an explicit recreate-class strategy.
-func (o *serverOps) recreateAs(ctx context.Context, target string, desired *pb.VMSpec) error {
+//
+// `source` is the VM the new one replaces (the target itself, or the VM a
+// "-next" replaces). When `desired` names the installer ISO that VM already
+// has, it is carried into the create as it was classified (recreateISOGrant),
+// as a compose file's unchanged volume is. Before the delete, everything the
+// create would refuse that the delete does not change is refused, so a
+// refusal leaves the target as it was (recreatePreflight).
+func (o *serverOps) recreateAs(ctx context.Context, target, source string, desired *pb.VMSpec) error {
 	if desired == nil {
 		return fmt.Errorf("recreate %q: no desired spec", target)
+	}
+	spec := proto.Clone(desired).(*pb.VMSpec)
+	spec.Name = target
+	if src, err := corrosion.GetVM(ctx, o.s.db, source); err == nil && src != nil {
+		ctx = withRecreateISOGrant(ctx, src)
+	}
+	if cur, err := corrosion.GetVM(ctx, o.s.db, target); err == nil && cur != nil {
+		if perr := o.s.recreatePreflight(ctx, spec, cur.HostName); perr != nil {
+			st := status.Convert(perr)
+			return status.Errorf(st.Code(), "recreate %s: %s; nothing was deleted", target, st.Message())
+		}
 	}
 	if _, err := o.s.DeleteVM(ctx, &pb.DeleteVMRequest{Name: target}); err != nil && status.Code(err) != codes.NotFound {
 		return fmt.Errorf("delete %s before recreate: %w", target, err)
 	}
-	spec := proto.Clone(desired).(*pb.VMSpec)
-	spec.Name = target
 	_, err := o.s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
 	return err
 }
 
 func (o *serverOps) RecreateVM(ctx context.Context, name string, desired *pb.VMSpec) error {
-	return o.recreateAs(ctx, name, desired)
+	return o.recreateAs(ctx, name, name, desired)
 }
 
 func (o *serverOps) CreateNextVM(ctx context.Context, name string, desired *pb.VMSpec) error {
-	return o.recreateAs(ctx, name+"-next", desired)
+	return o.recreateAs(ctx, name+"-next", name, desired)
 }
 
 func (o *serverOps) ReconfigureVM(ctx context.Context, name string, desired *pb.VMSpec, plan compose.ChangePlan) error {

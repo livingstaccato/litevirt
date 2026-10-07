@@ -739,21 +739,35 @@ for the UI's Browse dialog, and a sync pass gives up on it the same way.
 
 Some files are refused to everyone, Admin included, judged as written and after
 resolving symlinks: the PKI directory, anything in the data directory outside
-`pools/`, `mounts/` and `disks/uploads/` (`state.db`, the VM disks in
-`disks/`, `cloudinit/`, `nvram/`, …; the global library `pools/isos/` is under
-`pools/`), and anything under `/boot`,
-`/dev`, `/etc`, `/proc`, `/root`, `/sys`, `/var/backups`, `/var/spool`,
+`pools/`, `mounts/`, `disks/uploads/` and the ISO images directly in `disks/`
+(`state.db`, `cloudinit/`, `nvram/`, …; the global library `pools/isos/` is
+under `pools/`), and anything under `/boot`,
+`/dev`, `/etc`, `/proc`, `/sys`, `/var/backups`, `/var/spool`,
 `/var/lib/lxc`, `/var/lib/libvirt/qemu` or `/var/lib/libvirt/swtpm`. `/usr` is
 allowed (`virtio-win` installs there).
 
-Under `/home` and `/run` (`/var/run`) — where an ISO downloaded into a home
-directory, or a USB stick udisks mounts under `/run/media`, lives next to
-`~/.ssh` and runtime secrets — a file is given to a guest only when it is an
+An older cluster's default pool is `<data_dir>/disks` itself, and uploads into
+it used to land there, beside every project's VM disks: the UI offered them as
+`/var/lib/litevirt/disks/<name>.iso`. Such a file is given to a guest only when
+it is an optical disc image (as below) with a single hard link, and no VM disk
+row on any host names it — as its file, a backing image or a linked clone's
+base — and no replica record gives it to a VM. A VM created with that path
+keeps starting, an Admin may name it, and a non-admin names it through the
+pool (`default/<name>.iso`, or the path, which is taken as that reference),
+where another project's pool mapping the same directory is judged as for any
+shared pool directory.
+
+Under `/home`, `/root` and `/run` (`/var/run`) — where an ISO downloaded into
+a home directory (root's included), or a USB stick udisks mounts under
+`/run/media`, lives next to `~/.ssh` and runtime secrets — a file is given to
+a guest only when it is an
 optical disc image: a regular file carrying an ISO 9660 or UDF volume
 signature (read from the opened file, not judged by its name), not reached
 through a link into a dot-directory the path does not name itself. So
 `/home/u/isos/virtio-win.iso`, `/run/media/u/STICK/win11.iso` and libvirt's
-session pool `~/.local/share/libvirt/images/x.iso` work, and `~/.ssh/id_rsa`,
+session pool `~/.local/share/libvirt/images/x.iso` work (so does
+`/root/debian-12.iso`, for `lv iso pull --from-host-path` too), and
+`~/.ssh/id_rsa`,
 a key renamed `.iso`, or `~/isos/x.iso` linking into `~/.ssh` do not. The rule
 keeps keys and tokens out, not secrets packaged as ISOs: a cloud-init seed or
 an `autounattend` ISO in a home directory is a file the Admin names on
@@ -769,6 +783,14 @@ file.
 
 The entry node checks authority before forwarding; the owning host resolves
 the file against its own filesystem.
+
+`lv rebuild <vm>` and a recreate-class rolling update create the VM again
+from its spec, and keep its installer ISO as it was classified at its create:
+a host path (an Admin's, or one stored before `iso_scope`) stays one, judged
+on the host as at every start, whoever runs the rebuild; a pool ISO is judged
+again as its recorded kind. Anything the new create would refuse that the
+teardown does not change — the ISO included — is refused first, and the VM is
+left as it was.
 
 ### Known limits
 

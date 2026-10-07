@@ -3181,6 +3181,18 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 		}
 	}
 
+	// BEFORE anything destructive: everything the create below would refuse
+	// that the teardown does not change — the installer ISO included, judged
+	// here as the create will judge it — is refused now, with the VM intact.
+	// The VM's own ISO is carried into the create as it was classified
+	// (recreateISOGrant), so one its starts accept is not refused for want
+	// of an Admin's authority.
+	rctx := withRecreateISOGrant(ctx, vm)
+	if err := s.recreatePreflight(rctx, spec, s.hostName); err != nil {
+		st := status.Convert(err)
+		return nil, status.Errorf(st.Code(), "cannot rebuild %q: %s; nothing was changed", req.Name, st.Message())
+	}
+
 	// Stop and undefine the current domain.
 	if vm.State == "running" {
 		s.virt.DestroyDomain(req.Name)
@@ -3220,7 +3232,7 @@ func (s *Server) RebuildVM(ctx context.Context, req *pb.RebuildVMRequest) (*pb.V
 	// Recreate the VM using the stored spec.
 	slog.Info("rebuilding VM", "name", req.Name)
 	s.recordVMEvent(ctx, req.Name, "vm.rebuilt", "ok", "image="+spec.Image)
-	return s.CreateVM(ctx, &pb.CreateVMRequest{Spec: spec})
+	return s.CreateVM(rctx, &pb.CreateVMRequest{Spec: spec})
 }
 
 // CutoverVM completes a snapshot-and-replace update. The "-next" VM replaces the original.

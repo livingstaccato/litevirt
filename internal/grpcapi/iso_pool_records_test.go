@@ -29,7 +29,7 @@ func TestISOOwnership_AFirstArrivalOfAPoolRecordedFileIsAdmitted(t *testing.T) {
 	}
 	src := "/srv/source/acme-isos/install.iso"
 	move := func() error {
-		_, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig", InstallerIsoListed: true,
+		_, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig", InstallerIsoListed: true,
 			InstallerIsoPaths: []string{src}, InstallerIsoRuntime: true})
 		return err
 	}

@@ -80,6 +80,27 @@ func (s *Server) authorizeVMISO(ctx context.Context, project, host string, spec 
 	if iso == "" {
 		return nil
 	}
+	// A VM re-created (rebuilt, or recreated by a rolling update) keeps the
+	// ISO it has, as it was classified (recreateISOGrant): a host path stays
+	// one — the owner judges the file in full at the create, as at every
+	// start (resolveVMISO) — and a pool ISO is judged again as its recorded
+	// kind.
+	if g, ok := recreateISOGrantFor(ctx, iso, project); ok {
+		if g.hostPath() {
+			if filepath.Clean(iso) != iso {
+				return status.Errorf(codes.InvalidArgument,
+					"iso %q must be an absolute, clean path on the target host", iso)
+			}
+			if err := storage.CheckReadPathLexical(iso, s.dataDir, s.pkiDir); err != nil {
+				return status.Errorf(codes.InvalidArgument, "iso: %v", err)
+			}
+			spec.IsoScope = g.scope
+			return nil
+		}
+		if trusted == "" {
+			trusted = g.scope
+		}
+	}
 	poolScope := func(pool, file string) error {
 		kind, err := s.authorizeISORef(ctx, project, host, pool, file)
 		if err != nil {
@@ -263,6 +284,12 @@ func (s *Server) checkISOFile(iso string, hostPath bool) error {
 	if err := storage.CheckReadFile(iso, s.dataDir, s.pkiDir); err != nil {
 		return status.Errorf(codes.InvalidArgument, "iso: %v", err)
 	}
+	disksFile := storage.DataDirDisksFile(iso, s.dataDir)
+	if disksFile {
+		if err := s.refuseVMDiskAsISO(context.Background(), iso); err != nil {
+			return err
+		}
+	}
 	if resolved, err := filepath.EvalSymlinks(iso); err != nil || resolved != iso {
 		return status.Errorf(codes.InvalidArgument,
 			"iso %q is reached through a symlink; an ISO must be the file itself", iso)
@@ -279,7 +306,7 @@ func (s *Server) checkISOFile(iso string, hostPath bool) error {
 		if !ok || n == 1 {
 			return nil
 		}
-		if !hostPath {
+		if !hostPath || disksFile {
 			return status.Errorf(codes.InvalidArgument,
 				"iso %q has %d hard links, so it is also another file; put a copy in a library instead (`lv iso pull`)", iso, n)
 		}
@@ -306,15 +333,43 @@ func (s *Server) checkISOFile(iso string, hostPath bool) error {
 	if !os.SameFile(fi, ofi) || (openedAs != "" && openedAs != iso) {
 		return status.Errorf(codes.InvalidArgument, "iso %q changed while it was being checked; an ISO must be the file itself", iso)
 	}
-	// Under /home or /run, only an optical disc image is a file a guest may
-	// read: judged on the file just opened, not on a name.
-	if storage.UnderUserDataRoot(iso) {
+	// Under /home, /root or /run, and directly in <data_dir>/disks, only an
+	// optical disc image is a file a guest may read: judged on the file just
+	// opened, not on a name.
+	if storage.UnderUserDataRoot(iso) || disksFile {
 		if err := storage.OpticalImageAt(f); err != nil {
 			return status.Errorf(codes.InvalidArgument,
-				"iso %q is under a home or runtime directory, where only an ISO image may be attached: %v", iso, err)
+				"iso %q is under a home or runtime directory, or beside the VM disks, where only an ISO image may be attached: %v", iso, err)
 		}
 	}
 	return links(ofi)
+}
+
+// refuseVMDiskAsISO refuses, for a file directly in <data_dir>/disks — where
+// an older cluster's default pool kept its ISOs beside every project's VM
+// disks — a file that is a VM's disk: one a disk row on any host names (as its
+// file, a backing image or a linked clone's base), or one a replica or copy
+// record gives to a VM. A guest can write an ISO 9660 signature into its own
+// raw disk, so the signature alone does not tell an installer from a disk.
+// What cannot be read is refused (fail closed).
+func (s *Server) refuseVMDiskAsISO(ctx context.Context, iso string) error {
+	rows, err := s.diskReferencesAnyHost(ctx, iso)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "iso %q is beside the VM disks, and whether a VM disk is that file cannot be told: %v", iso, err)
+	}
+	if len(rows) > 0 {
+		return status.Errorf(codes.InvalidArgument, "iso %q is disk %q of VM %q, not an installer image", iso, rows[0].DiskName, rows[0].VMName)
+	}
+	recs, err := s.recordsOf(ctx, iso)
+	if err != nil {
+		return status.Errorf(codes.FailedPrecondition, "iso %q is beside the VM disks, and whether it is a VM's replica cannot be told: %v", iso, err)
+	}
+	for _, u := range recs {
+		if u.VM != "" {
+			return status.Errorf(codes.InvalidArgument, "iso %q is a replica of disk %q of VM %q, not an installer image", iso, u.Disk, u.VM)
+		}
+	}
+	return nil
 }
 
 // isoBeforeOpen is a test seam: it runs between checkVMISOFile's checks of the
@@ -407,7 +462,7 @@ func (s *Server) judgedCDROMDefinition(vm *corrosion.VMRecord, domXML string) (s
 	if len(cdroms) == 0 {
 		return domXML, nil
 	}
-	resolved, _, err := s.installerISOResolution(context.Background(), vm, vmSpecFor(vm), cdroms, "", false)
+	resolved, _, err := s.installerISOResolution(context.Background(), vm, vmSpecFor(vm), cdroms, "", false, false)
 	if err != nil {
 		return "", err
 	}
@@ -443,8 +498,10 @@ func (s *Server) judgedCDROMDefinition(vm *corrosion.VMRecord, domXML string) (s
 // wantSHA is a migration source's hash of the file it judged. With
 // tolerateAbsent (a stopped VM's move), an ISO that is not here — its pool,
 // its directory or its file — is left out with a warning instead of refused;
-// the start here judges it again.
-func (s *Server) installerISOResolution(ctx context.Context, vm *corrosion.VMRecord, spec *pb.VMSpec, cdroms []string, wantSHA string, tolerateAbsent bool) (map[string]string, []string, error) {
+// the start here judges it again. With listed (paths a migration source
+// named), each CD-ROM other than the VM's ISO is read under the probe budget
+// (resolveListedISO).
+func (s *Server) installerISOResolution(ctx context.Context, vm *corrosion.VMRecord, spec *pb.VMSpec, cdroms []string, wantSHA string, tolerateAbsent, listed bool) (map[string]string, []string, error) {
 	out := map[string]string{}
 	var warnings []string
 	absent := func(what string) {
@@ -504,6 +561,18 @@ func (s *Server) installerISOResolution(ctx context.Context, vm *corrosion.VMRec
 			}
 			continue
 		}
+		if listed {
+			r, gone, err := s.resolveListedISO(ctx, c, tolerateAbsent)
+			if err != nil {
+				return nil, nil, s.refuseISO(vm.Name, c, err)
+			}
+			if gone {
+				absent("no file " + c)
+				continue
+			}
+			out[c] = r
+			continue
+		}
 		if tolerateAbsent && hostFileAbsent(c) && storage.CheckRefusedReadPath(c, s.dataDir, s.pkiDir) == nil {
 			absent("no file " + c)
 			continue
@@ -516,6 +585,41 @@ func (s *Server) installerISOResolution(ctx context.Context, vm *corrosion.VMRec
 	}
 	return out, warnings, nil
 }
+
+// resolveListedISO judges a CD-ROM path a migration source listed that is
+// not the VM's own ISO (resolveHostISO, or absent with tolerateAbsent) under
+// the probe budget (deadlined): a path on a filesystem that does not answer
+// is refused once the budget runs out rather than pinning one of this
+// daemon's threads per request.
+func (s *Server) resolveListedISO(ctx context.Context, c string, tolerateAbsent bool) (resolved string, absent bool, err error) {
+	type answer struct {
+		resolved string
+		absent   bool
+		err      error
+	}
+	key := fmt.Sprintf("listed-iso:%t:%s", tolerateAbsent, c)
+	before := listedISOBeforeRead
+	v, derr := deadlined(ctx, key, networkMountOf(c), c, func() (any, error) {
+		if before != nil {
+			before(c)
+		}
+		if tolerateAbsent && hostFileAbsent(c) && storage.CheckRefusedReadPath(c, s.dataDir, s.pkiDir) == nil {
+			return answer{absent: true}, nil
+		}
+		r, err := s.resolveHostISO(c)
+		return answer{resolved: r, err: err}, nil
+	})
+	if derr != nil {
+		return "", false, status.Errorf(codes.FailedPrecondition, "iso %q could not be read on this host: %v", c, derr)
+	}
+	a := v.(answer)
+	return a.resolved, a.absent, a.err
+}
+
+// listedISOBeforeRead is a test seam: it runs at the start of a listed
+// path's read, inside its budget, where a filesystem that does not answer
+// would block.
+var listedISOBeforeRead func(path string)
 
 // hostFileAbsent reports that p names nothing on this host (a dangling link
 // included).
@@ -543,25 +647,42 @@ func hostFileAbsent(p string) bool {
 // until it is present — while one that names a pool of another kind or
 // another project here is refused, file or no file.
 //
+// Only a peer host — the migration source — says which CD-ROMs its domain
+// carries, and only the VM's owning host the hash of the file it judged
+// (wantSHA, which admits a file by its bytes and records it as the VM's). A
+// caller that is not a peer (a user holding vm.migrate on the VM) has those
+// fields ignored, as on main: this host judges the VM's own ISO and no path
+// the caller names.
+//
 // A source on an older build lists nothing (installer_iso_listed=false). On
 // main the only caller of EnsureDisks is the storage-copy path of a RUNNING
 // VM's libvirt runtime migration (a stopped or cold move from an older source
 // never calls the target, and its start here judges the ISO), so an unlisted
 // call is a runtime move, and the domain arrives unchanged: a pool ISO must
 // resolve here, and a host path is judged as itself.
-func (s *Server) verifyIncomingVMISO(vm *corrosion.VMRecord, req *pb.EnsureDisksRequest) (string, map[string]string, error) {
+func (s *Server) verifyIncomingVMISO(callCtx context.Context, vm *corrosion.VMRecord, req *pb.EnsureDisksRequest) (string, map[string]string, error) {
 	spec := vmSpecFor(vm)
 	if spec == nil {
 		spec = &pb.VMSpec{}
 	}
-	ctx := context.Background()
+	ctx := withReadProject(context.Background(), vm.Project)
 	runtime := req.GetInstallerIsoRuntime()
-	if req.GetInstallerIsoListed() {
+	listed := req.GetInstallerIsoListed()
+	if listed && s.requirePeerCert(callCtx) != nil {
+		slog.Warn("EnsureDisks: installer ISO paths and hash from a caller that is not a peer host are ignored",
+			"vm", vm.Name, "host", s.hostName, "caller", callerUsername(callCtx))
+		listed = false
+	}
+	if listed {
 		paths := req.GetInstallerIsoPaths()
 		if len(paths) == 0 {
 			return "", nil, nil
 		}
-		resolved, warnings, err := s.installerISOResolution(ctx, vm, spec, paths, singleSHA(req.GetInstallerIsoSha256()), !runtime)
+		wantSHA := ""
+		if cn := callerMTLSCommonName(callCtx); cn != "" && cn == vm.HostName {
+			wantSHA = singleSHA(req.GetInstallerIsoSha256())
+		}
+		resolved, warnings, err := s.installerISOResolution(ctx, vm, spec, paths, wantSHA, !runtime, true)
 		if err != nil {
 			return "", nil, err
 		}

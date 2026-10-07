@@ -176,7 +176,7 @@ func TestISORound3_AStoppedMoveToAnotherProjectsPoolIsRefusedFileOrNot(t *testin
 		t.Fatal(err)
 	}
 	projectLibrary(t, s, "b-lib", "other")
-	_, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	_, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: []string{"/srv/source/b-lib/x.iso"}, InstallerIsoRuntime: false})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("stopped move to a host whose b-lib is another project's (file absent): got %v, want FailedPrecondition", err)
@@ -192,7 +192,7 @@ func TestISORound3_AnOlderSourcesMoveIsRuntime(t *testing.T) {
 	if err := s.db.Execute(context.Background(), `UPDATE vms SET spec = ?, project = 'acme' WHERE name = 'mig'`, string(spec)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig"}); status.Code(err) != codes.FailedPrecondition {
+	if _, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig"}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("an older source's move with the ISO absent here: got %v, want FailedPrecondition", err)
 	}
 }

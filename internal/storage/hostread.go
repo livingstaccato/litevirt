@@ -24,8 +24,12 @@ import (
 // hypervisor state. /usr and the library directories are deliberately absent:
 // they hold nothing secret, and distribution ISOs live there (virtio-win
 // installs into /usr/share/virtio-win).
+//
+// /root is not one: an Admin logged in as root downloads installer ISOs into
+// it, so it is a user-data root (userDataRoots), where ~root/.ssh and the
+// rest stay refused.
 var secretRoots = []string{
-	"/boot", "/dev", "/etc", "/proc", "/root", "/sys",
+	"/boot", "/dev", "/etc", "/proc", "/sys",
 	"/var/backups", "/var/spool",
 	// LXC container root filesystems and configs.
 	"/var/lib/lxc",
@@ -40,8 +44,8 @@ var secretRoots = []string{
 // given only when it is an optical disc image (OpticalImageAt) and a regular
 // file, reached without a link leading into a dot-directory the path as named
 // does not name (introducedDotComponent); everything else under them is
-// refused like a secret root. /var/run is /run.
-var userDataRoots = []string{"/home", "/run", "/var/run"}
+// refused like a secret root. /var/run is /run; /root is root's home.
+var userDataRoots = []string{"/home", "/root", "/run", "/var/run"}
 
 // SetUserDataRootsForTest replaces the user-data roots and returns what
 // restores them, so a test can stand a temporary directory in for /home or
@@ -63,22 +67,28 @@ const ISOLibraryDir = "pools/isos"
 // unclean path (one that still carries a "." or ".." to resolve), anything
 // under a secret system directory, anything in or below the daemon's PKI
 // directory, and anything in its data directory outside pools/, mounts/ and
-// disks/uploads/ (state.db, cloudinit/, nvram/, imports/, images/, the VM
-// disks in disks/ …; the global ISO library, pools/isos/, is under pools/). Under a user-data root (/home, /run) only an
-// optical disc image passes, and not one a link reaches through a
-// dot-directory the named path does not name (userDataRoots). The path is
-// judged as written and after resolving symlinks, so a link at an innocent
-// name does not reach a refused file. It must also exist and be a regular
-// file once resolved: a device, directory or FIFO is never an ISO.
+// disks/uploads/ (state.db, cloudinit/, nvram/, imports/, images/, …; the
+// global ISO library, pools/isos/, is under pools/). Under a user-data root
+// (/home, /root, /run) only an optical disc image passes, and not one a link
+// reaches through a dot-directory the named path does not name
+// (userDataRoots). A file directly in <data_dir>/disks — where an older
+// cluster's default pool kept its ISOs beside the VM disks — passes only as
+// an optical disc image with a single link (DataDirDisksFile; whether a VM
+// disk row names it is the caller's to refuse). The path is judged as written
+// and after resolving symlinks, so a link at an innocent name does not reach a
+// refused file. It must also exist and be a regular file once resolved: a
+// device, directory or FIFO is never an ISO.
 func CheckReadFile(p, dataDir, pkiDir string) error {
 	if err := checkReadPathLexical(p); err != nil {
 		return err
 	}
-	userData := false
+	userData, disksFile := false, false
 	for _, cand := range pathForms(p) {
-		if err := refuseSecretPath(p, cand, dataDir, pkiDir); err != nil {
+		inDisks, err := refuseSecretPath(p, cand, dataDir, pkiDir)
+		if err != nil {
 			return err
 		}
+		disksFile = disksFile || inDisks
 		userData = userData || underUserDataRoot(cand)
 	}
 	fi, err := os.Stat(p)
@@ -91,8 +101,11 @@ func CheckReadFile(p, dataDir, pkiDir string) error {
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%q is not a regular file", p)
 	}
-	if userData {
-		return checkUserDataFile(p)
+	switch {
+	case disksFile:
+		return checkOpticalFile(p, true, "in the daemon's disks directory, beside the VM disks")
+	case userData:
+		return checkOpticalFile(p, false, "under a home or runtime directory")
 	}
 	return nil
 }
@@ -145,12 +158,14 @@ func introducedDotComponent(named, resolved string) string {
 	return ""
 }
 
-// checkUserDataFile is the rule for a file under a user-data root: no link on
-// the way to it leads into a dot-directory the path as named does not name,
-// and the file the resolved path opens — opened without following a link, and
-// confirmed to be that path — is a regular file carrying an ISO 9660 or UDF
-// volume signature. A key, a token or a database carries none.
-func checkUserDataFile(p string) error {
+// checkOpticalFile is the rule for a file under a user-data root, or directly
+// in <data_dir>/disks: no link on the way to it leads into a dot-directory the
+// path as named does not name, and the file the resolved path opens — opened
+// without following a link, and confirmed to be that path — is a regular file
+// carrying an ISO 9660 or UDF volume signature. A key, a token, a database or
+// a qcow2 disk carries none. With singleLink the opened file must also have a
+// single hard link, so it is not a second name for some other file.
+func checkOpticalFile(p string, singleLink bool, where string) error {
 	resolved, err := filepath.EvalSymlinks(p)
 	if err != nil {
 		return fmt.Errorf("%q: %w", p, err)
@@ -166,8 +181,26 @@ func checkUserDataFile(p string) error {
 	if real, rerr := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", f.Fd())); rerr == nil && real != resolved {
 		return fmt.Errorf("%q changed while it was being checked", p)
 	}
+	if singleLink {
+		if err := SingleLink(f); err != nil {
+			return fmt.Errorf("%q is %s, where only an ISO image may be attached: %w", p, where, err)
+		}
+	}
 	if err := OpticalImageAt(f); err != nil {
-		return fmt.Errorf("%q is under a home or runtime directory, where only an ISO image may be attached: %w", p, err)
+		return fmt.Errorf("%q is %s, where only an ISO image may be attached: %w", p, where, err)
+	}
+	return nil
+}
+
+// SingleLink refuses an open file with more than one hard link: a second name
+// for a file is that file, whatever the name says.
+func SingleLink(f *os.File) error {
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && uint64(st.Nlink) != 1 {
+		return fmt.Errorf("it has %d hard links, so it is also another file", st.Nlink)
 	}
 	return nil
 }
@@ -221,7 +254,8 @@ func CheckReadPathLexical(p, dataDir, pkiDir string) error {
 	if err := checkReadPathLexical(p); err != nil {
 		return err
 	}
-	return refuseSecretPath(p, p, dataDir, pkiDir)
+	_, err := refuseSecretPath(p, p, dataDir, pkiDir)
+	return err
 }
 
 // CheckRefusedReadPath refuses only the protected places — what no caller may
@@ -235,7 +269,7 @@ func CheckRefusedReadPath(p, dataDir, pkiDir string) error {
 		return nil
 	}
 	for _, cand := range pathForms(p) {
-		if err := refuseSecretPath(p, cand, dataDir, pkiDir); err != nil {
+		if _, err := refuseSecretPath(p, cand, dataDir, pkiDir); err != nil {
 			return err
 		}
 		if underUserDataRoot(cand) {
@@ -260,29 +294,62 @@ func checkReadPathLexical(p string) error {
 	return nil
 }
 
-func refuseSecretPath(p, cand, dataDir, pkiDir string) error {
+// refuseSecretPath refuses cand (p, as written or resolved) in a protected
+// place. inDisks reports a file directly in <data_dir>/disks, which is not
+// refused here but is readable only as an optical image (CheckReadFile) that
+// no VM disk is (the caller).
+func refuseSecretPath(p, cand, dataDir, pkiDir string) (inDisks bool, err error) {
 	for _, root := range secretRoots {
 		for _, r := range pathForms(root) {
 			if within(r, cand) {
-				return fmt.Errorf("%q is under %s, which holds host secrets or live system state", p, root)
+				return false, fmt.Errorf("%q is under %s, which holds host secrets or live system state", p, root)
 			}
 		}
 	}
 	if pkiDir != "" {
 		for _, d := range pathForms(pkiDir) {
 			if within(d, cand) {
-				return fmt.Errorf("%q is in the daemon's PKI directory %s", p, pkiDir)
+				return false, fmt.Errorf("%q is in the daemon's PKI directory %s", p, pkiDir)
 			}
 		}
 	}
 	if dataDir != "" {
 		for _, d := range pathForms(dataDir) {
-			if within(d, cand) && !inPoolArea(d, cand) && !inDiskUploads(d, cand) {
-				return fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/, mounts/ and disks/uploads/ hold pool content", p, dataDir)
+			if !within(d, cand) || inPoolArea(d, cand) || inDiskUploads(d, cand) {
+				continue
+			}
+			if inDataDirDisksTop(d, cand) {
+				inDisks = true
+				continue
+			}
+			return false, fmt.Errorf("%q is inside the daemon's data directory %s; only its pools/, mounts/, disks/uploads/ and the ISO images directly in disks/ hold pool content", p, dataDir)
+		}
+	}
+	return inDisks, nil
+}
+
+// inDataDirDisksTop reports whether p is directly in <dataDir>/disks: not
+// disks/ itself, and not in a directory below it.
+func inDataDirDisksTop(dataDir, p string) bool {
+	return filepath.Dir(filepath.Clean(p)) == filepath.Join(dataDir, dataDirDisks)
+}
+
+// DataDirDisksFile reports whether p, as written or resolved, is a file
+// directly in <data_dir>/disks — where every VM's local disks live and an
+// older cluster's default pool kept its ISOs — which a guest may be given only
+// as an optical image no VM disk row names.
+func DataDirDisksFile(p, dataDir string) bool {
+	if dataDir == "" || p == "" {
+		return false
+	}
+	for _, d := range pathForms(dataDir) {
+		for _, c := range pathForms(p) {
+			if inDataDirDisksTop(d, c) {
+				return true
 			}
 		}
 	}
-	return nil
+	return false
 }
 
 // DataDirDiskUploads is where users' uploads into a pool on <data_dir>/disks

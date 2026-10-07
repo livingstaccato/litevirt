@@ -87,11 +87,11 @@ func TestISOIdentity_AStoppedMoveToAHostWithoutTheISOIsAllowed(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := []string{"/srv/source/a-lib/foo.iso"}
-	if _, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	if _, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: src, InstallerIsoRuntime: false}); err != nil {
 		t.Fatalf("stopped move to a host without a-lib: %v", err)
 	}
-	if _, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	if _, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: src, InstallerIsoRuntime: true}); status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("live move to a host without a-lib: got %v, want FailedPrecondition", err)
 	}
@@ -107,7 +107,7 @@ func TestISOIdentity_AStoppedMoveStillJudgesAuthority(t *testing.T) {
 	}
 	lib := projectLibrary(t, s, "b-lib", "other")
 	writeLibFile(t, filepath.Join(lib, "x.iso"), isoBody)
-	_, err := s.EnsureDisks(adminCtx(), &pb.EnsureDisksRequest{VmName: "mig",
+	_, err := s.EnsureDisks(isoSourcePeer(t, s, "mig"), &pb.EnsureDisksRequest{VmName: "mig",
 		InstallerIsoListed: true, InstallerIsoPaths: []string{"/srv/source/b-lib/x.iso"}, InstallerIsoRuntime: false})
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("stopped move to a host whose b-lib is another project's: got %v, want FailedPrecondition", err)

@@ -17,8 +17,8 @@
         </select>
       </div>
       <div class="form-row">
-        <label>Target path</label>
-        <input type="text" name="target_path" placeholder="optional — defaults to {{.VMName}}-{{.DiskName}}.qcow2">
+        <label>Target path (admin only)</label>
+        <input type="text" name="target_path" placeholder="blank = a new {{.VMName}}-{{.DiskName}}-copy-… file">
       </div>
       <div class="form-actions">
         <button type="button" class="btn" onclick="document.getElementById('replicate-volume-modal').remove()">Cancel</button>

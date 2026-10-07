@@ -3,7 +3,9 @@ package grpcapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -195,16 +197,27 @@ func (s *Server) CloneVM(ctx context.Context, req *pb.CloneVMRequest) (*pb.VM, e
 		if mode == "linked" {
 			if err := qcow2.CreateWithBacking(clonePath, d.Path, size, nil); err != nil {
 				cleanup()
-				return nil, status.Errorf(codes.Internal, "create linked clone disk %s: %v", d.DiskName, err)
+				return nil, cloneDiskErr("create linked clone disk", d.DiskName, err)
 			}
 			backing = d.Path
 		} else {
 			// Uncompressed flatten: fast to write and fast for the clone's guest
 			// to read (a compressed convert would be CPU-bound here and inflate
 			// on every guest read). Pure-Go — no qemu-img dependency.
-			if err := qcow2.Convert(ctx, d.Path, clonePath, &qcow2.Options{Uncompressed: true}); err != nil {
+			//
+			// The chain is read by each layer's DECLARED backing format, every
+			// backing judged by diskChainRule first and the reader confined to
+			// exactly those: a raw backing (a promoted VM's replica, guest
+			// content) is read as raw, never parsed for a header the guest may
+			// have written.
+			accepted, err := precheckChain(d.Path, s.diskChainRule(ctx, d))
+			if err != nil {
 				cleanup()
-				return nil, status.Errorf(codes.Internal, "full-clone disk %s: %v", d.DiskName, err)
+				return nil, status.Errorf(codes.FailedPrecondition, "full-clone disk %s: %v", d.DiskName, err)
+			}
+			if err := qcow2.ConvertConfined(ctx, d.Path, clonePath, &qcow2.Options{Uncompressed: true}, onlyAccepted(accepted)); err != nil {
+				cleanup()
+				return nil, cloneDiskErr("full-clone disk", d.DiskName, err)
 			}
 		}
 		created = append(created, clonePath)
@@ -554,4 +567,15 @@ func allDisksShared(disks []corrosion.DiskRecord) bool {
 		}
 	}
 	return true
+}
+
+// cloneDiskErr reports a failed clone disk. The clone's "<target>-<disk>.qcow2"
+// can be another VM's disk (VM "a" disk "b-root" is VM "a-b" disk "root");
+// qcow2 refuses to create over it, and that refusal is FailedPrecondition, not
+// an internal error.
+func cloneDiskErr(what, disk string, err error) error {
+	if errors.Is(err, fs.ErrExist) {
+		return status.Errorf(codes.FailedPrecondition, "%s %s: %v — choose another target name", what, disk, err)
+	}
+	return status.Errorf(codes.Internal, "%s %s: %v", what, disk, err)
 }

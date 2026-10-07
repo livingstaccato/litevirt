@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/litevirt/litevirt/internal/randid"
 )
 
 // cephDriver provisions Ceph RBD images via the rbd CLI. We deliberately
@@ -127,28 +131,82 @@ func (d *cephDriver) rbdArgs(subArgs ...string) []string {
 // (or "<pool>/<image>@<snap>"); DstRef is "<pool>/<image>" on the
 // destination cluster. Cross-cluster replication uses SSHTarget,
 // matching ZFS.
-func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) error {
+func (d *cephDriver) Replicate(ctx context.Context, opts ReplicateOptions) (err error) {
 	if opts.SrcRef == "" || opts.DstRef == "" {
 		return fmt.Errorf("ceph replicate: src and dst refs required")
+	}
+	// The source side runs as the source pool's cluster and identity, the
+	// destination side as the destination's: never one cluster's
+	// credentials against the other's names.
+	src := d
+	if opts.SrcOptions != nil {
+		src = &cephDriver{opts: opts.SrcOptions, run: d.run}
 	}
 	snap := opts.SnapshotName
 	if snap == "" {
 		snap = "litevirt-" + nowSnapTag()
 	}
 	srcSnapSpec := opts.SrcRef + "@" + snap
-	if out, err := exec.CommandContext(ctx, "rbd", d.rbdArgs("snap", "create", "--", srcSnapSpec)...).CombinedOutput(); err != nil {
-		return fmt.Errorf("rbd snap create %s: %w: %s", srcSnapSpec, err, out)
-	}
 
-	sendArgs := []string{"export-diff"}
+	// A full copy is export | import, and import CREATES the destination,
+	// refusing one that exists; it is checked first too, before anything is
+	// sent or snapshotted. An incremental (export-diff | import-diff) applies
+	// onto an existing image, so it is only ever run against one this
+	// replication created earlier — the caller's choice, never a full copy's.
+	if !opts.Incremental {
+		if _, ierr := d.rbd(ctx, d.rbdArgs("info", "--", opts.DstRef)...); ierr == nil {
+			return fmt.Errorf("ceph replicate → %s: %w", opts.DstRef, ErrDestinationExists)
+		}
+	}
+	if out, serr := src.rbd(ctx, src.rbdArgs("snap", "create", "--", srcSnapSpec)...); serr != nil {
+		return fmt.Errorf("rbd snap create %s: %w: %s", srcSnapSpec, serr, out)
+	}
+	// The per-call snapshot is the copy's point in time only: always removed.
+	defer func() {
+		if out, rerr := src.rbd(ctx, src.rbdArgs("snap", "rm", "--", srcSnapSpec)...); rerr != nil && err == nil {
+			err = fmt.Errorf("rbd snap rm %s: %w: %s", srcSnapSpec, rerr, out)
+		}
+	}()
+
+	// A full copy is imported under a fresh name of its own, recorded, and
+	// only then renamed to DstRef (rbd rename refuses an existing name). Every
+	// cleanup removes only that fresh image — one this call created — never
+	// DstRef: an import that failed because an image of that name appeared in
+	// between (created by someone else) must not delete it.
+	recvRef := opts.DstRef
+	if !opts.Incremental {
+		d.sweepIncoming(ctx, opts.DstRef, time.Now())
+		recvRef = fmt.Sprintf("%s%s%d-%s", opts.DstRef, incomingMarker, time.Now().Unix(), randid.New()[:12])
+	}
+	var sendArgs, recvArgs []string
 	if opts.Incremental {
-		sendArgs = append(sendArgs, "--from-snap", "litevirt-replicate-prev")
+		sendArgs = src.rbdArgs("export-diff", "--from-snap", "litevirt-replicate-prev", "--", srcSnapSpec, "-")
+		recvArgs = d.rbdArgs("import-diff", "--", "-", recvRef)
+	} else {
+		sendArgs = src.rbdArgs("export", "--", srcSnapSpec, "-")
+		recvArgs = d.rbdArgs("import", "--", "-", recvRef)
 	}
-	sendArgs = append(sendArgs, "--", srcSnapSpec, "-")
-	recvArgs := []string{"import-diff", "--", "-", opts.DstRef}
+	removeIncoming := func() {
+		if !opts.Incremental {
+			_, _ = d.rbd(ctx, d.rbdArgs("rm", "--", recvRef)...)
+		}
+	}
 
-	if _, err := pipeCmds(ctx, opts.SSHTarget, "rbd", sendArgs, "rbd", recvArgs); err != nil {
-		return fmt.Errorf("ceph replicate %s → %s: %w", opts.SrcRef, opts.DstRef, err)
+	if _, perr := pipeCmds(ctx, opts.SSHTarget, "rbd", sendArgs, "rbd", recvArgs); perr != nil {
+		removeIncoming() // a partial image this copy created is not left unrecorded
+		return fmt.Errorf("ceph replicate %s → %s: %w", opts.SrcRef, opts.DstRef, perr)
+	}
+	for _, k := range sortedKeys(opts.Record) {
+		if out, merr := d.rbd(ctx, d.rbdArgs("image-meta", "set", "--", recvRef, "litevirt."+k, opts.Record[k])...); merr != nil {
+			removeIncoming()
+			return fmt.Errorf("ceph replicate → %s: record %s: %w: %s", opts.DstRef, k, merr, out)
+		}
+	}
+	if !opts.Incremental {
+		if out, rerr := d.rbd(ctx, d.rbdArgs("rename", "--", recvRef, opts.DstRef)...); rerr != nil {
+			removeIncoming()
+			return fmt.Errorf("ceph replicate → %s: place the copy: %w: %s", opts.DstRef, rerr, out)
+		}
 	}
 	return nil
 }
@@ -225,4 +283,44 @@ func cephImageName(path string) string {
 	}
 	imgParts := strings.SplitN(parts[1], ":", 2)
 	return imgParts[0]
+}
+
+// incomingMarker names a full copy's image while it is received, before it is
+// renamed into place: <dst>.litevirt-incoming-<unix seconds>-<random>.
+const incomingMarker = ".litevirt-incoming-"
+
+// incomingMaxAge is how old an incoming image is before a later copy into
+// the same pool removes it as the leftover of a crash between import and
+// rename. No copy runs that long without finishing.
+const incomingMaxAge = 24 * time.Hour
+
+// sweepIncoming removes, in dstRef's pool, incoming images a crashed copy
+// left (incomingMarker, older than incomingMaxAge). Only names this driver
+// mints are touched; a failure to list is ignored.
+func (d *cephDriver) sweepIncoming(ctx context.Context, dstRef string, now time.Time) {
+	pool, _, ok := strings.Cut(dstRef, "/")
+	if !ok || pool == "" {
+		return
+	}
+	out, err := d.rbd(ctx, d.rbdArgs("ls", "--", pool)...)
+	if err != nil {
+		return
+	}
+	for _, name := range strings.Fields(string(out)) {
+		_, rest, ok := strings.Cut(name, incomingMarker)
+		if !ok {
+			continue
+		}
+		secs, _, ok := strings.Cut(rest, "-")
+		if !ok {
+			continue
+		}
+		t, err := strconv.ParseInt(secs, 10, 64)
+		if err != nil || now.Sub(time.Unix(t, 0)) < incomingMaxAge {
+			continue
+		}
+		if _, err := d.rbd(ctx, d.rbdArgs("rm", "--", pool+"/"+name)...); err == nil {
+			slog.Info("ceph: removed an incoming image a crashed copy left", "image", pool+"/"+name)
+		}
+	}
 }

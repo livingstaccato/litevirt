@@ -375,6 +375,10 @@ type Server struct {
 	// changes on this node, so one process proposes one change at a time.
 	voterChangeMu sync.Mutex
 
+	// imagePrune bounds and serializes the image-version prune, and holds
+	// the images an in-flight disk create uses (image_prune.go).
+	imagePrune imagePruneState
+
 	// SR-IOV policy (host-local). sriovManaged + sriovManagedPFs is the allowlist of
 	// PF BDFs (canonical) litevirt may create a VF pool on; sriovMaxVFs caps that
 	// pool. pfLocks serializes the inventory→create→observe→claim critical section

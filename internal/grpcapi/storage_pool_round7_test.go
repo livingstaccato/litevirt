@@ -124,7 +124,8 @@ func TestPoolRound7_PrefixVMOfAnotherProjectWithoutTheDiskDoesNotClaim(t *testin
 				out = append(out, e.Name())
 			}
 		}
-		return out
+		// And the replicas runs record in the pool's replica area.
+		return append(out, areaReplicas(t, disks, "web-prod-root")...)
 	}
 	newest := names()[1]
 	if err := s.AutoPromoteReplica(context.Background(), "web-prod", "", 0); err != nil {

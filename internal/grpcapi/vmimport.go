@@ -267,6 +267,9 @@ func (s *Server) ImportVM(stream pb.LiteVirt_ImportVMServer) error {
 			}
 		}, writes); err != nil {
 			cleanupDisks()
+			if status.Code(err) == codes.AlreadyExists {
+				return err
+			}
 			if errors.Is(err, os.ErrExist) {
 				return status.Errorf(codes.FailedPrecondition,
 					"disk %q: %s appeared in the pool during the conversion; an import never replaces a file there", d.Name, dst)
@@ -1034,6 +1037,13 @@ func convertForeignDisk(ctx context.Context, src, srcFormat, dst, allowedDir str
 	}
 	// Only a file nobody else can write is checked and converted; otherwise
 	// what was checked need not be what qemu-img opens.
+	// A new file only. Without a pool the destination is <data_dir>/disks,
+	// which holds every project's pool-less disks, and "<vm>-<disk>.qcow2" can
+	// be another VM's disk (VM "a" disk "b-root" against VM "a-b" disk
+	// "root"): an existing file is refused, never replaced.
+	if err := refuseExistingFile(dst); err != nil {
+		return err
+	}
 	private, err := privateImportDisk(ctx, src, allowedDir, maxSrcBytes)
 	if err != nil {
 		return err
@@ -1170,10 +1180,6 @@ func (i *qemuImgInfo) openedFiles() []string {
 	}
 	return out
 }
-
-// maxBackingDepth bounds the chain walk; a legitimate foreign disk has at most
-// a handful of snapshots.
-const maxBackingDepth = 16
 
 // assertNoExternalDiskRefs rejects a disk that would make qemu-img open a file
 // outside allowedDir: a VMDK extent, a backing file anywhere in the chain, or

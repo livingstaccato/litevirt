@@ -246,7 +246,7 @@ func TestPoolRound6_PromoteAndPruneNeverTakeAnotherProjectsReplica(t *testing.T)
 	if !ok {
 		t.Fatal("no schedule")
 	}
-	if err := s.RunReplication(adminCtx(), sched, time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC)); err != nil {
+	if err := poolEraReplicate(t, s, sched, time.Date(2026, 10, 7, 0, 0, 0, 0, time.UTC)); err != nil {
 		t.Fatalf("replication run: %v", err)
 	}
 	for n := range bravos {

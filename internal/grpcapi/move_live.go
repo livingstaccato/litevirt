@@ -108,7 +108,12 @@ func (s *Server) liveMoveVolume(
 	if info, ierr := qcow2.Info(src.Path); ierr == nil && info.VirtualSize > 0 {
 		virtualSize = int64(info.VirtualSize)
 	}
+	// A new file only: preallocate refuses one that exists (AlreadyExists),
+	// so the cleanups below only ever remove what this move created.
 	if err := preallocate(destPath, virtualSize); err != nil {
+		if status.Code(err) == codes.AlreadyExists {
+			return err
+		}
 		return status.Errorf(codes.Internal, "preallocate destination: %v", err)
 	}
 
@@ -196,7 +201,11 @@ func (s *Server) liveMoveVolume(
 	// keeps the invariant: srcPath is never the durable restart path post-pivot, and
 	// no acknowledged post-pivot write is lost.
 	commit := func() error {
-		return corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, destPath, dstPool.Driver, targetPool)
+		if err := corrosion.UpdateDiskPlacement(ctx, s.db, vm.Name, src.DiskName, vm.HostName, destPath, dstPool.Driver, targetPool); err != nil {
+			return err
+		}
+		s.clearBackingIfFlattened(ctx, vm.Name, src.DiskName, destPath)
+		return nil
 	}
 	done := func() error {
 		if deleteSource {
@@ -312,6 +321,7 @@ func (s *Server) liveCatchUpAtDest(ctx context.Context, vm *corrosion.VMRecord, 
 			"vm", vm.Name, "disk", src.DiskName, "dest", destPath, "error", err)
 		return liveMovePlacementErr(err)
 	}
+	s.clearBackingIfFlattened(ctx, vm.Name, src.DiskName, destPath)
 	if deleteSource {
 		s.deleteSourceIfUnreferenced(ctx, vm, src, send)
 	}
@@ -354,7 +364,8 @@ func preallocate(path string, virtualSize int64) error {
 	if virtualSize <= 0 {
 		return fmt.Errorf("destination virtual size must be > 0")
 	}
-	return qcow2.Create(path, uint64(virtualSize), nil)
+	// qcow2.Create publishes exclusively: an existing path is refused.
+	return existAsAlreadyExists(qcow2.Create(path, uint64(virtualSize), nil))
 }
 
 // buildDiskXML produces the small <disk> snippet libvirt's BlockCopy

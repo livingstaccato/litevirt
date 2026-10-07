@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -106,7 +105,7 @@ func TestPoolRound6_PeerReplicaCallsAreTheVMsInItsProject(t *testing.T) {
 	if got := coord.replicaNames(context.Background(), "default", pool.hostName, k, "", false); !slices.Equal(got, want) {
 		t.Fatalf("promote's listing of acme's web/prod-root on the pool's host = %v, want %v", got, want)
 	}
-	if n := coord.pruneReplicasAnywhere(context.Background(), "default", pool.hostName, k, 1); n != 1 {
+	if n := coord.pruneReplicasRemote(context.Background(), client, "default", pool.hostName, k, 1); n != 1 {
 		t.Errorf("pruned %d, want 1 (acme's older replica)", n)
 	}
 	for n := range files {
@@ -142,23 +141,7 @@ func TestPoolRound6_AnOlderHostsListingIsMatchedByExactName(t *testing.T) {
 	}
 }
 
-// fakePushStream feeds PushReplicaIncrement its frames.
-type fakePushStream struct {
-	grpc.ServerStream
-	ctx  context.Context
-	msgs []*pb.PushReplicaIncrementRequest
-}
-
-func (f *fakePushStream) Context() context.Context { return f.ctx }
-func (f *fakePushStream) Recv() (*pb.PushReplicaIncrementRequest, error) {
-	if len(f.msgs) == 0 {
-		return nil, io.EOF
-	}
-	m := f.msgs[0]
-	f.msgs = f.msgs[1:]
-	return m, nil
-}
-func (f *fakePushStream) SendAndClose(*pb.PushReplicaIncrementResponse) error { return nil }
+// fakePushStream (disk_isolation_replica_test.go) feeds PushReplicaIncrement its frames.
 
 // A replica the daemon uploads or pushes is named for the VM's disk it says
 // it is of, in that VM's project, forks only from that disk's replicas, and
@@ -182,6 +165,9 @@ func TestPoolRound6_ReplicasArriveNamedAndRecordedForTheirVM(t *testing.T) {
 	if err := uploadAs(as("acme"), s, "default", full, "x"); err != nil {
 		t.Fatalf("app's replica upload: %v", err)
 	}
+	// An incremental push is a replica of its own record now (replica_records.go):
+	// one without a record — an older node's, named for any disk — is refused,
+	// and writes nothing at the pool's top level.
 	push := func(name, base string) error {
 		return s.PushReplicaIncrement(&fakePushStream{ctx: as("acme"), msgs: []*pb.PushReplicaIncrementRequest{
 			{PoolName: "default", Filename: name, Base: base, TotalSize: 4},
@@ -193,15 +179,15 @@ func TestPoolRound6_ReplicasArriveNamedAndRecordedForTheirVM(t *testing.T) {
 	if err := s.recordPoolReplica(context.Background(), "default", replicaKey{VM: "app-x", Disk: "root", Project: "bravo"}, filepath.Join(disks, theirs)); err != nil {
 		t.Fatal(err)
 	}
-	if err := push("app-x-root-20261006-130000.raw", theirs); status.Code(err) != codes.FailedPrecondition {
-		t.Errorf("a push forking from another VM's replica: got %v, want FailedPrecondition", err)
+	if err := push("app-x-root-20261006-130000.raw", theirs); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a push forking from another VM's replica: got %v, want InvalidArgument", err)
 	}
 	incr := "app-x-root-20261006-140000.raw"
-	if err := push(incr, ""); err != nil {
-		t.Fatalf("app's replica push: %v", err)
+	if err := push(incr, ""); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a push without its record: got %v, want InvalidArgument", err)
 	}
-	if got := s.replicaNames(context.Background(), "default", "", k, "", false); !slices.Equal(got, []string{full, incr}) {
-		t.Errorf("app's replicas = %v, want [%s %s]", got, full, incr)
+	if got := s.replicaNames(context.Background(), "default", "", k, "", false); !slices.Equal(got, []string{full}) {
+		t.Errorf("app's replicas = %v, want [%s]", got, full)
 	}
 }
 

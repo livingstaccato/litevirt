@@ -213,11 +213,15 @@ record:
 
 - the disks of the caller's VMs on this host (as their own file or as a
   backing file), including disks kept after the VM was deleted;
-- replicas of those disks, by their replica record: each replica the daemon
-  places (replication's copy, upload or incremental push) is recorded on the
-  pool's host with the VM, disk and project it is a replica of. A file merely
-  named like a replica (`<vm>-<disk>-<time>.qcow2`) is never owned through its
-  name; listing and deleting it needs `storage.hostpath` at the root;
+- replicas of those disks, by their replica record. Replication runs write
+  every replica into the pool's replica area with a record beside it
+  ([backups.md](backups.md#where-replicas-live-and-how-they-are-selected)),
+  and a listing shows the caller the replicas of the VMs it may read. A
+  replica at the pool's top level — written before runs used the area, or an
+  older node's replica upload — is recorded on the pool's host with the VM,
+  disk and project it is a replica of. A file merely named like a replica
+  (`<vm>-<disk>-<time>.qcow2`) is never owned through its name; listing and
+  deleting it needs `storage.hostpath` at the root;
 - files uploaded into this pool while it belonged to its current project (a
   global pool's uploads are visible to everyone who may use the pool).
 
@@ -230,8 +234,11 @@ or root on the node using the mTLS-as-admin fallback — sees and changes every
 file, as before: every identity that is not an admin carries a bearer, and a
 forwarded call always carries it.
 
-Replication and promotion act for one VM in one project. Their content calls
-say so, and the pool's host answers with that VM's replicas only: those whose
+Replication and promotion act for one VM in one project. Promotion and
+failover choose from the VM's records in the replica area and from the
+replicas at the pool's top level; pruning keeps `keep_replicas` across both,
+the area's first. For the top-level ones their content calls say whose they
+are, and the pool's host answers with that VM's replicas only: those whose
 record names the VM, disk and project, and a replica made before records (no
 record) only when its name is exactly `<vm>-<disk>-<YYYYMMDD-HHMMSS>`, its stamp
 is not in the future, and no VM of another project has a disk that writes the
@@ -247,12 +254,11 @@ failover promotes, pruning keeps the newest `keep_replicas`, and an incremental
 replica forks from the newest raw one. When the replica promotion picked is
 missing or unreadable on its host, it tries the next-older one there; a
 replica the operator named is never swapped. A replication run whose replica
-cannot be recorded (a full data directory, the replicated rows not writable)
-on a shared store where an unrecorded file would not be matched by its name
-removes it and fails, raising `replication.failed`, and the next run retries;
-anywhere else the replica stays, matched by its name, and the failure is
-logged. A `replicate-volume` copy that cannot be recorded stays, and the
-command's final status says so.
+cannot be recorded in the area removes it and fails, raising
+`replication.failed`, and the next run retries; the area's records live on
+the store beside the replicas, so a shared store's other hosts read them with
+no replicated row. A `replicate-volume` copy that cannot be recorded stays,
+and the command's final status says so.
 
 Records only ever add proof. A record bound to a file that has since changed
 (rewritten, or replaced by hand) no longer says whose it is, and the file is
@@ -276,7 +282,11 @@ a pool is recorded as the operator's copy of that VM's disk, whatever it is
 named: its project's, and promotable by naming it, but never a replica a run
 made — never pruned, never the newest replica failover promotes, never an
 incremental replica's base. An admin (`storage.hostpath` at the root) may
-name any file in the pool. Another project's upload is never taken.
+name any file in the pool but another project's alone: another project's
+upload or replica by record, a disk of another project's VM, or a file named
+exactly as only another project's VM disk's runs name its replicas
+(`<vm>-<disk>-<time>` where the VM's disk's own runs never write that name).
+A name both could have written is the admin's to choose.
 
 On shared storage — a pool directory on an NFS, CephFS, GlusterFS or CIFS/SMB
 mount other hosts mount too — the record of each upload and replica is also
@@ -382,6 +392,53 @@ canonical form only, without lookups, so a later DNS change is not re-checked
 there. An NFSv4 path relative to the pseudo-root (`nas:/acme`) and the NFSv3
 path of the same directory (`nas:/srv/nfs/acme`) cannot be told apart from the
 client: do not mix the two forms for one server.
+
+Creating a disk never replaces a file. A VM's disk is named
+`<vm>-<disk>.qcow2`, which is ambiguous across hyphens — VM `a` with disk
+`b-root` is the same file as VM `a-b` with disk `root` — and a pool, like
+`<data_dir>/disks`, may hold every project's disks. VM create, clone, and every
+image the daemon creates are published exclusively: a file already at the name
+is refused (`FailedPrecondition` for a create or clone), never overwritten and
+never cleaned up by the failed create. Choose another VM or disk name.
+
+Reading a disk's backing chain — a full clone, an image built from a VM, a
+cold migration's flatten, a move or copy with qemu-img — follows each layer's
+DECLARED backing format, never a guess: a backing declared `raw` (a
+`--no-localize` promoted VM's replica, which is guest content) is read as
+raw and never parsed for a header the guest may have written; a backing with
+no declared format, or declared twice, is refused. Every backing is judged,
+resolved through symlinks, before anything opens it, and is accepted only as:
+
+- a file in the image store with no external data file, whose own backing,
+  if any, is another file in the image store (a layered image) — an image is
+  a base, never a way to name any other file;
+- the `backing_disk` recorded on the layer naming it — the disk's own record,
+  or the record of whichever disk that layer is: a linked clone's template
+  disk, in whatever pool it lives in, and a `--no-localize` promoted VM's
+  replica. A backing declared `raw` is accepted only this way, so a linked
+  clone of a promoted VM (clone → promoted overlay → raw replica) copies too —
+  or, for a VM an earlier build promoted with `--no-localize` (which recorded
+  no `backing_disk`), as the replica its overlay was built from: in the pool
+  directory, the overlay `<vm>-promoted-<source>-<disk>-<ts>.qcow2` beside
+  exactly `<source>-<disk>-<ts>.raw` (the replica's own name, of the disk's
+  own name and a `YYYYMMDD-HHMMSS` replica timestamp), or in the VM's own
+  replica directory, claimed by no disk row and no other project's record.
+  A snapshot overlay that took the disk's place (`<stem>.<snapshot>`, after
+  the snapshot is reverted or deleted) is judged by its stem the same way,
+  and a layer of the disk's own — same directory, same stem, no row of its
+  own — answers to the disk's record;
+- a file in the directory of a file-based pool on this host that the VM's
+  project may use (global, or owned by that project), or the disk's own pool;
+- in `<data_dir>/disks` (which holds every project's disks) or the disk's own
+  directory, only a file the VM's project owns by record — a disk of one of
+  its VMs, or its recorded replica — or the base an external snapshot of the
+  VM left beside its overlay: same directory, the disk's own `<vm>-<disk>`
+  stem, claimed by no other VM's row. This holds after the snapshot is
+  reverted or deleted too, when the disk stays on an overlay named after it.
+
+Another project's file is refused wherever it sits, unless a record ties it
+to the layer naming it. A move, a restore or a copy that leaves a disk
+standalone clears its record's backing fields.
 
 Content operations never reach a file a live VM disk uses: a listing leaves
 out files a live disk of another pool uses, and a content delete refuses any
@@ -818,15 +875,43 @@ volumes**) and over REST (`POST /api/v1/stacks/{name}/migrate-volumes`, SSE).
 lv replicate-volume web-1 root dr-pool
 ```
 
-**Native send/recv** — when the source driver implements the
-`Replicator` interface, replication uses the backend's native
-primitive instead of qemu-img convert:
+The copy is always a **new** file in the target pool, named by the daemon —
+`<vm>-<disk>-copy-<time>-<id>.qcow2` — and reported on the DONE line. A pool
+can be shared by every project, so the old fixed `<vm>-<disk>.qcow2` could be
+another VM's disk (VM `a` disk `b-root` against VM `a-b` disk `root`), and the
+copy wrote over it. `--target-path` names the file instead; it requires the
+**admin** role (`storage.hostpath`), and an existing file there is refused with
+`AlreadyExists`, never replaced.
+
+**Native send/recv** — a zfs disk replicated into a zfs pool, or a ceph disk
+into a ceph pool, uses the backend's native primitive instead of qemu-img.
+The destination is a **new** dataset or image the daemon names under the
+target pool — `<pool source>/<vm>-<disk>-copy-<time>-<id>`, or, for an admin,
+`--target-path` as the leaf name — never the pool itself and never one that
+exists: the driver checks first (`zfs list` / `rbd info`) and refuses with
+`AlreadyExists` before anything is sent, `zfs recv` runs without `-F`, and a
+ceph full copy is `rbd export | rbd import` into a fresh name of its own,
+renamed into place only once it is recorded (`rbd rename` refuses an existing
+name). Every
+command keeps `--` before its positional arguments. The copy carries its
+owner record — project, VM, disk — as zfs user properties (`litevirt:*`) or
+rbd image metadata (`litevirt.*`). A ceph copy runs its source side
+(snapshot, export) with the SOURCE pool's own `conf`, `keyring` and `id`, and
+its destination side (check, import, metadata) with the destination pool's,
+so a copy between two ceph clusters uses each cluster's own credentials. The
+per-copy source snapshot is removed afterwards, and a copy that fails after it
+was received is removed rather than left unrecorded — only the image the copy
+itself created, never the destination name, which an image created in the
+meantime may hold. A btrfs disk takes the
+file copy. What the drivers implement:
 
 - **ZFS** — `zfs snapshot` then `zfs send | zfs recv`. Incremental
   (`-I` since the prior `litevirt-replicate-prev` snapshot) when
   `Incremental: true`.
-- **Ceph RBD** — `rbd export-diff | rbd import-diff`. Incremental
-  uses `--from-snap`. Cross-cluster via SSH wrap on the receive side.
+- **Ceph RBD** — a full copy is `rbd export | rbd import` (creating);
+  an incremental is `rbd export-diff --from-snap | rbd import-diff` onto an
+  image the replication created. Cross-cluster via SSH wrap on the receive
+  side.
 - **BTRFS** — `btrfs send | btrfs receive`. Incremental via `-p` against
   the prior replicate snapshot.
 
@@ -844,7 +929,7 @@ consistency is a planned follow-up.
 | Move (offline) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Move (live) | ✓ | ✓ | ✓ | ✓ | — | — | — | — |
 | Replicate via qemu-img | ✓ | ✓ | ✓ | ✓ | fallback | fallback | — | — |
-| Native send / receive | n/a | n/a | n/a | btrfs s/r | zfs s/r | rbd export-diff | n/a | n/a |
+| Native send / receive (`replicate-volume`) | n/a | n/a | n/a | file copy | zfs s/r | rbd export/import | n/a | n/a |
 | HA-friendly cluster store | no | yes | depends | no (host-local) | no (host-local) | yes | yes | no |
 
 The **Snapshots** row describes each backend's *native* snapshot capability

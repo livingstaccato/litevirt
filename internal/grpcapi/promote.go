@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -396,10 +397,11 @@ var errReplicaTooOld = errors.New("newest replica is too old for automatic promo
 // reassigns it.
 var autoPromoteMaxReplicaAge = 48 * time.Hour
 
-// replicaTimestamp reads the UTC run time out of a replica filename, which the
-// replication runner writes as `<vm>-<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>`. The
-// VM and disk names may themselves contain dashes, so the stamp is taken from
-// the END of the name.
+// replicaTimestamp reads the UTC run time out of a replica's file name, which
+// the replication runner writes (and its record names) as
+// `<disk>-<YYYYMMDD-HHMMSS>.<qcow2|raw>`. A disk name may itself contain
+// dashes, so the stamp is taken from the END of the name. Only a replica
+// already selected by its record is ever read this way.
 func replicaTimestamp(name string) (time.Time, bool) {
 	const layout = "20060102-150405"
 	base := strings.TrimSuffix(strings.TrimSuffix(name, ".qcow2"), ".raw")
@@ -463,12 +465,19 @@ func (s *Server) replicationScheduleForVM(ctx context.Context, vmName string) (c
 // explicit target host, the schedule's host, or every active host that has
 // the pool.
 //
-// It lists through replicaNames (local read, or a peer call as the daemon for
-// this VM's replicas), NOT the RBAC-gated ListStoragePoolContents handler:
-// AutoPromoteReplica runs from the failover coordinator with an
-// unauthenticated context, which the handler's RequireRole would reject. Only
-// this VM's replicas are listed — by record, or an unrecorded one by its exact
-// name — never a file another VM's name happens to share a prefix with.
+// Replicas come from two places, both selected by the VM's own records and
+// never by a name another VM's merely shares a prefix with:
+//
+//   - the VM's directory of the pool's replica area (replicaRecordsOn:
+//     replica_records.go), where replication runs write every replica now;
+//   - the top level of the pool (replicaNames: replica_match.go), where
+//     replicas written before that live — by their pool record, or an
+//     unrecorded one by its exact name.
+//
+// Remote hosts are asked with this host's certificate, not through an
+// RBAC-gated handler: AutoPromoteReplica runs from the failover coordinator
+// with an unauthenticated context, which the handler's RequireRole would
+// reject.
 func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequest, vm *corrosion.VMRecord, diskName, pool, schedHost string) (host string, replicas []string, err error) {
 	var candidates []string
 	switch {
@@ -493,13 +502,25 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 	byHost := map[string][]string{}
 	bestHost, bestName := "", ""
 	for _, h := range candidates {
-		names := s.replicaNames(ctx, pool, h, k, req.Replica, admin)
+		var names []string
+		for _, r := range s.replicaRecordsOn(ctx, pool, h, vm.Project, vm.Name) {
+			if r.Disk != diskName {
+				continue
+			}
+			if req.Replica != "" && r.File == req.Replica {
+				return h, []string{r.File}, nil
+			}
+			names = append(names, r.File)
+		}
+		top := s.replicaNames(ctx, pool, h, k, req.Replica, admin)
 		if req.Replica != "" {
-			if slices.Contains(names, req.Replica) {
+			if slices.Contains(top, req.Replica) {
 				return h, []string{req.Replica}, nil
 			}
 			continue
 		}
+		names = append(names, top...)
+		sortReplicasOldestFirst(names)
 		byHost[h] = names
 		// Each host's list is oldest first, by the run time in the names.
 		if len(names) > 0 && (bestName == "" || replicaOlder(bestName, names[len(names)-1])) {
@@ -507,7 +528,7 @@ func (s *Server) findReplicaHost(ctx context.Context, req *pb.PromoteReplicaRequ
 		}
 	}
 	if req.Replica != "" {
-		return "", nil, status.Errorf(codes.NotFound, "replica %q not found in pool %q", req.Replica, pool)
+		return "", nil, status.Errorf(codes.NotFound, "replica %q of vm %q disk %q not found in pool %q", req.Replica, req.VmName, diskName, pool)
 	}
 	if bestHost == "" {
 		return "", nil, status.Errorf(codes.NotFound, "no replica of %q disk %q found in pool %q", req.VmName, diskName, pool)
@@ -541,6 +562,29 @@ func (s *Server) relayPromote(ctx context.Context, host string, req *pb.PromoteR
 			return err
 		}
 	}
+}
+
+// liveDiskBacking is replicaPath when the promoted live disk is an overlay on
+// it (--no-localize, or no qemu-img), "" when it was localized. Recorded as
+// the disk's backing_disk, it is what keeps replica pruning — and pool content
+// delete — off the replica a running VM reads through (DisksReferencingPath).
+func liveDiskBacking(livePath, replicaPath string) string {
+	if info, err := qcow2.Info(livePath); err == nil && info.BackingFile == replicaPath {
+		return replicaPath
+	}
+	return ""
+}
+
+// createOverlayNoClobber creates a qcow2 at path backed by backing, as a new
+// file: qcow2 publishes it exclusively, refusing an existing path.
+func createOverlayNoClobber(path, backing, backingFmt string) error {
+	if err := qcow2.CreateWithBackingFormat(path, backing, backingFmt, 0, nil); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return existAsAlreadyExists(err)
+		}
+		return status.Errorf(codes.Internal, "create overlay: %v", err)
+	}
+	return nil
 }
 
 // doPromoteLocal performs the promotion on the host that holds the replica:
@@ -699,16 +743,46 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	if err != nil {
 		return err
 	}
-	replicaPath := s.namedReplicaPath(poolDir, replica)
-	if err := replicaReadable(replicaPath); err != nil {
-		return status.Errorf(codes.NotFound, "%s: %q on %q: %v", errReplicaUnavailable, replica, s.hostName, err)
+	// The replica is looked up again HERE, among this VM's own records on this
+	// host: a relayed or peer-direct request names a file, and a name is never
+	// enough to read one. A replica in the VM's directory of the pool's replica
+	// area is selected by its record there; one at the pool's top level,
+	// written before replicas moved into that area, by its pool record or, an
+	// unrecorded one, by its exact name (localReplicaNames) — the same lists
+	// findReplicaHost chose from.
+	replicaRec, replicaPath, ok := recordedReplica(poolDir, vm.Project, vm.Name, replica)
+	if ok && replicaRec.Disk != src.DiskName {
+		return status.Errorf(codes.NotFound, "replica %q is not a recorded replica of vm %q disk %q in pool %q on %q",
+			replica, vm.Name, src.DiskName, pool, s.hostName)
 	}
-	// A replica taken although its record had not arrived from its writer
-	// (lateReplicaOK) is said so, by name, on the VM's events.
-	if uploads, err := s.loadPoolUploads(ctx, filepath.Dir(replicaPath)); err == nil {
-		if _, st := s.recordState(uploads, replicaPath); st == recNone && !s.isLegacyUnrecorded(ctx, replicaPath) {
-			s.recordVMEvent(ctx, vm.Name, "replica.unrecorded", "warning", fmt.Sprintf(
-				"promoting %s, whose record had not arrived from %s, the VM's host, before it stopped answering", replica, vm.HostName))
+	if !ok {
+		k := replicaKeyOf(vm, src.DiskName)
+		// Only a replica the operator named (findReplicaHost) may be any file
+		// an admin names; one chosen for the VM, or merely passed in, must be
+		// the VM's own.
+		admin := req.Replica != "" && req.Replica == replica && s.RequirePerm(ctx, "/", verbStorageHostPath, "admin") == nil
+		if !slices.Contains(s.localReplicaNames(ctx, poolDir, k, "", false), replica) &&
+			!slices.Contains(s.localReplicaNames(ctx, poolDir, k, replica, admin), replica) {
+			return status.Errorf(codes.NotFound, "replica %q is not a replica of vm %q disk %q in pool %q on %q",
+				replica, vm.Name, src.DiskName, pool, s.hostName)
+		}
+		replicaPath = s.namedReplicaPath(poolDir, replica)
+		if err := replicaReadable(replicaPath); err != nil {
+			return status.Errorf(codes.NotFound, "%s: %q on %q: %v", errReplicaUnavailable, replica, s.hostName, err)
+		}
+		// A replica taken although its record had not arrived from its writer
+		// (lateReplicaOK) is said so, by name, on the VM's events.
+		if uploads, err := s.loadPoolUploads(ctx, filepath.Dir(replicaPath)); err == nil {
+			if _, st := s.recordState(uploads, replicaPath); st == recNone && !s.isLegacyUnrecorded(ctx, replicaPath) {
+				s.recordVMEvent(ctx, vm.Name, "replica.unrecorded", "warning", fmt.Sprintf(
+					"promoting %s, whose record had not arrived from %s, the VM's host, before it stopped answering", replica, vm.HostName))
+			}
+		}
+		// Its format is what replication wrote it as: an incremental replica
+		// is raw, a full one qcow2. Never probed.
+		replicaRec = replicaRecord{VM: vm.Name, Disk: src.DiskName, File: replica, Format: "qcow2"}
+		if strings.HasSuffix(replica, ".raw") {
+			replicaRec.Format = "raw"
 		}
 	}
 
@@ -896,17 +970,21 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 	// Skip the (re)build if a prior attempt already built the live disk (and definitely if
 	// it already STARTED the domain off it — rebuilding would overwrite a running VM's disk).
 	if !diskBuilt && !started {
+		// A file already at livePath that this proof did not build is not ours:
+		// targetName is the caller's choice, so in a shared pool the name can be
+		// another VM's disk. Refused before anything is written, and so before
+		// any of the error paths below that remove livePath.
+		if err := refuseExistingFile(livePath); err != nil {
+			return err
+		}
 		if req.NoLocalize {
-			backingFmt := "qcow2"
-			if strings.HasSuffix(replica, ".raw") {
-				backingFmt = "raw"
-			}
+			backingFmt := replicaRec.Format
 			_ = send(&pb.PromoteReplicaProgress{
 				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
 				Status: "creating overlay backed by replica (fast; pins the replica)",
 			})
-			if err := qcow2.CreateWithBackingFormat(livePath, replicaPath, backingFmt, 0, nil); err != nil {
-				return status.Errorf(codes.Internal, "create overlay: %v", err)
+			if err := createOverlayNoClobber(livePath, replicaPath, backingFmt); err != nil {
+				return err
 			}
 		} else if !qemuImgAvailable() && strings.HasSuffix(replica, ".raw") {
 			// Localize would convert raw→qcow2, but without qemu-img convertQcow2
@@ -919,8 +997,8 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 				Phase: pb.PromoteReplicaProgress_LOCALIZING, VmName: targetName, Host: s.hostName, Replica: replica,
 				Status: "qemu-img unavailable — overlay over raw replica (pins replica; install qemu-img to localize)",
 			})
-			if err := qcow2.CreateWithBackingFormat(livePath, replicaPath, "raw", 0, nil); err != nil {
-				return status.Errorf(codes.Internal, "create overlay over raw replica: %v", err)
+			if err := createOverlayNoClobber(livePath, replicaPath, "raw"); err != nil {
+				return err
 			}
 			slog.Warn("promote: localized via raw-backed overlay (qemu-img absent) — replica is pinned",
 				"vm", targetName, "replica", replica)
@@ -939,14 +1017,27 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 			// mid-copy leaves a sweepable temp (SweepStaleStaging) rather than an
 			// orphan live disk — the qemu-img child survives KillMode=process and
 			// would otherwise complete a final-named qcow2 with no domain.
-			tmpLive := filepath.Join(poolDir, fmt.Sprintf(".promote-%s-%s.tmp", targetName, ts))
-			if err := convertQcow2(ctx, replicaPath, tmpLive, emit); err != nil {
+			// A fresh, unpredictable temp (O_EXCL): qemu-img convert follows a
+			// symlink at its output, so the name must not be one anything
+			// else could have planted.
+			tf, terr := os.CreateTemp(poolDir, ".promote-*.tmp")
+			if terr != nil {
+				return status.Errorf(codes.Internal, "create live-disk temp: %v", terr)
+			}
+			tmpLive := tf.Name()
+			_ = tf.Close()
+			// The replica's format comes from its record, never a probe: an
+			// incremental replica is raw GUEST content, and a probe would
+			// obey a qcow2 header the guest wrote into it. A qcow2 replica
+			// must be standalone (nil: no backing at all). convertImage
+			// pre-checks the input and requires a standalone output.
+			if err := convertImage(ctx, replicaPath, replicaRec.Format, nil, tmpLive, emit); err != nil {
 				os.Remove(tmpLive)
 				return status.Errorf(codes.Internal, "copy replica: %v", err)
 			}
-			if err := os.Rename(tmpLive, livePath); err != nil {
+			if err := placeNoClobber(tmpLive, livePath); err != nil {
 				os.Remove(tmpLive)
-				return status.Errorf(codes.Internal, "finalize live disk: %v", err)
+				return err
 			}
 		}
 		recordStep("disk_built")
@@ -975,6 +1066,7 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		VMName: targetName, DiskName: src.DiskName, HostName: s.hostName,
 		Path: livePath, SizeBytes: src.SizeBytes, StorageType: poolRef.Driver,
 		StorageVolume: pool, TargetDev: lv.DiskDevName(promBus, 0), Bus: promBus,
+		BackingDisk: liveDiskBacking(livePath, replicaPath),
 	}}
 
 	var netCfg []lv.NetworkConfig

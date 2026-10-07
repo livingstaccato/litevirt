@@ -325,8 +325,9 @@ func (s *Server) lateReplicaOK(ctx context.Context, path string, k replicaKey) b
 }
 
 // explicitReplicaOK reports whether a manual promotion may use the file at
-// path, named by the operator, as k's disk: any regular file for an admin
-// (storage.hostpath at the root); otherwise a replica of it (isReplicaFor), a
+// path, named by the operator, as k's disk: for an admin (storage.hostpath
+// at the root) any regular file that is not another project's alone
+// (anotherProjectsOnly); otherwise a replica of it (isReplicaFor), a
 // replicate-volume copy of it, an upload its project owns
 // (uploadIsProjects), or a file from before records (or whose records are
 // stale) named <vm>-<disk>-<anything>.<qcow2|raw> that no other project's VM
@@ -336,8 +337,11 @@ func (s *Server) explicitReplicaOK(ctx context.Context, uploads poolRecords, pat
 	if err != nil || !fi.Mode().IsRegular() {
 		return false
 	}
-	if admin || s.isReplicaFor(ctx, uploads, path, k) {
+	if s.isReplicaFor(ctx, uploads, path, k) {
 		return true
+	}
+	if admin {
+		return !s.anotherProjectsOnly(ctx, uploads, path, k)
 	}
 	u, st := s.recordState(uploads, path)
 	switch {
@@ -530,4 +534,39 @@ func replicaUnavailable(err error) bool {
 	m := st.Message()
 	return strings.Contains(m, errReplicaUnavailable) || strings.Contains(m, "not present on") ||
 		(strings.HasPrefix(m, "replica ") && strings.Contains(m, "not found in pool"))
+}
+
+// anotherProjectsOnly reports whether the file at path is another project's
+// and never k's: another project's upload or replica by record, a disk of
+// another project's VM, or a file named exactly as only another project's VM
+// disk's replication names its replicas (<vm>-<disk>-<stamp>, a VM and disk
+// of another project) where k's disk's never is. These are the only files an
+// admin's named replica is refused: a name both could have written stays the
+// admin's to choose.
+func (s *Server) anotherProjectsOnly(ctx context.Context, uploads poolRecords, path string, k replicaKey) bool {
+	if u, st := s.recordState(uploads, path); st == recMatched && !u.Peer {
+		switch {
+		case u.VM != "" && !sameProject(u.Project, k.Project):
+			return true
+		case u.VM == "" && u.Project != "" && !sameProject(u.Project, k.Project):
+			return true
+		}
+	}
+	if s.usedByOtherProject(ctx, path, k) {
+		return true
+	}
+	p, ok := replicaNamePrefix(filepath.Base(path))
+	if !ok || p == k.VM+"-"+k.Disk {
+		return false
+	}
+	for i := 1; i < len(p)-1; i++ {
+		if p[i] != '-' {
+			continue
+		}
+		disks, claim := s.otherProjectDisks(ctx, p[:i], k)
+		if claim || disks[p[i+1:]] {
+			return true
+		}
+	}
+	return false
 }

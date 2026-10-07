@@ -57,3 +57,32 @@ func TestScheduler_ReplicationDispatch(t *testing.T) {
 		t.Errorf("backup runner fired %d times for a replication row, want 0", got)
 	}
 }
+
+// A fan-out schedule's per-VM run carries the row it came from (Origin), so
+// the runner can tell it from a vm-scoped schedule of the same VM into the same
+// pool — each prunes only the replicas it recorded.
+func TestScheduler_FanoutRunCarriesItsOrigin(t *testing.T) {
+	ctx := context.Background()
+	db := newSchedTestDB(t)
+	seedVM(t, db, "vm1")
+	if err := corrosion.UpsertBackupSchedule(ctx, db, corrosion.BackupScheduleRecord{
+		VMName: "__cluster__", Scope: "cluster", Repo: "dr-pool", Cron: "0 2 * * *", Enabled: true,
+		Type: "replication", TargetPool: "dr-pool", KeepReplicas: 3,
+	}); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+	repl := &recordingReplRunner{}
+	s := NewSnapshotScheduler(db, "host-a", &recordingRunner{})
+	s.ReplRunner = repl
+	s.Now = func() time.Time { return time.Date(2026, 1, 15, 2, 0, 0, 0, time.UTC) }
+
+	s.Tick(ctx)
+	repl.mu.Lock()
+	defer repl.mu.Unlock()
+	if len(repl.calls) != 1 {
+		t.Fatalf("ReplRunner fired %d times, want 1", len(repl.calls))
+	}
+	if got := repl.calls[0]; got.VMName != "vm1" || got.Origin != "__cluster__" {
+		t.Errorf("fan-out run = vm %q origin %q, want vm1 from __cluster__", got.VMName, got.Origin)
+	}
+}

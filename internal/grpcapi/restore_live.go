@@ -1,8 +1,9 @@
 package grpcapi
 
 import (
+	"errors"
 	"fmt"
-	"os"
+	"io/fs"
 	"path/filepath"
 
 	"google.golang.org/grpc"
@@ -32,18 +33,32 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 	if err := s.requirePermPrecheck(ctx, "operator"); err != nil {
 		return err
 	}
-	if req.RepoPath == "" || req.VmName == "" || req.DiskName == "" || req.Timestamp == "" || req.TargetPath == "" {
+	if req.RepoPath == "" || req.VmName == "" || req.DiskName == "" || req.Timestamp == "" {
 		return status.Error(codes.InvalidArgument,
-			"repo_path, vm_name, disk_name, timestamp, target_path all required")
+			"repo_path, vm_name, disk_name, timestamp all required")
+	}
+	// The overlay becomes a VM's disk. It is a fresh file the daemon names, or
+	// one an admin names that does not exist yet — never a file already there
+	// (restore_dest.go).
+	disksDir := filepath.Join(s.dataDir, "disks")
+	var target string
+	if req.TargetPath != "" {
+		var err error
+		if target, err = s.resolveAdminTarget(ctx, req.TargetPath, disksDir); err != nil {
+			return err
+		}
+	} else {
+		name := req.NewName
+		if name == "" {
+			name = req.VmName
+		}
+		var err error
+		if target, err = derivedDiskFile(disksDir, name, req.DiskName, "live", ".qcow2"); err != nil {
+			return err
+		}
 	}
 	// repo_path: registered repo name (any operator) or admin-only absolute path.
 	repoPath, err := s.resolveBackupRepoPath(ctx, req.RepoPath)
-	if err != nil {
-		return err
-	}
-	// target_path: a bare filename is contained under the disks dir; a custom
-	// absolute path is admin-only. The overlay path becomes the VM's disk path.
-	target, err := s.resolveRestoreTarget(ctx, req.TargetPath, filepath.Join(s.dataDir, "disks"))
 	if err != nil {
 		return err
 	}
@@ -108,20 +123,14 @@ func (s *Server) RestoreLive(req *pb.RestoreLiveRequest, stream grpc.ServerStrea
 		return err
 	}
 
-	// Create the overlay at a temp path and rename it into place BEFORE the
-	// domain is defined/started against it — never write through a symlink at
-	// the final path, and never rename a disk a VM is already running on.
-	if err := refuseSymlinkTarget(target); err != nil {
-		return err
-	}
-	tmpOverlay := target + ".restore.tmp"
-	_ = os.Remove(tmpOverlay)
-	if err := qcow2.CreateWithBackingURI(tmpOverlay, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
+	// Create the overlay BEFORE the domain is defined/started against it.
+	// qcow2 publishes it exclusively: anything already at the target — a
+	// file, a symlink, a disk a VM runs on — is refused, never replaced.
+	if err := qcow2.CreateWithBackingURI(target, nbdURL, uint64(manifest.TotalSize), nil); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return existAsAlreadyExists(err)
+		}
 		return status.Errorf(codes.Internal, "create overlay qcow2: %v", err)
-	}
-	if err := os.Rename(tmpOverlay, target); err != nil {
-		_ = os.Remove(tmpOverlay)
-		return status.Errorf(codes.Internal, "finalize overlay: %v", err)
 	}
 
 	if err := stream.Send(&pb.RestoreLiveProgress{

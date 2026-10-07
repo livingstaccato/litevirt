@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -16,7 +17,9 @@ import (
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
+	"github.com/litevirt/litevirt/internal/image"
 	"github.com/litevirt/litevirt/internal/qcow2"
+	"github.com/litevirt/litevirt/internal/randid"
 	"github.com/litevirt/litevirt/internal/safename"
 )
 
@@ -109,11 +112,18 @@ func (s *Server) ImportImage(stream pb.LiteVirt_ImportImageServer) error {
 		return status.Errorf(codes.InvalidArgument, "image %q: %v", name, err)
 	}
 
-	// Move to final location.
-	destPath := s.images.ImagePath(name)
-	if err := os.Rename(tmpFile.Name(), destPath); err != nil {
-		return status.Errorf(codes.Internal, "move image: %v", err)
+	// Publish. A re-import of a name disks are built on is a refresh: a new
+	// version for new disks, never a write over the file existing disks are
+	// built on — except to heal that file with content byte-identical to its
+	// recorded identity (image.Store.Publish). A peer's push (the
+	// reconciler's heal, autoPullImage) arrives here too.
+	s.recordImageProvenance(ctx, name)
+	pub, err := s.images.Publish(name, tmpFile.Name(), strings.TrimPrefix(got, "sha256:"))
+	if err != nil {
+		return status.Errorf(codes.Internal, "publish image: %v", err)
 	}
+	destPath := pub.Path
+	s.imagePublished(ctx, name, pub)
 
 	// Record in DB.
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -270,17 +280,29 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 	// on it blocks the very re-pull that would heal it (observed live: qemu
 	// "Image is not in qcow2 format" retrying forever). Require a nonzero
 	// size, and when the replicated images row records the expected size,
-	// require an exact match — a mismatch falls through to a fresh pull,
-	// which overwrites the damaged copy.
+	// require an exact match — a mismatch falls through to a fresh pull.
+	//
+	// The fresh copy is fetched into a temp and published (ImportImage →
+	// image.Store.Publish): when its sha256 is the local file's recorded
+	// identity — what every disk on it was built on — and the local bytes no
+	// longer match it, the file is healed in place with that byte-identical
+	// content. Otherwise it never replaces the local file: it becomes a new
+	// version for new disks, and a damaged base under existing disks is
+	// reported for repair by hand.
+	damaged := ""
 	if s.images != nil {
 		if fi, err := os.Stat(s.images.ImagePath(imageName)); err == nil && fi.Size() > 0 {
 			img, ierr := corrosion.GetImage(ctx, s.db, imageName)
 			if ierr != nil || img == nil || img.SizeBytes <= 0 || img.SizeBytes == fi.Size() {
 				return nil
 			}
+			damaged = s.images.ImagePath(imageName)
 			slog.Warn("auto-pull: local image size mismatch, re-pulling",
 				"image", imageName, "local_bytes", fi.Size(), "expected_bytes", img.SizeBytes)
 		}
+	}
+	if damaged != "" {
+		defer func() { s.reportUnhealedImage(ctx, imageName, damaged) }()
 	}
 
 	sources, err := s.imagePullSources(ctx, imageName)
@@ -299,6 +321,27 @@ func (s *Server) autoPullImage(ctx context.Context, imageName string) error {
 		return lastErr
 	}
 	return fmt.Errorf("no peer host has image %q with status=ready", imageName)
+}
+
+// reportUnhealedImage logs, at ERROR, a local image file that disks are built
+// on and whose bytes do not match its recorded identity (or that has none),
+// after a re-pull that could not heal it in place: the existing disks still
+// sit on it and need repair by hand; new disks use the fresh version.
+func (s *Server) reportUnhealedImage(ctx context.Context, imageName, path string) {
+	rec, known := image.RecordedDigest(path)
+	if known {
+		if got, err := image.FileDigest(path); err == nil && got == rec {
+			return // intact (healed, or an older version left for its disks)
+		}
+	}
+	rows, err := s.diskReferencesAnyHost(ctx, path)
+	if err == nil && len(rows) == 0 {
+		if byName, nerr := corrosion.DisksReferencingPath(ctx, s.db, imageName); nerr == nil && len(byName) == 0 {
+			return
+		}
+	}
+	slog.Error("auto-pull: the local image file disks are built on does not match the identity it was published with, and no byte-identical copy healed it; it was not replaced — repair it by hand (new disks use the fresh version)",
+		"image", imageName, "path", path, "identity_known", known)
 }
 
 // imagePullSources is the peers autoPullImage may pull imageName from: every
@@ -347,11 +390,11 @@ func (s *Server) imageAvailable(ctx context.Context, imageName string) (bool, er
 func (s *Server) pullImageFromPeer(ctx context.Context, imageName, sourceHost string) error {
 	slog.Info("auto-pulling image from peer", "image", imageName, "source", sourceHost, "target", s.hostName)
 
-	client, conn, err := s.peerClient(ctx, sourceHost)
+	client, closeConn, err := s.dialPeer(ctx, sourceHost)
 	if err != nil {
 		return fmt.Errorf("cannot reach source host %s: %w", sourceHost, err)
 	}
-	defer conn.Close()
+	defer closeConn()
 
 	stream, err := client.PushImage(ctx, &pb.PushImageRequest{
 		Name:       imageName,
@@ -429,14 +472,37 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 		srcDisk = disks[0]
 	}
 
-	// Create a flattened copy of the disk (no backing chain).
-	destPath := s.images.ImagePath(req.ImageName)
-	os.MkdirAll(filepath.Dir(destPath), 0755)
+	// Create a flattened copy of the disk (no backing chain), into a fresh
+	// temp in the image store, published below: a rebuild of an existing
+	// name is a new version, never a write over a file disks are built on.
+	imagesDir := filepath.Dir(s.images.CanonicalImagePath(req.ImageName))
+	os.MkdirAll(imagesDir, 0755)
+	destPath := filepath.Join(imagesDir, "import-"+randid.New()+".tmp")
+	defer os.Remove(destPath) // gone after the publish
 
 	slog.Info("building image from VM disk", "vm", req.VmName, "src", srcDisk.Path, "dest", destPath)
-	if err := qcow2.Convert(ctx, srcDisk.Path, destPath, nil); err != nil {
+	// Read by each layer's declared backing format and confined to the image
+	// store and the disk's pool: a promoted VM's raw replica is guest content
+	// and is never parsed as a header.
+	accepted, err := precheckChain(srcDisk.Path, s.diskChainRule(ctx, srcDisk))
+	if err != nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "image from VM %q: %v", req.VmName, err)
+	}
+	if err := qcow2.ConvertConfined(ctx, srcDisk.Path, destPath, nil, onlyAccepted(accepted)); err != nil {
 		return nil, status.Errorf(codes.Internal, "convert image: %v", err)
 	}
+
+	digest, err := image.FileDigest(destPath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "hash image: %v", err)
+	}
+	s.recordImageProvenance(ctx, req.ImageName)
+	pub, err := s.images.Publish(req.ImageName, destPath, digest)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "publish image: %v", err)
+	}
+	destPath = pub.Path
+	s.imagePublished(ctx, req.ImageName, pub)
 
 	// Get size and checksum.
 	info, err := os.Stat(destPath)
@@ -450,6 +516,7 @@ func (s *Server) BuildImage(ctx context.Context, req *pb.BuildImageRequest) (*pb
 		Name:      req.ImageName,
 		Format:    "qcow2",
 		SourceURL: "build:" + req.VmName,
+		Checksum:  "sha256:" + digest,
 		SizeBytes: info.Size(),
 	}); err != nil {
 		s.noteStateWriteFail(corrosion.OpImage, err)

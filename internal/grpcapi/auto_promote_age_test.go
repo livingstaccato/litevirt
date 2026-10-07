@@ -37,10 +37,7 @@ func seedReplicaOfAge(t *testing.T, s *Server, vmName, cron string, age time.Dur
 	}
 	dir := replicaPoolDir(t, s, "dr")
 	ts := time.Now().Add(-age).UTC().Format("20060102-150405")
-	name := vmName + "-root-" + ts + ".qcow2"
-	if err := os.WriteFile(filepath.Join(dir, name), []byte("replica"), 0o600); err != nil {
-		t.Fatalf("write replica: %v", err)
-	}
+	seedReplica(t, dir, "", vmName, "root", ts, "qcow2", 7)
 }
 
 // Automatic promotion refuses a replica older than the bound.

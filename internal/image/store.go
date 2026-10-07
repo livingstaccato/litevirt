@@ -35,9 +35,14 @@ func (s *Store) Init() error {
 	return nil
 }
 
-// ImagePath returns the path to a base image.
+// ImagePath returns the path to a base image: its current file, the one new
+// disks are built on — the version a refresh last published (versions.go), or
+// its first content.
 func (s *Store) ImagePath(imageName string) string {
-	return filepath.Join(s.imageDir, imageName+".qcow2")
+	if p, ok := s.currentVersion(imageName); ok {
+		return p
+	}
+	return s.CanonicalImagePath(imageName)
 }
 
 // SafeImagePath is ImagePath with the image name validated, so a name like
@@ -111,8 +116,10 @@ func (s *Store) CreateOverlayDisk(vmName, diskName, backingImage, size string) (
 		}
 	}
 	// Images stored before arrival checks existed are judged here too: an
-	// overlay must never chain to a base that names another host file.
-	if err := qcow2.AssertStandalone(backingPath); err != nil {
+	// overlay must never chain to a base that names another host file. A
+	// layered image — built on another image in the store — is a base, as
+	// on main.
+	if err := s.assertStoreBase(backingPath); err != nil {
 		return "", fmt.Errorf("base image %q: %w", backingImage, err)
 	}
 	if err := qcow2.CreateWithBacking(diskPath, backingPath, sizeBytes, nil); err != nil {
@@ -302,4 +309,41 @@ func (s *Store) DiskInfo(path string) (virtualSize int64, actualSize int64, err 
 	// Fallback: use actual size if not a valid qcow2 file.
 	virtualSize = actualSize
 	return virtualSize, actualSize, nil
+}
+
+// maxStoreChainDepth bounds a layered image's chain walk.
+const maxStoreChainDepth = 16
+
+// assertStoreBase accepts a base that is standalone, or layered only on other
+// images of this store (each layer resolved through symlinks), with no layer
+// naming an external data file, VMDK extents, or any file outside the store.
+func (s *Store) assertStoreBase(path string) error {
+	root, err := filepath.EvalSymlinks(s.imageDir)
+	if err != nil {
+		return fmt.Errorf("image store: %w", err)
+	}
+	cur := path
+	for depth := 0; depth <= maxStoreChainDepth; depth++ {
+		info, ierr := qcow2.Info(cur)
+		if ierr != nil || info.BackingFile == "" {
+			// Not qcow2, or no backing: judged whole.
+			return qcow2.AssertStandalone(cur)
+		}
+		if err := qcow2.AssertNoExternalData(cur); err != nil {
+			return err
+		}
+		b := info.BackingFile
+		if !filepath.IsAbs(b) {
+			b = filepath.Join(filepath.Dir(cur), b)
+		}
+		r, err := filepath.EvalSymlinks(b)
+		if err != nil {
+			return fmt.Errorf("layer %q names %q: %w", cur, info.BackingFile, err)
+		}
+		if r == root || !strings.HasPrefix(r, root+string(filepath.Separator)) {
+			return fmt.Errorf("layer %q names %q, outside the image store; only a standalone image, or one layered on other images in the store, is a base (flatten it first: qemu-img convert -O qcow2)", cur, info.BackingFile)
+		}
+		cur = r
+	}
+	return fmt.Errorf("%q: backing chain deeper than %d layers", path, maxStoreChainDepth)
 }

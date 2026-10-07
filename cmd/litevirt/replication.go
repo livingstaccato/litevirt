@@ -183,7 +183,7 @@ instead of copying (pins the replica until you localize it).`,
 	}
 	cmd.Flags().StringVar(&pool, "pool", "", "pool holding the replica (default: from the VM's replication schedule)")
 	cmd.Flags().StringVar(&host, "host", "", "host holding the replica (default: auto-resolved)")
-	cmd.Flags().StringVar(&replica, "replica", "", "exact replica filename (default: newest)")
+	cmd.Flags().StringVar(&replica, "replica", "", "one of the VM's recorded replicas, <disk>-<time>.<ext> (default: newest)")
 	cmd.Flags().StringVar(&newName, "new-name", "", "promote under a new name (alongside the original)")
 	cmd.Flags().BoolVar(&force, "force", false, "promote even if the original is on a healthy host")
 	cmd.Flags().BoolVar(&noLocalize, "no-localize", false, "boot off an overlay backed by the replica (fast; pins it)")

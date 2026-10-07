@@ -254,20 +254,32 @@ intact (but disk I/O is full).`,
 // uses the older full-disk RestoreVM RPC.
 func newBackupRestoreFromCmd() *cobra.Command {
 	var repo, vm, disk, ts, target string
+	var inPlace bool
 	cmd := &cobra.Command{
 		Use:   "restore-from",
-		Short: "Restore a snapshot from a backup repo to a target disk path",
+		Short: "Restore a snapshot from a backup repo into a new file, or in place over the VM's stopped disk",
+		Long: `Restore one disk from a backup manifest.
+
+By default the daemon writes a new file of its own under <data_dir>/disks and
+prints where. --in-place restores over the disk the VM's record names instead:
+the VM must be in the backup's project, on the daemon's host, and stopped.
+--target-path names the file to write; it requires the admin role, and an
+existing file there is refused, never replaced.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			for name, val := range map[string]string{
-				"--repo": repo, "--vm": vm, "--disk": disk, "--timestamp": ts, "--target-path": target,
+				"--repo": repo, "--vm": vm, "--disk": disk, "--timestamp": ts,
 			} {
 				if val == "" {
 					return fmt.Errorf("%s is required", name)
 				}
 			}
+			if inPlace && target != "" {
+				return fmt.Errorf("--in-place and --target-path are exclusive")
+			}
 			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
 				stream, err := c.RestoreFromBackup(ctx, &pb.RestoreFromBackupRequest{
 					RepoPath: repo, VmName: vm, DiskName: disk, Timestamp: ts, TargetPath: target,
+					InPlace: inPlace,
 				})
 				if err != nil {
 					return err
@@ -282,7 +294,7 @@ func newBackupRestoreFromCmd() *cobra.Command {
 					}
 					if p.Phase == pb.RestoreFromBackupProgress_DONE {
 						fmt.Printf("[done] %d chunks, %d bytes restored to %s\n",
-							p.ChunksDone, p.BytesWritten, target)
+							p.ChunksDone, p.BytesWritten, p.TargetPath)
 						return nil
 					}
 					fmt.Printf("[restore] %d/%d chunks (%d bytes)\n", p.ChunksDone, p.ChunksTotal, p.BytesWritten)
@@ -294,14 +306,15 @@ func newBackupRestoreFromCmd() *cobra.Command {
 	cmd.Flags().StringVar(&vm, "vm", "", "VM name (matches manifest)")
 	cmd.Flags().StringVar(&disk, "disk", "", "Disk name")
 	cmd.Flags().StringVar(&ts, "timestamp", "", "Manifest timestamp (exact RFC3339)")
-	cmd.Flags().StringVar(&target, "target-path", "", "Where to write the restored disk")
+	cmd.Flags().StringVar(&target, "target-path", "", "File to write (admin only; never an existing file). Default: a new file the daemon names")
+	cmd.Flags().BoolVar(&inPlace, "in-place", false, "Restore over the disk the VM's record names (the VM must be stopped)")
 	return cmd
 }
 
 // newBackupRestoreLiveCmd opens a streaming RPC that spawns an NBD
 // server backed by the manifest's chunk reader, creates a qcow2
-// overlay at --target-path, and prints the resulting NBD URL +
-// overlay path. The stream stays open so the NBD server keeps
+// overlay (a new file the daemon names, or --target-path for an admin),
+// and prints the resulting NBD URL + overlay path. The stream stays open so the NBD server keeps
 // serving until the operator hits Ctrl+C (or another agent closes
 // the gRPC stream).
 //
@@ -309,8 +322,7 @@ func newBackupRestoreFromCmd() *cobra.Command {
 //
 //	# Terminal 1 — start the live-restore source
 //	lv backup restore-live --repo /srv/backup --vm vm1 \
-//	    --disk root --timestamp 2026-05-11T10:00:00Z \
-//	    --target-path /var/lib/libvirt/images/vm1-live.qcow2
+//	    --disk root --timestamp 2026-05-11T10:00:00Z
 //
 //	# Terminal 2 — boot qemu/libvirt against the overlay path
 //	virsh define vm1.xml && virsh start vm1
@@ -334,10 +346,14 @@ server when the operator has finished pulling data locally.
 With --auto-start the daemon also defines and starts the VM against
 the overlay (from the manifest's embedded spec, or --name for a
 collision-avoiding rename). --blockpull then localizes the disk and
-tears the NBD server down automatically when it completes.`,
+tears the NBD server down automatically when it completes.
+
+The overlay is a new file the daemon names under <data_dir>/disks; the
+READY line prints it. --target-path names it instead: admin only, and an
+existing file there is refused, never replaced.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			for name, val := range map[string]string{
-				"--repo": repo, "--vm": vm, "--disk": disk, "--timestamp": ts, "--target-path": target,
+				"--repo": repo, "--vm": vm, "--disk": disk, "--timestamp": ts,
 			} {
 				if val == "" {
 					return fmt.Errorf("%s is required", name)
@@ -380,7 +396,7 @@ tears the NBD server down automatically when it completes.`,
 	cmd.Flags().StringVar(&vm, "vm", "", "VM name (matches manifest)")
 	cmd.Flags().StringVar(&disk, "disk", "", "Disk name")
 	cmd.Flags().StringVar(&ts, "timestamp", "", "Manifest timestamp (exact RFC3339)")
-	cmd.Flags().StringVar(&target, "target-path", "", "Where to write the qcow2 overlay")
+	cmd.Flags().StringVar(&target, "target-path", "", "Overlay file to create (admin only; never an existing file). Default: a new file the daemon names")
 	cmd.Flags().StringVar(&bind, "bind", "127.0.0.1:0", "NBD server bind addr (use 0.0.0.0:<port> for non-local qemu)")
 	cmd.Flags().BoolVar(&autoStart, "auto-start", false, "Define and start the VM automatically against the overlay")
 	cmd.Flags().StringVar(&newName, "name", "", "Rename the restored VM (avoids collision with the original)")

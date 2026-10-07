@@ -115,7 +115,7 @@ func partitionedWriter(t *testing.T, lastSeen time.Time, healthy bool) (h1, h2 *
 		t.Fatal(err)
 	}
 	sched.TargetHost = "h1"
-	if err := h1.RunReplication(adminCtx(), sched, time.Now().Add(-90*time.Minute)); err != nil {
+	if err := poolEraReplicate(t, h1, sched, time.Now().Add(-90*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	status := "unhealthy"
@@ -235,10 +235,12 @@ func TestPoolRound9_AnUnrecordedCopyIsReportedInTheStream(t *testing.T) {
 	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "web", DiskName: "root", TargetPool: "pa"}, rec); err != nil {
 		t.Fatalf("replicate-volume: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(own, "web-root.qcow2")); err != nil {
+	last := rec.Sent[len(rec.Sent)-1]
+	if p := last.GetTargetPath(); filepath.Dir(p) != own {
+		t.Errorf("the copy is at %q, want in %s", p, own)
+	} else if _, err := os.Stat(p); err != nil {
 		t.Errorf("the copy was not kept: %v", err)
 	}
-	last := rec.Sent[len(rec.Sent)-1]
 	if !strings.Contains(last.GetStatus(), "not recorded") {
 		t.Errorf("final status %q does not say the copy is not recorded", last.GetStatus())
 	}

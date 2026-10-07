@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/litevirt/litevirt/internal/netutil"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -368,6 +369,12 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 	// (spec.Uuid was minted above, before the ISO was resolved.)
 	// (Cpu/MemoryMib were defaulted before admission — see normalizeVMSpecResources.)
 
+	// A disk built on the image resolves its current file now and is recorded
+	// only below: until then no prune removes a file of the image.
+	if spec.Image != "" {
+		defer s.holdImage(spec.Image)()
+	}
+
 	// Prepare disks — track created paths for cleanup on failure.
 	var diskConfigs []lv.DiskConfig
 	var diskRecords []corrosion.DiskRecord
@@ -461,6 +468,14 @@ func (s *Server) createVM(ctx context.Context, req *pb.CreateVMRequest, decision
 		}
 		if err != nil {
 			cleanupDisks()
+			// "<vm>-<disk>.qcow2" is ambiguous across hyphens (VM "a" disk
+			// "b-root" is VM "a-b" disk "root"), and a pool can be every
+			// project's. Disk creation is exclusive: a file already there
+			// is a refusal, never replaced — and never cleaned up here.
+			if errors.Is(err, fs.ErrExist) {
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"create disk %s: %v — choose another VM or disk name", d.Name, err)
+			}
 			return nil, status.Errorf(codes.Internal, "create disk %s: %v", d.Name, err)
 		}
 		createdDiskPaths = append(createdDiskPaths, diskPath)

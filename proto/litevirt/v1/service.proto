@@ -582,7 +582,9 @@ message ReplicateVolumeRequest {
     string vm_name      = 1;
     string disk_name    = 2;
     string target_pool  = 3;
-    // target_path overrides the auto-derived "<vm>-<disk>.qcow2" filename.
+    // target_path names the destination file instead of the daemon-derived
+    // "<vm>-<disk>-copy-<time>-<id>.qcow2". Admin only, and never an existing
+    // file.
     string target_path  = 4;
 }
 message ReplicateVolumeProgress {
@@ -675,6 +677,11 @@ message ImportImageRequest { string name = 1; string format = 2;
 message ImportImageResponse { string name = 1; int64 size_bytes = 2;
     string checksum = 3; }
 message PushImageRequest   { string name = 1; string target_host = 2; }
+// PruneImagesRequest removes, on one host, the image-store files no disk there
+// is built on (each image's current file is always kept). name empty: every
+// image. host_name empty: the host serving the call.
+message PruneImagesRequest { string name = 1; string host_name = 2; bool dry_run = 3; }
+message PruneImagesResponse { string host_name = 1; repeated string removed = 2; int64 freed_bytes = 3; }
 message PushImageProgress  { string status = 1; float progress_pct = 2;
     string error = 3; }
 message BuildImageRequest  { string vm_name = 1; string image_name = 2; }
@@ -1001,7 +1008,14 @@ message RestoreFromBackupRequest {
     string vm_name       = 2;  // manifest selector
     string disk_name     = 3;
     string timestamp     = 4;  // exact RFC3339 of manifest
-    string target_path   = 5;  // where to write the restored disk
+    // target_path names the file to write, admin only, and never an existing
+    // file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+    // reports it in the DONE frame.
+    string target_path   = 5;
+    // in_place restores over the disk the VM's own record names (vm_name,
+    // disk_name). The VM must be in the backup's project, on this host and
+    // stopped. Exclusive with target_path.
+    bool   in_place      = 6;
 }
 message RestoreFromBackupProgress {
     enum Phase {
@@ -1015,6 +1029,7 @@ message RestoreFromBackupProgress {
     int32  chunks_total  = 4;
     string status        = 5;
     string error         = 6;
+    string target_path   = 7;  // the file written, on DONE
 }
 
 // ── Backup repository maintenance ──
@@ -1458,6 +1473,9 @@ message RestoreLiveRequest {
     string vm_name    = 2;
     string disk_name  = 3;
     string timestamp  = 4;
+    // target_path names the overlay file, admin only, and never an existing
+    // file. Empty: the daemon picks a fresh file under <data_dir>/disks and
+    // reports it as RestoreLiveProgress.target_path.
     string target_path = 5;
     // bind_addr controls the address the NBD server listens on.
     // Empty defaults to "127.0.0.1:0" — localhost-only, ephemeral
@@ -1711,6 +1729,13 @@ message StoragePoolContent {
     int64  size_bytes  = 3;
     string modified_at = 4; // RFC3339
     bool   is_iso      = 5; // .iso extension
+    // Set for a replica: the VM and disk it is a replica of, and its time. A
+    // listing shows only the replicas of VMs the caller may read, from their
+    // records in the pool's replica area; name is what PromoteReplica.replica
+    // takes.
+    string replica_vm    = 6;
+    string replica_disk  = 7;
+    string replica_taken = 8;
 }
 message ListStoragePoolContentsRequest {
     string pool_name = 1;
@@ -1725,13 +1750,36 @@ message UploadStoragePoolContentRequest {
     string host      = 2; // optional — defaults to caller's host
     string filename  = 3; // base name only (no path separators)
     bytes  chunk     = 4;
+    // 5 carried a replica record on an earlier build of this branch. Replicas
+    // now go only through the peer-only PushReplica, and a header carrying
+    // any field the receiver does not know is refused.
+    reserved 5;
 }
 message UploadStoragePoolContentResponse {
     string path       = 1;
     int64  size_bytes = 2;
+    reserved 3;
 }
-// Delete one file from a file-based pool (used by cross-host replication to
-// prune old replicas on a peer). filename is a base name.
+
+// Client-streaming replica push (cross-host replication), peer only. The
+// first message is the header (pool_name/host/replica, no chunk); the rest
+// carry chunks. The receiver writes a NEW file replica.file into the
+// replica area of (replica.project, replica.vm) and its record beside it.
+// A dedicated RPC rather than an upload field, so an entry node on an older
+// build — which has no handler for it — can never forward one for a user.
+message PushReplicaRequest {
+    string        pool_name = 1; // header
+    string        host      = 2; // header — optional, defaults to the receiver
+    ReplicaRecord replica   = 3; // header
+    bytes         chunk     = 4;
+}
+message PushReplicaResponse {
+    string path       = 1;
+    int64  size_bytes = 2;
+}
+// Delete one file from a file-based pool. filename is a base name. A file any
+// VM disk on any host uses is refused. (Replicas are pruned with the
+// peer-only PruneReplicas, by record, not through this.)
 message DeleteStoragePoolContentRequest {
     string pool_name = 1;
     string host      = 2; // optional — defaults to caller's host
@@ -1794,16 +1842,55 @@ message FetchISOLibraryFileChunk { bytes chunk = 1; }
 message PushReplicaIncrementRequest {
     string pool_name  = 1; // header
     string host       = 2; // header — optional, defaults to caller
-    string filename   = 3; // header — new replica base name
-    string base       = 4; // header — previous replica to fork from; "" = full
+    string filename   = 3; // header — new replica base name; must equal replica.file
+    string base       = 4; // header — a RECORDED replica of the same disk and schedule to fork from; "" = full
     int64  total_size = 5; // header — raw file virtual size
     int64  offset      = 6; // extent
     bytes  data        = 7; // extent
+    ReplicaRecord replica = 8; // header — required: the new replica's record
 }
 message PushReplicaIncrementResponse {
     string path          = 1;
     int64  bytes_written = 2;
+    bool   replica_recorded = 3;
 }
+
+// A replica's record. Replicas live in a daemon-owned area of the pool, one
+// directory per (project, vm), each file beside its record. Replication
+// lists, prunes and forks from, and promotion boots, only files that have a
+// record naming the caller's own project and VM — never a file matched by
+// name — so a pool every project shares cannot be used to read, overwrite or
+// delete another project's replicas or disks.
+message ReplicaRecord {
+    string project    = 1; // normalized project of the VM
+    string vm         = 2;
+    string disk       = 3;
+    string schedule   = 4; // the schedule that wrote it: "<schedule row vm_name>/<repo>"
+    string file       = 5; // "<disk>-<taken>.<format>", a base name in the owner directory
+    string format     = 6; // qcow2 | raw
+    string taken      = 7; // UTC run time, 20060102-150405
+    int64  size_bytes = 8; // set by ListReplicas
+}
+// Peer only. The replica records of one VM in a pool on host.
+message ListReplicasRequest {
+    string pool_name = 1;
+    string host      = 2; // optional — defaults to the receiver
+    string project   = 3;
+    string vm        = 4;
+}
+message ListReplicasResponse { repeated ReplicaRecord replicas = 1; }
+// Peer only. Keep the newest `keep` replicas one schedule recorded for one disk
+// of one VM; delete the older ones, never a file a VM disk references.
+message PruneReplicasRequest {
+    string pool_name = 1;
+    string host      = 2;
+    string project   = 3;
+    string vm        = 4;
+    string disk      = 5;
+    string schedule  = 6;
+    int32  keep      = 7;
+}
+message PruneReplicasResponse { int32 deleted = 1; }
 
 // ── Failover promotion (recover a VM from a replica) ──
 // RuntimeActionProof is the single-use authorization a coordinator (holding the
@@ -3129,6 +3216,7 @@ service LiteVirt {
     rpc ImportImage(stream ImportImageRequest)  returns (ImportImageResponse);
     rpc PushImage(PushImageRequest)            returns (stream PushImageProgress);
     rpc BuildImage(BuildImageRequest)          returns (BuildImageResponse);
+    rpc PruneImages(PruneImagesRequest)        returns (PruneImagesResponse);
 
     // ── Backup ──
     rpc BackupVM(BackupVMRequest)              returns (stream BackupChunk);
@@ -3345,6 +3433,13 @@ service LiteVirt {
     rpc FetchISOLibraryFile(FetchISOLibraryFileRequest) returns (stream FetchISOLibraryFileChunk);
     // Incremental replica push (dirty extents into a raw replica on a peer pool).
     rpc PushReplicaIncrement(stream PushReplicaIncrementRequest) returns (PushReplicaIncrementResponse);
+    // Peer only: one VM's replica records in a pool (promotion, incremental fork
+    // base, and a sender's proof that the receiver records replicas).
+    rpc ListReplicas(ListReplicasRequest) returns (ListReplicasResponse);
+    // Peer only: a full replica, written and recorded in the replica area.
+    rpc PushReplica(stream PushReplicaRequest) returns (PushReplicaResponse);
+    // Peer only: prune one schedule's recorded replicas of one disk.
+    rpc PruneReplicas(PruneReplicasRequest) returns (PruneReplicasResponse);
 
     // ── Internal ──
     rpc Ping(PingRequest) returns (PingResponse);

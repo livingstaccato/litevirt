@@ -69,15 +69,26 @@ func TestFleet_ReplicaInADisksPoolIsPromotableAcrossHosts(t *testing.T) {
 				t.Fatalf("replicate %s to %s: %v", vm, replicaHost.Name, err)
 			}
 		}
+		// Runs record each replica in the pool's replica area, beside it.
 		var reps []string
-		ents, _ := os.ReadDir(disks)
-		for _, e := range ents {
-			if strings.HasPrefix(e.Name(), vm+"-root-") && strings.HasSuffix(e.Name(), ".qcow2") {
-				reps = append(reps, e.Name())
+		_ = filepath.WalkDir(filepath.Join(disks, ".replicas"), func(p string, d os.DirEntry, err error) error {
+			if err != nil || !d.Type().IsRegular() || !strings.HasSuffix(p, ".json") {
+				return nil
 			}
-		}
+			data, rerr := os.ReadFile(p)
+			var rec struct {
+				VM   string `json:"vm"`
+				File string `json:"file"`
+			}
+			if rerr == nil && json.Unmarshal(data, &rec) == nil && rec.VM == vm {
+				if _, serr := os.Stat(filepath.Join(filepath.Dir(p), rec.File)); serr == nil {
+					reps = append(reps, rec.File)
+				}
+			}
+			return nil
+		})
 		if len(reps) != 1 {
-			t.Fatalf("%s's replicas among the disks = %v, want the newest one (kept 1)", vm, reps)
+			t.Fatalf("%s's recorded replicas in the pool = %v, want the newest one (kept 1)", vm, reps)
 		}
 	}
 

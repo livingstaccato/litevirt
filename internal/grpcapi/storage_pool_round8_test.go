@@ -57,6 +57,37 @@ func stampedReplicas(t *testing.T, dir, prefix string) []string {
 			out = append(out, e.Name())
 		}
 	}
+	// And the replicas a run records in the pool's replica area (where runs
+	// write them now: replica_records.go), by their records.
+	return append(out, areaReplicas(t, dir, prefix)...)
+}
+
+// areaReplicas lists the recorded replicas in dir's replica area whose VM and
+// disk make prefix (<vm>-<disk>), oldest first.
+func areaReplicas(t *testing.T, dir, prefix string) []string {
+	t.Helper()
+	owners, _ := os.ReadDir(filepath.Join(dir, replicaAreaDir))
+	var out []string
+	for _, o := range owners {
+		ents, _ := os.ReadDir(filepath.Join(dir, replicaAreaDir, o.Name()))
+		for _, e := range ents {
+			if !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, replicaAreaDir, o.Name(), e.Name()))
+			if err != nil {
+				continue
+			}
+			var r replicaRecord
+			if json.Unmarshal(data, &r) != nil || r.VM+"-"+r.Disk != prefix {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(dir, replicaAreaDir, o.Name(), r.File)); err == nil {
+				out = append(out, r.File)
+			}
+		}
+	}
+	slices.Sort(out)
 	return out
 }
 
@@ -72,21 +103,24 @@ func runKeep(t *testing.T, s *Server, vm string, keep int, at time.Time) {
 	}
 }
 
-// C1, the default name: a replicate-volume copy web-root.qcow2 sorts after
-// every stamped replica. It is not a replica: a keep-1 run keeps the replica
-// it just made, and failover promotes that replica, not the copy.
+// C1, the default name: a replicate-volume copy the daemon names
+// (web-root-copy-<time>-<id>.qcow2) sorts after every stamped replica. It is
+// not a replica: a keep-1 run keeps the replica it just made, and failover
+// promotes that replica, not the copy.
 func TestPoolRound8_ADefaultNamedCopyIsNotTheNewestReplica(t *testing.T) {
 	s, own := ownPoolServer(t)
-	if err := replicateVolume(adminCtx(), s, "web", "root", "pa", ""); err != nil {
+	copyRec := &streamRecorder[pb.ReplicateVolumeProgress]{ctx: adminCtx()}
+	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "web", DiskName: "root", TargetPool: "pa"}, copyRec); err != nil {
 		t.Fatalf("replicate-volume: %v", err)
 	}
+	copyName := filepath.Base(copyRec.Sent[len(copyRec.Sent)-1].GetTargetPath())
 	insertReplicationSchedule(t, s, "web", "pa")
 	runKeep(t, s, "web", 1, time.Now())
 	fresh := stampedReplicas(t, own, "web-root")
 	if len(fresh) != 1 {
 		t.Fatalf("after a keep-1 run web's replicas = %v, want the one it made", fresh)
 	}
-	if _, err := os.Stat(filepath.Join(own, "web-root.qcow2")); err != nil {
+	if _, err := os.Stat(filepath.Join(own, copyName)); err != nil {
 		t.Errorf("the operator's copy was pruned: %v", err)
 	}
 	if err := s.AutoPromoteReplica(context.Background(), "web", "", 0); err != nil {
@@ -97,25 +131,28 @@ func TestPoolRound8_ADefaultNamedCopyIsNotTheNewestReplica(t *testing.T) {
 	}
 }
 
-// C1, a custom name: offsite-copy.qcow2 sorts before every replica. Runs
-// past keep never prune it, and it is still promotable by name.
+// C1, a copy's name: the daemon names an operator's copy
+// (<vm>-<disk>-copy-<time>-<id>; only an admin names the file). Runs past
+// keep never prune it, and it is still promotable by name.
 func TestPoolRound8_ACustomNamedCopySurvivesPruning(t *testing.T) {
 	s, own := ownPoolServer(t)
 	pat := hostPathEngineCtx(t, s, "pat", "Operator", projectRBACBase("acme"))
-	if err := replicateVolume(pat, s, "web", "root", "pa", "offsite-copy.qcow2"); err != nil {
+	copyRec := &streamRecorder[pb.ReplicateVolumeProgress]{ctx: pat}
+	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "web", DiskName: "root", TargetPool: "pa"}, copyRec); err != nil {
 		t.Fatalf("replicate-volume: %v", err)
 	}
+	copyName := filepath.Base(copyRec.Sent[len(copyRec.Sent)-1].GetTargetPath())
 	insertReplicationSchedule(t, s, "web", "pa")
 	for i := 3; i >= 1; i-- {
 		runKeep(t, s, "web", 1, time.Now().Add(-time.Duration(i)*time.Hour))
 	}
-	if _, err := os.Stat(filepath.Join(own, "offsite-copy.qcow2")); err != nil {
+	if _, err := os.Stat(filepath.Join(own, copyName)); err != nil {
 		t.Errorf("three keep-1 runs removed the operator's copy: %v", err)
 	}
 	if got := stampedReplicas(t, own, "web-root"); len(got) != 1 {
 		t.Errorf("web's replicas after three keep-1 runs = %v, want 1", got)
 	}
-	if err := promote(pat, s, &pb.PromoteReplicaRequest{VmName: "web", TargetPool: "pa", Replica: "offsite-copy.qcow2", NoLocalize: true}); err != nil {
+	if err := promote(pat, s, &pb.PromoteReplicaRequest{VmName: "web", TargetPool: "pa", Replica: copyName, NoLocalize: true}); err != nil {
 		t.Errorf("promoting the copy by name: %v", err)
 	}
 }
@@ -127,17 +164,16 @@ func TestPoolRound8_ARawNamedCopyIsNeverAnIncrementBase(t *testing.T) {
 	if err := replicateVolume(adminCtx(), s, "web", "root", "pa", "zzz.raw"); err != nil {
 		t.Fatalf("replicate-volume: %v", err)
 	}
-	runner := "web-root-" + stampAgo(time.Hour) + ".raw"
-	p := filepath.Join(own, runner)
-	if err := os.WriteFile(p, make([]byte, 4096), 0o644); err != nil {
+	// The base is chosen from the replica area's records of the run's
+	// schedule (replica_records.go): the runner's raw replica, never a copy.
+	rec := newReplicaRecord("acme", "web", "root", "web/pa", stampAgo(time.Hour), "raw")
+	if _, err := publishRecordedReplica(context.Background(), own, rec, func(tmp string) error {
+		return os.WriteFile(tmp, make([]byte, 4096), 0o600)
+	}); err != nil {
 		t.Fatal(err)
 	}
-	k := replicaKey{VM: "web", Disk: "root", Project: "acme"}
-	if err := s.recordPoolReplica(context.Background(), "pa", k, p); err != nil {
-		t.Fatal(err)
-	}
-	if got := s.newestRawReplica(context.Background(), "pa", s.hostName, k); got != runner {
-		t.Errorf("increment base = %q, want the runner's %q", got, runner)
+	if got := s.newestRawReplica(context.Background(), "pa", s.hostName, "acme", "web", "root", "web/pa"); got != rec.File {
+		t.Errorf("increment base = %q, want the runner's %q", got, rec.File)
 	}
 }
 
@@ -200,7 +236,10 @@ func TestPoolRound8_AStaleRecordNeverRefusesAReplica(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	runKeep(t, h1, "cvm", 5, time.Now())
+	sched, _ := h1.replicationScheduleForVM(adminCtx(), "cvm")
+	if err := poolEraReplicate(t, h1, sched, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	k := replicaKey{VM: "cvm", Disk: "root", Project: "bravo"}
 	setRecordDev(t, h1, 4242)
 	if got := h1.replicaNames(context.Background(), "shared", "", k, "", false); len(got) != 1 {
@@ -273,7 +312,8 @@ func twoHostsOnMount(t *testing.T, line func(host, dir string) string, opts map[
 	return h1, h2, ms
 }
 
-// replicateOnH1 runs cvm's replication on h1 into "shared".
+// replicateOnH1 writes cvm's replica on h1 into "shared" as runs did before
+// replicas moved into the replica area (poolEraReplicate).
 func replicateOnH1(t *testing.T, h1 *Server, ms *mountSwitch) {
 	t.Helper()
 	ms.as("h1")
@@ -285,7 +325,7 @@ func replicateOnH1(t *testing.T, h1 *Server, ms *mountSwitch) {
 	if err := corrosion.UpsertBackupSchedule(adminCtx(), h1.db, sched); err != nil {
 		t.Fatal(err)
 	}
-	if err := h1.RunReplication(adminCtx(), sched, time.Now()); err != nil {
+	if err := poolEraReplicate(t, h1, sched, time.Now()); err != nil {
 		t.Fatalf("cvm's replication on h1: %v", err)
 	}
 }
@@ -375,14 +415,13 @@ func TestPoolRound8_WithoutVisibleSharedRecordsAReplicaIsMatchedByName(t *testin
 }
 
 // I1: a replica whose record cannot be written fails the run and is not left
-// behind, unpromotable.
+// behind, unpromotable. A run's record is the one beside its replica in the
+// pool's replica area (replica_records.go); the host's pool records file is
+// not the run's, and a broken one stops nothing.
 func TestPoolRound8_AReplicaThatCannotBeRecordedFailsTheRun(t *testing.T) {
 	h1, _, dir := twoHostsOnOneExport(t)
 	insertPromotableVM(t, h1, "web", "acme", "h1", "root")
-	if _, ok := h1.storeRecordsEpoch(context.Background(), sharedStoreOf(dir).ID); !ok {
-		t.Fatal("the store's records epoch is not known")
-	}
-	// The records file cannot be read or written.
+	// The pool records file cannot be read or written.
 	if err := os.Mkdir(filepath.Join(h1.dataDir, "pool-uploads.json"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -390,16 +429,32 @@ func TestPoolRound8_AReplicaThatCannotBeRecordedFailsTheRun(t *testing.T) {
 		VMName: "web", Scope: "vm", Repo: "shared", Cron: "0 0 * * *", Enabled: true,
 		Type: "replication", TargetPool: "shared", TargetHost: "h1", KeepReplicas: 2,
 	}
-	if err := h1.RunReplication(adminCtx(), sched, time.Now()); err == nil {
+	ok := time.Now().Add(-time.Hour)
+	if err := h1.RunReplication(adminCtx(), sched, ok); err != nil {
+		t.Fatalf("a run with a broken pool records file: %v", err)
+	}
+	if got := stampedReplicas(t, dir, "web-root"); len(got) != 1 {
+		t.Fatalf("web's recorded replicas = %v, want the run's", got)
+	}
+	// The run's own record cannot be written: a directory at its name.
+	at := time.Now()
+	owner := replicaOwnerDir(dir, "acme", "web")
+	for _, f := range []string{"qcow2", "raw"} {
+		if err := os.MkdirAll(filepath.Join(owner, replicaFileName("root", at.UTC().Format("20060102-150405"), f)+".json"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h1.RunReplication(adminCtx(), sched, at); err == nil {
 		t.Errorf("a full replication whose replica was not recorded succeeded")
 	}
-	k := replicaKey{VM: "web", Disk: "root", Project: "acme"}
-	name := "web-root-" + stampAgo(0) + ".raw"
-	if err := h1.applyIncrementLocal(context.Background(), "shared", name, "", 4096, bytes.NewReader(make([]byte, 4096)), [][2]int64{{0, 4096}}, k); err == nil {
+	rec := newReplicaRecord("acme", "web", "root", "web/shared", at.UTC().Format("20060102-150405"), "raw")
+	if err := h1.applyIncrementLocal(context.Background(), "shared", rec, "", 4096, bytes.NewReader(make([]byte, 4096)), [][2]int64{{0, 4096}}); err == nil {
 		t.Errorf("an incremental replica that was not recorded was applied")
 	}
-	if got := stampedReplicas(t, dir, "web-root"); len(got) != 0 {
-		t.Errorf("unrecorded replicas left behind: %v", got)
+	for _, f := range []string{"qcow2", "raw"} {
+		if _, err := os.Stat(filepath.Join(owner, replicaFileName("root", at.UTC().Format("20060102-150405"), f))); err == nil {
+			t.Errorf("the unrecorded %s replica was left behind", f)
+		}
 	}
 }
 
@@ -440,7 +495,7 @@ func TestPoolRound8_AReusedNameInAnotherProjectInheritsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	insertPromotableVM(t, h1, "web", "bravo", "h1", "root")
-	if err := h1.RunReplication(adminCtx(), sched, time.Now().Add(-2*time.Hour)); err != nil {
+	if err := poolEraReplicate(t, h1, sched, time.Now().Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	bravos := stampedReplicas(t, dir, "web-root")
@@ -448,7 +503,7 @@ func TestPoolRound8_AReusedNameInAnotherProjectInheritsNothing(t *testing.T) {
 		t.Fatal(err)
 	}
 	insertPromotableVM(t, h1, "web", "acme", "h1", "root")
-	if err := h1.RunReplication(adminCtx(), sched, time.Now().Add(-time.Hour)); err != nil {
+	if err := poolEraReplicate(t, h1, sched, time.Now().Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	var acmes []string
@@ -476,7 +531,7 @@ func TestPoolRound8_EachHostWritesItsOwnReplicaRow(t *testing.T) {
 	}
 	insertPromotableVM(t, h1, "cvm", "bravo", "h1", "root")
 	sched.TargetHost = "h1"
-	if err := h1.RunReplication(adminCtx(), sched, time.Now().Add(-2*time.Hour)); err != nil {
+	if err := poolEraReplicate(t, h1, sched, time.Now().Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	before, err := corrosion.ListPoolRecords(context.Background(), h1.db, corrosion.PoolReplicasKeyPrefix)
@@ -487,7 +542,7 @@ func TestPoolRound8_EachHostWritesItsOwnReplicaRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	sched.TargetHost = "h2"
-	if err := h2.RunReplication(adminCtx(), sched, time.Now().Add(-time.Hour)); err != nil {
+	if err := poolEraReplicate(t, h2, sched, time.Now().Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	after, err := corrosion.ListPoolRecords(context.Background(), h1.db, corrosion.PoolReplicasKeyPrefix)
@@ -597,10 +652,11 @@ func TestPoolRound8_AFutureStampIsRefusedSayingSo(t *testing.T) {
 	}
 }
 
-// I1, shared: a replica whose cluster-wide record cannot be written is
-// withdrawn and fails the run (other hosts could never match it).
+// I1, shared: other hosts on the store must be able to match a run's
+// replica. Its record sits beside it on the store (replica_records.go), so a
+// cluster whose replicated rows cannot be written still shares it.
 func TestPoolRound8_AReplicaThatCannotBeSharedFailsTheRun(t *testing.T) {
-	h1, _, dir := twoHostsOnOneExport(t)
+	h1, h2, dir := twoHostsOnOneExport(t)
 	setFor(t, &sharedWriteAttempts, 1)
 	insertPromotableVM(t, h1, "cvm", "bravo", "h1", "root")
 	sched := corrosion.BackupScheduleRecord{
@@ -610,18 +666,23 @@ func TestPoolRound8_AReplicaThatCannotBeSharedFailsTheRun(t *testing.T) {
 	if err := corrosion.UpsertBackupSchedule(adminCtx(), h1.db, sched); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := h1.storeRecordsEpoch(context.Background(), sharedStoreOf(dir).ID); !ok {
-		t.Fatal("the store's records epoch is not known")
-	}
 	// Every write to the replicated rows fails from here on.
 	if err := h1.db.Execute(context.Background(), `CREATE TRIGGER no_pool_rows BEFORE INSERT ON cluster_policies BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
 		t.Fatal(err)
 	}
-	if err := h1.RunReplication(adminCtx(), sched, time.Now()); err == nil {
-		t.Errorf("a replication whose replica was not shared succeeded")
+	if err := h1.RunReplication(adminCtx(), sched, time.Now()); err != nil {
+		t.Fatalf("a replication on shared storage with the replicated rows refused: %v", err)
 	}
-	if got := stampedReplicas(t, dir, "cvm-root"); len(got) != 0 {
-		t.Errorf("unshared replicas left behind: %v", got)
+	reps := stampedReplicas(t, dir, "cvm-root")
+	if len(reps) != 1 {
+		t.Fatalf("cvm's replicas = %v, want the run's", reps)
+	}
+	var seen []string
+	for _, r := range h2.replicaRecordsOn(context.Background(), "shared", "", "bravo", "cvm") {
+		seen = append(seen, r.File)
+	}
+	if !slices.Equal(seen, reps) {
+		t.Errorf("h2 sees cvm's replicas %v, want h1's %v", seen, reps)
 	}
 }
 

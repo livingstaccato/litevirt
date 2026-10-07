@@ -39,6 +39,13 @@ type BackupScheduleRecord struct {
 	TargetHost   string
 	KeepReplicas int
 
+	// Origin is the vm_name of the schedule ROW a fan-out run came from (its
+	// sentinel), set by the scheduler when it expands a pool/project/cluster
+	// schedule into per-VM runs. Not a column: it lets the replication runner
+	// tell two schedules replicating one VM into one pool apart, so one never
+	// prunes the other's replicas. Empty for a vm-scoped row (VMName is the row).
+	Origin string
+
 	// Replication follow-ups (v18). Incremental transfers only dirty extents
 	// into raw replicas (full-copy fallback when unavailable). AutoPromote lets
 	// failover bring up the freshest replica on host loss. LastCheckpoint is the

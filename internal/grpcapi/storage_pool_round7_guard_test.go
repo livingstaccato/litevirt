@@ -25,7 +25,7 @@ func TestPoolRound7_ASharedReplicaIsRecordedForEveryHost(t *testing.T) {
 	if err := corrosion.UpsertBackupSchedule(adminCtx(), h1.db, sched); err != nil {
 		t.Fatal(err)
 	}
-	if err := h1.RunReplication(adminCtx(), sched, time.Now()); err != nil {
+	if err := poolEraReplicate(t, h1, sched, time.Now()); err != nil {
 		t.Fatalf("cvm's replication on h1: %v", err)
 	}
 	k := replicaKey{VM: "cvm", Disk: "root", Project: "bravo"}
@@ -174,7 +174,7 @@ func TestPoolRound7_LocalPruneKeepsAReplicaALiveDiskUses(t *testing.T) {
 }
 
 // NC1: a replicate-volume copy into a pool is the VM's replica by record,
-// whatever the operator named it, and a manual promotion may name it.
+// whatever it is named, and a manual promotion may name it.
 func TestPoolRound7_AReplicateVolumeCopyIsTheVMsReplica(t *testing.T) {
 	s, _ := disksPoolServer(t)
 	own := filepath.Join(s.dataDir, "pools", "pa")
@@ -184,11 +184,13 @@ func TestPoolRound7_AReplicateVolumeCopyIsTheVMsReplica(t *testing.T) {
 	upsertPool(t, s, corrosion.StoragePoolRecord{HostName: s.hostName, Name: "pa", Driver: "dir", Target: own, Project: "acme"})
 	insertPromotableVM(t, s, "web", "acme", s.hostName, "root")
 	pat := hostPathEngineCtx(t, s, "pat", "Operator", projectRBACBase("acme"))
-	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "web", DiskName: "root", TargetPool: "pa", TargetPath: "offsite-copy.qcow2"},
-		&streamRecorder[pb.ReplicateVolumeProgress]{ctx: pat}); err != nil {
+	// The daemon names an operator's copy; only an admin names the file.
+	copyRec := &streamRecorder[pb.ReplicateVolumeProgress]{ctx: pat}
+	if err := s.ReplicateVolume(&pb.ReplicateVolumeRequest{VmName: "web", DiskName: "root", TargetPool: "pa"}, copyRec); err != nil {
 		t.Fatalf("replicate-volume: %v", err)
 	}
-	if err := promote(pat, s, &pb.PromoteReplicaRequest{VmName: "web", TargetPool: "pa", Replica: "offsite-copy.qcow2", NoLocalize: true}); err != nil {
+	copyName := filepath.Base(copyRec.Sent[len(copyRec.Sent)-1].GetTargetPath())
+	if err := promote(pat, s, &pb.PromoteReplicaRequest{VmName: "web", TargetPool: "pa", Replica: copyName, NoLocalize: true}); err != nil {
 		t.Errorf("promoting the replicate-volume copy by name: %v", err)
 	}
 }

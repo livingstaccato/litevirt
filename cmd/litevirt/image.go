@@ -24,6 +24,7 @@ func newImageCmd() *cobra.Command {
 		newImageRmCmd(),
 		newImagePushCmd(),
 		newImageBuildCmd(),
+		newImagePruneCmd(),
 	)
 	return cmd
 }
@@ -266,4 +267,40 @@ func formatBytes(b int64) string {
 	default:
 		return fmt.Sprintf("%d B", b)
 	}
+}
+
+func newImagePruneCmd() *cobra.Command {
+	var (
+		host   string
+		dryRun bool
+	)
+	cmd := &cobra.Command{
+		Use:   "prune [image]",
+		Short: "Remove image versions no disk on the host is built on",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			name := ""
+			if len(args) == 1 {
+				name = args[0]
+			}
+			return withClient(cmd.Context(), func(ctx context.Context, c pb.LiteVirtClient) error {
+				resp, err := c.PruneImages(ctx, &pb.PruneImagesRequest{Name: name, HostName: host, DryRun: dryRun})
+				if err != nil {
+					return fmt.Errorf("prune images: %w", err)
+				}
+				verb := "removed"
+				if dryRun {
+					verb = "would remove"
+				}
+				for _, f := range resp.Removed {
+					fmt.Printf("%s: %s %s\n", resp.HostName, verb, f)
+				}
+				fmt.Printf("%s: %s %d file(s), %d bytes\n", resp.HostName, verb, len(resp.Removed), resp.FreedBytes)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "Host whose image store to prune (default: the host serving the call)")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "List what would be removed, remove nothing")
+	return cmd
 }

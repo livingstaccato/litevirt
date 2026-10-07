@@ -38,6 +38,10 @@ func closeAndCleanup(c io.Closer, path string, err error) error {
 
 // Create creates a new empty qcow2 v3 image at path with the given virtual size.
 // opts may be nil for defaults (64 KB clusters, 16-bit refcounts).
+//
+// Every Create* refuses a path that already exists (an error wrapping
+// fs.ErrExist): the image is built at a temp and published with a hard link,
+// never renamed over what is there.
 func Create(path string, sizeBytes uint64, opts *Options) error {
 	if sizeBytes == 0 {
 		return fmt.Errorf("virtual size must be > 0")
@@ -198,15 +202,10 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	// Write to a temp file and atomically rename into place, then fsync the parent
 	// dir: a crash mid-write can't leave a partial/torn qcow2 at the real path.
 	//
-	// The temp name is predictable, and the directory may be a pool others can
-	// write (an NFS export's server). A crash's leftover — or anything planted
-	// there, a symlink included — is unlinked (never followed), and the temp
-	// is then created exclusively without following a final symlink, so a
-	// planted link can never make this truncate a file outside the pool.
-	tmpPath := path + ".tmp"
-	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("clear stale temp: %w", err)
-	}
+	// The temp name is fresh and unpredictable (tempSibling), so two creates
+	// of one path never share it and nothing can be planted there; it is
+	// still created exclusively without following a final symlink.
+	tmpPath := tempSibling(path)
 	f, err := os.OpenFile(tmpPath, os.O_RDWR|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
@@ -307,8 +306,8 @@ func createImage(path, backingPath, backingFormat string, sizeBytes uint64, opts
 	if err = Check(tmpPath); err != nil {
 		return fmt.Errorf("post-create check failed: %w", err)
 	}
-	if err = os.Rename(tmpPath, path); err != nil {
-		return fmt.Errorf("rename into place: %w", err)
+	if err = publishNoReplace(tmpPath, path); err != nil {
+		return err
 	}
 	committed = true
 	fsyncDir(filepath.Dir(path))

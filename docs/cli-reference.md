@@ -527,6 +527,28 @@ lv stack migrate-volumes <stack> --to fast --map pg-1/data=archive --map pg-2=wa
 ```bash
 lv image pull <url> --name <name> [--format qcow2] [--checksum sha256:...]
 lv image import <file> --name <name>
+#   Content is published as <name>@<sha256-prefix>.qcow2 (every host names the
+#   same content the same) and the name points at it. A pull or import under
+#   an existing name is a refresh: a new version that new VMs are built on. A file a disk is built on is never written over or removed.
+#   The one exception is a heal: a local copy whose bytes no longer match the
+#   sha256 recorded when it was published is put back from byte-identical
+#   content (the reconciler fetches it from a peer); any other content becomes
+#   a new version, and an unhealable base under disks is logged at ERROR.
+lv image prune [<image>] [--host <host>] [--dry-run]
+#   Removes, on one host, the image files no disk there is built on — judged
+#   from every visible disk's backing header, never from the image's name —
+#   keeping each image's current version, every version a kept image is
+#   layered on, every version a disk create in flight may use, and every
+#   version a disk-file backup was taken on: the backup pins it on the VM's
+#   host (<file>.pinned, permanent) wherever the manifest goes — a sink host,
+#   an absolute repo path. A backup taken before pins is honoured through its
+#   manifest when that is in a backup repo on the host; one taken by an older
+#   build records no base and pins nothing.
+#   Needs image.import. Nothing is removed unless the whole view can be read
+#   within 2 minutes: a pool directory, a disk header, an nfs share that is
+#   not mounted or a backup repo that cannot be read refuses the prune,
+#   saying which. A refresh prunes the image's older unused versions by
+#   itself, in the background, keeping the one it superseded.
 lv image push <image> --to <host>
 lv image build <vm> --name <name>        # Create image from running VM
 lv image ls
@@ -561,6 +583,9 @@ lv import dump.vma.zst --from vma --server-path /srv/stage/dump.vma.zst --name a
 #   --preserve-mac                 keep source MACs (default: regenerate)
 #   --server-path <path>           use a file/dir already staged on the target host
 #   --inspect                      print the mapping + warnings, import nothing
+#   Each disk lands as a NEW <vm>-<disk>.qcow2 in the target pool (or
+#   <data_dir>/disks without one); an existing file of that name is refused
+#   (AlreadyExists), never replaced.
 ```
 
 `--server-path`, `--disk-map` and any disk a Proxmox `.conf` names must be
@@ -743,10 +768,11 @@ lv backup snapshot <vm> --repo <path> [--disk <name>] [--incremental] [--quiesce
 #   --quiesce auto (default): freeze guest filesystems via the qemu-guest-agent for an
 #   application-consistent backup when the VM has an agent, else crash-consistent.
 #   --quiesce off: always crash-consistent. A freeze failure never fails the backup.
-lv backup restore-from --repo <p> --vm <v> --disk <d> \
-    --timestamp <ts> --target-path <path>
+lv backup restore-from --repo <p> --vm <v> --disk <d> --timestamp <ts>
+  [--in-place]        # restore over the VM's own disk from its record (VM stopped)
+  [--target-path <f>] # admin only; never an existing file. Default: a new daemon-named file
 lv backup restore-live --repo <p> --vm <v> --disk <d> \
-    --timestamp <ts> --target-path <overlay.qcow2> [--bind 127.0.0.1:0]
+    --timestamp <ts> [--target-path <overlay.qcow2>] [--bind 127.0.0.1:0]
   [--auto-start]      # define + start the VM against the overlay automatically
   [--name <new>]      # rename the restored VM (avoids collision with the original)
   [--blockpull]       # after start, localize the disk then tear down the NBD server
@@ -774,7 +800,7 @@ lv replication schedule rm <vm> --target-pool <pool> [--scope ...] [--pool-name 
 # Disaster recovery: bring a VM up from its replica.
 lv replication promote <vm>
   [--pool <p>] [--host <h>]   # where the replica lives (default: from the VM's schedule)
-  [--replica <file>]          # exact replica filename (default: newest)
+  [--replica <file>]          # one of the VM's recorded replicas, <disk>-<time>.<ext> (default: newest)
   [--new-name <name>]         # promote alongside a still-running original
   [--no-localize]             # boot off an overlay backed by the replica (fast; pins it)
   [--force]                   # promote even if the original is on a healthy host

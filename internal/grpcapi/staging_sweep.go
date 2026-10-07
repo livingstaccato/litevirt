@@ -33,7 +33,7 @@ func isStagingTemp(name string) bool {
 
 // isLegacyReplicaPartial matches the ".<replica>.partial" temp publishReplica
 // staged into before it switched to ".repl-*.tmp": a dot, a replica-shaped
-// name (a .qcow2 or .raw), then ".partial". This
+// name (what the old by-name replica match took — a .qcow2 or .raw), then ".partial". This
 // build never creates one, so every match is a leftover of a crash on an older
 // one; nothing else collects them.
 func isLegacyReplicaPartial(name string) bool {
@@ -123,6 +123,15 @@ func (s *Server) SweepStaleStaging(ctx context.Context) {
 			if dir, derr := fileBasedPoolDir(s.dataDir, StoragePoolRef{Driver: p.Driver, Source: p.Source, Target: p.Target}); derr == nil {
 				dirs[dir] = struct{}{}
 				replicaDirs[dir] = struct{}{}
+				// Replicas are written inside the pool's replica area, one
+				// directory per VM; their staging temps are there too.
+				if owners, rerr := os.ReadDir(filepath.Join(dir, replicaAreaDir)); rerr == nil {
+					for _, o := range owners {
+						if o.IsDir() {
+							dirs[filepath.Join(dir, replicaAreaDir, o.Name())] = struct{}{}
+						}
+					}
+				}
 			}
 		}
 	}

@@ -9,6 +9,8 @@ import (
 	"time"
 
 	golibvirt "github.com/digitalocean/go-libvirt"
+
+	"github.com/litevirt/litevirt/internal/qcow2"
 )
 
 // libvirt VIR_DOMAIN_SAVE_* flag values (not all exported as typed consts by
@@ -532,7 +534,15 @@ func (c *Client) RevertToLiveSnapshot(domainName, snapshotName, vmstatePath stri
 // resetOverlay recreates overlay as a fresh, empty qcow2 backed by base,
 // discarding any prior contents. Used by the live-snapshot revert to roll a
 // disk back to its frozen base without touching the base itself.
+//
+// qemu-img create opens base (to read its size) with the format NAMED (-F
+// qcow2), never probed. base is the snapshot's frozen disk, written by qemu;
+// its header is still checked for an external data file first, which qemu
+// would open with it.
 func resetOverlay(overlay, base string) error {
+	if err := qcow2.AssertNoExternalData(base); err != nil {
+		return fmt.Errorf("snapshot base %s: %w", base, err)
+	}
 	_ = os.Remove(overlay)
 	cmd := exec.Command("qemu-img", "create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", base, overlay)
 	if out, err := cmd.CombinedOutput(); err != nil {

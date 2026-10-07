@@ -170,6 +170,7 @@ var noisyMethods = map[string]struct{}{
 	"PushMutations":            {},
 	"AckMutations":             {},
 	"PushReplicaIncrement":     {},
+	"PushReplica":              {},
 	"GetHostHealth":            {},
 }
 

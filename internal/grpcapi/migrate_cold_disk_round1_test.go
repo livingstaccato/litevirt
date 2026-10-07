@@ -194,7 +194,14 @@ func TestReceiveMigrationDisk_RefusesWithoutFreeSpace(t *testing.T) {
 func TestStreamColdDisk_RefusesFlattenWithoutFreeSpace(t *testing.T) {
 	f := newColdDiskFixture(t)
 	const size = 1 << 20
-	base := filepath.Join(t.TempDir(), "base.qcow2")
+	// The base lives where a VM disk's base does: beside it, in the disk's
+	// directory — a linked clone's template disk, recorded as one.
+	f.recordTemplateBase(t)
+	baseDir := filepath.Dir(f.src.hostDiskFile(f.path))
+	if err := os.MkdirAll(baseDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(baseDir, "tpl-base.qcow2")
 	if err := qcow2.Create(base, size, nil); err != nil {
 		t.Fatal(err)
 	}

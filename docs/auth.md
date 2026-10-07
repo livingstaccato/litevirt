@@ -135,8 +135,8 @@ binding can:
   pool, a `--target`, a btrfs source, NFS mount options, a Ceph conf or
   keyring), any network-backed pool (`nfs`, `ceph`, `iscsi`), any pool on
   host block storage (`zfs`, `lvm-thin`), a compose
-  `backup-repos:` path, and a custom absolute `repo_path` or `target_path` on
-  a backup or restore RPC all need it, because the daemon reads and writes
+  `backup-repos:` path, a custom absolute `repo_path`, and any `target_path` on
+  a restore or `ReplicateVolume` RPC (a bare name included) all need it, because the daemon reads and writes
   there as root. Only `Admin` holds it (through `*`): `Operator` holds
   `storage.pool.write` but not this, at any path. A custom role gets it by
   naming it or `storage.*`. Without bindings the floor is `admin`. Using a pool
@@ -508,7 +508,10 @@ it to impersonate a user.
 > (`GetRuntimeInventory`/`CheckVIPParticipant`/`CheckLBPresent`),
 > `FetchBinary`, `GetVMIPRemote`, proof-bearing `PromoteReplica`/`ApplyLB`, and the
 > peer-gated `ProvisionNetwork`/`SyncVTEP`/`UpdateFDB`/`RefreshLB`/
-> `PushReplicaIncrement`. Not enforced today.
+> `PushReplicaIncrement`. Not enforced today. (`ListReplicas`, `PruneReplicas`
+> and `PushReplica` ARE peer-only, enforced: a replica's record is written and
+> read only by cluster hosts. `UploadStoragePoolContent` refuses a header with
+> any field the receiver does not know, so no replica rides on an upload.)
 
 ### Who can read the state dump
 

@@ -1440,6 +1440,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// the replicated rows are writable: on a new cluster failover_scope_v1
 	// latches after the first start (pool_records.go).
 	go svc.RunPoolRecordsMarker(ctx)
+	startLegacyImageProvenance(ctx, svc)
 
 	// Now that the gRPC server exists, wire it as the failover coordinator's
 	// replica promoter (auto_promote recovery) and start the coordinator.

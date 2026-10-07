@@ -2,7 +2,6 @@ package grpcapi
 
 import (
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -119,12 +118,8 @@ func TestPromoteReplica_RenamedPopulatesHardwareTables(t *testing.T) {
 		t.Fatalf("InsertVM: %v", err)
 	}
 
-	// A replica file named exactly as the runner names (vm, disk)'s replicas
-	// (replicaNameIs): "<vm>-<disk>-<YYYYMMDD-HHMMSS>.raw".
-	replicaPath := filepath.Join(poolDir, "vm1-root-20260101-000000.raw")
-	if err := os.WriteFile(replicaPath, make([]byte, 1<<20), 0644); err != nil {
-		t.Fatalf("write replica: %v", err)
-	}
+	// A recorded replica of (vm1, root), which is what doPromoteLocal selects.
+	seedReplica(t, poolDir, "", "vm1", "root", "20260101-000000", "raw", 1<<20)
 
 	stream := &streamRecorder[pb.PromoteReplicaProgress]{ctx: ctx}
 	if err := s.PromoteReplica(&pb.PromoteReplicaRequest{

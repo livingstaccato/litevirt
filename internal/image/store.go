@@ -311,6 +311,21 @@ func (s *Store) DiskInfo(path string) (virtualSize int64, actualSize int64, err 
 	return virtualSize, actualSize, nil
 }
 
+// AssertBase judges an image file a disk is an overlay on, as a base must
+// be: standalone, or layered only on other images of this store.
+func (s *Store) AssertBase(path string) error { return s.assertStoreBase(path) }
+
+// Contains reports whether path, resolved through symlinks, is inside the
+// image store.
+func (s *Store) Contains(path string) bool {
+	root, err := filepath.EvalSymlinks(s.imageDir)
+	if err != nil {
+		return false
+	}
+	r, err := filepath.EvalSymlinks(path)
+	return err == nil && strings.HasPrefix(r, root+string(filepath.Separator))
+}
+
 // maxStoreChainDepth bounds a layered image's chain walk.
 const maxStoreChainDepth = 16
 

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -1616,6 +1617,12 @@ func (s *Server) PrepareHardwareForStart(ctx context.Context, vm *corrosion.VMRe
 	// qemu reopens the installer ISO at every start, so it is judged again
 	// here, on the host that starts it — every start path runs this hook.
 	if err := s.verifyVMISOForStart(vm); err != nil {
+		return releasePreflight, err
+	}
+	// An image-store base is a file qemu opens for the guest at every start:
+	// one stored before arrival checks existed, or changed since, must still
+	// name no file outside the store.
+	if err := s.verifyImageBasesForStart(ctx, vm); err != nil {
 		return releasePreflight, err
 	}
 
@@ -4518,4 +4525,42 @@ func resolveStopTimeout(reqTimeout int32, specJSON string) int32 {
 		}
 	}
 	return 30
+}
+
+// verifyImageBasesForStart refuses a start of vm whose local disk is an
+// overlay on an image-store base that names a file outside the store, VMDK
+// extents or an external data file (image.Store.AssertBase). A layered image
+// whose whole chain stays in the store passes, as on main. Disks on other
+// hosts, absent files and backings outside the image store are not this
+// check's: the base is what an image import or pull let in.
+func (s *Server) verifyImageBasesForStart(ctx context.Context, vm *corrosion.VMRecord) error {
+	if s.images == nil {
+		return nil
+	}
+	disks, err := corrosion.GetVMDisks(ctx, s.db, vm.Name)
+	if err != nil {
+		return status.Errorf(codes.Internal, "read disks of %q: %v", vm.Name, err)
+	}
+	for _, d := range disks {
+		if d.HostName != "" && d.HostName != s.hostName {
+			continue
+		}
+		file := s.hostDiskFile(d.Path)
+		info, err := qcow2.Info(file)
+		if err != nil || info.BackingFile == "" {
+			continue
+		}
+		b := info.BackingFile
+		if !filepath.IsAbs(b) {
+			b = filepath.Join(filepath.Dir(file), b)
+		}
+		if !s.images.Contains(b) {
+			continue
+		}
+		if err := s.images.AssertBase(b); err != nil {
+			slog.Error("start refused: the disk's image-store base names a file outside the store", "vm", vm.Name, "disk", d.DiskName, "base", b, "error", err)
+			return status.Errorf(codes.FailedPrecondition, "disk %q of %q is built on image %s, which the host will not open: %v", d.DiskName, vm.Name, filepath.Base(b), err)
+		}
+	}
+	return nil
 }

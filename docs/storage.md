@@ -527,8 +527,12 @@ VM was created:
   first arrival by migration on a host where the directory is already shared,
   the source sends the sha256 of the file it judged for the VM, and the
   target admits a file with those very bytes (the guest gets what it already
-  had) and records it; any other file there is refused. The hash is computed
-  once per file version (device, inode, size, mtime). A VM restored from a
+  had) and records it. Wherever the directory is shared — a first arrival, a
+  start with no record of the file here — a file the pools' upload records
+  give to the pool the reference names (an upload into that library, its
+  project's) is that library's, and is admitted and recorded; any other file
+  there is refused. The hash is computed once per file version (device,
+  inode, size, mtime). A VM restored from a
   backup, or failed over, is defined without its installer CD-ROM (as before
   this release: only a create attaches one), so it starts whatever another
   project's pools map. A host's records

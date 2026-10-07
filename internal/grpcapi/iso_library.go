@@ -290,7 +290,7 @@ func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file
 	if err != nil {
 		return "", err
 	}
-	if err := s.isoFileOwnershipAllows(project, pool, file, path, rows, key, wantSHA); err != nil {
+	if err := s.isoFileOwnershipAllows(ctx, project, pool, file, path, rows, key, wantSHA); err != nil {
 		return "", err
 	}
 	if libraryCheck {
@@ -302,26 +302,36 @@ func (s *Server) resolveISOForVM(ctx context.Context, project, scope, pool, file
 }
 
 // isoFileOwnershipAllows is THE ownership rule for an ISO file in a pool
-// directory, decided in this one place (the storage branch's per-file
-// ownership records belong here after the merge). Every pool mapping the
-// directory on this host must be global or the VM's project's; when they all
-// are, this host records the file (recordISOIdentity). When another
-// project's pool maps it, the file passes only if
+// directory, decided in this one place. Every pool mapping the directory on
+// this host must be global or the VM's project's; when they all are, this
+// host records the file (recordISOIdentity). When another project's pool
+// maps it, the file passes only if
 //
+//   - the pools' per-file ownership records give it to the pool the
+//     reference names (isoFileOwnedByPool): its upload into that pool, which
+//     is that pool's project's, whatever other pool maps the directory — so
+//     a VM's first arrival on such a host, or a restored VM's start, takes
+//     it; or
 //   - it is the very file this host recorded for this VM before
 //     (isoIdentityHolds): that pool joining the directory since has not made
 //     it its file, so a VM that started yesterday still starts; or
 //   - on a migration target, its sha256 is wantSHA, the hash of the file the
 //     source judged for this VM and is booting it from: the guest gets the
-//     bytes it already had, which discloses nothing, and this host then
-//     records the file, so a later swap is caught.
+//     bytes it already had, which discloses nothing.
 //
-// A file put there since is refused. The pool the reference names is judged
-// before this, by its own project, never excused.
-func (s *Server) isoFileOwnershipAllows(project, pool, file, path string, rows []corrosion.StoragePoolRecord, key, wantSHA string) error {
+// Admitted either way, this host then records the file, so a later swap is
+// caught. A file put there since is refused. The pool the reference names is
+// judged before this, by its own project, never excused.
+func (s *Server) isoFileOwnershipAllows(ctx context.Context, project, pool, file, path string, rows []corrosion.StoragePoolRecord, key, wantSHA string) error {
 	for _, r := range rows {
 		if r.Project != "" && !tenancy.AdmitAttach(project, r.Project) {
 			if s.isoIdentityHolds(key, tenancy.NormalizeProject(project), path) {
+				return nil
+			}
+			if s.isoFileOwnedByPool(ctx, project, pool, path) {
+				s.recordISOIdentity(key, tenancy.NormalizeProject(project), path)
+				slog.Info("installer ISO: admitted as its pool's own file by the pool's record",
+					"pool", pool, "file", file, "host", s.hostName)
 				return nil
 			}
 			if wantSHA != "" {
@@ -339,6 +349,26 @@ func (s *Server) isoFileOwnershipAllows(project, pool, file, path string, rows [
 	}
 	s.recordISOIdentity(key, tenancy.NormalizeProject(project), path)
 	return nil
+}
+
+// isoFileOwnedByPool reports whether the pools' per-file ownership records
+// (storage_pool_confine.go) give the file at path to pool on this host, in a
+// project the VM's may use: an upload into that pool, recorded as its
+// project's (a global pool's, as everyone's), that still describes the file.
+func (s *Server) isoFileOwnedByPool(ctx context.Context, project, pool, path string) bool {
+	rec, ok, err := corrosion.GetStoragePool(ctx, s.db, s.hostName, pool)
+	if err != nil || !ok {
+		return false
+	}
+	uploads, err := s.loadPoolUploads(ctx, filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	u, ok := s.poolUploadOf(uploads, path)
+	if !ok || u.VM != "" || u.Peer || u.Pool != pool || !sameProject(u.Project, rec.Project) {
+		return false
+	}
+	return u.Project == "" || tenancy.AdmitAttach(project, u.Project)
 }
 
 // isoAbsentError marks a refusal because the ISO (its pool, or the file) is

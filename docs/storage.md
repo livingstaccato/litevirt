@@ -259,7 +259,11 @@ Records only ever add proof. A record bound to a file that has since changed
 matched by its name as if it had none. A record is bound to its path, size
 and modification time only, so a reboot, a remount (CIFS `noserverino`, FUSE)
 or a copy of the data directory and its pools (`rsync -a`, `cp -a`, a
-restore) keeps every upload its project's.
+restore) keeps every upload its project's. A copy that keeps the modification
+time only to the second (GNU `tar` in its default format, `scp -p`, an older
+`rsync`), or to the millisecond, microsecond or 100 ns (the target
+filesystem's granularity), still matches: the file's time is the record's
+truncated to that unit.
 
 A replica an operator names for a manual promotion (`--replica`) may also be
 a file the VM's project owns by record — an upload into one of its pools, or
@@ -300,8 +304,7 @@ taken for a replica by its name. While any host holding the pool is on
 another identity (mid re-IP, or spelling the server differently), files are
 matched by name. Everywhere else — a local directory, a network
 filesystem whose identity cannot be told (OCFS2, GFS2, virtiofs, other FUSE
-mounts), an export two hosts spell differently with no `addr=` to reconcile
-them, a store some host has not noted yet, or while `failover_scope_v1` has
+mounts), an export two hosts spell differently, a store some host has not noted yet, or while `failover_scope_v1` has
 not latched — files with no record are matched by name as described above.
 Spell an NFS server the same on every host to keep its records shared.
 
@@ -309,12 +312,18 @@ A replica's record on shared storage reaches another host as fast as the
 cluster replicates. A host cut off from the others (a partition) may keep
 writing replicas to the store whose records never arrive. Failover still
 takes such a replica when its name is exactly the VM disk's runner name, no
-upload record names it, the VM's host is fenced or no longer answering, that
-host has recorded replicas of this disk on the store, and the file is newer
-than every one of them and no newer than the moment that host was last seen
-answering (plus ten minutes of clock skew); the VM's events then name the
-replica as promoted without its record. A file planted by anyone else is
-outside those bounds and is refused.
+record this host holds names it, the upload API did not place it, the VM's
+host is fenced or no longer answering, that host has recorded replicas of
+this disk on the store, and the file is newer than every one of them and no
+newer than the moment that host was last seen answering (plus ten minutes of
+clock skew); the VM's events then name the replica as promoted without its
+record. Every upload into a directory on such a store leaves a marker on the
+store itself (`.litevirt-uploads/<name>` beside it, written before the upload
+is published, removed with it), which every host sees together with the file
+even when the upload's record has not arrived: an upload, through any host
+and whenever made, is never taken this way. What remains takeable is a file
+put on the store directly — not through litevirt — at the VM disk's next
+runner name, by someone with write access to the export, inside that window.
 
 On a store without an identity, a file recorded on another host has no
 record here: a project's own disk-image upload made through one host is

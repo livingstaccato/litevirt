@@ -13,6 +13,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -493,4 +494,61 @@ func (s *Server) isLegacyUnrecorded(ctx context.Context, path string) bool {
 	}
 	fi, err := os.Lstat(path)
 	return err == nil && !fi.ModTime().After(epoch)
+}
+
+// uploadMarkerDir holds, beside the files of a directory on a shared store
+// with an identity, one empty marker per file the upload API placed there. It
+// is written on the store itself before the upload is published, so every
+// host that can see the file can see the marker — across a partition too,
+// where the upload's record may not arrive. A marker only ever withdraws a
+// file from being taken as a late replica (lateReplicaOK); it gives no one
+// anything. Listings skip it (a directory), and no content name reaches into
+// it.
+const uploadMarkerDir = ".litevirt-uploads"
+
+func uploadMarkerPath(path string) string {
+	return filepath.Join(filepath.Dir(path), uploadMarkerDir, filepath.Base(path))
+}
+
+// markUpload writes path's upload marker, durably, when path is on a shared
+// store with an identity. A marker directory that is not a real directory
+// (someone with access to the store put something else there) is not written
+// through: the upload goes ahead unmarked, as before markers.
+func markUpload(path string) error {
+	dir := filepath.Dir(path)
+	if sharedStoreOf(dir).ID == "" {
+		return nil
+	}
+	mdir := filepath.Join(dir, uploadMarkerDir)
+	if err := os.Mkdir(mdir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	if fi, err := os.Lstat(mdir); err != nil || !fi.IsDir() {
+		slog.Warn("upload marker directory is not a directory; upload not marked", "dir", mdir)
+		return nil
+	}
+	f, err := os.OpenFile(uploadMarkerPath(path), os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return syncPath(mdir)
+}
+
+// unmarkUpload removes path's upload marker, if any.
+func unmarkUpload(path string) {
+	_ = os.Remove(uploadMarkerPath(path))
+}
+
+// hasUploadMarker reports whether the upload API placed path (or that cannot
+// be ruled out: any error but its absence counts as marked).
+func hasUploadMarker(path string) bool {
+	_, err := os.Lstat(uploadMarkerPath(path))
+	return !errors.Is(err, fs.ErrNotExist)
 }

@@ -99,8 +99,24 @@ type fileID struct {
 // of a filesystem without stable inode numbers (CIFS noserverino, FUSE)
 // changes; the modification time is the daemon's write time, which a user
 // cannot choose.
+//
+// A copy that keeps only a coarser modification time — whole seconds (GNU
+// tar's default format, scp -p, older rsync), or milliseconds, microseconds
+// or 100 ns (the target filesystem's granularity) — still matches: the file's
+// time is the record's truncated to that unit, or the other way round.
 func (id fileID) describedBy(u poolUpload) bool {
-	return id.size == u.Size && id.mtimeNs == u.MtimeNs
+	if id.size != u.Size {
+		return false
+	}
+	if id.mtimeNs == u.MtimeNs {
+		return true
+	}
+	for _, g := range []int64{1e9, 1e6, 1e3, 100} {
+		if id.mtimeNs == u.MtimeNs-u.MtimeNs%g || u.MtimeNs == id.mtimeNs-id.mtimeNs%g {
+			return true
+		}
+	}
+	return false
 }
 
 func fileIdentity(path string) (fileID, error) {

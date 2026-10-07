@@ -272,6 +272,7 @@ func (s *Server) DeleteStoragePoolContent(ctx context.Context, req *pb.DeleteSto
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
+	unmarkUpload(target)
 	if err := s.forgetPoolUpload(ctx, target); err != nil {
 		slog.Warn("pool content deleted but its upload record was not dropped", "pool", req.PoolName, "file", req.Filename, "error", err)
 	}
@@ -448,13 +449,32 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 	}
 	// Never replace what is there — a file, or a symlink planted at the name —
 	// and never write through one.
+	// An upload (not the daemon's replica) is marked on the store before it
+	// is published, so no host takes it for a late replica even where its
+	// record does not arrive (lateReplicaOK).
+	marked := caller.view != viewReplicas
+	if marked {
+		if err := markUpload(dest); err != nil {
+			unmarkUpload(dest)
+			return status.Errorf(codes.Internal, "mark upload: %v", err)
+		}
+	}
+	withdraw := func() {
+		_ = os.Remove(dest)
+		if marked {
+			unmarkUpload(dest)
+		}
+	}
 	if err := publishNoClobber(tmpName, dest, first.Filename); err != nil {
+		if marked && !lexists(dest) {
+			unmarkUpload(dest)
+		}
 		return err
 	}
 	if err := syncPath(dir); err != nil {
 		// The rename may not survive a crash; withdraw it rather than leave a
 		// name the storage will not vouch for.
-		_ = os.Remove(dest)
+		withdraw()
 		return status.Errorf(codes.Internal, "sync directory: %v", err)
 	}
 	// A caller's upload is recorded as its pool's project's: in a directory
@@ -478,7 +498,7 @@ func (s *Server) UploadStoragePoolContent(stream pb.LiteVirt_UploadStoragePoolCo
 		recErr = nil
 	}
 	if recErr != nil {
-		_ = os.Remove(dest)
+		withdraw()
 		return status.Errorf(codes.Internal, "record upload: %v", recErr)
 	}
 	return stream.SendAndClose(&pb.UploadStoragePoolContentResponse{Path: dest, SizeBytes: total})

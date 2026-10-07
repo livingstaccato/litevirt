@@ -264,11 +264,17 @@ func (s *Server) isReplicaFor(ctx context.Context, uploads poolRecords, path str
 // record of any host names the file (the caller's recNone), the VM's host is
 // not live, that host has a replica row for this VM disk on this store, and
 // the file is newer — by stamp and modification time — than every entry of
-// that row and no newer than the host was last seen answering.
+// that row and no newer than the host was last seen answering, and the upload
+// API did not place it (no upload marker on the store).
 func (s *Server) lateReplicaOK(ctx context.Context, path string, k replicaKey) bool {
 	name := filepath.Base(path)
 	_, ts, future, ok := parseReplicaName(name)
 	if !ok || future || !replicaNameIs(name, k) {
+		return false
+	}
+	// The upload API placed it (its record may be on the other side of the
+	// partition; its marker is on the store, with the file).
+	if hasUploadMarker(path) {
 		return false
 	}
 	vm, err := corrosion.GetVM(ctx, s.db, k.VM)

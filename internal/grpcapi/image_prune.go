@@ -51,8 +51,10 @@ const imagePruneDeadline = 2 * time.Minute
 //     <data_dir>/disks, in this host's file pool directories and in a btrfs
 //     pool's per-disk subvolumes — which also covers a disk created a moment
 //     ago whose row is not written yet, and leftovers no row names;
-//   - the base a backup manifest in a backup repo on this host was taken on
-//     (base_identity), and its chain;
+//   - every file a backup pinned on this host when it was taken on an
+//     overlay of it (pinBackupBase, whatever repo or host the manifest went
+//     to), and the base a backup manifest in a backup repo on this host
+//     records (base_identity: a backup taken before pins), and their chains;
 //   - every image's current file and every file in keep, and their chains —
 //     a layered image is built on another image's version — walked until
 //     nothing new is kept.
@@ -96,7 +98,7 @@ func (s *Server) imageFilesInUse(ctx context.Context, keep []string) (map[string
 		grew := false
 		for f, n := range st.StoreFiles() {
 			r := resolvedOr(f)
-			if w.walked[r] || !(f == st.ImagePath(n) || slices.Contains(keep, f) || w.inUse[r]) {
+			if w.walked[r] || !(f == st.ImagePath(n) || slices.Contains(keep, f) || w.inUse[r] || image.Pinned(f)) {
 				continue
 			}
 			if err := w.walk(f, true); err != nil {
@@ -508,4 +510,21 @@ func isMountpoint(dir string) (bool, error) {
 		return false, fmt.Errorf("cannot tell whether %s is a mountpoint", dir)
 	}
 	return a.Dev != b.Dev || a.Ino == b.Ino, nil
+}
+
+// pinBackupBase pins, on this host — the VM's, which holds the base — the
+// image-store file a disk-file backup of an overlay was taken on (id), so no
+// prune removes it, whatever repo or host the manifest lands in (a sink host,
+// an absolute repo path). A base outside the image store is not the prune's.
+func (s *Server) pinBackupBase(id *pbsstore.BaseIdentity) error {
+	if id == nil || !filepath.IsAbs(id.Path) {
+		return nil
+	}
+	if filepath.Dir(id.Path) != resolvedOr(s.imageStore().ImageDir()) {
+		return nil
+	}
+	if _, ok := image.ImageNameOfFile(id.Path); !ok {
+		return nil
+	}
+	return s.imageStore().Pin(id.Path)
 }

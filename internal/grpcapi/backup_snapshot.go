@@ -334,6 +334,9 @@ func (s *Server) pushBackup(
 		}
 		opts.ContentFormat = pbsstore.ContentDiskFile
 		opts.BaseIdentity = overlayBaseIdentity(disk.Path)
+		if err := s.pinBackupBase(opts.BaseIdentity); err != nil {
+			return nil, status.Errorf(codes.Internal, "pin the base the backup is taken on: %v", err)
+		}
 		m, err := pbsstore.PushFile(ctx, repo, disk.Path, opts)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "push: %v", err)
@@ -414,6 +417,9 @@ func (s *Server) pushBackup(
 		opts.BitmapName = ""
 		opts.ContentFormat = pbsstore.ContentDiskFile
 		opts.BaseIdentity = overlayBaseIdentity(disk.Path)
+		if err := s.pinBackupBase(opts.BaseIdentity); err != nil {
+			return nil, status.Errorf(codes.Internal, "pin the base the backup is taken on: %v", err)
+		}
 		m, perr := pbsstore.PushFile(ctx, repo, disk.Path, opts)
 		if perr != nil {
 			return nil, status.Errorf(codes.Internal, "push: %v", perr)

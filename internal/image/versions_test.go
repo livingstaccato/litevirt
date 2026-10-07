@@ -103,3 +103,40 @@ func TestPublish_HealsOnlyWithTheRecordedIdentity(t *testing.T) {
 		t.Errorf("temps left behind: %v", ents)
 	}
 }
+
+// N-I1: a pinned version is never removed, and a pin is no image file.
+func TestPin_APinnedVersionIsNeverRemoved(t *testing.T) {
+	s := NewStore(t.TempDir())
+	_ = s.Init()
+	v1, v2 := []byte("version one"), []byte("version two")
+	p1, err := s.Publish("ubuntu", stage(t, s, v1), digestOf(v1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish("ubuntu", stage(t, s, v2), digestOf(v2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pin(p1.Path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Pin(p1.Path); err != nil {
+		t.Fatalf("a second pin: %v", err)
+	}
+	if !Pinned(p1.Path) {
+		t.Fatal("not pinned")
+	}
+	if err := s.RemoveImageFile("ubuntu", p1.Path); err == nil {
+		t.Error("a pinned version was removed")
+	}
+	if _, err := os.Stat(p1.Path); err != nil {
+		t.Fatal("the pinned version is gone")
+	}
+	for f := range s.StoreFiles() {
+		if filepath.Ext(f) == ".pinned" {
+			t.Errorf("the pin %s is listed as an image file", f)
+		}
+	}
+	if err := s.Pin(filepath.Join(t.TempDir(), "x.qcow2")); err == nil {
+		t.Error("a file outside the store was pinned")
+	}
+}

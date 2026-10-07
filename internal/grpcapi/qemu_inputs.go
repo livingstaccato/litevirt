@@ -259,13 +259,9 @@ func (c *diskChain) judge(layer, resolved, format string) error {
 }
 
 // recordedBacking reports whether resolved is the backing_disk recorded on the
-// layer naming it: d's own record when layer is d's file, or any disk row
-// whose path is layer.
+// layer naming it (rowsOf).
 func (c *diskChain) recordedBacking(layer, resolved string) bool {
-	if layer == c.self && c.d.BackingDisk != "" && resolvedOr(c.s.hostDiskFile(c.d.BackingDisk)) == resolved {
-		return true
-	}
-	for _, r := range c.rowsAt(layer) {
+	for _, r := range c.rowsOf(layer) {
 		if r.BackingDisk != "" && resolvedOr(c.s.hostDiskFile(r.BackingDisk)) == resolved {
 			return true
 		}
@@ -326,7 +322,8 @@ func (c *diskChain) snapshotBase(layer, resolved string) bool {
 // replica of it in a directory a daemon created for exactly that VM:
 //   - this build's replica owner directory of the VM's own project and name;
 //   - or, as an earlier build laid replicas out, the pool directory itself,
-//     with the overlay <vm>-promoted-<stem>.qcow2 and the replica exactly
+//     with the overlay <vm>-promoted-<stem>.qcow2 (or a snapshot overlay of
+//     it, <vm>-promoted-<stem>.<snapshot>) and the replica exactly
 //     <stem>.raw, where stem is <source>-<disk>-<ts> of d's own disk name
 //     and a replica timestamp (legacyReplicaStem).
 //
@@ -334,12 +331,7 @@ func (c *diskChain) snapshotBase(layer, resolved string) bool {
 // project may use; the file must not be claimed by any disk row, nor recorded
 // as another project's replica.
 func (c *diskChain) legacyPromotedRaw(layer, resolved string) bool {
-	var rows []corrosion.DiskRecord
-	if layer == c.self {
-		rows = append(rows, c.d)
-	}
-	rows = append(rows, c.rowsAt(layer)...)
-	for _, r := range rows {
+	for _, r := range c.rowsOf(layer) {
 		if r.BackingDisk == "" && c.s.legacyPromotedReplica(c.ctx, r, c.projectOf(r.VMName), layer, resolved) {
 			return true
 		}
@@ -386,11 +378,10 @@ func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskReco
 		if filepath.Dir(resolved) != pd {
 			continue
 		}
-		stem, ok := strings.CutPrefix(filepath.Base(layer), r.VMName+"-promoted-")
-		if !ok {
-			continue
-		}
-		stem, ok = strings.CutSuffix(stem, ".qcow2")
+		// The overlay, or a snapshot overlay that took its place, by stem
+		// (<vm>-promoted-<stem>.qcow2 or .<snapshot>; the stem ends at the
+		// timestamp, which has no dot).
+		stem, ok := strings.CutPrefix(diskStem(filepath.Base(layer)), r.VMName+"-promoted-")
 		if ok && filepath.Base(resolved) == stem+".raw" && legacyReplicaStem(stem, r.DiskName) {
 			return true
 		}
@@ -413,6 +404,31 @@ func legacyReplicaStem(stem, disk string) bool {
 	}
 	src, ok := strings.CutSuffix(stem[:len(stem)-len(layout)], "-"+disk+"-")
 	return ok && safename.ValidateVMName(src) == nil
+}
+
+// rowsOf is the disk rows a layer answers to: every row whose own file it is
+// (rowsAt) and, when it is d's file — or one of d's own layers with no row of
+// its own: in d's file's directory, with its stem, the base a snapshot of d's
+// VM left when the record moved to the overlay (diskStem, as
+// reconcileDiskPaths and snapshotBase match it) — d's record.
+func (c *diskChain) rowsOf(layer string) []corrosion.DiskRecord {
+	rows := c.rowsAt(layer)
+	if layer == c.self || (len(rows) == 0 && c.ownLayer(layer)) {
+		rows = append([]corrosion.DiskRecord{c.d}, rows...)
+	}
+	return rows
+}
+
+// ownLayer reports a file beside d's file with d's file's stem, not recorded
+// as another project's replica.
+func (c *diskChain) ownLayer(layer string) bool {
+	if layer == c.self || filepath.Dir(layer) != filepath.Dir(c.self) || diskStem(layer) != diskStem(c.self) {
+		return false
+	}
+	if rec, ok := replicaRecordFor(layer); ok && tenancy.NormalizeProject(rec.Project) != c.project {
+		return false
+	}
+	return true
 }
 
 // rowsAt is every disk row whose own file is resolved.

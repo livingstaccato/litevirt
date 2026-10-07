@@ -175,7 +175,11 @@ resolved through symlinks, before anything opens it, and is accepted only as:
   directory, the overlay `<vm>-promoted-<source>-<disk>-<ts>.qcow2` beside
   exactly `<source>-<disk>-<ts>.raw` (the replica's own name, of the disk's
   own name and a `YYYYMMDD-HHMMSS` replica timestamp), or in the VM's own
-  replica directory, claimed by no disk row and no other project's record;
+  replica directory, claimed by no disk row and no other project's record.
+  A snapshot overlay that took the disk's place (`<stem>.<snapshot>`, after
+  the snapshot is reverted or deleted) is judged by its stem the same way,
+  and a layer of the disk's own — same directory, same stem, no row of its
+  own — answers to the disk's record;
 - a file in the directory of a file-based pool on this host that the VM's
   project may use (global, or owned by that project), or the disk's own pool;
 - in `<data_dir>/disks` (which holds every project's disks) or the disk's own

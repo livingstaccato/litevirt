@@ -115,6 +115,40 @@ func ImageNameOfFile(path string) (string, bool) {
 	return name, ok && safename.ValidateImageName(name) == nil
 }
 
+// pinPath is where a pin on a store file is recorded.
+func pinPath(path string) string { return path + ".pinned" }
+
+// Pin records that something outside the store needs path — a backup taken
+// on an overlay of it, wherever its manifest went — so it is never removed
+// (RemoveImageFile refuses it). A pin is permanent.
+func (s *Store) Pin(path string) error {
+	if !sameDir(filepath.Dir(path), s.imageDir) {
+		return fmt.Errorf("%s is not in the image store", path)
+	}
+	if _, ok := ImageNameOfFile(path); !ok {
+		return fmt.Errorf("%s is not an image file", path)
+	}
+	if Pinned(path) {
+		return nil
+	}
+	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+"."+randid.New()+".tmp")
+	if err := os.WriteFile(tmp, nil, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, pinPath(path)); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// Pinned reports whether path is pinned. A pin that cannot be read counts as
+// one: nothing is removed on a guess.
+func Pinned(path string) bool {
+	_, err := os.Lstat(pinPath(path))
+	return !errors.Is(err, fs.ErrNotExist)
+}
+
 // identityPath is where a file's provenance is recorded.
 func identityPath(path string) string { return path + ".sha256" }
 
@@ -417,6 +451,9 @@ func (s *Store) RemoveImageFile(name, path string) error {
 	}
 	if path == s.ImagePath(name) {
 		return fmt.Errorf("%s is image %q's current file", path, name)
+	}
+	if Pinned(path) {
+		return fmt.Errorf("%s is pinned: a backup was taken on it", path)
 	}
 	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err

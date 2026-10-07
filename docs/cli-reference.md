@@ -521,9 +521,12 @@ lv image prune [<image>] [--host <host>] [--dry-run]
 #   Removes, on one host, the image files no disk there is built on — judged
 #   from every visible disk's backing header, never from the image's name —
 #   keeping each image's current version, every version a kept image is
-#   layered on, every version a disk create in flight may use, and every base
-#   a backup manifest in a backup repo on the host records (base_identity).
-#   A backup taken by an older build records no base and pins nothing.
+#   layered on, every version a disk create in flight may use, and every
+#   version a disk-file backup was taken on: the backup pins it on the VM's
+#   host (<file>.pinned, permanent) wherever the manifest goes — a sink host,
+#   an absolute repo path. A backup taken before pins is honoured through its
+#   manifest when that is in a backup repo on the host; one taken by an older
+#   build records no base and pins nothing.
 #   Needs image.import. Nothing is removed unless the whole view can be read
 #   within 2 minutes: a pool directory, a disk header, an nfs share that is
 #   not mounted or a backup repo that cannot be read refuses the prune,

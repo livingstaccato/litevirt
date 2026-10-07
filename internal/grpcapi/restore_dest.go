@@ -511,7 +511,9 @@ func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *p
 	rule := s.diskChainRule(ctx, *d)
 	self := resolvedOr(d.Path)
 
-	// The record must agree.
+	// The record must agree — with what lies below the disk's own layers (the
+	// bases a snapshot of it left), which is what the record names.
+	agree := s.belowOwnLayers(ctx, *d, self, resolved)
 	for what, rec := range map[string]string{"backing_disk": d.BackingDisk, "backing_image": d.BackingImage} {
 		if rec == "" {
 			continue
@@ -520,13 +522,13 @@ func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *p
 		if what == "backing_image" && !filepath.IsAbs(p) {
 			// An image name: any version of it the store has published (a
 			// refresh never replaces the file a disk was built on).
-			if image.IsImageFile(resolvedOr(images), strings.TrimSuffix(p, ".qcow2"), resolved) {
+			if image.IsImageFile(resolvedOr(images), strings.TrimSuffix(p, ".qcow2"), agree) {
 				continue
 			}
 			p = filepath.Join(images, strings.TrimSuffix(p, ".qcow2")+".qcow2")
 		}
-		if r, err := filepath.EvalSymlinks(p); err != nil || r != resolved {
-			return "", "", fmt.Errorf("the disk's record (%s %q) disagrees with its image's backing %q; refusing to guess", what, rec, resolved)
+		if r, err := filepath.EvalSymlinks(p); err != nil || r != agree {
+			return "", "", fmt.Errorf("the disk's record (%s %q) disagrees with its image's backing %q; refusing to guess", what, rec, agree)
 		}
 	}
 
@@ -579,6 +581,36 @@ func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *p
 		return "", "", fmt.Errorf("the disk's raw backing %q is not a regular file", resolved)
 	}
 	return resolved, format, nil
+}
+
+// belowOwnLayers follows resolved, the backing of d's file self, down through
+// d's own layers — the bases a snapshot of d's VM left (snapshotBase), each a
+// regular qcow2 file — and returns the first backing that is not one: the
+// file d's record names. A layer whose header cannot be read ends the walk
+// there (the record is then compared with it, and disagrees).
+func (s *Server) belowOwnLayers(ctx context.Context, d corrosion.DiskRecord, self, resolved string) string {
+	c := s.newDiskChain(ctx, d)
+	cur := resolved
+	for i := 0; i < maxBackingDepth && c.snapshotBase(self, cur); i++ {
+		fi, err := os.Lstat(cur)
+		if err != nil || !fi.Mode().IsRegular() {
+			return cur
+		}
+		info, err := qcow2.Info(cur)
+		if err != nil || info.BackingFile == "" || looksLikeProtocol(info.BackingFile) {
+			return cur
+		}
+		next := info.BackingFile
+		if !filepath.IsAbs(next) {
+			next = filepath.Join(filepath.Dir(cur), next)
+		}
+		r, err := filepath.EvalSymlinks(next)
+		if err != nil {
+			return cur
+		}
+		cur = r
+	}
+	return cur
 }
 
 // recordedBackupBase is the base an overlay backup was taken on, for

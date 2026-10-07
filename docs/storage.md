@@ -368,6 +368,15 @@ refused without it. Only the VM's project's readers (holding
 `storage.content.write` on the pool) or an admin delete one, and never one a
 disk on any host uses (a `--no-localize` promotion's backing).
 
+Deleting a pool on its own directory (`<data_dir>/pools/<name>`) removes the
+daemon's own directories in it first: the replica area's empty directories,
+and the upload markers (`.litevirt-uploads`) of uploads no longer there. A
+pool still holding replicas or files is refused, naming them; with `--force`
+it is deleted anyway, as it always was: the replicas in its area go with it
+(not one a disk uses), and any other file stays where it is, in the
+directory, which is then kept — and a new pool of that name is refused the
+directory until it is emptied.
+
 A user's upload into a pool on `<data_dir>/disks` lands in
 `<data_dir>/disks/uploads/` and is listed with the pool's other content: the VM
 disks' own names (`<vm>-<disk>.qcow2`) are never taken by an upload, so

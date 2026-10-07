@@ -166,3 +166,90 @@ func TestFinalPools_ContentDeleteKeepsAnAreaReplicaADiskUses(t *testing.T) {
 		t.Fatalf("a replica a disk uses was deleted")
 	}
 }
+
+// ownPool creates local pool name in its own directory and returns it.
+func ownPool(t *testing.T, s *Server, name string) string {
+	t.Helper()
+	if _, err := s.CreateStoragePool(adminCtx(), &pb.CreateStoragePoolRequest{Name: name, Driver: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(s.dataDir, "pools", name)
+}
+
+func poolGone(t *testing.T, s *Server, name string) bool {
+	t.Helper()
+	_, ok, err := corrosion.GetStoragePool(adminCtx(), s.db, s.hostName, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return !ok
+}
+
+// C4: a pool that was a replication target, whose replicas were pruned (or
+// whose schedule is gone), and one that held uploads, are deleted: the
+// daemon's own empty directories are not files someone left.
+func TestFinalPools_PoolDeleteCleansTheDaemonsEmptyDirectories(t *testing.T) {
+	s := newPoolTestServer(t)
+	dir := ownPool(t, s, "dr")
+	owner := replicaOwnerDir(dir, "acme", "web")
+	if err := os.MkdirAll(owner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	markers := filepath.Join(dir, uploadMarkerDir)
+	if err := os.MkdirAll(markers, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(markers, "gone.iso"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "dr"}); err != nil {
+		t.Fatalf("deleting a pool holding only the daemon's empty directories: %v", err)
+	}
+	if present(dir) || !poolGone(t, s, "dr") {
+		t.Fatalf("pool directory present=%v, row gone=%v", present(dir), poolGone(t, s, "dr"))
+	}
+}
+
+// C4: replicas still in the area refuse a plain delete (they are data) and
+// go with --force — except one a disk uses, which is kept. --force always
+// deletes the pool, as on main; files someone left stay, and so does the
+// directory holding them.
+func TestFinalPools_PoolDeleteForceAlwaysSucceeds(t *testing.T) {
+	s := newPoolTestServer(t)
+	dir := ownPool(t, s, "dr")
+	rep := areaReplica(t, dir, "acme", "web", "root", "20261007-120000")
+	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "dr"}); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("deleting a pool holding replicas without --force: got %v, want FailedPrecondition", err)
+	}
+	if !present(rep) || poolGone(t, s, "dr") {
+		t.Fatalf("a refused delete changed something")
+	}
+	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "dr", Force: true}); err != nil {
+		t.Fatalf("--force: %v", err)
+	}
+	if present(rep) || present(dir) || !poolGone(t, s, "dr") {
+		t.Fatalf("--force: replica present=%v, dir present=%v, row gone=%v", present(rep), present(dir), poolGone(t, s, "dr"))
+	}
+
+	// A file someone left, and a replica a disk uses: the pool is deleted,
+	// both stay.
+	dir = ownPool(t, s, "dr2")
+	left := filepath.Join(dir, "notes.iso")
+	if err := os.WriteFile(left, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	used := areaReplica(t, dir, "acme", "web", "root", "20261007-130000")
+	if err := corrosion.InsertVM(context.Background(), s.db,
+		corrosion.VMRecord{Name: "web-dr", HostName: s.hostName, State: "stopped", Project: "acme"}, nil,
+		[]corrosion.DiskRecord{{VMName: "web-dr", DiskName: "root", HostName: s.hostName, Path: used, SizeBytes: 1 << 20, StorageType: "local"}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DeleteStoragePool(adminCtx(), &pb.DeleteStoragePoolRequest{Name: "dr2", Force: true}); err != nil {
+		t.Fatalf("--force with files left: %v", err)
+	}
+	if !poolGone(t, s, "dr2") || !present(left) || !present(used) || !present(used+".json") {
+		t.Fatalf("--force with files left: row gone=%v, left file=%v, used replica=%v, its record=%v",
+			poolGone(t, s, "dr2"), present(left), present(used), present(used+".json"))
+	}
+}

@@ -543,7 +543,7 @@ func (s *Server) originalDiskBacking(ctx context.Context, dest restoreDest, m *p
 	}
 	if err != nil && cur.BackingFormat == "raw" && d.BackingDisk == "" {
 		if vm, verr := corrosion.GetVM(ctx, s.db, d.VMName); verr == nil && vm != nil &&
-			s.legacyPromotedReplica(ctx, *d, tenancy.NormalizeProject(vm.Project), self, resolved) {
+			s.legacyPromotedReplica(ctx, *d, tenancy.NormalizeProject(vm.Project), self, resolved, "raw") {
 			format, immutable, err = "raw", true, nil
 		}
 	}

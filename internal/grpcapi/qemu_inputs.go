@@ -177,7 +177,7 @@ func confineTo(resolved string, roots ...string) error {
 //     the clone was authorized from), a --no-localize promotion's replica.
 //     A backing declared raw is accepted only this way, or as the replica
 //     under a VM an earlier build promoted with --no-localize
-//     (legacyPromotedRaw);
+//     (legacyPromoted, which accepts that build's qcow2 replica too);
 //   - in the directory of a file-based pool on this host that d's VM's project
 //     may use (global, or owned by that project), or d's own pool;
 //   - in <data_dir>/disks or d's own directory (outside those pools) only as a
@@ -262,10 +262,10 @@ func (c *diskChain) judge(layer, resolved, format string) error {
 		}
 		return nil
 	}
+	if c.legacyPromoted(layer, resolved, format) {
+		return nil
+	}
 	if format == "raw" {
-		if c.legacyPromotedRaw(layer, resolved) {
-			return nil
-		}
 		return fmt.Errorf("%s names a raw backing %q that is not the backing_disk recorded for it", layer, resolved)
 	}
 	if withinAny(resolved, c.pools) {
@@ -455,34 +455,43 @@ func (c *diskChain) snapshotBaseOf(layer, resolved, self, vm, project string) bo
 	return true
 }
 
-// legacyPromotedRaw accepts the raw replica under a VM promoted with
-// --no-localize by a build that did not record backing_disk: the layer is
-// that VM's own promoted disk (d's file, or the file of a disk row with no
-// backing_disk recorded), in its pool's directory, and the raw file is a
-// replica of it in a directory a daemon created for exactly that VM:
+// legacyPromoted accepts the replica under a VM promoted with --no-localize
+// by a build that did not record backing_disk — raw (an incremental
+// replica) or qcow2 (a full one; promote.go:901-910 at 3e4ba50b declared the
+// backing's format by the replica's suffix): the layer is that VM's own
+// promoted disk (d's file, or the file of a disk row with no backing_disk
+// recorded), in its pool's directory, and the replica is of it in a
+// directory a daemon created for exactly that VM:
 //   - this build's replica owner directory of the VM's own project and name;
-//   - or, as an earlier build laid replicas out, the pool directory itself,
-//     with the overlay <vm>-promoted-<stem>.qcow2 (or a snapshot overlay of
-//     it, <vm>-promoted-<stem>.<snapshot>) and the replica exactly
-//     <stem>.raw, where stem is <source>-<disk>-<ts> of d's own disk name
-//     and a replica timestamp (legacyReplicaStem).
+//   - or, as an earlier build laid replicas out, the pool directory itself
+//     (<data_dir>/disks for the default pool), with the overlay
+//     <vm>-promoted-<stem>.qcow2 (or a snapshot overlay of it,
+//     <vm>-promoted-<stem>.<snapshot>) and the replica exactly
+//     <stem>.<format>, where stem is <source>-<disk>-<ts> of d's own disk
+//     name and a replica timestamp (legacyReplicaStem).
 //
 // Paths are resolved (so no symlink is in them); the pool must be one the VM's
 // project may use; the file must not be claimed by any disk row, nor recorded
-// as another project's replica.
-func (c *diskChain) legacyPromotedRaw(layer, resolved string) bool {
+// as another project's replica, nor carry any record (upload, replica or
+// copy) of another project.
+func (c *diskChain) legacyPromoted(layer, resolved, format string) bool {
+	for _, u := range c.uploadRecords(resolved) {
+		if !u.Peer && !sameProject(u.Project, c.project) {
+			return false
+		}
+	}
 	for _, r := range c.rowsOf(layer) {
-		if r.BackingDisk == "" && c.s.legacyPromotedReplica(c.ctx, r, c.projectOf(r.VMName), layer, resolved) {
+		if r.BackingDisk == "" && c.s.legacyPromotedReplica(c.ctx, r, c.projectOf(r.VMName), layer, resolved, format) {
 			return true
 		}
 	}
 	return false
 }
 
-// legacyPromotedReplica is legacyPromotedRaw's test for one disk row r of a
-// VM in project, whose file is layer.
-func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskRecord, project, layer, resolved string) bool {
-	if r.StorageVolume == "" || project == "" {
+// legacyPromotedReplica is legacyPromoted's test for one disk row r of a
+// VM in project, whose file is layer, naming resolved as format.
+func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskRecord, project, layer, resolved, format string) bool {
+	if r.StorageVolume == "" || project == "" || (format != "raw" && format != "qcow2") {
 		return false
 	}
 	ref, ok := s.resolvePool(ctx, r.StorageVolume)
@@ -522,7 +531,7 @@ func (s *Server) legacyPromotedReplica(ctx context.Context, r corrosion.DiskReco
 		// (<vm>-promoted-<stem>.qcow2 or .<snapshot>; the stem ends at the
 		// timestamp, which has no dot).
 		stem, ok := strings.CutPrefix(diskStem(filepath.Base(layer)), r.VMName+"-promoted-")
-		if ok && filepath.Base(resolved) == stem+".raw" && legacyReplicaStem(stem, r.DiskName) {
+		if ok && filepath.Base(resolved) == stem+"."+format && legacyReplicaStem(stem, r.DiskName) {
 			return true
 		}
 	}

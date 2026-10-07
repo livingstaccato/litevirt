@@ -282,11 +282,10 @@ a pool is recorded as the operator's copy of that VM's disk, whatever it is
 named: its project's, and promotable by naming it, but never a replica a run
 made — never pruned, never the newest replica failover promotes, never an
 incremental replica's base. An admin (`storage.hostpath` at the root) may
-name any file in the pool but another project's alone: another project's
-upload or replica by record, a disk of another project's VM, or a file named
-exactly as only another project's VM disk's runs name its replicas
-(`<vm>-<disk>-<time>` where the VM's disk's own runs never write that name).
-A name both could have written is the admin's to choose.
+name any file in the pool, as before. When that file is another project's
+alone — its upload or replica by record, a disk of its VM, or a name only its
+VM disk's runs write — the promotion goes ahead, a warning is logged, and the
+VM's events (`replica.foreign`) name the owning project.
 
 On shared storage — a pool directory on an NFS, CephFS, GlusterFS or CIFS/SMB
 mount other hosts mount too — the record of each upload and replica is also

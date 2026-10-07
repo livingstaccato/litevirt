@@ -326,8 +326,7 @@ func (s *Server) lateReplicaOK(ctx context.Context, path string, k replicaKey) b
 
 // explicitReplicaOK reports whether a manual promotion may use the file at
 // path, named by the operator, as k's disk: for an admin (storage.hostpath
-// at the root) any regular file that is not another project's alone
-// (anotherProjectsOnly); otherwise a replica of it (isReplicaFor), a
+// at the root) any regular file, as on main; otherwise a replica of it (isReplicaFor), a
 // replicate-volume copy of it, an upload its project owns
 // (uploadIsProjects), or a file from before records (or whose records are
 // stale) named <vm>-<disk>-<anything>.<qcow2|raw> that no other project's VM
@@ -341,7 +340,10 @@ func (s *Server) explicitReplicaOK(ctx context.Context, uploads poolRecords, pat
 		return true
 	}
 	if admin {
-		return !s.anotherProjectsOnly(ctx, uploads, path, k)
+		// As on main, an admin's named replica is any file — another
+		// project's included; doPromoteLocal warns of that
+		// (anotherProjectsOwner).
+		return true
 	}
 	u, st := s.recordState(uploads, path)
 	switch {
@@ -536,37 +538,44 @@ func replicaUnavailable(err error) bool {
 		(strings.HasPrefix(m, "replica ") && strings.Contains(m, "not found in pool"))
 }
 
-// anotherProjectsOnly reports whether the file at path is another project's
-// and never k's: another project's upload or replica by record, a disk of
-// another project's VM, or a file named exactly as only another project's VM
-// disk's replication names its replicas (<vm>-<disk>-<stamp>, a VM and disk
-// of another project) where k's disk's never is. These are the only files an
-// admin's named replica is refused: a name both could have written stays the
-// admin's to choose.
-func (s *Server) anotherProjectsOnly(ctx context.Context, uploads poolRecords, path string, k replicaKey) bool {
+// anotherProjectsOwner reports whether the file at path is another
+// project's and never k's, and names that project: another project's upload
+// or replica by record, a disk of another project's VM, or a file named
+// exactly as only another project's VM disk's replication names its replicas
+// (<vm>-<disk>-<stamp>, a VM and disk of another project) where k's disk's
+// never is. An admin may still promote such a file by naming it; it is
+// warned of, never refused.
+func (s *Server) anotherProjectsOwner(ctx context.Context, uploads poolRecords, path string, k replicaKey) (string, bool) {
 	if u, st := s.recordState(uploads, path); st == recMatched && !u.Peer {
 		switch {
 		case u.VM != "" && !sameProject(u.Project, k.Project):
-			return true
+			return displayProject(u.Project), true
 		case u.VM == "" && u.Project != "" && !sameProject(u.Project, k.Project):
-			return true
+			return displayProject(u.Project), true
 		}
 	}
-	if s.usedByOtherProject(ctx, path, k) {
-		return true
+	refs, _ := corrosion.DisksReferencingPath(ctx, s.db, path)
+	kept, _ := corrosion.TombstonedDisksReferencingPath(ctx, s.db, path)
+	for _, d := range append(refs, kept...) {
+		if vm, err := corrosion.GetVMIncludingDeleted(ctx, s.db, d.VMName); err == nil && vm != nil && !sameProject(vm.Project, k.Project) {
+			return displayProject(vm.Project), true
+		}
 	}
 	p, ok := replicaNamePrefix(filepath.Base(path))
 	if !ok || p == k.VM+"-"+k.Disk {
-		return false
+		return "", false
 	}
 	for i := 1; i < len(p)-1; i++ {
 		if p[i] != '-' {
 			continue
 		}
-		disks, claim := s.otherProjectDisks(ctx, p[:i], k)
-		if claim || disks[p[i+1:]] {
-			return true
+		disks, _ := s.otherProjectDisks(ctx, p[:i], k)
+		if disks[p[i+1:]] {
+			if vm, err := corrosion.GetVMIncludingDeleted(ctx, s.db, p[:i]); err == nil && vm != nil {
+				return displayProject(vm.Project), true
+			}
+			return "another project", true
 		}
 	}
-	return false
+	return "", false
 }

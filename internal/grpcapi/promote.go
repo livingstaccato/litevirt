@@ -770,6 +770,17 @@ func (s *Server) doPromoteLocal(ctx context.Context, req *pb.PromoteReplicaReque
 		if err := replicaReadable(replicaPath); err != nil {
 			return status.Errorf(codes.NotFound, "%s: %q on %q: %v", errReplicaUnavailable, replica, s.hostName, err)
 		}
+		// An admin's named file that another project owns alone is taken, as
+		// on main — and said so, in the log and on the VM's events.
+		if admin {
+			if uploads, err := s.loadPoolUploads(ctx, s.poolContentDirs(poolDir)...); err == nil {
+				if owner, ok := s.anotherProjectsOwner(ctx, uploads, replicaPath, k); ok {
+					slog.Warn("promote: an admin named a replica another project owns", "vm", vm.Name, "replica", replica, "owner_project", owner)
+					s.recordVMEvent(ctx, vm.Name, "replica.foreign", "warning", fmt.Sprintf(
+						"promoting %s, named by an admin, which project %q owns, not this VM's project", replica, owner))
+				}
+			}
+		}
 		// A replica taken although its record had not arrived from its writer
 		// (lateReplicaOK) is said so, by name, on the VM's events.
 		if uploads, err := s.loadPoolUploads(ctx, filepath.Dir(replicaPath)); err == nil {

@@ -3,6 +3,8 @@ package grpcapi
 import (
 	"context"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -35,6 +37,32 @@ func TestDoPromoteLocal_AnAdminsAnyFileOnlyWhenNamed(t *testing.T) {
 	if err := f.s.doPromoteLocal(adminCtx(), &pb.PromoteReplicaRequest{VmName: "web", NewName: "named", NoLocalize: true, Replica: stray},
 		vm, &disks[0], "dr", stray, false, noop); err != nil {
 		t.Errorf("a file the admin named: %v", err)
+	}
+	f.assertBIntact(t)
+}
+
+// As on main, an admin's explicit replica promotes whatever file it names —
+// even one another project owns alone (here project B's replica, which A's
+// VM web disk 1 could never have written). It is not refused: it is logged
+// and the VM's events name the owning project. A non-admin is still refused
+// (TestPromoteReplica_CannotSelectAnotherProjectsFile).
+func TestPromoteReplica_AnAdminMayNameAnotherProjectsFileAndIsWarned(t *testing.T) {
+	f := newPoolFixture(t)
+	ctx := context.Background()
+	err := f.s.PromoteReplica(&pb.PromoteReplicaRequest{
+		VmName: "web", TargetPool: "dr", Replica: bReplicaQcow, NewName: "taken", NoLocalize: true,
+	}, &streamRecorder[pb.PromoteReplicaProgress]{ctx: adminCtx()})
+	if err != nil {
+		t.Fatalf("an admin naming another project's file: %v", err)
+	}
+	evs, err := corrosion.ListVMEvents(ctx, f.s.db, "web", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.ContainsFunc(evs, func(e corrosion.VMEventRecord) bool {
+		return e.Type == "replica.foreign" && strings.Contains(e.Detail, bReplicaQcow) && strings.Contains(e.Detail, `project "b"`)
+	}) {
+		t.Errorf("no event names %s as project b's: %+v", bReplicaQcow, evs)
 	}
 	f.assertBIntact(t)
 }

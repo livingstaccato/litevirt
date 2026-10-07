@@ -17,14 +17,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
 	pb "github.com/litevirt/litevirt/gen/litevirt/v1"
 	"github.com/litevirt/litevirt/internal/corrosion"
@@ -110,10 +108,13 @@ func TestFleet_CrossHostReplicationNeverTouchesAnotherProjectsFiles(t *testing.T
 		t.Errorf("A's recorded replicas on node 1 = %v, want only the newest", aReplicas)
 	}
 
-	// Promotion selects from A's records only: B's file is not A's replica.
+	// Promotion chooses from A's records only: B's file is never A's newest
+	// replica. An admin (here root on the node) who names it explicitly is
+	// not refused, as on main: the promotion goes ahead, B's file is only
+	// read (an overlay on it), and A's VM's events name project b.
 	st, err := c.SelfClient(src).PromoteReplica(ctx, &pb.PromoteReplicaRequest{
 		VmName: "web", TargetPool: "dr", TargetHost: dst.Name,
-		Replica: "web-1-root-20261001-000000.qcow2", NewName: "stolen", NoLocalize: true,
+		Replica: "web-1-root-20261001-000000.qcow2", NewName: "named", NoLocalize: true,
 	})
 	if err == nil {
 		for {
@@ -122,7 +123,25 @@ func TestFleet_CrossHostReplicationNeverTouchesAnotherProjectsFiles(t *testing.T
 			}
 		}
 	}
-	if status.Code(err) != codes.NotFound {
-		t.Errorf("promoting A's VM from B's file on node 1: got %v, want NotFound", err)
+	if err != io.EOF {
+		t.Fatalf("an admin promoting A's VM from B's named file on node 1: %v", err)
+	}
+	for name, want := range bFiles {
+		if got, _ := os.ReadFile(filepath.Join(dr, name)); !bytes.Equal(got, want) {
+			t.Errorf("project B's %s changed", name)
+		}
+	}
+	evs, err := corrosion.ListVMEvents(ctx, dst.DB, "web", 50, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	warned := false
+	for _, e := range evs {
+		if e.Type == "replica.foreign" && strings.Contains(e.Detail, `project "b"`) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no event on web names the promoted file as project b's: %+v", evs)
 	}
 }
